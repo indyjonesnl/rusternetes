@@ -406,6 +406,20 @@ impl CriContainerRuntime {
         Ok(cri.runtime_status(false).await?)
     }
 
+    /// Apply `KubeletConfiguration.runtimeRequestTimeout` to every CRI call
+    /// (upstream `NewRemoteRuntimeService(endpoint, kubeCfg.RuntimeRequestTimeout...)`,
+    /// pkg/kubelet/kubelet.go:408/411). Unset/zero keeps the 2m default.
+    #[must_use]
+    pub fn with_runtime_request_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.cri = self.cri.with_request_timeout(timeout);
+        self
+    }
+
+    /// The per-request CRI timeout currently in effect.
+    pub fn runtime_request_timeout(&self) -> std::time::Duration {
+        self.cri.request_timeout()
+    }
+
     /// Set the `kubernetes` Service host:port injected as KUBERNETES_SERVICE_*
     /// env into pods (defaults to 10.96.0.1:443).
     #[must_use]
@@ -2527,12 +2541,23 @@ impl CriContainerRuntime {
 
     /// NodeUnpublish the CSI volumes of pods that are gone. No-op when no
     /// VolumeManager is attached.
-    pub async fn unmount_orphaned_csi_volumes(
+    pub async fn unmount_csi_volumes(
         &self,
         live_pod_uids: &std::collections::HashSet<String>,
+        terminated_pod_uids: &std::collections::HashSet<String>,
     ) {
         if let Some(volumes) = self.volumes.as_ref() {
-            volumes.unmount_orphaned_csi_volumes(live_pod_uids).await;
+            volumes
+                .unmount_csi_volumes(live_pod_uids, terminated_pod_uids)
+                .await;
+        }
+    }
+
+    /// NodeUnstage staged CSI devices no pod holds or wants. No-op when no
+    /// VolumeManager is attached.
+    pub async fn unmount_unused_csi_devices(&self, desired_pods: &[Pod]) {
+        if let Some(volumes) = self.volumes.as_ref() {
+            volumes.unmount_unused_csi_devices(desired_pods).await;
         }
     }
 

@@ -166,6 +166,12 @@ pub enum ResourceScope {
     Unspecified,
     Namespaced,
     Cluster,
+    /// A value outside the supported set. Upstream's `ResourceScope` is a Go
+    /// string, so any string decodes and `validateEnumStrings`
+    /// (`validation.go:364`) answers `Unsupported value` (422), not a 400
+    /// decode failure (#2498).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 /// CustomResourceDefinitionVersion describes a version for a CRD
@@ -661,6 +667,11 @@ pub enum ConversionStrategyType {
 
     /// Webhook conversion calls an external webhook
     Webhook,
+
+    /// A value outside the supported set; see [`ResourceScope::Unknown`]
+    /// (`validation.go:617`) (#2498).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 /// WebhookConversion describes how to call a conversion webhook

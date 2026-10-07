@@ -613,7 +613,7 @@ impl LabelRequirement {
     }
 
     /// Port of `Requirement.Matches` (selector.go:257-298).
-    fn matches(&self, labels: &HashMap<String, String>) -> bool {
+    pub fn matches(&self, labels: &HashMap<String, String>) -> bool {
         match self.operator {
             LabelOperator::In | LabelOperator::Equals | LabelOperator::DoubleEquals => {
                 labels.get(&self.key).is_some_and(|v| self.has_value(v))

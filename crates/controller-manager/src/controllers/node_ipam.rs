@@ -22,6 +22,7 @@
 //! `--cluster-cidr`). [`CidrSet`] is IPv4+IPv6; the [`RangeAllocator`]
 //! holds one [`CidrSet`] per `--cluster-cidr` entry (IPv4, IPv6 or both).
 
+use super::cidrset_metrics;
 use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -31,7 +32,7 @@ use std::time::Duration;
 use anyhow::Result;
 use futures::StreamExt;
 use ipnet::IpNet;
-use rusternetes_common::resources::{EventSource, EventType, Node, NodeSpec, ObjectReference};
+use rusternetes_common::resources::{EventSource, EventType, Node, ObjectReference};
 use rusternetes_common::Error;
 use rusternetes_storage::{
     build_key, build_prefix, extract_key, EventRecorder, Storage, WatchEvent, WorkQueue,
@@ -287,7 +288,7 @@ const CLUSTER_SUBNET_MAX_DIFF: u8 = 16;
 /// (upstream `cidrset/metrics.go`: `cidrset_cidrs_allocations_total`,
 /// `cidrset_cidrs_releases_total`, `cirdset_max_cidrs`, `cidrset_usage_cidrs`,
 /// `cidrset_allocation_tries_per_request`), keyed by the `clusterCIDR` label.
-#[allow(dead_code)] // exposition on /metrics: #2410 (the series are tracked and tested)
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct CidrSetMetrics {
     /// The `clusterCIDR` label.
@@ -356,7 +357,6 @@ pub struct CidrSet {
     node_mask: u8,
     max_cidrs: u64,
     /// Upstream `label` (`clusterCIDR.String()`), identifies the metrics.
-    #[allow(dead_code)] // read by `metrics()`, see above
     label: String,
     inner: Mutex<CidrSetInner>,
 }
@@ -378,6 +378,8 @@ impl CidrSet {
         }
         // getMaxCIDRs
         let max_cidrs = 1u64 << (node_mask - cluster.prefix_len());
+        // `cidrSetMaxCidrs.WithLabelValues(cidrSet.label).Set(...)` (cidr_set.go:98)
+        cidrset_metrics::set_max_cidrs(&cluster.to_string(), max_cidrs);
         Ok(Self {
             width,
             node_mask,
@@ -408,8 +410,9 @@ impl CidrSet {
         self.inner.lock().expect("cidr set poisoned").allocated
     }
 
-    /// The set's metric series (upstream `cidrset/metrics.go`).
-    #[allow(dead_code)] // exposition on /metrics is a follow-up
+    /// The set's metric series (upstream `cidrset/metrics.go`); the live
+    /// series are exposed via [`cidrset_metrics`], this is the test accessor.
+    #[cfg(test)]
     pub fn metrics(&self) -> CidrSetMetrics {
         let s = self.inner.lock().expect("cidr set poisoned");
         CidrSetMetrics {
@@ -481,6 +484,9 @@ impl CidrSet {
         s.allocations += 1;
         s.tries_sum += tries as f64;
         s.tries_count += 1;
+        cidrset_metrics::inc_allocations(&self.label);
+        cidrset_metrics::observe_tries(&self.label, tries);
+        cidrset_metrics::set_usage(&self.label, s.allocated, self.max_cidrs);
         Ok(self.index_to_cidr_block(candidate))
     }
 
@@ -547,8 +553,10 @@ impl CidrSet {
                 s.set_bit(i, false);
                 s.allocated -= 1;
                 s.releases += 1;
+                cidrset_metrics::inc_releases(&self.label);
             }
         }
+        cidrset_metrics::set_usage(&self.label, s.allocated, self.max_cidrs);
         Ok(())
     }
 
@@ -562,10 +570,23 @@ impl CidrSet {
                 s.set_bit(i, true);
                 s.allocated += 1;
                 s.allocations += 1;
+                cidrset_metrics::inc_allocations(&self.label);
             }
         }
+        cidrset_metrics::set_usage(&self.label, s.allocated, self.max_cidrs);
         Ok(())
     }
+}
+
+/// Upstream `nodeForCIDRMergePatch` (`component-helpers/node/util/cidr.go:29`):
+/// `podCIDR` is always sent, `podCIDRs` is `omitempty`.
+fn node_cidr_merge_patch(cidrs: &[String]) -> serde_json::Value {
+    let mut spec = serde_json::Map::new();
+    spec.insert("podCIDR".into(), cidrs[0].clone().into());
+    if !cidrs.is_empty() {
+        spec.insert("podCIDRs".into(), cidrs.to_vec().into());
+    }
+    serde_json::json!({ "spec": spec })
 }
 
 /// A node's pod CIDRs: `spec.podCIDRs`, falling back to the legacy singular
@@ -801,21 +822,14 @@ impl<S: Storage + 'static> RangeAllocator<S> {
 
     /// Sets `spec.podCIDR`/`podCIDRs` on the node (upstream
     /// `nodeutil.PatchNodeCIDRs`, `component-helpers/node/util/cidr.go:40`).
-    /// Rusternetes storage has no merge-patch verb, so this is a fresh get
-    /// followed by an update of just those two spec fields.
+    /// Sends the same strategic-merge patch body upstream builds
+    /// (`nodeForCIDRMergePatch`, `cidr.go:29-38`: `{"spec":{"podCIDR":c[0],
+    /// "podCIDRs":c}}`, `podCIDRs` omitempty) through
+    /// [`Storage::patch_strategic_merge`] (a real PATCH in API mode).
     async fn patch_node_cidrs(&self, node_name: &str, cidrs: &[String]) -> Result<(), Error> {
         let key = build_key("nodes", None, node_name);
-        let mut node: Node = self.storage.get(&key).await?;
-        let spec = node.spec.get_or_insert(NodeSpec {
-            pod_cidr: None,
-            pod_cidrs: None,
-            provider_id: None,
-            unschedulable: None,
-            taints: None,
-        });
-        spec.pod_cidr = Some(cidrs[0].clone());
-        spec.pod_cidrs = Some(cidrs.to_vec());
-        self.storage.update(&key, &node).await?;
+        let patch = node_cidr_merge_patch(cidrs);
+        let _: Node = self.storage.patch_strategic_merge(&key, &patch).await?;
         Ok(())
     }
 
@@ -1003,6 +1017,35 @@ mod tests {
     use rusternetes_storage::memory::MemoryStorage;
     use rusternetes_storage::{build_key, build_prefix};
     use std::collections::HashSet;
+
+    /// The patch body is upstream's `nodeForCIDRMergePatch`
+    /// (`cidr.go:29-38`), and applying it leaves unrelated spec/metadata alone.
+    #[tokio::test]
+    async fn patch_node_cidrs_sends_only_the_cidr_delta() {
+        assert_eq!(
+            node_cidr_merge_patch(&["10.0.0.0/24".to_string()]),
+            serde_json::json!({"spec": {"podCIDR": "10.0.0.0/24", "podCIDRs": ["10.0.0.0/24"]}})
+        );
+        let storage = Arc::new(MemoryStorage::new());
+        let key = build_key("nodes", None, "n1");
+        let _: serde_json::Value = storage
+            .create(
+                &key,
+                &serde_json::json!({"apiVersion": "v1", "kind": "Node",
+                    "metadata": {"name": "n1", "labels": {"x": "y"}},
+                    "spec": {"unschedulable": true}}),
+            )
+            .await
+            .unwrap();
+        let patched: Node = storage
+            .patch_strategic_merge(&key, &node_cidr_merge_patch(&["10.0.0.0/24".to_string()]))
+            .await
+            .unwrap();
+        let spec = patched.spec.unwrap();
+        assert_eq!(spec.pod_cidr.as_deref(), Some("10.0.0.0/24"));
+        assert_eq!(spec.unschedulable, Some(true));
+        assert_eq!(patched.metadata.labels.unwrap()["x"], "y");
+    }
 
     fn ipn(s: &str) -> IpNet {
         s.parse::<IpNet>().unwrap().trunc()

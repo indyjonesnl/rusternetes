@@ -1123,7 +1123,7 @@ fn rc_owner_names(serialised_pod: &str) -> Vec<String> {
 /// api-server emits (crates/middleware/src/lib.rs, added in #1849). Both
 /// spellings are accepted so this keeps working if the cause is ever surfaced
 /// structurally.
-fn is_namespace_terminating_rejection(err: &rusternetes_common::Error) -> bool {
+pub(crate) fn is_namespace_terminating_rejection(err: &rusternetes_common::Error) -> bool {
     let rusternetes_common::Error::Forbidden(message) = err else {
         return false;
     };

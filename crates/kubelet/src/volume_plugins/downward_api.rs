@@ -95,8 +95,6 @@ impl Mounter for DownwardApiMounter {
             .expect("checked by can_support");
 
         let volume_dir = &self.path;
-        std::fs::create_dir_all(volume_dir)
-            .context("Failed to create DownwardAPI volume directory")?;
 
         // Spec defaultMode, or 0644 (the API default; see `collect_data`).
         let da_default_mode = downward_api.default_mode.unwrap_or(0o644);
@@ -114,23 +112,29 @@ impl Mounter for DownwardApiMounter {
         // `volumeutil.NewAtomicWriter(dir, ctx).Write(data, setPerms)`
         // (downwardapi.go SetUpAt): `..data` symlink swap, no-op when the
         // content is unchanged, so periodic re-SetUp is inert.
-        crate::atomic_writer::write_projected_payload(std::path::Path::new(volume_dir), &payload)
-            .with_context(|| {
-            format!(
+        //
+        // `wrapped.SetUpAt` (downwardapi.go:186): the wrapped emptyDir's
+        // `setupDir` creates the root at 0777. Its fsGroup `setPerms`
+        // (`:217-222`) is not ported (#2323 follow-up).
+        crate::volume_plugins::empty_dir::setup_dir(volume_dir)
+            .context("Failed to create DownwardAPI volume directory")?;
+
+        // `defer` at downwardapi.go:195-208: when the AtomicWriter fails after
+        // the wrapped SetUpAt, `unmounter.TearDown()` runs and emptyDir
+        // `TearDownAt` removes the volume directory (same as configMap).
+        if let Err(e) = crate::atomic_writer::write_projected_payload(
+            std::path::Path::new(volume_dir),
+            &payload,
+        ) {
+            if let Err(td) = std::fs::remove_dir_all(volume_dir) {
+                tracing::error!("Error tearing down volume {}: {}", self.volume.name, td);
+            }
+            return Err(anyhow::Error::new(e).context(format!(
                 "failed to project DownwardAPI volume {} for pod {}/{}",
                 self.volume.name,
                 self.pod.metadata.namespace.as_deref().unwrap_or(""),
                 self.pod.metadata.name
-            )
-        })?;
-
-        // Directory permissions: defaultMode plus traverse bits, applied after
-        // the payload is written so restrictive modes cannot block the write.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let da_dir_mode = da_default_mode as u32 | 0o111;
-            std::fs::set_permissions(volume_dir, std::fs::Permissions::from_mode(da_dir_mode))?;
+            )));
         }
 
         info!(
@@ -182,7 +186,11 @@ pub(crate) fn collect_data(
         }
         data.insert(
             clean_path(&item.path),
-            crate::atomic_writer::FileProjection { data: bytes, mode },
+            crate::atomic_writer::FileProjection {
+                fs_user: None,
+                data: bytes,
+                mode,
+            },
         );
     }
     if errlist.is_empty() {
@@ -370,5 +378,163 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o400);
+    }
+
+    fn read(dir: &std::path::Path, f: &str) -> String {
+        std::fs::read_to_string(dir.join(f)).unwrap()
+    }
+
+    // downwardapi_test.go TestDownwardAPI test_labels/test_annotations:
+    // `fieldpath.FormatMap` — sorted `k="v"` lines, value `%q`-quoted.
+    #[tokio::test]
+    async fn set_up_projects_labels_and_annotations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = mounter_for(
+            tmp.path(),
+            json!([
+                {"path": "labels", "fieldRef": {"fieldPath": "metadata.labels"}},
+                {"path": "annotations", "fieldRef": {"fieldPath": "metadata.annotations"}}
+            ]),
+        );
+        m.pod.metadata.labels = Some(
+            [("key2", "value2"), ("key1", "value1")]
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .into(),
+        );
+        m.pod.metadata.annotations = Some(
+            [("a1", "value1"), ("multiline", "c\nb\na")]
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .into(),
+        );
+        m.set_up().await.unwrap();
+        assert_eq!(
+            read(tmp.path(), "labels"),
+            "key1=\"value1\"\nkey2=\"value2\""
+        );
+        assert_eq!(
+            read(tmp.path(), "annotations"),
+            "a1=\"value1\"\nmultiline=\"c\\nb\\na\""
+        );
+    }
+
+    // test_namespace
+    #[tokio::test]
+    async fn set_up_projects_namespace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = mounter_for(
+            tmp.path(),
+            json!([{"path": "ns_file", "fieldRef": {"fieldPath": "metadata.namespace"}}]),
+        );
+        m.set_up().await.unwrap();
+        assert_eq!(read(tmp.path(), "ns_file"), "ns");
+    }
+
+    // test_write_with_unix_path + two consecutive slashes
+    #[tokio::test]
+    async fn set_up_writes_nested_paths_and_cleans_double_slashes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = mounter_for(
+            tmp.path(),
+            json!([
+                {"path": "these/are/my/labels", "fieldRef": {"fieldPath": "metadata.labels"}},
+                {"path": "this//name", "fieldRef": {"fieldPath": "metadata.name"}}
+            ]),
+        );
+        m.set_up().await.unwrap();
+        assert_eq!(read(tmp.path(), "these/are/my/labels"), "key1=\"value1\"");
+        assert_eq!(read(tmp.path(), "this/name"), "p");
+    }
+
+    // test_write_twice_with_update: changed data moves the `..data` link.
+    #[tokio::test]
+    async fn re_set_up_with_changed_data_moves_the_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = mounter_for(
+            tmp.path(),
+            json!([{"path": "labels", "fieldRef": {"fieldPath": "metadata.labels"}}]),
+        );
+        m.set_up().await.unwrap();
+        let before = std::fs::read_link(tmp.path().join("..data")).unwrap();
+        m.pod
+            .metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert("key3".into(), "value3".into());
+        m.set_up().await.unwrap();
+        assert_ne!(
+            before,
+            std::fs::read_link(tmp.path().join("..data")).unwrap()
+        );
+        assert_eq!(
+            read(tmp.path(), "labels"),
+            "key1=\"value1\"\nkey3=\"value3\""
+        );
+    }
+
+    // test_default_mode: verifyMode 0644 on the file.
+    #[tokio::test]
+    async fn set_up_default_mode_is_0644() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let m = mounter_for(
+            tmp.path(),
+            json!([{"path": "f", "fieldRef": {"fieldPath": "metadata.name"}}]),
+        );
+        m.set_up().await.unwrap();
+        let mode = std::fs::metadata(tmp.path().join("f"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o644);
+    }
+
+    // The wrapped emptyDir's `setupDir` (empty_dir.go:447-486) leaves the
+    // volume root at `perm` 0777; `ChangePermissions` with a nil fsGroup does
+    // not touch it. The old `defaultMode|0111` is gone.
+    #[tokio::test]
+    async fn volume_root_is_the_wrapped_empty_dir_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("vol");
+        let m = mounter_for(
+            &dir,
+            json!([{"path": "f", "mode": 256, "fieldRef": {"fieldPath": "metadata.name"}}]),
+        );
+        m.set_up().await.unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o777);
+    }
+
+    // SetUpAt's deferred cleanup (downwardapi.go:195-208): a failed
+    // AtomicWriter tears the volume down (emptyDir TearDownAt removes it).
+    #[tokio::test]
+    async fn failed_write_tears_the_volume_down() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("vol");
+        std::fs::create_dir_all(dir.join("..data_tmp/x")).unwrap();
+        let m = mounter_for(
+            &dir,
+            json!([{"path": "f", "fieldRef": {"fieldPath": "metadata.name"}}]),
+        );
+        assert!(m.set_up().await.is_err());
+        assert!(
+            !dir.exists(),
+            "volume dir must be removed after a failed write"
+        );
+    }
+
+    // `CollectData` runs before `wrapped.SetUpAt` (downwardapi.go:179-189):
+    // a bad item must not even create the volume directory.
+    #[tokio::test]
+    async fn collect_failure_does_not_create_the_volume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("vol");
+        let m = mounter_for(
+            &dir,
+            json!([{"path": "f", "fieldRef": {"fieldPath": "metadata.bogus"}}]),
+        );
+        assert!(m.set_up().await.is_err());
+        assert!(!dir.exists());
     }
 }

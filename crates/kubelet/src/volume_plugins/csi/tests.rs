@@ -793,16 +793,278 @@ async fn orphaned_pod_csi_volume_is_unpublished() {
 
     // Live pod: untouched.
     let live: std::collections::HashSet<String> = ["uid-1".to_string()].into();
-    vm.unmount_orphaned_csi_volumes(&live).await;
+    vm.unmount_csi_volumes(&live, &std::collections::HashSet::new())
+        .await;
     assert!(f.fake.calls.lock().unwrap().unpublish.is_empty());
     assert!(mount.is_dir());
 
     // Orphaned pod: NodeUnpublishVolume with the saved handle + mount path.
-    vm.unmount_orphaned_csi_volumes(&std::collections::HashSet::new())
-        .await;
+    vm.unmount_csi_volumes(
+        &std::collections::HashSet::new(),
+        &std::collections::HashSet::new(),
+    )
+    .await;
     let calls = f.fake.calls.lock().unwrap();
     assert_eq!(calls.unpublish.len(), 1);
     assert_eq!(calls.unpublish[0].volume_id, "vol-1");
     assert_eq!(calls.unpublish[0].target_path, m.get_path());
     assert!(!mount.exists());
+}
+
+// ---- ConstructVolumeSpec / UnmountDevice (#2423, #2424) ------------------
+
+fn volume_manager(root: &str) -> crate::volumes::VolumeManager {
+    crate::volumes::VolumeManager::new(
+        root.to_string(),
+        None,
+        rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+    )
+}
+
+/// `TestPluginConstructVolumeSpec` (`csi_plugin_test.go:319-434`): the spec
+/// rebuilt from `vol_data.json` carries the persisted PV name, driver and
+/// handle.
+#[tokio::test]
+async fn construct_volume_spec_rebuilds_a_persistent_spec() {
+    let f = fx("construct", &[], Some(json!({"attachRequired": false}))).await;
+    let p = pv(&f.driver, json!({}));
+    let v = claim_volume();
+    let spec = Spec {
+        volume: &v,
+        persistent_volume: Some(&p),
+    };
+    let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
+    m.set_up().await.unwrap();
+    let volume_dir = std::path::PathBuf::from(m.get_path())
+        .parent()
+        .unwrap()
+        .to_path_buf();
+
+    let rec = f.plugin.construct_volume_spec(&volume_dir).unwrap();
+    let rebuilt = rec.persistent_volume.expect("a PV spec");
+    let csi = rebuilt.spec.csi.as_ref().expect("a CSI source");
+    assert_eq!(csi.driver, f.driver);
+    assert_eq!(csi.volume_handle.as_deref(), Some("vol-1"));
+    assert_eq!(rebuilt.metadata.name, "pv1");
+    assert_eq!(rec.volume.name, "pv1");
+}
+
+/// `TestPluginConstructVolumeSpecWithInline` (`csi_plugin_test.go:436`): an
+/// ephemeral volume is rebuilt as a `CSIVolumeSource`, not a PV.
+#[tokio::test]
+async fn construct_volume_spec_rebuilds_an_inline_spec() {
+    let f = fx("construct-inline", &[], None).await;
+    let dir = std::path::Path::new(&f.root).join("vol");
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = HashMap::from([
+        ("specVolID".to_string(), "inl".to_string()),
+        ("driverName".to_string(), f.driver.clone()),
+        ("volumeHandle".to_string(), "csi-abc".to_string()),
+        ("volumeLifecycleMode".to_string(), "Ephemeral".to_string()),
+    ]);
+    save_volume_data(&dir, &data).unwrap();
+    let rec = f.plugin.construct_volume_spec(&dir).unwrap();
+    assert!(rec.persistent_volume.is_none());
+    assert_eq!(rec.volume.name, "inl");
+    assert_eq!(rec.volume.csi.as_ref().unwrap().driver, f.driver);
+}
+
+#[tokio::test]
+async fn construct_volume_spec_fails_without_a_data_file() {
+    let f = fx("construct-none", &[], None).await;
+    assert!(f
+        .plugin
+        .construct_volume_spec(std::path::Path::new(&f.root))
+        .is_err());
+}
+
+/// Lay out a staged device (`<g>/globalmount` + `<g>/vol_data.json`) by hand.
+fn staged_dir_only(f: &Fx) -> std::path::PathBuf {
+    let device = std::path::Path::new(&f.root).join("g/globalmount");
+    std::fs::create_dir_all(&device).unwrap();
+    save_volume_data(
+        device.parent().unwrap(),
+        &HashMap::from([
+            ("driverName".to_string(), f.driver.clone()),
+            ("volumeHandle".to_string(), "vol-1".to_string()),
+        ]),
+    )
+    .unwrap();
+    device
+}
+
+/// `TestAttacherUnmountDevice`, "success, json file exists"
+/// (`csi_attacher_test.go:1490`): `NodeUnstageVolume(volID, deviceMountPath)`,
+/// then the global dir and json file are removed.
+#[tokio::test]
+async fn unmount_device_unstages_and_removes_the_global_dir() {
+    let f = fx(
+        "unmountdev",
+        &[Cap::StageUnstageVolume],
+        Some(json!({"attachRequired": false})),
+    )
+    .await;
+    let device = staged_dir_only(&f);
+    f.plugin.unmount_device(&device).await.unwrap();
+    let calls = f.fake.calls.lock().unwrap();
+    assert_eq!(calls.unstage.len(), 1);
+    assert_eq!(calls.unstage[0].volume_id, "vol-1");
+    assert_eq!(
+        calls.unstage[0].staging_target_path,
+        device.to_string_lossy()
+    );
+    assert!(!device.exists());
+    assert!(!device.parent().unwrap().exists());
+}
+
+/// "stage_unstage not set ... unmount device is skipped" (`:1497`): no RPC,
+/// but the global dir and json file are still removed.
+#[tokio::test]
+async fn unmount_device_without_stage_capability_only_cleans_up() {
+    let f = fx("unmountdev-nocap", &[], None).await;
+    let device = staged_dir_only(&f);
+    f.plugin.unmount_device(&device).await.unwrap();
+    assert!(f.fake.calls.lock().unwrap().unstage.is_empty());
+    assert!(!device.parent().unwrap().exists());
+}
+
+/// "success: json file doesn't exist, unmount device is skipped" (`:1503`).
+#[tokio::test]
+async fn unmount_device_skips_when_the_data_file_is_missing() {
+    let f = fx("unmountdev-nofile", &[Cap::StageUnstageVolume], None).await;
+    let device = std::path::Path::new(&f.root).join("g/globalmount");
+    std::fs::create_dir_all(&device).unwrap();
+    f.plugin.unmount_device(&device).await.unwrap();
+    assert!(f.fake.calls.lock().unwrap().unstage.is_empty());
+}
+
+/// "fail: invalid json" (`:1511`).
+#[tokio::test]
+async fn unmount_device_fails_on_invalid_json() {
+    let f = fx("unmountdev-badjson", &[Cap::StageUnstageVolume], None).await;
+    let device = std::path::Path::new(&f.root).join("g/globalmount");
+    std::fs::create_dir_all(&device).unwrap();
+    std::fs::write(
+        device.parent().unwrap().join("vol_data.json"),
+        "{\"driverName\"}}",
+    )
+    .unwrap();
+    assert!(f.plugin.unmount_device(&device).await.is_err());
+}
+
+/// "fail with transient error, json file exists but client not found" (`:1519`).
+#[tokio::test]
+async fn unmount_device_with_an_unregistered_driver_is_transient() {
+    let f = fx("unmountdev-nodriver", &[Cap::StageUnstageVolume], None).await;
+    let device = std::path::Path::new(&f.root).join("g/globalmount");
+    std::fs::create_dir_all(&device).unwrap();
+    std::fs::write(
+        device.parent().unwrap().join("vol_data.json"),
+        r#"{"driverName":"unknown.example.com","volumeHandle":"h"}"#,
+    )
+    .unwrap();
+    let e = f.plugin.unmount_device(&device).await.unwrap_err();
+    assert!(
+        matches!(e.downcast_ref::<CsiError>(), Some(CsiError::Transient(_))),
+        "{e:#}"
+    );
+}
+
+/// Pod teardown mechanism: a volume is unpublished first, and the shared staged
+/// device is unstaged only once NO pod still holds it (`unmountDetachDevices`,
+/// `reconciler_common.go:273-315`: `GetUnmountedVolumes` + `!DSW.VolumeExists`).
+#[tokio::test]
+async fn staged_device_is_unstaged_only_after_the_last_pod_unpublishes() {
+    let f = fx(
+        "refcount",
+        &[Cap::StageUnstageVolume],
+        Some(json!({"attachRequired": false})),
+    )
+    .await;
+    let p = pv(&f.driver, json!({}));
+    let v = claim_volume();
+    let spec = Spec {
+        volume: &v,
+        persistent_volume: Some(&p),
+    };
+    let mut pod_b = pod();
+    pod_b.metadata.uid = "uid-2".to_string();
+    let m1 = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
+    m1.set_up().await.unwrap();
+    let m2 = f.plugin.new_mounter(&spec, &pod_b).await.unwrap();
+    m2.set_up().await.unwrap();
+    let vm = volume_manager(&f.root);
+
+    // Pod 2 is live, pod 1 gone: unpublish pod 1 only; the device stays staged.
+    let none = std::collections::HashSet::new();
+    let live2: std::collections::HashSet<String> = ["uid-2".to_string()].into();
+    vm.unmount_csi_volumes(&live2, &none).await;
+    vm.unmount_unused_csi_devices(&[]).await;
+    assert_eq!(f.fake.calls.lock().unwrap().unpublish.len(), 1);
+    assert!(
+        f.fake.calls.lock().unwrap().unstage.is_empty(),
+        "pod 2 still holds the device"
+    );
+
+    // Both gone: unpublish pod 2, then unstage exactly once.
+    vm.unmount_csi_volumes(&none, &none).await;
+    vm.unmount_unused_csi_devices(&[]).await;
+    let calls = f.fake.calls.lock().unwrap();
+    assert_eq!(calls.unpublish.len(), 2);
+    assert_eq!(calls.unstage.len(), 1);
+}
+
+/// A live pod that still wants the volume (desired state of the world) keeps
+/// its device staged even before it has published (`!DSW.VolumeExists`).
+#[tokio::test]
+async fn desired_volume_keeps_its_device_staged() {
+    let f = fx(
+        "desired",
+        &[Cap::StageUnstageVolume],
+        Some(json!({"attachRequired": false})),
+    )
+    .await;
+    let device = staged_dir_only(&f);
+    let vm = volume_manager(&f.root);
+    // The plugin dir is under the kubelet root; move the hand-made layout there.
+    let target = std::path::Path::new(&f.root)
+        .join("plugins/kubernetes.io/csi")
+        .join(&f.driver)
+        .join("abc");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::rename(device.parent().unwrap(), &target).unwrap();
+
+    let desired = std::collections::HashSet::from([(f.driver.clone(), "vol-1".to_string())]);
+    vm.unmount_csi_devices_not_in(&desired).await;
+    assert!(f.fake.calls.lock().unwrap().unstage.is_empty());
+    assert!(target.exists());
+
+    // Once nothing wants it, it is unstaged.
+    vm.unmount_csi_devices_not_in(&std::collections::HashSet::new())
+        .await;
+    assert_eq!(f.fake.calls.lock().unwrap().unstage.len(), 1);
+    assert!(!target.exists());
+}
+
+/// #2424: a terminated pod that is still present in the API has its volumes
+/// unmounted too (`findAndRemoveDeletedPods` + `ShouldPodRuntimeBeRemoved`,
+/// `pod_workers.go:698`); a running live pod's are left alone.
+#[tokio::test]
+async fn terminated_live_pod_csi_volume_is_unpublished() {
+    let f = fx("terminated", &[], Some(json!({"attachRequired": false}))).await;
+    let p = pv(&f.driver, json!({}));
+    let v = claim_volume();
+    let spec = Spec {
+        volume: &v,
+        persistent_volume: Some(&p),
+    };
+    let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
+    m.set_up().await.unwrap();
+    let vm = volume_manager(&f.root);
+    let live: std::collections::HashSet<String> = ["uid-1".to_string()].into();
+    vm.unmount_csi_volumes(&live, &std::collections::HashSet::new())
+        .await;
+    assert!(f.fake.calls.lock().unwrap().unpublish.is_empty());
+    vm.unmount_csi_volumes(&live, &live).await;
+    assert_eq!(f.fake.calls.lock().unwrap().unpublish.len(), 1);
 }

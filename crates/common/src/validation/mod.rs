@@ -9,6 +9,7 @@ pub mod apiservice;
 pub mod apps;
 pub mod authorization;
 pub mod certificatesigningrequest;
+pub mod clustertrustbundle;
 pub mod configmap;
 pub mod controllerrevision;
 pub mod crd;

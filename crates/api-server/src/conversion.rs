@@ -342,7 +342,10 @@ pub async fn convert_custom_resources<S: Storage>(
         .unwrap_or(rusternetes_common::resources::ConversionStrategyType::None);
 
     match strategy {
-        rusternetes_common::resources::ConversionStrategyType::None => {
+        rusternetes_common::resources::ConversionStrategyType::None
+        | rusternetes_common::resources::ConversionStrategyType::Unknown(_) => {
+            // An unknown strategy is refused at admission (validateEnumStrings,
+            // validation.go:617); treat any stored one like None.
             // No conversion - just update the API version on objects that need it.
             let target_api_version = format!("{}/{}", crd.spec.group, target_version);
             Ok(resources

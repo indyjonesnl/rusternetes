@@ -153,6 +153,28 @@ pub struct PodStats {
 /// Upstream default for `--eviction-pressure-transition-period`.
 pub const DEFAULT_TRANSITION_PERIOD: Duration = Duration::from_secs(5 * 60);
 
+/// Resolve the eviction pressure transition period.
+///
+/// Upstream feeds `kubeCfg.EvictionPressureTransitionPeriod.Duration` into
+/// `eviction.Config.PressureTransitionPeriod` (pkg/kubelet/kubelet.go:527).
+/// The config-file value is the base (default 5m when unset/zero,
+/// pkg/kubelet/apis/config/v1beta1/defaults.go:236-237) and an explicit
+/// `--eviction-pressure-transition-period` flag wins over it
+/// (cmd/kubelet/app/server.go `kubeletConfigFlagPrecedence`).
+pub fn resolve_transition_period(
+    flag: Option<&str>,
+    config: Option<&crate::config::KubeletConfiguration>,
+) -> anyhow::Result<Duration> {
+    if let Some(raw) = flag {
+        return parse_duration(raw).ok_or_else(|| {
+            anyhow::anyhow!("invalid --eviction-pressure-transition-period: '{}'", raw)
+        });
+    }
+    Ok(config
+        .map(|c| c.effective_eviction_pressure_transition_period())
+        .unwrap_or(DEFAULT_TRANSITION_PERIOD))
+}
+
 /// Minimum observation window before a hard threshold actually trips eviction.
 /// Mirrors upstream `thresholdsMetGracePeriod` for hard thresholds (which is 0
 /// by default but is gated by `thresholdsFirstObservedAt`). We use a small
@@ -1215,6 +1237,39 @@ mod tests {
         assert!(parse_eviction_flag("memory.available<").is_err());
         // Unsupported '>' op (upstream only allows '<').
         assert!(parse_eviction_flag("memory.available>100Mi").is_err());
+    }
+
+    #[test]
+    fn transition_period_reaches_consumer_from_config_and_flag_wins() {
+        use crate::config::KubeletConfiguration;
+        let cfg = KubeletConfiguration {
+            eviction_pressure_transition_period: Some(Duration::from_secs(45)),
+            ..Default::default()
+        };
+        // Config value reaches the EvictionManager's transition_period.
+        let p = resolve_transition_period(None, Some(&cfg)).unwrap();
+        assert_eq!(p, Duration::from_secs(45));
+        let m = EvictionManager::with_config(Vec::new(), p);
+        assert_eq!(m.transition_period, Duration::from_secs(45));
+        // Flag takes precedence over the file (kubeletConfigFlagPrecedence).
+        assert_eq!(
+            resolve_transition_period(Some("2m"), Some(&cfg)).unwrap(),
+            Duration::from_secs(120)
+        );
+        // Unset / zero / no file => upstream 5m default.
+        assert_eq!(
+            resolve_transition_period(None, None).unwrap(),
+            Duration::from_secs(300)
+        );
+        let zero = KubeletConfiguration {
+            eviction_pressure_transition_period: Some(Duration::ZERO),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_transition_period(None, Some(&zero)).unwrap(),
+            Duration::from_secs(300)
+        );
+        assert!(resolve_transition_period(Some("bogus"), None).is_err());
     }
 
     #[test]

@@ -9,11 +9,14 @@
 //! `certificates/subjectrestriction` (`Validate`, :64-93) is
 //! [`subject_restriction_error`].
 //!
-//! Not ported: `certificates/ctbattest` (no ClusterTrustBundle resource here).
+//! `certificates/ctbattest` (`Validate`, :86-122) is
+//! [`validate_cluster_trust_bundle_attest`].
 
 use rusternetes_common::auth::UserInfo;
 use rusternetes_common::authz::{Decision, RequestAttributes};
-use rusternetes_common::resources::{CertificateSigningRequest, CertificateSigningRequestStatus};
+use rusternetes_common::resources::{
+    CertificateSigningRequest, CertificateSigningRequestStatus, ClusterTrustBundle,
+};
 
 use crate::state::ApiServerState;
 
@@ -100,6 +103,46 @@ pub async fn validate_update(
             }
         }
         _ => {}
+    }
+    None
+}
+
+/// `ctbattest.Plugin.Validate` (plugin/pkg/admission/certificates/ctbattest/
+/// admission.go:86-122), registered for CREATE and UPDATE: setting
+/// `spec.signerName` on a ClusterTrustBundle needs the `attest` verb on the
+/// synthetic `signers` resource named by the signer (or `<domain>/*`).
+///
+/// `old` is the stored object of an UPDATE. Returns the error text to wrap in
+/// `admission.NewForbidden`.
+pub async fn validate_cluster_trust_bundle_attest(
+    state: &ApiServerState,
+    user: &UserInfo,
+    new: &ClusterTrustBundle,
+    old: Option<&ClusterTrustBundle>,
+) -> Option<String> {
+    // `p.enabled` (:62-65, :80-82): the plugin is inert with the gate off.
+    if !rusternetes_common::feature_gates::enabled(
+        rusternetes_common::feature_gates::Feature::ClusterTrustBundle,
+    ) {
+        return None;
+    }
+    // Validate against the *new* object: updates to signer name are rejected
+    // during validation (:97-98). No signer, no attest check (:100-103).
+    let signer = &new.spec.signer_name;
+    if signer.is_empty() {
+        return None;
+    }
+    // Skip when the semantics are unchanged, to support storage migration
+    // and GC workflows (:105-108).
+    if old.is_some_and(|old| {
+        crate::registry::rbac::escalation_check::is_only_mutating_gc_fields(new, old)
+    }) {
+        return None;
+    }
+    if !is_authorized_for_signer_name(state, user, "attest", signer).await {
+        return Some(format!(
+            "user not permitted to attest for signerName \"{signer}\""
+        ));
     }
     None
 }

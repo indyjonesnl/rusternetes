@@ -265,3 +265,119 @@ async fn cronjob_runs_a_worker_pool() {
     .await;
     assert!(peak > 1, "cronjob run() peaked at {peak}");
 }
+
+#[tokio::test]
+async fn servicecidr_runs_a_worker_pool() {
+    let peak = peak_concurrency(
+        "servicecidrs",
+        12,
+        |i| {
+            json!({
+                "apiVersion": "networking.k8s.io/v1", "kind": "ServiceCIDR",
+                "metadata": meta(i),
+                "spec": {"cidrs": [format!("10.{i}.0.0/16")]}
+            })
+        },
+        |s| async move {
+            let _ = Arc::new(crate::controllers::servicecidr::ServiceCIDRController::new(
+                s,
+            ))
+            .run()
+            .await;
+        },
+    )
+    .await;
+    assert!(peak > 1, "servicecidr run() peaked at {peak}");
+}
+
+#[tokio::test]
+async fn apiservice_runs_a_worker_pool() {
+    let peak = peak_concurrency(
+        "apiservices",
+        12,
+        |i| {
+            json!({
+                "apiVersion": "apiregistration.k8s.io/v1", "kind": "APIService",
+                "metadata": meta(i),
+                "spec": {"group": "g", "version": "v1", "groupPriorityMinimum": 1, "versionPriority": 1}
+            })
+        },
+        |s| async move {
+            let _ = Arc::new(
+                crate::controllers::apiservice::APIServiceAvailabilityController::new(s),
+            )
+            .run()
+            .await;
+        },
+    )
+    .await;
+    assert!(peak > 1, "apiservice run() peaked at {peak}");
+}
+
+#[tokio::test]
+async fn volume_expansion_runs_a_worker_pool() {
+    let peak = peak_concurrency(
+        "persistentvolumeclaims",
+        12,
+        |i| {
+            json!({
+                "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                "metadata": meta(i),
+                "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "1Gi"}}}
+            })
+        },
+        |s| async move {
+            let _ = Arc::new(
+                crate::controllers::volume_expansion::VolumeExpansionController::new(s),
+            )
+            .run()
+            .await;
+        },
+    )
+    .await;
+    assert!(peak > 1, "volume_expansion run() peaked at {peak}");
+}
+
+#[tokio::test]
+async fn resourceclaim_runs_a_worker_pool() {
+    let peak = peak_concurrency(
+        "resourceclaims",
+        12,
+        |i| {
+            json!({
+                "apiVersion": "resource.k8s.io/v1", "kind": "ResourceClaim",
+                "metadata": meta(i),
+                "spec": {}
+            })
+        },
+        |s| async move {
+            let _ = Arc::new(crate::controllers::resourceclaim::ResourceClaimController::new(s))
+                .run()
+                .await;
+        },
+    )
+    .await;
+    assert!(peak > 1, "resourceclaim run() peaked at {peak}");
+}
+
+#[tokio::test]
+async fn node_runs_a_worker_pool() {
+    let peak = peak_concurrency(
+        "nodes",
+        12,
+        |i| {
+            json!({
+                "apiVersion": "v1", "kind": "Node",
+                "metadata": meta(i),
+                "spec": {}
+            })
+        },
+        |s| async move {
+            let _ = Arc::new(crate::controllers::node::NodeController::new(s))
+                .run()
+                .await;
+        },
+    )
+    .await;
+    assert!(peak > 1, "node run() peaked at {peak}");
+}

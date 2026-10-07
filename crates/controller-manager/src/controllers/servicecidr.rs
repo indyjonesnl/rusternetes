@@ -25,6 +25,7 @@
 //! apiserver in the loop, so the finalizer removal and the delete happen
 //! together here (same shape as `replicationcontroller.rs`'s orphan path).
 
+use crate::controllers::worker_pool::spawn_workers;
 use anyhow::Result;
 use chrono::Utc;
 use futures::StreamExt;
@@ -32,7 +33,7 @@ use ipnet::IpNet;
 use rusternetes_common::resources::{
     IPAddress, ServiceCIDR, ServiceCIDRCondition, ServiceCIDRStatus,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_key, build_prefix, Storage, WatchEvent, WorkQueue};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -80,6 +81,62 @@ pub const LABEL_MANAGED_BY: &str = "ipaddress.kubernetes.io/managed-by";
 /// IPAddress managed by something else is not the service allocator's to
 /// protect (`containingServiceCIDRs`, `servicecidrs_controller.go:234-238`).
 pub const IP_ALLOCATOR_CONTROLLER_NAME: &str = "ipallocator.k8s.io";
+
+/// Workers draining the queue: `scc.Run(ctx, 5)`
+/// (cmd/kube-controller-manager/app/networking.go:55).
+const CONCURRENT_SERVICE_CIDR_SYNCS: usize = 5;
+
+/// Upstream `maxRetries` (`servicecidrs_controller.go:58`): requeues before a
+/// key is dropped.
+const MAX_RETRIES: u32 = 15;
+
+/// Name of the ServiceCIDR a watch event is about (cluster-scoped key).
+fn name_from_event(ev: &WatchEvent) -> String {
+    let key = match ev {
+        WatchEvent::Added(k, _) | WatchEvent::Modified(k, _) | WatchEvent::Deleted(k, _) => k,
+    };
+    key.rsplit('/').next().unwrap_or(key).to_string()
+}
+
+/// Upstream `overlappingServiceCIDRs`: names of the ServiceCIDRs whose
+/// prefixes overlap one of `cidr`'s (`servicecidr.OverlapsPrefix`,
+/// `pkg/api/servicecidr/servicecidr.go`).
+pub fn overlapping_service_cidrs(all: &[ServiceCIDR], cidr: &ServiceCIDR) -> Vec<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for c in spec_cidrs(cidr) {
+        let Ok(prefix) = c.parse::<IpNet>() else {
+            continue;
+        };
+        for sc in all {
+            if spec_cidrs(sc)
+                .iter()
+                .filter_map(|p| p.parse::<IpNet>().ok())
+                .any(|p| p.contains(&prefix) || prefix.contains(&p))
+            {
+                out.insert(sc.metadata.name.clone());
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// Upstream `containingServiceCIDRs`: only IPAddresses managed by the
+/// apiserver allocator count.
+pub fn containing_service_cidrs(all: &[ServiceCIDR], ip: &IPAddress) -> Vec<String> {
+    if label(&ip.metadata, LABEL_MANAGED_BY) != Some(IP_ALLOCATOR_CONTROLLER_NAME) {
+        return Vec::new();
+    }
+    let Ok(addr) = ip.metadata.name.parse::<IpAddr>() else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = contains_address(all, &addr)
+        .into_iter()
+        .map(|sc| sc.metadata.name.clone())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
 
 /// Upstream `PrefixContainsIP` (`pkg/api/servicecidr/servicecidr.go:96-110`).
 ///
@@ -231,23 +288,28 @@ impl<S: Storage + 'static> ServiceCIDRController<S> {
         self
     }
 
-    /// Watch-driven run loop with a periodic resync fallback, matching the
-    /// other controllers in this crate. Upstream is informer + workqueue over
-    /// both ServiceCIDRs and IPAddresses; both are watched here for the same
-    /// reason — an IPAddress appearing or going away can block or unblock a
-    /// pending ServiceCIDR deletion (`addIPAddress` / `deleteIPAddress`,
-    /// `servicecidrs_controller.go:184-212`).
+    /// Upstream `Run(ctx, workers)` (`servicecidrs_controller.go:Run`):
+    /// `workers` goroutines drain ONE rate-limited queue of ServiceCIDR names,
+    /// fed by the informer handlers `addServiceCIDR` / `updateServiceCIDR` /
+    /// `deleteServiceCIDR` / `addIPAddress` / `deleteIPAddress`.
+    /// The pool is [`spawn_workers`]; the queue de-duplicates per key and never
+    /// hands one name to two workers (see `WorkQueue::get`).
     ///
-    /// The resync also drives the deletion grace period: a ServiceCIDR still
-    /// inside its grace window is left alone and picked up on a later pass,
-    /// which is this loop's equivalent of upstream's `queue.AddAfter`.
+    /// Deviation: a periodic resync re-enqueues everything, as the other
+    /// controllers in this crate do, to heal a missed watch event.
     pub async fn run(self: Arc<Self>) -> Result<()> {
         info!("Starting ServiceCIDR controller");
 
-        loop {
-            if let Err(e) = self.reconcile_all().await {
-                error!("ServiceCIDR reconcile failed: {}", e);
+        let queue = WorkQueue::new();
+        spawn_workers(CONCURRENT_SERVICE_CIDR_SYNCS, &queue, |worker_queue| {
+            let worker_self = Arc::clone(&self);
+            async move {
+                worker_self.worker(worker_queue).await;
             }
+        });
+
+        loop {
+            self.enqueue_all(&queue).await;
 
             let cidr_prefix = build_prefix("servicecidrs", None);
             let ip_prefix = build_prefix("ipaddresses", None);
@@ -266,34 +328,129 @@ impl<S: Storage + 'static> ServiceCIDRController<S> {
                 }
             };
 
-            // The grace period is shorter than the resync, so poll at least
-            // that often while a deletion is pending.
-            let tick = self.interval.min(self.deletion_grace_period);
-            let mut resync = time::interval(tick);
+            let mut resync = time::interval(self.interval);
             resync.tick().await; // drop the immediate first tick
 
             loop {
-                let reconcile = tokio::select! {
+                tokio::select! {
                     ev = cidr_watch.next() => match ev {
-                        Some(Ok(_)) => true,
+                        Some(Ok(ev)) => self.on_service_cidr_event(&queue, &ev).await,
                         // Stream ended/errored -> reconnect via the outer loop.
                         _ => break,
                     },
                     ev = ip_watch.next() => match ev {
-                        Some(Ok(_)) => true,
+                        Some(Ok(ev)) => self.on_ip_address_event(&queue, &ev).await,
                         _ => break,
                     },
-                    _ = resync.tick() => true,
-                };
-                if reconcile {
-                    if let Err(e) = self.reconcile_all().await {
-                        error!("ServiceCIDR reconcile failed: {}", e);
-                    }
+                    _ = resync.tick() => self.enqueue_all(&queue).await,
                 }
             }
         }
     }
 
+    /// Upstream `addServiceCIDR` (enqueue the CIDR and every overlapping one),
+    /// `updateServiceCIDR` and `deleteServiceCIDR` (enqueue just the key).
+    async fn on_service_cidr_event(&self, queue: &WorkQueue, ev: &WatchEvent) {
+        let name = name_from_event(ev);
+        queue.add(name).await;
+        if let WatchEvent::Added(_, value) = ev {
+            if let Ok(cidr) = serde_json::from_str::<ServiceCIDR>(value) {
+                let all: Vec<ServiceCIDR> = self
+                    .storage
+                    .list(&build_prefix("servicecidrs", None))
+                    .await
+                    .unwrap_or_default();
+                for n in overlapping_service_cidrs(&all, &cidr) {
+                    queue.add(n).await;
+                }
+            }
+        }
+    }
+
+    /// Upstream `addIPAddress` / `deleteIPAddress`: an IPAddress appearing or
+    /// going away enqueues the ServiceCIDRs containing it. Updates are not
+    /// handled upstream (the IPAddress handler has no `UpdateFunc`).
+    async fn on_ip_address_event(&self, queue: &WorkQueue, ev: &WatchEvent) {
+        let value = match ev {
+            WatchEvent::Added(_, v) | WatchEvent::Deleted(_, v) => v,
+            WatchEvent::Modified(..) => return,
+        };
+        let Ok(ip) = serde_json::from_str::<IPAddress>(value) else {
+            return;
+        };
+        let all: Vec<ServiceCIDR> = self
+            .storage
+            .list(&build_prefix("servicecidrs", None))
+            .await
+            .unwrap_or_default();
+        for n in containing_service_cidrs(&all, &ip) {
+            queue.add(n).await;
+        }
+    }
+
+    async fn enqueue_all(&self, queue: &WorkQueue) {
+        match self
+            .storage
+            .list::<ServiceCIDR>(&build_prefix("servicecidrs", None))
+            .await
+        {
+            Ok(items) => {
+                for item in &items {
+                    queue.add(item.metadata.name.clone()).await;
+                }
+            }
+            Err(e) => error!("Failed to list servicecidrs for enqueue: {}", e),
+        }
+    }
+
+    /// Upstream `worker` / `processNext`: sync, `Forget` on success,
+    /// `AddRateLimited` while `NumRequeues < maxRetries`, otherwise drop the key.
+    async fn worker(&self, queue: WorkQueue) {
+        while let Some(key) = queue.get().await {
+            match self.sync(&key, &queue).await {
+                Ok(()) => queue.forget(&key).await,
+                Err(e) => {
+                    if queue.num_requeues(&key).await < MAX_RETRIES {
+                        debug!("Error syncing ServiceCIDR {key}, retrying: {e}");
+                        queue.requeue_rate_limited(key.clone()).await;
+                    } else {
+                        warn!("Dropping ServiceCIDR {key} out of the queue: {e}");
+                        queue.forget(&key).await;
+                    }
+                }
+            }
+            queue.done(&key).await;
+        }
+    }
+
+    /// Upstream `sync` entry: a key whose ServiceCIDR no longer exists is a
+    /// no-op; `timeUntilDeleted` becomes `queue.AddAfter`.
+    async fn sync(&self, name: &str, queue: &WorkQueue) -> Result<()> {
+        let Ok(cidr) = self
+            .storage
+            .get::<ServiceCIDR>(&build_key("servicecidrs", None, name))
+            .await
+        else {
+            return Ok(());
+        };
+        let cidrs: Vec<ServiceCIDR> = self
+            .storage
+            .list(&build_prefix("servicecidrs", None))
+            .await?;
+        let ips: Vec<IPAddress> = self
+            .storage
+            .list(&build_prefix("ipaddresses", None))
+            .await
+            .unwrap_or_default();
+        if let Some(after) = self.reconcile_one(&cidr, &cidrs, &ips).await? {
+            queue.add_after(name.to_string(), after).await;
+        }
+        Ok(())
+    }
+
+    /// Sync every ServiceCIDR once, synchronously (tests; `run()` is queue
+    /// driven).
+    #[allow(dead_code)] // main.rs compiles this module too; only tests call it
     pub async fn reconcile_all(&self) -> Result<()> {
         let cidrs: Vec<ServiceCIDR> = self
             .storage
@@ -322,20 +479,20 @@ impl<S: Storage + 'static> ServiceCIDRController<S> {
         cidr: &ServiceCIDR,
         all: &[ServiceCIDR],
         ips: &[IPAddress],
-    ) -> Result<()> {
+    ) -> Result<Option<Duration>> {
         // Deleting ...
         if let Some(deleted_at) = cidr.metadata.deletion_timestamp {
             if !can_delete_cidr(cidr, all, ips) {
                 // Say why it cannot go: re-evaluated whenever a ServiceCIDR or
                 // IPAddress event may lift the block.
-                return self
-                    .update_condition_if_needed(
-                        cidr,
-                        "False",
-                        REASON_TERMINATING,
-                        TERMINATING_MESSAGE,
-                    )
-                    .await;
+                self.update_condition_if_needed(
+                    cidr,
+                    "False",
+                    REASON_TERMINATING,
+                    TERMINATING_MESSAGE,
+                )
+                .await?;
+                return Ok(None);
             }
 
             // Safe to remove — but only after the deletion has been visible
@@ -348,15 +505,18 @@ impl<S: Storage + 'static> ServiceCIDRController<S> {
                     "ServiceCIDR {} still within the deletion grace period",
                     cidr.metadata.name
                 );
-                return Ok(());
+                // `c.queue.AddAfter(key, timeUntilDeleted)`.
+                return Ok(Some((grace - elapsed).to_std().unwrap_or_default()));
             }
-            return self.remove_finalizer_if_needed(cidr).await;
+            self.remove_finalizer_if_needed(cidr).await?;
+            return Ok(None);
         }
 
         // Created or Updated: the ServiceCIDR must have a finalizer.
         self.add_finalizer_if_needed(cidr).await?;
         self.update_condition_if_needed(cidr, "True", "", READY_MESSAGE)
-            .await
+            .await?;
+        Ok(None)
     }
 
     /// Upstream `addServiceCIDRFinalizerIfNeeded` (`:418-441`).
@@ -506,6 +666,58 @@ mod tests {
             &prefix,
             &"2001:db8::ffff:ffff:ffff:ffff".parse().unwrap()
         ));
+    }
+
+    fn sc(name: &str, cidrs: &[&str]) -> ServiceCIDR {
+        ServiceCIDR::new(name, cidrs.iter().map(|c| c.to_string()).collect())
+    }
+
+    fn ip(addr: &str, managed_by: Option<&str>) -> IPAddress {
+        let mut ip = IPAddress::new(
+            addr,
+            rusternetes_common::resources::ParentReference {
+                group: None,
+                resource: "services".to_string(),
+                namespace: Some("default".to_string()),
+                name: "svc".to_string(),
+                uid: None,
+            },
+        );
+        if let Some(m) = managed_by {
+            ip.metadata
+                .labels
+                .get_or_insert_with(Default::default)
+                .insert(LABEL_MANAGED_BY.to_string(), m.to_string());
+        }
+        ip
+    }
+
+    /// Upstream `TestController_cidrToCidrs`: overlapping = contains or is
+    /// contained, unrelated ranges excluded.
+    #[test]
+    fn overlapping_includes_containing_and_contained_only() {
+        let all = vec![
+            sc("a", &["192.168.0.0/24"]),
+            sc("wide", &["192.168.0.0/16"]),
+            sc("narrow", &["192.168.0.128/25"]),
+            sc("unrelated", &["10.0.0.0/24"]),
+        ];
+        assert_eq!(
+            overlapping_service_cidrs(&all, &all[0]),
+            vec!["a", "narrow", "wide"]
+        );
+    }
+
+    /// Upstream `TestController_ipToCidrs`: only allocator-managed IPs count.
+    #[test]
+    fn containing_requires_allocator_label() {
+        let all = vec![sc("a", &["192.168.0.0/24"]), sc("b", &["10.0.0.0/24"])];
+        let managed = ip("192.168.0.23", Some(IP_ALLOCATOR_CONTROLLER_NAME));
+        assert_eq!(containing_service_cidrs(&all, &managed), vec!["a"]);
+        assert!(containing_service_cidrs(&all, &ip("192.168.0.23", None)).is_empty());
+        assert!(
+            containing_service_cidrs(&all, &ip("192.168.0.23", Some("someone-else"))).is_empty()
+        );
     }
 
     #[test]

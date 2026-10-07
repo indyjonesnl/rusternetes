@@ -195,6 +195,28 @@ pub trait Storage: Send + Sync {
         update_status_cas_via_update(self, key, value).await
     }
 
+    /// Apply a strategic-merge PATCH `patch` to the stored object and return
+    /// the result: the client-go `Nodes().Patch(ctx, name,
+    /// types.StrategicMergePatchType, ...)` verb that
+    /// `nodeutil.PatchNodeCIDRs` uses
+    /// (`staging/src/k8s.io/component-helpers/node/util/cidr.go:54`).
+    ///
+    /// A patch is a delta against the LIVE object, never a copy of the
+    /// caller's stale read. API-backed storage overrides this to send a real
+    /// `PATCH` with `Content-Type: application/strategic-merge-patch+json` so
+    /// the api-server applies it. Direct backends have no schema at this layer,
+    /// so the default re-reads, applies an RFC 7386 JSON merge (objects merge
+    /// recursively, lists replace) and writes with the fresh resourceVersion,
+    /// retrying on [`Error::Conflict`] (upstream `GuaranteedUpdate`). Deviation:
+    /// lists with `patchStrategy:"merge"` are replaced rather than unioned;
+    /// callers must only patch lists they own (podCIDRs is guarded empty).
+    async fn patch_strategic_merge<T>(&self, key: &str, patch: &serde_json::Value) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        patch_via_update(self, key, patch).await
+    }
+
     /// Update a resource with raw JSON value (for GC operations)
     async fn update_raw(&self, key: &str, value: &serde_json::Value) -> Result<()>;
 
@@ -578,6 +600,47 @@ pub enum WatchEvent {
 /// Stream of watch events
 pub type WatchStream = futures::stream::BoxStream<'static, Result<WatchEvent>>;
 
+/// RFC 7386 JSON merge: objects merge recursively, `null` deletes, anything
+/// else replaces.
+fn json_merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
+    let serde_json::Value::Object(p) = patch else {
+        *target = patch.clone();
+        return;
+    };
+    if !target.is_object() {
+        *target = serde_json::Value::Object(Default::default());
+    }
+    let t = target.as_object_mut().expect("just made an object");
+    for (k, v) in p {
+        if v.is_null() {
+            t.remove(k);
+        } else {
+            json_merge_patch(t.entry(k.clone()).or_insert(serde_json::Value::Null), v);
+        }
+    }
+}
+
+/// Body of the default [`Storage::patch_strategic_merge`].
+async fn patch_via_update<S, T>(storage: &S, key: &str, patch: &serde_json::Value) -> Result<T>
+where
+    S: Storage + ?Sized,
+    T: Serialize + DeserializeOwned + Send + Sync,
+{
+    const MAX_ATTEMPTS: usize = 8;
+    for attempt in 0..MAX_ATTEMPTS {
+        let mut current: serde_json::Value = storage.get(key).await?;
+        json_merge_patch(&mut current, patch);
+        match storage.update::<serde_json::Value>(key, &current).await {
+            Ok(updated) => return serde_json::from_value(updated).map_err(Error::Serialization),
+            Err(Error::Conflict(_)) if attempt + 1 < MAX_ATTEMPTS => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(Error::Conflict(format!(
+        "patch_strategic_merge: exhausted {MAX_ATTEMPTS} CAS retries for {key}"
+    )))
+}
+
 /// Body of the default [`Storage::update_status_cas`]: validate the caller's
 /// resourceVersion against the stored object, graft the incoming `.status`
 /// onto the stored object, and write it through `update` carrying the stored
@@ -687,6 +750,14 @@ impl<S: Storage> Storage for std::sync::Arc<S> {
         T: Serialize + DeserializeOwned + Send + Sync,
     {
         (**self).update_status_cas(key, value).await
+    }
+
+    // Forward so `ApiStorage`'s real PATCH is not bypassed by the default.
+    async fn patch_strategic_merge<T>(&self, key: &str, patch: &serde_json::Value) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        (**self).patch_strategic_merge(key, patch).await
     }
 
     async fn update_raw(&self, key: &str, value: &serde_json::Value) -> Result<()> {
@@ -1176,6 +1247,19 @@ impl Storage for StorageBackend {
             #[cfg(feature = "api-client")]
             StorageBackend::Api(s) => Storage::update_status_cas(s, key, value).await,
             _ => update_status_cas_via_update(self, key, value).await,
+        }
+    }
+
+    /// `Api` sends a real PATCH; every other variant runs the default CAS
+    /// loop over `StorageBackend::{get,update}`.
+    async fn patch_strategic_merge<T>(&self, key: &str, patch: &serde_json::Value) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        match self {
+            #[cfg(feature = "api-client")]
+            StorageBackend::Api(s) => Storage::patch_strategic_merge(s, key, patch).await,
+            _ => patch_via_update(self, key, patch).await,
         }
     }
 

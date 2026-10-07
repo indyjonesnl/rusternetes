@@ -16,6 +16,7 @@ mod cri_runtime;
 // into the bin (shared modules) but read as dead here; the lib is their real
 // consumer.
 mod atomic_writer;
+mod clustertrustbundle;
 // The single home for downward-API `fieldRef`/`resourceFieldRef` resolution.
 // `volumes` and `cri_runtime::translate` both delegate here; until now this
 // module was declared only in `lib.rs`, so the *binary* compiled two divergent
@@ -59,6 +60,8 @@ mod sysctl;
 // with the desired-state-of-world populator (#1970).
 #[allow(dead_code, unused_imports)]
 mod volume_manager;
+#[allow(dead_code)]
+mod volume_ownership;
 #[allow(dead_code, unused_imports)]
 mod volume_plugins;
 #[allow(dead_code)]
@@ -70,7 +73,6 @@ use clap::Parser;
 use config::{KubeletConfiguration, RuntimeConfig};
 use eviction::{
     build_thresholds, parse_duration, parse_eviction_flag, EvictionManager, EvictionSignal,
-    DEFAULT_TRANSITION_PERIOD,
 };
 use kubelet::Kubelet;
 use rusternetes_common::observability::MetricsRegistry;
@@ -250,13 +252,16 @@ fn parse_soft_grace_periods(raw: Option<&str>) -> Result<HashMap<EvictionSignal,
 }
 
 /// Build the eviction manager from CLI flags (or upstream defaults).
-fn build_eviction_manager(args: &Args) -> Result<EvictionManager> {
-    let transition_period = match args.eviction_pressure_transition_period.as_deref() {
-        Some(raw) => parse_duration(raw).ok_or_else(|| {
-            anyhow::anyhow!("invalid --eviction-pressure-transition-period: '{}'", raw)
-        })?,
-        None => DEFAULT_TRANSITION_PERIOD,
-    };
+fn build_eviction_manager(
+    args: &Args,
+    config_file: Option<&KubeletConfiguration>,
+) -> Result<EvictionManager> {
+    // Config-file `evictionPressureTransitionPeriod` (default 5m); the flag wins
+    // (server.go kubeletConfigFlagPrecedence). See eviction.rs.
+    let transition_period = eviction::resolve_transition_period(
+        args.eviction_pressure_transition_period.as_deref(),
+        config_file,
+    )?;
 
     // If the user did NOT pass --eviction-hard at all, we use upstream defaults.
     // If they passed an empty string, eviction is disabled.
@@ -318,6 +323,12 @@ async fn main() -> Result<()> {
         .as_ref()
         .and_then(|c| c.node_status_update_frequency);
 
+    // fileCheckFrequency from the config file (None => upstream default 20s).
+    let file_check_frequency = config_file.as_ref().and_then(|c| c.file_check_frequency);
+
+    // runtimeRequestTimeout from the config file (None => upstream default 2m).
+    let runtime_request_timeout = config_file.as_ref().and_then(|c| c.runtime_request_timeout);
+
     // Parse etcd endpoints
     let etcd_endpoints: Vec<String> = args
         .etcd_servers
@@ -327,7 +338,7 @@ async fn main() -> Result<()> {
 
     // Build eviction manager from CLI flags BEFORE consuming `args` into
     // RuntimeConfig::build — that call moves out several String fields.
-    let eviction_manager = build_eviction_manager(&args)?;
+    let eviction_manager = build_eviction_manager(&args, config_file.as_ref())?;
 
     // Build runtime configuration with proper precedence
     let runtime_config = RuntimeConfig::build(
@@ -505,7 +516,9 @@ async fn main() -> Result<()> {
         )
         .await?
         .with_pod_manifest_path(args.pod_manifest_path.clone())
-        .with_node_status_update_frequency(node_status_update_frequency),
+        .with_node_status_update_frequency(node_status_update_frequency)
+        .with_file_check_frequency(file_check_frequency)
+        .with_runtime_request_timeout(runtime_request_timeout),
     );
 
     // Plugin manager (`pkg/kubelet/pluginmanager`): watch
@@ -513,25 +526,46 @@ async fn main() -> Result<()> {
     // the registration handshake, which fills the CSI driver store. Upstream
     // wires it in `kubelet.go` (`pluginManager.AddHandler(pluginwatcherapi.CSIPlugin,
     // plugincache.PluginHandler(csi.PluginHandler))`).
+    //
+    // `RegisterPlugin` records each driver's `NodeGetInfo` on the Node and
+    // CSINode (`nodeinfomanager.InstallCSIDriver`). Upstream sets `nim.nodeID`
+    // (the Node's UID) in `csiPlugin.Init` -> `initializeCSINode`, before any
+    // plugin can register, and keeps the kubelet NotReady until it succeeds
+    // (`csi_plugin.go:281-355`); here the plugin manager is started once the
+    // Node exists and the CSINode is initialized (retried every second, like
+    // `waitForAPIServerForever`'s poll). The NotReady gate is not ported.
     {
         let registry_dir = pluginmanager::plugins_registry_dir(&runtime_config.root_dir);
-        let plugin_manager = pluginmanager::PluginManager::new(registry_dir);
-        plugin_manager.add_handler(
-            pluginmanager::csi_handler::CSI_PLUGIN,
-            Arc::new(pluginmanager::csi_handler::RegistrationHandler::new()),
-        );
-        // The kubelet runs for the life of the process, so the stop channel's
-        // sender is parked in a task that never finishes.
-        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-        match plugin_manager.run(stop_rx) {
-            Ok(()) => {
-                tokio::spawn(async move {
+        let nim = Arc::new(volume_plugins::nodeinfomanager::NodeInfoManager::new(
+            runtime_config.node_name.clone(),
+            storage.clone(),
+        ));
+        tokio::spawn(async move {
+            loop {
+                match nim.initialize_csi_node().await {
+                    Ok(()) => break,
+                    Err(e) => {
+                        info!("Waiting to initialize the CSINode: {e}");
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
+            }
+            let plugin_manager = pluginmanager::PluginManager::new(registry_dir);
+            plugin_manager.add_handler(
+                pluginmanager::csi_handler::CSI_PLUGIN,
+                Arc::new(pluginmanager::csi_handler::RegistrationHandler::new(nim)),
+            );
+            // The kubelet runs for the life of the process, so the stop
+            // channel's sender is parked here and never dropped.
+            let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+            match plugin_manager.run(stop_rx) {
+                Ok(()) => {
                     let _keep = (plugin_manager, stop_tx);
                     std::future::pending::<()>().await;
-                });
+                }
+                Err(e) => warn!("Failed to start the kubelet plugin manager: {e}"),
             }
-            Err(e) => warn!("Failed to start the kubelet plugin manager: {e}"),
-        }
+        });
     }
 
     let server_state = server::ServerState {

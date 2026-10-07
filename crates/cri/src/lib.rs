@@ -12,6 +12,7 @@
 //! the kubelet.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use hyper_util::rt::TokioIo;
 use tonic::transport::{Channel, Endpoint, Uri};
@@ -72,9 +73,66 @@ pub struct CriClient {
     runtime: RuntimeServiceClient<Channel>,
     image: ImageServiceClient<Channel>,
     socket: PathBuf,
+    /// `KubeletConfiguration.runtimeRequestTimeout`: per-request deadline for
+    /// every non-streaming CRI call (upstream `remoteRuntimeService.timeout`,
+    /// staging/src/k8s.io/cri-client/pkg/remote_runtime.go:48,128 and
+    /// `remoteImageService.timeout`, remote_image.go:44,96).
+    timeout: Duration,
+}
+
+/// Upstream default `RuntimeRequestTimeout` (pkg/kubelet/apis/config/v1beta1/
+/// defaults.go:188-189).
+pub const DEFAULT_RUNTIME_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// RunPodSandbox gets twice the request timeout "(4 mins by default)"
+/// (remote_runtime.go:213-215).
+pub fn sandbox_timeout(timeout: Duration) -> Duration {
+    timeout * 2
+}
+
+/// StopContainer deadline is `r.timeout + time.Duration(timeout)*time.Second`
+/// (remote_runtime.go:391) — the grace period is added on top.
+pub fn stop_container_timeout(timeout: Duration, grace_secs: i64) -> Duration {
+    timeout + Duration::from_secs(grace_secs.max(0) as u64)
+}
+
+/// ExecSync: "Do not set timeout when timeout is 0"; otherwise
+/// `r.timeout+timeout` (remote_runtime.go:508-513).
+pub fn exec_sync_timeout(timeout: Duration, exec_secs: i64) -> Option<Duration> {
+    if exec_secs == 0 {
+        None
+    } else {
+        Some(timeout + Duration::from_secs(exec_secs.max(0) as u64))
+    }
+}
+
+/// Attach the per-request deadline as a gRPC deadline (`grpc-timeout` header),
+/// the tonic equivalent of Go's `context.WithTimeout` on the call context; the
+/// tonic channel enforces it client-side and the runtime sees it too.
+pub fn with_deadline<T>(msg: T, deadline: Option<Duration>) -> tonic::Request<T> {
+    let mut req = tonic::Request::new(msg);
+    if let Some(d) = deadline {
+        req.set_timeout(d);
+    }
+    req
 }
 
 impl CriClient {
+    /// Set `runtimeRequestTimeout` (default 2m when unset/zero, defaults.go:188).
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = if timeout.is_zero() {
+            DEFAULT_RUNTIME_REQUEST_TIMEOUT
+        } else {
+            timeout
+        };
+        self
+    }
+
+    /// The configured per-request timeout.
+    pub fn request_timeout(&self) -> Duration {
+        self.timeout
+    }
+
     /// Connect to a CRI runtime listening on a Unix domain socket.
     ///
     /// `socket` is a filesystem path (e.g. `/run/containerd/containerd.sock`).
@@ -106,6 +164,7 @@ impl CriClient {
             runtime: RuntimeServiceClient::new(channel.clone()),
             image: ImageServiceClient::new(channel),
             socket,
+            timeout: DEFAULT_RUNTIME_REQUEST_TIMEOUT,
         })
     }
 
@@ -138,7 +197,7 @@ impl CriClient {
         };
         let response = self
             .runtime
-            .version(request)
+            .version(with_deadline(request, Some(self.timeout)))
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "Version",
@@ -192,7 +251,7 @@ impl CriClient {
         };
         let resp = self
             .image
-            .image_status(request)
+            .image_status(with_deadline(request, Some(self.timeout)))
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "ImageStatus",
@@ -218,7 +277,7 @@ impl CriClient {
         };
         let resp = self
             .runtime
-            .run_pod_sandbox(request)
+            .run_pod_sandbox(with_deadline(request, Some(sandbox_timeout(self.timeout))))
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "RunPodSandbox",
@@ -233,7 +292,7 @@ impl CriClient {
             pod_sandbox_id: pod_sandbox_id.to_string(),
         };
         self.runtime
-            .stop_pod_sandbox(request)
+            .stop_pod_sandbox(with_deadline(request, Some(self.timeout)))
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "StopPodSandbox",
@@ -248,7 +307,7 @@ impl CriClient {
             pod_sandbox_id: pod_sandbox_id.to_string(),
         };
         self.runtime
-            .remove_pod_sandbox(request)
+            .remove_pod_sandbox(with_deadline(request, Some(self.timeout)))
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "RemovePodSandbox",
@@ -269,7 +328,7 @@ impl CriClient {
         };
         let resp = self
             .runtime
-            .pod_sandbox_status(request)
+            .pod_sandbox_status(with_deadline(request, Some(self.timeout)))
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "PodSandboxStatus",
@@ -295,7 +354,7 @@ impl CriClient {
         };
         let resp = self
             .runtime
-            .create_container(request)
+            .create_container(with_deadline(request, Some(self.timeout)))
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "CreateContainer",
@@ -310,7 +369,7 @@ impl CriClient {
             container_id: container_id.to_string(),
         };
         self.runtime
-            .start_container(request)
+            .start_container(with_deadline(request, Some(self.timeout)))
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "StartContainer",
@@ -327,7 +386,10 @@ impl CriClient {
             timeout,
         };
         self.runtime
-            .stop_container(request)
+            .stop_container(with_deadline(
+                request,
+                Some(stop_container_timeout(self.timeout, timeout)),
+            ))
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "StopContainer",
@@ -342,7 +404,7 @@ impl CriClient {
             container_id: container_id.to_string(),
         };
         self.runtime
-            .remove_container(request)
+            .remove_container(with_deadline(request, Some(self.timeout)))
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "RemoveContainer",
@@ -364,7 +426,7 @@ impl CriClient {
             ..Default::default()
         };
         self.runtime
-            .update_container_resources(request)
+            .update_container_resources(with_deadline(request, Some(self.timeout)))
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "UpdateContainerResources",
@@ -385,7 +447,7 @@ impl CriClient {
         };
         let resp = self
             .runtime
-            .container_status(request)
+            .container_status(with_deadline(request, Some(self.timeout)))
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "ContainerStatus",
@@ -404,7 +466,7 @@ impl CriClient {
         let request = v1::ListContainersRequest { filter };
         let resp = self
             .runtime
-            .list_containers(request)
+            .list_containers(with_deadline(request, Some(self.timeout)))
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "ListContainers",
@@ -421,7 +483,7 @@ impl CriClient {
         let request = v1::ListPodSandboxRequest { filter };
         let resp = self
             .runtime
-            .list_pod_sandbox(request)
+            .list_pod_sandbox(with_deadline(request, Some(self.timeout)))
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "ListPodSandbox",
@@ -436,7 +498,7 @@ impl CriClient {
         let request = v1::StatusRequest { verbose };
         let resp = self
             .runtime
-            .status(request)
+            .status(with_deadline(request, Some(self.timeout)))
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "Status",
@@ -457,7 +519,7 @@ impl CriClient {
         };
         let resp = self
             .runtime
-            .container_stats(request)
+            .container_stats(with_deadline(request, Some(self.timeout)))
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "ContainerStats",
@@ -475,7 +537,7 @@ impl CriClient {
         let request = v1::ListContainerStatsRequest { filter };
         let resp = self
             .runtime
-            .list_container_stats(request)
+            .list_container_stats(with_deadline(request, Some(self.timeout)))
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "ListContainerStats",
@@ -502,7 +564,10 @@ impl CriClient {
         };
         let resp = self
             .runtime
-            .exec_sync(request)
+            .exec_sync(with_deadline(
+                request,
+                exec_sync_timeout(self.timeout, timeout),
+            ))
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "ExecSync",
@@ -516,7 +581,7 @@ impl CriClient {
     pub async fn exec(&mut self, request: v1::ExecRequest) -> Result<String> {
         let resp = self
             .runtime
-            .exec(request)
+            .exec(with_deadline(request, Some(self.timeout)))
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "Exec",
@@ -529,7 +594,7 @@ impl CriClient {
     pub async fn attach(&mut self, request: v1::AttachRequest) -> Result<String> {
         let resp = self
             .runtime
-            .attach(request)
+            .attach(with_deadline(request, Some(self.timeout)))
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "Attach",
@@ -546,7 +611,7 @@ impl CriClient {
         };
         let resp = self
             .runtime
-            .port_forward(request)
+            .port_forward(with_deadline(request, Some(self.timeout)))
             .await
             .map_err(|source| CriError::Rpc {
                 rpc: "PortForward",
@@ -585,6 +650,63 @@ mod tests {
             normalize_socket_path(Path::new("/run/bare.sock")),
             PathBuf::from("/run/bare.sock")
         );
+    }
+
+    #[test]
+    fn upstream_timeout_arithmetic() {
+        let t = Duration::from_secs(120);
+        assert_eq!(sandbox_timeout(t), Duration::from_secs(240));
+        assert_eq!(stop_container_timeout(t, 30), Duration::from_secs(150));
+        assert_eq!(stop_container_timeout(t, -1), t);
+        assert_eq!(exec_sync_timeout(t, 0), None);
+        assert_eq!(exec_sync_timeout(t, 5), Some(Duration::from_secs(125)));
+        assert_eq!(DEFAULT_RUNTIME_REQUEST_TIMEOUT, t);
+    }
+
+    /// `runtimeRequestTimeout` must actually bound a CRI call: a runtime that
+    /// accepts the connection but never answers fails the request at the
+    /// configured deadline instead of hanging (upstream wraps every call in
+    /// `context.WithTimeout(ctx, r.timeout)`).
+    #[tokio::test]
+    async fn request_timeout_bounds_a_hung_runtime_call() {
+        let dir = std::env::temp_dir().join(format!("cri-timeout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("cri.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = listener.accept().await {
+                held.push(s); // accept, never reply
+            }
+        });
+        let mut client = CriClient::connect(&sock)
+            .await
+            .unwrap()
+            .with_request_timeout(Duration::from_millis(300));
+        assert_eq!(client.request_timeout(), Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        let res = tokio::time::timeout(Duration::from_secs(10), client.version())
+            .await
+            .expect("version() must be bounded by runtimeRequestTimeout, not hang");
+        let err = res.expect_err("hung runtime must fail");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(started.elapsed() >= Duration::from_millis(250));
+        match err {
+            CriError::Rpc { source, .. } => {
+                // tonic's client-side deadline surfaces as Cancelled
+                // ("Timeout expired"); a runtime-side one as DeadlineExceeded.
+                assert!(
+                    matches!(
+                        source.code(),
+                        tonic::Code::Cancelled | tonic::Code::DeadlineExceeded
+                    ),
+                    "unexpected status: {source}"
+                )
+            }
+            other => panic!("expected deadline exceeded, got {other}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The generated client types exist and the version request is constructible.
