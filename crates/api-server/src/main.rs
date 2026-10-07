@@ -135,6 +135,16 @@ struct Args {
     /// `exemptions` are read (kube-apiserver `--admission-control-config-file`).
     #[arg(long)]
     admission_control_config_file: Option<String>,
+
+    /// Amount of time to retain events, as a Go duration (`--event-ttl`,
+    /// pkg/controlplane/apiserver/options/options.go:162). `0` keeps them
+    /// forever.
+    #[arg(
+        long,
+        default_value = "1h",
+        value_parser = registry::core::event::parse_event_ttl
+    )]
+    event_ttl: u64,
 }
 
 #[tokio::main]
@@ -354,6 +364,7 @@ async fn main() -> Result<()> {
                 base: args.service_node_port_range.base,
                 size: args.service_node_port_range.size,
             })
+            .with_event_ttl(args.event_ttl)
             .with_prometheus_client(prometheus_client),
     );
 

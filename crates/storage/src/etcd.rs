@@ -1,6 +1,6 @@
 use crate::{Storage, WatchEvent, WatchStream};
 use async_trait::async_trait;
-use etcd_client::{Client, Compare, CompareOp, GetOptions, TxnOp, WatchOptions};
+use etcd_client::{Client, Compare, CompareOp, GetOptions, PutOptions, TxnOp, WatchOptions};
 use futures::StreamExt;
 use rusternetes_common::{authz::AuthzStorage, Error, Result};
 use serde::{de::DeserializeOwned, Serialize};
@@ -36,6 +36,67 @@ pub struct EtcdStorage {
     /// [`DEFAULT_LIST_PAGE_SIZE`]; overridable so tests can walk several pages
     /// without seeding hundreds of keys.
     page_size: i64,
+    /// Grants the leases TTL'd writes attach (`etcd3.store.leaseManager`).
+    leases: Arc<LeaseManager>,
+}
+
+/// `defaultLeaseReuseDurationSeconds` and `defaultLeaseMaxObjectCount`
+/// (`staging/src/k8s.io/apiserver/pkg/storage/etcd3/lease_manager.go:29-30`).
+const LEASE_REUSE_DURATION_SECONDS: i64 = 60;
+const LEASE_MAX_OBJECT_COUNT: i64 = 1000;
+/// `newDefaultLeaseManager` passes 0.05 as `leaseReuseDurationPercent`.
+const LEASE_REUSE_DURATION_PERCENT: f64 = 0.05;
+
+/// Port of `etcd3.leaseManager` (`lease_manager.go`). Lease operations are
+/// expensive in etcd, so a write that needs a lease expiring about when the
+/// previous one does reuses it instead of granting its own: every event has
+/// the same TTL, and one lease per event would be one `LeaseGrant` per event.
+/// Only the single previous lease is kept.
+struct LeaseManager {
+    state: std::sync::Mutex<LeaseState>,
+}
+
+#[derive(Default)]
+struct LeaseState {
+    prev_lease_id: i64,
+    prev_expiration: Option<std::time::Instant>,
+    attached_object_count: i64,
+}
+
+impl LeaseManager {
+    fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(LeaseState::default()),
+        }
+    }
+
+    /// `getReuseDurationSecondsLocked`.
+    fn reuse_duration_seconds(ttl: i64) -> i64 {
+        ((LEASE_REUSE_DURATION_PERCENT * ttl as f64) as i64).min(LEASE_REUSE_DURATION_SECONDS)
+    }
+
+    /// The reusable previous lease for `ttl`, if there is one (the first half
+    /// of `GetLease`): it must outlive the TTL (`valid`) by no more than the
+    /// reuse window (`sufficient`), and carry fewer than the maximum object
+    /// count. Every call counts as an attached object, success or failure.
+    fn reusable(&self, ttl: i64, now: std::time::Instant) -> Option<i64> {
+        let reuse = Self::reuse_duration_seconds(ttl);
+        let mut st = self.state.lock().unwrap();
+        st.attached_object_count += 1;
+        let expiration = st.prev_expiration?;
+        let valid = now + std::time::Duration::from_secs(ttl as u64) < expiration;
+        let sufficient = now + std::time::Duration::from_secs((ttl + reuse) as u64) > expiration;
+        (valid && sufficient && st.attached_object_count <= LEASE_MAX_OBJECT_COUNT)
+            .then_some(st.prev_lease_id)
+    }
+
+    /// Cache a freshly granted lease (the second half of `GetLease`).
+    fn granted(&self, id: i64, ttl: i64, now: std::time::Instant) {
+        let mut st = self.state.lock().unwrap();
+        st.prev_lease_id = id;
+        st.prev_expiration = Some(now + std::time::Duration::from_secs(ttl as u64));
+        st.attached_object_count = 1;
+    }
 }
 
 /// Whether a cached compaction floor alone settles "is `revision` compacted?".
@@ -100,6 +161,7 @@ impl EtcdStorage {
             client,
             page_size: DEFAULT_LIST_PAGE_SIZE,
             compact_revision: Arc::new(AtomicI64::new(0)),
+            leases: Arc::new(LeaseManager::new()),
         })
     }
 
@@ -129,6 +191,38 @@ impl EtcdStorage {
             .ok_or_else(|| Error::NotFound(key.to_string()))
     }
 
+    /// The put a write carries: attached to a lease for `ttl` seconds, or
+    /// bare for `ttl == 0` -- `ttlOpts` (`etcd3/store.go`) followed by
+    /// `clientv3.OpPut(key, value, opts...)`. A put without a lease detaches
+    /// the key from the one it held, which is how a TTL is removed.
+    async fn put_op(&self, key: &str, json: &str, ttl: u64) -> Result<TxnOp> {
+        if ttl == 0 {
+            return Ok(TxnOp::put(key, json, None));
+        }
+        let ttl = i64::try_from(ttl)
+            .map_err(|_| Error::Storage(format!("TTL {ttl}s overflows an etcd lease")))?;
+        let now = std::time::Instant::now();
+        let lease = match self.leases.reusable(ttl, now) {
+            Some(id) => id,
+            None => {
+                // Grant a little extra, so the lease can be reused.
+                let granted_ttl = ttl + LeaseManager::reuse_duration_seconds(ttl);
+                let mut client = self.client.clone();
+                let resp = client
+                    .lease_grant(granted_ttl, None)
+                    .await
+                    .map_err(|e| Error::Storage(format!("Failed to grant lease: {}", e)))?;
+                self.leases.granted(resp.id(), granted_ttl, now);
+                resp.id()
+            }
+        };
+        Ok(TxnOp::put(
+            key,
+            json,
+            Some(PutOptions::new().with_lease(lease)),
+        ))
+    }
+
     /// Write an existing key without a caller-supplied resourceVersion,
     /// returning the new `mod_revision`.
     ///
@@ -138,7 +232,7 @@ impl EtcdStorage {
     /// retries from the top when a concurrent writer moves the key underneath
     /// it. Mirroring that keeps every mutation inside the upstream RPC subset
     /// *and* closes the lost-update race a bare `Put` leaves open.
-    async fn put_guaranteed(&self, key: &str, json: &str) -> Result<i64> {
+    async fn put_guaranteed(&self, key: &str, json: &str, ttl: u64) -> Result<i64> {
         let mut client = self.client.clone();
         for _ in 0..GUARANTEED_UPDATE_ATTEMPTS {
             let expected = Self::read_mod_revision(&mut client, key).await?;
@@ -147,7 +241,7 @@ impl EtcdStorage {
             // recognised update shape, not an optional extra.
             let txn = etcd_client::Txn::new()
                 .when(vec![Compare::mod_revision(key, CompareOp::Equal, expected)])
-                .and_then(vec![TxnOp::put(key, json, None)])
+                .and_then(vec![self.put_op(key, json, ttl).await?])
                 .or_else(vec![TxnOp::get(key, None)]);
             let resp = client
                 .txn(txn)
@@ -276,6 +370,13 @@ impl Storage for EtcdStorage {
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
+        self.create_with_ttl(key, value, 0).await
+    }
+
+    async fn create_with_ttl<T>(&self, key: &str, value: &T, ttl: u64) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
         let mut client = self.client.clone();
         // Stamp system-managed creation metadata (uid, creationTimestamp,
         // generation) centrally, mirroring k8s registry.Store.Create.
@@ -300,7 +401,7 @@ impl Storage for EtcdStorage {
         // other shape falls outside the subset etcd-API shims implement.
         let txn = etcd_client::Txn::new()
             .when(vec![Compare::mod_revision(key, CompareOp::Equal, 0)])
-            .and_then(vec![TxnOp::put(key, json.clone(), None)]);
+            .and_then(vec![self.put_op(key, &json, ttl).await?]);
 
         let txn_resp = client
             .txn(txn)
@@ -352,6 +453,13 @@ impl Storage for EtcdStorage {
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
+        self.update_with_ttl(key, value, 0).await
+    }
+
+    async fn update_with_ttl<T>(&self, key: &str, value: &T, ttl: u64) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
         let mut client = self.client.clone();
         let json = Self::serialize(value)?;
 
@@ -379,7 +487,7 @@ impl Storage for EtcdStorage {
                     CompareOp::Equal,
                     expected_mod_revision,
                 )])
-                .and_then(vec![TxnOp::put(key, json.clone(), None)])
+                .and_then(vec![self.put_op(key, &json, ttl).await?])
                 .or_else(vec![TxnOp::get(key, None)]);
 
             let txn_resp = client
@@ -421,7 +529,7 @@ impl Storage for EtcdStorage {
         } else {
             // No resourceVersion provided — read-modify-write under a guard
             // rather than a bare PUT, matching upstream `GuaranteedUpdate`.
-            let mod_revision = self.put_guaranteed(key, &json).await?;
+            let mod_revision = self.put_guaranteed(key, &json, ttl).await?;
 
             debug!("Updated resource at key: {}", key);
 
@@ -433,7 +541,7 @@ impl Storage for EtcdStorage {
     async fn update_raw(&self, key: &str, value: &serde_json::Value) -> Result<()> {
         let json = serde_json::to_string(value).map_err(Error::Serialization)?;
 
-        self.put_guaranteed(key, &json).await?;
+        self.put_guaranteed(key, &json, 0).await?;
 
         debug!("Updated resource (raw) at key: {}", key);
         Ok(())
