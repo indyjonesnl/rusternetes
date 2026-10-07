@@ -465,3 +465,52 @@ async fn psa_ephemeralcontainers_update_is_evaluated() {
         "an added ephemeral container must be evaluated: {b:?}"
     );
 }
+
+/// admission_test.go "warn deny": a `warn` namespace admits the pod and the
+/// violation comes back as a `Warning:` header; an `audit`-only namespace
+/// admits it silently.
+#[tokio::test]
+async fn psa_warn_label_admits_with_warning_header() {
+    let (router, _mem) = spawn_router();
+    for (ns, mode) in [("psa-warn-ns", "warn"), ("psa-audit-ns", "audit")] {
+        let (s, b) = send(
+            router.clone(),
+            Method::POST,
+            "/api/v1/namespaces",
+            Some(&json!({"apiVersion": "v1", "kind": "Namespace",
+                "metadata": {"name": ns, "labels": {
+                    format!("pod-security.kubernetes.io/{mode}"): "baseline"}}})),
+        )
+        .await;
+        assert!(s.is_success(), "{b:?}");
+        let pod = json!({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "p"},
+            "spec": {"containers": [{"name": "c", "image": "busybox",
+                "securityContext": {"privileged": true}}]}});
+        let body = serde_json::to_vec(&pod).unwrap();
+        let (status, headers, _raw, v) = router
+            .send_full(
+                "POST",
+                &format!("/api/v1/namespaces/{ns}/pods"),
+                Some("application/json"),
+                None,
+                Some(body),
+            )
+            .await;
+        assert!(status.is_success(), "{mode} must not deny: {status} {v:?}");
+        let warnings: Vec<_> = headers
+            .get_all("warning")
+            .iter()
+            .filter_map(|h| h.to_str().ok())
+            .collect();
+        if mode == "warn" {
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.contains(r#"would violate PodSecurity \"baseline:latest\""#)),
+                "{warnings:?}"
+            );
+        } else {
+            assert!(warnings.is_empty(), "{warnings:?}");
+        }
+    }
+}

@@ -492,9 +492,15 @@ impl Admission<'_> {
                         None,
                         pod,
                     ) {
-                        crate::admission::PodSecurityAdmission::new()
-                            .admit_as(storage, namespace, pod, &self.user.username)
-                            .await?;
+                        // Warn mode: the request is admitted with warnings
+                        // (AdmissionResponse.Warnings -> warning.AddWarning).
+                        for w in crate::admission::PodSecurityAdmission::new()
+                            .admit_outcome(storage, namespace, pod, &self.user.username)
+                            .await?
+                            .warnings
+                        {
+                            ctx.add_warning(w);
+                        }
                     }
                 }
             }
@@ -510,9 +516,15 @@ impl Admission<'_> {
                         Some(old),
                         pod,
                     ) {
-                        crate::admission::PodSecurityAdmission::new()
-                            .admit_as(storage, namespace, pod, &self.user.username)
-                            .await?;
+                        // Warn mode: the request is admitted with warnings
+                        // (AdmissionResponse.Warnings -> warning.AddWarning).
+                        for w in crate::admission::PodSecurityAdmission::new()
+                            .admit_outcome(storage, namespace, pod, &self.user.username)
+                            .await?
+                            .warnings
+                        {
+                            ctx.add_warning(w);
+                        }
                     }
                     if self.subresource == Some("resize") {
                         crate::handlers::pod_subresources::check_node_declared_features_for_resize(
