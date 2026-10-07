@@ -11,8 +11,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::advanced::{
     check_host_port_conflicts, check_node_affinity, check_pod_affinity, check_pod_anti_affinity,
-    check_preemption_with_pdbs, check_taints_tolerations, check_topology_spread_constraints,
-    parse_resource_quantity, NodeScore,
+    check_taints_tolerations, check_topology_spread_constraints, parse_resource_quantity,
+    NodeScore,
 };
 use crate::data_plane::{ApiBackend, DataPlane};
 
@@ -449,7 +449,12 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             );
             for victim in &victims {
                 if let Err(e) = self.evict_pod(victim).await {
-                    error!("Failed to evict victim pod {}: {}", victim, e);
+                    error!(
+                        "Failed to evict victim pod {}/{}: {}",
+                        victim.metadata.namespace.as_deref().unwrap_or("default"),
+                        victim.metadata.name,
+                        e
+                    );
                 }
             }
             self.nominate(&pod_key, &node_name).await;
@@ -631,9 +636,14 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     );
 
                     // Evict lower-priority pods
-                    for pod_name in &pods_to_evict {
-                        if let Err(e) = self.evict_pod(pod_name).await {
-                            error!("Failed to evict pod {}: {}", pod_name, e);
+                    for victim in &pods_to_evict {
+                        if let Err(e) = self.evict_pod(victim).await {
+                            error!(
+                                "Failed to evict pod {}/{}: {}",
+                                victim.metadata.namespace.as_deref().unwrap_or("default"),
+                                victim.metadata.name,
+                                e
+                            );
                         }
                     }
 
@@ -1099,7 +1109,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         all_pods: &[Pod],
         priority_classes: &HashMap<String, PriorityClass>,
         pdbs: &[rusternetes_common::resources::PodDisruptionBudget],
-    ) -> Option<(String, Vec<String>)> {
+    ) -> Option<(String, Vec<Pod>)> {
         // If the pod's preemptionPolicy is "Never", skip preemption entirely.
         // Fall back to the PriorityClass's policy when the pod spec doesn't
         // carry one (mirrors the spec.priority backstop in the schedule
@@ -1190,8 +1200,13 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             // (pkg/scheduler/framework/preemption/preemption.go). Passing an
             // empty slice here — as this path did until #1797 — silently
             // disabled all of it.
-            let (can_preempt, pods_to_evict) =
-                check_preemption_with_pdbs(node, pod, all_pods, pdbs, priority_classes);
+            let (can_preempt, pods_to_evict) = crate::advanced::select_preemption_victims(
+                node,
+                pod,
+                all_pods,
+                pdbs,
+                priority_classes,
+            );
             if can_preempt && !pods_to_evict.is_empty() {
                 candidates.push(crate::advanced::PreemptionCandidate {
                     num_pdb_violations: crate::advanced::count_pdb_violating_victims(
@@ -1205,7 +1220,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             }
         }
 
-        let chosen = crate::advanced::pick_one_node_for_preemption(&candidates, all_pods)?;
+        let chosen = crate::advanced::pick_one_node_for_preemption(&candidates)?;
         candidates
             .into_iter()
             .find(|c| c.node_name == chosen)
@@ -1214,17 +1229,21 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
 
     /// Evict a pod by setting its deletionTimestamp (graceful delete).
     /// The kubelet will detect the deletionTimestamp and handle graceful shutdown.
-    async fn evict_pod(&self, pod_name: &str) -> rusternetes_common::Result<()> {
-        // Find the pod in all namespaces
+    ///
+    /// The victim is identified by namespace AND name, like upstream
+    /// `util.DeletePod` (`cs.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, ...)`,
+    /// pkg/scheduler/util/utils.go:137-138). Matching on name alone evicted a
+    /// same-named pod in every other namespace too (#2477).
+    async fn evict_pod(&self, victim: &Pod) -> rusternetes_common::Result<()> {
+        let pod_name = victim.metadata.name.as_str();
+        let victim_ns = victim.metadata.namespace.as_deref().unwrap_or("default");
         let all_pods: Vec<Pod> = self.data.list_pods().await?;
 
         for mut pod in all_pods {
-            if pod.metadata.name == pod_name {
-                let pod_ns = pod
-                    .metadata
-                    .namespace
-                    .clone()
-                    .unwrap_or_else(|| "default".to_string());
+            let pod_ns_matches =
+                pod.metadata.namespace.as_deref().unwrap_or("default") == victim_ns;
+            if pod.metadata.name == pod_name && pod_ns_matches {
+                let pod_ns = victim_ns.to_string();
 
                 // Set deletionTimestamp and add DisruptionTarget condition
                 if pod.metadata.deletion_timestamp.is_none() {
@@ -1273,7 +1292,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             }
         }
 
-        warn!("Pod {} not found for eviction", pod_name);
+        warn!("Pod {}/{} not found for eviction", victim_ns, pod_name);
         Ok(())
     }
 
@@ -2122,7 +2141,7 @@ mod tests {
             .unwrap();
 
         // Evict the pod (private method, accessible from within the module)
-        scheduler.evict_pod("low-pod").await.unwrap();
+        scheduler.evict_pod(&low_pod).await.unwrap();
 
         // The pod should still exist in storage with:
         // 1. deletionTimestamp set
@@ -2161,6 +2180,36 @@ mod tests {
         let dt = disruption.unwrap();
         assert_eq!(dt.status, "True");
         assert_eq!(dt.reason.as_deref(), Some("PreemptionByScheduler"));
+    }
+
+    /// #2477: evicting a victim deletes that namespace's pod only. Upstream
+    /// `util.DeletePod` deletes `Pods(pod.Namespace)` / `pod.Name`
+    /// (pkg/scheduler/util/utils.go:137-138); a name-only scan evicted the
+    /// same-named pod in every namespace.
+    #[tokio::test]
+    async fn test_evict_pod_leaves_same_named_pod_in_other_namespace() {
+        let storage = Arc::new(MemoryStorage::new());
+        let scheduler =
+            Scheduler::new_with_name(storage.clone(), 2, "default-scheduler".to_string());
+        for ns in ["ns-a", "ns-b"] {
+            let mut p = make_pending_pod("w", ns);
+            p.spec.as_mut().unwrap().node_name = Some("node-1".to_string());
+            storage
+                .create(&format!("/registry/pods/{ns}/w"), &p)
+                .await
+                .unwrap();
+        }
+        let victim: Pod = storage.get("/registry/pods/ns-a/w").await.unwrap();
+
+        scheduler.evict_pod(&victim).await.unwrap();
+
+        let a: Pod = storage.get("/registry/pods/ns-a/w").await.unwrap();
+        let b: Pod = storage.get("/registry/pods/ns-b/w").await.unwrap();
+        assert!(a.metadata.deletion_timestamp.is_some(), "victim evicted");
+        assert!(
+            b.metadata.deletion_timestamp.is_none(),
+            "same-named pod in another namespace must be untouched"
+        );
     }
 
     /// K8s treats nodeName="" the same as nodeName=nil (unscheduled).
