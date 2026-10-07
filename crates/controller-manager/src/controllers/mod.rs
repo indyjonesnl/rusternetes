@@ -45,6 +45,7 @@ pub mod statefulset;
 pub mod status_subresource_double;
 pub mod storage_class;
 pub mod taint_eviction;
+pub mod taint_eviction_timed_workers;
 pub mod ttl_controller;
 #[allow(dead_code)]
 pub mod volume_attachment;
