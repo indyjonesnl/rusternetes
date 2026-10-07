@@ -131,6 +131,92 @@ fn delete_options_errors() {
     ));
 }
 
+fn list_option_errors(pairs: &[(&str, &str)]) -> Vec<String> {
+    super::delete::validate_list_options(&q(pairs))
+        .iter()
+        .map(|e| e.to_string())
+        .collect()
+}
+
+/// `TestValidateListOptions` (internalversion/validation/validation_test.go),
+/// with `isWatchListFeatureEnabled` true (WatchList is on by default in 1.35,
+/// kube_features.go:503-509).
+#[test]
+fn validate_list_options_matches_upstream() {
+    assert!(list_option_errors(&[]).is_empty());
+    assert!(
+        list_option_errors(&[("resourceVersion", "1"), ("resourceVersionMatch", "Exact")])
+            .is_empty()
+    );
+    assert!(list_option_errors(&[
+        ("resourceVersion", "0"),
+        ("resourceVersionMatch", "NotOlderThan")
+    ])
+    .is_empty());
+    assert_eq!(
+        list_option_errors(&[("resourceVersion", "0"), ("resourceVersionMatch", "Exact")]),
+        vec![
+            r#"resourceVersionMatch: Forbidden: resourceVersionMatch "exact" is forbidden for resourceVersion "0""#
+        ]
+    );
+    assert_eq!(
+        list_option_errors(&[("resourceVersion", "0"), ("resourceVersionMatch", "foo")]),
+        vec![
+            r#"resourceVersionMatch: Unsupported value: "foo": supported values: "Exact", "NotOlderThan", """#
+        ]
+    );
+    assert_eq!(
+        list_option_errors(&[("resourceVersionMatch", "Exact"), ("continue", "x")]),
+        vec![
+            "resourceVersionMatch: Forbidden: resourceVersionMatch is forbidden unless resourceVersion is provided",
+            "resourceVersionMatch: Forbidden: resourceVersionMatch is forbidden when continue is provided",
+        ]
+    );
+    assert_eq!(
+        list_option_errors(&[("sendInitialEvents", "true")]),
+        vec!["sendInitialEvents: Forbidden: sendInitialEvents is forbidden for list"]
+    );
+}
+
+#[test]
+fn validate_list_options_watch() {
+    assert!(list_option_errors(&[("watch", "true")]).is_empty());
+    assert!(list_option_errors(&[
+        ("watch", "true"),
+        ("sendInitialEvents", "true"),
+        ("resourceVersionMatch", "NotOlderThan"),
+    ])
+    .is_empty());
+    assert_eq!(
+        list_option_errors(&[("watch", "true"), ("resourceVersionMatch", "NotOlderThan")]),
+        vec!["resourceVersionMatch: Forbidden: resourceVersionMatch is forbidden for watch unless sendInitialEvents is provided"]
+    );
+    assert_eq!(
+        list_option_errors(&[("watch", "true"), ("sendInitialEvents", "true")]),
+        vec!["resourceVersionMatch: Forbidden: sendInitialEvents requires setting resourceVersionMatch to NotOlderThan"]
+    );
+    assert_eq!(
+        list_option_errors(&[
+            ("watch", "true"),
+            ("sendInitialEvents", "true"),
+            ("resourceVersionMatch", "Exact"),
+        ]),
+        vec![
+            "resourceVersionMatch: Forbidden: sendInitialEvents requires setting resourceVersionMatch to NotOlderThan",
+            r#"resourceVersionMatch: Unsupported value: "Exact": supported values: "NotOlderThan""#,
+        ]
+    );
+    assert_eq!(
+        list_option_errors(&[
+            ("watch", "true"),
+            ("sendInitialEvents", "true"),
+            ("resourceVersionMatch", "NotOlderThan"),
+            ("continue", "123"),
+        ]),
+        vec!["resourceVersionMatch: Forbidden: resourceVersionMatch is forbidden when continue is provided"]
+    );
+}
+
 fn owner(uid: &str, controller: Option<bool>) -> rusternetes_common::types::OwnerReference {
     rusternetes_common::types::OwnerReference {
         api_version: "v1".into(),
