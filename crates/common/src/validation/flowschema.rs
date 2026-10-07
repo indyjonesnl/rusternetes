@@ -18,7 +18,7 @@ use crate::resources::flowcontrol::{
     FlowSchemaSubject, NonResourcePolicyRule, PolicyRulesWithSubjects, ResourcePolicyRule,
     SubjectKind,
 };
-use crate::validation::field::{Error, ErrorList, Path};
+use crate::validation::field::{BadValue, Error, ErrorList, Path};
 use crate::validation::flowcontrol_bootstrap::{mandatory_flow_schema, semantic_equal};
 use crate::validation::metav1::{is_dns1123_label, is_dns1123_subdomain};
 
@@ -69,7 +69,7 @@ fn validate_subject(subject: &FlowSchemaSubject, fld_path: &Path) -> ErrorList {
             errs.push(Error::forbidden(&fld_path.child(child), msg));
         }
     };
-    match subject.kind {
+    match &subject.kind {
         // Go's zero value, i.e. an absent `kind`. Upstream's `default` arm
         // (`pkg/apis/flowcontrol/validation/validation.go:185-187`): the kind
         // decides which of `user`/`group`/`serviceAccount` is even looked at,
@@ -77,6 +77,14 @@ fn validate_subject(subject: &FlowSchemaSubject, fld_path: &Path) -> ErrorList {
         SubjectKind::Unspecified => errs.push(Error::not_supported(
             &fld_path.child("kind"),
             String::new(),
+            &["Group", "ServiceAccount", "User"],
+        )),
+        // The same `default:` arm for a non-empty unknown kind
+        // (validation.go:185-187; `supportedSubjectKinds` :62-66). The bad
+        // value is `subject.Kind`.
+        SubjectKind::Unknown(kind) => errs.push(Error::not_supported(
+            &fld_path.child("kind"),
+            kind.clone(),
             &["Group", "ServiceAccount", "User"],
         )),
         SubjectKind::ServiceAccount => {
@@ -424,10 +432,15 @@ pub fn validate_flow_schema(fs: &FlowSchema) -> ErrorList {
     // `distinguisherMethod` is present its `type` must be one of the supported
     // methods. An absent `type` is Go's `""`, which fails that check.
     if let Some(dm) = &spec.distinguisher_method {
-        if matches!(dm.type_, FlowDistinguisherMethodType::Unspecified) {
+        // The bad value is `spec.DistinguisherMethod` itself, the whole struct
+        // (validation.go:118), so it renders as JSON, `{"type":"..."}`.
+        if matches!(
+            dm.type_,
+            FlowDistinguisherMethodType::Unspecified | FlowDistinguisherMethodType::Unknown(_)
+        ) {
             errs.push(Error::not_supported(
                 &spec_path.child("distinguisherMethod").child("type"),
-                String::new(),
+                BadValue::marshal(dm),
                 &["ByNamespace", "ByUser"],
             ));
         }

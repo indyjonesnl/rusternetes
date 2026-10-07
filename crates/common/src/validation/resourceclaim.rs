@@ -17,10 +17,10 @@
 //! ObjectMeta is validated separately.
 
 use crate::resources::{
-    AllocationResult, DeviceAllocationConfiguration, DeviceAllocationMode, DeviceClaim,
-    DeviceClaimConfiguration, DeviceRequestAllocationResult, DeviceSelector, DeviceToleration,
-    ExactDeviceRequest, OpaqueDeviceConfiguration, ResourceClaim, ResourceClaimSpec,
-    ResourceClaimStatus, TolerationOperator,
+    AllocationConfigSource, AllocationResult, DeviceAllocationConfiguration, DeviceAllocationMode,
+    DeviceClaim, DeviceClaimConfiguration, DeviceRequestAllocationResult, DeviceSelector,
+    DeviceTaintEffect, DeviceToleration, ExactDeviceRequest, OpaqueDeviceConfiguration,
+    ResourceClaim, ResourceClaimSpec, ResourceClaimStatus, TolerationOperator,
 };
 use crate::types::Condition;
 use crate::validation::csinode::validate_csi_driver_name;
@@ -459,9 +459,7 @@ fn validate_device_request_allocation_result(
 }
 
 /// `validateDeviceAllocationConfiguration` (`validation.go:522-532`) and
-/// `validateAllocationConfigSource` (`:534-545`). An unrecognised source cannot
-/// reach here: the closed Rust enum rejects it in the decoder, where upstream
-/// answers `NotSupported`.
+/// `validateAllocationConfigSource` (`:534-545`).
 fn validate_device_allocation_configuration(
     config: &DeviceAllocationConfiguration,
     fld_path: &Path,
@@ -470,6 +468,14 @@ fn validate_device_allocation_configuration(
     let mut errs: ErrorList = Vec::new();
     if config.source.is_none() {
         errs.push(Error::required(&fld_path.child("source"), ""));
+    }
+    // validation.go:539-540: anything but FromClaim/FromClass.
+    if let Some(AllocationConfigSource::Unknown(source)) = &config.source {
+        errs.push(Error::not_supported(
+            &fld_path.child("source"),
+            source.clone(),
+            &["FromClaim", "FromClass"],
+        ));
     }
 
     let requests_path = fld_path.child("requests");
@@ -563,14 +569,26 @@ fn validate_device_toleration(toleration: &DeviceToleration, fld_path: &Path) ->
                 errs.push(Error::invalid(&fld_path.child("value"), value.clone(), msg));
             }
         }
-        // Upstream's `case "":`. An operator that is neither `Equal` nor
-        // `Exists` is a `NotSupported` upstream; the closed Rust enum rejects
-        // it in the decoder instead.
+        // Upstream's `default:` arm (validation.go:1425-1426);
+        // `validDeviceTolerationOperators` is `Equal`, `Exists` (:1388).
+        Some(TolerationOperator::Unknown(op)) => errs.push(Error::not_supported(
+            &fld_path.child("operator"),
+            op.clone(),
+            &["Equal", "Exists"],
+        )),
+        // Upstream's `case "":`.
         None => errs.push(Error::required(&fld_path.child("operator"), "")),
     }
 
-    // `effect` is explicitly optional in a toleration (`validation.go:1428`),
-    // and an unsupported one cannot reach here through the closed enum.
+    // `effect` is explicitly optional in a toleration (`validation.go:1428`);
+    // a present one must be in `validDeviceTaintEffects` (:1431-1432).
+    if let Some(DeviceTaintEffect::Unknown(effect)) = &toleration.effect {
+        errs.push(Error::not_supported(
+            &fld_path.child("effect"),
+            effect.clone(),
+            &["NoExecute", "NoSchedule", "None"],
+        ));
+    }
     errs
 }
 
@@ -717,6 +735,12 @@ fn validate_allocation_mode(
                     ));
                 }
             }
+            // validation.go:283 `default:` arm; the list is `All`, `ExactCount`.
+            DeviceAllocationMode::Unknown(mode) => errs.push(Error::not_supported(
+                &fld_path.child("allocationMode"),
+                mode.clone(),
+                &["All", "ExactCount"],
+            )),
         }
     }
     errs
