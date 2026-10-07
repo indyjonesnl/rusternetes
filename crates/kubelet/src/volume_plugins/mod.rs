@@ -15,6 +15,7 @@ pub mod downward_api;
 pub mod empty_dir;
 pub mod host;
 pub mod host_path;
+pub mod nodeinfomanager;
 pub mod plugin;
 pub mod projected;
 pub mod registry;

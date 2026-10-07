@@ -22,6 +22,7 @@ redis = ["rusternetes-storage/redis"]
 [dependencies]
 mimalloc = { version = "0.1", optional = true }
 rusternetes-common = { path = "../common" }
+pem.workspace = true
 # api-client: StorageBackend::Api lets the in-cluster kubelet read/write via
 # the api-server while keeping its Arc<StorageBackend> handle unchanged.
 rusternetes-storage = { path = "../storage", features = ["api-client"] }
@@ -35,6 +36,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml = "0.9"
 sha2 = "0.10"
+sha1 = "0.10"
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -61,6 +63,7 @@ async-trait = { workspace = true }
 # wrapped in hyper_util's TokioIo.
 hyper-util = { version = "0.1", features = ["client", "tokio"] }
 tower = { workspace = true }
+inotify = "0.11"
 
 [build-dependencies]
 tonic-build = "0.12"

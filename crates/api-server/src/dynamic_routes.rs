@@ -57,7 +57,9 @@ impl DynamicRouteManager {
                 // `spec.scope` the way upstream's `validateEnumStrings(...,
                 // required=true)` does. Routing it as namespaced keeps this
                 // unreachable arm from silently exposing a cluster-wide path.
-                ResourceScope::Namespaced | ResourceScope::Unspecified => {
+                ResourceScope::Namespaced
+                | ResourceScope::Unspecified
+                | ResourceScope::Unknown(_) => {
                     // Namespaced resources have both namespaced and cluster-wide list endpoints
                     let ns_path = format!(
                         "/apis/{}/{}/namespaces/:namespace/{}",
@@ -159,7 +161,7 @@ impl DynamicRouteManager {
         match scope {
             // See the note in `build_routes_for_crd`: unreachable for a stored
             // CRD, routed as namespaced rather than cluster-wide.
-            ResourceScope::Namespaced | ResourceScope::Unspecified => {
+            ResourceScope::Namespaced | ResourceScope::Unspecified | ResourceScope::Unknown(_) => {
                 let status_name_path = format!(
                     "/apis/{}/{}/namespaces/:namespace/{}/:name/status",
                     group, version, plural
@@ -195,7 +197,7 @@ impl DynamicRouteManager {
         match scope {
             // See the note in `build_routes_for_crd`: unreachable for a stored
             // CRD, routed as namespaced rather than cluster-wide.
-            ResourceScope::Namespaced | ResourceScope::Unspecified => {
+            ResourceScope::Namespaced | ResourceScope::Unspecified | ResourceScope::Unknown(_) => {
                 let scale_path = format!(
                     "/apis/{}/{}/namespaces/:namespace/{}/:name/scale",
                     group, version, plural

@@ -1,4 +1,3 @@
-use crate::resources::serde_helpers::empty_string_as_none;
 use crate::resources::service_account::ObjectReference;
 use crate::resources::volume::LabelSelector;
 use crate::types::{ObjectMeta, TypeMeta};
@@ -29,11 +28,11 @@ pub struct CSIDriverSpec {
     pub pod_info_on_mount: Option<bool>,
 
     /// fsGroupPolicy defines if the volume supports changing ownership and permission of the volume
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "empty_string_as_none"
-    )]
+    ///
+    /// No `empty_string_as_none`: upstream's field is a `*FSGroupPolicy`, so a
+    /// non-nil "" reaches `validateFSGroupPolicy` (validation.go:505-516) and is
+    /// NotSupported. It decodes as `Unknown("")`, distinct from absent (#2505).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fs_group_policy: Option<FSGroupPolicy>,
 
     /// storageCapacity indicates that the CSI volume driver wants pod scheduling to consider storage capacity
@@ -70,12 +69,22 @@ pub enum FSGroupPolicy {
     ReadWriteOnceWithFSType,
     File,
     None,
+    /// A value outside the supported set. Upstream's field is a plain Go
+    /// `string`, so any string decodes and validation answers `Unsupported
+    /// value` (422), not a 400 decode failure (#2496).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum VolumeLifecycleMode {
     Persistent,
     Ephemeral,
+    /// A value outside the supported set. Upstream's field is a plain Go
+    /// `string`, so any string decodes and validation answers `Unsupported
+    /// value` (422), not a 400 decode failure (#2496).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

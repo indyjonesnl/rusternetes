@@ -12,7 +12,9 @@
 //! attribute/capacity maps are tracked in #1442. ObjectMeta is validated
 //! separately.
 
-use crate::resources::dra::{CounterSet, Device, DeviceCounterConsumption, DeviceTaint};
+use crate::resources::dra::{
+    CounterSet, Device, DeviceCounterConsumption, DeviceTaint, DeviceTaintEffect,
+};
 use crate::resources::{ResourceSlice, ResourceSliceSpec};
 use crate::validation::csinode::validate_csi_driver_name;
 use crate::validation::field::{Error, ErrorList, Path};
@@ -357,11 +359,11 @@ fn validate_device_taint(taint: &DeviceTaint, fld_path: &Path) -> ErrorList {
     match &taint.effect {
         None => errs.push(Error::required(&fld_path.child("effect"), "")),
         Some(effect) => {
-            let effect = format!("{effect:?}");
-            if !DEVICE_TAINT_EFFECTS.contains(&effect.as_str()) {
+            // validation.go:1402-1403: `!validDeviceTaintEffects.Has(...)`.
+            if let DeviceTaintEffect::Unknown(effect) = effect {
                 errs.push(Error::not_supported(
                     &fld_path.child("effect"),
-                    effect,
+                    effect.clone(),
                     DEVICE_TAINT_EFFECTS,
                 ));
             }

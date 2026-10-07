@@ -6,6 +6,7 @@ pub mod autoscaling;
 pub mod autoscaling_v1;
 pub mod binding;
 pub mod certificates;
+pub mod clustertrustbundle;
 pub mod componentstatus;
 pub mod config_and_secret;
 pub mod controllerrevision;
@@ -79,6 +80,7 @@ pub use certificates::{
     CertificateSigningRequestConditionType, CertificateSigningRequestSpec,
     CertificateSigningRequestStatus, KeyUsage,
 };
+pub use clustertrustbundle::{ClusterTrustBundle, ClusterTrustBundleSpec};
 pub use componentstatus::{ComponentCondition, ComponentStatus};
 pub use config_and_secret::{ConfigMap, Secret};
 pub use controllerrevision::ControllerRevision;

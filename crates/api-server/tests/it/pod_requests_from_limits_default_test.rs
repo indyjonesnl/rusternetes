@@ -137,3 +137,99 @@ async fn pod_templates_are_not_defaulted() {
         "template requests must stay unset: {body}"
     );
 }
+
+// ---- Pod-level resources (PodLevelResources, Beta/on in 1.35) ---------------
+//
+// `SetDefaults_Pod` continues with `defaultHugePagePodLimits` and
+// `defaultPodRequests` once the container-level pass is done
+// (`pkg/apis/core/v1/defaults.go:194-199`); cases are ported from
+// `TestPodResourcesDefaults` (`pkg/apis/core/v1/defaults_test.go:378`).
+
+/// "pod requests=empty map limits=set, container requests=unset limits=set":
+/// pod-level requests default to the aggregated container requests (2m+1m,
+/// 1Mi+5Mi), never to the pod limits (5m, 7Mi), which stay untouched.
+#[tokio::test]
+#[serial_test::serial]
+async fn pod_level_requests_default_to_aggregated_container_requests() {
+    let _g = rusternetes_common::feature_gates::with_feature(
+        rusternetes_common::feature_gates::Feature::PodLevelResources,
+        true,
+    );
+    let state = TestApiServer::new();
+    let pod = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": "p-podlevel"},
+        "spec": {
+            "resources": {"limits": {"cpu": "5m", "memory": "7Mi"}, "requests": {}},
+            "containers": [
+                {"name": "a", "image": "nginx",
+                 "resources": {"limits": {"cpu": "2m", "memory": "1Mi"}}},
+                {"name": "b", "image": "nginx",
+                 "resources": {"limits": {"cpu": "1m", "memory": "5Mi"}}}
+            ]
+        }
+    });
+    let (code, body) = state.post(&pods_uri(), &pod).await;
+    assert_eq!(code, StatusCode::CREATED, "create must succeed: {body}");
+    let res = &body["spec"]["resources"];
+    assert_eq!(res["requests"]["cpu"], json!("3m"), "{body}");
+    assert_eq!(res["requests"]["memory"], json!("6Mi"), "{body}");
+    assert_eq!(
+        res["limits"]["cpu"],
+        json!("5m"),
+        "limits untouched: {body}"
+    );
+    assert_eq!(res["limits"]["memory"], json!("7Mi"), "{body}");
+}
+
+/// "pod requests=unset limits=set, container resources=unset": the pod-level
+/// request falls back to the pod-level limit.
+#[tokio::test]
+#[serial_test::serial]
+async fn pod_level_requests_default_to_pod_limits_when_containers_have_none() {
+    let _g = rusternetes_common::feature_gates::with_feature(
+        rusternetes_common::feature_gates::Feature::PodLevelResources,
+        true,
+    );
+    let state = TestApiServer::new();
+    let pod = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": "p-podlevel-lim"},
+        "spec": {
+            "resources": {"limits": {"cpu": "2m", "memory": "1Mi"}},
+            "containers": [{"name": "a", "image": "nginx"}]
+        }
+    });
+    let (code, body) = state.post(&pods_uri(), &pod).await;
+    assert_eq!(code, StatusCode::CREATED, "create must succeed: {body}");
+    let res = &body["spec"]["resources"];
+    assert_eq!(res["requests"]["cpu"], json!("2m"), "{body}");
+    assert_eq!(res["requests"]["memory"], json!("1Mi"), "{body}");
+}
+
+/// Gate off: pod-level resources are left exactly as submitted.
+#[tokio::test]
+#[serial_test::serial]
+async fn pod_level_requests_not_defaulted_when_gate_off() {
+    let _g = rusternetes_common::feature_gates::with_feature(
+        rusternetes_common::feature_gates::Feature::PodLevelResources,
+        false,
+    );
+    let state = TestApiServer::new();
+    let pod = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": "p-podlevel-off"},
+        "spec": {
+            "resources": {"limits": {"cpu": "2m"}},
+            "containers": [{"name": "a", "image": "nginx"}]
+        }
+    });
+    let (_code, body) = state.post(&pods_uri(), &pod).await;
+    assert!(
+        body["spec"]["resources"]["requests"].is_null(),
+        "gate off must not default pod requests: {body}"
+    );
+}

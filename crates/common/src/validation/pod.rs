@@ -2419,16 +2419,17 @@ fn validate_volumes(volumes: &[Volume], fld_path: &Path) -> ErrorList {
 
 /// Upstream `supportedHostPathTypes`
 /// (`pkg/apis/core/validation/validation.go:1400-1408`). `""` is
-/// `HostPathUnset`, the zero value, and is supported.
+/// `HostPathUnset`, the zero value, and is supported. Held in the order
+/// `sets.List` (validation.go:1396) emits: sorted.
 const HOST_PATH_TYPES: &[&str] = &[
     "",
-    "DirectoryOrCreate",
-    "Directory",
-    "FileOrCreate",
-    "File",
-    "Socket",
-    "CharDevice",
     "BlockDevice",
+    "CharDevice",
+    "Directory",
+    "DirectoryOrCreate",
+    "File",
+    "FileOrCreate",
+    "Socket",
 ];
 
 /// Upstream `validVolumeDownwardAPIFieldPathExpressions`
@@ -4171,6 +4172,25 @@ fn fill_nulls_from(dst: &mut serde_json::Value, src: &serde_json::Value) {
 mod tests {
     use super::*;
     use crate::resources::pod::Sysctl;
+
+    /// validation.go:1396 `sets.List(supportedHostPathTypes)` sorts, so the
+    /// supported list in the NotSupported detail is lexicographic (#2499).
+    #[test]
+    fn host_path_type_not_supported_lists_sorted() {
+        let hp = HostPathVolumeSource {
+            path: "/x".to_string(),
+            type_: Some("bogus".to_string()),
+        };
+        let errs = validate_host_path_volume_source(&hp, &Path::new("hostPath"));
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(
+            errs[0].to_string().contains(
+                "\"\", \"BlockDevice\", \"CharDevice\", \"Directory\", \"DirectoryOrCreate\", \"File\", \"FileOrCreate\", \"Socket\""
+            ),
+            "{}",
+            errs[0]
+        );
+    }
 
     #[test]
     fn sysctl_name_validity_matches_upstream() {

@@ -1530,3 +1530,47 @@ fn validate_load_balancer_status_cases() {
     }
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
+
+/// `IPFamilyPolicy` and `InternalTrafficPolicy` are `*T` in
+/// `staging/src/k8s.io/api/core/v1/types.go:6121,6153` (release-1.35), so a
+/// non-nil `""` is distinct from nil and upstream rejects it:
+/// `validation.go:9011-9015` (`ipFamilyPolicy`) and `:6886-6888`
+/// (`internalTrafficPolicy`) both answer `field.NotSupported`. `type` (:5998)
+/// and `externalTrafficPolicy` (:6056) are plain strings that
+/// `SetDefaults_Service` (defaults.go:121-123,135-139) defaults from `""`, so
+/// they keep decoding `""` as unset.
+#[test]
+fn pointer_enum_empty_and_unknown_values_are_not_supported() {
+    let families = r#""SingleStack", "PreferDualStack", "RequireDualStack""#;
+    let traffic = r#""Cluster", "Local""#;
+    for (field, value, valid) in [
+        ("ipFamilyPolicy", "", families),
+        ("ipFamilyPolicy", "Bogus", families),
+        ("internalTrafficPolicy", "", traffic),
+        ("internalTrafficPolicy", "Bogus", traffic),
+    ] {
+        let mut v = make_valid_service();
+        v["spec"][field] = json!(value);
+        let svc = decode(v);
+        let errs: Vec<String> = validate_service_create(&svc)
+            .iter()
+            .map(|e| e.to_string())
+            .collect();
+        let want =
+            format!("spec.{field}: Unsupported value: \"{value}\": supported values: {valid}");
+        assert!(
+            errs.contains(&want),
+            "{field}={value:?}: want {want:?}, got {errs:?}"
+        );
+    }
+}
+
+#[test]
+fn plain_string_enums_still_decode_empty_as_unset() {
+    let mut v = make_valid_service();
+    v["spec"]["type"] = json!("");
+    v["spec"]["externalTrafficPolicy"] = json!("");
+    let svc = decode(v);
+    assert!(svc.spec.service_type.is_none());
+    assert!(svc.spec.external_traffic_policy.is_none());
+}

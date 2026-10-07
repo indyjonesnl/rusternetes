@@ -1,16 +1,16 @@
 //! CSIDriver validation — port of upstream Kubernetes
 //! `pkg/apis/storage/validation/validation.go::ValidateCSIDriver` (release-1.35).
 //!
-//! The typed `FSGroupPolicy` / `VolumeLifecycleMode` enums already reject
-//! invalid values at decode time, so the meaningful create-time checks ported
-//! here are the required-field presence checks (`attachRequired`,
+//! `FSGroupPolicy` / `VolumeLifecycleMode` carry an `Unknown(String)` arm (#2496)
+//! so an unsupported value decodes and is answered `NotSupported`, as upstream
+//! does. The other create-time checks ported here are the required-field presence checks (`attachRequired`,
 //! `podInfoOnMount`, `storageCapacity`), the `nodeAllocatableUpdatePeriodSeconds`
 //! lower bound, the `serviceAccountTokenInSecrets`/`tokenRequests` cross-field
 //! check, and `tokenRequests` (duplicate audience + expiration bounds).
 //! ObjectMeta is validated separately (#1087 / #1277). CSI conformance is
 //! non-negotiable for this project.
 
-use crate::resources::csi::CSIDriver;
+use crate::resources::csi::{CSIDriver, FSGroupPolicy, VolumeLifecycleMode};
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::objectmeta::validate_immutable_field;
 use std::collections::HashSet;
@@ -43,6 +43,28 @@ pub fn validate_csi_driver(driver: &CSIDriver) -> ErrorList {
     // (validation.go:453 / 493-500).
     if spec.storage_capacity.is_none() {
         errs.push(Error::required(&spec_path.child("storageCapacity"), ""));
+    }
+
+    // validateFSGroupPolicy (validation.go:502-516): `supportedFSGroupPolicy.List()`
+    // is sorted.
+    if let Some(FSGroupPolicy::Unknown(v)) = &spec.fs_group_policy {
+        errs.push(Error::not_supported(
+            &spec_path.child("fsGroupPolicy"),
+            v.clone(),
+            &["File", "None", "ReadWriteOnceWithFSType"],
+        ));
+    }
+
+    // validateVolumeLifecycleModes (validation.go:549-563): one error per bad
+    // entry, all on the list path, values in declaration order.
+    for mode in spec.volume_lifecycle_modes.as_deref().unwrap_or(&[]) {
+        if let VolumeLifecycleMode::Unknown(v) = mode {
+            errs.push(Error::not_supported(
+                &spec_path.child("volumeLifecycleModes"),
+                v.clone(),
+                &["Persistent", "Ephemeral"],
+            ));
+        }
     }
 
     // seLinuxMount is required while SELinuxMountReadWriteOncePod is on
@@ -261,5 +283,114 @@ mod tests {
             ),
             "{errs:?}"
         );
+    }
+
+    /// validation.go:505-516 `validateFSGroupPolicy`: an unknown value decodes
+    /// (Go string) and is NotSupported, sorted like `supportedFSGroupPolicy.List()`.
+    #[test]
+    fn unknown_fs_group_policy_is_not_supported() {
+        let spec: CSIDriverSpec = serde_json::from_value(serde_json::json!({
+            "attachRequired": false, "podInfoOnMount": false,
+            "storageCapacity": true, "seLinuxMount": false,
+            "fsGroupPolicy": "invalid-mode"
+        }))
+        .expect("an unknown fsGroupPolicy must decode");
+        let errs = validate_csi_driver(&driver(spec));
+        assert!(has(&errs, "spec.fsGroupPolicy", ErrorType::NotSupported));
+        assert!(
+            errs[0]
+                .to_string()
+                .contains("\"File\", \"None\", \"ReadWriteOnceWithFSType\""),
+            "{}",
+            errs[0]
+        );
+    }
+
+    /// validation.go:549-563 `validateVolumeLifecycleModes`: one NotSupported
+    /// per bad entry, listing `Persistent, Ephemeral` in that order.
+    #[test]
+    fn unknown_volume_lifecycle_mode_is_not_supported() {
+        let spec: CSIDriverSpec = serde_json::from_value(serde_json::json!({
+            "attachRequired": false, "podInfoOnMount": false,
+            "storageCapacity": true, "seLinuxMount": false,
+            "volumeLifecycleModes": ["Persistent", "no-such-mode"]
+        }))
+        .expect("an unknown volumeLifecycleModes entry must decode");
+        let errs = validate_csi_driver(&driver(spec));
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(has(
+            &errs,
+            "spec.volumeLifecycleModes",
+            ErrorType::NotSupported
+        ));
+        assert!(
+            errs[0]
+                .to_string()
+                .contains("\"Persistent\", \"Ephemeral\""),
+            "{}",
+            errs[0]
+        );
+    }
+
+    /// validation.go:505-516 `validateFSGroupPolicy`: only a nil pointer is
+    /// skipped; a non-nil empty string is not in `supportedFSGroupPolicy`, so
+    /// `fsGroupPolicy: ""` is NotSupported (#2505), while an absent field is fine.
+    #[test]
+    fn empty_string_fs_group_policy_is_not_supported_but_absent_is_fine() {
+        let bad: CSIDriverSpec = serde_json::from_value(serde_json::json!({
+            "attachRequired": false, "podInfoOnMount": false,
+            "storageCapacity": true, "seLinuxMount": false,
+            "fsGroupPolicy": ""
+        }))
+        .expect("an empty fsGroupPolicy must decode");
+        assert_eq!(
+            bad.fs_group_policy,
+            Some(FSGroupPolicy::Unknown(String::new()))
+        );
+        let errs = validate_csi_driver(&driver(bad));
+        assert!(
+            has(&errs, "spec.fsGroupPolicy", ErrorType::NotSupported),
+            "{errs:?}"
+        );
+
+        let ok: CSIDriverSpec = serde_json::from_value(serde_json::json!({
+            "attachRequired": false, "podInfoOnMount": false,
+            "storageCapacity": true, "seLinuxMount": false
+        }))
+        .unwrap();
+        assert!(ok.fs_group_policy.is_none());
+        assert!(!has(
+            &validate_csi_driver(&driver(ok)),
+            "spec.fsGroupPolicy",
+            ErrorType::NotSupported
+        ));
+    }
+
+    /// validation_test.go:2031-2035 "FSGroupPolicy invalidated" (update case):
+    /// changing a valid policy to "invalid" is rejected; changing to "File"
+    /// ("change FSGroupPolicy", :1934-1937) is allowed.
+    #[test]
+    fn update_to_invalid_fs_group_policy_rejected() {
+        let mk = |v: &str| {
+            let spec: CSIDriverSpec = serde_json::from_value(serde_json::json!({
+                "attachRequired": false, "podInfoOnMount": false,
+                "storageCapacity": true, "seLinuxMount": false,
+                "fsGroupPolicy": v
+            }))
+            .unwrap();
+            driver(spec)
+        };
+        let old = mk("None");
+        let errs = validate_csi_driver_update(&mk("invalid"), &old);
+        assert!(
+            has(&errs, "spec.fsGroupPolicy", ErrorType::NotSupported),
+            "{errs:?}"
+        );
+        let errs = validate_csi_driver_update(&mk(""), &old);
+        assert!(
+            has(&errs, "spec.fsGroupPolicy", ErrorType::NotSupported),
+            "{errs:?}"
+        );
+        assert!(validate_csi_driver_update(&mk("File"), &old).is_empty());
     }
 }

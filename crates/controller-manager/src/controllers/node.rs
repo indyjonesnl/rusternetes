@@ -1,3 +1,4 @@
+use crate::controllers::worker_pool::spawn_workers;
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use futures::StreamExt;
@@ -20,6 +21,16 @@ use tracing::{debug, error, info, warn};
 const NODE_MONITOR_GRACE_PERIOD_SECONDS: i64 = 40;
 const POD_EVICTION_TIMEOUT_SECONDS: i64 = 300; // 5 minutes
 const NODE_STARTUP_GRACE_PERIOD_SECS: u64 = 60;
+
+/// Workers draining the per-node queue: `nodeUpdateWorkerSize = 8`
+/// (pkg/controller/nodelifecycle/node_lifecycle_controller.go:133), launched in
+/// `Run` (:483-491). Upstream's pool runs the per-node taint/label pass
+/// (`doNodeProcessingPassWorker`, :516) off `nodeUpdateQueue`; the health
+/// monitor (`monitorNodeHealth`) is a single loop. Our `reconcile_node` fuses
+/// both per node, so the pool covers it per node. Deliberate deviation: no
+/// separate monitor loop. A node key is never handed to two workers at once
+/// (queue processing set), matching the :484-488 comment.
+const NODE_UPDATE_WORKER_SIZE: usize = 8;
 
 /// Per-node, per-condition snapshot of the last status/transition-time the
 /// controller observed. Used to detect when a condition flips status without the
@@ -68,10 +79,11 @@ impl<S: Storage + 'static> NodeController<S> {
     pub async fn run(self: Arc<Self>) -> Result<()> {
         let queue = WorkQueue::new();
 
-        let worker_queue = queue.clone();
-        let worker_self = Arc::clone(&self);
-        tokio::spawn(async move {
-            worker_self.worker(worker_queue).await;
+        spawn_workers(NODE_UPDATE_WORKER_SIZE, &queue, |worker_queue| {
+            let worker_self = Arc::clone(&self);
+            async move {
+                worker_self.worker(worker_queue).await;
+            }
         });
 
         loop {
