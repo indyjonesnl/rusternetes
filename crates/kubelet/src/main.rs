@@ -320,6 +320,9 @@ async fn main() -> Result<()> {
         .as_ref()
         .and_then(|c| c.node_status_update_frequency);
 
+    // fileCheckFrequency from the config file (None => upstream default 20s).
+    let file_check_frequency = config_file.as_ref().and_then(|c| c.file_check_frequency);
+
     // runtimeRequestTimeout from the config file (None => upstream default 2m).
     let runtime_request_timeout = config_file.as_ref().and_then(|c| c.runtime_request_timeout);
 
@@ -511,6 +514,7 @@ async fn main() -> Result<()> {
         .await?
         .with_pod_manifest_path(args.pod_manifest_path.clone())
         .with_node_status_update_frequency(node_status_update_frequency)
+        .with_file_check_frequency(file_check_frequency)
         .with_runtime_request_timeout(runtime_request_timeout),
     );
 
