@@ -114,34 +114,6 @@ fn is_pod_terminated(pod: &Pod) -> bool {
         && not_running(&status.ephemeral_container_statuses)
 }
 
-/// The slice of `findDeletablePlugin` (`pv_controller.go:1954-1994`) that
-/// resolves to the in-tree hostPath deleter: returns the PV's hostPath path
-/// when that plugin applies. A CSI source or a `migrated-to` annotation means
-/// an external deleter (`:1975-1984`). An external `provisioned-by`
-/// (`:1962-1970`) also skips the in-tree plugin, except the provisioner names
-/// Rusternetes' own dynamic provisioner uses for hostPath volumes
-/// (`dynamic_provisioner.rs`), which are the in-tree host-path plugin here
-/// (Rusternetes-only deviation; upstream has no such name).
-fn host_path_deleter_path(pv: &PersistentVolume) -> Option<String> {
-    let hp = pv.spec.host_path.as_ref()?;
-    if pv.spec.csi.is_some() {
-        return None;
-    }
-    let ann = pv.metadata.annotations.as_ref();
-    if ann.is_some_and(|a| a.get(ANN_MIGRATED_TO).is_some_and(|v| !v.is_empty())) {
-        return None;
-    }
-    match ann
-        .and_then(|a| a.get(ANN_DYNAMICALLY_PROVISIONED))
-        .map(String::as_str)
-    {
-        None | Some("") => {}
-        Some("rusternetes.io/hostpath" | "kubernetes.io/hostpath" | "hostpath") => {}
-        Some(_) => return None,
-    }
-    Some(hp.path.clone())
-}
-
 /// `hostPathDeleter.Delete` (`pkg/volume/hostpath/host_path.go:354-360`):
 ///
 /// ```go
@@ -185,6 +157,63 @@ async fn host_path_delete(path: &str) -> std::result::Result<(), String> {
         }
         _ => Ok(()),
     }
+}
+
+/// `FindDeletablePluginByName` names this controller has a deleter for. The
+/// upstream in-tree one is hostPath (`kubernetes.io/host-path`,
+/// `pkg/volume/hostpath/host_path.go:77`); the rest are the names
+/// `DynamicProvisioner` stamps on the PVs it creates (Rusternetes-only).
+const BUILTIN_DELETER_PLUGINS: &[&str] = &[
+    "kubernetes.io/host-path",
+    "kubernetes.io/hostpath",
+    "rusternetes.io/hostpath",
+    "hostpath",
+];
+
+/// `findDeletablePlugin` (`pv_controller.go:1954-1991`): `Ok(true)` a deleter
+/// plugin handles the volume, `Ok(false)` an external deleter does (do
+/// nothing), `Err` no deleter (the message becomes the event text).
+fn find_deletable_plugin(pv: &PersistentVolume) -> std::result::Result<bool, String> {
+    const NO_PLUGIN: &str = "no deletable volume plugin matched";
+    let ann = |k: &str| pv.metadata.annotations.as_ref().and_then(|a| a.get(k));
+    if let Some(name) = ann(ANN_DYNAMICALLY_PROVISIONED).filter(|n| !n.is_empty()) {
+        if BUILTIN_DELETER_PLUGINS.contains(&name.as_str()) {
+            return Ok(true);
+        }
+        if !name.starts_with("kubernetes.io/") {
+            // External provisioner is requested, do not report error.
+            return Ok(false);
+        }
+        return Err(NO_PLUGIN.to_string());
+    }
+    // CSI migration scenario / CSI volume source: external provisioner.
+    if ann(ANN_MIGRATED_TO).is_some() || pv.spec.csi.is_some() {
+        return Ok(false);
+    }
+    // "Try to find a plugin by spec."
+    if pv.spec.host_path.is_some() {
+        return Ok(true);
+    }
+    Err(format!(
+        "error getting deleter volume plugin for volume {:?}: {}",
+        pv.metadata.name, NO_PLUGIN
+    ))
+}
+
+/// Whether `pod` references `claim_name` (`PodPVCIndex`: a
+/// `persistentVolumeClaim` source or an ephemeral volume's `<pod>-<volume>`).
+fn pod_uses_claim(pod: &Pod, claim_name: &str) -> bool {
+    pod.spec.as_ref().is_some_and(|spec| {
+        spec.volumes.iter().flatten().any(|v| {
+            if let Some(src) = v.persistent_volume_claim.as_ref() {
+                src.claim_name == claim_name
+            } else if v.ephemeral.is_some() {
+                format!("{}-{}", pod.metadata.name, v.name) == claim_name
+            } else {
+                false
+            }
+        })
+    })
 }
 
 pub struct PVBinderController<S: Storage> {
@@ -655,13 +684,18 @@ impl<S: Storage + 'static> PVBinderController<S> {
         Ok(self.storage.update(&pv_key, &pv).await?)
     }
 
-    /// `reclaimVolume` (`pv_controller.go:1180-1230`). `Retain` does nothing;
-    /// `Delete` removes the PV. `Recycle` on a volume with no recycler
-    /// plugin fails it (`recycleVolumeOperation`, `:1279-1286`); hostPath/NFS
-    /// volumes are scrubbed by a recycler pod ([`super::pv_recycler`]) in a
-    /// detached operation (`:1192-1198`). A PV carrying the
+    /// `reclaimVolume` (`pv_controller.go:1180-1223`). `Retain` does nothing;
+    /// `Recycle` runs `recycleVolumeOperation` (hostPath/NFS volumes are
+    /// scrubbed by a recycler pod, [`super::pv_recycler`], in a detached
+    /// operation, `:1192-1198`); `Delete` runs `deleteVolumeOperation`; an
+    /// unknown policy fails the volume (`:1216-1221`). A PV carrying the
     /// `pv.kubernetes.io/migrated-to` annotation is left to the external
-    /// provisioner (`:1183-1187`).
+    /// provisioner (`:1182-1186`).
+    ///
+    /// Upstream schedules both operations on a goroutine keyed by
+    /// `recycle-/delete-<name>[<uid>]` (`scheduleOperation`); recycling keeps
+    /// that, because the recycler pod can run for minutes. The delete is
+    /// inline.
     async fn reclaim_volume(&self, pv: &PersistentVolume) -> Result<()> {
         if pv
             .metadata
@@ -672,56 +706,186 @@ impl<S: Storage + 'static> PVBinderController<S> {
         {
             return Ok(());
         }
-        if pv.spec.persistent_volume_reclaim_policy == Some(PersistentVolumeReclaimPolicy::Recycle)
-        {
-            // `case v1.PersistentVolumeReclaimRecycle` (`:1192-1198`).
-            let opname = format!("recycle-{}[{}]", pv.metadata.name, pv.metadata.uid);
-            let handle = self.operation_handle();
-            let pv = pv.clone();
-            self.schedule_operation(opname, async move {
-                handle.recycle_volume_operation(pv).await;
+        match pv.spec.persistent_volume_reclaim_policy {
+            // An unset policy is defaulted to Retain by the API server.
+            Some(PersistentVolumeReclaimPolicy::Retain) | None => {}
+            Some(PersistentVolumeReclaimPolicy::Recycle) => {
+                // `case v1.PersistentVolumeReclaimRecycle` (`:1192-1198`).
+                let opname = format!("recycle-{}[{}]", pv.metadata.name, pv.metadata.uid);
+                let handle = self.operation_handle();
+                let pv = pv.clone();
+                self.schedule_operation(opname, async move {
+                    handle.recycle_volume_operation(pv).await;
+                });
+            }
+            Some(PersistentVolumeReclaimPolicy::Delete) => {
+                self.delete_volume_operation(pv).await?;
+            }
+            _ => {
+                // `default:` branch (`pv_controller.go:1216-1221`).
+                self.update_volume_phase_with_event(
+                    pv.clone(),
+                    PersistentVolumePhase::Failed,
+                    "VolumeUnknownReclaimPolicy",
+                    "Volume has unrecognized PersistentVolumeReclaimPolicy",
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `isVolumeReleased` (`pv_controller.go:1395-1438`): the volume is bound
+    /// to a claim that no longer exists, or exists with another UID, or is
+    /// bound to a different volume.
+    async fn is_volume_released(&self, pv: &PersistentVolume) -> Result<bool> {
+        let Some(claim_ref) = pv.spec.claim_ref.as_ref() else {
+            return Ok(false);
+        };
+        let claim_uid = claim_ref.uid.as_deref().unwrap_or("");
+        if claim_uid.is_empty() {
+            // Bound by the user; the controller has not finished binding.
+            return Ok(false);
+        }
+        let claim = self.get_claim_by_ref(claim_ref).await?;
+        if let Some(claim) = claim.filter(|c| c.metadata.uid == claim_uid) {
+            return Ok(match claim.spec.volume_name.as_deref() {
+                // the claim is bound to another PV, this PV *is* released
+                Some(v) if !v.is_empty() && v != pv.metadata.name => true,
+                _ => false,
             });
-            return Ok(());
         }
-        if matches!(
-            pv.spec.persistent_volume_reclaim_policy,
-            Some(PersistentVolumeReclaimPolicy::Unknown(_))
-        ) {
-            // `default:` branch of reclaimVolume (`pv_controller.go:1217-1222`).
-            self.update_volume_phase_with_event(
-                pv.clone(),
-                PersistentVolumePhase::Failed,
-                "VolumeUnknownReclaimPolicy",
-                "Volume has unrecognized PersistentVolumeReclaimPolicy",
-            )
+        Ok(true)
+    }
+
+    /// `claims.GetByKey(claimrefToClaimKey(ref))` (`pv_controller.go:1410`).
+    async fn get_claim_by_ref(
+        &self,
+        claim_ref: &ObjectReference,
+    ) -> Result<Option<PersistentVolumeClaim>> {
+        let (Some(ns), Some(name)) = (claim_ref.namespace.as_deref(), claim_ref.name.as_deref())
+        else {
+            return Ok(None);
+        };
+        let key = build_key("persistentvolumeclaims", Some(ns), name);
+        match self.storage.get::<PersistentVolumeClaim>(&key).await {
+            Ok(c) => Ok(Some(c)),
+            Err(rusternetes_common::Error::NotFound(_)) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// `isVolumeUsed` (`pv_controller.go:1457-1474`): the sorted
+    /// `namespace/name` of every non-terminated pod using the claim the
+    /// volume was bound to.
+    async fn is_volume_used(&self, pv: &PersistentVolume) -> Result<Vec<String>> {
+        let Some(claim_ref) = pv.spec.claim_ref.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let namespace = claim_ref.namespace.as_deref().unwrap_or("");
+        let claim_name = claim_ref.name.as_deref().unwrap_or("");
+        let pods: Vec<Pod> = self
+            .storage
+            .list(&format!("/registry/pods/{}/", namespace))
             .await?;
+        let mut names: Vec<String> = pods
+            .iter()
+            .filter(|p| pod_uses_claim(p, claim_name) && !is_pod_terminated(p))
+            .map(|p| format!("{}/{}", namespace, p.metadata.name))
+            .collect();
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
+    /// `deleteVolumeOperation` (`pv_controller.go:1323-1390`). Re-reads the
+    /// volume, skips it unless still released (`:1342-1350`; the
+    /// `HonorPVReclaimPolicy` branch at `:1336` is taken, so a volume with a
+    /// deletion timestamp is still processed), then `doDeleteVolume`. A
+    /// failing deleter marks the volume `Failed` with `Warning
+    /// VolumeFailedDelete` (`:1354-1372`); the next sync retries.
+    async fn delete_volume_operation(&self, volume: &PersistentVolume) -> Result<()> {
+        let Some(new_volume) = self.get_volume(&volume.metadata.name).await? else {
+            return Ok(());
+        };
+        if !self.is_volume_released(&new_volume).await? {
+            debug!(
+                "Volume {} no longer needs deletion, skipping",
+                new_volume.metadata.name
+            );
             return Ok(());
         }
-        if pv.spec.persistent_volume_reclaim_policy == Some(PersistentVolumeReclaimPolicy::Delete) {
-            // `doDeleteVolume` (`pv_controller.go:1499-1540`): run the
-            // plugin's deleter first; a failure marks the volume Failed with
-            // a `VolumeFailedDelete` warning and the PV is kept
-            // (`deleteVolumeOperation`, `:1360-1366`); it is retried on the
-            // next sync.
-            if let Some(path) = host_path_deleter_path(pv) {
-                if let Err(msg) = host_path_delete(&path).await {
-                    self.update_volume_phase_with_event(
-                        pv.clone(),
-                        PersistentVolumePhase::Failed,
-                        "VolumeFailedDelete",
-                        &msg,
-                    )
-                    .await?;
-                    return Ok(());
-                }
+        match find_deletable_plugin(volume) {
+            // "External deleter is requested, do nothing" (`:1508-1512`).
+            Ok(false) => return Ok(()),
+            Ok(true) => {}
+            Err(msg) => {
+                debug!(
+                    "Deletion of volume {} failed: {}",
+                    volume.metadata.name, msg
+                );
+                self.update_volume_phase_with_event(
+                    volume.clone(),
+                    PersistentVolumePhase::Failed,
+                    "VolumeFailedDelete",
+                    &msg,
+                )
+                .await?;
+                return Ok(());
             }
-            let pv_key = build_key("persistentvolumes", None, &pv.metadata.name);
-            match self.storage.delete(&pv_key).await {
-                Ok(()) | Err(rusternetes_common::Error::NotFound(_)) => {}
-                Err(e) => return Err(e.into()),
-            }
-            info!("Reclaim(Delete): deleted released PV {}", pv.metadata.name);
         }
+        // `plugin.NewDeleter(...).Delete()` (`doDeleteVolume`, `:1499-1531`):
+        // the in-tree hostPath deleter wipes the directory first; a failure
+        // marks the volume Failed with `VolumeFailedDelete` and keeps the PV
+        // (`deleteVolumeOperation`, `:1354-1372`); the next sync retries.
+        if let Some(hp) = volume.spec.host_path.as_ref() {
+            if let Err(msg) = host_path_delete(&hp.path).await {
+                self.update_volume_phase_with_event(
+                    volume.clone(),
+                    PersistentVolumePhase::Failed,
+                    "VolumeFailedDelete",
+                    &msg,
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+        // "Remove in-tree delete finalizer on the PV as the volume has been
+        // deleted from the underlying storage" (`:1532-1538`).
+        self.remove_deletion_protection_finalizer(&volume.metadata.name)
+            .await?;
+        let pv_key = build_key("persistentvolumes", None, &volume.metadata.name);
+        match self.storage.delete(&pv_key).await {
+            Ok(()) | Err(rusternetes_common::Error::NotFound(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+        info!(
+            "Reclaim(Delete): deleted released PV {}",
+            volume.metadata.name
+        );
+        Ok(())
+    }
+
+    /// `removeDeletionProtectionFinalizer` (`pv_controller.go:1542-1572`).
+    async fn remove_deletion_protection_finalizer(&self, name: &str) -> Result<()> {
+        let Some(mut pv) = self.get_volume(name).await? else {
+            return Ok(());
+        };
+        let Some(finalizers) = pv.metadata.finalizers.as_mut() else {
+            return Ok(());
+        };
+        if !finalizers
+            .iter()
+            .any(|f| f == IN_TREE_PV_DELETION_PROTECTION_FINALIZER)
+        {
+            return Ok(());
+        }
+        finalizers.retain(|f| f != IN_TREE_PV_DELETION_PROTECTION_FINALIZER);
+        if finalizers.is_empty() {
+            pv.metadata.finalizers = None;
+        }
+        let pv_key = build_key("persistentvolumes", None, name);
+        self.storage.update(&pv_key, &pv).await?;
         Ok(())
     }
 
@@ -750,6 +914,50 @@ impl<S: Storage + 'static> PVBinderController<S> {
                 return;
             }
         };
+
+        // The guards before the plugin lookup (`:1240-1263`). A read error
+        // leaves the volume untouched; the next sync retries.
+        match self.is_volume_released(&volume).await {
+            Ok(true) => {}
+            Ok(false) => {
+                debug!(
+                    "Volume {} no longer needs recycling, skipping",
+                    volume.metadata.name
+                );
+                return;
+            }
+            Err(e) => {
+                debug!("RecycleVolumeOperation: isVolumeReleased failed: {}", e);
+                return;
+            }
+        }
+        let pods = match self.is_volume_used(&volume).await {
+            Ok(p) => p,
+            Err(e) => {
+                debug!("RecycleVolumeOperation: isVolumeUsed failed: {}", e);
+                return;
+            }
+        };
+        // "Verify the claim is in cache: if so, then it is a different PVC with
+        // the same name since the volume is known to be released at this
+        // moment ... So the old PV is safe to be recycled." (`:1254-1263`)
+        let claim_cached = match volume.spec.claim_ref.as_ref() {
+            Some(cr) => match self.get_claim_by_ref(cr).await {
+                Ok(c) => c.is_some(),
+                Err(e) => {
+                    debug!("RecycleVolumeOperation: reading claim failed: {}", e);
+                    return;
+                }
+            },
+            None => false,
+        };
+        if !pods.is_empty() && !claim_cached {
+            let msg = format!("Volume is used by pods: {}", pods.join(","));
+            debug!("Can't recycle volume {}: {}", volume.metadata.name, msg);
+            self.event(object_ref_for_pv(&volume), "VolumeFailedRecycle", &msg)
+                .await;
+            return;
+        }
 
         // Find a plugin.
         let Some(pod) = super::pv_recycler::recycler_pod_for_volume(&volume) else {
@@ -2531,6 +2739,12 @@ mod tests {
         let c = PVBinderController::new(storage.clone());
         let mut pv = bound_pv("pv");
         pv.spec.persistent_volume_reclaim_policy = Some(PersistentVolumeReclaimPolicy::Delete);
+        pv.spec.host_path = Some(
+            rusternetes_common::resources::volume::HostPathVolumeSource {
+                path: "/tmp/rusternetes-reclaim-test-nonexistent".into(),
+                r#type: None,
+            },
+        );
         put_pv(&storage, &pv).await;
         c.sync_volumes(&WorkQueue::new()).await.unwrap();
         assert!(get_pv(&storage, "pv").await.is_none());
@@ -3176,7 +3390,7 @@ mod tests {
         pv.spec.persistent_volume_reclaim_policy = Some(PersistentVolumeReclaimPolicy::Delete);
         pv.metadata.annotations = Some(HashMap::from([(
             ANN_DYNAMICALLY_PROVISIONED.to_string(),
-            "x".to_string(),
+            "kubernetes.io/host-path".to_string(),
         )]));
         put_pv(&storage, &pv).await;
         put_pvc(&storage, &claim_bound_elsewhere()).await;
@@ -4049,5 +4263,313 @@ mod tests {
             self.spec.storage_class_name = Some(c.into());
             self
         }
+    }
+
+    // ---- reclaimVolume: delete/recycle operations (pv_controller.go:1180-1540;
+    // delete_test.go 8-*, recycle_test.go 6-*) ----
+
+    fn reclaim_pv(
+        policy: PersistentVolumeReclaimPolicy,
+        provisioned_by: Option<&str>,
+        host_path: bool,
+    ) -> PersistentVolume {
+        let mut pv = bound_pv("pv");
+        pv.spec.persistent_volume_reclaim_policy = Some(policy);
+        if host_path {
+            pv.spec.host_path = Some(
+                rusternetes_common::resources::volume::HostPathVolumeSource {
+                    path: "/tmp/x".into(),
+                    r#type: None,
+                },
+            );
+        }
+        if let Some(p) = provisioned_by {
+            pv.metadata.annotations = Some(HashMap::from([(
+                ANN_DYNAMICALLY_PROVISIONED.to_string(),
+                p.to_string(),
+            )]));
+        }
+        pv
+    }
+
+    async fn reason_events(
+        storage: &Arc<MemoryStorage>,
+        reason: &str,
+    ) -> Vec<rusternetes_common::resources::Event> {
+        let all: Vec<rusternetes_common::resources::Event> =
+            storage.list("/registry/events/").await.unwrap();
+        all.into_iter().filter(|e| e.reason == reason).collect()
+    }
+
+    /// delete_test.go "8-3": no deleter plugin for the volume -> Failed and
+    /// `Warning VolumeFailedDelete`; the PV is NOT deleted.
+    #[tokio::test]
+    async fn delete_without_deleter_plugin_fails_volume() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        put_pv(
+            &storage,
+            &reclaim_pv(PersistentVolumeReclaimPolicy::Delete, None, false),
+        )
+        .await;
+        c.sync_volumes(&WorkQueue::new()).await.unwrap();
+        let pv = get_pv(&storage, "pv").await.expect("PV must survive");
+        assert_eq!(pv.status.unwrap().phase, PersistentVolumePhase::Failed);
+        let ev = reason_events(&storage, "VolumeFailedDelete").await;
+        assert_eq!(ev.len(), 1);
+        assert!(ev[0].message.contains("no deletable volume plugin matched"));
+    }
+
+    /// delete_test.go "8-10-1": a volume provisioned by an external
+    /// provisioner is left for the external deleter (findDeletablePlugin,
+    /// pv_controller.go:1957-1969): stays Released, no event.
+    #[tokio::test]
+    async fn delete_of_externally_provisioned_volume_is_left_alone() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        let pv = reclaim_pv(
+            PersistentVolumeReclaimPolicy::Delete,
+            Some("ebs.csi.aws.com"),
+            false,
+        );
+        put_pv(&storage, &pv).await;
+        c.sync_volumes(&WorkQueue::new()).await.unwrap();
+        let got = get_pv(&storage, "pv").await.expect("PV must survive");
+        assert_eq!(got.status.unwrap().phase, PersistentVolumePhase::Released);
+        assert!(reason_events(&storage, "VolumeFailedDelete")
+            .await
+            .is_empty());
+    }
+
+    /// An unknown `kubernetes.io/` provisioner is an error, not external
+    /// (pv_controller.go:1962-1966).
+    #[tokio::test]
+    async fn delete_with_unknown_in_tree_provisioner_fails_volume() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        let pv = reclaim_pv(
+            PersistentVolumeReclaimPolicy::Delete,
+            Some("kubernetes.io/nope"),
+            true,
+        );
+        put_pv(&storage, &pv).await;
+        c.sync_volumes(&WorkQueue::new()).await.unwrap();
+        let got = get_pv(&storage, "pv").await.unwrap();
+        assert_eq!(got.status.unwrap().phase, PersistentVolumePhase::Failed);
+        assert_eq!(reason_events(&storage, "VolumeFailedDelete").await.len(), 1);
+    }
+
+    /// delete_test.go "8-1" + doDeleteVolume (:1532-1538): the in-tree
+    /// deletion-protection finalizer is removed, then the PV is deleted.
+    #[tokio::test]
+    async fn delete_with_deleter_plugin_deletes_volume() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        let pv = reclaim_pv(
+            PersistentVolumeReclaimPolicy::Delete,
+            Some("kubernetes.io/host-path"),
+            true,
+        );
+        put_pv(&storage, &pv).await;
+        c.sync_volumes(&WorkQueue::new()).await.unwrap();
+        assert!(get_pv(&storage, "pv").await.is_none());
+    }
+
+    /// delete_test.go "8-7": the volume is bound again before deleteVolumeOperation
+    /// runs: isVolumeReleased is false, nothing is deleted.
+    #[tokio::test]
+    async fn delete_operation_skips_volume_that_is_no_longer_released() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        let pv = reclaim_pv(PersistentVolumeReclaimPolicy::Delete, None, true);
+        put_pv(&storage, &pv).await;
+        let mut claim = make_pvc("c", "u");
+        claim.spec.volume_name = Some("pv".into());
+        put_pvc(&storage, &claim).await;
+        c.reclaim_volume(&pv).await.unwrap();
+        assert!(get_pv(&storage, "pv").await.is_some());
+        // 8-6: volume deleted before deleting is not an error.
+        storage
+            .delete(&build_key("persistentvolumes", None, "pv"))
+            .await
+            .unwrap();
+        c.reclaim_volume(&pv).await.unwrap();
+    }
+
+    async fn put_pod_json(storage: &Arc<MemoryStorage>, name: &str, phase: Option<&str>) {
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": name, "namespace": "sstest"},
+            "spec": {
+                "nodeName": "n",
+                "containers": [{"name": "c", "image": "i"}],
+                "volumes": [{"name": "v", "persistentVolumeClaim": {"claimName": "c"}}]
+            },
+            "status": {"phase": phase}
+        }))
+        .unwrap();
+        storage
+            .create(&build_key("pods", Some("sstest"), name), &pod)
+            .await
+            .unwrap();
+    }
+
+    /// recycle_test.go "6-11": released volume still used by a running pod and
+    /// its claim gone -> `Normal VolumeFailedRecycle` naming the pods, no
+    /// phase change beyond Released (pv_controller.go:1265-1270).
+    #[tokio::test]
+    async fn recycle_of_volume_used_by_running_pod_emits_event_and_waits() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        put_pv(&storage, &recycle_pv("pv", true)).await;
+        put_pod_json(&storage, "p", Some("Running")).await;
+        c.sync_volumes(&WorkQueue::new()).await.unwrap();
+        settle(&c).await;
+        let got = get_pv(&storage, "pv").await.unwrap();
+        assert_eq!(got.status.unwrap().phase, PersistentVolumePhase::Released);
+        let ev = reason_events(&storage, "VolumeFailedRecycle").await;
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].message, "Volume is used by pods: sstest/p");
+        assert_eq!(
+            ev[0].event_type,
+            rusternetes_common::resources::EventType::Normal
+        );
+        assert!(
+            storage
+                .get::<Pod>(&build_key("pods", Some("default"), "recycler-for-pv"))
+                .await
+                .is_err(),
+            "no recycler pod may run while a pod uses the volume"
+        );
+    }
+
+    /// recycle_test.go "6-12": a pending pod holds the volume too.
+    #[tokio::test]
+    async fn recycle_of_volume_used_by_pending_pod_emits_event_and_waits() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        put_pv(&storage, &recycle_pv("pv", true)).await;
+        put_pod_json(&storage, "p", Some("Pending")).await;
+        c.sync_volumes(&WorkQueue::new()).await.unwrap();
+        settle(&c).await;
+        let got = get_pv(&storage, "pv").await.unwrap();
+        assert_eq!(got.status.unwrap().phase, PersistentVolumePhase::Released);
+        let ev = reason_events(&storage, "VolumeFailedRecycle").await;
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].message, "Volume is used by pods: sstest/p");
+    }
+
+    /// recycle_test.go "6-13": a completed pod does not hold the volume, so
+    /// the recycler runs and the volume becomes Available.
+    #[tokio::test]
+    async fn recycle_ignores_completed_pods() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        put_pv(&storage, &recycle_pv("pv", true)).await;
+        put_pod_json(&storage, "p", Some("Succeeded")).await;
+        let kubelet = fake_kubelet(
+            &storage,
+            "pv",
+            rusternetes_common::types::Phase::Succeeded,
+            None,
+        );
+        c.sync_volumes(&WorkQueue::new()).await.unwrap();
+        settle(&c).await;
+        kubelet.await.unwrap();
+        let got = get_pv(&storage, "pv").await.unwrap();
+        assert_eq!(got.status.unwrap().phase, PersistentVolumePhase::Available);
+        assert!(got.spec.claim_ref.is_none());
+        assert!(reason_events(&storage, "VolumeFailedRecycle")
+            .await
+            .is_empty());
+    }
+
+    /// recycle_test.go "6-14": a pod uses the claim name, but a (different)
+    /// claim with that name exists, so the old PV is safe to recycle.
+    #[tokio::test]
+    async fn recycle_proceeds_when_a_same_name_claim_exists() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        put_pv(&storage, &recycle_pv("pv", true)).await;
+        put_pod_json(&storage, "p", Some("Running")).await;
+        put_pvc(&storage, &make_pvc("c", "other-uid")).await;
+        let kubelet = fake_kubelet(
+            &storage,
+            "pv",
+            rusternetes_common::types::Phase::Succeeded,
+            None,
+        );
+        c.sync_volumes(&WorkQueue::new()).await.unwrap();
+        settle(&c).await;
+        kubelet.await.unwrap();
+        let got = get_pv(&storage, "pv").await.unwrap();
+        assert_eq!(got.status.unwrap().phase, PersistentVolumePhase::Available);
+        assert!(reason_events(&storage, "VolumeFailedRecycle")
+            .await
+            .is_empty());
+    }
+
+    /// recycle_test.go "6-6": the volume is deleted before the operation
+    /// starts: nothing happens and no recycler pod is created
+    /// (pv_controller.go:1231-1238).
+    #[tokio::test]
+    async fn recycle_operation_skips_volume_deleted_before_it_starts() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        c.recycle_volume_operation(recycle_pv("pv", true)).await;
+        assert!(get_pv(&storage, "pv").await.is_none());
+        assert!(storage
+            .get::<Pod>(&build_key("pods", Some("default"), "recycler-for-pv"))
+            .await
+            .is_err());
+        assert!(reason_events(&storage, "VolumeFailedRecycle")
+            .await
+            .is_empty());
+    }
+
+    /// Stale volume passed to the operation, current copy already recycled by
+    /// a previous operation (`isVolumeReleased` is false): skipped.
+    async fn recycle_stale_volume_is_skipped(by_controller: bool) {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        let stale = recycle_pv("pv", by_controller);
+        let mut current = stale.clone();
+        // What `unbindVolume` leaves behind (`:1140-1178`).
+        if by_controller {
+            current.spec.claim_ref = None;
+            current.metadata.annotations = None;
+        } else if let Some(cr) = current.spec.claim_ref.as_mut() {
+            cr.uid = None;
+        }
+        current.status = Some(rusternetes_common::resources::PersistentVolumeStatus {
+            phase: PersistentVolumePhase::Available,
+            ..Default::default()
+        });
+        put_pv(&storage, &current).await;
+        c.recycle_volume_operation(stale).await;
+        let got = get_pv(&storage, "pv").await.unwrap();
+        assert_eq!(got.status.unwrap().phase, PersistentVolumePhase::Available);
+        assert!(storage
+            .get::<Pod>(&build_key("pods", Some("default"), "recycler-for-pv"))
+            .await
+            .is_err());
+        assert!(reason_events(&storage, "VolumeFailedRecycle")
+            .await
+            .is_empty());
+        assert!(reason_events(&storage, "VolumeRecycled").await.is_empty());
+    }
+
+    /// recycle_test.go "6-7": "volume no longer needs recycling, skipping"
+    /// for a volume bound by the controller.
+    #[tokio::test]
+    async fn recycle_operation_skips_volume_recycled_by_previous_operation() {
+        recycle_stale_volume_is_skipped(true).await;
+    }
+
+    /// recycle_test.go "6-8": the same for a volume bound by the user.
+    #[tokio::test]
+    async fn recycle_operation_skips_prebound_volume_recycled_by_previous_operation() {
+        recycle_stale_volume_is_skipped(false).await;
     }
 }
