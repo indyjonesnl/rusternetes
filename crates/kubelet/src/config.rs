@@ -415,6 +415,31 @@ impl KubeletConfiguration {
             .unwrap_or(MAX_CONTAINER_BACKOFF)
     }
 
+    /// Gate-aware defaulting of `crashLoopBackOff.maxContainerRestartPeriod`
+    /// (v1beta1/defaults.go:311-315): only when `KubeletCrashLoopBackOffMax` is
+    /// enabled is a nil pointer defaulted to `MaxContainerBackOff`; with the
+    /// gate off the field stays unset (and `validate` rejects a set value).
+    pub fn default_max_container_restart_period(
+        configured: Option<std::time::Duration>,
+    ) -> Option<std::time::Duration> {
+        if rusternetes_common::feature_gates::enabled(
+            rusternetes_common::feature_gates::Feature::KubeletCrashLoopBackOffMax,
+        ) {
+            Some(configured.unwrap_or(MAX_CONTAINER_BACKOFF))
+        } else {
+            configured
+        }
+    }
+
+    /// The defaulted value fed to `newCrashLoopBackOff` (kubelet.go:353-356).
+    pub fn effective_max_container_restart_period_gated(&self) -> Option<std::time::Duration> {
+        Self::default_max_container_restart_period(
+            self.crash_loop_backoff
+                .as_ref()
+                .and_then(|c| c.max_container_restart_period),
+        )
+    }
+
     /// `cpuCFSQuotaPeriod` with the upstream default applied (100ms).
     pub fn effective_cpu_cfs_quota_period(&self) -> std::time::Duration {
         self.cpu_cfs_quota_period
@@ -510,20 +535,28 @@ impl KubeletConfiguration {
         }
 
         // validation.go:219-228. KubeletCrashLoopBackOffMax is Beta/default-on in
-        // 1.35 (kube_features.go:1429-1432); gates are not modelled, so it is
-        // treated as enabled and the nil case is the defaulted 300s.
-        if let Some(d) = self
+        // 1.35 (kube_features.go:1429-1432); the nil case is the defaulted 300s
+        // (defaults.go:311-315) so only a set value is range-checked.
+        let period = self
             .crash_loop_backoff
             .as_ref()
-            .and_then(|c| c.max_container_restart_period)
-        {
-            let ms = d.as_millis();
-            if !(1000..=300_000).contains(&ms) {
-                anyhow::bail!(
-                    "invalid configuration: CrashLoopBackOff.MaxContainerRestartPeriod (got: {} seconds) must be set between 1s and 300s",
-                    d.as_secs_f64()
-                );
+            .and_then(|c| c.max_container_restart_period);
+        if rusternetes_common::feature_gates::enabled(
+            rusternetes_common::feature_gates::Feature::KubeletCrashLoopBackOffMax,
+        ) {
+            if let Some(d) = period {
+                let ms = d.as_millis();
+                if !(1000..=300_000).contains(&ms) {
+                    anyhow::bail!(
+                        "invalid configuration: CrashLoopBackOff.MaxContainerRestartPeriod (got: {} seconds) must be set between 1s and 300s",
+                        d.as_secs_f64()
+                    );
+                }
             }
+        } else if period.is_some() {
+            anyhow::bail!(
+                "invalid configuration: FeatureGate KubeletCrashLoopBackOffMax not enabled, CrashLoopBackOff.MaxContainerRestartPeriod must not be set"
+            );
         }
 
         Ok(())
@@ -817,6 +850,23 @@ mod tests {
             s(5)
         );
         assert_eq!(c.effective_max_container_restart_period(), s(45));
+    }
+
+    /// validation.go:226-228 + defaults.go:311-315 with the gate off.
+    #[test]
+    #[serial_test::serial]
+    fn test_crashloop_max_gate_off() {
+        use rusternetes_common::feature_gates::{with_feature, Feature};
+        let _g = with_feature(Feature::KubeletCrashLoopBackOffMax, false);
+        let set: KubeletConfiguration =
+            serde_yaml::from_str("crashLoopBackOff:\n  maxContainerRestartPeriod: 45s\n").unwrap();
+        assert_eq!(
+            set.validate().unwrap_err().to_string(),
+            "invalid configuration: FeatureGate KubeletCrashLoopBackOffMax not enabled, CrashLoopBackOff.MaxContainerRestartPeriod must not be set"
+        );
+        let unset = KubeletConfiguration::default();
+        unset.validate().unwrap();
+        assert_eq!(unset.effective_max_container_restart_period_gated(), None);
     }
 
     /// validation_test.go:397-418 (too low / too high) and the 1s/300s bounds.
