@@ -218,6 +218,12 @@ pub enum PersistentVolumeReclaimPolicy {
     Retain,
     Recycle,
     Delete,
+    /// Any value this server does not recognise. Decoding leniently lets the
+    /// PV controller reach `reclaimVolume`'s default branch and fail the
+    /// volume (`pv_controller.go:1217-1222`) instead of the PV becoming
+    /// undecodable. Validation still rejects it on write.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
