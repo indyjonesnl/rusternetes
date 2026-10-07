@@ -83,6 +83,7 @@ impl VolumePlugin for ConfigMapPlugin {
                 .clone()
                 .expect("checked by can_support"),
             storage: self.host.get_kube_client().cloned(),
+            fs_group: crate::volume_plugins::util::fs_group_from(pod),
         }))
     }
 }
@@ -101,6 +102,8 @@ struct ConfigMapMounter {
     namespace: String,
     config_map: ConfigMapVolumeSource,
     storage: Option<Arc<StorageBackend>>,
+    /// `mounterArgs.FsGroup` (`volume.go:132`).
+    fs_group: Option<i64>,
 }
 
 #[async_trait]
@@ -178,9 +181,11 @@ impl Mounter for ConfigMapMounter {
         // `defer` at `configmap.go:222-237`: if the AtomicWriter fails after
         // the wrapped emptyDir SetUpAt, `unmounter.TearDown()` runs, and
         // emptyDir `TearDownAt` removes the volume directory.
-        if let Err(e) = crate::atomic_writer::write_projected_payload(
+        if let Err(e) = crate::volume_ownership::write_payload_with_ownership(
             std::path::Path::new(volume_dir),
             &payload,
+            self.fs_group,
+            true,
         ) {
             if let Err(td) = std::fs::remove_dir_all(volume_dir) {
                 tracing::error!("Error tearing down volume {}: {}", self.volume_name, td);
@@ -306,6 +311,7 @@ mod tests {
             storage: Some(Arc::new(StorageBackend::Memory(Arc::new(
                 rusternetes_storage::MemoryStorage::new(),
             )))),
+            fs_group: None,
         }
     }
 
