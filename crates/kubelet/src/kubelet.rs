@@ -134,8 +134,9 @@ pub enum PodWorkerState {
 /// The first restart after a crash is immediate. Matches upstream
 /// `pkg/kubelet/kubelet.go` `backOffPeriod = 10s`.
 const CRASHLOOP_BACKOFF_INITIAL: Duration = Duration::from_secs(10);
-/// Maximum CrashLoopBackOff delay. Matches upstream `MaxCrashLoopBackOff` (5m).
-const CRASHLOOP_BACKOFF_MAX: Duration = Duration::from_secs(300);
+/// Default maximum CrashLoopBackOff delay: upstream `MaxCrashLoopBackOff` (5m),
+/// overridable by `crashLoopBackOff.maxContainerRestartPeriod`.
+const CRASHLOOP_BACKOFF_MAX: Duration = crate::config::MAX_CONTAINER_BACKOFF;
 
 /// Defensive backoff for a terminal pod whose `finalize_terminated_pod_storage`
 /// reported removal but left the object in storage (#1157). The per-pod worker
@@ -451,6 +452,8 @@ pub struct Kubelet {
     /// ticked recently. Mirrors upstream `pkg/kubelet/kubelet.go`'s
     /// `syncLoopMonitor`. 0 = no successful sync yet.
     last_sync: AtomicU64,
+    /// Effective `crashLoopBackOff.maxContainerRestartPeriod` (default 5m).
+    crash_loop_backoff_max: Duration,
     /// Port the kubelet API server listens on (the `--metrics-port` flag).
     /// Advertised in the node's `status.daemonEndpoints.kubeletEndpoint.Port`
     /// so the api-server proxies log/exec/metrics requests to the right port.
@@ -739,6 +742,7 @@ impl Kubelet {
             recently_deleted: Arc::new(Mutex::new(HashMap::new())),
             pod_workers: Arc::new(Mutex::new(HashMap::new())),
             last_sync: AtomicU64::new(0),
+            crash_loop_backoff_max: CRASHLOOP_BACKOFF_MAX,
             metrics_port,
             pod_manifest_path: None,
             node_status_update_frequency: Duration::from_secs(10),
@@ -796,6 +800,22 @@ impl Kubelet {
             .iter()
             .map(|p| (p.metadata.name.clone(), p.clone()))
             .collect();
+    }
+
+    /// Apply `crashLoopBackOff.maxContainerRestartPeriod` (already validated to
+    /// [1s, 300s]; `None` keeps the 300s default). Ported from
+    /// `newCrashLoopBackOff` (pkg/kubelet/kubelet.go:345-358).
+    pub fn with_crash_loop_backoff_max(mut self, d: Option<Duration>) -> Self {
+        if let Some(d) = d {
+            self.crash_loop_backoff_max = d;
+        }
+        self
+    }
+
+    /// Initial backoff: 10s, clamped to the max (`if boMax < boInitial { boInitial = boMax }`,
+    /// kubelet.go:356-358).
+    pub(crate) fn crash_loop_backoff_initial(&self) -> Duration {
+        CRASHLOOP_BACKOFF_INITIAL.min(self.crash_loop_backoff_max)
     }
 
     /// Apply `KubeletConfiguration.runtimeRequestTimeout` (2m when unset/zero,
@@ -3187,7 +3207,7 @@ impl Kubelet {
                                                 RestartBackoff {
                                                     restart_count: 1,
                                                     last_restart: now,
-                                                    backoff: CRASHLOOP_BACKOFF_INITIAL,
+                                                    backoff: self.crash_loop_backoff_initial(),
                                                 },
                                             );
                                             (true, 1)
@@ -3198,8 +3218,8 @@ impl Kubelet {
                                             {
                                                 entry.restart_count += 1;
                                                 entry.last_restart = now;
-                                                entry.backoff =
-                                                    (entry.backoff * 2).min(CRASHLOOP_BACKOFF_MAX);
+                                                entry.backoff = (entry.backoff * 2)
+                                                    .min(self.crash_loop_backoff_max);
                                                 (true, entry.restart_count)
                                             } else {
                                                 (false, entry.restart_count)
@@ -5105,7 +5125,7 @@ impl Kubelet {
                             RestartBackoff {
                                 restart_count: 1,
                                 last_restart: now,
-                                backoff: CRASHLOOP_BACKOFF_INITIAL,
+                                backoff: self.crash_loop_backoff_initial(),
                             },
                         );
                         true
@@ -5114,7 +5134,7 @@ impl Kubelet {
                         if now.duration_since(entry.last_restart) >= entry.backoff {
                             entry.restart_count += 1;
                             entry.last_restart = now;
-                            entry.backoff = (entry.backoff * 2).min(CRASHLOOP_BACKOFF_MAX);
+                            entry.backoff = (entry.backoff * 2).min(self.crash_loop_backoff_max);
                             true
                         } else {
                             false // still within the backoff window
@@ -6294,6 +6314,47 @@ mod tests {
             .await
             .with_runtime_request_timeout(Some(Duration::ZERO));
         assert_eq!(z.runtime_request_timeout(), Duration::from_secs(120));
+    }
+
+    /// `crashLoopBackOff.maxContainerRestartPeriod` caps the restart backoff and
+    /// clamps the initial delay (kubelet.go:345-358).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn crash_loop_backoff_max_applies() {
+        use rusternetes_storage::StorageBackend;
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("absent.sock");
+        std::env::set_var(
+            "CONTAINER_RUNTIME_ENDPOINT",
+            format!("unix://{}", sock.display()),
+        );
+        let mk = || async {
+            Kubelet::new(
+                "node-clb".into(),
+                std::sync::Arc::new(StorageBackend::new_memory()),
+                10,
+                dir.path().join("vols").display().to_string(),
+                "10.96.0.10".into(),
+                "cluster.local".into(),
+                "bridge".into(),
+                String::new(),
+            )
+            .await
+            .unwrap()
+        };
+        let d = mk().await;
+        assert_eq!(d.crash_loop_backoff_max, Duration::from_secs(300));
+        assert_eq!(d.crash_loop_backoff_initial(), Duration::from_secs(10));
+        let c = mk()
+            .await
+            .with_crash_loop_backoff_max(Some(Duration::from_secs(60)));
+        assert_eq!(c.crash_loop_backoff_max, Duration::from_secs(60));
+        assert_eq!(c.crash_loop_backoff_initial(), Duration::from_secs(10));
+        let t = mk()
+            .await
+            .with_crash_loop_backoff_max(Some(Duration::from_secs(3)));
+        assert_eq!(t.crash_loop_backoff_initial(), Duration::from_secs(3));
     }
 
     /// #1929: a kubelet whose CRI endpoint is an absent socket must report

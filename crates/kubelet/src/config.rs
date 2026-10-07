@@ -152,6 +152,23 @@ pub struct KubeletConfiguration {
     #[serde(rename = "cpuCFSQuotaPeriod")]
     pub cpu_cfs_quota_period: Option<std::time::Duration>,
 
+    /// `authentication` (`KubeletAuthentication`): only the webhook cache TTL is
+    /// modelled (`pkg/kubelet/apis/config/types.go` `KubeletWebhookAuthentication.CacheTTL`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authentication: Option<KubeletAuthentication>,
+
+    /// `authorization` (`KubeletAuthorization`): only the webhook cache TTLs are modelled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<KubeletAuthorization>,
+
+    /// `crashLoopBackOff` (`CrashLoopBackOffConfig`, types.go:815-823).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "crashLoopBackOff"
+    )]
+    pub crash_loop_backoff: Option<CrashLoopBackOffConfig>,
+
     /// Port for the metrics server
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metrics_bind_port: Option<u16>,
@@ -172,6 +189,73 @@ fn nonzero_or(v: Option<std::time::Duration>, default_secs: u64) -> std::time::D
     v.filter(|d| !d.is_zero())
         .unwrap_or(std::time::Duration::from_secs(default_secs))
 }
+
+/// `KubeletAuthentication` (types.go:579); only `webhook.cacheTTL` is modelled.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KubeletAuthentication {
+    #[serde(default)]
+    pub webhook: KubeletWebhookAuthentication,
+}
+
+/// `KubeletWebhookAuthentication`: `cacheTTL` defaults to 2m (v1beta1/defaults.go:98-100).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KubeletWebhookAuthentication {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "rusternetes_common::go_duration::option_serde"
+    )]
+    #[serde(rename = "cacheTTL")]
+    pub cache_ttl: Option<std::time::Duration>,
+}
+
+/// `KubeletAuthorization`; only `webhook.cache{Authorized,Unauthorized}TTL` are modelled.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KubeletAuthorization {
+    #[serde(default)]
+    pub webhook: KubeletWebhookAuthorization,
+}
+
+/// `KubeletWebhookAuthorization`: `cacheAuthorizedTTL` 5m, `cacheUnauthorizedTTL` 30s
+/// (v1beta1/defaults.go:104-109).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KubeletWebhookAuthorization {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "rusternetes_common::go_duration::option_serde"
+    )]
+    #[serde(rename = "cacheAuthorizedTTL")]
+    pub cache_authorized_ttl: Option<std::time::Duration>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "rusternetes_common::go_duration::option_serde"
+    )]
+    #[serde(rename = "cacheUnauthorizedTTL")]
+    pub cache_unauthorized_ttl: Option<std::time::Duration>,
+}
+
+/// `CrashLoopBackOffConfig` (types.go:815-823).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CrashLoopBackOffConfig {
+    /// Unset means the 300s default; an explicit value must be in [1s, 300s]
+    /// (validation.go:223-225).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "rusternetes_common::go_duration::option_serde"
+    )]
+    pub max_container_restart_period: Option<std::time::Duration>,
+}
+
+/// `MaxContainerBackOff` (v1beta1/defaults.go:46).
+pub const MAX_CONTAINER_BACKOFF: std::time::Duration = std::time::Duration::from_secs(300);
 
 fn default_api_version() -> String {
     "kubelet.config.k8s.io/v1beta1".to_string()
@@ -204,6 +288,9 @@ impl Default for KubeletConfiguration {
             shutdown_grace_period: None,
             shutdown_grace_period_critical_pods: None,
             cpu_cfs_quota_period: None,
+            authentication: None,
+            authorization: None,
+            crash_loop_backoff: None,
             metrics_bind_port: None,
             log_level: None,
             cluster_service_cidr: None,
@@ -286,6 +373,46 @@ impl KubeletConfiguration {
                 None => std::time::Duration::from_secs(300),
             },
         }
+    }
+
+    /// `authentication.webhook.cacheTTL`, default 2m (defaults.go:98-100).
+    pub fn effective_authentication_webhook_cache_ttl(&self) -> std::time::Duration {
+        nonzero_or(
+            self.authentication
+                .as_ref()
+                .and_then(|a| a.webhook.cache_ttl),
+            120,
+        )
+    }
+
+    /// `authorization.webhook.cacheAuthorizedTTL`, default 5m (defaults.go:104-106).
+    pub fn effective_authorization_webhook_cache_authorized_ttl(&self) -> std::time::Duration {
+        nonzero_or(
+            self.authorization
+                .as_ref()
+                .and_then(|a| a.webhook.cache_authorized_ttl),
+            300,
+        )
+    }
+
+    /// `authorization.webhook.cacheUnauthorizedTTL`, default 30s (defaults.go:107-109).
+    pub fn effective_authorization_webhook_cache_unauthorized_ttl(&self) -> std::time::Duration {
+        nonzero_or(
+            self.authorization
+                .as_ref()
+                .and_then(|a| a.webhook.cache_unauthorized_ttl),
+            30,
+        )
+    }
+
+    /// `crashLoopBackOff.maxContainerRestartPeriod`; a *nil* pointer takes
+    /// `MaxContainerBackOff` (defaults.go:311-314). Unlike the other durations an
+    /// explicit zero is kept (and rejected by `validate`).
+    pub fn effective_max_container_restart_period(&self) -> std::time::Duration {
+        self.crash_loop_backoff
+            .as_ref()
+            .and_then(|c| c.max_container_restart_period)
+            .unwrap_or(MAX_CONTAINER_BACKOFF)
     }
 
     /// `cpuCFSQuotaPeriod` with the upstream default applied (100ms).
@@ -379,6 +506,23 @@ impl KubeletConfiguration {
                     "Invalid logLevel: {}. Must be one of: trace, debug, info, warn, error",
                     level
                 ),
+            }
+        }
+
+        // validation.go:219-228. KubeletCrashLoopBackOffMax is Beta/default-on in
+        // 1.35 (kube_features.go:1429-1432); gates are not modelled, so it is
+        // treated as enabled and the nil case is the defaulted 300s.
+        if let Some(d) = self
+            .crash_loop_backoff
+            .as_ref()
+            .and_then(|c| c.max_container_restart_period)
+        {
+            let ms = d.as_millis();
+            if !(1000..=300_000).contains(&ms) {
+                anyhow::bail!(
+                    "invalid configuration: CrashLoopBackOff.MaxContainerRestartPeriod (got: {} seconds) must be set between 1s and 300s",
+                    d.as_secs_f64()
+                );
             }
         }
 
@@ -643,6 +787,58 @@ mod tests {
             loaded.sync_frequency,
             Some(std::time::Duration::from_secs(90))
         );
+    }
+
+    #[test]
+    fn test_webhook_ttls_and_crashloop_max_defaults_and_parse() {
+        let s = std::time::Duration::from_secs;
+        let d = KubeletConfiguration::default();
+        assert_eq!(d.effective_authentication_webhook_cache_ttl(), s(120));
+        assert_eq!(
+            d.effective_authorization_webhook_cache_authorized_ttl(),
+            s(300)
+        );
+        assert_eq!(
+            d.effective_authorization_webhook_cache_unauthorized_ttl(),
+            s(30)
+        );
+        assert_eq!(d.effective_max_container_restart_period(), s(300));
+
+        let yaml = "authentication:\n  webhook:\n    cacheTTL: 10s\nauthorization:\n  webhook:\n    cacheAuthorizedTTL: 1m\n    cacheUnauthorizedTTL: 5s\ncrashLoopBackOff:\n  maxContainerRestartPeriod: 45s\n";
+        let c: KubeletConfiguration = serde_yaml::from_str(yaml).unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.effective_authentication_webhook_cache_ttl(), s(10));
+        assert_eq!(
+            c.effective_authorization_webhook_cache_authorized_ttl(),
+            s(60)
+        );
+        assert_eq!(
+            c.effective_authorization_webhook_cache_unauthorized_ttl(),
+            s(5)
+        );
+        assert_eq!(c.effective_max_container_restart_period(), s(45));
+    }
+
+    /// validation_test.go:397-418 (too low / too high) and the 1s/300s bounds.
+    #[test]
+    fn test_crashloop_max_validation_range() {
+        let mk = |y: &str| serde_yaml::from_str::<KubeletConfiguration>(y).unwrap();
+        let low = mk("crashLoopBackOff:\n  maxContainerRestartPeriod: 0s\n");
+        assert_eq!(
+            low.validate().unwrap_err().to_string(),
+            "invalid configuration: CrashLoopBackOff.MaxContainerRestartPeriod (got: 0 seconds) must be set between 1s and 300s"
+        );
+        let high = mk("crashLoopBackOff:\n  maxContainerRestartPeriod: 301s\n");
+        assert_eq!(
+            high.validate().unwrap_err().to_string(),
+            "invalid configuration: CrashLoopBackOff.MaxContainerRestartPeriod (got: 301 seconds) must be set between 1s and 300s"
+        );
+        mk("crashLoopBackOff:\n  maxContainerRestartPeriod: 1s\n")
+            .validate()
+            .unwrap();
+        mk("crashLoopBackOff:\n  maxContainerRestartPeriod: 300s\n")
+            .validate()
+            .unwrap();
     }
 
     #[test]
