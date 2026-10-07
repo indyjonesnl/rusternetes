@@ -56,6 +56,7 @@ pub type WorkFn =
 #[derive(Debug, Clone)]
 pub struct TimedWorker {
     pub created_at: DateTime<Utc>,
+    #[allow(dead_code)] // read by update_work and tests
     pub fire_at: DateTime<Utc>,
     cancelled: Arc<AtomicBool>,
     wake: Arc<Notify>,
@@ -173,6 +174,7 @@ impl TimedWorkerQueue {
 
     /// `UpdateWork` (timed_workers.go:164): adds or replaces a work item. A
     /// no-op when the old and new `fire_at` are the same.
+    #[allow(dead_code)] // ported API, exercised by tests
     pub fn update_work(&self, args: WorkArgs, created_at: DateTime<Utc>, fire_at: DateTime<Utc>) {
         let key = args.key();
         let mut workers = self.inner.workers.lock().unwrap();
@@ -214,6 +216,7 @@ impl TimedWorkerQueue {
 
     /// `CancelAndWait` (timed_workers.go:215): cancels every worker and waits
     /// for running work to terminate.
+    #[allow(dead_code)] // ported API, exercised by tests
     pub async fn cancel_and_wait(&self) {
         {
             let mut workers = self.inner.workers.lock().unwrap();
