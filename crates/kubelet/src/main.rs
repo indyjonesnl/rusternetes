@@ -542,11 +542,15 @@ async fn main() -> Result<()> {
     // (`klog.Fatalf`, csi_plugin.go:413), exhausting the retries exits.
     {
         let registry_dir = pluginmanager::plugins_registry_dir(&runtime_config.root_dir);
-        let nim = Arc::new(volume_plugins::nodeinfomanager::NodeInfoManager::new(
-            runtime_config.node_name.clone(),
-            storage.clone(),
-        ));
+        let nim = Arc::new(
+            volume_plugins::nodeinfomanager::NodeInfoManager::new(
+                runtime_config.node_name.clone(),
+                storage.clone(),
+            )
+            .with_migrated_plugins(volume_plugins::nodeinfomanager::default_migrated_plugins()),
+        );
         let klet = kubelet.clone();
+        let updater_storage = storage.clone();
         // Set before the task spawns (csi_plugin.go:374) so the first Ready
         // post cannot race ahead of the gate.
         klet.set_kubelet_error(Some("CSINode is not yet initialized".into()));
@@ -560,10 +564,22 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
             let plugin_manager = pluginmanager::PluginManager::new(registry_dir);
-            plugin_manager.add_handler(
-                pluginmanager::csi_handler::CSI_PLUGIN,
-                Arc::new(pluginmanager::csi_handler::RegistrationHandler::new(nim)),
-            );
+            let mut handler = pluginmanager::csi_handler::RegistrationHandler::new(nim.clone());
+            // `csi_plugin.go:417-426`: the csiNodeUpdater runs only with the
+            // `MutableCSINodeAllocatableCount` gate (on by default in 1.35).
+            if rusternetes_common::feature_gates::enabled(
+                rusternetes_common::feature_gates::Feature::MutableCSINodeAllocatableCount,
+            ) {
+                let updater = Arc::new(volume_plugins::csi_node_updater::CsiNodeUpdater::new(
+                    updater_storage,
+                    volume_plugins::csi_drivers_store::csi_drivers(),
+                    nim,
+                ));
+                let u = updater.clone();
+                tokio::spawn(async move { u.run().await });
+                handler = handler.with_node_updater(updater);
+            }
+            plugin_manager.add_handler(pluginmanager::csi_handler::CSI_PLUGIN, Arc::new(handler));
             // The kubelet runs for the life of the process, so the stop
             // channel's sender is parked here and never dropped.
             let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);

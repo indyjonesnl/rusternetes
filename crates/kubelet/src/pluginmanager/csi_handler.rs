@@ -9,9 +9,11 @@
 //! again if either fails (`csi_plugin.go:134-175`); `DeRegisterPlugin` calls
 //! `UninstallCSIDriver` (`unregisterDriver`, `csi_plugin.go:962-970`).
 //!
-//! NOT PORTED (tracked in follow-up issues): `csiNodeUpdaterVar.syncDriverUpdater`
-//! (the periodic `NodeGetInfo` refresh driven by
-//! `CSIDriver.NodeAllocatableUpdatePeriodSeconds`).
+//! After a successful `RegisterPlugin`, and in `DeRegisterPlugin`, the handler
+//! tells the `csiNodeUpdater` to re-evaluate the driver's periodic
+//! `NodeGetInfo` refresh (`csiNodeUpdaterVar.syncDriverUpdater`,
+//! `csi_plugin.go:165-167`, `:276-278`); see
+//! `volume_plugins::csi_node_updater`.
 
 use super::cache::PluginHandler;
 use crate::volume_plugins::csi_client::{CsiDriverClient, CSI_TIMEOUT};
@@ -21,6 +23,38 @@ use async_trait::async_trait;
 use std::cmp::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// `newCsiDriverClient` (`csi_client.go:153-176`): a client for the endpoint a
+/// registered driver reported, looked up by name in the store.
+pub fn csi_driver_client_for(
+    drivers: &DriversStore,
+    driver_name: &str,
+) -> Result<CsiDriverClient, String> {
+    let driver = drivers.get(driver_name).ok_or_else(|| {
+        format!("driver name {driver_name} not found in the list of registered CSI drivers")
+    })?;
+    Ok(CsiDriverClient::with_endpoint(driver_name, driver.endpoint))
+}
+
+/// The one method of `csiNodeUpdater` the handler calls
+/// (`csiNodeUpdaterVar.syncDriverUpdater`).
+#[async_trait]
+pub trait DriverUpdaterSync: Send + Sync {
+    async fn sync_driver_updater(&self, driver_name: &str);
+}
+
+#[async_trait]
+impl<S: rusternetes_storage::Storage + 'static> DriverUpdaterSync
+    for crate::volume_plugins::csi_node_updater::CsiNodeUpdater<S>
+{
+    async fn sync_driver_updater(&self, driver_name: &str) {
+        crate::volume_plugins::csi_node_updater::CsiNodeUpdater::sync_driver_updater(
+            self,
+            driver_name,
+        )
+        .await
+    }
+}
 
 /// `registerapi.CSIPlugin` (`pluginregistration/v1/constants.go:21`): the
 /// `PluginInfo.type` a CSI driver registrar reports.
@@ -153,6 +187,9 @@ pub struct RegistrationHandler {
     drivers: &'static DriversStore,
     /// Upstream's package-level `nim` (`csi_plugin.go:73`).
     nim: Arc<dyn NodeInfoInstaller>,
+    /// Upstream's package-level `csiNodeUpdaterVar` (nil unless the
+    /// `MutableCSINodeAllocatableCount` gate is on, `csi_plugin.go:417`).
+    node_updater: Option<Arc<dyn DriverUpdaterSync>>,
 }
 
 impl RegistrationHandler {
@@ -162,12 +199,23 @@ impl RegistrationHandler {
         Self {
             drivers: csi_drivers(),
             nim,
+            node_updater: None,
         }
+    }
+
+    /// Set `csiNodeUpdaterVar`.
+    pub fn with_node_updater(mut self, node_updater: Arc<dyn DriverUpdaterSync>) -> Self {
+        self.node_updater = Some(node_updater);
+        self
     }
 
     /// Back the handler with another store (tests).
     pub fn with_store(drivers: &'static DriversStore, nim: Arc<dyn NodeInfoInstaller>) -> Self {
-        Self { drivers, nim }
+        Self {
+            drivers,
+            nim,
+            node_updater: None,
+        }
     }
 
     /// `unregisterDriver` (`csi_plugin.go:962-970`): delete from the store
@@ -292,6 +340,11 @@ impl PluginHandler for RegistrationHandler {
         {
             return self.fail_registration(plugin_name, e).await;
         }
+
+        // `csi_plugin.go:165-167`
+        if let Some(u) = &self.node_updater {
+            u.sync_driver_updater(plugin_name).await;
+        }
         Ok(())
     }
 
@@ -303,6 +356,10 @@ impl PluginHandler for RegistrationHandler {
         );
         if let Err(e) = self.unregister_driver(plugin_name).await {
             tracing::error!("kubernetes.io/csi: registrationHandler.DeRegisterPlugin failed: {e}");
+        }
+        // `csi_plugin.go:276-278`
+        if let Some(u) = &self.node_updater {
+            u.sync_driver_updater(plugin_name).await;
         }
     }
 }
@@ -353,6 +410,15 @@ mod tests {
             if self.fail_install {
                 return Err("install failed".into());
             }
+            Ok(())
+        }
+        async fn update_csi_driver(
+            &self,
+            _: &str,
+            _: &str,
+            _: i64,
+            _: &HashMap<String, String>,
+        ) -> Result<(), String> {
             Ok(())
         }
         async fn uninstall_csi_driver(&self, driver_name: &str) -> Result<(), String> {
@@ -556,5 +622,57 @@ mod tests {
             .unwrap();
         h.deregister_plugin("csi.example.com", &ep).await;
         assert!(st.get("csi.example.com").is_none());
+    }
+
+    #[derive(Default)]
+    struct RecordingSync {
+        calls: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl DriverUpdaterSync for RecordingSync {
+        async fn sync_driver_updater(&self, driver_name: &str) {
+            self.calls.lock().unwrap().push(driver_name.into());
+        }
+    }
+
+    /// `RegisterPlugin` ends with `csiNodeUpdaterVar.syncDriverUpdater`
+    /// (`csi_plugin.go:165-167`) and `DeRegisterPlugin` does the same after
+    /// `unregisterDriver` (`csi_plugin.go:276-278`).
+    #[tokio::test]
+    async fn register_and_deregister_sync_the_node_updater() {
+        let st = store();
+        let nim = Arc::new(RecordingNim::default());
+        let sync = Arc::new(RecordingSync::default());
+        let h = RegistrationHandler::with_store(st, nim).with_node_updater(sync.clone());
+        let ep = driver_socket(Some(Ok(node_info("csi-node-1"))));
+        h.register_plugin("csi.example.com", &ep, &s(&["v1.0.0"]), None)
+            .await
+            .unwrap();
+        assert_eq!(*sync.calls.lock().unwrap(), vec!["csi.example.com"]);
+        h.deregister_plugin("csi.example.com", &ep).await;
+        assert_eq!(
+            *sync.calls.lock().unwrap(),
+            vec!["csi.example.com", "csi.example.com"]
+        );
+    }
+
+    /// The sync sits after the install (`csi_plugin.go:157-167`): a failed
+    /// registration returns before reaching it.
+    #[tokio::test]
+    async fn failed_registration_does_not_sync_the_node_updater() {
+        let st = store();
+        let nim = Arc::new(RecordingNim {
+            fail_install: true,
+            ..Default::default()
+        });
+        let sync = Arc::new(RecordingSync::default());
+        let h = RegistrationHandler::with_store(st, nim).with_node_updater(sync.clone());
+        let ep = driver_socket(Some(Ok(node_info("csi-node-1"))));
+        assert!(h
+            .register_plugin("csi.example.com", &ep, &s(&["v1.0.0"]), None)
+            .await
+            .is_err());
+        assert!(sync.calls.lock().unwrap().is_empty());
     }
 }

@@ -168,6 +168,10 @@ pub enum Feature {
 
     /// Upstream gate `StorageVersionMigrator` (1.35 Beta, still off; `pkg/features/kube_features.go:1829-1832`).
     StorageVersionMigrator,
+
+    /// Upstream gate `MutableCSINodeAllocatableCount` (1.35 Beta, on; `pkg/features/kube_features.go:1537-1541`).
+    /// Gates the kubelet's `csiNodeUpdater` (`pkg/volume/csi/csi_plugin.go:417`).
+    MutableCSINodeAllocatableCount,
 }
 
 impl Feature {
@@ -206,6 +210,7 @@ impl Feature {
             Feature::StorageVersionAPI => 29,
             Feature::APIServerIdentity => 30,
             Feature::StorageVersionMigrator => 31,
+            Feature::MutableCSINodeAllocatableCount => 32,
         }
     }
 
@@ -276,6 +281,8 @@ impl Feature {
             Feature::APIServerIdentity => true,
             // 1.35 Beta, still off (pkg/features/kube_features.go:1829-1832)
             Feature::StorageVersionMigrator => false,
+            // 1.35 Beta, on (pkg/features/kube_features.go:1537-1541)
+            Feature::MutableCSINodeAllocatableCount => true,
         }
     }
 }
@@ -324,6 +331,7 @@ pub const ALL_FEATURES: &[Feature] = &[
     Feature::StorageVersionAPI,
     Feature::APIServerIdentity,
     Feature::StorageVersionMigrator,
+    Feature::MutableCSINodeAllocatableCount,
 ];
 
 /// Total number of feature gates. Derived from [`ALL_FEATURES`].
@@ -370,6 +378,7 @@ static STATES: [AtomicBool; NUM_FEATURES] = [
     AtomicBool::new(Feature::StorageVersionAPI.default_enabled()),
     AtomicBool::new(Feature::APIServerIdentity.default_enabled()),
     AtomicBool::new(Feature::StorageVersionMigrator.default_enabled()),
+    AtomicBool::new(Feature::MutableCSINodeAllocatableCount.default_enabled()),
 ];
 
 /// Returns whether `feature` is currently enabled in this process.
