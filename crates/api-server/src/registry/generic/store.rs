@@ -64,6 +64,44 @@ const GET_BLOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3)
 /// `resourceVersionTooHighRetrySeconds` (storage/cacher/watch_cache.go).
 const RESOURCE_VERSION_TOO_HIGH_RETRY_SECONDS: i32 = 1;
 
+/// The freshness wait shared by `Store::get` and the list handlers: see
+/// [`Store::wait_until_fresh`] for the upstream citations.
+pub async fn wait_until_resource_version<S: Storage + ?Sized>(
+    storage: &S,
+    resource_version: &str,
+) -> Result<()> {
+    // `APIObjectVersioner.ParseResourceVersion`
+    // (storage/api_object_versioner.go:90-103).
+    let want: u64 = match resource_version {
+        "" | "0" => return Ok(()),
+        rv => rv.parse().map_err(|e: std::num::ParseIntError| {
+            Error::Invalid(vec![FieldError::invalid(
+                &Path::new("resourceVersion"),
+                rv,
+                format!(
+                    "strconv.ParseUint: parsing {rv:?}: {}",
+                    parse_uint_reason(&e)
+                ),
+            )])
+        })?,
+    };
+    let start = tokio::time::Instant::now();
+    loop {
+        let current = storage.current_revision().await?.max(0) as u64;
+        if current >= want {
+            return Ok(());
+        }
+        if start.elapsed() >= GET_BLOCK_TIMEOUT {
+            return Err(too_large_resource_version(
+                want,
+                current,
+                RESOURCE_VERSION_TOO_HIGH_RETRY_SECONDS,
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 /// The parts of `metav1.UpdateOptions` the Store consults.
 #[derive(Debug, Clone, Default)]
 pub struct UpdateOptions {
@@ -459,36 +497,7 @@ impl<T: Object, S: Storage> Store<T, S> {
     /// up to `blockTimeout` for the storage to reach the version, then fails
     /// with `NewTooLargeResourceVersionError` (storage/errors.go:229-242).
     async fn wait_until_fresh(&self, resource_version: &str) -> Result<()> {
-        // `APIObjectVersioner.ParseResourceVersion`
-        // (storage/api_object_versioner.go:90-103).
-        let want: u64 = match resource_version {
-            "" | "0" => return Ok(()),
-            rv => rv.parse().map_err(|e: std::num::ParseIntError| {
-                Error::Invalid(vec![FieldError::invalid(
-                    &Path::new("resourceVersion"),
-                    rv,
-                    format!(
-                        "strconv.ParseUint: parsing {rv:?}: {}",
-                        parse_uint_reason(&e)
-                    ),
-                )])
-            })?,
-        };
-        let start = tokio::time::Instant::now();
-        loop {
-            let current = self.storage.current_revision().await?.max(0) as u64;
-            if current >= want {
-                return Ok(());
-            }
-            if start.elapsed() >= GET_BLOCK_TIMEOUT {
-                return Err(too_large_resource_version(
-                    want,
-                    current,
-                    RESOURCE_VERSION_TOO_HIGH_RETRY_SECONDS,
-                ));
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        wait_until_resource_version(&*self.storage, resource_version).await
     }
 
     /// `InterpretGetError` (storage/errors/storage.go:44-57).
