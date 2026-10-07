@@ -92,6 +92,10 @@ impl VolumePlugin for ProjectedPlugin {
             // only when a downwardAPI source item has a `resourceFieldRef`,
             // same as Task 7's downwardAPI plugin.
             node_allocatable: self.host.get_node_allocatable().clone(),
+            // `MounterArgs{FsUser: util.FsUserFrom(pod), FsGroup: fsGroup}`
+            // (`operation_generator.go:501-509`, `:583-584`).
+            fs_user: crate::volume_plugins::util::fs_user_from(pod),
+            fs_group: crate::volume_plugins::util::fs_group_from(pod),
         }))
     }
 }
@@ -105,6 +109,10 @@ struct ProjectedMounter {
     storage: Option<Arc<StorageBackend>>,
     token_manager: rusternetes_common::auth::TokenManager,
     node_allocatable: HashMap<String, String>,
+    /// `mounterArgs.FsUser` (`volume.go:131`).
+    fs_user: Option<i64>,
+    /// `mounterArgs.FsGroup` (`volume.go:132`).
+    fs_group: Option<i64>,
 }
 
 /// `utilerrors.NewAggregate(errlist).Error()`
@@ -281,6 +289,24 @@ fn clean_path(p: &str) -> String {
 }
 
 impl ProjectedMounter {
+    /// The mode of a token / bundle / key file (`projected.go:276-282`):
+    ///
+    /// ```go
+    /// // When FsGroup is set, we depend on SetVolumeOwnership to
+    /// // change from 0600 to 0640.
+    /// mode := *s.source.DefaultMode
+    /// if mounterArgs.FsUser != nil || mounterArgs.FsGroup != nil {
+    ///     mode = 0600
+    /// }
+    /// ```
+    fn secret_file_mode(&self, default_mode: u32) -> u32 {
+        if self.fs_user.is_some() || self.fs_group.is_some() {
+            0o600
+        } else {
+            default_mode
+        }
+    }
+
     /// `collectData` (`projected.go:226-338`): build ONE payload from every
     /// source, accumulating errors, and fail with their aggregate.
     async fn collect_data(&self) -> Result<BTreeMap<String, FileProjection>> {
@@ -353,9 +379,9 @@ impl ProjectedMounter {
                         payload.insert(
                             tp.path.clone(),
                             FileProjection {
-                                fs_user: None,
+                                fs_user: self.fs_user,
                                 data: token.into_bytes(),
-                                mode: default_mode,
+                                mode: self.secret_file_mode(default_mode),
                             },
                         );
                     }
@@ -546,10 +572,15 @@ impl Mounter for ProjectedMounter {
     /// writes nothing), then project it with the AtomicWriter
     /// (`volumeutil.NewAtomicWriter` + `writer.Write`, `:208-221`).
     ///
-    /// Not ported: the wrapped memory-backed emptyDir mount (`:143-157`),
-    /// `MakeNestedMountpoints` and the fsGroup ownership callback
-    /// (`:191-206`) — the kubelet host has no tmpfs wrapper or fsGroup
-    /// plumbing yet; tracked in the PR's follow-up issue.
+    /// The fsGroup ownership callback (`:208-214`) is ported: `setPerms`
+    /// runs `NewVolumeOwnership(..).ChangePermissions()` on the whole volume
+    /// dir, with `GetAttributes().ReadOnly == true` (`:175-181`), after each
+    /// real write.
+    ///
+    /// Not ported: the wrapped memory-backed emptyDir mount (`:143-157`) and
+    /// `MakeNestedMountpoints` (`:166`) — see the follow-up issue linked from
+    /// the PR (the kubelet has no tmpfs unmount, so a wrapper would leak
+    /// mounts).
     async fn set_up(&self) -> Result<()> {
         let volume_dir = &self.path;
         std::fs::create_dir_all(volume_dir)
@@ -565,8 +596,20 @@ impl Mounter for ProjectedMounter {
             );
         })?;
 
-        crate::atomic_writer::write_projected_payload(std::path::Path::new(volume_dir), &payload)
-            .map_err(|e| {
+        // `setPerms` (`projected.go:200-206`): "This may be the first time
+        // writing and new files get created outside the timestamp
+        // subdirectory: change the permissions on the whole volume and not
+        // only in the timestamp directory."
+        let fs_group = self.fs_group;
+        let set_perms = move |dir: &std::path::Path| -> std::io::Result<()> {
+            crate::volume_ownership::set_volume_ownership(dir, fs_group, true)
+        };
+        crate::atomic_writer::write_projected_payload_with(
+            std::path::Path::new(volume_dir),
+            &payload,
+            Some(&set_perms),
+        )
+        .map_err(|e| {
             tracing::error!("Error writing payload to dir: {}", e);
             anyhow!(e)
         })?;
@@ -829,5 +872,130 @@ mod tests {
         assert_eq!(aggregate_message(&["a".into()]), "a");
         assert_eq!(aggregate_message(&["a".into(), "b".into()]), "[a, b]");
         assert_eq!(aggregate_message(&["a".into(), "a".into()]), "a");
+    }
+
+    // ---- fsUser / fsGroup (projected.go:279-282, :208-214) ----
+
+    fn pod_with_security(pod_sc: serde_json::Value, container_sc: serde_json::Value) -> Pod {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "ns", "uid": "uid-1"},
+            "spec": {
+                "securityContext": pod_sc,
+                "serviceAccountName": "default",
+                "containers": [{"name": "c", "image": "i", "securityContext": container_sc}]
+            }
+        }))
+        .unwrap()
+    }
+
+    async fn mounter_for(
+        root: &std::path::Path,
+        storage: &Arc<StorageBackend>,
+        v: &Volume,
+        pod: &Pod,
+    ) -> Box<dyn Mounter> {
+        let p = ProjectedPlugin::new(Arc::new(crate::volume_plugins::KubeletVolumeHost::new(
+            root.to_string_lossy().to_string(),
+            Some(storage.clone()),
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            HashMap::new(),
+        )));
+        let spec = Spec {
+            volume: v,
+            persistent_volume: None,
+        };
+        p.new_mounter(&spec, pod).await.unwrap()
+    }
+
+    /// The (uid, gid) a file created by this process gets — chowning to them
+    /// is permitted without root.
+    #[cfg(unix)]
+    fn own_ids() -> (i64, i64) {
+        use std::os::unix::fs::MetadataExt;
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("probe");
+        std::fs::write(&f, b"").unwrap();
+        let m = std::fs::metadata(&f).unwrap();
+        (m.uid() as i64, m.gid() as i64)
+    }
+
+    /// `TestCollectDataWithServiceAccountToken` (`projected_test.go:724-880`)
+    /// cases "fsUser != nil", "fsGroup != nil", "fsUser != nil && fsGroup !=
+    /// nil" and the default: a service-account token is forced to 0600 when
+    /// either is set (`projected.go:279-282`; "When FsGroup is set, we depend
+    /// on SetVolumeOwnership to change from 0600 to 0640"), and the final
+    /// on-disk mode follows. The e2e twin is `service_accounts.go:368`
+    /// ("should set ownership and permission when RunAsUser or FsGroup is
+    /// present"): `-rw-------` / `-rw-r-----` / `-rw-r-----` / `-rw-r--r--`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn service_account_token_mode_follows_fs_user_and_fs_group() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let (uid, gid) = own_ids();
+        let cases: [(&str, serde_json::Value, serde_json::Value, u32); 4] = [
+            (
+                "runAsUser",
+                serde_json::json!({}),
+                serde_json::json!({"runAsUser": uid}),
+                0o600,
+            ),
+            (
+                "fsGroup",
+                serde_json::json!({"fsGroup": gid}),
+                serde_json::json!({}),
+                0o640,
+            ),
+            (
+                "runAsUser+fsGroup",
+                serde_json::json!({"fsGroup": gid}),
+                serde_json::json!({"runAsUser": uid}),
+                0o640,
+            ),
+            (
+                "neither",
+                serde_json::json!({}),
+                serde_json::json!({}),
+                0o644,
+            ),
+        ];
+        for (name, pod_sc, ctr_sc, want) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let st = Arc::new(StorageBackend::new_memory());
+            let v = vol(serde_json::json!([
+                {"serviceAccountToken": {"path": "token", "expirationSeconds": 3600}}
+            ]));
+            let pod = pod_with_security(pod_sc, ctr_sc);
+            let m = mounter_for(dir.path(), &st, &v, &pod).await;
+            m.set_up().await.unwrap();
+            let tok = std::path::PathBuf::from(m.get_path()).join("token");
+            let meta = std::fs::metadata(&tok).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o777, want, "{name}");
+            assert_eq!(meta.uid() as i64, uid, "{name}");
+            assert_eq!(meta.gid() as i64, gid, "{name}");
+        }
+    }
+
+    /// `setPerms` is only run when the AtomicWriter writes (`atomic_writer.go:
+    /// 196-201`): a re-SetUp of an unchanged volume with an fsGroup leaves the
+    /// file untouched — ctime included — which is what #2390 asks of resync.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fs_group_ownership_is_not_reapplied_to_an_unchanged_volume() {
+        use std::os::unix::fs::MetadataExt;
+        let gid = own_ids().1;
+        let dir = tempfile::tempdir().unwrap();
+        let st = Arc::new(StorageBackend::new_memory());
+        put_cm(&st, "cm", "a", "1").await;
+        let v = vol(serde_json::json!([{"configMap": {"name": "cm"}}]));
+        let pod = pod_with_security(serde_json::json!({"fsGroup": gid}), serde_json::json!({}));
+        let m = mounter_for(dir.path(), &st, &v, &pod).await;
+        m.set_up().await.unwrap();
+        let real = std::fs::canonicalize(std::path::PathBuf::from(m.get_path()).join("a")).unwrap();
+        let before = std::fs::metadata(&real).unwrap().ctime_nsec();
+        let before_s = std::fs::metadata(&real).unwrap().ctime();
+        m.set_up().await.unwrap();
+        let after = std::fs::metadata(&real).unwrap();
+        assert_eq!((before_s, before), (after.ctime(), after.ctime_nsec()));
     }
 }

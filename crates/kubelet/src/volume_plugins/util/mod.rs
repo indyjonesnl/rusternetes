@@ -147,3 +147,123 @@ pub fn contains_access_mode(
 ) -> bool {
     modes.iter().any(|m| m == mode)
 }
+
+/// Port of `FsUserFrom` (`pkg/volume/util/util.go:541-557`): the pod's single
+/// effective `runAsUser`, or `None` when any container leaves it unset or two
+/// containers disagree.
+///
+/// Visits `podutil.AllFeatureEnabledContainers()` — init, regular and
+/// ephemeral containers. `DetermineEffectiveRunAsUser`
+/// (`pkg/securitycontext/util.go:127-141`): the container's `runAsUser` wins
+/// over the pod's.
+pub fn fs_user_from(pod: &Pod) -> Option<i64> {
+    let spec = pod.spec.as_ref()?;
+    let pod_run_as_user = spec.security_context.as_ref().and_then(|sc| sc.run_as_user);
+    let container_users = spec
+        .init_containers
+        .iter()
+        .flatten()
+        .map(|c| c.security_context.as_ref().and_then(|sc| sc.run_as_user))
+        .chain(
+            spec.containers
+                .iter()
+                .map(|c| c.security_context.as_ref().and_then(|sc| sc.run_as_user)),
+        )
+        .chain(
+            spec.ephemeral_containers
+                .iter()
+                .flatten()
+                .map(|c| c.security_context.as_ref().and_then(|sc| sc.run_as_user)),
+        );
+    let mut fs_user: Option<i64> = None;
+    for container_user in container_users {
+        // `!ok || (fsUser != nil && *fsUser != *runAsUser)` => nil, stop.
+        let effective = container_user.or(pod_run_as_user)?;
+        match fs_user {
+            Some(u) if u != effective => return None,
+            _ => fs_user = Some(effective),
+        }
+    }
+    fs_user
+}
+
+/// The `fsGroup` the operation generator hands a mounter
+/// (`pkg/volume/util/operationexecutor/operation_generator.go:501-509`):
+/// `pod.Spec.SecurityContext.FSGroup`.
+pub fn fs_group_from(pod: &Pod) -> Option<i64> {
+    pod.spec
+        .as_ref()
+        .and_then(|s| s.security_context.as_ref())
+        .and_then(|sc| sc.fs_group)
+}
+
+#[cfg(test)]
+mod fs_user_tests {
+    use super::*;
+
+    fn pod(v: serde_json::Value) -> Pod {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "ns", "uid": "u"},
+            "spec": v
+        }))
+        .unwrap()
+    }
+
+    fn c(uid: Option<i64>) -> serde_json::Value {
+        match uid {
+            Some(u) => {
+                serde_json::json!({"name": "c", "image": "i", "securityContext": {"runAsUser": u}})
+            }
+            None => serde_json::json!({"name": "c", "image": "i", "securityContext": {}}),
+        }
+    }
+
+    /// `TestFsUserFrom` (`pkg/volume/util/util_test.go:149-292`), all five cases.
+    #[test]
+    fn fs_user_from_matches_upstream_cases() {
+        // "no runAsUser specified"
+        assert_eq!(
+            fs_user_from(&pod(serde_json::json!({"containers": []}))),
+            None
+        );
+        // "some have runAsUser specified"
+        let p = pod(serde_json::json!({
+            "initContainers": [c(Some(1000))],
+            "containers": [c(Some(1000)), c(None)]
+        }));
+        assert_eq!(fs_user_from(&p), None);
+        // "all have runAsUser specified but not the same"
+        let p = pod(serde_json::json!({
+            "initContainers": [c(Some(999))],
+            "containers": [c(Some(1000)), c(Some(1000))],
+            "ephemeralContainers": [c(Some(1001))]
+        }));
+        assert_eq!(fs_user_from(&p), None);
+        // "init and regular containers have runAsUser specified and the same"
+        let p = pod(serde_json::json!({
+            "initContainers": [c(Some(1000))],
+            "containers": [c(Some(1000)), c(Some(1000))]
+        }));
+        assert_eq!(fs_user_from(&p), Some(1000));
+        // "all have runAsUser specified and the same"
+        let p = pod(serde_json::json!({
+            "initContainers": [c(Some(1000))],
+            "containers": [c(Some(1000)), c(Some(1000))],
+            "ephemeralContainers": [c(Some(1000))]
+        }));
+        assert_eq!(fs_user_from(&p), Some(1000));
+    }
+
+    /// `DetermineEffectiveRunAsUser` (`securitycontext/util.go:127-141`): the
+    /// pod-level `runAsUser` applies to containers that set none.
+    #[test]
+    fn pod_level_run_as_user_is_the_default() {
+        let p = pod(serde_json::json!({
+            "securityContext": {"runAsUser": 7, "fsGroup": 9},
+            "containers": [c(None), {"name": "d", "image": "i"}]
+        }));
+        assert_eq!(fs_user_from(&p), Some(7));
+        assert_eq!(fs_group_from(&p), Some(9));
+    }
+}

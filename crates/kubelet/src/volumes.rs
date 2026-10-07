@@ -632,9 +632,23 @@ impl VolumeManager {
             .and_then(|s| s.security_context.as_ref())
             .and_then(|sc| sc.fs_group)
         {
+            // A projected volume re-owns itself inside its own SetUp
+            // (`projected.go:200-214`, `setPerms` -> `volume_ownership`, with
+            // upstream's `mode | roMask`); the owner->group mirror below would
+            // turn its 0600 token into 0660 instead of 0640 (#2333).
+            let projected: std::collections::HashSet<&str> = pod
+                .spec
+                .as_ref()
+                .and_then(|s| s.volumes.as_ref())
+                .into_iter()
+                .flatten()
+                .filter(|v| v.projected.is_some())
+                .map(|v| v.name.as_str())
+                .collect();
             let paths: Vec<std::path::PathBuf> = volume_paths
-                .values()
-                .map(std::path::PathBuf::from)
+                .iter()
+                .filter(|(name, _)| !projected.contains(name.as_str()))
+                .map(|(_, p)| std::path::PathBuf::from(p))
                 .collect();
             let n = paths.len();
             // Blocking recursive lchown syscalls run off the async worker so
@@ -2486,6 +2500,57 @@ mod projected_mode_tests {
             0o755,
             "timestamp dir is 0755 (atomic_writer.go:399-408)"
         );
+    }
+
+    /// With a pod `fsGroup`, a projected file written 0600 ends up 0640
+    /// (`volume_linux.go:171-175`: `mode | roMask` for the projected volume's
+    /// `GetAttributes().ReadOnly`) -- NOT 0660, which the generic owner->group
+    /// mirror in `create_pod_volumes` would produce. The projected plugin owns
+    /// its ownership step (`projected.go:200-214`), so the post-pass must skip
+    /// it (#2333).
+    #[tokio::test]
+    async fn create_pod_volumes_projected_fs_group_is_ro_mask_not_mirror() {
+        use std::os::unix::fs::MetadataExt;
+        let storage = Arc::new(StorageBackend::new_memory());
+        let secret = Secret::new("sec", "default").with_data(HashMap::from([(
+            "password".to_string(),
+            b"hunter2".to_vec(),
+        )]));
+        Storage::create(
+            storage.as_ref(),
+            &build_key("secrets", Some("default"), "sec"),
+            &secret,
+        )
+        .await
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let probe = tmp.path().join("probe");
+        std::fs::write(&probe, b"").unwrap();
+        let gid = std::fs::metadata(&probe).unwrap().gid();
+        let vm = VolumeManager::new(
+            tmp.path().to_string_lossy().to_string(),
+            Some(storage.clone()),
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-1"},
+            "spec": {
+                "securityContext": {"fsGroup": gid},
+                "containers": [],
+                "volumes": [{
+                    "name": "proj",
+                    "projected": {"defaultMode": 384, "sources": [
+                        {"secret": {"name": "sec"}}
+                    ]}
+                }]
+            }
+        }))
+        .unwrap();
+        let paths = vm.create_pod_volumes(&pod).await.unwrap();
+        let file = std::path::Path::new(&paths["proj"]).join("password");
+        let meta = std::fs::metadata(&file).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o640);
+        assert_eq!(meta.gid(), gid);
     }
 }
 
