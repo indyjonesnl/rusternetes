@@ -90,7 +90,13 @@ mod tests {
         InfoRequest, PluginInfo, RegistrationStatus, RegistrationStatusResponse,
     };
     use super::*;
+    use crate::volume_plugins::csi_client::fake::FakeDriver;
+    use crate::volume_plugins::csi_client::proto::node_server::NodeServer;
+    use crate::volume_plugins::csi_client::proto::NodeGetInfoResponse;
     use crate::volume_plugins::csi_drivers_store::DriversStore;
+    use crate::volume_plugins::nodeinfomanager::{NodeInfoManager, ANNOTATION_KEY_NODE_ID};
+    use rusternetes_common::resources::Node;
+    use rusternetes_storage::{build_key, MemoryStorage, Storage};
     use std::path::Path;
     use std::sync::Mutex;
     use tokio::sync::oneshot;
@@ -127,6 +133,15 @@ mod tests {
         /// Serve `Registration` on `socket` (creating it) like the sidecar.
         fn serve(socket: &Path, plugin_type: &str, name: &str, versions: &[&str]) -> Registrar {
             let statuses = Arc::new(Mutex::new(Vec::new()));
+            // The same socket also answers the CSI Node service, as a driver
+            // sidecar pair would (`NodeGetInfo` is called on the endpoint).
+            let driver = FakeDriver::default();
+            *driver.node_info.lock().unwrap() = Some(Ok(NodeGetInfoResponse {
+                node_id: format!("{name}-node"),
+                max_volumes_per_node: 0,
+                accessible_topology: None,
+            }));
+            let node_svc = NodeServer::new(driver);
             let svc = RegistrationServer::new(FakeRegistrar {
                 info: PluginInfo {
                     r#type: plugin_type.to_string(),
@@ -141,6 +156,7 @@ mod tests {
             tokio::spawn(async move {
                 let _ = tonic::transport::Server::builder()
                     .add_service(svc)
+                    .add_service(node_svc)
                     .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async {
                         let _ = rx.await;
                     })
@@ -170,19 +186,67 @@ mod tests {
         panic!("timed out waiting for: {what}");
     }
 
-    fn manager(
+    async fn manager(
         dir: &Path,
     ) -> (
         PluginManager,
         &'static DriversStore,
         tokio::sync::watch::Sender<bool>,
     ) {
+        let (pm, store, stop, _storage) = manager_with_node(dir).await;
+        (pm, store, stop)
+    }
+
+    /// [`manager`], plus the storage holding the Node the handler records the
+    /// CSI node info on.
+    async fn manager_with_node(
+        dir: &Path,
+    ) -> (
+        PluginManager,
+        &'static DriversStore,
+        tokio::sync::watch::Sender<bool>,
+        Arc<MemoryStorage>,
+    ) {
+        let storage = Arc::new(MemoryStorage::new());
+        storage
+            .create(&build_key("nodes", None, "node1"), &Node::new("node1"))
+            .await
+            .unwrap();
+        let (pm, store, stop) = manager_with_storage(dir, storage.clone());
+        (pm, store, stop, storage)
+    }
+
+    /// A manager whose handler records node info on the Node in `storage`
+    /// (the NodeInfoManager works on `node1`; a missing Node just makes the
+    /// install fail, which the tests that don't care never look at).
+    fn manager_with_storage(
+        dir: &Path,
+        storage: Arc<MemoryStorage>,
+    ) -> (
+        PluginManager,
+        &'static DriversStore,
+        tokio::sync::watch::Sender<bool>,
+    ) {
+        let nim = Arc::new(NodeInfoManager::new("node1", storage));
         let store: &'static DriversStore = Box::leak(Box::new(DriversStore::new()));
         let pm = PluginManager::with_loop_sleep(dir, Duration::from_millis(50));
-        pm.add_handler(CSI_PLUGIN, Arc::new(RegistrationHandler::with_store(store)));
+        pm.add_handler(
+            CSI_PLUGIN,
+            Arc::new(RegistrationHandler::with_store(store, nim)),
+        );
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         pm.run(stop_rx).unwrap();
         (pm, store, stop_tx)
+    }
+
+    async fn nodeid_annotation(storage: &MemoryStorage) -> Option<String> {
+        let n: Node = storage
+            .get(&build_key("nodes", None, "node1"))
+            .await
+            .unwrap();
+        n.metadata
+            .annotations
+            .and_then(|a| a.get(ANNOTATION_KEY_NODE_ID).cloned())
     }
 
     /// The issue's acceptance: an unmodified registrar's socket in
@@ -191,7 +255,7 @@ mod tests {
     #[tokio::test]
     async fn csi_registrar_handshake_populates_driver_store() {
         let dir = tempfile::tempdir().unwrap();
-        let (pm, store, _stop) = manager(dir.path());
+        let (pm, store, _stop, node_storage) = manager_with_node(dir.path()).await;
         let sock = dir.path().join("csi.example.com-reg.sock");
         let mut plugin = Registrar::serve(&sock, CSI_PLUGIN, "csi.example.com", &["1.0.0"]);
 
@@ -213,12 +277,25 @@ mod tests {
         })
         .await;
         assert_eq!(pm.actual_state_of_world.get_registered_plugins().len(), 1);
+        // `NodeGetInfo` ran and `InstallCSIDriver` recorded it on the Node.
+        assert_eq!(
+            nodeid_annotation(&node_storage).await.as_deref(),
+            Some(r#"{"csi.example.com":"csi.example.com-node"}"#)
+        );
 
         plugin.stop(&sock);
         eventually("driver deregistered", || {
             store.get("csi.example.com").is_none()
         })
         .await;
+        // `DeRegisterPlugin` -> `UninstallCSIDriver` removed it again.
+        for _ in 0..100 {
+            if nodeid_annotation(&node_storage).await.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(nodeid_annotation(&node_storage).await, None);
         eventually("asw emptied", || {
             pm.actual_state_of_world.get_registered_plugins().is_empty()
         })
@@ -231,7 +308,7 @@ mod tests {
     #[tokio::test]
     async fn unsupported_version_is_notified_and_not_registered() {
         let dir = tempfile::tempdir().unwrap();
-        let (pm, store, _stop) = manager(dir.path());
+        let (pm, store, _stop) = manager(dir.path()).await;
         let sock = dir.path().join("old.sock");
         let plugin = Registrar::serve(&sock, CSI_PLUGIN, "csi.old.com", &["0.3.0"]);
 
@@ -255,7 +332,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_plugin_type_is_notified() {
         let dir = tempfile::tempdir().unwrap();
-        let (_pm, store, _stop) = manager(dir.path());
+        let (_pm, store, _stop) = manager(dir.path()).await;
         let sock = dir.path().join("dev.sock");
         let plugin = Registrar::serve(&sock, "DevicePlugin", "vendor.com/gpu", &["v1beta1"]);
 
@@ -280,7 +357,7 @@ mod tests {
     #[tokio::test]
     async fn recreated_socket_reregisters_with_new_version() {
         let dir = tempfile::tempdir().unwrap();
-        let (_pm, store, _stop) = manager(dir.path());
+        let (_pm, store, _stop) = manager(dir.path()).await;
         let sock = dir.path().join("csi.sock");
         let mut v1 = Registrar::serve(&sock, CSI_PLUGIN, "csi.example.com", &["1.0.0"]);
         eventually("v1 registered", || {

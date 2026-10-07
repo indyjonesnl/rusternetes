@@ -35,7 +35,7 @@ pub trait PluginHandler: Send + Sync {
 
     /// `DeRegisterPlugin`: called once the watcher observes that the socket
     /// has been deleted.
-    fn deregister_plugin(&self, plugin_name: &str, endpoint: &str);
+    async fn deregister_plugin(&self, plugin_name: &str, endpoint: &str);
 }
 
 /// Port of `PluginInfo` (`actual_state_of_world.go:73-80`).
