@@ -70,12 +70,22 @@ pub enum FSGroupPolicy {
     ReadWriteOnceWithFSType,
     File,
     None,
+    /// A value outside the supported set. Upstream's field is a plain Go
+    /// `string`, so any string decodes and validation answers `Unsupported
+    /// value` (422), not a 400 decode failure (#2496).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum VolumeLifecycleMode {
     Persistent,
     Ephemeral,
+    /// A value outside the supported set. Upstream's field is a plain Go
+    /// `string`, so any string decodes and validation answers `Unsupported
+    /// value` (422), not a 400 decode failure (#2496).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

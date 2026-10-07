@@ -344,6 +344,7 @@ impl CsiMounter {
                             .map(|m| match m {
                                 M::Persistent => "Persistent",
                                 M::Ephemeral => "Ephemeral",
+                                M::Unknown(v) => v.as_str(),
                             })
                             .collect::<Vec<_>>()
                     ))
