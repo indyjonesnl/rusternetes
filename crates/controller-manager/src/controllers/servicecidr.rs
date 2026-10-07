@@ -450,6 +450,7 @@ impl<S: Storage + 'static> ServiceCIDRController<S> {
 
     /// Sync every ServiceCIDR once, synchronously (tests; `run()` is queue
     /// driven).
+    #[allow(dead_code)] // main.rs compiles this module too; only tests call it
     pub async fn reconcile_all(&self) -> Result<()> {
         let cidrs: Vec<ServiceCIDR> = self
             .storage

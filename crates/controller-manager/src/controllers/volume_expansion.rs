@@ -1,3 +1,4 @@
+use crate::controllers::worker_pool::spawn_workers;
 use anyhow::{Context, Result};
 use rusternetes_common::resources::volume::{
     PersistentVolumeClaimPhase, PersistentVolumeClaimResizeStatus,
@@ -11,6 +12,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
 use tracing::{error, info, warn};
+
+/// Workers draining this controller's queue: `defaultWorkerCount = 10`
+/// (pkg/controller/volume/expand/expand_controller.go:58), launched in `Run` (:341-345).
+const CONCURRENT_VOLUME_EXPAND_SYNCS: usize = 10;
 
 pub struct VolumeExpansionController<S: Storage> {
     storage: Arc<S>,
@@ -28,10 +33,13 @@ impl<S: Storage + 'static> VolumeExpansionController<S> {
 
         let queue = WorkQueue::new();
 
-        let worker_queue = queue.clone();
-        let worker_self = Arc::clone(&self);
-        tokio::spawn(async move {
-            worker_self.worker(worker_queue).await;
+        // N workers drain ONE shared queue; a key in flight is never handed to
+        // a second worker (`wait.UntilWithContext(ctx, worker, time.Second)` x N).
+        spawn_workers(CONCURRENT_VOLUME_EXPAND_SYNCS, &queue, |worker_queue| {
+            let worker_self = Arc::clone(&self);
+            async move {
+                worker_self.worker(worker_queue).await;
+            }
         });
 
         loop {
