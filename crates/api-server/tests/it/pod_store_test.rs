@@ -94,6 +94,33 @@ async fn a_scheduled_pod_is_deleted_gracefully() {
     assert_eq!(stored["metadata"]["deletionGracePeriodSeconds"], 45);
 }
 
+/// #2386: a plain DELETE of a scheduled pod that never named a grace period
+/// still gives it the defaulted 30s (`terminationGracePeriodSeconds`), so the
+/// kubelet SIGTERMs and waits rather than killing at once. Like upstream's
+/// `rest.BeforeDelete` (pkg/api/rest/delete.go), `deletionTimestamp` is the
+/// moment the grace period ENDS, i.e. now + 30s.
+#[tokio::test]
+async fn a_default_delete_gives_the_pod_its_defaulted_grace_period() {
+    let api = TestApiServer::new();
+    create(&api, &scheduled_pod("p-default")).await;
+    let (s, deleted) = api.delete(&format!("{PODS}/p-default")).await;
+    assert_eq!(s, StatusCode::OK, "{deleted}");
+    let (s, stored) = api.get(&format!("{PODS}/p-default")).await;
+    assert_eq!(s, StatusCode::OK, "{stored}");
+    assert_eq!(stored["metadata"]["deletionGracePeriodSeconds"], 30);
+    let ts = chrono::DateTime::parse_from_rfc3339(
+        stored["metadata"]["deletionTimestamp"]
+            .as_str()
+            .expect("deletionTimestamp"),
+    )
+    .unwrap();
+    let ahead = (ts.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_seconds();
+    assert!(
+        (25..=31).contains(&ahead),
+        "deletionTimestamp should be ~now+30s, was {ahead}s ahead"
+    );
+}
+
 /// A pod that already terminated is deleted immediately (strategy.go:186-189).
 #[tokio::test]
 async fn a_terminated_pod_is_deleted_immediately() {
