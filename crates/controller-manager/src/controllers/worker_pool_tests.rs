@@ -406,3 +406,25 @@ async fn node_lifecycle_runs_a_pod_update_pool() {
     .await;
     assert!(peak > 1, "node-lifecycle pod pool peaked at {peak}");
 }
+
+#[tokio::test]
+async fn volume_snapshot_runs_a_worker_pool() {
+    let peak = peak_concurrency(
+        "volumesnapshots",
+        12,
+        |i| {
+            json!({
+                "apiVersion": "snapshot.storage.k8s.io/v1", "kind": "VolumeSnapshot",
+                "metadata": meta(i),
+                "spec": {"source": {"persistentVolumeClaimName": "pvc"}, "volumeSnapshotClassName": "c"}
+            })
+        },
+        |s| async move {
+            let _ = Arc::new(crate::controllers::volume_snapshot::VolumeSnapshotController::new(s))
+                .run()
+                .await;
+        },
+    )
+    .await;
+    assert!(peak > 1, "volume_snapshot run() peaked at {peak}");
+}
