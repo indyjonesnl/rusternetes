@@ -6,6 +6,7 @@
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod admission;
+mod audit;
 pub use rusternetes_admission_webhook as admission_webhook;
 mod bootstrap;
 pub use rusternetes_admission_webhook::cel_evaluators as cel;
@@ -145,6 +146,55 @@ struct Args {
         value_parser = registry::core::event::parse_event_ttl
     )]
     event_ttl: u64,
+
+    /// Path to the file that defines the audit policy configuration
+    /// (`--audit-policy-file`, pkg/server/options/audit.go:258).
+    #[arg(long)]
+    audit_policy_file: Option<String>,
+
+    /// Path of the file audit events are written to; `-` is stdout
+    /// (`--audit-log-path`, options/audit.go:436).
+    #[arg(long)]
+    audit_log_path: Option<String>,
+
+    /// Format of saved audits (`--audit-log-format`, options/audit.go:444);
+    /// only `json` is supported.
+    #[arg(long, default_value = "json")]
+    audit_log_format: String,
+}
+
+/// `--audit-policy-file` + `--audit-log-path` build the audit pipeline.
+/// Like `WithAudit` (filters/audit.go:42), a missing policy or sink leaves
+/// auditing off.
+async fn install_audit_from_flags(args: &Args) -> Result<()> {
+    if args.audit_log_format != "json" {
+        anyhow::bail!(
+            "invalid audit log format {:?}: only \"json\" is supported",
+            args.audit_log_format
+        );
+    }
+    let (Some(policy_file), Some(log_path)) = (&args.audit_policy_file, &args.audit_log_path)
+    else {
+        if args.audit_policy_file.is_some() || args.audit_log_path.is_some() {
+            warn!("auditing needs both --audit-policy-file and --audit-log-path; it is off");
+        }
+        return Ok(());
+    };
+    let yaml = std::fs::read_to_string(policy_file)
+        .with_context(|| format!("reading --audit-policy-file {policy_file}"))?;
+    let policy = audit::Policy::from_yaml(&yaml)
+        .map_err(|e| anyhow::anyhow!("{e}: from file {policy_file}"))?;
+    let sink: std::sync::Arc<dyn rusternetes_common::audit::AuditBackend> = if log_path == "-" {
+        std::sync::Arc::new(audit::StdoutAuditBackend)
+    } else {
+        std::sync::Arc::new(
+            rusternetes_common::audit::FileAuditBackend::new(log_path.clone())
+                .await
+                .with_context(|| format!("opening --audit-log-path {log_path}"))?,
+        )
+    };
+    audit::install_audit(audit::AuditConfig { policy, sink });
+    Ok(())
 }
 
 #[tokio::main]
@@ -165,6 +215,8 @@ async fn main() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("parsing {path}: {e}"))?;
         admission::install_pod_security_exemptions(exemptions);
     }
+
+    install_audit_from_flags(&args).await?;
 
     info!(
         "Starting Rusternetes API Server {}",

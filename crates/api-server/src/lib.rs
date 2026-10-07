@@ -1,4 +1,5 @@
 pub mod admission;
+pub mod audit;
 pub use rusternetes_admission_webhook as admission_webhook;
 pub mod bootstrap;
 pub use rusternetes_admission_webhook::cel_evaluators as cel;

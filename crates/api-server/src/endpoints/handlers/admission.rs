@@ -522,11 +522,11 @@ impl Admission<'_> {
                     ) {
                         // Warn mode: the request is admitted with warnings
                         // (AdmissionResponse.Warnings -> warning.AddWarning).
-                        for w in crate::admission::PodSecurityAdmission::new()
+                        let outcome = crate::admission::PodSecurityAdmission::new()
                             .admit_outcome(storage, namespace, pod, &self.user.username)
-                            .await?
-                            .warnings
-                        {
+                            .await?;
+                        crate::admission::record_pod_security_audit(&outcome);
+                        for w in outcome.warnings {
                             ctx.add_warning(w);
                         }
                     }
@@ -546,11 +546,11 @@ impl Admission<'_> {
                     ) {
                         // Warn mode: the request is admitted with warnings
                         // (AdmissionResponse.Warnings -> warning.AddWarning).
-                        for w in crate::admission::PodSecurityAdmission::new()
+                        let outcome = crate::admission::PodSecurityAdmission::new()
                             .admit_outcome(storage, namespace, pod, &self.user.username)
-                            .await?
-                            .warnings
-                        {
+                            .await?;
+                        crate::admission::record_pod_security_audit(&outcome);
+                        for w in outcome.warnings {
                             ctx.add_warning(w);
                         }
                     }
