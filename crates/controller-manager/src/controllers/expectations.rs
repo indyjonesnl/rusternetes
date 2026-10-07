@@ -67,6 +67,11 @@ pub struct ControllerExpectations {
     /// `UIDTrackingControllerExpectations.uidStore`
     /// (`controller_utils.go:343-409`).
     uids: Mutex<HashMap<String, HashSet<String>>>,
+    /// Rusternetes-only: pod keys a controller created and has not yet seen
+    /// arrive. The creation-side twin of `uids`, so a watch `Added` event and
+    /// a fresh listing each lower the creation count at most once per pod
+    /// (upstream's `addPod` lowers it unconditionally per event).
+    created: Mutex<HashMap<String, HashSet<String>>>,
     timeout: Duration,
 }
 
@@ -87,6 +92,7 @@ impl ControllerExpectations {
         Self {
             entries: Mutex::new(HashMap::new()),
             uids: Mutex::new(HashMap::new()),
+            created: Mutex::new(HashMap::new()),
             timeout,
         }
     }
@@ -170,6 +176,49 @@ impl ControllerExpectations {
     pub fn delete_expectations(&self, key: &str) {
         self.entries.lock().unwrap().remove(key);
         self.uids.lock().unwrap().remove(key);
+        self.created.lock().unwrap().remove(key);
+    }
+
+    /// Rusternetes-only: remember that `pod_key` was created for `key` and its
+    /// arrival is still awaited. Call after the matching `expect_creations`.
+    pub fn record_created(&self, key: &str, pod_key: &str) {
+        self.created
+            .lock()
+            .unwrap()
+            .entry(key.to_string())
+            .or_default()
+            .insert(pod_key.to_string());
+    }
+
+    /// Rusternetes-only: lower the creation count for `key`, but only if
+    /// `pod_key` is still awaited, so an `Added` event and a fresh listing of
+    /// the same pod never both count it.
+    pub fn creation_observed_of(&self, key: &str, pod_key: &str) {
+        let hit = self
+            .created
+            .lock()
+            .unwrap()
+            .get_mut(key)
+            .is_some_and(|set| set.remove(pod_key));
+        if hit {
+            self.creation_observed(key);
+        }
+    }
+
+    /// Rusternetes-only: created pod keys for `key` not yet observed.
+    pub fn pending_creations(&self, key: &str) -> Vec<String> {
+        self.created
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Rusternetes-only: forget the awaited-creation set for `key` (call when
+    /// a fresh `expect_creations` replaces the record).
+    pub fn clear_created(&self, key: &str) {
+        self.created.lock().unwrap().remove(key);
     }
 
     /// Upstream `UIDTrackingControllerExpectations.ExpectDeletions`
@@ -372,6 +421,23 @@ mod tests {
         assert!(!exp.satisfied(KEY));
 
         exp.deletion_observed_of(KEY, "ns/b");
+        assert!(exp.satisfied(KEY));
+    }
+
+    /// A created pod lowers the creation count once, however many times it is
+    /// observed (event and fresh listing both see it).
+    #[test]
+    fn creation_observed_of_counts_each_pod_once() {
+        let exp = ControllerExpectations::new();
+        exp.expect_creations(KEY, 2);
+        exp.record_created(KEY, "ns/a");
+        exp.record_created(KEY, "ns/b");
+        exp.creation_observed_of(KEY, "ns/a");
+        exp.creation_observed_of(KEY, "ns/a");
+        exp.creation_observed_of(KEY, "ns/other");
+        assert_eq!(exp.get_expectations(KEY), Some((1, 0)));
+        assert_eq!(exp.pending_creations(KEY), vec!["ns/b".to_string()]);
+        exp.creation_observed_of(KEY, "ns/b");
         assert!(exp.satisfied(KEY));
     }
 
