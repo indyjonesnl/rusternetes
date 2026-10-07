@@ -1,5 +1,6 @@
 pub mod certificates;
 pub mod pod_security_api;
+pub mod pod_security_policy;
 pub mod resourcequota;
 pub mod storage_object_in_use_protection;
 
@@ -1251,11 +1252,9 @@ impl PodSecurityAdmission {
     /// Returns `Ok(())` to admit the pod, `Err(Forbidden)` to reject.
     ///
     /// Enforcement keys off the namespace's
-    /// `pod-security.kubernetes.io/enforce` label. An absent label or
-    /// `privileged` admits everything. `baseline` and `restricted` apply the
-    /// baseline check set (no privileged containers, no host namespaces, no
-    /// hostPath volumes); `restricted` additionally requires non-root
-    /// execution and forbids privilege escalation.
+    /// `pod-security.kubernetes.io/enforce` label (and its `-version`).
+    /// An absent label or `privileged` admits everything; `baseline` and
+    /// `restricted` evaluate the versioned check registry.
     ///
     /// Upstream parity:
     /// `staging/src/k8s.io/pod-security-admission/policy/` (release-1.35).
@@ -1279,9 +1278,9 @@ impl PodSecurityAdmission {
     /// denies; audit adds the `audit-violations` annotation; warn adds a
     /// warning, but only to a request that is not already denied.
     ///
-    /// The checks themselves are version-agnostic (they behave as `latest`),
-    /// so a `-version` label is parsed and reported but selects no older
-    /// check set (tracked in #2418's follow-ups).
+    /// The checks come from the versioned registry
+    /// ([`pod_security_policy::CheckRegistry`]): a `-version` label selects
+    /// the check set that applied at that policy version.
     pub async fn admit_outcome<S: Storage>(
         &self,
         storage: &Arc<S>,
@@ -1303,15 +1302,27 @@ impl PodSecurityAdmission {
             return Ok(exempt("user"));
         }
         let ns_key = rusternetes_storage::build_key("namespaces", None, namespace);
+        // admission.go:344-350: a namespace that cannot be fetched answers
+        // `NewInternalError("failed to lookup namespace %q")`, not an allow.
+        //
+        // Deliberate deviation for NotFound: upstream never sees it here
+        // because the NamespaceLifecycle plugin runs first and answers
+        // NotFound for a pod in a namespace that does not exist. This server
+        // has no such plugin for pod creates yet, so a missing namespace is
+        // still treated as unlabelled (privileged) rather than turning every
+        // pod create into a 500.
         let labels = match storage
             .get::<rusternetes_common::resources::Namespace>(&ns_key)
             .await
         {
             Ok(ns) => ns.metadata.labels,
-            // If the namespace can't be read, fall back to allow-all rather
-            // than blocking pod creation on a storage hiccup (upstream
-            // answers an InternalError, admission.go:344-350).
-            Err(_) => None,
+            Err(rusternetes_common::Error::NotFound(_)) => None,
+            Err(e) => {
+                warn!("PodSecurity: failed to fetch pod namespace {namespace:?}: {e}");
+                return Err(rusternetes_common::Error::Internal(format!(
+                    "Internal error occurred: failed to lookup namespace {namespace:?}"
+                )));
+            }
         };
         let (policy, policy_errs) = pod_security_api::policy_to_evaluate(
             labels.as_ref(),
@@ -1355,13 +1366,19 @@ impl PodSecurityAdmission {
         annotations.insert("enforce-policy".to_string(), policy.enforce.to_string());
 
         let pod_name = &pod.metadata.name;
-        // EvaluatePod caches by LevelVersion; the checks are a pure function
-        // of the level here, so evaluate each distinct level once.
+        // EvaluatePod caches results by LevelVersion (admission.go:476-477).
+        let default_spec = rusternetes_common::resources::pod::PodSpec::default();
+        let spec = pod.spec.as_ref().unwrap_or(&default_spec);
         let mut cache: HashMap<pod_security_api::LevelVersion, Option<String>> = HashMap::new();
         let mut eval = |lv: pod_security_api::LevelVersion| {
             cache
                 .entry(lv)
-                .or_insert_with(|| first_violation(lv.level, pod))
+                .or_insert_with(|| {
+                    let result = pod_security_policy::aggregate_check_results(
+                        &pod_security_registry().evaluate_pod(lv, &pod.metadata, spec),
+                    );
+                    (!result.allowed).then(|| result.forbidden_detail())
+                })
                 .clone()
         };
 
@@ -1400,115 +1417,18 @@ pub struct PodSecurityOutcome {
     pub audit_annotations: BTreeMap<String, String>,
 }
 
-/// The first violation of the Pod Security Standard `level`, as the detail
-/// of upstream's `ForbiddenDetail`, or `None` if the pod complies.
-fn first_violation(level: pod_security_api::Level, pod: &Pod) -> Option<String> {
-    use pod_security_api::Level;
-    let (baseline, restricted) = match level {
-        Level::Restricted => (true, true),
-        Level::Baseline => (true, false),
-        Level::Privileged => (false, false),
-    };
-    if !baseline {
-        return None;
-    }
-    let spec = pod.spec.as_ref()?;
-
-    // Iterator over every workload container (regular + init), so the
-    // checks apply uniformly.
-    let regular = spec.containers.iter();
-    let init = spec.init_containers.iter().flatten();
-    // `policy.VisitContainers` also visits ephemeral containers.
-    let ephemeral = spec
-        .ephemeral_containers
-        .iter()
-        .flatten()
-        .map(|c| (c.name.as_str(), c.security_context.as_ref()));
-    let all_security_contexts = regular
-        .chain(init)
-        .map(|c| (c.name.as_str(), c.security_context.as_ref()))
-        .chain(ephemeral);
-
-    // --- Baseline: privileged containers ---
-    for (name, sc) in all_security_contexts.clone() {
-        if let Some(sc) = sc {
-            if sc.privileged == Some(true) {
-                return Some(format!(
-                    "privileged (container \"{name}\" must not set securityContext.privileged=true)"
-                ));
-            }
-        }
-    }
-
-    // --- Baseline: host namespaces ---
-    if spec.host_network == Some(true) || spec.host_pid == Some(true) || spec.host_ipc == Some(true)
-    {
-        return Some(
-            "host namespaces (hostNetwork, hostPID, and hostIPC must be unset or false)"
-                .to_string(),
-        );
-    }
-
-    // --- Baseline: hostPath volumes ---
-    if let Some(volumes) = &spec.volumes {
-        for v in volumes {
-            if v.host_path.is_some() {
-                return Some(format!(
-                    "hostPath volumes (volume \"{}\" uses a forbidden hostPath volume type)",
-                    v.name
-                ));
-            }
-        }
-    }
-
-    if !restricted {
-        return None;
-    }
-
-    let pod_sc = spec.security_context.as_ref();
-    let pod_run_as_non_root = pod_sc.and_then(|sc| sc.run_as_non_root);
-    let pod_run_as_user = pod_sc.and_then(|sc| sc.run_as_user);
-
-    // --- Restricted: runAsUser must not be 0 (root) ---
-    if pod_run_as_user == Some(0) {
-        return Some("runAsUser=0 (pod must not set securityContext.runAsUser=0)".to_string());
-    }
-    for (name, sc) in all_security_contexts.clone() {
-        if let Some(sc) = sc {
-            if sc.run_as_user == Some(0) {
-                return Some(format!(
-                    "runAsUser=0 (container \"{name}\" must not set securityContext.runAsUser=0)"
-                ));
-            }
-        }
-    }
-
-    // --- Restricted: runAsNonRoot must be true (silence is not consent) ---
-    // Satisfied if the pod-level securityContext sets runAsNonRoot=true,
-    // or every container sets it to true. A container with no explicit
-    // value falls back to the pod-level value.
-    if pod_run_as_non_root != Some(true) {
-        for (name, sc) in all_security_contexts.clone() {
-            let effective = sc.and_then(|sc| sc.run_as_non_root).or(pod_run_as_non_root);
-            if effective != Some(true) {
-                return Some(format!(
-                    "runAsNonRoot != true (pod or container \"{name}\" must set securityContext.runAsNonRoot=true)"
-                ));
-            }
-        }
-    }
-
-    // --- Restricted: allowPrivilegeEscalation must be false ---
-    for (name, sc) in all_security_contexts {
-        let allowed = sc.and_then(|sc| sc.allow_privilege_escalation);
-        if allowed != Some(false) {
-            return Some(format!(
-                "allowPrivilegeEscalation != false (container \"{name}\" must set securityContext.allowPrivilegeEscalation=false)"
-            ));
-        }
-    }
-
-    None
+/// The check registry for the default checks, built once
+/// (`policy.NewEvaluator(policy.DefaultChecks(), emulationVersion)`,
+/// admission.go `CompleteConfiguration`). The emulation version is the
+/// binary's 1.35, which is not older than the newest check (1.35), so it
+/// does not lower the cached maximum.
+fn pod_security_registry() -> &'static pod_security_policy::CheckRegistry {
+    static REGISTRY: std::sync::OnceLock<pod_security_policy::CheckRegistry> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        pod_security_policy::CheckRegistry::new(pod_security_policy::default_checks(), None)
+            .expect("the default PodSecurity checks are valid")
+    })
 }
 
 /// `Priority.getDefaultPriorityClass`
@@ -2191,7 +2111,10 @@ mod tests {
         let pod = pod_from_spec(
             "p",
             serde_json::json!({
-                "securityContext": { "runAsNonRoot": true },
+                "securityContext": {
+                    "runAsNonRoot": true,
+                    "seccompProfile": { "type": "RuntimeDefault" },
+                },
                 "volumes": [{ "name": "data", "emptyDir": {} }],
                 "containers": [{
                     "name": "main", "image": "busybox",
@@ -2199,6 +2122,7 @@ mod tests {
                         "runAsNonRoot": true,
                         "runAsUser": 1000,
                         "allowPrivilegeEscalation": false,
+                        "capabilities": { "drop": ["ALL"] },
                     },
                 }],
             }),
@@ -2656,7 +2580,7 @@ plugins:
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains(r#"host namespaces (hostNetwork=true), privileged (container "a" must not set securityContext.privileged=true), hostPort (container "a" uses hostPort 80)"#),
+            err.contains(r#"host namespaces (hostNetwork=true), hostPort (container "a" uses hostPort 80), privileged (container "a" must not set securityContext.privileged=true)"#),
             "{err}"
         );
     }
@@ -2666,14 +2590,33 @@ plugins:
     #[tokio::test]
     async fn psa_namespace_lookup_failure_is_internal_error() {
         let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
-        let err = PodSecurityAdmission::new()
-            .admit_outcome(&storage, "missing", &baseline_pod(), "alice")
+        // An unreadable (undecodable) Namespace record: a read error that is
+        // not NotFound.
+        let key = rusternetes_storage::build_key("namespaces", None, "broken");
+        storage
+            .create(&key, &serde_json::json!("not a namespace"))
             .await
-            .expect_err("a missing namespace must not fail open");
+            .unwrap();
+        let err = PodSecurityAdmission::new()
+            .admit_outcome(&storage, "broken", &baseline_pod(), "alice")
+            .await
+            .expect_err("an unreadable namespace must not fail open");
         assert!(
             matches!(&err, rusternetes_common::Error::Internal(m)
-                if m.contains(r#"failed to lookup namespace "missing""#)),
+                if m.contains(r#"failed to lookup namespace "broken""#)),
             "{err:?}"
         );
+    }
+
+    /// A namespace that does not exist is unlabelled: NamespaceLifecycle
+    /// (upstream) answers NotFound before PodSecurity runs, and this server
+    /// has no such plugin for pod creates.
+    #[tokio::test]
+    async fn psa_missing_namespace_is_unlabelled() {
+        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        PodSecurityAdmission::new()
+            .admit_outcome(&storage, "missing", &privileged_pod(None), "alice")
+            .await
+            .expect("a missing namespace carries no labels");
     }
 }
