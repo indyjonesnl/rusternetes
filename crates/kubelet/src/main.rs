@@ -36,6 +36,7 @@ mod kubelet;
 mod labels;
 #[allow(dead_code)]
 mod lifecycle;
+mod node_status;
 // Wired in main below; the full surface is only reachable from lib users/tests.
 #[allow(dead_code)]
 mod pluginmanager;
