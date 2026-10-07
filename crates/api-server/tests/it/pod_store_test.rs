@@ -365,6 +365,36 @@ async fn an_ephemeral_container_added_by_patch_survives_a_read_modify_put() {
     );
 }
 
+/// The e2e client speaks protobuf, which writes every non-pointer scalar of
+/// `v1.EphemeralContainerCommon` — `stdinOnce: false` included — so the
+/// existing container comes back with an explicit `false` where it was stored
+/// without one. Upstream's `bool` makes the two the same value (internal
+/// `core.EphemeralContainerCommon.StdinOnce` is a plain bool), so
+/// `ValidatePodEphemeralContainersUpdate` must not call it a change (#2382).
+#[tokio::test]
+async fn an_explicit_false_bool_is_not_a_change_to_an_ephemeral_container() {
+    let api = TestApiServer::new();
+    let created = create(&api, &pod("p1")).await;
+    let mut update = created.clone();
+    update["spec"]["ephemeralContainers"] =
+        json!([{"name": "debugger", "image": "busybox", "stdin": true, "tty": true}]);
+    let (s, body) = api
+        .put(&format!("{PODS}/p1/ephemeralcontainers"), &update)
+        .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+
+    let mut again = body.clone();
+    again["spec"]["ephemeralContainers"][0]["stdinOnce"] = json!(false);
+    again["spec"]["ephemeralContainers"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"name": "debugger2", "image": "busybox"}));
+    let (s, body) = api
+        .put(&format!("{PODS}/p1/ephemeralcontainers"), &again)
+        .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+}
+
 /// The conformance spec "should support pod readiness gates"
 /// (test/e2e/common/node/pods.go:779) patches `status.conditions` twice with a
 /// strategic-merge PATCH naming one condition each. `PodStatus.conditions` is
