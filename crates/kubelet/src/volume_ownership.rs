@@ -2,9 +2,11 @@
 //! (`:61-79`, `:100-120`, `:147-181`), the `SetVolumeOwnership` that a volume
 //! plugin runs when the pod sets `fsGroup`.
 //!
-//! Not ported: `fsGroupChangePolicy` / `skipPermissionChange` (`:183-229`) and
-//! the progress monitor (`:81-98`, `:123-145`) — the projected plugin passes
-//! `nil` for the policy (`projected.go:208`).
+//! `fsGroupChangePolicy` / `skipPermissionChange` / `requiresPermissionChange`
+//! (`:183-229`) are ported in [`set_volume_ownership_with_policy`]; every
+//! in-tree plugin ported so far passes `nil` for the policy (`projected.go:208`,
+//! `empty_dir.go:277`). The progress monitor (`:81-98`, `:123-145`) is not
+//! ported.
 //!
 //! Deliberate deviation: upstream's `changeFilePermission` logs an `Lchown` /
 //! `Chmod` failure and returns nil (`:151-175`); here a failure is returned, as
@@ -27,9 +29,25 @@ const SETGID: u32 = 0o2000;
 /// `NewVolumeOwnership(..).ChangePermissions()` (`volume_linux.go:61-79`): a
 /// no-op with no fsGroup, otherwise `changePermissionsRecursively`.
 pub fn set_volume_ownership(dir: &Path, fs_group: Option<i64>, read_only: bool) -> io::Result<()> {
+    set_volume_ownership_with_policy(dir, fs_group, None, read_only)
+}
+
+/// `ChangePermissions` with a `fsGroupChangePolicy` (`volume_linux.go:61-79`):
+/// `skipPermissionChange` short-circuits the walk when the policy is
+/// `OnRootMismatch` and the root already matches (`:183-229`). Any other policy
+/// (`Always`, unset) walks recursively.
+pub fn set_volume_ownership_with_policy(
+    dir: &Path,
+    fs_group: Option<i64>,
+    fs_group_change_policy: Option<&str>,
+    read_only: bool,
+) -> io::Result<()> {
     let Some(fs_group) = fs_group else {
         return Ok(());
     };
+    if skip_permission_change(dir, fs_group, fs_group_change_policy, read_only) {
+        return Ok(());
+    }
     walk_deep(dir, &mut |path, meta| {
         change_file_permission(path, fs_group, read_only, meta)
     })
@@ -51,6 +69,38 @@ pub fn write_payload_with_ownership(
     let set_perms =
         move |dir: &Path| -> io::Result<()> { set_volume_ownership(dir, fs_group, read_only) };
     crate::atomic_writer::write_projected_payload_with(dir, payload, Some(&set_perms))
+}
+
+/// `skipPermissionChange` (`volume_linux.go:183-189`).
+fn skip_permission_change(
+    dir: &Path,
+    fs_group: i64,
+    policy: Option<&str>,
+    read_only: bool,
+) -> bool {
+    if policy != Some("OnRootMismatch") {
+        return false;
+    }
+    !requires_permission_change(dir, fs_group, read_only)
+}
+
+/// `requiresPermissionChange` (`volume_linux.go:191-229`): the root must be a
+/// directory owned by `fsGroup`, setgid, with a permission superset of
+/// `rwMask|execMask` (`roMask|execMask` when read-only).
+fn requires_permission_change(root: &Path, fs_group: i64, read_only: bool) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(root) else {
+        return true;
+    };
+    if i64::from(meta.gid()) != fs_group {
+        return true;
+    }
+    if !meta.is_dir() {
+        return true;
+    }
+    let want = (if read_only { RO_MASK } else { RW_MASK }) | EXEC_MASK;
+    let have = meta.permissions().mode() & 0o777;
+    (want & have != want) || (meta.permissions().mode() & SETGID == 0)
 }
 
 /// `changeFilePermission` (`volume_linux.go:147-181`): `Lchown(-1, fsGroup)`,
@@ -218,5 +268,63 @@ mod tests {
         let d = std::env::temp_dir().join(format!("volown-missing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         assert!(set_volume_ownership(&d, Some(0), true).is_err());
+    }
+
+    fn own_gid(p: &Path) -> i64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(p).unwrap().gid() as i64
+    }
+
+    #[test]
+    fn on_root_mismatch_skips_when_root_already_matches() {
+        let d = tmp("orm-skip");
+        let gid = own_gid(&d);
+        // A conforming root, with a child that a recursive walk would change.
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o2770)).unwrap();
+        let f = d.join("f");
+        std::fs::write(&f, b"x").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        set_volume_ownership_with_policy(&d, Some(gid), Some("OnRootMismatch"), false).unwrap();
+        assert_eq!(
+            mode(&f),
+            0o600,
+            "OnRootMismatch with matching root must not walk"
+        );
+    }
+
+    #[test]
+    fn on_root_mismatch_walks_when_root_lacks_setgid() {
+        let d = tmp("orm-walk");
+        let gid = own_gid(&d);
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let f = d.join("f");
+        std::fs::write(&f, b"x").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        set_volume_ownership_with_policy(&d, Some(gid), Some("OnRootMismatch"), false).unwrap();
+        assert_eq!(mode(&f), 0o660);
+        assert_eq!(mode(&d) & 0o2000, 0o2000);
+    }
+
+    #[test]
+    fn always_policy_walks_even_when_root_matches() {
+        let d = tmp("always");
+        let gid = own_gid(&d);
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o2770)).unwrap();
+        let f = d.join("f");
+        std::fs::write(&f, b"x").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        set_volume_ownership_with_policy(&d, Some(gid), Some("Always"), false).unwrap();
+        assert_eq!(mode(&f), 0o660);
+    }
+
+    #[test]
+    fn requires_change_for_root_readonly_superset_check() {
+        let d = tmp("ro-superset");
+        let gid = own_gid(&d);
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o2550)).unwrap();
+        // roMask|execMask = 0550 is satisfied; rwMask|execMask = 0770 is not.
+        assert!(!requires_permission_change(&d, gid, true));
+        assert!(requires_permission_change(&d, gid, false));
+        assert!(requires_permission_change(&d, gid + 1, true));
     }
 }

@@ -856,14 +856,14 @@ pub async fn get_api_groups(
     (StatusCode::OK, Json(api_group_list)).into_response()
 }
 
-/// Whether `certificates.k8s.io/v1beta1` is served: its only resource,
-/// `clustertrustbundles`, is installed only under the `ClusterTrustBundle`
-/// feature gate (pkg/registry/certificates/rest/storage_certificates.go:
-/// 91-104), and upstream drops a group version that has no storage.
+/// Whether `certificates.k8s.io/v1beta1` is served: its resources,
+/// `clustertrustbundles` and `podcertificaterequests`, are installed only
+/// under the `ClusterTrustBundle` / `PodCertificateRequest` feature gates
+/// (pkg/registry/certificates/rest/storage_certificates.go:91-117), and
+/// upstream drops a group version that has no storage.
 fn certificates_v1beta1_served() -> bool {
-    rusternetes_common::feature_gates::enabled(
-        rusternetes_common::feature_gates::Feature::ClusterTrustBundle,
-    )
+    use rusternetes_common::feature_gates::{enabled, Feature};
+    enabled(Feature::ClusterTrustBundle) || enabled(Feature::PodCertificateRequest)
 }
 
 /// Helper to get all API group names and their preferred versions
@@ -894,6 +894,32 @@ fn get_api_group_names() -> Vec<(&'static str, &'static str)> {
         ("events.k8s.io", "v1"),
         ("apiregistration.k8s.io", "v1"),
     ]
+}
+
+/// The resource a built-in kind is served as at `group/version`: a port of
+/// `discoveryResourceResolver.Resolve`
+/// (pkg/registry/admissionregistration/resolver/resolver.go:36-60) over the
+/// discovery documents this crate serves. The kind must match, subresources
+/// (a `/` in the name) are skipped, and a group or version that is not served
+/// resolves to nothing (upstream's `NoKindMatchError`).
+pub fn resolve_kind_to_resource(group: &str, version: &str, kind: &str) -> Option<String> {
+    let served = match (group, version) {
+        ("", "v1") | ("autoscaling", "v1") => true,
+        ("certificates.k8s.io", "v1beta1") => certificates_v1beta1_served(),
+        _ => get_api_group_names()
+            .iter()
+            .any(|(g, v)| *g == group && *v == version),
+    };
+    if !served {
+        return None;
+    }
+    get_aggregated_resources_for_group_uncategorized(group, version)
+        .iter()
+        .find(|r| {
+            r["responseKind"]["kind"].as_str() == Some(kind)
+                && r["resource"].as_str().is_some_and(|n| !n.contains('/'))
+        })
+        .and_then(|r| r["resource"].as_str().map(str::to_string))
 }
 
 /// Build aggregated discovery resource entries for a given API group.
@@ -1397,15 +1423,33 @@ fn get_aggregated_resources_for_group_uncategorized(
             vec![sub("status", "CustomResourceDefinition", status_verbs)],
         )],
         "coordination.k8s.io" => vec![res("leases", "lease", "Lease", true, all_verbs, vec![])],
-        // v1beta1 serves only ClusterTrustBundle (storage_certificates.go:91-104).
-        "certificates.k8s.io" if version == "v1beta1" => vec![res(
-            "clustertrustbundles",
-            "clustertrustbundle",
-            "ClusterTrustBundle",
-            false,
-            all_verbs,
-            vec![],
-        )],
+        // v1beta1 serves ClusterTrustBundle and PodCertificateRequest, each
+        // under its own gate (storage_certificates.go:91-117).
+        "certificates.k8s.io" if version == "v1beta1" => {
+            use rusternetes_common::feature_gates::{enabled, Feature};
+            let mut v = Vec::new();
+            if enabled(Feature::ClusterTrustBundle) {
+                v.push(res(
+                    "clustertrustbundles",
+                    "clustertrustbundle",
+                    "ClusterTrustBundle",
+                    false,
+                    all_verbs,
+                    vec![],
+                ));
+            }
+            if enabled(Feature::PodCertificateRequest) {
+                v.push(res(
+                    "podcertificaterequests",
+                    "podcertificaterequest",
+                    "PodCertificateRequest",
+                    true,
+                    all_verbs,
+                    vec![sub("status", "PodCertificateRequest", status_verbs)],
+                ));
+            }
+            v
+        }
         "certificates.k8s.io" => vec![res_with_short(
             "certificatesigningrequests",
             "certificatesigningrequest",
@@ -3337,9 +3381,9 @@ pub async fn get_certificates_v1_resources() -> (StatusCode, Json<APIResourceLis
 }
 
 /// GET /apis/certificates.k8s.io/v1beta1
-/// Returns the resources of certificates.k8s.io/v1beta1: `clustertrustbundles`,
-/// which exists only while the `ClusterTrustBundle` gate is on (404 otherwise,
-/// as for an API version with no storage).
+/// Returns the resources of certificates.k8s.io/v1beta1: `clustertrustbundles`
+/// and `podcertificaterequests` (+ `/status`), each present only while its
+/// gate is on (404 when neither is, as for an API version with no storage).
 pub async fn get_certificates_v1beta1_resources() -> Response {
     if !certificates_v1beta1_served() {
         return (
@@ -3355,12 +3399,9 @@ pub async fn get_certificates_v1beta1_resources() -> Response {
         )
             .into_response();
     }
-    let resources = vec![APIResource {
-        name: "clustertrustbundles".to_string(),
-        singular_name: "clustertrustbundle".to_string(),
-        namespaced: false,
-        kind: "ClusterTrustBundle".to_string(),
-        verbs: [
+    use rusternetes_common::feature_gates::{enabled, Feature};
+    let all_verbs = || -> Vec<String> {
+        [
             "create",
             "delete",
             "deletecollection",
@@ -3372,11 +3413,46 @@ pub async fn get_certificates_v1beta1_resources() -> Response {
         ]
         .iter()
         .map(|s| s.to_string())
-        .collect(),
-        short_names: None,
-        categories: None,
-        storage_version_hash: None,
-    }];
+        .collect()
+    };
+    let mut resources = Vec::new();
+    if enabled(Feature::ClusterTrustBundle) {
+        resources.push(APIResource {
+            name: "clustertrustbundles".to_string(),
+            singular_name: "clustertrustbundle".to_string(),
+            namespaced: false,
+            kind: "ClusterTrustBundle".to_string(),
+            verbs: all_verbs(),
+            short_names: None,
+            categories: None,
+            storage_version_hash: None,
+        });
+    }
+    if enabled(Feature::PodCertificateRequest) {
+        resources.push(APIResource {
+            name: "podcertificaterequests".to_string(),
+            singular_name: "podcertificaterequest".to_string(),
+            namespaced: true,
+            kind: "PodCertificateRequest".to_string(),
+            verbs: all_verbs(),
+            short_names: None,
+            categories: None,
+            storage_version_hash: None,
+        });
+        resources.push(APIResource {
+            name: "podcertificaterequests/status".to_string(),
+            singular_name: "".to_string(),
+            namespaced: true,
+            kind: "PodCertificateRequest".to_string(),
+            verbs: ["get", "patch", "update"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            short_names: None,
+            categories: None,
+            storage_version_hash: None,
+        });
+    }
     let resource_list = APIResourceList {
         kind: "APIResourceList".to_string(),
         api_version: "v1".to_string(),
@@ -4099,6 +4175,26 @@ pub async fn get_apiregistration_v1_resources() -> (StatusCode, Json<APIResource
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+
+    #[test]
+    fn resolve_kind_finds_the_resource_serving_a_kind() {
+        // resolver/resolver.go:36-60
+        assert_eq!(
+            resolve_kind_to_resource("coordination.k8s.io", "v1", "Lease").as_deref(),
+            Some("leases")
+        );
+        assert_eq!(
+            resolve_kind_to_resource("", "v1", "Pod").as_deref(),
+            Some("pods")
+        );
+        // a wrong version, an unknown kind, and a subresource-only kind do not resolve
+        assert_eq!(
+            resolve_kind_to_resource("coordination.k8s.io", "v9", "Lease"),
+            None
+        );
+        assert_eq!(resolve_kind_to_resource("", "v1", "Nope"), None);
+        assert_eq!(resolve_kind_to_resource("", "v1", "PodExecOptions"), None);
+    }
 
     #[test]
     fn test_wants_aggregated_discovery_with_explicit_accept() {

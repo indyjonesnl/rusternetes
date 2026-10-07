@@ -1,3 +1,4 @@
+use crate::controllers::worker_pool::spawn_workers;
 use anyhow::{Context, Result};
 use rusternetes_common::resources::service_account::ObjectReference;
 use rusternetes_common::resources::volume::PersistentVolumeClaimPhase;
@@ -21,6 +22,10 @@ use tracing::{debug, error, info, warn};
 const IS_DEFAULT_SNAPSHOT_CLASS_ANNOTATION: &str =
     "snapshot.storage.kubernetes.io/is-default-class";
 
+/// `threads = flag.Int("worker-threads", 10, "Number of worker threads.")`
+/// (external-snapshotter `cmd/snapshot-controller/main.go:70`).
+const WORKER_THREADS: usize = 10;
+
 pub struct VolumeSnapshotController<S: Storage> {
     storage: Arc<S>,
     recorder: EventRecorder<S>,
@@ -41,10 +46,14 @@ impl<S: Storage + 'static> VolumeSnapshotController<S> {
 
         let queue = WorkQueue::new();
 
-        let worker_queue = queue.clone();
-        let worker_self = Arc::clone(&self);
-        tokio::spawn(async move {
-            worker_self.worker(worker_queue).await;
+        // N workers drain ONE shared queue; a key in flight is never handed to
+        // a second worker (`for i := 0; i < workers; i++ { go wait.Until(ctrl.snapshotWorker, 0, stopCh) }`,
+        // `snapshot_controller_base.go:283-285`).
+        spawn_workers(WORKER_THREADS, &queue, |worker_queue| {
+            let worker_self = Arc::clone(&self);
+            async move {
+                worker_self.worker(worker_queue).await;
+            }
         });
 
         loop {
@@ -92,41 +101,42 @@ impl<S: Storage + 'static> VolumeSnapshotController<S> {
     }
     async fn worker(&self, queue: WorkQueue) {
         while let Some(key) = queue.get().await {
-            let parts: Vec<&str> = key.splitn(3, '/').collect();
-            let (ns, name) = match parts.len() {
-                3 => (parts[1], parts[2]),
-                _ => {
-                    queue.done(&key).await;
-                    continue;
-                }
-            };
-            let storage_key = build_key("volumesnapshots", Some(ns), name);
-            match self.storage.get::<VolumeSnapshot>(&storage_key).await {
-                Ok(snapshot) => {
-                    // Only process snapshots that don't have a bound content yet
-                    if snapshot
-                        .status
-                        .as_ref()
-                        .and_then(|s| s.bound_volume_snapshot_content_name.as_ref())
-                        .is_none()
-                    {
-                        if let Err(e) = self.create_snapshot(&snapshot).await {
-                            error!("Failed to create snapshot for {}: {}", key, e);
-                            queue.requeue_rate_limited(key.clone()).await;
-                        } else {
-                            queue.forget(&key).await;
-                        }
-                    } else {
-                        queue.forget(&key).await;
-                    }
-                    // Also reconcile snapshot deletions
-                    let _ = self.reconcile_deletions().await;
-                }
-                Err(_) => {
-                    queue.forget(&key).await;
+            match self.process_key(&key).await {
+                Ok(()) => queue.forget(&key).await,
+                Err(e) => {
+                    error!("Failed to sync VolumeSnapshot {}: {}", key, e);
+                    queue.requeue_rate_limited(key.clone()).await;
                 }
             }
             queue.done(&key).await;
+        }
+    }
+
+    /// `syncSnapshotByKey` (external-snapshotter
+    /// `pkg/common-controller/snapshot_controller_base.go:377`): a key whose
+    /// snapshot is gone is the `deleteSnapshot` path (`:585`), scoped to THAT
+    /// snapshot's content only, not a sweep of every content.
+    async fn process_key(&self, key: &str) -> Result<()> {
+        let parts: Vec<&str> = key.splitn(3, '/').collect();
+        let (ns, name) = match parts.len() {
+            3 => (parts[1], parts[2]),
+            _ => return Ok(()),
+        };
+        let storage_key = build_key("volumesnapshots", Some(ns), name);
+        match self.storage.get::<VolumeSnapshot>(&storage_key).await {
+            Ok(snapshot) => {
+                // Only process snapshots that don't have a bound content yet
+                if snapshot
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.bound_volume_snapshot_content_name.as_ref())
+                    .is_none()
+                {
+                    self.create_snapshot(&snapshot).await?;
+                }
+                Ok(())
+            }
+            Err(_) => self.delete_snapshot(ns, name).await,
         }
     }
 
@@ -145,6 +155,22 @@ impl<S: Storage + 'static> VolumeSnapshotController<S> {
             }
             Err(e) => {
                 error!("Failed to list volumesnapshots for enqueue: {}", e);
+            }
+        }
+        // Resync also covers snapshots deleted while no event was seen (the
+        // informer resync in upstream re-lists contents, `syncContentByKey`):
+        // enqueue each content's referenced snapshot so a vanished one gets
+        // its per-key deletion pass.
+        if let Ok(contents) = self
+            .storage
+            .list::<VolumeSnapshotContent>("/registry/volumesnapshotcontents/")
+            .await
+        {
+            for c in &contents {
+                let r = &c.spec.volume_snapshot_ref;
+                if let (Some(ns), Some(name)) = (&r.namespace, &r.name) {
+                    queue.add(format!("volumesnapshots/{ns}/{name}")).await;
+                }
             }
         }
     }
@@ -582,6 +608,18 @@ impl<S: Storage + 'static> VolumeSnapshotController<S> {
     }
 
     async fn reconcile_deletions(&self) -> Result<()> {
+        self.release_contents(None).await
+    }
+
+    /// Release the contents bound to the one deleted snapshot `ns/name`.
+    async fn delete_snapshot(&self, ns: &str, name: &str) -> Result<()> {
+        self.release_contents(Some((ns, name))).await
+    }
+
+    /// Apply each content's deletion policy for a snapshot that no longer
+    /// exists; `only` restricts the pass to contents referencing that one
+    /// snapshot (`None` = full sweep, kept for `reconcile_all`).
+    async fn release_contents(&self, only: Option<(&str, &str)>) -> Result<()> {
         // Get all VolumeSnapshotContents
         let contents: Vec<VolumeSnapshotContent> = self
             .storage
@@ -593,6 +631,9 @@ impl<S: Storage + 'static> VolumeSnapshotController<S> {
             let vs_ref = &content.spec.volume_snapshot_ref;
 
             if let (Some(namespace), Some(name)) = (&vs_ref.namespace, &vs_ref.name) {
+                if only.is_some_and(|(n, m)| n != namespace || m != name) {
+                    continue;
+                }
                 let vs_key = build_key("volumesnapshots", Some(namespace), name);
 
                 // If the VolumeSnapshot is deleted and deletion policy is Delete
