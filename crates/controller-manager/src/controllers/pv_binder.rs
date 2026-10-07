@@ -363,6 +363,11 @@ impl<S: Storage + 'static> PVBinderController<S> {
     /// `updateVolumeMigrationAnnotationsAndFinalizers` (`:565`; in-tree to CSI
     /// migration, which Rusternetes has no plugins for).
     async fn sync_volume(&self, pv: PersistentVolume, claim_queue: &WorkQueue) -> Result<()> {
+        // "Set correct "migrated-to" annotations and modify finalizers on PV and
+        // update in API server if necessary" (`pv_controller.go:565-573`).
+        let pv = self
+            .update_volume_migration_annotations_and_finalizers(pv)
+            .await?;
         // `volume.Spec.ClaimRef == nil` and `claimRef.UID == ""`: unused, or
         // reserved for a claim that has not yet bound (`:576-596`).
         let claim_ref = match pv.spec.claim_ref.clone() {
@@ -532,6 +537,25 @@ impl<S: Storage + 'static> PVBinderController<S> {
         }
     }
 
+    /// `updateVolumeMigrationAnnotationsAndFinalizers`
+    /// (`pv_controller_base.go:361-381`): one `Update` when either the
+    /// `migrated-to` annotation or the deletion finalizers need fixing.
+    async fn update_volume_migration_annotations_and_finalizers(
+        &self,
+        mut pv: PersistentVolume,
+    ) -> Result<PersistentVolume> {
+        let ann_modified = update_migration_annotations(pv.metadata.annotations.as_mut());
+        let (finalizers, finalizers_modified) = modify_deletion_finalizers(&pv);
+        if !ann_modified && !finalizers_modified {
+            return Ok(pv);
+        }
+        if finalizers_modified {
+            pv.metadata.finalizers = finalizers;
+        }
+        let pv_key = build_key("persistentvolumes", None, &pv.metadata.name);
+        Ok(self.storage.update(&pv_key, &pv).await?)
+    }
+
     /// `reclaimVolume` (`pv_controller.go:1180-1230`). `Retain` does nothing;
     /// `Delete` removes the PV. `Recycle` on a volume with no recycler
     /// plugin fails it (`recycleVolumeOperation`, `:1279-1286`); the hostPath/NFS
@@ -560,6 +584,18 @@ impl<S: Storage + 'static> PVBinderController<S> {
                 PersistentVolumePhase::Failed,
                 "VolumeFailedRecycle",
                 "No recycler plugin found for the volume!",
+            )
+            .await?;
+            return Ok(());
+        }
+        if pv.spec.persistent_volume_reclaim_policy == Some(PersistentVolumeReclaimPolicy::Unknown)
+        {
+            // `default:` branch of reclaimVolume (`pv_controller.go:1217-1222`).
+            self.update_volume_phase_with_event(
+                pv.clone(),
+                PersistentVolumePhase::Failed,
+                "VolumeUnknownReclaimPolicy",
+                "Volume has unrecognized PersistentVolumeReclaimPolicy",
             )
             .await?;
             return Ok(());
@@ -1456,6 +1492,74 @@ impl<S: Storage + 'static> PVBinderController<S> {
 /// `pv.kubernetes.io/bind-completed: "yes"` unless already present
 /// (`:1064-1068`), which is what `syncClaim` (`:251`) and the scheduler's
 /// `isPVCBound` (`volumebinding/binder.go:776`) key on.
+/// `storagehelpers.PVDeletionInTreeProtectionFinalizer`
+/// (component-helpers pv_helpers.go:82).
+const IN_TREE_PV_DELETION_PROTECTION_FINALIZER: &str = "kubernetes.io/pv-controller";
+/// `storagehelpers.PVDeletionProtectionFinalizer` (pv_helpers.go:79).
+const EXTERNAL_PV_DELETION_PROTECTION_FINALIZER: &str =
+    "external-provisioner.volume.kubernetes.io/finalizer";
+
+/// `updateMigrationAnnotations` (`pv_controller_base.go:445-496`) for a volume
+/// (`claim == false`). Deviation: Rusternetes has no CSI-migrated in-tree
+/// plugins, so `IsMigrationEnabledForPlugin` is always false and only the
+/// rollback branch ("Migration annotation exists but the driver isn't migrated
+/// currently") applies.
+fn update_migration_annotations(
+    ann: Option<&mut std::collections::HashMap<String, String>>,
+) -> bool {
+    let Some(ann) = ann else { return false };
+    if !ann.contains_key(ANN_DYNAMICALLY_PROVISIONED) {
+        // Volume statically provisioned.
+        return false;
+    }
+    ann.get(ANN_MIGRATED_TO).is_some_and(|v| !v.is_empty()) && ann.remove(ANN_MIGRATED_TO).is_some()
+}
+
+/// `modifyDeletionFinalizers` (`pv_controller_base.go:398-443`) with CSI
+/// migration disabled for every plugin (see `update_migration_annotations`);
+/// `HonorPVReclaimPolicy` is GA and locked on in 1.35. Returns the new
+/// finalizers and whether they changed.
+fn modify_deletion_finalizers(pv: &PersistentVolume) -> (Option<Vec<String>>, bool) {
+    let unchanged = || (pv.metadata.finalizers.clone(), false);
+    let Some(provisioner) = pv
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(ANN_DYNAMICALLY_PROVISIONED))
+    else {
+        // Supported only for dynamically provisioned volumes.
+        return unchanged();
+    };
+    if !provisioner.starts_with("kubernetes.io/") {
+        return unchanged();
+    }
+    let mut out = pv.metadata.finalizers.clone().unwrap_or_default();
+    let mut modified = false;
+    let has = |out: &[String], f: &str| out.iter().any(|x| x == f);
+    let policy = pv.spec.persistent_volume_reclaim_policy.as_ref();
+    if policy == Some(&PersistentVolumeReclaimPolicy::Delete)
+        && !has(&out, IN_TREE_PV_DELETION_PROTECTION_FINALIZER)
+    {
+        out.push(IN_TREE_PV_DELETION_PROTECTION_FINALIZER.to_string());
+        modified = true;
+    } else if matches!(
+        policy,
+        Some(PersistentVolumeReclaimPolicy::Retain | PersistentVolumeReclaimPolicy::Recycle)
+    ) && has(&out, IN_TREE_PV_DELETION_PROTECTION_FINALIZER)
+    {
+        out.retain(|f| f != IN_TREE_PV_DELETION_PROTECTION_FINALIZER);
+        modified = true;
+    }
+    if has(&out, EXTERNAL_PV_DELETION_PROTECTION_FINALIZER) {
+        out.retain(|f| f != EXTERNAL_PV_DELETION_PROTECTION_FINALIZER);
+        modified = true;
+    }
+    if !modified {
+        return unchanged();
+    }
+    (if out.is_empty() { None } else { Some(out) }, true)
+}
+
 fn bind_claim_to_volume(pvc: &mut PersistentVolumeClaim, volume_name: &str) {
     if pvc.spec.volume_name.as_deref() != Some(volume_name) {
         pvc.spec.volume_name = Some(volume_name.to_string());
@@ -2032,6 +2136,140 @@ mod tests {
         c.sync_volumes(&WorkQueue::new()).await.unwrap();
         let got = get_pv(&storage, "pv").await.unwrap();
         assert_eq!(got.status.unwrap().phase, PersistentVolumePhase::Failed);
+    }
+
+    fn dynamic_pv(
+        name: &str,
+        policy: PersistentVolumeReclaimPolicy,
+        finalizers: &[&str],
+    ) -> PersistentVolume {
+        let mut pv = pv_with(name, None, Some(PersistentVolumePhase::Available));
+        pv.spec.persistent_volume_reclaim_policy = Some(policy);
+        pv.metadata.annotations = Some(
+            [(
+                ANN_DYNAMICALLY_PROVISIONED.to_string(),
+                "kubernetes.io/rbd".to_string(),
+            )]
+            .into(),
+        );
+        pv.metadata.finalizers = if finalizers.is_empty() {
+            None
+        } else {
+            Some(finalizers.iter().map(|s| s.to_string()).collect())
+        };
+        pv
+    }
+
+    /// pv_controller_test.go "5-9" + TestModifyDeletionFinalizers 13-3..13-6,
+    /// 13-12..13-14 (CSI migration disabled): `syncVolume` first runs
+    /// `updateVolumeMigrationAnnotationsAndFinalizers`
+    /// (pv_controller.go:565, pv_controller_base.go:361-381).
+    #[tokio::test]
+    async fn sync_volume_adds_in_tree_finalizer_and_drops_external_one() {
+        use PersistentVolumeReclaimPolicy::*;
+        let cases: Vec<(&str, PersistentVolume, Option<Vec<&str>>)> = vec![
+            // 13-4: Delete, no finalizers -> in-tree finalizer added.
+            (
+                "a",
+                dynamic_pv("a", Delete, &[]),
+                Some(vec![IN_TREE_PV_DELETION_PROTECTION_FINALIZER]),
+            ),
+            // 13-6: external finalizer removed, custom kept, in-tree added.
+            (
+                "b",
+                dynamic_pv(
+                    "b",
+                    Delete,
+                    &[EXTERNAL_PV_DELETION_PROTECTION_FINALIZER, "custom"],
+                ),
+                Some(vec!["custom", IN_TREE_PV_DELETION_PROTECTION_FINALIZER]),
+            ),
+            // 13-12: Retain, nothing to add.
+            ("c", dynamic_pv("c", Retain, &[]), None),
+            // 13-14: Retain removes the in-tree finalizer.
+            (
+                "d",
+                dynamic_pv("d", Retain, &[IN_TREE_PV_DELETION_PROTECTION_FINALIZER]),
+                None,
+            ),
+        ];
+        for (name, pv, want) in cases {
+            let storage = Arc::new(MemoryStorage::new());
+            let c = PVBinderController::new(storage.clone());
+            put_pv(&storage, &pv).await;
+            c.sync_volumes(&WorkQueue::new()).await.unwrap();
+            let got = get_pv(&storage, name).await.unwrap();
+            let want = want.map(|v| v.into_iter().map(String::from).collect::<Vec<_>>());
+            assert_eq!(got.metadata.finalizers, want, "case {name}");
+        }
+    }
+
+    /// 13-11 / 13-15 / 13-10: statically provisioned or unannotated volumes
+    /// are never touched, even when they carry the external finalizer.
+    #[tokio::test]
+    async fn sync_volume_leaves_static_volume_finalizers_alone() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        let mut pv = pv_with("s", None, Some(PersistentVolumePhase::Available));
+        pv.spec.persistent_volume_reclaim_policy = Some(PersistentVolumeReclaimPolicy::Delete);
+        pv.metadata.finalizers = Some(vec![EXTERNAL_PV_DELETION_PROTECTION_FINALIZER.into()]);
+        put_pv(&storage, &pv).await;
+        c.sync_volumes(&WorkQueue::new()).await.unwrap();
+        let got = get_pv(&storage, "s").await.unwrap();
+        assert_eq!(
+            got.metadata.finalizers,
+            Some(vec![EXTERNAL_PV_DELETION_PROTECTION_FINALIZER.to_string()])
+        );
+    }
+
+    /// TestControllerSync 5-9 / updateMigrationAnnotations: the migrated-to
+    /// annotation is removed when migration is off for the plugin.
+    #[tokio::test]
+    async fn sync_volume_removes_stale_migrated_to_annotation() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        let mut pv = dynamic_pv("m", PersistentVolumeReclaimPolicy::Retain, &[]);
+        pv.metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert(ANN_MIGRATED_TO.into(), "pd.csi.storage.gke.io".into());
+        put_pv(&storage, &pv).await;
+        c.sync_volumes(&WorkQueue::new()).await.unwrap();
+        let got = get_pv(&storage, "m").await.unwrap();
+        assert!(!got
+            .metadata
+            .annotations
+            .unwrap_or_default()
+            .contains_key(ANN_MIGRATED_TO));
+    }
+
+    /// pv_controller.go:1217-1222: an unrecognised reclaim policy fails the
+    /// volume with a `VolumeUnknownReclaimPolicy` Warning event.
+    #[tokio::test]
+    async fn unknown_reclaim_policy_fails_volume() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        let mut raw = serde_json::to_value(bound_pv("u")).unwrap();
+        raw["spec"]["persistentVolumeReclaimPolicy"] = serde_json::json!("Bogus");
+        let pv: PersistentVolume = serde_json::from_value(raw).expect("lenient decode");
+        put_pv(&storage, &pv).await;
+        c.sync_volumes(&WorkQueue::new()).await.unwrap();
+        let status = get_pv(&storage, "u").await.unwrap().status.unwrap();
+        assert_eq!(status.phase, PersistentVolumePhase::Failed);
+        assert_eq!(
+            status.message.as_deref(),
+            Some("Volume has unrecognized PersistentVolumeReclaimPolicy")
+        );
+        let events: Vec<rusternetes_common::resources::Event> =
+            storage.list("/registry/events/").await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.reason == "VolumeUnknownReclaimPolicy")
+                .count(),
+            1
+        );
     }
 
     /// binder_test.go "4-6": volume and claim bound to each other -> Bound.
