@@ -42,7 +42,12 @@ pub async fn create_subject_access_review(
         let errs =
             rusternetes_common::validation::authorization::validate_subject_access_review(&sar);
         if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
+            return Err(rusternetes_common::Error::new_invalid(
+                "authorization.k8s.io",
+                "SubjectAccessReview",
+                "",
+                errs,
+            ));
         }
     }
 
@@ -144,7 +149,12 @@ pub async fn create_self_subject_access_review(
                 &ssar,
             );
         if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
+            return Err(rusternetes_common::Error::new_invalid(
+                "authorization.k8s.io",
+                "SelfSubjectAccessReview",
+                "",
+                errs,
+            ));
         }
     }
 
@@ -243,7 +253,12 @@ pub async fn create_local_subject_access_review(
                 &lsar, &namespace,
             );
         if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
+            return Err(rusternetes_common::Error::new_invalid(
+                "authorization.k8s.io",
+                "LocalSubjectAccessReview",
+                "",
+                errs,
+            ));
         }
     }
 

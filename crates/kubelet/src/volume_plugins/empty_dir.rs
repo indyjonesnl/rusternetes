@@ -4,6 +4,7 @@ use crate::volume_plugins::{
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use rusternetes_common::resources::{EmptyDirVolumeSource, Pod};
+use std::path::Path;
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -77,6 +78,7 @@ impl VolumePlugin for EmptyDirPlugin {
                 .empty_dir
                 .clone()
                 .expect("checked by can_support"),
+            fs_group: crate::volume_plugins::util::fs_group_from(pod),
         }))
     }
 
@@ -279,6 +281,8 @@ struct EmptyDirMounter {
     path: String,
     volume_name: String,
     empty_dir: EmptyDirVolumeSource,
+    /// `MounterArgs.FsGroup` (`operation_generator.go:501-509`).
+    fs_group: Option<i64>,
 }
 
 #[async_trait]
@@ -307,6 +311,14 @@ impl Mounter for EmptyDirMounter {
                 .and_then(crate::runtime::parse_quantity_bytes);
             crate::runtime::mount_tmpfs_for_emptydir(volume_dir, size_bytes)?;
         }
+        // `volume.NewVolumeOwnership(ed, dir, mounterArgs.FsGroup, nil
+        // /*fsGroupChangePolicy*/, ..).ChangePermissions()` (empty_dir.go:277-278)
+        // after the medium is set up. emptyDir's `GetAttributes` is
+        // `ReadOnly: false` (:222), so rwMask 0660 (+ setgid|0110 on dirs).
+        // Deviation: upstream discards the error (`_ =`); we return it, as the
+        // other plugins here do, so a pod never starts against an unreadable
+        // volume.
+        crate::volume_ownership::set_volume_ownership(Path::new(volume_dir), self.fs_group, false)?;
         info!(
             "Created emptyDir volume {} at {}",
             self.volume_name, volume_dir
@@ -330,6 +342,38 @@ mod tests {
                 std::collections::HashMap::new(),
             ),
         ))
+    }
+
+    #[tokio::test]
+    async fn set_up_applies_fs_group_with_rw_mask_not_owner_mirror() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let d = tmp("fsgroup-setup");
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("f");
+        std::fs::write(&f, b"x").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let gid = std::fs::metadata(&d).unwrap().gid() as i64;
+        let m = EmptyDirMounter {
+            path: d.to_string_lossy().into_owned(),
+            volume_name: "v".into(),
+            empty_dir: EmptyDirVolumeSource {
+                medium: None,
+                size_limit: None,
+            },
+            fs_group: Some(gid),
+        };
+        m.set_up().await.unwrap();
+        // volume_linux.go:147-181: mode | rwMask. 0400|0660 = 0660 (the old
+        // owner->group mirror would have left 0440), and a dir
+        // gets setgid|execMask.
+        assert_eq!(
+            std::fs::metadata(&f).unwrap().permissions().mode() & 0o7777,
+            0o660
+        );
+        assert_eq!(
+            std::fs::metadata(&d).unwrap().permissions().mode() & 0o7777,
+            0o2777
+        );
     }
 
     #[test]
