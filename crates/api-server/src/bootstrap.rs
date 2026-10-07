@@ -1300,21 +1300,14 @@ pub fn cluster_authentication_info(
     }
 }
 
-/// `createNamespaceIfNeeded` (cluster_authentication_trust_controller.go:181-197).
-/// Upstream creates through the API; this writes the object the Namespace
-/// strategy would have stored (phase Active, the `kubernetes` finalizer, the
-/// `kubernetes.io/metadata.name` label).
-/// The system namespaces the apiserver ensures exist, from
-/// `pkg/controlplane/apiserver/options/options.go:131`
-/// (`SystemNamespaces: {NamespaceSystem, NamespacePublic, NamespaceDefault}`),
-/// created by `systemnamespaces.Controller.sync` /
-/// `createNamespaceIfNeeded`
-/// (`pkg/controlplane/controller/systemnamespaces/system_namespaces_controller.go:78-100`).
+/// `systemnamespaces.Controller.sync` / `createNamespaceIfNeeded`
+/// (`pkg/controlplane/controller/systemnamespaces/system_namespaces_controller.go:78-100`)
+/// over [`SYSTEM_NAMESPACES`]; upstream creates through the API, this writes
+/// the object the Namespace strategy would have stored (phase Active, the
+/// `kubernetes` finalizer, the `kubernetes.io/metadata.name` label).
 /// NamespaceLifecycle answers NotFound for a create in a missing namespace
-/// (#2533), so these must exist before the apiserver serves.
-pub const SYSTEM_NAMESPACES: [&str; 3] = ["kube-system", "kube-public", "default"];
-
-/// One pass of the systemnamespaces controller; idempotent.
+/// (#2533), so these must exist before the apiserver serves. One pass;
+/// idempotent.
 pub async fn bootstrap_system_namespaces(storage: &StorageBackend) -> Result<()> {
     for ns in SYSTEM_NAMESPACES {
         create_namespace_if_needed(storage, ns).await?;
