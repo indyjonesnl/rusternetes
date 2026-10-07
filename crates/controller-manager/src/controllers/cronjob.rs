@@ -1,3 +1,4 @@
+use crate::controllers::replicationcontroller::is_namespace_terminating_rejection;
 use crate::controllers::worker_pool::spawn_workers;
 use anyhow::Result;
 use futures::StreamExt;
@@ -15,6 +16,153 @@ use tracing::{debug, error, info, warn};
 /// `{cronjob}-{scheduledTime.Unix()/60}` (getTimeHashInMinutes, utils.go:270).
 fn job_name_for(cronjob_name: &str, scheduled_time: chrono::DateTime<chrono::Utc>) -> String {
     format!("{}-{}", cronjob_name, scheduled_time.timestamp() / 60)
+}
+
+/// `nextScheduleDelta` (cronjob_controllerv2.go:58): 100ms of padding on every
+/// requeue to absorb NTP skew.
+const NEXT_SCHEDULE_DELTA: chrono::Duration = chrono::Duration::milliseconds(100);
+
+/// Parse a Kubernetes schedule (5 fields or an `@descriptor`) into the `cron`
+/// crate's 7-field form.
+fn parse_standard_schedule(schedule: &str) -> Result<cron::Schedule, cron::error::Error> {
+    // Handle special schedules (Kubernetes 5-field format)
+    let cron_schedule = match schedule {
+        "@yearly" | "@annually" => "0 0 1 1 *",
+        "@monthly" => "0 0 1 * *",
+        "@weekly" => "0 0 * * 0",
+        "@daily" | "@midnight" => "0 0 * * *",
+        "@hourly" => "0 * * * *",
+        other => other,
+    };
+
+    // Kubernetes supports `?` in cron expressions (Quartz-style "no specific value").
+    // Replace with `*` since the `cron` crate doesn't support `?`.
+    let cron_schedule = cron_schedule.replace('?', "*");
+
+    // The `cron` crate expects 7 fields (sec min hour dom month dow year),
+    // but Kubernetes uses 5 fields (min hour dom month dow).
+    // Convert by prepending "0" for seconds and appending "*" for year.
+    let cron_schedule = numeric_dow_to_names(&cron_schedule);
+    let field_count = cron_schedule.split_whitespace().count();
+    let cron_schedule = if field_count == 5 {
+        format!("0 {} *", cron_schedule)
+    } else if field_count == 6 {
+        format!("0 {}", cron_schedule)
+    } else {
+        cron_schedule.to_string()
+    };
+    cron::Schedule::try_from(cron_schedule.as_str())
+}
+
+/// robfig/cron numbers the day of week 0-6 from Sunday (7 is also accepted:
+/// vendor/github.com/robfig/cron/v3/parser.go `dow` bounds {0, 6, dow names}),
+/// but the `cron` crate numbers it 1-7 from Sunday, so a numeric `4` (Thursday
+/// upstream) would mean Wednesday. Rewrite numeric days in the day-of-week
+/// field (the last of 5 or 6 fields) to names, which both crates agree on.
+/// Steps (`/n`) stay numeric.
+fn numeric_dow_to_names(schedule: &str) -> String {
+    const NAMES: [&str; 7] = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+    let mut fields: Vec<String> = schedule.split_whitespace().map(str::to_string).collect();
+    let dow_idx = match fields.len() {
+        5 => 4,
+        6 => 5,
+        _ => return schedule.to_string(),
+    };
+    let name = |n: &str| -> Option<&'static str> {
+        n.parse::<usize>()
+            .ok()
+            .filter(|d| *d <= 7)
+            .map(|d| NAMES[d % 7])
+    };
+    let rewritten: Vec<String> = fields[dow_idx]
+        .split(',')
+        .map(|item| {
+            let (range, step) = match item.split_once('/') {
+                Some((r, s)) => (r, Some(s)),
+                None => (item, None),
+            };
+            let range = match range.split_once('-') {
+                // `n-7` runs to Sunday, which is also day 0: SAT then SUN.
+                Some((a, "7")) if name(a).is_some() && a != "0" && a != "7" => {
+                    format!("{}-SAT,SUN", name(a).unwrap())
+                }
+                Some((a, b)) => match (name(a), name(b)) {
+                    (Some(a), Some(b)) => format!("{a}-{b}"),
+                    _ => range.to_string(),
+                },
+                None => name(range).map(str::to_string).unwrap_or(range.to_string()),
+            };
+            match step {
+                Some(s) => format!("{range}/{s}"),
+                None => range,
+            }
+        })
+        .collect();
+    fields[dow_idx] = rewritten.join(",");
+    fields.join(" ")
+}
+
+/// `nextScheduleTimeDuration` (pkg/controller/cronjob/utils.go:186-205): the
+/// delay until the next schedule slot, plus `NEXT_SCHEDULE_DELTA`.
+///
+/// `mostRecentScheduleTime(.., includeStartingDeadlineSeconds=false)` supplies
+/// the base: `earliestTime` (lastScheduleTime, else creationTimestamp) when
+/// `now` is before the first slot `t1`; otherwise the latest slot not after
+/// `now` -- or `now` itself when the schedule is degenerate (utils.go:128-131).
+/// The result is `schedule.Next(base)`; that is always the first slot after
+/// `now`, so the walk upstream does to find `mostRecentTime` is not repeated.
+fn next_schedule_duration(
+    schedule: &cron::Schedule,
+    tz: chrono_tz::Tz,
+    cj: &CronJob,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<Duration> {
+    let earliest = cj
+        .status
+        .as_ref()
+        .and_then(|s| s.last_schedule_time)
+        .or(cj.metadata.creation_timestamp)
+        .unwrap_or(now)
+        .with_timezone(&tz);
+    let now_tz = now.with_timezone(&tz);
+    let t1 = schedule.after(&earliest).next()?;
+    let next = if now_tz < t1 {
+        t1
+    } else {
+        schedule.after(&now_tz).next()?
+    };
+    (next.with_timezone(&chrono::Utc) - now + NEXT_SCHEDULE_DELTA)
+        .to_std()
+        .ok()
+}
+
+/// The most recent scheduled time in `(earliest, now]`, or None when nothing
+/// is due (mostRecentScheduleTime, pkg/controller/cronjob/utils.go:100-155).
+fn most_recent_schedule_time(
+    schedule: &cron::Schedule,
+    tz: chrono_tz::Tz,
+    now: chrono::DateTime<chrono::Utc>,
+    cronjob: &CronJob,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let now_tz = now.with_timezone(&tz);
+    // utils.go:101-105: earliestTime is the CronJob's creationTimestamp,
+    // replaced by status.lastScheduleTime.
+    let last_schedule = cronjob.status.as_ref().and_then(|s| s.last_schedule_time);
+    let start = match last_schedule.or(cronjob.metadata.creation_timestamp) {
+        Some(t) => t.with_timezone(&tz),
+        None => (now - chrono::Duration::minutes(1)).with_timezone(&tz),
+    };
+    // Walk every scheduled time in (start, now]; the latest wins. Capped
+    // like upstream's "too many missed start times" guard (utils.go).
+    let latest = schedule
+        .after(&start)
+        .take(10_000)
+        .take_while(|t| *t <= now_tz)
+        .last();
+    if let Some(t) = latest {
+        info!("CronJob due: scheduled={}, current={}", t, now);
+    }
+    latest.map(|t| t.with_timezone(&chrono::Utc))
 }
 
 /// Upstream `ConcurrentCronJobSyncs` default, workers launched by `Run`
@@ -168,7 +316,14 @@ impl<S: Storage + 'static> CronJobController<S> {
                 Ok(resource) => {
                     let mut resource = resource;
                     match self.reconcile(&mut resource).await {
-                        Ok(()) => queue.forget(&key).await,
+                        // processNextWorkItem (:176-185): Forget, then
+                        // AddAfter(requeueAfter) when the sync asked for one.
+                        Ok(requeue_after) => {
+                            queue.forget(&key).await;
+                            if let Some(after) = requeue_after {
+                                queue.add_after(key.clone(), after).await;
+                            }
+                        }
                         Err(e) => {
                             error!("Failed to reconcile {}: {}", key, e);
                             queue.requeue_rate_limited(key.clone()).await;
@@ -220,7 +375,10 @@ impl<S: Storage + 'static> CronJobController<S> {
     /// `sync` (cronjob_controllerv2.go:188-238): list the Jobs this CronJob
     /// controls, run `cleanupFinishedJobs` and `syncCronJob` against ONE copy
     /// of the CronJob, and write the status once if either asked for it.
-    async fn reconcile(&self, cronjob: &mut CronJob) -> Result<()> {
+    ///
+    /// Returns `requeueAfter` (:229-232): the delay after which the key is
+    /// re-added; a sync error is returned only when there is none (:234).
+    async fn reconcile(&self, cronjob: &mut CronJob) -> Result<Option<Duration>> {
         let namespace = cronjob.metadata.namespace.clone().unwrap_or_default();
         debug!(
             "Reconciling CronJob {}/{}",
@@ -277,7 +435,7 @@ impl<S: Storage + 'static> CronJobController<S> {
         jobs: &[Job],
         namespace: &str,
         update_status: &mut bool,
-    ) -> Result<()> {
+    ) -> Result<Option<Duration>> {
         let name = cronjob.metadata.name.clone();
         let now = chrono::Utc::now();
 
@@ -375,16 +533,24 @@ impl<S: Storage + 'static> CronJobController<S> {
 
         if cronjob.metadata.is_being_deleted() {
             // Don't do anything other than updating status (:498-502).
-            return Ok(());
+            return Ok(None);
         }
         if cronjob.spec.suspend.unwrap_or(false) {
             debug!("CronJob {}/{} is suspended", namespace, name);
-            return Ok(());
+            return Ok(None);
         }
 
         let schedule = cronjob.spec.schedule.clone();
-        let Some(scheduled_time) = self.scheduled_run_time(&schedule, now, cronjob).await? else {
-            return Ok(());
+        let Some((sched, tz)) = self.parse_schedule(&schedule, cronjob).await? else {
+            return Ok(None);
+        };
+        // `nextScheduleTimeDuration` (utils.go:188), evaluated against the
+        // CronJob as it stands at each of upstream's requeue returns.
+        let requeue = |cj: &CronJob| next_schedule_duration(&sched, tz, cj, now);
+        let Some(scheduled_time) = most_recent_schedule_time(&sched, tz, now, cronjob) else {
+            // :536-543
+            debug!("No unmet start times for {}/{}", namespace, name);
+            return Ok(requeue(cronjob));
         };
         // getJobName (:676): the Job is named from the SCHEDULED time.
         let scheduled_job_name = job_name_for(&name, scheduled_time);
@@ -399,7 +565,7 @@ impl<S: Storage + 'static> CronJobController<S> {
                 .is_some_and(|t| t == scheduled_time)
         {
             debug!("Not starting job because the scheduled time is already processed");
-            return Ok(());
+            return Ok(requeue(cronjob));
         }
 
         let policy = cronjob
@@ -418,7 +584,7 @@ impl<S: Storage + 'static> CronJobController<S> {
                 "Not starting job because prior execution is running and concurrency policy is Forbid",
             )
             .await;
-            return Ok(());
+            return Ok(requeue(cronjob));
         }
         if policy == "Replace" {
             for r in &active_refs(cronjob) {
@@ -449,7 +615,7 @@ impl<S: Storage + 'static> CronJobController<S> {
         }
 
         let Some(job) = self.create_job(cronjob, namespace, scheduled_time).await? else {
-            return Ok(());
+            return Ok(None);
         };
 
         // :655-671: add the just-started Job to the status list.
@@ -465,7 +631,8 @@ impl<S: Storage + 'static> CronJobController<S> {
         });
         status.last_schedule_time = Some(scheduled_time);
         *update_status = true;
-        Ok(())
+        // :672-673
+        Ok(requeue(cronjob))
     }
 
     /// `deleteJob` (cronjob_controllerv2.go:748-760): delete the Job and its
@@ -504,15 +671,28 @@ impl<S: Storage + 'static> CronJobController<S> {
 
     /// The most recent scheduled time in `(last, now]`, or None when nothing is
     /// due (mostRecentScheduleTime, pkg/controller/cronjob/utils.go).
+    #[cfg(test)]
     async fn scheduled_run_time(
         &self,
         schedule: &str,
         now: chrono::DateTime<chrono::Utc>,
         cronjob: &CronJob,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
-        // Get last schedule time
-        let last_schedule = cronjob.status.as_ref().and_then(|s| s.last_schedule_time);
+        Ok(match self.parse_schedule(schedule, cronjob).await? {
+            Some((sched, tz)) => most_recent_schedule_time(&sched, tz, now, cronjob),
+            None => None,
+        })
+    }
 
+    /// The schedule and zone `syncCronJob` evaluates against: the
+    /// spec.timeZone / formatSchedule / ParseCronScheduleWithPanicRecovery
+    /// steps (cronjob_controllerv2.go:505-526). `None` means "do not
+    /// schedule", with the matching event already recorded.
+    async fn parse_schedule(
+        &self,
+        schedule: &str,
+        cronjob: &CronJob,
+    ) -> Result<Option<(cron::Schedule, chrono_tz::Tz)>> {
         // syncCronJob checks spec.timeZone before anything else and records an
         // UnknownTimeZone event (cronjob_controllerv2.go:507-513).
         if let Some(name) = cronjob.spec.time_zone.as_deref() {
@@ -580,37 +760,10 @@ impl<S: Storage + 'static> CronJobController<S> {
                 (schedule, None)
             };
 
-        // Handle special schedules (Kubernetes 5-field format)
-        let cron_schedule = match schedule {
-            "@yearly" | "@annually" => "0 0 1 1 *",
-            "@monthly" => "0 0 1 * *",
-            "@weekly" => "0 0 * * 0",
-            "@daily" | "@midnight" => "0 0 * * *",
-            "@hourly" => "0 * * * *",
-            other => other,
-        };
-
-        // Kubernetes supports `?` in cron expressions (Quartz-style "no specific value").
-        // Replace with `*` since the `cron` crate doesn't support `?`.
-        let cron_schedule = cron_schedule.replace('?', "*");
-
-        // The `cron` crate expects 7 fields (sec min hour dom month dow year),
-        // but Kubernetes uses 5 fields (min hour dom month dow).
-        // Convert by prepending "0" for seconds and appending "*" for year.
-        let field_count = cron_schedule.split_whitespace().count();
-        let cron_schedule = if field_count == 5 {
-            format!("0 {} *", cron_schedule)
-        } else if field_count == 6 {
-            format!("0 {}", cron_schedule)
-        } else {
-            cron_schedule.to_string()
-        };
-
-        // Parse cron expression using the `cron` crate
-        let schedule_parsed = match cron::Schedule::try_from(cron_schedule.as_str()) {
+        let schedule_parsed = match parse_standard_schedule(schedule) {
             Ok(s) => s,
             Err(e) => {
-                warn!("Failed to parse cron schedule '{}': {}", cron_schedule, e);
+                warn!("Failed to parse cron schedule '{}': {}", schedule, e);
                 self.record_unparseable(cronjob, schedule, &e.to_string())
                     .await;
                 return Ok(None);
@@ -639,25 +792,7 @@ impl<S: Storage + 'static> CronJobController<S> {
                 }
             },
         };
-        let now_tz = now.with_timezone(&tz);
-
-        // mostRecentScheduleTime (utils.go:101-105): earliestTime is the
-        // CronJob's creationTimestamp, replaced by status.lastScheduleTime.
-        let start = match last_schedule.or(cronjob.metadata.creation_timestamp) {
-            Some(t) => t.with_timezone(&tz),
-            None => (now - chrono::Duration::minutes(1)).with_timezone(&tz),
-        };
-        // Walk every scheduled time in (start, now]; the latest wins. Capped
-        // like upstream's "too many missed start times" guard (utils.go).
-        let latest = schedule_parsed
-            .after(&start)
-            .take(10_000)
-            .take_while(|t| *t <= now_tz)
-            .last();
-        if let Some(t) = latest {
-            info!("CronJob due: scheduled={}, current={}", t, now);
-        }
-        Ok(latest.map(|t| t.with_timezone(&chrono::Utc)))
+        Ok(Some((schedule_parsed, tz)))
     }
 
     async fn create_job(
@@ -757,6 +892,10 @@ impl<S: Storage + 'static> CronJobController<S> {
                 );
                 return Ok(Some(existing));
             }
+            // cronjob_controllerv2.go:611-614: a Terminating namespace refuses
+            // every create, so return the error without the FailedCreate event
+            // (the event belongs to the default arm, :638-641).
+            Err(e) if is_namespace_terminating_rejection(&e) => return Err(e.into()),
             Err(e) => {
                 self.record_warning(cronjob, "FailedCreate", &format!("Error creating job: {e}"))
                     .await;
@@ -776,12 +915,18 @@ impl<S: Storage + 'static> CronJobController<S> {
     }
 
     /// `cleanupFinishedJobs` (cronjob_controllerv2.go:682-716). Returns whether
-    /// the status needs writing. The history limits default to 3 / 1 here, as
-    /// the API defaulting would (SetDefaults_CronJob); upstream's early return
-    /// when both are nil is that defaulting not having run.
+    /// the status needs writing.
     async fn cleanup_finished_jobs(&self, cronjob: &mut CronJob, jobs: &[Job]) -> bool {
-        let success_limit = cronjob.spec.successful_jobs_history_limit.unwrap_or(3);
-        let failed_limit = cronjob.spec.failed_jobs_history_limit.unwrap_or(1);
+        // :684-686. The 3 / 1 defaults are applied by the API server
+        // (SetDefaults_CronJob, pkg/apis/batch/v1/defaults.go:83-88;
+        // apply_cronjob_defaults), not here.
+        let (success_limit, failed_limit) = match (
+            cronjob.spec.successful_jobs_history_limit,
+            cronjob.spec.failed_jobs_history_limit,
+        ) {
+            (None, None) => return false,
+            (s, f) => (s, f),
+        };
 
         let mut successful: Vec<Job> = Vec::new();
         let mut failed: Vec<Job> = Vec::new();
@@ -794,12 +939,15 @@ impl<S: Storage + 'static> CronJobController<S> {
         }
 
         let mut update = false;
-        update |= self
-            .remove_oldest_jobs(cronjob, &mut successful, success_limit)
-            .await;
-        update |= self
-            .remove_oldest_jobs(cronjob, &mut failed, failed_limit)
-            .await;
+        // :701-712: each list is trimmed only when its own limit is set.
+        if let Some(limit) = success_limit {
+            update |= self
+                .remove_oldest_jobs(cronjob, &mut successful, limit)
+                .await;
+        }
+        if let Some(limit) = failed_limit {
+            update |= self.remove_oldest_jobs(cronjob, &mut failed, limit).await;
+        }
         update
     }
 
@@ -1383,5 +1531,246 @@ mod tests {
             storage.get("/registry/cronjobs/default/cj").await.unwrap();
         assert!(got.status.map(|s| s.active.is_empty()).unwrap_or(true));
         assert_eq!(reasons(&storage).await, vec!["UnexpectedJob"]);
+    }
+
+    // ---- requeueAfter (#2398) -------------------------------------------
+    // Ported from TestNextScheduleTimeDuration
+    // (pkg/controller/cronjob/utils_test.go:614-702).
+
+    fn std_schedule(s: &str) -> cron::Schedule {
+        super::parse_standard_schedule(s).unwrap()
+    }
+
+    fn at(offset: chrono::Duration) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2016-05-19T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+            + offset
+    }
+
+    fn cj_at(
+        schedule: &str,
+        last: Option<chrono::Duration>,
+    ) -> rusternetes_common::resources::CronJob {
+        let mut cj = cj_fixture(serde_json::json!({"schedule": schedule}));
+        cj.metadata.creation_timestamp = Some(at(chrono::Duration::zero()));
+        if let Some(l) = last {
+            cj.status = Some(Default::default());
+            cj.status.as_mut().unwrap().last_schedule_time = Some(at(l));
+        }
+        cj
+    }
+
+    #[test]
+    fn next_schedule_time_duration_matches_upstream_table() {
+        use chrono::Duration as D;
+        let delta = D::milliseconds(100); // nextScheduleDelta (:58)
+        let cases = [
+            (
+                "complex schedule skipping weekend",
+                "30 6-16/4 * * 1-5",
+                Some(D::minutes(30)),
+                D::hours(24) + D::minutes(31),
+                D::hours(3) + D::minutes(59) + delta,
+            ),
+            (
+                "another complex schedule skipping weekend",
+                "30 10,11,12 * * 1-5",
+                Some(D::minutes(30)),
+                D::hours(30) + D::minutes(30),
+                D::hours(66) + delta,
+            ),
+            (
+                "once a week cronjob, missed two runs",
+                "0 12 * * 4",
+                Some(D::hours(2)),
+                D::days(19) + D::hours(1) + D::minutes(30),
+                D::hours(48) + D::minutes(30) + delta,
+            ),
+            (
+                "no previous run of a cronjob",
+                "0 12 * * 5",
+                None,
+                D::hours(6),
+                D::hours(20) + delta,
+            ),
+        ];
+        for (name, schedule, last, now, want) in cases {
+            let cj = cj_at(schedule, last);
+            let got = super::next_schedule_duration(
+                &std_schedule(schedule),
+                chrono_tz::UTC,
+                &cj,
+                at(now),
+            )
+            .unwrap();
+            assert_eq!(got, want.to_std().unwrap(), "{name}");
+        }
+    }
+
+    /// `processNextWorkItem` (:176-185): a sync that returns requeueAfter is
+    /// Forgotten and re-added after that delay; the sync with nothing due
+    /// (`syncCronJob` :536-543) returns the time to the next slot.
+    #[tokio::test]
+    async fn sync_requeues_at_next_schedule_slot() {
+        use std::sync::Arc;
+        let storage = Arc::new(Mem::new());
+        let ctrl = super::CronJobController::new(Arc::clone(&storage));
+        // Yearly schedule, created 10 minutes ago: nothing due.
+        let cj = cj_json("0 0 1 1 *", "Allow", serde_json::json!({}));
+        let mut cj = seed(&storage, &cj, &[]).await;
+        let after = ctrl.reconcile(&mut cj).await.unwrap();
+        let after = after.expect("an unmet schedule must requeue at the next slot");
+        assert!(after > std::time::Duration::from_secs(60), "{after:?}");
+
+        // Suspended: upstream returns nil -> no requeue (:514-517).
+        let storage = Arc::new(Mem::new());
+        let ctrl = super::CronJobController::new(Arc::clone(&storage));
+        let mut sus = cj_json("* * * * *", "Allow", serde_json::json!({}));
+        sus.spec.suspend = Some(true);
+        let mut sus = seed(&storage, &sus, &[]).await;
+        assert!(ctrl.reconcile(&mut sus).await.unwrap().is_none());
+    }
+
+    /// After starting a Job, the requeue is the next slot after the run just
+    /// scheduled (:672-673).
+    #[tokio::test]
+    async fn sync_requeues_after_starting_a_job() {
+        use std::sync::Arc;
+        let storage = Arc::new(Mem::new());
+        let ctrl = super::CronJobController::new(Arc::clone(&storage));
+        let cj = cj_json("* * * * *", "Allow", serde_json::json!({}));
+        let mut cj = seed(&storage, &cj, &[]).await;
+        let after = ctrl.reconcile(&mut cj).await.unwrap().unwrap();
+        assert!(after <= std::time::Duration::from_secs(61), "{after:?}");
+    }
+
+    // ---- NamespaceTerminatingCause on create (#2398) --------------------
+
+    /// Rejects every Job create with `message`. Everything else delegates.
+    struct RejectJobCreate {
+        inner: std::sync::Arc<Mem>,
+        message: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl rusternetes_storage::Storage for RejectJobCreate {
+        async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            if key.starts_with("/registry/jobs/") {
+                return Err(rusternetes_common::Error::Forbidden(
+                    self.message.to_string(),
+                ));
+            }
+            self.inner.create(key, value).await
+        }
+        async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+        where
+            T: serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.get(key).await
+        }
+        async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.update(key, value).await
+        }
+        async fn update_raw(
+            &self,
+            key: &str,
+            value: &serde_json::Value,
+        ) -> rusternetes_common::Result<()> {
+            self.inner.update_raw(key, value).await
+        }
+        async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.list(prefix).await
+        }
+        async fn watch(
+            &self,
+            prefix: &str,
+        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            self.inner.watch(prefix).await
+        }
+        async fn watch_from_revision(
+            &self,
+            prefix: &str,
+            revision: i64,
+        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            self.inner.watch_from_revision(prefix, revision).await
+        }
+        async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+            self.inner.current_revision().await
+        }
+        async fn is_revision_compacted(&self, revision: i64) -> rusternetes_common::Result<bool> {
+            self.inner.is_revision_compacted(revision).await
+        }
+    }
+
+    /// cronjob_controllerv2.go:611-614: a create refused with
+    /// NamespaceTerminatingCause returns the error WITHOUT the FailedCreate
+    /// event (the event is in the default arm, :643-647); any other failure
+    /// still records it.
+    #[tokio::test]
+    async fn namespace_terminating_create_records_no_failed_create() {
+        use std::sync::Arc;
+        for (message, want_event) in [
+            (
+                "POST /registry/jobs failed: (Forbidden) jobs.batch is forbidden: unable to \
+                 create new content in namespace default because it is being terminated",
+                false,
+            ),
+            ("(Forbidden) exceeded quota: count/jobs.batch", true),
+        ] {
+            let inner = Arc::new(Mem::new());
+            let storage = Arc::new(RejectJobCreate {
+                inner: Arc::clone(&inner),
+                message,
+            });
+            let ctrl = super::CronJobController::new(Arc::clone(&storage));
+            let cj = cj_json("* * * * *", "Allow", serde_json::json!({}));
+            let mut cj = seed(&inner, &cj, &[]).await;
+            assert!(ctrl.reconcile(&mut cj).await.is_err());
+            let got = reasons(&inner).await.contains(&"FailedCreate".to_string());
+            assert_eq!(got, want_event, "{message}");
+        }
+    }
+
+    // ---- history limits (#2398) -----------------------------------------
+
+    /// cleanupFinishedJobs (:684-686): with BOTH limits nil nothing is
+    /// deleted -- defaulting is the API server's job (SetDefaults_CronJob,
+    /// pkg/apis/batch/v1/defaults.go:83-88), not the controller's.
+    #[tokio::test]
+    async fn cleanup_does_nothing_when_both_limits_nil() {
+        use rusternetes_common::resources::Job;
+        use rusternetes_storage::Storage;
+        use std::sync::Arc;
+        let storage = Arc::new(Mem::new());
+        let ctrl = super::CronJobController::new(Arc::clone(&storage));
+        let jobs: Vec<_> = (0..5)
+            .map(|i| {
+                job_json(
+                    &format!("j{i}"),
+                    &format!("u{i}"),
+                    true,
+                    Some("2025-01-01T00:00:00Z"),
+                )
+            })
+            .collect();
+        let cj = cj_json("0 0 1 1 *", "Allow", serde_json::json!({}));
+        let mut cj = seed(&storage, &cj, &jobs).await;
+        assert!(cj.spec.successful_jobs_history_limit.is_none());
+        assert!(!ctrl.cleanup_finished_jobs(&mut cj, &jobs).await);
+        let left: Vec<Job> = storage.list("/registry/jobs/default/").await.unwrap();
+        assert_eq!(left.len(), 5, "no limit set -> no Job deleted");
     }
 }
