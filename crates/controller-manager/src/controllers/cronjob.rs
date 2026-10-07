@@ -278,6 +278,62 @@ fn most_recent_schedule_time(
     Ok((earliest, most_recent, missed))
 }
 
+/// The inline `TZ=`/`CRON_TZ=` prefix handling of robfig/cron/v3
+/// `Parser.Parse` (vendor/github.com/robfig/cron/v3/parser.go:95-103): returns
+/// the schedule without the prefix and the zone it names. The error is the
+/// parser's message (a missing space, or `provided bad location`).
+fn split_inline_tz(schedule: &str) -> Result<(&str, Option<chrono_tz::Tz>), String> {
+    if !(schedule.starts_with("TZ=") || schedule.starts_with("CRON_TZ=")) {
+        return Ok((schedule, None));
+    }
+    let Some(i) = schedule.find(' ') else {
+        return Err("no space after TZ prefix".to_string());
+    };
+    let eq = schedule.find('=').unwrap_or(0);
+    let name = &schedule[eq + 1..i];
+    match name.parse::<chrono_tz::Tz>() {
+        Ok(t) => Ok((schedule[i..].trim(), Some(t))),
+        // robfig/cron parser.go:100.
+        Err(_) => Err(format!(
+            "provided bad location {name}: unknown time zone {name}"
+        )),
+    }
+}
+
+/// `metav1.GetControllerOf` reduced to what `resolveControllerRef`
+/// (cronjob_controllerv2.go:240-256) reads: (kind, name, uid).
+type ControllerRef = (String, String, String);
+
+fn controller_ref_of(job: &Job) -> Option<ControllerRef> {
+    job.metadata
+        .owner_references
+        .as_ref()?
+        .iter()
+        .find(|r| r.controller == Some(true))
+        .map(|r| (r.kind.clone(), r.name.clone(), r.uid.clone()))
+}
+
+/// What the informer's old object gives `updateJob` (:303-331): the last
+/// controllerRef seen per Job key. A storage `Modified` event carries only the
+/// new object, so the previous value is remembered here.
+type JobRefCache = std::collections::HashMap<String, Option<ControllerRef>>;
+
+/// The (spec.schedule, spec.timeZone) the informer's old CronJob gives
+/// `updateCronJob` (:386-397), per CronJob key.
+type CronJobSpecCache = std::collections::HashMap<String, (String, Option<String>)>;
+
+/// What the CronJob informer handlers do with one event
+/// (cronjob_controllerv2.go:121-132).
+#[derive(Debug, PartialEq)]
+enum CronJobEnqueue {
+    /// `enqueueController`.
+    Now(String),
+    /// `enqueueControllerAfter`.
+    After(String, Duration),
+    /// Nothing is enqueued.
+    Nothing,
+}
+
 /// `nextScheduleTimeDuration` (pkg/controller/cronjob/utils.go:188-205): the
 /// delay until the next schedule slot, plus `NEXT_SCHEDULE_DELTA`.
 fn next_schedule_duration(
@@ -384,45 +440,142 @@ impl<S: Storage + 'static> CronJobController<S> {
 
     /// `addJob` / `updateJob` / `deleteJob`
     /// (cronjob_controllerv2.go:279-362): resolve the Job's controllerRef to
-    /// its CronJob and return that CronJob's queue key, or None when nothing
-    /// should be enqueued.
+    /// its CronJob and return the queue keys to enqueue.
     ///
     /// `addJob` (:281-285) routes a Job already pending deletion through
     /// `deleteJob`; all three then do the same thing (get the controllerRef,
-    /// `resolveControllerRef`, `enqueueController`), so one function serves
-    /// every event. A `Deleted` event carries the previous value, which stands
-    /// in for `DeletedFinalStateUnknown` (:339-350).
-    ///
-    /// Deviation: `updateJob` (:317-321) also wakes the OLD controller when the
-    /// controllerRef changed. A storage watch event carries no old object, so
-    /// only the current controller is woken.
-    async fn job_event_cronjob_key(&self, ev: &rusternetes_storage::WatchEvent) -> Option<String> {
+    /// `resolveControllerRef`, `enqueueController`). A `Deleted` event carries
+    /// the previous value, which stands in for `DeletedFinalStateUnknown`
+    /// (:339-350). `updateJob` (:312-320) additionally wakes the OLD controller
+    /// when the controllerRef changed; `cache` supplies the old controllerRef
+    /// because a storage `Modified` event carries only the new object.
+    async fn job_event_cronjob_keys(
+        &self,
+        cache: &mut JobRefCache,
+        ev: &rusternetes_storage::WatchEvent,
+    ) -> Vec<String> {
         use rusternetes_storage::WatchEvent;
-        let body = match ev {
-            WatchEvent::Added(_, v) | WatchEvent::Modified(_, v) | WatchEvent::Deleted(_, v) => v,
+        let (storage_key, body) = match ev {
+            WatchEvent::Added(k, v) | WatchEvent::Modified(k, v) | WatchEvent::Deleted(k, v) => {
+                (k, v)
+            }
         };
-        let job: Job = serde_json::from_str(body).ok()?;
-        // metav1.GetControllerOf: the ref with controller=true.
-        let controller_ref = job
-            .metadata
-            .owner_references
-            .as_ref()?
-            .iter()
-            .find(|r| r.controller == Some(true))?;
-        // resolveControllerRef (:240-256): Kind, then Get by name, then UID.
-        if controller_ref.kind != "CronJob" {
+        let Ok(job) = serde_json::from_str::<Job>(body) else {
+            return Vec::new();
+        };
+        let cur = controller_ref_of(&job);
+        let mut refs = Vec::new();
+        match ev {
+            WatchEvent::Deleted(..) => {
+                cache.remove(storage_key);
+            }
+            WatchEvent::Added(..) => {
+                cache.insert(storage_key.clone(), cur.clone());
+            }
+            WatchEvent::Modified(..) => {
+                // :314-320: controllerRefChanged && oldControllerRef != nil.
+                let old = cache.insert(storage_key.clone(), cur.clone()).flatten();
+                if old != cur {
+                    refs.extend(old);
+                }
+            }
+        }
+        refs.extend(cur);
+        let Some(ns) = job.metadata.namespace.as_deref() else {
+            return Vec::new();
+        };
+        let mut keys = Vec::new();
+        for r in &refs {
+            if let Some(k) = self.resolve_controller_ref(ns, r).await {
+                keys.push(k);
+            }
+        }
+        keys
+    }
+
+    /// `resolveControllerRef` (:240-256): Kind, then Get by name, then UID.
+    async fn resolve_controller_ref(&self, ns: &str, r: &ControllerRef) -> Option<String> {
+        let (kind, name, uid) = r;
+        if kind != "CronJob" {
             return None;
         }
-        let ns = job.metadata.namespace.as_deref()?;
         let cronjob = self
             .storage
-            .get::<CronJob>(&build_key("cronjobs", Some(ns), &controller_ref.name))
+            .get::<CronJob>(&build_key("cronjobs", Some(ns), name))
             .await
             .ok()?;
-        if cronjob.metadata.uid != controller_ref.uid {
+        if &cronjob.metadata.uid != uid {
             return None;
         }
-        Some(format!("cronjobs/{}/{}", ns, controller_ref.name))
+        Some(format!("cronjobs/{}/{}", ns, name))
+    }
+
+    /// The CronJob informer handlers (cronjob_controllerv2.go:121-132): add and
+    /// delete enqueue now; `updateCronJob` (:386-420) enqueues after the next
+    /// schedule time when spec.schedule or spec.timeZone changed, else now.
+    /// `cache` supplies the old spec (a storage `Modified` event carries only
+    /// the new object).
+    async fn cronjob_event_enqueue(
+        &self,
+        cache: &mut CronJobSpecCache,
+        ev: &rusternetes_storage::WatchEvent,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> CronJobEnqueue {
+        use rusternetes_storage::WatchEvent;
+        let key = extract_key(ev);
+        let body = match ev {
+            WatchEvent::Deleted(..) => {
+                cache.remove(&key);
+                return CronJobEnqueue::Now(key);
+            }
+            WatchEvent::Added(_, b) | WatchEvent::Modified(_, b) => b,
+        };
+        let Ok(cj) = serde_json::from_str::<CronJob>(body) else {
+            return CronJobEnqueue::Now(key);
+        };
+        let cur = (cj.spec.schedule.clone(), cj.spec.time_zone.clone());
+        let old = cache.insert(key.clone(), cur.clone());
+        // :397: oldCJ.Spec.Schedule != newCJ.Spec.Schedule || TimeZone differs.
+        // An add, or a Modified with no remembered old spec, has nothing to
+        // compare: enqueue now.
+        if !matches!(ev, WatchEvent::Modified(..)) || old.is_none() || old.as_ref() == Some(&cur) {
+            return CronJobEnqueue::Now(key);
+        }
+        // :399 formatSchedule (:766-784): a schedule containing "TZ" is used
+        // as-is; else a loadable spec.timeZone is applied; an unloadable one is
+        // ignored (UTC).
+        let parsed = split_inline_tz(&cj.spec.schedule)
+            .and_then(|(sched, inline)| parse_standard_schedule(sched).map(|p| (p, inline)));
+        let (sched, inline) = match parsed {
+            Ok(v) => v,
+            Err(err) => {
+                // :400-405: log, record UnParseableCronJobSchedule, enqueue nothing.
+                debug!(
+                    "Unparseable schedule for cronjob {key}: {:?}: {err}",
+                    cj.spec.schedule
+                );
+                self.record_warning(
+                    &cj,
+                    "UnParseableCronJobSchedule",
+                    &format!("unparseable schedule for cronjob: {}", cj.spec.schedule),
+                )
+                .await;
+                return CronJobEnqueue::Nothing;
+            }
+        };
+        let tz = inline.unwrap_or_else(|| {
+            cj.spec
+                .time_zone
+                .as_deref()
+                .and_then(|n| n.parse::<chrono_tz::Tz>().ok())
+                .unwrap_or(chrono_tz::UTC)
+        });
+        // :408-410. Upstream dereferences the result; with no next slot there
+        // is nothing to wait for.
+        match next_schedule_duration(&sched, tz, &cj, now) {
+            Some(d) => CronJobEnqueue::After(key, d),
+            None => CronJobEnqueue::Nothing,
+        }
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
@@ -473,14 +626,43 @@ impl<S: Storage + 'static> CronJobController<S> {
                 }
             };
 
+            // The informer stores' old objects, seeded from a list taken after
+            // the watches are established so no change is missed.
+            let mut job_refs = JobRefCache::new();
+            if let Ok(jobs) = self.storage.list::<Job>("/registry/jobs/").await {
+                for j in &jobs {
+                    let ns = j.metadata.namespace.as_deref().unwrap_or("");
+                    job_refs.insert(
+                        format!("/registry/jobs/{}/{}", ns, j.metadata.name),
+                        controller_ref_of(j),
+                    );
+                }
+            }
+            let mut cronjob_specs = CronJobSpecCache::new();
+            if let Ok(cjs) = self.storage.list::<CronJob>("/registry/cronjobs/").await {
+                for c in &cjs {
+                    let ns = c.metadata.namespace.as_deref().unwrap_or("");
+                    cronjob_specs.insert(
+                        format!("cronjobs/{}/{}", ns, c.metadata.name),
+                        (c.spec.schedule.clone(), c.spec.time_zone.clone()),
+                    );
+                }
+            }
+
             let mut watch_broken = false;
             while !watch_broken {
                 tokio::select! {
                     event = watch.next() => {
                         match event {
                             Some(Ok(ev)) => {
-                                let key = extract_key(&ev);
-                                queue.add(key).await;
+                                match self
+                                    .cronjob_event_enqueue(&mut cronjob_specs, &ev, chrono::Utc::now())
+                                    .await
+                                {
+                                    CronJobEnqueue::Now(key) => queue.add(key).await,
+                                    CronJobEnqueue::After(key, d) => queue.add_after(key, d).await,
+                                    CronJobEnqueue::Nothing => {}
+                                }
                             }
                             Some(Err(e)) => {
                                 warn!("Watch error: {}, reconnecting", e);
@@ -495,7 +677,7 @@ impl<S: Storage + 'static> CronJobController<S> {
                     event = job_watch.next() => {
                         match event {
                             Some(Ok(ev)) => {
-                                if let Some(key) = self.job_event_cronjob_key(&ev).await {
+                                for key in self.job_event_cronjob_keys(&mut job_refs, &ev).await {
                                     queue.add(key).await;
                                 }
                             }
@@ -984,36 +1166,14 @@ impl<S: Storage + 'static> CronJobController<S> {
         // a schedule untouched, so the inline zone wins over spec.timeZone. A
         // bad zone or a missing space is an unparseable schedule: skip, as
         // syncCronJob does (cronjob_controllerv2.go:519-526).
-        let (schedule, inline_tz) =
-            if schedule.starts_with("TZ=") || schedule.starts_with("CRON_TZ=") {
-                let Some(i) = schedule.find(' ') else {
-                    warn!(
-                        "Unparseable schedule '{}': no space after TZ prefix",
-                        schedule
-                    );
-                    self.record_unparseable(cronjob, schedule, "no space after TZ prefix")
-                        .await;
-                    return Ok(None);
-                };
-                let eq = schedule.find('=').unwrap_or(0);
-                let name = &schedule[eq + 1..i];
-                match name.parse::<chrono_tz::Tz>() {
-                    Ok(t) => (schedule[i..].trim(), Some(t)),
-                    Err(_) => {
-                        warn!("Unparseable schedule '{}': bad location {}", schedule, name);
-                        // robfig/cron parser.go:100.
-                        self.record_unparseable(
-                            cronjob,
-                            schedule,
-                            &format!("provided bad location {name}: unknown time zone {name}"),
-                        )
-                        .await;
-                        return Ok(None);
-                    }
-                }
-            } else {
-                (schedule, None)
-            };
+        let (schedule, inline_tz) = match split_inline_tz(schedule) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Unparseable schedule '{}': {}", schedule, e);
+                self.record_unparseable(cronjob, schedule, &e).await;
+                return Ok(None);
+            }
+        };
 
         let schedule_parsed = match parse_standard_schedule(schedule) {
             Ok(s) => s,
@@ -1283,6 +1443,8 @@ fn job_finished_condition(job: &Job) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     #[test]
     fn test_cron_schedule_parsing() {
         // Test that schedule patterns are recognized
@@ -1814,8 +1976,9 @@ mod tests {
             WatchEvent::Deleted(k.clone(), body.clone()),
         ] {
             assert_eq!(
-                ctrl.job_event_cronjob_key(&ev).await.as_deref(),
-                Some("cronjobs/default/cj"),
+                ctrl.job_event_cronjob_keys(&mut Default::default(), &ev)
+                    .await,
+                vec!["cronjobs/default/cj".to_string()],
                 "{ev:?}"
             );
         }
@@ -1842,19 +2005,265 @@ mod tests {
             )
         };
         let orphan = job_json("j", "u", false, None);
-        assert_eq!(ctrl.job_event_cronjob_key(&ev(&orphan)).await, None);
+        assert_eq!(
+            ctrl.job_event_cronjob_keys(&mut Default::default(), &ev(&orphan))
+                .await,
+            Vec::<String>::new()
+        );
         let mut wrong_kind = job_json("j", "u", true, None);
         wrong_kind.metadata.owner_references.as_mut().unwrap()[0].kind = "Deployment".into();
-        assert_eq!(ctrl.job_event_cronjob_key(&ev(&wrong_kind)).await, None);
+        assert_eq!(
+            ctrl.job_event_cronjob_keys(&mut Default::default(), &ev(&wrong_kind))
+                .await,
+            Vec::<String>::new()
+        );
         let mut wrong_uid = job_json("j", "u", true, None);
         wrong_uid.metadata.owner_references.as_mut().unwrap()[0].uid = "other".into();
-        assert_eq!(ctrl.job_event_cronjob_key(&ev(&wrong_uid)).await, None);
+        assert_eq!(
+            ctrl.job_event_cronjob_keys(&mut Default::default(), &ev(&wrong_uid))
+                .await,
+            Vec::<String>::new()
+        );
         let mut missing = job_json("j", "u", true, None);
         missing.metadata.owner_references.as_mut().unwrap()[0].name = "gone".into();
-        assert_eq!(ctrl.job_event_cronjob_key(&ev(&missing)).await, None);
+        assert_eq!(
+            ctrl.job_event_cronjob_keys(&mut Default::default(), &ev(&missing))
+                .await,
+            Vec::<String>::new()
+        );
         let mut not_ctrl = job_json("j", "u", true, None);
         not_ctrl.metadata.owner_references.as_mut().unwrap()[0].controller = Some(false);
-        assert_eq!(ctrl.job_event_cronjob_key(&ev(&not_ctrl)).await, None);
+        assert_eq!(
+            ctrl.job_event_cronjob_keys(&mut Default::default(), &ev(&not_ctrl))
+                .await,
+            Vec::<String>::new()
+        );
+    }
+
+    // ---- CronJob / Job informer old-object handlers (#2607) -------------
+    // Ported from TestControllerV2UpdateCronJob
+    // (cronjob_controllerv2_test.go:1447-1671; the `@every` cases wait on
+    // #2624) and updateJob (cronjob_controllerv2.go:303-331).
+
+    fn cj_event(kind: &str, schedule: &str, tz: Option<&str>) -> rusternetes_storage::WatchEvent {
+        use rusternetes_storage::WatchEvent;
+        let mut cj = cj_fixture(serde_json::json!({"schedule": schedule}));
+        cj.spec.time_zone = tz.map(str::to_string);
+        // justBeforeTheHour (cronjob_controllerv2_test.go:150).
+        cj.status = Some(Default::default());
+        cj.status.as_mut().unwrap().last_schedule_time = Some(
+            chrono::DateTime::parse_from_rfc3339("2016-05-19T09:59:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        let k = "/registry/cronjobs/default/cj".to_string();
+        let body = serde_json::to_string(&cj).unwrap();
+        match kind {
+            "add" => WatchEvent::Added(k, body),
+            "del" => WatchEvent::Deleted(k, body),
+            _ => WatchEvent::Modified(k, body),
+        }
+    }
+
+    // justASecondBeforeTheHour (cronjob_controllerv2_test.go:105).
+    fn just_a_second_before_the_hour() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2016-05-19T09:59:59Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[tokio::test]
+    async fn update_cronjob_schedule_change_enqueues_after_next_slot() {
+        use super::CronJobEnqueue::*;
+        use std::sync::Arc;
+        let storage = Arc::new(Mem::new());
+        let ctrl = super::CronJobController::new(Arc::clone(&storage));
+        let now = just_a_second_before_the_hour();
+        let key = || "cronjobs/default/cj".to_string();
+        let delta = Duration::from_millis(100);
+        type Spec = (&'static str, Option<&'static str>);
+        let cases: Vec<(&str, Spec, Spec, super::CronJobEnqueue)> = vec![
+            // "spec.schedule changed": 1s to the next minute + nextScheduleDelta.
+            (
+                "spec.schedule changed",
+                ("30 * * * *", None),
+                ("*/1 * * * *", None),
+                After(key(), Duration::from_secs(1) + delta),
+            ),
+            // "spec.template changed": same schedule -> enqueueController.
+            (
+                "spec.template changed",
+                ("*/1 * * * *", None),
+                ("*/1 * * * *", None),
+                Now(key()),
+            ),
+            (
+                "spec.timeZone not changed",
+                ("", Some("America/New_York")),
+                ("", Some("America/New_York")),
+                Now(key()),
+            ),
+            // Unparseable (here: empty) schedule after a change: event, no enqueue.
+            (
+                "spec.timeZone changed, unparseable schedule",
+                ("", Some("America/New_York")),
+                ("", None),
+                Nothing,
+            ),
+        ];
+        for (name, old, new, want) in cases {
+            let mut cache = super::CronJobSpecCache::new();
+            // The first event only primes the cache.
+            let o = cj_event("add", old.0, old.1);
+            ctrl.cronjob_event_enqueue(&mut cache, &o, now).await;
+            let n = cj_event("mod", new.0, new.1);
+            assert_eq!(
+                ctrl.cronjob_event_enqueue(&mut cache, &n, now).await,
+                want,
+                "{name}"
+            );
+        }
+        assert_eq!(reasons(&storage).await, vec!["UnParseableCronJobSchedule"]);
+    }
+
+    /// addFunc / deleteFunc enqueue now (:121-132); a time-zone-only change
+    /// re-aims the requeue (:397).
+    #[tokio::test]
+    async fn cronjob_add_delete_enqueue_now_and_timezone_change_requeues_after() {
+        use super::CronJobEnqueue::*;
+        use std::sync::Arc;
+        let storage = Arc::new(Mem::new());
+        let ctrl = super::CronJobController::new(Arc::clone(&storage));
+        let now = just_a_second_before_the_hour();
+        let key = "cronjobs/default/cj".to_string();
+        let mut cache = super::CronJobSpecCache::new();
+        let add = cj_event("add", "0 12 * * *", None);
+        assert_eq!(
+            ctrl.cronjob_event_enqueue(&mut cache, &add, now).await,
+            Now(key.clone())
+        );
+        // 12:00 UTC -> 12:00 New York (16:00 UTC): a different next slot.
+        let m = cj_event("mod", "0 12 * * *", Some("America/New_York"));
+        match ctrl.cronjob_event_enqueue(&mut cache, &m, now).await {
+            After(k, d) => {
+                assert_eq!(k, key);
+                // 09:59:59Z -> 16:00:00Z, plus nextScheduleDelta.
+                assert_eq!(
+                    d,
+                    Duration::from_secs(6 * 3600 + 1) + Duration::from_millis(100)
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        let del = cj_event("del", "0 12 * * *", None);
+        assert_eq!(
+            ctrl.cronjob_event_enqueue(&mut cache, &del, now).await,
+            Now(key)
+        );
+        assert!(cache.is_empty());
+    }
+
+    /// updateJob (:312-320): a controllerRef change also wakes the OLD
+    /// controller. The old ref comes from the cache a Modified event lacks.
+    #[tokio::test]
+    async fn job_controller_ref_change_wakes_old_and_new_controller() {
+        use rusternetes_storage::{Storage, WatchEvent};
+        use std::sync::Arc;
+        let storage = Arc::new(Mem::new());
+        let ctrl = super::CronJobController::new(Arc::clone(&storage));
+        seed(
+            &storage,
+            &cj_json("* * * * *", "Allow", serde_json::json!({})),
+            &[],
+        )
+        .await;
+        let mut other = cj_json("* * * * *", "Allow", serde_json::json!({}));
+        other.metadata.name = "other".into();
+        other.metadata.uid = "other-uid".into();
+        storage
+            .create("/registry/cronjobs/default/other", &other)
+            .await
+            .unwrap();
+
+        let k = "/registry/jobs/default/j".to_string();
+        let owned = job_json("j", "ju", true, None);
+        let mut moved = owned.clone();
+        moved.metadata.owner_references.as_mut().unwrap()[0].name = "other".into();
+        moved.metadata.owner_references.as_mut().unwrap()[0].uid = "other-uid".into();
+        let ev = |j: &rusternetes_common::resources::Job| {
+            WatchEvent::Modified(k.clone(), serde_json::to_string(j).unwrap())
+        };
+        let mut cache = super::JobRefCache::new();
+        // Seen as an add (or the initial list): owned by cj.
+        let added = WatchEvent::Added(k.clone(), serde_json::to_string(&owned).unwrap());
+        assert_eq!(
+            ctrl.job_event_cronjob_keys(&mut cache, &added).await,
+            vec!["cronjobs/default/cj".to_string()]
+        );
+        // Unchanged ref: only the owner.
+        assert_eq!(
+            ctrl.job_event_cronjob_keys(&mut cache, &ev(&owned)).await,
+            vec!["cronjobs/default/cj".to_string()]
+        );
+        // Re-parented: old controller first, then the new one.
+        assert_eq!(
+            ctrl.job_event_cronjob_keys(&mut cache, &ev(&moved)).await,
+            vec![
+                "cronjobs/default/cj".to_string(),
+                "cronjobs/default/other".to_string()
+            ]
+        );
+        // Orphaned: the old controller (the new ref is nil, :323).
+        let orphan = job_json("j", "ju", false, None);
+        assert_eq!(
+            ctrl.job_event_cronjob_keys(&mut cache, &ev(&orphan)).await,
+            vec!["cronjobs/default/other".to_string()]
+        );
+        // Delete forgets the cache entry.
+        let del = WatchEvent::Deleted(k, serde_json::to_string(&orphan).unwrap());
+        ctrl.job_event_cronjob_keys(&mut cache, &del).await;
+        assert!(cache.is_empty());
+    }
+
+    /// run() end to end (#2606 follow-up): a Job finishing reaches the
+    /// CronJob through the Job informer, with no periodic resync (the old
+    /// 10s timer is gone). The yearly schedule never fires, so only the Job
+    /// event can clear status.active.
+    #[tokio::test]
+    async fn run_syncs_cronjob_when_its_job_finishes() {
+        use rusternetes_storage::Storage;
+        use std::sync::Arc;
+        let storage = Arc::new(Mem::new());
+        let ctrl = Arc::new(super::CronJobController::new(Arc::clone(&storage)));
+        let cj = cj_json(
+            "0 0 1 1 *",
+            "Allow",
+            serde_json::json!({"active": [job_ref("j", "ju")]}),
+        );
+        seed(&storage, &cj, &[job_json("j", "ju", true, None)]).await;
+        let handle = tokio::spawn(Arc::clone(&ctrl).run());
+        // Let the first sync and both watches establish.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let finished = job_json("j", "ju", true, Some("2025-01-15T06:00:30Z"));
+        storage
+            .update("/registry/jobs/default/j", &finished)
+            .await
+            .unwrap();
+        let mut cleared = false;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let got: rusternetes_common::resources::CronJob =
+                storage.get("/registry/cronjobs/default/cj").await.unwrap();
+            if got.status.is_some_and(|s| s.active.is_empty()) {
+                cleared = true;
+                break;
+            }
+        }
+        handle.abort();
+        assert!(
+            cleared,
+            "Job completion did not reach the CronJob within 4s"
+        );
     }
 
     // ---- requeueAfter (#2398) -------------------------------------------
