@@ -29,7 +29,7 @@ impl HostPathPlugin {
 /// (a new variant fails to compile here instead of silently serialising to
 /// something unexpected) and has no fallible/serialisation path to paper
 /// over with `unwrap_or_default`.
-fn host_path_type_as_str(t: &HostPathType) -> &'static str {
+fn host_path_type_as_str(t: &HostPathType) -> &str {
     match t {
         HostPathType::DirectoryOrCreate => "DirectoryOrCreate",
         HostPathType::Directory => "Directory",
@@ -38,6 +38,7 @@ fn host_path_type_as_str(t: &HostPathType) -> &'static str {
         HostPathType::Socket => "Socket",
         HostPathType::CharDevice => "CharDevice",
         HostPathType::BlockDevice => "BlockDevice",
+        HostPathType::Unknown(v) => v,
     }
 }
 

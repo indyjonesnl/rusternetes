@@ -588,8 +588,10 @@ impl<S: Storage + 'static> PVBinderController<S> {
             .await?;
             return Ok(());
         }
-        if pv.spec.persistent_volume_reclaim_policy == Some(PersistentVolumeReclaimPolicy::Unknown)
-        {
+        if matches!(
+            pv.spec.persistent_volume_reclaim_policy,
+            Some(PersistentVolumeReclaimPolicy::Unknown(_))
+        ) {
             // `default:` branch of reclaimVolume (`pv_controller.go:1217-1222`).
             self.update_volume_phase_with_event(
                 pv.clone(),
