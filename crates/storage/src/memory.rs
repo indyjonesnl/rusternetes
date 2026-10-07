@@ -424,7 +424,25 @@ impl Storage for MemoryStorage {
         drop(data); // Release lock before sending event
 
         // Emit watch event with previous value
-        self.emit(rev, WatchEvent::Deleted(key.to_string(), previous_value));
+        // The deleted object carries the DELETE's revision, as etcd's watch
+        // does (`etcd3/watcher.go` `parseEvent`: prevObj stamped with
+        // `e.rev`): a watch snapshot cut dedupes DELETED by it (#2223).
+        let stamped = match serde_json::from_str::<serde_json::Value>(&previous_value) {
+            Ok(mut v) => match v.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+                Some(m) => {
+                    m.insert(
+                        "resourceVersion".to_string(),
+                        serde_json::Value::String(
+                            crate::concurrency::mod_revision_to_resource_version(rev),
+                        ),
+                    );
+                    serde_json::to_string(&v).unwrap_or(previous_value)
+                }
+                None => previous_value,
+            },
+            Err(_) => previous_value,
+        };
+        self.emit(rev, WatchEvent::Deleted(key.to_string(), stamped));
 
         Ok(())
     }
@@ -636,6 +654,24 @@ mod tests {
         assert!(matches!(&got[0], WatchEvent::Added(k, _) if k == "/r/cm/b"));
         assert!(matches!(&got[1], WatchEvent::Added(k, _) if k == "/r/cm/c"));
         assert!(matches!(&got[2], WatchEvent::Deleted(k, _) if k == "/r/cm/b"));
+    }
+
+    /// A DELETED event carries the delete's revision, not the object's last
+    /// write (etcd3 `parseEvent` stamps `e.rev`), so a watch snapshot can
+    /// dedupe it by rv (#2223).
+    #[tokio::test]
+    async fn deleted_event_carries_the_delete_revision() {
+        use futures::StreamExt;
+        let s = MemoryStorage::new();
+        let a: serde_json::Value = s.create("/r/cm/a", &cm("a")).await.unwrap();
+        let mut w = s.watch("/r/cm/").await.unwrap();
+        s.delete("/r/cm/a").await.unwrap();
+        let Some(Ok(WatchEvent::Deleted(_, prev))) = w.next().await else {
+            panic!("expected Deleted");
+        };
+        let prev: serde_json::Value = serde_json::from_str(&prev).unwrap();
+        assert!(rv_of(&prev) > rv_of(&a));
+        assert_eq!(rv_of(&prev) as i64, s.current_revision().await.unwrap());
     }
 
     /// A resume point older than the retained history is "too old resource

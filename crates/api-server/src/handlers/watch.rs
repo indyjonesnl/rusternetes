@@ -366,15 +366,9 @@ async fn open_watch_stream(
     }
 }
 
-/// Highest `metadata.resourceVersion` among the objects a watch's initial
-/// snapshot lists: a lower bound on the revision the snapshot was read at.
-///
-/// Upstream stamps the whole snapshot with the cache's revision under its lock
-/// and continues the interval from exactly there (`newCacheIntervalFromStore`,
-/// `staging/src/k8s.io/apiserver/pkg/storage/cacher/watch_cache_interval.go:
-/// 139-179`). We cannot read the revision atomically with the list, so the
-/// highest listed object revision stands in: it can only under-cut, never
-/// drop an event the client has not seen.
+/// Highest `metadata.resourceVersion` among the objects a snapshot lists: the
+/// fallback cutoff when the backend cannot stamp the list with a revision.
+/// It can only under-cut, never drop an event the client has not seen.
 pub fn snapshot_resource_version(snapshot: &[serde_json::Value]) -> Option<u64> {
     snapshot
         .iter()
@@ -386,17 +380,57 @@ pub fn snapshot_resource_version(snapshot: &[serde_json::Value]) -> Option<u64> 
         .max()
 }
 
-/// Drop live `ADDED` events at or below the snapshot's resourceVersion.
+/// List `prefix` as a snapshot stamped with the revision it was read at, and
+/// return that revision as the cutoff for the live stream (#2223).
+///
+/// Upstream stamps the whole snapshot with the cache's revision under its lock
+/// and continues the interval from exactly there (`newCacheIntervalFromStore`,
+/// `staging/src/k8s.io/apiserver/pkg/storage/cacher/watch_cache_interval.go:
+/// 139-179`). Same shape as `Storage::list_paginated`: the revision is read
+/// BEFORE the data and the data is read AT it, so the list is exactly the
+/// state at `rev` and every live event with `rv <= rev` is already in it.
+/// Falls back to a plain list + highest listed rv when the backend has no
+/// usable revision.
+pub async fn list_snapshot(
+    state: &ApiServerState,
+    prefix: &str,
+) -> Result<(Vec<serde_json::Value>, Option<u64>)> {
+    if let Ok(rev) = state.storage.current_revision().await {
+        if rev > 0 {
+            if let Ok(list) = state
+                .storage
+                .list_at_revision::<serde_json::Value>(prefix, rev)
+                .await
+            {
+                return Ok((list, Some(rev as u64)));
+            }
+        }
+    }
+    let list: Vec<serde_json::Value> = state.storage.list(prefix).await?;
+    let cutoff = snapshot_resource_version(&list);
+    Ok((list, cutoff))
+}
+
+/// Drop every live event (ADDED, MODIFIED and DELETED) at or below the
+/// snapshot's resourceVersion.
 ///
 /// The watch subscribes before it lists (so a write in the gap is not lost),
 /// which means a write between the two is in the snapshot AND on the live
-/// stream. Upstream's `cacheWatcher.processInterval` skips every event with
-/// `event.ResourceVersion <= resourceVersion`
-/// (`staging/src/k8s.io/apiserver/pkg/storage/cacher/cache_watcher.go`); the
-/// snapshot already reflects such an event. Only ADDED is filtered here:
-/// MODIFIED/DELETED duplicates are idempotent for a reflector, and filtering
-/// them would endanger the selector-transition bookkeeping.
-pub fn skip_added_covered_by_snapshot(
+/// stream. Upstream's `cacheWatcher.process` forwards only events newer than
+/// the interval's revision, whatever their type:
+///
+/// ```text
+/// // only send events newer than resourceVersion
+/// if event.ResourceVersion > resourceVersion || (event.Type == watch.Bookmark && ...
+/// ```
+///
+/// (`staging/src/k8s.io/apiserver/pkg/storage/cacher/cache_watcher.go:535-539`;
+/// `processInterval` raises `resourceVersion` the same way at `:459-462`).
+/// The selector-transition bookkeeping is seeded from the snapshot, so an
+/// event the snapshot already reflects needs no second pass. A DELETED event
+/// carries the delete's revision (storage stamps it, as etcd3's
+/// `parseEvent` does with `e.rev`), so it is ordered correctly here.
+pub fn skip_events_covered_by_snapshot(
     stream: rusternetes_storage::WatchStream,
     cutoff: Option<u64>,
 ) -> rusternetes_storage::WatchStream {
@@ -406,7 +440,9 @@ pub fn skip_added_covered_by_snapshot(
     stream
         .filter(move |event| {
             let covered = match event {
-                Ok(WatchEvent::Added(_, value)) => extract_rv_from_json(value)
+                Ok(WatchEvent::Added(_, value))
+                | Ok(WatchEvent::Modified(_, value))
+                | Ok(WatchEvent::Deleted(_, value)) => extract_rv_from_json(value)
                     .and_then(|rv| rv.parse::<u64>().ok())
                     .is_some_and(|rv| rv <= cutoff),
                 _ => false,
@@ -542,7 +578,7 @@ where
     // object (e.g. a Deployment missing `spec`) does not abort the entire
     // watch with HTTP 400. Upstream Kubernetes skips bad objects and
     // continues streaming valid ones.
-    let raw_existing: Vec<serde_json::Value> = state.storage.list(&prefix).await?;
+    let (raw_existing, snapshot_rv) = list_snapshot(&state, &prefix).await?;
     // Convert each stored object to the requested version before it becomes an
     // initial ADDED event, so field-selector filtering sees the requested-version
     // layout (mirrors the LIST path). No-op when `converter` is None.
@@ -555,7 +591,6 @@ where
     } else {
         raw_existing
     };
-    let snapshot_rv = snapshot_resource_version(&raw_existing);
     let existing_resources: Vec<T> = raw_existing
         .into_iter()
         .filter_map(|v| match serde_json::from_value::<T>(v) {
@@ -587,9 +622,9 @@ where
     let should_send_initial =
         opens_with_current_state(send_initial_events, requested_rv.as_deref());
     // Cut the live stream at the snapshot (#2038): see
-    // `skip_added_covered_by_snapshot`. A resumed watch has no snapshot.
+    // `skip_events_covered_by_snapshot`. A resumed watch has no snapshot.
     let watch_stream = if should_send_initial {
-        skip_added_covered_by_snapshot(watch_stream, snapshot_rv)
+        skip_events_covered_by_snapshot(watch_stream, snapshot_rv)
     } else {
         watch_stream
     };
@@ -1102,7 +1137,7 @@ where
     // object (e.g. a Deployment missing `spec`) does not abort the entire
     // watch with HTTP 400. Upstream Kubernetes skips bad objects and
     // continues streaming valid ones.
-    let raw_existing: Vec<serde_json::Value> = state.storage.list(&prefix).await?;
+    let (raw_existing, snapshot_rv) = list_snapshot(&state, &prefix).await?;
     // Convert each stored object to the requested version before it becomes an
     // initial ADDED event, so field-selector filtering sees the requested-version
     // layout (mirrors the LIST path). No-op when `converter` is None.
@@ -1115,7 +1150,6 @@ where
     } else {
         raw_existing
     };
-    let snapshot_rv = snapshot_resource_version(&raw_existing);
     let existing_resources: Vec<T> = raw_existing
         .into_iter()
         .filter_map(|v| match serde_json::from_value::<T>(v) {
@@ -1145,9 +1179,9 @@ where
     let should_send_initial =
         opens_with_current_state(send_initial_events, requested_rv.as_deref());
     // Cut the live stream at the snapshot (#2038): see
-    // `skip_added_covered_by_snapshot`. A resumed watch has no snapshot.
+    // `skip_events_covered_by_snapshot`. A resumed watch has no snapshot.
     let watch_stream = if should_send_initial {
-        skip_added_covered_by_snapshot(watch_stream, snapshot_rv)
+        skip_events_covered_by_snapshot(watch_stream, snapshot_rv)
     } else {
         watch_stream
     };
@@ -2887,8 +2921,7 @@ pub async fn watch_cluster_scoped_json(
         Ok(stream) => stream,
         Err(expired) => return Ok(expired),
     };
-    let existing_resources: Vec<serde_json::Value> = state.storage.list(&prefix).await?;
-    let snapshot_rv = snapshot_resource_version(&existing_resources);
+    let (existing_resources, snapshot_rv) = list_snapshot(&state, &prefix).await?;
 
     let current_rev = state.storage.current_revision().await.unwrap_or(1);
     let current_rev_str = current_rev.to_string();
@@ -2911,9 +2944,9 @@ pub async fn watch_cluster_scoped_json(
     let should_send_initial =
         opens_with_current_state(send_initial_events, requested_rv.as_deref());
     // Cut the live stream at the snapshot (#2038): see
-    // `skip_added_covered_by_snapshot`. A resumed watch has no snapshot.
+    // `skip_events_covered_by_snapshot`. A resumed watch has no snapshot.
     let watch_stream = if should_send_initial {
-        skip_added_covered_by_snapshot(watch_stream, snapshot_rv)
+        skip_events_covered_by_snapshot(watch_stream, snapshot_rv)
     } else {
         watch_stream
     };
@@ -3116,8 +3149,7 @@ pub async fn watch_namespaced_json(
         Ok(stream) => stream,
         Err(expired) => return Ok(expired),
     };
-    let existing_resources: Vec<serde_json::Value> = state.storage.list(&prefix).await?;
-    let snapshot_rv = snapshot_resource_version(&existing_resources);
+    let (existing_resources, snapshot_rv) = list_snapshot(&state, &prefix).await?;
     let current_rev = state.storage.current_revision().await.unwrap_or(1);
     let current_rev_str = current_rev.to_string();
 
@@ -3140,9 +3172,9 @@ pub async fn watch_namespaced_json(
     let should_send_initial =
         opens_with_current_state(send_initial_events, requested_rv.as_deref());
     // Cut the live stream at the snapshot (#2038): see
-    // `skip_added_covered_by_snapshot`. A resumed watch has no snapshot.
+    // `skip_events_covered_by_snapshot`. A resumed watch has no snapshot.
     let watch_stream = if should_send_initial {
-        skip_added_covered_by_snapshot(watch_stream, snapshot_rv)
+        skip_events_covered_by_snapshot(watch_stream, snapshot_rv)
     } else {
         watch_stream
     };

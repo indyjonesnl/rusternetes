@@ -371,7 +371,7 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        let (_rev, prev_kv, succeeded) =
+        let (del_rev, prev_kv, succeeded) =
             retry_busy(RetryPolicy::default(), || self.backend.delete(key, 0))
                 .await
                 .map_err(|e| map_backend_error(key, "delete", "delete resource", &e))?;
@@ -397,7 +397,10 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
                 .as_ref()
                 .map(|kv| {
                     let raw = String::from_utf8_lossy(&kv.value).to_string();
-                    Self::inject_resource_version(&raw, kv.mod_revision)
+                    // Stamp the DELETE's revision, not the object's last
+                    // write (etcd3/watcher.go parseEvent stamps `e.rev`), so
+                    // a watch snapshot can dedupe DELETED by rv (#2223).
+                    Self::inject_resource_version(&raw, del_rev)
                 })
                 .unwrap_or_default();
             self.publish(WatchEvent::Deleted(key.to_string(), prev_value));
