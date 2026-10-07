@@ -83,6 +83,7 @@ mod validation_statefulset_update;
 mod validation_storageclass;
 mod validation_storageclass_update;
 mod validation_vac_update;
+mod validation_validating_admission_policy;
 mod validation_volumeattachment;
 mod validation_volumeattributesclass;
 mod validation_volumesnapshot_deletion_policy;
