@@ -4060,6 +4060,19 @@ pub fn validate_pod_spec_update(
     // 4. activeDeadlineSeconds: nil->positive or decrease-only. Upstream
     //    returns immediately on the range / increase errors
     //    (validation.go:5718-5738); only positive->nil falls through.
+    // The create-time range rule runs first upstream, because ValidatePodUpdate
+    // starts with validatePodMetadataAndSpec -> ValidatePodSpec
+    // (validation.go:4675-4679: 1..=MaxInt32), which is what refuses a zero
+    // on update (validation_test.go:13254 "change to zero from positive").
+    if let Some(ads) = new.active_deadline_seconds {
+        if !(1..=i32::MAX as i64).contains(&ads) {
+            all_errs.push(Error::invalid(
+                &spec.child("activeDeadlineSeconds"),
+                ads,
+                "must be between 1 and 2147483647, inclusive",
+            ));
+        }
+    }
     let errs = validate_active_deadline_seconds_update(
         old.active_deadline_seconds,
         new.active_deadline_seconds,

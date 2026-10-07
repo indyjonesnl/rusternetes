@@ -1385,6 +1385,20 @@ mod pod_update_fidelity {
         }
     }
 
+    // validation.go:4675-4679 via ValidatePodUpdate's validatePodMetadataAndSpec.
+    #[test]
+    fn active_deadline_zero_on_update_is_forbidden() {
+        let mut old = spec("nginx");
+        old.active_deadline_seconds = Some(30);
+        let mut new = old.clone();
+        new.active_deadline_seconds = Some(0);
+        let errs = validate_pod_spec_update(&old, &new, false);
+        assert!(
+            errs.iter().any(|e| e.field == "spec.activeDeadlineSeconds"),
+            "{errs:?}"
+        );
+    }
+
     #[test]
     fn init_container_count_change_is_forbidden() {
         let old = spec("nginx");
@@ -1422,7 +1436,14 @@ mod pod_update_fidelity {
     fn active_deadline_zero_is_in_range_and_negative_uses_inclusive_range_text() {
         let mut new = spec("nginx");
         new.active_deadline_seconds = Some(0);
-        assert!(validate_pod_spec_update(&spec("nginx"), &new, false).is_empty());
+        // The update range [0, MaxInt32] admits zero; the create-time rule
+        // (validation.go:4675-4679, run by ValidatePodUpdate) is what refuses it.
+        let errs = validate_pod_spec_update(&spec("nginx"), &new, false);
+        assert!(
+            errs.iter()
+                .all(|e| e.detail == "must be between 1 and 2147483647, inclusive"),
+            "{errs:?}"
+        );
         new.active_deadline_seconds = Some(-1);
         let errs = validate_pod_spec_update(&spec("nginx"), &new, false);
         assert!(
