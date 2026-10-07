@@ -91,7 +91,7 @@ fn matches_subject(d: &RequestDigest, s: &FlowSchemaSubject) -> bool {
             .is_some_and(|u| u.name == "*" || u.name == d.user_name),
         SubjectKind::Group => match &s.group {
             None => false,
-            Some(g) => g.name == "*" || d.groups.iter().any(|x| *x == g.name),
+            Some(g) => g.name == "*" || d.groups.contains(&g.name),
         },
         SubjectKind::ServiceAccount => match &s.service_account {
             None => false,
