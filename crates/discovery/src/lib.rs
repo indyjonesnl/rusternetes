@@ -649,13 +649,14 @@ pub async fn get_api_groups(
         APIGroup {
             name: "autoscaling".to_string(),
             versions: vec![
-                GroupVersionForDiscovery {
-                    group_version: "autoscaling/v1".to_string(),
-                    version: "v1".to_string(),
-                },
+                // Priority order, pkg/apis/autoscaling/install/install.go:43.
                 GroupVersionForDiscovery {
                     group_version: "autoscaling/v2".to_string(),
                     version: "v2".to_string(),
+                },
+                GroupVersionForDiscovery {
+                    group_version: "autoscaling/v1".to_string(),
+                    version: "v1".to_string(),
                 },
             ],
             preferred_version: GroupVersionForDiscovery {
@@ -855,14 +856,14 @@ pub async fn get_api_groups(
     (StatusCode::OK, Json(api_group_list)).into_response()
 }
 
-/// Whether `certificates.k8s.io/v1beta1` is served: its only resource,
-/// `clustertrustbundles`, is installed only under the `ClusterTrustBundle`
-/// feature gate (pkg/registry/certificates/rest/storage_certificates.go:
-/// 91-104), and upstream drops a group version that has no storage.
+/// Whether `certificates.k8s.io/v1beta1` is served: its resources,
+/// `clustertrustbundles` and `podcertificaterequests`, are installed only
+/// under the `ClusterTrustBundle` / `PodCertificateRequest` feature gates
+/// (pkg/registry/certificates/rest/storage_certificates.go:91-117), and
+/// upstream drops a group version that has no storage.
 fn certificates_v1beta1_served() -> bool {
-    rusternetes_common::feature_gates::enabled(
-        rusternetes_common::feature_gates::Feature::ClusterTrustBundle,
-    )
+    use rusternetes_common::feature_gates::{enabled, Feature};
+    enabled(Feature::ClusterTrustBundle) || enabled(Feature::PodCertificateRequest)
 }
 
 /// Helper to get all API group names and their preferred versions
@@ -1396,15 +1397,33 @@ fn get_aggregated_resources_for_group_uncategorized(
             vec![sub("status", "CustomResourceDefinition", status_verbs)],
         )],
         "coordination.k8s.io" => vec![res("leases", "lease", "Lease", true, all_verbs, vec![])],
-        // v1beta1 serves only ClusterTrustBundle (storage_certificates.go:91-104).
-        "certificates.k8s.io" if version == "v1beta1" => vec![res(
-            "clustertrustbundles",
-            "clustertrustbundle",
-            "ClusterTrustBundle",
-            false,
-            all_verbs,
-            vec![],
-        )],
+        // v1beta1 serves ClusterTrustBundle and PodCertificateRequest, each
+        // under its own gate (storage_certificates.go:91-117).
+        "certificates.k8s.io" if version == "v1beta1" => {
+            use rusternetes_common::feature_gates::{enabled, Feature};
+            let mut v = Vec::new();
+            if enabled(Feature::ClusterTrustBundle) {
+                v.push(res(
+                    "clustertrustbundles",
+                    "clustertrustbundle",
+                    "ClusterTrustBundle",
+                    false,
+                    all_verbs,
+                    vec![],
+                ));
+            }
+            if enabled(Feature::PodCertificateRequest) {
+                v.push(res(
+                    "podcertificaterequests",
+                    "podcertificaterequest",
+                    "PodCertificateRequest",
+                    true,
+                    all_verbs,
+                    vec![sub("status", "PodCertificateRequest", status_verbs)],
+                ));
+            }
+            v
+        }
         "certificates.k8s.io" => vec![res_with_short(
             "certificatesigningrequests",
             "certificatesigningrequest",
@@ -3336,9 +3355,9 @@ pub async fn get_certificates_v1_resources() -> (StatusCode, Json<APIResourceLis
 }
 
 /// GET /apis/certificates.k8s.io/v1beta1
-/// Returns the resources of certificates.k8s.io/v1beta1: `clustertrustbundles`,
-/// which exists only while the `ClusterTrustBundle` gate is on (404 otherwise,
-/// as for an API version with no storage).
+/// Returns the resources of certificates.k8s.io/v1beta1: `clustertrustbundles`
+/// and `podcertificaterequests` (+ `/status`), each present only while its
+/// gate is on (404 when neither is, as for an API version with no storage).
 pub async fn get_certificates_v1beta1_resources() -> Response {
     if !certificates_v1beta1_served() {
         return (
@@ -3354,12 +3373,9 @@ pub async fn get_certificates_v1beta1_resources() -> Response {
         )
             .into_response();
     }
-    let resources = vec![APIResource {
-        name: "clustertrustbundles".to_string(),
-        singular_name: "clustertrustbundle".to_string(),
-        namespaced: false,
-        kind: "ClusterTrustBundle".to_string(),
-        verbs: [
+    use rusternetes_common::feature_gates::{enabled, Feature};
+    let all_verbs = || -> Vec<String> {
+        [
             "create",
             "delete",
             "deletecollection",
@@ -3371,11 +3387,46 @@ pub async fn get_certificates_v1beta1_resources() -> Response {
         ]
         .iter()
         .map(|s| s.to_string())
-        .collect(),
-        short_names: None,
-        categories: None,
-        storage_version_hash: None,
-    }];
+        .collect()
+    };
+    let mut resources = Vec::new();
+    if enabled(Feature::ClusterTrustBundle) {
+        resources.push(APIResource {
+            name: "clustertrustbundles".to_string(),
+            singular_name: "clustertrustbundle".to_string(),
+            namespaced: false,
+            kind: "ClusterTrustBundle".to_string(),
+            verbs: all_verbs(),
+            short_names: None,
+            categories: None,
+            storage_version_hash: None,
+        });
+    }
+    if enabled(Feature::PodCertificateRequest) {
+        resources.push(APIResource {
+            name: "podcertificaterequests".to_string(),
+            singular_name: "podcertificaterequest".to_string(),
+            namespaced: true,
+            kind: "PodCertificateRequest".to_string(),
+            verbs: all_verbs(),
+            short_names: None,
+            categories: None,
+            storage_version_hash: None,
+        });
+        resources.push(APIResource {
+            name: "podcertificaterequests/status".to_string(),
+            singular_name: "".to_string(),
+            namespaced: true,
+            kind: "PodCertificateRequest".to_string(),
+            verbs: ["get", "patch", "update"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            short_names: None,
+            categories: None,
+            storage_version_hash: None,
+        });
+    }
     let resource_list = APIResourceList {
         kind: "APIResourceList".to_string(),
         api_version: "v1".to_string(),
@@ -4351,6 +4402,87 @@ mod tests {
             .iter()
             .find(|s| s.get("subresource").and_then(|v| v.as_str()) == Some("finalize"))
             .expect("namespaces should have finalize subresource");
+    }
+
+    /// Upstream's default-enabled served versions per built-in group, in
+    /// discovery order. pkg/controlplane/instance.go:447-468
+    /// (`stableAPIGroupVersionsEnabledByDefault`; beta/alpha are disabled
+    /// by default, :471-497) with order from each group's
+    /// `SetVersionPriority` (autoscaling: pkg/apis/autoscaling/install/
+    /// install.go:43 `v2, v1, ...`; the served ones are v2 then v1).
+    const UPSTREAM_SERVED: &[(&str, &[&str])] = &[
+        ("admissionregistration.k8s.io", &["v1"]),
+        ("apps", &["v1"]),
+        ("authentication.k8s.io", &["v1"]),
+        ("authorization.k8s.io", &["v1"]),
+        ("autoscaling", &["v2", "v1"]),
+        ("batch", &["v1"]),
+        ("certificates.k8s.io", &["v1"]),
+        ("coordination.k8s.io", &["v1"]),
+        ("discovery.k8s.io", &["v1"]),
+        ("events.k8s.io", &["v1"]),
+        ("networking.k8s.io", &["v1"]),
+        ("node.k8s.io", &["v1"]),
+        ("policy", &["v1"]),
+        ("rbac.authorization.k8s.io", &["v1"]),
+        ("resource.k8s.io", &["v1"]),
+        ("storage.k8s.io", &["v1"]),
+        ("scheduling.k8s.io", &["v1"]),
+        ("flowcontrol.apiserver.k8s.io", &["v1"]),
+        // Served by the apiextensions / kube-aggregator servers.
+        ("apiextensions.k8s.io", &["v1"]),
+        ("apiregistration.k8s.io", &["v1"]),
+    ];
+
+    #[tokio::test]
+    async fn test_apis_builtin_group_versions_match_upstream_default_set() {
+        let response = get_api_groups(None, HeaderMap::new()).await;
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let groups = v["groups"].as_array().unwrap();
+        for (name, want) in UPSTREAM_SERVED {
+            let g = groups
+                .iter()
+                .find(|g| g["name"] == *name)
+                .unwrap_or_else(|| panic!("/apis is missing built-in group {name}"));
+            let got: Vec<&str> = g["versions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x["version"].as_str().unwrap())
+                .collect();
+            assert_eq!(&got, want, "/apis versions for {name}");
+            assert_eq!(
+                g["preferredVersion"]["version"], want[0],
+                "{name} preferred"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_apis_group_names_table_matches_upstream_default_set() {
+        for (name, want) in UPSTREAM_SERVED {
+            let (_, preferred) = get_api_group_names()
+                .into_iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("get_api_group_names() is missing {name}"));
+            assert_eq!(preferred, want[0], "table preferred version for {name}");
+
+            let response = get_api_group(None, axum::extract::Path(name.to_string())).await;
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let got: Vec<&str> = v["versions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x["version"].as_str().unwrap())
+                .collect();
+            assert_eq!(&got, want, "/apis/{name} versions");
+        }
     }
 
     #[test]

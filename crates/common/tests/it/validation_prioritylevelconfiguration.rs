@@ -330,6 +330,20 @@ fn unknown_priority_level_type_is_not_supported() {
 }
 
 #[test]
+fn absent_priority_level_type_is_not_supported() {
+    // pkg/apis/flowcontrol/v1/defaults.go has no SetDefaults for the type
+    // (only Exempt/Limited/Queuing sub-structs), so an absent `type` is Go's
+    // zero value "" and hits validation.go:418-420 `default:` -> NotSupported.
+    let p = plc_from_json("workload", serde_json::json!({}));
+    let errs = validate_priority_level_configuration(&p);
+    assert!(
+        errs.iter()
+            .any(|e| e.error_type == ErrorType::NotSupported && e.field == "spec.type"),
+        "{errs:?}"
+    );
+}
+
+#[test]
 fn unknown_limit_response_type_is_not_supported() {
     // validation.go:477-479.
     let p = plc_from_json(

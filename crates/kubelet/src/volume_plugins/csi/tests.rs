@@ -14,6 +14,7 @@ use crate::volume_plugins::csi_client::proto::node_service_capability::rpc::Type
 use crate::volume_plugins::csi_client::proto::volume_capability::AccessType;
 use crate::volume_plugins::csi_client::CsiError;
 use crate::volume_plugins::csi_drivers_store::{csi_drivers, Driver};
+use crate::volume_plugins::plugin::DeviceMounterArgs;
 use rusternetes_common::resources::{Pod, Secret, Volume};
 use rusternetes_storage::{build_key, MemoryStorage, Storage, StorageBackend};
 use serde_json::json;
@@ -123,6 +124,237 @@ async fn put_secret(storage: &Arc<StorageBackend>, ns: &str, name: &str, k: &str
         .create(&build_key("secrets", Some(ns), name), &s)
         .await
         .unwrap();
+}
+
+/// Run the `MountVolume` operation (`GenerateMountVolumeFunc`): `MountDevice`
+/// then `SetUp`, through a registry holding the CSI plugin.
+async fn mount_volume(f: &Fx, spec: &Spec<'_>, pod: &Pod) -> String {
+    let mgr = crate::volume_plugins::VolumePluginMgr::new(vec![Box::new(CsiPlugin::new(host(
+        &f.root,
+        Some(f.storage.clone()),
+    )))]);
+    crate::volume_plugins::util::operation_generator::mount_volume(&mgr, spec, pod, "")
+        .await
+        .unwrap()
+}
+
+// ---- DeviceMounter (#2529) ------------------------------------------------
+
+/// `NewDeviceMounter` -> `GetDeviceMountPath` -> `MountDevice` stages the
+/// volume WITHOUT publishing it (`csi_attacher.go:264-411`): publishing is the
+/// mounter's `SetUp`.
+#[tokio::test]
+async fn device_mounter_stages_without_publishing() {
+    let f = fx(
+        "devmount",
+        &[Cap::StageUnstageVolume],
+        Some(json!({"attachRequired": false})),
+    )
+    .await;
+    put_secret(&f.storage, "sec-ns", "stage-secret", "k", "v").await;
+    let p = pv(
+        &f.driver,
+        json!({"fsType": "xfs",
+               "nodeStageSecretRef": {"name": "stage-secret", "namespace": "sec-ns"}}),
+    );
+    let v = claim_volume();
+    let spec = Spec {
+        volume: &v,
+        persistent_volume: Some(&p),
+    };
+    let dm = f.plugin.new_device_mounter().unwrap();
+    let path = dm.get_device_mount_path(&spec).unwrap();
+    assert!(path.ends_with("/globalmount"), "{path}");
+    dm.mount_device(&spec, "", &path, &DeviceMounterArgs::default())
+        .await
+        .unwrap();
+
+    let calls = f.fake.calls.lock().unwrap();
+    assert_eq!(calls.stage.len(), 1);
+    assert_eq!(calls.stage[0].staging_target_path, path);
+    assert_eq!(calls.stage[0].secrets["k"], "v");
+    assert!(calls.publish.is_empty(), "MountDevice must not publish");
+    // `UnmountDevice` finds the driver and handle here.
+    assert!(std::path::Path::new(&path)
+        .parent()
+        .unwrap()
+        .join("vol_data.json")
+        .exists());
+}
+
+/// `SetUp` no longer stages: the device mount is its own operation, run first
+/// by `MountVolume` (`operation_generator.go:530-552`).
+#[tokio::test]
+async fn set_up_alone_does_not_stage() {
+    let f = fx(
+        "nostage",
+        &[Cap::StageUnstageVolume],
+        Some(json!({"attachRequired": false})),
+    )
+    .await;
+    let p = pv(&f.driver, json!({}));
+    let v = claim_volume();
+    let spec = Spec {
+        volume: &v,
+        persistent_volume: Some(&p),
+    };
+    let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
+    m.set_up().await.unwrap();
+    let calls = f.fake.calls.lock().unwrap();
+    assert!(calls.stage.is_empty());
+    assert_eq!(calls.publish.len(), 1);
+    assert!(calls.publish[0]
+        .staging_target_path
+        .ends_with("/globalmount"));
+}
+
+/// The CSI spec orders NodeStageVolume before NodePublishVolume; the
+/// `MountVolume` operation guarantees it.
+#[tokio::test]
+async fn mount_volume_stages_before_it_publishes() {
+    let f = fx(
+        "order",
+        &[Cap::StageUnstageVolume],
+        Some(json!({"attachRequired": false})),
+    )
+    .await;
+    let p = pv(&f.driver, json!({}));
+    let v = claim_volume();
+    let spec = Spec {
+        volume: &v,
+        persistent_volume: Some(&p),
+    };
+    let path = mount_volume(&f, &spec, &pod()).await;
+    assert!(path.ends_with("/mount"), "{path}");
+    let calls = f.fake.calls.lock().unwrap();
+    assert_eq!((calls.stage.len(), calls.publish.len()), (1, 1));
+    assert_eq!(calls.order, vec!["stage", "publish"]);
+}
+
+/// A failed `MountDevice` stops the operation: nothing is published.
+#[tokio::test]
+async fn mount_volume_does_not_publish_when_staging_fails() {
+    let f = fx(
+        "stagefail",
+        &[Cap::StageUnstageVolume],
+        Some(json!({"attachRequired": false})),
+    )
+    .await;
+    *f.fake.stage_error.lock().unwrap() = Some(tonic::Code::InvalidArgument);
+    let p = pv(&f.driver, json!({}));
+    let v = claim_volume();
+    let spec = Spec {
+        volume: &v,
+        persistent_volume: Some(&p),
+    };
+    let mgr = crate::volume_plugins::VolumePluginMgr::new(vec![Box::new(CsiPlugin::new(host(
+        &f.root,
+        Some(f.storage.clone()),
+    )))]);
+    let err =
+        crate::volume_plugins::util::operation_generator::mount_volume(&mgr, &spec, &pod(), "")
+            .await
+            .unwrap_err();
+    assert!(err.to_string().contains("fake stage failure"), "{err}");
+    assert!(f.fake.calls.lock().unwrap().publish.is_empty());
+}
+
+/// `VOLUME_MOUNT_GROUP` (`csi_attacher.go:381-385`): the pod's fsGroup reaches
+/// NodeStageVolume only when the driver advertises the capability.
+#[tokio::test]
+async fn mount_device_delegates_fs_group_to_a_volume_mount_group_driver() {
+    let f = fx(
+        "stagevmg",
+        &[Cap::StageUnstageVolume, Cap::VolumeMountGroup],
+        Some(json!({"attachRequired": false})),
+    )
+    .await;
+    let p = pv(&f.driver, json!({}));
+    let v = claim_volume();
+    let spec = Spec {
+        volume: &v,
+        persistent_volume: Some(&p),
+    };
+    let dm = f.plugin.new_device_mounter().unwrap();
+    let path = dm.get_device_mount_path(&spec).unwrap();
+    let args = DeviceMounterArgs {
+        fs_group: Some(4242),
+        node_name: "node-1".into(),
+    };
+    dm.mount_device(&spec, "", &path, &args).await.unwrap();
+    let calls = f.fake.calls.lock().unwrap();
+    match calls.stage[0]
+        .volume_capability
+        .as_ref()
+        .unwrap()
+        .access_type
+        .as_ref()
+        .unwrap()
+    {
+        AccessType::Mount(m) => assert_eq!(m.volume_mount_group, "4242"),
+        other => panic!("expected mount, got {other:?}"),
+    }
+}
+
+/// Without `STAGE_UNSTAGE_VOLUME` `MountDevice` only records the metadata
+/// (`csi_attacher.go:357-361`).
+#[tokio::test]
+async fn mount_device_without_stage_capability_is_a_noop_rpc() {
+    let f = fx("nocap", &[], Some(json!({"attachRequired": false}))).await;
+    let p = pv(&f.driver, json!({}));
+    let v = claim_volume();
+    let spec = Spec {
+        volume: &v,
+        persistent_volume: Some(&p),
+    };
+    let dm = f.plugin.new_device_mounter().unwrap();
+    let path = dm.get_device_mount_path(&spec).unwrap();
+    dm.mount_device(&spec, "", &path, &DeviceMounterArgs::default())
+        .await
+        .unwrap();
+    assert!(f.fake.calls.lock().unwrap().stage.is_empty());
+    assert!(std::path::Path::new(&path).is_dir());
+}
+
+/// An unregistered driver is a transient failure (kubernetes#120268).
+#[tokio::test]
+async fn mount_device_with_an_unregistered_driver_is_transient() {
+    let f = fx("devunreg", &[], None).await;
+    let p = pv("nobody.csi.example.com", json!({}));
+    let v = claim_volume();
+    let spec = Spec {
+        volume: &v,
+        persistent_volume: Some(&p),
+    };
+    let dm = f.plugin.new_device_mounter().unwrap();
+    let path = dm.get_device_mount_path(&spec).unwrap();
+    let err = dm
+        .mount_device(&spec, "", &path, &DeviceMounterArgs::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err.downcast_ref::<CsiError>(),
+        Some(CsiError::Transient(_))
+    ));
+}
+
+/// `CanDeviceMount` (`csi_plugin.go:702-715`): persistent yes, ephemeral no.
+#[test]
+fn can_device_mount_is_persistent_only() {
+    let plugin = plugin();
+    let p = pv("d.csi.example.com", json!({}));
+    let claim = claim_volume();
+    assert!(plugin.can_device_mount(&Spec {
+        volume: &claim,
+        persistent_volume: Some(&p)
+    }));
+    let inline: Volume =
+        serde_json::from_value(json!({"name": "v", "csi": {"driver": "d.csi.example.com"}}))
+            .unwrap();
+    assert!(!plugin.can_device_mount(&Spec {
+        volume: &inline,
+        persistent_volume: None
+    }));
 }
 
 // ---- can_support / names -------------------------------------------------
@@ -327,8 +559,7 @@ async fn set_up_stages_then_publishes_when_the_driver_supports_it() {
         volume: &v,
         persistent_volume: Some(&p),
     };
-    let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
-    m.set_up().await.unwrap();
+    mount_volume(&f, &spec, &pod()).await;
 
     let calls = f.fake.calls.lock().unwrap();
     assert_eq!(calls.stage.len(), 1);
@@ -992,10 +1223,8 @@ async fn staged_device_is_unstaged_only_after_the_last_pod_unpublishes() {
     };
     let mut pod_b = pod();
     pod_b.metadata.uid = "uid-2".to_string();
-    let m1 = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
-    m1.set_up().await.unwrap();
-    let m2 = f.plugin.new_mounter(&spec, &pod_b).await.unwrap();
-    m2.set_up().await.unwrap();
+    mount_volume(&f, &spec, &pod()).await;
+    mount_volume(&f, &spec, &pod_b).await;
     let vm = volume_manager(&f.root);
 
     // Pod 2 is live, pod 1 gone: unpublish pod 1 only; the device stays staged.
@@ -1070,4 +1299,218 @@ async fn terminated_live_pod_csi_volume_is_unpublished() {
     assert!(f.fake.calls.lock().unwrap().unpublish.is_empty());
     vm.unmount_orphaned_volumes(&live, &live).await;
     assert_eq!(f.fake.calls.lock().unwrap().unpublish.len(), 1);
+}
+
+// ---- fsGroup (`csi_mounter.go:126-129`, `:250-260`, `:333-352`, `:469-527`) ----
+
+mod fs_group {
+    use super::*;
+    use rusternetes_common::resources::PersistentVolumeAccessMode as Am;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    fn fs_group_pod(gid: i64, policy: Option<&str>) -> Pod {
+        let mut sc = json!({"fsGroup": gid});
+        if let Some(p) = policy {
+            sc["fsGroupChangePolicy"] = json!(p);
+        }
+        serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "ns1", "uid": "uid-1"},
+            "spec": {"containers": [], "nodeName": "node-1", "securityContext": sc}
+        }))
+        .unwrap()
+    }
+
+    /// The test process's own gid: chowning to it needs no privilege.
+    fn own_gid(f: &Fx) -> i64 {
+        std::fs::metadata(f._dir.path()).unwrap().gid() as i64
+    }
+
+    fn mode(p: &std::path::Path) -> u32 {
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o7777
+    }
+
+    /// Mount a PV with a 0600 file already in the mount dir (what the driver's
+    /// NodePublish would have populated) and return that file.
+    async fn mount(
+        f: &Fx,
+        csi: serde_json::Value,
+        modes: Vec<Am>,
+        policy: Option<&str>,
+        root_mode: Option<u32>,
+    ) -> std::path::PathBuf {
+        let mut p = pv(&f.driver, csi);
+        p.spec.access_modes = modes;
+        let v = claim_volume();
+        let spec = Spec {
+            volume: &v,
+            persistent_volume: Some(&p),
+        };
+        let m = f
+            .plugin
+            .new_mounter(&spec, &fs_group_pod(own_gid(f), policy))
+            .await
+            .unwrap();
+        let dir = std::path::PathBuf::from(m.get_path());
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(rm) = root_mode {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(rm)).unwrap();
+        }
+        let file = dir.join("f");
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        m.set_up().await.unwrap();
+        file
+    }
+
+    fn driver_spec() -> Option<serde_json::Value> {
+        Some(json!({"attachRequired": false}))
+    }
+
+    /// Default policy, an RWO PV with an fsType: the kubelet applies fsGroup
+    /// with `mode | rwMask` and setgid on the root, and does not ask the driver.
+    #[tokio::test]
+    async fn kubelet_applies_fs_group_for_an_rwo_volume_with_fs_type() {
+        let f = fx("fsg-apply", &[], driver_spec()).await;
+        let file = mount(
+            &f,
+            json!({"fsType": "ext4"}),
+            vec![Am::ReadWriteOnce],
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(mode(&file), 0o660);
+        assert_eq!(mode(file.parent().unwrap()) & 0o2000, 0o2000);
+        let calls = f.fake.calls.lock().unwrap();
+        match calls.publish[0]
+            .volume_capability
+            .as_ref()
+            .unwrap()
+            .access_type
+            .as_ref()
+            .unwrap()
+        {
+            AccessType::Mount(m) => assert_eq!(m.volume_mount_group, ""),
+            other => panic!("expected mount, got {other:?}"),
+        }
+    }
+
+    /// `ReadWriteOnceWithFSType` (the default) skips a ReadWriteMany volume
+    /// and a volume with no fsType (`csi_mounter.go:478-497`).
+    #[tokio::test]
+    async fn default_policy_skips_rwx_and_missing_fs_type() {
+        let f = fx("fsg-skip", &[], driver_spec()).await;
+        let file = mount(
+            &f,
+            json!({"fsType": "ext4"}),
+            vec![Am::ReadWriteMany],
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(mode(&file), 0o600, "RWX is skipped");
+        let f = fx("fsg-skip2", &[], driver_spec()).await;
+        let file = mount(&f, json!({}), vec![Am::ReadWriteOnce], None, None).await;
+        assert_eq!(mode(&file), 0o600, "no fsType is skipped");
+    }
+
+    /// `fsGroupPolicy: File` applies regardless of fsType / access mode
+    /// (`csi_mounter.go:474-476`).
+    #[tokio::test]
+    async fn file_policy_applies_without_fs_type_or_rwo() {
+        let f = fx(
+            "fsg-file",
+            &[],
+            Some(json!({"attachRequired": false, "fsGroupPolicy": "File"})),
+        )
+        .await;
+        let file = mount(&f, json!({}), vec![Am::ReadWriteMany], None, None).await;
+        assert_eq!(mode(&file), 0o660);
+    }
+
+    /// `fsGroupPolicy: None` never applies (`csi_mounter.go:470`).
+    #[tokio::test]
+    async fn none_policy_never_applies() {
+        let f = fx(
+            "fsg-none",
+            &[],
+            Some(json!({"attachRequired": false, "fsGroupPolicy": "None"})),
+        )
+        .await;
+        let file = mount(
+            &f,
+            json!({"fsType": "ext4"}),
+            vec![Am::ReadWriteOnce],
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(mode(&file), 0o600);
+    }
+
+    /// A driver with VOLUME_MOUNT_GROUP gets the fsGroup in NodePublish and the
+    /// kubelet leaves the tree alone (`csi_mounter.go:257-260`, `:333`).
+    #[tokio::test]
+    async fn volume_mount_group_driver_receives_fs_group_and_kubelet_skips() {
+        let f = fx("fsg-vmg", &[Cap::VolumeMountGroup], driver_spec()).await;
+        let file = mount(
+            &f,
+            json!({"fsType": "ext4"}),
+            vec![Am::ReadWriteOnce],
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(mode(&file), 0o600, "the driver owns it, kubelet must not");
+        let calls = f.fake.calls.lock().unwrap();
+        match calls.publish[0]
+            .volume_capability
+            .as_ref()
+            .unwrap()
+            .access_type
+            .as_ref()
+            .unwrap()
+        {
+            AccessType::Mount(m) => assert_eq!(m.volume_mount_group, own_gid(&f).to_string()),
+            other => panic!("expected mount, got {other:?}"),
+        }
+    }
+
+    /// `fsGroupChangePolicy` reaches the ownership walk: `OnRootMismatch` with
+    /// a conforming root leaves the children alone (`csi_mounter.go:339`).
+    #[tokio::test]
+    async fn fs_group_change_policy_is_passed_to_the_ownership_change() {
+        let f = fx("fsg-orm", &[], driver_spec()).await;
+        let file = mount(
+            &f,
+            json!({"fsType": "ext4"}),
+            vec![Am::ReadWriteOnce],
+            Some("OnRootMismatch"),
+            Some(0o2770),
+        )
+        .await;
+        assert_eq!(mode(&file), 0o600);
+    }
+
+    /// An empty `fsGroupPolicy` string is an error, as upstream
+    /// (`csi_mounter.go:523-525`): transient, and nothing is published.
+    #[tokio::test]
+    async fn empty_fs_group_policy_is_a_transient_error() {
+        let f = fx(
+            "fsg-empty",
+            &[],
+            Some(json!({"attachRequired": false, "fsGroupPolicy": ""})),
+        )
+        .await;
+        let p = pv(&f.driver, json!({"fsType": "ext4"}));
+        let v = claim_volume();
+        let spec = Spec {
+            volume: &v,
+            persistent_volume: Some(&p),
+        };
+        let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
+        let e = m.set_up().await.unwrap_err();
+        assert!(e.to_string().contains("fsGroup policy"), "{e}");
+        assert!(f.fake.calls.lock().unwrap().publish.is_empty());
+    }
 }

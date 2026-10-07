@@ -36,6 +36,7 @@ mod kubelet;
 mod labels;
 #[allow(dead_code)]
 mod lifecycle;
+mod node_status;
 // Wired in main below; the full surface is only reachable from lib users/tests.
 #[allow(dead_code)]
 mod pluginmanager;
@@ -51,6 +52,7 @@ mod serving_tls;
 mod runtime;
 mod runtime_state;
 mod server;
+mod static_pod_watch;
 mod static_pods;
 mod streaming_server;
 mod sync_locks;
@@ -324,6 +326,11 @@ async fn main() -> Result<()> {
 
     // fileCheckFrequency from the config file (None => upstream default 20s).
     let file_check_frequency = config_file.as_ref().and_then(|c| c.file_check_frequency);
+    // nodeStatusReportFrequency (5m default, or nodeStatusUpdateFrequency when
+    // only that was set explicitly; defaults.go).
+    let node_status_report_frequency = config_file
+        .as_ref()
+        .map(|c| c.effective_node_status_report_frequency());
 
     // runtimeRequestTimeout from the config file (None => upstream default 2m).
     let runtime_request_timeout = config_file.as_ref().and_then(|c| c.runtime_request_timeout);
@@ -470,6 +477,7 @@ async fn main() -> Result<()> {
     // Initialize metrics
     let metrics = Arc::new(MetricsRegistry::new().with_kubelet_metrics()?);
     let metrics_clone = metrics.clone();
+    let plugin_metrics = metrics.clone();
 
     // Convert RuntimeConfig to KubeletConfiguration for /configz endpoint
     let kubelet_config = KubeletConfiguration {
@@ -522,6 +530,7 @@ async fn main() -> Result<()> {
         .with_pod_manifest_path(args.pod_manifest_path.clone())
         .with_node_status_update_frequency(node_status_update_frequency)
         .with_file_check_frequency(file_check_frequency)
+        .with_node_status_report_frequency(node_status_report_frequency)
         .with_runtime_request_timeout(runtime_request_timeout)
         .with_crash_loop_backoff_max(crash_loop_backoff_max),
     );
@@ -563,6 +572,7 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
             let plugin_manager = pluginmanager::PluginManager::new(registry_dir);
+            plugin_manager.register_metrics(&plugin_metrics.registry);
             let mut handler = pluginmanager::csi_handler::RegistrationHandler::new(nim.clone());
             // `csi_plugin.go:417-426`: the csiNodeUpdater runs only with the
             // `MutableCSINodeAllocatableCount` gate (on by default in 1.35).

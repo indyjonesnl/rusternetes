@@ -164,24 +164,30 @@ pub async fn create_token_request(
     // TokenRequest.spec.expirationSeconds bounds (upstream ValidateTokenRequest):
     // >= 10 minutes and <= 2^32 seconds.
     if expiration_seconds < 600 {
-        return Err(rusternetes_common::Error::Invalid(vec![
-            rusternetes_common::validation::field::Error::invalid(
+        return Err(rusternetes_common::Error::new_invalid(
+            "authentication.k8s.io",
+            "TokenRequest",
+            "",
+            vec![rusternetes_common::validation::field::Error::invalid(
                 &rusternetes_common::validation::field::Path::new("spec")
                     .child("expirationSeconds"),
                 expiration_seconds,
                 "may not specify a duration less than 10 minutes",
-            ),
-        ]));
+            )],
+        ));
     }
     if expiration_seconds > (1_i64 << 32) {
-        return Err(rusternetes_common::Error::Invalid(vec![
-            rusternetes_common::validation::field::Error::invalid(
+        return Err(rusternetes_common::Error::new_invalid(
+            "authentication.k8s.io",
+            "TokenRequest",
+            "",
+            vec![rusternetes_common::validation::field::Error::invalid(
                 &rusternetes_common::validation::field::Path::new("spec")
                     .child("expirationSeconds"),
                 expiration_seconds,
                 "may not specify a duration larger than 2^32 seconds",
-            ),
-        ]));
+            )],
+        ));
     }
 
     let now = chrono::Utc::now();
