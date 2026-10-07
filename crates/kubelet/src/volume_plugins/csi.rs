@@ -259,6 +259,155 @@ impl CsiPlugin {
     }
 }
 
+/// `volume.ReconstructedVolume` (`pkg/volume/plugins.go`): what
+/// `ConstructVolumeSpec` rebuilds from a mounted volume's on-disk state.
+///
+/// **Deviation:** upstream returns a `*volume.Spec` whose `Volume` is nil for a
+/// PV-backed spec. Our [`Spec`] borrows a mandatory `Volume`, so the owned parts
+/// are returned and the caller builds the `Spec`; for the PV arm `volume` is a
+/// placeholder named after the PV (see `Spec::name`'s inherited deviation).
+pub struct ReconstructedVolume {
+    pub volume: rusternetes_common::resources::Volume,
+    pub persistent_volume: Option<PersistentVolume>,
+}
+
+impl CsiPlugin {
+    /// Port of `ConstructVolumeSpec` (`csi_plugin.go:569-626`): rebuild the
+    /// volume spec from the `vol_data.json` in `mount_path` (the volume
+    /// directory, i.e. the parent of `mount`). An `Ephemeral` volume becomes a
+    /// `CSIVolumeSource` (`constructVolSourceSpec`), anything else a PV with a
+    /// `CSIPersistentVolumeSource` and Filesystem mode (`constructPVSourceSpec`).
+    /// The SELinux mount context is not ported (feature gate off).
+    pub fn construct_volume_spec(&self, mount_path: &Path) -> Result<ReconstructedVolume> {
+        let data = load_volume_data(mount_path).map_err(|e| {
+            anyhow!(
+                "kubernetes.io/csi: plugin.ConstructVolumeSpec failed loading volume data using [{}]: {e}",
+                mount_path.display()
+            )
+        })?;
+        let get = |k: &str| data.get(k).cloned().unwrap_or_default();
+        let (spec_vol_id, driver) = (
+            get(vol_data_key::SPEC_VOL_ID),
+            get(vol_data_key::DRIVER_NAME),
+        );
+        if get(vol_data_key::VOLUME_LIFECYCLE_MODE) == LifecycleMode::Ephemeral.as_str() {
+            let volume = serde_json::from_value(serde_json::json!({
+                "name": spec_vol_id, "csi": {"driver": driver}
+            }))?;
+            return Ok(ReconstructedVolume {
+                volume,
+                persistent_volume: None,
+            });
+        }
+        let pv: PersistentVolume = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": spec_vol_id},
+            "spec": {
+                "csi": {"driver": driver, "volumeHandle": get(vol_data_key::VOL_HANDLE)},
+                "volumeMode": "Filesystem"
+            }
+        }))?;
+        let volume = serde_json::from_value(serde_json::json!({"name": spec_vol_id}))?;
+        Ok(ReconstructedVolume {
+            volume,
+            persistent_volume: Some(pv),
+        })
+    }
+
+    /// Port of `csiAttacher.UnmountDevice` (`csi_attacher.go:526-590`):
+    /// `NodeUnstageVolume(volID, deviceMountPath)` using the driver and handle
+    /// that `MountDevice` persisted in `<deviceMountPath>/../vol_data.json`,
+    /// then remove the global dir and json file.
+    ///
+    /// A missing data file means the device was never staged here: skipped. A
+    /// driver that is not registered is a transient failure (kubernetes#120268).
+    pub async fn unmount_device(&self, device_mount_path: &Path) -> Result<()> {
+        let data_dir = device_mount_path
+            .parent()
+            .ok_or_else(|| anyhow!("device mount path {device_mount_path:?} has no parent"))?;
+        let data = match load_volume_data(data_dir) {
+            Ok(d) => d,
+            Err(_) if !data_dir.join(VOL_DATA_FILE_NAME).exists() => {
+                debug!(
+                    "kubernetes.io/csi: attacher.UnmountDevice skipped because volume data file [{}] does not exist",
+                    data_dir.display()
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                error!("kubernetes.io/csi: attacher.UnmountDevice failed to get driver and volume name from device mount path: {e}");
+                return Err(e);
+            }
+        };
+        let driver_name = data
+            .get(vol_data_key::DRIVER_NAME)
+            .cloned()
+            .unwrap_or_default();
+        let vol_id = data
+            .get(vol_data_key::VOL_HANDLE)
+            .cloned()
+            .unwrap_or_default();
+        let client = CsiDriverClient::new(&driver_name).map_err(|e| {
+            transient(format!(
+                "kubernetes.io/csi: attacher.UnmountDevice failed to create newCsiDriverClient: {e}"
+            ))
+        })?;
+        let stage_unstage_set = client.node_supports_stage_unstage().await.map_err(|e| {
+            anyhow!("kubernetes.io/csi: attacher.UnmountDevice failed to check whether STAGE_UNSTAGE_VOLUME set: {e}")
+        })?;
+        if !stage_unstage_set {
+            info!("kubernetes.io/csi: attacher.UnmountDevice STAGE_UNSTAGE_VOLUME capability not set. Skipping UnmountDevice...");
+        } else {
+            client
+                .node_unstage_volume(&vol_id, &device_mount_path.to_string_lossy())
+                .await
+                .map_err(|e| anyhow!("kubernetes.io/csi: attacher.UnmountDevice failed: {e}"))?;
+        }
+        remove_mount_dir(device_mount_path).map_err(|e| {
+            anyhow!(
+                "kubernetes.io/csi: failed to clean up global mount {}: {e}",
+                data_dir.display()
+            )
+        })?;
+        debug!(
+            "kubernetes.io/csi: attacher.UnmountDevice successfully requested NodeUnStageVolume [{}]",
+            device_mount_path.display()
+        );
+        Ok(())
+    }
+
+    /// The staged devices under `<pluginDir>/<driver>/<sha256(handle)>/`, as
+    /// `(driver, volumeHandle, globalmount path)`. Staging state lives on disk
+    /// in `vol_data.json` (`MountDevice`), which is how upstream's own
+    /// reconstruction finds devices after a restart.
+    pub fn list_staged_devices(&self) -> Vec<(String, String, PathBuf)> {
+        let root = plugin_dir(self.host.get_volumes_base_path());
+        let mut out = Vec::new();
+        let Ok(drivers) = std::fs::read_dir(&root) else {
+            return out;
+        };
+        for driver in drivers.flatten() {
+            let Ok(vols) = std::fs::read_dir(driver.path()) else {
+                continue;
+            };
+            for vol in vols.flatten() {
+                let Ok(data) = load_volume_data(&vol.path()) else {
+                    continue;
+                };
+                out.push((
+                    data.get(vol_data_key::DRIVER_NAME)
+                        .cloned()
+                        .unwrap_or_default(),
+                    data.get(vol_data_key::VOL_HANDLE)
+                        .cloned()
+                        .unwrap_or_default(),
+                    vol.path().join(GLOBAL_MOUNT_IN_GLOBAL_PATH),
+                ));
+            }
+        }
+        out
+    }
+}
+
 /// `GetPluginDir(CSIPluginName)` (`pkg/kubelet/volume_host.go`):
 /// `<root>/plugins/kubernetes.io/csi`. The plugin name's `/` stays a path
 /// separator here, unlike the pod-volume directory where it is escaped to `~`.
