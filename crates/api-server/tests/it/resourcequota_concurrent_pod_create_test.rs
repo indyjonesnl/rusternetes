@@ -46,6 +46,23 @@ async fn concurrent_pod_creates_are_admitted_one_at_a_time_against_quota() {
         .await;
     assert!(status.is_success(), "quota create: {status} {body}");
 
+    // The quota controller's first sync: admission reads `status.hard`, so a
+    // quota that has not been synced constrains nothing (`controller.go:464`).
+    let (status, body) = api
+        .send(
+            "PUT",
+            "/api/v1/namespaces/default/resourcequotas/condition-test/status",
+            Some("application/json"),
+            Some(&json!({
+                "apiVersion": "v1",
+                "kind": "ResourceQuota",
+                "metadata": { "name": "condition-test", "namespace": "default" },
+                "status": { "hard": { "pods": "2" }, "used": { "pods": "0" } },
+            })),
+        )
+        .await;
+    assert!(status.is_success(), "quota status: {status} {body}");
+
     // Each create on its own task, so the admissions genuinely overlap.
     let api = std::sync::Arc::new(api);
     let handles: Vec<_> = (0..8)
