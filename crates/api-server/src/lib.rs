@@ -1,6 +1,7 @@
 pub mod admission;
 pub use rusternetes_admission_webhook as admission_webhook;
 pub mod bootstrap;
+pub mod legacy_token_tracking;
 pub use rusternetes_admission_webhook::cel_evaluators as cel;
 pub use rusternetes_middleware::cbor;
 pub mod conversion;
@@ -304,6 +305,9 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
     registry::apiextensions::customresourcedefinition::spawn_crd_informer_synced_hook(
         storage.clone(),
     );
+
+    // start-legacy-token-tracking-controller (server.go:319-322).
+    legacy_token_tracking::spawn_legacy_token_tracking_controller(storage.clone());
 
     // The `kubernetes` ServiceCIDR, owned by the apiserver-side
     // default-ServiceCIDR controller (upstream
