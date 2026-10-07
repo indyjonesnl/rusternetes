@@ -47,3 +47,25 @@ impl fmt::Display for UniqueVolumeName {
         f.write_str(&self.0)
     }
 }
+
+/// Port of the operation-outcome error types in
+/// `pkg/volume/util/types/types.go:85-162`. Upstream has one struct per kind
+/// and tests them with `errors.As`; here they are one enum a caller recovers
+/// with `anyhow::Error::downcast_ref`. The message is the whole `Error()`.
+#[derive(Debug, thiserror::Error)]
+pub enum VolumeOperationError {
+    /// `FailedPrecondition` (`types.go:89`): a CSI operation returned a
+    /// failed-precondition error.
+    #[error("{0}")]
+    FailedPrecondition(String),
+    /// `InfeasibleError` (`types.go:112`): a final error meaning the operation
+    /// is not possible in the current state with the given arguments.
+    #[error("{0}")]
+    Infeasible(String),
+    /// `OperationNotSupported` (`types.go:130`).
+    #[error("{0}")]
+    OperationNotSupported(String),
+    /// `TransientOperationFailure` (`types.go:149`): may fix itself on retry.
+    #[error("{0}")]
+    TransientOperationFailure(String),
+}

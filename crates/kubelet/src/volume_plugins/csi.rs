@@ -114,6 +114,14 @@ impl VolumePlugin for CsiPlugin {
         ))
     }
 
+    /// Rust spelling of the `volume.NodeExpandableVolumePlugin` assertion
+    /// `expander.go:32` makes of `csiPlugin`.
+    fn as_node_expandable_plugin(
+        &self,
+    ) -> Option<&dyn crate::volume_plugins::plugin::NodeExpandableVolumePlugin> {
+        Some(self)
+    }
+
     /// `RequiresRemount` (`csi_plugin.go:457-460`): upstream consults the
     /// CSIDriver lister and returns `false` when it is nil. We have no lister,
     /// which is exactly that nil case.
@@ -1060,6 +1068,8 @@ fn remove_mount_dir(mount_path: &Path) -> Result<()> {
     )?;
     Ok(())
 }
+
+mod expander;
 
 #[cfg(test)]
 mod tests;

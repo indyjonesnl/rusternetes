@@ -95,7 +95,7 @@ pub enum NodeExpandError {
     UncertainProgress(String),
     /// A final gRPC error, returned as-is (`csi_client.go:351`).
     #[error("{}", .0.message())]
-    Grpc(tonic::Status),
+    Grpc(Box<tonic::Status>),
     /// A non-gRPC error: argument validation, or the access-mode lookup.
     #[error("{0}")]
     Failed(String),
@@ -409,7 +409,7 @@ impl CsiDriverClient {
         match self.call(c.node_expand_volume(req)).await {
             Ok(resp) => Ok(Quantity::from_value(resp.capacity_bytes, Format::BinarySI)),
             Err(s) if !is_final_error(&s) => Err(NodeExpandError::UncertainProgress(s.to_string())),
-            Err(s) => Err(NodeExpandError::Grpc(s)),
+            Err(s) => Err(NodeExpandError::Grpc(Box::new(s))),
         }
     }
 

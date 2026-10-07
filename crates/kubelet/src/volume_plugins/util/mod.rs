@@ -5,6 +5,7 @@
 //! `pkg/volume/util/util.go` is ~900 lines of which this is a small slice.
 
 pub mod operation_executor;
+pub mod operation_generator;
 pub mod selinux;
 pub mod types;
 pub mod volumepathhandler;
