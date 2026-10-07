@@ -477,3 +477,295 @@ async fn pvc_storage_class_quota() {
     .await
     .is_err());
 }
+
+/// A VolumeAttributesClass-scoped quota, as in
+/// `TestAdmitBelowVolumeAttributesClassQuotaLimit`
+/// (plugin/pkg/admission/resourcequota/admission_test.go:989-1117).
+fn vac_quota(name: &str, class: &str) -> ResourceQuota {
+    let mut q = quota(
+        &[
+            ("persistentvolumeclaims", "3"),
+            ("requests.storage", "100Gi"),
+        ],
+        &[
+            ("persistentvolumeclaims", "1"),
+            ("requests.storage", "10Gi"),
+        ],
+    );
+    q.metadata.name = name.to_string();
+    q.spec.scope_selector = Some(
+        serde_json::from_value(json!({"matchExpressions": [
+            {"scopeName": "VolumeAttributesClass", "operator": "In", "values": [class]}
+        ]}))
+        .unwrap(),
+    );
+    q
+}
+
+fn vac_pvc(
+    rv: &str,
+    spec_class: Option<&str>,
+    current: Option<&str>,
+    target: Option<&str>,
+) -> Value {
+    let mut c = pvc(rv, "1Gi", None);
+    if let Some(s) = spec_class {
+        c["spec"]["volumeAttributesClassName"] = json!(s);
+    }
+    let mut status = json!({"phase": "Bound"});
+    if let Some(s) = current {
+        status["currentVolumeAttributesClassName"] = json!(s);
+    }
+    if let Some(s) = target {
+        status["modifyVolumeStatus"] =
+            json!({"targetVolumeAttributesClassName": s, "status": "Pending"});
+    }
+    c["status"] = status;
+    c
+}
+
+async fn stored_all(storage: &MemoryStorage, quotas: &[ResourceQuota]) {
+    for q in quotas {
+        storage
+            .create(
+                &build_key("resourcequotas", Some("test"), &q.metadata.name),
+                q,
+            )
+            .await
+            .unwrap();
+    }
+}
+
+async fn used_of(storage: &MemoryStorage, name: &str) -> HashMap<String, String> {
+    let q: ResourceQuota = storage
+        .get(&build_key("resourcequotas", Some("test"), name))
+        .await
+        .unwrap();
+    q.status.unwrap().used.unwrap()
+}
+
+/// `TestAdmitBelowVolumeAttributesClassQuotaLimit`: a claim with the gold
+/// class is charged to the gold quota only.
+#[tokio::test]
+async fn admit_below_vac_quota_limit() {
+    let storage = MemoryStorage::new();
+    stored_all(
+        &storage,
+        &[
+            vac_quota("quota-gold", "gold"),
+            vac_quota("quota-silver", "silver"),
+        ],
+    )
+    .await;
+    let new = vac_pvc("", Some("gold"), None, None);
+    evaluate(
+        &storage,
+        &*pvc_evaluator(),
+        &attrs(Operation::Create, &new, None),
+    )
+    .await
+    .unwrap();
+    let gold = used_of(&storage, "quota-gold").await;
+    assert_eq!(gold["persistentvolumeclaims"], "2");
+    assert_eq!(gold["requests.storage"], "11Gi");
+    let silver = used_of(&storage, "quota-silver").await;
+    assert_eq!(silver["persistentvolumeclaims"], "1");
+    assert_eq!(silver["requests.storage"], "10Gi");
+}
+
+/// `TestAdmitBelowVolumeAttributesClassQuotaLimitWhenPVCScopeUpdated`
+/// (admission_test.go:1126-1460): which quota is charged as a claim's
+/// referenced classes change, on the claim and on its status subresource.
+#[tokio::test]
+async fn admit_below_vac_quota_limit_when_pvc_scope_updated() {
+    // (spec class, current class, target class)
+    type C<'a> = (Option<&'a str>, Option<&'a str>, Option<&'a str>);
+    type Case<'a> = (&'a str, Option<&'static str>, C<'a>, C<'a>, Option<&'a str>);
+    let cases: Vec<Case> = vec![
+        (
+            "desired class nil to gold",
+            None,
+            (None, None, None),
+            (Some("gold"), None, None),
+            Some("quota-gold"),
+        ),
+        (
+            "target class to gold",
+            Some("status"),
+            (Some("gold"), None, None),
+            (Some("gold"), None, Some("gold")),
+            None,
+        ),
+        (
+            "current class nil to gold",
+            Some("status"),
+            (Some("gold"), None, Some("gold")),
+            (Some("gold"), Some("gold"), None),
+            None,
+        ),
+        (
+            "desired class gold to silver",
+            None,
+            (Some("gold"), Some("gold"), None),
+            (Some("silver"), Some("gold"), None),
+            Some("quota-silver"),
+        ),
+        (
+            "target class to silver",
+            Some("status"),
+            (Some("silver"), Some("gold"), None),
+            (Some("silver"), Some("gold"), Some("silver")),
+            None,
+        ),
+        (
+            "desired class silver to copper",
+            None,
+            (Some("silver"), Some("gold"), Some("silver")),
+            (Some("copper"), Some("gold"), Some("silver")),
+            Some("quota-copper"),
+        ),
+        (
+            "current class to silver on status gains a class",
+            Some("status"),
+            (Some("gold"), Some("gold"), None),
+            (Some("gold"), Some("silver"), Some("gold")),
+            Some("quota-silver"),
+        ),
+    ];
+    for (desc, subresource, old, new, charged) in cases {
+        let storage = MemoryStorage::new();
+        stored_all(
+            &storage,
+            &[
+                vac_quota("quota-gold", "gold"),
+                vac_quota("quota-silver", "silver"),
+                vac_quota("quota-copper", "copper"),
+            ],
+        )
+        .await;
+        let old = vac_pvc("1", old.0, old.1, old.2);
+        let new = vac_pvc("", new.0, new.1, new.2);
+        let mut a = attrs(Operation::Update, &new, Some(&old));
+        a.subresource = subresource;
+        evaluate(&storage, &*pvc_evaluator(), &a).await.unwrap();
+        for name in ["quota-gold", "quota-silver", "quota-copper"] {
+            let u = used_of(&storage, name).await;
+            if Some(name) == charged {
+                assert_eq!(u["persistentvolumeclaims"], "2", "{desc}: {name}");
+                assert_eq!(u["requests.storage"], "11Gi", "{desc}: {name}");
+            } else {
+                assert_eq!(u["persistentvolumeclaims"], "1", "{desc}: {name}");
+                assert_eq!(u["requests.storage"], "10Gi", "{desc}: {name}");
+            }
+        }
+    }
+}
+
+/// "allow update pvc status when a quota is exceeded" (admission_test.go:
+/// 1390-1450): a status update that adds a class is charged past the limit.
+#[tokio::test]
+async fn pvc_status_update_is_charged_past_the_limit() {
+    let storage = MemoryStorage::new();
+    let mut silver = vac_quota("quota-silver", "silver");
+    silver.status = Some(ResourceQuotaStatus {
+        hard: Some(list(&[
+            ("persistentvolumeclaims", "1"),
+            ("requests.storage", "10Gi"),
+        ])),
+        used: Some(list(&[
+            ("persistentvolumeclaims", "1"),
+            ("requests.storage", "10Gi"),
+        ])),
+    });
+    stored_all(&storage, &[silver]).await;
+    let old = vac_pvc("1", Some("gold"), Some("gold"), None);
+    let new = vac_pvc("", Some("gold"), Some("silver"), Some("gold"));
+    let mut a = attrs(Operation::Update, &new, Some(&old));
+    a.subresource = Some("status");
+    evaluate(&storage, &*pvc_evaluator(), &a).await.unwrap();
+    let u = used_of(&storage, "quota-silver").await;
+    assert_eq!(u["persistentvolumeclaims"], "2");
+    assert_eq!(u["requests.storage"], "11Gi");
+}
+
+/// `TestPersistentVolumeClaimEvaluatorHandles`
+/// (persistent_volume_claims_test.go:348-400) plus the `status` subresource
+/// arm (persistent_volume_claims.go:96-111).
+#[test]
+fn pvc_evaluator_handles() {
+    let ev = pvc_evaluator();
+    let obj = pvc("1", "1Gi", None);
+    let h = |op: Operation, sub: Option<&'static str>, o: &Value, old: Option<&Value>| {
+        let mut a = attrs(op, o, old);
+        a.subresource = sub;
+        ev.handles(&a)
+    };
+    assert!(h(Operation::Create, None, &obj, None));
+    assert!(h(Operation::Update, None, &obj, None));
+    assert!(!h(Operation::Delete, None, &obj, None));
+    assert!(!h(Operation::Connect, None, &obj, None));
+    assert!(!h(Operation::Create, Some("subresource"), &obj, None));
+    assert!(!h(Operation::Update, Some("subresource"), &obj, None));
+
+    // status: only when RequiresQuotaReplenish.
+    let unchanged = obj.clone();
+    assert!(!h(
+        Operation::Update,
+        Some("status"),
+        &unchanged,
+        Some(&obj)
+    ));
+    let moved = vac_pvc("1", None, Some("gold"), None);
+    assert!(h(Operation::Update, Some("status"), &moved, Some(&obj)));
+    let grown = {
+        let mut c = obj.clone();
+        c["status"] = json!({"allocatedResources": {"storage": "2Gi"}});
+        c
+    };
+    assert!(h(Operation::Update, Some("status"), &grown, Some(&obj)));
+    // an undecodable object is not handled
+    assert!(!h(
+        Operation::Update,
+        Some("status"),
+        &json!("x"),
+        Some(&obj)
+    ));
+}
+
+/// `TestPersistentVolumeClaimEvaluatorMatchingScopes` through the trait.
+#[test]
+fn pvc_evaluator_matching_scopes_and_uncovered() {
+    use rusternetes_common::resources::ScopedResourceSelectorRequirement as Sel;
+    let ev = pvc_evaluator();
+    let sel = |op: &str, v: &[&str]| Sel {
+        scope_name: "VolumeAttributesClass".into(),
+        operator: op.into(),
+        values: if v.is_empty() {
+            None
+        } else {
+            Some(v.iter().map(|s| s.to_string()).collect())
+        },
+    };
+    let c = vac_pvc("1", Some("class1"), None, None);
+    let got = ev
+        .matching_scopes(&c, &[sel("DoesNotExist", &[]), sel("Exists", &[])])
+        .unwrap();
+    assert_eq!(got, vec![sel("Exists", &[])]);
+    // `UncoveredQuotaScopes` (:141-161): limited scopes without a matched
+    // quota scope of the same name.
+    let uncovered = ev
+        .uncovered_quota_scopes(&[sel("Exists", &[])], &[])
+        .unwrap();
+    assert_eq!(uncovered, vec![sel("Exists", &[])]);
+    let covered = ev
+        .uncovered_quota_scopes(&[sel("Exists", &[])], &[sel("In", &["a"])])
+        .unwrap();
+    assert!(covered.is_empty());
+    // The evaluators with no scope function have no matching scopes.
+    let cm = configmap();
+    let cme = evaluator_for(&GroupResource::new("", "configmaps")).unwrap();
+    assert!(cme
+        .matching_scopes(&cm, &[sel("Exists", &[])])
+        .unwrap()
+        .is_empty());
+}

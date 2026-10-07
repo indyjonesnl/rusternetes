@@ -99,17 +99,21 @@ pub fn check_request(
     a: &Attributes<'_>,
     evaluator: &dyn Evaluator,
 ) -> std::result::Result<Vec<ResourceQuota>, QuotaError> {
-    if !evaluator.handles(&a.operation, a.subresource) {
+    if !evaluator.handles(a) {
         return Ok(quotas.to_vec());
     }
 
     // The quotas pertinent to this request (controller.go:505-536).
     let mut interesting: Vec<usize> = Vec::new();
     for (i, q) in quotas.iter().enumerate() {
-        if !evaluator.matches(q) {
+        if !evaluator.matches(q, a.object).map_err(QuotaError::Other)? {
             continue;
         }
         let restricted = evaluator.matching_resources(&status_hard_names(q));
+        // controller.go:470-472.
+        evaluator.constraints(&restricted, a.object).map_err(|e| {
+            QuotaError::Forbidden(format!("failed quota: {}: {e}", q.metadata.name))
+        })?;
         if !has_usage_stats(q, &restricted) {
             return Err(QuotaError::Forbidden(format!(
                 "status unknown for quota: {}, resources: {}",
@@ -157,10 +161,15 @@ pub fn check_request(
             if interesting.is_empty() {
                 delta_when_no_interesting = delta.clone();
             }
+            // A quota the old object did not match is charged the full
+            // input usage (controller.go:576-586).
             for &i in &interesting {
-                // The evaluators ported here match a quota regardless of the
-                // object, so the old object matches whenever the new one does.
-                delta_by_index.insert(i, delta.clone());
+                if evaluator
+                    .matches(&quotas[i], prev)
+                    .map_err(QuotaError::Other)?
+                {
+                    delta_by_index.insert(i, delta.clone());
+                }
             }
         } else if interesting.is_empty() {
             delta_when_no_interesting = input_usage.clone();
@@ -295,7 +304,7 @@ pub async fn evaluate<S: Storage>(
     evaluator: &dyn Evaluator,
     a: &Attributes<'_>,
 ) -> std::result::Result<(), QuotaError> {
-    if a.namespace.is_empty() || !evaluator.handles(&a.operation, a.subresource) {
+    if a.namespace.is_empty() || !evaluator.handles(a) {
         return Ok(());
     }
     let _guard = crate::admission::lock_namespace_quota(a.namespace).await;

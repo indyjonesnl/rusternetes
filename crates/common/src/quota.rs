@@ -748,7 +748,7 @@ pub fn pvc_referenced_volume_attributes_class_names(
     names
 }
 
-/// `pvcMatchesScopeFunc` (`persistent_volume_claims.go:108-127`) with
+/// `pvcMatchesScopeFunc` (`persistent_volume_claims.go:293-309`) with
 /// `pvcMatchesSelector` (`:311-328`). Only the VolumeAttributesClass scope
 /// matches a claim; `VolumeAttributesClass` is GA and on by default in 1.35.
 pub fn pvc_matches_scope(
@@ -774,7 +774,7 @@ pub fn pvc_matches_scope(
     Ok(false)
 }
 
-/// `pvcEvaluator.MatchingScopes` (`persistent_volume_claims.go:99-118`): the
+/// `pvcEvaluator.MatchingScopes` (`persistent_volume_claims.go:122-139`): the
 /// selectors the claim matches.
 pub fn pvc_matching_scopes(
     pvc: &PersistentVolumeClaim,
@@ -791,7 +791,7 @@ pub fn pvc_matching_scopes(
     Ok(matched)
 }
 
-/// `RequiresQuotaReplenish` (`persistent_volume_claims.go:79-91`), with
+/// `RequiresQuotaReplenish` (`persistent_volume_claims.go:276-290`), with
 /// `RecoverVolumeExpansionFailure` and `VolumeAttributesClass` both on.
 pub fn pvc_requires_quota_replenish(
     pvc: &PersistentVolumeClaim,
