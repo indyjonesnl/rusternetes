@@ -270,6 +270,7 @@ mod service_create_init_ip_fields_test;
 mod service_dual_stack_test;
 mod service_externalname_transition_test;
 mod service_handler_test;
+mod service_ipaddress_loopback_test;
 mod service_ipv6_primary_test;
 mod service_list_watch_default_on_read_test;
 mod service_node_port_allocation_test;
