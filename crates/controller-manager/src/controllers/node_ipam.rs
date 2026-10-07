@@ -19,8 +19,8 @@
 //! Get -> Update window (#1887).
 //!
 //! Gated by `--allocate-node-cidrs` (which upstream requires be paired with
-//! `--cluster-cidr`). [`CidrSet`] is IPv4+IPv6; the [`RangeAllocator`] still
-//! drives a single IPv4 set (multi-set dual-stack: #2409).
+//! `--cluster-cidr`). [`CidrSet`] is IPv4+IPv6; the [`RangeAllocator`]
+//! holds one [`CidrSet`] per `--cluster-cidr` entry (IPv4, IPv6 or both).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use futures::StreamExt;
-use ipnet::{IpNet, Ipv4Net};
+use ipnet::IpNet;
 use rusternetes_common::resources::{EventSource, EventType, Node, NodeSpec, ObjectReference};
 use rusternetes_common::Error;
 use rusternetes_storage::{
@@ -46,65 +46,204 @@ pub const CIDR_UPDATE_WORKERS: usize = 30;
 /// Upstream `cidrUpdateRetries` (`pkg/controller/nodeipam/ipam/cidr_allocator.go:65`).
 pub const CIDR_UPDATE_RETRIES: usize = 3;
 
+/// Default IPv4 node CIDR mask size (upstream `defaultNodeMaskCIDRIPv4`,
+/// `cmd/kube-controller-manager/app/core.go:79`).
+pub const DEFAULT_NODE_MASK_CIDR_IPV4: u8 = 24;
+/// Default IPv6 node CIDR mask size (upstream `defaultNodeMaskCIDRIPv6`,
+/// `cmd/kube-controller-manager/app/core.go:81`).
+pub const DEFAULT_NODE_MASK_CIDR_IPV6: u8 = 64;
+
+/// The `--node-cidr-mask-size`, `--node-cidr-mask-size-ipv4` and
+/// `--node-cidr-mask-size-ipv6` flags; `0` means "not set", as upstream's
+/// `NodeIPAMControllerConfiguration` (`cmd/kube-controller-manager/app/options/nodeipamcontroller.go:39-41`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NodeCidrMaskSizes {
+    pub general: u8,
+    pub ipv4: u8,
+    pub ipv6: u8,
+}
+
 /// Static configuration for pod-CIDR allocation, parsed from the
-/// `--cluster-cidr` / `--node-cidr-mask-size` flags.
+/// `--cluster-cidr` / `--node-cidr-mask-size*` flags.
 #[derive(Debug, Clone)]
 pub struct NodeIpamConfig {
-    /// The whole cluster pod network (e.g. `10.244.0.0/16`).
-    pub cluster_cidr: Ipv4Net,
-    /// Prefix length of each per-node subnet (e.g. `24`).
-    pub node_mask: u8,
-    /// Service CIDR to keep out of the allocatable range when it overlaps the
-    /// cluster CIDR (upstream `CIDRAllocatorParams.ServiceCIDR`).
-    pub service_cidr: Option<Ipv4Net>,
+    /// The cluster pod networks, one per IP family at most two (upstream
+    /// `CIDRAllocatorParams.ClusterCIDRs`); `cidr_sets[idx]` and
+    /// `node_masks[idx]` are mapped to it by index.
+    pub cluster_cidrs: Vec<IpNet>,
+    /// Prefix length of each per-node subnet, one per entry of
+    /// `cluster_cidrs` (upstream `NodeCIDRMaskSizes`).
+    pub node_masks: Vec<u8>,
+    /// Service CIDRs to keep out of the allocatable range when they overlap a
+    /// cluster CIDR (upstream `ServiceCIDR` then `SecondaryServiceCIDR`).
+    pub service_cidrs: Vec<IpNet>,
+}
+
+fn parse_cidr_list(flag: &str, list: &str) -> Result<Vec<IpNet>, String> {
+    list.trim()
+        .split(',')
+        .map(|c| {
+            c.trim()
+                .parse::<IpNet>()
+                .map(|n| n.trunc())
+                .map_err(|e| format!("invalid {flag} entry {c:?}: {e}"))
+        })
+        .collect()
+}
+
+/// Upstream `netutils.IsDualStackCIDRs`: both IP families present.
+fn is_dual_stack(cidrs: &[IpNet]) -> bool {
+    cidrs.iter().any(|c| matches!(c, IpNet::V4(_)))
+        && cidrs.iter().any(|c| matches!(c, IpNet::V6(_)))
 }
 
 impl NodeIpamConfig {
-    /// Parse `--cluster-cidr` and validate `--node-cidr-mask-size` against it.
-    /// The node mask must be no shorter than the cluster prefix and at most 32.
+    /// Single-stack convenience: `--cluster-cidr` plus `--node-cidr-mask-size`.
+    #[cfg(test)]
     pub fn new(cluster_cidr: &str, node_mask: u8) -> Result<Self, String> {
-        let cluster: Ipv4Net = cluster_cidr
-            .parse()
-            .map_err(|e| format!("invalid --cluster-cidr {cluster_cidr:?}: {e}"))?;
-        let cluster = cluster.trunc();
-        if node_mask > 32 {
-            return Err(format!("--node-cidr-mask-size {node_mask} exceeds 32"));
-        }
-        if node_mask < cluster.prefix_len() {
+        Self::from_flags(
+            cluster_cidr,
+            NodeCidrMaskSizes {
+                general: node_mask,
+                ..Default::default()
+            },
+            None,
+        )
+    }
+
+    /// Parse `--cluster-cidr` (comma-separated, one or two entries),
+    /// `--node-cidr-mask-size*` and the optional `--service-cluster-ip-range`
+    /// (one or two entries).
+    ///
+    /// Port of `validateCIDRs` / `setNodeCIDRMaskSizes` /
+    /// `newNodeIpamController` (`cmd/kube-controller-manager/app/core.go`,
+    /// `:967`, `:1009`, `:114-147`) and `NodeIPAMControllerOptions.Validate`
+    /// (`options/nodeipamcontroller.go:79`). Deviation: an unparsable service
+    /// CIDR is an error here (upstream only logs a warning).
+    pub fn from_flags(
+        cluster_cidr: &str,
+        masks: NodeCidrMaskSizes,
+        service_cidr: Option<&str>,
+    ) -> Result<Self, String> {
+        let cluster_cidrs = parse_cidr_list("--cluster-cidr", cluster_cidr)?;
+        // validateCIDRs
+        if cluster_cidrs.len() > 1 && !is_dual_stack(&cluster_cidrs) {
             return Err(format!(
-                "--node-cidr-mask-size {node_mask} is shorter than the cluster CIDR prefix /{}",
-                cluster.prefix_len()
+                "len of ClusterCIDRs=={} and they are not configured as dual stack (at least one from each IPFamily",
+                cluster_cidrs.len()
             ));
         }
+        if cluster_cidrs.len() > 2 {
+            return Err(format!(
+                "length of clusterCIDRs is:{} more than max allowed of 2",
+                cluster_cidrs.len()
+            ));
+        }
+
+        let service_cidrs = match service_cidr.map(str::trim).filter(|s| !s.is_empty()) {
+            None => Vec::new(),
+            Some(list) => {
+                let svc = parse_cidr_list("--service-cluster-ip-range", list)?;
+                if svc.len() > 2 {
+                    return Err(
+                        "--service-cluster-ip-range can not contain more than two entries".into(),
+                    );
+                }
+                if svc.len() == 2 && !is_dual_stack(&svc) {
+                    return Err(
+                        "serviceCIDR and secondaryServiceCIDR are not dualstack (from different IPfamiles)"
+                            .into(),
+                    );
+                }
+                svc
+            }
+        };
+
+        let node_masks = Self::node_cidr_mask_sizes(masks, &cluster_cidrs)?;
+        for (cidr, mask) in cluster_cidrs.iter().zip(&node_masks) {
+            let width = if matches!(cidr, IpNet::V4(_)) {
+                32
+            } else {
+                128
+            };
+            if *mask > width {
+                return Err(format!(
+                    "--node-cidr-mask-size {mask} exceeds {width} for {cidr}"
+                ));
+            }
+            if *mask < cidr.prefix_len() {
+                return Err(format!(
+                    "--node-cidr-mask-size {mask} is shorter than the cluster CIDR prefix /{} of {cidr}",
+                    cidr.prefix_len()
+                ));
+            }
+        }
         Ok(Self {
-            cluster_cidr: cluster,
-            node_mask,
-            service_cidr: None,
+            cluster_cidrs,
+            node_masks,
+            service_cidrs,
         })
     }
 
-    /// Like [`Self::new`], additionally parsing the optional
-    /// `--service-cluster-ip-range`.
-    pub fn from_flags(
-        cluster_cidr: &str,
-        node_mask: u8,
-        service_cidr: Option<&str>,
-    ) -> Result<Self, String> {
-        let mut cfg = Self::new(cluster_cidr, node_mask)?;
-        if let Some(svc) = service_cidr {
-            let svc: Ipv4Net = svc
-                .parse()
-                .map_err(|e| format!("invalid --service-cluster-ip-range {svc:?}: {e}"))?;
-            cfg = cfg.with_service_cidr(svc);
+    /// Upstream `setNodeCIDRMaskSizes` (`core.go:1009-1078`): one mask per
+    /// cluster CIDR, in cluster-CIDR order (`sortedSizes`).
+    fn node_cidr_mask_sizes(m: NodeCidrMaskSizes, clusters: &[IpNet]) -> Result<Vec<u8>, String> {
+        let sorted = |v4: u8, v6: u8| -> Vec<u8> {
+            clusters
+                .iter()
+                .map(|c| if matches!(c, IpNet::V6(_)) { v6 } else { v4 })
+                .collect()
+        };
+        let (mut v4, mut v6) = (DEFAULT_NODE_MASK_CIDR_IPV4, DEFAULT_NODE_MASK_CIDR_IPV6);
+        // case one: cluster is dualstack
+        if clusters.len() > 1 {
+            if m.general != 0 {
+                return Err(
+                    "usage of --node-cidr-mask-size is not allowed with dual-stack clusters".into(),
+                );
+            }
+            if m.ipv4 != 0 {
+                v4 = m.ipv4;
+            }
+            if m.ipv6 != 0 {
+                v6 = m.ipv6;
+            }
+            return Ok(sorted(v4, v6));
         }
-        Ok(cfg)
+        let single_stack_v6 = matches!(clusters[0], IpNet::V6(_));
+        if m.general != 0 {
+            if m.ipv4 != 0 || m.ipv6 != 0 {
+                return Err("usage of --node-cidr-mask-size-ipv4 and --node-cidr-mask-size-ipv6 is not allowed if --node-cidr-mask-size is set. For dual-stack clusters please unset it and use IPFamily specific flags".into());
+            }
+            return Ok(sorted(m.general, m.general));
+        }
+        if m.ipv4 != 0 {
+            if single_stack_v6 {
+                return Err(
+                    "usage of --node-cidr-mask-size-ipv4 is not allowed for a single-stack IPv6 cluster"
+                        .into(),
+                );
+            }
+            v4 = m.ipv4;
+        }
+        if m.ipv6 != 0 {
+            if !single_stack_v6 {
+                return Err(
+                    "usage of --node-cidr-mask-size-ipv6 is not allowed for a single-stack IPv4 cluster"
+                        .into(),
+                );
+            }
+            v6 = m.ipv6;
+        }
+        Ok(sorted(v4, v6))
     }
 
     /// Keep `service_cidr` out of the allocatable range
     /// (upstream `rangeAllocator.filterOutServiceRange`).
+    #[cfg(test)]
     #[must_use]
-    pub fn with_service_cidr(mut self, service_cidr: Ipv4Net) -> Self {
-        self.service_cidr = Some(service_cidr.trunc());
+    pub fn with_service_cidr(mut self, service_cidr: IpNet) -> Self {
+        self.service_cidrs.push(service_cidr.trunc());
         self
     }
 }
@@ -444,7 +583,8 @@ fn node_pod_cidrs(node: &Node) -> Vec<String> {
 /// Allocates and tracks per-node pod CIDRs. Port of upstream `rangeAllocator`.
 pub struct RangeAllocator<S: Storage> {
     storage: Arc<S>,
-    cidr_set: CidrSet,
+    /// One set per cluster CIDR, mapped by index (upstream `cidrSets`).
+    cidr_sets: Vec<CidrSet>,
     recorder: EventRecorder<S>,
     /// Where incoming work is placed to de-dup and to allow rate limited
     /// requeues on errors (upstream `queue`).
@@ -457,16 +597,22 @@ impl<S: Storage + 'static> RangeAllocator<S> {
     /// (garbage in `podCIDRs`, or a CIDR outside the cluster range) is fatal,
     /// as upstream ("This error will keep crashing controller-manager").
     pub fn new(storage: Arc<S>, cfg: NodeIpamConfig, nodes: &[Node]) -> Result<Self, String> {
-        let cidr_set =
-            CidrSet::new(IpNet::V4(cfg.cluster_cidr), cfg.node_mask).map_err(|e| e.to_string())?;
+        // create a cidrSet for each cidr we operate on
+        let cidr_sets = cfg
+            .cluster_cidrs
+            .iter()
+            .zip(&cfg.node_masks)
+            .map(|(cidr, mask)| CidrSet::new(*cidr, *mask).map_err(|e| e.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
         let ra = Self {
             recorder: EventRecorder::new(Arc::clone(&storage)),
             storage,
-            cidr_set,
+            cidr_sets,
             queue: WorkQueue::new(),
         };
-        if let Some(svc) = cfg.service_cidr {
-            ra.filter_out_service_range(svc);
+        // ServiceCIDR, then SecondaryServiceCIDR.
+        for svc in &cfg.service_cidrs {
+            ra.filter_out_service_range(*svc);
         }
         for node in nodes {
             if node_pod_cidrs(node).is_empty() {
@@ -480,18 +626,20 @@ impl<S: Storage + 'static> RangeAllocator<S> {
 
     /// Marks every CIDR of the service range that overlaps the cluster CIDR as
     /// used so it is never assignable (upstream `filterOutServiceRange`).
-    fn filter_out_service_range(&self, service_cidr: Ipv4Net) {
-        let cluster = self.cidr_set.cluster;
-        let service_cidr = IpNet::V4(service_cidr);
-        let overlaps =
-            cluster.contains(&service_cidr.network()) || service_cidr.contains(&cluster.network());
-        if !overlaps {
-            return;
-        }
-        if let Err(e) = self.cidr_set.occupy(service_cidr) {
-            error!(
-                "Error filtering out service cidr {service_cidr} out cluster cidr {cluster}: {e}"
-            );
+    fn filter_out_service_range(&self, service_cidr: IpNet) {
+        for (idx, set) in self.cidr_sets.iter().enumerate() {
+            let cluster = set.cluster;
+            // if they don't overlap then ignore the filtering
+            let overlaps = cluster.contains(&service_cidr.network())
+                || service_cidr.contains(&cluster.network());
+            if !overlaps {
+                continue;
+            }
+            if let Err(e) = set.occupy(service_cidr) {
+                error!(
+                    "Error filtering out service cidr {service_cidr} out cluster cidr {cluster} (index {idx}): {e}"
+                );
+            }
         }
     }
 
@@ -503,7 +651,7 @@ impl<S: Storage + 'static> RangeAllocator<S> {
             })?;
             // Upstream: an index beyond the configured cluster CIDRs cannot be
             // locked (cluster went from dual-stack to single-stack).
-            if idx >= 1 {
+            if idx >= self.cidr_sets.len() {
                 anyhow::bail!(
                     "node:{} has an allocated cidr: {} at index:{} that does not exist in cluster cidrs configuration",
                     node.metadata.name,
@@ -511,7 +659,7 @@ impl<S: Storage + 'static> RangeAllocator<S> {
                     idx
                 );
             }
-            self.cidr_set.occupy(pod_cidr).map_err(|e| {
+            self.cidr_sets[idx].occupy(pod_cidr).map_err(|e| {
                 anyhow::anyhow!(
                     "failed to mark cidr[{pod_cidr}] at idx [{idx}] as occupied for node: {}: {e}",
                     node.metadata.name
@@ -527,16 +675,23 @@ impl<S: Storage + 'static> RangeAllocator<S> {
         if !node_pod_cidrs(node).is_empty() {
             return self.occupy_cidrs(node);
         }
-        let allocated = match self.cidr_set.allocate_next() {
-            Ok(c) => c,
-            Err(e) => {
-                self.record_node_status_change(node, "CIDRNotAvailable")
-                    .await;
-                anyhow::bail!("failed to allocate cidr from cluster cidr at idx:0: {e}");
+        let mut allocated: Vec<IpNet> = Vec::with_capacity(self.cidr_sets.len());
+        for (idx, set) in self.cidr_sets.iter().enumerate() {
+            match set.allocate_next() {
+                Ok(c) => allocated.push(c),
+                Err(e) => {
+                    // Deviation from upstream, which leaks the CIDRs already
+                    // taken from earlier sets (and again on every requeue):
+                    // nothing was written, so handing them back is safe.
+                    self.release_allocated(&allocated);
+                    self.record_node_status_change(node, "CIDRNotAvailable")
+                        .await;
+                    anyhow::bail!("failed to allocate cidr from cluster cidr at idx:{idx}: {e}");
+                }
             }
-        };
+        }
         debug!(
-            "Putting node {} with CIDR {} into the work queue",
+            "Putting node {} with CIDRs {:?} into the work queue",
             node.metadata.name, allocated
         );
         self.update_cidrs_allocation(&node.metadata.name, allocated)
@@ -553,7 +708,7 @@ impl<S: Storage + 'static> RangeAllocator<S> {
                     node.metadata.name
                 )
             })?;
-            if idx >= 1 {
+            if idx >= self.cidr_sets.len() {
                 anyhow::bail!(
                     "node:{} has an allocated cidr: {} at index:{} that does not exist in cluster cidrs configuration",
                     node.metadata.name,
@@ -562,24 +717,27 @@ impl<S: Storage + 'static> RangeAllocator<S> {
                 );
             }
             debug!("Release CIDR {} for node {}", cidr, node.metadata.name);
-            self.cidr_set
+            self.cidr_sets[idx]
                 .release(pod_cidr)
                 .map_err(|e| anyhow::anyhow!("error when releasing CIDR {cidr}: {e}"))?;
         }
         Ok(())
     }
 
-    fn release_allocated(&self, allocated: IpNet) {
-        if let Err(e) = self.cidr_set.release(allocated) {
-            error!("Error releasing allocated CIDR {allocated}: {e}");
+    /// Releases `allocated[idx]` back to `cidr_sets[idx]`.
+    fn release_allocated(&self, allocated: &[IpNet]) {
+        for (idx, cidr) in allocated.iter().enumerate() {
+            if let Err(e) = self.cidr_sets[idx].release(*cidr) {
+                error!("Error releasing allocated CIDR {cidr} (index {idx}): {e}");
+            }
         }
     }
 
     /// Assigns `allocated` to the node and writes it (upstream
     /// `updateCIDRsAllocation`).
-    async fn update_cidrs_allocation(&self, node_name: &str, allocated: IpNet) -> Result<()> {
+    async fn update_cidrs_allocation(&self, node_name: &str, allocated: Vec<IpNet>) -> Result<()> {
         let key = build_key("nodes", None, node_name);
-        let cidrs = vec![allocated.to_string()];
+        let cidrs: Vec<String> = allocated.iter().map(IpNet::to_string).collect();
         let node: Node = match self.storage.get(&key).await {
             Ok(n) => n,
             Err(e) => {
@@ -588,7 +746,7 @@ impl<S: Storage + 'static> RangeAllocator<S> {
                 error!(
                     "Failed while getting node {node_name} for updating Node.Spec.PodCIDRs: {e}"
                 );
-                self.release_allocated(allocated);
+                self.release_allocated(&allocated);
                 if matches!(e, Error::NotFound(_)) {
                     return Ok(());
                 }
@@ -600,15 +758,15 @@ impl<S: Storage + 'static> RangeAllocator<S> {
         // The CIDR list matches the proposed one: we possibly updated this node
         // and just failed to ack the success.
         if existing == cidrs {
-            debug!("Node {node_name} already has allocated CIDR {allocated}. It matches the proposed one");
+            debug!("Node {node_name} already has allocated CIDRs {allocated:?}. It matches the proposed one");
             return Ok(());
         }
         // The node has CIDRs: release the reserved one.
         if !existing.is_empty() {
             error!(
-                "Node {node_name} already has a CIDR allocated ({existing:?}). Releasing the new one {allocated}"
+                "Node {node_name} already has a CIDR allocated ({existing:?}). Releasing the new one {allocated:?}"
             );
-            self.release_allocated(allocated);
+            self.release_allocated(&allocated);
             return Ok(());
         }
 
@@ -636,7 +794,7 @@ impl<S: Storage + 'static> RangeAllocator<S> {
         // returns all falsely allocated CIDRs to the pool.
         if !matches!(err, Error::Network(_)) {
             error!("CIDR assignment for node {node_name} failed. Releasing allocated CIDR");
-            self.release_allocated(allocated);
+            self.release_allocated(&allocated);
         }
         Err(err.into())
     }
@@ -845,10 +1003,6 @@ mod tests {
     use rusternetes_storage::memory::MemoryStorage;
     use rusternetes_storage::{build_key, build_prefix};
     use std::collections::HashSet;
-
-    fn net(s: &str) -> Ipv4Net {
-        s.parse().unwrap()
-    }
 
     fn ipn(s: &str) -> IpNet {
         s.parse::<IpNet>().unwrap().trunc()
@@ -1191,7 +1345,10 @@ mod tests {
             node_with_cidr("b", None),
         ];
         let ra = allocator(&storage, "10.244.0.0/16", 24, &nodes).unwrap();
-        assert_eq!(ra.cidr_set.allocate_next().unwrap(), ipn("10.244.1.0/24"));
+        assert_eq!(
+            ra.cidr_sets[0].allocate_next().unwrap(),
+            ipn("10.244.1.0/24")
+        );
     }
 
     #[tokio::test]
@@ -1252,7 +1409,7 @@ mod tests {
         put(&storage, &n).await;
         let ra = allocator(&storage, "127.123.234.0/28", 30, &[]).unwrap();
         for _ in 0..4 {
-            ra.cidr_set.allocate_next().unwrap();
+            ra.cidr_sets[0].allocate_next().unwrap();
         }
         assert!(ra.allocate_or_occupy_cidr(&n).await.is_err());
         assert_eq!(cidr_of(&storage, "node0").await, None);
@@ -1270,7 +1427,10 @@ mod tests {
         let n = node_with_cidr("node0", Some("10.10.0.0/24"));
         let ra = allocator(&storage, "10.10.0.0/16", 24, std::slice::from_ref(&n)).unwrap();
         ra.release_cidr(&n).unwrap();
-        assert_eq!(ra.cidr_set.allocate_next().unwrap(), ipn("10.10.0.0/24"));
+        assert_eq!(
+            ra.cidr_sets[0].allocate_next().unwrap(),
+            ipn("10.10.0.0/24")
+        );
         // A node without CIDRs releases nothing.
         ra.release_cidr(&node_with_cidr("x", None)).unwrap();
     }
@@ -1283,7 +1443,10 @@ mod tests {
         put(&storage, &n).await;
         let ra = allocator(&storage, "10.10.0.0/16", 24, std::slice::from_ref(&n)).unwrap();
         ra.sync_node("nodes/node0").await.unwrap();
-        assert_eq!(ra.cidr_set.allocate_next().unwrap(), ipn("10.10.1.0/24"));
+        assert_eq!(
+            ra.cidr_sets[0].allocate_next().unwrap(),
+            ipn("10.10.1.0/24")
+        );
 
         n.metadata.deletion_timestamp = Some(chrono::Utc::now());
         storage
@@ -1291,7 +1454,10 @@ mod tests {
             .await
             .unwrap();
         ra.sync_node("nodes/node0").await.unwrap();
-        assert_eq!(ra.cidr_set.allocate_next().unwrap(), ipn("10.10.2.0/24"));
+        assert_eq!(
+            ra.cidr_sets[0].allocate_next().unwrap(),
+            ipn("10.10.2.0/24")
+        );
         // A key for a node that no longer exists is a no-op, not an error.
         ra.sync_node("nodes/gone").await.unwrap();
     }
@@ -1304,7 +1470,7 @@ mod tests {
         ra.allocate_or_occupy_cidr(&node_with_cidr("ghost", None))
             .await
             .unwrap();
-        assert_eq!(ra.cidr_set.allocated(), 0);
+        assert_eq!(ra.cidr_sets[0].allocated(), 0);
     }
 
     // updateCIDRsAllocation: "Node already has a CIDR allocated. Releasing the new one".
@@ -1322,7 +1488,7 @@ mod tests {
             cidr_of(&storage, "node0").await.as_deref(),
             Some("10.10.7.0/24")
         );
-        assert_eq!(ra.cidr_set.allocated(), 0);
+        assert_eq!(ra.cidr_sets[0].allocated(), 0);
     }
 
     // filterOutServiceRange
@@ -1331,9 +1497,9 @@ mod tests {
         let storage = Arc::new(MemoryStorage::new());
         let cfg = NodeIpamConfig::new("10.0.0.0/16", 24)
             .unwrap()
-            .with_service_cidr(net("10.0.0.0/23"));
+            .with_service_cidr(ipn("10.0.0.0/23"));
         let ra = RangeAllocator::new(storage, cfg, &[]).unwrap();
-        assert_eq!(ra.cidr_set.allocate_next().unwrap(), ipn("10.0.2.0/24"));
+        assert_eq!(ra.cidr_sets[0].allocate_next().unwrap(), ipn("10.0.2.0/24"));
     }
 
     // The issue #1887 race: assignment must not serialise behind one worker.
@@ -1375,15 +1541,14 @@ mod tests {
 
     #[test]
     fn from_flags_parses_service_range() {
-        let cfg = NodeIpamConfig::from_flags("10.0.0.0/16", 24, Some("10.0.0.0/23")).unwrap();
-        assert_eq!(cfg.service_cidr, Some(net("10.0.0.0/23")));
-        assert!(NodeIpamConfig::from_flags("10.0.0.0/16", 24, Some("nope")).is_err());
-        assert_eq!(
-            NodeIpamConfig::from_flags("10.0.0.0/16", 24, None)
-                .unwrap()
-                .service_cidr,
-            None
-        );
+        let m = masks(24, 0, 0);
+        let cfg = NodeIpamConfig::from_flags("10.0.0.0/16", m, Some("10.0.0.0/23")).unwrap();
+        assert_eq!(cfg.service_cidrs, [ipn("10.0.0.0/23")]);
+        assert!(NodeIpamConfig::from_flags("10.0.0.0/16", m, Some("nope")).is_err());
+        assert!(NodeIpamConfig::from_flags("10.0.0.0/16", m, None)
+            .unwrap()
+            .service_cidrs
+            .is_empty());
     }
 
     #[test]
@@ -1435,5 +1600,321 @@ mod tests {
             cidr_of(&storage, "third").await.as_deref(),
             Some("10.244.0.0/24")
         );
+    }
+
+    // ---- dual-stack: multi-set RangeAllocator (#2409) ----
+
+    fn node_with_cidrs(name: &str, cidrs: &[&str]) -> Node {
+        let mut n = Node::new(name);
+        if !cidrs.is_empty() {
+            n.spec = Some(rusternetes_common::resources::NodeSpec {
+                pod_cidr: Some(cidrs[0].to_string()),
+                pod_cidrs: Some(cidrs.iter().map(|c| c.to_string()).collect()),
+                provider_id: None,
+                unschedulable: None,
+                taints: None,
+            });
+        }
+        n
+    }
+
+    async fn cidrs_of(storage: &Arc<MemoryStorage>, name: &str) -> Vec<String> {
+        let n: Node = storage.get(&build_key("nodes", None, name)).await.unwrap();
+        n.spec.and_then(|s| s.pod_cidrs).unwrap_or_default()
+    }
+
+    /// Builds a config from explicit per-cluster-CIDR masks, as
+    /// `CIDRAllocatorParams{ClusterCIDRs, NodeCIDRMaskSizes}`.
+    fn dual_cfg(clusters: &[&str], masks: &[u8]) -> NodeIpamConfig {
+        NodeIpamConfig {
+            cluster_cidrs: clusters.iter().map(|c| ipn(c)).collect(),
+            node_masks: masks.to_vec(),
+            service_cidrs: Vec::new(),
+        }
+    }
+
+    // TestOccupyPreExistingCIDR (range_allocator_test.go:45-290), every row.
+    #[test]
+    fn occupy_pre_existing_cidr_rows() {
+        // (description, existing podCIDRs, cluster cidrs, masks, ctrlCreateFail)
+        type Row<'a> = (&'a str, &'a [&'a str], &'a [&'a str], &'a [u8], bool);
+        let rows: &[Row<'_>] = &[
+            (
+                "single stack no node allocation",
+                &[],
+                &["10.10.0.0/16"],
+                &[24],
+                false,
+            ),
+            (
+                "dual stack no node allocation",
+                &[],
+                &["10.10.0.0/16", "ace:cab:deca::/8"],
+                &[24, 24],
+                false,
+            ),
+            (
+                "single stack correct node allocation",
+                &["10.10.0.1/24"],
+                &["10.10.0.0/16"],
+                &[24],
+                false,
+            ),
+            (
+                "dual stack both allocated correctly",
+                &["10.10.0.1/24", "a00::/86"],
+                &["10.10.0.0/16", "ace:cab:deca::/8"],
+                &[24, 24],
+                false,
+            ),
+            (
+                "fail, single stack incorrect node allocation",
+                &["172.10.0.1/24"],
+                &["10.10.0.0/16"],
+                &[24],
+                true,
+            ),
+            (
+                "fail, dualstack node allocating from non existing cidr",
+                &["10.10.0.1/24", "a00::/86"],
+                &["10.10.0.0/16"],
+                &[24],
+                true,
+            ),
+            (
+                "fail, dualstack node allocating bad v4",
+                &["172.10.0.1/24", "a00::/86"],
+                &["10.10.0.0/16", "ace:cab:deca::/8"],
+                &[24, 24],
+                true,
+            ),
+            (
+                "fail, dualstack node allocating bad v6",
+                &["10.10.0.1/24", "cdd::/86"],
+                &["10.10.0.0/16", "ace:cab:deca::/8"],
+                &[24, 24],
+                true,
+            ),
+        ];
+        for (desc, pod_cidrs, clusters, masks, fail) in rows {
+            let storage = Arc::new(MemoryStorage::new());
+            let node = node_with_cidrs("node0", pod_cidrs);
+            let r = RangeAllocator::new(storage, dual_cfg(clusters, masks), &[node]);
+            assert_eq!(r.is_err(), *fail, "{desc}: {:?}", r.err());
+        }
+    }
+
+    // TestAllocateOrOccupyCIDRSuccess "Dualstack CIDRs v4,v6" / "v6,v4": one
+    // podCIDR per cluster CIDR, in cluster-CIDR order.
+    #[tokio::test]
+    async fn dual_stack_allocates_one_cidr_per_family_in_config_order() {
+        for (clusters, masks, want) in [
+            (
+                ["127.123.234.0/8", "ace:cab:deca::/84"],
+                [24u8, 98],
+                ["127.0.0.0/24", "ace:cab:deca::/98"],
+            ),
+            (
+                ["ace:cab:deca::/84", "127.123.234.0/8"],
+                [98u8, 24],
+                ["ace:cab:deca::/98", "127.0.0.0/24"],
+            ),
+        ] {
+            let storage = Arc::new(MemoryStorage::new());
+            put(&storage, &node_with_cidrs("node0", &[])).await;
+            let ra =
+                RangeAllocator::new(storage.clone(), dual_cfg(&clusters, &masks), &[]).unwrap();
+            ra.allocate_or_occupy_cidr(&node_with_cidrs("node0", &[]))
+                .await
+                .unwrap();
+            assert_eq!(cidrs_of(&storage, "node0").await, want);
+            // spec.podCIDR is the primary (first) one.
+            assert_eq!(cidr_of(&storage, "node0").await.as_deref(), Some(want[0]));
+        }
+    }
+
+    // `filterOutServiceRange` loops over every cluster CIDR; a service range
+    // only touches the set of the family it overlaps, and the secondary
+    // service CIDR is filtered the same way (`SecondaryServiceCIDR`).
+    #[tokio::test]
+    async fn dual_stack_service_cidrs_filter_only_overlapping_family() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut cfg = dual_cfg(&["10.0.0.0/16", "fd00::/48"], &[24, 64]);
+        cfg.service_cidrs = vec![ipn("10.0.0.0/23"), ipn("fd00::/62")];
+        let ra = RangeAllocator::new(storage, cfg, &[]).unwrap();
+        assert_eq!(ra.cidr_sets.len(), 2);
+        assert_eq!(ra.cidr_sets[0].allocate_next().unwrap(), ipn("10.0.2.0/24"));
+        assert_eq!(
+            ra.cidr_sets[1].allocate_next().unwrap(),
+            ipn("fd00:0:0:4::/64")
+        );
+    }
+
+    // TestReleaseCIDRSuccess dual-stack: both CIDRs go back to their own sets.
+    #[tokio::test]
+    async fn dual_stack_release_returns_each_cidr_to_its_set() {
+        let storage = Arc::new(MemoryStorage::new());
+        let n = node_with_cidrs("node0", &["10.10.0.0/24", "fd00::/64"]);
+        let ra = RangeAllocator::new(
+            storage,
+            dual_cfg(&["10.10.0.0/16", "fd00::/48"], &[24, 64]),
+            std::slice::from_ref(&n),
+        )
+        .unwrap();
+        assert_eq!(ra.cidr_sets[0].allocated(), 1);
+        assert_eq!(ra.cidr_sets[1].allocated(), 1);
+        ra.release_cidr(&n).unwrap();
+        assert_eq!(ra.cidr_sets[0].allocated(), 0);
+        assert_eq!(ra.cidr_sets[1].allocated(), 0);
+        // `idx >= len(r.cidrSets)`: a CIDR index with no set cannot be released.
+        let single = RangeAllocator::new(
+            Arc::new(MemoryStorage::new()),
+            dual_cfg(&["10.10.0.0/16"], &[24]),
+            &[],
+        )
+        .unwrap();
+        assert!(single.release_cidr(&n).is_err());
+    }
+
+    // updateCIDRsAllocation "node has cidrs, release the reserved": every
+    // allocated CIDR is released, one per set.
+    #[tokio::test]
+    async fn dual_stack_losing_race_releases_every_new_cidr() {
+        let storage = Arc::new(MemoryStorage::new());
+        put(
+            &storage,
+            &node_with_cidrs("node0", &["10.10.7.0/24", "fd00:0:0:7::/64"]),
+        )
+        .await;
+        let ra = RangeAllocator::new(
+            storage.clone(),
+            dual_cfg(&["10.10.0.0/16", "fd00::/48"], &[24, 64]),
+            &[],
+        )
+        .unwrap();
+        ra.allocate_or_occupy_cidr(&node_with_cidrs("node0", &[]))
+            .await
+            .unwrap();
+        assert_eq!(ra.cidr_sets[0].allocated(), 0);
+        assert_eq!(ra.cidr_sets[1].allocated(), 0);
+        assert_eq!(
+            cidrs_of(&storage, "node0").await,
+            ["10.10.7.0/24", "fd00:0:0:7::/64"]
+        );
+    }
+
+    // Deviation from upstream (which leaks the set-0 CIDR when set 1 is
+    // exhausted, then again on every rate-limited retry): nothing was
+    // written, so the earlier allocations are handed back.
+    #[tokio::test]
+    async fn dual_stack_partial_allocation_failure_releases_earlier_sets() {
+        let storage = Arc::new(MemoryStorage::new());
+        let n = node_with_cidrs("node0", &[]);
+        put(&storage, &n).await;
+        // v6 /126 with /127 nodes -> 2 CIDRs; exhaust them.
+        let ra = RangeAllocator::new(
+            storage.clone(),
+            dual_cfg(&["10.10.0.0/16", "fd00::/126"], &[24, 127]),
+            &[],
+        )
+        .unwrap();
+        ra.cidr_sets[1].allocate_next().unwrap();
+        ra.cidr_sets[1].allocate_next().unwrap();
+        assert!(ra.allocate_or_occupy_cidr(&n).await.is_err());
+        assert_eq!(ra.cidr_sets[0].allocated(), 0);
+        assert!(cidrs_of(&storage, "node0").await.is_empty());
+        let events: Vec<Event> = storage.list(&build_prefix("events", None)).await.unwrap();
+        assert!(events.iter().any(|e| e.reason == "CIDRNotAvailable"));
+    }
+
+    // ---- --cluster-cidr list / --node-cidr-mask-size-ipv4/-ipv6 ----
+    // cmd/kube-controller-manager/app/core.go validateCIDRs + setNodeCIDRMaskSizes
+
+    fn masks(general: u8, ipv4: u8, ipv6: u8) -> NodeCidrMaskSizes {
+        NodeCidrMaskSizes {
+            general,
+            ipv4,
+            ipv6,
+        }
+    }
+
+    #[test]
+    fn from_flags_dual_stack_uses_per_family_masks_and_defaults() {
+        let cfg =
+            NodeIpamConfig::from_flags("10.244.0.0/16,fd00::/48", masks(0, 0, 0), None).unwrap();
+        assert_eq!(cfg.cluster_cidrs, [ipn("10.244.0.0/16"), ipn("fd00::/48")]);
+        // defaultNodeMaskCIDRIPv4 = 24, defaultNodeMaskCIDRIPv6 = 64
+        assert_eq!(cfg.node_masks, [24, 64]);
+
+        // sortedSizes follows cluster-CIDR order, not v4-first.
+        let cfg =
+            NodeIpamConfig::from_flags("fd00::/48, 10.244.0.0/16", masks(0, 26, 56), None).unwrap();
+        assert_eq!(cfg.cluster_cidrs, [ipn("fd00::/48"), ipn("10.244.0.0/16")]);
+        assert_eq!(cfg.node_masks, [56, 26]);
+    }
+
+    #[test]
+    fn from_flags_single_stack_mask_rules() {
+        // Single-stack IPv6 defaults to /64.
+        let cfg = NodeIpamConfig::from_flags("fd00::/48", masks(0, 0, 0), None).unwrap();
+        assert_eq!(cfg.node_masks, [64]);
+        // --node-cidr-mask-size is the reference for a single family.
+        let cfg = NodeIpamConfig::from_flags("fd00::/48", masks(60, 0, 0), None).unwrap();
+        assert_eq!(cfg.node_masks, [60]);
+        // Family flags are accepted only for their own family.
+        let cfg = NodeIpamConfig::from_flags("10.0.0.0/16", masks(0, 26, 0), None).unwrap();
+        assert_eq!(cfg.node_masks, [26]);
+        assert!(NodeIpamConfig::from_flags("10.0.0.0/16", masks(0, 0, 64), None).is_err());
+        assert!(NodeIpamConfig::from_flags("fd00::/48", masks(0, 24, 0), None).is_err());
+        // Mixing the general flag with a family flag is an error.
+        assert!(NodeIpamConfig::from_flags("10.0.0.0/16", masks(24, 24, 0), None).is_err());
+    }
+
+    #[test]
+    fn from_flags_dual_stack_rejects_general_mask_and_bad_lists() {
+        let e =
+            NodeIpamConfig::from_flags("10.0.0.0/16,fd00::/48", masks(24, 0, 0), None).unwrap_err();
+        assert!(
+            e.contains("--node-cidr-mask-size is not allowed with dual-stack"),
+            "{e}"
+        );
+        // two cidrs of the same family
+        let e = NodeIpamConfig::from_flags("10.0.0.0/16,10.1.0.0/16", masks(0, 0, 0), None)
+            .unwrap_err();
+        assert!(e.contains("not configured as dual stack"), "{e}");
+        // more than two
+        let e =
+            NodeIpamConfig::from_flags("10.0.0.0/16,fd00::/48,10.1.0.0/16", masks(0, 0, 0), None)
+                .unwrap_err();
+        assert!(e.contains("more than max allowed of 2"), "{e}");
+        assert!(NodeIpamConfig::from_flags("10.0.0.0/16,nope", masks(0, 0, 0), None).is_err());
+        // A mask that does not fit its own cluster CIDR is still rejected.
+        assert!(NodeIpamConfig::from_flags("10.0.0.0/16,fd00::/48", masks(0, 8, 0), None).is_err());
+    }
+
+    #[test]
+    fn from_flags_service_cidr_list() {
+        let cfg = NodeIpamConfig::from_flags(
+            "10.0.0.0/16,fd00::/48",
+            masks(0, 0, 0),
+            Some("10.0.0.0/23,fd00::/62"),
+        )
+        .unwrap();
+        assert_eq!(cfg.service_cidrs, [ipn("10.0.0.0/23"), ipn("fd00::/62")]);
+        // `--service-cluster-ip-range can not contain more than two entries`
+        assert!(NodeIpamConfig::from_flags(
+            "10.0.0.0/16",
+            masks(0, 0, 0),
+            Some("10.0.0.0/23,fd00::/62,10.9.0.0/24")
+        )
+        .is_err());
+        // serviceCIDR and secondaryServiceCIDR must be from different families.
+        let e = NodeIpamConfig::from_flags(
+            "10.0.0.0/16",
+            masks(0, 0, 0),
+            Some("10.0.0.0/23,10.9.0.0/24"),
+        )
+        .unwrap_err();
+        assert!(e.contains("not dualstack"), "{e}");
     }
 }
