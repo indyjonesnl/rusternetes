@@ -2550,4 +2550,130 @@ plugins:
             .unwrap();
         assert_eq!(pull_secret_names(&pod), vec!["regcred"]);
     }
+
+    // --- #2493: versioned policy checks + namespace lookup failure ---
+
+    async fn put_ns_labels<S: Storage>(storage: &Arc<S>, name: &str, labels: &[(&str, &str)]) {
+        let labels: std::collections::BTreeMap<String, String> = labels
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let ns: rusternetes_common::resources::Namespace =
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "v1", "kind": "Namespace",
+                "metadata": { "name": name, "labels": labels },
+            }))
+            .unwrap();
+        let key = rusternetes_storage::build_key("namespaces", None, name);
+        storage.create(&key, &ns).await.unwrap();
+    }
+
+    /// policy/check_sysctls.go:70-79: `net.ipv4.tcp_rmem` joined the safe
+    /// set in v1.32, so `baseline:v1.31` forbids it and `latest` allows it.
+    #[tokio::test]
+    async fn psa_enforce_version_label_selects_older_sysctls_check() {
+        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        put_ns_labels(
+            &storage,
+            "old",
+            &[
+                ("pod-security.kubernetes.io/enforce", "baseline"),
+                ("pod-security.kubernetes.io/enforce-version", "v1.31"),
+            ],
+        )
+        .await;
+        put_ns_labels(
+            &storage,
+            "new",
+            &[("pod-security.kubernetes.io/enforce", "baseline")],
+        )
+        .await;
+        let pod = psa_pod(serde_json::json!({
+            "securityContext": {"sysctls": [{"name": "net.ipv4.tcp_rmem", "value": "1 2 3"}]},
+            "containers": [{"name": "a", "image": "i"}],
+        }));
+        let psa = PodSecurityAdmission::new();
+        let err = psa
+            .admit_outcome(&storage, "old", &pod, "alice")
+            .await
+            .expect_err("v1.31 forbids tcp_rmem");
+        assert!(
+            err.to_string().contains(
+                r#"violates PodSecurity "baseline:v1.31": forbidden sysctls (net.ipv4.tcp_rmem)"#
+            ),
+            "{err}"
+        );
+        psa.admit_outcome(&storage, "new", &pod, "alice")
+            .await
+            .expect("latest allows tcp_rmem");
+    }
+
+    /// policy/check_seccompProfile_restricted.go:54 and
+    /// check_capabilities_restricted.go:65: both restricted checks start at
+    /// v1.19 / v1.22, so a pod that sets neither passes `restricted:v1.18`.
+    #[tokio::test]
+    async fn psa_restricted_old_version_lacks_newer_checks() {
+        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        put_ns_labels(
+            &storage,
+            "old",
+            &[
+                ("pod-security.kubernetes.io/enforce", "restricted"),
+                ("pod-security.kubernetes.io/enforce-version", "v1.18"),
+            ],
+        )
+        .await;
+        let pod = psa_pod(serde_json::json!({
+            "securityContext": {"runAsNonRoot": true},
+            "containers": [{"name": "a", "image": "i",
+                "securityContext": {"allowPrivilegeEscalation": false}}],
+        }));
+        PodSecurityAdmission::new()
+            .admit_outcome(&storage, "old", &pod, "alice")
+            .await
+            .expect("restricted:v1.18 predates seccomp and capabilities checks");
+    }
+
+    /// The enforce message lists EVERY failing check, baseline first, as
+    /// `AggregateCheckResult.ForbiddenDetail` does (checks.go:98-117).
+    #[tokio::test]
+    async fn psa_enforce_message_aggregates_all_violations() {
+        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        put_ns_labels(
+            &storage,
+            "ns",
+            &[("pod-security.kubernetes.io/enforce", "baseline")],
+        )
+        .await;
+        let pod = psa_pod(serde_json::json!({
+            "hostNetwork": true,
+            "containers": [{"name": "a", "image": "i", "securityContext": {"privileged": true},
+                "ports": [{"containerPort": 80, "hostPort": 80}]}],
+        }));
+        let err = PodSecurityAdmission::new()
+            .admit_outcome(&storage, "ns", &pod, "alice")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(r#"host namespaces (hostNetwork=true), privileged (container "a" must not set securityContext.privileged=true), hostPort (container "a" uses hostPort 80)"#),
+            "{err}"
+        );
+    }
+
+    /// admission.go:344-350: a namespace that cannot be read is an
+    /// InternalError, not an allow.
+    #[tokio::test]
+    async fn psa_namespace_lookup_failure_is_internal_error() {
+        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let err = PodSecurityAdmission::new()
+            .admit_outcome(&storage, "missing", &baseline_pod(), "alice")
+            .await
+            .expect_err("a missing namespace must not fail open");
+        assert!(
+            matches!(&err, rusternetes_common::Error::Internal(m)
+                if m.contains(r#"failed to lookup namespace "missing""#)),
+            "{err:?}"
+        );
+    }
 }
