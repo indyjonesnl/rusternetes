@@ -2640,6 +2640,9 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             .layer(axum_middleware::from_fn(
                 middleware::generate_name_middleware,
             ))
+            // WithAudit sits after authentication and before the handler's
+            // authorization/admission (server/config.go DefaultBuildHandlerChain).
+            .layer(axum_middleware::from_fn(crate::audit::audit_middleware))
             .layer(axum_middleware::from_fn(
                 middleware::normalize_content_type_middleware,
             ))
@@ -2672,6 +2675,9 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             .layer(axum_middleware::from_fn(
                 middleware::generate_name_middleware,
             ))
+            // WithAudit sits after authentication and before the handler's
+            // authorization/admission (server/config.go DefaultBuildHandlerChain).
+            .layer(axum_middleware::from_fn(crate::audit::audit_middleware))
             .layer(axum_middleware::from_fn(
                 middleware::normalize_content_type_middleware,
             ))

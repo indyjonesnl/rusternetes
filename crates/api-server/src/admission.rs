@@ -1400,6 +1400,22 @@ pub struct PodSecurityOutcome {
     pub audit_annotations: BTreeMap<String, String>,
 }
 
+/// `audit.AddAuditAnnotations(ctx, AuditAnnotationPrefix+k, v...)` for the
+/// outcome's `AdmissionResponse.AuditAnnotations`
+/// (plugin/pkg/admission/security/podsecurity/admission.go:203-211;
+/// `AuditAnnotationPrefix` = `pod-security.kubernetes.io/`,
+/// pod-security-admission/api/constants.go:35,38).
+pub fn record_pod_security_audit(outcome: &PodSecurityOutcome) {
+    let kvs: Vec<(String, String)> = outcome
+        .audit_annotations
+        .iter()
+        .map(|(k, v)| (format!("pod-security.kubernetes.io/{k}"), v.clone()))
+        .collect();
+    if !kvs.is_empty() {
+        crate::audit::add_audit_annotations(&kvs);
+    }
+}
+
 /// The check registry for the default checks, built once
 /// (`policy.NewEvaluator(policy.DefaultChecks(), emulationVersion)`,
 /// admission.go `CompleteConfiguration`). The emulation version is the
