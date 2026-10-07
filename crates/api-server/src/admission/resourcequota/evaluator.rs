@@ -11,19 +11,21 @@
 //! VolumeAttributesClass scope and `Handles` for the `status` subresource
 //! (`RequiresQuotaReplenish`).
 //!
-//! The pod evaluator (`pods.go`) is not ported here: pods are admitted by
-//! the pod handler's own quota check (`crate::admission::check_resource_quota`)
-//! until Pods move onto the Store (#1990).
+//! and `pkg/quota/v1/evaluator/core/pods.go` (`podEvaluator`: `Handles`,
+//! `Matches` through `podMatchesScopeFunc`, `MatchingResources`,
+//! `MatchingScopes`, `Constraints`, `Usage`; the scope functions and `Usage`
+//! are `rusternetes_common::quota`, shared with the quota controller).
 
 use rusternetes_common::admission::Operation;
 use rusternetes_common::quantity::{Format, Quantity};
-use rusternetes_common::quota::ResourceList;
+use rusternetes_common::quota::{self, ResourceList};
 use rusternetes_common::quota::{
     pvc_matches_resource_name, pvc_matches_scope, pvc_matching_scopes,
     pvc_requires_quota_replenish, pvc_usage, scope_selectors_from_quota,
 };
 use rusternetes_common::resources::{
-    PersistentVolumeClaim, ResourceQuota, ScopedResourceSelectorRequirement, Service, ServiceType,
+    PersistentVolumeClaim, Pod, ResourceQuota, ScopedResourceSelectorRequirement, Service,
+    ServiceType,
 };
 use serde_json::Value;
 
@@ -319,6 +321,99 @@ fn decode_pvc(obj: &Value) -> Result<PersistentVolumeClaim, String> {
     })
 }
 
+/// `podResources` (pods.go:53-65).
+const POD_RESOURCES: [&str; 11] = [
+    "count/pods",
+    "cpu",
+    "memory",
+    "ephemeral-storage",
+    "requests.cpu",
+    "requests.memory",
+    "requests.ephemeral-storage",
+    "limits.cpu",
+    "limits.memory",
+    "limits.ephemeral-storage",
+    "pods",
+];
+
+/// `isExtendedResourceNameForQuota` (pods.go:86-97): a non-native name under
+/// `requests.`, or the implicit `requests.deviceclass.resource.kubernetes.io/`
+/// form.
+fn is_extended_resource_name_for_quota(name: &str) -> bool {
+    let implicit = name.starts_with("requests.deviceclass.resource.kubernetes.io/");
+    (!quota::is_native_resource_name(name) || implicit) && name.starts_with(quota::REQUESTS_PREFIX)
+}
+
+/// `toExternalPodOrError` (pods.go:300-313).
+fn decode_pod(obj: &Value) -> Result<Pod, String> {
+    serde_json::from_value(obj.clone()).map_err(|e| format!("expect *api.Pod or *v1.Pod, got {e}"))
+}
+
+/// `podEvaluator` (pods.go:121-298).
+pub struct PodEvaluator;
+
+impl Evaluator for PodEvaluator {
+    /// `Handles` (pods.go:179-199): a create, a `resize`, and an update only
+    /// when the pod moves between the Terminating scopes. Anything it cannot
+    /// decode is not handled.
+    fn handles(&self, a: &Attributes<'_>) -> bool {
+        match a.subresource {
+            None => {
+                if a.operation == Operation::Update {
+                    let (Ok(pod), Some(Ok(old))) =
+                        (decode_pod(a.object), a.old_object.map(decode_pod))
+                    else {
+                        return false;
+                    };
+                    // when scope changed
+                    if quota::is_terminating(&old) != quota::is_terminating(&pod) {
+                        return true;
+                    }
+                }
+                a.operation == Operation::Create
+            }
+            Some("resize") => a.operation == Operation::Update,
+            Some(_) => false,
+        }
+    }
+
+    /// `MatchingResources` (pods.go:208-222).
+    fn matching_resources(&self, input: &[String]) -> Vec<String> {
+        let mut out: Vec<String> = input
+            .iter()
+            .filter(|name| {
+                POD_RESOURCES.contains(&name.as_str())
+                    || name.starts_with(quota::HUGEPAGES_PREFIX)
+                    || name.starts_with("requests.hugepages-")
+                    || is_extended_resource_name_for_quota(name)
+            })
+            .cloned()
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// `podMatchesScopeFunc` (pods.go:331-356).
+    fn matches_scope(
+        &self,
+        selector: &ScopedResourceSelectorRequirement,
+        item: &Value,
+    ) -> Result<bool, String> {
+        quota::pod_matches_scope(selector, &decode_pod(item)?)
+    }
+
+    /// `Constraints` (pods.go:124-168).
+    fn constraints(&self, required: &[String], item: &Value) -> Result<(), String> {
+        quota::pod_constraints(&decode_pod(item)?, required)
+    }
+
+    /// `PodUsageFunc` (pods.go:381-411).
+    fn usage(&self, obj: &Value) -> Result<ResourceList, String> {
+        Ok(quota::pod_usage(&decode_pod(obj)?, chrono::Utc::now()))
+    }
+}
+
 /// `legacyObjectCountAliases` (registry.go:33-38).
 fn legacy_object_count_alias(gr: &GroupResource) -> Option<&'static str> {
     if !gr.group.is_empty() {
@@ -337,13 +432,13 @@ fn legacy_object_count_alias(gr: &GroupResource) -> Option<&'static str> {
 /// (registry.go:41-70), falling back to an object-count evaluator as
 /// `quotaEvaluator.Evaluate` does for an unregistered resource
 /// (plugin/resourcequota/controller.go:667-674). `None` for the resources
-/// whose evaluator is not ported (pods; see the module docs).
+/// whose evaluator is not ported (none today).
 pub fn evaluator_for(gr: &GroupResource) -> Option<Box<dyn Evaluator>> {
     if gr.group.is_empty() {
         match gr.resource.as_str() {
             "services" => return Some(Box::new(ServiceEvaluator)),
             "persistentvolumeclaims" => return Some(Box::new(PersistentVolumeClaimEvaluator)),
-            "pods" => return None,
+            "pods" => return Some(Box::new(PodEvaluator)),
             _ => {}
         }
     }

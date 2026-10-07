@@ -38,7 +38,8 @@ use chrono::{DateTime, Duration, Utc};
 use crate::label_selector::{LabelOperator, LabelRequirement};
 use crate::quantity::{Format, Quantity};
 use crate::resources::{
-    PersistentVolumeClaim, Pod, ResourceQuotaSpec, ScopedResourceSelectorRequirement,
+    PersistentVolumeClaim, Pod, PodAffinityTerm, ResourceQuotaSpec,
+    ScopedResourceSelectorRequirement,
 };
 use crate::types::{Phase, ResourceRequirements};
 
@@ -630,6 +631,123 @@ pub fn is_quota_charged(pod: &Pod, now: DateTime<Utc>) -> bool {
         }
     }
     true
+}
+
+/// `IsTerminating` (`pkg/quota/v1/evaluator/core/pods.go:417-422`): a
+/// non-negative `activeDeadlineSeconds`. A `deletionTimestamp` does not make a
+/// pod Terminating for quota.
+pub fn is_terminating(pod: &Pod) -> bool {
+    pod.spec
+        .as_ref()
+        .and_then(|s| s.active_deadline_seconds)
+        .is_some_and(|d| d >= 0)
+}
+
+/// `isBestEffort` (`pods.go:412-414`): `qos.GetPodQOS(pod) == PodQOSBestEffort`.
+pub fn is_best_effort(pod: &Pod) -> bool {
+    crate::qos::get_pod_qos(pod) == crate::qos::QoSClass::BestEffort
+}
+
+/// `crossNamespacePodAffinityTerm` (`pods.go:453-455`).
+fn cross_namespace_term(term: &PodAffinityTerm) -> bool {
+    term.namespaces.as_ref().is_some_and(|n| !n.is_empty()) || term.namespace_selector.is_some()
+}
+
+/// `usesCrossNamespacePodAffinity` (`pods.go:473-503`): any required or
+/// preferred (anti-)affinity term naming namespaces or a namespace selector.
+pub fn uses_cross_namespace_pod_affinity(pod: &Pod) -> bool {
+    let Some(affinity) = pod.spec.as_ref().and_then(|s| s.affinity.as_ref()) else {
+        return false;
+    };
+    let any = |required: &Option<Vec<PodAffinityTerm>>,
+               preferred: &Option<Vec<crate::resources::WeightedPodAffinityTerm>>| {
+        required.iter().flatten().any(cross_namespace_term)
+            || preferred
+                .iter()
+                .flatten()
+                .any(|t| cross_namespace_term(&t.pod_affinity_term))
+    };
+    affinity.pod_affinity.as_ref().is_some_and(|a| {
+        any(
+            &a.required_during_scheduling_ignored_during_execution,
+            &a.preferred_during_scheduling_ignored_during_execution,
+        )
+    }) || affinity.pod_anti_affinity.as_ref().is_some_and(|a| {
+        any(
+            &a.required_during_scheduling_ignored_during_execution,
+            &a.preferred_during_scheduling_ignored_during_execution,
+        )
+    })
+}
+
+/// `podMatchesSelector` (`pods.go:424-438`): the `PriorityClass` scope as a
+/// label selector over `{PriorityClass: <name>}` (empty when the pod has no
+/// class), via `ScopedResourceSelectorRequirementsAsSelector`
+/// (`pkg/apis/core/v1/helper/helpers.go`) and `labels.NewRequirement`, whose
+/// value-count rules are the errors below.
+fn priority_class_matches(
+    pod: &Pod,
+    selector: &ScopedResourceSelectorRequirement,
+) -> Result<bool, String> {
+    let class = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.priority_class_name.as_deref())
+        .filter(|c| !c.is_empty());
+    let values = selector.values.as_deref().unwrap_or(&[]);
+    match selector.operator.as_str() {
+        "In" | "NotIn" if values.is_empty() => Err(
+            "failed to parse and convert selector: for 'in', 'notin' operators, values set can't be empty"
+                .to_string(),
+        ),
+        "In" => Ok(class.is_some_and(|c| values.iter().any(|v| v == c))),
+        "NotIn" => Ok(class.is_none_or(|c| !values.iter().any(|v| v == c))),
+        "Exists" | "DoesNotExist" if !values.is_empty() => Err(
+            "failed to parse and convert selector: values set must be empty for exists and does not exist"
+                .to_string(),
+        ),
+        "Exists" => Ok(class.is_some()),
+        "DoesNotExist" => Ok(class.is_none()),
+        op => Err(format!(
+            "failed to parse and convert selector: {op:?} is not a valid scope selector operator"
+        )),
+    }
+}
+
+/// `podMatchesScopeFunc` (`pods.go:331-356`). An unknown scope matches
+/// nothing.
+pub fn pod_matches_scope(
+    selector: &ScopedResourceSelectorRequirement,
+    pod: &Pod,
+) -> Result<bool, String> {
+    Ok(match selector.scope_name.as_str() {
+        "Terminating" => is_terminating(pod),
+        "NotTerminating" => !is_terminating(pod),
+        "BestEffort" => is_best_effort(pod),
+        "NotBestEffort" => !is_best_effort(pod),
+        "PriorityClass" => {
+            if selector.operator == "Exists" {
+                // Existence of a class, without selector parsing (:343-347).
+                pod.spec
+                    .as_ref()
+                    .and_then(|s| s.priority_class_name.as_deref())
+                    .is_some_and(|c| !c.is_empty())
+            } else {
+                priority_class_matches(pod, selector)?
+            }
+        }
+        "CrossNamespacePodAffinity" => uses_cross_namespace_pod_affinity(pod),
+        _ => false,
+    })
+}
+
+/// Whether `pod` matches every scope of a quota: the scope half of
+/// `generic.Matches` (evaluator.go:190-209) and of `CalculateUsageStats`.
+/// A selector that fails to evaluate matches nothing.
+pub fn pod_matches_quota_scopes(pod: &Pod, spec: &ResourceQuotaSpec) -> bool {
+    scope_selectors_from_quota(spec)
+        .iter()
+        .all(|s| pod_matches_scope(s, pod).unwrap_or(false))
 }
 
 /// `storageClassSuffix` (`pkg/quota/v1/evaluator/core/persistent_volume_claims.go:47`).
@@ -1904,5 +2022,156 @@ mod tests {
         assert_eq!(got[0].scope_name, "BestEffort");
         assert_eq!(got[0].operator, "Exists");
         assert_eq!(got[1].operator, "In");
+    }
+
+    // ---- podEvaluator scopes: pods_test.go TestPodEvaluatorMatchingScopes ----
+
+    fn scope_sel(scope: &str, op: &str, values: &[&str]) -> ScopedResourceSelectorRequirement {
+        ScopedResourceSelectorRequirement {
+            scope_name: scope.to_string(),
+            operator: op.to_string(),
+            values: (!values.is_empty()).then(|| values.iter().map(|v| v.to_string()).collect()),
+        }
+    }
+
+    fn pod_from(spec: serde_json::Value) -> Pod {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "ns"},
+            "spec": spec,
+        }))
+        .unwrap()
+    }
+
+    /// The scopes (by name) of the test's full selector list a pod matches.
+    fn matching(pod: &Pod, selectors: &[ScopedResourceSelectorRequirement]) -> Vec<String> {
+        selectors
+            .iter()
+            .filter(|s| pod_matches_scope(s, pod).unwrap())
+            .map(|s| s.scope_name.clone())
+            .collect()
+    }
+
+    fn all_selectors() -> Vec<ScopedResourceSelectorRequirement> {
+        vec![
+            scope_sel("Terminating", "", &[]),
+            scope_sel("NotTerminating", "", &[]),
+            scope_sel("BestEffort", "", &[]),
+            scope_sel("NotBestEffort", "", &[]),
+            scope_sel("PriorityClass", "In", &["class1"]),
+            scope_sel("CrossNamespacePodAffinity", "", &[]),
+        ]
+    }
+
+    #[test]
+    fn scopes_empty_pod_and_priority_class() {
+        let pod = pod_from(serde_json::json!({"containers": []}));
+        assert_eq!(
+            matching(&pod, &all_selectors()),
+            ["NotTerminating", "BestEffort"]
+        );
+        let pod = pod_from(serde_json::json!({"containers": [], "priorityClassName": "class1"}));
+        assert_eq!(
+            matching(&pod, &all_selectors()),
+            ["NotTerminating", "BestEffort", "PriorityClass"]
+        );
+    }
+
+    #[test]
+    fn scopes_not_best_effort_and_terminating() {
+        let pod = pod_from(
+            serde_json::json!({"containers": [{"name": "c", "image": "i",
+            "resources": {"requests": {"cpu": "1", "memory": "50M"},
+                          "limits": {"cpu": "2", "memory": "100M"}}}]}),
+        );
+        assert_eq!(
+            matching(&pod, &all_selectors()),
+            ["NotTerminating", "NotBestEffort"]
+        );
+        let pod = pod_from(serde_json::json!({"containers": [], "activeDeadlineSeconds": 30}));
+        assert_eq!(
+            matching(&pod, &all_selectors()),
+            ["Terminating", "BestEffort"]
+        );
+        // A deletionTimestamp alone is not Terminating (IsTerminating).
+        let mut pod = pod_from(serde_json::json!({"containers": []}));
+        pod.metadata.deletion_timestamp = Some(Utc::now());
+        assert!(!is_terminating(&pod));
+    }
+
+    #[test]
+    fn scopes_cross_namespace_pod_affinity() {
+        let term = serde_json::json!({"labelSelector": {}, "topologyKey": "k"});
+        let mut with_ns = term.clone();
+        with_ns["namespaces"] = serde_json::json!(["ns1"]);
+        let mut with_sel = term.clone();
+        with_sel["namespaceSelector"] = serde_json::json!({});
+        let weighted =
+            |t: &serde_json::Value| serde_json::json!([{"weight": 1, "podAffinityTerm": t}]);
+        for affinity in [
+            serde_json::json!({"podAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": [with_ns]}}),
+            serde_json::json!({"podAffinity": {"preferredDuringSchedulingIgnoredDuringExecution": weighted(&with_sel)}}),
+            serde_json::json!({"podAntiAffinity": {"preferredDuringSchedulingIgnoredDuringExecution": weighted(&with_sel)}}),
+            serde_json::json!({"podAntiAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": [with_ns]}}),
+        ] {
+            let pod = pod_from(serde_json::json!({"containers": [], "affinity": affinity}));
+            assert!(uses_cross_namespace_pod_affinity(&pod), "{affinity}");
+        }
+        let pod = pod_from(serde_json::json!({"containers": [],
+            "affinity": {"podAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": [term]}}}));
+        assert!(!uses_cross_namespace_pod_affinity(&pod));
+    }
+
+    /// `podMatchesSelector`: PriorityClass In/NotIn/DoesNotExist over the
+    /// pod's class, and the selector-parse errors.
+    #[test]
+    fn scopes_priority_class_operators() {
+        let none = pod_from(serde_json::json!({"containers": []}));
+        let c1 = pod_from(serde_json::json!({"containers": [], "priorityClassName": "c1"}));
+        let m = |p: &Pod, op: &str, v: &[&str]| {
+            pod_matches_scope(&scope_sel("PriorityClass", op, v), p)
+        };
+        assert_eq!(m(&c1, "In", &["c1", "c2"]), Ok(true));
+        assert_eq!(m(&none, "In", &["c1"]), Ok(false));
+        assert_eq!(m(&c1, "NotIn", &["c1"]), Ok(false));
+        assert_eq!(m(&none, "NotIn", &["c1"]), Ok(true));
+        assert_eq!(m(&none, "DoesNotExist", &[]), Ok(true));
+        assert_eq!(m(&c1, "Exists", &[]), Ok(true));
+        assert!(m(&c1, "In", &[]).is_err());
+        assert!(m(&c1, "Bogus", &["x"]).is_err());
+    }
+
+    /// `getScopeSelectorsFromQuota` + `generic.Matches`: scopes AND
+    /// scopeSelector all apply; an unknown scope matches nothing.
+    #[test]
+    fn quota_scopes_are_anded_and_unknown_matches_nothing() {
+        let spec =
+            |scopes: &[&str], exprs: Vec<ScopedResourceSelectorRequirement>| ResourceQuotaSpec {
+                scopes: Some(scopes.iter().map(|s| s.to_string()).collect()),
+                scope_selector: Some(crate::resources::ScopeSelector {
+                    match_expressions: exprs,
+                }),
+                ..Default::default()
+            };
+        let pod = pod_from(serde_json::json!({"containers": [], "priorityClassName": "c1"}));
+        assert!(pod_matches_quota_scopes(
+            &pod,
+            &ResourceQuotaSpec::default()
+        ));
+        assert!(pod_matches_quota_scopes(
+            &pod,
+            &spec(
+                &["BestEffort"],
+                vec![scope_sel("PriorityClass", "In", &["c1"])]
+            )
+        ));
+        assert!(!pod_matches_quota_scopes(
+            &pod,
+            &spec(&["BestEffort", "Terminating"], vec![])
+        ));
+        assert!(!pod_matches_quota_scopes(
+            &pod,
+            &spec(&["Nonsense"], vec![])
+        ));
     }
 }

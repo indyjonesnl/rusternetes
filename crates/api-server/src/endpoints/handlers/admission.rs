@@ -488,8 +488,8 @@ impl Admission<'_> {
     }
 
     /// The in-tree validating plugins for a Pod: NodeRestriction on DELETE
-    /// (admission.go:257-270), PodSecurity on CREATE, and the pod
-    /// ResourceQuota evaluator.
+    /// (admission.go:257-270) and PodSecurity. The pod ResourceQuota
+    /// evaluator runs last, on the generic quota path (`validate_quota`).
     async fn validate_pod(
         &self,
         ctx: &RequestContext,
@@ -497,10 +497,6 @@ impl Admission<'_> {
         obj: Option<&Pod>,
         old: Option<&Pod>,
     ) -> Result<()> {
-        let name = obj
-            .or(old)
-            .map(|p| p.metadata.name.clone())
-            .unwrap_or_default();
         let storage = &self.state.storage;
         match op {
             Operation::Delete => {
@@ -567,63 +563,9 @@ impl Admission<'_> {
             _ => {}
         }
 
-        // The pod evaluator (pkg/quota/v1/evaluator/core/pods.go:179-199)
-        // handles CREATE, and an UPDATE only when the pod moves between
-        // quota scopes. The namespace lock is held until the pod is stored.
-        let (Some(pod), Some(namespace)) = (obj, self.namespace) else {
-            return Ok(());
-        };
-        // `Constraints` runs before any usage arithmetic
-        // (`resourcequota/controller.go:464-474`): a container omitting a
-        // quota'd cpu/memory is refused `failed quota: <name>: must specify ...`.
-        let constraints = |res: anyhow::Result<Option<String>>| -> Result<()> {
-            match res {
-                Ok(None) => Ok(()),
-                Ok(Some(msg)) => Err(self.forbidden(&name, msg)),
-                Err(e) => Err(Error::Internal(format!(
-                    "error checking ResourceQuota: {e}"
-                ))),
-            }
-        };
-        match (op, old) {
-            (Operation::Create, _) => {
-                ctx.hold(crate::admission::lock_namespace_quota(namespace).await);
-                constraints(
-                    crate::admission::check_pod_quota_constraints(storage, namespace, pod).await,
-                )?;
-                match crate::admission::check_resource_quota(storage, namespace, pod).await {
-                    Ok(None) => Ok(()),
-                    Ok(Some(msg)) => Err(self.forbidden(&name, msg)),
-                    Err(e) => Err(Error::Internal(format!(
-                        "error checking ResourceQuota: {e}"
-                    ))),
-                }
-            }
-            (Operation::Update, Some(old))
-                if self.subresource == Some("resize") || pod_quota_scope_changed(old, pod) =>
-            {
-                ctx.hold(crate::admission::lock_namespace_quota(namespace).await);
-                constraints(
-                    crate::admission::check_pod_quota_constraints(storage, namespace, pod).await,
-                )?;
-                match crate::admission::check_resource_quota_with_old(
-                    storage,
-                    namespace,
-                    pod,
-                    Some(old),
-                )
-                .await
-                {
-                    Ok(None) => Ok(()),
-                    Ok(Some(msg)) => Err(self.forbidden(&name, msg)),
-                    Err(e) => {
-                        tracing::warn!("Error checking ResourceQuota on pod update: {e}");
-                        Ok(())
-                    }
-                }
-            }
-            _ => Ok(()),
-        }
+        // Pod quota is the last plugin (`validate_quota`): the pod evaluator
+        // (pkg/quota/v1/evaluator/core/pods.go) runs on the generic path.
+        Ok(())
     }
 
     /// The mutating plugins: `MutationInterface.Admit`.
@@ -741,30 +683,6 @@ impl Admission<'_> {
             .await
             .map_err(|e| resourcequota::to_api_error(e, &gr, name))
     }
-}
-
-/// Whether a pod's ResourceQuota *scope* changed across an update, which is
-/// the only thing that makes an update worth re-evaluating against quota.
-///
-/// Ported from upstream's `podEvaluator.Handles`
-/// (pkg/quota/v1/evaluator/core/pods.go:179-199): quota is evaluated on
-/// CREATE, on the `resize` subresource, and on a plain UPDATE only when the
-/// terminating scope flips (`IsTerminating`, :417-422: a non-negative
-/// `activeDeadlineSeconds`). Everything else is already counted.
-///
-/// The gate is load-bearing here: our quota check recounts the namespace live,
-/// a paginated pod LIST, and running it on every update made
-/// `[sig-node] Pods Extended (pod generation) ... issue 500 podspec updates`
-/// take 2754 seconds before failing with `ResourceExhausted: h2 protocol
-/// error` against the storage backend.
-fn pod_quota_scope_changed(old: &Pod, new: &Pod) -> bool {
-    fn is_terminating(pod: &Pod) -> bool {
-        pod.spec
-            .as_ref()
-            .and_then(|s| s.active_deadline_seconds)
-            .is_some_and(|d| d >= 0)
-    }
-    is_terminating(old) != is_terminating(new)
 }
 
 /// `rest.AdmissionToValidateObjectFunc` for CREATE. With `authorize_create`
