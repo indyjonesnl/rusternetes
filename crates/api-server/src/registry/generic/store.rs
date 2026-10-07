@@ -1710,6 +1710,29 @@ impl<T: Object, S: Storage + Send + Sync + 'static> crate::registry::rest::RestS
             .map(|obj| self.decoded(obj))
             .collect();
         crate::handlers::filtering::apply_selectors(&mut items, list_options)?;
+
+        // `ListOptions.Limit` (store.go:1298-1301, :1343-1346): a request that
+        // sets it deletes and returns only that first page, "finish after
+        // running it"; one that does not sets `deleteCollectionPageSize` and
+        // pages through everything, which is the whole list here. Storage
+        // filters by selector while paging, so the page is the first `limit`
+        // matches in key order. A non-numeric limit is a decode failure,
+        // `NewBadRequest` (endpoints/handlers/delete.go:232-236).
+        let limit = match list_options.get("limit") {
+            None => 0,
+            Some(v) => v.parse::<i64>().map_err(|_| {
+                Error::BadRequest(format!(
+                    "failed to decode query parameter limit: strconv.ParseInt: parsing {v:?}: invalid syntax"
+                ))
+            })?,
+        };
+        if limit > 0 {
+            items.sort_by(|a, b| {
+                let (a, b) = (a.metadata(), b.metadata());
+                (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name))
+            });
+            items.truncate(limit as usize);
+        }
         Store::delete_collection(self, ctx, items, delete_validation, options).await
     }
 }

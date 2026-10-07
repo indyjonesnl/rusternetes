@@ -1434,6 +1434,42 @@ async fn an_update_replaces_the_ttl() {
     ));
 }
 
+/// `Store.DeleteCollection` with `listOptions.Limit > 0` (store.go:1298-1301,
+/// :1343-1346): "If the original request was setting the limit, finish after
+/// running it" -- only that first page is deleted, in key order, and only
+/// it is returned. Without a limit every match goes.
+#[tokio::test]
+async fn delete_collection_honours_the_limit() {
+    use crate::registry::rest::{zero_delete_options, RestStorage};
+    use std::collections::HashMap;
+    let registry = store(TestStrategy::default());
+    for name in ["a", "b", "c"] {
+        create(&registry, cm(name)).await;
+    }
+    let opts = zero_delete_options();
+    let limited: HashMap<String, String> = [("limit".to_string(), "2".to_string())].into();
+    let deleted = RestStorage::delete_collection(&registry, &ctx(), None, &opts, &limited)
+        .await
+        .unwrap();
+    let names: Vec<_> = deleted.iter().map(|o| o.metadata.name.as_str()).collect();
+    assert_eq!(names, ["a", "b"]);
+    registry
+        .get(&ctx(), "c", &GetOptions::default())
+        .await
+        .expect("the third item is past the limit and must survive");
+
+    let rest = RestStorage::delete_collection(&registry, &ctx(), None, &opts, &HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(rest.len(), 1);
+
+    let bad: HashMap<String, String> = [("limit".to_string(), "x".to_string())].into();
+    let err = RestStorage::delete_collection(&registry, &ctx(), None, &opts, &bad)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::BadRequest(_)), "{err:?}");
+}
+
 /// A `TTLFunc` error fails the write and stores nothing.
 #[tokio::test]
 async fn a_ttl_func_error_fails_the_create() {
