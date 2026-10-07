@@ -1,8 +1,8 @@
 use anyhow::Result;
 use rusternetes_common::resources::service_account::ObjectReference;
 use rusternetes_common::resources::volume::{
-    NodeSelectorTerm, PersistentVolumeClaimPhase, PersistentVolumeClaimStatus,
-    PersistentVolumeMode, PersistentVolumePhase, PersistentVolumeReclaimPolicy, VolumeNodeAffinity,
+    NodeSelectorTerm, PersistentVolumeClaimPhase, PersistentVolumeMode, PersistentVolumePhase,
+    PersistentVolumeReclaimPolicy, VolumeNodeAffinity,
 };
 use rusternetes_common::resources::{
     EventSource, EventType, Node, PersistentVolume, PersistentVolumeClaim,
@@ -20,6 +20,84 @@ pub const ANN_BIND_COMPLETED: &str = "pv.kubernetes.io/bind-completed";
 pub const ANN_DYNAMICALLY_PROVISIONED: &str = "pv.kubernetes.io/provisioned-by";
 /// `storagehelpers.AnnMigratedTo` (component-helpers pv_helpers.go).
 const ANN_MIGRATED_TO: &str = "pv.kubernetes.io/migrated-to";
+/// `util.AnnPreResizeCapacity` (`pkg/volume/util/resize_util.go:52`).
+const ANN_PRE_RESIZE_CAPACITY: &str = "volume.alpha.kubernetes.io/pre-resize-capacity";
+/// `storagehelpers.AnnStorageProvisioner` (pv_helpers.go:75).
+const ANN_STORAGE_PROVISIONER: &str = "volume.kubernetes.io/storage-provisioner";
+/// `storagehelpers.AnnBetaStorageProvisioner` (pv_helpers.go:76).
+const ANN_BETA_STORAGE_PROVISIONER: &str = "volume.beta.kubernetes.io/storage-provisioner";
+
+/// A Kubernetes `resource.Quantity` as an exact integer count of nano-units,
+/// or `None` when it does not parse (`resource.ParseQuantity`). Enough to
+/// implement `Quantity.Cmp` equality, so `1Gi` equals `1024Mi`.
+fn parse_quantity_nano(q: &str) -> Option<i128> {
+    let q = q.trim();
+    let (sign, q) = match q.strip_prefix('-') {
+        Some(r) => (-1i128, r),
+        None => (1, q.strip_prefix('+').unwrap_or(q)),
+    };
+    let split = q
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(q.len());
+    let (num, suffix) = q.split_at(split);
+    let (int_s, frac_s) = num.split_once('.').unwrap_or((num, ""));
+    if int_s.is_empty() && frac_s.is_empty() {
+        return None;
+    }
+    let digits: i128 = format!("{int_s}{frac_s}").parse().ok()?;
+    let scale = 10i128.checked_pow(u32::try_from(frac_s.len()).ok()?)?;
+    let nano: i128 = match suffix {
+        "n" => 1,
+        "u" => 1_000,
+        "m" => 1_000_000,
+        "" => 1_000_000_000,
+        "k" => 10i128.pow(12),
+        "M" => 10i128.pow(15),
+        "G" => 10i128.pow(18),
+        "T" => 10i128.pow(21),
+        "P" => 10i128.pow(24),
+        "E" => 10i128.pow(27),
+        "Ki" => 1024 * 10i128.pow(9),
+        "Mi" => 1024i128.pow(2) * 10i128.pow(9),
+        "Gi" => 1024i128.pow(3) * 10i128.pow(9),
+        "Ti" => 1024i128.pow(4) * 10i128.pow(9),
+        "Pi" => 1024i128.pow(5) * 10i128.pow(9),
+        "Ei" => 1024i128.pow(6) * 10i128.pow(9),
+        exp => {
+            let e: i32 = exp.strip_prefix(['e', 'E'])?.parse().ok()?;
+            if !(-9..=18).contains(&e) {
+                return None;
+            }
+            10i128.pow((9 + e) as u32)
+        }
+    };
+    Some(sign * digits.checked_mul(nano)? / scale)
+}
+
+/// `updateMigrationAnnotations(..., claim=true)`
+/// (`pv_controller_base.go:445-496`) with CSI migration disabled for every
+/// plugin: a claim carrying a provisioner annotation (`AnnStorageProvisioner`,
+/// else the beta one; `:455-470`) loses a non-empty `migrated-to` annotation
+/// (`:486-490`). Returns whether the map changed.
+fn update_claim_migration_annotations_map(
+    ann: Option<&mut std::collections::HashMap<String, String>>,
+) -> bool {
+    let Some(ann) = ann else { return false };
+    if !ann.contains_key(ANN_STORAGE_PROVISIONER) && !ann.contains_key(ANN_BETA_STORAGE_PROVISIONER)
+    {
+        return false;
+    }
+    ann.get(ANN_MIGRATED_TO).is_some_and(|v| !v.is_empty()) && ann.remove(ANN_MIGRATED_TO).is_some()
+}
+
+/// `volumeCap.Cmp(claimCap) == 0` (`pv_controller.go:835`); unparsable
+/// quantities compare by their text.
+fn quantity_eq(a: &str, b: &str) -> bool {
+    match (parse_quantity_nano(a), parse_quantity_nano(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => a == b,
+    }
+}
 
 /// `FindRecyclablePluginBySpec` (`pkg/volume/plugins.go:751`): the in-tree
 /// plugins kube-controller-manager registers a recycler for are hostPath and
@@ -516,11 +594,13 @@ impl<S: Storage + 'static> PVBinderController<S> {
     /// claim without `pv.kubernetes.io/bind-completed` goes to
     /// `syncUnboundClaim`, one with it to `syncBoundClaim`.
     ///
-    /// Not ported here (tracked separately): `updateClaimMigrationAnnotations`
-    /// (`:240`, CSI migration), `assignDefaultStorageClass`,
+    /// Not ported here (tracked separately): `assignDefaultStorageClass`,
     /// `provisionClaim`/delay-binding handling in the `volumeName == ""`
     /// branch, and `unbindClaim`.
     async fn bind_pvc(&self, pvc: &mut PersistentVolumeClaim) -> Result<()> {
+        // "Set correct "migrated-to" annotations on PVC and update in API
+        // server if necessary" (`syncClaim`, pv_controller.go:240-249).
+        self.update_claim_migration_annotations(pvc).await?;
         let bind_completed = pvc
             .metadata
             .annotations
@@ -540,6 +620,33 @@ impl<S: Storage + 'static> PVBinderController<S> {
             return self.sync_prebound_claim(pvc).await;
         }
         self.sync_unbound_claim(pvc).await
+    }
+
+    /// `updateClaimMigrationAnnotations` (`pv_controller_base.go:336-359`):
+    /// when the claim's provisioner annotation says it is (no longer)
+    /// CSI-migrated, anneal `pv.kubernetes.io/migrated-to` and `Update` the
+    /// claim. Deviation: Rusternetes has no CSI-migrated in-tree plugins, so
+    /// `IsMigrationEnabledForPlugin` is always false and only the rollback
+    /// branch of `updateMigrationAnnotations` (`:482-490`, "Migration
+    /// annotation exists but the driver isn't migrated currently") applies.
+    async fn update_claim_migration_annotations(
+        &self,
+        pvc: &mut PersistentVolumeClaim,
+    ) -> Result<()> {
+        let mut annotated = pvc.clone();
+        if !update_claim_migration_annotations_map(annotated.metadata.annotations.as_mut()) {
+            return Ok(());
+        }
+        let key = build_key(
+            "persistentvolumeclaims",
+            pvc.metadata.namespace.as_deref(),
+            &pvc.metadata.name,
+        );
+        let updated = self.storage.update(&key, &annotated).await.map_err(|e| {
+            anyhow::anyhow!("persistent Volume Controller can't anneal migration annotations: {e}")
+        })?;
+        *pvc = updated;
+        Ok(())
     }
 
     /// `PersistentVolumeController.syncBoundClaim`
@@ -757,22 +864,85 @@ impl<S: Storage + 'static> PVBinderController<S> {
         Ok(())
     }
 
-    /// `updateClaimStatus` (`pv_controller.go:784-882`), the `volume == nil`
-    /// reset form: set the phase and clear accessModes/capacity/
-    /// currentVolumeAttributesClassName; a no-op when nothing changes.
-    /// Written through the status subresource.
+    /// `updateClaimStatus` (`pv_controller.go:784-858`). With `volume ==
+    /// None` (`:796-806`) the phase is set and accessModes / capacity /
+    /// currentVolumeAttributesClassName are reset; with a volume (`:823-858`)
+    /// accessModes follow the volume, capacity is copied only on a phase
+    /// transition (honouring the pre-resize-capacity annotation) and
+    /// currentVolumeAttributesClassName only on Pending -> Bound. A no-op when
+    /// nothing changes; otherwise written through the status subresource.
     async fn update_claim_status(
         &self,
         pvc: &mut PersistentVolumeClaim,
         phase: PersistentVolumeClaimPhase,
-        _volume: Option<&PersistentVolume>,
+        volume: Option<&PersistentVolume>,
     ) -> Result<()> {
+        let old_phase = pvc.status.as_ref().map(|s| s.phase.clone());
         let mut status = pvc.status.clone().unwrap_or_default();
         let mut dirty = pvc.status.is_none() || status.phase != phase;
-        status.phase = phase;
-        dirty |= status.access_modes.take().is_some();
-        dirty |= status.capacity.take().is_some();
-        dirty |= status.current_volume_attributes_class_name.take().is_some();
+        status.phase = phase.clone();
+        match volume {
+            None => {
+                dirty |= status.access_modes.take().is_some();
+                dirty |= status.capacity.take().is_some();
+                dirty |= status.current_volume_attributes_class_name.take().is_some();
+            }
+            Some(volume) => {
+                if status.access_modes.as_ref() != Some(&volume.spec.access_modes) {
+                    status.access_modes = Some(volume.spec.access_modes.clone());
+                    dirty = true;
+                }
+                // "Update Capacity if the claim is becoming Bound, not if it
+                // was already. A discrepancy can be intentional to mean that
+                // the PVC filesystem size doesn't match the PV block device
+                // size, so don't clobber it" (`:817-819`).
+                if old_phase.as_ref() != Some(&phase) {
+                    let Some(volume_cap) = volume.spec.capacity.get("storage") else {
+                        anyhow::bail!(
+                            "PersistentVolume {:?} is without a storage capacity",
+                            volume.metadata.name
+                        );
+                    };
+                    let pre_resize = volume
+                        .metadata
+                        .annotations
+                        .as_ref()
+                        .and_then(|a| a.get(ANN_PRE_RESIZE_CAPACITY));
+                    if let Some(pre) = pre_resize {
+                        // `resource.ParseQuantity` failing falls back to the
+                        // volume's capacity (`:830-833`).
+                        let qty = if parse_quantity_nano(pre).is_some() {
+                            pre.clone()
+                        } else {
+                            volume_cap.clone()
+                        };
+                        status
+                            .capacity
+                            .get_or_insert_with(Default::default)
+                            .insert("storage".to_string(), qty);
+                        dirty = true;
+                    } else if status
+                        .capacity
+                        .as_ref()
+                        .and_then(|c| c.get("storage"))
+                        .is_none_or(|c| !quantity_eq(volume_cap, c))
+                    {
+                        status.capacity = Some(volume.spec.capacity.clone());
+                        dirty = true;
+                    }
+                }
+                // `:841-857`: only during binding, never afterwards.
+                if old_phase == Some(PersistentVolumeClaimPhase::Pending)
+                    && phase == PersistentVolumeClaimPhase::Bound
+                    && status.current_volume_attributes_class_name
+                        != volume.spec.volume_attributes_class_name
+                {
+                    status.current_volume_attributes_class_name =
+                        volume.spec.volume_attributes_class_name.clone();
+                    dirty = true;
+                }
+            }
+        }
         if !dirty {
             return Ok(());
         }
@@ -926,8 +1096,6 @@ impl<S: Storage + 'static> PVBinderController<S> {
         let namespace = pvc.metadata.namespace.clone().unwrap_or("default".into());
         let pvc_name = pvc.metadata.name.clone();
 
-        let pv_access_modes = pv.spec.access_modes.clone();
-        let pv_capacity = pv.spec.capacity.clone();
         let pv_name = pv.metadata.name.clone();
 
         // GetBindVolumeToClaim (component-helpers pv_helpers.go:120-154): a PV
@@ -970,23 +1138,14 @@ impl<S: Storage + 'static> PVBinderController<S> {
         self.storage.update_status(&pv_key, &pv).await?;
 
         bind_claim_to_volume(pvc, &pv_name);
-        pvc.status = Some(PersistentVolumeClaimStatus {
-            phase: PersistentVolumeClaimPhase::Bound,
-            access_modes: Some(pv_access_modes),
-            capacity: Some(pv_capacity),
-            conditions: None,
-            allocated_resources: None,
-            allocated_resource_statuses: None,
-            resize_status: None,
-            current_volume_attributes_class_name: None,
-            modify_volume_status: None,
-        });
         let pvc_key = build_key("persistentvolumeclaims", Some(&namespace), &pvc_name);
         // Same two-write split for the claim: `spec.volumeName` via the main
-        // resource, phase/capacity via the status subresource
-        // (pv_controller.go:866).
+        // resource (`bindClaimToVolume`), then phase/capacity/VAC via the
+        // status subresource (`updateClaimStatus(claim, ClaimBound, volume)`,
+        // `bind` at pv_controller.go:1122).
         self.storage.update(&pvc_key, pvc).await?;
-        self.storage.update_status(&pvc_key, pvc).await?;
+        self.update_claim_status(pvc, PersistentVolumeClaimPhase::Bound, Some(&pv))
+            .await?;
 
         info!(
             "Successfully bound PVC {}/{} to PV {}",
@@ -2214,5 +2373,261 @@ mod tests {
         let ev = events_with_reason(&storage, "VolumeMismatch").await;
         assert_eq!(ev.len(), 1);
         assert!(ev[0].message.ends_with("storageClassName does not match"));
+    }
+
+    #[test]
+    fn quantity_eq_compares_by_value() {
+        assert!(quantity_eq("1Gi", "1024Mi"));
+        assert!(quantity_eq("1.5Gi", "1536Mi"));
+        assert!(quantity_eq("1G", "1000M"));
+        assert!(quantity_eq("1e3", "1k"));
+        assert!(quantity_eq("500m", "0.5"));
+        assert!(!quantity_eq("1Gi", "1G"));
+        assert_eq!(parse_quantity_nano("bogus!"), None);
+        assert_eq!(parse_quantity_nano(""), None);
+    }
+
+    fn storage_cap(v: &str) -> HashMap<String, String> {
+        HashMap::from([("storage".to_string(), v.to_string())])
+    }
+
+    /// binder_test.go "2-12" (VolumeAttributesClass, GA in 1.35): binding a
+    /// claim to a volume with the same VAC sets
+    /// `status.currentVolumeAttributesClassName` from the volume
+    /// (`updateClaimStatus`, pv_controller.go:841-857).
+    #[tokio::test]
+    async fn binding_sets_current_vac_name_and_capacity_from_volume() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut pv = pv_for("pv", None);
+        pv.spec.volume_attributes_class_name = Some("gold".into());
+        put_pv(&storage, &pv).await;
+        let mut pvc = claim_with(
+            "c",
+            "u",
+            Some("pv"),
+            PersistentVolumeClaimPhase::Pending,
+            &[],
+        );
+        pvc.spec.volume_attributes_class_name = Some("gold".into());
+        let (r, got) = sync_claim(&storage, pvc).await;
+        r.unwrap();
+        let st = got.status.unwrap();
+        assert_eq!(st.phase, PersistentVolumeClaimPhase::Bound);
+        assert_eq!(
+            st.current_volume_attributes_class_name.as_deref(),
+            Some("gold")
+        );
+        assert_eq!(st.capacity, Some(storage_cap("1Gi")));
+        assert_eq!(st.access_modes, Some(pv.spec.access_modes.clone()));
+    }
+
+    /// pv_controller_test.go "5-2-3": a PV with the pre-resize-capacity
+    /// annotation makes the claim's status capacity that value (:826-837).
+    #[tokio::test]
+    async fn binding_uses_pre_resize_capacity_annotation() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut pv = pv_for("pv", None);
+        pv.spec.capacity = storage_cap("2Gi");
+        pv.metadata.annotations = Some(HashMap::from([(
+            "volume.alpha.kubernetes.io/pre-resize-capacity".to_string(),
+            "1Gi".to_string(),
+        )]));
+        put_pv(&storage, &pv).await;
+        let pvc = claim_with(
+            "c",
+            "u",
+            Some("pv"),
+            PersistentVolumeClaimPhase::Pending,
+            &[],
+        );
+        let (r, got) = sync_claim(&storage, pvc).await;
+        r.unwrap();
+        assert_eq!(got.status.unwrap().capacity, Some(storage_cap("1Gi")));
+    }
+
+    /// An unparsable pre-resize annotation falls back to the volume capacity
+    /// (:830-833).
+    #[tokio::test]
+    async fn unparsable_pre_resize_capacity_falls_back_to_volume_capacity() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut pv = pv_for("pv", None);
+        pv.spec.capacity = storage_cap("2Gi");
+        pv.metadata.annotations = Some(HashMap::from([(
+            "volume.alpha.kubernetes.io/pre-resize-capacity".to_string(),
+            "bogus!".to_string(),
+        )]));
+        put_pv(&storage, &pv).await;
+        let pvc = claim_with(
+            "c",
+            "u",
+            Some("pv"),
+            PersistentVolumeClaimPhase::Pending,
+            &[],
+        );
+        let (r, got) = sync_claim(&storage, pvc).await;
+        r.unwrap();
+        assert_eq!(got.status.unwrap().capacity, Some(storage_cap("2Gi")));
+    }
+
+    /// :817-819: capacity is only copied when the phase changes; an already
+    /// Bound claim keeps a status capacity that differs from the volume's (a
+    /// filesystem not yet resized), and nothing is written.
+    #[tokio::test]
+    async fn update_claim_status_does_not_clobber_capacity_when_already_bound() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        let mut pv = pv_for("pv", None);
+        pv.spec.capacity = storage_cap("2Gi");
+        let mut pvc = claim_with(
+            "c",
+            "u",
+            Some("pv"),
+            PersistentVolumeClaimPhase::Bound,
+            &[ANN_BIND_COMPLETED],
+        );
+        {
+            let st = pvc.status.as_mut().unwrap();
+            st.capacity = Some(storage_cap("1Gi"));
+            st.access_modes = Some(pv.spec.access_modes.clone());
+        }
+        put_pvc(&storage, &pvc).await;
+        c.update_claim_status(&mut pvc, PersistentVolumeClaimPhase::Bound, Some(&pv))
+            .await
+            .unwrap();
+        assert_eq!(
+            pvc.status.as_ref().unwrap().capacity,
+            Some(storage_cap("1Gi"))
+        );
+        assert!(pvc.status.as_ref().unwrap().access_modes.is_some());
+    }
+
+    /// `volumeCap.Cmp(claimCap) != 0` (:835): quantities are compared by
+    /// value, so an equal-valued status capacity is left as it was.
+    #[tokio::test]
+    async fn update_claim_status_compares_capacity_by_quantity_value() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        let pv = pv_for("pv", None);
+        let mut pvc = claim_with(
+            "c",
+            "u",
+            Some("pv"),
+            PersistentVolumeClaimPhase::Pending,
+            &[],
+        );
+        {
+            let st = pvc.status.as_mut().unwrap();
+            st.capacity = Some(storage_cap("1024Mi"));
+            st.access_modes = Some(pv.spec.access_modes.clone());
+        }
+        put_pvc(&storage, &pvc).await;
+        c.update_claim_status(&mut pvc, PersistentVolumeClaimPhase::Bound, Some(&pv))
+            .await
+            .unwrap();
+        let st = pvc.status.unwrap();
+        assert_eq!(st.phase, PersistentVolumeClaimPhase::Bound);
+        assert_eq!(st.capacity, Some(storage_cap("1024Mi")));
+    }
+
+    /// :821-824: a volume without storage capacity is an error on the phase
+    /// transition.
+    #[tokio::test]
+    async fn update_claim_status_errors_on_volume_without_capacity() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        let mut pv = pv_for("pv", None);
+        pv.spec.capacity = HashMap::new();
+        let mut pvc = claim_with(
+            "c",
+            "u",
+            Some("pv"),
+            PersistentVolumeClaimPhase::Pending,
+            &[],
+        );
+        put_pvc(&storage, &pvc).await;
+        let e = c
+            .update_claim_status(&mut pvc, PersistentVolumeClaimPhase::Bound, Some(&pv))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "PersistentVolume \"pv\" is without a storage capacity"
+        );
+    }
+
+    /// :841-857: currentVolumeAttributesClassName is set only on the
+    /// Pending -> Bound transition, never afterwards.
+    #[tokio::test]
+    async fn current_vac_name_is_only_set_on_pending_to_bound() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        let mut pv = pv_for("pv", None);
+        pv.spec.volume_attributes_class_name = Some("gold".into());
+        let mut pvc = claim_with("c", "u", Some("pv"), PersistentVolumeClaimPhase::Bound, &[]);
+        {
+            let st = pvc.status.as_mut().unwrap();
+            st.capacity = Some(storage_cap("1Gi"));
+            st.access_modes = Some(pv.spec.access_modes.clone());
+        }
+        put_pvc(&storage, &pvc).await;
+        c.update_claim_status(&mut pvc, PersistentVolumeClaimPhase::Bound, Some(&pv))
+            .await
+            .unwrap();
+        assert_eq!(
+            pvc.status.unwrap().current_volume_attributes_class_name,
+            None
+        );
+    }
+
+    fn claim_with_annotations(pairs: &[(&str, &str)]) -> PersistentVolumeClaim {
+        let mut pvc = claim_with("c", "u", None, PersistentVolumeClaimPhase::Pending, &[]);
+        pvc.metadata.annotations = Some(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        );
+        pvc
+    }
+
+    /// pv_controller_test.go TestAnnealMigrationAnnotations "migration off
+    /// removes migrated to (rollback)" (and the Beta provisioner variant) for
+    /// a claim, via `syncClaim` (`updateClaimMigrationAnnotations`,
+    /// pv_controller.go:240) with the claim written back.
+    #[tokio::test]
+    async fn sync_claim_removes_stale_migrated_to_annotation() {
+        for provisioner_key in [
+            "volume.kubernetes.io/storage-provisioner",
+            "volume.beta.kubernetes.io/storage-provisioner",
+        ] {
+            let storage = Arc::new(MemoryStorage::new());
+            let pvc = claim_with_annotations(&[
+                (provisioner_key, "kubernetes.io/rbd"),
+                (ANN_MIGRATED_TO, "rbd.csi.ceph.com"),
+            ]);
+            let (r, got) = sync_claim(&storage, pvc).await;
+            r.unwrap();
+            let ann = got.metadata.annotations.unwrap();
+            assert!(!ann.contains_key(ANN_MIGRATED_TO), "{provisioner_key}");
+            assert!(ann.contains_key(provisioner_key));
+        }
+    }
+
+    /// TestAnnealMigrationAnnotations "not dynamically provisioned": a claim
+    /// without a provisioner annotation keeps its annotations untouched.
+    #[tokio::test]
+    async fn sync_claim_leaves_unprovisioned_claim_annotations_alone() {
+        let storage = Arc::new(MemoryStorage::new());
+        let pvc = claim_with_annotations(&[(ANN_MIGRATED_TO, "x.csi")]);
+        let (r, got) = sync_claim(&storage, pvc).await;
+        r.unwrap();
+        assert_eq!(
+            got.metadata
+                .annotations
+                .unwrap()
+                .get(ANN_MIGRATED_TO)
+                .map(String::as_str),
+            Some("x.csi")
+        );
     }
 }
