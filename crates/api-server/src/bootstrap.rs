@@ -1304,6 +1304,24 @@ pub fn cluster_authentication_info(
 /// Upstream creates through the API; this writes the object the Namespace
 /// strategy would have stored (phase Active, the `kubernetes` finalizer, the
 /// `kubernetes.io/metadata.name` label).
+/// The system namespaces the apiserver ensures exist, from
+/// `pkg/controlplane/apiserver/options/options.go:131`
+/// (`SystemNamespaces: {NamespaceSystem, NamespacePublic, NamespaceDefault}`),
+/// created by `systemnamespaces.Controller.sync` /
+/// `createNamespaceIfNeeded`
+/// (`pkg/controlplane/controller/systemnamespaces/system_namespaces_controller.go:78-100`).
+/// NamespaceLifecycle answers NotFound for a create in a missing namespace
+/// (#2533), so these must exist before the apiserver serves.
+pub const SYSTEM_NAMESPACES: [&str; 3] = ["kube-system", "kube-public", "default"];
+
+/// One pass of the systemnamespaces controller; idempotent.
+pub async fn bootstrap_system_namespaces(storage: &StorageBackend) -> Result<()> {
+    for ns in SYSTEM_NAMESPACES {
+        create_namespace_if_needed(storage, ns).await?;
+    }
+    Ok(())
+}
+
 async fn create_namespace_if_needed(storage: &StorageBackend, ns: &str) -> Result<()> {
     use rusternetes_common::resources::Namespace;
     let key = rusternetes_storage::build_key("namespaces", None, ns);
@@ -1842,6 +1860,20 @@ mod tests {
         let es: EndpointSlice = storage.get(ENDPOINTSLICE_KEY).await.unwrap();
         assert_eq!(es.endpoints[0].addresses, vec!["10.89.0.5".to_string()]);
         assert_eq!(es.ports[0].port, Some(6443));
+    }
+
+    /// #2533: the systemnamespaces controller's pass creates default,
+    /// kube-system and kube-public, and is idempotent.
+    #[tokio::test]
+    async fn seeds_system_namespaces() {
+        let storage = Arc::new(StorageBackend::new_memory());
+        bootstrap_system_namespaces(storage.as_ref()).await.unwrap();
+        bootstrap_system_namespaces(storage.as_ref()).await.unwrap();
+        for ns in ["default", "kube-system", "kube-public"] {
+            let key = rusternetes_storage::build_key("namespaces", None, ns);
+            let got: serde_json::Value = storage.get(&key).await.unwrap();
+            assert_eq!(got["status"]["phase"], "Active", "{ns}");
+        }
     }
 
     /// #1659: bootstrap seeds the cluster-admin ClusterRole + a binding to the
