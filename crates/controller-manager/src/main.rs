@@ -185,6 +185,26 @@ struct Args {
     /// `--allocate-node-cidrs` is set.
     #[arg(long)]
     service_cluster_ip_range: Option<String>,
+
+    /// The period of time since the last usage of a legacy service account
+    /// token before it can be deleted (upstream
+    /// `--legacy-service-account-token-clean-up-period`, default 365d:
+    /// `cmd/kube-controller-manager/app/options/legacyserviceaccounttokencleaner.go:36`).
+    /// Go duration syntax (`8760h`).
+    #[arg(
+        long,
+        default_value = "8760h",
+        value_parser = parse_clean_up_period
+    )]
+    legacy_service_account_token_clean_up_period: std::time::Duration,
+}
+
+/// Parse a Go duration (`time.ParseDuration`) for a clap flag.
+fn parse_clean_up_period(s: &str) -> Result<std::time::Duration, String> {
+    let nanos = rusternetes_common::go_duration::parse_go_duration(s)?;
+    u64::try_from(nanos)
+        .map(std::time::Duration::from_nanos)
+        .map_err(|_| format!("negative duration {s:?}"))
 }
 
 /// Resolve node-IPAM flags into `(cluster_cidr, mask_sizes, service_cidr)`, or `None` when
@@ -314,6 +334,7 @@ async fn run_api_mode(args: Args) -> Result<()> {
         // cert paths in its own container — hand it the kubeconfig-resolved CA
         // so it can (re)create kube-root-ca.crt in every namespace.
         ca_cert_pem: ca_pem.and_then(|b| String::from_utf8(b).ok()),
+        legacy_sa_token_clean_up_period: args.legacy_service_account_token_clean_up_period,
         // Lib-qualified NodeIpamConfig (distinct from the bin's `mod controllers`
         // copy), so it matches the type ControllerManagerConfig expects.
         node_ipam: match node_ipam_params(&args)? {
@@ -909,6 +930,34 @@ async fn main() -> Result<()> {
             }
         }
     });
+
+    // Start legacy service-account token cleaner
+    // (`newLegacyServiceAccountTokenCleanerController`, core.go:933-963).
+    let legacy_cleaner = Arc::new(
+        controllers::legacy_serviceaccount_token_cleaner::LegacySATokenCleaner::new(
+            storage.clone(),
+            controllers::legacy_serviceaccount_token_cleaner::LegacySATokenCleanerOptions {
+                clean_up_period: args.legacy_service_account_token_clean_up_period,
+                sync_interval:
+                    controllers::legacy_serviceaccount_token_cleaner::DEFAULT_CLEANER_SYNC_INTERVAL,
+            },
+        )
+        .map_err(|e| {
+            anyhow::anyhow!("failed to init the legacy service account token cleaner: {e}")
+        })?,
+    );
+    spawn_controller!(
+        "LegacyServiceAccountTokenCleaner controller",
+        leader_elector,
+        {
+            let controller = legacy_cleaner.clone();
+            async move {
+                if let Err(e) = controller.run().await {
+                    tracing::error!("LegacyServiceAccountTokenCleaner controller error: {}", e);
+                }
+            }
+        }
+    );
 
     // Start Service controller (watch-based)
     let service_controller = Arc::new(ServiceController::new(storage.clone()));

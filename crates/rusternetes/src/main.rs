@@ -344,6 +344,8 @@ async fn async_main() -> Result<()> {
         // All-in-one does not expose node-IPAM flags; pod-CIDR allocation is a
         // multi-node compose concern (flannel stack runs the standalone CM).
         node_ipam: None,
+        legacy_sa_token_clean_up_period:
+            rusternetes_controller_manager::controllers::legacy_serviceaccount_token_cleaner::DEFAULT_CLEAN_UP_PERIOD,
     };
     // The controller-manager reaches cluster state through the embedded
     // api-server over the same loopback client as scheduler/DNS (#1128),
