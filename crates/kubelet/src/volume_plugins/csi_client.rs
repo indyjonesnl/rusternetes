@@ -29,8 +29,8 @@ use proto::volume_capability::access_mode::Mode as AccessModeKind;
 use proto::volume_capability::{AccessMode, AccessType, BlockVolume, MountVolume};
 use proto::{
     CapacityRange, NodeExpandVolumeRequest, NodeGetCapabilitiesRequest, NodeGetInfoRequest,
-    NodePublishVolumeRequest,
-    NodeStageVolumeRequest, NodeUnpublishVolumeRequest, NodeUnstageVolumeRequest, VolumeCapability,
+    NodePublishVolumeRequest, NodeStageVolumeRequest, NodeUnpublishVolumeRequest,
+    NodeUnstageVolumeRequest, VolumeCapability,
 };
 
 /// `csiTimeout` (`pkg/volume/csi/csi_plugin.go:55`): the deadline every CSI
