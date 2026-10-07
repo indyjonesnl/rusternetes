@@ -4,6 +4,7 @@ use crate::volume_plugins::{
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use rusternetes_common::resources::csi::FSGroupPolicy;
 use rusternetes_common::resources::{
     CSIDriver, PersistentVolume, PersistentVolumeAccessMode, Pod, Secret, VolumeAttachment,
 };
@@ -226,6 +227,12 @@ impl VolumePlugin for CsiPlugin {
             storage: self.host.get_kube_client().cloned(),
             plugin_dir: plugin_dir(self.host.get_volumes_base_path()),
             token_manager: self.host.get_service_account_token_func().clone(),
+            fs_group: crate::volume_plugins::util::fs_group_from(pod),
+            fs_group_change_policy: pod
+                .spec
+                .as_ref()
+                .and_then(|s| s.security_context.as_ref())
+                .and_then(|sc| sc.fs_group_change_policy.clone()),
         }))
     }
 
@@ -442,6 +449,10 @@ struct CsiMounter {
     /// token when the backend has no api-server to ask (see
     /// [`CsiMounter::pod_service_account_token_attrs`]).
     token_manager: rusternetes_common::auth::TokenManager,
+    /// `MounterArgs.FsGroup` (`operation_generator.go:501-509`).
+    fs_group: Option<i64>,
+    /// `MounterArgs.FSGroupChangePolicy` (`operation_generator.go:502-509`).
+    fs_group_change_policy: Option<String>,
 }
 
 fn transient(msg: String) -> anyhow::Error {
@@ -462,6 +473,65 @@ impl CsiMounter {
             Ok(d) => Ok(Some(d)),
             Err(rusternetes_common::Error::NotFound(_)) => Ok(None),
             Err(e) => Err(anyhow!("failed to get CSIDriver {}: {e}", self.driver_name)),
+        }
+    }
+
+    /// Port of `supportsFSGroup` (`csi_mounter.go:469-500`).
+    fn supports_fs_group(&self, fs_type: &str, driver_policy: &FSGroupPolicy) -> bool {
+        if self.fs_group.is_none() || matches!(driver_policy, FSGroupPolicy::None) || self.read_only
+        {
+            return false;
+        }
+        if matches!(driver_policy, FSGroupPolicy::File) {
+            return true;
+        }
+        if fs_type.is_empty() {
+            debug!(
+                "kubernetes.io/csi: mounter.SetupAt WARNING: skipping fsGroup, fsType not provided"
+            );
+            return false;
+        }
+        match &self.source {
+            Source::Pv(pv) => {
+                if pv.spec.access_modes.is_empty() {
+                    debug!("kubernetes.io/csi: mounter.SetupAt WARNING: skipping fsGroup, access modes not provided");
+                    return false;
+                }
+                // `hasReadWriteOnce` (`csi_util.go:132-143`): RWO or RWOP.
+                if !pv.spec.access_modes.iter().any(|m| {
+                    matches!(
+                        m,
+                        PersistentVolumeAccessMode::ReadWriteOnce
+                            | PersistentVolumeAccessMode::ReadWriteOncePod
+                    )
+                }) {
+                    debug!("kubernetes.io/csi: mounter.SetupAt WARNING: skipping fsGroup, only support ReadWriteOnce access mode");
+                    return false;
+                }
+                true
+            }
+            // Inline CSI volumes are always mounted with RWO AccessMode by SetUpAt.
+            Source::Inline(_) => true,
+        }
+    }
+
+    /// Port of `getFSGroupPolicy` (`csi_mounter.go:504-527`). No CSIDriver is
+    /// the default `ReadWriteOnceWithFSType`.
+    ///
+    /// DEVIATION: an unset `fsGroupPolicy` is read as that default instead of
+    /// an error, as `supports_volume_lifecycle_mode` does for its field —
+    /// the API server defaults it, but we read storage directly and may see it
+    /// unset. A non-nil empty string is still an error, as upstream.
+    fn get_fs_group_policy(&self, driver: Option<&CSIDriver>) -> Result<FSGroupPolicy> {
+        let Some(driver) = driver else {
+            return Ok(FSGroupPolicy::ReadWriteOnceWithFSType);
+        };
+        match &driver.spec.fs_group_policy {
+            None => Ok(FSGroupPolicy::ReadWriteOnceWithFSType),
+            Some(FSGroupPolicy::Unknown(s)) if s.is_empty() => Err(anyhow!(
+                "expected valid fsGroupPolicy, received nil value or empty string"
+            )),
+            Some(p) => Ok(p.clone()),
         }
     }
 
@@ -701,10 +771,12 @@ impl Mounter for CsiMounter {
 
     /// Port of `csiMountMgr.SetUpAt` (`csi_mounter.go:102-356`).
     ///
-    /// Not ported: `FSGroup` handling (`VOLUME_MOUNT_GROUP` delegation and the
-    /// kubelet-side ownership change — `set_up` carries no `MounterArgs` yet),
-    /// SELinux mount context, and the post-publish SELinux-support probe. See
-    /// #2312.
+    /// FSGroup handling is ported (`csi_mounter.go:126-129`, `:250-260`,
+    /// `:333-352`): `VOLUME_MOUNT_GROUP` delegation to the driver, else the
+    /// kubelet-side ownership change gated by `CSIDriver.Spec.FSGroupPolicy`.
+    ///
+    /// Not ported: SELinux mount context and the post-publish SELinux-support
+    /// probe. See #2312.
     async fn set_up(&self) -> Result<()> {
         let dir = Path::new(&self.path);
 
@@ -741,6 +813,13 @@ impl Mounter for CsiMounter {
                     "kubernetes.io/csi: mounter.SetupAt failed to check volume lifecycle mode: {e}"
                 ))
             })?;
+
+        // `getFSGroupPolicy` (`csi_mounter.go:126-129`).
+        let fs_group_policy = self.get_fs_group_policy(csi_driver.as_ref()).map_err(|e| {
+            transient(format!(
+                "kubernetes.io/csi: mounter.SetupAt failed to check fsGroup policy: {e}"
+            ))
+        })?;
 
         let mut access_mode = PersistentVolumeAccessMode::ReadWriteOnce;
         let fs_type: String;
@@ -896,6 +975,21 @@ impl Mounter for CsiMounter {
             return Err(e);
         }
 
+        // `NodeSupportsVolumeMountGroup` (`csi_mounter.go:250-260`): a driver
+        // with VOLUME_MOUNT_GROUP applies the fsGroup itself, through
+        // NodePublishVolume.
+        let driver_supports_volume_mount_group =
+            client.node_supports_volume_mount_group().await.map_err(|e| {
+                transient(format!(
+                    "kubernetes.io/csi: mounter.SetUpAt failed to determine if the node service has VOLUME_MOUNT_GROUP capability: {e}"
+                ))
+            })?;
+        let node_publish_fs_group = if driver_supports_volume_mount_group {
+            self.fs_group
+        } else {
+            None
+        };
+
         let result = client
             .node_publish_volume(
                 &self.volume_id,
@@ -908,7 +1002,7 @@ impl Mounter for CsiMounter {
                 node_publish_secrets,
                 &fs_type,
                 &mount_options,
-                None,
+                node_publish_fs_group,
             )
             .await;
         if let Err(e) = result {
@@ -923,6 +1017,39 @@ impl Mounter for CsiMounter {
                 }
             }
             return Err(e.into());
+        }
+
+        // `csi_mounter.go:333-352`: the driver does not apply the fsGroup, so
+        // the kubelet must. The mount succeeded, so a failure here is
+        // UncertainProgress (the volume must still be cleaned up).
+        if !driver_supports_volume_mount_group && self.supports_fs_group(&fs_type, &fs_group_policy)
+        {
+            let fs_group = self.fs_group;
+            let policy = self.fs_group_change_policy.clone();
+            let root = self.path.clone();
+            // GetAttributes().ReadOnly is `c.readOnly`, which
+            // `supportsFSGroup` already excluded.
+            tokio::task::spawn_blocking(move || {
+                crate::volume_ownership::set_volume_ownership_with_policy(
+                    Path::new(&root),
+                    fs_group,
+                    policy.as_deref(),
+                    false,
+                )
+            })
+            .await
+            .map_err(|e| anyhow!("fsGroup ownership task panicked: {e}"))?
+            .map_err(|e| {
+                CsiError::UncertainProgress(format!(
+                    "applyFSGroup failed for vol {}: {e}",
+                    self.volume_id
+                ))
+            })?;
+            debug!(
+                "kubernetes.io/csi: mounter.SetupAt fsGroup [{}] applied successfully to {}",
+                self.fs_group.unwrap_or_default(),
+                self.volume_id
+            );
         }
 
         debug!(
