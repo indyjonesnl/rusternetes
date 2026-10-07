@@ -1,3 +1,4 @@
+use crate::controllers::worker_pool::spawn_workers;
 use anyhow::Result;
 use rusternetes_common::resources::{
     AllocationResult, DeviceAllocationResult, DeviceClass, DeviceRequestAllocationResult,
@@ -8,6 +9,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
 use tracing::{debug, error, info, warn};
+
+/// Workers draining this controller's queue: `defaultResourceClaimControllerWorkers = 50`
+/// (cmd/kube-controller-manager/app/core.go:463), used at `:497`; the pool is launched by
+/// `Controller.Run` (pkg/controller/resourceclaim/controller.go:436-440).
+const CONCURRENT_RESOURCE_CLAIM_SYNCS: usize = 50;
 
 /// ResourceClaimController manages the allocation of devices for ResourceClaims
 ///
@@ -31,10 +37,13 @@ impl<S: Storage + 'static> ResourceClaimController<S> {
 
         let queue = WorkQueue::new();
 
-        let worker_queue = queue.clone();
-        let worker_self = Arc::clone(&self);
-        tokio::spawn(async move {
-            worker_self.worker(worker_queue).await;
+        // N workers drain ONE shared queue; a key in flight is never handed to
+        // a second worker (`wait.UntilWithContext(ctx, worker, time.Second)` x N).
+        spawn_workers(CONCURRENT_RESOURCE_CLAIM_SYNCS, &queue, |worker_queue| {
+            let worker_self = Arc::clone(&self);
+            async move {
+                worker_self.worker(worker_queue).await;
+            }
         });
 
         loop {

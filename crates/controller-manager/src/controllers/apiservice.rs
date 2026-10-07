@@ -1,3 +1,4 @@
+use crate::controllers::worker_pool::spawn_workers;
 /// APIService Availability Controller
 ///
 /// Watches APIService resources and updates their Available condition
@@ -11,6 +12,10 @@ use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQue
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, warn};
+
+/// Workers draining this controller's queue: the aggregator starts both availability
+/// controllers with `Run(5, ...)` (staging/src/k8s.io/kube-aggregator/pkg/apiserver/apiserver.go:341,363).
+const CONCURRENT_APISERVICE_AVAILABILITY_SYNCS: usize = 5;
 
 pub struct APIServiceAvailabilityController<S: Storage> {
     storage: Arc<S>,
@@ -28,11 +33,18 @@ impl<S: Storage + 'static> APIServiceAvailabilityController<S> {
         let queue = WorkQueue::new();
 
         // Spawn worker
-        let worker_queue = queue.clone();
-        let worker_self = Arc::clone(&self);
-        tokio::spawn(async move {
-            worker_self.worker(worker_queue).await;
-        });
+        // N workers drain ONE shared queue; a key in flight is never handed to
+        // a second worker (`wait.UntilWithContext(ctx, worker, time.Second)` x N).
+        spawn_workers(
+            CONCURRENT_APISERVICE_AVAILABILITY_SYNCS,
+            &queue,
+            |worker_queue| {
+                let worker_self = Arc::clone(&self);
+                async move {
+                    worker_self.worker(worker_queue).await;
+                }
+            },
+        );
 
         // Spawn secondary watch for endpointslices — changes to endpoints
         // affect APIService availability
