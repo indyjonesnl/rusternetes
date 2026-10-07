@@ -490,6 +490,20 @@ pub(crate) mod tests {
         async fn new_mounter(&self, _s: &Spec<'_>, _p: &Pod) -> anyhow::Result<Box<dyn Mounter>> {
             Err(anyhow!("not used"))
         }
+        fn new_unmounter(
+            &self,
+            _n: &str,
+            _u: &str,
+        ) -> anyhow::Result<Box<dyn crate::volume_plugins::plugin::Unmounter>> {
+            Err(anyhow!("not used"))
+        }
+        fn construct_volume_spec(
+            &self,
+            _n: &str,
+            _p: &str,
+        ) -> anyhow::Result<crate::volume_plugins::plugin::ReconstructedVolume> {
+            Err(anyhow!("not used"))
+        }
     }
 
     #[async_trait]
