@@ -1286,6 +1286,7 @@ mod tests {
     /// Pod-level `spec.resources` overrides the container aggregate for the
     /// names it sets (`helpers.go:168-176`), and only for supported names.
     #[test]
+    #[serial_test::serial]
     fn test_pod_requests_pod_level_resources_override() {
         let mut p = pod(vec![container("c1", &[("cpu", "1")], &[])], vec![]);
         p.spec.as_mut().unwrap().resources = Some(ResourceRequirements {
@@ -1581,6 +1582,7 @@ mod tests {
 
     /// `IsPodLevelResourcesSet` skips the check (`pods.go:131-133`).
     #[test]
+    #[serial_test::serial]
     fn test_pod_constraints_skipped_with_pod_level_resources() {
         let mut p = pod(vec![container("c", &[], &[])], vec![]);
         p.spec.as_mut().unwrap().resources = Some(ResourceRequirements {

@@ -463,4 +463,158 @@ mod tests {
         default_pod_requests_from_limits(&mut spec);
         assert_eq!(pod_requests(&spec), None);
     }
+
+    fn pod_limits(spec: &PodSpec) -> Option<HashMap<String, String>> {
+        spec.resources.as_ref().and_then(|r| r.limits.clone())
+    }
+
+    /// Two containers with cpu + hugepages-2Mi limits (and so, after container
+    /// defaulting, equal requests).
+    fn hugepage_containers() -> Vec<Container> {
+        vec![
+            container("a", Some(&[("cpu", "2m"), ("hugepages-2Mi", "4Mi")]), None),
+            container("b", Some(&[("cpu", "1m"), ("hugepages-2Mi", "2Mi")]), None),
+        ]
+    }
+
+    /// `defaults_test.go` "pod has cpu limit with hugepages requests=unset
+    /// limits=unset, container hugepages requests=unset limits=set": the pod
+    /// limit gains the aggregated container hugepages limit (6Mi), and the
+    /// request gains aggregated cpu (3m) and, from the new limit, hugepages.
+    #[test]
+    #[serial]
+    fn pod_cpu_limit_gets_aggregated_hugepages_limit() {
+        let _g = with_feature(Feature::PodLevelResources, true);
+        let mut spec = pod_spec(
+            hugepage_containers(),
+            Some(rr(Some(&[("cpu", "5m")]), None)),
+        );
+        default_pod_requests_from_limits(&mut spec);
+        assert_eq!(
+            pod_limits(&spec),
+            Some(map(&[("cpu", "5m"), ("hugepages-2Mi", "6Mi")]))
+        );
+        assert_eq!(
+            pod_requests(&spec),
+            Some(map(&[("cpu", "3m"), ("hugepages-2Mi", "6Mi")]))
+        );
+    }
+
+    /// "pod has cpu request with hugepages requests=unset limits=unset":
+    /// requests alone make the block "partly specified", so the hugepages limit
+    /// is created from the containers; the explicit cpu request is kept.
+    #[test]
+    #[serial]
+    fn pod_cpu_request_with_container_hugepages_limits() {
+        let _g = with_feature(Feature::PodLevelResources, true);
+        let mut spec = pod_spec(
+            hugepage_containers(),
+            Some(rr(None, Some(&[("cpu", "5m")]))),
+        );
+        default_pod_requests_from_limits(&mut spec);
+        let reqs = pod_requests(&spec).unwrap();
+        assert_eq!(
+            reqs["cpu"], "5m",
+            "an explicit pod request is never rewritten"
+        );
+        assert_eq!(reqs["hugepages-2Mi"], "6Mi");
+        assert_eq!(pod_limits(&spec).unwrap()["hugepages-2Mi"], "6Mi");
+    }
+
+    /// "pod hugepages requests=set limits=set, container hugepages
+    /// requests=unset limits=set": a pod-level hugepages request suppresses
+    /// limit defaulting (`defaults.go:507-510`); nothing changes.
+    #[test]
+    #[serial]
+    fn pod_hugepages_request_blocks_limit_defaulting() {
+        let _g = with_feature(Feature::PodLevelResources, true);
+        let both = &[("cpu", "5m"), ("hugepages-2Mi", "10Mi")];
+        let mut spec = pod_spec(hugepage_containers(), Some(rr(Some(both), Some(both))));
+        default_pod_requests_from_limits(&mut spec);
+        assert_eq!(pod_limits(&spec), Some(map(both)));
+        assert_eq!(pod_requests(&spec), Some(map(both)));
+    }
+
+    /// Direct: `default_huge_page_pod_limits` does nothing unless the pod-level
+    /// block already has a limit or a request (`defaults.go:491-493`).
+    #[test]
+    fn huge_page_limits_need_a_partly_specified_block() {
+        for res in [None, Some(rr(None, None)), Some(rr(Some(&[]), Some(&[])))] {
+            let mut spec = pod_spec(hugepage_containers(), res.clone());
+            default_huge_page_pod_limits(&mut spec);
+            assert_eq!(spec.resources, res);
+        }
+    }
+
+    /// Direct: only hugepages are copied; cpu is left to `defaultPodRequests`.
+    #[test]
+    fn huge_page_limits_copy_only_hugepages() {
+        let mut spec = pod_spec(
+            hugepage_containers(),
+            Some(rr(Some(&[("memory", "1Mi")]), None)),
+        );
+        default_huge_page_pod_limits(&mut spec);
+        assert_eq!(
+            pod_limits(&spec),
+            Some(map(&[("memory", "1Mi"), ("hugepages-2Mi", "6Mi")]))
+        );
+    }
+
+    /// Direct: an already-set pod hugepages limit is kept, not overwritten.
+    #[test]
+    fn huge_page_limits_keep_an_explicit_pod_limit() {
+        let mut spec = pod_spec(
+            hugepage_containers(),
+            Some(rr(Some(&[("hugepages-2Mi", "10Mi")]), None)),
+        );
+        default_huge_page_pod_limits(&mut spec);
+        assert_eq!(pod_limits(&spec), Some(map(&[("hugepages-2Mi", "10Mi")])));
+    }
+
+    /// Direct: `IsOvercommitAllowed` (`helpers.go:130-133`) - a container
+    /// hugepages request is never copied into the pod-level request; only the
+    /// pod-level limit can seed it.
+    #[test]
+    fn pod_requests_do_not_take_hugepages_from_containers() {
+        let mut spec = pod_spec(
+            vec![container(
+                "a",
+                None,
+                Some(&[("cpu", "2m"), ("hugepages-2Mi", "4Mi")]),
+            )],
+            Some(rr(Some(&[("cpu", "5m")]), None)),
+        );
+        default_pod_level_requests(&mut spec);
+        assert_eq!(pod_requests(&spec), Some(map(&[("cpu", "2m")])));
+    }
+
+    /// "pod limits=set, container unsupported requests=set limits=set": a
+    /// pod-level request is created only for supported names; "storage" and
+    /// "ephemeral-storage" at container level are not aggregated.
+    #[test]
+    fn pod_requests_ignore_unsupported_resources() {
+        let mut spec = pod_spec(
+            vec![container(
+                "a",
+                None,
+                Some(&[("storage", "1Mi"), ("ephemeral-storage", "5Mi")]),
+            )],
+            Some(rr(Some(&[("storage", "1Mi")]), None)),
+        );
+        default_pod_level_requests(&mut spec);
+        assert_eq!(pod_requests(&spec), None);
+
+        let mut spec = pod_spec(
+            vec![container("a", None, Some(&[("storage", "1Mi")]))],
+            Some(rr(
+                Some(&[("cpu", "2m"), ("memory", "1Mi"), ("storage", "1Mi")]),
+                None,
+            )),
+        );
+        default_pod_level_requests(&mut spec);
+        assert_eq!(
+            pod_requests(&spec),
+            Some(map(&[("cpu", "2m"), ("memory", "1Mi")]))
+        );
+    }
 }
