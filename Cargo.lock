@@ -4290,6 +4290,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
  "base64 0.22.1",
  "chrono",
  "chrono-tz",
@@ -4301,6 +4302,7 @@ dependencies = [
  "jsonwebtoken",
  "mimalloc",
  "pem",
+ "prometheus",
  "rand 0.9.4",
  "rcgen",
  "reqwest",
@@ -4344,6 +4346,7 @@ name = "rusternetes-discovery"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "rusternetes-common",
  "rusternetes-storage",
  "serde",
  "serde_json",
@@ -4442,6 +4445,7 @@ dependencies = [
  "hyper-util",
  "inotify",
  "mimalloc",
+ "pem",
  "prost",
  "rcgen",
  "reqwest",
@@ -4456,6 +4460,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "serial_test",
+ "sha1",
  "sha2 0.10.9",
  "sysinfo",
  "tar",

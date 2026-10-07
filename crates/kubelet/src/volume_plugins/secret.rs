@@ -109,6 +109,7 @@ pub(crate) fn make_payload(
                 payload.insert(
                     name.clone(),
                     FileProjection {
+                        fs_user: None,
                         data: bytes.clone(),
                         mode: default_mode,
                     },
@@ -126,6 +127,7 @@ pub(crate) fn make_payload(
                 payload.insert(
                     ktp.path.clone(),
                     FileProjection {
+                        fs_user: None,
                         data: content.clone(),
                         mode: ktp.mode.map(|m| m as u32).unwrap_or(default_mode),
                     },
@@ -337,6 +339,7 @@ impl Mounter for SecretMounter {
                     payload.insert(
                         "ca.crt".to_string(),
                         FileProjection {
+                            fs_user: None,
                             data: ca_content,
                             mode: secret_default_mode as u32,
                         },

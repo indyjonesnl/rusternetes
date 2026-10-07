@@ -112,6 +112,11 @@ pub enum KeyUsage {
     MicrosoftSGC,
     #[serde(rename = "netscape sgc")]
     NetscapeSGC,
+    /// A value outside the supported set. Upstream's `KeyUsage` is a plain Go
+    /// `string`, so any string decodes and validation answers `Unsupported
+    /// value` (422), not a 400 decode failure (#2497).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

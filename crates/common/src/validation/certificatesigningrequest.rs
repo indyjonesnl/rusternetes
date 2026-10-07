@@ -8,9 +8,8 @@
 //! `usages` required + no duplicates, `signerName` format (incl. the v1
 //! rejection of the legacy signer), and `expirationSeconds >= 600`.
 //!
-//! `usages` is a typed enum in the resource model, so an unrecognized usage
-//! *string* is already rejected at decode time (upstream's `allValidUsages`
-//! `NotSupported` check). The `request` self-signature is verified
+//! An unrecognized usage *string* decodes to `KeyUsage::Unknown` and is
+//! answered with upstream's `allValidUsages` `NotSupported` check (#2497). The `request` self-signature is verified
 //! (`CheckSignature`) after the structural PKCS#10 parse, mirroring upstream
 //! `validateCSR`.
 
@@ -69,6 +68,39 @@ fn parse_csr_request_error(request: &str) -> Option<String> {
 // Mirror upstream apimachinery length constants.
 const DNS1123_SUBDOMAIN_MAX_LENGTH: usize = 253;
 const DNS1123_LABEL_MAX_LENGTH: usize = 63;
+
+/// `allValidUsages` (`pkg/apis/certificates/validation/validation.go:154-178`)
+/// as `sets.String.List()` sorts it.
+const ALL_VALID_USAGES: &[&str] = &[
+    "any",
+    "cert sign",
+    "client auth",
+    "code signing",
+    "content commitment",
+    "crl sign",
+    "data encipherment",
+    "decipher only",
+    "digital signature",
+    "email protection",
+    "encipher only",
+    "ipsec end system",
+    "ipsec tunnel",
+    "ipsec user",
+    "key agreement",
+    "key encipherment",
+    "microsoft sgc",
+    "netscape sgc",
+    "ocsp signing",
+    "s/mime",
+    "server auth",
+    "signing",
+    "timestamping",
+];
+
+/// `hasUnknownUsage` (validation.go:448-455).
+fn has_unknown_usage(usages: &[KeyUsage]) -> bool {
+    usages.iter().any(|u| matches!(u, KeyUsage::Unknown(_)))
+}
 
 /// `certificates.LegacyUnknownSignerName` — not allowed via the v1 create API.
 const LEGACY_UNKNOWN_SIGNER_NAME: &str = "kubernetes.io/legacy-unknown";
@@ -366,6 +398,9 @@ struct UpdateValidationOptions {
     /// `allowSettingApprovalConditions` — the `/approval` subresource may
     /// add/modify Approved/Denied conditions.
     allow_setting_approval_conditions: bool,
+    /// `allowUnknownUsages` — old object already had a usage outside
+    /// `allValidUsages` (validation.go:439-446).
+    allow_unknown_usages: bool,
 }
 
 impl UpdateValidationOptions {
@@ -379,6 +414,7 @@ impl UpdateValidationOptions {
             allow_setting_certificate: false,
             allow_resetting_certificate: false,
             allow_setting_approval_conditions: false,
+            allow_unknown_usages: false,
         }
     }
 }
@@ -431,6 +467,7 @@ fn get_validation_options(
         allow_setting_certificate: false,
         allow_resetting_certificate: false,
         allow_setting_approval_conditions: false,
+        allow_unknown_usages: has_unknown_usage(&old_csr.spec.usages),
     }
 }
 
@@ -498,6 +535,18 @@ fn validate_certificate_signing_request_with_opts(
 
     if csr.spec.usages.is_empty() {
         errs.push(Error::required(&spec.child("usages"), ""));
+    }
+    // validation.go:193-199.
+    if !opts.allow_unknown_usages {
+        for (i, usage) in csr.spec.usages.iter().enumerate() {
+            if let KeyUsage::Unknown(u) = usage {
+                errs.push(Error::not_supported(
+                    &spec.child("usages").index(i),
+                    u.clone(),
+                    ALL_VALID_USAGES,
+                ));
+            }
+        }
     }
     let mut seen: Vec<&KeyUsage> = Vec::new();
     for (i, usage) in csr.spec.usages.iter().enumerate() {

@@ -712,10 +712,11 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
             // adds each scope-matching claim's `Usage` - the same
             // `pvc_usage` quota admission charges, so `status.used` carries
             // `requests.storage` and the per-class keys admission reads.
-            // `pvcMatchesScopeFunc` matches only the VolumeAttributesClass
-            // scope (not ported yet), so a scoped quota matches no claim.
-            let scoped = !scopes.is_empty()
-                || scope_selector.is_some_and(|s| !s.match_expressions.is_empty());
+            // `pvcMatchesScopeFunc` (:293-309) matches only the
+            // VolumeAttributesClass scope, so any other scope matches no
+            // claim; `CalculateUsageStats` (generic/evaluator.go:185-229)
+            // ANDs every `spec.scopes` entry (as `Exists`) and every
+            // `scopeSelector` expression.
             let zero = Quantity::from_value(0, Format::DecimalSI);
             let mut totals = quota::ResourceList::new();
             for key in hard_keys
@@ -724,11 +725,26 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
             {
                 totals.insert(key.clone(), zero);
             }
-            if !scoped {
-                let pvc_prefix = format!("/registry/persistentvolumeclaims/{}/", namespace);
-                let pvcs: Vec<rusternetes_common::resources::PersistentVolumeClaim> =
-                    self.storage.list(&pvc_prefix).await.unwrap_or_default();
-                for pvc in &pvcs {
+            let spec = rusternetes_common::resources::ResourceQuotaSpec {
+                hard: None,
+                scopes: Some(scopes.to_vec()),
+                scope_selector: scope_selector.cloned(),
+            };
+            let selectors = quota::scope_selectors_from_quota(&spec);
+            let pvc_prefix = format!("/registry/persistentvolumeclaims/{}/", namespace);
+            let pvcs: Vec<rusternetes_common::resources::PersistentVolumeClaim> =
+                self.storage.list(&pvc_prefix).await.unwrap_or_default();
+            // An erroring scope function ends the walk with what has been
+            // summed so far (evaluator.go:203-205, `return result, nil`).
+            'claims: for pvc in &pvcs {
+                let mut matches_scopes = true;
+                for selector in &selectors {
+                    match quota::pvc_matches_scope(selector, pvc) {
+                        Ok(m) => matches_scopes = matches_scopes && m,
+                        Err(_) => break 'claims,
+                    }
+                }
+                if matches_scopes {
                     totals = quota::add(&totals, &quota::pvc_usage(pvc));
                 }
             }
@@ -1305,6 +1321,97 @@ mod tests {
             usage["bronze.storageclass.storage.k8s.io/requests.storage"],
             "0"
         );
+    }
+
+    /// `pvcEvaluator.UsageStats` with `pvcMatchesScopeFunc`
+    /// (persistent_volume_claims.go:250-257, 293-309): a quota scoped to the
+    /// VolumeAttributesClass counts only the claims that reference the class
+    /// (spec, current or modify-target), and any other scope counts none.
+    #[tokio::test]
+    async fn test_calculate_usage_pvc_volume_attributes_class_scope() {
+        use rusternetes_common::resources::{ScopeSelector, ScopedResourceSelectorRequirement};
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ResourceQuotaController::new(storage.clone());
+        let claims = [
+            (
+                "spec-gold",
+                serde_json::json!({"volumeAttributesClassName": "gold"}),
+                serde_json::json!({}),
+            ),
+            (
+                "current-gold",
+                serde_json::json!({}),
+                serde_json::json!({"currentVolumeAttributesClassName": "gold"}),
+            ),
+            (
+                "target-gold",
+                serde_json::json!({}),
+                serde_json::json!({"modifyVolumeStatus": {"targetVolumeAttributesClassName": "gold", "status": "Pending"}}),
+            ),
+            (
+                "silver",
+                serde_json::json!({"volumeAttributesClassName": "silver"}),
+                serde_json::json!({}),
+            ),
+            ("none", serde_json::json!({}), serde_json::json!({})),
+        ];
+        for (name, spec_extra, status) in claims {
+            let mut spec = serde_json::json!({"resources": {"requests": {"storage": "1Gi"}}});
+            for (k, v) in spec_extra.as_object().unwrap() {
+                spec[k] = v.clone();
+            }
+            let pvc = serde_json::json!({
+                "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                "metadata": {"name": name, "namespace": "test-ns"},
+                "spec": spec, "status": status,
+            });
+            storage
+                .create(
+                    &format!("/registry/persistentvolumeclaims/test-ns/{name}"),
+                    &pvc,
+                )
+                .await
+                .unwrap();
+        }
+        let hard: Vec<String> = ["persistentvolumeclaims", "requests.storage"]
+            .map(String::from)
+            .to_vec();
+        let selector = |op: &str, values: Option<Vec<String>>| ScopeSelector {
+            match_expressions: vec![ScopedResourceSelectorRequirement {
+                scope_name: "VolumeAttributesClass".to_string(),
+                operator: op.to_string(),
+                values,
+            }],
+        };
+        let in_gold = selector("In", Some(vec!["gold".to_string()]));
+        let usage = controller
+            .calculate_usage("test-ns", &[], Some(&in_gold), &hard)
+            .await
+            .unwrap();
+        assert_eq!(usage["persistentvolumeclaims"], "3");
+        assert_eq!(usage["requests.storage"], "3Gi");
+
+        let exists = selector("Exists", None);
+        let usage = controller
+            .calculate_usage("test-ns", &[], Some(&exists), &hard)
+            .await
+            .unwrap();
+        assert_eq!(usage["persistentvolumeclaims"], "4");
+
+        let does_not_exist = selector("DoesNotExist", None);
+        let usage = controller
+            .calculate_usage("test-ns", &[], Some(&does_not_exist), &hard)
+            .await
+            .unwrap();
+        assert_eq!(usage["persistentvolumeclaims"], "1");
+
+        // `scopes: [BestEffort]` is an `Exists` selector on a scope the PVC
+        // evaluator does not know: it matches no claim.
+        let usage = controller
+            .calculate_usage("test-ns", &["BestEffort".to_string()], None, &hard)
+            .await
+            .unwrap();
+        assert_eq!(usage["persistentvolumeclaims"], "0");
     }
 
     /// A pod's peak footprint includes its init containers: upstream
