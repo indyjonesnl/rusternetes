@@ -28,7 +28,8 @@ use proto::node_service_capability::rpc::Type as NodeRpcType;
 use proto::volume_capability::access_mode::Mode as AccessModeKind;
 use proto::volume_capability::{AccessMode, AccessType, BlockVolume, MountVolume};
 use proto::{
-    CapacityRange, NodeExpandVolumeRequest, NodeGetCapabilitiesRequest, NodePublishVolumeRequest,
+    CapacityRange, NodeExpandVolumeRequest, NodeGetCapabilitiesRequest, NodeGetInfoRequest,
+    NodePublishVolumeRequest,
     NodeStageVolumeRequest, NodeUnpublishVolumeRequest, NodeUnstageVolumeRequest, VolumeCapability,
 };
 
@@ -138,6 +139,15 @@ pub fn as_single_node_multi_writer_capable_csi_access_mode(
     }
 }
 
+/// The three values upstream's `NodeGetInfo` returns (`csi_client.go:43-47`:
+/// `nodeID`, `maxVolumePerNode`, `accessibleTopology`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NodeInfo {
+    pub node_id: String,
+    pub max_volumes_per_node: i64,
+    pub accessible_topology: HashMap<String, String>,
+}
+
 /// Port of `csiDriverClient` (`csi_client.go:106-112`).
 pub struct CsiDriverClient {
     driver_name: String,
@@ -224,6 +234,25 @@ impl CsiDriverClient {
     /// calls `NodeGetCapabilities` every time — drivers may change.
     async fn node_supports_capability(&self, want: NodeRpcType) -> Result<bool, CsiError> {
         Ok(self.node_get_capabilities().await?.contains(&want))
+    }
+
+    /// `NodeGetInfo` / `nodeGetInfoV1` (`csi_client.go:172-209`): the driver's
+    /// node id, its max volumes per node (0 = unlimited) and the topology
+    /// segments (empty when the driver reports no `accessible_topology`).
+    pub async fn node_get_info(&self) -> Result<NodeInfo, CsiError> {
+        let mut c = self.node_client()?;
+        let resp = self
+            .call(c.node_get_info(NodeGetInfoRequest {}))
+            .await
+            .map_err(|s| CsiError::Failed(s.to_string()))?;
+        Ok(NodeInfo {
+            node_id: resp.node_id,
+            max_volumes_per_node: resp.max_volumes_per_node,
+            accessible_topology: resp
+                .accessible_topology
+                .map(|t| t.segments)
+                .unwrap_or_default(),
+        })
     }
 
     /// `NodeSupportsStageUnstage` (`csi_client.go:486`).
@@ -510,6 +539,7 @@ pub(crate) mod fake {
         pub unpublish: Vec<NodeUnpublishVolumeRequest>,
         pub expand: Vec<NodeExpandVolumeRequest>,
         pub capability_calls: usize,
+        pub node_get_info_calls: usize,
     }
 
     #[derive(Clone, Default)]
@@ -520,6 +550,8 @@ pub(crate) mod fake {
         pub publish_error: Arc<Mutex<Option<tonic::Code>>>,
         /// When set, `NodeExpandVolume` fails with this code.
         pub expand_error: Arc<Mutex<Option<tonic::Code>>>,
+        /// `NodeGetInfo`'s answer: `Err` makes the RPC fail.
+        pub node_info: Arc<Mutex<Option<Result<NodeGetInfoResponse, tonic::Code>>>>,
     }
 
     impl FakeDriver {
@@ -582,6 +614,17 @@ pub(crate) mod fake {
                 capacity_bytes: required,
             }))
         }
+        async fn node_get_info(
+            &self,
+            _r: Request<NodeGetInfoRequest>,
+        ) -> Result<Response<NodeGetInfoResponse>, Status> {
+            self.calls.lock().unwrap().node_get_info_calls += 1;
+            match self.node_info.lock().unwrap().clone() {
+                Some(Ok(r)) => Ok(Response::new(r)),
+                Some(Err(code)) => Err(Status::new(code, "fake node info failure")),
+                None => Ok(Response::new(NodeGetInfoResponse::default())),
+            }
+        }
         async fn node_get_capabilities(
             &self,
             _r: Request<NodeGetCapabilitiesRequest>,
@@ -619,11 +662,61 @@ pub(crate) mod fake {
 #[cfg(test)]
 mod tests {
     use super::fake::*;
+    use super::proto::{NodeGetInfoResponse, Topology};
     use super::*;
     use rusternetes_common::quantity::Format;
 
     fn caps(c: &[NodeRpcType]) -> FakeDriver {
         FakeDriver::with_capabilities(c)
+    }
+
+    /// `TestClientNodeGetInfo` (`csi_client_test.go`): `NodeGetInfo` returns the
+    /// driver's node id, its max volumes per node and the topology segments
+    /// (`csi_client.go:172-209`, `nodeGetInfoV1`).
+    #[tokio::test]
+    async fn node_get_info_returns_id_limit_and_topology_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("csi.sock");
+        let d = caps(&[]);
+        *d.node_info.lock().unwrap() = Some(Ok(NodeGetInfoResponse {
+            node_id: "com.example.csi/csi-node1".into(),
+            max_volumes_per_node: 10,
+            accessible_topology: Some(Topology {
+                segments: HashMap::from([("com.example.csi/zone".into(), "zoneA".into())]),
+            }),
+        }));
+        let _srv = serve(d.clone(), &sock);
+        let c = CsiDriverClient::with_endpoint("drv", &sock);
+
+        let info = c.node_get_info().await.unwrap();
+        assert_eq!(info.node_id, "com.example.csi/csi-node1");
+        assert_eq!(info.max_volumes_per_node, 10);
+        assert_eq!(info.accessible_topology["com.example.csi/zone"], "zoneA");
+        assert_eq!(d.calls.lock().unwrap().node_get_info_calls, 1);
+    }
+
+    /// No `accessible_topology` in the response: upstream returns a nil map
+    /// (`csi_client.go:203-206`).
+    #[tokio::test]
+    async fn node_get_info_without_topology_is_empty_and_errors_propagate() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("csi.sock");
+        let d = caps(&[]);
+        *d.node_info.lock().unwrap() = Some(Ok(NodeGetInfoResponse {
+            node_id: "n".into(),
+            ..Default::default()
+        }));
+        let _srv = serve(d.clone(), &sock);
+        let c = CsiDriverClient::with_endpoint("drv", &sock);
+        assert!(c
+            .node_get_info()
+            .await
+            .unwrap()
+            .accessible_topology
+            .is_empty());
+
+        *d.node_info.lock().unwrap() = Some(Err(tonic::Code::Unavailable));
+        assert!(c.node_get_info().await.is_err());
     }
 
     /// `TestClientNodePublishVolume` (`csi_client_test.go`): the request carries
