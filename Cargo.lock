@@ -4442,6 +4442,7 @@ dependencies = [
  "hyper-util",
  "inotify",
  "mimalloc",
+ "pem",
  "prost",
  "rcgen",
  "reqwest",

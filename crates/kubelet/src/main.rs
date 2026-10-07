@@ -16,6 +16,7 @@ mod cri_runtime;
 // into the bin (shared modules) but read as dead here; the lib is their real
 // consumer.
 mod atomic_writer;
+mod clustertrustbundle;
 // The single home for downward-API `fieldRef`/`resourceFieldRef` resolution.
 // `volumes` and `cri_runtime::translate` both delegate here; until now this
 // module was declared only in `lib.rs`, so the *binary* compiled two divergent
@@ -59,6 +60,8 @@ mod sysctl;
 // with the desired-state-of-world populator (#1970).
 #[allow(dead_code, unused_imports)]
 mod volume_manager;
+#[allow(dead_code)]
+mod volume_ownership;
 #[allow(dead_code, unused_imports)]
 mod volume_plugins;
 #[allow(dead_code)]
