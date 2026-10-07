@@ -1,4 +1,5 @@
 pub mod atomic_writer;
+pub mod clustertrustbundle;
 #[allow(dead_code)]
 pub mod cni;
 pub mod config;

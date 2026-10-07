@@ -817,6 +817,7 @@ impl VolumeManager {
                 dir,
                 |n| fetched.secret(n),
                 |n| fetched.config_map(n),
+                |i| fetched.trust_anchors(i),
             ) {
                 Ok(payload) => {
                     if let Err(e) = crate::volume_plugins::projected::write_payload(
@@ -1296,48 +1297,6 @@ impl VolumeManager {
         }
         Ok(())
     }
-
-    /// Get a pod field value for DownwardAPI
-    /// Resolve a downwardAPI/projected volume item's `fieldRef` to the string
-    /// written into the volume file.
-    ///
-    /// Delegates to [`crate::downward_api::resolve_pod_field`] so the volume and
-    /// env-var paths render `metadata.labels['x']`, `status.podIP` and friends
-    /// identically. The hand-rolled copy this replaced was a near-duplicate that
-    /// had drifted: it hardcoded the bracket-key offsets (`&path[17..]`, so only
-    /// single quotes parsed) where the shared helper accepts the double-quoted
-    /// and unquoted forms the API allows too.
-    pub(crate) fn get_pod_field_value(&self, pod: &Pod, field_path: &str) -> Result<String> {
-        crate::downward_api::resolve_pod_field(pod, field_path).map_err(|e| anyhow::anyhow!("{e}"))
-    }
-
-    /// Resolve a downwardAPI/projected volume item's `resourceFieldRef` to the
-    /// string written into the volume file.
-    ///
-    /// Delegates to [`crate::downward_api::resolve_container_resource`], the port
-    /// of upstream `ExtractResourceValueByContainerNameAndNodeAllocatable`, which
-    /// is exactly what `pkg/volume/downwardapi/downwardapi.go:266` calls. The env
-    /// var path ([`crate::cri_runtime::translate`]) resolves the same selectors
-    /// through the same function, so a `resourceFieldRef` cannot render one value
-    /// as a file and a different one as an environment variable.
-    ///
-    /// This used to be a second, hand-rolled copy that (a) fell back to a
-    /// hardcoded 4 cores / 8 GiB instead of consulting the node's allocatable —
-    /// which reported `limits.ephemeral-storage` as 8 GiB on a node advertising
-    /// 100 GiB — (b) never searched init containers, and (c) had no
-    /// requests-default-to-limits fallback.
-    pub(crate) fn get_container_resource_value(
-        &self,
-        pod: &Pod,
-        resource_ref: &rusternetes_common::resources::ResourceFieldSelector,
-    ) -> Result<String> {
-        crate::downward_api::resolve_container_resource(
-            pod,
-            resource_ref,
-            Some(&self.node_allocatable),
-        )
-        .map_err(|e| anyhow::anyhow!("{e}"))
-    }
 }
 
 /// Secrets and ConfigMaps a volume references, read from storage on the async
@@ -1349,6 +1308,9 @@ impl VolumeManager {
 struct FetchedSources {
     secrets: HashMap<String, rusternetes_common::resources::Secret>,
     config_maps: HashMap<String, ConfigMap>,
+    /// Trust anchors of each projected `clusterTrustBundle` source, keyed by
+    /// the source's index in `projected.sources` (`projected.go:320-355`).
+    trust_anchors: HashMap<usize, std::result::Result<Vec<u8>, String>>,
 }
 
 impl FetchedSources {
@@ -1367,7 +1329,13 @@ impl FetchedSources {
             cms.push(n);
         }
         if let Some(sources) = volume.projected.as_ref().and_then(|p| p.sources.as_ref()) {
-            for source in sources {
+            for (index, source) in sources.iter().enumerate() {
+                if let Some(ctb) = &source.cluster_trust_bundle {
+                    let anchors = crate::volume_plugins::projected::trust_anchors_for(storage, ctb)
+                        .await
+                        .map_err(|e| e.to_string());
+                    out.trust_anchors.insert(index, anchors);
+                }
                 if let Some(n) = source.secret.as_ref().and_then(|s| s.name.as_ref()) {
                     secrets.push(n);
                 }
@@ -1400,6 +1368,10 @@ impl FetchedSources {
 
     fn config_map(&self, name: &str) -> Option<&ConfigMap> {
         self.config_maps.get(name)
+    }
+
+    fn trust_anchors(&self, index: usize) -> Option<&std::result::Result<Vec<u8>, String>> {
+        self.trust_anchors.get(&index)
     }
 }
 

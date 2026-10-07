@@ -4419,6 +4419,7 @@ dependencies = [
  "http-body-util",
  "hyper-util",
  "mimalloc",
+ "pem",
  "prost",
  "rcgen",
  "reqwest",

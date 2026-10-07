@@ -64,7 +64,15 @@ impl VolumePlugin for ProjectedPlugin {
     }
 
     async fn new_mounter(&self, spec: &Spec<'_>, pod: &Pod) -> Result<Box<dyn Mounter>> {
-        Ok(Box::new(ProjectedMounter {
+        Ok(Box::new(self.build_mounter(spec, pod)))
+    }
+}
+
+impl ProjectedPlugin {
+    /// `NewMounter` (`projected.go:112-124`), concrete so tests can reach
+    /// `collect_data`.
+    fn build_mounter(&self, spec: &Spec<'_>, pod: &Pod) -> ProjectedMounter {
+        ProjectedMounter {
             path: self
                 .host
                 .get_pod_volume_dir(&pod.metadata.uid, self.name(), &spec.volume.name),
@@ -96,7 +104,7 @@ impl VolumePlugin for ProjectedPlugin {
             // (`operation_generator.go:501-509`, `:583-584`).
             fs_user: crate::volume_plugins::util::fs_user_from(pod),
             fs_group: crate::volume_plugins::util::fs_group_from(pod),
-        }))
+        }
     }
 }
 
@@ -391,9 +399,24 @@ impl ProjectedMounter {
                     }
                     Err(e) => errlist.push(e.to_string()),
                 }
+            } else if let Some(ctb) = &source.cluster_trust_bundle {
+                match trust_anchors_for(storage.as_ref(), ctb).await {
+                    Ok(trust_anchors) => {
+                        payload.insert(
+                            ctb.path.clone(),
+                            FileProjection {
+                                fs_user: self.fs_user,
+                                data: trust_anchors,
+                                mode: self.secret_file_mode(default_mode),
+                            },
+                        );
+                    }
+                    Err(e) => errlist.push(e.to_string()),
+                }
             }
-            // ClusterTrustBundle / PodCertificate: not yet implemented, see
-            // the follow-up issue linked from the PR.
+            // PodCertificate (`projected.go:357-398`): not implemented — it
+            // needs the kubelet's PodCertificate manager (see the follow-up
+            // issue linked from the PR). Such a source is skipped.
         }
 
         if errlist.is_empty() {
@@ -613,6 +636,31 @@ impl Mounter for ProjectedMounter {
     }
 }
 
+/// The `source.ClusterTrustBundle` lookup of `collectData`
+/// (`projected.go:320-345`): by name, else by signer name + label selector,
+/// else an error. `allowEmpty` is `optional` (`:321-324`).
+pub(crate) async fn trust_anchors_for<S: Storage + ?Sized>(
+    storage: &S,
+    ctb: &rusternetes_common::resources::ClusterTrustBundleProjection,
+) -> Result<Vec<u8>> {
+    let allow_empty = ctb.optional.unwrap_or(false);
+    if let Some(name) = &ctb.name {
+        crate::clustertrustbundle::get_trust_anchors_by_name(storage, name, allow_empty).await
+    } else if let Some(signer) = &ctb.signer_name {
+        crate::clustertrustbundle::get_trust_anchors_by_signer(
+            storage,
+            signer,
+            ctb.label_selector.as_ref(),
+            allow_empty,
+        )
+        .await
+    } else {
+        Err(anyhow!(
+            "ClusterTrustBundle projection requires either name or signerName to be set"
+        ))
+    }
+}
+
 /// `volumeutil.NewAtomicWriter(..).Write(data, setPerms)` (`projected.go:
 /// 200-221`). `setPerms` (`:200-206`): "This may be the first time writing and
 /// new files get created outside the timestamp subdirectory: change the
@@ -649,6 +697,7 @@ pub(crate) fn resync_payload<'a>(
     volume_dir: &std::path::Path,
     secret: impl Fn(&str) -> Option<&'a Secret>,
     config_map: impl Fn(&str) -> Option<&'a ConfigMap>,
+    trust_anchors: impl Fn(usize) -> Option<&'a std::result::Result<Vec<u8>, String>>,
 ) -> std::result::Result<BTreeMap<String, FileProjection>, String> {
     let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
     let default_mode = projected.default_mode.unwrap_or(0o644) as u32;
@@ -656,7 +705,7 @@ pub(crate) fn resync_payload<'a>(
     let fs_group = crate::volume_plugins::util::fs_group_from(pod);
     let mut errlist: Vec<String> = Vec::new();
     let mut payload: BTreeMap<String, FileProjection> = BTreeMap::new();
-    for source in projected.sources.iter().flatten() {
+    for (index, source) in projected.sources.iter().flatten().enumerate() {
         if let Some(sp) = &source.secret {
             let name = sp.name.clone().unwrap_or_default();
             let optional = sp.optional.unwrap_or(false);
@@ -717,6 +766,22 @@ pub(crate) fn resync_payload<'a>(
                     "service account token {} is not projected yet: {e}",
                     tp.path
                 )),
+            }
+        } else if let Some(ctb) = &source.cluster_trust_bundle {
+            // Fetched by the async half of the resync (`FetchedSources`).
+            match trust_anchors(index) {
+                Some(Ok(data)) => {
+                    payload.insert(
+                        ctb.path.clone(),
+                        FileProjection {
+                            fs_user,
+                            data: data.clone(),
+                            mode: secret_file_mode(fs_user, fs_group, default_mode),
+                        },
+                    );
+                }
+                Some(Err(e)) => errlist.push(e.clone()),
+                None => errlist.push("ClusterTrustBundle was not fetched".to_string()),
             }
         }
     }
@@ -1102,5 +1167,186 @@ mod tests {
         m.set_up().await.unwrap();
         let after = std::fs::metadata(&real).unwrap();
         assert_eq!((before_s, before), (after.ctime(), after.ctime_nsec()));
+    }
+
+    // ---- ClusterTrustBundle source (projected.go:320-355) ----
+
+    fn test_root(tag: &str) -> String {
+        pem::encode_config(
+            &pem::Pem::new("CERTIFICATE", tag.as_bytes().to_vec()),
+            pem::EncodeConfig::new().set_line_ending(pem::LineEnding::LF),
+        )
+    }
+
+    async fn put_ctb(
+        st: &Arc<StorageBackend>,
+        name: &str,
+        signer: Option<&str>,
+        labels: serde_json::Value,
+        bundle: &str,
+    ) {
+        let mut spec = serde_json::json!({"trustBundle": bundle});
+        if let Some(s) = signer {
+            spec["signerName"] = s.into();
+        }
+        let ctb = serde_json::json!({
+            "apiVersion": "certificates.k8s.io/v1beta1", "kind": "ClusterTrustBundle",
+            "metadata": {"name": name, "labels": labels}, "spec": spec
+        });
+        st.create(&build_key("clustertrustbundles", None, name), &ctb)
+            .await
+            .unwrap();
+    }
+
+    async fn collect(
+        st: &Arc<StorageBackend>,
+        v: &Volume,
+        pod: &Pod,
+    ) -> Result<BTreeMap<String, FileProjection>> {
+        let root = tempfile::tempdir().unwrap();
+        let plugin = ProjectedPlugin::new(Arc::new(crate::volume_plugins::KubeletVolumeHost::new(
+            root.path().to_string_lossy().to_string(),
+            Some(st.clone()),
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            HashMap::new(),
+        )));
+        let spec = Spec {
+            volume: v,
+            persistent_volume: None,
+        };
+        plugin.build_mounter(&spec, pod).collect_data().await
+    }
+
+    fn payload_bundle(p: &BTreeMap<String, FileProjection>, path: &str) -> Vec<Vec<u8>> {
+        let mut v: Vec<Vec<u8>> = pem::parse_many(&p[path].data)
+            .unwrap()
+            .into_iter()
+            .map(|b| b.into_contents())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// `TestCollectDataWithClusterTrustBundle` (`projected_test.go:882-1039`),
+    /// the three upstream cases: by name, by signer name + label selector, and
+    /// by name with a non-default `defaultMode`.
+    #[tokio::test]
+    async fn collect_data_cluster_trust_bundle_upstream_cases() {
+        let st = Arc::new(StorageBackend::new_memory());
+        let root1 = test_root("root1");
+        put_ctb(&st, "foo", None, serde_json::json!({}), &root1).await;
+        put_ctb(
+            &st,
+            "foo:example:bar",
+            Some("foo.example/bar"),
+            serde_json::json!({"key": "value"}),
+            &root1,
+        )
+        .await;
+        let want = vec![b"root1".to_vec()];
+
+        // "single ClusterTrustBundle by name"
+        let v: Volume = serde_json::from_value(serde_json::json!({
+            "name": "proj", "projected": {"defaultMode": 420, "sources": [
+                {"clusterTrustBundle": {"name": "foo", "path": "bundle.pem"}}
+            ]}
+        }))
+        .unwrap();
+        let got = collect(&st, &v, &pod()).await.unwrap();
+        assert_eq!(payload_bundle(&got, "bundle.pem"), want);
+        assert_eq!(got["bundle.pem"].mode, 0o644);
+        assert_eq!(got["bundle.pem"].fs_user, None);
+
+        // "single ClusterTrustBundle by signer name"
+        let v: Volume = serde_json::from_value(serde_json::json!({
+            "name": "proj", "projected": {"defaultMode": 420, "sources": [
+                {"clusterTrustBundle": {
+                    "signerName": "foo.example/bar",
+                    "labelSelector": {"matchLabels": {"key": "value"}},
+                    "path": "bundle.pem"}}
+            ]}
+        }))
+        .unwrap();
+        let got = collect(&st, &v, &pod()).await.unwrap();
+        assert_eq!(payload_bundle(&got, "bundle.pem"), want);
+        assert_eq!(got["bundle.pem"].mode, 0o644);
+
+        // "single ClusterTrustBundle by name, non-default mode"
+        let v: Volume = serde_json::from_value(serde_json::json!({
+            "name": "proj", "projected": {"defaultMode": 384, "sources": [
+                {"clusterTrustBundle": {"name": "foo", "path": "bundle.pem"}}
+            ]}
+        }))
+        .unwrap();
+        let got = collect(&st, &v, &pod()).await.unwrap();
+        assert_eq!(got["bundle.pem"].mode, 0o600);
+    }
+
+    /// `projected.go:344-352`: 0600 + `FsUser` when FsUser/FsGroup is set.
+    #[tokio::test]
+    async fn collect_data_cluster_trust_bundle_fs_user_and_group() {
+        let st = Arc::new(StorageBackend::new_memory());
+        put_ctb(&st, "foo", None, serde_json::json!({}), &test_root("r")).await;
+        let v: Volume = serde_json::from_value(serde_json::json!({
+            "name": "proj", "projected": {"defaultMode": 420, "sources": [
+                {"clusterTrustBundle": {"name": "foo", "path": "bundle.pem"}}
+            ]}
+        }))
+        .unwrap();
+        let got = collect(
+            &st,
+            &v,
+            &pod_with_security(serde_json::json!({"fsGroup": 1000}), serde_json::json!({})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got["bundle.pem"].mode, 0o600);
+        assert_eq!(got["bundle.pem"].fs_user, None);
+        let got = collect(
+            &st,
+            &v,
+            &pod_with_security(
+                serde_json::json!({}),
+                serde_json::json!({"runAsUser": 1000}),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got["bundle.pem"].mode, 0o600);
+        assert_eq!(got["bundle.pem"].fs_user, Some(1000));
+    }
+
+    /// `projected.go:312-317` and the `allowEmpty` handling (`:321-324`).
+    #[tokio::test]
+    async fn collect_data_cluster_trust_bundle_errors_and_optional() {
+        let st = Arc::new(StorageBackend::new_memory());
+        let neither: Volume = serde_json::from_value(serde_json::json!({
+            "name": "proj", "projected": {"defaultMode": 420, "sources": [
+                {"clusterTrustBundle": {"path": "b.pem"}}
+            ]}
+        }))
+        .unwrap();
+        assert_eq!(
+            collect(&st, &neither, &pod())
+                .await
+                .unwrap_err()
+                .to_string(),
+            "ClusterTrustBundle projection requires either name or signerName to be set"
+        );
+        let missing: Volume = serde_json::from_value(serde_json::json!({
+            "name": "proj", "projected": {"defaultMode": 420, "sources": [
+                {"clusterTrustBundle": {"name": "nope", "path": "b.pem"}}
+            ]}
+        }))
+        .unwrap();
+        assert!(collect(&st, &missing, &pod()).await.is_err());
+        let optional: Volume = serde_json::from_value(serde_json::json!({
+            "name": "proj", "projected": {"defaultMode": 420, "sources": [
+                {"clusterTrustBundle": {"name": "nope", "optional": true, "path": "b.pem"}}
+            ]}
+        }))
+        .unwrap();
+        let got = collect(&st, &optional, &pod()).await.unwrap();
+        assert!(got["b.pem"].data.is_empty());
     }
 }
