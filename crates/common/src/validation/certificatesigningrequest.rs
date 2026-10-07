@@ -105,6 +105,18 @@ fn has_unknown_usage(usages: &[KeyUsage]) -> bool {
 /// `certificates.LegacyUnknownSignerName` — not allowed via the v1 create API.
 const LEGACY_UNKNOWN_SIGNER_NAME: &str = "kubernetes.io/legacy-unknown";
 
+/// `hasDuplicateUsage` (validation.go:466-475).
+fn has_duplicate_usage(usages: &[KeyUsage]) -> bool {
+    let mut seen: Vec<&KeyUsage> = Vec::new();
+    for u in usages {
+        if seen.contains(&u) {
+            return true;
+        }
+        seen.push(u);
+    }
+    false
+}
+
 fn usage_str(u: &KeyUsage) -> String {
     serde_json::to_value(u)
         .ok()
@@ -401,6 +413,9 @@ struct UpdateValidationOptions {
     /// `allowUnknownUsages` — old object already had a usage outside
     /// `allValidUsages` (validation.go:439-446).
     allow_unknown_usages: bool,
+    /// `allowDuplicateUsages` — old object already had a duplicate usage
+    /// (validation.go:457-464, `hasDuplicateUsage` :466-475).
+    allow_duplicate_usages: bool,
 }
 
 impl UpdateValidationOptions {
@@ -415,6 +430,7 @@ impl UpdateValidationOptions {
             allow_resetting_certificate: false,
             allow_setting_approval_conditions: false,
             allow_unknown_usages: false,
+            allow_duplicate_usages: false,
         }
     }
 }
@@ -468,6 +484,7 @@ fn get_validation_options(
         allow_resetting_certificate: false,
         allow_setting_approval_conditions: false,
         allow_unknown_usages: has_unknown_usage(&old_csr.spec.usages),
+        allow_duplicate_usages: has_duplicate_usage(&old_csr.spec.usages),
     }
 }
 
@@ -548,15 +565,18 @@ fn validate_certificate_signing_request_with_opts(
             }
         }
     }
-    let mut seen: Vec<&KeyUsage> = Vec::new();
-    for (i, usage) in csr.spec.usages.iter().enumerate() {
-        if seen.contains(&usage) {
-            errs.push(Error::duplicate(
-                &spec.child("usages").index(i),
-                usage_str(usage),
-            ));
-        } else {
-            seen.push(usage);
+    // validation.go:200-208.
+    if !opts.allow_duplicate_usages {
+        let mut seen: Vec<&KeyUsage> = Vec::new();
+        for (i, usage) in csr.spec.usages.iter().enumerate() {
+            if seen.contains(&usage) {
+                errs.push(Error::duplicate(
+                    &spec.child("usages").index(i),
+                    usage_str(usage),
+                ));
+            } else {
+                seen.push(usage);
+            }
         }
     }
 
@@ -1064,6 +1084,42 @@ mod update_and_wiring_tests {
         assert!(
             errs.is_empty(),
             "unchanged invalid cert should be tolerated, got {errs:?}"
+        );
+    }
+
+    /// validation_test.go:555-559 "compatible update, existing duplicate usages".
+    #[test]
+    fn get_validation_options_existing_duplicate_usages() {
+        let mut old = base_csr();
+        old.spec.usages = vec![KeyUsage::Any, KeyUsage::Any];
+        let opts = get_validation_options(&base_csr(), &old);
+        assert!(opts.allow_duplicate_usages);
+        let mut clean = base_csr();
+        clean.spec.usages = vec![KeyUsage::Any];
+        assert!(!get_validation_options(&base_csr(), &clean).allow_duplicate_usages);
+    }
+
+    #[test]
+    fn update_tolerates_duplicate_usages_when_old_had_them() {
+        let mut old = base_csr();
+        old.spec.usages = vec![KeyUsage::ClientAuth, KeyUsage::ClientAuth];
+        let new = old.clone();
+        let errs = validate_certificate_signing_request_update_main(&new, &old);
+        assert!(
+            !errs.iter().any(|e| format!("{e}").contains("Duplicate")),
+            "old object had duplicates: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn update_rejects_new_duplicate_usages() {
+        let old = base_csr();
+        let mut new = base_csr();
+        new.spec.usages = vec![KeyUsage::ClientAuth, KeyUsage::ClientAuth];
+        let errs = validate_certificate_signing_request_update_main(&new, &old);
+        assert!(
+            errs.iter().any(|e| format!("{e}").contains("Duplicate")),
+            "{errs:?}"
         );
     }
 }

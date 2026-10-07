@@ -36,9 +36,8 @@ pub struct PriorityLevelConfigurationSpec {
     pub exempt: Option<ExemptPriorityLevelConfiguration>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PriorityLevelType {
-    #[default]
     Limited,
     Exempt,
     /// A value outside the supported set. Upstream's field is a plain Go
@@ -46,6 +45,15 @@ pub enum PriorityLevelType {
     /// value` (422), not a 400 decode failure (#2497).
     #[serde(untagged)]
     Unknown(String),
+}
+
+/// Go's zero value for the plain string `type` field is "". Upstream
+/// pkg/apis/flowcontrol/v1/defaults.go sets no default for it, so an absent
+/// type stays "" and validation.go:418-420 reports NotSupported (#2506).
+impl Default for PriorityLevelType {
+    fn default() -> Self {
+        PriorityLevelType::Unknown(String::new())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
