@@ -1263,11 +1263,18 @@ impl Kubelet {
         self.runtime_state.update_from_status(status);
     }
 
+    /// `kubeletVolumeHost.SetKubeletError` (pkg/kubelet/volume_host.go:122):
+    /// the CSI plugin's way to keep the node NotReady until it is initialized.
+    pub fn set_kubelet_error(&self, err: Option<String>) {
+        self.runtime_state.set_storage_state(err);
+    }
+
     /// Errors gating NodeReady (setters.go:491 runtime + network + storage).
     fn ready_errors(&self) -> Vec<String> {
         [
             self.runtime_state.runtime_errors(),
             self.runtime_state.network_errors(),
+            self.runtime_state.storage_errors(),
         ]
         .into_iter()
         .flatten()
