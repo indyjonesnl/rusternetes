@@ -671,10 +671,7 @@ pub(crate) fn write_payload(
     payload: &BTreeMap<String, FileProjection>,
     fs_group: Option<i64>,
 ) -> std::io::Result<()> {
-    let set_perms = move |dir: &std::path::Path| -> std::io::Result<()> {
-        crate::volume_ownership::set_volume_ownership(dir, fs_group, true)
-    };
-    crate::atomic_writer::write_projected_payload_with(dir, payload, Some(&set_perms))
+    crate::volume_ownership::write_payload_with_ownership(dir, payload, fs_group, true)
 }
 
 /// The payload a periodic re-SetUp of a projected volume projects
