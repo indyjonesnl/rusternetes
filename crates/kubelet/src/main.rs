@@ -331,7 +331,7 @@ async fn main() -> Result<()> {
     // crashLoopBackOff.maxContainerRestartPeriod (None => 300s default).
     let crash_loop_backoff_max = config_file
         .as_ref()
-        .map(|c| c.effective_max_container_restart_period());
+        .and_then(|c| c.effective_max_container_restart_period_gated());
 
     // Parse etcd endpoints
     let etcd_endpoints: Vec<String> = args
