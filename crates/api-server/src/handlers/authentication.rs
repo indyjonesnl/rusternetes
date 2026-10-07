@@ -45,7 +45,26 @@ pub async fn create_token_review(
 
     // Authenticate the provided token using the available authentication mechanisms
     // Try service account token first
-    let status = if let Ok(claims) = state.token_manager.validate_token(&token_review.spec.token) {
+    // Upstream puts `spec.audiences` in the request context so the token's
+    // audience is matched against them (tokenreview/storage.go:83-85), then the
+    // JWT authenticator verifies signature + issuer + audience and the
+    // validator checks the bound objects (jwt.go:334-411, claims.go:144-263).
+    let requested_audiences = token_review.spec.audiences.clone().unwrap_or_default();
+    let authn = match state
+        .token_manager
+        .authenticate_token(&token_review.spec.token, Some(&requested_audiences))
+    {
+        Ok((claims, matched)) => {
+            match rusternetes_middleware::validate_service_account_claims(&state.storage, &claims)
+                .await
+            {
+                Ok(()) => Ok((claims, matched)),
+                Err(e) => Err(e),
+            }
+        }
+        Err(e) => Err(e.to_string()),
+    };
+    let status = if let Ok((claims, matched_audiences)) = authn {
         // Valid service account token
         TokenReviewStatus {
             authenticated: Some(true),
@@ -93,7 +112,13 @@ pub async fn create_token_review(
                     extra
                 }),
             }),
-            audiences: token_review.spec.audiences.clone(),
+            // With --api-audiences configured the status carries the matched
+            // audiences like upstream; otherwise keep echoing the request.
+            audiences: if state.token_manager.api_audiences().is_empty() {
+                token_review.spec.audiences.clone()
+            } else {
+                Some(matched_audiences)
+            },
             error: None,
         }
     } else {
@@ -217,6 +242,7 @@ pub async fn create_token_request(
             },
             pod: None,
             node: None,
+            secret: None,
         }),
         pod_name: None,
         pod_uid: None,
@@ -227,41 +253,107 @@ pub async fn create_token_request(
     // Set audience from the request (TokenRequestSpec.audiences is Vec<String>, not Option)
     if !token_request.spec.audiences.is_empty() {
         claims.aud = token_request.spec.audiences.clone();
+    } else if !state.token_manager.api_audiences().is_empty() {
+        // Default unset spec audiences to the API server audiences
+        // (pkg/registry/core/serviceaccount/storage/token.go:116-119).
+        claims.aud = state.token_manager.api_audiences().to_vec();
     }
 
-    // Set bound object reference (pod name/uid) in claims for projected SA tokens
+    // Bound object reference. Port of `TokenREST.Create`
+    // (pkg/registry/core/serviceaccount/storage/token.go:171-224) and
+    // `token.Claims` (pkg/serviceaccount/claims.go:84-123): the referent must
+    // exist and its UID must match, and the claims record it so that deleting
+    // the object invalidates the token (see `validate_service_account_claims`).
     if let Some(ref bound_ref) = token_request.spec.bound_object_ref {
-        if bound_ref.kind.as_deref() == Some("Pod") {
-            claims.pod_name = bound_ref.name.clone();
-            claims.pod_uid = bound_ref.uid.clone();
-
-            // Try to get node name and node UID from the pod
-            if let Some(ref pod_name) = bound_ref.name {
-                let pod_key = rusternetes_storage::build_key("pods", Some(&namespace), pod_name);
-                if let Ok(pod) = state
-                    .storage
-                    .get::<rusternetes_common::resources::Pod>(&pod_key)
-                    .await
-                {
-                    let node_name = pod.spec.as_ref().and_then(|s| s.node_name.clone());
-                    claims.node_name = node_name.clone();
-
-                    // Look up node UID from the Node object
-                    if let Some(ref n) = node_name {
-                        let node_key = rusternetes_storage::build_key("nodes", None::<&str>, n);
-                        if let Ok(node) = state
-                            .storage
-                            .get::<rusternetes_common::resources::Node>(&node_key)
-                            .await
-                        {
-                            let uid = node.metadata.uid.clone();
-                            if !uid.is_empty() {
-                                claims.node_uid = Some(uid);
-                            }
-                        }
+        let api_version = bound_ref.api_version.clone().unwrap_or_default();
+        let kind = bound_ref.kind.clone().unwrap_or_default();
+        let ref_name = bound_ref.name.clone().unwrap_or_default();
+        let ref_uid = bound_ref.uid.clone().unwrap_or_default();
+        let core_group = !api_version.contains('/');
+        let uid: String;
+        match (core_group, kind.as_str()) {
+            (true, "Pod") => {
+                let pod_key = rusternetes_storage::build_key("pods", Some(&namespace), &ref_name);
+                let pod: rusternetes_common::resources::Pod = state.storage.get(&pod_key).await?;
+                let pod_sa = pod
+                    .spec
+                    .as_ref()
+                    .and_then(|s| s.service_account_name.clone())
+                    .unwrap_or_else(|| "default".to_string());
+                if pod_sa != service_account_name {
+                    return Err(rusternetes_common::Error::BadRequest(format!(
+                        "cannot bind token for serviceaccount {:?} to pod running with different serviceaccount name.",
+                        service_account_name
+                    )));
+                }
+                uid = pod.metadata.uid.clone();
+                claims.pod_name = Some(ref_name.clone());
+                claims.pod_uid = Some(uid.clone());
+                let mut node_ref = None;
+                if let Some(node_name) = pod.spec.as_ref().and_then(|s| s.node_name.clone()) {
+                    // A missing Node still records its name (token.go:196-202).
+                    let node_key =
+                        rusternetes_storage::build_key("nodes", None::<&str>, &node_name);
+                    let node_uid = state
+                        .storage
+                        .get::<rusternetes_common::resources::Node>(&node_key)
+                        .await
+                        .map(|n| n.metadata.uid)
+                        .unwrap_or_default();
+                    claims.node_name = Some(node_name.clone());
+                    if !node_uid.is_empty() {
+                        claims.node_uid = Some(node_uid.clone());
                     }
+                    node_ref = Some(rusternetes_common::auth::KubeRef {
+                        name: node_name,
+                        uid: node_uid,
+                    });
+                }
+                if let Some(k) = claims.kubernetes.as_mut() {
+                    k.pod = Some(rusternetes_common::auth::KubeRef {
+                        name: ref_name.clone(),
+                        uid: uid.clone(),
+                    });
+                    k.node = node_ref;
                 }
             }
+            (true, "Node") => {
+                let node_key = rusternetes_storage::build_key("nodes", None::<&str>, &ref_name);
+                let node: rusternetes_common::resources::Node =
+                    state.storage.get(&node_key).await?;
+                uid = node.metadata.uid.clone();
+                claims.node_name = Some(ref_name.clone());
+                claims.node_uid = Some(uid.clone());
+                if let Some(k) = claims.kubernetes.as_mut() {
+                    k.node = Some(rusternetes_common::auth::KubeRef {
+                        name: ref_name.clone(),
+                        uid: uid.clone(),
+                    });
+                }
+            }
+            (true, "Secret") => {
+                let key = rusternetes_storage::build_key("secrets", Some(&namespace), &ref_name);
+                let secret: rusternetes_common::resources::Secret = state.storage.get(&key).await?;
+                uid = secret.metadata.uid.clone();
+                if let Some(k) = claims.kubernetes.as_mut() {
+                    k.secret = Some(rusternetes_common::auth::KubeRef {
+                        name: ref_name.clone(),
+                        uid: uid.clone(),
+                    });
+                }
+            }
+            _ => {
+                return Err(rusternetes_common::Error::BadRequest(format!(
+                    "cannot bind token to object of type {}, Kind={}",
+                    api_version, kind
+                )));
+            }
+        }
+        if !ref_uid.is_empty() && uid != ref_uid {
+            return Err(rusternetes_common::Error::Conflict(format!(
+                "the UID in the bound object reference ({}) does not match the UID in record. The object might have been deleted and then recreated",
+                ref_uid
+            )));
         }
     }
 
