@@ -2781,6 +2781,47 @@ pub async fn watch_clustertrustbundles(
     .await
 }
 
+/// Watch podcertificaterequests in a namespace (certificates.k8s.io/v1beta1,
+/// 404 unless the PodCertificateRequest gate is on). The deprecated `/watch/`
+/// route installer.go registers for the namespaced scope.
+pub async fn watch_podcertificaterequests(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(namespace): Path<String>,
+    Query(params): Query<WatchParams>,
+) -> Result<Response> {
+    crate::handlers::podcertificaterequest::gate()?;
+    watch_namespaced::<rusternetes_common::resources::podcertificaterequest::PodCertificateRequest>(
+        state,
+        auth_ctx,
+        namespace,
+        "podcertificaterequests",
+        "certificates.k8s.io",
+        params,
+    )
+    .await
+}
+
+/// Watch podcertificaterequests across all namespaces via the `/watch/`
+/// prefix (installer.go registers it for the all-namespaces scope too).
+pub async fn watch_all_podcertificaterequests(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Query(params): Query<WatchParams>,
+) -> Result<Response> {
+    crate::handlers::podcertificaterequest::gate()?;
+    watch_cluster_scoped::<
+        rusternetes_common::resources::podcertificaterequest::PodCertificateRequest,
+    >(
+        state,
+        auth_ctx,
+        "podcertificaterequests",
+        "certificates.k8s.io",
+        params,
+    )
+    .await
+}
+
 /// Watch flowschemas (cluster-scoped)
 pub async fn watch_flowschemas(
     State(state): State<Arc<ApiServerState>>,

@@ -856,14 +856,14 @@ pub async fn get_api_groups(
     (StatusCode::OK, Json(api_group_list)).into_response()
 }
 
-/// Whether `certificates.k8s.io/v1beta1` is served: its only resource,
-/// `clustertrustbundles`, is installed only under the `ClusterTrustBundle`
-/// feature gate (pkg/registry/certificates/rest/storage_certificates.go:
-/// 91-104), and upstream drops a group version that has no storage.
+/// Whether `certificates.k8s.io/v1beta1` is served: its resources,
+/// `clustertrustbundles` and `podcertificaterequests`, are installed only
+/// under the `ClusterTrustBundle` / `PodCertificateRequest` feature gates
+/// (pkg/registry/certificates/rest/storage_certificates.go:91-117), and
+/// upstream drops a group version that has no storage.
 fn certificates_v1beta1_served() -> bool {
-    rusternetes_common::feature_gates::enabled(
-        rusternetes_common::feature_gates::Feature::ClusterTrustBundle,
-    )
+    use rusternetes_common::feature_gates::{enabled, Feature};
+    enabled(Feature::ClusterTrustBundle) || enabled(Feature::PodCertificateRequest)
 }
 
 /// Helper to get all API group names and their preferred versions
@@ -1397,15 +1397,33 @@ fn get_aggregated_resources_for_group_uncategorized(
             vec![sub("status", "CustomResourceDefinition", status_verbs)],
         )],
         "coordination.k8s.io" => vec![res("leases", "lease", "Lease", true, all_verbs, vec![])],
-        // v1beta1 serves only ClusterTrustBundle (storage_certificates.go:91-104).
-        "certificates.k8s.io" if version == "v1beta1" => vec![res(
-            "clustertrustbundles",
-            "clustertrustbundle",
-            "ClusterTrustBundle",
-            false,
-            all_verbs,
-            vec![],
-        )],
+        // v1beta1 serves ClusterTrustBundle and PodCertificateRequest, each
+        // under its own gate (storage_certificates.go:91-117).
+        "certificates.k8s.io" if version == "v1beta1" => {
+            use rusternetes_common::feature_gates::{enabled, Feature};
+            let mut v = Vec::new();
+            if enabled(Feature::ClusterTrustBundle) {
+                v.push(res(
+                    "clustertrustbundles",
+                    "clustertrustbundle",
+                    "ClusterTrustBundle",
+                    false,
+                    all_verbs,
+                    vec![],
+                ));
+            }
+            if enabled(Feature::PodCertificateRequest) {
+                v.push(res(
+                    "podcertificaterequests",
+                    "podcertificaterequest",
+                    "PodCertificateRequest",
+                    true,
+                    all_verbs,
+                    vec![sub("status", "PodCertificateRequest", status_verbs)],
+                ));
+            }
+            v
+        }
         "certificates.k8s.io" => vec![res_with_short(
             "certificatesigningrequests",
             "certificatesigningrequest",
@@ -3337,9 +3355,9 @@ pub async fn get_certificates_v1_resources() -> (StatusCode, Json<APIResourceLis
 }
 
 /// GET /apis/certificates.k8s.io/v1beta1
-/// Returns the resources of certificates.k8s.io/v1beta1: `clustertrustbundles`,
-/// which exists only while the `ClusterTrustBundle` gate is on (404 otherwise,
-/// as for an API version with no storage).
+/// Returns the resources of certificates.k8s.io/v1beta1: `clustertrustbundles`
+/// and `podcertificaterequests` (+ `/status`), each present only while its
+/// gate is on (404 when neither is, as for an API version with no storage).
 pub async fn get_certificates_v1beta1_resources() -> Response {
     if !certificates_v1beta1_served() {
         return (
@@ -3355,12 +3373,9 @@ pub async fn get_certificates_v1beta1_resources() -> Response {
         )
             .into_response();
     }
-    let resources = vec![APIResource {
-        name: "clustertrustbundles".to_string(),
-        singular_name: "clustertrustbundle".to_string(),
-        namespaced: false,
-        kind: "ClusterTrustBundle".to_string(),
-        verbs: [
+    use rusternetes_common::feature_gates::{enabled, Feature};
+    let all_verbs = || -> Vec<String> {
+        [
             "create",
             "delete",
             "deletecollection",
@@ -3372,11 +3387,46 @@ pub async fn get_certificates_v1beta1_resources() -> Response {
         ]
         .iter()
         .map(|s| s.to_string())
-        .collect(),
-        short_names: None,
-        categories: None,
-        storage_version_hash: None,
-    }];
+        .collect()
+    };
+    let mut resources = Vec::new();
+    if enabled(Feature::ClusterTrustBundle) {
+        resources.push(APIResource {
+            name: "clustertrustbundles".to_string(),
+            singular_name: "clustertrustbundle".to_string(),
+            namespaced: false,
+            kind: "ClusterTrustBundle".to_string(),
+            verbs: all_verbs(),
+            short_names: None,
+            categories: None,
+            storage_version_hash: None,
+        });
+    }
+    if enabled(Feature::PodCertificateRequest) {
+        resources.push(APIResource {
+            name: "podcertificaterequests".to_string(),
+            singular_name: "podcertificaterequest".to_string(),
+            namespaced: true,
+            kind: "PodCertificateRequest".to_string(),
+            verbs: all_verbs(),
+            short_names: None,
+            categories: None,
+            storage_version_hash: None,
+        });
+        resources.push(APIResource {
+            name: "podcertificaterequests/status".to_string(),
+            singular_name: "".to_string(),
+            namespaced: true,
+            kind: "PodCertificateRequest".to_string(),
+            verbs: ["get", "patch", "update"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            short_names: None,
+            categories: None,
+            storage_version_hash: None,
+        });
+    }
     let resource_list = APIResourceList {
         kind: "APIResourceList".to_string(),
         api_version: "v1".to_string(),
