@@ -78,6 +78,8 @@ pub async fn get_openapi_spec(State(state): State<Arc<ApiServerState>>) -> Respo
         ("coordination.k8s.io", "v1"),
         ("flowcontrol.apiserver.k8s.io", "v1"),
         ("certificates.k8s.io", "v1"),
+        // ClusterTrustBundle (storage_certificates.go:95-100)
+        ("certificates.k8s.io", "v1beta1"),
         ("discovery.k8s.io", "v1"),
         ("node.k8s.io", "v1"),
         ("autoscaling", "v1"),
