@@ -75,20 +75,12 @@ pub struct ServiceSpec {
 
     /// IPFamilyPolicy represents the dual-stack-ness requested or required by this Service.
     /// Can be SingleStack, PreferDualStack, or RequireDualStack.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "empty_string_as_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ip_family_policy: Option<IPFamilyPolicy>,
 
     /// InternalTrafficPolicy specifies if the cluster internal traffic should be routed to all endpoints
     /// or node-local endpoints only. "Cluster" routes to all endpoints. "Local" routes to node-local endpoints.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "empty_string_as_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub internal_traffic_policy: Option<ServiceInternalTrafficPolicy>,
 
     /// ExternalTrafficPolicy denotes if this Service desires to route external traffic to node-local or
@@ -254,6 +246,11 @@ pub enum IPFamilyPolicy {
     /// RequireDualStack indicates that this service requires dual-stack.
     /// The service will fail if the cluster is not configured for dual-stack.
     RequireDualStack,
+    /// A value outside the supported set, including a non-nil `""`. Upstream
+    /// keeps it and validation answers `NotSupported` (validation.go:9011-9015),
+    /// so decode must not 400 it.
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 /// ServiceInternalTrafficPolicy describes how nodes distribute service traffic they
@@ -266,6 +263,10 @@ pub enum ServiceInternalTrafficPolicy {
     Cluster,
     /// Local routes traffic only to node-local endpoints, dropping the traffic if no endpoints exist on the node
     Local,
+    /// A value outside the supported set, including a non-nil `""`
+    /// (validation.go:6886-6888 answers `NotSupported`).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 /// ServiceExternalTrafficPolicy describes how nodes distribute service traffic they
@@ -469,8 +470,16 @@ mod tests {
         }"#;
         let spec: ServiceSpec = serde_json::from_str(json).unwrap();
         assert!(spec.service_type.is_none());
-        assert!(spec.ip_family_policy.is_none());
-        assert!(spec.internal_traffic_policy.is_none());
+        // Pointer fields upstream (*IPFamilyPolicy, *ServiceInternalTrafficPolicy):
+        // a non-nil "" is kept and validation rejects it (#2531).
+        assert_eq!(
+            spec.ip_family_policy,
+            Some(IPFamilyPolicy::Unknown(String::new()))
+        );
+        assert_eq!(
+            spec.internal_traffic_policy,
+            Some(ServiceInternalTrafficPolicy::Unknown(String::new()))
+        );
         assert!(spec.external_traffic_policy.is_none());
     }
 
@@ -522,8 +531,17 @@ mod tests {
         }"#;
         let svc: Service = serde_json::from_str(json).unwrap();
         assert!(svc.spec.service_type.is_none());
-        assert!(svc.spec.internal_traffic_policy.is_none());
         assert!(svc.spec.external_traffic_policy.is_none());
-        assert!(svc.spec.ip_family_policy.is_none());
+        // `*IPFamilyPolicy` / `*ServiceInternalTrafficPolicy` upstream: Go
+        // clients omit a nil pointer (generated.pb.go:13193,13245 skip nil),
+        // so a literal "" is a real value that validation rejects (#2531).
+        assert_eq!(
+            svc.spec.internal_traffic_policy,
+            Some(ServiceInternalTrafficPolicy::Unknown(String::new()))
+        );
+        assert_eq!(
+            svc.spec.ip_family_policy,
+            Some(IPFamilyPolicy::Unknown(String::new()))
+        );
     }
 }

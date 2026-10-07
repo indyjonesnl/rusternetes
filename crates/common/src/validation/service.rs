@@ -260,11 +260,12 @@ fn opt_str(v: Option<&str>) -> BadValue {
     }
 }
 
-fn policy_str(p: &IPFamilyPolicy) -> &'static str {
+fn policy_str(p: &IPFamilyPolicy) -> &str {
     match p {
         IPFamilyPolicy::SingleStack => "SingleStack",
         IPFamilyPolicy::PreferDualStack => "PreferDualStack",
         IPFamilyPolicy::RequireDualStack => "RequireDualStack",
+        IPFamilyPolicy::Unknown(v) => v,
     }
 }
 
@@ -473,18 +474,26 @@ fn validate_service_external_traffic_fields_update(before: &Service, after: &Ser
 /// The enum admits only the supported values.
 fn validate_service_internal_traffic_fields_value(svc: &Service) -> ErrorList {
     let itp: Option<&ServiceInternalTrafficPolicy> = svc.spec.internal_traffic_policy.as_ref();
+    let mut errs = Vec::new();
     if itp.is_none()
         && matches!(
             service_type(svc),
             Some(ServiceType::NodePort | ServiceType::LoadBalancer | ServiceType::ClusterIP)
         )
     {
-        return vec![Error::required(
+        errs.push(Error::required(
             &Path::new("spec").child("internalTrafficPolicy"),
             "",
-        )];
+        ));
     }
-    Vec::new()
+    if let Some(ServiceInternalTrafficPolicy::Unknown(v)) = itp {
+        errs.push(Error::not_supported(
+            &Path::new("spec").child("internalTrafficPolicy"),
+            v.clone(),
+            &["Cluster", "Local"],
+        ));
+    }
+    errs
 }
 
 /// `validateServiceTrafficDistribution` (validation.go:6896-6921).
@@ -830,6 +839,16 @@ pub fn validate_service_cluster_ips_related_fields(
                 family_str(family),
             ));
         }
+    }
+
+    // `IPFamilyPolicy` stand alone validation (validation.go:9009-9016); nil is
+    // fine, a non-nil value must be supported.
+    if let Some(IPFamilyPolicy::Unknown(v)) = &svc.spec.ip_family_policy {
+        errs.push(Error::not_supported(
+            &spec_path.child("ipFamilyPolicy"),
+            v.clone(),
+            &["SingleStack", "PreferDualStack", "RequireDualStack"],
+        ));
     }
 
     let existing: &[String] = old.map(cluster_ips).unwrap_or(&[]);
