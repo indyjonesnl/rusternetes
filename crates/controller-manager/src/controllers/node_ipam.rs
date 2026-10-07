@@ -31,7 +31,7 @@ use std::time::Duration;
 use anyhow::Result;
 use futures::StreamExt;
 use ipnet::IpNet;
-use rusternetes_common::resources::{EventSource, EventType, Node, NodeSpec, ObjectReference};
+use rusternetes_common::resources::{EventSource, EventType, Node, ObjectReference};
 use rusternetes_common::Error;
 use rusternetes_storage::{
     build_key, build_prefix, extract_key, EventRecorder, Storage, WatchEvent, WorkQueue,
@@ -568,6 +568,17 @@ impl CidrSet {
     }
 }
 
+/// Upstream `nodeForCIDRMergePatch` (`component-helpers/node/util/cidr.go:29`):
+/// `podCIDR` is always sent, `podCIDRs` is `omitempty`.
+fn node_cidr_merge_patch(cidrs: &[String]) -> serde_json::Value {
+    let mut spec = serde_json::Map::new();
+    spec.insert("podCIDR".into(), cidrs[0].clone().into());
+    if !cidrs.is_empty() {
+        spec.insert("podCIDRs".into(), cidrs.to_vec().into());
+    }
+    serde_json::json!({ "spec": spec })
+}
+
 /// A node's pod CIDRs: `spec.podCIDRs`, falling back to the legacy singular
 /// `spec.podCIDR` when the list is absent.
 fn node_pod_cidrs(node: &Node) -> Vec<String> {
@@ -801,21 +812,14 @@ impl<S: Storage + 'static> RangeAllocator<S> {
 
     /// Sets `spec.podCIDR`/`podCIDRs` on the node (upstream
     /// `nodeutil.PatchNodeCIDRs`, `component-helpers/node/util/cidr.go:40`).
-    /// Rusternetes storage has no merge-patch verb, so this is a fresh get
-    /// followed by an update of just those two spec fields.
+    /// Sends the same strategic-merge patch body upstream builds
+    /// (`nodeForCIDRMergePatch`, `cidr.go:29-38`: `{"spec":{"podCIDR":c[0],
+    /// "podCIDRs":c}}`, `podCIDRs` omitempty) through
+    /// [`Storage::patch_strategic_merge`] (a real PATCH in API mode).
     async fn patch_node_cidrs(&self, node_name: &str, cidrs: &[String]) -> Result<(), Error> {
         let key = build_key("nodes", None, node_name);
-        let mut node: Node = self.storage.get(&key).await?;
-        let spec = node.spec.get_or_insert(NodeSpec {
-            pod_cidr: None,
-            pod_cidrs: None,
-            provider_id: None,
-            unschedulable: None,
-            taints: None,
-        });
-        spec.pod_cidr = Some(cidrs[0].clone());
-        spec.pod_cidrs = Some(cidrs.to_vec());
-        self.storage.update(&key, &node).await?;
+        let patch = node_cidr_merge_patch(cidrs);
+        let _: Node = self.storage.patch_strategic_merge(&key, &patch).await?;
         Ok(())
     }
 
@@ -1003,6 +1007,35 @@ mod tests {
     use rusternetes_storage::memory::MemoryStorage;
     use rusternetes_storage::{build_key, build_prefix};
     use std::collections::HashSet;
+
+    /// The patch body is upstream's `nodeForCIDRMergePatch`
+    /// (`cidr.go:29-38`), and applying it leaves unrelated spec/metadata alone.
+    #[tokio::test]
+    async fn patch_node_cidrs_sends_only_the_cidr_delta() {
+        assert_eq!(
+            node_cidr_merge_patch(&["10.0.0.0/24".to_string()]),
+            serde_json::json!({"spec": {"podCIDR": "10.0.0.0/24", "podCIDRs": ["10.0.0.0/24"]}})
+        );
+        let storage = Arc::new(MemoryStorage::new());
+        let key = build_key("nodes", None, "n1");
+        let _: serde_json::Value = storage
+            .create(
+                &key,
+                &serde_json::json!({"apiVersion": "v1", "kind": "Node",
+                    "metadata": {"name": "n1", "labels": {"x": "y"}},
+                    "spec": {"unschedulable": true}}),
+            )
+            .await
+            .unwrap();
+        let patched: Node = storage
+            .patch_strategic_merge(&key, &node_cidr_merge_patch(&["10.0.0.0/24".to_string()]))
+            .await
+            .unwrap();
+        let spec = patched.spec.unwrap();
+        assert_eq!(spec.pod_cidr.as_deref(), Some("10.0.0.0/24"));
+        assert_eq!(spec.unschedulable, Some(true));
+        assert_eq!(patched.metadata.labels.unwrap()["x"], "y");
+    }
 
     fn ipn(s: &str) -> IpNet {
         s.parse::<IpNet>().unwrap().trunc()
