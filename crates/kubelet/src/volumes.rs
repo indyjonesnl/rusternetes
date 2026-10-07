@@ -392,12 +392,17 @@ impl VolumeManager {
     /// registered" error) is logged and left for the next sync, as the
     /// reconciler retries a failed operation.
     ///
-    /// Not covered (tracked separately): `NodeUnstageVolume` /
-    /// `csiAttacher.UnmountDevice`, and unmounting for a pod that is deleted
-    /// while the kubelet stays up.
-    pub async fn unmount_orphaned_csi_volumes(
+    /// `terminated_pod_uids` are pods still present in the API whose runtime
+    /// is gone (Succeeded/Failed): upstream's populator drops their volumes
+    /// from the desired state once `ShouldPodRuntimeBeRemoved`
+    /// (`pod_workers.go:698`) holds (`findAndRemoveDeletedPods`,
+    /// `desired_state_of_world_populator.go:200-247`), so the reconciler
+    /// unmounts them as for a deleted pod. The staged device is released by
+    /// [`Self::unmount_unused_csi_devices`], after this.
+    pub async fn unmount_csi_volumes(
         &self,
         live_pod_uids: &std::collections::HashSet<String>,
+        terminated_pod_uids: &std::collections::HashSet<String>,
     ) {
         let root = &self.volumes_base_path;
         let pods = match crate::pod_dirs::list_pods_from_disk(root) {
@@ -408,7 +413,7 @@ impl VolumeManager {
             }
         };
         for uid in pods {
-            if live_pod_uids.contains(&uid) {
+            if live_pod_uids.contains(&uid) && !terminated_pod_uids.contains(&uid) {
                 continue;
             }
             let csi_dir = crate::pod_dirs::get_pod_volumes_dir(root, &uid).join(
@@ -430,6 +435,107 @@ impl VolumeManager {
                 if let Err(e) = unmounter.tear_down().await {
                     warn!("Orphaned pod {uid}: CSI TearDown of {spec_name} failed: {e:#}");
                 }
+            }
+        }
+    }
+
+    /// `(driver, volumeHandle)` of every persistent CSI volume a pod directory
+    /// on disk still holds (published and not yet torn down). The actual state
+    /// of world's "pods mounted to this volume", rebuilt the way upstream's
+    /// reconstruction does it: `ConstructVolumeSpec` on each volume dir.
+    fn csi_volumes_held_by_pods(&self) -> std::collections::HashSet<(String, String)> {
+        let root = &self.volumes_base_path;
+        let mut held = std::collections::HashSet::new();
+        let Ok(pods) = crate::pod_dirs::list_pods_from_disk(root) else {
+            return held;
+        };
+        for uid in pods {
+            let csi_dir = crate::pod_dirs::get_pod_volumes_dir(root, &uid).join(
+                crate::pod_dirs::escape_qualified_name(crate::pod_dirs::plugin::CSI),
+            );
+            let Ok(entries) = std::fs::read_dir(&csi_dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if let Ok(rec) = self.csi_plugin.construct_volume_spec(&entry.path()) {
+                    if let Some(csi) = rec.persistent_volume.and_then(|pv| pv.spec.csi) {
+                        held.insert((csi.driver, csi.volume_handle.unwrap_or_default()));
+                    }
+                }
+            }
+        }
+        held
+    }
+
+    /// `(driver, volumeHandle)` of every CSI PV the given pods want mounted:
+    /// the desired state of world's `VolumeExists`. `None` when a claim could
+    /// not be resolved, in which case no device may be unmounted this round
+    /// (an unknown desire is not "no desire").
+    async fn csi_volumes_desired_by(
+        &self,
+        pods: &[Pod],
+    ) -> Option<std::collections::HashSet<(String, String)>> {
+        let mut desired = std::collections::HashSet::new();
+        for pod in pods {
+            let Some(volumes) = pod.spec.as_ref().and_then(|s| s.volumes.as_ref()) else {
+                continue;
+            };
+            for volume in volumes {
+                if volume.persistent_volume_claim.is_none() {
+                    continue;
+                }
+                match self.resolve_persistent_volume(pod, volume).await {
+                    Ok(Some(pv)) => {
+                        if let Some(csi) = pv.spec.csi {
+                            desired.insert((csi.driver, csi.volume_handle.unwrap_or_default()));
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        debug!("Cannot resolve a claim of pod {}: {e:#}", pod.metadata.name);
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(desired)
+    }
+
+    /// NodeUnstage the staged CSI devices nothing wants any more.
+    ///
+    /// Port of the reconciler's `unmountDetachDevices`
+    /// (`pkg/kubelet/volumemanager/reconciler/reconciler_common.go:273-315`):
+    /// a device is unmounted when it is not mounted for any pod
+    /// (`GetUnmountedVolumes`: no pod dir still holds it, so this must run
+    /// after [`Self::unmount_csi_volumes`], which gives upstream's
+    /// unpublish-before-unstage order) and the desired state does not want it
+    /// (`!DesiredStateOfWorld.VolumeExists`: `desired_pods`' PVCs). Several pods
+    /// sharing one staged volume therefore refcount it by presence. Failures are
+    /// logged and retried next sync, as the reconciler does.
+    pub async fn unmount_unused_csi_devices(&self, desired_pods: &[Pod]) {
+        let Some(desired) = self.csi_volumes_desired_by(desired_pods).await else {
+            return;
+        };
+        self.unmount_csi_devices_not_in(&desired).await;
+    }
+
+    /// [`Self::unmount_unused_csi_devices`] with the desired set already known.
+    pub(crate) async fn unmount_csi_devices_not_in(
+        &self,
+        desired: &std::collections::HashSet<(String, String)>,
+    ) {
+        let held = self.csi_volumes_held_by_pods();
+        for (driver, handle, device_path) in self.csi_plugin.list_staged_devices() {
+            let key = (driver, handle);
+            if held.contains(&key) || desired.contains(&key) {
+                continue;
+            }
+            if let Err(e) = self.csi_plugin.unmount_device(&device_path).await {
+                warn!(
+                    "CSI UnmountDevice of {} ({}) failed: {e:#}",
+                    key.1,
+                    device_path.display()
+                );
             }
         }
     }

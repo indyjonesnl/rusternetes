@@ -292,6 +292,25 @@ fn init_container_failed_terminally(pod: &Pod, init_statuses: Option<&[Container
         .unwrap_or(false)
 }
 
+/// Whether a pod still in the API no longer wants its volumes mounted: its
+/// phase is terminal and no container is still running. Upstream's populator
+/// drops a pod's volumes from the desired state once
+/// `ShouldPodRuntimeBeRemoved` holds (`pod_workers.go:698`,
+/// `desired_state_of_world_populator.go:221-233`), i.e. the pod worker has seen
+/// every container exit.
+fn pod_volumes_released(pod: &Pod) -> bool {
+    let Some(status) = pod.status.as_ref() else {
+        return false;
+    };
+    matches!(status.phase, Some(Phase::Succeeded | Phase::Failed))
+        && !status
+            .container_statuses
+            .iter()
+            .flatten()
+            .chain(status.init_container_statuses.iter().flatten())
+            .any(|c| matches!(c.state, Some(ContainerState::Running { .. })))
+}
+
 fn deadline_exceeded_terminal(status: Option<&PodStatus>) -> bool {
     status.is_some_and(|status| {
         status.phase == Some(Phase::Failed)
@@ -1941,9 +1960,27 @@ impl Kubelet {
             .collect();
         // Unpublish CSI volumes first: upstream's reconciler unmounts before
         // cleanupOrphanedPodDirs, which refuses to remove a mounted volume.
+        // Pods that are deleted (not in the live set) and pods that are
+        // terminated but still in the API both no longer want their volumes.
+        let terminated_pod_uids: std::collections::HashSet<String> = all_pods
+            .iter()
+            .chain(node_pods.iter())
+            .filter(|p| pod_volumes_released(p))
+            .map(|p| p.metadata.uid.clone())
+            .filter(|uid| !uid.is_empty())
+            .collect();
         self.runtime
-            .unmount_orphaned_csi_volumes(&live_pod_uids)
+            .unmount_csi_volumes(&live_pod_uids, &terminated_pod_uids)
             .await;
+        // ...then release the staged devices nothing holds or wants any more
+        // (reconciler unmountDetachDevices, reconciler_common.go:273): after
+        // unpublish, so a shared device outlives every pod using it.
+        let desired_pods: Vec<Pod> = node_pods
+            .iter()
+            .filter(|p| !pod_volumes_released(p))
+            .cloned()
+            .collect();
+        self.runtime.unmount_unused_csi_devices(&desired_pods).await;
         self.runtime.cleanup_orphaned_pod_dirs(&live_pod_uids);
 
         // Garbage-collect terminal pods (Succeeded/Failed) from storage.
@@ -6061,6 +6098,29 @@ mod tests {
             now
         ));
         assert!(super::terminating_grace_elapsed(None, now));
+    }
+
+    /// A terminal pod with no running container no longer wants its volumes
+    /// (`ShouldPodRuntimeBeRemoved`); one still running a container, or a
+    /// running pod, does.
+    #[test]
+    fn pod_volumes_released_only_when_terminal_and_stopped() {
+        let mk = |phase: &str, state: serde_json::Value| -> rusternetes_common::resources::Pod {
+            serde_json::from_value(serde_json::json!({
+                "metadata": {"name": "p", "uid": "u"},
+                "spec": {"containers": []},
+                "status": {"phase": phase, "containerStatuses": [
+                    {"name": "c", "ready": false, "restartCount": 0, "image": "i", "imageID": "", "state": state}
+                ]}
+            }))
+            .unwrap()
+        };
+        let done = serde_json::json!({"terminated": {"exitCode": 0}});
+        let running = serde_json::json!({"running": {}});
+        assert!(super::pod_volumes_released(&mk("Succeeded", done.clone())));
+        assert!(super::pod_volumes_released(&mk("Failed", done.clone())));
+        assert!(!super::pod_volumes_released(&mk("Running", done)));
+        assert!(!super::pod_volumes_released(&mk("Failed", running)));
     }
 
     /// `nodeStatusUpdateFrequency` drives the heartbeat interval; default 10s
