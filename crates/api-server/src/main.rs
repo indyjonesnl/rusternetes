@@ -264,13 +264,9 @@ async fn main() -> Result<()> {
     }
     // Seed the cluster-admin ClusterRole + binding to system:masters so the
     // cluster admin is authorized on a freshly-bootstrapped (empty) store
-    // (upstream bootstrap policy; #1659). Idempotent.
-    if let Err(e) = bootstrap::bootstrap_default_rbac(storage.clone()).await {
-        warn!(
-            "Failed to bootstrap default RBAC: {}. Continuing anyway.",
-            e
-        );
-    }
+    // (upstream bootstrap policy; #1659). Idempotent. The `rbac/bootstrap-roles`
+    // PostStartHook (upstream storage_rbac.go:131-179): failing for 30s is fatal.
+    let _ = bootstrap::spawn_rbac_bootstrap_roles_hook(storage.clone()).await;
     // scheduling/bootstrap-system-priority-classes PostStartHook (upstream
     // pkg/registry/scheduling/rest/storage_scheduling.go): seeds
     // system-node-critical and system-cluster-critical.
