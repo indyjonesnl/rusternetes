@@ -47,6 +47,13 @@ reqwest = { workspace = true }
 cel.workspace = true
 prost.workspace = true
 prost-types.workspace = true
+# PodCertificateRequest proof-of-possession verification (upstream
+# ValidatePodCertificateRequestCreate: ed25519 / ECDSA P-256,384,521 / RSA-PSS).
+p256 = "0.13"
+p384 = "0.13"
+p521 = "0.13"
+rsa = { version = "0.9", features = ["sha2"] }
+ed25519-dalek = { version = "2", features = ["pkcs8"] }
 
 [features]
 default = []
@@ -55,6 +62,7 @@ axum-support = ["axum"]
 [dev-dependencies]
 tempfile = "3.27.0"
 proptest = "1"
+time = "0.3"
 serial_test = { workspace = true }
 criterion = "0.5"
 futures = "0.3"

@@ -1,5 +1,7 @@
 use super::csi_client::{CsiDriverClient, CsiError};
-use crate::volume_plugins::{Mounter, Spec, VolumeHost, VolumePlugin};
+use crate::volume_plugins::{
+    Mounter, ReconstructedVolume, Spec, Unmounter, VolumeHost, VolumePlugin,
+};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use rusternetes_common::resources::{
@@ -226,12 +228,10 @@ impl VolumePlugin for CsiPlugin {
             token_manager: self.host.get_service_account_token_func().clone(),
         }))
     }
-}
 
-impl CsiPlugin {
     /// `NewUnmounter` (`csi_plugin.go:540-567`): reload the volume info file the
     /// mounter persisted and rebuild enough state to unpublish.
-    pub fn new_unmounter(&self, spec_name: &str, pod_uid: &str) -> Result<CsiUnmounter> {
+    fn new_unmounter(&self, spec_name: &str, pod_uid: &str) -> Result<Box<dyn Unmounter>> {
         let volume_dir = self.host.get_pod_volume_dir(
             pod_uid,
             self.name(),
@@ -245,7 +245,7 @@ impl CsiPlugin {
                 path.display()
             )
         })?;
-        Ok(CsiUnmounter {
+        Ok(Box::new(CsiUnmounter {
             path,
             driver_name: data
                 .get(vol_data_key::DRIVER_NAME)
@@ -255,20 +255,20 @@ impl CsiPlugin {
                 .get(vol_data_key::VOL_HANDLE)
                 .cloned()
                 .unwrap_or_default(),
-        })
+        }))
     }
-}
 
-/// `volume.ReconstructedVolume` (`pkg/volume/plugins.go`): what
-/// `ConstructVolumeSpec` rebuilds from a mounted volume's on-disk state.
-///
-/// **Deviation:** upstream returns a `*volume.Spec` whose `Volume` is nil for a
-/// PV-backed spec. Our [`Spec`] borrows a mandatory `Volume`, so the owned parts
-/// are returned and the caller builds the `Spec`; for the PV arm `volume` is a
-/// placeholder named after the PV (see `Spec::name`'s inherited deviation).
-pub struct ReconstructedVolume {
-    pub volume: rusternetes_common::resources::Volume,
-    pub persistent_volume: Option<PersistentVolume>,
+    /// `ConstructVolumeSpec` (`csi_plugin.go:569-626`); see
+    /// [`CsiPlugin::construct_volume_spec_at`]. `mount_path` is the volume
+    /// directory (`<pod>/volumes/kubernetes.io~csi/<name>`), the parent of
+    /// `mount`, as `reconstructVolume` passes it.
+    fn construct_volume_spec(
+        &self,
+        _vol_name: &str,
+        mount_path: &str,
+    ) -> Result<ReconstructedVolume> {
+        self.construct_volume_spec_at(Path::new(mount_path))
+    }
 }
 
 impl CsiPlugin {
@@ -278,7 +278,7 @@ impl CsiPlugin {
     /// `CSIVolumeSource` (`constructVolSourceSpec`), anything else a PV with a
     /// `CSIPersistentVolumeSource` and Filesystem mode (`constructPVSourceSpec`).
     /// The SELinux mount context is not ported (feature gate off).
-    pub fn construct_volume_spec(&self, mount_path: &Path) -> Result<ReconstructedVolume> {
+    fn construct_volume_spec_at(&self, mount_path: &Path) -> Result<ReconstructedVolume> {
         let data = load_volume_data(mount_path).map_err(|e| {
             anyhow!(
                 "kubernetes.io/csi: plugin.ConstructVolumeSpec failed loading volume data using [{}]: {e}",
@@ -1083,14 +1083,19 @@ pub struct CsiUnmounter {
     volume_id: String,
 }
 
-impl CsiUnmounter {
-    pub fn get_path(&self) -> String {
+#[async_trait]
+impl Unmounter for CsiUnmounter {
+    fn get_path(&self) -> String {
         self.path.to_string_lossy().to_string()
     }
 
     /// Port of `TearDownAt` (`csi_mounter.go:432-466`): `NodeUnpublishVolume`,
     /// then remove the (now unmounted) mount dir and volume info file.
-    pub async fn tear_down(&self) -> Result<()> {
+    ///
+    /// Like upstream, the `dir` argument is not consulted: the CSI unmounter
+    /// always unpublishes the path it was built for (`csi_mounter.go:429-431`,
+    /// `TearDown` is `TearDownAt(GetPath())`).
+    async fn tear_down_at(&self, _dir: &str) -> Result<()> {
         let client = CsiDriverClient::new(&self.driver_name).map_err(|e| {
             // Treat the absence of the CSI driver as a transient error.
             transient(format!(
