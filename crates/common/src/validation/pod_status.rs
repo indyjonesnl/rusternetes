@@ -268,6 +268,42 @@ fn validate_pod_specific_annotation_updates(new: &Pod, old: &Pod, fld_path: &Pat
     errs
 }
 
+/// The annotation half of `validatePodMetadataAndSpec` (validation.go:4505),
+/// run by `ValidatePodCreate` (`old` is `None`) and `ValidatePodUpdate`
+/// (validation.go:5699, which also runs `ValidatePodSpecificAnnotationUpdates`).
+/// `AllowInvalidPodDeletionCost` comes from
+/// `GetValidationOptionsFromPodSpecAndMeta` (pkg/api/pod/util.go:414,488-492):
+/// off with the gate, and on an update only when the old annotations were
+/// already invalid.
+pub fn validate_pod_metadata_annotations(pod: &Pod, old: Option<&Pod>) -> ErrorList {
+    let fld_path = Path::new("metadata").child("annotations");
+    let empty = HashMap::new();
+    let annotations = pod.metadata.annotations.as_ref().unwrap_or(&empty);
+    let mut allow_invalid_pod_deletion_cost =
+        !crate::feature_gates::enabled(crate::feature_gates::Feature::PodDeletionCost);
+    if let Some(old) = old {
+        if !allow_invalid_pod_deletion_cost {
+            allow_invalid_pod_deletion_cost = get_deletion_cost_from_pod_annotations(
+                old.metadata.annotations.as_ref().unwrap_or(&empty),
+            )
+            .is_err();
+        }
+    }
+    let default_spec = PodSpec::default();
+    let mut errs = validate_pod_specific_annotations(
+        annotations,
+        pod.spec.as_ref().unwrap_or(&default_spec),
+        &fld_path,
+        allow_invalid_pod_deletion_cost,
+    );
+    if let Some(old) = old {
+        errs.extend(validate_pod_specific_annotation_updates(
+            pod, old, &fld_path,
+        ));
+    }
+    errs
+}
+
 /// `ValidatePodSpecificAnnotations` (validation.go:193-217). The options
 /// are `AllowInvalidPodDeletionCost`; the tolerations annotation is checked
 /// with `AllowTaintTolerationComparisonOperators` from the spec itself.

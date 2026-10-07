@@ -7,7 +7,10 @@
 //
 // Full E2E testing happens through the workflow tests that test the pod creation handler.
 
-use rusternetes_api_server::admission::{apply_limit_range, check_resource_quota};
+use rusternetes_api_server::admission::{
+    apply_limit_range, check_resource_quota as quota_verdict,
+    check_resource_quota_with_old as quota_verdict_with_old,
+};
 use rusternetes_common::resources::{
     Container, LimitRange, LimitRangeItem, LimitRangeSpec, Pod, PodSpec, ResourceQuota,
     ResourceQuotaSpec,
@@ -175,22 +178,8 @@ async fn test_limit_range_applies_defaults() {
 async fn test_quota_allows_when_under_limit() {
     let storage = Arc::new(MemoryStorage::new());
 
-    // Create a quota
-    let mut hard = HashMap::new();
-    hard.insert("pods".to_string(), "10".to_string());
-
-    let quota = ResourceQuota::new(
-        "test-quota",
-        "test-namespace",
-        ResourceQuotaSpec {
-            hard: Some(hard),
-            scopes: None,
-            scope_selector: None,
-        },
-    );
-
-    let key = build_key("resourcequotas", Some("test-namespace"), "test-quota");
-    storage.create(&key, &quota).await.unwrap();
+    // A synced quota: status.hard and status.used are set.
+    put_quota(&storage, "test-quota", &[("pods", "10")]).await;
 
     // Try to create a pod
     let pod = create_minimal_pod("test-pod", "test-namespace");
@@ -204,22 +193,8 @@ async fn test_quota_allows_when_under_limit() {
 async fn test_quota_rejects_when_exceeding_pod_count() {
     let storage = Arc::new(MemoryStorage::new());
 
-    // Create a quota with low pod limit
-    let mut hard = HashMap::new();
-    hard.insert("pods".to_string(), "1".to_string());
-
-    let quota = ResourceQuota::new(
-        "test-quota",
-        "test-namespace",
-        ResourceQuotaSpec {
-            hard: Some(hard),
-            scopes: None,
-            scope_selector: None,
-        },
-    );
-
-    let quota_key = build_key("resourcequotas", Some("test-namespace"), "test-quota");
-    storage.create(&quota_key, &quota).await.unwrap();
+    // A synced quota: status.hard and status.used are set.
+    put_quota(&storage, "test-quota", &[("pods", "1")]).await;
 
     // Create an existing pod
     let existing_pod = create_minimal_pod("existing-pod", "test-namespace");
@@ -683,6 +658,26 @@ async fn limitrange_pod_level_aggregates_across_containers() {
 // ===== ResourceQuota accounting on Quantity (#1714) =====
 
 /// `create_minimal_pod` with `requests` set on its single container.
+/// Whether the pod is admitted; the refusal text is asserted where it matters.
+async fn check_resource_quota(
+    storage: &Arc<MemoryStorage>,
+    namespace: &str,
+    pod: &Pod,
+) -> anyhow::Result<bool> {
+    Ok(quota_verdict(storage, namespace, pod).await?.is_none())
+}
+
+async fn check_resource_quota_with_old(
+    storage: &Arc<MemoryStorage>,
+    namespace: &str,
+    pod: &Pod,
+    old: Option<&Pod>,
+) -> anyhow::Result<bool> {
+    Ok(quota_verdict_with_old(storage, namespace, pod, old)
+        .await?
+        .is_none())
+}
+
 fn pod_with_requests(name: &str, namespace: &str, requests: &[(&str, &str)]) -> Pod {
     let mut pod = create_minimal_pod(name, namespace);
     let map: HashMap<String, String> = requests
@@ -712,10 +707,12 @@ async fn put_quota(storage: &Arc<MemoryStorage>, name: &str, hard: &[(&str, &str
             scope_selector: None,
         },
     );
-    // The quota controller has synced: status.hard mirrors spec.hard.
+    // The quota controller has synced: status.hard mirrors spec.hard and
+    // status.used carries a figure for every hard key (`hasUsageStats`).
+    let used: HashMap<String, String> = hard.keys().map(|k| (k.clone(), "0".to_string())).collect();
     quota.status = Some(rusternetes_common::resources::ResourceQuotaStatus {
         hard: Some(hard),
-        used: None,
+        used: Some(used),
     });
     let key = build_key("resourcequotas", Some("test-namespace"), name);
     storage.create(&key, &quota).await.unwrap();
@@ -892,8 +889,6 @@ async fn quota_ignores_dimensions_the_pod_does_not_request() {
 /// `RemoveZeros(SubtractWithNonNegativeResult(new, old))`.
 #[tokio::test]
 async fn quota_admits_update_with_zero_delta_at_the_limit() {
-    use rusternetes_api_server::admission::check_resource_quota_with_old;
-
     let storage = Arc::new(MemoryStorage::new());
     put_quota(
         &storage,
@@ -1064,5 +1059,79 @@ async fn quota_constraints_read_status_hard_not_spec_hard() {
             .unwrap()
             .as_deref(),
         Some("failed quota: synced: must specify requests.cpu for: test-container")
+    );
+}
+
+/// A quota with `spec.hard` but no `status.hard` yet (the controller has not
+/// synced it) constrains nothing: upstream's `checkRequest` reads
+/// `ResourceNames(resourceQuota.Status.Hard)`, so `MatchingResources` is empty
+/// and the quota is not interesting
+/// (`resourcequota/controller.go:464-465`, `generic/evaluator.go:Matches`).
+#[tokio::test]
+async fn quota_without_status_hard_constrains_nothing() {
+    let storage = Arc::new(MemoryStorage::new());
+    let hard: HashMap<String, String> = [("pods".to_string(), "0".to_string())].into();
+    let quota = ResourceQuota::new(
+        "unsynced",
+        "test-namespace",
+        ResourceQuotaSpec {
+            hard: Some(hard),
+            scopes: None,
+            scope_selector: None,
+        },
+    );
+    storage
+        .create(
+            &build_key("resourcequotas", Some("test-namespace"), "unsynced"),
+            &quota,
+        )
+        .await
+        .unwrap();
+
+    let pod = pod_with_requests("p", "test-namespace", &[("memory", "1Gi")]);
+    assert!(
+        check_resource_quota(&storage, "test-namespace", &pod)
+            .await
+            .unwrap(),
+        "spec.hard alone must not be enforced before status.hard is set"
+    );
+}
+
+/// `hasUsageStats` (`controller.go:763-777`): a quota whose `status.hard` names
+/// a pod resource with no `status.used` entry is refused
+/// `status unknown for quota: <name>, resources: <list>` (`controller.go:470`).
+#[tokio::test]
+async fn quota_without_status_used_is_refused() {
+    let storage = Arc::new(MemoryStorage::new());
+    let hard: HashMap<String, String> = [("pods".to_string(), "100".to_string())].into();
+    let mut quota = ResourceQuota::new(
+        "fresh",
+        "test-namespace",
+        ResourceQuotaSpec {
+            hard: Some(hard.clone()),
+            scopes: None,
+            scope_selector: None,
+        },
+    );
+    quota.status = Some(rusternetes_common::resources::ResourceQuotaStatus {
+        hard: Some(hard),
+        used: None,
+    });
+    storage
+        .create(
+            &build_key("resourcequotas", Some("test-namespace"), "fresh"),
+            &quota,
+        )
+        .await
+        .unwrap();
+
+    let pod = pod_with_requests("p", "test-namespace", &[("memory", "1Gi")]);
+    assert_eq!(
+        quota_verdict(&storage, "test-namespace", &pod)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("status unknown for quota: fresh, resources: pods"),
+        "a quota with no status.used for a hard pod resource must refuse"
     );
 }
