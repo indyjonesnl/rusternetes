@@ -4,12 +4,11 @@
 //! - /logs - Get container logs
 //! - /exec - Execute commands in containers (proxied to kubelet)
 //! - /attach - Attach to running containers (proxied to kubelet)
-//! - /portforward - Forward ports to pods (SPDY and WebSocket)
+//! - /portforward - Forward ports to pods (proxied to kubelet)
 
 use crate::{
     handlers::node_conn::{node_conn, NodeConn},
     middleware::AuthContext,
-    spdy, spdy_handlers,
     state::ApiServerState,
     streaming,
 };
@@ -133,12 +132,6 @@ pub struct AttachQuery {
     /// Use TTY
     #[serde(default)]
     pub tty: bool,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct PortForwardQuery {
-    /// Ports to forward
-    pub ports: Option<String>,
 }
 
 /// GET /api/v1/namespaces/{namespace}/pods/{name}/log
@@ -794,17 +787,75 @@ pub async fn attach(
     Ok(rusternetes_streamproxy::proxy_upgrade(target_url, req).await)
 }
 
+/// Build the kubelet `portForward` query from the request's `ports` options.
+///
+/// Port of `streamParams` for `*api.PodPortForwardOptions`
+/// (`pkg/registry/core/pod/strategy.go:716-723`): the ports become a single
+/// comma-joined `port=` param, and no param at all when there are none (kubectl's
+/// SPDY client sends its ports in stream headers, not the query).
+pub fn port_forward_stream_query(raw_query: &str) -> Result<String> {
+    let mut ports: Vec<u16> = Vec::new();
+    for (k, v) in url::form_urlencoded::parse(raw_query.as_bytes()) {
+        if k != "ports" {
+            continue;
+        }
+        for p in v.split(',') {
+            let port: u16 = p.trim().parse().map_err(|_| {
+                Error::BadRequest(format!("unable to parse {p:?} as a port in \"ports\""))
+            })?;
+            ports.push(port);
+        }
+    }
+    if ports.is_empty() {
+        return Ok(String::new());
+    }
+    let joined = ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(format!("port={joined}"))
+}
+
+/// Build the kubelet `/portForward/{ns}/{pod}` URL.
+///
+/// Upstream: `PortForwardLocation` (`pkg/registry/core/pod/strategy.go:798-830`)
+/// — `Path: /portForward/<ns>/<name>` (note the capital F).
+pub fn build_kubelet_portforward_url(
+    conn: &NodeConn,
+    ns: &str,
+    pod: &str,
+    stream_query: &str,
+) -> Uri {
+    let path = format!("/portForward/{ns}/{pod}");
+    let uri_str = if stream_query.is_empty() {
+        format!("{}://{}:{}{}", conn.scheme, conn.host, conn.port, path)
+    } else {
+        format!(
+            "{}://{}:{}{}?{}",
+            conn.scheme, conn.host, conn.port, path, stream_query
+        )
+    };
+    uri_str
+        .parse()
+        .expect("kubelet portForward URL is always valid")
+}
+
 /// GET/POST /api/v1/namespaces/{namespace}/pods/{name}/portforward
-/// Forward ports to a pod (supports both SPDY and WebSocket)
+///
+/// Proxies port-forward to the pod's kubelet with an upgrade-aware reverse proxy.
+/// Mirrors `PortForwardREST.Connect` (`pkg/registry/core/pod/rest/subresources.go:256-279`)
+/// + `PortForwardLocation`; the kubelet resolves the sandbox and calls CRI
+/// `PortForward`, and the SPDY/WebSocket bytes pass through untouched.
 pub async fn portforward(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
-    Query(query): Query<PortForwardQuery>,
-    ws: Option<WebSocketUpgrade>,
     req: Request,
 ) -> Result<Response> {
     info!("Port forwarding to pod {}/{}", namespace, name);
+
+    let raw_query = req.uri().query().unwrap_or("").to_string();
 
     // Check authorization
     let attrs = RequestAttributes::new(auth_ctx.user, "create", "pods")
@@ -819,74 +870,31 @@ pub async fn portforward(
         }
     }
 
-    // Get the pod
+    let stream_query = port_forward_stream_query(&raw_query)?;
+
+    // Fetch the pod and require spec.nodeName (upstream: 400 if unset).
     let pod_key = rusternetes_storage::build_key("pods", Some(&namespace), &name);
     let pod: rusternetes_common::resources::Pod = state.storage.get(&pod_key).await?;
 
-    // Parse ports from query parameter
-    let ports: Vec<u16> = if let Some(ref ports_str) = query.ports {
-        ports_str
-            .split(',')
-            .filter_map(|p| p.trim().parse().ok())
-            .collect()
-    } else {
-        vec![]
-    };
+    let node_name = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.node_name.as_deref())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| Error::BadRequest(format!("pod {} does not have a host assigned", name)))?
+        .to_string();
 
-    if ports.is_empty() {
-        return Err(Error::InvalidResource(
-            "No ports specified for port forwarding".to_string(),
-        ));
-    }
+    let node_key = rusternetes_storage::build_key("nodes", None::<&str>, &node_name);
+    let node: rusternetes_common::resources::Node = state.storage.get(&node_key).await?;
+    let conn = node_conn(&node, None)?;
 
-    // Check if this is a SPDY upgrade request (kubectl uses SPDY)
-    if spdy::is_spdy_request(&req) {
-        info!(
-            "Upgrading port-forward to SPDY for pod {}/{}, ports: {:?} (kubectl compatibility)",
-            namespace, name, ports
-        );
+    let target_url = build_kubelet_portforward_url(&conn, &namespace, &name, &stream_query);
+    info!(
+        "Proxying portforward {}/{} to kubelet: {}",
+        namespace, name, target_url
+    );
 
-        // Create SPDY upgrade response
-        let response = spdy::create_spdy_upgrade_response().map_err(|e| {
-            Error::Internal(format!("Failed to create SPDY upgrade response: {}", e))
-        })?;
-
-        // Spawn task to handle SPDY connection after upgrade
-        tokio::spawn(async move {
-            match spdy::upgrade_to_spdy(req).await {
-                Ok(spdy_conn) => {
-                    spdy_handlers::handle_spdy_portforward(spdy_conn, pod, ports).await;
-                }
-                Err(e) => {
-                    tracing::error!("Failed to upgrade to SPDY: {}", e);
-                }
-            }
-        });
-
-        return Ok(response.into_response());
-    }
-
-    // Handle WebSocket upgrade if requested
-    if let Some(ws) = ws {
-        info!(
-            "Upgrading port-forward to WebSocket for pod {}/{}, ports: {:?}",
-            namespace, name, ports
-        );
-        Ok(ws
-            .on_upgrade(move |socket| streaming::handle_portforward_websocket(socket, pod, ports))
-            .into_response())
-    } else {
-        // No upgrade requested - return error
-        Ok(Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .header("Content-Type", "text/plain")
-            .body(Body::from(
-                "Port forward requires protocol upgrade (SPDY or WebSocket). Use:\n\
-                - kubectl (uses SPDY automatically)\n\
-                - WebSocket protocol for custom clients\n",
-            ))
-            .unwrap())
-    }
+    Ok(rusternetes_streamproxy::proxy_upgrade(target_url, req).await)
 }
 
 /// Feature name kubelets advertise in `node.status.declaredFeatures` once they
@@ -1039,6 +1047,29 @@ pub(crate) async fn check_node_declared_features_for_resize<S: Storage>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn portforward_kubelet_url_matches_upstream_shape() {
+        let conn = NodeConn {
+            host: "10.0.0.5".into(),
+            port: 10250,
+            scheme: "https",
+        };
+        // strategy.go:823-828 - capital-F path, `port=` comma-joined.
+        let q = port_forward_stream_query("ports=80&ports=8080,9090").unwrap();
+        assert_eq!(q, "port=80,8080,9090");
+        assert_eq!(
+            build_kubelet_portforward_url(&conn, "ns1", "pod1", &q).to_string(),
+            "https://10.0.0.5:10250/portForward/ns1/pod1?port=80,8080,9090"
+        );
+        // kubectl's SPDY client sends no query: no param (strategy.go:716).
+        let q = port_forward_stream_query("").unwrap();
+        assert_eq!(
+            build_kubelet_portforward_url(&conn, "ns1", "pod1", &q).to_string(),
+            "https://10.0.0.5:10250/portForward/ns1/pod1"
+        );
+        assert!(port_forward_stream_query("ports=abc").is_err());
+    }
+
     #[test]
     fn exec_kubelet_url_matches_upstream_shape() {
         let u = build_kubelet_stream_url(
