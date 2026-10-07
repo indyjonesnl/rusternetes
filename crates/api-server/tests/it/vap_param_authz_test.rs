@@ -179,6 +179,36 @@ async fn policy_create_with_param_kind_needs_get_on_the_kind() {
     assert_eq!(s, StatusCode::CREATED, "{body}");
 }
 
+/// resolver/resolver.go:36-60: any kind the server serves resolves through
+/// discovery, not just a hand-picked table. `Lease` (coordination.k8s.io) is
+/// resolved to `leases`, so `get` on `leases` is enough; it is NOT authorized
+/// on resource `*`.
+#[tokio::test]
+async fn any_served_param_kind_resolves_to_its_exact_resource() {
+    let api = api().await;
+    grant(
+        &api,
+        "dave",
+        json!([{"apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get"]}]),
+    )
+    .await;
+    let lease = json!({"apiVersion": "coordination.k8s.io/v1", "kind": "Lease"});
+    let (s, body) = as_user(&api, "dave", "POST", VAP, Some(&policy("pl", Some(lease)))).await;
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+
+    // alice has no `get` on leases: still refused.
+    let lease = json!({"apiVersion": "coordination.k8s.io/v1", "kind": "Lease"});
+    let (s, body) = as_user(
+        &api,
+        "alice",
+        "POST",
+        VAP,
+        Some(&policy("pl2", Some(lease))),
+    )
+    .await;
+    assert_forbidden_field(s, &body, "spec.paramKind", "kind=Lease");
+}
+
 /// `EscalationAllowed`: a superuser skips the check.
 #[tokio::test]
 async fn policy_create_by_a_superuser_skips_the_check() {

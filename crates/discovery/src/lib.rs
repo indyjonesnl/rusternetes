@@ -896,6 +896,32 @@ fn get_api_group_names() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+/// The resource a built-in kind is served as at `group/version`: a port of
+/// `discoveryResourceResolver.Resolve`
+/// (pkg/registry/admissionregistration/resolver/resolver.go:36-60) over the
+/// discovery documents this crate serves. The kind must match, subresources
+/// (a `/` in the name) are skipped, and a group or version that is not served
+/// resolves to nothing (upstream's `NoKindMatchError`).
+pub fn resolve_kind_to_resource(group: &str, version: &str, kind: &str) -> Option<String> {
+    let served = match (group, version) {
+        ("", "v1") | ("autoscaling", "v1") => true,
+        ("certificates.k8s.io", "v1beta1") => certificates_v1beta1_served(),
+        _ => get_api_group_names()
+            .iter()
+            .any(|(g, v)| *g == group && *v == version),
+    };
+    if !served {
+        return None;
+    }
+    get_aggregated_resources_for_group_uncategorized(group, version)
+        .iter()
+        .find(|r| {
+            r["responseKind"]["kind"].as_str() == Some(kind)
+                && r["resource"].as_str().is_some_and(|n| !n.contains('/'))
+        })
+        .and_then(|r| r["resource"].as_str().map(str::to_string))
+}
+
 /// Build aggregated discovery resource entries for a given API group.
 /// Returns a list of resource objects in the apidiscovery.k8s.io/v2 format.
 /// In v2, subresources are nested inside their parent resource's "subresources" array,
@@ -4149,6 +4175,26 @@ pub async fn get_apiregistration_v1_resources() -> (StatusCode, Json<APIResource
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+
+    #[test]
+    fn resolve_kind_finds_the_resource_serving_a_kind() {
+        // resolver/resolver.go:36-60
+        assert_eq!(
+            resolve_kind_to_resource("coordination.k8s.io", "v1", "Lease").as_deref(),
+            Some("leases")
+        );
+        assert_eq!(
+            resolve_kind_to_resource("", "v1", "Pod").as_deref(),
+            Some("pods")
+        );
+        // a wrong version, an unknown kind, and a subresource-only kind do not resolve
+        assert_eq!(
+            resolve_kind_to_resource("coordination.k8s.io", "v9", "Lease"),
+            None
+        );
+        assert_eq!(resolve_kind_to_resource("", "v1", "Nope"), None);
+        assert_eq!(resolve_kind_to_resource("", "v1", "PodExecOptions"), None);
+    }
 
     #[test]
     fn test_wants_aggregated_discovery_with_explicit_accept() {
