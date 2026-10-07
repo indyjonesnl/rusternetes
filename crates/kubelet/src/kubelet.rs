@@ -448,6 +448,13 @@ pub struct Kubelet {
     /// `Kubelet.nodeStatusUpdateFrequency` (pkg/kubelet/kubelet.go:624),
     /// consumed by `wait.JitterUntil(kl.syncNodeStatus, ...)` (:1852).
     node_status_update_frequency: Duration,
+    /// `KubeletConfiguration.fileCheckFrequency`: how often the static pod
+    /// manifest dir is re-read. Upstream passes
+    /// `kubeCfg.FileCheckFrequency.Duration` as the `period` of
+    /// `config.NewSourceFile` (pkg/kubelet/kubelet.go:384), whose
+    /// `sourceFile.run` re-lists on `time.NewTicker(s.period)`
+    /// (pkg/kubelet/config/file.go:93-104).
+    file_check_frequency: Duration,
     /// Current file-sourced static pods, keyed by (suffixed) pod name.
     /// Workers consult this before storage so static pods survive
     /// mirror-pod deletion.
@@ -716,6 +723,7 @@ impl Kubelet {
             metrics_port,
             pod_manifest_path: None,
             node_status_update_frequency: Duration::from_secs(10),
+            file_check_frequency: Duration::from_secs(20),
             static_pods: Arc::new(Mutex::new(HashMap::new())),
             sysctl_allowlist: crate::sysctl::Allowlist::new(&allowed_unsafe_sysctls),
         })
@@ -734,6 +742,41 @@ impl Kubelet {
             .filter(|d| !d.is_zero())
             .unwrap_or(Duration::from_secs(10));
         self
+    }
+
+    /// Apply `KubeletConfiguration.fileCheckFrequency` (20s when unset/zero,
+    /// v1beta1/defaults.go).
+    pub fn with_file_check_frequency(mut self, d: Option<Duration>) -> Self {
+        self.file_check_frequency = d
+            .filter(|d| !d.is_zero())
+            .unwrap_or(Duration::from_secs(20));
+        self
+    }
+
+    /// Period of the static-pod file source poll in `run`.
+    pub(crate) fn static_pod_poll_interval(&self) -> Duration {
+        self.file_check_frequency
+    }
+
+    /// One pass of the file source (`sourceFile.listConfig`,
+    /// pkg/kubelet/config/file.go:121): re-read the manifest dir, project
+    /// mirror pods into storage, and publish the result to the static-pod
+    /// cache that `sync_loop` consumes.
+    pub(crate) async fn poll_static_pods(&self) {
+        let Some(dir) = &self.pod_manifest_path else {
+            return;
+        };
+        let pods = crate::static_pods::load_static_pods(dir, &self.node_name);
+        if let Err(e) =
+            crate::static_pods::reconcile_mirror_pods(self.storage.as_ref(), &self.node_name, &pods)
+                .await
+        {
+            warn!("static pods: mirror reconcile failed: {}", e);
+        }
+        *self.static_pods.lock().unwrap() = pods
+            .iter()
+            .map(|p| (p.metadata.name.clone(), p.clone()))
+            .collect();
     }
 
     /// Apply `KubeletConfiguration.runtimeRequestTimeout` (2m when unset/zero,
@@ -949,6 +992,10 @@ impl Kubelet {
         // The watch-triggered syncs handle the fast path
         let full_sync_interval = Duration::from_secs(self.sync_interval.as_secs().max(1));
         let mut full_sync_timer = tokio::time::interval(full_sync_interval);
+        // File source poll: first tick fires immediately ("Read path
+        // immediately to speed up startup", file.go:96), then every
+        // fileCheckFrequency.
+        let mut static_pod_timer = tokio::time::interval(self.static_pod_poll_interval());
 
         // Lease-based heartbeat in a SEPARATE task.
         // K8s kubelet uses Lease objects (coordination.k8s.io/v1) for heartbeats
@@ -1146,6 +1193,15 @@ impl Kubelet {
                     // If no worker exists, start one
                     if !has_worker {
                         self.ensure_pod_worker(&pod_name).await;
+                    }
+                }
+                // Static pod file source (NewSourceFile, kubelet.go:384)
+                _ = static_pod_timer.tick() => {
+                    self.poll_static_pods().await;
+                    if self.pod_manifest_path.is_some() {
+                        if let Err(e) = self.sync_loop().await {
+                            error!("Error in static pod sync: {}", e);
+                        }
                     }
                 }
                 // Periodic full sync as safety net
@@ -1799,27 +1855,10 @@ impl Kubelet {
         let all_pods_prefix = build_prefix("pods", None);
         let all_pods: Vec<Pod> = self.storage.list(&all_pods_prefix).await?;
 
-        // Static pods: rescan the manifest dir (file source resync) and
-        // project mirrors into storage before computing the node's pod set.
-        let static_pods: Vec<Pod> = if let Some(dir) = &self.pod_manifest_path {
-            let pods = crate::static_pods::load_static_pods(dir, &self.node_name);
-            if let Err(e) = crate::static_pods::reconcile_mirror_pods(
-                self.storage.as_ref(),
-                &self.node_name,
-                &pods,
-            )
-            .await
-            {
-                warn!("static pods: mirror reconcile failed: {}", e);
-            }
-            *self.static_pods.lock().unwrap() = pods
-                .iter()
-                .map(|p| (p.metadata.name.clone(), p.clone()))
-                .collect();
-            pods
-        } else {
-            Vec::new()
-        };
+        // Static pods: the file source is polled on its own ticker
+        // (`fileCheckFrequency`, see `poll_static_pods` / `run`); the sync
+        // loop consumes the last published set.
+        let static_pods: Vec<Pod> = self.static_pods.lock().unwrap().values().cloned().collect();
 
         let node_pods: Vec<Pod> =
             crate::static_pods::merge_node_pods(all_pods.clone(), static_pods, &self.node_name);
@@ -6102,6 +6141,56 @@ mod tests {
             .await
             .with_node_status_update_frequency(Some(Duration::ZERO));
         assert_eq!(z.node_status_heartbeat_interval(), Duration::from_secs(10));
+    }
+
+    /// `fileCheckFrequency` drives the static-pod file source poll
+    /// (kubelet.go:384 -> file.go:93) and a poll publishes manifests to the
+    /// cache `sync_loop` reads.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn file_check_frequency_drives_static_pod_poll() {
+        use rusternetes_storage::StorageBackend;
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("absent.sock");
+        std::env::set_var(
+            "CONTAINER_RUNTIME_ENDPOINT",
+            format!("unix://{}", sock.display()),
+        );
+        let manifests = dir.path().join("manifests");
+        std::fs::create_dir_all(&manifests).unwrap();
+        let mk = || async {
+            Kubelet::new(
+                "node-fc".into(),
+                std::sync::Arc::new(StorageBackend::new_memory()),
+                10,
+                dir.path().join("vols").display().to_string(),
+                "10.96.0.10".into(),
+                "cluster.local".into(),
+                "bridge".into(),
+                String::new(),
+            )
+            .await
+            .unwrap()
+        };
+        let d = mk().await;
+        assert_eq!(d.static_pod_poll_interval(), Duration::from_secs(20));
+        let z = mk().await.with_file_check_frequency(Some(Duration::ZERO));
+        assert_eq!(z.static_pod_poll_interval(), Duration::from_secs(20));
+        let k = mk()
+            .await
+            .with_pod_manifest_path(Some(manifests.clone()))
+            .with_file_check_frequency(Some(Duration::from_secs(5)));
+        assert_eq!(k.static_pod_poll_interval(), Duration::from_secs(5));
+
+        std::fs::write(
+            manifests.join("web.yaml"),
+            "apiVersion: v1\nkind: Pod\nmetadata:\n  name: web\nspec:\n  containers:\n  - name: c\n    image: busybox\n",
+        )
+        .unwrap();
+        assert!(k.static_pods.lock().unwrap().is_empty(), "no poll yet");
+        k.poll_static_pods().await;
+        assert_eq!(k.static_pods.lock().unwrap().len(), 1);
     }
 
     /// `runtimeRequestTimeout` reaches the CRI client (upstream passes
