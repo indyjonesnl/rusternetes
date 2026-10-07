@@ -15,6 +15,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{info, warn};
 
+use self::resourcequota::evaluator::status_hard_names;
+use self::resourcequota::{has_usage_stats, pretty_print_resource_names};
+
 /// Check if a pod is BestEffort QoS class — the `BestEffort` ResourceQuota
 /// scope.
 ///
@@ -217,11 +220,12 @@ pub async fn check_pod_quota_constraints<S: Storage>(
 ///
 /// Delegates to [`check_resource_quota_with_old`] with `old_pod = None`
 /// so the new pod's full resource footprint counts against the quota.
+/// `None` admits; `Some(msg)` is the `Forbidden` message.
 pub async fn check_resource_quota<S: Storage>(
     storage: &Arc<S>,
     namespace: &str,
     pod: &Pod,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Option<String>> {
     check_resource_quota_with_old(storage, namespace, pod, None).await
 }
 
@@ -246,6 +250,15 @@ pub async fn check_resource_quota<S: Storage>(
 /// which is how `hard: requests.example.com/foo: 1k` came to be silently
 /// unenforced (`limit_str.parse().unwrap_or(i64::MAX)`).
 ///
+/// Returns `None` to admit, or the `Forbidden` message (without the prefix the
+/// caller supplies): `exceeded quota: ...`, or, from `hasUsageStats`
+/// (`controller.go:469-471`), `status unknown for quota: <name>, resources: <list>`.
+///
+/// A quota is read the way upstream reads it: its hard limits come from
+/// `status.hard` (`controller.go:464`, `:605`), not `spec.hard`, so a quota the
+/// controller has not synced yet constrains nothing, and one whose
+/// `status.used` lacks a figure for a pod resource it limits refuses the pod.
+///
 /// Two deliberate deviations from upstream, both pre-existing:
 ///
 /// * **Live recount instead of `status.used`.** Upstream charges against the
@@ -261,12 +274,12 @@ pub async fn check_resource_quota_with_old<S: Storage>(
     namespace: &str,
     pod: &Pod,
     old_pod: Option<&Pod>,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Option<String>> {
     let quota_prefix = format!("/registry/resourcequotas/{}/", namespace);
     let quotas: Vec<ResourceQuota> = storage.list(&quota_prefix).await?;
 
     if quotas.is_empty() {
-        return Ok(true);
+        return Ok(None);
     }
 
     let now = Utc::now();
@@ -285,7 +298,7 @@ pub async fn check_resource_quota_with_old<S: Storage>(
 
     // Nothing charged means nothing can be exceeded (`controller.go:555-565`).
     if delta.is_empty() {
-        return Ok(true);
+        return Ok(None);
     }
 
     for mut quota_obj in quotas {
@@ -293,12 +306,29 @@ pub async fn check_resource_quota_with_old<S: Storage>(
             continue;
         }
 
-        let hard_raw = match &quota_obj.spec.hard {
-            Some(h) => h.clone(),
-            None => continue,
-        };
-        let hard = quota::parse_resource_list(&hard_raw);
-        let hard_names = quota::resource_names(&hard);
+        // `ResourceNames(resourceQuota.Status.Hard)` (`controller.go:464`): an
+        // unsynced quota has none, so `MatchingResources` is empty and the
+        // quota does not match the pod at all (`generic.Matches`).
+        let hard_names = status_hard_names(&quota_obj);
+        let restricted = pod_matching_resources(&hard_names);
+        if restricted.is_empty() {
+            continue;
+        }
+        // `controller.go:469-471`, after `Constraints`
+        // ([`check_pod_quota_constraints`]).
+        if !has_usage_stats(&quota_obj, &restricted) {
+            return Ok(Some(format!(
+                "status unknown for quota: {}, resources: {}",
+                quota_obj.metadata.name,
+                pretty_print_resource_names(&restricted)
+            )));
+        }
+        let hard = quota_obj
+            .status
+            .as_ref()
+            .and_then(|s| s.hard.as_ref())
+            .map(quota::parse_resource_list)
+            .unwrap_or_default();
 
         let requested = quota::mask(&delta, &hard_names);
         if requested.is_empty() {
@@ -319,14 +349,15 @@ pub async fn check_resource_quota_with_old<S: Storage>(
             // caller supplies: `exceeded quota: <name>, requested: <list>,
             // used: <list>, limited: <list>` where each list is
             // `prettyPrint(Mask(.., exceeded))` (`controller.go:619-625`).
-            warn!(
-                "Forbidden: exceeded quota: {}, requested: {}, used: {}, limited: {}",
+            let message = format!(
+                "exceeded quota: {}, requested: {}, used: {}, limited: {}",
                 quota_obj.metadata.name,
                 quota::pretty_print(&quota::mask(&requested, &exceeded)),
                 quota::pretty_print(&quota::mask(&used, &exceeded)),
                 quota::pretty_print(&quota::mask(&hard, &exceeded)),
             );
-            return Ok(false);
+            warn!("Forbidden: {message}");
+            return Ok(Some(message));
         }
 
         // Record the new usage. Upstream sets `Status.Used = newUsage`
@@ -338,7 +369,37 @@ pub async fn check_resource_quota_with_old<S: Storage>(
         write_quota_usage(storage, &quota_key, &mut quota_obj, &new_usage).await;
     }
 
-    Ok(true)
+    Ok(None)
+}
+
+/// `podEvaluator.MatchingResources` (`pkg/quota/v1/evaluator/core/pods.go:208-222`):
+/// the names in `input` a pod is charged against — `podResources`, the
+/// `hugepages-` / `requests.hugepages-` prefixes, and `requests.<extended>`
+/// (`isExtendedResourceNameForQuota`, :86-97).
+fn pod_matching_resources(input: &[String]) -> Vec<String> {
+    const POD_RESOURCES: [&str; 11] = [
+        "count/pods",
+        "cpu",
+        "memory",
+        "ephemeral-storage",
+        "requests.cpu",
+        "requests.memory",
+        "requests.ephemeral-storage",
+        "limits.cpu",
+        "limits.memory",
+        "limits.ephemeral-storage",
+        "pods",
+    ];
+    input
+        .iter()
+        .filter(|name| {
+            POD_RESOURCES.contains(&name.as_str())
+                || name.starts_with("hugepages-")
+                || name.starts_with("requests.hugepages-")
+                || (name.starts_with("requests.") && !quota::is_native_resource_name(name))
+        })
+        .cloned()
+        .collect()
 }
 
 /// Sum the quota footprint of every pod in `namespace` that `quota_obj`'s scopes
@@ -381,7 +442,7 @@ async fn write_quota_usage<S: Storage>(
     quota_obj: &mut ResourceQuota,
     new_usage: &quota::ResourceList,
 ) {
-    let hard = quota_obj.spec.hard.clone();
+    let hard = quota_obj.status.as_ref().and_then(|s| s.hard.clone());
     let used = masked_used(new_usage, hard.as_ref());
 
     let status = quota_obj.status.get_or_insert_with(|| {
@@ -398,7 +459,7 @@ async fn write_quota_usage<S: Storage>(
             quota_obj.metadata.name, e
         );
         if let Ok(mut fresh) = storage.get::<ResourceQuota>(quota_key).await {
-            let fresh_hard = fresh.spec.hard.clone();
+            let fresh_hard = fresh.status.as_ref().and_then(|s| s.hard.clone());
             let used = masked_used(new_usage, fresh_hard.as_ref());
             let status = fresh.status.get_or_insert_with(|| {
                 rusternetes_common::resources::ResourceQuotaStatus {

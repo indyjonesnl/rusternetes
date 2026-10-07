@@ -202,6 +202,11 @@ mod tests {
         let first = dsw.get_plugins_to_register()[0].uuid.clone();
         drop(l);
         std::fs::remove_file(&sock).unwrap();
+        // A freed inode is reused at once on tmpfs/overlayfs, and ctime only
+        // ticks at kernel-tick granularity, so a bind inside the same tick
+        // yields an identical SocketId. Cross a tick so the re-creation is
+        // observable, as it is across the 200ms production poll interval.
+        std::thread::sleep(Duration::from_millis(20));
         let _l2 = UnixListener::bind(&sock).unwrap();
         w.poll_once();
         let second = dsw.get_plugins_to_register();

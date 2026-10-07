@@ -552,8 +552,8 @@ impl Admission<'_> {
                     crate::admission::check_pod_quota_constraints(storage, namespace, pod).await,
                 )?;
                 match crate::admission::check_resource_quota(storage, namespace, pod).await {
-                    Ok(true) => Ok(()),
-                    Ok(false) => Err(self.forbidden(&name, "exceeded quota")),
+                    Ok(None) => Ok(()),
+                    Ok(Some(msg)) => Err(self.forbidden(&name, msg)),
                     Err(e) => Err(Error::Internal(format!(
                         "error checking ResourceQuota: {e}"
                     ))),
@@ -574,8 +574,8 @@ impl Admission<'_> {
                 )
                 .await
                 {
-                    Ok(true) => Ok(()),
-                    Ok(false) => Err(self.forbidden(&name, "exceeded quota")),
+                    Ok(None) => Ok(()),
+                    Ok(Some(msg)) => Err(self.forbidden(&name, msg)),
                     Err(e) => {
                         tracing::warn!("Error checking ResourceQuota on pod update: {e}");
                         Ok(())

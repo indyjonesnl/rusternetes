@@ -77,7 +77,7 @@ fn set_status_used(q: &mut ResourceQuota, used: &ResourceList) {
 }
 
 /// `hasUsageStats` (controller.go:763-777).
-fn has_usage_stats(q: &ResourceQuota, interesting: &[String]) -> bool {
+pub(crate) fn has_usage_stats(q: &ResourceQuota, interesting: &[String]) -> bool {
     let used = q.status.as_ref().and_then(|s| s.used.as_ref());
     status_hard_names(q)
         .iter()
@@ -85,7 +85,7 @@ fn has_usage_stats(q: &ResourceQuota, interesting: &[String]) -> bool {
         .all(|name| used.is_some_and(|u| u.contains_key(name)))
 }
 
-fn pretty_print_resource_names(names: &[String]) -> String {
+pub(crate) fn pretty_print_resource_names(names: &[String]) -> String {
     let mut names = names.to_vec();
     names.sort();
     names.join(",")
