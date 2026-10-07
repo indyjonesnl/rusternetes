@@ -367,8 +367,14 @@ fn validate_custom_resource_definition_spec_opts(
     }
 
     // scope — `validateEnumStrings(..., required=true)` (`:364`, `:502-515`).
-    if spec.scope == ResourceScope::Unspecified {
-        errs.push(Error::required(&fld_path.child("scope"), ""));
+    match &spec.scope {
+        ResourceScope::Unspecified => errs.push(Error::required(&fld_path.child("scope"), "")),
+        ResourceScope::Unknown(v) => errs.push(Error::not_supported(
+            &fld_path.child("scope"),
+            v.clone(),
+            &["Cluster", "Namespaced"],
+        )),
+        ResourceScope::Cluster | ResourceScope::Namespaced => {}
     }
 
     // versions (`:398-414`).
@@ -721,7 +727,17 @@ fn validate_conversion(
                 ));
             }
         }
-        Some(ConversionStrategyType::None) => {
+        // `validateEnumStrings` (:617) answers an unknown strategy
+        // `NotSupported`; it is then not Webhook, so the else branch (:638-645)
+        // applies exactly as for `None`.
+        Some(ConversionStrategyType::None) | Some(ConversionStrategyType::Unknown(_)) => {
+            if let Some(ConversionStrategyType::Unknown(v)) = &conversion.strategy {
+                errs.push(Error::not_supported(
+                    &fld_path.child("strategy"),
+                    v.clone(),
+                    &["None", "Webhook"],
+                ));
+            }
             if let Some(webhook) = &conversion.webhook {
                 errs.push(Error::forbidden(
                     &client_config_path,
@@ -1170,6 +1186,54 @@ mod whole_object_tests {
         .unwrap()];
         set_defaults_custom_resource_definition(&mut crd);
         crd
+    }
+
+    /// `validateEnumStrings` (validation.go:502-515): an unknown `spec.scope`
+    /// is a Go string, so it decodes and is `NotSupported` with the accepted
+    /// list in declaration order (`Cluster`, `Namespaced`, :364).
+    #[test]
+    fn unknown_scope_is_not_supported() {
+        let spec: crate::resources::CustomResourceDefinitionSpec =
+            serde_json::from_value(serde_json::json!({
+                "group": "example.com",
+                "names": {"kind": "Widget", "plural": "widgets"},
+                "scope": "Galactic",
+                "versions": [{"name": "v1", "served": true, "storage": true}]
+            }))
+            .expect("an unknown scope must decode");
+        let errs = validate_custom_resource_definition_spec(&spec, &Path::new("spec"));
+        let e = errs
+            .iter()
+            .find(|e| e.field == "spec.scope")
+            .unwrap_or_else(|| panic!("{errs:?}"));
+        assert_eq!(e.error_type, crate::validation::field::ErrorType::NotSupported, "{errs:?}");
+        assert!(
+            e.to_string()
+                .contains("supported values: \"Cluster\", \"Namespaced\""),
+            "{e}"
+        );
+    }
+
+    /// validation.go:617 + 618-640: an unknown strategy is `NotSupported`
+    /// (`None`, `Webhook`) and, not being Webhook, takes the else branch that
+    /// forbids `webhook` config.
+    #[test]
+    fn unknown_conversion_strategy_is_not_supported() {
+        let mut c = crd("example.com");
+        c.spec.conversion = Some(
+            serde_json::from_value(serde_json::json!({"strategy": "Carrier"}))
+                .expect("an unknown strategy must decode"),
+        );
+        let errs = validate_custom_resource_definition_spec(&c.spec, &Path::new("spec"));
+        let e = errs
+            .iter()
+            .find(|e| e.field == "spec.conversion.strategy")
+            .unwrap_or_else(|| panic!("{errs:?}"));
+        assert_eq!(e.error_type, crate::validation::field::ErrorType::NotSupported, "{errs:?}");
+        assert!(
+            e.to_string().contains("supported values: \"None\", \"Webhook\""),
+            "{e}"
+        );
     }
 
     /// `TestValidateCustomResourceDefinitionStoredVersions`
