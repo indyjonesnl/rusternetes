@@ -33,9 +33,12 @@ fn check_volume_mode_filesystem(spec: &Spec<'_>) -> Result<bool> {
     let Some(pv) = spec.persistent_volume else {
         return Ok(true);
     };
-    match pv.spec.volume_mode {
+    match &pv.spec.volume_mode {
         Some(PersistentVolumeMode::Block) => Ok(false),
-        Some(PersistentVolumeMode::Filesystem) => Ok(true),
+        // An unrecognised mode is rejected at admission; like upstream's
+        // `CheckVolumeModeFilesystem` (only Block is non-filesystem) treat it
+        // as a filesystem volume.
+        Some(PersistentVolumeMode::Filesystem | PersistentVolumeMode::Unknown(_)) => Ok(true),
         None => Err(anyhow!("cannot get volumeMode for volume: {}", spec.name())),
     }
 }
