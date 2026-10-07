@@ -131,6 +131,29 @@ impl Admission<'_> {
             let pod: Pod = recast(&obj)?;
             return recast(&self.admit_pod(op, pod).await?);
         }
+        // NodeRestriction.Admit (admission.go:228-229): a node's request on
+        // any operation or subresource of a PodCertificateRequest.
+        if self.resource.group == "certificates.k8s.io"
+            && self.resource.resource == "podcertificaterequests"
+        {
+            let pcr: rusternetes_common::resources::podcertificaterequest::PodCertificateRequest =
+                recast(&obj)?;
+            crate::handlers::node_restriction::admit_pod_certificate_request(
+                &*self.state.storage,
+                &rusternetes_middleware::AuthContext {
+                    user: self.user.clone(),
+                },
+                *op == Operation::Create,
+                self.subresource,
+                self.namespace.unwrap_or(""),
+                &pcr,
+            )
+            .await
+            .map_err(|e| match e {
+                Error::Forbidden(m) => self.forbidden(&pcr.metadata.name, m),
+                other => other,
+            })?;
+        }
         if *op != Operation::Create {
             return Ok(obj);
         }
