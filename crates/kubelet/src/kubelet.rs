@@ -383,6 +383,15 @@ pub(crate) fn node_allocatable_map() -> HashMap<String, String> {
 /// `pkg/kubelet/kuberuntime/kuberuntime_manager.go` `doBackOff` +
 /// `client-go/util/flowcontrol.Backoff`.
 #[derive(Clone)]
+/// `lastStatusReportTime` and `delayAfterNodeStatusChange`
+/// (pkg/kubelet/kubelet.go:1370-1375). `last_report == None` is the zero time
+/// of a freshly started kubelet.
+#[derive(Default)]
+struct StatusReportState {
+    last_report: Option<std::time::Instant>,
+    delay_secs: f64,
+}
+
 struct RestartBackoff {
     /// Number of times the kubelet has actually (re)started the container.
     /// Reported verbatim as `restartCount`.
@@ -477,6 +486,13 @@ pub struct Kubelet {
     /// `sourceFile.run` re-lists on `time.NewTicker(s.period)`
     /// (pkg/kubelet/config/file.go:93-104).
     file_check_frequency: Duration,
+    /// `KubeletConfiguration.nodeStatusReportFrequency` (default 5m): how
+    /// often an UNCHANGED node status is still written. Upstream
+    /// `Kubelet.nodeStatusReportFrequency` (pkg/kubelet/kubelet.go:624).
+    node_status_report_frequency: Duration,
+    /// `lastStatusReportTime` + `delayAfterNodeStatusChange`
+    /// (pkg/kubelet/kubelet.go:1374, :1370).
+    status_report_state: Mutex<StatusReportState>,
     /// Current file-sourced static pods, keyed by (suffixed) pod name.
     /// Workers consult this before storage so static pods survive
     /// mirror-pod deletion.
@@ -747,6 +763,8 @@ impl Kubelet {
             pod_manifest_path: None,
             node_status_update_frequency: Duration::from_secs(10),
             file_check_frequency: Duration::from_secs(20),
+            node_status_report_frequency: Duration::from_secs(300),
+            status_report_state: Mutex::new(StatusReportState::default()),
             static_pods: Arc::new(Mutex::new(HashMap::new())),
             sysctl_allowlist: crate::sysctl::Allowlist::new(&allowed_unsafe_sysctls),
         })
@@ -818,6 +836,15 @@ impl Kubelet {
         CRASHLOOP_BACKOFF_INITIAL.min(self.crash_loop_backoff_max)
     }
 
+    /// Apply `KubeletConfiguration.nodeStatusReportFrequency` (5m when
+    /// unset/zero; callers pass `effective_node_status_report_frequency()`).
+    pub fn with_node_status_report_frequency(mut self, d: Option<Duration>) -> Self {
+        self.node_status_report_frequency = d
+            .filter(|d| !d.is_zero())
+            .unwrap_or(Duration::from_secs(300));
+        self
+    }
+
     /// Apply `KubeletConfiguration.runtimeRequestTimeout` (2m when unset/zero,
     /// v1beta1/defaults.go:188-189) to the CRI client. Must be called right
     /// after construction, before the runtime handle is shared.
@@ -841,6 +868,25 @@ impl Kubelet {
     /// Interval of the dedicated NodeStatus heartbeat in `run`.
     pub(crate) fn node_status_heartbeat_interval(&self) -> Duration {
         self.node_status_update_frequency
+    }
+
+    /// Test hook: pretend the last report went out `ago` ago with no delay.
+    #[cfg(test)]
+    fn set_last_status_report_for_test(&self, ago: Duration) {
+        let mut st = self.status_report_state.lock().unwrap();
+        st.last_report = std::time::Instant::now().checked_sub(ago);
+        st.delay_secs = 0.0;
+    }
+
+    /// One period of the heartbeat loop with the upstream 4% jitter:
+    /// `wait.JitterUntil(kl.syncNodeStatus, kl.nodeStatusUpdateFrequency,
+    /// 0.04, true, ...)` (pkg/kubelet/kubelet.go:1852).
+    fn jittered_node_status_interval(&self) -> Duration {
+        crate::node_status::jitter(
+            self.node_status_heartbeat_interval(),
+            crate::node_status::NODE_STATUS_LOOP_JITTER_FACTOR,
+            crate::node_status::rand_unit(),
+        )
     }
 
     /// Liveness probe — true iff `sync_loop` completed inside the
@@ -1263,7 +1309,7 @@ impl Kubelet {
                 }
                 // Dedicated heartbeat — runs every nodeStatusUpdateFrequency
                 // (default 10s) independently of sync
-                _ = tokio::time::sleep(self.node_status_heartbeat_interval()) => {
+                _ = tokio::time::sleep(self.jittered_node_status_interval()) => {
                     if let Err(e) = self.update_node_status().await {
                         error!("Error updating node status: {}", e);
                     }
@@ -1463,6 +1509,9 @@ impl Kubelet {
 
         let key = build_key("nodes", None, &self.node_name);
         let mut node: Node = self.storage.get(&key).await?;
+        // `originalNode` of tryUpdateNodeStatus: change detection compares
+        // against it (kubelet_node_status.go:483-531).
+        let original_node = node.clone();
 
         // Get current node resource statistics via upstream-parity statvfs.
         let node_stats = get_node_stats(&self.eviction_root_dir);
@@ -1564,14 +1613,9 @@ impl Kubelet {
         // included (nodestatus/setters.go MachineInfo, :292-316). A client
         // that adds an extended resource to `status.capacity` relies on this
         // to see it become schedulable.
-        let mut needs_write = node
-            .status
-            .as_mut()
-            .is_some_and(sync_allocatable_with_capacity);
-
-        // Update heartbeat and ensure Ready=True.
-        // Only write to storage if the heartbeat is stale (>10s old) or status changed.
-        // This prevents rv churn that causes PATCH conflicts for external node updates.
+        if let Some(status) = node.status.as_mut() {
+            sync_allocatable_with_capacity(status);
+        }
 
         // Re-ensure the kubelet endpoint port on EVERY heartbeat, not only at
         // registration. `status.daemonEndpoints.kubeletEndpoint.Port` is read by
@@ -1595,42 +1639,65 @@ impl Kubelet {
                             port: self.metrics_port as i32,
                         }),
                     });
-                needs_write = true;
             }
         }
 
         // NodeReady is composed from runtime health, never asserted
-        // (nodestatus.ReadyCondition, setters.go:469). Persist when the
-        // condition changed or the heartbeat is stale (>10s).
+        // (nodestatus.ReadyCondition, setters.go:469).
         let ready_errs = self.ready_errors();
         if let Some(ref mut status) = node.status {
             let conditions = status.conditions.get_or_insert_with(Vec::new);
-            let now = chrono::Utc::now();
-            let last = conditions
-                .iter()
-                .find(|c| c.condition_type == "Ready")
-                .and_then(|c| c.last_heartbeat_time)
-                .unwrap_or(now - chrono::Duration::seconds(60));
             let was_ready = conditions
                 .iter()
                 .find(|c| c.condition_type == "Ready")
                 .map(|c| c.status.clone());
-            let changed = crate::runtime_state::set_ready_condition(conditions, ready_errs, now);
-            if changed || (now - last).num_seconds() > 10 {
-                needs_write = true;
-            } else if let Some(c) = conditions.iter_mut().find(|c| c.condition_type == "Ready") {
-                // Fresh heartbeat: do not churn the stored object.
-                c.last_heartbeat_time = Some(last);
-            }
+            let changed = crate::runtime_state::set_ready_condition(
+                conditions,
+                ready_errs,
+                chrono::Utc::now(),
+            );
             if changed && was_ready.as_deref() != Some("True") {
                 info!("Node Ready condition changed (was {was_ready:?})");
             }
         }
 
-        if needs_write {
+        // tryUpdateNodeStatus (kubelet_node_status.go:483-531): write only if
+        // the status changed (heartbeat timestamps ignored) or
+        // nodeStatusReportFrequency (+ delayAfterNodeStatusChange) elapsed.
+        // The node-heartbeat Lease keeps the node Ready in between.
+        let changed = crate::node_status::node_status_has_changed(
+            original_node.status.as_ref(),
+            node.status.as_ref(),
+        ) || original_node.metadata.labels != node.metadata.labels;
+        let should_write = {
+            let mut st = self.status_report_state.lock().unwrap();
+            let expired = crate::node_status::is_update_status_period_expired(
+                st.last_report,
+                std::time::Instant::now(),
+                self.node_status_report_frequency,
+                st.delay_secs,
+            );
+            let should_write = changed || expired;
+            if should_write {
+                // Fresh random delay on change or first report; fixed
+                // interval after a purely periodic one (:517-527).
+                st.delay_secs = if changed || st.last_report.is_none() {
+                    crate::node_status::calculate_delay_secs(
+                        self.node_status_report_frequency,
+                        crate::node_status::rand_unit(),
+                    )
+                } else {
+                    0.0
+                };
+            }
+            should_write
+        };
+
+        if should_write {
             // Node heartbeat is a pure status write (Ready condition, heartbeat
             // time) — route through the /status subresource.
             self.storage.update_status(&key, &node).await?;
+            self.status_report_state.lock().unwrap().last_report = Some(std::time::Instant::now());
         }
 
         // Collect and publish node + per-pod metrics to storage
@@ -6362,6 +6429,146 @@ mod tests {
             .await
             .with_crash_loop_backoff_max(Some(Duration::from_secs(3)));
         assert_eq!(t.crash_loop_backoff_initial(), Duration::from_secs(3));
+    }
+
+    use std::time::Duration;
+
+    async fn status_gate_kubelet(
+        dir: &tempfile::TempDir,
+        storage: std::sync::Arc<rusternetes_storage::StorageBackend>,
+    ) -> Kubelet {
+        let sock = dir.path().join("absent.sock");
+        std::env::set_var(
+            "CONTAINER_RUNTIME_ENDPOINT",
+            format!("unix://{}", sock.display()),
+        );
+        let k = Kubelet::new(
+            "node-gate".into(),
+            storage,
+            10,
+            dir.path().join("vols").display().to_string(),
+            "10.96.0.10".into(),
+            "cluster.local".into(),
+            "bridge".into(),
+            String::new(),
+        )
+        .await
+        .unwrap();
+        k.update_runtime_up().await;
+        k.register_node().await.unwrap();
+        k
+    }
+
+    async fn ready_heartbeat(
+        storage: &rusternetes_storage::StorageBackend,
+    ) -> chrono::DateTime<chrono::Utc> {
+        use rusternetes_storage::{build_key, Storage};
+        let n: rusternetes_common::resources::Node = storage
+            .get(&build_key("nodes", None, "node-gate"))
+            .await
+            .unwrap();
+        n.status
+            .unwrap()
+            .conditions
+            .unwrap()
+            .into_iter()
+            .find(|c| c.condition_type == "Ready")
+            .unwrap()
+            .last_heartbeat_time
+            .unwrap()
+    }
+
+    async fn backdate_ready_heartbeat(
+        storage: &rusternetes_storage::StorageBackend,
+        secs: i64,
+    ) -> chrono::DateTime<chrono::Utc> {
+        use rusternetes_storage::{build_key, Storage};
+        let key = build_key("nodes", None, "node-gate");
+        let mut n: rusternetes_common::resources::Node = storage.get(&key).await.unwrap();
+        let old = chrono::Utc::now() - chrono::Duration::seconds(secs);
+        for c in n.status.as_mut().unwrap().conditions.as_mut().unwrap() {
+            c.last_heartbeat_time = Some(old);
+        }
+        storage.update_status(&key, &n).await.unwrap();
+        ready_heartbeat(storage).await
+    }
+
+    /// tryUpdateNodeStatus (kubelet_node_status.go:483-531): a node whose
+    /// status has not changed is NOT rewritten on each heartbeat, only once
+    /// `nodeStatusReportFrequency` has elapsed. (Before #2520 every heartbeat
+    /// older than 10s rewrote the Node.)
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn unchanged_node_status_is_not_rewritten_within_report_frequency() {
+        use rusternetes_storage::StorageBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(StorageBackend::new_memory());
+        let k = status_gate_kubelet(&dir, storage.clone()).await;
+        // First report after start always goes out (zero lastStatusReportTime).
+        k.update_node_status().await.unwrap();
+        let old = backdate_ready_heartbeat(&storage, 30).await;
+        // Nothing changed and well inside nodeStatusReportFrequency (5m): skip.
+        k.update_node_status().await.unwrap();
+        assert_eq!(ready_heartbeat(&storage).await, old);
+    }
+
+    /// A quiet node still gets a status refresh once
+    /// `nodeStatusReportFrequency` has elapsed (isUpdateStatusPeriodExpired,
+    /// kubelet_node_status.go:535), so a skipped heartbeat never starves
+    /// consumers of the Ready condition's `lastHeartbeatTime`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn quiet_node_is_refreshed_after_report_frequency() {
+        use rusternetes_storage::StorageBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(StorageBackend::new_memory());
+        let k = status_gate_kubelet(&dir, storage.clone())
+            .await
+            .with_node_status_report_frequency(Some(Duration::from_secs(300)));
+        k.update_node_status().await.unwrap();
+        let old = backdate_ready_heartbeat(&storage, 30).await;
+        // Just under the period (no delay): still skipped.
+        k.set_last_status_report_for_test(Duration::from_secs(299));
+        k.update_node_status().await.unwrap();
+        assert_eq!(ready_heartbeat(&storage).await, old);
+        // Period elapsed: refreshed.
+        k.set_last_status_report_for_test(Duration::from_secs(300));
+        k.update_node_status().await.unwrap();
+        assert!(ready_heartbeat(&storage).await > old + chrono::Duration::seconds(20));
+    }
+
+    /// A real status change is written immediately, not held for the report
+    /// period (`changed || isUpdateStatusPeriodExpired`, :493-496).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn changed_node_status_is_written_immediately() {
+        use rusternetes_storage::{build_key, Storage, StorageBackend};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(StorageBackend::new_memory());
+        let k = status_gate_kubelet(&dir, storage.clone()).await;
+        k.update_node_status().await.unwrap();
+        let old = backdate_ready_heartbeat(&storage, 30).await;
+        let key = build_key("nodes", None, "node-gate");
+        let mut n: rusternetes_common::resources::Node = storage.get(&key).await.unwrap();
+        n.status.as_mut().unwrap().daemon_endpoints = None;
+        storage.update_status(&key, &n).await.unwrap();
+        k.update_node_status().await.unwrap();
+        assert!(ready_heartbeat(&storage).await > old + chrono::Duration::seconds(20));
+    }
+
+    /// `nodeStatusReportFrequency` is configurable and defaults to 5m
+    /// (v1beta1/defaults.go).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn report_frequency_builder_defaults_to_five_minutes() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(rusternetes_storage::StorageBackend::new_memory());
+        let k = status_gate_kubelet(&dir, storage).await;
+        assert_eq!(k.node_status_report_frequency, Duration::from_secs(300));
+        let k = k.with_node_status_report_frequency(Some(Duration::from_secs(42)));
+        assert_eq!(k.node_status_report_frequency, Duration::from_secs(42));
+        let k = k.with_node_status_report_frequency(Some(Duration::ZERO));
+        assert_eq!(k.node_status_report_frequency, Duration::from_secs(300));
     }
 
     /// #1929: a kubelet whose CRI endpoint is an absent socket must report
