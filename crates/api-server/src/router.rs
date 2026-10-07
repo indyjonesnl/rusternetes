@@ -2001,6 +2001,14 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             "/apis/certificates.k8s.io/v1beta1/watch/clustertrustbundles",
             get(handlers::watch::watch_clustertrustbundles),
         )
+        .route(
+            "/apis/certificates.k8s.io/v1beta1/watch/podcertificaterequests",
+            get(handlers::watch::watch_all_podcertificaterequests),
+        )
+        .route(
+            "/apis/certificates.k8s.io/v1beta1/watch/namespaces/:namespace/podcertificaterequests",
+            get(handlers::watch::watch_podcertificaterequests),
+        )
         // Discovery API - EndpointSlices (namespace-scoped)
         .route(
             "/apis/discovery.k8s.io/v1/namespaces/:namespace/endpointslices",

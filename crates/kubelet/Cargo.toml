@@ -23,6 +23,7 @@ redis = ["rusternetes-storage/redis"]
 mimalloc = { version = "0.1", optional = true }
 rusternetes-common = { path = "../common" }
 pem.workspace = true
+prometheus.workspace = true
 # api-client: StorageBackend::Api lets the in-cluster kubelet read/write via
 # the api-server while keeping its Arc<StorageBackend> handle unchanged.
 rusternetes-storage = { path = "../storage", features = ["api-client"] }

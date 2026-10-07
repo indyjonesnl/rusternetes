@@ -25,12 +25,21 @@ const NODE_STARTUP_GRACE_PERIOD_SECS: u64 = 60;
 /// Workers draining the per-node queue: `nodeUpdateWorkerSize = 8`
 /// (pkg/controller/nodelifecycle/node_lifecycle_controller.go:133), launched in
 /// `Run` (:483-491). Upstream's pool runs the per-node taint/label pass
-/// (`doNodeProcessingPassWorker`, :516) off `nodeUpdateQueue`; the health
-/// monitor (`monitorNodeHealth`) is a single loop. Our `reconcile_node` fuses
-/// both per node, so the pool covers it per node. Deliberate deviation: no
-/// separate monitor loop. A node key is never handed to two workers at once
-/// (queue processing set), matching the :484-488 comment.
+/// (`doNodeProcessingPassWorker`, :516) off `nodeUpdateQueue`; here
+/// `process_node` is that pass (shutdown taint, Lease, allocatable). A node key
+/// is never handed to two workers at once (queue processing set), matching the
+/// :484-488 comment.
 const NODE_UPDATE_WORKER_SIZE: usize = 8;
+
+/// `podUpdateWorkerSize = 4` (node_lifecycle_controller.go:131), launched in
+/// `Run` (:493-497): workers draining the pod-assignment queue
+/// (`doPodProcessingWorker`, :1097).
+const POD_UPDATE_WORKER_SIZE: usize = 4;
+
+/// `--node-monitor-period` default of 5s
+/// (pkg/controller/apis/config/v1alpha1/defaults.go `NodeMonitorPeriod`);
+/// `Run` ticks `monitorNodeHealth` on it (:506-512).
+const NODE_MONITOR_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Per-node, per-condition snapshot of the last status/transition-time the
 /// controller observed. Used to detect when a condition flips status without the
@@ -78,11 +87,40 @@ impl<S: Storage + 'static> NodeController<S> {
     /// for node changes. Falls back to periodic resync every 30s.
     pub async fn run(self: Arc<Self>) -> Result<()> {
         let queue = WorkQueue::new();
+        let pod_queue = WorkQueue::new();
 
+        // Node taint/label pass pool (:483-491).
         spawn_workers(NODE_UPDATE_WORKER_SIZE, &queue, |worker_queue| {
             let worker_self = Arc::clone(&self);
             async move {
                 worker_self.worker(worker_queue).await;
+            }
+        });
+
+        // Pod pool (:493-497), fed by pod assignment events (`podUpdated`, :1087).
+        spawn_workers(POD_UPDATE_WORKER_SIZE, &pod_queue, |worker_queue| {
+            let worker_self = Arc::clone(&self);
+            async move {
+                worker_self.pod_worker(worker_queue).await;
+            }
+        });
+        tokio::spawn({
+            let feeder = Arc::clone(&self);
+            let pod_queue = pod_queue.clone();
+            async move { feeder.feed_pod_queue(pod_queue).await }
+        });
+
+        // Separate single health-monitor loop (:506-512).
+        tokio::spawn({
+            let monitor = Arc::clone(&self);
+            async move {
+                let mut tick = tokio::time::interval(NODE_MONITOR_PERIOD);
+                loop {
+                    tick.tick().await;
+                    if let Err(e) = monitor.monitor_node_health().await {
+                        error!("Error monitoring node health: {}", e);
+                    }
+                }
             }
         });
 
@@ -136,7 +174,7 @@ impl<S: Storage + 'static> NodeController<S> {
             let name = key.strip_prefix("nodes/").unwrap_or(&key);
             let storage_key = build_key("nodes", None, name);
             match self.storage.get::<Node>(&storage_key).await {
-                Ok(resource) => match self.reconcile_node(&resource).await {
+                Ok(resource) => match self.process_node(&resource).await {
                     Ok(()) => queue.forget(&key).await,
                     Err(e) => {
                         error!("Failed to reconcile {}: {}", key, e);
@@ -149,6 +187,131 @@ impl<S: Storage + 'static> NodeController<S> {
                 }
             }
             queue.done(&key).await;
+        }
+    }
+
+    /// `doPodProcessingWorker` (node_lifecycle_controller.go:1097).
+    async fn pod_worker(&self, queue: WorkQueue) {
+        while let Some(key) = queue.get().await {
+            match self.process_pod(&key).await {
+                Ok(()) => queue.forget(&key).await,
+                Err(e) => {
+                    // :1156 `podUpdateQueue.AddRateLimited(podItem)`
+                    warn!("Unable to mark pod {} NotReady: {}", key, e);
+                    queue.requeue_rate_limited(key.clone()).await;
+                }
+            }
+            queue.done(&key).await;
+        }
+    }
+
+    /// `podUpdated` (:1087-1095): queue every pod that has a node assigned.
+    /// Upstream only enqueues on add / nodeName change; storage watch events
+    /// carry no old object, so every assigned-pod event is queued (processPod
+    /// is idempotent: it no-ops unless the Ready condition must flip).
+    async fn feed_pod_queue(&self, queue: WorkQueue) {
+        loop {
+            if let Ok(pods) = self.storage.list::<Pod>("/registry/pods/").await {
+                for pod in pods {
+                    Self::enqueue_pod(&queue, &pod).await;
+                }
+            }
+            let mut watch = match self.storage.watch(&build_prefix("pods", None)).await {
+                Ok(w) => w,
+                Err(e) => {
+                    error!("Failed to establish pod watch: {}, retrying", e);
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+            while let Some(ev) = watch.next().await {
+                match ev {
+                    Ok(rusternetes_storage::WatchEvent::Deleted(..)) => {}
+                    Ok(
+                        rusternetes_storage::WatchEvent::Added(key, _)
+                        | rusternetes_storage::WatchEvent::Modified(key, _),
+                    ) => {
+                        if let Ok(pod) = self.storage.get::<Pod>(&key).await {
+                            Self::enqueue_pod(&queue, &pod).await;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Pod watch error: {}, reconnecting", e);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn enqueue_pod(queue: &WorkQueue, pod: &Pod) {
+        let assigned = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.node_name.as_deref())
+            .is_some_and(|n| !n.is_empty());
+        if let (true, Some(ns)) = (assigned, pod.metadata.namespace.as_deref()) {
+            queue
+                .add(format!("pods/{}/{}", ns, pod.metadata.name))
+                .await;
+        }
+    }
+
+    /// `processPod` (:1115-1159): for a pod on a node whose Ready condition is
+    /// not True, mark the pod NotReady (`MarkPodsNotReady`,
+    /// pkg/controller/util/node/controller_utils.go:121). A missing pod or node
+    /// is skipped (:1120, :1131). Deviation: node readiness is read from the
+    /// stored Node, as there is no `nodeHealthMap` here.
+    pub async fn process_pod(&self, key: &str) -> Result<()> {
+        let pod_key = format!("/registry/{}", key);
+        let mut pod: Pod = match self.storage.get(&pod_key).await {
+            Ok(p) => p,
+            Err(rusternetes_common::Error::NotFound(_)) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let node_name = match pod.spec.as_ref().and_then(|s| s.node_name.clone()) {
+            Some(n) if !n.is_empty() => n,
+            _ => return Ok(()),
+        };
+        let node: Node = match self
+            .storage
+            .get(&build_key("nodes", None, &node_name))
+            .await
+        {
+            Ok(n) => n,
+            Err(rusternetes_common::Error::NotFound(_)) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        // :1144-1150 no Ready condition: handled on a later node update.
+        let node_ready = match node
+            .status
+            .as_ref()
+            .and_then(|s| s.conditions.as_ref())
+            .and_then(|cs| cs.iter().find(|c| c.condition_type == "Ready"))
+        {
+            Some(c) => c.status == "True",
+            None => return Ok(()),
+        };
+        if node_ready {
+            return Ok(());
+        }
+        // UpdatePodCondition: only write when the status actually changes.
+        let Some(cond) = pod
+            .status
+            .as_mut()
+            .and_then(|s| s.conditions.as_mut())
+            .and_then(|cs| cs.iter_mut().find(|c| c.condition_type == "Ready"))
+        else {
+            return Ok(());
+        };
+        if cond.status == "False" {
+            return Ok(());
+        }
+        cond.status = "False".to_string();
+        cond.last_transition_time = Some(Utc::now());
+        match self.storage.update(&pod_key, &pod).await {
+            Ok(_) | Err(rusternetes_common::Error::NotFound(_)) => Ok(()),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -182,21 +345,49 @@ impl<S: Storage + 'static> NodeController<S> {
         Ok(())
     }
 
-    /// Reconcile a single node
+    /// Reconcile a single node: the health pass then the per-node pass.
+    /// Only `reconcile_all` (tests / one-shot callers) uses the fused form; the
+    /// live `run()` drives the two halves from separate loops.
     async fn reconcile_node(&self, node: &Node) -> Result<()> {
-        let node_name = &node.metadata.name;
+        self.monitor_node(node).await?;
+        self.process_node(node).await
+    }
 
-        // Don't change node conditions during startup grace period (K8s: nodeStartupGracePeriod = 60s)
+    /// True while the node is inside the K8s startup grace period
+    /// (`nodeStartupGracePeriod = 60s`); records first sight.
+    fn in_startup_grace(&self, node_name: &str) -> bool {
         let first_seen_time = {
             let mut first_seen = self.first_seen.lock().unwrap();
             *first_seen
-                .entry(node_name.clone())
+                .entry(node_name.to_string())
                 .or_insert_with(std::time::Instant::now)
         };
-        if first_seen_time.elapsed()
-            < std::time::Duration::from_secs(NODE_STARTUP_GRACE_PERIOD_SECS)
-        {
-            // Node is still in startup grace period — don't modify its conditions
+        first_seen_time.elapsed() < std::time::Duration::from_secs(NODE_STARTUP_GRACE_PERIOD_SECS)
+    }
+
+    /// `monitorNodeHealth` (node_lifecycle_controller.go:665-774): one pass over
+    /// all nodes, run from its own loop. Upstream fans the per-node work out
+    /// with `workqueue.ParallelizeUntil(ctx, nc.nodeUpdateWorkerSize, ...)`
+    /// (:774); same bound here.
+    pub async fn monitor_node_health(&self) -> Result<()> {
+        let nodes: Vec<Node> = self.storage.list("/registry/nodes/").await?;
+        futures::stream::iter(nodes)
+            .for_each_concurrent(NODE_UPDATE_WORKER_SIZE, |node| async move {
+                if let Err(e) = self.monitor_node(&node).await {
+                    error!("Failed to monitor node {}: {}", &node.metadata.name, e);
+                }
+            })
+            .await;
+        Ok(())
+    }
+
+    /// Health half of the old fused reconcile: readiness, Ready condition,
+    /// condition transitions, not-ready taint and eviction.
+    async fn monitor_node(&self, node: &Node) -> Result<()> {
+        let node_name = &node.metadata.name;
+
+        // Don't change node conditions during startup grace period (K8s: nodeStartupGracePeriod = 60s)
+        if self.in_startup_grace(node_name) {
             return Ok(());
         }
 
@@ -237,6 +428,23 @@ impl<S: Storage + 'static> NodeController<S> {
         } else {
             // Node is Ready — ensure not-ready taint is removed
             self.remove_not_ready_taint(node).await?;
+        }
+
+        // Evict pods from nodes that have been NotReady for too long
+        if !is_ready && self.should_evict_pods(node) {
+            info!("Evicting pods from NotReady node {}", node_name);
+            self.evict_pods_from_node(node_name).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Per-node pass run by the 8-worker pool (`doNodeProcessingPassWorker`,
+    /// node_lifecycle_controller.go:516): shutdown taint, Lease, allocatable.
+    async fn process_node(&self, node: &Node) -> Result<()> {
+        let node_name = &node.metadata.name;
+        if self.in_startup_grace(node_name) {
+            return Ok(());
         }
 
         // Apply the shutdown taint when the node reports a graceful shutdown.
@@ -282,12 +490,6 @@ impl<S: Storage + 'static> NodeController<S> {
         // e.g. "cpu=500m,memory=1Gi") as a proxy for the kubelet flag plumbing that
         // the kubelet stub does not yet surface.
         self.compute_allocatable(node).await?;
-
-        // Evict pods from nodes that have been NotReady for too long
-        if !is_ready && self.should_evict_pods(node) {
-            info!("Evicting pods from NotReady node {}", node_name);
-            self.evict_pods_from_node(node_name).await?;
-        }
 
         Ok(())
     }
@@ -1031,5 +1233,93 @@ mod tests {
         };
 
         assert!(!controller.is_node_ready(&node_not_ready));
+    }
+
+    fn ready_node(name: &str, status: &str) -> Node {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Node",
+            "metadata": {"name": name},
+            "spec": {},
+            "status": {"conditions": [{"type": "Ready", "status": status}]}
+        }))
+        .unwrap()
+    }
+
+    fn pod_on(node: &str) -> Pod {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "default"},
+            "spec": {"nodeName": node, "containers": [{"name": "c", "image": "i"}]},
+            "status": {"conditions": [{"type": "Ready", "status": "True"}]}
+        }))
+        .unwrap()
+    }
+
+    /// processPod (node_lifecycle_controller.go:1153-1158): a pod on a node
+    /// whose Ready != True gets its Ready condition set False.
+    #[tokio::test]
+    async fn process_pod_marks_pod_not_ready_on_unready_node() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::new(storage.clone());
+        storage
+            .create(
+                &build_key("nodes", None, "n1"),
+                &ready_node("n1", "Unknown"),
+            )
+            .await
+            .unwrap();
+        let pk = build_key("pods", Some("default"), "p");
+        storage.create(&pk, &pod_on("n1")).await.unwrap();
+        c.process_pod("pods/default/p").await.unwrap();
+        let got: Pod = storage.get(&pk).await.unwrap();
+        let ready = got
+            .status
+            .unwrap()
+            .conditions
+            .unwrap()
+            .into_iter()
+            .find(|c| c.condition_type == "Ready")
+            .unwrap();
+        assert_eq!(ready.status, "False");
+    }
+
+    /// Ready node: the pod is left alone (:1153 guard).
+    #[tokio::test]
+    async fn process_pod_leaves_pod_on_ready_node() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::new(storage.clone());
+        storage
+            .create(&build_key("nodes", None, "n1"), &ready_node("n1", "True"))
+            .await
+            .unwrap();
+        let pk = build_key("pods", Some("default"), "p");
+        storage.create(&pk, &pod_on("n1")).await.unwrap();
+        c.process_pod("pods/default/p").await.unwrap();
+        let got: Pod = storage.get(&pk).await.unwrap();
+        assert_eq!(got.status.unwrap().conditions.unwrap()[0].status, "True");
+    }
+
+    /// The health monitor is its own pass over all nodes (:506-512), not a
+    /// per-node queue step.
+    #[tokio::test]
+    async fn monitor_node_health_flips_stale_node_unready() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::new(storage.clone());
+        storage
+            .create(&build_key("nodes", None, "n1"), &ready_node("n1", "True"))
+            .await
+            .unwrap();
+        c.seed_first_seen_for_test("n1");
+        c.monitor_node_health().await.unwrap();
+        let got: Node = storage.get(&build_key("nodes", None, "n1")).await.unwrap();
+        let ready = got.status.unwrap().conditions.unwrap();
+        assert_eq!(
+            ready
+                .iter()
+                .find(|c| c.condition_type == "Ready")
+                .unwrap()
+                .status,
+            "False"
+        );
     }
 }

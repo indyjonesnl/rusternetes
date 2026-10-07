@@ -12,6 +12,7 @@
 
 pub mod cache;
 pub mod csi_handler;
+pub mod metrics;
 pub mod operation;
 pub mod reconciler;
 pub mod watcher;
@@ -68,6 +69,17 @@ impl PluginManager {
     /// (`"CSIPlugin"`, `"DevicePlugin"`).
     pub fn add_handler(&self, plugin_type: &str, handler: Arc<dyn PluginHandler>) {
         self.reconciler.add_handler(plugin_type, handler);
+    }
+
+    /// `metrics.Register(pm.actualStateOfWorld, pm.desiredStateOfWorld)`
+    /// (`plugin_manager.go:124`, inside `Run`): expose
+    /// `plugin_manager_total_plugins` on `registry` (the kubelet's `/metrics`).
+    pub fn register_metrics(&self, registry: &prometheus::Registry) {
+        metrics::register(
+            registry,
+            self.actual_state_of_world.clone(),
+            self.desired_state_of_world.clone(),
+        );
     }
 
     /// `Run` (`:99-127`): start the watcher (populates the desired state) and

@@ -168,3 +168,49 @@ fn test_snapshot_handle_uniqueness() {
         content2.status.as_ref().unwrap().snapshot_handle
     );
 }
+
+fn orphan_content(name: &str, snapshot: &str) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "snapshot.storage.k8s.io/v1", "kind": "VolumeSnapshotContent",
+        "metadata": {"name": name, "uid": format!("uid-{name}")},
+        "spec": {
+            "source": {"volumeHandle": "h"},
+            "volumeSnapshotRef": {"namespace": "default", "name": snapshot},
+            "deletionPolicy": "Delete",
+            "driver": "hostpath-snapshotter"
+        }
+    })
+}
+
+/// external-snapshotter `deleteSnapshot`
+/// (`pkg/common-controller/snapshot_controller_base.go:585`) acts only on the
+/// snapshot whose delete event it was handed, never on a sweep of every
+/// content. A worker handed one key must leave other keys' contents alone.
+#[tokio::test]
+async fn deleted_snapshot_key_only_releases_its_own_content() {
+    let storage = Arc::new(MemoryStorage::new());
+    for (c, s) in [("content-a", "snap-a"), ("content-b", "snap-b")] {
+        storage
+            .create(
+                &build_key("volumesnapshotcontents", None, c),
+                &orphan_content(c, s),
+            )
+            .await
+            .unwrap();
+    }
+    let controller = VolumeSnapshotController::new(Arc::clone(&storage));
+
+    controller
+        .process_key("volumesnapshots/default/snap-a")
+        .await
+        .unwrap();
+
+    let a = storage
+        .get::<serde_json::Value>(&build_key("volumesnapshotcontents", None, "content-a"))
+        .await;
+    let b = storage
+        .get::<serde_json::Value>(&build_key("volumesnapshotcontents", None, "content-b"))
+        .await;
+    assert!(a.is_err(), "content-a should be deleted");
+    assert!(b.is_ok(), "content-b belongs to another key and must stay");
+}
