@@ -616,6 +616,16 @@ async fn main() -> Result<()> {
                 get(streaming_server::handle_attach_uid).post(streaming_server::handle_attach_uid),
             )
             .route(
+                "/portForward/:namespace/:pod",
+                get(streaming_server::handle_portforward)
+                    .post(streaming_server::handle_portforward),
+            )
+            .route(
+                "/portForward/:namespace/:pod/:uid",
+                get(streaming_server::handle_portforward_uid)
+                    .post(streaming_server::handle_portforward_uid),
+            )
+            .route(
                 "/containerLogs/:namespace/:pod/:container",
                 get(streaming_server::handle_container_logs),
             )
