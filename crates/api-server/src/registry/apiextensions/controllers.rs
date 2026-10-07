@@ -22,9 +22,10 @@
 //! `NonStructuralSchema` condition) and the `apiapproval` controller (the
 //! `KubernetesAPIApprovalPolicyConformant` condition), neither of which
 //! gates serving; the `InvalidCABundle` check of the establishing
-//! controller; the finalizer's wait for the instances to be gone (instances
-//! are removed from storage directly, finalizers and all) and its
-//! `OverlappingBuiltInResources` skip.
+//! controller; the finalizer's `OverlappingBuiltInResources` skip. The
+//! finalizer's wait for the instances to be gone is ported, but instances are
+//! removed from storage directly (finalizers and all), so it sees them go at
+//! once.
 
 use std::collections::HashSet;
 
