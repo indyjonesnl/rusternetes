@@ -158,7 +158,7 @@ fn validate_trust_bundle(path: &Path, input: &str) -> ErrorList {
         }
         // `x509.ParseCertificate` also rejects trailing data.
         let parsed = match x509_parser::parse_x509_certificate(&block.bytes) {
-            Ok((trailing, cert)) if trailing.is_empty() => cert,
+            Ok(([], cert)) => cert,
             _ => {
                 errs.push(Error::invalid(
                     path,
@@ -258,10 +258,9 @@ fn pem_decode(data: &[u8]) -> Option<(PemBlock, &[u8])> {
     loop {
         if rest.starts_with(&START[1..]) {
             rest = &rest[START.len() - 1..];
-        } else if let Some(at) = find(rest, START) {
-            rest = &rest[at + START.len()..];
         } else {
-            return None;
+            let at = find(rest, START)?;
+            rest = &rest[at + START.len()..];
         }
 
         let (type_line, after) = get_line(rest);
