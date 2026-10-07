@@ -1,6 +1,7 @@
 pub mod admission;
 pub use rusternetes_admission_webhook as admission_webhook;
 pub mod bootstrap;
+pub mod legacy_token_tracking;
 pub use rusternetes_admission_webhook::cel_evaluators as cel;
 pub use rusternetes_middleware::cbor;
 pub mod conversion;
@@ -279,6 +280,10 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
             e
         );
     }
+    // `rbac/bootstrap-roles` PostStartHook (upstream pkg/registry/rbac/rest/
+    // storage_rbac.go:131-179), same as main.rs: the SAME hook, awaited so a
+    // fresh store is never served with an empty RBAC policy (#2490).
+    let _ = bootstrap::spawn_rbac_bootstrap_roles_hook(storage.clone()).await;
     // scheduling/bootstrap-system-priority-classes PostStartHook (upstream
     // pkg/registry/scheduling/rest/storage_scheduling.go), same as main.rs.
     bootstrap::spawn_system_priority_classes_hook(storage.clone());
@@ -300,6 +305,13 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
     // CRD controllers' resync (upstream post-start hook, apiextensions-apiserver
     // pkg/apiserver/apiserver.go:244-252): retries a CRD left Terminating.
     registry::apiextensions::customresourcedefinition::spawn_resync(storage.clone());
+    // crd-informer-synced (apiserver.go:263): not ready until the CRDs are readable.
+    registry::apiextensions::customresourcedefinition::spawn_crd_informer_synced_hook(
+        storage.clone(),
+    );
+
+    // start-legacy-token-tracking-controller (server.go:319-322).
+    legacy_token_tracking::spawn_legacy_token_tracking_controller(storage.clone());
 
     // The `kubernetes` ServiceCIDR, owned by the apiserver-side
     // default-ServiceCIDR controller (upstream

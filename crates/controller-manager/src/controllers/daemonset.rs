@@ -1,3 +1,4 @@
+use super::expectations::ControllerExpectations;
 use crate::controllers::worker_pool::spawn_workers;
 use anyhow::Result;
 use futures::StreamExt;
@@ -90,11 +91,62 @@ const CONCURRENT_DAEMONSET_SYNCS: usize = 2;
 
 pub struct DaemonSetController<S: Storage> {
     storage: Arc<S>,
+    /// Per-DaemonSet ("ns/name") expectations of in-flight pod deletions.
+    /// Upstream `dsc.expectations` (`daemon_controller.go`), a
+    /// `UIDTrackingControllerExpectations`; shared implementation in
+    /// [`super::expectations`]. Only the deletion half is wired; creation
+    /// expectations are a tracked follow-up.
+    expectations: Arc<ControllerExpectations>,
 }
 
 impl<S: Storage + 'static> DaemonSetController<S> {
     pub fn new(storage: Arc<S>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            expectations: Arc::new(ControllerExpectations::new()),
+        }
+    }
+
+    /// Port of `RealPodControl.DeletePod` as driven by `syncNodes`
+    /// (`daemon_controller.go:1060-1073`; `controller_utils.go:618`):
+    /// record the expected deletions BEFORE issuing them
+    /// (`SetExpectations`, :1000), delete each pod GRACEFULLY, and on any
+    /// error lower the expectation for that pod (`DeletionObserved`, :1068)
+    /// because the informer will never see the delete. NotFound is benign
+    /// (`!apierrors.IsNotFound(err)`, :1069); other errors are returned.
+    async fn delete_pods(
+        &self,
+        exp_key: &str,
+        namespace: &str,
+        pod_names: &[String],
+    ) -> Result<()> {
+        if pod_names.is_empty() {
+            return Ok(());
+        }
+        let observed_keys: Vec<String> = pod_names
+            .iter()
+            .map(|n| format!("{}/{}", namespace, n))
+            .collect();
+        self.expectations
+            .expect_deletions_of(exp_key, &observed_keys);
+        let mut first_err: Option<rusternetes_common::Error> = None;
+        for (name, observed) in pod_names.iter().zip(&observed_keys) {
+            let pod_key = build_key("pods", Some(namespace), name);
+            if let Err(e) = self.storage.delete_gracefully(&pod_key).await {
+                self.expectations.deletion_observed_of(exp_key, observed);
+                if !matches!(e, rusternetes_common::Error::NotFound(_)) {
+                    warn!(
+                        "Failed to delete DaemonSet pod {}/{}: {}",
+                        namespace, name, e
+                    );
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e.into()),
+            None => Ok(()),
+        }
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
@@ -239,10 +291,24 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             | rusternetes_storage::WatchEvent::Deleted(_, v) => v,
         };
         if let Ok(pod) = serde_json::from_str::<Pod>(json_str) {
+            // `addPod`/`updatePod` route a pod with a deletionTimestamp to
+            // `deletePod` (daemon_controller.go:533-538, :582-589): a graceful
+            // delete MODIFIES the pod first and the kubelet removes it only
+            // after the grace period. `deletePod` then calls
+            // `expectations.DeletionObserved` (:668). The per-pod key set in
+            // the expectations makes the later DELETED event a no-op.
+            let deleting = matches!(event, rusternetes_storage::WatchEvent::Deleted(..))
+                || pod.metadata.deletion_timestamp.is_some();
             if let Some(owner_refs) = &pod.metadata.owner_references {
                 for owner in owner_refs {
                     if owner.kind == "DaemonSet" {
                         let ns = pod.metadata.namespace.as_deref().unwrap_or("default");
+                        if deleting {
+                            self.expectations.deletion_observed_of(
+                                &format!("{}/{}", ns, owner.name),
+                                &format!("{}/{}", ns, pod.metadata.name),
+                            );
+                        }
                         let key = format!("daemonsets/{}/{}", ns, owner.name);
                         queue.add(key).await;
                     }
@@ -290,7 +356,13 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                     }
                 }
                 Err(_) => {
-                    // Resource was deleted — nothing to reconcile
+                    // Resource was deleted — nothing to reconcile. Drop its
+                    // expectations so a DaemonSet recreated under the same
+                    // name starts clean (`DeleteExpectations`,
+                    // daemon_controller.go syncDaemonSet NotFound branch;
+                    // upstream TestExpectationsOnRecreate).
+                    self.expectations
+                        .delete_expectations(&format!("{}/{}", ns, name));
                     queue.forget(&key).await;
                 }
             }
@@ -533,9 +605,39 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             eligible_nodes.len()
         );
 
+        // Expectations are read BEFORE listing pods: upstream's
+        // `TestRSSyncExpectations` pins the ordering (a pod arriving between
+        // list and check would make the record look fulfilled while the list
+        // still lacks it). `syncDaemonSet` (daemon_controller.go:1263-1266)
+        // only updates status while expectations are unmet.
+        let exp_key = format!("{}/{}", namespace, name);
+        let mut exp_satisfied = self.expectations.satisfied(&exp_key);
+        // Deletion errors don't stop the sync (upstream `syncNodes` aggregates
+        // them after creating); they are returned once status is written.
+        let mut deferred_err: Option<anyhow::Error> = None;
+
         // Get current pods for this DaemonSet using owner references
         let pod_prefix = format!("/registry/pods/{}/", namespace);
         let all_pods: Vec<Pod> = self.storage.list(&pod_prefix).await?;
+
+        // Rusternetes deviation (no upstream equivalent; same intent as the
+        // ReplicaSet controller's settle-from-observation step): a pod this
+        // DaemonSet is still waiting to see deleted that the fresh listing
+        // already shows gone or terminating HAS been deleted, so settle that
+        // expectation now rather than blocking on a watch event that may
+        // never reach a controller driven by direct `reconcile` calls.
+        if !exp_satisfied {
+            for pending in self.expectations.pending_deletions(&exp_key) {
+                let still_live = all_pods.iter().any(|p| {
+                    p.metadata.deletion_timestamp.is_none()
+                        && format!("{}/{}", namespace, p.metadata.name) == pending
+                });
+                if !still_live {
+                    self.expectations.deletion_observed_of(&exp_key, &pending);
+                }
+            }
+            exp_satisfied = self.expectations.satisfied(&exp_key);
+        }
 
         // Find pods owned by this DaemonSet via ownerReferences (authoritative)
         // Fall back to label matching for backwards compatibility with pods created before this fix
@@ -561,6 +663,9 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             .collect();
 
         let mut pods_by_node = std::collections::HashMap::new();
+        // Pods this sync removes: failed/succeeded pods and pods on nodes that
+        // no longer qualify (upstream `podsToDelete` from `podsShouldBeOnNode`).
+        let mut pods_to_delete: Vec<String> = Vec::new();
         for pod in daemonset_pods.iter() {
             if let Some(node_name) = pod.spec.as_ref().and_then(|s| s.node_name.as_ref()) {
                 // Check if pod is in a terminal phase (Failed or Succeeded)
@@ -577,19 +682,15 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                     // in the same sync cycle (the node won't be in pods_by_node,
                     // so it will be treated as needing a new pod).
                     // K8s ref: pkg/controller/daemon/daemon_controller.go — podsShouldBeOnNode
-                    let pod_name = &pod.metadata.name;
-                    let pod_key = format!("/registry/pods/{}/{}", namespace, pod_name);
-                    if let Err(e) = self.storage.delete(&pod_key).await {
-                        warn!(
-                            "Failed to delete terminal DaemonSet pod {}: {}",
-                            pod_name, e
-                        );
-                    } else {
-                        info!(
-                            "Deleted terminal ({:?}) DaemonSet pod {}",
-                            pod.status.as_ref().and_then(|s| s.phase.as_ref()),
-                            pod_name
-                        );
+                    //
+                    // A terminal pod that is already terminating is skipped:
+                    // getNodesToDaemonPods(includeDeletedTerminal=false)
+                    // (daemon_controller.go:747) and podsShouldBeOnNode
+                    // (:811) leave it to the kubelet / PodGC.
+                    // The delete itself is issued gracefully, in one batch
+                    // with the other pods this sync removes (`syncNodes`).
+                    if pod.metadata.deletion_timestamp.is_none() {
+                        pods_to_delete.push(pod.metadata.name.clone());
                     }
                     // Don't add to pods_by_node — the node needs a new pod.
                     // The replacement will be created in the same reconcile cycle below.
@@ -607,10 +708,39 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             .and_then(|s| s.strategy_type.as_deref())
             .unwrap_or("RollingUpdate");
 
+        // Pods on nodes that are no longer eligible are removed
+        // (`!shouldContinueRunning && exists`, daemon_controller.go:900-908),
+        // skipping pods that are already terminating.
+        let eligible_node_names: std::collections::HashSet<_> = eligible_nodes
+            .iter()
+            .map(|n| n.metadata.name.as_str())
+            .collect();
+        for (node_name, pod) in pods_by_node.iter() {
+            if !eligible_node_names.contains(node_name.as_str())
+                && pod.metadata.deletion_timestamp.is_none()
+            {
+                info!(
+                    "Deleting DaemonSet pod {} from ineligible node {}",
+                    pod.metadata.name, node_name
+                );
+                pods_to_delete.push(pod.metadata.name.clone());
+            }
+        }
+
+        // `syncDaemonSet` (daemon_controller.go:1263-1266): while earlier
+        // deletions are unobserved, do nothing but update status.
+        if exp_satisfied {
+            // `syncNodes` (daemon_controller.go:984-1073): graceful delete of
+            // everything collected above, expectations set first.
+            if let Err(e) = self.delete_pods(&exp_key, namespace, &pods_to_delete).await {
+                deferred_err = Some(e);
+            }
+        }
+
         // --- Manage phase: ensure one pod per eligible node (only for nodes with NO pod) ---
         // This runs BEFORE the rolling update phase, matching K8s behavior:
         // manage() creates pods on empty nodes, then rollingUpdate() replaces old pods.
-        for node in eligible_nodes.iter() {
+        for node in eligible_nodes.iter().filter(|_| exp_satisfied) {
             let node_name = &node.metadata.name;
 
             if !pods_by_node.contains_key(node_name) {
@@ -643,7 +773,11 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         //
         // This ensures that at any point in time, the number of unavailable pods
         // never exceeds maxUnavailable, which is what the conformance test checks.
-        if update_strategy == "RollingUpdate" {
+        //
+        // Gated on expectations RE-CHECKED after manage (`updateDaemonSet`,
+        // daemon_controller.go:919-927): manage's own deletions leave them
+        // unmet, so no rolling-update deletion piles on top in the same sync.
+        if update_strategy == "RollingUpdate" && self.expectations.satisfied(&exp_key) {
             let max_unavailable_raw = daemonset
                 .spec
                 .update_strategy
@@ -676,7 +810,11 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                         .and_then(|s| s.phase.as_ref())
                         .map(|phase| matches!(phase, Phase::Failed | Phase::Succeeded))
                         .unwrap_or(false);
-                    if !is_terminal {
+                    // `findUpdatedPodsOnNode` skips pods with a
+                    // deletionTimestamp (update.go:267-269): a node whose only
+                    // pod is terminating has "no pod" and counts as
+                    // unavailable (update.go `oldPod == nil && newPod == nil`).
+                    if !is_terminal && pod.metadata.deletion_timestamp.is_none() {
                         current_pods_by_node
                             .entry(node_name.clone())
                             .or_default()
@@ -760,63 +898,26 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             // deletions count against the budget. K8s maxSurge=0 means we can never have
             // more than maxUnavailable pods missing at any time.
             let allowed_deletions = (max_unavailable - num_unavailable).max(0);
-            let mut deleted_count: i32 = 0;
-
-            // First, delete unavailable old pods (preferred — already not serving)
-            for (node_name, pod) in &old_unavailable_pods {
-                if deleted_count >= allowed_deletions {
-                    break;
-                }
-                let pod_name = &pod.metadata.name;
-                let pod_key = format!("/registry/pods/{}/{}", namespace, pod_name);
-                if let Ok(()) = self.storage.delete(&pod_key).await {
+            // Unavailable old pods first (already not serving), then
+            // available ones with the remaining budget; one graceful batch
+            // through `syncNodes` (update.go:253), expectations set first.
+            let rolling_deletes: Vec<String> = old_unavailable_pods
+                .iter()
+                .chain(old_available_pods.iter())
+                .take(allowed_deletions as usize)
+                .map(|(node_name, pod)| {
                     info!(
-                        "Rolling update: deleted unavailable old pod {} on node {} (budget {}/{})",
-                        pod_name,
-                        node_name,
-                        deleted_count + 1,
-                        allowed_deletions
+                        "Rolling update: deleting old pod {} on node {} (hash != {}, budget {})",
+                        pod.metadata.name, node_name, template_hash, allowed_deletions
                     );
-                    deleted_count += 1;
-                }
-            }
-
-            // Then, delete available old pods with remaining budget
-            for (node_name, pod) in &old_available_pods {
-                if deleted_count >= allowed_deletions {
-                    break;
-                }
-                let pod_name = &pod.metadata.name;
-                let pod_key = format!("/registry/pods/{}/{}", namespace, pod_name);
-                if let Ok(()) = self.storage.delete(&pod_key).await {
-                    info!(
-                        "Rolling update: deleted old pod {} on node {} (hash != {}, budget {}/{})",
-                        pod_name,
-                        node_name,
-                        template_hash,
-                        deleted_count + 1,
-                        allowed_deletions
-                    );
-                    deleted_count += 1;
-                }
-            }
-        }
-
-        // Remove pods from nodes that are no longer eligible
-        let eligible_node_names: std::collections::HashSet<_> = eligible_nodes
-            .iter()
-            .map(|n| n.metadata.name.as_str())
-            .collect();
-
-        for (node_name, pod) in pods_by_node.iter() {
-            if !eligible_node_names.contains(node_name.as_str()) {
-                let pod_name = &pod.metadata.name;
-                let pod_key = format!("/registry/pods/{}/{}", namespace, pod_name);
-                self.storage.delete(&pod_key).await?;
-                info!(
-                    "Deleted DaemonSet pod {} from ineligible node {}",
-                    pod_name, node_name
-                );
+                    pod.metadata.name.clone()
+                })
+                .collect();
+            if let Err(e) = self
+                .delete_pods(&exp_key, namespace, &rolling_deletes)
+                .await
+            {
+                deferred_err.get_or_insert(e);
             }
         }
 
@@ -912,7 +1013,10 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             self.storage.update_status_cas(&key, daemonset).await?;
         }
 
-        Ok(())
+        match deferred_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Delete all pods owned by a DaemonSet that is being deleted.
@@ -2134,9 +2238,13 @@ mod tests {
         // K8s ref: pkg/controller/daemon/daemon_controller.go — podsShouldBeOnNode
         controller.reconcile(&mut ds).await.unwrap();
 
-        // The failed pod should be gone
-        let result: rusternetes_common::Result<Pod> = storage.get(&pod_key).await;
-        assert!(result.is_err(), "Failed pod should have been deleted");
+        // The failed pod is being deleted gracefully (#2465: DeletePod stamps
+        // a deletionTimestamp; the kubelet removes it later).
+        let failed: Pod = storage.get(&pod_key).await.unwrap();
+        assert!(
+            failed.metadata.deletion_timestamp.is_some(),
+            "Failed pod should have been deleted"
+        );
 
         // A replacement pod should already exist (created in the same cycle)
         let pods_after: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
@@ -2147,6 +2255,7 @@ mod tests {
                     .owner_references
                     .as_ref()
                     .is_some_and(|refs| refs.iter().any(|r| r.name == "fail-ds"))
+                    && p.metadata.deletion_timestamp.is_none()
             })
             .collect();
         assert_eq!(
@@ -2396,5 +2505,217 @@ mod tests {
             .as_ref()
             .unwrap()
             .contains_key(TEMPLATE_GENERATION_LABEL));
+    }
+
+    // ---- #2465: graceful pod deletion (RealPodControl.DeletePod) ----
+
+    fn ds_pods(pods: &[Pod], ds_name: &str) -> Vec<Pod> {
+        pods.iter()
+            .filter(|p| {
+                p.metadata
+                    .owner_references
+                    .as_ref()
+                    .is_some_and(|refs| refs.iter().any(|r| r.name == ds_name))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// One node + one DS pod created by a first reconcile; returns the
+    /// controller, storage, the DS (re-read) and the pod's name.
+    async fn one_pod_fixture(
+        ds_name: &str,
+    ) -> (
+        DaemonSetController<MemoryStorage>,
+        Arc<MemoryStorage>,
+        DaemonSet,
+        String,
+    ) {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = DaemonSetController::new(storage.clone());
+        let node = make_test_node("n1");
+        storage.create("/registry/nodes/n1", &node).await.unwrap();
+        let mut ds = make_test_daemonset(ds_name, "default");
+        storage
+            .create(&format!("/registry/daemonsets/default/{ds_name}"), &ds)
+            .await
+            .unwrap();
+        controller.reconcile(&mut ds).await.unwrap();
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        let pod_name = ds_pods(&pods, ds_name)[0].metadata.name.clone();
+        let ds: DaemonSet = storage
+            .get(&format!("/registry/daemonsets/default/{ds_name}"))
+            .await
+            .unwrap();
+        (controller, storage, ds, pod_name)
+    }
+
+    /// `RealPodControl.DeletePod` is a graceful `Pods(ns).Delete(ctx, podID,
+    /// DeleteOptions{})` (pkg/controller/controller_utils.go:618): a failed
+    /// pod gets a deletionTimestamp, it does not vanish.
+    #[tokio::test]
+    async fn test_failed_pod_is_deleted_gracefully() {
+        let (controller, storage, mut ds, pod_name) = one_pod_fixture("gf").await;
+        let pod_key = format!("/registry/pods/default/{pod_name}");
+        let mut pod: Pod = storage.get(&pod_key).await.unwrap();
+        pod.status.as_mut().unwrap().phase = Some(Phase::Failed);
+        storage.update(&pod_key, &pod).await.unwrap();
+
+        controller.reconcile(&mut ds).await.unwrap();
+
+        let after: Pod = storage
+            .get(&pod_key)
+            .await
+            .expect("failed pod must still exist: delete is graceful");
+        assert!(
+            after.metadata.deletion_timestamp.is_some(),
+            "failed pod must carry a deletionTimestamp"
+        );
+    }
+
+    /// Rolling update replaces old pods through `podControl.DeletePod`
+    /// (update.go rollingUpdate -> syncNodes), i.e. gracefully.
+    #[tokio::test]
+    async fn test_rolling_update_old_pod_is_deleted_gracefully() {
+        let (controller, storage, mut ds, pod_name) = one_pod_fixture("gr").await;
+        ds.spec.template.spec.containers[0].image = "busybox:new".to_string();
+        controller.reconcile(&mut ds).await.unwrap();
+
+        let old: Pod = storage
+            .get(&format!("/registry/pods/default/{pod_name}"))
+            .await
+            .expect("old pod must still exist: delete is graceful");
+        assert!(old.metadata.deletion_timestamp.is_some());
+    }
+
+    /// Pods on a node that no longer qualifies are deleted via `syncNodes`
+    /// (daemon_controller.go podsShouldBeOnNode `!shouldContinueRunning`).
+    #[tokio::test]
+    async fn test_pod_on_ineligible_node_is_deleted_gracefully() {
+        let (controller, storage, mut ds, pod_name) = one_pod_fixture("gi").await;
+        let mut sel = HashMap::new();
+        sel.insert("disk".to_string(), "ssd".to_string());
+        ds.spec.template.spec.node_selector = Some(sel);
+        controller.reconcile(&mut ds).await.unwrap();
+
+        let pod: Pod = storage
+            .get(&format!("/registry/pods/default/{pod_name}"))
+            .await
+            .expect("pod must still exist: delete is graceful");
+        assert!(pod.metadata.deletion_timestamp.is_some());
+    }
+
+    /// Port of the `ExpectDeletions` / `deletePod` pair
+    /// (daemon_controller.go:1000, :668; UID-tracked per
+    /// controller_utils.go:380-390): a delete issued by a sync is expected;
+    /// the MODIFIED event carrying the deletionTimestamp observes it exactly
+    /// once; the later DELETED event of the same pod must not count again.
+    /// While it is unmet the next sync only updates status.
+    #[tokio::test]
+    async fn test_deletion_expectations_observed_once_and_gate_sync() {
+        let (controller, storage, mut ds, pod_name) = one_pod_fixture("ge").await;
+        ds.spec.template.spec.containers[0].image = "busybox:new".to_string();
+        controller.reconcile(&mut ds).await.unwrap();
+        assert_eq!(
+            controller.expectations.get_expectations("default/ge"),
+            Some((0, 1)),
+            "the graceful delete must be expected"
+        );
+        assert!(!controller.expectations.satisfied("default/ge"));
+
+        // MODIFIED with deletionTimestamp observes the deletion...
+        let pod_key = format!("/registry/pods/default/{pod_name}");
+        let pod: Pod = storage.get(&pod_key).await.unwrap();
+        let json = serde_json::to_string(&pod).unwrap();
+        let queue = WorkQueue::new();
+        controller
+            .enqueue_ds_for_pod_event(
+                &rusternetes_storage::WatchEvent::Modified(pod_key.clone(), json.clone()),
+                &queue,
+            )
+            .await;
+        assert!(controller.expectations.satisfied("default/ge"));
+        assert_eq!(
+            controller.expectations.get_expectations("default/ge"),
+            Some((0, 0))
+        );
+        // ...and the DELETED event of the same pod is not counted again.
+        controller
+            .enqueue_ds_for_pod_event(
+                &rusternetes_storage::WatchEvent::Deleted(pod_key, json),
+                &queue,
+            )
+            .await;
+        assert_eq!(
+            controller.expectations.get_expectations("default/ge"),
+            Some((0, 0)),
+            "DELETED after MODIFIED must not drive the counter negative"
+        );
+    }
+
+    /// `syncDaemonSet` (daemon_controller.go:1263-1266): while an expected
+    /// deletion is unobserved (the pod is still live in the listing) the sync
+    /// only updates status - no rolling-update deletion, no creation.
+    #[tokio::test]
+    async fn test_unmet_deletion_expectation_gates_sync() {
+        let (controller, storage, mut ds, pod_name) = one_pod_fixture("gg").await;
+        controller
+            .expectations
+            .expect_deletions_of("default/gg", &[format!("default/{pod_name}")]);
+        ds.spec.template.spec.containers[0].image = "busybox:new".to_string();
+
+        controller.reconcile(&mut ds).await.unwrap();
+
+        let pod: Pod = storage
+            .get(&format!("/registry/pods/default/{pod_name}"))
+            .await
+            .unwrap();
+        assert!(
+            pod.metadata.deletion_timestamp.is_none(),
+            "gated sync must not delete"
+        );
+        assert!(!controller.expectations.satisfied("default/gg"));
+    }
+
+    /// A pod the fresh listing shows terminating counts as observed: the
+    /// next sync releases the gate without waiting for a watch event.
+    #[tokio::test]
+    async fn test_listing_settles_deletion_expectation() {
+        let (controller, _storage, mut ds, _pod) = one_pod_fixture("gs").await;
+        ds.spec.template.spec.containers[0].image = "busybox:new".to_string();
+        controller.reconcile(&mut ds).await.unwrap();
+        assert_eq!(
+            controller.expectations.get_expectations("default/gs"),
+            Some((0, 1))
+        );
+        controller.reconcile(&mut ds).await.unwrap();
+        assert!(controller.expectations.satisfied("default/gs"));
+    }
+
+    /// `findUpdatedPodsOnNode` (update.go:268) and `podsShouldBeOnNode`
+    /// (daemon_controller.go:811,903) skip pods with a deletionTimestamp: a
+    /// terminating pod is not re-deleted and does not get a second pod
+    /// created next to it (TestDaemonSetRespectsTermination).
+    #[tokio::test]
+    async fn test_terminating_pod_is_left_alone() {
+        let (controller, storage, mut ds, pod_name) = one_pod_fixture("gt").await;
+        let pod_key = format!("/registry/pods/default/{pod_name}");
+        let mut pod: Pod = storage.get(&pod_key).await.unwrap();
+        let ts = chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp() - 5, 0).unwrap();
+        pod.metadata.deletion_timestamp = Some(ts);
+        storage.update(&pod_key, &pod).await.unwrap();
+        // A template change would otherwise make this pod an old-pod candidate.
+        ds.spec.template.spec.containers[0].image = "busybox:new".to_string();
+
+        controller.reconcile(&mut ds).await.unwrap();
+
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        assert_eq!(ds_pods(&pods, "gt").len(), 1, "no second pod next to it");
+        let after: Pod = storage.get(&pod_key).await.unwrap();
+        assert_eq!(
+            after.metadata.deletion_timestamp,
+            Some(ts),
+            "deletionTimestamp untouched"
+        );
     }
 }
