@@ -10,6 +10,35 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error};
 
+/// Carry the stored Endpoints' server-owned identity over to the object about
+/// to replace it.
+///
+/// Upstream updates `currentEndpoints.DeepCopy()` with the new subsets and
+/// labels (pkg/controller/endpoint/endpoints_controller.go:470-476), so the
+/// object it PUTs keeps the stored UID, creationTimestamp, finalizers and
+/// managedFields. The API server turns a non-empty `metadata.uid` on an update
+/// into a UID precondition (`defaultUpdatedObjectInfo.Preconditions`,
+/// staging/src/k8s.io/apiserver/pkg/registry/rest/update.go:188-203), so an
+/// object carrying any UID but the stored one is a permanent 409 once Endpoints
+/// is served by the generic Store, and one carrying none drops what the stored
+/// object holds (#2719; the EndpointSlice regression was #2718).
+///
+/// The labels, annotations and ownerReferences this controller computes are
+/// deliberately left as built (a divergence from upstream, which keeps the
+/// stored annotations and sets no ownerReference; tracked separately).
+fn adopt_existing_identity(endpoints: &mut Endpoints, existing: &Endpoints) {
+    let meta = &mut endpoints.metadata;
+    let old = &existing.metadata;
+    meta.uid = old.uid.clone();
+    meta.resource_version = old.resource_version.clone();
+    meta.creation_timestamp = old.creation_timestamp;
+    meta.generation = old.generation;
+    meta.finalizers = old.finalizers.clone();
+    meta.managed_fields = old.managed_fields.clone();
+    meta.deletion_timestamp = old.deletion_timestamp;
+    meta.deletion_grace_period_seconds = old.deletion_grace_period_seconds;
+}
+
 /// Upstream `pkg/controller/endpoint/endpoints_controller.go::maxCapacity`.
 /// Endpoints objects with more than this many addresses won't be routed
 /// correctly by kube-proxy, so the controller truncates and emits the
@@ -541,8 +570,7 @@ impl<S: Storage + 'static> EndpointsController<S> {
                 );
                 return Ok(());
             }
-            // Preserve resource version for update
-            endpoints.metadata.resource_version = existing.metadata.resource_version;
+            adopt_existing_identity(&mut endpoints, &existing);
         }
 
         // Try to update first, if it doesn't exist, create it
@@ -1575,5 +1603,117 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An update of an existing Endpoints must carry the stored object's
+    /// identity, as upstream's `currentEndpoints.DeepCopy()` does
+    /// (pkg/controller/endpoint/endpoints_controller.go:470). The generic Store
+    /// turns a non-empty `metadata.uid` into a UID precondition
+    /// (rest/update.go:188-203), so a rebuilt object with its own UID would 409
+    /// (the EndpointSlice regression, #2718); one with no UID silently drops
+    /// the stored finalizers and system fields (#2719).
+    #[tokio::test]
+    async fn updating_existing_endpoints_keeps_stored_identity() {
+        use crate::controllers::uid_precondition_double::UidPreconditionStorage;
+        use rusternetes_common::resources::{PodCondition, PodStatus, ServicePort, ServiceSpec};
+        use rusternetes_common::types::Phase;
+
+        let storage = Arc::new(UidPreconditionStorage::new());
+        let controller = EndpointsController::new(storage.clone());
+
+        let service = Service {
+            type_meta: rusternetes_common::types::TypeMeta {
+                kind: "Service".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: rusternetes_common::types::ObjectMeta::new("svc").with_namespace("default"),
+            spec: ServiceSpec {
+                selector: Some(HashMap::from([("app".to_string(), "web".to_string())])),
+                ports: vec![ServicePort {
+                    name: None,
+                    port: 80,
+                    target_port: None,
+                    protocol: "TCP".to_string(),
+                    node_port: None,
+                    app_protocol: None,
+                }],
+                ..Default::default()
+            },
+            status: None,
+        };
+        storage
+            .create("/registry/services/default/svc", &service)
+            .await
+            .unwrap();
+
+        // No pod yet: the Endpoints is created empty, and the server stamps it.
+        controller.reconcile_service(&service).await.unwrap();
+        let ep_key = "/registry/endpoints/default/svc";
+        let mut first: Endpoints = storage.get(ep_key).await.unwrap();
+        assert!(!first.metadata.uid.is_empty());
+        assert!(first.metadata.creation_timestamp.is_some());
+
+        // Somebody else (a user, another controller) put a finalizer on it.
+        first.metadata.finalizers = Some(vec!["example.com/keep".to_string()]);
+        storage.update(ep_key, &first).await.unwrap();
+        let first: Endpoints = storage.get(ep_key).await.unwrap();
+        storage.puts.lock().unwrap().clear();
+
+        // A ready pod appears: the existing Endpoints must be updated.
+        let pod = Pod {
+            type_meta: rusternetes_common::types::TypeMeta {
+                kind: "Pod".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: rusternetes_common::types::ObjectMeta {
+                name: "p1".to_string(),
+                namespace: Some("default".to_string()),
+                uid: "pod-uid-1".to_string(),
+                labels: Some(HashMap::from([("app".to_string(), "web".to_string())])),
+                ..Default::default()
+            },
+            spec: Some(rusternetes_common::resources::PodSpec {
+                containers: vec![],
+                ..Default::default()
+            }),
+            status: Some(PodStatus {
+                phase: Some(Phase::Running),
+                pod_ip: Some("10.0.0.1".to_string()),
+                conditions: Some(vec![PodCondition {
+                    condition_type: "Ready".to_string(),
+                    status: "True".to_string(),
+                    last_probe_time: None,
+                    last_transition_time: None,
+                    reason: None,
+                    message: None,
+                    observed_generation: None,
+                }]),
+                ..Default::default()
+            }),
+        };
+        storage
+            .create("/registry/pods/default/p1", &pod)
+            .await
+            .unwrap();
+        controller.reconcile_service(&service).await.unwrap();
+
+        let second: Endpoints = storage.get(ep_key).await.unwrap();
+        assert_eq!(second.subsets.len(), 1, "the update must land");
+        assert_eq!(second.metadata.uid, first.metadata.uid);
+        assert_eq!(
+            second.metadata.creation_timestamp,
+            first.metadata.creation_timestamp
+        );
+        assert_eq!(
+            second.metadata.finalizers, first.metadata.finalizers,
+            "an update must not drop the stored finalizers"
+        );
+        let puts = storage.puts.lock().unwrap();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(
+            puts[0]["metadata"]["uid"].as_str(),
+            Some(first.metadata.uid.as_str()),
+            "the PUT body must carry the stored UID"
+        );
     }
 }

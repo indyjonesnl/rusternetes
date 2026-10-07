@@ -49,6 +49,8 @@ pub mod storage_class;
 pub mod taint_eviction;
 pub mod taint_eviction_timed_workers;
 pub mod ttl_controller;
+#[cfg(test)]
+pub mod uid_precondition_double;
 #[allow(dead_code)]
 pub mod volume_attachment;
 pub mod volume_expansion;
