@@ -234,6 +234,9 @@ pub async fn list(
         }
     }
 
+    // ValidateListOptions + the resourceVersion floor (#2224).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let prefix = build_prefix("configmaps", Some(&namespace));
     let mut configmaps: Vec<ConfigMap> = state.storage.list(&prefix).await?;
 
@@ -297,6 +300,9 @@ pub async fn list_all_configmaps(
             return Err(rusternetes_common::Error::Forbidden(reason));
         }
     }
+
+    // ValidateListOptions + the resourceVersion floor (#2224).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
     let prefix = build_prefix("configmaps", None);
     let mut configmaps = state.storage.list::<ConfigMap>(&prefix).await?;

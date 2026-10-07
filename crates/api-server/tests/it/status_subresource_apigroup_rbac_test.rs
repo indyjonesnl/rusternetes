@@ -91,6 +91,7 @@ fn mint_sa_token(namespace: &str, sa_name: &str, uid: &str) -> String {
             },
             pod: None,
             node: None,
+            secret: None,
         }),
         pod_name: None,
         pod_uid: None,

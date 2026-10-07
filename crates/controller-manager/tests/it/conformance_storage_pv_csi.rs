@@ -554,6 +554,7 @@ fn csinode_lifecycle_serde_round_trip() {
 #[test]
 fn csi_inline_volume_source_round_trips_through_serde() {
     let vol = rusternetes_common::resources::Volume {
+        legacy_sources: Default::default(),
         name: "csi-inline-vol".to_string(),
         csi: Some(rusternetes_common::resources::csi::CSIVolumeSource {
             driver: "csi.example.com".to_string(),

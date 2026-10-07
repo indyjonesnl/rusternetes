@@ -54,6 +54,7 @@ fn pod_with_volumes(name: &str, volumes: Vec<Volume>) -> Pod {
 #[tokio::test]
 async fn projected_secret_explicit_default_mode_round_trips() {
     let projected_volume = Volume {
+        legacy_sources: Default::default(),
         name: "projected-secret-volume".to_string(),
         empty_dir: None,
         host_path: None,
@@ -137,6 +138,7 @@ async fn projected_secret_explicit_default_mode_round_trips() {
 #[tokio::test]
 async fn projected_omitted_default_mode_defaults_to_0644() {
     let projected_volume = Volume {
+        legacy_sources: Default::default(),
         name: "p-vol".to_string(),
         empty_dir: None,
         host_path: None,
@@ -184,6 +186,7 @@ async fn projected_omitted_default_mode_defaults_to_0644() {
 #[tokio::test]
 async fn secret_volume_omitted_default_mode_defaults_to_0644() {
     let secret_volume = Volume {
+        legacy_sources: Default::default(),
         name: "sv".to_string(),
         empty_dir: None,
         host_path: None,
@@ -218,6 +221,7 @@ async fn secret_volume_omitted_default_mode_defaults_to_0644() {
 #[tokio::test]
 async fn configmap_and_downward_api_volumes_default_mode_defaults_to_0644() {
     let cm_volume = Volume {
+        legacy_sources: Default::default(),
         name: "cm".to_string(),
         empty_dir: None,
         host_path: None,
@@ -238,6 +242,7 @@ async fn configmap_and_downward_api_volumes_default_mode_defaults_to_0644() {
         image: None,
     };
     let dapi_volume = Volume {
+        legacy_sources: Default::default(),
         name: "dapi".to_string(),
         empty_dir: None,
         host_path: None,

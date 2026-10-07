@@ -7,11 +7,9 @@ pub mod resourcequota;
 pub mod storage_object_in_use_protection;
 
 /// Pod admission controllers for ResourceQuota, LimitRange enforcement, and ServiceAccount injection
-use chrono::Utc;
 use rusternetes_common::{
     quantity::{parse_resource_value, Quantity},
-    quota,
-    resources::{LimitRange, Pod, ResourceQuota, ServiceAccount},
+    resources::{LimitRange, Pod, ServiceAccount},
     types::ResourceRequirements,
 };
 use rusternetes_storage::Storage;
@@ -19,140 +17,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use self::resourcequota::evaluator::status_hard_names;
-use self::resourcequota::{has_usage_stats, pretty_print_resource_names};
-
-/// Check if a pod is BestEffort QoS class — the `BestEffort` ResourceQuota
-/// scope.
-///
-/// Port of upstream `isBestEffort` (`pkg/quota/v1/evaluator/core/pods.go:412-414`),
-/// which is one line: `qos.GetPodQOS(pod) == corev1.PodQOSBestEffort`. It reads
-/// the same classifier as everything else, so the scope a pod is charged
-/// against is the class the api-server published.
-///
-/// This used to be a hand-rolled "any non-empty requests or limits map"
-/// scan, which counted resources `ComputePodQOS` ignores: a pod requesting only
-/// `nvidia.com/gpu`, or an explicit `cpu: "0"`, is BestEffort upstream
-/// (`isSupportedQoSComputeResource` + `Cmp(zeroQuantity) == 1`,
-/// `qos.go:29-35/57`) but was excluded from the BestEffort scope here.
-fn is_pod_best_effort(pod: &Pod) -> bool {
-    rusternetes_common::qos::get_pod_qos(pod) == rusternetes_common::qos::QoSClass::BestEffort
-}
-
-/// Check if a pod matches the scopes of a ResourceQuota.
-/// All scopes must match (AND logic).
-fn pod_matches_quota_scopes(pod: &Pod, quota: &ResourceQuota) -> bool {
-    let is_terminating = pod.metadata.deletion_timestamp.is_some()
-        || pod
-            .spec
-            .as_ref()
-            .and_then(|s| s.active_deadline_seconds)
-            .is_some();
-    let is_best_effort = is_pod_best_effort(pod);
-
-    // Check scopes list
-    if let Some(scopes) = &quota.spec.scopes {
-        for scope in scopes {
-            match scope.as_str() {
-                "Terminating" if !is_terminating => {
-                    return false;
-                }
-                "NotTerminating" if is_terminating => {
-                    return false;
-                }
-                "BestEffort" if !is_best_effort => {
-                    return false;
-                }
-                "NotBestEffort" if is_best_effort => {
-                    return false;
-                }
-                _ => {}
-            }
-        }
-    }
-
-    // Check scopeSelector if present
-    if let Some(selector) = &quota.spec.scope_selector {
-        for req in &selector.match_expressions {
-            match req.scope_name.as_str() {
-                "Terminating" => {
-                    let matches = match req.operator.as_str() {
-                        "Exists" => is_terminating,
-                        "DoesNotExist" => !is_terminating,
-                        _ => true,
-                    };
-                    if !matches {
-                        return false;
-                    }
-                }
-                "NotTerminating" => {
-                    let matches = match req.operator.as_str() {
-                        "Exists" => !is_terminating,
-                        "DoesNotExist" => is_terminating,
-                        _ => true,
-                    };
-                    if !matches {
-                        return false;
-                    }
-                }
-                "BestEffort" => {
-                    let matches = match req.operator.as_str() {
-                        "Exists" => is_best_effort,
-                        "DoesNotExist" => !is_best_effort,
-                        _ => true,
-                    };
-                    if !matches {
-                        return false;
-                    }
-                }
-                "NotBestEffort" => {
-                    let matches = match req.operator.as_str() {
-                        "Exists" => !is_best_effort,
-                        "DoesNotExist" => is_best_effort,
-                        _ => true,
-                    };
-                    if !matches {
-                        return false;
-                    }
-                }
-                "PriorityClass" => {
-                    let pod_priority_class = pod
-                        .spec
-                        .as_ref()
-                        .and_then(|s| s.priority_class_name.as_deref())
-                        .unwrap_or("");
-                    let matches = match req.operator.as_str() {
-                        "In" => req
-                            .values
-                            .as_ref()
-                            .is_some_and(|v| v.iter().any(|val| val == pod_priority_class)),
-                        "NotIn" => req
-                            .values
-                            .as_ref()
-                            .is_none_or(|v| !v.iter().any(|val| val == pod_priority_class)),
-                        "Exists" => !pod_priority_class.is_empty(),
-                        "DoesNotExist" => pod_priority_class.is_empty(),
-                        _ => true,
-                    };
-                    if !matches {
-                        return false;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    true
-}
-
 /// One lock per namespace, serialising pod quota admission within it.
 static QUOTA_NAMESPACE_LOCKS: std::sync::LazyLock<
     std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 > = std::sync::LazyLock::new(Default::default);
 
-/// Serialise pod quota admission in `namespace`: hold the returned guard from
-/// before the quota check until the pod has been written.
+/// Serialise quota admission in `namespace`: hold the returned guard across
+/// the check and the write of the quota's `status.used`.
 ///
 /// Upstream never evaluates two requests of one namespace at once.
 /// `quotaEvaluator.addWork` queues each request under its namespace and
@@ -160,17 +31,11 @@ static QUOTA_NAMESPACE_LOCKS: std::sync::LazyLock<
 /// `dirtyWork` until `completeWork` (`staging/src/k8s.io/apiserver/pkg/
 /// admission/plugin/resourcequota/controller.go:688-735`); each admitted
 /// request's usage is written to `status.used` before the next is checked
-/// (`checkQuotas`, :228-401).
-///
-/// Here usage is a live recount of stored pods (see
-/// [`check_resource_quota_with_old`]), so an admitted request is only visible
-/// to the next one once its pod is persisted — which is why the guard must
-/// span the storage write, not just the check. Without it, a ReplicationController
-/// slow-start batch's concurrent creates each saw the same usage and were all
-/// admitted past `hard`.
+/// (`checkQuotas`, :228-401). [`resourcequota::evaluate`] takes this lock for
+/// that span.
 ///
 /// Single api-server only: upstream's cross-apiserver safety is the optimistic
-/// `UpdateStatus` on the quota, which this in-process lock does not replace.
+/// `UpdateStatus` on the quota, which `resourcequota::check_quotas` also does.
 pub async fn lock_namespace_quota(namespace: &str) -> tokio::sync::OwnedMutexGuard<()> {
     let lock = {
         let mut locks = QUOTA_NAMESPACE_LOCKS
@@ -182,317 +47,6 @@ pub async fn lock_namespace_quota(namespace: &str) -> tokio::sync::OwnedMutexGua
         locks.entry(namespace.to_string()).or_default().clone()
     };
     lock.lock_owned().await
-}
-
-/// The `Constraints` half of upstream's `checkRequest`
-/// (`staging/src/k8s.io/apiserver/pkg/admission/plugin/resourcequota/
-/// controller.go:464-474`): for every quota in the namespace that matches the
-/// pod, `evaluator.Constraints(MatchingResources(ResourceNames(hard)), pod)`;
-/// the first failure is `Forbidden: failed quota: <name>: must specify ...`.
-/// Returns that message (without the `Forbidden` prefix the caller supplies), or
-/// `None` when every container covers what the quotas constrain.
-///
-/// Like upstream (`controller.go:464`: `ResourceNames(resourceQuota.Status.Hard)`)
-/// this reads `status.hard`, so a quota the controller has not synced yet
-/// constrains nothing.
-pub async fn check_pod_quota_constraints<S: Storage>(
-    storage: &Arc<S>,
-    namespace: &str,
-    pod: &Pod,
-) -> anyhow::Result<Option<String>> {
-    let quota_prefix = format!("/registry/resourcequotas/{}/", namespace);
-    let quotas: Vec<ResourceQuota> = storage.list(&quota_prefix).await?;
-    for quota_obj in quotas {
-        if !pod_matches_quota_scopes(pod, &quota_obj) {
-            continue;
-        }
-        let Some(hard) = quota_obj.status.as_ref().and_then(|s| s.hard.as_ref()) else {
-            continue;
-        };
-        let required: Vec<String> = hard.keys().cloned().collect();
-        if let Err(msg) = quota::pod_constraints(pod, &required) {
-            return Ok(Some(format!(
-                "failed quota: {}: {}",
-                quota_obj.metadata.name, msg
-            )));
-        }
-    }
-    Ok(None)
-}
-
-/// Check if pod creation would exceed ResourceQuota limits.
-///
-/// Delegates to [`check_resource_quota_with_old`] with `old_pod = None`
-/// so the new pod's full resource footprint counts against the quota.
-/// `None` admits; `Some(msg)` is the `Forbidden` message.
-pub async fn check_resource_quota<S: Storage>(
-    storage: &Arc<S>,
-    namespace: &str,
-    pod: &Pod,
-) -> anyhow::Result<Option<String>> {
-    check_resource_quota_with_old(storage, namespace, pod, None).await
-}
-
-/// Check if a pod CREATE or UPDATE would exceed ResourceQuota limits.
-///
-/// Port of upstream `quotaEvaluator.checkRequest`
-/// (`staging/src/k8s.io/apiserver/pkg/admission/plugin/resourcequota/controller.go:480-635`):
-///
-/// ```text
-/// delta      = Usage(new)                                    on CREATE
-///            = SubtractWithNonNegativeResult(Usage(new), Usage(old))  on UPDATE
-/// delta      = RemoveZeros(delta)   -> nothing left? admit
-/// requested  = Mask(delta, ResourceNames(hard))
-/// newUsage   = Add(used, requested)
-/// allowed    = LessThanOrEqual(Mask(newUsage, ResourceNames(requested)), hard)
-/// ```
-///
-/// Every step is `Quantity` arithmetic. The previous implementation open-coded
-/// one branch per quota key (`requests.cpu`, `requests.memory`, `limits.cpu`,
-/// `limits.memory`, `requests.ephemeral-storage`, then a loop for the rest),
-/// each reducing to `i64` millicores or bytes and each with its own fallback —
-/// which is how `hard: requests.example.com/foo: 1k` came to be silently
-/// unenforced (`limit_str.parse().unwrap_or(i64::MAX)`).
-///
-/// Returns `None` to admit, or the `Forbidden` message (without the prefix the
-/// caller supplies): `exceeded quota: ...`, or, from `hasUsageStats`
-/// (`controller.go:469-471`), `status unknown for quota: <name>, resources: <list>`.
-///
-/// A quota is read the way upstream reads it: its hard limits come from
-/// `status.hard` (`controller.go:464`, `:605`), not `spec.hard`, so a quota the
-/// controller has not synced yet constrains nothing, and one whose
-/// `status.used` lacks a figure for a pod resource it limits refuses the pod.
-///
-/// Two deliberate deviations from upstream, both pre-existing:
-///
-/// * **Live recount instead of `status.used`.** Upstream charges against the
-///   figure the quota controller maintains; this recomputes from the pods in
-///   storage so a stale `status.used` cannot reject a request after the pods it
-///   counted are gone. Consequence, shared with upstream: an UPDATE that
-///   *lowers* usage charges a zero delta, so the recorded figure stays high
-///   until the controller re-syncs.
-/// * **Scope filtering applied to the recount.** The recount only sums pods the
-///   quota's scopes match, which is what `status.used` would have held.
-pub async fn check_resource_quota_with_old<S: Storage>(
-    storage: &Arc<S>,
-    namespace: &str,
-    pod: &Pod,
-    old_pod: Option<&Pod>,
-) -> anyhow::Result<Option<String>> {
-    let quota_prefix = format!("/registry/resourcequotas/{}/", namespace);
-    let quotas: Vec<ResourceQuota> = storage.list(&quota_prefix).await?;
-
-    if quotas.is_empty() {
-        return Ok(None);
-    }
-
-    let now = Utc::now();
-    let input_usage = quota::pod_usage(pod, now);
-    let delta = match old_pod {
-        // UPDATE: charge the increase only. Upstream uses
-        // `SubtractWithNonNegativeResult` here (`controller.go:530`), so a
-        // shrinking dimension charges nothing rather than a credit.
-        Some(old) => quota::remove_zeros(&quota::subtract_with_non_negative_result(
-            &input_usage,
-            &quota::pod_usage(old, now),
-        )),
-        // CREATE: the pod's whole footprint.
-        None => quota::remove_zeros(&input_usage),
-    };
-
-    // Nothing charged means nothing can be exceeded (`controller.go:555-565`).
-    if delta.is_empty() {
-        return Ok(None);
-    }
-
-    for mut quota_obj in quotas {
-        if !pod_matches_quota_scopes(pod, &quota_obj) {
-            continue;
-        }
-
-        // `ResourceNames(resourceQuota.Status.Hard)` (`controller.go:464`): an
-        // unsynced quota has none, so `MatchingResources` is empty and the
-        // quota does not match the pod at all (`generic.Matches`).
-        let hard_names = status_hard_names(&quota_obj);
-        let restricted = pod_matching_resources(&hard_names);
-        if restricted.is_empty() {
-            continue;
-        }
-        // `controller.go:469-471`, after `Constraints`
-        // ([`check_pod_quota_constraints`]).
-        if !has_usage_stats(&quota_obj, &restricted) {
-            return Ok(Some(format!(
-                "status unknown for quota: {}, resources: {}",
-                quota_obj.metadata.name,
-                pretty_print_resource_names(&restricted)
-            )));
-        }
-        let hard = quota_obj
-            .status
-            .as_ref()
-            .and_then(|s| s.hard.as_ref())
-            .map(quota::parse_resource_list)
-            .unwrap_or_default();
-
-        let requested = quota::mask(&delta, &hard_names);
-        if requested.is_empty() {
-            continue;
-        }
-
-        // Live usage stands in for `status.used` — see the deviation note above.
-        let used = namespace_usage(storage, namespace, &quota_obj, now).await?;
-        let new_usage = quota::add(&used, &requested);
-
-        // Only the dimensions this request actually charges can fail: a
-        // namespace already over quota on some other dimension must not block
-        // a pod that does not ask for it (`controller.go:617`).
-        let compared = quota::mask(&new_usage, &quota::resource_names(&requested));
-        let (allowed, exceeded) = quota::less_than_or_equal(&compared, &hard);
-        if !allowed {
-            // Upstream's message, verbatim modulo the "Forbidden: " prefix the
-            // caller supplies: `exceeded quota: <name>, requested: <list>,
-            // used: <list>, limited: <list>` where each list is
-            // `prettyPrint(Mask(.., exceeded))` (`controller.go:619-625`).
-            let message = format!(
-                "exceeded quota: {}, requested: {}, used: {}, limited: {}",
-                quota_obj.metadata.name,
-                quota::pretty_print(&quota::mask(&requested, &exceeded)),
-                quota::pretty_print(&quota::mask(&used, &exceeded)),
-                quota::pretty_print(&quota::mask(&hard, &exceeded)),
-            );
-            warn!("Forbidden: {message}");
-            return Ok(Some(message));
-        }
-
-        // Record the new usage. Upstream sets `Status.Used = newUsage`
-        // (`controller.go:630`) — the full add, not just the compared subset.
-        let quota_key = format!(
-            "/registry/resourcequotas/{}/{}",
-            namespace, quota_obj.metadata.name
-        );
-        write_quota_usage(storage, &quota_key, &mut quota_obj, &new_usage).await;
-    }
-
-    Ok(None)
-}
-
-/// `podEvaluator.MatchingResources` (`pkg/quota/v1/evaluator/core/pods.go:208-222`):
-/// the names in `input` a pod is charged against — `podResources`, the
-/// `hugepages-` / `requests.hugepages-` prefixes, and `requests.<extended>`
-/// (`isExtendedResourceNameForQuota`, :86-97).
-fn pod_matching_resources(input: &[String]) -> Vec<String> {
-    const POD_RESOURCES: [&str; 11] = [
-        "count/pods",
-        "cpu",
-        "memory",
-        "ephemeral-storage",
-        "requests.cpu",
-        "requests.memory",
-        "requests.ephemeral-storage",
-        "limits.cpu",
-        "limits.memory",
-        "limits.ephemeral-storage",
-        "pods",
-    ];
-    input
-        .iter()
-        .filter(|name| {
-            POD_RESOURCES.contains(&name.as_str())
-                || name.starts_with("hugepages-")
-                || name.starts_with("requests.hugepages-")
-                || (name.starts_with("requests.") && !quota::is_native_resource_name(name))
-        })
-        .cloned()
-        .collect()
-}
-
-/// Sum the quota footprint of every pod in `namespace` that `quota_obj`'s scopes
-/// match — the figure `status.used` would hold.
-///
-/// Upstream equivalent is `generic.CalculateUsageStats`
-/// (`staging/src/k8s.io/apiserver/pkg/quota/v1/generic/evaluator.go`): filter by
-/// scope, then `quota.Add` each object's `Usage`. `pod_usage` carries the
-/// `QuotaV1Pod` rule with it, so a terminal pod contributes only `count/pods`
-/// and a terminating one keeps its charge until its grace period elapses.
-async fn namespace_usage<S: Storage>(
-    storage: &Arc<S>,
-    namespace: &str,
-    quota_obj: &ResourceQuota,
-    now: chrono::DateTime<Utc>,
-) -> anyhow::Result<quota::ResourceList> {
-    let pod_prefix = format!("/registry/pods/{}/", namespace);
-    let pods: Vec<Pod> = storage.list(&pod_prefix).await?;
-    let mut usage = quota::ResourceList::new();
-    for pod in pods
-        .iter()
-        .filter(|p| pod_matches_quota_scopes(p, quota_obj))
-    {
-        usage = quota::add(&usage, &quota::pod_usage(pod, now));
-    }
-    Ok(usage)
-}
-
-/// Write `new_usage` into the quota's `status.used`, masked to its hard keys.
-///
-/// A CAS conflict means a concurrent admission or a controller re-sync got
-/// there first; both write a figure derived from the same pod list, so the
-/// retry just recomputes and writes again rather than re-running the check.
-/// Upstream retries the whole evaluation up to three times
-/// (`checkQuotas(..., remainingRetries)`); here the controller's own reconcile
-/// converges the value regardless, so one retry is enough.
-async fn write_quota_usage<S: Storage>(
-    storage: &Arc<S>,
-    quota_key: &str,
-    quota_obj: &mut ResourceQuota,
-    new_usage: &quota::ResourceList,
-) {
-    let hard = quota_obj.status.as_ref().and_then(|s| s.hard.clone());
-    let used = masked_used(new_usage, hard.as_ref());
-
-    let status = quota_obj.status.get_or_insert_with(|| {
-        rusternetes_common::resources::ResourceQuotaStatus {
-            hard: hard.clone(),
-            used: None,
-        }
-    });
-    status.used = Some(used);
-
-    if let Err(e) = storage.update(quota_key, quota_obj).await {
-        warn!(
-            "Failed to atomically update quota usage for {}: {} — retrying with fresh data",
-            quota_obj.metadata.name, e
-        );
-        if let Ok(mut fresh) = storage.get::<ResourceQuota>(quota_key).await {
-            let fresh_hard = fresh.status.as_ref().and_then(|s| s.hard.clone());
-            let used = masked_used(new_usage, fresh_hard.as_ref());
-            let status = fresh.status.get_or_insert_with(|| {
-                rusternetes_common::resources::ResourceQuotaStatus {
-                    hard: fresh_hard.clone(),
-                    used: None,
-                }
-            });
-            status.used = Some(used);
-            let _ = storage.update(quota_key, &fresh).await;
-        }
-    }
-}
-
-/// `status.used` as canonical strings, restricted to the quota's hard keys and
-/// defaulting each of them to `"0"`. Mirrors what the quota controller writes,
-/// so the two do not fight over the same field
-/// (`quota.Mask(used, hardResources)` in `syncResourceQuota`).
-fn masked_used(
-    new_usage: &quota::ResourceList,
-    hard: Option<&HashMap<String, String>>,
-) -> HashMap<String, String> {
-    let mut used = quota::to_string_map(new_usage);
-    if let Some(hard) = hard {
-        for key in hard.keys() {
-            used.entry(key.clone()).or_insert_with(|| "0".to_string());
-        }
-        used.retain(|key, _| hard.contains_key(key));
-    }
-    used
 }
 
 /// Apply LimitRange defaults and validate constraints
@@ -1400,6 +954,22 @@ pub struct PodSecurityOutcome {
     pub audit_annotations: BTreeMap<String, String>,
 }
 
+/// `audit.AddAuditAnnotations(ctx, AuditAnnotationPrefix+k, v...)` for the
+/// outcome's `AdmissionResponse.AuditAnnotations`
+/// (plugin/pkg/admission/security/podsecurity/admission.go:203-211;
+/// `AuditAnnotationPrefix` = `pod-security.kubernetes.io/`,
+/// pod-security-admission/api/constants.go:35,38).
+pub fn record_pod_security_audit(outcome: &PodSecurityOutcome) {
+    let kvs: Vec<(String, String)> = outcome
+        .audit_annotations
+        .iter()
+        .map(|(k, v)| (format!("pod-security.kubernetes.io/{k}"), v.clone()))
+        .collect();
+    if !kvs.is_empty() {
+        crate::audit::add_audit_annotations(&kvs);
+    }
+}
+
 /// The check registry for the default checks, built once
 /// (`policy.NewEvaluator(policy.DefaultChecks(), emulationVersion)`,
 /// admission.go `CompleteConfiguration`). The emulation version is the
@@ -1436,6 +1006,7 @@ pub async fn get_default_priority_class<S: Storage>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusternetes_common::quota;
     use rusternetes_common::types::ObjectMeta;
 
     fn make_pod(name: &str, cpu_request: Option<&str>, cpu_limit: Option<&str>) -> Pod {
@@ -1464,101 +1035,6 @@ mod tests {
             }
         });
         serde_json::from_value(pod_json).unwrap()
-    }
-
-    #[test]
-    fn test_is_pod_best_effort_no_resources() {
-        let pod = make_pod("test", None, None);
-        assert!(is_pod_best_effort(&pod));
-    }
-
-    #[test]
-    fn test_is_pod_best_effort_with_requests() {
-        let pod = make_pod("test", Some("100m"), None);
-        assert!(!is_pod_best_effort(&pod));
-    }
-
-    #[test]
-    fn test_is_pod_best_effort_with_limits() {
-        let pod = make_pod("test", None, Some("200m"));
-        assert!(!is_pod_best_effort(&pod));
-    }
-
-    #[test]
-    fn test_pod_matches_quota_scopes_no_scopes() {
-        let pod = make_pod("test", Some("100m"), None);
-        let quota = ResourceQuota {
-            type_meta: rusternetes_common::types::TypeMeta {
-                api_version: "v1".to_string(),
-                kind: "ResourceQuota".to_string(),
-            },
-            metadata: ObjectMeta::new("quota"),
-            spec: rusternetes_common::resources::ResourceQuotaSpec {
-                hard: None,
-                scopes: None,
-                scope_selector: None,
-            },
-            status: None,
-        };
-        assert!(pod_matches_quota_scopes(&pod, &quota));
-    }
-
-    #[test]
-    fn test_pod_matches_quota_scopes_best_effort_match() {
-        let pod = make_pod("be", None, None);
-        let quota = ResourceQuota {
-            type_meta: rusternetes_common::types::TypeMeta {
-                api_version: "v1".to_string(),
-                kind: "ResourceQuota".to_string(),
-            },
-            metadata: ObjectMeta::new("quota"),
-            spec: rusternetes_common::resources::ResourceQuotaSpec {
-                hard: None,
-                scopes: Some(vec!["BestEffort".to_string()]),
-                scope_selector: None,
-            },
-            status: None,
-        };
-        assert!(pod_matches_quota_scopes(&pod, &quota));
-    }
-
-    #[test]
-    fn test_pod_matches_quota_scopes_best_effort_no_match() {
-        let pod = make_pod("not-be", Some("100m"), None);
-        let quota = ResourceQuota {
-            type_meta: rusternetes_common::types::TypeMeta {
-                api_version: "v1".to_string(),
-                kind: "ResourceQuota".to_string(),
-            },
-            metadata: ObjectMeta::new("quota"),
-            spec: rusternetes_common::resources::ResourceQuotaSpec {
-                hard: None,
-                scopes: Some(vec!["BestEffort".to_string()]),
-                scope_selector: None,
-            },
-            status: None,
-        };
-        assert!(!pod_matches_quota_scopes(&pod, &quota));
-    }
-
-    #[test]
-    fn test_pod_matches_quota_scopes_not_terminating() {
-        let pod = make_pod("test", Some("100m"), None);
-        let quota = ResourceQuota {
-            type_meta: rusternetes_common::types::TypeMeta {
-                api_version: "v1".to_string(),
-                kind: "ResourceQuota".to_string(),
-            },
-            metadata: ObjectMeta::new("quota"),
-            spec: rusternetes_common::resources::ResourceQuotaSpec {
-                hard: None,
-                scopes: Some(vec!["NotTerminating".to_string()]),
-                scope_selector: None,
-            },
-            status: None,
-        };
-        // Pod without activeDeadlineSeconds is NotTerminating
-        assert!(pod_matches_quota_scopes(&pod, &quota));
     }
 
     #[test]

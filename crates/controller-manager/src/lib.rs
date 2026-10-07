@@ -12,6 +12,7 @@ use controllers::{
     dynamic_provisioner::DynamicProvisionerController,
     endpoints::EndpointsController,
     endpointslice::EndpointSliceController,
+    ephemeral_volume::EphemeralVolumeController,
     events::EventsController,
     garbage_collector::GarbageCollector,
     hpa::HorizontalPodAutoscalerController,
@@ -301,6 +302,14 @@ where
         let c = Arc::new(PvcProtectionController::new(s));
         if let Err(e) = c.run().await {
             error!("PVC protection controller error: {}", e);
+        }
+    }));
+
+    let s = storage_for("EphemeralVolume");
+    handles.push(tokio::spawn(async move {
+        let c = Arc::new(EphemeralVolumeController::new(s));
+        if let Err(e) = c.run().await {
+            error!("Ephemeral volume controller error: {}", e);
         }
     }));
 

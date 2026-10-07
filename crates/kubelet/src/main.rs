@@ -338,7 +338,7 @@ async fn main() -> Result<()> {
     // crashLoopBackOff.maxContainerRestartPeriod (None => 300s default).
     let crash_loop_backoff_max = config_file
         .as_ref()
-        .map(|c| c.effective_max_container_restart_period());
+        .and_then(|c| c.effective_max_container_restart_period_gated());
 
     // Parse etcd endpoints
     let etcd_endpoints: Vec<String> = args
@@ -630,6 +630,16 @@ async fn main() -> Result<()> {
             .route(
                 "/attach/:namespace/:pod/:uid/:container",
                 get(streaming_server::handle_attach_uid).post(streaming_server::handle_attach_uid),
+            )
+            .route(
+                "/portForward/:namespace/:pod",
+                get(streaming_server::handle_portforward)
+                    .post(streaming_server::handle_portforward),
+            )
+            .route(
+                "/portForward/:namespace/:pod/:uid",
+                get(streaming_server::handle_portforward_uid)
+                    .post(streaming_server::handle_portforward_uid),
             )
             .route(
                 "/containerLogs/:namespace/:pod/:container",

@@ -169,6 +169,12 @@ pub enum Feature {
     /// Upstream gate `StorageVersionMigrator` (1.35 Beta, still off; `pkg/features/kube_features.go:1829-1832`).
     StorageVersionMigrator,
 
+    /// Upstream gate `KubeletCrashLoopBackOffMax` (1.32 Alpha off, 1.35 Beta on; `pkg/features/kube_features.go:1429-1432`).
+    KubeletCrashLoopBackOffMax,
+
+    /// Upstream gate `ReduceDefaultCrashLoopBackOffDecay` (1.33 Alpha, off; `pkg/features/kube_features.go:1692-1694`).
+    ReduceDefaultCrashLoopBackOffDecay,
+
     /// Upstream gate `MutableCSINodeAllocatableCount` (1.35 Beta, on; `pkg/features/kube_features.go:1537-1541`).
     /// Gates the kubelet's `csiNodeUpdater` (`pkg/volume/csi/csi_plugin.go:417`).
     MutableCSINodeAllocatableCount,
@@ -210,7 +216,9 @@ impl Feature {
             Feature::StorageVersionAPI => 29,
             Feature::APIServerIdentity => 30,
             Feature::StorageVersionMigrator => 31,
-            Feature::MutableCSINodeAllocatableCount => 32,
+            Feature::KubeletCrashLoopBackOffMax => 32,
+            Feature::ReduceDefaultCrashLoopBackOffDecay => 33,
+            Feature::MutableCSINodeAllocatableCount => 34,
         }
     }
 
@@ -281,6 +289,8 @@ impl Feature {
             Feature::APIServerIdentity => true,
             // 1.35 Beta, still off (pkg/features/kube_features.go:1829-1832)
             Feature::StorageVersionMigrator => false,
+            Feature::KubeletCrashLoopBackOffMax => true,
+            Feature::ReduceDefaultCrashLoopBackOffDecay => false,
             // 1.35 Beta, on (pkg/features/kube_features.go:1537-1541)
             Feature::MutableCSINodeAllocatableCount => true,
         }
@@ -331,6 +341,8 @@ pub const ALL_FEATURES: &[Feature] = &[
     Feature::StorageVersionAPI,
     Feature::APIServerIdentity,
     Feature::StorageVersionMigrator,
+    Feature::KubeletCrashLoopBackOffMax,
+    Feature::ReduceDefaultCrashLoopBackOffDecay,
     Feature::MutableCSINodeAllocatableCount,
 ];
 
@@ -378,6 +390,8 @@ static STATES: [AtomicBool; NUM_FEATURES] = [
     AtomicBool::new(Feature::StorageVersionAPI.default_enabled()),
     AtomicBool::new(Feature::APIServerIdentity.default_enabled()),
     AtomicBool::new(Feature::StorageVersionMigrator.default_enabled()),
+    AtomicBool::new(Feature::KubeletCrashLoopBackOffMax.default_enabled()),
+    AtomicBool::new(Feature::ReduceDefaultCrashLoopBackOffDecay.default_enabled()),
     AtomicBool::new(Feature::MutableCSINodeAllocatableCount.default_enabled()),
 ];
 

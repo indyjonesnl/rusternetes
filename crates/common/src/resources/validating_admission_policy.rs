@@ -168,6 +168,11 @@ pub enum OperationType {
     Connect,
     #[serde(rename = "*")]
     All,
+    /// A value outside the supported set. Upstream's field is a plain Go
+    /// `string`, so any string decodes and validation answers `Unsupported
+    /// value` (422), not a 400 decode failure (#2475).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 /// MatchPolicyType describes how the policy matches resources
@@ -177,6 +182,11 @@ pub enum MatchPolicyType {
     Exact,
     /// Equivalent means that matches are considered if they are equivalent
     Equivalent,
+    /// A value outside the supported set. Upstream's field is a plain Go
+    /// `string`, so any string decodes and validation answers `Unsupported
+    /// value` (422), not a 400 decode failure (#2475).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 /// Validation describes a validation rule written in CEL
@@ -223,6 +233,12 @@ pub enum StatusReason {
     TooManyRequests,
     InternalError,
     ServiceUnavailable,
+    RequestEntityTooLarge,
+    /// A value outside the supported set. Upstream's field is a plain Go
+    /// `string`, so any string decodes and validation answers `Unsupported
+    /// value` (422), not a 400 decode failure (#2475).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 /// ValidationAction specifies the action to take when validation fails
@@ -234,6 +250,11 @@ pub enum ValidationAction {
     Warn,
     /// Audit records a violation in audit logs but allows the request
     Audit,
+    /// A value outside the supported set. Upstream's field is a plain Go
+    /// `string`, so any string decodes and validation answers `Unsupported
+    /// value` (422), not a 400 decode failure (#2475).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 /// FailurePolicy defines how unrecognized errors from the policy are handled
@@ -243,6 +264,11 @@ pub enum FailurePolicy {
     Ignore,
     /// Fail means the API request is rejected
     Fail,
+    /// A value outside the supported set. Upstream's field is a plain Go
+    /// `string`, so any string decodes and validation answers `Unsupported
+    /// value` (422), not a 400 decode failure (#2475).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 /// AuditAnnotation describes an audit annotation
@@ -429,6 +455,11 @@ pub enum ParameterNotFoundAction {
     Allow,
     /// Deny causes the validation to fail when the parameter is not found
     Deny,
+    /// A value outside the supported set. Upstream's field is a plain Go
+    /// `string`, so any string decodes and validation answers `Unsupported
+    /// value` (422), not a 400 decode failure (#2475).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 #[cfg(test)]

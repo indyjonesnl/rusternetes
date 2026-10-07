@@ -9,7 +9,7 @@
 //! before the request proceeds — the quota controller corrects it later if
 //! the write never happens. Upstream batches the requests of one namespace
 //! on a work queue so they are checked one at a time; here the
-//! per-namespace lock the pod handler already takes
+//! per-namespace lock in [`evaluate`]
 //! ([`crate::admission::lock_namespace_quota`]) serialises them, and the
 //! optimistic status update is the cross-api-server guard, as upstream's is.
 //!

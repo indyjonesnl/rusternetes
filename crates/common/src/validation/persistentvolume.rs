@@ -15,10 +15,10 @@
 
 use crate::quantity::Quantity;
 use crate::resources::volume::{
-    CSIVolumeSource, HostPathVolumeSource, ISCSIVolumeSource, LocalVolumeSource, NodeSelector,
-    NodeSelectorRequirement, NodeSelectorTerm, PersistentVolume, PersistentVolumeAccessMode,
-    PersistentVolumeMode, PersistentVolumeReclaimPolicy, PersistentVolumeSpec, SecretReference,
-    VolumeNodeAffinity,
+    CSIVolumeSource, HostPathType, HostPathVolumeSource, ISCSIVolumeSource, LocalVolumeSource,
+    NodeSelector, NodeSelectorRequirement, NodeSelectorTerm, PersistentVolume,
+    PersistentVolumeAccessMode, PersistentVolumeMode, PersistentVolumeReclaimPolicy,
+    PersistentVolumeSpec, SecretReference, VolumeNodeAffinity,
 };
 use crate::validation::csinode::validate_csi_driver_name;
 use crate::validation::field::{Error, ErrorList, Path};
@@ -91,6 +91,14 @@ fn validate_path_no_backsteps(target_path: &str, fld_path: &Path) -> ErrorList {
     Vec::new()
 }
 
+/// `supportedAccessModes` (validation.go:1936-1940) as `sets.List` sorts it.
+pub(crate) const SUPPORTED_ACCESS_MODES: &[&str] = &[
+    "ReadOnlyMany",
+    "ReadWriteMany",
+    "ReadWriteOnce",
+    "ReadWriteOncePod",
+];
+
 /// Port of upstream `validateHostPathVolumeSource`
 /// (`pkg/apis/core/validation/validation.go:816-826`). The `type` enum is a
 /// closed Rust enum, so upstream's `validateHostPathType` membership check is
@@ -99,7 +107,26 @@ fn validate_host_path_volume_source(hp: &HostPathVolumeSource, fld_path: &Path) 
     if hp.path.is_empty() {
         return vec![Error::required(&fld_path.child("path"), "")];
     }
-    validate_path_no_backsteps(&hp.path, &fld_path.child("path"))
+    let mut errs = validate_path_no_backsteps(&hp.path, &fld_path.child("path"));
+    // validation.go:824 `validateHostPathType` (:1395). `supportedHostPathTypes`
+    // lists `HostPathUnset` (""), and `sets.List` sorts.
+    if let Some(HostPathType::Unknown(v)) = &hp.r#type {
+        errs.push(Error::not_supported(
+            &fld_path.child("type"),
+            v.clone(),
+            &[
+                "",
+                "BlockDevice",
+                "CharDevice",
+                "Directory",
+                "DirectoryOrCreate",
+                "File",
+                "FileOrCreate",
+                "Socket",
+            ],
+        ));
+    }
+    errs
 }
 
 /// Port of upstream `validateLocalVolumeSource`
@@ -380,14 +407,27 @@ pub fn validate_persistent_volume_spec(
             "at least 1 access mode is required",
         ));
     }
+    // validation.go:1985-1996: an unsupported mode is NotSupported and is not
+    // counted as "another" mode next to ReadWriteOncePod.
+    for mode in &spec.access_modes {
+        if let PersistentVolumeAccessMode::Unknown(v) = mode {
+            errs.push(Error::not_supported(
+                &fld_path.child("accessModes"),
+                v.clone(),
+                SUPPORTED_ACCESS_MODES,
+            ));
+        }
+    }
     let has_rwop = spec
         .access_modes
         .iter()
         .any(|m| matches!(m, PersistentVolumeAccessMode::ReadWriteOncePod));
-    let has_other = spec
-        .access_modes
-        .iter()
-        .any(|m| !matches!(m, PersistentVolumeAccessMode::ReadWriteOncePod));
+    let has_other = spec.access_modes.iter().any(|m| {
+        !matches!(
+            m,
+            PersistentVolumeAccessMode::ReadWriteOncePod | PersistentVolumeAccessMode::Unknown(_)
+        )
+    });
     if has_rwop && has_other {
         errs.push(Error::forbidden(
             &fld_path.child("accessModes"),
@@ -471,6 +511,26 @@ pub fn validate_persistent_volume_spec(
     // validation.go:~2018). Standalone PVs accept the full supported set
     // (enum validation handled elsewhere); the hostPath '/' Recycle case above
     // is independent.
+    if !inline {
+        // validation.go:2021-2023 (`supportedReclaimPolicy`, sorted).
+        if let Some(PersistentVolumeReclaimPolicy::Unknown(v)) =
+            &spec.persistent_volume_reclaim_policy
+        {
+            errs.push(Error::not_supported(
+                &fld_path.child("persistentVolumeReclaimPolicy"),
+                v.clone(),
+                &["Delete", "Recycle", "Retain"],
+            ));
+        }
+        // validation.go:2242-2244 (`supportedVolumeModes`, sorted).
+        if let Some(PersistentVolumeMode::Unknown(v)) = &spec.volume_mode {
+            errs.push(Error::not_supported(
+                &fld_path.child("volumeMode"),
+                v.clone(),
+                &["Block", "Filesystem"],
+            ));
+        }
+    }
     if inline {
         if let Some(policy) = &spec.persistent_volume_reclaim_policy {
             if *policy != PersistentVolumeReclaimPolicy::Retain {

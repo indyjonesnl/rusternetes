@@ -31,6 +31,12 @@ pub struct AuditEvent {
     pub verb: String,
     /// Authenticated user information
     pub user: UserInfo,
+    /// `Event.UserAgent`: the client's User-Agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
+    /// `Event.SourceIPs`: the client's addresses, origin first.
+    #[serde(default, rename = "sourceIPs", skip_serializing_if = "Vec::is_empty")]
+    pub source_ips: Vec<String>,
     /// Resource being accessed
     #[serde(skip_serializing_if = "Option::is_none")]
     pub object_ref: Option<ObjectReference>,
@@ -93,6 +99,10 @@ pub struct UserInfo {
 pub struct ObjectReference {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subresource: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_group: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -342,6 +352,8 @@ impl AuditLogger {
             request_uri,
             verb,
             user,
+            user_agent: None,
+            source_ips: Vec::new(),
             object_ref,
             response_status: None,
             request_received_timestamp: now,
@@ -383,6 +395,8 @@ impl AuditLogger {
             request_uri,
             verb,
             user,
+            user_agent: None,
+            source_ips: Vec::new(),
             object_ref,
             response_status: Some(ResponseStatus {
                 code: status_code,
@@ -440,6 +454,8 @@ mod tests {
                 groups: vec!["system:authenticated".to_string()],
                 extra: None,
             },
+            user_agent: None,
+            source_ips: Vec::new(),
             object_ref: None,
             response_status: None,
             request_received_timestamp: Utc::now(),
@@ -474,6 +490,8 @@ mod tests {
                 groups: vec!["system:masters".to_string()],
                 extra: None,
             },
+            user_agent: None,
+            source_ips: Vec::new(),
             object_ref: None,
             response_status: None,
             request_received_timestamp: Utc::now(),
@@ -519,8 +537,12 @@ mod tests {
                 groups: vec!["developers".to_string()],
                 extra: None,
             },
+            user_agent: None,
+            source_ips: Vec::new(),
             object_ref: Some(ObjectReference {
                 resource: Some("pods".to_string()),
+                subresource: None,
+                api_group: None,
                 namespace: Some("default".to_string()),
                 name: Some("test-pod".to_string()),
                 uid: Some("pod-123".to_string()),

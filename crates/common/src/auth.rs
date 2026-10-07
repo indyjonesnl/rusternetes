@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use crate::sa_keys::VerificationKey;
 use base64::Engine;
 use chrono::{Duration, Utc};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
@@ -9,18 +10,21 @@ use std::collections::HashMap;
 /// Nested kubernetes.io claim in JWT tokens (matches K8s pkg/serviceaccount/claims.go)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KubernetesClaims {
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub namespace: String,
-    #[serde(rename = "serviceaccount")]
+    #[serde(rename = "serviceaccount", default)]
     pub svcacct: KubeRef,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod: Option<KubeRef>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<KubeRef>,
+    /// Bound Secret (`pkg/serviceaccount/claims.go` `privateClaims.Kubernetes.Secret`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<KubeRef>,
 }
 
 /// Name+UID reference used in kubernetes.io JWT claims
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct KubeRef {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
@@ -35,24 +39,33 @@ pub struct KubeRef {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceAccountClaims {
     /// Subject (service account name)
+    #[serde(default)]
     pub sub: String,
 
-    /// Namespace (kept for backward compat with our auth middleware)
+    /// Namespace (kept for backward compat with our auth middleware).
+    /// Tokens minted by an upstream kube-apiserver carry it only inside the
+    /// nested `kubernetes.io` claim; `TokenManager` fills it from there.
+    #[serde(default)]
     pub namespace: String,
 
-    /// Service account UID (kept for backward compat)
+    /// Service account UID (kept for backward compat); see `namespace`.
+    #[serde(default)]
     pub uid: String,
 
     /// Issued at timestamp
+    #[serde(default)]
     pub iat: i64,
 
     /// Expiration timestamp
     pub exp: i64,
 
     /// Issuer
+    #[serde(default)]
     pub iss: String,
 
-    /// Audience
+    /// Audience. go-jose marshals a single audience as a bare string, so an
+    /// upstream-issued token may carry `"aud": "x"` as well as `["x"]`.
+    #[serde(default, deserialize_with = "deserialize_audience")]
     pub aud: Vec<String>,
 
     /// Nested kubernetes.io claims (matches K8s JWT structure)
@@ -74,6 +87,23 @@ pub struct ServiceAccountClaims {
     /// Node UID where the bound pod is running
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_uid: Option<String>,
+}
+
+fn deserialize_audience<'de, D>(d: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match Option::<OneOrMany>::deserialize(d)? {
+        None => Vec::new(),
+        Some(OneOrMany::One(s)) => vec![s],
+        Some(OneOrMany::Many(v)) => v,
+    })
 }
 
 impl ServiceAccountClaims {
@@ -100,6 +130,7 @@ impl ServiceAccountClaims {
                 svcacct: KubeRef { name: sa_name, uid },
                 pod: None,
                 node: None,
+                secret: None,
             }),
             pod_name: None,
             pod_uid: None,
@@ -109,6 +140,101 @@ impl ServiceAccountClaims {
     }
 }
 
+/// Options for the four upstream service-account flags
+/// (`--service-account-key-file`, `--service-account-signing-key-file`,
+/// `--service-account-issuer`, `--api-audiences`).
+///
+/// Ported from `pkg/kubeapiserver/options/authentication.go`
+/// (`ServiceAccountAuthenticationOptions`, `Validate`, `ToAuthenticationConfig`)
+/// and `pkg/controlplane/apiserver/options/validation.go` (`validateTokenRequest`).
+#[derive(Debug, Clone, Default)]
+pub struct ServiceAccountOptions {
+    /// `--service-account-key-file` (repeatable): PEM files whose RSA/ECDSA
+    /// private or public keys verify tokens.
+    pub key_files: Vec<String>,
+    /// `--service-account-signing-key-file`: private key tokens are signed with.
+    pub signing_key_file: Option<String>,
+    /// `--service-account-issuer` (repeatable): the first is asserted in the
+    /// `iss` of issued tokens, all are accepted.
+    pub issuers: Vec<String>,
+    /// `--api-audiences`. Defaults to the issuers when unset.
+    pub api_audiences: Vec<String>,
+}
+
+impl ServiceAccountOptions {
+    /// True when none of the four flags was given: the legacy
+    /// (`--jwt-secret` / auto-discovered key) behaviour applies.
+    pub fn is_empty(&self) -> bool {
+        self.key_files.is_empty()
+            && self.signing_key_file.is_none()
+            && self.issuers.is_empty()
+            && self.api_audiences.is_empty()
+    }
+
+    /// Port of `validateTokenRequest` (validation.go:34-52) and
+    /// `BuiltInAuthenticationOptions.Validate` (authentication.go:258-288).
+    pub fn validate(&self) -> Result<()> {
+        if self.is_empty() {
+            return Ok(());
+        }
+        let mut errs: Vec<String> = Vec::new();
+
+        // validation.go:38-49
+        let enable_attempted = self.signing_key_file.is_some()
+            || self.issuers.first().is_some_and(|i| !i.is_empty())
+            || !self.api_audiences.is_empty();
+        let enable_succeeded = self.signing_key_file.is_some() && !self.issuers.is_empty();
+        if enable_attempted && !enable_succeeded {
+            errs.push(
+                "--service-account-signing-key-file, --service-account-issuer, and --api-audiences should be specified together"
+                    .to_string(),
+            );
+        }
+
+        // authentication.go:258-277
+        let mut seen = std::collections::HashSet::new();
+        for issuer in &self.issuers {
+            if issuer.contains(':') {
+                if let Err(e) = url::Url::parse(issuer) {
+                    errs.push(format!(
+                        "service-account-issuer {issuer:?} contained a ':' but was not a valid URL: {e}"
+                    ));
+                    continue;
+                }
+            }
+            if issuer.is_empty() {
+                errs.push("service-account-issuer should not be an empty string".to_string());
+                continue;
+            }
+            if !seen.insert(issuer.clone()) {
+                errs.push(format!(
+                    "service-account-issuer {issuer:?} is already specified"
+                ));
+            }
+        }
+
+        // authentication.go:279-287 (the signing-endpoint alternative is not supported)
+        if self.issuers.is_empty() {
+            errs.push("service-account-issuer is a required flag".to_string());
+        }
+        if self.key_files.is_empty() {
+            errs.push("--service-account-key-file must be set".to_string());
+        }
+
+        if errs.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::InvalidResource(errs.join("; ")))
+        }
+    }
+}
+
+/// The issuers accepted when `--service-account-issuer` is not given.
+const DEFAULT_ISSUERS: [&str; 2] = [
+    "https://kubernetes.default.svc.cluster.local",
+    "rusternetes-api-server",
+];
+
 /// TokenManager handles JWT token generation and validation
 #[derive(Clone)]
 pub struct TokenManager {
@@ -116,6 +242,20 @@ pub struct TokenManager {
     decoding_key: DecodingKey,
     /// Whether we're using RS256 (true) or HS256 (false) signing
     use_rsa: bool,
+    /// Algorithm tokens are signed with.
+    signing_algorithm: Algorithm,
+    /// `kid` header of issued tokens (`keyIDFromPublicKey`), when signing with
+    /// an asymmetric key.
+    signing_key_id: Option<String>,
+    /// Static public keys tokens are verified with
+    /// (`serviceaccount.StaticPublicKeysGetter`). `None` = verify with the
+    /// signing key only (legacy behaviour).
+    verification_keys: Option<std::sync::Arc<Vec<VerificationKey>>>,
+    /// `--service-account-issuer`; empty = `DEFAULT_ISSUERS`.
+    issuers: Vec<String>,
+    /// `--api-audiences` (the authenticator's `implicitAuds`); empty = no
+    /// audience enforcement.
+    api_audiences: Vec<String>,
 }
 
 impl TokenManager {
@@ -125,6 +265,11 @@ impl TokenManager {
             encoding_key: EncodingKey::from_secret(secret),
             decoding_key: DecodingKey::from_secret(secret),
             use_rsa: false,
+            signing_algorithm: Algorithm::HS256,
+            signing_key_id: None,
+            verification_keys: None,
+            issuers: Vec::new(),
+            api_audiences: Vec::new(),
         }
     }
 
@@ -140,7 +285,82 @@ impl TokenManager {
             encoding_key,
             decoding_key,
             use_rsa: true,
+            signing_algorithm: Algorithm::RS256,
+            signing_key_id: None,
+            verification_keys: None,
+            issuers: Vec::new(),
+            api_audiences: Vec::new(),
         })
+    }
+
+    /// Apply the four upstream service-account flags on top of this manager.
+    ///
+    /// Port of `ToAuthenticationConfig` (authentication.go:616-645): key files
+    /// become a static public-key getter, issuers and API audiences configure
+    /// the authenticator, and the signing key replaces the signer.
+    pub fn with_service_account_options(mut self, opts: &ServiceAccountOptions) -> Result<Self> {
+        if opts.is_empty() {
+            return Ok(self);
+        }
+        opts.validate()?;
+
+        let mut keys: Vec<VerificationKey> = Vec::new();
+        for f in &opts.key_files {
+            keys.extend(crate::sa_keys::public_keys_from_file(f)?);
+        }
+        self.verification_keys = Some(std::sync::Arc::new(keys));
+
+        if let Some(path) = &opts.signing_key_file {
+            let data = std::fs::read(path).map_err(|e| {
+                Error::Internal(format!(
+                    "failed to read service account signing key {path}: {e}"
+                ))
+            })?;
+            let signing = crate::sa_keys::signing_key_from_pem(&data).map_err(|e| {
+                Error::Internal(format!(
+                    "failed to parse service account signing key {path}: {e}"
+                ))
+            })?;
+            self.encoding_key = signing.encoding_key;
+            self.signing_algorithm = signing.algorithm;
+            self.signing_key_id = Some(signing.key_id);
+            self.use_rsa = true;
+        }
+
+        self.issuers = opts.issuers.clone();
+        // authentication.go:618-620
+        self.api_audiences = if opts.api_audiences.is_empty() {
+            opts.issuers.clone()
+        } else {
+            opts.api_audiences.clone()
+        };
+        Ok(self)
+    }
+
+    /// The issuer asserted in issued tokens, when configured.
+    pub fn issuer(&self) -> Option<&str> {
+        self.issuers.first().map(String::as_str)
+    }
+
+    /// `--api-audiences` (defaulted to the issuers). Empty when unconfigured.
+    pub fn api_audiences(&self) -> &[String] {
+        &self.api_audiences
+    }
+
+    fn accepts_issuer(&self, iss: &str) -> bool {
+        if self.issuers.is_empty() {
+            DEFAULT_ISSUERS.contains(&iss)
+        } else {
+            self.issuers.iter().any(|i| i == iss)
+        }
+    }
+
+    fn accepted_issuers(&self) -> Vec<&str> {
+        if self.issuers.is_empty() {
+            DEFAULT_ISSUERS.to_vec()
+        } else {
+            self.issuers.iter().map(String::as_str).collect()
+        }
     }
 
     /// Create a TokenManager, trying RSA keys first, falling back to HMAC secret
@@ -180,47 +400,26 @@ impl TokenManager {
     }
 
     /// Generate a JWT token for a service account
-    pub fn generate_token(&self, claims: ServiceAccountClaims) -> Result<String> {
-        let header = if self.use_rsa {
-            Header::new(Algorithm::RS256)
+    pub fn generate_token(&self, mut claims: ServiceAccountClaims) -> Result<String> {
+        let mut header = if self.use_rsa {
+            Header::new(self.signing_algorithm)
         } else {
             Header::default() // HS256
         };
+        header.kid = self.signing_key_id.clone();
+        // `GenerateToken` (jwt.go:442-451): the configured issuer is applied
+        // last and wins over anything in the claims.
+        if let Some(iss) = self.issuer() {
+            claims.iss = iss.to_string();
+        }
         encode(&header, &claims, &self.encoding_key)
             .map_err(|e| Error::Internal(format!("Failed to generate token: {}", e)))
     }
 
-    /// Validate and decode a JWT token
+    /// Validate and decode a JWT token against the API server's own
+    /// audiences (see `authenticate_token`).
     pub fn validate_token(&self, token: &str) -> Result<ServiceAccountClaims> {
-        // First try with standard audience
-        let algo = if self.use_rsa {
-            Algorithm::RS256
-        } else {
-            Algorithm::HS256
-        };
-        let mut validation = Validation::new(algo);
-        validation.set_audience(&["rusternetes"]);
-        validation.set_issuer(&[
-            "https://kubernetes.default.svc.cluster.local",
-            "rusternetes-api-server",
-        ]);
-
-        if let Ok(data) = decode::<ServiceAccountClaims>(token, &self.decoding_key, &validation) {
-            return Ok(data.claims);
-        }
-
-        // Retry without audience validation — tokens created via TokenRequest API
-        // may have custom audiences (e.g. "https://kubernetes.default.svc", "api", etc.)
-        let mut validation_relaxed = Validation::new(algo);
-        validation_relaxed.set_issuer(&[
-            "https://kubernetes.default.svc.cluster.local",
-            "rusternetes-api-server",
-        ]);
-        validation_relaxed.validate_aud = false;
-
-        decode::<ServiceAccountClaims>(token, &self.decoding_key, &validation_relaxed)
-            .map(|data| data.claims)
-            .map_err(|e| Error::Authentication(format!("Invalid token: {}", e)))
+        self.authenticate_token(token, None).map(|(c, _)| c)
     }
 
     /// Validate and decode a JWT token against specific audiences
@@ -240,14 +439,164 @@ impl TokenManager {
         } else {
             validation.validate_aud = false;
         }
-        validation.set_issuer(&[
-            "https://kubernetes.default.svc.cluster.local",
-            "rusternetes-api-server",
-        ]);
+        validation.set_issuer(&self.accepted_issuers());
 
         decode::<ServiceAccountClaims>(token, &self.decoding_key, &validation)
             .map(|data| data.claims)
             .map_err(|e| Error::Authentication(format!("Invalid token: {}", e)))
+    }
+
+    /// Port of `jwtTokenAuthenticator.AuthenticateToken`
+    /// (`pkg/serviceaccount/jwt.go:334-411`): pre-check the (unverified)
+    /// issuer, verify the signature against the key selected by `kid` (or every
+    /// key when there is none), sanity-check the issuer again, then apply the
+    /// audience rules. `requested_audiences` is the audience set the caller
+    /// wants the token valid for (`authenticator.AudiencesFrom(ctx)`, e.g. a
+    /// TokenReview's `spec.audiences`); `None` means the API server's own.
+    ///
+    /// Without `--api-audiences` the token's audience is not enforced (the
+    /// authenticator's `implicitAuds` is empty, so the check at jwt.go:397 is
+    /// skipped).
+    ///
+    /// Returns the claims and the matched audiences.
+    pub fn authenticate_token(
+        &self,
+        token: &str,
+        requested_audiences: Option<&[String]>,
+    ) -> Result<(ServiceAccountClaims, Vec<String>)> {
+        let invalid = |m: String| Error::Authentication(format!("Invalid token: {m}"));
+
+        // hasCorrectIssuer (jwt.go:420-440)
+        if token.trim_start().starts_with('{') {
+            return Err(invalid("not a compact JWT".to_string()));
+        }
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() != 3 {
+            return Err(invalid("not a compact JWT".to_string()));
+        }
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(parts[1])
+            .map_err(|_| invalid("malformed payload".to_string()))?;
+        #[derive(Deserialize)]
+        struct IssOnly {
+            #[serde(default)]
+            iss: String,
+        }
+        let unverified: IssOnly = serde_json::from_slice(&payload)
+            .map_err(|_| invalid("malformed payload".to_string()))?;
+        if !self.accepts_issuer(&unverified.iss) {
+            return Err(invalid(format!(
+                "token issuer {:?} is invalid",
+                unverified.iss
+            )));
+        }
+
+        let header = jsonwebtoken::decode_header(token).map_err(|e| invalid(e.to_string()))?;
+        let kid = header.kid.clone().unwrap_or_default();
+
+        // Candidate (key, algorithms) pairs: `GetPublicKeys(ctx, kid)`.
+        let legacy_algs: Vec<Algorithm> = vec![if self.use_rsa {
+            Algorithm::RS256
+        } else {
+            Algorithm::HS256
+        }];
+        let candidates: Vec<(&DecodingKey, &[Algorithm])> = match &self.verification_keys {
+            Some(keys) => keys
+                .iter()
+                .filter(|k| kid.is_empty() || k.key_id == kid)
+                .map(|k| (&k.decoding_key, k.algorithms.as_slice()))
+                .collect(),
+            None => vec![(&self.decoding_key, legacy_algs.as_slice())],
+        };
+        if candidates.is_empty() {
+            return Err(invalid("invalid signature, no keys found".to_string()));
+        }
+
+        let issuers = self.accepted_issuers();
+        let mut errors: Vec<String> = Vec::new();
+        let mut decoded: Option<ServiceAccountClaims> = None;
+        for (key, algs) in candidates {
+            if !algs.contains(&header.alg) {
+                errors.push(format!("unexpected signature algorithm {:?}", header.alg));
+                continue;
+            }
+            let mut validation = Validation::new(header.alg);
+            validation.algorithms = algs.to_vec();
+            // Audiences are matched below (jwt.go:382-402); `validator.Validate`
+            // enforces expiry / not-before with `jwt.DefaultLeeway` (1 minute).
+            validation.validate_aud = false;
+            validation.validate_nbf = true;
+            validation.leeway = 60;
+            validation.set_issuer(&issuers);
+            match decode::<ServiceAccountClaims>(token, key, &validation) {
+                Ok(data) => {
+                    decoded = Some(data.claims);
+                    break;
+                }
+                Err(e) => errors.push(e.to_string()),
+            }
+        }
+        let mut claims = decoded.ok_or_else(|| invalid(errors.join("; ")))?;
+
+        // An upstream token carries namespace / SA uid only in `kubernetes.io`.
+        if let Some(k) = &claims.kubernetes {
+            if claims.namespace.is_empty() {
+                claims.namespace = k.namespace.clone();
+            }
+            if claims.uid.is_empty() {
+                claims.uid = k.svcacct.uid.clone();
+            }
+            if claims.sub.is_empty() && !k.namespace.is_empty() && !k.svcacct.name.is_empty() {
+                claims.sub = format!("system:serviceaccount:{}:{}", k.namespace, k.svcacct.name);
+            }
+            // Surface the bound pod / node in the flat fields `UserInfo` reads.
+            if let Some(p) = &k.pod {
+                if claims.pod_name.is_none() {
+                    claims.pod_name = Some(p.name.clone());
+                }
+                if claims.pod_uid.is_none() {
+                    claims.pod_uid = Some(p.uid.clone());
+                }
+            }
+            if let Some(n) = &k.node {
+                if claims.node_name.is_none() && !n.name.is_empty() {
+                    claims.node_name = Some(n.name.clone());
+                }
+                if claims.node_uid.is_none() && !n.uid.is_empty() {
+                    claims.node_uid = Some(n.uid.clone());
+                }
+            }
+        }
+
+        // iat in the future (`jwt.ErrIssuedInTheFuture`, claims.go:159).
+        if claims.iat > Utc::now().timestamp() + 60 {
+            return Err(invalid(
+                "service account token is issued in the future".to_string(),
+            ));
+        }
+
+        // Audience rules (jwt.go:382-402).
+        let implicit = &self.api_audiences;
+        let mut token_auds: Vec<String> = claims.aud.clone();
+        if token_auds.is_empty() {
+            // legacy token without an audience: only API server audiences
+            token_auds = implicit.clone();
+        }
+        let requested: Vec<String> = match requested_audiences {
+            Some(r) if !r.is_empty() => r.to_vec(),
+            _ => implicit.clone(),
+        };
+        let matched: Vec<String> = token_auds
+            .iter()
+            .filter(|a| requested.contains(a))
+            .cloned()
+            .collect();
+        if matched.is_empty() && !implicit.is_empty() {
+            return Err(Error::Authentication(format!(
+                "Invalid token: token audiences {token_auds:?} is invalid for the target audiences {requested:?}"
+            )));
+        }
+        Ok((claims, matched))
     }
 }
 
