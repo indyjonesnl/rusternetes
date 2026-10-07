@@ -1,4 +1,5 @@
 pub mod certificates;
+pub mod pod_security_api;
 pub mod resourcequota;
 pub mod storage_object_in_use_protection;
 
@@ -11,7 +12,7 @@ use rusternetes_common::{
     types::ResourceRequirements,
 };
 use rusternetes_storage::Storage;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -1259,6 +1260,7 @@ impl PodSecurityAdmission {
     /// Upstream parity:
     /// `staging/src/k8s.io/pod-security-admission/policy/` (release-1.35).
     /// `username` is the requester, so a user exemption can apply.
+    #[allow(dead_code)]
     pub async fn admit_as<S: Storage>(
         &self,
         storage: &Arc<S>,
@@ -1266,158 +1268,247 @@ impl PodSecurityAdmission {
         pod: &Pod,
         username: &str,
     ) -> Result<(), rusternetes_common::Error> {
+        self.admit_outcome(storage, namespace, pod, username)
+            .await
+            .map(|_| ())
+    }
+
+    /// `Admission.ValidatePod` + `EvaluatePod` for an admitted-or-denied
+    /// pod (admission.go:329-389, :455-528): the enforce / audit / warn
+    /// policy comes from the namespace labels (`PolicyToEvaluate`). Enforce
+    /// denies; audit adds the `audit-violations` annotation; warn adds a
+    /// warning, but only to a request that is not already denied.
+    ///
+    /// The checks themselves are version-agnostic (they behave as `latest`),
+    /// so a `-version` label is parsed and reported but selects no older
+    /// check set (tracked in #2418's follow-ups).
+    pub async fn admit_outcome<S: Storage>(
+        &self,
+        storage: &Arc<S>,
+        namespace: &str,
+        pod: &Pod,
+        username: &str,
+    ) -> Result<PodSecurityOutcome, rusternetes_common::Error> {
+        let exempt = |reason: &str| PodSecurityOutcome {
+            warnings: Vec::new(),
+            audit_annotations: BTreeMap::from([("exempt".to_string(), reason.to_string())]),
+        };
         // ValidatePod short-circuits on exempt namespaces, then users
         // (admission.go:334-343); EvaluatePod on exempt runtime classes
         // (admission.go:457-461).
-        if self.exemptions.exempt_namespace(namespace)
-            || self.exemptions.exempt_user(username)
-            || self.exemptions.exempt_runtime_class(
-                pod.spec
-                    .as_ref()
-                    .and_then(|s| s.runtime_class_name.as_deref()),
-            )
-        {
-            return Ok(());
+        if self.exemptions.exempt_namespace(namespace) {
+            return Ok(exempt("namespace"));
+        }
+        if self.exemptions.exempt_user(username) {
+            return Ok(exempt("user"));
         }
         let ns_key = rusternetes_storage::build_key("namespaces", None, namespace);
-        let level = match storage
+        let labels = match storage
             .get::<rusternetes_common::resources::Namespace>(&ns_key)
             .await
         {
-            Ok(ns) => ns
-                .metadata
-                .labels
-                .as_ref()
-                .and_then(|l| l.get("pod-security.kubernetes.io/enforce"))
-                .cloned()
-                .unwrap_or_else(|| "privileged".to_string()),
+            Ok(ns) => ns.metadata.labels,
             // If the namespace can't be read, fall back to allow-all rather
-            // than blocking pod creation on a storage hiccup.
-            Err(_) => "privileged".to_string(),
+            // than blocking pod creation on a storage hiccup (upstream
+            // answers an InternalError, admission.go:344-350).
+            Err(_) => None,
         };
-
-        let (baseline, restricted) = match level.as_str() {
-            "restricted" => (true, true),
-            "baseline" => (true, false),
-            // "privileged" or any unknown level: admit everything.
-            _ => (false, false),
-        };
-
-        if !baseline {
-            return Ok(());
+        let (policy, policy_errs) = pod_security_api::policy_to_evaluate(
+            labels.as_ref(),
+            pod_security_api::Policy::PRIVILEGED,
+        );
+        // Short-circuit on privileged enforce+audit+warn namespaces
+        // (admission.go:353-357).
+        if policy_errs.is_empty() && policy.fully_privileged() {
+            return Ok(PodSecurityOutcome {
+                warnings: Vec::new(),
+                audit_annotations: BTreeMap::from([(
+                    "enforce-policy".to_string(),
+                    pod_security_api::LevelVersion::new(
+                        pod_security_api::Level::Privileged,
+                        pod_security_api::Version::LATEST,
+                    )
+                    .to_string(),
+                )]),
+            });
+        }
+        if self.exemptions.exempt_runtime_class(
+            pod.spec
+                .as_ref()
+                .and_then(|s| s.runtime_class_name.as_deref()),
+        ) {
+            return Ok(exempt("runtimeClass"));
         }
 
-        let Some(spec) = &pod.spec else {
-            return Ok(());
-        };
+        let mut annotations = BTreeMap::new();
+        if !policy_errs.is_empty() {
+            let joined = policy_errs
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            annotations.insert(
+                "error".to_string(),
+                format!("Failed to parse policy: [{joined}]"),
+            );
+        }
+        annotations.insert("enforce-policy".to_string(), policy.enforce.to_string());
+
         let pod_name = &pod.metadata.name;
+        // EvaluatePod caches by LevelVersion; the checks are a pure function
+        // of the level here, so evaluate each distinct level once.
+        let mut cache: HashMap<pod_security_api::LevelVersion, Option<String>> = HashMap::new();
+        let mut eval = |lv: pod_security_api::LevelVersion| {
+            cache
+                .entry(lv)
+                .or_insert_with(|| first_violation(lv.level, pod))
+                .clone()
+        };
 
-        // Iterator over every workload container (regular + init), so the
-        // checks apply uniformly.
-        let regular = spec.containers.iter();
-        let init = spec.init_containers.iter().flatten();
-        // `policy.VisitContainers` also visits ephemeral containers.
-        let ephemeral = spec
-            .ephemeral_containers
-            .iter()
-            .flatten()
-            .map(|c| (c.name.as_str(), c.security_context.as_ref()));
-        let all_security_contexts = regular
-            .chain(init)
-            .map(|c| (c.name.as_str(), c.security_context.as_ref()))
-            .chain(ephemeral);
-
-        // --- Baseline: privileged containers ---
-        for (name, sc) in all_security_contexts.clone() {
-            if let Some(sc) = sc {
-                if sc.privileged == Some(true) {
-                    return Err(rusternetes_common::Error::Forbidden(format!(
-                        "pod {pod_name} violates PodSecurity \"{level}\": privileged \
-                         (container \"{name}\" must not set securityContext.privileged=true)"
-                    )));
-                }
-            }
-        }
-
-        // --- Baseline: host namespaces ---
-        if spec.host_network == Some(true)
-            || spec.host_pid == Some(true)
-            || spec.host_ipc == Some(true)
-        {
+        if let Some(detail) = eval(policy.enforce) {
             return Err(rusternetes_common::Error::Forbidden(format!(
-                "pod {pod_name} violates PodSecurity \"{level}\": host namespaces \
-                 (hostNetwork, hostPID, and hostIPC must be unset or false)"
+                "pod {pod_name} violates PodSecurity \"{}\": {detail}",
+                policy.enforce
             )));
         }
-
-        // --- Baseline: hostPath volumes ---
-        if let Some(volumes) = &spec.volumes {
-            for v in volumes {
-                if v.host_path.is_some() {
-                    return Err(rusternetes_common::Error::Forbidden(format!(
-                        "pod {pod_name} violates PodSecurity \"{level}\": hostPath volumes \
-                         (volume \"{}\" uses a forbidden hostPath volume type)",
-                        v.name
-                    )));
-                }
-            }
+        if let Some(detail) = eval(policy.audit) {
+            annotations.insert(
+                "audit-violations".to_string(),
+                format!("would violate PodSecurity \"{}\": {detail}", policy.audit),
+            );
         }
-
-        if !restricted {
-            return Ok(());
+        let mut warnings = Vec::new();
+        if let Some(detail) = eval(policy.warn) {
+            warnings.push(format!(
+                "would violate PodSecurity \"{}\": {detail}",
+                policy.warn
+            ));
         }
-
-        let pod_sc = spec.security_context.as_ref();
-        let pod_run_as_non_root = pod_sc.and_then(|sc| sc.run_as_non_root);
-        let pod_run_as_user = pod_sc.and_then(|sc| sc.run_as_user);
-
-        // --- Restricted: runAsUser must not be 0 (root) ---
-        if pod_run_as_user == Some(0) {
-            return Err(rusternetes_common::Error::Forbidden(format!(
-                "pod {pod_name} violates PodSecurity \"{level}\": runAsUser=0 \
-                 (pod must not set securityContext.runAsUser=0)"
-            )));
-        }
-        for (name, sc) in all_security_contexts.clone() {
-            if let Some(sc) = sc {
-                if sc.run_as_user == Some(0) {
-                    return Err(rusternetes_common::Error::Forbidden(format!(
-                        "pod {pod_name} violates PodSecurity \"{level}\": runAsUser=0 \
-                         (container \"{name}\" must not set securityContext.runAsUser=0)"
-                    )));
-                }
-            }
-        }
-
-        // --- Restricted: runAsNonRoot must be true (silence is not consent) ---
-        // Satisfied if the pod-level securityContext sets runAsNonRoot=true,
-        // or every container sets it to true. A container with no explicit
-        // value falls back to the pod-level value.
-        if pod_run_as_non_root != Some(true) {
-            for (name, sc) in all_security_contexts.clone() {
-                let effective = sc.and_then(|sc| sc.run_as_non_root).or(pod_run_as_non_root);
-                if effective != Some(true) {
-                    return Err(rusternetes_common::Error::Forbidden(format!(
-                        "pod {pod_name} violates PodSecurity \"{level}\": runAsNonRoot != true \
-                         (pod or container \"{name}\" must set securityContext.runAsNonRoot=true)"
-                    )));
-                }
-            }
-        }
-
-        // --- Restricted: allowPrivilegeEscalation must be false ---
-        for (name, sc) in all_security_contexts {
-            let allowed = sc.and_then(|sc| sc.allow_privilege_escalation);
-            if allowed != Some(false) {
-                return Err(rusternetes_common::Error::Forbidden(format!(
-                    "pod {pod_name} violates PodSecurity \"{level}\": allowPrivilegeEscalation != false \
-                     (container \"{name}\" must set securityContext.allowPrivilegeEscalation=false)"
-                )));
-            }
-        }
-
-        Ok(())
+        Ok(PodSecurityOutcome {
+            warnings,
+            audit_annotations: annotations,
+        })
     }
+}
+
+/// What an admitted pod carries out of PodSecurity: the `Warn` mode's
+/// warnings (an `AdmissionResponse.Warnings`) and the audit annotations
+/// (`AdmissionResponse.AuditAnnotations`).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PodSecurityOutcome {
+    pub warnings: Vec<String>,
+    pub audit_annotations: BTreeMap<String, String>,
+}
+
+/// The first violation of the Pod Security Standard `level`, as the detail
+/// of upstream's `ForbiddenDetail`, or `None` if the pod complies.
+fn first_violation(level: pod_security_api::Level, pod: &Pod) -> Option<String> {
+    use pod_security_api::Level;
+    let (baseline, restricted) = match level {
+        Level::Restricted => (true, true),
+        Level::Baseline => (true, false),
+        Level::Privileged => (false, false),
+    };
+    if !baseline {
+        return None;
+    }
+    let spec = pod.spec.as_ref()?;
+
+    // Iterator over every workload container (regular + init), so the
+    // checks apply uniformly.
+    let regular = spec.containers.iter();
+    let init = spec.init_containers.iter().flatten();
+    // `policy.VisitContainers` also visits ephemeral containers.
+    let ephemeral = spec
+        .ephemeral_containers
+        .iter()
+        .flatten()
+        .map(|c| (c.name.as_str(), c.security_context.as_ref()));
+    let all_security_contexts = regular
+        .chain(init)
+        .map(|c| (c.name.as_str(), c.security_context.as_ref()))
+        .chain(ephemeral);
+
+    // --- Baseline: privileged containers ---
+    for (name, sc) in all_security_contexts.clone() {
+        if let Some(sc) = sc {
+            if sc.privileged == Some(true) {
+                return Some(format!(
+                    "privileged (container \"{name}\" must not set securityContext.privileged=true)"
+                ));
+            }
+        }
+    }
+
+    // --- Baseline: host namespaces ---
+    if spec.host_network == Some(true) || spec.host_pid == Some(true) || spec.host_ipc == Some(true)
+    {
+        return Some(
+            "host namespaces (hostNetwork, hostPID, and hostIPC must be unset or false)"
+                .to_string(),
+        );
+    }
+
+    // --- Baseline: hostPath volumes ---
+    if let Some(volumes) = &spec.volumes {
+        for v in volumes {
+            if v.host_path.is_some() {
+                return Some(format!(
+                    "hostPath volumes (volume \"{}\" uses a forbidden hostPath volume type)",
+                    v.name
+                ));
+            }
+        }
+    }
+
+    if !restricted {
+        return None;
+    }
+
+    let pod_sc = spec.security_context.as_ref();
+    let pod_run_as_non_root = pod_sc.and_then(|sc| sc.run_as_non_root);
+    let pod_run_as_user = pod_sc.and_then(|sc| sc.run_as_user);
+
+    // --- Restricted: runAsUser must not be 0 (root) ---
+    if pod_run_as_user == Some(0) {
+        return Some("runAsUser=0 (pod must not set securityContext.runAsUser=0)".to_string());
+    }
+    for (name, sc) in all_security_contexts.clone() {
+        if let Some(sc) = sc {
+            if sc.run_as_user == Some(0) {
+                return Some(format!(
+                    "runAsUser=0 (container \"{name}\" must not set securityContext.runAsUser=0)"
+                ));
+            }
+        }
+    }
+
+    // --- Restricted: runAsNonRoot must be true (silence is not consent) ---
+    // Satisfied if the pod-level securityContext sets runAsNonRoot=true,
+    // or every container sets it to true. A container with no explicit
+    // value falls back to the pod-level value.
+    if pod_run_as_non_root != Some(true) {
+        for (name, sc) in all_security_contexts.clone() {
+            let effective = sc.and_then(|sc| sc.run_as_non_root).or(pod_run_as_non_root);
+            if effective != Some(true) {
+                return Some(format!(
+                    "runAsNonRoot != true (pod or container \"{name}\" must set securityContext.runAsNonRoot=true)"
+                ));
+            }
+        }
+    }
+
+    // --- Restricted: allowPrivilegeEscalation must be false ---
+    for (name, sc) in all_security_contexts {
+        let allowed = sc.and_then(|sc| sc.allow_privilege_escalation);
+        if allowed != Some(false) {
+            return Some(format!(
+                "allowPrivilegeEscalation != false (container \"{name}\" must set securityContext.allowPrivilegeEscalation=false)"
+            ));
+        }
+    }
+
+    None
 }
 
 /// `Priority.getDefaultPriorityClass`
@@ -2210,6 +2301,180 @@ plugins:
             PodSecurityExemptions::from_admission_configuration("plugins: []").unwrap(),
             PodSecurityExemptions::default()
         );
+    }
+
+    // ---- PodSecurity audit / warn modes and label parsing ----
+    // admission_test.go `TestValidatePodAndController` cases "enforce deny",
+    // "warn deny", "audit deny", "invalid namespace labels", exempt and
+    // privileged short-circuits (annotation keys).
+
+    /// `makeNs(enforce, warn, audit)` (admission_test.go).
+    async fn put_ns_modes(
+        storage: &Arc<rusternetes_storage::MemoryStorage>,
+        name: &str,
+        enforce: &str,
+        warn: &str,
+        audit: &str,
+    ) {
+        let mut labels = std::collections::BTreeMap::new();
+        for (k, v) in [("enforce", enforce), ("warn", warn), ("audit", audit)] {
+            if !v.is_empty() {
+                labels.insert(format!("pod-security.kubernetes.io/{k}"), v.to_string());
+            }
+        }
+        let ns: rusternetes_common::resources::Namespace =
+            serde_json::from_value(serde_json::json!({"apiVersion": "v1", "kind": "Namespace",
+                "metadata": {"name": name, "labels": labels}}))
+            .unwrap();
+        let key = rusternetes_storage::build_key("namespaces", None, name);
+        storage.create(&key, &ns).await.unwrap();
+    }
+
+    fn baseline_pod() -> Pod {
+        pod_from_spec(
+            "p",
+            serde_json::json!({"containers": [{"name": "main", "image": "busybox"}]}),
+        )
+    }
+
+    #[tokio::test]
+    async fn psa_warn_deny_allows_with_warning() {
+        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        put_ns_modes(&storage, "warn-ns", "", "baseline", "").await;
+        let out = PodSecurityAdmission::new()
+            .admit_outcome(&storage, "warn-ns", &privileged_pod(None), "alice")
+            .await
+            .expect("warn mode never denies");
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        assert!(
+            out.warnings[0].starts_with(r#"would violate PodSecurity "baseline:latest": "#),
+            "{}",
+            out.warnings[0]
+        );
+        assert!(!out.audit_annotations.contains_key("audit-violations"));
+    }
+
+    #[tokio::test]
+    async fn psa_audit_deny_allows_with_annotation() {
+        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        put_ns_modes(&storage, "audit-ns", "", "", "baseline").await;
+        let out = PodSecurityAdmission::new()
+            .admit_outcome(&storage, "audit-ns", &privileged_pod(None), "alice")
+            .await
+            .expect("audit mode never denies");
+        assert!(out.warnings.is_empty());
+        let v = &out.audit_annotations["audit-violations"];
+        assert!(
+            v.starts_with(r#"would violate PodSecurity "baseline:latest": "#),
+            "{v}"
+        );
+    }
+
+    /// "enforce deny": no warning on a request already rejected; the audit
+    /// annotation records the enforced policy.
+    #[tokio::test]
+    async fn psa_enforce_deny_message_names_level_and_version() {
+        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        put_ns_modes(&storage, "r-ns", "restricted", "", "").await;
+        let err = PodSecurityAdmission::new()
+            .admit_outcome(&storage, "r-ns", &privileged_pod(None), "alice")
+            .await
+            .expect_err("enforce denies");
+        assert!(
+            err.to_string()
+                .contains(r#"violates PodSecurity "restricted:latest": "#),
+            "{err}"
+        );
+    }
+
+    /// "enforce allow" records `enforce-policy`; the privileged
+    /// short-circuit is `privileged:latest` (response.go init).
+    #[tokio::test]
+    async fn psa_enforce_policy_audit_annotation() {
+        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        put_ns_modes(&storage, "b-ns", "baseline", "", "").await;
+        put_ns_modes(&storage, "p-ns", "", "", "").await;
+        let psa = PodSecurityAdmission::new();
+        let out = psa
+            .admit_outcome(&storage, "b-ns", &baseline_pod(), "alice")
+            .await
+            .unwrap();
+        assert_eq!(out.audit_annotations["enforce-policy"], "baseline:latest");
+        assert!(out.warnings.is_empty());
+        let out = psa
+            .admit_outcome(&storage, "p-ns", &privileged_pod(None), "alice")
+            .await
+            .unwrap();
+        assert_eq!(out.audit_annotations["enforce-policy"], "privileged:latest");
+    }
+
+    /// "invalid namespace labels": an unparseable enforce level is
+    /// restricted:latest, so even a baseline pod is denied, and the parse
+    /// error is annotated (EvaluatePod :466-470).
+    #[tokio::test]
+    async fn psa_invalid_enforce_label_fails_closed() {
+        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        put_ns_modes(&storage, "invalid-ns", "not-a-valid-level", "", "").await;
+        let err = PodSecurityAdmission::new()
+            .admit_outcome(&storage, "invalid-ns", &baseline_pod(), "alice")
+            .await
+            .expect_err("restricted:latest denies a pod without runAsNonRoot");
+        assert!(err.to_string().contains("restricted:latest"), "{err}");
+    }
+
+    /// An unparseable audit/warn level fails open and is annotated.
+    #[tokio::test]
+    async fn psa_invalid_warn_label_fails_open_with_error_annotation() {
+        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        put_ns_modes(&storage, "w-ns", "", "bogus", "").await;
+        let out = PodSecurityAdmission::new()
+            .admit_outcome(&storage, "w-ns", &privileged_pod(None), "alice")
+            .await
+            .unwrap();
+        assert!(out.warnings.is_empty());
+        assert!(
+            out.audit_annotations["error"].starts_with("Failed to parse policy: "),
+            "{:?}",
+            out.audit_annotations
+        );
+    }
+
+    /// Enforce also defaults warn to the enforce level, but a request that is
+    /// already denied carries no warning.
+    #[tokio::test]
+    async fn psa_enforce_defaults_warn_level() {
+        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        put_ns_modes(&storage, "e-ns", "baseline", "", "").await;
+        // restricted audit sees the baseline pod's missing runAsNonRoot.
+        put_ns_modes(&storage, "ea-ns", "baseline", "", "restricted").await;
+        let out = PodSecurityAdmission::new()
+            .admit_outcome(&storage, "ea-ns", &baseline_pod(), "alice")
+            .await
+            .unwrap();
+        assert!(out.audit_annotations.contains_key("audit-violations"));
+        assert!(out.warnings.is_empty(), "warn defaults to baseline: passes");
+    }
+
+    /// Exemptions annotate the reason (response.go init).
+    #[tokio::test]
+    async fn psa_exemption_audit_annotation() {
+        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        put_ns_modes(&storage, "ns", "restricted", "", "").await;
+        let psa = PodSecurityAdmission::with_exemptions(exemptions());
+        let by = |ns: &'static str, user: &'static str, rc: Option<&'static str>| {
+            let psa = psa.clone();
+            let storage = storage.clone();
+            async move {
+                psa.admit_outcome(&storage, ns, &privileged_pod(rc), user)
+                    .await
+                    .unwrap()
+                    .audit_annotations["exempt"]
+                    .clone()
+            }
+        };
+        assert_eq!(by("exempt-ns", "alice", None).await, "namespace");
+        assert_eq!(by("ns", "exempt-user", None).await, "user");
+        assert_eq!(by("ns", "alice", Some("exempt-rc")).await, "runtimeClass");
     }
 
     // ---- imagePullSecrets propagation (SA admission, upstream parity) -------
