@@ -61,6 +61,7 @@ async-trait = { workspace = true }
 # wrapped in hyper_util's TokioIo.
 hyper-util = { version = "0.1", features = ["client", "tokio"] }
 tower = { workspace = true }
+inotify = "0.11"
 
 [build-dependencies]
 tonic-build = "0.12"
