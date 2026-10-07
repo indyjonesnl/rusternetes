@@ -623,13 +623,13 @@ impl CrdRest {
         crd: &CustomResourceDefinition,
     ) -> std::result::Result<
         (),
-        (
+        Box<(
             rusternetes_common::resources::CustomResourceDefinitionCondition,
             Error,
-        ),
+        )>,
     > {
         let failed = |reason: &str, message: String, e: Error| {
-            (condition(TERMINATING, "True", reason, &message), e)
+            Box::new((condition(TERMINATING, "True", reason, &message), e))
         };
         let resource_type = instance_resource_type(crd);
         let items = self.list_instances(crd).await.map_err(|e| {
@@ -707,7 +707,8 @@ impl CrdRest {
                     "InstanceDeletionCompleted",
                     "removed all instances",
                 ),
-                Err((failed, e)) => {
+                Err(boxed) => {
+                    let (failed, e) = *boxed;
                     self.update_status(name, &|old| {
                         let mut c = old.clone();
                         set_crd_condition(&mut c, failed.clone());
@@ -1275,7 +1276,7 @@ mod tests {
         let calls = std::sync::atomic::AtomicUsize::new(0);
         let r = poll_until_gone(INSTANCE_DRAIN_INTERVAL, INSTANCE_DRAIN_TIMEOUT, || {
             let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            async move { Ok(if n < 3 { 3 - n } else { 0 }) }
+            async move { Ok(3_usize.saturating_sub(n)) }
         })
         .await;
         assert_eq!(r, Ok(()));
