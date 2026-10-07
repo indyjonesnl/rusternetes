@@ -74,7 +74,7 @@ impl std::error::Error for DownwardError {}
 ///
 /// - `metadata.name`, `metadata.namespace`, `metadata.uid`
 /// - `metadata.labels`, `metadata.annotations` (rendered as
-///   `key="value"\n` lines, sorted by key)
+///   `key="value"` lines joined by `\n`, sorted by key, no trailing newline)
 /// - `metadata.labels['key']`, `metadata.annotations['key']` (single value)
 /// - `spec.nodeName`, `spec.serviceAccountName`
 /// - `status.podIP`, `status.hostIP`
@@ -370,14 +370,41 @@ fn render_kv_map(map: Option<&std::collections::HashMap<String, String>>) -> Str
     };
     let mut pairs: Vec<_> = map.iter().collect();
     pairs.sort_by(|a, b| a.0.cmp(b.0));
-    let mut out = pairs
+    // Port of `fieldpath.FormatMap`
+    // (`staging/src/k8s.io/kubectl/pkg/util/fieldpath/fieldpath.go:31-43`):
+    // `fmtStr += fmt.Sprintf("%v=%q\n", key, m[key])` per sorted key, then
+    // `strings.TrimSuffix(fmtStr, "\n")` — so NO trailing newline.
+    pairs
         .iter()
-        .map(|(k, v)| format!("{k}=\"{v}\""))
+        .map(|(k, v)| format!("{k}={}", go_quote(v)))
         .collect::<Vec<_>>()
-        .join("\n");
-    if !out.is_empty() {
-        out.push('\n');
+        .join("\n")
+}
+
+/// Go's `%q` (`strconv.Quote`) for a string: escapes `\\`, `"`, the C
+/// control escapes, and other non-printable ASCII as `\xNN`; printable
+/// Unicode passes through.
+fn go_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\x07' => out.push_str("\\a"),
+            '\x08' => out.push_str("\\b"),
+            '\x0c' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x0b' => out.push_str("\\v"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\x{:02x}", c as u32))
+            }
+            c => out.push(c),
+        }
     }
+    out.push('"');
     out
 }
 
