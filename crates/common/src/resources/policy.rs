@@ -69,7 +69,7 @@ pub struct ScopeSelector {
 }
 
 /// ScopedResourceSelectorRequirement is a selector that contains values, a scope name, and an operator
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScopedResourceSelectorRequirement {
     /// The name of the scope that the selector applies to

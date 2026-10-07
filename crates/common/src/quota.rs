@@ -35,8 +35,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::{DateTime, Duration, Utc};
 
+use crate::label_selector::{LabelOperator, LabelRequirement};
 use crate::quantity::{Format, Quantity};
-use crate::resources::{PersistentVolumeClaim, Pod};
+use crate::resources::{
+    PersistentVolumeClaim, Pod, ResourceQuotaSpec, ScopedResourceSelectorRequirement,
+};
 use crate::types::{Phase, ResourceRequirements};
 
 /// A resource name → quantity map. Upstream `corev1.ResourceList`.
@@ -675,6 +678,141 @@ pub fn pvc_matches_resource_name(name: &str) -> bool {
         "persistentvolumeclaims" | "requests.storage" | "count/persistentvolumeclaims"
     ) || name.ends_with(&format!("{STORAGE_CLASS_SUFFIX}persistentvolumeclaims"))
         || name.ends_with(&format!("{STORAGE_CLASS_SUFFIX}requests.storage"))
+}
+
+/// `getScopeSelectorsFromQuota` (`staging/src/k8s.io/apiserver/pkg/quota/v1/
+/// generic/evaluator.go:171-181`): each `spec.scopes` entry as an `Exists`
+/// selector, then `spec.scopeSelector.matchExpressions`.
+pub fn scope_selectors_from_quota(
+    spec: &ResourceQuotaSpec,
+) -> Vec<ScopedResourceSelectorRequirement> {
+    let mut selectors: Vec<ScopedResourceSelectorRequirement> = spec
+        .scopes
+        .iter()
+        .flatten()
+        .map(|scope| ScopedResourceSelectorRequirement {
+            scope_name: scope.clone(),
+            operator: "Exists".to_string(),
+            values: None,
+        })
+        .collect();
+    if let Some(selector) = &spec.scope_selector {
+        selectors.extend(selector.match_expressions.iter().cloned());
+    }
+    selectors
+}
+
+/// `ScopedResourceSelectorRequirementsAsSelector`
+/// (`pkg/apis/core/v1/helper/helpers.go:320-341`) matched against `labels`.
+pub fn scoped_selector_matches_labels(
+    selector: &ScopedResourceSelectorRequirement,
+    labels: &HashMap<String, String>,
+) -> Result<bool, String> {
+    let op = match selector.operator.as_str() {
+        "In" => LabelOperator::In,
+        "NotIn" => LabelOperator::NotIn,
+        "Exists" => LabelOperator::Exists,
+        "DoesNotExist" => LabelOperator::DoesNotExist,
+        other => return Err(format!("{other:?} is not a valid scope selector operator")),
+    };
+    let requirement = LabelRequirement::new(
+        &selector.scope_name,
+        op,
+        selector.values.clone().unwrap_or_default(),
+    )?;
+    Ok(requirement.matches(labels))
+}
+
+/// `getReferencedVolumeAttributesClassNames`
+/// (`persistent_volume_claims.go:330-343`): the spec's class, the current
+/// class and the modify-in-flight target class, when set.
+pub fn pvc_referenced_volume_attributes_class_names(
+    pvc: &PersistentVolumeClaim,
+) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let mut insert = |name: Option<&String>| {
+        if let Some(n) = name.filter(|n| !n.is_empty()) {
+            names.insert(n.clone());
+        }
+    };
+    insert(pvc.spec.volume_attributes_class_name.as_ref());
+    if let Some(status) = &pvc.status {
+        insert(status.current_volume_attributes_class_name.as_ref());
+        insert(
+            status
+                .modify_volume_status
+                .as_ref()
+                .and_then(|m| m.target_volume_attributes_class_name.as_ref()),
+        );
+    }
+    names
+}
+
+/// `pvcMatchesScopeFunc` (`persistent_volume_claims.go:108-127`) with
+/// `pvcMatchesSelector` (`:311-328`). Only the VolumeAttributesClass scope
+/// matches a claim; `VolumeAttributesClass` is GA and on by default in 1.35.
+pub fn pvc_matches_scope(
+    selector: &ScopedResourceSelectorRequirement,
+    pvc: &PersistentVolumeClaim,
+) -> Result<bool, String> {
+    if selector.scope_name != "VolumeAttributesClass" {
+        return Ok(false);
+    }
+    let names = pvc_referenced_volume_attributes_class_names(pvc);
+    if selector.operator == "Exists" {
+        return Ok(!names.is_empty());
+    }
+    if names.is_empty() {
+        return scoped_selector_matches_labels(selector, &HashMap::new());
+    }
+    for name in names {
+        let labels = HashMap::from([(selector.scope_name.clone(), name)]);
+        if scoped_selector_matches_labels(selector, &labels)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// `pvcEvaluator.MatchingScopes` (`persistent_volume_claims.go:99-118`): the
+/// selectors the claim matches.
+pub fn pvc_matching_scopes(
+    pvc: &PersistentVolumeClaim,
+    selectors: &[ScopedResourceSelectorRequirement],
+) -> Result<Vec<ScopedResourceSelectorRequirement>, String> {
+    let mut matched = Vec::new();
+    for selector in selectors {
+        let m = pvc_matches_scope(selector, pvc)
+            .map_err(|e| format!("error on matching scope {selector:?}: {e}"))?;
+        if m {
+            matched.push(selector.clone());
+        }
+    }
+    Ok(matched)
+}
+
+/// `RequiresQuotaReplenish` (`persistent_volume_claims.go:79-91`), with
+/// `RecoverVolumeExpansionFailure` and `VolumeAttributesClass` both on.
+pub fn pvc_requires_quota_replenish(
+    pvc: &PersistentVolumeClaim,
+    old: &PersistentVolumeClaim,
+) -> bool {
+    let allocated_storage = |c: &PersistentVolumeClaim| {
+        c.status
+            .as_ref()
+            .and_then(|s| s.allocated_resources.as_ref())
+            .and_then(|r| r.get("storage"))
+            .and_then(|v| Quantity::parse(v.trim()).ok())
+    };
+    // `Storage()` returns a zero quantity when absent; compare as quantities.
+    let zero = Quantity::from_value(0, Format::BinarySI);
+    let a = allocated_storage(old).unwrap_or(zero);
+    let b = allocated_storage(pvc).unwrap_or(zero);
+    if a.cmp_value(&b) != std::cmp::Ordering::Equal {
+        return true;
+    }
+    pvc_referenced_volume_attributes_class_names(old)
+        != pvc_referenced_volume_attributes_class_names(pvc)
 }
 
 #[cfg(test)]
@@ -1533,5 +1671,202 @@ mod tests {
             serde_json::json!({}),
         );
         assert_eq!(s(&pvc_usage(&c), "requests.storage"), "3Gi");
+    }
+    fn sel(op: &str, values: &[&str]) -> crate::resources::ScopedResourceSelectorRequirement {
+        crate::resources::ScopedResourceSelectorRequirement {
+            scope_name: "VolumeAttributesClass".to_string(),
+            operator: op.to_string(),
+            values: if values.is_empty() {
+                None
+            } else {
+                Some(values.iter().map(|v| v.to_string()).collect())
+            },
+        }
+    }
+
+    /// `TestPersistentVolumeClaimEvaluatorMatchingScopes`
+    /// (persistent_volume_claims_test.go:46-160), every case.
+    #[test]
+    fn pvc_matching_scopes_ports_upstream_cases() {
+        let selectors_for = |names: &[&[&str]]| -> Vec<_> {
+            let mut out = vec![sel("DoesNotExist", &[]), sel("Exists", &[])];
+            out.extend(names.iter().map(|n| sel("In", n)));
+            out.push(sel("NotIn", &["class4"]));
+            out
+        };
+        let none = |c: &crate::resources::PersistentVolumeClaim, s: &[_]| {
+            pvc_matching_scopes(c, s).unwrap()
+        };
+
+        // EmptyPVC
+        let c = pvc(
+            serde_json::json!({}),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let s_in = vec![
+            sel("DoesNotExist", &[]),
+            sel("Exists", &[]),
+            sel("In", &["class1"]),
+            sel("NotIn", &["class4"]),
+        ];
+        assert_eq!(
+            none(&c, &s_in),
+            vec![sel("DoesNotExist", &[]), sel("NotIn", &["class4"])]
+        );
+
+        // VolumeAttributesClass
+        let c = pvc(
+            serde_json::json!({"volumeAttributesClassName": "class1"}),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let all = vec![
+            sel("DoesNotExist", &[]),
+            sel("Exists", &[]),
+            sel("In", &["class1"]),
+            sel("In", &["class4"]),
+            sel("NotIn", &["class4"]),
+        ];
+        assert_eq!(
+            none(&c, &all),
+            vec![
+                sel("Exists", &[]),
+                sel("In", &["class1"]),
+                sel("NotIn", &["class4"])
+            ]
+        );
+
+        // VolumeAttributesClassWithTarget
+        let c = pvc(
+            serde_json::json!({"volumeAttributesClassName": "class1"}),
+            serde_json::json!({"currentVolumeAttributesClassName": "class2"}),
+            serde_json::json!({}),
+        );
+        let all = selectors_for(&[
+            &["class1"],
+            &["class2"],
+            &["class1", "class2"],
+            &["class1", "class2", "class4"],
+            &["class4"],
+        ]);
+        assert_eq!(
+            none(&c, &all),
+            vec![
+                sel("Exists", &[]),
+                sel("In", &["class1"]),
+                sel("In", &["class2"]),
+                sel("In", &["class1", "class2"]),
+                sel("In", &["class1", "class2", "class4"]),
+                sel("NotIn", &["class4"]),
+            ]
+        );
+
+        // VolumeAttributesClassWithModityStatus
+        let c = pvc(
+            serde_json::json!({"volumeAttributesClassName": "class1"}),
+            serde_json::json!({
+                "currentVolumeAttributesClassName": "class2",
+                "modifyVolumeStatus": {"targetVolumeAttributesClassName": "class3", "status": "Pending"},
+            }),
+            serde_json::json!({}),
+        );
+        let all = selectors_for(&[
+            &["class1"],
+            &["class2"],
+            &["class3"],
+            &["class1", "class2", "class3"],
+            &["class1", "class2", "class3", "class4"],
+            &["class4"],
+        ]);
+        assert_eq!(
+            none(&c, &all),
+            vec![
+                sel("Exists", &[]),
+                sel("In", &["class1"]),
+                sel("In", &["class2"]),
+                sel("In", &["class3"]),
+                sel("In", &["class1", "class2", "class3"]),
+                sel("In", &["class1", "class2", "class3", "class4"]),
+                sel("NotIn", &["class4"]),
+            ]
+        );
+    }
+
+    /// `pvcMatchesScopeFunc` (:108-127): a scope other than
+    /// VolumeAttributesClass matches nothing.
+    #[test]
+    fn pvc_matches_scope_other_scope_is_false() {
+        let c = pvc(
+            serde_json::json!({}),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let mut s = sel("Exists", &[]);
+        s.scope_name = "BestEffort".to_string();
+        assert!(!pvc_matches_scope(&s, &c).unwrap());
+    }
+
+    /// An operator outside the four is an error, as
+    /// `ScopedResourceSelectorRequirementsAsSelector` (helpers.go:332-333).
+    #[test]
+    fn pvc_matches_scope_rejects_unknown_operator() {
+        let c = pvc(
+            serde_json::json!({"volumeAttributesClassName": "a"}),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let err = pvc_matches_scope(&sel("Bogus", &[]), &c).unwrap_err();
+        assert!(
+            err.contains("is not a valid scope selector operator"),
+            "{err}"
+        );
+    }
+
+    /// `RequiresQuotaReplenish` (:79-91): the referenced class names, or
+    /// `status.allocatedResources[storage]`, changed.
+    #[test]
+    fn pvc_requires_quota_replenish_cases() {
+        let mk = |spec: serde_json::Value, status: serde_json::Value| {
+            pvc(spec, status, serde_json::json!({}))
+        };
+        let a = mk(
+            serde_json::json!({"volumeAttributesClassName": "gold"}),
+            serde_json::json!({}),
+        );
+        let same = a.clone();
+        assert!(!pvc_requires_quota_replenish(&same, &a));
+        let b = mk(
+            serde_json::json!({"volumeAttributesClassName": "gold"}),
+            serde_json::json!({"currentVolumeAttributesClassName": "silver"}),
+        );
+        assert!(pvc_requires_quota_replenish(&b, &a));
+        let c = mk(
+            serde_json::json!({}),
+            serde_json::json!({"allocatedResources": {"storage": "2Gi"}}),
+        );
+        let d = mk(
+            serde_json::json!({}),
+            serde_json::json!({"allocatedResources": {"storage": "1Gi"}}),
+        );
+        assert!(pvc_requires_quota_replenish(&c, &d));
+        assert!(!pvc_requires_quota_replenish(&d, &d.clone()));
+    }
+
+    /// `getScopeSelectorsFromQuota` (generic/evaluator.go:171-181).
+    #[test]
+    fn scope_selectors_from_quota_cases() {
+        let spec: crate::resources::ResourceQuotaSpec = serde_json::from_value(serde_json::json!({
+            "scopes": ["BestEffort"],
+            "scopeSelector": {"matchExpressions": [
+                {"scopeName": "VolumeAttributesClass", "operator": "In", "values": ["gold"]}
+            ]},
+        }))
+        .unwrap();
+        let got = scope_selectors_from_quota(&spec);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].scope_name, "BestEffort");
+        assert_eq!(got[0].operator, "Exists");
+        assert_eq!(got[1].operator, "In");
     }
 }
