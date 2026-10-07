@@ -807,4 +807,49 @@ mod tests {
         assert_eq!(storage.len(), 0);
         assert!(storage.is_empty());
     }
+
+    /// `patch_strategic_merge` applies a delta to the LIVE object: fields the
+    /// patch does not name (here a label another writer set after the caller's
+    /// read) survive.
+    #[tokio::test]
+    async fn patch_strategic_merge_applies_delta_to_live_object() {
+        let s = MemoryStorage::new();
+        let _: serde_json::Value = s
+            .create(
+                "/r/nodes/n1",
+                &serde_json::json!({"metadata": {"name": "n1", "labels": {"a": "1"}}, "spec": {"unschedulable": true}}),
+            )
+            .await
+            .unwrap();
+        // A concurrent writer adds a label.
+        let mut live: serde_json::Value = s.get("/r/nodes/n1").await.unwrap();
+        live["metadata"]["labels"]["b"] = "2".into();
+        let _: serde_json::Value = s.update("/r/nodes/n1", &live).await.unwrap();
+
+        let patched: serde_json::Value = s
+            .patch_strategic_merge(
+                "/r/nodes/n1",
+                &serde_json::json!({"spec": {"podCIDR": "10.0.0.0/24", "podCIDRs": ["10.0.0.0/24"]}}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(patched["spec"]["podCIDR"], "10.0.0.0/24");
+        assert_eq!(patched["spec"]["unschedulable"], true);
+        assert_eq!(patched["metadata"]["labels"]["b"], "2");
+        let stored: serde_json::Value = s.get("/r/nodes/n1").await.unwrap();
+        assert_eq!(stored["spec"]["podCIDRs"][0], "10.0.0.0/24");
+    }
+
+    #[tokio::test]
+    async fn patch_strategic_merge_missing_object_is_not_found() {
+        let s = MemoryStorage::new();
+        let err = s
+            .patch_strategic_merge::<serde_json::Value>(
+                "/r/nodes/nope",
+                &serde_json::json!({"spec": {}}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+    }
 }
