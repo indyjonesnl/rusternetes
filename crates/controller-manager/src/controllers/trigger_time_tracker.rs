@@ -152,7 +152,7 @@ mod tests {
     //! Ports of `trigger_time_tracker_test.go`.
     use super::*;
     use chrono::{Duration, TimeZone};
-    use rusternetes_common::resources::{PodCondition, PodStatus};
+    use rusternetes_common::resources::{PodCondition, PodSpec, PodStatus, ServiceSpec};
     use rusternetes_common::types::ObjectMeta;
 
     const NS: &str = "ttNamespace1";
@@ -164,24 +164,26 @@ mod tests {
 
     /// `createPod`.
     fn create_pod(name: &str, ready: DateTime<Utc>) -> Pod {
-        Pod {
-            metadata: ObjectMeta::new(name).with_namespace(NS),
-            status: Some(PodStatus {
-                conditions: Some(vec![PodCondition {
-                    condition_type: "Ready".to_string(),
-                    status: "True".to_string(),
-                    last_transition_time: Some(ready),
-                    ..Default::default()
-                }]),
-                ..Default::default()
-            }),
+        let mut pod = Pod::new(name, PodSpec::default());
+        pod.metadata = ObjectMeta::new(name).with_namespace(NS);
+        pod.status = Some(PodStatus {
+            conditions: Some(vec![PodCondition {
+                condition_type: "Ready".to_string(),
+                status: "True".to_string(),
+                reason: None,
+                message: None,
+                last_probe_time: None,
+                last_transition_time: Some(ready),
+                observed_generation: None,
+            }]),
             ..Default::default()
-        }
+        });
+        pod
     }
 
     /// `createService`.
     fn create_service(created: DateTime<Utc>) -> Service {
-        let mut s = Service::default();
+        let mut s = Service::new(SVC, ServiceSpec::default());
         s.metadata = ObjectMeta::new(SVC).with_namespace(NS);
         s.metadata.creation_timestamp = Some(created);
         s

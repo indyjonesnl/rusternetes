@@ -91,15 +91,29 @@ async fn test_last_trigger_change_time_annotation_overridden() {
     );
 }
 
-/// TestLastTriggerChangeTimeAnnotation_AnnotationCleared: with no trigger time
-/// on the Service or pod the annotation is removed.
+/// TestLastTriggerChangeTimeAnnotation_AnnotationCleared: an update with no
+/// new trigger time (a pod without a Ready transition time joins; the Service
+/// is already known) removes the annotation.
 #[tokio::test]
 async fn test_last_trigger_change_time_annotation_cleared() {
     let storage = Arc::new(MemoryStorage::new());
     let controller = EndpointsController::new(storage.clone());
-    existing_endpoints(&storage, Some("2018-01-01T00:00:00Z")).await;
-    fixture(&storage, None).await;
+    fixture(&storage, Some(trigger_time())).await;
     controller.reconcile_all().await.unwrap();
+    assert!(annotation(&storage).await.is_some());
+
+    let selector = HashMap::from([("app".to_string(), "web".to_string())]);
+    let pod = create_test_pod("pod1", "other", selector, Some("1.2.3.5".to_string()), true);
+    storage
+        .create(&build_key("pods", Some("other"), "pod1"), &pod)
+        .await
+        .unwrap();
+    controller.reconcile_all().await.unwrap();
+    let ep: Endpoints = storage
+        .get(&build_key("endpoints", Some("other"), "foo"))
+        .await
+        .unwrap();
+    assert_eq!(ep.subsets[0].addresses.as_ref().unwrap().len(), 2);
     assert_eq!(annotation(&storage).await, None);
 }
 
