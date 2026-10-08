@@ -1113,8 +1113,12 @@ impl<S: Storage + 'static> NamespaceController<S> {
                     }
                 }
             } else {
-                // No finalizers — hard delete from storage.
-                if let Err(e) = self.storage.delete(&key).await {
+                // No finalizers. Upstream `deleteEachItem`
+                // (namespaced_resources_deleter.go:393-415) sends
+                // `DeleteOptions{PropagationPolicy: Background}` with no grace
+                // override, so the server picks the default (graceful) period;
+                // a grace-0 hard delete here diverged (#2729).
+                if let Err(e) = self.storage.delete_gracefully(&key).await {
                     if !matches!(e, rusternetes_common::Error::NotFound(_)) {
                         warn!(
                             "Failed to delete {}/{}/{}: {}",
@@ -2158,6 +2162,7 @@ mod tests {
         supported: bool,
         collection_calls: std::sync::Mutex<Vec<String>>,
         single_deletes: std::sync::Mutex<Vec<String>>,
+        graceful_deletes: std::sync::Mutex<Vec<String>>,
     }
 
     impl CollectionStorage {
@@ -2167,6 +2172,7 @@ mod tests {
                 supported,
                 collection_calls: Default::default(),
                 single_deletes: Default::default(),
+                graceful_deletes: Default::default(),
             })
         }
     }
@@ -2201,6 +2207,10 @@ mod tests {
         async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
             self.single_deletes.lock().unwrap().push(key.to_string());
             self.inner.delete(key).await
+        }
+        async fn delete_gracefully(&self, key: &str) -> rusternetes_common::Result<()> {
+            self.graceful_deletes.lock().unwrap().push(key.to_string());
+            self.inner.delete_gracefully(key).await
         }
         async fn delete_collection(&self, prefix: &str) -> rusternetes_common::Result<bool> {
             self.collection_calls
@@ -2325,14 +2335,23 @@ mod tests {
             1,
             "an unsupported verb must be cached, not retried: {calls:?}"
         );
+        // Upstream `deleteEachItem` (namespaced_resources_deleter.go:393-415)
+        // sends `DeleteOptions{PropagationPolicy: Background}` and no grace
+        // override, so the server decides: the graceful path, never the
+        // grace-0 hard delete (#2729).
         let singles = storage.single_deletes.lock().unwrap().clone();
+        assert!(
+            !singles.iter().any(|k| k.contains("/configmaps/")),
+            "per-item path must not hard-delete (grace 0): {singles:?}"
+        );
+        let graceful = storage.graceful_deletes.lock().unwrap().clone();
         assert_eq!(
-            singles
+            graceful
                 .iter()
                 .filter(|k| k.contains("/configmaps/"))
                 .count(),
             3,
-            "fallback must delete each configmap individually: {singles:?}"
+            "fallback must delete each configmap individually and gracefully: {graceful:?}"
         );
     }
 }
