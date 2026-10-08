@@ -1,7 +1,9 @@
 //! Verbatim case-by-case ports of upstream pod-security-admission per-check
 //! tables (staging/src/k8s.io/pod-security-admission/policy/):
 //! check_appArmorProfile_test.go, check_seccompProfile_restricted_test.go,
-//! check_seccompProfile_baseline_test.go, check_seLinuxOptions_test.go.
+//! check_seccompProfile_baseline_test.go, check_seLinuxOptions_test.go,
+//! check_runAsUser_test.go, check_runAsNonRoot_test.go,
+//! check_allowPrivilegeEscalation_test.go.
 //! Child module of `pod_security_policy` so it can reach the private checks.
 use super::*;
 use rusternetes_common::resources::pod::Pod;
@@ -358,4 +360,174 @@ fn se_linux_options() {
             &format!("pod set forbidden securityContext.seLinuxOptions: {detail}"),
         );
     }
+}
+
+/// Run `f` against a pod built from `spec` and assert reason/detail, or
+/// allowed when `want` is `None` (the tables' expectAllowed).
+#[track_caller]
+fn table(f: fn(&ObjectMeta, &PodSpec) -> CheckResult, spec: Value, want: Option<(&str, &str)>) {
+    let r = run(f, &mk(json!({}), spec));
+    match want {
+        None => assert!(r.allowed, "expected allowed: {r:?}"),
+        Some((reason, detail)) => forbidden(r, reason, detail),
+    }
+}
+
+fn named(n: &str, sc: Option<Value>) -> Value {
+    match sc {
+        Some(sc) => json!({"name": n, "securityContext": sc}),
+        None => json!({"name": n}),
+    }
+}
+
+/// check_runAsUser_test.go TestRunAsUser (runAsUser1_35).
+#[test]
+fn run_as_user_table() {
+    let f = run_as_user_1_35;
+    // pod runAsUser=0
+    table(
+        f,
+        json!({"securityContext": {"runAsUser": 0}, "containers": [named("a", None)]}),
+        Some(("runAsUser=0", "pod must not set runAsUser=0")),
+    );
+    // pod runAsUser=non-zero
+    table(
+        f,
+        json!({"securityContext": {"runAsUser": 1000}, "containers": [named("a", None)]}),
+        None,
+    );
+    // pod runAsUser=nil
+    table(
+        f,
+        json!({"securityContext": {}, "containers": [named("a", None)]}),
+        None,
+    );
+    // containers runAsUser=0
+    table(
+        f,
+        json!({"securityContext": {"runAsUser": 1000}, "containers": [
+            named("a", None),
+            named("b", Some(json!({}))),
+            named("c", Some(json!({"runAsUser": 0}))),
+            named("d", Some(json!({"runAsUser": 0}))),
+            named("e", Some(json!({"runAsUser": 1}))),
+            named("f", Some(json!({"runAsUser": 1}))),
+        ]}),
+        Some((
+            "runAsUser=0",
+            r#"containers "c", "d" must not set runAsUser=0"#,
+        )),
+    );
+    // containers runAsUser=non-zero
+    table(
+        f,
+        json!({"containers": [
+            named("c", Some(json!({"runAsUser": 1}))),
+            named("d", Some(json!({"runAsUser": 2}))),
+            named("e", Some(json!({"runAsUser": 3}))),
+            named("f", Some(json!({"runAsUser": 4}))),
+        ]}),
+        None,
+    );
+    // host users false allowed
+    table(f, json!({"hostUsers": false}), None);
+}
+
+/// check_runAsNonRoot_test.go TestRunAsNonRoot (runAsNonRoot1_35).
+#[test]
+fn run_as_non_root_table() {
+    let f = run_as_non_root_1_35;
+    let reason = "runAsNonRoot != true";
+    // no explicit runAsNonRoot
+    table(
+        f,
+        json!({"containers": [named("a", None)]}),
+        Some((
+            reason,
+            r#"pod or container "a" must set securityContext.runAsNonRoot=true"#,
+        )),
+    );
+    // pod runAsNonRoot=false
+    table(
+        f,
+        json!({"securityContext": {"runAsNonRoot": false}, "containers": [named("a", None)]}),
+        Some((
+            reason,
+            "pod must not set securityContext.runAsNonRoot=false",
+        )),
+    );
+    // containers runAsNonRoot=false
+    table(
+        f,
+        json!({"securityContext": {"runAsNonRoot": true}, "containers": [
+            named("a", None),
+            named("b", Some(json!({}))),
+            named("c", Some(json!({"runAsNonRoot": false}))),
+            named("d", Some(json!({"runAsNonRoot": false}))),
+            named("e", Some(json!({"runAsNonRoot": true}))),
+            named("f", Some(json!({"runAsNonRoot": true}))),
+        ]}),
+        Some((
+            reason,
+            r#"containers "c", "d" must not set securityContext.runAsNonRoot=false"#,
+        )),
+    );
+    // pod nil, container fallthrough
+    table(
+        f,
+        json!({"containers": [
+            named("a", None),
+            named("b", Some(json!({}))),
+            named("d", Some(json!({"runAsNonRoot": true}))),
+            named("e", Some(json!({"runAsNonRoot": true}))),
+        ]}),
+        Some((
+            reason,
+            r#"pod or containers "a", "b" must set securityContext.runAsNonRoot=true"#,
+        )),
+    );
+    // host users false allowed
+    table(f, json!({"hostUsers": false}), None);
+}
+
+/// check_allowPrivilegeEscalation_test.go TestAllowPrivilegeEscalation_1_25
+/// and _1_8.
+#[test]
+fn allow_privilege_escalation_table() {
+    let reason = "allowPrivilegeEscalation != false";
+    let multi = json!({"containers": [
+        named("a", None),
+        named("b", Some(json!({}))),
+        named("c", Some(json!({"allowPrivilegeEscalation": true}))),
+        named("d", Some(json!({"allowPrivilegeEscalation": false}))),
+    ]});
+    let detail =
+        r#"containers "a", "b", "c" must set securityContext.allowPrivilegeEscalation=false"#;
+    // 1_25: multiple containers
+    table(
+        allow_privilege_escalation_1_25,
+        multi.clone(),
+        Some((reason, detail)),
+    );
+    // 1_25: windows pod, admit without checking privilegeEscalation
+    table(
+        allow_privilege_escalation_1_25,
+        json!({"os": {"name": "windows"}, "containers": [named("a", None)]}),
+        None,
+    );
+    // 1_25: linux pod, reject if security context is not set
+    table(
+        allow_privilege_escalation_1_25,
+        json!({"os": {"name": "linux"}, "containers": [named("a", None)]}),
+        Some((
+            reason,
+            r#"container "a" must set securityContext.allowPrivilegeEscalation=false"#,
+        )),
+    );
+    // 1_8: multiple containers
+    table(
+        allow_privilege_escalation_1_8,
+        multi,
+        Some((reason, detail)),
+    );
 }
