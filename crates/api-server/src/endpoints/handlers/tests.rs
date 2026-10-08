@@ -132,7 +132,7 @@ fn delete_options_errors() {
 }
 
 fn list_option_errors(pairs: &[(&str, &str)]) -> Vec<String> {
-    super::delete::validate_list_options(&q(pairs))
+    crate::handlers::list_options::validate_list_options(&q(pairs))
         .iter()
         .map(|e| e.to_string())
         .collect()

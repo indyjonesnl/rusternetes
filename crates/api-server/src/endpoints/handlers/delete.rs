@@ -7,12 +7,12 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use rusternetes_common::auth::UserInfo;
 use rusternetes_common::deletion::DeleteOptions;
-use rusternetes_common::validation::field::{Error as FieldError, Path};
 use rusternetes_common::validation::metav1::validate_delete_options;
 use rusternetes_common::{Error, List, Result, Status};
 
 use super::admission::{Admission, DeleteValidation};
 use super::rest::{authorize, dry_run_param, is_dry_run, respond, respond_object, RequestScope};
+use crate::handlers::list_options::validate_list_options;
 use crate::registry::generic::Deleted;
 use crate::registry::rest::{zero_delete_options, Object, RequestContext};
 use crate::state::ApiServerState;
@@ -181,95 +181,4 @@ pub async fn delete_collection<T: Object>(
     list.metadata.continue_token = deleted.continue_token;
     list.metadata.remaining_item_count = deleted.remaining_item_count;
     Ok(respond(StatusCode::OK, &list, &ctx))
-}
-
-/// `ValidateListOptions` (apimachinery
-/// `pkg/apis/meta/internalversion/validation/validation.go:28-76`) over the
-/// query parameters `ListOptions` decodes. The WatchList gate is on by
-/// default in 1.35 (kube_features.go:503-509), so `isWatchListFeatureEnabled`
-/// is true here, and `SetListOptionsDefaults` (defaults.go:25-38) is applied
-/// first: a legacy watch (rv "" or "0") defaults to sendInitialEvents=true
-/// with resourceVersionMatch=NotOlderThan.
-pub fn validate_list_options(params: &HashMap<String, String>) -> Vec<FieldError> {
-    let get = |k: &str| params.get(k).map(String::as_str).unwrap_or("");
-    let flag = |v: &str| matches!(v, "true" | "1" | "True" | "TRUE" | "t" | "T");
-    let watch = flag(get("watch"));
-    let rv = get("resourceVersion");
-    let mut matched = get("resourceVersionMatch");
-    let mut send_initial = params.get("sendInitialEvents").map(|v| flag(v));
-    let cont = get("continue");
-
-    // SetListOptionsDefaults.
-    if send_initial.is_none() && matched.is_empty() && watch && (rv.is_empty() || rv == "0") {
-        send_initial = Some(true);
-        matched = "NotOlderThan";
-    }
-
-    let rvm = || Path::new("resourceVersionMatch");
-    let mut errs = Vec::new();
-    if watch {
-        // validateWatchOptions (validation.go:53-76).
-        if send_initial.is_some() && matched != "NotOlderThan" {
-            errs.push(FieldError::forbidden(
-                &rvm(),
-                "sendInitialEvents requires setting resourceVersionMatch to NotOlderThan",
-            ));
-        }
-        if !matched.is_empty() {
-            if send_initial.is_none() {
-                errs.push(FieldError::forbidden(
-                    &rvm(),
-                    "resourceVersionMatch is forbidden for watch unless sendInitialEvents is provided",
-                ));
-            }
-            if matched != "NotOlderThan" {
-                errs.push(FieldError::not_supported(
-                    &rvm(),
-                    matched.to_string(),
-                    &["NotOlderThan"],
-                ));
-            }
-            if !cont.is_empty() {
-                errs.push(FieldError::forbidden(
-                    &rvm(),
-                    "resourceVersionMatch is forbidden when continue is provided",
-                ));
-            }
-        }
-        return errs;
-    }
-    if !matched.is_empty() {
-        if rv.is_empty() {
-            errs.push(FieldError::forbidden(
-                &rvm(),
-                "resourceVersionMatch is forbidden unless resourceVersion is provided",
-            ));
-        }
-        if !cont.is_empty() {
-            errs.push(FieldError::forbidden(
-                &rvm(),
-                "resourceVersionMatch is forbidden when continue is provided",
-            ));
-        }
-        if matched != "Exact" && matched != "NotOlderThan" {
-            errs.push(FieldError::not_supported(
-                &rvm(),
-                matched.to_string(),
-                &["Exact", "NotOlderThan", ""],
-            ));
-        }
-        if matched == "Exact" && rv == "0" {
-            errs.push(FieldError::forbidden(
-                &rvm(),
-                "resourceVersionMatch \"exact\" is forbidden for resourceVersion \"0\"",
-            ));
-        }
-    }
-    if send_initial.is_some() {
-        errs.push(FieldError::forbidden(
-            &Path::new("sendInitialEvents"),
-            "sendInitialEvents is forbidden for list",
-        ));
-    }
-    errs
 }
