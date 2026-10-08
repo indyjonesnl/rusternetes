@@ -2275,6 +2275,107 @@ mod tests {
         assert!(get_pv(&storage, "pv").await.is_none());
     }
 
+    /// A released `Delete` PV backed by a hostPath. All paths live under a
+    /// unique `/tmp/hostpath.<uuid>` so the deleter's `/tmp/.+` guard passes
+    /// and no test can touch anything outside its own scratch directory.
+    fn host_path_delete_pv(name: &str, path: &str) -> PersistentVolume {
+        use rusternetes_common::resources::volume::HostPathVolumeSource;
+        let mut pv = bound_pv(name);
+        pv.spec.persistent_volume_reclaim_policy = Some(PersistentVolumeReclaimPolicy::Delete);
+        pv.spec.host_path = Some(HostPathVolumeSource {
+            path: path.to_string(),
+            r#type: None,
+        });
+        pv
+    }
+
+    fn scratch_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(format!("/tmp/hostpath.{}", uuid::Uuid::new_v4()))
+    }
+
+    /// host_path_test.go `TestDeleter`: the deleter removes the directory,
+    /// then the PV object is deleted (`deleteVolumeOperation`,
+    /// pv_controller.go:1323-1393).
+    #[tokio::test]
+    async fn host_path_deleter_removes_directory_then_pv() {
+        let dir = scratch_dir();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/data"), b"x").unwrap();
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        put_pv(&storage, &host_path_delete_pv("pv", dir.to_str().unwrap())).await;
+        c.sync_volumes(&WorkQueue::new()).await.unwrap();
+        let existed = dir.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!existed, "hostPath directory must be wiped by the deleter");
+        assert!(get_pv(&storage, "pv").await.is_none());
+    }
+
+    /// host_path_test.go `TestDeleterTempDir` "just-tmp" / "not-tmp": the
+    /// deleter refuses, so the PV goes Failed with a `VolumeFailedDelete`
+    /// warning and is NOT deleted (`deleteVolumeOperation`, :1360-1366).
+    #[tokio::test]
+    async fn host_path_deleter_refuses_paths_outside_tmp() {
+        for path in ["/tmp", "/tmp/", "/nottmp", "/nottmp/tmp/x"] {
+            let storage = Arc::new(MemoryStorage::new());
+            let c = PVBinderController::new(storage.clone());
+            put_pv(&storage, &host_path_delete_pv("pv", path)).await;
+            c.sync_volumes(&WorkQueue::new()).await.unwrap();
+            let got = get_pv(&storage, "pv")
+                .await
+                .unwrap_or_else(|| panic!("{path}: PV must survive a refused delete"));
+            let status = got.status.unwrap();
+            assert_eq!(status.phase, PersistentVolumePhase::Failed, "{path}");
+            let want =
+                format!("host_path deleter only supports /tmp/.+ but received provided {path}");
+            assert_eq!(status.message.as_deref(), Some(want.as_str()), "{path}");
+            let events: Vec<rusternetes_common::resources::Event> =
+                storage.list("/registry/events/").await.unwrap();
+            assert!(
+                events.iter().any(|e| e.reason == "VolumeFailedDelete"),
+                "{path}: expected a VolumeFailedDelete event"
+            );
+        }
+    }
+
+    /// Hardening beyond upstream's unanchored `/tmp/.+` regex: a `..`
+    /// component must not let a path escape /tmp/<x>/ and wipe a sibling.
+    #[tokio::test]
+    async fn host_path_deleter_refuses_parent_dir_traversal() {
+        let victim = scratch_dir();
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("keep"), b"x").unwrap();
+        let decoy = scratch_dir();
+        std::fs::create_dir_all(&decoy).unwrap();
+        let sneaky = format!(
+            "{}/../{}",
+            decoy.display(),
+            victim.file_name().unwrap().to_str().unwrap()
+        );
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        put_pv(&storage, &host_path_delete_pv("pv", &sneaky)).await;
+        c.sync_volumes(&WorkQueue::new()).await.unwrap();
+        let survived = victim.join("keep").exists();
+        let _ = std::fs::remove_dir_all(&victim);
+        let _ = std::fs::remove_dir_all(&decoy);
+        assert!(survived, "traversal path must not delete the target");
+        let got = get_pv(&storage, "pv").await.expect("PV must survive");
+        assert_eq!(got.status.unwrap().phase, PersistentVolumePhase::Failed);
+    }
+
+    /// `os.RemoveAll` returns nil for a missing path, so an already-gone
+    /// directory still lets the PV be deleted.
+    #[tokio::test]
+    async fn host_path_deleter_missing_directory_is_ok() {
+        let dir = scratch_dir();
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        put_pv(&storage, &host_path_delete_pv("pv", dir.to_str().unwrap())).await;
+        c.sync_volumes(&WorkQueue::new()).await.unwrap();
+        assert!(get_pv(&storage, "pv").await.is_none());
+    }
+
     /// recycle_test.go "6-3": a Recycle volume with no recycler plugin goes
     /// Failed with message "No recycler plugin found for the volume!" and a
     /// `Warning VolumeFailedRecycle` event (pv_controller.go:1279-1286).
