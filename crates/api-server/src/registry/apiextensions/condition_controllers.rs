@@ -15,20 +15,21 @@
 //! and the memo that stops two api-servers fighting over a message, is
 //! upstream's.
 //!
-//! Not modelled: `schema.ValidateStructural` (and `NewStructural`) over each
-//! version's `openAPIV3Schema`, which feeds the `Violations` message of the
-//! `NonStructuralSchema` condition. Rusternetes has no structural-schema
-//! type yet; only the `spec.preserveUnknownFields` violation is produced.
+//! `NewStructural` and `ValidateStructural` (`apiserver/schema`) over each
+//! version's `openAPIV3Schema` are in
+//! `rusternetes_common::validation::structural`.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use rusternetes_common::resources::crd::JSONSchemaProps;
 use rusternetes_common::resources::{CustomResourceDefinition, CustomResourceDefinitionCondition};
 use rusternetes_common::validation::crd::{
     api_approval_state, is_protected_community_group, ApiApprovalState,
     KUBE_API_APPROVED_ANNOTATION,
 };
 use rusternetes_common::validation::field::{Error, Path};
+use rusternetes_common::validation::structural::{new_structural, validate_structural};
 
 use super::controllers::{aggregate, condition, find_crd_condition, set_crd_condition};
 
@@ -72,6 +73,40 @@ pub fn calculate_non_structural_condition(
             )
             .to_string(),
         );
+    }
+
+    // :102-122. A version with no `openAPIV3Schema` is skipped upstream
+    // (`v.Schema == nil || v.Schema.OpenAPIV3Schema == nil`). Deviation: the
+    // typed model cannot tell an absent `openAPIV3Schema` from an empty one
+    // (it decodes to the default), so the default schema is treated as absent.
+    let absent = JSONSchemaProps::default();
+    for (i, v) in crd.spec.versions.iter().enumerate() {
+        let Some(schema) = v.schema.as_ref().map(|s| &s.open_apiv3_schema) else {
+            continue;
+        };
+        if *schema == absent {
+            continue;
+        }
+        let s = match new_structural(schema) {
+            Ok(s) => s,
+            Err(e) => {
+                return Some(condition(
+                    NON_STRUCTURAL_SCHEMA,
+                    "Unknown",
+                    "StructuralError",
+                    &format!(
+                        "failed to check validation schema for version {}: {e}",
+                        v.name
+                    ),
+                ));
+            }
+        };
+        let pth = Path::new("spec")
+            .child("versions")
+            .index(i)
+            .child("schema")
+            .child("openAPIV3Schema");
+        all_errs.extend(validate_structural(&pth, &s).iter().map(|e| e.to_string()));
     }
 
     if all_errs.is_empty() {
@@ -309,6 +344,75 @@ mod tests {
         assert_eq!(
             got.message.as_deref(),
             Some("spec.preserveUnknownFields: Invalid value: true: must be false")
+        );
+    }
+
+    fn crd_with_schema(schema: serde_json::Value) -> CustomResourceDefinition {
+        let mut c = crd("a.io", None, false);
+        c.spec.versions = serde_json::from_value(serde_json::json!([
+            {"name": "v1", "served": true, "storage": true,
+             "schema": {"openAPIV3Schema": schema}}
+        ]))
+        .unwrap();
+        c
+    }
+
+    /// `ValidateStructural` feeds the `Violations` message
+    /// (nonstructuralschema_controller.go:102-122).
+    #[test]
+    fn non_structural_schema_is_reported_per_version() {
+        let structural = crd_with_schema(serde_json::json!({
+            "type": "object",
+            "properties": {"spec": {"type": "object"}}
+        }));
+        assert_eq!(calculate_non_structural_condition(&structural), None);
+
+        let bad = crd_with_schema(serde_json::json!({
+            "type": "object",
+            "properties": {"a": {"type": "array"}, "b": {"description": "no type"}}
+        }));
+        let got = calculate_non_structural_condition(&bad).unwrap();
+        assert_eq!(got.type_, NON_STRUCTURAL_SCHEMA);
+        assert_eq!(got.status, "True");
+        assert_eq!(got.reason.as_deref(), Some("Violations"));
+        let p = "spec.versions[0].schema.openAPIV3Schema.properties";
+        assert_eq!(
+            got.message.as_deref(),
+            Some(
+                format!(
+                    "[{p}[a].items: Required value: must be specified, \
+                     {p}[b].type: Required value: must not be empty for specified object fields]"
+                )
+                .as_str()
+            )
+        );
+    }
+
+    /// Violations of the spec and of the schema are reported together (:96-122).
+    #[test]
+    fn non_structural_reports_preserve_unknown_fields_and_schema_together() {
+        let mut c = crd_with_schema(serde_json::json!({"type": "string"}));
+        c.spec.preserve_unknown_fields = Some(true);
+        let got = calculate_non_structural_condition(&c).unwrap();
+        let m = got.message.unwrap();
+        assert!(m.contains("spec.preserveUnknownFields: Invalid value: true: must be false"));
+        assert!(m.contains(
+            "openAPIV3Schema.type: Invalid value: \"string\": must be object at the root"
+        ));
+    }
+
+    /// `NewStructural` failing yields `StructuralError`, status Unknown, and
+    /// drops the earlier errors (:111-116).
+    #[test]
+    fn non_structural_new_structural_error_is_structural_error() {
+        let mut c = crd_with_schema(serde_json::json!({"type": "object", "$ref": "#/x"}));
+        c.spec.preserve_unknown_fields = Some(true);
+        let got = calculate_non_structural_condition(&c).unwrap();
+        assert_eq!(got.status, "Unknown");
+        assert_eq!(got.reason.as_deref(), Some("StructuralError"));
+        assert_eq!(
+            got.message.as_deref(),
+            Some("failed to check validation schema for version v1: OpenAPIV3Schema '$ref' is not supported")
         );
     }
 
