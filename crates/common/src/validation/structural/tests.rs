@@ -11,6 +11,8 @@ use serde_json::json;
 
 use super::*;
 
+type Mutation<T> = Vec<(&'static str, fn(&mut T))>;
+
 fn schema(v: serde_json::Value) -> JSONSchemaProps {
     serde_json::from_value(v).expect("valid JSONSchemaProps")
 }
@@ -85,7 +87,7 @@ fn metadata_only_name_and_generate_name_allowed() {
 
 #[test]
 fn metadata_anything_but_type_and_properties_is_forbidden() {
-    let mutations: Vec<(&str, fn(&mut Structural))> = vec![
+    let mutations: Mutation<Structural> = vec![
         ("items", |s| s.items = Some(Box::default())),
         ("additionalProperties", |s| {
             s.additional_properties = Some(Box::default())
@@ -315,7 +317,7 @@ fn nested_errs(v: &NestedValueValidation, opts: ValidationOptions) -> Vec<Error>
 
 #[test]
 fn nested_value_validation_every_forbidden_generic_is_checked() {
-    let mutations: Vec<(&str, fn(&mut Generic))> = vec![
+    let mutations: Mutation<Generic> = vec![
         ("description", |g| g.description = "d".into()),
         ("type", |g| g.type_ = "string".into()),
         ("title", |g| g.title = "t".into()),
@@ -334,7 +336,7 @@ fn nested_value_validation_every_forbidden_generic_is_checked() {
 
 #[test]
 fn nested_value_validation_every_forbidden_extension_is_checked() {
-    let mutations: Vec<(&str, fn(&mut Extensions))> = vec![
+    let mutations: Mutation<Extensions> = vec![
         ("x-preserve-unknown-fields", |x| {
             x.x_preserve_unknown_fields = true
         }),

@@ -546,9 +546,10 @@ pub fn validate_structural_metadata_invariants(
         let mut s = s.clone();
         let found_name = s.properties.contains_key("name");
         let found_generate_name = s.properties.contains_key("generateName");
-        if found_name && found_generate_name && s.properties.len() == 2 {
-            s.properties.clear();
-        } else if (found_name || found_generate_name) && s.properties.len() == 1 {
+        // (:207-212: two upstream branches with the same body)
+        if (found_name && found_generate_name && s.properties.len() == 2)
+            || ((found_name || found_generate_name) && s.properties.len() == 1)
+        {
             s.properties.clear();
         }
         s.generic.type_ = String::new();
