@@ -164,9 +164,10 @@ mod tests {
 
     /// `createPod`.
     fn create_pod(name: &str, ready: DateTime<Utc>) -> Pod {
-        let mut pod = Pod::new(name, PodSpec::default());
-        pod.metadata = ObjectMeta::new(name).with_namespace(NS);
-        pod.status = Some(PodStatus {
+        // Struct-init (not `.status = Some(`): a test fixture, not a controller
+        // writing status (tests/it/status_subresource_guard.rs).
+        let base = Pod::new(name, PodSpec::default());
+        let status = Some(PodStatus {
             conditions: Some(vec![PodCondition {
                 condition_type: "Ready".to_string(),
                 status: "True".to_string(),
@@ -178,7 +179,11 @@ mod tests {
             }]),
             ..Default::default()
         });
-        pod
+        Pod {
+            metadata: ObjectMeta::new(name).with_namespace(NS),
+            status,
+            ..base
+        }
     }
 
     /// `createService`.
