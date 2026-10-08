@@ -889,7 +889,7 @@ where
                                     if let Some(rv) = extract_rv_from_json(&prev_value) {
                                         latest_resource_version = Some(rv);
                                     }
-                                    if let Some(json) = build_delete_fallback_json(&key, &prev_value, None) {
+                                    if let Some(json) = build_delete_fallback_json(&key, &prev_value, Some((&bookmark_kind, &bookmark_api_version))) {
                                         if tx.send(Ok(format!("{}\n", json))).await.is_err() {
                                             debug!("Watch: tx.send failed, client disconnected");
                                             break;
@@ -1444,7 +1444,7 @@ where
                                     if let Some(rv) = extract_rv_from_json(&prev_value) {
                                         latest_resource_version = Some(rv);
                                     }
-                                    if let Some(json) = build_delete_fallback_json(&key, &prev_value, None) {
+                                    if let Some(json) = build_delete_fallback_json(&key, &prev_value, Some((&bookmark_kind, &bookmark_api_version))) {
                                         if tx.send(Ok(format!("{}\n", json))).await.is_err() {
                                             debug!("Watch: tx.send failed, client disconnected");
                                             break;
@@ -1906,10 +1906,14 @@ fn json_watch_event(
 pub fn build_delete_fallback_json(
     key: &str,
     prev_value: &str,
-    _kind_hint: Option<(&str, &str)>,
+    kind_hint: Option<(&str, &str)>,
 ) -> Option<String> {
     // Try to parse prev_value as raw JSON
     if let Ok(raw_obj) = serde_json::from_str::<serde_json::Value>(prev_value) {
+        let mut raw_obj = raw_obj;
+        if let Some((kind, api_version)) = kind_hint {
+            stamp_gvk(&mut raw_obj, kind, api_version);
+        }
         let k8s_event = serde_json::json!({
             "type": "DELETED",
             "object": raw_obj
@@ -1936,6 +1940,28 @@ pub fn build_delete_fallback_json(
         }
     });
     serde_json::to_string(&k8s_event).ok()
+}
+
+/// Stamp `kind` / `apiVersion` onto a JSON watch-event object that lacks them.
+///
+/// Same upstream mechanism as the typed path: the watch encoder is
+/// `EncoderForVersion(..., scope.Kind.GroupVersion())`
+/// (`staging/src/k8s.io/apiserver/pkg/endpoints/handlers/watch.go:81-83`) and
+/// the versioning codec's `doEncode` calls `objectKind.SetGroupVersionKind(gvk)`
+/// (`apimachinery/pkg/runtime/serializer/versioning/versioning.go`). A
+/// kind-less write body is stored kind-less (#2772).
+pub(crate) fn stamp_gvk(object: &mut serde_json::Value, kind: &str, api_version: &str) {
+    if let Some(map) = object.as_object_mut() {
+        for (key, want) in [("apiVersion", api_version), ("kind", kind)] {
+            let missing = map
+                .get(key)
+                .and_then(|v| v.as_str())
+                .is_none_or(str::is_empty);
+            if missing {
+                map.insert(key.to_string(), serde_json::Value::String(want.into()));
+            }
+        }
+    }
 }
 
 /// Extract resourceVersion from a raw JSON string.
@@ -3047,7 +3073,7 @@ pub async fn watch_cluster_scoped_json(
                 if let Some(rv) = json_resource_version(&object) {
                     latest_resource_version = Some(rv);
                 }
-                let Some((event_type, object)) = json_watch_event(
+                let Some((event_type, mut object)) = json_watch_event(
                     "ADDED",
                     object,
                     &label_selector,
@@ -3056,6 +3082,7 @@ pub async fn watch_cluster_scoped_json(
                 ) else {
                     continue;
                 };
+                stamp_gvk(&mut object, &bookmark_kind, &bookmark_api_version);
                 let k8s_event = serde_json::json!({
                     "type": event_type,
                     "object": object
@@ -3114,7 +3141,7 @@ pub async fn watch_cluster_scoped_json(
                                     if let Some(rv) = json_resource_version(&object) {
                                         latest_resource_version = Some(rv);
                                     }
-                                    let Some((event_type, object)) = json_watch_event(
+                                    let Some((event_type, mut object)) = json_watch_event(
                                         event_type,
                                         object,
                                         &label_selector,
@@ -3123,6 +3150,7 @@ pub async fn watch_cluster_scoped_json(
                                     ) else {
                                         continue;
                                     };
+                                    stamp_gvk(&mut object, &bookmark_kind, &bookmark_api_version);
                                     let k8s_event = serde_json::json!({
                                         "type": event_type,
                                         "object": object
@@ -3275,7 +3303,7 @@ pub async fn watch_namespaced_json(
                 if let Some(rv) = json_resource_version(&object) {
                     latest_resource_version = Some(rv);
                 }
-                let Some((event_type, object)) = json_watch_event(
+                let Some((event_type, mut object)) = json_watch_event(
                     "ADDED",
                     object,
                     &label_selector,
@@ -3284,6 +3312,7 @@ pub async fn watch_namespaced_json(
                 ) else {
                     continue;
                 };
+                stamp_gvk(&mut object, &bookmark_kind, &bookmark_api_version);
                 let k8s_event = serde_json::json!({
                     "type": event_type,
                     "object": object
@@ -3342,7 +3371,7 @@ pub async fn watch_namespaced_json(
                                     if let Some(rv) = json_resource_version(&object) {
                                         latest_resource_version = Some(rv);
                                     }
-                                    let Some((event_type, object)) = json_watch_event(
+                                    let Some((event_type, mut object)) = json_watch_event(
                                         event_type,
                                         object,
                                         &label_selector,
@@ -3351,6 +3380,7 @@ pub async fn watch_namespaced_json(
                                     ) else {
                                         continue;
                                     };
+                                    stamp_gvk(&mut object, &bookmark_kind, &bookmark_api_version);
                                     let k8s_event = serde_json::json!({
                                         "type": event_type,
                                         "object": object
