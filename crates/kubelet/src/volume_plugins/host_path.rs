@@ -1,5 +1,5 @@
 use crate::runtime::check_host_path_type_msg;
-use crate::volume_plugins::{Mounter, Spec, VolumeHost, VolumePlugin};
+use crate::volume_plugins::{Attributes, Mounter, Spec, VolumeHost, VolumePlugin};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use rusternetes_common::resources::volume::HostPathType;
@@ -123,6 +123,9 @@ impl VolumePlugin for HostPathPlugin {
             path,
             path_type,
             volume_name: spec.volume.name.clone(),
+            // `getVolumeSource` returns `spec.ReadOnly` for both arms
+            // (`host_path.go:364`, `:367`).
+            read_only: spec.read_only,
         }))
     }
 
@@ -163,12 +166,23 @@ struct HostPathMounter {
     path: String,
     path_type: Option<String>,
     volume_name: String,
+    read_only: bool,
 }
 
 #[async_trait]
 impl Mounter for HostPathMounter {
     fn get_path(&self) -> String {
         self.path.clone()
+    }
+
+    /// `hostPathMounter.GetAttributes` (`host_path.go:232-238`):
+    /// `{ReadOnly: b.readOnly, Managed: false, SELinuxRelabel: false}`.
+    fn get_attributes(&self) -> Attributes {
+        Attributes {
+            read_only: self.read_only,
+            managed: false,
+            selinux_relabel: false,
+        }
     }
 
     /// `hostPathMounter.SetUp` (`host_path.go:241-255`) — the type check runs
@@ -271,6 +285,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
+            read_only: false,
         };
         assert!(plugin().can_support(&spec));
     }
@@ -282,6 +297,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: Some(&pv),
+            read_only: false,
         };
         assert!(plugin().can_support(&spec));
     }
@@ -292,6 +308,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
+            read_only: false,
         };
         assert!(!plugin().can_support(&spec));
     }
@@ -304,6 +321,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: Some(&pv),
+            read_only: false,
         };
         let pod = test_pod();
         let m = plugin().new_mounter(&spec, &pod).await.unwrap();
@@ -321,6 +339,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
+            read_only: false,
         };
         let pod = test_pod();
         let m = plugin().new_mounter(&spec, &pod).await.unwrap();
@@ -338,6 +357,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
+            read_only: false,
         };
         let m = plugin().new_mounter(&spec, &test_pod()).await.unwrap();
         let err = m.set_up().await.unwrap_err().to_string();
@@ -361,6 +381,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: Some(&pv),
+            read_only: false,
         };
         let pod = test_pod();
         let m = plugin().new_mounter(&spec, &pod).await.unwrap();
@@ -374,6 +395,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
+            read_only: false,
         };
         let m = plugin().new_mounter(&spec, &test_pod()).await.unwrap();
         m.set_up().await.unwrap_err().to_string()
@@ -505,5 +527,43 @@ mod tests {
                     .and_then(|v| u32::from_str_radix(v.trim(), 8).ok())
             })
             .unwrap_or(0o022)
+    }
+
+    /// Port of `TestPersistentClaimReadOnlyFlag`
+    /// (`pkg/volume/hostpath/host_path_test.go:276-320`): the readOnly of
+    /// `NewSpecFromPersistentVolume(pv, true)` reaches
+    /// `mounter.GetAttributes().ReadOnly`, and hostPath is never `Managed` nor
+    /// `SELinuxRelabel` (`host_path.go:232-238`).
+    #[tokio::test]
+    async fn persistent_claim_read_only_flag() {
+        let v = claimed_volume();
+        let pv = pv_host_path("foo");
+        let spec = Spec {
+            volume: &v,
+            persistent_volume: Some(&pv),
+            read_only: true,
+        };
+        let m = plugin().new_mounter(&spec, &test_pod()).await.unwrap();
+        assert_eq!(
+            m.get_attributes(),
+            Attributes {
+                read_only: true,
+                managed: false,
+                selinux_relabel: false
+            }
+        );
+    }
+
+    /// `NewSpecFromVolume` leaves `ReadOnly` false (`plugins.go:549-553`).
+    #[tokio::test]
+    async fn inline_host_path_is_not_read_only() {
+        let v = inline_host_path("/tmp/x");
+        let spec = Spec {
+            volume: &v,
+            persistent_volume: None,
+            read_only: false,
+        };
+        let m = plugin().new_mounter(&spec, &test_pod()).await.unwrap();
+        assert!(!m.get_attributes().read_only);
     }
 }

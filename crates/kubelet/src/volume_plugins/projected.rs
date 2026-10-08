@@ -1,5 +1,5 @@
 use crate::atomic_writer::FileProjection;
-use crate::volume_plugins::{Mounter, Spec, VolumeHost, VolumePlugin};
+use crate::volume_plugins::{Attributes, Mounter, Spec, VolumeHost, VolumePlugin};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use rusternetes_common::resources::{ConfigMap, KeyToPath, Pod, Secret, Volume};
@@ -626,6 +626,15 @@ impl Mounter for ProjectedMounter {
         self.path.clone()
     }
 
+    /// `projectedVolume.GetAttributes` (`pkg/volume/projected/projected.go:173-179`).
+    fn get_attributes(&self) -> Attributes {
+        Attributes {
+            read_only: true,
+            managed: true,
+            selinux_relabel: true,
+        }
+    }
+
     /// `SetUpAt` (`projected.go:136-224`): collect the payload (an error here
     /// writes nothing), then project it with the AtomicWriter
     /// (`volumeutil.NewAtomicWriter` + `writer.Write`, `:208-221`).
@@ -881,6 +890,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
+            read_only: false,
         };
         assert!(plugin().can_support(&spec));
     }
@@ -894,6 +904,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
+            read_only: false,
         };
         assert!(!plugin().can_support(&spec));
     }
@@ -939,6 +950,7 @@ mod tests {
         let spec = Spec {
             volume: v,
             persistent_volume: None,
+            read_only: false,
         };
         p.new_mounter(&spec, &pod()).await.unwrap()
     }
@@ -1102,6 +1114,7 @@ mod tests {
         let spec = Spec {
             volume: v,
             persistent_volume: None,
+            read_only: false,
         };
         p.new_mounter(&spec, pod).await.unwrap()
     }
@@ -1241,6 +1254,7 @@ mod tests {
         let spec = Spec {
             volume: v,
             persistent_volume: None,
+            read_only: false,
         };
         plugin.build_mounter(&spec, pod).collect_data().await
     }

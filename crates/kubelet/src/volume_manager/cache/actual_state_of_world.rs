@@ -1877,6 +1877,10 @@ mod tests {
             self.id.to_string()
         }
 
+        fn get_attributes(&self) -> crate::volume_plugins::plugin::Attributes {
+            Default::default()
+        }
+
         async fn set_up(&self) -> Result<()> {
             Ok(())
         }
@@ -1950,6 +1954,7 @@ mod tests {
                 .expect("volumes")[index]
                 .clone(),
             persistent_volume: None,
+            read_only: false,
         })
     }
 

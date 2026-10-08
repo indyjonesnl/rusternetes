@@ -1096,6 +1096,7 @@ mod tests {
                 .expect("volumes")[index]
                 .clone(),
             persistent_volume: None,
+            read_only: false,
         })
     }
 
@@ -1753,6 +1754,7 @@ mod tests {
             Arc::new(OwnedSpec {
                 volume,
                 persistent_volume: Some(pv),
+                read_only: false,
             }),
         )
     }

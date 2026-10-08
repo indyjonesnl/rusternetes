@@ -69,17 +69,9 @@ fn quantity_of(map: Option<&HashMap<String, String>>) -> Quantity {
         .unwrap_or_else(|| Quantity::from_value(0, Format::DecimalSI))
 }
 
-/// `volumeToMount.VolumeSpec.ReadOnly`: `NewSpecFromPersistentVolume(pv,
-/// pvcReadOnly)` (`desired_state_of_world_populator.go:588`) takes it from the
-/// pod's `persistentVolumeClaim.readOnly`. [`Spec`] has no such field, so it is
-/// read back from the volume source it came from.
+/// `volumeToMount.VolumeSpec.ReadOnly` (`operation_generator.go:2032`).
 fn spec_read_only(vmt: &VolumeToMount) -> bool {
-    vmt.volume_spec
-        .volume
-        .persistent_volume_claim
-        .as_ref()
-        .and_then(|p| p.read_only)
-        .unwrap_or(false)
+    vmt.volume_spec.read_only
 }
 
 /// The part of `operationGenerator` that node expansion touches: the plugin
@@ -530,6 +522,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: Some(&pv),
+            read_only: false,
         };
         assert!(check_if_supports_node_expansion(&m, &spec).is_some());
     }
@@ -544,6 +537,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
+            read_only: false,
         };
         assert!(check_if_supports_node_expansion(&m, &spec).is_none());
     }
@@ -556,6 +550,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
+            read_only: false,
         };
         assert!(check_if_supports_node_expansion(&m, &spec).is_none());
     }
@@ -745,12 +740,9 @@ mod tests {
         let pv = test_pv("2G");
         let mut vmt = test_vmt(&pv, "2G");
         let mut owned = vmt.volume_spec.as_spec().to_owned_spec();
-        owned
-            .volume
-            .persistent_volume_claim
-            .as_mut()
-            .unwrap()
-            .read_only = Some(true);
+        // `NewSpecFromPersistentVolume(pv, true)`
+        // (`desired_state_of_world_populator.go:588`).
+        owned.read_only = true;
         vmt.volume_spec = Arc::new(owned);
         let asow = test_asow();
         let spec = vmt.volume_spec.as_spec();

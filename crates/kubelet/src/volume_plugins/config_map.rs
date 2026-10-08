@@ -1,4 +1,4 @@
-use crate::volume_plugins::{Mounter, Spec, VolumeHost, VolumePlugin};
+use crate::volume_plugins::{Attributes, Mounter, Spec, VolumeHost, VolumePlugin};
 use crate::volumes::build_configmap_payload;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -142,6 +142,15 @@ impl Mounter for ConfigMapMounter {
         self.path.clone()
     }
 
+    /// `configMapVolume.GetAttributes` (`pkg/volume/configmap/configmap.go:158-164`).
+    fn get_attributes(&self) -> Attributes {
+        Attributes {
+            read_only: true,
+            managed: true,
+            selinux_relabel: true,
+        }
+    }
+
     async fn set_up(&self) -> Result<()> {
         // ---- moved verbatim from create_volume's configMap branch
         //      (991a503d:crates/kubelet/src/volumes.rs:991-1059) ----
@@ -264,6 +273,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
+            read_only: false,
         };
         assert!(plugin().can_support(&spec));
     }
@@ -274,6 +284,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
+            read_only: false,
         };
         assert!(!plugin().can_support(&spec));
     }
@@ -372,6 +383,30 @@ mod tests {
         assert!(
             !dir.exists(),
             "volume dir must be removed after a failed write"
+        );
+    }
+
+    /// `configMapVolume.GetAttributes` (`pkg/volume/configmap/configmap.go:158-164`).
+    #[tokio::test]
+    async fn attributes_are_read_only_managed_relabel() {
+        let v = inline_config_map("x");
+        let spec = Spec {
+            volume: &v,
+            persistent_volume: None,
+            read_only: false,
+        };
+        let pod: rusternetes_common::resources::Pod = serde_json::from_value(
+            json!({"metadata": {"name": "p", "namespace": "default", "uid": "u"}, "spec": {"containers": []}}),
+        )
+        .unwrap();
+        let m = plugin().new_mounter(&spec, &pod).await.unwrap();
+        assert_eq!(
+            m.get_attributes(),
+            crate::volume_plugins::plugin::Attributes {
+                read_only: true,
+                managed: true,
+                selinux_relabel: true
+            }
         );
     }
 }

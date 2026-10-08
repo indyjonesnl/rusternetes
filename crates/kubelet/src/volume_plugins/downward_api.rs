@@ -1,4 +1,4 @@
-use crate::volume_plugins::{Mounter, Spec, VolumeHost, VolumePlugin};
+use crate::volume_plugins::{Attributes, Mounter, Spec, VolumeHost, VolumePlugin};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use rusternetes_common::resources::{Pod, Volume};
@@ -118,6 +118,15 @@ struct DownwardApiMounter {
 impl Mounter for DownwardApiMounter {
     fn get_path(&self) -> String {
         self.path.clone()
+    }
+
+    /// `downwardAPIVolume.GetAttributes` (`pkg/volume/downwardapi/downwardapi.go:154-160`).
+    fn get_attributes(&self) -> Attributes {
+        Attributes {
+            read_only: true,
+            managed: true,
+            selinux_relabel: true,
+        }
     }
 
     async fn set_up(&self) -> Result<()> {
@@ -292,6 +301,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
+            read_only: false,
         };
         assert!(plugin().can_support(&spec));
     }
@@ -302,6 +312,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
+            read_only: false,
         };
         assert!(!plugin().can_support(&spec));
     }
@@ -572,5 +583,19 @@ mod tests {
         );
         assert!(m.set_up().await.is_err());
         assert!(!dir.exists());
+    }
+
+    /// `downwardAPIVolume.GetAttributes` (`pkg/volume/downwardapi/downwardapi.go:154-160`).
+    #[test]
+    fn attributes_are_read_only_managed_relabel() {
+        let m = mounter_for(std::path::Path::new("/tmp/x"), json!([]));
+        assert_eq!(
+            m.get_attributes(),
+            crate::volume_plugins::plugin::Attributes {
+                read_only: true,
+                managed: true,
+                selinux_relabel: true
+            }
+        );
     }
 }

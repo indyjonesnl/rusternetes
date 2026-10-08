@@ -1,5 +1,5 @@
 use crate::atomic_writer::FileProjection;
-use crate::volume_plugins::{Mounter, Spec, VolumeHost, VolumePlugin};
+use crate::volume_plugins::{Attributes, Mounter, Spec, VolumeHost, VolumePlugin};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use rusternetes_common::resources::{KeyToPath, Pod, Secret, SecretVolumeSource};
@@ -178,6 +178,15 @@ impl Mounter for SecretMounter {
         self.path.clone()
     }
 
+    /// `secretVolume.GetAttributes` (`pkg/volume/secret/secret.go:164-170`).
+    fn get_attributes(&self) -> Attributes {
+        Attributes {
+            read_only: true,
+            managed: true,
+            selinux_relabel: true,
+        }
+    }
+
     async fn set_up(&self) -> Result<()> {
         // ---- moved verbatim from create_volume's secret branch
         //      (991a503d:crates/kubelet/src/volumes.rs:1062-1325) ----
@@ -330,6 +339,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
+            read_only: false,
         };
         assert!(plugin().can_support(&spec));
     }
@@ -340,6 +350,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
+            read_only: false,
         };
         assert!(!plugin().can_support(&spec));
     }
@@ -358,6 +369,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
+            read_only: false,
         };
         let pod = test_pod();
         let m = plugin().new_mounter(&spec, &pod).await.unwrap();
@@ -413,6 +425,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
+            read_only: false,
         };
         let m = p.new_mounter(&spec, &test_pod()).await.unwrap();
         let err = m.set_up().await.unwrap_err().to_string();
@@ -436,6 +449,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
+            read_only: false,
         };
         let m = p.new_mounter(&spec, &test_pod()).await.unwrap();
         m.set_up().await.unwrap();
@@ -457,6 +471,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
+            read_only: false,
         };
         let m = p.new_mounter(&spec, &test_pod()).await.unwrap();
         m.set_up().await.unwrap();
@@ -488,6 +503,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
+            read_only: false,
         };
         p.new_mounter(&spec, &test_pod()).await.unwrap()
     }
@@ -588,6 +604,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
+            read_only: false,
         };
         let pod: Pod = serde_json::from_value(json!({
             "metadata": {"name": "p", "namespace": "default", "uid": "uid-1"},

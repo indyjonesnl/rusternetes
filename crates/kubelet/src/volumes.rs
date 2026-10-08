@@ -133,6 +133,19 @@ pub struct VolumeManager {
     pub(crate) csi_plugin: Arc<crate::volume_plugins::csi::CsiPlugin>,
 }
 
+/// `pvcSource.ReadOnly` as `createVolumeSpec` passes it to
+/// `NewSpecFromPersistentVolume(pv, pvcReadOnly)`
+/// (`pkg/kubelet/volumemanager/populator/desired_state_of_world_populator.go:461`,
+/// `:588`). An `ephemeral` volume carries no such flag (`:432-441` builds the
+/// claim source from the generated name alone), so it is false.
+fn pvc_read_only(volume: &rusternetes_common::resources::Volume) -> bool {
+    volume
+        .persistent_volume_claim
+        .as_ref()
+        .and_then(|c| c.read_only)
+        .unwrap_or(false)
+}
+
 impl VolumeManager {
     /// Construct a `VolumeManager` from the same three values the bollard
     /// `ContainerRuntime` already carries.
@@ -647,6 +660,7 @@ impl VolumeManager {
         let spec = crate::volume_plugins::Spec {
             volume,
             persistent_volume: None,
+            read_only: false,
         };
         match self.plugin_mgr.find_plugin_by_spec(&spec) {
             Ok(plugin) => plugin.name(),
@@ -1131,6 +1145,9 @@ impl VolumeManager {
         let spec = crate::volume_plugins::Spec {
             volume,
             persistent_volume: pv.as_ref(),
+            // `NewSpecFromPersistentVolume(pv, pvcSource.ReadOnly)`; a spec
+            // without a PV is `NewSpecFromVolume`, ReadOnly false.
+            read_only: pv.is_some() && pvc_read_only(volume),
         };
 
         match self.plugin_mgr.find_plugin_by_spec(&spec) {
@@ -2845,6 +2862,7 @@ mod pvc_resolution_tests {
         let spec = crate::volume_plugins::Spec {
             volume: &volume,
             persistent_volume: Some(&resolved),
+            read_only: false,
         };
         let plugin = manager.plugin_mgr.find_plugin_by_spec(&spec).unwrap();
         assert_eq!(plugin.name(), crate::pod_dirs::plugin::HOST_PATH);
@@ -2852,6 +2870,27 @@ mod pvc_resolution_tests {
         // And create_volume must dispatch to the same plugin end-to-end.
         let path = manager.create_volume(&pod, &volume).await.unwrap();
         assert_eq!(path, "/mnt/data");
+    }
+
+    /// `createVolumeSpec` hands `pvcSource.ReadOnly` to
+    /// `NewSpecFromPersistentVolume(pv, pvcReadOnly)`
+    /// (`desired_state_of_world_populator.go:461`, `:588`); an inline volume's
+    /// `NewSpecFromVolume` leaves it false (`plugins.go:549-553`).
+    #[test]
+    fn spec_read_only_comes_from_the_claim_source() {
+        let ro: Volume = serde_json::from_value(json!({
+            "name": "c", "persistentVolumeClaim": {"claimName": "c", "readOnly": true}
+        }))
+        .unwrap();
+        let rw: Volume = serde_json::from_value(json!({
+            "name": "c", "persistentVolumeClaim": {"claimName": "c"}
+        }))
+        .unwrap();
+        let inline: Volume =
+            serde_json::from_value(json!({"name": "h", "hostPath": {"path": "/x"}})).unwrap();
+        assert!(pvc_read_only(&ro));
+        assert!(!pvc_read_only(&rw));
+        assert!(!pvc_read_only(&inline));
     }
 
     #[tokio::test]
