@@ -6294,7 +6294,9 @@ async fn upsert_metrics<S, T>(
         Ok(mut existing) => {
             let stored = meta(&mut existing).clone();
             let m = meta(&mut metrics);
-            let _ = (m, stored);
+            m.uid = stored.uid;
+            m.creation_timestamp = stored.creation_timestamp;
+            m.resource_version = stored.resource_version;
             if let Err(e) = storage.update(key, &metrics).await {
                 debug!("Failed to update metrics {key}: {e}");
             }
