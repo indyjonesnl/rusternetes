@@ -219,6 +219,12 @@ pub async fn create_token_request(
         ));
     }
 
+    // `--service-account-max-token-expiration`: shorten a longer request to the
+    // maximum (token.go:222-226), after validation.
+    let expiration_seconds = state
+        .token_manager
+        .clamp_expiration_seconds(expiration_seconds);
+
     let now = chrono::Utc::now();
     let expiration_timestamp = now
         .checked_add_signed(chrono::Duration::seconds(expiration_seconds))

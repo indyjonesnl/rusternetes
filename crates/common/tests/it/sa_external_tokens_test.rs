@@ -67,6 +67,7 @@ fn opts(key_files: &[&str]) -> ServiceAccountOptions {
         signing_key_file: Some(fixture("rsa-pkcs1.key")),
         issuers: vec![ISSUER.to_string()],
         api_audiences: vec![],
+        ..Default::default()
     }
 }
 
@@ -370,4 +371,56 @@ fn key_file_parsing_matches_keyutil() {
 
     assert!(sa_keys::parse_public_keys_pem(b"not pem").is_err());
     assert!(sa_keys::public_keys_from_file(&fixture("missing.pem")).is_err());
+}
+
+/// `--service-account-max-token-expiration`
+/// (`pkg/controlplane/apiserver/options/options.go:296-302`,
+/// `completeServiceAccountOptions`): zero is unset, otherwise it must lie in
+/// `[1h, 2^32 s]`.
+#[test]
+fn max_token_expiration_bounds_2714() {
+    let ok = |secs: u64| {
+        let mut o = opts(&["rsa.pub"]);
+        o.max_expiration = Some(std::time::Duration::from_secs(secs));
+        o.validate_max_expiration()
+    };
+    assert!(ok(0).is_ok(), "zero means unset");
+    assert!(ok(3600).is_ok());
+    assert!(ok(1 << 32).is_ok());
+    for bad in [1, 3599, (1 << 32) + 1] {
+        let err = ok(bad).unwrap_err().to_string();
+        assert!(
+            err.contains(
+                "the service-account-max-token-expiration must be between 1 hour and 2^32 seconds"
+            ),
+            "{bad}: {err}"
+        );
+    }
+    // The bound applies even when no other SA flag is given.
+    let o = ServiceAccountOptions {
+        max_expiration: Some(std::time::Duration::from_secs(60)),
+        ..Default::default()
+    };
+    assert!(TokenManager::new(b"s")
+        .with_service_account_options(&o)
+        .is_err());
+}
+
+/// `TokenREST.Create` (`pkg/registry/core/serviceaccount/storage/token.go:222-226`):
+/// a request longer than the max is shortened to it; unset (`0`) never clamps.
+#[test]
+fn max_token_expiration_clamps_requests_2714() {
+    let unset = TokenManager::new(b"s");
+    assert_eq!(unset.clamp_expiration_seconds(86_400), 86_400);
+
+    let o = ServiceAccountOptions {
+        max_expiration: Some(std::time::Duration::from_secs(7200)),
+        ..Default::default()
+    };
+    let tm = TokenManager::new(b"s")
+        .with_service_account_options(&o)
+        .unwrap();
+    assert_eq!(tm.max_token_expiration_seconds(), 7200);
+    assert_eq!(tm.clamp_expiration_seconds(86_400), 7200);
+    assert_eq!(tm.clamp_expiration_seconds(3600), 3600);
 }
