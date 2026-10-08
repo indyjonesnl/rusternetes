@@ -5,7 +5,7 @@ use rusternetes_common::resources::endpointslice::{
 };
 use rusternetes_common::resources::{EndpointSlice, Endpoints, Pod, Service};
 use rusternetes_common::types::Phase;
-use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
+use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WatchEvent, WorkQueue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info};
@@ -32,6 +32,41 @@ fn adopt_existing_identity(slice: &mut EndpointSlice, existing: &EndpointSlice) 
     slice.metadata.uid = existing.metadata.uid.clone();
     slice.metadata.creation_timestamp = existing.metadata.creation_timestamp;
     slice.metadata.resource_version = existing.metadata.resource_version.clone();
+}
+
+const MANAGED_BY_LABEL: &str = "endpointslice.kubernetes.io/managed-by";
+const SERVICE_NAME_LABEL: &str = "kubernetes.io/service-name";
+const CONTROLLER_NAME: &str = "endpointslice-controller.k8s.io";
+
+/// `endpointSliceChangeMinSyncDelay`
+/// (pkg/controller/endpointslice/endpointslice_controller.go:69).
+const ENDPOINT_SLICE_CHANGE_MIN_SYNC_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Port of `onEndpointSliceDelete` + `queueServiceForEndpointSlice`
+/// (endpointslice_controller.go:583-610): a deleted slice this controller
+/// manages (`ManagedByController`, staging/src/k8s.io/endpointslice/
+/// reconciler.go:666-669) queues its Service, keyed by `ServiceControllerKey`
+/// (staging/src/k8s.io/endpointslice/utils.go:201-210, `ns/<service-name
+/// label>`; no label -> error -> no queueing).
+///
+/// Deviation: upstream queues only when `endpointSliceTracker.HandleDeletion`
+/// says the delete was unexpected; we have no tracker, so a delete we issued
+/// ourselves also queues one (idempotent) extra sync.
+fn service_key_for_deleted_slice(event: &WatchEvent) -> Option<String> {
+    let WatchEvent::Deleted(_, prev) = event else {
+        return None;
+    };
+    let slice: EndpointSlice = serde_json::from_str(prev).ok()?;
+    let labels = slice.metadata.labels.as_ref()?;
+    if labels.get(MANAGED_BY_LABEL).map(String::as_str) != Some(CONTROLLER_NAME) {
+        return None;
+    }
+    let svc = labels.get(SERVICE_NAME_LABEL).filter(|s| !s.is_empty())?;
+    Some(format!(
+        "services/{}/{}",
+        slice.metadata.namespace.as_deref().unwrap_or(""),
+        svc
+    ))
 }
 
 const INFORMER_RESYNC_PERIOD: std::time::Duration = std::time::Duration::from_secs(12 * 3600);
@@ -397,6 +432,18 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                     continue;
                 }
             };
+            let slice_watch = match self
+                .storage
+                .watch(&build_prefix("endpointslices", None))
+                .await
+            {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::error!("Failed to establish endpointslice watch: {}, retrying", e);
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
             let ep_watch = match self.storage.watch(&ep_prefix).await {
                 Ok(w) => w,
                 Err(e) => {
@@ -419,6 +466,7 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
             let mut svc_watch = svc_watch;
             let mut pod_watch = pod_watch;
             let mut ep_watch = ep_watch;
+            let mut slice_watch = slice_watch;
             let mut resync = tokio::time::interval(resync_period());
             resync.tick().await;
 
@@ -453,6 +501,25 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                             }
                             None => {
                                 tracing::warn!("Pod watch stream ended, reconnecting");
+                                watch_broken = true;
+                            }
+                        }
+                    }
+                    event = slice_watch.next() => {
+                        match event {
+                            Some(Ok(ev)) => {
+                                if let Some(key) = service_key_for_deleted_slice(&ev){
+                                    queue
+                                        .add_after(key, ENDPOINT_SLICE_CHANGE_MIN_SYNC_DELAY)
+                                        .await;
+                                }
+                            }
+                            Some(Err(e)) => {
+                                tracing::warn!("EndpointSlice watch error: {}, reconnecting", e);
+                                watch_broken = true;
+                            }
+                            None => {
+                                tracing::warn!("EndpointSlice watch stream ended, reconnecting");
                                 watch_broken = true;
                             }
                         }
@@ -2457,6 +2524,78 @@ mod tests {
             storage.pod_lists.load(Ordering::SeqCst),
             before,
             "a pod event must update the snapshot, not trigger a pod LIST"
+        );
+    }
+
+    /// Conformance "should create Endpoints and EndpointSlices for Pods
+    /// matching a Service" deletes the slices of a named-port Service and
+    /// expects them back (test/e2e/network/endpointslice.go:261-263).
+    /// Upstream gets that from `onEndpointSliceDelete`
+    /// (pkg/controller/endpointslice/endpointslice_controller.go:583-592),
+    /// which queues the owning Service.
+    #[tokio::test]
+    async fn deleted_slice_is_recreated_without_waiting_for_resync() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut svc = snapshot_service("svc");
+        svc.spec.selector = Some(HashMap::from([("app".to_string(), "x".to_string())]));
+        storage
+            .create(&build_key("services", Some("ns"), "svc"), &svc)
+            .await
+            .unwrap();
+        let controller = Arc::new(EndpointSliceController::new(Arc::clone(&storage)));
+        let handle = tokio::spawn(async move { controller.run().await });
+        let es_key = build_key("endpointslices", Some("ns"), "svc");
+        let mut created = false;
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if storage.get::<EndpointSlice>(&es_key).await.is_ok() {
+                created = true;
+                break;
+            }
+        }
+        assert!(created, "slice never created");
+        storage.delete(&es_key).await.unwrap();
+        let mut back = false;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if storage.get::<EndpointSlice>(&es_key).await.is_ok() {
+                back = true;
+                break;
+            }
+        }
+        handle.abort();
+        assert!(back, "deleted slice was not recreated");
+    }
+
+    #[test]
+    fn service_key_for_deleted_slice_uses_service_name_label() {
+        let slice = |managed: &str, svc: Option<&str>| {
+            let mut l = HashMap::from([(MANAGED_BY_LABEL.to_string(), managed.to_string())]);
+            if let Some(s) = svc {
+                l.insert("kubernetes.io/service-name".to_string(), s.to_string());
+            }
+            let mut es = EndpointSlice::new("x-abc", "IPv4");
+            es.metadata.name = "x-abc".to_string();
+            es.metadata.namespace = Some("ns".to_string());
+            es.metadata.labels = Some(l);
+            WatchEvent::Deleted(
+                "/registry/endpointslices/ns/x-abc".to_string(),
+                serde_json::to_string(&es).unwrap(),
+            )
+        };
+        assert_eq!(
+            service_key_for_deleted_slice(&slice("endpointslice-controller.k8s.io", Some("svc"))),
+            Some("services/ns/svc".to_string())
+        );
+        // ManagedByController false (reconciler.go:666-669).
+        assert_eq!(
+            service_key_for_deleted_slice(&slice("someone-else", Some("svc"))),
+            None
+        );
+        // ServiceControllerKey errors without the label (utils.go:205-208).
+        assert_eq!(
+            service_key_for_deleted_slice(&slice("endpointslice-controller.k8s.io", None)),
+            None
         );
     }
 
