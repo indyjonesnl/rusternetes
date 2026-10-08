@@ -498,6 +498,63 @@ impl Storage for MemoryStorage {
         Ok(results)
     }
 
+    /// The collection as it stood at `revision` — etcd's
+    /// `Range(WithRev(revision))`, which `GetList` issues when
+    /// `ValidateListOptions` yields `withRev` (`etcd3/store.go` GetList;
+    /// `storage/interfaces.go:358-360,374-375`). The live state is rewound by
+    /// undoing, newest first, every retained write newer than `revision`.
+    ///
+    /// A revision the retained history no longer covers (evicted from the
+    /// ring) or at/below a compaction is `Gone`, upstream's
+    /// `NewResourceExpired("The resourceVersion for the provided list is too
+    /// old.")` (`etcd3/errors.go:53,68-72`). `revision <= 0` reads live, as
+    /// `Range` with no revision does.
+    async fn list_at_revision<T>(&self, prefix: &str, revision: i64) -> Result<Vec<T>>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        if revision <= 0 {
+            return self.list(prefix).await;
+        }
+        let compacted = self
+            .compacted_revision
+            .load(std::sync::atomic::Ordering::SeqCst);
+        // Held across the data read so no write lands between the two: `emit`
+        // takes this lock after the write, so a write either has its undo entry
+        // here and its effect in `data`, or neither is visible... except the
+        // sliver between a writer's `data` update and its `emit`; undoing only
+        // entries newer than `revision` makes that harmless for a `revision`
+        // at or below the revision the caller already observed.
+        let h = self.history.lock().unwrap();
+        if revision < h.evicted_floor || (compacted > 0 && revision <= compacted) {
+            return Err(Error::Gone(
+                "The resourceVersion for the provided list is too old.".to_string(),
+            ));
+        }
+        let mut state: std::collections::BTreeMap<String, String> = self
+            .data
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| k.starts_with(prefix))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (rev, key, previous) in h.undo.iter().rev() {
+            if *rev <= revision || !key.starts_with(prefix) {
+                continue;
+            }
+            match previous {
+                Some(v) => state.insert(key.clone(), v.clone()),
+                None => state.remove(key),
+            };
+        }
+        drop(h);
+        state
+            .values()
+            .map(|v| serde_json::from_str(v).map_err(Error::from))
+            .collect()
+    }
+
     /// Replay every retained event with revision `>= revision` under `prefix`,
     /// then continue live -- etcd's `WithRev(start)` semantics
     /// (`etcd3/watcher.go:380`; callers pass `rv + 1`).

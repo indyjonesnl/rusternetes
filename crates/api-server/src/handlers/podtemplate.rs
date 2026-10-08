@@ -23,7 +23,7 @@ use rusternetes_common::{
     resources::PodTemplate,
     List, Result,
 };
-use rusternetes_storage::{build_prefix, Storage};
+use rusternetes_storage::build_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
@@ -233,7 +233,8 @@ pub async fn list_podtemplates(
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
     let prefix = build_prefix("podtemplates", Some(&namespace));
-    let mut podtemplates: Vec<PodTemplate> = state.storage.list(&prefix).await?;
+    let mut podtemplates: Vec<PodTemplate> =
+        crate::handlers::list_options::list_items(&*state.storage, &prefix, &params).await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut podtemplates, &params)?;
@@ -258,8 +259,12 @@ pub async fn list_podtemplates(
     // The list RV must never fall below an item this same list returns.
     // Upstream gets both from one etcd range response; here the store
     // revision and the items are read separately, so take the max (#1825).
-    let resource_version =
-        crate::handlers::list_collection_resource_version(&state.storage, &podtemplates).await;
+    let resource_version = crate::handlers::list_options::list_resource_version(
+        &state.storage,
+        &params,
+        &podtemplates,
+    )
+    .await;
 
     let paginated =
         match rusternetes_common::paginate(podtemplates, pagination_params, &resource_version) {
@@ -345,7 +350,8 @@ pub async fn list_all_podtemplates(
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
     let prefix = build_prefix("podtemplates", None);
-    let mut podtemplates: Vec<PodTemplate> = state.storage.list(&prefix).await?;
+    let mut podtemplates: Vec<PodTemplate> =
+        crate::handlers::list_options::list_items(&*state.storage, &prefix, &params).await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut podtemplates, &params)?;
@@ -370,8 +376,12 @@ pub async fn list_all_podtemplates(
     // The list RV must never fall below an item this same list returns.
     // Upstream gets both from one etcd range response; here the store
     // revision and the items are read separately, so take the max (#1825).
-    let resource_version =
-        crate::handlers::list_collection_resource_version(&state.storage, &podtemplates).await;
+    let resource_version = crate::handlers::list_options::list_resource_version(
+        &state.storage,
+        &params,
+        &podtemplates,
+    )
+    .await;
 
     let paginated =
         match rusternetes_common::paginate(podtemplates, pagination_params, &resource_version) {

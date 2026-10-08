@@ -659,7 +659,8 @@ pub async fn list(
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
     let prefix = build_prefix("pods", Some(&namespace));
-    let mut pods: Vec<Pod> = state.storage.list(&prefix).await?;
+    let mut pods: Vec<Pod> =
+        crate::handlers::list_options::list_items(&*state.storage, &prefix, &params).await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut pods, &params)?;
@@ -690,7 +691,7 @@ pub async fn list(
     // Upstream gets both from one etcd range response; here the store
     // revision and the items are read separately, so take the max (#1825).
     let resource_version =
-        crate::handlers::list_collection_resource_version(&state.storage, &pods).await;
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &pods).await;
 
     // Apply pagination
     let paginated = match rusternetes_common::paginate(pods, pagination_params, &resource_version) {
@@ -794,7 +795,9 @@ pub async fn list_all_pods(
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
     let prefix = build_prefix("pods", None);
-    let mut pods = state.storage.list::<Pod>(&prefix).await?;
+    let mut pods =
+        crate::handlers::list_options::list_items::<Pod, _>(&*state.storage, &prefix, &params)
+            .await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut pods, &params)?;
@@ -822,7 +825,7 @@ pub async fn list_all_pods(
     // Upstream gets both from one etcd range response; here the store
     // revision and the items are read separately, so take the max (#1825).
     let resource_version =
-        crate::handlers::list_collection_resource_version(&state.storage, &pods).await;
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &pods).await;
 
     // Apply pagination
     let paginated = match rusternetes_common::paginate(pods, pagination_params, &resource_version) {
