@@ -164,7 +164,7 @@ mod tests {
 
     /// `createPod`.
     fn create_pod(name: &str, ready: DateTime<Utc>) -> Pod {
-        // Struct-init (not `.status = Some(`): a test fixture, not a controller
+        // Struct-init on purpose: a test fixture, not a controller
         // writing status (tests/it/status_subresource_guard.rs).
         let base = Pod::new(name, PodSpec::default());
         let status = Some(PodStatus {
