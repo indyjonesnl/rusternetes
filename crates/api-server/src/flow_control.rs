@@ -16,26 +16,38 @@
 //!   `Reject` => 429 immediately; `Queue` => bounded wait then 429
 //!   (`tooManyRequests`, priority-and-fairness.go:377-381).
 //!
-//! DELIBERATE DEVIATIONS (tracked as follow-up issues): no shuffle-sharded
-//! fair queueing across flows (a bounded FIFO semaphore wait stands in for the
-//! QueueSet), no borrowing between levels / dynamic currentCL adjustment, no
-//! width (work) estimator, no metrics, no FlowSchema status updates, and the
+//! - `apf_controller.go` `queueSetCompleterForPL` (:916-955) and
+//!   `startRequest` (:1022-1079): one `QueueSet` per priority level
+//!   (`flow_control_queueset.rs`), built from `LimitResponse.Queuing`
+//!   (`Reject` => `DesiredNumQueues` 0, i.e. queueless; `Exempt` => -1),
+//!   re-configured in place (`BeginConfigChange`) on every digest so queued and
+//!   executing requests survive a reload; `hashFlowID` (:1131-1140) with the
+//!   flow distinguisher computed only when the level has more than one queue.
+//!
+//! DELIBERATE DEVIATIONS (tracked as follow-up issues): no borrowing between
+//! levels / dynamic currentCL adjustment (currentCL == nominalCL), no width
+//! (work) estimator (callers pass seats), no metrics, no FlowSchema status
+//! updates, no quiescing/reaping of removed levels (a removed level's
+//! queueset is simply dropped once its in-flight handles finish), and the
 //! engine is NOT yet installed as a request filter, so nothing is enforced.
 
 use rusternetes_common::resources::flowcontrol::{
-    FlowDistinguisherMethodType, FlowSchema, FlowSchemaSubject, LimitResponseType,
-    NonResourcePolicyRule, PolicyRulesWithSubjects, PriorityLevelConfiguration, PriorityLevelType,
-    ResourcePolicyRule, SubjectKind,
+    FlowDistinguisherMethodType, FlowSchema, FlowSchemaSubject, NonResourcePolicyRule,
+    PolicyRulesWithSubjects, PriorityLevelConfiguration, PriorityLevelType, ResourcePolicyRule,
+    SubjectKind,
 };
 use rusternetes_common::validation::flowcontrol_bootstrap::{
     mandatory_flow_schema, mandatory_priority_level_configuration,
 };
 use rusternetes_storage::{build_key, Storage};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use tokio::sync::Semaphore;
+
+use crate::flow_control_queueset::{
+    DispatchingConfig, Execution, QueueSet, QueuingConfig, RealClock, WorkEstimate,
+};
+use sha2::{Digest, Sha256};
 use tracing::warn;
 
 /// `--max-requests-inflight` default (`server/config.go:443`).
@@ -182,10 +194,9 @@ struct LevelState {
     exempt: bool,
     /// Concurrency limit in seats (`nominalCL`; no borrowing, see module docs).
     nominal_cl: usize,
-    reject: bool,
-    max_waiting: usize,
-    semaphore: Arc<Semaphore>,
-    waiting: AtomicUsize,
+    /// `QueuingConfig.DesiredNumQueues` (startRequest reads `Queues` for it).
+    num_queues: isize,
+    queues: Arc<QueueSet>,
 }
 
 struct Config {
@@ -210,11 +221,48 @@ fn shares_of(pl: &PriorityLevelConfiguration) -> i32 {
     }
 }
 
+/// `queueSetCompleterForPL` (apf_controller.go:916-955): the queueset config
+/// of a priority level.
+fn queuing_config_for_pl(pl: &PriorityLevelConfiguration) -> QueuingConfig {
+    let mut q = QueuingConfig {
+        name: pl.metadata.name.clone(),
+        ..Default::default()
+    };
+    if pl.spec.limited.is_some() {
+        if let Some(qc) = pl
+            .spec
+            .limited
+            .as_ref()
+            .and_then(|l| l.limit_response.as_ref())
+            .and_then(|lr| lr.queuing.as_ref())
+        {
+            q.desired_num_queues = qc.queues as isize;
+            q.queue_length_limit = qc.queue_length_limit as isize;
+            q.hand_size = qc.hand_size as isize;
+        }
+    } else {
+        q.desired_num_queues = -1;
+    }
+    q
+}
+
+/// `hashFlowID` (apf_controller.go:1131-1140): the first 8 bytes of
+/// `sha256(fsName || 0x00 || flowDistinguisher)`, little endian.
+pub fn hash_flow_id(fs_name: &str, flow_distinguisher: &str) -> u64 {
+    let mut h = Sha256::new();
+    h.update(fs_name.as_bytes());
+    h.update([0u8]);
+    h.update(flow_distinguisher.as_bytes());
+    let sum = h.finalize();
+    u64::from_le_bytes(sum[..8].try_into().expect("sha256 is 32 bytes"))
+}
+
 /// Port of `digestFlowSchemasLocked` + `finishQueueSetReconfigsLocked`.
 fn digest(
     mut pls: Vec<PriorityLevelConfiguration>,
     fss: Vec<FlowSchema>,
     server_cl: i64,
+    prev: Option<&Config>,
 ) -> Config {
     for name in ["exempt", "catch-all"] {
         if !pls.iter().any(|p| p.metadata.name == name) {
@@ -233,31 +281,41 @@ fn digest(
         } else {
             0
         };
-        let (reject, max_waiting) = match pl
-            .spec
-            .limited
-            .as_ref()
-            .and_then(|l| l.limit_response.as_ref())
-        {
-            Some(lr) => match (&lr.type_, &lr.queuing) {
-                (LimitResponseType::Queue, Some(q)) => (
-                    false,
-                    (q.queues.max(0) as usize) * (q.queue_length_limit.max(0) as usize),
-                ),
-                (LimitResponseType::Queue, None) => (false, 0),
-                _ => (true, 0),
+        let qcfg = queuing_config_for_pl(pl);
+        let dcfg = DispatchingConfig {
+            concurrency_limit: cl,
+        };
+        let num_queues = qcfg.desired_num_queues;
+        // BeginConfigChange on the existing queueset, else BeginConstruction.
+        let queues = match prev.and_then(|c| c.levels.get(&pl.metadata.name)) {
+            Some(old) => match old.queues.set_configuration(qcfg, dcfg) {
+                Ok(()) => old.queues.clone(),
+                Err(e) => {
+                    warn!(
+                        "priority level {:?} has an invalid configuration: {}",
+                        pl.metadata.name, e
+                    );
+                    continue;
+                }
             },
-            None => (false, 0),
+            None => match QueueSet::new(Arc::new(RealClock::default()), qcfg, dcfg) {
+                Ok(q) => q,
+                Err(e) => {
+                    warn!(
+                        "priority level {:?} has an invalid configuration: {}",
+                        pl.metadata.name, e
+                    );
+                    continue;
+                }
+            },
         };
         levels.insert(
             pl.metadata.name.clone(),
             LevelState {
                 exempt,
                 nominal_cl: cl,
-                reject,
-                max_waiting,
-                semaphore: Arc::new(Semaphore::new(cl)),
-                waiting: AtomicUsize::new(0),
+                num_queues,
+                queues,
             },
         );
     }
@@ -288,11 +346,6 @@ fn digest(
     }
 }
 
-/// `hashFlowID` (apf_controller.go:1131-1140). STUB: red-test scaffold.
-pub fn hash_flow_id(_fs_name: &str, _flow_distinguisher: &str) -> u64 {
-    0
-}
-
 /// Errors from [`FlowControlEngine::execute`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum FlowControlError {
@@ -310,7 +363,7 @@ impl std::error::Error for FlowControlError {}
 
 /// Holds seats while a request executes; released on drop.
 pub struct FlowControlPermit {
-    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    _execution: Option<Execution>,
 }
 
 pub struct FlowControlEngine<S: Storage> {
@@ -333,7 +386,7 @@ impl<S: Storage> FlowControlEngine<S> {
         Self {
             storage,
             server_cl,
-            config: RwLock::new(Arc::new(digest(vec![], vec![], server_cl))),
+            config: RwLock::new(Arc::new(digest(vec![], vec![], server_cl, None))),
         }
     }
 
@@ -355,7 +408,8 @@ impl<S: Storage> FlowControlEngine<S> {
                 warn!("Failed to load PriorityLevelConfigurations: {}", e);
                 Vec::new()
             });
-        *self.config.write().unwrap() = Arc::new(digest(pls, fss, self.server_cl));
+        let prev = self.config.read().unwrap().clone();
+        *self.config.write().unwrap() = Arc::new(digest(pls, fss, self.server_cl, Some(&prev)));
         Ok(())
     }
 
@@ -390,40 +444,47 @@ impl<S: Storage> FlowControlEngine<S> {
             .map(|l| l.nominal_cl)
     }
 
-    /// Acquire `seats` for a request of the given level, waiting at most
-    /// `wait_limit` for `Queue` levels.
+    /// `startRequest` + `Request.Finish` (apf_controller.go:1022-1079,
+    /// apf_filter.go:155): start the request in its level's queueset and wait
+    /// at most `wait_limit` (upstream: `newReqWaitCtxFn`) to be dispatched.
+    /// Dropping the returned permit finishes the request.
     pub async fn execute(
         &self,
         c: &Classification,
         seats: u32,
         wait_limit: Duration,
     ) -> Result<FlowControlPermit, FlowControlError> {
-        let priority_level = c.priority_level.as_str();
         let cfg = self.config.read().unwrap().clone();
-        let Some(level) = cfg.levels.get(priority_level) else {
-            return Ok(FlowControlPermit { _permit: None });
+        let Some(level) = cfg.levels.get(&c.priority_level) else {
+            return Ok(FlowControlPermit { _execution: None });
         };
-        if level.exempt {
-            return Ok(FlowControlPermit { _permit: None });
-        }
-        // Clamp a too-wide request to the level, as upstream clamps to max seats.
-        let seats = seats.max(1).min(level.nominal_cl.max(1) as u32);
-        if let Ok(p) = level.semaphore.clone().try_acquire_many_owned(seats) {
-            return Ok(FlowControlPermit { _permit: Some(p) });
-        }
-        if level.reject || level.waiting.load(Ordering::SeqCst) >= level.max_waiting {
-            return Err(FlowControlError::TooManyRequests);
-        }
-        level.waiting.fetch_add(1, Ordering::SeqCst);
-        let got = tokio::time::timeout(
-            wait_limit,
-            level.semaphore.clone().acquire_many_owned(seats),
-        )
-        .await;
-        level.waiting.fetch_sub(1, Ordering::SeqCst);
-        match got {
-            Ok(Ok(p)) => Ok(FlowControlPermit { _permit: Some(p) }),
-            _ => Err(FlowControlError::TooManyRequests),
+        // The flow distinguisher and hash only matter with more than one queue.
+        let (hash_value, flow_distinguisher) = if !level.exempt && level.num_queues > 1 {
+            (
+                hash_flow_id(&c.flow_schema, &c.flow_distinguisher),
+                c.flow_distinguisher.as_str(),
+            )
+        } else {
+            (0, "")
+        };
+        let we = WorkEstimate {
+            initial_seats: seats.max(1) as u64,
+            final_seats: 0,
+            additional_latency: Duration::ZERO,
+        };
+        let handle = level
+            .queues
+            .start_request(&we, hash_value, flow_distinguisher, &c.flow_schema)
+            .map_err(|_| FlowControlError::TooManyRequests)?;
+        // Dropping the wait future on timeout cancels the queued request.
+        match tokio::time::timeout(wait_limit, handle.wait()).await {
+            Ok(exec) => {
+                exec.note_dispatched();
+                Ok(FlowControlPermit {
+                    _execution: Some(exec),
+                })
+            }
+            Err(_) => Err(FlowControlError::TooManyRequests),
         }
     }
 }
@@ -550,7 +611,7 @@ mod tests {
     // ---- QueueSet wiring (#2741) ----
 
     use rusternetes_common::resources::flowcontrol::{
-        LimitResponse, LimitedPriorityLevelConfiguration, QueuingConfiguration,
+        LimitResponse, LimitResponseType, LimitedPriorityLevelConfiguration, QueuingConfiguration,
     };
     use rusternetes_common::types::ObjectMeta;
 
@@ -617,7 +678,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 drop(p);
             }));
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::task::yield_now().await;
         }
         drop(held);
         for t in tasks {
