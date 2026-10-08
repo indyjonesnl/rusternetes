@@ -142,6 +142,10 @@ impl RestCreateStrategy<Job> for Strategy {
         generate_selector_if_needed(obj);
         obj.status = Some(JobStatus::default());
         obj.metadata.generation = Some(1);
+        rusternetes_common::pod_drop_disabled::drop_disabled_template_fields(
+            &mut obj.spec.template,
+            None,
+        );
     }
 
     fn validate(&self, _ctx: &RequestContext, obj: &Job) -> ErrorList {
@@ -172,6 +176,10 @@ impl RestUpdateStrategy<Job> for Strategy {
     /// change bumps the generation.
     fn prepare_for_update(&self, _ctx: &RequestContext, obj: &mut Job, old: &Job) {
         obj.status = old.status.clone();
+        rusternetes_common::pod_drop_disabled::drop_disabled_template_fields(
+            &mut obj.spec.template,
+            Some(&old.spec.template),
+        );
         if !semantic_equal(&obj.spec, &old.spec) {
             obj.metadata.generation = Some(old.metadata.generation.unwrap_or(0) + 1);
         }

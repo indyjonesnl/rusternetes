@@ -38,11 +38,14 @@ impl NamespaceScopedStrategy for Strategy {
 
 impl RestCreateStrategy<CronJob> for Strategy {
     /// `PrepareForCreate` (strategy.go:87-93): status is cleared and the
-    /// generation starts at 1. `DropDisabledTemplateFields` drops nothing we
-    /// model (see the Deployment strategy).
+    /// generation starts at 1; `DropDisabledTemplateFields` is strategy.go:93.
     fn prepare_for_create(&self, _ctx: &RequestContext, obj: &mut CronJob) {
         obj.status = Some(CronJobStatus::default());
         obj.metadata.generation = Some(1);
+        rusternetes_common::pod_drop_disabled::drop_disabled_template_fields(
+            &mut obj.spec.job_template.spec.template,
+            None,
+        );
     }
 
     fn validate(&self, _ctx: &RequestContext, obj: &CronJob) -> ErrorList {
@@ -76,6 +79,10 @@ impl RestUpdateStrategy<CronJob> for Strategy {
     /// change bumps the generation.
     fn prepare_for_update(&self, _ctx: &RequestContext, obj: &mut CronJob, old: &CronJob) {
         obj.status = old.status.clone();
+        rusternetes_common::pod_drop_disabled::drop_disabled_template_fields(
+            &mut obj.spec.job_template.spec.template,
+            Some(&old.spec.job_template.spec.template),
+        );
         if !semantic_equal(&obj.spec, &old.spec) {
             obj.metadata.generation = Some(old.metadata.generation.unwrap_or(0) + 1);
         }

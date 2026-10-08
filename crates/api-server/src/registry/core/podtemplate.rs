@@ -35,10 +35,13 @@ impl NamespaceScopedStrategy for Strategy {
 
 impl RestCreateStrategy<PodTemplate> for Strategy {
     /// `PrepareForCreate` (strategy.go:48-52): the generation starts at 1.
-    /// `DropDisabledTemplateFields` drops nothing we model (see the
-    /// Deployment strategy).
+    /// `DropDisabledTemplateFields` is strategy.go:51.
     fn prepare_for_create(&self, _ctx: &RequestContext, obj: &mut PodTemplate) {
         obj.metadata.generation = Some(1);
+        rusternetes_common::pod_drop_disabled::drop_disabled_template_fields(
+            &mut obj.template,
+            None,
+        );
     }
 
     fn validate(&self, _ctx: &RequestContext, obj: &PodTemplate) -> ErrorList {
@@ -57,6 +60,10 @@ impl RestUpdateStrategy<PodTemplate> for Strategy {
     /// `PrepareForUpdate` (strategy.go:77-89): a template change bumps the
     /// generation.
     fn prepare_for_update(&self, _ctx: &RequestContext, obj: &mut PodTemplate, old: &PodTemplate) {
+        rusternetes_common::pod_drop_disabled::drop_disabled_template_fields(
+            &mut obj.template,
+            Some(&old.template),
+        );
         if !semantic_equal(&obj.template, &old.template) {
             obj.metadata.generation = Some(old.metadata.generation.unwrap_or(0) + 1);
         }

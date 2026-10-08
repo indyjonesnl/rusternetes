@@ -218,7 +218,6 @@ mod pod_security_admission_test;
 mod pod_spec_decodes_when_absent_test;
 mod pod_store_test;
 mod pod_strategy_gaps_test;
-mod workload_template_drop_disabled_test;
 mod pod_subresources_store_test;
 mod pod_terminating_grace_test;
 mod pod_update_immutability_test;
@@ -347,6 +346,7 @@ mod webhook_config_watch_cabundle_test;
 mod webhook_match_conditions_test;
 mod webhook_timeout_test;
 mod workload_template_decodes_when_absent_test;
+mod workload_template_drop_disabled_test;
 
 mod metrics_label_selector_test;
 mod networking_store_test;

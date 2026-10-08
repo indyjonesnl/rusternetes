@@ -40,7 +40,10 @@ async fn assert_dropped(path: &str, body: Value, tmpl_path: &[&str]) {
     for k in tmpl_path {
         v = &v[*k];
     }
-    assert!(v.is_object(), "template missing at {tmpl_path:?}: {created}");
+    assert!(
+        v.is_object(),
+        "template missing at {tmpl_path:?}: {created}"
+    );
     assert!(v.get("workloadRef").is_none(), "{created}");
 }
 
