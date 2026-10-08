@@ -647,12 +647,13 @@ mod tests {
             "apiVersion": "v1", "kind": "PersistentVolume",
             "metadata": {"name": "pv-grow"},
             "spec": {"capacity": {"storage": "5Gi"}, "accessModes": ["ReadWriteOnce"],
-                     "storageClassName": "expandable"}
+                     "storageClassName": "expandable",
+                     "claimRef": {"namespace": "default", "name": "pvc-grow", "uid": "u-grow"}}
         }))
         .unwrap();
         let pvc: PersistentVolumeClaim = serde_json::from_value(serde_json::json!({
             "apiVersion": "v1", "kind": "PersistentVolumeClaim",
-            "metadata": {"name": "pvc-grow", "namespace": "default"},
+            "metadata": {"name": "pvc-grow", "namespace": "default", "uid": "u-grow"},
             "spec": {"accessModes": ["ReadWriteOnce"], "storageClassName": "expandable",
                      "volumeName": "pv-grow", "resources": {"requests": {"storage": "10Gi"}}},
             "status": {"phase": "Bound", "capacity": {"storage": "5Gi"}}
