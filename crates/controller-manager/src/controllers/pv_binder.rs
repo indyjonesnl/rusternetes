@@ -114,15 +114,6 @@ fn is_pod_terminated(pod: &Pod) -> bool {
         && not_running(&status.ephemeral_container_statuses)
 }
 
-/// `FindRecyclablePluginBySpec` (`pkg/volume/plugins.go:751`): the in-tree
-/// plugins kube-controller-manager registers a recycler for are hostPath and
-/// NFS (`cmd/kube-controller-manager/app/plugins.go:67-120`). Their
-/// recycler-pod execution is not ported, so those volumes are left Released;
-/// every other source has no recycler.
-fn has_recyclable_plugin(spec: &PersistentVolumeSpec) -> bool {
-    spec.host_path.is_some() || spec.nfs.is_some()
-}
-
 /// The slice of `findDeletablePlugin` (`pv_controller.go:1954-1994`) that
 /// resolves to the in-tree hostPath deleter: returns the PV's hostPath path
 /// when that plugin applies. A CSI source or a `migrated-to` annotation means
@@ -199,6 +190,10 @@ async fn host_path_delete(path: &str) -> std::result::Result<(), String> {
 pub struct PVBinderController<S: Storage> {
     storage: Arc<S>,
     recorder: EventRecorder<S>,
+    /// `ctrl.runningOperations` (`goroutinemap`): names of the volume
+    /// operations currently running, so one is never started twice
+    /// (`scheduleOperation`, `pv_controller.go:1895-1914`).
+    running_operations: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl<S: Storage + 'static> PVBinderController<S> {
@@ -206,7 +201,57 @@ impl<S: Storage + 'static> PVBinderController<S> {
         Self {
             recorder: EventRecorder::new(Arc::clone(&storage)),
             storage,
+            running_operations: Arc::default(),
         }
+    }
+
+    /// A handle for a detached volume operation: shares storage, recorder and
+    /// the running-operation set (upstream's operations are goroutines closing
+    /// over `ctrl`).
+    fn operation_handle(&self) -> Self {
+        Self {
+            storage: Arc::clone(&self.storage),
+            recorder: self.recorder.clone(),
+            running_operations: Arc::clone(&self.running_operations),
+        }
+    }
+
+    /// `scheduleOperation` (`pv_controller.go:1895-1914`) with
+    /// `goroutinemap.Run`: start `op` detached unless one with the same name
+    /// is running ("Operation is already running, skipping").
+    fn schedule_operation<F>(&self, name: String, op: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        {
+            let mut running = self
+                .running_operations
+                .lock()
+                .expect("running operations mutex poisoned");
+            if !running.insert(name.clone()) {
+                debug!("Operation {} is already running, skipping", name);
+                return;
+            }
+        }
+        let running = Arc::clone(&self.running_operations);
+        tokio::spawn(async move {
+            op.await;
+            running
+                .lock()
+                .expect("running operations mutex poisoned")
+                .remove(&name);
+        });
+    }
+
+    /// Whether any volume operation is still running (test synchronisation:
+    /// upstream's tests wait on `runningOperations`).
+    #[cfg(test)]
+    fn operations_running(&self) -> bool {
+        !self
+            .running_operations
+            .lock()
+            .expect("running operations mutex poisoned")
+            .is_empty()
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
@@ -612,8 +657,9 @@ impl<S: Storage + 'static> PVBinderController<S> {
 
     /// `reclaimVolume` (`pv_controller.go:1180-1230`). `Retain` does nothing;
     /// `Delete` removes the PV. `Recycle` on a volume with no recycler
-    /// plugin fails it (`recycleVolumeOperation`, `:1279-1286`); the hostPath/NFS
-    /// recycler pods are not ported, so those stay `Released` like `Retain`. A PV carrying the
+    /// plugin fails it (`recycleVolumeOperation`, `:1279-1286`); hostPath/NFS
+    /// volumes are scrubbed by a recycler pod ([`super::pv_recycler`]) in a
+    /// detached operation (`:1192-1198`). A PV carrying the
     /// `pv.kubernetes.io/migrated-to` annotation is left to the external
     /// provisioner (`:1183-1187`).
     async fn reclaim_volume(&self, pv: &PersistentVolume) -> Result<()> {
@@ -627,19 +673,14 @@ impl<S: Storage + 'static> PVBinderController<S> {
             return Ok(());
         }
         if pv.spec.persistent_volume_reclaim_policy == Some(PersistentVolumeReclaimPolicy::Recycle)
-            && !has_recyclable_plugin(&pv.spec)
         {
-            // recycleVolumeOperation, "No recycler found" branch
-            // (`pv_controller.go:1279-1286`): Failed phase + Warning event.
-            // Upstream: "the controller will retry
-            // recycling the volume in every syncVolume() call".
-            self.update_volume_phase_with_event(
-                pv.clone(),
-                PersistentVolumePhase::Failed,
-                "VolumeFailedRecycle",
-                "No recycler plugin found for the volume!",
-            )
-            .await?;
+            // `case v1.PersistentVolumeReclaimRecycle` (`:1192-1198`).
+            let opname = format!("recycle-{}[{}]", pv.metadata.name, pv.metadata.uid);
+            let handle = self.operation_handle();
+            let pv = pv.clone();
+            self.schedule_operation(opname, async move {
+                handle.recycle_volume_operation(pv).await;
+            });
             return Ok(());
         }
         if matches!(
@@ -682,6 +723,136 @@ impl<S: Storage + 'static> PVBinderController<S> {
             info!("Reclaim(Delete): deleted released PV {}", pv.metadata.name);
         }
         Ok(())
+    }
+
+    /// `recycleVolumeOperation` (`pv_controller.go:1227-1321`), the part after
+    /// the `isVolumeReleased`/`isVolumeUsed` guards: find the recycler
+    /// plugin, run it, then either mark the volume Failed or make it
+    /// Available again via `unbindVolume`. Runs detached, see
+    /// [`Self::schedule_operation`].
+    async fn recycle_volume_operation(&self, volume: PersistentVolume) {
+        debug!(
+            "RecycleVolumeOperation started for {}",
+            volume.metadata.name
+        );
+
+        // "This method may have been waiting for a volume lock for some time.
+        // Previous recycleVolumeOperation might just have saved an updated
+        // version, so read current volume state now."
+        let pv_key = build_key("persistentvolumes", None, &volume.metadata.name);
+        let volume = match self.storage.get::<PersistentVolume>(&pv_key).await {
+            Ok(v) => v,
+            Err(e) => {
+                debug!(
+                    "Error reading persistent volume {}: {}",
+                    volume.metadata.name, e
+                );
+                return;
+            }
+        };
+
+        // Find a plugin.
+        let Some(pod) = super::pv_recycler::recycler_pod_for_volume(&volume) else {
+            // No recycler found. Emit an event and mark the volume Failed.
+            if let Err(e) = self
+                .update_volume_phase_with_event(
+                    volume.clone(),
+                    PersistentVolumePhase::Failed,
+                    "VolumeFailedRecycle",
+                    "No recycler plugin found for the volume!",
+                )
+                .await
+            {
+                debug!(
+                    "RecycleVolumeOperation: failed to mark volume {} as failed: {}",
+                    volume.metadata.name, e
+                );
+            }
+            // Despite the volume being Failed, the controller will retry
+            // recycling the volume in every syncVolume() call.
+            return;
+        };
+
+        // Plugin found: `plugin.Recycle(volume.Name, spec, recorder)`.
+        let recycled = match pod {
+            Ok(pod) => {
+                // `newRecyclerEventRecorder` (`:1916-1922`).
+                let recorder = self.recorder.clone();
+                let involved = object_ref_for_pv(&volume);
+                let handle = tokio::runtime::Handle::current();
+                let client = super::pv_recycler::StorageRecyclerClient::new(
+                    Arc::clone(&self.storage),
+                    Box::new(move |event_type, message| {
+                        let recorder = recorder.clone();
+                        let involved = involved.clone();
+                        let event_type = if event_type == "Warning" {
+                            EventType::Warning
+                        } else {
+                            EventType::Normal
+                        };
+                        let message = format!("Recycler pod: {message}");
+                        handle.spawn(async move {
+                            let source = EventSource {
+                                component: "persistentvolume-controller".to_string(),
+                                host: None,
+                            };
+                            if let Err(e) = recorder
+                                .event(&involved, &source, event_type, "RecyclerPod", &message)
+                                .await
+                            {
+                                tracing::warn!("Failed to record RecyclerPod event: {}", e);
+                            }
+                        });
+                    }),
+                );
+                super::pv_recycler::recycle_volume_by_watching_pod_until_completion(
+                    &volume.metadata.name,
+                    pod,
+                    &client,
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        };
+
+        if let Err(e) = recycled {
+            // Recycler failed.
+            let strerr = format!("Recycle failed: {e}");
+            if let Err(e) = self
+                .update_volume_phase_with_event(
+                    volume.clone(),
+                    PersistentVolumePhase::Failed,
+                    "VolumeFailedRecycle",
+                    &strerr,
+                )
+                .await
+            {
+                debug!(
+                    "RecycleVolumeOperation: failed to mark volume {} as failed: {}",
+                    volume.metadata.name, e
+                );
+            }
+            // Despite the volume being Failed, the controller will retry
+            // recycling the volume in every syncVolume() call.
+            return;
+        }
+
+        info!("Volume {} recycled", volume.metadata.name);
+        self.event(
+            object_ref_for_pv(&volume),
+            "VolumeRecycled",
+            "Volume recycled",
+        )
+        .await;
+        // Make the volume available again.
+        if let Err(e) = self.unbind_volume(volume.clone()).await {
+            // "Oops, could not save the volume and therefore the controller
+            // will recycle the volume again on next update."
+            debug!(
+                "RecycleVolumeOperation: failed to make recycled volume {} 'Available', we will recycle the volume again: {}",
+                volume.metadata.name, e
+            );
+        }
     }
 
     /// `unbindVolume` (`pv_controller.go:1140-1178`): roll back a binding. A
@@ -2477,6 +2648,7 @@ mod tests {
         pv.spec.persistent_volume_reclaim_policy = Some(PersistentVolumeReclaimPolicy::Recycle);
         put_pv(&storage, &pv).await;
         c.sync_volumes(&WorkQueue::new()).await.unwrap();
+        settle(&c).await;
         let status = get_pv(&storage, "pv").await.unwrap().status.unwrap();
         assert_eq!(status.phase, PersistentVolumePhase::Failed);
         assert_eq!(
@@ -2492,6 +2664,7 @@ mod tests {
         assert_eq!(ev.len(), 1);
         // Already Failed: a further sync must not emit another event.
         c.sync_volumes(&WorkQueue::new()).await.unwrap();
+        settle(&c).await;
         let events: Vec<rusternetes_common::resources::Event> =
             storage.list("/registry/events/").await.unwrap();
         assert_eq!(
@@ -2501,6 +2674,236 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// Wait for every detached volume operation to finish (upstream's tests
+    /// wait on `runningOperations` the same way).
+    async fn settle(c: &PVBinderController<MemoryStorage>) {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while c.operations_running() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("volume operations must finish");
+    }
+
+    /// Stand-in for the kubelet: once the recycler pod `recycler-for-<pv>`
+    /// exists, drive it to `phase` with `message`.
+    fn fake_kubelet(
+        storage: &Arc<MemoryStorage>,
+        pv: &str,
+        phase: rusternetes_common::types::Phase,
+        message: Option<&str>,
+    ) -> tokio::task::JoinHandle<()> {
+        let storage = Arc::clone(storage);
+        let key = build_key("pods", Some("default"), &format!("recycler-for-{pv}"));
+        let message = message.map(String::from);
+        tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    if let Ok(mut pod) = storage.get::<Pod>(&key).await {
+                        pod.status = Some(rusternetes_common::resources::pod::PodStatus {
+                            phase: Some(phase),
+                            message,
+                            ..Default::default()
+                        });
+                        storage.update(&key, &pod).await.unwrap();
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("recycler pod was never created");
+        })
+    }
+
+    fn recycle_pv(name: &str, by_controller: bool) -> PersistentVolume {
+        let mut pv = bound_pv(name);
+        pv.spec.persistent_volume_reclaim_policy = Some(PersistentVolumeReclaimPolicy::Recycle);
+        pv.spec.host_path = Some(
+            rusternetes_common::resources::volume::HostPathVolumeSource {
+                path: "/tmp/recycle-me".into(),
+                r#type: None,
+            },
+        );
+        if by_controller {
+            pv.metadata.annotations = Some(
+                [(ANN_BOUND_BY_CONTROLLER.to_string(), "yes".to_string())]
+                    .into_iter()
+                    .collect(),
+            );
+        }
+        pv
+    }
+
+    /// recycle_test.go "6-1": a hostPath volume bound by the controller is
+    /// recycled by a recycler pod, then unbound and Available again with a
+    /// `Normal VolumeRecycled` event; the recycler pod is gone afterwards.
+    #[tokio::test]
+    async fn recycle_hostpath_volume_bound_by_controller_becomes_available() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        put_pv(&storage, &recycle_pv("pv", true)).await;
+        let kubelet = fake_kubelet(
+            &storage,
+            "pv",
+            rusternetes_common::types::Phase::Succeeded,
+            None,
+        );
+        c.sync_volumes(&WorkQueue::new()).await.unwrap();
+        settle(&c).await;
+        kubelet.await.unwrap();
+        let got = get_pv(&storage, "pv").await.unwrap();
+        assert_eq!(got.status.unwrap().phase, PersistentVolumePhase::Available);
+        assert!(got.spec.claim_ref.is_none());
+        assert!(got.metadata.annotations.is_none());
+        let ev = events_with_reason(&storage, "VolumeRecycled").await;
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].message, "Volume recycled");
+        assert!(storage
+            .get::<Pod>(&build_key("pods", Some("default"), "recycler-for-pv"))
+            .await
+            .is_err());
+    }
+
+    /// recycle_test.go "6-2": a volume pre-bound by the user keeps its
+    /// claimRef (minus the UID) when recycled.
+    #[tokio::test]
+    async fn recycle_prebound_volume_keeps_claim_ref_name() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        put_pv(&storage, &recycle_pv("pv", false)).await;
+        let kubelet = fake_kubelet(
+            &storage,
+            "pv",
+            rusternetes_common::types::Phase::Succeeded,
+            None,
+        );
+        c.sync_volumes(&WorkQueue::new()).await.unwrap();
+        settle(&c).await;
+        kubelet.await.unwrap();
+        let got = get_pv(&storage, "pv").await.unwrap();
+        assert_eq!(got.status.unwrap().phase, PersistentVolumePhase::Available);
+        let cr = got.spec.claim_ref.expect("claimRef kept");
+        assert_eq!(cr.name.as_deref(), Some("c"));
+        assert!(cr.uid.is_none());
+    }
+
+    /// recycle_test.go "6-5": the recycler failing marks the volume Failed
+    /// with "Recycle failed: ..." and a `Warning VolumeFailedRecycle` event;
+    /// the volume is not unbound.
+    #[tokio::test]
+    async fn recycle_failure_marks_volume_failed() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        put_pv(&storage, &recycle_pv("pv", true)).await;
+        let kubelet = fake_kubelet(
+            &storage,
+            "pv",
+            rusternetes_common::types::Phase::Failed,
+            Some("Pod was active on the node longer than specified deadline"),
+        );
+        c.sync_volumes(&WorkQueue::new()).await.unwrap();
+        settle(&c).await;
+        kubelet.await.unwrap();
+        let got = get_pv(&storage, "pv").await.unwrap();
+        let status = got.status.unwrap();
+        assert_eq!(status.phase, PersistentVolumePhase::Failed);
+        assert_eq!(
+            status.message.as_deref(),
+            Some("Recycle failed: failed to recycle volume: Pod was active on the node longer than specified deadline")
+        );
+        assert!(got.spec.claim_ref.is_some());
+        let ev = events_with_reason(&storage, "VolumeFailedRecycle").await;
+        assert_eq!(ev.len(), 1);
+        assert!(events_with_reason(&storage, "VolumeRecycled")
+            .await
+            .is_empty());
+    }
+
+    /// recycle_test.go "6-9": a claim with the same name but another UID
+    /// exists (recreated); the old volume is still recycled.
+    #[tokio::test]
+    async fn recycle_prebound_volume_while_a_same_name_claim_exists() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        put_pv(&storage, &recycle_pv("pv", false)).await;
+        put_pvc(&storage, &make_pvc("c", "uid-x")).await;
+        let kubelet = fake_kubelet(
+            &storage,
+            "pv",
+            rusternetes_common::types::Phase::Succeeded,
+            None,
+        );
+        c.sync_volumes(&WorkQueue::new()).await.unwrap();
+        settle(&c).await;
+        kubelet.await.unwrap();
+        let got = get_pv(&storage, "pv").await.unwrap();
+        assert_eq!(got.status.unwrap().phase, PersistentVolumePhase::Available);
+    }
+
+    /// `nfsPlugin.Recycle`: NFS volumes have a recycler too.
+    #[tokio::test]
+    async fn recycle_nfs_volume_becomes_available() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        let mut pv = recycle_pv("pv", true);
+        pv.spec.host_path = None;
+        pv.spec.nfs = Some(rusternetes_common::resources::volume::NFSVolumeSource {
+            server: "srv".into(),
+            path: "/exp".into(),
+            read_only: None,
+        });
+        put_pv(&storage, &pv).await;
+        let kubelet = fake_kubelet(
+            &storage,
+            "pv",
+            rusternetes_common::types::Phase::Succeeded,
+            None,
+        );
+        c.sync_volumes(&WorkQueue::new()).await.unwrap();
+        settle(&c).await;
+        kubelet.await.unwrap();
+        let got = get_pv(&storage, "pv").await.unwrap();
+        assert_eq!(got.status.unwrap().phase, PersistentVolumePhase::Available);
+    }
+
+    /// `scheduleOperation`/`goroutinemap`: while a recycle operation for a
+    /// volume runs, another sync must not start a second one (which would
+    /// find the recycler pod "already exists" and delete it).
+    #[tokio::test]
+    async fn recycle_operation_is_not_scheduled_twice() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        put_pv(&storage, &recycle_pv("pv", true)).await;
+        c.sync_volumes(&WorkQueue::new()).await.unwrap();
+        // The first operation is waiting on the (never started) recycler pod.
+        let key = build_key("pods", Some("default"), "recycler-for-pv");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while storage.get::<Pod>(&key).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("recycler pod created");
+        c.sync_volumes(&WorkQueue::new()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            storage.get::<Pod>(&key).await.is_ok(),
+            "second sync must not touch the running recycler pod"
+        );
+        let kubelet = fake_kubelet(
+            &storage,
+            "pv",
+            rusternetes_common::types::Phase::Succeeded,
+            None,
+        );
+        settle(&c).await;
+        kubelet.await.unwrap();
+        let got = get_pv(&storage, "pv").await.unwrap();
+        assert_eq!(got.status.unwrap().phase, PersistentVolumePhase::Available);
     }
 
     /// "Do not overwrite previous Failed state" (pv_controller.go:672-681).
