@@ -1849,11 +1849,42 @@ impl<S: Storage + 'static> JobController<S> {
             }
         }
 
+        // Evaluation order, `syncJob` (job_controller.go:941-998): "1. Evaluate the
+        // pre-existing SuccessCriteriaMet and FailureTarget to respect the
+        // previous reconcile results". A persisted interim condition IS the
+        // finishedCondition; nothing below re-derives (or overrides) it.
+        //   jobCtx.finishedCondition = hasSuccessCriteriaMetCondition(&job)
+        //   if nil: FailureTarget=True -> newFailedConditionForFailureTarget
+        // (`hasSuccessCriteriaMetCondition`, success_policy.go:52;
+        // `newFailedConditionForFailureTarget`, job_controller.go:1562).
+        let persisted_interim = |t: &str| -> Option<(String, String)> {
+            job.status
+                .as_ref()?
+                .conditions
+                .as_ref()?
+                .iter()
+                .find(|c| c.condition_type == t && c.status == "True")
+                .map(|c| {
+                    (
+                        c.reason.clone().unwrap_or_default(),
+                        c.message.clone().unwrap_or_default(),
+                    )
+                })
+        };
+        let persisted_success = persisted_interim("SuccessCriteriaMet");
+        // FailureTarget is only consulted when there is no SuccessCriteriaMet.
+        let persisted_failure = if persisted_success.is_none() {
+            persisted_interim("FailureTarget")
+        } else {
+            None
+        };
+        let has_persisted_interim = persisted_success.is_some() || persisted_failure.is_some();
+
         // Handle suspended jobs: delete all active pods (`manageJob`,
         // job_controller.go:1663-1673): `activePodsForRemoval(.., active)`,
         // `ExpectDeletions`, `deleteJobPods`; only when expectations are
         // satisfied (`:1016`).
-        if job.spec.suspend.unwrap_or(false) {
+        if job.spec.suspend.unwrap_or(false) && !has_persisted_interim {
             let mut removed = 0;
             let mut removed_ready = 0;
             if satisfied_expectations && active > 0 {
@@ -1904,8 +1935,98 @@ impl<S: Storage + 'static> JobController<S> {
             };
         }
 
+        // Merge FailIndex and backoff-per-index failed sets
+        let all_failed_index_set: HashSet<i32> = fail_index_set
+            .union(&backoff_failed_index_set)
+            .copied()
+            .collect();
+
+        let failed_indexes: Option<String> = if !all_failed_index_set.is_empty() {
+            let mut sorted: Vec<i32> = all_failed_index_set.iter().copied().collect();
+            sorted.sort();
+            Some(format_index_ranges(&sorted))
+        } else {
+            None
+        };
+
+        // For Indexed mode, K8s sets status.succeeded to the count of unique
+        // succeeded indexes (NOT the raw succeeded pod count). K8s ref:
+        //   pkg/controller/job/job_controller.go — status.Succeeded =
+        //   succeededIndexes.total().
+        let succeeded_index_count = if is_indexed {
+            succeeded_index_set.len() as i32
+        } else {
+            succeeded
+        };
+
+        info!(
+            "Job {}/{}: active={}, succeeded={}, failed={}, target={}",
+            namespace, name, active, succeeded, failed, completions
+        );
+
+        // Check maxFailedIndexes — if the number of failed indexes exceeds this limit, fail the job
+        let max_failed_indexes_exceeded = if is_indexed {
+            if let Some(max_failed) = job.spec.max_failed_indexes {
+                let failed_index_count = all_failed_index_set.len() as i32;
+                // Also count unique indexes with only failed pods (no succeeded) when no backoffLimitPerIndex
+                if backoff_limit_per_index.is_none() && fail_index_set.is_empty() {
+                    let mut failed_idx_set: HashSet<i32> = HashSet::new();
+                    for pod in job_pods.iter() {
+                        if matches!(
+                            pod.status.as_ref().and_then(|s| s.phase.as_ref()),
+                            Some(Phase::Failed)
+                        ) {
+                            if let Some(index) = get_pod_index(pod) {
+                                failed_idx_set.insert(index);
+                            }
+                        }
+                    }
+                    failed_idx_set.len() as i32 > max_failed
+                } else {
+                    failed_index_count > max_failed
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // For backoffLimitPerIndex, job fails when all indexes are either succeeded or failed
+        // Failure scenarios come before deadline, successPolicy and completions
+        // (job_controller.go:945-998); a persisted SuccessCriteriaMet means no
+        // failure is evaluated at all (:951 "only when the Job doesn't have the
+        // SuccessCriteriaMet condition"), and a persisted FailureTarget is
+        // already the failure (:953-955).
+        let is_failed = persisted_success.is_none()
+            && (persisted_failure.is_some()
+                || pod_failure_policy_triggered
+                || max_failed_indexes_exceeded
+                || if backoff_limit_per_index.is_some() && is_indexed {
+                    let completed_count = succeeded_index_count;
+                    let failed_count = all_failed_index_set.len() as i32;
+                    (completed_count + failed_count) >= completions
+                } else {
+                    failed > backoff_limit
+                });
+
+        // Check if Job is complete
+        // For indexed jobs, check number of distinct succeeded indexes
+        let is_complete = !is_failed
+            && if is_indexed {
+                succeeded_index_count >= completions
+            } else {
+                succeeded >= completions
+            };
+
         // Handle activeDeadlineSeconds — fail the job if it has been active too long
-        if let Some(deadline) = job.spec.active_deadline_seconds {
+        // (`pastActiveDeadline` is evaluated only when no failure and no
+        // pre-existing SuccessCriteriaMet decided the Job first, :970-973.)
+        if let Some(deadline) = job
+            .spec
+            .active_deadline_seconds
+            .filter(|_| !is_failed && persisted_success.is_none())
+        {
             if let Some(start) = job.status.as_ref().and_then(|s| s.start_time) {
                 let elapsed = chrono::Utc::now()
                     .signed_duration_since(start)
@@ -1985,82 +2106,6 @@ impl<S: Storage + 'static> JobController<S> {
             }
         }
 
-        // Merge FailIndex and backoff-per-index failed sets
-        let all_failed_index_set: HashSet<i32> = fail_index_set
-            .union(&backoff_failed_index_set)
-            .copied()
-            .collect();
-
-        let failed_indexes: Option<String> = if !all_failed_index_set.is_empty() {
-            let mut sorted: Vec<i32> = all_failed_index_set.iter().copied().collect();
-            sorted.sort();
-            Some(format_index_ranges(&sorted))
-        } else {
-            None
-        };
-
-        // For Indexed mode, K8s sets status.succeeded to the count of unique
-        // succeeded indexes (NOT the raw succeeded pod count). K8s ref:
-        //   pkg/controller/job/job_controller.go — status.Succeeded =
-        //   succeededIndexes.total().
-        let succeeded_index_count = if is_indexed {
-            succeeded_index_set.len() as i32
-        } else {
-            succeeded
-        };
-
-        info!(
-            "Job {}/{}: active={}, succeeded={}, failed={}, target={}",
-            namespace, name, active, succeeded, failed, completions
-        );
-
-        // Check if Job is complete
-        // For indexed jobs, check number of distinct succeeded indexes
-        let is_complete = if is_indexed {
-            succeeded_index_count >= completions
-        } else {
-            succeeded >= completions
-        };
-
-        // Check maxFailedIndexes — if the number of failed indexes exceeds this limit, fail the job
-        let max_failed_indexes_exceeded = if is_indexed {
-            if let Some(max_failed) = job.spec.max_failed_indexes {
-                let failed_index_count = all_failed_index_set.len() as i32;
-                // Also count unique indexes with only failed pods (no succeeded) when no backoffLimitPerIndex
-                if backoff_limit_per_index.is_none() && fail_index_set.is_empty() {
-                    let mut failed_idx_set: HashSet<i32> = HashSet::new();
-                    for pod in job_pods.iter() {
-                        if matches!(
-                            pod.status.as_ref().and_then(|s| s.phase.as_ref()),
-                            Some(Phase::Failed)
-                        ) {
-                            if let Some(index) = get_pod_index(pod) {
-                                failed_idx_set.insert(index);
-                            }
-                        }
-                    }
-                    failed_idx_set.len() as i32 > max_failed
-                } else {
-                    failed_index_count > max_failed
-                }
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
-        // For backoffLimitPerIndex, job fails when all indexes are either succeeded or failed
-        let is_failed = pod_failure_policy_triggered
-            || max_failed_indexes_exceeded
-            || if backoff_limit_per_index.is_some() && is_indexed {
-                let completed_count = succeeded_index_count;
-                let failed_count = all_failed_index_set.len() as i32;
-                (completed_count + failed_count) >= completions
-            } else {
-                failed > backoff_limit
-            };
-
         // Preserve the existing start_time if the job was already started
         let existing_start_time = job.status.as_ref().and_then(|s| s.start_time);
 
@@ -2072,7 +2117,7 @@ impl<S: Storage + 'static> JobController<S> {
         };
 
         // Check successPolicy — if defined and criteria met, mark job complete
-        let success_policy_met = if let Some(ref policy) = job.spec.success_policy {
+        let success_policy_matched = if let Some(ref policy) = job.spec.success_policy {
             policy.rules.iter().any(|rule| {
                 let indexes_ok = if let Some(ref succeeded_indexes_str) = rule.succeeded_indexes {
                     // Parse required indexes and check they are all in completed set
@@ -2103,6 +2148,17 @@ impl<S: Storage + 'static> JobController<S> {
             false
         };
 
+        // Success scenarios are evaluated after failures (:988-994); a
+        // persisted SuccessCriteriaMet is honoured regardless of the spec.
+        let success_policy_met =
+            persisted_success.is_some() || (!is_failed && success_policy_matched);
+        let (success_reason, success_message) = persisted_success.clone().unwrap_or_else(|| {
+            (
+                "SuccessPolicy".to_string(),
+                "Matched rules in the SuccessPolicy".to_string(),
+            )
+        });
+
         if success_policy_met {
             info!("Job {}/{} met success policy criteria", namespace, name);
 
@@ -2128,10 +2184,7 @@ impl<S: Storage + 'static> JobController<S> {
             let terminating = count_unfinished_pods(&job_pods);
             let conditions = if may_finish {
                 Some(enact_job_finished(
-                    complete_job_conditions(
-                        "SuccessPolicy".to_string(),
-                        "Matched rules in the SuccessPolicy".to_string(),
-                    ),
+                    complete_job_conditions(success_reason, success_message),
                     terminating,
                 ))
             } else {
@@ -2222,7 +2275,9 @@ impl<S: Storage + 'static> JobController<S> {
             );
 
             // Determine failure reason
-            let (reason, message) = if pod_failure_policy_triggered {
+            let (reason, message) = if let Some((r, m)) = persisted_failure.clone() {
+                (r, m)
+            } else if pod_failure_policy_triggered {
                 ("PodFailurePolicy".to_string(), pod_failure_message.clone())
             } else if max_failed_indexes_exceeded {
                 (
@@ -7076,5 +7131,188 @@ mod tests {
                 .any(|c| c.condition_type == "Complete" && c.status == "True"),
             "{st:?}"
         );
+    }
+
+    // ---- #2780: persisted interim condition + upstream evaluation order ----
+    //
+    // Upstream syncJob (pkg/controller/job/job_controller.go:945-998):
+    //   jobCtx.finishedCondition = hasSuccessCriteriaMetCondition(&job)   // :947
+    //   if nil { FailureTarget=True -> newFailedConditionForFailureTarget // :953-955
+    //            else podFailurePolicy }
+    //   if nil { backoffLimit, then activeDeadline }
+    //   ... per-index failures, then successPolicy, then completions.
+
+    fn interim(condition_type: &str, reason: &str, message: &str) -> JobCondition {
+        let now = chrono::Utc::now();
+        JobCondition {
+            condition_type: condition_type.to_string(),
+            status: "True".to_string(),
+            last_probe_time: Some(now),
+            last_transition_time: Some(now),
+            reason: Some(reason.to_string()),
+            message: Some(message.to_string()),
+        }
+    }
+
+    fn cond_of<'a>(job: &'a Job, t: &str) -> Option<&'a JobCondition> {
+        job.status
+            .as_ref()?
+            .conditions
+            .as_ref()?
+            .iter()
+            .find(|c| c.condition_type == t && c.status == "True")
+    }
+
+    /// job_controller_test.go:4977 "job with SuccessCriteriaMet has never been
+    /// transitioned to FailureTarget and Failed even if job meets backoffLimit"
+    /// (the persisted condition, not the spec's successPolicy, decides).
+    #[tokio::test]
+    async fn persisted_success_criteria_met_beats_backoff_limit() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job("psc", "default", 2, 2);
+        job.spec.completion_mode = Some("Indexed".to_string());
+        job.spec.backoff_limit = Some(0);
+        job.status = Some(JobStatus {
+            conditions: Some(vec![interim(
+                "SuccessCriteriaMet",
+                "SuccessPolicy",
+                "Matched rules at index 0",
+            )]),
+            ..Default::default()
+        });
+        let key = "/registry/jobs/default/psc";
+        storage.create(key, &job).await.unwrap();
+        for (n, ph, i) in [("a", Phase::Failed, 0), ("b", Phase::Succeeded, 1)] {
+            let p = make_indexed_pod(n, "default", ph, "psc", "job-uid-1", i);
+            storage
+                .create(&format!("/registry/pods/default/{n}"), &p)
+                .await
+                .unwrap();
+        }
+        let c = JobController::new(storage.clone());
+        reconcile_settled(&c, &storage, key).await;
+        let got: Job = storage.get(key).await.unwrap();
+        assert!(cond_of(&got, "Failed").is_none(), "{:?}", got.status);
+        let done = cond_of(&got, "Complete").expect("Complete follows SuccessCriteriaMet");
+        assert_eq!(done.reason.as_deref(), Some("SuccessPolicy"));
+        assert_eq!(done.message.as_deref(), Some("Matched rules at index 0"));
+    }
+
+    /// job_controller_test.go:5039 "job with FailureTarget has never been
+    /// transitioned to SuccessCriteriaMet even if job meets successPolicy".
+    #[tokio::test]
+    async fn persisted_failure_target_beats_success_policy() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job("pft", "default", 2, 2);
+        job.spec.completion_mode = Some("Indexed".to_string());
+        job.spec.success_policy = Some(
+            serde_json::from_value(serde_json::json!({"rules": [{"succeededCount": 1}]})).unwrap(),
+        );
+        let msg =
+            "Pod default/mypod-0 has condition DisruptionTarget matching FailJob rule at index 0";
+        job.status = Some(JobStatus {
+            conditions: Some(vec![interim("FailureTarget", "PodFailurePolicy", msg)]),
+            ..Default::default()
+        });
+        let key = "/registry/jobs/default/pft";
+        storage.create(key, &job).await.unwrap();
+        let p = make_indexed_pod("b", "default", Phase::Succeeded, "pft", "job-uid-1", 1);
+        storage
+            .create("/registry/pods/default/b", &p)
+            .await
+            .unwrap();
+        let c = JobController::new(storage.clone());
+        reconcile_settled(&c, &storage, key).await;
+        let got: Job = storage.get(key).await.unwrap();
+        assert!(
+            cond_of(&got, "SuccessCriteriaMet").is_none(),
+            "{:?}",
+            got.status
+        );
+        assert!(cond_of(&got, "Complete").is_none());
+        let failed = cond_of(&got, "Failed").expect("Failed follows FailureTarget");
+        assert_eq!(failed.reason.as_deref(), Some("PodFailurePolicy"));
+        assert_eq!(failed.message.as_deref(), Some(msg));
+    }
+
+    /// `newFailedConditionForFailureTarget` (job_controller.go:1562): Failed
+    /// carries the persisted FailureTarget's reason even when nothing in the
+    /// current pod list would re-derive it, and the Job stops creating pods.
+    #[tokio::test]
+    async fn persisted_failure_target_finishes_without_rederiving() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job("pfr", "default", 3, 3);
+        job.status = Some(JobStatus {
+            conditions: Some(vec![interim(
+                "FailureTarget",
+                "DeadlineExceeded",
+                "Job was active longer than specified deadline",
+            )]),
+            ..Default::default()
+        });
+        let key = "/registry/jobs/default/pfr";
+        storage.create(key, &job).await.unwrap();
+        let p = make_pod("r", "default", Phase::Running, "pfr", "job-uid-1");
+        storage
+            .create("/registry/pods/default/r", &p)
+            .await
+            .unwrap();
+        let c = JobController::new(storage.clone());
+        reconcile_settled(&c, &storage, key).await;
+        let got: Job = storage.get(key).await.unwrap();
+        let failed = cond_of(&got, "Failed").expect("Failed follows FailureTarget");
+        assert_eq!(failed.reason.as_deref(), Some("DeadlineExceeded"));
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        assert!(pods.len() <= 1, "no replacement pods: {}", pods.len());
+    }
+
+    /// Evaluation order, job_controller.go:960-985: backoffLimit is evaluated
+    /// before activeDeadlineSeconds.
+    #[tokio::test]
+    async fn backoff_limit_is_evaluated_before_active_deadline() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job("ord", "default", 1, 1);
+        job.spec.backoff_limit = Some(0);
+        job.spec.active_deadline_seconds = Some(1);
+        job.status = Some(JobStatus {
+            start_time: Some(chrono::Utc::now() - chrono::Duration::seconds(60)),
+            ..Default::default()
+        });
+        let key = "/registry/jobs/default/ord";
+        storage.create(key, &job).await.unwrap();
+        let p = make_pod("f", "default", Phase::Failed, "ord", "job-uid-1");
+        storage
+            .create("/registry/pods/default/f", &p)
+            .await
+            .unwrap();
+        let c = JobController::new(storage.clone());
+        reconcile_settled(&c, &storage, key).await;
+        let got: Job = storage.get(key).await.unwrap();
+        let failed = cond_of(&got, "Failed").expect("Failed");
+        assert_eq!(failed.reason.as_deref(), Some("BackoffLimitExceeded"));
+    }
+
+    /// Failure scenarios are evaluated before completions
+    /// (job_controller.go:945-998, then `complete` at :1035 only when
+    /// finishedCondition is nil).
+    #[tokio::test]
+    async fn failure_is_evaluated_before_completions() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job("fbc", "default", 1, 1);
+        job.spec.backoff_limit = Some(0);
+        let key = "/registry/jobs/default/fbc";
+        storage.create(key, &job).await.unwrap();
+        for (n, ph) in [("s", Phase::Succeeded), ("f", Phase::Failed)] {
+            let p = make_pod(n, "default", ph, "fbc", "job-uid-1");
+            storage
+                .create(&format!("/registry/pods/default/{n}"), &p)
+                .await
+                .unwrap();
+        }
+        let c = JobController::new(storage.clone());
+        reconcile_settled(&c, &storage, key).await;
+        let got: Job = storage.get(key).await.unwrap();
+        assert!(cond_of(&got, "Complete").is_none(), "{:?}", got.status);
+        assert!(cond_of(&got, "Failed").is_some());
     }
 }
