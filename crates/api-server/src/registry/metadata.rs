@@ -390,6 +390,26 @@ impl HasMetadata for rusternetes_common::resources::ValidatingAdmissionPolicyBin
     }
 }
 
+impl HasMetadata for rusternetes_common::resources::MutatingAdmissionPolicyBinding {
+    fn metadata(&self) -> &rusternetes_common::types::ObjectMeta {
+        &self.metadata
+    }
+
+    fn metadata_mut(&mut self) -> &mut rusternetes_common::types::ObjectMeta {
+        &mut self.metadata
+    }
+}
+
+impl HasMetadata for rusternetes_common::resources::MutatingAdmissionPolicy {
+    fn metadata(&self) -> &rusternetes_common::types::ObjectMeta {
+        &self.metadata
+    }
+
+    fn metadata_mut(&mut self) -> &mut rusternetes_common::types::ObjectMeta {
+        &mut self.metadata
+    }
+}
+
 impl HasMetadata for rusternetes_common::resources::ClusterTrustBundle {
     fn metadata(&self) -> &rusternetes_common::types::ObjectMeta {
         &self.metadata

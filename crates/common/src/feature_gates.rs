@@ -180,6 +180,17 @@ pub enum Feature {
     /// Upstream gate `MutableCSINodeAllocatableCount` (1.35 Beta, on; `pkg/features/kube_features.go:1537-1541`).
     /// Gates the kubelet's `csiNodeUpdater` (`pkg/volume/csi/csi_plugin.go:417`).
     MutableCSINodeAllocatableCount,
+
+    /// Upstream gate `MutatingAdmissionPolicy` (1.32 Alpha, 1.34 Beta, still off;
+    /// `staging/src/k8s.io/apiserver/pkg/features/kube_features.go:407-410`,
+    /// `pkg/features/kube_features.go:2049-2052`). Upstream the gate only enables
+    /// the admission plugin (`admission/plugin/policy/mutating/plugin.go:124`);
+    /// the REST resource is gated by the `admissionregistration.k8s.io/v1beta1`
+    /// API group, which is in `betaAPIGroupVersionsDisabledByDefault`
+    /// (`pkg/controlplane/instance.go`). Rusternetes has no `--runtime-config`,
+    /// so this gate stands in for both, as `ClusterTrustBundle` does for
+    /// `certificates.k8s.io/v1beta1`.
+    MutatingAdmissionPolicy,
 }
 
 impl Feature {
@@ -222,6 +233,7 @@ impl Feature {
             Feature::ReduceDefaultCrashLoopBackOffDecay => 33,
             Feature::WatchCacheInitializationPostStartHook => 34,
             Feature::MutableCSINodeAllocatableCount => 35,
+            Feature::MutatingAdmissionPolicy => 36,
         }
     }
 
@@ -298,6 +310,8 @@ impl Feature {
             Feature::WatchCacheInitializationPostStartHook => false,
             // 1.35 Beta, on (pkg/features/kube_features.go:1537-1541)
             Feature::MutableCSINodeAllocatableCount => true,
+            // 1.34 Beta, no `Default: true` (apiserver kube_features.go:407-410)
+            Feature::MutatingAdmissionPolicy => false,
         }
     }
 }
@@ -350,6 +364,7 @@ pub const ALL_FEATURES: &[Feature] = &[
     Feature::ReduceDefaultCrashLoopBackOffDecay,
     Feature::WatchCacheInitializationPostStartHook,
     Feature::MutableCSINodeAllocatableCount,
+    Feature::MutatingAdmissionPolicy,
 ];
 
 /// Total number of feature gates. Derived from [`ALL_FEATURES`].
@@ -400,6 +415,7 @@ static STATES: [AtomicBool; NUM_FEATURES] = [
     AtomicBool::new(Feature::ReduceDefaultCrashLoopBackOffDecay.default_enabled()),
     AtomicBool::new(Feature::WatchCacheInitializationPostStartHook.default_enabled()),
     AtomicBool::new(Feature::MutableCSINodeAllocatableCount.default_enabled()),
+    AtomicBool::new(Feature::MutatingAdmissionPolicy.default_enabled()),
 ];
 
 /// Returns whether `feature` is currently enabled in this process.

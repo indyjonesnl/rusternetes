@@ -24,7 +24,8 @@ use rusternetes_common::auth::UserInfo;
 use rusternetes_common::authz::{Authorizer, Decision, RequestAttributes};
 use rusternetes_common::resources::validating_admission_policy::{ParamKind, ParamRef};
 use rusternetes_common::resources::{
-    CustomResourceDefinition, ValidatingAdmissionPolicy, ValidatingAdmissionPolicyBinding,
+    CustomResourceDefinition, MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding,
+    ValidatingAdmissionPolicy, ValidatingAdmissionPolicyBinding,
 };
 use rusternetes_common::validation::field::{Error as FieldError, ErrorList, Path};
 use rusternetes_common::Result;
@@ -119,14 +120,50 @@ pub async fn authorize_param_kind(
     policy: &ValidatingAdmissionPolicy,
     old: Option<&ValidatingAdmissionPolicy>,
 ) -> ErrorList {
-    let Some(param_kind) = policy.spec.as_ref().and_then(|s| s.param_kind.as_ref()) else {
+    authorize_param_kind_of(
+        ctx,
+        authorizer,
+        storage,
+        policy.spec.as_ref().and_then(|s| s.param_kind.as_ref()),
+        old.map(|o| o.spec.as_ref().and_then(|s| s.param_kind.as_ref())),
+    )
+    .await
+}
+
+/// `mutatingAdmissionPolicyStrategy.authorizeCreate` / `authorizeUpdate` /
+/// `authorize` (mutatingadmissionpolicy/authz.go:30-96): identical to the
+/// validating policy's, over `MutatingAdmissionPolicy.spec.paramKind`.
+pub async fn authorize_mutating_param_kind(
+    ctx: &RequestContext,
+    authorizer: &dyn Authorizer,
+    storage: &StorageBackend,
+    policy: &MutatingAdmissionPolicy,
+    old: Option<&MutatingAdmissionPolicy>,
+) -> ErrorList {
+    authorize_param_kind_of(
+        ctx,
+        authorizer,
+        storage,
+        policy.spec.as_ref().and_then(|s| s.param_kind.as_ref()),
+        old.map(|o| o.spec.as_ref().and_then(|s| s.param_kind.as_ref())),
+    )
+    .await
+}
+
+/// The shared body: `param_kind` of the new object, and `old` (`None` on
+/// create) holding the old object's `param_kind`.
+async fn authorize_param_kind_of(
+    ctx: &RequestContext,
+    authorizer: &dyn Authorizer,
+    storage: &StorageBackend,
+    param_kind: Option<&ParamKind>,
+    old: Option<Option<&ParamKind>>,
+) -> ErrorList {
+    let Some(param_kind) = param_kind else {
         // no paramKind in new object
         return Vec::new();
     };
-    if let Some(old_kind) = old
-        .and_then(|o| o.spec.as_ref())
-        .and_then(|s| s.param_kind.as_ref())
-    {
+    if let Some(Some(old_kind)) = old {
         if old_kind == param_kind {
             // identical paramKind to old object
             return Vec::new();
@@ -193,25 +230,85 @@ pub async fn authorize_param_ref(
     binding: &ValidatingAdmissionPolicyBinding,
     old: Option<&ValidatingAdmissionPolicyBinding>,
 ) -> Result<ErrorList> {
-    let Some(param_ref) = binding.spec.as_ref().and_then(|s| s.param_ref.as_ref()) else {
+    authorize_param_ref_of(
+        ctx,
+        authorizer,
+        storage,
+        Flavor::Validating,
+        binding
+            .spec
+            .as_ref()
+            .map(|s| (s.policy_name.clone(), s.param_ref.as_ref())),
+        old.and_then(|o| o.spec.as_ref())
+            .map(|s| (s.policy_name.clone(), s.param_ref.as_ref())),
+    )
+    .await
+}
+
+/// `mutatingAdmissionPolicyBindingStrategy.authorizeCreate` /
+/// `authorizeUpdate` / `authorize` (mutatingadmissionpolicybinding/authz.go:
+/// 30-135): the validating binding's check over a `MutatingAdmissionPolicy`
+/// (read from `mutatingadmissionpolicies`), with upstream's two differences
+/// kept verbatim ([`Flavor::Mutating`]).
+pub async fn authorize_mutating_param_ref(
+    ctx: &RequestContext,
+    authorizer: &dyn Authorizer,
+    storage: &StorageBackend,
+    binding: &MutatingAdmissionPolicyBinding,
+    old: Option<&MutatingAdmissionPolicyBinding>,
+) -> Result<ErrorList> {
+    authorize_param_ref_of(
+        ctx,
+        authorizer,
+        storage,
+        Flavor::Mutating,
+        binding
+            .spec
+            .as_ref()
+            .map(|s| (s.policy_name.clone(), s.param_ref.as_ref())),
+        old.and_then(|o| o.spec.as_ref())
+            .map(|s| (s.policy_name.clone(), s.param_ref.as_ref())),
+    )
+    .await
+}
+
+/// Which binding's `authz.go` is being ported. The two files are identical
+/// except for the two lines below (diffed against release-1.35).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Flavor {
+    Validating,
+    /// `mutatingadmissionpolicybinding/authz.go:121` returns the
+    /// authorizer's error unwrapped (the validating one prefixes
+    /// `failed to authorize request: `), and `:133` passes `verb, user` to
+    /// a format that reads `user %v ... "%v"`, so the user and the verb
+    /// swap places in the message.
+    Mutating,
+}
+
+/// A binding's `(spec.policyName, spec.paramRef)`.
+type BindingRefs<'a> = (Option<String>, Option<&'a ParamRef>);
+
+async fn authorize_param_ref_of(
+    ctx: &RequestContext,
+    authorizer: &dyn Authorizer,
+    storage: &StorageBackend,
+    flavor: Flavor,
+    new: Option<BindingRefs<'_>>,
+    old: Option<BindingRefs<'_>>,
+) -> Result<ErrorList> {
+    let Some((policy_name, Some(param_ref))) = new else {
         // no paramRef in new object
         return Ok(Vec::new());
     };
-    if let Some(old_spec) = old.and_then(|o| o.spec.as_ref()) {
-        if old_spec.param_ref.as_ref() == Some(param_ref)
-            && old_spec.policy_name == binding.spec.as_ref().and_then(|s| s.policy_name.clone())
-        {
+    if let Some((old_policy, old_ref)) = old {
+        if old_ref == Some(param_ref) && old_policy == policy_name {
             // identical paramRef and policy to old object
             return Ok(Vec::new());
         }
     }
-    let policy_name = binding
-        .spec
-        .as_ref()
-        .and_then(|s| s.policy_name.clone())
-        .unwrap_or_default();
+    let policy_name = policy_name.unwrap_or_default();
     Ok(
-        match authorize_ref(ctx, authorizer, storage, &policy_name, param_ref).await {
+        match authorize_ref(ctx, authorizer, storage, flavor, &policy_name, param_ref).await {
             Ok(()) => Vec::new(),
             Err(msg) => vec![FieldError::forbidden(
                 &Path::new("spec").child("paramRef"),
@@ -225,6 +322,7 @@ async fn authorize_ref(
     ctx: &RequestContext,
     authorizer: &dyn Authorizer,
     storage: &StorageBackend,
+    flavor: Flavor,
     policy_name: &str,
     param_ref: &ParamRef,
 ) -> std::result::Result<(), String> {
@@ -235,16 +333,31 @@ async fn authorize_ref(
     let (mut resource, mut api_group) = ("*".to_string(), "*".to_string());
 
     // `policyGetter.GetValidatingAdmissionPolicy`
-    let policy: std::result::Result<ValidatingAdmissionPolicy, _> = storage
-        .get(&build_key("validatingadmissionpolicies", None, policy_name))
-        .await;
+    // (`GetMutatingAdmissionPolicy` for the mutating binding.) Only the
+    // policy's `paramKind` is read.
+    let policy: std::result::Result<Option<ParamKind>, ()> = match flavor {
+        Flavor::Validating => storage
+            .get::<ValidatingAdmissionPolicy>(&build_key(
+                "validatingadmissionpolicies",
+                None,
+                policy_name,
+            ))
+            .await
+            .map(|p| p.spec.and_then(|s| s.param_kind))
+            .map_err(|_| ()),
+        Flavor::Mutating => storage
+            .get::<MutatingAdmissionPolicy>(&build_key(
+                "mutatingadmissionpolicies",
+                None,
+                policy_name,
+            ))
+            .await
+            .map(|p| p.spec.and_then(|s| s.param_kind))
+            .map_err(|_| ()),
+    };
     let mut gv_parse_failed = false;
     let mut gvr_resolve_failed = false;
-    let policy_param_kind = policy
-        .as_ref()
-        .ok()
-        .and_then(|p| p.spec.as_ref())
-        .and_then(|s| s.param_kind.clone());
+    let policy_param_kind = policy.as_ref().ok().cloned().flatten();
     if let Some(param_kind) = &policy_param_kind {
         match parse_group_version(param_kind.api_version.as_deref().unwrap_or_default()) {
             Err(()) => gv_parse_failed = true,
@@ -272,6 +385,7 @@ async fn authorize_ref(
     }
 
     match authorizer.authorize(&attrs).await {
+        Err(e) if flavor == Flavor::Mutating => Err(e.to_string()),
         Err(e) => Err(format!("failed to authorize request: {e}")),
         Ok(Decision::Allow) => Ok(()),
         Ok(Decision::Deny(_)) => {
@@ -299,6 +413,12 @@ async fn authorize_ref(
             if gvr_resolve_failed {
                 return Err(format!(
                     "unable to resolve paramKind {kind} to determine minimum required permissions and user {who} does not have \"{verb}\" permission for all groups, versions and resources"
+                ));
+            }
+            if flavor == Flavor::Mutating {
+                // authz.go:133: `..., verb, user)` against `user %v ... "%v"`.
+                return Err(format!(
+                    "user {verb} does not have \"{who}\" permission on the object referenced by paramRef"
                 ));
             }
             Err(format!(
