@@ -889,7 +889,7 @@ where
                                     if let Some(rv) = extract_rv_from_json(&prev_value) {
                                         latest_resource_version = Some(rv);
                                     }
-                                    if let Some(json) = build_delete_fallback_json(&key, &prev_value) {
+                                    if let Some(json) = build_delete_fallback_json(&key, &prev_value, None) {
                                         if tx.send(Ok(format!("{}\n", json))).await.is_err() {
                                             debug!("Watch: tx.send failed, client disconnected");
                                             break;
@@ -1444,7 +1444,7 @@ where
                                     if let Some(rv) = extract_rv_from_json(&prev_value) {
                                         latest_resource_version = Some(rv);
                                     }
-                                    if let Some(json) = build_delete_fallback_json(&key, &prev_value) {
+                                    if let Some(json) = build_delete_fallback_json(&key, &prev_value, None) {
                                         if tx.send(Ok(format!("{}\n", json))).await.is_err() {
                                             debug!("Watch: tx.send failed, client disconnected");
                                             break;
@@ -1903,7 +1903,11 @@ fn json_watch_event(
 /// delivers DELETE events; the object payload is best-effort.
 ///
 /// Returns `Some(json_string)` if a valid event was constructed, `None` otherwise.
-pub fn build_delete_fallback_json(key: &str, prev_value: &str) -> Option<String> {
+pub fn build_delete_fallback_json(
+    key: &str,
+    prev_value: &str,
+    _kind_hint: Option<(&str, &str)>,
+) -> Option<String> {
     // Try to parse prev_value as raw JSON
     if let Ok(raw_obj) = serde_json::from_str::<serde_json::Value>(prev_value) {
         let k8s_event = serde_json::json!({
