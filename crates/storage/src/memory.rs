@@ -513,7 +513,11 @@ impl Storage for MemoryStorage {
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
-        if revision <= 0 {
+        // The newest revision is never compacted: etcd keeps the latest
+        // revision whatever the compaction point, and `list_paginated` reads
+        // at `current_revision()` for a first page or an inconsistent (rv=-1)
+        // continue (`ValidateListOptions`, `storage/interfaces.go:358-360`).
+        if revision <= 0 || revision >= self.revision.load(std::sync::atomic::Ordering::SeqCst) {
             return self.list(prefix).await;
         }
         let compacted = self
@@ -782,6 +786,10 @@ mod tests {
     async fn watch_from_compacted_revision_is_gone() {
         let s = MemoryStorage::new();
         let a: serde_json::Value = s.create("/r/cm/a", &cm("a")).await.unwrap();
+        let _: serde_json::Value = s
+            .create("/r/b", &serde_json::json!({"metadata": {"name": "b"}}))
+            .await
+            .unwrap();
         s.compact_to(rv_of(&a));
         assert!(matches!(
             s.watch_from_revision("/r/cm/", rv_of(&a)).await.err(),
@@ -1043,6 +1051,10 @@ mod tests {
         let s = MemoryStorage::new();
         let a: serde_json::Value = s
             .create("/r/a", &serde_json::json!({"metadata": {"name": "a"}}))
+            .await
+            .unwrap();
+        let _: serde_json::Value = s
+            .create("/r/b", &serde_json::json!({"metadata": {"name": "b"}}))
             .await
             .unwrap();
         s.compact_to(rv_of(&a));
