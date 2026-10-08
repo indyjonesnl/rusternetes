@@ -22,7 +22,7 @@ use rusternetes_common::{
     resources::ConfigMap,
     List, Result,
 };
-use rusternetes_storage::{build_prefix, Storage};
+use rusternetes_storage::build_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -238,7 +238,8 @@ pub async fn list(
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
     let prefix = build_prefix("configmaps", Some(&namespace));
-    let mut configmaps: Vec<ConfigMap> = state.storage.list(&prefix).await?;
+    let mut configmaps: Vec<ConfigMap> =
+        crate::handlers::list_options::list_items(&*state.storage, &prefix, &params).await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut configmaps, &params)?;
@@ -305,7 +306,12 @@ pub async fn list_all_configmaps(
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
     let prefix = build_prefix("configmaps", None);
-    let mut configmaps = state.storage.list::<ConfigMap>(&prefix).await?;
+    let mut configmaps = crate::handlers::list_options::list_items::<ConfigMap, _>(
+        &*state.storage,
+        &prefix,
+        &params,
+    )
+    .await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut configmaps, &params)?;
@@ -345,7 +351,8 @@ async fn paginate_configmaps_response(
     // Upstream gets both from one etcd range response; here the store
     // revision and the items are read separately, so take the max (#1825).
     let resource_version =
-        crate::handlers::list_collection_resource_version(&state.storage, &configmaps).await;
+        crate::handlers::list_options::list_resource_version(&state.storage, params, &configmaps)
+            .await;
 
     let paginated =
         match rusternetes_common::paginate(configmaps, pagination_params, &resource_version) {
@@ -380,7 +387,7 @@ async fn paginate_configmaps_response(
 mod finalizer_drain_put_tests {
     use super::*;
     use crate::state::ApiServerState;
-    use rusternetes_storage::build_key;
+    use rusternetes_storage::{build_key, Storage};
     use serde_json::json;
 
     async fn test_state() -> Arc<ApiServerState> {

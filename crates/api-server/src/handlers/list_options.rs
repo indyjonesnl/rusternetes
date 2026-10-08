@@ -16,10 +16,14 @@
 //!   version the storage has not reached yet waits `blockTimeout`, then fails
 //!   with `NewTooLargeResourceVersionError` (storage/errors.go:229-242).
 //!
-//! NOT ported: `resourceVersionMatch=Exact` reads the collection AS OF that
-//! revision (an etcd historical range read, 410 `too old resource version`
-//! once compacted). The storage trait has no such read here, so an `Exact`
-//! list is validated and floored like `NotOlderThan` but not pinned.
+//! * `resourceVersionMatch=Exact` reads the collection AS OF that revision:
+//!   `ValidateListOptions` sets `withRev = parsedRV`
+//!   (`storage/interfaces.go:374-375`), `GetList` ranges at it
+//!   (`etcd3/store.go:781-786`), and the list is stamped with it
+//!   (`UpdateList(..., withRev, ...)`, `:898`). A revision the store has
+//!   compacted is 410 `The resourceVersion for the provided list is too old.`
+//!   (`etcd3/errors.go:53,68-72`). See [`list_items`] and
+//!   [`list_resource_version`].
 
 use std::collections::HashMap;
 
@@ -140,6 +144,51 @@ pub async fn prepare_list<S: Storage + ?Sized>(
         .map(String::as_str)
         .unwrap_or("");
     crate::registry::generic::store::wait_until_resource_version(storage, rv).await
+}
+
+/// The revision a list pins to: `Some(rv)` for `resourceVersionMatch=Exact`
+/// (`ValidateListOptions`, `storage/interfaces.go:374-375`), `None` for every
+/// other combination (a floor, or a live read). Call after [`prepare_list`] has
+/// validated the options.
+pub fn exact_list_revision(params: &HashMap<String, String>) -> Option<i64> {
+    if params.get("resourceVersionMatch").map(String::as_str) != Some("Exact") {
+        return None;
+    }
+    params
+        .get("resourceVersion")
+        .and_then(|rv| rv.parse::<i64>().ok())
+        .filter(|rv| *rv > 0)
+}
+
+/// Read the collection under `prefix` for a list request: as of the pinned
+/// revision for `resourceVersionMatch=Exact` (etcd `WithRev`), live otherwise.
+pub async fn list_items<T, S>(
+    storage: &S,
+    prefix: &str,
+    params: &HashMap<String, String>,
+) -> Result<Vec<T>>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+    S: Storage + ?Sized,
+{
+    match exact_list_revision(params) {
+        Some(rv) => storage.list_at_revision(prefix, rv).await,
+        None => storage.list(prefix).await,
+    }
+}
+
+/// The list's `metadata.resourceVersion`: the pinned revision for an Exact
+/// list (`UpdateList(listObj, withRev, ...)`, `etcd3/store.go:898`), otherwise
+/// [`crate::handlers::list_collection_resource_version`].
+pub async fn list_resource_version<T: serde::Serialize>(
+    storage: &rusternetes_storage::StorageBackend,
+    params: &HashMap<String, String>,
+    items: &[T],
+) -> String {
+    match exact_list_revision(params) {
+        Some(rv) => rv.to_string(),
+        None => crate::handlers::list_collection_resource_version(storage, items).await,
+    }
 }
 
 #[cfg(test)]

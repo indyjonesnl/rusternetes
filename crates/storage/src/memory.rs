@@ -24,6 +24,13 @@ struct History {
     /// longer be replayed. Plays the role of upstream's `oldest` bound
     /// (`getAllEventsSinceLocked`, `watch_cache.go:885-896`).
     evicted_floor: i64,
+    /// For each retained event, the value its key held BEFORE the write
+    /// (`None` = the key did not exist), in the same order and with the same
+    /// eviction as `events`. Lets `list_at_revision` rewind the live state to
+    /// an earlier revision; stands in for etcd's MVCC revision history, which
+    /// `WithRev` reads (`etcd3/store.go` `GetList`, `withRev`). Entries are
+    /// `(revision, key, previous value)`.
+    undo: VecDeque<(i64, String, Option<String>)>,
 }
 
 #[derive(Clone)]
@@ -76,6 +83,7 @@ impl MemoryStorage {
                 events: VecDeque::new(),
                 capacity: capacity.max(1),
                 evicted_floor: 0,
+                undo: VecDeque::new(),
             })),
             data: Arc::new(RwLock::new(HashMap::new())),
             bus: crate::EventBus::new(crate::event_bus::DEFAULT_CAPACITY),
@@ -137,13 +145,23 @@ impl MemoryStorage {
     /// that a client could forge one.
     /// Record `event` (committed at `revision`) in the replay buffer and fan it
     /// out to live watchers, atomically with respect to `watch_from_revision`.
-    fn emit(&self, revision: i64, event: WatchEvent) {
+    ///
+    /// `previous` is the value the key held before this write (`None` if it did
+    /// not exist), kept so the state at an earlier revision can be rebuilt.
+    fn emit(&self, revision: i64, event: WatchEvent, previous: Option<String>) {
         let mut h = self.history.lock().unwrap();
         if h.events.len() >= h.capacity {
             if let Some((rev, _)) = h.events.pop_front() {
                 h.evicted_floor = h.evicted_floor.max(rev);
             }
+            h.undo.pop_front();
         }
+        let key = match &event {
+            WatchEvent::Added(k, _) | WatchEvent::Modified(k, _) | WatchEvent::Deleted(k, _) => {
+                k.clone()
+            }
+        };
+        h.undo.push_back((revision, key, previous));
         h.events.push_back((revision, event.clone()));
         self.bus.publish(event);
     }
@@ -272,6 +290,7 @@ impl Storage for MemoryStorage {
         self.emit(
             rev.parse().unwrap_or_default(),
             WatchEvent::Added(key.to_string(), serialized.clone()),
+            None,
         );
 
         Ok(serde_json::from_str(&serialized)?)
@@ -367,7 +386,7 @@ impl Storage for MemoryStorage {
 
         let rev = self.stamp_revision(&mut value_json)?;
         let serialized = serde_json::to_string(&value_json)?;
-        data.insert(key.to_string(), serialized.clone());
+        let previous = data.insert(key.to_string(), serialized.clone());
         drop(data); // Release lock before sending event
         self.set_ttl(key, ttl);
 
@@ -375,6 +394,7 @@ impl Storage for MemoryStorage {
         self.emit(
             rev.parse().unwrap_or_default(),
             WatchEvent::Modified(key.to_string(), serialized.clone()),
+            previous,
         );
 
         Ok(serde_json::from_str(&serialized)?)
@@ -397,13 +417,14 @@ impl Storage for MemoryStorage {
             return Err(Error::NotFound(key.to_string()));
         }
 
-        data.insert(key.to_string(), serialized.clone());
+        let previous = data.insert(key.to_string(), serialized.clone());
         drop(data); // Release lock before sending event
 
         // Emit watch event
         self.emit(
             rev.parse().unwrap_or_default(),
             WatchEvent::Modified(key.to_string(), serialized),
+            previous,
         );
 
         Ok(())
@@ -427,6 +448,7 @@ impl Storage for MemoryStorage {
         // The deleted object carries the DELETE's revision, as etcd's watch
         // does (`etcd3/watcher.go` `parseEvent`: prevObj stamped with
         // `e.rev`): a watch snapshot cut dedupes DELETED by it (#2223).
+        let undo_value = previous_value.clone();
         let stamped = match serde_json::from_str::<serde_json::Value>(&previous_value) {
             Ok(mut v) => match v.get_mut("metadata").and_then(|m| m.as_object_mut()) {
                 Some(m) => {
@@ -442,7 +464,11 @@ impl Storage for MemoryStorage {
             },
             Err(_) => previous_value,
         };
-        self.emit(rev, WatchEvent::Deleted(key.to_string(), stamped));
+        self.emit(
+            rev,
+            WatchEvent::Deleted(key.to_string(), stamped),
+            Some(undo_value),
+        );
 
         Ok(())
     }
@@ -470,6 +496,67 @@ impl Storage for MemoryStorage {
         }
 
         Ok(results)
+    }
+
+    /// The collection as it stood at `revision` — etcd's
+    /// `Range(WithRev(revision))`, which `GetList` issues when
+    /// `ValidateListOptions` yields `withRev` (`etcd3/store.go` GetList;
+    /// `storage/interfaces.go:358-360,374-375`). The live state is rewound by
+    /// undoing, newest first, every retained write newer than `revision`.
+    ///
+    /// A revision the retained history no longer covers (evicted from the
+    /// ring) or at/below a compaction is `Gone`, upstream's
+    /// `NewResourceExpired("The resourceVersion for the provided list is too
+    /// old.")` (`etcd3/errors.go:53,68-72`). `revision <= 0` reads live, as
+    /// `Range` with no revision does.
+    async fn list_at_revision<T>(&self, prefix: &str, revision: i64) -> Result<Vec<T>>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        // The newest revision is never compacted: etcd keeps the latest
+        // revision whatever the compaction point, and `list_paginated` reads
+        // at `current_revision()` for a first page or an inconsistent (rv=-1)
+        // continue (`ValidateListOptions`, `storage/interfaces.go:358-360`).
+        if revision <= 0 || revision >= self.revision.load(std::sync::atomic::Ordering::SeqCst) {
+            return self.list(prefix).await;
+        }
+        let compacted = self
+            .compacted_revision
+            .load(std::sync::atomic::Ordering::SeqCst);
+        // Held across the data read so no write lands between the two: `emit`
+        // takes this lock after the write, so a write either has its undo entry
+        // here and its effect in `data`, or neither is visible... except the
+        // sliver between a writer's `data` update and its `emit`; undoing only
+        // entries newer than `revision` makes that harmless for a `revision`
+        // at or below the revision the caller already observed.
+        let h = self.history.lock().unwrap();
+        if revision < h.evicted_floor || (compacted > 0 && revision <= compacted) {
+            return Err(Error::Gone(
+                "The resourceVersion for the provided list is too old.".to_string(),
+            ));
+        }
+        let mut state: std::collections::BTreeMap<String, String> = self
+            .data
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| k.starts_with(prefix))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (rev, key, previous) in h.undo.iter().rev() {
+            if *rev <= revision || !key.starts_with(prefix) {
+                continue;
+            }
+            match previous {
+                Some(v) => state.insert(key.clone(), v.clone()),
+                None => state.remove(key),
+            };
+        }
+        drop(h);
+        state
+            .values()
+            .map(|v| serde_json::from_str(v).map_err(Error::from))
+            .collect()
     }
 
     /// Replay every retained event with revision `>= revision` under `prefix`,
@@ -699,6 +786,10 @@ mod tests {
     async fn watch_from_compacted_revision_is_gone() {
         let s = MemoryStorage::new();
         let a: serde_json::Value = s.create("/r/cm/a", &cm("a")).await.unwrap();
+        let _: serde_json::Value = s
+            .create("/r/b", &serde_json::json!({"metadata": {"name": "b"}}))
+            .await
+            .unwrap();
         s.compact_to(rv_of(&a));
         assert!(matches!(
             s.watch_from_revision("/r/cm/", rv_of(&a)).await.err(),
@@ -887,5 +978,90 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+    }
+
+    /// `list_at_revision` rebuilds the collection as it stood at a past
+    /// revision: etcd's `Range(WithRev(rev))`, which `GetList` issues for
+    /// `resourceVersionMatch=Exact` (`etcd3/store.go` GetList, `withRev` from
+    /// `ValidateListOptions`, `storage/interfaces.go:374-375`). Ported from
+    /// `RunTestList` "resource version of second write, match=Exact"
+    /// (`storage/testing/store_tests.go:1580`).
+    #[tokio::test]
+    async fn list_at_revision_reads_the_collection_as_of_that_revision() {
+        let s = MemoryStorage::new();
+        let names = |l: Vec<serde_json::Value>| -> Vec<String> {
+            l.iter()
+                .map(|v| v["metadata"]["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let obj = |n: &str| serde_json::json!({"metadata": {"name": n}, "data": "v1"});
+
+        let a: serde_json::Value = s.create("/r/a", &obj("a")).await.unwrap();
+        let b: serde_json::Value = s.create("/r/b", &obj("b")).await.unwrap();
+        let mut a2 = a.clone();
+        a2["data"] = "v2".into();
+        let a2: serde_json::Value = s.update("/r/a", &a2).await.unwrap();
+        s.delete("/r/b").await.unwrap();
+        let _c: serde_json::Value = s.create("/r/c", &obj("c")).await.unwrap();
+
+        let at = |r: i64| {
+            let s = s.clone();
+            async move {
+                s.list_at_revision::<serde_json::Value>("/r/", r)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(names(at(rv_of(&a)).await), ["a"]);
+        let l = at(rv_of(&b)).await;
+        assert_eq!(names(l.clone()), ["a", "b"]);
+        assert_eq!(l[0]["data"], "v1");
+        // After the update: a is v2, b still there.
+        let l = at(rv_of(&a2)).await;
+        assert_eq!(names(l.clone()), ["a", "b"]);
+        assert_eq!(l[0]["data"], "v2");
+        // After the delete: b is gone, c not yet created.
+        assert_eq!(names(at(rv_of(&a2) + 1).await), ["a"]);
+        // Now.
+        let now = s.current_revision().await.unwrap();
+        assert_eq!(names(at(now).await), ["a", "c"]);
+    }
+
+    /// A revision older than the retained history, or at/below a compaction,
+    /// cannot be rebuilt: 410 `The resourceVersion for the provided list is
+    /// too old.` (`etcd3/errors.go:53,68-72`, `interpretListError`).
+    #[tokio::test]
+    async fn list_at_revision_below_history_or_compaction_is_gone() {
+        let s = MemoryStorage::with_history_capacity(2);
+        for n in ["a", "b", "c", "d"] {
+            let _: serde_json::Value = s
+                .create(
+                    &format!("/r/{n}"),
+                    &serde_json::json!({"metadata": {"name": n}}),
+                )
+                .await
+                .unwrap();
+        }
+        let err = s
+            .list_at_revision::<serde_json::Value>("/r/", 2)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Gone(_)), "{err:?}");
+
+        let s = MemoryStorage::new();
+        let a: serde_json::Value = s
+            .create("/r/a", &serde_json::json!({"metadata": {"name": "a"}}))
+            .await
+            .unwrap();
+        let _: serde_json::Value = s
+            .create("/r/b", &serde_json::json!({"metadata": {"name": "b"}}))
+            .await
+            .unwrap();
+        s.compact_to(rv_of(&a));
+        let err = s
+            .list_at_revision::<serde_json::Value>("/r/", rv_of(&a))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Gone(_)), "{err:?}");
     }
 }
