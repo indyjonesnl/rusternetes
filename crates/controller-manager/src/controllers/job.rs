@@ -7077,4 +7077,187 @@ mod tests {
             "{st:?}"
         );
     }
+
+    // ---- #2780: persisted interim condition + upstream evaluation order ----
+    //
+    // Upstream syncJob (pkg/controller/job/job_controller.go:945-998):
+    //   jobCtx.finishedCondition = hasSuccessCriteriaMetCondition(&job)   // :947
+    //   if nil { FailureTarget=True -> newFailedConditionForFailureTarget // :953-955
+    //            else podFailurePolicy }
+    //   if nil { backoffLimit, then activeDeadline }
+    //   ... per-index failures, then successPolicy, then completions.
+
+    fn interim(condition_type: &str, reason: &str, message: &str) -> JobCondition {
+        let now = chrono::Utc::now();
+        JobCondition {
+            condition_type: condition_type.to_string(),
+            status: "True".to_string(),
+            last_probe_time: Some(now),
+            last_transition_time: Some(now),
+            reason: Some(reason.to_string()),
+            message: Some(message.to_string()),
+        }
+    }
+
+    fn cond_of<'a>(job: &'a Job, t: &str) -> Option<&'a JobCondition> {
+        job.status
+            .as_ref()?
+            .conditions
+            .as_ref()?
+            .iter()
+            .find(|c| c.condition_type == t && c.status == "True")
+    }
+
+    /// job_controller_test.go:4977 "job with SuccessCriteriaMet has never been
+    /// transitioned to FailureTarget and Failed even if job meets backoffLimit"
+    /// (the persisted condition, not the spec's successPolicy, decides).
+    #[tokio::test]
+    async fn persisted_success_criteria_met_beats_backoff_limit() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job("psc", "default", 2, 2);
+        job.spec.completion_mode = Some("Indexed".to_string());
+        job.spec.backoff_limit = Some(0);
+        job.status = Some(JobStatus {
+            conditions: Some(vec![interim(
+                "SuccessCriteriaMet",
+                "SuccessPolicy",
+                "Matched rules at index 0",
+            )]),
+            ..Default::default()
+        });
+        let key = "/registry/jobs/default/psc";
+        storage.create(key, &job).await.unwrap();
+        for (n, ph, i) in [("a", Phase::Failed, 0), ("b", Phase::Succeeded, 1)] {
+            let p = make_indexed_pod(n, "default", ph, "psc", "job-uid-1", i);
+            storage
+                .create(&format!("/registry/pods/default/{n}"), &p)
+                .await
+                .unwrap();
+        }
+        let c = JobController::new(storage.clone());
+        reconcile_settled(&c, &storage, key).await;
+        let got: Job = storage.get(key).await.unwrap();
+        assert!(cond_of(&got, "Failed").is_none(), "{:?}", got.status);
+        let done = cond_of(&got, "Complete").expect("Complete follows SuccessCriteriaMet");
+        assert_eq!(done.reason.as_deref(), Some("SuccessPolicy"));
+        assert_eq!(done.message.as_deref(), Some("Matched rules at index 0"));
+    }
+
+    /// job_controller_test.go:5039 "job with FailureTarget has never been
+    /// transitioned to SuccessCriteriaMet even if job meets successPolicy".
+    #[tokio::test]
+    async fn persisted_failure_target_beats_success_policy() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job("pft", "default", 2, 2);
+        job.spec.completion_mode = Some("Indexed".to_string());
+        job.spec.success_policy = Some(
+            serde_json::from_value(serde_json::json!({"rules": [{"succeededCount": 1}]})).unwrap(),
+        );
+        let msg =
+            "Pod default/mypod-0 has condition DisruptionTarget matching FailJob rule at index 0";
+        job.status = Some(JobStatus {
+            conditions: Some(vec![interim("FailureTarget", "PodFailurePolicy", msg)]),
+            ..Default::default()
+        });
+        let key = "/registry/jobs/default/pft";
+        storage.create(key, &job).await.unwrap();
+        let p = make_indexed_pod("b", "default", Phase::Succeeded, "pft", "job-uid-1", 1);
+        storage
+            .create("/registry/pods/default/b", &p)
+            .await
+            .unwrap();
+        let c = JobController::new(storage.clone());
+        reconcile_settled(&c, &storage, key).await;
+        let got: Job = storage.get(key).await.unwrap();
+        assert!(
+            cond_of(&got, "SuccessCriteriaMet").is_none(),
+            "{:?}",
+            got.status
+        );
+        assert!(cond_of(&got, "Complete").is_none());
+        let failed = cond_of(&got, "Failed").expect("Failed follows FailureTarget");
+        assert_eq!(failed.reason.as_deref(), Some("PodFailurePolicy"));
+        assert_eq!(failed.message.as_deref(), Some(msg));
+    }
+
+    /// `newFailedConditionForFailureTarget` (job_controller.go:1562): Failed
+    /// carries the persisted FailureTarget's reason even when nothing in the
+    /// current pod list would re-derive it, and the Job stops creating pods.
+    #[tokio::test]
+    async fn persisted_failure_target_finishes_without_rederiving() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job("pfr", "default", 3, 3);
+        job.status = Some(JobStatus {
+            conditions: Some(vec![interim(
+                "FailureTarget",
+                "DeadlineExceeded",
+                "Job was active longer than specified deadline",
+            )]),
+            ..Default::default()
+        });
+        let key = "/registry/jobs/default/pfr";
+        storage.create(key, &job).await.unwrap();
+        let p = make_pod("r", "default", Phase::Running, "pfr", "job-uid-1");
+        storage
+            .create("/registry/pods/default/r", &p)
+            .await
+            .unwrap();
+        let c = JobController::new(storage.clone());
+        reconcile_settled(&c, &storage, key).await;
+        let got: Job = storage.get(key).await.unwrap();
+        let failed = cond_of(&got, "Failed").expect("Failed follows FailureTarget");
+        assert_eq!(failed.reason.as_deref(), Some("DeadlineExceeded"));
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        assert!(pods.len() <= 1, "no replacement pods: {}", pods.len());
+    }
+
+    /// Evaluation order, job_controller.go:960-985: backoffLimit is evaluated
+    /// before activeDeadlineSeconds.
+    #[tokio::test]
+    async fn backoff_limit_is_evaluated_before_active_deadline() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job("ord", "default", 1, 1);
+        job.spec.backoff_limit = Some(0);
+        job.spec.active_deadline_seconds = Some(1);
+        job.status = Some(JobStatus {
+            start_time: Some(chrono::Utc::now() - chrono::Duration::seconds(60)),
+            ..Default::default()
+        });
+        let key = "/registry/jobs/default/ord";
+        storage.create(key, &job).await.unwrap();
+        let p = make_pod("f", "default", Phase::Failed, "ord", "job-uid-1");
+        storage
+            .create("/registry/pods/default/f", &p)
+            .await
+            .unwrap();
+        let c = JobController::new(storage.clone());
+        reconcile_settled(&c, &storage, key).await;
+        let got: Job = storage.get(key).await.unwrap();
+        let failed = cond_of(&got, "Failed").expect("Failed");
+        assert_eq!(failed.reason.as_deref(), Some("BackoffLimitExceeded"));
+    }
+
+    /// Failure scenarios are evaluated before completions
+    /// (job_controller.go:945-998, then `complete` at :1035 only when
+    /// finishedCondition is nil).
+    #[tokio::test]
+    async fn failure_is_evaluated_before_completions() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job("fbc", "default", 1, 1);
+        job.spec.backoff_limit = Some(0);
+        let key = "/registry/jobs/default/fbc";
+        storage.create(key, &job).await.unwrap();
+        for (n, ph) in [("s", Phase::Succeeded), ("f", Phase::Failed)] {
+            let p = make_pod(n, "default", ph, "fbc", "job-uid-1");
+            storage
+                .create(&format!("/registry/pods/default/{n}"), &p)
+                .await
+                .unwrap();
+        }
+        let c = JobController::new(storage.clone());
+        reconcile_settled(&c, &storage, key).await;
+        let got: Job = storage.get(key).await.unwrap();
+        assert!(cond_of(&got, "Complete").is_none(), "{:?}", got.status);
+        assert!(cond_of(&got, "Failed").is_some());
+    }
 }
