@@ -39,6 +39,7 @@ pub mod job;
 pub mod lease;
 pub mod limitrange;
 pub mod metrics;
+pub mod mutating_admission_policy;
 pub mod namespace;
 pub mod networkpolicy;
 pub mod node;

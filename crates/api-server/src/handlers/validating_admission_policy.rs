@@ -43,7 +43,9 @@ pub(crate) fn patch_content_type(headers: &HeaderMap) -> &str {
 /// The create / get / update / patch / delete / deletecollection handlers of a
 /// cluster-scoped resource served by a [`RequestScope`]: thin wrappers over
 /// `endpoints::{create,get,update,patch,delete}_resource` and
-/// `delete_collection`, as in the sibling per-resource handler files.
+/// `delete_collection`, as in the sibling per-resource handler files. An
+/// optional trailing `gate: path` is a `fn() -> Result<()>` run first by every
+/// handler (the 404 of a resource whose gate is off).
 macro_rules! store_crud_handlers {
     (
         scope: $scope:ident,
@@ -52,7 +54,8 @@ macro_rules! store_crud_handlers {
         update: $update:ident,
         patch: $patch:ident,
         delete: $delete:ident,
-        deletecollection: $deletecollection:ident $(,)?
+        deletecollection: $deletecollection:ident
+        $(, gate: $gate:path)? $(,)?
     ) => {
         pub async fn $create(
             axum::extract::State(state): axum::extract::State<
@@ -64,6 +67,7 @@ macro_rules! store_crud_handlers {
             >,
             body: axum::body::Bytes,
         ) -> rusternetes_common::Result<axum::response::Response> {
+            $( $gate()?; )?
             $crate::endpoints::handlers::create_resource(
                 &state,
                 &$scope(&state),
@@ -85,6 +89,7 @@ macro_rules! store_crud_handlers {
                 std::collections::HashMap<String, String>,
             >,
         ) -> rusternetes_common::Result<axum::response::Response> {
+            $( $gate()?; )?
             $crate::endpoints::handlers::get_resource(
                 &state,
                 &$scope(&state),
@@ -107,6 +112,7 @@ macro_rules! store_crud_handlers {
             >,
             body: axum::body::Bytes,
         ) -> rusternetes_common::Result<axum::response::Response> {
+            $( $gate()?; )?
             $crate::endpoints::handlers::update_resource(
                 &state,
                 &$scope(&state),
@@ -131,6 +137,7 @@ macro_rules! store_crud_handlers {
             headers: axum::http::HeaderMap,
             body: axum::body::Bytes,
         ) -> rusternetes_common::Result<axum::response::Response> {
+            $( $gate()?; )?
             $crate::endpoints::handlers::patch_resource(
                 &state,
                 &$scope(&state),
@@ -155,6 +162,7 @@ macro_rules! store_crud_handlers {
             >,
             body: axum::body::Bytes,
         ) -> rusternetes_common::Result<axum::response::Response> {
+            $( $gate()?; )?
             $crate::endpoints::handlers::delete_resource(
                 &state,
                 &$scope(&state),
@@ -177,6 +185,7 @@ macro_rules! store_crud_handlers {
             >,
             body: axum::body::Bytes,
         ) -> rusternetes_common::Result<axum::response::Response> {
+            $( $gate()?; )?
             $crate::endpoints::handlers::delete_collection(
                 &state,
                 &$scope(&state),

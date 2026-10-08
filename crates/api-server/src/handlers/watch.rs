@@ -1976,6 +1976,21 @@ fn resource_type_to_kind_and_version(resource_type: &str, api_group: &str) -> (S
             "certificates.k8s.io/v1beta1".to_string(),
         );
     }
+    // Served only as admissionregistration.k8s.io/v1beta1
+    // (storage_apiserver.go:187-205).
+    if api_group == "admissionregistration.k8s.io" {
+        let mutating = match resource_type {
+            "mutatingadmissionpolicies" => Some("MutatingAdmissionPolicy"),
+            "mutatingadmissionpolicybindings" => Some("MutatingAdmissionPolicyBinding"),
+            _ => None,
+        };
+        if let Some(kind) = mutating {
+            return (
+                kind.to_string(),
+                "admissionregistration.k8s.io/v1beta1".to_string(),
+            );
+        }
+    }
     let kind = match resource_type {
         "pods" => "Pod",
         "services" => "Service",
@@ -2852,6 +2867,42 @@ pub async fn watch_certificatesigningrequests(
         auth_ctx,
         "certificatesigningrequests",
         "certificates.k8s.io",
+        params,
+    )
+    .await
+}
+
+/// Watch mutatingadmissionpolicies (cluster-scoped,
+/// admissionregistration.k8s.io/v1beta1, 404 unless the gate is on)
+pub async fn watch_mutatingadmissionpolicies(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Query(params): Query<WatchParams>,
+) -> Result<Response> {
+    crate::handlers::mutating_admission_policy::gate()?;
+    watch_cluster_scoped::<rusternetes_common::resources::MutatingAdmissionPolicy>(
+        state,
+        auth_ctx,
+        "mutatingadmissionpolicies",
+        "admissionregistration.k8s.io",
+        params,
+    )
+    .await
+}
+
+/// Watch mutatingadmissionpolicybindings (cluster-scoped,
+/// admissionregistration.k8s.io/v1beta1, 404 unless the gate is on)
+pub async fn watch_mutatingadmissionpolicybindings(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Query(params): Query<WatchParams>,
+) -> Result<Response> {
+    crate::handlers::mutating_admission_policy::gate()?;
+    watch_cluster_scoped::<rusternetes_common::resources::MutatingAdmissionPolicyBinding>(
+        state,
+        auth_ctx,
+        "mutatingadmissionpolicybindings",
+        "admissionregistration.k8s.io",
         params,
     )
     .await
