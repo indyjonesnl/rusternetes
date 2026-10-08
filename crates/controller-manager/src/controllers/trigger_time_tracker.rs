@@ -167,7 +167,7 @@ mod tests {
         // Struct-init on purpose: a test fixture, not a controller
         // writing status (tests/it/status_subresource_guard.rs).
         let base = Pod::new(name, PodSpec::default());
-        let status = Some(PodStatus {
+        let pod_state = Some(PodStatus {
             conditions: Some(vec![PodCondition {
                 condition_type: "Ready".to_string(),
                 status: "True".to_string(),
@@ -181,7 +181,7 @@ mod tests {
         });
         Pod {
             metadata: ObjectMeta::new(name).with_namespace(NS),
-            status,
+            status: pod_state,
             ..base
         }
     }
