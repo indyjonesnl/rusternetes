@@ -16,6 +16,7 @@ pub mod lifecycle;
 pub mod node_status;
 pub mod pluginmanager;
 pub mod pod_dirs;
+pub mod podcertificate;
 mod poll;
 pub mod removeall;
 pub mod runtime;
