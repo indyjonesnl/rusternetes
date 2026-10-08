@@ -619,7 +619,7 @@ async fn test_honors_reclaim_policy_retain() {
 }
 
 #[tokio::test]
-async fn test_restores_pvc_from_snapshot() {
+async fn test_non_csi_plugin_rejects_pvc_with_datasource() {
     let storage = setup_test().await;
 
     // Step 1: Create StorageClass
@@ -786,30 +786,29 @@ async fn test_restores_pvc_from_snapshot() {
     controller.reconcile_all().await.unwrap();
     sleep(Duration::from_millis(500)).await;
 
-    // Step 7: Verify PV was created with snapshot restoration
-    let pv_name = "pvc-default-restored-pvc";
-    let pv_key = build_key("persistentvolumes", None, pv_name);
+    // Step 7: the hostpath plugin is an in-tree, non-CSI plugin. Upstream
+    // provisionClaimOperation (pv_controller.go:1628-1636) refuses any claim
+    // with a dataSource for a non-CSI plugin: no PV, and a Warning
+    // ProvisioningFailed event on the claim. It must NOT fake a restore.
+    let pv_key = build_key("persistentvolumes", None, "pvc-default-restored-pvc");
     let pv: Result<PersistentVolume, _> = storage.get(&pv_key).await;
-
     assert!(
-        pv.is_ok(),
-        "PV should be created for PVC with snapshot dataSource"
+        pv.is_err(),
+        "non-CSI plugin must not provision a claim with a dataSource"
     );
-    let pv = pv.unwrap();
 
-    // Verify PV was provisioned correctly
-    assert_eq!(pv.spec.storage_class_name, Some("fast".to_string()));
-    assert_eq!(pv.spec.capacity.get("storage"), Some(&"5Gi".to_string()));
-
-    // Verify status message indicates snapshot restore
-    assert!(pv
-        .status
-        .as_ref()
-        .unwrap()
-        .message
-        .as_ref()
-        .unwrap()
-        .contains("snapshot"));
+    let events: Vec<rusternetes_common::resources::Event> =
+        storage.list("/registry/events/default/").await.unwrap();
+    let ev = events
+        .iter()
+        .find(|e| e.reason == "ProvisioningFailed")
+        .expect("ProvisioningFailed event");
+    assert_eq!(ev.involved_object.name.as_deref(), Some("restored-pvc"));
+    assert_eq!(ev.event_type, rusternetes_common::resources::EventType::Warning);
+    assert_eq!(
+        ev.message,
+        "plugin \"kubernetes.io/host-path\" is not a CSI plugin. Only CSI plugin can provision a claim with a datasource"
+    );
 }
 
 #[tokio::test]
