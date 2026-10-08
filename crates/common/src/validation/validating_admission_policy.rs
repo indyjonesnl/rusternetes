@@ -211,7 +211,7 @@ fn validate_validating_admission_policy_spec(
 }
 
 /// `validateParamKind` (`validation.go:832-884`).
-fn validate_param_kind(param_kind: &ParamKind, fld_path: &Path) -> ErrorList {
+pub(crate) fn validate_param_kind(param_kind: &ParamKind, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     let api_version_path = fld_path.child("apiVersion");
     let api_version = param_kind.api_version.clone().unwrap_or_default();
@@ -275,7 +275,10 @@ fn validate_param_kind(param_kind: &ParamKind, fld_path: &Path) -> ErrorList {
 /// `validateMatchResources` (`validation.go:886-918`), shared by a policy's
 /// `matchConstraints` and a binding's `matchResources` exactly as upstream
 /// shares it.
-fn validate_match_resources(match_resources: &MatchResources, fld_path: &Path) -> ErrorList {
+pub(crate) fn validate_match_resources(
+    match_resources: &MatchResources,
+    fld_path: &Path,
+) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
 
     // validation.go:891-895.
@@ -379,7 +382,9 @@ fn validate_named_rule_with_operations(
     errs
 }
 
-fn operation_str(op: &crate::resources::validating_admission_policy::OperationType) -> String {
+pub(crate) fn operation_str(
+    op: &crate::resources::validating_admission_policy::OperationType,
+) -> String {
     use crate::resources::validating_admission_policy::OperationType as Op;
     match op {
         Op::Create => "CREATE",
@@ -395,7 +400,7 @@ fn operation_str(op: &crate::resources::validating_admission_policy::OperationTy
 /// `path.ValidatePathSegmentName(name, false)`
 /// (`apimachinery/pkg/api/validation/path/name.go:29-48`): a name may not be
 /// `.`, `..`, or contain `/` or `%`.
-fn validate_path_segment_name(name: &str) -> Vec<String> {
+pub(crate) fn validate_path_segment_name(name: &str) -> Vec<String> {
     let mut msgs = Vec::new();
     if name == "." {
         msgs.push("may not be '.'".to_string());
@@ -445,7 +450,7 @@ pub fn validate_match_conditions(conditions: &[MatchCondition], fld_path: &Path)
 }
 
 /// `validateVariable` (`validation.go:999-1032`), minus the CEL compile.
-fn validate_variable(variable: &Variable, fld_path: &Path) -> ErrorList {
+pub(crate) fn validate_variable(variable: &Variable, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     if variable.name.trim().is_empty() {
         errs.push(Error::required(
@@ -617,7 +622,7 @@ fn validate_binding_spec(
 }
 
 /// `validateParamRef` (`validation.go:1198-1232`).
-fn validate_param_ref(param_ref: &ParamRef, fld_path: &Path) -> ErrorList {
+pub(crate) fn validate_param_ref(param_ref: &ParamRef, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     let name = param_ref.name.clone().unwrap_or_default();
 

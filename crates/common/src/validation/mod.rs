@@ -34,6 +34,7 @@ mod job_status_strategy_tests;
 pub mod lease;
 pub mod limitrange;
 pub mod metav1;
+pub mod mutating_admission_policy;
 pub mod namespace;
 pub mod networkpolicy;
 pub mod node;

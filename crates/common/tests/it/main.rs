@@ -56,6 +56,7 @@ mod validation_job;
 mod validation_lease;
 mod validation_limitrange;
 mod validation_metav1;
+mod validation_mutating_admission_policy;
 mod validation_namespace;
 mod validation_networkpolicy;
 mod validation_node;

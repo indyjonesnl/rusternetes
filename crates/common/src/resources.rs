@@ -25,6 +25,7 @@ pub mod ingress;
 pub mod ingressclass;
 pub mod ipaddress;
 pub mod metrics;
+pub mod mutating_admission_policy;
 pub mod namespace;
 pub mod networking;
 pub mod node;
@@ -157,6 +158,10 @@ pub use ingress::{
 pub use ingressclass::{IngressClass, IngressClassParametersReference, IngressClassSpec};
 pub use ipaddress::{IPAddress, IPAddressSpec, ParentReference};
 pub use metrics::{ContainerMetrics, NodeMetrics, PodMetrics};
+pub use mutating_admission_policy::{
+    MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding, MutatingAdmissionPolicyBindingSpec,
+    MutatingAdmissionPolicySpec,
+};
 pub use namespace::{Namespace, NamespaceCondition, NamespaceSpec, NamespaceStatus};
 pub use networking::{
     IPBlock, NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
