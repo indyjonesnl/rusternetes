@@ -727,7 +727,11 @@ impl CriContainerRuntime {
         // prefix is what `lifecycle::container_reason_from_error_message` turns
         // into the container's `waiting.reason` — the field the upstream
         // conformance specs assert on.
-        let mut cfg = translate::container_config_with_allocatable(
+        let mount_attrs = match self.volumes.as_ref() {
+            Some(vm) => vm.mount_attributes(pod, container),
+            None => std::collections::HashMap::new(),
+        };
+        let mut cfg = translate::container_config_with_mounts(
             pod,
             container,
             &container.image,
@@ -735,6 +739,7 @@ impl CriContainerRuntime {
             &config_maps,
             &secrets,
             node_allocatable,
+            &mount_attrs,
         )
         .map_err(|msg| {
             anyhow::anyhow!(

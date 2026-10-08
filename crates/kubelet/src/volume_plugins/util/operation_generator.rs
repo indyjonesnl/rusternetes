@@ -450,6 +450,19 @@ pub async fn mount_volume(
     pod: &Pod,
     device_path: &str,
 ) -> anyhow::Result<String> {
+    Ok(mount_volume_with_attributes(mgr, spec, pod, device_path)
+        .await?
+        .0)
+}
+
+/// [`mount_volume`], also returning `mounter.GetAttributes()` read after
+/// `SetUp` (`volume.go:187`) - what the kubelet's `makeMounts` consumes.
+pub async fn mount_volume_with_attributes(
+    mgr: &VolumePluginMgr,
+    spec: &Spec<'_>,
+    pod: &Pod,
+    device_path: &str,
+) -> anyhow::Result<(String, crate::volume_plugins::plugin::Attributes)> {
     let plugin = mgr.find_plugin_by_spec(spec)?;
     let mounter = plugin.new_mounter(spec, pod).await?;
 
@@ -479,7 +492,7 @@ pub async fn mount_volume(
     }
 
     mounter.set_up().await?;
-    Ok(mounter.get_path())
+    Ok((mounter.get_path(), mounter.get_attributes()))
 }
 
 #[cfg(test)]
