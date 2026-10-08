@@ -147,6 +147,21 @@ async fn create_bound_pvc(
 
     let key = build_key("persistentvolumeclaims", Some(namespace), name);
     storage.create(&key, &pvc).await.unwrap();
+
+    // A bound PV carries a claimRef naming this PVC's namespace and UID; the
+    // expand controller errors otherwise (expand_controller.go:222-226).
+    let pv_key = build_key("persistentvolumes", None, pv_name);
+    let mut pv: PersistentVolume = storage.get(&pv_key).await.unwrap();
+    pv.spec.claim_ref = Some(
+        rusternetes_common::resources::service_account::ObjectReference {
+            kind: Some("PersistentVolumeClaim".to_string()),
+            namespace: Some(namespace.to_string()),
+            name: Some(name.to_string()),
+            uid: Some(pvc.metadata.uid.clone()),
+            ..Default::default()
+        },
+    );
+    storage.update(&pv_key, &pv).await.unwrap();
     pvc
 }
 

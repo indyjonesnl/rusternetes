@@ -1,12 +1,15 @@
 use crate::controllers::worker_pool::spawn_workers;
 use anyhow::{Context, Result};
+use rusternetes_common::quantity::Quantity;
+use rusternetes_common::resources::service_account::ObjectReference;
 use rusternetes_common::resources::volume::{
     PersistentVolumeClaimPhase, PersistentVolumeClaimResizeStatus,
 };
+use rusternetes_common::resources::{EventSource, EventType};
 use rusternetes_common::resources::{
     PersistentVolume, PersistentVolumeClaim, PersistentVolumeClaimStatus, StorageClass,
 };
-use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
+use rusternetes_storage::{build_key, extract_key, EventRecorder, Storage, WorkQueue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,13 +20,19 @@ use tracing::{error, info, warn};
 /// (pkg/controller/volume/expand/expand_controller.go:58), launched in `Run` (:341-345).
 const CONCURRENT_VOLUME_EXPAND_SYNCS: usize = 10;
 
+/// `util.AnnPreResizeCapacity` (`pkg/volume/util/resize_util.go:52`).
+const ANN_PRE_RESIZE_CAPACITY: &str = "volume.alpha.kubernetes.io/pre-resize-capacity";
+
 pub struct VolumeExpansionController<S: Storage> {
     storage: Arc<S>,
+    /// `expc.recorder` (expand_controller.go).
+    recorder: EventRecorder<S>,
 }
 
 impl<S: Storage + 'static> VolumeExpansionController<S> {
     pub fn new(storage: Arc<S>) -> Self {
-        Self { storage }
+        let recorder = EventRecorder::new(Arc::clone(&storage));
+        Self { storage, recorder }
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
@@ -160,17 +169,47 @@ impl<S: Storage + 'static> VolumeExpansionController<S> {
         Ok(())
     }
 
+    /// `syncHandler` (pkg/controller/volume/expand/expand_controller.go:202-287).
     async fn reconcile_pvc(&self, pvc: &PersistentVolumeClaim) -> Result<()> {
         let pvc_name = &pvc.metadata.name;
         let namespace = pvc.metadata.namespace.as_deref().unwrap_or("default");
+        let key = format!("{namespace}/{pvc_name}");
 
-        // Only process bound PVCs
+        // Only process bound PVCs (the informer's update filter, :135-160).
         if pvc.status.as_ref().map(|s| &s.phase) != Some(&PersistentVolumeClaimPhase::Bound) {
             return Ok(());
         }
 
-        // Check if expansion is needed
-        if !self.needs_expansion(pvc)? {
+        // `getPersistentVolume` (:354-363): Get(volumeName) fails for "".
+        let volume_name = pvc.spec.volume_name.as_deref().unwrap_or("");
+        let pv: PersistentVolume = self
+            .storage
+            .get(&build_key("persistentvolumes", None, volume_name))
+            .await
+            .with_context(|| format!("failed to get PV {volume_name:?}"))?;
+
+        // :222-226
+        let claim_ref = pv.spec.claim_ref.as_ref();
+        if claim_ref.is_none_or(|r| {
+            r.namespace.as_deref().unwrap_or("") != namespace
+                || r.uid.as_deref().unwrap_or("") != pvc.metadata.uid
+        }) {
+            anyhow::bail!("persistent Volume is not bound to PVC being updated : {key}");
+        }
+
+        if !self.needs_expansion(pvc, &pv)? {
+            return Ok(());
+        }
+
+        // A CSI volume is expanded by the external-resizer sidecar calling
+        // ControllerExpandVolume (and the kubelet NodeExpandVolume), never by this
+        // controller: `FindExpandablePluginBySpec` finds no plugin for it and the
+        // controller only records ExternalExpanding and returns nil (:262-273; the
+        // "for csi plugin without migration path" case of TestSyncHandler,
+        // expand_controller_test.go:84-91). Writing PV/PVC capacity here would
+        // bypass the CSI contract.
+        if pv.spec.csi.is_some() {
+            self.record_external_expanding(pvc).await;
             return Ok(());
         }
 
@@ -205,29 +244,66 @@ impl<S: Storage + 'static> VolumeExpansionController<S> {
         Ok(())
     }
 
-    /// Check if a PVC needs expansion
-    fn needs_expansion(&self, pvc: &PersistentVolumeClaim) -> Result<bool> {
-        let status = pvc.status.as_ref().context("PVC has no status")?;
-
-        // Get requested storage from spec
-        let requested_storage = pvc
-            .spec
-            .resources
-            .requests
-            .as_ref()
-            .and_then(|r| r.get("storage"))
-            .context("PVC has no storage request")?;
-
-        // Get current capacity from status
-        let current_capacity = status.capacity.as_ref().and_then(|c| c.get("storage"));
-
-        match current_capacity {
-            None => Ok(false), // No capacity yet, not ready for expansion
-            Some(current) => {
-                // Check if requested is greater than current
-                Ok(self.storage_greater_than(requested_storage, current))
-            }
+    /// `expc.recorder.Event(pvc, EventTypeNormal, events.ExternalExpanding, msg)`
+    /// (expand_controller.go:262-271).
+    async fn record_external_expanding(&self, pvc: &PersistentVolumeClaim) {
+        let involved = ObjectReference {
+            kind: Some("PersistentVolumeClaim".to_string()),
+            namespace: pvc.metadata.namespace.clone(),
+            name: Some(pvc.metadata.name.clone()),
+            uid: Some(pvc.metadata.uid.clone()),
+            api_version: Some("v1".to_string()),
+            ..Default::default()
+        };
+        let source = EventSource {
+            component: "volume_expand".to_string(),
+            host: None,
+        };
+        if let Err(e) = self
+            .recorder
+            .event(
+                &involved,
+                &source,
+                EventType::Normal,
+                "ExternalExpanding",
+                "waiting for an external controller to expand this PVC",
+            )
+            .await
+        {
+            warn!("failed to record ExternalExpanding event: {e}");
         }
+    }
+
+    /// The gate at expand_controller.go:228-236: expand only when the request
+    /// exceeds `status.capacity` (a `resource.Quantity.Cmp`, so 1Gi == 1024Mi) or the PV
+    /// carries `util.AnnPreResizeCapacity`. An absent quantity is the zero Quantity.
+    fn needs_expansion(&self, pvc: &PersistentVolumeClaim, pv: &PersistentVolume) -> Result<bool> {
+        let zero = Quantity::parse("0").expect("0 is a quantity");
+        let parse = |s: Option<&String>| -> Result<Quantity> {
+            match s {
+                Some(s) => Quantity::parse(s).map_err(|e| anyhow::anyhow!("{s:?}: {e}")),
+                None => Ok(zero),
+            }
+        };
+        let request = parse(
+            pvc.spec
+                .resources
+                .requests
+                .as_ref()
+                .and_then(|r| r.get("storage")),
+        )?;
+        let current = parse(
+            pvc.status
+                .as_ref()
+                .and_then(|s| s.capacity.as_ref())
+                .and_then(|c| c.get("storage")),
+        )?;
+        let has_pre_resize = pv
+            .metadata
+            .annotations
+            .as_ref()
+            .is_some_and(|a| a.contains_key(ANN_PRE_RESIZE_CAPACITY));
+        Ok(request.cmp_value(&current) == std::cmp::Ordering::Greater || has_pre_resize)
     }
 
     /// Expand a PVC to the requested size
@@ -373,191 +449,185 @@ impl<S: Storage + 'static> VolumeExpansionController<S> {
 
         Ok(())
     }
-
-    /// Compare storage sizes and return true if first is greater than second
-    fn storage_greater_than(&self, size1: &str, size2: &str) -> bool {
-        // Parse the numeric part and unit from storage strings like "10Gi", "5Gi"
-        let parse_storage = |s: &str| -> Option<(f64, String)> {
-            let numeric_end = s.chars().position(|c| !c.is_numeric() && c != '.')?;
-            let (num_str, unit) = s.split_at(numeric_end);
-            let num = num_str.parse::<f64>().ok()?;
-            Some((num, unit.to_string()))
-        };
-
-        match (parse_storage(size1), parse_storage(size2)) {
-            (Some((num1, unit1)), Some((num2, unit2))) => {
-                // Units must match for comparison
-                if unit1 != unit2 {
-                    warn!("Storage units don't match: {} vs {}", unit1, unit2);
-                    return false;
-                }
-                num1 > num2
-            }
-            _ => {
-                warn!(
-                    "Failed to parse storage values: size1='{}', size2='{}'",
-                    size1, size2
-                );
-                false
-            }
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusternetes_common::resources::Event;
     use rusternetes_storage::memory::MemoryStorage;
 
-    #[test]
-    fn test_storage_greater_than() {
-        let storage = Arc::new(MemoryStorage::new());
-        let controller = VolumeExpansionController::new(storage);
+    // Port of `TestSyncHandler` (pkg/controller/volume/expand/expand_controller_test.go:48-157)
+    // and its fixtures `getFakePersistentVolume` / `getFakePersistentVolumeClaim` (:175-).
 
-        assert!(controller.storage_greater_than("10Gi", "5Gi"));
-        assert!(!controller.storage_greater_than("5Gi", "10Gi"));
-        assert!(!controller.storage_greater_than("10Gi", "10Gi")); // Equal is not greater
-        assert!(controller.storage_greater_than("100Mi", "50Mi"));
-        assert!(!controller.storage_greater_than("50Mi", "100Mi"));
-        assert!(controller.storage_greater_than("2000Gi", "1000Gi")); // 2000Gi > 1000Gi
+    fn pv(name: &str, driver: Option<&str>, size: &str, claim_uid: &str) -> PersistentVolume {
+        let mut spec = serde_json::json!({
+            "capacity": {"storage": size},
+            "claimRef": {"namespace": "default", "uid": claim_uid},
+        });
+        match driver {
+            Some(d) => spec["csi"] = serde_json::json!({"driver": d, "volumeHandle": "h"}),
+            None => spec["hostPath"] = serde_json::json!({"path": "/tmp/x"}),
+        }
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "PersistentVolume",
+            "metadata": {"name": name}, "spec": spec,
+        }))
+        .unwrap()
     }
 
-    #[test]
-    fn test_needs_expansion_no_capacity() {
-        let storage = Arc::new(MemoryStorage::new());
-        let controller = VolumeExpansionController::new(storage);
-
-        let mut requests = HashMap::new();
-        requests.insert("storage".to_string(), "10Gi".to_string());
-
-        let pvc = PersistentVolumeClaim {
-            type_meta: rusternetes_common::types::TypeMeta {
-                kind: "PersistentVolumeClaim".to_string(),
-                api_version: "v1".to_string(),
-            },
-            metadata: rusternetes_common::types::ObjectMeta::new("test-pvc"),
-            spec: rusternetes_common::resources::PersistentVolumeClaimSpec {
-                access_modes: vec![],
-                resources: rusternetes_common::resources::volume::ResourceRequirements {
-                    requests: Some(requests),
-                    limits: None,
-                },
-                volume_name: None,
-                storage_class_name: Some("fast".to_string()),
-                volume_mode: None,
-                selector: None,
-                data_source: None,
-                data_source_ref: None,
-                volume_attributes_class_name: None,
-            },
-            status: Some(PersistentVolumeClaimStatus {
-                phase: PersistentVolumeClaimPhase::Bound,
-                access_modes: None,
-                capacity: None, // No capacity yet
-                conditions: None,
-                allocated_resources: None,
-                allocated_resource_statuses: None,
-                resize_status: None,
-                current_volume_attributes_class_name: None,
-                modify_volume_status: None,
-            }),
-        };
-
-        assert!(!controller.needs_expansion(&pvc).unwrap());
+    fn pvc(
+        name: &str,
+        volume: &str,
+        status: &str,
+        request: &str,
+        uid: &str,
+    ) -> PersistentVolumeClaim {
+        let mut v = serde_json::json!({
+            "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+            "metadata": {"name": name, "namespace": "default", "uid": uid},
+            "spec": {"storageClassName": "sc", "resources": {"requests": {"storage": request}}},
+            "status": {"phase": "Bound", "capacity": {"storage": status}},
+        });
+        if !volume.is_empty() {
+            v["spec"]["volumeName"] = volume.into();
+        }
+        serde_json::from_value(v).unwrap()
     }
 
-    #[test]
-    fn test_needs_expansion_requested_greater() {
+    async fn setup(
+        pv_: Option<PersistentVolume>,
+        pvc_: &PersistentVolumeClaim,
+    ) -> (Arc<MemoryStorage>, VolumeExpansionController<MemoryStorage>) {
         let storage = Arc::new(MemoryStorage::new());
-        let controller = VolumeExpansionController::new(storage);
-
-        let mut requests = HashMap::new();
-        requests.insert("storage".to_string(), "10Gi".to_string());
-
-        let mut capacity = HashMap::new();
-        capacity.insert("storage".to_string(), "5Gi".to_string());
-
-        let pvc = PersistentVolumeClaim {
-            type_meta: rusternetes_common::types::TypeMeta {
-                kind: "PersistentVolumeClaim".to_string(),
-                api_version: "v1".to_string(),
-            },
-            metadata: rusternetes_common::types::ObjectMeta::new("test-pvc"),
-            spec: rusternetes_common::resources::PersistentVolumeClaimSpec {
-                access_modes: vec![],
-                resources: rusternetes_common::resources::volume::ResourceRequirements {
-                    requests: Some(requests),
-                    limits: None,
-                },
-                volume_name: None,
-                storage_class_name: Some("fast".to_string()),
-                volume_mode: None,
-                selector: None,
-                data_source: None,
-                data_source_ref: None,
-                volume_attributes_class_name: None,
-            },
-            status: Some(PersistentVolumeClaimStatus {
-                phase: PersistentVolumeClaimPhase::Bound,
-                access_modes: None,
-                capacity: Some(capacity),
-                conditions: None,
-                allocated_resources: None,
-                allocated_resource_statuses: None,
-                resize_status: None,
-                current_volume_attributes_class_name: None,
-                modify_volume_status: None,
-            }),
-        };
-
-        assert!(controller.needs_expansion(&pvc).unwrap());
+        if let Some(pv_) = pv_ {
+            storage
+                .create(
+                    &build_key("persistentvolumes", None, &pv_.metadata.name),
+                    &pv_,
+                )
+                .await
+                .unwrap();
+        }
+        storage
+            .create(
+                &build_key(
+                    "persistentvolumeclaims",
+                    Some("default"),
+                    &pvc_.metadata.name,
+                ),
+                pvc_,
+            )
+            .await
+            .unwrap();
+        let c = VolumeExpansionController::new(Arc::clone(&storage));
+        (storage, c)
     }
 
-    #[test]
-    fn test_needs_expansion_requested_equal() {
-        let storage = Arc::new(MemoryStorage::new());
-        let controller = VolumeExpansionController::new(storage);
+    async fn events(storage: &Arc<MemoryStorage>) -> Vec<Event> {
+        storage
+            .list::<Event>("/registry/events/default/")
+            .await
+            .unwrap()
+    }
 
-        let mut requests = HashMap::new();
-        requests.insert("storage".to_string(), "10Gi".to_string());
+    #[tokio::test]
+    async fn pvc_with_no_pv_binding_is_an_error() {
+        // "when pvc has no PV binding": hasError (expand_controller_test.go:58-63);
+        // upstream looks the PV up BEFORE comparing sizes (expand_controller.go:215-220).
+        let c1 = pvc("no-pv-pvc", "", "1Gi", "1Gi", "u1");
+        let (_s, c) = setup(None, &c1).await;
+        assert!(c.reconcile_pvc(&c1).await.is_err());
+    }
 
-        let mut capacity = HashMap::new();
-        capacity.insert("storage".to_string(), "10Gi".to_string());
+    #[tokio::test]
+    async fn pv_not_bound_to_this_pvc_is_an_error() {
+        // `pv.Spec.ClaimRef == nil || pvc.Namespace != ... || pvc.UID != ...`
+        // -> "persistent Volume is not bound to PVC being updated" (:222-226).
+        let c1 = pvc("p", "vol", "1Gi", "2Gi", "uid-mine");
+        let (_s, c) = setup(
+            Some(pv("vol", Some("com.csi.ceph"), "1Gi", "uid-other")),
+            &c1,
+        )
+        .await;
+        assert!(c.reconcile_pvc(&c1).await.is_err());
 
-        let pvc = PersistentVolumeClaim {
-            type_meta: rusternetes_common::types::TypeMeta {
-                kind: "PersistentVolumeClaim".to_string(),
-                api_version: "v1".to_string(),
-            },
-            metadata: rusternetes_common::types::ObjectMeta::new("test-pvc"),
-            spec: rusternetes_common::resources::PersistentVolumeClaimSpec {
-                access_modes: vec![],
-                resources: rusternetes_common::resources::volume::ResourceRequirements {
-                    requests: Some(requests),
-                    limits: None,
-                },
-                volume_name: None,
-                storage_class_name: Some("fast".to_string()),
-                volume_mode: None,
-                selector: None,
-                data_source: None,
-                data_source_ref: None,
-                volume_attributes_class_name: None,
-            },
-            status: Some(PersistentVolumeClaimStatus {
-                phase: PersistentVolumeClaimPhase::Bound,
-                access_modes: None,
-                capacity: Some(capacity),
-                conditions: None,
-                allocated_resources: None,
-                allocated_resource_statuses: None,
-                resize_status: None,
-                current_volume_attributes_class_name: None,
-                modify_volume_status: None,
-            }),
-        };
+        let mut unbound = pv("vol", Some("com.csi.ceph"), "1Gi", "uid-mine");
+        unbound.spec.claim_ref = None;
+        let (_s, c) = setup(Some(unbound), &c1).await;
+        assert!(c.reconcile_pvc(&c1).await.is_err());
+    }
 
-        assert!(!controller.needs_expansion(&pvc).unwrap());
+    #[tokio::test]
+    async fn csi_pv_is_not_resized_in_controller() {
+        // "for csi plugin without migration path": expansionCalled false, no error
+        // (:84-91). No expandable in-tree plugin -> ExternalExpanding event and the
+        // external resizer does the work (expand_controller.go:262-273).
+        let c1 = pvc("ceph-csi-pvc", "vol-5", "1Gi", "2Gi", "u5");
+        let (s, c) = setup(Some(pv("vol-5", Some("com.csi.ceph"), "1Gi", "u5")), &c1).await;
+        c.reconcile_pvc(&c1).await.unwrap();
+
+        let stored_pv: PersistentVolume = s
+            .get(&build_key("persistentvolumes", None, "vol-5"))
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_pv.spec.capacity["storage"], "1Gi",
+            "CSI PV must not be resized here"
+        );
+        let stored: PersistentVolumeClaim = s
+            .get(&build_key(
+                "persistentvolumeclaims",
+                Some("default"),
+                "ceph-csi-pvc",
+            ))
+            .await
+            .unwrap();
+        let st = stored.status.unwrap();
+        assert_eq!(st.capacity.unwrap()["storage"], "1Gi");
+        assert!(st.resize_status.is_none() && st.allocated_resources.is_none());
+        let evs = events(&s).await;
+        assert_eq!(evs.len(), 1, "{evs:?}");
+        assert_eq!(evs[0].reason, "ExternalExpanding");
+        assert_eq!(
+            evs[0].message,
+            "waiting for an external controller to expand this PVC"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_resize_annotation_triggers_sync_even_when_sizes_match() {
+        // "if pv has pre-resize capacity annotation" (:72-83): the early return at
+        // :228-236 is skipped, so the CSI PV still reaches ExternalExpanding.
+        let c1 = pvc("p", "vol-4", "2Gi", "2Gi", "u4");
+        let mut p = pv("vol-4", Some("com.csi.ceph"), "2Gi", "u4");
+        p.metadata.annotations = Some(HashMap::from([(
+            "volume.alpha.kubernetes.io/pre-resize-capacity".to_string(),
+            "1Gi".to_string(),
+        )]));
+        let (s, c) = setup(Some(p), &c1).await;
+        c.reconcile_pvc(&c1).await.unwrap();
+        assert_eq!(events(&s).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn equal_sizes_in_different_units_do_not_expand() {
+        // `pvcRequestSize.Cmp(pvcStatusSize) <= 0` is resource.Quantity (:235): 1Gi == 1024Mi.
+        let c1 = pvc("p", "vol", "1024Mi", "1Gi", "u");
+        let (s, c) = setup(Some(pv("vol", Some("com.csi.ceph"), "1Gi", "u")), &c1).await;
+        c.reconcile_pvc(&c1).await.unwrap();
+        assert!(events(&s).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn larger_request_in_different_units_expands() {
+        // 2Gi > 1500Mi, 1Gi > 1G: the old string compare returned false on unit mismatch.
+        for (status, request) in [("1500Mi", "2Gi"), ("1G", "1Gi")] {
+            let c1 = pvc("p", "vol", status, request, "u");
+            let (s, c) = setup(Some(pv("vol", Some("com.csi.ceph"), "1Gi", "u")), &c1).await;
+            c.reconcile_pvc(&c1).await.unwrap();
+            assert_eq!(events(&s).await.len(), 1, "{status} -> {request}");
+        }
     }
 
     /// Online expansion end to end, ported from the removed `PvcController`
@@ -577,12 +647,13 @@ mod tests {
             "apiVersion": "v1", "kind": "PersistentVolume",
             "metadata": {"name": "pv-grow"},
             "spec": {"capacity": {"storage": "5Gi"}, "accessModes": ["ReadWriteOnce"],
-                     "storageClassName": "expandable"}
+                     "storageClassName": "expandable",
+                     "claimRef": {"namespace": "default", "name": "pvc-grow", "uid": "u-grow"}}
         }))
         .unwrap();
         let pvc: PersistentVolumeClaim = serde_json::from_value(serde_json::json!({
             "apiVersion": "v1", "kind": "PersistentVolumeClaim",
-            "metadata": {"name": "pvc-grow", "namespace": "default"},
+            "metadata": {"name": "pvc-grow", "namespace": "default", "uid": "u-grow"},
             "spec": {"accessModes": ["ReadWriteOnce"], "storageClassName": "expandable",
                      "volumeName": "pv-grow", "resources": {"requests": {"storage": "10Gi"}}},
             "status": {"phase": "Bound", "capacity": {"storage": "5Gi"}}
