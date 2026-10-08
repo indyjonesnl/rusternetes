@@ -18,8 +18,11 @@ mod dynamic_routes;
 mod endpoints;
 #[allow(dead_code)]
 mod flow_control;
+mod flow_control_filter;
 #[allow(dead_code)]
 mod flow_control_queueset;
+#[allow(dead_code)]
+mod flow_control_work_estimator;
 mod gnostic;
 mod handlers;
 use rusternetes_middleware as middleware;
@@ -187,6 +190,23 @@ struct Args {
         value_parser = registry::core::event::parse_event_ttl
     )]
     event_ttl: u64,
+
+    /// Install the API Priority and Fairness request filter
+    /// (`WithPriorityAndFairness`, server/config.go:1027). Upstream enables it
+    /// by default (`APIPriorityAndFairness` is GA); it is opt-in here until a
+    /// sig-api-machinery conformance run has exercised it.
+    #[arg(long, default_value_t = false)]
+    enable_priority_and_fairness: bool,
+
+    /// `--max-requests-inflight` (server/config.go:443): with
+    /// `--max-mutating-requests-inflight` this is the server concurrency limit
+    /// APF divides between priority levels.
+    #[arg(long, default_value_t = flow_control::DEFAULT_MAX_REQUESTS_IN_FLIGHT)]
+    max_requests_inflight: i64,
+
+    /// `--max-mutating-requests-inflight` (server/config.go:444).
+    #[arg(long, default_value_t = flow_control::DEFAULT_MAX_MUTATING_REQUESTS_IN_FLIGHT)]
+    max_mutating_requests_inflight: i64,
 
     /// Path to the file that defines the audit policy configuration
     /// (`--audit-policy-file`, pkg/server/options/audit.go:258).
@@ -379,6 +399,29 @@ async fn main() -> Result<()> {
         info!("Prometheus URL not provided, custom metrics will return mock data");
         None
     };
+
+    // API Priority and Fairness: installed before the router is built, which
+    // layers it on the protected routes when present (#2704).
+    if args.enable_priority_and_fairness {
+        let engine = Arc::new(flow_control::FlowControlEngine::with_limits(
+            storage.clone(),
+            args.max_requests_inflight,
+            args.max_mutating_requests_inflight,
+        ));
+        engine
+            .initialize()
+            .await
+            .map_err(|e| anyhow::anyhow!("initializing API Priority and Fairness: {e}"))?;
+        flow_control_filter::spawn_config_reloader(
+            engine.clone(),
+            std::time::Duration::from_secs(2),
+        );
+        flow_control_filter::install_flow_control(Arc::new(flow_control_filter::ApfFilter::new(
+            engine,
+            flow_control_filter::DEFAULT_REQUEST_TIMEOUT / 4,
+        )));
+        info!("API Priority and Fairness enabled");
+    }
 
     // Create shared state with CA certificate and Prometheus client
     let state = Arc::new(
