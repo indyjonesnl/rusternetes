@@ -3067,83 +3067,9 @@ mod tests {
     /// content: the sig-network regression after #2108.
     #[tokio::test]
     async fn updating_an_existing_slice_keeps_its_uid() {
-        struct UidPreconditionStorage {
-            inner: Arc<MemoryStorage>,
-        }
+        use crate::controllers::uid_precondition_double::UidPreconditionStorage;
 
-        #[async_trait::async_trait]
-        impl Storage for UidPreconditionStorage {
-            async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
-            where
-                T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
-            {
-                self.inner.create(key, value).await
-            }
-            async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
-            where
-                T: serde::de::DeserializeOwned + Send + Sync,
-            {
-                self.inner.get(key).await
-            }
-            async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
-            where
-                T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
-            {
-                let sent = serde_json::to_value(value).unwrap();
-                let stored: serde_json::Value = self.inner.get(key).await?;
-                let sent_uid = sent["metadata"]["uid"].as_str().unwrap_or("");
-                let stored_uid = stored["metadata"]["uid"].as_str().unwrap_or("");
-                if !sent_uid.is_empty() && sent_uid != stored_uid {
-                    return Err(rusternetes_common::Error::Conflict(format!(
-                        "Precondition failed: UID in precondition: {sent_uid}, UID in object meta: {stored_uid}"
-                    )));
-                }
-                self.inner.update(key, value).await
-            }
-            async fn update_raw(
-                &self,
-                key: &str,
-                value: &serde_json::Value,
-            ) -> rusternetes_common::Result<()> {
-                self.inner.update_raw(key, value).await
-            }
-            async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
-                self.inner.delete(key).await
-            }
-            async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
-            where
-                T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
-            {
-                self.inner.list(prefix).await
-            }
-            async fn watch(
-                &self,
-                prefix: &str,
-            ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
-                self.inner.watch(prefix).await
-            }
-            async fn watch_from_revision(
-                &self,
-                prefix: &str,
-                revision: i64,
-            ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
-                self.inner.watch_from_revision(prefix, revision).await
-            }
-            async fn current_revision(&self) -> rusternetes_common::Result<i64> {
-                self.inner.current_revision().await
-            }
-            async fn is_revision_compacted(
-                &self,
-                revision: i64,
-            ) -> rusternetes_common::Result<bool> {
-                self.inner.is_revision_compacted(revision).await
-            }
-        }
-
-        let inner = Arc::new(MemoryStorage::new());
-        let storage = Arc::new(UidPreconditionStorage {
-            inner: Arc::clone(&inner),
-        });
+        let storage = Arc::new(UidPreconditionStorage::new());
         let controller = EndpointSliceController::new(Arc::clone(&storage));
 
         let service = Service {
