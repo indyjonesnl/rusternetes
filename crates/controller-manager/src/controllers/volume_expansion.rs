@@ -630,61 +630,44 @@ mod tests {
         }
     }
 
-    /// Online expansion end to end, ported from the removed `PvcController`
-    /// placeholder's `pvc_resize_operation_online_expansion`: a Bound claim
-    /// whose request exceeds `status.capacity` on an expandable class records
-    /// `allocatedResources`, grows the PV and `status.capacity`, stays Bound.
     #[tokio::test]
-    async fn reconcile_all_expands_bound_claim_on_expandable_class() {
-        let storage = Arc::new(MemoryStorage::new());
-        let sc: StorageClass = serde_json::from_value(serde_json::json!({
-            "apiVersion": "storage.k8s.io/v1", "kind": "StorageClass",
-            "metadata": {"name": "expandable"},
-            "provisioner": "example.com/csi", "allowVolumeExpansion": true
-        }))
-        .unwrap();
-        let pv: PersistentVolume = serde_json::from_value(serde_json::json!({
-            "apiVersion": "v1", "kind": "PersistentVolume",
-            "metadata": {"name": "pv-grow"},
-            "spec": {"capacity": {"storage": "5Gi"}, "accessModes": ["ReadWriteOnce"],
-                     "storageClassName": "expandable",
-                     "claimRef": {"namespace": "default", "name": "pvc-grow", "uid": "u-grow"}}
-        }))
-        .unwrap();
-        let pvc: PersistentVolumeClaim = serde_json::from_value(serde_json::json!({
-            "apiVersion": "v1", "kind": "PersistentVolumeClaim",
-            "metadata": {"name": "pvc-grow", "namespace": "default", "uid": "u-grow"},
-            "spec": {"accessModes": ["ReadWriteOnce"], "storageClassName": "expandable",
-                     "volumeName": "pv-grow", "resources": {"requests": {"storage": "10Gi"}}},
-            "status": {"phase": "Bound", "capacity": {"storage": "5Gi"}}
-        }))
-        .unwrap();
-        storage
-            .create(&build_key("storageclasses", None, "expandable"), &sc)
-            .await
-            .unwrap();
-        storage
-            .create(&build_key("persistentvolumes", None, "pv-grow"), &pv)
-            .await
-            .unwrap();
-        let pvc_key = build_key("persistentvolumeclaims", Some("default"), "pvc-grow");
-        storage.create(&pvc_key, &pvc).await.unwrap();
+    async fn hostpath_pv_is_not_resized_in_controller() {
+        // No expandable in-tree plugin exists for hostPath, so
+        // `FindExpandablePluginBySpec` returns nil and the controller only emits
+        // ExternalExpanding and returns nil (expand_controller.go:271-283). It must
+        // not write PV capacity or PVC status.
+        let c1 = pvc("p", "vol-hp", "5Gi", "10Gi", "u-hp");
+        let (s, c) = setup(Some(pv("vol-hp", None, "5Gi", "u-hp")), &c1).await;
+        c.reconcile_pvc(&c1).await.unwrap();
 
-        VolumeExpansionController::new(storage.clone())
-            .reconcile_all()
+        let stored_pv: PersistentVolume = s
+            .get(&build_key("persistentvolumes", None, "vol-hp"))
             .await
             .unwrap();
+        assert_eq!(stored_pv.spec.capacity["storage"], "5Gi");
+        let stored: PersistentVolumeClaim = s
+            .get(&build_key("persistentvolumeclaims", Some("default"), "p"))
+            .await
+            .unwrap();
+        let st = stored.status.unwrap();
+        assert_eq!(st.capacity.unwrap()["storage"], "5Gi");
+        assert!(st.resize_status.is_none() && st.allocated_resources.is_none());
+        let evs = events(&s).await;
+        assert_eq!(evs.len(), 1, "{evs:?}");
+        assert_eq!(evs[0].reason, "ExternalExpanding");
+        assert_eq!(
+            evs[0].message,
+            "waiting for an external controller to expand this PVC"
+        );
+    }
 
-        let got: PersistentVolumeClaim = storage.get(&pvc_key).await.unwrap();
-        let status = got.status.unwrap();
-        assert_eq!(status.phase, PersistentVolumeClaimPhase::Bound);
-        assert_eq!(status.allocated_resources.unwrap()["storage"], "10Gi");
-        assert_eq!(status.capacity.unwrap()["storage"], "10Gi");
-        assert!(status.resize_status.is_none());
-        let pv: PersistentVolume = storage
-            .get(&build_key("persistentvolumes", None, "pv-grow"))
-            .await
-            .unwrap();
-        assert_eq!(pv.spec.capacity["storage"], "10Gi");
+    #[tokio::test]
+    async fn storage_class_is_not_consulted() {
+        // upstream never reads the StorageClass in syncHandler; allowVolumeExpansion
+        // is enforced by the PVC admission plugin. A missing class is not an error.
+        let c1 = pvc("p", "vol", "1Gi", "2Gi", "u");
+        let (s, c) = setup(Some(pv("vol", None, "1Gi", "u")), &c1).await;
+        c.reconcile_all().await.unwrap();
+        assert_eq!(events(&s).await.len(), 1);
     }
 }
