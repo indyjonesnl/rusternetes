@@ -35,6 +35,91 @@ pub struct AuthContext {
     pub user: UserInfo,
 }
 
+/// What authentication observed about a request beyond who it is: audit
+/// annotations (`audit.AddAuditAnnotation`) and `Warning` headers
+/// (`warning.AddWarning`). Upstream writes both to the request context; the
+/// middleware here has neither, so the validator collects them and the caller
+/// applies them.
+#[derive(Clone, Debug, Default)]
+pub struct AuthObservations {
+    pub audit_annotations: Vec<(String, String)>,
+    pub warnings: Vec<String>,
+}
+
+impl AuthObservations {
+    pub fn add_audit_annotation(&mut self, key: &str, value: &str) {
+        self.audit_annotations
+            .push((key.to_string(), value.to_string()));
+    }
+
+    /// `warning.AddWarning(ctx, "", text)`: an empty warning is dropped and a
+    /// repeated one recorded once (endpoints/filters/warning.go:69-92).
+    pub fn add_warning(&mut self, text: &str) {
+        if !text.is_empty() && !self.warnings.iter().any(|w| w == text) {
+            self.warnings.push(text.to_string());
+        }
+    }
+
+    /// Emit the warnings as `Warning: 299 - "<text>"` headers.
+    pub fn append_warning_headers(&self, headers: &mut axum::http::HeaderMap) {
+        for w in &self.warnings {
+            let escaped = w.replace('\\', "\\\\").replace('"', "\\\"");
+            if let Ok(v) = axum::http::HeaderValue::from_str(&format!("299 - \"{escaped}\"")) {
+                headers.append(axum::http::header::WARNING, v);
+            }
+        }
+    }
+}
+
+/// Request extension carrying [`AuthObservations::audit_annotations`] to the
+/// audit filter.
+#[derive(Clone, Debug)]
+pub struct AuthAuditAnnotations(pub Vec<(String, String)>);
+
+/// `pkg/serviceaccount/metrics.go`: the legacy-token counters, subsystem
+/// `serviceaccount`, registered in the process-wide default registry (this
+/// port's `legacyregistry`), which `/metrics` serves.
+pub struct ServiceAccountMetrics {
+    pub legacy_tokens_total: prometheus::IntCounter,
+    pub legacy_manual_token_uses_total: prometheus::IntCounter,
+    pub legacy_auto_token_uses_total: prometheus::IntCounter,
+    pub invalid_legacy_auto_token_uses_total: prometheus::IntCounter,
+}
+
+/// The counters, registered on first use (`RegisterMetrics`'s
+/// `registerMetricsOnce`).
+pub fn serviceaccount_metrics() -> &'static ServiceAccountMetrics {
+    static METRICS: std::sync::OnceLock<ServiceAccountMetrics> = std::sync::OnceLock::new();
+    METRICS.get_or_init(|| {
+        let counter = |name: &str, help: &str| {
+            let c = prometheus::IntCounter::with_opts(
+                prometheus::Opts::new(name, help).subsystem("serviceaccount"),
+            )
+            .expect("valid counter opts");
+            let _ = prometheus::default_registry().register(Box::new(c.clone()));
+            c
+        };
+        ServiceAccountMetrics {
+            legacy_tokens_total: counter(
+                "legacy_tokens_total",
+                "Cumulative legacy service account tokens used",
+            ),
+            legacy_manual_token_uses_total: counter(
+                "legacy_manual_token_uses_total",
+                "Cumulative manually created legacy tokens used",
+            ),
+            legacy_auto_token_uses_total: counter(
+                "legacy_auto_token_uses_total",
+                "Cumulative auto-generated legacy tokens used",
+            ),
+            invalid_legacy_auto_token_uses_total: counter(
+                "invalid_legacy_auto_token_uses_total",
+                "Cumulative invalid auto-generated legacy tokens used",
+            ),
+        }
+    })
+}
+
 /// The DER-encoded client certificate chain the TLS layer verified against the
 /// configured `--client-ca-file`, injected as a request extension by the
 /// api-server's per-connection acceptor when mTLS is enabled (#1129). The leaf
@@ -447,13 +532,26 @@ pub async fn skip_auth_middleware(
 /// from `LEGACY_ISSUER` is checked only by the legacy validator
 /// (`newLegacyServiceAccountAuthenticator`); any other by the bound-token
 /// validator (`validate_service_account_claims`).
+///
+/// A token without an audience is a legacy token whichever issuer signed it:
+/// `jwt.go:383-387` records the `authentication.k8s.io/legacy-token` audit
+/// annotation and bumps `serviceaccount_legacy_tokens_total` (into `obs`).
+///
+/// Deviation: upstream does this before the audience intersection check, so a
+/// legacy token rejected for its audience is still counted; here the caller's
+/// audience check runs first and rejects it before this function is reached.
 pub async fn validate_service_account_token(
     storage: &StorageBackend,
     token: &str,
     claims: &rusternetes_common::auth::ServiceAccountClaims,
+    obs: &mut AuthObservations,
 ) -> std::result::Result<(), String> {
+    if claims.aud.is_empty() {
+        obs.add_audit_annotation("authentication.k8s.io/legacy-token", &claims.sub);
+        serviceaccount_metrics().legacy_tokens_total.inc();
+    }
     if claims.iss == rusternetes_common::auth::LEGACY_ISSUER {
-        validate_legacy_service_account_token(storage, token, claims).await
+        validate_legacy_service_account_token(storage, token, claims, obs).await
     } else {
         validate_service_account_claims(storage, claims).await
     }
@@ -476,13 +574,15 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// `legacy-token-last-used` (`patchSecretWithLastUsedDate`), which is what the
 /// legacy-token cleaner reads.
 ///
-/// Not ported (tracked in the PR): the audit annotations, `warning.AddWarning`
-/// and the `legacy_*_uses_total` metrics (legacy.go:143-170), which need
-/// request-scoped state the middleware crate does not have.
+/// The audit annotations, `warning.AddWarning` and `legacy_*_uses_total`
+/// counters of legacy.go:143-170 are recorded into `obs` / the process-wide
+/// counters; the request pipeline applies `obs` (audit event, `Warning`
+/// header) since this crate has no audit context.
 async fn validate_legacy_service_account_token(
     storage: &StorageBackend,
     token: &str,
     claims: &rusternetes_common::auth::ServiceAccountClaims,
+    obs: &mut AuthObservations,
 ) -> std::result::Result<(), String> {
     use rusternetes_common::auth::{
         LegacyPrivateClaims, LEGACY_TOKEN_INVALID_SINCE_LABEL_KEY as INVALID_SINCE,
@@ -573,6 +673,13 @@ async fn validate_legacy_service_account_token(
         .and_then(|l| l.get(INVALID_SINCE))
         .is_some_and(|v| !v.is_empty());
     if invalid_since {
+        obs.add_audit_annotation(
+            "authentication.k8s.io/legacy-token-invalidated",
+            &format!("{secret_name}/{namespace}"),
+        );
+        serviceaccount_metrics()
+            .invalid_legacy_auto_token_uses_total
+            .inc();
         patch_secret_with_last_used_date(storage, &secret_key, &secret).await;
         return Err(format!(
             "the token in secret {namespace}/{secret_name} for service account \
@@ -581,6 +688,32 @@ async fn validate_legacy_service_account_token(
              the '{INVALID_SINCE}' label from the secret to temporarily allow use \
              of this token"
         ));
+    }
+
+    // Check if it is an auto-generated secret-based token (legacy.go:157-165)
+    let auto_generated = sa
+        .secrets
+        .as_ref()
+        .is_some_and(|refs| refs.iter().any(|r| r.name.as_deref() == Some(secret_name)));
+    if auto_generated {
+        obs.add_warning(
+            "Use tokens from the TokenRequest API or manually created secret-based tokens \
+             instead of auto-generated secret-based tokens.",
+        );
+        obs.add_audit_annotation(
+            "authentication.k8s.io/legacy-token-autogenerated-secret",
+            secret_name,
+        );
+        serviceaccount_metrics().legacy_auto_token_uses_total.inc();
+    } else {
+        // A manually created secret-based token (legacy.go:167-171)
+        obs.add_audit_annotation(
+            "authentication.k8s.io/legacy-token-manual-secret",
+            secret_name,
+        );
+        serviceaccount_metrics()
+            .legacy_manual_token_uses_total
+            .inc();
     }
 
     patch_secret_with_last_used_date(storage, &secret_key, &secret).await;
@@ -784,6 +917,7 @@ pub async fn auth_middleware(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
 
+    let mut observations = AuthObservations::default();
     let user = if let Some(token) = auth_header.strip_prefix("Bearer ") {
         // Skip "Bearer "
 
@@ -792,7 +926,9 @@ pub async fn auth_middleware(
             // Upstream parity: a JWT that decodes is not sufficient; the
             // ServiceAccount and every bound object must still exist
             // (`validator.Validate`, claims.go:144-263).
-            if let Err(reason) = validate_service_account_token(&storage, token, &claims).await {
+            if let Err(reason) =
+                validate_service_account_token(&storage, token, &claims, &mut observations).await
+            {
                 warn!("Rejecting service account token: {}", reason);
                 return Err((StatusCode::UNAUTHORIZED, "Invalid token").into_response());
             }
@@ -841,8 +977,18 @@ pub async fn auth_middleware(
 
     // Insert UserInfo into request extensions
     request.extensions_mut().insert(AuthContext { user });
+    // The audit filter sits inside this one, so hand it the annotations
+    // authentication recorded (upstream records them on a context that
+    // `WithAuditInit` created before authentication ran).
+    if !observations.audit_annotations.is_empty() {
+        request
+            .extensions_mut()
+            .insert(AuthAuditAnnotations(observations.audit_annotations.clone()));
+    }
 
-    Ok(next.run(request).await)
+    let mut response = next.run(request).await;
+    observations.append_warning_headers(response.headers_mut());
+    Ok(response)
 }
 
 /// Middleware that normalizes Content-Type to application/json for write requests.

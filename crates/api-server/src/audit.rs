@@ -658,6 +658,15 @@ pub async fn with_audit(cfg: Arc<AuditConfig>, req: Request, next: Next) -> Resp
         sink: cfg.sink.clone(),
     });
 
+    // Annotations authentication recorded before this filter existed
+    // (e.g. `authentication.k8s.io/legacy-token*`, legacy.go:143-170).
+    if let Some(a) = req
+        .extensions()
+        .get::<rusternetes_middleware::AuthAuditAnnotations>()
+    {
+        ac.add_annotations(&a.0);
+    }
+
     if !ac.process_event_stage(AuditStage::RequestReceived).await {
         // "failed to store audit event" (audit.go:~62)
         return internal_error("failed to store audit event");
@@ -936,6 +945,31 @@ rules:
         assert_eq!(
             ev[1].annotations.as_ref().unwrap()["pod-security.kubernetes.io/enforce-policy"],
             "x:latest"
+        );
+    }
+
+    /// Annotations authentication recorded (`AuthAuditAnnotations`, e.g.
+    /// legacy.go:143-170) land on the audit event.
+    #[tokio::test]
+    async fn filter_applies_annotations_recorded_by_authentication() {
+        let cap = Arc::new(Capture(Default::default()));
+        let cfg = Arc::new(AuditConfig {
+            policy: Policy::from_yaml(POLICY).unwrap(),
+            sink: cap.clone(),
+        });
+        let mut req = axum::http::Request::get("/api/v1/namespaces/ns/secrets/s")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(rusternetes_middleware::AuthAuditAnnotations(vec![(
+                "authentication.k8s.io/legacy-token".to_string(),
+                "system:serviceaccount:ns:sa".to_string(),
+            )]));
+        app(cfg).oneshot(req).await.unwrap();
+        let ev = cap.0.lock().await;
+        assert_eq!(
+            ev[0].annotations.as_ref().unwrap()["authentication.k8s.io/legacy-token"],
+            "system:serviceaccount:ns:sa"
         );
     }
 

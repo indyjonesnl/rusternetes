@@ -290,3 +290,38 @@ async fn sub_claim_must_match_namespace_and_name() {
     seed_secret(&s, &token, json!({}), json!({})).await;
     assert_eq!(status_with(&s, &token).await, 401);
 }
+
+/// `warning.AddWarning` for an auto-generated secret-based token
+/// (legacy.go:158-162) reaches the response as a `Warning: 299` header; a
+/// manually created one (:165-168) draws none.
+#[tokio::test]
+async fn auto_generated_token_draws_a_warning_header_and_manual_does_not() {
+    for (listed, expect_warning) in [(&["tok"][..], true), (&[][..], false)] {
+        let s = server();
+        let token = legacy_token();
+        seed_sa(&s, "sa-uid", listed).await;
+        seed_secret(&s, &token, json!({}), json!({})).await;
+        let auth = format!("Bearer {token}");
+        let (_st, headers, _b, _v) = s
+            .send_with_headers(
+                "GET",
+                "/api/v1/namespaces/ns/configmaps",
+                &[("authorization", &auth)],
+                None,
+            )
+            .await;
+        let warnings: Vec<_> = headers
+            .get_all("warning")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        if expect_warning {
+            assert_eq!(
+                warnings,
+                vec!["299 - \"Use tokens from the TokenRequest API or manually created secret-based tokens instead of auto-generated secret-based tokens.\"".to_string()]
+            );
+        } else {
+            assert!(warnings.is_empty(), "{warnings:?}");
+        }
+    }
+}
