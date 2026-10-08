@@ -531,3 +531,117 @@ fn allow_privilege_escalation_table() {
         Some((reason, detail)),
     );
 }
+
+fn caps_containers() -> Value {
+    json!({"containers": [
+        {"name": "a", "securityContext": {"capabilities": {"add": ["FOO", "BAR"]}}},
+        {"name": "b", "securityContext": {"capabilities": {"add": ["BAR", "BAZ"]}}},
+        {"name": "c", "securityContext": {"capabilities":
+            {"add": ["NET_BIND_SERVICE", "CHOWN"], "drop": ["ALL", "FOO"]}}},
+    ]})
+}
+
+const CAPS_DETAIL: &str = "containers \"a\", \"b\" must set securityContext.capabilities.drop=[\"ALL\"]; containers \"a\", \"b\", \"c\" must not include \"BAR\", \"BAZ\", \"CHOWN\", \"FOO\" in securityContext.capabilities.add";
+
+/// check_capabilities_restricted_test.go TestCapabilitiesRestricted_1_25.
+#[test]
+fn capabilities_restricted_1_25_table() {
+    table(
+        capabilities_restricted_1_25,
+        caps_containers(),
+        Some(("unrestricted capabilities", CAPS_DETAIL)),
+    );
+    // windows pod, admit without checking capabilities
+    table(
+        capabilities_restricted_1_25,
+        json!({"os": {"name": "windows"}, "containers": [{"name": "a"}]}),
+        None,
+    );
+    // linux pod, reject if security context is not set
+    table(
+        capabilities_restricted_1_25,
+        json!({"os": {"name": "linux"}, "containers": [{"name": "a"}]}),
+        Some((
+            "unrestricted capabilities",
+            "container \"a\" must set securityContext.capabilities.drop=[\"ALL\"]",
+        )),
+    );
+}
+
+/// check_capabilities_restricted_test.go TestCapabilitiesRestricted_1_22.
+#[test]
+fn capabilities_restricted_1_22_table() {
+    table(
+        capabilities_restricted_1_22,
+        caps_containers(),
+        Some(("unrestricted capabilities", CAPS_DETAIL)),
+    );
+}
+
+/// check_hostPorts_test.go TestHostPort.
+#[test]
+fn host_ports_table() {
+    table(
+        host_ports_1_0,
+        json!({"containers": [
+            {"name": "a", "ports": [{"hostPort": 0}]},
+            {"name": "b", "ports": [{"hostPort": 0}, {"hostPort": 20}]},
+        ]}),
+        Some(("hostPort", "container \"b\" uses hostPort 20")),
+    );
+    table(
+        host_ports_1_0,
+        json!({"containers": [
+            {"name": "a", "ports": [{"hostPort": 0}]},
+            {"name": "b", "ports": [{"hostPort": 0}, {"hostPort": 10}, {"hostPort": 20}]},
+            {"name": "c", "ports": [{"hostPort": 0}, {"hostPort": 10}, {"hostPort": 30}]},
+        ]}),
+        Some((
+            "hostPort",
+            "containers \"b\", \"c\" use hostPorts 10, 20, 30",
+        )),
+    );
+}
+
+fn proc_mount_containers() -> Vec<Value> {
+    vec![
+        json!({"name": "a"}),
+        json!({"name": "b", "securityContext": {}}),
+        json!({"name": "c", "securityContext": {"procMount": "Default"}}),
+        json!({"name": "d", "securityContext": {"procMount": "Unmasked"}}),
+        json!({"name": "e", "securityContext": {"procMount": "other"}}),
+    ]
+}
+
+const PROC_MOUNT_DETAIL: &str =
+    "containers \"d\", \"e\" must not set securityContext.procMount to \"Unmasked\", \"other\"";
+
+/// check_procMount_baseline_test.go TestProcMountBaseline
+/// (procMount1_35baseline).
+#[test]
+fn proc_mount_baseline_table() {
+    table(
+        proc_mount_1_35_baseline,
+        json!({"containers": proc_mount_containers(), "hostUsers": true}),
+        Some(("procMount", PROC_MOUNT_DETAIL)),
+    );
+    // procMount with userns
+    table(
+        proc_mount_1_35_baseline,
+        json!({"containers": proc_mount_containers(), "hostUsers": false}),
+        None,
+    );
+}
+
+/// check_procMount_restricted_test.go TestProcMountRestricted: forbidden for
+/// both hostUsers values.
+#[test]
+fn proc_mount_restricted_table() {
+    for userns in [true, false] {
+        table(
+            proc_mount_1_0,
+            json!({"containers": proc_mount_containers(), "hostUsers": userns}),
+            Some(("procMount", PROC_MOUNT_DETAIL)),
+        );
+    }
+}

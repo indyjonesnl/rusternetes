@@ -42,8 +42,12 @@ fn load(dir: &Path) -> Vec<(String, Pod)> {
     paths.sort();
     for p in paths {
         let text = std::fs::read_to_string(&p).unwrap();
-        let pod: Pod = serde_yaml::from_str(&text)
+        let mut pod: Pod = serde_yaml::from_str(&text)
             .unwrap_or_else(|e| panic!("{} does not decode as a Pod: {e}", p.display()));
+        // run.go creates the pod through the apiserver, which applies the
+        // v1 defaults before admission runs (e.g. SetDefaults_Volume turns the
+        // fixtures' source-less `volume0` into an emptyDir).
+        crate::handlers::defaults::apply_pod_spec_defaults(pod.spec.as_mut().unwrap());
         let stem = p.file_stem().unwrap().to_string_lossy().to_string();
         out.push((stem, pod));
     }
