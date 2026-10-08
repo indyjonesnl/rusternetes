@@ -285,7 +285,7 @@ async fn watch_envelope_includes_type_and_object() {
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn watch_delete_event_includes_body_from_key_fallback() {
-    let json = build_delete_fallback_json("/registry/configmaps/default/cm1", "").unwrap();
+    let json = build_delete_fallback_json("/registry/configmaps/default/cm1", "", None).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed["type"].as_str(), Some("DELETED"));
     assert_eq!(parsed["object"]["metadata"]["name"].as_str(), Some("cm1"));
@@ -312,7 +312,7 @@ async fn watch_delete_event_includes_body_from_key_fallback() {
 #[tokio::test]
 async fn watch_delete_event_preserves_prev_object_when_present() {
     let prev = r#"{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"cm","namespace":"ns","resourceVersion":"55"},"data":{"k":"v"}}"#;
-    let json = build_delete_fallback_json("/registry/configmaps/ns/cm", prev).unwrap();
+    let json = build_delete_fallback_json("/registry/configmaps/ns/cm", prev, None).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed["type"].as_str(), Some("DELETED"));
     assert_eq!(parsed["object"]["data"]["k"].as_str(), Some("v"));

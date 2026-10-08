@@ -35,7 +35,7 @@ fn test_build_delete_fallback_from_valid_json() {
         r#"{"metadata":{"name":"my-svc","namespace":"default","resourceVersion":"10"},"spec":{}}"#;
     let key = "/registry/services/default/my-svc";
 
-    let json = build_delete_fallback_json(key, prev_value).unwrap();
+    let json = build_delete_fallback_json(key, prev_value, None).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
     assert_eq!(parsed["type"].as_str(), Some("DELETED"));
@@ -55,7 +55,7 @@ fn test_build_delete_fallback_from_valid_json() {
 fn test_build_delete_fallback_from_empty_prev_value() {
     let key = "/registry/services/default/my-svc";
 
-    let json = build_delete_fallback_json(key, "").unwrap();
+    let json = build_delete_fallback_json(key, "", None).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
     assert_eq!(parsed["type"].as_str(), Some("DELETED"));
@@ -75,7 +75,7 @@ fn test_build_delete_fallback_from_empty_prev_value() {
 fn test_build_delete_fallback_cluster_scoped() {
     let key = "/registry/nodes/node-1";
 
-    let json = build_delete_fallback_json(key, "").unwrap();
+    let json = build_delete_fallback_json(key, "", None).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
     assert_eq!(parsed["type"].as_str(), Some("DELETED"));
@@ -94,7 +94,7 @@ fn test_build_delete_fallback_preserves_full_object() {
     let prev_value = r#"{"apiVersion":"v1","kind":"Service","metadata":{"name":"test-svc","namespace":"ns","resourceVersion":"55","labels":{"app":"web"}},"spec":{"clusterIP":"10.0.0.1"}}"#;
     let key = "/registry/services/ns/test-svc";
 
-    let json = build_delete_fallback_json(key, prev_value).unwrap();
+    let json = build_delete_fallback_json(key, prev_value, None).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
     assert_eq!(parsed["type"].as_str(), Some("DELETED"));
@@ -116,7 +116,7 @@ fn test_build_delete_fallback_minimal_metadata() {
     let prev_value = r#"{"metadata":{"name":"svc","namespace":"default","resourceVersion":"100"}}"#;
     let key = "/registry/services/default/svc";
 
-    let json = build_delete_fallback_json(key, prev_value).unwrap();
+    let json = build_delete_fallback_json(key, prev_value, None).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
     assert_eq!(parsed["type"].as_str(), Some("DELETED"));
