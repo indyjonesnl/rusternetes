@@ -1680,7 +1680,30 @@ impl<S: Storage + 'static> JobController<S> {
                     .and_then(|s| s.completed_indexes.as_deref())
                     .unwrap_or(""),
             );
-            set.extend(collect_indexes_in_phase(job_pods.iter(), Phase::Succeeded));
+            // Rusternetes deviation (no upstream equivalent): once
+            // SuccessCriteriaMet is published, a pod this controller already
+            // deleted (`deleteActivePods`, job_controller.go:1001) that then
+            // exits 0 before the kubelet kills it must not add an index.
+            // Upstream's runtime reports such a pod Failed (SIGKILL) so it
+            // never reaches `calculateSucceededIndexes`; here, since #2784
+            // keeps the Job unfinished while pods terminate, it would raise
+            // `status.succeeded` above what met the policy (sig-apps
+            // "succeededIndexes rule ... some indexes remain pending" waits
+            // for exactly 1).
+            let success_criteria_met = job
+                .status
+                .as_ref()
+                .and_then(|s| s.conditions.as_ref())
+                .is_some_and(|cs| {
+                    cs.iter()
+                        .any(|c| c.condition_type == "SuccessCriteriaMet" && c.status == "True")
+                });
+            set.extend(collect_indexes_in_phase(
+                job_pods
+                    .iter()
+                    .filter(|p| !(success_criteria_met && p.metadata.deletion_timestamp.is_some())),
+                Phase::Succeeded,
+            ));
             set
         } else {
             HashSet::new()
