@@ -1464,3 +1464,7 @@ AiEAhWF2/JiVNXisqXic1Dfy761y8wW/Io2IJoBMvcYxo4E=
         assert!(validate_custom_resource_definition_update(&new, &old).is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "crd_structural_tests.rs"]
+mod structural_schema_tests;
