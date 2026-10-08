@@ -35,7 +35,6 @@ pub mod priorityclass;
 pub mod pv_binder;
 pub mod pv_protection;
 pub mod pv_recycler;
-pub mod pvc;
 pub mod pvc_protection;
 pub mod replicaset;
 pub mod replicationcontroller;
