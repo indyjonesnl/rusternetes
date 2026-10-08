@@ -135,6 +135,11 @@ pub struct ControllerManagerConfig {
     /// Node-IPAM config (pod-CIDR allocation). `None` disables it, matching
     /// upstream `--allocate-node-cidrs=false`.
     pub node_ipam: Option<crate::controllers::node_ipam::NodeIpamConfig>,
+    /// `--legacy-service-account-token-clean-up-period`: how long a legacy
+    /// service-account token must be unused before the cleaner removes it
+    /// (`pkg/controller/serviceaccount/config/v1alpha1/defaults.go:44`:
+    /// 365 days; see `DEFAULT_CLEAN_UP_PERIOD`).
+    pub legacy_sa_token_clean_up_period: std::time::Duration,
 }
 
 /// Run the controller-manager against a storage backend directly (all-in-one
@@ -491,6 +496,29 @@ where
         }
     }));
 
+    // `newLegacyServiceAccountTokenCleanerController`
+    // (cmd/kube-controller-manager/app/core.go:933-963).
+    let s = storage_for("LegacyServiceAccountTokenCleaner");
+    let clean_up_period = config.legacy_sa_token_clean_up_period;
+    handles.push(tokio::spawn(async move {
+        let options =
+            controllers::legacy_serviceaccount_token_cleaner::LegacySATokenCleanerOptions {
+                clean_up_period,
+                sync_interval:
+                    controllers::legacy_serviceaccount_token_cleaner::DEFAULT_CLEANER_SYNC_INTERVAL,
+            };
+        match controllers::legacy_serviceaccount_token_cleaner::LegacySATokenCleaner::new(
+            s, options,
+        ) {
+            Ok(c) => {
+                if let Err(e) = Arc::new(c).run().await {
+                    error!("LegacyServiceAccountTokenCleaner controller error: {}", e);
+                }
+            }
+            Err(e) => error!("failed to init the legacy service account token cleaner: {e}"),
+        }
+    }));
+
     let s = storage_for("Service");
     handles.push(tokio::spawn(async move {
         let c = Arc::new(ServiceController::new(s));
@@ -645,6 +673,8 @@ mod per_controller_client_tests {
                 metrics_config: None,
                 ca_cert_pem: None,
                 node_ipam: None,
+                legacy_sa_token_clean_up_period:
+                    controllers::legacy_serviceaccount_token_cleaner::DEFAULT_CLEAN_UP_PERIOD,
             },
         );
         for h in &handles {

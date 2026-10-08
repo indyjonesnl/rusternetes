@@ -23,6 +23,7 @@ pub mod hpa_replica_calculator;
 pub mod ingress;
 pub mod job;
 pub mod job_tracking;
+pub mod legacy_serviceaccount_token_cleaner;
 pub mod limitrange;
 pub mod loadbalancer;
 pub mod namespace;
