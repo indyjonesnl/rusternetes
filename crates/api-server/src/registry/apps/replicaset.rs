@@ -298,4 +298,48 @@ mod tests {
         assert_eq!(scale.status.selector, "app=r");
         assert_eq!(scale.metadata.name, "r");
     }
+
+    /// Upstream `dropDisabledStatusFields` (strategy.go): gate off and the old
+    /// status lacks the field -> dropped; old has it, or gate on -> kept.
+    #[test]
+    #[serial_test::serial]
+    fn status_drops_terminating_replicas_when_gate_off() {
+        use rusternetes_common::feature_gates::{self, Feature};
+        let _gate =
+            feature_gates::with_feature(Feature::DeploymentReplicaSetTerminatingReplicas, false);
+        let old = replica_set();
+        let mut new = old.clone();
+        new.status = Some(ReplicaSetStatus {
+            terminating_replicas: Some(3),
+            ..Default::default()
+        });
+        StatusStrategy.prepare_for_update(&ctx(), &mut new, &old);
+        assert_eq!(new.status.unwrap().terminating_replicas, None);
+
+        let mut old2 = replica_set();
+        old2.status = Some(ReplicaSetStatus {
+            terminating_replicas: Some(1),
+            ..Default::default()
+        });
+        let mut new2 = old2.clone();
+        new2.status = Some(ReplicaSetStatus {
+            terminating_replicas: Some(3),
+            ..Default::default()
+        });
+        StatusStrategy.prepare_for_update(&ctx(), &mut new2, &old2);
+        assert_eq!(new2.status.unwrap().terminating_replicas, Some(3));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn status_keeps_terminating_replicas_when_gate_on() {
+        let old = replica_set();
+        let mut new = old.clone();
+        new.status = Some(ReplicaSetStatus {
+            terminating_replicas: Some(3),
+            ..Default::default()
+        });
+        StatusStrategy.prepare_for_update(&ctx(), &mut new, &old);
+        assert_eq!(new.status.unwrap().terminating_replicas, Some(3));
+    }
 }
