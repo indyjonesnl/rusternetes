@@ -823,6 +823,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_webhook_ttls_and_crashloop_max_defaults_and_parse() {
         let s = std::time::Duration::from_secs;
         let d = KubeletConfiguration::default();
@@ -870,7 +871,11 @@ mod tests {
     }
 
     /// validation_test.go:397-418 (too low / too high) and the 1s/300s bounds.
+    /// Reads the process-global KubeletCrashLoopBackOffMax gate, which
+    /// `test_crashloop_max_gate_off` (and kubelet.rs's gate matrix) flip: must
+    /// be serial or plain `cargo test` (one process) sees the gate off.
     #[test]
+    #[serial_test::serial]
     fn test_crashloop_max_validation_range() {
         let mk = |y: &str| serde_yaml::from_str::<KubeletConfiguration>(y).unwrap();
         let low = mk("crashLoopBackOff:\n  maxContainerRestartPeriod: 0s\n");
