@@ -47,6 +47,7 @@ reqwest = { workspace = true }
 rustls = { workspace = true }
 
 [dev-dependencies]
+serial_test = { workspace = true }
 x509-parser = { workspace = true }
 # Stateful fake MetricsClient in hpa_controller_test (changing readings across
 # reconciles for the stabilization test).
