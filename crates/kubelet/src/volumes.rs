@@ -1900,12 +1900,12 @@ mod projected_mode_tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// #1656: a service-account-token Secret volume must not have its bound
-    /// token (or injected ca.crt) clobbered by a re-projection of the raw
-    /// Secret data.
+    /// #2638: a `kube-api-access*` / `*-token` Secret volume is an ordinary
+    /// Secret volume (upstream `secret.go` has no token special case), so the
+    /// stored token is projected at mount and re-projected unchanged.
     #[cfg(unix)]
     #[tokio::test]
-    async fn reproject_sa_token_secret_keeps_bound_token() {
+    async fn reproject_sa_named_secret_projects_stored_token() {
         let pod: Pod = serde_json::from_value(json!({
             "metadata": {"name": "p", "namespace": "default", "uid": "uid-sat"},
             "spec": {"containers": [], "volumes": [{
@@ -1940,7 +1940,7 @@ mod projected_mode_tests {
         )
         .join("token");
         let before = std::fs::read(&token).unwrap();
-        assert_ne!(before, b"static-unbound", "mount substitutes a bound token");
+        assert_eq!(before, b"static-unbound", "stored token projected verbatim");
         vm.refresh_volumes(&pod).await.unwrap();
         vm.resync_volumes(&pod, storage.as_ref()).await.unwrap();
         assert_eq!(std::fs::read(&token).unwrap(), before);
