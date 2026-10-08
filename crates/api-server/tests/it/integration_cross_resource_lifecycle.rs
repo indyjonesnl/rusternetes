@@ -491,6 +491,17 @@ async fn test_lifecycle_namespace_cascade_deletes_children() {
             .await
             .expect("namespace reconcile_all");
         ticks += 1;
+        // Pods are graceful-delete: upstream's namespace deleter stamps
+        // deletionTimestamp and waits for the kubelet to remove the pod
+        // (podStrategy.CheckGracefulDelete, pkg/registry/core/pod/strategy.go:164;
+        // namespaced_resources_deleter.go `estimate`). No kubelet runs here, so
+        // play its final hard delete for any terminating pod (#2729).
+        let pod_key = build_key("pods", Some("ns-c"), "p");
+        if let Some(pod) = snapshot(&mem, &pod_key).await {
+            if pod.pointer("/metadata/deletionTimestamp").is_some() {
+                let _ = mem.delete(&pod_key).await;
+            }
+        }
         let ns_gone = snapshot(&mem, &build_key("namespaces", None, "ns-c"))
             .await
             .is_none();
