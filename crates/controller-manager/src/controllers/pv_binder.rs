@@ -123,6 +123,79 @@ fn has_recyclable_plugin(spec: &PersistentVolumeSpec) -> bool {
     spec.host_path.is_some() || spec.nfs.is_some()
 }
 
+/// The slice of `findDeletablePlugin` (`pv_controller.go:1954-1994`) that
+/// resolves to the in-tree hostPath deleter: returns the PV's hostPath path
+/// when that plugin applies. A CSI source or a `migrated-to` annotation means
+/// an external deleter (`:1975-1984`). An external `provisioned-by`
+/// (`:1962-1970`) also skips the in-tree plugin, except the provisioner names
+/// Rusternetes' own dynamic provisioner uses for hostPath volumes
+/// (`dynamic_provisioner.rs`), which are the in-tree host-path plugin here
+/// (Rusternetes-only deviation; upstream has no such name).
+fn host_path_deleter_path(pv: &PersistentVolume) -> Option<String> {
+    let hp = pv.spec.host_path.as_ref()?;
+    if pv.spec.csi.is_some() {
+        return None;
+    }
+    let ann = pv.metadata.annotations.as_ref();
+    if ann.is_some_and(|a| a.get(ANN_MIGRATED_TO).is_some_and(|v| !v.is_empty())) {
+        return None;
+    }
+    match ann
+        .and_then(|a| a.get(ANN_DYNAMICALLY_PROVISIONED))
+        .map(String::as_str)
+    {
+        None | Some("") => {}
+        Some("rusternetes.io/hostpath" | "kubernetes.io/hostpath" | "hostpath") => {}
+        Some(_) => return None,
+    }
+    Some(hp.path.clone())
+}
+
+/// `hostPathDeleter.Delete` (`pkg/volume/hostpath/host_path.go:354-360`):
+///
+/// ```go
+/// regexp := regexp.MustCompile("/tmp/.+")
+/// if !regexp.MatchString(r.GetPath()) {
+///     return fmt.Errorf("host_path deleter only supports /tmp/.+ but received provided %s", r.GetPath())
+/// }
+/// return os.RemoveAll(r.GetPath())
+/// ```
+///
+/// Deliberate hardening (destructive operation): upstream's regex is
+/// unanchored, so `/x/tmp/y` and `/tmp/a/../../etc` pass. Here the path must
+/// START with `/tmp/` followed by something and contain no `..` component.
+/// The error text is unchanged. `os.RemoveAll` semantics: a missing path is
+/// success, and a symlink is removed itself, never followed.
+async fn host_path_delete(path: &str) -> std::result::Result<(), String> {
+    let refused =
+        || format!("host_path deleter only supports /tmp/.+ but received provided {path}");
+    let has_tail = path
+        .strip_prefix("/tmp/")
+        .is_some_and(|rest| !rest.is_empty());
+    let traverses = std::path::Path::new(path)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir));
+    if !has_tail || traverses {
+        return Err(refused());
+    }
+    let meta = match tokio::fs::symlink_metadata(path).await {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("failed to remove {path}: {e}")),
+    };
+    let res = if meta.is_dir() {
+        tokio::fs::remove_dir_all(path).await
+    } else {
+        tokio::fs::remove_file(path).await
+    };
+    match res {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(format!("failed to remove {path}: {e}"))
+        }
+        _ => Ok(()),
+    }
+}
+
 pub struct PVBinderController<S: Storage> {
     storage: Arc<S>,
     recorder: EventRecorder<S>,
@@ -584,6 +657,23 @@ impl<S: Storage + 'static> PVBinderController<S> {
             return Ok(());
         }
         if pv.spec.persistent_volume_reclaim_policy == Some(PersistentVolumeReclaimPolicy::Delete) {
+            // `doDeleteVolume` (`pv_controller.go:1499-1540`): run the
+            // plugin's deleter first; a failure marks the volume Failed with
+            // a `VolumeFailedDelete` warning and the PV is kept
+            // (`deleteVolumeOperation`, `:1360-1366`); it is retried on the
+            // next sync.
+            if let Some(path) = host_path_deleter_path(pv) {
+                if let Err(msg) = host_path_delete(&path).await {
+                    self.update_volume_phase_with_event(
+                        pv.clone(),
+                        PersistentVolumePhase::Failed,
+                        "VolumeFailedDelete",
+                        &msg,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
             let pv_key = build_key("persistentvolumes", None, &pv.metadata.name);
             match self.storage.delete(&pv_key).await {
                 Ok(()) | Err(rusternetes_common::Error::NotFound(_)) => {}
