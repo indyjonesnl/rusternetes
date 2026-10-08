@@ -9,6 +9,7 @@ pub mod cloud_provider;
 pub mod clusterauthenticationtrust;
 pub mod defaults;
 pub mod deletion;
+pub mod diff;
 pub mod dump;
 pub mod encryption;
 pub mod equality;

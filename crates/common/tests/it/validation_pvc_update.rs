@@ -337,20 +337,17 @@ fn spec_immutable_diff_far_apart_changes_make_two_hunks() {
     let old = pvc("1Gi", None);
     let mut new = pvc("1Gi", None);
     new.spec.access_modes = vec![PersistentVolumeAccessMode::ReadOnlyMany];
-    new.spec.volume_attributes_class_name = Some("x".into());
-    new.spec.volume_name = Some("pv".into());
+    new.spec.data_source = Some(TypedLocalObjectReference {
+        api_group: Some("snapshot.storage.k8s.io".into()),
+        kind: "VolumeSnapshot".into(),
+        name: "s".into(),
+    });
     let errs = validate_persistent_volume_claim_update(&new, &old);
     let e = errs.iter().find(|e| e.field == "spec").expect("spec error");
     assert!(e.detail.contains("\n@@ -1,6 +1,6 @@\n"), "{}", e.detail);
     assert!(
-        e.detail
-            .contains("-  \"VolumeName\": \"\",\n+  \"VolumeName\": \"pv\",\n"),
-        "{}",
-        e.detail
-    );
-    assert!(
         e.detail.contains(
-            "-  \"VolumeAttributesClassName\": null\n+  \"VolumeAttributesClassName\": \"x\"\n"
+            "\n@@ -12,7 +12,11 @@\n  \"VolumeName\": \"\",\n  \"StorageClassName\": null,\n  \"VolumeMode\": null,\n- \"DataSource\": null,\n+ \"DataSource\": {\n+  \"APIGroup\": \"snapshot.storage.k8s.io\",\n+  \"Kind\": \"VolumeSnapshot\",\n+  \"Name\": \"s\"\n+ },\n  \"DataSourceRef\": null,\n  \"VolumeAttributesClassName\": null\n }\n"
         ),
         "{}",
         e.detail
