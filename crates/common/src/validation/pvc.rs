@@ -205,9 +205,26 @@ pub fn validation_options_for_persistent_volume_claim(
 /// selector was invalid keeps passing validation. Upstream's only caller
 /// (`validateEphemeralVolumeSource`, :1893) passes a nil old template.
 pub fn validation_options_for_persistent_volume_claim_template(
-    _old_claim_template: Option<&crate::resources::pod::PersistentVolumeClaimTemplate>,
+    old_claim_template: Option<&crate::resources::pod::PersistentVolumeClaimTemplate>,
 ) -> PersistentVolumeClaimSpecValidationOptions {
-    PersistentVolumeClaimSpecValidationOptions::default()
+    let mut opts = PersistentVolumeClaimSpecValidationOptions::default();
+    let Some(old) = old_claim_template else {
+        // validation.go:2371-2374: no old template, options from feature gates only.
+        return opts;
+    };
+    if let Some(sel) = &old.spec.selector {
+        // validation.go:2378-2381: an old invalid selector stays allowed.
+        if !validate_label_selector(
+            &to_meta_label_selector(sel),
+            LabelSelectorValidationOptions::default(),
+            &Path::new(""),
+        )
+        .is_empty()
+        {
+            opts.allow_invalid_label_value_in_selector = true;
+        }
+    }
+    opts
 }
 
 /// `ValidatePersistentVolumeClaimSpec` (validation.go:2456-2535) with options.
