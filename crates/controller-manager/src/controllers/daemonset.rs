@@ -98,12 +98,6 @@ pub struct DaemonSetController<S: Storage> {
     /// [`super::expectations`]. Both halves are wired (creations and
     /// deletions, set together by `sync_nodes`).
     expectations: Arc<ControllerExpectations>,
-    /// Rusternetes-only: per-DaemonSet keys ("ns/pod") of pods this
-    /// controller created whose creation is still unobserved. Lets `Added`
-    /// events and a fresh listing each observe a creation exactly once
-    /// (upstream `addPod` observes unconditionally, :551).
-    created_pods:
-        std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>,
 }
 
 /// `BurstReplicas` (pkg/controller/daemon/daemon_controller.go:61): caps the
@@ -118,7 +112,6 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         Self {
             storage,
             expectations: Arc::new(ControllerExpectations::new()),
-            created_pods: Default::default(),
         }
     }
 
@@ -159,7 +152,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             .expect_deletions_of(exp_key, &observed_keys);
         self.expectations
             .set_expectations(exp_key, create_diff as i64, delete_diff as i64);
-        self.created_pods.lock().unwrap().remove(exp_key);
+        self.expectations.clear_created(exp_key);
 
         let mut first_err: Option<anyhow::Error> = None;
         let mut attempted = 0usize;
@@ -178,12 +171,8 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             for result in results {
                 match result {
                     Ok(pod_name) => {
-                        self.created_pods
-                            .lock()
-                            .unwrap()
-                            .entry(exp_key.to_string())
-                            .or_default()
-                            .insert(format!("{}/{}", namespace, pod_name));
+                        self.expectations
+                            .record_created(exp_key, &format!("{}/{}", namespace, pod_name));
                     }
                     Err(e) => {
                         // Rusternetes deviation: upstream returns without
@@ -365,15 +354,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
     /// is still waiting to see that pod (so an event and a listing never
     /// both count it).
     fn observe_creation(&self, exp_key: &str, pod_key: &str) {
-        let hit = self
-            .created_pods
-            .lock()
-            .unwrap()
-            .get_mut(exp_key)
-            .is_some_and(|set| set.remove(pod_key));
-        if hit {
-            self.expectations.creation_observed(exp_key);
-        }
+        self.expectations.creation_observed_of(exp_key, pod_key);
     }
 
     /// When a pod changes, find its owning DaemonSet and enqueue it for reconciliation.
@@ -469,10 +450,6 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                     // upstream TestExpectationsOnRecreate).
                     self.expectations
                         .delete_expectations(&format!("{}/{}", ns, name));
-                    self.created_pods
-                        .lock()
-                        .unwrap()
-                        .remove(&format!("{}/{}", ns, name));
                     queue.forget(&key).await;
                 }
             }
@@ -739,13 +716,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         if !exp_satisfied {
             // Same for creations: a pod this DaemonSet created that the
             // listing already shows has been observed.
-            let pending_creates: Vec<String> = self
-                .created_pods
-                .lock()
-                .unwrap()
-                .get(&exp_key)
-                .map(|set| set.iter().cloned().collect())
-                .unwrap_or_default();
+            let pending_creates: Vec<String> = self.expectations.pending_creations(&exp_key);
             for pending in pending_creates {
                 if all_pods
                     .iter()
