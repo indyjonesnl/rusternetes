@@ -7315,4 +7315,94 @@ mod tests {
         assert!(cond_of(&got, "Complete").is_none(), "{:?}", got.status);
         assert!(cond_of(&got, "Failed").is_some());
     }
+
+    // ---- #2818: failure scenarios outrank suspend ----
+    //
+    // syncJob (job_controller.go:945-998) evaluates finishedCondition for every
+    // Job; `manageJob` (:1663) is where suspend is handled, and only runs when
+    // finishedCondition is nil. `pastActiveDeadline` (:1596) is false while
+    // suspended ("activeDeadlineSeconds is not triggered when Job is
+    // suspended", job_controller_test.go:2603).
+
+    /// A suspended Job that exceeds backoffLimit still fails.
+    #[tokio::test]
+    async fn suspended_job_over_backoff_limit_fails() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job("sbl", "default", 1, 1);
+        job.spec.suspend = Some(true);
+        job.spec.backoff_limit = Some(0);
+        let key = "/registry/jobs/default/sbl";
+        storage.create(key, &job).await.unwrap();
+        let p = make_pod("f", "default", Phase::Failed, "sbl", "job-uid-1");
+        storage
+            .create("/registry/pods/default/f", &p)
+            .await
+            .unwrap();
+        let c = JobController::new(storage.clone());
+        reconcile_settled(&c, &storage, key).await;
+        let got: Job = storage.get(key).await.unwrap();
+        let failed = cond_of(&got, "Failed").expect("failure outranks suspend");
+        assert_eq!(failed.reason.as_deref(), Some("BackoffLimitExceeded"));
+    }
+
+    /// A suspended Job with a persisted FailureTarget still becomes Failed.
+    #[tokio::test]
+    async fn suspended_job_with_persisted_failure_target_fails() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job("spf", "default", 1, 1);
+        job.spec.suspend = Some(true);
+        job.status = Some(JobStatus {
+            conditions: Some(vec![interim(
+                "FailureTarget",
+                "BackoffLimitExceeded",
+                "Job has reached the specified backoff limit",
+            )]),
+            ..Default::default()
+        });
+        let key = "/registry/jobs/default/spf";
+        storage.create(key, &job).await.unwrap();
+        let c = JobController::new(storage.clone());
+        reconcile_settled(&c, &storage, key).await;
+        let got: Job = storage.get(key).await.unwrap();
+        assert!(cond_of(&got, "Failed").is_some(), "{:?}", got.status);
+    }
+
+    /// job_controller_test.go:2603: the deadline does not fire while suspended,
+    /// and the suspended Job keeps no active pods.
+    #[tokio::test]
+    async fn suspended_job_past_deadline_does_not_fail() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job("sdl", "default", 2, 1);
+        job.spec.suspend = Some(true);
+        job.spec.active_deadline_seconds = Some(10);
+        job.status = Some(JobStatus {
+            start_time: Some(chrono::Utc::now() - chrono::Duration::seconds(15)),
+            ..Default::default()
+        });
+        let key = "/registry/jobs/default/sdl";
+        storage.create(key, &job).await.unwrap();
+        let c = JobController::new(storage.clone());
+        reconcile_settled(&c, &storage, key).await;
+        let got: Job = storage.get(key).await.unwrap();
+        assert!(cond_of(&got, "Failed").is_none(), "{:?}", got.status);
+    }
+
+    /// A suspended Job that is already done (`complete`, :1035) completes.
+    #[tokio::test]
+    async fn suspended_job_with_all_completions_completes() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job("ssc", "default", 1, 1);
+        job.spec.suspend = Some(true);
+        let key = "/registry/jobs/default/ssc";
+        storage.create(key, &job).await.unwrap();
+        let p = make_pod("s", "default", Phase::Succeeded, "ssc", "job-uid-1");
+        storage
+            .create("/registry/pods/default/s", &p)
+            .await
+            .unwrap();
+        let c = JobController::new(storage.clone());
+        reconcile_settled(&c, &storage, key).await;
+        let got: Job = storage.get(key).await.unwrap();
+        assert!(cond_of(&got, "Complete").is_some(), "{:?}", got.status);
+    }
 }
