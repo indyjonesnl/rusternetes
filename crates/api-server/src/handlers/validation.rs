@@ -665,8 +665,8 @@ fn build_strict_decoding_message(unknown: &[String], duplicates: &[String]) -> S
 ///   "spec.bar"`.
 /// - `Warn` (also an absent param): unknown fields are returned in the `Ok(Vec<String>)` so the
 ///   handler can emit one `Warning: 299 - "..."` response header per field.
-///   Duplicate fields are NOT enforced in Warn mode (matches upstream — only
-///   strict decoding splits on duplicates).
+///   Duplicate fields are warned too (`duplicate field "x"`), per upstream
+///   `addStrictDecodingWarnings` (rest.go:439-446).
 /// - `Ignore`: empty vec, no enforcement.
 ///
 /// On success the returned vector contains zero or more `unknown field "..."`
@@ -727,12 +727,17 @@ where
             )))
         }
         FieldValidationMode::Warn => {
-            // Warn mode: unknown fields become per-field warnings. Drop
-            // duplicates here — Warn does not surface duplicate keys (they
-            // would have already been merged by serde_json without raising).
+            // Port of rest.go addStrictDecodingWarnings (:439-446): every
+            // strict decoding violation, duplicates included, becomes one
+            // warning (field_validation_test.go "post-warn-validation").
             Ok(unknown
                 .into_iter()
                 .map(|field| format!("unknown field \"{}\"", field))
+                .chain(
+                    duplicates
+                        .into_iter()
+                        .map(|field| format!("duplicate field \"{}\"", field)),
+                )
                 .collect())
         }
         FieldValidationMode::Ignore => Ok(Vec::new()), // unreachable, handled above
@@ -1051,6 +1056,31 @@ mod tests {
             "warning must identify the unknown field: {:?}",
             warnings
         );
+    }
+
+    /// Upstream `addStrictDecodingWarnings` (rest.go:439-446) turns every
+    /// strict decoding violation, duplicates included, into a warning; see
+    /// field_validation_test.go "post-warn-validation" / "post-no-validation".
+    #[test]
+    fn test_warn_mode_surfaces_duplicate_fields() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Simple {
+            name: String,
+        }
+        let body = br#"{"name": "a", "name": "b", "extra": 1}"#;
+        let parsed = Simple { name: "b".into() };
+        for directive in [Some("Warn"), None] {
+            let mut params = HashMap::new();
+            if let Some(d) = directive {
+                params.insert("fieldValidation".to_string(), d.to_string());
+            }
+            let warnings = validate_strict_fields(&params, body, &parsed).unwrap();
+            assert!(
+                warnings.contains(&r#"duplicate field "name""#.to_string()),
+                "{directive:?}: {warnings:?}"
+            );
+            assert!(warnings.contains(&r#"unknown field "extra""#.to_string()));
+        }
     }
 
     #[test]
