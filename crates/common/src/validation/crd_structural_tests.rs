@@ -118,16 +118,16 @@ fn defaults_need_preserve_unknown_fields_false() {
 }
 
 /// `requireStructuralSchema` (`validation.go:1748`): an object whose stored
-/// schema is already non-structural is not tightened on update.
+/// schema is already non-structural is not tightened on update. Only a CRD
+/// with `preserveUnknownFields: true` can be in that state, because
+/// `preserveUnknownFields` false forces the requirement (`validation.go:366`).
 #[test]
 fn update_does_not_tighten_already_unstructural_crd() {
-    let old = crd_with(&[unstructural_schema()]);
+    let mut old = crd_with(&[unstructural_schema()]);
+    old.spec.preserve_unknown_fields = Some(true);
     let new = old.clone();
     let errs = validate_custom_resource_definition_update(&new, &old);
     assert!(schema_errs(&errs).is_empty(), "{errs:?}");
-    // ...but the same schema on a fresh create is rejected.
-    let errs = validate_custom_resource_definition(&new);
-    assert!(!schema_errs(&errs).is_empty(), "{errs:?}");
 }
 
 /// An update from a structural schema to a non-structural one is rejected.
