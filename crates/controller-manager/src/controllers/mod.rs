@@ -9,6 +9,7 @@ pub mod daemonset;
 pub mod deployment;
 pub mod dynamic_provisioner;
 pub mod endpoints;
+pub mod endpoints_tracker;
 pub mod endpointslice;
 pub mod endpointslice_tracker;
 pub mod ephemeral_volume;
@@ -52,6 +53,7 @@ pub mod status_subresource_double;
 pub mod storage_class;
 pub mod taint_eviction;
 pub mod taint_eviction_timed_workers;
+pub mod trigger_time_tracker;
 pub mod ttl_controller;
 #[cfg(test)]
 pub mod uid_precondition_double;

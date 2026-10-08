@@ -30,6 +30,7 @@ mod deployment_proportional_test;
 mod deployment_scaling_test;
 mod dynamic_provisioner_test;
 mod endpoints_controller_test;
+mod endpoints_trigger_time_test;
 mod endpointslice_controller_test;
 mod endpointslice_idempotency_test;
 mod garbage_collector_idempotency_test;
