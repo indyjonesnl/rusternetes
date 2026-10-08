@@ -240,17 +240,44 @@ impl<T: Object> Patcher<'_, T> {
             )])
         };
         let obj: T = serde_json::from_value(patched).map_err(|e| invalid_patch(e.to_string()))?;
+        // `appliedStrictErrs`: the patch document's own errors, which precede
+        // the patched object's (patch.go:338-363 `append(appliedStrictErrs,
+        // strictError.Errors()...)`).
+        use crate::handlers::validation::FieldValidationMode;
+        let directive = FieldValidationMode::from_query(self.params);
+        let applied = if matches!(directive, FieldValidationMode::Ignore) {
+            Vec::new()
+        } else {
+            crate::handlers::validation::patch_document_strict_errors(
+                matches!(patch_type, PatchType::JsonPatch),
+                self.body,
+            )
+        };
         match crate::handlers::validation::validate_strict_fields(
             self.params,
             patched_js.as_bytes(),
             &obj,
         ) {
             Ok(warnings) => {
-                for warning in warnings {
+                if matches!(directive, FieldValidationMode::Strict) && !applied.is_empty() {
+                    return Err(invalid_patch(format!(
+                        "strict decoding error: {}",
+                        applied.join(", ")
+                    )));
+                }
+                for warning in applied.into_iter().chain(warnings) {
                     ctx.add_warning(warning);
                 }
             }
-            Err(Error::BadRequest(msg)) => return Err(invalid_patch(msg)),
+            Err(Error::BadRequest(msg)) => {
+                let msg = match msg.strip_prefix("strict decoding error: ") {
+                    Some(rest) if !applied.is_empty() => {
+                        format!("strict decoding error: {}, {rest}", applied.join(", "))
+                    }
+                    _ => msg,
+                };
+                return Err(invalid_patch(msg));
+            }
             Err(e) => return Err(e),
         }
         Ok(obj)

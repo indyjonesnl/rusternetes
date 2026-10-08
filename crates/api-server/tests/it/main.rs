@@ -186,6 +186,7 @@ mod node_restriction_test;
 mod openapi_discovery_test;
 mod openapi_v3_proto_test;
 mod patch_cas_retry_test;
+mod patch_document_strict_decoding_test;
 mod patch_finalizer_drain_test;
 mod patch_json_patch_semantics_test;
 mod patch_strategic_merge_semantics_test;
