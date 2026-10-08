@@ -281,3 +281,68 @@ fn dedup_owner_references_and_add_warning_matches_upstream() {
     dedup_owner_references_and_add_warning(&mut c, &ctx, false);
     assert!(ctx.warnings().is_empty());
 }
+
+/// create.go:211-218 / update.go:226-240 / patch.go:710-726: a too-large write
+/// is retried exactly once, with managedFields stripped; any other error, and
+/// a second too-large error, are returned as they are.
+mod too_large_retry {
+    use super::super::rest::retry_without_managed_fields_if_too_large;
+    use rusternetes_common::Error;
+
+    fn too_large() -> Error {
+        Error::StorageTooLarge("etcdserver: request is too large".into())
+    }
+
+    #[tokio::test]
+    async fn retries_once_without_managed_fields() {
+        let mut calls = Vec::new();
+        let out = retry_without_managed_fields_if_too_large(|strip| {
+            calls.push(strip);
+            let r = if strip {
+                Ok("stored")
+            } else {
+                Err(too_large())
+            };
+            async move { r }
+        })
+        .await;
+        assert_eq!(out.unwrap(), "stored");
+        assert_eq!(calls, vec![false, true]);
+    }
+
+    #[tokio::test]
+    async fn success_is_not_retried() {
+        let mut calls = 0;
+        let out = retry_without_managed_fields_if_too_large(|_| {
+            calls += 1;
+            async { Ok(()) }
+        })
+        .await;
+        assert!(out.is_ok());
+        assert_eq!(calls, 1);
+    }
+
+    #[tokio::test]
+    async fn other_errors_are_not_retried() {
+        let mut calls = 0;
+        let out: rusternetes_common::Result<()> = retry_without_managed_fields_if_too_large(|_| {
+            calls += 1;
+            async { Err(Error::Storage("etcdserver: leader changed".into())) }
+        })
+        .await;
+        assert!(matches!(out, Err(Error::Storage(_))));
+        assert_eq!(calls, 1);
+    }
+
+    #[tokio::test]
+    async fn a_second_too_large_error_is_returned() {
+        let mut calls = 0;
+        let out: rusternetes_common::Result<()> = retry_without_managed_fields_if_too_large(|_| {
+            calls += 1;
+            async { Err(too_large()) }
+        })
+        .await;
+        assert!(out.unwrap_err().is_too_large_error());
+        assert_eq!(calls, 2);
+    }
+}

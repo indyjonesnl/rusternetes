@@ -271,6 +271,30 @@ pub(super) fn dedup_owner_references_and_add_warning<T: Object>(
 }
 
 /// `checkName` (rest.go:272-290).
+/// The `FinishRequest` closure shared by create.go:211-218, update.go:226-240
+/// and patch.go:710-726:
+///
+/// ```text
+/// result, err := requestFunc()
+/// // If the object wasn't committed to storage because it's serialized size was too large,
+/// // it is safe to remove managedFields (which can be large) and try again.
+/// if isTooLargeError(err) { ...SetManagedFields(nil)...; result, err = requestFunc() }
+/// ```
+///
+/// `request(strip_managed_fields)` runs one attempt; the second attempt is
+/// made at most once, and only for a too-large error.
+pub(super) async fn retry_without_managed_fields_if_too_large<R, Fut>(
+    mut request: impl FnMut(bool) -> Fut,
+) -> Result<R>
+where
+    Fut: std::future::Future<Output = Result<R>>,
+{
+    match request(false).await {
+        Err(e) if e.is_too_large_error() => request(true).await,
+        other => other,
+    }
+}
+
 pub(super) fn check_name<T: Object>(obj: &T, name: &str, namespace: Option<&str>) -> Result<()> {
     let meta = obj.metadata();
     if meta.name.is_empty() {
