@@ -51,6 +51,7 @@ mod loadbalancer_status_lifecycle_test;
 mod namespace_controller_test;
 mod networkpolicy_controller_test;
 mod node_controller_test;
+mod node_zone_disruption_test;
 mod pdb_controller_test;
 mod pdb_disruption_controller_test;
 mod priorityclass_controller_test;

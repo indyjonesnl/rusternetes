@@ -1,8 +1,14 @@
+use crate::controllers::node_lifecycle_queue::{
+    RateLimitedTimedQueue, RateLimiter, TimedValue, EVICTION_RATE_LIMITER_BURST,
+    NODE_EVICTION_PERIOD,
+};
+use crate::controllers::node_lifecycle_zone::{get_zone_key, EvictionConfig, ZoneState};
 use crate::controllers::worker_pool::spawn_workers;
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use futures::StreamExt;
 use rusternetes_common::quantity::Quantity;
+use rusternetes_common::resources::node::Taint;
 use rusternetes_common::resources::{Lease, Node, NodeCondition, NodeStatus, Pod, PodStatus};
 use rusternetes_common::types::Phase;
 use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
@@ -46,18 +52,71 @@ const NODE_MONITOR_PERIOD: std::time::Duration = std::time::Duration::from_secs(
 /// reporter having refreshed its `lastTransitionTime`.
 type ObservedConditions = HashMap<String, HashMap<String, (String, Option<DateTime<Utc>>)>>;
 
+/// `labelNodeDisruptionExclusion` (node_lifecycle_controller.go:817-819): nodes
+/// carrying it are excluded from disruption checks.
+const LABEL_NODE_DISRUPTION_EXCLUSION: &str = "node.kubernetes.io/exclude-disruption";
+
+const TAINT_NODE_NOT_READY: &str = "node.kubernetes.io/not-ready";
+const TAINT_NODE_UNREACHABLE: &str = "node.kubernetes.io/unreachable";
+
+/// `NotReadyTaintTemplate` / `UnreachableTaintTemplate`
+/// (node_lifecycle_controller.go:70-83): both `NoExecute`.
+fn no_execute_taint(key: &str) -> Taint {
+    Taint {
+        key: key.to_string(),
+        value: Some(String::new()),
+        effect: "NoExecute".to_string(),
+        time_added: None,
+    }
+}
+
+/// `taintutils.TaintExists(node.Spec.Taints, template)`: key + NoExecute effect.
+fn node_has_taint(node: &Node, key: &str) -> bool {
+    node.spec
+        .as_ref()
+        .and_then(|s| s.taints.as_ref())
+        .is_some_and(|ts| ts.iter().any(|t| t.key == key && t.effect == "NoExecute"))
+}
+
+/// The state `evictorLock` guards upstream, plus the `zoneStates` and
+/// `knownNodeSet` maps `monitorNodeHealth` owns.
+#[derive(Default)]
+struct Evictor {
+    zone_states: HashMap<String, ZoneState>,
+    /// `zoneNoExecuteTainter`: one rate-limited queue per zone.
+    zone_no_execute_tainter: HashMap<String, Arc<RateLimitedTimedQueue>>,
+    /// `knownNodeSet`: node name -> uid.
+    known_node_set: HashMap<String, String>,
+}
+
+/// What `monitor_node` observed for one node, feeding `handleDisruption`.
+struct NodeObservation {
+    zone: String,
+    ready: bool,
+    excluded_from_disruption: bool,
+}
+
 pub struct NodeController<S: Storage> {
     storage: Arc<S>,
     first_seen: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
     observed_conditions: Arc<std::sync::Mutex<ObservedConditions>>,
+    eviction: EvictionConfig,
+    evictor: Arc<tokio::sync::Mutex<Evictor>>,
 }
 
 impl<S: Storage + 'static> NodeController<S> {
+    #[allow(dead_code)]
     pub fn new(storage: Arc<S>) -> Self {
+        Self::with_eviction_config(storage, EvictionConfig::default())
+    }
+
+    pub fn with_eviction_config(storage: Arc<S>, eviction: EvictionConfig) -> Self {
         Self {
             storage,
             first_seen: Arc::new(std::sync::Mutex::new(HashMap::new())),
             observed_conditions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            eviction,
+            evictor: Arc::new(tokio::sync::Mutex::new(Evictor::default())),
         }
     }
 
@@ -108,6 +167,19 @@ impl<S: Storage + 'static> NodeController<S> {
             let feeder = Arc::clone(&self);
             let pod_queue = pod_queue.clone();
             async move { feeder.feed_pod_queue(pod_queue).await }
+        });
+
+        // NoExecute tainting loop (:500-503
+        // `wait.UntilWithContext(ctx, nc.doNoExecuteTaintingPass, scheduler.NodeEvictionPeriod)`).
+        tokio::spawn({
+            let tainter = Arc::clone(&self);
+            async move {
+                let mut tick = tokio::time::interval(NODE_EVICTION_PERIOD);
+                loop {
+                    tick.tick().await;
+                    tainter.do_no_execute_tainting_pass().await;
+                }
+            }
         });
 
         // Separate single health-monitor loop (:506-512).
@@ -333,24 +405,19 @@ impl<S: Storage + 'static> NodeController<S> {
     pub async fn reconcile_all(&self) -> Result<()> {
         debug!("Starting node reconciliation");
 
-        // List all nodes
-        let nodes: Vec<Node> = self.storage.list("/registry/nodes/").await?;
+        // One-shot form of the three loops `run()` drives separately:
+        // `monitorNodeHealth`, the per-node pass, and `doNoExecuteTaintingPass`.
+        self.monitor_node_health().await?;
 
+        let nodes: Vec<Node> = self.storage.list("/registry/nodes/").await?;
         for node in nodes {
-            if let Err(e) = self.reconcile_node(&node).await {
+            if let Err(e) = self.process_node(&node).await {
                 error!("Failed to reconcile node {}: {}", &node.metadata.name, e);
             }
         }
 
+        self.do_no_execute_tainting_pass().await;
         Ok(())
-    }
-
-    /// Reconcile a single node: the health pass then the per-node pass.
-    /// Only `reconcile_all` (tests / one-shot callers) uses the fused form; the
-    /// live `run()` drives the two halves from separate loops.
-    async fn reconcile_node(&self, node: &Node) -> Result<()> {
-        self.monitor_node(node).await?;
-        self.process_node(node).await
     }
 
     /// True while the node is inside the K8s startup grace period
@@ -365,30 +432,122 @@ impl<S: Storage + 'static> NodeController<S> {
         first_seen_time.elapsed() < std::time::Duration::from_secs(NODE_STARTUP_GRACE_PERIOD_SECS)
     }
 
-    /// `monitorNodeHealth` (node_lifecycle_controller.go:665-774): one pass over
-    /// all nodes, run from its own loop. Upstream fans the per-node work out
-    /// with `workqueue.ParallelizeUntil(ctx, nc.nodeUpdateWorkerSize, ...)`
-    /// (:774); same bound here.
+    /// `monitorNodeHealth` (node_lifecycle_controller.go:670-778): one pass over
+    /// all nodes, run from its own loop. Registers new nodes/zones
+    /// (`classifyNodes`, :1178), fans the per-node work out with
+    /// `workqueue.ParallelizeUntil(ctx, nc.nodeUpdateWorkerSize, ...)` (:774;
+    /// same bound here), then runs `handleDisruption` (:776).
     pub async fn monitor_node_health(&self) -> Result<()> {
         let nodes: Vec<Node> = self.storage.list("/registry/nodes/").await?;
-        futures::stream::iter(nodes)
-            .for_each_concurrent(NODE_UPDATE_WORKER_SIZE, |node| async move {
-                if let Err(e) = self.monitor_node(&node).await {
-                    error!("Failed to monitor node {}: {}", &node.metadata.name, e);
-                }
-            })
+        self.register_nodes(&nodes).await;
+
+        let pending: Vec<_> = nodes
+            .iter()
+            .map(|node| self.monitor_node_logged(node))
+            .collect();
+        let observations: Vec<NodeObservation> = futures::stream::iter(pending)
+            .buffer_unordered(NODE_UPDATE_WORKER_SIZE)
+            .filter_map(futures::future::ready)
+            .collect()
             .await;
+
+        self.handle_disruption(&observations, &nodes).await;
         Ok(())
     }
 
+    async fn monitor_node_logged(&self, node: &Node) -> Option<NodeObservation> {
+        match self.monitor_node(node).await {
+            Ok(obs) => obs,
+            Err(e) => {
+                // :734-737 "Skipping - no pods will be evicted"
+                error!("Failed to monitor node {}: {}", &node.metadata.name, e);
+                None
+            }
+        }
+    }
+
+    /// `classifyNodes` (:1178) + the registration half of `monitorNodeHealth`
+    /// (:676-694): new zones get a tainter queue, new nodes are recorded and
+    /// have stale lifecycle taints cleared, deleted nodes are forgotten.
+    async fn register_nodes(&self, nodes: &[Node]) {
+        let mut added: Vec<&Node> = Vec::new();
+        let mut new_zone_representatives: Vec<&Node> = Vec::new();
+        let mut deleted: Vec<String> = Vec::new();
+        {
+            let ev = self.evictor.lock().await;
+            for node in nodes {
+                if !ev.known_node_set.contains_key(&node.metadata.name) {
+                    added.push(node);
+                } else if !ev.zone_states.contains_key(&get_zone_key(node)) {
+                    // Currently, we only consider new zone as updated.
+                    new_zone_representatives.push(node);
+                }
+            }
+            // If there's a difference between lengths of known Nodes and
+            // observed nodes we must have removed some Node.
+            if ev.known_node_set.len() + added.len() != nodes.len() {
+                let observed: std::collections::HashSet<&str> =
+                    nodes.iter().map(|n| n.metadata.name.as_str()).collect();
+                deleted = ev
+                    .known_node_set
+                    .keys()
+                    .filter(|k| !observed.contains(k.as_str()))
+                    .cloned()
+                    .collect();
+            }
+        }
+
+        for node in new_zone_representatives {
+            self.add_pod_evictor_for_new_zone(node).await;
+        }
+        for node in added {
+            debug!("Controller observed a new Node {}", node.metadata.name);
+            self.evictor
+                .lock()
+                .await
+                .known_node_set
+                .insert(node.metadata.name.clone(), node.metadata.uid.clone());
+            self.add_pod_evictor_for_new_zone(node).await;
+            if let Err(e) = self.mark_node_as_reachable(node).await {
+                warn!(
+                    "Failed to clear taints of new node {}: {}",
+                    node.metadata.name, e
+                );
+            }
+        }
+        for name in deleted {
+            debug!("Controller observed a Node deletion {}", name);
+            self.evictor.lock().await.known_node_set.remove(&name);
+        }
+    }
+
+    /// `addPodEvictorForNewZone` (:1224): create the zone's tainter queue with
+    /// the default `evictionLimiterQPS` limiter.
+    async fn add_pod_evictor_for_new_zone(&self, node: &Node) {
+        let zone = get_zone_key(node);
+        let mut ev = self.evictor.lock().await;
+        if !ev.zone_states.contains_key(&zone) {
+            ev.zone_states.insert(zone.clone(), ZoneState::Initial);
+            ev.zone_no_execute_tainter.insert(
+                zone,
+                Arc::new(RateLimitedTimedQueue::new(RateLimiter::token_bucket(
+                    self.eviction.eviction_limiter_qps,
+                    EVICTION_RATE_LIMITER_BURST,
+                ))),
+            );
+        }
+    }
+
     /// Health half of the old fused reconcile: readiness, Ready condition,
-    /// condition transitions, not-ready taint and eviction.
-    async fn monitor_node(&self, node: &Node) -> Result<()> {
+    /// condition transitions, then `processTaintBaseEviction`. Returns the
+    /// observation `handleDisruption` needs, or `None` while the node is
+    /// inside the startup grace period.
+    async fn monitor_node(&self, node: &Node) -> Result<Option<NodeObservation>> {
         let node_name = &node.metadata.name;
 
         // Don't change node conditions during startup grace period (K8s: nodeStartupGracePeriod = 60s)
         if self.in_startup_grace(node_name) {
-            return Ok(());
+            return Ok(None);
         }
 
         // Check if node is ready based on heartbeat AND Lease
@@ -409,6 +568,18 @@ impl<S: Storage + 'static> NodeController<S> {
             None => true, // No ready condition exists, need to create one
         };
 
+        // The Ready status after this pass: `update_node_status` writes
+        // True/False; an `Unknown` set by someone else is left alone.
+        let ready_status = if is_ready {
+            "True"
+        } else if !needs_update
+            && current_ready_condition.map(|c| c.status.as_str()) == Some("Unknown")
+        {
+            "Unknown"
+        } else {
+            "False"
+        };
+
         if needs_update {
             info!("Node {} ready status changed to: {}", node_name, is_ready);
             self.update_node_status(node, is_ready).await?;
@@ -420,23 +591,428 @@ impl<S: Storage + 'static> NodeController<S> {
         // the pressure-condition transition times observable.
         self.reconcile_condition_transitions(node).await?;
 
-        // Manage not-ready/unreachable taints (K8s node lifecycle controller pattern).
-        // Always check taints regardless of needs_update — the taint may have been
-        // set during initial registration and never removed.
-        if !is_ready {
-            self.add_not_ready_taint(node).await?;
-        } else {
-            // Node is Ready — ensure not-ready taint is removed
-            self.remove_not_ready_taint(node).await?;
-        }
+        // Not-ready/unreachable NoExecute taints are NOT applied here: like
+        // upstream they go through the zone's rate-limited queue
+        // (`processTaintBaseEviction`, :781) and are drained by
+        // `do_no_execute_tainting_pass`.
+        self.process_taint_base_eviction(node, ready_status).await;
 
-        // Evict pods from nodes that have been NotReady for too long
-        if !is_ready && self.should_evict_pods(node) {
+        // Evict pods from nodes that have been NotReady for too long. Only
+        // once the throttled pass has actually tainted the node, so a
+        // partition (which the queue holds back or disables) cannot bypass the
+        // rate limit through this path.
+        if !is_ready
+            && self.should_evict_pods(node)
+            && self.has_no_execute_not_ready_taint(node_name).await
+        {
             info!("Evicting pods from NotReady node {}", node_name);
             self.evict_pods_from_node(node_name).await?;
         }
 
+        Ok(Some(NodeObservation {
+            zone: get_zone_key(node),
+            ready: ready_status == "True",
+            excluded_from_disruption: node
+                .metadata
+                .labels
+                .as_ref()
+                .is_some_and(|l| l.contains_key(LABEL_NODE_DISRUPTION_EXCLUSION)),
+        }))
+    }
+
+    /// `processTaintBaseEviction` (:781-815).
+    async fn process_taint_base_eviction(&self, node: &Node, ready_status: &str) {
+        match ready_status {
+            "False" => {
+                // Update the taint straight away if the node is already tainted
+                // with the unreachable taint.
+                if node_has_taint(node, TAINT_NODE_UNREACHABLE) {
+                    if !self
+                        .swap_node_controller_taint(
+                            &node.metadata.name,
+                            no_execute_taint(TAINT_NODE_NOT_READY),
+                            TAINT_NODE_UNREACHABLE,
+                        )
+                        .await
+                    {
+                        error!("Failed to instantly swap UnreachableTaint to NotReadyTaint. Will try again in the next cycle");
+                    }
+                } else if self.mark_node_for_tainting(node, "False").await {
+                    debug!(
+                        "Node {} is NotReady. Adding it to the Taint queue",
+                        node.metadata.name
+                    );
+                }
+            }
+            "Unknown" => {
+                if node_has_taint(node, TAINT_NODE_NOT_READY) {
+                    if !self
+                        .swap_node_controller_taint(
+                            &node.metadata.name,
+                            no_execute_taint(TAINT_NODE_UNREACHABLE),
+                            TAINT_NODE_NOT_READY,
+                        )
+                        .await
+                    {
+                        error!("Failed to instantly swap NotReadyTaint to UnreachableTaint. Will try again in the next cycle");
+                    }
+                } else if self.mark_node_for_tainting(node, "Unknown").await {
+                    debug!(
+                        "Node {} is unresponsive. Adding it to the Taint queue",
+                        node.metadata.name
+                    );
+                }
+            }
+            "True" => match self.mark_node_as_reachable(node).await {
+                Ok(true) => debug!(
+                    "Node {} is healthy again, removed all taints",
+                    node.metadata.name
+                ),
+                Ok(false) => {}
+                Err(_) => error!("Failed to remove taints from node. Will retry in next iteration"),
+            },
+            _ => {}
+        }
+    }
+
+    async fn zone_queue(&self, node: &Node) -> Option<Arc<RateLimitedTimedQueue>> {
+        let ev = self.evictor.lock().await;
+        ev.zone_no_execute_tainter.get(&get_zone_key(node)).cloned()
+    }
+
+    /// `markNodeForTainting` (:1239): queue the node on its zone's tainter.
+    async fn mark_node_for_tainting(&self, node: &Node, status: &str) -> bool {
+        let Some(queue) = self.zone_queue(node).await else {
+            return false;
+        };
+        let name = &node.metadata.name;
+        if status == "False" && !node_has_taint(node, TAINT_NODE_NOT_READY) {
+            queue.remove(name);
+        }
+        if status == "Unknown" && !node_has_taint(node, TAINT_NODE_UNREACHABLE) {
+            queue.remove(name);
+        }
+        queue.add(name, &node.metadata.uid)
+    }
+
+    /// `markNodeAsReachable` (:1257): remove both lifecycle taints and drop the
+    /// node from its zone queue.
+    async fn mark_node_as_reachable(&self, node: &Node) -> Result<bool> {
+        self.remove_taint_off_node(node, TAINT_NODE_UNREACHABLE)
+            .await?;
+        self.remove_taint_off_node(node, TAINT_NODE_NOT_READY)
+            .await?;
+        Ok(match self.zone_queue(node).await {
+            Some(q) => q.remove(&node.metadata.name),
+            None => false,
+        })
+    }
+
+    /// `controller.RemoveTaintOffNode` (pkg/controller/controller_utils.go): a
+    /// no-op when the passed node carries no such NoExecute taint, otherwise
+    /// remove it from the stored node.
+    async fn remove_taint_off_node(&self, node: &Node, key: &str) -> Result<()> {
+        if !node_has_taint(node, key) {
+            return Ok(());
+        }
+        let node_key = build_key("nodes", None, &node.metadata.name);
+        let mut stored: Node = self.storage.get(&node_key).await?;
+        if let Some(spec) = stored.spec.as_mut() {
+            if let Some(taints) = spec.taints.as_mut() {
+                let before = taints.len();
+                taints.retain(|t| !(t.key == key && t.effect == "NoExecute"));
+                if taints.len() != before {
+                    if taints.is_empty() {
+                        spec.taints = None;
+                    }
+                    self.storage.update(&node_key, &stored).await?;
+                    debug!("Removed {} taint from node {}", key, node.metadata.name);
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// `SwapNodeControllerTaint`
+    /// (pkg/controller/util/node/controller_utils.go:194-226): stamp
+    /// `timeAdded`, add-or-update the new taint (`taintutils.AddOrUpdateTaint`
+    /// matches on key+effect and no-ops when fully equal), remove the opposite
+    /// one. Returns true on success. Both edits are one storage write here.
+    async fn swap_node_controller_taint(
+        &self,
+        node_name: &str,
+        mut taint_to_add: Taint,
+        taint_to_remove: &str,
+    ) -> bool {
+        taint_to_add.time_added = Some(Utc::now());
+        let node_key = build_key("nodes", None, node_name);
+        let mut stored: Node = match self.storage.get(&node_key).await {
+            Ok(n) => n,
+            Err(e) => {
+                error!("unable to taint unresponsive Node {:?}: {}", node_name, e);
+                return false;
+            }
+        };
+        let spec = stored
+            .spec
+            .get_or_insert(rusternetes_common::resources::NodeSpec {
+                pod_cidr: None,
+                pod_cidrs: None,
+                provider_id: None,
+                unschedulable: None,
+                taints: None,
+            });
+        let taints = spec.taints.get_or_insert_with(Vec::new);
+        let before = serde_json::to_value(&*taints).unwrap_or_default();
+        match taints
+            .iter_mut()
+            .find(|t| t.key == taint_to_add.key && t.effect == taint_to_add.effect)
+        {
+            Some(existing) => *existing = taint_to_add,
+            None => taints.push(taint_to_add),
+        }
+        taints.retain(|t| !(t.key == taint_to_remove && t.effect == "NoExecute"));
+        let after = serde_json::to_value(&*taints).unwrap_or_default();
+        if before == after {
+            return true;
+        }
+        match self.storage.update(&node_key, &stored).await {
+            Ok(_) => true,
+            Err(e) => {
+                error!("unable to taint unresponsive Node {:?}: {}", node_name, e);
+                false
+            }
+        }
+    }
+
+    async fn has_no_execute_not_ready_taint(&self, node_name: &str) -> bool {
+        match self
+            .storage
+            .get::<Node>(&build_key("nodes", None, node_name))
+            .await
+        {
+            Ok(n) => {
+                node_has_taint(&n, TAINT_NODE_NOT_READY)
+                    || node_has_taint(&n, TAINT_NODE_UNREACHABLE)
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// `doNoExecuteTaintingPass` (:595-663): drain every zone's rate-limited
+    /// queue, applying the not-ready or unreachable taint according to the
+    /// node's current Ready condition.
+    pub async fn do_no_execute_tainting_pass(&self) {
+        // Snapshot the queues so the lock is not held for the whole pass
+        // (:597-610).
+        let queues: Vec<Arc<RateLimitedTimedQueue>> = {
+            let ev = self.evictor.lock().await;
+            ev.zone_no_execute_tainter.values().cloned().collect()
+        };
+        for queue in queues {
+            // Function returns false and a time after which it should be
+            // retried, or true if it shouldn't (it succeeded).
+            queue
+                .try_process(|value: TimedValue| async move {
+                    let key = build_key("nodes", None, &value.value);
+                    let node: Node = match self.storage.get(&key).await {
+                        Ok(n) => n,
+                        Err(rusternetes_common::Error::NotFound(_)) => {
+                            debug!("Node {} no longer present", value.value);
+                            return (true, std::time::Duration::ZERO);
+                        }
+                        Err(e) => {
+                            debug!("Failed to get Node {}: {}", value.value, e);
+                            // retry in 50 millisecond
+                            return (false, std::time::Duration::from_millis(50));
+                        }
+                    };
+                    let Some(condition) = node
+                        .status
+                        .as_ref()
+                        .and_then(|s| s.conditions.as_ref())
+                        .and_then(|cs| cs.iter().find(|c| c.condition_type == "Ready"))
+                    else {
+                        debug!("Failed to get NodeCondition from node {}", value.value);
+                        return (false, std::time::Duration::from_millis(50));
+                    };
+                    // Because we want to mimic NodeStatus.Condition["Ready"] we
+                    // make "unreachable" and "not ready" taints mutually
+                    // exclusive.
+                    let (to_add, opposite) = match condition.status.as_str() {
+                        "False" => (TAINT_NODE_NOT_READY, TAINT_NODE_UNREACHABLE),
+                        "Unknown" => (TAINT_NODE_UNREACHABLE, TAINT_NODE_NOT_READY),
+                        _ => {
+                            // The Node is ready again, so there's no need to
+                            // taint it.
+                            return (true, std::time::Duration::ZERO);
+                        }
+                    };
+                    let ok = self
+                        .swap_node_controller_taint(
+                            &value.value,
+                            no_execute_taint(to_add),
+                            opposite,
+                        )
+                        .await;
+                    (ok, std::time::Duration::ZERO)
+                })
+                .await;
+        }
+    }
+
+    /// `handleDisruption` (:996-1085): derive each zone's state from its nodes'
+    /// Ready conditions and retune the zone's eviction limiter.
+    async fn handle_disruption(&self, observations: &[NodeObservation], nodes: &[Node]) {
+        let mut zone_to_conditions: HashMap<String, Vec<bool>> = HashMap::new();
+        for o in observations {
+            // Some nodes may be excluded from disruption checking
+            if !o.excluded_from_disruption {
+                zone_to_conditions
+                    .entry(o.zone.clone())
+                    .or_default()
+                    .push(o.ready);
+            }
+        }
+
+        let mut zone_states = self.evictor.lock().await.zone_states.clone();
+        let mut new_zone_states: HashMap<String, ZoneState> = HashMap::new();
+        let mut all_are_fully_disrupted = true;
+        for (k, v) in &zone_to_conditions {
+            let (_unhealthy, new_state) = self.eviction.compute_zone_state(v);
+            if new_state != ZoneState::FullDisruption {
+                all_are_fully_disrupted = false;
+            }
+            new_zone_states.insert(k.clone(), new_state);
+            zone_states.entry(k.clone()).or_insert(ZoneState::Initial);
+        }
+
+        let mut all_was_fully_disrupted = true;
+        let keys: Vec<String> = zone_states.keys().cloned().collect();
+        for k in keys {
+            if !zone_to_conditions.contains_key(&k) {
+                zone_states.remove(&k);
+                continue;
+            }
+            if zone_states[&k] != ZoneState::FullDisruption {
+                all_was_fully_disrupted = false;
+                break;
+            }
+        }
+
+        // At least one node was responding in previous pass or in the current
+        // pass. Semantics is as follows:
+        // - partialDisruption: use the reduced limiter,
+        // - normal: resume normal operation,
+        // - fullDisruption: restore normal eviction rate, unless all zones in
+        //   the cluster are in fullDisruption - then stop all evictions.
+        if !all_are_fully_disrupted || !all_was_fully_disrupted {
+            if all_are_fully_disrupted {
+                // We're switching to full disruption mode
+                info!("Controller detected that all Nodes are not-Ready. Entering master disruption mode");
+                for node in nodes {
+                    if let Err(e) = self.mark_node_as_reachable(node).await {
+                        error!(
+                            "Failed to remove taints from Node {}: {}",
+                            node.metadata.name, e
+                        );
+                    }
+                }
+                // We stop all evictions.
+                for k in zone_states.keys() {
+                    self.swap_zone_limiter(k, 0.0).await;
+                }
+                for v in zone_states.values_mut() {
+                    *v = ZoneState::FullDisruption;
+                }
+                self.evictor.lock().await.zone_states = zone_states;
+                // All rate limiters are updated, so we can return early here.
+                return;
+            }
+            if all_was_fully_disrupted {
+                // We're exiting full disruption mode
+                info!(
+                    "Controller detected that some Nodes are Ready. Exiting master disruption mode"
+                );
+                // When exiting disruption mode update probe timestamps on all
+                // Nodes (`probeTimestamp`/`readyTransitionTimestamp = now`,
+                // :1062-1067). This controller keeps no probe map; restarting
+                // each node's startup-grace clock gives the same effect: the
+                // stale heartbeats written while the master was unreachable
+                // are not held against the nodes.
+                {
+                    let mut first_seen = self.first_seen.lock().unwrap();
+                    let now = std::time::Instant::now();
+                    for node in nodes {
+                        first_seen.insert(node.metadata.name.clone(), now);
+                    }
+                }
+                // We reset all rate limiters to settings appropriate for the
+                // given state.
+                let keys: Vec<String> = zone_states.keys().cloned().collect();
+                for k in keys {
+                    let state = new_zone_states[&k];
+                    let size = zone_to_conditions.get(&k).map_or(0, Vec::len);
+                    self.set_limiter_in_zone(&k, size, state).await;
+                    zone_states.insert(k, state);
+                }
+                self.evictor.lock().await.zone_states = zone_states;
+                return;
+            }
+            // We know that there's at least one not-fully disrupted so, we can
+            // use default behavior for rate limiters
+            let keys: Vec<String> = zone_states.keys().cloned().collect();
+            for k in keys {
+                let new_state = new_zone_states[&k];
+                if zone_states[&k] == new_state {
+                    continue;
+                }
+                info!(
+                    "Controller detected that zone {:?} is now in state {:?}",
+                    k, new_state
+                );
+                let size = zone_to_conditions.get(&k).map_or(0, Vec::len);
+                self.set_limiter_in_zone(&k, size, new_state).await;
+                zone_states.insert(k, new_state);
+            }
+        }
+        self.evictor.lock().await.zone_states = zone_states;
+    }
+
+    async fn swap_zone_limiter(&self, zone: &str, qps: f32) {
+        let queue = self
+            .evictor
+            .lock()
+            .await
+            .zone_no_execute_tainter
+            .get(zone)
+            .cloned();
+        if let Some(q) = queue {
+            q.swap_limiter(qps).await;
+        }
+    }
+
+    /// `setLimiterInZone` (:1161).
+    async fn set_limiter_in_zone(&self, zone: &str, zone_size: usize, state: ZoneState) {
+        match state {
+            ZoneState::Normal => {
+                self.swap_zone_limiter(zone, self.eviction.eviction_limiter_qps)
+                    .await
+            }
+            // enterPartialDisruptionFunc = ReducedQPSFunc (:357)
+            ZoneState::PartialDisruption => {
+                self.swap_zone_limiter(zone, self.eviction.reduced_qps(zone_size))
+                    .await
+            }
+            // enterFullDisruptionFunc = HealthyQPSFunc (:358): a fully
+            // disrupted zone while other zones still respond keeps the normal
+            // rate; only all-zones-down stops evictions (handled above).
+            ZoneState::FullDisruption => {
+                self.swap_zone_limiter(zone, self.eviction.eviction_limiter_qps)
+                    .await
+            }
+            ZoneState::Initial => {}
+        }
     }
 
     /// Per-node pass run by the 8-worker pool (`doNodeProcessingPassWorker`,
@@ -786,69 +1362,6 @@ impl<S: Storage + 'static> NodeController<S> {
         self.storage.update_status(&node_key, &updated_node).await?;
 
         info!("Updated node {} status to ready={}", node_name, is_ready);
-        Ok(())
-    }
-
-    /// Add the not-ready taint to a NotReady node.
-    ///
-    /// Upstream `pkg/controller/nodelifecycle/node_lifecycle_controller.go` applies
-    /// `node.kubernetes.io/not-ready` with effect `NoExecute` (see `TaintNodeNotReady`),
-    /// which both prevents new scheduling and activates `TaintEvictionController` for
-    /// non-tolerating pods on the node.
-    async fn add_not_ready_taint(&self, node: &Node) -> Result<()> {
-        let node_name = &node.metadata.name;
-        let key = build_key("nodes", None, node_name);
-        let mut updated_node: Node = self.storage.get(&key).await?;
-
-        // Stamp time_added when adding a NoExecute taint, mirroring upstream
-        // SwapNodeControllerTaint (pkg/controller/util/node/controller_utils.go:197-198,
-        // `taintToAdd.TimeAdded = &now`). The kubelet's NoExecute sweep measures
-        // a timed toleration's grace period from this timestamp (#442): without
-        // it, a pod's tolerationSeconds:300 grace can never start counting.
-        let not_ready_taint = rusternetes_common::resources::node::Taint {
-            key: "node.kubernetes.io/not-ready".to_string(),
-            value: Some("".to_string()),
-            effect: "NoExecute".to_string(),
-            time_added: Some(chrono::Utc::now()),
-        };
-
-        let spec = updated_node
-            .spec
-            .get_or_insert(rusternetes_common::resources::NodeSpec {
-                pod_cidr: None,
-                pod_cidrs: None,
-                provider_id: None,
-                unschedulable: None,
-                taints: None,
-            });
-        let taints = spec.taints.get_or_insert_with(Vec::new);
-        if !taints.iter().any(|t| t.key == not_ready_taint.key) {
-            taints.push(not_ready_taint);
-            self.storage.update(&key, &updated_node).await?;
-            debug!("Added not-ready taint to node {}", node_name);
-        }
-        Ok(())
-    }
-
-    /// Remove not-ready taint from a node that became Ready.
-    async fn remove_not_ready_taint(&self, node: &Node) -> Result<()> {
-        let node_name = &node.metadata.name;
-        let key = build_key("nodes", None, node_name);
-        let mut updated_node: Node = self.storage.get(&key).await?;
-
-        if let Some(ref mut spec) = updated_node.spec {
-            if let Some(ref mut taints) = spec.taints {
-                let before = taints.len();
-                taints.retain(|t| t.key != "node.kubernetes.io/not-ready");
-                if taints.len() < before {
-                    if taints.is_empty() {
-                        spec.taints = None;
-                    }
-                    self.storage.update(&key, &updated_node).await?;
-                    debug!("Removed not-ready taint from node {}", node_name);
-                }
-            }
-        }
         Ok(())
     }
 
@@ -1320,6 +1833,333 @@ mod tests {
                 .unwrap()
                 .status,
             "False"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Zone-aware rate-limited NoExecute tainting (#2627). Ported from
+    // pkg/controller/nodelifecycle/node_lifecycle_controller_test.go:
+    // TestApplyNoExecuteTaints (:2289), TestApplyNoExecuteTaintsToNodesEnqueueTwice
+    // (:2712), TestSwapUnreachableNotReadyTaints (:2948). Upstream's
+    // newNodeLifecycleControllerFromClient passes `testRateLimiterQPS =
+    // 100000` for both limiters (:58); `fast_config` does the same.
+    // ------------------------------------------------------------------
+
+    const SECS_STALE: i64 = 3600;
+
+    fn fast_config() -> EvictionConfig {
+        EvictionConfig {
+            eviction_limiter_qps: 100_000.0,
+            secondary_eviction_limiter_qps: 100_000.0,
+            large_cluster_threshold: 50,
+            unhealthy_zone_threshold: 0.55,
+        }
+    }
+
+    /// A node in `zone1` with the given Ready status and heartbeat age.
+    fn znode(name: &str, zone: &str, status: &str, heartbeat_age_secs: i64) -> Node {
+        let hb = (Utc::now() - Duration::seconds(heartbeat_age_secs)).to_rfc3339();
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Node",
+            "metadata": {"name": name, "uid": format!("uid-{name}"), "labels": {
+                "topology.kubernetes.io/region": "region1",
+                "topology.kubernetes.io/zone": zone,
+                "failure-domain.beta.kubernetes.io/region": "region1",
+                "failure-domain.beta.kubernetes.io/zone": zone,
+            }},
+            "spec": {},
+            "status": {"conditions": [{
+                "type": "Ready", "status": status,
+                "lastHeartbeatTime": hb, "lastTransitionTime": hb,
+            }]}
+        }))
+        .unwrap()
+    }
+
+    async fn put(storage: &Arc<MemoryStorage>, c: &NodeController<MemoryStorage>, n: &Node) {
+        let key = build_key("nodes", None, &n.metadata.name);
+        if storage.get::<Node>(&key).await.is_ok() {
+            storage.update(&key, n).await.unwrap();
+        } else {
+            storage.create(&key, n).await.unwrap();
+        }
+        c.seed_first_seen_for_test(&n.metadata.name);
+    }
+
+    async fn taint_keys(storage: &Arc<MemoryStorage>, name: &str) -> Vec<(String, String)> {
+        let n: Node = storage.get(&build_key("nodes", None, name)).await.unwrap();
+        n.spec
+            .and_then(|s| s.taints)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| (t.key, t.effect))
+            .collect()
+    }
+
+    fn noexec(key: &str) -> (String, String) {
+        (key.to_string(), "NoExecute".to_string())
+    }
+
+    /// TestApplyNoExecuteTaints: Unknown -> unreachable, False -> not-ready,
+    /// Ready -> no taint, all NoExecute with `timeAdded` stamped.
+    #[tokio::test]
+    async fn apply_no_execute_taints() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::with_eviction_config(storage.clone(), fast_config());
+        put(
+            &storage,
+            &c,
+            &znode("node0", "zone1", "Unknown", SECS_STALE),
+        )
+        .await;
+        // "we need second healthy node in tests" (all-NotReady stops evictions).
+        put(&storage, &c, &znode("node1", "zone1", "True", 0)).await;
+        put(&storage, &c, &znode("node2", "zone1", "False", SECS_STALE)).await;
+
+        c.monitor_node_health().await.unwrap();
+        c.do_no_execute_tainting_pass().await;
+
+        assert_eq!(
+            taint_keys(&storage, "node0").await,
+            [noexec("node.kubernetes.io/unreachable")]
+        );
+        assert!(taint_keys(&storage, "node1").await.is_empty());
+        assert_eq!(
+            taint_keys(&storage, "node2").await,
+            [noexec("node.kubernetes.io/not-ready")]
+        );
+        let n0: Node = storage
+            .get(&build_key("nodes", None, "node0"))
+            .await
+            .unwrap();
+        assert!(n0.spec.unwrap().taints.unwrap()[0].time_added.is_some());
+    }
+
+    /// TestApplyNoExecuteTaintsToNodesEnqueueTwice: a node queued twice, then
+    /// healthy again, must not wedge the queue ("the taint job never stuck").
+    #[tokio::test]
+    async fn apply_no_execute_taints_to_nodes_enqueue_twice() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::with_eviction_config(storage.clone(), fast_config());
+        put(
+            &storage,
+            &c,
+            &znode("node0", "zone1", "Unknown", SECS_STALE),
+        )
+        .await;
+        put(&storage, &c, &znode("node1", "zone1", "True", 0)).await;
+
+        // 1. monitor node health twice, add untainted node once
+        c.monitor_node_health().await.unwrap();
+        c.monitor_node_health().await.unwrap();
+
+        // 2. mark node0 healthy
+        put(&storage, &c, &znode("node0", "zone1", "True", 0)).await;
+        // add other notReady nodes
+        put(
+            &storage,
+            &c,
+            &znode("node3", "zone1", "Unknown", SECS_STALE),
+        )
+        .await;
+        put(&storage, &c, &znode("node4", "zone1", "True", 0)).await;
+        put(&storage, &c, &znode("node5", "zone1", "False", SECS_STALE)).await;
+
+        // 3. monitor again
+        c.monitor_node_health().await.unwrap();
+        // 4. do NoExecute taint pass
+        c.do_no_execute_tainting_pass().await;
+
+        assert!(taint_keys(&storage, "node0").await.is_empty());
+        assert_eq!(
+            taint_keys(&storage, "node3").await,
+            [noexec("node.kubernetes.io/unreachable")]
+        );
+        assert_eq!(
+            taint_keys(&storage, "node5").await,
+            [noexec("node.kubernetes.io/not-ready")]
+        );
+    }
+
+    /// TestSwapUnreachableNotReadyTaints: Unknown -> unreachable; when the
+    /// condition turns False the unreachable taint is swapped for not-ready
+    /// "straight away" (processTaintBaseEviction :783-786).
+    #[tokio::test]
+    async fn swap_unreachable_not_ready_taints() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::with_eviction_config(storage.clone(), fast_config());
+        put(
+            &storage,
+            &c,
+            &znode("node0", "zone1", "Unknown", SECS_STALE),
+        )
+        .await;
+        put(&storage, &c, &znode("node1", "zone1", "True", 0)).await;
+
+        c.monitor_node_health().await.unwrap();
+        c.do_no_execute_tainting_pass().await;
+        assert_eq!(
+            taint_keys(&storage, "node0").await,
+            [noexec("node.kubernetes.io/unreachable")]
+        );
+
+        // node0 now reports NotReady (False); keep its taint, swap the status.
+        let mut n0: Node = storage
+            .get(&build_key("nodes", None, "node0"))
+            .await
+            .unwrap();
+        n0.status.as_mut().unwrap().conditions.as_mut().unwrap()[0].status = "False".into();
+        storage
+            .update(&build_key("nodes", None, "node0"), &n0)
+            .await
+            .unwrap();
+
+        c.monitor_node_health().await.unwrap();
+        c.do_no_execute_tainting_pass().await;
+        assert_eq!(
+            taint_keys(&storage, "node0").await,
+            [noexec("node.kubernetes.io/not-ready")]
+        );
+    }
+
+    async fn zone_qps(c: &NodeController<MemoryStorage>, zone: &str) -> f32 {
+        let q = c
+            .evictor
+            .lock()
+            .await
+            .zone_no_execute_tainter
+            .get(&format!("region1:\0:{zone}"))
+            .cloned()
+            .expect("zone queue");
+        q.limiter_qps().await
+    }
+
+    /// handleDisruption (:996-1085): PartialDisruption in a large cluster uses
+    /// the secondary rate; recovery returns to the primary rate.
+    #[tokio::test]
+    async fn partial_disruption_in_large_cluster_uses_secondary_qps_then_recovers() {
+        let storage = Arc::new(MemoryStorage::new());
+        let cfg = EvictionConfig {
+            large_cluster_threshold: 3,
+            ..EvictionConfig::default()
+        };
+        let c = NodeController::with_eviction_config(storage.clone(), cfg);
+        put(&storage, &c, &znode("ok", "zone1", "True", 0)).await;
+        for n in ["b1", "b2", "b3", "b4"] {
+            put(&storage, &c, &znode(n, "zone1", "False", SECS_STALE)).await;
+        }
+        c.monitor_node_health().await.unwrap();
+        // 5 nodes > threshold 3, 4/5 unhealthy: ReducedQPSFunc -> secondary.
+        assert_eq!(zone_qps(&c, "zone1").await, 0.01);
+
+        for n in ["b1", "b2", "b3", "b4"] {
+            put(&storage, &c, &znode(n, "zone1", "True", 0)).await;
+        }
+        c.monitor_node_health().await.unwrap();
+        assert_eq!(zone_qps(&c, "zone1").await, 0.1);
+    }
+
+    /// Entering master disruption removes taints and stops evictions
+    /// (:1039-1056); exiting it restores per-zone limiters and restarts the
+    /// nodes' grace clocks (:1058-1074).
+    #[tokio::test]
+    async fn master_disruption_clears_taints_and_stops_then_resumes() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::with_eviction_config(
+            storage.clone(),
+            EvictionConfig {
+                eviction_limiter_qps: 100_000.0,
+                ..EvictionConfig::default()
+            },
+        );
+        put(&storage, &c, &znode("a", "zone1", "False", SECS_STALE)).await;
+        put(&storage, &c, &znode("b", "zone1", "True", 0)).await;
+        c.monitor_node_health().await.unwrap();
+        c.do_no_execute_tainting_pass().await;
+        assert_eq!(
+            taint_keys(&storage, "a").await,
+            [noexec("node.kubernetes.io/not-ready")]
+        );
+
+        // b goes stale too: every node NotReady -> master disruption.
+        put(&storage, &c, &znode("b", "zone1", "True", SECS_STALE)).await;
+        c.monitor_node_health().await.unwrap();
+        assert!(
+            taint_keys(&storage, "a").await.is_empty(),
+            "entering master disruption removes the taints"
+        );
+        assert_eq!(
+            c.evictor
+                .lock()
+                .await
+                .zone_states
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            [ZoneState::FullDisruption]
+        );
+        c.do_no_execute_tainting_pass().await;
+        assert!(taint_keys(&storage, "a").await.is_empty());
+        assert_ne!(zone_qps(&c, "zone1").await, 100_000.0);
+
+        // b recovers: exiting full disruption resets the limiter for the zone.
+        put(&storage, &c, &znode("b", "zone1", "True", 0)).await;
+        c.monitor_node_health().await.unwrap();
+        assert_eq!(
+            c.evictor
+                .lock()
+                .await
+                .zone_states
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            [ZoneState::Normal]
+        );
+        assert_eq!(zone_qps(&c, "zone1").await, 100_000.0);
+    }
+
+    /// A zone in FullDisruption while another zone still responds keeps the
+    /// normal rate (`enterFullDisruptionFunc = HealthyQPSFunc`, :358); the
+    /// healthy zone is unaffected.
+    #[tokio::test]
+    async fn single_zone_full_disruption_keeps_normal_rate() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::new(storage.clone());
+        put(&storage, &c, &znode("z1a", "z1", "False", SECS_STALE)).await;
+        put(&storage, &c, &znode("z1b", "z1", "False", SECS_STALE)).await;
+        put(&storage, &c, &znode("z2a", "z2", "True", 0)).await;
+        c.monitor_node_health().await.unwrap();
+        assert_eq!(zone_qps(&c, "z1").await, 0.1);
+        assert_eq!(zone_qps(&c, "z2").await, 0.1);
+        let states = c.evictor.lock().await.zone_states.clone();
+        assert_eq!(states["region1:\0:z1"], ZoneState::FullDisruption);
+        assert_eq!(states["region1:\0:z2"], ZoneState::Normal);
+    }
+
+    /// Nodes labelled `node.kubernetes.io/exclude-disruption` are excluded
+    /// from disruption checks (isNodeExcludedFromDisruptionChecks, :817-825).
+    #[tokio::test]
+    async fn excluded_nodes_do_not_count_towards_disruption() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::with_eviction_config(storage.clone(), fast_config());
+        let mut ex = znode("ex", "zone1", "False", SECS_STALE);
+        ex.metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert(LABEL_NODE_DISRUPTION_EXCLUSION.to_string(), String::new());
+        put(&storage, &c, &ex).await;
+        put(&storage, &c, &znode("ok", "zone1", "True", 0)).await;
+        c.monitor_node_health().await.unwrap();
+        assert_eq!(
+            c.evictor
+                .lock()
+                .await
+                .zone_states
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            [ZoneState::Normal]
         );
     }
 }
