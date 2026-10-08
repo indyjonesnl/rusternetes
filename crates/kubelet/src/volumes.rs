@@ -244,6 +244,62 @@ impl VolumeManager {
         out
     }
 
+    /// Rebuild the mount-attribute record of every pod volume that has none
+    /// (after a kubelet restart, or when `start_container` runs without
+    /// `create_pod_volumes` in this process).
+    ///
+    /// Port of the Mounter half of `reconstructVolume`
+    /// (`pkg/kubelet/volumemanager/reconciler/reconstruct_common.go:352`,
+    /// `volumeMounter, err = plugin.NewMounter(volumeSpec, pod)`): the mounter
+    /// is built from the spec WITHOUT `SetUp`, and `makeMounts` then reads its
+    /// `GetAttributes()` (`kubelet_pods.go:296`). An existing record is kept
+    /// (upstream's `MarkVolumeAsMounted` refreshes the mounter, but never
+    /// resets `SELinuxLabeled`). As upstream's `reconstructVolume` returns the
+    /// error and the volume is simply not reconstructed, a volume whose
+    /// mounter cannot be built is left without a record (logged).
+    pub async fn reconstruct_mount_attributes(&self, pod: &Pod) {
+        let Some(spec) = pod.spec.as_ref() else {
+            return;
+        };
+        for volume in spec.volumes.iter().flatten() {
+            let key = (pod.metadata.uid.clone(), volume.name.clone());
+            if self.mounted.lock().unwrap().contains_key(&key) {
+                continue;
+            }
+            let pv = match self.resolve_persistent_volume(pod, volume).await {
+                Ok(pv) => pv,
+                Err(e) => {
+                    warn!("reconstruct mount attributes: volume {}: {e}", volume.name);
+                    continue;
+                }
+            };
+            let vspec = crate::volume_plugins::Spec {
+                volume,
+                persistent_volume: pv.as_ref(),
+                read_only: pv.is_some() && pvc_read_only(volume),
+            };
+            let Ok(plugin) = self.plugin_mgr.find_plugin_by_spec(&vspec) else {
+                continue;
+            };
+            match plugin.new_mounter(&vspec, pod).await {
+                Ok(mounter) => {
+                    self.mounted
+                        .lock()
+                        .unwrap()
+                        .entry(key)
+                        .or_insert_with(|| MountedVolume {
+                            attributes: mounter.get_attributes(),
+                            selinux_labeled: false,
+                        });
+                }
+                Err(e) => warn!(
+                    "reconstructVolume.NewMounter failed for volume {} pod {}: {e}",
+                    volume.name, pod.metadata.name
+                ),
+            }
+        }
+    }
+
     /// Whether a pod still has volumes mounted, in which case its directory
     /// must not be touched.
     ///
@@ -2994,6 +3050,83 @@ mod pvc_resolution_tests {
         assert!(!attrs["inline"].read_only);
         // hostPath is not Managed: never relabelled (host_path.go:180).
         assert!(attrs.values().all(|a| !a.selinux_relabel));
+    }
+
+    /// #2801: after a kubelet restart nothing ran `create_volume`, so the
+    /// attribute record is empty. Upstream rebuilds a Mounter per volume
+    /// (`reconstructVolume`, `reconciler/reconstruct_common.go:352`
+    /// `plugin.NewMounter(volumeSpec, pod)`) and `makeMounts` reads
+    /// `GetAttributes()` from it.
+    #[tokio::test]
+    async fn mount_attributes_are_reconstructed_without_create_pod_volumes() {
+        let storage = Arc::new(StorageBackend::new_memory());
+        let pv: PersistentVolume = serde_json::from_value(json!({
+            "metadata": {"name": "pv-1"},
+            "spec": {"capacity": {"storage": "1Gi"}, "accessModes": ["ReadWriteOnce"],
+                     "hostPath": {"path": "/mnt/data"}}
+        }))
+        .unwrap();
+        storage
+            .create(&build_key("persistentvolumes", None, "pv-1"), &pv)
+            .await
+            .unwrap();
+        let pvc: PersistentVolumeClaim = serde_json::from_value(json!({
+            "metadata": {"name": "claim-1", "namespace": "default"},
+            "spec": {"accessModes": ["ReadWriteOnce"], "volumeName": "pv-1",
+                     "resources": {"requests": {"storage": "1Gi"}}}
+        }))
+        .unwrap();
+        storage
+            .create(
+                &build_key("persistentvolumeclaims", Some("default"), "claim-1"),
+                &pvc,
+            )
+            .await
+            .unwrap();
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-1"},
+            "spec": {
+                "volumes": [
+                    {"name": "ro", "persistentVolumeClaim": {"claimName": "claim-1", "readOnly": true}},
+                    {"name": "rw", "persistentVolumeClaim": {"claimName": "claim-1"}}
+                ],
+                "containers": [{"name": "c", "image": "i", "volumeMounts": [
+                    {"name": "ro", "mountPath": "/ro"}, {"name": "rw", "mountPath": "/rw"}]}]
+            }
+        }))
+        .unwrap();
+        // A fresh manager: the restarted kubelet. No create_pod_volumes.
+        let manager = vm(Some(storage));
+        manager.reconstruct_mount_attributes(&pod).await;
+        let attrs = manager.mount_attributes(&pod, &pod.spec.as_ref().unwrap().containers[0]);
+        assert!(attrs["ro"].read_only, "ReadOnly forcing survives a restart");
+        assert!(!attrs["rw"].read_only);
+    }
+
+    /// A re-reconstruction must not clobber a live record (and its
+    /// `SELinuxLabeled` bit) written by `create_volume`.
+    #[tokio::test]
+    async fn reconstruct_keeps_an_existing_record() {
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-2"},
+            "spec": {"volumes": [{"name": "e", "emptyDir": {}}],
+                "containers": [{"name": "c", "image": "i",
+                    "volumeMounts": [{"name": "e", "mountPath": "/e"}]}]}
+        }))
+        .unwrap();
+        let manager = vm(None);
+        manager
+            .mounted
+            .lock()
+            .unwrap()
+            .entry(("uid-2".into(), "e".into()))
+            .or_default()
+            .selinux_labeled = true;
+        manager.reconstruct_mount_attributes(&pod).await;
+        assert!(
+            manager.mounted.lock().unwrap()[&("uid-2".to_string(), "e".to_string())]
+                .selinux_labeled
+        );
     }
 
     /// `createVolumeSpec` hands `pvcSource.ReadOnly` to

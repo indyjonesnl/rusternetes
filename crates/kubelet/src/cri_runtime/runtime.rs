@@ -728,7 +728,12 @@ impl CriContainerRuntime {
         // into the container's `waiting.reason` — the field the upstream
         // conformance specs assert on.
         let mount_attrs = match self.volumes.as_ref() {
-            Some(vm) => vm.mount_attributes(pod, container),
+            Some(vm) => {
+                // #2801: rebuild any missing record (restart / no
+                // create_pod_volumes in this process) first.
+                vm.reconstruct_mount_attributes(pod).await;
+                vm.mount_attributes(pod, container)
+            }
             None => std::collections::HashMap::new(),
         };
         let mut cfg = translate::container_config_with_mounts(
