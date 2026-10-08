@@ -2,15 +2,10 @@ use crate::controllers::worker_pool::spawn_workers;
 use anyhow::{Context, Result};
 use rusternetes_common::quantity::Quantity;
 use rusternetes_common::resources::service_account::ObjectReference;
-use rusternetes_common::resources::volume::{
-    PersistentVolumeClaimPhase, PersistentVolumeClaimResizeStatus,
-};
+use rusternetes_common::resources::volume::PersistentVolumeClaimPhase;
 use rusternetes_common::resources::{EventSource, EventType};
-use rusternetes_common::resources::{
-    PersistentVolume, PersistentVolumeClaim, PersistentVolumeClaimStatus, StorageClass,
-};
+use rusternetes_common::resources::{PersistentVolume, PersistentVolumeClaim};
 use rusternetes_storage::{build_key, extract_key, EventRecorder, Storage, WorkQueue};
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
@@ -201,46 +196,17 @@ impl<S: Storage + 'static> VolumeExpansionController<S> {
             return Ok(());
         }
 
-        // A CSI volume is expanded by the external-resizer sidecar calling
-        // ControllerExpandVolume (and the kubelet NodeExpandVolume), never by this
-        // controller: `FindExpandablePluginBySpec` finds no plugin for it and the
-        // controller only records ExternalExpanding and returns nil (:262-273; the
-        // "for csi plugin without migration path" case of TestSyncHandler,
-        // expand_controller_test.go:84-91). Writing PV/PVC capacity here would
-        // bypass the CSI contract.
-        if pv.spec.csi.is_some() {
-            self.record_external_expanding(pvc).await;
-            return Ok(());
-        }
-
-        info!("PVC {}/{} needs expansion", namespace, pvc_name);
-
-        // Get the storage class
-        let storage_class_name = pvc
-            .spec
-            .storage_class_name
-            .as_ref()
-            .context("PVC has no storage class name")?;
-
-        let sc_key = build_key("storageclasses", None, storage_class_name);
-        let storage_class: StorageClass = self
-            .storage
-            .get(&sc_key)
-            .await
-            .with_context(|| format!("StorageClass {} not found", storage_class_name))?;
-
-        // Check if volume expansion is allowed
-        if !storage_class.allow_volume_expansion.unwrap_or(false) {
-            warn!(
-                "Volume expansion not allowed for StorageClass {}. PVC {}/{} cannot be expanded.",
-                storage_class_name, namespace, pvc_name
-            );
-            return Ok(());
-        }
-
-        // Perform the expansion
-        self.expand_volume(pvc, &storage_class).await?;
-
+        // `FindExpandablePluginBySpec` (:271-283) finds an expandable plugin only for
+        // in-tree volume types that implement `ExpandableVolumePlugin`; rusternetes
+        // has none (hostPath/nfs/iscsi/local never did upstream either), and a CSI
+        // volume is expanded by the external-resizer sidecar calling
+        // ControllerExpandVolume (and the kubelet NodeExpandVolume). So every PV
+        // lands on the `volumePlugin == nil` branch: record ExternalExpanding and
+        // return nil without requeueing (the "for csi plugin without migration
+        // path" case of TestSyncHandler, expand_controller_test.go:84-91). Writing
+        // PV/PVC capacity here would bypass the CSI contract. The StorageClass is
+        // never read: allowVolumeExpansion is enforced by PVC admission.
+        self.record_external_expanding(pvc).await;
         Ok(())
     }
 
@@ -305,150 +271,6 @@ impl<S: Storage + 'static> VolumeExpansionController<S> {
             .is_some_and(|a| a.contains_key(ANN_PRE_RESIZE_CAPACITY));
         Ok(request.cmp_value(&current) == std::cmp::Ordering::Greater || has_pre_resize)
     }
-
-    /// Expand a PVC to the requested size
-    async fn expand_volume(
-        &self,
-        pvc: &PersistentVolumeClaim,
-        storage_class: &StorageClass,
-    ) -> Result<()> {
-        let pvc_name = &pvc.metadata.name;
-        let namespace = pvc.metadata.namespace.as_deref().unwrap_or("default");
-
-        let requested_storage = pvc
-            .spec
-            .resources
-            .requests
-            .as_ref()
-            .and_then(|r| r.get("storage"))
-            .context("PVC has no storage request")?;
-
-        info!(
-            "Expanding PVC {}/{} to {}",
-            namespace, pvc_name, requested_storage
-        );
-
-        // Get the bound PV
-        let pv_name = pvc
-            .spec
-            .volume_name
-            .as_ref()
-            .context("PVC has no volume name")?;
-
-        let pv_key = build_key("persistentvolumes", None, pv_name);
-        let mut pv: PersistentVolume = self
-            .storage
-            .get(&pv_key)
-            .await
-            .with_context(|| format!("PV {} not found", pv_name))?;
-
-        // Update PVC status to indicate resize is in progress
-        let mut updated_pvc = pvc.clone();
-        let mut status = updated_pvc
-            .status
-            .clone()
-            .unwrap_or(PersistentVolumeClaimStatus {
-                phase: PersistentVolumeClaimPhase::Bound,
-                access_modes: None,
-                capacity: None,
-                conditions: None,
-                allocated_resources: None,
-                allocated_resource_statuses: None,
-                resize_status: None,
-                current_volume_attributes_class_name: None,
-                modify_volume_status: None,
-            });
-
-        // Set allocated resources to the new requested size
-        let mut allocated = HashMap::new();
-        allocated.insert("storage".to_string(), requested_storage.clone());
-        status.allocated_resources = Some(allocated);
-        status.resize_status = Some(PersistentVolumeClaimResizeStatus::ControllerResizeInProgress);
-
-        updated_pvc.status = Some(status.clone());
-
-        let pvc_key = build_key("persistentvolumeclaims", Some(namespace), pvc_name);
-        // Status subresource write: a full-object PUT strips `.status` (#1723).
-        self.storage.update_status(&pvc_key, &updated_pvc).await?;
-
-        info!(
-            "Updated PVC {}/{} status to ControllerResizeInProgress",
-            namespace, pvc_name
-        );
-
-        // Perform the actual expansion on the PV
-        // For hostpath volumes, this is immediate
-        // For CSI volumes, this would call the CSI driver
-        match self
-            .resize_pv(&mut pv, requested_storage, storage_class)
-            .await
-        {
-            Ok(_) => {
-                info!(
-                    "Successfully resized PV {} to {}",
-                    pv_name, requested_storage
-                );
-
-                // Update PVC status to indicate resize is complete
-                status.capacity = Some({
-                    let mut capacity = HashMap::new();
-                    capacity.insert("storage".to_string(), requested_storage.clone());
-                    capacity
-                });
-                status.resize_status = None; // Clear resize status when complete
-                updated_pvc.status = Some(status);
-
-                // Status subresource write: a full-object PUT strips `.status` (#1723).
-                self.storage.update_status(&pvc_key, &updated_pvc).await?;
-
-                info!("Expansion completed for PVC {}/{}", namespace, pvc_name);
-                Ok(())
-            }
-            Err(e) => {
-                error!("Failed to resize PV {}: {}", pv_name, e);
-
-                // Update PVC status to indicate resize failed
-                status.resize_status =
-                    Some(PersistentVolumeClaimResizeStatus::ControllerResizeFailed);
-                updated_pvc.status = Some(status);
-
-                // Status subresource write: a full-object PUT strips `.status` (#1723).
-                self.storage.update_status(&pvc_key, &updated_pvc).await?;
-
-                Err(e)
-            }
-        }
-    }
-
-    /// Resize the underlying PersistentVolume
-    async fn resize_pv(
-        &self,
-        pv: &mut PersistentVolume,
-        new_size: &str,
-        _storage_class: &StorageClass,
-    ) -> Result<()> {
-        let pv_name = &pv.metadata.name;
-
-        info!("Resizing PV {} to {}", pv_name, new_size);
-
-        // Update PV capacity
-        pv.spec
-            .capacity
-            .insert("storage".to_string(), new_size.to_string());
-
-        // In a real implementation, this would:
-        // 1. For CSI volumes: Call CSI ControllerExpandVolume
-        // 2. For hostpath: Adjust quota or filesystem size
-        // 3. For cloud volumes: Resize the underlying disk
-
-        // For now, we'll just update the capacity in etcd
-        let pv_key = build_key("persistentvolumes", None, pv_name);
-        self.storage.update(&pv_key, pv).await?;
-
-        info!("Updated PV {} capacity to {}", pv_name, new_size);
-
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -456,6 +278,7 @@ mod tests {
     use super::*;
     use rusternetes_common::resources::Event;
     use rusternetes_storage::memory::MemoryStorage;
+    use std::collections::HashMap;
 
     // Port of `TestSyncHandler` (pkg/controller/volume/expand/expand_controller_test.go:48-157)
     // and its fixtures `getFakePersistentVolume` / `getFakePersistentVolumeClaim` (:175-).
