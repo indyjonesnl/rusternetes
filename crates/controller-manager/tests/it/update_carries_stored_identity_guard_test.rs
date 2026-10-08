@@ -37,9 +37,16 @@ const REVIEWED: &[(&str, &str, &str)] = &[
         "updates `existing.clone()` (upstream's DeepCopy, endpoints_controller.go:469); \
          `ObjectMeta::new` is only the create-path default",
     ),
+    (
+        "statefulset.rs",
+        "reconcile",
+        "`Uuid::new_v4` is the UID of a ControllerRevision it CREATES; its one write \
+         is `update_status_cas` of the StatefulSet this sync was handed",
+    ),
 ];
 
 const FRESH: &[&str] = &[
+    "Uuid::new_v4(",
     "ObjectMeta::new(",
     "ObjectMeta {",
     "EndpointSlice::new(",
@@ -123,6 +130,107 @@ fn a_controller_that_builds_fresh_and_updates_adopts_the_stored_identity() {
         "these controller functions build an object with a fresh identity and \
          write with update*, but never adopt the stored object's identity \
          (uid, creationTimestamp, finalizers, resourceVersion). The generic \
+         Store turns a non-empty metadata.uid into a UID precondition \
+         (rest/update.go:188-203), so every update 409s. Update a clone of the \
+         object you read, as upstream's DeepCopy does: {offenders:#?}"
+    );
+}
+
+/// Every non-test `.rs` file under `dir`, recursively, sorted.
+fn rs_files(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).expect("read_dir").flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(rs_files(&path));
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let is_test_file = name == "tests.rs" || name.ends_with("_tests.rs");
+        if name.ends_with(".rs") && !is_test_file {
+            out.push(path);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// `(path under crates/, fn, reason)` for functions outside `src/controllers/`
+/// that match the rule but were read and are safe.
+const REVIEWED_ELSEWHERE: &[(&str, &str, &str)] = &[
+    (
+        "api-server/src/bootstrap.rs",
+        "bootstrap_default_rbac",
+        "the api-server holds the StorageBackend directly: no Store, no UID precondition",
+    ),
+    (
+        "api-server/src/bootstrap.rs",
+        "reconcile_endpoints",
+        "direct StorageBackend write: no Store, no UID precondition",
+    ),
+    (
+        "api-server/src/bootstrap.rs",
+        "reconcile_endpointslice",
+        "direct StorageBackend write: no Store, no UID precondition",
+    ),
+    (
+        "api-server/src/bootstrap.rs",
+        "sync",
+        "direct StorageBackend write: no Store, no UID precondition",
+    ),
+    (
+        "api-server/src/bootstrap.rs",
+        "sync_cluster_authentication_trust",
+        "direct StorageBackend write of a re-read ConfigMap; no Store in front",
+    ),
+];
+
+/// #2719 audited the writers outside controller-manager. Anything that PUTs
+/// through `ApiStorage` (kubelet, scheduler, the shared event recorder) meets
+/// the same Store precondition as a controller does, so the rule applies there
+/// too. The api-server's own bootstrap holds the backend directly.
+#[test]
+fn other_components_that_build_fresh_and_update_adopt_the_stored_identity() {
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut files = rs_files(&crates.join("kubelet/src"));
+    files.extend(rs_files(&crates.join("scheduler/src")));
+    files.extend(rs_files(&crates.join("kube-proxy/src")));
+    files.extend(rs_files(&crates.join("dns/src")));
+    files.push(crates.join("storage/src/event_recorder.rs"));
+    for f in [
+        "bootstrap.rs",
+        "apiserver_identity.rs",
+        "legacy_token_tracking.rs",
+    ] {
+        files.push(crates.join("api-server/src").join(f));
+    }
+
+    let mut offenders = Vec::new();
+    let mut scanned = 0;
+    for path in &files {
+        let rel = path
+            .strip_prefix(&crates)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let src = std::fs::read_to_string(path).unwrap();
+        for (name, body) in fn_bodies(&src) {
+            scanned += 1;
+            let fresh = FRESH.iter().any(|p| body.contains(p));
+            let write = WRITE.iter().any(|p| body.contains(p));
+            let reviewed = REVIEWED_ELSEWHERE
+                .iter()
+                .any(|(f, n, _)| *f == rel && *n == name);
+            if fresh && write && !body.contains("adopt_existing_identity") && !reviewed {
+                offenders.push(format!("{rel}::{name}"));
+            }
+        }
+    }
+    assert!(scanned > 500, "the scan found only {scanned} functions");
+    assert!(
+        offenders.is_empty(),
+        "these functions build an object with a fresh identity and write with \
+         update*, but never adopt the stored object's identity. The generic \
          Store turns a non-empty metadata.uid into a UID precondition \
          (rest/update.go:188-203), so every update 409s. Update a clone of the \
          object you read, as upstream's DeepCopy does: {offenders:#?}"
