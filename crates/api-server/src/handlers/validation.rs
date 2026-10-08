@@ -585,6 +585,63 @@ impl FieldValidationMode {
     }
 }
 
+/// The strict-decoding errors of a PATCH document itself, which upstream
+/// collects before applying it and later merges ahead of the patched object's
+/// own errors.
+///
+/// - `application/json-patch+json` (`jsonPatcher.applyJSPatch`,
+///   staging/src/k8s.io/apiserver/pkg/endpoints/handlers/patch.go:389-401):
+///   `kjson.UnmarshalStrict(patchBytes, &[]jsonPatchOp)` reports an unknown
+///   field of an operation (`op`, `path`, `from`, `value`) and any duplicate
+///   key, each prefixed `json patch `.
+/// - merge and strategic merge patches (patch.go:420-427, :559-565):
+///   `kjson.UnmarshalStrict(patchBytes, &map[string]interface{})` reports
+///   duplicate keys.
+///
+/// Each entry reads like `duplicate field "spec.paused"`. Callers apply this
+/// only for `fieldValidation` Strict/Warn.
+pub fn patch_document_strict_errors(json_patch: bool, body: &[u8]) -> Vec<String> {
+    let Ok(text) = std::str::from_utf8(body) else {
+        return Vec::new();
+    };
+    if !json_patch {
+        return find_all_duplicate_json_keys(text)
+            .into_iter()
+            .map(|f| format!("duplicate field \"{f}\""))
+            .collect();
+    }
+    let trimmed = text.trim();
+    if !trimmed.starts_with('[') {
+        return Vec::new();
+    }
+    // (operation index, unknown-before-duplicate rank, message), so the
+    // result reads in document order as sigs.k8s.io/json reports it.
+    let mut found: Vec<(usize, u8, String)> = Vec::new();
+    if let Ok(serde_json::Value::Array(ops)) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        for (i, op) in ops.iter().enumerate() {
+            if let Some(obj) = op.as_object() {
+                for k in obj.keys() {
+                    if !matches!(k.as_str(), "op" | "path" | "from" | "value") {
+                        found.push((i, 0, format!("json patch unknown field \"[{i}].{k}\"")));
+                    }
+                }
+            }
+        }
+    }
+    let mut dups = Vec::new();
+    collect_value_duplicates(trimmed.as_bytes(), 0, "", &mut dups);
+    for d in dups {
+        let idx = d
+            .strip_prefix('[')
+            .and_then(|r| r.split(']').next())
+            .and_then(|n| n.parse::<usize>().ok())
+            .unwrap_or(usize::MAX);
+        found.push((idx, 1, format!("json patch duplicate field \"{d}\"")));
+    }
+    found.sort_by_key(|(i, rank, _)| (*i, *rank));
+    found.into_iter().map(|(_, _, m)| m).collect()
+}
+
 /// Build the canonical `strict decoding error: ...` message from the collected
 /// unknown / duplicate field paths.
 fn build_strict_decoding_message(unknown: &[String], duplicates: &[String]) -> String {
