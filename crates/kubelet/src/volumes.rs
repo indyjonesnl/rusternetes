@@ -244,6 +244,10 @@ impl VolumeManager {
         out
     }
 
+    /// Rebuild the mount-attribute record of every pod volume that has none.
+    /// STUB (red-test commit): filled in by the next commit.
+    pub async fn reconstruct_mount_attributes(&self, _pod: &Pod) {}
+
     /// Whether a pod still has volumes mounted, in which case its directory
     /// must not be touched.
     ///
@@ -2994,6 +2998,83 @@ mod pvc_resolution_tests {
         assert!(!attrs["inline"].read_only);
         // hostPath is not Managed: never relabelled (host_path.go:180).
         assert!(attrs.values().all(|a| !a.selinux_relabel));
+    }
+
+    /// #2801: after a kubelet restart nothing ran `create_volume`, so the
+    /// attribute record is empty. Upstream rebuilds a Mounter per volume
+    /// (`reconstructVolume`, `reconciler/reconstruct_common.go:352`
+    /// `plugin.NewMounter(volumeSpec, pod)`) and `makeMounts` reads
+    /// `GetAttributes()` from it.
+    #[tokio::test]
+    async fn mount_attributes_are_reconstructed_without_create_pod_volumes() {
+        let storage = Arc::new(StorageBackend::new_memory());
+        let pv: PersistentVolume = serde_json::from_value(json!({
+            "metadata": {"name": "pv-1"},
+            "spec": {"capacity": {"storage": "1Gi"}, "accessModes": ["ReadWriteOnce"],
+                     "hostPath": {"path": "/mnt/data"}}
+        }))
+        .unwrap();
+        storage
+            .create(&build_key("persistentvolumes", None, "pv-1"), &pv)
+            .await
+            .unwrap();
+        let pvc: PersistentVolumeClaim = serde_json::from_value(json!({
+            "metadata": {"name": "claim-1", "namespace": "default"},
+            "spec": {"accessModes": ["ReadWriteOnce"], "volumeName": "pv-1",
+                     "resources": {"requests": {"storage": "1Gi"}}}
+        }))
+        .unwrap();
+        storage
+            .create(
+                &build_key("persistentvolumeclaims", Some("default"), "claim-1"),
+                &pvc,
+            )
+            .await
+            .unwrap();
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-1"},
+            "spec": {
+                "volumes": [
+                    {"name": "ro", "persistentVolumeClaim": {"claimName": "claim-1", "readOnly": true}},
+                    {"name": "rw", "persistentVolumeClaim": {"claimName": "claim-1"}}
+                ],
+                "containers": [{"name": "c", "image": "i", "volumeMounts": [
+                    {"name": "ro", "mountPath": "/ro"}, {"name": "rw", "mountPath": "/rw"}]}]
+            }
+        }))
+        .unwrap();
+        // A fresh manager: the restarted kubelet. No create_pod_volumes.
+        let manager = vm(Some(storage));
+        manager.reconstruct_mount_attributes(&pod).await;
+        let attrs = manager.mount_attributes(&pod, &pod.spec.as_ref().unwrap().containers[0]);
+        assert!(attrs["ro"].read_only, "ReadOnly forcing survives a restart");
+        assert!(!attrs["rw"].read_only);
+    }
+
+    /// A re-reconstruction must not clobber a live record (and its
+    /// `SELinuxLabeled` bit) written by `create_volume`.
+    #[tokio::test]
+    async fn reconstruct_keeps_an_existing_record() {
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-2"},
+            "spec": {"volumes": [{"name": "e", "emptyDir": {}}],
+                "containers": [{"name": "c", "image": "i",
+                    "volumeMounts": [{"name": "e", "mountPath": "/e"}]}]}
+        }))
+        .unwrap();
+        let manager = vm(None);
+        manager
+            .mounted
+            .lock()
+            .unwrap()
+            .entry(("uid-2".into(), "e".into()))
+            .or_default()
+            .selinux_labeled = true;
+        manager.reconstruct_mount_attributes(&pod).await;
+        assert!(
+            manager.mounted.lock().unwrap()[&("uid-2".to_string(), "e".to_string())]
+                .selinux_labeled
+        );
     }
 
     /// `createVolumeSpec` hands `pvcSource.ReadOnly` to
