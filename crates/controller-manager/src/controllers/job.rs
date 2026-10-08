@@ -6731,4 +6731,170 @@ mod tests {
         names.sort();
         assert_eq!(names, vec!["a7", "b0"]);
     }
+
+    // --- `enactJobFinished` delay on EVERY finish path (#2651) -------------
+    //
+    // job_controller.go:1520-1524 holds the terminal condition back while
+    // pods terminate, whichever path produced `finishedCondition`; and
+    // :1003-1007 clears `finishedCondition` when `deleted != active ||
+    // !satisfiedExpectations`.
+
+    fn conds_of(job: &Job) -> Vec<String> {
+        job.status
+            .as_ref()
+            .and_then(|s| s.conditions.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| c.status == "True")
+            .map(|c| c.condition_type)
+            .collect()
+    }
+
+    /// A pod that is Running but already marked for deletion, as the kubelet
+    /// leaves it while the container stops.
+    fn terminating_pod(name: &str, job_name: &str) -> Pod {
+        let mut pod = make_pod(name, "default", Phase::Running, job_name, "job-uid-1");
+        pod.metadata.deletion_timestamp = Some(chrono::Utc::now());
+        pod
+    }
+
+    #[tokio::test]
+    async fn complete_is_delayed_while_pods_terminate() {
+        let storage = Arc::new(MemoryStorage::new());
+        let job = make_job("cdel", "default", 1, 1);
+        let job_key = "/registry/jobs/default/cdel";
+        storage.create(job_key, &job).await.unwrap();
+        for pod in [
+            make_pod("c-ok", "default", Phase::Succeeded, "cdel", "job-uid-1"),
+            terminating_pod("c-term", "cdel"),
+        ] {
+            let key = format!("/registry/pods/default/{}", pod.metadata.name);
+            storage.create(&key, &pod).await.unwrap();
+        }
+        let controller = JobController::new(storage.clone());
+        let mut j: Job = storage.get(job_key).await.unwrap();
+        controller.reconcile(&mut j).await.unwrap();
+
+        let got: Job = storage.get(job_key).await.unwrap();
+        let conds = conds_of(&got);
+        assert!(
+            conds.contains(&"SuccessCriteriaMet".to_string()),
+            "{conds:?}"
+        );
+        assert!(
+            !conds.contains(&"Complete".to_string()),
+            "Complete must wait for the terminating pod: {conds:?}"
+        );
+        assert!(got.status.as_ref().unwrap().completion_time.is_none());
+        assert_eq!(got.status.as_ref().unwrap().terminating, Some(1));
+
+        reap_terminating(&storage).await;
+        let mut j: Job = storage.get(job_key).await.unwrap();
+        controller.reconcile(&mut j).await.unwrap();
+        let got: Job = storage.get(job_key).await.unwrap();
+        assert!(conds_of(&got).contains(&"Complete".to_string()));
+        assert!(got.status.as_ref().unwrap().completion_time.is_some());
+    }
+
+    #[tokio::test]
+    async fn backoff_failed_is_delayed_while_pods_terminate() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job("bdel", "default", 1, 2);
+        job.spec.backoff_limit = Some(0);
+        let job_key = "/registry/jobs/default/bdel";
+        storage.create(job_key, &job).await.unwrap();
+        for pod in [
+            make_pod("b-fail", "default", Phase::Failed, "bdel", "job-uid-1"),
+            terminating_pod("b-term", "bdel"),
+        ] {
+            let key = format!("/registry/pods/default/{}", pod.metadata.name);
+            storage.create(&key, &pod).await.unwrap();
+        }
+        let controller = JobController::new(storage.clone());
+        let mut j: Job = storage.get(job_key).await.unwrap();
+        controller.reconcile(&mut j).await.unwrap();
+
+        let got: Job = storage.get(job_key).await.unwrap();
+        let conds = conds_of(&got);
+        assert!(conds.contains(&"FailureTarget".to_string()), "{conds:?}");
+        assert!(
+            !conds.contains(&"Failed".to_string()),
+            "Failed must wait for the terminating pod: {conds:?}"
+        );
+        assert_eq!(got.status.as_ref().unwrap().terminating, Some(1));
+
+        reap_terminating(&storage).await;
+        let mut j: Job = storage.get(job_key).await.unwrap();
+        controller.reconcile(&mut j).await.unwrap();
+        let got: Job = storage.get(job_key).await.unwrap();
+        assert!(conds_of(&got).contains(&"Failed".to_string()));
+    }
+
+    /// `deleteActivePods` (:1002): a Job past its backoff limit deletes its
+    /// still-active pods, and only finishes once they are gone.
+    #[tokio::test]
+    async fn backoff_failed_deletes_active_pods_then_finishes() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job("bact", "default", 1, 2);
+        job.spec.backoff_limit = Some(0);
+        let job_key = "/registry/jobs/default/bact";
+        storage.create(job_key, &job).await.unwrap();
+        for pod in [
+            make_pod("a-fail", "default", Phase::Failed, "bact", "job-uid-1"),
+            make_pod("a-run", "default", Phase::Running, "bact", "job-uid-1"),
+        ] {
+            let key = format!("/registry/pods/default/{}", pod.metadata.name);
+            storage.create(&key, &pod).await.unwrap();
+        }
+        let controller = JobController::new(storage.clone());
+        let mut j: Job = storage.get(job_key).await.unwrap();
+        controller.reconcile(&mut j).await.unwrap();
+
+        let run: Pod = storage.get("/registry/pods/default/a-run").await.unwrap();
+        assert!(
+            run.metadata.deletion_timestamp.is_some(),
+            "the active pod of a failed Job must be deleted"
+        );
+        let got: Job = storage.get(job_key).await.unwrap();
+        assert!(!conds_of(&got).contains(&"Failed".to_string()));
+
+        reap_terminating(&storage).await;
+        let mut j: Job = storage.get(job_key).await.unwrap();
+        controller.reconcile(&mut j).await.unwrap();
+        let got: Job = storage.get(job_key).await.unwrap();
+        assert!(conds_of(&got).contains(&"Failed".to_string()));
+    }
+
+    /// `if deleted != active || !satisfiedExpectations { finishedCondition =
+    /// nil }` (:1003-1007): no terminal (nor interim) condition while a pod
+    /// create is still unobserved.
+    #[tokio::test]
+    async fn failed_is_not_declared_while_expectations_unsatisfied() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job("bexp", "default", 1, 1);
+        job.spec.backoff_limit = Some(0);
+        let job_key = "/registry/jobs/default/bexp";
+        storage.create(job_key, &job).await.unwrap();
+        let pod = make_pod("e-fail", "default", Phase::Failed, "bexp", "job-uid-1");
+        storage
+            .create("/registry/pods/default/e-fail", &pod)
+            .await
+            .unwrap();
+        let controller = JobController::new(storage.clone());
+        controller.expectations.expect_creations("default/bexp", 1);
+        let mut j: Job = storage.get(job_key).await.unwrap();
+        controller.reconcile(&mut j).await.unwrap();
+        let got: Job = storage.get(job_key).await.unwrap();
+        let conds = conds_of(&got);
+        assert!(
+            !conds.contains(&"Failed".to_string()) && !conds.contains(&"FailureTarget".to_string()),
+            "must not finish while a pod create is unobserved: {conds:?}"
+        );
+
+        controller.expectations.creation_observed("default/bexp");
+        let mut j: Job = storage.get(job_key).await.unwrap();
+        controller.reconcile(&mut j).await.unwrap();
+        let got: Job = storage.get(job_key).await.unwrap();
+        assert!(conds_of(&got).contains(&"Failed".to_string()));
+    }
 }
