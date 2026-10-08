@@ -10,6 +10,7 @@ pub mod deployment;
 pub mod dynamic_provisioner;
 pub mod endpoints;
 pub mod endpointslice;
+pub mod endpointslice_tracker;
 pub mod ephemeral_volume;
 pub mod events;
 pub mod expectations;
