@@ -44,8 +44,8 @@ where
     I: FnMut() -> IFut,
     IFut: std::future::Future<Output = Option<String>>,
 {
-    let statuses = read_statuses().await;
     let ip = poll_until_some(poll_ip, ip_timeout, ip_interval).await;
+    let statuses = read_statuses().await;
     (statuses, ip)
 }
 
