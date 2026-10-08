@@ -4341,6 +4341,7 @@ dependencies = [
  "hyper-util",
  "indexmap 2.14.0",
  "ipnet",
+ "jsonwebtoken",
  "mimalloc",
  "openapiv3",
  "pem",
