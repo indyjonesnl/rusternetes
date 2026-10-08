@@ -56,7 +56,6 @@ mod pdb_disruption_controller_test;
 mod priorityclass_controller_test;
 mod pv_binder_test;
 mod pv_controller_extended_test;
-mod pvc_controller_test;
 mod replicaset_controller_test;
 mod resource_quota_idempotency_test;
 mod resource_quota_spec_clobber_test;
