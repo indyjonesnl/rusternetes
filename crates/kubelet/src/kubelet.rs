@@ -1938,18 +1938,10 @@ impl Kubelet {
         };
 
         let metrics_key = format!("/registry/metrics.k8s.io/nodes/{}", self.node_name);
-        match self.storage.get::<NodeMetrics>(&metrics_key).await {
-            Ok(_) => {
-                if let Err(e) = self.storage.update(&metrics_key, &metrics).await {
-                    debug!("Failed to update node metrics: {}", e);
-                }
-            }
-            Err(_) => {
-                if let Err(e) = self.storage.create(&metrics_key, &metrics).await {
-                    debug!("Failed to create node metrics: {}", e);
-                }
-            }
-        }
+        upsert_metrics(self.storage.as_ref(), &metrics_key, metrics, |m| {
+            &mut m.metadata
+        })
+        .await;
     }
 
     /// Collect per-pod container usage from the runtime and write `PodMetrics`
@@ -2022,18 +2014,7 @@ impl Kubelet {
             };
 
             let key = format!("/registry/metrics.k8s.io/pods/{namespace}/{name}");
-            match self.storage.get::<PodMetrics>(&key).await {
-                Ok(_) => {
-                    if let Err(e) = self.storage.update(&key, &metrics).await {
-                        debug!("Failed to update pod metrics for {name}: {e}");
-                    }
-                }
-                Err(_) => {
-                    if let Err(e) = self.storage.create(&key, &metrics).await {
-                        debug!("Failed to create pod metrics for {name}: {e}");
-                    }
-                }
-            }
+            upsert_metrics(self.storage.as_ref(), &key, metrics, |m| &mut m.metadata).await;
         }
     }
 
@@ -6290,9 +6271,144 @@ mod taint_eviction_tests {
     }
 }
 
+/// Create-or-update a metrics.k8s.io object the kubelet publishes.
+///
+/// Upstream never PUTs metrics objects (metrics-server serves them from
+/// memory), so there is nothing to port; the stored-object rule that does apply
+/// is `defaultUpdatedObjectInfo.Preconditions`
+/// (staging/src/k8s.io/apiserver/pkg/registry/rest/update.go:188-203): a
+/// non-empty `metadata.uid` on a PUT becomes a UID precondition. The object is
+/// rebuilt every tick with `ObjectMeta::new` (random UID), so on update it
+/// adopts the stored uid/creationTimestamp/resourceVersion, as controllers do
+/// by updating a `DeepCopy()` of the stored object (#2725).
+async fn upsert_metrics<S, T>(
+    storage: &S,
+    key: &str,
+    mut metrics: T,
+    meta: impl Fn(&mut T) -> &mut rusternetes_common::types::ObjectMeta,
+) where
+    S: Storage,
+    T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+{
+    match storage.get::<T>(key).await {
+        Ok(mut existing) => {
+            let stored = meta(&mut existing).clone();
+            let m = meta(&mut metrics);
+            m.uid = stored.uid;
+            m.creation_timestamp = stored.creation_timestamp;
+            m.resource_version = stored.resource_version;
+            if let Err(e) = storage.update(key, &metrics).await {
+                debug!("Failed to update metrics {key}: {e}");
+            }
+        }
+        Err(_) => {
+            if let Err(e) = storage.create(key, &metrics).await {
+                debug!("Failed to create metrics {key}: {e}");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Kubelet;
+
+    /// Storage that behaves like the api-server Store on PUT: a non-empty
+    /// `metadata.uid` that differs from the stored one is a 409 (rest/update.go:188-203).
+    struct UidStore(rusternetes_storage::memory::MemoryStorage);
+
+    #[async_trait::async_trait]
+    impl rusternetes_storage::Storage for UidStore {
+        async fn create<T>(&self, k: &str, v: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.0.create(k, v).await
+        }
+        async fn get<T>(&self, k: &str) -> rusternetes_common::Result<T>
+        where
+            T: serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.0.get(k).await
+        }
+        async fn update<T>(&self, k: &str, v: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            let sent = serde_json::to_value(v).unwrap();
+            let stored: serde_json::Value = self.0.get(k).await?;
+            let (a, b) = (
+                sent["metadata"]["uid"].as_str().unwrap_or(""),
+                stored["metadata"]["uid"].as_str().unwrap_or(""),
+            );
+            if !a.is_empty() && a != b {
+                return Err(rusternetes_common::Error::Conflict(format!(
+                    "Precondition failed: UID in precondition: {a}, UID in object meta: {b}"
+                )));
+            }
+            self.0.update(k, v).await
+        }
+        async fn update_raw(
+            &self,
+            k: &str,
+            v: &serde_json::Value,
+        ) -> rusternetes_common::Result<()> {
+            self.0.update_raw(k, v).await
+        }
+        async fn delete(&self, k: &str) -> rusternetes_common::Result<()> {
+            self.0.delete(k).await
+        }
+        async fn list<T>(&self, p: &str) -> rusternetes_common::Result<Vec<T>>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.0.list(p).await
+        }
+        async fn watch(
+            &self,
+            p: &str,
+        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            self.0.watch(p).await
+        }
+        async fn watch_from_revision(
+            &self,
+            p: &str,
+            r: i64,
+        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            self.0.watch_from_revision(p, r).await
+        }
+        async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+            self.0.current_revision().await
+        }
+        async fn is_revision_compacted(&self, r: i64) -> rusternetes_common::Result<bool> {
+            self.0.is_revision_compacted(r).await
+        }
+    }
+
+    /// #2725: a second publish carries a fresh random UID; it must adopt the
+    /// stored one or the Store 409s every tick.
+    #[tokio::test]
+    async fn republished_node_metrics_survive_uid_precondition() {
+        use rusternetes_common::resources::NodeMetrics;
+        use rusternetes_common::types::{ObjectMeta, TypeMeta};
+        use rusternetes_storage::Storage;
+        let st = UidStore(rusternetes_storage::memory::MemoryStorage::new());
+        let mk = |cpu: &str| NodeMetrics {
+            type_meta: TypeMeta {
+                api_version: "metrics.k8s.io/v1beta1".into(),
+                kind: "NodeMetrics".into(),
+            },
+            metadata: ObjectMeta::new("n1"),
+            timestamp: chrono::Utc::now(),
+            window: "30s".into(),
+            usage: [("cpu".to_string(), cpu.to_string())].into(),
+        };
+        let key = "/registry/metrics.k8s.io/nodes/n1";
+        super::upsert_metrics(&st, key, mk("1m"), |m| &mut m.metadata).await;
+        super::upsert_metrics(&st, key, mk("2m"), |m| &mut m.metadata).await;
+        let got: NodeMetrics = st.get(key).await.unwrap();
+        assert_eq!(got.usage["cpu"], "2m");
+    }
 
     /// #2459: deletionTimestamp is the deadline (now+grace), so at the deadline
     /// the grace has elapsed; before it, it has not.
