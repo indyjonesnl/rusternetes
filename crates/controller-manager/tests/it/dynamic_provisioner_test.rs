@@ -804,7 +804,10 @@ async fn test_non_csi_plugin_rejects_pvc_with_datasource() {
         .find(|e| e.reason == "ProvisioningFailed")
         .expect("ProvisioningFailed event");
     assert_eq!(ev.involved_object.name.as_deref(), Some("restored-pvc"));
-    assert_eq!(ev.event_type, rusternetes_common::resources::EventType::Warning);
+    assert_eq!(
+        ev.event_type,
+        rusternetes_common::resources::EventType::Warning
+    );
     assert_eq!(
         ev.message,
         "plugin \"kubernetes.io/host-path\" is not a CSI plugin. Only CSI plugin can provision a claim with a datasource"
