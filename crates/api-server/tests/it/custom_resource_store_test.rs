@@ -758,3 +758,39 @@ async fn scale_not_enabled_is_not_found() {
     let (status, out) = api.get(&format!("{}/w1/scale", ns_path("widgets"))).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{out}");
 }
+
+/// field_validation.go:620-735 "should detect duplicates in a CR when
+/// preserving unknown fields": a YAML apply body with a repeated key under
+/// `fieldValidation=Strict` is refused with
+/// `line 9: key "foo" already set in map` (applyPatcher strict-decodes the
+/// body, patch.go:517-527).
+#[tokio::test]
+async fn strict_apply_refuses_a_duplicate_yaml_key() {
+    let api = TestApiServer::new();
+    install(
+        &api,
+        &crd("widgets", "Widget", "Namespaced", false, open_schema()),
+    )
+    .await;
+    let path = format!(
+        "{}/mytest?fieldManager=field_validation_mgr&fieldValidation=Strict",
+        ns_path("widgets")
+    );
+    let yaml = format!(
+        "\napiVersion: {GROUP}/v1\nkind: Widget\nmetadata:\n  name: mytest\nspec:\n  unknown: uk1\n  foo: foo1\n  foo: foo2\n  cronSpec: \"* * * * */5\"\n  ports:\n  - name: x\n    containerPort: 80\n    protocol: TCP"
+    );
+    let (status, _, bytes, _) = api
+        .send_with_headers(
+            "PATCH",
+            &path,
+            &[("content-type", "application/apply-patch+yaml")],
+            Some(yaml.into_bytes()),
+        )
+        .await;
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert!(
+        text.contains(r#"line 9: key \"foo\" already set in map"#),
+        "{text}"
+    );
+}

@@ -10,7 +10,7 @@
 //! computed every `nodeStatusUpdateFrequency` but only written when it
 //! changed or `nodeStatusReportFrequency` elapsed.
 
-use rusternetes_common::resources::{NodeCondition, NodeStatus};
+use rusternetes_common::resources::{Node, NodeCondition, NodeStatus};
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
@@ -113,6 +113,265 @@ pub fn node_status_has_changed(
         normalize(serde_json::to_value(&s).unwrap_or(Value::Null))
     };
     strip(o) != strip(c)
+}
+
+// ---------------------------------------------------------------------------
+// PatchNodeStatus: two-way strategic-merge diff
+// ---------------------------------------------------------------------------
+
+/// Patch metadata of the `v1.Node` fields that carry `patchStrategy:"merge"`
+/// and therefore diff as keyed/merged lists; every other list is replaced
+/// whole (strategicpatch `handleSliceDiff` default arm,
+/// staging/src/k8s.io/apimachinery/pkg/util/strategicpatch/patch.go:336).
+/// `Some(key)` is a list of maps keyed by `patchMergeKey`; `None` is a merged
+/// list of scalars. The set is exactly the Node's merge-strategy lists:
+/// `metadata.finalizers`, `metadata.ownerReferences` (uid),
+/// `status.conditions` (type) and `status.addresses` (type, see the
+/// manual-addresses handling in [`prepare_patch_for_node_status`]).
+fn merge_list_key(path: &str) -> Option<Option<&'static str>> {
+    match path {
+        "metadata.finalizers" => Some(None),
+        "metadata.ownerReferences" => Some(Some("uid")),
+        "status.conditions" | "status.addresses" => Some(Some("type")),
+        _ => None,
+    }
+}
+
+fn sv(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// `diffMaps` (patch.go:168-234) with `SetElementOrder: true`.
+fn diff_maps(
+    original: &serde_json::Map<String, Value>,
+    modified: &serde_json::Map<String, Value>,
+    path: &str,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let mut patch = serde_json::Map::new();
+    for (key, mv) in modified {
+        let Some(ov) = original.get(key) else {
+            patch.insert(key.clone(), mv.clone());
+            continue;
+        };
+        let child = if path.is_empty() {
+            key.clone()
+        } else {
+            format!("{path}.{key}")
+        };
+        match (ov, mv) {
+            (Value::Object(o), Value::Object(m)) => {
+                let sub = diff_maps(o, m, &child)?;
+                if !sub.is_empty() {
+                    patch.insert(key.clone(), Value::Object(sub));
+                }
+            }
+            (Value::Array(o), Value::Array(m)) => match merge_list_key(&child) {
+                Some(merge_key) => {
+                    let (add, del, order) = diff_lists(o, m, merge_key)?;
+                    if !add.is_empty() {
+                        patch.insert(key.clone(), Value::Array(add));
+                    }
+                    if !del.is_empty() {
+                        patch.insert(format!("$deleteFromPrimitiveList/{key}"), Value::Array(del));
+                    }
+                    if !order.is_empty() {
+                        patch.insert(format!("$setElementOrder/{key}"), Value::Array(order));
+                    }
+                }
+                None => {
+                    if ov != mv {
+                        patch.insert(key.clone(), mv.clone());
+                    }
+                }
+            },
+            _ => {
+                // Differing types or scalars: replacePatchFieldIfNotEqual.
+                if ov != mv {
+                    patch.insert(key.clone(), mv.clone());
+                }
+            }
+        }
+    }
+    // updatePatchIfMissing (:368-379): clear keys absent from modified.
+    for key in original.keys() {
+        if !modified.contains_key(key) {
+            patch.insert(key.clone(), Value::Null);
+        }
+    }
+    Ok(patch)
+}
+
+type ListDiff = (Vec<Value>, Vec<Value>, Vec<Value>);
+
+/// `diffLists` (patch.go:548-615): (patchList, deleteList, setOrderList).
+fn diff_lists(
+    original: &[Value],
+    modified: &[Value],
+    merge_key: Option<&str>,
+) -> Result<ListDiff, String> {
+    if original.is_empty() {
+        return Ok((modified.to_vec(), vec![], vec![]));
+    }
+    let Some(mk) = merge_key else {
+        // diffListsOfScalars (:632-690)
+        let mut add: Vec<Value> = modified
+            .iter()
+            .filter(|v| !original.contains(v))
+            .cloned()
+            .collect();
+        let mut del: Vec<Value> = original
+            .iter()
+            .filter(|v| !modified.contains(v))
+            .cloned()
+            .collect();
+        add.dedup();
+        del.dedup();
+        let order = if !del.is_empty() || original != modified {
+            modified.to_vec()
+        } else {
+            vec![]
+        };
+        return Ok((add, del, order));
+    };
+    let key_of = |v: &Value| -> Result<String, String> {
+        v.get(mk)
+            .map(sv)
+            .ok_or_else(|| format!("map: {v} does not contain declared merge key: {mk}"))
+    };
+    for v in original.iter().chain(modified.iter()) {
+        key_of(v)?;
+    }
+    // diffListsOfMaps (:700-770): walk both lists sorted by merge key.
+    let mut o: Vec<&Value> = original.iter().collect();
+    let mut m: Vec<&Value> = modified.iter().collect();
+    o.sort_by_key(|v| key_of(v).unwrap_or_default());
+    m.sort_by_key(|v| key_of(v).unwrap_or_default());
+    let (mut oi, mut mi) = (0, 0);
+    let mut patch: Vec<Value> = vec![];
+    let mut deletions: Vec<Value> = vec![];
+    while oi < o.len() || mi < m.len() {
+        let ok = o.get(oi).map(|v| key_of(v).unwrap_or_default());
+        let mkv = m.get(mi).map(|v| key_of(v).unwrap_or_default());
+        match (ok, mkv) {
+            (Some(a), Some(b)) if a == b => {
+                let (Value::Object(ao), Value::Object(bo)) = (o[oi], m[mi]) else {
+                    return Err("list element is not a map".into());
+                };
+                let mut d = diff_maps(ao, bo, "")?;
+                if !d.is_empty() {
+                    d.insert(mk.to_string(), bo[mk].clone());
+                    patch.push(Value::Object(d));
+                }
+                oi += 1;
+                mi += 1;
+            }
+            (Some(a), Some(b)) if a > b => {
+                patch.push(m[mi].clone());
+                mi += 1;
+            }
+            (None, Some(_)) => {
+                patch.push(m[mi].clone());
+                mi += 1;
+            }
+            _ => {
+                // CreateDeleteDirective: {mergeKey: v, "$patch": "delete"}
+                let mut d = serde_json::Map::new();
+                d.insert(mk.to_string(), o[oi][mk].clone());
+                d.insert("$patch".into(), Value::String("delete".into()));
+                deletions.push(Value::Object(d));
+                oi += 1;
+            }
+        }
+    }
+    // normalizeSliceOrder: patch items follow `modified` order.
+    let pos = |v: &Value| {
+        let k = v.get(mk).map(sv).unwrap_or_default();
+        modified
+            .iter()
+            .position(|x| x.get(mk).map(sv).unwrap_or_default() == k)
+            .unwrap_or(usize::MAX)
+    };
+    patch.sort_by_key(pos);
+    let order_same = original.len() == modified.len()
+        && original
+            .iter()
+            .zip(modified)
+            .all(|(a, b)| a.get(mk).map(sv) == b.get(mk).map(sv));
+    patch.extend(deletions);
+    let order = if !patch.is_empty() || !order_same {
+        modified
+            .iter()
+            .map(|v| {
+                let mut d = serde_json::Map::new();
+                d.insert(mk.to_string(), v[mk].clone());
+                Value::Object(d)
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+    Ok((patch, vec![], order))
+}
+
+/// `preparePatchBytesforNodeStatus`
+/// (staging/src/k8s.io/component-helpers/node/util/status.go:46-82): the
+/// strategic-merge patch that turns `old` into `new`, restricted to
+/// `metadata`/`status` (spec is reset to the old one so only those can be
+/// patched, :57-61). `status.addresses` is wrongly annotated
+/// `patchStrategy=merge`, so when it changed it is excluded from the diff and
+/// sent as an explicit replace list (`fixupPatchForNodeStatusAddresses`,
+/// :84-130).
+///
+/// Deviation: upstream drives the diff from the Go struct's patch-meta tags
+/// via `CreateTwoWayMergePatch`; there is no Rust reflection equivalent, so
+/// the four merge-strategy lists of `v1.Node` are tabulated in
+/// [`merge_list_key`]. `$retainKeys` never applies to a Node.
+pub fn prepare_patch_for_node_status(old: &Node, new: &Node) -> Result<Value, String> {
+    let old_addrs = old
+        .status
+        .as_ref()
+        .and_then(|s| s.addresses.clone())
+        .unwrap_or_default();
+    let new_addrs = new
+        .status
+        .as_ref()
+        .and_then(|s| s.addresses.clone())
+        .unwrap_or_default();
+    let to_v = |a: &Vec<rusternetes_common::resources::NodeAddress>| {
+        serde_json::to_value(a).map_err(|e| e.to_string())
+    };
+    let manually_patch_addresses = !old_addrs.is_empty() && to_v(&old_addrs)? != to_v(&new_addrs)?;
+
+    let mut diff_node = new.clone();
+    diff_node.spec = old.spec.clone();
+    if manually_patch_addresses {
+        if let Some(st) = diff_node.status.as_mut() {
+            st.addresses = old.status.as_ref().and_then(|s| s.addresses.clone());
+        }
+    }
+    let old_data = serde_json::to_value(old).map_err(|e| e.to_string())?;
+    let new_data = serde_json::to_value(&diff_node).map_err(|e| e.to_string())?;
+    let (Value::Object(o), Value::Object(n)) = (old_data, new_data) else {
+        return Err("node did not serialize to an object".into());
+    };
+    let mut patch = diff_maps(&o, &n, "")?;
+    if manually_patch_addresses {
+        let mut addrs = to_v(&new_addrs)?.as_array().cloned().unwrap_or_default();
+        addrs.push(serde_json::json!({"$patch": "replace"}));
+        let status = patch
+            .entry("status")
+            .or_insert_with(|| Value::Object(Default::default()));
+        match status {
+            Value::Object(m) => {
+                m.insert("addresses".into(), Value::Array(addrs));
+            }
+            _ => return Err("unexpected data in patch".into()),
+        }
+    }
+    Ok(Value::Object(patch))
 }
 
 #[cfg(test)]
@@ -243,5 +502,156 @@ mod tests {
             let j = jitter(d, NODE_STATUS_LOOP_JITTER_FACTOR, rand_unit());
             assert!(j >= d && j < d.mul_f64(1.04));
         }
+    }
+
+    // ---- prepare_patch_for_node_status ----------------------------------
+    // Expected patches are what strategicpatch.CreateTwoWayMergePatch emits
+    // for v1.Node (patch.go diffMaps/diffLists; $setElementOrder on every
+    // changed merge list).
+
+    use rusternetes_common::resources::{NodeAddress, NodeSpec};
+    use serde_json::json;
+
+    fn node(c: Vec<NodeCondition>) -> Node {
+        let mut n = Node::new("n1");
+        n.metadata.uid = "uid-1".into(); // Node::new mints a random uid
+        n.status = Some(st(c));
+        n
+    }
+    fn addr(t: &str, a: &str) -> NodeAddress {
+        NodeAddress {
+            address_type: t.into(),
+            address: a.into(),
+        }
+    }
+
+    #[test]
+    fn identical_nodes_yield_an_empty_patch() {
+        let n = node(vec![cond("Ready", "True", now(), now())]);
+        assert_eq!(prepare_patch_for_node_status(&n, &n).unwrap(), json!({}));
+    }
+
+    #[test]
+    fn heartbeat_only_patches_the_one_condition_with_its_merge_key() {
+        let old = node(vec![
+            cond("Ready", "True", now(), now()),
+            cond("MemoryPressure", "False", now(), now()),
+        ]);
+        let later = now() + CDur::seconds(10);
+        let new = node(vec![
+            cond("Ready", "True", later, now()),
+            cond("MemoryPressure", "False", now(), now()),
+        ]);
+        let p = prepare_patch_for_node_status(&old, &new).unwrap();
+        assert_eq!(
+            p,
+            json!({"status": {
+                "conditions": [{"type": "Ready", "lastHeartbeatTime": later}],
+                "$setElementOrder/conditions": [{"type": "Ready"}, {"type": "MemoryPressure"}],
+            }})
+        );
+    }
+
+    #[test]
+    fn spec_changes_are_never_patched() {
+        let mut old = node(vec![]);
+        let spec = NodeSpec {
+            pod_cidr: None,
+            pod_cidrs: None,
+            provider_id: None,
+            unschedulable: None,
+            taints: None,
+        };
+        old.spec = Some(spec);
+        let mut new = old.clone();
+        new.spec = Some(NodeSpec {
+            pod_cidr: Some("10.0.0.0/24".into()),
+            pod_cidrs: None,
+            provider_id: None,
+            unschedulable: None,
+            taints: None,
+        });
+        assert_eq!(
+            prepare_patch_for_node_status(&old, &new).unwrap(),
+            json!({})
+        );
+    }
+
+    #[test]
+    fn removed_condition_becomes_a_delete_directive() {
+        let old = node(vec![
+            cond("Ready", "True", now(), now()),
+            cond("MemoryPressure", "False", now(), now()),
+        ]);
+        let new = node(vec![cond("Ready", "True", now(), now())]);
+        let p = prepare_patch_for_node_status(&old, &new).unwrap();
+        assert_eq!(
+            p,
+            json!({"status": {
+                "conditions": [{"type": "MemoryPressure", "$patch": "delete"}],
+                "$setElementOrder/conditions": [{"type": "Ready"}],
+            }})
+        );
+    }
+
+    #[test]
+    fn label_added_and_removed() {
+        let mut old = node(vec![]);
+        old.metadata.labels = Some([("a".to_string(), "1".to_string())].into());
+        let mut new = node(vec![]);
+        new.metadata.labels = Some([("b".to_string(), "2".to_string())].into());
+        let p = prepare_patch_for_node_status(&old, &new).unwrap();
+        assert_eq!(p, json!({"metadata": {"labels": {"a": null, "b": "2"}}}));
+    }
+
+    /// status.addresses is mis-annotated `merge`; when it changed the patch
+    /// carries an explicit replace list (fixupPatchForNodeStatusAddresses,
+    /// status.go:84-130) so a removed address really goes away.
+    #[test]
+    fn changed_addresses_are_sent_as_a_replace_list() {
+        let mut old = node(vec![]);
+        old.status.as_mut().unwrap().addresses =
+            Some(vec![addr("InternalIP", "10.0.0.1"), addr("Hostname", "n1")]);
+        let mut new = old.clone();
+        new.status.as_mut().unwrap().addresses = Some(vec![addr("InternalIP", "10.0.0.2")]);
+        let p = prepare_patch_for_node_status(&old, &new).unwrap();
+        assert_eq!(
+            p,
+            json!({"status": {"addresses": [
+                {"type": "InternalIP", "address": "10.0.0.2"},
+                {"$patch": "replace"},
+            ]}})
+        );
+    }
+
+    #[test]
+    fn unchanged_addresses_are_absent_and_first_addresses_are_a_plain_add() {
+        let mut old = node(vec![]);
+        old.status.as_mut().unwrap().addresses = Some(vec![addr("Hostname", "n1")]);
+        assert_eq!(
+            prepare_patch_for_node_status(&old, &old).unwrap(),
+            json!({})
+        );
+
+        let empty = node(vec![]);
+        let mut new = empty.clone();
+        new.status.as_mut().unwrap().addresses = Some(vec![addr("Hostname", "n1")]);
+        assert_eq!(
+            prepare_patch_for_node_status(&empty, &new).unwrap(),
+            json!({"status": {"addresses": [{"type": "Hostname", "address": "n1"}]}})
+        );
+    }
+
+    /// Non-merge lists (volumesInUse) are replaced whole.
+    #[test]
+    fn non_merge_lists_are_replaced_whole() {
+        let mut old = node(vec![]);
+        old.status.as_mut().unwrap().volumes_in_use = Some(vec!["a".into(), "b".into()]);
+        let mut new = old.clone();
+        new.status.as_mut().unwrap().volumes_in_use = Some(vec!["a".into()]);
+        assert_eq!(
+            prepare_patch_for_node_status(&old, &new).unwrap(),
+            json!({"status": {"volumesInUse": ["a"]}})
+        );
     }
 }

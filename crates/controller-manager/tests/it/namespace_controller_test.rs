@@ -862,3 +862,36 @@ async fn pods_with_finalizers_block_other_content_on_every_reconcile() {
         "namespace must publish NamespaceDeletionContentFailure while content remains"
     );
 }
+
+/// #2723: a namespace's content with a finalizer must be marked for deletion
+/// by a DELETE, not by a PUT. Upstream's deleter only ever deletes
+/// (`pkg/controller/namespace/deletion/namespaced_resources_deleter.go`
+/// `deleteEachItem` `:393-415`, `deleteCollection` `:322-326`) and the registry
+/// stamps `deletionTimestamp`; the generic Store refuses a PUT that sets it, so
+/// the old PUT-stamp left finalizer-held content never terminating.
+#[tokio::test]
+async fn finalizer_held_content_is_marked_for_deletion_by_a_delete() {
+    use crate::stale_list_double::StaleListStorage;
+    let storage = Arc::new(StaleListStorage::new().rejecting_deletion_timestamp_stamps());
+    let controller = NamespaceController::new(storage.clone());
+    let ns_name = "stamp-by-delete";
+
+    let namespace = terminating_ns(ns_name, vec!["kubernetes".to_string()]);
+    storage
+        .create(&build_key("namespaces", None, ns_name), &namespace)
+        .await
+        .unwrap();
+
+    let mut cm = ConfigMap::new("held", ns_name);
+    cm.metadata.finalizers = Some(vec!["example.com/hold".to_string()]);
+    let cm_key = build_key("configmaps", Some(ns_name), "held");
+    storage.create(&cm_key, &cm).await.unwrap();
+
+    controller.reconcile_all().await.unwrap();
+
+    let held: ConfigMap = storage.get(&cm_key).await.expect("finalizer keeps it");
+    assert!(
+        held.metadata.deletion_timestamp.is_some(),
+        "the namespace deleter must mark finalizer-held content for deletion"
+    );
+}

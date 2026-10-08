@@ -29,6 +29,8 @@ mod post_start_hooks;
 mod prometheus_client;
 #[allow(dead_code)]
 mod registry;
+#[allow(dead_code)]
+mod storage_readiness_hook;
 pub use rusternetes_protobuf as protobuf;
 #[allow(dead_code)]
 mod response;

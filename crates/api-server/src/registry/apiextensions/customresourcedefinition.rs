@@ -617,20 +617,16 @@ impl CrdRest {
         .collect()
     }
 
-    /// `deleteInstances` (crd_finalizer.go:181-): the stored instances of the
-    /// CRD are removed straight from storage, where upstream issues
-    /// `DeleteCollection` per namespace and then waits for the list to empty.
-    async fn delete_instances(&self, crd: &CustomResourceDefinition) -> Result<()> {
-        let resource_type = format!(
-            "{}_{}",
-            crd.spec.group.replace('.', "_"),
-            crd.spec.names.plural
-        );
+    /// The stored instances of the CRD as `(namespace, name)`: upstream's
+    /// `crClient.List(ctx, nil)` (crd_finalizer.go:195, :255). A stored
+    /// instance does not record its namespace, only its key does, so a
+    /// namespaced CRD's instances are found namespace by namespace.
+    async fn list_instances(
+        &self,
+        crd: &CustomResourceDefinition,
+    ) -> Result<Vec<(Option<String>, String)>> {
+        let resource_type = instance_resource_type(crd);
         let namespaced = crd.spec.scope == rusternetes_common::resources::ResourceScope::Namespaced;
-        // A stored instance does not record its namespace, only its key does,
-        // so a namespaced CRD's instances are found namespace by namespace —
-        // as upstream's finalizer issues one `DeleteCollection` per namespace
-        // (crd_finalizer.go:219-235).
         let namespaces: Vec<Option<String>> = if namespaced {
             let all: Vec<serde_json::Value> = self
                 .store
@@ -644,21 +640,69 @@ impl CrdRest {
         } else {
             vec![None]
         };
+        let mut out = Vec::new();
         for namespace in namespaces {
             let prefix = build_prefix(&resource_type, namespace.as_deref());
             let items: Vec<serde_json::Value> = self.store.storage.list(&prefix).await?;
             for item in items {
-                let Some(name) = item.pointer("/metadata/name").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                let key = build_key(&resource_type, namespace.as_deref(), name);
-                match self.store.storage.delete(&key).await {
-                    Ok(()) | Err(Error::NotFound(_)) => {}
-                    Err(e) => return Err(e),
+                if let Some(name) = item.pointer("/metadata/name").and_then(|v| v.as_str()) {
+                    out.push((namespace.clone(), name.to_string()));
                 }
             }
         }
-        Ok(())
+        Ok(out)
+    }
+
+    /// `deleteInstances` (crd_finalizer.go:181-273): the stored instances of
+    /// the CRD are removed straight from storage, where upstream issues
+    /// `DeleteCollection` per namespace; then, as upstream, wait until a list
+    /// of them comes back empty (:253-272). The `Err` carries the
+    /// `Terminating` condition upstream returns with its error.
+    async fn delete_instances(
+        &self,
+        crd: &CustomResourceDefinition,
+    ) -> std::result::Result<
+        (),
+        Box<(
+            rusternetes_common::resources::CustomResourceDefinitionCondition,
+            Error,
+        )>,
+    > {
+        let failed = |reason: &str, message: String, e: Error| {
+            Box::new((condition(TERMINATING, "True", reason, &message), e))
+        };
+        let resource_type = instance_resource_type(crd);
+        let items = self.list_instances(crd).await.map_err(|e| {
+            failed(
+                "InstanceDeletionFailed",
+                format!("could not list instances: {e}"),
+                e,
+            )
+        })?;
+        for (namespace, name) in items {
+            let key = build_key(&resource_type, namespace.as_deref(), &name);
+            match self.store.storage.delete(&key).await {
+                Ok(()) | Err(Error::NotFound(_)) => {}
+                Err(e) => {
+                    return Err(failed(
+                        "InstanceDeletionFailed",
+                        format!("could not issue all deletes: {e}"),
+                        e,
+                    ))
+                }
+            }
+        }
+        poll_until_gone(INSTANCE_DRAIN_INTERVAL, INSTANCE_DRAIN_TIMEOUT, || async {
+            Ok(self.list_instances(crd).await?.len())
+        })
+        .await
+        .map_err(|msg| {
+            failed(
+                "InstanceDeletionCheck",
+                format!("could not confirm zero CustomResources remaining: {msg}"),
+                Error::Internal(msg),
+            )
+        })
     }
 
     /// `CRDFinalizer.sync` (crd_finalizer.go:112-179).
@@ -703,13 +747,8 @@ impl CrdRest {
                     "InstanceDeletionCompleted",
                     "removed all instances",
                 ),
-                Err(e) => {
-                    let failed = condition(
-                        TERMINATING,
-                        "True",
-                        "InstanceDeletionFailed",
-                        &format!("could not issue all deletes: {e}"),
-                    );
+                Err(boxed) => {
+                    let (failed, e) = *boxed;
                     self.update_status(name, &|old| {
                         let mut c = old.clone();
                         set_crd_condition(&mut c, failed.clone());
@@ -736,6 +775,50 @@ impl CrdRest {
         })
         .await?;
         Ok(())
+    }
+}
+
+/// The storage resource type of a CRD's instances.
+fn instance_resource_type(crd: &CustomResourceDefinition) -> String {
+    format!(
+        "{}_{}",
+        crd.spec.group.replace('.', "_"),
+        crd.spec.names.plural
+    )
+}
+
+/// `wait.PollUntilContextTimeout(ctx, 5*time.Second, 1*time.Minute, true, ..)`
+/// (crd_finalizer.go:253).
+pub const INSTANCE_DRAIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+pub const INSTANCE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The finalizer's wait "until all the resources are deleted"
+/// (crd_finalizer.go:253-267): `remaining` is tried at once (`immediate`
+/// true), then every `interval`, until it reports zero; a list error ends the
+/// wait with that error, and `timeout` ends it with the
+/// `context deadline exceeded` of `PollUntilContextTimeout`.
+pub async fn poll_until_gone<F, Fut>(
+    interval: std::time::Duration,
+    timeout: std::time::Duration,
+    mut remaining: F,
+) -> std::result::Result<(), String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<usize>>,
+{
+    let poll = async {
+        loop {
+            match remaining().await {
+                Err(e) => return Err(e.to_string()),
+                Ok(0) => return Ok(()),
+                Ok(n) => tracing::debug!("waiting for {n} items to be removed"),
+            }
+            tokio::time::sleep(interval).await;
+        }
+    };
+    match tokio::time::timeout(timeout, poll).await {
+        Ok(r) => r,
+        Err(_) => Err("context deadline exceeded".to_string()),
     }
 }
 
@@ -1231,6 +1314,41 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
     }
     use super::*;
+
+    /// The drain wait polls at once, then every interval, until a list is
+    /// empty (crd_finalizer.go:253-267).
+    #[tokio::test(start_paused = true)]
+    async fn poll_until_gone_polls_until_the_list_is_empty() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let r = poll_until_gone(INSTANCE_DRAIN_INTERVAL, INSTANCE_DRAIN_TIMEOUT, || {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { Ok(3_usize.saturating_sub(n)) }
+        })
+        .await;
+        assert_eq!(r, Ok(()));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    /// Instances that never go away end the wait at the timeout
+    /// (`PollUntilContextTimeout` -> `context deadline exceeded`).
+    #[tokio::test(start_paused = true)]
+    async fn poll_until_gone_times_out_while_instances_remain() {
+        let r = poll_until_gone(INSTANCE_DRAIN_INTERVAL, INSTANCE_DRAIN_TIMEOUT, || async {
+            Ok(1)
+        })
+        .await;
+        assert_eq!(r, Err("context deadline exceeded".to_string()));
+    }
+
+    /// A list error ends the wait at once (crd_finalizer.go:255-257).
+    #[tokio::test(start_paused = true)]
+    async fn poll_until_gone_stops_on_a_list_error() {
+        let r = poll_until_gone(INSTANCE_DRAIN_INTERVAL, INSTANCE_DRAIN_TIMEOUT, || async {
+            Err(Error::Storage("boom".into()))
+        })
+        .await;
+        assert!(r.unwrap_err().contains("boom"));
+    }
 
     /// `go finalizingController.Run(5, ...)` (apiserver.go:249): five workers
     /// drain the queue at once, so one slow CRD does not hold up the rest.

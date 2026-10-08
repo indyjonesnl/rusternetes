@@ -214,6 +214,7 @@ mod pod_spec_decodes_when_absent_test;
 mod pod_store_test;
 mod pod_strategy_gaps_test;
 mod pod_subresources_store_test;
+mod pod_terminating_grace_test;
 mod pod_update_immutability_test;
 mod pod_volume_source_validation_test;
 mod poddisruptionbudget_handler_test;

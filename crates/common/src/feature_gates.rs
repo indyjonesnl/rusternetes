@@ -175,6 +175,8 @@ pub enum Feature {
     /// Upstream gate `ReduceDefaultCrashLoopBackOffDecay` (1.33 Alpha, off; `pkg/features/kube_features.go:1692-1694`).
     ReduceDefaultCrashLoopBackOffDecay,
 
+    /// Upstream gate `WatchCacheInitializationPostStartHook` (1.31 Beta, still off; `staging/src/k8s.io/apiserver/pkg/features/kube_features.go:494-496`).
+    WatchCacheInitializationPostStartHook,
     /// Upstream gate `MutableCSINodeAllocatableCount` (1.35 Beta, on; `pkg/features/kube_features.go:1537-1541`).
     /// Gates the kubelet's `csiNodeUpdater` (`pkg/volume/csi/csi_plugin.go:417`).
     MutableCSINodeAllocatableCount,
@@ -218,7 +220,8 @@ impl Feature {
             Feature::StorageVersionMigrator => 31,
             Feature::KubeletCrashLoopBackOffMax => 32,
             Feature::ReduceDefaultCrashLoopBackOffDecay => 33,
-            Feature::MutableCSINodeAllocatableCount => 34,
+            Feature::WatchCacheInitializationPostStartHook => 34,
+            Feature::MutableCSINodeAllocatableCount => 35,
         }
     }
 
@@ -291,6 +294,8 @@ impl Feature {
             Feature::StorageVersionMigrator => false,
             Feature::KubeletCrashLoopBackOffMax => true,
             Feature::ReduceDefaultCrashLoopBackOffDecay => false,
+            // 1.31 Beta, no `Default: true` (apiserver kube_features.go:494-496)
+            Feature::WatchCacheInitializationPostStartHook => false,
             // 1.35 Beta, on (pkg/features/kube_features.go:1537-1541)
             Feature::MutableCSINodeAllocatableCount => true,
         }
@@ -343,6 +348,7 @@ pub const ALL_FEATURES: &[Feature] = &[
     Feature::StorageVersionMigrator,
     Feature::KubeletCrashLoopBackOffMax,
     Feature::ReduceDefaultCrashLoopBackOffDecay,
+    Feature::WatchCacheInitializationPostStartHook,
     Feature::MutableCSINodeAllocatableCount,
 ];
 
@@ -392,6 +398,7 @@ static STATES: [AtomicBool; NUM_FEATURES] = [
     AtomicBool::new(Feature::StorageVersionMigrator.default_enabled()),
     AtomicBool::new(Feature::KubeletCrashLoopBackOffMax.default_enabled()),
     AtomicBool::new(Feature::ReduceDefaultCrashLoopBackOffDecay.default_enabled()),
+    AtomicBool::new(Feature::WatchCacheInitializationPostStartHook.default_enabled()),
     AtomicBool::new(Feature::MutableCSINodeAllocatableCount.default_enabled()),
 ];
 

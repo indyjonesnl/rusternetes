@@ -18,6 +18,22 @@ use tracing::{debug, error, info};
 /// multiplies it by a random 1-2 factor, see [`resync_period`]). Each
 /// resync re-fires the service handler, `onServiceUpdate`
 /// (`endpointslice_controller.go:122-126`). This replaces a 5s sweep (#2208).
+/// Carry the identity of the stored slice over to the slice about to replace it.
+///
+/// Upstream updates `existingSlice.DeepCopy()` with the new endpoints and
+/// labels (staging/src/k8s.io/endpointslice/reconciler.go:551, :559), so the
+/// object it PUTs keeps the stored UID. The API server turns a non-empty
+/// `metadata.uid` on an update into a UID precondition
+/// (`defaultUpdatedObjectInfo.Preconditions`,
+/// staging/src/k8s.io/apiserver/pkg/registry/rest/update.go:188-203), so a
+/// freshly built slice carrying a new random UID is a permanent 409 once
+/// EndpointSlice is served by the generic Store (#2108).
+fn adopt_existing_identity(slice: &mut EndpointSlice, existing: &EndpointSlice) {
+    slice.metadata.uid = existing.metadata.uid.clone();
+    slice.metadata.creation_timestamp = existing.metadata.creation_timestamp;
+    slice.metadata.resource_version = existing.metadata.resource_version.clone();
+}
+
 const INFORMER_RESYNC_PERIOD: std::time::Duration = std::time::Duration::from_secs(12 * 3600);
 
 /// Port of `ResyncPeriod` (`cmd/kube-controller-manager/app/controllermanager.go:176-181`):
@@ -691,7 +707,7 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                     if existing.endpoints == slice.endpoints && existing.ports == slice.ports {
                         continue;
                     }
-                    slice.metadata.resource_version = existing.metadata.resource_version;
+                    adopt_existing_identity(&mut slice, &existing);
                     match self.storage.update(&slice_key, &slice).await {
                         Ok(_) => {
                             debug!("Updated mirrored EndpointSlice {}/{}", ns, slice_name);
@@ -894,7 +910,7 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                         if existing.endpoints == slice.endpoints && existing.ports == slice.ports {
                             continue;
                         }
-                        slice.metadata.resource_version = existing.metadata.resource_version;
+                        adopt_existing_identity(&mut slice, &existing);
                         let _ = self.storage.update(&slice_key, &slice).await;
                     }
                     Err(_) => {
@@ -1237,7 +1253,7 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                     if existing.endpoints == slice.endpoints && existing.ports == slice.ports {
                         continue;
                     }
-                    slice.metadata.resource_version = existing.metadata.resource_version;
+                    adopt_existing_identity(&mut slice, &existing);
                     match self.storage.update(&slice_key, &slice).await {
                         Ok(_) => {
                             info!(
@@ -2662,5 +2678,164 @@ mod tests {
         // an ignored update (resync) never reaches the queue
         controller.on_pod_update(Some(&pod), Some(&pod.clone()));
         assert!(controller.pod_queue_rx.lock().await.try_recv().is_err());
+    }
+
+    /// The API server's generic Store turns a non-empty `metadata.uid` on a PUT
+    /// into a UID precondition (rest/update.go:188-203). A slice the controller
+    /// rebuilt from scratch carries a new random UID, so every update of an
+    /// existing slice was a 409 and the slice stayed at its first (empty)
+    /// content: the sig-network regression after #2108.
+    #[tokio::test]
+    async fn updating_an_existing_slice_keeps_its_uid() {
+        struct UidPreconditionStorage {
+            inner: Arc<MemoryStorage>,
+        }
+
+        #[async_trait::async_trait]
+        impl Storage for UidPreconditionStorage {
+            async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+            where
+                T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+            {
+                self.inner.create(key, value).await
+            }
+            async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+            where
+                T: serde::de::DeserializeOwned + Send + Sync,
+            {
+                self.inner.get(key).await
+            }
+            async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+            where
+                T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+            {
+                let sent = serde_json::to_value(value).unwrap();
+                let stored: serde_json::Value = self.inner.get(key).await?;
+                let sent_uid = sent["metadata"]["uid"].as_str().unwrap_or("");
+                let stored_uid = stored["metadata"]["uid"].as_str().unwrap_or("");
+                if !sent_uid.is_empty() && sent_uid != stored_uid {
+                    return Err(rusternetes_common::Error::Conflict(format!(
+                        "Precondition failed: UID in precondition: {sent_uid}, UID in object meta: {stored_uid}"
+                    )));
+                }
+                self.inner.update(key, value).await
+            }
+            async fn update_raw(
+                &self,
+                key: &str,
+                value: &serde_json::Value,
+            ) -> rusternetes_common::Result<()> {
+                self.inner.update_raw(key, value).await
+            }
+            async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+                self.inner.delete(key).await
+            }
+            async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+            where
+                T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+            {
+                self.inner.list(prefix).await
+            }
+            async fn watch(
+                &self,
+                prefix: &str,
+            ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+                self.inner.watch(prefix).await
+            }
+            async fn watch_from_revision(
+                &self,
+                prefix: &str,
+                revision: i64,
+            ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+                self.inner.watch_from_revision(prefix, revision).await
+            }
+            async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+                self.inner.current_revision().await
+            }
+            async fn is_revision_compacted(
+                &self,
+                revision: i64,
+            ) -> rusternetes_common::Result<bool> {
+                self.inner.is_revision_compacted(revision).await
+            }
+        }
+
+        let inner = Arc::new(MemoryStorage::new());
+        let storage = Arc::new(UidPreconditionStorage {
+            inner: Arc::clone(&inner),
+        });
+        let controller = EndpointSliceController::new(Arc::clone(&storage));
+
+        let service = Service {
+            type_meta: rusternetes_common::types::TypeMeta {
+                kind: "Service".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: ObjectMeta::new("svc").with_namespace("default"),
+            spec: ServiceSpec {
+                ports: vec![ServicePort {
+                    name: None,
+                    port: 80,
+                    target_port: None,
+                    protocol: "TCP".to_string(),
+                    node_port: None,
+                    app_protocol: None,
+                }],
+                selector: Some(HashMap::from([("app".to_string(), "test".to_string())])),
+                ..Default::default()
+            },
+            status: None,
+        };
+        storage
+            .create(&build_key("services", Some("default"), "svc"), &service)
+            .await
+            .unwrap();
+
+        // No pod yet: the slice is created empty.
+        controller.reconcile_service(&service).await.unwrap();
+        let slice_key = build_key("endpointslices", Some("default"), "svc");
+        let first: EndpointSlice = storage.get(&slice_key).await.unwrap();
+        assert!(first.endpoints.is_empty());
+
+        // A ready pod appears: the existing slice must be updated.
+        let pod = Pod {
+            type_meta: rusternetes_common::types::TypeMeta {
+                kind: "Pod".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: ObjectMeta::new("p1")
+                .with_namespace("default")
+                .with_labels(HashMap::from([("app".to_string(), "test".to_string())])),
+            spec: Some(rusternetes_common::resources::PodSpec {
+                containers: vec![rusternetes_common::resources::Container {
+                    name: "c".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            status: Some(rusternetes_common::resources::PodStatus {
+                phase: Some(Phase::Running),
+                pod_ip: Some("10.0.0.1".to_string()),
+                conditions: Some(vec![rusternetes_common::resources::PodCondition {
+                    condition_type: "Ready".to_string(),
+                    status: "True".to_string(),
+                    reason: None,
+                    message: None,
+                    last_probe_time: None,
+                    last_transition_time: None,
+                    observed_generation: None,
+                }]),
+                ..Default::default()
+            }),
+        };
+        storage
+            .create(&build_key("pods", Some("default"), "p1"), &pod)
+            .await
+            .unwrap();
+
+        controller.reconcile_service(&service).await.unwrap();
+        let second: EndpointSlice = storage.get(&slice_key).await.unwrap();
+        assert_eq!(second.endpoints.len(), 1);
+        assert_eq!(second.metadata.uid, first.metadata.uid);
     }
 }

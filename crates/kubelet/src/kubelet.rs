@@ -1761,9 +1761,18 @@ impl Kubelet {
         };
 
         if should_write {
-            // Node heartbeat is a pure status write (Ready condition, heartbeat
-            // time) — route through the /status subresource.
-            self.storage.update_status(&key, &node).await?;
+            // patchNodeStatus (kubelet_node_status.go:564-568) ->
+            // nodeutil.PatchNodeStatus (component-helpers/node/util/status.go
+            // :33-44): a strategic-merge PATCH of the /status subresource
+            // carrying only the delta against `original_node`, not a full
+            // status PUT. Direct (non-API) backends write `node` whole via
+            // update_status (see Storage::patch_status_strategic_merge).
+            let patch = crate::node_status::prepare_patch_for_node_status(&original_node, &node)
+                .map_err(|e| anyhow::anyhow!("failed to patch status for node: {e}"))?;
+            let _: Node = self
+                .storage
+                .patch_status_strategic_merge(&key, &patch, &node)
+                .await?;
             self.status_report_state.lock().unwrap().last_report = Some(std::time::Instant::now());
         }
 
