@@ -38,11 +38,14 @@ impl NamespaceScopedStrategy for Strategy {
 }
 
 impl RestCreateStrategy<ReplicaSet> for Strategy {
-    /// strategy.go:80-86. `DropDisabledTemplateFields` drops nothing we
-    /// model (see the Deployment strategy).
+    /// strategy.go:80-86, including `DropDisabledTemplateFields` (:86).
     fn prepare_for_create(&self, _ctx: &RequestContext, obj: &mut ReplicaSet) {
         obj.status = Some(ReplicaSetStatus::default());
         obj.metadata.generation = Some(1);
+        rusternetes_common::pod_drop_disabled::drop_disabled_template_fields(
+            &mut obj.spec.template,
+            None,
+        );
     }
 
     fn validate(&self, _ctx: &RequestContext, obj: &ReplicaSet) -> ErrorList {
@@ -72,6 +75,10 @@ impl RestUpdateStrategy<ReplicaSet> for Strategy {
     /// generation. Unlike a Deployment, annotations do not.
     fn prepare_for_update(&self, _ctx: &RequestContext, obj: &mut ReplicaSet, old: &ReplicaSet) {
         obj.status = old.status.clone();
+        rusternetes_common::pod_drop_disabled::drop_disabled_template_fields(
+            &mut obj.spec.template,
+            Some(&old.spec.template),
+        );
         if !semantic_equal(&obj.spec, &old.spec) {
             obj.metadata.generation = Some(old.metadata.generation.unwrap_or(0) + 1);
         }

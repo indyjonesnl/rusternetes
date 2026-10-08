@@ -44,6 +44,10 @@ fn max_unavailable_in_use(ss: Option<&StatefulSet>) -> bool {
 /// `rollingUpdate.maxUnavailable` is dropped unless the stored object already
 /// uses it.
 fn drop_disabled_fields(new: &mut StatefulSet, old: Option<&StatefulSet>) {
+    rusternetes_common::pod_drop_disabled::drop_disabled_template_fields(
+        &mut new.spec.template,
+        old.map(|o| &o.spec.template),
+    );
     if !feature_gates::enabled(Feature::MaxUnavailableStatefulSet) && !max_unavailable_in_use(old) {
         if let Some(ru) = new
             .spec

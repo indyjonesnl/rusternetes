@@ -41,11 +41,14 @@ impl NamespaceScopedStrategy for Strategy {
 impl RestCreateStrategy<DaemonSet> for Strategy {
     /// `PrepareForCreate` (strategy.go:70-80): status is cleared, the
     /// generation starts at 1 and the template generation at least at 1.
-    /// `DropDisabledTemplateFields` drops nothing we model (see the Deployment
-    /// strategy).
+    /// `DropDisabledTemplateFields` is strategy.go:79.
     fn prepare_for_create(&self, _ctx: &RequestContext, obj: &mut DaemonSet) {
         obj.status = Some(DaemonSetStatus::default());
         obj.metadata.generation = Some(1);
+        rusternetes_common::pod_drop_disabled::drop_disabled_template_fields(
+            &mut obj.spec.template,
+            None,
+        );
         let template_generation = obj.template_generation();
         obj.set_template_generation(template_generation.max(1));
     }
@@ -69,6 +72,10 @@ impl RestUpdateStrategy<DaemonSet> for Strategy {
     /// generation.
     fn prepare_for_update(&self, _ctx: &RequestContext, obj: &mut DaemonSet, old: &DaemonSet) {
         obj.status = old.status.clone();
+        rusternetes_common::pod_drop_disabled::drop_disabled_template_fields(
+            &mut obj.spec.template,
+            Some(&old.spec.template),
+        );
         let old_template_generation = old.template_generation();
         obj.set_template_generation(old_template_generation);
 

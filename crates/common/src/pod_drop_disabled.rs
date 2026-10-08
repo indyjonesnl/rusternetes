@@ -48,6 +48,17 @@ pub fn drop_disabled_pod_fields(pod: &mut Pod, old: Option<&Pod>) {
     drop_disabled_pod_status_fields(status, old_status, old_spec);
 }
 
+/// `podutil.DropDisabledTemplateFields(podTemplate, oldPodTemplate)`
+/// (util.go:677-695): the same drop as [`drop_disabled_pod_fields`], for the
+/// pod template every workload strategy's `PrepareForCreate` /
+/// `PrepareForUpdate` carries. `old` is `None` on create.
+pub fn drop_disabled_template_fields(
+    template: &mut crate::resources::workloads::PodTemplateSpec,
+    old: Option<&crate::resources::workloads::PodTemplateSpec>,
+) {
+    drop_disabled_fields(&mut template.spec, old.map(|t| &t.spec));
+}
+
 /// `dropDisabledFields` (util.go:721-814), for the gates in the module doc.
 fn drop_disabled_fields(spec: &mut PodSpec, old: Option<&PodSpec>) {
     if !enabled(Feature::PodLevelResources) && !pod_level_resources_in_use(old) {

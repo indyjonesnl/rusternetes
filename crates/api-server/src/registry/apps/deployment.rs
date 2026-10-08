@@ -39,12 +39,14 @@ impl NamespaceScopedStrategy for Strategy {
 }
 
 impl RestCreateStrategy<Deployment> for Strategy {
-    /// strategy.go:72-79. `DropDisabledTemplateFields` drops nothing we
-    /// model: every gated pod field it covers is either on by default in 1.35
-    /// or absent from our types.
+    /// strategy.go:72-79, including `DropDisabledTemplateFields` (:79).
     fn prepare_for_create(&self, _ctx: &RequestContext, obj: &mut Deployment) {
         obj.status = Some(DeploymentStatus::default());
         obj.metadata.generation = Some(1);
+        rusternetes_common::pod_drop_disabled::drop_disabled_template_fields(
+            &mut obj.spec.template,
+            None,
+        );
     }
 
     fn validate(&self, _ctx: &RequestContext, obj: &Deployment) -> ErrorList {
@@ -81,6 +83,10 @@ impl RestUpdateStrategy<Deployment> for Strategy {
     /// generation.
     fn prepare_for_update(&self, _ctx: &RequestContext, obj: &mut Deployment, old: &Deployment) {
         obj.status = old.status.clone();
+        rusternetes_common::pod_drop_disabled::drop_disabled_template_fields(
+            &mut obj.spec.template,
+            Some(&old.spec.template),
+        );
         if !semantic_equal(&obj.spec, &old.spec)
             || !semantic_equal(&obj.metadata.annotations, &old.metadata.annotations)
         {
