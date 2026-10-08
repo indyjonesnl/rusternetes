@@ -5612,6 +5612,100 @@ mod tests {
             .is_none());
     }
 
+    /// A non-indexed failed pod of `job-uid-1` that finished
+    /// `finished_secs_ago` seconds ago (and still holds the tracking finalizer).
+    fn failed_plain_pod(name: &str, finished_secs_ago: i64) -> Pod {
+        let mut pod = failed_pod_with_count(name, 0, 0, finished_secs_ago);
+        pod.metadata.annotations = None;
+        pod.metadata.labels = Some(HashMap::from([(
+            "job-name".to_string(),
+            "plain-job".to_string(),
+        )]));
+        pod.metadata.owner_references.as_mut().unwrap()[0].name = "plain-job".to_string();
+        pod
+    }
+
+    async fn plain_job_with_failed_pod(
+        storage: &Arc<MemoryStorage>,
+        finished_secs_ago: i64,
+    ) -> Job {
+        let job = make_job("plain-job", "default", 1, 1);
+        storage
+            .create("/registry/jobs/default/plain-job", &job)
+            .await
+            .unwrap();
+        let failed = failed_plain_pod("failed-0", finished_secs_ago);
+        storage
+            .create("/registry/pods/default/failed-0", &failed)
+            .await
+            .unwrap();
+        job
+    }
+
+    async fn plain_job_pod_names(storage: &Arc<MemoryStorage>) -> Vec<String> {
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        pods.into_iter().map(|p| p.metadata.name).collect()
+    }
+
+    /// `manageJob` (`job_controller.go:1731-1738`): a replacement pod is not
+    /// created while `newBackoffRecord.getRemainingTime(DefaultJobPodFailureBackOff,
+    /// MaxJobPodFailureBackOff)` is positive; the sync is re-enqueued with that
+    /// delay instead.
+    #[tokio::test]
+    async fn test_replacement_pod_delayed_by_failure_backoff() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = plain_job_with_failed_pod(&storage, 1).await;
+        let controller = JobController::new(storage.clone());
+        controller.reconcile(&mut job).await.unwrap();
+        assert_eq!(
+            plain_job_pod_names(&storage).await,
+            vec!["failed-0".to_string()],
+            "no replacement may be created inside the failure backoff window"
+        );
+        let d = controller
+            .take_requeue_delay("default", "plain-job")
+            .expect("the delayed creation must request a delayed requeue");
+        assert!(
+            d > Duration::from_secs(8) && d <= Duration::from_secs(10),
+            "{d:?}"
+        );
+    }
+
+    /// Once the window has elapsed the replacement is created at once.
+    #[tokio::test]
+    async fn test_replacement_pod_created_after_failure_backoff_elapsed() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = plain_job_with_failed_pod(&storage, 60).await;
+        let controller = JobController::new(storage.clone());
+        controller.reconcile(&mut job).await.unwrap();
+        assert_eq!(plain_job_pod_names(&storage).await.len(), 2);
+    }
+
+    /// `podBackoffStore` (`backoff_utils.go:44-91`) outlives a sync: after the
+    /// failed pod's finalizer is released it is no longer a "new" failed pod,
+    /// yet the next sync must still be inside the backoff window.
+    #[tokio::test]
+    async fn test_failure_backoff_survives_across_syncs() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = plain_job_with_failed_pod(&storage, 1).await;
+        let controller = JobController::new(storage.clone());
+        controller.reconcile(&mut job).await.unwrap();
+        let _ = controller.take_requeue_delay("default", "plain-job");
+        let mut job: Job = storage
+            .get("/registry/jobs/default/plain-job")
+            .await
+            .unwrap();
+        controller.reconcile(&mut job).await.unwrap();
+        assert_eq!(
+            plain_job_pod_names(&storage).await,
+            vec!["failed-0".to_string()],
+            "the second sync must still honour the recorded failure"
+        );
+        assert!(controller
+            .take_requeue_delay("default", "plain-job")
+            .is_some());
+    }
+
     /// `enqueueSyncJobWithDelay` never delays less than `SyncJobBatchPeriod`
     /// (`job_controller.go:620`).
     #[test]
