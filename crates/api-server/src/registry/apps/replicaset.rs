@@ -124,11 +124,11 @@ impl RestUpdateStrategy<ReplicaSet> for StatusStrategy {
     }
 
     /// strategy.go:209-215: only status may change. Unlike the Deployment
-    /// status strategy, labels are not reset. `dropDisabledStatusFields` is a
-    /// no-op: its `DeploymentReplicaSetTerminatingReplicas` gate is on by
-    /// default in 1.35.
+    /// status strategy, labels are not reset. `dropDisabledStatusFields` drops
+    /// `terminatingReplicas` when its gate is off.
     fn prepare_for_update(&self, _ctx: &RequestContext, obj: &mut ReplicaSet, old: &ReplicaSet) {
         obj.spec = old.spec.clone();
+        drop_disabled_status_fields(&mut obj.status, &old.status);
     }
 
     fn validate_update(
@@ -197,6 +197,25 @@ pub fn new_scale_rest(storage: Arc<StorageBackend>) -> ScaleRest<ReplicaSet> {
             set_replicas: |rs, replicas| rs.spec.replicas = replicas,
         },
     )
+}
+
+/// `dropDisabledStatusFields` (pkg/registry/apps/replicaset/strategy.go): with
+/// `DeploymentReplicaSetTerminatingReplicas` off, `status.terminatingReplicas`
+/// is dropped unless the old status already carries it.
+fn drop_disabled_status_fields(
+    status: &mut Option<ReplicaSetStatus>,
+    old: &Option<ReplicaSetStatus>,
+) {
+    if !rusternetes_common::feature_gates::enabled(
+        rusternetes_common::feature_gates::Feature::DeploymentReplicaSetTerminatingReplicas,
+    ) && old
+        .as_ref()
+        .is_none_or(|o| o.terminating_replicas.is_none())
+    {
+        if let Some(s) = status.as_mut() {
+            s.terminating_replicas = None;
+        }
+    }
 }
 
 #[cfg(test)]
