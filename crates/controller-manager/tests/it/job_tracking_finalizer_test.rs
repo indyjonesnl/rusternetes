@@ -27,6 +27,24 @@ use std::sync::Arc;
 // Fixtures
 // ---------------------------------------------------------------------------
 
+/// Stand-in for the kubelet: remove every pod the controller deleted
+/// gracefully (it carries a deletionTimestamp), so a Job waiting on
+/// terminating pods can finish (`enactJobFinished`, job_controller.go:1520).
+async fn reap_terminating(storage: &Arc<MemoryStorage>) {
+    let pods: Vec<Pod> = storage.list("/registry/pods/").await.unwrap();
+    for pod in pods
+        .iter()
+        .filter(|p| p.metadata.deletion_timestamp.is_some())
+    {
+        let key = build_key(
+            "pods",
+            pod.metadata.namespace.as_deref(),
+            &pod.metadata.name,
+        );
+        let _ = storage.delete(&key).await;
+    }
+}
+
 async fn setup() -> Arc<MemoryStorage> {
     let storage = Arc::new(MemoryStorage::new());
     storage.clear();
@@ -469,6 +487,9 @@ async fn a_finished_job_releases_every_pod_it_still_holds() {
     set_phase(&storage, "default", &pods[1], Phase::Running).await;
 
     controller.reconcile_all().await.unwrap();
+    // The running pod was deleted gracefully; Failed waits until it is gone.
+    reap_terminating(&storage).await;
+    controller.reconcile_all().await.unwrap();
     let finished = storage.get::<Job>(&key).await.unwrap();
     assert!(
         status_of(&finished)
@@ -653,6 +674,8 @@ async fn a_job_is_never_written_finished_while_uids_are_still_uncounted() {
     let pods = job_pods(&storage, "default").await;
     set_phase(&storage, "default", &pods[0], Phase::Failed).await;
     set_phase(&storage, "default", &pods[1], Phase::Running).await;
+    controller.reconcile_all().await.unwrap();
+    reap_terminating(&storage).await;
     controller.reconcile_all().await.unwrap();
 
     let mut writes = 0;
