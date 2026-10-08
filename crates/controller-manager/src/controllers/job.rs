@@ -1680,7 +1680,30 @@ impl<S: Storage + 'static> JobController<S> {
                     .and_then(|s| s.completed_indexes.as_deref())
                     .unwrap_or(""),
             );
-            set.extend(collect_indexes_in_phase(job_pods.iter(), Phase::Succeeded));
+            // Rusternetes deviation (no upstream equivalent): once
+            // SuccessCriteriaMet is published, a pod this controller already
+            // deleted (`deleteActivePods`, job_controller.go:1001) that then
+            // exits 0 before the kubelet kills it must not add an index.
+            // Upstream's runtime reports such a pod Failed (SIGKILL) so it
+            // never reaches `calculateSucceededIndexes`; here, since #2784
+            // keeps the Job unfinished while pods terminate, it would raise
+            // `status.succeeded` above what met the policy (sig-apps
+            // "succeededIndexes rule ... some indexes remain pending" waits
+            // for exactly 1).
+            let success_criteria_met = job
+                .status
+                .as_ref()
+                .and_then(|s| s.conditions.as_ref())
+                .is_some_and(|cs| {
+                    cs.iter()
+                        .any(|c| c.condition_type == "SuccessCriteriaMet" && c.status == "True")
+                });
+            set.extend(collect_indexes_in_phase(
+                job_pods
+                    .iter()
+                    .filter(|p| !(success_criteria_met && p.metadata.deletion_timestamp.is_some())),
+                Phase::Succeeded,
+            ));
             set
         } else {
             HashSet::new()
@@ -6990,5 +7013,68 @@ mod tests {
         controller.reconcile(&mut j).await.unwrap();
         let got: Job = storage.get(job_key).await.unwrap();
         assert!(conds_of(&got).contains(&"Failed".to_string()));
+    }
+
+    /// Regression of #2784 (sig-apps "with successPolicy succeededIndexes rule
+    /// should succeeded even when some indexes remain pending"): the spec waits
+    /// for `status.succeeded == 1`. Before #2784 Complete was written in the
+    /// same pass that met the policy, so a later Succeeded pod was never
+    /// counted; now the Job stays unfinished while pods terminate, and a pod
+    /// the sync itself deleted that then exits 0 must not add an index.
+    #[tokio::test]
+    async fn success_policy_ignores_late_success_of_pods_it_deleted() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job("late", "default", 5, 2);
+        job.spec.completion_mode = Some("Indexed".to_string());
+        job.spec.success_policy = Some(
+            serde_json::from_value(serde_json::json!({
+                "rules": [{ "succeededIndexes": "0" }]
+            }))
+            .unwrap(),
+        );
+        let key = "/registry/jobs/default/late";
+        storage.create(key, &job).await.unwrap();
+        let p0 = make_indexed_pod("p0", "default", Phase::Succeeded, "late", "job-uid-1", 0);
+        let p1 = make_indexed_pod("p1", "default", Phase::Running, "late", "job-uid-1", 1);
+        storage
+            .create("/registry/pods/default/p0", &p0)
+            .await
+            .unwrap();
+        storage
+            .create("/registry/pods/default/p1", &p1)
+            .await
+            .unwrap();
+
+        let controller = JobController::new(storage.clone());
+        let mut j: Job = storage.get(key).await.unwrap();
+        controller.reconcile(&mut j).await.unwrap();
+
+        // The kubelet: the deleted pod's container exits 0 before it is killed.
+        let mut p1: Pod = storage.get("/registry/pods/default/p1").await.unwrap();
+        assert!(p1.metadata.deletion_timestamp.is_some(), "sync deletes p1");
+        p1.status.as_mut().unwrap().phase = Some(Phase::Succeeded);
+        storage
+            .update("/registry/pods/default/p1", &p1)
+            .await
+            .unwrap();
+
+        let mut j: Job = storage.get(key).await.unwrap();
+        controller.reconcile(&mut j).await.unwrap();
+        reap_terminating(&storage).await;
+        let mut j: Job = storage.get(key).await.unwrap();
+        controller.reconcile(&mut j).await.unwrap();
+
+        let got: Job = storage.get(key).await.unwrap();
+        let st = got.status.as_ref().unwrap();
+        assert_eq!(st.succeeded, Some(1), "{st:?}");
+        assert_eq!(st.completed_indexes.as_deref(), Some("0"), "{st:?}");
+        assert!(
+            st.conditions
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|c| c.condition_type == "Complete" && c.status == "True"),
+            "{st:?}"
+        );
     }
 }
