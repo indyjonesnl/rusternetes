@@ -273,4 +273,128 @@ mod tests {
         strategy.prepare_for_update(&ctx, &mut changed, &old);
         assert_eq!(changed.metadata.generation, Some(4));
     }
+
+    fn messages(errs: &ErrorList) -> String {
+        errs.iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn strategy_update(
+        ctx: &RequestContext,
+        new: &MutatingAdmissionPolicy,
+        old: &MutatingAdmissionPolicy,
+    ) -> ErrorList {
+        Strategy.validate_update(ctx, new, old)
+    }
+
+    /// `TestValidateMutatingAdmissionPolicy` "variable compile error"
+    /// (validation_test.go:4395-4415): a `variables` expression that does not
+    /// compile.
+    #[test]
+    fn create_rejects_a_variable_that_does_not_compile() {
+        let mut p = valid();
+        p.spec.as_mut().unwrap().variables =
+            Some(serde_json::from_value(json!([{"name": "x", "expression": "///"}])).unwrap());
+        let errs = RestCreateStrategy::validate(&Strategy, &RequestContext::new(None), &p);
+        assert!(
+            messages(&errs).contains(
+                r#"spec.variables[0].expression: Invalid value: "///": compilation failed"#
+            ),
+            "{}",
+            messages(&errs)
+        );
+    }
+
+    /// `validateMatchCondition` (validation.go:984-997) under the mutating
+    /// policy's `spec.matchConditions`.
+    #[test]
+    fn create_rejects_a_match_condition_that_does_not_compile() {
+        let mut p = valid();
+        p.spec.as_mut().unwrap().match_conditions =
+            Some(serde_json::from_value(json!([{"name": "c", "expression": "///"}])).unwrap());
+        let errs = RestCreateStrategy::validate(&Strategy, &RequestContext::new(None), &p);
+        assert!(
+            messages(&errs).contains(
+                r#"spec.matchConditions[0].expression: Invalid value: "///": compilation failed"#
+            ),
+            "{}",
+            messages(&errs)
+        );
+    }
+
+    /// `validateApplyConfiguration` / `validateJSONPatch`
+    /// (validation.go:1458-1498).
+    #[test]
+    fn create_rejects_a_patch_expression_that_does_not_compile() {
+        let mut p = valid();
+        p.spec.as_mut().unwrap().mutations = Some(
+            serde_json::from_value(json!([
+                {"patchType": "ApplyConfiguration", "applyConfiguration": {"expression": "///"}},
+                {"patchType": "JSONPatch", "jsonPatch": {"expression": "///"}}
+            ]))
+            .unwrap(),
+        );
+        let errs = RestCreateStrategy::validate(&Strategy, &RequestContext::new(None), &p);
+        let m = messages(&errs);
+        assert!(
+            m.contains(r#"spec.mutations[0].applyConfiguration.expression: Invalid value: "///": compilation failed"#),
+            "{m}"
+        );
+        assert!(
+            m.contains(r#"spec.mutations[1].jsonPatch.expression: Invalid value: "///": compilation failed"#),
+            "{m}"
+        );
+    }
+
+    /// The `Object{...}` / `JSONPatch{...}` initializers are valid.
+    #[test]
+    fn create_accepts_object_and_jsonpatch_initializers() {
+        let mut p = valid();
+        p.spec.as_mut().unwrap().mutations = Some(
+            serde_json::from_value(json!([
+                {"patchType": "ApplyConfiguration", "applyConfiguration":
+                    {"expression": "Object{ spec: Object.spec{ replicas: 1 } }"}},
+                {"patchType": "JSONPatch", "jsonPatch": {"expression":
+                    "[JSONPatch{op: \"add\", path: \"/spec/replicas\", value: 1}]"}}
+            ]))
+            .unwrap(),
+        );
+        let errs = RestCreateStrategy::validate(&Strategy, &RequestContext::new(None), &p);
+        assert!(errs.is_empty(), "{}", messages(&errs));
+    }
+
+    /// `ValidateMutatingAdmissionPolicyUpdate` (validation.go:1349-1354) with
+    /// `ignoreMutatingAdmissionPolicyMatchConditions` (:630-638): unchanged
+    /// `matchConditions` and `paramKind` are not compiled again; a change is.
+    #[test]
+    fn update_skips_unchanged_match_conditions_only() {
+        let ctx = RequestContext::new(None);
+        let mut old = valid();
+        old.spec.as_mut().unwrap().match_conditions =
+            Some(serde_json::from_value(json!([{"name": "c", "expression": "///"}])).unwrap());
+        let unchanged = old.clone();
+        let errs = strategy_update(&ctx, &unchanged, &old);
+        assert!(errs.is_empty(), "{}", messages(&errs));
+
+        let mut changed = old.clone();
+        changed.spec.as_mut().unwrap().match_conditions =
+            Some(serde_json::from_value(json!([{"name": "c", "expression": "///  "}])).unwrap());
+        let errs = strategy_update(&ctx, &changed, &old);
+        assert!(
+            messages(&errs).contains("spec.matchConditions[0].expression"),
+            "{}",
+            messages(&errs)
+        );
+
+        let mut param_changed = old.clone();
+        param_changed.spec.as_mut().unwrap().param_kind = None;
+        let errs = strategy_update(&ctx, &param_changed, &old);
+        assert!(
+            messages(&errs).contains("spec.matchConditions[0].expression"),
+            "{}",
+            messages(&errs)
+        );
+    }
 }
