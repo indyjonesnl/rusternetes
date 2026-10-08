@@ -217,6 +217,29 @@ pub trait Storage: Send + Sync {
         patch_via_update(self, key, patch).await
     }
 
+    /// PATCH the `/status` subresource with a strategic-merge `patch`
+    /// (`Nodes().Patch(ctx, name, types.StrategicMergePatchType, patchBytes,
+    /// metav1.PatchOptions{}, "status")`, `nodeutil.PatchNodeStatus`,
+    /// staging/src/k8s.io/component-helpers/node/util/status.go:33-44).
+    ///
+    /// `full` is the complete desired object the patch was computed to
+    /// produce. API-backed storage ignores it and sends the delta. Direct
+    /// backends have no strategic-merge engine at this layer (the
+    /// api-server's lives in its own crate) and an RFC 7386 merge would
+    /// REPLACE merge-keyed lists such as `status.conditions` with the delta, so
+    /// they fall back to [`Storage::update_status`] with `full`.
+    async fn patch_status_strategic_merge<T>(
+        &self,
+        key: &str,
+        _patch: &serde_json::Value,
+        full: &T,
+    ) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        self.update_status(key, full).await
+    }
+
     /// Update a resource with raw JSON value (for GC operations)
     async fn update_raw(&self, key: &str, value: &serde_json::Value) -> Result<()>;
 
@@ -760,6 +783,20 @@ impl<S: Storage> Storage for std::sync::Arc<S> {
         (**self).patch_strategic_merge(key, patch).await
     }
 
+    async fn patch_status_strategic_merge<T>(
+        &self,
+        key: &str,
+        patch: &serde_json::Value,
+        full: &T,
+    ) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        (**self)
+            .patch_status_strategic_merge(key, patch, full)
+            .await
+    }
+
     async fn update_raw(&self, key: &str, value: &serde_json::Value) -> Result<()> {
         (**self).update_raw(key, value).await
     }
@@ -1247,6 +1284,25 @@ impl Storage for StorageBackend {
             #[cfg(feature = "api-client")]
             StorageBackend::Api(s) => Storage::update_status_cas(s, key, value).await,
             _ => update_status_cas_via_update(self, key, value).await,
+        }
+    }
+
+    /// `Api` sends a real status PATCH; direct variants write `full`.
+    async fn patch_status_strategic_merge<T>(
+        &self,
+        key: &str,
+        patch: &serde_json::Value,
+        full: &T,
+    ) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        match self {
+            #[cfg(feature = "api-client")]
+            StorageBackend::Api(s) => {
+                Storage::patch_status_strategic_merge(s, key, patch, full).await
+            }
+            _ => self.update_status(key, full).await,
         }
     }
 
