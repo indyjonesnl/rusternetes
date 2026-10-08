@@ -11,7 +11,7 @@
 //! - `MutatingAdmissionPolicy` (`admissionregistration.k8s.io/v1beta1`,
 //!   served only under the `MutatingAdmissionPolicy` gate): the CEL compile of
 //!   `applyConfiguration` / `jsonPatch` / `matchConditions` / `variables`
-//!   (`validateApplyConfiguration`, `validateJSONPatch`, @CEL@) with the
+//!   (`validateApplyConfiguration`, `validateJSONPatch`, #2798) with the
 //!   update-time `ignoreMutatingAdmissionPolicyMatchConditions` /
 //!   `preexistingExpressions` options that only gate it, and the admission
 //!   plugin (#2731).
