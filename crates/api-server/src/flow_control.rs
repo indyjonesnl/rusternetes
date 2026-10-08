@@ -64,6 +64,8 @@ use tracing::warn;
 pub const DEFAULT_MAX_REQUESTS_IN_FLIGHT: i64 = 400;
 /// `--max-mutating-requests-inflight` default (`server/config.go:444`).
 pub const DEFAULT_MAX_MUTATING_REQUESTS_IN_FLIGHT: i64 = 200;
+/// `priorityLevelMaxSeatsPercent` (apf_controller.go:63).
+const PRIORITY_LEVEL_MAX_SEATS_PERCENT: f64 = 0.15;
 /// Default per-level `NominalConcurrencyShares` (`v1/defaults.go`).
 const DEFAULT_SHARES: i32 = 30;
 /// `Retry-After` value sent with a 429.
@@ -223,11 +225,17 @@ struct Config {
 }
 
 /// Result of classification.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Classification {
     pub flow_schema: String,
     pub priority_level: String,
     pub flow_distinguisher: String,
+    /// `FlowSchema.metadata.uid`, sent as
+    /// `X-Kubernetes-PF-FlowSchema-UID` (priority-and-fairness.go:354-361).
+    pub flow_schema_uid: String,
+    /// `PriorityLevelConfiguration.metadata.uid`, sent as
+    /// `X-Kubernetes-PF-PriorityLevel-UID`.
+    pub priority_level_uid: String,
 }
 
 fn shares_of(pl: &PriorityLevelConfiguration) -> i32 {
@@ -583,11 +591,44 @@ impl<S: Storage> FlowControlEngine<S> {
             Some(FlowDistinguisherMethodType::ByNamespace) => d.namespace.clone(),
             _ => String::new(),
         };
+        let priority_level = fs.spec.priority_level_configuration.name.clone();
         Classification {
             flow_schema: fs.metadata.name.clone(),
-            priority_level: fs.spec.priority_level_configuration.name.clone(),
+            flow_schema_uid: fs.metadata.uid.clone(),
+            priority_level_uid: cfg
+                .levels
+                .get(&priority_level)
+                .map(|l| l.pl.metadata.uid.clone())
+                .unwrap_or_default(),
+            priority_level,
             flow_distinguisher,
         }
+    }
+
+    /// `GetMaxSeats` (max_seats.go:34), set in `finishQueueSetReconfigsLocked`
+    /// (apf_controller.go:882-894): MAX(1, MIN(ceil(0.15 * nominalCL),
+    /// nominalCL / handSize)), only for levels that queue; 0 otherwise.
+    pub fn max_seats(&self, priority_level: &str) -> u64 {
+        let cfg = self.config.read().unwrap();
+        let Some(l) = cfg.levels.get(priority_level) else {
+            return 0;
+        };
+        let Some(qc) =
+            l.pl.spec
+                .limited
+                .as_ref()
+                .and_then(|l| l.limit_response.as_ref())
+                .and_then(|lr| lr.queuing.as_ref())
+        else {
+            return 0;
+        };
+        let by_percent = (l.nominal_cl as f64 * PRIORITY_LEVEL_MAX_SEATS_PERCENT).ceil();
+        let by_hand = if qc.hand_size > 0 {
+            (l.nominal_cl as i64 / qc.hand_size as i64) as f64
+        } else {
+            by_percent
+        };
+        by_percent.min(by_hand).max(1.0) as u64
     }
 
     /// The queueset of a priority level (test and reaper support).
@@ -652,6 +693,22 @@ impl<S: Storage> FlowControlEngine<S> {
         seats: u32,
         wait_limit: Duration,
     ) -> Result<FlowControlPermit, FlowControlError> {
+        let we = WorkEstimate {
+            initial_seats: seats.max(1) as u64,
+            final_seats: 0,
+            additional_latency: Duration::ZERO,
+        };
+        self.execute_with_estimate(c, &we, wait_limit).await
+    }
+
+    /// [`Self::execute`] with the work estimator's full `WorkEstimate`
+    /// (`workEstimator()` result, priority-and-fairness.go:121-135).
+    pub async fn execute_with_estimate(
+        &self,
+        c: &Classification,
+        we: &WorkEstimate,
+        wait_limit: Duration,
+    ) -> Result<FlowControlPermit, FlowControlError> {
         // Hold the read lock across the synchronous `start_request`
         // (upstream: startRequest runs under `cfgCtlr.lock.RLock()`), so a
         // concurrent digest cannot judge the level idle and drop it between
@@ -671,14 +728,9 @@ impl<S: Storage> FlowControlEngine<S> {
             } else {
                 (0, "")
             };
-            let we = WorkEstimate {
-                initial_seats: seats.max(1) as u64,
-                final_seats: 0,
-                additional_latency: Duration::ZERO,
-            };
             level
                 .queues
-                .start_request(&we, hash_value, flow_distinguisher, &c.flow_schema)
+                .start_request(we, hash_value, flow_distinguisher, &c.flow_schema)
         };
         let handle = match started {
             Ok(h) => h,
@@ -713,6 +765,7 @@ mod tests {
             flow_schema: fs.into(),
             priority_level: pl.into(),
             flow_distinguisher: dist.into(),
+            ..Default::default()
         }
     }
 
