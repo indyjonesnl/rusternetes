@@ -118,9 +118,9 @@ impl<S: Storage + 'static> EphemeralVolumeController<S> {
 
     /// `handleVolume`.
     async fn handle_volume(&self, pod: &Pod, vol: &Volume) -> Result<()> {
-        let Some(eph) = vol.ephemeral.as_ref() else {
+        if vol.ephemeral.is_none() {
             return Ok(());
-        };
+        }
         let namespace = pod.metadata.namespace.as_deref().unwrap_or("");
         let pvc_name = volume_claim_name(pod, vol);
         let key = build_key("persistentvolumeclaims", Some(namespace), &pvc_name);
@@ -173,10 +173,13 @@ impl<S: Storage + 'static> EphemeralVolumeController<S> {
             spec: template.spec.clone(),
             status: None,
         };
-        self.storage
-            .create(&key, &pvc)
-            .await
-            .map_err(|e| anyhow!("create PVC {pvc_name}: {e}"))?;
+        // controller.go:295-300: count the attempt before the call, the
+        // failure after it.
+        ephemeral_volume_metrics::inc_create_attempts();
+        if let Err(e) = self.storage.create(&key, &pvc).await {
+            ephemeral_volume_metrics::inc_create_failures();
+            return Err(anyhow!("create PVC {pvc_name}: {e}"));
+        }
         info!(
             "Created ephemeral PVC {namespace}/{pvc_name} for pod {}",
             pod.metadata.name
@@ -468,8 +471,9 @@ mod tests {
         c.sync_pod("ns", "test-pod").await.unwrap();
         assert_eq!(ephemeral_volume_metrics::create_attempts(), a + 1);
         assert_eq!(ephemeral_volume_metrics::create_failures(), f);
-        assert!(ephemeral_volume_metrics::gather()
-            .contains("ephemeral_volume_controller_create_total"));
+        assert!(
+            ephemeral_volume_metrics::gather().contains("ephemeral_volume_controller_create_total")
+        );
     }
 
     // Existing claim: no create call, so no metric.
