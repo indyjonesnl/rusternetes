@@ -55,6 +55,9 @@ pub struct JobController<S: Storage> {
     /// (`enqueueSyncJobWithDelay`, `job_controller.go:620`); the worker drains
     /// it after each sync and calls `WorkQueue::add_after`.
     requeue_delays: std::sync::Mutex<HashMap<String, Duration>>,
+    /// Upstream's `podBackoffStore` (`job_controller.go:128`): per-Job failure
+    /// history that delays replacement pod creation (`manageJob`, `:1731`).
+    backoff_store: BackoffStore,
 }
 
 /// `SyncJobBatchPeriod` (`job_controller.go:64`).
@@ -99,6 +102,11 @@ struct TrackedPods {
     /// Pods whose tracking finalizer must come off — but only AFTER the status
     /// above has been written, never before.
     to_release: Vec<Pod>,
+    /// `jobCtx.newBackoffRecord` (`job_controller.go:934`).
+    new_backoff_record: BackoffRecord,
+    /// Upstream's `needsFlush`: the record is only stored once the status that
+    /// accounts for the new pods is written (`:1396`).
+    needs_flush: bool,
 }
 
 /// Terminal-failure conditions for a Job, in the order the api-server demands.
@@ -281,6 +289,7 @@ impl<S: Storage + 'static> JobController<S> {
             expectations: Arc::new(ControllerExpectations::new()),
             finalizer_expectations: FinalizerExpectations::new(),
             requeue_delays: std::sync::Mutex::new(HashMap::new()),
+            backoff_store: BackoffStore::default(),
         }
     }
 
@@ -445,6 +454,7 @@ impl<S: Storage + 'static> JobController<S> {
         only_replace_failed_pods: bool,
         delayed_deletion_uids: &HashSet<String>,
         job_terminal: bool,
+        completions: i32,
     ) -> TrackedPods {
         // Upstream satisfies an expectation when its informer delivers the pod
         // without the finalizer (`finalizerRemovalObserved`). Our equivalent
@@ -484,7 +494,7 @@ impl<S: Storage + 'static> JobController<S> {
 
         // Phase 3 of the previous pass: UIDs whose finalizer removal has landed
         // become real counter increments.
-        clean_uncounted_pods_without_finalizers(
+        let cleaned = clean_uncounted_pods_without_finalizers(
             &mut base_succeeded,
             &mut base_failed,
             &mut uncounted,
@@ -493,6 +503,11 @@ impl<S: Storage + 'static> JobController<S> {
 
         // Phase 1 of this pass: claim newly-finished pods.
         let mut to_release: Vec<Pod> = Vec::new();
+        // `getNewFinishedPods` (`job_controller.go:1633`) feeds
+        // `newBackoffRecord`: finalizer held, not already parked, valid index.
+        let mut new_succeeded: Vec<&Pod> = Vec::new();
+        let mut new_failed: Vec<&Pod> = Vec::new();
+        let mut needs_flush = cleaned;
         for pod in job_pods.iter() {
             if !has_job_tracking_finalizer(pod) || expected_removed.contains(&pod.metadata.uid) {
                 continue;
@@ -508,8 +523,14 @@ impl<S: Storage + 'static> JobController<S> {
             } else {
                 None
             };
+            let valid_index =
+                !is_indexed || get_pod_index(pod).is_some_and(|i| i >= 0 && i < completions);
             match phase {
                 Some(Phase::Succeeded) => {
+                    if valid_index && !uncounted_has_succeeded(&uncounted, uid) {
+                        new_succeeded.push(pod);
+                        needs_flush = true;
+                    }
                     // An Indexed Job tracks successes by completion index in
                     // `.status.completedIndexes`, which is durable on its own,
                     // so upstream never parks their UIDs: "The completion index
@@ -521,6 +542,9 @@ impl<S: Storage + 'static> JobController<S> {
                     to_release.push(pod.clone());
                 }
                 Some(Phase::Failed) => {
+                    if valid_index && !uncounted_has_failed(&uncounted, uid) {
+                        new_failed.push(pod);
+                    }
                     // `canRemoveFinalizer` (`job_controller.go:1359`): the last
                     // failed pod of an index is neither counted nor released
                     // until a replacement for the index exists, because it is
@@ -538,6 +562,7 @@ impl<S: Storage + 'static> JobController<S> {
                         && !uncounted_has_failed(&uncounted, uid)
                     {
                         push_uncounted_failed(&mut uncounted, uid);
+                        needs_flush = true;
                     }
                     to_release.push(pod.clone());
                 }
@@ -557,7 +582,12 @@ impl<S: Storage + 'static> JobController<S> {
         let failed =
             base_failed.unwrap_or(0) + uncounted.failed.as_ref().map_or(0, |v| v.len() as i32);
 
+        let new_backoff_record =
+            self.backoff_store
+                .new_backoff_record(job_key, &new_succeeded, &new_failed);
         TrackedPods {
+            new_backoff_record,
+            needs_flush,
             status_succeeded: Some(base_succeeded.unwrap_or(0)),
             status_failed: Some(base_failed.unwrap_or(0)),
             succeeded,
@@ -630,6 +660,7 @@ impl<S: Storage + 'static> JobController<S> {
     /// `cleanUncountedPodsWithoutFinalizers` over the UIDs that were actually
     /// released — in the SAME pass, so the visible counters converge here
     /// instead of waiting for a sync that a finished Job never gets.
+    #[allow(clippy::too_many_arguments)]
     async fn flush_status_and_release(
         &self,
         key: &str,
@@ -638,6 +669,7 @@ impl<S: Storage + 'static> JobController<S> {
         job: &mut Job,
         pods_to_release: &[Pod],
         job_pods: &[Pod],
+        backoff_update: Option<&BackoffRecord>,
     ) -> Result<()> {
         // Upstream's `enactJobFinished` (`job_controller.go:1509-1519`) refuses
         // to add the terminal condition while `.status.uncountedTerminatedPods`
@@ -693,6 +725,11 @@ impl<S: Storage + 'static> JobController<S> {
             };
 
         self.write_status(key, job).await?;
+        // `flushUncountedAndRemoveFinalizers` (`job_controller.go:1396`): the
+        // record is stored once the status that parks the new pods is written.
+        if let Some(record) = backoff_update {
+            self.backoff_store.update(job_tracking_key, record);
+        }
 
         // Upstream's `canRemoveFinalizer` (`job_controller.go:1359`) short-
         // circuits to true the moment the Job is being deleted or has reached a
@@ -922,6 +959,8 @@ impl<S: Storage + 'static> JobController<S> {
                     // job_controller.go:839).
                     self.expectations
                         .delete_expectations(&format!("{}/{}", ns, name));
+                    // `job_controller.go:842`: and the backoff record.
+                    self.backoff_store.remove(&format!("{}/{}", ns, name));
                     queue.forget(&key).await;
                 }
             }
@@ -1158,6 +1197,8 @@ impl<S: Storage + 'static> JobController<S> {
             // when the Job goes away (`deleteExpectations`); keeping it would
             // leak a growing set of UIDs for an object that no longer exists.
             self.finalizer_expectations.forget(&job_tracking_key);
+            // `deleteJob` (`job_controller.go:564`).
+            self.backoff_store.remove(&job_tracking_key);
             return Ok(());
         }
 
@@ -1190,6 +1231,9 @@ impl<S: Storage + 'static> JobController<S> {
                         && c.status == "True"
                 });
                 if is_finished {
+                    // `syncJob` (`job_controller.go:866`): a finished Job's
+                    // backoff record is removed.
+                    self.backoff_store.remove(&format!("{namespace}/{name}"));
                     // Honour spec.ttlSecondsAfterFinished: once the TTL has
                     // elapsed relative to the job's completionTime, mark the job
                     // for deletion (set deletionTimestamp). K8s ref:
@@ -1687,7 +1731,12 @@ impl<S: Storage + 'static> JobController<S> {
             only_replace_failed_pods,
             &delayed_deletion_uids,
             job.metadata.is_being_deleted() || job_is_finished(job),
+            job.spec.completions.unwrap_or(1),
         );
+        let new_backoff_record = tracked.new_backoff_record.clone();
+        let backoff_update = tracked
+            .needs_flush
+            .then(|| tracked.new_backoff_record.clone());
 
         // Decision values (counted + parked) drive completion and backoff.
         let succeeded = if is_indexed {
@@ -1791,6 +1840,7 @@ impl<S: Storage + 'static> JobController<S> {
                 job,
                 &pods_to_release,
                 &job_pods,
+                backoff_update.as_ref(),
             )
             .await?;
             return match manage_err {
@@ -1863,6 +1913,7 @@ impl<S: Storage + 'static> JobController<S> {
                         job,
                         &pods_to_release,
                         &job_pods,
+                        backoff_update.as_ref(),
                     )
                     .await?;
                     return Ok(());
@@ -2040,6 +2091,7 @@ impl<S: Storage + 'static> JobController<S> {
                 job,
                 &pods_to_release,
                 &job_pods,
+                backoff_update.as_ref(),
             )
             .await?;
             return Ok(());
@@ -2179,6 +2231,20 @@ impl<S: Storage + 'static> JobController<S> {
                     };
                     pods_needed = (want_active - terminating - fresh_active)
                         .min(MAX_POD_CREATE_DELETE_PER_SYNC as i32);
+                    // `manageJob` (`job_controller.go:1729-1737`): without
+                    // backoffLimitPerIndex the global failure backoff gates
+                    // creation; `enqueueSyncJobWithDelay` re-runs the sync.
+                    if pods_needed > 0 && backoff_limit_per_index.is_none() {
+                        let remaining = new_backoff_record.remaining_time(
+                            chrono::Utc::now(),
+                            DEFAULT_JOB_POD_FAILURE_BACKOFF,
+                            MAX_JOB_POD_FAILURE_BACKOFF,
+                        );
+                        if !remaining.is_zero() {
+                            self.request_requeue(namespace, name, remaining);
+                            pods_needed = 0;
+                        }
+                    }
                 }
             }
 
@@ -2416,6 +2482,7 @@ impl<S: Storage + 'static> JobController<S> {
             job,
             &pods_to_release,
             &job_pods,
+            backoff_update.as_ref(),
         )
         .await?;
 
@@ -3016,18 +3083,133 @@ fn remaining_time_per_index(
     let failures = parse_count_annotation(pod, JOB_INDEX_FAILURE_COUNT_ANNOTATION)
         + parse_count_annotation(pod, JOB_INDEX_IGNORED_FAILURE_COUNT_ANNOTATION)
         + 1;
-    let mut backoff = DEFAULT_JOB_POD_FAILURE_BACKOFF;
+    remaining_time_for_failures_count(
+        now,
+        DEFAULT_JOB_POD_FAILURE_BACKOFF,
+        MAX_JOB_POD_FAILURE_BACKOFF,
+        failures,
+        Some(pod_finished_time(pod)),
+    )
+}
+
+/// `getRemainingTimeForFailuresCount` (`backoff_utils.go:258`) with
+/// `DefaultJobPodFailureBackOff` / `MaxJobPodFailureBackOff`: 10s doubling per
+/// failure, capped at 10m, minus the time since the last failure.
+fn remaining_time_for_failures_count(
+    now: chrono::DateTime<chrono::Utc>,
+    default_backoff: Duration,
+    max_backoff: Duration,
+    failures: i32,
+    last_failure_time: Option<chrono::DateTime<chrono::Utc>>,
+) -> Duration {
+    let Some(last_failure_time) = last_failure_time else {
+        return Duration::ZERO;
+    };
+    if failures == 0 {
+        return Duration::ZERO;
+    }
+    let mut backoff = default_backoff;
     for _ in 1..failures {
         backoff *= 2;
-        if backoff >= MAX_JOB_POD_FAILURE_BACKOFF {
-            backoff = MAX_JOB_POD_FAILURE_BACKOFF;
+        if backoff >= max_backoff {
+            backoff = max_backoff;
             break;
         }
     }
-    let elapsed = (now - pod_finished_time(pod))
-        .to_std()
-        .unwrap_or(Duration::ZERO);
+    let elapsed = (now - last_failure_time).to_std().unwrap_or(Duration::ZERO);
     backoff.saturating_sub(elapsed)
+}
+
+/// `backoffRecord` (`backoff_utils.go:35`): the failures since the last
+/// success and when the latest one finished.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+struct BackoffRecord {
+    failures_after_last_success: i32,
+    last_failure_time: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl BackoffRecord {
+    /// `backoffRecord.getRemainingTime` (`backoff_utils.go:243`).
+    fn remaining_time(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        default_backoff: Duration,
+        max_backoff: Duration,
+    ) -> Duration {
+        remaining_time_for_failures_count(
+            now,
+            default_backoff,
+            max_backoff,
+            self.failures_after_last_success,
+            self.last_failure_time,
+        )
+    }
+}
+
+/// `backoffStore` (`backoff_utils.go:40`), keyed `namespace/name`: the
+/// failure history that outlives the pods whose finalizers were released.
+#[derive(Default)]
+struct BackoffStore {
+    records: std::sync::Mutex<HashMap<String, BackoffRecord>>,
+}
+
+impl BackoffStore {
+    /// `updateBackoffRecord` (`backoff_utils.go:44`).
+    fn update(&self, key: &str, record: &BackoffRecord) {
+        self.records
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), record.clone());
+    }
+
+    /// `removeBackoffRecord` (`backoff_utils.go:64`).
+    fn remove(&self, key: &str) {
+        self.records.lock().unwrap().remove(key);
+    }
+
+    /// `newBackoffRecord` (`backoff_utils.go:92`): the stored record advanced
+    /// by the pods that finished since it was stored.
+    fn new_backoff_record(
+        &self,
+        key: &str,
+        new_succeeded: &[&Pod],
+        new_failed: &[&Pod],
+    ) -> BackoffRecord {
+        let mut backoff = self
+            .records
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+            .unwrap_or_default();
+        let sorted = |pods: &[&Pod]| {
+            let mut times: Vec<chrono::DateTime<chrono::Utc>> =
+                pods.iter().map(|p| pod_finished_time(p)).collect();
+            times.sort();
+            times
+        };
+        let succeeded = sorted(new_succeeded);
+        let failed = sorted(new_failed);
+        let Some(last_success) = succeeded.last() else {
+            if let Some(last_failure) = failed.last() {
+                backoff.failures_after_last_success += failed.len() as i32;
+                backoff.last_failure_time = Some(*last_failure);
+            }
+            return backoff;
+        };
+        backoff.failures_after_last_success = 0;
+        backoff.last_failure_time = None;
+        for failed_time in failed.iter().rev() {
+            if *failed_time <= *last_success {
+                break;
+            }
+            if backoff.last_failure_time.is_none() {
+                backoff.last_failure_time = Some(*failed_time);
+            }
+            backoff.failures_after_last_success += 1;
+        }
+        backoff
+    }
 }
 
 /// `getNewIndexFailureCounts` (`indexed_job_utils.go:360`): the
@@ -5612,6 +5794,242 @@ mod tests {
             .is_none());
     }
 
+    /// A non-indexed failed pod of `job-uid-1` that finished
+    /// `finished_secs_ago` seconds ago (and still holds the tracking finalizer).
+    fn failed_plain_pod(name: &str, finished_secs_ago: i64) -> Pod {
+        let mut pod = failed_pod_with_count(name, 0, 0, finished_secs_ago);
+        pod.metadata.annotations = None;
+        pod.metadata.labels = Some(HashMap::from([(
+            "job-name".to_string(),
+            "plain-job".to_string(),
+        )]));
+        pod.metadata.owner_references.as_mut().unwrap()[0].name = "plain-job".to_string();
+        pod
+    }
+
+    async fn plain_job_with_failed_pod(
+        storage: &Arc<MemoryStorage>,
+        finished_secs_ago: i64,
+    ) -> Job {
+        let job = make_job("plain-job", "default", 1, 1);
+        storage
+            .create("/registry/jobs/default/plain-job", &job)
+            .await
+            .unwrap();
+        let failed = failed_plain_pod("failed-0", finished_secs_ago);
+        storage
+            .create("/registry/pods/default/failed-0", &failed)
+            .await
+            .unwrap();
+        job
+    }
+
+    async fn plain_job_pod_names(storage: &Arc<MemoryStorage>) -> Vec<String> {
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        pods.into_iter().map(|p| p.metadata.name).collect()
+    }
+
+    /// `manageJob` (`job_controller.go:1731-1738`): a replacement pod is not
+    /// created while `newBackoffRecord.getRemainingTime(DefaultJobPodFailureBackOff,
+    /// MaxJobPodFailureBackOff)` is positive; the sync is re-enqueued with that
+    /// delay instead.
+    #[tokio::test]
+    async fn test_replacement_pod_delayed_by_failure_backoff() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = plain_job_with_failed_pod(&storage, 1).await;
+        let controller = JobController::new(storage.clone());
+        controller.reconcile(&mut job).await.unwrap();
+        assert_eq!(
+            plain_job_pod_names(&storage).await,
+            vec!["failed-0".to_string()],
+            "no replacement may be created inside the failure backoff window"
+        );
+        let d = controller
+            .take_requeue_delay("default", "plain-job")
+            .expect("the delayed creation must request a delayed requeue");
+        assert!(
+            d > Duration::from_secs(8) && d <= Duration::from_secs(10),
+            "{d:?}"
+        );
+    }
+
+    /// Once the window has elapsed the replacement is created at once.
+    #[tokio::test]
+    async fn test_replacement_pod_created_after_failure_backoff_elapsed() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = plain_job_with_failed_pod(&storage, 60).await;
+        let controller = JobController::new(storage.clone());
+        controller.reconcile(&mut job).await.unwrap();
+        assert_eq!(plain_job_pod_names(&storage).await.len(), 2);
+    }
+
+    /// `podBackoffStore` (`backoff_utils.go:44-91`) outlives a sync: after the
+    /// failed pod's finalizer is released it is no longer a "new" failed pod,
+    /// yet the next sync must still be inside the backoff window.
+    #[tokio::test]
+    async fn test_failure_backoff_survives_across_syncs() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = plain_job_with_failed_pod(&storage, 1).await;
+        let controller = JobController::new(storage.clone());
+        controller.reconcile(&mut job).await.unwrap();
+        let _ = controller.take_requeue_delay("default", "plain-job");
+        let mut job: Job = storage
+            .get("/registry/jobs/default/plain-job")
+            .await
+            .unwrap();
+        controller.reconcile(&mut job).await.unwrap();
+        assert_eq!(
+            plain_job_pod_names(&storage).await,
+            vec!["failed-0".to_string()],
+            "the second sync must still honour the recorded failure"
+        );
+        assert!(controller
+            .take_requeue_delay("default", "plain-job")
+            .is_some());
+    }
+
+    /// Port of `TestGetRemainingBackoffTime` (`backoff_utils_test.go:404`).
+    #[test]
+    fn test_get_remaining_backoff_time() {
+        use chrono::TimeZone;
+        let t0 = chrono::Utc
+            .with_ymd_and_hms(2009, 11, 10, 23, 0, 0)
+            .unwrap();
+        let secs = chrono::Duration::seconds;
+        let d = Duration::from_secs;
+        // (name, failures, lastFailureTime set, now offset, want)
+        let cases: Vec<(&str, i32, bool, i64, u64)> = vec![
+            ("no failures", 0, false, 0, 0),
+            ("one failure; same time", 1, true, 0, 5),
+            ("one failure; +1s", 1, true, 1, 4),
+            ("one failure; +5s", 1, true, 5, 0),
+            ("one failure; +6s", 1, true, 6, 0),
+            ("three failures; same time", 3, true, 0, 20),
+            ("eight failures; below max", 8, true, 0, 640),
+            ("nine failures; capped at max", 9, true, 0, 700),
+        ];
+        for (name, failures, has_time, offset, want) in cases {
+            let record = BackoffRecord {
+                failures_after_last_success: failures,
+                last_failure_time: has_time.then_some(t0),
+            };
+            let got = record.remaining_time(t0 + secs(offset), d(5), d(700));
+            assert_eq!(got, d(want), "{name}");
+        }
+    }
+
+    fn pod_finished_at(t: chrono::DateTime<chrono::Utc>) -> Pod {
+        let mut pod = failed_plain_pod("p", 0);
+        pod.status.as_mut().unwrap().container_statuses =
+            Some(vec![terminated_status("test", Some(t))]);
+        pod
+    }
+
+    /// Port of `TestNewBackoffRecord` (`backoff_utils_test.go:31`).
+    #[test]
+    fn test_new_backoff_record() {
+        use chrono::TimeZone;
+        let t0 = chrono::Utc
+            .with_ymd_and_hms(2009, 11, 10, 23, 0, 0)
+            .unwrap();
+        let ms = chrono::Duration::milliseconds;
+        // (name, stored failures, succeeded offsets, failed offsets,
+        //  want failures, want lastFailureTime offset)
+        type Case = (
+            &'static str,
+            Option<i32>,
+            Vec<i64>,
+            Vec<i64>,
+            i32,
+            Option<i64>,
+        );
+        let cases: Vec<Case> = vec![
+            ("one new failure", None, vec![], vec![0], 1, Some(0)),
+            ("two new failures", None, vec![], vec![0, -1], 2, Some(0)),
+            (
+                "two failures then success",
+                None,
+                vec![0],
+                vec![-2, -1],
+                0,
+                None,
+            ),
+            (
+                "two failures, success, two more failures",
+                None,
+                vec![-2],
+                vec![0, -4, -3, -1],
+                2,
+                Some(0),
+            ),
+            (
+                "stored count 2 plus one failure",
+                Some(2),
+                vec![],
+                vec![0],
+                3,
+                Some(0),
+            ),
+            (
+                "success and failure at same timestamp",
+                None,
+                vec![0],
+                vec![0],
+                0,
+                None,
+            ),
+            ("nothing new", None, vec![], vec![], 0, None),
+            ("one success", None, vec![0], vec![], 0, None),
+        ];
+        for (name, stored, succeeded, failed, want_failures, want_time) in cases {
+            let store = BackoffStore::default();
+            if let Some(n) = stored {
+                store.update(
+                    "key",
+                    &BackoffRecord {
+                        failures_after_last_success: n,
+                        last_failure_time: None,
+                    },
+                );
+            }
+            let succ: Vec<Pod> = succeeded
+                .iter()
+                .map(|o| pod_finished_at(t0 + ms(*o)))
+                .collect();
+            let fail: Vec<Pod> = failed
+                .iter()
+                .map(|o| pod_finished_at(t0 + ms(*o)))
+                .collect();
+            let succ: Vec<&Pod> = succ.iter().collect();
+            let fail: Vec<&Pod> = fail.iter().collect();
+            let got = store.new_backoff_record("key", &succ, &fail);
+            assert_eq!(got.failures_after_last_success, want_failures, "{name}");
+            assert_eq!(
+                got.last_failure_time.map(|t| (t - t0).num_milliseconds()),
+                want_time,
+                "{name}"
+            );
+        }
+    }
+
+    /// `removeBackoffRecord` (`backoff_utils.go:64`) forgets the Job's history.
+    #[tokio::test]
+    async fn test_backoff_record_removed_when_job_deleted() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = plain_job_with_failed_pod(&storage, 1).await;
+        let controller = JobController::new(storage.clone());
+        controller.reconcile(&mut job).await.unwrap();
+        assert!(controller
+            .backoff_store
+            .records
+            .lock()
+            .unwrap()
+            .contains_key("default/plain-job"));
+        job.metadata.deletion_timestamp = Some(chrono::Utc::now());
+        controller.reconcile(&mut job).await.unwrap();
+        assert!(controller.backoff_store.records.lock().unwrap().is_empty());
+    }
+
     /// `enqueueSyncJobWithDelay` never delays less than `SyncJobBatchPeriod`
     /// (`job_controller.go:620`).
     #[test]
@@ -6046,7 +6464,11 @@ mod tests {
             .await
             .unwrap();
         let mut pod = make_pod("p1", "default", Phase::Running, "term", "job-uid-1");
-        pod.metadata.deletion_timestamp = Some(chrono::Utc::now());
+        // A pod deleted while Running counts as failed (`isPodFailed`), and its
+        // finish time is `deletionTimestamp - grace` (`backoff_utils.go:231`),
+        // so the deletion must be older than the 10s failure backoff for the
+        // replacement to be created in this sync.
+        pod.metadata.deletion_timestamp = Some(chrono::Utc::now() - chrono::Duration::seconds(60));
         storage
             .create("/registry/pods/default/p1", &pod)
             .await
