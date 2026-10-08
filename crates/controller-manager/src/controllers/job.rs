@@ -1878,62 +1878,7 @@ impl<S: Storage + 'static> JobController<S> {
         } else {
             None
         };
-        let has_persisted_interim = persisted_success.is_some() || persisted_failure.is_some();
-
-        // Handle suspended jobs: delete all active pods (`manageJob`,
-        // job_controller.go:1663-1673): `activePodsForRemoval(.., active)`,
-        // `ExpectDeletions`, `deleteJobPods`; only when expectations are
-        // satisfied (`:1016`).
-        if job.spec.suspend.unwrap_or(false) && !has_persisted_interim {
-            let mut removed = 0;
-            let mut removed_ready = 0;
-            if satisfied_expectations && active > 0 {
-                let active_pods = active_job_pods(job_pods.iter());
-                let to_delete = active_pods_for_removal(job, &active_pods, active as usize);
-                let (rr, r, err) = self.delete_job_pods(&exp_key, namespace, &to_delete).await;
-                removed_ready = rr;
-                removed = r;
-                manage_err = err;
-                info!(
-                    "Suspended job {}/{}: deleted {} active pods",
-                    namespace, name, removed
-                );
-            }
-            let active = active - removed;
-            let ready = ready - removed_ready;
-            // Preserve existing start_time
-            let existing_start_time = job.status.as_ref().and_then(|s| s.start_time);
-            let existing_conditions = job.status.as_ref().and_then(|s| s.conditions.clone());
-            job.status = Some(JobStatus {
-                active: Some(active),
-                succeeded: status_succeeded,
-                failed: status_failed,
-                conditions: existing_conditions,
-                start_time: existing_start_time,
-                completion_time: None,
-                ready: Some(ready),
-                terminating: None,
-                completed_indexes: completed_indexes.clone(),
-                failed_indexes: None,
-                uncounted_terminated_pods: uncounted_status.clone(),
-                observed_generation: job.metadata.generation,
-            });
-            let key = format!("/registry/jobs/{}/{}", namespace, name);
-            self.flush_status_and_release(
-                &key,
-                &job_tracking_key,
-                namespace,
-                job,
-                &pods_to_release,
-                &job_pods,
-                backoff_update.as_ref(),
-            )
-            .await?;
-            return match manage_err {
-                Some(e) => Err(e),
-                None => Ok(()),
-            };
-        }
+        let job_suspended = job.spec.suspend.unwrap_or(false);
 
         // Merge FailIndex and backoff-per-index failed sets
         let all_failed_index_set: HashSet<i32> = fail_index_set
@@ -2020,12 +1965,12 @@ impl<S: Storage + 'static> JobController<S> {
             };
 
         // Handle activeDeadlineSeconds — fail the job if it has been active too long
-        // (`pastActiveDeadline` is evaluated only when no failure and no
+        // (`pastActiveDeadline` is false while suspended, :1596, and is evaluated only when no failure and no
         // pre-existing SuccessCriteriaMet decided the Job first, :970-973.)
         if let Some(deadline) = job
             .spec
             .active_deadline_seconds
-            .filter(|_| !is_failed && persisted_success.is_none())
+            .filter(|_| !is_failed && persisted_success.is_none() && !job_suspended)
         {
             if let Some(start) = job.status.as_ref().and_then(|s| s.start_time) {
                 let elapsed = chrono::Utc::now()
@@ -2217,6 +2162,64 @@ impl<S: Storage + 'static> JobController<S> {
             )
             .await?;
             return match derr {
+                Some(e) => Err(e),
+                None => Ok(()),
+            };
+        }
+
+        // Suspend is handled in `manageJob`, which runs only when no
+        // finishedCondition was found (job_controller.go:1016, :945-998), so a
+        // failure, success policy or completion outranks it. Delete all active
+        // pods (`manageJob`,
+        // job_controller.go:1663-1673): `activePodsForRemoval(.., active)`,
+        // `ExpectDeletions`, `deleteJobPods`; only when expectations are
+        // satisfied (`:1016`).
+        if job_suspended && !is_failed && !is_complete {
+            let mut removed = 0;
+            let mut removed_ready = 0;
+            if satisfied_expectations && active > 0 {
+                let active_pods = active_job_pods(job_pods.iter());
+                let to_delete = active_pods_for_removal(job, &active_pods, active as usize);
+                let (rr, r, err) = self.delete_job_pods(&exp_key, namespace, &to_delete).await;
+                removed_ready = rr;
+                removed = r;
+                manage_err = err;
+                info!(
+                    "Suspended job {}/{}: deleted {} active pods",
+                    namespace, name, removed
+                );
+            }
+            let active = active - removed;
+            let ready = ready - removed_ready;
+            // Preserve existing start_time
+            let existing_start_time = job.status.as_ref().and_then(|s| s.start_time);
+            let existing_conditions = job.status.as_ref().and_then(|s| s.conditions.clone());
+            job.status = Some(JobStatus {
+                active: Some(active),
+                succeeded: status_succeeded,
+                failed: status_failed,
+                conditions: existing_conditions,
+                start_time: existing_start_time,
+                completion_time: None,
+                ready: Some(ready),
+                terminating: None,
+                completed_indexes: completed_indexes.clone(),
+                failed_indexes: None,
+                uncounted_terminated_pods: uncounted_status.clone(),
+                observed_generation: job.metadata.generation,
+            });
+            let key = format!("/registry/jobs/{}/{}", namespace, name);
+            self.flush_status_and_release(
+                &key,
+                &job_tracking_key,
+                namespace,
+                job,
+                &pods_to_release,
+                &job_pods,
+                backoff_update.as_ref(),
+            )
+            .await?;
+            return match manage_err {
                 Some(e) => Err(e),
                 None => Ok(()),
             };
