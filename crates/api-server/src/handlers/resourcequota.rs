@@ -270,6 +270,9 @@ pub async fn list(
     }
 
     let prefix = build_prefix("resourcequotas", Some(&namespace));
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut quotas = state.storage.list::<ResourceQuota>(&prefix).await?;
 
     // Apply field and label selector filtering
@@ -311,6 +314,9 @@ pub async fn list_all(
     }
 
     let prefix = build_prefix("resourcequotas", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut quotas = state.storage.list::<ResourceQuota>(&prefix).await?;
 
     // Apply field and label selector filtering

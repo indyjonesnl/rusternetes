@@ -150,6 +150,9 @@ pub async fn list_csistoragecapacities(
     }
 
     let prefix = build_prefix("csistoragecapacities", Some(&namespace));
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut cscs: Vec<CSIStorageCapacity> = state.storage.list(&prefix).await?;
 
     // Apply field and label selector filtering
@@ -214,6 +217,9 @@ pub async fn list_all_csistoragecapacities(
     }
 
     let prefix = build_prefix("csistoragecapacities", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut cscs: Vec<CSIStorageCapacity> = state.storage.list(&prefix).await?;
 
     // Apply field and label selector filtering

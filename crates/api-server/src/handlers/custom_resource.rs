@@ -230,6 +230,9 @@ pub async fn list_custom_resources(
         build_prefix(&resource_type, None)
     };
 
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut crs: Vec<CustomResource> = state.storage.list(&prefix).await?;
 
     // Apply schema defaults on read (K8s "defaulting on read")

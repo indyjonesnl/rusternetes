@@ -297,6 +297,9 @@ pub async fn list_pvcs(
     }
 
     let prefix = build_prefix("persistentvolumeclaims", Some(&namespace));
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut pvcs: Vec<PersistentVolumeClaim> = state.storage.list(&prefix).await?;
 
     // Apply field and label selector filtering
@@ -361,6 +364,9 @@ pub async fn list_all_pvcs(
     }
 
     let prefix = build_prefix("persistentvolumeclaims", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut pvcs = state.storage.list::<PersistentVolumeClaim>(&prefix).await?;
 
     // Apply field and label selector filtering

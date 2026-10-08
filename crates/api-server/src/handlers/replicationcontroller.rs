@@ -362,6 +362,9 @@ pub async fn list_replicationcontrollers(
     }
 
     let prefix = build_prefix("replicationcontrollers", Some(&namespace));
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut rcs = state.storage.list::<ReplicationController>(&prefix).await?;
 
     // Apply field and label selector filtering
@@ -423,6 +426,9 @@ pub async fn list_all_replicationcontrollers(
     }
 
     let prefix = build_prefix("replicationcontrollers", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut rcs = state.storage.list::<ReplicationController>(&prefix).await?;
 
     // Apply field and label selector filtering

@@ -178,6 +178,7 @@ pub async fn list_endpointslices(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<WatchParams>,
+    Query(list_options): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
     debug!("Listing endpointslices in namespace: {}", namespace);
 
@@ -205,6 +206,9 @@ pub async fn list_endpointslices(
     }
 
     let prefix = build_prefix("endpointslices", Some(&namespace));
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &list_options).await?;
+
     let mut endpointslices = state.storage.list::<EndpointSlice>(&prefix).await?;
 
     // Apply field and label selector filtering
@@ -228,6 +232,7 @@ pub async fn list_all_endpointslices(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<WatchParams>,
+    Query(list_options): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
     debug!("Listing all endpointslices");
 
@@ -255,6 +260,9 @@ pub async fn list_all_endpointslices(
     }
 
     let prefix = build_prefix("endpointslices", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &list_options).await?;
+
     let mut endpointslices = state.storage.list::<EndpointSlice>(&prefix).await?;
 
     // Apply field and label selector filtering

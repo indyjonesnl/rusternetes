@@ -272,6 +272,9 @@ pub async fn list_volumesnapshots(
     }
 
     let prefix = build_prefix("volumesnapshots", Some(&namespace));
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut vss = state.storage.list::<VolumeSnapshot>(&prefix).await?;
 
     // Apply field and label selector filtering
@@ -312,6 +315,9 @@ pub async fn list_all_volumesnapshots(
     }
 
     let prefix = build_prefix("volumesnapshots", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut vss = state.storage.list::<VolumeSnapshot>(&prefix).await?;
 
     // Apply field and label selector filtering
