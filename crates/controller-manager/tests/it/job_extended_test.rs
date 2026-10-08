@@ -29,6 +29,24 @@ use std::sync::Arc;
 // Fixtures
 // ---------------------------------------------------------------------------
 
+/// Stand-in for the kubelet: remove every pod the controller deleted
+/// gracefully (it carries a deletionTimestamp), so a Job waiting on
+/// terminating pods can finish (`enactJobFinished`, job_controller.go:1520).
+async fn reap_terminating(storage: &Arc<MemoryStorage>) {
+    let pods: Vec<Pod> = storage.list("/registry/pods/").await.unwrap();
+    for pod in pods
+        .iter()
+        .filter(|p| p.metadata.deletion_timestamp.is_some())
+    {
+        let key = build_key(
+            "pods",
+            pod.metadata.namespace.as_deref(),
+            &pod.metadata.name,
+        );
+        let _ = storage.delete(&key).await;
+    }
+}
+
 async fn setup_test() -> Arc<MemoryStorage> {
     let storage = Arc::new(MemoryStorage::new());
     storage.clear();
@@ -1362,6 +1380,9 @@ async fn job_with_max_failed_indexes_should_fail_when_exceeded() {
         storage.update(&pod_key, &failed).await.unwrap();
     }
 
+    controller.reconcile_all().await.unwrap();
+    // The still-active pods were deleted; Failed waits until they are gone.
+    reap_terminating(&storage).await;
     controller.reconcile_all().await.unwrap();
 
     let updated_job: Job = storage.get(&job_key).await.unwrap();
