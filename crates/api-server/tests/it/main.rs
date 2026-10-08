@@ -352,3 +352,4 @@ mod metrics_label_selector_test;
 mod networking_store_test;
 mod pod_status_proto_state_test;
 mod run_seeds_default_rbac_test;
+mod synthesized_list_options_test;
