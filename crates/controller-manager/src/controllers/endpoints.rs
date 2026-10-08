@@ -4,39 +4,70 @@ use futures::StreamExt;
 use rusternetes_common::resources::{
     EndpointAddress, EndpointPort, EndpointReference, EndpointSubset, Endpoints, Pod, Service,
 };
-use rusternetes_common::types::OwnerReference;
 use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error};
 
-/// Carry the stored Endpoints' server-owned identity over to the object about
-/// to replace it.
-///
-/// Upstream updates `currentEndpoints.DeepCopy()` with the new subsets and
-/// labels (pkg/controller/endpoint/endpoints_controller.go:470-476), so the
-/// object it PUTs keeps the stored UID, creationTimestamp, finalizers and
-/// managedFields. The API server turns a non-empty `metadata.uid` on an update
-/// into a UID precondition (`defaultUpdatedObjectInfo.Preconditions`,
-/// staging/src/k8s.io/apiserver/pkg/registry/rest/update.go:188-203), so an
-/// object carrying any UID but the stored one is a permanent 409 once Endpoints
-/// is served by the generic Store, and one carrying none drops what the stored
-/// object holds (#2719; the EndpointSlice regression was #2718).
-///
-/// The labels, annotations and ownerReferences this controller computes are
-/// deliberately left as built (a divergence from upstream, which keeps the
-/// stored annotations and sets no ownerReference; tracked separately).
-fn adopt_existing_identity(endpoints: &mut Endpoints, existing: &Endpoints) {
-    let meta = &mut endpoints.metadata;
-    let old = &existing.metadata;
-    meta.uid = old.uid.clone();
-    meta.resource_version = old.resource_version.clone();
-    meta.creation_timestamp = old.creation_timestamp;
-    meta.generation = old.generation;
-    meta.finalizers = old.finalizers.clone();
-    meta.managed_fields = old.managed_fields.clone();
-    meta.deletion_timestamp = old.deletion_timestamp;
-    meta.deletion_grace_period_seconds = old.deletion_grace_period_seconds;
+/// `LabelManagedBy` (pkg/controller/endpoint/endpoints_controller.go:73).
+const LABEL_MANAGED_BY: &str = "endpoints.kubernetes.io/managed-by";
+/// `ControllerName` (pkg/controller/endpoint/endpoints_controller.go:76).
+const CONTROLLER_NAME: &str = "endpoint-controller";
+/// `v1.IsHeadlessService`
+/// (staging/src/k8s.io/api/core/v1/well_known_labels.go:64).
+const IS_HEADLESS_SERVICE_LABEL: &str = "service.kubernetes.io/headless";
+/// `v1.EndpointsLastChangeTriggerTime`
+/// (staging/src/k8s.io/api/core/v1/annotation_key_constants.go:118).
+const LAST_CHANGE_TRIGGER_TIME_ANNOTATION: &str =
+    "endpoints.kubernetes.io/last-change-trigger-time";
+
+/// `helper.IsServiceIPSet`: a Service has a cluster IP unless it is headless.
+fn is_service_ip_set(service: &Service) -> bool {
+    !matches!(
+        service.spec.cluster_ip.as_deref(),
+        None | Some("") | Some("None")
+    )
+}
+
+/// Port of `labelsCorrectForEndpoints`
+/// (pkg/controller/endpoint/endpoints_controller.go:769-785): the Endpoints'
+/// labels are correct when it is managed by this controller and carries
+/// exactly the Service's labels, ignoring the headless and managed-by labels.
+fn labels_correct_for_endpoints(
+    ep_labels: &HashMap<String, String>,
+    svc_labels: &HashMap<String, String>,
+) -> bool {
+    if ep_labels.get(LABEL_MANAGED_BY).map(String::as_str) != Some(CONTROLLER_NAME) {
+        return false;
+    }
+    let mut skipped = 0;
+    for (k, v) in ep_labels {
+        if k == IS_HEADLESS_SERVICE_LABEL || k == LABEL_MANAGED_BY {
+            skipped += 1;
+        } else if svc_labels.get(k) != Some(v) {
+            return false;
+        }
+    }
+    svc_labels.len() == ep_labels.len() - skipped
+}
+
+/// Port of `capacityAnnotationSetCorrectly`
+/// (pkg/controller/endpoint/endpoints_controller.go:668-680).
+fn capacity_annotation_set_correctly(
+    annotations: &HashMap<String, String>,
+    subsets: &[EndpointSubset],
+) -> bool {
+    let n: usize = subsets
+        .iter()
+        .map(|s| {
+            s.addresses.as_ref().map_or(0, Vec::len)
+                + s.not_ready_addresses.as_ref().map_or(0, Vec::len)
+        })
+        .sum();
+    if n > MAX_ENDPOINTS_CAPACITY {
+        return false;
+    }
+    !annotations.contains_key(ENDPOINTS_OVER_CAPACITY_ANNOTATION)
 }
 
 /// Upstream `pkg/controller/endpoint/endpoints_controller.go::maxCapacity`.
@@ -511,9 +542,45 @@ impl<S: Storage + 'static> EndpointsController<S> {
         // route correctly via kube-proxy, so this is a hard cap.
         let truncated = truncate_endpoint_subsets(&mut subsets, MAX_ENDPOINTS_CAPACITY);
 
-        // Derive annotations: copy from the service, then set/clear the
-        // over-capacity marker based on whether we truncated this reconcile.
-        let mut annotations = service.metadata.annotations.clone().unwrap_or_default();
+        let endpoints_key = build_key("endpoints", Some(namespace), service_name);
+        let svc_labels = service.metadata.labels.clone().unwrap_or_default();
+        let existing: Option<Endpoints> = self.storage.get(&endpoints_key).await.ok();
+
+        // Skip the write when nothing changed
+        // (endpoints_controller.go:459-468).
+        if let Some(cur) = &existing {
+            let cur_labels = cur.metadata.labels.clone().unwrap_or_default();
+            let cur_annotations = cur.metadata.annotations.clone().unwrap_or_default();
+            if cur.subsets == subsets
+                && labels_correct_for_endpoints(&cur_labels, &svc_labels)
+                && capacity_annotation_set_correctly(&cur_annotations, &cur.subsets)
+            {
+                debug!(
+                    "Endpoints for service {}/{} unchanged, skipping write",
+                    namespace, service_name
+                );
+                return Ok(());
+            }
+        }
+
+        // Update a copy of the stored object, keeping its identity and
+        // annotations (endpoints_controller.go:469-499). Upstream sets no
+        // ownerReferences on the Endpoints it creates.
+        let mut endpoints = existing.clone().unwrap_or_else(|| Endpoints {
+            type_meta: rusternetes_common::types::TypeMeta {
+                kind: "Endpoints".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: rusternetes_common::types::ObjectMeta::new(service_name.clone())
+                .with_namespace(namespace.clone()),
+            subsets: Vec::new(),
+        });
+        endpoints.subsets = subsets;
+
+        // The trigger-time tracker is not ported (#2747), so the annotation is
+        // cleared as upstream does when there is no new trigger time.
+        let mut annotations = endpoints.metadata.annotations.take().unwrap_or_default();
+        annotations.remove(LAST_CHANGE_TRIGGER_TIME_ANNOTATION);
         if truncated {
             annotations.insert(
                 ENDPOINTS_OVER_CAPACITY_ANNOTATION.to_string(),
@@ -522,56 +589,16 @@ impl<S: Storage + 'static> EndpointsController<S> {
         } else {
             annotations.remove(ENDPOINTS_OVER_CAPACITY_ANNOTATION);
         }
-        let annotations = if annotations.is_empty() {
-            None
+        endpoints.metadata.annotations = (!annotations.is_empty()).then_some(annotations);
+
+        let mut labels = svc_labels;
+        if is_service_ip_set(service) {
+            labels.remove(IS_HEADLESS_SERVICE_LABEL);
         } else {
-            Some(annotations)
-        };
-
-        // Create or update endpoints
-        let mut endpoints = Endpoints {
-            type_meta: rusternetes_common::types::TypeMeta {
-                kind: "Endpoints".to_string(),
-                api_version: "v1".to_string(),
-            },
-            metadata: rusternetes_common::types::ObjectMeta {
-                name: service_name.clone(),
-                generate_name: None,
-                generation: None,
-                managed_fields: None,
-                namespace: Some(namespace.clone()),
-                uid: String::new(),
-                resource_version: None,
-                deletion_grace_period_seconds: None,
-                finalizers: None,
-                owner_references: Some(vec![OwnerReference {
-                    api_version: "v1".to_string(),
-                    kind: "Service".to_string(),
-                    name: service_name.clone(),
-                    uid: service.metadata.uid.clone(),
-                    controller: Some(true),
-                    block_owner_deletion: Some(true),
-                }]),
-                creation_timestamp: None,
-                deletion_timestamp: None,
-                labels: service.metadata.labels.clone(),
-                annotations,
-            },
-            subsets,
-        };
-
-        let endpoints_key = build_key("endpoints", Some(namespace), service_name);
-        // Check if existing endpoints match — skip write if nothing changed
-        if let Ok(existing) = self.storage.get::<Endpoints>(&endpoints_key).await {
-            if existing.subsets == endpoints.subsets {
-                debug!(
-                    "Endpoints for service {}/{} unchanged, skipping write",
-                    namespace, service_name
-                );
-                return Ok(());
-            }
-            adopt_existing_identity(&mut endpoints, &existing);
+            labels.insert(IS_HEADLESS_SERVICE_LABEL.to_string(), String::new());
         }
+        labels.insert(LABEL_MANAGED_BY.to_string(), CONTROLLER_NAME.to_string());
+        endpoints.metadata.labels = Some(labels);
 
         // Try to update first, if it doesn't exist, create it
         match self.storage.update(&endpoints_key, &endpoints).await {
@@ -1715,5 +1742,206 @@ mod tests {
             Some(first.metadata.uid.as_str()),
             "the PUT body must carry the stored UID"
         );
+    }
+
+    /// TestSyncEndpointsHeadlessServiceLabel (endpoints_controller_test.go:525):
+    /// an Endpoints already carrying managed-by + headless labels and no
+    /// service labels is correct, so there must be no write.
+    #[tokio::test]
+    async fn headless_service_label_present_means_no_write() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = EndpointsController::new(storage.clone());
+        let mut svc = svc_for_metadata_tests("None");
+        svc.metadata.labels = None;
+        controller.reconcile_service(&svc).await.unwrap();
+        let key = "/registry/endpoints/default/svc";
+        let before: Endpoints = storage.get(key).await.unwrap();
+        let labels = before.metadata.labels.clone().unwrap();
+        assert_eq!(labels.len(), 2, "managed-by + headless only: {labels:?}");
+        controller.reconcile_service(&svc).await.unwrap();
+        let after: Endpoints = storage.get(key).await.unwrap();
+        assert_eq!(
+            before.metadata.resource_version,
+            after.metadata.resource_version
+        );
+    }
+
+    /// TestSyncEndpointsItemsPreexistingLabelsChange (:1173) and
+    /// TestSyncEndpointsHeadlessService (:1284): pre-existing Endpoints with
+    /// different/no labels are rewritten with the Service's labels +
+    /// managed-by (+ headless), even when the subsets already match.
+    #[tokio::test]
+    async fn preexisting_labels_change_is_rewritten() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = EndpointsController::new(storage.clone());
+        let mut svc = svc_for_metadata_tests("None");
+        svc.metadata.labels = Some(HashMap::from([("baz".to_string(), "blah".to_string())]));
+        controller.reconcile_service(&svc).await.unwrap();
+        let key = "/registry/endpoints/default/svc";
+        let mut ep: Endpoints = storage.get(key).await.unwrap();
+        ep.metadata.labels = Some(HashMap::from([("foo".to_string(), "bar".to_string())]));
+        storage.update(key, &ep).await.unwrap();
+        controller.reconcile_service(&svc).await.unwrap();
+        let ep: Endpoints = storage.get(key).await.unwrap();
+        assert_eq!(
+            ep.metadata.labels.unwrap(),
+            HashMap::from([
+                ("baz".to_string(), "blah".to_string()),
+                (IS_HEADLESS_SERVICE_LABEL.to_string(), String::new()),
+                (LABEL_MANAGED_BY.to_string(), CONTROLLER_NAME.to_string()),
+            ])
+        );
+    }
+
+    /// TestSyncServiceOverCapacity "annotation removed below capacity"
+    /// (:2261 ff.): a stale over-capacity annotation is removed even though
+    /// the subsets are unchanged (capacityAnnotationSetCorrectly).
+    #[tokio::test]
+    async fn stale_over_capacity_annotation_is_removed() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = EndpointsController::new(storage.clone());
+        let svc = svc_for_metadata_tests("10.0.0.5");
+        controller.reconcile_service(&svc).await.unwrap();
+        let key = "/registry/endpoints/default/svc";
+        let mut ep: Endpoints = storage.get(key).await.unwrap();
+        ep.metadata.annotations = Some(HashMap::from([
+            (
+                ENDPOINTS_OVER_CAPACITY_ANNOTATION.to_string(),
+                "truncated".to_string(),
+            ),
+            ("user".to_string(), "keep".to_string()),
+        ]));
+        storage.update(key, &ep).await.unwrap();
+        controller.reconcile_service(&svc).await.unwrap();
+        let ep: Endpoints = storage.get(key).await.unwrap();
+        assert_eq!(
+            ep.metadata.annotations.unwrap(),
+            HashMap::from([("user".to_string(), "keep".to_string())])
+        );
+    }
+
+    #[test]
+    fn capacity_annotation_set_correctly_matches_upstream() {
+        let none = HashMap::new();
+        let ann = HashMap::from([(
+            ENDPOINTS_OVER_CAPACITY_ANNOTATION.to_string(),
+            "truncated".to_string(),
+        )]);
+        assert!(capacity_annotation_set_correctly(&none, &[]));
+        assert!(!capacity_annotation_set_correctly(&ann, &[]));
+        let addr = EndpointAddress {
+            ip: "1.1.1.1".into(),
+            hostname: None,
+            node_name: None,
+            target_ref: None,
+        };
+        let big = EndpointSubset {
+            addresses: Some(vec![addr; MAX_ENDPOINTS_CAPACITY + 1]),
+            not_ready_addresses: None,
+            ports: None,
+        };
+        assert!(!capacity_annotation_set_correctly(&none, &[big]));
+    }
+
+    fn svc_for_metadata_tests(cluster_ip: &str) -> Service {
+        use rusternetes_common::resources::ServiceSpec;
+        let mut md = rusternetes_common::types::ObjectMeta::new("svc").with_namespace("default");
+        md.uid = "svc-uid".to_string();
+        md.labels = Some(HashMap::from([("app".to_string(), "web".to_string())]));
+        md.annotations = Some(HashMap::from([("svc-only".to_string(), "x".to_string())]));
+        Service {
+            type_meta: rusternetes_common::types::TypeMeta {
+                kind: "Service".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: md,
+            spec: ServiceSpec {
+                selector: Some(HashMap::from([("app".to_string(), "web".to_string())])),
+                cluster_ip: Some(cluster_ip.to_string()),
+                ..Default::default()
+            },
+            status: None,
+        }
+    }
+
+    /// Port of the metadata handling at endpoints_controller.go:469-499 and
+    /// TestSyncEndpointsItemsWithLabels (:1119): labels = service labels +
+    /// managed-by (+ headless), the Service's annotations are NOT copied, and
+    /// no ownerReference is set.
+    #[tokio::test]
+    async fn created_endpoints_labels_annotations_and_no_owner() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = EndpointsController::new(storage.clone());
+        let svc = svc_for_metadata_tests("None");
+        controller.reconcile_service(&svc).await.unwrap();
+        let ep: Endpoints = storage
+            .get("/registry/endpoints/default/svc")
+            .await
+            .unwrap();
+        let labels = ep.metadata.labels.unwrap();
+        assert_eq!(labels.get("app").map(String::as_str), Some("web"));
+        assert_eq!(
+            labels.get(LABEL_MANAGED_BY).map(String::as_str),
+            Some("endpoint-controller")
+        );
+        assert!(labels.contains_key(IS_HEADLESS_SERVICE_LABEL));
+        assert!(ep.metadata.annotations.is_none());
+        assert!(ep.metadata.owner_references.is_none());
+    }
+
+    /// Stored annotations survive an update; a service with a cluster IP has
+    /// no headless label; stale labels are repaired even when the subsets are
+    /// unchanged (labelsCorrectForEndpoints).
+    #[tokio::test]
+    async fn existing_annotations_kept_and_labels_repaired() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = EndpointsController::new(storage.clone());
+        let svc = svc_for_metadata_tests("10.0.0.5");
+        controller.reconcile_service(&svc).await.unwrap();
+        let key = "/registry/endpoints/default/svc";
+        let mut ep: Endpoints = storage.get(key).await.unwrap();
+        assert!(!ep
+            .metadata
+            .labels
+            .as_ref()
+            .unwrap()
+            .contains_key(IS_HEADLESS_SERVICE_LABEL));
+        ep.metadata.annotations = Some(HashMap::from([("user".to_string(), "keep".to_string())]));
+        ep.metadata.labels = Some(HashMap::from([("stale".to_string(), "y".to_string())]));
+        storage.update(key, &ep).await.unwrap();
+
+        controller.reconcile_service(&svc).await.unwrap();
+        let ep: Endpoints = storage.get(key).await.unwrap();
+        assert_eq!(
+            ep.metadata
+                .annotations
+                .unwrap()
+                .get("user")
+                .map(String::as_str),
+            Some("keep")
+        );
+        let labels = ep.metadata.labels.unwrap();
+        assert!(!labels.contains_key("stale"));
+        assert_eq!(labels.get("app").map(String::as_str), Some("web"));
+    }
+
+    #[test]
+    fn labels_correct_for_endpoints_matches_upstream() {
+        let svc = HashMap::from([("a".to_string(), "1".to_string())]);
+        let mut ep = svc.clone();
+        assert!(!labels_correct_for_endpoints(&ep, &svc), "no managed-by");
+        ep.insert(LABEL_MANAGED_BY.into(), CONTROLLER_NAME.into());
+        assert!(labels_correct_for_endpoints(&ep, &svc));
+        ep.insert(IS_HEADLESS_SERVICE_LABEL.into(), String::new());
+        assert!(labels_correct_for_endpoints(&ep, &svc));
+        ep.insert("extra".into(), "z".into());
+        assert!(!labels_correct_for_endpoints(&ep, &svc));
+        let mut ep2 = HashMap::from([(LABEL_MANAGED_BY.to_string(), CONTROLLER_NAME.to_string())]);
+        assert!(
+            !labels_correct_for_endpoints(&ep2, &svc),
+            "svc label missing"
+        );
+        ep2.insert("a".into(), "2".into());
+        assert!(!labels_correct_for_endpoints(&ep2, &svc), "value differs");
     }
 }

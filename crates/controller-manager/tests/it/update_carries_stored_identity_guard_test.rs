@@ -31,6 +31,12 @@ const REVIEWED: &[(&str, &str, &str)] = &[
         "create_replicaset_with_replicas",
         "creates the ReplicaSet; its one `update` writes a Deployment it just re-read",
     ),
+    (
+        "endpoints.rs",
+        "reconcile_service",
+        "updates `existing.clone()` (upstream's DeepCopy, endpoints_controller.go:469); \
+         `ObjectMeta::new` is only the create-path default",
+    ),
     // EndpointSlice is fixed by #2718, which owns endpointslice.rs. Delete
     // these three entries when it merges (#2719).
     ("endpointslice.rs", "mirror_endpoint", "fixed by #2718"),
