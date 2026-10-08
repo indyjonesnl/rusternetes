@@ -2708,7 +2708,7 @@ mod tests {
                             message,
                             ..Default::default()
                         });
-                        storage.update(&key, &pod).await.unwrap();
+                        storage.update_status(&key, &pod).await.unwrap();
                         return;
                     }
                     tokio::time::sleep(Duration::from_millis(5)).await;

@@ -772,7 +772,7 @@ mod tests {
                         phase: Some(Phase::Succeeded),
                         ..Default::default()
                     });
-                    s2.update(&key, &p).await.unwrap();
+                    s2.update_status(&key, &p).await.unwrap();
                     return;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
