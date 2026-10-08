@@ -288,6 +288,11 @@ fn digest(
     }
 }
 
+/// `hashFlowID` (apf_controller.go:1131-1140). STUB: red-test scaffold.
+pub fn hash_flow_id(_fs_name: &str, _flow_distinguisher: &str) -> u64 {
+    0
+}
+
 /// Errors from [`FlowControlEngine::execute`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum FlowControlError {
@@ -389,10 +394,11 @@ impl<S: Storage> FlowControlEngine<S> {
     /// `wait_limit` for `Queue` levels.
     pub async fn execute(
         &self,
-        priority_level: &str,
+        c: &Classification,
         seats: u32,
         wait_limit: Duration,
     ) -> Result<FlowControlPermit, FlowControlError> {
+        let priority_level = c.priority_level.as_str();
         let cfg = self.config.read().unwrap().clone();
         let Some(level) = cfg.levels.get(priority_level) else {
             return Ok(FlowControlPermit { _permit: None });
@@ -426,6 +432,14 @@ impl<S: Storage> FlowControlEngine<S> {
 mod tests {
     use super::*;
     use rusternetes_storage::memory::MemoryStorage;
+
+    fn cls(fs: &str, pl: &str, dist: &str) -> Classification {
+        Classification {
+            flow_schema: fs.into(),
+            priority_level: pl.into(),
+            flow_distinguisher: dist.into(),
+        }
+    }
 
     fn engine() -> FlowControlEngine<MemoryStorage> {
         FlowControlEngine::new(Arc::new(MemoryStorage::new()))
@@ -496,7 +510,7 @@ mod tests {
     async fn exempt_never_waits() {
         let e = engine();
         assert!(e
-            .execute("exempt", 1, Duration::from_millis(1))
+            .execute(&cls("exempt", "exempt", ""), 1, Duration::from_millis(1))
             .await
             .is_ok());
     }
@@ -507,15 +521,167 @@ mod tests {
         let e = FlowControlEngine::with_limits(Arc::new(MemoryStorage::new()), 1, 0);
         assert_eq!(e.concurrency_limit("catch-all"), Some(1));
         let held = e
-            .execute("catch-all", 1, Duration::from_millis(5))
+            .execute(
+                &cls("catch-all", "catch-all", ""),
+                1,
+                Duration::from_millis(5),
+            )
             .await
             .unwrap();
-        let second = e.execute("catch-all", 1, Duration::from_millis(5)).await;
+        let second = e
+            .execute(
+                &cls("catch-all", "catch-all", ""),
+                1,
+                Duration::from_millis(5),
+            )
+            .await;
         assert_eq!(second.err(), Some(FlowControlError::TooManyRequests));
         drop(held);
         assert!(e
-            .execute("catch-all", 1, Duration::from_millis(5))
+            .execute(
+                &cls("catch-all", "catch-all", ""),
+                1,
+                Duration::from_millis(5)
+            )
             .await
             .is_ok());
+    }
+
+    // ---- QueueSet wiring (#2741) ----
+
+    use rusternetes_common::resources::flowcontrol::{
+        LimitResponse, LimitedPriorityLevelConfiguration, QueuingConfiguration,
+    };
+    use rusternetes_common::types::ObjectMeta;
+
+    /// A `Limited`/`Queue` level named `test` (CL 1 when the server limit is 1).
+    fn queueing_pl(queues: i32, hand: i32, len: i32) -> PriorityLevelConfiguration {
+        let mut pl = mandatory_priority_level_configuration("catch-all").unwrap();
+        pl.metadata = ObjectMeta::new("test");
+        pl.spec.limited = Some(LimitedPriorityLevelConfiguration {
+            nominal_concurrency_shares: Some(1000),
+            lending_concurrency_limit: None,
+            lendable_percent: None,
+            borrowing_limit_percent: None,
+            limit_response: Some(LimitResponse {
+                type_: LimitResponseType::Queue,
+                queuing: Some(QueuingConfiguration {
+                    queues,
+                    hand_size: hand,
+                    queue_length_limit: len,
+                }),
+            }),
+        });
+        pl
+    }
+
+    async fn engine_with(pl: PriorityLevelConfiguration) -> FlowControlEngine<MemoryStorage> {
+        let st = Arc::new(MemoryStorage::new());
+        st.create(&build_key("prioritylevelconfigurations", None, "test"), &pl)
+            .await
+            .unwrap();
+        let e = FlowControlEngine::with_limits(st, 1, 0);
+        e.initialize().await.unwrap();
+        e
+    }
+
+    #[test]
+    fn hash_flow_id_matches_upstream_vectors() {
+        // sha256(fsName || 0x00 || distinguisher)[:8] little-endian
+        // (apf_controller.go:1131-1140); vectors from python hashlib.
+        assert_eq!(hash_flow_id("fs", "a"), 3672294129925421940);
+        assert_eq!(hash_flow_id("fs", "b"), 11054805014913603293);
+        assert_eq!(hash_flow_id("", ""), 10987292151339758702);
+        assert_eq!(hash_flow_id("catch-all", "user"), 2294043605982591715);
+    }
+
+    #[tokio::test]
+    async fn queued_requests_are_dispatched_fairly_across_flows() {
+        // One seat; flow a queues 3 requests, then flow b queues 1. Fair
+        // queueing serves b before a's second request; a FIFO semaphore does not.
+        let e = Arc::new(engine_with(queueing_pl(64, 1, 10)).await);
+        let held = e
+            .execute(&cls("fs", "test", "h"), 1, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let order = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let mut tasks = vec![];
+        for (name, flow) in [("a1", "a"), ("a2", "a"), ("a3", "a"), ("b1", "b")] {
+            let (e, order) = (e.clone(), order.clone());
+            tasks.push(tokio::spawn(async move {
+                let p = e
+                    .execute(&cls("fs", "test", flow), 1, Duration::from_secs(5))
+                    .await
+                    .unwrap();
+                order.lock().unwrap().push(name.to_string());
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                drop(p);
+            }));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        drop(held);
+        for t in tasks {
+            t.await.unwrap();
+        }
+        let order = order.lock().unwrap().clone();
+        let pos = |n: &str| order.iter().position(|x| x == n).unwrap();
+        assert!(pos("b1") < pos("a2"), "unfair order: {order:?}");
+    }
+
+    #[tokio::test]
+    async fn reload_keeps_in_flight_seats_accounted() {
+        // Reconfigure via set_configuration (not a fresh queueset): a seat held
+        // across `initialize()` must still count against the level.
+        let e = engine_with(queueing_pl(4, 1, 1)).await;
+        let held = e
+            .execute(&cls("fs", "test", "a"), 1, Duration::from_millis(5))
+            .await
+            .unwrap();
+        e.initialize().await.unwrap();
+        let second = e
+            .execute(&cls("fs", "test", "a"), 1, Duration::from_millis(20))
+            .await;
+        assert_eq!(second.err(), Some(FlowControlError::TooManyRequests));
+        drop(held);
+        assert!(e
+            .execute(&cls("fs", "test", "a"), 1, Duration::from_millis(20))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn queue_length_limit_rejects_immediately() {
+        let e = Arc::new(engine_with(queueing_pl(1, 1, 1)).await);
+        let _held = e
+            .execute(&cls("fs", "test", "a"), 1, Duration::from_millis(5))
+            .await
+            .unwrap();
+        let e2 = e.clone();
+        let queued = tokio::spawn(async move {
+            e2.execute(&cls("fs", "test", "a"), 1, Duration::from_millis(300))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let start = std::time::Instant::now();
+        let third = e
+            .execute(&cls("fs", "test", "a"), 1, Duration::from_secs(5))
+            .await;
+        assert_eq!(third.err(), Some(FlowControlError::TooManyRequests));
+        assert!(start.elapsed() < Duration::from_millis(200));
+        let _ = queued.await;
+    }
+
+    #[tokio::test]
+    async fn exempt_is_not_limited_by_concurrency() {
+        // Exempt: DesiredNumQueues < 0 dispatches immediately whatever the CL.
+        let e = engine();
+        let mut held = vec![];
+        for _ in 0..1000 {
+            held.push(
+                e.execute(&cls("exempt", "exempt", ""), 5, Duration::from_millis(1))
+                    .await
+                    .unwrap(),
+            );
+        }
     }
 }
