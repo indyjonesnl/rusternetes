@@ -160,6 +160,27 @@ struct Args {
     #[arg(long)]
     allocate_node_cidrs: bool,
 
+    /// NoExecute taints per second applied to nodes of a healthy zone
+    /// (upstream `--node-eviction-rate`, default 0.1).
+    #[arg(long, default_value = "0.1")]
+    node_eviction_rate: f32,
+
+    /// Eviction rate used when a zone is unhealthy and the cluster is large
+    /// (upstream `--secondary-node-eviction-rate`, default 0.01).
+    #[arg(long, default_value = "0.01")]
+    secondary_node_eviction_rate: f32,
+
+    /// Number of nodes above which a partially disrupted zone is "large" and
+    /// uses the secondary rate; at or below it evictions stop (upstream
+    /// `--large-cluster-size-threshold`, default 50).
+    #[arg(long, default_value = "50")]
+    large_cluster_size_threshold: i32,
+
+    /// Fraction of not-ready nodes at which a zone is partially disrupted
+    /// (upstream `--unhealthy-zone-threshold`, default 0.55).
+    #[arg(long, default_value = "0.55")]
+    unhealthy_zone_threshold: f32,
+
     /// Cluster pod-network CIDR(s) carved into per-node subnets (e.g.
     /// `10.244.0.0/16`, or `10.244.0.0/16,fd00::/48` for dual-stack: at most
     /// two, one per IP family). Only used when `--allocate-node-cidrs` is set.
@@ -983,7 +1004,15 @@ async fn main() -> Result<()> {
     });
 
     // Start Node controller (watch-based)
-    let node_controller = Arc::new(NodeController::new(storage.clone()));
+    let node_controller = Arc::new(NodeController::with_eviction_config(
+        storage.clone(),
+        controllers::node_lifecycle_zone::EvictionConfig {
+            eviction_limiter_qps: args.node_eviction_rate,
+            secondary_eviction_limiter_qps: args.secondary_node_eviction_rate,
+            large_cluster_threshold: args.large_cluster_size_threshold,
+            unhealthy_zone_threshold: args.unhealthy_zone_threshold,
+        },
+    ));
     spawn_controller!("Node controller", leader_elector, {
         let controller = node_controller.clone();
         async move {

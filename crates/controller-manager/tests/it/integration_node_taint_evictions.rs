@@ -326,6 +326,17 @@ async fn test_taint_based_evictions() {
     storage.create(&node_key, &node).await.unwrap();
     node_ctrl.seed_first_seen_for_test(node_name);
 
+    // "Because of the logic that prevents NC from evicting anything when all
+    // Nodes are NotReady we need second healthy node in tests"
+    // (node_lifecycle_controller_test.go TestApplyNoExecuteTaints): with every
+    // node NotReady the zone is FullDisruption and nothing is tainted (#2627).
+    let healthy = make_ready_node("node-healthy");
+    storage
+        .create(&build_key("nodes", None, "node-healthy"), &healthy)
+        .await
+        .unwrap();
+    node_ctrl.seed_first_seen_for_test("node-healthy");
+
     // Three pods on the NotReady node:
     //   pod-zero-toleration — tolerates with tolerationSeconds=0 (evict now).
     //   pod-200-toleration  — tolerates 200s (must remain on first tick).
