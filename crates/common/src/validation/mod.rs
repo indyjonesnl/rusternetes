@@ -58,6 +58,7 @@ pub mod secret;
 pub mod service;
 pub mod servicecidr;
 pub mod storageclass;
+pub mod structural;
 pub mod validating_admission_policy;
 pub mod volumeattachment;
 pub mod volumeattributesclass;
