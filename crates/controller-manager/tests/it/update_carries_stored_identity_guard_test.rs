@@ -37,15 +37,6 @@ const REVIEWED: &[(&str, &str, &str)] = &[
         "updates `existing.clone()` (upstream's DeepCopy, endpoints_controller.go:469); \
          `ObjectMeta::new` is only the create-path default",
     ),
-    // EndpointSlice is fixed by #2718, which owns endpointslice.rs. Delete
-    // these three entries when it merges (#2719).
-    ("endpointslice.rs", "mirror_endpoint", "fixed by #2718"),
-    ("endpointslice.rs", "reconcile_all", "fixed by #2718"),
-    (
-        "endpointslice.rs",
-        "reconcile_service_with_pods",
-        "fixed by #2718",
-    ),
 ];
 
 const FRESH: &[&str] = &[
