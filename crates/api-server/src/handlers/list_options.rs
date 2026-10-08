@@ -149,6 +149,48 @@ mod tests {
         );
     }
 
+    /// The one `validate_list_options` covers the watch rules too
+    /// (validation.go:53-76), with WatchList on (kube_features.go:503-509) and
+    /// `SetListOptionsDefaults` applied (#2686).
+    #[test]
+    fn validate_covers_watch_rules() {
+        assert!(errs(&[("watch", "true")]).is_empty());
+        assert!(errs(&[
+            ("watch", "true"),
+            ("sendInitialEvents", "true"),
+            ("resourceVersionMatch", "NotOlderThan"),
+        ])
+        .is_empty());
+        assert_eq!(
+            errs(&[("watch", "true"), ("resourceVersionMatch", "NotOlderThan")]),
+            vec!["resourceVersionMatch: Forbidden: resourceVersionMatch is forbidden for watch unless sendInitialEvents is provided"]
+        );
+        assert_eq!(
+            errs(&[("watch", "true"), ("sendInitialEvents", "true")]),
+            vec!["resourceVersionMatch: Forbidden: sendInitialEvents requires setting resourceVersionMatch to NotOlderThan"]
+        );
+        assert_eq!(
+            errs(&[
+                ("watch", "true"),
+                ("sendInitialEvents", "true"),
+                ("resourceVersionMatch", "Exact"),
+            ]),
+            vec![
+                "resourceVersionMatch: Forbidden: sendInitialEvents requires setting resourceVersionMatch to NotOlderThan",
+                r#"resourceVersionMatch: Unsupported value: "Exact": supported values: "NotOlderThan""#,
+            ]
+        );
+        assert_eq!(
+            errs(&[
+                ("watch", "true"),
+                ("sendInitialEvents", "true"),
+                ("resourceVersionMatch", "NotOlderThan"),
+                ("continue", "123"),
+            ]),
+            vec!["resourceVersionMatch: Forbidden: resourceVersionMatch is forbidden when continue is provided"]
+        );
+    }
+
     #[tokio::test]
     async fn invalid_options_are_422() {
         let storage = MemoryStorage::new();
