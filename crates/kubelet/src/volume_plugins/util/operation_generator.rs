@@ -745,12 +745,9 @@ mod tests {
         let pv = test_pv("2G");
         let mut vmt = test_vmt(&pv, "2G");
         let mut owned = vmt.volume_spec.as_spec().to_owned_spec();
-        owned
-            .volume
-            .persistent_volume_claim
-            .as_mut()
-            .unwrap()
-            .read_only = Some(true);
+        // `NewSpecFromPersistentVolume(pv, true)`
+        // (`desired_state_of_world_populator.go:588`).
+        owned.read_only = true;
         vmt.volume_spec = Arc::new(owned);
         let asow = test_asow();
         let spec = vmt.volume_spec.as_spec();

@@ -719,4 +719,27 @@ mod tests {
             "/var/lib/rusternetes/pods/uid-1/volumes/kubernetes.io~empty-dir/scratch"
         );
     }
+
+    /// `emptyDir.GetAttributes` (`pkg/volume/emptydir/empty_dir.go:220-226`):
+    /// writable, but managed and relabelled.
+    #[test]
+    fn attributes_are_writable_managed_relabel() {
+        let m = EmptyDirMounter {
+            path: "/tmp/x".into(),
+            volume_name: "v".into(),
+            empty_dir: EmptyDirVolumeSource {
+                medium: None,
+                size_limit: None,
+            },
+            fs_group: None,
+        };
+        assert_eq!(
+            m.get_attributes(),
+            crate::volume_plugins::plugin::Attributes {
+                read_only: false,
+                managed: true,
+                selinux_relabel: true
+            }
+        );
+    }
 }

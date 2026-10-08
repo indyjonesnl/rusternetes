@@ -182,6 +182,34 @@ async fn device_mounter_stages_without_publishing() {
         .exists());
 }
 
+/// `csiMountMgr.GetAttributes` (`csi_mounter.go:418-424`):
+/// `{ReadOnly: c.readOnly, Managed: !c.readOnly, SELinuxRelabel: c.needSELinuxRelabel}`.
+/// The readOnly of a PV-backed mounter is `Spec.ReadOnly`
+/// (`getReadOnlyFromSpec`, `csi_plugin.go:499`), i.e. the claim's `readOnly`.
+#[tokio::test]
+async fn mounter_attributes_follow_spec_read_only() {
+    use crate::volume_plugins::plugin::Attributes;
+    let f = fx("attrs", &[], Some(json!({"attachRequired": false}))).await;
+    let p = pv(&f.driver, json!({}));
+    let v = claim_volume();
+    for read_only in [true, false] {
+        let spec = Spec {
+            volume: &v,
+            persistent_volume: Some(&p),
+            read_only,
+        };
+        let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
+        assert_eq!(
+            m.get_attributes(),
+            Attributes {
+                read_only,
+                managed: !read_only,
+                selinux_relabel: false
+            }
+        );
+    }
+}
+
 /// `SetUp` no longer stages: the device mount is its own operation, run first
 /// by `MountVolume` (`operation_generator.go:530-552`).
 #[tokio::test]

@@ -221,6 +221,7 @@ impl crate::volume_plugins::Unmounter for HostPathUnmounter {
 mod tests {
     use super::*;
     use crate::runtime::{check_host_path_type, HostPathCheck};
+    use crate::volume_plugins::plugin::Attributes;
     use rusternetes_common::resources::{PersistentVolume, Volume};
     use serde_json::json;
 
@@ -505,5 +506,43 @@ mod tests {
                     .and_then(|v| u32::from_str_radix(v.trim(), 8).ok())
             })
             .unwrap_or(0o022)
+    }
+
+    /// Port of `TestPersistentClaimReadOnlyFlag`
+    /// (`pkg/volume/hostpath/host_path_test.go:276-320`): the readOnly of
+    /// `NewSpecFromPersistentVolume(pv, true)` reaches
+    /// `mounter.GetAttributes().ReadOnly`, and hostPath is never `Managed` nor
+    /// `SELinuxRelabel` (`host_path.go:232-238`).
+    #[tokio::test]
+    async fn persistent_claim_read_only_flag() {
+        let v = claimed_volume();
+        let pv = pv_host_path("foo");
+        let spec = Spec {
+            volume: &v,
+            persistent_volume: Some(&pv),
+            read_only: true,
+        };
+        let m = plugin().new_mounter(&spec, &test_pod()).await.unwrap();
+        assert_eq!(
+            m.get_attributes(),
+            Attributes {
+                read_only: true,
+                managed: false,
+                selinux_relabel: false
+            }
+        );
+    }
+
+    /// `NewSpecFromVolume` leaves `ReadOnly` false (`plugins.go:549-553`).
+    #[tokio::test]
+    async fn inline_host_path_is_not_read_only() {
+        let v = inline_host_path("/tmp/x");
+        let spec = Spec {
+            volume: &v,
+            persistent_volume: None,
+            read_only: false,
+        };
+        let m = plugin().new_mounter(&spec, &test_pod()).await.unwrap();
+        assert!(!m.get_attributes().read_only);
     }
 }

@@ -573,4 +573,18 @@ mod tests {
         assert!(m.set_up().await.is_err());
         assert!(!dir.exists());
     }
+
+    /// `downwardAPIVolume.GetAttributes` (`pkg/volume/downwardapi/downwardapi.go:154-160`).
+    #[test]
+    fn attributes_are_read_only_managed_relabel() {
+        let m = mounter_for(std::path::Path::new("/tmp/x"), json!([]));
+        assert_eq!(
+            m.get_attributes(),
+            crate::volume_plugins::plugin::Attributes {
+                read_only: true,
+                managed: true,
+                selinux_relabel: true
+            }
+        );
+    }
 }

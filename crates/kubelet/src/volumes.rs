@@ -2854,6 +2854,27 @@ mod pvc_resolution_tests {
         assert_eq!(path, "/mnt/data");
     }
 
+    /// `createVolumeSpec` hands `pvcSource.ReadOnly` to
+    /// `NewSpecFromPersistentVolume(pv, pvcReadOnly)`
+    /// (`desired_state_of_world_populator.go:461`, `:588`); an inline volume's
+    /// `NewSpecFromVolume` leaves it false (`plugins.go:549-553`).
+    #[test]
+    fn spec_read_only_comes_from_the_claim_source() {
+        let ro: Volume = serde_json::from_value(json!({
+            "name": "c", "persistentVolumeClaim": {"claimName": "c", "readOnly": true}
+        }))
+        .unwrap();
+        let rw: Volume = serde_json::from_value(json!({
+            "name": "c", "persistentVolumeClaim": {"claimName": "c"}
+        }))
+        .unwrap();
+        let inline: Volume =
+            serde_json::from_value(json!({"name": "h", "hostPath": {"path": "/x"}})).unwrap();
+        assert!(pvc_read_only(&ro));
+        assert!(!pvc_read_only(&rw));
+        assert!(!pvc_read_only(&inline));
+    }
+
     #[tokio::test]
     async fn a_non_claim_volume_resolves_to_no_pv() {
         let volume: Volume = serde_json::from_value(json!({
