@@ -131,6 +131,20 @@ pub struct VolumeManager {
     /// (`unmount_device`, `list_staged_devices`) that are not part of
     /// `VolumePlugin`. `plugin_mgr` holds the plugin as a `dyn VolumePlugin`.
     pub(crate) csi_plugin: Arc<crate::volume_plugins::csi::CsiPlugin>,
+    /// Each mounted pod volume's `Mounter.GetAttributes()` result plus the
+    /// `SELinuxLabeled` bit, keyed by (pod UID, volume name). Stands in for the
+    /// `VolumeInfo{Mounter, SELinuxLabeled}` map upstream's `makeMounts` reads
+    /// (`pkg/kubelet/container/runtime.go` `VolumeInfo`;
+    /// `kubelet_pods.go:296`, `:392`). `Arc`-shared because the manager is
+    /// `Clone`d per runtime attach and every clone must see one record.
+    mounted: Arc<std::sync::Mutex<HashMap<(String, String), MountedVolume>>>,
+}
+
+/// `kubecontainer.VolumeInfo` as far as `makeMounts` reads it.
+#[derive(Clone, Copy, Debug, Default)]
+struct MountedVolume {
+    attributes: crate::volume_plugins::plugin::Attributes,
+    selinux_labeled: bool,
 }
 
 /// `pvcSource.ReadOnly` as `createVolumeSpec` passes it to
@@ -190,7 +204,44 @@ impl VolumeManager {
             node_allocatable,
             plugin_mgr,
             csi_plugin: Arc::new(crate::volume_plugins::csi::CsiPlugin::new(host)),
+            mounted: Arc::default(),
         }
+    }
+
+    /// The `makeMounts` read of each mounted volume's attributes for one
+    /// container, keyed by volume name (`pkg/kubelet/kubelet_pods.go:296`,
+    /// `:392`): `read_only` is `Attributes.ReadOnly` (`mustMountRO`);
+    /// `selinux_relabel` is `Managed && SELinuxRelabel && !SELinuxLabeled`,
+    /// and the volume is then marked labeled so a later container's mount of
+    /// it is not relabelled again. A volume with no record (not mounted by this
+    /// manager) is absent, as upstream errors for a missing `vol.Mounter`; the
+    /// mount is then left exactly as the container spec declared it.
+    pub fn mount_attributes(
+        &self,
+        pod: &Pod,
+        container: &rusternetes_common::resources::Container,
+    ) -> HashMap<String, crate::cri_runtime::translate::MountAttrs> {
+        let mut out = HashMap::new();
+        let mut mounted = self.mounted.lock().unwrap();
+        for vm in container.volume_mounts.iter().flatten() {
+            let Some(vol) = mounted.get_mut(&(pod.metadata.uid.clone(), vm.name.clone())) else {
+                continue;
+            };
+            let a = vol.attributes;
+            let mut relabel = false;
+            if a.managed && a.selinux_relabel && !vol.selinux_labeled {
+                vol.selinux_labeled = true;
+                relabel = true;
+            }
+            let entry =
+                out.entry(vm.name.clone())
+                    .or_insert(crate::cri_runtime::translate::MountAttrs {
+                        read_only: a.read_only,
+                        selinux_relabel: false,
+                    });
+            entry.selinux_relabel |= relabel;
+        }
+        out
     }
 
     /// Whether a pod still has volumes mounted, in which case its directory
@@ -1152,13 +1203,22 @@ impl VolumeManager {
 
         match self.plugin_mgr.find_plugin_by_spec(&spec) {
             Ok(_) => {
-                crate::volume_plugins::util::operation_generator::mount_volume(
-                    &self.plugin_mgr,
-                    &spec,
-                    pod,
-                    "",
-                )
-                .await
+                let (path, attributes) =
+                    crate::volume_plugins::util::operation_generator::mount_volume_with_attributes(
+                        &self.plugin_mgr,
+                        &spec,
+                        pod,
+                        "",
+                    )
+                    .await?;
+                // Keep an existing `SELinuxLabeled` across a re-mount of the
+                // same pod volume (upstream keeps it on the pod's VolumeInfo).
+                let mut mounted = self.mounted.lock().unwrap();
+                let rec = mounted
+                    .entry((pod.metadata.uid.clone(), volume.name.clone()))
+                    .or_default();
+                rec.attributes = attributes;
+                Ok(path)
             }
             Err(crate::volume_plugins::PluginLookupError::NoPluginMatched) if pv.is_some() => {
                 // Preserve the pre-registry message: today only a
@@ -2870,6 +2930,70 @@ mod pvc_resolution_tests {
         // And create_volume must dispatch to the same plugin end-to-end.
         let path = manager.create_volume(&pod, &volume).await.unwrap();
         assert_eq!(path, "/mnt/data");
+    }
+
+    /// #2782: a `readOnly: true` PVC over a hostPath PV must reach the CRI
+    /// mount as read-only (`makeMounts`: `mustMountRO`, kubelet_pods.go:392),
+    /// while a read-write claim and an inline hostPath stay read-write.
+    #[tokio::test]
+    async fn read_only_pvc_over_host_path_pv_yields_read_only_mount_attrs() {
+        let storage = Arc::new(StorageBackend::new_memory());
+        let pv: PersistentVolume = serde_json::from_value(json!({
+            "metadata": {"name": "pv-1"},
+            "spec": {
+                "capacity": {"storage": "1Gi"},
+                "accessModes": ["ReadWriteOnce"],
+                "hostPath": {"path": "/mnt/data"}
+            }
+        }))
+        .unwrap();
+        storage
+            .create(&build_key("persistentvolumes", None, "pv-1"), &pv)
+            .await
+            .unwrap();
+        let pvc: PersistentVolumeClaim = serde_json::from_value(json!({
+            "metadata": {"name": "claim-1", "namespace": "default"},
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "volumeName": "pv-1",
+                "resources": {"requests": {"storage": "1Gi"}}
+            }
+        }))
+        .unwrap();
+        storage
+            .create(
+                &build_key("persistentvolumeclaims", Some("default"), "claim-1"),
+                &pvc,
+            )
+            .await
+            .unwrap();
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-1"},
+            "spec": {
+                "volumes": [
+                    {"name": "ro", "persistentVolumeClaim": {"claimName": "claim-1", "readOnly": true}},
+                    {"name": "rw", "persistentVolumeClaim": {"claimName": "claim-1"}},
+                    {"name": "inline", "hostPath": {"path": "/mnt/inline"}}
+                ],
+                "containers": [{
+                    "name": "c", "image": "i",
+                    "volumeMounts": [
+                        {"name": "ro", "mountPath": "/ro"},
+                        {"name": "rw", "mountPath": "/rw"},
+                        {"name": "inline", "mountPath": "/inline"}
+                    ]
+                }]
+            }
+        }))
+        .unwrap();
+        let manager = vm(Some(storage));
+        manager.create_pod_volumes(&pod).await.unwrap();
+        let attrs = manager.mount_attributes(&pod, &pod.spec.as_ref().unwrap().containers[0]);
+        assert!(attrs["ro"].read_only);
+        assert!(!attrs["rw"].read_only);
+        assert!(!attrs["inline"].read_only);
+        // hostPath is not Managed: never relabelled (host_path.go:180).
+        assert!(attrs.values().all(|a| !a.selinux_relabel));
     }
 
     /// `createVolumeSpec` hands `pvcSource.ReadOnly` to
