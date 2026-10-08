@@ -66,6 +66,15 @@ pub async fn get_openapi_spec(State(state): State<Arc<ApiServerState>>) -> Respo
     let path_entry =
         |gv: &str| serde_json::json!({"serverRelativeURL": format!("/openapi/v3/{}", gv)});
     paths.insert("api/v1".into(), path_entry("api/v1"));
+    // MutatingAdmissionPolicy gate (storage_apiserver.go:187-205).
+    if rusternetes_common::feature_gates::enabled(
+        rusternetes_common::feature_gates::Feature::MutatingAdmissionPolicy,
+    ) {
+        paths.insert(
+            "apis/admissionregistration.k8s.io/v1beta1".into(),
+            path_entry("apis/admissionregistration.k8s.io/v1beta1"),
+        );
+    }
     for (group, version) in &[
         ("apps", "v1"),
         ("batch", "v1"),

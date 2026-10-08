@@ -250,7 +250,7 @@ pub async fn get_api_groups(
                 continue;
             }
             seen_groups.insert(name.to_string());
-            let versions = if name == "certificates.k8s.io" && certificates_v1beta1_served() {
+            let versions = if group_v1beta1_served(name) {
                 vec![
                     serde_json::json!({
                         "version": version,
@@ -760,6 +760,20 @@ pub async fn get_api_groups(
         }
     }
 
+    // admissionregistration.k8s.io/v1beta1 is served under the
+    // MutatingAdmissionPolicy gate (storage_apiserver.go:187-205).
+    if admissionregistration_v1beta1_served() {
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|g| g.name == "admissionregistration.k8s.io")
+        {
+            group.versions.push(GroupVersionForDiscovery {
+                group_version: "admissionregistration.k8s.io/v1beta1".to_string(),
+                version: "v1beta1".to_string(),
+            });
+        }
+    }
+
     // Dynamically add CRD groups to the non-aggregated discovery response.
     // kubectl uses this to find resources by GVK. Without CRD groups here,
     // kubectl create/explain fails with "no matches for kind".
@@ -866,6 +880,27 @@ fn certificates_v1beta1_served() -> bool {
     enabled(Feature::ClusterTrustBundle) || enabled(Feature::PodCertificateRequest)
 }
 
+/// Whether `admissionregistration.k8s.io/v1beta1` is served: its resources,
+/// `mutatingadmissionpolicies` and `mutatingadmissionpolicybindings`, are
+/// installed only while the version is enabled, i.e. under the
+/// `MutatingAdmissionPolicy` gate (pkg/registry/admissionregistration/rest/
+/// storage_apiserver.go:187-205), and upstream drops a group version that has
+/// no storage.
+fn admissionregistration_v1beta1_served() -> bool {
+    rusternetes_common::feature_gates::enabled(
+        rusternetes_common::feature_gates::Feature::MutatingAdmissionPolicy,
+    )
+}
+
+/// Whether `group` also serves a `v1beta1` next to its preferred version.
+fn group_v1beta1_served(group: &str) -> bool {
+    match group {
+        "certificates.k8s.io" => certificates_v1beta1_served(),
+        "admissionregistration.k8s.io" => admissionregistration_v1beta1_served(),
+        _ => false,
+    }
+}
+
 /// Helper to get all API group names and their preferred versions
 fn get_api_group_names() -> Vec<(&'static str, &'static str)> {
     vec![
@@ -906,6 +941,7 @@ pub fn resolve_kind_to_resource(group: &str, version: &str, kind: &str) -> Optio
     let served = match (group, version) {
         ("", "v1") | ("autoscaling", "v1") => true,
         ("certificates.k8s.io", "v1beta1") => certificates_v1beta1_served(),
+        ("admissionregistration.k8s.io", "v1beta1") => admissionregistration_v1beta1_served(),
         _ => get_api_group_names()
             .iter()
             .any(|(g, v)| *g == group && *v == version),
@@ -1206,6 +1242,30 @@ fn get_aggregated_resources_for_group_uncategorized(
                 vec![],
             ),
         ],
+        // pkg/registry/admissionregistration/rest/storage_apiserver.go:187-205
+        "admissionregistration.k8s.io" if version == "v1beta1" => {
+            if !admissionregistration_v1beta1_served() {
+                return Vec::new();
+            }
+            vec![
+                res(
+                    "mutatingadmissionpolicies",
+                    "mutatingadmissionpolicy",
+                    "MutatingAdmissionPolicy",
+                    false,
+                    all_verbs,
+                    vec![],
+                ),
+                res(
+                    "mutatingadmissionpolicybindings",
+                    "mutatingadmissionpolicybinding",
+                    "MutatingAdmissionPolicyBinding",
+                    false,
+                    all_verbs,
+                    vec![],
+                ),
+            ]
+        }
         "admissionregistration.k8s.io" => vec![
             res(
                 "validatingwebhookconfigurations",
@@ -1676,7 +1736,7 @@ pub async fn get_api_group(
 
     if let Some((name, version)) = found {
         // autoscaling has both v1 and v2
-        let versions = if *name == "certificates.k8s.io" && certificates_v1beta1_served() {
+        let versions = if group_v1beta1_served(name) {
             vec![
                 GroupVersionForDiscovery {
                     group_version: format!("{}/{}", name, version),
@@ -3458,6 +3518,70 @@ pub async fn get_certificates_v1beta1_resources() -> Response {
         api_version: "v1".to_string(),
         group_version: "certificates.k8s.io/v1beta1".to_string(),
         resources,
+    };
+    (StatusCode::OK, Json(resource_list)).into_response()
+}
+
+/// GET /apis/admissionregistration.k8s.io/v1beta1
+/// Returns `mutatingadmissionpolicies` and `mutatingadmissionpolicybindings`
+/// (404 while the `MutatingAdmissionPolicy` gate is off, as for an API version
+/// with no storage: storage_apiserver.go:187-205).
+pub async fn get_admissionregistration_v1beta1_resources() -> Response {
+    if !admissionregistration_v1beta1_served() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "kind": "Status",
+                "apiVersion": "v1",
+                "status": "Failure",
+                "message": "the server could not find the requested resource",
+                "reason": "NotFound",
+                "code": 404
+            })),
+        )
+            .into_response();
+    }
+    let all_verbs = || -> Vec<String> {
+        [
+            "create",
+            "delete",
+            "deletecollection",
+            "get",
+            "list",
+            "patch",
+            "update",
+            "watch",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    };
+    let resource = |name: &str, singular: &str, kind: &str| APIResource {
+        name: name.to_string(),
+        singular_name: singular.to_string(),
+        namespaced: false,
+        kind: kind.to_string(),
+        verbs: all_verbs(),
+        short_names: None,
+        categories: Some(vec!["api-extensions".to_string()]),
+        storage_version_hash: None,
+    };
+    let resource_list = APIResourceList {
+        kind: "APIResourceList".to_string(),
+        api_version: "v1".to_string(),
+        group_version: "admissionregistration.k8s.io/v1beta1".to_string(),
+        resources: vec![
+            resource(
+                "mutatingadmissionpolicies",
+                "mutatingadmissionpolicy",
+                "MutatingAdmissionPolicy",
+            ),
+            resource(
+                "mutatingadmissionpolicybindings",
+                "mutatingadmissionpolicybinding",
+                "MutatingAdmissionPolicyBinding",
+            ),
+        ],
     };
     (StatusCode::OK, Json(resource_list)).into_response()
 }
