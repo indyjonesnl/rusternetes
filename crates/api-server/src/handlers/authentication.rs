@@ -55,8 +55,12 @@ pub async fn create_token_review(
         .authenticate_token(&token_review.spec.token, Some(&requested_audiences))
     {
         Ok((claims, matched)) => {
-            match rusternetes_middleware::validate_service_account_claims(&state.storage, &claims)
-                .await
+            match rusternetes_middleware::validate_service_account_token(
+                &state.storage,
+                &token_review.spec.token,
+                &claims,
+            )
+            .await
             {
                 Ok(()) => Ok((claims, matched)),
                 Err(e) => Err(e),

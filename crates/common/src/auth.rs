@@ -56,7 +56,9 @@ pub struct ServiceAccountClaims {
     #[serde(default)]
     pub iat: i64,
 
-    /// Expiration timestamp
+    /// Expiration timestamp. Absent (0) for legacy secret-based tokens, which
+    /// never expire (`legacy.go` `LegacyClaims` sets no `exp`).
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub exp: i64,
 
     /// Issuer
@@ -87,6 +89,49 @@ pub struct ServiceAccountClaims {
     /// Node UID where the bound pod is running
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_uid: Option<String>,
+}
+
+fn is_zero(v: &i64) -> bool {
+    *v == 0
+}
+
+/// `serviceaccount.LegacyIssuer` (`pkg/serviceaccount/legacy.go:56`).
+pub const LEGACY_ISSUER: &str = "kubernetes/serviceaccount";
+/// `serviceaccount.LastUsedLabelKey` (`legacy.go:57`).
+pub const LEGACY_TOKEN_LAST_USED_LABEL_KEY: &str = "kubernetes.io/legacy-token-last-used";
+/// `serviceaccount.InvalidSinceLabelKey` (`legacy.go:40`).
+pub const LEGACY_TOKEN_INVALID_SINCE_LABEL_KEY: &str = "kubernetes.io/legacy-token-invalid-since";
+
+/// `legacyPrivateClaims` (`pkg/serviceaccount/legacy.go:60-65`): the private
+/// claims of a legacy secret-based token.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LegacyPrivateClaims {
+    #[serde(rename = "kubernetes.io/serviceaccount/service-account.name", default)]
+    pub service_account_name: String,
+    #[serde(rename = "kubernetes.io/serviceaccount/service-account.uid", default)]
+    pub service_account_uid: String,
+    #[serde(rename = "kubernetes.io/serviceaccount/secret.name", default)]
+    pub secret_name: String,
+    #[serde(rename = "kubernetes.io/serviceaccount/namespace", default)]
+    pub namespace: String,
+}
+
+impl LegacyPrivateClaims {
+    /// Decode the private claims from the payload of a token whose signature
+    /// has already been verified.
+    pub fn from_verified_token(token: &str) -> Result<Self> {
+        let payload = token
+            .split('.')
+            .nth(1)
+            .and_then(|p| {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(p)
+                    .ok()
+            })
+            .ok_or_else(|| Error::Authentication("Invalid token: malformed payload".into()))?;
+        serde_json::from_slice(&payload)
+            .map_err(|_| Error::Authentication("Invalid token: malformed payload".into()))
+    }
 }
 
 fn deserialize_audience<'de, D>(d: D) -> std::result::Result<Vec<String>, D::Error>
@@ -347,20 +392,30 @@ impl TokenManager {
         &self.api_audiences
     }
 
+    /// The legacy authenticator is always registered next to the bound-token
+    /// one (`pkg/kubeapiserver/authenticator/config.go:141-147`,
+    /// `newLegacyServiceAccountAuthenticator`: `JWTTokenAuthenticator([]string{
+    /// serviceaccount.LegacyIssuer}, ...)`), so `LEGACY_ISSUER` is accepted
+    /// whatever `--service-account-issuer` says. Such a token must then pass
+    /// the legacy validator, never the bound one (see the middleware's
+    /// `validate_service_account_token`).
     fn accepts_issuer(&self, iss: &str) -> bool {
-        if self.issuers.is_empty() {
-            DEFAULT_ISSUERS.contains(&iss)
-        } else {
-            self.issuers.iter().any(|i| i == iss)
-        }
+        iss == LEGACY_ISSUER
+            || if self.issuers.is_empty() {
+                DEFAULT_ISSUERS.contains(&iss)
+            } else {
+                self.issuers.iter().any(|i| i == iss)
+            }
     }
 
     fn accepted_issuers(&self) -> Vec<&str> {
-        if self.issuers.is_empty() {
+        let mut v: Vec<&str> = if self.issuers.is_empty() {
             DEFAULT_ISSUERS.to_vec()
         } else {
             self.issuers.iter().map(String::as_str).collect()
-        }
+        };
+        v.push(LEGACY_ISSUER);
+        v
     }
 
     /// Create a TokenManager, trying RSA keys first, falling back to HMAC secret
@@ -526,6 +581,9 @@ impl TokenManager {
             // enforces expiry / not-before with `jwt.DefaultLeeway` (1 minute).
             validation.validate_aud = false;
             validation.validate_nbf = true;
+            // `exp` is optional: go-jose `Claims.Validate` only checks it when
+            // present, and legacy tokens never carry one.
+            validation.required_spec_claims.clear();
             validation.leeway = 60;
             validation.set_issuer(&issuers);
             match decode::<ServiceAccountClaims>(token, key, &validation) {
@@ -537,6 +595,19 @@ impl TokenManager {
             }
         }
         let mut claims = decoded.ok_or_else(|| invalid(errors.join("; ")))?;
+
+        // A legacy token carries them in the `kubernetes.io/serviceaccount/*`
+        // private claims (`legacyPrivateClaims`); the legacy validator
+        // verifies them against the Secret / ServiceAccount.
+        if claims.iss == LEGACY_ISSUER {
+            let private = LegacyPrivateClaims::from_verified_token(token)?;
+            if claims.namespace.is_empty() {
+                claims.namespace = private.namespace;
+            }
+            if claims.uid.is_empty() {
+                claims.uid = private.service_account_uid;
+            }
+        }
 
         // An upstream token carries namespace / SA uid only in `kubernetes.io`.
         if let Some(k) = &claims.kubernetes {

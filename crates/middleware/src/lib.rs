@@ -441,6 +441,194 @@ pub async fn skip_auth_middleware(
     Ok(next.run(request).await)
 }
 
+/// Domain validation for a service-account token whose signature, issuer and
+/// audience are already verified: picks the validator the way
+/// `pkg/kubeapiserver/authenticator/config.go:141-154` does, by issuer. A token
+/// from `LEGACY_ISSUER` is checked only by the legacy validator
+/// (`newLegacyServiceAccountAuthenticator`); any other by the bound-token
+/// validator (`validate_service_account_claims`).
+pub async fn validate_service_account_token(
+    storage: &StorageBackend,
+    token: &str,
+    claims: &rusternetes_common::auth::ServiceAccountClaims,
+) -> std::result::Result<(), String> {
+    if claims.iss == rusternetes_common::auth::LEGACY_ISSUER {
+        validate_legacy_service_account_token(storage, token, claims).await
+    } else {
+        validate_service_account_claims(storage, claims).await
+    }
+}
+
+/// `subtle.ConstantTimeCompare(a, b) != 0`.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Port of `legacyValidator.Validate` with `lookup=true`
+/// (`pkg/serviceaccount/legacy.go:73-170`): the claims must be present and
+/// consistent, the Secret the token was minted for must still exist, not be
+/// deleted and still hold this exact token, the ServiceAccount must still exist
+/// with the same UID, and a Secret marked `legacy-token-invalid-since` rejects
+/// the token. Every use that gets past the lookups stamps the Secret with
+/// `legacy-token-last-used` (`patchSecretWithLastUsedDate`), which is what the
+/// legacy-token cleaner reads.
+///
+/// Not ported (tracked in the PR): the audit annotations, `warning.AddWarning`
+/// and the `legacy_*_uses_total` metrics (legacy.go:143-170), which need
+/// request-scoped state the middleware crate does not have.
+async fn validate_legacy_service_account_token(
+    storage: &StorageBackend,
+    token: &str,
+    claims: &rusternetes_common::auth::ServiceAccountClaims,
+) -> std::result::Result<(), String> {
+    use rusternetes_common::auth::{
+        LegacyPrivateClaims, LEGACY_TOKEN_INVALID_SINCE_LABEL_KEY as INVALID_SINCE,
+    };
+    use rusternetes_common::resources::{Secret, ServiceAccount};
+
+    let private = LegacyPrivateClaims::from_verified_token(token).map_err(|e| e.to_string())?;
+
+    // Make sure the claims we need exist (legacy.go:76-97)
+    if claims.sub.is_empty() {
+        return Err("sub claim is missing".to_string());
+    }
+    let namespace = &private.namespace;
+    if namespace.is_empty() {
+        return Err("namespace claim is missing".to_string());
+    }
+    let secret_name = &private.secret_name;
+    if secret_name.is_empty() {
+        return Err("secretName claim is missing".to_string());
+    }
+    let sa_name = &private.service_account_name;
+    if sa_name.is_empty() {
+        return Err("serviceAccountName claim is missing".to_string());
+    }
+    let sa_uid = &private.service_account_uid;
+    if sa_uid.is_empty() {
+        return Err("serviceAccountUID claim is missing".to_string());
+    }
+
+    // `SplitUsername` + the comparison (legacy.go:99-102)
+    let mut sub = claims
+        .sub
+        .strip_prefix("system:serviceaccount:")
+        .unwrap_or("")
+        .splitn(2, ':');
+    let (sub_ns, sub_name) = (sub.next().unwrap_or(""), sub.next().unwrap_or(""));
+    if sub_ns.is_empty() || sub_name.is_empty() || sub_ns != namespace || sub_name != sa_name {
+        return Err("sub claim is invalid".to_string());
+    }
+
+    // Make sure token hasn't been invalidated by deletion of the secret
+    // (legacy.go:104-116)
+    let secret_key = build_key("secrets", Some(namespace.as_str()), secret_name);
+    let secret: Secret = storage
+        .get(&secret_key)
+        .await
+        .map_err(|_| "Token has been invalidated".to_string())?;
+    if secret.metadata.deletion_timestamp.is_some() {
+        return Err("Token has been invalidated".to_string());
+    }
+    let stored = secret
+        .data
+        .as_ref()
+        .and_then(|d| d.get("token"))
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if !constant_time_eq(stored, token.as_bytes()) {
+        return Err("Token does not match server's copy".to_string());
+    }
+
+    // Make sure service account still exists (name and UID)
+    // (legacy.go:118-132)
+    let sa: ServiceAccount = storage
+        .get(&build_key(
+            "serviceaccounts",
+            Some(namespace.as_str()),
+            sa_name,
+        ))
+        .await
+        .map_err(|_| format!("serviceaccounts \"{sa_name}\" not found"))?;
+    if sa.metadata.deletion_timestamp.is_some() {
+        return Err(format!(
+            "ServiceAccount {namespace}/{sa_name} has been deleted"
+        ));
+    }
+    if sa.metadata.uid != *sa_uid {
+        return Err(format!(
+            "ServiceAccount UID ({}) does not match claim ({sa_uid})",
+            sa.metadata.uid
+        ));
+    }
+
+    // Check if the secret has been marked as invalid (legacy.go:149-154)
+    let invalid_since = secret
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|l| l.get(INVALID_SINCE))
+        .is_some_and(|v| !v.is_empty());
+    if invalid_since {
+        patch_secret_with_last_used_date(storage, &secret_key, &secret).await;
+        return Err(format!(
+            "the token in secret {namespace}/{secret_name} for service account \
+             {namespace}/{sa_name} has been marked invalid. Use tokens from the \
+             TokenRequest API or manually created secret-based tokens, or remove \
+             the '{INVALID_SINCE}' label from the secret to temporarily allow use \
+             of this token"
+        ));
+    }
+
+    patch_secret_with_last_used_date(storage, &secret_key, &secret).await;
+    Ok(())
+}
+
+/// Port of `patchSecretWithLastUsedDate` (legacy.go:185-198): merge-patch the
+/// label `kubernetes.io/legacy-token-last-used=<today UTC>` unless it already
+/// reads today or tomorrow. A failed patch is logged, never fatal.
+///
+/// Deviation: upstream's apply-configuration patch carries `metadata.uid` as a
+/// precondition; the storage merge patch here sends the label only, so a Secret
+/// recreated between the read and the patch gets the (harmless) stamp.
+async fn patch_secret_with_last_used_date(
+    storage: &StorageBackend,
+    key: &str,
+    secret: &rusternetes_common::resources::Secret,
+) {
+    use rusternetes_common::auth::LEGACY_TOKEN_LAST_USED_LABEL_KEY as LAST_USED;
+
+    let now = chrono::Utc::now();
+    let today = now.format("%Y-%m-%d").to_string();
+    let tomorrow = (now + chrono::Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+    let last_used = secret
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|l| l.get(LAST_USED))
+        .map(String::as_str)
+        .unwrap_or("");
+    if last_used != today && last_used != tomorrow {
+        let patch = serde_json::json!({"metadata": {"labels": {LAST_USED: today}}});
+        if let Err(e) = storage
+            .patch_strategic_merge::<serde_json::Value>(key, &patch)
+            .await
+        {
+            warn!(
+                "Failed to label legacy service account token {}/{} with last-used date, err: {}",
+                secret.metadata.name,
+                secret.metadata.namespace.as_deref().unwrap_or(""),
+                e
+            );
+        }
+    }
+}
+
 /// Port of `validator.Validate` (pkg/serviceaccount/claims.go:144-263), the
 /// domain validation the JWT authenticator applies once signature and issuer
 /// are verified: the ServiceAccount and every object the token is bound to
@@ -604,7 +792,7 @@ pub async fn auth_middleware(
             // Upstream parity: a JWT that decodes is not sufficient; the
             // ServiceAccount and every bound object must still exist
             // (`validator.Validate`, claims.go:144-263).
-            if let Err(reason) = validate_service_account_claims(&storage, &claims).await {
+            if let Err(reason) = validate_service_account_token(&storage, token, &claims).await {
                 warn!("Rejecting service account token: {}", reason);
                 return Err((StatusCode::UNAUTHORIZED, "Invalid token").into_response());
             }
