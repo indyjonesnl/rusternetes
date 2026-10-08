@@ -161,6 +161,7 @@ async fn device_mounter_stages_without_publishing() {
     let spec = Spec {
         volume: &v,
         persistent_volume: Some(&p),
+        read_only: false,
     };
     let dm = f.plugin.new_device_mounter().unwrap();
     let path = dm.get_device_mount_path(&spec).unwrap();
@@ -225,6 +226,7 @@ async fn set_up_alone_does_not_stage() {
     let spec = Spec {
         volume: &v,
         persistent_volume: Some(&p),
+        read_only: false,
     };
     let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
     m.set_up().await.unwrap();
@@ -251,6 +253,7 @@ async fn mount_volume_stages_before_it_publishes() {
     let spec = Spec {
         volume: &v,
         persistent_volume: Some(&p),
+        read_only: false,
     };
     let path = mount_volume(&f, &spec, &pod()).await;
     assert!(path.ends_with("/mount"), "{path}");
@@ -274,6 +277,7 @@ async fn mount_volume_does_not_publish_when_staging_fails() {
     let spec = Spec {
         volume: &v,
         persistent_volume: Some(&p),
+        read_only: false,
     };
     let mgr = crate::volume_plugins::VolumePluginMgr::new(vec![Box::new(CsiPlugin::new(host(
         &f.root,
@@ -302,6 +306,7 @@ async fn mount_device_delegates_fs_group_to_a_volume_mount_group_driver() {
     let spec = Spec {
         volume: &v,
         persistent_volume: Some(&p),
+        read_only: false,
     };
     let dm = f.plugin.new_device_mounter().unwrap();
     let path = dm.get_device_mount_path(&spec).unwrap();
@@ -334,6 +339,7 @@ async fn mount_device_without_stage_capability_is_a_noop_rpc() {
     let spec = Spec {
         volume: &v,
         persistent_volume: Some(&p),
+        read_only: false,
     };
     let dm = f.plugin.new_device_mounter().unwrap();
     let path = dm.get_device_mount_path(&spec).unwrap();
@@ -353,6 +359,7 @@ async fn mount_device_with_an_unregistered_driver_is_transient() {
     let spec = Spec {
         volume: &v,
         persistent_volume: Some(&p),
+        read_only: false,
     };
     let dm = f.plugin.new_device_mounter().unwrap();
     let path = dm.get_device_mount_path(&spec).unwrap();
@@ -374,14 +381,16 @@ fn can_device_mount_is_persistent_only() {
     let claim = claim_volume();
     assert!(plugin.can_device_mount(&Spec {
         volume: &claim,
-        persistent_volume: Some(&p)
+        persistent_volume: Some(&p),
+        read_only: false,
     }));
     let inline: Volume =
         serde_json::from_value(json!({"name": "v", "csi": {"driver": "d.csi.example.com"}}))
             .unwrap();
     assert!(!plugin.can_device_mount(&Spec {
         volume: &inline,
-        persistent_volume: None
+        persistent_volume: None,
+        read_only: false,
     }));
 }
 
@@ -395,6 +404,7 @@ fn supports_an_inline_csi_volume() {
     let spec = Spec {
         volume: &v,
         persistent_volume: None,
+        read_only: false,
     };
     assert!(plugin().can_support(&spec));
 }
@@ -405,6 +415,7 @@ fn rejects_other_kinds() {
     let spec = Spec {
         volume: &v,
         persistent_volume: None,
+        read_only: false,
     };
     assert!(!plugin().can_support(&spec));
 }
@@ -418,6 +429,7 @@ fn supports_a_persistent_volume_with_a_csi_source() {
     let spec = Spec {
         volume: &v,
         persistent_volume: Some(&p),
+        read_only: false,
     };
     assert!(plugin().can_support(&spec));
 }
@@ -433,6 +445,7 @@ fn rejects_a_persistent_volume_without_a_csi_source() {
     let spec = Spec {
         volume: &v,
         persistent_volume: Some(&p),
+        read_only: false,
     };
     assert!(!plugin().can_support(&spec));
 }
@@ -450,6 +463,7 @@ fn get_volume_name_for_a_pv() {
     let spec = Spec {
         volume: &v,
         persistent_volume: Some(&p),
+        read_only: false,
     };
     assert_eq!(
         plugin().get_volume_name(&spec).unwrap(),
@@ -470,6 +484,7 @@ async fn mounter_get_path_uses_the_pv_name_and_mount_suffix() {
     let spec = Spec {
         volume: &v,
         persistent_volume: Some(&p),
+        read_only: false,
     };
     let m = plugin().new_mounter(&spec, &pod()).await.unwrap();
     assert_eq!(
@@ -500,6 +515,7 @@ async fn set_up_publishes_a_persistent_volume() {
     let spec = Spec {
         volume: &v,
         persistent_volume: Some(&p),
+        read_only: false,
     };
     let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
     m.set_up().await.unwrap();
@@ -544,8 +560,8 @@ async fn set_up_publishes_a_persistent_volume() {
     assert!(data["attachmentID"].starts_with("csi-"));
 }
 
-/// The claim's `readOnly` reaches NodePublishVolume (`Spec.ReadOnly`,
-/// `csi_plugin.go:513`).
+/// `Spec.ReadOnly` (the claim's `readOnly`) reaches NodePublishVolume (
+/// `csi_plugin.go:499`, `:513`).
 #[tokio::test]
 async fn set_up_passes_the_claims_read_only_flag() {
     let f = fx("ro", &[], Some(json!({"attachRequired": false}))).await;
@@ -557,6 +573,7 @@ async fn set_up_passes_the_claims_read_only_flag() {
     let spec = Spec {
         volume: &v,
         persistent_volume: Some(&p),
+        read_only: true,
     };
     let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
     m.set_up().await.unwrap();
@@ -586,6 +603,7 @@ async fn set_up_stages_then_publishes_when_the_driver_supports_it() {
     let spec = Spec {
         volume: &v,
         persistent_volume: Some(&p),
+        read_only: false,
     };
     mount_volume(&f, &spec, &pod()).await;
 
@@ -625,6 +643,7 @@ async fn set_up_injects_pod_info_when_the_driver_asks_for_it() {
     let spec = Spec {
         volume: &v,
         persistent_volume: Some(&p),
+        read_only: false,
     };
     let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
     m.set_up().await.unwrap();
@@ -647,6 +666,7 @@ async fn set_up_omits_pod_info_by_default() {
     let spec = Spec {
         volume: &v,
         persistent_volume: Some(&p),
+        read_only: false,
     };
     let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
     m.set_up().await.unwrap();
@@ -681,6 +701,7 @@ async fn set_up_injects_service_account_tokens_into_the_volume_context() {
     let spec = Spec {
         volume: &v,
         persistent_volume: Some(&p),
+        read_only: false,
     };
     let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
     m.set_up().await.unwrap();
@@ -730,6 +751,7 @@ async fn set_up_puts_service_account_tokens_in_secrets_when_asked() {
     let spec = Spec {
         volume: &v,
         persistent_volume: Some(&p),
+        read_only: false,
     };
     let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
     m.set_up().await.unwrap();
@@ -751,6 +773,7 @@ async fn set_up_without_token_requests_adds_no_token_attribute() {
     let spec = Spec {
         volume: &v,
         persistent_volume: Some(&p),
+        read_only: false,
     };
     let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
     m.set_up().await.unwrap();
@@ -769,6 +792,7 @@ async fn set_up_reads_the_publish_context_from_the_volume_attachment() {
     let spec = Spec {
         volume: &v,
         persistent_volume: Some(&p),
+        read_only: false,
     };
     let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
 
@@ -810,6 +834,7 @@ async fn set_up_with_an_unregistered_driver_is_transient() {
     let spec = Spec {
         volume: &v,
         persistent_volume: Some(&p),
+        read_only: false,
     };
     let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
     let err = m.set_up().await.unwrap_err();
@@ -841,6 +866,7 @@ async fn final_publish_error_cleans_up_but_uncertain_keeps_the_data_file() {
         let spec = Spec {
             volume: &v,
             persistent_volume: Some(&p),
+            read_only: false,
         };
         let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
         let err = m.set_up().await.unwrap_err();
@@ -879,6 +905,7 @@ async fn set_up_rejects_a_driver_that_does_not_support_the_mode() {
     let spec = Spec {
         volume: &v,
         persistent_volume: Some(&p),
+        read_only: false,
     };
     let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
     let err = m.set_up().await.unwrap_err();
@@ -916,6 +943,7 @@ async fn set_up_publishes_an_inline_volume_on_a_registered_driver() {
     let spec = Spec {
         volume: &v,
         persistent_volume: None,
+        read_only: false,
     };
     let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
     assert_eq!(
@@ -949,6 +977,7 @@ async fn inline_volume_on_an_unregistered_driver_keeps_the_placeholder_dir() {
     let spec = Spec {
         volume: &v,
         persistent_volume: None,
+        read_only: false,
     };
     let m = p.new_mounter(&spec, &pod()).await.unwrap();
     m.set_up().await.unwrap();
@@ -968,6 +997,7 @@ async fn tear_down_unpublishes_and_cleans_up() {
     let spec = Spec {
         volume: &v,
         persistent_volume: Some(&p),
+        read_only: false,
     };
     let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
     m.set_up().await.unwrap();
@@ -1001,6 +1031,7 @@ async fn tear_down_with_an_unregistered_driver_is_transient() {
     let spec = Spec {
         volume: &v,
         persistent_volume: Some(&p),
+        read_only: false,
     };
     let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
     m.set_up().await.unwrap();
@@ -1040,6 +1071,7 @@ async fn orphaned_pod_csi_volume_is_unpublished() {
     let spec = Spec {
         volume: &v,
         persistent_volume: Some(&p),
+        read_only: false,
     };
     let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
     m.set_up().await.unwrap();
@@ -1091,6 +1123,7 @@ async fn construct_volume_spec_rebuilds_a_persistent_spec() {
     let spec = Spec {
         volume: &v,
         persistent_volume: Some(&p),
+        read_only: false,
     };
     let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
     m.set_up().await.unwrap();
@@ -1248,6 +1281,7 @@ async fn staged_device_is_unstaged_only_after_the_last_pod_unpublishes() {
     let spec = Spec {
         volume: &v,
         persistent_volume: Some(&p),
+        read_only: false,
     };
     let mut pod_b = pod();
     pod_b.metadata.uid = "uid-2".to_string();
@@ -1317,6 +1351,7 @@ async fn terminated_live_pod_csi_volume_is_unpublished() {
     let spec = Spec {
         volume: &v,
         persistent_volume: Some(&p),
+        read_only: false,
     };
     let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
     m.set_up().await.unwrap();
@@ -1372,6 +1407,7 @@ mod fs_group {
         let spec = Spec {
             volume: &v,
             persistent_volume: Some(&p),
+            read_only: false,
         };
         let m = f
             .plugin
@@ -1535,6 +1571,7 @@ mod fs_group {
         let spec = Spec {
             volume: &v,
             persistent_volume: Some(&p),
+            read_only: false,
         };
         let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
         let e = m.set_up().await.unwrap_err();

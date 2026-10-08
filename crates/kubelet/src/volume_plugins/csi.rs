@@ -3,7 +3,7 @@ use crate::volume_plugins::plugin::{
     DeviceMountableVolumePlugin, DeviceMounter, DeviceMounterArgs,
 };
 use crate::volume_plugins::{
-    Mounter, ReconstructedVolume, Spec, Unmounter, VolumeHost, VolumePlugin,
+    Attributes, Mounter, ReconstructedVolume, Spec, Unmounter, VolumeHost, VolumePlugin,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -220,13 +220,8 @@ impl VolumePlugin for CsiPlugin {
                     Source::Pv(Box::new(pv.clone())),
                     pv_src.driver.clone(),
                     pv_src.volume_handle.clone().unwrap_or_default(),
-                    // `Spec.ReadOnly` (`volume.NewSpecFromPersistentVolume(pv,
-                    // readOnly)`): the claim volume's readOnly flag.
-                    spec.volume
-                        .persistent_volume_claim
-                        .as_ref()
-                        .and_then(|c| c.read_only)
-                        .unwrap_or(false),
+                    // `getReadOnlyFromSpec` (`csi_plugin.go:499`): `spec.ReadOnly`.
+                    spec.read_only,
                     LifecycleMode::Persistent,
                 )
             } else {
@@ -918,6 +913,18 @@ impl DeviceMounter for CsiAttacher {
 impl Mounter for CsiMounter {
     fn get_path(&self) -> String {
         self.path.clone()
+    }
+
+    /// `csiMountMgr.GetAttributes` (`csi_mounter.go:418-424`):
+    /// `{ReadOnly: c.readOnly, Managed: !c.readOnly, SELinuxRelabel:
+    /// c.needSELinuxRelabel}`. `needSELinuxRelabel` is the SELinux mount
+    /// context negotiation, which is not ported (#2312), so it is false.
+    fn get_attributes(&self) -> Attributes {
+        Attributes {
+            read_only: self.read_only,
+            managed: !self.read_only,
+            selinux_relabel: false,
+        }
     }
 
     /// Port of `csiMountMgr.SetUpAt` (`csi_mounter.go:102-356`).

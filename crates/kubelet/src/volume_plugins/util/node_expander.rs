@@ -587,6 +587,7 @@ pub(crate) mod tests {
             volume_spec: Arc::new(OwnedSpec {
                 volume,
                 persistent_volume: Some(pv.clone()),
+                read_only: false,
             }),
             outer_volume_spec_names: vec![],
             pod: Arc::new(pod),

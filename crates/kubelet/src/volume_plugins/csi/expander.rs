@@ -269,6 +269,7 @@ mod tests {
         let spec = Spec {
             volume: &vol,
             persistent_volume: Some(pv),
+            read_only: false,
         };
         f.plugin
             .node_expand_with_client(
@@ -416,6 +417,7 @@ mod tests {
         let spec = Spec {
             volume: &vol,
             persistent_volume: Some(&pv),
+            read_only: false,
         };
         let err = f
             .plugin

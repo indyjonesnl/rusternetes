@@ -1,5 +1,5 @@
 use crate::runtime::check_host_path_type_msg;
-use crate::volume_plugins::{Mounter, Spec, VolumeHost, VolumePlugin};
+use crate::volume_plugins::{Attributes, Mounter, Spec, VolumeHost, VolumePlugin};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use rusternetes_common::resources::volume::HostPathType;
@@ -123,6 +123,9 @@ impl VolumePlugin for HostPathPlugin {
             path,
             path_type,
             volume_name: spec.volume.name.clone(),
+            // `getVolumeSource` returns `spec.ReadOnly` for both arms
+            // (`host_path.go:364`, `:367`).
+            read_only: spec.read_only,
         }))
     }
 
@@ -163,12 +166,23 @@ struct HostPathMounter {
     path: String,
     path_type: Option<String>,
     volume_name: String,
+    read_only: bool,
 }
 
 #[async_trait]
 impl Mounter for HostPathMounter {
     fn get_path(&self) -> String {
         self.path.clone()
+    }
+
+    /// `hostPathMounter.GetAttributes` (`host_path.go:232-238`):
+    /// `{ReadOnly: b.readOnly, Managed: false, SELinuxRelabel: false}`.
+    fn get_attributes(&self) -> Attributes {
+        Attributes {
+            read_only: self.read_only,
+            managed: false,
+            selinux_relabel: false,
+        }
     }
 
     /// `hostPathMounter.SetUp` (`host_path.go:241-255`) — the type check runs
@@ -221,7 +235,6 @@ impl crate::volume_plugins::Unmounter for HostPathUnmounter {
 mod tests {
     use super::*;
     use crate::runtime::{check_host_path_type, HostPathCheck};
-    use crate::volume_plugins::plugin::Attributes;
     use rusternetes_common::resources::{PersistentVolume, Volume};
     use serde_json::json;
 
@@ -272,6 +285,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
+            read_only: false,
         };
         assert!(plugin().can_support(&spec));
     }
@@ -283,6 +297,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: Some(&pv),
+            read_only: false,
         };
         assert!(plugin().can_support(&spec));
     }
@@ -293,6 +308,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
+            read_only: false,
         };
         assert!(!plugin().can_support(&spec));
     }
@@ -305,6 +321,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: Some(&pv),
+            read_only: false,
         };
         let pod = test_pod();
         let m = plugin().new_mounter(&spec, &pod).await.unwrap();
@@ -322,6 +339,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
+            read_only: false,
         };
         let pod = test_pod();
         let m = plugin().new_mounter(&spec, &pod).await.unwrap();
@@ -339,6 +357,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
+            read_only: false,
         };
         let m = plugin().new_mounter(&spec, &test_pod()).await.unwrap();
         let err = m.set_up().await.unwrap_err().to_string();
@@ -362,6 +381,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: Some(&pv),
+            read_only: false,
         };
         let pod = test_pod();
         let m = plugin().new_mounter(&spec, &pod).await.unwrap();
@@ -375,6 +395,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
+            read_only: false,
         };
         let m = plugin().new_mounter(&spec, &test_pod()).await.unwrap();
         m.set_up().await.unwrap_err().to_string()

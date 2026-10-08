@@ -225,6 +225,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
+            read_only: false,
         };
         assert_eq!(
             mgr().find_plugin_by_spec(&spec).unwrap().name(),
@@ -238,6 +239,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
+            read_only: false,
         };
         assert!(matches!(
             mgr().find_plugin_by_spec(&spec),
@@ -254,6 +256,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
+            read_only: false,
         };
         let err = mgr().find_plugin_by_spec(&spec).err().unwrap();
         let msg = err.to_string();
@@ -332,6 +335,7 @@ mod tests {
             Ok(OwnedSpec {
                 volume: volume(volume_name),
                 persistent_volume: None,
+                read_only: false,
             })
         }
     }
@@ -356,6 +360,7 @@ mod tests {
         let spec = Spec {
             volume: &blk,
             persistent_volume: None,
+            read_only: false,
         };
         let found = m.find_mapper_plugin_by_spec(&spec).unwrap().unwrap();
         assert_eq!(found.name(), "kubernetes.io/block");
@@ -364,6 +369,7 @@ mod tests {
         let spec = Spec {
             volume: &a,
             persistent_volume: None,
+            read_only: false,
         };
         assert!(m.find_mapper_plugin_by_spec(&spec).unwrap().is_none());
 
@@ -371,6 +377,7 @@ mod tests {
         let spec = Spec {
             volume: &z,
             persistent_volume: None,
+            read_only: false,
         };
         assert!(matches!(
             m.find_mapper_plugin_by_spec(&spec),
@@ -474,6 +481,7 @@ mod tests {
         let spec = Spec {
             volume: &e,
             persistent_volume: None,
+            read_only: false,
         };
         let found = m
             .find_node_expandable_plugin_by_spec(&spec)
@@ -486,6 +494,7 @@ mod tests {
         let spec = Spec {
             volume: &a,
             persistent_volume: None,
+            read_only: false,
         };
         assert!(m
             .find_node_expandable_plugin_by_spec(&spec)
@@ -496,6 +505,7 @@ mod tests {
         let spec = Spec {
             volume: &z,
             persistent_volume: None,
+            read_only: false,
         };
         assert!(matches!(
             m.find_node_expandable_plugin_by_spec(&spec),

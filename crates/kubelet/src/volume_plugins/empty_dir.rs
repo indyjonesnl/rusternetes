@@ -1,5 +1,5 @@
 use crate::volume_plugins::{
-    Mounter, ReconstructedVolume, Spec, Unmounter, VolumeHost, VolumePlugin,
+    Attributes, Mounter, ReconstructedVolume, Spec, Unmounter, VolumeHost, VolumePlugin,
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -291,6 +291,15 @@ impl Mounter for EmptyDirMounter {
         self.path.clone()
     }
 
+    /// `emptyDir.GetAttributes` (`pkg/volume/emptydir/empty_dir.go:220-226`).
+    fn get_attributes(&self) -> Attributes {
+        Attributes {
+            read_only: false,
+            managed: true,
+            selinux_relabel: true,
+        }
+    }
+
     async fn set_up(&self) -> Result<()> {
         let volume_dir = &self.path;
         let empty_dir = &self.empty_dir;
@@ -382,6 +391,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
+            read_only: false,
         };
         assert!(plugin().can_support(&spec));
     }
@@ -393,6 +403,7 @@ mod tests {
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
+            read_only: false,
         };
         assert!(!plugin().can_support(&spec));
     }

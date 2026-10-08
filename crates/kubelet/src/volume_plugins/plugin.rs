@@ -13,6 +13,12 @@ use rusternetes_common::resources::{PersistentVolume, Pod, Volume};
 pub struct Spec<'a> {
     pub volume: &'a Volume,
     pub persistent_volume: Option<&'a PersistentVolume>,
+    /// `Spec.ReadOnly` (`pkg/volume/plugins.go:437`): set by
+    /// `NewSpecFromPersistentVolume(pv, readOnly)` (`plugins.go:556-561`) from
+    /// the pod's `persistentVolumeClaim.readOnly`
+    /// (`desired_state_of_world_populator.go:461`, `:588`); false for
+    /// `NewSpecFromVolume` (`plugins.go:549-553`).
+    pub read_only: bool,
 }
 
 impl Spec<'_> {
@@ -42,6 +48,7 @@ impl Spec<'_> {
         OwnedSpec {
             volume: self.volume.clone(),
             persistent_volume: self.persistent_volume.cloned(),
+            read_only: self.read_only,
         }
     }
 }
@@ -60,6 +67,8 @@ impl Spec<'_> {
 pub struct OwnedSpec {
     pub volume: Volume,
     pub persistent_volume: Option<PersistentVolume>,
+    /// See [`Spec::read_only`].
+    pub read_only: bool,
 }
 
 impl OwnedSpec {
@@ -68,6 +77,7 @@ impl OwnedSpec {
         Spec {
             volume: &self.volume,
             persistent_volume: self.persistent_volume.as_ref(),
+            read_only: self.read_only,
         }
     }
 
@@ -265,6 +275,15 @@ pub trait Unmounter: Send + Sync {
     async fn tear_down_at(&self, dir: &str) -> Result<()>;
 }
 
+/// Port of `volume.Attributes` (`pkg/volume/volume.go:119-124`): the
+/// attributes of a [`Mounter`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Attributes {
+    pub read_only: bool,
+    pub managed: bool,
+    pub selinux_relabel: bool,
+}
+
 /// Port of `volume.Mounter` (`pkg/volume/volume.go:162`).
 ///
 /// `set_up` is async where upstream's `SetUp` is synchronous: our bodies await
@@ -290,6 +309,13 @@ pub trait Mounter: Send + Sync {
     /// (fsGroup, SELinux label); no moved body reads any of it, so the
     /// argument is not ported until a consumer needs it.
     async fn set_up(&self) -> Result<()>;
+
+    /// `Mounter::GetAttributes` (`volume.go:187`): the attributes of the
+    /// mounter, called after `SetUp`. The kubelet's `makeMounts` reads
+    /// `Managed && SELinuxRelabel` to decide the CRI mount's `selinux_relabel`
+    /// and `ReadOnly` to force a read-only mount
+    /// (`pkg/kubelet/kubelet_pods.go:296`, `:392`).
+    fn get_attributes(&self) -> Attributes;
 }
 
 /// Port of `volume.BlockVolumeMapper` (`pkg/volume/volume.go:200-203`), which
