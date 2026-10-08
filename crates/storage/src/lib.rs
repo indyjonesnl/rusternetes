@@ -278,6 +278,16 @@ pub trait Storage: Send + Sync {
             // No ObjectMeta to stamp — nothing graceful to emulate.
             return self.delete(key).await;
         };
+        // Only pods have a graceful-delete strategy upstream
+        // (`podStrategy.CheckGracefulDelete`, pkg/registry/core/pod/strategy.go);
+        // every other kind is removed at once unless a finalizer holds it.
+        let has_finalizers = metadata
+            .get("finalizers")
+            .and_then(|f| f.as_array())
+            .is_some_and(|f| !f.is_empty());
+        if !has_finalizers && !key.starts_with("/registry/pods/") {
+            return self.delete(key).await;
+        }
         if metadata.contains_key("deletionTimestamp") {
             return Ok(()); // deletion already in progress
         }

@@ -1113,8 +1113,12 @@ impl<S: Storage + 'static> NamespaceController<S> {
                     }
                 }
             } else {
-                // No finalizers — hard delete from storage.
-                if let Err(e) = self.storage.delete(&key).await {
+                // No finalizers. Upstream `deleteEachItem`
+                // (namespaced_resources_deleter.go:393-415) sends
+                // `DeleteOptions{PropagationPolicy: Background}` with no grace
+                // override, so the server picks the default (graceful) period;
+                // a grace-0 hard delete here diverged (#2729).
+                if let Err(e) = self.storage.delete_gracefully(&key).await {
                     if !matches!(e, rusternetes_common::Error::NotFound(_)) {
                         warn!(
                             "Failed to delete {}/{}/{}: {}",
