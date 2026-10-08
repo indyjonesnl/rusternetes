@@ -865,11 +865,14 @@ fn mounts_with(
     attrs: &HashMap<String, MountAttrs>,
     selinux_enabled: bool,
 ) -> Result<Vec<v1::Mount>, String> {
-    let _ = (attrs, selinux_enabled);
     let Some(vms) = container.volume_mounts.as_ref() else {
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
+    // Volumes already relabelled by an earlier mount in this container:
+    // upstream sets `vol.SELinuxLabeled = true` on the first use so only that
+    // mount carries `SELinuxRelabel` (`kubelet_pods.go:296-300`).
+    let mut relabelled: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for vm in vms.iter() {
         // A mount whose volume did not resolve to a host path is skipped, as
         // before — the volume manager reports that separately.
@@ -877,6 +880,8 @@ fn mounts_with(
             continue;
         };
         let sub_path = resolve_sub_path(vm, env)?;
+        let a = attrs.get(&vm.name).copied().unwrap_or_default();
+        let relabel_volume = a.selinux_relabel && relabelled.insert(vm.name.as_str());
         out.push(v1::Mount {
             container_path: vm.mount_path.clone(),
             host_path: match sub_path.as_deref() {
@@ -886,7 +891,11 @@ fn mounts_with(
                     .into_owned(),
                 None => host.clone(),
             },
-            readonly: vm.read_only.unwrap_or(false),
+            // `ReadOnly: mount.ReadOnly || mustMountRO` (`kubelet_pods.go:417`).
+            readonly: vm.read_only.unwrap_or(false) || a.read_only,
+            // `v.SELinuxRelabel && selinux.GetEnabled()`
+            // (`kuberuntime_container.go:484`).
+            selinux_relabel: crate::go_selinux::relabel_if_enabled(relabel_volume, selinux_enabled),
             propagation: translate_mount_propagation(vm.mount_propagation.as_deref()),
             ..Default::default()
         });
