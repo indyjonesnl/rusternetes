@@ -1841,16 +1841,8 @@ fn typed_event_json<T: Serialize>(
     api_version: &str,
 ) -> serde_json::Result<String> {
     let mut value = serde_json::to_value(event)?;
-    if let Some(object) = value.get_mut("object").and_then(|o| o.as_object_mut()) {
-        for (key, want) in [("apiVersion", api_version), ("kind", kind)] {
-            let missing = object
-                .get(key)
-                .and_then(|v| v.as_str())
-                .is_none_or(str::is_empty);
-            if missing {
-                object.insert(key.to_string(), serde_json::Value::String(want.into()));
-            }
-        }
+    if let Some(object) = value.get_mut("object") {
+        stamp_gvk(object, kind, api_version);
     }
     serde_json::to_string(&value)
 }
