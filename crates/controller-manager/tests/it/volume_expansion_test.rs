@@ -194,39 +194,26 @@ async fn test_volume_expansion_allowed() {
     let controller = VolumeExpansionController::new(storage.clone());
     controller.reconcile_all().await.unwrap();
 
-    // Verify PVC was expanded
+    // A hostPath PV has no expandable in-tree plugin: upstream emits
+    // ExternalExpanding and never resizes in the controller
+    // (expand_controller.go:271-283). PVC status and PV capacity are untouched.
     let updated_pvc: PersistentVolumeClaim = storage.get(&pvc_key).await.unwrap();
+    let status = updated_pvc.status.as_ref().unwrap();
     assert_eq!(
-        updated_pvc
-            .status
-            .as_ref()
-            .unwrap()
-            .capacity
-            .as_ref()
-            .unwrap()
-            .get("storage"),
-        Some(&"10Gi".to_string())
+        status.capacity.as_ref().unwrap().get("storage").unwrap(),
+        "5Gi"
     );
-    assert_eq!(
-        updated_pvc
-            .status
-            .as_ref()
-            .unwrap()
-            .allocated_resources
-            .as_ref()
-            .unwrap()
-            .get("storage"),
-        Some(&"10Gi".to_string())
-    );
-    assert_eq!(updated_pvc.status.as_ref().unwrap().resize_status, None); // Completed
+    assert!(status.allocated_resources.is_none());
+    assert_eq!(status.resize_status, None);
 
-    // Verify PV was expanded
     let pv_key = build_key("persistentvolumes", None, "test-pv");
     let updated_pv: PersistentVolume = storage.get(&pv_key).await.unwrap();
-    assert_eq!(
-        updated_pv.spec.capacity.get("storage"),
-        Some(&"10Gi".to_string())
-    );
+    assert_eq!(updated_pv.spec.capacity.get("storage").unwrap(), "5Gi");
+
+    let events: Vec<rusternetes_common::resources::Event> =
+        storage.list("/registry/events/default/").await.unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].reason, "ExternalExpanding");
 }
 
 #[tokio::test]
