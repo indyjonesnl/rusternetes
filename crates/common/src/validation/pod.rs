@@ -3074,9 +3074,11 @@ fn validate_ephemeral_volume_source(
 ) -> ErrorList {
     match ephemeral.volume_claim_template.as_ref() {
         None => vec![Error::required(&fld_path.child("volumeClaimTemplate"), "")],
-        Some(template) => crate::validation::pvc::validate_persistent_volume_claim_spec(
+        Some(template) => crate::validation::pvc::validate_persistent_volume_claim_spec_with_opts(
             &template.spec,
             &fld_path.child("volumeClaimTemplate").child("spec"),
+            // validation.go:1893: `ValidationOptionsForPersistentVolumeClaimTemplate(tmpl, nil)`.
+            &crate::validation::pvc::validation_options_for_persistent_volume_claim_template(None),
         ),
     }
 }

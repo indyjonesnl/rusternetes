@@ -70,6 +70,7 @@ mod validation_podtemplate;
 mod validation_priorityclass;
 mod validation_prioritylevelconfiguration;
 mod validation_pvc;
+mod validation_pvc_template_opts;
 mod validation_pvc_update;
 mod validation_rbac;
 mod validation_replicaset;
