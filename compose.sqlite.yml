@@ -259,7 +259,10 @@ services:
       - RUST_LOG=info
       - RUST_MIN_STACK=8388608
       - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
-      - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
+      # Per-node root: upstream's kubelet owns its root dir exclusively and its
+      # cleanupOrphanedPodDirs sweep removes every pod dir it does not know (#2771).
+      # The parent is still mounted everywhere, so log/hostPath paths resolve.
+      - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}/node-1
       # The runtime's CRI streaming server (exec/attach) is reachable on
       # loopback now that the kubelet shares its netns. The default DNS name
       # `containerd` would send node-2's exec tokens to node-1's runtime, which
@@ -298,7 +301,7 @@ services:
       - RUST_LOG=info
       - RUST_MIN_STACK=8388608
       - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
-      - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
+      - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}/node-2
       # Loopback — see the note on node-1's kubelet.
       - CONTAINERD_STREAM_HOST=localhost
     command: ["--node-name", "node-2", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.rusternetes/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3"]
