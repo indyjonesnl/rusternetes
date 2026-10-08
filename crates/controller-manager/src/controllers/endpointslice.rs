@@ -1,3 +1,4 @@
+use super::endpointslice_tracker::EndpointSliceTracker;
 use anyhow::Result;
 use futures::StreamExt;
 use rusternetes_common::resources::endpointslice::{
@@ -42,31 +43,125 @@ const CONTROLLER_NAME: &str = "endpointslice-controller.k8s.io";
 /// (pkg/controller/endpointslice/endpointslice_controller.go:69).
 const ENDPOINT_SLICE_CHANGE_MIN_SYNC_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Port of `onEndpointSliceDelete` + `queueServiceForEndpointSlice`
-/// (endpointslice_controller.go:583-610): a deleted slice this controller
-/// manages (`ManagedByController`, staging/src/k8s.io/endpointslice/
-/// reconciler.go:666-669) queues its Service, keyed by `ServiceControllerKey`
-/// (staging/src/k8s.io/endpointslice/utils.go:201-210, `ns/<service-name
-/// label>`; no label -> error -> no queueing).
-///
-/// Deviation: upstream queues only when `endpointSliceTracker.HandleDeletion`
-/// says the delete was unexpected; we have no tracker, so a delete we issued
-/// ourselves also queues one (idempotent) extra sync.
-fn service_key_for_deleted_slice(event: &WatchEvent) -> Option<String> {
-    let WatchEvent::Deleted(_, prev) = event else {
-        return None;
-    };
-    let slice: EndpointSlice = serde_json::from_str(prev).ok()?;
-    let labels = slice.metadata.labels.as_ref()?;
-    if labels.get(MANAGED_BY_LABEL).map(String::as_str) != Some(CONTROLLER_NAME) {
-        return None;
-    }
-    let svc = labels.get(SERVICE_NAME_LABEL).filter(|s| !s.is_empty())?;
+/// `ManagedByController` (staging/src/k8s.io/endpointslice/reconciler.go:666-669).
+fn managed_by_controller(slice: &EndpointSlice) -> bool {
+    slice
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|l| l.get(MANAGED_BY_LABEL))
+        .map(String::as_str)
+        == Some(CONTROLLER_NAME)
+}
+
+/// `ServiceControllerKey` (staging/src/k8s.io/endpointslice/utils.go:201-210,
+/// `ns/<service-name label>`; no label -> error -> nothing queued), in the
+/// `services/ns/name` form this controller's queue uses.
+fn service_controller_key(slice: &EndpointSlice) -> Option<String> {
+    let svc = slice
+        .metadata
+        .labels
+        .as_ref()?
+        .get(SERVICE_NAME_LABEL)
+        .filter(|s| !s.is_empty())?;
     Some(format!(
         "services/{}/{}",
         slice.metadata.namespace.as_deref().unwrap_or(""),
         svc
     ))
+}
+
+/// What the informer's indexer remembers of a slice, for
+/// `onEndpointSliceUpdate`'s `prevObj`: only the labels the handler compares.
+#[derive(Clone, Debug, PartialEq)]
+struct SliceLabels {
+    service_name: Option<String>,
+    managed_by_controller: bool,
+}
+
+impl SliceLabels {
+    fn of(slice: &EndpointSlice) -> Self {
+        Self {
+            service_name: slice
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(SERVICE_NAME_LABEL))
+                .cloned(),
+            managed_by_controller: managed_by_controller(slice),
+        }
+    }
+}
+
+/// Port of `onEndpointSliceAdd` / `onEndpointSliceUpdate` /
+/// `onEndpointSliceDelete` (endpointslice_controller.go:542-592): the
+/// Services to queue (`queueServiceForEndpointSlice`, :596-610) for one slice
+/// watch event. `known` is the informer cache of previous label state, updated
+/// here as the indexer is before handlers fire.
+fn services_to_queue_for_slice_event(
+    tracker: &EndpointSliceTracker,
+    known: &mut HashMap<String, SliceLabels>,
+    event: &WatchEvent,
+) -> Vec<String> {
+    let (key, value) = match event {
+        WatchEvent::Added(k, v) | WatchEvent::Modified(k, v) | WatchEvent::Deleted(k, v) => (k, v),
+    };
+    let Ok(slice) = serde_json::from_str::<EndpointSlice>(value) else {
+        return vec![];
+    };
+    let current = SliceLabels::of(&slice);
+    let add_path = |slice: &EndpointSlice| -> Vec<String> {
+        if managed_by_controller(slice) && tracker.should_sync(slice) {
+            service_controller_key(slice).into_iter().collect()
+        } else {
+            vec![]
+        }
+    };
+    match event {
+        WatchEvent::Added(..) => {
+            known.insert(key.clone(), current);
+            add_path(&slice)
+        }
+        WatchEvent::Modified(..) => {
+            let Some(prev) = known.insert(key.clone(), current.clone()) else {
+                // Never seen (cannot happen after the initial LIST): an add.
+                return add_path(&slice);
+            };
+            // Slice generation does not change when labels change. Although
+            // the controller will never change LabelServiceName, users might
+            // (:564-574): queue both the new and the previous Service.
+            if current.service_name != prev.service_name {
+                let mut keys: Vec<String> = service_controller_key(&slice).into_iter().collect();
+                let mut prev_slice = slice.clone();
+                prev_slice.metadata.labels = Some(
+                    prev.service_name
+                        .iter()
+                        .map(|n| (SERVICE_NAME_LABEL.to_string(), n.clone()))
+                        .collect(),
+                );
+                keys.extend(service_controller_key(&prev_slice));
+                return keys;
+            }
+            if current.managed_by_controller != prev.managed_by_controller
+                || (current.managed_by_controller && tracker.should_sync(&slice))
+            {
+                return service_controller_key(&slice).into_iter().collect();
+            }
+            vec![]
+        }
+        WatchEvent::Deleted(..) => {
+            known.remove(key);
+            // `HandleDeletion` returns false if we did not expect the slice
+            // to be deleted; then the Service needs another sync (:585-591).
+            if managed_by_controller(&slice)
+                && tracker.has(&slice)
+                && !tracker.handle_deletion(&slice)
+            {
+                return service_controller_key(&slice).into_iter().collect();
+            }
+            vec![]
+        }
+    }
 }
 
 const INFORMER_RESYNC_PERIOD: std::time::Duration = std::time::Duration::from_secs(12 * 3600);
@@ -257,6 +352,8 @@ pub struct EndpointSliceController<S: Storage> {
     /// an unbounded channel has the same semantics.
     pod_queue_tx: tokio::sync::mpsc::UnboundedSender<PodQueueItem>,
     pod_queue_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<PodQueueItem>>>,
+    /// `c.endpointSliceTracker` (`endpointslice_controller.go:154,224`).
+    slice_tracker: EndpointSliceTracker,
 }
 
 /// A `podQueue` entry plus its `NumRequeues` count (`handlePodErr`).
@@ -278,6 +375,7 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
             pods_synced: tokio::sync::watch::channel(false).0,
             pod_queue_tx,
             pod_queue_rx: Arc::new(tokio::sync::Mutex::new(pod_queue_rx)),
+            slice_tracker: EndpointSliceTracker::new(),
         }
     }
 
@@ -467,6 +565,22 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
             let mut pod_watch = pod_watch;
             let mut ep_watch = ep_watch;
             let mut slice_watch = slice_watch;
+            // The slice informer's indexer: previous labels for update events.
+            let mut known_slices: HashMap<String, SliceLabels> = self
+                .storage
+                .list::<EndpointSlice>(&build_prefix("endpointslices", None))
+                .await
+                .unwrap_or_default()
+                .iter()
+                .map(|s| {
+                    let key = build_key(
+                        "endpointslices",
+                        s.metadata.namespace.as_deref(),
+                        &s.metadata.name,
+                    );
+                    (key, SliceLabels::of(s))
+                })
+                .collect();
             let mut resync = tokio::time::interval(resync_period());
             resync.tick().await;
 
@@ -508,7 +622,11 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                     event = slice_watch.next() => {
                         match event {
                             Some(Ok(ev)) => {
-                                if let Some(key) = service_key_for_deleted_slice(&ev){
+                                for key in services_to_queue_for_slice_event(
+                                    &self.slice_tracker,
+                                    &mut known_slices,
+                                    &ev,
+                                ) {
                                     queue
                                         .add_after(key, ENDPOINT_SLICE_CHANGE_MIN_SYNC_DELAY)
                                         .await;
@@ -630,6 +748,9 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                     }
                 },
                 Err(_) => {
+                    // `c.endpointSliceTracker.DeleteService`
+                    // (endpointslice_controller.go:390).
+                    self.slice_tracker.delete_service(ns, name);
                     queue.forget(&key).await;
                 }
             }
@@ -1322,7 +1443,9 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                     }
                     adopt_existing_identity(&mut slice, &existing);
                     match self.storage.update(&slice_key, &slice).await {
-                        Ok(_) => {
+                        Ok(updated) => {
+                            // reconciler.go:464.
+                            self.slice_tracker.update(&updated);
                             info!(
                                 "Updated endpointslice {}/{} for service ({} endpoints)",
                                 namespace,
@@ -1340,7 +1463,9 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                 // lasted.
                 Err(rusternetes_common::Error::NotFound(_)) => {
                     slice.metadata.resource_version = None;
-                    self.storage.create(&slice_key, &slice).await?;
+                    let created = self.storage.create(&slice_key, &slice).await?;
+                    // reconciler.go:453.
+                    self.slice_tracker.update(&created);
                     info!(
                         "Created endpointslice {}/{} for service",
                         namespace, slice_name
@@ -1400,6 +1525,8 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                         namespace, slice_name, e
                     );
                 } else {
+                    // reconciler.go:473.
+                    self.slice_tracker.expect_deletion(existing);
                     info!(
                         "Deleted stale endpointslice {}/{} (no longer needed for service {})",
                         namespace, slice_name, service_name
@@ -2567,36 +2694,150 @@ mod tests {
         assert!(back, "deleted slice was not recreated");
     }
 
+    fn ev_slice(svc: Option<&str>, managed: &str, uid: &str, generation: i64) -> EndpointSlice {
+        let mut l = HashMap::from([(MANAGED_BY_LABEL.to_string(), managed.to_string())]);
+        if let Some(s) = svc {
+            l.insert(SERVICE_NAME_LABEL.to_string(), s.to_string());
+        }
+        let mut es = EndpointSlice::new("x-abc", "IPv4");
+        es.metadata.namespace = Some("ns".to_string());
+        es.metadata.uid = uid.to_string();
+        es.metadata.generation = Some(generation);
+        es.metadata.labels = Some(l);
+        es
+    }
+
+    const EV_KEY: &str = "/registry/endpointslices/ns/x-abc";
+
+    fn added(es: &EndpointSlice) -> WatchEvent {
+        WatchEvent::Added(EV_KEY.to_string(), serde_json::to_string(es).unwrap())
+    }
+    fn modified(es: &EndpointSlice) -> WatchEvent {
+        WatchEvent::Modified(EV_KEY.to_string(), serde_json::to_string(es).unwrap())
+    }
+    fn deleted(es: &EndpointSlice) -> WatchEvent {
+        WatchEvent::Deleted(EV_KEY.to_string(), serde_json::to_string(es).unwrap())
+    }
+
+    /// `onEndpointSliceDelete` (endpointslice_controller.go:583-592): only a
+    /// delete the tracker did not expect queues the Service; keyed by
+    /// `ServiceControllerKey` (utils.go:201-210).
     #[test]
-    fn service_key_for_deleted_slice_uses_service_name_label() {
-        let slice = |managed: &str, svc: Option<&str>| {
-            let mut l = HashMap::from([(MANAGED_BY_LABEL.to_string(), managed.to_string())]);
-            if let Some(s) = svc {
-                l.insert("kubernetes.io/service-name".to_string(), s.to_string());
-            }
-            let mut es = EndpointSlice::new("x-abc", "IPv4");
-            es.metadata.name = "x-abc".to_string();
-            es.metadata.namespace = Some("ns".to_string());
-            es.metadata.labels = Some(l);
-            WatchEvent::Deleted(
-                "/registry/endpointslices/ns/x-abc".to_string(),
-                serde_json::to_string(&es).unwrap(),
-            )
-        };
+    fn slice_delete_queues_service_only_when_unexpected() {
+        let me = CONTROLLER_NAME;
+        let t = EndpointSliceTracker::new();
+        let mut known = HashMap::new();
+        let s = ev_slice(Some("svc"), me, "u1", 1);
+        // Untracked slice (`Has` false): nothing to repair.
+        assert!(services_to_queue_for_slice_event(&t, &mut known, &deleted(&s)).is_empty());
+        // Tracked, deleted by someone else: queue.
+        t.update(&s);
         assert_eq!(
-            service_key_for_deleted_slice(&slice("endpointslice-controller.k8s.io", Some("svc"))),
-            Some("services/ns/svc".to_string())
+            services_to_queue_for_slice_event(&t, &mut known, &deleted(&s)),
+            vec!["services/ns/svc".to_string()]
         );
+        // Our own delete (ExpectDeletion): no extra sync.
+        t.update(&s);
+        t.expect_deletion(&s);
+        assert!(services_to_queue_for_slice_event(&t, &mut known, &deleted(&s)).is_empty());
         // ManagedByController false (reconciler.go:666-669).
+        let other = ev_slice(Some("svc"), "someone-else", "u2", 1);
+        t.update(&other);
+        assert!(services_to_queue_for_slice_event(&t, &mut known, &deleted(&other)).is_empty());
+        // No service-name label: ServiceControllerKey errors.
+        let nolabel = ev_slice(None, me, "u3", 1);
+        t.update(&nolabel);
+        assert!(services_to_queue_for_slice_event(&t, &mut known, &deleted(&nolabel)).is_empty());
+    }
+
+    /// `onEndpointSliceAdd`/`Update` (:542-578): our own write (generation
+    /// == tracked) does not queue; an external edit (newer generation) does.
+    #[test]
+    fn slice_update_queues_service_only_for_external_changes() {
+        let me = CONTROLLER_NAME;
+        let t = EndpointSliceTracker::new();
+        let mut known = HashMap::new();
+        let own = ev_slice(Some("svc"), me, "u1", 1);
+        t.update(&own);
+        assert!(services_to_queue_for_slice_event(&t, &mut known, &added(&own)).is_empty());
+        assert!(services_to_queue_for_slice_event(&t, &mut known, &modified(&own)).is_empty());
+        let edited = ev_slice(Some("svc"), me, "u1", 2);
         assert_eq!(
-            service_key_for_deleted_slice(&slice("someone-else", Some("svc"))),
-            None
+            services_to_queue_for_slice_event(&t, &mut known, &modified(&edited)),
+            vec!["services/ns/svc".to_string()]
         );
-        // ServiceControllerKey errors without the label (utils.go:205-208).
+        // An add the tracker has never seen (e.g. after a restart) syncs.
+        let fresh = ev_slice(Some("svc"), me, "u9", 1);
         assert_eq!(
-            service_key_for_deleted_slice(&slice("endpointslice-controller.k8s.io", None)),
-            None
+            services_to_queue_for_slice_event(&t, &mut known, &added(&fresh)),
+            vec!["services/ns/svc".to_string()]
         );
+    }
+
+    /// Label edits do not bump the generation, so `onEndpointSliceUpdate`
+    /// handles them explicitly (:564-577).
+    #[test]
+    fn slice_label_changes_queue_old_and_new_service() {
+        let me = CONTROLLER_NAME;
+        let t = EndpointSliceTracker::new();
+        let mut known = HashMap::new();
+        let a = ev_slice(Some("a"), me, "u1", 1);
+        t.update(&a);
+        services_to_queue_for_slice_event(&t, &mut known, &added(&a));
+        let b = ev_slice(Some("b"), me, "u1", 1);
+        assert_eq!(
+            services_to_queue_for_slice_event(&t, &mut known, &modified(&b)),
+            vec!["services/ns/b".to_string(), "services/ns/a".to_string()]
+        );
+        // managed-by flipped away from this controller: ManagedByChanged.
+        let t2 = EndpointSliceTracker::new();
+        let mut known2 = HashMap::new();
+        let m = ev_slice(Some("a"), me, "u1", 1);
+        t2.update(&m);
+        services_to_queue_for_slice_event(&t2, &mut known2, &added(&m));
+        let unmanaged = ev_slice(Some("a"), "someone-else", "u1", 1);
+        assert_eq!(
+            services_to_queue_for_slice_event(&t2, &mut known2, &modified(&unmanaged)),
+            vec!["services/ns/a".to_string()]
+        );
+    }
+
+    /// An external edit to a managed slice is repaired without waiting for
+    /// the resync (the add/update half of the tracker port).
+    #[tokio::test]
+    async fn externally_edited_slice_is_repaired_without_waiting_for_resync() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut svc = snapshot_service("svc");
+        svc.spec.selector = Some(HashMap::from([("app".to_string(), "x".to_string())]));
+        storage
+            .create(&build_key("services", Some("ns"), "svc"), &svc)
+            .await
+            .unwrap();
+        let controller = Arc::new(EndpointSliceController::new(Arc::clone(&storage)));
+        let handle = tokio::spawn(async move { controller.run().await });
+        let es_key = build_key("endpointslices", Some("ns"), "svc");
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if storage.get::<EndpointSlice>(&es_key).await.is_ok() {
+                break;
+            }
+        }
+        let mut es: EndpointSlice = storage.get(&es_key).await.unwrap();
+        let ports_before = es.ports.clone();
+        es.ports = vec![];
+        es.metadata.generation = Some(es.metadata.generation.unwrap_or(0) + 1);
+        storage.update(&es_key, &es).await.unwrap();
+        let mut repaired = false;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let now: EndpointSlice = storage.get(&es_key).await.unwrap();
+            if now.ports == ports_before {
+                repaired = true;
+                break;
+            }
+        }
+        handle.abort();
+        assert!(repaired, "external edit was not repaired");
     }
 
     /// Upstream has no periodic full resync of its own: only the informers
