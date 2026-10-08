@@ -202,7 +202,7 @@ services:
       - RUST_LOG=info
       - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
       - KUBERNETES_SERVICE_HOST_OVERRIDE=api-server
-      - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
+      - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}/node-1
     command: ["--node-name", "node-1", "--etcd-servers", "http://rhino:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--pod-manifest-path", "/etc/rusternetes/manifests"]
 
   # Kubelet 2 - second node agent for multi-node conformance tests
@@ -234,7 +234,7 @@ services:
       - RUST_LOG=info
       - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
       - KUBERNETES_SERVICE_HOST_OVERRIDE=api-server
-      - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
+      - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}/node-2
     command: ["--node-name", "node-2", "--etcd-servers", "http://rhino:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3"]
 
   # Kube-proxy runs INSIDE the containerd service's network namespace

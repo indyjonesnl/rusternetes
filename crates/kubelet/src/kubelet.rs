@@ -3592,14 +3592,10 @@ impl Kubelet {
                             }
 
                             // Get container statuses and pod IP
-                            let container_statuses =
-                                self.get_container_statuses(&fresh_pod).await.ok();
-                            // Wait briefly for CNI to publish the pod IP so the
-                            // first Running write carries it, instead of leaving
-                            // the pod Running-but-unroutable until the next 5s
-                            // sync tick. Bounded; falls back to None on timeout
-                            // (a later tick refreshes it, as before).
-                            let pod_ip = crate::poll::poll_until_some(
+                            // Statuses are read AFTER the bounded IP wait (#2771):
+                            // upstream generates the whole status at write time.
+                            let (container_statuses, pod_ip) = crate::poll::observe_running_status(
+                                || async { self.get_container_statuses(&fresh_pod).await.ok() },
                                 || async {
                                     self.runtime.get_pod_ip(&fresh_pod).await.ok().flatten()
                                 },
@@ -4101,15 +4097,9 @@ impl Kubelet {
                         return Ok(());
                     }
 
-                    // Get container statuses
-                    let container_statuses = self.get_container_statuses(&fresh_pod).await.ok();
-
-                    // Get pod IP
-                    // Wait briefly for CNI to publish the pod IP so this Running
-                    // write carries it, instead of leaving the pod
-                    // Running-but-unroutable until the next 5s sync tick. Bounded;
-                    // falls back to None on timeout (a later tick refreshes it).
-                    let pod_ip = crate::poll::poll_until_some(
+                    // Statuses are read AFTER the bounded IP wait (#2771).
+                    let (container_statuses, pod_ip) = crate::poll::observe_running_status(
+                        || async { self.get_container_statuses(&fresh_pod).await.ok() },
                         || async { self.runtime.get_pod_ip(&fresh_pod).await.ok().flatten() },
                         std::time::Duration::from_secs(10),
                         std::time::Duration::from_millis(150),

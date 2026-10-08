@@ -247,6 +247,37 @@ STUB
     esac
 }
 
+# Each kubelet must own its OWN root directory (#2771). Upstream's kubelet
+# assumes exclusive ownership of /var/lib/kubelet: HandlePodCleanups ->
+# cleanupOrphanedPodDirs (pkg/kubelet/kubelet_volumes.go:169) removes every pod
+# dir on disk whose UID is not in the pod set THIS kubelet knows. Two kubelets on
+# one KUBELET_VOLUMES_PATH therefore delete each other's pod volume dirs (a pod
+# recreated on node-1 mid-sweep lost its projected volume to node-2's sweep).
+test_each_kubelet_has_its_own_volumes_root() {
+    local v1 v2
+    v1="$(service_block kubelet | grep -o 'KUBELET_VOLUMES_PATH: .*' | awk '{print $2}')"
+    v2="$(service_block kubelet2 | grep -o 'KUBELET_VOLUMES_PATH: .*' | awk '{print $2}')"
+    if [ -z "$v1" ] || [ -z "$v2" ]; then
+        fail "both kubelets must set KUBELET_VOLUMES_PATH (got '$v1' / '$v2')"
+        return
+    fi
+    if [ "$v1" = "$v2" ]; then
+        fail "kubelet and kubelet2 share KUBELET_VOLUMES_PATH '$v1'"
+    else
+        PASS_COUNT=$((PASS_COUNT + 1))
+    fi
+    # Neither root may be a prefix of the other, or one sweep still sees the
+    # other's directories.
+    case "$v2/" in
+        "$v1/"*) fail "node-2's volumes root '$v2' is inside node-1's '$v1'" ;;
+        *) PASS_COUNT=$((PASS_COUNT + 1)) ;;
+    esac
+    case "$v1/" in
+        "$v2/"*) fail "node-1's volumes root '$v1' is inside node-2's '$v2'" ;;
+        *) PASS_COUNT=$((PASS_COUNT + 1)) ;;
+    esac
+}
+
 # ----- Runner -----
 
 if ! command -v docker >/dev/null 2>&1; then

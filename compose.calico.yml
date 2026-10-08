@@ -114,7 +114,7 @@ services:
       - RUST_LOG=info
       - RUST_MIN_STACK=8388608
       - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
-      - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
+      - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}/node-1
     # --eviction-hard="" disables the eviction manager: this box shares one
     # ~99%-full host disk across every node container, so the default
     # imagefs.available<15% hard threshold would (correctly, by its own logic)
@@ -144,7 +144,7 @@ services:
       - RUST_LOG=info
       - RUST_MIN_STACK=8388608
       - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
-      - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
+      - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}/node-2
     # See node-1: eviction disabled because the shared host disk is ~99% full.
     command: ["--node-name", "node-2", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.rusternetes/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--eviction-hard", ""]
 
