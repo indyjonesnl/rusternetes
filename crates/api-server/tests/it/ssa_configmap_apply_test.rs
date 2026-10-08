@@ -278,7 +278,9 @@ async fn ssa_immutable_configmap_rejects_data_change() {
         "data": { "k1": "v2" },
         "immutable": true,
     });
-    let (status, _) = apply(&state, "default", "cm-immut", "kubectl", false, &desired).await;
+    // The create recorded its requester as owner of `data` (#2701), so the
+    // apply forces: the subject here is the immutability fence, not ownership.
+    let (status, _) = apply(&state, "default", "cm-immut", "kubectl", true, &desired).await;
     // Upstream returns 422 (Invalid) for immutability violations; our
     // legacy update handler returns the same. SSA must match.
     assert!(

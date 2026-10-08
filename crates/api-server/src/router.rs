@@ -2643,6 +2643,11 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             // WithAudit sits after authentication and before the handler's
             // authorization/admission (server/config.go DefaultBuildHandlerChain).
             .layer(axum_middleware::from_fn(crate::audit::audit_middleware))
+            // The field manager names an Update's manager after the user agent
+            // (handlers/create.go:259-282 `managerOrUserAgent`).
+            .layer(axum_middleware::from_fn(
+                crate::fieldmanager::user_agent_middleware,
+            ))
             .layer(axum_middleware::from_fn(
                 middleware::normalize_content_type_middleware,
             ))
@@ -2678,6 +2683,11 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             // WithAudit sits after authentication and before the handler's
             // authorization/admission (server/config.go DefaultBuildHandlerChain).
             .layer(axum_middleware::from_fn(crate::audit::audit_middleware))
+            // The field manager names an Update's manager after the user agent
+            // (handlers/create.go:259-282 `managerOrUserAgent`).
+            .layer(axum_middleware::from_fn(
+                crate::fieldmanager::user_agent_middleware,
+            ))
             .layer(axum_middleware::from_fn(
                 middleware::normalize_content_type_middleware,
             ))

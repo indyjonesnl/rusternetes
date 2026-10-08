@@ -22,12 +22,13 @@ pub mod prometheus_client;
 pub mod registry;
 pub use rusternetes_protobuf as protobuf;
 #[allow(dead_code)]
+pub mod fieldmanager;
+#[allow(dead_code)]
 pub mod response;
 pub mod router;
 #[allow(dead_code)]
 pub mod spdy;
 pub mod spdy3;
-#[allow(dead_code)]
 pub mod ssa;
 pub mod startup;
 pub mod state;

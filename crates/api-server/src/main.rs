@@ -38,8 +38,9 @@ mod spdy;
 // The bin only drives handle_spdy3_exec; the rest of the codec API is exercised
 // by the lib + tests, so allow dead_code in the binary build.
 #[allow(dead_code)]
-mod spdy3;
+mod fieldmanager;
 #[allow(dead_code)]
+mod spdy3;
 mod ssa;
 mod state;
 #[allow(dead_code)]
