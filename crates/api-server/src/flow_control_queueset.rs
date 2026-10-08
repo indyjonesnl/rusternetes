@@ -932,6 +932,13 @@ impl QueueSet {
         Ok(qs)
     }
 
+    /// The validation half of `BeginConstruction` / `BeginConfigChange`
+    /// (queueset.go:158-196, :197 `checkConfig`): lets a caller learn that a
+    /// config is broken before committing to it.
+    pub fn validate_config(qcfg: &QueuingConfig) -> Result<(), String> {
+        check_config(qcfg).map(|_| ())
+    }
+
     /// `BeginConfigChange` + `Complete` on an existing set.
     pub fn set_configuration(
         &self,

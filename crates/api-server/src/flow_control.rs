@@ -197,6 +197,8 @@ struct LevelState {
     /// `QueuingConfig.DesiredNumQueues` (startRequest reads `Queues` for it).
     num_queues: isize,
     queues: Arc<QueueSet>,
+    /// `priorityLevelState.quiescing` (apf_controller.go:215-217).
+    quiescing: bool,
 }
 
 struct Config {
@@ -316,6 +318,7 @@ fn digest(
                 nominal_cl: cl,
                 num_queues,
                 queues,
+                quiescing: false,
             },
         );
     }
@@ -433,6 +436,29 @@ impl<S: Storage> FlowControlEngine<S> {
             flow_distinguisher,
         }
     }
+
+    /// The queueset of a priority level (test and reaper support).
+    pub fn queueset_for(&self, priority_level: &str) -> Option<Arc<QueueSet>> {
+        self.config
+            .read()
+            .unwrap()
+            .levels
+            .get(priority_level)
+            .map(|l| l.queues.clone())
+    }
+
+    /// Whether a priority level is undesired but still draining.
+    pub fn is_quiescing(&self, priority_level: &str) -> bool {
+        self.config
+            .read()
+            .unwrap()
+            .levels
+            .get(priority_level)
+            .is_some_and(|l| l.quiescing)
+    }
+
+    /// `maybeReap` (apf_controller.go:1085-1100).
+    pub fn maybe_reap(&self, _priority_level: &str) {}
 
     /// Concurrency limit (seats) of a priority level, if known.
     pub fn concurrency_limit(&self, priority_level: &str) -> Option<usize> {
@@ -743,6 +769,203 @@ mod tests {
                     .await
                     .unwrap(),
             );
+        }
+    }
+
+    // ---- quiescing / reaping (#2769) ----
+    //
+    // Port of the invariant `TestConfigConsumer` checks after each digest
+    // (controller_test.go:253-285): a queueset exists for every desired level,
+    // every mandatory level, and every undesired level that is still busy; no
+    // other queueset is non-idle.
+
+    async fn put_pl(st: &Arc<MemoryStorage>, pl: &PriorityLevelConfiguration) {
+        let key = build_key("prioritylevelconfigurations", None, &pl.metadata.name);
+        if st.create(&key, pl).await.is_err() {
+            st.update(&key, pl).await.unwrap();
+        }
+    }
+
+    async fn del_pl(st: &Arc<MemoryStorage>, name: &str) {
+        let _ = st
+            .delete(&build_key("prioritylevelconfigurations", None, name))
+            .await;
+    }
+
+    fn named_pl(name: &str, queues: i32, hand: i32) -> PriorityLevelConfiguration {
+        let mut pl = queueing_pl(queues, hand, 10);
+        pl.metadata = ObjectMeta::new(name);
+        pl
+    }
+
+    async fn level_a_engine() -> (Arc<MemoryStorage>, FlowControlEngine<MemoryStorage>) {
+        let st = Arc::new(MemoryStorage::new());
+        put_pl(&st, &named_pl("a", 4, 2)).await;
+        let e = FlowControlEngine::with_limits(st.clone(), 100, 0);
+        e.initialize().await.unwrap();
+        (st, e)
+    }
+
+    async fn hold_seat(e: &FlowControlEngine<MemoryStorage>, pl: &str) -> FlowControlPermit {
+        e.execute(&cls("x", pl, "d"), 1, Duration::from_millis(50))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn removed_idle_level_is_dropped() {
+        let (st, e) = level_a_engine().await;
+        assert!(e.queueset_for("a").is_some());
+        del_pl(&st, "a").await;
+        e.initialize().await.unwrap();
+        assert!(e.queueset_for("a").is_none());
+    }
+
+    #[tokio::test]
+    async fn removed_busy_level_quiesces_then_is_reaped() {
+        // processOldPLsLocked (apf_controller.go:810-836) + maybeReap.
+        let (st, e) = level_a_engine().await;
+        let qs = e.queueset_for("a").unwrap();
+        let permit = hold_seat(&e, "a").await;
+        del_pl(&st, "a").await;
+        e.initialize().await.unwrap();
+        assert!(e.is_quiescing("a"));
+        assert!(Arc::ptr_eq(&qs, &e.queueset_for("a").unwrap()));
+        // Still busy: reaping does nothing.
+        e.maybe_reap("a");
+        assert!(e.queueset_for("a").is_some());
+        drop(permit);
+        e.maybe_reap("a");
+        assert!(e.queueset_for("a").is_none());
+    }
+
+    #[tokio::test]
+    async fn quiescing_level_that_becomes_desired_again_keeps_its_queueset() {
+        // digestNewPLsLocked (apf_controller.go:737-740).
+        let (st, e) = level_a_engine().await;
+        let qs = e.queueset_for("a").unwrap();
+        let permit = hold_seat(&e, "a").await;
+        let pl = named_pl("a", 4, 2);
+        del_pl(&st, "a").await;
+        e.initialize().await.unwrap();
+        assert!(e.is_quiescing("a"));
+        put_pl(&st, &pl).await;
+        e.initialize().await.unwrap();
+        assert!(!e.is_quiescing("a"));
+        assert!(Arc::ptr_eq(&qs, &e.queueset_for("a").unwrap()));
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn broken_update_to_busy_level_keeps_old_queueset_quiescing() {
+        // digestNewPLsLocked ignores a broken spec (:765-769); the old state
+        // is then processed as an undesired level (:810-836).
+        let (st, e) = level_a_engine().await;
+        let qs = e.queueset_for("a").unwrap();
+        let permit = hold_seat(&e, "a").await;
+        // hand size larger than the deck: invalid shuffle sharding.
+        put_pl(&st, &named_pl("a", 2, 5)).await;
+        e.initialize().await.unwrap();
+        let kept = e.queueset_for("a").expect("busy level must be retained");
+        assert!(Arc::ptr_eq(&qs, &kept));
+        assert!(e.is_quiescing("a"));
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn broken_update_to_idle_level_drops_it() {
+        let (st, e) = level_a_engine().await;
+        put_pl(&st, &named_pl("a", 2, 5)).await;
+        e.initialize().await.unwrap();
+        assert!(e.queueset_for("a").is_none());
+    }
+
+    #[tokio::test]
+    async fn broken_new_level_is_ignored() {
+        let (st, e) = level_a_engine().await;
+        put_pl(&st, &named_pl("b", 2, 5)).await;
+        e.initialize().await.unwrap();
+        assert!(e.queueset_for("b").is_none());
+        assert!(e.queueset_for("a").is_some());
+    }
+
+    #[tokio::test]
+    async fn mandatory_levels_are_never_dropped() {
+        let (_st, e) = level_a_engine().await;
+        for _ in 0..2 {
+            e.initialize().await.unwrap();
+            assert!(e.queueset_for("exempt").is_some());
+            assert!(e.queueset_for("catch-all").is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn quiescing_level_still_gets_a_share_while_draining() {
+        // processOldPLsLocked :852-857: lingering levels stay in shareSum.
+        let (st, e) = level_a_engine().await;
+        let before = e.concurrency_limit("a").unwrap();
+        let permit = hold_seat(&e, "a").await;
+        del_pl(&st, "a").await;
+        e.initialize().await.unwrap();
+        assert_eq!(e.concurrency_limit("a"), Some(before));
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn digest_invariant_over_a_sequence_of_configs() {
+        // Deterministic stand-in for TestConfigConsumer's random walk.
+        let st = Arc::new(MemoryStorage::new());
+        let e = FlowControlEngine::with_limits(st.clone(), 100, 0);
+        let names = ["p0", "p1", "p2", "p3"];
+        let mut held: Vec<(String, FlowControlPermit)> = vec![];
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut persisting: std::collections::HashSet<String> = Default::default();
+        for _step in 0..40 {
+            let mut desired = std::collections::HashSet::new();
+            for n in names {
+                match next() % 3 {
+                    0 => del_pl(&st, n).await,
+                    1 => {
+                        put_pl(&st, &named_pl(n, 4, 2)).await;
+                        desired.insert(n.to_string());
+                    }
+                    // broken: ignored, like an absent object
+                    _ => put_pl(&st, &named_pl(n, 2, 5)).await,
+                }
+            }
+            e.initialize().await.unwrap();
+            let mut next_persist = std::collections::HashSet::new();
+            for n in &persisting {
+                if held.iter().any(|(h, _)| h == n) {
+                    next_persist.insert(n.clone());
+                }
+            }
+            persisting = next_persist.union(&desired).cloned().collect();
+            for n in &persisting {
+                assert!(e.queueset_for(n).is_some(), "missing queueset {n}");
+            }
+            for n in names {
+                if !persisting.contains(n) {
+                    assert!(
+                        e.queueset_for(n).is_none_or(|q| q.is_idle()),
+                        "unexpected busy queueset {n}"
+                    );
+                }
+            }
+            for n in &desired {
+                if next() % 2 == 0 {
+                    held.push((n.clone(), hold_seat(&e, n).await));
+                }
+            }
+            if next() % 3 == 0 {
+                held.clear();
+            }
         }
     }
 }
