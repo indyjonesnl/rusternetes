@@ -108,6 +108,16 @@ impl<T: Object> RequestScope<T> {
         }
     }
 
+    /// `scope.FieldManager` (installer.go:697-722 `NewDefaultFieldManager`):
+    /// the Update path's field manager for this resource or subresource.
+    pub(super) fn field_manager(&self) -> crate::fieldmanager::FieldManager {
+        crate::fieldmanager::FieldManager::new(
+            &self.api_version(),
+            self.subresource,
+            self.store.get_reset_fields(),
+        )
+    }
+
     pub(super) fn namespace_scoped(&self) -> bool {
         self.store.namespace_scoped()
     }

@@ -22,6 +22,7 @@ use super::admission::{Admission, CreateValidation, MutatingAdmission, UpdateVal
 use super::rest::{
     authorize, check_name, dry_run_param, is_dry_run, respond_object, ApplyFn, RequestScope,
 };
+use crate::fieldmanager::manager_or_user_agent;
 use crate::patch::{apply_patch, PatchType};
 use crate::registry::generic;
 use crate::registry::rest::{
@@ -138,6 +139,7 @@ pub async fn patch_resource<T: Object>(
     };
 
     let patcher = Patcher {
+        manager: manager_or_user_agent(options.field_manager.as_deref()),
         scope,
         mechanism,
         name,
@@ -194,6 +196,8 @@ enum Mechanism<T> {
 
 /// `patcher.applyPatch` (patch.go:581-621) as a `TransformFunc`.
 struct Patcher<'a, T: Object> {
+    /// `managerOrUserAgent(options.FieldManager, userAgent)`.
+    manager: String,
     scope: &'a RequestScope<T>,
     mechanism: Mechanism<T>,
     name: &'a str,
@@ -354,7 +358,12 @@ impl<T: Object> TransformFunc<T> for Patcher<'_, T> {
                 return Err(not_found(self.scope.store.qualified_resource(), self.name))
             }
             (Mechanism::Json(patch_type), Some(current)) => {
-                self.patch_current(ctx, patch_type, current)?
+                let patched = self.patch_current(ctx, patch_type, current)?;
+                // patch.go:372, :466: a patch's Update entry, with the object
+                // it was applied to as the live one.
+                self.scope
+                    .field_manager()
+                    .update_no_errors(Some(current), patched, &self.manager)
             }
         };
 

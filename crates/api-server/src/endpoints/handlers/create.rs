@@ -14,6 +14,7 @@ use super::rest::{
     authorize, decode, dedup_owner_references_and_add_warning, dry_run_param, is_dry_run,
     respond_object, RequestScope,
 };
+use crate::fieldmanager::manager_or_user_agent;
 use crate::registry::generic;
 use crate::registry::rest::{
     ensure_object_namespace_matches_request_namespace, expected_namespace_for_scope,
@@ -82,7 +83,14 @@ pub async fn create_resource<T: Object>(
     // create.go:192-193: dedup owner references before mutating admission,
     // and again after it (:207-208).
     dedup_owner_references_and_add_warning(&mut obj, &ctx, false);
-    let mut obj = admission.admit(Operation::Create, obj, None).await?;
+    // create.go:199: record the creator's Update entry, before mutating
+    // admission, against an empty live object.
+    let mut obj = scope.field_manager().update_no_errors(
+        None,
+        obj,
+        &manager_or_user_agent(options.field_manager.as_deref()),
+    );
+    obj = admission.admit(Operation::Create, obj, None).await?;
     dedup_owner_references_and_add_warning(&mut obj, &ctx, true);
     // The dispatcher decodes a webhook's patched object like a request body.
     scope.convert(&mut obj);

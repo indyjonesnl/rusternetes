@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use async_trait::async_trait;
 use axum::http::StatusCode;
 use axum::response::Response;
 use rusternetes_common::auth::UserInfo;
@@ -13,6 +14,7 @@ use super::rest::{
     authorize, check_name, decode, dedup_owner_references_and_add_warning, dry_run_param,
     is_dry_run, respond_object, RequestScope,
 };
+use crate::fieldmanager::manager_or_user_agent;
 use crate::registry::generic;
 use crate::registry::rest::{
     ensure_object_namespace_matches_request_namespace, expected_namespace_for_scope,
@@ -86,10 +88,17 @@ pub async fn update_resource<T: Object>(
     // update.go:156-230: mutating admission is a transformer, so it sees the
     // live object on every retry; validating admission is the Store's
     // callback, and a create-on-update must also be allowed to `create`.
-    let transformers: Vec<Box<dyn TransformFunc<T> + '_>> = vec![Box::new(MutatingAdmission {
-        admission: &admission,
-        scope,
-    })];
+    // update.go:160-167: the managedFields transformer comes first.
+    let transformers: Vec<Box<dyn TransformFunc<T> + '_>> = vec![
+        Box::new(UpdateManagedFields {
+            scope,
+            manager: manager_or_user_agent(options.field_manager.as_deref()),
+        }),
+        Box::new(MutatingAdmission {
+            admission: &admission,
+            scope,
+        }),
+    ];
     let obj_info = DefaultUpdatedObjectInfo::new(Some(obj), transformers);
     let create_validation = CreateValidation {
         admission: &admission,
@@ -117,4 +126,24 @@ pub async fn update_resource<T: Object>(
         StatusCode::OK
     };
     Ok(respond_object(scope, status, &out, &ctx))
+}
+
+/// The managedFields transformer of `UpdateResource` (update.go:162-167):
+/// `scope.FieldManager.UpdateNoErrors(liveObj, newObj, managerOrUserAgent(...))`.
+struct UpdateManagedFields<'a, T: Object> {
+    scope: &'a RequestScope<T>,
+    manager: String,
+}
+
+#[async_trait]
+impl<T: Object> TransformFunc<T> for UpdateManagedFields<'_, T> {
+    async fn transform(&self, _ctx: &RequestContext, new: Option<T>, old: Option<&T>) -> Result<T> {
+        let new = new.ok_or_else(|| Error::Internal("no object to update".to_string()))?;
+        // A create-on-update has a zero live object (no uid).
+        let live = old.filter(|o| !o.metadata().uid.is_empty());
+        Ok(self
+            .scope
+            .field_manager()
+            .update_no_errors(live, new, &self.manager))
+    }
 }
