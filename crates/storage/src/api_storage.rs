@@ -1862,4 +1862,125 @@ mod tests {
                 .unwrap_err();
         assert!(matches!(err, Error::Gone(_)), "{err:?}");
     }
+
+    // ---- watch resume (#2708) ------------------------------------------
+    //
+    // Upstream: client-go/tools/cache/reflector.go. `watch` (:520-535) sends
+    // `ResourceVersion: r.LastSyncResourceVersion()` and
+    // `AllowWatchBookmarks: true`; `watchHandler` (:962-970) takes a
+    // `watch.Bookmark`'s rv as `setLastSyncResourceVersion`; an expired watch
+    // (:561 `isExpiredError`) ends the watch so the caller relists.
+    // reflector_test.go `TestReflectorListAndWatchWithErrors` /
+    // `TestReflectorWatchHandler` pin: rv carried across a re-watch, and
+    // bookmarks advance rv without surfacing as store events.
+
+    fn ev(kind: &str, name: &str, rv: &str) -> String {
+        format!(
+            r#"{{"type":"{kind}","object":{{"apiVersion":"v1","kind":"ConfigMap","metadata":{{"name":"{name}","namespace":"default","resourceVersion":"{rv}"}}}}}}"#
+        ) + "\n"
+    }
+
+    const EXPIRED: &str = r#"{"type":"ERROR","object":{"kind":"Status","apiVersion":"v1","status":"Failure","message":"too old resource version: 1 (9)","reason":"Expired","code":410}}"#;
+
+    /// Serves `bodies[i]` to the i-th connection (then empty bodies), logging
+    /// each request line.
+    async fn spawn_watch_server(bodies: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            let mut i = 0;
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let req = read_request(&mut stream).await;
+                log.lock()
+                    .await
+                    .push(req.lines().next().unwrap_or("").to_string());
+                let body = bodies.get(i).cloned().unwrap_or_default();
+                i += 1;
+                respond(&mut stream, "200 OK", &body).await;
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn storage_for(base: &str) -> ApiStorage {
+        ApiStorage::new(Arc::new(ApiClient::new(base, true, None).unwrap()))
+    }
+
+    const CM_PREFIX: &str = "/registry/configmaps/default/";
+
+    /// `watch_from_revision` ignored its revision: the watch must carry
+    /// `resourceVersion=<rv>` (`reflector.go:526-527`) and ask for bookmarks
+    /// (`:534`).
+    #[tokio::test]
+    async fn watch_from_revision_sends_the_revision_and_asks_for_bookmarks() {
+        let (base, seen) = spawn_watch_server(vec![ev("ADDED", "a", "11")]).await;
+        let mut w = storage_for(&base)
+            .watch_from_revision(CM_PREFIX, 10)
+            .await
+            .unwrap();
+        let first = w.next().await.expect("an event").expect("not an error");
+        assert!(matches!(first, WatchEvent::Added(..)), "{first:?}");
+        let line = seen.lock().await[0].clone();
+        assert!(line.contains("resourceVersion=10"), "{line}");
+        assert!(line.contains("allowWatchBookmarks=true"), "{line}");
+    }
+
+    /// A compacted revision is the in-stream 410 `Expired` envelope; the
+    /// subscriber must be told (`isExpiredError`, `reflector.go:1051-1058`)
+    /// so it relists, not silently see an empty stream.
+    #[tokio::test]
+    async fn watch_from_revision_surfaces_expiry_as_gone() {
+        let (base, _seen) = spawn_watch_server(vec![format!("{EXPIRED}\n")]).await;
+        let mut w = storage_for(&base)
+            .watch_from_revision(CM_PREFIX, 1)
+            .await
+            .unwrap();
+        match w.next().await {
+            Some(Err(Error::Gone(_))) => {}
+            other => panic!("expected Err(Gone), got {other:?}"),
+        }
+    }
+
+    /// The shared upstream drops a BOOKMARK for subscribers but remembers its
+    /// rv: when the watch ends it is re-established `resourceVersion=<bookmark
+    /// rv>` and the subscriber's stream carries on (no close, no relist).
+    #[tokio::test]
+    async fn shared_watch_resumes_from_the_bookmark_revision() {
+        let first = ev("ADDED", "a", "5") + &ev("BOOKMARK", "", "9");
+        let second = ev("ADDED", "b", "10");
+        let (base, seen) = spawn_watch_server(vec![first, second]).await;
+        let mut w = storage_for(&base).watch(CM_PREFIX).await.unwrap();
+        let mut names = Vec::new();
+        for _ in 0..2 {
+            match w.next().await.expect("stream stayed open").unwrap() {
+                WatchEvent::Added(k, _) => names.push(k),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(
+            names,
+            vec![
+                "/registry/configmaps/default/a",
+                "/registry/configmaps/default/b"
+            ]
+        );
+        let reqs = seen.lock().await.clone();
+        assert!(!reqs[0].contains("resourceVersion"), "{reqs:?}");
+        assert!(reqs[0].contains("allowWatchBookmarks=true"), "{reqs:?}");
+        assert!(reqs[1].contains("resourceVersion=9"), "{reqs:?}");
+    }
+
+    /// An expired resume ends the shared stream so subscribers relist
+    /// (`reflector.go:561`), rather than looping on a dead revision.
+    #[tokio::test]
+    async fn shared_watch_ends_on_expiry() {
+        let first = ev("ADDED", "a", "5");
+        let second = format!("{EXPIRED}\n");
+        let (base, _seen) = spawn_watch_server(vec![first, second]).await;
+        let mut w = storage_for(&base).watch(CM_PREFIX).await.unwrap();
+        assert!(matches!(w.next().await, Some(Ok(WatchEvent::Added(..)))));
+        assert!(w.next().await.is_none(), "stream must close for a relist");
+    }
 }
