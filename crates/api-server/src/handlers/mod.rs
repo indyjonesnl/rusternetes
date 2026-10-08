@@ -151,6 +151,28 @@ pub async fn list_collection_resource_version<T: serde::Serialize>(
     collection_resource_version(current, &list_resource_version(items))
 }
 
+/// `ValidateListOptions` for a list that is synthesized rather than read from
+/// the store (metrics.k8s.io, componentstatuses, custom/external metrics).
+/// Upstream `ListResource`
+/// (`apiserver/pkg/endpoints/handlers/get.go`) validates the options of every
+/// list; there is no resourceVersion floor here because nothing is read from
+/// the store (#2814).
+pub fn validate_synthesized_list_options(
+    params: &std::collections::HashMap<String, String>,
+) -> rusternetes_common::Result<()> {
+    let errs = list_options::validate_list_options(params);
+    if errs.is_empty() {
+        return Ok(());
+    }
+    // `NewInvalid(meta.k8s.io ListOptions, "", errs)`, as `prepare_list`.
+    Err(rusternetes_common::Error::new_invalid(
+        "meta.k8s.io",
+        "ListOptions",
+        "",
+        errs,
+    ))
+}
+
 /// Pure core of [`list_collection_resource_version`]: the greater of the store
 /// revision and the highest item resourceVersion, as a decimal string.
 pub fn collection_resource_version(current_revision: Option<i64>, items_max_rv: &str) -> String {

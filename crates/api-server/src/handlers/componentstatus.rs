@@ -49,6 +49,7 @@ pub async fn get(
 pub async fn list(
     State(_state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<List<ComponentStatus>>> {
     debug!("Listing componentstatuses");
 
@@ -59,6 +60,8 @@ pub async fn list(
     if let Decision::Deny(reason) = _state.authorizer.authorize(&attrs).await? {
         return Err(rusternetes_common::Error::Forbidden(reason));
     }
+
+    crate::handlers::validate_synthesized_list_options(&params)?;
 
     // Return status for all known components
     let components = vec![

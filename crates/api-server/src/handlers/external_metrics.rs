@@ -38,6 +38,7 @@ pub async fn list_external_metrics(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, metric_name)): Path<(String, String)>,
     Query(query): Query<ExternalMetricQuery>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<ExternalMetricValueList>> {
     info!(
         "Listing external metric {} in namespace {}",
@@ -53,6 +54,8 @@ pub async fn list_external_metrics(
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
         return Err(rusternetes_common::Error::Forbidden(reason));
     }
+
+    crate::handlers::validate_synthesized_list_options(&params)?;
 
     // Parse the label selector into both a map (for Prometheus) and the labels
     // echoed back on each metric value.
