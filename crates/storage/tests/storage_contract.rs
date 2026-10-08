@@ -3,12 +3,11 @@
 
 mod contract;
 
-// MemoryStorage now keeps a monotonic write counter and stamps
-// `metadata.resourceVersion` from it (#1942), so it satisfies the revision
-// rows. It still keeps no per-revision history, so it cannot serve a paged
-// list as a snapshot at a past revision -- that gap is real and tracked, not
-// asserted away.
-contract_suite!(memory, async { crate::contract::fixtures::memory() }, revisions: true, snapshot_paging: false);
+// MemoryStorage keeps a monotonic write counter and stamps
+// `metadata.resourceVersion` from it (#1942), and an undo log of each retained
+// write's previous value, so it serves a list as a snapshot at a past revision
+// (#2684).
+contract_suite!(memory, async { crate::contract::fixtures::memory() }, revisions: true, snapshot_paging: true);
 contract_suite!(etcd, crate::contract::fixtures::etcd(), revisions: true, snapshot_paging: true);
 contract_suite!(kine, crate::contract::fixtures::kine(), revisions: true, snapshot_paging: true);
 
