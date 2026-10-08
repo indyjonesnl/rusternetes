@@ -330,6 +330,7 @@ mod watch_delivery_exhaustive_test;
 mod watch_delivery_matrix_test;
 mod watch_delivery_rhino_test;
 mod watch_event_envelope_test;
+mod watch_event_objects_carry_gvk_test;
 mod watch_event_proto_envelope_test;
 mod watch_handler_test;
 mod watch_labelselector_create_test;

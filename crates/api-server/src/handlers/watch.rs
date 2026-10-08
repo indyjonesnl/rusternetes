@@ -662,7 +662,7 @@ where
                 event_type: WatchEventType::Added,
                 object: object.clone(),
             };
-            if let Ok(json) = serde_json::to_string(&k8s_event) {
+            if let Ok(json) = typed_event_json(&k8s_event, &bookmark_kind, &bookmark_api_version) {
                 let _ = tx.try_send(Ok(format!("{}\n", json)));
             }
         }
@@ -792,7 +792,7 @@ where
                                         event_type: WatchEventType::Added,
                                         object,
                                     };
-                                    if let Ok(json) = serde_json::to_string(&k8s_event) {
+                                    if let Ok(json) = typed_event_json(&k8s_event, &bookmark_kind, &bookmark_api_version) {
                                         // Use send().await to guarantee delivery. With
                                         // rhino/SQLite the poll loop has up to 1s latency,
                                         // so events can arrive in bursts. try_send() would
@@ -835,7 +835,7 @@ where
                                         event_type,
                                         object,
                                     };
-                                    if let Ok(json) = serde_json::to_string(&k8s_event) {
+                                    if let Ok(json) = typed_event_json(&k8s_event, &bookmark_kind, &bookmark_api_version) {
                                         if tx.send(Ok(format!("{}\n", json))).await.is_err() {
                                             debug!("Watch: tx.send failed, client disconnected");
                                             break;
@@ -877,7 +877,7 @@ where
                                         event_type: WatchEventType::Deleted,
                                         object,
                                     };
-                                    if let Ok(json) = serde_json::to_string(&k8s_event) {
+                                    if let Ok(json) = typed_event_json(&k8s_event, &bookmark_kind, &bookmark_api_version) {
                                         if tx.send(Ok(format!("{}\n", json))).await.is_err() {
                                             debug!("Watch: tx.send failed, client disconnected");
                                             break;
@@ -1232,7 +1232,9 @@ where
                     event_type: WatchEventType::Added,
                     object,
                 };
-                if let Ok(json) = serde_json::to_string(&k8s_event) {
+                if let Ok(json) =
+                    typed_event_json(&k8s_event, &bookmark_kind, &bookmark_api_version)
+                {
                     // Use send().await to guarantee delivery. try_send() caused
                     // initial events to be silently dropped when the channel was
                     // full (before Hyper starts draining), which then caused the
@@ -1352,7 +1354,7 @@ where
                                         event_type: WatchEventType::Added,
                                         object,
                                     };
-                                    if let Ok(json) = serde_json::to_string(&k8s_event) {
+                                    if let Ok(json) = typed_event_json(&k8s_event, &bookmark_kind, &bookmark_api_version) {
                                         if tx.send(Ok(format!("{}\n", json))).await.is_err() {
                                             debug!("Watch: tx.send failed, client disconnected");
                                             break;
@@ -1388,7 +1390,7 @@ where
                                         event_type,
                                         object,
                                     };
-                                    if let Ok(json) = serde_json::to_string(&k8s_event) {
+                                    if let Ok(json) = typed_event_json(&k8s_event, &bookmark_kind, &bookmark_api_version) {
                                         if tx.send(Ok(format!("{}\n", json))).await.is_err() {
                                             debug!("Watch: tx.send failed, client disconnected");
                                             break;
@@ -1430,7 +1432,7 @@ where
                                         event_type: WatchEventType::Deleted,
                                         object,
                                     };
-                                    if let Ok(json) = serde_json::to_string(&k8s_event) {
+                                    if let Ok(json) = typed_event_json(&k8s_event, &bookmark_kind, &bookmark_api_version) {
                                         if tx.send(Ok(format!("{}\n", json))).await.is_err() {
                                             debug!("Watch: tx.send failed, client disconnected");
                                             break;
@@ -1822,6 +1824,37 @@ impl HasMetadata for JsonWatchObject {
 /// and `cacheWatcher.convertToWatchEvent` (`cache_watcher.go:374-395`) turns a
 /// change that moves an object into the selector into `ADDED` and out of it
 /// into `DELETED`. `None` suppresses the event (#2044).
+/// Serialize a typed watch event whose object always names its `kind` and
+/// `apiVersion`.
+///
+/// Upstream's watch encoder is `EncoderForVersion(..., scope.Kind.GroupVersion())`
+/// (`staging/src/k8s.io/apiserver/pkg/endpoints/handlers/watch.go:81-83`); the
+/// versioning codec stamps the GVK on every encode
+/// (`apimachinery/pkg/runtime/serializer/versioning/versioning.go`
+/// `doEncode`: `objectKind.SetGroupVersionKind(gvk)`). A typed or dynamic
+/// client's write body carries no TypeMeta, so the stored object has none, and
+/// client-go cannot decode an event object without a kind: the stream
+/// watcher reports a 500 ERROR that `RetryWatcher` retries silently, forever.
+fn typed_event_json<T: Serialize>(
+    event: &K8sWatchEvent<T>,
+    kind: &str,
+    api_version: &str,
+) -> serde_json::Result<String> {
+    let mut value = serde_json::to_value(event)?;
+    if let Some(object) = value.get_mut("object").and_then(|o| o.as_object_mut()) {
+        for (key, want) in [("apiVersion", api_version), ("kind", kind)] {
+            let missing = object
+                .get(key)
+                .and_then(|v| v.as_str())
+                .is_none_or(str::is_empty);
+            if missing {
+                object.insert(key.to_string(), serde_json::Value::String(want.into()));
+            }
+        }
+    }
+    serde_json::to_string(&value)
+}
+
 fn json_watch_event(
     event_type: &'static str,
     value: serde_json::Value,
