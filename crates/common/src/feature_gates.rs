@@ -174,6 +174,9 @@ pub enum Feature {
 
     /// Upstream gate `ReduceDefaultCrashLoopBackOffDecay` (1.33 Alpha, off; `pkg/features/kube_features.go:1692-1694`).
     ReduceDefaultCrashLoopBackOffDecay,
+
+    /// Upstream gate `WatchCacheInitializationPostStartHook` (1.31 Beta, still off; `staging/src/k8s.io/apiserver/pkg/features/kube_features.go:494-496`).
+    WatchCacheInitializationPostStartHook,
 }
 
 impl Feature {
@@ -214,6 +217,7 @@ impl Feature {
             Feature::StorageVersionMigrator => 31,
             Feature::KubeletCrashLoopBackOffMax => 32,
             Feature::ReduceDefaultCrashLoopBackOffDecay => 33,
+            Feature::WatchCacheInitializationPostStartHook => 34,
         }
     }
 
@@ -286,6 +290,8 @@ impl Feature {
             Feature::StorageVersionMigrator => false,
             Feature::KubeletCrashLoopBackOffMax => true,
             Feature::ReduceDefaultCrashLoopBackOffDecay => false,
+            // 1.31 Beta, no `Default: true` (apiserver kube_features.go:494-496)
+            Feature::WatchCacheInitializationPostStartHook => false,
         }
     }
 }
@@ -336,6 +342,7 @@ pub const ALL_FEATURES: &[Feature] = &[
     Feature::StorageVersionMigrator,
     Feature::KubeletCrashLoopBackOffMax,
     Feature::ReduceDefaultCrashLoopBackOffDecay,
+    Feature::WatchCacheInitializationPostStartHook,
 ];
 
 /// Total number of feature gates. Derived from [`ALL_FEATURES`].
@@ -384,6 +391,7 @@ static STATES: [AtomicBool; NUM_FEATURES] = [
     AtomicBool::new(Feature::StorageVersionMigrator.default_enabled()),
     AtomicBool::new(Feature::KubeletCrashLoopBackOffMax.default_enabled()),
     AtomicBool::new(Feature::ReduceDefaultCrashLoopBackOffDecay.default_enabled()),
+    AtomicBool::new(Feature::WatchCacheInitializationPostStartHook.default_enabled()),
 ];
 
 /// Returns whether `feature` is currently enabled in this process.

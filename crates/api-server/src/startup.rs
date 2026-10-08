@@ -9,7 +9,9 @@
 //! shipped missing from the other (#2490). Add new hooks HERE only; the
 //! `startup_hooks_single_path` test enforces it.
 
-use crate::{apiserver_identity, bootstrap, legacy_token_tracking, registry};
+use crate::{
+    apiserver_identity, bootstrap, legacy_token_tracking, registry, storage_readiness_hook,
+};
 use rusternetes_storage::{Storage, StorageBackend};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -47,6 +49,9 @@ pub async fn register_post_start_hooks(
     bootstrap::spawn_system_priority_classes_hook(storage.clone());
     // start-system-namespaces-controller (server.go:145).
     bootstrap::spawn_system_namespaces_controller(storage.clone());
+    // storage-readiness PostStartHook (server.go:315-317), behind
+    // WatchCacheInitializationPostStartHook (off by default).
+    storage_readiness_hook::spawn_for_backend(storage.clone());
     // Keep the kubernetes endpoint tracking the live api-server IP across
     // container recreates / IP changes (upstream EndpointReconciler, #1188).
     bootstrap::spawn_endpoint_reconciler(storage.clone(), api_port, service_ip);
@@ -137,6 +142,7 @@ mod startup_hooks_single_path {
         "spawn_crd_informer_synced_hook(",
         "spawn_legacy_token_tracking_controller(",
         "spawn_identity_hooks(",
+        "storage_readiness_hook::spawn_for_backend(",
     ];
 
     /// Source of an entry point without its test module.
