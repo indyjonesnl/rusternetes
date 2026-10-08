@@ -9,12 +9,11 @@
 //!   `matchConditions` of the two webhook configurations are compiled, as
 //!   `validateMatchConditionsExpression` does.
 //! - `MutatingAdmissionPolicy` (`admissionregistration.k8s.io/v1beta1`,
-//!   served only under the `MutatingAdmissionPolicy` gate): the CEL compile of
-//!   `applyConfiguration` / `jsonPatch` / `matchConditions` / `variables`
-//!   (`validateApplyConfiguration`, `validateJSONPatch`, #2798) with the
-//!   update-time `ignoreMutatingAdmissionPolicyMatchConditions` /
-//!   `preexistingExpressions` options that only gate it, and the admission
-//!   plugin (#2731).
+//!   served only under the `MutatingAdmissionPolicy` gate): those expressions
+//!   are parsed (syntax errors) with the update-time
+//!   `ignoreMutatingAdmissionPolicyMatchConditions` gate, but the typed
+//!   `mutation` CEL environment (type checks, `params`/`variables` references,
+//!   `StoredExpressions`) is #2834, and the admission plugin is #2731.
 //! - `GetResetFields` (managed-fields reset sets) and declarative validation.
 
 pub mod authz;
