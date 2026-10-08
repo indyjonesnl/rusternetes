@@ -4,7 +4,7 @@
 //!
 //! Scope: the CEL-free structural checks of `spec` — the `selectors` set
 //! (≤32, each must carry a `cel` selector whose `expression` is non-empty and
-//! ≤10Ki) and the `config` set (≤32). Compiling the CEL expressions against the
+//! ≤10Ki) and the `config` set (≤32). Parse-checking the CEL expressions; compiling against the
 //! DRA CEL environment is tracked in #1442. ObjectMeta is validated separately.
 
 use crate::resources::{DeviceClass, DeviceClassSpec};
