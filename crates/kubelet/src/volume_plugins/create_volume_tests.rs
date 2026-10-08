@@ -251,19 +251,20 @@ async fn config_map_missing_optional_yields_an_empty_volume() {
     }
 }
 
-// ------------------------------------------------- secret: SA token + CA cert
+// ------------------------------------- secret: no SA token / CA special case
 
 fn sa_token_secret_volume() -> Volume {
     volume(json!({"name": "kube-api-access-abc", "secret": {"secretName": "sa1-token"}}))
 }
 
-/// An SA-token secret volume (volume name `kube-api-access*` or secret name
-/// `*-token`) has the stored static `token` replaced by a freshly minted
-/// token bound to the pod, ServiceAccount and Node (uids read from storage).
-/// Rusternetes-only (secret.go has no such step; declared CLAUDE.md rule 8).
+/// Upstream's secret plugin projects the stored Secret verbatim: no volume or
+/// secret NAME makes it mint a token (`pkg/volume/secret/secret.go:162-208`,
+/// `MakePayload` :210-247 -- no token or CA logic anywhere). A legacy
+/// `kube-api-access*` / `*-token` Secret volume keeps its stored `token`
+/// (#2638; SA tokens arrive via the projected `serviceAccountToken` source).
 #[tokio::test]
 #[serial_test::serial]
-async fn secret_sa_token_volume_replaces_token_with_bound_jwt() {
+async fn secret_sa_named_volume_projects_stored_token_verbatim() {
     let _g = CaEnvGuard::set(Some("/nonexistent/ca.crt"));
     let e = env();
     seed_sa_and_node(&e).await;
@@ -274,32 +275,17 @@ async fn secret_sa_token_volume_replaces_token_with_bound_jwt() {
             .await
             .unwrap();
 
-    let token = std::fs::read_to_string(format!("{path}/token")).unwrap();
-    assert_ne!(token, "static-token");
-    let c = decode(&token);
-    assert_eq!(c.sub, "system:serviceaccount:default:sa1");
-    assert_eq!(c.namespace, "default");
-    assert_eq!(c.uid, "sa-uid-1");
-    assert_eq!(c.iss, "https://kubernetes.default.svc.cluster.local");
-    assert_eq!(c.aud, vec!["rusternetes".to_string()]);
-    assert_eq!(c.exp - c.iat, 3600);
-    assert_eq!(c.pod_name.as_deref(), Some("p"));
-    assert_eq!(c.pod_uid.as_deref(), Some("uid-1"));
-    assert_eq!(c.node_name.as_deref(), Some("node-1"));
-    assert_eq!(c.node_uid.as_deref(), Some("node-uid-1"));
-    let k = c.kubernetes.expect("kubernetes.io claims");
-    assert_eq!(k.svcacct.name, "sa1");
-    assert_eq!(k.svcacct.uid, "sa-uid-1");
-    assert_eq!(k.pod.unwrap().uid, "uid-1");
-    assert_eq!(k.node.unwrap().uid, "node-uid-1");
-    // Other keys are untouched.
+    assert_eq!(
+        std::fs::read(format!("{path}/token")).unwrap(),
+        b"static-token"
+    );
     assert_eq!(std::fs::read(format!("{path}/x")).unwrap(), b"y");
 }
 
-/// With `items`, the token substitution follows the `key: token` item's path.
+/// `items` mapping of the `token` key keeps the stored bytes too.
 #[tokio::test]
 #[serial_test::serial]
-async fn secret_sa_token_substitution_follows_items_path() {
+async fn secret_sa_named_volume_items_keep_stored_token() {
     let _g = CaEnvGuard::set(Some("/nonexistent/ca.crt"));
     let e = env();
     seed_sa_and_node(&e).await;
@@ -310,101 +296,25 @@ async fn secret_sa_token_substitution_follows_items_path() {
     }}));
     let path = e.vm.create_volume(&pod(), &v).await.unwrap();
 
-    assert_eq!(read_claims(&format!("{path}/t/jwt")).uid, "sa-uid-1");
-    // An item that merely LANDS on a path named "token" but maps another key
-    // is not the token key and keeps its own data.
+    assert_eq!(
+        std::fs::read(format!("{path}/t/jwt")).unwrap(),
+        b"static-token"
+    );
     assert_eq!(std::fs::read(format!("{path}/t/token")).unwrap(), b"y");
 }
 
-/// A secret that merely has a `token` key, under a name/volume that is not an
-/// SA-token one, keeps its stored token (no minting).
+/// The kubelet never injects the cluster CA into a Secret volume: it reaches
+/// pods through the `kube-root-ca.crt` ConfigMap projection (#2638), so a
+/// `CA_CERT_PATH` / `_certs/ca.crt` must have no effect on a Secret volume.
 #[tokio::test]
 #[serial_test::serial]
-async fn secret_with_token_key_but_ordinary_name_is_not_reminted() {
-    let _g = CaEnvGuard::set(Some("/nonexistent/ca.crt"));
-    let e = env();
-    seed_secret(&e, "mysecret", &[("token", b"static-token")]).await;
-    let v = volume(json!({"name": "sec", "secret": {"secretName": "mysecret"}}));
-    let path = e.vm.create_volume(&pod(), &v).await.unwrap();
-    assert_eq!(
-        std::fs::read(format!("{path}/token")).unwrap(),
-        b"static-token"
-    );
-}
-
-/// The cluster CA is injected as `ca.crt` into a service-account secret
-/// volume, from `CA_CERT_PATH` when set.
-#[tokio::test]
-#[serial_test::serial]
-async fn secret_sa_volume_gets_ca_crt_from_env_path() {
+async fn secret_volume_never_gets_ca_crt_injected() {
     let e = env();
     let ca_file = e.tmp.path().join("env-ca.crt");
     std::fs::write(&ca_file, CA).unwrap();
-    let _g = CaEnvGuard::set(Some(ca_file.to_str().unwrap()));
-    seed_sa_and_node(&e).await;
-    seed_secret(&e, "sa1-token", &[("token", b"t")]).await;
-    let v =
-        volume(json!({"name": "s", "secret": {"secretName": "sa1-token", "defaultMode": 0o440}}));
-    let path = e.vm.create_volume(&pod(), &v).await.unwrap();
-
-    assert_eq!(std::fs::read(format!("{path}/ca.crt")).unwrap(), CA);
-    assert_eq!(mode(&format!("{path}/ca.crt")), 0o440);
-}
-
-/// Without `CA_CERT_PATH`, the CA is read from `<volumes base>/_certs/ca.crt`
-/// (`VolumeHost::get_volumes_base_path`).
-#[tokio::test]
-#[serial_test::serial]
-async fn secret_sa_volume_gets_ca_crt_from_volumes_certs_dir() {
-    let _g = CaEnvGuard::set(None);
-    let e = env();
     std::fs::create_dir_all(e.tmp.path().join("_certs")).unwrap();
     std::fs::write(e.tmp.path().join("_certs/ca.crt"), CA).unwrap();
-    seed_secret(&e, "sa1-token", &[("token", b"t")]).await;
-    let path =
-        e.vm.create_volume(&pod(), &sa_token_secret_volume())
-            .await
-            .unwrap();
-    assert_eq!(std::fs::read(format!("{path}/ca.crt")).unwrap(), CA);
-}
-
-/// A `ca.crt` already present in the Secret is never overwritten.
-#[tokio::test]
-#[serial_test::serial]
-async fn secret_existing_ca_crt_is_not_overwritten() {
-    let e = env();
-    let ca_file = e.tmp.path().join("env-ca.crt");
-    std::fs::write(&ca_file, CA).unwrap();
     let _g = CaEnvGuard::set(Some(ca_file.to_str().unwrap()));
-    seed_secret(&e, "sa1-token", &[("token", b"t"), ("ca.crt", b"OWN")]).await;
-    let path =
-        e.vm.create_volume(&pod(), &sa_token_secret_volume())
-            .await
-            .unwrap();
-    assert_eq!(std::fs::read(format!("{path}/ca.crt")).unwrap(), b"OWN");
-}
-
-/// A non-service-account secret (no `token` key, name not `*-token`) gets no
-/// CA injected even when one is available.
-#[tokio::test]
-#[serial_test::serial]
-async fn secret_non_sa_volume_gets_no_ca_crt() {
-    let e = env();
-    let ca_file = e.tmp.path().join("env-ca.crt");
-    std::fs::write(&ca_file, CA).unwrap();
-    let _g = CaEnvGuard::set(Some(ca_file.to_str().unwrap()));
-    seed_secret(&e, "plain", &[("password", b"p")]).await;
-    let v = volume(json!({"name": "s", "secret": {"secretName": "plain"}}));
-    let path = e.vm.create_volume(&pod(), &v).await.unwrap();
-    assert!(!std::path::Path::new(&format!("{path}/ca.crt")).exists());
-}
-
-/// A missing CA is a warning, not a failure: the volume is still created.
-#[tokio::test]
-#[serial_test::serial]
-async fn secret_sa_volume_without_any_ca_still_succeeds() {
-    let _g = CaEnvGuard::set(Some("/nonexistent/ca.crt"));
-    let e = env();
     seed_secret(&e, "sa1-token", &[("token", b"t")]).await;
     let path =
         e.vm.create_volume(&pod(), &sa_token_secret_volume())
@@ -412,6 +322,20 @@ async fn secret_sa_volume_without_any_ca_still_succeeds() {
             .unwrap();
     assert!(!std::path::Path::new(&format!("{path}/ca.crt")).exists());
     assert!(std::path::Path::new(&format!("{path}/token")).exists());
+}
+
+/// A `ca.crt` stored in the Secret is projected like any other key.
+#[tokio::test]
+#[serial_test::serial]
+async fn secret_existing_ca_crt_is_projected_as_stored() {
+    let _g = CaEnvGuard::set(Some("/nonexistent/ca.crt"));
+    let e = env();
+    seed_secret(&e, "sa1-token", &[("token", b"t"), ("ca.crt", b"OWN")]).await;
+    let path =
+        e.vm.create_volume(&pod(), &sa_token_secret_volume())
+            .await
+            .unwrap();
+    assert_eq!(std::fs::read(format!("{path}/ca.crt")).unwrap(), b"OWN");
 }
 
 // ---------------------------------------------- projected serviceAccountToken

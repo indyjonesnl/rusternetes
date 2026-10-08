@@ -797,7 +797,6 @@ impl VolumeManager {
             let volume_dir = self.pod_volume_dir(pod, volume);
             Self::reproject_secret(
                 &volume_dir,
-                &volume.name,
                 secret_source,
                 fetched.secret(secret_name),
                 crate::volume_plugins::util::fs_group_from(pod),
@@ -900,16 +899,8 @@ impl VolumeManager {
     /// content. A required Secret that cannot be read leaves the volume
     /// untouched (SetUp fails, kubelet retries); an optional one projects an
     /// empty Secret (`secret.go:167-172`).
-    ///
-    /// Rusternetes-specific (mirrors the initial mount in
-    /// `volume_plugins/secret.rs`): a service-account-token Secret volume
-    /// carries a minted bound token and an injected `ca.crt`, neither of which
-    /// lives in the stored Secret. Re-projection keeps the bytes already on
-    /// disk for those two files instead of clobbering them with the raw
-    /// Secret data.
     fn reproject_secret(
         volume_dir: &str,
-        volume_name: &str,
         source: &rusternetes_common::resources::SecretVolumeSource,
         fetched: Option<&rusternetes_common::resources::Secret>,
         fs_group: Option<i64>,
@@ -928,7 +919,7 @@ impl VolumeManager {
             None => return,
         };
         let mode = source.default_mode.unwrap_or(0o644) as u32;
-        let mut payload = match crate::volume_plugins::secret::make_payload(
+        let payload = match crate::volume_plugins::secret::make_payload(
             source.items.as_deref(),
             secret,
             mode,
@@ -940,38 +931,6 @@ impl VolumeManager {
                 return;
             }
         };
-
-        let is_sa_token_volume =
-            volume_name.contains("kube-api-access") || secret_name.ends_with("-token");
-        if is_sa_token_volume {
-            let dir = std::path::Path::new(volume_dir);
-            let token_path = match source.items.as_deref() {
-                Some(items) if !items.is_empty() => items
-                    .iter()
-                    .find(|i| i.key == "token")
-                    .map(|i| i.path.clone()),
-                _ => Some("token".to_string()),
-            };
-            if let Some(tp) = token_path {
-                if let (Some(entry), Ok(existing)) =
-                    (payload.get_mut(&tp), std::fs::read(dir.join(&tp)))
-                {
-                    entry.data = existing;
-                }
-            }
-            if !payload.contains_key("ca.crt") {
-                if let Ok(existing) = std::fs::read(dir.join("ca.crt")) {
-                    payload.insert(
-                        "ca.crt".to_string(),
-                        FileProjection {
-                            fs_user: None,
-                            data: existing,
-                            mode,
-                        },
-                    );
-                }
-            }
-        }
 
         if let Err(e) = crate::volume_ownership::write_payload_with_ownership(
             std::path::Path::new(volume_dir),
@@ -1284,7 +1243,6 @@ impl VolumeManager {
                 };
                 Self::reproject_secret(
                     &volume_dir,
-                    &volume.name,
                     secret_source,
                     fetched.secret(secret_name),
                     crate::volume_plugins::util::fs_group_from(pod),
@@ -1900,12 +1858,12 @@ mod projected_mode_tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// #1656: a service-account-token Secret volume must not have its bound
-    /// token (or injected ca.crt) clobbered by a re-projection of the raw
-    /// Secret data.
+    /// #2638: a `kube-api-access*` / `*-token` Secret volume is an ordinary
+    /// Secret volume (upstream `secret.go` has no token special case), so the
+    /// stored token is projected at mount and re-projected unchanged.
     #[cfg(unix)]
     #[tokio::test]
-    async fn reproject_sa_token_secret_keeps_bound_token() {
+    async fn reproject_sa_named_secret_projects_stored_token() {
         let pod: Pod = serde_json::from_value(json!({
             "metadata": {"name": "p", "namespace": "default", "uid": "uid-sat"},
             "spec": {"containers": [], "volumes": [{
@@ -1940,7 +1898,7 @@ mod projected_mode_tests {
         )
         .join("token");
         let before = std::fs::read(&token).unwrap();
-        assert_ne!(before, b"static-unbound", "mount substitutes a bound token");
+        assert_eq!(before, b"static-unbound", "stored token projected verbatim");
         vm.refresh_volumes(&pod).await.unwrap();
         vm.resync_volumes(&pod, storage.as_ref()).await.unwrap();
         assert_eq!(std::fs::read(&token).unwrap(), before);

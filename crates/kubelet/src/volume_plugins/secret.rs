@@ -6,7 +6,7 @@ use rusternetes_common::resources::{KeyToPath, Pod, Secret, SecretVolumeSource};
 use rusternetes_storage::{build_key, Storage, StorageBackend};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::info;
 
 /// Port of `pkg/volume/secret/secret.go`.
 pub struct SecretPlugin {
@@ -72,18 +72,7 @@ impl VolumePlugin for SecretPlugin {
                 .clone()
                 .unwrap_or_else(|| "default".to_string()),
             secret: spec.volume.secret.clone().expect("checked by can_support"),
-            // Carries the pod's NAME, used only for the service-account token
-            // audience. On-disk paths never use it — `path` is already resolved.
-            pod_name: pod.metadata.name.clone(),
-            pod_uid: pod.metadata.uid.clone(),
-            service_account_name: pod
-                .spec
-                .as_ref()
-                .and_then(|s| s.service_account_name.clone()),
-            node_name: pod.spec.as_ref().and_then(|s| s.node_name.clone()),
             storage: self.host.get_kube_client().cloned(),
-            volumes_base_path: self.host.get_volumes_base_path().to_string(),
-            token_manager: self.host.get_service_account_token_func().clone(),
             fs_group: crate::volume_plugins::util::fs_group_from(pod),
             pod: pod.clone(),
         }))
@@ -175,15 +164,7 @@ struct SecretMounter {
     volume_name: String,
     namespace: String,
     secret: SecretVolumeSource,
-    /// Carries the pod's NAME, used only for the service-account token
-    /// audience. On-disk paths never use it — `path` is already resolved.
-    pod_name: String,
-    pod_uid: String,
-    service_account_name: Option<String>,
-    node_name: Option<String>,
     storage: Option<Arc<StorageBackend>>,
-    volumes_base_path: String,
-    token_manager: rusternetes_common::auth::TokenManager,
     /// `mounterArgs.FsGroup` (`volume.go:132`).
     fs_group: Option<i64>,
     /// `secretVolumeMounter.pod` (`secret.go:155`), read by
@@ -213,75 +194,6 @@ impl Mounter for SecretMounter {
             .context("Secret volume must specify secret_name")?;
 
         let is_optional = secret_source.optional.unwrap_or(false);
-
-        // For SA token volumes, generate a bound token with pod reference
-        // instead of using the static token from the Secret.
-        let is_sa_token_volume =
-            self.volume_name.contains("kube-api-access") || secret_name.ends_with("-token");
-        let bound_token: Option<String> = if is_sa_token_volume {
-            let sa_name = self.service_account_name.as_deref().unwrap_or("default");
-            let sa_key = build_key("serviceaccounts", Some(&self.namespace), sa_name);
-            let sa_uid = storage
-                .get::<serde_json::Value>(&sa_key)
-                .await
-                .ok()
-                .and_then(|v| {
-                    v.pointer("/metadata/uid")
-                        .and_then(|u| u.as_str())
-                        .map(|s| s.to_string())
-                })
-                .unwrap_or_default();
-            let node_name = self.node_name.clone();
-            let node_uid = if let Some(ref nn) = node_name {
-                let node_key = build_key("nodes", None::<&str>, nn);
-                storage
-                    .get::<serde_json::Value>(&node_key)
-                    .await
-                    .ok()
-                    .and_then(|v| {
-                        v.pointer("/metadata/uid")
-                            .and_then(|u| u.as_str())
-                            .map(|s| s.to_string())
-                    })
-            } else {
-                None
-            };
-            let now = chrono::Utc::now();
-            let claims = rusternetes_common::auth::ServiceAccountClaims {
-                sub: format!("system:serviceaccount:{}:{}", self.namespace, sa_name),
-                namespace: self.namespace.to_string(),
-                uid: sa_uid.clone(),
-                iat: now.timestamp(),
-                exp: (now + chrono::Duration::hours(1)).timestamp(),
-                iss: "https://kubernetes.default.svc.cluster.local".to_string(),
-                aud: vec!["rusternetes".to_string()],
-                kubernetes: Some(rusternetes_common::auth::KubernetesClaims {
-                    namespace: self.namespace.to_string(),
-                    svcacct: rusternetes_common::auth::KubeRef {
-                        name: sa_name.to_string(),
-                        uid: sa_uid,
-                    },
-                    pod: Some(rusternetes_common::auth::KubeRef {
-                        name: self.pod_name.to_string(),
-                        uid: self.pod_uid.clone(),
-                    }),
-                    node: node_name
-                        .as_ref()
-                        .map(|nn| rusternetes_common::auth::KubeRef {
-                            name: nn.clone(),
-                            uid: node_uid.clone().unwrap_or_default(),
-                        }),
-                    secret: None,
-                }),
-                pod_name: Some(self.pod_name.to_string()),
-                pod_uid: Some(self.pod_uid.clone()),
-                node_name,
-                node_uid,
-            };
-            self.token_manager.generate_token(claims).ok()
-        } else {
-            None
-        };
 
         let key = build_key("secrets", Some(&self.namespace), secret_name);
         let secret_result: Result<Secret, _> = storage.get(&key).await;
@@ -322,78 +234,19 @@ impl Mounter for SecretMounter {
         let secret_ref = secret.as_ref().unwrap_or(&empty);
 
         // `MakePayload` (secret.go:210-247).
-        let mut payload = make_payload(
+        let payload = make_payload(
             secret_source.items.as_deref(),
             secret_ref,
             secret_default_mode as u32,
             is_optional,
         )?;
 
-        // Rusternetes-specific (no upstream equivalent in this plugin): the
-        // SA-token Secret volume substitutes a freshly minted bound token.
-        if let Some(bt) = &bound_token {
-            for (path, projection) in payload.iter_mut() {
-                let key_is_token = match secret_source.items.as_deref() {
-                    Some(items) if !items.is_empty() => {
-                        items.iter().any(|i| i.key == "token" && &i.path == path)
-                    }
-                    _ => path == "token",
-                };
-                if key_is_token {
-                    projection.data = bt.as_bytes().to_vec();
-                }
-            }
-        }
-
-        // Rusternetes-specific: service account token secrets also get the
-        // cluster CA injected as ca.crt.
-        let is_service_account_secret = secret_ref
-            .data
-            .as_ref()
-            .map(|data| data.contains_key("token"))
-            .unwrap_or(false)
-            || secret_name.ends_with("-token");
-
-        if is_service_account_secret {
-            let has_ca_cert = secret_ref
-                .data
-                .as_ref()
-                .map(|data| data.contains_key("ca.crt"))
-                .unwrap_or(false);
-            if !has_ca_cert && !payload.contains_key("ca.crt") {
-                // Try multiple locations: environment variable, volumes/_certs, then fallback to .rusternetes/certs
-                let ca_cert_source = std::env::var("CA_CERT_PATH").unwrap_or_else(|_| {
-                    let volumes_cert_path = format!("{}/_certs/ca.crt", self.volumes_base_path);
-                    if std::path::Path::new(&volumes_cert_path).exists() {
-                        volumes_cert_path
-                    } else {
-                        format!(
-                            "{}/.rusternetes/certs/ca.crt",
-                            std::env::var("HOME").unwrap_or_else(|_| "/root".to_string())
-                        )
-                    }
-                });
-                if let Ok(ca_content) = std::fs::read(&ca_cert_source) {
-                    payload.insert(
-                        "ca.crt".to_string(),
-                        FileProjection {
-                            fs_user: None,
-                            data: ca_content,
-                            mode: secret_default_mode as u32,
-                        },
-                    );
-                    info!(
-                        "Injected CA certificate into service account secret volume (from {})",
-                        ca_cert_source
-                    );
-                } else {
-                    warn!(
-                        "CA certificate not found at {}, pods may not be able to verify API server",
-                        ca_cert_source
-                    );
-                }
-            }
-        }
+        // No service-account token or CA special case here: upstream's secret
+        // plugin projects the Secret verbatim (secret.go:162-208, MakePayload
+        // :210-247). SA tokens and the cluster CA reach pods through the
+        // projected `kube-api-access` volume (serviceAccountToken source +
+        // `kube-root-ca.crt` ConfigMap; plugin/pkg/admission/serviceaccount/
+        // admission.go TokenVolumeSource), injected at admission (#2638).
 
         // `wrapped.SetUpAt(dir, ...)` (secret.go:179-181) runs AFTER `getSecret`
         // and `MakePayload` (:166-177), so a missing Secret or bad item leaves
