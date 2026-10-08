@@ -1554,6 +1554,48 @@ async fn delete_collection_rejects_a_malformed_continue() {
     assert!(matches!(err, Error::BadRequest(_)), "{err:?}");
 }
 
+/// A continue token pinned to a compacted revision is answered with the
+/// resumable 410, as `Storage::list_paginated` does for a List
+/// (etcd3/errors.go:66-89 `interpretListError` / `handleCompactedErrorForPaging`):
+/// the status carries a fresh `rv=-1` token that resumes at the same key.
+#[tokio::test]
+async fn delete_collection_compacted_continue_is_a_resumable_410() {
+    use crate::registry::rest::{zero_delete_options, RestStorage};
+    use std::collections::HashMap;
+    let registry = store(TestStrategy::default());
+    for name in ["a", "b", "c", "d"] {
+        create(&registry, cm(name)).await;
+    }
+    let opts = zero_delete_options();
+    let mut q: HashMap<String, String> = [("limit".to_string(), "2".to_string())].into();
+    let p1 = RestStorage::delete_collection(&registry, &ctx(), None, &opts, &q)
+        .await
+        .unwrap();
+    q.insert("continue".to_string(), p1.continue_token.unwrap());
+    registry.storage.compact_to(i64::MAX);
+
+    let err = RestStorage::delete_collection(&registry, &ctx(), None, &opts, &q)
+        .await
+        .unwrap_err();
+    let Error::GoneWithContinue { continue_token, .. } = err else {
+        panic!("want GoneWithContinue, got {err:?}");
+    };
+    let d = rusternetes_storage::decode_default_token(&continue_token).unwrap();
+    assert_eq!(d.start_key, "test/c");
+    assert_eq!(
+        d.compacted_at,
+        Some(rusternetes_storage::INCONSISTENT_CONTINUE_RV)
+    );
+
+    // The fresh token resumes at the latest revision and finishes the walk.
+    q.insert("continue".to_string(), continue_token);
+    let p2 = RestStorage::delete_collection(&registry, &ctx(), None, &opts, &q)
+        .await
+        .unwrap();
+    let names: Vec<_> = p2.items.iter().map(|o| o.metadata.name.as_str()).collect();
+    assert_eq!(names, ["c", "d"]);
+}
+
 /// A `TTLFunc` error fails the write and stores nothing.
 #[tokio::test]
 async fn a_ttl_func_error_fails_the_create() {

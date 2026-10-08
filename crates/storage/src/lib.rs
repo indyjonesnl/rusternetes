@@ -558,7 +558,7 @@ pub struct ContinueToken {
 /// Shared by both detection paths — the explicit `is_revision_compacted` probe
 /// and the compaction error surfacing from the pinned read — so a client sees
 /// an identical response whichever one fires.
-fn compacted_continue_error(start_key: &str, rv: i64) -> Error {
+pub fn compacted_continue_error(start_key: &str, rv: i64) -> Error {
     Error::GoneWithContinue {
         message: format!(
             "continue token expired (resource version {} has been compacted)",

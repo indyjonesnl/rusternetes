@@ -817,6 +817,8 @@ impl RestStorage<CustomResource> for CustomResourceRest {
         let revision = rusternetes_storage::Storage::current_revision(&*self.store.storage)
             .await
             .unwrap_or(0);
+        crate::registry::generic::reject_compacted_continue(&*self.store.storage, list_options)
+            .await?;
         let mut items: Vec<CustomResource> =
             rusternetes_storage::Storage::list(&*self.store.storage, &prefix).await?;
         for item in &mut items {

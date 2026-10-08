@@ -1715,6 +1715,7 @@ impl<T: Object, S: Storage + Send + Sync + 'static> crate::registry::rest::RestS
         // Read the revision BEFORE the data, as `Storage::list_paginated`
         // does, so the token's pin is never newer than the page.
         let revision = self.storage.current_revision().await.unwrap_or(0);
+        reject_compacted_continue(&*self.storage, list_options).await?;
         let mut items: Vec<T> = self
             .storage
             .list(&prefix)
@@ -1734,6 +1735,35 @@ impl<T: Object, S: Storage + Send + Sync + 'static> crate::registry::rest::RestS
     }
 }
 
+/// A continue token pinned to a revision the backend has compacted is
+/// answered with the resumable 410, exactly as `Storage::list_paginated`
+/// does for a List: upstream `interpretListError` ->
+/// `handleCompactedErrorForPaging` (storage/etcd3/errors.go:66-89) returns a
+/// 410 whose `ListMeta.Continue` is a fresh `rv=-1` token for the same key.
+/// An `rv=-1` token (`INCONSISTENT_CONTINUE_RV`) reads at the latest revision
+/// and is never rejected (storage/interfaces.go `ValidateListOptions`).
+/// A malformed token is left for [`page_for_delete_collection`] to report.
+pub(crate) async fn reject_compacted_continue<S: Storage>(
+    storage: &S,
+    list_options: &std::collections::HashMap<String, String>,
+) -> Result<()> {
+    let Some(token) = list_options.get("continue").filter(|c| !c.is_empty()) else {
+        return Ok(());
+    };
+    let Ok(d) = rusternetes_storage::decode_default_token(token) else {
+        return Ok(());
+    };
+    if let Some(rv) = d.compacted_at.filter(|rv| *rv > 0) {
+        if storage.is_revision_compacted(rv).await.unwrap_or(false) {
+            return Err(rusternetes_storage::compacted_continue_error(
+                &d.start_key,
+                rv,
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// `storage.PrepareContinueToken` (apiserver/pkg/storage/continue.go:100-120)
 /// and the `limit`/`continue` part of `DeleteCollection`'s list loop
 /// (registry/generic/registry/store.go:1298-1301, :1343-1346, :1355).
@@ -1746,9 +1776,7 @@ impl<T: Object, S: Storage + Send + Sync + 'static> crate::registry::rest::RestS
 /// (continue.go:114-117) -- selectors make etcd's count inexact. A request
 /// without `limit` deletes everything after the token.
 ///
-/// Deliberate gap: the token's pinned revision is not read at, so a
-/// compacted token is not answered with the resumable 410 that
-/// `Storage::list_paginated` gives a List.
+/// The token's pinned revision is checked by [`reject_compacted_continue`].
 pub(crate) fn page_for_delete_collection<T: Object>(
     mut items: Vec<T>,
     list_options: &std::collections::HashMap<String, String>,
