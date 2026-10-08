@@ -12,6 +12,7 @@ pub mod endpoints;
 #[allow(dead_code)]
 pub mod flow_control;
 pub mod flow_control_queueset;
+pub mod flow_control_work_estimator;
 pub mod gnostic;
 pub mod handlers;
 pub use rusternetes_middleware as middleware;
