@@ -35,8 +35,9 @@
 //! - **`current_revision`/`is_revision_compacted`** are answered by the
 //!   api-server (a one-item LIST's `metadata.resourceVersion`, and a
 //!   `resourceVersionMatch=Exact` LIST's `Expired` status), the way a
-//!   client-go reflector learns both. `watch_from_revision` still ignores its
-//!   revision (see `watch_inner`).
+//!   client-go reflector learns both. `watch_from_revision` opens its own
+//!   upstream at the revision (see `watch_inner`); the shared stream tracks
+//!   bookmark revisions and resumes from them.
 
 use crate::{Storage, WatchEvent, WatchStream};
 use async_trait::async_trait;
@@ -955,9 +956,13 @@ impl ApiStorage {
     /// later subscribers join its broadcast. So the ~50 controller watch()
     /// calls collapse to one HTTP connection per resource type (#1138).
     ///
-    /// `rv` is intentionally ignored: a shared stream cannot honor a
-    /// per-subscriber resourceVersion, and controllers relist on (re)connect.
-    async fn watch_inner(&self, prefix: &str, _rv: Option<String>) -> Result<WatchStream> {
+    /// A shared stream cannot honor a per-subscriber resourceVersion, so a
+    /// caller that names one (`watch_from_revision`) gets its own upstream
+    /// opened at that revision ([`dedicated_watch`]) — the way a reflector's
+    /// `Watch` carries `ResourceVersion: r.LastSyncResourceVersion()`
+    /// (`client-go/tools/cache/reflector.go:526-527`). `watch()` (no revision)
+    /// joins the shared stream.
+    async fn watch_inner(&self, prefix: &str, rv: Option<String>) -> Result<WatchStream> {
         let (rt, rest) = parse_key(prefix)?;
         let Some((root, namespaced)) = self.try_resolve(&rt).await else {
             // Type not served — a stream that never yields, mirroring a watch on
@@ -966,6 +971,16 @@ impl ApiStorage {
             return Ok(futures::stream::pending().boxed());
         };
         let path = build_collection_for_prefix(&root, namespaced, &rt, &rest)?;
+
+        if let Some(rv) = rv {
+            return Ok(dedicated_watch(
+                self.client.clone(),
+                path,
+                rt,
+                namespaced,
+                rv,
+            ));
+        }
 
         // Get-or-create the shared upstream for this collection path.
         let rx = {
@@ -1009,12 +1024,116 @@ impl ApiStorage {
     }
 }
 
+/// `AllowWatchBookmarks: true` on every watch, as the reflector does
+/// (`reflector.go:534`): the server then sends BOOKMARK frames whose
+/// resourceVersion lets a restarted watch resume instead of relisting.
+const WATCH_BOOKMARKS_QUERY: &str = "?allowWatchBookmarks=true";
+
+/// The resourceVersion an event's object carries (`meta.GetResourceVersion()`
+/// in `watchHandler`, `reflector.go`). For a BOOKMARK this is the whole
+/// payload.
+fn event_resource_version(ev: &ClientWatchEvent<Value>) -> Option<String> {
+    let (ClientWatchEvent::Added(o)
+    | ClientWatchEvent::Modified(o)
+    | ClientWatchEvent::Deleted(o)
+    | ClientWatchEvent::Bookmark(o)) = ev;
+    o.get("metadata")?
+        .get("resourceVersion")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Re-key a client watch event into storage form. Bookmarks are progress
+/// markers, not resource deltas, so they map to nothing (their rv is consumed
+/// via [`event_resource_version`]).
+fn map_watch_event(rt: &str, namespaced: bool, ev: ClientWatchEvent<Value>) -> Option<WatchEvent> {
+    match ev {
+        ClientWatchEvent::Added(o) => storage_key_for(rt, namespaced, &o)
+            .ok()
+            .map(|k| WatchEvent::Added(k, o.to_string())),
+        ClientWatchEvent::Modified(o) => storage_key_for(rt, namespaced, &o)
+            .ok()
+            .map(|k| WatchEvent::Modified(k, o.to_string())),
+        ClientWatchEvent::Deleted(o) => storage_key_for(rt, namespaced, &o)
+            .ok()
+            .map(|k| WatchEvent::Deleted(k, o.to_string())),
+        ClientWatchEvent::Bookmark(_) => None,
+    }
+}
+
+/// Whether a watch error is the server's in-stream `ERROR` envelope carrying a
+/// 410 `Status` — `isExpiredError` (`reflector.go:1051-1058`:
+/// `IsResourceExpired(err) || IsGone(err)`). `parse_watch_line` renders the
+/// envelope as `watch ERROR envelope: <Status json>`.
+fn is_expired_watch_error(e: &anyhow::Error) -> bool {
+    let m = e.to_string();
+    let Some(body) = m.strip_prefix("watch ERROR envelope: ") else {
+        return false;
+    };
+    let Ok(status) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    status.get("code").and_then(Value::as_i64) == Some(410)
+        || matches!(
+            status.get("reason").and_then(Value::as_str),
+            Some("Expired" | "Gone")
+        )
+}
+
+/// A watch opened at `rv`, private to one caller (`watch_from_revision`).
+/// Events arrive after `rv`; a compacted `rv` surfaces as `Err(Error::Gone)`
+/// (the reflector's cue to relist), any other failure as `Err(Error::Network)`.
+fn dedicated_watch(
+    client: Arc<ApiClient>,
+    path: String,
+    rt: String,
+    namespaced: bool,
+    rv: String,
+) -> WatchStream {
+    let (out, rx) = tokio::sync::mpsc::channel::<Result<WatchEvent>>(SHARED_WATCH_BUFFER);
+    tokio::spawn(async move {
+        let url = format!("{path}{WATCH_BOOKMARKS_QUERY}");
+        let raw = match watch_stream::<Value>(&client, &url, Some(&rv)).await {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = out.send(Err(Error::Network(e.to_string()))).await;
+                return;
+            }
+        };
+        futures::pin_mut!(raw);
+        while let Some(ev) = raw.next().await {
+            let item = match ev {
+                Ok(ev) => match map_watch_event(&rt, namespaced, ev) {
+                    Some(ev) => Ok(ev),
+                    None => continue,
+                },
+                Err(e) if is_expired_watch_error(&e) => Err(Error::Gone(e.to_string())),
+                Err(e) => Err(Error::Network(e.to_string())),
+            };
+            let failed = item.is_err();
+            if out.send(item).await.is_err() || failed {
+                return;
+            }
+        }
+    });
+    futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|i| (i, rx)) }).boxed()
+}
+
 /// The single upstream task behind a shared watch: read the api-server's
 /// `?watch=true` stream for `path`, re-key each event into `/registry/...`
-/// form, and broadcast it to all subscribers. Exits (and deregisters itself)
-/// when the upstream closes/errors or when no subscribers remain — at which
-/// point any surviving/late subscriber sees the channel close and reconnects,
-/// recreating a fresh upstream.
+/// form, and broadcast it to all subscribers.
+///
+/// Resume mechanism ported from the reflector: every event (BOOKMARK included)
+/// advances `lastSyncResourceVersion` (`watchHandler`, `reflector.go:962-970`:
+/// `case watch.Bookmark` then `setLastSyncResourceVersion(resourceVersion)`),
+/// and a watch that ends without an expiry is re-established from it
+/// (`reflector.go:526-527`) with the subscribers none the wiser. A 410
+/// (`isExpiredError`, `reflector.go:561`) ends the task so subscribers relist.
+/// A connection that ends having made no progress also ends it (no hot loop).
+///
+/// Exits (and deregisters itself) when the upstream cannot be resumed or when
+/// no subscribers remain — at which point any surviving/late subscriber sees
+/// the channel close and reconnects, recreating a fresh upstream.
 async fn shared_upstream(
     client: Arc<ApiClient>,
     path: String,
@@ -1023,37 +1142,39 @@ async fn shared_upstream(
     tx: broadcast::Sender<Arc<WatchEvent>>,
     registry: SharedWatches,
 ) {
-    let raw = match watch_stream::<Value>(&client, &path, None).await {
-        Ok(s) => s,
-        Err(_) => {
+    let url = format!("{path}{WATCH_BOOKMARKS_QUERY}");
+    let mut last_rv: Option<String> = None;
+    'connect: loop {
+        let raw = match watch_stream::<Value>(&client, &url, last_rv.as_deref()).await {
+            Ok(s) => s,
             // Connect failed; drop the registration so the next watch() retries.
-            remove_shared(&registry, &path, &tx).await;
-            return;
-        }
-    };
-    futures::pin_mut!(raw);
-    while let Some(ev) = raw.next().await {
-        let mapped: Option<WatchEvent> = match ev {
-            Ok(ClientWatchEvent::Added(o)) => storage_key_for(&rt, namespaced, &o)
-                .ok()
-                .map(|k| WatchEvent::Added(k, o.to_string())),
-            Ok(ClientWatchEvent::Modified(o)) => storage_key_for(&rt, namespaced, &o)
-                .ok()
-                .map(|k| WatchEvent::Modified(k, o.to_string())),
-            Ok(ClientWatchEvent::Deleted(o)) => storage_key_for(&rt, namespaced, &o)
-                .ok()
-                .map(|k| WatchEvent::Deleted(k, o.to_string())),
-            // Bookmarks are watch-progress markers, not resource deltas.
-            Ok(ClientWatchEvent::Bookmark(_)) => None,
-            // Upstream error → end; subscribers see close and reconnect.
             Err(_) => break,
         };
-        if let Some(ev) = mapped {
-            // `send` errors only when there are zero receivers — every
-            // controller has dropped this watch, so stop holding the connection.
-            if tx.send(Arc::new(ev)).is_err() {
-                break;
+        let started_at = last_rv.clone();
+        futures::pin_mut!(raw);
+        while let Some(ev) = raw.next().await {
+            let ev = match ev {
+                Ok(ev) => ev,
+                // Expired -> subscribers must relist. Any other error: resume
+                // from the last observed rv if we have one.
+                Err(e) if is_expired_watch_error(&e) => break 'connect,
+                Err(_) => break,
+            };
+            if let Some(rv) = event_resource_version(&ev) {
+                last_rv = Some(rv);
             }
+            if let Some(ev) = map_watch_event(&rt, namespaced, ev) {
+                // `send` errors only when there are zero receivers — every
+                // controller has dropped this watch, so stop holding the
+                // connection.
+                if tx.send(Arc::new(ev)).is_err() {
+                    break 'connect;
+                }
+            }
+        }
+        // Resume only if this connection advanced the rv.
+        if last_rv.is_none() || last_rv == started_at {
+            break;
         }
     }
     remove_shared(&registry, &path, &tx).await;
