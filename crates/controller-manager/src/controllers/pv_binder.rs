@@ -4341,6 +4341,40 @@ mod tests {
             .is_empty());
     }
 
+    /// findDeletablePlugin (pv_controller.go:1977-1980): a CSI volume source
+    /// (no provisioned-by annotation) is deleted by the external-provisioner,
+    /// never by this controller: stays Released, no event, PV kept.
+    #[tokio::test]
+    async fn delete_of_csi_source_volume_is_left_to_external_deleter() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = PVBinderController::new(storage.clone());
+        let mut pv = reclaim_pv(PersistentVolumeReclaimPolicy::Delete, None, false);
+        pv.spec.csi = Some(rusternetes_common::resources::volume::CSIVolumeSource {
+            driver: "ebs.csi.aws.com".into(),
+            volume_handle: Some("vol-1".into()),
+            ..Default::default()
+        });
+        put_pv(&storage, &pv).await;
+        c.sync_volumes(&WorkQueue::new()).await.unwrap();
+        let got = get_pv(&storage, "pv").await.expect("PV must survive");
+        assert_eq!(got.status.unwrap().phase, PersistentVolumePhase::Released);
+        assert!(reason_events(&storage, "VolumeFailedDelete")
+            .await
+            .is_empty());
+    }
+
+    /// findDeletablePlugin (pv_controller.go:1973-1976): a `migrated-to` PV
+    /// is left to the external deleter too.
+    #[test]
+    fn find_deletable_plugin_migrated_to_is_external() {
+        let mut pv = reclaim_pv(PersistentVolumeReclaimPolicy::Delete, None, true);
+        pv.metadata
+            .annotations
+            .get_or_insert_with(Default::default)
+            .insert(ANN_MIGRATED_TO.to_string(), "ebs.csi.aws.com".into());
+        assert_eq!(find_deletable_plugin(&pv), Ok(false));
+    }
+
     /// An unknown `kubernetes.io/` provisioner is an error, not external
     /// (pv_controller.go:1962-1966).
     #[tokio::test]
