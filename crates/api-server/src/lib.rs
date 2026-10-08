@@ -1,5 +1,6 @@
 pub mod admission;
 pub mod audit;
+pub mod authorizer;
 pub use rusternetes_admission_webhook as admission_webhook;
 pub mod apiserver_identity;
 pub mod bootstrap;
@@ -42,7 +43,6 @@ pub mod watch_cache;
 
 use axum_server::tls_rustls::RustlsConfig;
 use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::RBACAuthorizer;
 use rusternetes_common::observability::MetricsRegistry;
 use rusternetes_common::tls::TlsConfig;
 use rusternetes_storage::StorageBackend;
@@ -237,17 +237,10 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
             .with_service_account_options(&config.service_account)?,
     );
 
-    let authorizer: Arc<dyn rusternetes_common::authz::Authorizer> = if config.skip_auth {
+    if config.skip_auth {
         warn!("Authentication and authorization disabled - insecure mode");
-        Arc::new(rusternetes_common::authz::AlwaysAllowAuthorizer)
-    } else {
-        info!("Initializing RBAC Authorizer");
-        // `system:masters` superuser first, as `newForConfig`
-        // (`pkg/kubeapiserver/authorizer/reload.go:97-99`) does (#1576).
-        let rbac: Arc<dyn rusternetes_common::authz::Authorizer> =
-            Arc::new(RBACAuthorizer::new(storage.clone()));
-        Arc::new(rusternetes_common::authz::superuser_then(vec![rbac]))
-    };
+    }
+    let authorizer = authorizer::build_authorizer(storage.clone(), config.skip_auth);
 
     let metrics = Arc::new(MetricsRegistry::new().with_api_server_metrics()?);
 
