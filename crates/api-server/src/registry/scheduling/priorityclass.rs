@@ -17,8 +17,9 @@ use rusternetes_storage::StorageBackend;
 
 use crate::registry::generic::{CreateOptions, Deleted, Store, UpdateOptions};
 use crate::registry::rest::{
-    GroupResource, NamespaceScopedStrategy, RequestContext, RestCreateStrategy, RestDeleteStrategy,
-    RestStorage, RestUpdateStrategy, UpdatedObjectInfo, ValidateObject, ValidateObjectUpdate,
+    DeletedCollection, GroupResource, NamespaceScopedStrategy, RequestContext, RestCreateStrategy,
+    RestDeleteStrategy, RestStorage, RestUpdateStrategy, UpdatedObjectInfo, ValidateObject,
+    ValidateObjectUpdate,
 };
 
 /// `SystemPriorityClassNames()` (pkg/apis/scheduling/v1/helpers.go:56-63),
@@ -169,7 +170,7 @@ impl RestStorage<PriorityClass> for PriorityClassRest {
         delete_validation: Option<&dyn ValidateObject<PriorityClass>>,
         options: &DeleteOptions,
         list_options: &HashMap<String, String>,
-    ) -> Result<Vec<PriorityClass>> {
+    ) -> Result<DeletedCollection<PriorityClass>> {
         RestStorage::delete_collection(&self.store, ctx, delete_validation, options, list_options)
             .await
     }
