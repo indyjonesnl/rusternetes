@@ -10,16 +10,19 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use rusternetes_common::authz::Authorizer;
+use rusternetes_common::resources::mutating_admission_policy::PatchType;
 use rusternetes_common::resources::MutatingAdmissionPolicy;
-use rusternetes_common::validation::field::{ErrorList, Path};
+use rusternetes_common::validation::field::{Error as FieldError, ErrorList, Path};
 use rusternetes_common::validation::mutating_admission_policy::{
-    set_defaults_mutating_admission_policy, validate_mutating_admission_policy,
+    ignore_mutating_admission_policy_match_conditions, set_defaults_mutating_admission_policy,
+    validate_mutating_admission_policy,
 };
 use rusternetes_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
 use rusternetes_common::{Error, Result};
 use rusternetes_storage::StorageBackend;
 
 use super::authz::authorize_mutating_param_kind;
+use super::webhookconfiguration::parse_failure;
 use crate::registry::generic::store::{
     BeginCreate, BeginUpdate, CreateOptions, Finish, UpdateOptions,
 };
@@ -53,6 +56,79 @@ fn validate(obj: &MutatingAdmissionPolicy) -> ErrorList {
     errs
 }
 
+/// One CEL compile, as `convertCELErrorToValidationError`
+/// (validation.go:1073-1085) reports it: `field.Invalid` carrying the
+/// expression, under `fld_path`.
+fn compile_error(expression: &str, fld_path: &Path) -> Option<FieldError> {
+    parse_failure(expression)
+        .map(|detail| FieldError::invalid(fld_path, expression.to_string(), detail))
+}
+
+/// The CEL compile half of `validateMutatingAdmissionPolicySpec`
+/// (validation.go:1372-1423): `matchConditions` unless `ignore_match_conditions`
+/// (`validateMatchCondition`, :984-997), each `variables[i].expression`
+/// (`validateVariable`, :999-1032) and each mutation's `applyConfiguration` /
+/// `jsonPatch` expression (`validateApplyConfiguration`, `validateJSONPatch`,
+/// :1458-1498). A blank expression is `Required`, already reported by the
+/// shape rules, and is not compiled.
+///
+/// Upstream compiles against the typed `mutation` environment
+/// (`Object`, `oldObject`, `params`, `variables`, `JSONPatch`, `Object{}`
+/// initializers); there is no such environment here, so this reuses the
+/// untyped parse of the webhook `matchConditions` compile (`parse_failure`) and
+/// catches syntax errors only. The `StoredExpressions` environment selected
+/// by `preexistingExpressions` therefore makes no difference.
+fn compile_errors(obj: &MutatingAdmissionPolicy, ignore_match_conditions: bool) -> ErrorList {
+    let mut errs = ErrorList::new();
+    let Some(spec) = &obj.spec else {
+        return errs;
+    };
+    let spec_path = Path::new("spec");
+    if !ignore_match_conditions {
+        for (i, c) in spec.match_conditions.iter().flatten().enumerate() {
+            let expression = c.expression.trim();
+            if !expression.is_empty() {
+                let path = spec_path
+                    .child("matchConditions")
+                    .index(i)
+                    .child("expression");
+                errs.extend(compile_error(expression, &path));
+            }
+        }
+    }
+    for (i, v) in spec.variables.iter().flatten().enumerate() {
+        if !v.expression.trim().is_empty() {
+            let path = spec_path.child("variables").index(i).child("expression");
+            errs.extend(compile_error(&v.expression, &path));
+        }
+    }
+    for (i, m) in spec.mutations.iter().flatten().enumerate() {
+        let path = spec_path.child("mutations").index(i);
+        // `validateMutation` (:1425-1456) compiles only the expression that
+        // `patchType` selects.
+        let (expression, child) = match m.patch_type {
+            Some(PatchType::JsonPatch) => {
+                (m.json_patch.as_ref().map(|p| &p.expression), "jsonPatch")
+            }
+            Some(PatchType::ApplyConfiguration) => (
+                m.apply_configuration.as_ref().map(|a| &a.expression),
+                "applyConfiguration",
+            ),
+            _ => (None, ""),
+        };
+        if let Some(expression) = expression {
+            let trimmed = expression.trim();
+            if !trimmed.is_empty() {
+                errs.extend(compile_error(
+                    trimmed,
+                    &path.child(child).child("expression"),
+                ));
+            }
+        }
+    }
+    errs
+}
+
 /// `mutatingAdmissionPolicyStrategy` (strategy.go:34-39).
 pub struct Strategy;
 
@@ -72,7 +148,9 @@ impl RestCreateStrategy<MutatingAdmissionPolicy> for Strategy {
     /// `Validate` (strategy.go:76-85) minus the `paramKind` authorization,
     /// which is [`ParamKindAuthz`].
     fn validate(&self, _ctx: &RequestContext, obj: &MutatingAdmissionPolicy) -> ErrorList {
-        validate(obj)
+        let mut errs = validate(obj);
+        errs.extend(compile_errors(obj, false));
+        errs
     }
 }
 
@@ -95,16 +173,21 @@ impl RestUpdateStrategy<MutatingAdmissionPolicy> for Strategy {
         }
     }
 
-    /// `ValidateMutatingAdmissionPolicyUpdate` (validation.go:1349-1354). The
-    /// `ignoreMatchConditions` / `preexistingExpressions` options only matter
-    /// to the CEL compile, which is not modelled (see [`super`]).
+    /// `ValidateMutatingAdmissionPolicyUpdate` (validation.go:1349-1354):
+    /// unchanged `matchConditions` / `paramKind` are not compiled again
+    /// (`ignoreMutatingAdmissionPolicyMatchConditions`, :630-638).
     fn validate_update(
         &self,
         _ctx: &RequestContext,
         obj: &MutatingAdmissionPolicy,
-        _old: &MutatingAdmissionPolicy,
+        old: &MutatingAdmissionPolicy,
     ) -> ErrorList {
-        validate(obj)
+        let mut errs = validate(obj);
+        errs.extend(compile_errors(
+            obj,
+            ignore_mutating_admission_policy_match_conditions(obj, old),
+        ));
+        errs
     }
 
     /// strategy.go:120-122.

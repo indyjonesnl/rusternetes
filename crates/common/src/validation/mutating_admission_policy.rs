@@ -8,10 +8,12 @@
 //! (`:1372`), `validateMutation` (`:1425`),
 //! `validateMutatingAdmissionPolicyBindingSpec` (`:1513`) and the
 //! "DELETE is not mutable" operation check (`supportedMutatingOperations`,
-//! `:521`). Compiling the `applyConfiguration` / `jsonPatch` / variable /
-//! matchCondition expressions (`validateApplyConfiguration`, `validateJSONPatch`,
-//! `:1458-1498`) needs the mutating CEL environment and is not modelled here;
-//! only the `Required` rule on a blank expression that precedes the compile is.
+//! `:521`). The parse of the expressions is the registry strategy's
+//! (`registry::admissionregistration::mutatingadmissionpolicy`); the typed
+//! mutating CEL environment is not modelled (#2834), so only the `Required`
+//! rule on a blank expression that precedes the compile lives here.
+
+use std::collections::HashSet;
 
 use crate::resources::mutating_admission_policy::{
     MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding, MutatingAdmissionPolicyBindingSpec,
@@ -60,6 +62,58 @@ pub fn set_defaults_mutating_admission_policy_binding(
     {
         set_defaults_match_resources(match_resources);
     }
+}
+
+/// `ignoreMutatingAdmissionPolicyMatchConditions` (`validation.go:630-638`):
+/// true when no update could invalidate a previously-valid match condition,
+/// i.e. `paramKind` and `matchConditions` are unchanged
+/// (`equality.Semantic.DeepEqual`, under which nil and empty lists are equal).
+pub fn ignore_mutating_admission_policy_match_conditions(
+    new: &MutatingAdmissionPolicy,
+    old: &MutatingAdmissionPolicy,
+) -> bool {
+    let new = new.spec.clone().unwrap_or_default();
+    let old = old.spec.clone().unwrap_or_default();
+    new.param_kind == old.param_kind
+        && new.match_conditions.unwrap_or_default() == old.match_conditions.unwrap_or_default()
+}
+
+/// The expressions an old policy already stores, which an update compiles
+/// against the `StoredExpressions` CEL environment rather than
+/// `NewExpressions` (`preexistingExpressions`, `validation.go:326`).
+#[derive(Debug, Default, PartialEq)]
+pub struct PreexistingExpressions {
+    pub match_condition_expressions: HashSet<String>,
+    pub apply_configuration_expressions: HashSet<String>,
+    pub json_patch_expressions: HashSet<String>,
+}
+
+/// `findMutatingPolicyPreexistingExpressions` (`validation.go:326-340`).
+pub fn find_mutating_policy_preexisting_expressions(
+    policy: &MutatingAdmissionPolicy,
+) -> PreexistingExpressions {
+    let mut preexisting = PreexistingExpressions::default();
+    let Some(spec) = &policy.spec else {
+        return preexisting;
+    };
+    for mc in spec.match_conditions.as_deref().unwrap_or_default() {
+        preexisting
+            .match_condition_expressions
+            .insert(mc.expression.clone());
+    }
+    for m in spec.mutations.as_deref().unwrap_or_default() {
+        if let Some(a) = &m.apply_configuration {
+            preexisting
+                .apply_configuration_expressions
+                .insert(a.expression.clone());
+        }
+        if let Some(j) = &m.json_patch {
+            preexisting
+                .json_patch_expressions
+                .insert(j.expression.clone());
+        }
+    }
+    preexisting
 }
 
 /// `ValidateMutatingAdmissionPolicy` (`validation.go:1362`) minus ObjectMeta,
@@ -286,4 +340,62 @@ fn validate_binding_spec(spec: &MutatingAdmissionPolicyBindingSpec, fld_path: &P
         ));
     }
     errs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn policy(spec: serde_json::Value) -> MutatingAdmissionPolicy {
+        serde_json::from_value(json!({"metadata": {"name": "p"}, "spec": spec})).unwrap()
+    }
+
+    /// `ignoreMutatingAdmissionPolicyMatchConditions` (validation.go:630-638).
+    #[test]
+    fn ignore_match_conditions_only_when_param_kind_and_conditions_unchanged() {
+        let conds = json!([{"name": "c", "expression": "true"}]);
+        let kind = json!({"kind": "K", "apiVersion": "v1"});
+        let old = policy(json!({"matchConditions": conds, "paramKind": kind}));
+        assert!(ignore_mutating_admission_policy_match_conditions(
+            &old, &old
+        ));
+        let other = policy(
+            json!({"matchConditions": [{"name": "c", "expression": "false"}], "paramKind": kind}),
+        );
+        assert!(!ignore_mutating_admission_policy_match_conditions(
+            &other, &old
+        ));
+        let no_kind = policy(json!({"matchConditions": conds}));
+        assert!(!ignore_mutating_admission_policy_match_conditions(
+            &no_kind, &old
+        ));
+        // Semantic.DeepEqual: nil and empty are equal.
+        assert!(ignore_mutating_admission_policy_match_conditions(
+            &policy(json!({"matchConditions": []})),
+            &policy(json!({}))
+        ));
+    }
+
+    /// `findMutatingPolicyPreexistingExpressions` (validation.go:326-340).
+    #[test]
+    fn preexisting_expressions_are_collected_from_the_old_policy() {
+        let old = policy(json!({
+            "matchConditions": [{"name": "c", "expression": "m"}],
+            "mutations": [
+                {"patchType": "ApplyConfiguration", "applyConfiguration": {"expression": "a"}},
+                {"patchType": "JSONPatch", "jsonPatch": {"expression": "j"}}
+            ]
+        }));
+        let got = find_mutating_policy_preexisting_expressions(&old);
+        assert_eq!(
+            got.match_condition_expressions,
+            HashSet::from(["m".to_string()])
+        );
+        assert_eq!(
+            got.apply_configuration_expressions,
+            HashSet::from(["a".to_string()])
+        );
+        assert_eq!(got.json_patch_expressions, HashSet::from(["j".to_string()]));
+    }
 }

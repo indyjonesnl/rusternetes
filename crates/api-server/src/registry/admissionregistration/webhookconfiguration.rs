@@ -42,7 +42,20 @@ fn is_missing_declaration(err: &str) -> bool {
 /// no typed environment, so this compiles with the plain `cel` crate and
 /// tolerates the errors that come from the missing declarations rather than
 /// from the expression itself.
-fn compile_failure(expression: &str) -> Option<String> {
+pub(super) fn compile_failure(expression: &str) -> Option<String> {
+    compile_failure_in(expression, true)
+}
+
+/// As [`compile_failure`], but only parses. The MutatingAdmissionPolicy
+/// expressions use `Object{...}` / `JSONPatch{...}` struct initializers, which
+/// the `cel` crate parses but panics on when executed ("Support structs!"),
+/// so the execute step that catches webhook match-condition errors cannot be
+/// applied to them.
+pub(super) fn parse_failure(expression: &str) -> Option<String> {
+    compile_failure_in(expression, false)
+}
+
+fn compile_failure_in(expression: &str, execute: bool) -> Option<String> {
     // The antlr4rust parser panics on some invalid expressions instead of
     // returning `Err`.
     let source = expression.to_string();
@@ -63,6 +76,10 @@ fn compile_failure(expression: &str) -> Option<String> {
             ))
         }
     };
+
+    if !execute {
+        return None;
+    }
 
     // The CEL crate's parser accepts some expressions Kubernetes rejects.
     // Executing with an empty context catches the genuinely invalid ones.
