@@ -4,9 +4,8 @@
 //! the `CSINode` object (`spec.drivers[]`: node id, topology keys, allocatable
 //! count).
 //!
-//! NOT PORTED (deliberate, tracked in the follow-up issues): the CSI-migration
-//! annotation (`setMigrationAnnotation`, `migratedPlugins`) and
-//! `UpdateCSIDriver`.
+//! Also ported: the CSI-migration annotation (`setMigrationAnnotation`,
+//! `migratedPlugins`) and `UpdateCSIDriver`.
 
 use async_trait::async_trait;
 use rusternetes_common::resources::{
@@ -20,6 +19,72 @@ use std::sync::Arc;
 
 /// `annotationKeyNodeID` (`nodeinfomanager.go:49`).
 pub const ANNOTATION_KEY_NODE_ID: &str = "csi.volume.kubernetes.io/nodeid";
+
+/// `v1.MigratedPluginsAnnotationKey`
+/// (`staging/src/k8s.io/api/core/v1/annotation_key_constants.go:132`).
+pub const MIGRATED_PLUGINS_ANNOTATION_KEY: &str = "storage.alpha.kubernetes.io/migrated-plugins";
+
+/// `nodeInfoManager.migratedPlugins` (`nodeinfomanager.go:68`): in-tree plugin
+/// name -> "is it served by CSI on this node".
+pub type MigratedPlugins = BTreeMap<String, fn() -> bool>;
+
+/// The map `csiPlugin.Init` builds (`csi_plugin.go:325-347`). The in-tree
+/// plugins all have a CSI translation in 1.35; `CSIMigrationPortworx` is GA and
+/// `LockToDefault: true` (`pkg/features/kube_features.go:1178`), so its closure
+/// is constant `true`.
+pub fn default_migrated_plugins() -> MigratedPlugins {
+    // csitranslationplugins.*PluginName
+    // (`staging/src/k8s.io/csi-translation-lib/plugins/`: gce_pd.go:35,
+    // aws_ebs.go:37, openstack_cinder.go:35, azure_disk.go:36,
+    // azure_file.go:34, vsphere_volume.go:33, portworx.go:30).
+    [
+        "kubernetes.io/gce-pd",
+        "kubernetes.io/aws-ebs",
+        "kubernetes.io/cinder",
+        "kubernetes.io/azure-disk",
+        "kubernetes.io/azure-file",
+        "kubernetes.io/vsphere-volume",
+        "kubernetes.io/portworx-volume",
+    ]
+    .into_iter()
+    .map(|n| (n.to_string(), (|| true) as fn() -> bool))
+    .collect()
+}
+
+/// `setMigrationAnnotation` (`nodeinfomanager.go:544-583`): make the CSINode's
+/// migrated-plugins annotation list exactly the plugins whose func reports
+/// true. Returns whether the annotation changed. A `None` map is a no-op; an
+/// emptied list deletes the key but leaves the (possibly empty) map behind.
+pub fn set_migration_annotation(
+    migrated_plugins: Option<&MigratedPlugins>,
+    node_info: &mut CSINode,
+) -> bool {
+    let Some(migrated_plugins) = migrated_plugins else {
+        return false;
+    };
+    let mut annotations = node_info.metadata.annotations.clone().unwrap_or_default();
+    let old: BTreeSet<&str> = match annotations.get(MIGRATED_PLUGINS_ANNOTATION_KEY) {
+        Some(v) if !v.is_empty() => v.split(',').collect(),
+        _ => BTreeSet::new(),
+    };
+    let new: BTreeSet<&str> = migrated_plugins
+        .iter()
+        .filter(|(_, f)| f())
+        .map(|(n, _)| n.as_str())
+        .collect();
+    if old == new {
+        return false;
+    }
+    // `sets.List` is sorted.
+    let nas = new.into_iter().collect::<Vec<_>>().join(",");
+    if nas.is_empty() {
+        annotations.remove(MIGRATED_PLUGINS_ANNOTATION_KEY);
+    } else {
+        annotations.insert(MIGRATED_PLUGINS_ANNOTATION_KEY.to_string(), nas);
+    }
+    node_info.metadata.annotations = Some(annotations);
+    true
+}
 
 /// `updateBackoff` (`nodeinfomanager.go:54-59`): 4 steps, 10ms, factor 5.
 /// (Upstream also adds jitter 0.1; irrelevant to the contract.)
@@ -45,6 +110,16 @@ pub trait NodeInfoInstaller: Send + Sync {
         topology: &HashMap<String, String>,
     ) -> Result<(), String>;
 
+    /// `UpdateCSIDriver` (`nodeinfomanager.go:138-144`): refresh the CSINode
+    /// entry only.
+    async fn update_csi_driver(
+        &self,
+        driver_name: &str,
+        driver_node_id: &str,
+        max_attach_limit: i64,
+        topology: &HashMap<String, String>,
+    ) -> Result<(), String>;
+
     /// `UninstallCSIDriver`.
     async fn uninstall_csi_driver(&self, driver_name: &str) -> Result<(), String>;
 }
@@ -58,6 +133,8 @@ pub struct NodeInfoManager<S: Storage> {
     storage: Arc<S>,
     /// `nim.lock`.
     lock: tokio::sync::Mutex<()>,
+    /// `nim.migratedPlugins`; `None` is upstream's nil map.
+    migrated_plugins: Option<MigratedPlugins>,
 }
 
 impl<S: Storage> NodeInfoManager<S> {
@@ -68,7 +145,14 @@ impl<S: Storage> NodeInfoManager<S> {
             node_uid: std::sync::Mutex::new(String::new()),
             storage,
             lock: tokio::sync::Mutex::new(()),
+            migrated_plugins: None,
         }
+    }
+
+    /// The `migratedPlugins` argument of `NewNodeInfoManager`.
+    pub fn with_migrated_plugins(mut self, migrated_plugins: MigratedPlugins) -> Self {
+        self.migrated_plugins = Some(migrated_plugins);
+        self
     }
 
     fn node_key(&self) -> String {
@@ -111,9 +195,9 @@ impl<S: Storage> NodeInfoManager<S> {
     }
 
     /// `InitializeCSINodeWithAnnotation` / `tryInitializeCSINodeWithAnnotation`
-    /// (`nodeinfomanager.go:413-467`), minus the CSI-migration annotation: read
-    /// the Node's UID into `nim.nodeID`, then create the CSINode if missing or
-    /// make sure it is owned by this Node.
+    /// (`nodeinfomanager.go:413-467`): read the Node's UID into `nim.nodeID`,
+    /// then create the CSINode if missing, or make sure it is owned by this
+    /// Node and carries the current migrated-plugins annotation.
     pub async fn initialize_csi_node(&self) -> Result<(), String> {
         self.exponential_backoff("CSINode annotation", || async {
             let _g = self.lock.lock().await;
@@ -128,7 +212,19 @@ impl<S: Storage> NodeInfoManager<S> {
                     self.create_csi_node().await.map(|_| ())
                 }
                 Err(e) => Err(e.to_string()),
-                Ok(info) => self.ensure_node_owns_csi_node(&info).await,
+                Ok(mut info) => {
+                    self.ensure_node_owns_csi_node(&info).await?;
+                    // `nodeinfomanager.go:457-462`
+                    if set_migration_annotation(self.migrated_plugins.as_ref(), &mut info) {
+                        self.storage
+                            .update(&self.csinode_key(), &info)
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    } else {
+                        Ok(())
+                    }
+                }
             }
         })
         .await
@@ -201,11 +297,10 @@ impl<S: Storage> NodeInfoManager<S> {
         ))
     }
 
-    /// `CreateCSINode` (`nodeinfomanager.go:505-532`), minus the migration
-    /// annotation: a CSINode named after the node, owned by it. Like upstream
+    /// `CreateCSINode` (`nodeinfomanager.go:505-532`): a CSINode named after the node, owned by it. Like upstream
     /// it takes no lock (its callers hold `nim.lock`).
     pub async fn create_csi_node(&self) -> Result<CSINode, String> {
-        let info = CSINode {
+        let mut info = CSINode {
             type_meta: TypeMeta {
                 kind: "CSINode".into(),
                 api_version: "storage.k8s.io/v1".into(),
@@ -225,6 +320,7 @@ impl<S: Storage> NodeInfoManager<S> {
             },
             spec: CSINodeSpec { drivers: vec![] },
         };
+        set_migration_annotation(self.migrated_plugins.as_ref(), &mut info);
         self.storage
             .create(&self.csinode_key(), &info)
             .await
@@ -378,7 +474,11 @@ impl<S: Storage> NodeInfoManager<S> {
                 new_specs.push(d.clone());
             }
         }
-        if !spec_modified {
+        // `nodeinfomanager.go:624-628`: the annotation is set before deciding
+        // whether anything needs writing.
+        let annotation_modified =
+            set_migration_annotation(self.migrated_plugins.as_ref(), &mut info);
+        if !spec_modified && !annotation_modified {
             return Ok(());
         }
 
@@ -605,6 +705,19 @@ impl<S: Storage + 'static> NodeInfoInstaller for NodeInfoManager<S> {
         .await
         .map_err(|e| format!("error updating Node object with CSI driver node info: {e}"))?;
 
+        self.update_csi_node(driver_name, driver_node_id, max_attach_limit, topology)
+            .await
+            .map_err(|e| format!("error updating CSINode object with CSI driver node info: {e}"))
+    }
+
+    /// `UpdateCSIDriver` (`nodeinfomanager.go:138-144`).
+    async fn update_csi_driver(
+        &self,
+        driver_name: &str,
+        driver_node_id: &str,
+        max_attach_limit: i64,
+        topology: &HashMap<String, String>,
+    ) -> Result<(), String> {
         self.update_csi_node(driver_name, driver_node_id, max_attach_limit, topology)
             .await
             .map_err(|e| format!("error updating CSINode object with CSI driver node info: {e}"))
@@ -1203,5 +1316,220 @@ mod tests {
         let k = csi_attach_limit_key(long);
         assert_eq!(k.len(), "attachable-volumes-csi-".len() + 23 + 16, "{k}");
         assert!(k.starts_with("attachable-volumes-csi-very-long-csi-driver-"));
+    }
+
+    // ---- CSI migration annotation (`setMigrationAnnotation`) ----
+
+    fn migrated(entries: &[(&str, bool)]) -> MigratedPlugins {
+        let mut m = MigratedPlugins::new();
+        for (name, on) in entries {
+            m.insert(
+                name.to_string(),
+                if *on {
+                    (|| true) as fn() -> bool
+                } else {
+                    (|| false) as fn() -> bool
+                },
+            );
+        }
+        m
+    }
+
+    fn csi_node_with_annotations(a: &[(&str, &str)]) -> CSINode {
+        let mut c = csi_node(vec![], "");
+        if !a.is_empty() {
+            c.metadata.annotations = Some(
+                a.iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            );
+        }
+        c
+    }
+
+    fn annotations_of(c: &CSINode) -> Option<Vec<(String, String)>> {
+        c.metadata.annotations.as_ref().map(|m| {
+            let mut v: Vec<_> = m.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            v.sort();
+            v
+        })
+    }
+
+    /// `TestSetMigrationAnnotation` (nodeinfomanager_test.go:853-998), every
+    /// row, including the `Annotations: map[string]string{}` left behind by
+    /// "remove plugin".
+    #[test]
+    fn set_migration_annotation_table() {
+        let key = MIGRATED_PLUGINS_ANNOTATION_KEY;
+        let kv = |k: &str, v: &str| (k.to_string(), v.to_string());
+        struct Case {
+            name: &'static str,
+            plugins: Option<MigratedPlugins>,
+            existing: Vec<(&'static str, &'static str)>,
+            expected: Option<Vec<(String, String)>>,
+            modified: bool,
+        }
+        let cases = vec![
+            Case {
+                name: "nil migrated plugins",
+                plugins: None,
+                existing: vec![],
+                expected: None,
+                modified: false,
+            },
+            Case {
+                name: "one modified plugin",
+                plugins: Some(migrated(&[("test", true)])),
+                existing: vec![],
+                expected: Some(vec![kv(key, "test")]),
+                modified: true,
+            },
+            Case {
+                name: "existing plugin",
+                plugins: Some(migrated(&[("test", true)])),
+                existing: vec![(key, "test")],
+                expected: Some(vec![kv(key, "test")]),
+                modified: false,
+            },
+            Case {
+                name: "remove plugin",
+                plugins: Some(migrated(&[])),
+                existing: vec![(key, "test")],
+                expected: Some(vec![]),
+                modified: true,
+            },
+            Case {
+                name: "one modified plugin, other annotations stable",
+                plugins: Some(migrated(&[("test", true)])),
+                existing: vec![("other", "annotation")],
+                expected: Some(vec![kv("other", "annotation"), kv(key, "test")]),
+                modified: true,
+            },
+            Case {
+                name: "multiple plugins modified, other annotations stable",
+                plugins: Some(migrated(&[("test", true), ("foo", false)])),
+                existing: vec![("other", "annotation"), (key, "foo")],
+                expected: Some(vec![kv("other", "annotation"), kv(key, "test")]),
+                modified: true,
+            },
+            Case {
+                name: "multiple plugins added, other annotations stable",
+                plugins: Some(migrated(&[("test", true), ("foo", true)])),
+                existing: vec![("other", "annotation")],
+                expected: Some(vec![kv("other", "annotation"), kv(key, "foo,test")]),
+                modified: true,
+            },
+        ];
+        for c in cases {
+            let mut node = csi_node_with_annotations(&c.existing);
+            let modified = set_migration_annotation(c.plugins.as_ref(), &mut node);
+            assert_eq!(modified, c.modified, "{}: modified", c.name);
+            assert_eq!(annotations_of(&node), c.expected, "{}: annotations", c.name);
+        }
+    }
+
+    /// The 1.35 map built in `csiPlugin.Init` (`csi_plugin.go:325-347`): every
+    /// in-tree plugin that still has a CSI translation is migrated.
+    #[test]
+    fn default_migrated_plugins_lists_every_in_tree_plugin() {
+        let mut node = csi_node_with_annotations(&[]);
+        assert!(set_migration_annotation(
+            Some(&default_migrated_plugins()),
+            &mut node
+        ));
+        assert_eq!(
+            node.metadata.annotations.unwrap()[MIGRATED_PLUGINS_ANNOTATION_KEY],
+            "kubernetes.io/aws-ebs,kubernetes.io/azure-disk,kubernetes.io/azure-file,\
+kubernetes.io/cinder,kubernetes.io/gce-pd,kubernetes.io/portworx-volume,\
+kubernetes.io/vsphere-volume"
+        );
+    }
+
+    /// nodeinfomanager_test.go:315-350 ("pre-existing node info ... owned by
+    /// previous node" with `migratedPlugins`): the CSINode created by
+    /// `CreateCSINode` carries the annotation.
+    #[tokio::test]
+    async fn create_csi_node_sets_the_migration_annotation() {
+        let (st, nim) = setup(node(vec![], vec![], vec![]), None).await;
+        let nim = nim.with_migrated_plugins(migrated(&[(DRIVER1, true)]));
+        nim.initialize_csi_node().await.unwrap();
+        let (_, c) = got(&st).await;
+        assert_eq!(
+            annotations_of(&c.unwrap()),
+            Some(vec![(
+                MIGRATED_PLUGINS_ANNOTATION_KEY.to_string(),
+                DRIVER1.to_string()
+            )])
+        );
+    }
+
+    /// `tryInitializeCSINodeWithAnnotation` (`nodeinfomanager.go:457-462`): an
+    /// existing, owned CSINode whose annotation is stale is updated.
+    #[tokio::test]
+    async fn initialize_updates_a_stale_migration_annotation_on_an_existing_csinode() {
+        let mut n = node(vec![], vec![], vec![]);
+        n.metadata.uid = "uid1".into();
+        let (st, nim) = setup(n, Some(csi_node(vec![], "uid1"))).await;
+        let nim = nim.with_migrated_plugins(migrated(&[("a", true), ("b", true)]));
+        nim.initialize_csi_node().await.unwrap();
+        let (_, c) = got(&st).await;
+        assert_eq!(
+            annotations_of(&c.unwrap()),
+            Some(vec![(
+                MIGRATED_PLUGINS_ANNOTATION_KEY.to_string(),
+                "a,b".to_string()
+            )])
+        );
+    }
+
+    /// `installDriverToCSINode` (`nodeinfomanager.go:624-628`): a spec that is
+    /// unchanged still gets written when only the annotation changed.
+    #[tokio::test]
+    async fn install_writes_when_only_the_migration_annotation_changed() {
+        let (st, nim) = setup(
+            node(vec![], vec![], vec![]),
+            Some(csi_node(vec![(DRIVER1, "id1", None, vec![])], "")),
+        )
+        .await;
+        let nim = nim.with_migrated_plugins(migrated(&[(DRIVER1, true)]));
+        nim.install_csi_driver(DRIVER1, "id1", 0, &HashMap::new())
+            .await
+            .unwrap();
+        let (_, c) = got(&st).await;
+        let c = c.unwrap();
+        assert_eq!(c.spec.drivers.len(), 1);
+        assert_eq!(
+            annotations_of(&c),
+            Some(vec![(
+                MIGRATED_PLUGINS_ANNOTATION_KEY.to_string(),
+                DRIVER1.to_string()
+            )])
+        );
+    }
+
+    // ---- UpdateCSIDriver ----
+
+    /// `UpdateCSIDriver` (`nodeinfomanager.go:138-144`) refreshes the CSINode
+    /// entry only: the Node's annotation is not touched.
+    #[tokio::test]
+    async fn update_csi_driver_updates_csinode_but_not_node() {
+        let (st, nim) = setup(
+            node(vec![], vec![], vec![]),
+            Some(csi_node(vec![(DRIVER1, "id1", Some(5), vec![])], "")),
+        )
+        .await;
+        nim.update_csi_driver(DRIVER1, "id1", 9, &HashMap::new())
+            .await
+            .unwrap();
+        let (n, c) = got(&st).await;
+        assert_eq!(
+            c.unwrap().spec.drivers[0]
+                .allocatable
+                .as_ref()
+                .unwrap()
+                .count,
+            Some(9)
+        );
+        assert!(no_nodeid_annotation(&n));
     }
 }
