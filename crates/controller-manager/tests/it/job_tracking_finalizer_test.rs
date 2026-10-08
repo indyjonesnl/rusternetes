@@ -104,6 +104,14 @@ async fn job_pods(storage: &Arc<MemoryStorage>, namespace: &str) -> Vec<Pod> {
 async fn set_phase(storage: &Arc<MemoryStorage>, namespace: &str, pod: &Pod, phase: Phase) {
     let key = build_key("pods", Some(namespace), &pod.metadata.name);
     let mut p: Pod = storage.get(&key).await.unwrap();
+    if phase == Phase::Failed {
+        // `getFinishedTime` (`backoff_utils.go:174`) falls back to the pod's
+        // creation time when no container status carries a finish time. Age it
+        // past `MaxJobPodFailureBackOff` so the failure backoff
+        // (`manageJob`, `job_controller.go:1731`) does not delay the
+        // replacement these tests expect; upstream's tests use a fake clock.
+        p.metadata.creation_timestamp = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+    }
     p.status = Some(PodStatus {
         phase: Some(phase),
         ..Default::default()
