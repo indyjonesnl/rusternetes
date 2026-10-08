@@ -795,11 +795,31 @@ pub trait RestStorage<T: Object>: Send + Sync {
         _delete_validation: Option<&dyn ValidateObject<T>>,
         _options: &DeleteOptions,
         _list_options: &std::collections::HashMap<String, String>,
-    ) -> Result<Vec<T>> {
+    ) -> Result<DeletedCollection<T>> {
         Err(method_not_supported(
             self.qualified_resource(),
             "deletecollection",
         ))
+    }
+}
+
+/// What `DeleteCollection` returns: the deleted items and the `ListMeta` of
+/// the page it listed (`listObj`, store.go:1366), whose `continue` and
+/// `remainingItemCount` tell the client where the next page starts.
+#[derive(Debug, Clone)]
+pub struct DeletedCollection<T> {
+    pub items: Vec<T>,
+    pub continue_token: Option<String>,
+    pub remaining_item_count: Option<i64>,
+}
+
+impl<T> From<Vec<T>> for DeletedCollection<T> {
+    fn from(items: Vec<T>) -> Self {
+        Self {
+            items,
+            continue_token: None,
+            remaining_item_count: None,
+        }
     }
 }
 

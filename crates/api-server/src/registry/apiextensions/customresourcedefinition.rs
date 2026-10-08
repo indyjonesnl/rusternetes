@@ -1011,7 +1011,7 @@ impl RestStorage<CustomResourceDefinition> for CrdRest {
         delete_validation: Option<&dyn ValidateObject<CustomResourceDefinition>>,
         options: &DeleteOptions,
         list_options: &std::collections::HashMap<String, String>,
-    ) -> Result<Vec<CustomResourceDefinition>> {
+    ) -> Result<crate::registry::rest::DeletedCollection<CustomResourceDefinition>> {
         let deleted = RestStorage::delete_collection(
             &self.store,
             ctx,
@@ -1022,7 +1022,7 @@ impl RestStorage<CustomResourceDefinition> for CrdRest {
         .await?;
         let dry_run = options.dry_run.as_ref().is_some_and(|d| !d.is_empty());
         if !dry_run {
-            for crd in &deleted {
+            for crd in &deleted.items {
                 self.conditions.forget(&crd.metadata.name);
                 let _ = self
                     .sync_group_except(&crd.spec.group, &crd.metadata.name)

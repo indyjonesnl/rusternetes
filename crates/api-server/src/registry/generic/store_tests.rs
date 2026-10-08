@@ -1450,7 +1450,8 @@ async fn delete_collection_honours_the_limit() {
     let limited: HashMap<String, String> = [("limit".to_string(), "2".to_string())].into();
     let deleted = RestStorage::delete_collection(&registry, &ctx(), None, &opts, &limited)
         .await
-        .unwrap();
+        .unwrap()
+        .items;
     let names: Vec<_> = deleted.iter().map(|o| o.metadata.name.as_str()).collect();
     assert_eq!(names, ["a", "b"]);
     registry
@@ -1461,10 +1462,93 @@ async fn delete_collection_honours_the_limit() {
     let rest = RestStorage::delete_collection(&registry, &ctx(), None, &opts, &HashMap::new())
         .await
         .unwrap();
-    assert_eq!(rest.len(), 1);
+    assert_eq!(rest.items.len(), 1);
+    assert!(rest.continue_token.is_none());
 
     let bad: HashMap<String, String> = [("limit".to_string(), "x".to_string())].into();
     let err = RestStorage::delete_collection(&registry, &ctx(), None, &opts, &bad)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::BadRequest(_)), "{err:?}");
+}
+
+/// The response is `listObj` (store.go:1366): a limited request returns
+/// `metadata.continue` and `remainingItemCount` (`PrepareContinueToken`,
+/// storage/continue.go:100-120), and passing that token as `continue`
+/// (store.go:1355) deletes the next page. The token is key-based, so it
+/// still resumes after the first page is gone.
+#[tokio::test]
+async fn delete_collection_returns_continue_and_resumes() {
+    use crate::registry::rest::{zero_delete_options, RestStorage};
+    use std::collections::HashMap;
+    let registry = store(TestStrategy::default());
+    for name in ["a", "b", "c", "d", "e"] {
+        create(&registry, cm(name)).await;
+    }
+    let opts = zero_delete_options();
+    let mut q: HashMap<String, String> = [("limit".to_string(), "2".to_string())].into();
+    let p1 = RestStorage::delete_collection(&registry, &ctx(), None, &opts, &q)
+        .await
+        .unwrap();
+    assert_eq!(p1.items.len(), 2);
+    assert_eq!(p1.remaining_item_count, Some(3));
+    let token = p1.continue_token.expect("more items remain");
+
+    q.insert("continue".to_string(), token);
+    let p2 = RestStorage::delete_collection(&registry, &ctx(), None, &opts, &q)
+        .await
+        .unwrap();
+    let names: Vec<_> = p2.items.iter().map(|o| o.metadata.name.as_str()).collect();
+    assert_eq!(names, ["c", "d"]);
+    assert_eq!(p2.remaining_item_count, Some(1));
+
+    q.insert("continue".to_string(), p2.continue_token.unwrap());
+    let p3 = RestStorage::delete_collection(&registry, &ctx(), None, &opts, &q)
+        .await
+        .unwrap();
+    assert_eq!(p3.items.len(), 1);
+    assert!(p3.continue_token.is_none() && p3.remaining_item_count.is_none());
+    for name in ["a", "b", "c", "d", "e"] {
+        assert!(matches!(
+            registry.get(&ctx(), name, &GetOptions::default()).await,
+            Err(Error::NotFound(_))
+        ));
+    }
+}
+
+/// With a selector the count is inexact, so `remainingItemCount` stays unset
+/// (continue.go:111-117), but `continue` is still returned.
+#[tokio::test]
+async fn delete_collection_with_a_selector_has_no_remaining_count() {
+    use crate::registry::rest::{zero_delete_options, RestStorage};
+    use std::collections::HashMap;
+    let registry = store(TestStrategy::default());
+    for name in ["a", "b", "c"] {
+        create(&registry, cm(name)).await;
+    }
+    let q: HashMap<String, String> = [
+        ("limit".to_string(), "1".to_string()),
+        (
+            "fieldSelector".to_string(),
+            "metadata.name!=zzz".to_string(),
+        ),
+    ]
+    .into();
+    let p = RestStorage::delete_collection(&registry, &ctx(), None, &zero_delete_options(), &q)
+        .await
+        .unwrap();
+    assert!(p.continue_token.is_some());
+    assert_eq!(p.remaining_item_count, None);
+}
+
+/// A malformed `continue` is a 400, as for a List.
+#[tokio::test]
+async fn delete_collection_rejects_a_malformed_continue() {
+    use crate::registry::rest::{zero_delete_options, RestStorage};
+    use std::collections::HashMap;
+    let registry = store(TestStrategy::default());
+    let q: HashMap<String, String> = [("continue".to_string(), "garbage".to_string())].into();
+    let err = RestStorage::delete_collection(&registry, &ctx(), None, &zero_delete_options(), &q)
         .await
         .unwrap_err();
     assert!(matches!(err, Error::BadRequest(_)), "{err:?}");

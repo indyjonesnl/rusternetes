@@ -808,12 +808,15 @@ impl RestStorage<CustomResource> for CustomResourceRest {
         delete_validation: Option<&dyn ValidateObject<CustomResource>>,
         options: &DeleteOptions,
         list_options: &std::collections::HashMap<String, String>,
-    ) -> Result<Vec<CustomResource>> {
+    ) -> Result<crate::registry::rest::DeletedCollection<CustomResource>> {
         if let Some(fs) = list_options.get("fieldSelector").filter(|s| !s.is_empty()) {
             validate_field_selector_paths(self.crd(), &self.strategy.version, fs)?;
         }
         let prefix =
             rusternetes_storage::build_prefix(&self.store.storage_prefix, ctx.namespace.as_deref());
+        let revision = rusternetes_storage::Storage::current_revision(&*self.store.storage)
+            .await
+            .unwrap_or(0);
         let mut items: Vec<CustomResource> =
             rusternetes_storage::Storage::list(&*self.store.storage, &prefix).await?;
         for item in &mut items {
@@ -828,9 +831,17 @@ impl RestStorage<CustomResource> for CustomResourceRest {
         )
         .await?;
         crate::handlers::filtering::apply_selectors(&mut items, list_options)?;
-        self.store
-            .delete_collection(ctx, items, delete_validation, options)
-            .await
+        let page =
+            crate::registry::generic::page_for_delete_collection(items, list_options, revision)?;
+        let items = self
+            .store
+            .delete_collection(ctx, page.items, delete_validation, options)
+            .await?;
+        Ok(crate::registry::rest::DeletedCollection {
+            items,
+            continue_token: page.continue_token,
+            remaining_item_count: page.remaining_item_count,
+        })
     }
 }
 

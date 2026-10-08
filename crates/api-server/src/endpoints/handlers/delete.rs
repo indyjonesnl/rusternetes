@@ -166,16 +166,20 @@ pub async fn delete_collection<T: Object>(
     let validation = DeleteValidation {
         admission: &admission,
     };
-    let items = scope
+    let deleted = scope
         .store
         .delete_collection(&ctx, Some(&validation), &options, params)
         .await?;
 
-    let list = List::new(
+    let mut list = List::new(
         format!("{}List", scope.kind.kind),
         scope.api_version(),
-        items,
+        deleted.items,
     );
+    // The response is the listed page (`listObj`, store.go:1366), so its
+    // ListMeta carries `continue` and `remainingItemCount`.
+    list.metadata.continue_token = deleted.continue_token;
+    list.metadata.remaining_item_count = deleted.remaining_item_count;
     Ok(respond(StatusCode::OK, &list, &ctx))
 }
 

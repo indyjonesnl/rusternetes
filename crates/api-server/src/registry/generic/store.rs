@@ -29,9 +29,10 @@ use tracing::debug;
 
 use crate::registry::rest::{
     before_create, before_delete, before_update, check_generated_name_error,
-    fill_object_meta_system_fields, with_group_kind, zero_delete_options, GarbageCollectionPolicy,
-    GroupResource, Object, RequestContext, RestCreateStrategy, RestDeleteStrategy,
-    RestUpdateStrategy, TransformFunc, UpdatedObjectInfo, ValidateObject, ValidateObjectUpdate,
+    fill_object_meta_system_fields, with_group_kind, zero_delete_options, DeletedCollection,
+    GarbageCollectionPolicy, GroupResource, Object, RequestContext, RestCreateStrategy,
+    RestDeleteStrategy, RestUpdateStrategy, TransformFunc, UpdatedObjectInfo, ValidateObject,
+    ValidateObjectUpdate,
 };
 
 /// `OptimisticLockErrorMsg` (store.go:262).
@@ -1708,9 +1709,12 @@ impl<T: Object, S: Storage + Send + Sync + 'static> crate::registry::rest::RestS
         delete_validation: Option<&dyn ValidateObject<T>>,
         options: &DeleteOptions,
         list_options: &std::collections::HashMap<String, String>,
-    ) -> Result<Vec<T>> {
+    ) -> Result<DeletedCollection<T>> {
         let prefix =
             rusternetes_storage::build_prefix(&self.storage_prefix, ctx.namespace.as_deref());
+        // Read the revision BEFORE the data, as `Storage::list_paginated`
+        // does, so the token's pin is never newer than the page.
+        let revision = self.storage.current_revision().await.unwrap_or(0);
         let mut items: Vec<T> = self
             .storage
             .list(&prefix)
@@ -1719,31 +1723,81 @@ impl<T: Object, S: Storage + Send + Sync + 'static> crate::registry::rest::RestS
             .map(|obj| self.decoded(obj))
             .collect();
         crate::handlers::filtering::apply_selectors(&mut items, list_options)?;
-
-        // `ListOptions.Limit` (store.go:1298-1301, :1343-1346): a request that
-        // sets it deletes and returns only that first page, "finish after
-        // running it"; one that does not sets `deleteCollectionPageSize` and
-        // pages through everything, which is the whole list here. Storage
-        // filters by selector while paging, so the page is the first `limit`
-        // matches in key order. A non-numeric limit is a decode failure,
-        // `NewBadRequest` (endpoints/handlers/delete.go:232-236).
-        let limit = match list_options.get("limit") {
-            None => 0,
-            Some(v) => v.parse::<i64>().map_err(|_| {
-                Error::BadRequest(format!(
-                    "failed to decode query parameter limit: strconv.ParseInt: parsing {v:?}: invalid syntax"
-                ))
-            })?,
-        };
-        if limit > 0 {
-            items.sort_by(|a, b| {
-                let (a, b) = (a.metadata(), b.metadata());
-                (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name))
-            });
-            items.truncate(limit as usize);
-        }
-        Store::delete_collection(self, ctx, items, delete_validation, options).await
+        let page = page_for_delete_collection(items, list_options, revision)?;
+        let items =
+            Store::delete_collection(self, ctx, page.items, delete_validation, options).await?;
+        Ok(DeletedCollection {
+            items,
+            continue_token: page.continue_token,
+            remaining_item_count: page.remaining_item_count,
+        })
     }
+}
+
+/// `storage.PrepareContinueToken` (apiserver/pkg/storage/continue.go:100-120)
+/// and the `limit`/`continue` part of `DeleteCollection`'s list loop
+/// (registry/generic/registry/store.go:1298-1301, :1343-1346, :1355).
+///
+/// `items` are the selector-filtered matches. A `continue` token resumes at
+/// its key (continue tokens are key-based, so they stay valid after the
+/// previous page was deleted); a `limit` keeps only that first page and, when
+/// more remain, returns the token for the next one. Like upstream,
+/// `remainingItemCount` is set only when the predicate is empty
+/// (continue.go:114-117) -- selectors make etcd's count inexact. A request
+/// without `limit` deletes everything after the token.
+///
+/// Deliberate gap: the token's pinned revision is not read at, so a
+/// compacted token is not answered with the resumable 410 that
+/// `Storage::list_paginated` gives a List.
+pub(crate) fn page_for_delete_collection<T: Object>(
+    mut items: Vec<T>,
+    list_options: &std::collections::HashMap<String, String>,
+    revision: i64,
+) -> Result<DeletedCollection<T>> {
+    let key = |o: &T| {
+        let m = o.metadata();
+        match m.namespace.as_deref() {
+            Some(ns) if !ns.is_empty() => format!("{}/{}", ns, m.name),
+            _ => m.name.clone(),
+        }
+    };
+    // A non-numeric limit is a decode failure, `NewBadRequest`
+    // (endpoints/handlers/delete.go:232-236).
+    let limit = match list_options.get("limit") {
+        None => 0,
+        Some(v) => v.parse::<i64>().map_err(|_| {
+            Error::BadRequest(format!(
+                "failed to decode query parameter limit: strconv.ParseInt: parsing {v:?}: invalid syntax"
+            ))
+        })?,
+    };
+    let start = match list_options.get("continue").filter(|c| !c.is_empty()) {
+        Some(token) => Some(
+            rusternetes_storage::decode_default_token(token)
+                .map_err(|_| Error::BadRequest("invalid continue token".to_string()))?
+                .start_key,
+        ),
+        None => None,
+    };
+    items.sort_by_cached_key(|o| key(o));
+    if let Some(start) = &start {
+        items.retain(|o| key(o) >= *start);
+    }
+    let empty_predicate = ["labelSelector", "fieldSelector"]
+        .iter()
+        .all(|k| list_options.get(*k).is_none_or(|v| v.is_empty()));
+    let mut page = DeletedCollection::from(items);
+    if limit > 0 && page.items.len() > limit as usize {
+        let rest = page.items.split_off(limit as usize);
+        page.continue_token = Some(rusternetes_storage::encode_default_token(
+            &key(&rest[0]),
+            revision,
+        ));
+        if empty_predicate {
+            page.remaining_item_count = Some(rest.len() as i64);
+        }
+    }
+    Ok(page)
 }
 
 #[cfg(test)]

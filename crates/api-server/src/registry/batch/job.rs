@@ -25,9 +25,9 @@ use rusternetes_storage::StorageBackend;
 
 use crate::registry::generic::{CreateOptions, Deleted, Store, UpdateOptions};
 use crate::registry::rest::{
-    GarbageCollectionPolicy, GroupResource, NamespaceScopedStrategy, RequestContext,
-    RestCreateStrategy, RestDeleteStrategy, RestStorage, RestUpdateStrategy, UpdatedObjectInfo,
-    ValidateObject, ValidateObjectUpdate,
+    DeletedCollection, GarbageCollectionPolicy, GroupResource, NamespaceScopedStrategy,
+    RequestContext, RestCreateStrategy, RestDeleteStrategy, RestStorage, RestUpdateStrategy,
+    UpdatedObjectInfo, ValidateObject, ValidateObjectUpdate,
 };
 
 // `pkg/apis/batch/types.go` label keys.
@@ -333,7 +333,7 @@ impl RestStorage<Job> for JobRest {
         delete_validation: Option<&dyn ValidateObject<Job>>,
         options: &DeleteOptions,
         list_options: &std::collections::HashMap<String, String>,
-    ) -> Result<Vec<Job>> {
+    ) -> Result<DeletedCollection<Job>> {
         warn_on_default_propagation(ctx, options);
         RestStorage::delete_collection(&self.store, ctx, delete_validation, options, list_options)
             .await
