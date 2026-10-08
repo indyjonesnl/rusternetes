@@ -524,6 +524,11 @@ pub(crate) fn validate_selector_slice(selectors: &[DeviceSelector], fld_path: &P
                         &expr_path,
                         CEL_SELECTOR_EXPRESSION_MAX_LENGTH,
                     ));
+                } else if let Some(detail) = crate::cel::parse_failure(&cel.expression) {
+                    // Upstream compiles against the DRA environment
+                    // (`dracel.GetCompiler(..).CompileCELExpression`, :316-330);
+                    // only the parse half is ported (see #2692 follow-ups).
+                    errs.push(Error::invalid(&expr_path, cel.expression.clone(), detail));
                 }
             }
         }
