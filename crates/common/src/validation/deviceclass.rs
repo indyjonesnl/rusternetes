@@ -82,6 +82,33 @@ mod tests {
         assert!(e.iter().any(|m| m.contains("cel")), "{e:?}");
     }
 
+    /// `validateCELSelector` (validation.go:316): an expression that does not
+    /// compile is `field.Invalid(.., "compilation failed: ...")`.
+    #[test]
+    fn uncompilable_expression_rejected() {
+        let e = errs(serde_json::json!({
+            "selectors": [{"cel": {"expression": "device.driver =="}}]
+        }));
+        assert!(
+            e.iter()
+                .any(|m| m.contains("selectors[0].cel.expression")
+                    && m.contains("compilation failed")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn dra_environment_expressions_compile() {
+        for x in [
+            "device.driver == 'dra.example.com'",
+            "device.attributes['dra.example.com'].model == 'a'",
+            "device.capacity['dra.example.com'].memory.compareTo(quantity('1Gi')) >= 0",
+        ] {
+            let e = errs(serde_json::json!({"selectors": [{"cel": {"expression": x}}]}));
+            assert!(e.is_empty(), "{x}: {e:?}");
+        }
+    }
+
     #[test]
     fn empty_expression_rejected() {
         let e = errs(serde_json::json!({"selectors": [{"cel": {"expression": ""}}]}));
