@@ -18,6 +18,8 @@ mod dynamic_routes;
 mod endpoints;
 #[allow(dead_code)]
 mod flow_control;
+#[allow(dead_code)]
+mod flow_control_queueset;
 mod gnostic;
 mod handlers;
 use rusternetes_middleware as middleware;
