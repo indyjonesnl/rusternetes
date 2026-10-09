@@ -1,0 +1,6 @@
+Rusternetes
+
+This repository vendors test fixtures and OpenAPI specifications from
+Kubernetes (https://github.com/kubernetes/kubernetes), Copyright The
+Kubernetes Authors, licensed under the Apache License 2.0. See
+tests/upstream/LICENSE and tests/upstream/k8s-1.35/PROVENANCE.
