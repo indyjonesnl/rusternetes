@@ -344,7 +344,7 @@ pub struct PolicyInvocation<'a, P, B, E> {
 pub trait DispatchDelegate<P: Sync, B: Sync, E: Sync>: Send + Sync {
     async fn dispatch(
         &self,
-        attr: &Attributes,
+        attr: &mut Attributes,
         invocations: &[PolicyInvocation<'_, P, B, E>],
     ) -> Result<Vec<PolicyError>, Error>;
 }
@@ -399,7 +399,7 @@ fn denied(attr: &Attributes, errors: &[PolicyError]) -> Error {
 /// (follow-up on #2886).
 pub async fn dispatch<P, B, E>(
     matcher: &Matcher<'_>,
-    attr: &Attributes,
+    attr: &mut Attributes,
     hooks: &[PolicyHook<P, B, E>],
     delegate: &dyn DispatchDelegate<P, B, E>,
 ) -> Result<(), Error>
@@ -485,7 +485,7 @@ where
     }
 
     if !relevant.is_empty() {
-        policy_errors.extend(delegate.dispatch(attr, &relevant).await?);
+        policy_errors.extend(delegate.dispatch(&mut *attr, &relevant).await?);
     }
 
     // The failure policy defaults to Fail (and is validated at the API level).
@@ -1021,7 +1021,7 @@ mod tests {
     impl DispatchDelegate<Pol, Bind, ()> for Delegate {
         async fn dispatch(
             &self,
-            _: &Attributes,
+            _: &mut Attributes,
             invocations: &[PolicyInvocation<'_, Pol, Bind, ()>],
         ) -> Result<Vec<PolicyError>, Error> {
             for i in invocations {
@@ -1043,7 +1043,7 @@ mod tests {
             namespaces: &NoNamespaces,
             mapper: &NoMapper,
         };
-        dispatch(&m, &pod_attr(), hooks, delegate).await
+        dispatch(&m, &mut pod_attr(), hooks, delegate).await
     }
     fn status_of(e: Error) -> Status {
         match e {
