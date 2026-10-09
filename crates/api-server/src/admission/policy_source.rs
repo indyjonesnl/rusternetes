@@ -144,13 +144,16 @@ pub trait Informer<T>: Send + Sync {
     fn remove_event_handler(&self, id: usize);
 }
 
+/// An informer event handler.
+type Handler = Arc<dyn Fn() + Send + Sync>;
+
 /// A list+watch cache over one storage prefix: the `SharedIndexInformer` of
 /// this crate. [`StorageInformer::run`] is the reflector loop.
 pub struct StorageInformer<T> {
     prefix: String,
     cache: RwLock<HashMap<String, Arc<T>>>,
     synced: AtomicBool,
-    handlers: Mutex<(usize, Vec<(usize, Arc<dyn Fn() + Send + Sync>)>)>,
+    handlers: Mutex<(usize, Vec<(usize, Handler)>)>,
 }
 
 impl<T: DeserializeOwned + Send + Sync + 'static> StorageInformer<T> {
@@ -434,6 +437,9 @@ fn parse_group_version(gv: &str) -> Result<(String, String), String> {
     }
 }
 
+/// The compiled hook list, shared with readers.
+pub type Hooks<P, B, E> = Arc<Vec<PolicyHook<P, B, E>>>;
+
 struct CompiledPolicyEntry<E> {
     policy_version: String,
     evaluator: E,
@@ -460,7 +466,7 @@ pub struct PolicySource<P, B, E> {
     refresh_interval: Duration,
     /// Currently compiled list of valid/active policy-binding pairs. As an
     /// invariant `None` is only the not-yet-compiled state (policy_source.go:218-221).
-    policies: RwLock<Option<Arc<Vec<PolicyHook<P, B, E>>>>>,
+    policies: RwLock<Option<Hooks<P, B, E>>>,
     /// Whether the cache of policies is dirty and needs to be recompiled.
     policies_dirty: Arc<AtomicBool>,
     running: AtomicBool,
@@ -557,15 +563,14 @@ where
     }
 
     /// `Hooks` (policy_source.go:225-236): `None` until the first compilation.
-    pub fn hooks(&self) -> Option<Arc<Vec<PolicyHook<P, B, E>>>> {
+    pub fn hooks(&self) -> Option<Hooks<P, B, E>> {
         self.policies.read().unwrap().clone()
     }
 
     /// `refreshPolicies` (policy_source.go:238-264).
     pub fn refresh_policies(&self) {
-        if !self.upstream_has_synced() {
-            return;
-        } else if !self.policies_dirty.swap(false, Ordering::SeqCst) {
+        // `||` short-circuits: the dirty flag is only cleared once synced.
+        if !self.upstream_has_synced() || !self.policies_dirty.swap(false, Ordering::SeqCst) {
             return;
         }
 
@@ -604,11 +609,6 @@ where
             );
         }
 
-        // RED-COMMIT STUB: not implemented yet.
-        #[allow(unreachable_code)]
-        if true {
-            return (Vec::new(), None);
-        }
         // Fat-fingered lock that can be made more fine-tuned if required.
         let mut state = self.state.lock().unwrap();
 
