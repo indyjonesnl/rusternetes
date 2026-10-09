@@ -312,7 +312,7 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
     if config.skip_auth {
         warn!("Authentication and authorization disabled - insecure mode");
     }
-    let authorizer = authorizer::build_authorizer(storage.clone(), config.skip_auth);
+    let authorizer = authorizer::build_authorizer(storage.clone(), config.skip_auth, &[])?;
 
     let metrics = Arc::new(MetricsRegistry::new().with_api_server_metrics()?);
 

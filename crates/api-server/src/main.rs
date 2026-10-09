@@ -293,7 +293,7 @@ async fn main() -> Result<()> {
         warn!("⚠️  This should ONLY be used in development/testing environments");
     }
     let authorizer =
-        rusternetes_api_server::authorizer::build_authorizer(storage.clone(), args.skip_auth);
+        rusternetes_api_server::authorizer::build_authorizer(storage.clone(), args.skip_auth, &[])?;
 
     // Initialize Metrics Registry
     info!("Initializing Metrics Registry");
