@@ -935,7 +935,17 @@ fn get_api_group_names() -> Vec<(&'static str, &'static str)> {
 /// `apiServicesToRegister` input): `/api/v1` plus `/apis/<group>/<version>`
 /// for every group-version this server serves.
 pub fn delegate_listed_paths() -> Vec<String> {
-    todo!()
+    let mut paths = vec!["/api/v1".to_string()];
+    for (group, version) in get_api_group_names() {
+        paths.push(format!("/apis/{group}/{version}"));
+        if group_v1beta1_served(group) {
+            paths.push(format!("/apis/{group}/v1beta1"));
+        }
+        if group == "autoscaling" {
+            paths.push("/apis/autoscaling/v1".to_string());
+        }
+    }
+    paths
 }
 
 /// The resource a built-in kind is served as at `group/version`: a port of
@@ -4313,7 +4323,10 @@ mod listed_paths_tests {
         assert!(paths.contains(&"/apis/apps/v1".to_string()));
         assert!(paths.contains(&"/apis/apiregistration.k8s.io/v1".to_string()));
         for (g, _) in get_api_group_names() {
-            assert!(paths.iter().any(|p| p.starts_with(&format!("/apis/{g}/"))), "{g}");
+            assert!(
+                paths.iter().any(|p| p.starts_with(&format!("/apis/{g}/"))),
+                "{g}"
+            );
         }
         let mut dedup = paths.clone();
         dedup.sort();

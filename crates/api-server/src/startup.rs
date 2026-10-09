@@ -61,6 +61,13 @@ pub async fn register_post_start_hooks(
     // which lives in the apiserver — not KCM).
     bootstrap::spawn_apiservice_availability_controller(storage.clone());
 
+    // kube-apiserver-autoregistration PostStartHook + autoregister-completion
+    // boot-sequence check (upstream pkg/controlplane/apiserver/aggregator.go:150-193).
+    crate::autoregister::spawn_autoregistration(
+        storage.clone(),
+        rusternetes_discovery::delegate_listed_paths(),
+    );
+
     // CRD controllers' resync (upstream post-start hook, apiextensions-apiserver
     // pkg/apiserver/apiserver.go:244-252): retries a CRD left Terminating.
     registry::apiextensions::customresourcedefinition::spawn_resync(storage.clone());

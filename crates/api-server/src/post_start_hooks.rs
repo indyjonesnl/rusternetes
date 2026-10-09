@@ -23,7 +23,11 @@ pub const FATAL_EXIT_CODE: i32 = 255;
 #[derive(Default)]
 pub struct PostStartHooks {
     hooks: Mutex<BTreeMap<String, Arc<AtomicBool>>>,
+    boot_checks: Mutex<BTreeMap<String, BootCheck>>,
 }
+
+/// A `healthz.NamedCheck` added by `AddBootSequenceHealthChecks`.
+type BootCheck = Box<dyn Fn() -> Result<(), String> + Send + Sync>;
 
 fn state(done: &AtomicBool) -> Result<(), &'static str> {
     if done.load(Ordering::SeqCst) {
@@ -46,6 +50,28 @@ impl PostStartHooks {
             .unwrap()
             .insert(name.to_string(), done.clone());
         done
+    }
+
+    /// `AddBootSequenceHealthChecks`: a named check (no `poststarthook/` prefix).
+    pub fn register_boot_check(
+        &self,
+        name: &str,
+        check: impl Fn() -> Result<(), String> + Send + Sync + 'static,
+    ) {
+        self.boot_checks
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), Box::new(check));
+    }
+
+    /// All boot-sequence checks as `(name, result)`.
+    pub fn boot_checks(&self) -> Vec<(String, Result<(), String>)> {
+        self.boot_checks
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(n, c)| (n.clone(), c()))
+            .collect()
     }
 
     /// `postStartHookHealthz.Check` for one hook; `None` if not registered.

@@ -11,8 +11,8 @@
 //! add/update/delete events through a rate-limited workqueue; [`run`] here
 //! re-syncs every known name on a short tick (the sync is idempotent and
 //! guarded by the same synced-once / present-at-start state).
-//! Not yet wired into `startup.rs`: the `kube-apiserver-autoregistration` hook
-//! needs the delegate's ListedPaths and the crdregistration controller.
+//! Wired into `startup.rs` via [`spawn_autoregistration`]; crdregistration is
+//! not ported yet (see that function's deviation note).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
@@ -362,11 +362,44 @@ pub const DEFAULT_GENERIC_API_SERVICE_PRIORITIES: &[(&str, &str, i32, i32)] = &[
     ("storagemigration.k8s.io", "v1beta1", 15800, 9),
 ];
 
+/// The kube-apiserver's own `apiVersionPriorities` overlay
+/// (`cmd/kube-apiserver/app/aggregator.go:31-60`, `merge(DefaultGeneric...,
+/// {...})`): the groups served by the kube-apiserver rather than the generic
+/// control plane. Entries here win over [`DEFAULT_GENERIC_API_SERVICE_PRIORITIES`].
+pub const KUBE_APISERVER_API_VERSION_PRIORITIES: &[(&str, &str, i32, i32)] = &[
+    ("", "v1", 18000, 1),
+    ("apps", "v1", 17800, 15),
+    ("autoscaling", "v1", 17500, 15),
+    ("autoscaling", "v2", 17500, 30),
+    ("autoscaling", "v2beta1", 17500, 9),
+    ("autoscaling", "v2beta2", 17500, 1),
+    ("batch", "v1", 17400, 15),
+    ("batch", "v1beta1", 17400, 9),
+    ("batch", "v2alpha1", 17400, 9),
+    ("networking.k8s.io", "v1", 17200, 15),
+    ("networking.k8s.io", "v1beta1", 17200, 9),
+    ("policy", "v1", 17100, 15),
+    ("policy", "v1beta1", 17100, 9),
+    ("storage.k8s.io", "v1", 16800, 15),
+    ("storage.k8s.io", "v1beta1", 16800, 9),
+    ("storage.k8s.io", "v1alpha1", 16800, 1),
+    ("scheduling.k8s.io", "v1", 16600, 15),
+    ("scheduling.k8s.io", "v1alpha1", 16600, 1),
+    ("node.k8s.io", "v1", 16300, 15),
+    ("node.k8s.io", "v1alpha1", 16300, 1),
+    ("node.k8s.io", "v1beta1", 16300, 9),
+    ("resource.k8s.io", "v1", 16200, 21),
+    ("resource.k8s.io", "v1beta2", 16200, 15),
+    ("resource.k8s.io", "v1beta1", 16200, 9),
+    ("resource.k8s.io", "v1alpha3", 16200, 1),
+];
+
 /// `makeAPIService` (aggregator.go:~262-281): `None` for a group-version
 /// without a priority, so a CRD's group-version is never pinned in the list.
 pub fn make_api_service(group: &str, version: &str) -> Option<APIService> {
-    let (_, _, group_priority, version_priority) = DEFAULT_GENERIC_API_SERVICE_PRIORITIES
+    let (_, _, group_priority, version_priority) = KUBE_APISERVER_API_VERSION_PRIORITIES
         .iter()
+        .chain(DEFAULT_GENERIC_API_SERVICE_PRIORITIES.iter())
         .find(|(g, v, _, _)| *g == group && *v == version)?;
     let mut s = APIService::default();
     s.metadata.name = format!("{version}.{group}");
@@ -417,16 +450,40 @@ pub struct APIServiceAvailableCheck {
 
 impl APIServiceAvailableCheck {
     pub fn new(api_services: &[APIService]) -> Self {
-        let _ = api_services;
-        todo!()
+        Self {
+            pending: std::sync::Arc::new(Mutex::new(
+                api_services
+                    .iter()
+                    .map(|s| s.metadata.name.clone())
+                    .collect(),
+            )),
+        }
     }
-    /// `handleAPIServiceChange`.
+    /// `handleAPIServiceChange` (aggregator.go:275-284): a pending APIService
+    /// seen `Available=True` leaves the pending list.
     pub fn handle_api_service_change(&self, service: &APIService) {
-        let _ = service;
-        todo!()
+        let mut pending = self.pending.lock().unwrap();
+        if !pending.contains(&service.metadata.name) {
+            return;
+        }
+        if service.status.conditions.iter().any(|c| {
+            c.type_ == rusternetes_common::resources::apiregistration::AVAILABLE
+                && c.status == "True"
+        }) {
+            pending.remove(&service.metadata.name);
+        }
     }
+    /// The named check (aggregator.go:293-300); the message formats the sorted
+    /// names like Go's `fmt` of `[]string` (`[a b]`).
     pub fn check(&self) -> Result<(), String> {
-        todo!()
+        let pending = self.pending.lock().unwrap();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "missing APIService: [{}]",
+            pending.iter().cloned().collect::<Vec<_>>().join(" ")
+        ))
     }
 }
 
@@ -435,13 +492,51 @@ pub const AUTOREGISTER_COMPLETION_CHECK: &str = "autoregister-completion";
 /// Name of the post-start hook (aggregator.go:~170).
 pub const AUTOREGISTRATION_HOOK: &str = "kube-apiserver-autoregistration";
 
-/// The `kube-apiserver-autoregistration` hook body + boot check, over `storage`.
+/// The `kube-apiserver-autoregistration` PostStartHook (aggregator.go:150-181)
+/// plus its `autoregister-completion` boot-sequence check (:183-193), over
+/// `storage`. `listed_paths` is the delegate's `ListedPaths()`.
+///
+/// Deviations: (1) crdregistration is not ported yet, so this is upstream's
+/// `crdAPIEnabled == false` branch (:166-171, start without waiting for the
+/// initial CRD sync) -- tracked in the follow-up issue; (2) the controller is
+/// driven by [`AutoRegisterController::run`]'s tick rather than an informer,
+/// and the check observes Available by polling storage each second.
 pub fn spawn_autoregistration<S: Storage + 'static>(
     storage: std::sync::Arc<S>,
     listed_paths: Vec<String>,
 ) -> tokio::task::JoinHandle<()> {
-    let _ = (storage, listed_paths);
-    todo!()
+    let controller = std::sync::Arc::new(AutoRegisterController::new());
+    let api_services = api_services_to_register(&listed_paths, &controller);
+    let check = std::sync::Arc::new(APIServiceAvailableCheck::new(&api_services));
+    crate::post_start_hooks::global().register_boot_check(AUTOREGISTER_COMPLETION_CHECK, {
+        let check = check.clone();
+        move || check.check()
+    });
+    crate::post_start_hooks::spawn_starting_hook(AUTOREGISTRATION_HOOK, move || {
+        let client = std::sync::Arc::new(StorageAPIServiceClient(storage));
+        // `Run(5, context.Done())`: the stop channel never fires for the
+        // process lifetime.
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let c = controller.clone();
+        let cl = client.clone();
+        tokio::spawn(async move {
+            let _keep = stop_tx;
+            c.run(cl.as_ref(), stop_rx).await;
+        });
+        // Observe Available (informer add/update handlers upstream).
+        tokio::spawn(async move {
+            loop {
+                if let Ok(names) = client.list_names().await {
+                    for n in names {
+                        if let Ok(Some(a)) = client.get(&n).await {
+                            check.handle_api_service_change(&a);
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        });
+    })
 }
 
 #[cfg(test)]
@@ -536,6 +631,18 @@ mod tests {
         assert_eq!(core.spec.group_priority_minimum, 18000);
         assert_eq!(core.spec.version_priority, 1);
         assert!(ctl.get_api_service_to_sync("v1.example.com").is_none());
+    }
+
+    // cmd/kube-apiserver/app/aggregator.go:31 merges over the generic table.
+    #[test]
+    fn kube_apiserver_priorities_overlay_the_generic_ones() {
+        let apps = make_api_service("apps", "v1").unwrap();
+        assert_eq!(apps.spec.group_priority_minimum, 17800);
+        let r = make_api_service("resource.k8s.io", "v1alpha3").unwrap();
+        assert_eq!(
+            (r.spec.group_priority_minimum, r.spec.version_priority),
+            (16200, 1)
+        );
     }
 
     fn available(mut s: APIService, status: &str) -> APIService {
