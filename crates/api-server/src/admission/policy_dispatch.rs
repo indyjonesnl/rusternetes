@@ -69,28 +69,29 @@ pub struct PolicyReinvokeContext {
 impl PolicyReinvokeContext {
     /// reinvocationcontext.go:45-47.
     pub fn should_reinvoke(&self, policy: &PolicyKey) -> bool {
-        todo!()
+        self.reinvoke_policies.contains(policy)
     }
 
     /// reinvocationcontext.go:49-51; `nil` against an object is a change.
     pub fn is_output_changed_since_last_policy_invocation(&self, object: Option<&Value>) -> bool {
-        todo!()
+        self.last_policy_output.as_ref() != object
     }
 
     /// reinvocationcontext.go:53-59 (a deep copy, as upstream).
     pub fn set_last_policy_invocation_output(&mut self, object: Option<&Value>) {
-        todo!()
+        self.last_policy_output = object.cloned();
     }
 
     /// reinvocationcontext.go:61-66.
     pub fn add_reinvocable_policy_to_previously_invoked(&mut self, policy: PolicyKey) {
-        todo!()
+        self.previously_invoked_reinvocable_policies.insert(policy);
     }
 
     /// reinvocationcontext.go:68-78: everything invoked so far becomes due for
     /// reinvocation, and the invoked set starts over.
     pub fn require_reinvoking_previously_invoked_plugins(&mut self) {
-        todo!()
+        self.reinvoke_policies
+            .extend(self.previously_invoked_reinvocable_policies.drain());
     }
 }
 
@@ -128,11 +129,8 @@ pub trait ParamStore: Send + Sync {
     /// param kind. A miss is `Error::NotFound`.
     async fn get(&self, namespace: Option<&str>, name: &str) -> Result<Value, Error>;
     /// `GenericNamespaceLister.List`.
-    async fn list(
-        &self,
-        namespace: Option<&str>,
-        selector: &Selector,
-    ) -> Result<Vec<Value>, Error>;
+    async fn list(&self, namespace: Option<&str>, selector: &Selector)
+        -> Result<Vec<Value>, Error>;
     /// `Informer().HasSynced`.
     fn has_synced(&self) -> bool;
 }
@@ -176,7 +174,102 @@ pub async fn collect_params(
     param_ref: Option<&ParamRef>,
     namespace: &str,
 ) -> Result<Vec<Option<Value>>, String> {
-    todo!()
+    // Where the param kind is ready to use, set up cluster-scoped or
+    // namespaced access to the params.
+    let mut store_namespace: Option<String> = None;
+    if let (Some(kind), Some(pref)) = (param_kind, param_ref) {
+        let Some(store) = param_store else {
+            return Err(format!(
+                "paramKind kind `{}` not known",
+                param_kind_string(kind)
+            ));
+        };
+        if param_scope == ParamScope::Namespace {
+            // "default" to the request's namespace if not provided.
+            let ns = match pref.namespace.as_deref() {
+                Some(n) if !n.is_empty() => n,
+                _ if namespace.is_empty() => {
+                    // You must supply a namespace if your matcher can possibly
+                    // match a cluster-scoped resource.
+                    return Err("cannot use namespaced paramRef in policy binding that matches cluster-scoped resources".into());
+                }
+                _ => namespace,
+            };
+            store_namespace = Some(ns.to_string());
+        }
+        // If the param informer has not yet had time to perform an initial
+        // listing, don't attempt to use it.
+        if !wait_for_cache_sync(store, PARAM_SYNC_TIMEOUT).await {
+            return Err(format!(
+                "paramKind kind `{}` not yet synced to use for admission",
+                param_kind_string(kind)
+            ));
+        }
+    }
+
+    // Find params to use with the policy.
+    let Some(_) = param_kind else {
+        // ParamKind is unset. Ignore any paramRef.
+        return Ok(vec![None]);
+    };
+    let Some(pref) = param_ref else {
+        // Policy ParamKind is set, but the binding does not use it. Validate
+        // with nil params.
+        return Ok(vec![None]);
+    };
+    let namespace_set = pref.namespace.as_deref().is_some_and(|n| !n.is_empty());
+    if namespace_set && param_scope == ParamScope::Root {
+        // Not allowed to set a namespace for a cluster-scoped param.
+        return Err(
+            "paramRef.namespace must not be provided for a cluster-scoped `paramKind`".into(),
+        );
+    }
+    // `param_store` is Some: checked above.
+    let store = param_store.expect("checked above");
+
+    let params: Vec<Value> = match pref.name.as_deref() {
+        Some(name) if !name.is_empty() => {
+            if pref.selector.is_some() {
+                // This should be validated, but just in case.
+                return Err("paramRef.name and paramRef.selector are mutually exclusive".into());
+            }
+            match store.get(store_namespace.as_deref(), name).await {
+                Ok(param) => vec![param],
+                // Param not yet available. The user may need to wait a bit
+                // before being able to use it; fall through to the not-found
+                // action.
+                Err(Error::NotFound(_)) => Vec::new(),
+                // Param mis-configured (namespace set for a cluster-scoped
+                // kind or unset for a namespaced one), or an internal error.
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        _ => match pref.selector.as_ref() {
+            Some(_) => {
+                // Cannot parse the label selector: configuration error.
+                let selector = selector_of(pref.selector.as_ref())?;
+                store
+                    .list(store_namespace.as_deref(), &selector)
+                    .await
+                    .map_err(|e| e.to_string())?
+            }
+            // Should be unreachable due to validation.
+            None => return Err("one of name or selector must be provided".into()),
+        },
+    };
+
+    // Apply the fail action for the params-not-found case.
+    if params.is_empty()
+        && matches!(
+            pref.parameter_not_found_action,
+            Some(ParameterNotFoundAction::Deny)
+        )
+    {
+        return Err(
+            "no params found for policy binding with `Deny` parameterNotFoundAction".into(),
+        );
+    }
+    Ok(params.into_iter().map(Some).collect())
 }
 
 /// policy_dispatcher.go:347-355 (`PolicyError`), with the policy's failure
@@ -260,7 +353,40 @@ pub trait DispatchDelegate<P: Sync, B: Sync, E: Sync>: Send + Sync {
 /// message and reason the first denial supplies and every denial as a cause
 /// (policy_dispatcher.go:181-215).
 fn denied(attr: &Attributes, errors: &[PolicyError]) -> Error {
-    todo!()
+    let mut status = Status {
+        kind: "Status".into(),
+        api_version: "v1".into(),
+        metadata: None,
+        status: Some("Failure".into()),
+        message: None,
+        reason: Some("Forbidden".into()),
+        details: Some(StatusDetails {
+            name: Some(attr.name.clone()),
+            group: Some(attr.resource.group.clone()),
+            kind: Some(attr.resource.resource.clone()),
+            uid: None,
+            causes: Some(Vec::new()),
+            retry_after_seconds: None,
+        }),
+        code: Some(403),
+    };
+    for e in errors {
+        let message = e.error();
+        if status.message.is_none() {
+            status.message = Some(message.clone());
+            if let Some(reason) = e.reason.as_deref().filter(|r| !r.is_empty()) {
+                status.reason = Some(reason.to_string());
+            }
+        }
+        if let Some(causes) = status.details.as_mut().and_then(|d| d.causes.as_mut()) {
+            causes.push(StatusCause {
+                reason: None,
+                message: Some(message),
+                field: None,
+            });
+        }
+    }
+    Error::Status(Box::new(status))
 }
 
 /// `policyDispatcher.Dispatch` (policy_dispatcher.go:99-229): select the
@@ -282,7 +408,96 @@ where
     B: BindingAccessor + Sync,
     E: Sync,
 {
-    todo!()
+    let mut relevant: Vec<PolicyInvocation<'_, P, B, E>> = Vec::new();
+    let mut policy_errors: Vec<PolicyError> = Vec::new();
+    let config_error = |policy: &P, binding: Option<&B>, err: String| PolicyError {
+        policy_name: policy.name().to_string(),
+        failure_policy: policy.failure_policy().cloned(),
+        binding_name: binding.map(|b| b.name().to_string()),
+        message: match binding {
+            None => format!("failed to configure policy: {err}"),
+            Some(_) => format!("failed to configure binding: {err}"),
+        },
+        reason: None,
+    };
+
+    for hook in hooks {
+        let matched = match matcher
+            .definition_matches(attr, hook.policy.match_constraints())
+            .await
+        {
+            // An error evaluating whether this policy matches anything.
+            Err(e) => {
+                policy_errors.push(config_error(&hook.policy, None, error_text(&e)));
+                continue;
+            }
+            Ok(None) => continue,
+            Ok(Some(m)) => m,
+        };
+        if let Some(err) = &hook.configuration_error {
+            policy_errors.push(config_error(&hook.policy, None, err.clone()));
+            continue;
+        }
+
+        for binding in &hook.bindings {
+            match matcher
+                .binding_matches(attr, binding.match_resources())
+                .await
+            {
+                Err(e) => {
+                    policy_errors.push(config_error(&hook.policy, Some(binding), error_text(&e)));
+                    continue;
+                }
+                Ok(false) => continue,
+                Ok(true) => {}
+            }
+
+            // Collect params for this binding.
+            let params = match collect_params(
+                hook.policy.param_kind(),
+                hook.param_store.as_deref(),
+                hook.param_scope,
+                binding.param_ref(),
+                &attr.namespace,
+            )
+            .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    policy_errors.push(config_error(&hook.policy, Some(binding), e));
+                    continue;
+                }
+            };
+
+            // Empty params without an error is parameterNotFoundAction
+            // Allow: nothing to add.
+            for param in params {
+                relevant.push(PolicyInvocation {
+                    policy: &hook.policy,
+                    kind: matched.kind.clone(),
+                    resource: matched.resource.clone(),
+                    binding,
+                    evaluator: &hook.evaluator,
+                    param,
+                });
+            }
+        }
+    }
+
+    if !relevant.is_empty() {
+        policy_errors.extend(delegate.dispatch(attr, &relevant).await?);
+    }
+
+    // The failure policy defaults to Fail (and is validated at the API level).
+    let filtered: Vec<PolicyError> = policy_errors
+        .into_iter()
+        .filter(|e| !matches!(e.failure_policy, Some(FailurePolicy::Ignore)))
+        .collect();
+    if filtered.is_empty() {
+        Ok(())
+    } else {
+        Err(denied(attr, &filtered))
+    }
 }
 
 /// `err.Error()` for the errors the matcher returns, without the variant
@@ -524,15 +739,28 @@ mod tests {
         let s = synced(vec![(Some("ns1".into()), obj.clone())]);
         let r = pref(Some("p"));
         assert_eq!(
-            collect_params(Some(&kind()), Some(&s), ParamScope::Namespace, Some(&r), "ns1").await,
+            collect_params(
+                Some(&kind()),
+                Some(&s),
+                ParamScope::Namespace,
+                Some(&r),
+                "ns1"
+            )
+            .await,
             Ok(vec![Some(obj.clone())])
         );
         // paramRef.namespace wins over the request's
         let mut r2 = pref(Some("p"));
         r2.namespace = Some("ns1".into());
         assert_eq!(
-            collect_params(Some(&kind()), Some(&s), ParamScope::Namespace, Some(&r2), "other")
-                .await,
+            collect_params(
+                Some(&kind()),
+                Some(&s),
+                ParamScope::Namespace,
+                Some(&r2),
+                "other"
+            )
+            .await,
             Ok(vec![Some(obj)])
         );
     }
@@ -661,7 +889,10 @@ mod tests {
     struct NoNamespaces;
     #[async_trait]
     impl NamespaceLister for NoNamespaces {
-        async fn namespace_labels(&self, name: &str) -> rusternetes_common::Result<HashMap<String, String>> {
+        async fn namespace_labels(
+            &self,
+            name: &str,
+        ) -> rusternetes_common::Result<HashMap<String, String>> {
             Err(Error::NotFound(format!("namespace {name} not found")))
         }
     }
@@ -807,10 +1038,7 @@ mod tests {
         }
     }
 
-    async fn run(
-        hooks: &[PolicyHook<Pol, Bind, ()>],
-        delegate: &Delegate,
-    ) -> Result<(), Error> {
+    async fn run(hooks: &[PolicyHook<Pol, Bind, ()>], delegate: &Delegate) -> Result<(), Error> {
         let m = Matcher {
             namespaces: &NoNamespaces,
             mapper: &NoMapper,
@@ -967,7 +1195,10 @@ mod tests {
         ];
         let s = status_of(
             run(
-                &[hook(ignored, vec![bind("b")]), hook(failing, vec![bind("b1")])],
+                &[
+                    hook(ignored, vec![bind("b")]),
+                    hook(failing, vec![bind("b1")]),
+                ],
                 &d,
             )
             .await
