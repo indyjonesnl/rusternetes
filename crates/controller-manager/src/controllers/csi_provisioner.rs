@@ -381,6 +381,16 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
         self
     }
 
+    /// `RetryIntervalMax`.
+    pub fn with_retry_interval_max(self, _max: Duration) -> Self {
+        self
+    }
+
+    /// `syncVolume` (stub, #2965).
+    pub async fn sync_volume(&self, _volume: &PersistentVolume) -> Result<()> {
+        Ok(())
+    }
+
     /// `--prevent-volume-mode-conversion`.
     pub fn with_prevent_volume_mode_conversion(mut self, on: bool) -> Self {
         self.prevent_volume_mode_conversion = on;
