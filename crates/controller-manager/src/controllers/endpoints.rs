@@ -1,3 +1,5 @@
+use crate::controllers::endpoints_tracker::StaleEndpointsTracker;
+use crate::controllers::trigger_time_tracker::{format_rfc3339_nano, TriggerTimeTracker};
 use crate::controllers::worker_pool::spawn_workers;
 use anyhow::Result;
 use futures::StreamExt;
@@ -201,11 +203,27 @@ const CONCURRENT_ENDPOINT_SYNCS: usize = 5;
 /// 3. Pod IP assignment
 pub struct EndpointsController<S: Storage> {
     storage: Arc<S>,
+    /// `e.staleEndpointsTracker` (endpoints_controller.go:158,121).
+    stale_endpoints_tracker: StaleEndpointsTracker,
+    /// `e.triggerTimeTracker` (endpoints_controller.go:177,122): computes the
+    /// `endpoints.kubernetes.io/last-change-trigger-time` annotation.
+    trigger_time_tracker: TriggerTimeTracker,
 }
 
 impl<S: Storage + 'static> EndpointsController<S> {
     pub fn new(storage: Arc<S>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            stale_endpoints_tracker: StaleEndpointsTracker::new(),
+            trigger_time_tracker: TriggerTimeTracker::new(),
+        }
+    }
+
+    /// The service-not-found arm of `syncService`
+    /// (endpoints_controller.go:360-361): forget the deleted Service.
+    fn forget_service(&self, namespace: &str, name: &str) {
+        self.trigger_time_tracker.delete_service(namespace, name);
+        self.stale_endpoints_tracker.delete(namespace, name);
     }
 
     /// Watch-based run loop. Watches services AND pods as primary resources.
@@ -377,6 +395,7 @@ impl<S: Storage + 'static> EndpointsController<S> {
                     }
                 },
                 Err(_) => {
+                    self.forget_service(ns, name);
                     queue.forget(&key).await;
                 }
             }
@@ -509,6 +528,13 @@ impl<S: Storage + 'static> EndpointsController<S> {
             .filter(|pod| self.pod_matches_selector(pod, selector))
             .collect();
 
+        // Called before any early return so the tracker's state is updated even
+        // when the sync turns out to be a no-op
+        // (endpoints_controller.go:385-389).
+        let endpoints_last_change_trigger_time = self
+            .trigger_time_tracker
+            .compute_endpoint_last_change_trigger_time(namespace, service, &matching_pods);
+
         debug!(
             "Found {} matching pods for service {}/{}",
             matching_pods.len(),
@@ -546,6 +572,24 @@ impl<S: Storage + 'static> EndpointsController<S> {
         let svc_labels = service.metadata.labels.clone().unwrap_or_default();
         let existing: Option<Endpoints> = self.storage.get(&endpoints_key).await.ok();
 
+        // endpoints_controller.go:451-452: an Endpoints at a resource version
+        // this controller already replaced is out of date.
+        if let Some(cur) = &existing {
+            if let Some(rv) = cur.metadata.resource_version.as_deref() {
+                if self
+                    .stale_endpoints_tracker
+                    .is_stale(namespace, service_name, rv)
+                {
+                    return Err(anyhow::anyhow!(
+                        "endpoints informer cache is out of date, resource version {} already processed for endpoints {}/{}",
+                        rv,
+                        namespace,
+                        service_name
+                    ));
+                }
+            }
+        }
+
         // Skip the write when nothing changed
         // (endpoints_controller.go:459-468).
         if let Some(cur) = &existing {
@@ -577,10 +621,20 @@ impl<S: Storage + 'static> EndpointsController<S> {
         });
         endpoints.subsets = subsets;
 
-        // The trigger-time tracker is not ported (#2747), so the annotation is
-        // cleared as upstream does when there is no new trigger time.
+        // endpoints_controller.go:477-482: export the computed trigger time, or
+        // clear the annotation when there is no new one.
         let mut annotations = endpoints.metadata.annotations.take().unwrap_or_default();
-        annotations.remove(LAST_CHANGE_TRIGGER_TIME_ANNOTATION);
+        match endpoints_last_change_trigger_time {
+            Some(t) => {
+                annotations.insert(
+                    LAST_CHANGE_TRIGGER_TIME_ANNOTATION.to_string(),
+                    format_rfc3339_nano(t),
+                );
+            }
+            None => {
+                annotations.remove(LAST_CHANGE_TRIGGER_TIME_ANNOTATION);
+            }
+        }
         if truncated {
             annotations.insert(
                 ENDPOINTS_OVER_CAPACITY_ANNOTATION.to_string(),
@@ -602,7 +656,18 @@ impl<S: Storage + 'static> EndpointsController<S> {
 
         // Try to update first, if it doesn't exist, create it
         match self.storage.update(&endpoints_key, &endpoints).await {
-            Ok(_) => {}
+            Ok(updated) => {
+                // endpoints_controller.go:539-541: track the replaced resource
+                // version so a lagging read of it is recognised as stale.
+                if let Some(cur) = &existing {
+                    if updated.metadata.resource_version != cur.metadata.resource_version {
+                        if let Some(rv) = cur.metadata.resource_version.as_deref() {
+                            self.stale_endpoints_tracker
+                                .stale(namespace, service_name, rv);
+                        }
+                    }
+                }
+            }
             Err(rusternetes_common::Error::NotFound(_)) => {
                 self.storage.create(&endpoints_key, &endpoints).await?;
             }
@@ -885,7 +950,7 @@ mod tests {
     #[tokio::test]
     async fn test_pod_matches_selector() {
         let storage = Arc::new(MemoryStorage::new());
-        let controller = EndpointsController { storage };
+        let controller = EndpointsController::new(storage);
 
         let mut pod_labels = HashMap::new();
         pod_labels.insert("app".to_string(), "nginx".to_string());
@@ -1885,7 +1950,17 @@ mod tests {
             Some("endpoint-controller")
         );
         assert!(labels.contains_key(IS_HEADLESS_SERVICE_LABEL));
-        assert!(ep.metadata.annotations.is_none());
+        // The Service's annotations are not copied; the only annotation is the
+        // trigger time, which for a new Service is its creationTimestamp
+        // (trigger_time_tracker.go:117-120).
+        let annotations = ep.metadata.annotations.unwrap();
+        assert_eq!(annotations.len(), 1);
+        assert_eq!(
+            annotations.get(LAST_CHANGE_TRIGGER_TIME_ANNOTATION),
+            Some(&format_rfc3339_nano(
+                svc.metadata.creation_timestamp.unwrap()
+            ))
+        );
         assert!(ep.metadata.owner_references.is_none());
     }
 

@@ -8,7 +8,11 @@ use rusternetes_storage::{build_key, MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-fn create_test_service(name: &str, namespace: &str, selector: HashMap<String, String>) -> Service {
+pub(crate) fn create_test_service(
+    name: &str,
+    namespace: &str,
+    selector: HashMap<String, String>,
+) -> Service {
     Service {
         type_meta: TypeMeta {
             kind: "Service".to_string(),
@@ -53,7 +57,7 @@ fn create_test_service(name: &str, namespace: &str, selector: HashMap<String, St
     }
 }
 
-fn create_test_pod(
+pub(crate) fn create_test_pod(
     name: &str,
     namespace: &str,
     labels: HashMap<String, String>,
