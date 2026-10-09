@@ -738,3 +738,126 @@ mod busy_read_tests {
         assert_eq!(s.current_revision().await.unwrap(), 7);
     }
 }
+
+#[cfg(test)]
+mod stats_tests {
+    //! `Storage::stats` must be a keys-only read plus a per-key size cache
+    //! (#2869; upstream `storage/etcd3/stats.go` `resourceSizeEstimator.Stats`),
+    //! not a list that decodes and re-encodes every object once a minute.
+    use super::*;
+    use rhino::backend::{Backend, KeyValue, Result as BResult, WatchResult};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Default)]
+    struct Recording {
+        saw_keys_only: AtomicBool,
+        saw_value_read: AtomicBool,
+    }
+
+    fn kv(key: &str, value: &[u8], rev: i64) -> KeyValue {
+        KeyValue {
+            key: key.to_string(),
+            value: value.to_vec(),
+            version: 1,
+            create_revision: rev,
+            mod_revision: rev,
+            lease: 0,
+        }
+    }
+
+    #[async_trait]
+    impl Backend for Recording {
+        async fn start(&self) -> BResult<()> {
+            Ok(())
+        }
+        async fn get(
+            &self,
+            _: &str,
+            _: &str,
+            _: i64,
+            _: i64,
+            _: bool,
+        ) -> BResult<(i64, Option<KeyValue>)> {
+            unimplemented!()
+        }
+        async fn create(&self, _: &str, _: &[u8], _: i64) -> BResult<i64> {
+            unimplemented!()
+        }
+        async fn delete(&self, _: &str, _: i64) -> BResult<(i64, Option<KeyValue>, bool)> {
+            unimplemented!()
+        }
+        async fn delete_prefix(&self, _: &str) -> BResult<(i64, i64, Vec<KeyValue>)> {
+            unimplemented!()
+        }
+        async fn list(
+            &self,
+            _: &str,
+            _: &str,
+            _: i64,
+            _: i64,
+            keys_only: bool,
+        ) -> BResult<(i64, Vec<KeyValue>)> {
+            if keys_only {
+                self.saw_keys_only.store(true, Ordering::SeqCst);
+            } else {
+                self.saw_value_read.store(true, Ordering::SeqCst);
+            }
+            let value = |v: &'static [u8]| if keys_only { Vec::new() } else { v.to_vec() };
+            Ok((
+                9,
+                vec![
+                    kv(
+                        "/registry/pods/ns/a",
+                        &value(br#"{"metadata":{"name":"a"}}"#),
+                        8,
+                    ),
+                    kv(
+                        "/registry/pods/ns/b",
+                        &value(br#"{"metadata":{"name":"b"}}"#),
+                        9,
+                    ),
+                ],
+            ))
+        }
+        async fn count(&self, _: &str, _: &str, _: i64) -> BResult<(i64, i64)> {
+            unimplemented!()
+        }
+        async fn update(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: i64,
+            _: i64,
+        ) -> BResult<(i64, Option<KeyValue>, bool)> {
+            unimplemented!()
+        }
+        async fn watch(&self, _: &str, _: i64) -> BResult<WatchResult> {
+            unimplemented!()
+        }
+        async fn db_size(&self) -> BResult<i64> {
+            Ok(0)
+        }
+        async fn current_revision(&self) -> BResult<i64> {
+            Ok(9)
+        }
+        async fn wait_for_sync_to(&self, _: i64) {}
+        async fn compact(&self, r: i64) -> BResult<i64> {
+            Ok(r)
+        }
+    }
+
+    #[tokio::test]
+    async fn stats_reads_keys_only_and_never_the_values() {
+        let s = RhinoStorage {
+            backend: Arc::new(Recording::default()),
+            bus: None,
+        };
+        let st = Storage::stats(&s, "/registry/pods/").await.unwrap();
+        assert_eq!(st.object_count, 2);
+        assert!(s.backend.saw_keys_only.load(Ordering::SeqCst));
+        assert!(
+            !s.backend.saw_value_read.load(Ordering::SeqCst),
+            "stats must not read object values"
+        );
+    }
+}

@@ -163,6 +163,40 @@ mod tests {
         );
     }
 
+    /// Upstream starts an observer per registered store, CRD stores included
+    /// (`customresource_handler.go` builds a `genericregistry.Store` per CRD
+    /// version), so a custom resource's list is costed by its object count.
+    #[tokio::test]
+    async fn a_registered_crd_is_observed_under_plural_dot_group() {
+        let s = MemoryStorage::new();
+        let crd = serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {"name": "widgets.example.com"},
+            "spec": {
+                "group": "example.com",
+                "names": {"plural": "widgets", "singular": "widget", "kind": "Widget"},
+                "scope": "Namespaced",
+                "versions": [{"name": "v1", "served": true, "storage": true}]
+            }
+        });
+        s.create(
+            "/registry/customresourcedefinitions/widgets.example.com",
+            &crd,
+        )
+        .await
+        .unwrap();
+        let cr = serde_json::json!({"metadata": {"name": "w1", "namespace": "ns"}});
+        s.create("/registry/example_com_widgets/ns/w1", &cr)
+            .await
+            .unwrap();
+        let t = ObjectCountTracker::new();
+        poll_once(&s, &t).await;
+        let (st, err) = t.get("widgets.example.com");
+        assert_eq!(err, None, "CRD resources are polled, not NotFound");
+        assert_eq!(st.object_count, 1);
+    }
+
     #[tokio::test]
     async fn run_polls_immediately_then_stops_on_signal() {
         let s = Arc::new(MemoryStorage::new());
