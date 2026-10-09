@@ -126,7 +126,7 @@ struct TrackedPods {
 /// the Job stays `active: 1`, and every spec that waits for it to fail hangs.
 /// Terminal-success conditions for a Job, in the order the api-server demands.
 ///
-/// The mirror of [`failed_job_conditions`]: the interim `SuccessCriteriaMet`
+/// The mirror of [`FinishedCondition`]: the interim `SuccessCriteriaMet`
 /// is appended first and `Complete` inherits its reason and message
 /// (`job_controller.go:1317-1327`). Validation enforces the pair —
 /// `pkg/apis/batch/validation/validation.go:525-527`:
@@ -214,48 +214,72 @@ fn job_is_finished(job: &Job) -> bool {
         })
 }
 
-fn complete_job_conditions(reason: String, message: String) -> Vec<JobCondition> {
-    let now = chrono::Utc::now();
-    vec![
-        JobCondition {
-            condition_type: "SuccessCriteriaMet".to_string(),
-            status: "True".to_string(),
-            last_probe_time: Some(now),
-            last_transition_time: Some(now),
-            reason: Some(reason.clone()),
-            message: Some(message.clone()),
-        },
-        JobCondition {
-            condition_type: "Complete".to_string(),
-            status: "True".to_string(),
-            last_probe_time: Some(now),
-            last_transition_time: Some(now),
-            reason: Some(reason),
-            message: Some(message),
-        },
-    ]
+/// `jobCtx.finishedCondition` (`job_controller.go:945-998`): the ONE verdict
+/// every scenario in `syncJob` feeds - pre-existing SuccessCriteriaMet /
+/// FailureTarget, backoffLimit, `pastActiveDeadline`, per-index failures,
+/// successPolicy and completions. `Success` is `Complete` (staged through
+/// the interim `SuccessCriteriaMet`), `Failure` is `Failed` (staged through
+/// `FailureTarget`, `newFailedConditionForFailureTarget`, :1562).
+#[derive(Clone, Debug)]
+struct FinishedCondition {
+    success: bool,
+    reason: String,
+    message: String,
 }
 
-fn failed_job_conditions(reason: String, message: String) -> Vec<JobCondition> {
-    let now = chrono::Utc::now();
-    vec![
-        JobCondition {
-            condition_type: "FailureTarget".to_string(),
+impl FinishedCondition {
+    fn success(reason: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            success: true,
+            reason: reason.into(),
+            message: message.into(),
+        }
+    }
+
+    fn failure(reason: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            reason: reason.into(),
+            message: message.into(),
+        }
+    }
+
+    /// The single terminal handler: `enactJobFinished` (:1520-1545).
+    /// Returns the conditions and `completionTime` to publish. `ready` is
+    /// false while the finish gate (:1003-1007) is closed or uncounted pods
+    /// remain; then the previous conditions stand. While pods terminate only
+    /// the interim condition goes out (:1520-1524). `completionTime` is set
+    /// only for `Complete` (:1531-1533; validation.go:505-513).
+    fn enact(
+        &self,
+        previous: Option<Vec<JobCondition>>,
+        may_finish: bool,
+        terminating: i32,
+    ) -> (
+        Option<Vec<JobCondition>>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        if !may_finish {
+            return (previous, None);
+        }
+        let now = chrono::Utc::now();
+        let (interim, terminal) = if self.success {
+            ("SuccessCriteriaMet", "Complete")
+        } else {
+            ("FailureTarget", "Failed")
+        };
+        let cond = |t: &str| JobCondition {
+            condition_type: t.to_string(),
             status: "True".to_string(),
             last_probe_time: Some(now),
             last_transition_time: Some(now),
-            reason: Some(reason.clone()),
-            message: Some(message.clone()),
-        },
-        JobCondition {
-            condition_type: "Failed".to_string(),
-            status: "True".to_string(),
-            last_probe_time: Some(now),
-            last_transition_time: Some(now),
-            reason: Some(reason),
-            message: Some(message),
-        },
-    ]
+            reason: Some(self.reason.clone()),
+            message: Some(self.message.clone()),
+        };
+        let conditions = enact_job_finished(vec![cond(interim), cond(terminal)], terminating);
+        let completion_time = (self.success && terminating == 0).then_some(now);
+        (Some(conditions), completion_time)
+    }
 }
 
 /// Raise outgoing Job status counters to the persisted values so they never
@@ -2016,14 +2040,60 @@ impl<S: Storage + 'static> JobController<S> {
         // persisted SuccessCriteriaMet is honoured regardless of the spec.
         let success_policy_met =
             persisted_success.is_some() || (!is_failed && success_policy_matched);
-        let (success_reason, success_message) = persisted_success.clone().unwrap_or_else(|| {
-            (
-                "SuccessPolicy".to_string(),
+
+        // The single `finishedCondition` (job_controller.go:945-998, :1035-1037),
+        // in upstream's evaluation order: pre-existing SuccessCriteriaMet,
+        // pre-existing FailureTarget, failure scenarios, successPolicy, and
+        // lastly completions.
+        let finished: Option<FinishedCondition> = if let Some((r, m)) = persisted_success.clone() {
+            Some(FinishedCondition::success(r, m))
+        } else if let Some((r, m)) = persisted_failure.clone() {
+            Some(FinishedCondition::failure(r, m))
+        } else if is_failed {
+            Some(if deadline_exceeded {
+                // job_controller.go:969
+                FinishedCondition::failure(
+                    "DeadlineExceeded",
+                    "Job was active longer than specified deadline",
+                )
+            } else if pod_failure_policy_triggered {
+                FinishedCondition::failure("PodFailurePolicy", pod_failure_message.clone())
+            } else if max_failed_indexes_exceeded {
+                // job_controller.go:980
+                FinishedCondition::failure(
+                    "MaxFailedIndexesExceeded",
+                    "Job has exceeded the specified maximal number of failed indexes",
+                )
+            } else if index_failed && !early_failed {
+                // job_controller.go:982
+                FinishedCondition::failure("FailedIndexes", "Job has failed indexes")
+            } else {
+                // job_controller.go:964
+                FinishedCondition::failure(
+                    "BackoffLimitExceeded",
+                    "Job has reached the specified backoff limit",
+                )
+            })
+        } else if success_policy_matched {
+            // job_controller.go:993
+            Some(FinishedCondition::success(
+                "SuccessPolicy",
                 success_policy_message.clone().unwrap_or_default(),
-            )
-        });
+            ))
+        } else if is_complete {
+            // newSuccessCondition, job_controller.go:1101-1105
+            Some(FinishedCondition::success(
+                "CompletionsReached",
+                "Reached expected number of succeeded pods",
+            ))
+        } else {
+            None
+        };
 
         if success_policy_met {
+            let finished = finished
+                .clone()
+                .expect("success_policy_met implies a finishedCondition");
             info!("Job {}/{} met success policy criteria", namespace, name);
 
             // `deleteActivePods` (job_controller.go:1002, :1122-1140;
@@ -2046,14 +2116,11 @@ impl<S: Storage + 'static> JobController<S> {
             // conformance spec asserts it). Meanwhile only the interim
             // SuccessCriteriaMet condition is published.
             let terminating = count_unfinished_pods(&job_pods);
-            let conditions = if may_finish {
-                Some(enact_job_finished(
-                    complete_job_conditions(success_reason, success_message),
-                    terminating,
-                ))
-            } else {
-                job.status.as_ref().and_then(|s| s.conditions.clone())
-            };
+            let (conditions, completion_time) = finished.enact(
+                job.status.as_ref().and_then(|s| s.conditions.clone()),
+                may_finish,
+                terminating,
+            );
 
             job.status = Some(JobStatus {
                 active: Some(active - deleted),
@@ -2061,7 +2128,7 @@ impl<S: Storage + 'static> JobController<S> {
                 failed: status_failed,
                 conditions,
                 start_time,
-                completion_time: (may_finish && terminating == 0).then(chrono::Utc::now),
+                completion_time,
                 ready: Some(ready - deleted_ready),
                 terminating: Some(terminating),
                 completed_indexes: completed_indexes.clone(),
@@ -2165,24 +2232,21 @@ impl<S: Storage + 'static> JobController<S> {
             let terminating = count_unfinished_pods(&job_pods);
             // `enactJobFinished` (:1520-1524): Complete waits for terminating
             // pods; only the interim SuccessCriteriaMet is published meanwhile.
-            let conditions = if active_left == 0 {
-                Some(enact_job_finished(
-                    complete_job_conditions(
-                        "CompletionsReached".to_string(),
-                        "Reached expected number of succeeded pods".to_string(),
-                    ),
+            let (conditions, completion_time) = finished
+                .as_ref()
+                .expect("is_complete implies a finishedCondition")
+                .enact(
+                    job.status.as_ref().and_then(|s| s.conditions.clone()),
+                    active_left == 0,
                     terminating,
-                ))
-            } else {
-                job.status.as_ref().and_then(|s| s.conditions.clone())
-            };
+                );
             job.status = Some(JobStatus {
                 active: Some(active_left),
                 succeeded: status_succeeded,
                 failed: status_failed,
                 conditions,
                 start_time,
-                completion_time: (active_left == 0 && terminating == 0).then(chrono::Utc::now),
+                completion_time,
                 ready: Some(ready - deleted_ready),
                 terminating: Some(terminating),
                 completed_indexes: completed_indexes.clone(),
@@ -2195,39 +2259,6 @@ impl<S: Storage + 'static> JobController<S> {
                 "Job {}/{} failed after {} failures",
                 namespace, name, failed
             );
-
-            // Determine failure reason
-            let (reason, message) = if let Some((r, m)) = persisted_failure.clone() {
-                (r, m)
-            } else if deadline_exceeded {
-                (
-                    "DeadlineExceeded".to_string(),
-                    format!(
-                        "Job was active longer than specified deadline of {} seconds",
-                        job.spec.active_deadline_seconds.unwrap_or_default()
-                    ),
-                )
-            } else if pod_failure_policy_triggered {
-                ("PodFailurePolicy".to_string(), pod_failure_message.clone())
-            } else if max_failed_indexes_exceeded {
-                (
-                    "MaxFailedIndexesExceeded".to_string(),
-                    "Job has exceeded the maximum number of failed indexes".to_string(),
-                )
-            } else if backoff_limit_per_index.is_some() && is_indexed {
-                (
-                    "FailedIndexes".to_string(),
-                    format!(
-                        "Job has failed indexes: {}",
-                        failed_indexes.as_deref().unwrap_or("")
-                    ),
-                )
-            } else {
-                (
-                    "BackoffLimitExceeded".to_string(),
-                    format!("Job has reached backoff limit of {}", backoff_limit),
-                )
-            };
 
             // `deleteActivePods` + the finish gate (job_controller.go:1002-1007).
             let (may_finish, deleted_ready, deleted, derr) = self
@@ -2242,14 +2273,14 @@ impl<S: Storage + 'static> JobController<S> {
             // `enactJobFinished` (:1520-1524): Failed waits for terminating
             // pods; only FailureTarget is published meanwhile.
             let terminating = count_unfinished_pods(&job_pods);
-            let conditions = if may_finish {
-                Some(enact_job_finished(
-                    failed_job_conditions(reason, message),
+            let (conditions, completion_time) = finished
+                .as_ref()
+                .expect("is_failed implies a finishedCondition")
+                .enact(
+                    job.status.as_ref().and_then(|s| s.conditions.clone()),
+                    may_finish,
                     terminating,
-                ))
-            } else {
-                job.status.as_ref().and_then(|s| s.conditions.clone())
-            };
+                );
             job.status = Some(JobStatus {
                 active: Some(active - deleted),
                 succeeded: status_succeeded,
@@ -2257,8 +2288,8 @@ impl<S: Storage + 'static> JobController<S> {
                 conditions,
                 start_time,
                 // completionTime is valid ONLY on a Complete job
-                // (validation.go:505-513).
-                completion_time: None,
+                // (validation.go:505-513); `enact` yields None here.
+                completion_time,
                 ready: Some(ready - deleted_ready),
                 terminating: Some(terminating),
                 completed_indexes: completed_indexes.clone(),
