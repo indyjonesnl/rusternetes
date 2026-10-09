@@ -293,7 +293,6 @@ mod service_update_ip_families_test;
 mod serviceaccount_handler_test;
 mod serviceaccount_store_test;
 mod small_api_decode_when_absent_test;
-mod spdy_test;
 mod ssa_configmap_apply_test;
 mod ssa_reset_fields_test;
 mod ssa_secret_apply_test;
