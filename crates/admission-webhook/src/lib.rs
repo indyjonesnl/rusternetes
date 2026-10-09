@@ -2504,6 +2504,109 @@ mod tests {
 
     // ===== JSON Patch Tests =====
 
+    fn op(
+        op: rusternetes_common::admission::PatchOp,
+        path: &str,
+        value: Option<Value>,
+        from: Option<&str>,
+    ) -> PatchOperation {
+        PatchOperation {
+            op,
+            path: path.to_string(),
+            value,
+            from: from.map(String::from),
+        }
+    }
+
+    // #2967: RFC 6902 array indexes, "-" append, move/copy/test and
+    // ~0/~1 escapes (evanphx/json-patch, used by upstream
+    // plugin/webhook/mutating/dispatcher.go).
+    #[test]
+    fn test_apply_json_patch_array_index_and_append() {
+        use rusternetes_common::admission::PatchOp;
+        let mut obj = json!({"spec": {"containers": [{"command": ["a", "b"]}]}});
+        apply_json_patch(
+            &mut obj,
+            &op(
+                PatchOp::Replace,
+                "/spec/containers/0/command/0",
+                Some(json!("z")),
+                None,
+            ),
+        )
+        .unwrap();
+        assert_eq!(obj["spec"]["containers"][0]["command"], json!(["z", "b"]));
+        apply_json_patch(
+            &mut obj,
+            &op(
+                PatchOp::Add,
+                "/spec/containers/0/command/-",
+                Some(json!("c")),
+                None,
+            ),
+        )
+        .unwrap();
+        apply_json_patch(
+            &mut obj,
+            &op(
+                PatchOp::Add,
+                "/spec/containers/0/command/0",
+                Some(json!("y")),
+                None,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            obj["spec"]["containers"][0]["command"],
+            json!(["y", "z", "b", "c"])
+        );
+        apply_json_patch(
+            &mut obj,
+            &op(PatchOp::Remove, "/spec/containers/0/command/1", None, None),
+        )
+        .unwrap();
+        assert_eq!(
+            obj["spec"]["containers"][0]["command"],
+            json!(["y", "b", "c"])
+        );
+        assert!(apply_json_patch(
+            &mut obj,
+            &op(
+                PatchOp::Replace,
+                "/spec/containers/0/command/9",
+                Some(json!("q")),
+                None
+            )
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_apply_json_patch_move_copy_test_and_escapes() {
+        use rusternetes_common::admission::PatchOp;
+        let mut obj = json!({"metadata": {"annotations": {"a/b": "1"}}, "x": 1});
+        apply_json_patch(&mut obj, &op(PatchOp::Copy, "/y", None, Some("/x"))).unwrap();
+        apply_json_patch(&mut obj, &op(PatchOp::Move, "/z", None, Some("/x"))).unwrap();
+        assert_eq!(obj["y"], json!(1));
+        assert_eq!(obj["z"], json!(1));
+        assert!(obj.get("x").is_none());
+        apply_json_patch(
+            &mut obj,
+            &op(
+                PatchOp::Replace,
+                "/metadata/annotations/a~1b",
+                Some(json!("2")),
+                None,
+            ),
+        )
+        .unwrap();
+        assert_eq!(obj["metadata"]["annotations"]["a/b"], json!("2"));
+        apply_json_patch(&mut obj, &op(PatchOp::Test, "/y", Some(json!(1)), None)).unwrap();
+        assert!(
+            apply_json_patch(&mut obj, &op(PatchOp::Test, "/y", Some(json!(2)), None)).is_err()
+        );
+    }
+
     #[test]
     fn test_apply_json_patch_add() {
         let mut obj = json!({
