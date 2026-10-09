@@ -39,10 +39,10 @@ async fn review(State(m): State<Shared>, Json(body): Json<Value>) -> axum::respo
     m.called += 1;
     m.last = Some(body.clone());
     if !(200..300).contains(&m.status_code) {
-        let mut resp =
-            (StatusCode::from_u16(m.status_code).unwrap(), "HTTP Error").into_response();
+        let mut resp = (StatusCode::from_u16(m.status_code).unwrap(), "HTTP Error").into_response();
         if let Some(ra) = &m.retry_after {
-            resp.headers_mut().insert("retry-after", ra.parse().unwrap());
+            resp.headers_mut()
+                .insert("retry-after", ra.parse().unwrap());
         }
         return resp;
     }
@@ -223,6 +223,9 @@ async fn cache_and_retry_table() {
         let mut a = RequestAttributes::new(user(n), "v".repeat(2000), "r".repeat(2000));
         a.api_group = "g".repeat(2000);
         a.name = Some("n".repeat(2000));
+        // upstream also has a 2000-char APIVersion; we carry none, so the
+        // subresource makes up the 10000 bytes.
+        a.subresource = Some("a".repeat(2000));
         a.namespace = Some("kittensandponies".into());
         a
     };
@@ -236,10 +239,26 @@ async fn cache_and_retry_table() {
         ("404 doesnt retry", &alice, false, 404, true, false, 1),
         ("403 doesnt retry", &alice, false, 403, true, false, 1),
         ("401 doesnt retry", &alice, false, 401, true, false, 1),
-        ("alice successful request", &alice, true, 200, false, true, 1),
+        (
+            "alice successful request",
+            &alice,
+            true,
+            200,
+            false,
+            true,
+            1,
+        ),
         ("alice cached request", &alice, false, 500, false, true, 0),
         ("bob failed request", &bob, false, 500, true, false, 5),
-        ("bob unauthorized request", &bob, false, 200, false, false, 1),
+        (
+            "bob unauthorized request",
+            &bob,
+            false,
+            200,
+            false,
+            false,
+            1,
+        ),
         (
             "bob unauthorized cached request",
             &bob,
@@ -372,9 +391,10 @@ async fn status_maps_to_opinion() {
     // Opinion::Deny carries no error, so the error text is in the reason.
     mock.lock().unwrap().allow = true;
     match wh.authorize_opinion(&resource("a")).await.unwrap() {
-        Opinion::Deny(reason) => assert!(reason.contains(
-            "webhook subject access review returned both allow and deny response"
-        )),
+        Opinion::Deny(reason) => {
+            assert!(reason
+                .contains("webhook subject access review returned both allow and deny response"))
+        }
         other => panic!("allowed+denied must deny, got {other:?}"),
     }
 }

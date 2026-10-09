@@ -47,6 +47,9 @@ pub struct AuthorizationArgs {
     /// authorization.go:176-177).
     #[arg(long = "authorization-policy-file", default_value = "")]
     pub authorization_policy_file: String,
+    /// `--authorization-webhook-*` (#2895).
+    #[command(flatten)]
+    pub webhook: crate::authorization_webhook::AuthorizationWebhookArgs,
 }
 
 /// `IsValidAuthorizationMode` (modes.go:41).
@@ -103,15 +106,30 @@ pub fn validate_authorization_modes(modes: &[String], policy_file: &str) -> Vec<
 /// `system:masters` superuser authorizer first (reload.go:97-99) followed by
 /// the configured `modes` in order (reload.go:101-176), after Complete and
 /// Validate. ABAC reads `policy_file` once here (reload.go:118-123 reuses the
-/// list loaded at startup; no hot reload). Webhook is not yet implemented.
+/// list loaded at startup; no hot reload). Webhook: see [`build_authorizer_with_webhook`].
 pub fn build_authorizer<S: AuthzStorage + 'static>(
     storage: Arc<S>,
     skip_auth: bool,
     modes: &[String],
     policy_file: &str,
 ) -> anyhow::Result<Arc<dyn Authorizer>> {
+    build_authorizer_with_webhook(storage, skip_auth, modes, policy_file, &Default::default())
+}
+
+/// [`build_authorizer`] with the `--authorization-webhook-*` options, for the
+/// `Webhook` mode (reload.go:124-167).
+pub fn build_authorizer_with_webhook<S: AuthzStorage + 'static>(
+    storage: Arc<S>,
+    skip_auth: bool,
+    modes: &[String],
+    policy_file: &str,
+    webhook: &crate::authorization_webhook::AuthorizationWebhookArgs,
+) -> anyhow::Result<Arc<dyn Authorizer>> {
     let modes = complete_authorization_modes(modes);
-    let errs = validate_authorization_modes(&modes, policy_file);
+    let mut errs = validate_authorization_modes(&modes, policy_file);
+    errs.extend(crate::authorization_webhook::validate_webhook_args(
+        &modes, webhook,
+    ));
     if !errs.is_empty() {
         anyhow::bail!("invalid authorization options: {}", errs.join("; "));
     }
@@ -127,6 +145,9 @@ pub fn build_authorizer<S: AuthzStorage + 'static>(
             // config.go:126-130 `abac.NewFromFile(config.PolicyFile)`.
             MODE_ABAC => chain.push(Arc::new(PolicyList::new_from_file(Path::new(policy_file))?)),
             MODE_RBAC => chain.push(Arc::new(RBACAuthorizer::new(storage.clone()))),
+            MODE_WEBHOOK => chain.push(Arc::new(
+                crate::authorization_webhook::WebhookAuthorizer::from_args(webhook)?,
+            )),
             other => anyhow::bail!("authorization-mode {other} is not supported yet"),
         }
     }
@@ -340,6 +361,16 @@ mod tests {
             .unwrap()
             .to_string()
             .contains("policy file not passed"));
+    }
+
+    // TestAuthzValidate: Webhook without its config file is refused at build.
+    #[test]
+    fn webhook_mode_requires_its_config_file() {
+        let err = build(&["Webhook"]).err().unwrap().to_string();
+        assert!(
+            err.contains("authorization-mode Webhook's authorization config file not passed"),
+            "{err}"
+        );
     }
 
     mod args {

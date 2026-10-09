@@ -299,11 +299,12 @@ async fn main() -> Result<()> {
         warn!("⚠️  Using AlwaysAllowAuthorizer - all requests will be permitted");
         warn!("⚠️  This should ONLY be used in development/testing environments");
     }
-    let authorizer = rusternetes_api_server::authorizer::build_authorizer(
+    let authorizer = rusternetes_api_server::authorizer::build_authorizer_with_webhook(
         storage.clone(),
         args.skip_auth,
         &args.authorization.authorization_mode,
         &args.authorization.authorization_policy_file,
+        &args.authorization.webhook,
     )?;
 
     // Initialize Metrics Registry
@@ -323,6 +324,7 @@ async fn main() -> Result<()> {
         service_account,
         authorization_mode: args.authorization.authorization_mode.clone(),
         authorization_policy_file: args.authorization.authorization_policy_file.clone(),
+        authorization_webhook: args.authorization.webhook.clone(),
         ..Default::default()
     };
     let prepared_tls = rusternetes_api_server::prepare_tls_for_config(&api_config)?;

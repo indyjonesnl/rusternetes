@@ -1,6 +1,7 @@
 pub mod abac;
 pub mod admission;
 pub mod audit;
+pub mod authorization_webhook;
 pub mod authorizer;
 pub use rusternetes_admission_webhook as admission_webhook;
 pub mod apiserver_identity;
@@ -176,6 +177,8 @@ pub struct ApiServerConfig {
     pub authorization_mode: Vec<String>,
     /// `--authorization-policy-file` for ABAC mode.
     pub authorization_policy_file: String,
+    /// `--authorization-webhook-*` (#2895).
+    pub authorization_webhook: authorization_webhook::AuthorizationWebhookArgs,
     pub prometheus_url: Option<String>,
     /// Path to the console SPA build directory. When set, the API server
     /// serves the console UI at `/console/` and falls back to `index.html`
@@ -289,6 +292,7 @@ impl Default for ApiServerConfig {
             skip_auth: true,
             authorization_mode: Vec::new(),
             authorization_policy_file: String::new(),
+            authorization_webhook: Default::default(),
             prometheus_url: None,
             console_dir: None,
             client_ca_file: None,
@@ -322,11 +326,12 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
     if config.skip_auth {
         warn!("Authentication and authorization disabled - insecure mode");
     }
-    let authorizer = authorizer::build_authorizer(
+    let authorizer = authorizer::build_authorizer_with_webhook(
         storage.clone(),
         config.skip_auth,
         &config.authorization_mode,
         &config.authorization_policy_file,
+        &config.authorization_webhook,
     )?;
 
     let metrics = Arc::new(MetricsRegistry::new().with_api_server_metrics()?);
