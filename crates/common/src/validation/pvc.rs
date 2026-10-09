@@ -603,8 +603,35 @@ fn specs_semantically_equal(a: &PersistentVolumeClaimSpec, b: &PersistentVolumeC
 /// diff of `json.MarshalIndent` of the INTERNAL `core.PersistentVolumeClaimSpec`
 /// (types.go:503-575), which has no json tags — so Go field names in
 /// declaration order, no omitempty, nil pointers/maps/slices as `null`.
+/// Known gap: `access_modes` is a plain `Vec`, so a nil and an empty
+/// `AccessModes` slice both render `null` (Go: `null` vs `[]`).
 fn spec_diff(old: &PersistentVolumeClaimSpec, new: &PersistentVolumeClaimSpec) -> String {
     crate::diff::diff(&go_spec_json(old), &go_spec_json(new))
+}
+
+/// `core.ResourceList` (`map[ResourceName]resource.Quantity`) as
+/// `json.MarshalIndent` emits it: keys sorted, each value through
+/// `Quantity.MarshalJSON`, which writes the canonical `Quantity.String()`
+/// (apimachinery `pkg/api/resource/quantity.go`), so `1024Mi` is `1Gi`. A
+/// value that does not parse could never have decoded in Go; it is kept as
+/// stored. `None` is a nil map (`null`), `Some(empty)` a non-nil one (`{}`).
+fn quantity_map(m: &Option<HashMap<String, String>>) -> GoJson {
+    match m {
+        None => GoJson::Null,
+        Some(m) => {
+            let mut v: Vec<(String, GoJson)> = m
+                .iter()
+                .map(|(k, raw)| {
+                    let s = Quantity::parse(raw)
+                        .map(|q| q.canonical_string())
+                        .unwrap_or_else(|_| raw.clone());
+                    (k.clone(), GoJson::str(s))
+                })
+                .collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            GoJson::Object(v)
+        }
+    }
 }
 
 fn go_spec_json(s: &PersistentVolumeClaimSpec) -> GoJson {
@@ -709,14 +736,8 @@ fn go_spec_json(s: &PersistentVolumeClaimSpec) -> GoJson {
         (
             "Resources".into(),
             GoJson::Object(vec![
-                (
-                    "Limits".into(),
-                    GoJson::string_map(s.resources.limits.as_ref().map(|m| m.iter())),
-                ),
-                (
-                    "Requests".into(),
-                    GoJson::string_map(s.resources.requests.as_ref().map(|m| m.iter())),
-                ),
+                ("Limits".into(), quantity_map(&s.resources.limits)),
+                ("Requests".into(), quantity_map(&s.resources.requests)),
             ]),
         ),
         (
