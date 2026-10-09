@@ -303,6 +303,7 @@ async fn main() -> Result<()> {
         storage.clone(),
         args.skip_auth,
         &args.authorization.authorization_mode,
+        &args.authorization.authorization_policy_file,
     )?;
 
     // Initialize Metrics Registry
@@ -321,6 +322,7 @@ async fn main() -> Result<()> {
         service_node_port_range: args.service_node_port_range,
         service_account,
         authorization_mode: args.authorization.authorization_mode.clone(),
+        authorization_policy_file: args.authorization.authorization_policy_file.clone(),
         ..Default::default()
     };
     let prepared_tls = rusternetes_api_server::prepare_tls_for_config(&api_config)?;

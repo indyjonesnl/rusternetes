@@ -173,6 +173,8 @@ pub struct ApiServerConfig {
     pub skip_auth: bool,
     /// `--authorization-mode`; empty means the default `Node,RBAC` (#2854).
     pub authorization_mode: Vec<String>,
+    /// `--authorization-policy-file` for ABAC mode.
+    pub authorization_policy_file: String,
     pub prometheus_url: Option<String>,
     /// Path to the console SPA build directory. When set, the API server
     /// serves the console UI at `/console/` and falls back to `index.html`
@@ -285,6 +287,7 @@ impl Default for ApiServerConfig {
             tls_san: "localhost,127.0.0.1".to_string(),
             skip_auth: true,
             authorization_mode: Vec::new(),
+            authorization_policy_file: String::new(),
             prometheus_url: None,
             console_dir: None,
             client_ca_file: None,
@@ -322,6 +325,7 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
         storage.clone(),
         config.skip_auth,
         &config.authorization_mode,
+        &config.authorization_policy_file,
     )?;
 
     let metrics = Arc::new(MetricsRegistry::new().with_api_server_metrics()?);
