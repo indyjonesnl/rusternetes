@@ -504,6 +504,7 @@ impl AuditContext {
             g.event.response_status = Some(ResponseStatus {
                 code,
                 message: None,
+                ..Default::default()
             });
         }
     }
@@ -678,11 +679,47 @@ pub async fn with_audit(cfg: Arc<AuditConfig>, req: Request, next: Next) -> Resp
         resp.headers_mut().insert("Audit-ID", v);
     }
     ac.set_response_status(resp.status().as_u16());
+    if !resp.status().is_success() && !resp.status().is_informational() {
+        resp = record_status_body(&ac, resp).await;
+    }
     if long_running {
         ac.process_event_stage(AuditStage::ResponseStarted).await;
     }
     ac.process_event_stage(AuditStage::ResponseComplete).await;
     resp
+}
+
+/// Largest error body buffered to recover the Status (error responses are
+/// small; a streamed body is never an error Status).
+const MAX_STATUS_BODY: usize = 1 << 20;
+
+/// `audit.LogResponseObject` (audit/request.go): at Metadata level and above
+/// the `metav1.Status` the handler wrote becomes the event's `ResponseStatus`
+/// (`ac.LogResponseObject` -> `ev.ResponseStatus = status`). Upstream hooks the
+/// serializer; here the (non-2xx) body is read back and passed through
+/// unchanged. Deviation: a 2xx Status (e.g. a delete's Success) is not
+/// recorded, because buffering success bodies would break streaming.
+async fn record_status_body(ac: &AuditContext, resp: Response) -> Response {
+    let (parts, body) = resp.into_parts();
+    let bytes = axum::body::to_bytes(body, MAX_STATUS_BODY)
+        .await
+        .unwrap_or_default();
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+        if v.get("kind").and_then(|k| k.as_str()) == Some("Status") {
+            let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+            if let Ok(mut g) = ac.inner.lock() {
+                g.event.response_status = Some(ResponseStatus {
+                    status: s("status"),
+                    message: s("message"),
+                    reason: s("reason"),
+                    details: v.get("details").cloned(),
+                    code: parts.status.as_u16(),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+    Response::from_parts(parts, axum::body::Body::from(bytes))
 }
 
 fn internal_error(msg: &str) -> Response {
@@ -971,6 +1008,57 @@ rules:
             ev[0].annotations.as_ref().unwrap()["authentication.k8s.io/legacy-token"],
             "system:serviceaccount:ns:sa"
         );
+    }
+
+    /// `LogResponseObject` (audit/request.go) stores the `metav1.Status` the
+    /// handler wrote as the event's ResponseStatus, so a NotFound carries its
+    /// status/reason/message, not just the code.
+    #[tokio::test]
+    async fn failed_response_status_body_is_recorded() {
+        let cap = Arc::new(Capture(Default::default()));
+        let cfg = Arc::new(AuditConfig {
+            policy: Policy::from_yaml(&POLICY.replace("omitStages: [\"RequestReceived\"]\n", ""))
+                .unwrap(),
+            sink: cap.clone(),
+        });
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/:ns/secrets/:name",
+                get(|| async {
+                    (
+                        axum::http::StatusCode::NOT_FOUND,
+                        [("content-type", "application/json")],
+                        r#"{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"secrets \"s\" not found","reason":"NotFound","details":{"name":"s","kind":"secrets"},"code":404}"#,
+                    )
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| {
+                let cfg = cfg.clone();
+                async move { with_audit(cfg, req, next).await }
+            }));
+        let resp = app
+            .oneshot(
+                axum::http::Request::get("/api/v1/namespaces/ns/secrets/s")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        // The client still receives the body untouched.
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("NotFound"));
+        let ev = cap.0.lock().await;
+        let rs = ev[1].response_status.as_ref().unwrap();
+        assert_eq!(rs.code, 404);
+        assert_eq!(rs.status.as_deref(), Some("Failure"));
+        assert_eq!(rs.reason.as_deref(), Some("NotFound"));
+        assert_eq!(rs.message.as_deref(), Some("secrets \"s\" not found"));
+        assert_eq!(rs.details.as_ref().unwrap()["name"], "s");
+        let json = serde_json::to_value(rs).unwrap();
+        assert_eq!(json["metadata"], serde_json::json!({}));
     }
 
     #[tokio::test]
