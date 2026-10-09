@@ -74,7 +74,6 @@ impl VolumePlugin for SecretPlugin {
                 .unwrap_or_else(|| "default".to_string()),
             secret: spec.volume.secret.clone().expect("checked by can_support"),
             storage: self.host.get_kube_client().cloned(),
-            fs_group: crate::volume_plugins::util::fs_group_from(pod),
             pod: pod.clone(),
         }))
     }
@@ -168,8 +167,6 @@ struct SecretMounter {
     namespace: String,
     secret: SecretVolumeSource,
     storage: Option<Arc<StorageBackend>>,
-    /// `mounterArgs.FsGroup` (`volume.go:132`).
-    fs_group: Option<i64>,
     /// `secretVolumeMounter.pod` (`secret.go:155`), read by
     /// `MakeNestedMountpoints`.
     pod: Pod,
@@ -293,7 +290,7 @@ impl Mounter for SecretMounter {
         if let Err(e) = crate::volume_ownership::write_payload_with_ownership(
             std::path::Path::new(volume_dir),
             &payload,
-            args.fs_group.or(self.fs_group),
+            args.fs_group,
             true,
         ) {
             // emptyDir `TearDownAt` removes the ready dir first (empty_dir.go:497-500).

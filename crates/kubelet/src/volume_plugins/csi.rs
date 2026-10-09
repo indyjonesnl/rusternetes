@@ -265,12 +265,6 @@ impl VolumePlugin for CsiPlugin {
             storage: self.host.get_kube_client().cloned(),
             plugin_dir: plugin_dir(self.host.get_volumes_base_path()),
             token_manager: self.host.get_service_account_token_func().clone(),
-            fs_group: crate::volume_plugins::util::fs_group_from(pod),
-            fs_group_change_policy: pod
-                .spec
-                .as_ref()
-                .and_then(|s| s.security_context.as_ref())
-                .and_then(|sc| sc.fs_group_change_policy.clone()),
         }))
     }
 
@@ -487,10 +481,6 @@ struct CsiMounter {
     /// token when the backend has no api-server to ask (see
     /// [`CsiMounter::pod_service_account_token_attrs`]).
     token_manager: rusternetes_common::auth::TokenManager,
-    /// `MounterArgs.FsGroup` (`operation_generator.go:501-509`).
-    fs_group: Option<i64>,
-    /// `MounterArgs.FSGroupChangePolicy` (`operation_generator.go:502-509`).
-    fs_group_change_policy: Option<String>,
 }
 
 fn transient(msg: String) -> anyhow::Error {
@@ -945,11 +935,10 @@ impl Mounter for CsiMounter {
         args: &crate::volume_plugins::MounterArgs,
     ) -> Result<()> {
         let dir = Path::new(dir_str);
-        let fs_group = args.fs_group.or(self.fs_group);
-        let fs_group_change_policy = args
-            .fs_group_change_policy
-            .clone()
-            .or_else(|| self.fs_group_change_policy.clone());
+        // `mounterArgs.FsGroup` / `.FSGroupChangePolicy` (`csi_mounter.go`
+        // `SetUpAt`); `NewMounter` captures neither.
+        let fs_group = args.fs_group;
+        let fs_group_change_policy = args.fs_group_change_policy.clone();
 
         let client = match CsiDriverClient::new(&self.driver_name) {
             Ok(c) => c,

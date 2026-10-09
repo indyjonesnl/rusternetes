@@ -131,10 +131,6 @@ impl ProjectedPlugin {
             // only when a downwardAPI source item has a `resourceFieldRef`,
             // same as Task 7's downwardAPI plugin.
             node_allocatable: self.host.get_node_allocatable().clone(),
-            // `MounterArgs{FsUser: util.FsUserFrom(pod), FsGroup: fsGroup}`
-            // (`operation_generator.go:501-509`, `:583-584`).
-            fs_user: crate::volume_plugins::util::fs_user_from(pod),
-            fs_group: crate::volume_plugins::util::fs_group_from(pod),
         }
     }
 }
@@ -150,10 +146,6 @@ struct ProjectedMounter {
     storage: Option<Arc<StorageBackend>>,
     token_manager: rusternetes_common::auth::TokenManager,
     node_allocatable: HashMap<String, String>,
-    /// `mounterArgs.FsUser` (`volume.go:131`).
-    fs_user: Option<i64>,
-    /// `mounterArgs.FsGroup` (`volume.go:132`).
-    fs_group: Option<i64>,
 }
 
 /// `utilerrors.NewAggregate(errlist).Error()`
@@ -348,13 +340,22 @@ fn secret_file_mode(fs_user: Option<i64>, fs_group: Option<i64>, default_mode: u
 }
 
 impl ProjectedMounter {
-    fn secret_file_mode(&self, default_mode: u32) -> u32 {
-        secret_file_mode(self.fs_user, self.fs_group, default_mode)
+    /// `mounterArgs.FsUser` / `.FsGroup` (`volume.go:131-132`), read per call
+    /// as `projected.go:276-282` does - never captured by `NewMounter`.
+    fn secret_file_mode(
+        &self,
+        args: &crate::volume_plugins::MounterArgs,
+        default_mode: u32,
+    ) -> u32 {
+        secret_file_mode(args.fs_user, args.fs_group, default_mode)
     }
 
     /// `collectData` (`projected.go:226-338`): build ONE payload from every
     /// source, accumulating errors, and fail with their aggregate.
-    async fn collect_data(&self) -> Result<BTreeMap<String, FileProjection>> {
+    async fn collect_data(
+        &self,
+        args: &crate::volume_plugins::MounterArgs,
+    ) -> Result<BTreeMap<String, FileProjection>> {
         let projected = self
             .volume
             .projected
@@ -424,9 +425,9 @@ impl ProjectedMounter {
                         payload.insert(
                             tp.path.clone(),
                             FileProjection {
-                                fs_user: self.fs_user,
+                                fs_user: args.fs_user,
                                 data: token.into_bytes(),
-                                mode: self.secret_file_mode(default_mode),
+                                mode: self.secret_file_mode(args, default_mode),
                             },
                         );
                     }
@@ -438,9 +439,9 @@ impl ProjectedMounter {
                         payload.insert(
                             ctb.path.clone(),
                             FileProjection {
-                                fs_user: self.fs_user,
+                                fs_user: args.fs_user,
                                 data: trust_anchors,
-                                mode: self.secret_file_mode(default_mode),
+                                mode: self.secret_file_mode(args, default_mode),
                             },
                         );
                     }
@@ -470,13 +471,13 @@ impl ProjectedMounter {
                         continue;
                     }
                 };
-                let mode = self.secret_file_mode(default_mode);
+                let mode = self.secret_file_mode(args, default_mode);
                 let mut put = |path: &Option<String>, data: Vec<u8>| {
                     if let Some(path) = path.as_deref().filter(|p| !p.is_empty()) {
                         payload.insert(
                             path.to_string(),
                             FileProjection {
-                                fs_user: self.fs_user,
+                                fs_user: args.fs_user,
                                 data,
                                 mode,
                             },
@@ -695,7 +696,7 @@ impl Mounter for ProjectedMounter {
         std::fs::create_dir_all(volume_dir)
             .context("Failed to create projected volume directory")?;
 
-        let payload = self.collect_data().await.inspect_err(|e| {
+        let payload = self.collect_data(args).await.inspect_err(|e| {
             tracing::error!(
                 "Error preparing data for projected volume {} for pod {}/{}: {}",
                 self.volume.name,
@@ -705,12 +706,7 @@ impl Mounter for ProjectedMounter {
             );
         })?;
 
-        write_payload(
-            std::path::Path::new(volume_dir),
-            &payload,
-            args.fs_group.or(self.fs_group),
-        )
-        .map_err(|e| {
+        write_payload(std::path::Path::new(volume_dir), &payload, args.fs_group).map_err(|e| {
             tracing::error!("Error writing payload to dir: {}", e);
             anyhow!(e)
         })?;
@@ -897,6 +893,16 @@ fn token_jitter_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The args the operation generator builds from the pod
+    /// (`operation_generator.go:582-589`).
+    fn args_for(pod: &Pod) -> crate::volume_plugins::MounterArgs {
+        crate::volume_plugins::MounterArgs {
+            fs_user: crate::volume_plugins::util::fs_user_from(pod),
+            fs_group: crate::volume_plugins::util::fs_group_from(pod),
+            ..Default::default()
+        }
+    }
 
     // Upstream pkg/kubelet/token/token_manager.go:40 `maxTTL = 24 * time.Hour`,
     // :187 `now.After(iat.Add(maxTTL - jitter))` => refresh by 24h-jitter.
@@ -1225,7 +1231,7 @@ mod tests {
             ]));
             let pod = pod_with_security(pod_sc, ctr_sc);
             let m = mounter_for(dir.path(), &st, &v, &pod).await;
-            m.set_up().await.unwrap();
+            m.set_up_with(&args_for(&pod)).await.unwrap();
             let tok = std::path::PathBuf::from(m.get_path()).join("token");
             let meta = std::fs::metadata(&tok).unwrap();
             assert_eq!(meta.permissions().mode() & 0o777, want, "{name}");
@@ -1248,11 +1254,11 @@ mod tests {
         let v = vol(serde_json::json!([{"configMap": {"name": "cm"}}]));
         let pod = pod_with_security(serde_json::json!({"fsGroup": gid}), serde_json::json!({}));
         let m = mounter_for(dir.path(), &st, &v, &pod).await;
-        m.set_up().await.unwrap();
+        m.set_up_with(&args_for(&pod)).await.unwrap();
         let real = std::fs::canonicalize(std::path::PathBuf::from(m.get_path()).join("a")).unwrap();
         let before = std::fs::metadata(&real).unwrap().ctime_nsec();
         let before_s = std::fs::metadata(&real).unwrap().ctime();
-        m.set_up().await.unwrap();
+        m.set_up_with(&args_for(&pod)).await.unwrap();
         let after = std::fs::metadata(&real).unwrap();
         assert_eq!((before_s, before), (after.ctime(), after.ctime_nsec()));
     }
@@ -1303,7 +1309,10 @@ mod tests {
             persistent_volume: None,
             read_only: false,
         };
-        plugin.build_mounter(&spec, pod).collect_data().await
+        plugin
+            .build_mounter(&spec, pod)
+            .collect_data(&args_for(pod))
+            .await
     }
 
     fn payload_bundle(p: &BTreeMap<String, FileProjection>, path: &str) -> Vec<Vec<u8>> {
@@ -1483,7 +1492,10 @@ mod tests {
             persistent_volume: None,
             read_only: false,
         };
-        plugin.build_mounter(&spec, pod).collect_data().await
+        plugin
+            .build_mounter(&spec, pod)
+            .collect_data(&args_for(pod))
+            .await
     }
 
     /// `TestCollectDataWithPodCertificate` (`projected_test.go:1041-1142`),
@@ -1588,7 +1600,7 @@ mod tests {
         };
         ProjectedPlugin::new(Arc::new(host))
             .build_mounter(&spec, &pod())
-            .collect_data()
+            .collect_data(&args_for(&pod()))
             .await
             .unwrap();
         assert_eq!(*rec.0.lock().unwrap(), vec![1]);

@@ -78,7 +78,6 @@ impl VolumePlugin for EmptyDirPlugin {
                 .empty_dir
                 .clone()
                 .expect("checked by can_support"),
-            fs_group: crate::volume_plugins::util::fs_group_from(pod),
         }))
     }
 
@@ -281,8 +280,6 @@ struct EmptyDirMounter {
     path: String,
     volume_name: String,
     empty_dir: EmptyDirVolumeSource,
-    /// `MounterArgs.FsGroup` (`operation_generator.go:501-509`).
-    fs_group: Option<i64>,
 }
 
 #[async_trait]
@@ -327,11 +324,7 @@ impl Mounter for EmptyDirMounter {
         // Deviation: upstream discards the error (`_ =`); we return it, as the
         // other plugins here do, so a pod never starts against an unreadable
         // volume.
-        crate::volume_ownership::set_volume_ownership(
-            Path::new(volume_dir),
-            args.fs_group.or(self.fs_group),
-            false,
-        )?;
+        crate::volume_ownership::set_volume_ownership(Path::new(volume_dir), args.fs_group, false)?;
         info!(
             "Created emptyDir volume {} at {}",
             self.volume_name, volume_dir
@@ -373,9 +366,13 @@ mod tests {
                 medium: None,
                 size_limit: None,
             },
-            fs_group: Some(gid),
         };
-        m.set_up().await.unwrap();
+        m.set_up_with(&crate::volume_plugins::MounterArgs {
+            fs_group: Some(gid),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
         // volume_linux.go:147-181: mode | rwMask. 0400|0660 = 0660 (the old
         // owner->group mirror would have left 0440), and a dir
         // gets setgid|execMask.
@@ -746,7 +743,6 @@ mod tests {
                 medium: None,
                 size_limit: None,
             },
-            fs_group: None,
         };
         assert_eq!(
             m.get_attributes(),

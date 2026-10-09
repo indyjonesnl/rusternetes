@@ -70,7 +70,6 @@ impl VolumePlugin for DownwardApiPlugin {
             // only plugin that calls it, since only a `resourceFieldRef` needs
             // the node's allocatable to default an unset limit.
             node_allocatable: self.host.get_node_allocatable().clone(),
-            fs_group: crate::volume_plugins::util::fs_group_from(pod),
         }))
     }
 
@@ -110,8 +109,6 @@ struct DownwardApiMounter {
     volume: Volume,
     pod: Pod,
     node_allocatable: HashMap<String, String>,
-    /// `mounterArgs.FsGroup` (`volume.go:132`).
-    fs_group: Option<i64>,
 }
 
 #[async_trait]
@@ -167,7 +164,7 @@ impl Mounter for DownwardApiMounter {
         if let Err(e) = crate::volume_ownership::write_payload_with_ownership(
             std::path::Path::new(volume_dir),
             &payload,
-            args.fs_group.or(self.fs_group),
+            args.fs_group,
             true,
         ) {
             if let Err(td) = std::fs::remove_dir_all(volume_dir) {
@@ -341,7 +338,6 @@ mod tests {
             .unwrap(),
             pod: test_pod(),
             node_allocatable: HashMap::new(),
-            fs_group: None,
         }
     }
 
