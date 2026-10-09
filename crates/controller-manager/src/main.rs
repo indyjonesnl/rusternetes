@@ -287,7 +287,7 @@ async fn run_api_mode(args: Args) -> Result<()> {
     // bin compiles its own copy of `controllers`, with a separate registry).
     spawn_metrics_server(
         args.metrics_port,
-        rusternetes_controller_manager::controllers::cidrset_metrics::gather,
+        rusternetes_controller_manager::controllers::gather_metrics,
     );
 
     let (ca_pem, kube_insecure, token, client_cert, client_key) =
@@ -393,7 +393,7 @@ async fn main() -> Result<()> {
         return run_api_mode(args).await;
     }
 
-    spawn_metrics_server(args.metrics_port, controllers::cidrset_metrics::gather);
+    spawn_metrics_server(args.metrics_port, controllers::gather_metrics);
 
     info!(
         "Starting Rusternetes Controller Manager {}",

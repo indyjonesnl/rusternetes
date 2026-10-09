@@ -16,8 +16,10 @@
 //! only re-enqueues on pod add and PVC delete; here every pod/PVC event
 //! re-enqueues the pods of that namespace, which is safe because
 //! `handleVolume` is idempotent. The metrics
-//! (`ephemeral_volume_create_total` / `_failures_total`) are not ported.
+//! (`ephemeral_volume_controller_create_total` / `_create_failures_total`)
+//! live in [`super::ephemeral_volume_metrics`].
 
+use super::ephemeral_volume_metrics;
 use anyhow::{anyhow, Result};
 use rusternetes_common::resources::service_account::ObjectReference;
 use rusternetes_common::resources::volume::PersistentVolumeClaim;
@@ -116,9 +118,9 @@ impl<S: Storage + 'static> EphemeralVolumeController<S> {
 
     /// `handleVolume`.
     async fn handle_volume(&self, pod: &Pod, vol: &Volume) -> Result<()> {
-        let Some(eph) = vol.ephemeral.as_ref() else {
+        if vol.ephemeral.is_none() {
             return Ok(());
-        };
+        }
         let namespace = pod.metadata.namespace.as_deref().unwrap_or("");
         let pvc_name = volume_claim_name(pod, vol);
         let key = build_key("persistentvolumeclaims", Some(namespace), &pvc_name);
@@ -132,6 +134,17 @@ impl<S: Storage + 'static> EphemeralVolumeController<S> {
             Err(e) => return Err(e.into()),
         }
 
+        self.create_claim(pod, vol).await
+    }
+
+    /// The create half of `handleVolume` (`controller.go:271-301`).
+    async fn create_claim(&self, pod: &Pod, vol: &Volume) -> Result<()> {
+        let Some(eph) = vol.ephemeral.as_ref() else {
+            return Ok(());
+        };
+        let namespace = pod.metadata.namespace.as_deref().unwrap_or("");
+        let pvc_name = volume_claim_name(pod, vol);
+        let key = build_key("persistentvolumeclaims", Some(namespace), &pvc_name);
         // Create the PVC with pod as owner. A pod without a template cannot
         // pass validation; there is nothing to copy.
         let template = eph
@@ -160,10 +173,13 @@ impl<S: Storage + 'static> EphemeralVolumeController<S> {
             spec: template.spec.clone(),
             status: None,
         };
-        self.storage
-            .create(&key, &pvc)
-            .await
-            .map_err(|e| anyhow!("create PVC {pvc_name}: {e}"))?;
+        // controller.go:295-300: count the attempt before the call, the
+        // failure after it.
+        ephemeral_volume_metrics::inc_create_attempts();
+        if let Err(e) = self.storage.create(&key, &pvc).await {
+            ephemeral_volume_metrics::inc_create_failures();
+            return Err(anyhow!("create PVC {pvc_name}: {e}"));
+        }
         info!(
             "Created ephemeral PVC {namespace}/{pvc_name} for pod {}",
             pod.metadata.name
@@ -345,6 +361,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn creates_the_claim_owned_by_the_pod() {
         let (s, c) = setup(&[pod("test-pod", "ns", "u1", false, true)], &[]).await;
         c.sync_pod("ns", "test-pod").await.unwrap();
@@ -366,6 +383,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn no_such_pod_is_a_noop() {
         let (s, c) = setup(&[], &[]).await;
         c.sync_pod("ns", "test-pod").await.unwrap();
@@ -373,6 +391,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn deleted_pod_is_a_noop() {
         let (s, c) = setup(&[pod("test-pod", "ns", "u1", true, true)], &[]).await;
         c.sync_pod("ns", "test-pod").await.unwrap();
@@ -380,6 +399,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn pod_without_volumes_is_a_noop() {
         let (s, c) = setup(&[pod("test-pod", "ns", "u1", false, false)], &[]).await;
         c.sync_pod("ns", "test-pod").await.unwrap();
@@ -387,6 +407,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn create_with_other_namespace_claim() {
         let other = claim("test-pod-myvolume", "other", None);
         let (s, c) = setup(&[pod("test-pod", "ns", "u1", false, true)], &[other]).await;
@@ -395,6 +416,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn existing_owned_claim_is_left_alone() {
         let own = claim("test-pod-myvolume", "ns", Some("u1"));
         let (s, c) = setup(&[pod("test-pod", "ns", "u1", false, true)], &[own]).await;
@@ -405,6 +427,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn claim_owned_by_someone_else_is_an_error() {
         let foreign = claim("test-pod-myvolume", "ns", None);
         let (s, c) = setup(&[pod("test-pod", "ns", "u1", false, true)], &[foreign]).await;
@@ -421,6 +444,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn a_claim_deleted_out_from_under_the_pod_is_recreated() {
         let (s, c) = setup(&[pod("test-pod", "ns", "u1", false, true)], &[]).await;
         c.sync_pod("ns", "test-pod").await.unwrap();
@@ -433,5 +457,60 @@ mod tests {
         .unwrap();
         c.sync_pod("ns", "test-pod").await.unwrap();
         assert_eq!(pvcs(&s).await.len(), 1);
+    }
+
+    // controller_test.go TestSyncHandler "create": one create attempt, no failure.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn metrics_count_a_successful_create() {
+        let (_s, c) = setup(&[pod("test-pod", "ns", "u1", false, true)], &[]).await;
+        let (a, f) = (
+            ephemeral_volume_metrics::create_attempts(),
+            ephemeral_volume_metrics::create_failures(),
+        );
+        c.sync_pod("ns", "test-pod").await.unwrap();
+        assert_eq!(ephemeral_volume_metrics::create_attempts(), a + 1);
+        assert_eq!(ephemeral_volume_metrics::create_failures(), f);
+        assert!(
+            ephemeral_volume_metrics::gather().contains("ephemeral_volume_controller_create_total")
+        );
+    }
+
+    // Existing claim: no create call, so no metric.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn metrics_ignore_an_existing_claim() {
+        let own = claim("test-pod-myvolume", "ns", Some("u1"));
+        let (_s, c) = setup(&[pod("test-pod", "ns", "u1", false, true)], &[own]).await;
+        let (a, f) = (
+            ephemeral_volume_metrics::create_attempts(),
+            ephemeral_volume_metrics::create_failures(),
+        );
+        c.sync_pod("ns", "test-pod").await.unwrap();
+        assert_eq!(ephemeral_volume_metrics::create_attempts(), a);
+        assert_eq!(ephemeral_volume_metrics::create_failures(), f);
+    }
+
+    // "create with failure": a Create that errors counts an attempt AND a
+    // failure. The claim appears between the read and the create (the
+    // lister-lag race), so the create is refused with AlreadyExists.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn metrics_count_a_failed_create() {
+        let (s, c) = setup(&[pod("test-pod", "ns", "u1", false, true)], &[]).await;
+        let p = pod("test-pod", "ns", "u1", false, true);
+        let vol = p.spec.as_ref().unwrap().volumes.as_ref().unwrap()[0].clone();
+        let key = build_key("persistentvolumeclaims", Some("ns"), "test-pod-myvolume");
+        s.create(&key, &claim("test-pod-myvolume", "ns", None))
+            .await
+            .unwrap();
+        let (a, f) = (
+            ephemeral_volume_metrics::create_attempts(),
+            ephemeral_volume_metrics::create_failures(),
+        );
+        let err = c.create_claim(&p, &vol).await.unwrap_err().to_string();
+        assert!(err.contains("create PVC test-pod-myvolume"), "{err}");
+        assert_eq!(ephemeral_volume_metrics::create_attempts(), a + 1);
+        assert_eq!(ephemeral_volume_metrics::create_failures(), f + 1);
     }
 }

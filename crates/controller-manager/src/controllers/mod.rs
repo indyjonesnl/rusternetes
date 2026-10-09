@@ -12,6 +12,7 @@ pub mod endpoints;
 pub mod endpointslice;
 pub mod endpointslice_tracker;
 pub mod ephemeral_volume;
+pub mod ephemeral_volume_metrics;
 pub mod events;
 pub mod expectations;
 pub mod garbage_collector;
@@ -131,4 +132,12 @@ pub async fn check_resource_quota<S: rusternetes_storage::Storage>(
         }
     }
     Ok(())
+}
+
+/// Every controller's Prometheus series in text exposition format: the
+/// `legacyregistry` equivalent served on the controller-manager `/metrics`.
+pub fn gather_metrics() -> String {
+    let mut out = cidrset_metrics::gather();
+    out.push_str(&ephemeral_volume_metrics::gather());
+    out
 }
