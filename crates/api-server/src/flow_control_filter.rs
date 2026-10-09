@@ -544,6 +544,20 @@ pub fn spawn_config_reloader<S: Storage + 'static>(
     })
 }
 
+/// Adjust the priority levels' concurrency limits every
+/// `borrowingAdjustmentPeriod` (apf_controller.go:386, `wait.Until(
+/// cfgCtlr.updateBorrowing, borrowingAdjustmentPeriod, stopCh)`). (#2743)
+pub fn spawn_borrowing_updater<S: Storage + 'static>(
+    engine: Arc<FlowControlEngine<S>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(crate::flow_control::BORROWING_ADJUSTMENT_PERIOD).await;
+            engine.update_borrowing();
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

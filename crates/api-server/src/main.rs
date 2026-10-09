@@ -18,7 +18,11 @@ mod dynamic_routes;
 mod endpoints;
 #[allow(dead_code)]
 mod flow_control;
+#[allow(dead_code)]
+mod flow_control_conc_alloc;
 mod flow_control_filter;
+#[allow(dead_code)]
+mod flow_control_integrator;
 #[allow(dead_code)]
 mod flow_control_object_count;
 #[allow(dead_code)]
@@ -375,6 +379,7 @@ async fn main() -> Result<()> {
             engine.clone(),
             std::time::Duration::from_secs(2),
         );
+        flow_control_filter::spawn_borrowing_updater(engine.clone());
         let apf = Arc::new(flow_control_filter::ApfFilter::new(
             engine,
             flow_control_filter::DEFAULT_REQUEST_TIMEOUT / 4,
