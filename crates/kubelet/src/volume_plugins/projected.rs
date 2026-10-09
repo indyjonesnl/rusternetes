@@ -471,24 +471,14 @@ impl ProjectedMounter {
                         continue;
                     }
                 };
-                let mode = self.secret_file_mode(args, default_mode);
-                let mut put = |path: &Option<String>, data: Vec<u8>| {
-                    if let Some(path) = path.as_deref().filter(|p| !p.is_empty()) {
-                        payload.insert(
-                            path.to_string(),
-                            FileProjection {
-                                fs_user: args.fs_user,
-                                data,
-                                mode,
-                            },
-                        );
-                    }
-                };
-                let mut bundle = key.clone();
-                bundle.extend_from_slice(&certificates);
-                put(&pc.credential_bundle_path, bundle);
-                put(&pc.key_path, key);
-                put(&pc.certificate_chain_path, certificates);
+                pod_certificate_files(
+                    pc,
+                    key,
+                    certificates,
+                    args.fs_user,
+                    self.secret_file_mode(args, default_mode),
+                    &mut payload,
+                );
             }
         }
 
@@ -757,6 +747,41 @@ pub(crate) fn write_payload(
     crate::volume_ownership::write_payload_with_ownership(dir, payload, fs_group, true)
 }
 
+/// `(key, certificate chain)` of one `podCertificate` source, or the manager's
+/// error text.
+pub(crate) type BundleResult = std::result::Result<(Vec<u8>, Vec<u8>), String>;
+
+/// The three file projections of a `podCertificate` source
+/// (`projected.go:403-427`): `credentialBundlePath` is key followed by chain.
+/// Shared by the mount path ([`ProjectedMounter::collect_data`]) and the
+/// resync path ([`resync_payload`]), which must project identical bytes.
+fn pod_certificate_files(
+    pc: &rusternetes_common::resources::pod::PodCertificateProjection,
+    key: Vec<u8>,
+    certificates: Vec<u8>,
+    fs_user: Option<i64>,
+    mode: u32,
+    payload: &mut BTreeMap<String, FileProjection>,
+) {
+    let mut put = |path: &Option<String>, data: Vec<u8>| {
+        if let Some(path) = path.as_deref().filter(|p| !p.is_empty()) {
+            payload.insert(
+                path.to_string(),
+                FileProjection {
+                    fs_user,
+                    data,
+                    mode,
+                },
+            );
+        }
+    };
+    let mut bundle = key.clone();
+    bundle.extend_from_slice(&certificates);
+    put(&pc.credential_bundle_path, bundle);
+    put(&pc.key_path, key);
+    put(&pc.certificate_chain_path, certificates);
+}
+
 /// The payload a periodic re-SetUp of a projected volume projects
 /// (`collectData`, `projected.go:226-338`), built from objects the caller has
 /// already fetched, so it can run on the blocking pool (#2390).
@@ -770,6 +795,7 @@ pub(crate) fn write_payload(
 /// is the mounter's job (an async `TokenRequest`, refreshed at 80% of its
 /// lifetime, `token_manager.go:174-195`), and re-projecting the SAME bytes is
 /// what keeps the AtomicWriter inert.
+#[allow(clippy::too_many_arguments)] // one lookup closure per fetched source kind
 pub(crate) fn resync_payload<'a>(
     projected: &rusternetes_common::resources::ProjectedVolumeSource,
     pod: &Pod,
@@ -778,6 +804,7 @@ pub(crate) fn resync_payload<'a>(
     secret: impl Fn(&str) -> Option<&'a Secret>,
     config_map: impl Fn(&str) -> Option<&'a ConfigMap>,
     trust_anchors: impl Fn(usize) -> Option<&'a std::result::Result<Vec<u8>, String>>,
+    pod_certificates: impl Fn(usize) -> Option<&'a BundleResult>,
 ) -> std::result::Result<BTreeMap<String, FileProjection>, String> {
     let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
     let default_mode = projected.default_mode.unwrap_or(0o644) as u32;
@@ -862,6 +889,23 @@ pub(crate) fn resync_payload<'a>(
                 }
                 Some(Err(e)) => errlist.push(e.clone()),
                 None => errlist.push("ClusterTrustBundle was not fetched".to_string()),
+            }
+        } else if let Some(pc) = &source.pod_certificate {
+            // `source.PodCertificate` arm (`projected.go:391-428`); the bundle
+            // was asked of the pod certificate manager by the async half of
+            // the resync (`FetchedSources`), as `SetUpAt` re-runs
+            // `collectData` on every remount (`RequiresRemount`).
+            match pod_certificates(index) {
+                Some(Ok((key, certificates))) => pod_certificate_files(
+                    pc,
+                    key.clone(),
+                    certificates.clone(),
+                    fs_user,
+                    secret_file_mode(fs_user, fs_group, default_mode),
+                    &mut payload,
+                ),
+                Some(Err(e)) => errlist.push(e.clone()),
+                None => errlist.push("pod certificate bundle was not fetched".to_string()),
             }
         }
     }

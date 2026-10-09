@@ -138,6 +138,11 @@ pub struct VolumeManager {
     /// `kubelet_pods.go:296`, `:392`). `Arc`-shared because the manager is
     /// `Clone`d per runtime attach and every clone must see one record.
     mounted: Arc<std::sync::Mutex<HashMap<(String, String), MountedVolume>>>,
+    /// The kubelet's pod certificate manager, the same one the volume host
+    /// hands to the projected plugin (`kubeletVolumeHost.podCertificateManager`,
+    /// `pkg/kubelet/volume_host.go:86`). Resync re-asks it for the bundle of
+    /// each `podCertificate` source so a rotated credential reaches the mount.
+    pod_certificate_manager: Option<Arc<dyn crate::podcertificate::Manager>>,
 }
 
 /// `kubecontainer.VolumeInfo` as far as `makeMounts` reads it.
@@ -187,7 +192,7 @@ impl VolumeManager {
             token_manager.clone(),
             node_allocatable.clone(),
         );
-        if let Some(m) = pod_certificate_manager {
+        if let Some(m) = pod_certificate_manager.clone() {
             kubelet_host = kubelet_host.with_pod_certificate_manager(m);
         }
         let host: Arc<dyn crate::volume_plugins::VolumeHost> = Arc::new(kubelet_host);
@@ -221,6 +226,7 @@ impl VolumeManager {
             plugin_mgr,
             csi_plugin: Arc::new(crate::volume_plugins::csi::CsiPlugin::new(host)),
             mounted: Arc::default(),
+            pod_certificate_manager,
         }
     }
 
@@ -903,7 +909,10 @@ impl VolumeManager {
 
         if let Some(volumes) = &pod.spec.as_ref().unwrap().volumes {
             for volume in volumes {
-                let fetched = FetchedSources::fetch(storage, namespace, volume).await;
+                let mut fetched = FetchedSources::fetch(storage, namespace, volume).await;
+                fetched
+                    .fetch_pod_certificates(self.pod_certificate_manager.as_deref(), pod, volume)
+                    .await;
                 let this = self.clone();
                 let pod = pod.clone();
                 let volume = volume.clone();
@@ -988,6 +997,7 @@ impl VolumeManager {
                 |n| fetched.secret(n),
                 |n| fetched.config_map(n),
                 |i| fetched.trust_anchors(i),
+                |i| fetched.pod_certificate(i),
             ) {
                 Ok(payload) => {
                     if let Err(e) = crate::volume_plugins::projected::write_payload(
@@ -1464,6 +1474,9 @@ struct FetchedSources {
     /// Trust anchors of each projected `clusterTrustBundle` source, keyed by
     /// the source's index in `projected.sources` (`projected.go:320-355`).
     trust_anchors: HashMap<usize, std::result::Result<Vec<u8>, String>>,
+    /// `(key, certificate chain)` of each projected `podCertificate` source,
+    /// keyed by source index (`projected.go:392`); filled only on resync.
+    pod_certificates: HashMap<usize, crate::volume_plugins::projected::BundleResult>,
 }
 
 impl FetchedSources {
@@ -1513,6 +1526,48 @@ impl FetchedSources {
             }
         }
         out
+    }
+
+    /// Ask the pod certificate manager for each `podCertificate` source's
+    /// bundle (`GetPodCertificateCredentialBundle`, `projected.go:392`). With
+    /// no manager the source errors `unimplemented`, as `NoOpManager` does
+    /// (`podcertificatemanager.go:994`).
+    async fn fetch_pod_certificates(
+        &mut self,
+        manager: Option<&dyn crate::podcertificate::Manager>,
+        pod: &Pod,
+        volume: &rusternetes_common::resources::Volume,
+    ) {
+        let Some(sources) = volume.projected.as_ref().and_then(|p| p.sources.as_ref()) else {
+            return;
+        };
+        for (index, source) in sources.iter().enumerate() {
+            if source.pod_certificate.is_none() {
+                continue;
+            }
+            let bundle = match manager {
+                Some(m) => {
+                    m.get_pod_certificate_credential_bundle(
+                        pod.metadata.namespace.as_deref().unwrap_or("default"),
+                        &pod.metadata.name,
+                        &pod.metadata.uid,
+                        &volume.name,
+                        index,
+                    )
+                    .await
+                }
+                None => Err(anyhow::anyhow!("unimplemented")),
+            };
+            self.pod_certificates
+                .insert(index, bundle.map_err(|e| e.to_string()));
+        }
+    }
+
+    fn pod_certificate(
+        &self,
+        index: usize,
+    ) -> Option<&crate::volume_plugins::projected::BundleResult> {
+        self.pod_certificates.get(&index)
     }
 
     fn secret(&self, name: &str) -> Option<&rusternetes_common::resources::Secret> {
@@ -3779,5 +3834,67 @@ mod pod_certificate_resync_tests {
             std::fs::read(format!("{path}/bundle.pem")).unwrap(),
             b"key2\ncert2\n"
         );
+    }
+    /// A manager error leaves the volume untouched, as a failed `SetUpAt`
+    /// writes nothing (`projected.go:393-396` appends to `errlist`;
+    /// `:337` returns the aggregate; `SetUpAt` bails before the writer).
+    #[tokio::test]
+    async fn resync_keeps_files_when_manager_errors() {
+        struct Failing;
+        #[async_trait::async_trait]
+        impl crate::podcertificate::Manager for Failing {
+            fn track_pod(&self, _pod: &Pod) {}
+            fn forget_pod(&self, _pod: &Pod) {}
+            async fn get_pod_certificate_credential_bundle(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: usize,
+            ) -> Result<(Vec<u8>, Vec<u8>)> {
+                Err(anyhow::anyhow!("no credential bundle yet"))
+            }
+            fn metric_report(&self) -> crate::podcertificate::MetricReport {
+                Default::default()
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(StorageBackend::new_memory());
+        let dir = tmp
+            .path()
+            .join("pods/uid-pc/volumes/kubernetes.io~projected/creds");
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-pc"},
+            "spec": {"containers": [], "volumes": [{
+                "name": "creds",
+                "projected": {"sources": [
+                    {"podCertificate": {
+                        "signerName": "example.com/signer", "keyType": "ED25519",
+                        "keyPath": "key.pem"
+                    }}
+                ]}
+            }]}
+        }))
+        .unwrap();
+        let ok = Arc::new(RotatingManager(Mutex::new((
+            b"k\n".to_vec(),
+            b"c\n".to_vec(),
+        ))));
+        let mk = |m: Arc<dyn crate::podcertificate::Manager>| {
+            VolumeManager::new_with_pod_certificate_manager(
+                tmp.path().to_string_lossy().to_string(),
+                Some(storage.clone()),
+                rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+                Some(m),
+            )
+        };
+        let volume = pod.spec.as_ref().unwrap().volumes.as_ref().unwrap()[0].clone();
+        mk(ok).create_volume(&pod, &volume).await.unwrap();
+        mk(Arc::new(Failing))
+            .resync_volumes(&pod, storage.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(dir.join("key.pem")).unwrap(), b"k\n");
     }
 }
