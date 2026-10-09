@@ -53,7 +53,7 @@ use axum::extract::{Request, State};
 use axum::http::{header::RETRY_AFTER, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use rusternetes_storage::{Storage, StorageBackend};
 
 use crate::audit::request_info;
@@ -527,21 +527,189 @@ pub fn installed() -> Option<Arc<ApfFilter<StorageBackend>>> {
     FLOW_CONTROL.get().cloned()
 }
 
-/// Keep the engine's configuration current with the stored FlowSchemas and
-/// PriorityLevelConfigurations. Upstream reacts to informer events
-/// (`apf_controller.go` `Run`); a short poll is the equivalent here. (#2808)
+/// `configQueue`'s rate limiter (apf_controller.go:295-298):
+/// `NewTypedItemExponentialFailureRateLimiter(200ms, 8h)`. "Start with
+/// longish delay because conflicts will be between different processes".
+const CONFIG_QUEUE_BASE_DELAY: Duration = Duration::from_millis(200);
+const CONFIG_QUEUE_MAX_DELAY: Duration = Duration::from_secs(8 * 3600);
+/// The single queue item (`configQueue.Add(0)`).
+const CONFIG_QUEUE_KEY: &str = "config_consumer";
+
+/// What the informer event handlers (apf_controller.go:308-368) compare
+/// between the old and new object: a PriorityLevelConfiguration's spec
+/// (:314-322); a FlowSchema's spec and status (:337-358).
+fn relevant_part(is_flow_schema: bool, value: &serde_json::Value) -> serde_json::Value {
+    let get = |k: &str| value.get(k).cloned().unwrap_or(serde_json::Value::Null);
+    if is_flow_schema {
+        serde_json::json!([get("spec"), get("status")])
+    } else {
+        get("spec")
+    }
+}
+
+/// The informer store's role for the handlers' `UpdateFunc(old, new)`: the last
+/// seen relevant part of every object, so a modification that changes neither
+/// spec (nor, for a FlowSchema, status) does not trigger a reload.
+#[derive(Default)]
+struct ConfigEventFilter {
+    seen: HashMap<String, serde_json::Value>,
+}
+
+impl ConfigEventFilter {
+    /// Whether `event` should `configQueue.Add(0)`: AddFunc and DeleteFunc
+    /// always do; UpdateFunc only when the relevant part changed (an object
+    /// never seen before counts as changed).
+    fn triggers(&mut self, is_flow_schema: bool, event: &rusternetes_storage::WatchEvent) -> bool {
+        use rusternetes_storage::WatchEvent::{Added, Deleted, Modified};
+        match event {
+            Added(k, v) | Modified(k, v) => {
+                let new = serde_json::from_str::<serde_json::Value>(v)
+                    .map(|v| relevant_part(is_flow_schema, &v))
+                    .unwrap_or(serde_json::Value::Null);
+                let old = self.seen.insert(k.clone(), new.clone());
+                match (event, old) {
+                    (Modified(..), Some(old)) => old != new,
+                    _ => true,
+                }
+            }
+            Deleted(k, _) => {
+                self.seen.remove(k);
+                true
+            }
+        }
+    }
+}
+
+/// Drive the engine's configuration from watch events rather than a poll: the
+/// port of `configController.Run`'s worker (apf_controller.go:371-391) and
+/// `processNextWorkItem` (:508-529) over the informers' event handlers
+/// (:308-368). (#2811, was #2808's 2s poll)
+///
+/// Mechanism, as upstream: every relevant FlowSchema or
+/// PriorityLevelConfiguration event adds the one item to `configQueue`
+/// (deduplicated, so a burst of events costs one sync); the worker runs
+/// `syncOne`, and on error requeues with the exponential-failure rate limiter
+/// (`AddRateLimited`, 200ms..8h) or `Forget`s the failures on success. The
+/// watches are opened *before* the initial sync is enqueued (the informers'
+/// list-then-watch, `WaitForCacheSync`), and a watch that breaks is reopened
+/// with a fresh enqueue, standing in for the reflector's relist.
+///
+/// DEVIATION: upstream's informers resync every 10 minutes
+/// (pkg/controlplane/apiserver/config.go:159), but the handlers' `UpdateFunc`
+/// drops a resync (old == new), so it never reloads anything; there is
+/// therefore no periodic wake-up here and an idle cluster does not poll.
+/// `specificDelay` (FlowSchema status-update conflicts, :520-523) is not
+/// ported: the status writer is not part of this controller yet.
 pub fn spawn_config_reloader<S: Storage + 'static>(
     engine: Arc<FlowControlEngine<S>>,
-    interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            if let Err(e) = engine.initialize().await {
-                tracing::warn!("APF configuration reload failed: {e}");
+    let storage = engine.storage();
+    tokio::spawn(run_config_worker(
+        move || {
+            let engine = engine.clone();
+            async move { engine.sync_one().await.map_err(|e| e.to_string()) }
+        },
+        move |prefix: String| {
+            let storage = storage.clone();
+            async move { storage.watch(&prefix).await.ok() }
+        },
+    ))
+}
+
+/// The worker loop, with the sync and the watch source injected so the queue
+/// semantics are testable. `watch(prefix)` returns `None` when a watch cannot
+/// be opened; it is retried with the same backoff.
+async fn run_config_worker<Sync, SyncFut, Watch, WatchFut>(mut sync: Sync, mut watch: Watch)
+where
+    Sync: FnMut() -> SyncFut,
+    SyncFut: std::future::Future<Output = Result<(), String>>,
+    Watch: FnMut(String) -> WatchFut,
+    WatchFut: std::future::Future<Output = Option<rusternetes_storage::WatchStream>>,
+{
+    use crate::registry::apiextensions::customresourcedefinition::ItemExponentialFailureRateLimiter;
+    use rusternetes_storage::build_key;
+
+    let fs_prefix = build_key("flowschemas", None, "");
+    let pl_prefix = build_key("prioritylevelconfigurations", None, "");
+    let mut limiter =
+        ItemExponentialFailureRateLimiter::new(CONFIG_QUEUE_BASE_DELAY, CONFIG_QUEUE_MAX_DELAY);
+    let mut filter = ConfigEventFilter::default();
+    let mut fs_watch: Option<rusternetes_storage::WatchStream> = None;
+    let mut pl_watch: Option<rusternetes_storage::WatchStream> = None;
+    let mut retry_at: Option<tokio::time::Instant> = None;
+    // The informers' initial list delivers an Add for every object.
+    let mut queued = true;
+    loop {
+        // (Re)open broken watches before syncing, so no event is missed
+        // between the list and the watch; a reopen is a relist.
+        for (slot, prefix) in [(&mut fs_watch, &fs_prefix), (&mut pl_watch, &pl_prefix)] {
+            if slot.is_none() {
+                *slot = watch(prefix.clone()).await;
+                if slot.is_some() {
+                    queued = true;
+                } else {
+                    retry_at.get_or_insert(
+                        tokio::time::Instant::now() + limiter.when(CONFIG_QUEUE_KEY),
+                    );
+                }
             }
-            tokio::time::sleep(interval).await;
         }
-    })
+        if queued {
+            queued = false;
+            match sync().await {
+                Ok(()) => {
+                    limiter.forget(CONFIG_QUEUE_KEY);
+                    // A watch still down must be retried even with nothing
+                    // queued, or the worker would sleep forever.
+                    retry_at = (fs_watch.is_none() || pl_watch.is_none())
+                        .then(|| tokio::time::Instant::now() + limiter.when(CONFIG_QUEUE_KEY));
+                }
+                Err(e) => {
+                    tracing::warn!("APF configuration reload failed: {e}");
+                    retry_at = Some(tokio::time::Instant::now() + limiter.when(CONFIG_QUEUE_KEY));
+                }
+            }
+        }
+        let timer = async {
+            match retry_at {
+                Some(t) => tokio::time::sleep_until(t).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            _ = timer => { retry_at = None; queued = true; }
+            ev = next_event(&mut fs_watch) => match ev {
+                Some(Ok(ev)) => queued |= filter.triggers(true, &ev),
+                Some(Err(_)) | None => fs_watch = None,
+            },
+            ev = next_event(&mut pl_watch) => match ev {
+                Some(Ok(ev)) => queued |= filter.triggers(false, &ev),
+                Some(Err(_)) | None => pl_watch = None,
+            },
+        }
+        // The queue holds one deduplicated item: absorb every event already
+        // delivered so a burst costs a single sync.
+        for (slot, is_fs) in [(&mut fs_watch, true), (&mut pl_watch, false)] {
+            while let Some(ev) = next_event(slot).now_or_never() {
+                match ev {
+                    Some(Ok(ev)) => queued |= filter.triggers(is_fs, &ev),
+                    Some(Err(_)) | None => {
+                        *slot = None;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn next_event(
+    w: &mut Option<rusternetes_storage::WatchStream>,
+) -> Option<rusternetes_common::Result<rusternetes_storage::WatchEvent>> {
+    match w {
+        Some(w) => w.next().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Adjust the priority levels' concurrency limits every
@@ -1291,13 +1459,130 @@ mod tests {
         pl
     }
 
+    fn ev_mod(k: &str, v: serde_json::Value) -> rusternetes_storage::WatchEvent {
+        rusternetes_storage::WatchEvent::Modified(k.into(), v.to_string())
+    }
+
+    // Handlers apf_controller.go:308-368: PL update triggers on spec only.
+    #[test]
+    fn pl_update_triggers_only_on_spec_change() {
+        let mut f = ConfigEventFilter::default();
+        let add = rusternetes_storage::WatchEvent::Added(
+            "k".into(),
+            serde_json::json!({"spec": {"a": 1}, "status": {}}).to_string(),
+        );
+        assert!(f.triggers(false, &add));
+        // Status-only change: no trigger.
+        assert!(!f.triggers(
+            false,
+            &ev_mod(
+                "k",
+                serde_json::json!({"spec": {"a": 1}, "status": {"x": 1}})
+            )
+        ));
+        assert!(f.triggers(false, &ev_mod("k", serde_json::json!({"spec": {"a": 2}}))));
+        // A resync-style identical update: no trigger.
+        assert!(!f.triggers(false, &ev_mod("k", serde_json::json!({"spec": {"a": 2}}))));
+        let del = rusternetes_storage::WatchEvent::Deleted("k".into(), String::new());
+        assert!(f.triggers(false, &del));
+    }
+
+    // FlowSchema update triggers on spec OR status (:337-358).
+    #[test]
+    fn fs_update_triggers_on_spec_or_status_change() {
+        let mut f = ConfigEventFilter::default();
+        let m = |s: i32, st: i32| {
+            ev_mod(
+                "k",
+                serde_json::json!({"spec": {"p": s}, "status": {"c": st}}),
+            )
+        };
+        assert!(f.triggers(true, &m(1, 1)));
+        assert!(!f.triggers(true, &m(1, 1)));
+        assert!(f.triggers(true, &m(1, 2)));
+        assert!(f.triggers(true, &m(2, 2)));
+    }
+
+    // processNextWorkItem (:517-520): a failed sync is requeued with the
+    // 200ms exponential-failure limiter, success forgets the failures.
+    #[tokio::test(start_paused = true)]
+    async fn failed_sync_is_requeued_with_exponential_backoff() {
+        let calls = Arc::new(Mutex::new(Vec::<tokio::time::Instant>::new()));
+        let c = calls.clone();
+        let _task = tokio::spawn(run_config_worker(
+            move || {
+                let c = c.clone();
+                async move {
+                    let mut c = c.lock().unwrap();
+                    c.push(tokio::time::Instant::now());
+                    if c.len() < 4 {
+                        Err("boom".to_string())
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            |_prefix: String| async { Some(futures::stream::pending().boxed()) },
+        ));
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let c = calls.lock().unwrap();
+        assert_eq!(c.len(), 4, "no further syncs once it succeeds and idles");
+        assert_eq!(c[1] - c[0], Duration::from_millis(200));
+        assert_eq!(c[2] - c[1], Duration::from_millis(400));
+        assert_eq!(c[3] - c[2], Duration::from_millis(800));
+    }
+
+    // `configQueue.Add(0)` dedupes: a burst of events is one sync, and a
+    // quiet period runs none (no polling).
+    #[tokio::test(start_paused = true)]
+    async fn event_burst_is_one_sync_and_idle_never_syncs() {
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let rx = Arc::new(Mutex::new(Some(rx)));
+        let c = n.clone();
+        let _task = tokio::spawn(run_config_worker(
+            move || {
+                let c = c.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+            move |prefix: String| {
+                let rx = rx.clone();
+                async move {
+                    if prefix.contains("prioritylevel") {
+                        let rx = rx.lock().unwrap().take().unwrap();
+                        Some(tokio_stream::wrappers::UnboundedReceiverStream::new(rx).boxed())
+                    } else {
+                        Some(futures::stream::pending().boxed())
+                    }
+                }
+            },
+        ));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(n.load(Ordering::SeqCst), 1, "initial sync only");
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        assert_eq!(n.load(Ordering::SeqCst), 1, "idle: no polling");
+        for i in 0..5 {
+            tx.send(Ok(rusternetes_storage::WatchEvent::Added(
+                format!("k{i}"),
+                "{}".into(),
+            )))
+            .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(n.load(Ordering::SeqCst) >= 2);
+        assert!(n.load(Ordering::SeqCst) <= 3, "burst coalesced");
+    }
+
     #[tokio::test]
     async fn config_change_applies_without_waiting_for_a_poll() {
         use rusternetes_storage::build_key;
         let st = Arc::new(MemoryStorage::new());
         let engine = Arc::new(FlowControlEngine::with_limits(st.clone(), 100, 0));
         engine.initialize().await.unwrap();
-        let _task = spawn_config_reloader(engine.clone(), Duration::from_secs(3600));
+        let _task = spawn_config_reloader(engine.clone());
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(engine.concurrency_limit("evented").is_none());
         st.create(

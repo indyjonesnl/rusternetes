@@ -375,10 +375,7 @@ async fn main() -> Result<()> {
             .initialize()
             .await
             .map_err(|e| anyhow::anyhow!("initializing API Priority and Fairness: {e}"))?;
-        flow_control_filter::spawn_config_reloader(
-            engine.clone(),
-            std::time::Duration::from_secs(2),
-        );
+        flow_control_filter::spawn_config_reloader(engine.clone());
         flow_control_filter::spawn_borrowing_updater(engine.clone());
         let apf = Arc::new(flow_control_filter::ApfFilter::new(
             engine,
