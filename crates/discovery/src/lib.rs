@@ -1281,6 +1281,23 @@ fn get_aggregated_resources_for_group_uncategorized(
                     all_verbs,
                     vec![],
                 ),
+                // v1beta1Storage (storage_apiserver.go:155-185).
+                res(
+                    "validatingadmissionpolicies",
+                    "validatingadmissionpolicy",
+                    "ValidatingAdmissionPolicy",
+                    false,
+                    all_verbs,
+                    vec![sub("status", "ValidatingAdmissionPolicy", status_verbs)],
+                ),
+                res(
+                    "validatingadmissionpolicybindings",
+                    "validatingadmissionpolicybinding",
+                    "ValidatingAdmissionPolicyBinding",
+                    false,
+                    all_verbs,
+                    vec![],
+                ),
             ]
         }
         "admissionregistration.k8s.io" => vec![
@@ -3597,6 +3614,29 @@ pub async fn get_admissionregistration_v1beta1_resources() -> Response {
                 "mutatingadmissionpolicybindings",
                 "mutatingadmissionpolicybinding",
                 "MutatingAdmissionPolicyBinding",
+            ),
+            resource(
+                "validatingadmissionpolicies",
+                "validatingadmissionpolicy",
+                "ValidatingAdmissionPolicy",
+            ),
+            APIResource {
+                name: "validatingadmissionpolicies/status".to_string(),
+                singular_name: String::new(),
+                namespaced: false,
+                kind: "ValidatingAdmissionPolicy".to_string(),
+                verbs: ["get", "patch", "update"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                short_names: None,
+                categories: None,
+                storage_version_hash: None,
+            },
+            resource(
+                "validatingadmissionpolicybindings",
+                "validatingadmissionpolicybinding",
+                "ValidatingAdmissionPolicyBinding",
             ),
         ],
     };

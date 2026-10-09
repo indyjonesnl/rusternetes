@@ -55,7 +55,8 @@ macro_rules! store_crud_handlers {
         patch: $patch:ident,
         delete: $delete:ident,
         deletecollection: $deletecollection:ident
-        $(, gate: $gate:path)? $(,)?
+        $(, gate: $gate:path)?
+        $(, convert: $convert:path)? $(,)?
     ) => {
         pub async fn $create(
             axum::extract::State(state): axum::extract::State<
@@ -68,7 +69,7 @@ macro_rules! store_crud_handlers {
             body: axum::body::Bytes,
         ) -> rusternetes_common::Result<axum::response::Response> {
             $( $gate()?; )?
-            $crate::endpoints::handlers::create_resource(
+            let out = $crate::endpoints::handlers::create_resource(
                 &state,
                 &$scope(&state),
                 &auth_ctx.user,
@@ -76,7 +77,9 @@ macro_rules! store_crud_handlers {
                 &params,
                 &body,
             )
-            .await
+            .await?;
+            $( let out = $convert(out).await?; )?
+            Ok(out)
         }
 
         pub async fn $get(
@@ -90,7 +93,7 @@ macro_rules! store_crud_handlers {
             >,
         ) -> rusternetes_common::Result<axum::response::Response> {
             $( $gate()?; )?
-            $crate::endpoints::handlers::get_resource(
+            let out = $crate::endpoints::handlers::get_resource(
                 &state,
                 &$scope(&state),
                 &auth_ctx.user,
@@ -98,7 +101,9 @@ macro_rules! store_crud_handlers {
                 &name,
                 &params,
             )
-            .await
+            .await?;
+            $( let out = $convert(out).await?; )?
+            Ok(out)
         }
 
         pub async fn $update(
@@ -113,7 +118,7 @@ macro_rules! store_crud_handlers {
             body: axum::body::Bytes,
         ) -> rusternetes_common::Result<axum::response::Response> {
             $( $gate()?; )?
-            $crate::endpoints::handlers::update_resource(
+            let out = $crate::endpoints::handlers::update_resource(
                 &state,
                 &$scope(&state),
                 &auth_ctx.user,
@@ -122,7 +127,9 @@ macro_rules! store_crud_handlers {
                 &params,
                 &body,
             )
-            .await
+            .await?;
+            $( let out = $convert(out).await?; )?
+            Ok(out)
         }
 
         pub async fn $patch(
@@ -138,7 +145,7 @@ macro_rules! store_crud_handlers {
             body: axum::body::Bytes,
         ) -> rusternetes_common::Result<axum::response::Response> {
             $( $gate()?; )?
-            $crate::endpoints::handlers::patch_resource(
+            let out = $crate::endpoints::handlers::patch_resource(
                 &state,
                 &$scope(&state),
                 &auth_ctx.user,
@@ -148,7 +155,9 @@ macro_rules! store_crud_handlers {
                 $crate::handlers::validating_admission_policy::patch_content_type(&headers),
                 &body,
             )
-            .await
+            .await?;
+            $( let out = $convert(out).await?; )?
+            Ok(out)
         }
 
         pub async fn $delete(
@@ -163,7 +172,7 @@ macro_rules! store_crud_handlers {
             body: axum::body::Bytes,
         ) -> rusternetes_common::Result<axum::response::Response> {
             $( $gate()?; )?
-            $crate::endpoints::handlers::delete_resource(
+            let out = $crate::endpoints::handlers::delete_resource(
                 &state,
                 &$scope(&state),
                 &auth_ctx.user,
@@ -172,7 +181,9 @@ macro_rules! store_crud_handlers {
                 &params,
                 &body,
             )
-            .await
+            .await?;
+            $( let out = $convert(out).await?; )?
+            Ok(out)
         }
 
         pub async fn $deletecollection(
@@ -186,7 +197,7 @@ macro_rules! store_crud_handlers {
             body: axum::body::Bytes,
         ) -> rusternetes_common::Result<axum::response::Response> {
             $( $gate()?; )?
-            $crate::endpoints::handlers::delete_collection(
+            let out = $crate::endpoints::handlers::delete_collection(
                 &state,
                 &$scope(&state),
                 &auth_ctx.user,
@@ -194,7 +205,9 @@ macro_rules! store_crud_handlers {
                 &params,
                 &body,
             )
-            .await
+            .await?;
+            $( let out = $convert(out).await?; )?
+            Ok(out)
         }
     };
 }

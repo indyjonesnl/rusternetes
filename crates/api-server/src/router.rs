@@ -2316,6 +2316,40 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
                 .patch(handlers::mutating_admission_policy::patch_mutating_admission_policy_binding)
                 .delete(handlers::mutating_admission_policy::delete_mutating_admission_policy_binding),
         )
+        // Admission v1beta1 API - ValidatingAdmissionPolicies and bindings
+        // (v1beta1Storage, storage_apiserver.go:155-185; same 404 gate)
+        .route(
+            "/apis/admissionregistration.k8s.io/v1beta1/validatingadmissionpolicies",
+            get(handlers::validating_admission_policy_v1beta1::list_validating_admission_policies)
+                .post(handlers::validating_admission_policy_v1beta1::create_validating_admission_policy)
+                .delete(handlers::validating_admission_policy_v1beta1::deletecollection_validatingadmissionpolicies),
+        )
+        .route(
+            "/apis/admissionregistration.k8s.io/v1beta1/validatingadmissionpolicies/:name",
+            get(handlers::validating_admission_policy_v1beta1::get_validating_admission_policy)
+                .put(handlers::validating_admission_policy_v1beta1::update_validating_admission_policy)
+                .patch(handlers::validating_admission_policy_v1beta1::patch_validating_admission_policy)
+                .delete(handlers::validating_admission_policy_v1beta1::delete_validating_admission_policy),
+        )
+        .route(
+            "/apis/admissionregistration.k8s.io/v1beta1/validatingadmissionpolicies/:name/status",
+            get(handlers::validating_admission_policy_v1beta1::get_validating_admission_policy_status)
+                .put(handlers::validating_admission_policy_v1beta1::update_validating_admission_policy_status)
+                .patch(handlers::validating_admission_policy_v1beta1::patch_validating_admission_policy_status),
+        )
+        .route(
+            "/apis/admissionregistration.k8s.io/v1beta1/validatingadmissionpolicybindings",
+            get(handlers::validating_admission_policy_v1beta1::list_validating_admission_policy_bindings)
+                .post(handlers::validating_admission_policy_v1beta1::create_validating_admission_policy_binding)
+                .delete(handlers::validating_admission_policy_v1beta1::deletecollection_validatingadmissionpolicybindings),
+        )
+        .route(
+            "/apis/admissionregistration.k8s.io/v1beta1/validatingadmissionpolicybindings/:name",
+            get(handlers::validating_admission_policy_v1beta1::get_validating_admission_policy_binding)
+                .put(handlers::validating_admission_policy_v1beta1::update_validating_admission_policy_binding)
+                .patch(handlers::validating_admission_policy_v1beta1::patch_validating_admission_policy_binding)
+                .delete(handlers::validating_admission_policy_v1beta1::delete_validating_admission_policy_binding),
+        )
         // Admission v1 API - ValidatingAdmissionPolicyBindings (cluster-scoped)
         .route(
             "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicybindings",
@@ -2574,6 +2608,14 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         .route(
             "/apis/admissionregistration.k8s.io/v1beta1/watch/mutatingadmissionpolicybindings",
             get(handlers::watch::watch_mutatingadmissionpolicybindings),
+        )
+        .route(
+            "/apis/admissionregistration.k8s.io/v1beta1/watch/validatingadmissionpolicies",
+            get(handlers::validating_admission_policy_v1beta1::watch_validatingadmissionpolicies),
+        )
+        .route(
+            "/apis/admissionregistration.k8s.io/v1beta1/watch/validatingadmissionpolicybindings",
+            get(handlers::validating_admission_policy_v1beta1::watch_validatingadmissionpolicybindings),
         )
         .route(
             "/apis/policy/v1/watch/namespaces/:namespace/poddisruptionbudgets",

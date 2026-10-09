@@ -72,6 +72,7 @@ pub mod statefulset;
 pub mod storageclass;
 pub mod table;
 pub mod validating_admission_policy;
+pub mod validating_admission_policy_v1beta1;
 pub mod validation;
 pub mod volumeattachment;
 pub mod volumeattributesclass;
