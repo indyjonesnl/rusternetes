@@ -5,6 +5,7 @@ pub mod auth;
 pub mod authz;
 pub mod build_info;
 pub mod cel;
+pub mod cel_dra;
 pub mod cel_env;
 pub mod cloud_provider;
 pub mod clusterauthenticationtrust;

@@ -525,10 +525,25 @@ pub(crate) fn validate_selector_slice(selectors: &[DeviceSelector], fld_path: &P
                         CEL_SELECTOR_EXPRESSION_MAX_LENGTH,
                     ));
                 } else if let Some(detail) = crate::cel::parse_failure(&cel.expression) {
-                    // Upstream compiles against the DRA environment
-                    // (`dracel.GetCompiler(..).CompileCELExpression`, :316-330);
-                    // only the parse half is ported (see #2692 follow-ups).
                     errs.push(Error::invalid(&expr_path, cel.expression.clone(), detail));
+                } else {
+                    // `CompileCELExpression` type-checks against the DRA
+                    // environment and estimates the cost (compile.go:150-218);
+                    // `validateCELSelector` converts the result (:331-334).
+                    match crate::cel_dra::compile_selector(&cel.expression) {
+                        crate::cel_dra::SelectorCompilation::Invalid(detail) => {
+                            errs.push(Error::invalid(&expr_path, cel.expression.clone(), detail));
+                        }
+                        crate::cel_dra::SelectorCompilation::Ok { max_cost }
+                            if max_cost > crate::cel_dra::CEL_SELECTOR_EXPRESSION_MAX_COST =>
+                        {
+                            errs.push(Error::forbidden(
+                                &expr_path,
+                                "too complex, exceeds cost limit",
+                            ));
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
