@@ -312,6 +312,10 @@ pub struct Classification {
     /// `PriorityLevelConfiguration.metadata.uid`, sent as
     /// `X-Kubernetes-PF-PriorityLevel-UID`.
     pub priority_level_uid: String,
+    /// `!nonMutatingRequestVerbs.Has(requestInfo.Verb)`
+    /// (server/filters/maxinflight.go:46, priority-and-fairness.go:143):
+    /// anything but get/list/watch. Feeds `read_vs_write_current_requests`.
+    pub is_mutating: bool,
 }
 
 fn shares_of(pl: &PriorityLevelConfiguration) -> i32 {
@@ -955,6 +959,7 @@ impl<S: Storage> FlowControlEngine<S> {
                 .unwrap_or_default(),
             priority_level,
             flow_distinguisher,
+            is_mutating: !matches!(d.verb.as_str(), "get" | "list" | "watch"),
         }
     }
 
@@ -1997,6 +2002,110 @@ mod tests {
             1.0
         );
     }
+
+    // ---- #2960: limit gauges, utilization and read-vs-write histograms ----
+
+    use super::metric_test_util::{has_series, sample_sum};
+
+    const NS: &str = "apiserver_flowcontrol_";
+
+    async fn engine_with_level(
+        name: &str,
+    ) -> (Arc<MemoryStorage>, FlowControlEngine<MemoryStorage>) {
+        let st = Arc::new(MemoryStorage::new());
+        put_pl(&st, &named_pl(name, 4, 2)).await;
+        let e = FlowControlEngine::with_limits(st.clone(), 100, 0);
+        e.initialize().await.unwrap();
+        (st, e)
+    }
+
+    async fn hold(
+        e: &FlowControlEngine<MemoryStorage>,
+        pl: &str,
+        mutating: bool,
+    ) -> FlowControlPermit {
+        let mut c = cls("x", pl, "d");
+        c.is_mutating = mutating;
+        e.execute(&c, 1, Duration::from_millis(50)).await.unwrap()
+    }
+
+    // SetPriorityLevelConfiguration (apf_controller.go:874),
+    // NotePriorityLevelConcurrencyAdjustment (:481), SetFairFrac (:440-454).
+    #[tokio::test]
+    async fn digest_publishes_the_limit_gauges() {
+        let (_st, e) = engine_with_level("m-limits").await;
+        let (nominal, min, max, current) = {
+            let cfg = e.config.read().unwrap();
+            let l = &cfg.levels["m-limits"];
+            let current_cl = l.borrow.lock().unwrap().current_cl;
+            (l.nominal_cl, l.min_cl, l.max_cl, current_cl)
+        };
+        let l = [("priority_level", "m-limits")];
+        assert!(nominal > 0);
+        for name in ["nominal_limit_seats", "request_concurrency_limit"] {
+            assert_eq!(sample(&format!("{NS}{name}"), &l), nominal as f64, "{name}");
+        }
+        assert_eq!(sample(&format!("{NS}lower_limit_seats"), &l), min as f64);
+        assert_eq!(sample(&format!("{NS}upper_limit_seats"), &l), max as f64);
+        assert_eq!(
+            sample(&format!("{NS}current_limit_seats"), &l),
+            current as f64
+        );
+        for name in [
+            "demand_seats_high_watermark",
+            "demand_seats_average",
+            "demand_seats_stdev",
+            "demand_seats_smoothed",
+            "target_seats",
+        ] {
+            assert!(has_series(&format!("{NS}{name}"), &l), "{name} missing");
+        }
+        assert!(has_series(&format!("{NS}seat_fair_frac"), &[]));
+    }
+
+    // execSeatsGauge / reqsGaugePair (queueset.go:281-284, :680-681, :867-879):
+    // the level's utilization histograms integrate over time.
+    #[tokio::test]
+    async fn utilization_histograms_integrate_a_held_seat() {
+        let (_st, e) = engine_with_level("m-util").await;
+        let exec = [("priority_level", "m-util"), ("phase", "executing")];
+        let seats = format!("{NS}priority_level_seat_utilization");
+        let reqs = format!("{NS}priority_level_request_utilization");
+        let permit = hold(&e, "m-util", false).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(sample_sum(&seats, &exec) > 0.0, "seat utilization held");
+        assert!(sample_sum(&reqs, &exec) > 0.0, "request utilization held");
+        drop(permit);
+        let after = sample_sum(&seats, &exec);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let later = sample_sum(&seats, &exec);
+        assert!(
+            (later - after).abs() < 1e-6,
+            "idle adds nothing: {after} vs {later}"
+        );
+        assert!(has_series(
+            &reqs,
+            &[("priority_level", "m-util"), ("phase", "waiting")]
+        ));
+    }
+
+    // noteExecutingDelta (priority-and-fairness.go:150-156): the read-vs-write
+    // histograms split on the verb.
+    #[tokio::test]
+    async fn read_vs_write_splits_on_the_verb() {
+        let (_st, e) = engine_with_level("m-rw").await;
+        let name = format!("{NS}read_vs_write_current_requests");
+        let mutating = [("phase", "executing"), ("request_kind", "mutating")];
+        let before = sample_sum(&name, &mutating);
+        let permit = hold(&e, "m-rw", true).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(sample_sum(&name, &mutating) > before);
+        drop(permit);
+        assert!(has_series(
+            &name,
+            &[("phase", "waiting"), ("request_kind", "readOnly")]
+        ));
+    }
 }
 
 /// Reads samples back out of the process-global registry
@@ -2005,6 +2114,40 @@ mod tests {
 pub(crate) mod metric_test_util {
     /// The value of the counter/gauge, or the sample count of the histogram,
     /// of `name` whose labels include all of `labels` (0 when absent).
+    /// Whether a series of `name` with all of `labels` exists.
+    pub fn has_series(name: &str, labels: &[(&str, &str)]) -> bool {
+        prometheus::default_registry()
+            .gather()
+            .iter()
+            .filter(|mf| mf.name() == name)
+            .flat_map(|mf| mf.get_metric().iter())
+            .any(|m| {
+                labels.iter().all(|(k, v)| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.name() == *k && l.value() == *v)
+                })
+            })
+    }
+
+    /// The sample sum of the histogram `name` whose labels include all of `labels`.
+    pub fn sample_sum(name: &str, labels: &[(&str, &str)]) -> f64 {
+        prometheus::default_registry()
+            .gather()
+            .iter()
+            .filter(|mf| mf.name() == name)
+            .flat_map(|mf| mf.get_metric().iter())
+            .filter(|m| {
+                labels.iter().all(|(k, v)| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.name() == *k && l.value() == *v)
+                })
+            })
+            .map(|m| m.get_histogram().get_sample_sum())
+            .sum()
+    }
+
     pub fn sample(name: &str, labels: &[(&str, &str)]) -> f64 {
         let mut total = 0.0;
         for mf in prometheus::default_registry().gather() {
