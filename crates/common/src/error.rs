@@ -226,7 +226,13 @@ impl axum::response::IntoResponse for Error {
                 .as_ref()
                 .and_then(|d| d.retry_after_seconds)
                 .filter(|s| *s > 0);
+            let audit_obj = serde_json::to_value(&*status_obj).ok();
             let mut response = (code, Json(*status_obj)).into_response();
+            if let Some(v) = audit_obj {
+                response
+                    .extensions_mut()
+                    .insert(crate::audit::AuditResponseObject(v));
+            }
             if let Some(seconds) = retry_after {
                 if let Ok(value) = axum::http::HeaderValue::from_str(&seconds.to_string()) {
                     response
@@ -346,7 +352,14 @@ impl axum::response::IntoResponse for Error {
             );
         }
 
-        (status, Json(status_obj)).into_response()
+        let audit_obj = serde_json::to_value(&status_obj).ok();
+        let mut response = (status, Json(status_obj)).into_response();
+        if let Some(v) = audit_obj {
+            response
+                .extensions_mut()
+                .insert(crate::audit::AuditResponseObject(v));
+        }
+        response
     }
 }
 
