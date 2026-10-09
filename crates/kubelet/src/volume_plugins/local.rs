@@ -1,5 +1,6 @@
 use crate::volume_plugins::{
-    Attributes, Mounter, ReconstructedVolume, Spec, Unmounter, VolumeHost, VolumePlugin,
+    Attributes, Mounter, MounterArgs, ReconstructedVolume, Spec, Unmounter, VolumeHost,
+    VolumePlugin,
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -118,8 +119,10 @@ impl Mounter for LocalMounter {
         }
     }
 
-    /// `SetUpAt` (`local.go:529-626`).
-    async fn set_up(&self) -> Result<()> {
+    /// `SetUpAt` (`local.go:529-626`). Like `HostPathPlugin`, the host
+    /// directory is handed to the runtime rather than bind-mounted, so `_dir`
+    /// is unused and ownership is applied to the volume's own path.
+    async fn set_up_at(&self, _dir: &str, args: &MounterArgs) -> Result<()> {
         if self.path.is_empty() {
             return Err(anyhow!("LocalVolume volume path is empty"));
         }
@@ -131,10 +134,15 @@ impl Mounter for LocalMounter {
         // with `mounterArgs.FsGroup` / `FSGroupChangePolicy`, skipped when
         // read-only.
         if !self.read_only {
+            // `mounterArgs.FsGroup` / `FSGroupChangePolicy` (`local.go:616-624`);
+            // the mounter's own fields are the fallback for `set_up()` callers
+            // that pass empty args (#2900 removes them).
             let (root, fs_group, policy) = (
                 self.path.clone(),
-                self.fs_group,
-                self.fs_group_change_policy.clone(),
+                args.fs_group.or(self.fs_group),
+                args.fs_group_change_policy
+                    .clone()
+                    .or_else(|| self.fs_group_change_policy.clone()),
             );
             tokio::task::spawn_blocking(move || {
                 crate::volume_ownership::set_volume_ownership_with_policy(
