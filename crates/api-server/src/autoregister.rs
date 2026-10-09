@@ -19,6 +19,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use rusternetes_common::resources::APIService;
+use rusternetes_storage::{build_key, build_prefix, Storage};
 
 /// `AutoRegisterManagedLabel`.
 pub const AUTO_REGISTER_MANAGED_LABEL: &str = "kube-aggregator.kubernetes.io/automanaged";
@@ -80,13 +81,39 @@ impl AutoRegisterController {
     }
 
     /// `AddAPIServiceToSyncOnStart`.
-    pub fn add_api_service_to_sync_on_start(&self, _in: &APIService) {}
+    pub fn add_api_service_to_sync_on_start(&self, in_: &APIService) {
+        self.add_api_service_to_sync_typed(in_, MANAGE_ON_START);
+    }
 
     /// `AddAPIServiceToSync`.
-    pub fn add_api_service_to_sync(&self, _in: &APIService) {}
+    pub fn add_api_service_to_sync(&self, in_: &APIService) {
+        self.add_api_service_to_sync_typed(in_, MANAGE_CONTINUOUSLY);
+    }
+
+    /// `addAPIServiceToSync`: label the copy and enqueue its name.
+    fn add_api_service_to_sync_typed(&self, in_: &APIService, sync_type: &str) {
+        let mut api_service = in_.clone();
+        api_service
+            .metadata
+            .labels
+            .get_or_insert_with(HashMap::new)
+            .insert(
+                AUTO_REGISTER_MANAGED_LABEL.to_string(),
+                sync_type.to_string(),
+            );
+        let name = api_service.metadata.name.clone();
+        self.api_services_to_sync
+            .lock()
+            .unwrap()
+            .insert(name.clone(), api_service);
+        self.queue.lock().unwrap().insert(name);
+    }
 
     /// `RemoveAPIServiceToSync`.
-    pub fn remove_api_service_to_sync(&self, _name: &str) {}
+    pub fn remove_api_service_to_sync(&self, name: &str) {
+        self.api_services_to_sync.lock().unwrap().remove(name);
+        self.queue.lock().unwrap().insert(name.to_string());
+    }
 
     /// `GetAPIServiceToSync`.
     pub fn get_api_service_to_sync(&self, name: &str) -> Option<APIService> {
@@ -106,16 +133,279 @@ impl AutoRegisterController {
             .insert(name.to_string());
     }
 
-    /// `checkAPIService`.
+    /// `checkAPIService` (autoregister_controller.go:~207-288): the decision
+    /// table of current vs desired, with the synced-once and present-at-start
+    /// enforcement.
     pub async fn check_api_service(
         &self,
-        _client: &dyn APIServiceClient,
-        _name: &str,
+        client: &dyn APIServiceClient,
+        name: &str,
     ) -> Result<(), ClientError> {
-        let _ = (is_automanaged(None), is_automanaged_on_start(None));
-        let _ = &self.queue;
-        Ok(())
+        let desired = self.get_api_service_to_sync(name);
+        let curr = client.get(name).await;
+
+        // if we've never synced this service successfully, record a successful sync.
+        let has_synced = self.synced_successfully.lock().unwrap().contains(name);
+        let result = self
+            .decide_and_apply(client, name, desired.as_ref(), curr, has_synced)
+            .await;
+        if !has_synced && result.is_ok() {
+            self.synced_successfully
+                .lock()
+                .unwrap()
+                .insert(name.to_string());
+        }
+        result
     }
+
+    async fn decide_and_apply(
+        &self,
+        client: &dyn APIServiceClient,
+        name: &str,
+        desired: Option<&APIService>,
+        curr: Result<Option<APIService>, ClientError>,
+        has_synced: bool,
+    ) -> Result<(), ClientError> {
+        // we had a real error, just return it (1A,1B,1C)
+        let curr = curr?;
+        // we don't have an entry and we don't want one (2A)
+        if curr.is_none() && desired.is_none() {
+            return Ok(());
+        }
+        // the local object only wants to sync on start and has already synced
+        // (2B,5B,6B "once" enforcement)
+        if is_automanaged_on_start(desired) && has_synced {
+            return Ok(());
+        }
+        // we don't have an entry and we do want one (2B,2C)
+        let Some(curr) = curr else {
+            return match client.create(desired.expect("checked above")).await {
+                // created in the meantime, we'll get called again
+                Err(ClientError::AlreadyExists) => Ok(()),
+                other => other,
+            };
+        };
+        // we aren't trying to manage this APIService (3A,3B,3C)
+        if !is_automanaged(Some(&curr)) {
+            return Ok(());
+        }
+        // the remote object only wants to sync on start, but was added after
+        // we started (4A,4B,4C)
+        if is_automanaged_on_start(Some(&curr))
+            && !self.api_services_at_start.lock().unwrap().contains(name)
+        {
+            return Ok(());
+        }
+        // the remote object only wants to sync on start and has already
+        // synced (5A,5B,5C "once" enforcement)
+        if is_automanaged_on_start(Some(&curr)) && has_synced {
+            return Ok(());
+        }
+        let Some(desired) = desired else {
+            // we have a spurious APIService that we're managing, delete it (5A,6A)
+            return match client.delete(&curr.metadata.name, &curr.metadata.uid).await {
+                // deleted or changed in the meantime, we'll get called again
+                Err(ClientError::NotFound | ClientError::Conflict) => Ok(()),
+                other => other,
+            };
+        };
+        // if the specs already match, nothing for us to do
+        if curr.spec == desired.spec {
+            return Ok(());
+        }
+        // we have an entry and we have a desired, now we deconflict. Only a
+        // few fields matter. (5B,5C,6B,6C)
+        let mut api_service = curr;
+        api_service.spec = desired.spec.clone();
+        match client.update(&api_service).await {
+            Err(ClientError::NotFound | ClientError::Conflict) => Ok(()),
+            other => other,
+        }
+    }
+
+    /// `Run` (minus the informer): record what exists at start, then sync
+    /// every known name until `stop` fires. See the module deviation note.
+    pub async fn run(
+        &self,
+        client: &dyn APIServiceClient,
+        mut stop: tokio::sync::watch::Receiver<bool>,
+    ) {
+        if let Ok(names) = client.list_names().await {
+            self.record_present_at_start(names);
+        }
+        loop {
+            let mut names: BTreeSet<String> = std::mem::take(&mut *self.queue.lock().unwrap());
+            names.extend(self.api_services_to_sync.lock().unwrap().keys().cloned());
+            if let Ok(listed) = client.list_names().await {
+                names.extend(listed);
+            }
+            for name in names {
+                if let Err(e) = self.check_api_service(client, &name).await {
+                    tracing::warn!("autoregister: {name} failed with : {e:?}");
+                }
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                _ = stop.changed() => return,
+            }
+        }
+    }
+}
+
+/// An `APIServiceClient` over the API server's own storage (upstream uses the
+/// loopback client; creates stamp the system fields as `FillObjectMetaSystemFields`).
+pub struct StorageAPIServiceClient<S: Storage>(pub std::sync::Arc<S>);
+
+fn map_err(e: rusternetes_common::Error) -> ClientError {
+    match e {
+        rusternetes_common::Error::NotFound(_) => ClientError::NotFound,
+        rusternetes_common::Error::AlreadyExists(_) => ClientError::AlreadyExists,
+        rusternetes_common::Error::Conflict(_) => ClientError::Conflict,
+        other => ClientError::Other(other.to_string()),
+    }
+}
+
+#[async_trait]
+impl<S: Storage + 'static> APIServiceClient for StorageAPIServiceClient<S> {
+    async fn get(&self, name: &str) -> Result<Option<APIService>, ClientError> {
+        match self
+            .0
+            .get::<APIService>(&build_key("apiservices", None, name))
+            .await
+        {
+            Ok(a) => Ok(Some(a)),
+            Err(rusternetes_common::Error::NotFound(_)) => Ok(None),
+            Err(e) => Err(map_err(e)),
+        }
+    }
+    async fn list_names(&self) -> Result<Vec<String>, ClientError> {
+        let all = self
+            .0
+            .list::<APIService>(&build_prefix("apiservices", None))
+            .await
+            .map_err(map_err)?;
+        Ok(all.into_iter().map(|a| a.metadata.name).collect())
+    }
+    async fn create(&self, apiservice: &APIService) -> Result<(), ClientError> {
+        let mut a = apiservice.clone();
+        if a.api_version.is_empty() {
+            a.api_version = "apiregistration.k8s.io/v1".to_string();
+        }
+        if a.kind.is_empty() {
+            a.kind = "APIService".to_string();
+        }
+        crate::registry::rest::fill_object_meta_system_fields(&mut a.metadata);
+        self.0
+            .create(&build_key("apiservices", None, &a.metadata.name), &a)
+            .await
+            .map(|_| ())
+            .map_err(map_err)
+    }
+    async fn update(&self, apiservice: &APIService) -> Result<(), ClientError> {
+        self.0
+            .update(
+                &build_key("apiservices", None, &apiservice.metadata.name),
+                apiservice,
+            )
+            .await
+            .map(|_| ())
+            .map_err(map_err)
+    }
+    async fn delete(&self, name: &str, uid: &str) -> Result<(), ClientError> {
+        let key = build_key("apiservices", None, name);
+        let current = self.0.get::<APIService>(&key).await.map_err(map_err)?;
+        // `Preconditions: NewUIDPreconditions(uid)`
+        if current.metadata.uid != uid {
+            return Err(ClientError::Conflict);
+        }
+        self.0.delete(&key).await.map_err(map_err)
+    }
+}
+
+/// `APIServicePriority`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct APIServicePriority {
+    pub group: i32,
+    pub version: i32,
+}
+
+/// `DefaultGenericAPIServicePriorities` (aggregator.go:317-352), as
+/// `(group, version, group priority, version priority)`.
+pub const DEFAULT_GENERIC_API_SERVICE_PRIORITIES: &[(&str, &str, i32, i32)] = &[
+    ("", "v1", 18000, 1),
+    ("events.k8s.io", "v1", 17750, 15),
+    ("events.k8s.io", "v1beta1", 17750, 5),
+    ("authentication.k8s.io", "v1", 17700, 15),
+    ("authentication.k8s.io", "v1beta1", 17700, 9),
+    ("authentication.k8s.io", "v1alpha1", 17700, 1),
+    ("authorization.k8s.io", "v1", 17600, 15),
+    ("certificates.k8s.io", "v1", 17300, 15),
+    ("certificates.k8s.io", "v1beta1", 17300, 9),
+    ("certificates.k8s.io", "v1alpha1", 17300, 1),
+    ("rbac.authorization.k8s.io", "v1", 17000, 15),
+    ("apiextensions.k8s.io", "v1", 16700, 15),
+    ("admissionregistration.k8s.io", "v1", 16700, 15),
+    ("admissionregistration.k8s.io", "v1beta1", 16700, 12),
+    ("admissionregistration.k8s.io", "v1alpha1", 16700, 9),
+    ("coordination.k8s.io", "v1", 16500, 15),
+    ("coordination.k8s.io", "v1beta1", 16500, 13),
+    ("coordination.k8s.io", "v1alpha2", 16500, 12),
+    ("discovery.k8s.io", "v1", 16200, 15),
+    ("discovery.k8s.io", "v1beta1", 16200, 12),
+    ("flowcontrol.apiserver.k8s.io", "v1", 16100, 21),
+    ("flowcontrol.apiserver.k8s.io", "v1beta3", 16100, 18),
+    ("flowcontrol.apiserver.k8s.io", "v1beta2", 16100, 15),
+    ("flowcontrol.apiserver.k8s.io", "v1beta1", 16100, 12),
+    ("flowcontrol.apiserver.k8s.io", "v1alpha1", 16100, 9),
+    ("internal.apiserver.k8s.io", "v1alpha1", 16000, 9),
+    ("resource.k8s.io", "v1alpha3", 15900, 9),
+    ("storagemigration.k8s.io", "v1beta1", 15800, 9),
+];
+
+/// `makeAPIService` (aggregator.go:~262-281): `None` for a group-version
+/// without a priority, so a CRD's group-version is never pinned in the list.
+pub fn make_api_service(group: &str, version: &str) -> Option<APIService> {
+    let (_, _, group_priority, version_priority) = DEFAULT_GENERIC_API_SERVICE_PRIORITIES
+        .iter()
+        .find(|(g, v, _, _)| *g == group && *v == version)?;
+    let mut s = APIService::default();
+    s.metadata.name = format!("{version}.{group}");
+    s.spec.group = group.to_string();
+    s.spec.version = version.to_string();
+    s.spec.group_priority_minimum = *group_priority;
+    s.spec.version_priority = *version_priority;
+    Some(s)
+}
+
+/// `apiServicesToRegister` (aggregator.go:354-387): registers on start one
+/// APIService per delegate path `/api/v1` or `/apis/<group>/<version>`.
+pub fn api_services_to_register(
+    listed_paths: &[String],
+    registration: &AutoRegisterController,
+) -> Vec<APIService> {
+    let mut api_services = vec![];
+    for curr in listed_paths {
+        if curr == "/api/v1" {
+            if let Some(s) = make_api_service("", "v1") {
+                registration.add_api_service_to_sync_on_start(&s);
+                api_services.push(s);
+            }
+            continue;
+        }
+        if !curr.starts_with("/apis/") {
+            continue;
+        }
+        let tokens: Vec<&str> = curr.split('/').collect();
+        if tokens.len() != 4 {
+            continue;
+        }
+        let Some(s) = make_api_service(tokens[2], tokens[3]) else {
+            continue;
+        };
+        registration.add_api_service_to_sync_on_start(&s);
+        api_services.push(s);
+    }
+    api_services
 }
 
 #[cfg(test)]
@@ -184,6 +474,32 @@ mod tests {
     }
     fn modified(name: &str) -> APIService {
         svc(name, Some("true"), "something")
+    }
+
+    // apiServicesToRegister/makeAPIService: only listed paths with a known
+    // priority are registered, and always on-start.
+    #[test]
+    fn api_services_to_register_registers_prioritised_paths_on_start() {
+        let ctl = AutoRegisterController::new();
+        let paths: Vec<String> = [
+            "/api",
+            "/api/v1",
+            "/apis/rbac.authorization.k8s.io/v1",
+            "/apis/example.com/v1",
+            "/apis/rbac.authorization.k8s.io",
+            "/healthz",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let out = api_services_to_register(&paths, &ctl);
+        let names: Vec<&str> = out.iter().map(|s| s.metadata.name.as_str()).collect();
+        assert_eq!(names, vec!["v1.", "v1.rbac.authorization.k8s.io"]);
+        let core = ctl.get_api_service_to_sync("v1.").unwrap();
+        assert_eq!(automanaged_type(Some(&core)), "onstart");
+        assert_eq!(core.spec.group_priority_minimum, 18000);
+        assert_eq!(core.spec.version_priority, 1);
+        assert!(ctl.get_api_service_to_sync("v1.example.com").is_none());
     }
 
     #[derive(Clone, Copy)]
