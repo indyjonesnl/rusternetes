@@ -21,6 +21,8 @@ pub mod plugin;
 pub mod projected;
 pub mod registry;
 pub mod secret;
+#[cfg(test)]
+mod set_up_at_tests;
 pub mod util;
 
 pub use host::{KubeletVolumeHost, VolumeHost};
