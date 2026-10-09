@@ -51,3 +51,27 @@ fn plain_empty_string_stays_absent() {
     let v = decode("ObjectMeta", &[0x12, 0x00]);
     assert!(v.get("generateName").is_none(), "got {v}");
 }
+
+#[test]
+fn sibling_pointer_strings_keep_explicit_empty() {
+    // PodSpec.runtimeClassName(29) *string; IngressSpec.ingressClassName(4) *string.
+    let v = decode("PodSpec", &[0xea, 0x01, 0x00]);
+    assert_eq!(
+        v.get("runtimeClassName"),
+        Some(&Value::String(String::new())),
+        "got {v}"
+    );
+    let v = decode("IngressSpec", &[0x22, 0x00]);
+    assert_eq!(
+        v.get("ingressClassName"),
+        Some(&Value::String(String::new())),
+        "got {v}"
+    );
+}
+
+#[test]
+fn sibling_plain_string_empty_stays_absent() {
+    // PodSpec.schedulerName(19) is a plain string.
+    let v = decode("PodSpec", &[0x9a, 0x01, 0x00]);
+    assert!(v.get("schedulerName").is_none(), "got {v}");
+}
