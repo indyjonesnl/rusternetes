@@ -679,7 +679,7 @@ pub async fn with_audit(cfg: Arc<AuditConfig>, req: Request, next: Next) -> Resp
         resp.headers_mut().insert("Audit-ID", v);
     }
     ac.set_response_status(resp.status().as_u16());
-    if !resp.status().is_success() && !resp.status().is_informational() {
+    if !resp.status().is_informational() && status_body_is_recordable(&resp) {
         resp = record_status_body(&ac, resp).await;
     }
     if long_running {
@@ -697,14 +697,32 @@ const MAX_STATUS_BODY: usize = 1 << 20;
 /// the `metav1.Status` the handler wrote becomes the event's `ResponseStatus`
 /// (`ac.LogResponseObject` -> `ev.ResponseStatus = status`). Upstream hooks the
 /// serializer; here the (non-2xx) body is read back and passed through
-/// unchanged. Deviation: a 2xx Status (e.g. a delete's Success) is not
-/// recorded, because buffering success bodies would break streaming.
+/// unchanged. Deviation: upstream hooks the serializer, so it never reads a
+/// body back; here only a body that is ALREADY fully in memory (exact
+/// `size_hint`, <= `MAX_STATUS_BODY`) and JSON is inspected, so a streamed or
+/// watch response (no exact size) is never buffered.
+fn status_body_is_recordable(resp: &Response) -> bool {
+    let json = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("json"));
+    json && axum::body::HttpBody::size_hint(resp.body())
+        .exact()
+        .is_some_and(|n| n <= MAX_STATUS_BODY as u64)
+}
+
 async fn record_status_body(ac: &AuditContext, resp: Response) -> Response {
     let (parts, body) = resp.into_parts();
     let bytes = axum::body::to_bytes(body, MAX_STATUS_BODY)
         .await
         .unwrap_or_default();
-    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+    // Cheap pre-check so a large non-Status object is never parsed.
+    let maybe_status = bytes.windows(8).any(|w| w == b"\"Status\"");
+    if let Some(v) = maybe_status
+        .then(|| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .flatten()
+    {
         if v.get("kind").and_then(|k| k.as_str()) == Some("Status") {
             let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
             if let Ok(mut g) = ac.inner.lock() {
