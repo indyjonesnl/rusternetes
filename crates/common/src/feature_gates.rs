@@ -191,6 +191,12 @@ pub enum Feature {
     /// so this gate stands in for both, as `ClusterTrustBundle` does for
     /// `certificates.k8s.io/v1beta1`.
     MutatingAdmissionPolicy,
+
+    /// Upstream gate `DeploymentReplicaSetTerminatingReplicas` (1.33 Alpha,
+    /// 1.35 Beta, on; `pkg/features/kube_features.go:1270-1273`). When off, the
+    /// Deployment/ReplicaSet status strategies drop `status.terminatingReplicas`
+    /// unless the stored object already has it (`dropDisabledStatusFields`).
+    DeploymentReplicaSetTerminatingReplicas,
 }
 
 impl Feature {
@@ -234,6 +240,7 @@ impl Feature {
             Feature::WatchCacheInitializationPostStartHook => 34,
             Feature::MutableCSINodeAllocatableCount => 35,
             Feature::MutatingAdmissionPolicy => 36,
+            Feature::DeploymentReplicaSetTerminatingReplicas => 37,
         }
     }
 
@@ -312,6 +319,8 @@ impl Feature {
             Feature::MutableCSINodeAllocatableCount => true,
             // 1.34 Beta, no `Default: true` (apiserver kube_features.go:407-410)
             Feature::MutatingAdmissionPolicy => false,
+            // 1.35 Beta, on (pkg/features/kube_features.go:1270-1273)
+            Feature::DeploymentReplicaSetTerminatingReplicas => true,
         }
     }
 }
@@ -365,6 +374,7 @@ pub const ALL_FEATURES: &[Feature] = &[
     Feature::WatchCacheInitializationPostStartHook,
     Feature::MutableCSINodeAllocatableCount,
     Feature::MutatingAdmissionPolicy,
+    Feature::DeploymentReplicaSetTerminatingReplicas,
 ];
 
 /// Total number of feature gates. Derived from [`ALL_FEATURES`].
@@ -416,6 +426,7 @@ static STATES: [AtomicBool; NUM_FEATURES] = [
     AtomicBool::new(Feature::WatchCacheInitializationPostStartHook.default_enabled()),
     AtomicBool::new(Feature::MutableCSINodeAllocatableCount.default_enabled()),
     AtomicBool::new(Feature::MutatingAdmissionPolicy.default_enabled()),
+    AtomicBool::new(Feature::DeploymentReplicaSetTerminatingReplicas.default_enabled()),
 ];
 
 /// Returns whether `feature` is currently enabled in this process.

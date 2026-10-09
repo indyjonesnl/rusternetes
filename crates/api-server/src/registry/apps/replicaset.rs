@@ -124,11 +124,11 @@ impl RestUpdateStrategy<ReplicaSet> for StatusStrategy {
     }
 
     /// strategy.go:209-215: only status may change. Unlike the Deployment
-    /// status strategy, labels are not reset. `dropDisabledStatusFields` is a
-    /// no-op: its `DeploymentReplicaSetTerminatingReplicas` gate is on by
-    /// default in 1.35.
+    /// status strategy, labels are not reset. `dropDisabledStatusFields` drops
+    /// `terminatingReplicas` when its gate is off.
     fn prepare_for_update(&self, _ctx: &RequestContext, obj: &mut ReplicaSet, old: &ReplicaSet) {
         obj.spec = old.spec.clone();
+        drop_disabled_status_fields(&mut obj.status, &old.status);
     }
 
     fn validate_update(
@@ -197,6 +197,25 @@ pub fn new_scale_rest(storage: Arc<StorageBackend>) -> ScaleRest<ReplicaSet> {
             set_replicas: |rs, replicas| rs.spec.replicas = replicas,
         },
     )
+}
+
+/// `dropDisabledStatusFields` (pkg/registry/apps/replicaset/strategy.go): with
+/// `DeploymentReplicaSetTerminatingReplicas` off, `status.terminatingReplicas`
+/// is dropped unless the old status already carries it.
+fn drop_disabled_status_fields(
+    status: &mut Option<ReplicaSetStatus>,
+    old: &Option<ReplicaSetStatus>,
+) {
+    if !rusternetes_common::feature_gates::enabled(
+        rusternetes_common::feature_gates::Feature::DeploymentReplicaSetTerminatingReplicas,
+    ) && old
+        .as_ref()
+        .is_none_or(|o| o.terminating_replicas.is_none())
+    {
+        if let Some(s) = status.as_mut() {
+            s.terminating_replicas = None;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -297,5 +316,49 @@ mod tests {
         assert_eq!(scale.status.replicas, 1);
         assert_eq!(scale.status.selector, "app=r");
         assert_eq!(scale.metadata.name, "r");
+    }
+
+    /// Upstream `dropDisabledStatusFields` (strategy.go): gate off and the old
+    /// status lacks the field -> dropped; old has it, or gate on -> kept.
+    #[test]
+    #[serial_test::serial]
+    fn status_drops_terminating_replicas_when_gate_off() {
+        use rusternetes_common::feature_gates::{self, Feature};
+        let _gate =
+            feature_gates::with_feature(Feature::DeploymentReplicaSetTerminatingReplicas, false);
+        let old = replica_set();
+        let mut new = old.clone();
+        new.status = Some(ReplicaSetStatus {
+            terminating_replicas: Some(3),
+            ..Default::default()
+        });
+        StatusStrategy.prepare_for_update(&ctx(), &mut new, &old);
+        assert_eq!(new.status.unwrap().terminating_replicas, None);
+
+        let mut old2 = replica_set();
+        old2.status = Some(ReplicaSetStatus {
+            terminating_replicas: Some(1),
+            ..Default::default()
+        });
+        let mut new2 = old2.clone();
+        new2.status = Some(ReplicaSetStatus {
+            terminating_replicas: Some(3),
+            ..Default::default()
+        });
+        StatusStrategy.prepare_for_update(&ctx(), &mut new2, &old2);
+        assert_eq!(new2.status.unwrap().terminating_replicas, Some(3));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn status_keeps_terminating_replicas_when_gate_on() {
+        let old = replica_set();
+        let mut new = old.clone();
+        new.status = Some(ReplicaSetStatus {
+            terminating_replicas: Some(3),
+            ..Default::default()
+        });
+        StatusStrategy.prepare_for_update(&ctx(), &mut new, &old);
+        assert_eq!(new.status.unwrap().terminating_replicas, Some(3));
     }
 }
