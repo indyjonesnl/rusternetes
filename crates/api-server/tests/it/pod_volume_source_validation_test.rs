@@ -34,11 +34,9 @@ fn volume(source: Value) -> Value {
 /// `(label, pod spec, substring the answer must contain)`.
 fn cases() -> Vec<(&'static str, Value, &'static str)> {
     vec![
-        (
-            "a volume with no source at all",
-            volume(json!({})),
-            "spec.volumes[0]: Required value: must specify a volume type",
-        ),
+        // A volume with no source is NOT here: the v1 defaulter turns it into an
+        // emptyDir before validation, so it is valid on the wire. See
+        // `a_volume_with_no_source_defaults_to_emptydir`.
         (
             "a volume with two sources",
             volume(json!({ "emptyDir": {}, "hostPath": { "path": "/x" } })),
@@ -272,4 +270,31 @@ async fn well_formed_volume_sources_are_written() {
             "a well-formed volume source must be written: {source} -> {status} {body}"
         );
     }
+}
+
+/// Upstream `SetDefaults_Volume` (`pkg/apis/core/v1/defaults.go:66-71`) gives a
+/// volume whose `VolumeSource` has every pointer nil an `EmptyDir`, and
+/// defaulting runs on decode, before validation. So over the API a no-source
+/// volume is valid. The "no volume source" case in
+/// `pkg/apis/core/validation/validation_test.go` (`TestValidateVolumes`) runs
+/// on internal types, bypassing defaulting, which is why `validate_volumes`
+/// still reports "must specify a volume type" for that shape.
+#[tokio::test]
+async fn a_volume_with_no_source_defaults_to_emptydir() {
+    let api = TestApiServer::new();
+    let (status, body) = api
+        .send(
+            "POST",
+            "/api/v1/namespaces/default/pods",
+            Some("application/json"),
+            Some(&json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": { "name": "no-source", "namespace": "default" },
+                "spec": volume(json!({})),
+            })),
+        )
+        .await;
+    assert!(status.is_success(), "{status} {body}");
+    assert_eq!(body["spec"]["volumes"][0]["emptyDir"], json!({}), "{body}");
 }
