@@ -940,6 +940,10 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             get(handlers::discovery::get_certificates_v1beta1_resources),
         )
         .route(
+            "/apis/admissionregistration.k8s.io/v1beta1",
+            get(handlers::discovery::get_admissionregistration_v1beta1_resources),
+        )
+        .route(
             "/apis/snapshot.storage.k8s.io/v1",
             get(handlers::discovery::get_snapshot_v1_resources),
         )
