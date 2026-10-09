@@ -51,6 +51,24 @@ pub async fn readyz(State(state): State<Arc<ApiServerState>>) -> (StatusCode, Js
         }
     }
 
+    for (name, res) in crate::post_start_hooks::global().boot_checks() {
+        match res {
+            Ok(()) => checks.push(ComponentHealth {
+                name,
+                status: "ok".to_string(),
+                message: None,
+            }),
+            Err(e) => {
+                all_healthy = false;
+                checks.push(ComponentHealth {
+                    name,
+                    status: "failed".to_string(),
+                    message: Some(e),
+                });
+            }
+        }
+    }
+
     for (name, res) in crate::post_start_hooks::global().checks() {
         match res {
             Ok(()) => checks.push(ComponentHealth {
