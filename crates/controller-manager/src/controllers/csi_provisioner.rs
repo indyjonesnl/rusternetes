@@ -17,9 +17,13 @@
 //! Slices 1-2 (this file): a claim with or without a VolumeSnapshot / PVC
 //! data source (`getVolumeContentSource`). NOT yet ported, each tracked on
 //! #2882 and rejected loudly rather than silently ignored: a cross-namespace
-//! `dataSourceRef` (`IsGranted`, #2981), provisioner/other secret parameters
-//! (`getSecretReference`), topology (`GenerateAccessibilityRequirements`,
-//! `GenerateVolumeNodeAffinity`) and VolumeAttributesClass.
+//! `dataSourceRef` (`IsGranted`, #2981) and topology
+//! (`GenerateAccessibilityRequirements`, `GenerateVolumeNodeAffinity`).
+//!
+//! Slice 4 (#2964): the provisioner / publish / stage / expand / modify secret
+//! parameters (`getSecretReference`, `getCredentials`, incl. the
+//! StorageClass-derived deletion secrets `getSecretsFromSC`, #2992) and the
+//! claim's VolumeAttributesClass (`MutableParameters`).
 //!
 //! Slice 3 (#2965): the delete path (`syncVolume`, `isProvisionerForVolume`,
 //! `handleProtectionFinalizer`, `shouldDelete`, `deleteVolumeOperation`,
@@ -27,24 +31,23 @@
 //! `canDeleteVolume`) and the slow-retry set for infeasible
 //! (`InvalidArgument`) requests (`delayProvisioningIfRecentlyInfeasible`,
 //! `markForSlowRetry`, csi-lib-utils `slowset`). NOT ported here: CSI
-//! migration of in-tree PVs (`IsPVMigratable` / `TranslateInTreePVToCSI`) and
-//! StorageClass-derived deletion secrets (`getSecretsFromSC`, needs
-//! `getSecretReference`, with the rest of the secret parameters).
+//! migration of in-tree PVs (`IsPVMigratable` / `TranslateInTreePVToCSI`).
 
 use anyhow::{anyhow, Context, Result};
 use rusternetes_common::quantity::{Format, Quantity};
-use rusternetes_common::resources::csi::VolumeAttachment;
+use rusternetes_common::resources::csi::{VolumeAttachment, VolumeAttributesClass};
 use rusternetes_common::resources::service_account::ObjectReference;
 use rusternetes_common::resources::volume::{
     CSIVolumeSource, PersistentVolumeAccessMode, PersistentVolumeClaimPhase, PersistentVolumeMode,
-    PersistentVolumePhase, PersistentVolumeReclaimPolicy, StorageClass, VolumeBindingMode,
-    VolumeSnapshot, VolumeSnapshotContent,
+    PersistentVolumePhase, PersistentVolumeReclaimPolicy, SecretReference, StorageClass,
+    VolumeBindingMode, VolumeSnapshot, VolumeSnapshotContent,
 };
 use rusternetes_common::resources::{
     EventSource, EventType, PersistentVolume, PersistentVolumeClaim, PersistentVolumeSpec,
     PersistentVolumeStatus, Secret,
 };
 use rusternetes_common::types::{ObjectMeta, TypeMeta};
+use rusternetes_common::validation::metav1::{is_dns1123_label, is_dns1123_subdomain};
 use rusternetes_csi::controller_client::{
     check_driver_capabilities, ControllerError, CsiControllerClient, DriverCapabilities,
     ProvisioningState, RequiredCapabilities,
@@ -86,6 +89,9 @@ const ANN_DELETION_SECRET_NAME: &str = "volume.kubernetes.io/provisioner-deletio
 const ANN_DELETION_SECRET_NAMESPACE: &str =
     "volume.kubernetes.io/provisioner-deletion-secret-namespace";
 /// `provisionerIDKey` (external-provisioner controller.go:315).
+/// `annModifyControllerSecretRefName` / `...Namespace` (controller.go:156-157).
+const ANN_MODIFY_SECRET_NAME: &str = "volume.kubernetes.io/controller-modify-secret-name";
+const ANN_MODIFY_SECRET_NAMESPACE: &str = "volume.kubernetes.io/controller-modify-secret-namespace";
 const PROVISIONER_ID_KEY: &str = "storage.kubernetes.io/csiProvisionerIdentity";
 /// `csiParameterPrefix` and the well-known keys under it (controller.go:83-109).
 const CSI_PARAMETER_PREFIX: &str = "csi.storage.k8s.io/";
@@ -288,6 +294,266 @@ pub fn remove_prefixed_parameters(
     Ok(out)
 }
 
+/// `secretParamsMap` (controller.go:140-158): the parameter keys naming one
+/// kind of secret. `deprecated_*` are the pre-prefix keys, NOT stripped from
+/// the parameters passed to CreateVolume.
+struct SecretParams {
+    name: &'static str,
+    deprecated_name_key: Option<&'static str>,
+    deprecated_namespace_key: Option<&'static str>,
+    name_key: &'static str,
+    namespace_key: &'static str,
+}
+
+/// `defaultSecretParams` .. `controllerModifySecretParams` (controller.go:174-229).
+const DEFAULT_SECRET_PARAMS: SecretParams = SecretParams {
+    name: "Default",
+    deprecated_name_key: None,
+    deprecated_namespace_key: None,
+    name_key: "csi.storage.k8s.io/secret-name",
+    namespace_key: "csi.storage.k8s.io/secret-namespace",
+};
+const PROVISIONER_SECRET_PARAMS: SecretParams = SecretParams {
+    name: "Provisioner",
+    deprecated_name_key: Some("csiProvisionerSecretName"),
+    deprecated_namespace_key: Some("csiProvisionerSecretNamespace"),
+    name_key: "csi.storage.k8s.io/provisioner-secret-name",
+    namespace_key: "csi.storage.k8s.io/provisioner-secret-namespace",
+};
+const NODE_PUBLISH_SECRET_PARAMS: SecretParams = SecretParams {
+    name: "NodePublish",
+    deprecated_name_key: Some("csiNodePublishSecretName"),
+    deprecated_namespace_key: Some("csiNodePublishSecretNamespace"),
+    name_key: "csi.storage.k8s.io/node-publish-secret-name",
+    namespace_key: "csi.storage.k8s.io/node-publish-secret-namespace",
+};
+const CONTROLLER_PUBLISH_SECRET_PARAMS: SecretParams = SecretParams {
+    name: "ControllerPublish",
+    deprecated_name_key: Some("csiControllerPublishSecretName"),
+    deprecated_namespace_key: Some("csiControllerPublishSecretNamespace"),
+    name_key: "csi.storage.k8s.io/controller-publish-secret-name",
+    namespace_key: "csi.storage.k8s.io/controller-publish-secret-namespace",
+};
+const NODE_STAGE_SECRET_PARAMS: SecretParams = SecretParams {
+    name: "NodeStage",
+    deprecated_name_key: Some("csiNodeStageSecretName"),
+    deprecated_namespace_key: Some("csiNodeStageSecretNamespace"),
+    name_key: "csi.storage.k8s.io/node-stage-secret-name",
+    namespace_key: "csi.storage.k8s.io/node-stage-secret-namespace",
+};
+const CONTROLLER_EXPAND_SECRET_PARAMS: SecretParams = SecretParams {
+    name: "ControllerExpand",
+    deprecated_name_key: None,
+    deprecated_namespace_key: None,
+    name_key: "csi.storage.k8s.io/controller-expand-secret-name",
+    namespace_key: "csi.storage.k8s.io/controller-expand-secret-namespace",
+};
+const NODE_EXPAND_SECRET_PARAMS: SecretParams = SecretParams {
+    name: "NodeExpand",
+    deprecated_name_key: None,
+    deprecated_namespace_key: None,
+    name_key: "csi.storage.k8s.io/node-expand-secret-name",
+    namespace_key: "csi.storage.k8s.io/node-expand-secret-namespace",
+};
+const CONTROLLER_MODIFY_SECRET_PARAMS: SecretParams = SecretParams {
+    name: "ControllerModify",
+    deprecated_name_key: None,
+    deprecated_namespace_key: None,
+    name_key: "csi.storage.k8s.io/controller-modify-secret-name",
+    namespace_key: "csi.storage.k8s.io/controller-modify-secret-namespace",
+};
+
+/// `verifyAndGetSecretNameAndNamespaceTemplate` (controller.go:1860-1902).
+fn verify_and_get_secret_templates(
+    secret: &SecretParams,
+    sc_params: &HashMap<String, String>,
+) -> std::result::Result<(String, String), String> {
+    let (mut name_t, mut ns_t) = (String::new(), String::new());
+    let (mut num_name, mut num_ns) = (0, 0);
+    if let Some((k, t)) = secret
+        .deprecated_name_key
+        .and_then(|k| sc_params.get(k).map(|t| (k, t)))
+    {
+        name_t = t.clone();
+        num_name += 1;
+        warn!(
+            "\"{k}\" is deprecated and will be removed in a future release, please use \"{}\" instead",
+            secret.name_key
+        );
+    }
+    if let Some((k, t)) = secret
+        .deprecated_namespace_key
+        .and_then(|k| sc_params.get(k).map(|t| (k, t)))
+    {
+        ns_t = t.clone();
+        num_ns += 1;
+        warn!(
+            "\"{k}\" is deprecated and will be removed in a future release, please use \"{}\" instead",
+            secret.namespace_key
+        );
+    }
+    if let Some(t) = sc_params.get(secret.name_key) {
+        name_t = t.clone();
+        num_name += 1;
+    }
+    if let Some(t) = sc_params.get(secret.namespace_key) {
+        ns_t = t.clone();
+        num_ns += 1;
+    }
+    if num_name > 1 || num_ns > 1 {
+        Err(format!(
+            "{} secrets specified in parameters with both \"csi\" and \"{CSI_PARAMETER_PREFIX}\" keys",
+            secret.name
+        ))
+    } else if num_name != num_ns {
+        Err(format!(
+            "either name and namespace for {} secrets specified, Both must be specified",
+            secret.name
+        ))
+    } else if num_name == 1 {
+        if name_t.is_empty() || ns_t.is_empty() {
+            return Err(format!(
+                "{} secrets specified in parameters but value of either namespace or name is empty",
+                secret.name
+            ));
+        }
+        Ok((name_t, ns_t))
+    } else {
+        Ok((String::new(), String::new()))
+    }
+}
+
+/// Go `os.Expand`'s `getShellName`: the variable name at the start of `s`
+/// (after the `$`) and the bytes consumed.
+fn shell_name(s: &str) -> (&str, usize) {
+    let b = s.as_bytes();
+    let special = |c: u8| b"*#$@!?-0123456789".contains(&c);
+    if b[0] == b'{' {
+        if b.len() > 2 && special(b[1]) && b[2] == b'}' {
+            return (&s[1..2], 3);
+        }
+        for i in 1..b.len() {
+            if b[i] == b'}' {
+                if i == 1 {
+                    return ("", 2); // bad syntax: ${}
+                }
+                return (&s[1..i], i + 1);
+            }
+        }
+        return ("", 1); // bad syntax: no closing brace
+    }
+    if special(b[0]) {
+        return (&s[..1], 1);
+    }
+    let mut i = 0;
+    while i < b.len() && (b[i] == b'_' || b[i].is_ascii_alphanumeric()) {
+        i += 1;
+    }
+    (&s[..i], i)
+}
+
+/// `resolveTemplate` (controller.go:1989-2002) over Go's `os.Expand`.
+fn resolve_template(
+    template: &str,
+    params: &HashMap<String, String>,
+) -> std::result::Result<String, String> {
+    let mut missing = std::collections::BTreeSet::new();
+    let mut out = String::new();
+    let b = template.as_bytes();
+    let (mut i, mut j) = (0, 0);
+    while j < b.len() {
+        if b[j] == b'$' && j + 1 < b.len() {
+            out.push_str(&template[i..j]);
+            let (name, w) = shell_name(&template[j + 1..]);
+            if name.is_empty() && w > 0 {
+                // "Encountered invalid syntax; eat the characters."
+            } else if name.is_empty() {
+                out.push('$');
+            } else if let Some(v) = params.get(name) {
+                out.push_str(v);
+            } else {
+                missing.insert(name.to_string());
+            }
+            j += w;
+            i = j + 1;
+        }
+        j += 1;
+    }
+    if i < template.len() {
+        out.push_str(&template[i..]);
+    }
+    if missing.is_empty() {
+        Ok(out)
+    } else {
+        let quoted: Vec<String> = missing.iter().map(|m| format!("{m:?}")).collect();
+        Err(format!("invalid tokens: [{}]", quoted.join(" ")))
+    }
+}
+
+/// `getSecretReference` (controller.go:1922-1987): the secret named by the
+/// class parameters, its name and namespace templates resolved against the PV
+/// and claim. No lookup of the secret itself is performed.
+fn get_secret_reference(
+    secret_params: &SecretParams,
+    sc_params: &HashMap<String, String>,
+    pv_name: &str,
+    pvc: &PersistentVolumeClaim,
+) -> std::result::Result<Option<SecretReference>, String> {
+    let (mut name_t, mut ns_t) = verify_and_get_secret_templates(secret_params, sc_params)
+        .map_err(|e| format!("failed to get name and namespace template from params: {e}"))?;
+    // "if didn't find secrets for specific call, try to check default values"
+    if name_t.is_empty() && ns_t.is_empty() {
+        (name_t, ns_t) = verify_and_get_secret_templates(&DEFAULT_SECRET_PARAMS, sc_params)
+            .map_err(|e| {
+                format!("failed to get default name and namespace template from params: {e}")
+            })?;
+    }
+    if name_t.is_empty() && ns_t.is_empty() {
+        return Ok(None);
+    }
+
+    let pvc_ns = pvc.metadata.namespace.clone().unwrap_or_default();
+
+    // Namespace: the PV name or the PVC namespace (neither is under the PVC
+    // user's control).
+    let ns_params = HashMap::from([
+        ("pv.name".to_string(), pv_name.to_string()),
+        ("pvc.namespace".to_string(), pvc_ns.clone()),
+    ]);
+    let namespace = resolve_template(&ns_t, &ns_params)
+        .map_err(|e| format!("error resolving value {ns_t:?}: {e}"))?;
+    if !is_dns1123_label(&namespace).is_empty() {
+        return Err(if ns_t != namespace {
+            format!("{ns_t:?} resolved to {namespace:?} which is not a valid namespace name")
+        } else {
+            format!("{ns_t:?} is not a valid namespace name")
+        });
+    }
+
+    // Name: also the PVC name and annotations (under the PVC user's control).
+    let mut name_params = HashMap::from([
+        ("pv.name".to_string(), pv_name.to_string()),
+        ("pvc.name".to_string(), pvc.metadata.name.clone()),
+        ("pvc.namespace".to_string(), pvc_ns),
+    ]);
+    for (k, v) in pvc.metadata.annotations.iter().flatten() {
+        name_params.insert(format!("pvc.annotations['{k}']"), v.clone());
+    }
+    let name = resolve_template(&name_t, &name_params)
+        .map_err(|e| format!("error resolving value {name_t:?}: {e}"))?;
+    if !is_dns1123_subdomain(&name).is_empty() {
+        return Err(if name_t != name {
+            format!("{name_t:?} resolved to {name:?} which is not a valid secret name")
+        } else {
+            format!("{name_t:?} is not a valid secret name")
+        });
+    }
+    Ok(Some(SecretReference {
+        name: Some(name),
+        namespace: Some(namespace),
+    }))
+}
+
 /// `CheckPersistentVolumeClaimModeBlock`.
 fn is_block(claim: &PersistentVolumeClaim) -> bool {
     matches!(claim.spec.volume_mode, Some(PersistentVolumeMode::Block))
@@ -342,6 +608,15 @@ fn storage_bytes(q: Option<&String>) -> i64 {
 struct Prepared {
     fs_type: String,
     req: CreateVolumeRequest,
+    /// `csiPVSource`: the secret refs `Provision` copies onto the PV.
+    controller_publish_secret_ref: Option<SecretReference>,
+    node_stage_secret_ref: Option<SecretReference>,
+    node_publish_secret_ref: Option<SecretReference>,
+    controller_expand_secret_ref: Option<SecretReference>,
+    node_expand_secret_ref: Option<SecretReference>,
+    /// `provDeletionSecrets` (the provisioner secret) and `provModifySecrets`.
+    deletion_secret: Option<SecretReference>,
+    modify_secret: Option<SecretReference>,
 }
 
 pub struct CsiProvisioner<S: Storage> {
@@ -996,27 +1271,62 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
                     );
                     return Ok(HashMap::new());
                 }
-                if let Some(k) = class.parameters.iter().flatten().map(|(k, _)| k).find(|k| {
-                    matches!(
-                        k.strip_prefix(CSI_PARAMETER_PREFIX).unwrap_or(k),
-                        "provisioner-secret-name"
-                            | "provisioner-secret-namespace"
-                            | "secret-name"
-                            | "secret-namespace"
-                            | "csiProvisionerSecretName"
-                            | "csiProvisionerSecretNamespace"
+                // The claim is rebuilt from the claimRef: only its name and
+                // namespace are known (no annotations).
+                let claim_ref = volume.spec.claim_ref.as_ref().expect("checked above");
+                let mut meta = ObjectMeta::new(claim_ref.name.clone().unwrap_or_default());
+                meta.namespace = claim_ref.namespace.clone();
+                let pvc = PersistentVolumeClaim {
+                    type_meta: TypeMeta::default(),
+                    metadata: meta,
+                    spec: Default::default(),
+                    status: None,
+                };
+                let sc_params = class.parameters.clone().unwrap_or_default();
+                let secret_ref = get_secret_reference(
+                    &PROVISIONER_SECRET_PARAMS,
+                    &sc_params,
+                    &volume.metadata.name,
+                    &pvc,
+                )
+                .map_err(|e| {
+                    anyhow!(
+                        "failed to get secretreference for volume {}: {e}",
+                        volume.metadata.name
                     )
-                }) {
-                    return Err(anyhow!(
-                        "StorageClass parameter {k:?} (secrets) is not supported by this provisioner yet (#2882)"
-                    ));
-                }
+                })?;
+                return Ok(match self.credentials(secret_ref.as_ref()).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        // "Continue with deletion, as the secret may have
+                        // already been deleted."
+                        error!(
+                            "Failed to get credentials for volume {}: {e}",
+                            volume.metadata.name
+                        );
+                        HashMap::new()
+                    }
+                });
             }
             Err(e) => warn!(
                 "failed to get storageclass: {class_name}, proceeding to delete without secrets. {e}"
             ),
         }
         Ok(HashMap::new())
+    }
+
+    /// `getCredentials` for a possibly-absent reference (controller.go:2004-2008).
+    async fn credentials(&self, r: Option<&SecretReference>) -> Result<HashMap<String, String>> {
+        match r {
+            None => Ok(HashMap::new()),
+            Some(r) => {
+                self.get_credentials(
+                    r.namespace.as_deref().unwrap_or_default(),
+                    r.name.as_deref().unwrap_or_default(),
+                )
+                .await
+            }
+        }
     }
 
     /// `getCredentials` (controller.go:2004-2019).
@@ -1199,15 +1509,15 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
                 }
             }
         }
-        if claim
+        // `vacName` (:638-:647): a claim's VolumeAttributesClass needs
+        // MODIFY_VOLUME.
+        let vac_name = claim
             .spec
             .volume_attributes_class_name
-            .as_deref()
-            .is_some_and(|v| !v.is_empty())
-        {
-            return Err(fin(
-                "VolumeAttributesClass is not supported by this provisioner yet (#2882)".into(),
-            ));
+            .clone()
+            .unwrap_or_default();
+        if !vac_name.is_empty() {
+            rc.modify_volume = true;
         }
 
         let caps = self.driver_capabilities().await.map_err(|e| {
@@ -1242,16 +1552,6 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             fs_type = self.default_fs_type.clone();
         }
 
-        // Secrets are not ported yet: refuse rather than silently omit.
-        if let Some(k) = params.keys().find(|k| {
-            k.strip_prefix(CSI_PARAMETER_PREFIX)
-                .is_some_and(|r| r.contains("secret-"))
-        }) {
-            return Err(fin(format!(
-                "StorageClass parameter {k:?} (secrets) is not supported by this provisioner yet (#2882)"
-            )));
-        }
-
         let requested = claim
             .spec
             .resources
@@ -1273,6 +1573,30 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
                 ),
             )
             .map_err(fin)?;
+
+        // Resolve the provision secret credentials (:743-:752); every
+        // failure here is ProvisioningNoChange.
+        let no_change = |e: String| (ProvisioningState::NoChange, Failure::Error(anyhow!(e)));
+        let provisioner_secret_ref =
+            get_secret_reference(&PROVISIONER_SECRET_PARAMS, &params, pv_name, claim)
+                .map_err(no_change)?;
+        let provisioner_credentials = self
+            .credentials(provisioner_secret_ref.as_ref())
+            .await
+            .map_err(|e| (ProvisioningState::NoChange, Failure::Error(e)))?;
+
+        // Controller publish, node stage, node publish, expand and modify
+        // secret references (:754-:777).
+        let secret_ref = |p: &SecretParams| {
+            get_secret_reference(p, &params, pv_name, claim)
+                .map_err(|e| (ProvisioningState::NoChange, Failure::Error(anyhow!(e))))
+        };
+        let controller_publish_secret_ref = secret_ref(&CONTROLLER_PUBLISH_SECRET_PARAMS)?;
+        let node_stage_secret_ref = secret_ref(&NODE_STAGE_SECRET_PARAMS)?;
+        let node_publish_secret_ref = secret_ref(&NODE_PUBLISH_SECRET_PARAMS)?;
+        let controller_expand_secret_ref = secret_ref(&CONTROLLER_EXPAND_SECRET_PARAMS)?;
+        let node_expand_secret_ref = secret_ref(&NODE_EXPAND_SECRET_PARAMS)?;
+        let modify_secret = secret_ref(&CONTROLLER_MODIFY_SECRET_PARAMS)?;
 
         let mut parameters = remove_prefixed_parameters(&params).map_err(|e| {
             fin(format!(
@@ -1296,8 +1620,30 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
                 required_bytes,
                 limit_bytes: 0,
             }),
+            secrets: provisioner_credentials,
             ..Default::default()
         };
+
+        // The claim's VolumeAttributesClass (:814-:825).
+        if !vac_name.is_empty() {
+            let vac: VolumeAttributesClass = self
+                .storage
+                .get(&build_key("volumeattributesclasses", None, &vac_name))
+                .await
+                .map_err(|e| {
+                    (
+                        ProvisioningState::NoChange,
+                        Failure::Error(anyhow!("volumeattributesclasses {vac_name:?}: {e}")),
+                    )
+                })?;
+            if vac.driver_name != self.driver_name {
+                return Err(fin(format!(
+                    "VAC {vac_name} referenced in PVC is for driver {} which does not match driver name {}",
+                    vac.driver_name, self.driver_name
+                )));
+            }
+            req.mutable_parameters = vac.parameters.unwrap_or_default();
+        }
 
         if let Some(ds) = data_source.as_ref().filter(|_| rc.clone || rc.snapshot) {
             let source = self
@@ -1325,7 +1671,17 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
                     .map_err(|e| (ProvisioningState::NoChange, Failure::Error(e)))?;
             }
         }
-        Ok(Prepared { fs_type, req })
+        Ok(Prepared {
+            fs_type,
+            req,
+            controller_publish_secret_ref,
+            node_stage_secret_ref,
+            node_publish_secret_ref,
+            controller_expand_secret_ref,
+            node_expand_secret_ref,
+            deletion_secret: provisioner_secret_ref,
+            modify_secret,
+        })
     }
 
     // ---- data sources ---------------------------------------------------------
@@ -1736,7 +2092,17 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
 
         // prepareProvision returns ProvisioningNoChange alongside its
         // non-final failures; a `?` keeps the state it chose.
-        let Prepared { fs_type, req } = self.prepare_provision(claim, sc, pv_name).await?;
+        let Prepared {
+            fs_type,
+            req,
+            controller_publish_secret_ref,
+            node_stage_secret_ref,
+            node_publish_secret_ref,
+            controller_expand_secret_ref,
+            node_expand_secret_ref,
+            deletion_secret,
+            modify_secret,
+        } = self.prepare_provision(claim, sc, pv_name).await?;
         let vol_size_bytes = req.capacity_range.as_ref().map_or(0, |c| c.required_bytes);
         let vol_caps = req.volume_capabilities.clone();
 
@@ -1809,9 +2175,23 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
 
         let block = is_block(claim);
         let mut annotations = HashMap::new();
-        // No provisioner secret ref: upstream stamps empty strings (:988-:989).
-        annotations.insert(ANN_DELETION_SECRET_NAME.to_string(), String::new());
-        annotations.insert(ANN_DELETION_SECRET_NAMESPACE.to_string(), String::new());
+        // The provisioner secret, or empty strings without one (:982-:990).
+        let (del_name, del_ns) = deletion_secret
+            .map(|r| (r.name.unwrap_or_default(), r.namespace.unwrap_or_default()))
+            .unwrap_or_default();
+        annotations.insert(ANN_DELETION_SECRET_NAME.to_string(), del_name);
+        annotations.insert(ANN_DELETION_SECRET_NAMESPACE.to_string(), del_ns);
+        // Only when modify secrets are configured (:992-:996).
+        if let Some(r) = modify_secret {
+            annotations.insert(
+                ANN_MODIFY_SECRET_NAME.to_string(),
+                r.name.unwrap_or_default(),
+            );
+            annotations.insert(
+                ANN_MODIFY_SECRET_NAMESPACE.to_string(),
+                r.namespace.unwrap_or_default(),
+            );
+        }
 
         let mut meta = ObjectMeta::new(pv_name);
         meta.annotations = Some(annotations);
@@ -1838,8 +2218,18 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
                     // "Set FSType if PV is not Block Volume"
                     fs_type: if block { None } else { Some(fs_type) },
                     volume_attributes: Some(volume_attributes),
-                    ..Default::default()
+                    controller_publish_secret_ref,
+                    node_stage_secret_ref,
+                    node_publish_secret_ref,
+                    controller_expand_secret_ref,
+                    node_expand_secret_ref,
                 }),
+                // `pv.Spec.VolumeAttributesClassName = vacName` (:1016-:1018).
+                volume_attributes_class_name: claim
+                    .spec
+                    .volume_attributes_class_name
+                    .clone()
+                    .filter(|v| !v.is_empty()),
                 ..Default::default()
             },
             status: Some(PersistentVolumeStatus {
@@ -2237,6 +2627,144 @@ mod tests {
         assert!(remove_prefixed_parameters(&bad)
             .unwrap_err()
             .contains("found unknown parameter key"));
+    }
+
+    fn pvc(name: &str, ns: &str, ann: &[(&str, &str)]) -> PersistentVolumeClaim {
+        let mut meta = ObjectMeta::new(name).with_namespace(ns);
+        meta.annotations = Some(
+            ann.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        );
+        PersistentVolumeClaim {
+            type_meta: TypeMeta::default(),
+            metadata: meta,
+            spec: Default::default(),
+            status: None,
+        }
+    }
+
+    fn params(p: &[(&str, &str)]) -> HashMap<String, String> {
+        p.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// `TestGetSecretReference` (controller_test.go) cases: tokens, the
+    /// deprecated keys, the default keys and every refusal.
+    #[test]
+    fn secret_references_resolve_like_get_secret_reference() {
+        let sp = &PROVISIONER_SECRET_PARAMS;
+        let c = pvc("pvc1", "ns1", &[("example.com/k", "from-ann")]);
+        let r = |p: &[(&str, &str)]| get_secret_reference(sp, &params(p), "pv1", &c);
+        let named = |n: &str, ns: &str| {
+            Ok(Some(SecretReference {
+                name: Some(n.into()),
+                namespace: Some(ns.into()),
+            }))
+        };
+
+        assert_eq!(r(&[]), Ok(None));
+        assert_eq!(
+            r(&[
+                (
+                    "csi.storage.k8s.io/provisioner-secret-name",
+                    "${pv.name}-${pvc.name}"
+                ),
+                (
+                    "csi.storage.k8s.io/provisioner-secret-namespace",
+                    "${pvc.namespace}"
+                ),
+            ]),
+            named("pv1-pvc1", "ns1")
+        );
+        // Deprecated keys and `$name` shorthand.
+        assert_eq!(
+            r(&[
+                ("csiProvisionerSecretName", "${pv.name}"),
+                ("csiProvisionerSecretNamespace", "ns"),
+            ]),
+            named("pv1", "ns")
+        );
+        // `$pv` is the variable (`.name` stays literal) and `pv` is unknown.
+        assert!(r(&[
+            ("csiProvisionerSecretName", "$pv.name"),
+            ("csiProvisionerSecretNamespace", "ns"),
+        ])
+        .unwrap_err()
+        .contains("invalid tokens: [\"pv\"]"));
+        assert_eq!(
+            r(&[
+                (
+                    "csi.storage.k8s.io/provisioner-secret-name",
+                    "${pvc.annotations['example.com/k']}"
+                ),
+                ("csi.storage.k8s.io/provisioner-secret-namespace", "ns"),
+            ]),
+            named("from-ann", "ns")
+        );
+        // Falls back to the default keys.
+        assert_eq!(
+            r(&[
+                ("csi.storage.k8s.io/secret-name", "dflt"),
+                ("csi.storage.k8s.io/secret-namespace", "ns"),
+            ]),
+            named("dflt", "ns")
+        );
+        // Refusals.
+        let both = r(&[
+            ("csiProvisionerSecretName", "a"),
+            ("csi.storage.k8s.io/provisioner-secret-name", "a"),
+        ])
+        .unwrap_err();
+        assert!(both.contains("with both \"csi\" and \"csi.storage.k8s.io/\" keys"));
+        let half = r(&[("csi.storage.k8s.io/provisioner-secret-name", "a")]).unwrap_err();
+        assert!(half.contains("Both must be specified"));
+        let empty = r(&[
+            ("csi.storage.k8s.io/provisioner-secret-name", ""),
+            ("csi.storage.k8s.io/provisioner-secret-namespace", "ns"),
+        ])
+        .unwrap_err();
+        assert!(empty.contains("value of either namespace or name is empty"));
+        let bad_ns = r(&[
+            ("csi.storage.k8s.io/provisioner-secret-name", "a"),
+            (
+                "csi.storage.k8s.io/provisioner-secret-namespace",
+                "${pv.name}.X",
+            ),
+        ])
+        .unwrap_err();
+        assert!(bad_ns.contains("resolved to \"pv1.X\" which is not a valid namespace name"));
+        let bad_name = r(&[
+            ("csi.storage.k8s.io/provisioner-secret-name", "Bad_Name"),
+            ("csi.storage.k8s.io/provisioner-secret-namespace", "ns"),
+        ])
+        .unwrap_err();
+        assert!(bad_name.contains("\"Bad_Name\" is not a valid secret name"));
+        // The namespace template cannot read the PVC name.
+        let ns_tok = r(&[
+            ("csi.storage.k8s.io/provisioner-secret-name", "a"),
+            (
+                "csi.storage.k8s.io/provisioner-secret-namespace",
+                "${pvc.name}",
+            ),
+        ])
+        .unwrap_err();
+        assert!(ns_tok.contains("invalid tokens: [\"pvc.name\"]"));
+    }
+
+    /// Go `os.Expand` edge cases `resolveTemplate` inherits.
+    #[test]
+    fn resolve_template_follows_os_expand() {
+        let p = params(&[("a", "1"), ("b.c", "2")]);
+        assert_eq!(resolve_template("x${a}y${b.c}", &p).unwrap(), "x1y2");
+        assert_eq!(resolve_template("$a-z", &p).unwrap(), "1-z");
+        assert_eq!(resolve_template("cost$", &p).unwrap(), "cost$");
+        assert_eq!(resolve_template("a${}b", &p).unwrap(), "ab");
+        assert_eq!(
+            resolve_template("${z}${y}", &p).unwrap_err(),
+            "invalid tokens: [\"y\" \"z\"]"
+        );
     }
 
     #[test]

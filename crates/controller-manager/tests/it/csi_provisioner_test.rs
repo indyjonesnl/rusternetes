@@ -1512,10 +1512,11 @@ async fn class_derived_deletion_secrets_are_resolved_for_a_pv_without_annotation
         PersistentVolumeReclaimPolicy::Delete,
     );
     pv.spec.storage_class_name = Some("fast".into());
-    let mut cr = ObjectReference::default();
-    cr.name = Some("data".into());
-    cr.namespace = Some("ns1".into());
-    pv.spec.claim_ref = Some(cr);
+    pv.spec.claim_ref = Some(ObjectReference {
+        name: Some("data".into()),
+        namespace: Some("ns1".into()),
+        ..Default::default()
+    });
     put_pv(&storage, &pv).await;
     p.sync_volume(&pv).await.unwrap();
     let reqs = deleted(&rec);
