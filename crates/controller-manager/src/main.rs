@@ -63,6 +63,23 @@ struct Args {
     #[arg(long, default_value = "http://localhost:2379")]
     etcd_servers: String,
 
+    /// Run a CSI external-provisioner for a driver: `<driver-name>=<controller
+    /// socket path>` (the sidecar's `--csi-address`). Repeatable.
+    #[arg(long = "csi-provisioner", value_name = "DRIVER=SOCKET")]
+    csi_provisioners: Vec<String>,
+
+    /// `--default-fstype` of external-provisioner, for every `--csi-provisioner`.
+    #[arg(long, default_value = "")]
+    csi_default_fstype: String,
+
+    /// `--extra-create-metadata` of external-provisioner.
+    #[arg(long)]
+    csi_extra_create_metadata: bool,
+
+    /// `--controller-publish-readonly` of external-provisioner.
+    #[arg(long)]
+    csi_controller_publish_readonly: bool,
+
     /// Storage backend: "etcd" or "sqlite"
     #[arg(long, default_value = "etcd")]
     storage_backend: String,
@@ -725,6 +742,31 @@ async fn main() -> Result<()> {
             }
         }
     });
+
+    // Start one CSI external-provisioner per `--csi-provisioner` driver.
+    for spec in &args.csi_provisioners {
+        let Some((driver, socket)) = spec.split_once('=') else {
+            anyhow::bail!("--csi-provisioner {spec:?}: expected <driver-name>=<socket path>");
+        };
+        let provisioner = Arc::new(
+            controllers::csi_provisioner::CsiProvisioner::new(
+                storage.clone(),
+                driver,
+                rusternetes_csi::controller_client::CsiControllerClient::with_endpoint(socket),
+            )
+            .with_default_fs_type(args.csi_default_fstype.clone())
+            .with_extra_create_metadata(args.csi_extra_create_metadata)
+            .with_controller_publish_read_only(args.csi_controller_publish_readonly),
+        );
+        spawn_controller!("CSI provisioner", leader_elector, {
+            let controller = provisioner.clone();
+            async move {
+                if let Err(e) = controller.run().await {
+                    tracing::error!("CSI provisioner error: {}", e);
+                }
+            }
+        });
+    }
 
     // Start Volume Snapshot controller
     let volume_snapshot_controller = Arc::new(VolumeSnapshotController::new(storage.clone()));
