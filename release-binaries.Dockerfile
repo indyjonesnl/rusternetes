@@ -24,8 +24,8 @@
 FROM rust:1.95-alpine AS builder
 
 # Same toolchain set as all-in-one-musl.Dockerfile (ring, bundled SQLite,
-# mimalloc, tonic/prost codegen, static libz, now unused by the workspace; kept until verified removable).
-RUN apk add --no-cache build-base musl-dev perl protoc protobuf-dev zlib-dev zlib-static
+# mimalloc, tonic/prost codegen).
+RUN apk add --no-cache build-base musl-dev perl protoc protobuf-dev
 
 WORKDIR /build
 COPY . .
