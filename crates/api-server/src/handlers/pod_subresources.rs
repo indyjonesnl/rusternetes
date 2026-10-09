@@ -522,15 +522,69 @@ pub fn build_kubelet_stream_url(
     uri_str.parse().expect("kubelet stream URL is always valid")
 }
 
-/// Run the validating webhooks for an `admission.Connect` on a pod
-/// subresource.
+/// Reject a CONNECT request that carries a `dryRun` query key.
+///
+/// Upstream: `ConnectResource`
+/// (`staging/src/k8s.io/apiserver/pkg/endpoints/handlers/rest.go:179-182`)
+/// answers `NewBadRequest("dryRun is not supported")` before anything else;
+/// `isDryRun` (`rest.go:399-401`) is `len(url.Query()["dryRun"]) != 0`, so the
+/// mere presence of the key counts, even with an empty value.
+pub(crate) fn reject_connect_dry_run(raw_query: &str) -> Result<()> {
+    if url::form_urlencoded::parse(raw_query.as_bytes()).any(|(k, _)| k == "dryRun") {
+        return Err(Error::BadRequest("dryRun is not supported".to_string()));
+    }
+    Ok(())
+}
+
+/// Build the kubelet stream query from (possibly webhook-mutated) options.
+///
+/// Port of `streamParams` (`pkg/registry/core/pod/strategy.go:688-724`):
+/// `stdin/stdout/stderr/tty` become `input/output/error/tty=1` when set
+/// (`pkg/apis/core/types.go:6724-6730`), `command` repeats per element (exec
+/// only). Used only when a mutating webhook changed the options, so an
+/// unmutated request keeps forwarding the client's raw query.
+fn stream_query_from_options(options: &serde_json::Value, with_command: bool) -> String {
+    let mut ser = url::form_urlencoded::Serializer::new(String::new());
+    for (field, param) in [
+        ("stdin", "input"),
+        ("stdout", "output"),
+        ("stderr", "error"),
+        ("tty", "tty"),
+    ] {
+        if options[field].as_bool().unwrap_or(false) {
+            ser.append_pair(param, "1");
+        }
+    }
+    if with_command {
+        for c in options["command"].as_array().into_iter().flatten() {
+            if let Some(c) = c.as_str() {
+                ser.append_pair("command", c);
+            }
+        }
+    }
+    ser.finish()
+}
+
+/// Container named by the final options, if any.
+fn options_container(options: &serde_json::Value) -> Option<String> {
+    options["container"]
+        .as_str()
+        .filter(|c| !c.is_empty())
+        .map(str::to_string)
+}
+
+/// Run mutating then validating webhooks for an `admission.Connect` on a pod
+/// subresource and return the (possibly mutated) options object.
 ///
 /// Upstream: `ConnectResource`
 /// (`staging/src/k8s.io/apiserver/pkg/endpoints/handlers/rest.go:199-216`)
 /// admits the decoded connect-options object (`PodExecOptions`,
 /// `PodAttachOptions`, `PodPortForwardOptions`) with `admission.Connect`
-/// before `connecter.Connect` is invoked. Shared by exec, attach and
-/// portforward.
+/// before `connecter.Connect` is invoked: first the mutating `Admit`, then the
+/// validating `Validate` on the SAME (already mutated) `opts` pointer, which
+/// `connecter.Connect` then consumes. Shared by exec, attach and portforward.
+/// Dry-run never reaches here (`reject_connect_dry_run`), so the dispatchers
+/// run with `dry_run = false`.
 async fn run_connect_admission(
     state: &ApiServerState,
     kind: &str,
@@ -539,7 +593,7 @@ async fn run_connect_admission(
     name: &str,
     options: serde_json::Value,
     user: &rusternetes_common::admission::UserInfo,
-) -> Result<()> {
+) -> Result<serde_json::Value> {
     use rusternetes_common::admission::{
         AdmissionResponse, GroupVersionKind, GroupVersionResource, Operation,
     };
@@ -553,6 +607,27 @@ async fn run_connect_admission(
         version: "v1".to_string(),
         resource: resource.to_string(),
     };
+    let (mutating, mutated) = state
+        .webhook_manager
+        .run_mutating_webhooks_with_dryrun(
+            &Operation::Connect,
+            &gvk,
+            &gvr,
+            Some(namespace),
+            name,
+            Some(options.clone()),
+            None,
+            user,
+            false,
+        )
+        .await?;
+    if let AdmissionResponse::Deny(reason) = mutating {
+        return Err(Error::Forbidden(format!(
+            "admission webhook denied the request: {}",
+            reason
+        )));
+    }
+    let options = mutated.unwrap_or(options);
     if let AdmissionResponse::Deny(reason) = state
         .webhook_manager
         .run_validating_webhooks(
@@ -561,7 +636,7 @@ async fn run_connect_admission(
             &gvr,
             Some(namespace),
             name,
-            Some(options),
+            Some(options.clone()),
             None,
             user,
         )
@@ -572,7 +647,7 @@ async fn run_connect_admission(
             reason
         )));
     }
-    Ok(())
+    Ok(options)
 }
 
 /// GET/POST /api/v1/namespaces/{namespace}/pods/{name}/exec
@@ -612,26 +687,40 @@ pub async fn exec(
         }
     }
 
+    // rest.go:179-182: dryRun is rejected for every CONNECT.
+    reject_connect_dry_run(&raw_query)?;
+
     // Run admission webhooks for Connect operation (exec)
-    run_connect_admission(
+    let exec_options = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "PodExecOptions",
+        "stdin": query.stdin,
+        "stdout": query.stdout,
+        "stderr": query.stderr,
+        "tty": query.tty,
+        "container": query.container.as_deref().unwrap_or(""),
+        "command": query.command
+    });
+    let admitted = run_connect_admission(
         &state,
         "PodExecOptions",
         "pods/exec",
         &namespace,
         &name,
-        serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "PodExecOptions",
-            "stdin": query.stdin,
-            "stdout": query.stdout,
-            "stderr": query.stderr,
-            "tty": query.tty,
-            "container": query.container.as_deref().unwrap_or(""),
-            "command": query.command
-        }),
+        exec_options.clone(),
         &webhook_user_info,
     )
     .await?;
+    // `connecter.Connect` consumes the MUTATED opts (rest.go:204-216): when a
+    // webhook changed them, rebuild the kubelet query via `streamParams`.
+    let (raw_query, query_container) = if admitted != exec_options {
+        (
+            stream_query_from_options(&admitted, true),
+            options_container(&admitted),
+        )
+    } else {
+        (raw_query, query.container.clone())
+    };
 
     // Fetch the pod and require spec.nodeName (upstream: 400 if unset).
     let pod_key = rusternetes_storage::build_key("pods", Some(&namespace), &name);
@@ -651,8 +740,8 @@ pub async fn exec(
         .to_string();
 
     // Resolve the container name (default to first container).
-    let container_name = if let Some(ref container) = query.container {
-        container.clone()
+    let container_name = if let Some(container) = query_container {
+        container
     } else {
         pod.spec
             .as_ref()
@@ -721,25 +810,38 @@ pub async fn attach(
         }
     }
 
+    // rest.go:179-182: dryRun is rejected for every CONNECT.
+    reject_connect_dry_run(&raw_query)?;
+
     // Run admission webhooks for Connect operation (attach)
-    run_connect_admission(
+    let attach_options = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "PodAttachOptions",
+        "stdin": query.stdin,
+        "stdout": query.stdout,
+        "stderr": query.stderr,
+        "tty": query.tty,
+        "container": query.container.as_deref().unwrap_or("")
+    });
+    let admitted = run_connect_admission(
         &state,
         "PodAttachOptions",
         "pods/attach",
         &namespace,
         &name,
-        serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "PodAttachOptions",
-            "stdin": query.stdin,
-            "stdout": query.stdout,
-            "stderr": query.stderr,
-            "tty": query.tty,
-            "container": query.container.as_deref().unwrap_or("")
-        }),
+        attach_options.clone(),
         &webhook_user_info,
     )
     .await?;
+    // `connecter.Connect` consumes the MUTATED opts (rest.go:204-216).
+    let (raw_query, query_container) = if admitted != attach_options {
+        (
+            stream_query_from_options(&admitted, false),
+            options_container(&admitted),
+        )
+    } else {
+        (raw_query, query.container.clone())
+    };
 
     // Fetch the pod and require spec.nodeName (upstream: 400 if unset).
     let pod_key = rusternetes_storage::build_key("pods", Some(&namespace), &name);
@@ -759,8 +861,8 @@ pub async fn attach(
         .to_string();
 
     // Resolve the container name (default to first container).
-    let container_name = if let Some(ref container) = query.container {
-        container.clone()
+    let container_name = if let Some(container) = query_container {
+        container
     } else {
         pod.spec
             .as_ref()
@@ -893,22 +995,40 @@ pub async fn portforward(
     // `getRequestOptions` (rest.go:194-198) decodes the options and 400s on a
     // bad query BEFORE admission; then admission.Connect (rest.go:199-216)
     // runs on the decoded `PodPortForwardOptions`, before the pod is fetched.
+    // rest.go:179-182: dryRun is rejected first, before options are decoded.
+    reject_connect_dry_run(&raw_query)?;
     let ports = parse_port_forward_ports(&raw_query)?;
-    let stream_query = port_forward_stream_query(&raw_query)?;
-    run_connect_admission(
+    let mut stream_query = port_forward_stream_query(&raw_query)?;
+    let port_options = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "PodPortForwardOptions",
+        "ports": ports,
+    });
+    let admitted = run_connect_admission(
         &state,
         "PodPortForwardOptions",
         "pods/portforward",
         &namespace,
         &name,
-        serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "PodPortForwardOptions",
-            "ports": ports,
-        }),
+        port_options.clone(),
         &webhook_user_info,
     )
     .await?;
+    // `streamParams` runs on the MUTATED opts (strategy.go:716-723).
+    if admitted != port_options {
+        let mutated: Vec<String> = admitted["ports"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p.as_i64())
+            .map(|p| p.to_string())
+            .collect();
+        stream_query = if mutated.is_empty() {
+            String::new()
+        } else {
+            format!("port={}", mutated.join(","))
+        };
+    }
 
     // Fetch the pod and require spec.nodeName (upstream: 400 if unset).
     let pod_key = rusternetes_storage::build_key("pods", Some(&namespace), &name);

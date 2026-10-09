@@ -191,8 +191,8 @@ async fn validating_connect_webhook_sees_mutated_options() {
             uid,
             vec![PatchOperation {
                 op: PatchOp::Replace,
-                path: "/command/0".into(),
-                value: Some(serde_json::json!("id")),
+                path: "/container".into(),
+                value: Some(serde_json::json!("sidecar")),
                 from: None,
             }],
         )
@@ -213,5 +213,5 @@ async fn validating_connect_webhook_sees_mutated_options() {
     assert_eq!(mseen.lock().unwrap().len(), 1);
     let v = vseen.lock().unwrap();
     assert_eq!(v.len(), 1);
-    assert_eq!(v[0]["object"]["command"], serde_json::json!(["id"]));
+    assert_eq!(v[0]["object"]["container"], "sidecar");
 }
