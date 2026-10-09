@@ -103,6 +103,7 @@ impl ProjectedPlugin {
     /// `collect_data`.
     fn build_mounter(&self, spec: &Spec<'_>, pod: &Pod) -> ProjectedMounter {
         ProjectedMounter {
+            host: self.host.clone(),
             path: self
                 .host
                 .get_pod_volume_dir(&pod.metadata.uid, self.name(), &spec.volume.name),
@@ -139,6 +140,8 @@ impl ProjectedPlugin {
 }
 
 struct ProjectedMounter {
+    /// `s.plugin.kvHost` (`projected.go`), for the pod certificate manager.
+    host: Arc<dyn VolumeHost>,
     path: String,
     volume: Volume,
     namespace: String,
@@ -369,7 +372,7 @@ impl ProjectedMounter {
 
         let mut errlist: Vec<String> = Vec::new();
         let mut payload: BTreeMap<String, FileProjection> = BTreeMap::new();
-        for source in projected.sources.iter().flatten() {
+        for (source_index, source) in projected.sources.iter().flatten().enumerate() {
             if let Some(sp) = &source.secret {
                 let name = sp.name.clone().unwrap_or_default();
                 let optional = sp.optional.unwrap_or(false);
@@ -443,10 +446,49 @@ impl ProjectedMounter {
                     }
                     Err(e) => errlist.push(e.to_string()),
                 }
+            } else if let Some(pc) = &source.pod_certificate {
+                // `source.PodCertificate` arm (`projected.go:357-398`).
+                let Some(manager) = self.host.pod_certificate_manager() else {
+                    // `NoOpManager.GetPodCertificateCredentialBundle`
+                    // (`podcertificatemanager.go:994`).
+                    errlist.push("unimplemented".to_string());
+                    continue;
+                };
+                let (key, certificates) = match manager
+                    .get_pod_certificate_credential_bundle(
+                        &self.namespace,
+                        &self.pod_name,
+                        &self.pod.metadata.uid,
+                        &self.volume.name,
+                        source_index,
+                    )
+                    .await
+                {
+                    Ok(b) => b,
+                    Err(e) => {
+                        errlist.push(e.to_string());
+                        continue;
+                    }
+                };
+                let mode = self.secret_file_mode(default_mode);
+                let mut put = |path: &Option<String>, data: Vec<u8>| {
+                    if let Some(path) = path.as_deref().filter(|p| !p.is_empty()) {
+                        payload.insert(
+                            path.to_string(),
+                            FileProjection {
+                                fs_user: self.fs_user,
+                                data,
+                                mode,
+                            },
+                        );
+                    }
+                };
+                let mut bundle = key.clone();
+                bundle.extend_from_slice(&certificates);
+                put(&pc.credential_bundle_path, bundle);
+                put(&pc.key_path, key);
+                put(&pc.certificate_chain_path, certificates);
             }
-            // PodCertificate (`projected.go:357-398`): not implemented — it
-            // needs the kubelet's PodCertificate manager (see the follow-up
-            // issue linked from the PR). Such a source is skipped.
         }
 
         if errlist.is_empty() {
