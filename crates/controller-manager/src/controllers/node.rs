@@ -755,6 +755,104 @@ impl<S: Storage + 'static> NodeController<S> {
         Ok(())
     }
 
+    /// `doNoScheduleTaintingPass` (node_lifecycle_controller.go:540-589):
+    /// derive the NoSchedule taints the node's conditions call for
+    /// (`nodeConditionToTaintKeyStatusMap`, :87-104) plus `unschedulable`,
+    /// diff them (`taintutils.TaintSetDiff`) against the NoSchedule taints
+    /// the controller owns (`taintKeyToNodeConditionMap`, :106-113; a user's
+    /// own NoSchedule taints are left alone) and apply the difference via
+    /// `SwapNodeControllerTaint`. This is what clears the
+    /// `not-ready:NoSchedule` taint the api-server's NodeTaint admission
+    /// stamps at registration once the node is Ready (#3003).
+    async fn do_no_schedule_tainting_pass(&self, node: &Node) -> Result<()> {
+        // nodeConditionToTaintKeyStatusMap
+        fn condition_taint(cond_type: &str, status: &str) -> Option<&'static str> {
+            match (cond_type, status) {
+                ("Ready", "False") => Some("node.kubernetes.io/not-ready"),
+                ("Ready", "Unknown") => Some("node.kubernetes.io/unreachable"),
+                ("MemoryPressure", "True") => Some("node.kubernetes.io/memory-pressure"),
+                ("DiskPressure", "True") => Some("node.kubernetes.io/disk-pressure"),
+                ("NetworkUnavailable", "True") => Some("node.kubernetes.io/network-unavailable"),
+                ("PIDPressure", "True") => Some("node.kubernetes.io/pid-pressure"),
+                _ => None,
+            }
+        }
+        // taintKeyToNodeConditionMap + the unschedulable key.
+        const OWNED: [&str; 7] = [
+            "node.kubernetes.io/not-ready",
+            "node.kubernetes.io/unreachable",
+            "node.kubernetes.io/network-unavailable",
+            "node.kubernetes.io/memory-pressure",
+            "node.kubernetes.io/disk-pressure",
+            "node.kubernetes.io/pid-pressure",
+            "node.kubernetes.io/unschedulable",
+        ];
+
+        let mut want: Vec<&'static str> = node
+            .status
+            .as_ref()
+            .and_then(|s| s.conditions.as_ref())
+            .map(|cs| {
+                cs.iter()
+                    .filter_map(|c| condition_taint(&c.condition_type, &c.status))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if node.spec.as_ref().and_then(|s| s.unschedulable) == Some(true) {
+            want.push("node.kubernetes.io/unschedulable");
+        }
+
+        let have: Vec<&str> = node
+            .spec
+            .as_ref()
+            .and_then(|s| s.taints.as_ref())
+            .map(|ts| {
+                ts.iter()
+                    .filter(|t| t.effect == "NoSchedule" && OWNED.contains(&t.key.as_str()))
+                    .map(|t| t.key.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let to_add: Vec<&str> = want.iter().copied().filter(|k| !have.contains(k)).collect();
+        let to_del: Vec<&str> = have.iter().copied().filter(|k| !want.contains(k)).collect();
+        if to_add.is_empty() && to_del.is_empty() {
+            return Ok(());
+        }
+
+        // SwapNodeControllerTaint: stamp timeAdded, add, then delete.
+        let node_key = build_key("nodes", None, &node.metadata.name);
+        let mut stored: Node = self.storage.get(&node_key).await?;
+        let spec = stored
+            .spec
+            .get_or_insert(rusternetes_common::resources::NodeSpec {
+                pod_cidr: None,
+                pod_cidrs: None,
+                provider_id: None,
+                unschedulable: None,
+                taints: None,
+            });
+        let taints = spec.taints.get_or_insert_with(Vec::new);
+        for key in &to_add {
+            if !taints
+                .iter()
+                .any(|t| t.key == *key && t.effect == "NoSchedule")
+            {
+                taints.push(Taint {
+                    key: (*key).to_string(),
+                    value: None,
+                    effect: "NoSchedule".to_string(),
+                    time_added: Some(Utc::now()),
+                });
+            }
+        }
+        taints.retain(|t| !(t.effect == "NoSchedule" && to_del.contains(&t.key.as_str())));
+        if taints.is_empty() {
+            spec.taints = None;
+        }
+        self.storage.update(&node_key, &stored).await?;
+        Ok(())
+    }
+
     /// `SwapNodeControllerTaint`
     /// (pkg/controller/util/node/controller_utils.go:194-226): stamp
     /// `timeAdded`, add-or-update the new taint (`taintutils.AddOrUpdateTaint`
@@ -1047,6 +1145,11 @@ impl<S: Storage + 'static> NodeController<S> {
     /// node_lifecycle_controller.go:516): shutdown taint, Lease, allocatable.
     async fn process_node(&self, node: &Node) -> Result<()> {
         let node_name = &node.metadata.name;
+        // `doNoScheduleTaintingPass` runs ahead of everything else in the
+        // worker and is not subject to the startup grace period.
+        if let Err(e) = self.do_no_schedule_tainting_pass(node).await {
+            error!("Failed to taint NoSchedule on node {}: {}", node_name, e);
+        }
         if self.in_startup_grace(node_name) {
             return Ok(());
         }
