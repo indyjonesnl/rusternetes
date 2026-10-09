@@ -6,10 +6,12 @@
 //! none, `v1beta1/types.go:1202`), so there is no status strategy or
 //! subresource, and `PrepareForCreate` only starts the generation.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use rusternetes_common::authz::Authorizer;
+use rusternetes_common::cel_env::{mutation_env_failure, ExpectedOutput, MutationEnv};
 use rusternetes_common::resources::mutating_admission_policy::PatchType;
 use rusternetes_common::resources::MutatingAdmissionPolicy;
 use rusternetes_common::validation::field::{Error as FieldError, ErrorList, Path};
@@ -22,7 +24,6 @@ use rusternetes_common::{Error, Result};
 use rusternetes_storage::StorageBackend;
 
 use super::authz::authorize_mutating_param_kind;
-use super::webhookconfiguration::parse_failure;
 use crate::registry::generic::store::{
     BeginCreate, BeginUpdate, CreateOptions, Finish, UpdateOptions,
 };
@@ -59,8 +60,13 @@ fn validate(obj: &MutatingAdmissionPolicy) -> ErrorList {
 /// One CEL compile, as `convertCELErrorToValidationError`
 /// (validation.go:1073-1085) reports it: `field.Invalid` carrying the
 /// expression, under `fld_path`.
-fn compile_error(expression: &str, fld_path: &Path) -> Option<FieldError> {
-    parse_failure(expression)
+fn compile_error(
+    expression: &str,
+    env: &MutationEnv,
+    expected: ExpectedOutput,
+    fld_path: &Path,
+) -> Option<FieldError> {
+    mutation_env_failure(expression, env, expected)
         .map(|detail| FieldError::invalid(fld_path, expression.to_string(), detail))
 }
 
@@ -72,19 +78,28 @@ fn compile_error(expression: &str, fld_path: &Path) -> Option<FieldError> {
 /// :1458-1498). A blank expression is `Required`, already reported by the
 /// shape rules, and is not compiled.
 ///
-/// Upstream compiles against the typed `mutation` environment
-/// (`Object`, `oldObject`, `params`, `variables`, `JSONPatch`, `Object{}`
-/// initializers); there is no such environment here, so this reuses the
-/// untyped parse of the webhook `matchConditions` compile (`parse_failure`) and
-/// catches syntax errors only. The `StoredExpressions` environment selected
-/// by `preexistingExpressions` therefore makes no difference.
+/// The environments are the three upstream builds, see
+/// [`rusternetes_common::cel_env`] for what of the cel-go checker the `cel`
+/// crate lets this port (declarations, `variables` fields, `Object` /
+/// `JSONPatch` type names, the output type of the unambiguous shapes) and what
+/// it does not (type inference). `environment.StoredExpressions`, which
+/// `preexistingExpressions` selects, only gates library versions and so makes
+/// no difference here.
 fn compile_errors(obj: &MutatingAdmissionPolicy, ignore_match_conditions: bool) -> ErrorList {
     let mut errs = ErrorList::new();
     let Some(spec) = &obj.spec else {
         return errs;
     };
     let spec_path = Path::new("spec");
+    let has_params = spec.param_kind.is_some();
     if !ignore_match_conditions {
+        // `validateMatchConditionsExpression` (:1100-1112): the stateless
+        // compiler, so no `variables` and no patch types.
+        let env = MutationEnv {
+            has_params,
+            has_patch_types: false,
+            variables: None,
+        };
         for (i, c) in spec.match_conditions.iter().flatten().enumerate() {
             let expression = c.expression.trim();
             if !expression.is_empty() {
@@ -92,35 +107,63 @@ fn compile_errors(obj: &MutatingAdmissionPolicy, ignore_match_conditions: bool) 
                     .child("matchConditions")
                     .index(i)
                     .child("expression");
-                errs.extend(compile_error(expression, &path));
+                errs.extend(compile_error(expression, &env, ExpectedOutput::Any, &path));
             }
         }
     }
+    // The composited compiler stores every variable (`CompileAndStoreVariable`,
+    // composition.go:95-100, adds the field even when it fails to compile).
+    let variables: BTreeSet<String> = spec
+        .variables
+        .iter()
+        .flatten()
+        .map(|v| v.name.clone())
+        .filter(|n| !n.trim().is_empty())
+        .collect();
+    let variable_env = MutationEnv {
+        has_params,
+        has_patch_types: false,
+        variables: Some(variables),
+    };
     for (i, v) in spec.variables.iter().flatten().enumerate() {
         if !v.expression.trim().is_empty() {
             let path = spec_path.child("variables").index(i).child("expression");
-            errs.extend(compile_error(&v.expression, &path));
+            errs.extend(compile_error(
+                &v.expression,
+                &variable_env,
+                ExpectedOutput::Any,
+                &path,
+            ));
         }
     }
+    let mutation_env = MutationEnv {
+        has_patch_types: true,
+        ..variable_env
+    };
     for (i, m) in spec.mutations.iter().flatten().enumerate() {
         let path = spec_path.child("mutations").index(i);
         // `validateMutation` (:1425-1456) compiles only the expression that
         // `patchType` selects.
-        let (expression, child) = match m.patch_type {
-            Some(PatchType::JsonPatch) => {
-                (m.json_patch.as_ref().map(|p| &p.expression), "jsonPatch")
-            }
+        let (expression, child, expected) = match m.patch_type {
+            Some(PatchType::JsonPatch) => (
+                m.json_patch.as_ref().map(|p| &p.expression),
+                "jsonPatch",
+                ExpectedOutput::JsonPatchList,
+            ),
             Some(PatchType::ApplyConfiguration) => (
                 m.apply_configuration.as_ref().map(|a| &a.expression),
                 "applyConfiguration",
+                ExpectedOutput::Object,
             ),
-            _ => (None, ""),
+            _ => (None, "", ExpectedOutput::Any),
         };
         if let Some(expression) = expression {
             let trimmed = expression.trim();
             if !trimmed.is_empty() {
                 errs.extend(compile_error(
                     trimmed,
+                    &mutation_env,
+                    expected,
                     &path.child(child).child("expression"),
                 ));
             }
