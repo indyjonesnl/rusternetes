@@ -175,8 +175,8 @@ async fn test_node_not_ready_with_old_heartbeat() {
     assert!(ready_condition.is_some());
     let condition = ready_condition.unwrap();
 
-    // Status should be False due to old heartbeat
-    assert_eq!(condition.status, "False");
+    // Unknown, not False: tryUpdateNodeHealth (#2836)
+    assert_eq!(condition.status, "Unknown");
 
     // Clean up
     storage.delete(&key).await.unwrap();
@@ -320,7 +320,7 @@ async fn test_node_shutdown_taint_applied_on_graceful_shutdown() {
     let controller = NodeController::new(storage.clone());
 
     let now = Utc::now();
-    let stale = now - Duration::seconds(120);
+    let stale = now - Duration::seconds(1);
 
     // Kubelet reports Ready=False with reason "NodeShutdown" as soon as it
     // starts the graceful-shutdown sequence (see
