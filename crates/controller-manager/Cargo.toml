@@ -48,6 +48,9 @@ reqwest = { workspace = true }
 rustls = { workspace = true }
 
 [dev-dependencies]
+tempfile = "3"
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic.workspace = true
 serial_test = { workspace = true }
 x509-parser = { workspace = true }
 # Stateful fake MetricsClient in hpa_controller_test (changing readings across
