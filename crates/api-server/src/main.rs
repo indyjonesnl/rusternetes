@@ -59,7 +59,6 @@ use axum_server::tls_rustls::RustlsConfig;
 use clap::Parser;
 use prometheus_client::PrometheusClient;
 use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::RBACAuthorizer;
 use rusternetes_common::observability::MetricsRegistry;
 use rusternetes_storage::{StorageBackend, StorageConfig};
 use state::ApiServerState;
@@ -287,27 +286,14 @@ async fn main() -> Result<()> {
             .with_service_account_options(&service_account)?,
     );
 
-    // Initialize Authorizer (RBAC or AlwaysAllow based on skip_auth)
-    let authorizer: Arc<dyn rusternetes_common::authz::Authorizer> = if args.skip_auth {
+    // Authorizer chain, shared with the all-in-one entry point (#2679).
+    if args.skip_auth {
         warn!("⚠️  AUTHENTICATION AND AUTHORIZATION DISABLED - INSECURE MODE");
         warn!("⚠️  Using AlwaysAllowAuthorizer - all requests will be permitted");
         warn!("⚠️  This should ONLY be used in development/testing environments");
-        Arc::new(rusternetes_common::authz::AlwaysAllowAuthorizer)
-    } else {
-        // Node,RBAC union (upstream --authorization-mode=Node,RBAC): a kubelet
-        // (system:node:<name>) is authorized for its node's resources by the
-        // Node authorizer; everything else falls through to RBAC. Without the
-        // Node authorizer, vanilla kubelets are Forbidden on an RBAC-only store
-        // (modern clusters do not bind system:nodes to system:node — #1664).
-        info!("Initializing Node,RBAC union Authorizer");
-        let node: Arc<dyn rusternetes_common::authz::Authorizer> =
-            Arc::new(rusternetes_common::authz::NodeAuthorizer);
-        let rbac: Arc<dyn rusternetes_common::authz::Authorizer> =
-            Arc::new(RBACAuthorizer::new(storage.clone()));
-        // `system:masters` superuser first, as `newForConfig`
-        // (`pkg/kubeapiserver/authorizer/reload.go:97-99`) does (#1576).
-        Arc::new(rusternetes_common::authz::superuser_then(vec![node, rbac]))
-    };
+    }
+    let authorizer =
+        rusternetes_api_server::authorizer::build_authorizer(storage.clone(), args.skip_auth);
 
     // Initialize Metrics Registry
     info!("Initializing Metrics Registry");
