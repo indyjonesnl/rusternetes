@@ -36,6 +36,10 @@ struct Fake {
     /// `None` echoes the requested size; `Some(n)` reports `n` bytes.
     capacity: Option<i64>,
     create_code: Option<tonic::Code>,
+    /// Controller capabilities beyond CREATE_DELETE_VOLUME.
+    extra_caps: Vec<controller_service_capability::rpc::Type>,
+    /// A driver that ignores `volume_content_source` (it must echo it).
+    drop_content_source: bool,
 }
 
 impl Fake {
@@ -44,7 +48,19 @@ impl Fake {
             rec: Default::default(),
             capacity: None,
             create_code: None,
+            extra_caps: vec![],
+            drop_content_source: false,
         }
+    }
+
+    /// A driver that can restore snapshots and clone volumes.
+    fn with_content_sources() -> Self {
+        let mut f = Self::new();
+        f.extra_caps = vec![
+            controller_service_capability::rpc::Type::CreateDeleteSnapshot,
+            controller_service_capability::rpc::Type::CloneVolume,
+        ];
+        f
     }
 }
 
@@ -72,14 +88,17 @@ impl Controller for Fake {
         &self,
         _r: Request<ControllerGetCapabilitiesRequest>,
     ) -> Result<Response<ControllerGetCapabilitiesResponse>, Status> {
+        let mut types = vec![controller_service_capability::rpc::Type::CreateDeleteVolume];
+        types.extend(self.extra_caps.iter().copied());
         Ok(Response::new(ControllerGetCapabilitiesResponse {
-            capabilities: vec![ControllerServiceCapability {
-                r#type: Some(controller_service_capability::Type::Rpc(
-                    controller_service_capability::Rpc {
-                        r#type: controller_service_capability::rpc::Type::CreateDeleteVolume as i32,
-                    },
-                )),
-            }],
+            capabilities: types
+                .into_iter()
+                .map(|t| ControllerServiceCapability {
+                    r#type: Some(controller_service_capability::Type::Rpc(
+                        controller_service_capability::Rpc { r#type: t as i32 },
+                    )),
+                })
+                .collect(),
         }))
     }
     async fn create_volume(
@@ -97,6 +116,11 @@ impl Controller for Fake {
                 capacity_bytes: self.capacity.unwrap_or(required),
                 volume_id: "vol-1".into(),
                 volume_context: [("shape".to_string(), "round".to_string())].into(),
+                content_source: if self.drop_content_source {
+                    None
+                } else {
+                    req.volume_content_source.clone()
+                },
                 ..Default::default()
             }),
         }))
@@ -466,4 +490,405 @@ async fn the_pv_controller_annotates_claims_for_an_external_provisioner() {
         .any(|e| e.reason == "ExternalProvisioning"));
     // ... and the in-tree path does not create a PV for it.
     assert!(pv(&storage).await.is_none());
+}
+
+// ---- data sources (#2963): getVolumeContentSource / getPVCSource /
+// getSnapshotSource (external-provisioner controller.go:1184 / :1198 / :1289),
+// the clone / snapshot-protection finalizers (:1054 / :1070 / :1097) and
+// Provision's "volume content source missing" cleanup (:931-:945).
+
+const SNAP_GROUP: &str = "snapshot.storage.k8s.io";
+const SNAP_UID: &str = "snap-uid-1";
+const CLONE_FINALIZER: &str = "provisioner.storage.kubernetes.io/cloning-protection";
+const SNAP_FINALIZER: &str =
+    "provisioner.storage.kubernetes.io/volumesnapshot-as-source-protection";
+
+fn snapshot_claim() -> PersistentVolumeClaim {
+    let mut c = claim(&[(ANN, DRIVER)]);
+    c.spec.data_source = Some(TypedLocalObjectReference {
+        api_group: Some(SNAP_GROUP.into()),
+        kind: "VolumeSnapshot".into(),
+        name: "snap".into(),
+    });
+    c
+}
+
+fn clone_claim() -> PersistentVolumeClaim {
+    let mut c = claim(&[(ANN, DRIVER)]);
+    c.spec.data_source = Some(TypedLocalObjectReference {
+        api_group: None,
+        kind: "PersistentVolumeClaim".into(),
+        name: "src".into(),
+    });
+    c
+}
+
+fn snapshot(ready: bool, restore_size: Option<&str>) -> VolumeSnapshot {
+    let mut meta = ObjectMeta::new("snap").with_namespace("ns1");
+    meta.uid = SNAP_UID.into();
+    VolumeSnapshot {
+        type_meta: TypeMeta {
+            kind: "VolumeSnapshot".into(),
+            api_version: "snapshot.storage.k8s.io/v1".into(),
+        },
+        metadata: meta,
+        spec: Default::default(),
+        status: Some(VolumeSnapshotStatus {
+            bound_volume_snapshot_content_name: Some("snapcontent-1".into()),
+            creation_time: None,
+            ready_to_use: Some(ready),
+            restore_size: restore_size.map(String::from),
+            error: None,
+        }),
+    }
+}
+
+fn snapshot_content(driver: &str, handle: Option<&str>) -> VolumeSnapshotContent {
+    VolumeSnapshotContent {
+        type_meta: TypeMeta {
+            kind: "VolumeSnapshotContent".into(),
+            api_version: "snapshot.storage.k8s.io/v1".into(),
+        },
+        metadata: ObjectMeta::new("snapcontent-1"),
+        spec: VolumeSnapshotContentSpec {
+            driver: driver.into(),
+            volume_snapshot_ref: ObjectReference {
+                name: Some("snap".into()),
+                namespace: Some("ns1".into()),
+                uid: Some(SNAP_UID.into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        status: Some(VolumeSnapshotContentStatus {
+            snapshot_handle: handle.map(String::from),
+            creation_time: None,
+            ready_to_use: Some(true),
+            restore_size: None,
+            error: None,
+        }),
+    }
+}
+
+async fn put_snapshot(storage: &MemoryStorage, s: &VolumeSnapshot, c: &VolumeSnapshotContent) {
+    storage
+        .create(&build_key("volumesnapshots", Some("ns1"), "snap"), s)
+        .await
+        .unwrap();
+    storage
+        .create(
+            &build_key("volumesnapshotcontents", None, "snapcontent-1"),
+            c,
+        )
+        .await
+        .unwrap();
+}
+
+async fn snapshot_finalizers(storage: &MemoryStorage) -> Vec<String> {
+    let s: VolumeSnapshot = storage
+        .get(&build_key("volumesnapshots", Some("ns1"), "snap"))
+        .await
+        .unwrap();
+    s.metadata.finalizers.unwrap_or_default()
+}
+
+/// A bound CSI source PVC `src` and its Bound PV `pv-src`.
+async fn put_source_pvc(storage: &MemoryStorage, driver: &str, size: &str) {
+    let mut meta = ObjectMeta::new("src").with_namespace("ns1");
+    meta.uid = "src-uid".into();
+    let mut src = claim(&[]);
+    src.metadata = meta;
+    src.spec.volume_name = Some("pv-src".into());
+    src.spec.resources.requests = Some([("storage".to_string(), size.to_string())].into());
+    src.status = Some(PersistentVolumeClaimStatus {
+        phase: PersistentVolumeClaimPhase::Bound,
+        ..Default::default()
+    });
+    storage
+        .create(
+            &build_key("persistentvolumeclaims", Some("ns1"), "src"),
+            &src,
+        )
+        .await
+        .unwrap();
+    let pv = PersistentVolume {
+        type_meta: TypeMeta {
+            kind: "PersistentVolume".into(),
+            api_version: "v1".into(),
+        },
+        metadata: ObjectMeta::new("pv-src"),
+        spec: PersistentVolumeSpec {
+            csi: Some(CSIVolumeSource {
+                driver: driver.into(),
+                volume_handle: Some("vol-src".into()),
+                ..Default::default()
+            }),
+            claim_ref: Some(ObjectReference {
+                kind: Some("PersistentVolumeClaim".into()),
+                namespace: Some("ns1".into()),
+                name: Some("src".into()),
+                uid: Some("src-uid".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        status: Some(PersistentVolumeStatus {
+            phase: PersistentVolumePhase::Bound,
+            message: None,
+            reason: None,
+            last_phase_transition_time: None,
+        }),
+    };
+    storage
+        .create(&build_key("persistentvolumes", None, "pv-src"), &pv)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_snapshot_data_source_becomes_a_snapshot_content_source() {
+    let (storage, p, rec, _d) = env(Fake::with_content_sources(), storage_class(None)).await;
+    put_snapshot(
+        &storage,
+        &snapshot(true, Some("1Gi")),
+        &snapshot_content(DRIVER, Some("snap-handle-1")),
+    )
+    .await;
+    p.sync_claim(&snapshot_claim()).await.unwrap();
+
+    let reqs = rec.lock().unwrap().create_volume.clone();
+    assert_eq!(reqs.len(), 1);
+    match reqs[0]
+        .volume_content_source
+        .as_ref()
+        .and_then(|s| s.r#type.as_ref())
+    {
+        Some(volume_content_source::Type::Snapshot(s)) => {
+            assert_eq!(s.snapshot_id, "snap-handle-1")
+        }
+        other => panic!("expected a snapshot content source, got {other:?}"),
+    }
+    assert!(pv(&storage).await.is_some());
+    // setSnapshotFinalizer ran before CreateVolume; removeSnapshotFinalizer
+    // after the PV was built (Provision, :1043-:1049).
+    assert!(!snapshot_finalizers(&storage)
+        .await
+        .contains(&SNAP_FINALIZER.to_string()));
+}
+
+#[tokio::test]
+async fn a_snapshot_is_protected_while_its_volume_is_not_yet_provisioned() {
+    let mut fake = Fake::with_content_sources();
+    fake.create_code = Some(tonic::Code::Unavailable);
+    let (storage, p, _rec, _d) = env(fake, storage_class(None)).await;
+    put_snapshot(
+        &storage,
+        &snapshot(true, None),
+        &snapshot_content(DRIVER, Some("h")),
+    )
+    .await;
+    p.sync_claim(&snapshot_claim()).await.unwrap_err();
+    assert!(snapshot_finalizers(&storage)
+        .await
+        .contains(&SNAP_FINALIZER.to_string()));
+}
+
+#[tokio::test]
+async fn an_unready_snapshot_is_not_restored() {
+    let (storage, p, rec, _d) = env(Fake::with_content_sources(), storage_class(None)).await;
+    put_snapshot(
+        &storage,
+        &snapshot(false, None),
+        &snapshot_content(DRIVER, Some("h")),
+    )
+    .await;
+    let err = p.sync_claim(&snapshot_claim()).await.unwrap_err();
+    assert!(
+        err.to_string().contains("snapshot snap is not Ready"),
+        "{err}"
+    );
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+}
+
+#[tokio::test]
+async fn a_snapshot_of_another_driver_is_refused() {
+    let (storage, p, rec, _d) = env(Fake::with_content_sources(), storage_class(None)).await;
+    put_snapshot(
+        &storage,
+        &snapshot(true, None),
+        &snapshot_content("other.csi.io", Some("h")),
+    )
+    .await;
+    let err = p.sync_claim(&snapshot_claim()).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("is not handled by CSI driver of StorageClass fast"),
+        "{err}"
+    );
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+}
+
+#[tokio::test]
+async fn a_snapshot_without_a_handle_is_refused() {
+    let (storage, p, rec, _d) = env(Fake::with_content_sources(), storage_class(None)).await;
+    put_snapshot(
+        &storage,
+        &snapshot(true, None),
+        &snapshot_content(DRIVER, None),
+    )
+    .await;
+    let err = p.sync_claim(&snapshot_claim()).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("snapshot handle snap is not available"),
+        "{err}"
+    );
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+}
+
+#[tokio::test]
+async fn a_claim_smaller_than_the_snapshot_restore_size_is_refused() {
+    let (storage, p, rec, _d) = env(Fake::with_content_sources(), storage_class(None)).await;
+    put_snapshot(
+        &storage,
+        &snapshot(true, Some("2Gi")),
+        &snapshot_content(DRIVER, Some("h")),
+    )
+    .await;
+    let err = p.sync_claim(&snapshot_claim()).await.unwrap_err();
+    assert!(err.to_string().contains("is less than the size"), "{err}");
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+}
+
+#[tokio::test]
+async fn a_snapshot_data_source_of_the_wrong_api_group_is_rejected() {
+    let (_storage, p, rec, _d) = env(Fake::with_content_sources(), storage_class(None)).await;
+    let mut c = snapshot_claim();
+    c.spec.data_source.as_mut().unwrap().api_group = Some("example.com".into());
+    let err = p.sync_claim(&c).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("the PVC source does not belong to the right APIGroup"),
+        "{err}"
+    );
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+}
+
+#[tokio::test]
+async fn a_snapshot_source_needs_create_delete_snapshot() {
+    let (storage, p, rec, _d) = env(Fake::new(), storage_class(None)).await;
+    put_snapshot(
+        &storage,
+        &snapshot(true, None),
+        &snapshot_content(DRIVER, Some("h")),
+    )
+    .await;
+    let err = p.sync_claim(&snapshot_claim()).await.unwrap_err();
+    assert!(err.to_string().contains("CREATE_DELETE_SNAPSHOT"), "{err}");
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+}
+
+#[tokio::test]
+async fn a_pvc_data_source_becomes_a_volume_content_source_and_is_protected() {
+    let (storage, p, rec, _d) = env(Fake::with_content_sources(), storage_class(None)).await;
+    put_source_pvc(&storage, DRIVER, "1Gi").await;
+    p.sync_claim(&clone_claim()).await.unwrap();
+
+    let reqs = rec.lock().unwrap().create_volume.clone();
+    assert_eq!(reqs.len(), 1);
+    match reqs[0]
+        .volume_content_source
+        .as_ref()
+        .and_then(|s| s.r#type.as_ref())
+    {
+        Some(volume_content_source::Type::Volume(v)) => assert_eq!(v.volume_id, "vol-src"),
+        other => panic!("expected a volume content source, got {other:?}"),
+    }
+    assert!(pv(&storage).await.is_some());
+    // setCloneFinalizer (:1054): the source stays until the clone is bound.
+    let src: PersistentVolumeClaim = storage
+        .get(&build_key("persistentvolumeclaims", Some("ns1"), "src"))
+        .await
+        .unwrap();
+    assert!(src
+        .metadata
+        .finalizers
+        .unwrap_or_default()
+        .contains(&CLONE_FINALIZER.to_string()));
+}
+
+#[tokio::test]
+async fn a_clone_smaller_than_its_source_is_refused() {
+    let (storage, p, rec, _d) = env(Fake::with_content_sources(), storage_class(None)).await;
+    put_source_pvc(&storage, DRIVER, "2Gi").await;
+    let err = p.sync_claim(&clone_claim()).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("must be greater than or equal in size to the specified PVC data source"),
+        "{err}"
+    );
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+}
+
+#[tokio::test]
+async fn a_clone_of_another_drivers_volume_is_refused() {
+    let (storage, p, rec, _d) = env(Fake::with_content_sources(), storage_class(None)).await;
+    put_source_pvc(&storage, "other.csi.io", "1Gi").await;
+    let err = p.sync_claim(&clone_claim()).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("claim in dataSource not bound or invalid"),
+        "{err}"
+    );
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+}
+
+#[tokio::test]
+async fn a_clone_needs_clone_volume() {
+    let (storage, p, rec, _d) = env(Fake::new(), storage_class(None)).await;
+    put_source_pvc(&storage, DRIVER, "1Gi").await;
+    let err = p.sync_claim(&clone_claim()).await.unwrap_err();
+    assert!(err.to_string().contains("CLONE_VOLUME"), "{err}");
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+}
+
+/// Provision :931-:945: a driver that ignores the content source has made a
+/// blank volume; delete it and retry in the background.
+#[tokio::test]
+async fn a_volume_without_the_requested_content_source_is_deleted() {
+    let mut fake = Fake::with_content_sources();
+    fake.drop_content_source = true;
+    let (storage, p, rec, _d) = env(fake, storage_class(None)).await;
+    put_source_pvc(&storage, DRIVER, "1Gi").await;
+    let err = p.sync_claim(&clone_claim()).await.unwrap_err();
+    assert!(
+        err.to_string().contains("volume content source missing"),
+        "{err}"
+    );
+    let del = rec.lock().unwrap().delete_volume.clone();
+    assert_eq!(del.len(), 1);
+    assert_eq!(del[0].volume_id, "vol-1");
+    assert!(pv(&storage).await.is_none());
+}
+
+/// `dataSource` (:2096): the cross-namespace form needs the
+/// CrossNamespaceVolumeDataSource gate, off here.
+#[tokio::test]
+async fn a_data_source_ref_namespace_needs_the_cross_namespace_gate() {
+    let (_storage, p, rec, _d) = env(Fake::with_content_sources(), storage_class(None)).await;
+    let mut c = clone_claim();
+    c.spec.data_source = None;
+    c.spec.data_source_ref = Some(TypedObjectReference {
+        api_group: None,
+        kind: "PersistentVolumeClaim".into(),
+        name: "src".into(),
+        namespace: Some("other".into()),
+    });
+    let err = p.sync_claim(&c).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("CrossNamespaceVolumeDataSource feature is disabled"),
+        "{err}"
+    );
+    assert!(rec.lock().unwrap().create_volume.is_empty());
 }
