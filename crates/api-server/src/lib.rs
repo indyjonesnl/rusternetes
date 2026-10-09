@@ -5,6 +5,7 @@ pub use rusternetes_admission_webhook as admission_webhook;
 pub mod apiserver_identity;
 pub mod autoregister;
 pub mod bootstrap;
+pub mod crdregistration;
 pub mod legacy_token_tracking;
 pub use rusternetes_admission_webhook::cel_evaluators as cel;
 pub use rusternetes_middleware::cbor;
