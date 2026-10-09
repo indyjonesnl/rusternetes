@@ -59,18 +59,12 @@ impl VolumePlugin for LocalPlugin {
     }
 
     /// `NewMounter` (`local.go:138-169`).
-    async fn new_mounter(&self, spec: &Spec<'_>, pod: &Pod) -> Result<Box<dyn Mounter>> {
+    async fn new_mounter(&self, spec: &Spec<'_>, _pod: &Pod) -> Result<Box<dyn Mounter>> {
         let path = local_path(spec)
             .ok_or_else(|| anyhow!("local plugin got a spec with no local source"))?;
         Ok(Box::new(LocalMounter {
             path: path.to_string(),
             read_only: spec.read_only,
-            fs_group: crate::volume_plugins::util::fs_group_from(pod),
-            fs_group_change_policy: pod
-                .spec
-                .as_ref()
-                .and_then(|s| s.security_context.as_ref())
-                .and_then(|sc| sc.fs_group_change_policy.clone()),
         }))
     }
 
@@ -99,8 +93,6 @@ impl VolumePlugin for LocalPlugin {
 struct LocalMounter {
     path: String,
     read_only: bool,
-    fs_group: Option<i64>,
-    fs_group_change_policy: Option<String>,
 }
 
 #[async_trait]
@@ -119,7 +111,7 @@ impl Mounter for LocalMounter {
     }
 
     /// `SetUpAt` (`local.go:529-626`).
-    async fn set_up_at(&self, dir: &str, _args: &crate::volume_plugins::MounterArgs) -> Result<()> {
+    async fn set_up_at(&self, dir: &str, args: &crate::volume_plugins::MounterArgs) -> Result<()> {
         if dir.is_empty() {
             return Err(anyhow!("LocalVolume volume path is empty"));
         }
@@ -133,8 +125,8 @@ impl Mounter for LocalMounter {
         if !self.read_only {
             let (root, fs_group, policy) = (
                 dir.to_string(),
-                self.fs_group,
-                self.fs_group_change_policy.clone(),
+                args.fs_group,
+                args.fs_group_change_policy.clone(),
             );
             tokio::task::spawn_blocking(move || {
                 crate::volume_ownership::set_volume_ownership_with_policy(
@@ -204,6 +196,20 @@ mod tests {
         .unwrap()
     }
 
+    /// The args the operation generator builds from the pod
+    /// (`operation_generator.go:582-589`).
+    fn args_for(pod: &Pod) -> crate::volume_plugins::MounterArgs {
+        crate::volume_plugins::MounterArgs {
+            fs_group: crate::volume_plugins::util::fs_group_from(pod),
+            fs_group_change_policy: pod
+                .spec
+                .as_ref()
+                .and_then(|s| s.security_context.as_ref())
+                .and_then(|sc| sc.fs_group_change_policy.clone()),
+            ..Default::default()
+        }
+    }
+
     fn tmp(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("local-plugin-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -251,7 +257,7 @@ mod tests {
             read_only: false,
         };
         let m = plugin().new_mounter(&s, &pod(gid, None)).await.unwrap();
-        m.set_up().await.unwrap();
+        m.set_up_with(&args_for(&pod(gid, None))).await.unwrap();
         assert_eq!(mode(&f), 0o660);
         assert_eq!(mode(&d) & 0o2000, 0o2000);
     }
@@ -272,7 +278,7 @@ mod tests {
             read_only: true,
         };
         let m = plugin().new_mounter(&s, &pod(gid, None)).await.unwrap();
-        m.set_up().await.unwrap();
+        m.set_up_with(&args_for(&pod(gid, None))).await.unwrap();
         assert_eq!(mode(&f), 0o400);
     }
 
@@ -298,13 +304,17 @@ mod tests {
             .new_mounter(&s, &pod(gid, Some("OnRootMismatch")))
             .await
             .unwrap();
-        m.set_up().await.unwrap();
+        m.set_up_with(&args_for(&pod(gid, Some("OnRootMismatch"))))
+            .await
+            .unwrap();
         assert_eq!(mode(&f), 0o600, "OnRootMismatch + matching root: no walk");
         let m = plugin()
             .new_mounter(&s, &pod(gid, Some("Always")))
             .await
             .unwrap();
-        m.set_up().await.unwrap();
+        m.set_up_with(&args_for(&pod(gid, Some("Always"))))
+            .await
+            .unwrap();
         assert_eq!(mode(&f), 0o660, "Always walks");
     }
 
