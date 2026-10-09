@@ -553,6 +553,7 @@ fn digest(
     // finishQueueSetReconfigsLocked (:846-912).
     let mut levels = HashMap::new();
     let mut nominal_cl_sum = 0usize;
+    let mut max_waiting_requests = 0isize;
     for (name, st) in new_states {
         let exempt = matches!(st.pl.spec.type_, PriorityLevelType::Exempt);
         let cl = if share_sum > 0.0 {
@@ -570,6 +571,8 @@ fn digest(
         };
         let (min_cl, max_cl) = (cl.saturating_sub(lendable_cl), cl + borrowing_cl);
         nominal_cl_sum += cl;
+        // `metrics.SetPriorityLevelConfiguration` (apf_controller.go:874).
+        fcmetrics::set_priority_level_configuration(&name, cl as i64, min_cl as i64, max_cl as i64);
         // Introducing queues starts with currentCL = nominalCL - lendableCL/2
         // and no demand history (:897-900); retained ones keep theirs.
         let borrow = match st.borrow {
@@ -584,6 +587,10 @@ fn digest(
             concurrency_limit: borrow.current_cl,
         };
         let num_queues = qcfg.desired_num_queues;
+        if num_queues > 0 {
+            // `meal.maxWaitingRequests += Queues * QueueLengthLimit` (:882).
+            max_waiting_requests += num_queues * qcfg.queue_length_limit;
+        }
         // validate_pl (or an earlier digest) already approved this config.
         let queues = match st.queues {
             Some(q) => {
@@ -610,9 +617,11 @@ fn digest(
             },
         );
     }
+    // The read-vs-write denominators (apf_controller.go:705-708).
+    fcmetrics::set_read_write_denominators(max_waiting_requests as f64, nominal_cl_sum as f64);
     // `meal.cfgCtlr.nominalCLSum = meal.maxExecutingRequests;
     // updateBorrowingLocked(false, newPLStates)` (:909-910).
-    update_borrowing_locked(&levels, nominal_cl_sum);
+    update_borrowing_locked(&levels, nominal_cl_sum, server_cl);
     Config {
         nominal_cl_sum,
         flow_schemas: seq,
@@ -635,7 +644,20 @@ fn lend_borrow_percents(pl: &PriorityLevelConfiguration) -> (Option<i32>, Option
 /// `currentCL` from its smoothed seat demand and the server's total
 /// concurrency, and impose it on the level's queueset (the completer
 /// re-creation upstream does is `set_configuration` here).
-fn update_borrowing_locked(levels: &HashMap<String, LevelState>, nominal_cl_sum: usize) {
+/// `qll` of `queueSet.setConfiguration` (queueset.go:276-282).
+fn queue_capacity(q: &QueuingConfig) -> isize {
+    let mut qll = q.queue_length_limit.max(1);
+    if q.desired_num_queues > 0 {
+        qll *= q.desired_num_queues;
+    }
+    qll
+}
+
+fn update_borrowing_locked(
+    levels: &HashMap<String, LevelState>,
+    nominal_cl_sum: usize,
+    server_cl: i64,
+) {
     let mut items: Vec<AllocProblemItem> = Vec::with_capacity(levels.len());
     let mut non_exempt_names: Vec<&str> = Vec::with_capacity(levels.len());
     let mut idx_of_non_exempt: HashMap<&str, usize> = HashMap::new();
@@ -676,14 +698,20 @@ fn update_borrowing_locked(levels: &HashMap<String, LevelState>, nominal_cl_sum:
     let mut allocs: Vec<f64> = Vec::new();
     let mut share_frac = 0f64;
     let mut backstop = false;
+    // `metrics.SetFairFrac` (apf_controller.go:440-454).
     if remaining_server_cl <= min_cl_sum as i64 {
         // every non-exempt level gets its minCL
+        fcmetrics::set_fair_frac(0.0);
     } else if remaining_server_cl <= min_current_cl_sum as i64 {
         share_frac = (remaining_server_cl - min_cl_sum as i64) as f64
             / (min_current_cl_sum - min_cl_sum) as f64;
+        fcmetrics::set_fair_frac(0.0);
     } else {
         match compute_concurrency_allocation(nominal_cl_sum as i64, &items) {
-            Ok((a, _fair_frac)) => allocs = a,
+            Ok((a, fair_frac)) => {
+                allocs = a;
+                fcmetrics::set_fair_frac(fair_frac);
+            }
             Err(e) => {
                 error!(
                     "Unable to derive new concurrency limits for {:?}: {}",
@@ -710,6 +738,23 @@ fn update_borrowing_locked(levels: &HashMap<String, LevelState>, nominal_cl_sum:
         };
         let rel_change = rel_diff(current_cl as f64, b.current_cl as f64);
         b.current_cl = current_cl;
+        // `NotePriorityLevelConcurrencyAdjustment` (apf_controller.go:481).
+        // `items[idx].target` with `idx` the zero value for an exempt level
+        // (not in `idxOfNonExempt`) reads the first item, as upstream does.
+        let target = idx_of_non_exempt
+            .get(name.as_str())
+            .or(Some(&0))
+            .and_then(|&i| items.get(i))
+            .map_or(0.0, |it| it.target);
+        fcmetrics::note_priority_level_concurrency_adjustment(
+            name,
+            b.stats.high_watermark as f64,
+            b.stats.avg,
+            b.stats.std_dev,
+            b.stats.smoothed,
+            target,
+            current_cl as i64,
+        );
         if rel_change >= 0.05 {
             tracing::info!(
                 pl = %name, current_cl, high_watermark = b.stats.high_watermark,
@@ -718,6 +763,19 @@ fn update_borrowing_locked(levels: &HashMap<String, LevelState>, nominal_cl_sum:
             );
         }
         let qcfg = queuing_config_for_pl(&l.pl);
+        // `queueset.go:276-284`: the gauge denominators; the concurrency
+        // denominator is `currentCL`, else `max(1, round(serverCL/10))`
+        // (apf_controller.go:486-491).
+        let concurrency_denominator = if current_cl > 0 {
+            current_cl as f64
+        } else {
+            (server_cl as f64 / 10.0).round().max(1.0)
+        };
+        fcmetrics::set_level_denominators(
+            name,
+            queue_capacity(&qcfg) as f64,
+            concurrency_denominator,
+        );
         l.queues
             .set_configuration(
                 qcfg,
@@ -786,15 +844,21 @@ struct InQueue {
     priority_level: String,
     flow_schema: String,
     seats: i64,
+    mutating: bool,
 }
 
 impl InQueue {
-    fn new(priority_level: &str, flow_schema: &str, seats: usize) -> Self {
+    fn new(priority_level: &str, flow_schema: &str, seats: usize, mutating: bool) -> Self {
         fcmetrics::add_in_queues(priority_level, flow_schema, 1, seats as i64);
+        // `reqsGaugePair.RequestsWaiting.Add(1)` (queueset.go:649) and
+        // `noteWaitingDelta(1)` (priority-and-fairness.go:150-156).
+        fcmetrics::add_level_waiting(priority_level, 1.0);
+        fcmetrics::add_read_write(fcmetrics::Phase::Waiting, mutating, 1);
         Self {
             priority_level: priority_level.to_string(),
             flow_schema: flow_schema.to_string(),
             seats: seats as i64,
+            mutating,
         }
     }
 }
@@ -802,6 +866,8 @@ impl InQueue {
 impl Drop for InQueue {
     fn drop(&mut self) {
         fcmetrics::add_in_queues(&self.priority_level, &self.flow_schema, -1, -self.seats);
+        fcmetrics::add_level_waiting(&self.priority_level, -1.0);
+        fcmetrics::add_read_write(fcmetrics::Phase::Waiting, self.mutating, -1);
     }
 }
 
@@ -814,17 +880,23 @@ struct ExecutionMetrics {
     seats: i64,
     started: Instant,
     is_watch: bool,
+    mutating: bool,
 }
 
 impl ExecutionMetrics {
-    fn new(priority_level: &str, flow_schema: &str, seats: usize) -> Self {
+    fn new(priority_level: &str, flow_schema: &str, seats: usize, mutating: bool) -> Self {
         fcmetrics::add_executing(priority_level, flow_schema, 1, seats as i64);
+        // `RequestsExecuting.Add(1)` + `execSeatsGauge.Add(seats)`
+        // (queueset.go:680-681, :726-727) and `noteExecutingDelta(1)`.
+        fcmetrics::add_level_executing(priority_level, 1.0, seats as f64);
+        fcmetrics::add_read_write(fcmetrics::Phase::Executing, mutating, 1);
         Self {
             priority_level: priority_level.to_string(),
             flow_schema: flow_schema.to_string(),
             seats: seats as i64,
             started: Instant::now(),
             is_watch: false,
+            mutating,
         }
     }
 }
@@ -832,6 +904,8 @@ impl ExecutionMetrics {
 impl Drop for ExecutionMetrics {
     fn drop(&mut self) {
         fcmetrics::add_executing(&self.priority_level, &self.flow_schema, -1, -self.seats);
+        fcmetrics::add_level_executing(&self.priority_level, -1.0, -(self.seats as f64));
+        fcmetrics::add_read_write(fcmetrics::Phase::Executing, self.mutating, -1);
         fcmetrics::observe_execution_duration(
             &self.priority_level,
             &self.flow_schema,
@@ -1060,7 +1134,7 @@ impl<S: Storage> FlowControlEngine<S> {
         // mutated through its per-level mutexes.
         #[allow(clippy::readonly_write_lock)]
         let cfg = self.config.write().unwrap();
-        update_borrowing_locked(&cfg.levels, cfg.nominal_cl_sum);
+        update_borrowing_locked(&cfg.levels, cfg.nominal_cl_sum, self.server_cl);
     }
 
     /// The borrowing bounds and current limit of a level.
@@ -1160,7 +1234,7 @@ impl<S: Storage> FlowControlEngine<S> {
         let queued = if handle.is_dispatched() {
             None
         } else {
-            Some((InQueue::new(pl, fs, seats), Instant::now()))
+            Some((InQueue::new(pl, fs, seats, c.is_mutating), Instant::now()))
         };
         // Dropping the wait future on timeout cancels the queued request.
         match tokio::time::timeout(wait_limit, handle.wait()).await {
@@ -1176,7 +1250,7 @@ impl<S: Storage> FlowControlEngine<S> {
                 fcmetrics::add_dispatch(pl, fs);
                 Ok(FlowControlPermit {
                     _execution: Some(exec),
-                    metrics: Some(ExecutionMetrics::new(pl, fs, seats)),
+                    metrics: Some(ExecutionMetrics::new(pl, fs, seats, c.is_mutating)),
                 })
             }
             Err(_) => {
