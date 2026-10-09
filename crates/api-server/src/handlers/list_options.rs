@@ -344,4 +344,40 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::Invalid(_)), "{err:?}");
     }
+
+    /// The wait is woken by the storage's writes, not by a timer (upstream's
+    /// `w.cond.Wait()` in `waitUntilFreshAndBlock`,
+    /// storage/cacher/watch_cache.go:448-488, broadcast on every event
+    /// processed, `watch_cache.go` `processEvent`). On the paused clock a
+    /// poll loop only ever finishes a timer tick after the write, so the
+    /// elapsed virtual time between the write and the wake-up is nonzero.
+    #[tokio::test(start_paused = true)]
+    async fn wait_is_woken_by_a_write_not_a_poll_tick() {
+        let storage = std::sync::Arc::new(MemoryStorage::new());
+        let want = storage.current_revision().await.unwrap() + 1;
+        let waiter = {
+            let storage = storage.clone();
+            tokio::spawn(async move {
+                prepare_list(&*storage, &q(&[("resourceVersion", &want.to_string())]))
+                    .await
+                    .map(|_| tokio::time::Instant::now())
+            })
+        };
+        // Let the waiter register and park.
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        let cm = serde_json::json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"a","namespace":"ns"}});
+        storage
+            .create("/registry/configmaps/ns/a", &cm)
+            .await
+            .unwrap();
+        let wrote = tokio::time::Instant::now();
+        let woke = waiter.await.unwrap().unwrap();
+        assert!(
+            woke - wrote < std::time::Duration::from_millis(10),
+            "woke {:?} after the write",
+            woke - wrote
+        );
+    }
 }
