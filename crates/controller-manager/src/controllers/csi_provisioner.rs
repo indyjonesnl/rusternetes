@@ -157,11 +157,10 @@ impl From<anyhow::Error> for Failure {
 
 type Outcome<T> = std::result::Result<T, (ProvisioningState, Failure)>;
 
-/// Why `csiProvisioner.Delete` stopped.
+/// Why `csiProvisioner.Delete` stopped. (`IgnoredError` is only returned for
+/// a node deployment, which is not ported.)
 #[derive(Debug)]
 enum DeleteFailure {
-    /// `controller.IgnoredError`.
-    Ignored(String),
     /// `controller.VolumeInUseError`: postponed, not failed.
     InUse(String),
     Error(anyhow::Error),
@@ -839,12 +838,6 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
         let object = Self::volume_ref(volume);
         match self.delete_csi_volume(volume).await {
             Ok(()) => {}
-            Err(DeleteFailure::Ignored(reason)) => {
-                // "Delete ignored, do nothing and hope another provisioner
-                // will delete it."
-                debug!("Volume deletion ignored: {reason}");
-                return Ok(());
-            }
             Err(DeleteFailure::InUse(reason)) => {
                 // "Volume is still in use, retry later without treating it
                 // as a failure."
@@ -954,11 +947,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
 
         // One DeleteVolume under the client's `--timeout`.
         self.client
-            .delete_volume(DeleteVolumeRequest {
-                volume_id,
-                secrets,
-                ..Default::default()
-            })
+            .delete_volume(DeleteVolumeRequest { volume_id, secrets })
             .await
             .map_err(|e| anyhow::Error::new(e).into())
     }
