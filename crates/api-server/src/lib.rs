@@ -13,6 +13,7 @@ pub mod endpoints;
 #[allow(dead_code)]
 pub mod flow_control;
 pub mod flow_control_filter;
+pub mod flow_control_object_count;
 pub mod flow_control_queueset;
 pub mod flow_control_work_estimator;
 pub mod gnostic;
