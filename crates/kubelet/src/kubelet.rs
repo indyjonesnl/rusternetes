@@ -1765,8 +1765,8 @@ impl Kubelet {
             // nodeutil.PatchNodeStatus (component-helpers/node/util/status.go
             // :33-44): a strategic-merge PATCH of the /status subresource
             // carrying only the delta against `original_node`, not a full
-            // status PUT. Direct (non-API) backends write `node` whole via
-            // update_status (see Storage::patch_status_strategic_merge).
+            // status PUT. Direct (non-API) backends apply the delta onto the
+            // current object (see Storage::patch_status_strategic_merge).
             let patch = crate::node_status::prepare_patch_for_node_status(&original_node, &node)
                 .map_err(|e| anyhow::anyhow!("failed to patch status for node: {e}"))?;
             let _: Node = self

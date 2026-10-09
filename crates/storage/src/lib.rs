@@ -224,20 +224,19 @@ pub trait Storage: Send + Sync {
     ///
     /// `full` is the complete desired object the patch was computed to
     /// produce. API-backed storage ignores it and sends the delta. Direct
-    /// backends have no strategic-merge engine at this layer (the
-    /// api-server's lives in its own crate) and an RFC 7386 merge would
-    /// REPLACE merge-keyed lists such as `status.conditions` with the delta, so
-    /// they fall back to [`Storage::update_status`] with `full`.
+    /// backends re-read, apply `patch` with the shared strategic-merge applier
+    /// (`rusternetes_common::patch`) onto the CURRENT object and write only
+    /// `.status` back, CAS-retrying on conflict; `full` is unused.
     async fn patch_status_strategic_merge<T>(
         &self,
         key: &str,
-        _patch: &serde_json::Value,
-        full: &T,
+        patch: &serde_json::Value,
+        _full: &T,
     ) -> Result<T>
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
-        self.update_status(key, full).await
+        patch_status_via_update(self, key, patch).await
     }
 
     /// Update a resource with raw JSON value (for GC operations)
@@ -671,6 +670,52 @@ where
     }
     Err(Error::Conflict(format!(
         "patch_strategic_merge: exhausted {MAX_ATTEMPTS} CAS retries for {key}"
+    )))
+}
+
+/// Body of the default [`Storage::patch_status_strategic_merge`]: re-read the
+/// object, apply `patch` with the shared strategic-merge applier
+/// (`strategicpatch.StrategicMergePatch`,
+/// apimachinery/pkg/util/strategicpatch/patch.go:812; handlers/patch.go:446
+/// applies it onto the current object), keep ONLY the resulting `.status`
+/// (the `/status` subresource resets everything else,
+/// registry/core/node/strategy.go `nodeStatusStrategy.PrepareForUpdate`), and
+/// write with the fresh resourceVersion, retrying on conflict
+/// (`GuaranteedUpdate`). Deviation: the applier is schema-less (merge keys
+/// tabulated, not read from struct tags).
+async fn patch_status_via_update<S, T>(
+    storage: &S,
+    key: &str,
+    patch: &serde_json::Value,
+) -> Result<T>
+where
+    S: Storage + ?Sized,
+    T: Serialize + DeserializeOwned + Send + Sync,
+{
+    use rusternetes_common::patch::{apply_patch, PatchType};
+    const MAX_ATTEMPTS: usize = 8;
+    for attempt in 0..MAX_ATTEMPTS {
+        let mut current: serde_json::Value = storage.get(key).await?;
+        let merged = apply_patch(&current, patch, PatchType::StrategicMergePatch)
+            .map_err(|e| Error::InvalidResource(format!("invalid status patch for {key}: {e}")))?;
+        if let Some(obj) = current.as_object_mut() {
+            match merged.get("status") {
+                Some(status) => {
+                    obj.insert("status".to_string(), status.clone());
+                }
+                None => {
+                    obj.remove("status");
+                }
+            }
+        }
+        match storage.update::<serde_json::Value>(key, &current).await {
+            Ok(updated) => return serde_json::from_value(updated).map_err(Error::Serialization),
+            Err(Error::Conflict(_)) if attempt + 1 < MAX_ATTEMPTS => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(Error::Conflict(format!(
+        "patch_status_strategic_merge: exhausted {MAX_ATTEMPTS} CAS retries for {key}"
     )))
 }
 
@@ -1302,7 +1347,7 @@ impl Storage for StorageBackend {
         &self,
         key: &str,
         patch: &serde_json::Value,
-        full: &T,
+        _full: &T,
     ) -> Result<T>
     where
         T: Serialize + DeserializeOwned + Send + Sync,
@@ -1310,9 +1355,9 @@ impl Storage for StorageBackend {
         match self {
             #[cfg(feature = "api-client")]
             StorageBackend::Api(s) => {
-                Storage::patch_status_strategic_merge(s, key, patch, full).await
+                Storage::patch_status_strategic_merge(s, key, patch, _full).await
             }
-            _ => self.update_status(key, full).await,
+            _ => patch_status_via_update(self, key, patch).await,
         }
     }
 
