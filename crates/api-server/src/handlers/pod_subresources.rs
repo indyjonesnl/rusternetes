@@ -522,6 +522,59 @@ pub fn build_kubelet_stream_url(
     uri_str.parse().expect("kubelet stream URL is always valid")
 }
 
+/// Run the validating webhooks for an `admission.Connect` on a pod
+/// subresource.
+///
+/// Upstream: `ConnectResource`
+/// (`staging/src/k8s.io/apiserver/pkg/endpoints/handlers/rest.go:199-216`)
+/// admits the decoded connect-options object (`PodExecOptions`,
+/// `PodAttachOptions`, `PodPortForwardOptions`) with `admission.Connect`
+/// before `connecter.Connect` is invoked. Shared by exec, attach and
+/// portforward.
+async fn run_connect_admission(
+    state: &ApiServerState,
+    kind: &str,
+    resource: &str,
+    namespace: &str,
+    name: &str,
+    options: serde_json::Value,
+    user: &rusternetes_common::admission::UserInfo,
+) -> Result<()> {
+    use rusternetes_common::admission::{
+        AdmissionResponse, GroupVersionKind, GroupVersionResource, Operation,
+    };
+    let gvk = GroupVersionKind {
+        group: "".to_string(),
+        version: "v1".to_string(),
+        kind: kind.to_string(),
+    };
+    let gvr = GroupVersionResource {
+        group: "".to_string(),
+        version: "v1".to_string(),
+        resource: resource.to_string(),
+    };
+    if let AdmissionResponse::Deny(reason) = state
+        .webhook_manager
+        .run_validating_webhooks(
+            &Operation::Connect,
+            &gvk,
+            &gvr,
+            Some(namespace),
+            name,
+            Some(options),
+            None,
+            user,
+        )
+        .await?
+    {
+        return Err(Error::Forbidden(format!(
+            "admission webhook denied the request: {}",
+            reason
+        )));
+    }
+    Ok(())
+}
+
 /// GET/POST /api/v1/namespaces/{namespace}/pods/{name}/exec
 ///
 /// Proxies exec to the pod's kubelet using an upgrade-aware reverse proxy.
@@ -560,19 +613,13 @@ pub async fn exec(
     }
 
     // Run admission webhooks for Connect operation (exec)
-    {
-        use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource, Operation};
-        let gvk = GroupVersionKind {
-            group: "".to_string(),
-            version: "v1".to_string(),
-            kind: "PodExecOptions".to_string(),
-        };
-        let gvr = GroupVersionResource {
-            group: "".to_string(),
-            version: "v1".to_string(),
-            resource: "pods/exec".to_string(),
-        };
-        let exec_options = serde_json::json!({
+    run_connect_admission(
+        &state,
+        "PodExecOptions",
+        "pods/exec",
+        &namespace,
+        &name,
+        serde_json::json!({
             "apiVersion": "v1",
             "kind": "PodExecOptions",
             "stdin": query.stdin,
@@ -581,27 +628,10 @@ pub async fn exec(
             "tty": query.tty,
             "container": query.container.as_deref().unwrap_or(""),
             "command": query.command
-        });
-        if let rusternetes_common::admission::AdmissionResponse::Deny(reason) = state
-            .webhook_manager
-            .run_validating_webhooks(
-                &Operation::Connect,
-                &gvk,
-                &gvr,
-                Some(&namespace),
-                &name,
-                Some(exec_options),
-                None,
-                &webhook_user_info,
-            )
-            .await?
-        {
-            return Err(Error::Forbidden(format!(
-                "admission webhook denied the request: {}",
-                reason
-            )));
-        }
-    }
+        }),
+        &webhook_user_info,
+    )
+    .await?;
 
     // Fetch the pod and require spec.nodeName (upstream: 400 if unset).
     let pod_key = rusternetes_storage::build_key("pods", Some(&namespace), &name);
@@ -692,19 +722,13 @@ pub async fn attach(
     }
 
     // Run admission webhooks for Connect operation (attach)
-    {
-        use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource, Operation};
-        let gvk = GroupVersionKind {
-            group: "".to_string(),
-            version: "v1".to_string(),
-            kind: "PodAttachOptions".to_string(),
-        };
-        let gvr = GroupVersionResource {
-            group: "".to_string(),
-            version: "v1".to_string(),
-            resource: "pods/attach".to_string(),
-        };
-        let attach_options = serde_json::json!({
+    run_connect_admission(
+        &state,
+        "PodAttachOptions",
+        "pods/attach",
+        &namespace,
+        &name,
+        serde_json::json!({
             "apiVersion": "v1",
             "kind": "PodAttachOptions",
             "stdin": query.stdin,
@@ -712,27 +736,10 @@ pub async fn attach(
             "stderr": query.stderr,
             "tty": query.tty,
             "container": query.container.as_deref().unwrap_or("")
-        });
-        if let rusternetes_common::admission::AdmissionResponse::Deny(reason) = state
-            .webhook_manager
-            .run_validating_webhooks(
-                &Operation::Connect,
-                &gvk,
-                &gvr,
-                Some(&namespace),
-                &name,
-                Some(attach_options),
-                None,
-                &webhook_user_info,
-            )
-            .await?
-        {
-            return Err(Error::Forbidden(format!(
-                "admission webhook denied the request: {}",
-                reason
-            )));
-        }
-    }
+        }),
+        &webhook_user_info,
+    )
+    .await?;
 
     // Fetch the pod and require spec.nodeName (upstream: 400 if unset).
     let pod_key = rusternetes_storage::build_key("pods", Some(&namespace), &name);
@@ -794,6 +801,21 @@ pub async fn attach(
 /// comma-joined `port=` param, and no param at all when there are none (kubectl's
 /// SPDY client sends its ports in stream headers, not the query).
 pub fn port_forward_stream_query(raw_query: &str) -> Result<String> {
+    let ports = parse_port_forward_ports(raw_query)?;
+    if ports.is_empty() {
+        return Ok(String::new());
+    }
+    let joined = ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(format!("port={joined}"))
+}
+
+/// Decode `PodPortForwardOptions.Ports` from the request query: the `ports`
+/// key (v1 json tag, `types.go:7321`), repeated and/or comma-separated.
+pub fn parse_port_forward_ports(raw_query: &str) -> Result<Vec<u16>> {
     let mut ports: Vec<u16> = Vec::new();
     for (k, v) in url::form_urlencoded::parse(raw_query.as_bytes()) {
         if k != "ports" {
@@ -806,15 +828,7 @@ pub fn port_forward_stream_query(raw_query: &str) -> Result<String> {
             ports.push(port);
         }
     }
-    if ports.is_empty() {
-        return Ok(String::new());
-    }
-    let joined = ports
-        .iter()
-        .map(u16::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    Ok(format!("port={joined}"))
+    Ok(ports)
 }
 
 /// Build the kubelet `/portForward/{ns}/{pod}` URL.
@@ -857,6 +871,12 @@ pub async fn portforward(
 
     let raw_query = req.uri().query().unwrap_or("").to_string();
 
+    let webhook_user_info = rusternetes_common::admission::UserInfo {
+        username: auth_ctx.user.username.clone(),
+        uid: auth_ctx.user.uid.clone(),
+        groups: auth_ctx.user.groups.clone(),
+    };
+
     // Check authorization
     let attrs = RequestAttributes::new(auth_ctx.user, "create", "pods")
         .with_namespace(&namespace)
@@ -870,7 +890,25 @@ pub async fn portforward(
         }
     }
 
+    // `getRequestOptions` (rest.go:194-198) decodes the options and 400s on a
+    // bad query BEFORE admission; then admission.Connect (rest.go:199-216)
+    // runs on the decoded `PodPortForwardOptions`, before the pod is fetched.
+    let ports = parse_port_forward_ports(&raw_query)?;
     let stream_query = port_forward_stream_query(&raw_query)?;
+    run_connect_admission(
+        &state,
+        "PodPortForwardOptions",
+        "pods/portforward",
+        &namespace,
+        &name,
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PodPortForwardOptions",
+            "ports": ports,
+        }),
+        &webhook_user_info,
+    )
+    .await?;
 
     // Fetch the pod and require spec.nodeName (upstream: 400 if unset).
     let pod_key = rusternetes_storage::build_key("pods", Some(&namespace), &name);
