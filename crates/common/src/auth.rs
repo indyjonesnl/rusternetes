@@ -661,6 +661,12 @@ impl TokenManager {
         }
         let mut claims = decoded.ok_or_else(|| invalid(errors.join("; ")))?;
 
+        // jwt.go:383-387: a token without an audience is a legacy token; it is
+        // observed here, before the audience intersection can reject it.
+        if claims.aud.is_empty() {
+            on_legacy_token(&claims);
+        }
+
         // A legacy token carries them in the `kubernetes.io/serviceaccount/*`
         // private claims (`legacyPrivateClaims`); the legacy validator
         // verifies them against the Secret / ServiceAccount.

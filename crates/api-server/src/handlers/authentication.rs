@@ -51,10 +51,14 @@ pub async fn create_token_review(
     // validator checks the bound objects (jwt.go:334-411, claims.go:144-263).
     let requested_audiences = token_review.spec.audiences.clone().unwrap_or_default();
     let mut observations = rusternetes_middleware::AuthObservations::default();
-    let authn = match state
-        .token_manager
-        .authenticate_token(&token_review.spec.token, Some(&requested_audiences))
-    {
+    // jwt.go:383-387 observes a legacy token before the audience check, so
+    // one rejected for its audience is still annotated and counted.
+    let authenticated = state.token_manager.authenticate_token_observed(
+        &token_review.spec.token,
+        Some(&requested_audiences),
+        &mut |claims| observations.observe_legacy_token(&claims.sub),
+    );
+    let authn = match authenticated {
         Ok((claims, matched)) => {
             match rusternetes_middleware::validate_service_account_token(
                 &state.storage,
