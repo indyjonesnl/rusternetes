@@ -397,4 +397,30 @@ mod tests {
             r#"Invalid value: {"name":"n","resourceVersion":"7","generation":2,"labels":{"a":"2","b":"1"}}: must be empty"#
         );
     }
+
+    /// #2375: the kubelet's webhook authorizer posts its SubjectAccessReview as
+    /// protobuf (client-go's default for core clients). Go's generated marshaller
+    /// writes every scalar `ObjectMeta` field, so the decoded metadata is
+    /// `{"name":"","generation":0}`. Upstream's `DeepEqual(metav1.ObjectMeta{}, ..)`
+    /// treats Go zero values as empty; `generation: Some(0)` must too, or every
+    /// kubelet authz check answers 422 and the node never goes Ready.
+    #[test]
+    fn metadata_with_only_go_zero_scalars_is_empty() {
+        let meta = ObjectMeta {
+            generation: Some(0),
+            generate_name: Some(String::new()),
+            namespace: Some(String::new()),
+            resource_version: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(metadata_must_be_empty(&meta, &meta, "must be empty").is_none());
+        let review = SubjectAccessReview {
+            metadata: meta,
+            ..serde_json::from_value(serde_json::json!({
+                "spec": {"user": "u", "resourceAttributes": {"verb": "get"}}
+            }))
+            .unwrap()
+        };
+        assert!(validate_subject_access_review(&review).is_empty());
+    }
 }
