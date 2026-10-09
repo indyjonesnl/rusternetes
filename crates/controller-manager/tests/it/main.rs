@@ -33,6 +33,7 @@ mod endpoints_controller_test;
 mod endpoints_trigger_time_test;
 mod endpointslice_controller_test;
 mod endpointslice_idempotency_test;
+mod endpointslice_trigger_time_test;
 mod garbage_collector_idempotency_test;
 mod garbage_collector_test;
 mod hpa_controller_test;
