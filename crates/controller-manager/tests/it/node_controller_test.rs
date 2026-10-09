@@ -158,10 +158,11 @@ async fn test_node_not_ready_with_old_heartbeat() {
     let key = build_key("nodes", None, "test-node-not-ready");
     storage.create(&key, &node).await.unwrap();
 
-    // Skip the 60s startup grace so reconcile flips the condition this tick.
+    // First pass records the probe (tryUpdateNodeHealth, :885-891); the
+    // heartbeat then stays silent past nodeMonitorGracePeriod (40s).
     controller.seed_first_seen_for_test("test-node-not-ready");
-
-    // Reconcile
+    controller.reconcile_all().await.unwrap();
+    controller.advance_clock_for_test(Duration::seconds(60));
     controller.reconcile_all().await.unwrap();
 
     // Node should be marked as not ready
@@ -175,8 +176,9 @@ async fn test_node_not_ready_with_old_heartbeat() {
     assert!(ready_condition.is_some());
     let condition = ready_condition.unwrap();
 
-    // Status should be False due to old heartbeat
-    assert_eq!(condition.status, "False");
+    // A silent kubelet is Unknown (never False): upstream tryUpdateNodeHealth.
+    assert_eq!(condition.status, "Unknown");
+    assert_eq!(condition.reason.as_deref(), Some("NodeStatusUnknown"));
 
     // Clean up
     storage.delete(&key).await.unwrap();
@@ -230,10 +232,11 @@ async fn test_node_without_ready_condition() {
     let key = build_key("nodes", None, "test-node-no-condition");
     storage.create(&key, &node).await.unwrap();
 
-    // Skip the 60s startup grace so reconcile creates the condition this tick.
+    // Within nodeStartupGracePeriod (60s) nothing is posted; after it the
+    // controller posts Ready=Unknown/NodeStatusNeverUpdated.
     controller.seed_first_seen_for_test("test-node-no-condition");
-
-    // Reconcile should create a Ready condition
+    controller.reconcile_all().await.unwrap();
+    controller.advance_clock_for_test(Duration::seconds(61));
     controller.reconcile_all().await.unwrap();
 
     // Node should have a Ready condition now
@@ -688,6 +691,15 @@ async fn test_node_remains_ready_when_lease_is_fresh_despite_stale_heartbeat() {
 
     controller.seed_first_seen_for_test("test-node-fresh-lease");
     controller.reconcile_all().await.unwrap();
+    // The kubelet keeps renewing its Lease while the Ready heartbeat is stuck
+    // (tryUpdateNodeHealth, :928-936): the probe advances, the node stays Ready.
+    controller.advance_clock_for_test(Duration::seconds(30));
+    let mut renewed = lease.clone();
+    renewed.spec.as_mut().unwrap().renew_time = Some(now + Duration::seconds(30));
+    storage.update(&lease_key, &renewed).await.unwrap();
+    controller.reconcile_all().await.unwrap();
+    controller.advance_clock_for_test(Duration::seconds(30));
+    controller.reconcile_all().await.unwrap();
 
     let updated: Node = storage.get(&node_key).await.unwrap();
     let ready = updated
@@ -718,7 +730,7 @@ async fn test_node_remains_ready_when_lease_is_fresh_despite_stale_heartbeat() {
 }
 
 #[tokio::test]
-async fn test_node_lease_renewal_bumps_renew_time() {
+async fn test_node_controller_does_not_renew_kubelet_lease() {
     let storage = Arc::new(MemoryStorage::new());
     let controller = NodeController::new(storage.clone());
 
@@ -765,17 +777,18 @@ async fn test_node_lease_renewal_bumps_renew_time() {
     controller.seed_first_seen_for_test("test-node-lease-renew");
     controller.reconcile_all().await.unwrap();
 
-    let renewed: Lease = storage.get(&lease_key).await.unwrap();
-    let renew_time = renewed
+    // The Lease belongs to the kubelet (pkg/kubelet/nodelease); the node
+    // lifecycle controller only reads it as a probe. Renewing it here would
+    // keep the probe fresh forever and a dead kubelet could never go stale.
+    let untouched: Lease = storage.get(&lease_key).await.unwrap();
+    let renew_time = untouched
         .spec
         .as_ref()
         .and_then(|s| s.renew_time)
-        .expect("renewTime must be present after reconcile");
-    assert!(
-        renew_time > initial,
-        "controller must bump renewTime: initial={:?}, current={:?}",
-        initial,
-        renew_time
+        .expect("renewTime must be present");
+    assert_eq!(
+        renew_time, initial,
+        "controller must not renew the kubelet's Lease"
     );
 
     storage.delete(&node_key).await.unwrap();

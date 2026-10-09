@@ -21,7 +21,7 @@
 //! `Arc<MemoryStorage>` — no API server, no informers — following the same
 //! pattern used by `crates/controller-manager/tests/node_controller_test.rs`.
 
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use rusternetes_common::resources::pod::Toleration;
 use rusternetes_common::resources::{
     Container, Node, NodeCondition, NodeSpec, NodeStatus, Pod, PodSpec, PodStatus, Taint,
@@ -306,20 +306,21 @@ async fn test_taint_based_evictions() {
     let node_ctrl = NodeController::new(storage.clone());
     let evict_ctrl = TaintEvictionController::new(storage.clone());
 
-    // Single NotReady node with a stale heartbeat (>40s) — node controller
-    // should flip Ready=False and add the not-ready taint.
+    // Single node the kubelet reports NotReady (Ready=False, fresh heartbeat) —
+    // node controller should add the not-ready taint. (A node that merely goes
+    // silent is Ready=Unknown and gets the unreachable taint instead.)
     let node_name = "node-not-ready";
-    let stale = Utc::now() - Duration::seconds(120);
+    let stale = Utc::now();
     let mut node = make_ready_node(node_name);
     {
         let status = node.status.as_mut().unwrap();
         status.conditions = Some(vec![NodeCondition {
             condition_type: "Ready".to_string(),
-            status: "True".to_string(),
+            status: "False".to_string(),
             last_heartbeat_time: Some(stale),
             last_transition_time: Some(stale),
-            reason: Some("KubeletReady".to_string()),
-            message: Some("kubelet is ready".to_string()),
+            reason: Some("KubeletNotReady".to_string()),
+            message: Some("kubelet is not ready".to_string()),
         }]);
     }
     let node_key = build_key("nodes", None, node_name);

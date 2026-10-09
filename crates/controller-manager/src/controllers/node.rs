@@ -96,8 +96,40 @@ struct NodeObservation {
     excluded_from_disruption: bool,
 }
 
+/// `nodeHealthData` (node_lifecycle_controller.go:168-185): what the controller
+/// last saw of one node. Only the Ready condition of the saved `status` is ever
+/// consulted (`GetNodeCondition(nodeHealth.status, NodeReady)`), so that is all
+/// that is kept. `lease_renew_time` is `lease.Spec.RenewTime`.
+#[derive(Clone)]
+struct NodeHealthData {
+    probe_timestamp: DateTime<Utc>,
+    ready_transition_timestamp: DateTime<Utc>,
+    ready_condition: Option<NodeCondition>,
+    lease_renew_time: Option<DateTime<Utc>>,
+}
+
+/// `controllerutil.GetNodeCondition(&node.Status, t)`: a copy of the condition.
+fn get_node_condition(node: &Node, condition_type: &str) -> Option<NodeCondition> {
+    node.status
+        .as_ref()?
+        .conditions
+        .as_ref()?
+        .iter()
+        .find(|c| c.condition_type == condition_type)
+        .cloned()
+}
+
+/// `scheduler.NodeHealthUpdateRetry` (pkg/scheduler/apis/config/types.go) = 5
+/// and `retrySleepTime` (node_lifecycle_controller.go:128) = 20ms.
+const NODE_HEALTH_UPDATE_RETRY: u32 = 5;
+const RETRY_SLEEP_TIME: std::time::Duration = std::time::Duration::from_millis(20);
+
 pub struct NodeController<S: Storage> {
     storage: Arc<S>,
+    /// `nodeHealthMap` (:235).
+    health_map: Arc<std::sync::Mutex<HashMap<String, NodeHealthData>>>,
+    /// Offset added to the wall clock by `now()`; see `advance_clock_for_test`.
+    clock_offset: Arc<std::sync::Mutex<Duration>>,
     first_seen: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
     observed_conditions: Arc<std::sync::Mutex<ObservedConditions>>,
     eviction: EvictionConfig,
@@ -113,6 +145,8 @@ impl<S: Storage + 'static> NodeController<S> {
     pub fn with_eviction_config(storage: Arc<S>, eviction: EvictionConfig) -> Self {
         Self {
             storage,
+            health_map: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            clock_offset: Arc::new(std::sync::Mutex::new(Duration::zero())),
             first_seen: Arc::new(std::sync::Mutex::new(HashMap::new())),
             observed_conditions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             eviction,
@@ -538,86 +572,306 @@ impl<S: Storage + 'static> NodeController<S> {
         }
     }
 
-    /// Health half of the old fused reconcile: readiness, Ready condition,
-    /// condition transitions, then `processTaintBaseEviction`. Returns the
-    /// observation `handleDisruption` needs, or `None` while the node is
-    /// inside the startup grace period.
+    /// The per-node body of `monitorNodeHealth`'s `updateNodeFunc`
+    /// (node_lifecycle_controller.go:703-767): `tryUpdateNodeHealth` under the
+    /// `wait.PollImmediate(retrySleepTime, retrySleepTime*NodeHealthUpdateRetry)`
+    /// retry (:713-729), then `processTaintBaseEviction` (:750). Returns the
+    /// observation `handleDisruption` needs; an `Err` is upstream's "Skipping -
+    /// no pods will be evicted" (:727).
     async fn monitor_node(&self, node: &Node) -> Result<Option<NodeObservation>> {
-        let node_name = &node.metadata.name;
-
-        // Don't change node conditions during startup grace period (K8s: nodeStartupGracePeriod = 60s)
-        if self.in_startup_grace(node_name) {
-            return Ok(None);
-        }
-
-        // Check if node is ready based on heartbeat AND Lease
-        let is_ready = self.is_node_ready_async(node).await;
-
-        // Get current ready condition
-        let current_ready_condition = node
-            .status
-            .as_ref()
-            .and_then(|s| s.conditions.as_ref())
-            .and_then(|conditions| conditions.iter().find(|c| c.condition_type == "Ready"));
-
-        let needs_update = match current_ready_condition {
-            Some(condition) => {
-                let current_is_ready = condition.status == "True";
-                current_is_ready != is_ready
+        let mut node = node.clone();
+        let mut attempt = 0;
+        let current_ready_condition = loop {
+            match self.try_update_node_health(&mut node).await {
+                Ok((_observed, current)) => break current,
+                Err(e) => {
+                    attempt += 1;
+                    if attempt >= NODE_HEALTH_UPDATE_RETRY {
+                        return Err(e);
+                    }
+                    tokio::time::sleep(RETRY_SLEEP_TIME).await;
+                    // Re-get the node: it may have been deleted or updated.
+                    node = self
+                        .storage
+                        .get(&build_key("nodes", None, &node.metadata.name))
+                        .await?;
+                }
             }
-            None => true, // No ready condition exists, need to create one
         };
-
-        // The Ready status after this pass: `update_node_status` writes
-        // True/False; an `Unknown` set by someone else is left alone.
-        let ready_status = if is_ready {
-            "True"
-        } else if !needs_update
-            && current_ready_condition.map(|c| c.status.as_str()) == Some("Unknown")
-        {
-            "Unknown"
-        } else {
-            "False"
-        };
-
-        if needs_update {
-            info!("Node {} ready status changed to: {}", node_name, is_ready);
-            self.update_node_status(node, is_ready).await?;
-        }
-
-        // Refresh lastTransitionTime on any non-Ready condition that flipped
-        // status without its reporter (kubelet eviction manager) bumping the
-        // timestamp. Mirrors upstream pkg/controller/nodelifecycle, which keeps
-        // the pressure-condition transition times observable.
-        self.reconcile_condition_transitions(node).await?;
-
-        // Not-ready/unreachable NoExecute taints are NOT applied here: like
-        // upstream they go through the zone's rate-limited queue
-        // (`processTaintBaseEviction`, :781) and are drained by
-        // `do_no_execute_tainting_pass`.
-        self.process_taint_base_eviction(node, ready_status).await;
-
-        // Evict pods from nodes that have been NotReady for too long. Only
-        // once the throttled pass has actually tainted the node, so a
-        // partition (which the queue holds back or disables) cannot bypass the
-        // rate limit through this path.
-        if !is_ready
-            && self.should_evict_pods(node)
-            && self.has_no_execute_not_ready_taint(node_name).await
-        {
-            info!("Evicting pods from NotReady node {}", node_name);
-            self.evict_pods_from_node(node_name).await?;
-        }
-
-        Ok(Some(NodeObservation {
-            zone: get_zone_key(node),
-            ready: ready_status == "True",
+        let node_name = node.metadata.name.clone();
+        let observation = NodeObservation {
+            zone: get_zone_key(&node),
+            // computeZoneState counts a nil or non-True condition as unhealthy.
+            ready: current_ready_condition
+                .as_ref()
+                .is_some_and(|c| c.status == "True"),
             excluded_from_disruption: node
                 .metadata
                 .labels
                 .as_ref()
                 .is_some_and(|l| l.contains_key(LABEL_NODE_DISRUPTION_EXCLUSION)),
-        }))
+        };
+
+        let Some(current) = current_ready_condition else {
+            return Ok(Some(observation));
+        };
+
+        // Refresh lastTransitionTime on any non-Ready condition that flipped
+        // status without its reporter (kubelet eviction manager) bumping the
+        // timestamp. Mirrors upstream pkg/controller/nodelifecycle, which keeps
+        // the pressure-condition transition times observable.
+        self.reconcile_condition_transitions(&node).await?;
+
+        // Not-ready/unreachable NoExecute taints are NOT applied here: like
+        // upstream they go through the zone's rate-limited queue
+        // (`processTaintBaseEviction`, :781) and are drained by
+        // `do_no_execute_tainting_pass`.
+        self.process_taint_base_eviction(&node, &current.status)
+            .await;
+
+        // Evict pods from nodes that have been NotReady for too long. Only
+        // once the throttled pass has actually tainted the node, so a
+        // partition (which the queue holds back or disables) cannot bypass the
+        // rate limit through this path.
+        if current.status != "True"
+            && self.should_evict_pods(&node)
+            && self.has_no_execute_not_ready_taint(&node_name).await
+        {
+            info!("Evicting pods from NotReady node {}", node_name);
+            self.evict_pods_from_node(&node_name).await?;
+        }
+
+        Ok(Some(observation))
+    }
+
+    /// `nc.now()` (node_lifecycle_controller.go:238 `now func() metav1.Time`):
+    /// the controller's clock, injectable so tests can pass time the way
+    /// upstream's tests reassign `nodeController.now`.
+    fn now(&self) -> DateTime<Utc> {
+        Utc::now() + *self.clock_offset.lock().unwrap()
+    }
+
+    /// Test helper standing in for upstream tests reassigning `nc.now`: move the
+    /// controller's clock forward by `by`.
+    #[allow(dead_code)]
+    #[doc(hidden)]
+    pub fn advance_clock_for_test(&self, by: Duration) {
+        *self.clock_offset.lock().unwrap() += by;
+    }
+
+    /// `tryUpdateNodeHealth` (node_lifecycle_controller.go:830-994): compare the
+    /// node's Ready condition and Lease to what the controller saw last time
+    /// (`nodeHealthMap`), advance `probeTimestamp` when the kubelet showed life,
+    /// and once nothing has been seen for the grace period post Unknown on Ready
+    /// and the pressure conditions. Returns the Ready condition as first observed
+    /// and the (possibly updated) current one; `node` is updated in place.
+    ///
+    /// The map entry is stored on every return path (the Go `defer`, :832-834).
+    async fn try_update_node_health(
+        &self,
+        node: &mut Node,
+    ) -> Result<(NodeCondition, Option<NodeCondition>)> {
+        let mut health = self
+            .health_map
+            .lock()
+            .unwrap()
+            .get(&node.metadata.name)
+            .cloned();
+        let result = self.try_update_node_health_inner(node, &mut health).await;
+        if let Some(h) = health {
+            self.health_map
+                .lock()
+                .unwrap()
+                .insert(node.metadata.name.clone(), h);
+        }
+        result
+    }
+
+    async fn try_update_node_health_inner(
+        &self,
+        node: &mut Node,
+        node_health: &mut Option<NodeHealthData>,
+    ) -> Result<(NodeCondition, Option<NodeCondition>)> {
+        // A zero `metav1.Time` is the Go default for an unset creationTimestamp.
+        let creation_zero = node
+            .metadata
+            .creation_timestamp
+            .unwrap_or(DateTime::UNIX_EPOCH);
+        let current_ready_condition = get_node_condition(node, "Ready");
+        let observed_ready_condition: NodeCondition;
+        let grace_period: Duration;
+        match &current_ready_condition {
+            None => {
+                // If ready condition is nil, then kubelet (or nodecontroller)
+                // never posted node status. A fake ready condition is created,
+                // where LastHeartbeatTime and LastTransitionTime is set to
+                // node.CreationTimestamp to avoid handle the corner case.
+                observed_ready_condition = NodeCondition {
+                    condition_type: "Ready".to_string(),
+                    status: "Unknown".to_string(),
+                    last_heartbeat_time: node.metadata.creation_timestamp,
+                    last_transition_time: node.metadata.creation_timestamp,
+                    reason: None,
+                    message: None,
+                };
+                grace_period = Duration::seconds(NODE_STARTUP_GRACE_PERIOD_SECS as i64);
+                match node_health {
+                    Some(h) => h.ready_condition = None,
+                    None => {
+                        *node_health = Some(NodeHealthData {
+                            ready_condition: None,
+                            probe_timestamp: creation_zero,
+                            ready_transition_timestamp: creation_zero,
+                            lease_renew_time: None,
+                        })
+                    }
+                }
+            }
+            Some(c) => {
+                // If ready condition is not nil, make a copy of it, since we
+                // may modify it in place later.
+                observed_ready_condition = c.clone();
+                grace_period = Duration::seconds(NODE_MONITOR_GRACE_PERIOD_SECONDS);
+            }
+        }
+
+        // There are following cases to check (:864-877); `savedCondition` is
+        // read AFTER the nil-Ready branch above has refreshed `status` (:882).
+        let saved_condition = node_health.as_ref().and_then(|h| h.ready_condition.clone());
+        let saved_lease = node_health.as_ref().and_then(|h| h.lease_renew_time);
+        let now = self.now();
+        let fresh = |ready: &Option<NodeCondition>, transition: DateTime<Utc>| NodeHealthData {
+            ready_condition: ready.clone(),
+            probe_timestamp: now,
+            ready_transition_timestamp: transition,
+            lease_renew_time: None,
+        };
+        if node_health.is_none() {
+            debug!(
+                "Missing timestamp for Node {}. Assuming now as a timestamp",
+                node.metadata.name
+            );
+            *node_health = Some(fresh(&current_ready_condition, now));
+        } else if saved_condition.is_none() && current_ready_condition.is_some() {
+            debug!(
+                "Creating timestamp entry for newly observed Node {}",
+                node.metadata.name
+            );
+            *node_health = Some(fresh(&current_ready_condition, now));
+        } else if saved_condition.is_some() && current_ready_condition.is_none() {
+            error!(
+                "ReadyCondition was removed from Status of Node {}",
+                node.metadata.name
+            );
+            // TODO upstream: figure out what to do in this case. For now we do
+            // the same thing as above.
+            *node_health = Some(fresh(&current_ready_condition, now));
+        } else if let (Some(saved), Some(current)) = (&saved_condition, &current_ready_condition) {
+            if saved.last_heartbeat_time != current.last_heartbeat_time {
+                // If ReadyCondition changed since the last time we checked, we
+                // update the transition timestamp to "now", otherwise we leave
+                // it as it is.
+                let transition = if saved.last_transition_time != current.last_transition_time {
+                    now
+                } else {
+                    node_health.as_ref().unwrap().ready_transition_timestamp
+                };
+                // :922-926 builds a fresh struct, so `lease` is reset here.
+                *node_health = Some(fresh(&current_ready_condition, transition));
+            }
+        }
+        let h = node_health.as_mut().unwrap();
+
+        // Always update the probe time if node lease is renewed. Note: If kubelet
+        // never posted the node status, but continues renewing the heartbeat
+        // leases, the node controller will assume the node is healthy and take
+        // no action.
+        let observed_lease = self.node_lease_renew_time(&node.metadata.name).await;
+        if let Some(observed) = observed_lease {
+            if saved_lease.is_none_or(|saved| saved < observed) {
+                h.lease_renew_time = Some(observed);
+                h.probe_timestamp = now;
+            }
+        }
+
+        if now > h.probe_timestamp + grace_period {
+            // NodeReady condition or lease was last set longer ago than
+            // gracePeriod, so update it to Unknown (regardless of its current
+            // value) in the master.
+            //
+            // We don't change 'NodeNetworkUnavailable' condition, as it's
+            // managed on a control plane level.
+            let probe = h.probe_timestamp;
+            let creation = node.metadata.creation_timestamp;
+            let status = node.status.get_or_insert_with(NodeStatus::default);
+            let conditions = status.conditions.get_or_insert_with(Vec::new);
+            for condition_type in ["Ready", "MemoryPressure", "DiskPressure", "PIDPressure"] {
+                match conditions
+                    .iter_mut()
+                    .find(|c| c.condition_type == condition_type)
+                {
+                    None => {
+                        debug!(
+                            "Condition {} of node {} was never updated by kubelet",
+                            condition_type, node.metadata.name
+                        );
+                        conditions.push(NodeCondition {
+                            condition_type: condition_type.to_string(),
+                            status: "Unknown".to_string(),
+                            reason: Some("NodeStatusNeverUpdated".to_string()),
+                            message: Some("Kubelet never posted node status.".to_string()),
+                            last_heartbeat_time: creation,
+                            last_transition_time: Some(now),
+                        });
+                    }
+                    Some(current) => {
+                        debug!(
+                            "Node {} hasn't been updated for {}s ({} condition)",
+                            node.metadata.name,
+                            (now - probe).num_seconds(),
+                            condition_type
+                        );
+                        if current.status != "Unknown" {
+                            current.status = "Unknown".to_string();
+                            current.reason = Some("NodeStatusUnknown".to_string());
+                            current.message =
+                                Some("Kubelet stopped posting node status.".to_string());
+                            current.last_transition_time = Some(now);
+                        }
+                    }
+                }
+            }
+            // We need to update currentReadyCondition due to its value
+            // potentially changed.
+            let current_ready_condition = get_node_condition(node, "Ready");
+            if current_ready_condition.as_ref() != Some(&observed_ready_condition) {
+                let key = build_key("nodes", None, &node.metadata.name);
+                // Status subresource write: node conditions live under
+                // `.status`, which a full-object PUT strips (#1723).
+                self.storage.update_status(&key, node).await?;
+                *node_health = Some(NodeHealthData {
+                    ready_condition: current_ready_condition.clone(),
+                    probe_timestamp: probe,
+                    ready_transition_timestamp: self.now(),
+                    lease_renew_time: observed_lease,
+                });
+            }
+            return Ok((observed_ready_condition, current_ready_condition));
+        }
+
+        Ok((observed_ready_condition, current_ready_condition))
+    }
+
+    /// `nc.leaseLister.Leases(v1.NamespaceNodeLease).Get(node.Name)` (:932):
+    /// the node Lease's `spec.renewTime`, if the Lease exists.
+    async fn node_lease_renew_time(&self, node_name: &str) -> Option<DateTime<Utc>> {
+        let key = build_key("leases", Some("kube-node-lease"), node_name);
+        self.storage
+            .get::<Lease>(&key)
+            .await
+            .ok()
+            .and_then(|l| l.spec)
+            .and_then(|s| s.renew_time)
     }
 
     /// `processTaintBaseEviction` (:781-815).
@@ -935,16 +1189,17 @@ impl<S: Storage + 'static> NodeController<S> {
                     "Controller detected that some Nodes are Ready. Exiting master disruption mode"
                 );
                 // When exiting disruption mode update probe timestamps on all
-                // Nodes (`probeTimestamp`/`readyTransitionTimestamp = now`,
-                // :1062-1067). This controller keeps no probe map; restarting
-                // each node's startup-grace clock gives the same effect: the
-                // stale heartbeats written while the master was unreachable
-                // are not held against the nodes.
+                // Nodes (:1058-1065).
                 {
-                    let mut first_seen = self.first_seen.lock().unwrap();
-                    let now = std::time::Instant::now();
+                    let now = self.now();
+                    let mut health_map = self.health_map.lock().unwrap();
                     for node in nodes {
-                        first_seen.insert(node.metadata.name.clone(), now);
+                        // `v := getDeepCopy(name)`: Go would nil-deref on a node
+                        // never probed; skip it instead.
+                        if let Some(v) = health_map.get_mut(&node.metadata.name) {
+                            v.probe_timestamp = now;
+                            v.ready_transition_timestamp = now;
+                        }
                     }
                 }
                 // We reset all rate limiters to settings appropriate for the
@@ -1047,14 +1302,11 @@ impl<S: Storage + 'static> NodeController<S> {
             self.remove_shutdown_taint(node).await?;
         }
 
-        // Refresh the node's coordination Lease renewTime.
-        //
-        // NOTE: divergence from upstream — upstream has the *kubelet* renew the
-        // node Lease (pkg/kubelet/node_manager.go -> nodeLeaseController); the
-        // controller only reads the Lease to determine readiness. rusternetes
-        // drives Lease renewal controller-side because the test suite pins this
-        // behaviour here and the kubelet stub does not yet emit Lease updates.
-        self.renew_node_lease(node_name).await?;
+        // NOTE: the node Lease is NOT renewed here. Upstream's kubelet renews it
+        // (pkg/kubelet/nodelease/controller.go) and this controller only reads
+        // it as a probe (tryUpdateNodeHealth, :932-936). Renewing it from the
+        // controller would keep every probe fresh forever, so a dead kubelet's
+        // heartbeat could never go stale.
 
         // Compute status.allocatable = status.capacity − kube-reserved.
         //
@@ -1068,101 +1320,6 @@ impl<S: Storage + 'static> NodeController<S> {
         self.compute_allocatable(node).await?;
 
         Ok(())
-    }
-
-    /// Check if a node is ready based on its last heartbeat
-    /// Check if a node is ready by examining BOTH:
-    /// 1. The node's Ready condition heartbeat time
-    /// 2. The node's Lease renewTime in kube-node-lease namespace
-    ///
-    /// K8s uses Lease-based heartbeats since v1.14. The Lease is updated
-    /// by a separate kubelet task that doesn't conflict with node status
-    /// updates. The node controller checks the Lease first (more reliable),
-    /// then falls back to the node condition heartbeat.
-    ///
-    /// K8s ref: pkg/controller/nodelifecycle/node_lifecycle_controller.go
-    fn is_node_ready(&self, node: &Node) -> bool {
-        let status = match &node.status {
-            Some(s) => s,
-            None => return false,
-        };
-
-        // Get the Ready condition
-        let ready_condition = match &status.conditions {
-            Some(conditions) => conditions.iter().find(|c| c.condition_type == "Ready"),
-            None => return false,
-        };
-
-        let ready_condition = match ready_condition {
-            Some(c) => c,
-            None => return false,
-        };
-
-        // If condition says NotReady, check if Lease says otherwise
-        // (Lease is more reliable — no CAS conflicts)
-        if ready_condition.status != "True" {
-            return false;
-        }
-
-        // Check last heartbeat time from node condition
-        if let Some(last_heartbeat) = &ready_condition.last_heartbeat_time {
-            let now = Utc::now();
-            let elapsed = now.signed_duration_since(*last_heartbeat);
-
-            if elapsed < Duration::seconds(NODE_MONITOR_GRACE_PERIOD_SECONDS) {
-                return true; // Node condition heartbeat is fresh
-            }
-        }
-
-        // Node condition heartbeat is stale — check Lease as fallback.
-        // The Lease is updated by a separate kubelet task that doesn't
-        // compete with node status updates.
-        if self.is_node_lease_fresh(&node.metadata.name) {
-            return true;
-        }
-
-        false
-    }
-
-    /// Async version that checks BOTH node condition AND Lease.
-    async fn is_node_ready_async(&self, node: &Node) -> bool {
-        // First check node condition heartbeat (fast, no storage read)
-        if self.is_node_ready(node) {
-            return true;
-        }
-
-        // Node condition heartbeat stale — check Lease (reliable, separate object)
-        let lease_key = format!("/registry/leases/kube-node-lease/{}", node.metadata.name);
-        if let Ok(lease) = self
-            .storage
-            .get::<rusternetes_common::resources::Lease>(&lease_key)
-            .await
-        {
-            if let Some(ref spec) = lease.spec {
-                if let Some(renew_time) = spec.renew_time {
-                    let now = Utc::now();
-                    let elapsed = now.signed_duration_since(renew_time);
-                    if elapsed < Duration::seconds(NODE_MONITOR_GRACE_PERIOD_SECONDS) {
-                        debug!(
-                            "Node {} lease is fresh (renewed {}s ago)",
-                            node.metadata.name,
-                            elapsed.num_seconds()
-                        );
-                        return true;
-                    }
-                }
-            }
-        }
-
-        false
-    }
-
-    /// Check if the node's Lease in kube-node-lease namespace has a
-    /// recent renewTime. Returns true if the Lease exists and was
-    /// renewed within the grace period.
-    fn is_node_lease_fresh(&self, _node_name: &str) -> bool {
-        // Sync stub — async version in is_node_ready_async
-        false
     }
 
     /// Check if pods should be evicted from a node
@@ -1286,85 +1443,6 @@ impl<S: Storage + 'static> NodeController<S> {
         Ok(())
     }
 
-    /// Update node status
-    async fn update_node_status(&self, node: &Node, is_ready: bool) -> Result<()> {
-        let node_name = &node.metadata.name;
-        let node_key = build_key("nodes", None, node_name);
-
-        // Get current node
-        let mut updated_node: Node = self.storage.get(&node_key).await?;
-
-        // Initialize status if needed
-        if updated_node.status.is_none() {
-            updated_node.status = Some(NodeStatus {
-                conditions: None,
-                addresses: None,
-                capacity: None,
-                allocatable: None,
-                node_info: None,
-                images: None,
-                volumes_in_use: None,
-                volumes_attached: None,
-                daemon_endpoints: None,
-                config: None,
-                features: None,
-                runtime_handlers: None,
-                declared_features: None,
-            });
-        }
-
-        let status = updated_node.status.as_mut().unwrap();
-
-        // Initialize conditions if needed
-        if status.conditions.is_none() {
-            status.conditions = Some(Vec::new());
-        }
-
-        let conditions = status.conditions.as_mut().unwrap();
-
-        // Update or create Ready condition
-        let now = Utc::now();
-        let ready_status = if is_ready { "True" } else { "False" };
-        let reason = if is_ready {
-            "KubeletReady"
-        } else {
-            "KubeletNotReady"
-        };
-        let message = if is_ready {
-            "kubelet is posting ready status"
-        } else {
-            "kubelet stopped posting node status"
-        };
-
-        if let Some(ready_condition) = conditions.iter_mut().find(|c| c.condition_type == "Ready") {
-            // Update existing condition
-            if ready_condition.status != ready_status {
-                ready_condition.last_transition_time = Some(now);
-            }
-            ready_condition.status = ready_status.to_string();
-            ready_condition.reason = Some(reason.to_string());
-            ready_condition.message = Some(message.to_string());
-            ready_condition.last_heartbeat_time = Some(now);
-        } else {
-            // Create new Ready condition
-            conditions.push(NodeCondition {
-                condition_type: "Ready".to_string(),
-                status: ready_status.to_string(),
-                last_heartbeat_time: Some(now),
-                last_transition_time: Some(now),
-                reason: Some(reason.to_string()),
-                message: Some(message.to_string()),
-            });
-        }
-
-        // Status subresource write: node conditions live under `.status`, which a
-        // full-object PUT strips (#1723).
-        self.storage.update_status(&node_key, &updated_node).await?;
-
-        info!("Updated node {} status to ready={}", node_name, is_ready);
-        Ok(())
-    }
-
     /// Apply the `node.kubernetes.io/shutdown` taint (NoSchedule) when the kubelet
     /// has started a graceful shutdown (Ready=False, reason="NodeShutdown").
     ///
@@ -1428,29 +1506,6 @@ impl<S: Storage + 'static> NodeController<S> {
                     debug!("Removed shutdown taint from node {}", node_name);
                 }
             }
-        }
-        Ok(())
-    }
-
-    /// Refresh the coordination Lease for `node_name` in the `kube-node-lease`
-    /// namespace by bumping `spec.renewTime` to now.
-    ///
-    /// NOTE: upstream has the kubelet renew the node Lease
-    /// (pkg/kubelet/node_manager.go → nodeLeaseController); this controller only
-    /// reads the Lease to decide readiness. rusternetes drives renewal here because
-    /// the kubelet stub does not yet emit Lease heartbeats.
-    async fn renew_node_lease(&self, node_name: &str) -> Result<()> {
-        let lease_key = build_key("leases", Some("kube-node-lease"), node_name);
-        let mut lease: Lease = match self.storage.get(&lease_key).await {
-            Ok(l) => l,
-            Err(rusternetes_common::Error::NotFound(_)) => return Ok(()), // no lease — nothing to renew
-            Err(e) => return Err(e.into()),
-        };
-
-        if let Some(ref mut spec) = lease.spec {
-            spec.renew_time = Some(Utc::now());
-            self.storage.update(&lease_key, &lease).await?;
-            debug!("Renewed node lease for {}", node_name);
         }
         Ok(())
     }
@@ -1654,98 +1709,12 @@ fn parse_resource_list(input: &str) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusternetes_common::types::{ObjectMeta, TypeMeta};
     use rusternetes_storage::memory::MemoryStorage;
 
     #[tokio::test]
     async fn test_node_controller_creation() {
         let storage = Arc::new(MemoryStorage::new());
         let _controller = NodeController::new(storage);
-    }
-
-    #[test]
-    fn test_node_ready_check() {
-        let storage = Arc::new(MemoryStorage::new());
-        let controller = NodeController::new(storage);
-
-        // Node with recent heartbeat
-        let node_ready = Node {
-            type_meta: TypeMeta {
-                kind: "Node".to_string(),
-                api_version: "v1".to_string(),
-            },
-            metadata: ObjectMeta {
-                name: "test-node".to_string(),
-                namespace: None,
-                uid: String::new(),
-                resource_version: None,
-                deletion_grace_period_seconds: None,
-                finalizers: None,
-                owner_references: None,
-                creation_timestamp: None,
-                deletion_timestamp: None,
-                labels: None,
-                annotations: None,
-                generate_name: None,
-                generation: None,
-                managed_fields: None,
-            },
-            spec: None,
-            status: Some(NodeStatus {
-                conditions: Some(vec![NodeCondition {
-                    condition_type: "Ready".to_string(),
-                    status: "True".to_string(),
-                    last_heartbeat_time: Some(Utc::now()),
-                    last_transition_time: Some(Utc::now()),
-                    reason: Some("KubeletReady".to_string()),
-                    message: Some("kubelet is ready".to_string()),
-                }]),
-                addresses: None,
-                capacity: None,
-                allocatable: None,
-                node_info: None,
-                images: None,
-                volumes_in_use: None,
-                volumes_attached: None,
-                daemon_endpoints: None,
-                config: None,
-                features: None,
-                runtime_handlers: None,
-                declared_features: None,
-            }),
-        };
-
-        assert!(controller.is_node_ready(&node_ready));
-
-        // Node with old heartbeat
-        let old_time = Utc::now() - Duration::seconds(60);
-        let node_not_ready = Node {
-            status: Some(NodeStatus {
-                conditions: Some(vec![NodeCondition {
-                    condition_type: "Ready".to_string(),
-                    status: "True".to_string(),
-                    last_heartbeat_time: Some(old_time),
-                    last_transition_time: Some(old_time),
-                    reason: Some("KubeletReady".to_string()),
-                    message: Some("kubelet is ready".to_string()),
-                }]),
-                addresses: None,
-                capacity: None,
-                allocatable: None,
-                node_info: None,
-                images: None,
-                volumes_in_use: None,
-                volumes_attached: None,
-                daemon_endpoints: None,
-                config: None,
-                features: None,
-                runtime_handlers: None,
-                declared_features: None,
-            }),
-            ..node_ready
-        };
-
-        assert!(!controller.is_node_ready(&node_not_ready));
     }
 
     fn ready_node(name: &str, status: &str) -> Node {
@@ -1822,18 +1791,13 @@ mod tests {
             .create(&build_key("nodes", None, "n1"), &ready_node("n1", "True"))
             .await
             .unwrap();
-        c.seed_first_seen_for_test("n1");
+        c.monitor_node_health().await.unwrap();
+        // The first pass only records the probe (:885-891); no heartbeat for
+        // longer than nodeMonitorGracePeriod then posts Unknown, not False.
+        c.advance_clock_for_test(Duration::hours(1));
         c.monitor_node_health().await.unwrap();
         let got: Node = storage.get(&build_key("nodes", None, "n1")).await.unwrap();
-        let ready = got.status.unwrap().conditions.unwrap();
-        assert_eq!(
-            ready
-                .iter()
-                .find(|c| c.condition_type == "Ready")
-                .unwrap()
-                .status,
-            "False"
-        );
+        assert_eq!(cond_of(&got, "Ready").unwrap().status, "Unknown");
     }
 
     // ------------------------------------------------------------------
@@ -1860,8 +1824,11 @@ mod tests {
     async fn stale_heartbeat_posts_ready_unknown_not_false() {
         let storage = Arc::new(MemoryStorage::new());
         let c = NodeController::new(storage.clone());
-        let n = znode("n1", "zone1", "True", SECS_STALE);
+        let n = znode("n1", "zone1", "True", 0);
         put(&storage, &c, &n).await;
+        c.monitor_node_health().await.unwrap();
+        // timeToPass (:1129, :1252): the heartbeat does not move for an hour.
+        c.advance_clock_for_test(Duration::hours(1));
         c.monitor_node_health().await.unwrap();
         let got: Node = storage.get(&build_key("nodes", None, "n1")).await.unwrap();
         let ready = cond_of(&got, "Ready").unwrap();
@@ -1903,6 +1870,154 @@ mod tests {
                 "{t}"
             );
         }
+    }
+
+    /// "Node created recently, without status. Expect no action from node
+    /// controller (within startup grace period)" and "status updated recently:
+    /// no action (within monitor grace period)" (:1081-1098, :1195-1227).
+    #[tokio::test]
+    async fn within_grace_period_takes_no_action() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::new(storage.clone());
+        let mut fresh_no_status = znode("n0", "zone1", "True", 0);
+        fresh_no_status.status = None;
+        fresh_no_status.metadata.creation_timestamp = Some(Utc::now());
+        put(&storage, &c, &fresh_no_status).await;
+        put(&storage, &c, &znode("n1", "zone1", "True", 0)).await;
+        c.monitor_node_health().await.unwrap();
+        c.advance_clock_for_test(Duration::seconds(30));
+        c.monitor_node_health().await.unwrap();
+        let n0: Node = storage.get(&build_key("nodes", None, "n0")).await.unwrap();
+        assert!(n0.status.is_none(), "startup grace is 60s");
+        let n1: Node = storage.get(&build_key("nodes", None, "n1")).await.unwrap();
+        assert_eq!(cond_of(&n1, "Ready").unwrap().status, "True");
+        // ... and past the 60s startup grace the never-posted node goes Unknown.
+        c.advance_clock_for_test(Duration::seconds(31));
+        c.monitor_node_health().await.unwrap();
+        let n0: Node = storage.get(&build_key("nodes", None, "n0")).await.unwrap();
+        assert_eq!(cond_of(&n0, "Ready").unwrap().status, "Unknown");
+    }
+
+    /// A moving heartbeat advances `probeTimestamp` (:907-927), so a node whose
+    /// total silence never exceeds the grace period stays Ready.
+    #[tokio::test]
+    async fn heartbeat_renewal_resets_the_probe() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::new(storage.clone());
+        put(&storage, &c, &znode("n1", "zone1", "True", 0)).await;
+        c.monitor_node_health().await.unwrap();
+        c.advance_clock_for_test(Duration::seconds(30));
+        let mut n = znode("n1", "zone1", "True", 0);
+        n.status.as_mut().unwrap().conditions.as_mut().unwrap()[0].last_heartbeat_time =
+            Some(Utc::now() + Duration::seconds(30));
+        put(&storage, &c, &n).await;
+        c.monitor_node_health().await.unwrap();
+        c.advance_clock_for_test(Duration::seconds(30));
+        c.monitor_node_health().await.unwrap();
+        let got: Node = storage.get(&build_key("nodes", None, "n1")).await.unwrap();
+        assert_eq!(cond_of(&got, "Ready").unwrap().status, "True");
+        c.advance_clock_for_test(Duration::seconds(11));
+        c.monitor_node_health().await.unwrap();
+        let got: Node = storage.get(&build_key("nodes", None, "n1")).await.unwrap();
+        assert_eq!(cond_of(&got, "Ready").unwrap().status, "Unknown");
+    }
+
+    fn node_lease(name: &str, renew: DateTime<Utc>) -> Lease {
+        Lease::new(name, "kube-node-lease").with_spec(rusternetes_common::resources::LeaseSpec {
+            holder_identity: Some(name.to_string()),
+            lease_duration_seconds: Some(40),
+            acquire_time: Some(renew),
+            renew_time: Some(renew),
+            lease_transitions: Some(0),
+            preferred_holder: None,
+            strategy: None,
+        })
+    }
+
+    /// TestMonitorNodeHealthUpdateNodeAndPodStatusWithLease: a renewed Lease
+    /// advances the probe even if the Ready heartbeat never moves (:928-936),
+    /// and the controller itself must not renew it.
+    #[tokio::test]
+    async fn lease_renewal_resets_the_probe() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::new(storage.clone());
+        put(&storage, &c, &znode("n1", "zone1", "True", 0)).await;
+        let lk = build_key("leases", Some("kube-node-lease"), "n1");
+        storage
+            .create(&lk, &node_lease("n1", Utc::now()))
+            .await
+            .unwrap();
+        c.monitor_node_health().await.unwrap();
+        c.advance_clock_for_test(Duration::seconds(30));
+        storage
+            .update(&lk, &node_lease("n1", Utc::now() + Duration::seconds(30)))
+            .await
+            .unwrap();
+        c.monitor_node_health().await.unwrap();
+        c.advance_clock_for_test(Duration::seconds(30));
+        c.monitor_node_health().await.unwrap();
+        let got: Node = storage.get(&build_key("nodes", None, "n1")).await.unwrap();
+        assert_eq!(
+            cond_of(&got, "Ready").unwrap().status,
+            "True",
+            "a renewed Lease keeps the node alive despite a stale heartbeat"
+        );
+        let lease: Lease = storage.get(&lk).await.unwrap();
+        assert!(
+            lease.spec.unwrap().renew_time.unwrap() > Utc::now() + Duration::seconds(29),
+            "the controller must not renew the kubelet's Lease"
+        );
+        // The lease stops: the node goes Unknown once the grace period passes.
+        c.advance_clock_for_test(Duration::seconds(41));
+        c.monitor_node_health().await.unwrap();
+        let got: Node = storage.get(&build_key("nodes", None, "n1")).await.unwrap();
+        assert_eq!(cond_of(&got, "Ready").unwrap().status, "Unknown");
+    }
+
+    /// Once Unknown has been posted the node is not rewritten every pass:
+    /// `currentCondition.Status != Unknown` guards the transition time (:967-972).
+    #[tokio::test]
+    async fn unknown_is_posted_once() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::new(storage.clone());
+        put(&storage, &c, &znode("n1", "zone1", "True", 0)).await;
+        c.monitor_node_health().await.unwrap();
+        c.advance_clock_for_test(Duration::hours(1));
+        c.monitor_node_health().await.unwrap();
+        let first: Node = storage.get(&build_key("nodes", None, "n1")).await.unwrap();
+        c.advance_clock_for_test(Duration::hours(1));
+        c.monitor_node_health().await.unwrap();
+        let second: Node = storage.get(&build_key("nodes", None, "n1")).await.unwrap();
+        assert_eq!(
+            cond_of(&first, "Ready").unwrap().last_transition_time,
+            cond_of(&second, "Ready").unwrap().last_transition_time
+        );
+    }
+
+    /// Exiting master disruption resets `probeTimestamp` and
+    /// `readyTransitionTimestamp` on every node (:1058-1065, #2837).
+    #[tokio::test]
+    async fn exiting_master_disruption_resets_probe_timestamps() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::new(storage.clone());
+        put(&storage, &c, &znode("a", "zone1", "True", 0)).await;
+        put(&storage, &c, &znode("b", "zone1", "True", 0)).await;
+        c.monitor_node_health().await.unwrap();
+        c.advance_clock_for_test(Duration::hours(1));
+        c.monitor_node_health().await.unwrap();
+        let a_probe_in_disruption = c.health_map.lock().unwrap()["a"].probe_timestamp;
+        c.advance_clock_for_test(Duration::minutes(10));
+        // b is back: some Nodes are Ready, so master disruption ends.
+        let mut b = znode("b", "zone1", "True", 0);
+        b.status.as_mut().unwrap().conditions.as_mut().unwrap()[0].last_heartbeat_time =
+            Some(Utc::now() + Duration::hours(2));
+        put(&storage, &c, &b).await;
+        c.monitor_node_health().await.unwrap();
+        let hm = c.health_map.lock().unwrap();
+        assert!(hm["a"].probe_timestamp >= a_probe_in_disruption + Duration::minutes(10));
+        assert!(
+            hm["a"].ready_transition_timestamp >= a_probe_in_disruption + Duration::minutes(10)
+        );
     }
 
     // ------------------------------------------------------------------
@@ -2141,17 +2256,17 @@ mod tests {
                 ..EvictionConfig::default()
             },
         );
-        put(&storage, &c, &znode("a", "zone1", "False", SECS_STALE)).await;
+        put(&storage, &c, &znode("a", "zone1", "Unknown", SECS_STALE)).await;
         put(&storage, &c, &znode("b", "zone1", "True", 0)).await;
         c.monitor_node_health().await.unwrap();
         c.do_no_execute_tainting_pass().await;
         assert_eq!(
             taint_keys(&storage, "a").await,
-            [noexec("node.kubernetes.io/not-ready")]
+            [noexec("node.kubernetes.io/unreachable")]
         );
 
         // b goes stale too: every node NotReady -> master disruption.
-        put(&storage, &c, &znode("b", "zone1", "True", SECS_STALE)).await;
+        c.advance_clock_for_test(Duration::hours(1));
         c.monitor_node_health().await.unwrap();
         assert!(
             taint_keys(&storage, "a").await.is_empty(),
@@ -2172,7 +2287,7 @@ mod tests {
         assert_ne!(zone_qps(&c, "zone1").await, 100_000.0);
 
         // b recovers: exiting full disruption resets the limiter for the zone.
-        put(&storage, &c, &znode("b", "zone1", "True", 0)).await;
+        put(&storage, &c, &znode("b", "zone1", "True", -5)).await;
         c.monitor_node_health().await.unwrap();
         assert_eq!(
             c.evictor

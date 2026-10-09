@@ -8,7 +8,7 @@
 //! largeClusterThreshold 50, unhealthyZoneThreshold 0.55
 //! (`pkg/controller/apis/config/v1alpha1/defaults.go`).
 
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use rusternetes_common::resources::{Node, NodeCondition, NodeStatus};
 use rusternetes_common::types::{ObjectMeta, TypeMeta};
 use rusternetes_controller_manager::controllers::node::NodeController;
@@ -17,11 +17,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 fn zoned_node(name: &str, zone: &str, ready_fresh: bool) -> Node {
-    let heartbeat = if ready_fresh {
-        Utc::now()
-    } else {
-        Utc::now() - Duration::seconds(120)
-    };
+    // A node the kubelet itself reports NotReady (Ready=False, fresh
+    // heartbeat). A silent kubelet is Ready=Unknown/unreachable instead
+    // (tryUpdateNodeHealth), which the unit tests cover.
+    let heartbeat = Utc::now();
+    let status = if ready_fresh { "True" } else { "False" };
     let mut labels = HashMap::new();
     labels.insert(
         "topology.kubernetes.io/region".to_string(),
@@ -53,7 +53,7 @@ fn zoned_node(name: &str, zone: &str, ready_fresh: bool) -> Node {
         status: Some(NodeStatus {
             conditions: Some(vec![NodeCondition {
                 condition_type: "Ready".to_string(),
-                status: "True".to_string(),
+                status: status.to_string(),
                 last_heartbeat_time: Some(heartbeat),
                 last_transition_time: Some(heartbeat),
                 reason: Some("KubeletReady".to_string()),
