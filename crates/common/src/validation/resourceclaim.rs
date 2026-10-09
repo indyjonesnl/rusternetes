@@ -525,10 +525,25 @@ pub(crate) fn validate_selector_slice(selectors: &[DeviceSelector], fld_path: &P
                         CEL_SELECTOR_EXPRESSION_MAX_LENGTH,
                     ));
                 } else if let Some(detail) = crate::cel::parse_failure(&cel.expression) {
-                    // Upstream compiles against the DRA environment
-                    // (`dracel.GetCompiler(..).CompileCELExpression`, :316-330);
-                    // only the parse half is ported (see #2692 follow-ups).
                     errs.push(Error::invalid(&expr_path, cel.expression.clone(), detail));
+                } else {
+                    // `CompileCELExpression` type-checks against the DRA
+                    // environment and estimates the cost (compile.go:150-218);
+                    // `validateCELSelector` converts the result (:331-334).
+                    match crate::cel_dra::compile_selector(&cel.expression) {
+                        crate::cel_dra::SelectorCompilation::Invalid(detail) => {
+                            errs.push(Error::invalid(&expr_path, cel.expression.clone(), detail));
+                        }
+                        crate::cel_dra::SelectorCompilation::Ok { max_cost }
+                            if max_cost > crate::cel_dra::CEL_SELECTOR_EXPRESSION_MAX_COST =>
+                        {
+                            errs.push(Error::forbidden(
+                                &expr_path,
+                                "too complex, exceeds cost limit",
+                            ));
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
@@ -782,6 +797,76 @@ mod tests {
             .into_iter()
             .map(|e| e.to_string())
             .collect()
+    }
+
+    fn selector_errs(expression: &str) -> Vec<String> {
+        errs(serde_json::json!({
+            "requests": [{
+                "name": "gpu",
+                "exactly": {
+                    "deviceClassName": "gpu.example.com",
+                    "allocationMode": "ExactCount",
+                    "count": 1,
+                    "selectors": [{"cel": {"expression": expression}}]
+                }
+            }]
+        }))
+    }
+
+    /// Port of `CEL-compile-errors` (validation_resourceclaim_test.go:567): the
+    /// expression parses but does not type-check against the DRA environment.
+    #[test]
+    fn selector_index_type_error_is_compilation_failed() {
+        let e = selector_errs("device.attributes[true].someBoolean");
+        assert!(
+            e.iter().any(|m| m.contains(
+                "compilation failed: ERROR: <input>:1:18: found no matching overload for '_[_]' applied to '(map(string, map(string, any)), bool)'\n | device.attributes[true].someBoolean\n | .................^"
+            )),
+            "{e:?}"
+        );
+    }
+
+    /// Port of `CEL-cost` (validation_resourceclaim_test.go:610).
+    #[test]
+    fn selector_exceeding_cost_limit_is_forbidden() {
+        let e = selector_errs(
+            "[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(x, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(y, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(z, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(z2, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(z3, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(z4, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(z5, int('1'.find('[0-9]*')) < 100)))))))",
+        );
+        assert!(
+            e.iter().any(|m| m.contains("selectors[0].cel.expression")
+                && m.contains("Forbidden")
+                && m.contains("too complex, exceeds cost limit")),
+            "{e:?}"
+        );
+    }
+
+    /// `CompileCELExpression` (compile.go:166-170): the output must be bool or any.
+    #[test]
+    fn selector_must_evaluate_to_bool() {
+        let e = selector_errs("device.driver");
+        assert!(
+            e.iter()
+                .any(|m| m.contains("must evaluate to bool or the unknown type, not string")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn selector_typed_ok_expressions_pass() {
+        for x in [
+            "device.driver == 'dra.example.com'",
+            "device.attributes['d'].model == 'a'",
+            "device.attributes['d']['model'] == 'a'",
+            "device.allowMultipleAllocations",
+            "device.attributes['d'].x",
+            "has(device.attributes['d'].x) && device.attributes['d'].x == 1",
+            "device.capacity['d'].memory.compareTo(quantity('1Gi')) >= 0",
+            "['a','b'].exists(x, x == device.driver)",
+            "['a','b'][0] == 'a'",
+        ] {
+            let e = selector_errs(x);
+            assert!(e.is_empty(), "{x}: {e:?}");
+        }
     }
 
     #[test]
