@@ -4,7 +4,7 @@ use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use rusternetes_common::resources::{Namespace, Secret, ServiceAccount};
 use rusternetes_common::types::{ObjectMeta, TypeMeta};
 use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -35,48 +35,23 @@ fn is_service_account_token(secret: &Secret, sa_name: &str, sa_uid: Option<&str>
     }
 }
 
-/// JWT Claims for ServiceAccount tokens
-/// Follows Kubernetes ServiceAccount token format
-#[derive(Debug, Serialize, Deserialize)]
-struct ServiceAccountClaims {
-    /// Issuer - typically the API server URL
-    iss: String,
-    /// Subject - the ServiceAccount in format "system:serviceaccount:<namespace>:<name>"
+/// Claims of a legacy Secret-based ServiceAccount token. Port of
+/// `serviceaccount.LegacyClaims` (pkg/serviceaccount/legacy.go:42-51) as
+/// signed by `GenerateToken` (pkg/serviceaccount/jwt.go:443-452): the issuer,
+/// the subject and `legacyPrivateClaims` (legacy.go:58-63); no `exp`, `iat`,
+/// `nbf` or `aud`, so the token never expires.
+#[derive(Debug, Serialize)]
+struct LegacyTokenClaims<'a> {
+    iss: &'static str,
     sub: String,
-    /// Audience - who the token is intended for
-    #[serde(skip_serializing_if = "Option::is_none")]
-    aud: Option<Vec<String>>,
-    /// Expiration time (Unix timestamp)
-    exp: i64,
-    /// Issued at time (Unix timestamp)
-    iat: i64,
-    /// Not before time (Unix timestamp)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    nbf: Option<i64>,
-    /// Kubernetes-specific claims
-    #[serde(rename = "kubernetes.io")]
-    kubernetes: KubernetesClaims,
-}
-
-/// Kubernetes-specific claims in the JWT
-#[derive(Debug, Serialize, Deserialize)]
-struct KubernetesClaims {
-    namespace: String,
-    serviceaccount: ServiceAccountRef,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pod: Option<PodRef>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ServiceAccountRef {
-    name: String,
-    uid: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct PodRef {
-    name: String,
-    uid: String,
+    #[serde(rename = "kubernetes.io/serviceaccount/service-account.name")]
+    service_account_name: &'a str,
+    #[serde(rename = "kubernetes.io/serviceaccount/service-account.uid")]
+    service_account_uid: &'a str,
+    #[serde(rename = "kubernetes.io/serviceaccount/secret.name")]
+    secret_name: &'a str,
+    #[serde(rename = "kubernetes.io/serviceaccount/namespace")]
+    namespace: &'a str,
 }
 
 /// ServiceAccountController: the union of upstream's two ServiceAccount controllers.
@@ -437,31 +412,17 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
         namespace: &str,
         sa_name: &str,
         sa_uid: &str,
-        _secret_name: &str,
+        secret_name: &str,
     ) -> Result<String> {
         // If we have a signing key, generate a proper JWT
         if let Some(ref signing_key) = self.signing_key {
-            let now = chrono::Utc::now().timestamp();
-
-            // Token valid for 1 year (in production, this could be configurable)
-            let expiration = now + (365 * 24 * 60 * 60);
-
-            // Build the claims
-            let claims = ServiceAccountClaims {
-                iss: "rusternetes".to_string(), // In production, this would be the API server URL
+            let claims = LegacyTokenClaims {
+                iss: rusternetes_common::auth::LEGACY_ISSUER,
                 sub: format!("system:serviceaccount:{}:{}", namespace, sa_name),
-                aud: Some(vec!["rusternetes".to_string()]), // In production, this would be configurable
-                exp: expiration,
-                iat: now,
-                nbf: Some(now),
-                kubernetes: KubernetesClaims {
-                    namespace: namespace.to_string(),
-                    serviceaccount: ServiceAccountRef {
-                        name: sa_name.to_string(),
-                        uid: sa_uid.to_string(),
-                    },
-                    pod: None, // Pod reference is added when the token is projected into a pod
-                },
+                service_account_name: sa_name,
+                service_account_uid: sa_uid,
+                secret_name,
+                namespace,
             };
 
             // Create JWT header with RS256 algorithm
