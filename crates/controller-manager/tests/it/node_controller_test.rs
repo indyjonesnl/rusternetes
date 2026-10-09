@@ -201,7 +201,7 @@ async fn test_node_without_ready_condition() {
             deletion_grace_period_seconds: None,
             finalizers: None,
             owner_references: None,
-            creation_timestamp: Some(Utc::now()),
+            creation_timestamp: Some(Utc::now() - Duration::hours(2)),
             deletion_timestamp: None,
             labels: None,
             annotations: None,
@@ -230,7 +230,8 @@ async fn test_node_without_ready_condition() {
     let key = build_key("nodes", None, "test-node-no-condition");
     storage.create(&key, &node).await.unwrap();
 
-    // Skip the 60s startup grace so reconcile creates the condition this tick.
+    // Created two hours ago and never posted status: past nodeStartupGracePeriod
+    // (tryUpdateNodeHealth, measured from creationTimestamp) the controller posts it.
     controller.seed_first_seen_for_test("test-node-no-condition");
 
     // Reconcile should create a Ready condition
@@ -244,7 +245,7 @@ async fn test_node_without_ready_condition() {
         .and_then(|s| s.conditions.as_ref())
         .and_then(|conditions| conditions.iter().find(|c| c.condition_type == "Ready"));
 
-    assert!(ready_condition.is_some());
+    assert_eq!(ready_condition.expect("Ready posted").status, "Unknown");
 
     // Clean up
     storage.delete(&key).await.unwrap();
@@ -718,7 +719,7 @@ async fn test_node_remains_ready_when_lease_is_fresh_despite_stale_heartbeat() {
 }
 
 #[tokio::test]
-async fn test_node_lease_renewal_bumps_renew_time() {
+async fn test_node_lease_is_not_renewed_by_the_controller() {
     let storage = Arc::new(MemoryStorage::new());
     let controller = NodeController::new(storage.clone());
 
@@ -771,11 +772,11 @@ async fn test_node_lease_renewal_bumps_renew_time() {
         .as_ref()
         .and_then(|s| s.renew_time)
         .expect("renewTime must be present after reconcile");
-    assert!(
-        renew_time > initial,
-        "controller must bump renewTime: initial={:?}, current={:?}",
-        initial,
-        renew_time
+    // The kubelet renews its own Lease (pkg/kubelet/nodelease); a controller-side
+    // renewal would keep a dead kubelet looking alive (#2974).
+    assert_eq!(
+        renew_time, initial,
+        "controller must not renew the node Lease"
     );
 
     storage.delete(&node_key).await.unwrap();
