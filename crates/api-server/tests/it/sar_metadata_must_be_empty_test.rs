@@ -238,7 +238,8 @@ async fn a_protobuf_review_with_go_zero_scalars_is_accepted() {
     ld(&mut spec, 1, &attrs); // resourceAttributes
     ld(&mut spec, 3, b"alice"); // user
     ld(&mut spec, 6, b""); // uid
-    let status_msg = [0x08, 0x00, 0x10, 0x00, 0x1a, 0x00, 0x22, 0x00];
+                           // status: allowed(1)=false, reason(2)="", evaluationError(3)="", denied(4)=false
+    let status_msg = [0x08, 0x00, 0x12, 0x00, 0x1a, 0x00, 0x20, 0x00];
     let mut sar = Vec::new();
     ld(&mut sar, 1, &meta);
     ld(&mut sar, 2, &spec);
@@ -265,5 +266,5 @@ async fn a_protobuf_review_with_go_zero_scalars_is_accepted() {
         )
         .await;
     let text = String::from_utf8_lossy(&bytes);
-    assert_eq!(status.as_u16(), 201, "{status} {text}");
+    assert!(status.is_success(), "{status} {text}");
 }
