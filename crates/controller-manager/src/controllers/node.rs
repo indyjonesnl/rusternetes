@@ -1832,7 +1832,107 @@ mod tests {
                 .find(|c| c.condition_type == "Ready")
                 .unwrap()
                 .status,
-            "False"
+            "Unknown"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // tryUpdateNodeHealth stale-heartbeat write (#2836). Ported from
+    // pkg/controller/nodelifecycle/node_lifecycle_controller_test.go
+    // TestMonitorNodeHealthUpdateStatus (:1010): the case "Node created long
+    // time ago, with status updated by kubelet exceeds grace period" (:1097-1190)
+    // and "without status" (:1019). Impl: node_lifecycle_controller.go:937-985.
+    // ------------------------------------------------------------------
+
+    async fn monitored(
+        node: &Node,
+    ) -> (
+        Arc<MemoryStorage>,
+        Vec<NodeCondition>,
+        chrono::DateTime<Utc>,
+    ) {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::new(storage.clone());
+        put(&storage, &c, node).await;
+        let before = Utc::now();
+        c.monitor_node_health().await.unwrap();
+        let got: Node = storage
+            .get(&build_key("nodes", None, &node.metadata.name))
+            .await
+            .unwrap();
+        (storage, got.status.unwrap().conditions.unwrap(), before)
+    }
+
+    fn cond<'a>(cs: &'a [NodeCondition], t: &str) -> &'a NodeCondition {
+        cs.iter().find(|c| c.condition_type == t).unwrap()
+    }
+
+    #[tokio::test]
+    async fn stale_heartbeat_posts_ready_unknown_not_false() {
+        let node = znode("n1", "z1", "True", SECS_STALE);
+        let hb = node.status.as_ref().unwrap().conditions.as_ref().unwrap()[0].last_heartbeat_time;
+        let (_s, cs, before) = monitored(&node).await;
+        let r = cond(&cs, "Ready");
+        assert_eq!(r.status, "Unknown");
+        assert_eq!(r.reason.as_deref(), Some("NodeStatusUnknown"));
+        assert_eq!(
+            r.message.as_deref(),
+            Some("Kubelet stopped posting node status.")
+        );
+        // The controller must not forge a heartbeat the kubelet never sent.
+        assert_eq!(r.last_heartbeat_time, hb);
+        assert!(r.last_transition_time.unwrap() >= before);
+    }
+
+    #[tokio::test]
+    async fn stale_heartbeat_marks_pressure_conditions_never_updated() {
+        let node = znode("n1", "z1", "True", SECS_STALE);
+        let created = node.metadata.creation_timestamp;
+        let (_s, cs, before) = monitored(&node).await;
+        for t in ["MemoryPressure", "DiskPressure", "PIDPressure"] {
+            let c = cond(&cs, t);
+            assert_eq!(c.status, "Unknown", "{t}");
+            assert_eq!(c.reason.as_deref(), Some("NodeStatusNeverUpdated"), "{t}");
+            assert_eq!(
+                c.message.as_deref(),
+                Some("Kubelet never posted node status."),
+                "{t}"
+            );
+            assert_eq!(c.last_heartbeat_time, created, "{t}");
+            assert!(c.last_transition_time.unwrap() >= before, "{t}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_heartbeat_on_not_ready_node_also_goes_unknown() {
+        // currentCondition.Status != Unknown => Unknown, whatever it was.
+        let node = znode("n1", "z1", "False", SECS_STALE);
+        let (_s, cs, _) = monitored(&node).await;
+        assert_eq!(cond(&cs, "Ready").status, "Unknown");
+    }
+
+    #[tokio::test]
+    async fn fresh_not_ready_condition_is_left_to_the_kubelet() {
+        let node = znode("n1", "z1", "False", 1);
+        let (_s, cs, _) = monitored(&node).await;
+        assert_eq!(cond(&cs, "Ready").status, "False");
+    }
+
+    #[tokio::test]
+    async fn node_without_status_gets_never_updated_unknown() {
+        let node: Node = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Node",
+            "metadata": {"name": "n1", "creationTimestamp": "2012-01-01T00:00:00Z"},
+            "spec": {}
+        }))
+        .unwrap();
+        let (_s, cs, _) = monitored(&node).await;
+        let r = cond(&cs, "Ready");
+        assert_eq!(r.status, "Unknown");
+        assert_eq!(r.reason.as_deref(), Some("NodeStatusNeverUpdated"));
+        assert_eq!(
+            r.message.as_deref(),
+            Some("Kubelet never posted node status.")
         );
     }
 
