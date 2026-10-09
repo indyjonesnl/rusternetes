@@ -1617,8 +1617,12 @@ mod exhausted {
             !is_resource_exhaust_error(Some(&attachment(None))),
             "nil ErrorCode"
         );
-        assert!(!is_resource_exhaust_error(Some(&attachment(Some(NOT_FOUND)))));
-        assert!(is_resource_exhaust_error(Some(&attachment(Some(EXHAUSTED)))));
+        assert!(!is_resource_exhaust_error(Some(&attachment(Some(
+            NOT_FOUND
+        )))));
+        assert!(is_resource_exhaust_error(Some(&attachment(Some(
+            EXHAUSTED
+        )))));
         let mut no_status = attachment(None);
         no_status.status = None;
         assert!(!is_resource_exhaust_error(Some(&no_status)), "nil status");
