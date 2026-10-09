@@ -1,0 +1,27 @@
+[package]
+name = "rusternetes-csi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "rusternetes_csi"
+path = "src/lib.rs"
+
+[dependencies]
+tonic.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+hyper-util = { version = "0.1", features = ["client", "tokio"] }
+tower = { workspace = true }
+thiserror.workspace = true
+tokio.workspace = true
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
+tokio-stream = { version = "0.1", features = ["net"] }

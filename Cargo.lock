@@ -4474,6 +4474,7 @@ dependencies = [
  "rusternetes-client",
  "rusternetes-cloud-providers",
  "rusternetes-common",
+ "rusternetes-csi",
  "rusternetes-storage",
  "rustls 0.23.40",
  "serde",
@@ -4505,6 +4506,22 @@ dependencies = [
  "tower 0.4.13",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "rusternetes-csi"
+version = "0.1.0"
+dependencies = [
+ "hyper-util",
+ "prost",
+ "prost-types",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
+ "tower 0.4.13",
 ]
 
 [[package]]
@@ -4627,6 +4644,7 @@ dependencies = [
  "rusternetes-client",
  "rusternetes-common",
  "rusternetes-cri",
+ "rusternetes-csi",
  "rusternetes-storage",
  "rusternetes-streamproxy",
  "rustix",

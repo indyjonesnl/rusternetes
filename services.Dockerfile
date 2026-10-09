@@ -189,6 +189,7 @@ COPY crates/rusternetes/Cargo.toml        crates/rusternetes/Cargo.toml
 COPY crates/scheduler/Cargo.toml          crates/scheduler/Cargo.toml
 COPY crates/storage/Cargo.toml            crates/storage/Cargo.toml
 COPY crates/streamproxy/Cargo.toml        crates/streamproxy/Cargo.toml
+COPY crates/csi/Cargo.toml        crates/csi/Cargo.toml
 COPY crates/test_support/Cargo.toml       crates/test_support/Cargo.toml
 
 # build.rs scripts + proto/ files belong with the manifests because
@@ -204,6 +205,8 @@ COPY crates/cri/build.rs        crates/cri/build.rs
 COPY crates/cri/proto           crates/cri/proto
 # kubelet/build.rs runs tonic-build over the CSI v1 proto (#2313); without both
 # in Pass-1 the generated `proto` module is empty and kubelet fails to compile.
+COPY crates/csi/build.rs     crates/csi/build.rs
+COPY crates/csi/proto        crates/csi/proto
 COPY crates/kubelet/build.rs     crates/kubelet/build.rs
 COPY crates/kubelet/proto        crates/kubelet/proto
 
@@ -215,7 +218,7 @@ COPY crates/kubelet/proto        crates/kubelet/proto
 #                 scheduler
 # `echo "fn main(){}"` in every main.rs; empty lib.rs is fine.
 RUN set -eux; \
-    for c in client common storage cloud-providers protobuf middleware admission-webhook discovery cri streamproxy test_support; do \
+    for c in client common storage cloud-providers protobuf middleware admission-webhook discovery cri streamproxy csi test_support; do \
         mkdir -p crates/$c/src && : > crates/$c/src/lib.rs; \
     done; \
     for c in kubectl rusternetes; do \
@@ -281,6 +284,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         -p rusternetes-scheduler \
         -p rusternetes-storage \
         -p rusternetes-streamproxy \
+        -p rusternetes-csi \
  && { [ "$USE_SCCACHE" = "1" ] && sccache --show-stats || true; }
 
 # ----- PASS 2: real source compile (only changed workspace crates rebuild) -----
@@ -317,6 +321,7 @@ COPY crates/scheduler/src            crates/scheduler/src
 COPY crates/scheduler/tests          crates/scheduler/tests
 COPY crates/storage/src              crates/storage/src
 COPY crates/streamproxy/src          crates/streamproxy/src
+COPY crates/csi/src          crates/csi/src
 # test_support: the in-process api-server test harness. A workspace member, so
 # its manifest is required for `cargo` to resolve the workspace even though the
 # release bins don't depend on it (dev-dependency); src is copied so in-image
