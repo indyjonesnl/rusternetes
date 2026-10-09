@@ -1943,17 +1943,23 @@ impl<S: Storage + 'static> JobController<S> {
         // failure is evaluated at all (:951 "only when the Job doesn't have the
         // SuccessCriteriaMet condition"), and a persisted FailureTarget is
         // already the failure (:953-955).
-        let is_failed = persisted_success.is_none()
+        // Order matters (job_controller.go:955-995): pod failure policy and
+        // backoffLimit, then `pastActiveDeadline`, and only after those the
+        // per-index scenarios (maxFailedIndexes, FailedIndexes). So the
+        // deadline outranks the per-index ones, and is evaluated only when
+        // the earlier scenarios have not already failed the Job.
+        let early_failed = persisted_success.is_none()
             && (persisted_failure.is_some()
                 || pod_failure_policy_triggered
-                || max_failed_indexes_exceeded
-                || if backoff_limit_per_index.is_some() && is_indexed {
+                || (!(backoff_limit_per_index.is_some() && is_indexed) && failed > backoff_limit));
+        let index_failed = persisted_success.is_none()
+            && (max_failed_indexes_exceeded
+                || (backoff_limit_per_index.is_some() && is_indexed && {
                     let completed_count = succeeded_index_count;
                     let failed_count = all_failed_index_set.len() as i32;
                     (completed_count + failed_count) >= completions
-                } else {
-                    failed > backoff_limit
-                });
+                }));
+        let is_failed = early_failed || index_failed;
 
         // Check if Job is complete
         // For indexed jobs, check number of distinct succeeded indexes
@@ -1970,7 +1976,7 @@ impl<S: Storage + 'static> JobController<S> {
         if let Some(deadline) = job
             .spec
             .active_deadline_seconds
-            .filter(|_| !is_failed && persisted_success.is_none() && !job_suspended)
+            .filter(|_| !early_failed && persisted_success.is_none() && !job_suspended)
         {
             if let Some(start) = job.status.as_ref().and_then(|s| s.start_time) {
                 let elapsed = chrono::Utc::now()
