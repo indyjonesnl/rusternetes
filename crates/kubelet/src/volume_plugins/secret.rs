@@ -553,6 +553,27 @@ mod tests {
         assert_eq!(mode & 0o777, 0o777);
     }
 
+    /// `TestPlugin` (secret_test.go:340-348): "secret volume should create its
+    /// own empty wrapper path" -- the wrapped emptyDir's `SetReady`
+    /// (empty_dir.go:284, `volumeutil.SetReady` util.go:93) creates
+    /// `<pod>/plugins/kubernetes.io~empty-dir/wrapped_<vol>`.
+    #[tokio::test]
+    async fn set_up_creates_the_wrapped_empty_dir_metadata_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = mounter_at(
+            tmp.path(),
+            json!([{"key": "a", "path": "a"}]),
+            Some(opaque("s", &[("a", b"1")])),
+        )
+        .await;
+        m.set_up().await.unwrap();
+        let wrapper = tmp
+            .path()
+            .join("pods/uid-1/plugins/kubernetes.io~empty-dir/wrapped_sec");
+        assert!(wrapper.is_dir(), "missing {}", wrapper.display());
+        assert!(wrapper.join("ready").exists());
+    }
+
     /// SetUpAt's `defer` (secret.go:183-200): a failed AtomicWriter runs
     /// `unmounter.TearDown()`, and emptyDir `TearDownAt` removes the volume.
     #[tokio::test]
