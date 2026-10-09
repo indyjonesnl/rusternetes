@@ -43,6 +43,17 @@ pub enum Error {
     #[error("Storage error: {0}")]
     Storage(String),
 
+    /// A write the storage backend refused because the serialized object
+    /// exceeded its request-size limit (etcd `request is too large`, or a gRPC
+    /// `ResourceExhausted` "trying to send message larger than max").
+    /// Upstream passes the raw backend error through the store untouched and
+    /// the handlers recognise it with `isTooLargeError`
+    /// (endpoints/handlers/rest.go:457-471); here the backend tags it so
+    /// [`Error::is_too_large_error`] can. It surfaces as a 500 InternalError,
+    /// exactly as the raw etcd error does upstream.
+    #[error("Storage error: {0}")]
+    StorageTooLarge(String),
+
     #[error("Network error: {0}")]
     Network(String),
 
@@ -107,6 +118,13 @@ fn format_error_list(errs: &ErrorList) -> String {
 }
 
 impl Error {
+    /// `isTooLargeError` (endpoints/handlers/rest.go:457-471): the write was
+    /// refused for its serialized size, so the handlers may retry it without
+    /// managedFields.
+    pub fn is_too_large_error(&self) -> bool {
+        matches!(self, Error::StorageTooLarge(_))
+    }
+
     /// `errors.NewInvalid(qualifiedKind, name, errs)`
     /// (`apimachinery/pkg/api/errors/errors.go:284-312`, release-1.35): a 422
     /// Status whose message is `<Kind> "<name>" is invalid: <aggregate>` (the
@@ -167,7 +185,7 @@ impl Error {
             Error::Invalid(_) => "Invalid",
             Error::BadRequest(_) => "BadRequest",
             Error::Serialization(_) => "BadRequest",
-            Error::Storage(_) => "InternalError",
+            Error::Storage(_) | Error::StorageTooLarge(_) => "InternalError",
             Error::Network(_) => "ServiceUnavailable",
             Error::Authentication(_) => "Unauthorized",
             Error::Authorization(_) => "Forbidden",
@@ -266,7 +284,7 @@ impl axum::response::IntoResponse for Error {
                 continue_meta = Some(continue_token);
                 (StatusCode::GONE, message, "Gone", None)
             }
-            Error::Storage(msg) => (
+            Error::Storage(msg) | Error::StorageTooLarge(msg) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 msg,
                 "InternalError",
@@ -518,6 +536,19 @@ fn extract_resource_details_for_invalid(msg: &str) -> Option<crate::types::Statu
 
 #[cfg(all(test, feature = "axum-support"))]
 mod tests {
+    #[test]
+    fn too_large_storage_error_is_recognised_and_is_a_500() {
+        use axum::response::IntoResponse;
+        let e = Error::StorageTooLarge("etcdserver: request is too large".into());
+        assert!(e.is_too_large_error());
+        assert!(!Error::Storage("etcdserver: request is too large".into()).is_too_large_error());
+        assert_eq!(e.reason(), "InternalError");
+        assert_eq!(
+            e.into_response().status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
     use super::*;
     use crate::validation::field::{ErrorType, Path};
 
