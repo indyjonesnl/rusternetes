@@ -107,4 +107,29 @@ fn object_meta_non_zero_scalars_are_kept() {
     let v = decode("ObjectMeta", &[0x0a, 0x01, b'a', 0x38, 0x03]);
     assert_eq!(v["name"], "a");
     assert_eq!(v["generation"], 3);
+
+/// #2931: the table must cover every plain `omitempty` bool/int, not a
+/// hand-picked subset. `ObjectMeta.Generation int64 json:"generation,omitempty"`
+/// (apimachinery meta/v1 types.go:177), `ServicePort.NodePort int32
+/// json:"nodePort,omitempty"` and `DeploymentStatus.Replicas int32
+/// json:"replicas,omitempty"` were all missing.
+#[test]
+fn plain_omitempty_scalars_outside_the_hand_list_decode_absent() {
+    // ObjectMeta: generation(7)=0
+    assert_eq!(decode("ObjectMeta", &[0x38, 0x00]), serde_json::json!({}));
+    // ServicePort: nodePort(5)=0
+    assert_eq!(decode("ServicePort", &[0x28, 0x00]), serde_json::json!({}));
+    // DeploymentStatus: replicas(2)=0
+    assert_eq!(
+        decode("DeploymentStatus", &[0x10, 0x00]),
+        serde_json::json!({})
+    );
+}
+
+/// A non-`omitempty` field (`ServicePort.Port int32 json:"port"`) is always in
+/// the JSON, so a written zero stays.
+#[test]
+fn a_non_omitempty_zero_is_kept() {
+    // ServicePort: port(3)=0
+    assert_eq!(decode("ServicePort", &[0x18, 0x00])["port"], 0);
 }
