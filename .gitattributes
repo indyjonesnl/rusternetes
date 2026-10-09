@@ -1,0 +1,4 @@
+# Vendored upstream Kubernetes golden oracles: byte-exact, never normalised,
+# collapsed in PR diffs. Refresh with scripts/sync-upstream-testdata.sh.
+tests/upstream/** linguist-vendored -text -diff
+tests/upstream/**/*.pb binary
