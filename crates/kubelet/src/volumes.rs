@@ -168,14 +168,29 @@ impl VolumeManager {
         storage: Option<Arc<rusternetes_storage::StorageBackend>>,
         token_manager: rusternetes_common::auth::TokenManager,
     ) -> Self {
+        Self::new_with_pod_certificate_manager(volumes_base_path, storage, token_manager, None)
+    }
+
+    /// [`VolumeManager::new`] plus the kubelet's pod certificate manager, which
+    /// the volume host hands to the projected `podCertificate` source
+    /// (`kubeletVolumeHost.podCertificateManager`, `pkg/kubelet/volume_host.go:86`).
+    pub fn new_with_pod_certificate_manager(
+        volumes_base_path: String,
+        storage: Option<Arc<rusternetes_storage::StorageBackend>>,
+        token_manager: rusternetes_common::auth::TokenManager,
+        pod_certificate_manager: Option<Arc<dyn crate::podcertificate::Manager>>,
+    ) -> Self {
         let node_allocatable = crate::kubelet::node_allocatable_map();
-        let host: Arc<dyn crate::volume_plugins::VolumeHost> =
-            Arc::new(crate::volume_plugins::KubeletVolumeHost::new(
-                volumes_base_path.clone(),
-                storage.clone(),
-                token_manager.clone(),
-                node_allocatable.clone(),
-            ));
+        let mut kubelet_host = crate::volume_plugins::KubeletVolumeHost::new(
+            volumes_base_path.clone(),
+            storage.clone(),
+            token_manager.clone(),
+            node_allocatable.clone(),
+        );
+        if let Some(m) = pod_certificate_manager {
+            kubelet_host = kubelet_host.with_pod_certificate_manager(m);
+        }
+        let host: Arc<dyn crate::volume_plugins::VolumeHost> = Arc::new(kubelet_host);
         let plugin_mgr = Arc::new(crate::volume_plugins::VolumePluginMgr::new(vec![
             Box::new(crate::volume_plugins::empty_dir::EmptyDirPlugin::new(
                 host.clone(),

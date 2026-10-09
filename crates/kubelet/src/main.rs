@@ -537,6 +537,8 @@ async fn main() -> Result<()> {
         .with_crash_loop_backoff_max(crash_loop_backoff_max),
     );
 
+    kubelet.register_pod_certificate_metrics(&plugin_metrics.registry);
+
     // Plugin manager (`pkg/kubelet/pluginmanager`): watch
     // `<root>/plugins_registry` for CSI node-driver-registrar sockets and run
     // the registration handshake, which fills the CSI driver store. Upstream

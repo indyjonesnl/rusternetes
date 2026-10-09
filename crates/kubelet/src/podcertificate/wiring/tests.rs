@@ -112,7 +112,7 @@ fn reconcile_tracks_after_add_and_forgets_before_remove() {
     assert_eq!(cache.get_pods().len(), 2);
     // Unchanged set: no repeat TrackPod.
     cache.reconcile(&[a.clone(), b.clone()], &rec);
-    cache.reconcile(&[a.clone()], &rec);
+    cache.reconcile(std::slice::from_ref(&a), &rec);
 
     let calls = rec.calls.lock().unwrap().clone();
     let mut tracked: Vec<_> = calls.iter().filter(|c| c.0 == "track").cloned().collect();
@@ -125,10 +125,7 @@ fn reconcile_tracks_after_add_and_forgets_before_remove() {
         ]
     );
     assert_eq!(
-        calls
-            .iter()
-            .filter(|c| c.0 == "forget")
-            .collect::<Vec<_>>(),
+        calls.iter().filter(|c| c.0 == "forget").collect::<Vec<_>>(),
         vec![&("forget".to_string(), "uid-b".to_string(), true)]
     );
     assert!(cache.get_pod_by_uid("uid-b").is_none());
@@ -147,7 +144,8 @@ fn collector_exposes_states_gauge() {
     let m = &fams[0].metric[0];
     assert_eq!(m.gauge.value(), 3.0);
     let labels: Vec<_> = m
-        .label.iter()
+        .label
+        .iter()
         .map(|l| (l.name().to_string(), l.value().to_string()))
         .collect();
     assert_eq!(
@@ -228,7 +226,7 @@ async fn gate_on_tracked_pod_gets_a_pcr_and_forget_clears_it() {
     let run = tokio::spawn(issuing.run(token.clone()));
 
     let p = pod("uid-a", "a");
-    cache.reconcile(&[p.clone()], &*manager);
+    cache.reconcile(std::slice::from_ref(&p), &*manager);
 
     let mut found = false;
     for _ in 0..100 {
@@ -242,7 +240,10 @@ async fn gate_on_tracked_pod_gets_a_pcr_and_forget_clears_it() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    assert!(found, "no PodCertificateRequest created for the tracked pod");
+    assert!(
+        found,
+        "no PodCertificateRequest created for the tracked pod"
+    );
     assert!(!manager.metric_report().pod_certificate_states.is_empty());
 
     cache.reconcile(&[], &*manager);

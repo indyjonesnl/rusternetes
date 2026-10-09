@@ -438,6 +438,16 @@ struct RestartBackoff {
 pub struct Kubelet {
     node_name: String,
     storage: Arc<StorageBackend>,
+    /// `kubelet.podCertificateManager` (`kubelet.go:1242-1245`): fed by
+    /// `pod_cache.reconcile` as pods are added to / dropped from the node, and
+    /// handed to the volume host. A `NoOpManager` unless the
+    /// `PodCertificateRequest` gate is on (`kubelet.go:955-972`).
+    pod_certificate_manager: Arc<dyn crate::podcertificate::Manager>,
+    /// The `IssuingManager` behind `pod_certificate_manager`, whose `run` is
+    /// spawned from [`Kubelet::run`] (`kubelet.go:967`).
+    pod_certificate_issuing: Option<Arc<crate::podcertificate::IssuingManager<StorageBackend>>>,
+    /// `kubelet.podManager` as the pod certificate manager reads it.
+    pod_cache: Arc<crate::podcertificate::wiring::PodCache>,
     runtime: Arc<CriContainerRuntime>,
     /// `containerRuntimeVersion` reported in NodeStatus, resolved once at startup
     /// from the CRI Version RPC (`<runtime_name>://<runtime_version>`), not a
@@ -732,10 +742,20 @@ impl Kubelet {
         let jwt_secret = std::env::var("JWT_SECRET")
             .unwrap_or_else(|_| "rusternetes-secret-change-in-production".to_string());
         let token_manager = rusternetes_common::auth::TokenManager::new_auto(jwt_secret.as_bytes());
-        let volumes = crate::volumes::VolumeManager::new(
+        // Pod certificate manager (`kubelet.go:955-972`), built before the
+        // volume host so the projected `podCertificate` source can reach it.
+        let pod_cache = crate::podcertificate::wiring::PodCache::new();
+        let (pod_certificate_manager, pod_certificate_issuing) =
+            crate::podcertificate::wiring::new_pod_certificate_manager(
+                storage.clone(),
+                pod_cache.clone(),
+                &node_name,
+            );
+        let volumes = crate::volumes::VolumeManager::new_with_pod_certificate_manager(
             volume_dir.clone(),
             Some(storage.clone()),
             token_manager,
+            Some(pod_certificate_manager.clone()),
         );
 
         // The kubernetes Service host:port injected into pods as
@@ -778,6 +798,9 @@ impl Kubelet {
         Ok(Self {
             node_name,
             storage,
+            pod_certificate_manager,
+            pod_certificate_issuing,
+            pod_cache,
             runtime: Arc::new(runtime),
             container_runtime_version,
             runtime_state: crate::runtime_state::RuntimeState::new(
@@ -810,6 +833,22 @@ impl Kubelet {
             static_pods: Arc::new(Mutex::new(HashMap::new())),
             sysctl_allowlist: crate::sysctl::Allowlist::new(&allowed_unsafe_sysctls),
         })
+    }
+
+    /// `metrics.RegisterCollectors(collectors.PodCertificateCollectorFor(m))`
+    /// (`kubelet.go:969`): expose `kubelet_podcertificate_states` on
+    /// `registry`. Upstream registers only alongside the `IssuingManager`, so a
+    /// `NoOpManager` kubelet registers nothing.
+    pub fn register_pod_certificate_metrics(&self, registry: &prometheus::Registry) {
+        if self.pod_certificate_issuing.is_none() {
+            return;
+        }
+        let collector = crate::podcertificate::wiring::PodCertificateCollector::new(
+            self.pod_certificate_manager.clone(),
+        );
+        if let Err(e) = registry.register(Box::new(collector)) {
+            warn!("registering kubelet_podcertificate_states: {e}");
+        }
     }
 
     /// Enable static pods from a manifest directory (kubeadm staticPodPath).
@@ -999,6 +1038,12 @@ impl Kubelet {
 
     pub async fn run(self: &Arc<Self>) -> Result<()> {
         info!("Kubelet started for node: {}", self.node_name);
+
+        // `go podCertificateManager.Run(ctx)` (`kubelet.go:967`). The kubelet
+        // runs for the life of the process, so the token is never cancelled.
+        if let Some(issuing) = self.pod_certificate_issuing.clone() {
+            tokio::spawn(issuing.run(crate::podcertificate::tokio_util_cancel::Token::new()));
+        }
 
         // Check runtime state once before registering so the first Ready
         // report is honest (kubelet.go:1849-1851), then keep polling every
@@ -2034,6 +2079,11 @@ impl Kubelet {
             crate::static_pods::merge_node_pods(all_pods.clone(), static_pods, &self.node_name);
 
         debug!("Found {} pods assigned to this node", node_pods.len());
+
+        // HandlePodAdditions / HandlePodRemoves: TrackPod / ForgetPod for pods
+        // that arrived on / left the node (kubelet.go:2729, :2948).
+        self.pod_cache
+            .reconcile(&node_pods, self.pod_certificate_manager.as_ref());
 
         // Ensure per-pod workers exist for all assigned pods and signal them.
         // K8s ref: pkg/kubelet/pod_workers.go — podWorkerLoop (long-lived)
