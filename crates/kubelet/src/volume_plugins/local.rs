@@ -126,7 +126,27 @@ impl Mounter for LocalMounter {
         if self.path.split('/').any(|i| i == "..") {
             return Err(anyhow!("invalid path: {} must not contain '..'", self.path));
         }
-        let _ = (&self.fs_group, &self.fs_group_change_policy);
+        // `local.go:616-624`: "Volume owner will be written only once on the
+        // first volume mount" -- `NewVolumeOwnership(..).ChangePermissions()`
+        // with `mounterArgs.FsGroup` / `FSGroupChangePolicy`, skipped when
+        // read-only.
+        if !self.read_only {
+            let (root, fs_group, policy) = (
+                self.path.clone(),
+                self.fs_group,
+                self.fs_group_change_policy.clone(),
+            );
+            tokio::task::spawn_blocking(move || {
+                crate::volume_ownership::set_volume_ownership_with_policy(
+                    std::path::Path::new(&root),
+                    fs_group,
+                    policy.as_deref(),
+                    false,
+                )
+            })
+            .await
+            .map_err(|e| anyhow!("fsGroup ownership task panicked: {e}"))??;
+        }
         Ok(())
     }
 }
