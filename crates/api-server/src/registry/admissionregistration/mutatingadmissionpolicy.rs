@@ -448,6 +448,114 @@ mod tests {
         assert!(errs.is_empty(), "{}", messages(&errs));
     }
 
+    fn create_errors(p: &MutatingAdmissionPolicy) -> String {
+        messages(&RestCreateStrategy::validate(
+            &Strategy,
+            &RequestContext::new(None),
+            p,
+        ))
+    }
+
+    fn with_mutations_on(
+        mut p: MutatingAdmissionPolicy,
+        mutations: serde_json::Value,
+    ) -> MutatingAdmissionPolicy {
+        p.spec.as_mut().unwrap().mutations = Some(serde_json::from_value(mutations).unwrap());
+        p
+    }
+
+    fn with_mutations(mutations: serde_json::Value) -> MutatingAdmissionPolicy {
+        with_mutations_on(valid(), mutations)
+    }
+
+    /// `TestValidateMutatingAdmissionPolicy` "applyConfiguration must
+    /// evaluate to Object" (validation_test.go:4270-4286); the message is
+    /// `compile.go:199`.
+    #[test]
+    fn create_rejects_an_apply_configuration_that_is_not_an_object() {
+        let p = with_mutations(json!([
+            {"patchType": "ApplyConfiguration", "applyConfiguration": {"expression": "1 < 2"}}
+        ]));
+        let m = create_errors(&p);
+        assert!(
+            m.contains(r#"spec.mutations[0].applyConfiguration.expression: Invalid value: "1 < 2": must evaluate to Object"#),
+            "{m}"
+        );
+    }
+
+    /// "Reference to missing variable" (validation_test.go:4415-4442).
+    #[test]
+    fn create_rejects_a_reference_to_a_missing_variable() {
+        let mut p = with_mutations(
+            json!([{"patchType": "JSONPatch", "jsonPatch": {"expression":
+            "[JSONPatch{op: \"add\", path: \"/spec/repliacs\", value: variables.x + variables.y}]"}}]),
+        );
+        p.spec.as_mut().unwrap().variables =
+            Some(serde_json::from_value(json!([{"name": "x", "expression": "10 + 10"}])).unwrap());
+        let m = create_errors(&p);
+        assert!(m.contains("undefined field 'y'"), "{m}");
+        // the declared one is fine
+        p.spec.as_mut().unwrap().mutations = Some(
+            serde_json::from_value(
+                json!([{"patchType": "JSONPatch", "jsonPatch": {"expression":
+            "[JSONPatch{op: \"add\", path: \"/spec/replicas\", value: variables.x}]"}}]),
+            )
+            .unwrap(),
+        );
+        assert_eq!(create_errors(&p), "");
+    }
+
+    /// matchConditions with `params` and no `paramKind`
+    /// (validation_test.go:5170-5190), and the same for a mutation.
+    #[test]
+    fn create_rejects_params_without_a_param_kind() {
+        let mut p = valid();
+        let spec = p.spec.as_mut().unwrap();
+        spec.param_kind = None;
+        spec.match_conditions = Some(
+            serde_json::from_value(
+                json!([{"name": "hasParams", "expression": "params.foo == \"okay\""}]),
+            )
+            .unwrap(),
+        );
+        let m = create_errors(&p);
+        assert!(
+            m.contains("spec.matchConditions[0].expression")
+                && m.contains("undeclared reference to 'params'"),
+            "{m}"
+        );
+        let mut p = valid();
+        p.spec.as_mut().unwrap().param_kind = None;
+        let m = create_errors(&with_mutations_on(
+            p,
+            json!([{"patchType": "ApplyConfiguration", "applyConfiguration":
+                {"expression": "Object{ spec: Object.spec{ replicas: params.n } }"}}]),
+        ));
+        assert!(m.contains("undeclared reference to 'params'"), "{m}");
+    }
+
+    /// The checker declares only the environment's variables
+    /// (`createEnvForOpts`, compile.go:251-291); comprehension variables are
+    /// bound by their macro.
+    #[test]
+    fn create_checks_declarations_and_scopes_comprehension_variables() {
+        let p = with_mutations(
+            json!([{"patchType": "JSONPatch", "jsonPatch": {"expression":
+            "[JSONPatch{op: \"add\", path: \"/a\", value: nope}]"}}]),
+        );
+        assert!(create_errors(&p).contains("undeclared reference to 'nope'"));
+        let p = with_mutations(
+            json!([{"patchType": "JSONPatch", "jsonPatch": {"expression":
+            "object.items.map(i, JSONPatch{op: \"add\", path: \"/a\", value: i})"}}]),
+        );
+        assert_eq!(create_errors(&p), "");
+        let p = with_mutations(
+            json!([{"patchType": "JSONPatch", "jsonPatch": {"expression":
+            "[JSONPatch{op: \"add\", path: \"/a\", bogus: 1}]"}}]),
+        );
+        assert!(create_errors(&p).contains("undefined field 'bogus'"));
+    }
+
     /// `ValidateMutatingAdmissionPolicyUpdate` (validation.go:1349-1354) with
     /// `ignoreMutatingAdmissionPolicyMatchConditions` (:630-638): unchanged
     /// `matchConditions` and `paramKind` are not compiled again; a change is.
