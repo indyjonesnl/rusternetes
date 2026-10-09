@@ -150,3 +150,142 @@ fn pod_security_fixtures() {
         "{pass_pods}/{fail_pods}"
     );
 }
+
+/// `expectErrorSubstring` of the fixture generators (`test/fixtures_*.go`);
+/// `getFixtures` (fixtures.go:260-266) defaults it to the check ID.
+fn expect_error_substring(id: &str) -> &str {
+    match id {
+        "hostPorts" => "hostPort",
+        "hostProbesAndHostLifecycle" => "probe or lifecycle host",
+        "hostPathVolumes" => "hostPath",
+        "appArmorProfile" => "forbidden AppArmor profile",
+        "capabilities_baseline" => "capabilities",
+        "capabilities_restricted" => "unrestricted capabilities",
+        "windowsHostProcess" => "hostProcess",
+        "hostNamespaces" => "host namespaces",
+        "procMount" | "procMount_restricted" => "procMount",
+        "seLinuxOptions" => "seLinuxOptions",
+        "seccompProfile_baseline" | "seccompProfile_restricted" => "seccompProfile",
+        "sysctls" => "forbidden sysctl",
+        "restrictedVolumes" => "restricted volume types",
+        other => other,
+    }
+}
+
+/// run.go:273-337 `createController`: the same fixture pod wrapped in a
+/// Deployment (run.go:285-294, label `test=true`) and dry-run created in a
+/// namespace labelled enforce+warn at the level/version under test. A
+/// controller is never denied; pass pods must produce no warning and fail
+/// pods a warning naming the failing check (run.go:316-336).
+///
+/// `failRequiresError` (run.go:302-307; only procMount at 1.35 baseline,
+/// fixtures_procMount.go:93) means API validation rejects the pod outright,
+/// which is outside PodSecurity itself, so those scenarios are not replayed
+/// here.
+#[tokio::test]
+async fn pod_security_fixtures_controller_scenarios() {
+    use rusternetes_common::resources::Namespace;
+    use rusternetes_storage::{build_key, MemoryStorage, Storage};
+    use std::sync::Arc;
+
+    let psa = crate::admission::PodSecurityAdmission::new();
+    let storage = Arc::new(MemoryStorage::new());
+    let mut controllers = 0;
+
+    // run.go:285-294 wraps `pod.ObjectMeta`/`pod.Spec` in a Deployment with
+    // `test=true` added to the labels (:278-281).
+    let deployment = |pod: &Pod| {
+        let mut meta = serde_json::to_value(&pod.metadata).unwrap();
+        meta["labels"] = serde_json::json!({"test": "true"});
+        serde_json::json!({
+            "apiVersion": "apps/v1", "kind": "Deployment",
+            "metadata": {"name": "test"},
+            "spec": {
+                "selector": {"matchLabels": {"test": "true"}},
+                "template": {"metadata": meta, "spec": pod.spec},
+            },
+        })
+    };
+
+    for level in [Level::Baseline, Level::Restricted] {
+        for minor in 0..=NEWEST_MINOR_VERSION_TO_TEST {
+            // run.go:212-219
+            let ns = format!("podsecurity-{level}-1-{minor}");
+            let mut labels = std::collections::BTreeMap::new();
+            for mode in ["enforce", "warn"] {
+                labels.insert(
+                    format!("pod-security.kubernetes.io/{mode}"),
+                    level.to_string(),
+                );
+                labels.insert(
+                    format!("pod-security.kubernetes.io/{mode}-version"),
+                    format!("v1.{minor}"),
+                );
+            }
+            let n: Namespace = serde_json::from_value(serde_json::json!({
+                "apiVersion": "v1", "kind": "Namespace",
+                "metadata": {"name": ns, "labels": labels}}))
+            .unwrap();
+            storage
+                .create(&build_key("namespaces", None, &ns), &n)
+                .await
+                .unwrap();
+
+            let dir = testdata()
+                .join(level.to_string())
+                .join(format!("v1.{minor}"));
+            let run = |pod: &Pod| {
+                let obj = deployment(pod);
+                let (psa, storage, ns) = (&psa, &storage, ns.clone());
+                async move {
+                    psa.validate_pod_controller(
+                        storage,
+                        &ns,
+                        None,
+                        "apps",
+                        "deployments",
+                        &obj,
+                        "tester",
+                    )
+                    .await
+                }
+            };
+
+            for (name, pod) in load(&dir.join("pass")) {
+                let out = run(&pod).await;
+                assert!(
+                    out.warnings.is_empty(),
+                    "{ns} pass/{name}: unexpected warning {:?}",
+                    out.warnings
+                );
+                controllers += 1;
+            }
+
+            let applicable = checks_for(level, minor);
+            for (name, pod) in load(&dir.join("fail")) {
+                let stem = check_stem(&name).to_string();
+                if stem == "procmount" && minor >= 35 {
+                    continue; // failRequiresError, see above
+                }
+                let check = applicable
+                    .iter()
+                    .find(|c| c.id.to_lowercase() == stem)
+                    .unwrap_or_else(|| panic!("{ns} fail/{name}: no applicable check {stem}"));
+                let want = expect_error_substring(check.id);
+                let out = run(&pod).await;
+                let text = out.warnings.join("; ");
+                assert!(!text.is_empty(), "{ns} fail/{name}: expected a warning");
+                assert!(
+                    !text.contains(UNKNOWN_FORBIDDEN_REASON),
+                    "{ns} fail/{name}: unknown forbidden reason: {text}"
+                );
+                assert!(
+                    text.contains(want),
+                    "{ns} fail/{name}: warning {text:?} lacks {want:?}"
+                );
+                controllers += 1;
+            }
+        }
+    }
+    assert!(controllers > 1500, "{controllers}");
+}
