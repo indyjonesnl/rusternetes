@@ -975,6 +975,26 @@ pub fn resolve_kind_to_resource(group: &str, version: &str, kind: &str) -> Optio
         .and_then(|r| r["resource"].as_str().map(str::to_string))
 }
 
+/// One `RegisterKindFor` call (installer.go:1127) for a built-in resource or
+/// subresource this server serves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredKind {
+    pub group: String,
+    pub version: String,
+    pub resource: String,
+    /// `""` for the main resource.
+    pub subresource: String,
+    /// The `fqKindToRegister`.
+    pub kind_group: String,
+    pub kind_version: String,
+    pub kind: String,
+}
+
+/// Every built-in `resource[/subresource] -> kind` this server serves.
+pub fn registered_kinds() -> Vec<RegisteredKind> {
+    Vec::new()
+}
+
 /// Build aggregated discovery resource entries for a given API group.
 /// Returns a list of resource objects in the apidiscovery.k8s.io/v2 format.
 /// In v2, subresources are nested inside their parent resource's "subresources" array,

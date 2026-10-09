@@ -7,6 +7,7 @@ pub mod policy_dispatch;
 pub mod policy_matching;
 pub mod policy_mutating;
 pub mod policy_source;
+pub mod policy_registry;
 pub mod resourcequota;
 pub mod storage_object_in_use_protection;
 
