@@ -353,3 +353,24 @@ fn spec_immutable_diff_far_apart_changes_make_two_hunks() {
         e.detail
     );
 }
+
+/// `resource.Quantity.MarshalJSON` emits the canonical form (`1024Mi` is
+/// `1Gi`, `1000m` is `1`), so `json.MarshalIndent` in `diff.Diff` shows the
+/// canonical string, not the stored one (apimachinery
+/// `pkg/api/resource/quantity.go` `MarshalJSON` -> `String`).
+#[test]
+fn spec_immutable_diff_renders_quantities_canonically() {
+    let mut old = pvc("1024Mi", None);
+    old.spec.resources.limits = Some(HashMap::from([("cpu".to_string(), "1000m".to_string())]));
+    let mut new = old.clone();
+    new.spec.resources.limits = Some(HashMap::from([("cpu".to_string(), "2".to_string())]));
+    let errs = validate_persistent_volume_claim_update(&new, &old);
+    let e = errs.iter().find(|e| e.field == "spec").expect("spec error");
+    assert!(
+        !e.detail.contains("1024Mi") && !e.detail.contains("1000m"),
+        "{}",
+        e.detail
+    );
+    assert!(e.detail.contains("\"cpu\": \"1\""), "{}", e.detail);
+    assert!(e.detail.contains("\"storage\": \"1Gi\""), "{}", e.detail);
+}
