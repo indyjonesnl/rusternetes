@@ -1063,27 +1063,13 @@ pub fn strip_false_extensions(value: &mut serde_json::Value) {
             }
         }
 
-        // Zero-value integers should be omitted (Go omitempty on int64/float64).
-        // JSONSchemaProps fields like maxLength, minLength, maxItems, etc. use
-        // pointer types (*int64) in Go with omitempty — zero means "not set".
-        let zero_int_fields = [
-            "maximum",
-            "minimum",
-            "multipleOf",
-            "maxLength",
-            "minLength",
-            "maxItems",
-            "minItems",
-            "maxProperties",
-            "minProperties",
-        ];
-        for key in &zero_int_fields {
-            if let Some(serde_json::Value::Number(n)) = obj.get(*key) {
-                if n.as_f64() == Some(0.0) || n.as_i64() == Some(0) {
-                    obj.remove(*key);
-                }
-            }
-        }
+        // NOTE: maximum/minimum/multipleOf/maxLength/minLength/maxItems/minItems/
+        // maxProperties/minProperties are deliberately NOT stripped when 0. Upstream
+        // they are pointers (`*float64`/`*int64`, `omitempty`), so only nil is
+        // omitted and an explicit 0 is serialised.
+        // K8s ref: apiextensions/v1/types_jsonschema.go:80-94. Our CRD model
+        // (common/resources/crd.rs) is Option<_> and skips None, so an absent
+        // field never reaches here as 0 (#2946).
 
         // Empty arrays should be omitted (Go omitempty on slices)
         let array_fields = ["required", "enum", "allOf", "oneOf", "anyOf"];
