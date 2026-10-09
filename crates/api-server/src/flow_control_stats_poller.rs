@@ -12,17 +12,112 @@ use std::time::Duration;
 use rusternetes_storage::Storage;
 
 use crate::flow_control_object_count::ObjectCountTracker;
+use crate::flow_control_work_estimator::Stats;
 
-/// One poll of every observed resource.
-pub async fn poll_once<S: Storage>(_storage: &S, _tracker: &ObjectCountTracker) {}
+/// The `(group, resource)` pairs observed. Upstream starts one observer per
+/// registered `genericregistry.Store`; this server has no store registry, so
+/// the built-in resources are listed here. Custom resources are not observed
+/// (their lists cost the minimum seats: `ObjectCountNotFoundErr`).
+pub const OBSERVED_RESOURCES: &[(&str, &str)] = &[
+    ("", "pods"),
+    ("", "services"),
+    ("", "endpoints"),
+    ("", "configmaps"),
+    ("", "secrets"),
+    ("", "serviceaccounts"),
+    ("", "namespaces"),
+    ("", "nodes"),
+    ("", "events"),
+    ("", "persistentvolumes"),
+    ("", "persistentvolumeclaims"),
+    ("", "replicationcontrollers"),
+    ("", "resourcequotas"),
+    ("", "limitranges"),
+    ("apps", "deployments"),
+    ("apps", "replicasets"),
+    ("apps", "statefulsets"),
+    ("apps", "daemonsets"),
+    ("apps", "controllerrevisions"),
+    ("batch", "jobs"),
+    ("batch", "cronjobs"),
+    ("discovery.k8s.io", "endpointslices"),
+    ("networking.k8s.io", "ingresses"),
+    ("networking.k8s.io", "networkpolicies"),
+    ("rbac.authorization.k8s.io", "roles"),
+    ("rbac.authorization.k8s.io", "rolebindings"),
+    ("rbac.authorization.k8s.io", "clusterroles"),
+    ("rbac.authorization.k8s.io", "clusterrolebindings"),
+    ("storage.k8s.io", "storageclasses"),
+    ("coordination.k8s.io", "leases"),
+    ("apiextensions.k8s.io", "customresourcedefinitions"),
+    ("autoscaling", "horizontalpodautoscalers"),
+    ("policy", "poddisruptionbudgets"),
+    ("flowcontrol.apiserver.k8s.io", "flowschemas"),
+    (
+        "flowcontrol.apiserver.k8s.io",
+        "prioritylevelconfigurations",
+    ),
+];
 
-/// Poll until `stop` fires.
+/// `schema.GroupResource.String()`, the tracker's key.
+fn group_resource(group: &str, resource: &str) -> String {
+    if group.is_empty() {
+        resource.to_string()
+    } else {
+        format!("{resource}.{group}")
+    }
+}
+
+/// One poll of every observed resource (the body of the `JitterUntil`
+/// closure, store.go:1668-1678): on a `Stats` error, log and skip; otherwise
+/// `Set`.
+pub async fn poll_once<S: Storage>(storage: &S, tracker: &ObjectCountTracker) {
+    for (group, resource) in OBSERVED_RESOURCES {
+        let prefix = rusternetes_storage::build_prefix(resource, None);
+        match storage.stats(&prefix).await {
+            Ok(st) => tracker.set(
+                &group_resource(group, resource),
+                Stats {
+                    object_count: st.object_count,
+                    estimated_average_object_size_bytes: st.estimated_average_object_size_bytes,
+                },
+            ),
+            Err(e) => {
+                tracing::debug!(resource, error = %e, "Failed to update storage count metric");
+            }
+        }
+    }
+}
+
+/// `CountMetricPollPeriod` default (server/options/etcd.go:87).
+pub const COUNT_METRIC_POLL_PERIOD: Duration = Duration::from_secs(60);
+
+/// `resourceCountPollPeriodJitter` (store.go:263).
+const RESOURCE_COUNT_POLL_PERIOD_JITTER: f64 = 1.2;
+
+/// `wait.JitterUntil(f, period, 1.2, sliding=true, stopCh)`: runs `f`
+/// immediately, then after `period + rand*1.2*period`, until stopped.
 pub async fn run<S: Storage>(
-    _storage: Arc<S>,
-    _tracker: Arc<ObjectCountTracker>,
-    _period: Duration,
-    _stop: tokio::sync::watch::Receiver<bool>,
+    storage: Arc<S>,
+    tracker: Arc<ObjectCountTracker>,
+    period: Duration,
+    mut stop: tokio::sync::watch::Receiver<bool>,
 ) {
+    loop {
+        if *stop.borrow() {
+            return;
+        }
+        poll_once(storage.as_ref(), &tracker).await;
+        let wait = period.mul_f64(1.0 + rand::random::<f64>() * RESOURCE_COUNT_POLL_PERIOD_JITTER);
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            r = stop.changed() => {
+                if r.is_err() || *stop.borrow() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

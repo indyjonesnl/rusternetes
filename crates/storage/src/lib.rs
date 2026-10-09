@@ -515,8 +515,22 @@ pub trait Storage: Send + Sync {
     /// `storage.Interface.Stats` (storage/interfaces.go): the object count and
     /// estimated average object size under `prefix`.
     async fn stats(&self, prefix: &str) -> Result<ResourceStats> {
-        let _ = prefix;
-        Ok(ResourceStats::default())
+        // etcd3 answers this from a keys-only read plus a per-key size cache
+        // (storage/etcd3/stats.go `resourceSizeEstimator.Stats`); the generic
+        // fallback lists the prefix and measures the encoded objects.
+        let objects: Vec<serde_json::Value> = self.list(prefix).await?;
+        let count = objects.len() as i64;
+        if count == 0 {
+            return Ok(ResourceStats::default());
+        }
+        let total: usize = objects
+            .iter()
+            .map(|o| serde_json::to_vec(o).map(|b| b.len()).unwrap_or(0))
+            .sum();
+        Ok(ResourceStats {
+            object_count: count,
+            estimated_average_object_size_bytes: total as i64 / count,
+        })
     }
 }
 
