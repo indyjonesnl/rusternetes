@@ -13,10 +13,11 @@
 //! no unit test for `CollectParams` or `Dispatch` on their own, so those are
 //! pinned branch by branch to the Go source.
 //!
-//! The mutating delegate (`dispatchInvocations`) is in `policy_mutating.rs`.
-//! Not here yet (follow-ups of #2886): the `patch/` package (applyConfiguration,
-//! jsonPatch) and the type converter, the equivalent-resource mapper, and the
-//! wiring at the head of `Admission::admit`.
+//! The mutating delegate (`dispatchInvocations`) is in `policy_mutating.rs`;
+//! the equivalent-resource mapper and namespace lister are in
+//! `policy_registry.rs` (#2909). Not here yet (follow-ups of #2886): the
+//! `patch/` package (applyConfiguration, jsonPatch) and the type converter,
+//! and the wiring at the head of `Admission::admit`.
 
 // Not called from the request path yet; the bin target compiles `admission`
 // separately and would flag every item.

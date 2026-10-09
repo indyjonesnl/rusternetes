@@ -9,14 +9,17 @@
 //!
 //! Tests are ported from `runtime/mapper_test.go` (`TestResourceMapper`).
 
-#![allow(dead_code, unused_variables)]
+// Not called from the request path yet (the MutatingAdmissionPolicy plugin is
+// the rest of #2731); the bin target compiles `admission` separately.
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
-use rusternetes_common::{Error, Result};
+use rusternetes_common::resources::Namespace;
+use rusternetes_common::Result;
 use rusternetes_storage::Storage;
 
 use super::policy_matching::{EquivalentResourceMapper, NamespaceLister};
@@ -42,29 +45,88 @@ impl EquivalentResourceRegistry {
     /// `NewEquivalentResourceRegistry`: all versions of a GroupResource are
     /// equivalent.
     pub fn new() -> Self {
-        todo!()
+        Self {
+            key_func: None,
+            inner: RwLock::new(Inner::default()),
+        }
     }
 
     /// `NewEquivalentResourceRegistryWithIdentity`; `key_func(group,
     /// resource)` returning `""` falls back to `group/resource`.
     pub fn with_identity(key_func: impl Fn(&str, &str) -> String + Send + Sync + 'static) -> Self {
-        todo!()
+        Self {
+            key_func: Some(Box::new(key_func)),
+            inner: RwLock::new(Inner::default()),
+        }
     }
 
-    /// `RegisterKindFor`.
+    /// `RegisterKindFor` (mapper.go): upstream appends without de-duplicating.
     pub fn register_kind_for(
         &self,
         resource: GroupVersionResource,
         subresource: &str,
         kind: GroupVersionKind,
     ) {
-        todo!()
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        inner
+            .kinds
+            .entry((
+                resource.group.clone(),
+                resource.version.clone(),
+                resource.resource.clone(),
+            ))
+            .or_default()
+            .insert(subresource.to_string(), kind);
+
+        // get the shared key of the parent resource
+        let gr = (resource.group.clone(), resource.resource.clone());
+        let mut key = self
+            .key_func
+            .as_ref()
+            .map(|f| f(&gr.0, &gr.1))
+            .unwrap_or_default();
+        if key.is_empty() {
+            // schema.GroupResource.String()
+            key = if gr.0.is_empty() {
+                gr.1.clone()
+            } else {
+                format!("{}.{}", gr.1, gr.0)
+            };
+        }
+        inner.keys.insert(gr, key.clone());
+        inner
+            .resources
+            .entry(key)
+            .or_default()
+            .entry(subresource.to_string())
+            .or_default()
+            .push(resource);
     }
 
     /// A registry holding every built-in resource this server serves, as
-    /// installer.go registers them.
+    /// installer.go:1127 registers them (`RegisterKindFor` per resource and
+    /// subresource), with the default identity: all served versions of a
+    /// GroupResource are equivalent. Upstream's identity is the storage
+    /// prefix (server/config.go:734-745); only the `extensions` group shares a
+    /// prefix across groups upstream, and it is not served here.
     pub fn from_discovery() -> Self {
-        todo!()
+        let reg = Self::new();
+        for k in rusternetes_discovery::registered_kinds() {
+            reg.register_kind_for(
+                GroupVersionResource {
+                    group: k.group,
+                    version: k.version,
+                    resource: k.resource,
+                },
+                &k.subresource,
+                GroupVersionKind {
+                    group: k.kind_group,
+                    version: k.kind_version,
+                    kind: k.kind,
+                },
+            );
+        }
+        reg
     }
 }
 
@@ -80,11 +142,32 @@ impl EquivalentResourceMapper for EquivalentResourceRegistry {
         resource: &GroupVersionResource,
         subresource: &str,
     ) -> Vec<GroupVersionResource> {
-        todo!()
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        inner
+            .keys
+            .get(&(resource.group.clone(), resource.resource.clone()))
+            .and_then(|key| inner.resources.get(key))
+            .and_then(|subs| subs.get(subresource))
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn kind_for(&self, resource: &GroupVersionResource, subresource: &str) -> GroupVersionKind {
-        todo!()
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        inner
+            .kinds
+            .get(&(
+                resource.group.clone(),
+                resource.version.clone(),
+                resource.resource.clone(),
+            ))
+            .and_then(|subs| subs.get(subresource))
+            .cloned()
+            .unwrap_or(GroupVersionKind {
+                group: String::new(),
+                version: String::new(),
+                kind: String::new(),
+            })
     }
 }
 
@@ -101,15 +184,20 @@ impl<S: Storage> StorageNamespaceLister<S> {
 
 #[async_trait]
 impl<S: Storage> NamespaceLister for StorageNamespaceLister<S> {
+    /// `NamespaceLister.Get`: a missing namespace is `NotFound`.
     async fn namespace_labels(&self, name: &str) -> Result<HashMap<String, String>> {
-        todo!()
+        let ns: Namespace = self
+            .storage
+            .get(&rusternetes_storage::build_key("namespaces", None, name))
+            .await?;
+        Ok(ns.metadata.labels.unwrap_or_default())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusternetes_common::resources::Namespace;
+    use rusternetes_common::Error;
     use rusternetes_storage::MemoryStorage;
 
     fn gvr(g: &str, v: &str, r: &str) -> GroupVersionResource {
