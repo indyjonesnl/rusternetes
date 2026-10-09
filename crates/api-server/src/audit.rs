@@ -679,7 +679,7 @@ pub async fn with_audit(cfg: Arc<AuditConfig>, req: Request, next: Next) -> Resp
         resp.headers_mut().insert("Audit-ID", v);
     }
     ac.set_response_status(resp.status().as_u16());
-    if !resp.status().is_success() && !resp.status().is_informational() {
+    if !resp.status().is_informational() && status_body_is_recordable(&resp) {
         resp = record_status_body(&ac, resp).await;
     }
     if long_running {
@@ -697,14 +697,32 @@ const MAX_STATUS_BODY: usize = 1 << 20;
 /// the `metav1.Status` the handler wrote becomes the event's `ResponseStatus`
 /// (`ac.LogResponseObject` -> `ev.ResponseStatus = status`). Upstream hooks the
 /// serializer; here the (non-2xx) body is read back and passed through
-/// unchanged. Deviation: a 2xx Status (e.g. a delete's Success) is not
-/// recorded, because buffering success bodies would break streaming.
+/// unchanged. Deviation: upstream hooks the serializer, so it never reads a
+/// body back; here only a body that is ALREADY fully in memory (exact
+/// `size_hint`, <= `MAX_STATUS_BODY`) and JSON is inspected, so a streamed or
+/// watch response (no exact size) is never buffered.
+fn status_body_is_recordable(resp: &Response) -> bool {
+    let json = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("json"));
+    json && axum::body::HttpBody::size_hint(resp.body())
+        .exact()
+        .is_some_and(|n| n <= MAX_STATUS_BODY as u64)
+}
+
 async fn record_status_body(ac: &AuditContext, resp: Response) -> Response {
     let (parts, body) = resp.into_parts();
     let bytes = axum::body::to_bytes(body, MAX_STATUS_BODY)
         .await
         .unwrap_or_default();
-    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+    // Cheap pre-check so a large non-Status object is never parsed.
+    let maybe_status = bytes.windows(8).any(|w| w == b"\"Status\"");
+    if let Some(v) = maybe_status
+        .then(|| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .flatten()
+    {
         if v.get("kind").and_then(|k| k.as_str()) == Some("Status") {
             let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
             if let Ok(mut g) = ac.inner.lock() {
@@ -1059,6 +1077,98 @@ rules:
         assert_eq!(rs.details.as_ref().unwrap()["name"], "s");
         let json = serde_json::to_value(rs).unwrap();
         assert_eq!(json["metadata"], serde_json::json!({}));
+    }
+
+    async fn run_status_app(route: axum::routing::MethodRouter) -> (Response, Vec<AuditEvent>) {
+        let cap = Arc::new(Capture(Default::default()));
+        let cfg = Arc::new(AuditConfig {
+            policy: Policy::from_yaml(&POLICY.replace("omitStages: [\"RequestReceived\"]\n", ""))
+                .unwrap(),
+            sink: cap.clone(),
+        });
+        let app = Router::new()
+            .route("/api/v1/namespaces/:ns/secrets/:name", route)
+            .layer(axum::middleware::from_fn(move |req, next| {
+                let cfg = cfg.clone();
+                async move { with_audit(cfg, req, next).await }
+            }));
+        let resp = app
+            .oneshot(
+                axum::http::Request::get("/api/v1/namespaces/ns/secrets/s")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let ev = cap.0.lock().await.clone();
+        (resp, ev)
+    }
+
+    /// `LogResponseObject` (audit/request.go) records the Status a handler
+    /// writes whatever its code: a delete's 200 `Success` Status is on the
+    /// event too, and the client still gets the body.
+    #[tokio::test]
+    async fn success_status_body_is_recorded() {
+        let (resp, ev) = run_status_app(get(|| async {
+            (
+                [("content-type", "application/json")],
+                r#"{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Success","details":{"name":"s","kind":"secrets","uid":"u1"},"code":200}"#,
+            )
+        }))
+        .await;
+        assert_eq!(resp.status(), 200);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("Success"));
+        let rs = ev[1].response_status.as_ref().unwrap();
+        assert_eq!(rs.code, 200);
+        assert_eq!(rs.status.as_deref(), Some("Success"));
+        assert_eq!(rs.details.as_ref().unwrap()["uid"], "u1");
+    }
+
+    /// A non-Status object leaves only the code (LogResponseObject sets
+    /// `ev.ResponseStatus = {Code}` for it).
+    #[tokio::test]
+    async fn non_status_success_body_records_only_the_code() {
+        let (_resp, ev) = run_status_app(get(|| async {
+            (
+                [("content-type", "application/json")],
+                r#"{"kind":"Secret","apiVersion":"v1","metadata":{"name":"s"}}"#,
+            )
+        }))
+        .await;
+        let rs = ev[1].response_status.as_ref().unwrap();
+        assert_eq!(rs.code, 200);
+        assert!(rs.status.is_none() && rs.details.is_none());
+    }
+
+    /// A streamed (watch-style) body must not be buffered: the first chunk
+    /// reaches the client while the stream is still open.
+    #[tokio::test]
+    async fn streamed_success_body_is_not_buffered() {
+        let (resp, _ev) = run_status_app(get(|| async {
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(1);
+            tx.send(Ok(b"{\"type\":\"ADDED\"}\n".to_vec()))
+                .await
+                .unwrap();
+            // Keep the stream open for the response's lifetime.
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                drop(tx);
+            });
+            (
+                [("content-type", "application/json")],
+                Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
+            )
+        }))
+        .await;
+        use futures::StreamExt;
+        let mut s = resp.into_body().into_data_stream();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), s.next())
+            .await
+            .expect("first chunk must arrive without waiting for stream end");
+        assert!(first.is_some());
     }
 
     #[tokio::test]
