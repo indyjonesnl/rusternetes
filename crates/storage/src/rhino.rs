@@ -31,6 +31,10 @@ pub struct RhinoStorage<B: Backend> {
     /// Optional in-process event bus. `Some` only in the all-in-one binary,
     /// where this process is the sole writer (#1039). `None` everywhere else.
     bus: Option<crate::EventBus>,
+    /// Per-key object sizes behind `Storage::stats` (stats.go
+    /// `resourceSizeEstimator`), fed by the reads and creates that already
+    /// hold the encoded value.
+    sizes: crate::size_estimator::SizeEstimator,
 }
 
 #[cfg(feature = "sqlite")]
@@ -60,6 +64,7 @@ impl RhinoStorage<SqliteBackend> {
         Ok(Self {
             backend: Arc::new(backend),
             bus: None,
+            sizes: Default::default(),
         })
     }
 }
@@ -88,6 +93,7 @@ impl RhinoStorage<RedisBackend> {
         Ok(Self {
             backend: Arc::new(backend),
             bus: None,
+            sizes: Default::default(),
         })
     }
 }
@@ -152,6 +158,8 @@ impl<B: Backend> RhinoStorage<B> {
 
         let mut results = Vec::with_capacity(kvs.len());
         for kv in kvs {
+            self.sizes
+                .update_key(&kv.key, kv.value.len(), kv.mod_revision);
             let json = String::from_utf8(kv.value)
                 .map_err(|e| Error::Storage(format!("Invalid UTF-8 in value: {}", e)))?;
             let json_with_rv = Self::inject_resource_version(&json, kv.mod_revision);
@@ -206,6 +214,7 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
         })?;
 
         debug!("Created resource at key: {}", key);
+        self.sizes.update_key(key, json.len(), mod_revision);
 
         let json_with_rv = Self::inject_resource_version(&json, mod_revision);
         self.publish(WatchEvent::Added(key.to_string(), json_with_rv.clone()));
@@ -224,6 +233,7 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
 
         match kv {
             Some(kv) => {
+                self.sizes.update_key(key, kv.value.len(), kv.mod_revision);
                 let json = String::from_utf8(kv.value)
                     .map_err(|e| Error::Storage(format!("Invalid UTF-8 in value: {}", e)))?;
                 let json_with_rv = Self::inject_resource_version(&json, kv.mod_revision);
@@ -283,6 +293,7 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
             }
 
             debug!("Updated resource at key: {}", key);
+            self.sizes.update_key(key, json.len(), rev);
             let json_with_rv = Self::inject_resource_version(&json, rev);
             self.publish(WatchEvent::Modified(key.to_string(), json_with_rv.clone()));
             serde_json::from_str(&json_with_rv).map_err(Error::Serialization)
@@ -333,6 +344,7 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
             }
 
             debug!("Updated resource at key: {}", key);
+            self.sizes.update_key(key, json.len(), new_rev);
             let json_with_rv = Self::inject_resource_version(&json, new_rev);
             self.publish(WatchEvent::Modified(key.to_string(), json_with_rv.clone()));
             serde_json::from_str(&json_with_rv).map_err(Error::Serialization)
@@ -389,6 +401,7 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
         }
 
         debug!("Deleted resource at key: {}", key);
+        self.sizes.delete_key(key, del_rev);
         // Guarded so the prev-value reconstruction (utf8 + RV inject) is skipped
         // entirely when no bus is attached — keep the guard, don't simplify to a
         // bare `self.publish(...)` which would do that work unconditionally.
@@ -413,6 +426,18 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
         T: Serialize + DeserializeOwned + Send + Sync,
     {
         self.list_inner(prefix, 0).await
+    }
+
+    /// `storage/etcd3/stats.go` `resourceSizeEstimator.Stats`: a keys-only
+    /// read for the count, the average size from the per-key cache.
+    async fn stats(&self, prefix: &str) -> Result<crate::ResourceStats> {
+        let (_rev, kvs) = retry_busy(RetryPolicy::default(), || {
+            self.backend.list(prefix, "", 0, 0, true)
+        })
+        .await
+        .map_err(|e| map_backend_error(prefix, "stats", "list keys", &e))?;
+        let keys: Vec<String> = kvs.into_iter().map(|kv| kv.key).collect();
+        Ok(self.sizes.stats(prefix, &keys))
     }
 
     // Paged lists pin every continuation to the first page's revision
@@ -688,6 +713,7 @@ mod busy_read_tests {
         RhinoStorage {
             backend: Arc::new(Flaky::new(locked)),
             bus: None,
+            sizes: Default::default(),
         }
     }
 
@@ -847,10 +873,27 @@ mod stats_tests {
     }
 
     #[tokio::test]
+    async fn stats_average_size_comes_from_what_a_list_already_read() {
+        let s = RhinoStorage {
+            backend: Arc::new(Recording::default()),
+            bus: None,
+            sizes: Default::default(),
+        };
+        let _: Vec<serde_json::Value> = Storage::list(&s, "/registry/pods/").await.unwrap();
+        let st = Storage::stats(&s, "/registry/pods/").await.unwrap();
+        assert_eq!(st.object_count, 2);
+        assert_eq!(
+            st.estimated_average_object_size_bytes,
+            br#"{"metadata":{"name":"a"}}"#.len() as i64
+        );
+    }
+
+    #[tokio::test]
     async fn stats_reads_keys_only_and_never_the_values() {
         let s = RhinoStorage {
             backend: Arc::new(Recording::default()),
             bus: None,
+            sizes: Default::default(),
         };
         let st = Storage::stats(&s, "/registry/pods/").await.unwrap();
         assert_eq!(st.object_count, 2);

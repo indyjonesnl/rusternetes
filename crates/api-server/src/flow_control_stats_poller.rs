@@ -74,19 +74,62 @@ fn group_resource(group: &str, resource: &str) -> String {
 pub async fn poll_once<S: Storage>(storage: &S, tracker: &ObjectCountTracker) {
     for (group, resource) in OBSERVED_RESOURCES {
         let prefix = rusternetes_storage::build_prefix(resource, None);
-        match storage.stats(&prefix).await {
-            Ok(st) => tracker.set(
-                &group_resource(group, resource),
-                Stats {
-                    object_count: st.object_count,
-                    estimated_average_object_size_bytes: st.estimated_average_object_size_bytes,
-                },
-            ),
-            Err(e) => {
-                tracing::debug!(resource, error = %e, "Failed to update storage count metric");
-            }
+        observe(storage, tracker, group, resource, &prefix).await;
+    }
+    for (group, plural) in registered_custom_resources(storage).await {
+        // The storage type of `handlers/custom_resource.rs`.
+        let resource_type = format!("{}_{}", group.replace('.', "_"), plural);
+        let prefix = rusternetes_storage::build_prefix(&resource_type, None);
+        observe(storage, tracker, &group, &plural, &prefix).await;
+    }
+}
+
+/// The `Stats` call and `Set` of the `JitterUntil` closure, store.go:1668-1678.
+async fn observe<S: Storage>(
+    storage: &S,
+    tracker: &ObjectCountTracker,
+    group: &str,
+    resource: &str,
+    prefix: &str,
+) {
+    match storage.stats(prefix).await {
+        Ok(st) => tracker.set(
+            &group_resource(group, resource),
+            Stats {
+                object_count: st.object_count,
+                estimated_average_object_size_bytes: st.estimated_average_object_size_bytes,
+            },
+        ),
+        Err(e) => {
+            tracing::debug!(resource, error = %e, "Failed to update storage count metric");
         }
     }
+}
+
+/// `(spec.group, spec.names.plural)` of every registered CRD. Upstream gives
+/// each CRD version its own `genericregistry.Store`
+/// (`apiextensions-apiserver/pkg/apiserver/customresource_handler.go:855`
+/// `customresource.NewStorage`), and every Store starts its own observer
+/// (`store.go:1638` `startObservingCount`), so custom
+/// resources are counted exactly like built-ins. This server has no store
+/// registry; the registered CRDs are read each poll, which also stops
+/// observing a CRD once it is deleted (upstream's `destroy`).
+async fn registered_custom_resources<S: Storage>(storage: &S) -> Vec<(String, String)> {
+    let prefix = rusternetes_storage::build_prefix("customresourcedefinitions", None);
+    let crds: Vec<serde_json::Value> = match storage.list(&prefix).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(error = %e, "Failed to list CRDs for the object count poller");
+            return Vec::new();
+        }
+    };
+    crds.iter()
+        .filter_map(|crd| {
+            let group = crd.pointer("/spec/group")?.as_str()?;
+            let plural = crd.pointer("/spec/names/plural")?.as_str()?;
+            Some((group.to_string(), plural.to_string()))
+        })
+        .collect()
 }
 
 /// `CountMetricPollPeriod` default (server/options/etcd.go:87).
