@@ -408,6 +408,42 @@ pub fn api_services_to_register(
     api_services
 }
 
+/// `makeAPIServiceAvailableHealthCheck` (aggregator.go:266-301): the
+/// `autoregister-completion` boot-sequence check, failing with
+/// `missing APIService: [..]` until every registered APIService was seen Available.
+pub struct APIServiceAvailableCheck {
+    pending: std::sync::Arc<Mutex<BTreeSet<String>>>,
+}
+
+impl APIServiceAvailableCheck {
+    pub fn new(api_services: &[APIService]) -> Self {
+        let _ = api_services;
+        todo!()
+    }
+    /// `handleAPIServiceChange`.
+    pub fn handle_api_service_change(&self, service: &APIService) {
+        let _ = service;
+        todo!()
+    }
+    pub fn check(&self) -> Result<(), String> {
+        todo!()
+    }
+}
+
+/// Name of the boot-sequence check (aggregator.go:~196).
+pub const AUTOREGISTER_COMPLETION_CHECK: &str = "autoregister-completion";
+/// Name of the post-start hook (aggregator.go:~170).
+pub const AUTOREGISTRATION_HOOK: &str = "kube-apiserver-autoregistration";
+
+/// The `kube-apiserver-autoregistration` hook body + boot check, over `storage`.
+pub fn spawn_autoregistration<S: Storage + 'static>(
+    storage: std::sync::Arc<S>,
+    listed_paths: Vec<String>,
+) -> tokio::task::JoinHandle<()> {
+    let _ = (storage, listed_paths);
+    todo!()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,6 +536,58 @@ mod tests {
         assert_eq!(core.spec.group_priority_minimum, 18000);
         assert_eq!(core.spec.version_priority, 1);
         assert!(ctl.get_api_service_to_sync("v1.example.com").is_none());
+    }
+
+    fn available(mut s: APIService, status: &str) -> APIService {
+        s.status
+            .conditions
+            .push(rusternetes_common::resources::APIServiceCondition {
+                type_: "Available".to_string(),
+                status: status.to_string(),
+                ..Default::default()
+            });
+        s
+    }
+
+    // makeAPIServiceAvailableHealthCheck: pending until each is seen Available.
+    #[test]
+    fn completion_check_pending_until_all_available() {
+        let a = make_api_service("apps", "v1").unwrap();
+        let b = make_api_service("", "v1").unwrap();
+        let chk = APIServiceAvailableCheck::new(&[a.clone(), b.clone()]);
+        assert_eq!(
+            chk.check().unwrap_err(),
+            "missing APIService: [v1. v1.apps]"
+        );
+        chk.handle_api_service_change(&available(a.clone(), "False"));
+        assert!(chk.check().is_err(), "Available=False does not count");
+        chk.handle_api_service_change(&available(plain("zzz"), "True"));
+        assert!(chk.check().is_err(), "unrelated APIService ignored");
+        chk.handle_api_service_change(&available(a, "True"));
+        assert_eq!(chk.check().unwrap_err(), "missing APIService: [v1.]");
+        chk.handle_api_service_change(&available(b, "True"));
+        assert!(chk.check().is_ok());
+    }
+
+    // The hook creates every delegate path's APIService as `onstart`-managed.
+    #[tokio::test]
+    async fn autoregistration_hook_seeds_listed_apiservices() {
+        let storage = std::sync::Arc::new(rusternetes_storage::MemoryStorage::new());
+        let paths = vec!["/api/v1".to_string(), "/apis/apps/v1".to_string()];
+        let h = spawn_autoregistration(storage.clone(), paths);
+        let client = StorageAPIServiceClient(storage.clone());
+        let mut got = None;
+        for _ in 0..50 {
+            if let Ok(Some(a)) = client.get("v1.apps").await {
+                got = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let a = got.expect("v1.apps seeded");
+        assert_eq!(automanaged_type(Some(&a)), "onstart");
+        assert!(client.get("v1.").await.unwrap().is_some());
+        h.abort();
     }
 
     #[derive(Clone, Copy)]

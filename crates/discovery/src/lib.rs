@@ -931,6 +931,13 @@ fn get_api_group_names() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+/// The delegate's `ListedPaths` for autoregistration (aggregator.go:354-387
+/// `apiServicesToRegister` input): `/api/v1` plus `/apis/<group>/<version>`
+/// for every group-version this server serves.
+pub fn delegate_listed_paths() -> Vec<String> {
+    todo!()
+}
+
 /// The resource a built-in kind is served as at `group/version`: a port of
 /// `discoveryResourceResolver.Resolve`
 /// (pkg/registry/admissionregistration/resolver/resolver.go:36-60) over the
@@ -4293,6 +4300,26 @@ pub async fn get_apiregistration_v1_resources() -> (StatusCode, Json<APIResource
     };
 
     (StatusCode::OK, Json(resource_list))
+}
+
+#[cfg(test)]
+mod listed_paths_tests {
+    use super::*;
+
+    #[test]
+    fn listed_paths_cover_core_and_every_served_group_version() {
+        let paths = delegate_listed_paths();
+        assert!(paths.contains(&"/api/v1".to_string()));
+        assert!(paths.contains(&"/apis/apps/v1".to_string()));
+        assert!(paths.contains(&"/apis/apiregistration.k8s.io/v1".to_string()));
+        for (g, _) in get_api_group_names() {
+            assert!(paths.iter().any(|p| p.starts_with(&format!("/apis/{g}/"))), "{g}");
+        }
+        let mut dedup = paths.clone();
+        dedup.sort();
+        dedup.dedup();
+        assert_eq!(dedup.len(), paths.len(), "no duplicate paths");
+    }
 }
 
 #[cfg(test)]
