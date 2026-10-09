@@ -112,6 +112,7 @@ COPY rusternetes/crates/rusternetes/Cargo.toml        ./rusternetes/crates/ruste
 COPY rusternetes/crates/scheduler/Cargo.toml          ./rusternetes/crates/scheduler/Cargo.toml
 COPY rusternetes/crates/storage/Cargo.toml            ./rusternetes/crates/storage/Cargo.toml
 COPY rusternetes/crates/streamproxy/Cargo.toml        ./rusternetes/crates/streamproxy/Cargo.toml
+COPY rusternetes/crates/csi/Cargo.toml        ./rusternetes/crates/csi/Cargo.toml
 COPY rusternetes/crates/test_support/Cargo.toml       ./rusternetes/crates/test_support/Cargo.toml
 
 # build.rs + proto/. api-server has both; common has a build.rs that stamps
@@ -126,6 +127,8 @@ COPY rusternetes/crates/cri/build.rs        ./rusternetes/crates/cri/build.rs
 COPY rusternetes/crates/cri/proto           ./rusternetes/crates/cri/proto
 # kubelet/build.rs runs tonic-build over the CSI v1 proto (#2313); without both
 # in Pass-1 the generated `proto` module is empty and kubelet fails to compile.
+COPY rusternetes/crates/csi/build.rs     ./rusternetes/crates/csi/build.rs
+COPY rusternetes/crates/csi/proto        ./rusternetes/crates/csi/proto
 COPY rusternetes/crates/kubelet/build.rs     ./rusternetes/crates/kubelet/build.rs
 COPY rusternetes/crates/kubelet/proto        ./rusternetes/crates/kubelet/proto
 
@@ -137,7 +140,7 @@ COPY rusternetes/crates/kubelet/proto        ./rusternetes/crates/kubelet/proto
 #                 kube-proxy, scheduler
 RUN set -eux; \
     cd /build/rusternetes; \
-    for c in client common storage cloud-providers protobuf middleware admission-webhook discovery cri streamproxy test_support; do \
+    for c in client common storage cloud-providers protobuf middleware admission-webhook discovery cri streamproxy csi test_support; do \
         mkdir -p crates/$c/src && : > crates/$c/src/lib.rs; \
     done; \
     for c in kubectl rusternetes; do \
@@ -193,6 +196,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         -p rusternetes-scheduler \
         -p rusternetes-storage \
         -p rusternetes-streamproxy \
+        -p rusternetes-csi \
  && sccache --show-stats
 
 # ----- PASS 2: real source compile -----
@@ -223,6 +227,7 @@ COPY rusternetes/crates/scheduler/src            ./crates/scheduler/src
 COPY rusternetes/crates/scheduler/tests          ./crates/scheduler/tests
 COPY rusternetes/crates/storage/src              ./crates/storage/src
 COPY rusternetes/crates/streamproxy/src          ./crates/streamproxy/src
+COPY rusternetes/crates/csi/src          ./crates/csi/src
 
 # Git SHA for the version banner. `.git` is excluded from the build context,
 # so the SHA is injected as a build-arg (compose passes ${RUSTERNETES_GIT_SHA});

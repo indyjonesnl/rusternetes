@@ -17,11 +17,10 @@ use std::time::Duration;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
-/// Generated from `proto/csi/v1/csi.proto` (package `csi.v1`).
-#[allow(clippy::result_large_err, clippy::large_enum_variant)]
-pub mod proto {
-    tonic::include_proto!("csi.v1");
-}
+pub(crate) use rusternetes_csi::normalize_endpoint;
+/// The generated `csi.v1` proto lives in the shared `rusternetes-csi` crate
+/// (the controller-manager's provisioner uses it too).
+pub use rusternetes_csi::proto;
 
 use proto::node_client::NodeClient;
 use proto::node_service_capability::rpc::Type as NodeRpcType;
@@ -508,18 +507,6 @@ impl CsiDriverClient {
         .map(|_| ())
         .map_err(|s| CsiError::Failed(s.to_string()))
     }
-}
-
-/// Strip a `unix://` (or `unix:`) scheme, leaving the socket path. The
-/// registered endpoint is a path (`csi_plugin.go:118`) but plugin-registration
-/// hands over `unix://` forms in some deployments.
-pub(crate) fn normalize_endpoint(endpoint: &std::path::Path) -> PathBuf {
-    let s = endpoint.to_string_lossy();
-    let trimmed = s
-        .strip_prefix("unix://")
-        .or_else(|| s.strip_prefix("unix:"))
-        .unwrap_or(&s);
-    PathBuf::from(trimmed)
 }
 
 #[cfg(test)]

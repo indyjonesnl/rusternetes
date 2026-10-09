@@ -29,6 +29,7 @@ prometheus.workspace = true
 rusternetes-storage = { path = "../storage", features = ["api-client"] }
 rusternetes-client = { path = "../client" }
 rusternetes-cri = { path = "../cri" }
+rusternetes-csi = { path = "../csi" }
 rusternetes-streamproxy = { path = "../streamproxy" }
 thiserror.workspace = true
 uuid.workspace = true

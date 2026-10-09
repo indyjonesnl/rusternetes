@@ -16,7 +16,7 @@
 //! Scope: the wire client only. The provisioning loop (PVC -> request,
 //! capacity re-check, orphan cleanup) is separate work.
 
-use super::csi_client::{normalize_endpoint, proto};
+use crate::{normalize_endpoint, proto};
 use hyper_util::rt::TokioIo;
 use proto::controller_client::ControllerClient;
 use proto::controller_service_capability::rpc::Type as ControllerRpc;

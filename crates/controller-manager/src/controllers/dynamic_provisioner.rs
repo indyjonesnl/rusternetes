@@ -1,13 +1,14 @@
 use anyhow::{Context, Result};
+use rusternetes_common::resources::service_account::ObjectReference;
 use rusternetes_common::resources::volume::{
     HostPathType, HostPathVolumeSource, PersistentVolumePhase, PersistentVolumeReclaimPolicy,
 };
 use rusternetes_common::resources::{
-    PersistentVolume, PersistentVolumeClaim, PersistentVolumeStatus, StorageClass, VolumeSnapshot,
-    VolumeSnapshotContent,
+    EventSource, EventType, PersistentVolume, PersistentVolumeClaim, PersistentVolumeStatus,
+    StorageClass, VolumeSnapshot, VolumeSnapshotContent,
 };
 use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
+use rusternetes_storage::{build_key, extract_key, EventRecorder, Storage, WorkQueue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,11 +17,98 @@ use tracing::{debug, error, info, warn};
 
 pub struct DynamicProvisionerController<S: Storage> {
     storage: Arc<S>,
+    recorder: EventRecorder<S>,
 }
 
 impl<S: Storage + 'static> DynamicProvisionerController<S> {
     pub fn new(storage: Arc<S>) -> Self {
-        Self { storage }
+        Self {
+            recorder: EventRecorder::new(Arc::clone(&storage)),
+            storage,
+        }
+    }
+
+    /// `provisionClaimOperationExternal` (`pv_controller.go:1822-1861`) with
+    /// `setClaimProvisioner` (`pv_controller_base.go:638-661`): "Add
+    /// provisioner annotation so external provisioners know when to start",
+    /// then report `ExternalProvisioning` and wait for the external
+    /// provisioner. CSI migration (`IsMigrationEnabledForPlugin`) is not
+    /// modelled: no in-tree plugin is migrated here.
+    async fn provision_claim_external(
+        &self,
+        pvc: &PersistentVolumeClaim,
+        provisioner: &str,
+    ) -> Result<()> {
+        let namespace = pvc.metadata.namespace.as_deref().unwrap_or("default");
+        let involved = ObjectReference {
+            kind: Some("PersistentVolumeClaim".to_string()),
+            namespace: Some(namespace.to_string()),
+            name: Some(pvc.metadata.name.clone()),
+            uid: Some(pvc.metadata.uid.clone()),
+            api_version: Some("v1".to_string()),
+            resource_version: pvc.metadata.resource_version.clone(),
+            field_path: None,
+        };
+        let source = EventSource {
+            component: "persistentvolume-controller".to_string(),
+            host: None,
+        };
+        let already_set = pvc
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get("volume.kubernetes.io/storage-provisioner"))
+            .is_some_and(|v| v == provisioner);
+        if !already_set {
+            let mut claim = pvc.clone();
+            let ann = claim.metadata.annotations.get_or_insert_with(HashMap::new);
+            ann.insert(
+                "volume.beta.kubernetes.io/storage-provisioner".to_string(),
+                provisioner.to_string(),
+            );
+            ann.insert(
+                "volume.kubernetes.io/storage-provisioner".to_string(),
+                provisioner.to_string(),
+            );
+            let key = build_key(
+                "persistentvolumeclaims",
+                Some(namespace),
+                &pvc.metadata.name,
+            );
+            if let Err(e) = self.storage.update(&key, &claim).await {
+                let msg = format!("Error saving claim: {e}");
+                let _ = self
+                    .recorder
+                    .event(
+                        &involved,
+                        &source,
+                        EventType::Warning,
+                        "ProvisioningFailed",
+                        &msg,
+                    )
+                    .await;
+                return Err(e.into());
+            }
+        }
+        let msg = format!(
+            "Waiting for a volume to be created either by the external provisioner '{provisioner}' \
+             or manually by the system administrator. If volume creation is delayed, please verify that \
+             the provisioner is running and correctly registered."
+        );
+        if let Err(e) = self
+            .recorder
+            .event(
+                &involved,
+                &source,
+                EventType::Normal,
+                "ExternalProvisioning",
+                &msg,
+            )
+            .await
+        {
+            warn!("Failed to record ExternalProvisioning event: {e}");
+        }
+        Ok(())
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
@@ -191,6 +279,15 @@ impl<S: Storage + 'static> DynamicProvisionerController<S> {
 
         // Check if provisioner is supported
         if !self.is_provisioner_supported(&storage_class.provisioner) {
+            // `findProvisionablePlugin` (pv_controller.go:1941-1947): a class
+            // outside `kubernetes.io/` that no in-tree plugin handles is an
+            // external provisioner's: "External provisioner is requested, do
+            // not report error".
+            if !storage_class.provisioner.starts_with("kubernetes.io/") {
+                return self
+                    .provision_claim_external(pvc, &storage_class.provisioner)
+                    .await;
+            }
             warn!(
                 "Provisioner {} is not supported. Skipping PVC {}/{}",
                 storage_class.provisioner, namespace, pvc_name

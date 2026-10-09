@@ -19,6 +19,9 @@ rusternetes-common = { path = "../common" }
 # api-client: StorageBackend::Api + the ApiStorage adapter used by run_with_api.
 rusternetes-storage = { path = "../storage", features = ["api-client"] }
 rusternetes-client = { path = "../client" }
+rusternetes-csi = { path = "../csi" }
+# gRPC status codes for the CSI provisioner (`isInfeasibleError`).
+tonic.workspace = true
 rusternetes-cloud-providers = { path = "../cloud-providers", optional = true }
 tokio.workspace = true
 fnv = "1.0"
@@ -47,6 +50,8 @@ reqwest = { workspace = true }
 rustls = { workspace = true }
 
 [dev-dependencies]
+tempfile = "3"
+tokio-stream = { version = "0.1", features = ["net"] }
 serial_test = { workspace = true }
 x509-parser = { workspace = true }
 # Stateful fake MetricsClient in hpa_controller_test (changing readings across

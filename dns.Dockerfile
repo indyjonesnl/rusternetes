@@ -84,6 +84,7 @@ COPY crates/rusternetes/Cargo.toml        crates/rusternetes/Cargo.toml
 COPY crates/scheduler/Cargo.toml          crates/scheduler/Cargo.toml
 COPY crates/storage/Cargo.toml            crates/storage/Cargo.toml
 COPY crates/streamproxy/Cargo.toml        crates/streamproxy/Cargo.toml
+COPY crates/csi/Cargo.toml        crates/csi/Cargo.toml
 COPY crates/test_support/Cargo.toml       crates/test_support/Cargo.toml
 
 COPY crates/api-server/build.rs crates/api-server/build.rs
@@ -92,6 +93,8 @@ COPY crates/cri/build.rs        crates/cri/build.rs
 COPY crates/cri/proto           crates/cri/proto
 # kubelet/build.rs runs tonic-build over the CSI v1 proto (#2313); without both
 # in Pass-1 the generated `proto` module is empty and kubelet fails to compile.
+COPY crates/csi/build.rs     crates/csi/build.rs
+COPY crates/csi/proto        crates/csi/proto
 COPY crates/kubelet/build.rs     crates/kubelet/build.rs
 COPY crates/kubelet/proto        crates/kubelet/proto
 COPY crates/common/build.rs     crates/common/build.rs
@@ -99,7 +102,7 @@ COPY crates/common/build.rs     crates/common/build.rs
 # Dummy sources so `cargo build` can resolve the workspace before the
 # real source COPY further down.
 RUN set -eux; \
-    for c in client common storage cloud-providers streamproxy test_support; do \
+    for c in client common storage cloud-providers streamproxy csi test_support; do \
         mkdir -p crates/$c/src && : > crates/$c/src/lib.rs; \
     done; \
     for c in kubectl rusternetes; do \
