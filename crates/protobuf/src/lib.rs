@@ -36,6 +36,11 @@ const WIRE_32BIT: u8 = 5;
 /// decodes. Fields whose tag lacks `omitempty` (containerPort, exitCode, ...)
 /// are always present in JSON, so they stay.
 const PLAIN_ZERO_SCALARS: &[(&str, &[&str])] = &[
+    // `ObjectMeta.Generation int64 json:"generation,omitempty"`
+    // (apimachinery meta/v1 types.go); the marshaller writes it unconditionally
+    // (generated.pb.go `ObjectMeta.MarshalToSizedBuffer`). The string fields
+    // are already dropped when empty by the string decoder (#2929).
+    ("ObjectMeta", &["generation"]),
     ("Container", &["stdin", "stdinOnce", "tty"]),
     ("EphemeralContainerCommon", &["stdin", "stdinOnce", "tty"]),
     ("PodSpec", &["hostNetwork", "hostPID", "hostIPC"]),

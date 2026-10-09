@@ -69,3 +69,42 @@ fn volume_mount_and_port_plain_scalars() {
         serde_json::json!({})
     );
 }
+
+/// #2929: Go's generated `ObjectMeta.MarshalToSizedBuffer` writes `name`,
+/// `generateName`, `namespace`, `uid`, `resourceVersion` and `generation`
+/// unconditionally (k8s.io/apimachinery/pkg/apis/meta/v1/generated.pb.go), but
+/// their JSON tags are `omitempty`, so the decoder must emit the JSON form:
+/// nothing.
+#[test]
+fn object_meta_go_zero_scalars_decode_absent() {
+    let v = decode(
+        "ObjectMeta",
+        &[
+            0x0a, 0x00, // name(1)=""
+            0x12, 0x00, // generateName(2)=""
+            0x1a, 0x00, // namespace(3)=""
+            0x2a, 0x00, // uid(5)=""
+            0x32, 0x00, // resourceVersion(6)=""
+            0x38, 0x00, // generation(7)=0
+        ],
+    );
+    let obj = v.as_object().unwrap();
+    for k in [
+        "name",
+        "generateName",
+        "namespace",
+        "uid",
+        "resourceVersion",
+        "generation",
+    ] {
+        assert!(!obj.contains_key(k), "{k} must be absent: {v}");
+    }
+}
+
+#[test]
+fn object_meta_non_zero_scalars_are_kept() {
+    // name(1)="a", generation(7)=3
+    let v = decode("ObjectMeta", &[0x0a, 0x01, b'a', 0x38, 0x03]);
+    assert_eq!(v["name"], "a");
+    assert_eq!(v["generation"], 3);
+}
