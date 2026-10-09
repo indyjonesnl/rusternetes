@@ -513,7 +513,7 @@ impl CsiDriverClient {
 /// Strip a `unix://` (or `unix:`) scheme, leaving the socket path. The
 /// registered endpoint is a path (`csi_plugin.go:118`) but plugin-registration
 /// hands over `unix://` forms in some deployments.
-fn normalize_endpoint(endpoint: &std::path::Path) -> PathBuf {
+pub(crate) fn normalize_endpoint(endpoint: &std::path::Path) -> PathBuf {
     let s = endpoint.to_string_lossy();
     let trimmed = s
         .strip_prefix("unix://")
