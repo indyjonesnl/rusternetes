@@ -59,18 +59,12 @@ impl VolumePlugin for LocalPlugin {
     }
 
     /// `NewMounter` (`local.go:138-169`).
-    async fn new_mounter(&self, spec: &Spec<'_>, pod: &Pod) -> Result<Box<dyn Mounter>> {
+    async fn new_mounter(&self, spec: &Spec<'_>, _pod: &Pod) -> Result<Box<dyn Mounter>> {
         let path = local_path(spec)
             .ok_or_else(|| anyhow!("local plugin got a spec with no local source"))?;
         Ok(Box::new(LocalMounter {
             path: path.to_string(),
             read_only: spec.read_only,
-            fs_group: crate::volume_plugins::util::fs_group_from(pod),
-            fs_group_change_policy: pod
-                .spec
-                .as_ref()
-                .and_then(|s| s.security_context.as_ref())
-                .and_then(|sc| sc.fs_group_change_policy.clone()),
         }))
     }
 
@@ -99,8 +93,6 @@ impl VolumePlugin for LocalPlugin {
 struct LocalMounter {
     path: String,
     read_only: bool,
-    fs_group: Option<i64>,
-    fs_group_change_policy: Option<String>,
 }
 
 #[async_trait]
@@ -119,7 +111,7 @@ impl Mounter for LocalMounter {
     }
 
     /// `SetUpAt` (`local.go:529-626`).
-    async fn set_up_at(&self, dir: &str, _args: &crate::volume_plugins::MounterArgs) -> Result<()> {
+    async fn set_up_at(&self, dir: &str, args: &crate::volume_plugins::MounterArgs) -> Result<()> {
         if dir.is_empty() {
             return Err(anyhow!("LocalVolume volume path is empty"));
         }
@@ -133,8 +125,8 @@ impl Mounter for LocalMounter {
         if !self.read_only {
             let (root, fs_group, policy) = (
                 dir.to_string(),
-                self.fs_group,
-                self.fs_group_change_policy.clone(),
+                args.fs_group,
+                args.fs_group_change_policy.clone(),
             );
             tokio::task::spawn_blocking(move || {
                 crate::volume_ownership::set_volume_ownership_with_policy(
@@ -204,6 +196,20 @@ mod tests {
         .unwrap()
     }
 
+    /// The args the operation generator builds from the pod
+    /// (`operation_generator.go:582-589`).
+    fn args_for(pod: &Pod) -> crate::volume_plugins::MounterArgs {
+        crate::volume_plugins::MounterArgs {
+            fs_group: crate::volume_plugins::util::fs_group_from(pod),
+            fs_group_change_policy: pod
+                .spec
+                .as_ref()
+                .and_then(|s| s.security_context.as_ref())
+                .and_then(|sc| sc.fs_group_change_policy.clone()),
+            ..Default::default()
+        }
+    }
+
     fn tmp(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("local-plugin-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -251,7 +257,7 @@ mod tests {
             read_only: false,
         };
         let m = plugin().new_mounter(&s, &pod(gid, None)).await.unwrap();
-        m.set_up().await.unwrap();
+        m.set_up_with(&args_for(&pod(gid, None))).await.unwrap();
         assert_eq!(mode(&f), 0o660);
         assert_eq!(mode(&d) & 0o2000, 0o2000);
     }
@@ -272,7 +278,7 @@ mod tests {
             read_only: true,
         };
         let m = plugin().new_mounter(&s, &pod(gid, None)).await.unwrap();
-        m.set_up().await.unwrap();
+        m.set_up_with(&args_for(&pod(gid, None))).await.unwrap();
         assert_eq!(mode(&f), 0o400);
     }
 
@@ -298,13 +304,99 @@ mod tests {
             .new_mounter(&s, &pod(gid, Some("OnRootMismatch")))
             .await
             .unwrap();
-        m.set_up().await.unwrap();
+        m.set_up_with(&args_for(&pod(gid, Some("OnRootMismatch"))))
+            .await
+            .unwrap();
         assert_eq!(mode(&f), 0o600, "OnRootMismatch + matching root: no walk");
         let m = plugin()
             .new_mounter(&s, &pod(gid, Some("Always")))
             .await
             .unwrap();
+        m.set_up_with(&args_for(&pod(gid, Some("Always"))))
+            .await
+            .unwrap();
+        assert_eq!(mode(&f), 0o660, "Always walks");
+    }
+
+    fn bare_pod() -> Pod {
+        serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "u"},
+            "spec": {"containers": []}
+        }))
+        .unwrap()
+    }
+
+    /// `SetUpAt` reads `mounterArgs.FsGroup` (`local.go:620-624`), never the
+    /// pod: `operation_generator.go:582-589` is the only place the pod's
+    /// fsGroup reaches a mounter (#2900).
+    #[tokio::test]
+    async fn set_up_reads_fs_group_from_mounter_args_not_the_pod() {
+        let d = tmp("args-fsgroup");
+        let f = d.join("f");
+        std::fs::write(&f, b"x").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let gid = std::fs::metadata(&d).unwrap().gid() as i64;
+        let v = claimed();
+        let pv = pv_local(d.to_str().unwrap());
+        let s = Spec {
+            volume: &v,
+            persistent_volume: Some(&pv),
+            read_only: false,
+        };
+        // Pod has no fsGroup; the args do.
+        let m = plugin().new_mounter(&s, &bare_pod()).await.unwrap();
+        m.set_up_with(&crate::volume_plugins::MounterArgs {
+            fs_group: Some(gid),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(mode(&f), 0o660);
+        // Pod has an fsGroup; empty args must not apply it.
+        let f2 = d.join("g");
+        std::fs::write(&f2, b"x").unwrap();
+        std::fs::set_permissions(&f2, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let m = plugin().new_mounter(&s, &pod(gid, None)).await.unwrap();
         m.set_up().await.unwrap();
+        assert_eq!(
+            mode(&f2),
+            0o400,
+            "pod fsGroup must not leak past MounterArgs"
+        );
+    }
+
+    /// `mounterArgs.FSGroupChangePolicy` (`local.go:621`) comes from the args.
+    #[tokio::test]
+    async fn set_up_reads_change_policy_from_mounter_args() {
+        let d = tmp("args-policy");
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o2770)).unwrap();
+        let f = d.join("f");
+        std::fs::write(&f, b"x").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let gid = std::fs::metadata(&d).unwrap().gid() as i64;
+        let v = claimed();
+        let pv = pv_local(d.to_str().unwrap());
+        let s = Spec {
+            volume: &v,
+            persistent_volume: Some(&pv),
+            read_only: false,
+        };
+        let m = plugin().new_mounter(&s, &bare_pod()).await.unwrap();
+        m.set_up_with(&crate::volume_plugins::MounterArgs {
+            fs_group: Some(gid),
+            fs_group_change_policy: Some("OnRootMismatch".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(mode(&f), 0o600, "OnRootMismatch + matching root: no walk");
+        m.set_up_with(&crate::volume_plugins::MounterArgs {
+            fs_group: Some(gid),
+            fs_group_change_policy: Some("Always".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
         assert_eq!(mode(&f), 0o660, "Always walks");
     }
 }
