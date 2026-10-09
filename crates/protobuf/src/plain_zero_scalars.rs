@@ -313,3 +313,301 @@ pub const PLAIN_ZERO_SCALARS: &[(&str, &[&str])] = &[
         &["readOnly"],
     ),
 ];
+
+/// Pointer-to-string (`*string`, `*StringAlias`) fields upstream, by message
+/// name, sorted by name. An explicit empty value is real for these (#2952).
+#[rustfmt::skip]
+pub const POINTER_STRINGS: &[(&str, &[&str])] = &[
+    (
+        "AdmissionResponse",
+        &["patchType"],
+    ),
+    (
+        "AllocatedDeviceStatus",
+        &["shareID"],
+    ),
+    (
+        "AppArmorProfile",
+        &["localhostProfile"],
+    ),
+    (
+        "AzureDiskVolumeSource",
+        &["cachingMode", "fsType", "kind"],
+    ),
+    (
+        "AzureFilePersistentVolumeSource",
+        &["secretNamespace"],
+    ),
+    (
+        "CSIDriverSpec",
+        &["fsGroupPolicy"],
+    ),
+    (
+        "CSIVolumeSource",
+        &["fsType"],
+    ),
+    (
+        "ClusterTrustBundleProjection",
+        &["name", "signerName"],
+    ),
+    (
+        "Container",
+        &["restartPolicy"],
+    ),
+    (
+        "ContainerStatus",
+        &["stopSignal"],
+    ),
+    (
+        "CronJobSpec",
+        &["timeZone"],
+    ),
+    (
+        "CustomResourceDefinitionVersion",
+        &["deprecationWarning"],
+    ),
+    (
+        "CustomResourceSubresourceScale",
+        &["labelSelectorPath"],
+    ),
+    (
+        "DeleteOptions",
+        &["propagationPolicy"],
+    ),
+    (
+        "Device",
+        &["nodeName"],
+    ),
+    (
+        "DeviceAttribute",
+        &["string", "version"],
+    ),
+    (
+        "DeviceClassSpec",
+        &["extendedResourceName"],
+    ),
+    (
+        "DeviceConstraint",
+        &["distinctAttribute", "matchAttribute"],
+    ),
+    (
+        "Endpoint",
+        &["hostname", "nodeName", "zone"],
+    ),
+    (
+        "EndpointAddress",
+        &["nodeName"],
+    ),
+    (
+        "EndpointPort",
+        &["appProtocol"],
+    ),
+    (
+        "EphemeralContainerCommon",
+        &["restartPolicy"],
+    ),
+    (
+        "GRPCAction",
+        &["service"],
+    ),
+    (
+        "GlusterfsPersistentVolumeSource",
+        &["endpointsNamespace"],
+    ),
+    (
+        "HPAScalingRules",
+        &["selectPolicy"],
+    ),
+    (
+        "HTTPIngressPath",
+        &["pathType"],
+    ),
+    (
+        "HostPathVolumeSource",
+        &["type"],
+    ),
+    (
+        "ISCSIPersistentVolumeSource",
+        &["initiatorName"],
+    ),
+    (
+        "ISCSIVolumeSource",
+        &["initiatorName"],
+    ),
+    (
+        "IngressClassParametersReference",
+        &["apiGroup", "namespace", "scope"],
+    ),
+    (
+        "IngressPortStatus",
+        &["error"],
+    ),
+    (
+        "IngressSpec",
+        &["ingressClassName"],
+    ),
+    (
+        "JobSpec",
+        &["completionMode", "managedBy", "podReplacementPolicy"],
+    ),
+    (
+        "JobStatus",
+        &["failedIndexes"],
+    ),
+    (
+        "LeaseSpec",
+        &["holderIdentity", "preferredHolder", "strategy"],
+    ),
+    (
+        "Lifecycle",
+        &["stopSignal"],
+    ),
+    (
+        "LoadBalancerIngress",
+        &["ipMode"],
+    ),
+    (
+        "LocalVolumeSource",
+        &["fsType"],
+    ),
+    (
+        "MatchResources",
+        &["matchPolicy"],
+    ),
+    (
+        "MutatingWebhook",
+        &["failurePolicy", "matchPolicy", "reinvocationPolicy", "sideEffects"],
+    ),
+    (
+        "ParamRef",
+        &["parameterNotFoundAction"],
+    ),
+    (
+        "PersistentVolumeClaimSpec",
+        &["storageClassName", "volumeAttributesClassName", "volumeMode"],
+    ),
+    (
+        "PersistentVolumeClaimStatus",
+        &["currentVolumeAttributesClassName"],
+    ),
+    (
+        "PersistentVolumeSpec",
+        &["volumeAttributesClassName", "volumeMode"],
+    ),
+    (
+        "PodDNSConfigOption",
+        &["value"],
+    ),
+    (
+        "PodDisruptionBudgetSpec",
+        &["unhealthyPodEvictionPolicy"],
+    ),
+    (
+        "PodFailurePolicyOnExitCodesRequirement",
+        &["containerName"],
+    ),
+    (
+        "PodLogOptions",
+        &["stream"],
+    ),
+    (
+        "PodResourceClaim",
+        &["resourceClaimName", "resourceClaimTemplateName"],
+    ),
+    (
+        "PodResourceClaimStatus",
+        &["resourceClaimName"],
+    ),
+    (
+        "PodSecurityContext",
+        &["fsGroupChangePolicy", "seLinuxChangePolicy", "supplementalGroupsPolicy"],
+    ),
+    (
+        "PodSpec",
+        &["hostnameOverride", "preemptionPolicy", "runtimeClassName"],
+    ),
+    (
+        "PortStatus",
+        &["error"],
+    ),
+    (
+        "Preconditions",
+        &["resourceVersion"],
+    ),
+    (
+        "ResourceSliceSpec",
+        &["nodeName"],
+    ),
+    (
+        "Rule",
+        &["scope"],
+    ),
+    (
+        "SeccompProfile",
+        &["localhostProfile"],
+    ),
+    (
+        "SecurityContext",
+        &["procMount"],
+    ),
+    (
+        "ServicePort",
+        &["appProtocol"],
+    ),
+    (
+        "ServiceReference",
+        &["path"],
+    ),
+    (
+        "ServiceSpec",
+        &["internalTrafficPolicy", "ipFamilyPolicy", "loadBalancerClass", "trafficDistribution"],
+    ),
+    (
+        "StorageClass",
+        &["volumeBindingMode"],
+    ),
+    (
+        "SuccessPolicyRule",
+        &["succeededIndexes"],
+    ),
+    (
+        "TopologySpreadConstraint",
+        &["nodeAffinityPolicy", "nodeTaintsPolicy"],
+    ),
+    (
+        "TypedLocalObjectReference",
+        &["apiGroup"],
+    ),
+    (
+        "TypedObjectReference",
+        &["apiGroup", "namespace"],
+    ),
+    (
+        "ValidatingAdmissionPolicySpec",
+        &["failurePolicy"],
+    ),
+    (
+        "ValidatingWebhook",
+        &["failurePolicy", "matchPolicy", "sideEffects"],
+    ),
+    (
+        "VolumeAttachmentSource",
+        &["persistentVolumeName"],
+    ),
+    (
+        "VolumeMount",
+        &["mountPropagation", "recursiveReadOnly"],
+    ),
+    (
+        "VolumeMountStatus",
+        &["recursiveReadOnly"],
+    ),
+    (
+        "WebhookClientConfig",
+        &["url"],
+    ),
+    (
+        "WindowsSecurityContextOptions",
+        &["gmsaCredentialSpec", "gmsaCredentialSpecName", "runAsUserName"],
+    ),
+];
