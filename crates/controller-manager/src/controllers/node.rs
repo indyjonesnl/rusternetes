@@ -2424,4 +2424,58 @@ mod tests {
         assert_eq!(m::zone_health(&z), Some(100.0));
         assert_eq!(m::unhealthy_nodes(&z), Some(0.0));
     }
+
+    fn noschedule(key: &str) -> (String, String) {
+        (key.to_string(), "NoSchedule".to_string())
+    }
+
+    /// TestNoScheduleTaintingPass shape (node_lifecycle_controller_test.go
+    /// TestTaintNodeByCondition): a real api-server's NodeTaint admission
+    /// stamps `not-ready:NoSchedule` at registration; once the node reports
+    /// Ready=True the per-node pass must remove it (#3003).
+    #[tokio::test]
+    async fn no_schedule_not_ready_taint_cleared_when_ready() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::with_eviction_config(storage.clone(), fast_config());
+        let mut n = znode("node0", "zone1", "True", 0);
+        n.spec = serde_json::from_value(serde_json::json!({
+            "taints": [
+                {"key": "node.kubernetes.io/not-ready", "effect": "NoSchedule"},
+                {"key": "example.com/user", "effect": "NoSchedule"}
+            ]
+        }))
+        .unwrap();
+        put(&storage, &c, &n).await;
+        c.reconcile_all().await.unwrap();
+        assert_eq!(
+            taint_keys(&storage, "node0").await,
+            [noschedule("example.com/user")]
+        );
+    }
+
+    /// Ready=False -> not-ready:NoSchedule; Ready=Unknown -> unreachable;
+    /// spec.unschedulable -> unschedulable; pressure condition True -> its taint.
+    #[tokio::test]
+    async fn no_schedule_taints_follow_conditions() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::with_eviction_config(storage.clone(), fast_config());
+        put(&storage, &c, &znode("ok", "zone1", "True", 0)).await;
+        put(&storage, &c, &znode("nr", "zone1", "False", 0)).await;
+        let mut cordoned = znode("cordon", "zone1", "True", 0);
+        cordoned.spec = serde_json::from_value(serde_json::json!({"unschedulable": true})).unwrap();
+        put(&storage, &c, &cordoned).await;
+        for n in ["nr", "cordon"] {
+            let node: Node = storage.get(&build_key("nodes", None, n)).await.unwrap();
+            c.process_node(&node).await.unwrap();
+        }
+        assert_eq!(
+            taint_keys(&storage, "nr").await,
+            [noschedule("node.kubernetes.io/not-ready")]
+        );
+        assert_eq!(
+            taint_keys(&storage, "cordon").await,
+            [noschedule("node.kubernetes.io/unschedulable")]
+        );
+        assert!(taint_keys(&storage, "ok").await.is_empty());
+    }
 }
