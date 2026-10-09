@@ -1837,6 +1837,75 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // tryUpdateNodeHealth (#2836). Ported from
+    // pkg/controller/nodelifecycle/node_lifecycle_controller_test.go:
+    // TestMonitorNodeHealthUpdateStatus (:1010).
+    // ------------------------------------------------------------------
+
+    fn cond_of(n: &Node, t: &str) -> Option<NodeCondition> {
+        n.status
+            .as_ref()?
+            .conditions
+            .as_ref()?
+            .iter()
+            .find(|c| c.condition_type == t)
+            .cloned()
+    }
+
+    /// "Node created long time ago, with status updated by kubelet exceeds grace
+    /// period. Expect Unknown status posted from node controller": Ready goes
+    /// Unknown/NodeStatusUnknown (never False), and the pressure conditions
+    /// the kubelet never posted are created Unknown/NodeStatusNeverUpdated.
+    #[tokio::test]
+    async fn stale_heartbeat_posts_ready_unknown_not_false() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::new(storage.clone());
+        let n = znode("n1", "zone1", "True", SECS_STALE);
+        put(&storage, &c, &n).await;
+        c.monitor_node_health().await.unwrap();
+        let got: Node = storage.get(&build_key("nodes", None, "n1")).await.unwrap();
+        let ready = cond_of(&got, "Ready").unwrap();
+        assert_eq!(ready.status, "Unknown");
+        assert_eq!(ready.reason.as_deref(), Some("NodeStatusUnknown"));
+        assert_eq!(
+            ready.message.as_deref(),
+            Some("Kubelet stopped posting node status.")
+        );
+        for t in ["MemoryPressure", "DiskPressure", "PIDPressure"] {
+            let cond = cond_of(&got, t).unwrap_or_else(|| panic!("{t} not created"));
+            assert_eq!(cond.status, "Unknown");
+            assert_eq!(cond.reason.as_deref(), Some("NodeStatusNeverUpdated"));
+            assert_eq!(
+                cond.message.as_deref(),
+                Some("Kubelet never posted node status.")
+            );
+        }
+    }
+
+    /// "Node created long time ago, without status: Expect Unknown status posted
+    /// from node controller" (reason NodeStatusNeverUpdated on all four).
+    #[tokio::test]
+    async fn never_posted_status_posts_unknown_never_updated() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::new(storage.clone());
+        let mut n = znode("n1", "zone1", "True", 0);
+        n.status = None;
+        n.metadata.creation_timestamp = Some(Utc::now() - Duration::days(365));
+        put(&storage, &c, &n).await;
+        c.monitor_node_health().await.unwrap();
+        let got: Node = storage.get(&build_key("nodes", None, "n1")).await.unwrap();
+        for t in ["Ready", "MemoryPressure", "DiskPressure", "PIDPressure"] {
+            let cond = cond_of(&got, t).unwrap_or_else(|| panic!("{t} not created"));
+            assert_eq!(cond.status, "Unknown", "{t}");
+            assert_eq!(
+                cond.reason.as_deref(),
+                Some("NodeStatusNeverUpdated"),
+                "{t}"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Zone-aware rate-limited NoExecute tainting (#2627). Ported from
     // pkg/controller/nodelifecycle/node_lifecycle_controller_test.go:
     // TestApplyNoExecuteTaints (:2289), TestApplyNoExecuteTaintsToNodesEnqueueTwice
