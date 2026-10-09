@@ -1,3 +1,4 @@
+pub mod abac;
 pub mod admission;
 pub mod audit;
 pub mod authorizer;
