@@ -1409,11 +1409,7 @@ mod fs_group {
             persistent_volume: Some(&p),
             read_only: false,
         };
-        let m = f
-            .plugin
-            .new_mounter(&spec, &fs_group_pod(own_gid(f), policy))
-            .await
-            .unwrap();
+        let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
         let dir = std::path::PathBuf::from(m.get_path());
         std::fs::create_dir_all(&dir).unwrap();
         if let Some(rm) = root_mode {
@@ -1422,7 +1418,16 @@ mod fs_group {
         let file = dir.join("f");
         std::fs::write(&file, b"x").unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
-        m.set_up().await.unwrap();
+        // The pod's fsGroup reaches the mounter only as `MounterArgs`
+        // (`operation_generator.go:582-589`).
+        let fsg = fs_group_pod(own_gid(f), policy);
+        m.set_up_with(&crate::volume_plugins::MounterArgs {
+            fs_group: crate::volume_plugins::util::fs_group_from(&fsg),
+            fs_group_change_policy: policy.map(str::to_string),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
         file
     }
 

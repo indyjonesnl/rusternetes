@@ -83,7 +83,6 @@ impl VolumePlugin for ConfigMapPlugin {
                 .clone()
                 .expect("checked by can_support"),
             storage: self.host.get_kube_client().cloned(),
-            fs_group: crate::volume_plugins::util::fs_group_from(pod),
         }))
     }
 
@@ -132,8 +131,6 @@ struct ConfigMapMounter {
     namespace: String,
     config_map: ConfigMapVolumeSource,
     storage: Option<Arc<StorageBackend>>,
-    /// `mounterArgs.FsGroup` (`volume.go:132`).
-    fs_group: Option<i64>,
 }
 
 #[async_trait]
@@ -223,7 +220,7 @@ impl Mounter for ConfigMapMounter {
         if let Err(e) = crate::volume_ownership::write_payload_with_ownership(
             std::path::Path::new(volume_dir),
             &payload,
-            args.fs_group.or(self.fs_group),
+            args.fs_group,
             true,
         ) {
             if let Err(td) = std::fs::remove_dir_all(volume_dir) {
@@ -352,7 +349,6 @@ mod tests {
             storage: Some(Arc::new(StorageBackend::Memory(Arc::new(
                 rusternetes_storage::MemoryStorage::new(),
             )))),
-            fs_group: None,
         }
     }
 
@@ -441,9 +437,13 @@ mod tests {
             config_map: serde_json::from_value(json!({"name": "cm", "defaultMode": 0o600}))
                 .unwrap(),
             storage: Some(storage),
-            fs_group: Some(gid),
         };
-        m.set_up().await.unwrap();
+        m.set_up_with(&crate::volume_plugins::MounterArgs {
+            fs_group: Some(gid),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.join("data-1")).unwrap(),
             "value-1"

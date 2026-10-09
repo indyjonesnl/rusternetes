@@ -12,6 +12,9 @@
 
 use crate::events::{FILE_SYSTEM_RESIZE_FAILED, FILE_SYSTEM_RESIZE_SUCCESS};
 use crate::volume_manager::cache::actual_state_of_world::ActualStateOfWorld;
+use crate::volume_manager::cache::desired_state_of_world::{
+    desired_size_limit, effective_selinux_mount_label, get_selinux_label,
+};
 use crate::volume_plugins::plugin::{
     DeviceMounterArgs, NodeExpandableVolumePlugin, NodeResizeOptions, Spec,
 };
@@ -491,22 +494,68 @@ pub async fn mount_volume_with_attributes(
         );
     }
 
-    // `operation_generator.go:582-589`. Not ported: `DesiredSize` (volume
-    // expansion, #1970) and `SELinuxLabel` (#2312).
     mounter
-        .set_up_with(&crate::volume_plugins::MounterArgs {
-            fs_user: crate::volume_plugins::util::fs_user_from(pod),
-            fs_group: fs_group_from(pod),
-            fs_group_change_policy: pod
-                .spec
-                .as_ref()
-                .and_then(|s| s.security_context.as_ref())
-                .and_then(|sc| sc.fs_group_change_policy.clone()),
-            desired_size: None,
-            selinux_label: String::new(),
-        })
+        .set_up_with(&mounter_args_for(
+            mgr,
+            spec,
+            pod,
+            &crate::volume_plugins::util::selinux::Translator,
+        )?)
         .await?;
     Ok((mounter.get_path(), mounter.get_attributes()))
+}
+
+/// The `volume.MounterArgs` the operation generator hands to `SetUp`
+/// (`operation_generator.go:582-589`):
+///
+/// ```go
+/// volumeMounter.SetUp(volume.MounterArgs{
+///     FsUser:              util.FsUserFrom(volumeToMount.Pod),
+///     FsGroup:             fsGroup,
+///     DesiredSize:         volumeToMount.DesiredSizeLimit,
+///     FSGroupChangePolicy: fsGroupChangePolicy,
+///     Recorder:            og.recorder,
+///     SELinuxLabel:        volumeToMount.SELinuxLabel,
+/// })
+/// ```
+///
+/// Upstream reads `DesiredSizeLimit` and `SELinuxLabel` off the
+/// `VolumeToMount` that `DesiredStateOfWorld.AddPodToVolume` filled in. The
+/// kubelet's `create_volume` has no `DesiredStateOfWorld` yet, so they are
+/// computed here by the same functions `AddPodToVolume` uses
+/// ([`desired_size_limit`], [`get_effective_selinux_mount_label`]).
+pub(crate) fn mounter_args_for(
+    mgr: &VolumePluginMgr,
+    spec: &Spec<'_>,
+    pod: &Pod,
+    selinux_translator: &dyn crate::volume_plugins::util::selinux::SELinuxLabelTranslator,
+) -> anyhow::Result<crate::volume_plugins::MounterArgs> {
+    // `AddPodToVolume` (`desired_state_of_world.go:317-336`): the label the
+    // containers that mount the volume need, cleared for a volume whose access
+    // mode cannot carry `-o context=`.
+    let (selinux_file_label, _plugin_supports_selinux_context_mount) = get_selinux_label(
+        mgr,
+        selinux_translator,
+        spec,
+        &crate::volume_plugins::util::selinux_container_contexts(pod, &spec.volume.name),
+        pod.spec.as_ref().and_then(|s| s.security_context.as_ref()),
+    )
+    .map_err(|e| anyhow!("{e}"))?;
+    let selinux_label = effective_selinux_mount_label(spec, &selinux_file_label);
+    Ok(crate::volume_plugins::MounterArgs {
+        fs_user: crate::volume_plugins::util::fs_user_from(pod),
+        fs_group: fs_group_from(pod),
+        fs_group_change_policy: pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.security_context.as_ref())
+            .and_then(|sc| sc.fs_group_change_policy.clone()),
+        desired_size: desired_size_limit(pod, spec.volume).map(|q| {
+            // `resource.Quantity.Value()`: an int64.
+            q.value().clamp(i64::MIN as i128, i64::MAX as i128) as i64
+        }),
+        selinux_label,
+    })
 }
 
 #[cfg(test)]
@@ -840,5 +889,171 @@ mod tests {
             f.pvc().await.status.unwrap().capacity.unwrap()["storage"],
             "2G"
         );
+    }
+
+    // ---- `MounterArgs` population (`operation_generator.go:582-589`, #2900) ----
+
+    use crate::volume_plugins::plugin::{Mounter, Unmounter, VolumePlugin};
+    use crate::volume_plugins::util::selinux::FakeSELinuxLabelTranslator;
+    use async_trait::async_trait;
+    use rusternetes_common::feature_gates::{with_feature, Feature};
+
+    fn pod_json(v: serde_json::Value) -> Pod {
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn empty_dir_mgr() -> VolumePluginMgr {
+        let host = Arc::new(KubeletVolumeHost::new(
+            "/var/lib/rusternetes".to_string(),
+            None,
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            HashMap::new(),
+        ));
+        VolumePluginMgr::new(vec![Box::new(
+            crate::volume_plugins::empty_dir::EmptyDirPlugin::new(host),
+        )])
+    }
+
+    fn args_of(pod: &Pod, vol: serde_json::Value) -> crate::volume_plugins::MounterArgs {
+        let v: Volume = serde_json::from_value(vol).unwrap();
+        let spec = Spec {
+            volume: &v,
+            persistent_volume: None,
+            read_only: false,
+        };
+        mounter_args_for(&empty_dir_mgr(), &spec, pod, &FakeSELinuxLabelTranslator).unwrap()
+    }
+
+    fn pod_with_limit(limit: Option<&str>) -> Pod {
+        let mut c = json!({"name": "c", "image": "i"});
+        if let Some(l) = limit {
+            c["resources"] = json!({"limits": {"ephemeral-storage": l}});
+        }
+        pod_json(json!({
+            "metadata": {"name": "p", "namespace": "ns", "uid": "u"},
+            "spec": {"containers": [c]}
+        }))
+    }
+
+    /// `AddPodToVolume` (`desired_state_of_world.go:297-322`): the emptyDir
+    /// `sizeLimit` is the desired size limit.
+    #[test]
+    fn empty_dir_size_limit_is_the_desired_size() {
+        let a = args_of(
+            &pod_with_limit(None),
+            json!({"name": "v", "emptyDir": {"sizeLimit": "1Gi"}}),
+        );
+        assert_eq!(a.desired_size, Some(1 << 30));
+    }
+
+    /// The smaller of the pod's ephemeral-storage limit and the sizeLimit wins.
+    #[test]
+    fn pod_ephemeral_storage_limit_wins_when_smaller() {
+        let a = args_of(
+            &pod_with_limit(Some("500Mi")),
+            json!({"name": "v", "emptyDir": {"sizeLimit": "1Gi"}}),
+        );
+        assert_eq!(a.desired_size, Some(500 << 20));
+        let a = args_of(
+            &pod_with_limit(Some("2Gi")),
+            json!({"name": "v", "emptyDir": {"sizeLimit": "1Gi"}}),
+        );
+        assert_eq!(a.desired_size, Some(1 << 30));
+    }
+
+    /// Not a local ephemeral volume: no desired size limit (`:315-316`).
+    #[test]
+    fn non_local_ephemeral_volume_has_no_desired_size() {
+        let a = args_of(
+            &pod_with_limit(Some("500Mi")),
+            json!({"name": "v", "emptyDir": {"medium": "Memory"}}),
+        );
+        assert_eq!(a.desired_size, None);
+    }
+
+    struct SelinuxPlugin(bool);
+
+    #[async_trait]
+    impl VolumePlugin for SelinuxPlugin {
+        fn name(&self) -> &'static str {
+            "fake-selinux"
+        }
+        fn get_volume_name(&self, spec: &Spec<'_>) -> anyhow::Result<String> {
+            Ok(spec.name().to_string())
+        }
+        fn can_support(&self, _spec: &Spec<'_>) -> bool {
+            true
+        }
+        fn requires_remount(&self, _spec: &Spec<'_>) -> bool {
+            false
+        }
+        fn supports_selinux_context_mount(&self, _spec: &Spec<'_>) -> anyhow::Result<bool> {
+            Ok(self.0)
+        }
+        async fn new_mounter(&self, _: &Spec<'_>, _: &Pod) -> anyhow::Result<Box<dyn Mounter>> {
+            unimplemented!()
+        }
+        fn new_unmounter(&self, _: &str, _: &str) -> anyhow::Result<Box<dyn Unmounter>> {
+            unimplemented!()
+        }
+        fn construct_volume_spec(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> anyhow::Result<crate::volume_plugins::ReconstructedVolume> {
+            unimplemented!()
+        }
+    }
+
+    fn selinux_args(
+        plugin_supports: bool,
+        access_mode: &str,
+    ) -> crate::volume_plugins::MounterArgs {
+        let _g = with_feature(Feature::SELinuxMountReadWriteOncePod, true);
+        let mgr = VolumePluginMgr::new(vec![Box::new(SelinuxPlugin(plugin_supports))]);
+        let pod = pod_json(json!({
+            "metadata": {"name": "p", "namespace": "ns", "uid": "u"},
+            "spec": {
+                "containers": [{
+                    "name": "c", "image": "i",
+                    "volumeMounts": [{"name": "v", "mountPath": "/v"}],
+                    "securityContext": {"seLinuxOptions": {
+                        "user": "system_u", "role": "object_r",
+                        "type": "container_t", "level": "s0:c1,c2"}}
+                }],
+                "volumes": [{"name": "v", "persistentVolumeClaim": {"claimName": "c"}}]
+            }
+        }));
+        let v = pod.spec.as_ref().unwrap().volumes.as_ref().unwrap()[0].clone();
+        let pv: PersistentVolume = serde_json::from_value(json!({
+            "metadata": {"name": "pv"}, "spec": {"accessModes": [access_mode]}
+        }))
+        .unwrap();
+        let spec = Spec {
+            volume: &v,
+            persistent_volume: Some(&pv),
+            read_only: false,
+        };
+        mounter_args_for(&mgr, &spec, &pod, &FakeSELinuxLabelTranslator).unwrap()
+    }
+
+    /// `AddPodToVolume` -> `getSELinuxLabel` -> `GetMountSELinuxLabel`: an RWOP
+    /// volume on a plugin that supports the context mount carries the
+    /// containers' file label into `MounterArgs.SELinuxLabel`.
+    #[test]
+    #[serial_test::serial]
+    fn rwop_volume_gets_the_container_selinux_label() {
+        let a = selinux_args(true, "ReadWriteOncePod");
+        assert_eq!(
+            a.selinux_label,
+            "system_u:object_r:container_file_t:s0:c1,c2"
+        );
+    }
+
+    /// A plugin without SELinux context-mount support gets no label.
+    #[test]
+    #[serial_test::serial]
+    fn plugin_without_selinux_mount_gets_no_label() {
+        assert_eq!(selinux_args(false, "ReadWriteOncePod").selinux_label, "");
     }
 }
