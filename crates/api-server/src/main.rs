@@ -94,37 +94,8 @@ struct Args {
     #[arg(long, default_value = "rusternetes-secret-change-in-production")]
     jwt_secret: String,
 
-    /// File containing PEM-encoded x509 RSA or ECDSA private or public keys,
-    /// used to verify ServiceAccount tokens. The specified file can contain
-    /// multiple keys, and the flag can be specified multiple times with
-    /// different files. Must be specified when
-    /// --service-account-signing-key-file is provided
-    /// (pkg/kubeapiserver/options/authentication.go:432-437).
-    #[arg(long = "service-account-key-file")]
-    service_account_key_file: Vec<String>,
-
-    /// Path to the file that contains the current private key of the service
-    /// account token issuer. The issuer will sign issued ID tokens with this
-    /// private key (pkg/controlplane/apiserver/options/options.go:207).
-    #[arg(long = "service-account-signing-key-file")]
-    service_account_signing_key_file: Option<String>,
-
-    /// Identifier of the service account token issuer. The issuer will assert
-    /// this identifier in "iss" claim of issued tokens. When this flag is
-    /// specified multiple times, the first is used to generate tokens and all
-    /// are used to determine which issuers are accepted
-    /// (pkg/kubeapiserver/options/authentication.go:442-452).
-    #[arg(long = "service-account-issuer")]
-    service_account_issuer: Vec<String>,
-
-    /// Identifiers of the API. The service account token authenticator will
-    /// validate that tokens used against the API are bound to at least one of
-    /// these audiences. If the --service-account-issuer flag is configured and
-    /// this flag is not, this field defaults to a single element list
-    /// containing the issuer URL
-    /// (pkg/kubeapiserver/options/authentication.go:352).
-    #[arg(long = "api-audiences", value_delimiter = ',')]
-    api_audiences: Vec<String>,
+    #[command(flatten)]
+    service_account: rusternetes_api_server::ServiceAccountArgs,
 
     /// Enable TLS/HTTPS
     #[arg(long)]
@@ -310,12 +281,7 @@ async fn main() -> Result<()> {
     // Initialize TokenManager — prefer RSA keys for RS256 (K8s OIDC compatible),
     // fall back to HMAC HS256 if no RSA keys found.
     info!("Initializing TokenManager");
-    let service_account = rusternetes_common::auth::ServiceAccountOptions {
-        key_files: args.service_account_key_file.clone(),
-        signing_key_file: args.service_account_signing_key_file.clone(),
-        issuers: args.service_account_issuer.clone(),
-        api_audiences: args.api_audiences.clone(),
-    };
+    let service_account = args.service_account.to_options();
     let token_manager = Arc::new(
         TokenManager::new_auto(args.jwt_secret.as_bytes())
             .with_service_account_options(&service_account)?,

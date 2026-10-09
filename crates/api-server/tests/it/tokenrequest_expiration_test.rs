@@ -90,3 +90,36 @@ async fn token_expiration_invalid_is_new_invalid_shaped() {
         "{body}"
     );
 }
+
+/// `--service-account-max-token-expiration` (#2714): `TokenREST.Create`
+/// shortens a longer request to the max
+/// (`pkg/registry/core/serviceaccount/storage/token.go:222-226`) and the
+/// issued token's `exp` and the status timestamp follow the shortened value.
+#[tokio::test]
+async fn token_expiration_clamped_to_max_2714() {
+    use rusternetes_common::auth::{ServiceAccountOptions, TokenManager};
+    let tm = TokenManager::new(b"max-exp-secret")
+        .with_service_account_options(&ServiceAccountOptions {
+            max_expiration: Some(std::time::Duration::from_secs(7200)),
+            ..Default::default()
+        })
+        .unwrap();
+    let state = TestApiServer::builder().token_manager(tm).build();
+    make_sa(&state, "sa-max").await;
+    let before = chrono::Utc::now().timestamp();
+    let (code, body) = state.post(&token_uri("sa-max"), &token_req(86_400)).await;
+    assert!(
+        code == StatusCode::OK || code == StatusCode::CREATED,
+        "{code} {body}"
+    );
+    let ts = chrono::DateTime::parse_from_rfc3339(
+        body["status"]["expirationTimestamp"].as_str().unwrap(),
+    )
+    .unwrap()
+    .timestamp();
+    assert!(
+        (ts - before - 7200).abs() <= 5,
+        "expiration must be clamped to 7200s, got {}s: {body}",
+        ts - before
+    );
+}

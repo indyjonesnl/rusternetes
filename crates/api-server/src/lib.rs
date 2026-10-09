@@ -195,6 +195,77 @@ pub struct ApiServerConfig {
     pub event_ttl: u64,
 }
 
+/// The `--service-account-*` / `--api-audiences` flags, shared by the
+/// `api-server` and all-in-one binaries (#1575, #2713). Help text and flag
+/// names follow `ServiceAccountAuthenticationOptions.AddFlags`
+/// (pkg/kubeapiserver/options/authentication.go:431-470).
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct ServiceAccountArgs {
+    /// File containing PEM-encoded x509 RSA or ECDSA private or public keys,
+    /// used to verify ServiceAccount tokens. The specified file can contain
+    /// multiple keys, and the flag can be specified multiple times with
+    /// different files. Must be specified when
+    /// --service-account-signing-key-file is provided
+    /// (pkg/kubeapiserver/options/authentication.go:432-437).
+    #[arg(long = "service-account-key-file")]
+    pub service_account_key_file: Vec<String>,
+
+    /// Path to the file that contains the current private key of the service
+    /// account token issuer. The issuer will sign issued ID tokens with this
+    /// private key (pkg/controlplane/apiserver/options/options.go:207).
+    #[arg(long = "service-account-signing-key-file")]
+    pub service_account_signing_key_file: Option<String>,
+
+    /// Identifier of the service account token issuer. The issuer will assert
+    /// this identifier in "iss" claim of issued tokens. When this flag is
+    /// specified multiple times, the first is used to generate tokens and all
+    /// are used to determine which issuers are accepted
+    /// (pkg/kubeapiserver/options/authentication.go:442-452).
+    #[arg(long = "service-account-issuer")]
+    pub service_account_issuer: Vec<String>,
+
+    /// Identifiers of the API. The service account token authenticator will
+    /// validate that tokens used against the API are bound to at least one of
+    /// these audiences. If the --service-account-issuer flag is configured and
+    /// this flag is not, this field defaults to a single element list
+    /// containing the issuer URL
+    /// (pkg/kubeapiserver/options/authentication.go:352).
+    #[arg(long = "api-audiences", value_delimiter = ',')]
+    pub api_audiences: Vec<String>,
+
+    /// The maximum validity duration of a token created by the service account
+    /// token issuer, as a Go duration (e.g. 24h). If an otherwise valid
+    /// TokenRequest with a validity duration larger than this value is
+    /// requested, a token will be issued with a validity duration of this
+    /// value (authentication.go:459-462).
+    #[arg(
+        long = "service-account-max-token-expiration",
+        value_parser = parse_go_duration_arg
+    )]
+    pub service_account_max_token_expiration: Option<std::time::Duration>,
+}
+
+fn parse_go_duration_arg(s: &str) -> std::result::Result<std::time::Duration, String> {
+    let ns = rusternetes_common::go_duration::parse_go_duration(s)?;
+    // A negative duration is below the 1h lower bound upstream rejects; map it
+    // to zero here would silently mean "unset", so refuse it at parse time.
+    u64::try_from(ns)
+        .map(std::time::Duration::from_nanos)
+        .map_err(|_| format!("negative duration {s:?} is not allowed"))
+}
+
+impl ServiceAccountArgs {
+    pub fn to_options(&self) -> rusternetes_common::auth::ServiceAccountOptions {
+        rusternetes_common::auth::ServiceAccountOptions {
+            key_files: self.service_account_key_file.clone(),
+            signing_key_file: self.service_account_signing_key_file.clone(),
+            issuers: self.service_account_issuer.clone(),
+            api_audiences: self.api_audiences.clone(),
+            max_expiration: self.service_account_max_token_expiration,
+        }
+    }
+}
+
 impl Default for ApiServerConfig {
     fn default() -> Self {
         Self {
@@ -415,5 +486,46 @@ mod tests {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
         }
+    }
+}
+
+#[cfg(test)]
+mod service_account_args_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser, Debug)]
+    struct Wrap {
+        #[command(flatten)]
+        sa: ServiceAccountArgs,
+    }
+
+    #[test]
+    fn flags_map_to_options_2713() {
+        let w = Wrap::try_parse_from([
+            "x",
+            "--service-account-key-file=/k1",
+            "--service-account-key-file=/k2",
+            "--service-account-signing-key-file=/s",
+            "--service-account-issuer=https://i",
+            "--api-audiences=a,b",
+            "--service-account-max-token-expiration=24h",
+        ])
+        .unwrap();
+        let o = w.sa.to_options();
+        assert_eq!(o.key_files, ["/k1", "/k2"]);
+        assert_eq!(o.signing_key_file.as_deref(), Some("/s"));
+        assert_eq!(o.issuers, ["https://i"]);
+        assert_eq!(o.api_audiences, ["a", "b"]);
+        assert_eq!(
+            o.max_expiration,
+            Some(std::time::Duration::from_secs(86400))
+        );
+    }
+
+    #[test]
+    fn bad_duration_rejected() {
+        assert!(Wrap::try_parse_from(["x", "--service-account-max-token-expiration=-1h"]).is_err());
+        assert!(Wrap::try_parse_from(["x", "--service-account-max-token-expiration=abc"]).is_err());
     }
 }

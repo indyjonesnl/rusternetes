@@ -204,6 +204,11 @@ pub struct ServiceAccountOptions {
     pub issuers: Vec<String>,
     /// `--api-audiences`. Defaults to the issuers when unset.
     pub api_audiences: Vec<String>,
+    /// `--service-account-max-token-expiration` (authentication.go:459-462):
+    /// the longest TokenRequest validity; a longer request is shortened to it.
+    /// `None`/zero = unset. Independent of the other flags, so it does not
+    /// count towards [`Self::is_empty`].
+    pub max_expiration: Option<std::time::Duration>,
 }
 
 impl ServiceAccountOptions {
@@ -214,6 +219,26 @@ impl ServiceAccountOptions {
             && self.signing_key_file.is_none()
             && self.issuers.is_empty()
             && self.api_audiences.is_empty()
+    }
+
+    /// The `--service-account-max-token-expiration` bound check of
+    /// `completeServiceAccountOptions` (options.go:296-302): unset, or between
+    /// one hour and 2^32 seconds.
+    pub fn validate_max_expiration(&self) -> Result<()> {
+        match self.max_expiration {
+            Some(d) if !d.is_zero() => {
+                let low = std::time::Duration::from_secs(3600);
+                let up = std::time::Duration::from_secs(1 << 32);
+                if d < low || d > up {
+                    return Err(Error::InvalidResource(
+                        "the service-account-max-token-expiration must be between 1 hour and 2^32 seconds"
+                            .to_string(),
+                    ));
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Port of `validateTokenRequest` (validation.go:34-52) and
@@ -301,6 +326,9 @@ pub struct TokenManager {
     /// `--api-audiences` (the authenticator's `implicitAuds`); empty = no
     /// audience enforcement.
     api_audiences: Vec<String>,
+    /// `--service-account-max-token-expiration` in seconds; 0 = unset
+    /// (`TokenREST.maxExpirationSeconds`).
+    max_token_expiration_seconds: i64,
 }
 
 impl TokenManager {
@@ -315,6 +343,7 @@ impl TokenManager {
             verification_keys: None,
             issuers: Vec::new(),
             api_audiences: Vec::new(),
+            max_token_expiration_seconds: 0,
         }
     }
 
@@ -335,6 +364,7 @@ impl TokenManager {
             verification_keys: None,
             issuers: Vec::new(),
             api_audiences: Vec::new(),
+            max_token_expiration_seconds: 0,
         })
     }
 
@@ -344,6 +374,10 @@ impl TokenManager {
     /// become a static public-key getter, issuers and API audiences configure
     /// the authenticator, and the signing key replaces the signer.
     pub fn with_service_account_options(mut self, opts: &ServiceAccountOptions) -> Result<Self> {
+        opts.validate_max_expiration()?;
+        self.max_token_expiration_seconds = opts
+            .max_expiration
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
         if opts.is_empty() {
             return Ok(self);
         }
@@ -380,6 +414,23 @@ impl TokenManager {
             opts.api_audiences.clone()
         };
         Ok(self)
+    }
+
+    /// `--service-account-max-token-expiration` in seconds; 0 when unset.
+    pub fn max_token_expiration_seconds(&self) -> i64 {
+        self.max_token_expiration_seconds
+    }
+
+    /// `TokenREST.Create` (pkg/registry/core/serviceaccount/storage/token.go:
+    /// 222-226): a requested expiration longer than the configured maximum is
+    /// shortened to it.
+    pub fn clamp_expiration_seconds(&self, requested: i64) -> i64 {
+        let max = self.max_token_expiration_seconds;
+        if max > 0 && requested > max {
+            max
+        } else {
+            requested
+        }
     }
 
     /// The issuer asserted in issued tokens, when configured.

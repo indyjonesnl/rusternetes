@@ -283,6 +283,7 @@ pub struct TestApiServerBuilder {
     ca_cert_pem: Option<String>,
     service_cluster_ip_range: String,
     strict_namespaces: bool,
+    token_manager: Option<TokenManager>,
 }
 
 impl Default for TestApiServerBuilder {
@@ -294,6 +295,7 @@ impl Default for TestApiServerBuilder {
             ca_cert_pem: None,
             service_cluster_ip_range: String::new(),
             strict_namespaces: false,
+            token_manager: None,
         }
     }
 }
@@ -327,6 +329,13 @@ impl TestApiServerBuilder {
         self
     }
 
+    /// Use this [`TokenManager`] (e.g. one configured with
+    /// `--service-account-*` options) instead of the secret-derived default.
+    pub fn token_manager(mut self, tm: TokenManager) -> Self {
+        self.token_manager = Some(tm);
+        self
+    }
+
     /// Inject a CA-cert PEM so the namespace handler seeds `kube-root-ca.crt`.
     pub fn ca_cert_pem(mut self, pem: impl Into<String>) -> Self {
         self.ca_cert_pem = Some(pem.into());
@@ -344,7 +353,10 @@ impl TestApiServerBuilder {
     pub fn build(self) -> TestApiServer {
         let mem = Arc::new(MemoryStorage::new());
         let backend = Arc::new(StorageBackend::Memory(mem.clone()));
-        let token_manager = Arc::new(TokenManager::new(&self.secret));
+        let token_manager = Arc::new(
+            self.token_manager
+                .unwrap_or_else(|| TokenManager::new(&self.secret)),
+        );
         let authorizer: Arc<dyn Authorizer> = if self.rbac {
             Arc::new(RBACAuthorizer::new(backend.clone()))
         } else {

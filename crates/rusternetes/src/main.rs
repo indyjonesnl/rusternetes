@@ -173,6 +173,10 @@ struct Args {
         value_parser = rusternetes_api_server::registry::core::event::parse_event_ttl
     )]
     event_ttl: u64,
+
+    /// `--service-account-*` / `--api-audiences` (#2713).
+    #[command(flatten)]
+    service_account: rusternetes_api_server::ServiceAccountArgs,
 }
 
 fn main() -> Result<()> {
@@ -272,6 +276,7 @@ async fn async_main() -> Result<()> {
         client_ca_file: args.client_ca_file.clone(),
         service_cluster_ip_range: args.service_cluster_ip_range.clone(),
         event_ttl: args.event_ttl,
+        service_account: args.service_account.to_options(),
         ..Default::default()
     };
     let prepared_tls = rusternetes_api_server::prepare_tls_for_config(&api_config)?;
