@@ -1,3 +1,4 @@
+use crate::controllers::node_lifecycle_metrics;
 use crate::controllers::node_lifecycle_queue::{
     RateLimitedTimedQueue, RateLimiter, TimedValue, EVICTION_RATE_LIMITER_BURST,
     NODE_EVICTION_PERIOD,
@@ -528,6 +529,8 @@ impl<S: Storage + 'static> NodeController<S> {
         let mut ev = self.evictor.lock().await;
         if !ev.zone_states.contains_key(&zone) {
             ev.zone_states.insert(zone.clone(), ZoneState::Initial);
+            // Init the metric for the new zone (:1233-1235).
+            node_lifecycle_metrics::init_evictions(&zone);
             ev.zone_no_execute_tainter.insert(
                 zone,
                 Arc::new(RateLimitedTimedQueue::new(RateLimiter::token_bucket(
@@ -855,6 +858,10 @@ impl<S: Storage + 'static> NodeController<S> {
                             opposite,
                         )
                         .await;
+                    if ok {
+                        // Count the number of evictions (:654-658).
+                        node_lifecycle_metrics::inc_evictions(&get_zone_key(&node));
+                    }
                     (ok, std::time::Duration::ZERO)
                 })
                 .await;
@@ -879,7 +886,8 @@ impl<S: Storage + 'static> NodeController<S> {
         let mut new_zone_states: HashMap<String, ZoneState> = HashMap::new();
         let mut all_are_fully_disrupted = true;
         for (k, v) in &zone_to_conditions {
-            let (_unhealthy, new_state) = self.eviction.compute_zone_state(v);
+            let (unhealthy, new_state) = self.eviction.compute_zone_state(v);
+            node_lifecycle_metrics::set_zone_stats(k, v.len(), unhealthy);
             if new_state != ZoneState::FullDisruption {
                 all_are_fully_disrupted = false;
             }
@@ -891,6 +899,7 @@ impl<S: Storage + 'static> NodeController<S> {
         let keys: Vec<String> = zone_states.keys().cloned().collect();
         for k in keys {
             if !zone_to_conditions.contains_key(&k) {
+                node_lifecycle_metrics::clear_zone(&k);
                 zone_states.remove(&k);
                 continue;
             }
