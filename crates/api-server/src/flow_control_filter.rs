@@ -35,8 +35,11 @@
 //!   `Store.startObservingCount` port) for a fixed table of built-in
 //!   resources; custom resources are not observed, so their lists report
 //!   `ObjectCountNotFound` and cost the minimum number of seats.
-//! - No watermark/metrics (`apiserver_flowcontrol_*`, `RecordDroppedRequest`).
-//!   (#2809)
+//! - Metrics: the counters, queue/executing gauges and wait/execution/seat
+//!   histograms are ported (`flow_control_metrics`, #2809). Not ported: the
+//!   watermark/timing-ratio histograms, `RecordDroppedRequest`/
+//!   `RecordRequestTermination`, the queueset R/S gauges and the seat-demand
+//!   gauges (follow-ups of #2809).
 //! - `getRequestWaitContext` has no request deadline to take 1/4 of (we have no
 //!   `WithRequestDeadline`/timeout filter), so the default limit applies:
 //!   `RequestTimeout/4` = 15s (config.go:445, :1027).
@@ -283,6 +286,8 @@ pub struct ApfFilter<S: Storage> {
 impl<S: Storage + 'static> ApfFilter<S> {
     /// `defaultRequestWaitLimit` is `RequestTimeout/4` (config.go:1027).
     pub fn new(engine: Arc<FlowControlEngine<S>>, default_wait_limit: Duration) -> Self {
+        // `fcmetrics.Register()`.
+        crate::flow_control_metrics::register_all();
         let max_seats_engine = engine.clone();
         let object_counts = Arc::new(ObjectCountTracker::new());
         // The estimator's `watchCountGetter` is
@@ -403,6 +408,8 @@ async fn serve_watch<S: Storage + 'static>(
     let signal = InitializationSignal::new();
     let handler = scope_signal(signal.clone(), next.run(req));
     tokio::pin!(handler);
+    let mut permit = permit;
+    permit.mark_watch();
     let mut permit = Some(permit);
     let resp = tokio::select! {
         resp = &mut handler => resp,
@@ -472,6 +479,13 @@ pub async fn priority_and_fairness<S: Storage + 'static>(
         req.uri().query().unwrap_or(""),
         &classification.flow_schema,
         &classification.priority_level,
+    );
+
+    // `ObserveWorkEstimatedSeats` (priority-and-fairness.go:134).
+    crate::flow_control_metrics::observe_work_estimated_seats(
+        &classification.priority_level,
+        &classification.flow_schema,
+        estimate.max_seats(),
     );
 
     let wait = request_wait_limit(Instant::now(), None, None, f.default_wait_limit);
@@ -851,10 +865,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            sample("apiserver_flowcontrol_work_estimated_seats", &l) - before,
-            1.0
-        );
+        // `catch-all` is shared with the other tests running in this
+        // process, so only a lower bound is stable.
+        assert!(sample("apiserver_flowcontrol_work_estimated_seats", &l) - before >= 1.0);
     }
 
     #[tokio::test]
