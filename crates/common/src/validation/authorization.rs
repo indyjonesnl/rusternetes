@@ -198,6 +198,25 @@ fn metadata_must_be_empty(
 ) -> Option<Error> {
     let mut compared = compared.clone();
     compared.managed_fields = None;
+    // Go compares decoded structs, where `Name`, `GenerateName`, `Namespace`,
+    // `ResourceVersion` and `Generation` are value types: absent and zero are
+    // the same thing. Our `Option` fields can tell them apart, and the
+    // protobuf decoder (a client-go core client such as the kubelet's webhook
+    // authorizer posts protobuf, whose generated marshaller writes every scalar)
+    // yields `Some(0)` / `Some("")`. Fold those back to the Go zero value
+    // (#2375).
+    for s in [
+        &mut compared.generate_name,
+        &mut compared.namespace,
+        &mut compared.resource_version,
+    ] {
+        if s.as_deref() == Some("") {
+            *s = None;
+        }
+    }
+    if compared.generation == Some(0) {
+        compared.generation = None;
+    }
     if compared == ObjectMeta::default() {
         return None;
     }
