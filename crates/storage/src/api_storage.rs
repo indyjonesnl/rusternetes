@@ -801,6 +801,46 @@ impl Storage for ApiStorage {
         Ok(out)
     }
 
+    /// LIST at exactly `revision`: `resourceVersion=N&resourceVersionMatch=Exact`
+    /// (`ResourceVersionMatchExact`, `apimachinery/pkg/apis/meta/v1/types.go`;
+    /// the server pins the read, `apiserver/pkg/storage/etcd3/store.go`
+    /// `withRev`). The trait default ignored the revision.
+    async fn list_at_revision<T>(&self, prefix: &str, revision: i64) -> Result<Vec<T>>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        let query = format!("resourceVersion={revision}&resourceVersionMatch=Exact");
+        Ok(self.list_page(prefix, &query).await?.0)
+    }
+
+    /// One server-side page: `limit` and `continue` go to the api-server and
+    /// the server's own opaque continue token comes back, as a client-go
+    /// `ListPager` does (`client-go/tools/pager/pager.go:88-140`) — rather than
+    /// listing everything and slicing in memory. A 410 `Expired` surfaces as
+    /// [`Error::Gone`] (`errors.IsResourceExpired`, `pager.go:107`), leaving the
+    /// caller to decide on the full-list fallback (`FullListIfExpired`).
+    async fn list_paginated<T>(
+        &self,
+        prefix: &str,
+        limit: usize,
+        continue_token: Option<&str>,
+    ) -> Result<(Vec<T>, Option<String>)>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        if limit == 0 && continue_token.is_none() {
+            return Ok((self.list(prefix).await?, None));
+        }
+        let mut query = Vec::new();
+        if limit > 0 {
+            query.push(format!("limit={limit}"));
+        }
+        if let Some(t) = continue_token {
+            query.push(format!("continue={}", percent_encode(t)));
+        }
+        self.list_page(prefix, &query.join("&")).await
+    }
+
     async fn watch(&self, prefix: &str) -> Result<WatchStream> {
         self.watch_inner(prefix, None).await
     }
@@ -855,7 +895,53 @@ fn is_expired_error(e: &anyhow::Error) -> bool {
     m.starts_with("Error from server (Expired)") || m.starts_with("Error from server (Gone)")
 }
 
+/// Percent-encode a query value (RFC 3986 unreserved bytes pass through).
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 impl ApiStorage {
+    /// GET one list page with `query` appended; returns the items and the
+    /// server's `metadata.continue` (None when empty/absent).
+    async fn list_page<T>(&self, prefix: &str, query: &str) -> Result<(Vec<T>, Option<String>)>
+    where
+        T: DeserializeOwned,
+    {
+        let (rt, rest) = parse_key(prefix)?;
+        let Some((root, namespaced)) = self.try_resolve(&rt).await else {
+            return Ok((Vec::new(), None));
+        };
+        let path = build_collection_for_prefix(&root, namespaced, &rt, &rest)?;
+        let sep = if path.contains('?') { '&' } else { '?' };
+        let list: KubernetesList<Value> = self
+            .client
+            .get(&format!("{path}{sep}{query}"))
+            .await
+            .map_err(|e| match e {
+                GetError::Other(ref err) if is_expired_error(err) => {
+                    Error::Gone(format!("{err:#}"))
+                }
+                e => map_get_err(e),
+            })?;
+        let next = list
+            .metadata
+            .and_then(|m| m.continue_token)
+            .filter(|t| !t.is_empty());
+        let mut out = Vec::with_capacity(list.items.len());
+        for item in list.items {
+            out.push(serde_json::from_value(item).map_err(Error::Serialization)?);
+        }
+        Ok((out, next))
+    }
+
     /// Collection path of `namespaces`: cluster-scoped and always served, so a
     /// revision probe has exactly one path and no namespace to choose.
     async fn namespaces_collection(&self) -> Result<String> {
@@ -1712,5 +1798,68 @@ mod tests {
         .await;
         let storage = ApiStorage::new(Arc::new(ApiClient::new(&base, true, None).unwrap()));
         assert!(storage.is_revision_compacted(5).await.is_err());
+    }
+
+    // ---- list_at_revision / list_paginated go to the server (#2709) --------
+    //
+    // Both used the trait defaults: list everything, sort, slice in memory (and
+    // ignore the revision). A reflector's pager sends limit/continue and
+    // resourceVersion(Match) to the server instead
+    // (`client-go/tools/pager/pager.go:80-100`).
+
+    const POD_LIST_PAGE: &str = r#"{"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"77","continue":"abc+/="},"items":[{"apiVersion":"v1","kind":"Pod","metadata":{"name":"a","namespace":"default"}}]}"#;
+
+    fn pod_storage(base: &str) -> ApiStorage {
+        ApiStorage::new(Arc::new(ApiClient::new(base, true, None).unwrap()))
+    }
+
+    #[tokio::test]
+    async fn list_at_revision_asks_the_server_for_that_exact_revision() {
+        let (base, seen) = spawn_fixed_server("200 OK", POD_LIST_PAGE).await;
+        let storage = pod_storage(&base);
+        let items = Storage::list_at_revision::<Value>(&storage, "/registry/pods/default/", 42)
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        let line = seen.lock().await.last().unwrap().clone();
+        assert!(
+            line.contains("resourceVersion=42") && line.contains("resourceVersionMatch=Exact"),
+            "{line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_paginated_sends_limit_and_continue_and_returns_the_servers_token() {
+        let (base, seen) = spawn_fixed_server("200 OK", POD_LIST_PAGE).await;
+        let storage = pod_storage(&base);
+        let (items, next) = Storage::list_paginated::<Value>(
+            &storage,
+            "/registry/pods/default/",
+            1,
+            Some("tok+/="),
+        )
+        .await
+        .unwrap();
+        assert_eq!(items.len(), 1);
+        // The server's own token, passed through untouched.
+        assert_eq!(next.as_deref(), Some("abc+/="));
+        let line = seen.lock().await.last().unwrap().clone();
+        assert!(line.contains("limit=1"), "{line}");
+        assert!(line.contains("continue=tok%2B%2F%3D"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn list_paginated_maps_an_expired_continue_to_gone() {
+        let (base, _) = spawn_fixed_server(
+            "410 Gone",
+            r#"{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Expired","code":410,"message":"too old resource version"}"#,
+        )
+        .await;
+        let storage = pod_storage(&base);
+        let err =
+            Storage::list_paginated::<Value>(&storage, "/registry/pods/default/", 1, Some("t"))
+                .await
+                .unwrap_err();
+        assert!(matches!(err, Error::Gone(_)), "{err:?}");
     }
 }
