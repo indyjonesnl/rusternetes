@@ -100,6 +100,10 @@ struct Args {
     #[command(flatten)]
     service_account: rusternetes_api_server::ServiceAccountArgs,
 
+    /// `--authorization-mode` (#2854).
+    #[command(flatten)]
+    authorization: rusternetes_api_server::authorizer::AuthorizationArgs,
+
     /// Enable TLS/HTTPS
     #[arg(long)]
     tls: bool,
@@ -296,8 +300,11 @@ async fn main() -> Result<()> {
         warn!("⚠️  Using AlwaysAllowAuthorizer - all requests will be permitted");
         warn!("⚠️  This should ONLY be used in development/testing environments");
     }
-    let authorizer =
-        rusternetes_api_server::authorizer::build_authorizer(storage.clone(), args.skip_auth);
+    let authorizer = rusternetes_api_server::authorizer::build_authorizer(
+        storage.clone(),
+        args.skip_auth,
+        &args.authorization.authorization_mode,
+    )?;
 
     // Initialize Metrics Registry
     info!("Initializing Metrics Registry");
@@ -314,6 +321,7 @@ async fn main() -> Result<()> {
         client_ca_file: args.client_ca_file.clone(),
         service_node_port_range: args.service_node_port_range,
         service_account,
+        authorization_mode: args.authorization.authorization_mode.clone(),
         ..Default::default()
     };
     let prepared_tls = rusternetes_api_server::prepare_tls_for_config(&api_config)?;

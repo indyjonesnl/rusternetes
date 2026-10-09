@@ -177,6 +177,10 @@ struct Args {
     /// `--service-account-*` / `--api-audiences` (#2713).
     #[command(flatten)]
     service_account: rusternetes_api_server::ServiceAccountArgs,
+
+    /// `--authorization-mode` (#2854).
+    #[command(flatten)]
+    authorization: rusternetes_api_server::authorizer::AuthorizationArgs,
 }
 
 fn main() -> Result<()> {
@@ -277,6 +281,7 @@ async fn async_main() -> Result<()> {
         service_cluster_ip_range: args.service_cluster_ip_range.clone(),
         event_ttl: args.event_ttl,
         service_account: args.service_account.to_options(),
+        authorization_mode: args.authorization.authorization_mode.clone(),
         ..Default::default()
     };
     let prepared_tls = rusternetes_api_server::prepare_tls_for_config(&api_config)?;
