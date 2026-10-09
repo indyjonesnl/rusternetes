@@ -107,6 +107,7 @@ fn object_meta_non_zero_scalars_are_kept() {
     let v = decode("ObjectMeta", &[0x0a, 0x01, b'a', 0x38, 0x03]);
     assert_eq!(v["name"], "a");
     assert_eq!(v["generation"], 3);
+}
 
 /// #2931: the table must cover every plain `omitempty` bool/int, not a
 /// hand-picked subset. `ObjectMeta.Generation int64 json:"generation,omitempty"`
