@@ -22,94 +22,32 @@ const WIRE_64BIT: u8 = 1;
 const WIRE_LENGTH_DELIMITED: u8 = 2;
 const WIRE_32BIT: u8 = 5;
 
-/// Non-pointer `bool`/`int` fields tagged `json:",omitempty"` upstream, by
-/// message. Go's generated protobuf marshaller writes a plain scalar even when
-/// it is zero (`dAtA[i] = 0`), whereas JSON drops it, so an object that
-/// arrives over protobuf carries `false`/`0` where its JSON twin carries
-/// nothing. Our models are `Option<_>`, which tells the two apart (#2382,
-/// #2449), so the decoder emits the JSON form: absent. Pointer fields (`*bool`,
-/// `*int32`) are NOT listed — the marshaller writes those only when non-nil, so
-/// an explicit zero there is a real value.
-///
-/// Derived from k8s.io/api `*/types.go` (release-1.35): every `bool`/`int32`/
-/// `int64` field without `*` and with `omitempty` on a message this registry
-/// decodes. Fields whose tag lacks `omitempty` (containerPort, exitCode, ...)
-/// are always present in JSON, so they stay.
-const PLAIN_ZERO_SCALARS: &[(&str, &[&str])] = &[
-    // `ObjectMeta.Generation int64 json:"generation,omitempty"`
-    // (apimachinery meta/v1 types.go); the marshaller writes it unconditionally
-    // (generated.pb.go `ObjectMeta.MarshalToSizedBuffer`). The string fields
-    // are already dropped when empty by the string decoder (#2929).
-    ("ObjectMeta", &["generation"]),
-    ("Container", &["stdin", "stdinOnce", "tty"]),
-    ("EphemeralContainerCommon", &["stdin", "stdinOnce", "tty"]),
-    ("PodSpec", &["hostNetwork", "hostPID", "hostIPC"]),
-    ("ContainerPort", &["hostPort"]),
-    ("VolumeMount", &["readOnly"]),
-    (
-        "Probe",
-        &[
-            "initialDelaySeconds",
-            "timeoutSeconds",
-            "periodSeconds",
-            "successThreshold",
-            "failureThreshold",
-        ],
-    ),
-    ("PodCondition", &["observedGeneration"]),
-    ("PersistentVolumeClaimVolumeSource", &["readOnly"]),
-    ("NFSVolumeSource", &["readOnly"]),
-    (
-        "AWSElasticBlockStoreVolumeSource",
-        &["partition", "readOnly"],
-    ),
-    ("GCEPersistentDiskVolumeSource", &["partition", "readOnly"]),
-    ("AzureFileVolumeSource", &["readOnly"]),
-    ("AzureFilePersistentVolumeSource", &["readOnly"]),
-    ("CSIPersistentVolumeSource", &["readOnly"]),
-    ("CephFSVolumeSource", &["readOnly"]),
-    ("CephFSPersistentVolumeSource", &["readOnly"]),
-    ("CinderVolumeSource", &["readOnly"]),
-    ("CinderPersistentVolumeSource", &["readOnly"]),
-    ("FCVolumeSource", &["readOnly"]),
-    ("FlexVolumeSource", &["readOnly"]),
-    ("FlexPersistentVolumeSource", &["readOnly"]),
-    ("GlusterfsVolumeSource", &["readOnly"]),
-    ("GlusterfsPersistentVolumeSource", &["readOnly"]),
-    (
-        "ISCSIVolumeSource",
-        &["chapAuthDiscovery", "chapAuthSession", "readOnly"],
-    ),
-    (
-        "ISCSIPersistentVolumeSource",
-        &["chapAuthDiscovery", "chapAuthSession", "readOnly"],
-    ),
-    ("PortworxVolumeSource", &["readOnly"]),
-    ("QuobyteVolumeSource", &["readOnly"]),
-    ("RBDVolumeSource", &["readOnly"]),
-    ("RBDPersistentVolumeSource", &["readOnly"]),
-    ("ScaleIOVolumeSource", &["readOnly", "sslEnabled"]),
-    ("ScaleIOPersistentVolumeSource", &["readOnly", "sslEnabled"]),
-    ("StorageOSVolumeSource", &["readOnly"]),
-    ("StorageOSPersistentVolumeSource", &["readOnly"]),
-    ("DeploymentSpec", &["minReadySeconds", "paused"]),
-    ("ReplicaSetSpec", &["minReadySeconds"]),
-    ("StatefulSetSpec", &["minReadySeconds"]),
-    ("DaemonSetSpec", &["minReadySeconds"]),
-    ("ReplicationControllerSpec", &["minReadySeconds"]),
-    ("PriorityClass", &["globalDefault"]),
-];
+// Non-pointer `bool`/`int` fields tagged `json:",omitempty"` upstream, by
+// message (table generated from k8s.io/api `types.go`, release-1.35, by
+// scripts/gen-protobuf-plain-zero-scalars.py; #2931). Go's generated protobuf
+// marshaller writes a plain scalar even when it is zero (`dAtA[i] = 0`),
+// whereas JSON drops it, so an object that arrives over protobuf carries
+// `false`/`0` where its JSON twin carries nothing. Our models are `Option<_>`,
+// which tells the two apart (#2382, #2449), so the decoder emits the JSON form:
+// absent. Pointer fields (`*bool`, `*int32`) are NOT listed -- the marshaller
+// writes those only when non-nil, so an explicit zero there is a real value.
+// Fields whose tag lacks `omitempty` (containerPort, exitCode, ...) are always
+// present in JSON, so they stay. Plain strings need no table: the string
+// decoder already drops an empty one.
+pub mod plain_zero_scalars;
+use plain_zero_scalars::PLAIN_ZERO_SCALARS;
 
 /// Remove the zero-valued plain scalars of `msg_type` (see
 /// [`PLAIN_ZERO_SCALARS`]) from a decoded message.
 fn drop_plain_zero_scalars(msg_type: &str, value: &mut Value) {
-    let Some((_, fields)) = PLAIN_ZERO_SCALARS.iter().find(|(m, _)| *m == msg_type) else {
+    let Ok(i) = PLAIN_ZERO_SCALARS.binary_search_by(|(m, _)| (*m).cmp(msg_type)) else {
         return;
     };
+    let fields = PLAIN_ZERO_SCALARS[i].1;
     let Some(obj) = value.as_object_mut() else {
         return;
     };
-    for f in *fields {
+    for f in fields {
         let zero = match obj.get(*f) {
             Some(Value::Bool(b)) => !*b,
             Some(Value::Number(n)) => n.as_i64() == Some(0),
