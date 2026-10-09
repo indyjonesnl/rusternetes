@@ -11,12 +11,28 @@
 // not available on this machine (only its generated Go code is, under the
 // kubernetes vendor tree), so the file is reconstructed from those bindings and
 // holds exactly the Node-service RPCs the kubelet's volume plugin calls
-// (`pkg/volume/csi/csi_client.go`). The `csi_secret` field option is omitted: it
+// (`pkg/volume/csi/csi_client.go`), plus the Identity.GetPluginCapabilities and
+// Controller (CreateVolume/DeleteVolume/ControllerGetCapabilities/
+// CreateSnapshot/DeleteSnapshot) RPCs of the external-provisioner client. The `csi_secret` field option is omitted: it
 // only drives log redaction in Go's `protosanitizer` and has no wire effect.
 // Replace with the verbatim file when the spec repo is vendored.
 
 syntax = "proto3";
 package csi.v1;
+
+import "google/protobuf/timestamp.proto";
+
+service Identity {
+  rpc GetPluginCapabilities (GetPluginCapabilitiesRequest) returns (GetPluginCapabilitiesResponse) {}
+}
+
+service Controller {
+  rpc CreateVolume (CreateVolumeRequest) returns (CreateVolumeResponse) {}
+  rpc DeleteVolume (DeleteVolumeRequest) returns (DeleteVolumeResponse) {}
+  rpc ControllerGetCapabilities (ControllerGetCapabilitiesRequest) returns (ControllerGetCapabilitiesResponse) {}
+  rpc CreateSnapshot (CreateSnapshotRequest) returns (CreateSnapshotResponse) {}
+  rpc DeleteSnapshot (DeleteSnapshotRequest) returns (DeleteSnapshotResponse) {}
+}
 
 service Node {
   rpc NodeStageVolume (NodeStageVolumeRequest) returns (NodeStageVolumeResponse) {}
@@ -159,3 +175,142 @@ message NodeExpandVolumeRequest {
 message NodeExpandVolumeResponse {
   int64 capacity_bytes = 1;
 }
+
+// ---- Identity + Controller service subset (external-provisioner / snapshotter
+// client side). Field numbers verified against the vendored csi.pb.go.
+
+message GetPluginCapabilitiesRequest {}
+
+message GetPluginCapabilitiesResponse {
+  repeated PluginCapability capabilities = 1;
+}
+
+message PluginCapability {
+  message Service {
+    enum Type {
+      UNKNOWN = 0;
+      CONTROLLER_SERVICE = 1;
+      VOLUME_ACCESSIBILITY_CONSTRAINTS = 2;
+      GROUP_CONTROLLER_SERVICE = 3;
+    }
+    Type type = 1;
+  }
+  message VolumeExpansion {
+    enum Type {
+      UNKNOWN = 0;
+      ONLINE = 1;
+      OFFLINE = 2;
+    }
+    Type type = 1;
+  }
+  oneof type {
+    Service service = 1;
+    VolumeExpansion volume_expansion = 2;
+  }
+}
+
+message ControllerGetCapabilitiesRequest {}
+
+message ControllerGetCapabilitiesResponse {
+  repeated ControllerServiceCapability capabilities = 1;
+}
+
+message ControllerServiceCapability {
+  message RPC {
+    enum Type {
+      UNKNOWN = 0;
+      CREATE_DELETE_VOLUME = 1;
+      PUBLISH_UNPUBLISH_VOLUME = 2;
+      LIST_VOLUMES = 3;
+      GET_CAPACITY = 4;
+      CREATE_DELETE_SNAPSHOT = 5;
+      LIST_SNAPSHOTS = 6;
+      CLONE_VOLUME = 7;
+      PUBLISH_READONLY = 8;
+      EXPAND_VOLUME = 9;
+      LIST_VOLUMES_PUBLISHED_NODES = 10;
+      VOLUME_CONDITION = 11;
+      GET_VOLUME = 12;
+      SINGLE_NODE_MULTI_WRITER = 13;
+      MODIFY_VOLUME = 14;
+    }
+    Type type = 1;
+  }
+  oneof type {
+    RPC rpc = 1;
+  }
+}
+
+message TopologyRequirement {
+  repeated Topology requisite = 1;
+  repeated Topology preferred = 2;
+}
+
+message VolumeContentSource {
+  message SnapshotSource {
+    string snapshot_id = 1;
+  }
+  message VolumeSource {
+    string volume_id = 1;
+  }
+  oneof type {
+    SnapshotSource snapshot = 1;
+    VolumeSource volume = 2;
+  }
+}
+
+message Volume {
+  int64 capacity_bytes = 1;
+  string volume_id = 2;
+  map<string, string> volume_context = 3;
+  VolumeContentSource content_source = 4;
+  repeated Topology accessible_topology = 5;
+}
+
+message CreateVolumeRequest {
+  string name = 1;
+  CapacityRange capacity_range = 2;
+  repeated VolumeCapability volume_capabilities = 3;
+  map<string, string> parameters = 4;
+  map<string, string> secrets = 5;
+  VolumeContentSource volume_content_source = 6;
+  TopologyRequirement accessibility_requirements = 7;
+  map<string, string> mutable_parameters = 8;
+}
+
+message CreateVolumeResponse {
+  Volume volume = 1;
+}
+
+message DeleteVolumeRequest {
+  string volume_id = 1;
+  map<string, string> secrets = 2;
+}
+
+message DeleteVolumeResponse {}
+
+message CreateSnapshotRequest {
+  string source_volume_id = 1;
+  string name = 2;
+  map<string, string> secrets = 3;
+  map<string, string> parameters = 4;
+}
+
+message CreateSnapshotResponse {
+  Snapshot snapshot = 1;
+}
+
+message Snapshot {
+  int64 size_bytes = 1;
+  string snapshot_id = 2;
+  string source_volume_id = 3;
+  google.protobuf.Timestamp creation_time = 4;
+  bool ready_to_use = 5;
+}
+
+message DeleteSnapshotRequest {
+  string snapshot_id = 1;
+  map<string, string> secrets = 2;
+}
+
+message DeleteSnapshotResponse {}
