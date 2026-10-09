@@ -1268,4 +1268,56 @@ mod tests {
         drop(resp);
         assert_eq!(filter.watch_count_for_test(&info), 0);
     }
+    // ---- config controller: event-driven reload (#2811) ----
+    // `NewTestableController` + informer handlers (apf_controller.go:308-368)
+    // enqueue the config key on every FlowSchema/PriorityLevelConfiguration
+    // event; the worker re-digests. A reload therefore does not wait for any
+    // poll interval: the resync period here is an hour.
+
+    async fn wait_for<F: Fn() -> bool>(cond: F) -> bool {
+        for _ in 0..100 {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        cond()
+    }
+
+    fn extra_pl(name: &str) -> rusternetes_common::resources::PriorityLevelConfiguration {
+        use rusternetes_common::validation::flowcontrol_bootstrap::mandatory_priority_level_configuration;
+        let mut pl = mandatory_priority_level_configuration("catch-all").unwrap();
+        pl.metadata = rusternetes_common::types::ObjectMeta::new(name);
+        pl
+    }
+
+    #[tokio::test]
+    async fn config_change_applies_without_waiting_for_a_poll() {
+        use rusternetes_storage::build_key;
+        let st = Arc::new(MemoryStorage::new());
+        let engine = Arc::new(FlowControlEngine::with_limits(st.clone(), 100, 0));
+        engine.initialize().await.unwrap();
+        let _task = spawn_config_reloader(engine.clone(), Duration::from_secs(3600));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(engine.concurrency_limit("evented").is_none());
+        st.create(
+            &build_key("prioritylevelconfigurations", None, "evented"),
+            &extra_pl("evented"),
+        )
+        .await
+        .unwrap();
+        let e = engine.clone();
+        assert!(
+            wait_for(move || e.concurrency_limit("evented").is_some()).await,
+            "PL create event must reach the engine within the resync period"
+        );
+        st.delete(&build_key("prioritylevelconfigurations", None, "evented"))
+            .await
+            .unwrap();
+        let e = engine.clone();
+        assert!(
+            wait_for(move || e.concurrency_limit("evented").is_none()).await,
+            "PL delete event must reach the engine"
+        );
+    }
 }
