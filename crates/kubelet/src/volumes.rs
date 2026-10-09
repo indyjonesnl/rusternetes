@@ -183,6 +183,7 @@ impl VolumeManager {
             Box::new(crate::volume_plugins::host_path::HostPathPlugin::new(
                 host.clone(),
             )),
+            Box::new(crate::volume_plugins::local::LocalPlugin::new(host.clone())),
             Box::new(crate::volume_plugins::config_map::ConfigMapPlugin::new(
                 host.clone(),
             )),
