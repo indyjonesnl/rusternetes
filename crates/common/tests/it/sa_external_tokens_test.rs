@@ -306,6 +306,42 @@ fn token_without_audience_is_valid_for_the_api_audiences_only() {
 }
 
 #[test]
+fn legacy_token_is_observed_before_the_audience_rejection() {
+    // jwt.go:383-398: the legacy-token audit annotation and metric are
+    // recorded when the token has no `aud`, BEFORE the audience intersection,
+    // so a legacy token rejected for its audience is still observed.
+    let mut o = opts(&["rsa.pub"]);
+    o.api_audiences = vec!["api".to_string()];
+    let tm = manager(&o);
+    let mut c = upstream_claims(ISSUER, json!(null));
+    c.as_object_mut().unwrap().remove("aud");
+    let token = sign(Algorithm::RS256, rsa_key(), None, &c);
+
+    let mut seen: Vec<String> = Vec::new();
+    let rejected = tm.authenticate_token_observed(&token, Some(&["other".to_string()]), &mut |c| {
+        seen.push(c.sub.clone())
+    });
+    assert!(rejected.is_err());
+    assert_eq!(seen, vec!["system:serviceaccount:ns1:sa1".to_string()]);
+
+    // An accepted legacy token is observed once; a bound token is not.
+    seen.clear();
+    tm.authenticate_token_observed(&token, None, &mut |c| seen.push(c.sub.clone()))
+        .unwrap();
+    assert_eq!(seen.len(), 1);
+    seen.clear();
+    let bound = sign(
+        Algorithm::RS256,
+        rsa_key(),
+        None,
+        &upstream_claims(ISSUER, json!("api")),
+    );
+    tm.authenticate_token_observed(&bound, None, &mut |c| seen.push(c.sub.clone()))
+        .unwrap();
+    assert!(seen.is_empty());
+}
+
+#[test]
 fn unconfigured_manager_keeps_the_legacy_behaviour() {
     let tm = TokenManager::new(b"secret");
     let claims = ServiceAccountClaims::new("sa1".into(), "ns1".into(), "uid".into(), 1);

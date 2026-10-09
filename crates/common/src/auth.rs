@@ -570,6 +570,20 @@ impl TokenManager {
         token: &str,
         requested_audiences: Option<&[String]>,
     ) -> Result<(ServiceAccountClaims, Vec<String>)> {
+        self.authenticate_token_observed(token, requested_audiences, &mut |_| {})
+    }
+
+    /// [`Self::authenticate_token`] that calls `on_legacy_token` with the
+    /// verified claims of a token without an audience, at the point
+    /// `jwt.go:383-387` observes it: after the signature and issuer checks and
+    /// BEFORE the audience intersection, so a legacy token rejected for its
+    /// audience is still reported.
+    pub fn authenticate_token_observed(
+        &self,
+        token: &str,
+        requested_audiences: Option<&[String]>,
+        on_legacy_token: &mut dyn FnMut(&ServiceAccountClaims),
+    ) -> Result<(ServiceAccountClaims, Vec<String>)> {
         let invalid = |m: String| Error::Authentication(format!("Invalid token: {m}"));
 
         // hasCorrectIssuer (jwt.go:420-440)
@@ -646,6 +660,12 @@ impl TokenManager {
             }
         }
         let mut claims = decoded.ok_or_else(|| invalid(errors.join("; ")))?;
+
+        // jwt.go:383-387: a token without an audience is a legacy token; it is
+        // observed here, before the audience intersection can reject it.
+        if claims.aud.is_empty() {
+            on_legacy_token(&claims);
+        }
 
         // A legacy token carries them in the `kubernetes.io/serviceaccount/*`
         // private claims (`legacyPrivateClaims`); the legacy validator

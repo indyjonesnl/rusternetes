@@ -144,6 +144,28 @@ async fn invalidated_token_annotates_and_counts() {
 }
 
 #[tokio::test]
+async fn legacy_use_observed_before_audience_check_is_not_counted_twice() {
+    // jwt.go:383-387 observes first; the validator then runs on the same obs.
+    let s = seed(&[], json!({})).await;
+    let m = serviceaccount_metrics();
+    let before = m.legacy_tokens_total.get();
+    let mut obs = AuthObservations::default();
+    obs.observe_legacy_token("system:serviceaccount:ns:sa");
+    validate_service_account_token(&s, &token(), &claims(), &mut obs)
+        .await
+        .unwrap();
+    let annotated = obs
+        .audit_annotations
+        .iter()
+        .filter(|(k, _)| k == "authentication.k8s.io/legacy-token")
+        .count();
+    // the counter is process-wide (parallel tests), so the single annotation
+    // is what proves the observation ran once
+    assert_eq!(annotated, 1);
+    assert!(m.legacy_tokens_total.get() > before);
+}
+
+#[tokio::test]
 async fn bound_token_with_an_audience_is_not_a_legacy_use() {
     let s = StorageBackend::new_memory();
     let mut c = claims();

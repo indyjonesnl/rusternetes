@@ -44,12 +44,27 @@ pub struct AuthContext {
 pub struct AuthObservations {
     pub audit_annotations: Vec<(String, String)>,
     pub warnings: Vec<String>,
+    /// Set once the token's legacy use was observed, so the observation made
+    /// before the audience check is not repeated by the validator.
+    legacy_token_observed: bool,
 }
 
 impl AuthObservations {
     pub fn add_audit_annotation(&mut self, key: &str, value: &str) {
         self.audit_annotations
             .push((key.to_string(), value.to_string()));
+    }
+
+    /// `jwt.go:383-387`: record the `authentication.k8s.io/legacy-token` audit
+    /// annotation and bump `serviceaccount_legacy_tokens_total` for a token
+    /// without an audience. Idempotent per request.
+    pub fn observe_legacy_token(&mut self, subject: &str) {
+        if self.legacy_token_observed {
+            return;
+        }
+        self.legacy_token_observed = true;
+        self.add_audit_annotation("authentication.k8s.io/legacy-token", subject);
+        serviceaccount_metrics().legacy_tokens_total.inc();
     }
 
     /// `warning.AddWarning(ctx, "", text)`: an empty warning is dropped and a
@@ -536,10 +551,9 @@ pub async fn skip_auth_middleware(
 /// A token without an audience is a legacy token whichever issuer signed it:
 /// `jwt.go:383-387` records the `authentication.k8s.io/legacy-token` audit
 /// annotation and bumps `serviceaccount_legacy_tokens_total` (into `obs`).
-///
-/// Deviation: upstream does this before the audience intersection check, so a
-/// legacy token rejected for its audience is still counted; here the caller's
-/// audience check runs first and rejects it before this function is reached.
+/// A caller that checks audiences first records the observation itself via
+/// [`AuthObservations::observe_legacy_token`] before rejecting (jwt.go orders
+/// it ahead of the audience intersection); it is not repeated here.
 pub async fn validate_service_account_token(
     storage: &StorageBackend,
     token: &str,
@@ -547,8 +561,7 @@ pub async fn validate_service_account_token(
     obs: &mut AuthObservations,
 ) -> std::result::Result<(), String> {
     if claims.aud.is_empty() {
-        obs.add_audit_annotation("authentication.k8s.io/legacy-token", &claims.sub);
-        serviceaccount_metrics().legacy_tokens_total.inc();
+        obs.observe_legacy_token(&claims.sub);
     }
     if claims.iss == rusternetes_common::auth::LEGACY_ISSUER {
         validate_legacy_service_account_token(storage, token, claims, obs).await
