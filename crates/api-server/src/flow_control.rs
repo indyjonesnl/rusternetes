@@ -66,6 +66,9 @@ pub const DEFAULT_MAX_REQUESTS_IN_FLIGHT: i64 = 400;
 pub const DEFAULT_MAX_MUTATING_REQUESTS_IN_FLIGHT: i64 = 200;
 /// `priorityLevelMaxSeatsPercent` (apf_controller.go:63).
 const PRIORITY_LEVEL_MAX_SEATS_PERCENT: f64 = 0.15;
+
+/// `borrowingAdjustmentPeriod` (apf_controller.go:79).
+pub const BORROWING_ADJUSTMENT_PERIOD: Duration = Duration::from_secs(10);
 /// Default per-level `NominalConcurrencyShares` (`v1/defaults.go`).
 const DEFAULT_SHARES: i32 = 30;
 /// `Retry-After` value sent with a 429.
@@ -507,6 +510,15 @@ fn digest(
     }
 }
 
+/// `nominalCL`, `minCL`, `maxCL` and `currentCL` of a priority level.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BorrowingState {
+    pub nominal_cl: usize,
+    pub min_cl: usize,
+    pub max_cl: usize,
+    pub current_cl: usize,
+}
+
 /// Errors from [`FlowControlEngine::execute`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum FlowControlError {
@@ -540,6 +552,17 @@ impl<S: Storage> FlowControlEngine<S> {
             DEFAULT_MAX_REQUESTS_IN_FLIGHT,
             DEFAULT_MAX_MUTATING_REQUESTS_IN_FLIGHT,
         )
+    }
+
+    /// [`Self::with_limits`] with the clock the queuesets and seat-demand
+    /// integrators read (upstream: `TestableConfig.Clock`).
+    pub fn with_limits_and_clock(
+        storage: Arc<S>,
+        max_inflight: i64,
+        max_mutating_inflight: i64,
+        _clock: Arc<dyn crate::flow_control_queueset::Clock>,
+    ) -> Self {
+        Self::with_limits(storage, max_inflight, max_mutating_inflight)
     }
 
     pub fn with_limits(storage: Arc<S>, max_inflight: i64, max_mutating_inflight: i64) -> Self {
@@ -681,6 +704,33 @@ impl<S: Storage> FlowControlEngine<S> {
             .levels
             .get(priority_level)
             .map(|l| l.nominal_cl)
+    }
+
+    /// `lockAndDigestConfigObjects` (apf_controller.go:595).
+    pub fn digest_config_objects(
+        &self,
+        pls: Vec<PriorityLevelConfiguration>,
+        fss: Vec<FlowSchema>,
+    ) {
+        let mut cfg = self.config.write().unwrap();
+        let next = digest(pls, fss, self.server_cl, Some(&cfg));
+        *cfg = Arc::new(next);
+    }
+
+    /// `updateBorrowing` (apf_controller.go:393).
+    pub fn update_borrowing(&self) {}
+
+    /// The borrowing bounds and current limit of a level.
+    pub fn borrowing_state(&self, _priority_level: &str) -> Option<BorrowingState> {
+        None
+    }
+
+    /// The level's seat-demand integrator.
+    pub fn seat_demand(
+        &self,
+        _priority_level: &str,
+    ) -> Option<Arc<crate::flow_control_integrator::Integrator>> {
+        None
     }
 
     /// `startRequest` + `Request.Finish` (apf_controller.go:1022-1079,
@@ -873,6 +923,134 @@ mod tests {
             )
             .await
             .is_ok());
+    }
+
+    // ---- borrowing (#2743; exempt_borrowing_test.go) ----
+
+    fn borrowing_pl(
+        name: &str,
+        shares: i32,
+        lendable: Option<i32>,
+        borrowing: Option<i32>,
+    ) -> PriorityLevelConfiguration {
+        let mut pl = queueing_pl(128, 6, 50);
+        pl.metadata = ObjectMeta::new(name);
+        let l = pl.spec.limited.as_mut().unwrap();
+        l.nominal_concurrency_shares = Some(shares);
+        l.lendable_percent = lendable;
+        l.borrowing_limit_percent = borrowing;
+        pl
+    }
+
+    /// `TestUpdateBorrowing` (exempt_borrowing_test.go:33). The levels mirror
+    /// `SuggestedPriorityLevelConfigurationWorkloadHigh` (shares 40, lendable
+    /// 50%), `...WorkloadLow` (100, 90%) and the mandatory catch-all (5, 0%).
+    #[test]
+    fn update_borrowing_matches_upstream_exempt_borrowing_test() {
+        use crate::flow_control_integrator::test_clock::ManualClock;
+        let period = BORROWING_ADJUSTMENT_PERIOD;
+        let clk = ManualClock::new();
+        let server_cl = (40 + 100 + 5) * 6;
+        let e = FlowControlEngine::with_limits_and_clock(
+            Arc::new(MemoryStorage::new()),
+            server_cl,
+            0,
+            clk.clone(),
+        );
+        e.digest_config_objects(
+            vec![
+                borrowing_pl("high", 40, Some(50), None),
+                mandatory_priority_level_configuration("exempt").unwrap(),
+                borrowing_pl("mid", 100, Some(90), None),
+                mandatory_priority_level_configuration("catch-all").unwrap(),
+            ],
+            vec![],
+        );
+        let st = |n: &str| e.borrowing_state(n).unwrap();
+        let demand = |n: &str, x: f64| e.seat_demand(n).unwrap().set(x);
+        let (high, mid, low) = (st("high"), st("mid"), st("catch-all"));
+        assert_eq!(
+            high.nominal_cl + mid.nominal_cl + low.nominal_cl,
+            server_cl as usize
+        );
+
+        // Scenario 1: everybody wants more than ServerConcurrencyLimit.
+        // Exempt borrows so much that less than minCL is left for each
+        // non-exempt level.
+        for n in ["exempt", "high", "mid", "catch-all"] {
+            demand(n, (server_cl + 100) as f64);
+        }
+        clk.set(period);
+        e.update_borrowing();
+        assert_eq!(st("exempt").current_cl, server_cl as usize + 100);
+        assert_eq!(st("high").current_cl, high.min_cl);
+        assert_eq!(st("mid").current_cl, mid.min_cl);
+        assert_eq!(st("catch-all").current_cl, low.min_cl);
+
+        // Scenario 2: non-exempt want more than serverCL but get halfway
+        // between minCL and minCurrentCL.
+        let exp_high = (high.nominal_cl + high.min_cl) / 2;
+        let exp_mid = (mid.nominal_cl + mid.min_cl) / 2;
+        let exp_low = (low.nominal_cl + low.min_cl) / 2;
+        let exp_exempt = server_cl as usize - (exp_high + exp_mid + exp_low);
+        demand("exempt", exp_exempt as f64);
+        clk.set(2 * period);
+        e.update_borrowing();
+        clk.set(3 * period);
+        e.update_borrowing();
+        assert_eq!(st("exempt").current_cl, exp_exempt);
+        assert_eq!(st("high").current_cl, exp_high);
+        assert_eq!(st("mid").current_cl, exp_mid);
+        assert_eq!(st("catch-all").current_cl, exp_low);
+
+        // Scenario 3: only mid is willing to lend, and exempt borrows all of
+        // that (regular borrowing).
+        let exp_high = high.nominal_cl;
+        let exp_mid = mid.min_cl;
+        let exp_low = low.nominal_cl;
+        let exp_exempt = server_cl as usize - (exp_high + exp_mid + exp_low);
+        demand("exempt", exp_exempt as f64);
+        demand("mid", 1.0);
+        clk.set(4 * period);
+        e.update_borrowing();
+        clk.set(5 * period);
+        e.update_borrowing();
+        assert_eq!(st("exempt").current_cl, exp_exempt);
+        assert_eq!(st("high").current_cl, exp_high);
+        assert_eq!(st("mid").current_cl, exp_mid);
+        assert_eq!(st("catch-all").current_cl, exp_low);
+    }
+
+    /// `finishQueueSetReconfigsLocked` (apf_controller.go:859-900): min/max
+    /// from lendable/borrowing percents, initial currentCL = nominal -
+    /// lendable/2, and a level with no demand lends down to its minCL.
+    #[test]
+    fn digest_derives_min_max_and_initial_current_cl() {
+        use crate::flow_control_integrator::test_clock::ManualClock;
+        let e = FlowControlEngine::with_limits_and_clock(
+            Arc::new(MemoryStorage::new()),
+            100,
+            0,
+            ManualClock::new(),
+        );
+        e.digest_config_objects(
+            vec![
+                borrowing_pl("a", 50, Some(40), Some(30)),
+                borrowing_pl("b", 50, None, Some(0)),
+            ],
+            vec![],
+        );
+        // catch-all (5 shares) joins: shareSum 105.
+        let a = e.borrowing_state("a").unwrap();
+        assert_eq!(a.nominal_cl, 48); // ceil(100*50/105)
+        assert_eq!(a.min_cl, 48 - 19); // lendable round(48*0.4)=19
+        assert_eq!(a.max_cl, 48 + 14); // borrowing round(48*0.3)=14
+        let b = e.borrowing_state("b").unwrap();
+        assert_eq!((b.min_cl, b.max_cl), (48, 48));
+        assert_eq!(b.current_cl, 48);
+        // No demand has been observed, so the first adjustment lends all it can.
+        e.update_borrowing();
+        assert!(e.borrowing_state("a").unwrap().current_cl >= a.min_cl);
     }
 
     // ---- QueueSet wiring (#2741) ----

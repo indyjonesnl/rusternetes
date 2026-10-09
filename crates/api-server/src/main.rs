@@ -18,7 +18,9 @@ mod dynamic_routes;
 mod endpoints;
 #[allow(dead_code)]
 mod flow_control;
+mod flow_control_conc_alloc;
 mod flow_control_filter;
+mod flow_control_integrator;
 #[allow(dead_code)]
 mod flow_control_object_count;
 #[allow(dead_code)]

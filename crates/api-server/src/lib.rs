@@ -13,7 +13,9 @@ pub mod dynamic_routes;
 pub mod endpoints;
 #[allow(dead_code)]
 pub mod flow_control;
+pub mod flow_control_conc_alloc;
 pub mod flow_control_filter;
+pub mod flow_control_integrator;
 pub mod flow_control_object_count;
 pub mod flow_control_queueset;
 pub mod flow_control_stats_poller;
