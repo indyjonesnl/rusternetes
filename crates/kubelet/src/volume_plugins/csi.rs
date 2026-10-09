@@ -1404,6 +1404,27 @@ impl Unmounter for CsiUnmounter {
     }
 }
 
+/// `isResourceExhaustError` (`csi_plugin.go:234-240`): the attachment's
+/// `status.attachError.errorCode` is gRPC `ResourceExhausted` (8).
+pub(crate) fn is_resource_exhaust_error(attachment: Option<&VolumeAttachment>) -> bool {
+    let _ = attachment;
+    false
+}
+
+impl CsiPlugin {
+    /// Port of `VerifyExhaustedResource` (`csi_plugin.go:192-232`).
+    pub async fn verify_exhausted_resource(
+        &self,
+        spec: &Spec<'_>,
+        node_name: &str,
+        drivers: &crate::volume_plugins::csi_drivers_store::DriversStore,
+        nim: &dyn crate::volume_plugins::nodeinfomanager::NodeInfoInstaller,
+    ) -> bool {
+        let _ = (spec, node_name, drivers, nim);
+        false
+    }
+}
+
 /// `getAttachmentName` (`csi_attacher.go:593-596`).
 pub(crate) fn get_attachment_name(vol_name: &str, driver: &str, node: &str) -> String {
     format!(

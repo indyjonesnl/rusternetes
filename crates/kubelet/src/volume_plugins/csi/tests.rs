@@ -1579,3 +1579,198 @@ mod fs_group {
         assert!(f.fake.calls.lock().unwrap().publish.is_empty());
     }
 }
+
+// ---- VerifyExhaustedResource (`csi_plugin_test.go:1470-1547`, `csi_plugin.go:192-232`) ----
+
+mod exhausted {
+    use super::*;
+    use crate::volume_plugins::csi_client::proto::NodeGetInfoResponse;
+    use crate::volume_plugins::csi_drivers_store::DriversStore;
+    use crate::volume_plugins::nodeinfomanager::NodeInfoInstaller;
+    use rusternetes_common::resources::{CSIDriver, VolumeAttachment};
+    use std::sync::Mutex;
+
+    const EXHAUSTED: i32 = 8;
+    const NOT_FOUND: i32 = 5;
+
+    fn attachment(code: Option<i32>) -> VolumeAttachment {
+        let status = match code {
+            Some(c) => json!({"attached": false, "attachError": {"message": "e", "errorCode": c}}),
+            None => json!({"attached": false, "attachError": {"message": "e"}}),
+        };
+        serde_json::from_value(json!({
+            "metadata": {"name": "x"},
+            "spec": {"attacher": "d", "nodeName": "n", "source": {}},
+            "status": status
+        }))
+        .unwrap()
+    }
+
+    /// `TestIsResourceExhaustError` (`csi_plugin_test.go:1470-1547`).
+    #[test]
+    fn is_resource_exhaust_error_table() {
+        assert!(!is_resource_exhaust_error(None), "nil attachment");
+        let mut no_err = attachment(None);
+        no_err.status.as_mut().unwrap().attach_error = None;
+        assert!(!is_resource_exhaust_error(Some(&no_err)), "nil AttachError");
+        assert!(
+            !is_resource_exhaust_error(Some(&attachment(None))),
+            "nil ErrorCode"
+        );
+        assert!(!is_resource_exhaust_error(Some(&attachment(Some(NOT_FOUND)))));
+        assert!(is_resource_exhaust_error(Some(&attachment(Some(EXHAUSTED)))));
+        let mut no_status = attachment(None);
+        no_status.status = None;
+        assert!(!is_resource_exhaust_error(Some(&no_status)), "nil status");
+    }
+
+    #[derive(Default)]
+    struct Rec(Mutex<Vec<String>>);
+
+    #[async_trait::async_trait]
+    impl NodeInfoInstaller for Rec {
+        async fn install_csi_driver(
+            &self,
+            _: &str,
+            _: &str,
+            _: i64,
+            _: &HashMap<String, String>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn update_csi_driver(
+            &self,
+            n: &str,
+            _: &str,
+            _: i64,
+            _: &HashMap<String, String>,
+        ) -> Result<(), String> {
+            self.0.lock().unwrap().push(n.into());
+            Ok(())
+        }
+        async fn uninstall_csi_driver(&self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    const DRIVER: &str = "exhausted.csi.example.com";
+    const NODE: &str = "node-1";
+
+    struct Fx {
+        plugin: CsiPlugin,
+        drivers: &'static DriversStore,
+        rec: Rec,
+        _dir: tempfile::TempDir,
+    }
+
+    /// `csi_driver`: `Some(period)` creates a CSIDriver with that
+    /// `nodeAllocatableUpdatePeriodSeconds`, `None` no object at all.
+    /// `code`: `Some(code)` creates the VolumeAttachment with that error code.
+    async fn fx(csi_driver: Option<Option<i64>>, code: Option<Option<i32>>) -> Fx {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("csi.sock");
+        let fake = FakeDriver::default();
+        *fake.node_info.lock().unwrap() = Some(Ok(NodeGetInfoResponse {
+            node_id: "n1".into(),
+            max_volumes_per_node: 7,
+            accessible_topology: None,
+        }));
+        std::mem::forget(serve(fake, &sock));
+        let drivers: &'static DriversStore = Box::leak(Box::new(DriversStore::new()));
+        drivers.set(
+            DRIVER,
+            Driver {
+                endpoint: sock.to_string_lossy().to_string(),
+                highest_supported_version: "1.0.0".into(),
+            },
+        );
+        let st = Arc::new(StorageBackend::Memory(Arc::new(MemoryStorage::new())));
+        if let Some(period) = csi_driver {
+            let mut d: CSIDriver = serde_json::from_value(json!({
+                "metadata": {"name": DRIVER}, "spec": {}
+            }))
+            .unwrap();
+            d.spec.node_allocatable_update_period_seconds = period;
+            st.create(&build_key("csidrivers", None, DRIVER), &d)
+                .await
+                .unwrap();
+        }
+        if let Some(code) = code {
+            let name = get_attachment_name("vol-1", DRIVER, NODE);
+            let mut a = attachment(code);
+            a.metadata.name = name.clone();
+            st.create(&build_key("volumeattachments", None, &name), &a)
+                .await
+                .unwrap();
+        }
+        Fx {
+            plugin: CsiPlugin::new(host("/var/lib/rusternetes", Some(st))),
+            drivers,
+            rec: Rec::default(),
+            _dir: dir,
+        }
+    }
+
+    async fn verify(f: &Fx, spec_pv: &rusternetes_common::resources::PersistentVolume) -> bool {
+        let vol = claim_volume();
+        let spec = Spec {
+            volume: &vol,
+            persistent_volume: Some(spec_pv),
+            read_only: false,
+        };
+        f.plugin
+            .verify_exhausted_resource(&spec, NODE, f.drivers, &f.rec)
+            .await
+    }
+
+    #[tokio::test]
+    async fn resource_exhausted_attachment_refreshes_csinode_and_returns_true() {
+        let f = fx(Some(Some(10)), Some(Some(EXHAUSTED))).await;
+        assert!(verify(&f, &pv(DRIVER, json!({}))).await);
+        assert_eq!(*f.rec.0.lock().unwrap(), vec![DRIVER], "updateCSIDriver");
+    }
+
+    #[tokio::test]
+    async fn other_attach_error_returns_false_without_refresh() {
+        let f = fx(Some(Some(10)), Some(Some(NOT_FOUND))).await;
+        assert!(!verify(&f, &pv(DRIVER, json!({}))).await);
+        assert!(f.rec.0.lock().unwrap().is_empty());
+    }
+
+    /// `period == 0` (`csi_plugin.go:204-206`): no VolumeAttachment is consulted.
+    #[tokio::test]
+    async fn unset_update_period_returns_false() {
+        let f = fx(Some(None), Some(Some(EXHAUSTED))).await;
+        assert!(!verify(&f, &pv(DRIVER, json!({}))).await);
+        assert!(f.rec.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_csidriver_returns_false() {
+        let f = fx(None, Some(Some(EXHAUSTED))).await;
+        assert!(!verify(&f, &pv(DRIVER, json!({}))).await);
+    }
+
+    #[tokio::test]
+    async fn missing_attachment_returns_false() {
+        let f = fx(Some(Some(10)), None).await;
+        assert!(!verify(&f, &pv(DRIVER, json!({}))).await);
+    }
+
+    /// `spec.PersistentVolume == nil` (`csi_plugin.go:193-196`).
+    #[tokio::test]
+    async fn spec_without_pv_returns_false() {
+        let f = fx(Some(Some(10)), Some(Some(EXHAUSTED))).await;
+        let vol = claim_volume();
+        let spec = Spec {
+            volume: &vol,
+            persistent_volume: None,
+            read_only: false,
+        };
+        assert!(
+            !f.plugin
+                .verify_exhausted_resource(&spec, NODE, f.drivers, &f.rec)
+                .await
+        );
+    }
+}
