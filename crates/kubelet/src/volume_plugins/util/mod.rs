@@ -246,6 +246,39 @@ impl crate::volume_plugins::Unmounter for WrappedEmptyDirUnmounter {
     }
 }
 
+/// `emptyDir.getMetaDir` (`empty_dir.go:557-559`) of the emptyDir wrapped for
+/// `vol_name`: `<pod>/plugins/kubernetes.io~empty-dir/wrapped_<vol_name>`
+/// (`NewWrapperMounter`, `volume_host.go:194-198`).
+pub fn wrapped_empty_dir_meta_dir(
+    host: &std::sync::Arc<dyn crate::volume_plugins::VolumeHost>,
+    vol_name: &str,
+    pod_uid: &str,
+) -> String {
+    let escaped = crate::pod_dirs::escape_qualified_name(crate::pod_dirs::plugin::EMPTY_DIR);
+    std::path::Path::new(&host.get_pod_plugin_dir(pod_uid, &escaped))
+        .join(format!("wrapped_{vol_name}"))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// `volumeutil.SetReady` (`pkg/volume/util/util.go:93-106`): MkdirAll the dir
+/// at 0750 and touch the `ready` file. Errors are logged, not returned.
+pub fn set_ready(dir: &str) {
+    use std::os::unix::fs::DirBuilderExt;
+    if let Err(e) = std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o750)
+        .create(dir)
+    {
+        tracing::error!("Can't mkdir {dir}: {e}");
+        return;
+    }
+    let ready_file = std::path::Path::new(dir).join("ready");
+    if let Err(e) = std::fs::File::create(&ready_file) {
+        tracing::error!("Can't touch {}: {e}", ready_file.display());
+    }
+}
+
 /// Port of `UnmountViaEmptyDir` (`pkg/volume/util/util.go:173-184`): the
 /// tear-down of secret, configMap, downwardAPI and projected is delegated to
 /// emptyDir, which finds out whether `dir` is a tmpfs mount, unmounts it if so

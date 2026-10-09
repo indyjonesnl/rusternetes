@@ -19,6 +19,10 @@ pub trait VolumeHost: Send + Sync {
     /// `GetPodVolumeDir` (`plugins.go:361`).
     fn get_pod_volume_dir(&self, pod_uid: &str, plugin_name: &str, volume_name: &str) -> String;
 
+    /// `GetPodPluginDir` (`plugins.go:364`, `kubelet_getters.go:208-210`).
+    /// `escaped_plugin_name` is already escaped, as at upstream's callers.
+    fn get_pod_plugin_dir(&self, pod_uid: &str, escaped_plugin_name: &str) -> String;
+
     /// `GetKubeClient` (`plugins.go:377`). Our equivalent of the API client is
     /// the storage backend the kubelet already reads objects through.
     fn get_kube_client(&self) -> Option<&Arc<StorageBackend>>;
@@ -88,6 +92,12 @@ impl VolumeHost for KubeletVolumeHost {
         )
         .to_string_lossy()
         .into_owned()
+    }
+
+    fn get_pod_plugin_dir(&self, pod_uid: &str, escaped_plugin_name: &str) -> String {
+        crate::pod_dirs::get_pod_plugin_dir(&self.volumes_base_path, pod_uid, escaped_plugin_name)
+            .to_string_lossy()
+            .into_owned()
     }
 
     fn get_kube_client(&self) -> Option<&Arc<StorageBackend>> {
