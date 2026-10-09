@@ -693,6 +693,43 @@ async fn a_snapshot_is_protected_while_its_volume_is_not_yet_provisioned() {
         .contains(&SNAP_FINALIZER.to_string()));
 }
 
+/// `--prevent-volume-mode-conversion` (default on): a Block claim over a
+/// Filesystem snapshot needs the allow-volume-mode-change annotation.
+#[tokio::test]
+async fn a_volume_mode_conversion_needs_the_snapshot_content_annotation() {
+    let (storage, p, rec, _d) = env(Fake::with_content_sources(), storage_class(None)).await;
+    let mut content = snapshot_content(DRIVER, Some("h"));
+    content.spec.source_volume_mode = Some("Filesystem".into());
+    put_snapshot(&storage, &snapshot(true, None), &content).await;
+    let mut c = snapshot_claim();
+    c.spec.volume_mode = Some(PersistentVolumeMode::Block);
+    let err = p.sync_claim(&c).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("modifies the mode of the source volume but does not have permission"),
+        "{err}"
+    );
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+
+    content
+        .metadata
+        .annotations
+        .get_or_insert_with(Default::default)
+        .insert(
+            "snapshot.storage.kubernetes.io/allow-volume-mode-change".into(),
+            "true".into(),
+        );
+    storage
+        .update(
+            &build_key("volumesnapshotcontents", None, "snapcontent-1"),
+            &content,
+        )
+        .await
+        .unwrap();
+    p.sync_claim(&c).await.unwrap();
+    assert_eq!(rec.lock().unwrap().create_volume.len(), 1);
+}
+
 #[tokio::test]
 async fn an_unready_snapshot_is_not_restored() {
     let (storage, p, rec, _d) = env(Fake::with_content_sources(), storage_class(None)).await;

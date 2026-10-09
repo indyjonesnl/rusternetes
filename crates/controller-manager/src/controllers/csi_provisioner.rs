@@ -14,10 +14,10 @@
 //! driver name and talks to that driver's Controller service over its unix
 //! socket ([`CsiControllerClient`]).
 //!
-//! Slice 1 (this file): a claim without a data source. NOT yet ported, each
-//! tracked on #2882 and rejected loudly rather than silently ignored:
-//! `dataSource` / `dataSourceRef` of kind VolumeSnapshot or PVC
-//! (`getVolumeContentSource`), provisioner/other secret parameters
+//! Slices 1-2 (this file): a claim with or without a VolumeSnapshot / PVC
+//! data source (`getVolumeContentSource`). NOT yet ported, each tracked on
+//! #2882 and rejected loudly rather than silently ignored: a cross-namespace
+//! `dataSourceRef` (`IsGranted`, #2981), provisioner/other secret parameters
 //! (`getSecretReference`), topology (`GenerateAccessibilityRequirements`,
 //! `GenerateVolumeNodeAffinity`), VolumeAttributesClass, the delete path
 //! (`syncVolume` / `deleteVolumeOperation`) and the slow-retry set for
@@ -27,8 +27,8 @@ use anyhow::{anyhow, Context, Result};
 use rusternetes_common::quantity::{Format, Quantity};
 use rusternetes_common::resources::service_account::ObjectReference;
 use rusternetes_common::resources::volume::{
-    CSIVolumeSource, PersistentVolumeAccessMode, PersistentVolumeMode, PersistentVolumePhase,
-    StorageClass, VolumeBindingMode,
+    CSIVolumeSource, PersistentVolumeAccessMode, PersistentVolumeClaimPhase, PersistentVolumeMode,
+    PersistentVolumePhase, StorageClass, VolumeBindingMode, VolumeSnapshot, VolumeSnapshotContent,
 };
 use rusternetes_common::resources::{
     EventSource, EventType, PersistentVolume, PersistentVolumeClaim, PersistentVolumeSpec,
@@ -41,8 +41,11 @@ use rusternetes_csi::controller_client::{
 };
 use rusternetes_csi::proto::volume_capability::access_mode::Mode as AccessModeKind;
 use rusternetes_csi::proto::volume_capability::{AccessMode, AccessType, BlockVolume, MountVolume};
+use rusternetes_csi::proto::volume_content_source::{
+    SnapshotSource, Type as ContentSourceType, VolumeSource,
+};
 use rusternetes_csi::proto::{
-    CapacityRange, CreateVolumeRequest, DeleteVolumeRequest, VolumeCapability,
+    CapacityRange, CreateVolumeRequest, DeleteVolumeRequest, VolumeCapability, VolumeContentSource,
 };
 use rusternetes_storage::WorkQueueConfig;
 use rusternetes_storage::{build_key, extract_key, EventRecorder, Storage, WorkQueue};
@@ -100,6 +103,14 @@ const PV_NAME_KEY: &str = "csi.storage.k8s.io/pv/name";
 const SNAPSHOT_KIND: &str = "VolumeSnapshot";
 const SNAPSHOT_API_GROUP: &str = "snapshot.storage.k8s.io";
 const PVC_KIND: &str = "PersistentVolumeClaim";
+/// `pvcCloneFinalizer` (controller.go:164).
+const PVC_CLONE_FINALIZER: &str = "provisioner.storage.kubernetes.io/cloning-protection";
+/// `snapshotSourceProtectionFinalizer` (controller.go:168).
+const SNAPSHOT_SOURCE_PROTECTION_FINALIZER: &str =
+    "provisioner.storage.kubernetes.io/volumesnapshot-as-source-protection";
+/// `annAllowVolumeModeChange` (controller.go:170).
+const ANN_ALLOW_VOLUME_MODE_CHANGE: &str =
+    "snapshot.storage.kubernetes.io/allow-volume-mode-change";
 /// `deleteVolumeRetryCount` (controller.go:141).
 const DELETE_VOLUME_RETRY_COUNT: usize = 5;
 /// `--volume-name-prefix` default (csi-provisioner.go:81).
@@ -152,6 +163,13 @@ fn claim_class(claim: &PersistentVolumeClaim) -> String {
         .and_then(|a| a.get("volume.beta.kubernetes.io/storage-class"))
         .cloned()
         .unwrap_or_default()
+}
+
+/// `checkFinalizer` (controller.go:2088).
+fn has_finalizer(meta: &ObjectMeta, finalizer: &str) -> bool {
+    meta.finalizers
+        .as_ref()
+        .is_some_and(|f| f.iter().any(|f| f == finalizer))
 }
 
 fn annotation<'a>(meta: &'a ObjectMeta, key: &str) -> Option<&'a String> {
@@ -241,6 +259,51 @@ fn is_block(claim: &PersistentVolumeClaim) -> bool {
     matches!(claim.spec.volume_mode, Some(PersistentVolumeMode::Block))
 }
 
+/// The `*v1.ObjectReference` `dataSource` (controller.go:2096) normalises a
+/// claim's `dataSource` / `dataSourceRef` to; `api_group` is upstream's
+/// `APIVersion` field, which it fills with the API group.
+#[derive(Debug, Clone)]
+struct DataSource {
+    kind: String,
+    name: String,
+    api_group: String,
+    namespace: String,
+}
+
+/// `dataSource` (controller.go:2096-2142). The cross-namespace branch needs
+/// the `CrossNamespaceVolumeDataSource` gate (alpha, off by default) and a
+/// ReferenceGrant check (`IsGranted`); neither is ported (#2981), so, as with
+/// the gate disabled, a `dataSourceRef.namespace` is refused.
+fn data_source(claim: &PersistentVolumeClaim) -> std::result::Result<Option<DataSource>, String> {
+    let ns = claim.metadata.namespace.clone().unwrap_or_default();
+    if let Some(d) = &claim.spec.data_source {
+        return Ok(Some(DataSource {
+            kind: d.kind.clone(),
+            name: d.name.clone(),
+            api_group: d.api_group.clone().unwrap_or_default(),
+            namespace: ns,
+        }));
+    }
+    if let Some(d) = &claim.spec.data_source_ref {
+        if d.namespace.as_deref().is_some_and(|n| !n.is_empty()) {
+            return Err("dataSourceRef namespace specified but the CrossNamespaceVolumeDataSource feature is disabled".to_string());
+        }
+        return Ok(Some(DataSource {
+            kind: d.kind.clone(),
+            name: d.name.clone(),
+            api_group: d.api_group.clone().unwrap_or_default(),
+            namespace: ns,
+        }));
+    }
+    Ok(None)
+}
+
+/// `Quantity.Value()` of a `storage` entry, `0` when absent (Go's zero value).
+fn storage_bytes(q: Option<&String>) -> i64 {
+    q.and_then(|q| Quantity::parse(q).ok())
+        .map_or(0, |q| q.value() as i64)
+}
+
 /// What `prepareProvision` returns.
 struct Prepared {
     fs_type: String,
@@ -257,6 +320,7 @@ pub struct CsiProvisioner<S: Storage> {
     default_fs_type: String,
     extra_create_metadata: bool,
     controller_publish_read_only: bool,
+    prevent_volume_mode_conversion: bool,
     recorder: EventRecorder<S>,
     /// `claimsInProgress`: claims whose CreateVolume may still be running in
     /// the driver; kept so a claim deleted meanwhile is still driven to
@@ -290,6 +354,9 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             default_fs_type: String::new(),
             extra_create_metadata: false,
             controller_publish_read_only: false,
+            // `--prevent-volume-mode-conversion` defaults to true
+            // (csi-provisioner.go:112).
+            prevent_volume_mode_conversion: true,
             claims_in_progress: Mutex::new(HashMap::new()),
             unsaved: Mutex::new(HashMap::new()),
             capabilities: tokio::sync::OnceCell::new(),
@@ -311,6 +378,12 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
     /// `--controller-publish-readonly`.
     pub fn with_controller_publish_read_only(mut self, on: bool) -> Self {
         self.controller_publish_read_only = on;
+        self
+    }
+
+    /// `--prevent-volume-mode-conversion`.
+    pub fn with_prevent_volume_mode_conversion(mut self, on: bool) -> Self {
+        self.prevent_volume_mode_conversion = on;
         self
     }
 
@@ -636,45 +709,27 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
         let fin = |e: String| (ProvisioningState::Finished, Failure::Error(anyhow!(e)));
 
         // dataSource normalisation + required capabilities (:586-:625).
-        let rc = RequiredCapabilities::default();
-        let data_source = claim
-            .spec
-            .data_source
-            .as_ref()
-            .map(|d| {
-                (
-                    d.api_group.clone().unwrap_or_default(),
-                    d.kind.clone(),
-                    d.name.clone(),
-                    None,
-                )
-            })
-            .or_else(|| {
-                claim.spec.data_source_ref.as_ref().map(|d| {
-                    (
-                        d.api_group.clone().unwrap_or_default(),
-                        d.kind.clone(),
-                        d.name.clone(),
-                        d.namespace.clone(),
-                    )
-                })
-            });
-        if let Some((api_group, kind, name, namespace)) = &data_source {
-            if name.is_empty() {
+        let mut rc = RequiredCapabilities::default();
+        let data_source = data_source(claim).map_err(fin)?;
+        if let Some(ds) = &data_source {
+            // PVC.Spec.DataSource.Name is the name of the VolumeSnapshot API object
+            if ds.name.is_empty() {
                 return Err(fin(format!(
                     "the PVC source not found for PVC {}",
                     claim.metadata.name
                 )));
             }
-            match kind.as_str() {
+            match ds.kind.as_str() {
                 SNAPSHOT_KIND => {
-                    if api_group != SNAPSHOT_API_GROUP {
+                    if ds.api_group != SNAPSHOT_API_GROUP {
                         return Err(fin(format!(
-                            "the PVC source does not belong to the right APIGroup. Expected {SNAPSHOT_API_GROUP}, Got {api_group}"
+                            "the PVC source does not belong to the right APIGroup. Expected {SNAPSHOT_API_GROUP}, Got {}",
+                            ds.api_group
                         )));
                     }
+                    rc.snapshot = true;
                 }
-                PVC_KIND => {}
+                PVC_KIND => rc.clone = true,
                 other => {
                     // "Assume external data populator to create the volume,
                     // and there is no more work for us to do"
@@ -693,10 +748,6 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
                     ));
                 }
             }
-            let _ = namespace;
-            return Err(fin(format!(
-                "dataSource {kind} {name} is not supported by this provisioner yet (#2882: VolumeContentSource)"
-            )));
         }
         if claim
             .spec
@@ -787,7 +838,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             parameters.insert(PV_NAME_KEY.into(), pv_name.to_string());
         }
 
-        let req = CreateVolumeRequest {
+        let mut req = CreateVolumeRequest {
             name: pv_name.to_string(),
             parameters,
             volume_capabilities: volume_caps,
@@ -797,7 +848,397 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             }),
             ..Default::default()
         };
+
+        if let Some(ds) = data_source.as_ref().filter(|_| rc.clone || rc.snapshot) {
+            let source = self
+                .get_volume_content_source(claim, sc, ds)
+                .await
+                .map_err(|e| {
+                    (
+                        ProvisioningState::NoChange,
+                        Failure::Error(anyhow!(
+                            "error getting handle for DataSource Type {} by Name {}: {e}",
+                            ds.kind,
+                            ds.name
+                        )),
+                    )
+                })?;
+            req.volume_content_source = source;
+            if rc.clone {
+                self.set_clone_finalizer(ds)
+                    .await
+                    .map_err(|e| (ProvisioningState::NoChange, Failure::Error(e)))?;
+            }
+            if rc.snapshot {
+                self.set_snapshot_finalizer(ds)
+                    .await
+                    .map_err(|e| (ProvisioningState::NoChange, Failure::Error(e)))?;
+            }
+        }
         Ok(Prepared { fs_type, req })
+    }
+
+    // ---- data sources ---------------------------------------------------------
+
+    /// `getVolumeContentSource` (controller.go:1184-1196).
+    async fn get_volume_content_source(
+        &self,
+        claim: &PersistentVolumeClaim,
+        sc: &StorageClass,
+        ds: &DataSource,
+    ) -> Result<Option<VolumeContentSource>> {
+        match ds.kind.as_str() {
+            SNAPSHOT_KIND => self.get_snapshot_source(claim, sc, ds).await.map(Some),
+            PVC_KIND => self.get_pvc_source(claim, sc, ds).await.map(Some),
+            // "treat it as a noop and extend as needed"
+            _ => Ok(None),
+        }
+    }
+
+    /// `getPVCSource` (controller.go:1198-1287).
+    async fn get_pvc_source(
+        &self,
+        claim: &PersistentVolumeClaim,
+        sc: &StorageClass,
+        ds: &DataSource,
+    ) -> Result<VolumeContentSource> {
+        let source: PersistentVolumeClaim = self
+            .storage
+            .get(&build_key(
+                "persistentvolumeclaims",
+                Some(&ds.namespace),
+                &ds.name,
+            ))
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "error getting PVC {} (namespace {:?}) from api server: {e}",
+                    ds.name,
+                    claim.metadata.namespace.as_deref().unwrap_or("")
+                )
+            })?;
+        let phase = source.status.as_ref().map(|s| s.phase.clone());
+        if phase != Some(PersistentVolumeClaimPhase::Bound) {
+            return Err(anyhow!(
+                "the PVC DataSource {} must have a status of Bound.  Got {:?}",
+                ds.name,
+                phase
+            ));
+        }
+        if source.metadata.deletion_timestamp.is_some() {
+            return Err(anyhow!(
+                "the PVC DataSource {} is currently being deleted",
+                ds.name
+            ));
+        }
+        if source.spec.storage_class_name.is_none() {
+            return Err(anyhow!(
+                "the source PVC ({}) storageclass cannot be empty",
+                source.metadata.name
+            ));
+        }
+        if claim.spec.storage_class_name.is_none() {
+            return Err(anyhow!(
+                "the requested PVC ({}) storageclass cannot be empty",
+                claim.metadata.name
+            ));
+        }
+
+        let requested = storage_bytes(
+            claim
+                .spec
+                .resources
+                .requests
+                .as_ref()
+                .and_then(|r| r.get("storage")),
+        );
+        let source_size = storage_bytes(
+            source
+                .spec
+                .resources
+                .requests
+                .as_ref()
+                .and_then(|r| r.get("storage")),
+        );
+        if requested < source_size {
+            return Err(anyhow!(
+                "error, new PVC request must be greater than or equal in size to the specified PVC data source, requested {requested} but source is {source_size}"
+            ));
+        }
+
+        let volume_name = source.spec.volume_name.clone().unwrap_or_default();
+        if volume_name.is_empty() {
+            return Err(anyhow!(
+                "volume name is empty in source PVC {}",
+                source.metadata.name
+            ));
+        }
+        let invalid = || anyhow!("claim in dataSource not bound or invalid");
+        let source_pv: PersistentVolume = self
+            .storage
+            .get(&build_key("persistentvolumes", None, &volume_name))
+            .await
+            .map_err(|e| {
+                warn!(
+                    "error getting volume {volume_name} for PVC {}/{}: {e}",
+                    ds.namespace, source.metadata.name
+                );
+                invalid()
+            })?;
+        let Some(csi) = source_pv.spec.csi.as_ref() else {
+            warn!("error getting volume source from {volume_name}");
+            return Err(invalid());
+        };
+        if csi.driver != sc.provisioner {
+            warn!("the source volume {volume_name} is handled by a different CSI driver than requested by StorageClass");
+            return Err(invalid());
+        }
+        let Some(claim_ref) = source_pv.spec.claim_ref.as_ref() else {
+            warn!("the source volume {volume_name} is not bound");
+            return Err(invalid());
+        };
+        if claim_ref.uid.as_deref() != Some(source.metadata.uid.as_str())
+            || claim_ref.namespace.as_deref() != source.metadata.namespace.as_deref()
+            || claim_ref.name.as_deref() != Some(source.metadata.name.as_str())
+        {
+            warn!("the source volume {volume_name} is bound to a different PVC than requested");
+            return Err(invalid());
+        }
+        if source_pv.status.as_ref().map(|s| &s.phase) != Some(&PersistentVolumePhase::Bound) {
+            warn!("the source volume {volume_name} status should be Bound");
+            return Err(invalid());
+        }
+
+        let is_fs = |m: &Option<PersistentVolumeMode>| {
+            m.as_ref()
+                .is_none_or(|m| *m == PersistentVolumeMode::Filesystem)
+        };
+        if is_fs(&claim.spec.volume_mode) && !is_fs(&source_pv.spec.volume_mode) {
+            return Err(anyhow!(
+                "the source PVC and destination PVCs must have the same volume mode for cloning.  Source is Block, but new PVC requested Filesystem"
+            ));
+        }
+        if claim.spec.volume_mode == Some(PersistentVolumeMode::Block)
+            && source_pv.spec.volume_mode != Some(PersistentVolumeMode::Block)
+        {
+            return Err(anyhow!(
+                "the source PVC and destination PVCs must have the same volume mode for cloning.  Source is Filesystem, but new PVC requested Block"
+            ));
+        }
+
+        Ok(VolumeContentSource {
+            r#type: Some(ContentSourceType::Volume(VolumeSource {
+                volume_id: csi.volume_handle.clone().unwrap_or_default(),
+            })),
+        })
+    }
+
+    /// `getSnapshotSource` (controller.go:1289-1393).
+    async fn get_snapshot_source(
+        &self,
+        claim: &PersistentVolumeClaim,
+        sc: &StorageClass,
+        ds: &DataSource,
+    ) -> Result<VolumeContentSource> {
+        let snapshot: VolumeSnapshot = self
+            .storage
+            .get(&build_key("volumesnapshots", Some(&ds.namespace), &ds.name))
+            .await
+            .map_err(|e| anyhow!("error getting snapshot {} from api server: {e}", ds.name))?;
+
+        // "If the finalizer exists, it means provisioning was started before
+        // deletion began, so we should continue to prevent resource leaks. If
+        // the finalizer doesn't exist, this is a new provisioning attempt and
+        // should be rejected."
+        if snapshot.metadata.deletion_timestamp.is_some()
+            && !has_finalizer(&snapshot.metadata, SNAPSHOT_SOURCE_PROTECTION_FINALIZER)
+        {
+            return Err(anyhow!("snapshot {} is being deleted", ds.name));
+        }
+
+        let Some(content_name) = snapshot
+            .status
+            .as_ref()
+            .and_then(|s| s.bound_volume_snapshot_content_name.clone())
+        else {
+            return Err(anyhow!("snapshot {} not bound", ds.name));
+        };
+        let content: VolumeSnapshotContent = self
+            .storage
+            .get(&build_key("volumesnapshotcontents", None, &content_name))
+            .await
+            .map_err(|e| {
+                warn!(
+                    "error getting snapshotcontent {content_name} for snapshot {}/{}: {e}",
+                    ds.namespace, ds.name
+                );
+                anyhow!(
+                    "error getting snapshotcontent {content_name} for snapshot {}",
+                    ds.name
+                )
+            })?;
+
+        let r = &content.spec.volume_snapshot_ref;
+        if r.uid.as_deref() != Some(snapshot.metadata.uid.as_str())
+            || r.namespace.as_deref() != snapshot.metadata.namespace.as_deref()
+            || r.name.as_deref() != Some(snapshot.metadata.name.as_str())
+        {
+            return Err(anyhow!(
+                "snapshotcontent {content_name} for snapshot {} is bound to a different snapshot",
+                ds.name
+            ));
+        }
+        if content.spec.driver != sc.provisioner {
+            return Err(anyhow!(
+                "snapshotcontent {content_name} for snapshot {} is not handled by CSI driver of StorageClass {}",
+                ds.name,
+                sc.metadata.name
+            ));
+        }
+        if snapshot.status.as_ref().and_then(|s| s.ready_to_use) != Some(true) {
+            return Err(anyhow!("snapshot {} is not Ready", ds.name));
+        }
+        let Some(handle) = content
+            .status
+            .as_ref()
+            .and_then(|s| s.snapshot_handle.clone())
+        else {
+            return Err(anyhow!("snapshot handle {} is not available", ds.name));
+        };
+
+        if let Some(restore) = snapshot
+            .status
+            .as_ref()
+            .and_then(|s| s.restore_size.as_ref())
+        {
+            let Some(requested) = claim
+                .spec
+                .resources
+                .requests
+                .as_ref()
+                .and_then(|r| r.get("storage"))
+            else {
+                return Err(anyhow!(
+                    "error getting capacity for PVC {} when creating snapshot {}",
+                    claim.metadata.name,
+                    snapshot.metadata.name
+                ));
+            };
+            let vol_size = storage_bytes(Some(requested));
+            let restore_size = storage_bytes(Some(restore));
+            // "the volume size should be equal to or larger than its
+            // snapshot size." A larger one is the plugin's expansion to do.
+            if vol_size < restore_size {
+                return Err(anyhow!(
+                    "requested volume size {vol_size} is less than the size {restore_size} for the source snapshot {}",
+                    snapshot.metadata.name
+                ));
+            }
+        }
+
+        if self.prevent_volume_mode_conversion {
+            if let (Some(src_mode), Some(mode)) = (
+                content.spec.source_volume_mode.as_deref(),
+                claim.spec.volume_mode.as_ref(),
+            ) {
+                let mode = match mode {
+                    PersistentVolumeMode::Filesystem => "Filesystem",
+                    PersistentVolumeMode::Block => "Block",
+                    PersistentVolumeMode::Unknown(m) => m.as_str(),
+                };
+                if src_mode != mode {
+                    let who = format!(
+                        "requested volume {}/{} modifies the mode of the source volume but does not have permission to do so.",
+                        claim.metadata.namespace.as_deref().unwrap_or(""),
+                        claim.metadata.name
+                    );
+                    let allow = annotation(&content.metadata, ANN_ALLOW_VOLUME_MODE_CHANGE)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "{who} {ANN_ALLOW_VOLUME_MODE_CHANGE} annotation is not present on snapshotcontent {}",
+                                content.metadata.name
+                            )
+                        })?;
+                    // Go's strconv.ParseBool.
+                    let allowed = match allow.as_str() {
+                        "1" | "t" | "T" | "true" | "TRUE" | "True" => true,
+                        "0" | "f" | "F" | "false" | "FALSE" | "False" => false,
+                        other => {
+                            return Err(anyhow!(
+                                "{who} failed to convert {ANN_ALLOW_VOLUME_MODE_CHANGE} annotation value to boolean with error: strconv.ParseBool: parsing {other:?}: invalid syntax"
+                            ))
+                        }
+                    };
+                    if !allowed {
+                        return Err(anyhow!(
+                            "{who} {ANN_ALLOW_VOLUME_MODE_CHANGE} is set to false on snapshotcontent {}",
+                            content.metadata.name
+                        ));
+                    }
+                }
+            }
+        }
+
+        Ok(VolumeContentSource {
+            r#type: Some(ContentSourceType::Snapshot(SnapshotSource {
+                snapshot_id: handle,
+            })),
+        })
+    }
+
+    /// `setCloneFinalizer` (controller.go:1054-1068).
+    async fn set_clone_finalizer(&self, ds: &DataSource) -> Result<()> {
+        let key = build_key("persistentvolumeclaims", Some(&ds.namespace), &ds.name);
+        let mut source: PersistentVolumeClaim = self.storage.get(&key).await?;
+        if has_finalizer(&source.metadata, PVC_CLONE_FINALIZER) {
+            return Ok(());
+        }
+        source
+            .metadata
+            .finalizers
+            .get_or_insert_with(Vec::new)
+            .push(PVC_CLONE_FINALIZER.to_string());
+        self.storage.update(&key, &source).await?;
+        Ok(())
+    }
+
+    /// `setSnapshotFinalizer` (controller.go:1070-1095). Upstream tolerates a
+    /// Forbidden update for RBAC back-compat; this process writes storage
+    /// directly, so there is no such case.
+    async fn set_snapshot_finalizer(&self, ds: &DataSource) -> Result<()> {
+        let key = build_key("volumesnapshots", Some(&ds.namespace), &ds.name);
+        let mut snapshot: VolumeSnapshot = self.storage.get(&key).await?;
+        if has_finalizer(&snapshot.metadata, SNAPSHOT_SOURCE_PROTECTION_FINALIZER) {
+            return Ok(());
+        }
+        snapshot
+            .metadata
+            .finalizers
+            .get_or_insert_with(Vec::new)
+            .push(SNAPSHOT_SOURCE_PROTECTION_FINALIZER.to_string());
+        self.storage.update(&key, &snapshot).await?;
+        Ok(())
+    }
+
+    /// `removeSnapshotFinalizer` (controller.go:1097-1140): a missing
+    /// snapshot, or one without the finalizer, is nothing to do.
+    async fn remove_snapshot_finalizer(&self, namespace: &str, name: &str) -> Result<()> {
+        let key = build_key("volumesnapshots", Some(namespace), name);
+        let mut snapshot: VolumeSnapshot = match self.storage.get(&key).await {
+            Ok(s) => s,
+            Err(rusternetes_common::Error::NotFound(_)) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        if !has_finalizer(&snapshot.metadata, SNAPSHOT_SOURCE_PROTECTION_FINALIZER) {
+            return Ok(());
+        }
+        if let Some(f) = snapshot.metadata.finalizers.as_mut() {
+            f.retain(|f| f != SNAPSHOT_SOURCE_PROTECTION_FINALIZER);
+        }
+        match self.storage.update(&key, &snapshot).await {
+            Ok(_) | Err(rusternetes_common::Error::NotFound(_)) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// `cleanupVolume` (controller.go:2074-2086).
@@ -893,6 +1334,23 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             ));
         }
 
+        // A data source must come back in the volume's content source
+        // (:931-:945): without it the driver made a blank volume. (The
+        // cross-namespace dataSourceRef arm of the condition is unreachable,
+        // see `data_source`.)
+        if claim.spec.data_source.is_some() && vol.content_source.is_none() {
+            let mut source_err = "volume content source missing".to_string();
+            if let Err(e) = self.cleanup_volume(&vol.volume_id).await {
+                source_err = format!(
+                    "{source_err}. cleanup of volume {pv_name} failed, volume is orphaned: {e}"
+                );
+            }
+            return Err((
+                ProvisioningState::InBackground,
+                Failure::Error(anyhow!(source_err)),
+            ));
+        }
+
         // `ReadOnlyMany` on its own with --controller-publish-readonly (:965-:971).
         let pv_read_only = vol_caps.len() == 1
             && vol_caps[0].access_mode.as_ref().map(|m| m.mode)
@@ -945,6 +1403,24 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             "successfully created PV {} for PVC {} and csi volume name {}",
             pv.metadata.name, claim.metadata.name, vol.volume_id
         );
+
+        // "Remove snapshot finalizer if this PVC was provisioned from a
+        // snapshot" (:1042-:1049); a failure doesn't fail provisioning.
+        if let Some(d) = claim
+            .spec
+            .data_source
+            .as_ref()
+            .filter(|d| d.kind == SNAPSHOT_KIND)
+        {
+            let ns = claim.metadata.namespace.as_deref().unwrap_or("");
+            if let Err(e) = self.remove_snapshot_finalizer(ns, &d.name).await {
+                warn!(
+                    "Failed to remove snapshot finalizer from {ns}/{}: {e}",
+                    d.name
+                );
+            }
+        }
+
         Ok(pv)
     }
 
