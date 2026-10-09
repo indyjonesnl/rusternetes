@@ -138,6 +138,77 @@ impl Default for CELEvaluator {
     }
 }
 
+/// A CEL error that comes from a declaration this server does not supply,
+/// rather than from the expression being malformed.
+fn is_missing_declaration(err: &str) -> bool {
+    let err = err.to_lowercase();
+    err.contains("no such key")
+        || err.contains("not found")
+        || err.contains("undeclared")
+        || err.contains("undefined")
+        || err.contains("no matching overload")
+}
+
+/// Why `expression` does not compile, if it does not.
+///
+/// Upstream compiles against a typed CEL environment
+/// (`validateMatchConditionsExpression`, validation.go:1100). Rusternetes has
+/// no typed environment, so this compiles with the plain `cel` crate and
+/// tolerates the errors that come from the missing declarations rather than
+/// from the expression itself.
+pub fn compile_failure(expression: &str) -> Option<String> {
+    compile_failure_in(expression, true)
+}
+
+/// As [`compile_failure`], but only parses. The MutatingAdmissionPolicy
+/// expressions use `Object{...}` / `JSONPatch{...}` struct initializers, which
+/// the `cel` crate parses but panics on when executed ("Support structs!"),
+/// so the execute step that catches webhook match-condition errors cannot be
+/// applied to them.
+pub fn parse_failure(expression: &str) -> Option<String> {
+    compile_failure_in(expression, false)
+}
+
+fn compile_failure_in(expression: &str, execute: bool) -> Option<String> {
+    // The antlr4rust parser panics on some invalid expressions instead of
+    // returning `Err`.
+    let source = expression.to_string();
+    let program = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cel::Program::compile(&source)
+    })) {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => {
+            // The CEL crate type-checks at compile time and rejects references
+            // to declarations we do not supply (`object.metadata`), which are
+            // valid at admission time.
+            return (!is_missing_declaration(&e.to_string()))
+                .then(|| format!("compilation failed: {e}"));
+        }
+        Err(_) => {
+            return Some(format!(
+                "compilation failed: invalid CEL expression '{expression}'"
+            ))
+        }
+    };
+
+    if !execute {
+        return None;
+    }
+
+    // The CEL crate's parser accepts some expressions Kubernetes rejects.
+    // Executing with an empty context catches the genuinely invalid ones.
+    let ctx = cel::Context::default();
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| program.execute(&ctx))) {
+        Ok(Ok(_)) => None,
+        Ok(Err(e)) => {
+            (!is_missing_declaration(&e.to_string())).then(|| format!("compilation failed: {e}"))
+        }
+        Err(_) => Some(format!(
+            "compilation failed: invalid CEL expression '{expression}'"
+        )),
+    }
+}
+
 /// CELContext holds variables available to CEL expressions
 #[derive(Debug, Clone)]
 pub struct CELContext {

@@ -4,7 +4,7 @@
 //!
 //! Scope: the CEL-free structural checks of `spec` — the `selectors` set
 //! (≤32, each must carry a `cel` selector whose `expression` is non-empty and
-//! ≤10Ki) and the `config` set (≤32). Compiling the CEL expressions against the
+//! ≤10Ki) and the `config` set (≤32). Parse-checking the CEL expressions; compiling against the
 //! DRA CEL environment is tracked in #1442. ObjectMeta is validated separately.
 
 use crate::resources::{DeviceClass, DeviceClassSpec};
@@ -80,6 +80,33 @@ mod tests {
     fn selector_requires_cel() {
         let e = errs(serde_json::json!({"selectors": [{}]}));
         assert!(e.iter().any(|m| m.contains("cel")), "{e:?}");
+    }
+
+    /// `validateCELSelector` (validation.go:316): an expression that does not
+    /// compile is `field.Invalid(.., "compilation failed: ...")`.
+    #[test]
+    fn uncompilable_expression_rejected() {
+        let e = errs(serde_json::json!({
+            "selectors": [{"cel": {"expression": "device.driver =="}}]
+        }));
+        assert!(
+            e.iter()
+                .any(|m| m.contains("selectors[0].cel.expression")
+                    && m.contains("compilation failed")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn dra_environment_expressions_compile() {
+        for x in [
+            "device.driver == 'dra.example.com'",
+            "device.attributes['dra.example.com'].model == 'a'",
+            "device.capacity['dra.example.com'].memory.compareTo(quantity('1Gi')) >= 0",
+        ] {
+            let e = errs(serde_json::json!({"selectors": [{"cel": {"expression": x}}]}));
+            assert!(e.is_empty(), "{x}: {e:?}");
+        }
     }
 
     #[test]
