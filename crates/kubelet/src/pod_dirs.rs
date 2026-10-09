@@ -53,6 +53,8 @@ pub mod plugin {
     pub const CSI: &str = "kubernetes.io/csi";
     /// `pkg/volume/hostpath/host_path.go:77`
     pub const HOST_PATH: &str = "kubernetes.io/host-path";
+    /// `pkg/volume/local/local.go:64`
+    pub const LOCAL: &str = "kubernetes.io/local-volume";
 }
 
 /// Convert a plugin name, which contains a `/`, into a form safe to use on
