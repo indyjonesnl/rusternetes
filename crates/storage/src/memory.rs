@@ -1064,4 +1064,24 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::Gone(_)), "{err:?}");
     }
+
+    #[tokio::test]
+    async fn stats_counts_objects_and_averages_their_size() {
+        let s = MemoryStorage::new();
+        for i in 0..3 {
+            let v = serde_json::json!({"metadata": {"name": format!("p{i}")}});
+            s.create(&format!("/registry/pods/ns/p{i}"), &v)
+                .await
+                .unwrap();
+        }
+        let v = serde_json::json!({"metadata": {"name": "n"}});
+        s.create("/registry/nodes/n", &v).await.unwrap();
+        let st = s.stats("/registry/pods/").await.unwrap();
+        assert_eq!(st.object_count, 3);
+        assert!(st.estimated_average_object_size_bytes > 0);
+        assert_eq!(
+            s.stats("/registry/none/").await.unwrap(),
+            crate::ResourceStats::default()
+        );
+    }
 }

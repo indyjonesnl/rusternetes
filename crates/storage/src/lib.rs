@@ -510,6 +510,34 @@ pub trait Storage: Send + Sync {
 
     /// Check if a revision has been compacted (no longer available)
     async fn is_revision_compacted(&self, revision: i64) -> Result<bool>;
+
+    /// `storage.Interface.Stats` (storage/interfaces.go): the object count and
+    /// estimated average object size under `prefix`.
+    async fn stats(&self, prefix: &str) -> Result<ResourceStats> {
+        // etcd3 answers this from a keys-only read plus a per-key size cache
+        // (storage/etcd3/stats.go `resourceSizeEstimator.Stats`); the generic
+        // fallback lists the prefix and measures the encoded objects.
+        let objects: Vec<serde_json::Value> = self.list(prefix).await?;
+        let count = objects.len() as i64;
+        if count == 0 {
+            return Ok(ResourceStats::default());
+        }
+        let total: usize = objects
+            .iter()
+            .map(|o| serde_json::to_vec(o).map(|b| b.len()).unwrap_or(0))
+            .sum();
+        Ok(ResourceStats {
+            object_count: count,
+            estimated_average_object_size_bytes: total as i64 / count,
+        })
+    }
+}
+
+/// `storage.Stats` (storage/interfaces.go).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResourceStats {
+    pub object_count: i64,
+    pub estimated_average_object_size_bytes: i64,
 }
 
 /// Default sort key for an opaque JSON resource — uses
@@ -913,6 +941,10 @@ impl<S: Storage> Storage for std::sync::Arc<S> {
 
     async fn is_revision_compacted(&self, revision: i64) -> Result<bool> {
         (**self).is_revision_compacted(revision).await
+    }
+
+    async fn stats(&self, prefix: &str) -> Result<ResourceStats> {
+        (**self).stats(prefix).await
     }
 }
 

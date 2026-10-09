@@ -20,7 +20,11 @@ mod endpoints;
 mod flow_control;
 mod flow_control_filter;
 #[allow(dead_code)]
+mod flow_control_object_count;
+#[allow(dead_code)]
 mod flow_control_queueset;
+#[allow(dead_code)]
+mod flow_control_stats_poller;
 #[allow(dead_code)]
 mod flow_control_work_estimator;
 mod gnostic;
@@ -368,10 +372,29 @@ async fn main() -> Result<()> {
             engine.clone(),
             std::time::Duration::from_secs(2),
         );
-        flow_control_filter::install_flow_control(Arc::new(flow_control_filter::ApfFilter::new(
+        let apf = Arc::new(flow_control_filter::ApfFilter::new(
             engine,
             flow_control_filter::DEFAULT_REQUEST_TIMEOUT / 4,
-        )));
+        ));
+        // `storage-object-count-tracker-hook` (server/config.go:962-970) and
+        // `Store.startObservingCount` (store.go:1638): prune the tracker, and
+        // poll the stores' object counts into it for the list estimator.
+        // The senders live for the process; the server never signals stop.
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        std::mem::forget(stop_tx);
+        let tracker = apf.object_count_tracker();
+        tokio::spawn({
+            let tracker = tracker.clone();
+            let stop = stop_rx.clone();
+            async move { tracker.run_until(stop).await }
+        });
+        tokio::spawn(flow_control_stats_poller::run(
+            storage.clone(),
+            tracker,
+            flow_control_stats_poller::COUNT_METRIC_POLL_PERIOD,
+            stop_rx,
+        ));
+        flow_control_filter::install_flow_control(apf);
         info!("API Priority and Fairness enabled");
     }
 

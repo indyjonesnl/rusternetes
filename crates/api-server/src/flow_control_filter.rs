@@ -33,9 +33,10 @@
 //! - No `RegisterWatch`/`ObservedWatch` registration (`watch_tracker.go`): the
 //!   estimator's interested-watcher count is always 0. (#2775 covers the
 //!   estimator input; #2808 the tracker.)
-//! - Object counts are not tracked (`StorageObjectCountTracker`): the
-//!   estimator's stats getter reports `ObjectCountNotFound`, so lists cost the
-//!   minimum number of seats rather than be over-charged. (#2775)
+//! - Object counts come from `flow_control_stats_poller` (the
+//!   `Store.startObservingCount` port) for a fixed table of built-in
+//!   resources; custom resources are not observed, so their lists report
+//!   `ObjectCountNotFound` and cost the minimum number of seats.
 //! - No watermark/metrics (`apiserver_flowcontrol_*`, `RecordDroppedRequest`).
 //!   (#2809)
 //! - `getRequestWaitContext` has no request deadline to take 1/4 of (we have no
@@ -57,9 +58,8 @@ use rusternetes_storage::{Storage, StorageBackend};
 
 use crate::audit::request_info;
 use crate::flow_control::{Classification, FlowControlEngine, RequestDigest};
-use crate::flow_control_work_estimator::{
-    RequestInfo, Stats, StatsError, WorkEstimator, WorkEstimatorConfig,
-};
+use crate::flow_control_object_count::ObjectCountTracker;
+use crate::flow_control_work_estimator::{RequestInfo, WorkEstimator, WorkEstimatorConfig};
 
 /// `ResponseHeaderMatchedPriorityLevelConfigurationUID`
 /// (`k8s.io/api/flowcontrol/v1/types.go:56`).
@@ -269,6 +269,9 @@ pub fn is_long_running(
 pub struct ApfFilter<S: Storage> {
     engine: Arc<FlowControlEngine<S>>,
     estimator: WorkEstimator,
+    /// `StorageObjectCountTracker` (config.go:472); fed by
+    /// `flow_control_stats_poller`, read by the list estimator.
+    object_counts: Arc<ObjectCountTracker>,
     dropped: DroppedRequestsTracker,
     default_wait_limit: Duration,
 }
@@ -277,10 +280,10 @@ impl<S: Storage + 'static> ApfFilter<S> {
     /// `defaultRequestWaitLimit` is `RequestTimeout/4` (config.go:1027).
     pub fn new(engine: Arc<FlowControlEngine<S>>, default_wait_limit: Duration) -> Self {
         let max_seats_engine = engine.clone();
+        let object_counts = Arc::new(ObjectCountTracker::new());
         let estimator = WorkEstimator::new(
-            // No StorageObjectCountTracker yet (#2775): "no objects known"
-            // costs the minimum, never an over-charge.
-            Box::new(|_| -> Result<Stats, StatsError> { Err(StatsError::NotFound) }),
+            // `c.StorageObjectCountTracker.Get` (server/config.go:1025).
+            object_counts.stats_getter(),
             // No watch tracker yet (#2808).
             Box::new(|_| 0),
             WorkEstimatorConfig::default(),
@@ -289,9 +292,16 @@ impl<S: Storage + 'static> ApfFilter<S> {
         Self {
             engine,
             estimator,
+            object_counts,
             dropped: DroppedRequestsTracker::default(),
             default_wait_limit,
         }
+    }
+
+    /// The tracker the list estimator reads; the stats poller and its pruner
+    /// are run against it at startup.
+    pub fn object_count_tracker(&self) -> Arc<ObjectCountTracker> {
+        self.object_counts.clone()
     }
 }
 
@@ -448,6 +458,7 @@ pub fn spawn_config_reloader<S: Storage + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::flow_control_work_estimator::Stats;
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
     use axum::middleware::from_fn_with_state;
@@ -965,5 +976,43 @@ mod tests {
         gate.notify_one();
         assert_eq!(held.await.unwrap().unwrap().status(), StatusCode::OK);
         assert!(engine.queueset_for("a").is_none(), "reaped on finish");
+    }
+
+    /// The estimator reads the filter's own tracker: a polled, large `pods`
+    /// resource makes a list cost more than the minimum, an unpolled one does
+    /// not (`ObjectCountNotFoundErr` -> minimum seats).
+    #[tokio::test]
+    async fn list_cost_follows_the_polled_object_counts() {
+        let st = Arc::new(MemoryStorage::new());
+        let engine = Arc::new(FlowControlEngine::with_limits(st.clone(), 100, 0));
+        engine.initialize().await.unwrap();
+        let filter = ApfFilter::new(engine.clone(), Duration::from_secs(1));
+        let c = engine.classify(&RequestDigest {
+            user_name: "bob".into(),
+            groups: vec!["system:authenticated".into()],
+            is_resource_request: true,
+            verb: "list".into(),
+            resource: "pods".into(),
+            ..Default::default()
+        });
+        let info = RequestInfo {
+            verb: "list".into(),
+            resource: "pods".into(),
+            ..Default::default()
+        };
+        let cost = |f: &ApfFilter<MemoryStorage>| {
+            f.estimator
+                .estimate_work(Some(&info), "", &c.flow_schema, &c.priority_level)
+                .initial_seats
+        };
+        assert_eq!(cost(&filter), 1, "unpolled resource costs the minimum");
+        filter.object_count_tracker().set(
+            "pods",
+            Stats {
+                object_count: 50_000,
+                estimated_average_object_size_bytes: 10_000,
+            },
+        );
+        assert!(cost(&filter) > 1, "a large polled resource costs more");
     }
 }
