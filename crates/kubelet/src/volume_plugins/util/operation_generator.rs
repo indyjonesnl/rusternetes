@@ -491,7 +491,21 @@ pub async fn mount_volume_with_attributes(
         );
     }
 
-    mounter.set_up().await?;
+    // `operation_generator.go:582-589`. Not ported: `DesiredSize` (volume
+    // expansion, #1970) and `SELinuxLabel` (#2312).
+    mounter
+        .set_up_with(&crate::volume_plugins::MounterArgs {
+            fs_user: crate::volume_plugins::util::fs_user_from(pod),
+            fs_group: fs_group_from(pod),
+            fs_group_change_policy: pod
+                .spec
+                .as_ref()
+                .and_then(|s| s.security_context.as_ref())
+                .and_then(|sc| sc.fs_group_change_policy.clone()),
+            desired_size: None,
+            selinux_label: String::new(),
+        })
+        .await?;
     Ok((mounter.get_path(), mounter.get_attributes()))
 }
 

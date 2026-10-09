@@ -151,7 +151,7 @@ impl Mounter for ConfigMapMounter {
         }
     }
 
-    async fn set_up(&self) -> Result<()> {
+    async fn set_up_at(&self, dir: &str, args: &crate::volume_plugins::MounterArgs) -> Result<()> {
         // ---- moved verbatim from create_volume's configMap branch
         //      (991a503d:crates/kubelet/src/volumes.rs:991-1059) ----
         let storage = self
@@ -171,7 +171,7 @@ impl Mounter for ConfigMapMounter {
         let configmap_result: Result<ConfigMap, _> = storage.get(&key).await;
 
         // Create volume directory
-        let volume_dir = &self.path;
+        let volume_dir = dir;
         std::fs::create_dir_all(volume_dir)
             .context("Failed to create ConfigMap volume directory")?;
 
@@ -223,7 +223,7 @@ impl Mounter for ConfigMapMounter {
         if let Err(e) = crate::volume_ownership::write_payload_with_ownership(
             std::path::Path::new(volume_dir),
             &payload,
-            self.fs_group,
+            args.fs_group.or(self.fs_group),
             true,
         ) {
             if let Err(td) = std::fs::remove_dir_all(volume_dir) {

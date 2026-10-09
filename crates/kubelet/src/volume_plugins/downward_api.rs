@@ -129,14 +129,14 @@ impl Mounter for DownwardApiMounter {
         }
     }
 
-    async fn set_up(&self) -> Result<()> {
+    async fn set_up_at(&self, dir: &str, args: &crate::volume_plugins::MounterArgs) -> Result<()> {
         let downward_api = self
             .volume
             .downward_api
             .as_ref()
             .expect("checked by can_support");
 
-        let volume_dir = &self.path;
+        let volume_dir = dir;
 
         // Spec defaultMode, or 0644 (the API default; see `collect_data`).
         let da_default_mode = downward_api.default_mode.unwrap_or(0o644);
@@ -167,7 +167,7 @@ impl Mounter for DownwardApiMounter {
         if let Err(e) = crate::volume_ownership::write_payload_with_ownership(
             std::path::Path::new(volume_dir),
             &payload,
-            self.fs_group,
+            args.fs_group.or(self.fs_group),
             true,
         ) {
             if let Err(td) = std::fs::remove_dir_all(volume_dir) {

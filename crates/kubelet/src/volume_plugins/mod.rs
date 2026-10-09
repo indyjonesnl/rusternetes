@@ -27,7 +27,7 @@ pub mod util;
 
 pub use host::{KubeletVolumeHost, VolumeHost};
 pub use plugin::{
-    Attributes, DeviceMounter, DeviceMounterArgs, Mounter, OwnedSpec, ReconstructedVolume, Spec,
-    Unmounter, VolumePlugin,
+    Attributes, DeviceMounter, DeviceMounterArgs, Mounter, MounterArgs, OwnedSpec,
+    ReconstructedVolume, Spec, Unmounter, VolumePlugin,
 };
 pub use registry::{PluginLookupError, VolumePluginMgr};

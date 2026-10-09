@@ -648,8 +648,8 @@ impl Mounter for ProjectedMounter {
     /// `MakeNestedMountpoints` (`:166`) — see the follow-up issue linked from
     /// the PR (the kubelet has no tmpfs unmount, so a wrapper would leak
     /// mounts).
-    async fn set_up(&self) -> Result<()> {
-        let volume_dir = &self.path;
+    async fn set_up_at(&self, dir: &str, args: &crate::volume_plugins::MounterArgs) -> Result<()> {
+        let volume_dir = dir;
         std::fs::create_dir_all(volume_dir)
             .context("Failed to create projected volume directory")?;
 
@@ -663,7 +663,12 @@ impl Mounter for ProjectedMounter {
             );
         })?;
 
-        write_payload(std::path::Path::new(volume_dir), &payload, self.fs_group).map_err(|e| {
+        write_payload(
+            std::path::Path::new(volume_dir),
+            &payload,
+            args.fs_group.or(self.fs_group),
+        )
+        .map_err(|e| {
             tracing::error!("Error writing payload to dir: {}", e);
             anyhow!(e)
         })?;
