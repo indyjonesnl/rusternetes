@@ -8,7 +8,7 @@
 //! all-in-one binary) call [`build_authorizer`] so they cannot diverge (#2679).
 
 use rusternetes_common::authz::{
-    superuser_then, AlwaysAllowAuthorizer, Authorizer, AuthzStorage, RBACAuthorizer,
+    superuser_then, AlwaysAllowAuthorizer, Authorizer, AuthzStorage, NodeAuthorizer, RBACAuthorizer,
 };
 use std::sync::Arc;
 
@@ -21,15 +21,18 @@ pub fn build_authorizer<S: AuthzStorage + 'static>(
     if skip_auth {
         return Arc::new(AlwaysAllowAuthorizer);
     }
+    // Node -> RBAC, upstream's default order (`--authorization-mode=Node,RBAC`).
+    // Without Node, kubelets are Forbidden on an RBAC-only store (#1664).
+    let node: Arc<dyn Authorizer> = Arc::new(NodeAuthorizer);
     let rbac: Arc<dyn Authorizer> = Arc::new(RBACAuthorizer::new(storage));
-    Arc::new(superuser_then(vec![rbac]))
+    Arc::new(superuser_then(vec![node, rbac]))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusternetes_common::authz::{Decision, RequestAttributes};
     use rusternetes_common::auth::UserInfo;
+    use rusternetes_common::authz::{Decision, RequestAttributes};
     use rusternetes_storage::MemoryStorage;
 
     fn user(name: &str, groups: &[&str]) -> UserInfo {
