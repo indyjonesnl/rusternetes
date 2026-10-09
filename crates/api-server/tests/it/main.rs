@@ -318,6 +318,7 @@ mod tokenrequest_expiration_test;
 mod undecodable_body_status_test;
 mod unverified_fixes_test;
 mod vap_param_authz_test;
+mod vap_v1beta1_test;
 mod vap_validation_test;
 mod volume_integration_test;
 mod volumeattachment_handler_test;
