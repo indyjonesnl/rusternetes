@@ -4236,6 +4236,99 @@ mod tests {
         assert_eq!(failed.reason.as_deref(), Some("DeadlineExceeded"));
     }
 
+    /// Every failure scenario feeds the one `finishedCondition`
+    /// (`job_controller.go:960-985`) whose message is the upstream literal:
+    /// "Job has reached the specified backoff limit" (:964), "Job was active
+    /// longer than specified deadline" (:969, no seconds suffix),
+    /// "Job has exceeded the specified maximal number of failed indexes"
+    /// (:980) and "Job has failed indexes" (:982).
+    #[tokio::test]
+    async fn finished_condition_messages_match_upstream() {
+        async fn run(configure: impl FnOnce(&mut Job), pods: Vec<Pod>) -> String {
+            let storage = Arc::new(MemoryStorage::new());
+            let mut job = make_job("msg-job", "default", 2, 2);
+            configure(&mut job);
+            let job_key = build_key("jobs", Some("default"), "msg-job");
+            storage.create(&job_key, &job).await.unwrap();
+            for p in &pods {
+                let k = build_key("pods", Some("default"), &p.metadata.name);
+                storage.create(&k, p).await.unwrap();
+            }
+            let controller = JobController::new(storage.clone());
+            let mut job: Job = storage.get(&job_key).await.unwrap();
+            controller.reconcile(&mut job).await.unwrap();
+            let stored: Job = storage.get(&job_key).await.unwrap();
+            let conds = stored.status.unwrap().conditions.unwrap_or_default();
+            conds
+                .iter()
+                .find(|c| c.condition_type == "Failed" && c.status == "True")
+                .unwrap_or_else(|| panic!("job must end Failed, got {conds:?}"))
+                .message
+                .clone()
+                .unwrap_or_default()
+        }
+        let failed_pod = |i: i32| {
+            make_indexed_pod(
+                &format!("msg-job-{i}"),
+                "default",
+                Phase::Failed,
+                "msg-job",
+                "job-uid-1",
+                i,
+            )
+        };
+
+        let backoff = run(
+            |j| j.spec.backoff_limit = Some(0),
+            vec![make_pod(
+                "msg-job-a",
+                "default",
+                Phase::Failed,
+                "msg-job",
+                "job-uid-1",
+            )],
+        )
+        .await;
+        assert_eq!(backoff, "Job has reached the specified backoff limit");
+
+        let deadline = run(
+            |j| {
+                j.spec.active_deadline_seconds = Some(1);
+                j.status = Some(JobStatus {
+                    start_time: Some(chrono::Utc::now() - chrono::Duration::seconds(60)),
+                    ..Default::default()
+                });
+            },
+            vec![],
+        )
+        .await;
+        assert_eq!(deadline, "Job was active longer than specified deadline");
+
+        let max_failed = run(
+            |j| {
+                j.spec.completion_mode = Some("Indexed".to_string());
+                j.spec.backoff_limit_per_index = Some(0);
+                j.spec.max_failed_indexes = Some(0);
+            },
+            vec![failed_pod(0)],
+        )
+        .await;
+        assert_eq!(
+            max_failed,
+            "Job has exceeded the specified maximal number of failed indexes"
+        );
+
+        let failed_idx = run(
+            |j| {
+                j.spec.completion_mode = Some("Indexed".to_string());
+                j.spec.backoff_limit_per_index = Some(0);
+            },
+            vec![failed_pod(0), failed_pod(1)],
+        )
+        .await;
+        assert_eq!(failed_idx, "Job has failed indexes");
+    }
+
     #[tokio::test]
     async fn test_pod_failure_policy_fail_index() {
         let storage = Arc::new(MemoryStorage::new());
