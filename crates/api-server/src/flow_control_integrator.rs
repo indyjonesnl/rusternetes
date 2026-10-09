@@ -213,6 +213,34 @@ pub(crate) mod test_clock {
         }
         fn after(&self, _d: Duration, _f: Box<dyn FnOnce() + Send>) {}
     }
+
+    /// `eventclock.Real` driven by tokio's clock: under
+    /// `#[tokio::test(start_paused = true)]` time only moves when every task
+    /// is idle, so a 25-second upstream scenario runs instantly and
+    /// deterministically. `after` fires from a spawned `tokio::time::sleep`.
+    pub struct TokioClock {
+        start: tokio::time::Instant,
+    }
+
+    impl TokioClock {
+        pub fn new() -> Arc<TokioClock> {
+            Arc::new(TokioClock {
+                start: tokio::time::Instant::now(),
+            })
+        }
+    }
+
+    impl Clock for TokioClock {
+        fn now(&self) -> Duration {
+            self.start.elapsed()
+        }
+        fn after(&self, d: Duration, f: Box<dyn FnOnce() + Send>) {
+            tokio::spawn(async move {
+                tokio::time::sleep(d).await;
+                f();
+            });
+        }
+    }
 }
 
 #[cfg(test)]
