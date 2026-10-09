@@ -1786,6 +1786,65 @@ mod tests {
     use rusternetes_common::types::ObjectMeta;
     use rusternetes_storage::MemoryStorage;
 
+    /// Port of `TestSyncServiceMissing`
+    /// (endpointslice_controller_test.go:318-350): syncing a Service that no
+    /// longer exists makes no writes and drops only that Service's
+    /// trigger-time state (endpointslice_controller.go:388-390).
+    #[tokio::test]
+    async fn test_sync_service_missing() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = EndpointSliceController::new(Arc::clone(&storage));
+
+        let existing = Service {
+            type_meta: rusternetes_common::types::TypeMeta {
+                kind: "Service".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: ObjectMeta::new("stillthere").with_namespace("default"),
+            spec: ServiceSpec {
+                selector: Some(HashMap::from([("foo".to_string(), "bar".to_string())])),
+                ..Default::default()
+            },
+            status: None,
+        };
+        storage
+            .create(
+                &build_key("services", Some("default"), "stillthere"),
+                &existing,
+            )
+            .await
+            .unwrap();
+        controller
+            .trigger_time_tracker
+            .insert_empty_service("default", "stillthere");
+        controller
+            .trigger_time_tracker
+            .insert_empty_service("default", "notthere");
+
+        let queue = WorkQueue::new();
+        // Work-queue key format, as in `get_services_to_update`.
+        queue.add("services/default/notthere".to_string()).await;
+        // The worker loops on `queue.get()` forever; one item is all we feed.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            controller.worker(queue),
+        )
+        .await;
+
+        assert!(!controller
+            .trigger_time_tracker
+            .has_service("default", "notthere"));
+        assert!(controller
+            .trigger_time_tracker
+            .has_service("default", "stillthere"));
+        // No client actions: no EndpointSlice was created.
+        let slices = storage
+            .list::<EndpointSlice>(&build_prefix("endpointslices", Some("default")))
+            .await
+            .unwrap();
+        assert!(slices.is_empty());
+    }
+
     #[tokio::test]
     async fn test_endpointslice_controller_creation() {
         let storage = Arc::new(MemoryStorage::new());

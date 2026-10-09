@@ -100,6 +100,25 @@ impl TriggerTimeTracker {
         min_changed_trigger_time
     }
 
+    /// Test-only view of `ServiceStates` (upstream's test reads the exported
+    /// map directly: `endpointslice_controller_test.go:340-347`).
+    #[cfg(test)]
+    pub(crate) fn has_service(&self, namespace: &str, name: &str) -> bool {
+        self.service_states
+            .lock()
+            .unwrap()
+            .contains_key(&(namespace.to_string(), name.to_string()))
+    }
+
+    /// Test-only: `ServiceStates[key] = ServiceState{}`.
+    #[cfg(test)]
+    pub(crate) fn insert_empty_service(&self, namespace: &str, name: &str) {
+        self.service_states.lock().unwrap().insert(
+            (namespace.to_string(), name.to_string()),
+            Default::default(),
+        );
+    }
+
     /// `DeleteService` (`:131-137`).
     pub fn delete_service(&self, namespace: &str, name: &str) {
         self.service_states
