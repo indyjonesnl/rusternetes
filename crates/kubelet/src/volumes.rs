@@ -3686,3 +3686,98 @@ mod blocking_fs_offload_tests {
         );
     }
 }
+
+/// #2913: a mounted projected `podCertificate` volume must pick up a rotated
+/// credential bundle on resync. Upstream: the projected plugin
+/// `RequiresRemount` (`pkg/volume/projected/projected.go:100-102`) makes the
+/// reconciler re-run `SetUpAt` (`reconciler_common.go:185,210`), whose
+/// `collectData` re-asks the pod certificate manager
+/// (`projected.go:391-428`) and rewrites through the AtomicWriter.
+#[cfg(all(test, unix))]
+mod pod_certificate_resync_tests {
+    use super::*;
+    use rusternetes_storage::StorageBackend;
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    /// A manager whose bundle the test rotates.
+    struct RotatingManager(Mutex<(Vec<u8>, Vec<u8>)>);
+
+    #[async_trait::async_trait]
+    impl crate::podcertificate::Manager for RotatingManager {
+        fn track_pod(&self, _pod: &Pod) {}
+        fn forget_pod(&self, _pod: &Pod) {}
+        async fn get_pod_certificate_credential_bundle(
+            &self,
+            _namespace: &str,
+            _pod_name: &str,
+            _pod_uid: &str,
+            _volume_name: &str,
+            _source_index: usize,
+        ) -> Result<(Vec<u8>, Vec<u8>)> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+        fn metric_report(&self) -> crate::podcertificate::MetricReport {
+            Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn resync_projects_rotated_pod_certificate() {
+        let mgr = Arc::new(RotatingManager(Mutex::new((
+            b"key1\n".to_vec(),
+            b"cert1\n".to_vec(),
+        ))));
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(StorageBackend::new_memory());
+        let vm = VolumeManager::new_with_pod_certificate_manager(
+            tmp.path().to_string_lossy().to_string(),
+            Some(storage.clone()),
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            Some(mgr.clone()),
+        );
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-pc"},
+            "spec": {"containers": [], "volumes": [{
+                "name": "creds",
+                "projected": {"defaultMode": 420, "sources": [
+                    {"podCertificate": {
+                        "signerName": "example.com/signer",
+                        "keyType": "ED25519",
+                        "keyPath": "key.pem",
+                        "certificateChainPath": "chain.pem",
+                        "credentialBundlePath": "bundle.pem"
+                    }}
+                ]}
+            }]}
+        }))
+        .unwrap();
+        let volume = pod.spec.as_ref().unwrap().volumes.as_ref().unwrap()[0].clone();
+        let path = vm.create_volume(&pod, &volume).await.unwrap();
+        assert_eq!(
+            std::fs::read(format!("{path}/chain.pem")).unwrap(),
+            b"cert1\n"
+        );
+
+        // An unchanged bundle must keep every file.
+        vm.resync_volumes(&pod, storage.as_ref()).await.unwrap();
+        assert_eq!(std::fs::read(format!("{path}/key.pem")).unwrap(), b"key1\n");
+        assert_eq!(
+            std::fs::read(format!("{path}/chain.pem")).unwrap(),
+            b"cert1\n"
+        );
+
+        // Rotate: the manager now hands out a new bundle.
+        *mgr.0.lock().unwrap() = (b"key2\n".to_vec(), b"cert2\n".to_vec());
+        vm.resync_volumes(&pod, storage.as_ref()).await.unwrap();
+        assert_eq!(std::fs::read(format!("{path}/key.pem")).unwrap(), b"key2\n");
+        assert_eq!(
+            std::fs::read(format!("{path}/chain.pem")).unwrap(),
+            b"cert2\n"
+        );
+        assert_eq!(
+            std::fs::read(format!("{path}/bundle.pem")).unwrap(),
+            b"key2\ncert2\n"
+        );
+    }
+}
