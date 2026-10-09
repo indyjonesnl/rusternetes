@@ -24,6 +24,7 @@ mod daemonset_controller_revision_test;
 mod daemonset_controller_test;
 mod daemonset_extended_test;
 mod daemonset_revision_match_test;
+mod daemonset_revision_pointer_zero_test;
 mod deployment_controller_test;
 mod deployment_extended_test;
 mod deployment_idempotency_test;
