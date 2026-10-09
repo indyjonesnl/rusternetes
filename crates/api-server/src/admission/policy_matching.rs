@@ -130,7 +130,7 @@ fn resource_matches(rule: &RuleWithOperations, attr: &Attributes) -> bool {
 }
 
 /// `metav1.LabelSelectorAsSelector` over this API group's selector type.
-fn selector_of(selector: Option<&LabelSelector>) -> std::result::Result<Selector, String> {
+pub(crate) fn selector_of(selector: Option<&LabelSelector>) -> std::result::Result<Selector, String> {
     let converted = selector.map(|s| MetaLabelSelector {
         match_labels: s.match_labels.clone(),
         match_expressions: s.match_expressions.as_ref().map(|reqs| {
