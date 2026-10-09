@@ -33,6 +33,7 @@ pub mod network_policy;
 pub mod node;
 pub mod node_ipam;
 pub mod node_lifecycle_queue;
+pub mod node_lifecycle_metrics;
 pub mod node_lifecycle_zone;
 pub mod pod_disruption_budget;
 pub mod priorityclass;
@@ -141,5 +142,6 @@ pub async fn check_resource_quota<S: rusternetes_storage::Storage>(
 pub fn gather_metrics() -> String {
     let mut out = cidrset_metrics::gather();
     out.push_str(&ephemeral_volume_metrics::gather());
+    out.push_str(&node_lifecycle_metrics::gather());
     out
 }
