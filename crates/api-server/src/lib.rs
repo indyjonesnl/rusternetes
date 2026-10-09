@@ -3,6 +3,7 @@ pub mod audit;
 pub mod authorizer;
 pub use rusternetes_admission_webhook as admission_webhook;
 pub mod apiserver_identity;
+pub mod autoregister;
 pub mod bootstrap;
 pub mod legacy_token_tracking;
 pub use rusternetes_admission_webhook::cel_evaluators as cel;
