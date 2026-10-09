@@ -10,6 +10,7 @@
 //! below. A stray `tests/<name>.rs` still compiles -- it just silently
 //! reintroduces a separate binary, which is what this layout avoids.
 mod authz_rbac_node;
+mod cel_struct_literals_test;
 mod crd_jsonschemaprops_roundtrip_test;
 mod decode_parity;
 mod fuzz_roundtrip_jsonproto_test;
@@ -93,7 +94,6 @@ mod validation_volumeattachment;
 mod validation_volumeattributesclass;
 mod validation_volumesnapshot_deletion_policy;
 mod validation_webhookconfiguration;
-mod cel_struct_literals_test;
 mod wire_field_shape_guard;
 
 mod networking_store_ingress_validation;
