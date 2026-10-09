@@ -835,6 +835,26 @@ rules:
         assert_eq!(a.verb, "deletecollection");
         let a = request_info(&Method::GET, "/api/v1/namespaces/ns", None);
         assert_eq!((a.resource.as_str(), a.name.as_str()), ("namespaces", "ns"));
+        // requestinfo.go:247-253: a list/watch with an exact `metadata.name`
+        // field selector names the object.
+        let a = request_info(
+            &Method::GET,
+            "/api/v1/namespaces/ns/pods",
+            Some("watch=true&fieldSelector=metadata.name%3Dmypod"),
+        );
+        assert_eq!((a.verb.as_str(), a.name.as_str()), ("watch", "mypod"));
+        let a = request_info(
+            &Method::GET,
+            "/api/v1/pods",
+            Some("fieldSelector=status.phase=Running,metadata.name==p"),
+        );
+        assert_eq!((a.verb.as_str(), a.name.as_str()), ("list", "p"));
+        let a = request_info(
+            &Method::GET,
+            "/api/v1/pods",
+            Some("fieldSelector=metadata.name!=p"),
+        );
+        assert_eq!(a.name, "");
         let a = request_info(&Method::GET, "/healthz", None);
         assert!(!a.is_resource_request);
         assert_eq!(a.verb, "get");

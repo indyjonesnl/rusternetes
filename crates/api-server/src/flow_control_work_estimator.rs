@@ -34,6 +34,7 @@ pub struct RequestInfo {
     pub api_group: String,
     pub resource: String,
     pub subresource: String,
+    pub namespace: String,
     pub name: String,
 }
 
@@ -608,6 +609,7 @@ mod tests {
                 resource: c.info.2.into(),
                 name: c.info.3.into(),
                 subresource: c.info.4.into(),
+                ..Default::default()
             };
             let query = url::Url::parse(c.uri)
                 .ok()
