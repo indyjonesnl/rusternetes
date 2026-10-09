@@ -1881,7 +1881,11 @@ mod tests {
             Default::default()
         }
 
-        async fn set_up(&self) -> Result<()> {
+        async fn set_up_at(
+            &self,
+            _dir: &str,
+            _args: &crate::volume_plugins::MounterArgs,
+        ) -> Result<()> {
             Ok(())
         }
     }

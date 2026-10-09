@@ -22,11 +22,13 @@ pub mod plugin;
 pub mod projected;
 pub mod registry;
 pub mod secret;
+#[cfg(test)]
+mod set_up_at_tests;
 pub mod util;
 
 pub use host::{KubeletVolumeHost, VolumeHost};
 pub use plugin::{
-    Attributes, DeviceMounter, DeviceMounterArgs, Mounter, OwnedSpec, ReconstructedVolume, Spec,
-    Unmounter, VolumePlugin,
+    Attributes, DeviceMounter, DeviceMounterArgs, Mounter, MounterArgs, OwnedSpec,
+    ReconstructedVolume, Spec, Unmounter, VolumePlugin,
 };
 pub use registry::{PluginLookupError, VolumePluginMgr};

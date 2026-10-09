@@ -190,7 +190,7 @@ impl Mounter for SecretMounter {
         }
     }
 
-    async fn set_up(&self) -> Result<()> {
+    async fn set_up_at(&self, dir: &str, args: &crate::volume_plugins::MounterArgs) -> Result<()> {
         // ---- moved verbatim from create_volume's secret branch
         //      (991a503d:crates/kubelet/src/volumes.rs:1062-1325) ----
         let storage = self
@@ -210,7 +210,7 @@ impl Mounter for SecretMounter {
         let key = build_key("secrets", Some(&self.namespace), secret_name);
         let secret_result: Result<Secret, _> = storage.get(&key).await;
 
-        let volume_dir = &self.path;
+        let volume_dir = dir;
 
         let secret = match secret_result {
             Ok(s) => Some(s),
@@ -293,7 +293,7 @@ impl Mounter for SecretMounter {
         if let Err(e) = crate::volume_ownership::write_payload_with_ownership(
             std::path::Path::new(volume_dir),
             &payload,
-            self.fs_group,
+            args.fs_group.or(self.fs_group),
             true,
         ) {
             // emptyDir `TearDownAt` removes the ready dir first (empty_dir.go:497-500).

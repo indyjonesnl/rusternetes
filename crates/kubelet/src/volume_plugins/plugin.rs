@@ -284,6 +284,23 @@ pub struct Attributes {
     pub selinux_relabel: bool,
 }
 
+/// Port of `volume.MounterArgs` (`pkg/volume/volume.go:126-139`).
+///
+/// Not ported: `Recorder` and `VolumeOwnershipApplicator` (no consumer; the
+/// latter is a unit-test seam). `fs_group_change_policy` is the policy string
+/// (`Always` / `OnRootMismatch`) as our `PodSecurityContext` carries it.
+/// `desired_size` is the byte count of the `resource.Quantity`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MounterArgs {
+    /// When set, ownership of the volume is changed to be owned and writable
+    /// by `fs_user`. Currently only for projected service account tokens.
+    pub fs_user: Option<i64>,
+    pub fs_group: Option<i64>,
+    pub fs_group_change_policy: Option<String>,
+    pub desired_size: Option<i64>,
+    pub selinux_label: String,
+}
+
 /// Port of `volume.Mounter` (`pkg/volume/volume.go:162`).
 ///
 /// `set_up` is async where upstream's `SetUp` is synchronous: our bodies await
@@ -305,10 +322,25 @@ pub trait Mounter: Send + Sync {
     /// `Volume::GetPath` (`volume.go:36`).
     fn get_path(&self) -> String;
 
-    /// `Mounter::SetUp` (`volume.go:175`). Upstream takes `MounterArgs`
-    /// (fsGroup, SELinux label); no moved body reads any of it, so the
-    /// argument is not ported until a consumer needs it.
-    async fn set_up(&self) -> Result<()>;
+    /// `Mounter::SetUpAt` (`volume.go:184`): prepare and mount the volume at
+    /// `dir`, which may not exist yet. Idempotent. Every plugin's body lives
+    /// here, as upstream's does; `SetUp` is `SetUpAt(GetPath(), args)`.
+    async fn set_up_at(&self, dir: &str, args: &MounterArgs) -> Result<()>;
+
+    /// `Mounter::SetUp(mounterArgs)` (`volume.go:175`):
+    /// `SetUpAt(GetPath(), args)`, which every upstream plugin implements
+    /// identically. hostPath overrides it (its `SetUpAt` is an error).
+    async fn set_up_with(&self, args: &MounterArgs) -> Result<()> {
+        self.set_up_at(&self.get_path(), args).await
+    }
+
+    /// `SetUp` with empty `MounterArgs`. Rust-only convenience that keeps
+    /// pre-`MounterArgs` callers compiling; production goes through
+    /// [`Mounter::set_up_with`] with the args the operation generator builds
+    /// (`operation_generator.go:582-589`).
+    async fn set_up(&self) -> Result<()> {
+        self.set_up_with(&MounterArgs::default()).await
+    }
 
     /// `Mounter::GetAttributes` (`volume.go:187`): the attributes of the
     /// mounter, called after `SetUp`. The kubelet's `makeMounts` reads

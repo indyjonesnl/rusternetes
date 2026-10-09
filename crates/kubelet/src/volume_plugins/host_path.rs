@@ -189,7 +189,7 @@ impl Mounter for HostPathMounter {
     /// for both arms, which is why a PV-backed hostPath is checked here where
     /// `create_volume`'s PVC branch did not check it. Sanctioned delta, see
     /// the plan.
-    async fn set_up(&self) -> Result<()> {
+    async fn set_up_with(&self, _args: &crate::volume_plugins::MounterArgs) -> Result<()> {
         // `validation.ValidatePathNoBacksteps(b.GetPath())` runs BEFORE the
         // type check (`host_path.go:242-245`), so a path with a backstep is
         // rejected with this error, never a type error. #1973.
@@ -205,6 +205,16 @@ impl Mounter for HostPathMounter {
         info!("Using hostPath volume {} at {}", self.volume_name, path);
         // ---- end moved body ----
         Ok(())
+    }
+
+    /// `hostPathMounter.SetUpAt` (`host_path.go:257-260`): "SetUpAt does not
+    /// make sense for host paths - probably programmer error."
+    async fn set_up_at(
+        &self,
+        _dir: &str,
+        _args: &crate::volume_plugins::MounterArgs,
+    ) -> Result<()> {
+        Err(anyhow!("SetUpAt() does not make sense for host paths"))
     }
 }
 

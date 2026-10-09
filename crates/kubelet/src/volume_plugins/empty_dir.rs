@@ -300,8 +300,8 @@ impl Mounter for EmptyDirMounter {
         }
     }
 
-    async fn set_up(&self) -> Result<()> {
-        let volume_dir = &self.path;
+    async fn set_up_at(&self, dir: &str, args: &crate::volume_plugins::MounterArgs) -> Result<()> {
+        let volume_dir = dir;
         let empty_dir = &self.empty_dir;
         // SetUpAt (empty_dir.go:268-277): the medium switch. Anything that is
         // not Default, Memory or a huge-page medium is an error.
@@ -327,7 +327,11 @@ impl Mounter for EmptyDirMounter {
         // Deviation: upstream discards the error (`_ =`); we return it, as the
         // other plugins here do, so a pod never starts against an unreadable
         // volume.
-        crate::volume_ownership::set_volume_ownership(Path::new(volume_dir), self.fs_group, false)?;
+        crate::volume_ownership::set_volume_ownership(
+            Path::new(volume_dir),
+            args.fs_group.or(self.fs_group),
+            false,
+        )?;
         info!(
             "Created emptyDir volume {} at {}",
             self.volume_name, volume_dir

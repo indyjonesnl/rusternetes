@@ -504,9 +504,13 @@ impl CsiMounter {
     }
 
     /// Port of `supportsFSGroup` (`csi_mounter.go:469-500`).
-    fn supports_fs_group(&self, fs_type: &str, driver_policy: &FSGroupPolicy) -> bool {
-        if self.fs_group.is_none() || matches!(driver_policy, FSGroupPolicy::None) || self.read_only
-        {
+    fn supports_fs_group(
+        &self,
+        fs_group: Option<i64>,
+        fs_type: &str,
+        driver_policy: &FSGroupPolicy,
+    ) -> bool {
+        if fs_group.is_none() || matches!(driver_policy, FSGroupPolicy::None) || self.read_only {
             return false;
         }
         if matches!(driver_policy, FSGroupPolicy::File) {
@@ -935,8 +939,17 @@ impl Mounter for CsiMounter {
     ///
     /// Not ported: SELinux mount context and the post-publish SELinux-support
     /// probe. See #2312.
-    async fn set_up(&self) -> Result<()> {
-        let dir = Path::new(&self.path);
+    async fn set_up_at(
+        &self,
+        dir_str: &str,
+        args: &crate::volume_plugins::MounterArgs,
+    ) -> Result<()> {
+        let dir = Path::new(dir_str);
+        let fs_group = args.fs_group.or(self.fs_group);
+        let fs_group_change_policy = args
+            .fs_group_change_policy
+            .clone()
+            .or_else(|| self.fs_group_change_policy.clone());
 
         let client = match CsiDriverClient::new(&self.driver_name) {
             Ok(c) => c,
@@ -947,7 +960,7 @@ impl Mounter for CsiMounter {
                 std::fs::create_dir_all(dir).context("Failed to create CSI volume directory")?;
                 info!(
                     "Created CSI ephemeral volume {} at {} (managed by CSI driver)",
-                    self.spec_name, self.path
+                    self.spec_name, dir_str
                 );
                 return Ok(());
             }
@@ -1139,7 +1152,7 @@ impl Mounter for CsiMounter {
                 ))
             })?;
         let node_publish_fs_group = if driver_supports_volume_mount_group {
-            self.fs_group
+            fs_group
         } else {
             None
         };
@@ -1149,7 +1162,7 @@ impl Mounter for CsiMounter {
                 &self.volume_id,
                 self.read_only,
                 &device_mount_path,
-                &self.path,
+                dir_str,
                 &access_mode,
                 publish_context,
                 vol_attribs,
@@ -1176,11 +1189,11 @@ impl Mounter for CsiMounter {
         // `csi_mounter.go:333-352`: the driver does not apply the fsGroup, so
         // the kubelet must. The mount succeeded, so a failure here is
         // UncertainProgress (the volume must still be cleaned up).
-        if !driver_supports_volume_mount_group && self.supports_fs_group(&fs_type, &fs_group_policy)
+        if !driver_supports_volume_mount_group
+            && self.supports_fs_group(fs_group, &fs_type, &fs_group_policy)
         {
-            let fs_group = self.fs_group;
-            let policy = self.fs_group_change_policy.clone();
-            let root = self.path.clone();
+            let policy = fs_group_change_policy;
+            let root = dir_str.to_string();
             // GetAttributes().ReadOnly is `c.readOnly`, which
             // `supportsFSGroup` already excluded.
             tokio::task::spawn_blocking(move || {
@@ -1201,7 +1214,7 @@ impl Mounter for CsiMounter {
             })?;
             debug!(
                 "kubernetes.io/csi: mounter.SetupAt fsGroup [{}] applied successfully to {}",
-                self.fs_group.unwrap_or_default(),
+                fs_group.unwrap_or_default(),
                 self.volume_id
             );
         }
