@@ -575,6 +575,9 @@ pub fn add_audit_annotations(kvs: &[(String, String)]) {
     });
 }
 
+/// `audit.LogResponseObject` (request.go:172): not yet implemented.
+pub fn log_response_object(_obj: &serde_json::Value) {}
+
 /// `audit.AddAuditAnnotation(ctx, key, value)` (context.go:297).
 #[allow(dead_code)]
 pub fn add_audit_annotation(key: &str, value: &str) {
@@ -681,6 +684,7 @@ pub async fn with_audit(cfg: Arc<AuditConfig>, req: Request, next: Next) -> Resp
             resource_version: None,
         }),
         response_status: None,
+        response_object: None,
         request_received_timestamp: received,
         stage_timestamp: received,
         annotations: None,
@@ -1079,62 +1083,21 @@ rules:
         );
     }
 
-    /// `LogResponseObject` (audit/request.go) stores the `metav1.Status` the
-    /// handler wrote as the event's ResponseStatus, so a NotFound carries its
-    /// status/reason/message, not just the code.
-    #[tokio::test]
-    async fn failed_response_status_body_is_recorded() {
-        let cap = Arc::new(Capture(Default::default()));
-        let cfg = Arc::new(AuditConfig {
-            policy: Policy::from_yaml(&POLICY.replace("omitStages: [\"RequestReceived\"]\n", ""))
-                .unwrap(),
-            sink: cap.clone(),
-        });
-        let app = Router::new()
-            .route(
-                "/api/v1/namespaces/:ns/secrets/:name",
-                get(|| async {
-                    (
-                        axum::http::StatusCode::NOT_FOUND,
-                        [("content-type", "application/json")],
-                        r#"{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"secrets \"s\" not found","reason":"NotFound","details":{"name":"s","kind":"secrets"},"code":404}"#,
-                    )
-                }),
-            )
-            .layer(axum::middleware::from_fn(move |req, next| {
-                let cfg = cfg.clone();
-                async move { with_audit(cfg, req, next).await }
-            }));
-        let resp = app
-            .oneshot(
-                axum::http::Request::get("/api/v1/namespaces/ns/secrets/s")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 404);
-        // The client still receives the body untouched.
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
-            .await
-            .unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("NotFound"));
-        let ev = cap.0.lock().await;
-        let rs = ev[1].response_status.as_ref().unwrap();
-        assert_eq!(rs.code, 404);
-        assert_eq!(rs.status.as_deref(), Some("Failure"));
-        assert_eq!(rs.reason.as_deref(), Some("NotFound"));
-        assert_eq!(rs.message.as_deref(), Some("secrets \"s\" not found"));
-        assert_eq!(rs.details.as_ref().unwrap()["name"], "s");
-        let json = serde_json::to_value(rs).unwrap();
-        assert_eq!(json["metadata"], serde_json::json!({}));
+    /// A policy that audits every request at `level`.
+    fn level_policy(level: &str, omit_managed: bool) -> Policy {
+        Policy::from_yaml(&format!(
+            "apiVersion: audit.k8s.io/v1\nkind: Policy\nomitManagedFields: {omit_managed}\nrules:\n- level: {level}\n"
+        ))
+        .unwrap()
     }
 
-    async fn run_status_app(route: axum::routing::MethodRouter) -> (Response, Vec<AuditEvent>) {
+    async fn run_policy_app(
+        policy: Policy,
+        route: axum::routing::MethodRouter,
+    ) -> (Response, Vec<AuditEvent>) {
         let cap = Arc::new(Capture(Default::default()));
         let cfg = Arc::new(AuditConfig {
-            policy: Policy::from_yaml(&POLICY.replace("omitStages: [\"RequestReceived\"]\n", ""))
-                .unwrap(),
+            policy,
             sink: cap.clone(),
         });
         let app = Router::new()
@@ -1155,43 +1118,202 @@ rules:
         (resp, ev)
     }
 
-    /// `LogResponseObject` (audit/request.go) records the Status a handler
-    /// writes whatever its code: a delete's 200 `Success` Status is on the
-    /// event too, and the client still gets the body.
+    fn pod_json() -> serde_json::Value {
+        serde_json::json!({
+            "kind": "Pod", "apiVersion": "v1",
+            "metadata": {"name": "test-pod", "namespace": "test-namespace",
+                "managedFields": [{"manager": "kubectl"}]},
+            "spec": {"containers": [{"name": "test-container", "image": "test-image"}]}
+        })
+    }
+
+    async fn run_status_app(route: axum::routing::MethodRouter) -> (Response, Vec<AuditEvent>) {
+        run_policy_app(level_policy("Metadata", false), route).await
+    }
+
+    /// A handler failing with an `Error` is recorded through the response
+    /// extension `Error::into_response` sets (the `LogResponseObject` call in
+    /// `WriteObjectNegotiated`): the NotFound carries its status/reason/
+    /// message/details, and the client's body is untouched.
     #[tokio::test]
-    async fn success_status_body_is_recorded() {
+    async fn failed_response_status_is_recorded() {
         let (resp, ev) = run_status_app(get(|| async {
+            Err::<&str, _>(rusternetes_common::Error::NotFound(
+                "secrets \"s\" not found".into(),
+            ))
+        }))
+        .await;
+        assert_eq!(resp.status(), 404);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("NotFound"));
+        let rs = ev.last().unwrap().response_status.as_ref().unwrap();
+        assert_eq!(rs.code, 404);
+        assert_eq!(rs.status.as_deref(), Some("Failure"));
+        assert_eq!(rs.reason.as_deref(), Some("NotFound"));
+        assert_eq!(rs.message.as_deref(), Some("secrets \"s\" not found"));
+        assert_eq!(rs.details.as_ref().unwrap()["name"], "s");
+        let json = serde_json::to_value(rs).unwrap();
+        assert_eq!(json["metadata"], serde_json::json!({}));
+        assert!(ev.last().unwrap().response_object.is_none());
+    }
+
+    /// The filter no longer reads a body back: a Status-shaped JSON body the
+    /// handler never passed to `log_response_object` leaves only the code.
+    #[tokio::test]
+    async fn unhooked_status_body_is_not_read_back() {
+        let (_resp, ev) = run_status_app(get(|| async {
             (
+                axum::http::StatusCode::NOT_FOUND,
                 [("content-type", "application/json")],
-                r#"{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Success","details":{"name":"s","kind":"secrets","uid":"u1"},"code":200}"#,
+                r#"{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","reason":"NotFound","code":404}"#,
             )
         }))
         .await;
-        assert_eq!(resp.status(), 200);
+        let rs = ev.last().unwrap().response_status.as_ref().unwrap();
+        assert_eq!(rs.code, 404);
+        assert!(rs.status.is_none() && rs.reason.is_none());
+    }
+
+    /// TestLogResponseObjectWithStatus, Metadata case: the Status fields are
+    /// logged without the object; the code set by the writer is kept.
+    #[tokio::test]
+    async fn status_at_metadata_logs_fields_without_object() {
+        let (_resp, ev) = run_status_app(get(|| async {
+            log_response_object(&serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "metadata": {},
+                "status": "Success", "message": "Test message", "code": 200
+            }));
+            "ok"
+        }))
+        .await;
+        let last = ev.last().unwrap();
+        let rs = last.response_status.as_ref().unwrap();
+        assert_eq!(rs.status.as_deref(), Some("Success"));
+        assert_eq!(rs.message.as_deref(), Some("Test message"));
+        assert_eq!(rs.code, 200);
+        assert!(last.response_object.is_none());
+    }
+
+    /// TestLogResponseObjectWithStatus, RequestResponse case: fields AND the
+    /// encoded object.
+    #[tokio::test]
+    async fn status_at_request_response_logs_fields_and_object() {
+        let status = serde_json::json!({
+            "kind": "Status", "apiVersion": "v1", "metadata": {},
+            "status": "Success", "message": "Test message", "code": 200
+        });
+        let s2 = status.clone();
+        let (_resp, ev) = run_policy_app(
+            level_policy("RequestResponse", false),
+            get(move || async move {
+                log_response_object(&s2);
+                "ok"
+            }),
+        )
+        .await;
+        let last = ev.last().unwrap();
+        let rs = last.response_status.as_ref().unwrap();
+        assert_eq!(rs.status.as_deref(), Some("Success"));
+        assert_eq!(rs.message.as_deref(), Some("Test message"));
+        assert_eq!(last.response_object.as_ref(), Some(&status));
+    }
+
+    /// TestLogResponseObjectWithPod: a non-Status object at RequestResponse is
+    /// recorded as `responseObject`; `responseStatus` keeps only the code.
+    #[tokio::test]
+    async fn pod_at_request_response_is_recorded() {
+        let (_resp, ev) = run_policy_app(
+            level_policy("RequestResponse", false),
+            get(|| async {
+                log_response_object(&pod_json());
+                "ok"
+            }),
+        )
+        .await;
+        let last = ev.last().unwrap();
+        let obj = last.response_object.as_ref().expect("responseObject");
+        assert_eq!(obj["metadata"]["name"], "test-pod");
+        assert_eq!(obj["spec"]["containers"][0]["image"], "test-image");
+        let rs = last.response_status.as_ref().unwrap();
+        assert_eq!(rs.code, 200);
+        assert!(rs.status.is_none() && rs.message.is_none());
+    }
+
+    /// TestLogResponseObjectLevelCheck: below RequestResponse a non-Status
+    /// object records nothing; outside an audit context the call is a no-op.
+    #[tokio::test]
+    async fn pod_below_request_response_is_not_recorded() {
+        for level in ["Metadata", "Request"] {
+            let (_resp, ev) = run_policy_app(
+                level_policy(level, false),
+                get(|| async {
+                    log_response_object(&pod_json());
+                    "ok"
+                }),
+            )
+            .await;
+            assert!(ev.last().unwrap().response_object.is_none(), "{level}");
+        }
+        log_response_object(&pod_json());
+    }
+
+    /// `shouldOmitManagedFields` / `copyWithoutManagedFields`: the object and
+    /// the items of a list lose `metadata.managedFields`.
+    #[tokio::test]
+    async fn omit_managed_fields_strips_object_and_list_items() {
+        let list = serde_json::json!({
+            "kind": "PodList", "apiVersion": "v1", "metadata": {},
+            "items": [pod_json()]
+        });
+        for (omit, obj) in [(true, pod_json()), (true, list), (false, pod_json())] {
+            let o = obj.clone();
+            let (_resp, ev) = run_policy_app(
+                level_policy("RequestResponse", omit),
+                get(move || async move {
+                    log_response_object(&o);
+                    "ok"
+                }),
+            )
+            .await;
+            let rec = ev.last().unwrap().response_object.as_ref().unwrap();
+            let meta = if rec["kind"] == "PodList" {
+                &rec["items"][0]["metadata"]
+            } else {
+                &rec["metadata"]
+            };
+            assert_eq!(meta.get("managedFields").is_none(), omit);
+        }
+    }
+
+    /// A 2xx Status written by a handler through the shared `respond` helper
+    /// (a delete's `Success`) is recorded handler-side.
+    #[tokio::test]
+    async fn respond_helper_records_the_object() {
+        use crate::endpoints::handlers::rest::respond;
+        use crate::registry::rest::RequestContext;
+        let (resp, ev) = run_policy_app(
+            level_policy("RequestResponse", false),
+            get(|| async {
+                respond(
+                    axum::http::StatusCode::OK,
+                    &serde_json::json!({"kind": "Status", "apiVersion": "v1", "metadata": {},
+                        "status": "Success", "details": {"name": "s", "uid": "u1"}, "code": 200}),
+                    &RequestContext::new(Some("ns")),
+                )
+            }),
+        )
+        .await;
         let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
             .await
             .unwrap();
         assert!(String::from_utf8_lossy(&body).contains("Success"));
-        let rs = ev[1].response_status.as_ref().unwrap();
-        assert_eq!(rs.code, 200);
+        let last = ev.last().unwrap();
+        let rs = last.response_status.as_ref().unwrap();
         assert_eq!(rs.status.as_deref(), Some("Success"));
         assert_eq!(rs.details.as_ref().unwrap()["uid"], "u1");
-    }
-
-    /// A non-Status object leaves only the code (LogResponseObject sets
-    /// `ev.ResponseStatus = {Code}` for it).
-    #[tokio::test]
-    async fn non_status_success_body_records_only_the_code() {
-        let (_resp, ev) = run_status_app(get(|| async {
-            (
-                [("content-type", "application/json")],
-                r#"{"kind":"Secret","apiVersion":"v1","metadata":{"name":"s"}}"#,
-            )
-        }))
-        .await;
-        let rs = ev[1].response_status.as_ref().unwrap();
-        assert_eq!(rs.code, 200);
-        assert!(rs.status.is_none() && rs.details.is_none());
+        assert!(last.response_object.is_some());
     }
 
     /// A streamed (watch-style) body must not be buffered: the first chunk
@@ -1276,6 +1398,7 @@ rules:
                     source_ips: vec![],
                     object_ref: None,
                     response_status: None,
+                    response_object: None,
                     request_received_timestamp: Utc::now(),
                     stage_timestamp: Utc::now(),
                     annotations: None,
