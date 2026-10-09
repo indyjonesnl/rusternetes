@@ -11,8 +11,8 @@
 //! add/update/delete events through a rate-limited workqueue; [`run`] here
 //! re-syncs every known name on a short tick (the sync is idempotent and
 //! guarded by the same synced-once / present-at-start state).
-//! Wired into `startup.rs` via [`spawn_autoregistration`]; crdregistration is
-//! not ported yet (see that function's deviation note).
+//! Wired into `startup.rs` via [`spawn_autoregistration`], together with the
+//! `crdregistration` controller (`crate::crdregistration`).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
@@ -249,6 +249,15 @@ impl AutoRegisterController {
                 _ = stop.changed() => return,
             }
         }
+    }
+}
+
+impl crate::crdregistration::AutoAPIServiceRegistration for AutoRegisterController {
+    fn add_api_service_to_sync(&self, in_: &APIService) {
+        AutoRegisterController::add_api_service_to_sync(self, in_)
+    }
+    fn remove_api_service_to_sync(&self, name: &str) {
+        AutoRegisterController::remove_api_service_to_sync(self, name)
     }
 }
 
@@ -496,11 +505,14 @@ pub const AUTOREGISTRATION_HOOK: &str = "kube-apiserver-autoregistration";
 /// plus its `autoregister-completion` boot-sequence check (:183-193), over
 /// `storage`. `listed_paths` is the delegate's `ListedPaths()`.
 ///
-/// Deviations: (1) crdregistration is not ported yet, so this is upstream's
-/// `crdAPIEnabled == false` branch (:166-171, start without waiting for the
-/// initial CRD sync) -- tracked in the follow-up issue; (2) the controller is
-/// driven by [`AutoRegisterController::run`]'s tick rather than an informer,
-/// and the check observes Available by polling storage each second.
+/// This server always serves CRDs, so it takes upstream's `crdAPIEnabled ==
+/// true` branch: `go crdRegistrationController.Run(5, ...)` (:164-166), and the
+/// autoregistration controller starts only after `WaitForInitialSync()`
+/// (:172-176) so its initial sync cannot delete APIServices of existing CRDs.
+///
+/// Deviation (tracked in #2916): the controller is driven by
+/// [`AutoRegisterController::run`]'s tick rather than an informer, and the
+/// check observes Available by polling storage each second.
 pub fn spawn_autoregistration<S: Storage + 'static>(
     storage: std::sync::Arc<S>,
     listed_paths: Vec<String>,
@@ -513,14 +525,34 @@ pub fn spawn_autoregistration<S: Storage + 'static>(
         move || check.check()
     });
     crate::post_start_hooks::spawn_starting_hook(AUTOREGISTRATION_HOOK, move || {
+        let storage_for_crds = storage.clone();
         let client = std::sync::Arc::new(StorageAPIServiceClient(storage));
         // `Run(5, context.Done())`: the stop channel never fires for the
         // process lifetime.
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let crd_controller =
+            std::sync::Arc::new(crate::crdregistration::CrdRegistrationController::new(
+                crate::crdregistration::StorageCrdLister(storage_for_crds.clone()),
+                controller.clone(),
+            ));
         let c = controller.clone();
         let cl = client.clone();
         tokio::spawn(async move {
             let _keep = stop_tx;
+            // Event handlers first, so no CRD event falls between the initial
+            // list and the watch.
+            crate::crdregistration::spawn_crd_event_handlers(
+                storage_for_crds,
+                crd_controller.clone(),
+            )
+            .await;
+            // `go crdRegistrationController.Run(5, context.Done())`
+            tokio::spawn(crd_controller.clone().run(5, stop_rx.clone()));
+            // "let the CRD controller process the initial set of CRDs before
+            // starting the autoregistration controller."
+            tracing::info!("waiting for initial CRD sync...");
+            crd_controller.wait_for_initial_sync().await;
+            tracing::info!("initial CRD sync complete...");
             c.run(cl.as_ref(), stop_rx).await;
         });
         // Observe Available (informer add/update handlers upstream).
