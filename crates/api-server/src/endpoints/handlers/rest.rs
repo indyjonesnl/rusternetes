@@ -311,6 +311,10 @@ pub(crate) fn respond<B: Serialize>(
             headers.append(header::WARNING, v);
         }
     }
+    // `WriteObjectNegotiated` -> `audit.LogResponseObject`
+    // (responsewriters/writers.go:346): the object is recorded where it is
+    // serialized, not read back from the body by the audit filter.
+    crate::audit::log_response_object(body);
     (status, headers, Json(body)).into_response()
 }
 

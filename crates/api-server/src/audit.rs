@@ -6,11 +6,12 @@
 //!   `pkg/audit/policy/reader.go` (`LoadPolicyFromBytes`),
 //!   `pkg/apis/audit/validation/validation.go` (`ValidatePolicy`);
 //! - `pkg/audit/context.go` (`AuditContext`, `ProcessEventStage`,
-//!   `AddAuditAnnotations`), `pkg/audit/request.go` (`LogRequestMetadata`);
+//!   `AddAuditAnnotations`), `pkg/audit/request.go` (`LogRequestMetadata`,
+//!   `LogResponseObject`);
 //! - `pkg/endpoints/filters/audit.go` (`WithAudit`);
 //! - `pkg/endpoints/request/requestinfo.go` (`NewRequestInfo`).
 //!
-//! Not yet ported (tracked in the PR): Request / RequestResponse bodies,
+//! Not yet ported (tracked in the PR): the RequestObject body,
 //! impersonated users, the ResponseStarted -> ResponseComplete split of a
 //! long-running request, the Panic stage, the webhook backend flags, log
 //! rotation and the `legacy` format.
@@ -530,14 +531,69 @@ impl AuditContext {
         }
     }
 
+    /// `SetEventResponseStatusCode` (context.go:273-280): sets only the code,
+    /// keeping any Status fields `LogResponseObject` already recorded.
     fn set_response_status(&self, code: u16) {
         if let Ok(mut g) = self.inner.lock() {
+            g.event
+                .response_status
+                .get_or_insert_with(ResponseStatus::default)
+                .code = code;
+        }
+    }
+
+    fn level_ord(&self) -> u8 {
+        self.inner
+            .lock()
+            .map(|g| level_ord(&g.event.level))
+            .unwrap_or(0)
+    }
+
+    fn audit_id(&self) -> String {
+        self.inner
+            .lock()
+            .map(|g| g.event.audit_id.clone())
+            .unwrap_or_default()
+    }
+
+    /// `LogResponseObject` (audit/request.go:172-199) +
+    /// `AuditContext.LogResponseObject` (context.go:158-175): below Metadata
+    /// nothing is recorded; a `metav1.Status` has its bounded fields copied
+    /// into `ResponseStatus`; at RequestResponse the object itself becomes
+    /// `ResponseObject`, minus `managedFields` when the request's audit config
+    /// omits them (`shouldOmitManagedFields`, request.go:289).
+    fn log_response_object(&self, obj: &serde_json::Value) {
+        let Ok(mut g) = self.inner.lock() else {
+            return;
+        };
+        if level_ord(&g.event.level) < 1 {
+            return;
+        }
+        if obj.get("kind").and_then(|k| k.as_str()) == Some("Status") {
+            let s = |k: &str| obj.get(k).and_then(|x| x.as_str()).map(str::to_string);
+            let code = obj
+                .get("code")
+                .and_then(|c| c.as_u64())
+                .and_then(|c| u16::try_from(c).ok())
+                .unwrap_or(0);
+            // "selectively copy the bounded fields."
             g.event.response_status = Some(ResponseStatus {
+                status: s("status"),
+                message: s("message"),
+                reason: s("reason"),
+                details: obj.get("details").cloned(),
                 code,
-                message: None,
                 ..Default::default()
             });
         }
+        if level_ord(&g.event.level) < 3 {
+            return;
+        }
+        let mut obj = obj.clone();
+        if g.config.omit_managed_fields {
+            remove_managed_fields(&mut obj);
+        }
+        g.event.response_object = Some(obj);
     }
 
     /// `GetEventLevel`.
@@ -546,6 +602,28 @@ impl AuditContext {
             .lock()
             .map(|g| g.event.level.clone())
             .unwrap_or(AuditLevel::None)
+    }
+}
+
+/// `copyWithoutManagedFields` (audit/request.go:235-276): the object's own
+/// `metadata.managedFields`, those of a list's `items`, and those of a Table's
+/// `rows[].object`.
+fn remove_managed_fields(obj: &mut serde_json::Value) {
+    fn strip(v: &mut serde_json::Value) {
+        if let Some(meta) = v.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+            meta.remove("managedFields");
+        }
+    }
+    strip(obj);
+    if let Some(items) = obj.get_mut("items").and_then(|i| i.as_array_mut()) {
+        items.iter_mut().for_each(strip);
+    }
+    if obj.get("kind").and_then(|k| k.as_str()) == Some("Table") {
+        if let Some(rows) = obj.get_mut("rows").and_then(|r| r.as_array_mut()) {
+            rows.iter_mut()
+                .filter_map(|r| r.get_mut("object"))
+                .for_each(strip);
+        }
     }
 }
 
@@ -575,8 +653,26 @@ pub fn add_audit_annotations(kvs: &[(String, String)]) {
     });
 }
 
-/// `audit.LogResponseObject` (request.go:172): not yet implemented.
-pub fn log_response_object(_obj: &serde_json::Value) {}
+/// `audit.LogResponseObject(ctx, obj, gv, s)` (audit/request.go:172-199),
+/// called by the response writers where the object is serialized
+/// (`WriteObjectNegotiated`, responsewriters/writers.go:346). A no-op when the
+/// request is not audited. The level is checked BEFORE the object is
+/// serialized (request.go:174-180), so an unaudited or Metadata-level request
+/// pays nothing for it.
+pub fn log_response_object<B: serde::Serialize>(obj: &B) {
+    let _ = AUDIT_CONTEXT.try_with(|ac| {
+        if ac.level_ord() < 1 {
+            return;
+        }
+        match serde_json::to_value(obj) {
+            Ok(v) => ac.log_response_object(&v),
+            Err(e) => error!(
+                "encoding failed of response object (auditID {}): {e}",
+                ac.audit_id()
+            ),
+        }
+    });
+}
 
 /// `audit.AddAuditAnnotation(ctx, key, value)` (context.go:297).
 #[allow(dead_code)]
@@ -713,66 +809,22 @@ pub async fn with_audit(cfg: Arc<AuditConfig>, req: Request, next: Next) -> Resp
     if let Ok(v) = HeaderValue::from_str(&audit_id) {
         resp.headers_mut().insert("Audit-ID", v);
     }
-    ac.set_response_status(resp.status().as_u16());
-    if !resp.status().is_informational() && status_body_is_recordable(&resp) {
-        resp = record_status_body(&ac, resp).await;
+    // The error writer (`Error::into_response`) cannot reach this crate's
+    // audit context; it hands the Status it serialized over as a response
+    // extension, recorded here exactly as `LogResponseObject` would have.
+    if let Some(rusternetes_common::audit::AuditResponseObject(obj)) =
+        resp.extensions_mut()
+            .remove::<rusternetes_common::audit::AuditResponseObject>()
+    {
+        ac.log_response_object(&obj);
     }
+    // `auditResponseWriter.processCode` (filters/audit.go:204-211).
+    ac.set_response_status(resp.status().as_u16());
     if long_running {
         ac.process_event_stage(AuditStage::ResponseStarted).await;
     }
     ac.process_event_stage(AuditStage::ResponseComplete).await;
     resp
-}
-
-/// Largest error body buffered to recover the Status (error responses are
-/// small; a streamed body is never an error Status).
-const MAX_STATUS_BODY: usize = 1 << 20;
-
-/// `audit.LogResponseObject` (audit/request.go): at Metadata level and above
-/// the `metav1.Status` the handler wrote becomes the event's `ResponseStatus`
-/// (`ac.LogResponseObject` -> `ev.ResponseStatus = status`). Upstream hooks the
-/// serializer; here the (non-2xx) body is read back and passed through
-/// unchanged. Deviation: upstream hooks the serializer, so it never reads a
-/// body back; here only a body that is ALREADY fully in memory (exact
-/// `size_hint`, <= `MAX_STATUS_BODY`) and JSON is inspected, so a streamed or
-/// watch response (no exact size) is never buffered.
-fn status_body_is_recordable(resp: &Response) -> bool {
-    let json = resp
-        .headers()
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.contains("json"));
-    json && axum::body::HttpBody::size_hint(resp.body())
-        .exact()
-        .is_some_and(|n| n <= MAX_STATUS_BODY as u64)
-}
-
-async fn record_status_body(ac: &AuditContext, resp: Response) -> Response {
-    let (parts, body) = resp.into_parts();
-    let bytes = axum::body::to_bytes(body, MAX_STATUS_BODY)
-        .await
-        .unwrap_or_default();
-    // Cheap pre-check so a large non-Status object is never parsed.
-    let maybe_status = bytes.windows(8).any(|w| w == b"\"Status\"");
-    if let Some(v) = maybe_status
-        .then(|| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .flatten()
-    {
-        if v.get("kind").and_then(|k| k.as_str()) == Some("Status") {
-            let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
-            if let Ok(mut g) = ac.inner.lock() {
-                g.event.response_status = Some(ResponseStatus {
-                    status: s("status"),
-                    message: s("message"),
-                    reason: s("reason"),
-                    details: v.get("details").cloned(),
-                    code: parts.status.as_u16(),
-                    ..Default::default()
-                });
-            }
-        }
-    }
-    Response::from_parts(parts, axum::body::Body::from(bytes))
 }
 
 fn internal_error(msg: &str) -> Response {

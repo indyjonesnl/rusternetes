@@ -11,6 +11,13 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tracing::{error, info};
 
+/// Response extension carrying the object a writer serialized, for the
+/// api-server's audit filter to record (`audit.LogResponseObject`,
+/// audit/request.go:172). `Error::into_response` sets it for its `Status`:
+/// the writer lives in this crate, the audit context in the api-server.
+#[derive(Debug, Clone)]
+pub struct AuditResponseObject(pub serde_json::Value);
+
 /// Audit event representing an API request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
