@@ -43,6 +43,10 @@ pub struct AuditEvent {
     /// HTTP response code
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_status: Option<ResponseStatus>,
+    /// `Event.ResponseObject` (a `runtime.Unknown`, serialised as the raw
+    /// object): set only at `RequestResponse` level, by `LogResponseObject`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_object: Option<serde_json::Value>,
     /// Request received timestamp
     #[serde(
         serialize_with = "crate::types::k8s_micro_time_required::serialize",
@@ -369,6 +373,7 @@ impl AuditLogger {
             source_ips: Vec::new(),
             object_ref,
             response_status: None,
+            response_object: None,
             request_received_timestamp: now,
             stage_timestamp: now,
             annotations: None,
@@ -416,6 +421,7 @@ impl AuditLogger {
                 message,
                 ..Default::default()
             }),
+            response_object: None,
             request_received_timestamp: now, // Should be the original timestamp
             stage_timestamp: now,
             annotations: None,
@@ -472,6 +478,7 @@ mod tests {
             source_ips: Vec::new(),
             object_ref: None,
             response_status: None,
+            response_object: None,
             request_received_timestamp: Utc::now(),
             stage_timestamp: Utc::now(),
             annotations: None,
@@ -508,6 +515,7 @@ mod tests {
             source_ips: Vec::new(),
             object_ref: None,
             response_status: None,
+            response_object: None,
             request_received_timestamp: Utc::now(),
             stage_timestamp: Utc::now(),
             annotations: None,
@@ -568,6 +576,7 @@ mod tests {
                 message: Some("Created".to_string()),
                 ..Default::default()
             }),
+            response_object: None,
             request_received_timestamp: Utc::now(),
             stage_timestamp: Utc::now(),
             annotations: None,
