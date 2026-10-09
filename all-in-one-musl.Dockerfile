@@ -36,7 +36,7 @@ FROM rust:1.95-alpine AS builder
 #   build-base/musl-dev  — gcc + musl headers for ring, bundled SQLite, mimalloc
 #   perl                 — ring's build script
 #   protoc/protobuf-dev  — tonic/prost proto codegen in crates/{cri,api-server}
-#   zlib-dev/zlib-static — static libz for the flate2 zlib backend (SPDY),
+#   zlib-dev/zlib-static — static libz (formerly the SPDY flate2 backend, now unused),
 #                          which links `-lz`; a fully static link needs libz.a
 #   ca-certificates      — copied into the scratch image for outbound TLS roots
 RUN apk add --no-cache build-base musl-dev perl protoc protobuf-dev zlib-dev zlib-static ca-certificates

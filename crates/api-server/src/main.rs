@@ -38,16 +38,10 @@ mod registry;
 mod storage_readiness_hook;
 pub use rusternetes_protobuf as protobuf;
 #[allow(dead_code)]
-mod response;
-mod router;
-#[allow(dead_code)]
-mod spdy;
-// The bin only drives handle_spdy3_exec; the rest of the codec API is exercised
-// by the lib + tests, so allow dead_code in the binary build.
-#[allow(dead_code)]
 mod fieldmanager;
 #[allow(dead_code)]
-mod spdy3;
+mod response;
+mod router;
 mod ssa;
 mod state;
 #[allow(dead_code)]

@@ -32,9 +32,6 @@ pub mod fieldmanager;
 #[allow(dead_code)]
 pub mod response;
 pub mod router;
-#[allow(dead_code)]
-pub mod spdy;
-pub mod spdy3;
 pub mod ssa;
 pub mod startup;
 pub mod state;
