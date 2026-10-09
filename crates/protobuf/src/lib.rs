@@ -33,9 +33,21 @@ const WIRE_32BIT: u8 = 5;
 // writes those only when non-nil, so an explicit zero there is a real value.
 // Fields whose tag lacks `omitempty` (containerPort, exitCode, ...) are always
 // present in JSON, so they stay. Plain strings need no table: the string
-// decoder already drops an empty one.
+// decoder drops an empty one, except pointer strings (POINTER_STRINGS, #2952).
 pub mod plain_zero_scalars;
-use plain_zero_scalars::PLAIN_ZERO_SCALARS;
+use plain_zero_scalars::{PLAIN_ZERO_SCALARS, POINTER_STRINGS};
+
+/// Whether `field` of `msg_type` is a Go `*string` (or pointer to a string
+/// alias). Its marshaller writes a non-nil pointer even when empty
+/// (`if m.StorageClassName != nil { ... }`, core/v1 generated.pb.go
+/// PersistentVolumeClaimSpec.MarshalToSizedBuffer), so an empty value on the
+/// wire is a real explicit "" (#2952). A plain `string` is written
+/// unconditionally and dropped by JSON omitempty, so empty means absent.
+fn is_pointer_string(msg_type: &str, field: &str) -> bool {
+    POINTER_STRINGS
+        .binary_search_by(|(m, _)| (*m).cmp(msg_type))
+        .is_ok_and(|i| POINTER_STRINGS[i].1.contains(&field))
+}
 
 /// Remove the zero-valued plain scalars of `msg_type` (see
 /// [`PLAIN_ZERO_SCALARS`]) from a decoded message.
@@ -7543,13 +7555,13 @@ impl ProtoRegistry {
     /// Returns None if the message type is not in the registry.
     pub fn decode_message(&self, msg_type: &str, data: &[u8]) -> Option<Value> {
         let schema = self.schemas.get(msg_type)?;
-        let mut value = self.decode_with_schema(schema, data);
+        let mut value = self.decode_with_schema(schema, msg_type, data);
         drop_plain_zero_scalars(msg_type, &mut value);
         Some(value)
     }
 
     /// Decode protobuf bytes using a specific schema
-    fn decode_with_schema(&self, schema: &MessageSchema, data: &[u8]) -> Value {
+    fn decode_with_schema(&self, schema: &MessageSchema, msg_type: &str, data: &[u8]) -> Value {
         let mut obj = Map::new();
         let mut repeated_fields: HashMap<String, Vec<Value>> = HashMap::new();
         let mut pos = 0;
@@ -7714,7 +7726,9 @@ impl ProtoRegistry {
                                 // prevents `"value": ""` from appearing in an EnvVar
                                 // that only has valueFrom set, which would otherwise
                                 // shadow the valueFrom path in the kubelet.
-                                if !field_data.is_empty() {
+                                // A Go `*string` is the exception (#2952): non-nil
+                                // empty is an explicit "", keep it.
+                                if !field_data.is_empty() || is_pointer_string(msg_type, name) {
                                     let s = String::from_utf8_lossy(field_data).to_string();
                                     obj.insert(name.clone(), Value::String(s));
                                 }
