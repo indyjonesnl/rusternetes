@@ -836,6 +836,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observes_work_estimated_seats() {
+        // ObserveWorkEstimatedSeats (priority-and-fairness.go:134), recorded
+        // once the estimate is made, for the matched level and flow schema.
+        use crate::flow_control::metric_test_util::sample;
+        let l = [
+            ("priority_level", "catch-all"),
+            ("flow_schema", "catch-all"),
+        ];
+        let before = sample("apiserver_flowcontrol_work_estimated_seats", &l);
+        let app = app(10, Duration::from_millis(50), none_hook(), bob()).await;
+        let resp = app
+            .oneshot(get_req("/api/v1/namespaces/default"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            sample("apiserver_flowcontrol_work_estimated_seats", &l) - before,
+            1.0
+        );
+    }
+
+    #[tokio::test]
     async fn system_masters_is_exempt_from_the_limit() {
         // TestApfExemptRequest: the `exempt` level never rejects, even with
         // every seat of the server taken.
