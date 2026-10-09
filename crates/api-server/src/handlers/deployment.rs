@@ -379,6 +379,9 @@ pub async fn list(
     }
 
     let prefix = build_prefix("deployments", Some(&namespace));
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut deployments: Vec<Deployment> = state.storage.list(&prefix).await?;
 
     // Apply field and label selector filtering
@@ -460,6 +463,9 @@ pub async fn list_all_deployments(
     }
 
     let prefix = build_prefix("deployments", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut deployments = state.storage.list::<Deployment>(&prefix).await?;
 
     // Apply field and label selector filtering

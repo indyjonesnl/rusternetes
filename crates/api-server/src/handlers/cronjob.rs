@@ -290,6 +290,9 @@ pub async fn list(
     }
 
     let prefix = build_prefix("cronjobs", Some(&namespace));
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut cronjobs: Vec<CronJob> = state.storage.list(&prefix).await?;
 
     // Apply field and label selector filtering
@@ -353,6 +356,9 @@ pub async fn list_all_cronjobs(
     }
 
     let prefix = build_prefix("cronjobs", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut cronjobs = state.storage.list::<CronJob>(&prefix).await?;
 
     // Apply field and label selector filtering

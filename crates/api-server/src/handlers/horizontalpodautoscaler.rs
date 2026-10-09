@@ -393,6 +393,9 @@ pub async fn list(
     }
 
     let prefix = build_prefix("horizontalpodautoscalers", Some(&namespace));
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut hpas = state
         .storage
         .list::<HorizontalPodAutoscaler>(&prefix)
@@ -447,6 +450,9 @@ pub async fn list_all(
     }
 
     let prefix = build_prefix("horizontalpodautoscalers", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut hpas = state
         .storage
         .list::<HorizontalPodAutoscaler>(&prefix)

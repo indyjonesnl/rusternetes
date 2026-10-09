@@ -226,6 +226,9 @@ pub async fn list(
     }
 
     let prefix = build_prefix("leases", Some(&namespace));
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut leases: Vec<Lease> = state.storage.list(&prefix).await?;
 
     // Apply field and label selector filtering
@@ -290,6 +293,9 @@ pub async fn list_all_leases(
     }
 
     let prefix = build_prefix("leases", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut leases = state.storage.list::<Lease>(&prefix).await?;
 
     // Apply field and label selector filtering

@@ -189,6 +189,9 @@ pub async fn list_clustertrustbundles(
     }
 
     let prefix = build_prefix("clustertrustbundles", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut items = state.storage.list::<ClusterTrustBundle>(&prefix).await?;
     crate::handlers::filtering::apply_selectors(&mut items, &params)?;
 

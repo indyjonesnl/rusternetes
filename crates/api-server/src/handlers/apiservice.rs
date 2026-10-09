@@ -261,6 +261,9 @@ pub async fn list_apiservices(
     }
 
     let prefix = build_prefix("apiservices", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut items = state.storage.list::<APIService>(&prefix).await?;
 
     // `?labelSelector=` / `?fieldSelector=` narrow the list, as upstream's

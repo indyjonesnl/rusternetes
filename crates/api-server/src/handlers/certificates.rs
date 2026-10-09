@@ -208,6 +208,9 @@ pub async fn list_certificate_signing_requests(
     }
 
     let prefix = build_prefix("certificatesigningrequests", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut items = state
         .storage
         .list::<CertificateSigningRequest>(&prefix)

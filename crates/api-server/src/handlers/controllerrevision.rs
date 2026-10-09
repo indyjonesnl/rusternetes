@@ -230,6 +230,9 @@ pub async fn list_controllerrevisions(
     }
 
     let prefix = build_prefix("controllerrevisions", Some(&namespace));
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut crs: Vec<ControllerRevision> = state.storage.list(&prefix).await?;
 
     // Apply field and label selector filtering
@@ -296,6 +299,9 @@ pub async fn list_all_controllerrevisions(
     }
 
     let prefix = build_prefix("controllerrevisions", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut crs: Vec<ControllerRevision> = state.storage.list(&prefix).await?;
 
     // Apply field and label selector filtering

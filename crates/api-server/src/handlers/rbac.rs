@@ -216,6 +216,9 @@ pub async fn list_roles(
     }
 
     let prefix = build_prefix("roles", Some(&namespace));
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut roles = state.storage.list::<Role>(&prefix).await?;
 
     // Apply field and label selector filtering
@@ -259,6 +262,9 @@ pub async fn list_all_roles(
     }
 
     let prefix = build_prefix("roles", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut roles = state.storage.list::<Role>(&prefix).await?;
 
     // Apply field and label selector filtering
@@ -433,6 +439,9 @@ pub async fn list_rolebindings(
     }
 
     let prefix = build_prefix("rolebindings", Some(&namespace));
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut rolebindings = state.storage.list::<RoleBinding>(&prefix).await?;
 
     // Apply field and label selector filtering
@@ -482,6 +491,9 @@ pub async fn list_all_rolebindings(
     }
 
     let prefix = build_prefix("rolebindings", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut rolebindings = state.storage.list::<RoleBinding>(&prefix).await?;
 
     // Apply field and label selector filtering
@@ -657,6 +669,9 @@ pub async fn list_clusterroles(
     }
 
     let prefix = build_prefix("clusterroles", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut clusterroles = state.storage.list::<ClusterRole>(&prefix).await?;
 
     // Apply field and label selector filtering
@@ -829,6 +844,9 @@ pub async fn list_clusterrolebindings(
     }
 
     let prefix = build_prefix("clusterrolebindings", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut clusterrolebindings = state.storage.list::<ClusterRoleBinding>(&prefix).await?;
 
     // Apply field and label selector filtering

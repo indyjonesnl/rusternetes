@@ -206,6 +206,9 @@ pub async fn list_priority_level_configurations(
     }
 
     let prefix = build_prefix("prioritylevelconfigurations", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut items = state
         .storage
         .list::<PriorityLevelConfiguration>(&prefix)
@@ -449,6 +452,9 @@ pub async fn list_flow_schemas(
     }
 
     let prefix = build_prefix("flowschemas", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut items = state.storage.list::<FlowSchema>(&prefix).await?;
 
     // Apply field and label selector filtering

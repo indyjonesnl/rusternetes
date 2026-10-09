@@ -108,6 +108,9 @@ pub async fn list_csidrivers(
     }
 
     let prefix = build_prefix("csidrivers", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut drivers = state.storage.list::<CSIDriver>(&prefix).await?;
 
     // Apply field and label selector filtering

@@ -379,6 +379,9 @@ pub async fn list(
     }
 
     let prefix = build_prefix("replicasets", Some(&namespace));
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut replicasets: Vec<ReplicaSet> = state.storage.list(&prefix).await?;
 
     // Apply field and label selector filtering
@@ -457,6 +460,9 @@ pub async fn list_all_replicasets(
     }
 
     let prefix = build_prefix("replicasets", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut replicasets = state.storage.list::<ReplicaSet>(&prefix).await?;
 
     // Apply field and label selector filtering

@@ -158,6 +158,9 @@ pub async fn list_resourceclaims(
     }
 
     let prefix = build_prefix("resourceclaims", Some(&namespace));
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut claims: Vec<ResourceClaim> = state.storage.list(&prefix).await?;
 
     // Apply field and label selector filtering
@@ -221,6 +224,9 @@ pub async fn list_all_resourceclaims(
     }
 
     let prefix = build_prefix("resourceclaims", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut claims: Vec<ResourceClaim> = state.storage.list(&prefix).await?;
 
     // Apply field and label selector filtering

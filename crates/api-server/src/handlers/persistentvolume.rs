@@ -288,6 +288,9 @@ pub async fn list_pvs(
     }
 
     let prefix = build_prefix("persistentvolumes", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut pvs: Vec<PersistentVolume> = state.storage.list(&prefix).await?;
 
     // Apply field and label selector filtering
