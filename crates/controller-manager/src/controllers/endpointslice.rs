@@ -1,4 +1,5 @@
 use super::endpointslice_tracker::EndpointSliceTracker;
+use super::trigger_time_tracker::{format_rfc3339_nano, TriggerTimeTracker};
 use anyhow::Result;
 use futures::StreamExt;
 use rusternetes_common::resources::endpointslice::{
@@ -354,6 +355,36 @@ pub struct EndpointSliceController<S: Storage> {
     pod_queue_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<PodQueueItem>>>,
     /// `c.endpointSliceTracker` (`endpointslice_controller.go:154,224`).
     slice_tracker: EndpointSliceTracker,
+    /// `c.triggerTimeTracker` (`endpointslice_controller.go:158,238`): computes
+    /// the `endpoints.kubernetes.io/last-change-trigger-time` annotation.
+    trigger_time_tracker: TriggerTimeTracker,
+}
+
+/// `v1.EndpointsLastChangeTriggerTime`.
+const LAST_CHANGE_TRIGGER_TIME_ANNOTATION: &str =
+    "endpoints.kubernetes.io/last-change-trigger-time";
+
+/// `addTriggerTimeAnnotation` (staging/src/k8s.io/endpointslice/utils.go:187-197):
+/// export the trigger time, or clear the annotation when there is none.
+fn add_trigger_time_annotation(
+    slice: &mut EndpointSlice,
+    trigger_time: Option<chrono::DateTime<chrono::Utc>>,
+) {
+    let annotations = slice
+        .metadata
+        .annotations
+        .get_or_insert_with(Default::default);
+    match trigger_time {
+        Some(t) => {
+            annotations.insert(
+                LAST_CHANGE_TRIGGER_TIME_ANNOTATION.to_string(),
+                format_rfc3339_nano(t),
+            );
+        }
+        None => {
+            annotations.remove(LAST_CHANGE_TRIGGER_TIME_ANNOTATION);
+        }
+    }
 }
 
 /// A `podQueue` entry plus its `NumRequeues` count (`handlePodErr`).
@@ -376,6 +407,7 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
             pod_queue_tx,
             pod_queue_rx: Arc::new(tokio::sync::Mutex::new(pod_queue_rx)),
             slice_tracker: EndpointSliceTracker::new(),
+            trigger_time_tracker: TriggerTimeTracker::new(),
         }
     }
 
@@ -749,7 +781,8 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                 },
                 Err(_) => {
                     // `c.endpointSliceTracker.DeleteService`
-                    // (endpointslice_controller.go:390).
+                    // (endpointslice_controller.go:388-390).
+                    self.trigger_time_tracker.delete_service(ns, name);
                     self.slice_tracker.delete_service(ns, name);
                     queue.forget(&key).await;
                 }
@@ -1249,6 +1282,21 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
             })
             .collect();
 
+        // endpointslice_controller.go:440-444: compute before reconciling so the
+        // tracker advances even when the sync turns out to be a no-op. Upstream
+        // passes every selector-matched pod (`podLister.List(selector)`), not
+        // just those that qualify for a slice.
+        let selected_pods: Vec<&Pod> = all_pods
+            .iter()
+            .filter(|pod| match &pod.metadata.labels {
+                Some(pod_labels) => selector.iter().all(|(k, v)| pod_labels.get(k) == Some(v)),
+                None => false,
+            })
+            .collect();
+        let last_change_trigger_time = self
+            .trigger_time_tracker
+            .compute_endpoint_last_change_trigger_time(namespace, service, &selected_pods);
+
         info!(
             "EndpointSlice reconcile {}/{}: {} matching pods (from {} total in namespace)",
             namespace,
@@ -1442,6 +1490,8 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                         continue;
                     }
                     adopt_existing_identity(&mut slice, &existing);
+                    // reconciler.go:459.
+                    add_trigger_time_annotation(&mut slice, last_change_trigger_time);
                     match self.storage.update(&slice_key, &slice).await {
                         Ok(updated) => {
                             // reconciler.go:464.
@@ -1463,6 +1513,8 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                 // lasted.
                 Err(rusternetes_common::Error::NotFound(_)) => {
                     slice.metadata.resource_version = None;
+                    // reconciler.go:444.
+                    add_trigger_time_annotation(&mut slice, last_change_trigger_time);
                     let created = self.storage.create(&slice_key, &slice).await?;
                     // reconciler.go:453.
                     self.slice_tracker.update(&created);
