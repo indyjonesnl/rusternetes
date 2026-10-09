@@ -2,7 +2,7 @@ use crate::controllers::worker_pool::spawn_workers;
 use anyhow::Result;
 use futures::StreamExt;
 use rusternetes_common::resources::workloads::{
-    Job, JobCondition, JobStatus, UncountedTerminatedPods,
+    Job, JobCondition, JobStatus, SuccessPolicy, UncountedTerminatedPods,
 };
 use rusternetes_common::resources::{Pod, PodStatus};
 use rusternetes_common::types::{OwnerReference, Phase};
@@ -1909,33 +1909,17 @@ impl<S: Storage + 'static> JobController<S> {
             namespace, name, active, succeeded, failed, completions
         );
 
-        // Check maxFailedIndexes — if the number of failed indexes exceeds this limit, fail the job
-        let max_failed_indexes_exceeded = if is_indexed {
-            if let Some(max_failed) = job.spec.max_failed_indexes {
-                let failed_index_count = all_failed_index_set.len() as i32;
-                // Also count unique indexes with only failed pods (no succeeded) when no backoffLimitPerIndex
-                if backoff_limit_per_index.is_none() && fail_index_set.is_empty() {
-                    let mut failed_idx_set: HashSet<i32> = HashSet::new();
-                    for pod in job_pods.iter() {
-                        if matches!(
-                            pod.status.as_ref().and_then(|s| s.phase.as_ref()),
-                            Some(Phase::Failed)
-                        ) {
-                            if let Some(index) = get_pod_index(pod) {
-                                failed_idx_set.insert(index);
-                            }
-                        }
-                    }
-                    failed_idx_set.len() as i32 > max_failed
-                } else {
-                    failed_index_count > max_failed
-                }
-            } else {
-                false
-            }
-        } else {
-            false
-        };
+        // maxFailedIndexes is evaluated only inside `hasBackoffLimitPerIndex`
+        // (job_controller.go:978-985):
+        //   if job.Spec.MaxFailedIndexes != nil && jobCtx.failedIndexes.total() > int(*job.Spec.MaxFailedIndexes)
+        // Without backoffLimitPerIndex failed pods count only against
+        // backoffLimit.
+        let max_failed_indexes_exceeded = is_indexed
+            && backoff_limit_per_index.is_some()
+            && job
+                .spec
+                .max_failed_indexes
+                .is_some_and(|max| all_failed_index_set.len() as i64 > i64::from(max));
 
         // For backoffLimitPerIndex, job fails when all indexes are either succeeded or failed
         // Failure scenarios come before deadline, successPolicy and completions
@@ -2062,36 +2046,18 @@ impl<S: Storage + 'static> JobController<S> {
         };
 
         // Check successPolicy — if defined and criteria met, mark job complete
-        let success_policy_matched = if let Some(ref policy) = job.spec.success_policy {
-            policy.rules.iter().any(|rule| {
-                let indexes_ok = if let Some(ref succeeded_indexes_str) = rule.succeeded_indexes {
-                    // Parse required indexes and check they are all in completed set
-                    let completed = completed_indexes.as_deref().unwrap_or("");
-                    let completed_set: HashSet<i32> = parse_index_ranges(completed);
-                    let required_set: HashSet<i32> = parse_index_ranges(succeeded_indexes_str);
-                    required_set.is_subset(&completed_set)
-                } else {
-                    true // No index constraint
-                };
-
-                let count_ok = if let Some(count) = rule.succeeded_count {
-                    succeeded_index_count >= count
-                } else {
-                    true // No count constraint
-                };
-
-                // If rule has neither succeededIndexes nor succeededCount, match on all completions
-                let has_criteria =
-                    rule.succeeded_indexes.is_some() || rule.succeeded_count.is_some();
-                if has_criteria {
-                    indexes_ok && count_ok
-                } else {
-                    succeeded_index_count >= completions
-                }
-            })
+        // `matchSuccessPolicy` (success_policy.go:28), reached only inside
+        // `if isIndexedJob(&job)` (job_controller.go:991-996).
+        let success_policy_message = if is_indexed {
+            match_success_policy(
+                job.spec.success_policy.as_ref(),
+                completions,
+                &succeeded_index_set,
+            )
         } else {
-            false
+            None
         };
+        let success_policy_matched = success_policy_message.is_some();
 
         // Success scenarios are evaluated after failures (:988-994); a
         // persisted SuccessCriteriaMet is honoured regardless of the spec.
@@ -2100,7 +2066,7 @@ impl<S: Storage + 'static> JobController<S> {
         let (success_reason, success_message) = persisted_success.clone().unwrap_or_else(|| {
             (
                 "SuccessPolicy".to_string(),
-                "Matched rules in the SuccessPolicy".to_string(),
+                success_policy_message.clone().unwrap_or_default(),
             )
         });
 
@@ -3474,6 +3440,75 @@ where
 }
 
 /// Parse index ranges like "0,1,3-5" into a set of integers {0, 1, 3, 4, 5}
+/// Port of `parseIndexesFromString` (indexed_job_utils.go:204): intervals of
+/// `indexes_str` clipped to `completions`; a corrupted interval is skipped and
+/// parsing stops at the first interval starting at or after `completions`.
+fn parse_indexes_from_string(indexes_str: &str, completions: i32) -> Vec<(i32, i32)> {
+    let mut result: Vec<(i32, i32)> = Vec::new();
+    if indexes_str.is_empty() {
+        return result;
+    }
+    for interval_str in indexes_str.split(',') {
+        let mut limits = interval_str.split('-');
+        let Ok(first) = limits.next().unwrap_or("").parse::<i32>() else {
+            continue;
+        };
+        if first >= completions {
+            break;
+        }
+        let last = match limits.next() {
+            Some(l) => match l.parse::<i32>() {
+                Ok(l) => l.min(completions - 1),
+                Err(_) => continue,
+            },
+            None => first,
+        };
+        match result.last_mut() {
+            Some(prev) if prev.1 == first - 1 => prev.1 = last,
+            _ => result.push((first, last)),
+        }
+    }
+    result
+}
+
+/// Port of `matchSuccessPolicy` (success_policy.go:28) and
+/// `matchSucceededIndexesRule` (:67). Returns the SuccessCriteriaMet message.
+fn match_success_policy(
+    policy: Option<&SuccessPolicy>,
+    completions: i32,
+    succeeded: &HashSet<i32>,
+) -> Option<String> {
+    let policy = policy?;
+    if succeeded.is_empty() {
+        return None;
+    }
+    for (index, rule) in policy.rules.iter().enumerate() {
+        let matched = if let Some(ref idx) = rule.succeeded_indexes {
+            let required = parse_indexes_from_string(idx, completions);
+            // Failed to parse succeededIndexes of the rule: `continue`.
+            if required.is_empty() {
+                continue;
+            }
+            let total: i64 = required.iter().map(|(f, l)| i64::from(l - f + 1)).sum();
+            let contains = required
+                .iter()
+                .map(|&(f, l)| succeeded.iter().filter(|&&i| i >= f && i <= l).count() as i64)
+                .sum::<i64>();
+            contains == total
+                || rule
+                    .succeeded_count
+                    .is_some_and(|c| contains >= i64::from(c))
+        } else {
+            rule.succeeded_count
+                .is_some_and(|c| succeeded.len() as i64 >= i64::from(c))
+        };
+        if matched {
+            return Some(format!("Matched rules at index {index}"));
+        }
+    }
+    None
+}
+
 fn parse_index_ranges(s: &str) -> HashSet<i32> {
     let mut set = HashSet::new();
     if s.is_empty() {
@@ -3532,7 +3567,7 @@ fn format_index_ranges(indexes: &[i32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusternetes_common::resources::workloads::{Job, JobSpec, PodTemplateSpec, SuccessPolicy};
+    use rusternetes_common::resources::workloads::{Job, JobSpec, PodTemplateSpec};
     use rusternetes_common::resources::{
         Container, ContainerState, ContainerStatus, Pod, PodCondition, PodSpec, PodStatus,
     };
