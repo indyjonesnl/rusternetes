@@ -1193,5 +1193,7 @@ pub mod tokio_util_cancel {
     }
 }
 
+pub mod wiring;
+
 #[cfg(test)]
 mod tests;

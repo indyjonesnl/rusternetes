@@ -150,6 +150,8 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
         .await?,
     );
 
+    k.register_pod_certificate_metrics(&metrics.registry);
+
     let server_state = server::ServerState {
         node_name: config.node_name.clone(),
         storage: storage.clone(),

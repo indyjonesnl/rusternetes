@@ -119,12 +119,12 @@ impl Mounter for LocalMounter {
     }
 
     /// `SetUpAt` (`local.go:529-626`).
-    async fn set_up(&self) -> Result<()> {
-        if self.path.is_empty() {
+    async fn set_up_at(&self, dir: &str, _args: &crate::volume_plugins::MounterArgs) -> Result<()> {
+        if dir.is_empty() {
             return Err(anyhow!("LocalVolume volume path is empty"));
         }
-        if self.path.split('/').any(|i| i == "..") {
-            return Err(anyhow!("invalid path: {} must not contain '..'", self.path));
+        if dir.split('/').any(|i| i == "..") {
+            return Err(anyhow!("invalid path: {} must not contain '..'", dir));
         }
         // `local.go:616-624`: "Volume owner will be written only once on the
         // first volume mount" -- `NewVolumeOwnership(..).ChangePermissions()`
@@ -132,7 +132,7 @@ impl Mounter for LocalMounter {
         // read-only.
         if !self.read_only {
             let (root, fs_group, policy) = (
-                self.path.clone(),
+                dir.to_string(),
                 self.fs_group,
                 self.fs_group_change_policy.clone(),
             );
