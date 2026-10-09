@@ -804,17 +804,12 @@ pub fn label_selector_as_selector(selector: Option<&LabelSelector>) -> Result<Se
     if match_labels + match_expressions == 0 {
         return Ok(Selector::Everything);
     }
-    for req in selector.match_expressions.iter().flatten() {
-        if !matches!(
-            req.operator.as_str(),
-            "In" | "NotIn" | "Exists" | "DoesNotExist"
-        ) {
-            return Err(format!(
-                "{:?} is not a valid label selector operator",
-                req.operator
-            ));
-        }
-    }
+    // Every requirement goes through `labels.NewRequirement`
+    // (`helpers.go:62-79`, `labels/selector.go:185-225`): an unknown operator,
+    // an invalid key or value, and a wrong value count are all errors.
+    // `as_selector_string` is that same port, and checks the operator with
+    // upstream's message.
+    selector.as_selector_string()?;
     Ok(Selector::Requirements(selector.clone()))
 }
 

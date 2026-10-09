@@ -150,15 +150,7 @@ fn selector_of(selector: Option<&LabelSelector>) -> std::result::Result<Selector
                 .collect()
         }),
     });
-    let selector = label_selector_as_selector(converted.as_ref())?;
-    // `LabelSelectorAsSelector` builds each requirement with
-    // `labels.NewRequirement` (helpers.go:62), which refuses an invalid key or
-    // value; `label_selector_as_selector` only checks the operator, so run the
-    // same validation `as_selector_string` does.
-    if let Selector::Requirements(requirements) = &selector {
-        requirements.as_selector_string()?;
-    }
-    Ok(selector)
+    label_selector_as_selector(converted.as_ref())
 }
 
 /// `meta.Accessor(obj).GetLabels()`.
