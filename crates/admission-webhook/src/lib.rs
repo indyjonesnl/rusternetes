@@ -1815,91 +1815,23 @@ impl<S: Storage> AdmissionWebhookManager<S> {
     }
 }
 
-/// Apply a single JSON patch operation to an object
+/// Apply a single RFC 6902 operation to an object.
+///
+/// Delegates to `rusternetes_common::patch` (the same applier the PATCH
+/// handler uses) so array indexes, `-` append, `~0`/`~1` escapes and
+/// move/copy/test behave as in evanphx/json-patch, which upstream's
+/// mutating dispatcher uses: `DecodePatch` / `Apply` at
+/// staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/mutating/dispatcher.go:336,359.
 fn apply_json_patch(object: &mut Value, patch: &PatchOperation) -> Result<()> {
-    use rusternetes_common::admission::PatchOp;
+    use rusternetes_common::patch::{apply_patch, PatchType};
 
-    match patch.op {
-        PatchOp::Add => {
-            if let Some(value) = &patch.value {
-                apply_json_pointer_add(object, &patch.path, value.clone())?;
-            }
-        }
-        PatchOp::Remove => {
-            apply_json_pointer_remove(object, &patch.path)?;
-        }
-        PatchOp::Replace => {
-            if let Some(value) = &patch.value {
-                apply_json_pointer_replace(object, &patch.path, value.clone())?;
-            }
-        }
-        _ => {
-            // For now, only support add, remove, replace
-            warn!("Unsupported patch operation: {:?}", patch.op);
-        }
-    }
-
-    Ok(())
-}
-
-/// Apply JSON pointer add operation
-fn apply_json_pointer_add(object: &mut Value, path: &str, value: Value) -> Result<()> {
-    let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-
-    if parts.is_empty() || parts[0].is_empty() {
-        *object = value;
-        return Ok(());
-    }
-
-    let mut current = object;
-    for (i, part) in parts.iter().enumerate() {
-        if i == parts.len() - 1 {
-            // Last part - add the value
-            if let Some(obj) = current.as_object_mut() {
-                obj.insert(part.to_string(), value.clone());
-            }
-        } else {
-            // Navigate to the next level
-            current = current
-                .as_object_mut()
-                .and_then(|obj| obj.get_mut(*part))
-                .ok_or_else(|| {
-                    rusternetes_common::Error::InvalidResource(format!("Path not found: {}", path))
-                })?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Apply JSON pointer remove operation
-fn apply_json_pointer_remove(object: &mut Value, path: &str) -> Result<()> {
-    let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-
-    if parts.is_empty() || parts[0].is_empty() {
-        return Err(rusternetes_common::Error::InvalidResource(
-            "Cannot remove root".to_string(),
-        ));
-    }
-
-    let mut current = object;
-    for (i, part) in parts.iter().enumerate() {
-        if i == parts.len() - 1 {
-            // Last part - remove the value
-            if let Some(obj) = current.as_object_mut() {
-                obj.remove(*part);
-            }
-        } else {
-            // Navigate to the next level
-            current = current
-                .as_object_mut()
-                .and_then(|obj| obj.get_mut(*part))
-                .ok_or_else(|| {
-                    rusternetes_common::Error::InvalidResource(format!("Path not found: {}", path))
-                })?;
-        }
-    }
-
+    let doc = Value::Array(vec![serde_json::to_value(patch)?]);
+    *object = apply_patch(object, &doc, PatchType::JsonPatch).map_err(|e| {
+        rusternetes_common::Error::InvalidResource(format!(
+            "JSON patch {:?} {} failed: {}",
+            patch.op, patch.path, e
+        ))
+    })?;
     Ok(())
 }
 
@@ -2437,36 +2369,6 @@ fn build_admission_request_for_match(
     }
 }
 
-/// Apply JSON pointer replace operation
-fn apply_json_pointer_replace(object: &mut Value, path: &str, value: Value) -> Result<()> {
-    let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-
-    if parts.is_empty() || parts[0].is_empty() {
-        *object = value;
-        return Ok(());
-    }
-
-    let mut current = object;
-    for (i, part) in parts.iter().enumerate() {
-        if i == parts.len() - 1 {
-            // Last part - replace the value
-            if let Some(obj) = current.as_object_mut() {
-                obj.insert(part.to_string(), value.clone());
-            }
-        } else {
-            // Navigate to the next level
-            current = current
-                .as_object_mut()
-                .and_then(|obj| obj.get_mut(*part))
-                .ok_or_else(|| {
-                    rusternetes_common::Error::InvalidResource(format!("Path not found: {}", path))
-                })?;
-        }
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2731,11 +2633,8 @@ mod tests {
         };
 
         let result = apply_json_patch(&mut obj, &patch);
+        // RFC 6902: "/" addresses the empty-string key, which is absent.
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Cannot remove root"));
     }
 
     // ===== Webhook Matching Tests =====
