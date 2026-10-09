@@ -2,10 +2,11 @@
 //
 // This module provides CEL expression evaluation for ValidatingAdmissionPolicy
 
+use crate::cel_struct::{self, CompiledExpression};
 use anyhow::{anyhow, Result};
 use cel::{
     objects::{Key, Map},
-    Context, Program, Value,
+    Value,
 };
 use serde_json;
 use std::collections::HashMap;
@@ -14,7 +15,7 @@ use std::sync::Arc;
 /// CELEvaluator evaluates CEL expressions with given context
 pub struct CELEvaluator {
     // Cache compiled programs for performance
-    program_cache: HashMap<String, Program>,
+    program_cache: HashMap<String, CompiledExpression>,
 }
 
 impl CELEvaluator {
@@ -23,6 +24,17 @@ impl CELEvaluator {
         Self {
             program_cache: HashMap::new(),
         }
+    }
+
+    /// Compile (or fetch from the cache) `expression`. `Object{}` /
+    /// `JSONPatch{}` initializers are rewritten to maps; see [`cel_struct`].
+    fn compiled(&mut self, expression: &str) -> Result<&CompiledExpression> {
+        if !self.program_cache.contains_key(expression) {
+            let prog = cel_struct::compile(expression)
+                .map_err(|e| anyhow!("Failed to compile CEL expression '{}': {}", expression, e))?;
+            self.program_cache.insert(expression.to_string(), prog);
+        }
+        Ok(&self.program_cache[expression])
     }
 
     /// Evaluate a CEL expression with the given context
@@ -35,17 +47,10 @@ impl CELEvaluator {
     /// The result of the evaluation as a boolean, or an error
     pub fn evaluate(&mut self, expression: &str, context: &CELContext) -> Result<bool> {
         // Get or compile the program
-        let program = if let Some(prog) = self.program_cache.get(expression) {
-            prog
-        } else {
-            let prog = Program::compile(expression)
-                .map_err(|e| anyhow!("Failed to compile CEL expression '{}': {}", expression, e))?;
-            self.program_cache.insert(expression.to_string(), prog);
-            self.program_cache.get(expression).unwrap()
-        };
+        let program = self.compiled(expression)?;
 
         // Create CEL context
-        let mut cel_context = Context::default();
+        let mut cel_context = cel_struct::new_context();
 
         // Add variables to context
         for (key, value) in &context.variables {
@@ -53,8 +58,7 @@ impl CELEvaluator {
         }
 
         // Execute the program
-        let result = program
-            .execute(&cel_context)
+        let result = cel_struct::execute(program, &cel_context)
             .map_err(|e| anyhow!("Failed to execute CEL expression '{}': {}", expression, e))?;
 
         // Convert result to boolean
@@ -70,17 +74,10 @@ impl CELEvaluator {
     /// Evaluate a CEL expression that returns a string (for messages, audit annotations, etc.)
     pub fn evaluate_string(&mut self, expression: &str, context: &CELContext) -> Result<String> {
         // Get or compile the program
-        let program = if let Some(prog) = self.program_cache.get(expression) {
-            prog
-        } else {
-            let prog = Program::compile(expression)
-                .map_err(|e| anyhow!("Failed to compile CEL expression '{}': {}", expression, e))?;
-            self.program_cache.insert(expression.to_string(), prog);
-            self.program_cache.get(expression).unwrap()
-        };
+        let program = self.compiled(expression)?;
 
         // Create CEL context
-        let mut cel_context = Context::default();
+        let mut cel_context = cel_struct::new_context();
 
         // Add variables to context
         for (key, value) in &context.variables {
@@ -88,8 +85,7 @@ impl CELEvaluator {
         }
 
         // Execute the program
-        let result = program
-            .execute(&cel_context)
+        let result = cel_struct::execute(program, &cel_context)
             .map_err(|e| anyhow!("Failed to execute CEL expression '{}': {}", expression, e))?;
 
         // Convert result to string
@@ -105,28 +101,20 @@ impl CELEvaluator {
 
     /// Evaluate a CEL expression and return the raw Value (for VAP variables)
     pub fn evaluate_to_value(&mut self, expression: &str, context: &CELContext) -> Result<Value> {
-        let program = if let Some(prog) = self.program_cache.get(expression) {
-            prog
-        } else {
-            let prog = Program::compile(expression)
-                .map_err(|e| anyhow!("Failed to compile CEL expression '{}': {}", expression, e))?;
-            self.program_cache.insert(expression.to_string(), prog);
-            self.program_cache.get(expression).unwrap()
-        };
+        let program = self.compiled(expression)?;
 
-        let mut cel_context = Context::default();
+        let mut cel_context = cel_struct::new_context();
         for (key, value) in &context.variables {
             let _ = cel_context.add_variable(key.clone(), value.clone());
         }
 
-        program
-            .execute(&cel_context)
+        cel_struct::execute(program, &cel_context)
             .map_err(|e| anyhow!("Failed to execute CEL expression '{}': {}", expression, e))
     }
 
     /// Type-check a CEL expression without executing it
     pub fn type_check(&mut self, expression: &str) -> Result<()> {
-        Program::compile(expression)
+        cel_struct::compile(expression)
             .map_err(|e| anyhow!("Failed to compile CEL expression '{}': {}", expression, e))?;
         Ok(())
     }

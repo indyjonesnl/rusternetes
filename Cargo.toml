@@ -71,7 +71,7 @@ rcgen = { version = "0.13", features = [
 ] } # Certificate generation + CSR/CA PEM parsing (x509-parser feature gates from_ca_cert_pem / CertificateSigningRequestParams)
 prometheus = "0.14" # Prometheus metrics
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false } # HTTP client
-cel = "0.13" # Common Expression Language (CEL) interpreter
+cel = { version = "0.13", features = ["json"] } # Common Expression Language (CEL) interpreter; json: Value::json() for MAP output (#2885)
 x509-parser = "0.16" # X.509 certificate parsing
 pem = "3.0" # PEM format encoding/decoding
 base64 = "0.22" # Base64 encoding/decoding
