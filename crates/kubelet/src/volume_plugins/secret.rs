@@ -62,6 +62,7 @@ impl VolumePlugin for SecretPlugin {
 
     async fn new_mounter(&self, spec: &Spec<'_>, pod: &Pod) -> Result<Box<dyn Mounter>> {
         Ok(Box::new(SecretMounter {
+            host: self.host.clone(),
             path: self
                 .host
                 .get_pod_volume_dir(&pod.metadata.uid, self.name(), &spec.volume.name),
@@ -160,6 +161,8 @@ pub(crate) fn make_payload(
 }
 
 struct SecretMounter {
+    /// `plugin.host` (`secret.go:151`), for the wrapped emptyDir's metadata dir.
+    host: Arc<dyn VolumeHost>,
     path: String,
     volume_name: String,
     namespace: String,
@@ -264,6 +267,16 @@ impl Mounter for SecretMounter {
         // ownership runs in the AtomicWriter's `setPerms` (:242-247) below.
         crate::volume_plugins::empty_dir::setup_dir(volume_dir)
             .context("Failed to create Secret volume directory")?;
+        // The wrapped emptyDir's `SetUpAt` ends with
+        // `volumeutil.SetReady(ed.getMetaDir())` (empty_dir.go:284), which
+        // creates `<pod>/plugins/kubernetes.io~empty-dir/wrapped_<vol>`
+        // (`TestPlugin`, secret_test.go:340-348).
+        let meta_dir = crate::volume_plugins::util::wrapped_empty_dir_meta_dir(
+            &self.host,
+            &self.volume_name,
+            &self.pod.metadata.uid,
+        );
+        crate::volume_plugins::util::set_ready(&meta_dir);
         // `volumeutil.MakeNestedMountpoints(b.volName, dir, b.pod)`
         // (secret.go:181-183), before the failure-teardown `defer` is armed.
         crate::volume_plugins::util::nested_volumes::make_nested_mountpoints(
@@ -283,6 +296,8 @@ impl Mounter for SecretMounter {
             self.fs_group,
             true,
         ) {
+            // emptyDir `TearDownAt` removes the ready dir first (empty_dir.go:497-500).
+            let _ = std::fs::remove_dir_all(&meta_dir);
             if let Err(td) = std::fs::remove_dir_all(volume_dir) {
                 tracing::error!("Error tearing down volume {}: {}", self.volume_name, td);
             }

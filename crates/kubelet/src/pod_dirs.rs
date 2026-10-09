@@ -92,6 +92,16 @@ pub fn get_pod_volumes_dir(root: &str, pod_uid: &str) -> PathBuf {
     get_pod_dir(root, pod_uid).join(VOLUMES_DIR_NAME)
 }
 
+/// `<root>/pods/<podUID>/plugins/<escaped-plugin>` — `getPodPluginDir`
+/// (`kubelet_getters.go:208-210`, over `getPodPluginsDir` `:201-203` and
+/// `DefaultKubeletPluginsDirName`, `defaults.go:24`). The caller passes the
+/// already-escaped plugin name, as `emptyDir.getMetaDir` does.
+pub fn get_pod_plugin_dir(root: &str, pod_uid: &str, escaped_plugin_name: &str) -> PathBuf {
+    get_pod_dir(root, pod_uid)
+        .join("plugins")
+        .join(escaped_plugin_name)
+}
+
 /// `<root>/pods/<podUID>/volume-subpaths` — `getPodVolumeSubpathsDir`
 /// (`kubelet_getters.go:167-169`).
 pub fn get_pod_volume_subpaths_dir(root: &str, pod_uid: &str) -> PathBuf {
