@@ -31,7 +31,7 @@ fn object_literals_evaluate_to_maps() {
     assert_eq!(
         eval(
             r#"Object{spec: Object.spec{template: Object.spec.template{containers: [
-                 Object.spec.template.containers.item{name: "nginx", args: ["-g"]}]}}}"#
+                 Object.spec.template.containers{name: "nginx", args: ["-g"]}]}}}"#
         )
         .unwrap(),
         json!({"spec": {"template": {"containers": [{"name": "nginx", "args": ["-g"]}]}}})
@@ -45,8 +45,10 @@ fn object_literals_evaluate_to_maps() {
         json!(3)
     );
     assert_eq!(
-        eval("Object{spec: Object.spec{replicas: 3}} == Object{spec: Object.spec{replicas: 1 + 2}}")
-            .unwrap(),
+        eval(
+            "Object{spec: Object.spec{replicas: 3}} == Object{spec: Object.spec{replicas: 1 + 2}}"
+        )
+        .unwrap(),
         json!(true)
     );
 }
@@ -109,6 +111,9 @@ fn rejected_initializers_are_errors_not_panics() {
         "Object{spec: Object{replicas: 3}}",
         "Object{spec: Object.spec{t: Object.spec.u{}}}",
         "Object{l: [Object.m{}]}",
+        // typeresolver_test.go spells list elements `.item{}`; that resolves, but
+        // the field-path check the patchers apply (lists are unnamed) rejects it.
+        "Object{c: [Object.c.item{}]}",
         // dynamic/objects.go convertField: map keys must be strings.
         "Object{m: {1: 2}}",
     ] {
