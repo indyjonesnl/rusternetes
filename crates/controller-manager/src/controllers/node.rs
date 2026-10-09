@@ -560,7 +560,22 @@ impl<S: Storage + 'static> NodeController<S> {
             .and_then(|s| s.conditions.as_ref())
             .and_then(|conditions| conditions.iter().find(|c| c.condition_type == "Ready"));
 
+        // tryUpdateNodeHealth (node_lifecycle_controller.go:937): once neither
+        // the Ready heartbeat nor the node Lease has been refreshed within
+        // nodeMonitorGracePeriod, every health condition goes Unknown. A
+        // condition the kubelet itself posted False inside the grace period
+        // is the kubelet's to own and is left alone.
+        let heartbeat_stale = match current_ready_condition.and_then(|c| c.last_heartbeat_time) {
+            Some(hb) => {
+                Utc::now().signed_duration_since(hb)
+                    >= Duration::seconds(NODE_MONITOR_GRACE_PERIOD_SECONDS)
+            }
+            None => true,
+        };
+        let stale = !is_ready && heartbeat_stale;
+
         let needs_update = match current_ready_condition {
+            Some(condition) if stale => condition.status != "Unknown",
             Some(condition) => {
                 let current_is_ready = condition.status == "True";
                 current_is_ready != is_ready
@@ -568,21 +583,25 @@ impl<S: Storage + 'static> NodeController<S> {
             None => true, // No ready condition exists, need to create one
         };
 
-        // The Ready status after this pass: `update_node_status` writes
-        // True/False; an `Unknown` set by someone else is left alone.
+        // The Ready status after this pass.
         let ready_status = if is_ready {
             "True"
-        } else if !needs_update
-            && current_ready_condition.map(|c| c.status.as_str()) == Some("Unknown")
-        {
+        } else if stale {
             "Unknown"
         } else {
-            "False"
+            current_ready_condition
+                .map(|c| c.status.as_str())
+                .unwrap_or("Unknown")
         };
 
         if needs_update {
-            info!("Node {} ready status changed to: {}", node_name, is_ready);
-            self.update_node_status(node, is_ready).await?;
+            if stale {
+                info!("Node {} stopped posting status; marking Unknown", node_name);
+                self.mark_node_status_unknown(node).await?;
+            } else {
+                info!("Node {} ready status changed to: {}", node_name, is_ready);
+                self.update_node_status(node, is_ready).await?;
+            }
         }
 
         // Refresh lastTransitionTime on any non-Ready condition that flipped
@@ -1286,6 +1305,43 @@ impl<S: Storage + 'static> NodeController<S> {
         Ok(())
     }
 
+    /// The stale-heartbeat write of `tryUpdateNodeHealth`
+    /// (pkg/controller/nodelifecycle/node_lifecycle_controller.go:937-985):
+    /// Ready and the three pressure conditions go Unknown, a condition the
+    /// kubelet never posted is appended as `NodeStatusNeverUpdated`.
+    /// `NetworkUnavailable` is left to the control plane (:944). Heartbeat
+    /// times are not touched: the controller must not forge one.
+    async fn mark_node_status_unknown(&self, node: &Node) -> Result<()> {
+        let node_key = build_key("nodes", None, &node.metadata.name);
+        let mut updated: Node = self.storage.get(&node_key).await?;
+        let created = updated.metadata.creation_timestamp;
+        let now = Utc::now();
+        let status = updated.status.get_or_insert_with(NodeStatus::default);
+        let conditions = status.conditions.get_or_insert_with(Vec::new);
+        for t in ["Ready", "MemoryPressure", "DiskPressure", "PIDPressure"] {
+            match conditions.iter_mut().find(|c| c.condition_type == t) {
+                None => conditions.push(NodeCondition {
+                    condition_type: t.to_string(),
+                    status: "Unknown".to_string(),
+                    reason: Some("NodeStatusNeverUpdated".to_string()),
+                    message: Some("Kubelet never posted node status.".to_string()),
+                    last_heartbeat_time: created,
+                    last_transition_time: Some(now),
+                }),
+                Some(c) if c.status != "Unknown" => {
+                    c.status = "Unknown".to_string();
+                    c.reason = Some("NodeStatusUnknown".to_string());
+                    c.message = Some("Kubelet stopped posting node status.".to_string());
+                    c.last_transition_time = Some(now);
+                }
+                Some(_) => {}
+            }
+        }
+        // Status subresource write (#1723).
+        self.storage.update_status(&node_key, &updated).await?;
+        Ok(())
+    }
+
     /// Update node status
     async fn update_node_status(&self, node: &Node, is_ready: bool) -> Result<()> {
         let node_name = &node.metadata.name;
@@ -1832,7 +1888,118 @@ mod tests {
                 .find(|c| c.condition_type == "Ready")
                 .unwrap()
                 .status,
-            "False"
+            "Unknown"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // tryUpdateNodeHealth stale-heartbeat write (#2836). Ported from
+    // pkg/controller/nodelifecycle/node_lifecycle_controller_test.go
+    // TestMonitorNodeHealthUpdateStatus (:1010): the case "Node created long
+    // time ago, with status updated by kubelet exceeds grace period" (:1097-1190)
+    // and "without status" (:1019). Impl: node_lifecycle_controller.go:937-985.
+    // ------------------------------------------------------------------
+
+    async fn monitored(
+        node: &Node,
+    ) -> (
+        Arc<MemoryStorage>,
+        Vec<NodeCondition>,
+        chrono::DateTime<Utc>,
+    ) {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::new(storage.clone());
+        put(&storage, &c, node).await;
+        let before = Utc::now();
+        c.monitor_node_health().await.unwrap();
+        let got: Node = storage
+            .get(&build_key("nodes", None, &node.metadata.name))
+            .await
+            .unwrap();
+        (storage, got.status.unwrap().conditions.unwrap(), before)
+    }
+
+    fn cond<'a>(cs: &'a [NodeCondition], t: &str) -> &'a NodeCondition {
+        cs.iter().find(|c| c.condition_type == t).unwrap()
+    }
+
+    #[tokio::test]
+    async fn stale_heartbeat_posts_ready_unknown_not_false() {
+        let node = znode("n1", "z1", "True", SECS_STALE);
+        let hb = node.status.as_ref().unwrap().conditions.as_ref().unwrap()[0].last_heartbeat_time;
+        let (_s, cs, before) = monitored(&node).await;
+        let r = cond(&cs, "Ready");
+        assert_eq!(r.status, "Unknown");
+        assert_eq!(r.reason.as_deref(), Some("NodeStatusUnknown"));
+        assert_eq!(
+            r.message.as_deref(),
+            Some("Kubelet stopped posting node status.")
+        );
+        // The controller must not forge a heartbeat the kubelet never sent.
+        assert_eq!(
+            r.last_heartbeat_time.map(|t| t.timestamp()),
+            hb.map(|t| t.timestamp())
+        );
+        assert!(r.last_transition_time.unwrap().timestamp() >= before.timestamp());
+    }
+
+    #[tokio::test]
+    async fn stale_heartbeat_marks_pressure_conditions_never_updated() {
+        let mut node = znode("n1", "z1", "True", SECS_STALE);
+        node.metadata.creation_timestamp = Some(Utc::now() - Duration::days(1));
+        let created = node.metadata.creation_timestamp;
+        let (_s, cs, before) = monitored(&node).await;
+        for t in ["MemoryPressure", "DiskPressure", "PIDPressure"] {
+            let c = cond(&cs, t);
+            assert_eq!(c.status, "Unknown", "{t}");
+            assert_eq!(c.reason.as_deref(), Some("NodeStatusNeverUpdated"), "{t}");
+            assert_eq!(
+                c.message.as_deref(),
+                Some("Kubelet never posted node status."),
+                "{t}"
+            );
+            assert_eq!(
+                c.last_heartbeat_time.map(|t| t.timestamp()),
+                created.map(|t| t.timestamp()),
+                "{t}"
+            );
+            assert!(
+                c.last_transition_time.unwrap().timestamp() >= before.timestamp(),
+                "{t}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_heartbeat_on_not_ready_node_also_goes_unknown() {
+        // currentCondition.Status != Unknown => Unknown, whatever it was.
+        let node = znode("n1", "z1", "False", SECS_STALE);
+        let (_s, cs, _) = monitored(&node).await;
+        assert_eq!(cond(&cs, "Ready").status, "Unknown");
+    }
+
+    #[tokio::test]
+    async fn fresh_not_ready_condition_is_left_to_the_kubelet() {
+        let node = znode("n1", "z1", "False", 1);
+        let (_s, cs, _) = monitored(&node).await;
+        assert_eq!(cond(&cs, "Ready").status, "False");
+    }
+
+    #[tokio::test]
+    async fn node_without_status_gets_never_updated_unknown() {
+        let node: Node = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Node",
+            "metadata": {"name": "n1", "creationTimestamp": "2012-01-01T00:00:00Z"},
+            "spec": {}
+        }))
+        .unwrap();
+        let (_s, cs, _) = monitored(&node).await;
+        let r = cond(&cs, "Ready");
+        assert_eq!(r.status, "Unknown");
+        assert_eq!(r.reason.as_deref(), Some("NodeStatusNeverUpdated"));
+        assert_eq!(
+            r.message.as_deref(),
+            Some("Kubelet never posted node status.")
         );
     }
 
@@ -1914,7 +2081,7 @@ mod tests {
         .await;
         // "we need second healthy node in tests" (all-NotReady stops evictions).
         put(&storage, &c, &znode("node1", "zone1", "True", 0)).await;
-        put(&storage, &c, &znode("node2", "zone1", "False", SECS_STALE)).await;
+        put(&storage, &c, &znode("node2", "zone1", "False", 0)).await;
 
         c.monitor_node_health().await.unwrap();
         c.do_no_execute_tainting_pass().await;
@@ -1963,7 +2130,7 @@ mod tests {
         )
         .await;
         put(&storage, &c, &znode("node4", "zone1", "True", 0)).await;
-        put(&storage, &c, &znode("node5", "zone1", "False", SECS_STALE)).await;
+        put(&storage, &c, &znode("node5", "zone1", "False", 0)).await;
 
         // 3. monitor again
         c.monitor_node_health().await.unwrap();
@@ -2009,6 +2176,8 @@ mod tests {
             .await
             .unwrap();
         n0.status.as_mut().unwrap().conditions.as_mut().unwrap()[0].status = "False".into();
+        n0.status.as_mut().unwrap().conditions.as_mut().unwrap()[0].last_heartbeat_time =
+            Some(Utc::now());
         storage
             .update(&build_key("nodes", None, "node0"), &n0)
             .await
@@ -2046,7 +2215,7 @@ mod tests {
         let c = NodeController::with_eviction_config(storage.clone(), cfg);
         put(&storage, &c, &znode("ok", "zone1", "True", 0)).await;
         for n in ["b1", "b2", "b3", "b4"] {
-            put(&storage, &c, &znode(n, "zone1", "False", SECS_STALE)).await;
+            put(&storage, &c, &znode(n, "zone1", "False", 0)).await;
         }
         c.monitor_node_health().await.unwrap();
         // 5 nodes > threshold 3, 4/5 unhealthy: ReducedQPSFunc -> secondary.
@@ -2072,7 +2241,7 @@ mod tests {
                 ..EvictionConfig::default()
             },
         );
-        put(&storage, &c, &znode("a", "zone1", "False", SECS_STALE)).await;
+        put(&storage, &c, &znode("a", "zone1", "False", 0)).await;
         put(&storage, &c, &znode("b", "zone1", "True", 0)).await;
         c.monitor_node_health().await.unwrap();
         c.do_no_execute_tainting_pass().await;
@@ -2125,8 +2294,8 @@ mod tests {
     async fn single_zone_full_disruption_keeps_normal_rate() {
         let storage = Arc::new(MemoryStorage::new());
         let c = NodeController::new(storage.clone());
-        put(&storage, &c, &znode("z1a", "z1", "False", SECS_STALE)).await;
-        put(&storage, &c, &znode("z1b", "z1", "False", SECS_STALE)).await;
+        put(&storage, &c, &znode("z1a", "z1", "False", 0)).await;
+        put(&storage, &c, &znode("z1b", "z1", "False", 0)).await;
         put(&storage, &c, &znode("z2a", "z2", "True", 0)).await;
         c.monitor_node_health().await.unwrap();
         assert_eq!(zone_qps(&c, "z1").await, 0.1);
@@ -2142,7 +2311,7 @@ mod tests {
     async fn excluded_nodes_do_not_count_towards_disruption() {
         let storage = Arc::new(MemoryStorage::new());
         let c = NodeController::with_eviction_config(storage.clone(), fast_config());
-        let mut ex = znode("ex", "zone1", "False", SECS_STALE);
+        let mut ex = znode("ex", "zone1", "False", 0);
         ex.metadata
             .labels
             .as_mut()

@@ -306,8 +306,9 @@ async fn test_taint_based_evictions() {
     let node_ctrl = NodeController::new(storage.clone());
     let evict_ctrl = TaintEvictionController::new(storage.clone());
 
-    // Single NotReady node with a stale heartbeat (>40s) — node controller
-    // should flip Ready=False and add the not-ready taint.
+    // Single NotReady node (kubelet posts Ready=False with a fresh heartbeat,
+    // as TestTaintBasedEvictions does) — node controller adds the not-ready taint.
+    // A stale heartbeat would instead go Unknown/unreachable (#2836).
     let node_name = "node-not-ready";
     let stale = Utc::now() - Duration::seconds(120);
     let mut node = make_ready_node(node_name);
@@ -315,10 +316,10 @@ async fn test_taint_based_evictions() {
         let status = node.status.as_mut().unwrap();
         status.conditions = Some(vec![NodeCondition {
             condition_type: "Ready".to_string(),
-            status: "True".to_string(),
-            last_heartbeat_time: Some(stale),
+            status: "False".to_string(),
+            last_heartbeat_time: Some(Utc::now()),
             last_transition_time: Some(stale),
-            reason: Some("KubeletReady".to_string()),
+            reason: Some("KubeletNotReady".to_string()),
             message: Some("kubelet is ready".to_string()),
         }]);
     }
@@ -374,7 +375,7 @@ async fn test_taint_based_evictions() {
     storage.create(&key_200, &pod_200).await.unwrap();
     storage.create(&key_none, &pod_none).await.unwrap();
 
-    // 1. Node lifecycle controller observes the stale heartbeat and applies
+    // 1. Node lifecycle controller observes the NotReady node and applies
     //    the not-ready taint with effect NoExecute.
     node_ctrl.reconcile_all().await.unwrap();
 

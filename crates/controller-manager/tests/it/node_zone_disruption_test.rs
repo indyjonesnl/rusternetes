@@ -83,7 +83,7 @@ async fn count_not_ready_tainted(storage: &MemoryStorage, names: &[&str]) -> usi
             .spec
             .as_ref()
             .and_then(|s| s.taints.as_ref())
-            .map(|ts| ts.iter().any(|t| t.key == "node.kubernetes.io/not-ready"))
+            .map(|ts| ts.iter().any(|t| t.key == "node.kubernetes.io/unreachable"))
             .unwrap_or(false);
         if tainted {
             n += 1;
