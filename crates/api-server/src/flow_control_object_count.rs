@@ -74,26 +74,56 @@ impl ObjectCountTracker {
 
     /// `Set`.
     pub fn set(&self, group_resource: &str, stats: Stats) {
-        let _ = (group_resource, stats);
-        todo!()
+        let now = self.clock.now();
+        let mut counts = self.counts.lock().unwrap();
+        counts.insert(
+            group_resource.to_string(),
+            TimestampedStats {
+                stats,
+                last_updated_at: now,
+            },
+        );
     }
 
     /// `Get`.
     pub fn get(&self, group_resource: &str) -> (Stats, Option<StatsError>) {
-        let _ = group_resource;
-        todo!()
+        let now = self.clock.now();
+        let counts = self.counts.lock().unwrap();
+        match counts.get(group_resource) {
+            Some(item) => {
+                // `lastUpdatedAt.Before(now - staleTolerationThreshold)`
+                if now.duration_since(item.last_updated_at) > STALE_TOLERATION_THRESHOLD {
+                    (item.stats, Some(StatsError::Stale))
+                } else {
+                    (item.stats, None)
+                }
+            }
+            None => (Stats::default(), Some(StatsError::NotFound)),
+        }
     }
 
     /// `prune`.
     fn prune(&self, threshold: Duration) {
-        let _ = threshold;
-        todo!()
+        let now = self.clock.now();
+        let mut counts = self.counts.lock().unwrap();
+        // Keep entries with `lastUpdatedAt.After(now - threshold)`.
+        counts.retain(|_, c| now.saturating_duration_since(c.last_updated_at) < threshold);
     }
 
     /// `RunUntil`.
-    pub async fn run_until(&self, stop: tokio::sync::watch::Receiver<bool>) {
-        let _ = stop;
-        todo!()
+    pub async fn run_until(&self, mut stop: tokio::sync::watch::Receiver<bool>) {
+        // `wait.PollUntil(pruneInterval, ...)`: first prune after one interval.
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(PRUNE_INTERVAL) => self.prune(PRUNE_INTERVAL),
+                r = stop.changed() => {
+                    if r.is_err() || *stop.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+        tracing::info!("StorageObjectCountTracker pruner is exiting");
     }
 
     /// `Get` as the estimator's `statsGetterFn`.
