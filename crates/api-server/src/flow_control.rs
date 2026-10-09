@@ -820,6 +820,31 @@ impl<S: Storage> FlowControlEngine<S> {
         Ok(())
     }
 
+    /// The storage the configuration is read from.
+    pub fn storage(&self) -> Arc<S> {
+        self.storage.clone()
+    }
+
+    /// `syncOne` (apf_controller.go:535-546): list every FlowSchema and
+    /// PriorityLevelConfiguration and digest them together. Unlike
+    /// [`Self::initialize`] a failed list is an error, so that the caller
+    /// requeues rate-limited (`processNextWorkItem`, :517-520) instead of
+    /// digesting an empty configuration.
+    pub async fn sync_one(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let pls: Vec<PriorityLevelConfiguration> = self
+            .storage
+            .list(&build_key("prioritylevelconfigurations", None, ""))
+            .await
+            .map_err(|e| format!("unable to list PriorityLevelConfiguration objects: {e}"))?;
+        let fss: Vec<FlowSchema> = self
+            .storage
+            .list(&build_key("flowschemas", None, ""))
+            .await
+            .map_err(|e| format!("unable to list FlowSchema objects: {e}"))?;
+        self.digest_config_objects(pls, fss);
+        Ok(())
+    }
+
     /// First matching FlowSchema in precedence order; `catch-all` is always
     /// present and matches everything.
     pub fn classify(&self, d: &RequestDigest) -> Classification {
