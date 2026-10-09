@@ -3532,7 +3532,7 @@ fn format_index_ranges(indexes: &[i32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusternetes_common::resources::workloads::{Job, JobSpec, PodTemplateSpec};
+    use rusternetes_common::resources::workloads::{Job, JobSpec, PodTemplateSpec, SuccessPolicy};
     use rusternetes_common::resources::{
         Container, ContainerState, ContainerStatus, Pod, PodCondition, PodSpec, PodStatus,
     };
@@ -7407,5 +7407,178 @@ mod tests {
         reconcile_settled(&c, &storage, key).await;
         let got: Job = storage.get(key).await.unwrap();
         assert!(cond_of(&got, "Complete").is_some(), "{:?}", got.status);
+    }
+
+    /// Run one settled reconcile of a 3-completion job whose pods are
+    /// `(index, phase)`, and return the stored Job.
+    async fn settle_sp(
+        name: &str,
+        indexed: bool,
+        patch: impl FnOnce(&mut Job),
+        pods: &[(i32, Phase)],
+    ) -> Job {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job(name, "default", 3, 3);
+        if indexed {
+            job.spec.completion_mode = Some("Indexed".to_string());
+        }
+        patch(&mut job);
+        let key = format!("/registry/jobs/default/{name}");
+        storage.create(&key, &job).await.unwrap();
+        for (i, phase) in pods {
+            let pn = format!("{name}-{i}");
+            let p = make_indexed_pod(&pn, "default", phase.clone(), name, "job-uid-1", *i);
+            storage
+                .create(&format!("/registry/pods/default/{pn}"), &p)
+                .await
+                .unwrap();
+        }
+        let c = JobController::new(storage.clone());
+        reconcile_settled(&c, &storage, &key).await;
+        storage.get(&key).await.unwrap()
+    }
+
+    fn sp(rules: serde_json::Value) -> Option<SuccessPolicy> {
+        Some(serde_json::from_value(serde_json::json!({ "rules": rules })).unwrap())
+    }
+
+    /// job_controller.go:984 sits inside `if hasBackoffLimitPerIndex(&job)`
+    /// (:978): without backoffLimitPerIndex, maxFailedIndexes is never
+    /// evaluated and failed pods count only against backoffLimit.
+    #[tokio::test]
+    async fn max_failed_indexes_needs_backoff_limit_per_index() {
+        let got = settle_sp(
+            "mfi",
+            true,
+            |j| {
+                j.spec.backoff_limit = Some(6);
+                j.spec.max_failed_indexes = Some(0);
+            },
+            &[(0, Phase::Failed), (1, Phase::Running), (2, Phase::Running)],
+        )
+        .await;
+        assert!(cond_of(&got, "Failed").is_none(), "{:?}", got.status);
+    }
+
+    /// success_policy.go matchSuccessPolicy only has a `SucceededIndexes` and
+    /// a `SucceededCount` branch; a rule with neither never matches.
+    #[tokio::test]
+    async fn success_policy_rule_without_criteria_never_matches() {
+        let got = settle_sp(
+            "nocrit",
+            true,
+            |j| j.spec.success_policy = sp(serde_json::json!([{}])),
+            &[
+                (0, Phase::Succeeded),
+                (1, Phase::Succeeded),
+                (2, Phase::Running),
+            ],
+        )
+        .await;
+        assert!(
+            cond_of(&got, "SuccessCriteriaMet").is_none(),
+            "{:?}",
+            got.status
+        );
+        assert!(cond_of(&got, "Complete").is_none(), "{:?}", got.status);
+    }
+
+    /// success_policy.go matchSuccessPolicy: a rule whose succeededIndexes
+    /// parses to nothing is skipped (`continue`) and the next rule is tried.
+    #[tokio::test]
+    async fn success_policy_skips_unparsable_rule() {
+        let got = settle_sp(
+            "badrule",
+            true,
+            |j| {
+                j.spec.success_policy = sp(serde_json::json!([
+                    {"succeededIndexes": "abc", "succeededCount": 1},
+                    {"succeededCount": 1}
+                ]))
+            },
+            &[
+                (0, Phase::Succeeded),
+                (1, Phase::Running),
+                (2, Phase::Running),
+            ],
+        )
+        .await;
+        let c = cond_of(&got, "SuccessCriteriaMet")
+            .or_else(|| cond_of(&got, "Complete"))
+            .expect("policy met");
+        assert_eq!(c.message.as_deref(), Some("Matched rules at index 1"));
+    }
+
+    /// job_controller.go:991-996: success policy is evaluated only inside
+    /// `if isIndexedJob(&job)`.
+    #[tokio::test]
+    async fn success_policy_ignored_for_non_indexed_job() {
+        let got = settle_sp(
+            "nonidx",
+            false,
+            |j| j.spec.success_policy = sp(serde_json::json!([{"succeededCount": 1}])),
+            &[
+                (0, Phase::Succeeded),
+                (1, Phase::Running),
+                (2, Phase::Running),
+            ],
+        )
+        .await;
+        assert!(
+            cond_of(&got, "SuccessCriteriaMet").is_none(),
+            "{:?}",
+            got.status
+        );
+        assert!(cond_of(&got, "Complete").is_none(), "{:?}", got.status);
+    }
+
+    /// matchSucceededIndexesRule: with both fields set, succeededCount counts
+    /// only succeeded indexes inside the rule's set (`contains >=
+    /// succeededCount`), not every succeeded index.
+    #[tokio::test]
+    async fn success_policy_count_is_scoped_to_rule_indexes() {
+        // Indexes 1 and 2 succeeded; rule set {0,1}: contains == 1 < 2.
+        let got = settle_sp(
+            "scoped",
+            true,
+            |j| {
+                j.spec.success_policy =
+                    sp(serde_json::json!([{"succeededIndexes": "0-1", "succeededCount": 2}]))
+            },
+            &[
+                (0, Phase::Running),
+                (1, Phase::Succeeded),
+                (2, Phase::Succeeded),
+            ],
+        )
+        .await;
+        assert!(
+            cond_of(&got, "SuccessCriteriaMet").is_none(),
+            "{:?}",
+            got.status
+        );
+        assert!(cond_of(&got, "Complete").is_none(), "{:?}", got.status);
+        // Indexes 0 and 1 of rule set {0-2} succeeded: contains == 2 >= 2.
+        let got = settle_sp(
+            "scoped2",
+            true,
+            |j| {
+                j.spec.success_policy =
+                    sp(serde_json::json!([{"succeededIndexes": "0-2", "succeededCount": 2}]))
+            },
+            &[
+                (0, Phase::Succeeded),
+                (1, Phase::Succeeded),
+                (2, Phase::Running),
+            ],
+        )
+        .await;
+        assert!(
+            cond_of(&got, "SuccessCriteriaMet")
+                .or_else(|| cond_of(&got, "Complete"))
+                .is_some(),
+            "{:?}",
+            got.status
+        );
     }
 }
