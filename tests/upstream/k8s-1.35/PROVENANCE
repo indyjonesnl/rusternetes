@@ -1,0 +1,15 @@
+Upstream:  https://github.com/kubernetes/kubernetes
+Branch:    release-1.35
+Commit:    90640ec14a7612baba12b658e962a9436b583ce4
+Synced:    2026-10-09
+License:   Apache-2.0 (see ../LICENSE)
+
+Copied paths (upstream -> here):
+  staging/src/k8s.io/api/testdata/HEAD -> tests/upstream/k8s-1.35/api-testdata/
+  staging/src/k8s.io/apiextensions-apiserver/pkg/apis/testdata/HEAD -> tests/upstream/k8s-1.35/apiextensions-testdata/
+  api/openapi-spec/v3 -> tests/upstream/k8s-1.35/openapi-spec/v3/
+  api/openapi-spec/swagger.json -> tests/upstream/k8s-1.35/openapi-spec/swagger.json
+
+Refresh:   scripts/sync-upstream-testdata.sh [path-to-kubernetes-checkout]
+           (checkout must be on release-1.35; FORCE=1 overrides).
+Do not edit these files by hand.
