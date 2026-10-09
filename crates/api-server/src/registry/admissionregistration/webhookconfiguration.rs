@@ -24,7 +24,7 @@ use crate::registry::rest::{
     RestUpdateStrategy,
 };
 
-pub(super) use rusternetes_common::cel::{compile_failure, parse_failure};
+pub(super) use rusternetes_common::cel::compile_failure;
 
 /// The compile half of `validateMatchCondition` (validation.go:984-997): each
 /// non-blank `matchConditions[j].expression` of each webhook, as a
