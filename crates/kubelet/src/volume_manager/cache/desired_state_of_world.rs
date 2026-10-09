@@ -326,35 +326,7 @@ impl DesiredStateOfWorld {
         );
 
         if !state.volumes_to_mount.contains_key(&volume_name) {
-            let mut size_limit: Option<Quantity> = None;
-            if is_local_ephemeral_volume(&volume_spec.volume) {
-                let limits = pod_limits(&pod);
-                let ephemeral_storage_limit = limits
-                    .get(EPHEMERAL_STORAGE)
-                    .copied()
-                    .unwrap_or_else(|| Quantity::from_value(0, Format::DecimalSI));
-                let mut chosen = Quantity::from_value(
-                    saturating_i64(ephemeral_storage_limit.value()),
-                    Format::BinarySI,
-                );
-                if let Some(empty_dir_limit) = volume_spec
-                    .volume
-                    .empty_dir
-                    .as_ref()
-                    .and_then(|ed| ed.size_limit.as_deref())
-                    .and_then(|s| Quantity::parse(s).ok())
-                {
-                    if empty_dir_limit.value() > 0
-                        && (chosen.value() == 0 || empty_dir_limit.value() < chosen.value())
-                    {
-                        chosen = Quantity::from_value(
-                            saturating_i64(empty_dir_limit.value()),
-                            Format::BinarySI,
-                        );
-                    }
-                }
-                size_limit = Some(chosen);
-            }
+            let size_limit = desired_size_limit(&pod, &volume_spec.volume);
             let mut effective_selinux_mount_label = selinux_file_label.clone();
             if !volume_supports_selinux_mount(&spec) {
                 // Clear SELinux label for the volume with unsupported access modes.
@@ -469,56 +441,13 @@ impl DesiredStateOfWorld {
         selinux_container_contexts: &[Option<SELinuxOptions>],
         pod_security_context: Option<&rusternetes_common::resources::pod::PodSecurityContext>,
     ) -> Result<(String, bool), DesiredStateOfWorldError> {
-        let (label_info, err) = get_mount_selinux_label(
+        get_selinux_label(
+            &self.volume_plugin_mgr,
+            self.selinux_translator.as_ref(),
             volume_spec,
             selinux_container_contexts,
             pod_security_context,
-            &self.volume_plugin_mgr,
-            self.selinux_translator.as_ref(),
-        );
-        if let Some(err) = err {
-            let access_mode = get_volume_access_mode(volume_spec);
-            let selinux_supported = volume_supports_selinux_mount(volume_spec);
-
-            match err {
-                SELinuxLabelError::Translation(_) => {
-                    return match handle_selinux_metric_error(
-                        err.into(),
-                        selinux_supported,
-                        &SELINUX_CONTAINER_CONTEXT_WARNINGS,
-                        &SELINUX_CONTAINER_CONTEXT_ERRORS,
-                        &[access_mode],
-                    ) {
-                        Some(err) => Err(err),
-                        None => Ok((
-                            String::new(),
-                            label_info.plugin_supports_selinux_context_mount,
-                        )),
-                    };
-                }
-                SELinuxLabelError::MultipleLabels(_) => {
-                    // Note the `false`: upstream does NOT propagate
-                    // `labelInfo.PluginSupportsSELinuxContextMount` on this arm
-                    // (`:431`), unlike the other two.
-                    return match handle_selinux_metric_error(
-                        err.into(),
-                        selinux_supported,
-                        &SELINUX_POD_CONTEXT_MISMATCH_WARNINGS,
-                        &SELINUX_POD_CONTEXT_MISMATCH_ERRORS,
-                        &[access_mode],
-                    ) {
-                        Some(err) => Err(err),
-                        None => Ok((String::new(), false)),
-                    };
-                }
-                SELinuxLabelError::Other(_) => return Err(err.into()),
-            }
-        }
-
-        Ok((
-            label_info.selinux_mount_label,
-            label_info.plugin_supports_selinux_context_mount,
-        ))
+        )
     }
 
     /// Sets the `reported_in_use` value to true for `reported_volumes`. For
@@ -817,6 +746,120 @@ const EPHEMERAL_STORAGE: &str = "ephemeral-storage";
 
 /// `v1.ResourceStorage` — the key `ResourceList.Storage()` reads.
 const STORAGE: &str = "storage";
+
+/// Port of `getSELinuxLabel` (`desired_state_of_world.go:405-437`) with the
+/// plugin manager and translator passed in, so the kubelet's `create_volume`
+/// (which has no `DesiredStateOfWorld` yet) computes `SELinuxLabel` with the
+/// same code `AddPodToVolume` does.
+pub(crate) fn get_selinux_label(
+    volume_plugin_mgr: &VolumePluginMgr,
+    selinux_translator: &dyn SELinuxLabelTranslator,
+    volume_spec: &Spec<'_>,
+    selinux_container_contexts: &[Option<SELinuxOptions>],
+    pod_security_context: Option<&rusternetes_common::resources::pod::PodSecurityContext>,
+) -> Result<(String, bool), DesiredStateOfWorldError> {
+    let (label_info, err) = get_mount_selinux_label(
+        volume_spec,
+        selinux_container_contexts,
+        pod_security_context,
+        volume_plugin_mgr,
+        selinux_translator,
+    );
+    if let Some(err) = err {
+        let access_mode = get_volume_access_mode(volume_spec);
+        let selinux_supported = volume_supports_selinux_mount(volume_spec);
+
+        match err {
+            SELinuxLabelError::Translation(_) => {
+                return match handle_selinux_metric_error(
+                    err.into(),
+                    selinux_supported,
+                    &SELINUX_CONTAINER_CONTEXT_WARNINGS,
+                    &SELINUX_CONTAINER_CONTEXT_ERRORS,
+                    &[access_mode],
+                ) {
+                    Some(err) => Err(err),
+                    None => Ok((
+                        String::new(),
+                        label_info.plugin_supports_selinux_context_mount,
+                    )),
+                };
+            }
+            SELinuxLabelError::MultipleLabels(_) => {
+                // Note the `false`: upstream does NOT propagate
+                // `labelInfo.PluginSupportsSELinuxContextMount` on this arm
+                // (`:431`), unlike the other two.
+                return match handle_selinux_metric_error(
+                    err.into(),
+                    selinux_supported,
+                    &SELINUX_POD_CONTEXT_MISMATCH_WARNINGS,
+                    &SELINUX_POD_CONTEXT_MISMATCH_ERRORS,
+                    &[access_mode],
+                ) {
+                    Some(err) => Err(err),
+                    None => Ok((String::new(), false)),
+                };
+            }
+            SELinuxLabelError::Other(_) => return Err(err.into()),
+        }
+    }
+
+    Ok((
+        label_info.selinux_mount_label,
+        label_info.plugin_supports_selinux_context_mount,
+    ))
+}
+
+/// The `effectiveSELinuxMountFileLabel` `AddPodToVolume` stores
+/// (`desired_state_of_world.go:333-336`): the label, cleared for a volume
+/// whose access mode cannot carry `-o context=`.
+pub(crate) fn effective_selinux_mount_label(
+    volume_spec: &Spec<'_>,
+    selinux_file_label: &str,
+) -> String {
+    if volume_supports_selinux_mount(volume_spec) {
+        selinux_file_label.to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// The `DesiredSizeLimit` `AddPodToVolume` records for a volume
+/// (`desired_state_of_world.go:297-322`): for a local ephemeral volume, the
+/// pod's ephemeral-storage limit, lowered to the emptyDir `sizeLimit` when
+/// that is smaller; `None` for any other volume.
+pub(crate) fn desired_size_limit(
+    pod: &Pod,
+    volume: &rusternetes_common::resources::Volume,
+) -> Option<Quantity> {
+    let mut size_limit: Option<Quantity> = None;
+    if is_local_ephemeral_volume(volume) {
+        let limits = pod_limits(pod);
+        let ephemeral_storage_limit = limits
+            .get(EPHEMERAL_STORAGE)
+            .copied()
+            .unwrap_or_else(|| Quantity::from_value(0, Format::DecimalSI));
+        let mut chosen = Quantity::from_value(
+            saturating_i64(ephemeral_storage_limit.value()),
+            Format::BinarySI,
+        );
+        if let Some(empty_dir_limit) = volume
+            .empty_dir
+            .as_ref()
+            .and_then(|ed| ed.size_limit.as_deref())
+            .and_then(|s| Quantity::parse(s).ok())
+        {
+            if empty_dir_limit.value() > 0
+                && (chosen.value() == 0 || empty_dir_limit.value() < chosen.value())
+            {
+                chosen =
+                    Quantity::from_value(saturating_i64(empty_dir_limit.value()), Format::BinarySI);
+            }
+        }
+        size_limit = Some(chosen);
+    }
+    size_limit
+}
 
 /// `resource.Quantity.Value()` is an `int64` upstream; ours is an `i128`
 /// because the parser keeps a wider mantissa. Clamping is the closest thing to

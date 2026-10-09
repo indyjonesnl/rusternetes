@@ -191,6 +191,65 @@ pub fn fs_user_from(pod: &Pod) -> Option<i64> {
     fs_user
 }
 
+/// The effective SELinux options of every container that mounts
+/// `volume_name`: the SELinux half of `GetPodVolumeNames(pod, true)`
+/// (`pkg/volume/util/util.go:507-537`).
+///
+/// Visits init, regular and ephemeral containers. The effective options are
+/// the container's own, else the pod's (`DetermineEffectiveSecurityContext`,
+/// `pkg/securitycontext/util.go:44-62`); a container with neither adds
+/// nothing (`seLinuxOptions != nil` at `util.go:524`).
+pub fn selinux_container_contexts(
+    pod: &Pod,
+    volume_name: &str,
+) -> Vec<Option<rusternetes_common::resources::pod::SELinuxOptions>> {
+    let Some(spec) = pod.spec.as_ref() else {
+        return Vec::new();
+    };
+    let pod_opts = spec
+        .security_context
+        .as_ref()
+        .and_then(|sc| sc.se_linux_options.clone());
+    let mut out = Vec::new();
+    let mut visit =
+        |mounts: &Option<Vec<rusternetes_common::resources::pod::VolumeMount>>,
+         opts: Option<rusternetes_common::resources::pod::SELinuxOptions>| {
+            let Some(opts) = opts.or_else(|| pod_opts.clone()) else {
+                return;
+            };
+            for m in mounts.iter().flatten() {
+                if m.name == volume_name {
+                    out.push(Some(opts.clone()));
+                }
+            }
+        };
+    for c in spec.init_containers.iter().flatten() {
+        visit(
+            &c.volume_mounts,
+            c.security_context
+                .as_ref()
+                .and_then(|sc| sc.se_linux_options.clone()),
+        );
+    }
+    for c in &spec.containers {
+        visit(
+            &c.volume_mounts,
+            c.security_context
+                .as_ref()
+                .and_then(|sc| sc.se_linux_options.clone()),
+        );
+    }
+    for c in spec.ephemeral_containers.iter().flatten() {
+        visit(
+            &c.volume_mounts,
+            c.security_context
+                .as_ref()
+                .and_then(|sc| sc.se_linux_options.clone()),
+        );
+    }
+    out
+}
+
 /// The `fsGroup` the operation generator hands a mounter
 /// (`pkg/volume/util/operationexecutor/operation_generator.go:501-509`):
 /// `pod.Spec.SecurityContext.FSGroup`.

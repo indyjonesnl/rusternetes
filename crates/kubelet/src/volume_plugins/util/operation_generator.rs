@@ -12,6 +12,9 @@
 
 use crate::events::{FILE_SYSTEM_RESIZE_FAILED, FILE_SYSTEM_RESIZE_SUCCESS};
 use crate::volume_manager::cache::actual_state_of_world::ActualStateOfWorld;
+use crate::volume_manager::cache::desired_state_of_world::{
+    desired_size_limit, effective_selinux_mount_label, get_selinux_label,
+};
 use crate::volume_plugins::plugin::{
     DeviceMounterArgs, NodeExpandableVolumePlugin, NodeResizeOptions, Spec,
 };
@@ -527,6 +530,18 @@ pub(crate) fn mounter_args_for(
     pod: &Pod,
     selinux_translator: &dyn crate::volume_plugins::util::selinux::SELinuxLabelTranslator,
 ) -> anyhow::Result<crate::volume_plugins::MounterArgs> {
+    // `AddPodToVolume` (`desired_state_of_world.go:317-336`): the label the
+    // containers that mount the volume need, cleared for a volume whose access
+    // mode cannot carry `-o context=`.
+    let (selinux_file_label, _plugin_supports_selinux_context_mount) = get_selinux_label(
+        mgr,
+        selinux_translator,
+        spec,
+        &crate::volume_plugins::util::selinux_container_contexts(pod, &spec.volume.name),
+        pod.spec.as_ref().and_then(|s| s.security_context.as_ref()),
+    )
+    .map_err(|e| anyhow!("{e}"))?;
+    let selinux_label = effective_selinux_mount_label(spec, &selinux_file_label);
     Ok(crate::volume_plugins::MounterArgs {
         fs_user: crate::volume_plugins::util::fs_user_from(pod),
         fs_group: fs_group_from(pod),
@@ -535,8 +550,11 @@ pub(crate) fn mounter_args_for(
             .as_ref()
             .and_then(|s| s.security_context.as_ref())
             .and_then(|sc| sc.fs_group_change_policy.clone()),
-        desired_size: None,
-        selinux_label: String::new(),
+        desired_size: desired_size_limit(pod, spec.volume).map(|q| {
+            // `resource.Quantity.Value()`: an int64.
+            q.value().clamp(i64::MIN as i128, i64::MAX as i128) as i64
+        }),
+        selinux_label,
     })
 }
 
