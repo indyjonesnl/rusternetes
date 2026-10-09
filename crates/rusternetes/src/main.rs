@@ -283,6 +283,7 @@ async fn async_main() -> Result<()> {
         service_account: args.service_account.to_options(),
         authorization_mode: args.authorization.authorization_mode.clone(),
         authorization_policy_file: args.authorization.authorization_policy_file.clone(),
+        authorization_webhook: args.authorization.webhook.clone(),
         ..Default::default()
     };
     let prepared_tls = rusternetes_api_server::prepare_tls_for_config(&api_config)?;

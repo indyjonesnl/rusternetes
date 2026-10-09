@@ -136,10 +136,44 @@ pub enum Decision {
     Deny(String),
 }
 
+/// The three-valued answer of upstream's `authorizer.Decision`
+/// (`staging/src/k8s.io/apiserver/pkg/authorization/authorizer/interfaces.go`:
+/// `DecisionDeny` / `DecisionAllow` / `DecisionNoOpinion`). [`Decision`] has no
+/// `NoOpinion` (an authorizer's `Deny` means "fall through" to the next one in
+/// the [`UnionAuthorizer`]), so an authorizer that must be able to stop the
+/// chain with an *explicit* deny, such as the authorization webhook
+/// (`status.denied`, or `failurePolicy: Deny`), overrides
+/// [`Authorizer::authorize_opinion`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum Opinion {
+    Allow,
+    /// An explicit deny: the union stops here (union.go returns on `Deny`).
+    Deny(String),
+    /// No decision; the union asks the next authorizer. `error` is the error
+    /// upstream returns alongside `DecisionNoOpinion`; the union collects those
+    /// and returns them only if no later authorizer decides.
+    NoOpinion {
+        reason: String,
+        error: Option<String>,
+    },
+}
+
 /// Authorizer trait for authorization implementations
 #[async_trait]
 pub trait Authorizer: Send + Sync {
     async fn authorize(&self, attrs: &RequestAttributes) -> Result<Decision>;
+
+    /// Three-valued form of [`Authorizer::authorize`]. The default maps
+    /// `Deny` to `NoOpinion`, the established meaning of `Deny` here.
+    async fn authorize_opinion(&self, attrs: &RequestAttributes) -> Result<Opinion> {
+        Ok(match self.authorize(attrs).await? {
+            Decision::Allow => Opinion::Allow,
+            Decision::Deny(reason) => Opinion::NoOpinion {
+                reason,
+                error: None,
+            },
+        })
+    }
 
     /// Get all rules that apply to a user in a given namespace
     async fn get_user_rules(
@@ -852,12 +886,23 @@ impl UnionAuthorizer {
 #[async_trait]
 impl Authorizer for UnionAuthorizer {
     async fn authorize(&self, attrs: &RequestAttributes) -> Result<Decision> {
+        // union.go `unionAuthzHandler.Authorize`: Allow and an explicit Deny
+        // return at once, NoOpinion moves on; errors that came with a NoOpinion
+        // are returned only if nobody decides.
         let mut reasons = Vec::new();
+        let mut errors = Vec::new();
         for authorizer in &self.authorizers {
-            match authorizer.authorize(attrs).await? {
-                Decision::Allow => return Ok(Decision::Allow),
-                Decision::Deny(reason) => reasons.push(reason),
+            match authorizer.authorize_opinion(attrs).await? {
+                Opinion::Allow => return Ok(Decision::Allow),
+                Opinion::Deny(reason) => return Ok(Decision::Deny(reason)),
+                Opinion::NoOpinion { reason, error } => {
+                    reasons.push(reason);
+                    errors.extend(error);
+                }
             }
+        }
+        if !errors.is_empty() {
+            return Err(crate::error::Error::Authorization(errors.join("; ")));
         }
         Ok(Decision::Deny(reasons.join("; ")))
     }
