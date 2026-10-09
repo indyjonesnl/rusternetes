@@ -1061,6 +1061,98 @@ rules:
         assert_eq!(json["metadata"], serde_json::json!({}));
     }
 
+    async fn run_status_app(route: axum::routing::MethodRouter) -> (Response, Vec<AuditEvent>) {
+        let cap = Arc::new(Capture(Default::default()));
+        let cfg = Arc::new(AuditConfig {
+            policy: Policy::from_yaml(&POLICY.replace("omitStages: [\"RequestReceived\"]\n", ""))
+                .unwrap(),
+            sink: cap.clone(),
+        });
+        let app = Router::new()
+            .route("/api/v1/namespaces/:ns/secrets/:name", route)
+            .layer(axum::middleware::from_fn(move |req, next| {
+                let cfg = cfg.clone();
+                async move { with_audit(cfg, req, next).await }
+            }));
+        let resp = app
+            .oneshot(
+                axum::http::Request::get("/api/v1/namespaces/ns/secrets/s")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let ev = cap.0.lock().await.clone();
+        (resp, ev)
+    }
+
+    /// `LogResponseObject` (audit/request.go) records the Status a handler
+    /// writes whatever its code: a delete's 200 `Success` Status is on the
+    /// event too, and the client still gets the body.
+    #[tokio::test]
+    async fn success_status_body_is_recorded() {
+        let (resp, ev) = run_status_app(get(|| async {
+            (
+                [("content-type", "application/json")],
+                r#"{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Success","details":{"name":"s","kind":"secrets","uid":"u1"},"code":200}"#,
+            )
+        }))
+        .await;
+        assert_eq!(resp.status(), 200);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("Success"));
+        let rs = ev[1].response_status.as_ref().unwrap();
+        assert_eq!(rs.code, 200);
+        assert_eq!(rs.status.as_deref(), Some("Success"));
+        assert_eq!(rs.details.as_ref().unwrap()["uid"], "u1");
+    }
+
+    /// A non-Status object leaves only the code (LogResponseObject sets
+    /// `ev.ResponseStatus = {Code}` for it).
+    #[tokio::test]
+    async fn non_status_success_body_records_only_the_code() {
+        let (_resp, ev) = run_status_app(get(|| async {
+            (
+                [("content-type", "application/json")],
+                r#"{"kind":"Secret","apiVersion":"v1","metadata":{"name":"s"}}"#,
+            )
+        }))
+        .await;
+        let rs = ev[1].response_status.as_ref().unwrap();
+        assert_eq!(rs.code, 200);
+        assert!(rs.status.is_none() && rs.details.is_none());
+    }
+
+    /// A streamed (watch-style) body must not be buffered: the first chunk
+    /// reaches the client while the stream is still open.
+    #[tokio::test]
+    async fn streamed_success_body_is_not_buffered() {
+        let (resp, _ev) = run_status_app(get(|| async {
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(1);
+            tx.send(Ok(b"{\"type\":\"ADDED\"}\n".to_vec()))
+                .await
+                .unwrap();
+            // Keep the stream open for the response's lifetime.
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                drop(tx);
+            });
+            (
+                [("content-type", "application/json")],
+                Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
+            )
+        }))
+        .await;
+        use futures::StreamExt;
+        let mut s = resp.into_body().into_data_stream();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), s.next())
+            .await
+            .expect("first chunk must arrive without waiting for stream end");
+        assert!(first.is_some());
+    }
+
     #[tokio::test]
     async fn filter_honours_level_none_and_omit_stages() {
         let cap = Arc::new(Capture(Default::default()));
