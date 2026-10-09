@@ -804,17 +804,12 @@ pub fn label_selector_as_selector(selector: Option<&LabelSelector>) -> Result<Se
     if match_labels + match_expressions == 0 {
         return Ok(Selector::Everything);
     }
-    for req in selector.match_expressions.iter().flatten() {
-        if !matches!(
-            req.operator.as_str(),
-            "In" | "NotIn" | "Exists" | "DoesNotExist"
-        ) {
-            return Err(format!(
-                "{:?} is not a valid label selector operator",
-                req.operator
-            ));
-        }
-    }
+    // Every requirement goes through `labels.NewRequirement`
+    // (`helpers.go:62-79`, `labels/selector.go:185-225`): an unknown operator,
+    // an invalid key or value, and a wrong value count are all errors.
+    // `as_selector_string` is that same port, and checks the operator with
+    // upstream's message.
+    selector.as_selector_string()?;
     Ok(Selector::Requirements(selector.clone()))
 }
 
@@ -1403,6 +1398,42 @@ mod tests {
             Err("\"Greater\" is not a valid label selector operator".to_string())
         );
         assert!(!s.matches_labels(&labels(&[("a", "b")])));
+    }
+
+    /// `TestLabelSelectorAsSelector` (`helpers_test.go:31-90`) pins that an
+    /// `Exists` requirement carrying values is an error; the rest of
+    /// `NewRequirement` (`labels/selector.go:185-225`) refuses an invalid key,
+    /// an invalid value and an empty `In`/`NotIn` set the same way.
+    #[test]
+    fn a_requirement_newrequirement_refuses_is_an_error() {
+        for bad in [
+            // Exists with values (helpers_test.go case 6).
+            serde_json::json!({"matchExpressions": [{"key": "baz", "operator": "Exists", "values": ["qux", "norf"]}]}),
+            serde_json::json!({"matchExpressions": [{"key": "baz", "operator": "DoesNotExist", "values": ["x"]}]}),
+            // Empty In / NotIn set.
+            serde_json::json!({"matchExpressions": [{"key": "baz", "operator": "In"}]}),
+            serde_json::json!({"matchExpressions": [{"key": "baz", "operator": "NotIn", "values": []}]}),
+            // Invalid key.
+            serde_json::json!({"matchExpressions": [{"key": "not a key!", "operator": "Exists"}]}),
+            serde_json::json!({"matchLabels": {"bad key": "v"}}),
+            // Invalid value.
+            serde_json::json!({"matchLabels": {"app": "not valid!"}}),
+            serde_json::json!({"matchExpressions": [{"key": "a", "operator": "In", "values": ["-bad"]}]}),
+        ] {
+            let s = sel(bad.clone());
+            assert!(
+                label_selector_as_selector(Some(&s)).is_err(),
+                "{bad} must be refused"
+            );
+            // Eviction reads this as "does not match".
+            assert!(!s.matches_labels(&labels(&[("app", "web"), ("baz", "x")])));
+        }
+
+        let good = sel(serde_json::json!({
+            "matchLabels": {"foo": "bar"},
+            "matchExpressions": [{"key": "baz", "operator": "In", "values": ["qux", "norf"]}]
+        }));
+        assert!(label_selector_as_selector(Some(&good)).is_ok());
     }
 
     #[test]
