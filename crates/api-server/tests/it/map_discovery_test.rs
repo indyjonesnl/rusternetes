@@ -65,16 +65,23 @@ async fn v1beta1_is_advertised_under_the_gate() {
         names,
         vec![
             "mutatingadmissionpolicies",
-            "mutatingadmissionpolicybindings"
+            "mutatingadmissionpolicybindings",
+            "validatingadmissionpolicies",
+            "validatingadmissionpolicies/status",
+            "validatingadmissionpolicybindings"
         ],
         "{list}"
     );
     for r in res {
         assert_eq!(r["namespaced"], false);
-        assert_eq!(r["categories"], serde_json::json!(["api-extensions"]));
+        if !r["name"].as_str().unwrap().ends_with("/status") {
+            assert_eq!(r["categories"], serde_json::json!(["api-extensions"]));
+        }
     }
     assert_eq!(res[0]["kind"], "MutatingAdmissionPolicy");
     assert_eq!(res[1]["kind"], "MutatingAdmissionPolicyBinding");
+    assert_eq!(res[2]["kind"], "ValidatingAdmissionPolicy");
+    assert_eq!(res[4]["kind"], "ValidatingAdmissionPolicyBinding");
 
     let (status, group) = api.get("/apis/admissionregistration.k8s.io/").await;
     assert_eq!(status, StatusCode::OK, "{group}");
@@ -117,7 +124,9 @@ async fn aggregated_discovery_follows_the_gate() {
                 rs,
                 vec![
                     "mutatingadmissionpolicies",
-                    "mutatingadmissionpolicybindings"
+                    "mutatingadmissionpolicybindings",
+                    "validatingadmissionpolicies",
+                    "validatingadmissionpolicybindings"
                 ]
             );
         } else {
