@@ -10,6 +10,7 @@
 //! out-of-range value is rejected at deserialization (matching upstream's
 //! `NotSupported` set membership check).
 
+use crate::diff::GoJson;
 use crate::quantity::{Format, Quantity};
 use crate::resources::volume::{
     LabelSelector as VolumeLabelSelector, PersistentVolumeAccessMode, PersistentVolumeClaim,
@@ -598,30 +599,142 @@ fn specs_semantically_equal(a: &PersistentVolumeClaimSpec, b: &PersistentVolumeC
         && strip(a) == strip(b)
 }
 
-/// Stand-in for upstream's `diff.Diff(old, new)` in the spec-immutable error:
-/// the top-level spec fields that differ, old then new.
+/// `diff.Diff(old, new)` of the spec (validation.go:2583-2584): the unified
+/// diff of `json.MarshalIndent` of the INTERNAL `core.PersistentVolumeClaimSpec`
+/// (types.go:503-575), which has no json tags — so Go field names in
+/// declaration order, no omitempty, nil pointers/maps/slices as `null`.
 fn spec_diff(old: &PersistentVolumeClaimSpec, new: &PersistentVolumeClaimSpec) -> String {
-    let o = serde_json::to_value(old).unwrap_or_default();
-    let n = serde_json::to_value(new).unwrap_or_default();
-    let empty = serde_json::Map::new();
-    let (o, n) = (
-        o.as_object().unwrap_or(&empty),
-        n.as_object().unwrap_or(&empty),
-    );
-    let mut keys: Vec<&String> = o.keys().chain(n.keys()).collect();
-    keys.sort();
-    keys.dedup();
-    let mut out = String::new();
-    for k in keys {
-        if o.get(k) != n.get(k) {
-            out.push_str(&format!(
-                "  {k}:\n-   {}\n+   {}\n",
-                o.get(k).map_or("<absent>".into(), |v| v.to_string()),
-                n.get(k).map_or("<absent>".into(), |v| v.to_string())
-            ));
+    crate::diff::diff(&go_spec_json(old), &go_spec_json(new))
+}
+
+fn go_spec_json(s: &PersistentVolumeClaimSpec) -> GoJson {
+    use serde_json::Value;
+    let selector = match &s.selector {
+        None => GoJson::Null,
+        Some(sel) => {
+            // metav1.LabelSelector: matchLabels, matchExpressions (omitempty).
+            let v = serde_json::to_value(sel).unwrap_or_default();
+            let mut o = Vec::new();
+            if let Some(Value::Object(ml)) = v.get("matchLabels") {
+                let mut e: Vec<(String, GoJson)> = ml
+                    .iter()
+                    .map(|(k, v)| (k.clone(), GoJson::str(v.as_str().unwrap_or_default())))
+                    .collect();
+                e.sort_by(|a, b| a.0.cmp(&b.0));
+                if !e.is_empty() {
+                    o.push(("matchLabels".to_string(), GoJson::Object(e)));
+                }
+            }
+            if let Some(Value::Array(me)) = v.get("matchExpressions") {
+                if !me.is_empty() {
+                    let reqs = me
+                        .iter()
+                        .map(|r| {
+                            let mut f = vec![
+                                (
+                                    "key".to_string(),
+                                    GoJson::str(r["key"].as_str().unwrap_or_default()),
+                                ),
+                                (
+                                    "operator".to_string(),
+                                    GoJson::str(r["operator"].as_str().unwrap_or_default()),
+                                ),
+                            ];
+                            if let Some(vals) = r["values"].as_array() {
+                                if !vals.is_empty() {
+                                    f.push((
+                                        "values".to_string(),
+                                        GoJson::Array(
+                                            vals.iter()
+                                                .map(|x| {
+                                                    GoJson::str(x.as_str().unwrap_or_default())
+                                                })
+                                                .collect(),
+                                        ),
+                                    ));
+                                }
+                            }
+                            GoJson::Object(f)
+                        })
+                        .collect();
+                    o.push(("matchExpressions".to_string(), GoJson::Array(reqs)));
+                }
+            }
+            GoJson::Object(o)
         }
-    }
-    out
+    };
+    let access_modes = if s.access_modes.is_empty() {
+        GoJson::Null
+    } else {
+        GoJson::Array(
+            s.access_modes
+                .iter()
+                .map(|m| {
+                    GoJson::str(
+                        serde_json::to_value(m)
+                            .ok()
+                            .and_then(|v| v.as_str().map(str::to_string))
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect(),
+        )
+    };
+    let mode = s.volume_mode.as_ref().map_or(GoJson::Null, |m| {
+        GoJson::str(
+            serde_json::to_value(m)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default(),
+        )
+    });
+    let data_source = s.data_source.as_ref().map_or(GoJson::Null, |d| {
+        GoJson::Object(vec![
+            ("APIGroup".into(), GoJson::opt_str(&d.api_group)),
+            ("Kind".into(), GoJson::str(d.kind.clone())),
+            ("Name".into(), GoJson::str(d.name.clone())),
+        ])
+    });
+    let data_source_ref = s.data_source_ref.as_ref().map_or(GoJson::Null, |d| {
+        GoJson::Object(vec![
+            ("APIGroup".into(), GoJson::opt_str(&d.api_group)),
+            ("Kind".into(), GoJson::str(d.kind.clone())),
+            ("Name".into(), GoJson::str(d.name.clone())),
+            ("Namespace".into(), GoJson::opt_str(&d.namespace)),
+        ])
+    });
+    GoJson::Object(vec![
+        ("AccessModes".into(), access_modes),
+        ("Selector".into(), selector),
+        (
+            "Resources".into(),
+            GoJson::Object(vec![
+                (
+                    "Limits".into(),
+                    GoJson::string_map(s.resources.limits.as_ref().map(|m| m.iter())),
+                ),
+                (
+                    "Requests".into(),
+                    GoJson::string_map(s.resources.requests.as_ref().map(|m| m.iter())),
+                ),
+            ]),
+        ),
+        (
+            "VolumeName".into(),
+            GoJson::str(s.volume_name.clone().unwrap_or_default()),
+        ),
+        (
+            "StorageClassName".into(),
+            GoJson::opt_str(&s.storage_class_name),
+        ),
+        ("VolumeMode".into(), mode),
+        ("DataSource".into(), data_source),
+        ("DataSourceRef".into(), data_source_ref),
+        (
+            "VolumeAttributesClassName".into(),
+            GoJson::opt_str(&s.volume_attributes_class_name),
+        ),
+    ])
 }
 
 fn storage_quantity(spec: &PersistentVolumeClaimSpec) -> Quantity {
@@ -639,8 +752,8 @@ fn storage_quantity(spec: &PersistentVolumeClaimSpec) -> Quantity {
 /// (`ValidationOptionsForPersistentVolumeClaim`, :2336-2364).
 /// `EnableRecoverFromExpansionFailure` and `EnableVolumeAttributesClass` are
 /// GA/locked on, so the "feature gate disabled" branch at :2602-2604 can not
-/// fire. Deviation: the `spec is immutable` message carries a top-level-field
-/// diff instead of Go's `diff.Diff` text.
+/// fire. The `spec is immutable` message carries `diff.Diff` text
+/// ([`crate::diff`]).
 pub fn validate_persistent_volume_claim_update(
     new_pvc: &PersistentVolumeClaim,
     old_pvc: &PersistentVolumeClaim,

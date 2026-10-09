@@ -314,3 +314,42 @@ fn invalid_api_group_kept_when_old_object_has_it() {
     });
     assert!(ok(&old.clone(), &old));
 }
+
+/// The spec-immutable message carries `diff.Diff(old.Spec, new.Spec)`
+/// (validation.go:2583-2584): a go-difflib unified diff, context 3, of the
+/// `json.MarshalIndent(spec, "", " ")` of the INTERNAL type (Go field names,
+/// declaration order, no omitempty).
+#[test]
+fn spec_immutable_error_carries_unified_diff() {
+    let old = pvc("1Gi", None);
+    let mut new = pvc("1Gi", None);
+    new.spec.access_modes = vec![PersistentVolumeAccessMode::ReadOnlyMany];
+    let errs = validate_persistent_volume_claim_update(&new, &old);
+    let e = errs.iter().find(|e| e.field == "spec").expect("spec error");
+    assert_eq!(
+        e.detail,
+        "spec is immutable after creation except resources.requests and volumeAttributesClassName for bound claims\n@@ -1,6 +1,6 @@\n {\n  \"AccessModes\": [\n-  \"ReadWriteOnce\"\n+  \"ReadOnlyMany\"\n  ],\n  \"Selector\": null,\n  \"Resources\": {\n"
+    );
+}
+
+#[test]
+fn spec_immutable_diff_far_apart_changes_make_two_hunks() {
+    let old = pvc("1Gi", None);
+    let mut new = pvc("1Gi", None);
+    new.spec.access_modes = vec![PersistentVolumeAccessMode::ReadOnlyMany];
+    new.spec.data_source = Some(TypedLocalObjectReference {
+        api_group: Some("snapshot.storage.k8s.io".into()),
+        kind: "VolumeSnapshot".into(),
+        name: "s".into(),
+    });
+    let errs = validate_persistent_volume_claim_update(&new, &old);
+    let e = errs.iter().find(|e| e.field == "spec").expect("spec error");
+    assert!(e.detail.contains("\n@@ -1,6 +1,6 @@\n"), "{}", e.detail);
+    assert!(
+        e.detail.contains(
+            "\n@@ -12,7 +12,11 @@\n  \"VolumeName\": \"\",\n  \"StorageClassName\": null,\n  \"VolumeMode\": null,\n- \"DataSource\": null,\n+ \"DataSource\": {\n+  \"APIGroup\": \"snapshot.storage.k8s.io\",\n+  \"Kind\": \"VolumeSnapshot\",\n+  \"Name\": \"s\"\n+ },\n  \"DataSourceRef\": null,\n  \"VolumeAttributesClassName\": null\n }\n"
+        ),
+        "{}",
+        e.detail
+    );
+}
