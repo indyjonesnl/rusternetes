@@ -1961,6 +1961,24 @@ impl<S: Storage + 'static> JobController<S> {
                 });
         let is_failed = early_failed || deadline_exceeded || index_failed;
 
+        // `job_controller.go:970-973`: when no scenario finished the Job and
+        // the deadline has not passed, `jm.queue.AddAfter(key,
+        // activeDeadlineSeconds - Since(startTime))` so the deadline fires on
+        // time. Goes through `request_requeue` (clamped to SyncJobBatchPeriod).
+        if !early_failed && !deadline_exceeded && persisted_success.is_none() && !job_suspended {
+            if let Some((deadline, start)) = job
+                .spec
+                .active_deadline_seconds
+                .zip(job.status.as_ref().and_then(|s| s.start_time))
+            {
+                let remaining = chrono::Duration::seconds(deadline)
+                    - chrono::Utc::now().signed_duration_since(start);
+                if let Ok(remaining) = remaining.to_std() {
+                    self.request_requeue(namespace, name, remaining);
+                }
+            }
+        }
+
         // Check if Job is complete
         // For indexed jobs, check number of distinct succeeded indexes
         let is_complete = !is_failed
