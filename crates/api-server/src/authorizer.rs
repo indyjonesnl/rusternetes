@@ -8,7 +8,8 @@
 //! all-in-one binary) call [`build_authorizer`] so they cannot diverge (#2679).
 
 use rusternetes_common::authz::{
-    superuser_then, AlwaysAllowAuthorizer, Authorizer, AuthzStorage, NodeAuthorizer, RBACAuthorizer,
+    superuser_then, AlwaysAllowAuthorizer, AlwaysDenyAuthorizer, Authorizer, AuthzStorage,
+    NodeAuthorizer, RBACAuthorizer,
 };
 use std::sync::Arc;
 
@@ -33,38 +34,85 @@ pub const AUTHORIZATION_MODE_CHOICES: [&str; 6] = [
 /// binaries (#2854).
 #[derive(clap::Args, Debug, Clone, Default)]
 pub struct AuthorizationArgs {
+    /// Ordered list of plug-ins to do authorization on secure port.
+    /// Comma-delimited list of: AlwaysAllow,AlwaysDeny,ABAC,Webhook,RBAC,Node
+    /// (`AddFlags`, authorization.go:166-168). Defaults to Node,RBAC.
     #[arg(long = "authorization-mode", value_delimiter = ',')]
     pub authorization_mode: Vec<String>,
 }
 
 /// `IsValidAuthorizationMode` (modes.go:41).
-pub fn is_valid_authorization_mode(_mode: &str) -> bool {
-    todo!()
+pub fn is_valid_authorization_mode(mode: &str) -> bool {
+    AUTHORIZATION_MODE_CHOICES.contains(&mode)
 }
 
-/// `BuiltInAuthorizationOptions.Complete`.
-pub fn complete_authorization_modes(_modes: &[String]) -> Vec<String> {
-    todo!()
+/// `BuiltInAuthorizationOptions.Complete`
+/// (pkg/kubeapiserver/options/authorization.go:88-96).
+///
+/// Deliberate deviation: upstream defaults an empty list to `AlwaysAllow`;
+/// rusternetes keeps its established `Node,RBAC` default (what kubeadm sets
+/// for a real cluster, and what #1664/#2679 rely on).
+pub fn complete_authorization_modes(modes: &[String]) -> Vec<String> {
+    if modes.is_empty() {
+        return vec![MODE_NODE.to_string(), MODE_RBAC.to_string()];
+    }
+    modes.to_vec()
 }
 
-/// `BuiltInAuthorizationOptions.Validate`.
-pub fn validate_authorization_modes(_modes: &[String]) -> Vec<String> {
-    todo!()
+/// `BuiltInAuthorizationOptions.Validate`, legacy-flag branch
+/// (authorization.go:123-152). ABAC/Webhook-specific checks (policy file,
+/// webhook config file) arrive with those modes' flags.
+pub fn validate_authorization_modes(modes: &[String]) -> Vec<String> {
+    let mut errs = Vec::new();
+    if modes.is_empty() {
+        errs.push("at least one authorization-mode must be passed".to_string());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for mode in modes {
+        if !is_valid_authorization_mode(mode) {
+            errs.push(format!("authorization-mode {mode:?} is not a valid mode"));
+        }
+        seen.insert(mode.as_str());
+    }
+    if seen.len() != modes.len() {
+        // Go's %q of a []string prints `["a" "b"]`.
+        let quoted: Vec<String> = modes.iter().map(|m| format!("{m:?}")).collect();
+        errs.push(format!(
+            "authorization-mode [{}] has mode specified more than once",
+            quoted.join(" ")
+        ));
+    }
+    errs
 }
 
-/// Build the authorizer chain.
+/// Build the authorizer chain: `AlwaysAllow` when `skip_auth`, otherwise the
+/// `system:masters` superuser authorizer first (reload.go:97-99) followed by
+/// the configured `modes` in order (reload.go:101-176), after Complete and
+/// Validate. ABAC and Webhook are valid upstream modes not yet implemented.
 pub fn build_authorizer<S: AuthzStorage + 'static>(
     storage: Arc<S>,
     skip_auth: bool,
     modes: &[String],
 ) -> anyhow::Result<Arc<dyn Authorizer>> {
-    let _ = modes;
+    let modes = complete_authorization_modes(modes);
+    let errs = validate_authorization_modes(&modes);
+    if !errs.is_empty() {
+        anyhow::bail!("invalid authorization options: {}", errs.join("; "));
+    }
     if skip_auth {
         return Ok(Arc::new(AlwaysAllowAuthorizer));
     }
-    let node: Arc<dyn Authorizer> = Arc::new(NodeAuthorizer);
-    let rbac: Arc<dyn Authorizer> = Arc::new(RBACAuthorizer::new(storage));
-    Ok(Arc::new(superuser_then(vec![node, rbac])))
+    let mut chain: Vec<Arc<dyn Authorizer>> = Vec::new();
+    for mode in &modes {
+        match mode.as_str() {
+            MODE_NODE => chain.push(Arc::new(NodeAuthorizer)),
+            MODE_ALWAYS_ALLOW => chain.push(Arc::new(AlwaysAllowAuthorizer)),
+            MODE_ALWAYS_DENY => chain.push(Arc::new(AlwaysDenyAuthorizer)),
+            MODE_RBAC => chain.push(Arc::new(RBACAuthorizer::new(storage.clone()))),
+            other => anyhow::bail!("authorization-mode {other} is not supported yet"),
+        }
+    }
+    Ok(Arc::new(superuser_then(chain)))
 }
 
 #[cfg(test)]
