@@ -307,4 +307,86 @@ mod tests {
         m.set_up().await.unwrap();
         assert_eq!(mode(&f), 0o660, "Always walks");
     }
+
+    fn bare_pod() -> Pod {
+        serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "u"},
+            "spec": {"containers": []}
+        }))
+        .unwrap()
+    }
+
+    /// `SetUpAt` reads `mounterArgs.FsGroup` (`local.go:620-624`), never the
+    /// pod: `operation_generator.go:582-589` is the only place the pod's
+    /// fsGroup reaches a mounter (#2900).
+    #[tokio::test]
+    async fn set_up_reads_fs_group_from_mounter_args_not_the_pod() {
+        let d = tmp("args-fsgroup");
+        let f = d.join("f");
+        std::fs::write(&f, b"x").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let gid = std::fs::metadata(&d).unwrap().gid() as i64;
+        let v = claimed();
+        let pv = pv_local(d.to_str().unwrap());
+        let s = Spec {
+            volume: &v,
+            persistent_volume: Some(&pv),
+            read_only: false,
+        };
+        // Pod has no fsGroup; the args do.
+        let m = plugin().new_mounter(&s, &bare_pod()).await.unwrap();
+        m.set_up_with(&crate::volume_plugins::MounterArgs {
+            fs_group: Some(gid),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(mode(&f), 0o660);
+        // Pod has an fsGroup; empty args must not apply it.
+        let f2 = d.join("g");
+        std::fs::write(&f2, b"x").unwrap();
+        std::fs::set_permissions(&f2, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let m = plugin().new_mounter(&s, &pod(gid, None)).await.unwrap();
+        m.set_up().await.unwrap();
+        assert_eq!(
+            mode(&f2),
+            0o400,
+            "pod fsGroup must not leak past MounterArgs"
+        );
+    }
+
+    /// `mounterArgs.FSGroupChangePolicy` (`local.go:621`) comes from the args.
+    #[tokio::test]
+    async fn set_up_reads_change_policy_from_mounter_args() {
+        let d = tmp("args-policy");
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o2770)).unwrap();
+        let f = d.join("f");
+        std::fs::write(&f, b"x").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let gid = std::fs::metadata(&d).unwrap().gid() as i64;
+        let v = claimed();
+        let pv = pv_local(d.to_str().unwrap());
+        let s = Spec {
+            volume: &v,
+            persistent_volume: Some(&pv),
+            read_only: false,
+        };
+        let m = plugin().new_mounter(&s, &bare_pod()).await.unwrap();
+        m.set_up_with(&crate::volume_plugins::MounterArgs {
+            fs_group: Some(gid),
+            fs_group_change_policy: Some("OnRootMismatch".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(mode(&f), 0o600, "OnRootMismatch + matching root: no walk");
+        m.set_up_with(&crate::volume_plugins::MounterArgs {
+            fs_group: Some(gid),
+            fs_group_change_policy: Some("Always".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(mode(&f), 0o660, "Always walks");
+    }
 }
