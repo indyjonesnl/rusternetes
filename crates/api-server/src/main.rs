@@ -25,6 +25,7 @@ mod flow_control_object_count;
 mod flow_control_queueset;
 #[allow(dead_code)]
 mod flow_control_stats_poller;
+mod flow_control_watch_tracker;
 #[allow(dead_code)]
 mod flow_control_work_estimator;
 mod gnostic;

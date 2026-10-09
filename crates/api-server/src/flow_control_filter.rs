@@ -23,16 +23,14 @@
 //!
 //! DELIBERATE DEVIATIONS (each tracked as an issue):
 //!
-//! - Watch initialization signal. Upstream holds a watch's seat until the
-//!   storage layer signals that the initial events were sent
-//!   (`watchInitializationSignal`, :153-262). No such signal reaches our watch
-//!   handlers, so the seat is held until the handler has returned the response
-//!   (headers ready), after which the body streams without a seat. A watch is
-//!   still classified, costed (`watch` is estimated like a list under
-//!   `WatchList`) and queued/rejected like any other request. (#2808)
-//! - No `RegisterWatch`/`ObservedWatch` registration (`watch_tracker.go`): the
-//!   estimator's interested-watcher count is always 0. (#2775 covers the
-//!   estimator input; #2808 the tracker.)
+//! - Watch initialization signal and `RegisterWatch` (#2808) are ported:
+//!   `serve_watch` holds the seat until `watch_initialized()` fires (the watch
+//!   handlers call it once the initial state is read and the live stream is
+//!   open, `watch_snapshot`) or the handler returns, and keeps the watch
+//!   registered with the `WatchTracker` until the response body is dropped.
+//!   The tracker feeds the estimator's interested-watcher count. Remaining
+//!   gap: a watch handler that never reaches `watch_snapshot` frees its seat
+//!   only when it returns.
 //! - Object counts come from `flow_control_stats_poller` (the
 //!   `Store.startObservingCount` port) for a fixed table of built-in
 //!   resources; custom resources are not observed, so their lists report
@@ -50,15 +48,20 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
+use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{header::RETRY_AFTER, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use futures::StreamExt;
 use rusternetes_storage::{Storage, StorageBackend};
 
 use crate::audit::request_info;
-use crate::flow_control::{Classification, FlowControlEngine, RequestDigest};
+use crate::flow_control::{Classification, FlowControlEngine, FlowControlPermit, RequestDigest};
 use crate::flow_control_object_count::ObjectCountTracker;
+use crate::flow_control_watch_tracker::{
+    scope_signal, ForgetWatch, InitializationSignal, WatchTracker,
+};
 use crate::flow_control_work_estimator::{RequestInfo, WorkEstimator, WorkEstimatorConfig};
 
 /// `ResponseHeaderMatchedPriorityLevelConfigurationUID`
@@ -274,6 +277,7 @@ pub struct ApfFilter<S: Storage> {
     object_counts: Arc<ObjectCountTracker>,
     dropped: DroppedRequestsTracker,
     default_wait_limit: Duration,
+    watch_tracker: Arc<WatchTracker>,
 }
 
 impl<S: Storage + 'static> ApfFilter<S> {
@@ -281,11 +285,16 @@ impl<S: Storage + 'static> ApfFilter<S> {
     pub fn new(engine: Arc<FlowControlEngine<S>>, default_wait_limit: Duration) -> Self {
         let max_seats_engine = engine.clone();
         let object_counts = Arc::new(ObjectCountTracker::new());
+        // The estimator's `watchCountGetter` is
+        // `FlowControl.GetInterestedWatchCount` (server/config.go:1025); the
+        // tracker is the controller's `NewWatchTracker()`
+        // (apf_controller.go:289).
+        let watch_tracker = Arc::new(WatchTracker::new());
+        let counting_tracker = watch_tracker.clone();
         let estimator = WorkEstimator::new(
             // `c.StorageObjectCountTracker.Get` (server/config.go:1025).
             object_counts.stats_getter(),
-            // No watch tracker yet (#2808).
-            Box::new(|_| 0),
+            Box::new(move |info| counting_tracker.get_interested_watch_count(Some(info))),
             WorkEstimatorConfig::default(),
             Box::new(move |pl| max_seats_engine.max_seats(pl)),
         );
@@ -295,6 +304,7 @@ impl<S: Storage + 'static> ApfFilter<S> {
             object_counts,
             dropped: DroppedRequestsTracker::default(),
             default_wait_limit,
+            watch_tracker,
         }
     }
 
@@ -302,6 +312,17 @@ impl<S: Storage + 'static> ApfFilter<S> {
     /// are run against it at startup.
     pub fn object_count_tracker(&self) -> Arc<ObjectCountTracker> {
         self.object_counts.clone()
+    }
+
+    #[cfg(test)]
+    fn watch_count_for_test(&self, info: &RequestInfo) -> i64 {
+        self.estimator.watch_count(info)
+    }
+
+    /// The `WatchTracker` the filter registers watches with.
+    #[cfg(test)]
+    pub fn watch_tracker(&self) -> &Arc<WatchTracker> {
+        &self.watch_tracker
     }
 }
 
@@ -334,6 +355,69 @@ fn too_many_requests(retry_after: i64) -> Response {
         HeaderValue::from_str(&retry_after.to_string()).expect("digits are a valid header"),
     );
     r
+}
+
+/// A response body that keeps a watch registered with the [`WatchTracker`]
+/// until the body is dropped, i.e. until the watch is over.
+fn forget_watch_with_body(resp: Response, forget: ForgetWatch) -> Response {
+    let (parts, body) = resp.into_parts();
+    let stream = body.into_data_stream().map(move |chunk| {
+        // Moved into the closure so it lives exactly as long as the stream.
+        let _registered = &forget;
+        chunk
+    });
+    Response::from_parts(parts, Body::from_stream(stream))
+}
+
+/// The watch branch of `Handle` (priority-and-fairness.go:171-290), given the
+/// seat `execute()` runs under.
+///
+/// Upstream runs `execute` (register the watch, then wait for the
+/// initialization signal while holding the seat) on a goroutine beside the
+/// handler. Here one task drives the handler future and, as soon as the
+/// signal fires, frees the seat while the handler carries on. The deferred
+/// `watchInitializationSignal.Signal()` (:186-190) is the handler returning
+/// without ever signalling: the seat is released then. `forgetWatch` runs when
+/// the watch is over, which is when the response body is dropped (or at once
+/// if the handler produced no body worth tracking).
+async fn serve_watch<S: Storage + 'static>(
+    f: &ApfFilter<S>,
+    attrs: &crate::audit::Attributes,
+    req: Request,
+    next: Next,
+    permit: FlowControlPermit,
+) -> Response {
+    let info = RequestInfo {
+        verb: attrs.verb.clone(),
+        api_group: attrs.api_group.clone(),
+        resource: attrs.resource.clone(),
+        subresource: attrs.subresource.clone(),
+        namespace: attrs.namespace.clone(),
+        name: attrs.name.clone(),
+    };
+    // `forgetWatch = h.fcIfc.RegisterWatch(r)` (:211)
+    let forget = f
+        .watch_tracker
+        .register_watch(&info, req.uri().query().unwrap_or(""));
+
+    let signal = InitializationSignal::new();
+    let handler = scope_signal(signal.clone(), next.run(req));
+    tokio::pin!(handler);
+    let mut permit = Some(permit);
+    let resp = tokio::select! {
+        resp = &mut handler => resp,
+        // `watchInitializationSignal.Wait()` returned (:218): the request is
+        // finished from the APF point of view.
+        _ = signal.wait() => {
+            permit.take();
+            handler.await
+        }
+    };
+    drop(permit);
+    match forget {
+        Some(forget) => forget_watch_with_body(resp, forget),
+        None => resp,
+    }
 }
 
 /// `priorityAndFairnessHandler.Handle` (priority-and-fairness.go:73-323).
@@ -382,6 +466,7 @@ pub async fn priority_and_fairness<S: Storage + 'static>(
             api_group: attrs.api_group.clone(),
             resource: attrs.resource.clone(),
             subresource: attrs.subresource.clone(),
+            namespace: attrs.namespace.clone(),
             name: attrs.name.clone(),
         }),
         req.uri().query().unwrap_or(""),
@@ -396,10 +481,14 @@ pub async fn priority_and_fairness<S: Storage + 'static>(
         .await
     {
         Ok(permit) => {
-            // The seat is held while the handler runs and released on drop; for
-            // a watch that is until the response is ready (see module docs).
-            let mut resp = next.run(req).await;
-            drop(permit);
+            let mut resp = if is_watch {
+                serve_watch(&f, &attrs, req, next, permit).await
+            } else {
+                // The seat is held while the handler runs and released on drop.
+                let resp = next.run(req).await;
+                drop(permit);
+                resp
+            };
             // `Handle`'s deferred `if idle { maybeReap(pl.Name) }`
             // (apf_filter.go:171-177); `maybe_reap` re-checks that the level
             // is quiescing and its queueset idle.
@@ -1014,5 +1103,155 @@ mod tests {
             },
         );
         assert!(cost(&filter) > 1, "a large polled resource costs more");
+    }
+
+    // ---- watch initialization + RegisterWatch (priority-and-fairness.go:171-290) ----
+
+    /// A router whose watch route optionally signals initialization, then
+    /// keeps the handler alive until `gate` fires (a watch that has sent its
+    /// initial events and is still being served).
+    async fn watch_app(
+        gate: Arc<Notify>,
+        initialized: bool,
+    ) -> (Router, Arc<ApfFilter<MemoryStorage>>) {
+        let engine = Arc::new(FlowControlEngine::with_limits(
+            Arc::new(MemoryStorage::new()),
+            1,
+            0,
+        ));
+        engine.initialize().await.unwrap();
+        let filter = Arc::new(ApfFilter::new(engine, Duration::from_millis(50)));
+        let ctx = rusternetes_middleware::AuthContext { user: bob() };
+        let router = Router::new()
+            .route(
+                "/api/v1/watch/namespaces",
+                get(move || {
+                    let gate = gate.clone();
+                    async move {
+                        if initialized {
+                            crate::flow_control_watch_tracker::watch_initialized();
+                        }
+                        gate.notified().await;
+                        "w"
+                    }
+                }),
+            )
+            .route("/api/v1/namespaces/default", get(|| async { "ok" }))
+            .layer(from_fn_with_state(
+                filter.clone(),
+                priority_and_fairness::<MemoryStorage>,
+            ))
+            .layer(axum::middleware::from_fn(
+                move |mut req: axum::extract::Request, next: Next| {
+                    let ctx = ctx.clone();
+                    async move {
+                        req.extensions_mut().insert(ctx);
+                        next.run(req).await
+                    }
+                },
+            ));
+        (router, filter)
+    }
+
+    fn create_namespace_info() -> RequestInfo {
+        RequestInfo {
+            verb: "create".into(),
+            resource: "namespaces".into(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_watch_releases_its_seat_when_initialized_not_when_it_returns() {
+        // The seat is held "until the request is finished from the APF point
+        // of view (which is when its initialization is done)" (:217-218).
+        let gate = Arc::new(Notify::new());
+        let (app, _) = watch_app(gate.clone(), true).await;
+        let a = app.clone();
+        let watch =
+            tokio::spawn(async move { a.oneshot(get_req("/api/v1/watch/namespaces")).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // One seat on `catch-all`, and the watch is still being served: a
+        // second request is admitted because the watch finished initializing.
+        let resp = app
+            .clone()
+            .oneshot(get_req("/api/v1/namespaces/default"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        gate.notify_one();
+        let _ = watch.await;
+    }
+
+    #[tokio::test]
+    async fn an_uninitialized_watch_keeps_its_seat_until_the_handler_returns() {
+        // The deferred `watchInitializationSignal.Signal()` (:186-190) only
+        // fires once the handler is done, so until then the seat is held.
+        let gate = Arc::new(Notify::new());
+        let (app, _) = watch_app(gate.clone(), false).await;
+        let a = app.clone();
+        let watch =
+            tokio::spawn(async move { a.oneshot(get_req("/api/v1/watch/namespaces")).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let resp = app
+            .clone()
+            .oneshot(get_req("/api/v1/namespaces/default"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        gate.notify_one();
+        let _ = watch.await;
+    }
+
+    #[tokio::test]
+    async fn a_watch_is_registered_until_its_response_is_dropped() {
+        // `forgetWatch` runs when the watch is over (:196-198), not when the
+        // response head is ready.
+        let gate = Arc::new(Notify::new());
+        gate.notify_one(); // let the handler return its response right away
+        let (app, filter) = watch_app(gate, true).await;
+        let create = create_namespace_info();
+        assert_eq!(
+            filter
+                .watch_tracker()
+                .get_interested_watch_count(Some(&create)),
+            0
+        );
+        let resp = app
+            .oneshot(get_req("/api/v1/watch/namespaces"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            filter
+                .watch_tracker()
+                .get_interested_watch_count(Some(&create)),
+            1,
+            "registered while the body is alive"
+        );
+        drop(resp);
+        assert_eq!(
+            filter
+                .watch_tracker()
+                .get_interested_watch_count(Some(&create)),
+            0,
+            "forgotten when the watch ends"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_estimator_sees_the_tracked_watches() {
+        // #2775: the work estimator's watch count getter reads the tracker.
+        let gate = Arc::new(Notify::new());
+        gate.notify_one();
+        let (app, filter) = watch_app(gate, true).await;
+        let resp = app
+            .oneshot(get_req("/api/v1/watch/namespaces"))
+            .await
+            .unwrap();
+        let info = create_namespace_info();
+        assert_eq!(filter.watch_count_for_test(&info), 1);
+        drop(resp);
+        assert_eq!(filter.watch_count_for_test(&info), 0);
     }
 }

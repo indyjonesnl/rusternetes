@@ -380,6 +380,14 @@ pub fn snapshot_resource_version(snapshot: &[serde_json::Value]) -> Option<u64> 
         .max()
 }
 
+/// `utilflowcontrol.WatchInitialized(ctx)`: the live stream is open and the
+/// initial state is read, which is `cacheWatcher.process` starting
+/// (`cacher/cache_watcher.go:527`). Tells API Priority and Fairness the watch
+/// is initialized so it frees the seat the watch was admitted under.
+fn signal_watch_initialized() {
+    crate::flow_control_watch_tracker::watch_initialized();
+}
+
 /// (Named `watch_snapshot`, not `list_*`: this is the WATCH path, whose start
 /// revision legitimately IS the store revision -- see
 /// `list_resource_version_floor_guard_test`.)
@@ -406,12 +414,14 @@ pub async fn watch_snapshot(
                 .list_at_revision::<serde_json::Value>(prefix, rev)
                 .await
             {
+                signal_watch_initialized();
                 return Ok((list, Some(rev as u64)));
             }
         }
     }
     let list: Vec<serde_json::Value> = state.storage.list(prefix).await?;
     let cutoff = snapshot_resource_version(&list);
+    signal_watch_initialized();
     Ok((list, cutoff))
 }
 

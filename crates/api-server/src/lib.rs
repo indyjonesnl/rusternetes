@@ -17,6 +17,7 @@ pub mod flow_control_filter;
 pub mod flow_control_object_count;
 pub mod flow_control_queueset;
 pub mod flow_control_stats_poller;
+pub mod flow_control_watch_tracker;
 pub mod flow_control_work_estimator;
 pub mod gnostic;
 pub mod handlers;

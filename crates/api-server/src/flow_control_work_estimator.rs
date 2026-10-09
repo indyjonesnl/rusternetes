@@ -34,6 +34,7 @@ pub struct RequestInfo {
     pub api_group: String,
     pub resource: String,
     pub subresource: String,
+    pub namespace: String,
     pub name: String,
 }
 
@@ -158,6 +159,12 @@ impl WorkEstimator {
             config,
             max_seats_fn,
         }
+    }
+
+    /// The interested-watcher count the mutating estimator would use.
+    #[cfg(test)]
+    pub(crate) fn watch_count(&self, info: &RequestInfo) -> i64 {
+        (self.watch_count_getter)(info)
     }
 
     /// `workEstimator.estimate` (width.go:107). `query` is `r.URL.RawQuery`.
@@ -608,6 +615,7 @@ mod tests {
                 resource: c.info.2.into(),
                 name: c.info.3.into(),
                 subresource: c.info.4.into(),
+                ..Default::default()
             };
             let query = url::Url::parse(c.uri)
                 .ok()
