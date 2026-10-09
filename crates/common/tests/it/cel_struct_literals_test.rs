@@ -123,6 +123,38 @@ fn rejected_initializers_are_errors_not_panics() {
     }
 }
 
+/// MAP validation (`cel_env`) and evaluation (`cel_struct`) must agree: what
+/// the checker accepts evaluates, and its compile-time rejections are also
+/// rejected by evaluation.
+#[test]
+fn validation_and_evaluation_compose() {
+    use rusternetes_common::cel_env::{mutation_env_failure, ExpectedOutput, MutationEnv};
+    let env = MutationEnv {
+        has_params: false,
+        has_patch_types: true,
+        variables: None,
+    };
+    let check = |e: &str| mutation_env_failure(e, &env, ExpectedOutput::Any);
+    for ok in [
+        "Object{}",
+        "Object{spec: Object.spec{replicas: object.spec.replicas + 1}}",
+        r#"[JSONPatch{op: "add", path: "/spec/replicas", value: 3}]"#,
+        r#"JSONPatch{op: "remove", path: "/a"}"#,
+    ] {
+        assert_eq!(check(ok), None, "{ok}");
+        assert!(eval(ok).is_ok(), "{ok}");
+    }
+    for bad in ["Invalid{}", "JSONPatch{bogus: 1}"] {
+        assert!(check(bad).is_some(), "{bad}");
+        assert!(eval(bad).is_err(), "{bad}");
+    }
+    // The checker accepts these (upstream rejects them at evaluation time).
+    for rt in ["Object{spec: Object.status{}}", "JSONPatch{op: 1}"] {
+        assert_eq!(check(rt), None, "{rt}");
+        assert!(eval(rt).is_err(), "{rt}");
+    }
+}
+
 #[test]
 fn hostile_input_never_panics() {
     for expr in [
