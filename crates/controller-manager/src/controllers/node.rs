@@ -103,6 +103,9 @@ pub struct NodeController<S: Storage> {
     observed_conditions: Arc<std::sync::Mutex<ObservedConditions>>,
     eviction: EvictionConfig,
     evictor: Arc<tokio::sync::Mutex<Evictor>>,
+    /// Test-only shift of the controller's clock (`nc.now`, upstream's
+    /// injectable `now func() metav1.Time`).
+    clock_offset: Arc<std::sync::Mutex<Duration>>,
 }
 
 impl<S: Storage + 'static> NodeController<S> {
@@ -118,7 +121,22 @@ impl<S: Storage + 'static> NodeController<S> {
             observed_conditions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             eviction,
             evictor: Arc::new(tokio::sync::Mutex::new(Evictor::default())),
+            clock_offset: Arc::new(std::sync::Mutex::new(Duration::zero())),
         }
+    }
+
+    /// `nc.now()`: the controller's clock.
+    #[allow(dead_code)]
+    fn now(&self) -> DateTime<Utc> {
+        Utc::now() + *self.clock_offset.lock().unwrap()
+    }
+
+    /// Test helper: move the controller's clock forward, the way upstream's
+    /// tests advance `fakeNow`.
+    #[allow(dead_code)]
+    #[doc(hidden)]
+    pub fn advance_clock_for_test(&self, by: Duration) {
+        *self.clock_offset.lock().unwrap() += by;
     }
 
     /// Test helper: mark `node_name` as first seen long enough ago that the
@@ -2126,6 +2144,207 @@ mod tests {
             r.message.as_deref(),
             Some("Kubelet never posted node status.")
         );
+    }
+
+    // ------------------------------------------------------------------
+    // nodeHealthMap (#2973). Ported from
+    // pkg/controller/nodelifecycle/node_lifecycle_controller_test.go:
+    // TestMonitorNodeHealthUpdateStatus (:1010),
+    // TestMonitorNodeHealthUpdateNodeAndPodStatusWithLease (:1283) and
+    // TestTryUpdateNodeHealth (:3532). Impl: tryUpdateNodeHealth
+    // (node_lifecycle_controller.go:830-935): staleness is measured on the
+    // CONTROLLER's clock from when it last saw the heartbeat/lease change
+    // (`probeTimestamp`), never from the kubelet's own timestamps.
+    // ------------------------------------------------------------------
+
+    /// Create a node WITHOUT `seed_first_seen_for_test`: the controller has
+    /// never seen it, like a real first observation.
+    async fn put_raw(storage: &Arc<MemoryStorage>, n: &Node) {
+        let key = build_key("nodes", None, &n.metadata.name);
+        storage.create(&key, n).await.unwrap();
+    }
+
+    /// A Ready=True node whose kubelet clock is an hour behind ours.
+    fn skewed_node(name: &str, heartbeat: chrono::DateTime<Utc>) -> Node {
+        let hb = heartbeat.to_rfc3339();
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Node",
+            "metadata": {"name": name, "uid": format!("uid-{name}"),
+                "creationTimestamp": (Utc::now() - Duration::days(1)).to_rfc3339()},
+            "spec": {},
+            "status": {"conditions": [{
+                "type": "Ready", "status": "True",
+                "lastHeartbeatTime": hb, "lastTransitionTime": hb,
+            }]}
+        }))
+        .unwrap()
+    }
+
+    async fn ready_status(storage: &Arc<MemoryStorage>, name: &str) -> String {
+        let n: Node = storage.get(&build_key("nodes", None, name)).await.unwrap();
+        cond(&n.status.unwrap().conditions.unwrap(), "Ready")
+            .status
+            .clone()
+    }
+
+    async fn set_heartbeat(
+        storage: &Arc<MemoryStorage>,
+        name: &str,
+        heartbeat: chrono::DateTime<Utc>,
+    ) {
+        let key = build_key("nodes", None, name);
+        let mut n: Node = storage.get(&key).await.unwrap();
+        let c = n
+            .status
+            .as_mut()
+            .unwrap()
+            .conditions
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|c| c.condition_type == "Ready")
+            .unwrap();
+        c.last_heartbeat_time = Some(heartbeat);
+        storage.update_status(&key, &n).await.unwrap();
+    }
+
+    /// "Missing timestamp for Node. Assuming now as a timestamp" (:896): a
+    /// heartbeat that is old by the kubelet's clock is not held against the node
+    /// the first time the controller sees it.
+    #[tokio::test]
+    async fn first_observation_assumes_now_so_clock_skew_is_irrelevant() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::new(storage.clone());
+        let node = skewed_node("n1", Utc::now() - Duration::hours(1));
+        put_raw(&storage, &node).await;
+        c.monitor_node_health().await.unwrap();
+        assert_eq!(ready_status(&storage, "n1").await, "True");
+        // ...but it is held against it once nodeMonitorGracePeriod passes with
+        // no new heartbeat observed.
+        c.advance_clock_for_test(Duration::seconds(NODE_MONITOR_GRACE_PERIOD_SECONDS + 1));
+        c.monitor_node_health().await.unwrap();
+        assert_eq!(ready_status(&storage, "n1").await, "Unknown");
+    }
+
+    /// A heartbeat VALUE that changed since last observed refreshes
+    /// probeTimestamp (:906-919), however skewed its absolute time is.
+    #[tokio::test]
+    async fn changed_heartbeat_refreshes_probe_timestamp() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::new(storage.clone());
+        let hb = Utc::now() - Duration::hours(1);
+        put_raw(&storage, &skewed_node("n1", hb)).await;
+        c.monitor_node_health().await.unwrap();
+        c.advance_clock_for_test(Duration::seconds(30));
+        set_heartbeat(&storage, "n1", hb + Duration::seconds(10)).await;
+        c.monitor_node_health().await.unwrap();
+        // 60s after the first look, but only 30s after the heartbeat moved.
+        c.advance_clock_for_test(Duration::seconds(30));
+        c.monitor_node_health().await.unwrap();
+        assert_eq!(ready_status(&storage, "n1").await, "True");
+    }
+
+    fn lease_at(name: &str, renew: chrono::DateTime<Utc>) -> Lease {
+        use rusternetes_common::resources::LeaseSpec;
+        Lease {
+            type_meta: TypeMeta {
+                kind: "Lease".to_string(),
+                api_version: "coordination.k8s.io/v1".to_string(),
+            },
+            metadata: ObjectMeta::new(name).with_namespace("kube-node-lease"),
+            spec: Some(LeaseSpec {
+                holder_identity: Some(name.to_string()),
+                lease_duration_seconds: Some(40),
+                acquire_time: Some(renew),
+                renew_time: Some(renew),
+                lease_transitions: Some(0),
+                preferred_holder: None,
+                strategy: None,
+            }),
+        }
+    }
+
+    /// `savedLease.Spec.RenewTime.Before(observedLease.Spec.RenewTime)` (:925):
+    /// a lease renewal that moved refreshes the probe; the saved lease is what
+    /// is compared, not the lease's own clock.
+    #[tokio::test]
+    async fn lease_renewal_observed_later_refreshes_probe_timestamp() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::new(storage.clone());
+        let t0 = Utc::now() - Duration::hours(1);
+        put_raw(&storage, &skewed_node("n1", t0)).await;
+        let lkey = build_key("leases", Some("kube-node-lease"), "n1");
+        storage.create(&lkey, &lease_at("n1", t0)).await.unwrap();
+        c.monitor_node_health().await.unwrap();
+        c.advance_clock_for_test(Duration::seconds(30));
+        storage
+            .update(&lkey, &lease_at("n1", t0 + Duration::seconds(10)))
+            .await
+            .unwrap();
+        c.monitor_node_health().await.unwrap();
+        c.advance_clock_for_test(Duration::seconds(30));
+        c.monitor_node_health().await.unwrap();
+        assert_eq!(ready_status(&storage, "n1").await, "True");
+    }
+
+    /// Same lease renewTime, stale heartbeat: nothing moved, so after the grace
+    /// period the node goes Unknown (:1675 "status ... exceeds grace period.
+    /// Node lease is also expired").
+    #[tokio::test]
+    async fn unmoved_lease_does_not_refresh_probe_timestamp() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::new(storage.clone());
+        let t0 = Utc::now() - Duration::hours(1);
+        put_raw(&storage, &skewed_node("n1", t0)).await;
+        let lkey = build_key("leases", Some("kube-node-lease"), "n1");
+        storage.create(&lkey, &lease_at("n1", t0)).await.unwrap();
+        c.monitor_node_health().await.unwrap();
+        c.advance_clock_for_test(Duration::seconds(NODE_MONITOR_GRACE_PERIOD_SECONDS + 1));
+        c.monitor_node_health().await.unwrap();
+        assert_eq!(ready_status(&storage, "n1").await, "Unknown");
+    }
+
+    /// `gracePeriod = nc.nodeStartupGracePeriod` (:842) for a node that never
+    /// posted Ready, measured from `node.CreationTimestamp` (:843-849):
+    /// "Node created recently, without status" (:1300) is left alone.
+    #[tokio::test]
+    async fn node_without_status_gets_startup_grace_from_creation_timestamp() {
+        let created = (Utc::now() - Duration::seconds(50)).to_rfc3339();
+        let node: Node = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Node",
+            "metadata": {"name": "n1", "creationTimestamp": created},
+            "spec": {}
+        }))
+        .unwrap();
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::new(storage.clone());
+        put_raw(&storage, &node).await;
+        c.monitor_node_health().await.unwrap();
+        let got: Node = storage.get(&build_key("nodes", None, "n1")).await.unwrap();
+        assert!(
+            got.status.and_then(|s| s.conditions).is_none(),
+            "inside nodeStartupGracePeriod nothing is posted"
+        );
+        c.advance_clock_for_test(Duration::seconds(NODE_STARTUP_GRACE_PERIOD_SECS as i64));
+        c.monitor_node_health().await.unwrap();
+        assert_eq!(ready_status(&storage, "n1").await, "Unknown");
+    }
+
+    /// #2974: the kubelet renews its own Lease (pkg/kubelet/nodelease). The
+    /// controller must not, or a dead kubelet looks alive forever.
+    #[tokio::test]
+    async fn controller_does_not_renew_the_node_lease() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::new(storage.clone());
+        let t0 = (Utc::now() - Duration::seconds(300)).timestamp();
+        let t0 = chrono::DateTime::<Utc>::from_timestamp(t0, 0).unwrap();
+        put_raw(&storage, &skewed_node("n1", t0)).await;
+        let lkey = build_key("leases", Some("kube-node-lease"), "n1");
+        storage.create(&lkey, &lease_at("n1", t0)).await.unwrap();
+        c.seed_first_seen_for_test("n1");
+        c.reconcile_all().await.unwrap();
+        let l: Lease = storage.get(&lkey).await.unwrap();
+        assert_eq!(l.spec.unwrap().renew_time, Some(t0));
     }
 
     // ------------------------------------------------------------------
