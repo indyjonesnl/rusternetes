@@ -7408,4 +7408,151 @@ mod tests {
         let got: Job = storage.get(key).await.unwrap();
         assert!(cond_of(&got, "Complete").is_some(), "{:?}", got.status);
     }
+
+    // ---- #2841: one finishedCondition, upstream's evaluation order ----
+    //
+    // syncJob (job_controller.go:945-998) evaluates, in order: pre-existing
+    // SuccessCriteriaMet / FailureTarget, podFailurePolicy, backoffLimit,
+    // pastActiveDeadline (:1596-1604, `duration >= allowedDuration`),
+    // maxFailedIndexes, failedIndexes, successPolicy.
+
+    const DEADLINE_MSG: &str = "Job was active longer than specified deadline";
+
+    async fn run_finished(job: Job, pods: Vec<Pod>) -> Job {
+        let storage = Arc::new(MemoryStorage::new());
+        let name = job.metadata.name.clone();
+        let key = format!("/registry/jobs/default/{name}");
+        storage.create(&key, &job).await.unwrap();
+        for p in pods {
+            storage
+                .create(&format!("/registry/pods/default/{}", p.metadata.name), &p)
+                .await
+                .unwrap();
+        }
+        let c = JobController::new(storage.clone());
+        reconcile_settled(&c, &storage, &key).await;
+        storage.get(&key).await.unwrap()
+    }
+
+    fn indexed_failing_job(name: &str, completions: i32) -> Job {
+        let mut job = make_job(name, "default", completions, completions);
+        job.spec.completion_mode = Some("Indexed".to_string());
+        job.spec.backoff_limit_per_index = Some(0);
+        job
+    }
+
+    /// job_controller_test.go:2569 "activeDeadlineSeconds times-out before any
+    /// pod starts": startTime == activeDeadlineSeconds already fails, because
+    /// pastActiveDeadline is `duration >= allowedDuration` (:1601).
+    #[tokio::test]
+    async fn deadline_fires_when_elapsed_equals_deadline() {
+        let mut job = make_job("dle", "default", 1, 1);
+        job.spec.active_deadline_seconds = Some(10);
+        job.status = Some(JobStatus {
+            start_time: Some(chrono::Utc::now() - chrono::Duration::seconds(10)),
+            ..Default::default()
+        });
+        let got = run_finished(job, vec![]).await;
+        let failed = cond_of(&got, "Failed").expect("Failed at elapsed == deadline");
+        assert_eq!(failed.reason.as_deref(), Some("DeadlineExceeded"));
+        assert_eq!(failed.message.as_deref(), Some(DEADLINE_MSG));
+    }
+
+    /// `newFailureCondition(JobReasonDeadlineExceeded, "Job was active longer
+    /// than specified deadline")` (job_controller.go:974), verbatim.
+    #[tokio::test]
+    async fn deadline_message_is_upstreams() {
+        let mut job = make_job("dlm", "default", 1, 1);
+        job.spec.active_deadline_seconds = Some(1);
+        job.status = Some(JobStatus {
+            start_time: Some(chrono::Utc::now() - chrono::Duration::seconds(60)),
+            ..Default::default()
+        });
+        let got = run_finished(job, vec![]).await;
+        let failed = cond_of(&got, "Failed").expect("Failed");
+        assert_eq!(failed.message.as_deref(), Some(DEADLINE_MSG));
+    }
+
+    /// pastActiveDeadline (:974) is evaluated before the per-index scenarios
+    /// (:975-985), which only run while finishedCondition is nil.
+    #[tokio::test]
+    async fn deadline_outranks_failed_indexes() {
+        let mut job = indexed_failing_job("dlf", 3);
+        job.spec.active_deadline_seconds = Some(1);
+        job.status = Some(JobStatus {
+            start_time: Some(chrono::Utc::now() - chrono::Duration::seconds(60)),
+            ..Default::default()
+        });
+        let pods = vec![
+            make_indexed_pod("f0", "default", Phase::Failed, "dlf", "job-uid-1", 0),
+            make_indexed_pod("s1", "default", Phase::Succeeded, "dlf", "job-uid-1", 1),
+            make_indexed_pod("s2", "default", Phase::Succeeded, "dlf", "job-uid-1", 2),
+        ];
+        let got = run_finished(job, pods).await;
+        let failed = cond_of(&got, "Failed").expect("Failed");
+        assert_eq!(failed.reason.as_deref(), Some("DeadlineExceeded"));
+    }
+
+    /// maxFailedIndexes is checked before failedIndexes (:975-985) and its
+    /// message is upstream's.
+    #[tokio::test]
+    async fn max_failed_indexes_is_checked_before_failed_indexes() {
+        let mut job = indexed_failing_job("mfi", 2);
+        job.spec.max_failed_indexes = Some(0);
+        let pods = vec![
+            make_indexed_pod("f0", "default", Phase::Failed, "mfi", "job-uid-1", 0),
+            make_indexed_pod("s1", "default", Phase::Succeeded, "mfi", "job-uid-1", 1),
+        ];
+        let got = run_finished(job, pods).await;
+        let failed = cond_of(&got, "Failed").expect("Failed");
+        assert_eq!(failed.reason.as_deref(), Some("MaxFailedIndexesExceeded"));
+        assert_eq!(
+            failed.message.as_deref(),
+            Some("Job has exceeded the specified maximal number of failed indexes")
+        );
+    }
+
+    /// failedIndexes message is upstream's constant "Job has failed indexes"
+    /// (:983), without the index list.
+    #[tokio::test]
+    async fn failed_indexes_message_is_upstreams() {
+        let job = indexed_failing_job("fim", 2);
+        let pods = vec![
+            make_indexed_pod("f0", "default", Phase::Failed, "fim", "job-uid-1", 0),
+            make_indexed_pod("s1", "default", Phase::Succeeded, "fim", "job-uid-1", 1),
+        ];
+        let got = run_finished(job, pods).await;
+        let failed = cond_of(&got, "Failed").expect("Failed");
+        assert_eq!(failed.reason.as_deref(), Some("FailedIndexes"));
+        assert_eq!(failed.message.as_deref(), Some("Job has failed indexes"));
+    }
+
+    /// The deadline is evaluated before successPolicy (:974 vs :988-994).
+    #[tokio::test]
+    async fn deadline_outranks_success_policy() {
+        let mut job = make_job("dsp", "default", 3, 3);
+        job.spec.completion_mode = Some("Indexed".to_string());
+        job.spec.active_deadline_seconds = Some(1);
+        job.spec.success_policy = Some(
+            serde_json::from_value(serde_json::json!({
+                "rules": [{ "succeededIndexes": "0" }]
+            }))
+            .unwrap(),
+        );
+        job.status = Some(JobStatus {
+            start_time: Some(chrono::Utc::now() - chrono::Duration::seconds(60)),
+            ..Default::default()
+        });
+        let pods = vec![make_indexed_pod(
+            "s0",
+            "default",
+            Phase::Succeeded,
+            "dsp",
+            "job-uid-1",
+            0,
+        )];
+        let got = run_finished(job, pods).await;
+        let failed = cond_of(&got, "Failed").expect("Failed");
+        assert_eq!(failed.reason.as_deref(), Some("DeadlineExceeded"));
+    }
 }
