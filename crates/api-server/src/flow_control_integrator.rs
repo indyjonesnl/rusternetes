@@ -44,21 +44,38 @@ pub struct Moments {
 }
 
 impl Moments {
-    /// `ConstantMoments`.
+    /// `ConstantMoments` (integrator.go:176).
     pub fn constant(dt: f64, x: f64) -> Moments {
-        let _ = (dt, x);
-        todo!()
+        Moments {
+            elapsed_seconds: dt,
+            integral_x: x * dt,
+            integral_xx: x * x * dt,
+        }
     }
 
-    /// `Add`: combine over two ranges of time.
+    /// `Add` (integrator.go:185): combine over two ranges of time.
     pub fn add(self, other: Moments) -> Moments {
-        let _ = other;
-        todo!()
+        Moments {
+            elapsed_seconds: self.elapsed_seconds + other.elapsed_seconds,
+            integral_x: self.integral_x + other.integral_x,
+            integral_xx: self.integral_xx + other.integral_xx,
+        }
     }
 
-    /// `AvgAndStdDev`.
+    /// `AvgAndStdDev` (integrator.go:203).
     pub fn avg_and_std_dev(self) -> (f64, f64) {
-        todo!()
+        if self.elapsed_seconds <= 0.0 {
+            return (f64::NAN, f64::NAN);
+        }
+        let avg = self.integral_x / self.elapsed_seconds;
+        // standard deviation is sqrt(average((x - xbar)^2))
+        //   = sqrt(Integral(x^2 dt)/Duration - xbar^2)
+        let variance = self.integral_xx / self.elapsed_seconds - avg * avg;
+        if variance >= 0.0 {
+            (avg, variance.sqrt())
+        } else {
+            (avg, f64::NAN)
+        }
     }
 }
 
@@ -70,6 +87,40 @@ struct State {
     max: f64,
 }
 
+impl State {
+    /// `updateLocked` (integrator.go:109).
+    fn update(&mut self, now: Duration) {
+        let dt = now.saturating_sub(self.last_time).as_secs_f64();
+        self.last_time = now;
+        self.moments = self.moments.add(Moments::constant(dt, self.x));
+    }
+
+    /// `setLocked` (integrator.go:98).
+    fn set(&mut self, now: Duration, x: f64) {
+        self.update(now);
+        self.x = x;
+        if x < self.min {
+            self.min = x;
+        }
+        if x > self.max {
+            self.max = x;
+        }
+    }
+
+    /// `getResultsLocked` (integrator.go:131).
+    fn results(&mut self, now: Duration) -> IntegratorResults {
+        self.update(now);
+        let (average, deviation) = self.moments.avg_and_std_dev();
+        IntegratorResults {
+            duration: self.moments.elapsed_seconds,
+            average,
+            deviation,
+            min: self.min,
+            max: self.max,
+        }
+    }
+}
+
 /// `integrator` (integrator.go:67).
 pub struct Integrator {
     clock: Arc<dyn Clock>,
@@ -77,31 +128,55 @@ pub struct Integrator {
 }
 
 impl Integrator {
-    /// `NewNamedIntegrator`.
+    /// `NewNamedIntegrator` (integrator.go:80).
     pub fn new(clock: Arc<dyn Clock>) -> Integrator {
-        let _ = clock;
-        todo!()
+        let now = clock.now();
+        Integrator {
+            clock,
+            state: Mutex::new(State {
+                last_time: now,
+                x: 0.0,
+                moments: Moments::default(),
+                min: 0.0,
+                max: 0.0,
+            }),
+        }
     }
 
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `Set` (integrator.go:88).
     pub fn set(&self, x: f64) {
-        let _ = (&self.state, x);
-        todo!()
+        let now = self.clock.now();
+        self.lock().set(now, x);
     }
 
+    /// `Add` (integrator.go:94).
     pub fn add(&self, delta_x: f64) {
-        let _ = delta_x;
-        todo!()
+        let now = self.clock.now();
+        let mut s = self.lock();
+        let x = s.x + delta_x;
+        s.set(now, x);
     }
 
+    /// `GetResults` (integrator.go:122).
     pub fn get_results(&self) -> IntegratorResults {
-        let _ = &self.clock;
-        todo!()
+        let now = self.clock.now();
+        self.lock().results(now)
     }
 
-    /// Return the results of integrating to now, and reset integration to
-    /// start now.
+    /// `Reset` (integrator.go:128): the results of integrating to now, and
+    /// reset integration to start now.
     pub fn reset(&self) -> IntegratorResults {
-        todo!()
+        let now = self.clock.now();
+        let mut s = self.lock();
+        let results = s.results(now);
+        s.moments = Moments::default();
+        s.min = s.x;
+        s.max = s.x;
+        results
     }
 }
 
