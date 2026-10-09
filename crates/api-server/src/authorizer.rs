@@ -7,10 +7,12 @@
 //! Both entry points (`main.rs` and `lib.rs::run`, the latter used by the
 //! all-in-one binary) call [`build_authorizer`] so they cannot diverge (#2679).
 
+use crate::abac::PolicyList;
 use rusternetes_common::authz::{
     superuser_then, AlwaysAllowAuthorizer, AlwaysDenyAuthorizer, Authorizer, AuthzStorage,
     NodeAuthorizer, RBACAuthorizer,
 };
+use std::path::Path;
 use std::sync::Arc;
 
 /// `--authorization-mode` values (`pkg/kubeapiserver/authorizer/modes/modes.go:22-35`).
@@ -39,6 +41,12 @@ pub struct AuthorizationArgs {
     /// (`AddFlags`, authorization.go:166-168). Defaults to Node,RBAC.
     #[arg(long = "authorization-mode", value_delimiter = ',')]
     pub authorization_mode: Vec<String>,
+
+    /// File with authorization policy in json line by line format, used with
+    /// --authorization-mode=ABAC, on the secure port (`AddFlags`,
+    /// authorization.go:176-177).
+    #[arg(long = "authorization-policy-file", default_value = "")]
+    pub authorization_policy_file: String,
 }
 
 /// `IsValidAuthorizationMode` (modes.go:41).
@@ -60,9 +68,9 @@ pub fn complete_authorization_modes(modes: &[String]) -> Vec<String> {
 }
 
 /// `BuiltInAuthorizationOptions.Validate`, legacy-flag branch
-/// (authorization.go:123-152). ABAC/Webhook-specific checks (policy file,
-/// webhook config file) arrive with those modes' flags.
-pub fn validate_authorization_modes(modes: &[String]) -> Vec<String> {
+/// (authorization.go:123-152). The Webhook-specific checks (webhook config
+/// file) arrive with that mode's flags.
+pub fn validate_authorization_modes(modes: &[String], policy_file: &str) -> Vec<String> {
     let mut errs = Vec::new();
     if modes.is_empty() {
         errs.push("at least one authorization-mode must be passed".to_string());
@@ -71,6 +79,9 @@ pub fn validate_authorization_modes(modes: &[String]) -> Vec<String> {
     for mode in modes {
         if !is_valid_authorization_mode(mode) {
             errs.push(format!("authorization-mode {mode:?} is not a valid mode"));
+        }
+        if mode == MODE_ABAC && policy_file.is_empty() {
+            errs.push("authorization-mode ABAC's authorization policy file not passed".to_string());
         }
         seen.insert(mode.as_str());
     }
@@ -82,20 +93,25 @@ pub fn validate_authorization_modes(modes: &[String]) -> Vec<String> {
             quoted.join(" ")
         ));
     }
+    if !policy_file.is_empty() && !seen.contains(MODE_ABAC) {
+        errs.push("cannot specify --authorization-policy-file without mode ABAC".to_string());
+    }
     errs
 }
 
 /// Build the authorizer chain: `AlwaysAllow` when `skip_auth`, otherwise the
 /// `system:masters` superuser authorizer first (reload.go:97-99) followed by
 /// the configured `modes` in order (reload.go:101-176), after Complete and
-/// Validate. ABAC and Webhook are valid upstream modes not yet implemented.
+/// Validate. ABAC reads `policy_file` once here (reload.go:118-123 reuses the
+/// list loaded at startup; no hot reload). Webhook is not yet implemented.
 pub fn build_authorizer<S: AuthzStorage + 'static>(
     storage: Arc<S>,
     skip_auth: bool,
     modes: &[String],
+    policy_file: &str,
 ) -> anyhow::Result<Arc<dyn Authorizer>> {
     let modes = complete_authorization_modes(modes);
-    let errs = validate_authorization_modes(&modes);
+    let errs = validate_authorization_modes(&modes, policy_file);
     if !errs.is_empty() {
         anyhow::bail!("invalid authorization options: {}", errs.join("; "));
     }
@@ -108,6 +124,8 @@ pub fn build_authorizer<S: AuthzStorage + 'static>(
             MODE_NODE => chain.push(Arc::new(NodeAuthorizer)),
             MODE_ALWAYS_ALLOW => chain.push(Arc::new(AlwaysAllowAuthorizer)),
             MODE_ALWAYS_DENY => chain.push(Arc::new(AlwaysDenyAuthorizer)),
+            // config.go:126-130 `abac.NewFromFile(config.PolicyFile)`.
+            MODE_ABAC => chain.push(Arc::new(PolicyList::new_from_file(Path::new(policy_file))?)),
             MODE_RBAC => chain.push(Arc::new(RBACAuthorizer::new(storage.clone()))),
             other => anyhow::bail!("authorization-mode {other} is not supported yet"),
         }
@@ -144,7 +162,7 @@ mod tests {
     }
 
     fn build(m: &[&str]) -> anyhow::Result<Arc<dyn Authorizer>> {
-        build_authorizer(Arc::new(MemoryStorage::new()), false, &modes(m))
+        build_authorizer(Arc::new(MemoryStorage::new()), false, &modes(m), "")
     }
 
     /// A kubelet reads its own Node through the Node authorizer even with an
@@ -167,14 +185,14 @@ mod tests {
 
     #[tokio::test]
     async fn skip_auth_allows_everything() {
-        let a = build_authorizer(Arc::new(MemoryStorage::new()), true, &[]).unwrap();
+        let a = build_authorizer(Arc::new(MemoryStorage::new()), true, &[], "").unwrap();
         let attrs = RequestAttributes::new(user("alice", &[]), "delete", "nodes");
         assert!(allowed(&a, attrs).await);
     }
 
     // TestAuthzValidate (pkg/kubeapiserver/options/authorization_test.go:34-).
     fn errs(m: &[&str]) -> String {
-        validate_authorization_modes(&modes(m)).join("; ")
+        validate_authorization_modes(&modes(m), "").join("; ")
     }
 
     #[test]
@@ -194,8 +212,10 @@ mod tests {
 
     #[test]
     fn validate_allow_and_deny_ok() {
-        assert!(validate_authorization_modes(&modes(&["AlwaysAllow", "AlwaysDeny"])).is_empty());
-        assert!(validate_authorization_modes(&modes(&["Node", "RBAC"])).is_empty());
+        assert!(
+            validate_authorization_modes(&modes(&["AlwaysAllow", "AlwaysDeny"]), "").is_empty()
+        );
+        assert!(validate_authorization_modes(&modes(&["Node", "RBAC"]), "").is_empty());
     }
 
     #[test]
@@ -259,6 +279,69 @@ mod tests {
         assert!(build(&["RBAC", "RBAC"]).is_err());
     }
 
+    // authorization.go:139-141, :147-149 (verbatim messages).
+    #[test]
+    fn validate_abac_requires_policy_file() {
+        assert!(errs(&["ABAC"])
+            .contains("authorization-mode ABAC's authorization policy file not passed"));
+        assert!(validate_authorization_modes(&modes(&["ABAC"]), "/p").is_empty());
+    }
+
+    #[test]
+    fn validate_policy_file_requires_abac() {
+        let e = validate_authorization_modes(&modes(&["RBAC"]), "/p").join("; ");
+        assert!(e.contains("cannot specify --authorization-policy-file without mode ABAC"));
+    }
+
+    fn policy_file(contents: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let p = std::env::temp_dir().join(format!(
+            "abac_authorizer_{}_{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::write(&p, contents).unwrap();
+        p
+    }
+
+    #[tokio::test]
+    async fn abac_mode_authorizes_from_policy_file() {
+        let p = policy_file(
+            "{\"apiVersion\":\"abac.authorization.kubernetes.io/v1beta1\",\"kind\":\"Policy\",\"spec\":{\"user\":\"alice\",\"namespace\":\"*\",\"resource\":\"pods\",\"apiGroup\":\"*\",\"readonly\":true}}\n",
+        );
+        let a = build_authorizer(
+            Arc::new(MemoryStorage::new()),
+            false,
+            &modes(&["ABAC"]),
+            p.to_str().unwrap(),
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&p);
+        assert!(allowed(&a, pods(user("alice", &[]))).await);
+        assert!(!allowed(&a, pods(user("bob", &[]))).await);
+        let write =
+            RequestAttributes::new(user("alice", &[]), "create", "pods").with_namespace("default");
+        assert!(!allowed(&a, write).await);
+    }
+
+    #[test]
+    fn abac_mode_fails_on_missing_or_bad_policy_file() {
+        let b =
+            |f: &str| build_authorizer(Arc::new(MemoryStorage::new()), false, &modes(&["ABAC"]), f);
+        assert!(b("/nonexistent/policy.jsonl").is_err());
+        let p = policy_file("not json\n");
+        let e = b(p.to_str().unwrap()).err().unwrap().to_string();
+        let _ = std::fs::remove_file(&p);
+        assert!(e.contains("line 1: not json"), "{e}");
+        // Validate runs first: ABAC without a file never reaches the loader.
+        assert!(b("")
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("policy file not passed"));
+    }
+
     mod args {
         use super::super::AuthorizationArgs;
         use clap::Parser;
@@ -276,6 +359,9 @@ mod tests {
             assert_eq!(w.a.authorization_mode, ["Node", "RBAC", "AlwaysDeny"]);
             let w = Wrap::try_parse_from(["x"]).unwrap();
             assert!(w.a.authorization_mode.is_empty());
+            assert!(w.a.authorization_policy_file.is_empty());
+            let w = Wrap::try_parse_from(["x", "--authorization-policy-file=/p"]).unwrap();
+            assert_eq!(w.a.authorization_policy_file, "/p");
         }
     }
 }
