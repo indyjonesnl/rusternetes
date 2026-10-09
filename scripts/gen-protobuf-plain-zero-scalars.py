@@ -126,7 +126,7 @@ def generate(src):
     out.append("/// Non-pointer `bool`/`int*` fields tagged `json:\",omitempty\"` upstream,")
     out.append("/// by message name, sorted by name (binary-searched by the decoder).")
     out.append("#[rustfmt::skip]")
-    out.append("pub(crate) const PLAIN_ZERO_SCALARS: &[(&str, &[&str])] = &[")
+    out.append("pub const PLAIN_ZERO_SCALARS: &[(&str, &[&str])] = &[")
     for msg, fields in rows:
         out.append("    (")
         out.append('        "%s",' % msg)

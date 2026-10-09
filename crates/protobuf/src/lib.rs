@@ -34,7 +34,7 @@ const WIRE_32BIT: u8 = 5;
 // Fields whose tag lacks `omitempty` (containerPort, exitCode, ...) are always
 // present in JSON, so they stay. Plain strings need no table: the string
 // decoder already drops an empty one.
-mod plain_zero_scalars;
+pub mod plain_zero_scalars;
 use plain_zero_scalars::PLAIN_ZERO_SCALARS;
 
 /// Remove the zero-valued plain scalars of `msg_type` (see

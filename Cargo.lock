@@ -4686,6 +4686,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "rusternetes-common",
+ "serde",
  "serde_json",
  "tracing",
 ]

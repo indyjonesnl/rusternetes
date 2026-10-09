@@ -7,7 +7,7 @@
 /// Non-pointer `bool`/`int*` fields tagged `json:",omitempty"` upstream,
 /// by message name, sorted by name (binary-searched by the decoder).
 #[rustfmt::skip]
-pub(crate) const PLAIN_ZERO_SCALARS: &[(&str, &[&str])] = &[
+pub const PLAIN_ZERO_SCALARS: &[(&str, &[&str])] = &[
     (
         "APIServiceSpec",
         &["insecureSkipTLSVerify"],
