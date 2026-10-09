@@ -115,11 +115,24 @@ pub struct ObjectReference {
     pub resource_version: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `Event.ResponseStatus` (a `metav1.Status`): the code always, and for a
+/// failed request the Status the handler wrote (`status`, `reason`,
+/// `message`, `details`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ResponseStatus {
-    pub code: u16,
+    /// `metav1.Status.metadata`: always serialised, as `{}`.
+    #[serde(default)]
+    pub metadata: serde_json::Map<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+    pub code: u16,
 }
 
 /// Audit policy defining what to log
@@ -401,6 +414,7 @@ impl AuditLogger {
             response_status: Some(ResponseStatus {
                 code: status_code,
                 message,
+                ..Default::default()
             }),
             request_received_timestamp: now, // Should be the original timestamp
             stage_timestamp: now,
@@ -552,6 +566,7 @@ mod tests {
             response_status: Some(ResponseStatus {
                 code: 201,
                 message: Some("Created".to_string()),
+                ..Default::default()
             }),
             request_received_timestamp: Utc::now(),
             stage_timestamp: Utc::now(),
