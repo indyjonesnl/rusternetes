@@ -15,8 +15,8 @@ use axum::http::StatusCode;
 use rusternetes_common::{
     admission::{AdmissionReview, AdmissionReviewResponse},
     resources::{
-        FailurePolicy, OperationType, Rule, RuleWithOperations, SideEffectClass,
-        ValidatingWebhook, ValidatingWebhookConfiguration, WebhookClientConfig,
+        FailurePolicy, OperationType, Rule, RuleWithOperations, SideEffectClass, ValidatingWebhook,
+        ValidatingWebhookConfiguration, WebhookClientConfig,
     },
 };
 use rusternetes_storage::{build_key, Storage};
@@ -116,7 +116,8 @@ async fn portforward_is_denied_by_connect_webhook_with_options_object() {
     let req = &seen[0];
     assert_eq!(req["operation"], "CONNECT");
     assert_eq!(req["kind"]["kind"], "PodPortForwardOptions");
-    assert_eq!(req["resource"]["resource"], "pods/portforward");
+    assert_eq!(req["resource"]["resource"], "pods");
+    assert_eq!(req["subResource"], "portforward");
     assert_eq!(req["name"], "target");
     assert_eq!(req["namespace"], "default");
     assert_eq!(req["object"]["kind"], "PodPortForwardOptions");
