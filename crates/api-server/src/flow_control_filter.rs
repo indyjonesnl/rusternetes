@@ -23,16 +23,14 @@
 //!
 //! DELIBERATE DEVIATIONS (each tracked as an issue):
 //!
-//! - Watch initialization signal. Upstream holds a watch's seat until the
-//!   storage layer signals that the initial events were sent
-//!   (`watchInitializationSignal`, :153-262). No such signal reaches our watch
-//!   handlers, so the seat is held until the handler has returned the response
-//!   (headers ready), after which the body streams without a seat. A watch is
-//!   still classified, costed (`watch` is estimated like a list under
-//!   `WatchList`) and queued/rejected like any other request. (#2808)
-//! - No `RegisterWatch`/`ObservedWatch` registration (`watch_tracker.go`): the
-//!   estimator's interested-watcher count is always 0. (#2775 covers the
-//!   estimator input; #2808 the tracker.)
+//! - Watch initialization signal and `RegisterWatch` (#2808) are ported:
+//!   `serve_watch` holds the seat until `watch_initialized()` fires (the watch
+//!   handlers call it once the initial state is read and the live stream is
+//!   open, `watch_snapshot`) or the handler returns, and keeps the watch
+//!   registered with the `WatchTracker` until the response body is dropped.
+//!   The tracker feeds the estimator's interested-watcher count. Remaining
+//!   gap: a watch handler that never reaches `watch_snapshot` frees its seat
+//!   only when it returns.
 //! - Object counts come from `flow_control_stats_poller` (the
 //!   `Store.startObservingCount` port) for a fixed table of built-in
 //!   resources; custom resources are not observed, so their lists report
@@ -50,16 +48,20 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
+use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{header::RETRY_AFTER, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use futures::StreamExt;
 use rusternetes_storage::{Storage, StorageBackend};
 
 use crate::audit::request_info;
-use crate::flow_control::{Classification, FlowControlEngine, RequestDigest};
+use crate::flow_control::{Classification, FlowControlEngine, FlowControlPermit, RequestDigest};
 use crate::flow_control_object_count::ObjectCountTracker;
-use crate::flow_control_watch_tracker::WatchTracker;
+use crate::flow_control_watch_tracker::{
+    scope_signal, ForgetWatch, InitializationSignal, WatchTracker,
+};
 use crate::flow_control_work_estimator::{RequestInfo, WorkEstimator, WorkEstimatorConfig};
 
 /// `ResponseHeaderMatchedPriorityLevelConfigurationUID`
@@ -283,11 +285,16 @@ impl<S: Storage + 'static> ApfFilter<S> {
     pub fn new(engine: Arc<FlowControlEngine<S>>, default_wait_limit: Duration) -> Self {
         let max_seats_engine = engine.clone();
         let object_counts = Arc::new(ObjectCountTracker::new());
+        // The estimator's `watchCountGetter` is
+        // `FlowControl.GetInterestedWatchCount` (server/config.go:1025); the
+        // tracker is the controller's `NewWatchTracker()`
+        // (apf_controller.go:289).
+        let watch_tracker = Arc::new(WatchTracker::new());
+        let counting_tracker = watch_tracker.clone();
         let estimator = WorkEstimator::new(
             // `c.StorageObjectCountTracker.Get` (server/config.go:1025).
             object_counts.stats_getter(),
-            // No watch tracker yet (#2808).
-            Box::new(|_| 0),
+            Box::new(move |info| counting_tracker.get_interested_watch_count(Some(info))),
             WorkEstimatorConfig::default(),
             Box::new(move |pl| max_seats_engine.max_seats(pl)),
         );
@@ -297,7 +304,7 @@ impl<S: Storage + 'static> ApfFilter<S> {
             object_counts,
             dropped: DroppedRequestsTracker::default(),
             default_wait_limit,
-            watch_tracker: Arc::new(WatchTracker::new()),
+            watch_tracker,
         }
     }
 
@@ -308,11 +315,12 @@ impl<S: Storage + 'static> ApfFilter<S> {
     }
 
     #[cfg(test)]
-    fn watch_count_for_test(&self, _info: &RequestInfo) -> i64 {
-        0
+    fn watch_count_for_test(&self, info: &RequestInfo) -> i64 {
+        self.estimator.watch_count(info)
     }
 
     /// The `WatchTracker` the filter registers watches with.
+    #[cfg(test)]
     pub fn watch_tracker(&self) -> &Arc<WatchTracker> {
         &self.watch_tracker
     }
@@ -347,6 +355,69 @@ fn too_many_requests(retry_after: i64) -> Response {
         HeaderValue::from_str(&retry_after.to_string()).expect("digits are a valid header"),
     );
     r
+}
+
+/// A response body that keeps a watch registered with the [`WatchTracker`]
+/// until the body is dropped, i.e. until the watch is over.
+fn forget_watch_with_body(resp: Response, forget: ForgetWatch) -> Response {
+    let (parts, body) = resp.into_parts();
+    let stream = body.into_data_stream().map(move |chunk| {
+        // Moved into the closure so it lives exactly as long as the stream.
+        let _registered = &forget;
+        chunk
+    });
+    Response::from_parts(parts, Body::from_stream(stream))
+}
+
+/// The watch branch of `Handle` (priority-and-fairness.go:171-290), given the
+/// seat `execute()` runs under.
+///
+/// Upstream runs `execute` (register the watch, then wait for the
+/// initialization signal while holding the seat) on a goroutine beside the
+/// handler. Here one task drives the handler future and, as soon as the
+/// signal fires, frees the seat while the handler carries on. The deferred
+/// `watchInitializationSignal.Signal()` (:186-190) is the handler returning
+/// without ever signalling: the seat is released then. `forgetWatch` runs when
+/// the watch is over, which is when the response body is dropped (or at once
+/// if the handler produced no body worth tracking).
+async fn serve_watch<S: Storage + 'static>(
+    f: &ApfFilter<S>,
+    attrs: &crate::audit::Attributes,
+    req: Request,
+    next: Next,
+    permit: FlowControlPermit,
+) -> Response {
+    let info = RequestInfo {
+        verb: attrs.verb.clone(),
+        api_group: attrs.api_group.clone(),
+        resource: attrs.resource.clone(),
+        subresource: attrs.subresource.clone(),
+        namespace: attrs.namespace.clone(),
+        name: attrs.name.clone(),
+    };
+    // `forgetWatch = h.fcIfc.RegisterWatch(r)` (:211)
+    let forget = f
+        .watch_tracker
+        .register_watch(&info, req.uri().query().unwrap_or(""));
+
+    let signal = InitializationSignal::new();
+    let handler = scope_signal(signal.clone(), next.run(req));
+    tokio::pin!(handler);
+    let mut permit = Some(permit);
+    let resp = tokio::select! {
+        resp = &mut handler => resp,
+        // `watchInitializationSignal.Wait()` returned (:218): the request is
+        // finished from the APF point of view.
+        _ = signal.wait() => {
+            permit.take();
+            handler.await
+        }
+    };
+    drop(permit);
+    match forget {
+        Some(forget) => forget_watch_with_body(resp, forget),
+        None => resp,
+    }
 }
 
 /// `priorityAndFairnessHandler.Handle` (priority-and-fairness.go:73-323).
@@ -410,10 +481,14 @@ pub async fn priority_and_fairness<S: Storage + 'static>(
         .await
     {
         Ok(permit) => {
-            // The seat is held while the handler runs and released on drop; for
-            // a watch that is until the response is ready (see module docs).
-            let mut resp = next.run(req).await;
-            drop(permit);
+            let mut resp = if is_watch {
+                serve_watch(&f, &attrs, req, next, permit).await
+            } else {
+                // The seat is held while the handler runs and released on drop.
+                let resp = next.run(req).await;
+                drop(permit);
+                resp
+            };
             // `Handle`'s deferred `if idle { maybeReap(pl.Name) }`
             // (apf_filter.go:171-177); `maybe_reap` re-checks that the level
             // is quiescing and its queueset idle.

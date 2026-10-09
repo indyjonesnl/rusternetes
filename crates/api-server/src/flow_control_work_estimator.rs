@@ -161,6 +161,12 @@ impl WorkEstimator {
         }
     }
 
+    /// The interested-watcher count the mutating estimator would use.
+    #[cfg(test)]
+    pub(crate) fn watch_count(&self, info: &RequestInfo) -> i64 {
+        (self.watch_count_getter)(info)
+    }
+
     /// `workEstimator.estimate` (width.go:107). `query` is `r.URL.RawQuery`.
     pub fn estimate_work(
         &self,

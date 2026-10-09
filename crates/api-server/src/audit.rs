@@ -432,11 +432,42 @@ pub fn request_info(method: &Method, path: &str, query: Option<&str>) -> Attribu
             .filter_map(|kv| kv.split_once('='))
             .any(|(k, v)| k == "watch" && !matches!(v.to_lowercase().as_str(), "false" | "0"));
         a.verb = if watch { "watch" } else { "list" }.to_string();
+        // requestinfo.go:247-253: an exact `metadata.name` field selector names
+        // the object.
+        if let Some(name) = query
+            .and_then(|q| field_selector_exact_match(q, "metadata.name"))
+            .filter(|n| is_valid_path_segment_name(n))
+        {
+            a.name = name;
+        }
     }
     if a.name.is_empty() && a.verb == "delete" {
         a.verb = "deletecollection".to_string();
     }
     a
+}
+
+/// `fieldSelector.RequiresExactMatch(field)` over the request's `fieldSelector`
+/// query parameter (fields/selector.go `hasTerm`/`andTerm.RequiresExactMatch`):
+/// the value of the first `field=value`/`field==value` term. An unparsable
+/// selector yields `None`, as `DecodeParameters` failing leaves
+/// `opts.FieldSelector` nil (requestinfo.go:225-232).
+pub fn field_selector_exact_match(query: &str, field: &str) -> Option<String> {
+    use rusternetes_common::field_selector::{FieldOperator, FieldSelector};
+    let raw = url::form_urlencoded::parse(query.as_bytes())
+        .find(|(k, _)| k == "fieldSelector")?
+        .1;
+    let selector = FieldSelector::parse(&raw).ok()?;
+    selector
+        .requirements()
+        .iter()
+        .find(|r| r.operator() == FieldOperator::Equals && r.field() == field)
+        .map(|r| r.value().to_string())
+}
+
+/// `path.IsValidPathSegmentName` (apimachinery/pkg/api/validation/path/name.go:31).
+fn is_valid_path_segment_name(name: &str) -> bool {
+    name != "." && name != ".." && !name.contains('/') && !name.contains('%')
 }
 
 // ---------------------------------------------------------------------
