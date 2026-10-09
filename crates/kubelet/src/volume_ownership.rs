@@ -327,4 +327,108 @@ mod tests {
         assert!(requires_permission_change(&d, gid, false));
         assert!(requires_permission_change(&d, gid + 1, true));
     }
+
+    /// `verifyDirectoryPermission` (`volume_linux_test.go:474-494`).
+    fn verify_directory_permission(p: &Path, read_only: bool) -> bool {
+        let Ok(m) = std::fs::symlink_metadata(p) else {
+            return false;
+        };
+        let want = (if read_only { RO_MASK } else { RW_MASK }) | EXEC_MASK;
+        let have = m.permissions().mode();
+        (want & (have & 0o777) == want) && (have & SETGID != 0)
+    }
+
+    /// `TestSetVolumeOwnershipMode` "fsgroupchangepolicy=always"
+    /// (`volume_linux_test.go:197-229`): a subdirectory without setgid is fixed.
+    #[test]
+    fn upstream_mode_always_fixes_rogue_subdir() {
+        let d = tmp("up-always");
+        let gid = own_gid(&d);
+        let m = mode(&d);
+        std::fs::set_permissions(
+            &d,
+            std::fs::Permissions::from_mode(m | RW_MASK | SETGID | EXEC_MASK),
+        )
+        .unwrap();
+        let rogue = d.join("roguedir");
+        std::fs::create_dir(&rogue).unwrap();
+        std::fs::set_permissions(&rogue, std::fs::Permissions::from_mode(m & !SETGID)).unwrap();
+        set_volume_ownership_with_policy(&d, Some(gid), Some("Always"), false).unwrap();
+        assert!(verify_directory_permission(&rogue, false));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// "onrootmismatch,rootdir=validperm" (`:230-262`): a valid root means the
+    /// rogue subdirectory is left alone.
+    #[test]
+    fn upstream_mode_on_root_mismatch_valid_root_skips_subdir() {
+        let d = tmp("up-orm-valid");
+        let gid = own_gid(&d);
+        let m = mode(&d);
+        std::fs::set_permissions(
+            &d,
+            std::fs::Permissions::from_mode(m | RW_MASK | SETGID | EXEC_MASK),
+        )
+        .unwrap();
+        let rogue = d.join("roguedir");
+        std::fs::create_dir(&rogue).unwrap();
+        std::fs::set_permissions(&rogue, std::fs::Permissions::from_mode(RW_MASK)).unwrap();
+        set_volume_ownership_with_policy(&d, Some(gid), Some("OnRootMismatch"), false).unwrap();
+        assert!(!verify_directory_permission(&rogue, false));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// "onrootmismatch,rootdir=invalidperm" (`:263-293`): root 0770 lacks
+    /// setgid, so the walk runs and the subdirectory is fixed.
+    #[test]
+    fn upstream_mode_on_root_mismatch_invalid_root_walks() {
+        let d = tmp("up-orm-invalid");
+        let gid = own_gid(&d);
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let rogue = d.join("roguedir");
+        std::fs::create_dir(&rogue).unwrap();
+        std::fs::set_permissions(&rogue, std::fs::Permissions::from_mode(RW_MASK)).unwrap();
+        set_volume_ownership_with_policy(&d, Some(gid), Some("OnRootMismatch"), false).unwrap();
+        assert!(verify_directory_permission(&rogue, false));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `TestSetVolumeOwnershipOwner` "symlink" (`:555-583`), runnable as a
+    /// non-root user by chowning to the caller's own gid: the link itself is
+    /// lchown'd (`Lstat` owner), and the walk succeeds on it.
+    #[test]
+    fn upstream_owner_symlink_is_lchowned_not_followed() {
+        let d = tmp("up-owner-symlink");
+        let gid = own_gid(&d);
+        let f = d.join("file.txt");
+        std::fs::write(&f, b"x").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = d.join("file_link.txt");
+        std::os::unix::fs::symlink(&f, &link).unwrap();
+        set_volume_ownership_with_policy(&d, Some(gid), Some("Always"), false).unwrap();
+        let lm = std::fs::symlink_metadata(&link).unwrap();
+        assert!(lm.file_type().is_symlink());
+        assert_eq!(i64::from(lm.gid()), gid);
+        assert_eq!(
+            i64::from(lm.uid()),
+            i64::from(std::fs::metadata(&f).unwrap().uid())
+        );
+        // The target was reached once as a regular file: 0755 | rwMask.
+        assert_eq!(mode(&f), 0o775);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `TestSetVolumeOwnershipOwner` "fsGroup=nil" (`:520-541`): owner and
+    /// group are untouched.
+    #[test]
+    fn upstream_owner_nil_fs_group_keeps_owner() {
+        let d = tmp("up-owner-nil");
+        let f = d.join("file.txt");
+        std::fs::write(&f, b"x").unwrap();
+        let before = std::fs::metadata(&f).unwrap();
+        set_volume_ownership_with_policy(&d, None, Some("Always"), false).unwrap();
+        let after = std::fs::metadata(&f).unwrap();
+        assert_eq!((before.uid(), before.gid()), (after.uid(), after.gid()));
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

@@ -409,4 +409,58 @@ mod tests {
             }
         );
     }
+
+    /// `TestPlugin` (`configmap_test.go:324-388`): `SetUp` with
+    /// `mounterArgs.FsGroup` set projects the data, and `SetVolumeOwnership`
+    /// runs over the whole volume (`configmap.go:246-252`, read-only
+    /// attributes): root dir gets setgid + `roMask|execMask`, the symlinks stay
+    /// symlinks, and the file reached through `..data` keeps `defaultMode`
+    /// OR `roMask`.
+    #[tokio::test]
+    async fn fs_group_set_up_projects_data_and_applies_ownership() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("vol");
+        let gid = i64::from(std::fs::metadata(tmp.path()).unwrap().gid());
+        let storage = Arc::new(StorageBackend::Memory(Arc::new(
+            rusternetes_storage::MemoryStorage::new(),
+        )));
+        let cm: ConfigMap = serde_json::from_value(json!({
+            "metadata": {"name": "cm", "namespace": "ns"},
+            "data": {"data-1": "value-1", "data-2": "value-2"}
+        }))
+        .unwrap();
+        storage
+            .create(&build_key("configmaps", Some("ns"), "cm"), &cm)
+            .await
+            .unwrap();
+        let m = ConfigMapMounter {
+            path: dir.to_string_lossy().into_owned(),
+            volume_name: "cfg".into(),
+            namespace: "ns".into(),
+            config_map: serde_json::from_value(json!({"name": "cm", "defaultMode": 0o600}))
+                .unwrap(),
+            storage: Some(storage),
+            fs_group: Some(gid),
+        };
+        m.set_up().await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("data-1")).unwrap(),
+            "value-1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("data-2")).unwrap(),
+            "value-2"
+        );
+        assert!(std::fs::symlink_metadata(dir.join("data-1"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let root = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(root & 0o2000, 0o2000, "root dir must be setgid");
+        assert_eq!(root & 0o550, 0o550, "root dir gets roMask|execMask");
+        let real = std::fs::metadata(dir.join("data-1")).unwrap();
+        assert_eq!(real.permissions().mode() & 0o777, 0o640, "0600 | roMask");
+        assert_eq!(i64::from(real.gid()), gid);
+    }
 }
