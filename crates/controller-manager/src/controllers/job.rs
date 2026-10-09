@@ -1927,17 +1927,23 @@ impl<S: Storage + 'static> JobController<S> {
         // failure is evaluated at all (:951 "only when the Job doesn't have the
         // SuccessCriteriaMet condition"), and a persisted FailureTarget is
         // already the failure (:953-955).
-        let is_failed = persisted_success.is_none()
+        // Order matters (job_controller.go:955-995): pod failure policy and
+        // backoffLimit, then `pastActiveDeadline`, and only after those the
+        // per-index scenarios (maxFailedIndexes, FailedIndexes). So the
+        // deadline outranks the per-index ones, and is evaluated only when
+        // the earlier scenarios have not already failed the Job.
+        let early_failed = persisted_success.is_none()
             && (persisted_failure.is_some()
                 || pod_failure_policy_triggered
-                || max_failed_indexes_exceeded
-                || if backoff_limit_per_index.is_some() && is_indexed {
+                || (!(backoff_limit_per_index.is_some() && is_indexed) && failed > backoff_limit));
+        let index_failed = persisted_success.is_none()
+            && (max_failed_indexes_exceeded
+                || (backoff_limit_per_index.is_some() && is_indexed && {
                     let completed_count = succeeded_index_count;
                     let failed_count = all_failed_index_set.len() as i32;
                     (completed_count + failed_count) >= completions
-                } else {
-                    failed > backoff_limit
-                });
+                }));
+        let is_failed = early_failed || index_failed;
 
         // Check if Job is complete
         // For indexed jobs, check number of distinct succeeded indexes
@@ -1954,7 +1960,7 @@ impl<S: Storage + 'static> JobController<S> {
         if let Some(deadline) = job
             .spec
             .active_deadline_seconds
-            .filter(|_| !is_failed && persisted_success.is_none() && !job_suspended)
+            .filter(|_| !early_failed && persisted_success.is_none() && !job_suspended)
         {
             if let Some(start) = job.status.as_ref().and_then(|s| s.start_time) {
                 let elapsed = chrono::Utc::now()
@@ -4229,6 +4235,50 @@ mod tests {
             1,
             "Should not create a retry pod for exhausted index 0"
         );
+    }
+
+    /// `syncJob` evaluates the failure scenarios in order: pod failure policy,
+    /// backoffLimit, `pastActiveDeadline`, and only THEN the per-index ones
+    /// (maxFailedIndexes / FailedIndexes) (job_controller.go:969-995). A Job
+    /// past its deadline that also has a failed index reports DeadlineExceeded.
+    #[tokio::test]
+    async fn deadline_exceeded_outranks_failed_indexes() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job("dl-job", "default", 1, 1);
+        job.spec.completion_mode = Some("Indexed".to_string());
+        job.spec.backoff_limit_per_index = Some(0);
+        job.spec.backoff_limit = Some(100);
+        job.spec.active_deadline_seconds = Some(1);
+        job.status = Some(JobStatus {
+            start_time: Some(chrono::Utc::now() - chrono::Duration::seconds(60)),
+            ..Default::default()
+        });
+        let job_key = build_key("jobs", Some("default"), "dl-job");
+        storage.create(&job_key, &job).await.unwrap();
+        let pod = make_indexed_pod(
+            "dl-job-0",
+            "default",
+            Phase::Failed,
+            "dl-job",
+            "job-uid-1",
+            0,
+        );
+        storage
+            .create(&build_key("pods", Some("default"), "dl-job-0"), &pod)
+            .await
+            .unwrap();
+
+        let controller = JobController::new(storage.clone());
+        let mut job: Job = storage.get(&job_key).await.unwrap();
+        controller.reconcile(&mut job).await.unwrap();
+
+        let stored: Job = storage.get(&job_key).await.unwrap();
+        let conditions = stored.status.unwrap().conditions.unwrap_or_default();
+        let failed = conditions
+            .iter()
+            .find(|c| c.condition_type == "Failed" && c.status == "True")
+            .unwrap_or_else(|| panic!("job must end Failed, got {conditions:?}"));
+        assert_eq!(failed.reason.as_deref(), Some("DeadlineExceeded"));
     }
 
     #[tokio::test]
