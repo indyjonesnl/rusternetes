@@ -53,15 +53,6 @@ impl Moments {
         }
     }
 
-    /// `Add` (integrator.go:185): combine over two ranges of time.
-    pub fn add(self, other: Moments) -> Moments {
-        Moments {
-            elapsed_seconds: self.elapsed_seconds + other.elapsed_seconds,
-            integral_x: self.integral_x + other.integral_x,
-            integral_xx: self.integral_xx + other.integral_xx,
-        }
-    }
-
     /// `AvgAndStdDev` (integrator.go:203).
     pub fn avg_and_std_dev(self) -> (f64, f64) {
         if self.elapsed_seconds <= 0.0 {
@@ -79,6 +70,18 @@ impl Moments {
     }
 }
 
+/// `Add` (integrator.go:185): combine over two ranges of time.
+impl std::ops::Add for Moments {
+    type Output = Moments;
+    fn add(self, other: Moments) -> Moments {
+        Moments {
+            elapsed_seconds: self.elapsed_seconds + other.elapsed_seconds,
+            integral_x: self.integral_x + other.integral_x,
+            integral_xx: self.integral_xx + other.integral_xx,
+        }
+    }
+}
+
 struct State {
     last_time: Duration,
     x: f64,
@@ -92,7 +95,7 @@ impl State {
     fn update(&mut self, now: Duration) {
         let dt = now.saturating_sub(self.last_time).as_secs_f64();
         self.last_time = now;
-        self.moments = self.moments.add(Moments::constant(dt, self.x));
+        self.moments = self.moments + Moments::constant(dt, self.x);
     }
 
     /// `setLocked` (integrator.go:98).

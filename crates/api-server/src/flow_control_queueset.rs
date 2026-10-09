@@ -44,6 +44,7 @@
 //! This module is NOT yet wired into `flow_control.rs`; see the follow-up
 //! issues referenced from the PR.
 
+use crate::flow_control_integrator::Integrator;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -399,6 +400,9 @@ struct Inner {
     tot_requests_executing: usize,
     tot_seats_in_use: usize,
     tot_seats_waiting: usize,
+    /// `qs.seatDemandIntegrator`: integrates `totSeatsInUse +
+    /// totSeatsWaiting` (the borrowing adjustment reads and resets it).
+    seat_demand: Arc<Integrator>,
     enqueues: usize,
     tot_requests_dispatched: u64,
     tot_requests_rejected: u64,
@@ -428,6 +432,7 @@ impl Inner {
     fn new(clock: Arc<dyn Clock>) -> Inner {
         let now = clock.now();
         Inner {
+            seat_demand: Arc::new(Integrator::new(clock.clone())),
             clock,
             estimated_service_duration_ns: ESTIMATED_SERVICE_DURATION_NS,
             qcfg: QueuingConfig::default(),
@@ -537,6 +542,13 @@ impl Inner {
                 }
             }
         }
+    }
+
+    /// `qs.seatDemandIntegrator.Set(totSeatsInUse + totSeatsWaiting)`
+    /// (queueset.go:438, :650, :682, :711, :728, :880).
+    fn note_seat_demand(&self) {
+        self.seat_demand
+            .set((self.tot_seats_in_use + self.tot_seats_waiting) as f64);
     }
 
     /// `getVirtualTimeRatioLocked` (queueset.go:455).
@@ -678,6 +690,7 @@ impl Inner {
         q.sum.total_work_sum += w.total_work;
         self.tot_requests_waiting += 1;
         self.tot_seats_waiting += w.max_seats();
+        self.note_seat_demand();
     }
 
     /// The FIFO's `removeFromQueueLocked` (fifo_list.go:79): remove a
@@ -719,6 +732,7 @@ impl Inner {
         let rid = self.new_request(fs_name, flow_distinguisher, None, work, true);
         self.tot_requests_executing += 1;
         self.tot_seats_in_use += work.max_seats();
+        self.note_seat_demand();
         self.queueless_executing.insert(rid);
         rid
     }
@@ -742,6 +756,7 @@ impl Inner {
         // The request leaves its queue and starts executing.
         self.tot_requests_executing += 1;
         self.tot_seats_in_use += work.max_seats();
+        self.note_seat_demand();
         let qpos = self.queue_pos(qid).expect("queue");
         let queue = &mut self.queues[qpos];
         queue.executing.insert(rid);
@@ -847,6 +862,7 @@ impl Inner {
         };
         let max = r.work.max_seats();
         self.tot_seats_in_use -= max;
+        self.note_seat_demand();
         if let Some(qid) = r.queue_id {
             if let Some(qpos) = self.queue_pos(qid) {
                 self.queues[qpos].seats_in_use -= max;
@@ -902,6 +918,7 @@ impl Inner {
         if self.remove_waiting(qid, rid) {
             self.tot_requests_waiting -= 1;
             self.tot_seats_waiting -= max;
+            self.note_seat_demand();
             self.tot_requests_rejected += 1;
             self.tot_requests_cancelled += 1;
             self.requests.remove(&rid);
@@ -956,6 +973,17 @@ impl QueueSet {
 
     pub fn is_idle(&self) -> bool {
         self.lock().is_idle()
+    }
+
+    /// The seat-demand integrator (upstream: the `seatDemandIntegrator` the
+    /// priority level state owns and hands to the queueset).
+    pub fn seat_demand(&self) -> Arc<Integrator> {
+        self.lock().seat_demand.clone()
+    }
+
+    /// The dispatching limit currently in force.
+    pub fn concurrency_limit(&self) -> usize {
+        self.lock().dcfg.concurrency_limit
     }
 
     pub fn stats(&self) -> QueueSetStats {
@@ -1682,6 +1710,61 @@ mod tests {
         // Nothing else may run alongside the too-wide request.
         let other = qs.start_request(&we(1), 1, "", "fs").unwrap();
         assert!(!other.is_dispatched());
+    }
+
+    // ---- seat demand (queueset.go seatDemandIntegrator) ----
+
+    #[test]
+    fn seat_demand_integrates_seats_in_use_plus_waiting() {
+        let clk = FakeClock::new();
+        let qs = QueueSet::new(
+            clk.clone(),
+            qcfg(4, 10, 1),
+            DispatchingConfig {
+                concurrency_limit: 2,
+            },
+        )
+        .unwrap();
+        let demand = qs.seat_demand();
+        let running = qs.start_request(&we(2), 1, "", "fs").unwrap(); // 2 in use
+        let waiting = qs.start_request(&we(1), 2, "", "fs").unwrap(); // +1 waiting
+        clk.advance(Duration::from_secs(1));
+        assert_eq!(demand.get_results().max, 3.0);
+        drop(running.try_execution().ok().unwrap()); // waiting one dispatches: 1
+        clk.advance(Duration::from_secs(1));
+        let r = demand.reset();
+        assert_eq!(r.max, 3.0);
+        assert!((r.average - 2.0).abs() < 1e-9, "average {}", r.average);
+        drop(waiting);
+        demand.reset(); // start a fresh window with the released demand
+        clk.advance(Duration::from_secs(1));
+        assert_eq!(demand.reset().max, 0.0);
+    }
+
+    /// `Complete` with a larger `ConcurrencyLimit` dispatches what now fits
+    /// (queueset.go `setConfiguration` -> `dispatchAsMuchAsPossibleLocked`).
+    #[test]
+    fn raising_the_concurrency_limit_dispatches_waiting_requests() {
+        let qs = QueueSet::new(
+            FakeClock::new(),
+            qcfg(4, 10, 1),
+            DispatchingConfig {
+                concurrency_limit: 1,
+            },
+        )
+        .unwrap();
+        let _a = qs.start_request(&we(1), 1, "", "fs").unwrap();
+        let b = qs.start_request(&we(1), 2, "", "fs").unwrap();
+        assert!(!b.is_dispatched());
+        qs.set_configuration(
+            qcfg(4, 10, 1),
+            DispatchingConfig {
+                concurrency_limit: 2,
+            },
+        )
+        .unwrap();
+        assert!(b.is_dispatched());
+        assert_eq!(qs.concurrency_limit(), 2);
     }
 
     // ---- TestContextCancel ----

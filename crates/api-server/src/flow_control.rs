@@ -24,11 +24,17 @@
 //!   executing requests survive a reload; `hashFlowID` (:1131-1140) with the
 //!   flow distinguisher computed only when the level has more than one queue.
 //!
-//! DELIBERATE DEVIATIONS (tracked as follow-up issues): no borrowing between
-//! levels / dynamic currentCL adjustment (currentCL == nominalCL), no width
-//! (work) estimator (callers pass seats), no metrics, no FlowSchema status
-//! updates, and the engine is NOT yet installed as a request filter, so
-//! nothing is enforced.
+//! - Borrowing (#2743): `finishQueueSetReconfigsLocked` min/max/initial
+//!   currentCL (:859-900) and `updateBorrowingLocked` (:399-496), driven every
+//!   `borrowingAdjustmentPeriod` by [`FlowControlEngine::update_borrowing`]
+//!   from smoothed seat-demand statistics (`seatDemandStats`, :255-275) fed by
+//!   each queueset's seat-demand integrator, and
+//!   `computeConcurrencyAllocation` (`flow_control_conc_alloc.rs`).
+//!
+//! DELIBERATE DEVIATIONS (tracked as follow-up issues): no metrics
+//! (`ConcurrencyDenominator`, ratioed gauges,
+//! `NotePriorityLevelConcurrencyAdjustment`: #2809) and no FlowSchema status
+//! updates.
 //!
 //! Quiescing (#2769): `digest` ports `digestNewPLsLocked` (broken specs are
 //! ignored), `processOldPLsLocked` (an undesired level that is still busy is
@@ -51,14 +57,16 @@ use rusternetes_common::validation::flowcontrol_bootstrap::{
 };
 use rusternetes_storage::{build_key, Storage};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use crate::flow_control_conc_alloc::{compute_concurrency_allocation, AllocProblemItem};
+use crate::flow_control_integrator::{Integrator, IntegratorResults};
 use crate::flow_control_queueset::{
-    DispatchingConfig, Execution, QueueSet, QueuingConfig, RealClock, WorkEstimate,
+    Clock, DispatchingConfig, Execution, QueueSet, QueuingConfig, RealClock, WorkEstimate,
 };
 use sha2::{Digest, Sha256};
-use tracing::warn;
+use tracing::{error, warn};
 
 /// `--max-requests-inflight` default (`server/config.go:443`).
 pub const DEFAULT_MAX_REQUESTS_IN_FLIGHT: i64 = 400;
@@ -210,8 +218,15 @@ struct LevelState {
     /// it had when it was last desired.
     pl: PriorityLevelConfiguration,
     exempt: bool,
-    /// Concurrency limit in seats (`nominalCL`; no borrowing, see module docs).
+    /// `nominalCL`: the concurrency limit configured by shares.
     nominal_cl: usize,
+    /// `minCL`: the nominal limit less the lendable amount.
+    min_cl: usize,
+    /// `maxCL`: the nominal limit plus the amount that may be borrowed.
+    max_cl: usize,
+    /// `currentCL` and `seatDemandStats`, adjusted by `updateBorrowingLocked`
+    /// (always under the config write lock; the mutex only satisfies `Arc`).
+    borrow: Mutex<BorrowDynamic>,
     /// `QueuingConfig.DesiredNumQueues` (startRequest reads `Queues` for it).
     num_queues: isize,
     queues: Arc<QueueSet>,
@@ -219,7 +234,63 @@ struct LevelState {
     quiescing: bool,
 }
 
+/// The dynamic part of a priority level: `currentCL` and `seatDemandStats`.
+#[derive(Clone, Copy, Debug, Default)]
+struct BorrowDynamic {
+    current_cl: usize,
+    stats: SeatDemandStats,
+}
+
+/// `seatDemandSmoothingCoefficient` (apf_controller.go:88): half-life of the
+/// smoothing is 5 minutes at the 10s adjustment period.
+const SEAT_DEMAND_SMOOTHING_COEFFICIENT: f64 = 0.977;
+
+/// `seatDemandStats` (apf_controller.go:255): derived from periodically
+/// examining the seat-demand integrator.
+#[derive(Clone, Copy, Debug, Default)]
+struct SeatDemandStats {
+    avg: f64,
+    std_dev: f64,
+    high_watermark: usize,
+    smoothed: f64,
+}
+
+impl SeatDemandStats {
+    /// `seatDemandStats.update` (apf_controller.go:262-274).
+    fn update(&mut self, obs: &IntegratorResults) {
+        self.high_watermark = obs.max.round().max(0.0) as usize;
+        if obs.duration <= 0.0 {
+            return;
+        }
+        let deviation = if obs.deviation.is_nan() {
+            0.0
+        } else {
+            obs.deviation
+        };
+        self.avg = obs.average;
+        self.std_dev = deviation;
+        let envelope = obs.average + deviation;
+        self.smoothed = envelope.max(
+            SEAT_DEMAND_SMOOTHING_COEFFICIENT * self.smoothed
+                + (1.0 - SEAT_DEMAND_SMOOTHING_COEFFICIENT) * envelope,
+        );
+    }
+}
+
+/// `relDiff` (apf_controller.go:1142).
+fn rel_diff(x: f64, y: f64) -> f64 {
+    let den = x.abs().max(y.abs());
+    if den == 0.0 {
+        0.0
+    } else {
+        (x - y).abs() / den
+    }
+}
+
 struct Config {
+    /// `nominalCLSum` (apf_controller.go:193): the sum of the levels' nominal
+    /// limits (`meal.maxExecutingRequests`).
+    nominal_cl_sum: usize,
     flow_schemas: Vec<FlowSchema>,
     levels: HashMap<String, LevelState>,
     /// The objects this config was digested from, so a reap can re-digest
@@ -338,12 +409,15 @@ fn digest(
     fss: Vec<FlowSchema>,
     server_cl: i64,
     prev: Option<&Config>,
+    clock: &Arc<dyn Clock>,
 ) -> Config {
     /// A level of `meal.newPLStates` before `finishQueueSetReconfigsLocked`.
     struct Pending {
         pl: PriorityLevelConfiguration,
         queues: Option<Arc<QueueSet>>,
         quiescing: bool,
+        /// `currentCL` and stats of the level being retained.
+        borrow: Option<BorrowDynamic>,
     }
     let mut new_states: HashMap<String, Pending> = HashMap::new();
     let mut share_sum = 0f64;
@@ -372,6 +446,7 @@ fn digest(
                 pl: pl.clone(),
                 queues: old.map(|o| o.queues.clone()),
                 quiescing: false,
+                borrow: old.map(|o| *o.borrow.lock().unwrap()),
             },
         );
     }
@@ -446,6 +521,7 @@ fn digest(
                     pl: old.pl.clone(),
                     queues: Some(old.queues.clone()),
                     quiescing,
+                    borrow: Some(*old.borrow.lock().unwrap()),
                 },
             );
         }
@@ -462,13 +538,15 @@ fn digest(
                     pl,
                     queues: None,
                     quiescing: false,
+                    borrow: None,
                 },
             );
         }
     }
 
-    // finishQueueSetReconfigsLocked (:846-905).
+    // finishQueueSetReconfigsLocked (:846-912).
     let mut levels = HashMap::new();
+    let mut nominal_cl_sum = 0usize;
     for (name, st) in new_states {
         let exempt = matches!(st.pl.spec.type_, PriorityLevelType::Exempt);
         let cl = if share_sum > 0.0 {
@@ -476,9 +554,28 @@ fn digest(
         } else {
             0
         };
+        let (lendable_percent, borrowing_limit_percent) = lend_borrow_percents(&st.pl);
+        let lendable_cl = lendable_percent
+            .map(|p| ((cl as f64) * (p as f64) / 100.0).round() as usize)
+            .unwrap_or(0);
+        let borrowing_cl = match borrowing_limit_percent {
+            Some(p) => ((cl as f64) * (p as f64) / 100.0).round() as usize,
+            None => server_cl.max(0) as usize,
+        };
+        let (min_cl, max_cl) = (cl.saturating_sub(lendable_cl), cl + borrowing_cl);
+        nominal_cl_sum += cl;
+        // Introducing queues starts with currentCL = nominalCL - lendableCL/2
+        // and no demand history (:897-900); retained ones keep theirs.
+        let borrow = match st.borrow {
+            Some(b) if st.queues.is_some() => b,
+            _ => BorrowDynamic {
+                current_cl: cl - lendable_cl / 2,
+                stats: SeatDemandStats::default(),
+            },
+        };
         let qcfg = queuing_config_for_pl(&st.pl);
         let dcfg = DispatchingConfig {
-            concurrency_limit: cl,
+            concurrency_limit: borrow.current_cl,
         };
         let num_queues = qcfg.desired_num_queues;
         // validate_pl (or an earlier digest) already approved this config.
@@ -488,8 +585,9 @@ fn digest(
                     .expect("queueing config was validated");
                 q
             }
-            None => QueueSet::new(Arc::new(RealClock::default()), qcfg, dcfg)
-                .expect("queueing config was validated"),
+            None => {
+                QueueSet::new(clock.clone(), qcfg, dcfg).expect("queueing config was validated")
+            }
         };
         levels.insert(
             name,
@@ -497,16 +595,131 @@ fn digest(
                 pl: st.pl,
                 exempt,
                 nominal_cl: cl,
+                min_cl,
+                max_cl,
+                borrow: Mutex::new(borrow),
                 num_queues,
                 queues,
                 quiescing: st.quiescing,
             },
         );
     }
+    // `meal.cfgCtlr.nominalCLSum = meal.maxExecutingRequests;
+    // updateBorrowingLocked(false, newPLStates)` (:909-910).
+    update_borrowing_locked(&levels, nominal_cl_sum);
     Config {
+        nominal_cl_sum,
         flow_schemas: seq,
         levels,
         inputs: (pls, fss),
+    }
+}
+
+/// `plSpecCommons` (apf_controller.go:1152): the (LendablePercent,
+/// BorrowingLimitPercent) of a level; an exempt level has no borrowing limit.
+fn lend_borrow_percents(pl: &PriorityLevelConfiguration) -> (Option<i32>, Option<i32>) {
+    match (&pl.spec.limited, &pl.spec.exempt) {
+        (Some(l), _) => (l.lendable_percent, l.borrowing_limit_percent),
+        (None, Some(e)) => (e.lendable_percent, None),
+        _ => (None, None),
+    }
+}
+
+/// `updateBorrowingLocked` (apf_controller.go:399-496): derive every level's
+/// `currentCL` from its smoothed seat demand and the server's total
+/// concurrency, and impose it on the level's queueset (the completer
+/// re-creation upstream does is `set_configuration` here).
+fn update_borrowing_locked(levels: &HashMap<String, LevelState>, nominal_cl_sum: usize) {
+    let mut items: Vec<AllocProblemItem> = Vec::with_capacity(levels.len());
+    let mut non_exempt_names: Vec<&str> = Vec::with_capacity(levels.len());
+    let mut idx_of_non_exempt: HashMap<&str, usize> = HashMap::new();
+    // minCurrentCL of the exempt levels
+    let mut ccl_of_exempt: HashMap<&str, usize> = HashMap::new();
+    // sums over non-exempt levels
+    let (mut min_cl_sum, mut min_current_cl_sum) = (0usize, 0usize);
+    let mut remaining_server_cl = nominal_cl_sum as i64;
+    for (name, l) in levels {
+        let mut b = l.borrow.lock().unwrap();
+        let obs = l.queues.seat_demand().reset();
+        b.stats.update(&obs);
+        if l.exempt {
+            let min_current_cl = l.min_cl.max(b.stats.high_watermark);
+            ccl_of_exempt.insert(name, min_current_cl);
+            remaining_server_cl -= min_current_cl as i64;
+        } else {
+            // Lower bound on this level's adjusted limit is the lesser of its
+            // seat demand high watermark over the last period and its
+            // configured limit, BUT not lower than the lower bound from
+            // configuration. See KEP-1040.
+            let min_current_cl = l.min_cl.max(l.nominal_cl.min(b.stats.high_watermark));
+            idx_of_non_exempt.insert(name, items.len());
+            non_exempt_names.push(name);
+            items.push(AllocProblemItem {
+                lower_bound: min_current_cl as f64,
+                upper_bound: l.max_cl as f64,
+                target: (min_current_cl as f64).max(b.stats.smoothed),
+            });
+            min_cl_sum += l.min_cl;
+            min_current_cl_sum += min_current_cl;
+        }
+    }
+    if items.is_empty() && nominal_cl_sum > 0 {
+        error!("Impossible: no priority levels");
+        return;
+    }
+    let mut allocs: Vec<f64> = Vec::new();
+    let mut share_frac = 0f64;
+    let mut backstop = false;
+    if remaining_server_cl <= min_cl_sum as i64 {
+        // every non-exempt level gets its minCL
+    } else if remaining_server_cl <= min_current_cl_sum as i64 {
+        share_frac = (remaining_server_cl - min_cl_sum as i64) as f64
+            / (min_current_cl_sum - min_cl_sum) as f64;
+    } else {
+        match compute_concurrency_allocation(nominal_cl_sum as i64, &items) {
+            Ok((a, _fair_frac)) => allocs = a,
+            Err(e) => {
+                error!(
+                    "Unable to derive new concurrency limits for {:?}: {}",
+                    non_exempt_names, e
+                );
+                backstop = true;
+                allocs = non_exempt_names
+                    .iter()
+                    .map(|n| levels[*n].borrow.lock().unwrap().current_cl as f64)
+                    .collect();
+            }
+        }
+    }
+    for (name, l) in levels {
+        let mut b = l.borrow.lock().unwrap();
+        let current_cl = match idx_of_non_exempt.get(name.as_str()) {
+            None => ccl_of_exempt[name.as_str()],
+            Some(_) if remaining_server_cl <= min_cl_sum as i64 => l.min_cl,
+            Some(_) if remaining_server_cl <= min_current_cl_sum as i64 => {
+                let min_current_cl = l.min_cl.max(l.nominal_cl.min(b.stats.high_watermark));
+                l.min_cl + ((min_current_cl - l.min_cl) as f64 * share_frac).round() as usize
+            }
+            Some(&idx) => allocs[idx].round() as usize,
+        };
+        let rel_change = rel_diff(current_cl as f64, b.current_cl as f64);
+        b.current_cl = current_cl;
+        if rel_change >= 0.05 {
+            tracing::info!(
+                pl = %name, current_cl, high_watermark = b.stats.high_watermark,
+                avg = b.stats.avg, std_dev = b.stats.std_dev, smoothed = b.stats.smoothed,
+                backstop, "Update CurrentCL"
+            );
+        }
+        let qcfg = queuing_config_for_pl(&l.pl);
+        l.queues
+            .set_configuration(
+                qcfg,
+                DispatchingConfig {
+                    concurrency_limit: current_cl,
+                },
+            )
+            .expect("existing priority level's queueing config was validated");
     }
 }
 
@@ -542,6 +755,8 @@ pub struct FlowControlPermit {
 pub struct FlowControlEngine<S: Storage> {
     storage: Arc<S>,
     server_cl: i64,
+    /// The clock queuesets and seat-demand integrators read.
+    clock: Arc<dyn Clock>,
     config: RwLock<Arc<Config>>,
 }
 
@@ -560,18 +775,25 @@ impl<S: Storage> FlowControlEngine<S> {
         storage: Arc<S>,
         max_inflight: i64,
         max_mutating_inflight: i64,
-        _clock: Arc<dyn crate::flow_control_queueset::Clock>,
+        clock: Arc<dyn Clock>,
     ) -> Self {
-        Self::with_limits(storage, max_inflight, max_mutating_inflight)
-    }
-
-    pub fn with_limits(storage: Arc<S>, max_inflight: i64, max_mutating_inflight: i64) -> Self {
         let server_cl = max_inflight + max_mutating_inflight;
+        let config = RwLock::new(Arc::new(digest(vec![], vec![], server_cl, None, &clock)));
         Self {
             storage,
             server_cl,
-            config: RwLock::new(Arc::new(digest(vec![], vec![], server_cl, None))),
+            clock,
+            config,
         }
+    }
+
+    pub fn with_limits(storage: Arc<S>, max_inflight: i64, max_mutating_inflight: i64) -> Self {
+        Self::with_limits_and_clock(
+            storage,
+            max_inflight,
+            max_mutating_inflight,
+            Arc::new(RealClock::default()),
+        )
     }
 
     /// (Re)load FlowSchemas and PriorityLevelConfigurations from storage.
@@ -594,9 +816,7 @@ impl<S: Storage> FlowControlEngine<S> {
             });
         // Digest under the write lock (`lockAndDigestConfigObjects`) so that
         // "idle" cannot change between the check and the swap.
-        let mut cfg = self.config.write().unwrap();
-        let next = digest(pls, fss, self.server_cl, Some(&cfg));
-        *cfg = Arc::new(next);
+        self.digest_config_objects(pls, fss);
         Ok(())
     }
 
@@ -692,7 +912,7 @@ impl<S: Storage> FlowControlEngine<S> {
         }
         let mut cfg = self.config.write().unwrap();
         let (pls, fss) = cfg.inputs.clone();
-        let next = digest(pls, fss, self.server_cl, Some(&cfg));
+        let next = digest(pls, fss, self.server_cl, Some(&cfg), &self.clock);
         *cfg = Arc::new(next);
     }
 
@@ -713,24 +933,41 @@ impl<S: Storage> FlowControlEngine<S> {
         fss: Vec<FlowSchema>,
     ) {
         let mut cfg = self.config.write().unwrap();
-        let next = digest(pls, fss, self.server_cl, Some(&cfg));
+        let next = digest(pls, fss, self.server_cl, Some(&cfg), &self.clock);
         *cfg = Arc::new(next);
     }
 
-    /// `updateBorrowing` (apf_controller.go:393).
-    pub fn update_borrowing(&self) {}
-
-    /// The borrowing bounds and current limit of a level.
-    pub fn borrowing_state(&self, _priority_level: &str) -> Option<BorrowingState> {
-        None
+    /// `updateBorrowing` (apf_controller.go:393): run every
+    /// [`BORROWING_ADJUSTMENT_PERIOD`] under the config write lock.
+    pub fn update_borrowing(&self) {
+        // The write lock only serializes with `digest` and with requests
+        // starting (upstream: `cfgCtlr.lock.Lock()`); the `Config` itself is
+        // mutated through its per-level mutexes.
+        #[allow(clippy::readonly_write_lock)]
+        let cfg = self.config.write().unwrap();
+        update_borrowing_locked(&cfg.levels, cfg.nominal_cl_sum);
     }
 
-    /// The level's seat-demand integrator.
-    pub fn seat_demand(
-        &self,
-        _priority_level: &str,
-    ) -> Option<Arc<crate::flow_control_integrator::Integrator>> {
-        None
+    /// The borrowing bounds and current limit of a level.
+    pub fn borrowing_state(&self, priority_level: &str) -> Option<BorrowingState> {
+        let cfg = self.config.read().unwrap();
+        let l = cfg.levels.get(priority_level)?;
+        let current_cl = l.borrow.lock().unwrap().current_cl;
+        Some(BorrowingState {
+            nominal_cl: l.nominal_cl,
+            min_cl: l.min_cl,
+            max_cl: l.max_cl,
+            current_cl,
+        })
+    }
+
+    /// The level's seat-demand integrator
+    /// (`priorityLevelState.seatDemandIntegrator`).
+    pub fn seat_demand(&self, priority_level: &str) -> Option<Arc<Integrator>> {
+        let cfg = self.config.read().unwrap();
+        cfg.levels
+            .get(priority_level)
+            .map(|l| l.queues.seat_demand())
     }
 
     /// `startRequest` + `Request.Finish` (apf_controller.go:1022-1079,
@@ -1051,6 +1288,47 @@ mod tests {
         // No demand has been observed, so the first adjustment lends all it can.
         e.update_borrowing();
         assert!(e.borrowing_state("a").unwrap().current_cl >= a.min_cl);
+    }
+
+    /// A busy level borrows what an idle lendable level lends, and the
+    /// queueset enforces the new `currentCL` (the point of
+    /// `updateBorrowingLocked` completing the queueset with it).
+    #[test]
+    fn busy_level_borrows_from_idle_lendable_level() {
+        use crate::flow_control_integrator::test_clock::ManualClock;
+        let clk = ManualClock::new();
+        let e = FlowControlEngine::with_limits_and_clock(
+            Arc::new(MemoryStorage::new()),
+            100,
+            0,
+            clk.clone(),
+        );
+        e.digest_config_objects(
+            vec![
+                borrowing_pl("busy", 50, Some(50), None),
+                borrowing_pl("idle", 50, Some(50), None),
+            ],
+            vec![],
+        );
+        let busy = e.borrowing_state("busy").unwrap();
+        assert!(busy.current_cl < busy.nominal_cl + 1);
+        e.seat_demand("busy").unwrap().set(1000.0);
+        clk.set(BORROWING_ADJUSTMENT_PERIOD);
+        e.update_borrowing();
+        let after = e.borrowing_state("busy").unwrap();
+        assert!(
+            after.current_cl > after.nominal_cl,
+            "expected to borrow above nominal {}, got {}",
+            after.nominal_cl,
+            after.current_cl
+        );
+        assert!(after.current_cl <= after.max_cl);
+        assert_eq!(
+            e.queueset_for("busy").unwrap().concurrency_limit(),
+            after.current_cl
+        );
+        let idle = e.borrowing_state("idle").unwrap();
+        assert!(idle.current_cl >= idle.min_cl && idle.current_cl < idle.nominal_cl);
     }
 
     // ---- QueueSet wiring (#2741) ----
