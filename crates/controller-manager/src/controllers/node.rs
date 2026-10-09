@@ -914,15 +914,28 @@ impl<S: Storage + 'static> NodeController<S> {
             zone_states.entry(k.clone()).or_insert(ZoneState::Initial);
         }
 
+        // DELIBERATE DEVIATION from node_lifecycle_controller.go:1015-1028.
+        // Upstream drops emptied zones and checks `v != stateFullDisruption`
+        // in ONE loop over a Go map, `break`ing at the first non-full zone.
+        // Go's map order is random, so an emptied zone visited after the
+        // break is neither cleared nor deleted; later `newZoneStates[k]`
+        // reads then yield Go's zero value silently, but an indexed Rust
+        // `HashMap` panics (flaky `emptied_zone_metrics_reset`). Drop the
+        // emptied zones in a separate pass first so the outcome is order
+        // independent.
+        let emptied: Vec<String> = zone_states
+            .keys()
+            .filter(|k| !zone_to_conditions.contains_key(*k))
+            .cloned()
+            .collect();
+        for k in emptied {
+            node_lifecycle_metrics::clear_zone(&k);
+            zone_states.remove(&k);
+        }
+
         let mut all_was_fully_disrupted = true;
-        let keys: Vec<String> = zone_states.keys().cloned().collect();
-        for k in keys {
-            if !zone_to_conditions.contains_key(&k) {
-                node_lifecycle_metrics::clear_zone(&k);
-                zone_states.remove(&k);
-                continue;
-            }
-            if zone_states[&k] != ZoneState::FullDisruption {
+        for v in zone_states.values() {
+            if *v != ZoneState::FullDisruption {
                 all_was_fully_disrupted = false;
                 break;
             }
