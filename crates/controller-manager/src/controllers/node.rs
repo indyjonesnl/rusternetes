@@ -1,3 +1,4 @@
+use crate::controllers::node_lifecycle_metrics;
 use crate::controllers::node_lifecycle_queue::{
     RateLimitedTimedQueue, RateLimiter, TimedValue, EVICTION_RATE_LIMITER_BURST,
     NODE_EVICTION_PERIOD,
@@ -528,6 +529,8 @@ impl<S: Storage + 'static> NodeController<S> {
         let mut ev = self.evictor.lock().await;
         if !ev.zone_states.contains_key(&zone) {
             ev.zone_states.insert(zone.clone(), ZoneState::Initial);
+            // Init the metric for the new zone (:1233-1235).
+            node_lifecycle_metrics::init_evictions(&zone);
             ev.zone_no_execute_tainter.insert(
                 zone,
                 Arc::new(RateLimitedTimedQueue::new(RateLimiter::token_bucket(
@@ -874,6 +877,10 @@ impl<S: Storage + 'static> NodeController<S> {
                             opposite,
                         )
                         .await;
+                    if ok {
+                        // Count the number of evictions (:654-658).
+                        node_lifecycle_metrics::inc_evictions(&get_zone_key(&node));
+                    }
                     (ok, std::time::Duration::ZERO)
                 })
                 .await;
@@ -898,7 +905,8 @@ impl<S: Storage + 'static> NodeController<S> {
         let mut new_zone_states: HashMap<String, ZoneState> = HashMap::new();
         let mut all_are_fully_disrupted = true;
         for (k, v) in &zone_to_conditions {
-            let (_unhealthy, new_state) = self.eviction.compute_zone_state(v);
+            let (unhealthy, new_state) = self.eviction.compute_zone_state(v);
+            node_lifecycle_metrics::set_zone_stats(k, v.len(), unhealthy);
             if new_state != ZoneState::FullDisruption {
                 all_are_fully_disrupted = false;
             }
@@ -910,6 +918,7 @@ impl<S: Storage + 'static> NodeController<S> {
         let keys: Vec<String> = zone_states.keys().cloned().collect();
         for k in keys {
             if !zone_to_conditions.contains_key(&k) {
+                node_lifecycle_metrics::clear_zone(&k);
                 zone_states.remove(&k);
                 continue;
             }
@@ -2330,5 +2339,89 @@ mod tests {
                 .collect::<Vec<_>>(),
             [ZoneState::Normal]
         );
+    }
+
+    fn metric_zone(zone: &str) -> String {
+        get_zone_key(&znode("x", zone, "True", 0))
+    }
+
+    /// `handleDisruption` (:1001-1004) sets zoneSize / zoneHealth /
+    /// unhealthyNodes per zone; `addPodEvictorForNewZone` (:1235) seeds
+    /// `evictions_total` at 0. Upstream has no test for these series; the
+    /// expected values follow its formulas verbatim.
+    #[tokio::test]
+    async fn monitor_publishes_zone_metrics() {
+        use crate::controllers::node_lifecycle_metrics as m;
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::with_eviction_config(storage.clone(), fast_config());
+        put(&storage, &c, &znode("m0", "metrics-zone-a", "True", 0)).await;
+        put(&storage, &c, &znode("m1", "metrics-zone-a", "True", 0)).await;
+        put(&storage, &c, &znode("m2", "metrics-zone-a", "True", 0)).await;
+        put(
+            &storage,
+            &c,
+            &znode("m3", "metrics-zone-a", "False", SECS_STALE),
+        )
+        .await;
+        c.monitor_node_health().await.unwrap();
+
+        let z = metric_zone("metrics-zone-a");
+        assert_eq!(m::zone_size(&z), Some(4.0));
+        assert_eq!(m::unhealthy_nodes(&z), Some(1.0));
+        assert_eq!(m::zone_health(&z), Some(75.0));
+        assert_eq!(m::evictions_total(&z), 0);
+        assert!(m::gather().contains("node_collector_evictions_total"));
+    }
+
+    /// `doNoExecuteTaintingPass` (:655-658): a successful taint swap counts
+    /// one eviction for the node's zone.
+    #[tokio::test]
+    async fn tainting_pass_counts_evictions() {
+        use crate::controllers::node_lifecycle_metrics as m;
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::with_eviction_config(storage.clone(), fast_config());
+        put(
+            &storage,
+            &c,
+            &znode("e0", "metrics-zone-b", "Unknown", SECS_STALE),
+        )
+        .await;
+        put(&storage, &c, &znode("e1", "metrics-zone-b", "True", 0)).await;
+        c.monitor_node_health().await.unwrap();
+        c.do_no_execute_tainting_pass().await;
+        assert_eq!(m::evictions_total(&metric_zone("metrics-zone-b")), 1);
+    }
+
+    /// `handleDisruption` (:1016-1021): a zone with no nodes left reads
+    /// size 0, health 100, unhealthy 0.
+    #[tokio::test]
+    async fn emptied_zone_metrics_reset() {
+        use crate::controllers::node_lifecycle_metrics as m;
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::with_eviction_config(storage.clone(), fast_config());
+        put(
+            &storage,
+            &c,
+            &znode("r0", "metrics-zone-c", "False", SECS_STALE),
+        )
+        .await;
+        put(&storage, &c, &znode("r1", "metrics-zone-c", "True", 0)).await;
+        put(&storage, &c, &znode("r2", "metrics-zone-d", "True", 0)).await;
+        c.monitor_node_health().await.unwrap();
+        let z = metric_zone("metrics-zone-c");
+        assert_eq!(m::zone_size(&z), Some(2.0));
+
+        storage
+            .delete(&build_key("nodes", None, "r0"))
+            .await
+            .unwrap();
+        storage
+            .delete(&build_key("nodes", None, "r1"))
+            .await
+            .unwrap();
+        c.monitor_node_health().await.unwrap();
+        assert_eq!(m::zone_size(&z), Some(0.0));
+        assert_eq!(m::zone_health(&z), Some(100.0));
+        assert_eq!(m::unhealthy_nodes(&z), Some(0.0));
     }
 }
