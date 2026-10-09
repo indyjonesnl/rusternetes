@@ -3,7 +3,10 @@
 //! check_appArmorProfile_test.go, check_seccompProfile_restricted_test.go,
 //! check_seccompProfile_baseline_test.go, check_seLinuxOptions_test.go,
 //! check_runAsUser_test.go, check_runAsNonRoot_test.go,
-//! check_allowPrivilegeEscalation_test.go.
+//! check_allowPrivilegeEscalation_test.go, check_hostNamespaces_test.go,
+//! check_privileged_test.go, check_hostPathVolumes_test.go,
+//! check_restrictedVolumes_test.go, check_windowsHostProcess_test.go,
+//! check_capabilities_baseline_test.go.
 //! Child module of `pod_security_policy` so it can reach the private checks.
 use super::*;
 use rusternetes_common::resources::pod::Pod;
@@ -644,4 +647,159 @@ fn proc_mount_restricted_table() {
             Some(("procMount", PROC_MOUNT_DETAIL)),
         );
     }
+}
+
+/// check_hostNamespaces_test.go TestHostNamespaces (hostNamespaces_1_0).
+#[test]
+fn host_namespaces_table() {
+    table(
+        host_namespaces_1_0,
+        json!({"hostNetwork": true, "hostIPC": true, "hostPID": true, "containers": []}),
+        Some((
+            "host namespaces",
+            "hostNetwork=true, hostPID=true, hostIPC=true",
+        )),
+    );
+}
+
+/// check_privileged_test.go TestPrivileged (privileged_1_0).
+#[test]
+fn privileged_table() {
+    table(
+        privileged_1_0,
+        json!({"containers": [
+            named("a", None),
+            named("b", Some(json!({}))),
+            named("c", Some(json!({"privileged": false}))),
+            named("d", Some(json!({"privileged": true}))),
+            named("e", Some(json!({"privileged": true}))),
+        ]}),
+        Some((
+            "privileged",
+            r#"containers "d", "e" must not set securityContext.privileged=true"#,
+        )),
+    );
+}
+
+/// check_hostPathVolumes_test.go TestHostPathVolumes (hostPathVolumes_1_0).
+#[test]
+fn host_path_volumes_table() {
+    table(
+        host_path_volumes_1_0,
+        json!({"containers": [], "volumes": [
+            {"name": "a", "hostPath": {"path": ""}},
+            {"name": "b", "hostPath": {"path": ""}},
+            {"name": "c", "emptyDir": {}},
+        ]}),
+        Some(("hostPath volumes", r#"volumes "a", "b""#)),
+    );
+}
+
+/// check_restrictedVolumes_test.go TestRestrictedVolumes
+/// (restrictedVolumes_1_0): every volume source of the table, in order.
+#[test]
+fn restricted_volumes_table() {
+    let allowed: [(&str, Value); 9] = [
+        ("emptyDir", json!({})),
+        ("secret", json!({})),
+        ("persistentVolumeClaim", json!({"claimName": ""})),
+        ("downwardAPI", json!({})),
+        ("configMap", json!({})),
+        ("projected", json!({})),
+        ("csi", json!({"driver": ""})),
+        ("ephemeral", json!({})),
+        ("image", json!({})),
+    ];
+    let restricted: [(&str, Value); 21] = [
+        ("hostPath", json!({"path": ""})),
+        ("gcePersistentDisk", json!({"pdName": ""})),
+        ("awsElasticBlockStore", json!({"volumeID": ""})),
+        ("gitRepo", json!({"repository": ""})),
+        ("nfs", json!({"server": "", "path": ""})),
+        ("iscsi", json!({"targetPortal": "", "iqn": "", "lun": 0})),
+        ("glusterfs", json!({"endpoints": "", "path": ""})),
+        ("rbd", json!({"monitors": [], "image": ""})),
+        ("flexVolume", json!({"driver": ""})),
+        ("cinder", json!({"volumeID": ""})),
+        ("cephfs", json!({"monitors": []})),
+        ("flocker", json!({})),
+        ("fc", json!({})),
+        ("azureFile", json!({"secretName": "", "shareName": ""})),
+        ("vsphereVolume", json!({"volumePath": ""})),
+        ("quobyte", json!({"registry": "", "volume": ""})),
+        ("azureDisk", json!({"diskName": "", "diskURI": ""})),
+        ("photonPersistentDisk", json!({"pdID": ""})),
+        ("portworxVolume", json!({"volumeID": ""})),
+        (
+            "scaleIO",
+            json!({"gateway": "", "system": "", "secretRef": {}}),
+        ),
+        ("storageos", json!({})),
+    ];
+    let mut volumes = Vec::new();
+    for (i, (k, v)) in allowed.iter().enumerate() {
+        volumes.push(json!({"name": format!("a{}", i + 1), *k: v}));
+    }
+    for (i, (k, v)) in restricted.iter().enumerate() {
+        volumes.push(json!({"name": format!("b{}", i + 1), *k: v}));
+    }
+    volumes.push(json!({"name": "c1"}));
+    table(
+        restricted_volumes_1_0,
+        json!({"containers": [], "volumes": volumes}),
+        Some((
+            "restricted volume types",
+            concat!(
+                r#"volumes "b1", "b2", "b3", "b4", "b5", "b6", "b7", "b8", "b9", "b10", "b11", "b12", "b13", "b14", "b15", "b16", "b17", "b18", "b19", "b20", "b21", "c1""#,
+                " use restricted volume types ",
+                r#""awsElasticBlockStore", "azureDisk", "azureFile", "cephfs", "cinder", "fc", "flexVolume", "flocker", "gcePersistentDisk", "gitRepo", "glusterfs", "#,
+                r#""hostPath", "iscsi", "nfs", "photonPersistentDisk", "portworxVolume", "quobyte", "rbd", "scaleIO", "storageos", "unknown", "vsphereVolume""#
+            ),
+        )),
+    );
+}
+
+/// check_windowsHostProcess_test.go TestWindowsHostProcess
+/// (windowsHostProcess_1_0).
+#[test]
+fn windows_host_process_table() {
+    let wo = |hp: Option<bool>| match hp {
+        Some(b) => json!({"windowsOptions": {"hostProcess": b}}),
+        None => json!({"windowsOptions": {}}),
+    };
+    table(
+        windows_host_process_1_0,
+        json!({
+        "securityContext": wo(Some(true)),
+        "containers": [
+            named("a", None),
+            named("b", Some(json!({}))),
+            named("c", Some(wo(None))),
+            named("d", Some(wo(Some(false)))),
+            named("e", Some(wo(Some(true)))),
+            named("f", Some(wo(Some(true)))),
+        ]}),
+        Some((
+            "hostProcess",
+            r#"pod and containers "e", "f" must not set securityContext.windowsOptions.hostProcess=true"#,
+        )),
+    );
+}
+
+/// check_capabilities_baseline_test.go TestCapabilitiesBaseline
+/// (capabilitiesBaseline_1_0).
+#[test]
+fn capabilities_baseline_table() {
+    let add = |names: [&str; 2]| Some(json!({"capabilities": {"add": names}}));
+    table(
+        capabilities_baseline_1_0,
+        json!({"containers": [
+            named("a", add(["FOO", "BAR"])),
+            named("b", add(["BAR", "BAZ"])),
+        ]}),
+        Some((
+            "non-default capabilities",
+            r#"containers "a", "b" must not include "BAR", "BAZ", "FOO" in securityContext.capabilities.add"#,
+        )),
+    );
 }
