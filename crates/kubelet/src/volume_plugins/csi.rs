@@ -1404,15 +1404,29 @@ impl Unmounter for CsiUnmounter {
     }
 }
 
+/// gRPC `codes.ResourceExhausted`.
+const GRPC_RESOURCE_EXHAUSTED: i32 = 8;
+
 /// `isResourceExhaustError` (`csi_plugin.go:234-240`): the attachment's
 /// `status.attachError.errorCode` is gRPC `ResourceExhausted` (8).
 pub(crate) fn is_resource_exhaust_error(attachment: Option<&VolumeAttachment>) -> bool {
-    let _ = attachment;
-    false
+    attachment
+        .and_then(|a| a.status.as_ref())
+        .and_then(|s| s.attach_error.as_ref())
+        .and_then(|e| e.error_code)
+        == Some(GRPC_RESOURCE_EXHAUSTED)
 }
 
 impl CsiPlugin {
-    /// Port of `VerifyExhaustedResource` (`csi_plugin.go:192-232`).
+    /// Port of `VerifyExhaustedResource` (`csi_plugin.go:192-232`): true when
+    /// the volume's VolumeAttachment reports a `ResourceExhausted` attach
+    /// error, after refreshing the CSINode allocatable count
+    /// (`updateCSIDriver`, `csi_node_updater::update_csi_driver`).
+    ///
+    /// Deliberate expression difference: upstream reads `p.host.GetNodeName()`
+    /// and the package-level `nim` / `csiDrivers`; `VolumeHost` here has no node
+    /// name and those are not globals on `CsiPlugin`, so the caller passes them.
+    /// Like upstream every failure is logged and reads as `false`.
     pub async fn verify_exhausted_resource(
         &self,
         spec: &Spec<'_>,
@@ -1420,7 +1434,76 @@ impl CsiPlugin {
         drivers: &crate::volume_plugins::csi_drivers_store::DriversStore,
         nim: &dyn crate::volume_plugins::nodeinfomanager::NodeInfoInstaller,
     ) -> bool {
-        let _ = (spec, node_name, drivers, nim);
+        let Some(csi) = spec.persistent_volume.and_then(|pv| pv.spec.csi.as_ref()) else {
+            error!("Invalid volume spec for CSI");
+            return false;
+        };
+        let plugin_name = csi.driver.as_str();
+
+        let driver = match get_csi_driver(self.host.get_kube_client(), plugin_name).await {
+            Ok(Some(d)) => d,
+            Ok(None) => {
+                error!("Failed to retrieve CSIDriver {plugin_name}: not found");
+                return false;
+            }
+            Err(e) => {
+                error!("Failed to retrieve CSIDriver {plugin_name}: {e}");
+                return false;
+            }
+        };
+
+        let period = crate::volume_plugins::csi_node_updater::get_node_allocatable_update_period(
+            Some(&driver),
+        );
+        if period.is_zero() {
+            return false;
+        }
+
+        let volume_handle = csi.volume_handle.as_deref().unwrap_or_default();
+        let attachment_name = get_attachment_name(volume_handle, plugin_name, node_name);
+        let Some(storage) = self.host.get_kube_client() else {
+            error!("Failed to get volume attachment {attachment_name}: no kubernetes client");
+            return false;
+        };
+        let attachment = match tokio::time::timeout(
+            crate::volume_plugins::csi_client::CSI_TIMEOUT,
+            storage.get::<VolumeAttachment>(&build_key(
+                "volumeattachments",
+                None,
+                &attachment_name,
+            )),
+        )
+        .await
+        {
+            Ok(Ok(a)) => a,
+            Ok(Err(e)) => {
+                error!("Failed to get volume attachment {attachment_name}: {e}");
+                return false;
+            }
+            Err(_) => {
+                error!(
+                    "Failed to get volume attachment {attachment_name}: context deadline exceeded"
+                );
+                return false;
+            }
+        };
+
+        if is_resource_exhaust_error(Some(&attachment)) {
+            debug!(
+                "Detected ResourceExhausted error for volume {} of {plugin_name}",
+                volume_handle
+            );
+            if let Err(e) = crate::volume_plugins::csi_node_updater::update_csi_driver(
+                drivers,
+                nim,
+                plugin_name,
+            )
+            .await
+            {
+                error!("Failed to update CSIDriver {plugin_name}: {e}");
+            }
+            return true;
+        }
         false
     }
 }
