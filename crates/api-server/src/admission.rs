@@ -3,6 +3,7 @@ pub mod pod_security_api;
 pub mod pod_security_controller;
 pub mod pod_security_namespace;
 pub mod pod_security_policy;
+pub mod policy_matching;
 pub mod resourcequota;
 pub mod storage_object_in_use_protection;
 
