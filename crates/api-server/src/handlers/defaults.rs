@@ -69,8 +69,37 @@ pub fn apply_pod_spec_defaults(spec: &mut PodSpec) {
     // defaultMode defaults to 0644 when unset.
     if let Some(ref mut volumes) = spec.volumes {
         for vol in volumes {
+            apply_volume_default_source(vol);
             apply_volume_default_mode(vol);
         }
+    }
+}
+
+/// `SetDefaults_Volume` (pkg/apis/core/v1/defaults.go:66-71): a volume with no
+/// source at all becomes an `emptyDir`
+/// (`if ptr.AllPtrFieldsNil(&obj.VolumeSource)`). PodSecurity's
+/// restricted-volumes check relies on this (upstream test fixture
+/// `volume0` "implicit empty dir").
+fn apply_volume_default_source(vol: &mut rusternetes_common::resources::pod::Volume) {
+    use rusternetes_common::resources::pod::{EmptyDirVolumeSource, LegacyVolumeSources};
+    let none = vol.empty_dir.is_none()
+        && vol.host_path.is_none()
+        && vol.config_map.is_none()
+        && vol.secret.is_none()
+        && vol.persistent_volume_claim.is_none()
+        && vol.downward_api.is_none()
+        && vol.csi.is_none()
+        && vol.ephemeral.is_none()
+        && vol.nfs.is_none()
+        && vol.iscsi.is_none()
+        && vol.projected.is_none()
+        && vol.image.is_none()
+        && vol.legacy_sources == LegacyVolumeSources::default();
+    if none {
+        vol.empty_dir = Some(EmptyDirVolumeSource {
+            medium: None,
+            size_limit: None,
+        });
     }
 }
 
@@ -948,6 +977,32 @@ mod tests {
             Some(0o600),
             "explicit mode preserved"
         );
+    }
+
+    /// SetDefaults_Volume (pkg/apis/core/v1/defaults.go:66-71): a volume with
+    /// no source becomes an emptyDir; one with a source is untouched.
+    #[test]
+    fn test_volume_without_source_defaults_to_empty_dir() {
+        let mut spec = PodSpec {
+            containers: vec![],
+            volumes: Some(vec![
+                serde_json::from_value(serde_json::json!({"name": "bare"})).unwrap(),
+                serde_json::from_value(
+                    serde_json::json!({"name": "gce", "gcePersistentDisk": {"pdName": "x"}}),
+                )
+                .unwrap(),
+                serde_json::from_value(
+                    serde_json::json!({"name": "hp", "hostPath": {"path": "/x"}}),
+                )
+                .unwrap(),
+            ]),
+            ..Default::default()
+        };
+        apply_pod_spec_defaults(&mut spec);
+        let v = spec.volumes.as_deref().unwrap();
+        assert!(v[0].empty_dir.is_some(), "bare volume -> emptyDir");
+        assert!(v[1].empty_dir.is_none(), "legacy source preserved");
+        assert!(v[2].empty_dir.is_none(), "hostPath preserved");
     }
 
     #[test]

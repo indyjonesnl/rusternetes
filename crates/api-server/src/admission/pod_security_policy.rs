@@ -1636,6 +1636,10 @@ fn windows_host_process_1_0(_: &ObjectMeta, spec: &PodSpec) -> CheckResult {
 mod cases;
 
 #[cfg(test)]
+#[path = "pod_security_fixtures.rs"]
+mod fixtures;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use rusternetes_common::resources::pod::Pod;
