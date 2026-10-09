@@ -11,7 +11,9 @@
 // not available on this machine (only its generated Go code is, under the
 // kubernetes vendor tree), so the file is reconstructed from those bindings and
 // holds exactly the Node-service RPCs the kubelet's volume plugin calls
-// (`pkg/volume/csi/csi_client.go`). The `csi_secret` field option is omitted: it
+// (`pkg/volume/csi/csi_client.go`), plus the Identity.GetPluginCapabilities and
+// Controller (CreateVolume/DeleteVolume/ControllerGetCapabilities/
+// CreateSnapshot/DeleteSnapshot) RPCs of the external-provisioner client. The `csi_secret` field option is omitted: it
 // only drives log redaction in Go's `protosanitizer` and has no wire effect.
 // Replace with the verbatim file when the spec repo is vendored.
 

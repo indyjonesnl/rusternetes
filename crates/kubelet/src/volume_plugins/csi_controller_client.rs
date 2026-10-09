@@ -49,9 +49,26 @@ pub enum ProvisioningState {
 }
 
 /// Port of `checkError` (`controller.go:2036-2073`).
+///
+/// Only a gRPC status reaches here; a non-gRPC error is handled by
+/// [`ControllerError::provisioning_state`].
 pub fn provisioning_state(status: &tonic::Status, may_reschedule: bool) -> ProvisioningState {
-    let _ = (status, may_reschedule);
-    todo!()
+    use tonic::Code::*;
+    match status.code() {
+        // CSI: operation not pending, "Unable to provision in
+        // `accessible_topology`". May succeed on another node.
+        ResourceExhausted => {
+            if may_reschedule {
+                ProvisioningState::Reschedule
+            } else {
+                ProvisioningState::Finished
+            }
+        }
+        // The previous call may still be in progress.
+        Cancelled | DeadlineExceeded | Unavailable | Aborted => ProvisioningState::InBackground,
+        // Provisioning either did not start or failed: not in progress.
+        _ => ProvisioningState::Finished,
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -77,9 +94,18 @@ impl ControllerError {
         }
     }
 
+    /// The provisioning state this error implies. Failures before any RPC
+    /// leave nothing to clean up (`ProvisioningNoChange`); a malformed driver
+    /// answer is treated like `checkError`'s non-gRPC branch
+    /// (`controller.go:2041-2046`): be on the safe side, assume in progress.
     pub fn provisioning_state(&self, may_reschedule: bool) -> ProvisioningState {
-        let _ = may_reschedule;
-        todo!()
+        match self {
+            ControllerError::Grpc(s) => provisioning_state(s, may_reschedule),
+            ControllerError::InvalidResponse(_) => ProvisioningState::InBackground,
+            ControllerError::UnsupportedCapability(_) | ControllerError::InvalidArgument(_) => {
+                ProvisioningState::NoChange
+            }
+        }
     }
 }
 
@@ -93,7 +119,8 @@ pub struct DriverCapabilities {
 impl DriverCapabilities {
     /// `SupportsTopology`: `VOLUME_ACCESSIBILITY_CONSTRAINTS`.
     pub fn supports_topology(&self) -> bool {
-        todo!()
+        self.plugin
+            .contains(&PluginService::VolumeAccessibilityConstraints)
     }
 }
 
@@ -106,19 +133,62 @@ pub struct RequiredCapabilities {
 }
 
 impl RequiredCapabilities {
+    /// What a `CreateVolumeRequest` needs beyond plain create/delete: a
+    /// snapshot source needs `CREATE_DELETE_SNAPSHOT`, a volume source needs
+    /// `CLONE_VOLUME` (`getSnapshotSource` / `getPVCSource`), and mutable
+    /// parameters (a VolumeAttributesClass) need `MODIFY_VOLUME`.
     pub fn for_request(req: &CreateVolumeRequest) -> Self {
-        let _ = req;
-        todo!()
+        let mut rc = Self::default();
+        match req
+            .volume_content_source
+            .as_ref()
+            .and_then(|s| s.r#type.as_ref())
+        {
+            Some(proto::volume_content_source::Type::Snapshot(_)) => rc.snapshot = true,
+            Some(proto::volume_content_source::Type::Volume(_)) => rc.clone = true,
+            None => {}
+        }
+        rc.modify_volume = !req.mutable_parameters.is_empty();
+        rc
     }
 }
 
-/// Port of `checkDriverCapabilities` (`controller.go:449-483`).
+/// Port of `checkDriverCapabilities` (`controller.go:449-483`), messages verbatim.
 pub fn check_driver_capabilities(
     caps: &DriverCapabilities,
     rc: &RequiredCapabilities,
 ) -> Result<(), ControllerError> {
-    let _ = (caps, rc);
-    todo!()
+    let unsupported = |m: &str| Err(ControllerError::UnsupportedCapability(m.to_string()));
+    if !caps.plugin.contains(&PluginService::ControllerService) {
+        return unsupported(
+            "CSI driver does not support dynamic provisioning: plugin CONTROLLER_SERVICE capability is not reported",
+        );
+    }
+    if !caps.controller.contains(&ControllerRpc::CreateDeleteVolume) {
+        return unsupported(
+            "CSI driver does not support dynamic provisioning: controller CREATE_DELETE_VOLUME capability is not reported",
+        );
+    }
+    if rc.snapshot
+        && !caps
+            .controller
+            .contains(&ControllerRpc::CreateDeleteSnapshot)
+    {
+        return unsupported(
+            "CSI driver does not support snapshot restore: controller CREATE_DELETE_SNAPSHOT capability is not reported",
+        );
+    }
+    if rc.clone && !caps.controller.contains(&ControllerRpc::CloneVolume) {
+        return unsupported(
+            "CSI driver does not support clone operations: controller CLONE_VOLUME capability is not reported",
+        );
+    }
+    if rc.modify_volume && !caps.controller.contains(&ControllerRpc::ModifyVolume) {
+        return unsupported(
+            "CSI driver does not support VolumeAttributesClass: controller MODIFY_VOLUME capability is not reported",
+        );
+    }
+    Ok(())
 }
 
 pub struct CsiControllerClient {
@@ -134,12 +204,13 @@ impl CsiControllerClient {
         }
     }
 
+    /// Per-operation timeout (`--timeout`, default [`DEFAULT_OPERATION_TIMEOUT`]).
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
-    #[allow(dead_code)]
+    /// Lazily dial the driver's unix socket (same connector as the Node client).
     fn channel(&self) -> Result<Channel, ControllerError> {
         let path = normalize_endpoint(&self.endpoint);
         let endpoint = Endpoint::try_from("http://[::]:50051")
@@ -155,36 +226,143 @@ impl CsiControllerClient {
         )
     }
 
+    /// One operation under its own timeout (`context.WithTimeout(.., p.timeout)`),
+    /// a timeout surfacing as the `DeadlineExceeded` status Go's context yields.
+    async fn call<T>(
+        &self,
+        fut: impl std::future::Future<Output = Result<tonic::Response<T>, tonic::Status>>,
+    ) -> Result<T, ControllerError> {
+        match tokio::time::timeout(self.timeout, fut).await {
+            Ok(r) => r
+                .map(|r| r.into_inner())
+                .map_err(|s| ControllerError::Grpc(Box::new(s))),
+            Err(_) => Err(ControllerError::Grpc(Box::new(
+                tonic::Status::deadline_exceeded("context deadline exceeded"),
+            ))),
+        }
+    }
+
+    /// Port of `GetDriverCapabilities` (`controller.go:331-348`) with
+    /// `rpc.GetPluginCapabilities` / `rpc.GetControllerCapabilities`
+    /// (csi-lib-utils `rpc/common.go`): only supported capabilities are kept.
     pub async fn get_driver_capabilities(&self) -> Result<DriverCapabilities, ControllerError> {
-        let _: Option<(IdentityClient<Channel>, ControllerClient<Channel>)> = None;
-        let _ = (
-            GetPluginCapabilitiesRequest {},
-            ControllerGetCapabilitiesRequest {},
-        );
-        todo!()
+        let ch = self.channel()?;
+        let plugin = self
+            .call(
+                IdentityClient::new(ch.clone())
+                    .get_plugin_capabilities(GetPluginCapabilitiesRequest {}),
+            )
+            .await?;
+        let controller = self
+            .call(
+                ControllerClient::new(ch)
+                    .controller_get_capabilities(ControllerGetCapabilitiesRequest {}),
+            )
+            .await?;
+        let mut caps = DriverCapabilities::default();
+        for c in plugin.capabilities {
+            if let Some(proto::plugin_capability::Type::Service(s)) = c.r#type {
+                if let Ok(t) = PluginService::try_from(s.r#type) {
+                    caps.plugin.insert(t);
+                }
+            }
+        }
+        for c in controller.capabilities {
+            if let Some(proto::controller_service_capability::Type::Rpc(r)) = c.r#type {
+                if let Ok(t) = ControllerRpc::try_from(r.r#type) {
+                    caps.controller.insert(t);
+                }
+            }
+        }
+        Ok(caps)
     }
 
+    /// `CreateVolume` (`controller.go:878-880`), after `checkDriverCapabilities`.
+    /// `VolumeContentSource` selects snapshot restore / clone.
     pub async fn create_volume(&self, req: CreateVolumeRequest) -> Result<Volume, ControllerError> {
-        let _ = req;
-        todo!()
+        // CSI spec: `name` and `volume_capabilities` are REQUIRED.
+        if req.name.is_empty() {
+            return Err(ControllerError::InvalidArgument(
+                "CreateVolume: name must be set".into(),
+            ));
+        }
+        if req.volume_capabilities.is_empty() {
+            return Err(ControllerError::InvalidArgument(
+                "CreateVolume: volume_capabilities must be set".into(),
+            ));
+        }
+        let caps = self.get_driver_capabilities().await?;
+        check_driver_capabilities(&caps, &RequiredCapabilities::for_request(&req))?;
+        let resp = self
+            .call(ControllerClient::new(self.channel()?).create_volume(req))
+            .await?;
+        match resp.volume {
+            Some(v) if !v.volume_id.is_empty() => Ok(v),
+            _ => Err(ControllerError::InvalidResponse(
+                "CreateVolume returned no volume or an empty volume_id".into(),
+            )),
+        }
     }
 
+    /// `DeleteVolume` (`controller.go:1452`). Idempotent per the CSI spec.
     pub async fn delete_volume(&self, req: DeleteVolumeRequest) -> Result<(), ControllerError> {
-        let _ = req;
-        todo!()
+        if req.volume_id.is_empty() {
+            return Err(ControllerError::InvalidArgument(
+                "DeleteVolume: volume_id must be set".into(),
+            ));
+        }
+        self.call(ControllerClient::new(self.channel()?).delete_volume(req))
+            .await
+            .map(|_| ())
     }
 
+    /// `CreateSnapshot`, gated on `CREATE_DELETE_SNAPSHOT` (external-snapshotter).
     pub async fn create_snapshot(
         &self,
         req: CreateSnapshotRequest,
     ) -> Result<Snapshot, ControllerError> {
-        let _ = req;
-        todo!()
+        if req.source_volume_id.is_empty() || req.name.is_empty() {
+            return Err(ControllerError::InvalidArgument(
+                "CreateSnapshot: source_volume_id and name must be set".into(),
+            ));
+        }
+        self.require_snapshot().await?;
+        let resp = self
+            .call(ControllerClient::new(self.channel()?).create_snapshot(req))
+            .await?;
+        match resp.snapshot {
+            Some(s) if !s.snapshot_id.is_empty() => Ok(s),
+            _ => Err(ControllerError::InvalidResponse(
+                "CreateSnapshot returned no snapshot or an empty snapshot_id".into(),
+            )),
+        }
     }
 
+    /// `DeleteSnapshot`, gated on `CREATE_DELETE_SNAPSHOT`. Idempotent.
     pub async fn delete_snapshot(&self, req: DeleteSnapshotRequest) -> Result<(), ControllerError> {
-        let _ = req;
-        todo!()
+        if req.snapshot_id.is_empty() {
+            return Err(ControllerError::InvalidArgument(
+                "DeleteSnapshot: snapshot_id must be set".into(),
+            ));
+        }
+        self.require_snapshot().await?;
+        self.call(ControllerClient::new(self.channel()?).delete_snapshot(req))
+            .await
+            .map(|_| ())
+    }
+
+    async fn require_snapshot(&self) -> Result<(), ControllerError> {
+        let caps = self.get_driver_capabilities().await?;
+        if !caps.plugin.contains(&PluginService::ControllerService)
+            || !caps
+                .controller
+                .contains(&ControllerRpc::CreateDeleteSnapshot)
+        {
+            return Err(ControllerError::UnsupportedCapability(
+                "CSI driver does not support snapshots: controller CREATE_DELETE_SNAPSHOT capability is not reported".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
