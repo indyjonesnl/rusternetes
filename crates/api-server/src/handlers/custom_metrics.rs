@@ -107,6 +107,7 @@ pub async fn list_custom_metrics(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, resource_type, metric_name)): Path<(String, String, String)>,
     Query(query): Query<MetricQuery>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<MetricValueList>> {
     info!(
         "Listing custom metric {} for {}/{}",
@@ -122,6 +123,8 @@ pub async fn list_custom_metrics(
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
         return Err(rusternetes_common::Error::Forbidden(reason));
     }
+
+    crate::handlers::validate_synthesized_list_options(&params)?;
 
     // Parse label selector if provided
     let (selector, label_map) = if let Some(label_selector) = query.label_selector {

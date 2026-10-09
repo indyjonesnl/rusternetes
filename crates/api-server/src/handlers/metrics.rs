@@ -177,6 +177,8 @@ pub async fn list_node_metrics(
         return Err(rusternetes_common::Error::Forbidden(reason));
     }
 
+    crate::handlers::validate_synthesized_list_options(&params)?;
+
     // metrics-server pkg/api/node.go builds NodeMetrics with the source
     // node's labels; selectors match those, so overlay them from the Node.
     let nodes_prefix = build_prefix("nodes", None);
@@ -286,6 +288,8 @@ pub async fn list_pod_metrics(
         return Err(rusternetes_common::Error::Forbidden(reason));
     }
 
+    crate::handlers::validate_synthesized_list_options(&params)?;
+
     // Get all pods in namespace
     let pods_prefix = build_prefix("pods", Some(&namespace));
     let pods: Vec<rusternetes_common::resources::Pod> =
@@ -321,6 +325,8 @@ pub async fn list_all_pod_metrics(
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
         return Err(rusternetes_common::Error::Forbidden(reason));
     }
+
+    crate::handlers::validate_synthesized_list_options(&params)?;
 
     // Get all namespaces first
     let ns_prefix = build_prefix("namespaces", None);
