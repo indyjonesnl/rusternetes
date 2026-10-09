@@ -4315,6 +4315,7 @@ dependencies = [
  "mimalloc",
  "openapiv3",
  "pem",
+ "prometheus",
  "prometheus-http-query",
  "prost",
  "prost-build",

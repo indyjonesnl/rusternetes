@@ -58,12 +58,14 @@ use rusternetes_common::validation::flowcontrol_bootstrap::{
 use rusternetes_storage::{build_key, Storage};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::flow_control_conc_alloc::{compute_concurrency_allocation, AllocProblemItem};
 use crate::flow_control_integrator::{Integrator, IntegratorResults};
+use crate::flow_control_metrics as fcmetrics;
 use crate::flow_control_queueset::{
-    Clock, DispatchingConfig, Execution, QueueSet, QueuingConfig, RealClock, WorkEstimate,
+    Clock, DispatchingConfig, Execution, QueueSet, QueuingConfig, RealClock, RejectReason,
+    WorkEstimate,
 };
 use sha2::{Digest, Sha256};
 use tracing::{error, warn};
@@ -750,6 +752,89 @@ impl std::error::Error for FlowControlError {}
 /// Holds seats while a request executes; released on drop.
 pub struct FlowControlPermit {
     _execution: Option<Execution>,
+    /// The metrics `Handle`'s dispatched closure maintains (apf_filter.go:181-193);
+    /// dropped (and so recorded) with the permit, i.e. when the seats are
+    /// released.
+    metrics: Option<ExecutionMetrics>,
+}
+
+impl FlowControlPermit {
+    /// A permit with no seat behind it (exempt/unknown level).
+    fn untracked() -> Self {
+        Self {
+            _execution: None,
+            metrics: None,
+        }
+    }
+
+    /// Label the execution `type="watch"` for `request_execution_seconds`
+    /// (`ObserveExecutionDuration`, metrics.go:585-592: `RequestInfo.Verb == "watch"`).
+    pub fn mark_watch(&mut self) {
+        if let Some(m) = self.metrics.as_mut() {
+            m.is_watch = true;
+        }
+    }
+}
+
+/// Seats a request holds in a queue until it dispatches or gives up
+/// (`AddRequestsInQueues`/`AddSeatsInQueues`, queueset.go:646, :705, :434).
+struct InQueue {
+    priority_level: String,
+    flow_schema: String,
+    seats: i64,
+}
+
+impl InQueue {
+    fn new(priority_level: &str, flow_schema: &str, seats: usize) -> Self {
+        fcmetrics::add_in_queues(priority_level, flow_schema, 1, seats as i64);
+        Self {
+            priority_level: priority_level.to_string(),
+            flow_schema: flow_schema.to_string(),
+            seats: seats as i64,
+        }
+    }
+}
+
+impl Drop for InQueue {
+    fn drop(&mut self) {
+        fcmetrics::add_in_queues(&self.priority_level, &self.flow_schema, -1, -self.seats);
+    }
+}
+
+/// A dispatched request's executing gauges (`AddRequestsExecuting` +
+/// `AddSeatConcurrencyInUse`, queueset.go:678, :724, :866, :878) and its
+/// execution duration (apf_filter.go:187-191).
+struct ExecutionMetrics {
+    priority_level: String,
+    flow_schema: String,
+    seats: i64,
+    started: Instant,
+    is_watch: bool,
+}
+
+impl ExecutionMetrics {
+    fn new(priority_level: &str, flow_schema: &str, seats: usize) -> Self {
+        fcmetrics::add_executing(priority_level, flow_schema, 1, seats as i64);
+        Self {
+            priority_level: priority_level.to_string(),
+            flow_schema: flow_schema.to_string(),
+            seats: seats as i64,
+            started: Instant::now(),
+            is_watch: false,
+        }
+    }
+}
+
+impl Drop for ExecutionMetrics {
+    fn drop(&mut self) {
+        fcmetrics::add_executing(&self.priority_level, &self.flow_schema, -1, -self.seats);
+        fcmetrics::observe_execution_duration(
+            &self.priority_level,
+            &self.flow_schema,
+            self.is_watch,
+            self.started.elapsed(),
+        );
+    }
 }
 
 pub struct FlowControlEngine<S: Storage> {
@@ -1028,7 +1113,7 @@ impl<S: Storage> FlowControlEngine<S> {
         let started = {
             let guard = self.config.read().unwrap();
             let Some(level) = guard.levels.get(&c.priority_level) else {
-                return Ok(FlowControlPermit { _execution: None });
+                return Ok(FlowControlPermit::untracked());
             };
             // The flow distinguisher and hash only matter with more than one
             // queue.
@@ -1044,9 +1129,19 @@ impl<S: Storage> FlowControlEngine<S> {
                 .queues
                 .start_request(we, hash_value, flow_distinguisher, &c.flow_schema)
         };
+        let (pl, fs) = (c.priority_level.as_str(), c.flow_schema.as_str());
         let handle = match started {
             Ok(h) => h,
             Err(rejected) => {
+                // `AddReject` (queueset.go:321, :340).
+                fcmetrics::add_reject(
+                    pl,
+                    fs,
+                    match rejected.reason {
+                        RejectReason::ConcurrencyLimit => "concurrency-limit",
+                        RejectReason::QueueFull => "queue-full",
+                    },
+                );
                 // `if idle { maybeReapReadLocked }` (apf_controller.go:1075-1077)
                 if rejected.idle {
                     self.maybe_reap(&c.priority_level);
@@ -1054,15 +1149,42 @@ impl<S: Storage> FlowControlEngine<S> {
                 return Err(FlowControlError::TooManyRequests);
             }
         };
+        let seats = we.max_seats();
+        // `queued := startWaitingTime != time.Time{}` (apf_filter.go:158):
+        // the request is waiting in a queue rather than already dispatched.
+        let queued = if handle.is_dispatched() {
+            None
+        } else {
+            Some((InQueue::new(pl, fs, seats), Instant::now()))
+        };
         // Dropping the wait future on timeout cancels the queued request.
         match tokio::time::timeout(wait_limit, handle.wait()).await {
             Ok(exec) => {
+                if let Some((in_queue, since)) = queued {
+                    drop(in_queue);
+                    // `observeQueueWaitTime(..., FormatBool(req != nil), ...)`
+                    // (apf_filter.go:183-185).
+                    fcmetrics::observe_waiting_duration(pl, fs, true, since.elapsed());
+                }
                 exec.note_dispatched();
+                // `AddDispatch` (apf_filter.go:187).
+                fcmetrics::add_dispatch(pl, fs);
                 Ok(FlowControlPermit {
                     _execution: Some(exec),
+                    metrics: Some(ExecutionMetrics::new(pl, fs, seats)),
                 })
             }
-            Err(_) => Err(FlowControlError::TooManyRequests),
+            Err(_) => {
+                if let Some((in_queue, since)) = queued {
+                    drop(in_queue);
+                    // `if queued && !executed` (apf_filter.go:199-201); `req`
+                    // is non-nil here, so `execute` is "true" as upstream.
+                    fcmetrics::observe_waiting_duration(pl, fs, true, since.elapsed());
+                }
+                // `AddReject(..., "time-out")` (queueset.go:433).
+                fcmetrics::add_reject(pl, fs, "time-out");
+                Err(FlowControlError::TooManyRequests)
+            }
         }
     }
 }
@@ -1384,6 +1506,17 @@ mod tests {
         pl
     }
 
+    fn reject_pl() -> PriorityLevelConfiguration {
+        let mut pl = queueing_pl(0, 0, 0);
+        if let Some(l) = pl.spec.limited.as_mut() {
+            l.limit_response = Some(LimitResponse {
+                type_: LimitResponseType::Reject,
+                queuing: None,
+            });
+        }
+        pl
+    }
+
     async fn engine_with(pl: PriorityLevelConfiguration) -> FlowControlEngine<MemoryStorage> {
         let st = Arc::new(MemoryStorage::new());
         st.create(&build_key("prioritylevelconfigurations", None, "test"), &pl)
@@ -1689,5 +1822,213 @@ mod tests {
                 held.clear();
             }
         }
+    }
+
+    // ---- apiserver_flowcontrol_* metrics (#2809) ----
+    //
+    // Ports of the observations `queueset.go` (AddReject :321/:340/:433,
+    // AddRequestsInQueues :646/:705, AddRequestsExecuting :678/:724/:866,
+    // AddSeatConcurrencyInUse) and `apf_filter.go` `Handle` (:164-201:
+    // AddDispatch, ObserveExecutionDuration, observeQueueWaitTime) make.
+
+    use super::metric_test_util::sample;
+
+    #[tokio::test]
+    async fn dispatch_counts_and_executing_gauges_follow_the_permit() {
+        let e = engine_with(queueing_pl(4, 1, 10)).await;
+        let l = [("priority_level", "test"), ("flow_schema", "m-dispatch")];
+        let before = sample("apiserver_flowcontrol_dispatched_requests_total", &l);
+        let permit = e
+            .execute(
+                &cls("m-dispatch", "test", "a"),
+                1,
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sample("apiserver_flowcontrol_dispatched_requests_total", &l) - before,
+            1.0
+        );
+        assert_eq!(
+            sample("apiserver_flowcontrol_current_executing_requests", &l),
+            1.0
+        );
+        assert_eq!(
+            sample("apiserver_flowcontrol_current_executing_seats", &l),
+            1.0
+        );
+        let exec_before = sample("apiserver_flowcontrol_request_execution_seconds", &l);
+        drop(permit);
+        assert_eq!(
+            sample("apiserver_flowcontrol_current_executing_requests", &l),
+            0.0
+        );
+        assert_eq!(
+            sample("apiserver_flowcontrol_current_executing_seats", &l),
+            0.0
+        );
+        assert_eq!(
+            sample("apiserver_flowcontrol_request_execution_seconds", &l) - exec_before,
+            1.0
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_full_is_counted_as_a_rejection() {
+        let e = Arc::new(engine_with(queueing_pl(1, 1, 1)).await);
+        let _held = e
+            .execute(&cls("m-full", "test", "a"), 1, Duration::from_millis(5))
+            .await
+            .unwrap();
+        let e2 = e.clone();
+        let queued = tokio::spawn(async move {
+            e2.execute(&cls("m-full", "test", "a"), 1, Duration::from_millis(300))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let l = [
+            ("priority_level", "test"),
+            ("flow_schema", "m-full"),
+            ("reason", "queue-full"),
+        ];
+        let before = sample("apiserver_flowcontrol_rejected_requests_total", &l);
+        let inq = [("priority_level", "test"), ("flow_schema", "m-full")];
+        assert_eq!(
+            sample("apiserver_flowcontrol_current_inqueue_requests", &inq),
+            1.0
+        );
+        assert_eq!(
+            sample("apiserver_flowcontrol_current_inqueue_seats", &inq),
+            1.0
+        );
+        assert!(e
+            .execute(&cls("m-full", "test", "a"), 1, Duration::from_millis(5))
+            .await
+            .is_err());
+        assert_eq!(
+            sample("apiserver_flowcontrol_rejected_requests_total", &l) - before,
+            1.0
+        );
+        queued.abort();
+    }
+
+    #[tokio::test]
+    async fn a_wait_that_times_out_is_a_time_out_rejection_and_leaves_the_queue() {
+        let e = engine_with(queueing_pl(4, 1, 10)).await;
+        let _held = e
+            .execute(&cls("m-to", "test", "a"), 1, Duration::from_millis(5))
+            .await
+            .unwrap();
+        let l = [
+            ("priority_level", "test"),
+            ("flow_schema", "m-to"),
+            ("reason", "time-out"),
+        ];
+        let before = sample("apiserver_flowcontrol_rejected_requests_total", &l);
+        assert!(e
+            .execute(&cls("m-to", "test", "a"), 1, Duration::from_millis(20))
+            .await
+            .is_err());
+        assert_eq!(
+            sample("apiserver_flowcontrol_rejected_requests_total", &l) - before,
+            1.0
+        );
+        let q = [("priority_level", "test"), ("flow_schema", "m-to")];
+        assert_eq!(
+            sample("apiserver_flowcontrol_current_inqueue_requests", &q),
+            0.0
+        );
+        // The waited request is observed with execute="true" (`req != nil`,
+        // apf_filter.go:201 call sites).
+        assert_eq!(
+            sample("apiserver_flowcontrol_request_wait_duration_seconds", &q),
+            1.0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_queued_request_that_dispatches_observes_its_wait() {
+        let e = Arc::new(engine_with(queueing_pl(4, 1, 10)).await);
+        let held = e
+            .execute(&cls("m-wait", "test", "a"), 1, Duration::from_millis(5))
+            .await
+            .unwrap();
+        let e2 = e.clone();
+        let t = tokio::spawn(async move {
+            e2.execute(&cls("m-wait", "test", "a"), 1, Duration::from_secs(5))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        drop(held);
+        let _p = t.await.unwrap().unwrap();
+        let l = [
+            ("priority_level", "test"),
+            ("flow_schema", "m-wait"),
+            ("execute", "true"),
+        ];
+        // Only the queued request observes a wait (`if queued`).
+        assert_eq!(
+            sample("apiserver_flowcontrol_request_wait_duration_seconds", &l),
+            1.0
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrency_limit_rejection_without_queues() {
+        // desired_num_queues < 1 (Reject-type level): queueset.go:321.
+        let e = engine_with(reject_pl()).await;
+        let _held = e
+            .execute(&cls("m-cl", "test", ""), 1, Duration::from_millis(5))
+            .await
+            .unwrap();
+        let l = [
+            ("priority_level", "test"),
+            ("flow_schema", "m-cl"),
+            ("reason", "concurrency-limit"),
+        ];
+        let before = sample("apiserver_flowcontrol_rejected_requests_total", &l);
+        assert!(e
+            .execute(&cls("m-cl", "test", ""), 1, Duration::from_millis(5))
+            .await
+            .is_err());
+        assert_eq!(
+            sample("apiserver_flowcontrol_rejected_requests_total", &l) - before,
+            1.0
+        );
+    }
+}
+
+/// Reads samples back out of the process-global registry
+/// (`legacyregistry`, which `/metrics` serves).
+#[cfg(test)]
+pub(crate) mod metric_test_util {
+    /// The value of the counter/gauge, or the sample count of the histogram,
+    /// of `name` whose labels include all of `labels` (0 when absent).
+    pub fn sample(name: &str, labels: &[(&str, &str)]) -> f64 {
+        let mut total = 0.0;
+        for mf in prometheus::default_registry().gather() {
+            if mf.name() != name {
+                continue;
+            }
+            for m in mf.get_metric() {
+                let ok = labels.iter().all(|(k, v)| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.name() == *k && l.value() == *v)
+                });
+                if !ok {
+                    continue;
+                }
+                total += match mf.get_field_type() {
+                    prometheus::proto::MetricType::HISTOGRAM => {
+                        m.get_histogram().get_sample_count() as f64
+                    }
+                    prometheus::proto::MetricType::COUNTER => m.get_counter().value(),
+                    _ => m.get_gauge().value(),
+                };
+            }
+        }
+        total
     }
 }

@@ -24,6 +24,8 @@ mod flow_control_filter;
 #[allow(dead_code)]
 mod flow_control_integrator;
 #[allow(dead_code)]
+mod flow_control_metrics;
+#[allow(dead_code)]
 mod flow_control_object_count;
 #[allow(dead_code)]
 mod flow_control_queueset;

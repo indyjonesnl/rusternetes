@@ -18,6 +18,7 @@ pub mod flow_control;
 pub mod flow_control_conc_alloc;
 pub mod flow_control_filter;
 pub mod flow_control_integrator;
+pub mod flow_control_metrics;
 pub mod flow_control_object_count;
 pub mod flow_control_queueset;
 pub mod flow_control_stats_poller;
