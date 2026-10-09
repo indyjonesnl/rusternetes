@@ -2,7 +2,7 @@ use crate::controllers::worker_pool::spawn_workers;
 use anyhow::Result;
 use futures::StreamExt;
 use rusternetes_common::resources::workloads::{
-    Job, JobCondition, JobStatus, UncountedTerminatedPods,
+    Job, JobCondition, JobStatus, SuccessPolicy, UncountedTerminatedPods,
 };
 use rusternetes_common::resources::{Pod, PodStatus};
 use rusternetes_common::types::{OwnerReference, Phase};
@@ -1909,33 +1909,17 @@ impl<S: Storage + 'static> JobController<S> {
             namespace, name, active, succeeded, failed, completions
         );
 
-        // Check maxFailedIndexes — if the number of failed indexes exceeds this limit, fail the job
-        let max_failed_indexes_exceeded = if is_indexed {
-            if let Some(max_failed) = job.spec.max_failed_indexes {
-                let failed_index_count = all_failed_index_set.len() as i32;
-                // Also count unique indexes with only failed pods (no succeeded) when no backoffLimitPerIndex
-                if backoff_limit_per_index.is_none() && fail_index_set.is_empty() {
-                    let mut failed_idx_set: HashSet<i32> = HashSet::new();
-                    for pod in job_pods.iter() {
-                        if matches!(
-                            pod.status.as_ref().and_then(|s| s.phase.as_ref()),
-                            Some(Phase::Failed)
-                        ) {
-                            if let Some(index) = get_pod_index(pod) {
-                                failed_idx_set.insert(index);
-                            }
-                        }
-                    }
-                    failed_idx_set.len() as i32 > max_failed
-                } else {
-                    failed_index_count > max_failed
-                }
-            } else {
-                false
-            }
-        } else {
-            false
-        };
+        // maxFailedIndexes is evaluated only inside `hasBackoffLimitPerIndex`
+        // (job_controller.go:978-985):
+        //   if job.Spec.MaxFailedIndexes != nil && jobCtx.failedIndexes.total() > int(*job.Spec.MaxFailedIndexes)
+        // Without backoffLimitPerIndex failed pods count only against
+        // backoffLimit.
+        let max_failed_indexes_exceeded = is_indexed
+            && backoff_limit_per_index.is_some()
+            && job
+                .spec
+                .max_failed_indexes
+                .is_some_and(|max| all_failed_index_set.len() as i64 > i64::from(max));
 
         // For backoffLimitPerIndex, job fails when all indexes are either succeeded or failed
         // Failure scenarios come before deadline, successPolicy and completions
@@ -2062,36 +2046,18 @@ impl<S: Storage + 'static> JobController<S> {
         };
 
         // Check successPolicy — if defined and criteria met, mark job complete
-        let success_policy_matched = if let Some(ref policy) = job.spec.success_policy {
-            policy.rules.iter().any(|rule| {
-                let indexes_ok = if let Some(ref succeeded_indexes_str) = rule.succeeded_indexes {
-                    // Parse required indexes and check they are all in completed set
-                    let completed = completed_indexes.as_deref().unwrap_or("");
-                    let completed_set: HashSet<i32> = parse_index_ranges(completed);
-                    let required_set: HashSet<i32> = parse_index_ranges(succeeded_indexes_str);
-                    required_set.is_subset(&completed_set)
-                } else {
-                    true // No index constraint
-                };
-
-                let count_ok = if let Some(count) = rule.succeeded_count {
-                    succeeded_index_count >= count
-                } else {
-                    true // No count constraint
-                };
-
-                // If rule has neither succeededIndexes nor succeededCount, match on all completions
-                let has_criteria =
-                    rule.succeeded_indexes.is_some() || rule.succeeded_count.is_some();
-                if has_criteria {
-                    indexes_ok && count_ok
-                } else {
-                    succeeded_index_count >= completions
-                }
-            })
+        // `matchSuccessPolicy` (success_policy.go:28), reached only inside
+        // `if isIndexedJob(&job)` (job_controller.go:991-996).
+        let success_policy_message = if is_indexed {
+            match_success_policy(
+                job.spec.success_policy.as_ref(),
+                completions,
+                &succeeded_index_set,
+            )
         } else {
-            false
+            None
         };
+        let success_policy_matched = success_policy_message.is_some();
 
         // Success scenarios are evaluated after failures (:988-994); a
         // persisted SuccessCriteriaMet is honoured regardless of the spec.
@@ -2100,7 +2066,7 @@ impl<S: Storage + 'static> JobController<S> {
         let (success_reason, success_message) = persisted_success.clone().unwrap_or_else(|| {
             (
                 "SuccessPolicy".to_string(),
-                "Matched rules in the SuccessPolicy".to_string(),
+                success_policy_message.clone().unwrap_or_default(),
             )
         });
 
@@ -3474,6 +3440,75 @@ where
 }
 
 /// Parse index ranges like "0,1,3-5" into a set of integers {0, 1, 3, 4, 5}
+/// Port of `parseIndexesFromString` (indexed_job_utils.go:204): intervals of
+/// `indexes_str` clipped to `completions`; a corrupted interval is skipped and
+/// parsing stops at the first interval starting at or after `completions`.
+fn parse_indexes_from_string(indexes_str: &str, completions: i32) -> Vec<(i32, i32)> {
+    let mut result: Vec<(i32, i32)> = Vec::new();
+    if indexes_str.is_empty() {
+        return result;
+    }
+    for interval_str in indexes_str.split(',') {
+        let mut limits = interval_str.split('-');
+        let Ok(first) = limits.next().unwrap_or("").parse::<i32>() else {
+            continue;
+        };
+        if first >= completions {
+            break;
+        }
+        let last = match limits.next() {
+            Some(l) => match l.parse::<i32>() {
+                Ok(l) => l.min(completions - 1),
+                Err(_) => continue,
+            },
+            None => first,
+        };
+        match result.last_mut() {
+            Some(prev) if prev.1 == first - 1 => prev.1 = last,
+            _ => result.push((first, last)),
+        }
+    }
+    result
+}
+
+/// Port of `matchSuccessPolicy` (success_policy.go:28) and
+/// `matchSucceededIndexesRule` (:67). Returns the SuccessCriteriaMet message.
+fn match_success_policy(
+    policy: Option<&SuccessPolicy>,
+    completions: i32,
+    succeeded: &HashSet<i32>,
+) -> Option<String> {
+    let policy = policy?;
+    if succeeded.is_empty() {
+        return None;
+    }
+    for (index, rule) in policy.rules.iter().enumerate() {
+        let matched = if let Some(ref idx) = rule.succeeded_indexes {
+            let required = parse_indexes_from_string(idx, completions);
+            // Failed to parse succeededIndexes of the rule: `continue`.
+            if required.is_empty() {
+                continue;
+            }
+            let total: i64 = required.iter().map(|(f, l)| i64::from(l - f + 1)).sum();
+            let contains = required
+                .iter()
+                .map(|&(f, l)| succeeded.iter().filter(|&&i| i >= f && i <= l).count() as i64)
+                .sum::<i64>();
+            contains == total
+                || rule
+                    .succeeded_count
+                    .is_some_and(|c| contains >= i64::from(c))
+        } else {
+            rule.succeeded_count
+                .is_some_and(|c| succeeded.len() as i64 >= i64::from(c))
+        };
+        if matched {
+            return Some(format!("Matched rules at index {index}"));
+        }
+    }
+    None
+}
+
 fn parse_index_ranges(s: &str) -> HashSet<i32> {
     let mut set = HashSet::new();
     if s.is_empty() {
@@ -7407,5 +7442,178 @@ mod tests {
         reconcile_settled(&c, &storage, key).await;
         let got: Job = storage.get(key).await.unwrap();
         assert!(cond_of(&got, "Complete").is_some(), "{:?}", got.status);
+    }
+
+    /// Run one settled reconcile of a 3-completion job whose pods are
+    /// `(index, phase)`, and return the stored Job.
+    async fn settle_sp(
+        name: &str,
+        indexed: bool,
+        patch: impl FnOnce(&mut Job),
+        pods: &[(i32, Phase)],
+    ) -> Job {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job(name, "default", 3, 3);
+        if indexed {
+            job.spec.completion_mode = Some("Indexed".to_string());
+        }
+        patch(&mut job);
+        let key = format!("/registry/jobs/default/{name}");
+        storage.create(&key, &job).await.unwrap();
+        for (i, phase) in pods {
+            let pn = format!("{name}-{i}");
+            let p = make_indexed_pod(&pn, "default", phase.clone(), name, "job-uid-1", *i);
+            storage
+                .create(&format!("/registry/pods/default/{pn}"), &p)
+                .await
+                .unwrap();
+        }
+        let c = JobController::new(storage.clone());
+        reconcile_settled(&c, &storage, &key).await;
+        storage.get(&key).await.unwrap()
+    }
+
+    fn sp(rules: serde_json::Value) -> Option<SuccessPolicy> {
+        Some(serde_json::from_value(serde_json::json!({ "rules": rules })).unwrap())
+    }
+
+    /// job_controller.go:984 sits inside `if hasBackoffLimitPerIndex(&job)`
+    /// (:978): without backoffLimitPerIndex, maxFailedIndexes is never
+    /// evaluated and failed pods count only against backoffLimit.
+    #[tokio::test]
+    async fn max_failed_indexes_needs_backoff_limit_per_index() {
+        let got = settle_sp(
+            "mfi",
+            true,
+            |j| {
+                j.spec.backoff_limit = Some(6);
+                j.spec.max_failed_indexes = Some(0);
+            },
+            &[(0, Phase::Failed), (1, Phase::Running), (2, Phase::Running)],
+        )
+        .await;
+        assert!(cond_of(&got, "Failed").is_none(), "{:?}", got.status);
+    }
+
+    /// success_policy.go matchSuccessPolicy only has a `SucceededIndexes` and
+    /// a `SucceededCount` branch; a rule with neither never matches.
+    #[tokio::test]
+    async fn success_policy_rule_without_criteria_never_matches() {
+        let got = settle_sp(
+            "nocrit",
+            true,
+            |j| j.spec.success_policy = sp(serde_json::json!([{}])),
+            &[
+                (0, Phase::Succeeded),
+                (1, Phase::Succeeded),
+                (2, Phase::Running),
+            ],
+        )
+        .await;
+        assert!(
+            cond_of(&got, "SuccessCriteriaMet").is_none(),
+            "{:?}",
+            got.status
+        );
+        assert!(cond_of(&got, "Complete").is_none(), "{:?}", got.status);
+    }
+
+    /// success_policy.go matchSuccessPolicy: a rule whose succeededIndexes
+    /// parses to nothing is skipped (`continue`) and the next rule is tried.
+    #[tokio::test]
+    async fn success_policy_skips_unparsable_rule() {
+        let got = settle_sp(
+            "badrule",
+            true,
+            |j| {
+                j.spec.success_policy = sp(serde_json::json!([
+                    {"succeededIndexes": "abc", "succeededCount": 1},
+                    {"succeededCount": 1}
+                ]))
+            },
+            &[
+                (0, Phase::Succeeded),
+                (1, Phase::Running),
+                (2, Phase::Running),
+            ],
+        )
+        .await;
+        let c = cond_of(&got, "SuccessCriteriaMet")
+            .or_else(|| cond_of(&got, "Complete"))
+            .expect("policy met");
+        assert_eq!(c.message.as_deref(), Some("Matched rules at index 1"));
+    }
+
+    /// job_controller.go:991-996: success policy is evaluated only inside
+    /// `if isIndexedJob(&job)`.
+    #[tokio::test]
+    async fn success_policy_ignored_for_non_indexed_job() {
+        let got = settle_sp(
+            "nonidx",
+            false,
+            |j| j.spec.success_policy = sp(serde_json::json!([{"succeededCount": 1}])),
+            &[
+                (0, Phase::Succeeded),
+                (1, Phase::Running),
+                (2, Phase::Running),
+            ],
+        )
+        .await;
+        assert!(
+            cond_of(&got, "SuccessCriteriaMet").is_none(),
+            "{:?}",
+            got.status
+        );
+        assert!(cond_of(&got, "Complete").is_none(), "{:?}", got.status);
+    }
+
+    /// matchSucceededIndexesRule: with both fields set, succeededCount counts
+    /// only succeeded indexes inside the rule's set (`contains >=
+    /// succeededCount`), not every succeeded index.
+    #[tokio::test]
+    async fn success_policy_count_is_scoped_to_rule_indexes() {
+        // Indexes 1 and 2 succeeded; rule set {0,1}: contains == 1 < 2.
+        let got = settle_sp(
+            "scoped",
+            true,
+            |j| {
+                j.spec.success_policy =
+                    sp(serde_json::json!([{"succeededIndexes": "0-1", "succeededCount": 2}]))
+            },
+            &[
+                (0, Phase::Running),
+                (1, Phase::Succeeded),
+                (2, Phase::Succeeded),
+            ],
+        )
+        .await;
+        assert!(
+            cond_of(&got, "SuccessCriteriaMet").is_none(),
+            "{:?}",
+            got.status
+        );
+        assert!(cond_of(&got, "Complete").is_none(), "{:?}", got.status);
+        // Indexes 0 and 1 of rule set {0-2} succeeded: contains == 2 >= 2.
+        let got = settle_sp(
+            "scoped2",
+            true,
+            |j| {
+                j.spec.success_policy =
+                    sp(serde_json::json!([{"succeededIndexes": "0-2", "succeededCount": 2}]))
+            },
+            &[
+                (0, Phase::Succeeded),
+                (1, Phase::Succeeded),
+                (2, Phase::Running),
+            ],
+        )
+        .await;
+        assert!(
+            cond_of(&got, "SuccessCriteriaMet")
+                .or_else(|| cond_of(&got, "Complete"))
+                .is_some(),
+            "{:?}",
+            got.status
+        );
     }
 }
