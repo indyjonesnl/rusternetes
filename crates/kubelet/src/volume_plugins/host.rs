@@ -55,6 +55,14 @@ pub trait VolumeHost: Send + Sync {
     /// implicit one that silently breaks if the layout ever changes. That was #1967: two
     /// path builders disagreeing.
     fn get_volumes_base_path(&self) -> &str;
+
+    /// `GetPodCertificateCredentialBundle` (`plugins.go` `KubeletVolumeHost`,
+    /// implemented by `pkg/kubelet/volume_host.go`): the kubelet's pod
+    /// certificate manager. `None` is upstream's `NoOpManager` situation
+    /// (static / detached kubelet), whose bundle call fails "unimplemented".
+    fn pod_certificate_manager(&self) -> Option<&Arc<dyn crate::podcertificate::Manager>> {
+        None
+    }
 }
 
 /// The kubelet's `VolumeHost`. Owns clones of the three values
@@ -64,6 +72,7 @@ pub struct KubeletVolumeHost {
     storage: Option<Arc<StorageBackend>>,
     token_manager: TokenManager,
     node_allocatable: HashMap<String, String>,
+    pod_certificate_manager: Option<Arc<dyn crate::podcertificate::Manager>>,
 }
 
 impl KubeletVolumeHost {
@@ -78,7 +87,18 @@ impl KubeletVolumeHost {
             storage,
             token_manager,
             node_allocatable,
+            pod_certificate_manager: None,
         }
+    }
+
+    /// Attach the kubelet's pod certificate manager
+    /// (`kubeletVolumeHost.podCertificateManager`, `volume_host.go`).
+    pub fn with_pod_certificate_manager(
+        mut self,
+        manager: Arc<dyn crate::podcertificate::Manager>,
+    ) -> Self {
+        self.pod_certificate_manager = Some(manager);
+        self
     }
 }
 
@@ -114,6 +134,10 @@ impl VolumeHost for KubeletVolumeHost {
 
     fn get_volumes_base_path(&self) -> &str {
         &self.volumes_base_path
+    }
+
+    fn pod_certificate_manager(&self) -> Option<&Arc<dyn crate::podcertificate::Manager>> {
+        self.pod_certificate_manager.as_ref()
     }
 }
 

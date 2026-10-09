@@ -103,6 +103,7 @@ impl ProjectedPlugin {
     /// `collect_data`.
     fn build_mounter(&self, spec: &Spec<'_>, pod: &Pod) -> ProjectedMounter {
         ProjectedMounter {
+            host: self.host.clone(),
             path: self
                 .host
                 .get_pod_volume_dir(&pod.metadata.uid, self.name(), &spec.volume.name),
@@ -139,6 +140,8 @@ impl ProjectedPlugin {
 }
 
 struct ProjectedMounter {
+    /// `s.plugin.kvHost` (`projected.go`), for the pod certificate manager.
+    host: Arc<dyn VolumeHost>,
     path: String,
     volume: Volume,
     namespace: String,
@@ -369,7 +372,7 @@ impl ProjectedMounter {
 
         let mut errlist: Vec<String> = Vec::new();
         let mut payload: BTreeMap<String, FileProjection> = BTreeMap::new();
-        for source in projected.sources.iter().flatten() {
+        for (source_index, source) in projected.sources.iter().flatten().enumerate() {
             if let Some(sp) = &source.secret {
                 let name = sp.name.clone().unwrap_or_default();
                 let optional = sp.optional.unwrap_or(false);
@@ -443,10 +446,49 @@ impl ProjectedMounter {
                     }
                     Err(e) => errlist.push(e.to_string()),
                 }
+            } else if let Some(pc) = &source.pod_certificate {
+                // `source.PodCertificate` arm (`projected.go:357-398`).
+                let Some(manager) = self.host.pod_certificate_manager() else {
+                    // `NoOpManager.GetPodCertificateCredentialBundle`
+                    // (`podcertificatemanager.go:994`).
+                    errlist.push("unimplemented".to_string());
+                    continue;
+                };
+                let (key, certificates) = match manager
+                    .get_pod_certificate_credential_bundle(
+                        &self.namespace,
+                        &self.pod_name,
+                        &self.pod.metadata.uid,
+                        &self.volume.name,
+                        source_index,
+                    )
+                    .await
+                {
+                    Ok(b) => b,
+                    Err(e) => {
+                        errlist.push(e.to_string());
+                        continue;
+                    }
+                };
+                let mode = self.secret_file_mode(default_mode);
+                let mut put = |path: &Option<String>, data: Vec<u8>| {
+                    if let Some(path) = path.as_deref().filter(|p| !p.is_empty()) {
+                        payload.insert(
+                            path.to_string(),
+                            FileProjection {
+                                fs_user: self.fs_user,
+                                data,
+                                mode,
+                            },
+                        );
+                    }
+                };
+                let mut bundle = key.clone();
+                bundle.extend_from_slice(&certificates);
+                put(&pc.credential_bundle_path, bundle);
+                put(&pc.key_path, key);
+                put(&pc.certificate_chain_path, certificates);
             }
-            // PodCertificate (`projected.go:357-398`): not implemented — it
-            // needs the kubelet's PodCertificate manager (see the follow-up
-            // issue linked from the PR). Such a source is skipped.
         }
 
         if errlist.is_empty() {
@@ -1390,5 +1432,174 @@ mod tests {
         .unwrap();
         let got = collect(&st, &optional, &pod()).await.unwrap();
         assert!(got["b.pem"].data.is_empty());
+    }
+
+    /// `FakeKubeletVolumeHost.GetPodCertificateCredentialBundle`
+    /// (`pkg/volume/testing/testing.go`): hardcoded `"key\n"`, `"cert\n"`.
+    struct FakePodCertificateManager;
+
+    #[async_trait]
+    impl crate::podcertificate::Manager for FakePodCertificateManager {
+        fn track_pod(&self, _pod: &Pod) {}
+        fn forget_pod(&self, _pod: &Pod) {}
+        async fn get_pod_certificate_credential_bundle(
+            &self,
+            _namespace: &str,
+            _pod_name: &str,
+            _pod_uid: &str,
+            _volume_name: &str,
+            _source_index: usize,
+        ) -> Result<(Vec<u8>, Vec<u8>)> {
+            Ok((b"key\n".to_vec(), b"cert\n".to_vec()))
+        }
+        fn metric_report(&self) -> crate::podcertificate::MetricReport {
+            Default::default()
+        }
+    }
+
+    async fn collect_pc(
+        v: &Volume,
+        pod: &Pod,
+        with_manager: bool,
+    ) -> Result<BTreeMap<String, FileProjection>> {
+        let root = tempfile::tempdir().unwrap();
+        let mut host = crate::volume_plugins::KubeletVolumeHost::new(
+            root.path().to_string_lossy().to_string(),
+            Some(Arc::new(StorageBackend::new_memory())),
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            HashMap::new(),
+        );
+        if with_manager {
+            host = host.with_pod_certificate_manager(Arc::new(FakePodCertificateManager));
+        }
+        let plugin = ProjectedPlugin::new(Arc::new(host));
+        let spec = Spec {
+            volume: v,
+            persistent_volume: None,
+            read_only: false,
+        };
+        plugin.build_mounter(&spec, pod).collect_data().await
+    }
+
+    /// `TestCollectDataWithPodCertificate` (`projected_test.go:1041-1142`),
+    /// case "credential bundle".
+    #[tokio::test]
+    async fn collect_data_pod_certificate_credential_bundle() {
+        let v: Volume = serde_json::from_value(serde_json::json!({
+            "name": "proj", "projected": {"defaultMode": 420, "sources": [
+                {"podCertificate": {"signerName": "example.com/foo", "keyType": "ED25519",
+                                    "credentialBundlePath": "credbundle.pem"}}
+            ]}
+        }))
+        .unwrap();
+        let got = collect_pc(&v, &pod(), true).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got["credbundle.pem"].data, b"key\ncert\n");
+        assert_eq!(got["credbundle.pem"].mode, 0o644);
+    }
+
+    /// Same test, case "key and cert bundle".
+    #[tokio::test]
+    async fn collect_data_pod_certificate_key_and_cert() {
+        let v: Volume = serde_json::from_value(serde_json::json!({
+            "name": "proj", "projected": {"defaultMode": 420, "sources": [
+                {"podCertificate": {"signerName": "example.com/foo", "keyType": "ED25519",
+                                    "keyPath": "key.pem",
+                                    "certificateChainPath": "certificates.pem"}}
+            ]}
+        }))
+        .unwrap();
+        let got = collect_pc(&v, &pod(), true).await.unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got["key.pem"].data, b"key\n");
+        assert_eq!(got["certificates.pem"].data, b"cert\n");
+        assert_eq!(got["key.pem"].mode, 0o644);
+    }
+
+    /// `projected.go:372-375`: fsGroup set forces mode 0600, same as the
+    /// other credential-bearing sources.
+    #[tokio::test]
+    async fn collect_data_pod_certificate_fs_group_forces_0600() {
+        let v: Volume = serde_json::from_value(serde_json::json!({
+            "name": "proj", "projected": {"defaultMode": 420, "sources": [
+                {"podCertificate": {"signerName": "example.com/foo", "keyType": "ED25519",
+                                    "keyPath": "key.pem"}}
+            ]}
+        }))
+        .unwrap();
+        let mut p = pod();
+        p.spec.as_mut().unwrap().security_context =
+            Some(serde_json::from_value(serde_json::json!({"fsGroup": 1000})).unwrap());
+        let got = collect_pc(&v, &p, true).await.unwrap();
+        assert_eq!(got["key.pem"].mode, 0o600);
+    }
+
+    /// The source index passed to the manager is the position in `sources`
+    /// (`for sourceIndex, source := range s.source.Sources`), so it counts the
+    /// non-certificate sources before it.
+    #[tokio::test]
+    async fn collect_data_pod_certificate_passes_source_index() {
+        use std::sync::Mutex;
+        struct Recorder(Mutex<Vec<usize>>);
+        #[async_trait]
+        impl crate::podcertificate::Manager for Recorder {
+            fn track_pod(&self, _pod: &Pod) {}
+            fn forget_pod(&self, _pod: &Pod) {}
+            async fn get_pod_certificate_credential_bundle(
+                &self,
+                _n: &str,
+                _p: &str,
+                _u: &str,
+                _v: &str,
+                source_index: usize,
+            ) -> Result<(Vec<u8>, Vec<u8>)> {
+                self.0.lock().unwrap().push(source_index);
+                Ok((b"k".to_vec(), b"c".to_vec()))
+            }
+            fn metric_report(&self) -> crate::podcertificate::MetricReport {
+                Default::default()
+            }
+        }
+        let rec = Arc::new(Recorder(Mutex::new(vec![])));
+        let root = tempfile::tempdir().unwrap();
+        let host = crate::volume_plugins::KubeletVolumeHost::new(
+            root.path().to_string_lossy().to_string(),
+            Some(Arc::new(StorageBackend::new_memory())),
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            HashMap::new(),
+        )
+        .with_pod_certificate_manager(rec.clone());
+        let v: Volume = serde_json::from_value(serde_json::json!({
+            "name": "proj", "projected": {"defaultMode": 420, "sources": [
+                {"downwardAPI": {"items": []}},
+                {"podCertificate": {"signerName": "a/b", "keyType": "ED25519", "keyPath": "k"}}
+            ]}
+        }))
+        .unwrap();
+        let spec = Spec {
+            volume: &v,
+            persistent_volume: None,
+            read_only: false,
+        };
+        ProjectedPlugin::new(Arc::new(host))
+            .build_mounter(&spec, &pod())
+            .collect_data()
+            .await
+            .unwrap();
+        assert_eq!(*rec.0.lock().unwrap(), vec![1]);
+    }
+
+    /// Without a manager the host behaves as upstream's `NoOpManager`
+    /// (`podcertificatemanager.go:994`): "unimplemented".
+    #[tokio::test]
+    async fn collect_data_pod_certificate_without_manager_errors() {
+        let v: Volume = serde_json::from_value(serde_json::json!({
+            "name": "proj", "projected": {"defaultMode": 420, "sources": [
+                {"podCertificate": {"signerName": "a/b", "keyType": "ED25519", "keyPath": "k"}}
+            ]}
+        }))
+        .unwrap();
+        let err = collect_pc(&v, &pod(), false).await.unwrap_err();
+        assert_eq!(err.to_string(), "unimplemented");
     }
 }
