@@ -7666,4 +7666,54 @@ mod tests {
             got.status
         );
     }
+
+    // ---- #2841: one finishedCondition path ----
+
+    /// `pastActiveDeadline` (job_controller.go:1601): `duration >= allowedDuration`.
+    /// A Job active for exactly the deadline has exceeded it.
+    #[tokio::test]
+    async fn deadline_is_exceeded_at_exactly_the_deadline() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job("dlb", "default", 1, 1);
+        job.spec.active_deadline_seconds = Some(10);
+        job.status = Some(JobStatus {
+            start_time: Some(chrono::Utc::now() - chrono::Duration::seconds(10)),
+            ..Default::default()
+        });
+        let key = "/registry/jobs/default/dlb";
+        storage.create(key, &job).await.unwrap();
+        let c = JobController::new(storage.clone());
+        reconcile_settled(&c, &storage, key).await;
+        let got: Job = storage.get(key).await.unwrap();
+        let failed = cond_of(&got, "Failed").expect("deadline reached => Failed");
+        assert_eq!(failed.reason.as_deref(), Some("DeadlineExceeded"));
+    }
+
+    /// The deadline is a failure scenario evaluated before completions
+    /// (job_controller.go:968-970, `complete` at :1035 only when
+    /// finishedCondition is nil): a Job past its deadline fails even if every
+    /// completion has already succeeded.
+    #[tokio::test]
+    async fn deadline_outranks_completions() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job("dlc", "default", 1, 1);
+        job.spec.active_deadline_seconds = Some(10);
+        job.status = Some(JobStatus {
+            start_time: Some(chrono::Utc::now() - chrono::Duration::seconds(60)),
+            ..Default::default()
+        });
+        let key = "/registry/jobs/default/dlc";
+        storage.create(key, &job).await.unwrap();
+        let p = make_pod("s", "default", Phase::Succeeded, "dlc", "job-uid-1");
+        storage
+            .create("/registry/pods/default/s", &p)
+            .await
+            .unwrap();
+        let c = JobController::new(storage.clone());
+        reconcile_settled(&c, &storage, key).await;
+        let got: Job = storage.get(key).await.unwrap();
+        assert!(cond_of(&got, "Complete").is_none(), "{:?}", got.status);
+        let failed = cond_of(&got, "Failed").expect("deadline outranks completions");
+        assert_eq!(failed.reason.as_deref(), Some("DeadlineExceeded"));
+    }
 }
