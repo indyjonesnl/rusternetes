@@ -23,7 +23,7 @@ pub async fn create_token_review(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     DumpingJson(mut token_review): DumpingJson<TokenReview>,
-) -> Result<Json<TokenReview>> {
+) -> Result<(axum::http::HeaderMap, Json<TokenReview>)> {
     info!("Creating token review");
 
     // Check authorization - creating a TokenReview requires impersonation privileges
@@ -50,6 +50,7 @@ pub async fn create_token_review(
     // JWT authenticator verifies signature + issuer + audience and the
     // validator checks the bound objects (jwt.go:334-411, claims.go:144-263).
     let requested_audiences = token_review.spec.audiences.clone().unwrap_or_default();
+    let mut observations = rusternetes_middleware::AuthObservations::default();
     let authn = match state
         .token_manager
         .authenticate_token(&token_review.spec.token, Some(&requested_audiences))
@@ -59,6 +60,7 @@ pub async fn create_token_review(
                 &state.storage,
                 &token_review.spec.token,
                 &claims,
+                &mut observations,
             )
             .await
             {
@@ -141,7 +143,12 @@ pub async fn create_token_review(
     };
 
     token_review.status = Some(status);
-    Ok(Json(token_review))
+    // The authenticator's audit annotations and warnings land on this
+    // request's audit event and response, like upstream's request context.
+    crate::audit::add_audit_annotations(&observations.audit_annotations);
+    let mut headers = axum::http::HeaderMap::new();
+    observations.append_warning_headers(&mut headers);
+    Ok((headers, Json(token_review)))
 }
 
 /// Create a TokenRequest (authentication.k8s.io/v1)
