@@ -511,6 +511,20 @@ pub trait Storage: Send + Sync {
 
     /// Check if a revision has been compacted (no longer available)
     async fn is_revision_compacted(&self, revision: i64) -> Result<bool>;
+
+    /// `storage.Interface.Stats` (storage/interfaces.go): the object count and
+    /// estimated average object size under `prefix`.
+    async fn stats(&self, prefix: &str) -> Result<ResourceStats> {
+        let _ = prefix;
+        Ok(ResourceStats::default())
+    }
+}
+
+/// `storage.Stats` (storage/interfaces.go).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResourceStats {
+    pub object_count: i64,
+    pub estimated_average_object_size_bytes: i64,
 }
 
 /// Default sort key for an opaque JSON resource — uses
@@ -868,6 +882,10 @@ impl<S: Storage> Storage for std::sync::Arc<S> {
 
     async fn is_revision_compacted(&self, revision: i64) -> Result<bool> {
         (**self).is_revision_compacted(revision).await
+    }
+
+    async fn stats(&self, prefix: &str) -> Result<ResourceStats> {
+        (**self).stats(prefix).await
     }
 }
 

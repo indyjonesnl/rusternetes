@@ -20,7 +20,11 @@ mod endpoints;
 mod flow_control;
 mod flow_control_filter;
 #[allow(dead_code)]
+mod flow_control_object_count;
+#[allow(dead_code)]
 mod flow_control_queueset;
+#[allow(dead_code)]
+mod flow_control_stats_poller;
 #[allow(dead_code)]
 mod flow_control_work_estimator;
 mod gnostic;
