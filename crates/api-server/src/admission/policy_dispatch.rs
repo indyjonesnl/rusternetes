@@ -13,11 +13,10 @@
 //! no unit test for `CollectParams` or `Dispatch` on their own, so those are
 //! pinned branch by branch to the Go source.
 //!
-//! Not here yet (follow-ups of #2886): the mutating delegate
-//! (`dispatchInvocations`, needs the CEL struct-literal evaluator #2885 and the
-//! typed env #2834), versioned attributes / the type converter, the
-//! policy/binding source, the equivalent-resource mapper, and the wiring at the
-//! head of `Admission::admit`.
+//! The mutating delegate (`dispatchInvocations`) is in `policy_mutating.rs`.
+//! Not here yet (follow-ups of #2886): the `patch/` package (applyConfiguration,
+//! jsonPatch) and the type converter, the equivalent-resource mapper, and the
+//! wiring at the head of `Admission::admit`.
 
 // Not called from the request path yet; the bin target compiles `admission`
 // separately and would flag every item.

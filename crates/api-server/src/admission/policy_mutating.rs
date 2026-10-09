@@ -289,8 +289,165 @@ impl MutatingDispatcher {
             reinvoke.with_policy_context(|c| c.require_reinvoking_previously_invoked_plugins());
         }
 
-        let _ = (&mut versioned, &mut last_kind, invocations);
-        todo!("red: dispatchInvocations body")
+        let mut policy_errors: Vec<PolicyError> = Vec::new();
+        let config_error = |err: String, inv: &PolicyInvocation<'_, _, _, _>| {
+            PolicyError::new(inv.policy, Some(inv.binding), err, Some("Invalid"))
+        };
+
+        // There is at least one invocation to invoke. Make sure we have a namespace
+        // object if the incoming object is not cluster scoped to pass into the evaluator.
+        let mut namespace_name = attr.namespace.clone();
+
+        // Special case, the namespace object has the namespace of itself (maybe a bug).
+        // unset it if the incoming object is a namespace
+        let gvk = &attr.kind;
+        if gvk.kind == "Namespace" && gvk.version == "v1" && gvk.group.is_empty() {
+            namespace_name.clear();
+        }
+
+        // if it is cluster scoped, namespaceName will be empty
+        // Otherwise, get the Namespace resource.
+        let namespace = if namespace_name.is_empty() {
+            None
+        } else {
+            match self.namespaces.get_namespace(&namespace_name).await {
+                Ok(ns) => Some(ns),
+                Err(e @ Error::Status(_)) => return Err(e),
+                Err(_) => {
+                    return Err(Error::NotFound(format!(
+                        "namespaces \"{namespace_name}\" not found"
+                    )))
+                }
+            }
+        };
+
+        // Should loop through invocations, handling possible error and invoking
+        // evaluator to apply patch, also should handle re-invocations
+        for invocation in invocations {
+            let mutations = invocation
+                .policy
+                .spec
+                .as_ref()
+                .and_then(|s| s.mutations.as_ref())
+                .map_or(0, Vec::len);
+            if invocation.evaluator.mutators.len() != mutations {
+                // This would be a bug. The compiler should always return exactly as
+                // many evaluators as there are mutations
+                return Err(Error::Internal(format!(
+                    "expected {} compiled evaluators for policy {}, got {}",
+                    mutations,
+                    PolicyAccessor::name(invocation.policy),
+                    invocation.evaluator.mutators.len()
+                )));
+            }
+
+            // `versionedAttributes.VersionedAttribute(invocation.Kind)`: the
+            // conversion to the invoked version is the identity on JSON.
+            let idx = match versioned.iter().position(|(k, _)| *k == invocation.kind) {
+                Some(i) => i,
+                None => {
+                    versioned.push((
+                        invocation.kind.clone(),
+                        VersionedAttributes {
+                            versioned_kind: invocation.kind.clone(),
+                            versioned_object: attr.object.clone(),
+                            versioned_old_object: attr.old_object.clone(),
+                            dirty: false,
+                        },
+                    ));
+                    versioned.len() - 1
+                }
+            };
+
+            if let Some(matcher) = &invocation.evaluator.matcher {
+                let result = matcher
+                    .matches(&versioned[idx].1, invocation.param.as_ref())
+                    .await;
+                if let Some(err) = result.error {
+                    policy_errors.push(config_error(err, invocation));
+                    continue;
+                }
+
+                // if preconditions are not met, then skip mutations
+                if !result.matches {
+                    continue;
+                }
+            }
+
+            // This should never fail: it occurs if there is a programming
+            // error causing the Param not to be a valid object.
+            let invocation_key = key_for(
+                invocation.policy,
+                invocation.binding,
+                invocation.param.as_ref(),
+            )?;
+            if reinvoke.is_reinvoke()
+                && !reinvoke.with_policy_context(|c| c.should_reinvoke(&invocation_key))
+            {
+                continue;
+            }
+
+            let object_before_mutations = versioned[idx].1.versioned_object.clone();
+            // Mutations for a single invocation of a MutatingAdmissionPolicy are evaluated
+            // in order.
+            for mutation_index in 0..mutations {
+                last_kind = Some(invocation.kind.clone());
+                if versioned[idx].1.versioned_object.is_none() {
+                    // Do not call patchers if there is no object to patch.
+                    continue;
+                }
+
+                let patcher = invocation.evaluator.mutators[mutation_index].as_ref();
+                if let Err(err) = self
+                    .dispatch_one(
+                        patcher,
+                        &mut versioned[idx].1,
+                        namespace.as_ref(),
+                        &invocation.resource,
+                        invocation.param.as_ref(),
+                    )
+                    .await
+                {
+                    match err {
+                        PatchError::Status(e) => return Err(e),
+                        PatchError::Other(m) => {
+                            policy_errors.push(config_error(m, invocation));
+                            continue;
+                        }
+                    }
+                }
+            }
+            if object_before_mutations != versioned[idx].1.versioned_object {
+                // The mutation has changed the object. Prepare to reinvoke all previous mutations that are eligible for re-invocation.
+                reinvoke.with_policy_context(|c| c.require_reinvoking_previously_invoked_plugins());
+                reinvoke.set_should_reinvoke();
+            }
+            if invocation
+                .policy
+                .spec
+                .as_ref()
+                .and_then(|s| s.reinvocation_policy.as_ref())
+                == Some(&ReinvocationPolicyType::IfNeeded)
+            {
+                reinvoke.with_policy_context(|c| {
+                    c.add_reinvocable_policy_to_previously_invoked(invocation_key)
+                });
+            }
+        }
+
+        if let Some(kind) = last_kind {
+            if let Some((_, last)) = versioned.iter().find(|(k, _)| *k == kind) {
+                if last.versioned_object.is_some() && last.dirty {
+                    reinvoke
+                        .with_policy_context(|c| c.require_reinvoking_previously_invoked_plugins());
+                    reinvoke.set_should_reinvoke();
+                    // `Convert(VersionedObject, Attributes.GetObject())`.
+                    attr.object = last.versioned_object.clone();
+                }
+            }
+        }
+
+        Ok(policy_errors)
     }
 }
 
