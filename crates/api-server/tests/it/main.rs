@@ -234,6 +234,7 @@ mod priorityclass_http_crud_test;
 mod priorityclass_store_test;
 mod projected_defaultmode_test;
 mod proto_encoder_wire_format_test;
+mod protobuf_pvc_empty_storage_class_test;
 mod protobuf_roundtrip_fuzz;
 mod protobuf_schema_parity_upstream;
 mod protobuf_test;
