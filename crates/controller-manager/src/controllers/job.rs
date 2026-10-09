@@ -7555,4 +7555,19 @@ mod tests {
         let failed = cond_of(&got, "Failed").expect("Failed");
         assert_eq!(failed.reason.as_deref(), Some("DeadlineExceeded"));
     }
+
+    /// failedIndexes only fires when `failedIndexes.total() > 0`
+    /// (job_controller.go:982): a per-index Job whose indexes all succeeded
+    /// completes rather than failing with "FailedIndexes".
+    #[tokio::test]
+    async fn per_index_job_with_all_indexes_succeeded_completes() {
+        let job = indexed_failing_job("pas", 2);
+        let pods = vec![
+            make_indexed_pod("s0", "default", Phase::Succeeded, "pas", "job-uid-1", 0),
+            make_indexed_pod("s1", "default", Phase::Succeeded, "pas", "job-uid-1", 1),
+        ];
+        let got = run_finished(job, pods).await;
+        assert!(cond_of(&got, "Failed").is_none(), "{:?}", got.status);
+        assert!(cond_of(&got, "Complete").is_some(), "{:?}", got.status);
+    }
 }
