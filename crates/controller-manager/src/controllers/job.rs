@@ -7626,6 +7626,54 @@ mod tests {
         assert_eq!(failed.reason.as_deref(), Some("DeadlineExceeded"));
     }
 
+    /// `syncJob` (job_controller.go:970-973): while a Job has not yet passed
+    /// `activeDeadlineSeconds` (and is not suspended), the sync is re-enqueued
+    /// `AddAfter(key, deadline - Since(startTime))` so the deadline fires on
+    /// time rather than at the next unrelated event.
+    #[tokio::test]
+    async fn unexpired_deadline_requeues_for_the_remaining_time() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job("dlr", "default", 1, 1);
+        job.spec.active_deadline_seconds = Some(100);
+        job.status = Some(JobStatus {
+            start_time: Some(chrono::Utc::now() - chrono::Duration::seconds(40)),
+            ..Default::default()
+        });
+        storage
+            .create("/registry/jobs/default/dlr", &job)
+            .await
+            .unwrap();
+        let c = JobController::new(storage.clone());
+        c.reconcile(&mut job).await.unwrap();
+        let d = c
+            .take_requeue_delay("default", "dlr")
+            .expect("an unexpired deadline must request a delayed requeue");
+        assert!(
+            d > Duration::from_secs(55) && d <= Duration::from_secs(60),
+            "{d:?}"
+        );
+    }
+
+    /// Suspended Jobs never requeue for the deadline (:971 `!jobSuspended`).
+    #[tokio::test]
+    async fn suspended_job_does_not_requeue_for_deadline() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job("dls", "default", 1, 1);
+        job.spec.active_deadline_seconds = Some(100);
+        job.spec.suspend = Some(true);
+        job.status = Some(JobStatus {
+            start_time: Some(chrono::Utc::now() - chrono::Duration::seconds(40)),
+            ..Default::default()
+        });
+        storage
+            .create("/registry/jobs/default/dls", &job)
+            .await
+            .unwrap();
+        let c = JobController::new(storage.clone());
+        c.reconcile(&mut job).await.unwrap();
+        assert!(c.take_requeue_delay("default", "dls").is_none());
+    }
+
     /// The deadline is a failure scenario evaluated before completions
     /// (job_controller.go:968-970, `complete` at :1035 only when
     /// finishedCondition is nil): a Job past its deadline fails even if every
