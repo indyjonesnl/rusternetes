@@ -1,4 +1,5 @@
 pub mod certificates;
+pub mod config;
 pub mod pod_security_api;
 pub mod pod_security_controller;
 pub mod pod_security_namespace;
@@ -739,19 +740,12 @@ impl PodSecurityExemptions {
     /// admission/api/v1/defaults.go).
     pub fn from_admission_configuration(
         yaml: &str,
-        _config_file: &std::path::Path,
+        config_file: &std::path::Path,
     ) -> Result<Self, String> {
-        let doc: serde_json::Value = serde_yaml::from_str(yaml).map_err(|e| e.to_string())?;
-        let Some(cfg) = doc
-            .get("plugins")
-            .and_then(|p| p.as_array())
-            .into_iter()
-            .flatten()
-            .find(|p| p.get("name").and_then(|n| n.as_str()) == Some("PodSecurity"))
-            .and_then(|p| p.get("configuration"))
-        else {
+        let Some(text) = config::plugin_configuration_for(yaml, config_file, "PodSecurity")? else {
             return Ok(Self::default());
         };
+        let cfg: serde_json::Value = serde_yaml::from_str(&text).map_err(|e| e.to_string())?;
         match cfg.get("exemptions") {
             Some(e) => serde_json::from_value(e.clone()).map_err(|e| e.to_string()),
             None => Ok(Self::default()),
@@ -1673,7 +1667,7 @@ mod tests {
     /// (apiserver/pkg/admission/config.go): a plugin entry with `path`
     /// reads the file, relative to the config file's directory.
     #[test]
-    fn psa_exemptions_from_plugin_path_relative_to_config_file() {
+    fn psa_exemptions_from_plugin_path_relative_toconfig_file() {
         let dir = std::env::temp_dir().join(format!("psa-path-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
