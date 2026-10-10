@@ -172,6 +172,7 @@ mod list_pagination_test;
 mod list_resource_version_floor_guard_test;
 mod list_resource_version_router_test;
 mod managedfields_update_test;
+mod map_admission_plugin_test;
 mod map_discovery_test;
 mod map_registry_test;
 mod minimal_body_decodes_test;

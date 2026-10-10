@@ -1,3 +1,4 @@
+use crate::admission::policy_plugin::MutatingPolicyPlugin;
 use crate::admission_webhook::AdmissionWebhookManager;
 use crate::prometheus_client::PrometheusClient;
 use crate::registry::core::service::alloc::ClusterIpAllocators;
@@ -37,6 +38,10 @@ pub struct ApiServerState {
     /// `--event-ttl` in seconds: how long an Event lives after its last write
     /// (`ControlPlane.EventTTL`, pkg/controlplane/apiserver/config.go:75).
     pub event_ttl: u64,
+    /// The MutatingAdmissionPolicy plugin (#2910), run at the head of
+    /// `Admission::admit` while `Feature::MutatingAdmissionPolicy` is on.
+    /// `None` until a policy source is installed.
+    pub mutating_admission_policy: Option<Arc<MutatingPolicyPlugin>>,
 }
 
 /// `newServiceIPAllocators`' NodePort half (storage_core.go:484-495): one
@@ -104,6 +109,7 @@ impl ApiServerState {
             ca_cert_pem: None,
             prometheus_client: None,
             event_ttl: crate::registry::core::event::DEFAULT_EVENT_TTL_SECONDS,
+            mutating_admission_policy: None,
         }
     }
 
@@ -136,6 +142,15 @@ impl ApiServerState {
     /// Set `--event-ttl`, in seconds; `0` keeps events forever.
     pub fn with_event_ttl(mut self, seconds: u64) -> Self {
         self.event_ttl = seconds;
+        self
+    }
+
+    /// Install the MutatingAdmissionPolicy plugin (#2910). The server binary
+    /// installs none until the `patch/` package exists (#2996); the library
+    /// and its tests do.
+    #[allow(dead_code)]
+    pub fn with_mutating_admission_policy(mut self, plugin: Arc<MutatingPolicyPlugin>) -> Self {
+        self.mutating_admission_policy = Some(plugin);
         self
     }
 
