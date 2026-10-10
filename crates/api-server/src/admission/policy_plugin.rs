@@ -20,12 +20,15 @@ use rusternetes_common::admission::Operation;
 use rusternetes_common::resources::{MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding};
 use rusternetes_common::Error;
 
-use super::policy_dispatch::PolicyHook;
-use super::policy_matching::{Attributes, EquivalentResourceMapper, NamespaceLister};
+use super::policy_dispatch::{dispatch, PolicyHook};
+use super::policy_matching::{Attributes, EquivalentResourceMapper, Matcher, NamespaceLister};
 use super::policy_mutating::{
-    MutatingEvaluator, NamespaceObjects, ObjectDefaulter, ReinvocationContext, TypeConverters,
+    MutatingDispatcher, MutatingEvaluator, NamespaceObjects, ObjectDefaulter, ReinvocationContext,
+    TypeConverters,
 };
 use super::policy_source::Hooks;
+use crate::registry::rest::GroupResource;
+use rusternetes_common::feature_gates::Feature;
 
 pub type MutatingHook =
     PolicyHook<MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding, MutatingEvaluator>;
@@ -47,20 +50,84 @@ pub struct MutatingPolicyPlugin {
     pub defaulter: Arc<dyn ObjectDefaulter>,
 }
 
+/// generic/plugin.go:46-52 `admissionResources`: the CEL-based admission
+/// configuration resources are always excluded. The decision ignores the
+/// version (`gvr.GroupResource()`).
+const EXCLUDED_RESOURCES: [(&str, &str); 4] = [
+    (
+        "admissionregistration.k8s.io",
+        "validatingadmissionpolicies",
+    ),
+    (
+        "admissionregistration.k8s.io",
+        "validatingadmissionpolicybindings",
+    ),
+    ("admissionregistration.k8s.io", "mutatingadmissionpolicies"),
+    (
+        "admissionregistration.k8s.io",
+        "mutatingadmissionpolicybindings",
+    ),
+];
+
 impl MutatingPolicyPlugin {
     /// `Handler.Handles`: `NewHandler(Create, Update, Connect)`.
     pub fn handles(op: &Operation) -> bool {
-        todo!("{op:?}")
+        matches!(
+            op,
+            Operation::Create | Operation::Update | Operation::Connect
+        )
     }
 
-    /// `Plugin.Dispatch`.
+    /// `InspectFeatureGates` (mutating/plugin.go): `SetEnabled(featureGates.
+    /// Enabled(features.MutatingAdmissionPolicy))`, read per request here
+    /// because the gate is process-wide and settable.
+    pub fn enabled() -> bool {
+        rusternetes_common::feature_gates::enabled(Feature::MutatingAdmissionPolicy)
+    }
+
+    /// `shouldIgnoreResource` (generic/plugin.go:217-222).
+    fn should_ignore_resource(attr: &Attributes) -> bool {
+        EXCLUDED_RESOURCES
+            .iter()
+            .any(|(g, r)| attr.resource.group == *g && attr.resource.resource == *r)
+    }
+
+    /// `Plugin.Dispatch` (generic/plugin.go:200-215), behind `Handles`.
     pub async fn admit(
         &self,
         attr: &mut Attributes,
         reinvocation: Arc<ReinvocationContext>,
     ) -> Result<(), Error> {
-        let _ = (attr, reinvocation);
-        todo!()
+        if !Self::handles(&attr.operation) || !Self::enabled() {
+            return Ok(());
+        }
+        if Self::should_ignore_resource(attr) {
+            return Ok(());
+        }
+        // `c.WaitForReady()`: the handler's ready func is the namespace
+        // informer and the source having synced (plugin.go:191-193). The
+        // namespace lister reads storage, so only the source can be unready.
+        let hooks = match self.source.hooks() {
+            Some(h) if self.source.has_synced() => h,
+            _ => {
+                return Err(Error::Forbidden(format!(
+                    "{} \"{}\" is forbidden: not yet ready to handle request",
+                    GroupResource::new(&attr.resource.group, &attr.resource.resource),
+                    attr.name
+                )))
+            }
+        };
+        let matcher = Matcher {
+            namespaces: self.namespaces.as_ref(),
+            mapper: self.mapper.as_ref(),
+        };
+        let delegate = MutatingDispatcher {
+            namespaces: self.namespace_objects.clone(),
+            type_converters: self.type_converters.clone(),
+            defaulter: self.defaulter.clone(),
+            reinvocation,
+        };
+        dispatch(&matcher, attr, &hooks, &delegate).await
     }
 }
 
