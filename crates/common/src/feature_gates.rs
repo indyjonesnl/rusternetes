@@ -197,6 +197,10 @@ pub enum Feature {
     /// Deployment/ReplicaSet status strategies drop `status.terminatingReplicas`
     /// unless the stored object already has it (`dropDisabledStatusFields`).
     DeploymentReplicaSetTerminatingReplicas,
+
+    /// Upstream gate `StorageCapacityScoring` (1.33 Alpha, off; `pkg/features/kube_features.go:1820-1822`).
+    /// Enables the scheduler VolumeBinding Score extension point.
+    StorageCapacityScoring,
 }
 
 impl Feature {
@@ -241,6 +245,7 @@ impl Feature {
             Feature::MutableCSINodeAllocatableCount => 35,
             Feature::MutatingAdmissionPolicy => 36,
             Feature::DeploymentReplicaSetTerminatingReplicas => 37,
+            Feature::StorageCapacityScoring => 38,
         }
     }
 
@@ -321,6 +326,8 @@ impl Feature {
             Feature::MutatingAdmissionPolicy => false,
             // 1.35 Beta, on (pkg/features/kube_features.go:1270-1273)
             Feature::DeploymentReplicaSetTerminatingReplicas => true,
+            // 1.33 Alpha, off (pkg/features/kube_features.go:1820-1822)
+            Feature::StorageCapacityScoring => false,
         }
     }
 }
@@ -375,6 +382,7 @@ pub const ALL_FEATURES: &[Feature] = &[
     Feature::MutableCSINodeAllocatableCount,
     Feature::MutatingAdmissionPolicy,
     Feature::DeploymentReplicaSetTerminatingReplicas,
+    Feature::StorageCapacityScoring,
 ];
 
 /// Total number of feature gates. Derived from [`ALL_FEATURES`].
@@ -427,6 +435,7 @@ static STATES: [AtomicBool; NUM_FEATURES] = [
     AtomicBool::new(Feature::MutableCSINodeAllocatableCount.default_enabled()),
     AtomicBool::new(Feature::MutatingAdmissionPolicy.default_enabled()),
     AtomicBool::new(Feature::DeploymentReplicaSetTerminatingReplicas.default_enabled()),
+    AtomicBool::new(Feature::StorageCapacityScoring.default_enabled()),
 ];
 
 /// Returns whether `feature` is currently enabled in this process.
