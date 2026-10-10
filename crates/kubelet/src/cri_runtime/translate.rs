@@ -824,6 +824,55 @@ fn translate_mount_propagation(mode: Option<&str>) -> i32 {
     }
 }
 
+/// Port of upstream `resolveRecursiveReadOnly`
+/// (`pkg/kubelet/kubelet_pods.go:2831-2853`): the quaternary core-API
+/// `recursiveReadOnly` becomes the CRI `Mount.recursive_read_only` boolean.
+/// Error strings are upstream's verbatim.
+pub fn resolve_recursive_read_only(
+    vm: &rusternetes_common::resources::pod::VolumeMount,
+    runtime_supports_rro: bool,
+) -> Result<bool, String> {
+    let mode = match vm.recursive_read_only.as_deref() {
+        None | Some("Disabled") => return Ok(false),
+        Some(m) => m,
+    };
+    if !vm.read_only.unwrap_or(false) {
+        return Err(format!(
+            "volume {:?} requested recursive read-only mode, but it is not read-only",
+            vm.name
+        ));
+    }
+    if let Some(p) = vm.mount_propagation.as_deref() {
+        if p != "None" {
+            return Err(format!(
+                "volume {:?} requested recursive read-only mode, but it is not compatible with propagation {:?}",
+                vm.name, p
+            ));
+        }
+    }
+    match mode {
+        "IfPossible" => Ok(runtime_supports_rro),
+        "Enabled" if runtime_supports_rro => Ok(true),
+        "Enabled" => Err(format!(
+            "volume {:?} requested recursive read-only mode, but it is not supported by the runtime",
+            vm.name
+        )),
+        other => Err(format!("unknown recursive read-only mode {other:?}")),
+    }
+}
+
+/// Port of `runtimeHandlerSupportsRecursiveReadOnlyMounts`
+/// (`pkg/kubelet/kubelet_pods.go:2815-2828`), fed by the CRI `Status`
+/// `runtime_handlers` (`pkg/kubelet/kuberuntime/helpers.go:240-252`).
+pub fn runtime_handler_supports_rro(name: &str, handlers: &[v1::RuntimeHandler]) -> bool {
+    handlers
+        .iter()
+        .find(|h| h.name == name)
+        .and_then(|h| h.features.as_ref())
+        .map(|f| f.recursive_read_only_mounts)
+        .unwrap_or(false)
+}
+
 /// Build the CRI mounts for a container.
 ///
 /// `env` is the container's fully-resolved environment: upstream expands
@@ -836,6 +885,7 @@ fn mounts(
     host_paths: &HashMap<String, String>,
     env: &HashMap<String, String>,
     attrs: &HashMap<String, MountAttrs>,
+    supports_rro: bool,
 ) -> Result<Vec<v1::Mount>, String> {
     mounts_with(
         container,
@@ -843,6 +893,7 @@ fn mounts(
         env,
         attrs,
         crate::go_selinux::get_enabled(),
+        supports_rro,
     )
 }
 
@@ -864,6 +915,7 @@ fn mounts_with(
     env: &HashMap<String, String>,
     attrs: &HashMap<String, MountAttrs>,
     selinux_enabled: bool,
+    supports_rro: bool,
 ) -> Result<Vec<v1::Mount>, String> {
     let Some(vms) = container.volume_mounts.as_ref() else {
         return Ok(Vec::new());
@@ -880,6 +932,9 @@ fn mounts_with(
             continue;
         };
         let sub_path = resolve_sub_path(vm, env)?;
+        // `resolveRecursiveReadOnly` (`kubelet_pods.go:394`); its error stops
+        // container creation, as in `makeMounts`.
+        let rro = resolve_recursive_read_only(vm, supports_rro)?;
         let a = attrs.get(&vm.name).copied().unwrap_or_default();
         let relabel_volume = a.selinux_relabel && relabelled.insert(vm.name.as_str());
         out.push(v1::Mount {
@@ -897,6 +952,8 @@ fn mounts_with(
             // (`kuberuntime_container.go:484`).
             selinux_relabel: crate::go_selinux::relabel_if_enabled(relabel_volume, selinux_enabled),
             propagation: translate_mount_propagation(vm.mount_propagation.as_deref()),
+            // `RecursiveReadOnly: rro` (`kubelet_pods.go:409`).
+            recursive_read_only: rro,
             ..Default::default()
         });
     }
@@ -1316,6 +1373,7 @@ pub fn container_config_with_allocatable(
         secrets,
         node_allocatable,
         &HashMap::new(),
+        false,
     )
 }
 
@@ -1331,6 +1389,7 @@ pub fn container_config_with_mounts(
     secrets: &HashMap<String, Secret>,
     node_allocatable: Option<&HashMap<String, String>>,
     mount_attrs: &HashMap<String, MountAttrs>,
+    supports_rro: bool,
 ) -> Result<v1::ContainerConfig, String> {
     let mut labels = pod_labels(pod);
     labels.insert(labels::CONTAINER_NAME.to_string(), container.name.clone());
@@ -1369,7 +1428,7 @@ pub fn container_config_with_mounts(
         args: expand_all(container.args.clone().unwrap_or_default(), &env_map),
         working_dir: container.working_dir.clone().unwrap_or_default(),
         envs,
-        mounts: mounts(container, host_paths, &env_map, mount_attrs)?,
+        mounts: mounts(container, host_paths, &env_map, mount_attrs, supports_rro)?,
         labels,
         log_path: format!("{}.log", container.name),
         linux,
@@ -1806,7 +1865,7 @@ mod tests {
                 selinux_relabel: false,
             },
         )]);
-        let m = mounts_with(&c, &host_paths, &HashMap::new(), &attrs, true).unwrap();
+        let m = mounts_with(&c, &host_paths, &HashMap::new(), &attrs, true, false).unwrap();
         assert!(m[0].readonly, "disk /etc/hosts must be forced read-only");
         assert!(m[1].readonly);
         assert!(!m[2].readonly, "disk4 has no attributes: stays read-write");
@@ -1815,7 +1874,15 @@ mod tests {
     #[test]
     fn default_attributes_leave_mount_flags_alone() {
         let (c, host_paths) = two_mounts_of_one_volume();
-        let m = mounts_with(&c, &host_paths, &HashMap::new(), &HashMap::new(), true).unwrap();
+        let m = mounts_with(
+            &c,
+            &host_paths,
+            &HashMap::new(),
+            &HashMap::new(),
+            true,
+            false,
+        )
+        .unwrap();
         assert_eq!(
             m.iter().map(|m| m.readonly).collect::<Vec<_>>(),
             [false, true, false]
@@ -1835,7 +1902,7 @@ mod tests {
                 selinux_relabel: true,
             },
         )]);
-        let on = mounts_with(&c, &host_paths, &HashMap::new(), &attrs, true).unwrap();
+        let on = mounts_with(&c, &host_paths, &HashMap::new(), &attrs, true, false).unwrap();
         assert!(on[0].selinux_relabel);
         // Once per volume: `vol.SELinuxLabeled = true` after the first mount.
         assert!(
@@ -1843,7 +1910,7 @@ mod tests {
             "second mount of disk is already labeled"
         );
         assert!(!on[2].selinux_relabel);
-        let off = mounts_with(&c, &host_paths, &HashMap::new(), &attrs, false).unwrap();
+        let off = mounts_with(&c, &host_paths, &HashMap::new(), &attrs, false, false).unwrap();
         assert!(off.iter().all(|m| !m.selinux_relabel));
     }
 
@@ -1883,6 +1950,94 @@ mod tests {
     }
 
     #[test]
+    fn resolve_rro_matches_upstream() {
+        use rusternetes_common::resources::pod::VolumeMount;
+        let vm = |ro: bool, rro: Option<&str>, prop: Option<&str>| VolumeMount {
+            name: "v".into(),
+            mount_path: "/v".into(),
+            read_only: Some(ro),
+            sub_path: None,
+            sub_path_expr: None,
+            mount_propagation: prop.map(str::to_string),
+            recursive_read_only: rro.map(str::to_string),
+        };
+        // nil / Disabled -> false, no error even when not read-only.
+        assert_eq!(
+            resolve_recursive_read_only(&vm(false, None, None), true),
+            Ok(false)
+        );
+        assert_eq!(
+            resolve_recursive_read_only(&vm(false, Some("Disabled"), None), true),
+            Ok(false)
+        );
+        // Enabled/IfPossible require readOnly.
+        assert!(resolve_recursive_read_only(&vm(false, Some("Enabled"), None), true).is_err());
+        assert!(resolve_recursive_read_only(&vm(false, Some("IfPossible"), None), true).is_err());
+        // ...and propagation None (unset or "None").
+        assert!(resolve_recursive_read_only(
+            &vm(true, Some("Enabled"), Some("HostToContainer")),
+            true
+        )
+        .is_err());
+        assert_eq!(
+            resolve_recursive_read_only(&vm(true, Some("Enabled"), Some("None")), true),
+            Ok(true)
+        );
+        // IfPossible follows runtime support; Enabled errors without it.
+        assert_eq!(
+            resolve_recursive_read_only(&vm(true, Some("IfPossible"), None), true),
+            Ok(true)
+        );
+        assert_eq!(
+            resolve_recursive_read_only(&vm(true, Some("IfPossible"), None), false),
+            Ok(false)
+        );
+        assert!(resolve_recursive_read_only(&vm(true, Some("Enabled"), None), false).is_err());
+        assert!(resolve_recursive_read_only(&vm(true, Some("Bogus"), None), true).is_err());
+    }
+
+    #[test]
+    fn runtime_handler_rro_support_matches_upstream() {
+        let h = |name: &str, rro: bool| v1::RuntimeHandler {
+            name: name.into(),
+            features: Some(v1::RuntimeHandlerFeatures {
+                recursive_read_only_mounts: rro,
+                ..Default::default()
+            }),
+        };
+        // Empty list (runtime cannot list handlers) -> false.
+        assert!(!runtime_handler_supports_rro("", &[]));
+        let hs = [h("", true), h("gvisor", false)];
+        assert!(runtime_handler_supports_rro("", &hs));
+        assert!(!runtime_handler_supports_rro("gvisor", &hs));
+        // Unknown handler -> false.
+        assert!(!runtime_handler_supports_rro("nope", &hs));
+    }
+
+    #[test]
+    fn mount_carries_recursive_read_only() {
+        use rusternetes_common::resources::pod::VolumeMount;
+        let c = Container {
+            name: "app".into(),
+            image: "busybox".into(),
+            volume_mounts: Some(vec![VolumeMount {
+                name: "v".into(),
+                mount_path: "/v".into(),
+                read_only: Some(true),
+                sub_path: None,
+                sub_path_expr: None,
+                mount_propagation: None,
+                recursive_read_only: Some("Enabled".into()),
+            }]),
+            ..Default::default()
+        };
+        let hp = HashMap::from([("v".to_string(), "/host/v".to_string())]);
+        let ok = mounts(&c, &hp, &HashMap::new(), &HashMap::new(), true).unwrap();
+        assert!(ok[0].recursive_read_only && ok[0].readonly);
+        assert!(mounts(&c, &hp, &HashMap::new(), &HashMap::new(), false).is_err());
+    }
+
+    #[test]
     fn mount_propagation_modes() {
         use rusternetes_common::resources::pod::VolumeMount;
         use v1::MountPropagation;
@@ -1903,7 +2058,7 @@ mod tests {
         let host_paths = HashMap::from([("v".to_string(), "/host/v".to_string())]);
         let mut prop = |mode: Option<&str>| -> i32 {
             c.volume_mounts = Some(vec![mk(mode)]);
-            mounts(&c, &host_paths, &HashMap::new(), &HashMap::new()).unwrap()[0].propagation
+            mounts(&c, &host_paths, &HashMap::new(), &HashMap::new(), false).unwrap()[0].propagation
         };
         assert_eq!(
             prop(Some("HostToContainer")),
