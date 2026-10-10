@@ -44,8 +44,10 @@ pub const DEFAULT_EVENT_TTL_SECONDS: u64 = 3600;
 /// The `--event-ttl` in force for this process, in seconds.
 ///
 /// Upstream threads one server-side value into the event store once
-/// (`cmd/kube-apiserver/app/options` `EventTTL` -> `pkg/controlplane/instance.go`
-/// `EventTTL: c.Extra.EventTTL` -> `pkg/registry/core/event/storage/storage.go:42-44`
+/// (`pkg/controlplane/apiserver/config.go:299` `EventTTL:                opts.EventTTL,`
+/// -> `pkg/controlplane/apiserver/apis.go:51` `EventTTL:                    c.Extra.EventTTL,`
+/// -> `pkg/controlplane/instance.go:434` `eventsrest.RESTStorageProvider{TTL: c.ControlPlane.EventTTL},`
+/// -> `pkg/registry/core/event/storage/storage.go:42-44`
 /// `TTLFunc: func(runtime.Object, uint64, bool) (uint64, error) { return ttl, nil }`),
 /// so every event writer is governed by it. In-process recorders (controller-manager,
 /// kubelet, scheduler, api-server bootstrap/repair) write storage directly and are
@@ -311,6 +313,8 @@ mod tests {
 
     #[tokio::test]
     async fn new_recorders_follow_the_process_event_ttl() {
+        // Mutates the process-wide TTL only for the instant between set and
+        // `new()` (restored immediately); no other test here waits on expiry.
         set_process_event_ttl(1);
         let storage = Arc::new(MemoryStorage::new());
         let recorder = EventRecorder::new(Arc::clone(&storage));
