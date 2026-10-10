@@ -85,6 +85,8 @@ fn build_pv(
             meta
         },
         spec: PersistentVolumeSpec {
+            gce_persistent_disk: None,
+            aws_elastic_block_store: None,
             capacity: cap,
             host_path: Some(HostPathVolumeSource {
                 path: format!("/tmp/test-pv/{}", name),

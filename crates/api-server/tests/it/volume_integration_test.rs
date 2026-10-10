@@ -32,6 +32,8 @@ fn test_persistentvolume_creation() {
         },
         metadata: ObjectMeta::new("test-pv"),
         spec: PersistentVolumeSpec {
+            gce_persistent_disk: None,
+            aws_elastic_block_store: None,
             capacity,
             host_path: Some(HostPathVolumeSource {
                 path: "/mnt/data".to_string(),
@@ -334,6 +336,8 @@ fn test_pv_with_multiple_access_modes() {
         },
         metadata: ObjectMeta::new("shared-pv"),
         spec: PersistentVolumeSpec {
+            gce_persistent_disk: None,
+            aws_elastic_block_store: None,
             capacity,
             host_path: Some(HostPathVolumeSource {
                 path: "/shared".to_string(),

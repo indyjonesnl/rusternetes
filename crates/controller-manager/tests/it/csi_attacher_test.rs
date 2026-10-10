@@ -563,3 +563,153 @@ async fn pv_finalizer_is_kept_while_an_attachment_references_it() {
         .unwrap();
     assert_eq!(pv.metadata.finalizers.unwrap(), vec![FINALIZER.to_string()]);
 }
+
+// ---- CSI migration of in-tree PVs (#3047) -----------------------------------
+//
+// Upstream: external-attacher `csi_handler.go` `getCSISource` /
+// `csiAttach` / `csiDetach` (`IsPVMigratable` + `TranslateInTreePVToCSI`),
+// `SyncNewOrUpdatedPersistentVolume` (`:647-722`) and `controller.go`
+// `processFinalizers` (`:264-283`).
+
+const GCE_DRIVER: &str = "pd.csi.storage.gke.io";
+const GCE_FINALIZER: &str = "external-attacher/pd-csi-storage-gke-io";
+
+fn start_gce() -> Env {
+    let mut e = start(Fake::new());
+    e.attacher = CsiAttacher::new(
+        e.storage.clone(),
+        GCE_DRIVER,
+        CsiControllerClient::with_endpoint(e._dir.path().join("csi.sock")),
+    );
+    e
+}
+
+fn gce_pv_json(finalizers: serde_json::Value, annotations: serde_json::Value) -> serde_json::Value {
+    json!({
+        "apiVersion": "v1", "kind": "PersistentVolume",
+        "metadata": {"name": "pv1", "uid": "pv-uid",
+                     "labels": {"topology.kubernetes.io/zone": "us-central1-a"},
+                     "finalizers": finalizers, "annotations": annotations},
+        "spec": {"accessModes": ["ReadWriteOnce"],
+                 "gcePersistentDisk": {"pdName": "disk1", "fsType": "ext4"}}
+    })
+}
+
+async fn seed_gce(e: &Env) {
+    put(
+        &e.storage,
+        "persistentvolumes",
+        None,
+        "pv1",
+        gce_pv_json(json!([]), json!({})),
+    )
+    .await;
+    put(
+        &e.storage,
+        "csinodes",
+        None,
+        "node-1",
+        json!({"apiVersion": "storage.k8s.io/v1", "kind": "CSINode",
+               "metadata": {"name": "node-1"},
+               "spec": {"drivers": [{"name": GCE_DRIVER, "nodeID": "projects/p/zones/us-central1-a/instances/n1"}]}}),
+    )
+    .await;
+    put(
+        &e.storage,
+        "volumeattachments",
+        None,
+        "va1",
+        va_json("va1", GCE_DRIVER),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn attach_translates_an_in_tree_gce_pv() {
+    let e = start_gce();
+    seed_gce(&e).await;
+    e.attacher.reconcile_all().await.unwrap();
+    let st = va(&e).await.status.expect("status set");
+    assert!(st.attached, "attach error: {:?}", st.attach_error);
+    let rec = e.rec.lock().unwrap();
+    assert_eq!(rec.publish.len(), 1);
+    assert_eq!(
+        rec.publish[0].volume_id,
+        "projects/UNSPECIFIED/zones/us-central1-a/disks/disk1"
+    );
+    match rec.publish[0]
+        .volume_capability
+        .as_ref()
+        .unwrap()
+        .access_type
+        .as_ref()
+        .unwrap()
+    {
+        volume_capability::AccessType::Mount(m) => assert_eq!(m.fs_type, "ext4"),
+        other => panic!("expected mount, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn detach_translates_an_in_tree_gce_pv() {
+    let e = start_gce();
+    seed_gce(&e).await;
+    e.attacher.reconcile_all().await.unwrap();
+    mark_deleting(&e).await;
+    e.attacher.reconcile_all().await.unwrap();
+    let rec = e.rec.lock().unwrap();
+    assert_eq!(rec.unpublish.len(), 1);
+    assert_eq!(
+        rec.unpublish[0].volume_id,
+        "projects/UNSPECIFIED/zones/us-central1-a/disks/disk1"
+    );
+}
+
+/// `SyncNewOrUpdatedPersistentVolume`: a live in-tree PV without the
+/// `pv.kubernetes.io/migrated-to` annotation (rollback) loses the finalizer.
+#[tokio::test]
+async fn migratable_pv_without_migrated_to_loses_finalizer() {
+    let e = start_gce();
+    put(
+        &e.storage,
+        "persistentvolumes",
+        None,
+        "pv1",
+        gce_pv_json(json!([GCE_FINALIZER]), json!({})),
+    )
+    .await;
+    e.attacher.reconcile_all().await.unwrap();
+    let pv: PersistentVolume = e
+        .storage
+        .get(&build_key("persistentvolumes", None, "pv1"))
+        .await
+        .unwrap();
+    assert!(pv.metadata.finalizers.unwrap_or_default().is_empty());
+}
+
+/// ...and keeps it when the annotation names this attacher (`controller.go:274`).
+#[tokio::test]
+async fn migratable_pv_with_matching_migrated_to_keeps_finalizer() {
+    let e = start_gce();
+    put(
+        &e.storage,
+        "persistentvolumes",
+        None,
+        "pv1",
+        gce_pv_json(
+            json!([GCE_FINALIZER]),
+            json!({"pv.kubernetes.io/migrated-to": GCE_DRIVER}),
+        ),
+    )
+    .await;
+    e.attacher.reconcile_all().await.unwrap();
+    let pv: PersistentVolume = e
+        .storage
+        .get(&build_key("persistentvolumes", None, "pv1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        pv.metadata.finalizers.unwrap(),
+        vec![GCE_FINALIZER.to_string()]
+    );
+}

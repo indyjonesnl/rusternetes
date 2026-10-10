@@ -39,6 +39,8 @@ async fn create_test_pv(
             meta
         },
         spec: PersistentVolumeSpec {
+            gce_persistent_disk: None,
+            aws_elastic_block_store: None,
             capacity,
             host_path: Some(HostPathVolumeSource {
                 path: format!("/tmp/test-pv/{}", name),
@@ -282,6 +284,8 @@ async fn test_matches_access_modes() {
             meta
         },
         spec: PersistentVolumeSpec {
+            gce_persistent_disk: None,
+            aws_elastic_block_store: None,
             capacity,
             host_path: Some(HostPathVolumeSource {
                 path: "/tmp/test-pv/rwo-pv".to_string(),
@@ -390,6 +394,8 @@ async fn test_skips_already_bound_pv() {
             meta
         },
         spec: PersistentVolumeSpec {
+            gce_persistent_disk: None,
+            aws_elastic_block_store: None,
             capacity,
             host_path: Some(HostPathVolumeSource {
                 path: "/tmp/test-pv/bound-pv".to_string(),
