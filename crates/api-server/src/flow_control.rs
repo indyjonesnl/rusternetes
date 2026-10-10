@@ -2262,6 +2262,22 @@ mod tests {
         ));
     }
 
+    // seatDemandRatioedGauge (apf_controller.go:705-729, queueset.go:650):
+    // the demand_seats histogram integrates (seats in use + waiting) over
+    // the level's concurrency denominator.
+    #[tokio::test]
+    async fn demand_seats_histogram_integrates_a_held_seat() {
+        let (_st, e) = engine_with_level("m-demand").await;
+        let name = format!("{NS}demand_seats");
+        let permit = hold(&e, "m-demand", false).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            sample_sum(&name, &[("priority_level", "m-demand")]) > 0.0,
+            "demand integrates while a seat is held"
+        );
+        drop(permit);
+    }
+
     // noteExecutingDelta (priority-and-fairness.go:150-156): the read-vs-write
     // histograms split on the verb.
     #[tokio::test]

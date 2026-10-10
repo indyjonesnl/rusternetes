@@ -1954,6 +1954,109 @@ mod tests {
         assert!(waiting.is_dispatched());
     }
 
+    // ---- #2987: queueset metrics (queueset.go:478, :521, :577, :819, :842) ----
+
+    fn named_qcfg(name: &str) -> QueuingConfig {
+        QueuingConfig {
+            name: name.into(),
+            ..qcfg(2, 5, 1)
+        }
+    }
+
+    #[test]
+    fn queueset_publishes_virtual_time_and_dispatch_gauges() {
+        use crate::flow_control::metric_test_util::{has_series, sample};
+        let clk = FakeClock::new();
+        let qs = QueueSet::new(
+            clk.clone(),
+            named_qcfg("m-vt"),
+            DispatchingConfig {
+                concurrency_limit: 1,
+            },
+        )
+        .unwrap();
+        let run = qs.start_request(&we(1), 0, "", "m-vt-fs").unwrap();
+        let waiting = qs.start_request(&we(1), 0, "", "m-vt-fs").unwrap();
+        clk.advance(Duration::from_secs(1));
+        drop(run);
+        assert!(waiting.is_dispatched());
+        let ns = "apiserver_flowcontrol_";
+        let pl = [("priority_level", "m-vt")];
+        for g in ["current_r", "dispatch_r", "latest_s"] {
+            assert!(has_series(&format!("{ns}{g}"), &pl), "{g} missing");
+        }
+        for g in ["next_s_bounds", "next_discounted_s_bounds"] {
+            for b in ["min", "max"] {
+                assert!(
+                    has_series(
+                        &format!("{ns}{g}"),
+                        &[("priority_level", "m-vt"), ("bound", b)]
+                    ),
+                    "{g}{{{b}}} missing"
+                );
+            }
+        }
+        assert!(sample(&format!("{ns}current_r"), &pl) > 0.0);
+    }
+
+    #[test]
+    fn queue_length_after_enqueue_is_observed_and_no_accommodation_counted() {
+        use crate::flow_control::metric_test_util::sample;
+        let clk = FakeClock::new();
+        let qs = QueueSet::new(
+            clk.clone(),
+            named_qcfg("m-ql"),
+            DispatchingConfig {
+                concurrency_limit: 1,
+            },
+        )
+        .unwrap();
+        let l = [("priority_level", "m-ql"), ("flow_schema", "m-ql-fs")];
+        let _run = qs.start_request(&we(1), 0, "", "m-ql-fs").unwrap();
+        let _waiting = qs.start_request(&we(1), 0, "", "m-ql-fs").unwrap();
+        // Observed once per enqueued request (queueset.go:577).
+        assert_eq!(
+            sample(
+                "apiserver_flowcontrol_request_queue_length_after_enqueue",
+                &l
+            ),
+            2.0
+        );
+        // The second request's dispatch attempt found no free seat (:819).
+        assert!(
+            sample(
+                "apiserver_flowcontrol_request_dispatch_no_accommodation_total",
+                &l
+            ) >= 1.0
+        );
+    }
+
+    #[test]
+    fn epoch_advance_is_counted() {
+        use crate::flow_control::metric_test_util::sample;
+        let clk = FakeClock::new();
+        let qs = QueueSet::new(
+            clk.clone(),
+            named_qcfg("m-ep"),
+            DispatchingConfig {
+                concurrency_limit: 1,
+            },
+        )
+        .unwrap();
+        let _run = qs.start_request(&we(1), 0, "", "fs").unwrap();
+        let _waiting = qs.start_request(&we(1), 0, "", "fs").unwrap();
+        qs.lock().current_r = SeatSeconds(HIGH_R.0 - 1);
+        clk.advance(Duration::from_secs(1));
+        qs.lock().sync_time();
+        assert_eq!(
+            sample(
+                "apiserver_flowcontrol_epoch_advance_total",
+                &[("priority_level", "m-ep"), ("success", "true")]
+            ),
+            1.0
+        );
+    }
+
     // ---- uniform-scenario fairness (queueset_test.go TestBaseline family) ----
 
     struct SimClient {
