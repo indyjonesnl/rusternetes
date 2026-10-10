@@ -785,12 +785,25 @@ impl CriContainerRuntime {
         let supports_rro = if !wants_rro {
             false
         } else {
-            match self.runtime_status().await {
-                Ok(st) => translate::runtime_handler_supports_rro(
-                    &self.runtime_handler,
-                    &st.runtime_handlers,
-                ),
-                Err(_) => false,
+            // `kl.runtimeClassManager.LookupRuntimeHandler(pod.Spec.RuntimeClassName)`
+            // (`kubelet_pods.go:2804`); no manager (no storage) or a failed
+            // lookup is "no support" (`:2802`, `:2806`).
+            let handler = match self.volumes.as_ref().and_then(|v| v.storage.as_ref()) {
+                Some(storage) => super::host_policy::lookup_runtime_handler(
+                    storage.as_ref(),
+                    pod.spec
+                        .as_ref()
+                        .and_then(|s| s.runtime_class_name.as_deref()),
+                )
+                .await
+                .ok(),
+                None => None,
+            };
+            match (handler, self.runtime_status().await) {
+                (Some(h), Ok(st)) => {
+                    translate::runtime_handler_supports_rro(&h, &st.runtime_handlers)
+                }
+                _ => false,
             }
         };
         let mut cfg = translate::container_config_with_mounts(
