@@ -79,7 +79,7 @@ pub(crate) const PROTO_FILES: &[&str] = &[
 /// registry key is `<group>/<version>.<MessageName>` — `events.k8s.io/v1.Event`
 /// is the canonical example (see the off-by-one regression in fields 12-15
 /// fixed in the same PR that added this helper).
-fn qualified_prefix_for(rel_path: &str) -> &'static str {
+pub(crate) fn qualified_prefix_for(rel_path: &str) -> &'static str {
     match rel_path {
         "k8s.io/api/core/v1/generated.proto" => "",
         "k8s.io/api/apps/v1/generated.proto" => "apps/v1",
@@ -119,7 +119,7 @@ fn read_proto(rel: &str) -> String {
         .unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e))
 }
 
-fn parse_all_files() -> Vec<FileDescriptorProto> {
+pub(crate) fn parse_all_files() -> Vec<FileDescriptorProto> {
     PROTO_FILES
         .iter()
         .map(|rel| {
