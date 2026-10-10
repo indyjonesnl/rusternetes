@@ -10,6 +10,7 @@
 //! below. A stray `tests/<name>.rs` still compiles -- it just silently
 //! reintroduces a separate binary, which is what this layout avoids.
 mod apiservice_available_test;
+mod attach_detach_test;
 mod availability_status_test;
 mod conformance_apps_deployment_replicaset;
 mod conformance_apps_job_cronjob;
