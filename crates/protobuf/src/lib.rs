@@ -7788,6 +7788,24 @@ impl ProtoRegistry {
                     // #26315095760).
                     return decode_micro_timestamp(data);
                 }
+                if msg_type == "FieldsV1" {
+                    // Inverse of the encode side: Raw is the JSON text of the
+                    // field set, which is the JSON form of `fieldsV1`.
+                    if let Some(raw) = self
+                        .decode_message("FieldsV1", data)
+                        .and_then(|v| v.get("Raw").and_then(|r| r.as_str().map(String::from)))
+                    {
+                        use base64::Engine;
+                        if let Some(parsed) = base64::engine::general_purpose::STANDARD
+                            .decode(raw)
+                            .ok()
+                            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                        {
+                            return parsed;
+                        }
+                    }
+                    return Value::Object(Map::new());
+                }
                 match self.decode_message(msg_type, data) {
                     Some(v) => v,
                     None => {
@@ -8020,7 +8038,17 @@ impl ProtoRegistry {
                 // round-trip via `encode_timestamp` rather than the
                 // generic `encode_with_schema` (which would see a non-Object
                 // value and emit a zero-length submessage).
-                if (inner_type == "Time" || inner_type == "MicroTime") && val.is_string() {
+                if inner_type == "FieldsV1" && val.is_object() {
+                    // `FieldsV1 { optional bytes Raw = 1 }` carries the JSON
+                    // text of the field set; `FieldsV1.MarshalJSON` returns
+                    // Raw verbatim (apimachinery meta/v1 generated.proto:373,
+                    // types.go). The JSON form of `fieldsV1` is that object
+                    // itself, not `{"Raw": ...}`, so wrap its serialisation.
+                    let raw = serde_json::to_vec(val).unwrap_or_default();
+                    let mut inner = Vec::new();
+                    push_length_delimited_field(&mut inner, 1, &raw);
+                    push_length_delimited_field(buf, tag, &inner);
+                } else if (inner_type == "Time" || inner_type == "MicroTime") && val.is_string() {
                     let bytes = encode_timestamp(val);
                     push_length_delimited_field(buf, tag, &bytes);
                 } else if let Some(inner) = self.encode_message(inner_type, val) {
