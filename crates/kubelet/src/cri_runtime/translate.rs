@@ -164,7 +164,7 @@ fn sysctls(pod: &Pod) -> HashMap<String, String> {
 }
 
 /// De-duplicate a sequence of strings, preserving first-seen order
-/// (upstream `omitDuplicates`).
+/// (upstream `omitDuplicates`, `pkg/kubelet/network/dns/dns.go:89`).
 fn dedup<I: IntoIterator<Item = String>>(iter: I) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     iter.into_iter()
@@ -172,10 +172,96 @@ fn dedup<I: IntoIterator<Item = String>>(iter: I) -> Vec<String> {
         .collect()
 }
 
-/// Merge resolv.conf options name-keyed (upstream `mergeDNSOptions`): an option
-/// from the pod's `dnsConfig` overrides a base option of the same name (e.g.
-/// `ndots`), otherwise it is appended. Each option renders as `name` or
-/// `name:value`.
+/// Upstream `validation.MaxDNSNameservers`
+/// (`pkg/apis/core/validation/validation.go:4127`).
+const MAX_DNS_NAMESERVERS: usize = 3;
+/// Upstream `validation.MaxDNSSearchPaths` (`validation.go:4129`).
+const MAX_DNS_SEARCH_PATHS: usize = 32;
+/// Upstream `validation.MaxDNSSearchListChars` (`validation.go:4131`).
+const MAX_DNS_SEARCH_LIST_CHARS: usize = 2048;
+/// Upstream `utilvalidation.DNS1123SubdomainMaxLength`.
+const DNS1123_SUBDOMAIN_MAX_LENGTH: usize = 253;
+/// Upstream `maxResolvConfLength` (`dns.go:56`).
+pub const MAX_RESOLV_CONF_LENGTH: u64 = 10 * 1 << 20;
+
+/// Upstream `appendOptions` (`dns.go:357`): later options override earlier ones
+/// of the same name (the part before `:`). Order is first-seen (Go's map
+/// iteration order is random; we keep it deterministic).
+fn append_options(options: Vec<String>, new: impl IntoIterator<Item = String>) -> Vec<String> {
+    let name = |s: &str| s.split(':').next().unwrap_or(s).to_string();
+    let mut out = options;
+    for o in new {
+        match out.iter().position(|e| name(e) == name(&o)) {
+            Some(pos) => out[pos] = o,
+            None => out.push(o),
+        }
+    }
+    out
+}
+
+/// Port of upstream `parseResolvConf` (`dns.go:226`): nameservers accumulate,
+/// the last `search` line wins (trailing dots trimmed, `.` dropped), `options`
+/// lines are merged name-keyed. A bare `nameserver` line is an error.
+pub fn parse_resolv_conf(content: &str) -> Result<v1::DnsConfig, String> {
+    let mut cfg = v1::DnsConfig::default();
+    let mut errors: Vec<&str> = Vec::new();
+    for line in content.split('\n') {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        let fields: Vec<&str> = trimmed.split_whitespace().collect();
+        let Some(first) = fields.first() else {
+            continue;
+        };
+        match *first {
+            "nameserver" => {
+                if fields.len() >= 2 {
+                    cfg.servers.push(fields[1].to_string());
+                } else {
+                    errors.push("nameserver list is empty ");
+                }
+            }
+            "search" => {
+                cfg.searches = fields[1..]
+                    .iter()
+                    .filter(|s| **s != ".")
+                    .map(|s| s.strip_suffix('.').unwrap_or(s).to_string())
+                    .collect();
+            }
+            "options" => {
+                let opts = std::mem::take(&mut cfg.options);
+                cfg.options = append_options(opts, fields[1..].iter().map(|s| s.to_string()));
+            }
+            _ => {}
+        }
+    }
+    if errors.is_empty() {
+        Ok(cfg)
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
+/// Read and parse the host resolver file (upstream `getDNSConfig`,
+/// `dns.go:279`). An empty path yields an empty config.
+pub fn read_host_dns_config(path: &str) -> Result<v1::DnsConfig, String> {
+    use std::io::Read;
+    if path.is_empty() {
+        return Ok(v1::DnsConfig::default());
+    }
+    let f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    f.take(MAX_RESOLV_CONF_LENGTH)
+        .read_to_end(&mut buf)
+        .map_err(|e| e.to_string())?;
+    parse_resolv_conf(&String::from_utf8_lossy(&buf))
+        .map_err(|e| format!("Encountered error while parsing resolv conf file. Error: {e}"))
+}
+
+/// Port of upstream `mergeDNSOptions` (`dns.go:327`): an option from the pod's
+/// `dnsConfig` overrides an existing option of the same name; otherwise it is
+/// appended. Each option renders as `name` or `name:value`.
 fn merge_dns_options(
     base: Vec<String>,
     extra: &[rusternetes_common::resources::pod::PodDNSConfigOption],
@@ -183,9 +269,9 @@ fn merge_dns_options(
     let opt_name = |s: &str| s.split(':').next().unwrap_or(s).to_string();
     let mut out = base;
     for o in extra {
-        let rendered = match &o.value {
-            Some(v) => format!("{}:{}", o.name, v),
-            None => o.name.clone(),
+        let rendered = match o.value.as_deref() {
+            Some(v) if !v.is_empty() => format!("{}:{}", o.name, v),
+            _ => o.name.clone(),
         };
         match out.iter().position(|e| opt_name(e) == o.name) {
             Some(pos) => out[pos] = rendered,
@@ -195,22 +281,71 @@ fn merge_dns_options(
     out
 }
 
-/// Build the CRI [`DnsConfig`](v1::DnsConfig) for a pod from its
-/// `dnsPolicy`/`dnsConfig`, the cluster DNS server IPs, and the cluster domain.
-/// Ports the upstream kubelet `dns.Configurer.GetPodDNS`
-/// (`pkg/kubelet/network/dns/dns.go`).
+/// Port of upstream `formDNSSearchFitsLimits` (`dns.go:102`) and
+/// `formDNSNameserversFitsLimits` (`dns.go:149`). Upstream also emits a
+/// `DNSConfigForming` warning event; here the truncation is logged.
+fn form_dns_config_fits_limits(mut cfg: v1::DnsConfig, pod: &Pod) -> v1::DnsConfig {
+    let pod_name = pod.metadata.name.as_str();
+    if cfg.servers.len() > MAX_DNS_NAMESERVERS {
+        cfg.servers.truncate(MAX_DNS_NAMESERVERS);
+        tracing::warn!(
+            pod = pod_name,
+            applied = %cfg.servers.join(" "),
+            "DNSConfigForming: Nameserver limits were exceeded, some nameservers have been omitted"
+        );
+    }
+
+    let mut exceeded = false;
+    let mut search = cfg.searches;
+    if search.len() > MAX_DNS_SEARCH_PATHS {
+        search.truncate(MAX_DNS_SEARCH_PATHS);
+        exceeded = true;
+    }
+    // glibc 2.28 aborts on a search path over 255 chars; filter them out.
+    let before = search.len();
+    search.retain(|s| s.len() <= DNS1123_SUBDOMAIN_MAX_LENGTH);
+    if search.len() != before {
+        exceeded = true;
+    }
+    let line_len = search.join(" ").len();
+    if line_len > MAX_DNS_SEARCH_LIST_CHARS {
+        let mut cut_num = 0usize;
+        let mut cut_len = 0usize;
+        for s in search.iter().rev() {
+            cut_len += s.len() + 1;
+            cut_num += 1;
+            if line_len.saturating_sub(cut_len) <= MAX_DNS_SEARCH_LIST_CHARS {
+                break;
+            }
+        }
+        search.truncate(search.len() - cut_num);
+        exceeded = true;
+    }
+    if exceeded {
+        tracing::warn!(
+            pod = pod_name,
+            applied = %search.join(" "),
+            "DNSConfigForming: Search Line limits were exceeded, some search paths have been omitted"
+        );
+    }
+    cfg.searches = search;
+    cfg
+}
+
+/// Port of upstream `Configurer.GetPodDNS` (`pkg/kubelet/network/dns/dns.go:386`)
+/// including `getPodDNSType` (`:304`), `generateSearchesForDNSClusterFirst`
+/// (`:165`), `appendDNSConfig` (`:378`) and the limit trimming (`:159`).
 ///
-/// Returns `None` for the `Default` policy — and for `ClusterFirst*` when no
-/// cluster DNS is configured (upstream falls back to `Default` there). Leaving
-/// `PodSandboxConfig.dns_config` unset makes the runtime copy the host's
-/// `/etc/resolv.conf` into the sandbox, which is exactly "inherit node DNS".
-/// (Merging an explicit `dnsConfig` onto the host base for `Default` would need
-/// the kubelet to read the host resolv.conf; not done here.)
-pub fn dns_config(
+/// `host` is the parsed host resolver file ([`read_host_dns_config`]): the base
+/// for `Default` and the source of host searches for `ClusterFirst*`; policy
+/// `None` starts empty. The `ResolverConfig == ""` localhost fallback (`:431`)
+/// is not ported: the kubelet always has a resolv-conf path.
+pub fn get_pod_dns(
     pod: &Pod,
     cluster_dns: &[String],
     cluster_domain: &str,
-) -> Option<v1::DnsConfig> {
+    host: &v1::DnsConfig,
+) -> v1::DnsConfig {
     let policy = pod
         .spec
         .as_ref()
@@ -218,71 +353,64 @@ pub fn dns_config(
         // The api-server defaults an unset dnsPolicy to ClusterFirst.
         .unwrap_or("ClusterFirst");
 
-    let mut cfg = match policy {
-        // DNSNone: empty base, populated solely from the pod's dnsConfig.
-        "None" => v1::DnsConfig::default(),
-        // ClusterFirst on a hostNetwork pod falls back to Default (host DNS),
-        // matching upstream getPodDNSType (pkg/kubelet/network/dns/dns.go): only
-        // ClusterFirstWithHostNet keeps clusterDNS when sharing the host netns.
-        // Without this, hostNetwork control-plane static pods (scheduler /
-        // controller-manager, dnsPolicy unset => ClusterFirst) get
-        // `nameserver <clusterDNS>` and can't resolve the `api-server` Docker
-        // alias before cluster DNS is up — their reflectors never sync and the
-        // cluster never schedules anything.
-        "ClusterFirst" if host_network(pod) => return None,
-        "ClusterFirst" | "ClusterFirstWithHostNet" => {
-            if cluster_dns.is_empty() {
-                return None; // no ClusterDNS -> fall back to Default (host DNS)
-            }
-            let domain = if cluster_domain.is_empty() {
-                "cluster.local"
+    enum Kind {
+        Cluster,
+        Host,
+        None,
+    }
+    let kind = match policy {
+        "None" => Kind::None,
+        "ClusterFirstWithHostNet" => Kind::Cluster,
+        "ClusterFirst" if !host_network(pod) => Kind::Cluster,
+        "ClusterFirst" | "Default" => Kind::Host,
+        // Invalid policy: upstream logs and falls back to ClusterFirst.
+        _ => Kind::Cluster,
+    };
+
+    let mut cfg = match kind {
+        Kind::None => v1::DnsConfig::default(),
+        Kind::Cluster if !cluster_dns.is_empty() => {
+            // generateSearchesForDNSClusterFirst: with no cluster domain the
+            // host searches are kept as-is.
+            let searches = if cluster_domain.is_empty() {
+                host.searches.clone()
             } else {
-                cluster_domain
+                let ns = namespace(pod);
+                dedup(
+                    [
+                        format!("{ns}.svc.{cluster_domain}"),
+                        format!("svc.{cluster_domain}"),
+                        cluster_domain.to_string(),
+                    ]
+                    .into_iter()
+                    .chain(host.searches.iter().cloned()),
+                )
             };
-            let ns = namespace(pod);
             v1::DnsConfig {
                 servers: cluster_dns.to_vec(),
-                searches: vec![
-                    format!("{ns}.svc.{domain}"),
-                    format!("svc.{domain}"),
-                    domain.to_string(),
-                ],
+                searches,
                 options: vec!["ndots:5".to_string()],
             }
         }
-        // "Default" and any unknown value: inherit the node's resolv.conf.
-        _ => return None,
+        // Cluster without ClusterDNS falls through to Default (MissingClusterDNS).
+        Kind::Cluster | Kind::Host => host.clone(),
     };
 
-    // appendDNSConfig: additively merge the pod's explicit dnsConfig.
+    // appendDNSConfig.
     if let Some(dns) = pod.spec.as_ref().and_then(|s| s.dns_config.as_ref()) {
-        if let Some(ns) = dns.nameservers.as_ref() {
-            cfg.servers = dedup(cfg.servers.into_iter().chain(ns.iter().cloned()));
-        }
-        if let Some(s) = dns.searches.as_ref() {
-            cfg.searches = dedup(cfg.searches.into_iter().chain(s.iter().cloned()));
-        }
-        if let Some(opts) = dns.options.as_ref() {
-            cfg.options = merge_dns_options(cfg.options, opts);
-        }
+        cfg.servers = dedup(
+            cfg.servers
+                .into_iter()
+                .chain(dns.nameservers.iter().flatten().cloned()),
+        );
+        cfg.searches = dedup(
+            cfg.searches
+                .into_iter()
+                .chain(dns.searches.iter().flatten().cloned()),
+        );
+        cfg.options = merge_dns_options(cfg.options, dns.options.as_deref().unwrap_or(&[]));
     }
-
-    Some(cfg)
-}
-
-/// STUB (red-test commit): replaced by the real port in the next commit.
-pub fn get_pod_dns(
-    pod: &Pod,
-    cluster_dns: &[String],
-    cluster_domain: &str,
-    _host: &v1::DnsConfig,
-) -> v1::DnsConfig {
-    dns_config(pod, cluster_dns, cluster_domain).unwrap_or_default()
-}
-
-/// STUB: replaced by the real port in the next commit.
-pub fn parse_resolv_conf(_content: &str) -> Result<v1::DnsConfig, String> {
-    Ok(v1::DnsConfig::default())
+    form_dns_config_fits_limits(cfg, pod)
 }
 
 /// Whether any container in the pod requests `privileged` (upstream
@@ -2354,8 +2482,8 @@ mod tests {
     fn dns_cluster_first_is_default_with_cluster_searches_and_ndots() {
         // No dnsPolicy => ClusterFirst (api-server default).
         let pod = pod_with(PodSpec::default());
-        let dns = dns_config(&pod, &["10.96.0.10".to_string()], "cluster.local")
-            .expect("ClusterFirst yields a DnsConfig");
+        let dns =
+            old_dns(&pod, &["10.96.0.10".to_string()]).expect("ClusterFirst yields a DnsConfig");
         assert_eq!(dns.servers, vec!["10.96.0.10".to_string()]);
         assert_eq!(
             dns.searches,
@@ -2375,13 +2503,16 @@ mod tests {
             ..Default::default()
         });
         // None => leave dns_config unset so the runtime copies host resolv.conf.
-        assert!(dns_config(&pod, &["10.96.0.10".to_string()], "cluster.local").is_none());
+        assert!(old_dns(&pod, &["10.96.0.10".to_string()])
+            .unwrap()
+            .servers
+            .is_empty());
     }
 
     #[test]
     fn dns_cluster_first_without_cluster_dns_falls_back_to_host() {
         let pod = pod_with(PodSpec::default());
-        assert!(dns_config(&pod, &[], "cluster.local").is_none());
+        assert!(old_dns(&pod, &[]).unwrap().servers.is_empty());
     }
 
     #[test]
@@ -2395,7 +2526,10 @@ mod tests {
             host_network: Some(true),
             ..Default::default()
         });
-        assert!(dns_config(&pod, &["10.96.0.10".to_string()], "cluster.local").is_none());
+        assert!(old_dns(&pod, &["10.96.0.10".to_string()])
+            .unwrap()
+            .servers
+            .is_empty());
     }
 
     #[test]
@@ -2407,7 +2541,7 @@ mod tests {
             dns_policy: Some("ClusterFirstWithHostNet".to_string()),
             ..Default::default()
         });
-        let dns = dns_config(&pod, &["10.96.0.10".to_string()], "cluster.local")
+        let dns = old_dns(&pod, &["10.96.0.10".to_string()])
             .expect("ClusterFirstWithHostNet yields a DnsConfig on hostNetwork");
         assert_eq!(dns.servers, vec!["10.96.0.10".to_string()]);
     }
@@ -2427,7 +2561,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        let dns = dns_config(&pod, &["10.96.0.10".to_string()], "cluster.local").unwrap();
+        let dns = old_dns(&pod, &["10.96.0.10".to_string()]).unwrap();
         // No cluster defaults leak in for policy None.
         assert_eq!(dns.servers, vec!["1.2.3.4".to_string()]);
         assert_eq!(dns.searches, vec!["custom.example".to_string()]);
@@ -2454,7 +2588,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        let dns = dns_config(&pod, &["10.96.0.10".to_string()], "cluster.local").unwrap();
+        let dns = old_dns(&pod, &["10.96.0.10".to_string()]).unwrap();
         // cluster server + appended pod nameserver.
         assert_eq!(
             dns.servers,
@@ -2468,6 +2602,15 @@ mod tests {
             dns.options,
             vec!["ndots:3".to_string(), "edns0".to_string()]
         );
+    }
+
+    fn old_dns(pod: &Pod, cluster_dns: &[String]) -> Option<v1::DnsConfig> {
+        Some(get_pod_dns(
+            pod,
+            cluster_dns,
+            "cluster.local",
+            &v1::DnsConfig::default(),
+        ))
     }
 
     // --- GetPodDNS host-base tests (ported from upstream dns_test.go) ---
@@ -2593,6 +2736,7 @@ mod tests {
                     "g".repeat(250),
                     "h".repeat(250),
                     "i".repeat(250),
+                    "j".repeat(250),
                 ]),
                 options: None,
             }),
@@ -2602,7 +2746,7 @@ mod tests {
         assert!(!dns.searches.iter().any(|s| s.len() > 253));
         assert!(dns.searches.join(" ").len() <= 2048);
         assert_eq!(dns.searches[0], "ok.example");
-        assert_eq!(dns.searches.len(), 8);
+        assert_eq!(dns.searches.len(), 9);
     }
 
     #[test]
