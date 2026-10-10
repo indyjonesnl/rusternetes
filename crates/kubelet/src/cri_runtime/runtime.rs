@@ -752,6 +752,25 @@ impl CriContainerRuntime {
             }
             None => std::collections::HashMap::new(),
         };
+        // `runtimeClassSupportsRecursiveReadOnlyMounts` (`kubelet_pods.go:2800`)
+        // from the CRI Status `runtime_handlers`; an RPC failure is "no
+        // support", as for a runtime that cannot list handlers.
+        let wants_rro = container
+            .volume_mounts
+            .iter()
+            .flatten()
+            .any(|m| m.recursive_read_only.is_some());
+        let supports_rro = if !wants_rro {
+            false
+        } else {
+            match self.runtime_status().await {
+                Ok(st) => translate::runtime_handler_supports_rro(
+                    &self.runtime_handler,
+                    &st.runtime_handlers,
+                ),
+                Err(_) => false,
+            }
+        };
         let mut cfg = translate::container_config_with_mounts(
             pod,
             container,
@@ -761,6 +780,7 @@ impl CriContainerRuntime {
             &secrets,
             node_allocatable,
             &mount_attrs,
+            supports_rro,
         )
         .map_err(|msg| {
             anyhow::anyhow!(
