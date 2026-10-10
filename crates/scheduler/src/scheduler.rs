@@ -897,12 +897,19 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
 
         // Phase 4c: VolumeBinding Filter (FindPodVolumes) — bound PV node
         // affinity, matching/provisionable unbound WaitForFirstConsumer claims.
+        // `podVolumesByNode` (volume_binding.go stateData): Filter's per-node
+        // result, read back by PreScore/Score.
+        let mut pod_volumes_by_node: std::collections::HashMap<String, volume_binding::PodVolumes> =
+            std::collections::HashMap::new();
         let port_ok_nodes: Vec<&Node> = match volume_ctx {
             Some((snap, claims)) => port_ok_nodes
                 .into_iter()
                 .filter(
                     |node| match volume_binding::find_pod_volumes(pod, &claims, node, &snap) {
-                        Ok((_, reasons)) if reasons.is_empty() => true,
+                        Ok((vols, reasons)) if reasons.is_empty() => {
+                            pod_volumes_by_node.insert(node.metadata.name.clone(), vols);
+                            true
+                        }
                         Ok((_, reasons)) => {
                             debug!(
                                 "Node {} rejected for pod {}: {}",
@@ -929,6 +936,22 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             debug!("No nodes satisfy the pod's volume requirements");
             return None;
         }
+
+        // VolumeBinding PreScore (volume_binding.go:456-468): `pl.scorer` is
+        // only built when StorageCapacityScoring is on (volume_binding.go:642-653);
+        // otherwise, or when PreScore says Skip, Score is not run.
+        let scoring_enabled = rusternetes_common::feature_gates::enabled(
+            rusternetes_common::feature_gates::Feature::StorageCapacityScoring,
+        );
+        let volume_scorer = if scoring_enabled
+            && !volume_binding::pre_score_skip(&pod_volumes_by_node, scoring_enabled)
+        {
+            Some(volume_binding::build_scorer_function(
+                &volume_binding::default_shape(),
+            ))
+        } else {
+            None
+        };
 
         // Phase 5, 6 & 7: Score nodes based on affinity, pod affinity/anti-affinity, topology spread, and resources
         let mut node_scores: Vec<NodeScore> = Vec::new();
@@ -983,7 +1006,17 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             // - priority (weight 15%)
             // - pod anti-affinity penalty (weight 12%)
             // - topology spread penalty (weight 10%)
-            let total_score = (resource_score as i64 * 25 / 100)
+            // VolumeBinding Score, plugin weight 1 (default_plugins.go:44: no
+            // `Weight` => 1) on the 0..=MaxNodeScore range.
+            let volume_score = volume_scorer.as_ref().map_or(0, |scorer| {
+                volume_binding::score(
+                    pod_volumes_by_node.get(&node.metadata.name),
+                    scorer,
+                    scoring_enabled,
+                )
+            });
+            let total_score = volume_score
+                + (resource_score as i64 * 25 / 100)
                 + (node_affinity_score as i64 * 20 / 100)
                 + (pod_affinity_score as i64 * 18 / 100)
                 + (priority_score as i64 * 15 / 100)
@@ -2040,6 +2073,90 @@ mod tests {
 
         scheduler.schedule_pending_pods().await.unwrap();
         let p: Pod = storage.get("/registry/pods/default/vol-pod").await.unwrap();
+        assert_eq!(
+            p.spec.as_ref().and_then(|s| s.node_name.as_deref()),
+            Some("node-2")
+        );
+    }
+
+    /// VolumeBinding Score wiring (#3036), StorageCapacityScoring on: with the
+    /// default shape (utilization 0 -> 100, 100 -> 0) the node whose static
+    /// PV leaves more room wins even though `node-1` would win the tie-break.
+    #[tokio::test]
+    async fn test_volume_binding_score_prefers_node_with_more_free_capacity() {
+        let _gate = rusternetes_common::feature_gates::with_feature(
+            rusternetes_common::feature_gates::Feature::StorageCapacityScoring,
+            true,
+        );
+        let storage = Arc::new(MemoryStorage::new());
+        let scheduler =
+            Scheduler::new_with_name(storage.clone(), 1, "default-scheduler".to_string());
+        for n in ["node-1", "node-2"] {
+            let mut node = make_node(n);
+            node.metadata.labels =
+                Some(HashMap::from([("kubernetes.io/hostname".into(), n.into())]));
+            storage
+                .create(&format!("/registry/nodes/{n}"), &node)
+                .await
+                .unwrap();
+        }
+        let class: rusternetes_common::resources::StorageClass =
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "storage.k8s.io/v1", "kind": "StorageClass",
+                "metadata": {"name": "wait"},
+                "provisioner": "kubernetes.io/no-provisioner",
+                "volumeBindingMode": "WaitForFirstConsumer"
+            }))
+            .unwrap();
+        storage
+            .create("/registry/storageclasses/wait", &class)
+            .await
+            .unwrap();
+        let pvc: rusternetes_common::resources::PersistentVolumeClaim =
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                "metadata": {"name": "claim", "namespace": "default"},
+                "spec": {"storageClassName": "wait",
+                    "resources": {"requests": {"storage": "1Gi"}}},
+                "status": {"phase": "Pending"}
+            }))
+            .unwrap();
+        storage
+            .create("/registry/persistentvolumeclaims/default/claim", &pvc)
+            .await
+            .unwrap();
+        for (node, size) in [("node-1", "1Gi"), ("node-2", "10Gi")] {
+            let pv: rusternetes_common::resources::PersistentVolume =
+                serde_json::from_value(serde_json::json!({
+                    "apiVersion": "v1", "kind": "PersistentVolume",
+                    "metadata": {"name": format!("pv-{node}")},
+                    "spec": {"capacity": {"storage": size}, "accessModes": ["ReadWriteOnce"],
+                        "storageClassName": "wait", "hostPath": {"path": "/x"},
+                        "nodeAffinity": {"required": {"nodeSelectorTerms": [{"matchExpressions": [
+                            {"key": "kubernetes.io/hostname", "operator": "In", "values": [node]}]}]}}},
+                    "status": {"phase": "Available"}
+                }))
+                .unwrap();
+            storage
+                .create(&format!("/registry/persistentvolumes/pv-{node}"), &pv)
+                .await
+                .unwrap();
+        }
+        let mut pod = make_pending_pod("score-pod", "default");
+        pod.spec.as_mut().unwrap().volumes = Some(vec![serde_json::from_value(
+            serde_json::json!({"name": "v", "persistentVolumeClaim": {"claimName": "claim"}}),
+        )
+        .unwrap()]);
+        storage
+            .create("/registry/pods/default/score-pod", &pod)
+            .await
+            .unwrap();
+
+        scheduler.schedule_pending_pods().await.unwrap();
+        let p: Pod = storage
+            .get("/registry/pods/default/score-pod")
+            .await
+            .unwrap();
         assert_eq!(
             p.spec.as_ref().and_then(|s| s.node_name.as_deref()),
             Some("node-2")

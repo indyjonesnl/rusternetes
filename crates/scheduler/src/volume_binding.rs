@@ -730,12 +730,13 @@ pub fn find_pod_volumes(
 }
 
 // ---------------------------------------------------------------------------
-// Score (volume_binding.go PreScore/Score, scorer.go) -- STUB, see next commit.
+// Score: volume_binding.go PreScore/Score (:456-526), binder.go
+// StorageResource (:87-102) and scorer.go (whole file).
 // ---------------------------------------------------------------------------
 
 /// `maxUtilization` (volume_binding.go:47).
 pub const MAX_UTILIZATION: i64 = 100;
-/// `fwk.MaxNodeScore` (kube-scheduler framework/interface.go).
+/// `fwk.MaxNodeScore` (staging/src/k8s.io/kube-scheduler/framework/interface.go:289).
 pub const MAX_NODE_SCORE: i64 = 100;
 /// `config.MaxCustomPriorityScore` (pkg/scheduler/apis/config/types.go:220).
 pub const MAX_CUSTOM_PRIORITY_SCORE: i64 = 10;
@@ -757,24 +758,125 @@ pub struct StorageResource {
 /// `classResourceMap` (scorer.go:26).
 pub type ClassResourceMap = HashMap<String, StorageResource>;
 
+/// `BindingInfo.StorageResource` (binder.go:93-102): both fields mandatory,
+/// a missing quantity reads as zero (Go's zero-value `resource.Quantity`).
+fn binding_storage_resource(b: &BindingInfo) -> StorageResource {
+    let requested = storage_request(&b.pvc).map_or(0, |q| q.value() as i64);
+    let capacity =
+        b.pv.spec
+            .capacity
+            .get("storage")
+            .and_then(|q| Quantity::parse(q).ok())
+            .map_or(0, |q| q.value() as i64);
+    StorageResource {
+        requested,
+        capacity,
+    }
+}
+
+/// The shape the scheduler config defaults to when `StorageCapacityScoring`
+/// is on and `shape` is empty: `SetDefaults_VolumeBindingArgs`
+/// (pkg/scheduler/apis/config/v1/defaults.go:196-207), scaled to
+/// `MaxNodeScore` by `New` (volume_binding.go:647-651).
 pub fn default_shape() -> Vec<FunctionShapePoint> {
-    todo!()
+    [(0, MAX_CUSTOM_PRIORITY_SCORE), (100, 0)]
+        .iter()
+        .map(|&(utilization, score)| FunctionShapePoint {
+            utilization,
+            score: score * (MAX_NODE_SCORE / MAX_CUSTOM_PRIORITY_SCORE),
+        })
+        .collect()
 }
 
-pub fn build_scorer_function(_shape: &[FunctionShapePoint]) -> impl Fn(&ClassResourceMap) -> i64 {
-    |_| todo!()
+/// `helper.BuildBrokenLinearFunction` (framework/plugins/helper/shape_score.go:40-52).
+fn build_broken_linear_function(shape: Vec<FunctionShapePoint>) -> impl Fn(i64) -> i64 {
+    move |p| {
+        for i in 0..shape.len() {
+            if p <= shape[i].utilization {
+                if i == 0 {
+                    return shape[0].score;
+                }
+                return shape[i - 1].score
+                    + (shape[i].score - shape[i - 1].score) * (p - shape[i - 1].utilization)
+                        / (shape[i].utilization - shape[i - 1].utilization);
+            }
+        }
+        shape[shape.len() - 1].score
+    }
 }
 
-pub fn pre_score_skip(_by_node: &HashMap<String, PodVolumes>, _scoring_enabled: bool) -> bool {
-    todo!()
+/// `buildScorerFunction` (scorer.go:31-53).
+pub fn build_scorer_function(shape: &[FunctionShapePoint]) -> impl Fn(&ClassResourceMap) -> i64 {
+    let raw = build_broken_linear_function(shape.to_vec());
+    let f = move |requested: i64, capacity: i64| -> i64 {
+        if capacity == 0 || requested > capacity {
+            return raw(MAX_UTILIZATION);
+        }
+        raw(requested * MAX_UTILIZATION / capacity)
+    };
+    move |class_resources: &ClassResourceMap| {
+        // in alpha stage, all classes have the same weight
+        let weight_sum = class_resources.len();
+        if weight_sum == 0 {
+            return 0;
+        }
+        let node_score: i64 = class_resources
+            .values()
+            .map(|r| f(r.requested, r.capacity))
+            .sum();
+        // math.Round rounds half away from zero, as does f64::round.
+        (node_score as f64 / weight_sum as f64).round() as i64
+    }
 }
 
+/// `PreScore` (volume_binding.go:456-468): true = `fwk.Skip`. The caller maps
+/// "no scorer" (gate off) to skip itself, as `pl.scorer == nil` does.
+pub fn pre_score_skip(by_node: &HashMap<String, PodVolumes>, scoring_enabled: bool) -> bool {
+    // `state.hasStaticBindings` is the OR over every Filter'd node
+    // (volume_binding.go:446).
+    let has_static_bindings = by_node.values().any(|v| !v.static_bindings.is_empty());
+    !(has_static_bindings || scoring_enabled)
+}
+
+/// `Score` (volume_binding.go:471-523) for one node's `PodVolumes`
+/// (`None` = node absent from `podVolumesByNode` => 0).
 pub fn score(
-    _pod_volumes: Option<&PodVolumes>,
-    _scorer: &dyn Fn(&ClassResourceMap) -> i64,
-    _scoring_enabled: bool,
+    pod_volumes: Option<&PodVolumes>,
+    scorer: &dyn Fn(&ClassResourceMap) -> i64,
+    scoring_enabled: bool,
 ) -> i64 {
-    todo!()
+    let Some(pod_volumes) = pod_volumes else {
+        return 0;
+    };
+    let mut class_resources = ClassResourceMap::new();
+    if !pod_volumes.static_bindings.is_empty() || !scoring_enabled {
+        // group static binding volumes by storage class
+        for b in &pod_volumes.static_bindings {
+            let r = binding_storage_resource(b);
+            let e = class_resources.entry(volume_class(&b.pv)).or_default();
+            e.requested += r.requested;
+            e.capacity += r.capacity;
+        }
+    } else {
+        // group dynamic binding volumes by storage class
+        for provision in &pod_volumes.dynamic_provisions {
+            let Some(node_capacity) = provision.node_capacity.as_ref() else {
+                continue;
+            };
+            let e = class_resources
+                .entry(claim_class(&provision.pvc))
+                .or_default();
+            // Assigned, not `+=`: two 50GB claims on a 100GB class must not
+            // read as 200GB (volume_binding.go:508-512).
+            e.capacity = node_capacity
+                .capacity
+                .as_ref()
+                .and_then(|q| Quantity::parse(q).ok())
+                .map_or(0, |q| q.value() as i64);
+            e.requested += storage_request(&provision.pvc).map_or(0, |q| q.value() as i64);
+        }
+    }
+    scorer(&class_resources)
 }
 
 #[cfg(test)]
@@ -1554,7 +1656,6 @@ mod tests {
                 node_capacity("node-b", "wait-cap", "50Gi"),
                 node_capacity("node-c", "wait-cap", "10Gi"),
             ],
-            ..Default::default()
         };
         let got = run_scores(
             &pod_with_claims(&["pvc-dynamic", "pvc-static"]),
