@@ -142,7 +142,6 @@ impl Controller for Fake {
                 } else {
                     req.volume_content_source.clone()
                 },
-                ..Default::default()
             }),
         }))
     }

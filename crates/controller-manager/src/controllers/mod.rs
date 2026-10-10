@@ -6,6 +6,7 @@ pub mod cidrset_metrics;
 pub mod clusterrole_aggregation;
 pub mod cronjob;
 pub mod csi_provisioner;
+pub mod csi_topology;
 pub mod daemonset;
 pub mod deployment;
 pub mod dynamic_provisioner;
