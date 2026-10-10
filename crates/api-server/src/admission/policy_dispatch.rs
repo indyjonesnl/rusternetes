@@ -37,6 +37,7 @@ use rusternetes_common::Error;
 use serde_json::Value;
 
 use super::policy_matching::{selector_of, Attributes, Matcher};
+use super::policy_mutating::VersionedAttributes;
 
 /// `types.NamespacedName`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -345,8 +346,81 @@ pub trait DispatchDelegate<P: Sync, B: Sync, E: Sync>: Send + Sync {
     async fn dispatch(
         &self,
         attr: &mut Attributes,
+        versioned: &mut VersionedAttributeAccessor<'_>,
         invocations: &[PolicyInvocation<'_, P, B, E>],
     ) -> Result<Vec<PolicyError>, Error>;
+}
+
+/// `admission.NewVersionedAttributes` (apiserver `pkg/admission/attributes.go`):
+/// converts the request's objects to `gvk`. The error is what a failed
+/// conversion returns.
+pub trait VersionConverter: Send + Sync {
+    fn new_versioned_attributes(
+        &self,
+        attr: &Attributes,
+        gvk: &GroupVersionKind,
+    ) -> Result<VersionedAttributes, String>;
+}
+
+/// Objects are JSON in every version here, so converting to `gvk` is the
+/// identity on the request's objects.
+pub struct IdentityConverter;
+
+impl VersionConverter for IdentityConverter {
+    fn new_versioned_attributes(
+        &self,
+        attr: &Attributes,
+        gvk: &GroupVersionKind,
+    ) -> Result<VersionedAttributes, String> {
+        Ok(VersionedAttributes {
+            versioned_kind: gvk.clone(),
+            versioned_object: attr.object.clone(),
+            versioned_old_object: attr.old_object.clone(),
+            dirty: false,
+        })
+    }
+}
+
+/// policy_dispatcher.go `versionedAttributeAccessor` (`webhookgeneric.
+/// VersionedAttributeAccessor`): one `VersionedAttributes` per kind, built on
+/// first use and cached for every later hook call.
+pub struct VersionedAttributeAccessor<'a> {
+    versioned_attrs: Vec<(GroupVersionKind, VersionedAttributes)>,
+    converter: &'a dyn VersionConverter,
+}
+
+impl<'a> VersionedAttributeAccessor<'a> {
+    pub fn new(converter: &'a dyn VersionConverter) -> Self {
+        Self {
+            versioned_attrs: Vec::new(),
+            converter,
+        }
+    }
+
+    /// `VersionedAttribute(gvk)` (policy_dispatcher.go:378-389).
+    pub fn versioned_attribute(
+        &mut self,
+        attr: &Attributes,
+        gvk: &GroupVersionKind,
+    ) -> Result<&mut VersionedAttributes, String> {
+        let idx = match self.versioned_attrs.iter().position(|(k, _)| k == gvk) {
+            Some(i) => i,
+            None => {
+                let v = self.converter.new_versioned_attributes(attr, gvk)?;
+                self.versioned_attrs.push((gvk.clone(), v));
+                self.versioned_attrs.len() - 1
+            }
+        };
+        Ok(&mut self.versioned_attrs[idx].1)
+    }
+
+    /// The cached entry for `gvk`, without building one.
+    pub fn cached(&self, gvk: &GroupVersionKind) -> Option<&VersionedAttributes> {
+        self.versioned_attrs
+            .iter()
+            .find(|(k, _)| k == gvk)
+            .map(|(_, v)| v)
+    }
 }
 
 /// `admission.NewForbidden(a, "admission request denied by policy")` with the
@@ -394,9 +468,6 @@ fn denied(attr: &Attributes, errors: &[PolicyError]) -> Error {
 /// tuples to the delegate, and fail the request with every error whose policy
 /// has `failurePolicy: Fail`.
 ///
-/// Deviation: upstream also pre-warms `VersionedAttribute(matchGVK)` per
-/// binding; that is the delegate's concern until versioned attributes exist
-/// (follow-up on #2886).
 pub async fn dispatch<P, B, E>(
     matcher: &Matcher<'_>,
     attr: &mut Attributes,
@@ -408,7 +479,25 @@ where
     B: BindingAccessor + Sync,
     E: Sync,
 {
+    dispatch_with_converter(matcher, attr, hooks, delegate, &IdentityConverter).await
+}
+
+/// `dispatch` with the converter `NewVersionedAttributes` uses.
+pub async fn dispatch_with_converter<P, B, E>(
+    matcher: &Matcher<'_>,
+    attr: &mut Attributes,
+    hooks: &[PolicyHook<P, B, E>],
+    delegate: &dyn DispatchDelegate<P, B, E>,
+    converter: &dyn VersionConverter,
+) -> Result<(), Error>
+where
+    P: PolicyAccessor + Sync,
+    B: BindingAccessor + Sync,
+    E: Sync,
+{
     let mut relevant: Vec<PolicyInvocation<'_, P, B, E>> = Vec::new();
+    // Construct all the versions we need to call our webhooks.
+    let mut versioned = VersionedAttributeAccessor::new(converter);
     let mut policy_errors: Vec<PolicyError> = Vec::new();
     let config_error = |policy: &P, binding: Option<&B>, err: String| PolicyError {
         policy_name: policy.name().to_string(),
@@ -485,7 +574,11 @@ where
     }
 
     if !relevant.is_empty() {
-        policy_errors.extend(delegate.dispatch(&mut *attr, &relevant).await?);
+        policy_errors.extend(
+            delegate
+                .dispatch(&mut *attr, &mut versioned, &relevant)
+                .await?,
+        );
     }
 
     // The failure policy defaults to Fail (and is validated at the API level).
@@ -1016,14 +1109,21 @@ mod tests {
         seen: Mutex<Vec<(String, String, Option<Value>)>>,
         errors: Mutex<Vec<PolicyError>>,
         status_error: Option<fn() -> Error>,
+        /// Whether the Pod kind was already in the accessor on entry.
+        warm_on_entry: Mutex<Vec<bool>>,
     }
     #[async_trait]
     impl DispatchDelegate<Pol, Bind, ()> for Delegate {
         async fn dispatch(
             &self,
             _: &mut Attributes,
+            versioned: &mut VersionedAttributeAccessor<'_>,
             invocations: &[PolicyInvocation<'_, Pol, Bind, ()>],
         ) -> Result<Vec<PolicyError>, Error> {
+            self.warm_on_entry
+                .lock()
+                .unwrap()
+                .push(versioned.cached(&gvk("", "v1", "Pod")).is_some());
             for i in invocations {
                 self.seen.lock().unwrap().push((
                     i.policy.name.to_string(),
@@ -1230,5 +1330,110 @@ mod tests {
             PolicyError::new(&p, None, "m", None).error(),
             "policy \"p\" denied request: m"
         );
+    }
+
+    // ---- VersionedAttributes pre-warm (policy_dispatcher.go:152-160) -----
+
+    /// Counts conversions and fails on request.
+    struct Converter {
+        calls: Mutex<Vec<GroupVersionKind>>,
+        fail: bool,
+    }
+    impl VersionConverter for Converter {
+        fn new_versioned_attributes(
+            &self,
+            attr: &Attributes,
+            gvk: &GroupVersionKind,
+        ) -> Result<VersionedAttributes, String> {
+            self.calls.lock().unwrap().push(gvk.clone());
+            if self.fail {
+                return Err("no conversion to v1 Pod".into());
+            }
+            IdentityConverter.new_versioned_attributes(attr, gvk)
+        }
+    }
+    async fn run_converting(
+        hooks: &[PolicyHook<Pol, Bind, ()>],
+        delegate: &Delegate,
+        converter: &Converter,
+    ) -> Result<(), Error> {
+        let m = Matcher {
+            namespaces: &NoNamespaces,
+            mapper: &NoMapper,
+        };
+        dispatch_with_converter(&m, &mut pod_attr(), hooks, delegate, converter).await
+    }
+
+    /// The versioned attributes of a matched kind are built by `Dispatch`
+    /// before the delegate runs, once however many bindings match.
+    #[tokio::test]
+    async fn matched_kind_is_warmed_once_before_the_delegate() {
+        let c = Converter {
+            calls: Mutex::new(vec![]),
+            fail: false,
+        };
+        let d = Delegate::default();
+        run_converting(&[hook(pol("p"), vec![bind("b1"), bind("b2")])], &d, &c)
+            .await
+            .unwrap();
+        assert_eq!(*d.warm_on_entry.lock().unwrap(), vec![true]);
+        assert_eq!(*c.calls.lock().unwrap(), vec![gvk("", "v1", "Pod")]);
+    }
+
+    /// A failed conversion is a policy-level (no binding) config error and the
+    /// binding is skipped: the delegate never sees it.
+    #[tokio::test]
+    async fn failed_warm_is_a_policy_config_error_and_skips_the_binding() {
+        let c = Converter {
+            calls: Mutex::new(vec![]),
+            fail: true,
+        };
+        let d = Delegate::default();
+        let s = status_of(
+            run_converting(&[hook(pol("p"), vec![bind("b")])], &d, &c)
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(
+            s.message.as_deref(),
+            Some(
+                "policy \"p\" denied request: failed to configure policy: no conversion to v1 Pod"
+            )
+        );
+        assert!(d.seen.lock().unwrap().is_empty());
+        assert!(d.warm_on_entry.lock().unwrap().is_empty());
+    }
+
+    /// failurePolicy Ignore swallows the warm-up error like any other.
+    #[tokio::test]
+    async fn failed_warm_honours_failure_policy_ignore() {
+        let c = Converter {
+            calls: Mutex::new(vec![]),
+            fail: true,
+        };
+        let mut p = pol("p");
+        p.failure = Some(FailurePolicy::Ignore);
+        let d = Delegate::default();
+        assert!(run_converting(&[hook(p, vec![bind("b")])], &d, &c)
+            .await
+            .is_ok());
+    }
+
+    /// Only a binding that matches warms: no conversion for a miss.
+    #[tokio::test]
+    async fn non_matching_binding_does_not_warm() {
+        let c = Converter {
+            calls: Mutex::new(vec![]),
+            fail: false,
+        };
+        let mut b = bind("b");
+        let mut mr = match_pods();
+        mr.resource_rules.as_mut().unwrap()[0].rule.resources = Some(vec!["deployments".into()]);
+        b.resources = Some(mr);
+        let d = Delegate::default();
+        run_converting(&[hook(pol("p"), vec![b])], &d, &c)
+            .await
+            .unwrap();
+        assert!(c.calls.lock().unwrap().is_empty());
     }
 }
