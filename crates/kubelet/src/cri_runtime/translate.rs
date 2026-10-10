@@ -270,6 +270,21 @@ pub fn dns_config(
     Some(cfg)
 }
 
+/// STUB (red-test commit): replaced by the real port in the next commit.
+pub fn get_pod_dns(
+    pod: &Pod,
+    cluster_dns: &[String],
+    cluster_domain: &str,
+    _host: &v1::DnsConfig,
+) -> v1::DnsConfig {
+    dns_config(pod, cluster_dns, cluster_domain).unwrap_or_default()
+}
+
+/// STUB: replaced by the real port in the next commit.
+pub fn parse_resolv_conf(_content: &str) -> Result<v1::DnsConfig, String> {
+    Ok(v1::DnsConfig::default())
+}
+
 /// Whether any container in the pod requests `privileged` (upstream
 /// `kubecontainer.HasPrivilegedContainer`). Covers regular + init containers.
 fn pod_has_privileged_container(pod: &Pod) -> bool {
@@ -2453,6 +2468,157 @@ mod tests {
             dns.options,
             vec!["ndots:3".to_string(), "edns0".to_string()]
         );
+    }
+
+    // --- GetPodDNS host-base tests (ported from upstream dns_test.go) ---
+
+    fn host_dns() -> v1::DnsConfig {
+        v1::DnsConfig {
+            servers: vec!["127.0.0.1".into()],
+            searches: vec!["host.example".into()],
+            options: vec!["ndots:1".into(), "timeout:2".into()],
+        }
+    }
+
+    #[test]
+    fn get_pod_dns_default_policy_uses_host_base() {
+        let pod = pod_with(PodSpec {
+            dns_policy: Some("Default".to_string()),
+            ..Default::default()
+        });
+        let dns = get_pod_dns(&pod, &["10.96.0.10".into()], "cluster.local", &host_dns());
+        assert_eq!(dns, host_dns());
+    }
+
+    #[test]
+    fn get_pod_dns_default_policy_merges_explicit_dns_config() {
+        use rusternetes_common::resources::pod::{PodDNSConfig, PodDNSConfigOption};
+        let pod = pod_with(PodSpec {
+            dns_policy: Some("Default".to_string()),
+            dns_config: Some(PodDNSConfig {
+                nameservers: Some(vec!["1.2.3.4".into(), "127.0.0.1".into()]),
+                searches: Some(vec!["extra.example".into()]),
+                options: Some(vec![PodDNSConfigOption {
+                    name: "ndots".into(),
+                    value: Some("3".into()),
+                }]),
+            }),
+            ..Default::default()
+        });
+        let dns = get_pod_dns(&pod, &[], "cluster.local", &host_dns());
+        assert_eq!(dns.servers, vec!["127.0.0.1", "1.2.3.4"]);
+        assert_eq!(dns.searches, vec!["host.example", "extra.example"]);
+        assert_eq!(dns.options, vec!["ndots:3", "timeout:2"]);
+    }
+
+    #[test]
+    fn get_pod_dns_cluster_first_appends_host_searches_deduped() {
+        let pod = pod_with(PodSpec::default());
+        let mut host = host_dns();
+        host.searches = vec!["host.example".into(), "svc.cluster.local".into()];
+        let dns = get_pod_dns(&pod, &["10.96.0.10".into()], "cluster.local", &host);
+        assert_eq!(dns.servers, vec!["10.96.0.10"]);
+        assert_eq!(
+            dns.searches,
+            vec![
+                "prod.svc.cluster.local",
+                "svc.cluster.local",
+                "cluster.local",
+                "host.example"
+            ]
+        );
+        assert_eq!(dns.options, vec!["ndots:5"]);
+    }
+
+    #[test]
+    fn get_pod_dns_cluster_first_without_cluster_dns_falls_back_to_host() {
+        let pod = pod_with(PodSpec::default());
+        assert_eq!(
+            get_pod_dns(&pod, &[], "cluster.local", &host_dns()),
+            host_dns()
+        );
+    }
+
+    #[test]
+    fn get_pod_dns_none_ignores_host() {
+        let pod = pod_with(PodSpec {
+            dns_policy: Some("None".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(
+            get_pod_dns(&pod, &["10.96.0.10".into()], "cluster.local", &host_dns()),
+            v1::DnsConfig::default()
+        );
+    }
+
+    #[test]
+    fn get_pod_dns_limits_nameservers_searches_and_length() {
+        use rusternetes_common::resources::pod::PodDNSConfig;
+        let pod = pod_with(PodSpec {
+            dns_policy: Some("None".to_string()),
+            dns_config: Some(PodDNSConfig {
+                nameservers: Some((1..=5).map(|i| format!("1.1.1.{i}")).collect()),
+                searches: Some(
+                    (0..40)
+                        .map(|i| format!("s{i}.example"))
+                        .chain(["x".repeat(254)])
+                        .collect(),
+                ),
+                options: None,
+            }),
+            ..Default::default()
+        });
+        let dns = get_pod_dns(&pod, &[], "cluster.local", &v1::DnsConfig::default());
+        assert_eq!(dns.servers.len(), 3);
+        assert_eq!(dns.searches.len(), 32);
+        assert_eq!(dns.searches[0], "s0.example");
+    }
+
+    #[test]
+    fn get_pod_dns_limits_search_chars_and_overlong_entries() {
+        use rusternetes_common::resources::pod::PodDNSConfig;
+        let long = "a".repeat(254);
+        let pod = pod_with(PodSpec {
+            dns_policy: Some("None".to_string()),
+            dns_config: Some(PodDNSConfig {
+                nameservers: None,
+                searches: Some(vec![
+                    "ok.example".into(),
+                    long,
+                    "b".repeat(250),
+                    "c".repeat(250),
+                    "d".repeat(250),
+                    "e".repeat(250),
+                    "f".repeat(250),
+                    "g".repeat(250),
+                    "h".repeat(250),
+                    "i".repeat(250),
+                ]),
+                options: None,
+            }),
+            ..Default::default()
+        });
+        let dns = get_pod_dns(&pod, &[], "cluster.local", &v1::DnsConfig::default());
+        assert!(!dns.searches.iter().any(|s| s.len() > 253));
+        assert!(dns.searches.join(" ").len() <= 2048);
+        assert_eq!(dns.searches[0], "ok.example");
+        assert_eq!(dns.searches.len(), 8);
+    }
+
+    #[test]
+    fn parse_resolv_conf_matches_upstream() {
+        let dns = parse_resolv_conf(
+            "# c\nnameserver 1.1.1.1\nnameserver 8.8.8.8 extra\nsearch a.example. . b.example\n\
+             search c.example d.example.\noptions ndots:2 edns0\noptions ndots:4 timeout:1\n",
+        )
+        .unwrap();
+        assert_eq!(dns.servers, vec!["1.1.1.1", "8.8.8.8"]);
+        // last search line wins; trailing dots trimmed; "." dropped.
+        assert_eq!(dns.searches, vec!["c.example", "d.example"]);
+        let mut o = dns.options.clone();
+        o.sort();
+        assert_eq!(o, vec!["edns0", "ndots:4", "timeout:1"]);
+        assert!(parse_resolv_conf("nameserver\n").is_err());
     }
 
     #[test]
