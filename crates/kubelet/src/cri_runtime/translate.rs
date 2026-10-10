@@ -1155,10 +1155,9 @@ fn selinux_options(pod: &Pod, container: &Container) -> Option<v1::SeLinuxOption
 }
 
 /// Upstream `securitycontext.defaultMaskedPaths` (pkg/securitycontext/util.go).
-/// The per-CPU `/sys/devices/system/cpu/cpuN/thermal_throttle` paths upstream
-/// appends after a host `os.Stat` are omitted here — that host-FS scan is
-/// runtime-side work; this static set is the contract-significant base.
-const DEFAULT_MASKED_PATHS: &[&str] = &[
+/// Static base only; the per-CPU `thermal_throttle` paths upstream appends
+/// after a host `os.Stat` are added by `host_policy::default_masked_paths`.
+pub(crate) const DEFAULT_MASKED_PATHS: &[&str] = &[
     "/proc/asound",
     "/proc/acpi",
     "/proc/interrupts",
@@ -1192,7 +1191,7 @@ fn convert_masked_paths(proc_mount: Option<&str>) -> Vec<String> {
     if proc_mount == Some("Unmasked") {
         return Vec::new();
     }
-    DEFAULT_MASKED_PATHS.iter().map(|s| s.to_string()).collect()
+    super::host_policy::default_masked_paths().to_vec()
 }
 
 /// Port of upstream `securitycontext.ConvertToRuntimeReadonlyPaths`.
@@ -3432,14 +3431,20 @@ mod tests {
     fn default_procmount_sends_default_masked_and_readonly_paths() {
         // Unset procMount → upstream default masked/readonly paths.
         let sc = sec_ctx_for(serde_json::Value::Null);
-        assert_eq!(sc.masked_paths, DEFAULT_MASKED_PATHS);
+        assert_eq!(
+            sc.masked_paths,
+            super::super::host_policy::default_masked_paths()
+        );
         assert_eq!(sc.readonly_paths, DEFAULT_READONLY_PATHS);
     }
 
     #[test]
     fn explicit_default_procmount_sends_defaults() {
         let sc = sec_ctx_for(serde_json::json!({"procMount": "Default"}));
-        assert_eq!(sc.masked_paths, DEFAULT_MASKED_PATHS);
+        assert_eq!(
+            sc.masked_paths,
+            super::super::host_policy::default_masked_paths()
+        );
         assert_eq!(sc.readonly_paths, DEFAULT_READONLY_PATHS);
     }
 
@@ -3669,6 +3674,9 @@ mod tests {
         .unwrap()
         .security_context
         .unwrap();
-        assert_eq!(sc.masked_paths, DEFAULT_MASKED_PATHS);
+        assert_eq!(
+            sc.masked_paths,
+            super::super::host_policy::default_masked_paths()
+        );
     }
 }
