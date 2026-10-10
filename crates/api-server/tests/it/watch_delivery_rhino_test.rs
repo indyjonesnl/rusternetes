@@ -337,3 +337,144 @@ async fn rhino_sqlite_watch_delivers_added_modified_deleted() {
         broken.join("\n")
     );
 }
+
+/// #3071: `waitForServiceAccountInNamespace`
+/// (`test/e2e/framework/util.go:278-307`) LISTs serviceaccounts with
+/// `fieldSelector=metadata.name=default`, then WATCHes from the list's
+/// resourceVersion. The SA controller creates `default` concurrently, so the
+/// object lands before, between, or after the two calls. Whichever it is, the
+/// pair must not lose it: either the LIST returned it, or the WATCH from the
+/// LIST's resourceVersion delivers `ADDED`. Upstream guarantees this because
+/// the list RV and items come from one read (`etcd3/store.go GetList`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rhino_sqlite_list_then_watch_never_loses_concurrent_default_sa() {
+    let (state, db_path) = make_sqlite_state().await;
+    let router = build_router(state.clone(), None);
+    let sel = "fieldSelector=metadata.name%3Ddefault";
+    let mut lost = Vec::new();
+
+    for round in 0..400 {
+        let ns = format!("race-{round}");
+        let (s, b) = send(
+            &router,
+            Method::POST,
+            "/api/v1/namespaces",
+            Some(&json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":ns}})),
+        )
+        .await;
+        assert!(s.is_success(), "{s} {b}");
+        let base = format!("/api/v1/namespaces/{ns}/serviceaccounts");
+
+        // Concurrent creator (the SA controller) plus unrelated write noise.
+        let r2 = router.clone();
+        let base2 = base.clone();
+        let ns2 = ns.clone();
+        let creator = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_micros((round as u64 % 7) * 300)).await;
+            send(
+                &r2,
+                Method::POST,
+                &base2,
+                Some(&json!({"apiVersion":"v1","kind":"ServiceAccount",
+                    "metadata":{"name":"default","namespace":ns2}})),
+            )
+            .await
+        });
+        let r3 = router.clone();
+        let ns3 = ns.clone();
+        let noise = tokio::spawn(async move {
+            for i in 0..5 {
+                let _ = send(
+                    &r3,
+                    Method::POST,
+                    &format!("/api/v1/namespaces/{ns3}/configmaps"),
+                    Some(&json!({"apiVersion":"v1","kind":"ConfigMap",
+                        "metadata":{"name":format!("n{i}"),"namespace":ns3}})),
+                )
+                .await;
+            }
+        });
+
+        let (s, list) = send(&router, Method::GET, &format!("{base}?{sel}"), None).await;
+        assert!(s.is_success(), "{s} {list}");
+        let listed = list["items"]
+            .as_array()
+            .map(|a| a.iter().any(|i| i["metadata"]["name"] == "default"))
+            .unwrap_or(false);
+        let rv = list["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let events = collect(
+            router.clone(),
+            format!("{base}?watch=true&resourceVersion={rv}&{sel}&allowWatchBookmarks=true"),
+            3,
+            Duration::from_millis(700),
+        )
+        .await;
+        let _ = creator.await;
+        let _ = noise.await;
+        let seen = events
+            .iter()
+            .any(|e| e["type"] == "ADDED" && e["object"]["metadata"]["name"] == "default");
+        if !listed && !seen {
+            lost.push(format!("round {round}: list rv {rv}, events {events:?}"));
+        }
+    }
+    let _ = std::fs::remove_file(&db_path);
+    assert!(lost.is_empty(), "lost default SA:\n{}", lost.join("\n"));
+}
+
+/// #3071: client-go 1.35 reflectors (`UntilWithSync` in
+/// `waitForServiceAccountInNamespace`) open with a watch-list
+/// (`sendInitialEvents=true`). A `default` SA created concurrently with the
+/// open must reach the stream as `ADDED`, whether it lands in the initial
+/// snapshot or after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rhino_sqlite_watchlist_never_loses_concurrent_default_sa() {
+    let (state, db_path) = make_sqlite_state().await;
+    let router = build_router(state.clone(), None);
+    let mut lost = Vec::new();
+    for round in 0..200 {
+        let ns = format!("wl-{round}");
+        let (s, b) = send(
+            &router,
+            Method::POST,
+            "/api/v1/namespaces",
+            Some(&json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":ns}})),
+        )
+        .await;
+        assert!(s.is_success(), "{s} {b}");
+        let base = format!("/api/v1/namespaces/{ns}/serviceaccounts");
+        let r2 = router.clone();
+        let base2 = base.clone();
+        let ns2 = ns.clone();
+        let creator = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_micros((round as u64 % 7) * 300)).await;
+            send(
+                &r2,
+                Method::POST,
+                &base2,
+                Some(&json!({"apiVersion":"v1","kind":"ServiceAccount",
+                    "metadata":{"name":"default","namespace":ns2}})),
+            )
+            .await
+        });
+        let events = collect(
+            router.clone(),
+            format!("{base}?watch=true&sendInitialEvents=true&resourceVersionMatch=NotOlderThan&allowWatchBookmarks=true&fieldSelector=metadata.name%3Ddefault"),
+            4,
+            Duration::from_millis(700),
+        )
+        .await;
+        let _ = creator.await;
+        let seen = events
+            .iter()
+            .any(|e| e["type"] == "ADDED" && e["object"]["metadata"]["name"] == "default");
+        if !seen {
+            lost.push(format!("round {round}: events {events:?}"));
+        }
+    }
+    let _ = std::fs::remove_file(&db_path);
+    assert!(lost.is_empty(), "lost default SA:\n{}", lost.join("\n"));
+}
