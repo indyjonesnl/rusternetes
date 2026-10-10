@@ -267,6 +267,8 @@ async fn async_main() -> Result<()> {
             &args.service_cluster_ip_range,
         )
         .map_err(|e| anyhow::anyhow!(e))?;
+    // Thread --event-ttl to every in-process EventRecorder (#3026).
+    rusternetes_storage::event_recorder::set_process_event_ttl(args.event_ttl);
     let api_storage = storage.clone();
     let mut api_config = rusternetes_api_server::ApiServerConfig {
         bind_address: args.bind_address.clone(),

@@ -24,6 +24,7 @@
 //! over-threshold message to the aggregate "(combined from similar events)"
 //! form.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rusternetes_common::event_correlator::{
@@ -40,8 +41,31 @@ use crate::Storage;
 /// event store and for in-process recorders.
 pub const DEFAULT_EVENT_TTL_SECONDS: u64 = 3600;
 
-/// Process-wide `--event-ttl` for in-process recorders. STUB (red commit).
-pub fn set_process_event_ttl(_seconds: u64) {}
+/// The `--event-ttl` in force for this process, in seconds.
+///
+/// Upstream threads one server-side value into the event store once
+/// (`cmd/kube-apiserver/app/options` `EventTTL` -> `pkg/controlplane/instance.go`
+/// `EventTTL: c.Extra.EventTTL` -> `pkg/registry/core/event/storage/storage.go:42-44`
+/// `TTLFunc: func(runtime.Object, uint64, bool) (uint64, error) { return ttl, nil }`),
+/// so every event writer is governed by it. In-process recorders (controller-manager,
+/// kubelet, scheduler, api-server bootstrap/repair) write storage directly and are
+/// constructed in ~20 places across crates; the all-in-one binary is one process with
+/// one `--event-ttl`, so it is held here once and [`EventRecorder::new`] reads it.
+/// Standalone components keep the upstream default (they have no server-side source).
+/// Deliberate deviation from upstream's plumbing; the semantics (one TTL for all
+/// event writes) are the same.
+static PROCESS_EVENT_TTL: AtomicU64 = AtomicU64::new(DEFAULT_EVENT_TTL_SECONDS);
+
+/// Set the process-wide event TTL in seconds (`0` = no expiry). Call before
+/// constructing recorders; the all-in-one binary calls it with `--event-ttl`.
+pub fn set_process_event_ttl(seconds: u64) {
+    PROCESS_EVENT_TTL.store(seconds, Ordering::Relaxed);
+}
+
+/// The process-wide event TTL in seconds.
+pub fn process_event_ttl() -> u64 {
+    PROCESS_EVENT_TTL.load(Ordering::Relaxed)
+}
 
 /// Records Kubernetes events on behalf of a component, routing each emission
 /// through a shared [`EventCorrelator`] before writing to `storage`.
@@ -76,7 +100,7 @@ impl<S: Storage + ?Sized> EventRecorder<S> {
         Self {
             storage,
             correlator: Arc::new(Mutex::new(EventCorrelator::new(RealClock))),
-            event_ttl: DEFAULT_EVENT_TTL_SECONDS,
+            event_ttl: process_event_ttl(),
         }
     }
 
