@@ -254,6 +254,9 @@ async fn main() -> Result<()> {
         let exemptions = admission::PodSecurityExemptions::from_admission_configuration(&yaml)
             .map_err(|e| anyhow::anyhow!("parsing {path}: {e}"))?;
         admission::install_pod_security_exemptions(exemptions);
+        let limited = admission::resourcequota::config::from_admission_configuration(&yaml)
+            .map_err(|e| anyhow::anyhow!("parsing {path}: {e}"))?;
+        admission::resourcequota::config::install_limited_resources(limited);
     }
 
     install_audit_from_flags(&args).await?;

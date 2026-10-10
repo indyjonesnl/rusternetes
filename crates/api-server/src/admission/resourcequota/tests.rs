@@ -262,7 +262,7 @@ async fn admit_when_unrelated_resource_exceeds_quota() {
     )];
     let cm = configmap();
     let ev = evaluator_for(&GroupResource::new("", "configmaps")).unwrap();
-    let out = check_request(&quotas, &attrs(Operation::Create, &cm, None), &*ev).unwrap();
+    let out = check_request(&quotas, &attrs(Operation::Create, &cm, None), &*ev, &[]).unwrap();
     assert_eq!(
         out[0].status.as_ref().unwrap().used.as_ref().unwrap()["configmaps"],
         "2"
@@ -275,7 +275,7 @@ fn status_unknown_rejects() {
     let quotas = [quota(&[("count/deployments.apps", "2")], &[])];
     let d = json!({"metadata": {"name": "d", "namespace": "test"}});
     let ev = evaluator_for(&GroupResource::new("apps", "deployments")).unwrap();
-    let err = check_request(&quotas, &attrs(Operation::Create, &d, None), &*ev).unwrap_err();
+    let err = check_request(&quotas, &attrs(Operation::Create, &d, None), &*ev, &[]).unwrap_err();
     assert_eq!(
         err,
         QuotaError::Forbidden(
@@ -296,6 +296,7 @@ fn updates_that_decrease_usage_pass() {
         &quotas,
         &attrs(Operation::Update, &new, Some(&old)),
         &ServiceEvaluator,
+        &[],
     )
     .unwrap();
     assert_eq!(out[0].status, quotas[0].status);
@@ -303,7 +304,7 @@ fn updates_that_decrease_usage_pass() {
     let cm = configmap();
     let ev = ObjectCountEvaluator::new(&GroupResource::new("", "configmaps"), Some("configmaps"));
     let quotas = [quota(&[("configmaps", "1")], &[("configmaps", "1")])];
-    check_request(&quotas, &attrs(Operation::Update, &cm, Some(&cm)), &ev).unwrap();
+    check_request(&quotas, &attrs(Operation::Update, &cm, Some(&cm)), &ev, &[]).unwrap();
 }
 
 /// A scoped quota never matches the object-count and service evaluators
@@ -314,7 +315,7 @@ fn scoped_quotas_do_not_match() {
     q.spec.scopes = Some(vec!["NotTerminating".to_string()]);
     let cm = configmap();
     let ev = evaluator_for(&GroupResource::new("", "configmaps")).unwrap();
-    check_request(&[q], &attrs(Operation::Create, &cm, None), &*ev).unwrap();
+    check_request(&[q], &attrs(Operation::Create, &cm, None), &*ev, &[]).unwrap();
 }
 
 /// `NewEvaluators` (registry.go:41-70): pods have their own evaluator,
@@ -354,6 +355,7 @@ async fn a_conflicting_status_write_is_retried() {
         vec![first],
         &attrs(Operation::Create, &cm, None),
         &*ev,
+        &[],
         3,
     )
     .await
@@ -950,7 +952,13 @@ fn pod_constraints_fail_before_usage_stats() {
     let mut q = quota(&[("requests.cpu", "1")], &[]);
     q.metadata.name = "cpu".to_string();
     let p = pod("", json!({"containers": [{"name": "c", "image": "i"}]}));
-    let err = check_request(&[q], &attrs(Operation::Create, &p, None), &PodEvaluator).unwrap_err();
+    let err = check_request(
+        &[q],
+        &attrs(Operation::Create, &p, None),
+        &PodEvaluator,
+        &[],
+    )
+    .unwrap_err();
     assert_eq!(
         err,
         QuotaError::Forbidden("failed quota: cpu: must specify requests.cpu for: c".to_string())
@@ -998,6 +1006,7 @@ fn update_into_scope_charges_full_usage() {
         &[q],
         &attrs(Operation::Update, &new, Some(&old)),
         &PodEvaluator,
+        &[],
     )
     .unwrap();
     assert_eq!(
@@ -1021,4 +1030,379 @@ async fn plain_pod_update_is_ignored() {
     .await
     .unwrap();
     assert_eq!(used(&storage).await["pods"], "1");
+}
+
+// ---------------------------------------------------------------------
+// LimitedResources: ports of admission_test.go TestAdmitLimitedResource*,
+// TestAdmitLimitedScopeWithCoverQuota, TestAdmit{ZeroDelta,RejectIncrease,
+// AllowDecrease}UsageWithoutCoveringQuota (plugin/pkg/admission/resourcequota)
+// ---------------------------------------------------------------------
+
+use super::config::{from_admission_configuration, load_configuration};
+use super::{evaluate_with, LimitedResource};
+use rusternetes_common::resources::ScopedResourceSelectorRequirement;
+
+fn limited(resource: &str, contains: &[&str]) -> LimitedResource {
+    LimitedResource {
+        resource: resource.to_string(),
+        match_contains: contains.iter().map(|s| s.to_string()).collect(),
+        ..Default::default()
+    }
+}
+
+fn limited_scope(scope: &str, op: &str, values: &[&str]) -> LimitedResource {
+    LimitedResource {
+        resource: "pods".to_string(),
+        match_scopes: vec![ScopedResourceSelectorRequirement {
+            scope_name: scope.to_string(),
+            operator: op.to_string(),
+            values: (!values.is_empty()).then(|| values.iter().map(|s| s.to_string()).collect()),
+        }],
+        ..Default::default()
+    }
+}
+
+/// `validPod(.., getResourceRequirements(getResourceList("3", "2Gi"), ..))`.
+fn cpu_pod(priority: Option<&str>) -> Value {
+    let mut spec = json!({"containers": [{
+        "name": "c", "image": "i",
+        "resources": {"requests": {"cpu": "3", "memory": "2Gi"}},
+    }]});
+    if let Some(p) = priority {
+        spec["priorityClassName"] = json!(p);
+    }
+    pod("", spec)
+}
+
+fn best_effort_pod() -> Value {
+    pod(
+        "",
+        json!({"containers": [{"name": "c", "image": "i"}], "priorityClassName": "fake-priority"}),
+    )
+}
+
+async fn pod_create(
+    storage: &MemoryStorage,
+    p: &Value,
+    limited: &[LimitedResource],
+) -> Result<(), QuotaError> {
+    evaluate_with(
+        storage,
+        &PodEvaluator,
+        &attrs(Operation::Create, p, None),
+        limited,
+    )
+    .await
+}
+
+/// `TestAdmitLimitedResourceNoQuota`.
+#[tokio::test]
+async fn limited_resource_no_quota_is_refused() {
+    let storage = MemoryStorage::new();
+    let err = pod_create(&storage, &cpu_pod(None), &[limited("pods", &["cpu"])])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        QuotaError::Forbidden("insufficient quota to consume: cpu,requests.cpu".to_string())
+    );
+}
+
+/// `TestAdmitLimitedResourceNoQuotaIgnoresNonMatchingResources`.
+#[tokio::test]
+async fn limited_resource_ignores_other_resources() {
+    let storage = MemoryStorage::new();
+    pod_create(
+        &storage,
+        &cpu_pod(None),
+        &[limited("services", &["services"])],
+    )
+    .await
+    .unwrap();
+}
+
+/// `TestAdmitLimitedResourceWithQuota` / `...WithMultipleQuota`.
+#[tokio::test]
+async fn limited_resource_with_covering_quota_is_admitted() {
+    let storage = MemoryStorage::new();
+    let mut q = quota(&[("requests.cpu", "10")], &[("requests.cpu", "1")]);
+    q.metadata.name = "quota".to_string();
+    stored(&storage, &q).await;
+    pod_create(
+        &storage,
+        &cpu_pod(None),
+        &[limited("pods", &["requests.cpu"])],
+    )
+    .await
+    .unwrap();
+
+    // A second, unrelated quota does not stop the first from covering.
+    let mut q2 = quota(&[("memory", "10Gi")], &[("memory", "1Gi")]);
+    q2.metadata.name = "quota2".to_string();
+    storage
+        .create(&build_key("resourcequotas", Some("test"), "quota2"), &q2)
+        .await
+        .unwrap();
+    pod_create(
+        &storage,
+        &cpu_pod(None),
+        &[limited("pods", &["requests.cpu"])],
+    )
+    .await
+    .unwrap();
+}
+
+/// `TestAdmitLimitedResourceWithQuotaThatDoesNotCover`.
+#[tokio::test]
+async fn limited_resource_with_non_covering_quota_is_refused() {
+    let storage = MemoryStorage::new();
+    stored(
+        &storage,
+        &quota(&[("memory", "10Gi")], &[("memory", "1Gi")]),
+    )
+    .await;
+    let err = pod_create(&storage, &cpu_pod(None), &[limited("pods", &["cpu"])])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, QuotaError::Forbidden(m) if m.starts_with("insufficient quota to consume"))
+    );
+}
+
+/// `TestAdmitLimitedScopeWithCoverQuota`, selected cases.
+#[tokio::test]
+async fn limited_scope_needs_a_covering_quota_scope() {
+    // "Covering quota does not exist for configured limited scope
+    // PriorityClassNameExists."
+    let storage = MemoryStorage::new();
+    let err = pod_create(
+        &storage,
+        &cpu_pod(Some("fake-priority")),
+        &[limited_scope("PriorityClass", "Exists", &[])],
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err,
+        QuotaError::Other(
+            "insufficient quota to match these scopes: [{PriorityClass Exists []}]".to_string()
+        )
+    );
+
+    // "... resourceQuotaBestEffort"
+    let err = pod_create(
+        &storage,
+        &best_effort_pod(),
+        &[limited_scope("BestEffort", "Exists", &[])],
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err,
+        QuotaError::Other(
+            "insufficient quota to match these scopes: [{BestEffort Exists []}]".to_string()
+        )
+    );
+
+    // "Covering quota exist for configured limited scope resourceQuotaBestEffort"
+    let mut q = quota(&[("pods", "5")], &[("pods", "3")]);
+    q.spec.scopes = Some(vec!["BestEffort".to_string()]);
+    stored(&storage, &q).await;
+    pod_create(
+        &storage,
+        &best_effort_pod(),
+        &[limited_scope("BestEffort", "Exists", &[])],
+    )
+    .await
+    .unwrap();
+}
+
+/// "Two scopes ... Neither matches pod. Pod allowed" and a PriorityClass In
+/// scope that matches the pod's class.
+#[tokio::test]
+async fn limited_scope_not_matching_the_pod_is_ignored() {
+    let storage = MemoryStorage::new();
+    pod_create(
+        &storage,
+        &cpu_pod(Some("fake-priority")),
+        &[
+            limited_scope("BestEffort", "Exists", &[]),
+            limited_scope("PriorityClass", "In", &["cluster-services"]),
+        ],
+    )
+    .await
+    .unwrap();
+    let err = pod_create(
+        &storage,
+        &cpu_pod(Some("cluster-services")),
+        &[limited_scope("PriorityClass", "In", &["cluster-services"])],
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, QuotaError::Other(m) if m.starts_with("insufficient quota to match these scopes"))
+    );
+}
+
+/// "configured limited scope PriorityClassNameExists and limited cpu
+/// resource. No covering quota for cpu and pod admit fails."
+#[tokio::test]
+async fn limited_scope_and_resource_combine() {
+    let storage = MemoryStorage::new();
+    let mut q = quota(&[("pods", "10")], &[("pods", "0")]);
+    q.spec.scope_selector = serde_json::from_value(json!({"matchExpressions": [
+        {"scopeName": "PriorityClass", "operator": "Exists"}
+    ]}))
+    .unwrap();
+    stored(&storage, &q).await;
+    let mut lim = limited_scope("PriorityClass", "Exists", &[]);
+    lim.match_contains = vec!["requests.cpu".to_string()];
+    let err = pod_create(&storage, &cpu_pod(Some("fake-priority")), &[lim])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        QuotaError::Forbidden("insufficient quota to consume: requests.cpu".to_string())
+    );
+}
+
+async fn service_update(old: Value, new: Value) -> Result<(), QuotaError> {
+    let storage = MemoryStorage::new();
+    evaluate_with(
+        &storage,
+        &ServiceEvaluator,
+        &attrs(Operation::Update, &new, Some(&old)),
+        &[limited("services", &["services.loadbalancers"])],
+    )
+    .await
+}
+
+/// `TestAdmitZeroDeltaUsageWithoutCoveringQuota`.
+#[tokio::test]
+async fn zero_delta_without_covering_quota_is_admitted() {
+    service_update(
+        service("1", json!({"type": "LoadBalancer"})),
+        service("", json!({"type": "LoadBalancer"})),
+    )
+    .await
+    .unwrap();
+}
+
+/// `TestAdmitRejectIncreaseUsageWithoutCoveringQuota`.
+#[tokio::test]
+async fn increase_without_covering_quota_is_refused() {
+    service_update(
+        service("1", json!({"type": "NodePort", "ports": [{"port": 1234}]})),
+        service("", json!({"type": "LoadBalancer"})),
+    )
+    .await
+    .unwrap_err();
+}
+
+/// `TestAdmitAllowDecreaseUsageWithoutCoveringQuota`.
+#[tokio::test]
+async fn decrease_without_covering_quota_is_admitted() {
+    service_update(
+        service("1", json!({"type": "LoadBalancer"})),
+        service("", json!({"type": "NodePort", "ports": [{"port": 1234}]})),
+    )
+    .await
+    .unwrap();
+}
+
+// -- config.go / validation.go (config_test.go, validation_test.go) --
+
+const V1_CONFIG: &str = r#"
+kind: ResourceQuotaConfiguration
+apiVersion: apiserver.config.k8s.io/v1
+limitedResources:
+- apiGroup: ""
+  resource: persistentvolumeclaims
+  matchContains:
+  - .storageclass.storage.k8s.io/requests.storage
+- apiGroup: ""
+  resource: pods
+  matchScopes:
+  - scopeName: PriorityClass
+    operator: In
+    values:
+    - cluster-services
+"#;
+
+fn expected_config() -> Vec<LimitedResource> {
+    vec![
+        limited(
+            "persistentvolumeclaims",
+            &[".storageclass.storage.k8s.io/requests.storage"],
+        ),
+        limited_scope("PriorityClass", "In", &["cluster-services"]),
+    ]
+}
+
+/// `TestLoadConfiguration`.
+#[test]
+fn load_configuration_cases() {
+    assert!(load_configuration("")
+        .unwrap_err()
+        .contains("'Kind' is missing"));
+    assert!(
+        load_configuration(r#"{"kind":"Unknown","apiVersion":"v1"}"#)
+            .unwrap_err()
+            .contains(r#"no kind "Unknown" is registered"#)
+    );
+    // Strict decoding: duplicate and unknown fields.
+    let dup = V1_CONFIG.replacen(
+        "  resource: persistentvolumeclaims\n",
+        "  resource: persistentvolumeclaims\n  resource: persistentvolumeclaims\n",
+        1,
+    );
+    assert!(load_configuration(&dup)
+        .unwrap_err()
+        .contains("strict decoding error"));
+    let unknown = V1_CONFIG.replacen("  resource:", "  foo: bar\n  resource:", 1);
+    assert!(load_configuration(&unknown)
+        .unwrap_err()
+        .contains("strict decoding error"));
+
+    assert_eq!(load_configuration(V1_CONFIG).unwrap(), expected_config());
+    for api_version in [
+        "resourcequota.admission.k8s.io/v1alpha1",
+        "resourcequota.admission.k8s.io/v1beta1",
+    ] {
+        let doc = V1_CONFIG
+            .replace("ResourceQuotaConfiguration", "Configuration")
+            .replace("apiserver.config.k8s.io/v1", api_version);
+        assert_eq!(load_configuration(&doc).unwrap(), expected_config());
+    }
+}
+
+/// `TestValidateConfiguration`: `resource` is required.
+#[test]
+fn load_configuration_requires_resource() {
+    let doc = "kind: ResourceQuotaConfiguration\napiVersion: apiserver.config.k8s.io/v1\nlimitedResources:\n- matchContains:\n  - requests.cpu\n";
+    let err = load_configuration(doc).unwrap_err();
+    assert!(
+        err.contains("limitedResources[0].resource: Required value"),
+        "{err}"
+    );
+}
+
+/// The `ResourceQuota` plugin entry of an `AdmissionConfiguration`.
+#[test]
+fn admission_configuration_plugin_entry() {
+    let doc = format!(
+        "apiVersion: apiserver.config.k8s.io/v1\nkind: AdmissionConfiguration\nplugins:\n- name: ResourceQuota\n  configuration:\n{}",
+        V1_CONFIG
+            .lines()
+            .map(|l| format!("    {l}\n"))
+            .collect::<String>()
+    );
+    assert_eq!(
+        from_admission_configuration(&doc).unwrap(),
+        expected_config()
+    );
+    // No entry: nothing is limited.
+    let none =
+        "apiVersion: apiserver.config.k8s.io/v1\nkind: AdmissionConfiguration\nplugins: []\n";
+    assert_eq!(from_admission_configuration(none).unwrap(), vec![]);
 }
