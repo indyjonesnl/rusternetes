@@ -2176,4 +2176,173 @@ mod tests {
             &spec(&["Nonsense"], vec![])
         ));
     }
+
+    // -----------------------------------------------------------------
+    // PodUsageFunc UseStatusResources — InPlacePodVerticalScaling
+    // (pkg/quota/v1/evaluator/core/pods.go:400-404; ported from
+    // pods_test.go TestPodEvaluatorUsageResourceResize :1026-1170 and
+    // component-helpers/resource/helpers_test.go "resized, infeasible" cases)
+    // -----------------------------------------------------------------
+
+    /// A pod with one container (`spec` requests/limits) and one container
+    /// status carrying `status_json` fields (merged into `{"name": ...}`).
+    fn resized_pod(
+        requests: &[(&str, &str)],
+        limits: &[(&str, &str)],
+        status_json: Option<serde_json::Value>,
+        infeasible: bool,
+    ) -> Pod {
+        let mut p = pod(vec![container("c", requests, limits)], vec![]);
+        let mut status = crate::resources::PodStatus::default();
+        if let Some(mut cs) = status_json {
+            cs["name"] = serde_json::json!("c");
+            status.container_statuses = Some(vec![serde_json::from_value(cs).unwrap()]);
+        }
+        if infeasible {
+            status.conditions = Some(vec![serde_json::from_value(serde_json::json!({
+                "type": "PodResizePending", "status": "True", "reason": "Infeasible"
+            }))
+            .unwrap()]);
+        }
+        p.status = Some(status);
+        p
+    }
+
+    fn usage_of(p: &Pod) -> ResourceList {
+        pod_usage(p, Utc::now())
+    }
+
+    /// `TestPodEvaluatorUsageResourceResize`: the larger of spec and the
+    /// kubelet-actuated request is charged (`determineEffectiveRequests`).
+    #[test]
+    #[serial_test::serial]
+    fn pod_usage_charges_max_of_spec_and_actuated_requests() {
+        let _g = crate::feature_gates::with_feature(
+            crate::feature_gates::Feature::InPlacePodVerticalScaling,
+            true,
+        );
+        let p = resized_pod(
+            &[("cpu", "100m"), ("memory", "200Mi")],
+            &[("cpu", "200m"), ("memory", "400Mi")],
+            Some(
+                serde_json::json!({"resources": {"requests": {"cpu": "150m", "memory": "250Mi"}}}),
+            ),
+            false,
+        );
+        let u = usage_of(&p);
+        assert_eq!(u["requests.cpu"].canonical_string(), "150m");
+        assert_eq!(u["cpu"].canonical_string(), "150m");
+        assert_eq!(u["requests.memory"].canonical_string(), "250Mi");
+        assert_eq!(u["limits.cpu"].canonical_string(), "200m");
+        assert_eq!(u["limits.memory"].canonical_string(), "400Mi");
+    }
+
+    /// `TestPodEvaluatorUsageResourceResize` "ContainerStatus.Resources==nil":
+    /// no actuated resources, spec is charged.
+    #[test]
+    #[serial_test::serial]
+    fn pod_usage_status_without_resources_uses_spec() {
+        let _g = crate::feature_gates::with_feature(
+            crate::feature_gates::Feature::InPlacePodVerticalScaling,
+            true,
+        );
+        let p = resized_pod(
+            &[("cpu", "100m")],
+            &[("cpu", "200m")],
+            Some(serde_json::json!({})),
+            false,
+        );
+        assert_eq!(usage_of(&p)["requests.cpu"].canonical_string(), "100m");
+    }
+
+    /// `helpers_test.go` "resized: per-resource 3-way maximum": spec,
+    /// actuated and allocated are compared per resource.
+    #[test]
+    #[serial_test::serial]
+    fn pod_usage_requests_are_per_resource_max_of_spec_actuated_allocated() {
+        let _g = crate::feature_gates::with_feature(
+            crate::feature_gates::Feature::InPlacePodVerticalScaling,
+            true,
+        );
+        let p = resized_pod(
+            &[
+                ("cpu", "30m"),
+                ("memory", "20M"),
+                ("ephemeral-storage", "10G"),
+            ],
+            &[],
+            Some(serde_json::json!({
+                "allocatedResources": {"cpu": "20m", "memory": "10M", "ephemeral-storage": "30G"},
+                "resources": {"requests": {"cpu": "10m", "memory": "30M", "ephemeral-storage": "20G"}}
+            })),
+            false,
+        );
+        let u = usage_of(&p);
+        assert_eq!(u["requests.cpu"].canonical_string(), "30m");
+        assert_eq!(u["requests.memory"].canonical_string(), "30M");
+        assert_eq!(u["requests.ephemeral-storage"].canonical_string(), "30G");
+    }
+
+    /// `helpers_test.go` "resized, infeasible": the spec request is ignored
+    /// and the actuated one charged.
+    #[test]
+    #[serial_test::serial]
+    fn pod_usage_infeasible_resize_ignores_spec_request() {
+        let _g = crate::feature_gates::with_feature(
+            crate::feature_gates::Feature::InPlacePodVerticalScaling,
+            true,
+        );
+        let p = resized_pod(
+            &[("cpu", "4")],
+            &[],
+            Some(serde_json::json!({"resources": {"requests": {"cpu": "2"}}})),
+            true,
+        );
+        assert_eq!(usage_of(&p)["requests.cpu"].canonical_string(), "2");
+
+        // "resized, infeasible & in-progress": allocated wins over actuated.
+        let p = resized_pod(
+            &[("cpu", "6")],
+            &[],
+            Some(serde_json::json!({
+                "allocatedResources": {"cpu": "4"},
+                "resources": {"requests": {"cpu": "2"}}
+            })),
+            true,
+        );
+        assert_eq!(usage_of(&p)["requests.cpu"].canonical_string(), "4");
+    }
+
+    /// `AggregateContainerLimits` + `determineEffectiveLimits`: limits are
+    /// max(spec, actuated), or just actuated when the resize is infeasible.
+    #[test]
+    #[serial_test::serial]
+    fn pod_usage_limits_follow_actuated_status() {
+        let _g = crate::feature_gates::with_feature(
+            crate::feature_gates::Feature::InPlacePodVerticalScaling,
+            true,
+        );
+        let status = serde_json::json!({"resources": {"limits": {"cpu": "300m"}}});
+        let p = resized_pod(&[], &[("cpu", "200m")], Some(status.clone()), false);
+        assert_eq!(usage_of(&p)["limits.cpu"].canonical_string(), "300m");
+        let p = resized_pod(&[], &[("cpu", "400m")], Some(status), true);
+        assert_eq!(usage_of(&p)["limits.cpu"].canonical_string(), "300m");
+    }
+
+    /// With the gate off (`UseStatusResources: false`) only spec counts.
+    #[test]
+    #[serial_test::serial]
+    fn pod_usage_ignores_status_when_gate_off() {
+        let _g = crate::feature_gates::with_feature(
+            crate::feature_gates::Feature::InPlacePodVerticalScaling,
+            false,
+        );
+        let p = resized_pod(
+            &[("cpu", "100m")],
+            &[],
+            Some(serde_json::json!({"resources": {"requests": {"cpu": "150m"}}})),
+            false,
+        );
+        assert_eq!(usage_of(&p)["requests.cpu"].canonical_string(), "100m");
+    }
 }
