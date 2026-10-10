@@ -335,7 +335,19 @@ pub(crate) fn respond<B: Serialize>(
             headers.append(header::WARNING, v);
         }
     }
-    (status, headers, Json(body)).into_response()
+    let mut response = (status, headers, Json(body)).into_response();
+    if status.is_success() {
+        // The serializer is chosen from the request's `Accept` for every
+        // resource, not per kind (`transformResponseObject`,
+        // staging/src/k8s.io/apiserver/pkg/endpoints/handlers/response.go
+        // `WriteObjectNegotiated` -> `negotiation.NegotiateOutputMediaType`).
+        // The response middleware re-encodes when the client asked for
+        // protobuf and a schema is registered for the body's GVK.
+        response
+            .extensions_mut()
+            .insert(crate::response::NativeProtoOptIn::from_body());
+    }
+    response
 }
 
 /// [`respond`] for a typed object served by `scope`: the body names the
