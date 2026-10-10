@@ -54,6 +54,21 @@ struct LegacyTokenClaims<'a> {
     namespace: &'a str,
 }
 
+/// Map a Namespace watch event to the work-queue key of its default
+/// ServiceAccount. Port of `namespaceAdded` / `namespaceUpdated`
+/// (pkg/controller/serviceaccount/serviceaccounts_controller.go), which
+/// enqueue the namespace name; there is no DeleteFunc, so deletions map to
+/// nothing.
+fn namespace_event_key(ev: &rusternetes_storage::WatchEvent) -> Option<String> {
+    use rusternetes_storage::WatchEvent;
+    if matches!(ev, WatchEvent::Deleted(..)) {
+        return None;
+    }
+    let key = extract_key(ev);
+    let name = key.strip_prefix("namespaces/")?;
+    Some(format!("serviceaccounts/{}/default", name))
+}
+
 /// ServiceAccountController: the union of upstream's two ServiceAccount controllers.
 ///
 /// 1. Creates the "default" ServiceAccount in each namespace — upstream
@@ -166,6 +181,19 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
                 }
             };
 
+            // Namespace informer: upstream registers AddFunc/UpdateFunc
+            // (serviceaccounts_controller.go `NewServiceAccountsController`,
+            // `namespaceAdded` / `namespaceUpdated`) that enqueue the namespace.
+            let ns_prefix = build_prefix("namespaces", None);
+            let mut ns_watch = match self.storage.watch(&ns_prefix).await {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::error!("Failed to establish namespace watch: {}, retrying", e);
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+
             let mut resync = tokio::time::interval(std::time::Duration::from_secs(30));
             resync.tick().await;
 
@@ -184,6 +212,23 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
                             }
                             None => {
                                 tracing::warn!("Watch stream ended, reconnecting");
+                                watch_broken = true;
+                            }
+                        }
+                    }
+                    event = ns_watch.next() => {
+                        match event {
+                            Some(Ok(ev)) => {
+                                if let Some(key) = namespace_event_key(&ev) {
+                                    queue.add(key).await;
+                                }
+                            }
+                            Some(Err(e)) => {
+                                tracing::warn!("Namespace watch error: {}, reconnecting", e);
+                                watch_broken = true;
+                            }
+                            None => {
+                                tracing::warn!("Namespace watch stream ended, reconnecting");
                                 watch_broken = true;
                             }
                         }
@@ -241,9 +286,14 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
                 queue.done(&key).await;
                 continue;
             }
-            // Ensure the default service account exists in this namespace
+            // Ensure the default service account exists in this namespace.
+            // Upstream `processNextWorkItem` re-queues a failed sync with
+            // `c.queue.AddRateLimited(key)` rather than waiting for the resync.
             if let Err(e) = self.ensure_default_serviceaccount(ns).await {
                 tracing::error!("Failed to ensure default SA in {}: {}", ns, e);
+                queue.requeue_rate_limited(key.clone()).await;
+                queue.done(&key).await;
+                continue;
             }
             // Reconcile the specific service account
             match self.reconcile_serviceaccount(ns, name).await {
