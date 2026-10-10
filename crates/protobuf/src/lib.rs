@@ -14501,6 +14501,31 @@ mod tests {
         assert_eq!(first.get("image"), Some(&Value::String("nginx".into())));
     }
 
+    /// Refs #3062: `FieldsV1` is `message { optional bytes Raw = 1 }` whose
+    /// Raw is the JSON text of the field set
+    /// (apimachinery meta/v1 generated.proto:373; FieldsV1.MarshalJSON returns
+    /// Raw verbatim). The JSON object form of `managedFields[].fieldsV1` must
+    /// therefore survive an encode/decode round trip, otherwise a typed
+    /// (protobuf) GET differs from the JSON GET of the same Pod.
+    #[test]
+    fn test_managed_fields_fieldsv1_roundtrips_through_proto() {
+        let registry = ProtoRegistry::new();
+        let entry = json!({
+            "manager": "m",
+            "operation": "Update",
+            "fieldsType": "FieldsV1",
+            "fieldsV1": {"f:spec": {"f:containers": {"k:{\"name\":\"c1\"}": {}}}},
+            "subresource": "resize",
+        });
+        let bytes = registry
+            .encode_message("ManagedFieldsEntry", &entry)
+            .expect("schema registered");
+        let back = registry
+            .decode_message("ManagedFieldsEntry", &bytes)
+            .expect("decodes");
+        assert_eq!(back.get("fieldsV1"), entry.get("fieldsV1"));
+    }
+
     #[test]
     fn test_apimachinery_meta_v1_schemas_registered() {
         // Every shared `apimachinery/pkg/apis/meta/v1` type listed in
