@@ -348,7 +348,7 @@ impl WorkEstimator {
     fn estimate_mutating(
         &self,
         info: &RequestInfo,
-        _flow_schema: &str,
+        flow_schema: &str,
         priority_level: &str,
     ) -> WorkEstimate {
         let cfg = &self.config;
@@ -376,7 +376,8 @@ impl WorkEstimator {
         }
 
         let watch_count = (self.watch_count_getter)(info);
-        // (metrics.ObserveWatchCount: not ported, see module docs.)
+        // :78
+        crate::flow_control_metrics::observe_watch_count(priority_level, flow_schema, watch_count);
 
         // :549-596
         let mut final_seats: u64 = 0;

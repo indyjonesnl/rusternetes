@@ -45,6 +45,7 @@
 //! issues referenced from the PR.
 
 use crate::flow_control_integrator::Integrator;
+use crate::flow_control_metrics as fcmetrics;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -514,10 +515,12 @@ impl Inner {
         } else if self.current_r >= HIGH_R {
             self.advance_epoch(incr_r);
         }
+        fcmetrics::set_current_r(&self.qcfg.name, self.current_r.to_float());
     }
 
     /// `advanceEpoch` (queueset.go:416).
     fn advance_epoch(&mut self, incr_r: SeatSeconds) {
+        let mut success = true;
         let old_r = self.current_r;
         self.current_r -= R_DECREMENT;
         info!(qs = %self.qcfg.name, %old_r, new_r = %self.current_r, %incr_r, "Advancing epoch");
@@ -531,6 +534,7 @@ impl Inner {
             queue.next_dispatch_r -= R_DECREMENT;
             if queue.next_dispatch_r > old {
                 error!(qs = %self.qcfg.name, queue = q_idx, "queue::nextDispatchR underflow");
+                success = false;
             }
             for rid in &queue.waiting {
                 if let Some(req) = self.requests.get_mut(rid) {
@@ -538,17 +542,22 @@ impl Inner {
                     req.arrival_r -= R_DECREMENT;
                     if req.arrival_r > old {
                         error!(qs = %self.qcfg.name, queue = q_idx, "request::arrivalR underflow");
+                        success = false;
                     }
                 }
             }
         }
+        // queueset.go:521
+        fcmetrics::add_epoch_advance(&self.qcfg.name, success);
     }
 
     /// `qs.seatDemandIntegrator.Set(totSeatsInUse + totSeatsWaiting)`
     /// (queueset.go:438, :650, :682, :711, :728, :880).
     fn note_seat_demand(&self) {
-        self.seat_demand
-            .set((self.tot_seats_in_use + self.tot_seats_waiting) as f64);
+        let demand = (self.tot_seats_in_use + self.tot_seats_waiting) as f64;
+        self.seat_demand.set(demand);
+        // The union gauge also feeds `demand_seats` (apf_controller.go:722).
+        fcmetrics::set_seat_demand(&self.qcfg.name, demand);
     }
 
     /// `getVirtualTimeRatioLocked` (queueset.go:455).
@@ -667,6 +676,12 @@ impl Inner {
         let rid = if ok {
             let rid = self.new_request(fs_name, flow_distinguisher, Some(qid), work, false);
             self.enqueue_to_bound(qid, rid);
+            // queueset.go:577 `ObserveQueueLength`
+            fcmetrics::observe_queue_length(
+                &self.qcfg.name,
+                fs_name,
+                self.queues[qpos].waiting.len(),
+            );
             Some(rid)
         } else {
             None
@@ -776,12 +791,25 @@ impl Inner {
     fn find_dispatch_queue_to_bound(&mut self) -> Option<(u64, u64)> {
         let mut min_virtual_finish = MAX_SEAT_SECONDS;
         let mut min_queue: Option<usize> = None;
+        let mut s_min = MAX_SEAT_SECONDS;
+        let mut ds_min = MAX_SEAT_SECONDS;
+        let mut s_max = MIN_SEAT_SECONDS;
+        let mut ds_max = MIN_SEAT_SECONDS;
         let nq = self.queues.len();
         for _ in 0..nq {
             self.robin_index = (self.robin_index + 1) % nq as isize;
             let queue = &self.queues[self.robin_index as usize];
             if let Some(oldest) = queue.waiting.front() {
                 let oldest_work = self.requests[oldest].work;
+                s_min = s_min.min(queue.next_dispatch_r);
+                s_max = s_max.max(queue.next_dispatch_r);
+                let estimated_work_in_progress = seats_times_duration(
+                    queue.seats_in_use as f64,
+                    self.estimated_service_duration_ns,
+                );
+                let discounted = queue.next_dispatch_r - estimated_work_in_progress;
+                ds_min = ds_min.min(discounted);
+                ds_max = ds_max.max(discounted);
                 let current_virtual_finish = queue.next_dispatch_r + oldest_work.total_work;
                 if current_virtual_finish < min_virtual_finish {
                     min_virtual_finish = current_virtual_finish;
@@ -796,6 +824,9 @@ impl Inner {
         if !self.can_accommodate_seats(max_seats) {
             // Not advancing the round robin index further; the head of the
             // selected queue waits for executing requests to complete.
+            // queueset.go:819
+            let fs = self.requests[&rid].fs_name.clone();
+            fcmetrics::add_dispatch_with_no_accommodation(&self.qcfg.name, &fs);
             return None;
         }
         self.remove_waiting(qid, rid);
@@ -816,6 +847,16 @@ impl Inner {
         if self.queues[min_index].next_dispatch_r < self.requests[&rid].arrival_r {
             error!(qs = %self.qcfg.name, "dispatch before arrival");
         }
+        // queueset.go:842
+        fcmetrics::set_dispatch_metrics(
+            &self.qcfg.name,
+            self.current_r.to_float(),
+            self.queues[min_index].next_dispatch_r.to_float(),
+            s_min.to_float(),
+            s_max.to_float(),
+            ds_min.to_float(),
+            ds_max.to_float(),
+        );
         Some((qid, rid))
     }
 
@@ -2007,13 +2048,13 @@ mod tests {
             clk.clone(),
             named_qcfg("m-ql"),
             DispatchingConfig {
-                concurrency_limit: 1,
+                concurrency_limit: 2,
             },
         )
         .unwrap();
         let l = [("priority_level", "m-ql"), ("flow_schema", "m-ql-fs")];
         let _run = qs.start_request(&we(1), 0, "", "m-ql-fs").unwrap();
-        let _waiting = qs.start_request(&we(1), 0, "", "m-ql-fs").unwrap();
+        let _waiting = qs.start_request(&we(2), 0, "", "m-ql-fs").unwrap();
         // Observed once per enqueued request (queueset.go:577).
         assert_eq!(
             sample(
@@ -2045,7 +2086,14 @@ mod tests {
         .unwrap();
         let _run = qs.start_request(&we(1), 0, "", "fs").unwrap();
         let _waiting = qs.start_request(&we(1), 0, "", "fs").unwrap();
-        qs.lock().current_r = SeatSeconds(HIGH_R.0 - 1);
+        {
+            let mut g = qs.lock();
+            g.current_r = SeatSeconds(HIGH_R.0 - 1);
+            let qi = g.queues.iter().position(|q| !q.waiting.is_empty()).unwrap();
+            g.queues[qi].next_dispatch_r = SeatSeconds(HIGH_R.0 - 5);
+            let rid = *g.queues[qi].waiting.front().unwrap();
+            g.requests.get_mut(&rid).unwrap().arrival_r = SeatSeconds(HIGH_R.0 - 3);
+        }
         clk.advance(Duration::from_secs(1));
         qs.lock().sync_time();
         assert_eq!(

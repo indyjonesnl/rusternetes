@@ -21,11 +21,14 @@
 //! `priority_level_request_utilization`, `read_vs_write_current_requests`, and
 //! the limit/demand gauges the concurrency adjuster sets.
 //!
-//! NOT ported here (tracked as follow-ups): the `demand_seats` timing-ratio
-//! histogram, the queueset virtual-time gauges (`current_r`, `dispatch_r`,
-//! ...), `request_queue_length_after_enqueue`, `epoch_advance_total`,
-//! `request_dispatch_no_accommodation_total`, `watch_count_samples`,
-//! `RecordDroppedRequest`/`RecordRequestTermination`.
+//! Also ported (#2987): the `demand_seats` timing-ratio histogram, the
+//! queueset virtual-time gauges (`current_r`, `dispatch_r`, `latest_s`,
+//! `next_s_bounds`, `next_discounted_s_bounds`),
+//! `request_queue_length_after_enqueue`, `epoch_advance_total`,
+//! `request_dispatch_no_accommodation_total` and `watch_count_samples`.
+//!
+//! NOT ported here (tracked as a follow-up): `RecordDroppedRequest` /
+//! `RecordRequestTermination` and the `apf_pl`/`apf_fs`/`apf_iseats` log keys.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -158,6 +161,16 @@ static WORK_ESTIMATED_SEATS: LazyLock<HistogramVec> = LazyLock::new(|| {
 /// Touch every metric so all families are registered (`Register()`,
 /// metrics.go:56-60). Called when the filter is built.
 pub fn register_all() {
+    LazyLock::force(&DEMAND_SEATS);
+    LazyLock::force(&CURRENT_R);
+    LazyLock::force(&DISPATCH_R);
+    LazyLock::force(&LATEST_S);
+    LazyLock::force(&NEXT_S_BOUNDS);
+    LazyLock::force(&NEXT_DISCOUNTED_S_BOUNDS);
+    LazyLock::force(&REQUEST_QUEUE_LENGTH_AFTER_ENQUEUE);
+    LazyLock::force(&WATCH_COUNT_SAMPLES);
+    LazyLock::force(&EPOCH_ADVANCE_TOTAL);
+    LazyLock::force(&REQUEST_DISPATCH_NO_ACCOMMODATION_TOTAL);
     LazyLock::force(&REJECTED_REQUESTS_TOTAL);
     LazyLock::force(&DISPATCHED_REQUESTS_TOTAL);
     LazyLock::force(&CURRENT_INQUEUE_REQUESTS);
@@ -490,6 +503,144 @@ fn timing_ratio_vec(
     v
 }
 
+/// `ApiserverSeatDemands` (metrics.go:374-390).
+static DEMAND_SEATS: LazyLock<TimingRatioHistogramVec> = LazyLock::new(|| {
+    timing_ratio_vec(
+        "demand_seats",
+        "Observations, at the end of every nanosecond, of (the number of seats each priority level could use) / (nominal number of seats for that level)",
+        &[0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.7, 2.0, 2.8, 4.0, 6.0],
+        &[],
+        &["priority_level"],
+    )
+});
+
+/// `queueLengthBuckets` (metrics.go:49).
+const QUEUE_LENGTH_BUCKETS: &[f64] = &[0.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0];
+/// `watch_count_samples` buckets (metrics.go:305).
+const WATCH_COUNT_BUCKETS: &[f64] = &[0.0, 1.0, 10.0, 100.0, 1000.0, 10000.0];
+
+const PL: &[&str] = &["priority_level"];
+const PL_BOUND: &[&str] = &["priority_level", "bound"];
+
+/// metrics.go:153-201.
+static CURRENT_R: LazyLock<GaugeVec> =
+    LazyLock::new(|| float_gauge_vec("current_r", "R(time of last change)", PL));
+static DISPATCH_R: LazyLock<GaugeVec> =
+    LazyLock::new(|| float_gauge_vec("dispatch_r", "R(time of last dispatch)", PL));
+static LATEST_S: LazyLock<GaugeVec> =
+    LazyLock::new(|| float_gauge_vec("latest_s", "S(most recently dispatched request)", PL));
+static NEXT_S_BOUNDS: LazyLock<GaugeVec> = LazyLock::new(|| {
+    float_gauge_vec(
+        "next_s_bounds",
+        "min and max, over queues, of S(oldest waiting request in queue)",
+        PL_BOUND,
+    )
+});
+static NEXT_DISCOUNTED_S_BOUNDS: LazyLock<GaugeVec> = LazyLock::new(|| {
+    float_gauge_vec(
+        "next_discounted_s_bounds",
+        "min and max, over queues, of S(oldest waiting request in queue) - estimated work in progress",
+        PL_BOUND,
+    )
+});
+/// metrics.go:224-233.
+static REQUEST_QUEUE_LENGTH_AFTER_ENQUEUE: LazyLock<HistogramVec> = LazyLock::new(|| {
+    histogram_vec(
+        "request_queue_length_after_enqueue",
+        "Length of queue in the API Priority and Fairness subsystem, as seen by each request after it is enqueued",
+        QUEUE_LENGTH_BUCKETS,
+        PL_FS,
+    )
+});
+/// metrics.go:300-309.
+static WATCH_COUNT_SAMPLES: LazyLock<HistogramVec> = LazyLock::new(|| {
+    histogram_vec(
+        "watch_count_samples",
+        "count of watchers for mutating requests in API Priority and Fairness",
+        WATCH_COUNT_BUCKETS,
+        PL_FS,
+    )
+});
+/// metrics.go:311-320.
+static EPOCH_ADVANCE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    counter_vec(
+        "epoch_advance_total",
+        "Number of times the queueset's progress meter jumped backward",
+        &["priority_level", "success"],
+    )
+});
+/// metrics.go:334-343.
+static REQUEST_DISPATCH_NO_ACCOMMODATION_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    counter_vec(
+        "request_dispatch_no_accommodation_total",
+        "Number of times a dispatch attempt resulted in a non accommodation due to lack of available seats",
+        PL_FS,
+    )
+});
+
+/// `SetCurrentR` (metrics.go:543), from `syncTimeLocked` (queueset.go:478).
+pub fn set_current_r(pl: &str, r: f64) {
+    CURRENT_R.with_label_values(&[pl]).set(r);
+}
+
+/// `SetDispatchMetrics` (metrics.go:548), from `selectQueueLocked`
+/// (queueset.go:842).
+pub fn set_dispatch_metrics(
+    pl: &str,
+    r: f64,
+    s: f64,
+    s_min: f64,
+    s_max: f64,
+    discounted_s_min: f64,
+    discounted_s_max: f64,
+) {
+    DISPATCH_R.with_label_values(&[pl]).set(r);
+    LATEST_S.with_label_values(&[pl]).set(s);
+    NEXT_S_BOUNDS.with_label_values(&[pl, "min"]).set(s_min);
+    NEXT_S_BOUNDS.with_label_values(&[pl, "max"]).set(s_max);
+    NEXT_DISCOUNTED_S_BOUNDS
+        .with_label_values(&[pl, "min"])
+        .set(discounted_s_min);
+    NEXT_DISCOUNTED_S_BOUNDS
+        .with_label_values(&[pl, "max"])
+        .set(discounted_s_max);
+}
+
+/// `AddEpochAdvance` (metrics.go:599), from `advanceEpoch` (queueset.go:521).
+pub fn add_epoch_advance(pl: &str, success: bool) {
+    EPOCH_ADVANCE_TOTAL
+        .with_label_values(&[pl, if success { "true" } else { "false" }])
+        .inc();
+}
+
+/// `ObserveQueueLength` (metrics.go:), from queueset.go:577.
+pub fn observe_queue_length(pl: &str, fs: &str, length: usize) {
+    REQUEST_QUEUE_LENGTH_AFTER_ENQUEUE
+        .with_label_values(&[pl, fs])
+        .observe(length as f64);
+}
+
+/// `AddDispatchWithNoAccommodation` (metrics.go:610), from queueset.go:819.
+pub fn add_dispatch_with_no_accommodation(pl: &str, fs: &str) {
+    REQUEST_DISPATCH_NO_ACCOMMODATION_TOTAL
+        .with_label_values(&[pl, fs])
+        .inc();
+}
+
+/// `ObserveWatchCount` (metrics.go:594), from mutating_work_estimator.go:78.
+pub fn observe_watch_count(pl: &str, fs: &str, count: i64) {
+    WATCH_COUNT_SAMPLES
+        .with_label_values(&[pl, fs])
+        .observe(count as f64);
+}
+
+/// `qs.seatDemandIntegrator.Set` through the union gauge
+/// (`NewUnionGauge(integrator, ApiserverSeatDemands member)`,
+/// apf_controller.go:722-723): the numerator of `demand_seats`.
+pub fn set_seat_demand(pl: &str, seats: f64) {
+    DEMAND_SEATS.set(&[pl], seats);
+}
+
 const PHASE_WAITING: &str = "waiting";
 const PHASE_EXECUTING: &str = "executing";
 /// `epmetrics.ReadOnlyKind` / `MutatingKind` (endpoints/metrics/metrics.go:369-371).
@@ -657,6 +808,9 @@ pub fn set_level_denominators(pl: &str, queue_capacity: f64, concurrency_denomin
     PRIORITY_LEVEL_REQUEST_UTILIZATION
         .set_denominator(&[PHASE_EXECUTING, pl], concurrency_denominator);
     PRIORITY_LEVEL_SEAT_UTILIZATION.set_denominator(&[pl], concurrency_denominator);
+    // `seatDemandRatioedGauge.SetDenominator(concurrencyDenominator)`
+    // (apf_controller.go:492).
+    DEMAND_SEATS.set_denominator(&[pl], concurrency_denominator);
 }
 
 /// `qs.reqsGaugePair.RequestsWaiting.Add` (queueset.go:437, :649, :708).
