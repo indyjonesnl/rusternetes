@@ -6,6 +6,7 @@ pub mod pod_security_policy;
 pub mod policy_dispatch;
 pub mod policy_matching;
 pub mod policy_mutating;
+pub mod policy_plugin;
 pub mod policy_registry;
 pub mod policy_source;
 pub mod resourcequota;
