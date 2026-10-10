@@ -129,6 +129,7 @@ mod fieldref_apiversion_default_before_validate_test;
 mod finalizer_drain_guard_test;
 mod flowcontrol_store_test;
 mod flowschema_watch_from_list_rv_test;
+mod gc_orphan_deployment_flow_test;
 mod generate_name_router_test;
 mod generic_leftovers_store_test;
 mod horizontalpodautoscaler_handler_test;
