@@ -28,6 +28,10 @@
 #        --skip-preflight  Skip the cluster health gate (conformance-preflight.sh);
 #                          results then describe the cluster, not the code (#1777)
 #        --parallel N   ginkgo procs (default 2; ginkgo isolates [Serial] specs)
+#
+# Env: HYDROPHONE_TIMEOUT (seconds, default 14400; 0 = unbounded) bounds the
+#      hydrophone call; HYDROPHONE_KILL_AFTER (default 60) is the SIGKILL grace.
+#      A killed run still salvages junit and collects diagnostics (#1635).
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -259,6 +263,28 @@ if [ -n "${TARGET_RUN_LIB_ONLY:-}" ]; then
     return 0 2>/dev/null || true
 fi
 
+# salvage_junit_from_pod <output-dir> <kubeconfig>
+# After a killed hydrophone: if it never copied junit out, pull the results
+# straight from the conformance pod's output sidecar (hydrophone's own source:
+# pod e2e-conformance-test, container output-container, /tmp/results). The suite
+# may well have finished — the hang is usually hydrophone's log follow (#1635).
+# Best-effort: never changes the verdict by itself.
+salvage_junit_from_pod() {
+    local out="${1:-}" kc="${2:-}"
+    [ -n "$out" ] && [ -d "$out" ] || return 0
+    ls "$out"/junit_*.xml >/dev/null 2>&1 && return 0
+    command -v kubectl >/dev/null 2>&1 || return 0
+    local ns="${CONFORMANCE_NAMESPACE:-conformance}"
+    if timeout 120 kubectl --kubeconfig "$kc" --request-timeout=30s -n "$ns" cp \
+         -c output-container "e2e-conformance-test:/tmp/results" "$out" >/dev/null 2>&1 \
+       && ls "$out"/junit_*.xml >/dev/null 2>&1; then
+        echo "[conformance-target-run] salvaged junit from pod $ns/e2e-conformance-test"
+    else
+        echo "[conformance-target-run] no junit salvageable from pod $ns/e2e-conformance-test" >&2
+    fi
+    return 0
+}
+
 # ---------- arg parsing ----------
 TARGET=""; FOCUS=""; SKIP=""; FOCUS_OVERRIDDEN=0
 KUBECONFIG_PATH="${KUBECONFIG:-$HOME/.kube/rusternetes-config}"
@@ -342,16 +368,41 @@ fi
 # [Serial] specs into a dedicated single-proc phase, so a focus that includes
 # serial specs stays correct at --parallel > 1. Single-threaded (--parallel 1)
 # ran a full SIG slice past the 90-min job timeout (#1616).
+# Bound the hydrophone call (#1635). Hydrophone follows the conformance pod's
+# logs to detect completion; if that follow never hits EOF it blocks forever even
+# though the suite has finished, and a lost runner means the workflow's
+# timeout-minutes is not enforced either (#2451: jobs ran ~24h against a 300-min
+# limit). So the script enforces its own wall-clock bound: SIGTERM at
+# HYDROPHONE_TIMEOUT, SIGKILL HYDROPHONE_KILL_AFTER later, then carry on to the
+# junit / diagnostics below. Default 14400s (240 min) = conformance-target.yml's
+# timeout-minutes (300) minus 60 min for bring-up, teardown and artifact upload.
+# coreutils `timeout` signals its whole process group, so ginkgo children die too.
+HYDROPHONE_TIMEOUT="${HYDROPHONE_TIMEOUT:-14400}"
+HYDROPHONE_KILL_AFTER="${HYDROPHONE_KILL_AFTER:-60}"
+hydro_cmd=("$HYDROPHONE_BIN"
+    --focus "$FOCUS"
+    --skip "$SKIP"
+    --parallel "$PARALLEL"
+    --output-dir "$OUTPUT_DIR"
+    --kubeconfig "$KUBECONFIG_PATH"
+    --conformance-image "$CONFORMANCE_IMAGE")
+if [ "$HYDROPHONE_TIMEOUT" = "0" ]; then
+    hydro_bound=()   # explicit opt-out
+else
+    command -v timeout >/dev/null 2>&1 \
+        || die "coreutils 'timeout' not on PATH; install it or set HYDROPHONE_TIMEOUT=0 to run unbounded"
+    hydro_bound=(timeout --signal=TERM --kill-after="$HYDROPHONE_KILL_AFTER" "$HYDROPHONE_TIMEOUT")
+fi
 set +e
-"$HYDROPHONE_BIN" \
-    --focus "$FOCUS" \
-    --skip "$SKIP" \
-    --parallel "$PARALLEL" \
-    --output-dir "$OUTPUT_DIR" \
-    --kubeconfig "$KUBECONFIG_PATH" \
-    --conformance-image "$CONFORMANCE_IMAGE" 2>&1 | tee "$OUTPUT_DIR/run.log"
+${hydro_bound[@]+"${hydro_bound[@]}"} "${hydro_cmd[@]}" 2>&1 | tee "$OUTPUT_DIR/run.log"
 hydro_exit=${PIPESTATUS[0]}
 set -e
+
+# 124 = TERM delivered by timeout; 137 = it had to SIGKILL (--kill-after).
+if [ "${#hydro_bound[@]}" -gt 0 ] && { [ "$hydro_exit" -eq 124 ] || [ "$hydro_exit" -eq 137 ]; }; then
+    echo "[conformance-target-run] target=$TARGET hydrophone timed out after ${HYDROPHONE_TIMEOUT}s (exit $hydro_exit) — salvaging results" >&2
+    salvage_junit_from_pod "$OUTPUT_DIR" "$KUBECONFIG_PATH"
+fi
 
 # Ginkgo writes framework setup testcases to junit even when the focus selects
 # zero specs, so junit counts alone can turn an empty run into a false 3/3
