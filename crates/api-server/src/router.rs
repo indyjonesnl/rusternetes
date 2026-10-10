@@ -2846,4 +2846,8 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
     .layer(axum::middleware::from_fn(
         crate::middleware::capture_payload,
     ))
+    // Carries the revision a LIST was read at to the RV it stamps (#3078).
+    .layer(axum::middleware::from_fn(
+        crate::handlers::list_options::list_snapshot_middleware,
+    ))
 }

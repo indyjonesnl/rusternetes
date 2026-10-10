@@ -160,8 +160,49 @@ pub fn exact_list_revision(params: &HashMap<String, String>) -> Option<i64> {
         .filter(|rv| *rv > 0)
 }
 
+tokio::task_local! {
+    /// The store revision the current request's last LIST was read at
+    /// ([`list_items`]) and that [`list_resource_version`] stamps.
+    static LIST_SNAPSHOT_REV: std::cell::Cell<Option<i64>>;
+}
+
+/// Scope one request's list snapshot. Every handler pairs `list_items` with a
+/// later `list_resource_version`; this carries the revision from the first to
+/// the second so both describe one read (installed per request by
+/// [`list_snapshot_middleware`]).
+pub async fn with_list_snapshot<F: std::future::Future>(fut: F) -> F::Output {
+    LIST_SNAPSHOT_REV
+        .scope(std::cell::Cell::new(None), fut)
+        .await
+}
+
+/// Axum layer wrapping each request in [`with_list_snapshot`].
+pub async fn list_snapshot_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    with_list_snapshot(next.run(req)).await
+}
+
+fn record_list_snapshot(rev: Option<i64>) {
+    let _ = LIST_SNAPSHOT_REV.try_with(|c| c.set(rev));
+}
+
+fn recorded_list_snapshot() -> Option<i64> {
+    LIST_SNAPSHOT_REV.try_with(|c| c.get()).ok().flatten()
+}
+
 /// Read the collection under `prefix` for a list request: as of the pinned
-/// revision for `resourceVersionMatch=Exact` (etcd `WithRev`), live otherwise.
+/// revision for `resourceVersionMatch=Exact` (etcd `WithRev`), otherwise as of
+/// a revision read first.
+///
+/// Upstream's `GetList` takes the list and its `ResourceVersion` from one etcd
+/// range response (`etcd3/store.go`: `getResp.Header.Revision` ->
+/// `UpdateList(listObj, uint64(withRev), ...)`), so a write cannot land between
+/// "the items" and "the RV". Reading the revision first and listing at it
+/// (as `watch::watch_snapshot` does) gives the same property here; the
+/// revision is remembered for [`list_resource_version`]. A backend that cannot
+/// read at a revision falls back to a live list and the old behaviour.
 pub async fn list_items<T, S>(
     storage: &S,
     prefix: &str,
@@ -171,30 +212,81 @@ where
     T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
     S: Storage + ?Sized,
 {
-    match exact_list_revision(params) {
-        Some(rv) => storage.list_at_revision(prefix, rv).await,
-        None => storage.list(prefix).await,
+    if let Some(rv) = exact_list_revision(params) {
+        record_list_snapshot(None);
+        return storage.list_at_revision(prefix, rv).await;
     }
+    if let Some(rev) = crate::handlers::list_snapshot_revision(storage).await {
+        if let Ok(items) = storage.list_at_revision(prefix, rev).await {
+            record_list_snapshot(Some(rev));
+            return Ok(items);
+        }
+    }
+    record_list_snapshot(None);
+    storage.list(prefix).await
 }
 
 /// The list's `metadata.resourceVersion`: the pinned revision for an Exact
-/// list (`UpdateList(listObj, withRev, ...)`, `etcd3/store.go:898`), otherwise
-/// [`crate::handlers::list_collection_resource_version`].
+/// list (`UpdateList(listObj, withRev, ...)`, `etcd3/store.go:898`), the
+/// revision [`list_items`] read at when one was recorded for this request,
+/// otherwise [`crate::handlers::list_collection_resource_version`].
 pub async fn list_resource_version<T: serde::Serialize>(
     storage: &rusternetes_storage::StorageBackend,
     params: &HashMap<String, String>,
     items: &[T],
 ) -> String {
-    match exact_list_revision(params) {
-        Some(rv) => rv.to_string(),
-        None => crate::handlers::list_collection_resource_version(storage, items).await,
+    if let Some(rv) = exact_list_revision(params) {
+        return rv.to_string();
     }
+    if let Some(rev) = recorded_list_snapshot() {
+        // Never below an item returned (a backend whose `list_at_revision`
+        // is a live read can hand back newer items; see #1824).
+        return crate::handlers::collection_resource_version(
+            Some(rev),
+            &crate::handlers::list_resource_version(items),
+        );
+    }
+    crate::handlers::list_collection_resource_version(storage, items).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusternetes_storage::MemoryStorage;
+    use rusternetes_storage::{MemoryStorage, StorageBackend};
+
+    /// #3078: items and the collection RV must come from one read. A write
+    /// landing between `list_items` and `list_resource_version` is absent from
+    /// `items`, so it must also be absent from the stamped RV; otherwise
+    /// LIST -> WATCH(rv) never delivers its ADDED. Upstream stamps the RV from
+    /// the same etcd range response (`etcd3/store.go` GetList,
+    /// `getResp.Header.Revision`).
+    #[tokio::test]
+    async fn list_rv_never_includes_a_write_absent_from_items() {
+        let storage = StorageBackend::Memory(std::sync::Arc::new(MemoryStorage::new()));
+        let obj = |n: &str| serde_json::json!({"metadata": {"name": n}});
+        let _: serde_json::Value = storage.create("/r/a", &obj("a")).await.unwrap();
+        with_list_snapshot(async {
+            let params = HashMap::new();
+            let items: Vec<serde_json::Value> = list_items(&storage, "/r/", &params).await.unwrap();
+            assert_eq!(items.len(), 1);
+            // The racing write, between the two reads.
+            let b: serde_json::Value = storage.create("/r/b", &obj("b")).await.unwrap();
+            let b_rv: i64 = b["metadata"]["resourceVersion"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            let rv: i64 = list_resource_version(&storage, &params, &items)
+                .await
+                .parse()
+                .unwrap();
+            assert!(
+                rv < b_rv,
+                "list RV {rv} includes write at {b_rv} that is missing from its items"
+            );
+        })
+        .await;
+    }
 
     fn q(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
