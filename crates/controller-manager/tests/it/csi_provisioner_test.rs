@@ -1295,3 +1295,298 @@ async fn a_non_infeasible_failure_is_not_slow_retried() {
     p.sync_claim(&c).await.unwrap_err();
     assert_eq!(rec.lock().unwrap().create_volume.len(), 2);
 }
+
+// ---- secrets and VolumeAttributesClass (#2964) ------------------------------
+//
+// external-provisioner `pkg/controller/controller.go`: `prepareProvision`
+// (:743-:826), `getSecretReference` (:1922), `getCredentials` (:2004),
+// `getSecretsFromSC` (:1484); `Provision` (:985-:1018).
+
+use rusternetes_common::resources::csi::VolumeAttributesClass;
+
+fn with_params(mut sc: StorageClass, extra: &[(&str, &str)]) -> StorageClass {
+    let p = sc.parameters.get_or_insert_with(Default::default);
+    for (k, v) in extra {
+        p.insert(k.to_string(), v.to_string());
+    }
+    sc
+}
+
+async fn put_secret(storage: &MemoryStorage, ns: &str, name: &str, k: &str, v: &str) {
+    let secret = Secret::new(name, ns).with_data([(k.to_string(), v.as_bytes().to_vec())].into());
+    storage
+        .create(&build_key("secrets", Some(ns), name), &secret)
+        .await
+        .unwrap();
+}
+
+fn secret_params() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "csi.storage.k8s.io/provisioner-secret-name",
+            "prov-${pvc.name}",
+        ),
+        (
+            "csi.storage.k8s.io/provisioner-secret-namespace",
+            "${pvc.namespace}",
+        ),
+        ("csi.storage.k8s.io/controller-publish-secret-name", "cp"),
+        (
+            "csi.storage.k8s.io/controller-publish-secret-namespace",
+            "sec-ns",
+        ),
+        ("csi.storage.k8s.io/node-stage-secret-name", "ns-${pv.name}"),
+        ("csi.storage.k8s.io/node-stage-secret-namespace", "sec-ns"),
+        (
+            "csi.storage.k8s.io/node-publish-secret-name",
+            "${pvc.annotations['example.com/np']}",
+        ),
+        ("csi.storage.k8s.io/node-publish-secret-namespace", "sec-ns"),
+        ("csi.storage.k8s.io/controller-expand-secret-name", "ce"),
+        (
+            "csi.storage.k8s.io/controller-expand-secret-namespace",
+            "sec-ns",
+        ),
+        ("csi.storage.k8s.io/node-expand-secret-name", "ne"),
+        ("csi.storage.k8s.io/node-expand-secret-namespace", "sec-ns"),
+        ("csi.storage.k8s.io/controller-modify-secret-name", "cm"),
+        (
+            "csi.storage.k8s.io/controller-modify-secret-namespace",
+            "sec-ns",
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn provisioner_secrets_are_resolved_and_recorded_on_the_pv() {
+    let sc = with_params(storage_class(None), &secret_params());
+    let (storage, p, rec, _d) = env(Fake::new(), sc).await;
+    put_secret(&storage, "ns1", "prov-data", "token", "s3cret").await;
+    p.sync_claim(&claim(&[(ANN, DRIVER), ("example.com/np", "np-secret")]))
+        .await
+        .unwrap();
+
+    let reqs = rec.lock().unwrap().create_volume.clone();
+    assert_eq!(reqs.len(), 1, "CreateVolume must be issued");
+    assert_eq!(
+        reqs[0].secrets.get("token").map(String::as_str),
+        Some("s3cret")
+    );
+    // The secret parameters are stripped from the driver parameters.
+    assert_eq!(reqs[0].parameters.len(), 1);
+
+    let pv = pv(&storage).await.expect("PV created");
+    let ann = pv.metadata.annotations.as_ref().unwrap();
+    let a = |k: &str| ann.get(k).map(String::as_str);
+    assert_eq!(
+        a("volume.kubernetes.io/provisioner-deletion-secret-name"),
+        Some("prov-data")
+    );
+    assert_eq!(
+        a("volume.kubernetes.io/provisioner-deletion-secret-namespace"),
+        Some("ns1")
+    );
+    assert_eq!(
+        a("volume.kubernetes.io/controller-modify-secret-name"),
+        Some("cm")
+    );
+    assert_eq!(
+        a("volume.kubernetes.io/controller-modify-secret-namespace"),
+        Some("sec-ns")
+    );
+
+    let csi = pv.spec.csi.as_ref().unwrap();
+    let r = |s: &Option<SecretReference>| {
+        s.as_ref()
+            .map(|s| (s.name.clone().unwrap(), s.namespace.clone().unwrap()))
+    };
+    let want = |n: &str| Some((n.to_string(), "sec-ns".to_string()));
+    assert_eq!(r(&csi.controller_publish_secret_ref), want("cp"));
+    assert_eq!(
+        r(&csi.node_stage_secret_ref),
+        want(&format!("ns-pvc-{PVC_UID}"))
+    );
+    assert_eq!(r(&csi.node_publish_secret_ref), want("np-secret"));
+    assert_eq!(r(&csi.controller_expand_secret_ref), want("ce"));
+    assert_eq!(r(&csi.node_expand_secret_ref), want("ne"));
+}
+
+#[tokio::test]
+async fn the_default_secret_parameters_cover_every_call() {
+    // `defaultSecretParams` (:174): `csi.storage.k8s.io/secret-*`.
+    let sc = with_params(
+        storage_class(None),
+        &[
+            ("csi.storage.k8s.io/secret-name", "dflt"),
+            ("csi.storage.k8s.io/secret-namespace", "sec-ns"),
+        ],
+    );
+    let (storage, p, rec, _d) = env(Fake::new(), sc).await;
+    put_secret(&storage, "sec-ns", "dflt", "k", "v").await;
+    p.sync_claim(&claim(&[(ANN, DRIVER)])).await.unwrap();
+    let reqs = rec.lock().unwrap().create_volume.clone();
+    assert_eq!(reqs[0].secrets.get("k").map(String::as_str), Some("v"));
+    let pv = pv(&storage).await.unwrap();
+    assert_eq!(
+        pv.spec
+            .csi
+            .unwrap()
+            .node_stage_secret_ref
+            .unwrap()
+            .name
+            .as_deref(),
+        Some("dflt")
+    );
+}
+
+#[tokio::test]
+async fn a_name_without_a_namespace_secret_parameter_is_refused() {
+    let sc = with_params(
+        storage_class(None),
+        &[("csi.storage.k8s.io/provisioner-secret-name", "only-name")],
+    );
+    let (_storage, p, rec, _d) = env(Fake::new(), sc).await;
+    let err = p.sync_claim(&claim(&[(ANN, DRIVER)])).await.unwrap_err();
+    assert!(
+        err.to_string().contains("Both must be specified"),
+        "got: {err}"
+    );
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+}
+
+#[tokio::test]
+async fn an_unresolvable_secret_template_token_is_refused() {
+    let sc = with_params(
+        storage_class(None),
+        &[
+            ("csi.storage.k8s.io/provisioner-secret-name", "${pvc.bogus}"),
+            ("csi.storage.k8s.io/provisioner-secret-namespace", "ns1"),
+        ],
+    );
+    let (_storage, p, rec, _d) = env(Fake::new(), sc).await;
+    let err = p.sync_claim(&claim(&[(ANN, DRIVER)])).await.unwrap_err();
+    assert!(err.to_string().contains("invalid tokens"), "got: {err}");
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+}
+
+#[tokio::test]
+async fn a_missing_provisioner_secret_fails_before_create_volume() {
+    // `getCredentials` error -> ProvisioningNoChange (:749-:752).
+    let sc = with_params(
+        storage_class(None),
+        &[
+            ("csi.storage.k8s.io/provisioner-secret-name", "absent"),
+            ("csi.storage.k8s.io/provisioner-secret-namespace", "ns1"),
+        ],
+    );
+    let (_storage, p, rec, _d) = env(Fake::new(), sc).await;
+    let err = p.sync_claim(&claim(&[(ANN, DRIVER)])).await.unwrap_err();
+    assert!(
+        err.to_string().contains("error getting secret absent"),
+        "got: {err}"
+    );
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+}
+
+#[tokio::test]
+async fn class_derived_deletion_secrets_are_resolved_for_a_pv_without_annotations() {
+    // `getSecretsFromSC` (:1484): the claim is rebuilt from the PV's claimRef.
+    let sc = with_params(
+        storage_class(None),
+        &[
+            (
+                "csi.storage.k8s.io/provisioner-secret-name",
+                "${pvc.name}-del",
+            ),
+            (
+                "csi.storage.k8s.io/provisioner-secret-namespace",
+                "${pvc.namespace}",
+            ),
+        ],
+    );
+    let (storage, p, rec, _d) = env(Fake::new(), sc).await;
+    put_secret(&storage, "ns1", "data-del", "user", "admin").await;
+    let mut pv = csi_pv(
+        "pv1",
+        PersistentVolumePhase::Released,
+        PersistentVolumeReclaimPolicy::Delete,
+    );
+    pv.spec.storage_class_name = Some("fast".into());
+    pv.spec.claim_ref = Some(ObjectReference {
+        name: Some("data".into()),
+        namespace: Some("ns1".into()),
+        ..Default::default()
+    });
+    put_pv(&storage, &pv).await;
+    p.sync_volume(&pv).await.unwrap();
+    let reqs = deleted(&rec);
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(
+        reqs[0].secrets.get("user").map(String::as_str),
+        Some("admin")
+    );
+}
+
+fn vac(driver: &str, params: &[(&str, &str)]) -> VolumeAttributesClass {
+    VolumeAttributesClass {
+        type_meta: TypeMeta {
+            kind: "VolumeAttributesClass".into(),
+            api_version: "storage.k8s.io/v1".into(),
+        },
+        metadata: ObjectMeta::new("gold"),
+        driver_name: driver.into(),
+        parameters: Some(
+            params
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        ),
+    }
+}
+
+async fn put_vac(storage: &MemoryStorage, v: &VolumeAttributesClass) {
+    storage
+        .create(&build_key("volumeattributesclasses", None, "gold"), v)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_volume_attributes_class_becomes_mutable_parameters() {
+    // `req.MutableParameters = vac.Parameters` (:814-:824) and
+    // `pv.Spec.VolumeAttributesClassName` (:1016-:1018).
+    let mut fake = Fake::new();
+    fake.extra_caps = vec![controller_service_capability::rpc::Type::ModifyVolume];
+    let (storage, p, rec, _d) = env(fake, storage_class(None)).await;
+    put_vac(&storage, &vac(DRIVER, &[("iops", "3000")])).await;
+    let mut c = claim(&[(ANN, DRIVER)]);
+    c.spec.volume_attributes_class_name = Some("gold".into());
+    p.sync_claim(&c).await.unwrap();
+    let reqs = rec.lock().unwrap().create_volume.clone();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(
+        reqs[0].mutable_parameters.get("iops").map(String::as_str),
+        Some("3000")
+    );
+    let pv = pv(&storage).await.unwrap();
+    assert_eq!(
+        pv.spec.volume_attributes_class_name.as_deref(),
+        Some("gold")
+    );
+}
+
+#[tokio::test]
+async fn a_volume_attributes_class_of_another_driver_is_refused() {
+    let mut fake = Fake::new();
+    fake.extra_caps = vec![controller_service_capability::rpc::Type::ModifyVolume];
+    let (storage, p, rec, _d) = env(fake, storage_class(None)).await;
+    put_vac(&storage, &vac("other.example.com", &[("iops", "3000")])).await;
+    let mut c = claim(&[(ANN, DRIVER)]);
+    c.spec.volume_attributes_class_name = Some("gold".into());
+    let err = p.sync_claim(&c).await.unwrap_err();
+    assert!(
+        err.to_string().contains("does not match driver name"),
+        "got: {err}"
+    );
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+}
