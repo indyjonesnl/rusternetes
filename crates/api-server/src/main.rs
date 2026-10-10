@@ -13,10 +13,11 @@ mod bootstrap;
 #[allow(dead_code)]
 mod legacy_token_tracking;
 pub use rusternetes_admission_webhook::cel_evaluators as cel;
+#[allow(dead_code)]
+mod apiserver_request_metrics;
 mod conversion;
 mod dynamic_routes;
 mod endpoints;
-#[allow(dead_code)]
 mod flow_control;
 #[allow(dead_code)]
 mod flow_control_conc_alloc;

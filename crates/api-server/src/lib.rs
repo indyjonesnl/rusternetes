@@ -11,10 +11,11 @@ pub mod crdregistration;
 pub mod legacy_token_tracking;
 pub use rusternetes_admission_webhook::cel_evaluators as cel;
 pub use rusternetes_middleware::cbor;
+#[allow(dead_code)]
+pub mod apiserver_request_metrics;
 pub mod conversion;
 pub mod dynamic_routes;
 pub mod endpoints;
-#[allow(dead_code)]
 pub mod flow_control;
 pub mod flow_control_conc_alloc;
 pub mod flow_control_filter;

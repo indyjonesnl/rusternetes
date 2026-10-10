@@ -107,6 +107,11 @@ pub fn request_wait_limit(
     (arrived_at + limit).saturating_duration_since(now)
 }
 
+/// `truncateLogField` (priority-and-fairness.go:61-68).
+pub fn truncate_log_field(s: &str) -> &str {
+    s
+}
+
 // ---------------------------------------------------------------------
 // DroppedRequestsTracker
 // ---------------------------------------------------------------------
@@ -1106,6 +1111,52 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(resp.headers().contains_key(HEADER_PRIORITY_LEVEL_UID));
+    }
+
+    // priority-and-fairness.go:311-312: a 429 records the dropped request and
+    // the termination (TestApfRejectRequest checks both metrics exist).
+    #[tokio::test]
+    async fn rejected_request_records_dropped_and_termination_metrics() {
+        use crate::flow_control::metric_test_util::sample;
+        let l = [
+            ("verb", "GET"),
+            ("resource", "namespaces"),
+            ("scope", "resource"),
+            ("component", "apiserver"),
+            ("code", "429"),
+        ];
+        let (t0, r0) = (
+            sample("apiserver_request_terminations_total", &l),
+            sample("apiserver_request_total", &l),
+        );
+        let gate = Arc::new(Notify::new());
+        let first = Arc::new(AtomicUsize::new(0));
+        let (g, f) = (gate.clone(), first.clone());
+        let hook: Arc<dyn Fn() -> Option<Arc<Notify>> + Send + Sync> =
+            Arc::new(move || (f.fetch_add(1, Ordering::SeqCst) == 0).then(|| g.clone()));
+        let app = app(1, Duration::from_millis(50), hook, bob()).await;
+        let a = app.clone();
+        let held =
+            tokio::spawn(async move { a.oneshot(get_req("/api/v1/namespaces/default")).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let resp = app
+            .clone()
+            .oneshot(get_req("/api/v1/namespaces/default"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(sample("apiserver_request_terminations_total", &l) >= t0 + 1.0);
+        assert!(sample("apiserver_request_total", &l) >= r0 + 1.0);
+        gate.notify_one();
+        held.await.unwrap().unwrap();
+    }
+
+    // httplog.AddKeyValue(ctx, "apf_pl", truncateLogField(pl.Name)) (:119).
+    #[test]
+    fn truncate_log_field_caps_at_64() {
+        assert_eq!(truncate_log_field("short"), "short");
+        let long = "x".repeat(100);
+        assert_eq!(truncate_log_field(&long).len(), 64);
     }
 
     #[tokio::test]
