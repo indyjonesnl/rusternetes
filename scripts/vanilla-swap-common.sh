@@ -185,6 +185,7 @@ vs_teardown() {
     | xargs -r docker rm -f >/dev/null 2>&1 || true
   docker volume rm "vanilla-swap-${cluster}-cri" >/dev/null 2>&1 || true
   docker volume rm "vanilla-swap-${cluster}-cri-data" >/dev/null 2>&1 || true
+  docker volume rm "vanilla-swap-${cluster}-cni-conf" >/dev/null 2>&1 || true
   docker volume rm "vanilla-swap-${cluster}-kubelet-vols" >/dev/null 2>&1 || true
 }
 
@@ -444,6 +445,55 @@ vs_render_recipe_template() {
   printf '%s\n' "$rendered"
 }
 
+# vs_cri_cni_docker_args <cluster>
+# One `docker run` arg per line for the CRI container: drop the image's baked
+# cluster-wide conflist (CNI_CONF_FROM_NODE_IPAM, deploy/containerd/entrypoint.sh)
+# and put /etc/cni/net.d on a volume the node-net agent also mounts — the agent
+# shares containerd's NETWORK namespace, not its mount namespace
+# (compose.sqlite.yml `cni-conf`, #1691). #1648.
+vs_cri_cni_docker_args() {
+  local cluster="$1"
+  printf '%s\n' -e 'CNI_CONF_FROM_NODE_IPAM=1' -v "vanilla-swap-${cluster}-cni-conf:/etc/cni/net.d"
+}
+
+# vs_node_net_agent_docker_args <cluster> <node-name> <kube-proxy-image>
+# One arg per line for the node-network agent (kube-proxy --configure-node-network,
+# the kindnetd analogue: kindnetd main.go:313 makeNodesReconciler + cni.go:41
+# ComputeCNIConfigInputs): writes the conflist from THIS node's spec.podCIDR so
+# host-local IPAM hands out the CIDR node-ipam assigned and the other nodes'
+# routes (kindnet, from spec.podCIDR) reach it. Runs in containerd's netns.
+vs_node_net_agent_docker_args() {
+  local cluster="$1" node_name="$2" image="$3"
+  printf '%s\n' \
+    --privileged \
+    --network "container:vanilla-swap-${cluster}-containerd" \
+    --label "rusternetes-swap-cluster=$cluster" \
+    -v "vanilla-swap-${cluster}-cni-conf:/etc/cni/net.d" \
+    -v /lib/modules:/lib/modules:ro \
+    "$image" \
+    --node-name "$node_name" \
+    --kubeconfig /app/admin.conf \
+    --insecure-skip-tls-verify \
+    --configure-node-network \
+    --pod-cidr "${VS_CLUSTER_CIDR:-10.244.0.0/16}"
+}
+
+# vs_start_node_net_agent <cluster> <node-name> <image> <kubeconfig> <api-ip>
+vs_start_node_net_agent() {
+  local cluster="$1" node_name="$2" image="$3" kc="$4" api_ip="$5"
+  local name="vanilla-swap-${cluster}-${node_name}-netagent"
+  local -a args
+  mapfile -t args < <(vs_node_net_agent_docker_args "$cluster" "$node_name" "$image")
+  # --api-server-url is a kube-proxy flag; append after the image args.
+  docker create --name "$name" "${args[@]}" --api-server-url "https://${api_ip}:6443" >/dev/null \
+    || vs_die "failed to create node-net agent $name" "$VS_EX_NOTUP"
+  # COPIED IN, not bind-mounted — same DinD reasoning as the kubelet kubeconfig.
+  docker cp "$kc" "${name}:/app/admin.conf" \
+    || vs_die "failed to copy the kubeconfig into $name" "$VS_EX_NOTUP"
+  docker start "$name" >/dev/null || vs_die "node-net agent $name did not start" "$VS_EX_NOTUP"
+  vs_log "node-net agent $name started (CNI conflist from node '$node_name' spec.podCIDR, #1648)"
+}
+
 # vs_swap_join_worker <cluster> <recipe> <image> <kubeconfig>
 # Attaches ONE extra node running the rusternetes kubelet to the vanilla control
 # plane, as CONTAINERS on the kind network (the kubelet binary needs a newer
@@ -468,7 +518,10 @@ vs_swap_join_worker() {
   cri_repo="${VS_IMAGE_REPO%/*}/$(vs_recipe_field "$root/$recipe" criImageRepoSuffix)"
   local cri_image="${cri_repo}:${RUSTERNETES_IMAGE_TAG:-main}"
 
+  local kp_image="${VS_IMAGE_REPO%/*}/kube-proxy:${RUSTERNETES_IMAGE_TAG:-main}"
   local cp node_ip vol="vanilla-swap-${cluster}-cri" datavol="vanilla-swap-${cluster}-cri-data"
+  local -a cni_args
+  mapfile -t cni_args < <(vs_cri_cni_docker_args "$cluster")
   cp="$(vs_control_plane_node "$cluster")"
   node_ip="$(docker inspect "$cp" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' | head -1)"
 
@@ -508,6 +561,7 @@ vs_swap_join_worker() {
     -v "${vol}:/run/containerd" \
     -v "${datavol}:/var/lib/containerd" \
     -v "${volsdir}:/app/volumes:rshared" \
+    "${cni_args[@]}" \
     "$cri_image" >/dev/null
   local i
   for (( i=0; i<30; i++ )); do
@@ -577,6 +631,10 @@ vs_swap_join_worker() {
     || vs_die "failed to copy the node kubeconfig into $node_container" "$VS_EX_NOTUP"
   docker start "$node_container" >/dev/null
 
+  # Node-network agent (#1648): derive this node's CNI conflist from its
+  # node-ipam spec.podCIDR (+ host-gw routes to the other nodes' CIDRs).
+  vs_start_node_net_agent "$cluster" "$node_name" "$kp_image" "$kc" "$node_ip"
+
   # A module that exits on startup should say so now, not 180 seconds from now
   # via a readiness timeout: the container is already dead and its logs are the
   # whole answer.
@@ -644,7 +702,12 @@ vs_collect_cluster_images() {
 # not a module under test, so it is excluded from the count.
 vs_guard_cluster() {
   local cluster="$1" kubeconfig="$2" count
-  count="$(vs_collect_cluster_images "$cluster" "$kubeconfig" | grep -v '/containerd' | vs_count_rusternetes_images)"
+  # The node-net agent (*/kube-proxy run by vs_start_node_net_agent) is CNI
+  # infrastructure for the swapped node, like the CRI runtime. Only skip it for
+  # the kubelet leg: on the kube-proxy leg kube-proxy IS the module under test.
+  local -a excl=(-e '/containerd')
+  [ "${VS_MODULE:-}" = "kube-proxy" ] || excl+=(-e '/kube-proxy')
+  count="$(vs_collect_cluster_images "$cluster" "$kubeconfig" | grep -v "${excl[@]}" | vs_count_rusternetes_images)"
   count="${count:-0}"
   vs_log "post-swap guard: $count rusternetes image(s) present"
   [ "$count" -eq 1 ] || vs_die "single-module guard: expected exactly 1 rusternetes image in cluster, found $count" "$VS_EX_GUARD"
