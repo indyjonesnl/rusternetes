@@ -265,6 +265,9 @@ pub async fn list_servicecidrs(
     }
 
     let prefix = build_prefix("servicecidrs", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let servicecidrs = state.storage.list::<ServiceCIDR>(&prefix).await?;
 
     let mut list = List::new("ServiceCIDRList", "networking.k8s.io/v1", servicecidrs);

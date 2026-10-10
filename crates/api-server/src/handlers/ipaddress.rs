@@ -190,6 +190,9 @@ pub async fn list_ipaddresses(
     }
 
     let prefix = build_prefix("ipaddresses", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut ipaddresses = state.storage.list::<IPAddress>(&prefix).await?;
 
     // Apply field and label selector filtering

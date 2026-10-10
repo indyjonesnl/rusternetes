@@ -130,6 +130,9 @@ pub async fn list_resourceslices(
     }
 
     let prefix = build_prefix("resourceslices", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut slices: Vec<ResourceSlice> = state.storage.list(&prefix).await?;
 
     // Apply field and label selector filtering

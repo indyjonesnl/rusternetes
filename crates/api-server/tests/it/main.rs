@@ -234,6 +234,7 @@ mod priorityclass_http_crud_test;
 mod priorityclass_store_test;
 mod projected_defaultmode_test;
 mod proto_encoder_wire_format_test;
+mod protobuf_pvc_empty_storage_class_test;
 mod protobuf_roundtrip_fuzz;
 mod protobuf_schema_parity_upstream;
 mod protobuf_test;
@@ -352,6 +353,7 @@ mod workload_template_decodes_when_absent_test;
 mod workload_template_drop_disabled_test;
 
 mod connect_mutating_admission_test;
+mod list_options_all_routes_test;
 mod list_resource_version_match_exact_test;
 mod metrics_label_selector_test;
 mod networking_store_test;

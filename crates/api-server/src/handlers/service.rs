@@ -309,6 +309,7 @@ pub async fn list(
     Path(namespace): Path<String>,
     headers: HeaderMap,
     Query(params): Query<WatchParams>,
+    Query(list_options): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
     // Check if this is a watch request
     if params.watch.unwrap_or(false) {
@@ -338,6 +339,9 @@ pub async fn list(
 
     let prefix = build_prefix("services", Some(&namespace));
     let primary = state.cluster_ip_allocators.primary_family();
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &list_options).await?;
+
     let mut services = state.storage.list::<Service>(&prefix).await?;
     // `Store.Decorator` on every listed item (`Store.List` store.go:381-383;
     // `defaultOnReadServiceList` storage.go:243-252).
@@ -385,6 +389,7 @@ pub async fn list_all_services(
     Extension(auth_ctx): Extension<AuthContext>,
     headers: HeaderMap,
     Query(params): Query<WatchParams>,
+    Query(list_options): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
     // Debug log the params
     debug!("list_all_services called with watch={:?}", params.watch);
@@ -414,6 +419,9 @@ pub async fn list_all_services(
 
     let prefix = build_prefix("services", None);
     let primary = state.cluster_ip_allocators.primary_family();
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &list_options).await?;
+
     let mut services = state.storage.list::<Service>(&prefix).await?;
     // `Store.Decorator` on every listed item (`Store.List` store.go:381-383;
     // `defaultOnReadServiceList` storage.go:243-252).

@@ -8,7 +8,7 @@
 
 use rusternetes_common::resources::service_account::ObjectReference;
 use rusternetes_common::resources::volume::*;
-use rusternetes_common::resources::{Event, PersistentVolume, PersistentVolumeClaim};
+use rusternetes_common::resources::{Event, PersistentVolume, PersistentVolumeClaim, Secret};
 use rusternetes_common::types::{ObjectMeta, TypeMeta};
 use rusternetes_controller_manager::controllers::csi_provisioner::CsiProvisioner;
 use rusternetes_controller_manager::controllers::dynamic_provisioner::DynamicProvisionerController;
@@ -36,6 +36,7 @@ struct Fake {
     /// `None` echoes the requested size; `Some(n)` reports `n` bytes.
     capacity: Option<i64>,
     create_code: Option<tonic::Code>,
+    delete_code: Option<tonic::Code>,
     /// Controller capabilities beyond CREATE_DELETE_VOLUME.
     extra_caps: Vec<controller_service_capability::rpc::Type>,
     /// A driver that ignores `volume_content_source` (it must echo it).
@@ -48,6 +49,7 @@ impl Fake {
             rec: Default::default(),
             capacity: None,
             create_code: None,
+            delete_code: None,
             extra_caps: vec![],
             drop_content_source: false,
         }
@@ -130,6 +132,9 @@ impl Controller for Fake {
         r: Request<DeleteVolumeRequest>,
     ) -> Result<Response<DeleteVolumeResponse>, Status> {
         self.rec.lock().unwrap().delete_volume.push(r.into_inner());
+        if let Some(c) = self.delete_code {
+            return Err(Status::new(c, "fake delete failure"));
+        }
         Ok(Response::new(DeleteVolumeResponse {}))
     }
     async fn create_snapshot(
@@ -928,4 +933,365 @@ async fn a_data_source_ref_namespace_needs_the_cross_namespace_gate() {
         "{err}"
     );
     assert!(rec.lock().unwrap().create_volume.is_empty());
+}
+
+// ---- delete path (#2965) ----------------------------------------------------
+//
+// sig-storage-lib-external-provisioner `controller/controller.go`:
+// `syncVolume` (:1149), `isProvisionerForVolume` (:1175),
+// `handleProtectionFinalizer` (:1203), `shouldDelete` (:1285),
+// `deleteVolumeOperation` (:1636); external-provisioner
+// `pkg/controller/controller.go` `Delete` (:1390), `handleSecretsForDeletion`,
+// `canDeleteVolume` (:1526).
+
+const FINALIZER: &str = "external-provisioner.volume.kubernetes.io/finalizer";
+
+fn csi_pv(
+    name: &str,
+    phase: PersistentVolumePhase,
+    policy: PersistentVolumeReclaimPolicy,
+) -> PersistentVolume {
+    let mut meta = ObjectMeta::new(name);
+    meta.annotations = Some(
+        [(
+            "pv.kubernetes.io/provisioned-by".to_string(),
+            DRIVER.to_string(),
+        )]
+        .into(),
+    );
+    meta.finalizers = Some(vec![FINALIZER.to_string()]);
+    PersistentVolume {
+        type_meta: TypeMeta {
+            kind: "PersistentVolume".into(),
+            api_version: "v1".into(),
+        },
+        metadata: meta,
+        spec: PersistentVolumeSpec {
+            persistent_volume_reclaim_policy: Some(policy),
+            csi: Some(CSIVolumeSource {
+                driver: DRIVER.into(),
+                volume_handle: Some("vol-1".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        status: Some(PersistentVolumeStatus {
+            phase,
+            ..Default::default()
+        }),
+    }
+}
+
+async fn put_pv(storage: &MemoryStorage, pv: &PersistentVolume) {
+    storage
+        .create(&build_key("persistentvolumes", None, &pv.metadata.name), pv)
+        .await
+        .unwrap();
+}
+
+async fn get_pv(storage: &MemoryStorage, name: &str) -> Option<PersistentVolume> {
+    storage
+        .get(&build_key("persistentvolumes", None, name))
+        .await
+        .ok()
+}
+
+fn deleted(rec: &Arc<Mutex<Recorded>>) -> Vec<DeleteVolumeRequest> {
+    rec.lock().unwrap().delete_volume.clone()
+}
+
+#[tokio::test]
+async fn a_released_delete_pv_is_deleted_and_its_finalizer_released() {
+    let (storage, p, rec, _d) = env(Fake::new(), storage_class(None)).await;
+    let pv = csi_pv(
+        "pv1",
+        PersistentVolumePhase::Released,
+        PersistentVolumeReclaimPolicy::Delete,
+    );
+    put_pv(&storage, &pv).await;
+    p.sync_volume(&pv).await.unwrap();
+    let reqs = deleted(&rec);
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].volume_id, "vol-1");
+    assert!(get_pv(&storage, "pv1").await.is_none(), "PV removed");
+}
+
+#[tokio::test]
+async fn a_pv_that_should_not_be_deleted_is_left_alone() {
+    let (storage, p, rec, _d) = env(Fake::new(), storage_class(None)).await;
+    let cases = [
+        // `shouldDelete`: Retain reclaim policy.
+        (
+            "retain",
+            PersistentVolumePhase::Released,
+            PersistentVolumeReclaimPolicy::Retain,
+        ),
+        // `shouldDelete`: not Released.
+        (
+            "bound",
+            PersistentVolumePhase::Bound,
+            PersistentVolumeReclaimPolicy::Delete,
+        ),
+        (
+            "failed",
+            PersistentVolumePhase::Failed,
+            PersistentVolumeReclaimPolicy::Delete,
+        ),
+    ];
+    for (name, phase, policy) in cases {
+        let pv = csi_pv(name, phase, policy);
+        put_pv(&storage, &pv).await;
+        p.sync_volume(&pv).await.unwrap();
+        assert!(get_pv(&storage, name).await.is_some(), "{name} kept");
+    }
+    assert!(deleted(&rec).is_empty());
+
+    // `shouldDelete`: "The finalizer was removed, i.e. the volume has been
+    // already deleted."
+    let mut pv = csi_pv(
+        "gone",
+        PersistentVolumePhase::Released,
+        PersistentVolumeReclaimPolicy::Delete,
+    );
+    pv.metadata.finalizers = None;
+    pv.metadata.deletion_timestamp = Some(chrono::Utc::now());
+    put_pv(&storage, &pv).await;
+    p.sync_volume(&pv).await.unwrap();
+    assert!(deleted(&rec).is_empty());
+}
+
+#[tokio::test]
+async fn another_drivers_pv_is_not_ours_to_delete() {
+    let (storage, p, rec, _d) = env(Fake::new(), storage_class(None)).await;
+    let mut pv = csi_pv(
+        "other",
+        PersistentVolumePhase::Released,
+        PersistentVolumeReclaimPolicy::Delete,
+    );
+    pv.metadata
+        .annotations
+        .as_mut()
+        .unwrap()
+        .insert("pv.kubernetes.io/provisioned-by".into(), "other.csi".into());
+    put_pv(&storage, &pv).await;
+    p.sync_volume(&pv).await.unwrap();
+    assert!(deleted(&rec).is_empty());
+    assert!(get_pv(&storage, "other").await.is_some());
+
+    // A statically provisioned CSI PV is ours iff `spec.csi.driver` is.
+    let mut stat = csi_pv(
+        "static",
+        PersistentVolumePhase::Released,
+        PersistentVolumeReclaimPolicy::Delete,
+    );
+    stat.metadata.annotations = None;
+    put_pv(&storage, &stat).await;
+    p.sync_volume(&stat).await.unwrap();
+    assert_eq!(deleted(&rec).len(), 1);
+}
+
+#[tokio::test]
+async fn the_protection_finalizer_follows_the_reclaim_policy() {
+    let (storage, p, rec, _d) = env(Fake::new(), storage_class(None)).await;
+
+    // Bound + Delete: the finalizer is added.
+    let mut pv = csi_pv(
+        "bound",
+        PersistentVolumePhase::Bound,
+        PersistentVolumeReclaimPolicy::Delete,
+    );
+    pv.metadata.finalizers = None;
+    put_pv(&storage, &pv).await;
+    p.sync_volume(&pv).await.unwrap();
+    let got = get_pv(&storage, "bound").await.unwrap();
+    assert_eq!(got.metadata.finalizers, Some(vec![FINALIZER.to_string()]));
+
+    // Reclaim policy changed to Retain: the finalizer is removed.
+    let pv = csi_pv(
+        "retained",
+        PersistentVolumePhase::Bound,
+        PersistentVolumeReclaimPolicy::Retain,
+    );
+    put_pv(&storage, &pv).await;
+    p.sync_volume(&pv).await.unwrap();
+    let got = get_pv(&storage, "retained").await.unwrap();
+    assert!(got.metadata.finalizers.unwrap_or_default().is_empty());
+    assert!(deleted(&rec).is_empty());
+}
+
+fn with_secret_annotations(mut pv: PersistentVolume) -> PersistentVolume {
+    let ann = pv.metadata.annotations.as_mut().unwrap();
+    ann.insert(
+        "volume.kubernetes.io/provisioner-deletion-secret-name".into(),
+        "creds".into(),
+    );
+    ann.insert(
+        "volume.kubernetes.io/provisioner-deletion-secret-namespace".into(),
+        "sec-ns".into(),
+    );
+    pv
+}
+
+#[tokio::test]
+async fn deletion_secrets_come_from_the_provisioner_annotations() {
+    let (storage, p, rec, _d) = env(Fake::new(), storage_class(None)).await;
+    let secret =
+        Secret::new("creds", "sec-ns").with_data([("user".to_string(), b"admin".to_vec())].into());
+    storage
+        .create(&build_key("secrets", Some("sec-ns"), "creds"), &secret)
+        .await
+        .unwrap();
+    let pv = with_secret_annotations(csi_pv(
+        "pv1",
+        PersistentVolumePhase::Released,
+        PersistentVolumeReclaimPolicy::Delete,
+    ));
+    put_pv(&storage, &pv).await;
+    p.sync_volume(&pv).await.unwrap();
+    let reqs = deleted(&rec);
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(
+        reqs[0].secrets.get("user").map(String::as_str),
+        Some("admin")
+    );
+}
+
+#[tokio::test]
+async fn a_missing_deletion_secret_does_not_block_deletion() {
+    // "Continue with deletion, as the secret may have already been deleted."
+    let (storage, p, rec, _d) = env(Fake::new(), storage_class(None)).await;
+    let pv = with_secret_annotations(csi_pv(
+        "pv1",
+        PersistentVolumePhase::Released,
+        PersistentVolumeReclaimPolicy::Delete,
+    ));
+    put_pv(&storage, &pv).await;
+    p.sync_volume(&pv).await.unwrap();
+    assert_eq!(deleted(&rec).len(), 1);
+    assert!(deleted(&rec)[0].secrets.is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_delete_volume_keeps_the_pv_and_warns() {
+    let mut fake = Fake::new();
+    fake.delete_code = Some(tonic::Code::Internal);
+    let (storage, p, _rec, _d) = env(fake, storage_class(None)).await;
+    let pv = csi_pv(
+        "pv1",
+        PersistentVolumePhase::Released,
+        PersistentVolumeReclaimPolicy::Delete,
+    );
+    put_pv(&storage, &pv).await;
+    p.sync_volume(&pv).await.unwrap_err();
+    let got = get_pv(&storage, "pv1")
+        .await
+        .expect("PV kept for the retry");
+    assert_eq!(got.metadata.finalizers, Some(vec![FINALIZER.to_string()]));
+    assert!(events(&storage)
+        .await
+        .iter()
+        .any(|e| e.reason == "VolumeFailedDelete"));
+}
+
+#[tokio::test]
+async fn an_attached_volume_postpones_deletion_without_failing_it() {
+    // `canDeleteVolume` (controller.go:1526): only when the driver can
+    // PUBLISH_UNPUBLISH_VOLUME (csi-provisioner.go:312).
+    let mut fake = Fake::new();
+    fake.extra_caps = vec![controller_service_capability::rpc::Type::PublishUnpublishVolume];
+    let (storage, p, rec, _d) = env(fake, storage_class(None)).await;
+    let va = rusternetes_common::resources::csi::VolumeAttachment {
+        type_meta: TypeMeta {
+            kind: "VolumeAttachment".into(),
+            api_version: "storage.k8s.io/v1".into(),
+        },
+        metadata: ObjectMeta::new("va1"),
+        spec: rusternetes_common::resources::csi::VolumeAttachmentSpec {
+            attacher: DRIVER.into(),
+            node_name: "node-1".into(),
+            source: rusternetes_common::resources::csi::VolumeAttachmentSource {
+                persistent_volume_name: Some("pv1".into()),
+                inline_volume_spec: None,
+            },
+        },
+        status: None,
+    };
+    storage
+        .create(&build_key("volumeattachments", None, "va1"), &va)
+        .await
+        .unwrap();
+    let pv = csi_pv(
+        "pv1",
+        PersistentVolumePhase::Released,
+        PersistentVolumeReclaimPolicy::Delete,
+    );
+    put_pv(&storage, &pv).await;
+    let err = p.sync_volume(&pv).await.unwrap_err();
+    assert!(
+        err.to_string().contains("still attached to node node-1"),
+        "{err}"
+    );
+    assert!(deleted(&rec).is_empty());
+    assert!(get_pv(&storage, "pv1").await.is_some());
+    let evs = events(&storage).await;
+    assert!(evs.iter().any(|e| e.reason == "VolumeDelete"));
+    assert!(!evs.iter().any(|e| e.reason == "VolumeFailedDelete"));
+}
+
+// ---- infeasible slow retry (#2965) ---------------------------------------------
+//
+// lib `delayProvisioningIfRecentlyInfeasible` (:1545), `markForSlowRetry`
+// (:1566), `slowset.SlowSet` (csi-lib-utils).
+
+#[tokio::test]
+async fn an_infeasible_claim_is_not_retried_until_the_slow_set_expires() {
+    let mut fake = Fake::new();
+    fake.create_code = Some(tonic::Code::InvalidArgument);
+    let (storage, p, rec, _d) = env(fake, storage_class(None)).await;
+    let c = claim(&[(ANN, DRIVER)]);
+    p.sync_claim(&c).await.unwrap_err();
+    assert_eq!(rec.lock().unwrap().create_volume.len(), 1);
+
+    // Second sync: delayed, the driver is not asked again.
+    let err = p.sync_claim(&c).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("skipping volume provisioning for pvc"),
+        "{err}"
+    );
+    assert_eq!(rec.lock().unwrap().create_volume.len(), 1);
+
+    // A replaced StorageClass (new UID) clears the delay (:1555-1558).
+    let mut sc = storage_class(None);
+    sc.metadata.uid = "new-class-uid".into();
+    storage
+        .update(&build_key("storageclasses", None, "fast"), &sc)
+        .await
+        .unwrap();
+    p.sync_claim(&c).await.unwrap_err();
+    assert_eq!(rec.lock().unwrap().create_volume.len(), 2);
+}
+
+#[tokio::test]
+async fn the_slow_set_expires_after_the_retry_interval_max() {
+    let mut fake = Fake::new();
+    fake.create_code = Some(tonic::Code::InvalidArgument);
+    let (_storage, p, rec, _d) = env(fake, storage_class(None)).await;
+    let p = p.with_retry_interval_max(std::time::Duration::from_millis(150));
+    let c = claim(&[(ANN, DRIVER)]);
+    p.sync_claim(&c).await.unwrap_err();
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    p.sync_claim(&c).await.unwrap_err();
+    assert_eq!(rec.lock().unwrap().create_volume.len(), 2);
+}
+
+#[tokio::test]
+async fn a_non_infeasible_failure_is_not_slow_retried() {
+    let mut fake = Fake::new();
+    fake.create_code = Some(tonic::Code::Internal);
+    let (_storage, p, rec, _d) = env(fake, storage_class(None)).await;
+    let c = claim(&[(ANN, DRIVER)]);
+    p.sync_claim(&c).await.unwrap_err();
+    p.sync_claim(&c).await.unwrap_err();
+    assert_eq!(rec.lock().unwrap().create_volume.len(), 2);
 }

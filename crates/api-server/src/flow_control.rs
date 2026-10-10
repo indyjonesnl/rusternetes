@@ -1516,6 +1516,105 @@ mod tests {
         assert!(e.borrowing_state("a").unwrap().current_cl >= a.min_cl);
     }
 
+    /// `TestBorrowing` (flowcontrol/borrowing_test.go:60). Two levels with
+    /// nominal limit 12 each (server limit 24); 24 closed-loop clients on
+    /// level 0 and 6 on level 1, each request holding a seat for 250 ms.
+    /// The first 10 s are ignored, the next 15 s are measured: level 0 must
+    /// deliver about 16 (its 12 plus what it borrows) and level 1 about 6.
+    /// Upstream runs this on `eventclock.Real`; we run the same scenario on
+    /// tokio's paused clock. Requests are classified directly to their level
+    /// (the upstream FlowSchemas only route `test-userN` to `test-plN`).
+    async fn run_borrowing_scenario(lendable: [i32; 2], borrowing: [i32; 2]) {
+        use crate::flow_control_integrator::test_clock::TokioClock;
+        let clk = TokioClock::new();
+        let st = Arc::new(MemoryStorage::new());
+        let e = Arc::new(FlowControlEngine::with_limits_and_clock(
+            st,
+            24,
+            0,
+            clk.clone(),
+        ));
+        let mut pls = vec![];
+        for flow in 0..2 {
+            let mut pl = borrowing_pl(
+                &format!("test-pl{flow}"),
+                100,
+                Some(lendable[flow]),
+                Some(borrowing[flow]),
+            );
+            pl.spec.limited.as_mut().unwrap().limit_response = Some(LimitResponse {
+                type_: LimitResponseType::Queue,
+                queuing: Some(QueuingConfiguration {
+                    queues: 10,
+                    hand_size: 2,
+                    queue_length_limit: 10,
+                }),
+            });
+            pls.push(pl);
+        }
+        e.digest_config_objects(pls, vec![]);
+        // `wait.Until(cfgCtlr.updateBorrowing, borrowingAdjustmentPeriod)`.
+        let updater = crate::flow_control_filter::spawn_borrowing_updater(e.clone());
+        let integrators: Vec<Arc<Integrator>> = (0..2)
+            .map(|_| Arc::new(Integrator::new(clk.clone())))
+            .collect();
+        let mut clients = vec![];
+        for (flow, n) in [24usize, 6].into_iter().enumerate() {
+            for _ in 0..n {
+                let (e, igr) = (e.clone(), integrators[flow].clone());
+                let c = cls(
+                    &format!("test-fs{flow}"),
+                    &format!("test-pl{flow}"),
+                    &format!("test-user{flow}"),
+                );
+                clients.push(tokio::spawn(async move {
+                    loop {
+                        // `controller.Handle(...)`; a rejection just retries.
+                        if let Ok(p) = e.execute(&c, 1, Duration::from_secs(15)).await {
+                            igr.add(1.0);
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                            igr.add(-1.0);
+                            drop(p);
+                        } else {
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                }));
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        for i in &integrators {
+            i.reset();
+        }
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        let r0 = integrators[0].reset();
+        let r1 = integrators[1].reset();
+        updater.abort();
+        for c in clients {
+            c.abort();
+        }
+        assert!(
+            (15.5..=16.1).contains(&r0.average),
+            "flow 0 average concurrency {} but expected about 16",
+            r0.average
+        );
+        assert!(
+            (5.5..=6.1).contains(&r1.average),
+            "flow 1 average concurrency {} but expected about 6",
+            r1.average
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn borrowing_lendable_limited_matches_upstream_test_borrowing() {
+        run_borrowing_scenario([50, 33], [67, 50]).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn borrowing_borrowing_limited_matches_upstream_test_borrowing() {
+        run_borrowing_scenario([50, 67], [33, 50]).await;
+    }
+
     /// A busy level borrows what an idle lendable level lends, and the
     /// queueset enforces the new `currentCL` (the point of
     /// `updateBorrowingLocked` completing the queueset with it).

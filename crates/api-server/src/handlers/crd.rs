@@ -274,6 +274,9 @@ pub async fn list_crds(
     }
 
     let prefix = build_prefix("customresourcedefinitions", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut crds = state
         .storage
         .list::<CustomResourceDefinition>(&prefix)

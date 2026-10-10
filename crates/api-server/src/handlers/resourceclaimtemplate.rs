@@ -152,6 +152,9 @@ pub async fn list_resourceclaimtemplates(
     }
 
     let prefix = build_prefix("resourceclaimtemplates", Some(&namespace));
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut templates: Vec<ResourceClaimTemplate> = state.storage.list(&prefix).await?;
 
     crate::handlers::filtering::apply_selectors(&mut templates, &params)?;
@@ -213,6 +216,9 @@ pub async fn list_all_resourceclaimtemplates(
     }
 
     let prefix = build_prefix("resourceclaimtemplates", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut templates: Vec<ResourceClaimTemplate> = state.storage.list(&prefix).await?;
 
     crate::handlers::filtering::apply_selectors(&mut templates, &params)?;

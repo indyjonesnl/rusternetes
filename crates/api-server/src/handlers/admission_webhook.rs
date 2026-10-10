@@ -90,6 +90,9 @@ pub async fn list_validating_webhooks(
     }
 
     let prefix = build_prefix("validatingwebhookconfigurations", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut configs = state
         .storage
         .list::<ValidatingWebhookConfiguration>(&prefix)
@@ -172,6 +175,9 @@ pub async fn list_mutating_webhooks(
     }
 
     let prefix = build_prefix("mutatingwebhookconfigurations", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut configs = state
         .storage
         .list::<MutatingWebhookConfiguration>(&prefix)

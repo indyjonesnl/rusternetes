@@ -297,6 +297,9 @@ pub async fn list(
     }
 
     let prefix = build_prefix("namespaces", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut namespaces = state.storage.list::<Namespace>(&prefix).await?;
 
     // Apply field and label selector filtering
