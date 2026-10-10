@@ -23,12 +23,9 @@
 //!   cannot type (a call to a library function) is `dyn`, which type-checks,
 //!   so it never rejects what upstream accepts;
 //! * `checker.Cost` (`vendor/github.com/google/cel-go/checker/cost.go`,
-//!   `coster`) with the DRA `sizeEstimator` (`compile.go:417-475`).
-//!
-//! Not ported: the Kubernetes function libraries' `EstimateCallCost`
-//! (`apiserver/pkg/cel/library/cost.go`), which prices e.g. `quantity()` and
-//! `semver` calls above the base cost of 1. A selector can therefore be
-//! estimated lower than upstream estimates it, never higher.
+//!   `coster`) with the DRA `sizeEstimator` (`compile.go:417-475`) and the
+//!   Kubernetes libraries' `CostEstimator.EstimateCallCost`
+//!   (`apiserver/pkg/cel/library/cost.go`), see `estimate_call_cost`.
 //!
 //! Positions are reconstructed from the source text because the crate drops
 //! its source info on a successful parse.
@@ -110,6 +107,10 @@ enum Ty {
     Any,
     /// `apiservercel.Quantity`: opaque, only used through library functions.
     Quantity,
+    /// Another opaque/struct type of the Kubernetes CEL libraries
+    /// (`semver`, `ip`, `cidr`, `url`, `format`), only used to price `==`
+    /// (`CostEstimator.EstimateCallCost`, `_==_`).
+    Lib(&'static str),
     /// The `device` variable.
     Device,
     List(Box<Ty>),
@@ -129,6 +130,7 @@ impl Ty {
             Ty::Dyn => "dyn".into(),
             Ty::Any => "any".into(),
             Ty::Quantity => "apiserver.cel.Quantity".into(),
+            Ty::Lib(n) => (*n).into(),
             Ty::Device => "device".into(),
             Ty::List(t) => format!("list({})", t.name()),
             Ty::Map(k, v) => format!("map({}, {})", k.name(), v.name()),
@@ -137,7 +139,7 @@ impl Ty {
 
     /// Unchecked: anything is assignable to and from it.
     fn is_unchecked(&self) -> bool {
-        matches!(self, Ty::Dyn | Ty::Any | Ty::Quantity)
+        matches!(self, Ty::Dyn | Ty::Any | Ty::Quantity | Ty::Lib(_))
     }
 
     /// No `dyn` anywhere in it, so its name is what upstream would print.
@@ -514,6 +516,27 @@ impl<'a> Checker<'a> {
             "bool" => Ty::Bool,
             "bytes" => Ty::Bytes,
             "quantity" => Ty::Quantity,
+            "semver" => Ty::Lib("kubernetes.Semver"),
+            "ip" => Ty::Lib("net.IP"),
+            "cidr" => Ty::Lib("net.CIDR"),
+            "url" => Ty::Lib("kubernetes.URL"),
+            "format.named" => Ty::Lib("kubernetes.NamedFormat"),
+            // Kubernetes strings library results, so the cost estimator can
+            // see a list's element type (`listElementNode`).
+            "split" | "findAll"
+                if target
+                    .as_ref()
+                    .is_some_and(|t| *t == Ty::Str || t.is_unchecked()) =>
+            {
+                Ty::List(Box::new(Ty::Str))
+            }
+            "find" | "lowerAscii" | "upperAscii" | "trim" | "substring" | "replace"
+                if target
+                    .as_ref()
+                    .is_some_and(|t| *t == Ty::Str || t.is_unchecked()) =>
+            {
+                Ty::Str
+            }
             _ => Ty::Dyn,
         }
     }
@@ -543,6 +566,14 @@ impl Size {
         Size {
             min: self.min.saturating_add(o.min),
             max: self.max.saturating_add(o.max),
+        }
+    }
+
+    /// `SizeEstimate.Multiply`.
+    fn mul(self, o: Size) -> Size {
+        Size {
+            min: self.min.saturating_mul(o.min),
+            max: self.max.saturating_mul(o.max),
         }
     }
 
@@ -621,6 +652,11 @@ const MAP_CREATE_BASE: u64 = 30;
 const STRUCT_CREATE_BASE: u64 = 40;
 const CONST_COST: u64 = 0;
 const SELECT_AND_IDENT: u64 = 1;
+
+/// `apiservercel.MaxFormatSize` / `MaxNameFormatRegexSize`
+/// (`staging/src/k8s.io/apiserver/pkg/cel/limits.go:52-53`).
+const MAX_FORMAT_SIZE: u64 = 64;
+const MAX_NAME_FORMAT_REGEX_SIZE: f64 = 128.0;
 
 /// `entrySizeEstimate`.
 #[derive(Clone, Copy, Debug)]
@@ -1074,6 +1110,228 @@ impl<'a> Coster<'a> {
         sum.add(fn_cost)
     }
 
+    /// `CostEstimator.listElementNode` + `sizeEstimate`: the size of a list's
+    /// elements, by `<path>/@items` when the list has a path.
+    fn element_size(&self, list: &IdedExpr) -> Size {
+        let path = self.path(list);
+        if path.is_empty() {
+            return Size::UNKNOWN;
+        }
+        let mut p = path;
+        p.push("@items".to_string());
+        estimate_size(&p).unwrap_or(Size::UNKNOWN)
+    }
+
+    /// `CostEstimator.EstimateCallCost`
+    /// (`staging/src/k8s.io/apiserver/pkg/cel/library/cost.go:112-410`): the
+    /// cost of the call itself, without its arguments, and the result size.
+    /// `None` when upstream returns nil. The authorizer and
+    /// `fieldSelector`/`labelSelector` cases are not ported: the DRA
+    /// environment does not declare those libraries, so such a selector never
+    /// reaches the cost estimate upstream.
+    fn estimate_call_cost(
+        &mut self,
+        call: &cel::common::ast::CallExpr,
+    ) -> Option<(Cost, Option<Size>)> {
+        let name = call.func_name.as_str();
+        let args = &call.args;
+        let target = call.target.as_deref();
+        let one = Some((Cost::fixed(1), None));
+        match name {
+            "isSorted" | "sum" | "max" | "min" | "indexOf" | "lastIndexOf" => {
+                let t = target?;
+                if let Ty::List(el) = self.ty(t) {
+                    // Charge 1 for comparing each element; strings and bytes
+                    // add the cost of traversing them.
+                    let mut el_cost = Cost::fixed(1);
+                    if matches!(*el, Ty::Str | Ty::Bytes) {
+                        el_cost = el_cost.add(self.element_size(t).times_factor(STRING_TRAVERSAL));
+                    }
+                    Some((self.size_or_unknown(t).times_cost(el_cost), None))
+                } else {
+                    // The target is a string (`indexOf` / `lastIndexOf`).
+                    Some((self.size_or_unknown(t).times_factor(STRING_TRAVERSAL), None))
+                }
+            }
+            "url" | "jsonpatch.escapeKey" if args.len() == 1 => {
+                let sz = self.size_or_unknown(&args[0]);
+                Some((sz.times_factor(STRING_TRAVERSAL), Some(sz)))
+            }
+            "lowerAscii" | "upperAscii" | "substring" | "trim" => {
+                let sz = self.size_or_unknown(target?);
+                Some((sz.times_factor(STRING_TRAVERSAL), Some(sz)))
+            }
+            "replace" if args.len() >= 2 => {
+                let sz = self.size_or_unknown(target?);
+                let to_replace = self.size_or_unknown(&args[0]);
+                let replace_with = self.size_or_unknown(&args[1]);
+                let mut count = Size::fixed(0);
+                let mut retained = Size::fixed(0);
+                // The longest replacement.
+                if to_replace.min == 0 {
+                    // Replacing "" surrounds every character with the replacement.
+                    count.max = sz.max.saturating_add(1);
+                    retained.max = sz.max;
+                } else if replace_with.max <= to_replace.min {
+                    count.max = 0;
+                    retained.max = sz.max;
+                } else {
+                    count.max = (sz.max as f64 / to_replace.min as f64).ceil() as u64;
+                }
+                // The shortest replacement.
+                if to_replace.max == 0 {
+                    count.min = sz.min.saturating_add(1);
+                    retained.min = sz.min;
+                } else if to_replace.max <= replace_with.min {
+                    count.min = 0;
+                    retained.min = sz.min;
+                } else {
+                    count.min = (sz.min as f64 / to_replace.max as f64).ceil() as u64;
+                }
+                let size = count.mul(replace_with).add(retained);
+                // The traversal plus the construction of the result.
+                Some((sz.times_factor(2.0 * STRING_TRAVERSAL), Some(size)))
+            }
+            "split" => {
+                let sz = self.size_or_unknown(target?);
+                let mut max = sz.max;
+                if args.len() > 1 {
+                    if let Expr::Literal(LiteralValue::Int(i)) = &args[1].expr {
+                        max = *i.inner() as u64;
+                    }
+                }
+                Some((
+                    sz.times_factor(2.0 * STRING_TRAVERSAL),
+                    Some(Size { min: 0, max }),
+                ))
+            }
+            "join" => {
+                let t = target?;
+                let list = self.size_or_unknown(t);
+                let mut sz = Size::fixed(0);
+                if matches!(self.ty(t), Ty::List(_)) {
+                    sz = list.mul(self.element_size(t));
+                }
+                if let Some(sep) = args.first() {
+                    let sep = self.size_or_unknown(sep);
+                    let seps = Size {
+                        min: list.min.saturating_sub(1),
+                        max: list.max.saturating_sub(1),
+                    };
+                    sz = sz.add(sep.mul(seps));
+                }
+                Some((sz.times_factor(STRING_TRAVERSAL), Some(sz)))
+            }
+            "find" | "findAll" if !args.is_empty() => {
+                let sz = self.size_or_unknown(target?);
+                // One is added to the string length so the product with an
+                // empty string is not 0.
+                let str_cost = sz.add(Size::fixed(1)).times_factor(STRING_TRAVERSAL);
+                let regex_cost = self
+                    .size_or_unknown(&args[0])
+                    .times_factor(REGEX_STRING_LENGTH);
+                Some((
+                    str_cost.mul(regex_cost),
+                    Some(Size {
+                        min: 0,
+                        max: sz.max,
+                    }),
+                ))
+            }
+            "cidr" | "isIP" | "isCIDR" if !args.is_empty() => {
+                let sz = self.size_or_unknown(&args[0]);
+                Some((sz.times_factor(STRING_TRAVERSAL), None))
+            }
+            // `cidr_ip` is the member form: a field access.
+            "ip" if target.is_some() => one,
+            "ip" if !args.is_empty() => {
+                let sz = self.size_or_unknown(&args[0]);
+                Some((sz.times_factor(STRING_TRAVERSAL), None))
+            }
+            "ip.isCanonical" if !args.is_empty() => {
+                let sz = self.size_or_unknown(&args[0]);
+                Some((sz.times_factor(2.0 * STRING_TRAVERSAL), None))
+            }
+            "masked"
+            | "prefixLength"
+            | "family"
+            | "isUnspecified"
+            | "isLoopback"
+            | "isLinkLocalMulticast"
+            | "isLinkLocalUnicast"
+            | "isGlobalUnicast" => one,
+            "containsIP" | "containsCIDR" if !args.is_empty() => {
+                // Comparing two byte lists of 4 or 16 bytes each.
+                let sz = Size { min: 4, max: 16 };
+                let mut c = sz.add(sz).times_factor(STRING_TRAVERSAL);
+                if name == "containsCIDR" {
+                    // Mask the base CIDR and compare the CIDR bits.
+                    c = c.add(sz.times_factor(STRING_TRAVERSAL)).add(Cost::fixed(1));
+                }
+                if self.ty(&args[0]) == Ty::Str {
+                    // The string must be parsed into the right type.
+                    c = c.add(
+                        self.size_or_unknown(&args[0])
+                            .times_factor(STRING_TRAVERSAL),
+                    );
+                }
+                Some((c, None))
+            }
+            "quantity" | "isQuantity" | "semver" | "isSemver" if !args.is_empty() => {
+                let sz = self.size_or_unknown(&args[0]);
+                Some((sz.times_factor(STRING_TRAVERSAL), None))
+            }
+            "validate" if !args.is_empty() => {
+                let sz = self.size_or_unknown(&args[0]);
+                Some((
+                    sz.times_factor(STRING_TRAVERSAL)
+                        .mul_factor_pub(MAX_NAME_FORMAT_REGEX_SIZE * REGEX_STRING_LENGTH),
+                    None,
+                ))
+            }
+            "format.named" => one,
+            "sign" | "asInteger" | "isInteger" | "asApproximateFloat" | "isGreaterThan"
+            | "isLessThan" | "compareTo" | "add" | "sub" | "major" | "minor" | "patch" => one,
+            "getScheme" | "getHostname" | "getHost" | "getPort" | "getEscapedPath" | "getQuery" => {
+                one
+            }
+            operators::EQUALS if args.len() == 2 => {
+                let (lt, rt) = (self.ty(&args[0]), self.ty(&args[1]));
+                if lt != rt {
+                    return None;
+                }
+                match lt {
+                    // O(1) equality checks.
+                    Ty::Quantity => one,
+                    Ty::Lib("net.IP" | "net.CIDR" | "kubernetes.Semver") => one,
+                    Ty::Lib("kubernetes.NamedFormat") => Some((
+                        Cost {
+                            min: 1,
+                            max: MAX_FORMAT_SIZE,
+                        }
+                        .mul_factor_pub(STRING_TRAVERSAL),
+                        None,
+                    )),
+                    Ty::Lib("kubernetes.URL") => {
+                        // Upstream reads the computed size of `rhs` for both
+                        // sides (cost.go:373-374).
+                        let size = self.compute_size(&args[1]).unwrap_or(Size::fixed(1));
+                        Some((
+                            Cost {
+                                min: 1,
+                                max: size.max,
+                            }
+                            .mul_factor_pub(STRING_TRAVERSAL),
+                            None,
+                        ))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// `coster.functionCost`: only the overloads that are priced by size are
     /// special-cased; everything else is `1 + the arguments`.
     fn function_cost(
@@ -1086,8 +1344,22 @@ impl<'a> Coster<'a> {
         let arg_sum = arg_costs.iter().fold(Cost::default(), |a, c| a.add(*c));
         let args = &call.args;
         let arg_ty = |i: usize, s: &Self| args.get(i).map(|a| s.ty(a)).unwrap_or(Ty::Dyn);
-        let target_ty = call.target.as_ref().map(|t| self.ty(t));
+        // A member call on `any` (an attribute value) resolves to the string
+        // overload, as cel-go's checker does for a dyn target.
+        let target_ty = call.target.as_ref().map(|t| self.ty(t)).map(|t| {
+            if t.is_unchecked() {
+                Ty::Str
+            } else {
+                t
+            }
+        });
         let is_str_or_bytes = |t: &Ty| matches!(t, Ty::Str | Ty::Bytes);
+
+        // `c.estimator.EstimateCallCost` is consulted before the built-in
+        // overload costs (cel-go `checker/cost.go:742-745`).
+        if let Some((cost, size)) = self.estimate_call_cost(call) {
+            return (cost.add(arg_sum), size);
+        }
 
         match name {
             operators::IN if args.len() == 2 && matches!(arg_ty(1, self), Ty::List(_)) => {
@@ -1298,5 +1570,60 @@ mod tests {
         // device.attributes has at most 32 domains.
         let c = cost("device.attributes.all(d, d == 'x')");
         assert!(c < CEL_SELECTOR_EXPRESSION_MAX_COST, "{c}");
+    }
+
+    /// `compile_test.go` `expectCost` table (`TestCEL`,
+    /// `staging/src/k8s.io/dynamic-resource-allocation/cel/compile_test.go:56-331`),
+    /// the compile-time estimate only.
+    #[test]
+    fn upstream_compile_test_expect_cost_table() {
+        let a = r#"device.attributes["dra.example.com"]"#;
+        let c = r#"device.capacity["dra.example.com"]"#;
+        let cases: Vec<(String, u64)> = vec![
+            (r#"device.attributes["no-such-domain"].noSuchAttr.isGreaterThan(quantity("0"))"#.into(), 6),
+            (r#""no-such-domain" in device.attributes"#.into(), 3),
+            (r#"device.driver == """#.into(), 2),
+            (r#"device.driver == "dra.example.com""#.into(), 4),
+            (format!("{a}.name"), 4),
+            (format!(r#"{a}["name"]"#), 4),
+            // `cel.bind` (want 15) is not costed: the parser has no bind macro, tracked in a follow-up issue.
+            (format!("{a}.name > 0"), 5),
+            (format!(r#"{a}.name == "fish""#), 5),
+            (format!(r#"{a}.name.isGreaterThan(semver("0.0.1"))"#), 6),
+            (format!(r#"{a}.name.isGreaterThan(semver("v0.0.1", true)) && isSemver("v1.0.0", true)"#), 7),
+            (format!(r#"{c}.name.isGreaterThan(quantity("1Ki"))"#), 6),
+            (format!(r#""name" in {c} && {c}.name.isGreaterThan(quantity("1Ki"))"#), 10),
+            (format!(r#"!("name" in {c}) || {c}.name.isGreaterThan(quantity("1Ki"))"#), 11),
+            (format!("{a}.a && {a}.b && {a}.c"), 12),
+            (r#"device.attributes.exists_one(x, x == "dra.example.com")"#.into(), 164),
+            (format!(r#"{a}.exists_one(x, x == "services")"#), 133),
+            (format!(r#"{a}.services.split("example").size() >= 2"#), 19),
+            (format!(r#"{a}.services.matches("[^a]?sym")"#), 18),
+            (r#"device.capacity.exists_one(x, x == "dra.example.com")"#.into(), 164),
+            (format!(r#"{c}.exists_one(x, x == "memory")"#), 133),
+            (
+                "[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(x, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(y, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(z, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(z2, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(z3, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(z4, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(z5, int('1'.find('[0-9]*')) < 100)))))))".into(),
+                85555551,
+            ),
+            ("device.allowMultipleAllocations == true".into(), 3),
+        ];
+        let mut bad = Vec::new();
+        for (x, want) in &cases {
+            let got = match compile_selector(x) {
+                SelectorCompilation::Ok { max_cost } => max_cost,
+                SelectorCompilation::Invalid(d) => panic!("{x}: {d}"),
+            };
+            if got != *want {
+                bad.push(format!("{x}: want {want}, got {got}"));
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
+    /// `_==_` on `Quantity` is O(1) (`cost.go:359-361`): two `quantity('x')`
+    /// at 1 each plus 1, not a string-size product.
+    #[test]
+    fn quantity_equality_is_constant_cost() {
+        assert_eq!(cost("quantity('1') == quantity('2')"), 3);
     }
 }
