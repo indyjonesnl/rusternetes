@@ -23,7 +23,7 @@ use rusternetes_storage::Storage;
 use serde_json::Value;
 
 use super::policy_dispatch::ParamScope;
-use super::policy_mutating::{NamespaceObjects, TypeConverters};
+use super::policy_mutating::{NamespaceObjects, ObjectDefaulter, TypeConverters};
 use super::policy_source::{RestMapper, RestMapping};
 
 /// `meta.RESTMapper` over the resources this server serves.
@@ -92,6 +92,14 @@ impl TypeConverters for RegistryTypeConverters {
     }
 }
 
+/// `ObjectInterfaces.GetObjectDefaulter()` over the registry's per-kind
+/// defaulting.
+pub struct SchemeObjectDefaulter;
+
+impl ObjectDefaulter for SchemeObjectDefaulter {
+    fn default_object(&self, _object: &mut Value) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +166,43 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+    }
+
+    #[test]
+    fn defaulter_defaults_a_deployment_after_patch() {
+        // Scheme.Default runs SetDefaults_Deployment and the pod template's.
+        let mut o = serde_json::json!({
+            "apiVersion": "apps/v1", "kind": "Deployment",
+            "metadata": {"name": "d"},
+            "spec": {"selector": {"matchLabels": {"a": "b"}},
+                "template": {"metadata": {"labels": {"a": "b"}},
+                    "spec": {"containers": [{"name": "c", "image": "i", "customField": true}]}}}
+        });
+        SchemeObjectDefaulter.default_object(&mut o);
+        assert_eq!(o["spec"]["strategy"]["type"], "RollingUpdate");
+        assert_eq!(o["spec"]["template"]["spec"]["restartPolicy"], "Always");
+        // Fields the typed form does not know survive.
+        assert_eq!(
+            o["spec"]["template"]["spec"]["containers"][0]["customField"],
+            true
+        );
+    }
+
+    #[test]
+    fn defaulter_leaves_set_values_and_unknown_kinds_alone() {
+        let mut o = serde_json::json!({
+            "apiVersion": "example.com/v1", "kind": "Widget", "spec": {"a": 1}
+        });
+        let before = o.clone();
+        SchemeObjectDefaulter.default_object(&mut o);
+        assert_eq!(o, before);
+        let mut p = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod", "metadata": {"name": "p"},
+            "spec": {"restartPolicy": "Never", "containers": [{"name": "c", "image": "i"}]}
+        });
+        SchemeObjectDefaulter.default_object(&mut p);
+        assert_eq!(p["spec"]["restartPolicy"], "Never");
+        assert_eq!(p["spec"]["enableServiceLinks"], true);
     }
 
     #[test]
