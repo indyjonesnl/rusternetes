@@ -7,6 +7,7 @@ static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod advanced;
 mod data_plane;
+mod diagnosis;
 #[allow(dead_code)]
 mod framework;
 #[allow(dead_code)]
