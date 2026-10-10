@@ -240,6 +240,7 @@ mod protobuf_pvc_empty_storage_class_test;
 mod protobuf_roundtrip_fuzz;
 mod protobuf_schema_parity_upstream;
 mod protobuf_test;
+mod protobuf_wire_decode_upstream;
 mod proxy_method_routing_test;
 mod proxy_node_name_port_test;
 mod proxy_test;
