@@ -41,6 +41,10 @@ struct Fake {
     extra_caps: Vec<controller_service_capability::rpc::Type>,
     /// A driver that ignores `volume_content_source` (it must echo it).
     drop_content_source: bool,
+    /// Report `VOLUME_ACCESSIBILITY_CONSTRAINTS`.
+    topology: bool,
+    /// `Volume.accessible_topology` of the CreateVolume response.
+    accessible_topology: Vec<Topology>,
 }
 
 impl Fake {
@@ -52,7 +56,16 @@ impl Fake {
             delete_code: None,
             extra_caps: vec![],
             drop_content_source: false,
+            topology: false,
+            accessible_topology: vec![],
         }
+    }
+
+    /// A driver that opts in to `VOLUME_ACCESSIBILITY_CONSTRAINTS`.
+    fn with_topology() -> Self {
+        let mut f = Self::new();
+        f.topology = true;
+        f
     }
 
     /// A driver that can restore snapshots and clone volumes.
@@ -72,14 +85,19 @@ impl Identity for Fake {
         &self,
         _r: Request<GetPluginCapabilitiesRequest>,
     ) -> Result<Response<GetPluginCapabilitiesResponse>, Status> {
+        let mut types = vec![plugin_capability::service::Type::ControllerService];
+        if self.topology {
+            types.push(plugin_capability::service::Type::VolumeAccessibilityConstraints);
+        }
         Ok(Response::new(GetPluginCapabilitiesResponse {
-            capabilities: vec![PluginCapability {
-                r#type: Some(plugin_capability::Type::Service(
-                    plugin_capability::Service {
-                        r#type: plugin_capability::service::Type::ControllerService as i32,
-                    },
-                )),
-            }],
+            capabilities: types
+                .into_iter()
+                .map(|t| PluginCapability {
+                    r#type: Some(plugin_capability::Type::Service(
+                        plugin_capability::Service { r#type: t as i32 },
+                    )),
+                })
+                .collect(),
         }))
     }
 }
@@ -118,12 +136,12 @@ impl Controller for Fake {
                 capacity_bytes: self.capacity.unwrap_or(required),
                 volume_id: "vol-1".into(),
                 volume_context: [("shape".to_string(), "round".to_string())].into(),
+                accessible_topology: self.accessible_topology.clone(),
                 content_source: if self.drop_content_source {
                     None
                 } else {
                     req.volume_content_source.clone()
                 },
-                ..Default::default()
             }),
         }))
     }
@@ -1589,4 +1607,183 @@ async fn a_volume_attributes_class_of_another_driver_is_refused() {
         "got: {err}"
     );
     assert!(rec.lock().unwrap().create_volume.is_empty());
+}
+
+// ---- topology (#3007): external-provisioner pkg/controller/topology.go -------
+
+use rusternetes_common::resources::csi::{CSINode, CSINodeDriver, CSINodeSpec};
+use rusternetes_common::resources::Node;
+
+const SELECTED_NODE: &str = "volume.kubernetes.io/selected-node";
+
+fn zone(v: &str) -> Topology {
+    Topology {
+        segments: [("topology.example.com/zone".to_string(), v.to_string())].into(),
+    }
+}
+
+async fn put_node(storage: &MemoryStorage, name: &str, zone: Option<&str>, with_csi_node: bool) {
+    let mut n = Node::new(name);
+    if let Some(z) = zone {
+        n.metadata.labels = Some([("topology.example.com/zone".to_string(), z.to_string())].into());
+    }
+    storage
+        .create(&build_key("nodes", None, name), &n)
+        .await
+        .unwrap();
+    if with_csi_node {
+        let cn = CSINode {
+            type_meta: TypeMeta {
+                kind: "CSINode".into(),
+                api_version: "storage.k8s.io/v1".into(),
+            },
+            metadata: ObjectMeta::new(name),
+            spec: CSINodeSpec {
+                drivers: vec![CSINodeDriver {
+                    name: DRIVER.into(),
+                    node_id: name.into(),
+                    topology_keys: Some(vec!["topology.example.com/zone".into()]),
+                    allocatable: None,
+                }],
+            },
+        };
+        storage
+            .create(&build_key("csinodes", None, name), &cn)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn immediate_binding_passes_the_aggregated_cluster_topology() {
+    let (storage, p, rec, _d) = env(Fake::with_topology(), storage_class(None)).await;
+    put_node(&storage, "n1", Some("a"), true).await;
+    put_node(&storage, "n2", Some("b"), true).await;
+    // A node without the driver registered must not be reported.
+    put_node(&storage, "n3", Some("c"), false).await;
+    p.sync_claim(&claim(&[(ANN, DRIVER)])).await.unwrap();
+
+    let reqs = rec.lock().unwrap().create_volume.clone();
+    assert_eq!(reqs.len(), 1);
+    let ar = reqs[0]
+        .accessibility_requirements
+        .as_ref()
+        .expect("topology");
+    assert_eq!(ar.requisite, vec![zone("a"), zone("b")]);
+    // Immediate binding: statefulset-spreading rotation of the sorted terms.
+    assert_eq!(ar.preferred.len(), 2);
+}
+
+#[tokio::test]
+async fn a_driver_without_the_topology_capability_gets_no_requirements() {
+    let (storage, p, rec, _d) = env(Fake::new(), storage_class(None)).await;
+    put_node(&storage, "n1", Some("a"), true).await;
+    p.sync_claim(&claim(&[(ANN, DRIVER)])).await.unwrap();
+    let reqs = rec.lock().unwrap().create_volume.clone();
+    assert!(reqs[0].accessibility_requirements.is_none());
+    assert!(pv(&storage).await.unwrap().spec.node_affinity.is_none());
+}
+
+#[tokio::test]
+async fn delayed_binding_prefers_the_selected_nodes_topology() {
+    let (storage, p, rec, _d) = env(
+        Fake::with_topology(),
+        storage_class(Some(VolumeBindingMode::WaitForFirstConsumer)),
+    )
+    .await;
+    put_node(&storage, "n1", Some("a"), true).await;
+    put_node(&storage, "n2", Some("b"), true).await;
+    p.sync_claim(&claim(&[(ANN, DRIVER), (SELECTED_NODE, "n2")]))
+        .await
+        .unwrap();
+    let reqs = rec.lock().unwrap().create_volume.clone();
+    let ar = reqs[0]
+        .accessibility_requirements
+        .as_ref()
+        .expect("topology");
+    assert_eq!(ar.requisite, vec![zone("a"), zone("b")]);
+    assert_eq!(ar.preferred, vec![zone("b"), zone("a")]);
+}
+
+#[tokio::test]
+async fn the_pv_gets_node_affinity_from_the_accessible_topology() {
+    let mut fake = Fake::with_topology();
+    fake.accessible_topology = vec![zone("a"), zone("b")];
+    let (storage, p, _rec, _d) = env(fake, storage_class(None)).await;
+    put_node(&storage, "n1", Some("a"), true).await;
+    p.sync_claim(&claim(&[(ANN, DRIVER)])).await.unwrap();
+    let terms = pv(&storage)
+        .await
+        .unwrap()
+        .spec
+        .node_affinity
+        .expect("nodeAffinity")
+        .required
+        .unwrap()
+        .node_selector_terms;
+    assert_eq!(terms.len(), 2);
+    let e = &terms[1].match_expressions.as_ref().unwrap()[0];
+    assert_eq!(e.key, "topology.example.com/zone");
+    assert_eq!(e.operator, "In");
+    assert_eq!(e.values.as_deref(), Some(&["b".to_string()][..]));
+}
+
+#[tokio::test]
+async fn a_selected_node_without_a_csinode_reschedules() {
+    let (storage, p, rec, _d) = env(
+        Fake::with_topology(),
+        storage_class(Some(VolumeBindingMode::WaitForFirstConsumer)),
+    )
+    .await;
+    let c = claim(&[(ANN, DRIVER), (SELECTED_NODE, "gone")]);
+    storage
+        .create(
+            &build_key("persistentvolumeclaims", Some("ns1"), "data"),
+            &c,
+        )
+        .await
+        .unwrap();
+    let _ = p.sync_claim(&c).await;
+    // `ProvisioningReschedule`: no RPC, selectedNode removed, no PV.
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+    let after: PersistentVolumeClaim = storage
+        .get(&build_key("persistentvolumeclaims", Some("ns1"), "data"))
+        .await
+        .unwrap();
+    assert!(!after
+        .metadata
+        .annotations
+        .unwrap_or_default()
+        .contains_key(SELECTED_NODE));
+    assert!(pv(&storage).await.is_none());
+}
+
+#[tokio::test]
+async fn resource_exhausted_with_a_selected_node_reschedules() {
+    let mut fake = Fake::with_topology();
+    fake.create_code = Some(tonic::Code::ResourceExhausted);
+    let (storage, p, _rec, _d) = env(
+        fake,
+        storage_class(Some(VolumeBindingMode::WaitForFirstConsumer)),
+    )
+    .await;
+    put_node(&storage, "n1", Some("a"), true).await;
+    let c = claim(&[(ANN, DRIVER), (SELECTED_NODE, "n1")]);
+    storage
+        .create(
+            &build_key("persistentvolumeclaims", Some("ns1"), "data"),
+            &c,
+        )
+        .await
+        .unwrap();
+    let _ = p.sync_claim(&c).await;
+    let after: PersistentVolumeClaim = storage
+        .get(&build_key("persistentvolumeclaims", Some("ns1"), "data"))
+        .await
+        .unwrap();
+    assert!(!after
+        .metadata
+        .annotations
+        .unwrap_or_default()
+        .contains_key(SELECTED_NODE));
 }

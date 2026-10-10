@@ -91,6 +91,17 @@ struct Args {
     #[arg(long, default_value = "5m", value_parser = parse_clean_up_period)]
     csi_retry_interval_max: std::time::Duration,
 
+    /// `--strict-topology` of external-provisioner (csi-provisioner.go:91):
+    /// late binding passes only the selected node's topology to CreateVolume.
+    #[arg(long)]
+    csi_strict_topology: bool,
+
+    /// `--immediate-topology` of external-provisioner (csi-provisioner.go:92,
+    /// default true): immediate binding passes the aggregated cluster
+    /// topology, or none when disabled.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    csi_immediate_topology: bool,
+
     /// Storage backend: "etcd" or "sqlite"
     #[arg(long, default_value = "etcd")]
     storage_backend: String,
@@ -769,7 +780,9 @@ async fn main() -> Result<()> {
             .with_extra_create_metadata(args.csi_extra_create_metadata)
             .with_controller_publish_read_only(args.csi_controller_publish_readonly)
             .with_prevent_volume_mode_conversion(args.csi_prevent_volume_mode_conversion)
-            .with_retry_interval_max(args.csi_retry_interval_max),
+            .with_retry_interval_max(args.csi_retry_interval_max)
+            .with_strict_topology(args.csi_strict_topology)
+            .with_immediate_topology(args.csi_immediate_topology),
         );
         spawn_controller!("CSI provisioner", leader_elector, {
             let controller = provisioner.clone();

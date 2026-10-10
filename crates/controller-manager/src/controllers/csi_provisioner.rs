@@ -33,6 +33,9 @@
 //! `markForSlowRetry`, csi-lib-utils `slowset`). NOT ported here: CSI
 //! migration of in-tree PVs (`IsPVMigratable` / `TranslateInTreePVToCSI`).
 
+use super::csi_topology::{
+    generate_volume_node_affinity, TopologyError, TopologyInputs, TopologyStore,
+};
 use anyhow::{anyhow, Context, Result};
 use rusternetes_common::quantity::{Format, Quantity};
 use rusternetes_common::resources::csi::{VolumeAttachment, VolumeAttributesClass};
@@ -642,6 +645,12 @@ pub struct CsiProvisioner<S: Storage> {
     retry_interval_max: Duration,
     /// `slowSet`, keyed by claim UID.
     slow_set: Mutex<HashMap<String, SlowEntry>>,
+    /// `--strict-topology` (csi-provisioner.go:91, default false).
+    strict_topology: bool,
+    /// `--immediate-topology` (csi-provisioner.go:92, default true).
+    immediate_topology: bool,
+    /// `pvcNodeStore` (cache.go `InMemoryStore`), keyed by PVC UID.
+    pvc_node_store: TopologyStore,
     capabilities: tokio::sync::OnceCell<DriverCapabilities>,
 }
 
@@ -675,8 +684,24 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             unsaved: Mutex::new(HashMap::new()),
             retry_interval_max: RETRY_INTERVAL_MAX,
             slow_set: Mutex::new(HashMap::new()),
+            strict_topology: false,
+            immediate_topology: true,
+            pvc_node_store: TopologyStore::new(),
             capabilities: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// `--strict-topology`: pass only the selected node's topology.
+    pub fn with_strict_topology(mut self, on: bool) -> Self {
+        self.strict_topology = on;
+        self
+    }
+
+    /// `--immediate-topology`: with immediate binding, pass the aggregated
+    /// cluster topology (true, the default) or none.
+    pub fn with_immediate_topology(mut self, on: bool) -> Self {
+        self.immediate_topology = on;
+        self
     }
 
     /// `--default-fstype`.
@@ -1464,6 +1489,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
         &self,
         claim: &PersistentVolumeClaim,
         sc: &StorageClass,
+        selected_node: &str,
         pv_name: &str,
     ) -> Outcome<Prepared> {
         let fin = |e: String| (ProvisioningState::Finished, Failure::Error(anyhow!(e)));
@@ -1670,6 +1696,35 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
                     .await
                     .map_err(|e| (ProvisioningState::NoChange, Failure::Error(e)))?;
             }
+        }
+        // `if p.supportsTopology()` (controller.go:720-739). Upstream runs this
+        // before resolving the secrets; both failures are NoChange here.
+        if caps.supports_topology() {
+            let requirements = TopologyInputs {
+                storage: &*self.storage,
+                store: &self.pvc_node_store,
+                driver_name: &self.driver_name,
+                pvc_uid: &claim.metadata.uid,
+                pvc_name: &claim.metadata.name,
+                allowed_topologies: sc.allowed_topologies.as_deref().unwrap_or_default(),
+                selected_node_name: selected_node,
+                strict_topology: self.strict_topology,
+                immediate_topology: self.immediate_topology,
+            }
+            .generate_accessibility_requirements()
+            .await
+            .map_err(|e| match e {
+                // "The node or CSINode object can't be found, ask the
+                // scheduler for a reschedule"
+                TopologyError::NotFound(m) => {
+                    (ProvisioningState::Reschedule, Failure::Error(anyhow!(m)))
+                }
+                TopologyError::Other(m) => (
+                    ProvisioningState::NoChange,
+                    Failure::Error(anyhow!("error generating accessibility requirements: {m}")),
+                ),
+            })?;
+            req.accessibility_requirements = requirements;
         }
         Ok(Prepared {
             fs_type,
@@ -2102,7 +2157,9 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             node_expand_secret_ref,
             deletion_secret,
             modify_secret,
-        } = self.prepare_provision(claim, sc, pv_name).await?;
+        } = self
+            .prepare_provision(claim, sc, selected_node, pv_name)
+            .await?;
         let vol_size_bytes = req.capacity_range.as_ref().map_or(0, |c| c.required_bytes);
         let vol_caps = req.volume_capabilities.clone();
 
@@ -2120,6 +2177,15 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
                 let may_reschedule = supports_topology && !selected_node.is_empty();
                 let state = e.provisioning_state(may_reschedule);
                 debug!("CreateVolume failed, may reschedule = {may_reschedule} => state = {state:?}: {e}");
+                // "Delete the entry in in memory cache if the error is final"
+                if supports_topology
+                    && matches!(
+                        state,
+                        ProvisioningState::Finished | ProvisioningState::Reschedule
+                    )
+                {
+                    self.pvc_node_store.delete(&claim.metadata.uid);
+                }
                 return Err((state, Failure::Error(anyhow::Error::new(e))));
             }
         };
@@ -2230,6 +2296,13 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
                     .volume_attributes_class_name
                     .clone()
                     .filter(|v| !v.is_empty()),
+                // `pv.Spec.NodeAffinity = GenerateVolumeNodeAffinity(
+                // rep.Volume.AccessibleTopology)` (controller.go:1003-1005).
+                node_affinity: if supports_topology {
+                    generate_volume_node_affinity(&vol.accessible_topology)
+                } else {
+                    None
+                },
                 ..Default::default()
             },
             status: Some(PersistentVolumeStatus {
@@ -2243,6 +2316,11 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             "successfully created PV {} for PVC {} and csi volume name {}",
             pv.metadata.name, claim.metadata.name, vol.volume_id
         );
+
+        // "Remove entry from the in memory cache" (:1039-:1041).
+        if supports_topology {
+            self.pvc_node_store.delete(&claim.metadata.uid);
+        }
 
         // "Remove snapshot finalizer if this PVC was provisioned from a
         // snapshot" (:1042-:1049); a failure doesn't fail provisioning.
