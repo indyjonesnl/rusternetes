@@ -142,7 +142,7 @@ async fn orphaning_a_replicaset_lets_the_deployment_go() {
     assert!(
         rs["metadata"]["ownerReferences"]
             .as_array()
-            .map_or(true, |a| a.is_empty()),
+            .is_none_or(|a| a.is_empty()),
         "the RS is orphaned: {rs}"
     );
 }
@@ -259,7 +259,7 @@ async fn orphaning_survives_concurrent_status_writers() {
         assert!(
             rs["metadata"]["ownerReferences"]
                 .as_array()
-                .map_or(true, |a| a.is_empty()),
+                .is_none_or(|a| a.is_empty()),
             "round {round}: RS still owned: {rs}"
         );
     }
