@@ -165,6 +165,22 @@ pub async fn get_openapi_spec_path(
     // Paths are like "api/v1" or "apis/apps/v1" or "apis/example.com/v1"
     let (requested_group, requested_version) = parse_gv_path(&gv_path);
 
+    // kube-openapi's handler3 serves one document per group-version whose
+    // `components.schemas` hold the generated definitions of its kinds
+    // (staging/src/k8s.io/kube-openapi/pkg/handler3/handler.go; the documents
+    // are the kube-openapi builder output published at
+    // api/openapi-spec/v3/apis__<group>__<version>_openapi.json).
+    if let Some(upstream) = upstream_v3_schemas(&requested_group, &requested_version) {
+        if let Some(schemas) = spec_json
+            .pointer_mut("/components/schemas")
+            .and_then(|v| v.as_object_mut())
+        {
+            for (name, schema) in upstream {
+                schemas.insert(name.clone(), schema.clone());
+            }
+        }
+    }
+
     // Query storage for CRDs matching this group/version and inject their schemas.
     if let Ok(crds) = state
         .storage
@@ -355,6 +371,46 @@ pub async fn get_openapi_spec_path(
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(json_bytes))
         .unwrap()
+}
+
+/// Upstream's generated `components.schemas` for a group-version, vendored
+/// from release-1.35 `api/openapi-spec/v3` by
+/// `scripts/sync-upstream-openapi.sh`. Only group-versions listed here are
+/// served from upstream definitions; the rest still use the stub schemas.
+fn upstream_v3_schemas(
+    group: &str,
+    version: &str,
+) -> Option<&'static serde_json::Map<String, serde_json::Value>> {
+    use std::sync::OnceLock;
+    static APPS_V1: OnceLock<serde_json::Map<String, serde_json::Value>> = OnceLock::new();
+    static BATCH_V1: OnceLock<serde_json::Map<String, serde_json::Value>> = OnceLock::new();
+    let (cell, src) = match (group, version) {
+        ("apps", "v1") => (
+            &APPS_V1,
+            include_str!("../../openapi/upstream/v1.35/apps__v1.schemas.json"),
+        ),
+        ("batch", "v1") => (
+            &BATCH_V1,
+            include_str!("../../openapi/upstream/v1.35/batch__v1.schemas.json"),
+        ),
+        _ => return None,
+    };
+    Some(cell.get_or_init(|| serde_json::from_str(src).unwrap_or_default()))
+}
+
+/// Upstream v2 (swagger) definitions served on top of the built-in stubs:
+/// `apps/v1 ControllerRevision` and the `autoscaling/v1 Scale` returned by
+/// the apps scale subresources, with their transitive `$ref` closure
+/// (release-1.35 `api/openapi-spec/swagger.json`).
+fn upstream_v2_extra_definitions() -> &'static serde_json::Map<String, serde_json::Value> {
+    use std::sync::OnceLock;
+    static DEFS: OnceLock<serde_json::Map<String, serde_json::Value>> = OnceLock::new();
+    DEFS.get_or_init(|| {
+        serde_json::from_str(include_str!(
+            "../../openapi/upstream/v1.35/v2_extra.definitions.json"
+        ))
+        .unwrap_or_default()
+    })
 }
 
 /// Parse the group and version from an OpenAPI v3 path.
@@ -691,6 +747,13 @@ pub fn build_swagger_spec_for_crds(crds: &[serde_json::Value]) -> serde_json::Va
     //          staging/src/k8s.io/api/core/v1/types_swagger_doc_generated.go
     for (key, def) in core_v1_builtin_definitions() {
         definitions.insert(key, def);
+    }
+    // Real upstream definitions for kinds the stubs do not cover; never
+    // replace an existing stub (`ObjectMeta` and friends).
+    for (key, def) in upstream_v2_extra_definitions() {
+        definitions
+            .entry(key.clone())
+            .or_insert_with(|| def.clone());
     }
 
     serde_json::json!({
