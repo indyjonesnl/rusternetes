@@ -1,4 +1,5 @@
 pub mod certificates;
+pub mod config;
 pub mod pod_security_api;
 pub mod pod_security_controller;
 pub mod pod_security_namespace;
@@ -737,18 +738,14 @@ impl PodSecurityExemptions {
     /// its inline `configuration` (a `PodSecurityConfiguration`). No such
     /// entry means no exemptions (the plugin's defaults,
     /// admission/api/v1/defaults.go).
-    pub fn from_admission_configuration(yaml: &str) -> Result<Self, String> {
-        let doc: serde_json::Value = serde_yaml::from_str(yaml).map_err(|e| e.to_string())?;
-        let Some(cfg) = doc
-            .get("plugins")
-            .and_then(|p| p.as_array())
-            .into_iter()
-            .flatten()
-            .find(|p| p.get("name").and_then(|n| n.as_str()) == Some("PodSecurity"))
-            .and_then(|p| p.get("configuration"))
-        else {
+    pub fn from_admission_configuration(
+        yaml: &str,
+        config_file: &std::path::Path,
+    ) -> Result<Self, String> {
+        let Some(text) = config::plugin_configuration_for(yaml, config_file, "PodSecurity")? else {
             return Ok(Self::default());
         };
+        let cfg: serde_json::Value = serde_yaml::from_str(&text).map_err(|e| e.to_string())?;
         match cfg.get("exemptions") {
             Some(e) => serde_json::from_value(e.clone()).map_err(|e| e.to_string()),
             None => Ok(Self::default()),
@@ -1666,6 +1663,39 @@ mod tests {
             .expect_err("other runtimeClass still enforced");
     }
 
+    /// Upstream `GetAdmissionPluginConfigurationFor`
+    /// (apiserver/pkg/admission/config.go): a plugin entry with `path`
+    /// reads the file, relative to the config file's directory.
+    #[test]
+    fn psa_exemptions_from_plugin_path_relative_toconfig_file() {
+        let dir = std::env::temp_dir().join(format!("psa-path-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("psa.yaml"),
+            "apiVersion: pod-security.admission.config.k8s.io/v1\nkind: PodSecurityConfiguration\nexemptions:\n  usernames: [\"u\"]\n",
+        )
+        .unwrap();
+        let yaml = "apiVersion: apiserver.config.k8s.io/v1\nkind: AdmissionConfiguration\nplugins:\n- name: PodSecurity\n  path: psa.yaml\n";
+        let e = PodSecurityExemptions::from_admission_configuration(yaml, &dir.join("adm.yaml"))
+            .unwrap();
+        assert_eq!(e.usernames, vec!["u"]);
+        // Inline `configuration` wins over `path` (config.go:127-135).
+        let both =
+            format!("{yaml}  configuration:\n    exemptions:\n      usernames: [\"inline\"]\n");
+        let e = PodSecurityExemptions::from_admission_configuration(&both, &dir.join("adm.yaml"))
+            .unwrap();
+        assert_eq!(e.usernames, vec!["inline"]);
+        // An unreadable path is an error naming it.
+        let missing = yaml.replace("psa.yaml", "nope.yaml");
+        let err =
+            PodSecurityExemptions::from_admission_configuration(&missing, &dir.join("adm.yaml"))
+                .unwrap_err();
+        assert!(
+            err.contains("Couldn't open admission plugin configuration"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn psa_exemptions_parse_from_admission_configuration() {
         let yaml = r#"
@@ -1683,12 +1713,20 @@ plugins:
       namespaces: ["n1", "n2"]
       runtimeClasses: ["rc"]
 "#;
-        let e = PodSecurityExemptions::from_admission_configuration(yaml).unwrap();
+        let e = PodSecurityExemptions::from_admission_configuration(
+            yaml,
+            std::path::Path::new("c.yaml"),
+        )
+        .unwrap();
         assert_eq!(e.usernames, vec!["u"]);
         assert_eq!(e.namespaces, vec!["n1", "n2"]);
         assert_eq!(e.runtime_classes, vec!["rc"]);
         assert_eq!(
-            PodSecurityExemptions::from_admission_configuration("plugins: []").unwrap(),
+            PodSecurityExemptions::from_admission_configuration(
+                "plugins: []",
+                std::path::Path::new("c.yaml")
+            )
+            .unwrap(),
             PodSecurityExemptions::default()
         );
     }

@@ -75,21 +75,17 @@ pub fn load_configuration(yaml: &str) -> Result<Vec<LimitedResource>, String> {
 }
 
 /// The `ResourceQuota` entry of an `AdmissionConfiguration` document
-/// (`--admission-control-config-file`), its inline `configuration`. No such
+/// (`--admission-control-config-file`), its inline `configuration` or the
+/// file named by its `path`. No such
 /// entry means nothing is limited (the plugin's default configuration).
-pub fn from_admission_configuration(yaml: &str) -> Result<Vec<LimitedResource>, String> {
-    let doc: serde_json::Value = serde_yaml::from_str(yaml).map_err(|e| e.to_string())?;
-    let Some(cfg) = doc
-        .get("plugins")
-        .and_then(|p| p.as_array())
-        .into_iter()
-        .flatten()
-        .find(|p| p.get("name").and_then(|n| n.as_str()) == Some("ResourceQuota"))
-        .and_then(|p| p.get("configuration"))
-    else {
-        return Ok(Vec::new());
-    };
-    load_configuration(&serde_yaml::to_string(cfg).map_err(|e| e.to_string())?)
+pub fn from_admission_configuration(
+    yaml: &str,
+    config_file: &std::path::Path,
+) -> Result<Vec<LimitedResource>, String> {
+    match crate::admission::config::plugin_configuration_for(yaml, config_file, "ResourceQuota")? {
+        Some(cfg) => load_configuration(&cfg),
+        None => Ok(Vec::new()),
+    }
 }
 
 static CONFIGURED: std::sync::OnceLock<Vec<LimitedResource>> = std::sync::OnceLock::new();

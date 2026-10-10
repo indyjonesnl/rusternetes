@@ -1398,11 +1398,35 @@ fn admission_configuration_plugin_entry() {
             .collect::<String>()
     );
     assert_eq!(
-        from_admission_configuration(&doc).unwrap(),
+        from_admission_configuration(&doc, std::path::Path::new("c.yaml")).unwrap(),
         expected_config()
     );
     // No entry: nothing is limited.
     let none =
         "apiVersion: apiserver.config.k8s.io/v1\nkind: AdmissionConfiguration\nplugins: []\n";
-    assert_eq!(from_admission_configuration(none).unwrap(), vec![]);
+    assert_eq!(
+        from_admission_configuration(none, std::path::Path::new("c.yaml")).unwrap(),
+        vec![]
+    );
+}
+
+/// Upstream `GetAdmissionPluginConfigurationFor`
+/// (apiserver/pkg/admission/config.go): `path` is read relative to the
+/// config file's directory; inline `configuration` takes precedence.
+#[test]
+fn admission_configuration_plugin_path() {
+    let dir = std::env::temp_dir().join(format!("rq-path-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("rq.yaml"), V1_CONFIG).unwrap();
+    let doc = "apiVersion: apiserver.config.k8s.io/v1\nkind: AdmissionConfiguration\nplugins:\n- name: ResourceQuota\n  path: rq.yaml\n";
+    assert_eq!(
+        from_admission_configuration(doc, &dir.join("adm.yaml")).unwrap(),
+        expected_config()
+    );
+    let missing = doc.replace("rq.yaml", "nope.yaml");
+    let err = from_admission_configuration(&missing, &dir.join("adm.yaml")).unwrap_err();
+    assert!(
+        err.contains("Couldn't open admission plugin configuration"),
+        "{err}"
+    );
 }
