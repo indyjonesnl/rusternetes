@@ -716,13 +716,10 @@ impl Admission<'_> {
     /// after `SetIsReinvoke`, and each plugin decides from its own
     /// reinvocation context what to rerun.
     ///
-    /// Deviation: the mutating webhooks run on the first pass only. The
-    /// webhook manager keeps its own reinvocation state (one second round
-    /// among IfNeeded webhooks inside a single call) instead of a
-    /// `webhookReinvokeContext` in the shared context, so a webhook is not
-    /// rerun because a policy or in-tree plugin changed the object after it
-    /// (webhook/mutating/dispatcher.go:115-119). Tracked as a follow-up of
-    /// #3014.
+    /// The mutating webhooks keep their `webhookReinvokeContext` in the
+    /// shared context (webhook/mutating/dispatcher.go:106-121), so an
+    /// `IfNeeded` webhook is rerun on the second pass when a policy or
+    /// in-tree plugin changed the object after it (#3041).
     pub async fn admit<T: Object>(&self, op: Operation, obj: T, old: Option<&T>) -> Result<T> {
         use crate::admission::policy_mutating::ReinvocationContext;
         let reinvocation = std::sync::Arc::new(ReinvocationContext::new(false));
@@ -749,15 +746,15 @@ impl Admission<'_> {
         let obj = self
             .admit_mutating_policy(op, obj, old, reinvocation)
             .await?;
-        if reinvocation.is_reinvoke() {
-            return Ok(obj);
-        }
         let name = obj.metadata().name.clone();
         let before_webhooks = to_value(&obj)?;
-        let (response, mutated) = self
+        // dispatcher.go:106-113: this plugin's context lives in the shared
+        // reinvocation context, so it survives into the second pass.
+        let mut webhook_ctx = reinvocation.take_webhook_context();
+        let result = self
             .state
             .webhook_manager
-            .run_mutating_webhooks_with_dryrun(
+            .run_mutating_webhooks_pass(
                 op,
                 self.kind,
                 &self.request_resource(),
@@ -767,26 +764,41 @@ impl Admission<'_> {
                 old.map(to_value).transpose()?,
                 &self.user_info(),
                 self.dry_run,
+                reinvocation.is_reinvoke(),
+                &mut webhook_ctx,
             )
-            .await?;
+            .await;
+        let (response, mutated, changed) = match result {
+            Ok(r) => r,
+            Err(e) => {
+                reinvocation.restore_webhook_context(webhook_ctx);
+                return Err(e);
+            }
+        };
+        if changed {
+            // dispatcher.go:197: `reinvokeCtx.SetShouldReinvoke()`.
+            reinvocation.set_should_reinvoke();
+        }
         if let AdmissionResponse::Deny(reason) = &response {
+            reinvocation.restore_webhook_context(webhook_ctx);
             return Err(denied(reason));
         }
-        match mutated {
-            Some(value) => {
-                // webhook/mutating/dispatcher.go:192-196: a webhook that
-                // changed the object asks for reinvocation.
-                if value != before_webhooks {
-                    reinvocation.set_should_reinvoke();
-                }
-                serde_json::from_value(value).map_err(|e| {
-                    Error::Internal(format!(
-                        "failed to decode the object mutated by admission: {e}"
-                    ))
-                })
-            }
+        let decoded = match mutated {
+            Some(value) => serde_json::from_value(value).map_err(|e| {
+                Error::Internal(format!(
+                    "failed to decode the object mutated by admission: {e}"
+                ))
+            }),
             None => Ok(obj),
+        };
+        // The next pass compares the typed object (what the plugins hand on),
+        // not the raw webhook output, against the last webhook output: a
+        // serde round trip that normalises a field is not a mutation.
+        if let Ok(typed) = &decoded {
+            webhook_ctx.set_last_webhook_invocation_output(Some(to_value(typed)?));
         }
+        reinvocation.restore_webhook_context(webhook_ctx);
+        decoded
     }
 
     /// The validating plugins: `ValidationInterface.Validate`. `obj` is `None`

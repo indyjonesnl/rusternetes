@@ -56,6 +56,10 @@ pub struct ReinvocationContext {
     is_reinvoke: AtomicBool,
     should_reinvoke: AtomicBool,
     values: Mutex<HashMap<String, PolicyReinvokeContext>>,
+    /// The `MutatingAdmissionWebhook` plugin's value
+    /// (`reinvokeCtx.SetValue(PluginName, webhookReinvokeCtx)`,
+    /// webhook/mutating/dispatcher.go:108-113). Typed rather than keyed.
+    webhook_value: Mutex<rusternetes_admission_webhook::WebhookReinvokeContext>,
 }
 
 impl ReinvocationContext {
@@ -77,6 +81,18 @@ impl ReinvocationContext {
     }
     pub fn should_reinvoke(&self) -> bool {
         self.should_reinvoke.load(Ordering::SeqCst)
+    }
+    /// Takes the webhook plugin's context out so it can be held across an
+    /// `.await`; hand it back with [`Self::restore_webhook_context`]. The
+    /// chain of one request is sequential, so nothing reads it in between.
+    pub fn take_webhook_context(&self) -> rusternetes_admission_webhook::WebhookReinvokeContext {
+        std::mem::take(&mut *self.webhook_value.lock().unwrap())
+    }
+    pub fn restore_webhook_context(
+        &self,
+        ctx: rusternetes_admission_webhook::WebhookReinvokeContext,
+    ) {
+        *self.webhook_value.lock().unwrap() = ctx;
     }
     /// Runs `f` on this plugin's context, creating it on first use
     /// (dispatcher.go:81-87).

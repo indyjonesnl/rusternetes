@@ -189,6 +189,13 @@ fn state(install: bool) -> ApiServerState {
 
 fn state_with(plugin: Option<Arc<MutatingPolicyPlugin>>) -> ApiServerState {
     let backend = Arc::new(StorageBackend::Memory(Arc::new(MemoryStorage::new())));
+    state_on(backend, plugin)
+}
+
+fn state_on(
+    backend: Arc<StorageBackend>,
+    plugin: Option<Arc<MutatingPolicyPlugin>>,
+) -> ApiServerState {
     let s = ApiServerState::new(
         backend,
         Arc::new(TokenManager::new(b"secret")),
@@ -327,4 +334,133 @@ async fn never_policy_is_not_reinvoked() {
     let state = state_with(Some(plugin_with(vec![first, second])));
     admit(&state, Operation::Create).await;
     assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+}
+
+// ---- #3041: mutating webhooks join the shared ReinvocationContext --------
+// webhook/mutating/dispatcher.go:106-121 (`webhookReinvokeContext`).
+
+/// Mock mutating webhook: sets label `w=call-N` and counts its calls.
+async fn mock_webhook() -> (String, Arc<AtomicUsize>) {
+    use base64::Engine;
+    use rusternetes_common::admission::AdmissionReview;
+    use warp::Filter;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c = calls.clone();
+    let route = warp::post()
+        .and(warp::body::json())
+        .map(move |review: AdmissionReview| {
+            let n = c.fetch_add(1, Ordering::SeqCst) + 1;
+            let uid = review.request.map(|r| r.uid).unwrap_or_default();
+            let patch =
+                json!([{"op": "add", "path": "/metadata/labels/w", "value": format!("call-{n}")}]);
+            warp::reply::json(&json!({
+                "apiVersion": "admission.k8s.io/v1", "kind": "AdmissionReview",
+                "response": {
+                    "uid": uid, "allowed": true, "patchType": "JSONPatch",
+                    "patch": base64::engine::general_purpose::STANDARD.encode(patch.to_string()),
+                }
+            }))
+        });
+    let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+    tokio::spawn(server);
+    (format!("http://{addr}"), calls)
+}
+
+async fn install_webhook(backend: &Arc<StorageBackend>, url: String) {
+    use rusternetes_common::resources::{
+        MutatingWebhook, MutatingWebhookConfiguration, OperationType as WhOp, ReinvocationPolicy,
+        Rule, RuleWithOperations as WhRule, SideEffectClass, WebhookClientConfig,
+    };
+    use rusternetes_storage::{build_key, Storage};
+    let cfg = MutatingWebhookConfiguration {
+        api_version: "admissionregistration.k8s.io/v1".into(),
+        kind: "MutatingWebhookConfiguration".into(),
+        metadata: rusternetes_common::types::ObjectMeta::new("w-cfg"),
+        webhooks: Some(vec![MutatingWebhook {
+            name: "w.example.com".into(),
+            client_config: WebhookClientConfig {
+                url: Some(url),
+                service: None,
+                ca_bundle: None,
+            },
+            rules: vec![WhRule {
+                operations: vec![WhOp::All],
+                rule: Rule {
+                    api_groups: vec!["".into()],
+                    api_versions: vec!["v1".into()],
+                    resources: vec!["configmaps".into()],
+                    scope: None,
+                },
+            }],
+            failure_policy: None,
+            match_policy: None,
+            namespace_selector: None,
+            object_selector: None,
+            side_effects: SideEffectClass::None,
+            timeout_seconds: None,
+            admission_review_versions: vec!["v1".into()],
+            reinvocation_policy: Some(ReinvocationPolicy::IfNeeded),
+            match_conditions: None,
+        }]),
+    };
+    backend
+        .create(
+            &build_key("mutatingwebhookconfigurations", None, "w-cfg"),
+            &cfg,
+        )
+        .await
+        .unwrap();
+}
+
+/// Sets label `n` to its own call count: every rerun changes the object.
+struct Stamp(Arc<AtomicUsize>);
+#[async_trait]
+impl Patcher for Stamp {
+    async fn patch(&self, r: &PatchRequest<'_>) -> Result<Value, PatchError> {
+        let n = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut o = r.versioned_attributes.versioned_object.clone().unwrap();
+        o["metadata"]["labels"]["n"] = json!(n.to_string());
+        Ok(o)
+    }
+}
+
+/// dispatcher.go:115-119: on the second pass a policy rerun that changed the
+/// object since the webhook's last output requires the IfNeeded webhook to be
+/// reinvoked.
+#[tokio::test]
+#[serial]
+async fn if_needed_webhook_is_reinvoked_after_a_policy_changed_the_object() {
+    let _g = with_feature(Feature::MutatingAdmissionPolicy, true);
+    let backend = Arc::new(StorageBackend::Memory(Arc::new(MemoryStorage::new())));
+    let (url, w_calls) = mock_webhook().await;
+    install_webhook(&backend, url).await;
+    let p_calls = Arc::new(AtomicUsize::new(0));
+    let policy = hook(
+        "p",
+        Some(ReinvocationPolicyType::IfNeeded),
+        Arc::new(Stamp(p_calls.clone())),
+    );
+    let state = state_on(backend, Some(plugin_with(vec![policy])));
+    let cm = admit(&state, Operation::Create).await;
+    assert_eq!(p_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(w_calls.load(Ordering::SeqCst), 2);
+    let l = labels(&cm).unwrap();
+    assert_eq!(l.get("w").map(String::as_str), Some("call-2"));
+    assert_eq!(l.get("n").map(String::as_str), Some("2"));
+}
+
+/// dispatcher.go:115: nothing changed the object since the webhook's last
+/// output (the policy rerun is idempotent), so the webhook is not rerun.
+#[tokio::test]
+#[serial]
+async fn if_needed_webhook_is_not_reinvoked_when_nothing_changed_after_it() {
+    let _g = with_feature(Feature::MutatingAdmissionPolicy, true);
+    let backend = Arc::new(StorageBackend::Memory(Arc::new(MemoryStorage::new())));
+    let (url, w_calls) = mock_webhook().await;
+    install_webhook(&backend, url).await;
+    let (policy, p_calls) = counting("p", Some(ReinvocationPolicyType::IfNeeded), "a");
+    let state = state_on(backend, Some(plugin_with(vec![policy])));
+    admit(&state, Operation::Create).await;
+    assert_eq!(p_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(w_calls.load(Ordering::SeqCst), 1);
 }
