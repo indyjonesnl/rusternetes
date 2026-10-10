@@ -585,6 +585,26 @@ impl Storage for ApiStorage {
         serde_json::from_value(updated).map_err(Error::Serialization)
     }
 
+    /// Over the API the server owns expiry: the Event registry applies the
+    /// event TTL on every write (registry/core/event, `ttlFunc` in
+    /// pkg/registry/core/event/storage/storage.go:42-44), so the client's
+    /// `ttl` is not sent. Without this override the Storage default refuses
+    /// ttl != 0 and EventRecorder (which always writes with a TTL) would lose
+    /// every Event in API mode.
+    async fn create_with_ttl<T>(&self, key: &str, value: &T, _ttl: u64) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        self.create(key, value).await
+    }
+
+    async fn update_with_ttl<T>(&self, key: &str, value: &T, _ttl: u64) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        self.update(key, value).await
+    }
+
     async fn update_subresource<T>(&self, key: &str, subresource: &str, value: &T) -> Result<T>
     where
         T: Serialize + DeserializeOwned + Send + Sync,
