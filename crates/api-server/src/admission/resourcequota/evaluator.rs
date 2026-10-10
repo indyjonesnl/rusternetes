@@ -417,6 +417,20 @@ impl Evaluator for PodEvaluator {
         out
     }
 
+    /// `podEvaluator.UncoveredQuotaScopes` (pods.go:239-257): the limited
+    /// scopes with no matched quota scope of the same name.
+    fn uncovered_quota_scopes(
+        &self,
+        limited: &[ScopedResourceSelectorRequirement],
+        matched: &[ScopedResourceSelectorRequirement],
+    ) -> Result<Vec<ScopedResourceSelectorRequirement>, String> {
+        Ok(limited
+            .iter()
+            .filter(|l| !matched.iter().any(|m| m.scope_name == l.scope_name))
+            .cloned()
+            .collect())
+    }
+
     /// `podMatchesScopeFunc` (pods.go:331-356).
     fn matches_scope(
         &self,
