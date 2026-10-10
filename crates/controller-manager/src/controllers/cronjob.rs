@@ -2845,6 +2845,29 @@ mod tests {
         ) -> rusternetes_common::Result<()> {
             self.inner.update_raw(key, value).await
         }
+        // Events are written with a TTL (#2303); the default impl refuses ttl != 0.
+        async fn create_with_ttl<T>(
+            &self,
+            key: &str,
+            value: &T,
+            ttl: u64,
+        ) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.create_with_ttl(key, value, ttl).await
+        }
+        async fn update_with_ttl<T>(
+            &self,
+            key: &str,
+            value: &T,
+            ttl: u64,
+        ) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.update_with_ttl(key, value, ttl).await
+        }
         async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
             self.inner.delete(key).await
         }

@@ -35,6 +35,11 @@ use rusternetes_common::Result;
 
 use crate::Storage;
 
+/// `--event-ttl`'s default, 1h (`pkg/controlplane/apiserver/options/options.go:129`,
+/// `EventTTL: 1 * time.Hour`), in seconds. Single source for the API server's
+/// event store and for in-process recorders.
+pub const DEFAULT_EVENT_TTL_SECONDS: u64 = 3600;
+
 /// Records Kubernetes events on behalf of a component, routing each emission
 /// through a shared [`EventCorrelator`] before writing to `storage`.
 ///
@@ -47,6 +52,8 @@ pub struct EventRecorder<S: Storage + ?Sized> {
     /// call; the guard is always dropped before any `await`, so no storage I/O
     /// ever happens while holding it.
     correlator: Arc<Mutex<EventCorrelator<RealClock>>>,
+    /// Seconds an event lives after each write; `0` = no expiry.
+    event_ttl: u64,
 }
 
 impl<S: Storage + ?Sized> Clone for EventRecorder<S> {
@@ -54,6 +61,7 @@ impl<S: Storage + ?Sized> Clone for EventRecorder<S> {
         Self {
             storage: Arc::clone(&self.storage),
             correlator: Arc::clone(&self.correlator),
+            event_ttl: self.event_ttl,
         }
     }
 }
@@ -65,7 +73,20 @@ impl<S: Storage + ?Sized> EventRecorder<S> {
         Self {
             storage,
             correlator: Arc::new(Mutex::new(EventCorrelator::new(RealClock))),
+            event_ttl: DEFAULT_EVENT_TTL_SECONDS,
         }
+    }
+
+    /// Upstream recorders hand events to the API server (client-go
+    /// `tools/record/event.go` `recordToSink` -> `sink.Create` / `sink.Patch`),
+    /// whose event store applies `--event-ttl` to every write
+    /// (`pkg/registry/core/event/storage/storage.go:42-44`). In-process
+    /// recorders write storage directly, so they apply the same TTL here.
+    ///
+    /// Override the event TTL in seconds (`--event-ttl`); `0` disables expiry.
+    pub fn with_event_ttl(mut self, seconds: u64) -> Self {
+        self.event_ttl = seconds;
+        self
     }
 
     /// Emit an event about `involved` from `source`.
@@ -139,7 +160,9 @@ impl<S: Storage + ?Sized> EventRecorder<S> {
                 count: bumped,
                 last_observed_time: now,
             });
-            self.storage.update(&key, &existing).await?;
+            self.storage
+                .update_with_ttl(&key, &existing, self.event_ttl)
+                .await?;
             return Ok(());
         }
 
@@ -156,7 +179,9 @@ impl<S: Storage + ?Sized> EventRecorder<S> {
         event.count = correlated.count.max(1);
         event.first_timestamp = Some(correlated.first_timestamp);
         event.last_timestamp = Some(correlated.last_timestamp);
-        self.storage.create(&key, &event).await?;
+        self.storage
+            .create_with_ttl(&key, &event, self.event_ttl)
+            .await?;
         Ok(())
     }
 }
@@ -229,6 +254,32 @@ mod tests {
         let event_name = Event::generate_name(&obj, reason);
         let key = format!("/registry/events/{}/{}", ns, event_name);
         storage.get::<Event>(&key).await.ok()
+    }
+
+    #[tokio::test]
+    async fn recorded_events_expire_after_the_event_ttl() {
+        let storage = Arc::new(MemoryStorage::new());
+        let recorder = EventRecorder::new(Arc::clone(&storage)).with_event_ttl(1);
+        let involved = obj_ref("web", "default");
+        recorder
+            .event(&involved, &source(), EventType::Normal, "Started", "m")
+            .await
+            .unwrap();
+        assert!(stored(&storage, "default", "web", "Started")
+            .await
+            .is_some());
+        // A recurrence rewrites the object and must re-arm the lease.
+        recorder
+            .event(&involved, &source(), EventType::Normal, "Started", "m2")
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert!(
+            stored(&storage, "default", "web", "Started")
+                .await
+                .is_none(),
+            "in-process events must carry the event TTL like API-written ones"
+        );
     }
 
     #[tokio::test]

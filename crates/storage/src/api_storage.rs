@@ -585,6 +585,26 @@ impl Storage for ApiStorage {
         serde_json::from_value(updated).map_err(Error::Serialization)
     }
 
+    /// Over the API the server owns expiry: the Event registry applies the
+    /// event TTL on every write (registry/core/event, `ttlFunc` in
+    /// pkg/registry/core/event/storage/storage.go:42-44), so the client's
+    /// `ttl` is not sent. Without this override the Storage default refuses
+    /// ttl != 0 and EventRecorder (which always writes with a TTL) would lose
+    /// every Event in API mode.
+    async fn create_with_ttl<T>(&self, key: &str, value: &T, _ttl: u64) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        self.create(key, value).await
+    }
+
+    async fn update_with_ttl<T>(&self, key: &str, value: &T, _ttl: u64) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        self.update(key, value).await
+    }
+
     async fn update_subresource<T>(&self, key: &str, subresource: &str, value: &T) -> Result<T>
     where
         T: Serialize + DeserializeOwned + Send + Sync,
@@ -1505,6 +1525,29 @@ mod tests {
             attempts.load(Ordering::SeqCst),
             4,
             "expected 3 conflicting PUTs + 1 success"
+        );
+    }
+
+    /// EventRecorder writes every Event with `*_with_ttl` (#2303). Over the
+    /// API the server applies the event TTL itself (registry/core/event), so
+    /// ApiStorage must accept a non-zero ttl rather than fall back to the
+    /// Storage default, which refuses it and would drop every Event written
+    /// by a component running in API mode.
+    #[tokio::test]
+    async fn update_with_ttl_is_accepted_over_the_api() {
+        let (base, _attempts) = spawn_conflict_server(0).await;
+        let client = Arc::new(ApiClient::new(&base, true, None).unwrap());
+        let storage = ApiStorage::new(client);
+        let node = serde_json::json!({
+            "apiVersion": "v1", "kind": "Node",
+            "metadata": {"name": "rusternetes-node"}, "status": {}
+        });
+        let result: Result<Value> = storage
+            .update_with_ttl("/registry/nodes/rusternetes-node", &node, 3600)
+            .await;
+        assert!(
+            result.is_ok(),
+            "ApiStorage must not refuse a ttl, got {result:?}"
         );
     }
 
