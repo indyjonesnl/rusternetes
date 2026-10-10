@@ -680,4 +680,41 @@ mod tests {
             })
         );
     }
+
+    /// Upstream `namespaceAdded` / `namespaceUpdated`
+    /// (pkg/controller/serviceaccount/serviceaccounts_controller.go) enqueue the
+    /// namespace on its informer event, so the default ServiceAccount appears
+    /// within a sync, not on the next periodic resync. A namespace created
+    /// after the controller started must get its default SA well before the
+    /// 30s resync (#3029).
+    #[tokio::test]
+    async fn namespace_add_event_creates_default_serviceaccount_promptly() {
+        use rusternetes_common::resources::Namespace;
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = Arc::new(ServiceAccountController::new(storage.clone()));
+        let handle = tokio::spawn(controller.run());
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let ns: Namespace = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Namespace",
+            "metadata": {"name": "late-ns"}
+        }))
+        .unwrap();
+        storage
+            .create(&build_key("namespaces", None, "late-ns"), &ns)
+            .await
+            .unwrap();
+
+        let sa_key = build_key("serviceaccounts", Some("late-ns"), "default");
+        let mut found = false;
+        for _ in 0..50 {
+            if storage.get::<ServiceAccount>(&sa_key).await.is_ok() {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        handle.abort();
+        assert!(found, "default SA not created within 5s of namespace add");
+    }
 }
