@@ -2180,6 +2180,117 @@ mod tests {
         storage.update_status(&key, &n).await.unwrap();
     }
 
+    /// TestTryUpdateNodeHealth (node_lifecycle_controller_test.go:3532-3745),
+    /// ported table row for row: seed `nodeHealthMap` with the node's own
+    /// status and `creationTimestamp` as probe time, run `tryUpdateNodeHealth`,
+    /// and require the returned current Ready status to equal the Ready status
+    /// saved in the map. Upstream's `fakeNow`/`fakeOld` are `now` and a year
+    /// before it, as the controller clock here is `Utc::now()` + offset.
+    #[tokio::test]
+    async fn try_update_node_health_table() {
+        let fake_now = Utc::now();
+        let fake_old = fake_now - Duration::days(365);
+        // (name, creation/heartbeat time, Ready status or None for "Status nil")
+        let table: [(&str, chrono::DateTime<Utc>, Option<&str>); 8] = [
+            ("Status true", fake_now, Some("True")),
+            ("Status false", fake_now, Some("False")),
+            ("Status unknown", fake_now, Some("Unknown")),
+            ("Status nil", fake_now, None),
+            ("Status true - after grace period", fake_old, Some("True")),
+            ("Status false - after grace period", fake_old, Some("False")),
+            (
+                "Status unknown - after grace period",
+                fake_old,
+                Some("Unknown"),
+            ),
+            ("Status nil - after grace period", fake_old, None),
+        ];
+        for (name, at, status) in table {
+            let storage = Arc::new(MemoryStorage::new());
+            let c = NodeController::new(storage.clone());
+            let t = at.to_rfc3339();
+            let conditions = match status {
+                Some(s) => serde_json::json!([{
+                    "type": "Ready", "status": s,
+                    "lastHeartbeatTime": t, "lastTransitionTime": t,
+                }]),
+                None => serde_json::json!([]),
+            };
+            let node: Node = serde_json::from_value(serde_json::json!({
+                "apiVersion": "v1", "kind": "Node",
+                "metadata": {"name": "node0", "creationTimestamp": t},
+                "spec": {},
+                "status": {"conditions": conditions}
+            }))
+            .unwrap();
+            put_raw(&storage, &node).await;
+            c.node_health.lock().unwrap().insert(
+                "node0".to_string(),
+                NodeHealthData {
+                    probe_timestamp: at,
+                    ready_transition_timestamp: at,
+                    status_ready: ready_condition_of(&node).cloned(),
+                    lease: None,
+                },
+            );
+            let (_grace, _observed, current) = c
+                .try_update_node_health(&node)
+                .await
+                .unwrap_or_else(|e| panic!("{name}: unexpected error: {e}"));
+            let saved = c
+                .node_health
+                .lock()
+                .unwrap()
+                .get("node0")
+                .and_then(|h| h.status_ready.clone());
+            assert_eq!(
+                current.as_ref().map(|c| c.status.clone()),
+                saved.as_ref().map(|c| c.status.clone()),
+                "{name}"
+            );
+        }
+    }
+
+    fn pod_ready(status: &str) -> Pod {
+        let mut p = pod_on("n1");
+        p.status.as_mut().unwrap().conditions.as_mut().unwrap()[0].status = status.to_string();
+        p
+    }
+
+    async fn pod_ready_status(storage: &Arc<MemoryStorage>) -> String {
+        let p: Pod = storage
+            .get(&build_key("pods", Some("default"), "p"))
+            .await
+            .unwrap();
+        p.status.unwrap().conditions.unwrap()[0].status.clone()
+    }
+
+    /// updateNodeFunc (:752-763): the pass that observes Ready True -> not True
+    /// marks the node's pods NotReady itself (`MarkPodsNotReady`), without
+    /// waiting for the pod worker.
+    #[tokio::test]
+    async fn monitor_marks_pods_not_ready_on_ready_transition() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::new(storage.clone());
+        storage
+            .create(&build_key("nodes", None, "n1"), &ready_node("n1", "True"))
+            .await
+            .unwrap();
+        storage
+            .create(
+                &build_key("pods", Some("default"), "p"),
+                &pod_ready("True"),
+            )
+            .await
+            .unwrap();
+        c.monitor_node_health().await.unwrap();
+        assert_eq!(pod_ready_status(&storage).await, "True");
+        c.advance_clock_for_test(Duration::seconds(NODE_MONITOR_GRACE_PERIOD_SECONDS + 1));
+        c.monitor_node_health().await.unwrap();
+        assert_eq!(ready_status(&storage, "n1").await, "Unknown");
+        assert_eq!(pod_ready_status(&storage).await, "False");
+    }
+
     /// "Missing timestamp for Node. Assuming now as a timestamp" (:896): a
     /// heartbeat that is old by the kubelet's clock is not held against the node
     /// the first time the controller sees it.
