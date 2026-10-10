@@ -42,7 +42,7 @@ use serde_json::Value;
 
 use super::policy_dispatch::{
     BindingAccessor, DispatchDelegate, NamespacedName, PolicyAccessor, PolicyError,
-    PolicyInvocation, PolicyKey, PolicyReinvokeContext,
+    PolicyInvocation, PolicyKey, PolicyReinvokeContext, VersionedAttributeAccessor,
 };
 use super::policy_matching::Attributes;
 
@@ -272,6 +272,7 @@ impl MutatingDispatcher {
     async fn dispatch_invocations(
         &self,
         attr: &mut Attributes,
+        versioned: &mut VersionedAttributeAccessor<'_>,
         invocations: &[PolicyInvocation<
             '_,
             MutatingAdmissionPolicy,
@@ -280,7 +281,6 @@ impl MutatingDispatcher {
         >],
     ) -> Result<Vec<PolicyError>, Error> {
         let reinvoke = &self.reinvocation;
-        let mut versioned: Vec<(GroupVersionKind, VersionedAttributes)> = Vec::new();
         let mut last_kind: Option<GroupVersionKind> = None;
 
         if reinvoke.is_reinvoke()
@@ -345,28 +345,14 @@ impl MutatingDispatcher {
                 )));
             }
 
-            // `versionedAttributes.VersionedAttribute(invocation.Kind)`: the
-            // conversion to the invoked version is the identity on JSON.
-            let idx = match versioned.iter().position(|(k, _)| *k == invocation.kind) {
-                Some(i) => i,
-                None => {
-                    versioned.push((
-                        invocation.kind.clone(),
-                        VersionedAttributes {
-                            versioned_kind: invocation.kind.clone(),
-                            versioned_object: attr.object.clone(),
-                            versioned_old_object: attr.old_object.clone(),
-                            dirty: false,
-                        },
-                    ));
-                    versioned.len() - 1
-                }
-            };
+            // `versionedAttributes.VersionedAttribute(invocation.Kind)`
+            // (cached; `Dispatch` has already warmed it).
+            let current = versioned
+                .versioned_attribute(attr, &invocation.kind)
+                .map_err(Error::Internal)?;
 
             if let Some(matcher) = &invocation.evaluator.matcher {
-                let result = matcher
-                    .matches(&versioned[idx].1, invocation.param.as_ref())
-                    .await;
+                let result = matcher.matches(current, invocation.param.as_ref()).await;
                 if let Some(err) = result.error {
                     policy_errors.push(config_error(err, invocation));
                     continue;
@@ -391,12 +377,15 @@ impl MutatingDispatcher {
                 continue;
             }
 
-            let object_before_mutations = versioned[idx].1.versioned_object.clone();
+            let object_before_mutations = current.versioned_object.clone();
             // Mutations for a single invocation of a MutatingAdmissionPolicy are evaluated
             // in order.
             for mutation_index in 0..mutations {
                 last_kind = Some(invocation.kind.clone());
-                if versioned[idx].1.versioned_object.is_none() {
+                let current = versioned
+                    .versioned_attribute(attr, &invocation.kind)
+                    .map_err(Error::Internal)?;
+                if current.versioned_object.is_none() {
                     // Do not call patchers if there is no object to patch.
                     continue;
                 }
@@ -405,7 +394,7 @@ impl MutatingDispatcher {
                 if let Err(err) = self
                     .dispatch_one(
                         patcher,
-                        &mut versioned[idx].1,
+                        current,
                         namespace.as_ref(),
                         &invocation.resource,
                         invocation.param.as_ref(),
@@ -421,7 +410,10 @@ impl MutatingDispatcher {
                     }
                 }
             }
-            if object_before_mutations != versioned[idx].1.versioned_object {
+            let current = versioned
+                .versioned_attribute(attr, &invocation.kind)
+                .map_err(Error::Internal)?;
+            if object_before_mutations != current.versioned_object {
                 // The mutation has changed the object. Prepare to reinvoke all previous mutations that are eligible for re-invocation.
                 reinvoke.with_policy_context(|c| c.require_reinvoking_previously_invoked_plugins());
                 reinvoke.set_should_reinvoke();
@@ -440,7 +432,7 @@ impl MutatingDispatcher {
         }
 
         if let Some(kind) = last_kind {
-            if let Some((_, last)) = versioned.iter().find(|(k, _)| *k == kind) {
+            if let Some(last) = versioned.cached(&kind) {
                 if last.versioned_object.is_some() && last.dirty {
                     reinvoke
                         .with_policy_context(|c| c.require_reinvoking_previously_invoked_plugins());
@@ -462,6 +454,7 @@ impl DispatchDelegate<MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding, M
     async fn dispatch(
         &self,
         attr: &mut Attributes,
+        versioned: &mut VersionedAttributeAccessor<'_>,
         invocations: &[PolicyInvocation<
             '_,
             MutatingAdmissionPolicy,
@@ -469,7 +462,9 @@ impl DispatchDelegate<MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding, M
             MutatingEvaluator,
         >],
     ) -> Result<Vec<PolicyError>, Error> {
-        let result = self.dispatch_invocations(attr, invocations).await;
+        let result = self
+            .dispatch_invocations(attr, versioned, invocations)
+            .await;
         // The deferred `SetLastPolicyInvocationOutput` (dispatcher.go:96-98)
         // runs on every return path.
         self.reinvocation
@@ -481,6 +476,7 @@ impl DispatchDelegate<MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding, M
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admission::policy_dispatch::IdentityConverter;
     use rusternetes_common::admission::Operation;
     use rusternetes_common::resources::mutating_admission_policy::{
         MutatingAdmissionPolicyBindingSpec, MutatingAdmissionPolicySpec, Mutation, PatchType,
@@ -690,7 +686,8 @@ mod tests {
                 param: c.param.clone(),
             })
             .collect();
-        d.dispatch(attr, &invocations).await
+        let mut versioned = VersionedAttributeAccessor::new(&IdentityConverter);
+        d.dispatch(attr, &mut versioned, &invocations).await
     }
     fn ctx() -> Arc<ReinvocationContext> {
         Arc::new(ReinvocationContext::new(false))
