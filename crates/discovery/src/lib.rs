@@ -1082,6 +1082,20 @@ fn resource_categories(group: &str, resource: &str) -> &'static [&'static str] {
     }
 }
 
+/// `resolve_kind_to_resource` plus the resource's scope (`true` when
+/// namespaced): the two halves of a `meta.RESTMapping`.
+pub fn resolve_kind_to_resource_and_scope(
+    group: &str,
+    version: &str,
+    kind: &str,
+) -> Option<(String, bool)> {
+    let resource = resolve_kind_to_resource(group, version, kind)?;
+    get_aggregated_resources_for_group_uncategorized(group, version)
+        .iter()
+        .find(|r| r["resource"].as_str() == Some(resource.as_str()))
+        .map(|r| (resource.clone(), r["scope"].as_str() == Some("Namespaced")))
+}
+
 fn get_aggregated_resources_for_group_uncategorized(
     group: &str,
     version: &str,

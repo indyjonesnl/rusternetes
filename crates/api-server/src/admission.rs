@@ -4,6 +4,7 @@ pub mod pod_security_controller;
 pub mod pod_security_namespace;
 pub mod pod_security_policy;
 pub mod policy_dispatch;
+pub mod policy_install;
 pub mod policy_matching;
 pub mod policy_mutating;
 pub mod policy_plugin;
