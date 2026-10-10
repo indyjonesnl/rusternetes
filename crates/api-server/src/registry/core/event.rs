@@ -99,8 +99,8 @@ impl RestDeleteStrategy<Event> for Strategy {
 }
 
 /// `--event-ttl`'s default, 1h (`pkg/controlplane/apiserver/options/options.go:129`),
-/// in seconds.
-pub const DEFAULT_EVENT_TTL_SECONDS: u64 = 3600;
+/// in seconds. Defined in the storage crate so in-process recorders share it.
+pub use rusternetes_storage::event_recorder::DEFAULT_EVENT_TTL_SECONDS;
 
 /// `NewREST(optsGetter, ttl)` (storage/storage.go:40-60): events expire `ttl`
 /// seconds after they are written. The `TTLFunc` ignores the existing TTL and

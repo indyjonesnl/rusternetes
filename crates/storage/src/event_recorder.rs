@@ -35,6 +35,11 @@ use rusternetes_common::Result;
 
 use crate::Storage;
 
+/// `--event-ttl`'s default, 1h (`pkg/controlplane/apiserver/options/options.go:129`,
+/// `EventTTL: 1 * time.Hour`), in seconds. Single source for the API server's
+/// event store and for in-process recorders.
+pub const DEFAULT_EVENT_TTL_SECONDS: u64 = 3600;
+
 /// Records Kubernetes events on behalf of a component, routing each emission
 /// through a shared [`EventCorrelator`] before writing to `storage`.
 ///
@@ -68,10 +73,16 @@ impl<S: Storage + ?Sized> EventRecorder<S> {
         Self {
             storage,
             correlator: Arc::new(Mutex::new(EventCorrelator::new(RealClock))),
-            event_ttl: 0,
+            event_ttl: DEFAULT_EVENT_TTL_SECONDS,
         }
     }
 
+    /// Upstream recorders hand events to the API server (client-go
+    /// `tools/record/event.go` `recordToSink` -> `sink.Create` / `sink.Patch`),
+    /// whose event store applies `--event-ttl` to every write
+    /// (`pkg/registry/core/event/storage/storage.go:42-44`). In-process
+    /// recorders write storage directly, so they apply the same TTL here.
+    ///
     /// Override the event TTL in seconds (`--event-ttl`); `0` disables expiry.
     pub fn with_event_ttl(mut self, seconds: u64) -> Self {
         self.event_ttl = seconds;
@@ -149,7 +160,9 @@ impl<S: Storage + ?Sized> EventRecorder<S> {
                 count: bumped,
                 last_observed_time: now,
             });
-            self.storage.update(&key, &existing).await?;
+            self.storage
+                .update_with_ttl(&key, &existing, self.event_ttl)
+                .await?;
             return Ok(());
         }
 
@@ -166,7 +179,9 @@ impl<S: Storage + ?Sized> EventRecorder<S> {
         event.count = correlated.count.max(1);
         event.first_timestamp = Some(correlated.first_timestamp);
         event.last_timestamp = Some(correlated.last_timestamp);
-        self.storage.create(&key, &event).await?;
+        self.storage
+            .create_with_ttl(&key, &event, self.event_ttl)
+            .await?;
         Ok(())
     }
 }
