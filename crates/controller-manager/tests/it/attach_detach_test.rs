@@ -296,3 +296,84 @@ async fn rwx_volume_attaches_to_every_node() {
     controller(&s).reconcile_all().await.unwrap();
     assert_eq!(vas(&s).await.len(), 2);
 }
+
+// ---- node.status.volumesAttached (#3053) --------------------------------
+// Upstream: `statusupdater/node_status_updater.go` `updateNodeStatus`
+// (`node.Status.VolumesAttached = attachedVolumes`, patched via
+// PatchNodeStatus) fed by `cache/actual_state_of_world.go`
+// `GetVolumesToReportAttached`; `reconciler.go:245-265` removes the volume
+// from the report and updates the node BEFORE detaching.
+
+async fn node_attached(s: &MemoryStorage, name: &str) -> Vec<String> {
+    let n: rusternetes_common::resources::Node =
+        s.get(&build_key("nodes", None, name)).await.unwrap();
+    n.status
+        .and_then(|s| s.volumes_attached)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|v| v.name)
+        .collect()
+}
+
+fn unique() -> String {
+    format!("kubernetes.io/csi/{DRIVER}^vol-1")
+}
+
+async fn seed_pod_p(s: &MemoryStorage) {
+    put(
+        s,
+        "pods",
+        Some("ns"),
+        "p",
+        pod("p", "node-1", "claim", "Running"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn reports_attached_volume_on_node_status() {
+    let s = Arc::new(MemoryStorage::new());
+    seed_node(&s, "node-1", None).await;
+    seed_volume(&s, json!(["ReadWriteOnce"])).await;
+    seed_pod_p(&s).await;
+
+    controller(&s).reconcile_all().await.unwrap();
+    assert_eq!(node_attached(&s, "node-1").await, vec![unique()]);
+
+    // Idempotent.
+    controller(&s).reconcile_all().await.unwrap();
+    assert_eq!(node_attached(&s, "node-1").await, vec![unique()]);
+}
+
+#[tokio::test]
+async fn removes_volume_from_node_status_when_detached() {
+    let s = Arc::new(MemoryStorage::new());
+    seed_node(&s, "node-1", None).await;
+    seed_volume(&s, json!(["ReadWriteOnce"])).await;
+    seed_pod_p(&s).await;
+    controller(&s).reconcile_all().await.unwrap();
+    s.delete(&build_key("pods", Some("ns"), "p")).await.unwrap();
+
+    controller(&s).reconcile_all().await.unwrap();
+    assert!(vas(&s).await.is_empty());
+    assert!(node_attached(&s, "node-1").await.is_empty());
+}
+
+#[tokio::test]
+async fn volume_still_mounted_stays_reported_attached() {
+    let s = Arc::new(MemoryStorage::new());
+    seed_node(&s, "node-1", None).await;
+    seed_volume(&s, json!(["ReadWriteOnce"])).await;
+    seed_pod_p(&s).await;
+    controller(&s).reconcile_all().await.unwrap();
+    // Kubelet reports the volume mounted, then the pod goes away.
+    let key = build_key("nodes", None, "node-1");
+    let mut n: rusternetes_common::resources::Node = s.get(&key).await.unwrap();
+    n.status.as_mut().unwrap().volumes_in_use = Some(vec![unique()]);
+    s.update(&key, &n).await.unwrap();
+    s.delete(&build_key("pods", Some("ns"), "p")).await.unwrap();
+
+    controller(&s).reconcile_all().await.unwrap();
+    assert_eq!(vas(&s).await.len(), 1);
+    assert_eq!(node_attached(&s, "node-1").await, vec![unique()]);
+}
