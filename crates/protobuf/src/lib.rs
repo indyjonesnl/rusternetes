@@ -2317,7 +2317,7 @@ impl ProtoRegistry {
                     (
                         2,
                         (
-                            "jsonSchemas".into(),
+                            "jSONSchemas".into(),
                             FieldType::Repeated(Box::new(FieldType::Message(
                                 "JSONSchemaProps".into(),
                             ))),
@@ -8064,7 +8064,9 @@ impl ProtoRegistry {
                 } else if (inner_type == "Time" || inner_type == "MicroTime") && val.is_string() {
                     let bytes = encode_timestamp(val);
                     push_length_delimited_field(buf, tag, &bytes);
-                } else if let Some(inner) = self.encode_message(inner_type, val) {
+                } else if let Some(inner) =
+                    self.encode_message(inner_type, &wrap_json_schema_union(inner_type, val))
+                {
                     push_length_delimited_field(buf, tag, &inner);
                 }
             }
@@ -8134,7 +8136,7 @@ impl ProtoRegistry {
                         {
                             Some(encode_timestamp(v))
                         } else {
-                            self.encode_message(inner_type, v)
+                            self.encode_message(inner_type, &wrap_json_schema_union(inner_type, v))
                         };
                         if let Some(inner) = inner {
                             push_length_delimited_field(&mut entry, 2, &inner);
@@ -13395,6 +13397,45 @@ impl ProtoRegistry {
 // `metav1.Status` value built by `apierrors.New*` helpers carries a
 // zero-valued ListMeta, and proto3 message-typed optional fields encode as
 // nothing on the wire when the value is the zero value.
+
+/// The apiextensions `JSONSchemaPropsOr{Array,Bool,StringArray}` unions are
+/// structs on the protobuf wire but inline JSON (`v1/marshal.go`
+/// `JSONSchemaPropsOrArray.MarshalJSON` etc.: the bare schema, array or bool).
+/// Wrap the JSON form into the message shape the schemas above describe so
+/// `items`, `additionalProperties`, `additionalItems` and `dependencies`
+/// survive encoding (#3081). Mirrors the generated `Marshal` of
+/// `apiextensions/v1/generated.pb.go`. Already-wrapped values pass through.
+fn wrap_json_schema_union<'a>(inner_type: &str, val: &'a Value) -> std::borrow::Cow<'a, Value> {
+    use std::borrow::Cow;
+    let wrapped = match (inner_type, val) {
+        ("JSONSchemaPropsOrArray", Value::Array(_)) => json!({ "jSONSchemas": val }),
+        ("JSONSchemaPropsOrArray", Value::Object(m)) if m.is_empty() => return Cow::Borrowed(val),
+        ("JSONSchemaPropsOrArray", Value::Object(m))
+            if !m.contains_key("schema") && !m.contains_key("jSONSchemas") =>
+        {
+            json!({ "schema": val })
+        }
+        ("JSONSchemaPropsOrBool", Value::Bool(b)) => json!({ "allows": b }),
+        // UnmarshalJSON of an object sets Allows=true with the Schema.
+        ("JSONSchemaPropsOrBool", Value::Object(m)) if m.is_empty() => return Cow::Borrowed(val),
+        ("JSONSchemaPropsOrBool", Value::Object(m))
+            if !m.contains_key("schema") && !m.contains_key("allows") =>
+        {
+            json!({ "allows": true, "schema": val })
+        }
+        ("JSONSchemaPropsOrStringArray", Value::Array(_)) => json!({ "property": val }),
+        ("JSONSchemaPropsOrStringArray", Value::Object(m)) if m.is_empty() => {
+            return Cow::Borrowed(val)
+        }
+        ("JSONSchemaPropsOrStringArray", Value::Object(m))
+            if !m.contains_key("schema") && !m.contains_key("property") =>
+        {
+            json!({ "schema": val })
+        }
+        _ => return Cow::Borrowed(val),
+    };
+    Cow::Owned(wrapped)
+}
 
 /// Encode a [`Status`] to the native K8s protobuf envelope:
 /// `k8s\0` magic + `Unknown { typeMeta, raw, contentType="application/vnd.kubernetes.protobuf" }`

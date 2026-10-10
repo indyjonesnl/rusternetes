@@ -44,3 +44,49 @@ fn crd_array_items_type_roundtrips() {
         .cloned();
     assert_eq!(ty, Some(json!("object")), "items after roundtrip: {back}");
 }
+
+/// The sibling unions share the bug: `additionalProperties` (bool or schema)
+/// and the tuple form of `items` must survive too.
+#[test]
+fn crd_additional_properties_and_tuple_items_roundtrip() {
+    let r = ProtoRegistry::new();
+    let schema = |props: serde_json::Value| {
+        json!({
+            "metadata": {"name": "foos.example.com"},
+            "spec": {
+                "group": "example.com", "scope": "Namespaced",
+                "names": {"plural": "foos", "kind": "Foo"},
+                "versions": [{"name": "v1", "served": true, "storage": true,
+                    "schema": {"openAPIV3Schema": {"type": "object", "properties": props}}}]
+            }
+        })
+    };
+    let crd = schema(json!({
+        "closed": {"type": "object", "additionalProperties": false},
+        "map": {"type": "object", "additionalProperties": {"type": "string"}},
+        "tuple": {"type": "array", "items": [{"type": "string"}, {"type": "integer"}]}
+    }));
+    let bytes = r.encode_message("CustomResourceDefinition", &crd).unwrap();
+    let back = r
+        .decode_message("CustomResourceDefinition", &bytes)
+        .unwrap();
+    let p = |k: &str| {
+        back.pointer(&format!(
+            "/spec/versions/0/schema/openAPIV3Schema/properties/{k}"
+        ))
+        .cloned()
+        .unwrap()
+    };
+    assert_eq!(
+        p("closed")["additionalProperties"],
+        json!({"allows": false})
+    );
+    assert_eq!(
+        p("map")["additionalProperties"]["schema"]["type"],
+        json!("string")
+    );
+    assert_eq!(
+        p("tuple")["items"]["jSONSchemas"][1]["type"],
+        json!("integer")
+    );
+}
