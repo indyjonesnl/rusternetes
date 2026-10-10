@@ -55,3 +55,14 @@ diff-clean.
 
 If a file refuses to parse, fix the parser glue in the parity test — not the
 upstream snapshot.
+
+## Hard gate vs warning-only
+
+All 76 `generated.proto` files of the release (every `k8s.io/api/*` group/version,
+apimachinery, apiextensions, kube-aggregator, apiserver audit, metrics; the
+`testapigroup`/`example` fixture groups excluded) are bundled. Only the 21 files
+listed in `PROTO_FILES` of `crates/api-server/tests/it/protobuf_schema_parity_upstream.rs`
+are a **hard** parity gate. The rest feed the **warning-only** wire-format
+coverage report (`crates/api-server/tests/it/wire_format_coverage_test.rs`,
+`bash scripts/wire-format-coverage.sh`, CI step "Wire-format coverage report").
+Re-sync with `UPSTREAM_CHECKOUT=../kubernetes bash scripts/sync-upstream-protos.sh`.
