@@ -90,7 +90,7 @@ const ANN_SELECTED_NODE: &str = "volume.kubernetes.io/selected-node";
 const ANN_BETA_STORAGE_CLASS: &str = "volume.beta.kubernetes.io/storage-class";
 
 /// `util.IsPodTerminated` (`pkg/volume/util/util.go:303-310`).
-fn is_pod_terminated(pod: &Pod) -> bool {
+pub(crate) fn is_pod_terminated(pod: &Pod) -> bool {
     use rusternetes_common::resources::pod::{
         ContainerState, ContainerStateTerminated, ContainerStateWaiting, ContainerStatus,
     };

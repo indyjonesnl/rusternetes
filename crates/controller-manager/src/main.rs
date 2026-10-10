@@ -74,6 +74,12 @@ struct Args {
     #[arg(long = "csi-attacher", value_name = "DRIVER=SOCKET")]
     csi_attachers: Vec<String>,
 
+    /// Run the CSI half of the AttachDetachController (#3048): create and
+    /// delete the `VolumeAttachment`s of scheduled pods' CSI volumes. Off by
+    /// default; enable together with `--csi-attacher`.
+    #[arg(long = "attach-detach-controller", default_value_t = false)]
+    attach_detach_controller: bool,
+
     /// `--default-fstype` of external-provisioner, for every `--csi-provisioner`.
     #[arg(long, default_value = "")]
     csi_default_fstype: String,
@@ -818,6 +824,21 @@ async fn main() -> Result<()> {
             async move {
                 if let Err(e) = controller.run().await {
                     tracing::error!("CSI attacher error: {e}");
+                }
+            }
+        });
+    }
+
+    // AttachDetachController (#3048), opt-in.
+    if args.attach_detach_controller {
+        let attach_detach = Arc::new(controllers::attach_detach::AttachDetachController::new(
+            storage.clone(),
+        ));
+        spawn_controller!("AttachDetach controller", leader_elector, {
+            let controller = attach_detach.clone();
+            async move {
+                if let Err(e) = controller.run().await {
+                    tracing::error!("AttachDetach controller error: {e}");
                 }
             }
         });
