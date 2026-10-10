@@ -62,6 +62,35 @@ pub fn binding_body(pod_name: &str, node_name: &str) -> serde_json::Value {
 
 /// Read-side key function for the pods reflector store: `pods/{ns}/{name}`,
 /// matching the work-queue key shape the scheduler already uses.
+/// The `DisruptionTarget` condition the scheduler stamps on a preemption
+/// victim. Ported from `PreemptPod` (pkg/scheduler/framework/preemption/
+/// preemption.go:186-192): status True, reason `PreemptionByScheduler`,
+/// message `"<schedulerName>: preempting to accommodate a higher priority pod"`.
+pub fn preemption_disruption_condition(
+    scheduler_name: &str,
+) -> rusternetes_common::resources::PodCondition {
+    rusternetes_common::resources::PodCondition {
+        condition_type: "DisruptionTarget".to_string(),
+        status: "True".to_string(),
+        last_probe_time: None,
+        last_transition_time: Some(chrono::Utc::now()),
+        reason: Some("PreemptionByScheduler".to_string()),
+        message: Some(format!(
+            "{scheduler_name}: preempting to accommodate a higher priority pod"
+        )),
+        observed_generation: None,
+    }
+}
+
+/// Strategic-merge `pods/status` patch carrying only the condition delta
+/// (conditions merge by `type`), as `util.PatchPodStatus` sends
+/// (pkg/scheduler/util/utils.go:105-134).
+pub fn disruption_target_status_patch(
+    condition: &rusternetes_common::resources::PodCondition,
+) -> serde_json::Value {
+    json!({ "status": { "conditions": [condition] } })
+}
+
 fn pod_store_key(p: &Pod) -> String {
     format!(
         "{}/{}",
@@ -305,16 +334,35 @@ impl<S: Storage + Send + Sync + 'static> DataPlane<S> {
                 Ok(())
             }
             DataPlane::Api(a) => {
-                // Best-effort DisruptionTarget condition via /status; the DELETE
-                // below is what actually frees resources, so a status hiccup
-                // must not abort the eviction.
-                let _: std::result::Result<Pod, _> = a
+                // Upstream PreemptPod: PatchPodStatus(DisruptionTarget) then
+                // DeletePod (preemption.go:196-209). The patch is a status
+                // delta, NOT a PUT of the informer's stale object, which
+                // conflicted on resourceVersion and was swallowed (#3055).
+                // A non-NotFound patch error aborts, as upstream returns err.
+                let cond = mutated_pod
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.conditions.as_ref())
+                    .and_then(|cs| cs.iter().find(|c| c.condition_type == "DisruptionTarget"))
+                    .cloned()
+                    .unwrap_or_else(|| preemption_disruption_condition("default-scheduler"));
+                let patched: std::result::Result<serde_json::Value, _> = a
                     .client
-                    .put(
+                    .patch(
                         &format!("/api/v1/namespaces/{}/pods/{}/status", ns, name),
-                        mutated_pod,
+                        &disruption_target_status_patch(&cond),
+                        "application/strategic-merge-patch+json",
                     )
                     .await;
+                if let Err(e) = patched {
+                    let msg = e.to_string();
+                    if msg.contains("404") || msg.contains("NotFound") {
+                        return Ok(());
+                    }
+                    return Err(Error::Internal(format!(
+                        "evict DisruptionTarget patch failed: {msg}"
+                    )));
+                }
                 let body = json!({ "gracePeriodSeconds": grace_period_seconds });
                 a.client
                     .delete_with_options(&ApiBackend::pod_path(ns, name), &[], Some(&body))

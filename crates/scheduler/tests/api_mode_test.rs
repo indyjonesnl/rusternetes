@@ -51,3 +51,32 @@ fn binding_body_matches_apiserver_contract() {
     assert_eq!(b["kind"], "Binding");
     assert_eq!(b["target"]["kind"], "Node");
 }
+
+/// Upstream `PreemptPod` (pkg/scheduler/framework/preemption/preemption.go:182-193)
+/// builds `DisruptionTarget=True`, reason `PreemptionByScheduler`, message
+/// `"<schedulerName>: preempting to accommodate a higher priority pod"`, then
+/// `util.PatchPodStatus` (pkg/scheduler/util/utils.go:105-134) sends ONLY that
+/// delta as a strategic-merge PATCH on `pods/status` (conditions merge by
+/// `type`) before `DeletePod`. A whole-pod PUT of the informer's (stale)
+/// object conflicts on resourceVersion and was silently swallowed (#3055).
+#[test]
+fn preemption_disruption_condition_matches_upstream() {
+    use rusternetes_scheduler::data_plane::{
+        disruption_target_status_patch, preemption_disruption_condition,
+    };
+    let c = preemption_disruption_condition("default-scheduler");
+    assert_eq!(c.condition_type, "DisruptionTarget");
+    assert_eq!(c.status, "True");
+    assert_eq!(c.reason.as_deref(), Some("PreemptionByScheduler"));
+    assert_eq!(
+        c.message.as_deref(),
+        Some("default-scheduler: preempting to accommodate a higher priority pod")
+    );
+    let body = disruption_target_status_patch(&c);
+    let conds = body["status"]["conditions"].as_array().unwrap();
+    assert_eq!(conds.len(), 1);
+    assert_eq!(conds[0]["type"], "DisruptionTarget");
+    assert_eq!(conds[0]["reason"], "PreemptionByScheduler");
+    assert!(body.get("metadata").is_none(), "status delta only");
+    assert!(body["status"].get("phase").is_none());
+}
