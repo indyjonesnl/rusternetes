@@ -30,8 +30,8 @@
 //!   - Tests are synchronous (`#[test]`) because every helper is pure.
 
 use rusternetes_common::resources::{
-    Container, ContainerState, ContainerStatus, ExecAction, Lifecycle, LifecycleHandler, Pod,
-    PodSpec, SleepAction,
+    Container, ContainerState, ContainerStateTerminated, ContainerStatus, ExecAction, Lifecycle,
+    LifecycleHandler, Pod, PodSpec, SleepAction,
 };
 use rusternetes_common::types::{ObjectMeta, TypeMeta};
 use rusternetes_kubelet::lifecycle;
@@ -226,8 +226,12 @@ fn container_should_run_with_expected_status_restart_never() {
 fn exit_code_zero_propagates_as_completed() {
     let state = lifecycle::terminated_state_from_exit(0, None, None);
     match state {
-        ContainerState::Terminated {
-            exit_code, reason, ..
+        ContainerState {
+            terminated:
+                Some(ContainerStateTerminated {
+                    exit_code, reason, ..
+                }),
+            ..
         } => {
             assert_eq!(exit_code, 0);
             assert_eq!(reason.as_deref(), Some("Completed"));
@@ -244,8 +248,12 @@ fn exit_code_zero_propagates_as_completed() {
 fn nonzero_exit_code_propagates_with_error_reason() {
     let state = lifecycle::terminated_state_from_exit(42, None, None);
     match state {
-        ContainerState::Terminated {
-            exit_code, reason, ..
+        ContainerState {
+            terminated:
+                Some(ContainerStateTerminated {
+                    exit_code, reason, ..
+                }),
+            ..
         } => {
             assert_eq!(exit_code, 42);
             assert_eq!(reason.as_deref(), Some("Error"));
@@ -262,8 +270,12 @@ fn nonzero_exit_code_propagates_with_error_reason() {
 fn exit_code_137_propagates_as_oom_killed() {
     let state = lifecycle::terminated_state_from_exit(137, None, None);
     match state {
-        ContainerState::Terminated {
-            exit_code, reason, ..
+        ContainerState {
+            terminated:
+                Some(ContainerStateTerminated {
+                    exit_code, reason, ..
+                }),
+            ..
         } => {
             assert_eq!(exit_code, 137);
             assert_eq!(reason.as_deref(), Some("OOMKilled"));
@@ -280,7 +292,10 @@ fn exit_code_137_propagates_as_oom_killed() {
 fn docker_error_field_overrides_reason() {
     let state = lifecycle::terminated_state_from_exit(1, Some("ContainerCannotRun".into()), None);
     match state {
-        ContainerState::Terminated { reason, .. } => {
+        ContainerState {
+            terminated: Some(ContainerStateTerminated { reason, .. }),
+            ..
+        } => {
             assert_eq!(reason.as_deref(), Some("ContainerCannotRun"));
         }
         _ => panic!("expected Terminated"),
@@ -312,8 +327,12 @@ fn exit_code_propagates_through_container_status_struct() {
         stop_signal: None,
     };
     match status.state.as_ref().expect("state present") {
-        ContainerState::Terminated {
-            exit_code, reason, ..
+        ContainerState {
+            terminated:
+                Some(ContainerStateTerminated {
+                    exit_code, reason, ..
+                }),
+            ..
         } => {
             assert_eq!(*exit_code, 1);
             assert_eq!(reason.as_deref(), Some("Error"));
@@ -350,7 +369,10 @@ fn termination_message_round_trips_through_terminated_state() {
     let state =
         lifecycle::terminated_state_from_exit(0, None, Some("OK after migration".to_string()));
     match state {
-        ContainerState::Terminated { message, .. } => {
+        ContainerState {
+            terminated: Some(ContainerStateTerminated { message, .. }),
+            ..
+        } => {
             assert_eq!(message.as_deref(), Some("OK after migration"));
         }
         _ => panic!("expected Terminated"),
@@ -385,8 +407,12 @@ fn termination_message_empty_when_pod_succeeds_under_fallback_policy() {
     // policy reads logs only on error).
     let state = lifecycle::terminated_state_from_exit(0, None, None);
     match state {
-        ContainerState::Terminated {
-            exit_code, message, ..
+        ContainerState {
+            terminated:
+                Some(ContainerStateTerminated {
+                    exit_code, message, ..
+                }),
+            ..
         } => {
             assert_eq!(exit_code, 0);
             assert!(message.is_none(), "no message must surface for clean exit");

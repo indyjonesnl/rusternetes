@@ -1612,10 +1612,10 @@ impl<S: Storage + 'static> JobController<S> {
                             cs.iter()
                                 .filter_map(|c| match &c.state {
                                     Some(
-                                        rusternetes_common::resources::ContainerState::Terminated {
+                                        rusternetes_common::resources::ContainerState { terminated: Some(rusternetes_common::resources::ContainerStateTerminated {
                                             exit_code,
                                             ..
-                                        },
+                                        }), .. },
                                     ) => Some(*exit_code),
                                     _ => None,
                                 })
@@ -3142,11 +3142,15 @@ fn latest_finish_time(
     statuses: &[rusternetes_common::resources::pod::ContainerStatus],
     check: impl Fn(&rusternetes_common::resources::pod::ContainerStatus) -> bool,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
-    use rusternetes_common::resources::pod::ContainerState;
+    use rusternetes_common::resources::pod::{ContainerState, ContainerStateTerminated};
     let mut finish = prev;
     for cs in statuses.iter().filter(|c| check(c)) {
-        let Some(ContainerState::Terminated {
-            finished_at: Some(t),
+        let Some(ContainerState {
+            terminated:
+                Some(ContainerStateTerminated {
+                    finished_at: Some(t),
+                    ..
+                }),
             ..
         }) = &cs.state
         else {
@@ -3561,7 +3565,8 @@ mod tests {
     use super::*;
     use rusternetes_common::resources::workloads::{Job, JobSpec, PodTemplateSpec};
     use rusternetes_common::resources::{
-        Container, ContainerState, ContainerStatus, Pod, PodCondition, PodSpec, PodStatus,
+        Container, ContainerState, ContainerStateRunning, ContainerStateTerminated,
+        ContainerStatus, Pod, PodCondition, PodSpec, PodStatus,
     };
     use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
     use rusternetes_storage::MemoryStorage;
@@ -3721,14 +3726,17 @@ mod tests {
                 name: "test".to_string(),
                 ready: false,
                 restart_count: 0,
-                state: Some(ContainerState::Terminated {
-                    exit_code,
-                    signal: None,
-                    reason: Some("Error".to_string()),
-                    message: None,
-                    started_at: None,
-                    finished_at: None,
-                    container_id: None,
+                state: Some(ContainerState {
+                    terminated: Some(ContainerStateTerminated {
+                        exit_code,
+                        signal: None,
+                        reason: Some("Error".to_string()),
+                        message: None,
+                        started_at: None,
+                        finished_at: None,
+                        container_id: None,
+                    }),
+                    ..Default::default()
                 }),
                 last_state: None,
                 image: Some("busybox".to_string()),
@@ -4539,14 +4547,17 @@ mod tests {
                 name: "test".to_string(),
                 ready: false,
                 restart_count: 3, // restarted 3 times before succeeding
-                state: Some(ContainerState::Terminated {
-                    exit_code: 0,
-                    signal: None,
-                    reason: Some("Completed".to_string()),
-                    message: None,
-                    started_at: None,
-                    finished_at: None,
-                    container_id: None,
+                state: Some(ContainerState {
+                    terminated: Some(ContainerStateTerminated {
+                        exit_code: 0,
+                        signal: None,
+                        reason: Some("Completed".to_string()),
+                        message: None,
+                        started_at: None,
+                        finished_at: None,
+                        container_id: None,
+                    }),
+                    ..Default::default()
                 }),
                 last_state: None,
                 image: Some("busybox".to_string()),
@@ -5803,14 +5814,17 @@ mod tests {
             name: "test".to_string(),
             ready: false,
             restart_count: 0,
-            state: Some(ContainerState::Terminated {
-                exit_code: 1,
-                signal: None,
-                reason: Some("Error".to_string()),
-                message: None,
-                started_at: None,
-                finished_at: Some(finished.to_rfc3339()),
-                container_id: None,
+            state: Some(ContainerState {
+                terminated: Some(ContainerStateTerminated {
+                    exit_code: 1,
+                    signal: None,
+                    reason: Some("Error".to_string()),
+                    message: None,
+                    started_at: None,
+                    finished_at: Some(finished.to_rfc3339()),
+                    container_id: None,
+                }),
+                ..Default::default()
             }),
             last_state: None,
             image: Some("busybox".to_string()),
@@ -6005,14 +6019,17 @@ mod tests {
             .unwrap()
             .remove(0);
         cs.name = name.to_string();
-        cs.state = Some(ContainerState::Terminated {
-            exit_code: 0,
-            signal: None,
-            reason: None,
-            message: None,
-            started_at: None,
-            finished_at: finished.map(|t| t.to_rfc3339()),
-            container_id: None,
+        cs.state = Some(ContainerState {
+            terminated: Some(ContainerStateTerminated {
+                exit_code: 0,
+                signal: None,
+                reason: None,
+                message: None,
+                started_at: None,
+                finished_at: finished.map(|t| t.to_rfc3339()),
+                container_id: None,
+            }),
+            ..Default::default()
         });
         cs
     }
@@ -6063,7 +6080,10 @@ mod tests {
         }]);
         let status = pod.status.as_mut().unwrap();
         let mut running = terminated_status("sidecar", None);
-        running.state = Some(ContainerState::Running { started_at: None });
+        running.state = Some(ContainerState {
+            running: Some(ContainerStateRunning { started_at: None }),
+            ..Default::default()
+        });
         status.init_container_statuses = Some(vec![running]);
         status.conditions = Some(vec![PodCondition {
             condition_type: "Ready".to_string(),

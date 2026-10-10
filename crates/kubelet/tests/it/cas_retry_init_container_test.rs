@@ -15,7 +15,10 @@
 
 use async_trait::async_trait;
 use rusternetes_common::{
-    resources::{Container, ContainerState, ContainerStatus, Pod, PodSpec, PodStatus},
+    resources::{
+        Container, ContainerState, ContainerStateTerminated, ContainerStateWaiting,
+        ContainerStatus, Pod, PodSpec, PodStatus,
+    },
     types::{ObjectMeta, Phase, TypeMeta},
     Error,
 };
@@ -129,14 +132,17 @@ fn get_fresh_init_container_statuses() -> Option<Vec<ContainerStatus>> {
             name: "init-1".to_string(),
             ready: true,
             restart_count: 0,
-            state: Some(ContainerState::Terminated {
-                exit_code: 0,
-                reason: Some("Completed".to_string()),
-                message: None,
-                started_at: None,
-                finished_at: None,
-                container_id: None,
-                signal: None,
+            state: Some(ContainerState {
+                terminated: Some(ContainerStateTerminated {
+                    exit_code: 0,
+                    reason: Some("Completed".to_string()),
+                    message: None,
+                    started_at: None,
+                    finished_at: None,
+                    container_id: None,
+                    signal: None,
+                }),
+                ..Default::default()
             }),
             last_state: None,
             image: Some("busybox:latest".to_string()),
@@ -154,14 +160,17 @@ fn get_fresh_init_container_statuses() -> Option<Vec<ContainerStatus>> {
             name: "init-2".to_string(),
             ready: true,
             restart_count: 0,
-            state: Some(ContainerState::Terminated {
-                exit_code: 0,
-                reason: Some("Completed".to_string()),
-                message: None,
-                started_at: None,
-                finished_at: None,
-                container_id: None,
-                signal: None,
+            state: Some(ContainerState {
+                terminated: Some(ContainerStateTerminated {
+                    exit_code: 0,
+                    reason: Some("Completed".to_string()),
+                    message: None,
+                    started_at: None,
+                    finished_at: None,
+                    container_id: None,
+                    signal: None,
+                }),
+                ..Default::default()
             }),
             last_state: None,
             image: Some("busybox:latest".to_string()),
@@ -185,9 +194,12 @@ fn get_stale_init_container_statuses() -> Option<Vec<ContainerStatus>> {
             name: "init-1".to_string(),
             ready: false, // stale — intermediate write before init completed
             restart_count: 0,
-            state: Some(ContainerState::Waiting {
-                reason: Some("PodInitializing".to_string()),
-                message: None,
+            state: Some(ContainerState {
+                waiting: Some(ContainerStateWaiting {
+                    reason: Some("PodInitializing".to_string()),
+                    message: None,
+                }),
+                ..Default::default()
             }),
             last_state: None,
             image: Some("busybox:latest".to_string()),
@@ -205,9 +217,12 @@ fn get_stale_init_container_statuses() -> Option<Vec<ContainerStatus>> {
             name: "init-2".to_string(),
             ready: false, // stale
             restart_count: 0,
-            state: Some(ContainerState::Waiting {
-                reason: Some("PodInitializing".to_string()),
-                message: None,
+            state: Some(ContainerState {
+                waiting: Some(ContainerStateWaiting {
+                    reason: Some("PodInitializing".to_string()),
+                    message: None,
+                }),
+                ..Default::default()
             }),
             last_state: None,
             image: Some("busybox:latest".to_string()),
@@ -491,7 +506,10 @@ async fn test_9ff9e3a_init_container_statuses_refreshed_on_cas_retry() {
         );
         matches!(
             ic.state,
-            Some(ContainerState::Terminated { exit_code: 0, .. })
+            Some(ContainerState {
+                terminated: Some(ContainerStateTerminated { exit_code: 0, .. }),
+                ..
+            })
         );
     }
 

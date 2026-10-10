@@ -164,14 +164,17 @@ fn failed_status_finished_ago(secs_ago: i64) -> PodStatus {
             name: "task".to_string(),
             ready: false,
             restart_count: 0,
-            state: Some(ContainerState::Terminated {
-                exit_code: 1,
-                signal: None,
-                reason: Some("Error".to_string()),
-                message: None,
-                started_at: None,
-                finished_at: Some(finished.to_rfc3339()),
-                container_id: None,
+            state: Some(ContainerState {
+                terminated: Some(ContainerStateTerminated {
+                    exit_code: 1,
+                    signal: None,
+                    reason: Some("Error".to_string()),
+                    message: None,
+                    started_at: None,
+                    finished_at: Some(finished.to_rfc3339()),
+                    container_id: None,
+                }),
+                ..Default::default()
             }),
             last_state: None,
             image: Some("busybox".to_string()),

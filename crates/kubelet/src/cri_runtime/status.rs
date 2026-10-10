@@ -7,7 +7,10 @@
 //! top.
 
 use rusternetes_common::quantity::{Format, Quantity};
-use rusternetes_common::resources::pod::{Container, ContainerState, ContainerStatus};
+use rusternetes_common::resources::pod::{
+    Container, ContainerState, ContainerStateRunning, ContainerStateTerminated,
+    ContainerStateWaiting, ContainerStatus,
+};
 use rusternetes_common::types::ResourceRequirements;
 use rusternetes_cri::v1;
 use std::collections::HashMap;
@@ -108,8 +111,13 @@ fn container_status_resources(
     // container ID has not changed (kubelet_pods.go:2345-2355).
     let old_resources = old
         .filter(|o| {
-            matches!(o.state, Some(ContainerState::Running { .. }))
-                && o.container_id.as_deref() == Some(cri.id.as_str())
+            matches!(
+                o.state,
+                Some(ContainerState {
+                    running: Some(ContainerStateRunning { .. }),
+                    ..
+                })
+            ) && o.container_id.as_deref() == Some(cri.id.as_str())
         })
         .and_then(|o| o.resources.as_ref());
 
@@ -308,25 +316,37 @@ fn non_empty(s: String) -> Option<String> {
 /// Map the CRI runtime state into a rusternetes [`ContainerState`].
 fn map_state(cri: &v1::ContainerStatus) -> ContainerState {
     match v1::ContainerState::try_from(cri.state).unwrap_or(v1::ContainerState::ContainerUnknown) {
-        v1::ContainerState::ContainerCreated => ContainerState::Waiting {
-            reason: Some("ContainerCreating".to_string()),
-            message: empty_to_none(&cri.message),
+        v1::ContainerState::ContainerCreated => ContainerState {
+            waiting: Some(ContainerStateWaiting {
+                reason: Some("ContainerCreating".to_string()),
+                message: empty_to_none(&cri.message),
+            }),
+            ..Default::default()
         },
-        v1::ContainerState::ContainerRunning => ContainerState::Running {
-            started_at: nanos_to_rfc3339(cri.started_at),
+        v1::ContainerState::ContainerRunning => ContainerState {
+            running: Some(ContainerStateRunning {
+                started_at: nanos_to_rfc3339(cri.started_at),
+            }),
+            ..Default::default()
         },
-        v1::ContainerState::ContainerExited => ContainerState::Terminated {
-            exit_code: cri.exit_code,
-            signal: None,
-            reason: empty_to_none(&cri.reason),
-            message: empty_to_none(&cri.message),
-            started_at: nanos_to_rfc3339(cri.started_at),
-            finished_at: nanos_to_rfc3339(cri.finished_at),
-            container_id: empty_to_none(&cri.id),
+        v1::ContainerState::ContainerExited => ContainerState {
+            terminated: Some(ContainerStateTerminated {
+                exit_code: cri.exit_code,
+                signal: None,
+                reason: empty_to_none(&cri.reason),
+                message: empty_to_none(&cri.message),
+                started_at: nanos_to_rfc3339(cri.started_at),
+                finished_at: nanos_to_rfc3339(cri.finished_at),
+                container_id: empty_to_none(&cri.id),
+            }),
+            ..Default::default()
         },
-        v1::ContainerState::ContainerUnknown => ContainerState::Waiting {
-            reason: Some("Unknown".to_string()),
-            message: empty_to_none(&cri.message),
+        v1::ContainerState::ContainerUnknown => ContainerState {
+            waiting: Some(ContainerStateWaiting {
+                reason: Some("Unknown".to_string()),
+                message: empty_to_none(&cri.message),
+            }),
+            ..Default::default()
         },
     }
 }
@@ -656,7 +676,13 @@ mod tests {
         assert!(s.ready);
         assert_eq!(s.restart_count, 2);
         assert_eq!(s.container_id.as_deref(), Some("ctr-abc"));
-        assert!(matches!(s.state, Some(ContainerState::Running { .. })));
+        assert!(matches!(
+            s.state,
+            Some(ContainerState {
+                running: Some(ContainerStateRunning { .. }),
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -668,7 +694,10 @@ mod tests {
         );
         assert!(!s.ready);
         match s.state {
-            Some(ContainerState::Waiting { reason, .. }) => {
+            Some(ContainerState {
+                waiting: Some(ContainerStateWaiting { reason, .. }),
+                ..
+            }) => {
                 assert_eq!(reason.as_deref(), Some("ContainerCreating"));
             }
             other => panic!("expected Waiting, got {other:?}"),
@@ -683,9 +712,13 @@ mod tests {
         let s = map_container_status(&cri, None, None);
         assert!(!s.ready);
         match s.state {
-            Some(ContainerState::Terminated {
-                exit_code,
-                finished_at,
+            Some(ContainerState {
+                terminated:
+                    Some(ContainerStateTerminated {
+                        exit_code,
+                        finished_at,
+                        ..
+                    }),
                 ..
             }) => {
                 assert_eq!(exit_code, 137);

@@ -592,7 +592,10 @@ mod tests {
         assert_eq!(parse_quantity_bytes("-1Gi"), None);
         assert_eq!(parse_quantity_bytes("-1"), None);
     }
-    use rusternetes_common::resources::{Container, ContainerState, ContainerStatus, Pod, PodSpec};
+    use rusternetes_common::resources::{
+        Container, ContainerState, ContainerStateRunning, ContainerStateTerminated,
+        ContainerStateWaiting, ContainerStatus, Pod, PodSpec,
+    };
     use rusternetes_common::types::{ObjectMeta, TypeMeta};
 
     fn make_container(name: &str) -> Container {
@@ -2665,14 +2668,17 @@ mod tests {
             name: "init-fail".to_string(),
             ready: false,
             restart_count: 0,
-            state: Some(ContainerState::Terminated {
-                exit_code: 1,
-                signal: None,
-                reason: Some("Error".to_string()),
-                message: None,
-                started_at: Some("2026-01-01T00:00:00Z".to_string()),
-                finished_at: Some("2026-01-01T00:00:01Z".to_string()),
-                container_id: Some("docker://abc123".to_string()),
+            state: Some(ContainerState {
+                terminated: Some(ContainerStateTerminated {
+                    exit_code: 1,
+                    signal: None,
+                    reason: Some("Error".to_string()),
+                    message: None,
+                    started_at: Some("2026-01-01T00:00:00Z".to_string()),
+                    finished_at: Some("2026-01-01T00:00:01Z".to_string()),
+                    container_id: Some("docker://abc123".to_string()),
+                }),
+                ..Default::default()
             }),
             last_state: None,
             image: Some("busybox:latest".to_string()),
@@ -2702,9 +2708,12 @@ mod tests {
                     name: c.name.clone(),
                     ready: false,
                     restart_count: 0,
-                    state: Some(ContainerState::Waiting {
-                        reason: Some("PodInitializing".to_string()),
-                        message: None,
+                    state: Some(ContainerState {
+                        waiting: Some(ContainerStateWaiting {
+                            reason: Some("PodInitializing".to_string()),
+                            message: None,
+                        }),
+                        ..Default::default()
                     }),
                     last_state: None,
                     image: Some(c.image.clone()),
@@ -2775,7 +2784,10 @@ mod tests {
         );
 
         match &init_status.state {
-            Some(ContainerState::Terminated { exit_code, .. }) => {
+            Some(ContainerState {
+                terminated: Some(ContainerStateTerminated { exit_code, .. }),
+                ..
+            }) => {
                 assert_eq!(*exit_code, 1, "init container exit code should be 1");
             }
             other => panic!("Expected Terminated state, got: {:?}", other),
@@ -2805,7 +2817,10 @@ mod tests {
         );
 
         match &app_status.state {
-            Some(ContainerState::Waiting { reason, .. }) => {
+            Some(ContainerState {
+                waiting: Some(ContainerStateWaiting { reason, .. }),
+                ..
+            }) => {
                 assert_eq!(
                     reason.as_deref(),
                     Some("PodInitializing"),
@@ -2847,7 +2862,10 @@ mod tests {
         assert!(app_status.container_id.is_none());
 
         match &app_status.state {
-            Some(ContainerState::Waiting { reason, .. }) => {
+            Some(ContainerState {
+                waiting: Some(ContainerStateWaiting { reason, .. }),
+                ..
+            }) => {
                 assert_eq!(reason.as_deref(), Some("PodInitializing"));
             }
             other => panic!("Expected Waiting state for app container, got: {:?}", other),
@@ -2923,20 +2941,27 @@ mod tests {
         let started = "2026-01-01T00:00:00Z".to_string();
         let finished = "2026-01-01T00:01:00Z".to_string();
 
-        let state = ContainerState::Terminated {
-            exit_code: 0,
-            signal: None,
-            reason: Some("Completed".to_string()),
-            message: None,
-            started_at: Some(started.clone()),
-            finished_at: Some(finished.clone()),
-            container_id: Some("docker://abc123".to_string()),
+        let state = ContainerState {
+            terminated: Some(ContainerStateTerminated {
+                exit_code: 0,
+                signal: None,
+                reason: Some("Completed".to_string()),
+                message: None,
+                started_at: Some(started.clone()),
+                finished_at: Some(finished.clone()),
+                container_id: Some("docker://abc123".to_string()),
+            }),
+            ..Default::default()
         };
 
         match state {
-            ContainerState::Terminated {
-                started_at,
-                finished_at,
+            ContainerState {
+                terminated:
+                    Some(ContainerStateTerminated {
+                        started_at,
+                        finished_at,
+                        ..
+                    }),
                 ..
             } => {
                 assert_eq!(
@@ -2957,22 +2982,28 @@ mod tests {
     #[test]
     fn test_container_status_last_state_preserved() {
         // When a container restarts, last_state should be the previous state.
-        let prev_state = ContainerState::Terminated {
-            exit_code: 1,
-            signal: None,
-            reason: Some("Error".to_string()),
-            message: None,
-            started_at: Some("2026-01-01T00:00:00Z".to_string()),
-            finished_at: Some("2026-01-01T00:01:00Z".to_string()),
-            container_id: Some("docker://prev123".to_string()),
+        let prev_state = ContainerState {
+            terminated: Some(ContainerStateTerminated {
+                exit_code: 1,
+                signal: None,
+                reason: Some("Error".to_string()),
+                message: None,
+                started_at: Some("2026-01-01T00:00:00Z".to_string()),
+                finished_at: Some("2026-01-01T00:01:00Z".to_string()),
+                container_id: Some("docker://prev123".to_string()),
+            }),
+            ..Default::default()
         };
 
         let status = ContainerStatus {
             name: "app".to_string(),
             ready: false,
             restart_count: 1,
-            state: Some(ContainerState::Running {
-                started_at: Some("2026-01-01T00:02:00Z".to_string()),
+            state: Some(ContainerState {
+                running: Some(ContainerStateRunning {
+                    started_at: Some("2026-01-01T00:02:00Z".to_string()),
+                }),
+                ..Default::default()
             }),
             last_state: Some(prev_state.clone()),
             image: Some("nginx:latest".to_string()),
@@ -2989,7 +3020,10 @@ mod tests {
 
         assert!(status.last_state.is_some(), "last_state should be set");
         match &status.last_state {
-            Some(ContainerState::Terminated { exit_code, .. }) => {
+            Some(ContainerState {
+                terminated: Some(ContainerStateTerminated { exit_code, .. }),
+                ..
+            }) => {
                 assert_eq!(
                     *exit_code, 1,
                     "last_state should have the previous exit code"
@@ -3022,8 +3056,11 @@ mod tests {
             name: "web".to_string(),
             ready: true,
             restart_count: 0,
-            state: Some(ContainerState::Running {
-                started_at: Some("2026-01-01T00:00:00Z".to_string()),
+            state: Some(ContainerState {
+                running: Some(ContainerStateRunning {
+                    started_at: Some("2026-01-01T00:00:00Z".to_string()),
+                }),
+                ..Default::default()
             }),
             last_state: None,
             image: Some("nginx:1.25".to_string()),
@@ -3499,15 +3536,21 @@ mod tests {
         // K8s conformance expects: init container that exits non-zero with RestartAlways
         // should show CrashLoopBackOff in status.
         // See: init_container.go:414-419 — checks status.State.Terminated.ExitCode != 0
-        let state = ContainerState::Waiting {
-            reason: Some("CrashLoopBackOff".to_string()),
-            message: Some(
-                "back-off restarting failed container init container \"init1\" exited with 1"
-                    .to_string(),
-            ),
+        let state = ContainerState {
+            waiting: Some(ContainerStateWaiting {
+                reason: Some("CrashLoopBackOff".to_string()),
+                message: Some(
+                    "back-off restarting failed container init container \"init1\" exited with 1"
+                        .to_string(),
+                ),
+            }),
+            ..Default::default()
         };
         match &state {
-            ContainerState::Waiting { reason, .. } => {
+            ContainerState {
+                waiting: Some(ContainerStateWaiting { reason, .. }),
+                ..
+            } => {
                 assert_eq!(reason.as_deref(), Some("CrashLoopBackOff"));
             }
             _ => panic!("Expected Waiting state"),
@@ -3523,9 +3566,12 @@ mod tests {
             name: "app".to_string(),
             ready: false,
             restart_count: 0,
-            state: Some(ContainerState::Waiting {
-                reason: Some("PodInitializing".to_string()),
-                message: None,
+            state: Some(ContainerState {
+                waiting: Some(ContainerStateWaiting {
+                    reason: Some("PodInitializing".to_string()),
+                    message: None,
+                }),
+                ..Default::default()
             }),
             last_state: None,
             image: Some("nginx:latest".to_string()),
@@ -3540,7 +3586,10 @@ mod tests {
             stop_signal: None,
         };
         match &app_status.state {
-            Some(ContainerState::Waiting { reason, .. }) => {
+            Some(ContainerState {
+                waiting: Some(ContainerStateWaiting { reason, .. }),
+                ..
+            }) => {
                 assert_eq!(
                     reason.as_deref(),
                     Some("PodInitializing"),
@@ -3568,18 +3617,24 @@ mod tests {
             name: "init1".to_string(),
             ready: false,
             restart_count: 3,
-            state: Some(ContainerState::Waiting {
-                reason: Some("CrashLoopBackOff".to_string()),
-                message: Some("back-off restarting failed container".to_string()),
+            state: Some(ContainerState {
+                waiting: Some(ContainerStateWaiting {
+                    reason: Some("CrashLoopBackOff".to_string()),
+                    message: Some("back-off restarting failed container".to_string()),
+                }),
+                ..Default::default()
             }),
-            last_state: Some(ContainerState::Terminated {
-                exit_code: 1,
-                signal: None,
-                reason: Some("Error".to_string()),
-                message: None,
-                started_at: None,
-                finished_at: None,
-                container_id: None,
+            last_state: Some(ContainerState {
+                terminated: Some(ContainerStateTerminated {
+                    exit_code: 1,
+                    signal: None,
+                    reason: Some("Error".to_string()),
+                    message: None,
+                    started_at: None,
+                    finished_at: None,
+                    container_id: None,
+                }),
+                ..Default::default()
             }),
             image: Some("init-image:latest".to_string()),
             image_id: None,
@@ -3601,7 +3656,10 @@ mod tests {
             "Init container should have lastTerminationState after restart"
         );
         match &status.last_state {
-            Some(ContainerState::Terminated { exit_code, .. }) => {
+            Some(ContainerState {
+                terminated: Some(ContainerStateTerminated { exit_code, .. }),
+                ..
+            }) => {
                 assert_ne!(
                     *exit_code, 0,
                     "LastTerminationState should show non-zero exit code"
@@ -3663,18 +3721,24 @@ mod tests {
                 name: "init1".to_string(),
                 ready: false,
                 restart_count: 1,
-                state: Some(ContainerState::Waiting {
-                    reason: Some("CrashLoopBackOff".to_string()),
-                    message: Some("back-off restarting failed container".to_string()),
+                state: Some(ContainerState {
+                    waiting: Some(ContainerStateWaiting {
+                        reason: Some("CrashLoopBackOff".to_string()),
+                        message: Some("back-off restarting failed container".to_string()),
+                    }),
+                    ..Default::default()
                 }),
-                last_state: Some(ContainerState::Terminated {
-                    exit_code: 1,
-                    signal: None,
-                    reason: Some("Error".to_string()),
-                    message: None,
-                    started_at: None,
-                    finished_at: None,
-                    container_id: None,
+                last_state: Some(ContainerState {
+                    terminated: Some(ContainerStateTerminated {
+                        exit_code: 1,
+                        signal: None,
+                        reason: Some("Error".to_string()),
+                        message: None,
+                        started_at: None,
+                        finished_at: None,
+                        container_id: None,
+                    }),
+                    ..Default::default()
                 }),
                 image: None,
                 image_id: None,
@@ -3691,9 +3755,12 @@ mod tests {
                 name: "init2".to_string(),
                 ready: false,
                 restart_count: 0,
-                state: Some(ContainerState::Waiting {
-                    reason: Some("PodInitializing".to_string()),
-                    message: None,
+                state: Some(ContainerState {
+                    waiting: Some(ContainerStateWaiting {
+                        reason: Some("PodInitializing".to_string()),
+                        message: None,
+                    }),
+                    ..Default::default()
                 }),
                 last_state: None,
                 image: None,
@@ -3711,7 +3778,10 @@ mod tests {
 
         // First init container should show failure
         match &init_statuses[0].state {
-            Some(ContainerState::Waiting { reason, .. }) => {
+            Some(ContainerState {
+                waiting: Some(ContainerStateWaiting { reason, .. }),
+                ..
+            }) => {
                 assert_eq!(reason.as_deref(), Some("CrashLoopBackOff"));
             }
             _ => panic!("First init container should be Waiting/CrashLoopBackOff"),
@@ -3719,7 +3789,10 @@ mod tests {
 
         // Second init container should be waiting
         match &init_statuses[1].state {
-            Some(ContainerState::Waiting { reason, .. }) => {
+            Some(ContainerState {
+                waiting: Some(ContainerStateWaiting { reason, .. }),
+                ..
+            }) => {
                 assert_eq!(reason.as_deref(), Some("PodInitializing"));
             }
             _ => panic!("Second init container should be Waiting/PodInitializing"),
@@ -3734,21 +3807,27 @@ mod tests {
     /// after the kubelet restarts the failed container.
     #[test]
     fn test_last_state_terminated_carries_exit_code() {
-        let prev_terminated = ContainerState::Terminated {
-            exit_code: 42,
-            signal: None,
-            reason: Some("Error".to_string()),
-            message: None,
-            started_at: Some("2026-01-01T00:00:00Z".to_string()),
-            finished_at: Some("2026-01-01T00:00:05Z".to_string()),
-            container_id: Some("docker://prev".to_string()),
+        let prev_terminated = ContainerState {
+            terminated: Some(ContainerStateTerminated {
+                exit_code: 42,
+                signal: None,
+                reason: Some("Error".to_string()),
+                message: None,
+                started_at: Some("2026-01-01T00:00:00Z".to_string()),
+                finished_at: Some("2026-01-01T00:00:05Z".to_string()),
+                container_id: Some("docker://prev".to_string()),
+            }),
+            ..Default::default()
         };
         let cs = ContainerStatus {
             name: "app".to_string(),
             ready: true,
             restart_count: 1,
-            state: Some(ContainerState::Running {
-                started_at: Some("2026-01-01T00:00:10Z".to_string()),
+            state: Some(ContainerState {
+                running: Some(ContainerStateRunning {
+                    started_at: Some("2026-01-01T00:00:10Z".to_string()),
+                }),
+                ..Default::default()
             }),
             last_state: Some(prev_terminated.clone()),
             image: Some("busybox".to_string()),
@@ -3764,7 +3843,10 @@ mod tests {
         };
 
         match cs.last_state {
-            Some(ContainerState::Terminated { exit_code, .. }) => {
+            Some(ContainerState {
+                terminated: Some(ContainerStateTerminated { exit_code, .. }),
+                ..
+            }) => {
                 assert_eq!(exit_code, 42, "lastState exit_code must match previous run");
             }
             _ => panic!("lastState must be Terminated with exit_code"),
@@ -3790,14 +3872,17 @@ mod tests {
             name: "main".to_string(),
             ready: false,
             restart_count: 0,
-            state: Some(ContainerState::Terminated {
-                exit_code: 137,
-                signal: None,
-                reason: Some("OOMKilled".to_string()),
-                message: None,
-                started_at: Some("2026-01-01T00:00:00Z".to_string()),
-                finished_at: Some("2026-01-01T00:00:30Z".to_string()),
-                container_id: Some("docker://abc".to_string()),
+            state: Some(ContainerState {
+                terminated: Some(ContainerStateTerminated {
+                    exit_code: 137,
+                    signal: None,
+                    reason: Some("OOMKilled".to_string()),
+                    message: None,
+                    started_at: Some("2026-01-01T00:00:00Z".to_string()),
+                    finished_at: Some("2026-01-01T00:00:30Z".to_string()),
+                    container_id: Some("docker://abc".to_string()),
+                }),
+                ..Default::default()
             }),
             last_state: None,
             image: Some("busybox".to_string()),

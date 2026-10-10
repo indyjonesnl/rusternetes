@@ -11,7 +11,7 @@
 //! breaks the gate would fail here.
 
 use rusternetes_common::resources::{
-    Container, ContainerState, ContainerStatus, Pod, PodSpec, PodStatus,
+    Container, ContainerState, ContainerStateTerminated, ContainerStatus, Pod, PodSpec, PodStatus,
 };
 use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
 use rusternetes_kubelet::kubelet::pod_status_equal;
@@ -21,14 +21,17 @@ fn make_succeeded_pod() -> Pod {
         name: "init-0".to_string(),
         ready: true,
         restart_count: 0,
-        state: Some(ContainerState::Terminated {
-            exit_code: 0,
-            signal: None,
-            reason: Some("Completed".to_string()),
-            message: None,
-            started_at: Some("2026-05-13T10:00:00Z".to_string()),
-            finished_at: Some("2026-05-13T10:00:01Z".to_string()),
-            container_id: Some("docker://init0".to_string()),
+        state: Some(ContainerState {
+            terminated: Some(ContainerStateTerminated {
+                exit_code: 0,
+                signal: None,
+                reason: Some("Completed".to_string()),
+                message: None,
+                started_at: Some("2026-05-13T10:00:00Z".to_string()),
+                finished_at: Some("2026-05-13T10:00:01Z".to_string()),
+                container_id: Some("docker://init0".to_string()),
+            }),
+            ..Default::default()
         }),
         last_state: None,
         image: Some("busybox:1.36".to_string()),
@@ -46,14 +49,17 @@ fn make_succeeded_pod() -> Pod {
         name: "agnhost".to_string(),
         ready: false,
         restart_count: 0,
-        state: Some(ContainerState::Terminated {
-            exit_code: 0,
-            signal: None,
-            reason: Some("Completed".to_string()),
-            message: None,
-            started_at: Some("2026-05-13T10:00:02Z".to_string()),
-            finished_at: Some("2026-05-13T10:00:05Z".to_string()),
-            container_id: Some("docker://app0".to_string()),
+        state: Some(ContainerState {
+            terminated: Some(ContainerStateTerminated {
+                exit_code: 0,
+                signal: None,
+                reason: Some("Completed".to_string()),
+                message: None,
+                started_at: Some("2026-05-13T10:00:02Z".to_string()),
+                finished_at: Some("2026-05-13T10:00:05Z".to_string()),
+                container_id: Some("docker://app0".to_string()),
+            }),
+            ..Default::default()
         }),
         last_state: None,
         image: Some("registry.k8s.io/e2e-test-images/agnhost:2.40".to_string()),

@@ -1,5 +1,6 @@
 use rusternetes_common::resources::{
-    Container, ContainerState, ContainerStatus, Pod, PodSpec, PodStatus,
+    Container, ContainerState, ContainerStateRunning, ContainerStateTerminated, ContainerStatus,
+    Pod, PodSpec, PodStatus,
 };
 use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
 
@@ -216,14 +217,17 @@ fn test_sidecar_runs_alongside_main_containers() {
             // Regular init container - completed
             ContainerStatus {
                 name: "init-0".to_string(),
-                state: Some(ContainerState::Terminated {
-                    exit_code: 0,
-                    reason: Some("Completed".to_string()),
-                    signal: None,
-                    message: None,
-                    started_at: None,
-                    finished_at: None,
-                    container_id: None,
+                state: Some(ContainerState {
+                    terminated: Some(ContainerStateTerminated {
+                        exit_code: 0,
+                        reason: Some("Completed".to_string()),
+                        signal: None,
+                        message: None,
+                        started_at: None,
+                        finished_at: None,
+                        container_id: None,
+                    }),
+                    ..Default::default()
                 }),
                 ready: false,
                 restart_count: 0,
@@ -242,8 +246,11 @@ fn test_sidecar_runs_alongside_main_containers() {
             // Sidecar - running
             ContainerStatus {
                 name: "sidecar-0".to_string(),
-                state: Some(ContainerState::Running {
-                    started_at: Some("2024-01-01T00:00:05Z".to_string()),
+                state: Some(ContainerState {
+                    running: Some(ContainerStateRunning {
+                        started_at: Some("2024-01-01T00:00:05Z".to_string()),
+                    }),
+                    ..Default::default()
                 }),
                 ready: true,
                 restart_count: 0,
@@ -262,8 +269,11 @@ fn test_sidecar_runs_alongside_main_containers() {
         ]),
         container_statuses: Some(vec![ContainerStatus {
             name: "app-0".to_string(),
-            state: Some(ContainerState::Running {
-                started_at: Some("2024-01-01T00:00:06Z".to_string()),
+            state: Some(ContainerState {
+                running: Some(ContainerStateRunning {
+                    started_at: Some("2024-01-01T00:00:06Z".to_string()),
+                }),
+                ..Default::default()
             }),
             ready: true,
             restart_count: 0,
@@ -296,8 +306,12 @@ fn test_sidecar_runs_alongside_main_containers() {
 
     // Regular init container should be terminated
     match &init_statuses[0].state {
-        Some(ContainerState::Terminated {
-            exit_code, reason, ..
+        Some(ContainerState {
+            terminated:
+                Some(ContainerStateTerminated {
+                    exit_code, reason, ..
+                }),
+            ..
         }) => {
             assert_eq!(*exit_code, 0);
             assert_eq!(*reason, Some("Completed".to_string()));
@@ -309,7 +323,10 @@ fn test_sidecar_runs_alongside_main_containers() {
     assert_eq!(init_statuses[1].name, "sidecar-0");
     assert!(matches!(
         init_statuses[1].state,
-        Some(ContainerState::Running { .. })
+        Some(ContainerState {
+            running: Some(ContainerStateRunning { .. }),
+            ..
+        })
     ));
     assert!(init_statuses[1].ready);
 
@@ -318,7 +335,10 @@ fn test_sidecar_runs_alongside_main_containers() {
     assert_eq!(app_statuses.len(), 1);
     assert!(matches!(
         app_statuses[0].state,
-        Some(ContainerState::Running { .. })
+        Some(ContainerState {
+            running: Some(ContainerStateRunning { .. }),
+            ..
+        })
     ));
     assert!(app_statuses[0].ready);
 }
@@ -425,14 +445,17 @@ fn test_sidecar_failure_should_not_block_pod() {
         start_time: None,
         init_container_statuses: Some(vec![ContainerStatus {
             name: "sidecar-0".to_string(),
-            state: Some(ContainerState::Terminated {
-                exit_code: 1,
-                reason: Some("Error".to_string()),
-                signal: None,
-                message: None,
-                started_at: None,
-                finished_at: None,
-                container_id: None,
+            state: Some(ContainerState {
+                terminated: Some(ContainerStateTerminated {
+                    exit_code: 1,
+                    reason: Some("Error".to_string()),
+                    signal: None,
+                    message: None,
+                    started_at: None,
+                    finished_at: None,
+                    container_id: None,
+                }),
+                ..Default::default()
             }),
             ready: false,
             restart_count: 3,
@@ -450,8 +473,11 @@ fn test_sidecar_failure_should_not_block_pod() {
         }]),
         container_statuses: Some(vec![ContainerStatus {
             name: "app-0".to_string(),
-            state: Some(ContainerState::Running {
-                started_at: Some("2024-01-01T00:00:00Z".to_string()),
+            state: Some(ContainerState {
+                running: Some(ContainerStateRunning {
+                    started_at: Some("2024-01-01T00:00:00Z".to_string()),
+                }),
+                ..Default::default()
             }),
             ready: true,
             restart_count: 0,

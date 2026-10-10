@@ -1660,82 +1660,87 @@ pub struct ResourceHealth {
     pub health: Option<String>,
 }
 
-/// Go's `ContainerState` (core/v1/types.go) is a struct of three optional
-/// pointers; nothing requires exactly one (`ValidateContainerStateTransition`,
-/// pkg/apis/core/validation/validation.go:5841, only constrains Terminated
-/// transitions), so a strategic-merge status patch without `waiting: null`
-/// stores `running` and `waiting` together (#2453). This enum holds one, so the
-/// hand-written `Deserialize` below accepts several keys and keeps the most
-/// final one (Terminated, then Running, then Waiting); `null` keys are absent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(
-    remote = "Self",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
-pub enum ContainerState {
-    Waiting {
-        reason: Option<String>,
-        message: Option<String>,
-    },
-    Running {
-        #[serde(
-            default,
-            skip_serializing_if = "Option::is_none",
-            serialize_with = "crate::types::k8s_time_str::serialize",
-            deserialize_with = "crate::types::k8s_time_str::deserialize"
-        )]
-        started_at: Option<String>,
-    },
-    Terminated {
-        exit_code: i32,
-        signal: Option<i32>,
-        reason: Option<String>,
-        message: Option<String>,
-        #[serde(
-            default,
-            skip_serializing_if = "Option::is_none",
-            serialize_with = "crate::types::k8s_time_str::serialize",
-            deserialize_with = "crate::types::k8s_time_str::deserialize"
-        )]
-        started_at: Option<String>,
-        #[serde(
-            default,
-            skip_serializing_if = "Option::is_none",
-            serialize_with = "crate::types::k8s_time_str::serialize",
-            deserialize_with = "crate::types::k8s_time_str::deserialize"
-        )]
-        finished_at: Option<String>,
-        container_id: Option<String>,
-    },
+/// ContainerState holds a possible state of container. Only one of its members
+/// may be specified; if none are specified, the default one is
+/// `ContainerStateWaiting`.
+///
+/// Ported from `ContainerState` (staging/src/k8s.io/api/core/v1/types.go:3300):
+/// a struct of three optional pointers. Nothing requires exactly one
+/// (`ValidateContainerStateTransition`, pkg/apis/core/validation/validation.go:5841,
+/// only constrains Terminated transitions), so a strategic-merge status patch
+/// without `waiting: null` stores `running` and `waiting` together (#2453).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerState {
+    /// Details about a waiting container
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<ContainerStateWaiting>,
+    /// Details about a running container
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running: Option<ContainerStateRunning>,
+    /// Details about a terminated container
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminated: Option<ContainerStateTerminated>,
 }
 
-impl Serialize for ContainerState {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        ContainerState::serialize(self, serializer)
-    }
+/// ContainerStateWaiting is a waiting state of a container
+/// (types.go:3257).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerStateWaiting {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
-impl<'de> Deserialize<'de> for ContainerState {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = serde_json::Value::deserialize(deserializer)?;
-        let value = match value {
-            serde_json::Value::Object(mut map) if map.len() > 1 => {
-                map.retain(|_, v| !v.is_null());
-                if map.len() > 1 {
-                    let keep = ["terminated", "running", "waiting"]
-                        .into_iter()
-                        .find(|k| map.contains_key(*k));
-                    if let Some(k) = keep {
-                        map.retain(|key, _| key == k);
-                    }
-                }
-                serde_json::Value::Object(map)
-            }
-            v => v,
-        };
-        ContainerState::deserialize(value).map_err(serde::de::Error::custom)
-    }
+/// ContainerStateRunning is a running state of a container (types.go:3267).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerStateRunning {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::types::k8s_time_str::serialize",
+        deserialize_with = "crate::types::k8s_time_str::deserialize"
+    )]
+    pub started_at: Option<String>,
+}
+
+/// ContainerStateTerminated is a terminated state of a container
+/// (types.go:3274).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerStateTerminated {
+    #[serde(default)]
+    pub exit_code: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::types::k8s_time_str::serialize",
+        deserialize_with = "crate::types::k8s_time_str::deserialize"
+    )]
+    pub started_at: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::types::k8s_time_str::serialize",
+        deserialize_with = "crate::types::k8s_time_str::deserialize"
+    )]
+    pub finished_at: Option<String>,
+    #[serde(
+        rename = "containerID",
+        alias = "containerId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub container_id: Option<String>,
 }
 
 /// Affinity is a group of affinity scheduling rules
@@ -2115,26 +2120,28 @@ pub struct PodResourceClaimStatus {
 mod tests {
     use super::*;
 
-    /// #2453: Go's struct tolerates several states set at once.
+    /// #2453/#2454: Go's struct holds several states at once and encodes
+    /// them all back (core/v1/types.go:3300 `ContainerState`).
     #[test]
-    fn container_state_with_several_keys_keeps_the_most_final() {
-        let s: ContainerState = serde_json::from_value(serde_json::json!({
+    fn container_state_with_several_keys_round_trips() {
+        let input = serde_json::json!({
             "running": {"startedAt": "2026-10-07T00:00:00Z"},
             "waiting": {"reason": "ContainerCreating"}
-        }))
-        .unwrap();
-        assert!(matches!(s, ContainerState::Running { .. }));
-        let s: ContainerState = serde_json::from_value(serde_json::json!({
-            "running": {}, "waiting": null
-        }))
-        .unwrap();
-        assert!(matches!(s, ContainerState::Running { .. }));
-        let s: ContainerState = serde_json::from_value(serde_json::json!({
+        });
+        let s: ContainerState = serde_json::from_value(input.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&s).unwrap(), input);
+        let s: ContainerState =
+            serde_json::from_value(serde_json::json!({"running": {}, "waiting": null})).unwrap();
+        assert_eq!(
+            serde_json::to_value(&s).unwrap(),
+            serde_json::json!({"running": {}})
+        );
+        let input = serde_json::json!({
             "waiting": {"reason": "x"},
             "terminated": {"exitCode": 1}
-        }))
-        .unwrap();
-        assert!(matches!(s, ContainerState::Terminated { exit_code: 1, .. }));
+        });
+        let s: ContainerState = serde_json::from_value(input.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&s).unwrap(), input);
     }
 
     /// Pod condition timestamps MUST serialize at whole-second precision, like
@@ -2491,8 +2498,11 @@ mod tests {
                 name: "app".to_string(),
                 ready: true,
                 restart_count: 0,
-                state: Some(ContainerState::Running {
-                    started_at: Some("2024-01-01T00:00:00Z".to_string()),
+                state: Some(ContainerState {
+                    running: Some(ContainerStateRunning {
+                        started_at: Some("2024-01-01T00:00:00Z".to_string()),
+                    }),
+                    ..Default::default()
                 }),
                 last_state: None,
                 image: Some("nginx:latest".to_string()),
@@ -2511,14 +2521,17 @@ mod tests {
                     name: "init-myservice".to_string(),
                     ready: true,
                     restart_count: 0,
-                    state: Some(ContainerState::Terminated {
-                        exit_code: 0,
-                        reason: Some("Completed".to_string()),
-                        signal: None,
-                        message: None,
-                        started_at: None,
-                        finished_at: None,
-                        container_id: None,
+                    state: Some(ContainerState {
+                        terminated: Some(ContainerStateTerminated {
+                            exit_code: 0,
+                            reason: Some("Completed".to_string()),
+                            signal: None,
+                            message: None,
+                            started_at: None,
+                            finished_at: None,
+                            container_id: None,
+                        }),
+                        ..Default::default()
                     }),
                     last_state: None,
                     image: Some("busybox:1.28".to_string()),
@@ -2536,14 +2549,17 @@ mod tests {
                     name: "init-mydb".to_string(),
                     ready: true,
                     restart_count: 0,
-                    state: Some(ContainerState::Terminated {
-                        exit_code: 0,
-                        reason: Some("Completed".to_string()),
-                        signal: None,
-                        message: None,
-                        started_at: None,
-                        finished_at: None,
-                        container_id: None,
+                    state: Some(ContainerState {
+                        terminated: Some(ContainerStateTerminated {
+                            exit_code: 0,
+                            reason: Some("Completed".to_string()),
+                            signal: None,
+                            message: None,
+                            started_at: None,
+                            finished_at: None,
+                            container_id: None,
+                        }),
+                        ..Default::default()
                     }),
                     last_state: None,
                     image: Some("busybox:1.28".to_string()),
@@ -2576,7 +2592,11 @@ mod tests {
 
         // Verify both init containers completed successfully
         for init_status in init_statuses {
-            if let Some(ContainerState::Terminated { exit_code, .. }) = &init_status.state {
+            if let Some(ContainerState {
+                terminated: Some(ContainerStateTerminated { exit_code, .. }),
+                ..
+            }) = &init_status.state
+            {
                 assert_eq!(*exit_code, 0);
             }
         }
@@ -3046,8 +3066,11 @@ mod tests {
                     name: "app".to_string(),
                     ready: true,
                     restart_count: 0,
-                    state: Some(ContainerState::Running {
-                        started_at: Some("2024-01-01T00:00:00Z".to_string()),
+                    state: Some(ContainerState {
+                        running: Some(ContainerStateRunning {
+                            started_at: Some("2024-01-01T00:00:00Z".to_string()),
+                        }),
+                        ..Default::default()
                     }),
                     last_state: None,
                     image: Some("nginx".to_string()),

@@ -20,7 +20,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
-use rusternetes_common::resources::pod::{Container, ContainerState, ContainerStatus, Pod, Probe};
+use rusternetes_common::resources::pod::{
+    Container, ContainerState, ContainerStateRunning, ContainerStateTerminated,
+    ContainerStateWaiting, ContainerStatus, Pod, Probe,
+};
 use rusternetes_common::resources::{ConfigMap, Secret, Service};
 use rusternetes_cri::{v1, CriClient, CriError};
 use rusternetes_storage::{build_prefix, Storage};
@@ -120,9 +123,12 @@ fn waiting_status(name: &str) -> ContainerStatus {
         name: name.to_string(),
         ready: false,
         restart_count: 0,
-        state: Some(ContainerState::Waiting {
-            reason: Some("ContainerCreating".to_string()),
-            message: None,
+        state: Some(ContainerState {
+            waiting: Some(ContainerStateWaiting {
+                reason: Some("ContainerCreating".to_string()),
+                message: None,
+            }),
+            ..Default::default()
         }),
         last_state: None,
         image: None,
@@ -196,7 +202,13 @@ fn container_has_run(cs: &ContainerStatus) -> bool {
         || cs.container_id.is_some()
         || matches!(
             cs.state,
-            Some(ContainerState::Running { .. }) | Some(ContainerState::Terminated { .. })
+            Some(ContainerState {
+                running: Some(ContainerStateRunning { .. }),
+                ..
+            }) | Some(ContainerState {
+                terminated: Some(ContainerStateTerminated { .. }),
+                ..
+            })
         )
 }
 
@@ -622,10 +634,14 @@ impl CriContainerRuntime {
     /// file (and, for `FallbackToLogsOnError`, the log tail) and override the
     /// runtime-supplied message. No-op for non-terminated states. #442.
     fn apply_termination_message(&self, pod: &Pod, name: &str, status: &mut ContainerStatus) {
-        let Some(ContainerState::Terminated {
-            exit_code,
-            reason,
-            message,
+        let Some(ContainerState {
+            terminated:
+                Some(ContainerStateTerminated {
+                    exit_code,
+                    reason,
+                    message,
+                    ..
+                }),
             ..
         }) = status.state.as_mut()
         else {
@@ -2165,7 +2181,13 @@ impl CriContainerRuntime {
             let Some(probe) = container.readiness_probe.as_ref() else {
                 continue;
             };
-            let running = matches!(st.state, Some(ContainerState::Running { .. }));
+            let running = matches!(
+                st.state,
+                Some(ContainerState {
+                    running: Some(ContainerStateRunning { .. }),
+                    ..
+                })
+            );
             st.ready = running
                 && self
                     .evaluate_container_readiness(pod, container, probe)
@@ -2713,7 +2735,11 @@ fn format_runtime_version(v: &v1::VersionResponse) -> String {
 /// maps to `Waiting{}` with an *empty* reason rather than `ContainerCreating`.
 pub(crate) fn fix_not_started_init_waiting_reason(statuses: &mut [ContainerStatus]) {
     for st in statuses {
-        if let Some(ContainerState::Waiting { reason, .. }) = &mut st.state {
+        if let Some(ContainerState {
+            waiting: Some(ContainerStateWaiting { reason, .. }),
+            ..
+        }) = &mut st.state
+        {
             if reason.as_deref() == Some("ContainerCreating") {
                 *reason = Some("PodInitializing".to_string());
             }
@@ -2729,7 +2755,7 @@ fn init_container_ready(state: &Option<ContainerState>, restartable: bool, prior
     if restartable {
         return prior;
     }
-    matches!(state, Some(ContainerState::Terminated { exit_code, .. }) if *exit_code == 0)
+    matches!(state, Some(ContainerState { terminated: Some(ContainerStateTerminated { exit_code, .. }), .. }) if *exit_code == 0)
 }
 
 /// Map a `grpc.health.v1` ServingStatus code to probe success. Per the kubelet
@@ -2963,9 +2989,12 @@ mod tests {
         let waiting = test_container_status(
             "c",
             0,
-            Some(ContainerState::Waiting {
-                reason: Some("PodInitializing".to_string()),
-                message: None,
+            Some(ContainerState {
+                waiting: Some(ContainerStateWaiting {
+                    reason: Some("PodInitializing".to_string()),
+                    message: None,
+                }),
+                ..Default::default()
             }),
             None,
         );
@@ -2982,14 +3011,17 @@ mod tests {
         let terminated = test_container_status(
             "c",
             0,
-            Some(ContainerState::Terminated {
-                exit_code: 137,
-                signal: None,
-                reason: None,
-                message: None,
-                started_at: None,
-                finished_at: None,
-                container_id: None,
+            Some(ContainerState {
+                terminated: Some(ContainerStateTerminated {
+                    exit_code: 137,
+                    signal: None,
+                    reason: None,
+                    message: None,
+                    started_at: None,
+                    finished_at: None,
+                    container_id: None,
+                }),
+                ..Default::default()
             }),
             Some("cid-0".to_string()),
         );
@@ -3000,7 +3032,10 @@ mod tests {
         let running = test_container_status(
             "c",
             2,
-            Some(ContainerState::Running { started_at: None }),
+            Some(ContainerState {
+                running: Some(ContainerStateRunning { started_at: None }),
+                ..Default::default()
+            }),
             Some("cid-2".to_string()),
         );
         let pod = pod_with_statuses(vec![running], vec![]);
@@ -3014,7 +3049,10 @@ mod tests {
         let sidecar = test_container_status(
             "side",
             1,
-            Some(ContainerState::Running { started_at: None }),
+            Some(ContainerState {
+                running: Some(ContainerStateRunning { started_at: None }),
+                ..Default::default()
+            }),
             Some("cid".to_string()),
         );
         let pod = pod_with_statuses(vec![], vec![sidecar]);
@@ -3024,17 +3062,23 @@ mod tests {
     #[test]
     fn plain_init_container_ready_only_after_successful_exit() {
         let term = |code| {
-            Some(ContainerState::Terminated {
-                exit_code: code,
-                signal: None,
-                reason: None,
-                message: None,
-                started_at: None,
-                finished_at: None,
-                container_id: None,
+            Some(ContainerState {
+                terminated: Some(ContainerStateTerminated {
+                    exit_code: code,
+                    signal: None,
+                    reason: None,
+                    message: None,
+                    started_at: None,
+                    finished_at: None,
+                    container_id: None,
+                }),
+                ..Default::default()
             })
         };
-        let running = Some(ContainerState::Running { started_at: None });
+        let running = Some(ContainerState {
+            running: Some(ContainerStateRunning { started_at: None }),
+            ..Default::default()
+        });
         // Plain init container: Ready only once it has terminated with exit 0
         // (upstream prober_manager). A non-zero exit or still-running = not ready.
         assert!(init_container_ready(&term(0), false, false));
@@ -3116,7 +3160,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        let running = Some(ContainerState::Running { started_at: None });
+        let running = Some(ContainerState {
+            running: Some(ContainerStateRunning { started_at: None }),
+            ..Default::default()
+        });
         let mut statuses = vec![
             ContainerStatus {
                 name: "plain-init".to_string(),
@@ -3858,18 +3905,24 @@ mod tests {
                 name: "init1".to_string(),
                 ready: false,
                 restart_count: 2,
-                state: Some(ContainerState::Waiting {
-                    reason: Some("CrashLoopBackOff".to_string()),
-                    message: Some("back-off restarting failed container".to_string()),
+                state: Some(ContainerState {
+                    waiting: Some(ContainerStateWaiting {
+                        reason: Some("CrashLoopBackOff".to_string()),
+                        message: Some("back-off restarting failed container".to_string()),
+                    }),
+                    ..Default::default()
                 }),
-                last_state: Some(ContainerState::Terminated {
-                    exit_code: 1,
-                    signal: None,
-                    reason: Some("Error".to_string()),
-                    message: None,
-                    started_at: None,
-                    finished_at: None,
-                    container_id: None,
+                last_state: Some(ContainerState {
+                    terminated: Some(ContainerStateTerminated {
+                        exit_code: 1,
+                        signal: None,
+                        reason: Some("Error".to_string()),
+                        message: None,
+                        started_at: None,
+                        finished_at: None,
+                        container_id: None,
+                    }),
+                    ..Default::default()
                 }),
                 ..waiting_status("init1")
             },
@@ -3881,7 +3934,10 @@ mod tests {
         // Before the fix, init2 has ContainerCreating — verify the pre-fix
         // state so the test documents the regression it catches.
         match &statuses[1].state {
-            Some(ContainerState::Waiting { reason, .. }) => {
+            Some(ContainerState {
+                waiting: Some(ContainerStateWaiting { reason, .. }),
+                ..
+            }) => {
                 assert_eq!(
                     reason.as_deref(),
                     Some("ContainerCreating"),
@@ -3895,7 +3951,10 @@ mod tests {
 
         // After the fix: init1's CrashLoopBackOff reason is preserved.
         match &statuses[0].state {
-            Some(ContainerState::Waiting { reason, .. }) => {
+            Some(ContainerState {
+                waiting: Some(ContainerStateWaiting { reason, .. }),
+                ..
+            }) => {
                 assert_eq!(
                     reason.as_deref(),
                     Some("CrashLoopBackOff"),
@@ -3907,7 +3966,10 @@ mod tests {
 
         // After the fix: init2 reports PodInitializing, not ContainerCreating.
         match &statuses[1].state {
-            Some(ContainerState::Waiting { reason, .. }) => {
+            Some(ContainerState {
+                waiting: Some(ContainerStateWaiting { reason, .. }),
+                ..
+            }) => {
                 assert_eq!(
                     reason.as_deref(),
                     Some("PodInitializing"),

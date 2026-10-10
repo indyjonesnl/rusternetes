@@ -253,7 +253,10 @@ async fn cri_container_runtime_lifecycle() {
     assert!(
         matches!(
             st.state,
-            Some(rusternetes_common::resources::pod::ContainerState::Running { .. })
+            Some(rusternetes_common::resources::pod::ContainerState {
+                running: Some(rusternetes_common::resources::pod::ContainerStateRunning { .. }),
+                ..
+            })
         ),
         "expected Running state, got {:?}",
         st.state
@@ -613,8 +616,10 @@ async fn init_container_runs_before_app() {
         .expect("pod has init containers");
     assert_eq!(init_statuses.len(), 1);
     match &init_statuses[0].state {
-        Some(rusternetes_common::resources::pod::ContainerState::Terminated {
-            exit_code, ..
+        Some(rusternetes_common::resources::pod::ContainerState {
+            terminated:
+                Some(rusternetes_common::resources::pod::ContainerStateTerminated { exit_code, .. }),
+            ..
         }) => {
             assert_eq!(*exit_code, 0, "init container should exit 0");
         }

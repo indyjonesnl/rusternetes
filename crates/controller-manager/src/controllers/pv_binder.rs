@@ -91,7 +91,9 @@ const ANN_BETA_STORAGE_CLASS: &str = "volume.beta.kubernetes.io/storage-class";
 
 /// `util.IsPodTerminated` (`pkg/volume/util/util.go:303-310`).
 fn is_pod_terminated(pod: &Pod) -> bool {
-    use rusternetes_common::resources::pod::{ContainerState, ContainerStatus};
+    use rusternetes_common::resources::pod::{
+        ContainerState, ContainerStateTerminated, ContainerStateWaiting, ContainerStatus,
+    };
     use rusternetes_common::types::Phase;
     let Some(status) = pod.status.as_ref() else {
         return false;
@@ -104,7 +106,13 @@ fn is_pod_terminated(pod: &Pod) -> bool {
         s.iter().flatten().all(|c| {
             matches!(
                 c.state,
-                Some(ContainerState::Terminated { .. }) | Some(ContainerState::Waiting { .. })
+                Some(ContainerState {
+                    terminated: Some(ContainerStateTerminated { .. }),
+                    ..
+                }) | Some(ContainerState {
+                    waiting: Some(ContainerStateWaiting { .. }),
+                    ..
+                })
             )
         })
     };
