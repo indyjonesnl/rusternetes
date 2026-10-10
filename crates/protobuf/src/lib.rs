@@ -340,6 +340,7 @@ impl ProtoRegistry {
                             ))),
                         ),
                     ),
+                    (7, ("terminatingReplicas".into(), FieldType::Int)),
                 ]),
             },
         );
@@ -1302,8 +1303,10 @@ impl ProtoRegistry {
                         ),
                     ),
                     (9, ("ready".into(), FieldType::Int)),
-                    (10, ("terminating".into(), FieldType::Int)),
-                    (11, ("failedIndexes".into(), FieldType::String)),
+                    // batch/v1 generated.proto `message JobStatus`:
+                    // failedIndexes = 10 (string), terminating = 11 (int32).
+                    (10, ("failedIndexes".into(), FieldType::String)),
+                    (11, ("terminating".into(), FieldType::Int)),
                 ]),
             },
         );
@@ -2438,6 +2441,7 @@ impl ProtoRegistry {
                             FieldType::Repeated(Box::new(FieldType::String)),
                         ),
                     ),
+                    (4, ("observedGeneration".into(), FieldType::Int)),
                 ]),
             },
         );
@@ -2456,6 +2460,7 @@ impl ProtoRegistry {
                     ),
                     (4, ("reason".into(), FieldType::String)),
                     (5, ("message".into(), FieldType::String)),
+                    (6, ("observedGeneration".into(), FieldType::Int)),
                 ]),
             },
         );
@@ -4920,22 +4925,28 @@ impl ProtoRegistry {
             },
         );
 
-        // MetricTarget — value/averageValue are Quantity (skipped)
+        // MetricTarget (autoscaling/v2 generated.proto)
         schemas.insert(
             "MetricTarget".into(),
             MessageSchema {
                 fields: HashMap::from([
                     (1, ("type".into(), FieldType::String)),
+                    (2, ("value".into(), FieldType::Quantity)),
+                    (3, ("averageValue".into(), FieldType::Quantity)),
                     (4, ("averageUtilization".into(), FieldType::Int)),
                 ]),
             },
         );
 
-        // MetricValueStatus — value/averageValue are Quantity (skipped)
+        // MetricValueStatus (autoscaling/v2 generated.proto)
         schemas.insert(
             "MetricValueStatus".into(),
             MessageSchema {
-                fields: HashMap::from([(3, ("averageUtilization".into(), FieldType::Int))]),
+                fields: HashMap::from([
+                    (1, ("value".into(), FieldType::Quantity)),
+                    (2, ("averageValue".into(), FieldType::Quantity)),
+                    (3, ("averageUtilization".into(), FieldType::Int)),
+                ]),
             },
         );
 
@@ -5242,7 +5253,7 @@ impl ProtoRegistry {
             },
         );
 
-        // HPAScalingRules — tolerance is Quantity (skipped)
+        // HPAScalingRules (autoscaling/v2 generated.proto)
         schemas.insert(
             "HPAScalingRules".into(),
             MessageSchema {
@@ -5258,6 +5269,7 @@ impl ProtoRegistry {
                         ),
                     ),
                     (3, ("stabilizationWindowSeconds".into(), FieldType::Int)),
+                    (4, ("tolerance".into(), FieldType::Quantity)),
                 ]),
             },
         );
@@ -6866,6 +6878,7 @@ impl ProtoRegistry {
                 ),
                 (7, ("readyReplicas".into(), FieldType::Int)),
                 (8, ("collisionCount".into(), FieldType::Int)),
+                (9, ("terminatingReplicas".into(), FieldType::Int)),
             ]),
         }
     }
@@ -10096,8 +10109,8 @@ impl ProtoRegistry {
                         ),
                     ),
                     (3, ("storageClassName".into(), FieldType::String)),
-                    // field 4 = capacity (Quantity) — skipped; see fn doc
-                    // field 5 = maximumVolumeSize (Quantity) — skipped; see fn doc
+                    (4, ("capacity".into(), FieldType::Quantity)),
+                    (5, ("maximumVolumeSize".into(), FieldType::Quantity)),
                 ]),
             },
         );
