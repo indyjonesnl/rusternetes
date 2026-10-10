@@ -44,6 +44,8 @@ use rusternetes_common::{Error, Result};
 use rusternetes_storage::{build_key, Storage};
 use serde_json::json;
 
+use crate::volume_binding::VolumeSnapshot;
+
 /// Build the `Binding` body the api-server's `create_binding` handler accepts.
 /// The handler only requires `target.name`; the rest mirrors what `kubectl`
 /// and client-go send so the wire object is a valid `v1.Binding`.
@@ -200,6 +202,49 @@ impl<S: Storage + Send + Sync + 'static> DataPlane<S> {
                 .get_list("/apis/policy/v1/poddisruptionbudgets")
                 .await
                 .map_err(get_err_to_common),
+        }
+    }
+
+    /// Snapshot of the volume objects the VolumeBinding plugin reads for `ns`
+    /// (upstream: the PVC/PV/StorageClass/CSIDriver/CSIStorageCapacity
+    /// listers). Only called for pods that reference a PVC.
+    pub async fn list_volume_snapshot(&self, ns: &str) -> Result<VolumeSnapshot> {
+        match self {
+            DataPlane::Storage(s) => {
+                use rusternetes_storage::build_prefix;
+                Ok(VolumeSnapshot {
+                    pvcs: s
+                        .list(&build_prefix("persistentvolumeclaims", Some(ns)))
+                        .await?,
+                    pvs: s.list(&build_prefix("persistentvolumes", None)).await?,
+                    classes: s.list(&build_prefix("storageclasses", None)).await?,
+                    csi_drivers: s.list(&build_prefix("csidrivers", None)).await?,
+                    csi_capacities: s.list(&build_prefix("csistoragecapacities", None)).await?,
+                })
+            }
+            DataPlane::Api(a) => {
+                let c = &a.client;
+                let pvc_path = format!("/api/v1/namespaces/{ns}/persistentvolumeclaims");
+                Ok(VolumeSnapshot {
+                    pvcs: c.get_list(&pvc_path).await.map_err(get_err_to_common)?,
+                    pvs: c
+                        .get_list("/api/v1/persistentvolumes")
+                        .await
+                        .map_err(get_err_to_common)?,
+                    classes: c
+                        .get_list("/apis/storage.k8s.io/v1/storageclasses")
+                        .await
+                        .map_err(get_err_to_common)?,
+                    csi_drivers: c
+                        .get_list("/apis/storage.k8s.io/v1/csidrivers")
+                        .await
+                        .map_err(get_err_to_common)?,
+                    csi_capacities: c
+                        .get_list("/apis/storage.k8s.io/v1/csistoragecapacities")
+                        .await
+                        .map_err(get_err_to_common)?,
+                })
+            }
         }
     }
 

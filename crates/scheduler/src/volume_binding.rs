@@ -51,12 +51,14 @@ pub enum PreFilterOutcome {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)] // read by AssumePodVolumes/BindPodVolumes (follow-up #3017 steps 2-3)
 pub struct BindingInfo {
     pub pv: PersistentVolume,
     pub pvc: PersistentVolumeClaim,
 }
 
 #[derive(Clone)]
+#[allow(dead_code)] // read by AssumePodVolumes/BindPodVolumes (follow-up #3017 steps 2-3)
 pub struct DynamicProvision {
     pub pvc: PersistentVolumeClaim,
     pub node_capacity: Option<CSIStorageCapacity>,
