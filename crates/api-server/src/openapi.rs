@@ -894,6 +894,7 @@ fn generate_components() -> openapiv3::Components {
     // Add basic schemas for common types
     add_object_meta_schema(&mut schemas);
     add_basic_resource_schemas(&mut schemas);
+    add_admissionregistration_v1_schemas(&mut schemas);
 
     openapiv3::Components {
         schemas,
@@ -957,53 +958,160 @@ fn add_basic_resource_schemas(schemas: &mut IndexMap<String, ReferenceOr<Schema>
     // Using x-kubernetes-group-version-kind extension so kubectl can map GVK to schemas.
     // Schemas use additionalProperties: true to allow any fields (permissive validation).
     let resources = [
-        ("Pod", "Pod is a collection of containers that can run on a host"),
-        ("Service", "Service is a named abstraction of software service"),
-        ("ConfigMap", "ConfigMap holds configuration data for pods to consume"),
+        (
+            "Pod",
+            "Pod is a collection of containers that can run on a host",
+        ),
+        (
+            "Service",
+            "Service is a named abstraction of software service",
+        ),
+        (
+            "ConfigMap",
+            "ConfigMap holds configuration data for pods to consume",
+        ),
         ("Secret", "Secret holds secret data of a certain type"),
         ("Node", "Node is a worker node in Kubernetes"),
         ("Namespace", "Namespace provides a scope for Names"),
-        ("Deployment", "Deployment enables declarative updates for Pods and ReplicaSets"),
-        ("ReplicaSet", "ReplicaSet ensures a specified number of pod replicas are running"),
-        ("StatefulSet", "StatefulSet represents a set of pods with consistent identities"),
-        ("DaemonSet", "DaemonSet represents a set of pods run on every node"),
+        (
+            "Deployment",
+            "Deployment enables declarative updates for Pods and ReplicaSets",
+        ),
+        (
+            "ReplicaSet",
+            "ReplicaSet ensures a specified number of pod replicas are running",
+        ),
+        (
+            "StatefulSet",
+            "StatefulSet represents a set of pods with consistent identities",
+        ),
+        (
+            "DaemonSet",
+            "DaemonSet represents a set of pods run on every node",
+        ),
         ("Job", "Job represents the configuration of a single job"),
-        ("CronJob", "CronJob represents the configuration of a single cron job"),
-        ("Ingress", "Ingress is a collection of rules for inbound connections"),
-        ("NetworkPolicy", "NetworkPolicy describes what network traffic is allowed for a set of Pods"),
+        (
+            "CronJob",
+            "CronJob represents the configuration of a single cron job",
+        ),
+        (
+            "Ingress",
+            "Ingress is a collection of rules for inbound connections",
+        ),
+        (
+            "NetworkPolicy",
+            "NetworkPolicy describes what network traffic is allowed for a set of Pods",
+        ),
         ("ClusterRole", "ClusterRole is a cluster level set of rules"),
-        ("ClusterRoleBinding", "ClusterRoleBinding binds a ClusterRole to subjects"),
+        (
+            "ClusterRoleBinding",
+            "ClusterRoleBinding binds a ClusterRole to subjects",
+        ),
         ("Role", "Role is a set of rules within a namespace"),
-        ("RoleBinding", "RoleBinding binds a Role to subjects within a namespace"),
-        ("ServiceAccount", "ServiceAccount binds together a name and a secret"),
-        ("PersistentVolume", "PersistentVolume is a storage resource provisioned by an admin"),
-        ("PersistentVolumeClaim", "PersistentVolumeClaim is a user's request for storage"),
-        ("StorageClass", "StorageClass describes the parameters for a class of storage"),
-        ("CSIDriver", "CSIDriver captures information about a CSI volume driver"),
-        ("CSINode", "CSINode holds information about the CSI drivers on a node"),
-        ("VolumeAttachment", "VolumeAttachment captures the intent to attach or detach a volume"),
-        ("PriorityClass", "PriorityClass defines mapping from a priority class name to the priority value"),
-        ("CustomResourceDefinition", "CustomResourceDefinition represents a custom API resource"),
-        ("MutatingWebhookConfiguration", "MutatingWebhookConfiguration describes the configuration of admission webhooks"),
-        ("ValidatingWebhookConfiguration", "ValidatingWebhookConfiguration describes the configuration of admission webhooks"),
-        ("ValidatingAdmissionPolicy", "ValidatingAdmissionPolicy describes the configuration of an admission validation policy"),
-        ("ValidatingAdmissionPolicyBinding", "ValidatingAdmissionPolicyBinding binds a ValidatingAdmissionPolicy"),
-        ("Lease", "Lease defines a lease concept used for leader election"),
-        ("FlowSchema", "FlowSchema defines the schema of a group of flows"),
-        ("PriorityLevelConfiguration", "PriorityLevelConfiguration represents the configuration of a priority level"),
-        ("CertificateSigningRequest", "CertificateSigningRequest objects provide a mechanism for CSR approval"),
-        ("EndpointSlice", "EndpointSlice represents a subset of the endpoints that implement a service"),
-        ("RuntimeClass", "RuntimeClass defines a class of container runtime"),
-        ("HorizontalPodAutoscaler", "HorizontalPodAutoscaler configuration"),
-        ("PodDisruptionBudget", "PodDisruptionBudget is an object to limit disruptions to pods"),
-        ("ResourceClaim", "ResourceClaim describes which resources are needed by a pod"),
-        ("DeviceClass", "DeviceClass is a vendor- or admin-provided resource that describes a class of devices"),
-        ("Event", "Event is a report of an event somewhere in the cluster"),
-        ("LimitRange", "LimitRange sets resource usage limits for each kind of resource"),
-        ("ResourceQuota", "ResourceQuota sets aggregate quota restrictions per namespace"),
-        ("ReplicationController", "ReplicationController represents a replication controller"),
-        ("Endpoints", "Endpoints is a collection of endpoints that implement the actual service"),
-        ("PodTemplate", "PodTemplate describes a template for creating copies of a predefined pod"),
+        (
+            "RoleBinding",
+            "RoleBinding binds a Role to subjects within a namespace",
+        ),
+        (
+            "ServiceAccount",
+            "ServiceAccount binds together a name and a secret",
+        ),
+        (
+            "PersistentVolume",
+            "PersistentVolume is a storage resource provisioned by an admin",
+        ),
+        (
+            "PersistentVolumeClaim",
+            "PersistentVolumeClaim is a user's request for storage",
+        ),
+        (
+            "StorageClass",
+            "StorageClass describes the parameters for a class of storage",
+        ),
+        (
+            "CSIDriver",
+            "CSIDriver captures information about a CSI volume driver",
+        ),
+        (
+            "CSINode",
+            "CSINode holds information about the CSI drivers on a node",
+        ),
+        (
+            "VolumeAttachment",
+            "VolumeAttachment captures the intent to attach or detach a volume",
+        ),
+        (
+            "PriorityClass",
+            "PriorityClass defines mapping from a priority class name to the priority value",
+        ),
+        (
+            "CustomResourceDefinition",
+            "CustomResourceDefinition represents a custom API resource",
+        ),
+        (
+            "Lease",
+            "Lease defines a lease concept used for leader election",
+        ),
+        (
+            "FlowSchema",
+            "FlowSchema defines the schema of a group of flows",
+        ),
+        (
+            "PriorityLevelConfiguration",
+            "PriorityLevelConfiguration represents the configuration of a priority level",
+        ),
+        (
+            "CertificateSigningRequest",
+            "CertificateSigningRequest objects provide a mechanism for CSR approval",
+        ),
+        (
+            "EndpointSlice",
+            "EndpointSlice represents a subset of the endpoints that implement a service",
+        ),
+        (
+            "RuntimeClass",
+            "RuntimeClass defines a class of container runtime",
+        ),
+        (
+            "HorizontalPodAutoscaler",
+            "HorizontalPodAutoscaler configuration",
+        ),
+        (
+            "PodDisruptionBudget",
+            "PodDisruptionBudget is an object to limit disruptions to pods",
+        ),
+        (
+            "ResourceClaim",
+            "ResourceClaim describes which resources are needed by a pod",
+        ),
+        (
+            "DeviceClass",
+            "DeviceClass is a vendor- or admin-provided resource that describes a class of devices",
+        ),
+        (
+            "Event",
+            "Event is a report of an event somewhere in the cluster",
+        ),
+        (
+            "LimitRange",
+            "LimitRange sets resource usage limits for each kind of resource",
+        ),
+        (
+            "ResourceQuota",
+            "ResourceQuota sets aggregate quota restrictions per namespace",
+        ),
+        (
+            "ReplicationController",
+            "ReplicationController represents a replication controller",
+        ),
+        (
+            "Endpoints",
+            "Endpoints is a collection of endpoints that implement the actual service",
+        ),
+        (
+            "PodTemplate",
+            "PodTemplate describes a template for creating copies of a predefined pod",
+        ),
     ];
 
     for (name, desc) in resources {
@@ -1039,6 +1147,53 @@ fn add_basic_resource_schemas(schemas: &mut IndexMap<String, ReferenceOr<Schema>
                 schema_kind: SchemaKind::Type(Type::Object(ObjectType::default())),
             }),
         );
+    }
+}
+
+/// admissionregistration.k8s.io/v1 kinds, keyed like upstream's v3 documents
+/// (`io.k8s.api.admissionregistration.v1.<Kind>`) with the real group/version in
+/// `x-kubernetes-group-version-kind`. The generic list above stamps every kind
+/// as core/v1, which is wrong for named groups.
+/// K8s ref: staging/src/k8s.io/api/admissionregistration/v1/types.go
+fn add_admissionregistration_v1_schemas(schemas: &mut IndexMap<String, ReferenceOr<Schema>>) {
+    let kinds = [
+        ("MutatingWebhookConfiguration", "MutatingWebhookConfiguration describes the configuration of and admission webhook that accept or reject and may change the object."),
+        ("ValidatingWebhookConfiguration", "ValidatingWebhookConfiguration describes the configuration of and admission webhook that accept or reject and object without changing it."),
+        ("ValidatingAdmissionPolicy", "ValidatingAdmissionPolicy describes the definition of an admission validation policy that accepts or rejects an object without changing it."),
+        ("ValidatingAdmissionPolicyBinding", "ValidatingAdmissionPolicyBinding binds the ValidatingAdmissionPolicy with paramerized resources."),
+    ];
+    for (kind, desc) in kinds {
+        for (name, description) in [
+            (kind.to_string(), desc.to_string()),
+            (
+                format!("{kind}List"),
+                format!("{kind}List is a list of {kind}"),
+            ),
+        ] {
+            let mut ext = IndexMap::new();
+            ext.insert(
+                "x-kubernetes-group-version-kind".to_string(),
+                serde_json::json!([{
+                    "group": "admissionregistration.k8s.io",
+                    "version": "v1",
+                    "kind": name,
+                }]),
+            );
+            schemas.insert(
+                format!("io.k8s.api.admissionregistration.v1.{name}"),
+                ReferenceOr::Item(Schema {
+                    schema_data: SchemaData {
+                        description: Some(description),
+                        extensions: ext,
+                        ..Default::default()
+                    },
+                    schema_kind: SchemaKind::Type(Type::Object(ObjectType {
+                        additional_properties: Some(openapiv3::AdditionalProperties::Any(true)),
+                        ..Default::default()
+                    })),
+                }),
+            );
+        }
     }
 }
 

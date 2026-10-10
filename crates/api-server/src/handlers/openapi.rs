@@ -808,6 +808,11 @@ fn core_v1_builtin_definitions() -> Vec<(String, serde_json::Value)> {
         ("apps", "v1", "DaemonSet", "DaemonSet represents the configuration of a daemon set."),
         ("batch", "v1", "Job", "Job represents the configuration of a single job."),
         ("batch", "v1", "CronJob", "CronJob represents the configuration of a single cron job."),
+        // admissionregistration.k8s.io/v1 (k8s.io/api/admissionregistration/v1/types.go)
+        ("admissionregistration.k8s.io", "v1", "MutatingWebhookConfiguration", "MutatingWebhookConfiguration describes the configuration of and admission webhook that accept or reject and may change the object."),
+        ("admissionregistration.k8s.io", "v1", "ValidatingWebhookConfiguration", "ValidatingWebhookConfiguration describes the configuration of and admission webhook that accept or reject and object without changing it."),
+        ("admissionregistration.k8s.io", "v1", "ValidatingAdmissionPolicy", "ValidatingAdmissionPolicy describes the definition of an admission validation policy that accepts or rejects an object without changing it."),
+        ("admissionregistration.k8s.io", "v1", "ValidatingAdmissionPolicyBinding", "ValidatingAdmissionPolicyBinding binds the ValidatingAdmissionPolicy with paramerized resources."),
     ];
 
     BUILT_INS
@@ -819,7 +824,10 @@ fn core_v1_builtin_definitions() -> Vec<(String, serde_json::Value)> {
             } else {
                 // sibling groups live under io.k8s.api.<group>; non-domain
                 // groups like "apps" and "batch" match upstream's flat layout.
-                format!("io.k8s.api.{}", group)
+                // Upstream ToRESTFriendlyName keeps only the leading label of a
+                // domain-style group (`admissionregistration.k8s.io` ->
+                // `io.k8s.api.admissionregistration`).
+                format!("io.k8s.api.{}", group.split('.').next().unwrap_or(group))
             };
             let key = format!("{}.{}.{}", api_group_dotted, version, kind);
 
@@ -856,7 +864,13 @@ fn core_v1_builtin_definitions() -> Vec<(String, serde_json::Value)> {
             // top-level secrets/imagePullSecrets but no spec or status.
             if matches!(
                 *kind,
-                "ConfigMap" | "Secret" | "Event" | "Endpoints" | "ServiceAccount"
+                "ConfigMap"
+                    | "Secret"
+                    | "Event"
+                    | "Endpoints"
+                    | "ServiceAccount"
+                    | "MutatingWebhookConfiguration"
+                    | "ValidatingWebhookConfiguration"
             ) {
                 if let Some(props) = def
                     .get_mut("properties")
