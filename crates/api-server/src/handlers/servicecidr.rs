@@ -23,7 +23,7 @@ use rusternetes_common::{
     resources::ServiceCIDR,
     List, Result,
 };
-use rusternetes_storage::{build_prefix, Storage};
+use rusternetes_storage::build_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
@@ -268,10 +268,17 @@ pub async fn list_servicecidrs(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let servicecidrs = state.storage.list::<ServiceCIDR>(&prefix).await?;
+    let servicecidrs = crate::handlers::list_options::list_items::<ServiceCIDR, _>(
+        &*state.storage,
+        &prefix,
+        &params,
+    )
+    .await?;
 
     let mut list = List::new("ServiceCIDRList", "networking.k8s.io/v1", servicecidrs);
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list).into_response())
 }

@@ -222,8 +222,10 @@ pub async fn list_priority_level_configurations(
         "flowcontrol.apiserver.k8s.io/v1",
         items,
     );
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list).into_response())
 }
 
@@ -455,14 +457,21 @@ pub async fn list_flow_schemas(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let mut items = state.storage.list::<FlowSchema>(&prefix).await?;
+    let mut items = crate::handlers::list_options::list_items::<FlowSchema, _>(
+        &*state.storage,
+        &prefix,
+        &params,
+    )
+    .await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut items, &params)?;
 
     let mut list = List::new("FlowSchemaList", "flowcontrol.apiserver.k8s.io/v1", items);
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list).into_response())
 }
 

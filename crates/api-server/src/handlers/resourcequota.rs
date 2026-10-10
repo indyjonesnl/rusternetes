@@ -23,7 +23,7 @@ use rusternetes_common::{
     resources::ResourceQuota,
     List, Result,
 };
-use rusternetes_storage::{build_prefix, Storage};
+use rusternetes_storage::build_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
@@ -273,14 +273,21 @@ pub async fn list(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let mut quotas = state.storage.list::<ResourceQuota>(&prefix).await?;
+    let mut quotas = crate::handlers::list_options::list_items::<ResourceQuota, _>(
+        &*state.storage,
+        &prefix,
+        &params,
+    )
+    .await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut quotas, &params)?;
 
     let mut list = List::new("ResourceQuotaList", "v1", quotas);
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list).into_response())
 }
 
@@ -317,14 +324,21 @@ pub async fn list_all(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let mut quotas = state.storage.list::<ResourceQuota>(&prefix).await?;
+    let mut quotas = crate::handlers::list_options::list_items::<ResourceQuota, _>(
+        &*state.storage,
+        &prefix,
+        &params,
+    )
+    .await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut quotas, &params)?;
 
     let mut list = List::new("ResourceQuotaList", "v1", quotas);
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list).into_response())
 }
 

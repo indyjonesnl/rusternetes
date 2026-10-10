@@ -24,7 +24,7 @@ use rusternetes_common::{
     resources::Endpoints,
     List, Result,
 };
-use rusternetes_storage::{build_prefix, Storage};
+use rusternetes_storage::build_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
@@ -211,7 +211,12 @@ pub async fn list_endpoints(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &list_options).await?;
 
-    let mut endpoints = state.storage.list::<Endpoints>(&prefix).await?;
+    let mut endpoints = crate::handlers::list_options::list_items::<Endpoints, _>(
+        &*state.storage,
+        &prefix,
+        &list_options,
+    )
+    .await?;
 
     // Apply field and label selector filtering
     let mut params_map = HashMap::new();
@@ -224,8 +229,14 @@ pub async fn list_endpoints(
     crate::handlers::filtering::apply_selectors(&mut endpoints, &params_map)?;
 
     let mut list = List::new("EndpointsList", "v1", endpoints);
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(
+            &state.storage,
+            &list_options,
+            &list.items,
+        )
+        .await,
+    );
     Ok(Json(list).into_response())
 }
 
@@ -264,7 +275,12 @@ pub async fn list_all_endpoints(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &list_options).await?;
 
-    let mut endpoints = state.storage.list::<Endpoints>(&prefix).await?;
+    let mut endpoints = crate::handlers::list_options::list_items::<Endpoints, _>(
+        &*state.storage,
+        &prefix,
+        &list_options,
+    )
+    .await?;
 
     // Apply field and label selector filtering
     let mut params_map = HashMap::new();
@@ -277,7 +293,13 @@ pub async fn list_all_endpoints(
     crate::handlers::filtering::apply_selectors(&mut endpoints, &params_map)?;
 
     let mut list = List::new("EndpointsList", "v1", endpoints);
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(
+            &state.storage,
+            &list_options,
+            &list.items,
+        )
+        .await,
+    );
     Ok(Json(list).into_response())
 }

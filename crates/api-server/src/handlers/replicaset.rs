@@ -23,7 +23,7 @@ use rusternetes_common::{
     resources::{ReplicaSet, Scale},
     List, Result,
 };
-use rusternetes_storage::{build_prefix, Storage};
+use rusternetes_storage::build_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
@@ -382,14 +382,16 @@ pub async fn list(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let mut replicasets: Vec<ReplicaSet> = state.storage.list(&prefix).await?;
+    let mut replicasets: Vec<ReplicaSet> =
+        crate::handlers::list_options::list_items(&*state.storage, &prefix, &params).await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut replicasets, &params)?;
 
     // Get the store revision for the list; never "0"/"" so informers can watch.
     let resource_version =
-        crate::handlers::list_collection_resource_version(&state.storage, &replicasets).await;
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &replicasets)
+            .await;
 
     // Check if table format is requested
     let accept = headers.get("accept").and_then(|v| v.to_str().ok());
@@ -463,14 +465,20 @@ pub async fn list_all_replicasets(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let mut replicasets = state.storage.list::<ReplicaSet>(&prefix).await?;
+    let mut replicasets = crate::handlers::list_options::list_items::<ReplicaSet, _>(
+        &*state.storage,
+        &prefix,
+        &params,
+    )
+    .await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut replicasets, &params)?;
 
     // Get the store revision for the list; never "0"/"" so informers can watch.
     let resource_version =
-        crate::handlers::list_collection_resource_version(&state.storage, &replicasets).await;
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &replicasets)
+            .await;
 
     // Check if table format is requested
     let accept = headers.get("accept").and_then(|v| v.to_str().ok());

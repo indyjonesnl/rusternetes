@@ -290,8 +290,10 @@ pub async fn list_crds(
         "apiextensions.k8s.io/v1",
         crds,
     );
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list).into_response())
 }
 

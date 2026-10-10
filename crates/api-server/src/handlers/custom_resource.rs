@@ -233,7 +233,8 @@ pub async fn list_custom_resources(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let mut crs: Vec<CustomResource> = state.storage.list(&prefix).await?;
+    let mut crs: Vec<CustomResource> =
+        crate::handlers::list_options::list_items(&*state.storage, &prefix, &params).await?;
 
     // Apply schema defaults on read (K8s "defaulting on read")
     for cr in &mut crs {
@@ -266,8 +267,10 @@ pub async fn list_custom_resources(
         .unwrap_or_else(|| format!("{}List", crd.spec.names.kind));
     let list_api_version = format!("{group}/{version}");
     let mut list = List::new(&list_kind, &list_api_version, crs);
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list))
 }
 

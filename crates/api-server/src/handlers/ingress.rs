@@ -15,7 +15,7 @@ use rusternetes_common::{
     resources::Ingress,
     List, Result,
 };
-use rusternetes_storage::{build_prefix, Storage};
+use rusternetes_storage::build_prefix;
 use std::{collections::HashMap, sync::Arc};
 use tracing::debug;
 fn scope(state: &ApiServerState, subresource: Option<&'static str>) -> RequestScope<Ingress> {
@@ -279,14 +279,17 @@ pub async fn list(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let mut ingresses: Vec<Ingress> = state.storage.list(&prefix).await?;
+    let mut ingresses: Vec<Ingress> =
+        crate::handlers::list_options::list_items(&*state.storage, &prefix, &params).await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut ingresses, &params)?;
 
     let mut list = List::new("IngressList", "networking.k8s.io/v1", ingresses);
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list).into_response())
 }
 
@@ -345,13 +348,17 @@ pub async fn list_all_ingresses(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let mut ingresses = state.storage.list::<Ingress>(&prefix).await?;
+    let mut ingresses =
+        crate::handlers::list_options::list_items::<Ingress, _>(&*state.storage, &prefix, &params)
+            .await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut ingresses, &params)?;
 
     let mut list = List::new("IngressList", "networking.k8s.io/v1", ingresses);
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list).into_response())
 }

@@ -23,7 +23,7 @@ use rusternetes_common::{
     resources::csi::VolumeAttributesClass,
     List, Result,
 };
-use rusternetes_storage::{build_prefix, Storage};
+use rusternetes_storage::build_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
@@ -179,14 +179,21 @@ pub async fn list_volumeattributesclasses(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let mut vacs = state.storage.list::<VolumeAttributesClass>(&prefix).await?;
+    let mut vacs = crate::handlers::list_options::list_items::<VolumeAttributesClass, _>(
+        &*state.storage,
+        &prefix,
+        &params,
+    )
+    .await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut vacs, &params)?;
 
     let mut list = List::new("VolumeAttributesClassList", "storage.k8s.io/v1", vacs);
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(axum::response::IntoResponse::into_response(Json(list)))
 }
 
