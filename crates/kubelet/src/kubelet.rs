@@ -784,6 +784,7 @@ impl Kubelet {
             .with_event_recorder(storage.clone())
             .with_service_host(service_host, "443")
             .with_cluster_dns(&cluster_dns, &cluster_domain)
+            .with_node_name(&node_name)
             .with_node_allocatable(node_allocatable_map());
 
         // Resolve the runtime identity once via the CRI Version RPC so
@@ -953,6 +954,16 @@ impl Kubelet {
         self
     }
 
+    /// Set the host resolver file (`--resolv-conf`; empty disables the host
+    /// base and falls back to localhost, `dns.go:431`).
+    pub fn with_resolv_conf(mut self, path: &str) -> Self {
+        let rt = Arc::get_mut(&mut self.runtime)
+            .expect("runtime handle is unshared at construction time");
+        let updated = rt.clone().with_resolv_conf(path);
+        *rt = updated;
+        self
+    }
+
     /// The CRI per-request timeout in effect (test/diagnostic accessor).
     #[cfg(test)]
     pub(crate) fn runtime_request_timeout(&self) -> Duration {
@@ -1050,6 +1061,10 @@ impl Kubelet {
 
     pub async fn run(self: &Arc<Self>) -> Result<()> {
         info!("Kubelet started for node: {}", self.node_name);
+
+        // `kl.dnsConfigurer.CheckLimitsForResolvConf` at syncLoop start
+        // (`kubelet.go:2524-2526`).
+        self.runtime.check_limits_for_resolv_conf().await;
 
         // `go podCertificateManager.Run(ctx)` (`kubelet.go:967`). The kubelet
         // runs for the life of the process, so the token is never cancelled.

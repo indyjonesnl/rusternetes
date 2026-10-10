@@ -281,18 +281,45 @@ fn merge_dns_options(
     out
 }
 
+/// Which object a [`DnsEvent`] is recorded against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnsEventTarget {
+    /// The pod being configured.
+    Pod,
+    /// The node (upstream `Configurer.nodeRef`).
+    Node,
+}
+
+/// A warning event the upstream `Configurer` records while forming a pod's DNS
+/// config (`c.recorder.Event` / `Eventf`). Always `Warning` type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsEvent {
+    pub target: DnsEventTarget,
+    pub reason: &'static str,
+    pub message: String,
+}
+
 /// Port of upstream `formDNSSearchFitsLimits` (`dns.go:102`) and
-/// `formDNSNameserversFitsLimits` (`dns.go:149`). Upstream also emits a
-/// `DNSConfigForming` warning event; here the truncation is logged.
-fn form_dns_config_fits_limits(mut cfg: v1::DnsConfig, pod: &Pod) -> v1::DnsConfig {
+/// `formDNSNameserversFitsLimits` (`dns.go:149`). Each truncation records a
+/// `DNSConfigForming` warning on the pod, returned in `events`.
+fn form_dns_config_fits_limits(
+    mut cfg: v1::DnsConfig,
+    pod: &Pod,
+    events: &mut Vec<DnsEvent>,
+) -> v1::DnsConfig {
     let pod_name = pod.metadata.name.as_str();
     if cfg.servers.len() > MAX_DNS_NAMESERVERS {
         cfg.servers.truncate(MAX_DNS_NAMESERVERS);
-        tracing::warn!(
-            pod = pod_name,
-            applied = %cfg.servers.join(" "),
-            "DNSConfigForming: Nameserver limits were exceeded, some nameservers have been omitted"
+        let message = format!(
+            "Nameserver limits were exceeded, some nameservers have been omitted, the applied nameserver line is: {}",
+            cfg.servers.join(" ")
         );
+        tracing::warn!(pod = pod_name, "DNSConfigForming: {message}");
+        events.push(DnsEvent {
+            target: DnsEventTarget::Pod,
+            reason: "DNSConfigForming",
+            message,
+        });
     }
 
     let mut exceeded = false;
@@ -322,14 +349,58 @@ fn form_dns_config_fits_limits(mut cfg: v1::DnsConfig, pod: &Pod) -> v1::DnsConf
         exceeded = true;
     }
     if exceeded {
-        tracing::warn!(
-            pod = pod_name,
-            applied = %search.join(" "),
-            "DNSConfigForming: Search Line limits were exceeded, some search paths have been omitted"
+        let message = format!(
+            "Search Line limits were exceeded, some search paths have been omitted, the applied search line is: {}",
+            search.join(" ")
         );
+        tracing::warn!(pod = pod_name, "DNSConfigForming: {message}");
+        events.push(DnsEvent {
+            target: DnsEventTarget::Pod,
+            reason: "DNSConfigForming",
+            message,
+        });
     }
     cfg.searches = search;
     cfg
+}
+
+/// Port of upstream `Configurer.CheckLimitsForResolvConf` (`dns.go:178`).
+/// Returns the message of the `CheckLimitsForResolvConf` node warning, or
+/// `None` when the host resolv.conf is within limits. Upstream calls it once
+/// from `syncLoop` (`kubelet.go:2525`) when `ResolverConfig != ""`.
+pub fn check_limits_for_resolv_conf(resolv_conf: &str, cluster_domain: &str) -> Option<String> {
+    let content = match std::fs::read(resolv_conf) {
+        Ok(c) => c,
+        Err(e) => return Some(format!("open {resolv_conf}: {e}")),
+    };
+    let host = match parse_resolv_conf(&String::from_utf8_lossy(&content)) {
+        Ok(h) => h,
+        Err(e) => return Some(e),
+    };
+    let mut domain_count_limit = MAX_DNS_SEARCH_PATHS;
+    if !cluster_domain.is_empty() {
+        domain_count_limit -= 3;
+    }
+    if host.searches.len() > domain_count_limit {
+        return Some(format!(
+            "Resolv.conf file '{resolv_conf}' contains search line consisting of more than {domain_count_limit} domains!"
+        ));
+    }
+    if host
+        .searches
+        .iter()
+        .any(|s| s.len() > DNS1123_SUBDOMAIN_MAX_LENGTH)
+    {
+        return Some(format!(
+            "Resolv.conf file \"{resolv_conf}\" contains a search path which length is more than allowed {DNS1123_SUBDOMAIN_MAX_LENGTH} chars!"
+        ));
+    }
+    if host.searches.join(" ").len() > MAX_DNS_SEARCH_LIST_CHARS {
+        return Some(format!(
+            "Resolv.conf file '{resolv_conf}' contains search line which length is more than allowed {MAX_DNS_SEARCH_LIST_CHARS} chars!"
+        ));
+    }
+    None
 }
 
 /// Port of upstream `Configurer.GetPodDNS` (`pkg/kubelet/network/dns/dns.go:386`)
@@ -339,13 +410,39 @@ fn form_dns_config_fits_limits(mut cfg: v1::DnsConfig, pod: &Pod) -> v1::DnsConf
 /// `host` is the parsed host resolver file ([`read_host_dns_config`]): the base
 /// for `Default` and the source of host searches for `ClusterFirst*`; policy
 /// `None` starts empty. The `ResolverConfig == ""` localhost fallback (`:431`)
-/// is not ported: the kubelet always has a resolv-conf path.
+/// is ported in [`get_pod_dns_with_events`], which this wraps with a non-empty
+/// resolv-conf path and drops the events.
 pub fn get_pod_dns(
     pod: &Pod,
     cluster_dns: &[String],
     cluster_domain: &str,
     host: &v1::DnsConfig,
 ) -> v1::DnsConfig {
+    get_pod_dns_with_events(
+        pod,
+        cluster_dns,
+        cluster_domain,
+        host,
+        "/etc/resolv.conf",
+        &[],
+    )
+    .0
+}
+
+/// [`get_pod_dns`] plus the `resolv_conf` path (`Configurer.ResolverConfig`) and
+/// `node_ips` (`Configurer.nodeIPs`) it depends on, returning the warning
+/// events upstream records via `c.recorder` (`MissingClusterDNS` on node + pod,
+/// `DNSConfigForming` on the pod). An empty `resolv_conf` triggers the
+/// localhost fallback (`dns.go:431-447`).
+pub fn get_pod_dns_with_events(
+    pod: &Pod,
+    cluster_dns: &[String],
+    cluster_domain: &str,
+    host: &v1::DnsConfig,
+    resolv_conf: &str,
+    node_ips: &[String],
+) -> (v1::DnsConfig, Vec<DnsEvent>) {
+    let mut events = Vec::new();
     let policy = pod
         .spec
         .as_ref()
@@ -393,7 +490,47 @@ pub fn get_pod_dns(
             }
         }
         // Cluster without ClusterDNS falls through to Default (MissingClusterDNS).
-        Kind::Cluster | Kind::Host => host.clone(),
+        Kind::Cluster | Kind::Host => {
+            if matches!(kind, Kind::Cluster) {
+                let node_msg = "kubelet does not have ClusterDNS IP configured and cannot create Pod using \"ClusterFirst\" policy. Falling back to \"Default\" policy.".to_string();
+                // format.Pod: name_namespace(uid).
+                let pod_msg = format!(
+                    "pod: \"{}_{}({})\". {}",
+                    pod.metadata.name,
+                    namespace(pod),
+                    pod.metadata.uid,
+                    node_msg
+                );
+                tracing::warn!(pod = %pod.metadata.name, "MissingClusterDNS: {node_msg}");
+                events.push(DnsEvent {
+                    target: DnsEventTarget::Node,
+                    reason: "MissingClusterDNS",
+                    message: node_msg,
+                });
+                events.push(DnsEvent {
+                    target: DnsEventTarget::Pod,
+                    reason: "MissingClusterDNS",
+                    message: pod_msg,
+                });
+            }
+            let mut cfg = host.clone();
+            // dns.go:431: `--resolv-conf=""` => localhost nameserver (bind's
+            // documented default) and a "." search, disabling lookups.
+            if resolv_conf.is_empty() {
+                for ip in node_ips {
+                    cfg.servers.push(if ip.contains(':') {
+                        "::1".to_string()
+                    } else {
+                        "127.0.0.1".to_string()
+                    });
+                }
+                if cfg.servers.is_empty() {
+                    cfg.servers.push("127.0.0.1".to_string());
+                }
+                cfg.searches = vec![".".to_string()];
+            }
+            cfg
+        }
     };
 
     // appendDNSConfig.
@@ -410,7 +547,8 @@ pub fn get_pod_dns(
         );
         cfg.options = merge_dns_options(cfg.options, dns.options.as_deref().unwrap_or(&[]));
     }
-    form_dns_config_fits_limits(cfg, pod)
+    let cfg = form_dns_config_fits_limits(cfg, pod, &mut events);
+    (cfg, events)
 }
 
 /// Whether any container in the pod requests `privileged` (upstream
