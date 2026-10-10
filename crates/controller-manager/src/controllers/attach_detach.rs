@@ -23,8 +23,17 @@
 //!   `attachDesiredVolumes` (`:319`: a single-attach volume attached to
 //!   another node is not attached again).
 //!
-//! NOT ported (tracked on #3048): `node.status.volumesAttached` updates
-//! (`statusupdater`), force-detach on unhealthy node / `out-of-service` taint,
+//! - `.../statusupdater/node_status_updater.go` `updateNodeStatus` (`:121-131`,
+//!   `node.Status.VolumesAttached = attachedVolumes`) fed by
+//!   `cache/actual_state_of_world.go` `getAttachedVolumeFromUpdateObject`
+//!   (`:713-726`); `reconciler.go` `:245-265` removes the volume from the
+//!   report and updates the node BEFORE detaching, skipping the detach when
+//!   that update fails. Deviation: upstream replaces the whole list; this
+//!   controller only owns the `kubernetes.io/csi/` entries and leaves any
+//!   other entry alone. Upstream's `devicePath` is `""` for CSI (`Attach`
+//!   returns `""`, `csi_attacher.go:138`).
+//!
+//! NOT ported (tracked on #3053): force-detach on unhealthy node / `out-of-service` taint,
 //! the multi-attach event, CSI migration of in-tree volumes, ephemeral inline
 //! CSI volumes (never attachable, `CanAttach`), `maxWaitForUnmountDuration`.
 //! Off by default; enabled with `--attach-detach-controller`.
@@ -35,6 +44,7 @@ use futures::StreamExt;
 use rusternetes_common::resources::csi::{
     CSIDriver, VolumeAttachment, VolumeAttachmentSource, VolumeAttachmentSpec,
 };
+use rusternetes_common::resources::node::AttachedVolume;
 use rusternetes_common::resources::volume::{
     PersistentVolumeAccessMode, PersistentVolumeClaimPhase,
 };
@@ -43,7 +53,7 @@ use rusternetes_common::types::{ObjectMeta, TypeMeta};
 use rusternetes_common::Error;
 use rusternetes_storage::{build_key, build_prefix, Storage};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -63,6 +73,8 @@ pub fn attachment_name(volume_handle: &str, driver: &str, node: &str) -> String 
 fn unique_volume_name(driver: &str, handle: &str) -> String {
     format!("kubernetes.io/csi/{driver}^{handle}")
 }
+
+const CSI_PREFIX: &str = "kubernetes.io/csi/";
 
 /// One CSI volume a pod needs attached to a node.
 #[derive(Clone)]
@@ -226,6 +238,56 @@ impl<S: Storage + 'static> AttachDetachController<S> {
         out
     }
 
+    /// `nodeStatusUpdater.updateNodeStatus`: make the CSI entries of
+    /// `node.status.volumesAttached` equal `report`. No-op when already equal
+    /// (`PatchNodeStatus` sends nothing for an empty diff); a missing node is
+    /// not an error (`processNodeVolumes`, `:87-92`).
+    async fn update_node_status(&self, node_name: &str, report: &BTreeSet<String>) -> Result<()> {
+        let key = build_key("nodes", None, node_name);
+        let node: Node = match self.storage.get(&key).await {
+            Ok(n) => n,
+            Err(Error::NotFound(_)) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let current = node
+            .status
+            .as_ref()
+            .and_then(|s| s.volumes_attached.clone())
+            .unwrap_or_default();
+        let mut want: Vec<AttachedVolume> = current
+            .iter()
+            .filter(|v| !v.name.starts_with(CSI_PREFIX))
+            .cloned()
+            .collect();
+        want.extend(report.iter().map(|n| AttachedVolume {
+            name: n.clone(),
+            device_path: String::new(),
+        }));
+        let same = want.len() == current.len()
+            && want
+                .iter()
+                .all(|w| current.iter().any(|c| c.name == w.name));
+        if same {
+            return Ok(());
+        }
+        let list = serde_json::to_value(&want)?;
+        let patch = serde_json::json!({"status": {
+            "volumesAttached": if want.is_empty() { serde_json::Value::Null } else { list }
+        }});
+        let mut full = node;
+        full.status
+            .get_or_insert_with(Default::default)
+            .volumes_attached = if want.is_empty() { None } else { Some(want) };
+        match self
+            .storage
+            .patch_status_strategic_merge::<Node>(&key, &patch, &full)
+            .await
+        {
+            Ok(_) | Err(Error::NotFound(_)) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// One pass of `reconciler.reconcile`: detaches, then attaches.
     pub async fn reconcile_all(&self) -> Result<()> {
         let pods: Vec<Pod> = self.storage.list(&build_prefix("pods", None)).await?;
@@ -279,6 +341,20 @@ impl<S: Storage + 'static> AttachDetachController<S> {
             attached.push((va, pv, handle));
         }
 
+        // The volumes each node reports as attached
+        // (`GetVolumesToReportAttached`): every owned attachment not already
+        // being deleted.
+        let mut report: HashMap<String, BTreeSet<String>> = HashMap::new();
+        for (va, pv, handle) in &attached {
+            if va.metadata.deletion_timestamp.is_none() {
+                let driver = pv.spec.csi.as_ref().map_or("", |c| c.driver.as_str());
+                report
+                    .entry(va.spec.node_name.clone())
+                    .or_default()
+                    .insert(unique_volume_name(driver, handle));
+            }
+        }
+
         // Detach first (reconciler.go:167-170).
         for (va, pv, handle) in &attached {
             if desired.contains_key(&va.metadata.name) || va.metadata.deletion_timestamp.is_some() {
@@ -298,6 +374,23 @@ impl<S: Storage + 'static> AttachDetachController<S> {
                     "Cannot detach volume {unique} from {}: still mounted",
                     va.spec.node_name
                 );
+                continue;
+            }
+            // reconciler.go:245-265: drop the volume from the report and
+            // update the node first; if that fails skip the detach and keep
+            // reporting it.
+            let node_report = report.entry(va.spec.node_name.clone()).or_default();
+            node_report.remove(&unique);
+            let snapshot = node_report.clone();
+            if let Err(e) = self.update_node_status(&va.spec.node_name, &snapshot).await {
+                warn!(
+                    "UpdateNodeStatusForNode failed for {}: {e:#}",
+                    va.spec.node_name
+                );
+                report
+                    .entry(va.spec.node_name.clone())
+                    .or_default()
+                    .insert(unique);
                 continue;
             }
             // Detach (csi_attacher.go:442): delete; NotFound is done.
@@ -366,6 +459,35 @@ impl<S: Storage + 'static> AttachDetachController<S> {
                 Err(Error::AlreadyExists(_)) => {}
                 Err(e) => return Err(e.into()),
             }
+            // MarkVolumeAsAttached once Attach() returned.
+            report
+                .entry(w.node.clone())
+                .or_default()
+                .insert(unique_volume_name(&w.driver, &w.handle));
+        }
+
+        // UpdateNodeStatuses: every node we report for, plus any node still
+        // carrying CSI entries we no longer report.
+        let mut failed = 0;
+        for node in &node_list {
+            let name = &node.metadata.name;
+            let has_csi = node
+                .status
+                .as_ref()
+                .and_then(|s| s.volumes_attached.as_ref())
+                .is_some_and(|v| v.iter().any(|v| v.name.starts_with(CSI_PREFIX)));
+            let empty = BTreeSet::new();
+            let r = report.get(name).unwrap_or(&empty);
+            if r.is_empty() && !has_csi {
+                continue;
+            }
+            if let Err(e) = self.update_node_status(name, r).await {
+                warn!("could not update volumesAttached of node {name}: {e:#}");
+                failed += 1;
+            }
+        }
+        if failed > 0 {
+            anyhow::bail!("unable to update {failed} nodes");
         }
         Ok(())
     }
