@@ -93,11 +93,86 @@ impl TypeConverters for RegistryTypeConverters {
 }
 
 /// `ObjectInterfaces.GetObjectDefaulter()` over the registry's per-kind
-/// defaulting.
+/// defaulting (`handlers::defaults`, the ports of the `SetDefaults_*`
+/// functions in `pkg/apis/*/v*/defaults.go`).
+///
+/// Upstream `Scheme.Default(obj)` (apimachinery `runtime/scheme.go`) looks the
+/// defaulting func up by the object's Go type and does nothing when none is
+/// registered; here the kind comes from the object's own `apiVersion`/`kind`.
+/// The typed defaulters work on our resource structs, so the defaulted form is
+/// merged back fill-missing-only: fields the typed form does not model survive
+/// a mutation and a field a patch set is never overwritten.
 pub struct SchemeObjectDefaulter;
 
+fn default_typed<T>(object: &mut Value, f: impl FnOnce(&mut T))
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    let Ok(mut typed) = serde_json::from_value::<T>(object.clone()) else {
+        return;
+    };
+    f(&mut typed);
+    if let Ok(defaulted) = serde_json::to_value(&typed) {
+        fill_missing(object, &defaulted);
+    }
+}
+
+/// Copy into `target` every value `source` has and `target` lacks.
+fn fill_missing(target: &mut Value, source: &Value) {
+    match (target, source) {
+        (Value::Object(t), Value::Object(s)) => {
+            for (k, sv) in s {
+                match t.get_mut(k) {
+                    Some(tv) => fill_missing(tv, sv),
+                    None => {
+                        t.insert(k.clone(), sv.clone());
+                    }
+                }
+            }
+        }
+        (Value::Array(t), Value::Array(s)) if t.len() == s.len() => {
+            for (tv, sv) in t.iter_mut().zip(s) {
+                fill_missing(tv, sv);
+            }
+        }
+        _ => {}
+    }
+}
+
 impl ObjectDefaulter for SchemeObjectDefaulter {
-    fn default_object(&self, _object: &mut Value) {}
+    fn default_object(&self, object: &mut Value) {
+        use crate::handlers::defaults as d;
+        use rusternetes_common::resources as r;
+        let api_version = object["apiVersion"].as_str().unwrap_or_default();
+        let group = api_version.split_once('/').map_or("", |(g, _)| g);
+        let kind = object["kind"].as_str().unwrap_or_default().to_string();
+        match (group, kind.as_str()) {
+            ("", "Pod") => default_typed::<r::Pod>(object, |p| {
+                if let Some(spec) = p.spec.as_mut() {
+                    d::apply_pod_spec_defaults(spec);
+                    d::apply_pod_defaults(spec);
+                }
+            }),
+            ("", "ReplicationController") => {
+                default_typed(object, d::apply_replicationcontroller_defaults)
+            }
+            ("", "Service") => default_typed(object, d::apply_service_defaults),
+            ("", "LimitRange") => default_typed(object, d::apply_limit_range_defaults),
+            ("", "PersistentVolumeClaim") => {
+                default_typed::<r::volume::PersistentVolumeClaim>(object, |c| {
+                    d::apply_pvc_spec_defaults(&mut c.spec)
+                })
+            }
+            ("apps", "Deployment") => default_typed(object, d::apply_deployment_defaults),
+            ("apps", "DaemonSet") => default_typed(object, d::apply_daemonset_defaults),
+            ("apps", "StatefulSet") => default_typed(object, d::apply_statefulset_defaults),
+            ("apps", "ReplicaSet") => default_typed(object, d::apply_replicaset_defaults),
+            ("batch", "Job") => default_typed(object, d::apply_job_defaults),
+            ("batch", "CronJob") => default_typed(object, d::apply_cronjob_defaults),
+            // No registered defaulting func: Scheme.Default is a no-op.
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]
