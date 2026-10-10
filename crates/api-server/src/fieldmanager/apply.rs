@@ -217,6 +217,9 @@ impl FieldManager {
 /// the config.
 fn merge_values(live: &Value, config: &Value, name: &str) -> Value {
     match (live, config) {
+        (Value::Object(_), Value::Object(_)) if field_kind(name) == FieldKind::Atomic => {
+            config.clone()
+        }
         (Value::Object(l), Value::Object(c)) => {
             let mut out = l.clone();
             for (k, cv) in c {

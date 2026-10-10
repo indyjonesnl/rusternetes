@@ -67,18 +67,18 @@ async fn apply_on_main_resource_does_not_own_status() {
     let (code, out) = apply(&api, &format!("{SC}/rf-main"), "user", &b).await;
     assert_eq!(code, StatusCode::CREATED, "{out}");
     assert!(
-        owned_keys(&out, "user").contains(&"spec".to_string()),
+        owned_keys(&out, "user").contains(&"f:spec".to_string()),
         "{out}"
     );
     assert!(
-        !owned_keys(&out, "user").contains(&"status".to_string()),
+        !owned_keys(&out, "user").contains(&"f:status".to_string()),
         "{out}"
     );
 
     let (code, out) = apply(&api, &format!("{SC}/rf-main"), "user2", &b).await;
     assert_eq!(code, StatusCode::OK, "{out}");
     assert!(
-        !owned_keys(&out, "user2").contains(&"status".to_string()),
+        !owned_keys(&out, "user2").contains(&"f:status".to_string()),
         "{out}"
     );
 }
@@ -102,11 +102,11 @@ async fn apply_on_status_does_not_own_spec() {
     let (code, out) = apply(&api, &format!("{SC}/rf-status/status"), "ctrl", &b).await;
     assert_eq!(code, StatusCode::OK, "{out}");
     assert!(
-        owned_keys(&out, "ctrl").contains(&"status".to_string()),
+        owned_keys(&out, "ctrl").contains(&"f:status".to_string()),
         "{out}"
     );
     assert!(
-        !owned_keys(&out, "ctrl").contains(&"spec".to_string()),
+        !owned_keys(&out, "ctrl").contains(&"f:spec".to_string()),
         "{out}"
     );
 }
@@ -138,11 +138,11 @@ async fn reset_fields_do_not_conflict_across_endpoints() {
     let (code, out) = apply(&api, &format!("{SC}/rf-conflict"), "user", &user).await;
     assert_eq!(code, StatusCode::OK, "{out}");
     assert!(
-        owned_keys(&out, "ctrl").contains(&"status".to_string()),
+        owned_keys(&out, "ctrl").contains(&"f:status".to_string()),
         "{out}"
     );
     assert!(
-        !owned_keys(&out, "user").contains(&"status".to_string()),
+        !owned_keys(&out, "user").contains(&"f:status".to_string()),
         "{out}"
     );
 }
@@ -168,11 +168,11 @@ async fn deployment_apply_does_not_own_status() {
     let (code, out) = apply(&api, uri, "user", &b).await;
     assert_eq!(code, StatusCode::CREATED, "{out}");
     assert!(
-        owned_keys(&out, "user").contains(&"spec".to_string()),
+        owned_keys(&out, "user").contains(&"f:spec".to_string()),
         "{out}"
     );
     assert!(
-        !owned_keys(&out, "user").contains(&"status".to_string()),
+        !owned_keys(&out, "user").contains(&"f:status".to_string()),
         "{out}"
     );
 }

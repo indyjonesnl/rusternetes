@@ -200,6 +200,9 @@ pub(super) enum FieldKind {
     KeyedList(&'static [&'static str]),
     /// A `listType=set` of scalars.
     ScalarSet,
+    /// `+structType=atomic` / `+mapType=atomic`: the whole value is one leaf
+    /// (`metav1.LabelSelector`, `Service.spec.selector`, ...).
+    Atomic,
 }
 
 pub(super) fn field_kind(name: &str) -> FieldKind {
@@ -218,6 +221,7 @@ pub(super) fn field_kind(name: &str) -> FieldKind {
         "ownerReferences" => FieldKind::KeyedList(&["uid"]),
         "hostAliases" => FieldKind::KeyedList(&["ip"]),
         "finalizers" => FieldKind::ScalarSet,
+        "selector" | "podSelector" | "namespaceSelector" | "labelSelector" => FieldKind::Atomic,
         _ => FieldKind::Struct,
     }
 }
@@ -275,6 +279,7 @@ impl Fields {
         path.push(format!("f:{name}"));
         match v {
             Value::Object(m) if m.is_empty() => self.leaf(path, v),
+            Value::Object(_) if field_kind(name) == FieldKind::Atomic => self.leaf(path, v),
             Value::Object(m) => {
                 if field_kind(name) == FieldKind::Map {
                     self.set.insert(path);

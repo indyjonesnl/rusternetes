@@ -265,7 +265,9 @@ pub fn apply_legacy<T: Serialize + DeserializeOwned>(
             conflicts
                 .into_iter()
                 .map(|c| PathConflict {
-                    path: c.path,
+                    // `PathConflict::path` has no leading dot; the handler
+                    // adds it (`Path.String()` starts with one).
+                    path: c.path.trim_start_matches('.').to_string(),
                     current_manager: c.manager,
                     applying_manager: opts.field_manager.clone(),
                 })
@@ -968,7 +970,7 @@ mod tests {
             match out {
                 ApplyOutcome::Conflicts(c) => {
                     assert_eq!(c.len(), 1, "{c:?}");
-                    assert_eq!(c[0].path, ".spec.holderIdentity");
+                    assert_eq!(c[0].path, "spec.holderIdentity");
                     assert_eq!(c[0].current_manager, "a");
                 }
                 _ => panic!("expected a conflict"),
