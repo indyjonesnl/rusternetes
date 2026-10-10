@@ -2115,26 +2115,28 @@ pub struct PodResourceClaimStatus {
 mod tests {
     use super::*;
 
-    /// #2453: Go's struct tolerates several states set at once.
+    /// #2453/#2454: Go's struct holds several states at once and encodes
+    /// them all back (core/v1/types.go:3300 `ContainerState`).
     #[test]
-    fn container_state_with_several_keys_keeps_the_most_final() {
-        let s: ContainerState = serde_json::from_value(serde_json::json!({
+    fn container_state_with_several_keys_round_trips() {
+        let input = serde_json::json!({
             "running": {"startedAt": "2026-10-07T00:00:00Z"},
             "waiting": {"reason": "ContainerCreating"}
-        }))
-        .unwrap();
-        assert!(matches!(s, ContainerState::Running { .. }));
-        let s: ContainerState = serde_json::from_value(serde_json::json!({
-            "running": {}, "waiting": null
-        }))
-        .unwrap();
-        assert!(matches!(s, ContainerState::Running { .. }));
-        let s: ContainerState = serde_json::from_value(serde_json::json!({
+        });
+        let s: ContainerState = serde_json::from_value(input.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&s).unwrap(), input);
+        let s: ContainerState =
+            serde_json::from_value(serde_json::json!({"running": {}, "waiting": null})).unwrap();
+        assert_eq!(
+            serde_json::to_value(&s).unwrap(),
+            serde_json::json!({"running": {}})
+        );
+        let input = serde_json::json!({
             "waiting": {"reason": "x"},
             "terminated": {"exitCode": 1}
-        }))
-        .unwrap();
-        assert!(matches!(s, ContainerState::Terminated { exit_code: 1, .. }));
+        });
+        let s: ContainerState = serde_json::from_value(input.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&s).unwrap(), input);
     }
 
     /// Pod condition timestamps MUST serialize at whole-second precision, like

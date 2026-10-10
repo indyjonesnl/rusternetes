@@ -565,10 +565,9 @@ async fn kubelet_status_patch_tolerates_running_and_waiting_both_set() {
     let (s, body) = patch_status(&api, &patch).await;
     assert_eq!(s, StatusCode::OK, "{body}");
     let st = &body["status"]["containerStatuses"][0]["state"];
-    // Deliberate deviation: our `ContainerState` holds one state, so the
-    // stored pod keeps the more final one (Running over Waiting).
+    // Go stores both keys: the merge only replaces what the patch names.
     assert!(
-        st.get("running").is_some() && st.get("waiting").is_none(),
+        st.get("running").is_some() && st.get("waiting").is_some(),
         "{body}"
     );
 }
