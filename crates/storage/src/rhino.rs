@@ -34,7 +34,7 @@ pub struct RhinoStorage<B: Backend> {
     /// Per-key object sizes behind `Storage::stats` (stats.go
     /// `resourceSizeEstimator`), fed by the reads and creates that already
     /// hold the encoded value.
-    sizes: crate::size_estimator::SizeEstimator,
+    sizes: Arc<crate::size_estimator::SizeEstimator>,
 }
 
 #[cfg(feature = "sqlite")]
@@ -476,12 +476,23 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
         );
 
         let mut events_rx = watch_result.events;
+        let sizes = self.sizes.clone();
 
         let watch_stream = async_stream::stream! {
             while let Some(events) = events_rx.recv().await {
                 for event in events {
                     let key = event.kv.key.clone();
                     let mod_revision = event.kv.mod_revision;
+
+                    // Feed the size estimator like upstream's watch loop
+                    // (storage/etcd3/watcher.go:408-415: UpdateKey on PUT,
+                    // DeleteKey on DELETE) so a resource nobody reads still
+                    // reports an average size (#2991).
+                    if event.delete {
+                        sizes.delete_key(&key, mod_revision);
+                    } else {
+                        sizes.update_key(&key, event.kv.value.len(), mod_revision);
+                    }
 
                     if event.delete {
                         // For deletes, use prev_kv value if available, otherwise use kv value
