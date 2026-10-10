@@ -174,6 +174,19 @@ pub fn validate_synthesized_list_options(
     ))
 }
 
+/// The revision a LIST reads at, taken BEFORE the items so the RV stamped on
+/// the response is the revision the items were read at (#3078). Lives here,
+/// with the other sanctioned revision readers, because the list-handler guard
+/// forbids list functions from touching `current_revision()` themselves.
+pub async fn list_snapshot_revision<S: rusternetes_storage::Storage + ?Sized>(
+    storage: &S,
+) -> Option<i64> {
+    match storage.current_revision().await {
+        Ok(rev) if rev > 0 => Some(rev),
+        _ => None,
+    }
+}
+
 /// Pure core of [`list_collection_resource_version`]: the greater of the store
 /// revision and the highest item resourceVersion, as a decimal string.
 pub fn collection_resource_version(current_revision: Option<i64>, items_max_rv: &str) -> String {
