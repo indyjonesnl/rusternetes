@@ -1579,7 +1579,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         // Go's getPatch() round-trips the DaemonSet through Go's typed struct
         // serialization which applies omitempty, dropping empty strings, null
         // pointers, empty slices/maps, zero ints, and false booleans.
-        template_value = Self::strip_go_omitempty_zeros(&template_value);
+        template_value = Self::strip_go_omitempty_zeros(&template_value, "");
         // Add $patch: "replace" to the template object (K8s strategic merge patch marker)
         if let Some(obj) = template_value.as_object_mut() {
             obj.insert("$patch".to_string(), serde_json::json!("replace"));
@@ -1628,13 +1628,13 @@ impl<S: Storage + 'static> DaemonSetController<S> {
     /// When Go round-trips a DaemonSet through its typed struct serialization,
     /// all fields with `json:",omitempty"` that have zero values are dropped.
     /// Our ControllerRevision data must match those exact bytes.
-    fn strip_go_omitempty_zeros(value: &serde_json::Value) -> serde_json::Value {
+    fn strip_go_omitempty_zeros(value: &serde_json::Value, parent_key: &str) -> serde_json::Value {
         match value {
             serde_json::Value::Object(map) => {
                 let mut cleaned = serde_json::Map::new();
                 for (key, val) in map {
                     // Recursively clean nested values first
-                    let cleaned_val = Self::strip_go_omitempty_zeros(val);
+                    let cleaned_val = Self::strip_go_omitempty_zeros(val, key);
                     // Skip zero-value fields (Go's omitempty behavior).
                     // Exception: Go keeps empty structs that come from non-nil
                     // pointers (e.g., securityContext: {} from &SecurityContext{}).
@@ -1647,7 +1647,10 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                             key.as_str(),
                             "securityContext" | "resources" | "capabilities"
                         );
-                    if !is_preserved_empty_struct && Self::is_go_zero_value(&cleaned_val) {
+                    if !is_preserved_empty_struct
+                        && Self::is_go_zero_value(&cleaned_val)
+                        && Self::go_drops_zero(key, parent_key, &cleaned_val)
+                    {
                         continue;
                     }
                     cleaned.insert(key.clone(), cleaned_val);
@@ -1656,10 +1659,62 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             }
             serde_json::Value::Array(arr) => serde_json::Value::Array(
                 arr.iter()
-                    .map(|v| Self::strip_go_omitempty_zeros(v))
+                    .map(|v| Self::strip_go_omitempty_zeros(v, parent_key))
                     .collect(),
             ),
             other => other.clone(),
+        }
+    }
+
+    /// Whether Go's encoding/json would actually omit this zero value.
+    ///
+    /// `omitempty` drops a zero scalar only when the Go field is a plain
+    /// `bool`/`int*`; a `*bool`/`*int*` is omitted only when nil, so an
+    /// explicit 0/false is kept (`TerminationGracePeriodSeconds *int64`
+    /// types.go:2749, `RunAsUser *int64` :4826, `Privileged *bool` :8197).
+    /// Rusternetes serializes `None` as an absent key, so any zero scalar
+    /// that is present is an explicit pointer value unless its key is one of
+    /// the plain `omitempty` scalars below. Strings/arrays/maps/objects keep
+    /// the previous behaviour (out of scope for #2954).
+    ///
+    /// The plain-omitempty keys reachable from a PodTemplateSpec are taken
+    /// from the same upstream `core/v1/types.go` (release-1.35) as
+    /// `PLAIN_ZERO_SCALARS` in crates/protobuf/src/plain_zero_scalars.rs
+    /// (that table is keyed by message name, which the schema-less JSON
+    /// walk here does not have; the controller-manager crate also does not
+    /// depend on it): PodSpec hostNetwork/hostPID/hostIPC (:4209-4219),
+    /// Container stdin/stdinOnce/tty (:3092-3105), ContainerPort hostPort
+    /// (:2355), Probe initialDelaySeconds/timeoutSeconds/periodSeconds/
+    /// successThreshold/failureThreshold (:2720-2737), VolumeMount readOnly
+    /// (:2376), and the volume-source scalars partition, chapAuthDiscovery,
+    /// chapAuthSession, sslEnabled, readOnly (:236-1858). Exceptions where
+    /// `readOnly` is a `*bool`: azureDisk (:1711) and csi (:2275).
+    fn go_drops_zero(key: &str, parent_key: &str, value: &serde_json::Value) -> bool {
+        if !matches!(
+            value,
+            serde_json::Value::Bool(_) | serde_json::Value::Number(_)
+        ) {
+            return true;
+        }
+        match key {
+            "readOnly" => !matches!(parent_key, "azureDisk" | "csi"),
+            "hostNetwork"
+            | "hostPID"
+            | "hostIPC"
+            | "stdin"
+            | "stdinOnce"
+            | "tty"
+            | "hostPort"
+            | "initialDelaySeconds"
+            | "timeoutSeconds"
+            | "periodSeconds"
+            | "successThreshold"
+            | "failureThreshold"
+            | "partition"
+            | "chapAuthDiscovery"
+            | "chapAuthSession"
+            | "sslEnabled" => true,
+            _ => false,
         }
     }
 
