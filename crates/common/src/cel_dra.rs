@@ -1299,4 +1299,52 @@ mod tests {
         let c = cost("device.attributes.all(d, d == 'x')");
         assert!(c < CEL_SELECTOR_EXPRESSION_MAX_COST, "{c}");
     }
+
+    /// `compile_test.go` `expectCost` table (`TestCEL`,
+    /// `staging/src/k8s.io/dynamic-resource-allocation/cel/compile_test.go:56-331`),
+    /// the compile-time estimate only.
+    #[test]
+    fn upstream_compile_test_expect_cost_table() {
+        let a = r#"device.attributes["dra.example.com"]"#;
+        let c = r#"device.capacity["dra.example.com"]"#;
+        let cases: Vec<(String, u64)> = vec![
+            (r#"device.attributes["no-such-domain"].noSuchAttr.isGreaterThan(quantity("0"))"#.into(), 6),
+            (r#""no-such-domain" in device.attributes"#.into(), 3),
+            (r#"device.driver == """#.into(), 2),
+            (r#"device.driver == "dra.example.com""#.into(), 4),
+            (format!("{a}.name"), 4),
+            (format!(r#"{a}["name"]"#), 4),
+            (r#"cel.bind(dra, device.attributes["dra.example.com"], dra.name)"#.into(), 15),
+            (format!("{a}.name > 0"), 5),
+            (format!(r#"{a}.name == "fish""#), 5),
+            (format!(r#"{a}.name.isGreaterThan(semver("0.0.1"))"#), 6),
+            (format!(r#"{a}.name.isGreaterThan(semver("v0.0.1", true)) && isSemver("v1.0.0", true)"#), 7),
+            (format!(r#"{c}.name.isGreaterThan(quantity("1Ki"))"#), 6),
+            (format!(r#""name" in {c} && {c}.name.isGreaterThan(quantity("1Ki"))"#), 10),
+            (format!(r#"!("name" in {c}) || {c}.name.isGreaterThan(quantity("1Ki"))"#), 11),
+            (format!("{a}.a && {a}.b && {a}.c"), 12),
+            (r#"device.attributes.exists_one(x, x == "dra.example.com")"#.into(), 164),
+            (format!(r#"{a}.exists_one(x, x == "services")"#), 133),
+            (format!(r#"{a}.services.split("example").size() >= 2"#), 19),
+            (format!(r#"{a}.services.matches("[^a]?sym")"#), 18),
+            (r#"device.capacity.exists_one(x, x == "dra.example.com")"#.into(), 164),
+            (format!(r#"{c}.exists_one(x, x == "memory")"#), 133),
+            (
+                "[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(x, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(y, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(z, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(z2, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(z3, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(z4, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(z5, int('1'.find('[0-9]*')) < 100)))))))".into(),
+                85555551,
+            ),
+            ("device.allowMultipleAllocations == true".into(), 3),
+        ];
+        let mut bad = Vec::new();
+        for (x, want) in &cases {
+            let got = match compile_selector(x) {
+                SelectorCompilation::Ok { max_cost } => max_cost,
+                SelectorCompilation::Invalid(d) => panic!("{x}: {d}"),
+            };
+            if got != *want {
+                bad.push(format!("{x}: want {want}, got {got}"));
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
 }
