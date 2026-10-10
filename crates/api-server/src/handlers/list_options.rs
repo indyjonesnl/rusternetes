@@ -191,10 +191,50 @@ pub async fn list_resource_version<T: serde::Serialize>(
     }
 }
 
+/// Scope one request's list snapshot (stub; made real by the fix commit).
+pub async fn with_list_snapshot<F: std::future::Future>(fut: F) -> F::Output {
+    fut.await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusternetes_storage::MemoryStorage;
+    use rusternetes_storage::{MemoryStorage, StorageBackend};
+
+    /// #3078: items and the collection RV must come from one read. A write
+    /// landing between `list_items` and `list_resource_version` is absent from
+    /// `items`, so it must also be absent from the stamped RV; otherwise
+    /// LIST -> WATCH(rv) never delivers its ADDED. Upstream stamps the RV from
+    /// the same etcd range response (`etcd3/store.go` GetList,
+    /// `getResp.Header.Revision`).
+    #[tokio::test]
+    async fn list_rv_never_includes_a_write_absent_from_items() {
+        let storage = StorageBackend::Memory(std::sync::Arc::new(MemoryStorage::new()));
+        let obj = |n: &str| serde_json::json!({"metadata": {"name": n}});
+        let _: serde_json::Value = storage.create("/r/a", &obj("a")).await.unwrap();
+        with_list_snapshot(async {
+            let params = HashMap::new();
+            let items: Vec<serde_json::Value> =
+                list_items(&storage, "/r/", &params).await.unwrap();
+            assert_eq!(items.len(), 1);
+            // The racing write, between the two reads.
+            let b: serde_json::Value = storage.create("/r/b", &obj("b")).await.unwrap();
+            let b_rv: i64 = b["metadata"]["resourceVersion"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            let rv: i64 = list_resource_version(&storage, &params, &items)
+                .await
+                .parse()
+                .unwrap();
+            assert!(
+                rv < b_rv,
+                "list RV {rv} includes write at {b_rv} that is missing from its items"
+            );
+        })
+        .await;
+    }
 
     fn q(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
