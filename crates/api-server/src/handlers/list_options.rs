@@ -216,12 +216,10 @@ where
         record_list_snapshot(None);
         return storage.list_at_revision(prefix, rv).await;
     }
-    if let Ok(rev) = storage.current_revision().await {
-        if rev > 0 {
-            if let Ok(items) = storage.list_at_revision(prefix, rev).await {
-                record_list_snapshot(Some(rev));
-                return Ok(items);
-            }
+    if let Some(rev) = crate::handlers::list_snapshot_revision(storage).await {
+        if let Ok(items) = storage.list_at_revision(prefix, rev).await {
+            record_list_snapshot(Some(rev));
+            return Ok(items);
         }
     }
     record_list_snapshot(None);
