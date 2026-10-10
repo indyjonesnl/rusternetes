@@ -11,8 +11,10 @@
 //!
 //! Of those plugins Rusternetes implements the two webhook plugins,
 //! ValidatingAdmissionPolicy and ResourceQuota
-//! ([`crate::admission::resourcequota`]). MutatingAdmissionPolicy is not
-//! implemented.
+//! ([`crate::admission::resourcequota`]). MutatingAdmissionPolicy is wired
+//! ahead of the mutating webhooks behind `Feature::MutatingAdmissionPolicy`
+//! ([`crate::admission::policy_plugin`]), but no policy source is installed
+//! in the state yet (the `patch/` package is #2996), so it does nothing.
 //!
 //! The in-tree plugins ahead of them run first, in `AllOrderedPlugins` order
 //! (plugins.go:69-100), for the resources on this path that they handle:
@@ -663,9 +665,63 @@ impl Admission<'_> {
         Ok(())
     }
 
+    /// `mutatingadmissionpolicy.Plugin.Admit` (policy/mutating/plugin.go).
+    /// A no-op unless `Feature::MutatingAdmissionPolicy` is on and a policy
+    /// source is installed in the state: nothing changes (not even a
+    /// round-trip through JSON) otherwise.
+    ///
+    /// Deviation: one dispatch, no reinvocation loop
+    /// (apiserver/pkg/admission/reinvocation.go); tracked in #2910's
+    /// follow-ups.
+    async fn admit_mutating_policy<T: Object>(
+        &self,
+        op: &Operation,
+        obj: T,
+        old: Option<&T>,
+    ) -> Result<T> {
+        use crate::admission::policy_mutating::ReinvocationContext;
+        use crate::admission::policy_plugin::MutatingPolicyPlugin;
+
+        if !MutatingPolicyPlugin::handles(op) || !MutatingPolicyPlugin::enabled() {
+            return Ok(obj);
+        }
+        let Some(plugin) = self.state.mutating_admission_policy.as_ref() else {
+            return Ok(obj);
+        };
+        let before = to_value(&obj)?;
+        let mut attr = crate::admission::policy_matching::Attributes {
+            kind: self.kind.clone(),
+            resource: self.resource.clone(),
+            subresource: self.subresource.unwrap_or("").to_string(),
+            namespace: self.namespace.unwrap_or("").to_string(),
+            name: obj.metadata().name.clone(),
+            operation: op.clone(),
+            object: Some(before.clone()),
+            old_object: old.map(to_value).transpose()?,
+        };
+        plugin
+            .admit(
+                &mut attr,
+                std::sync::Arc::new(ReinvocationContext::new(false)),
+            )
+            .await?;
+        match attr.object {
+            Some(after) if after != before => serde_json::from_value(after).map_err(|e| {
+                Error::Internal(format!(
+                    "failed to decode the object mutated by admission: {e}"
+                ))
+            }),
+            _ => Ok(obj),
+        }
+    }
+
     /// The mutating plugins: `MutationInterface.Admit`.
     pub async fn admit<T: Object>(&self, op: Operation, obj: T, old: Option<&T>) -> Result<T> {
+        // MutatingAdmissionPolicy is first (plugins.go:106-110), ahead of
+        // the webhooks; the in-tree plugins in `AllOrderedPlugins` precede
+        // all four, and they are kept ahead of it here as before.
         let obj = self.admit_in_tree(&op, obj).await?;
+        let obj = self.admit_mutating_policy(&op, obj, old).await?;
         let name = obj.metadata().name.clone();
         let (response, mutated) = self
             .state
