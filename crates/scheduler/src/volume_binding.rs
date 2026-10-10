@@ -729,6 +729,54 @@ pub fn find_pod_volumes(
     ))
 }
 
+// ---------------------------------------------------------------------------
+// Score (volume_binding.go PreScore/Score, scorer.go) -- STUB, see next commit.
+// ---------------------------------------------------------------------------
+
+/// `maxUtilization` (volume_binding.go:47).
+pub const MAX_UTILIZATION: i64 = 100;
+/// `fwk.MaxNodeScore` (kube-scheduler framework/interface.go).
+pub const MAX_NODE_SCORE: i64 = 100;
+/// `config.MaxCustomPriorityScore` (pkg/scheduler/apis/config/types.go:220).
+pub const MAX_CUSTOM_PRIORITY_SCORE: i64 = 10;
+
+/// `helper.FunctionShapePoint` (framework/plugins/helper/shape_score.go).
+#[derive(Clone, Copy, Debug)]
+pub struct FunctionShapePoint {
+    pub utilization: i64,
+    pub score: i64,
+}
+
+/// `StorageResource` (binder.go:87-91).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StorageResource {
+    pub requested: i64,
+    pub capacity: i64,
+}
+
+/// `classResourceMap` (scorer.go:26).
+pub type ClassResourceMap = HashMap<String, StorageResource>;
+
+pub fn default_shape() -> Vec<FunctionShapePoint> {
+    todo!()
+}
+
+pub fn build_scorer_function(_shape: &[FunctionShapePoint]) -> impl Fn(&ClassResourceMap) -> i64 {
+    |_| todo!()
+}
+
+pub fn pre_score_skip(_by_node: &HashMap<String, PodVolumes>, _scoring_enabled: bool) -> bool {
+    todo!()
+}
+
+pub fn score(
+    _pod_volumes: Option<&PodVolumes>,
+    _scorer: &dyn Fn(&ClassResourceMap) -> i64,
+    _scoring_enabled: bool,
+) -> i64 {
+    todo!()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1144,5 +1192,402 @@ mod tests {
             ),
             _ => panic!("expected Unresolvable"),
         }
+    }
+
+    // ---- scorer_test.go TestScore ----
+
+    fn scaled(points: &[(i64, i64)]) -> Vec<FunctionShapePoint> {
+        points
+            .iter()
+            .map(|&(u, sc)| FunctionShapePoint {
+                utilization: u,
+                score: sc * (MAX_NODE_SCORE / MAX_CUSTOM_PRIORITY_SCORE),
+            })
+            .collect()
+    }
+    /// `defaultShapePoint` of volume_binding_test.go:80-89 (prefer high utilization).
+    fn prefer_utilization() -> Vec<FunctionShapePoint> {
+        scaled(&[(0, 0), (100, 10)])
+    }
+    fn res(requested: i64, capacity: i64) -> StorageResource {
+        StorageResource {
+            requested,
+            capacity,
+        }
+    }
+    fn classes(items: &[(&str, i64, i64)]) -> ClassResourceMap {
+        items
+            .iter()
+            .map(|&(c, r, cap)| (c.to_string(), res(r, cap)))
+            .collect()
+    }
+
+    #[test]
+    fn scorer_default_shape_single_class() {
+        let f = build_scorer_function(&prefer_utilization());
+        for (req, want) in [(0, 0), (30, 30), (50, 50), (100, 100)] {
+            assert_eq!(f(&classes(&[("hdd", req, 100)])), want, "req {req}");
+        }
+    }
+
+    #[test]
+    fn scorer_default_shape_multiple_classes() {
+        let f = build_scorer_function(&prefer_utilization());
+        for (hdd, ssd, want) in [
+            (0, 0, 0),
+            (0, 30, 15),
+            (30, 30, 30),
+            (30, 60, 45),
+            (50, 50, 50),
+            (50, 100, 75),
+            (100, 100, 100),
+        ] {
+            assert_eq!(
+                f(&classes(&[("hdd", hdd, 100), ("ssd", ssd, 100)])),
+                want,
+                "hdd {hdd} ssd {ssd}"
+            );
+        }
+    }
+
+    #[test]
+    fn scorer_custom_shape_multiple_classes() {
+        let f = build_scorer_function(&[
+            FunctionShapePoint {
+                utilization: 50,
+                score: 0,
+            },
+            FunctionShapePoint {
+                utilization: 80,
+                score: 30,
+            },
+            FunctionShapePoint {
+                utilization: 100,
+                score: 50,
+            },
+        ]);
+        for (hdd, ssd, want) in [
+            (0, 0, 0),
+            (0, 30, 0),
+            (30, 30, 0),
+            (30, 60, 5),
+            (50, 100, 25),
+            (90, 90, 40),
+            (100, 100, 50),
+        ] {
+            assert_eq!(
+                f(&classes(&[("hdd", hdd, 100), ("ssd", ssd, 100)])),
+                want,
+                "hdd {hdd} ssd {ssd}"
+            );
+        }
+    }
+
+    #[test]
+    fn scorer_empty_map_zero_capacity_and_overcommit() {
+        let f = build_scorer_function(&prefer_utilization());
+        assert_eq!(f(&ClassResourceMap::new()), 0);
+        // capacity == 0 || requested > capacity => rawScoringFunction(maxUtilization)
+        assert_eq!(f(&classes(&[("hdd", 10, 0)])), 100);
+        assert_eq!(f(&classes(&[("hdd", 200, 100)])), 100);
+    }
+
+    #[test]
+    fn default_shape_is_max_score_at_zero_utilization() {
+        // SetDefaults_VolumeBindingArgs (apis/config/v1/defaults.go:196-207)
+        let f = build_scorer_function(&default_shape());
+        assert_eq!(f(&classes(&[("c", 0, 100)])), 100);
+        assert_eq!(f(&classes(&[("c", 100, 100)])), 0);
+    }
+
+    // ---- volume_binding_test.go score cases ----
+
+    fn node_named(name: &str) -> Node {
+        node(name, json!({"kubernetes.io/hostname": name, "node": name}))
+    }
+    fn sized_pvc(name: &str, class: &str, size: &str) -> PersistentVolumeClaim {
+        pvc(
+            name,
+            json!({"storageClassName": class, "resources": {"requests": {"storage": size}}}),
+            json!({}),
+            json!({"phase": "Pending"}),
+        )
+    }
+    fn host_affinity(node: &str) -> Value {
+        json!({"required": {"nodeSelectorTerms": [{"matchExpressions": [
+            {"key": "kubernetes.io/hostname", "operator": "In", "values": [node]}]}]}})
+    }
+    fn node_capacity(node: &str, class: &str, size: &str) -> CSIStorageCapacity {
+        serde_json::from_value(json!({
+            "apiVersion": "storage.k8s.io/v1", "kind": "CSIStorageCapacity",
+            "metadata": {"name": format!("cap-{node}"), "namespace": "ns"},
+            "storageClassName": class, "capacity": size,
+            "nodeTopology": {"matchLabels": {"node": node}}
+        }))
+        .unwrap()
+    }
+    fn pod_with_claims(claims: &[&str]) -> Pod {
+        pod(serde_json::Value::Array(
+            claims
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    json!({"name": format!("v{i}"), "persistentVolumeClaim": {"claimName": c}})
+                })
+                .collect(),
+        ))
+    }
+    /// Filter every node (keeping `PodVolumes` per node like `podVolumesByNode`),
+    /// then PreScore + Score. Filter-failed nodes score 0 (upstream's test
+    /// expects 0 for them).
+    fn run_scores(
+        p: &Pod,
+        nodes: &[Node],
+        s: &VolumeSnapshot,
+        shape: &[FunctionShapePoint],
+    ) -> Vec<i64> {
+        let claims = ready(p, s);
+        let mut by_node = HashMap::new();
+        for n in nodes {
+            let (vols, reasons) = find_pod_volumes(p, &claims, n, s).unwrap();
+            if reasons.is_empty() {
+                by_node.insert(n.metadata.name.clone(), vols);
+            }
+        }
+        assert!(!pre_score_skip(&by_node, true));
+        let scorer = build_scorer_function(shape);
+        nodes
+            .iter()
+            .map(|n| match by_node.get(&n.metadata.name) {
+                Some(v) => score(Some(v), &scorer, true),
+                None => 0,
+            })
+            .collect()
+    }
+    fn wait_class(name: &str, provisioner: &str) -> StorageClass {
+        class(name, "WaitForFirstConsumer", provisioner, None)
+    }
+    fn local_pvs(size_a: &str, size_b: &str, class: &str, tag: &str) -> Vec<PersistentVolume> {
+        vec![
+            pv(
+                &format!("pv-a-{tag}0"),
+                class,
+                size_a,
+                Some(host_affinity("node-a")),
+            ),
+            pv(
+                &format!("pv-a-{tag}1"),
+                class,
+                size_a,
+                Some(host_affinity("node-a")),
+            ),
+            pv(
+                &format!("pv-b-{tag}0"),
+                class,
+                size_b,
+                Some(host_affinity("node-b")),
+            ),
+            pv(
+                &format!("pv-b-{tag}1"),
+                class,
+                size_b,
+                Some(host_affinity("node-b")),
+            ),
+        ]
+    }
+    const NOPROV: &str = "kubernetes.io/no-provisioner";
+
+    fn three_nodes() -> [Node; 3] {
+        [
+            node_named("node-a"),
+            node_named("node-b"),
+            node_named("node-c"),
+        ]
+    }
+
+    #[test]
+    fn score_local_volumes_with_close_capacity_are_preferred() {
+        let s = VolumeSnapshot {
+            pvcs: vec![sized_pvc("pvc-a", "wait", "50Gi")],
+            pvs: local_pvs("200Gi", "100Gi", "wait", ""),
+            classes: vec![wait_class("wait", NOPROV)],
+            ..Default::default()
+        };
+        let got = run_scores(
+            &pod_with_claims(&["pvc-a"]),
+            &three_nodes(),
+            &s,
+            &prefer_utilization(),
+        );
+        assert_eq!(got, vec![25, 50, 0]);
+    }
+
+    #[test]
+    fn score_local_volumes_with_close_capacity_multiple_pvcs() {
+        let mut pvs = local_pvs("200Gi", "100Gi", "wait", "");
+        pvs.extend(local_pvs("200Gi", "100Gi", "wait-hdd", "h"));
+        let s = VolumeSnapshot {
+            pvcs: vec![
+                sized_pvc("pvc-0", "wait", "50Gi"),
+                sized_pvc("pvc-1", "wait-hdd", "100Gi"),
+            ],
+            pvs,
+            classes: vec![wait_class("wait", NOPROV), wait_class("wait-hdd", NOPROV)],
+            ..Default::default()
+        };
+        let got = run_scores(
+            &pod_with_claims(&["pvc-0", "pvc-1"]),
+            &three_nodes(),
+            &s,
+            &prefer_utilization(),
+        );
+        assert_eq!(got, vec![38, 75, 0]);
+    }
+
+    fn dynamic_snapshot(sizes: &[(&str, &str)], request: &str) -> (VolumeSnapshot, Vec<Node>) {
+        let nodes: Vec<Node> = sizes.iter().map(|(n, _)| node_named(n)).collect();
+        let s = VolumeSnapshot {
+            pvcs: vec![sized_pvc("pvc-dynamic", "wait-cap", request)],
+            classes: vec![wait_class("wait-cap", "example.com/csi")],
+            csi_drivers: vec![csi_driver(true)],
+            csi_capacities: sizes
+                .iter()
+                .map(|(n, sz)| node_capacity(n, "wait-cap", sz))
+                .collect(),
+            ..Default::default()
+        };
+        (s, nodes)
+    }
+
+    #[test]
+    fn score_storage_capacity_prefers_least_free() {
+        let (s, nodes) = dynamic_snapshot(
+            &[("node-a", "100Gi"), ("node-b", "50Gi"), ("node-c", "10Gi")],
+            "10Gi",
+        );
+        let got = run_scores(
+            &pod_with_claims(&["pvc-dynamic"]),
+            &nodes,
+            &s,
+            &prefer_utilization(),
+        );
+        assert_eq!(got, vec![10, 20, 100]);
+    }
+
+    #[test]
+    fn score_prefer_node_with_least_allocatable() {
+        let (s, nodes) = dynamic_snapshot(
+            &[("node-a", "100Gi"), ("node-b", "20Gi"), ("node-c", "10Gi")],
+            "10Gi",
+        );
+        let got = run_scores(
+            &pod_with_claims(&["pvc-dynamic"]),
+            &nodes,
+            &s,
+            &prefer_utilization(),
+        );
+        assert_eq!(got, vec![10, 50, 100]);
+    }
+
+    #[test]
+    fn score_prefer_node_with_maximum_allocatable_custom_shape() {
+        let (s, nodes) = dynamic_snapshot(
+            &[("node-a", "100Gi"), ("node-b", "20Gi"), ("node-c", "10Gi")],
+            "10Gi",
+        );
+        let got = run_scores(
+            &pod_with_claims(&["pvc-dynamic"]),
+            &nodes,
+            &s,
+            &default_shape(),
+        );
+        assert_eq!(got, vec![90, 50, 0]);
+    }
+
+    #[test]
+    fn score_dynamic_provisioning_same_class_uses_capacity_once() {
+        // Capacity is assigned (not summed) per class: 2 x 50Gi on 100Gi => 100.
+        let s = VolumeSnapshot {
+            pvcs: vec![
+                sized_pvc("pvc-dynamic-0", "wait-cap", "50Gi"),
+                sized_pvc("pvc-dynamic-1", "wait-cap", "50Gi"),
+            ],
+            classes: vec![wait_class("wait-cap", "example.com/csi")],
+            csi_drivers: vec![csi_driver(true)],
+            csi_capacities: vec![node_capacity("node-a", "wait-cap", "100Gi")],
+            ..Default::default()
+        };
+        let got = run_scores(
+            &pod_with_claims(&["pvc-dynamic-0", "pvc-dynamic-1"]),
+            &[node_named("node-a")],
+            &s,
+            &prefer_utilization(),
+        );
+        assert_eq!(got, vec![100]);
+    }
+
+    #[test]
+    fn score_with_static_binds_ignores_dynamic_provisions() {
+        let s = VolumeSnapshot {
+            pvcs: vec![
+                sized_pvc("pvc-dynamic", "wait-cap", "10Gi"),
+                sized_pvc("pvc-static", "wait", "50Gi"),
+            ],
+            pvs: ["a", "b", "c"]
+                .iter()
+                .map(|n| {
+                    pv(
+                        &format!("pv-static-{n}"),
+                        "wait",
+                        "100Gi",
+                        Some(host_affinity(&format!("node-{n}"))),
+                    )
+                })
+                .collect(),
+            classes: vec![
+                wait_class("wait", NOPROV),
+                wait_class("wait-cap", "example.com/csi"),
+            ],
+            csi_drivers: vec![csi_driver(true)],
+            csi_capacities: vec![
+                node_capacity("node-a", "wait-cap", "100Gi"),
+                node_capacity("node-b", "wait-cap", "50Gi"),
+                node_capacity("node-c", "wait-cap", "10Gi"),
+            ],
+            ..Default::default()
+        };
+        let got = run_scores(
+            &pod_with_claims(&["pvc-dynamic", "pvc-static"]),
+            &three_nodes(),
+            &s,
+            &prefer_utilization(),
+        );
+        assert_eq!(got, vec![50, 50, 50]);
+    }
+
+    #[test]
+    fn pre_score_skip_rules() {
+        // volume_binding.go PreScore: skip unless static bindings exist or
+        // StorageCapacityScoring is on.
+        let mut by_node = HashMap::new();
+        by_node.insert("n".to_string(), PodVolumes::default());
+        assert!(pre_score_skip(&by_node, false));
+        assert!(!pre_score_skip(&by_node, true));
+        let s = VolumeSnapshot {
+            pvcs: vec![sized_pvc("a", "wait", "1Gi")],
+            pvs: vec![pv("pv", "wait", "2Gi", None)],
+            classes: vec![wait_class("wait", NOPROV)],
+            ..Default::default()
+        };
+        let (vols, _) = filter(&pod_with_claims(&["a"]), &node_named("n"), &s);
+        let mut with_static = HashMap::new();
+        with_static.insert("n".to_string(), vols);
+        assert!(!pre_score_skip(&with_static, false));
+    }
+
+    #[test]
+    fn score_without_pod_volumes_for_node_is_zero() {
+        let scorer = build_scorer_function(&prefer_utilization());
+        assert_eq!(score(None, &scorer, true), 0);
     }
 }
