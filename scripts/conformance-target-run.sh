@@ -195,7 +195,11 @@ capture_component_logs() {
 # These components are not compose services, so `compose logs` cannot see them.
 # The kubelet writes their stdout to
 # `$KUBELET_VOLUMES_PATH/pod-logs/<ns>_<pod>_<uid>/<container>.log`
-# (crates/kubelet/src/cri_runtime/runtime.rs:577-621). That tree is created by
+# (crates/kubelet/src/cri_runtime/runtime.rs:577-621). compose.sqlite.yml gives
+# each kubelet its OWN root (`KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}/node-N`,
+# #2771) and kubelet.rs:750 puts `pod-logs` under it, so the tree is
+# `$vol/node-N/pod-logs/...`, not `$vol/pod-logs/...` (the latter matched nothing
+# and left every run without a controller-manager log, #3029). That tree is created by
 # the kubelet as root, so read it from inside the kubelet container — which
 # bind-mounts KUBELET_VOLUMES_PATH at the SAME path (compose.sqlite.yml) — and
 # fall back to a plain host read for a local run where the files are readable.
@@ -215,7 +219,7 @@ capture_static_pod_logs() {
         captured=""
         for kubelet in rusternetes-kubelet rusternetes-kubelet2; do
             if "$runtime" exec "$kubelet" sh -c \
-                   "cat $vol/pod-logs/kube-system_${comp}*/${comp}.log" \
+                   "cat $vol/pod-logs/kube-system_${comp}*/${comp}.log $vol/*/pod-logs/kube-system_${comp}*/${comp}.log; true" \
                    >"$dest" 2>/dev/null && [ -s "$dest" ]; then
                 echo "[conformance-target-run] captured $comp log (static pod on $kubelet) -> $dest"
                 captured=1
@@ -224,6 +228,7 @@ capture_static_pod_logs() {
         done
         if [ -z "$captured" ]; then
             if cat "$vol"/pod-logs/kube-system_"${comp}"*/"${comp}".log \
+                   "$vol"/*/pod-logs/kube-system_"${comp}"*/"${comp}".log \
                    >"$dest" 2>/dev/null && [ -s "$dest" ]; then
                 echo "[conformance-target-run] captured $comp log (static pod, host) -> $dest"
             else
