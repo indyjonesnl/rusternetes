@@ -15,7 +15,7 @@
     "recipe": "ci/vanilla-swap/kind/apiserver-patch.yaml",
     "imageRepo": "ghcr.io/indyjonesnl/rusternetes/api-server",
     "target": "sig-api-machinery",
-    "focus": "\\[sig-api-machinery\\].*\\[Conformance\\]",
+    "focus": "\\[sig-api-machinery\\].*\\[Conformance\\]|\\[Conformance\\].*\\[sig-api-machinery\\]",
     "skip": "\\[Flaky\\]|\\[Serial\\]",
     "readiness": "readyz"
   },
@@ -25,7 +25,7 @@
     "recipe": "ci/vanilla-swap/kind/scheduler-patch.yaml",
     "imageRepo": "ghcr.io/indyjonesnl/rusternetes/scheduler",
     "target": "sig-scheduling",
-    "focus": "\\[sig-scheduling\\].*\\[Conformance\\]",
+    "focus": "\\[sig-scheduling\\].*\\[Conformance\\]|\\[Conformance\\].*\\[sig-scheduling\\]",
     "skip": "\\[Flaky\\]|\\[Serial\\]",
     "readiness": "pod-scheduled"
   },
@@ -35,7 +35,7 @@
     "recipe": "ci/vanilla-swap/kind/controller-manager-patch.yaml",
     "imageRepo": "ghcr.io/indyjonesnl/rusternetes/controller-manager",
     "target": "sig-apps",
-    "focus": "\\[sig-apps\\].*\\[Conformance\\]",
+    "focus": "\\[sig-apps\\].*\\[Conformance\\]|\\[Conformance\\].*\\[sig-apps\\]",
     "skip": "\\[Flaky\\]|\\[Serial\\]",
     "readiness": "deployment-reconciled"
   },
@@ -45,7 +45,7 @@
     "recipe": "ci/vanilla-swap/kind/kube-proxy-daemonset.yaml",
     "imageRepo": "ghcr.io/indyjonesnl/rusternetes/kube-proxy",
     "target": "sig-network",
-    "focus": "\\[sig-network\\].*Services.*\\[Conformance\\]",
+    "focus": "\\[sig-network\\].*Services.*\\[Conformance\\]|\\[Conformance\\].*\\[sig-network\\].*Services",
     "skip": "\\[Flaky\\]|\\[Serial\\]",
     "readiness": "service-programmed"
   }
