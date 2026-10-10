@@ -40,6 +40,9 @@ use crate::Storage;
 /// event store and for in-process recorders.
 pub const DEFAULT_EVENT_TTL_SECONDS: u64 = 3600;
 
+/// Process-wide `--event-ttl` for in-process recorders. STUB (red commit).
+pub fn set_process_event_ttl(_seconds: u64) {}
+
 /// Records Kubernetes events on behalf of a component, routing each emission
 /// through a shared [`EventCorrelator`] before writing to `storage`.
 ///
@@ -279,6 +282,26 @@ mod tests {
                 .await
                 .is_none(),
             "in-process events must carry the event TTL like API-written ones"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_recorders_follow_the_process_event_ttl() {
+        set_process_event_ttl(1);
+        let storage = Arc::new(MemoryStorage::new());
+        let recorder = EventRecorder::new(Arc::clone(&storage));
+        set_process_event_ttl(DEFAULT_EVENT_TTL_SECONDS);
+        let involved = obj_ref("ttl-web", "default");
+        recorder
+            .event(&involved, &source(), EventType::Normal, "Started", "m")
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert!(
+            stored(&storage, "default", "ttl-web", "Started")
+                .await
+                .is_none(),
+            "a recorder built by EventRecorder::new must use the configured --event-ttl"
         );
     }
 
