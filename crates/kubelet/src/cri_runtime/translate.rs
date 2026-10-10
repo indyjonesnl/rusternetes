@@ -2764,6 +2764,175 @@ mod tests {
         assert!(parse_resolv_conf("nameserver\n").is_err());
     }
 
+    // --- #3065: resolv-conf fallback + DNS events (dns.go:431, :178, :119, :145) ---
+
+    /// `dns.go:431`: `--resolv-conf=""` on a Default-policy pod yields the
+    /// localhost nameserver and a `.` search instead of an empty config.
+    #[test]
+    fn empty_resolv_conf_falls_back_to_localhost() {
+        let pod = pod_with(PodSpec {
+            dns_policy: Some("Default".to_string()),
+            ..Default::default()
+        });
+        let (dns, _) = get_pod_dns_with_events(
+            &pod,
+            &[],
+            "cluster.local",
+            &v1::DnsConfig::default(),
+            "",
+            &[],
+        );
+        assert_eq!(dns.servers, vec!["127.0.0.1".to_string()]);
+        assert_eq!(dns.searches, vec![".".to_string()]);
+        let (dns6, _) = get_pod_dns_with_events(
+            &pod,
+            &[],
+            "cluster.local",
+            &v1::DnsConfig::default(),
+            "",
+            &["fd00::1".to_string(), "10.0.0.1".to_string()],
+        );
+        assert_eq!(
+            dns6.servers,
+            vec!["::1".to_string(), "127.0.0.1".to_string()]
+        );
+    }
+
+    /// A non-empty resolv-conf path never triggers the fallback.
+    #[test]
+    fn non_empty_resolv_conf_keeps_host_config() {
+        let pod = pod_with(PodSpec {
+            dns_policy: Some("Default".to_string()),
+            ..Default::default()
+        });
+        let (dns, events) = get_pod_dns_with_events(
+            &pod,
+            &[],
+            "cluster.local",
+            &host_dns(),
+            "/etc/resolv.conf",
+            &[],
+        );
+        assert_eq!(dns, host_dns());
+        assert!(events.is_empty());
+    }
+
+    /// `dns.go:145-146`: ClusterFirst without cluster DNS emits MissingClusterDNS
+    /// on both the node and the pod.
+    #[test]
+    fn cluster_first_without_cluster_dns_emits_missing_cluster_dns() {
+        let pod = pod_with(PodSpec::default());
+        let (_, events) = get_pod_dns_with_events(
+            &pod,
+            &[],
+            "cluster.local",
+            &host_dns(),
+            "/etc/resolv.conf",
+            &[],
+        );
+        let node_msg = "kubelet does not have ClusterDNS IP configured and cannot create Pod using \"ClusterFirst\" policy. Falling back to \"Default\" policy.";
+        assert_eq!(
+            events,
+            vec![
+                DnsEvent {
+                    target: DnsEventTarget::Node,
+                    reason: "MissingClusterDNS",
+                    message: node_msg.to_string(),
+                },
+                DnsEvent {
+                    target: DnsEventTarget::Pod,
+                    reason: "MissingClusterDNS",
+                    message: format!("pod: \"web_prod(uid-123)\". {node_msg}"),
+                },
+            ]
+        );
+    }
+
+    /// `dns.go:119`/`:145`: truncation emits DNSConfigForming on the pod.
+    #[test]
+    fn limit_truncation_emits_dns_config_forming() {
+        use rusternetes_common::resources::pod::PodDNSConfig;
+        let pod = pod_with(PodSpec {
+            dns_policy: Some("None".to_string()),
+            dns_config: Some(PodDNSConfig {
+                nameservers: Some((1..=4).map(|i| format!("1.1.1.{i}")).collect()),
+                searches: Some((0..33).map(|i| format!("s{i}.example")).collect()),
+                options: None,
+            }),
+            ..Default::default()
+        });
+        let (_, events) = get_pod_dns_with_events(
+            &pod,
+            &[],
+            "cluster.local",
+            &v1::DnsConfig::default(),
+            "/etc/resolv.conf",
+            &[],
+        );
+        assert_eq!(events.len(), 2);
+        assert!(events
+            .iter()
+            .all(|e| e.target == DnsEventTarget::Pod && e.reason == "DNSConfigForming"));
+        assert_eq!(
+            events[0].message,
+            "Nameserver limits were exceeded, some nameservers have been omitted, the applied nameserver line is: 1.1.1.1 1.1.1.2 1.1.1.3"
+        );
+        assert!(events[1].message.starts_with(
+            "Search Line limits were exceeded, some search paths have been omitted, the applied search line is: s0.example "
+        ));
+    }
+
+    /// `dns.go:178`: CheckLimitsForResolvConf node-event messages.
+    #[test]
+    fn check_limits_for_resolv_conf_messages() {
+        let dir = std::env::temp_dir().join(format!("rn-resolv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ok = dir.join("ok");
+        std::fs::write(&ok, "nameserver 1.1.1.1\nsearch a.example\n").unwrap();
+        assert_eq!(
+            check_limits_for_resolv_conf(ok.to_str().unwrap(), "cluster.local"),
+            None
+        );
+
+        // 30 > 32-3 when a cluster domain is set.
+        let many = dir.join("many");
+        let search: Vec<String> = (0..30).map(|i| format!("s{i}.x")).collect();
+        std::fs::write(&many, format!("search {}\n", search.join(" "))).unwrap();
+        let p = many.to_str().unwrap();
+        assert_eq!(
+            check_limits_for_resolv_conf(p, "cluster.local"),
+            Some(format!(
+                "Resolv.conf file '{p}' contains search line consisting of more than 29 domains!"
+            ))
+        );
+        assert_eq!(check_limits_for_resolv_conf(p, ""), None);
+
+        let long = dir.join("long");
+        std::fs::write(&long, format!("search {}\n", "a".repeat(254))).unwrap();
+        let p = long.to_str().unwrap();
+        assert_eq!(
+            check_limits_for_resolv_conf(p, "cluster.local"),
+            Some(format!(
+                "Resolv.conf file \"{p}\" contains a search path which length is more than allowed 253 chars!"
+            ))
+        );
+
+        let chars = dir.join("chars");
+        let search: Vec<String> = (0..9).map(|_| "b".repeat(250)).collect();
+        std::fs::write(&chars, format!("search {}\n", search.join(" "))).unwrap();
+        let p = chars.to_str().unwrap();
+        assert_eq!(
+            check_limits_for_resolv_conf(p, ""),
+            Some(format!(
+                "Resolv.conf file '{p}' contains search line which length is more than allowed 2048 chars!"
+            ))
+        );
+
+        let missing = check_limits_for_resolv_conf("/nonexistent/resolv.conf", "x").unwrap();
+        assert!(missing.contains("No such file"), "{missing}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn security_context_maps_privileged_and_user() {
         use rusternetes_common::resources::pod::SecurityContext;
