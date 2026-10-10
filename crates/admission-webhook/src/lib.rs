@@ -24,6 +24,61 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
+/// `webhookReinvokeContext`, this plugin's value in the request's shared
+/// `ReinvocationContext` (webhook/mutating/reinvocationcontext.go:28-79).
+#[derive(Debug, Default, Clone)]
+pub struct WebhookReinvokeContext {
+    /// `lastWebhookOutput`: the result of the last webhook plugin call.
+    last_webhook_output: Option<Value>,
+    /// `previouslyInvokedReinvocableWebhooks`: invoked webhooks that should be
+    /// reinvoked if a later mutation occurs.
+    previously_invoked_reinvocable_webhooks: std::collections::HashSet<String>,
+    /// `reinvokeWebhooks`: webhooks that should be reinvoked.
+    reinvoke_webhooks: std::collections::HashSet<String>,
+}
+
+impl WebhookReinvokeContext {
+    /// reinvocationcontext.go:36-38.
+    pub fn should_reinvoke_webhook(&self, webhook: &str) -> bool {
+        self.reinvoke_webhooks.contains(webhook)
+    }
+
+    /// reinvocationcontext.go:40-42: `!DeepEqual(lastWebhookOutput, object)`,
+    /// where a nil object only equals a nil last output.
+    pub fn is_output_changed_since_last_webhook_invocation(&self, object: &Option<Value>) -> bool {
+        self.last_webhook_output != *object
+    }
+
+    /// reinvocationcontext.go:44-50 (a deep copy, as upstream).
+    pub fn set_last_webhook_invocation_output(&mut self, object: Option<Value>) {
+        self.last_webhook_output = object;
+    }
+
+    /// reinvocationcontext.go:52-57.
+    pub fn add_reinvocable_webhook_to_previously_invoked(&mut self, webhook: String) {
+        self.previously_invoked_reinvocable_webhooks.insert(webhook);
+    }
+
+    /// reinvocationcontext.go:59-69: everything invoked so far becomes due
+    /// for reinvocation, and the invoked set starts over.
+    pub fn require_reinvoking_previously_invoked_plugins(&mut self) {
+        self.reinvoke_webhooks
+            .extend(self.previously_invoked_reinvocable_webhooks.drain());
+    }
+}
+
+/// Joins the two passes' responses: the patches of both, a denial wins.
+fn merge_responses(first: AdmissionResponse, second: AdmissionResponse) -> AdmissionResponse {
+    match (first, second) {
+        (AdmissionResponse::AllowWithPatch(mut a), AdmissionResponse::AllowWithPatch(b)) => {
+            a.extend(b);
+            AdmissionResponse::AllowWithPatch(a)
+        }
+        (AdmissionResponse::Allow, other) | (other, AdmissionResponse::Allow) => other,
+        (_, other) => other,
+    }
+}
+
 /// K8s v1.35 admission webhook timeout bounds.
 /// admissionregistration.k8s.io/v1: timeoutSeconds must be 1-30, default 10.
 /// K8s ref: staging/src/k8s.io/api/admissionregistration/v1/types.go
@@ -1102,6 +1157,14 @@ impl<S: Storage> AdmissionWebhookManager<S> {
 
     /// Run mutating webhooks honoring the request's dry-run state.
     ///
+    /// This is the whole reinvoker for a caller that has no other mutating
+    /// plugins (`reinvoker.Admit`,
+    /// staging/src/k8s.io/apiserver/pkg/admission/reinvocation.go:34-50): the
+    /// pass runs once and, when a webhook changed the object, runs again with
+    /// the reinvocation context. Callers with other mutating plugins in the
+    /// chain use [`Self::run_mutating_webhooks_pass`] with the request's
+    /// shared context instead.
+    ///
     /// When `dry_run=true`:
     /// - Webhooks with `sideEffects` of `Some` or `Unknown` are rejected.
     /// - The `dryRun: true` field is set on the `AdmissionReviewRequest`.
@@ -1115,17 +1178,109 @@ impl<S: Storage> AdmissionWebhookManager<S> {
         gvr: &GroupVersionResource,
         namespace: Option<&str>,
         name: &str,
-        mut object: Option<Value>,
+        object: Option<Value>,
         old_object: Option<Value>,
         user_info: &UserInfo,
         dry_run: bool,
     ) -> Result<(AdmissionResponse, Option<Value>)> {
+        let mut ctx = WebhookReinvokeContext::default();
+        let (first, object, should_reinvoke) = self
+            .run_mutating_webhooks_pass(
+                operation,
+                gvk,
+                gvr,
+                namespace,
+                name,
+                object,
+                old_object.clone(),
+                user_info,
+                dry_run,
+                false,
+                &mut ctx,
+            )
+            .await?;
+        if !should_reinvoke || matches!(first, AdmissionResponse::Deny(_)) {
+            return Ok((first, object));
+        }
+        let (second, object, _) = self
+            .run_mutating_webhooks_pass(
+                operation, gvk, gvr, namespace, name, object, old_object, user_info, dry_run, true,
+                &mut ctx,
+            )
+            .await?;
+        Ok((merge_responses(first, second), object))
+    }
+
+    /// One pass of the mutating webhook dispatcher
+    /// (`mutatingDispatcher.Dispatch`, dispatcher.go:106-121 and the
+    /// deferred `SetLastWebhookInvocationOutput`): `reinvoke_ctx` is this
+    /// plugin's `webhookReinvokeContext` from the request's shared
+    /// `ReinvocationContext`, `is_reinvoke` is its `IsReinvoke()`. Returns
+    /// the response, the object, and whether a webhook changed the object
+    /// (`reinvokeCtx.SetShouldReinvoke()`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_mutating_webhooks_pass(
+        &self,
+        operation: &Operation,
+        gvk: &GroupVersionKind,
+        gvr: &GroupVersionResource,
+        namespace: Option<&str>,
+        name: &str,
+        object: Option<Value>,
+        old_object: Option<Value>,
+        user_info: &UserInfo,
+        dry_run: bool,
+        is_reinvoke: bool,
+        reinvoke_ctx: &mut WebhookReinvokeContext,
+    ) -> Result<(AdmissionResponse, Option<Value>, bool)> {
+        if is_reinvoke && reinvoke_ctx.is_output_changed_since_last_webhook_invocation(&object) {
+            // dispatcher.go:115-119: the in-tree plugin / policy reinvocations
+            // mutated the object, so every eligible webhook is reinvoked.
+            reinvoke_ctx.require_reinvoking_previously_invoked_plugins();
+        }
+        let result = self
+            .dispatch_mutating_webhooks(
+                operation,
+                gvk,
+                gvr,
+                namespace,
+                name,
+                object,
+                old_object,
+                user_info,
+                dry_run,
+                is_reinvoke,
+                reinvoke_ctx,
+            )
+            .await;
+        if let Ok((_, object, _)) = &result {
+            // dispatcher.go:120-122 (`defer`).
+            reinvoke_ctx.set_last_webhook_invocation_output(object.clone());
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_mutating_webhooks(
+        &self,
+        operation: &Operation,
+        gvk: &GroupVersionKind,
+        gvr: &GroupVersionResource,
+        namespace: Option<&str>,
+        name: &str,
+        mut object: Option<Value>,
+        old_object: Option<Value>,
+        user_info: &UserInfo,
+        dry_run: bool,
+        is_reinvoke: bool,
+        reinvoke_ctx: &mut WebhookReinvokeContext,
+    ) -> Result<(AdmissionResponse, Option<Value>, bool)> {
         // K8s exempts webhook configuration objects from admission webhooks.
         // K8s ref: staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/predicates/rules/rules.go
         if gvr.resource == "validatingwebhookconfigurations"
             || gvr.resource == "mutatingwebhookconfigurations"
         {
-            return Ok((AdmissionResponse::Allow, object));
+            return Ok((AdmissionResponse::Allow, object, false));
         }
 
         // Load all MutatingWebhookConfigurations
@@ -1136,18 +1291,20 @@ impl<S: Storage> AdmissionWebhookManager<S> {
 
         let mut all_patches = Vec::new();
         let mut all_warnings = Vec::new();
-
-        // Track webhooks with reinvocationPolicy=IfNeeded that were invoked in the
-        // first pass. Each entry records the webhook config and the object
-        // snapshot it observed at the end of its first call. After the first
-        // pass, if the final object diverges from a snapshot — i.e. a later
-        // webhook in the chain mutated it — the webhook is reinvoked once.
-        // K8s ref: staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/mutating/dispatcher.go
-        let mut reinvoke_candidates: Vec<(MutatingWebhook, Value)> = Vec::new();
+        let mut should_reinvoke = false;
 
         for config in configs {
             if let Some(webhooks) = &config.webhooks {
-                for webhook in webhooks {
+                for (index, webhook) in webhooks.iter().enumerate() {
+                    // The accessor UID, configuration/mutating_webhook_manager.go
+                    // :140-143: "<configuration>/<webhook>/<n>" where n counts
+                    // earlier webhooks of the same name (names are not unique).
+                    let duplicates = webhooks[..index]
+                        .iter()
+                        .filter(|w| w.name == webhook.name)
+                        .count();
+                    let webhook_uid =
+                        format!("{}/{}/{}", config.metadata.name, webhook.name, duplicates);
                     // Check if this webhook applies to this request
                     if !self.webhook_matches(&webhook.rules, operation, gvk, gvr, namespace) {
                         continue;
@@ -1316,6 +1473,12 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                         }
                     }
 
+                    // dispatcher.go:150-153: during reinvocation a webhook is not
+                    // called for the first time; only those the context marked.
+                    if is_reinvoke && !reinvoke_ctx.should_reinvoke_webhook(&webhook_uid) {
+                        continue;
+                    }
+
                     // Enforce SideEffects policy for dry-run requests.
                     // K8s rejects dry-run requests through webhooks with sideEffects=Some or Unknown.
                     // K8s ref: staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/mutating/dispatcher.go
@@ -1331,6 +1494,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                                 webhook.name
                             )),
                             object,
+                            should_reinvoke,
                         ));
                     }
 
@@ -1338,6 +1502,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                         "Running mutating webhook {} for {}/{}",
                         webhook.name, gvk.kind, name
                     );
+                    let object_before_call = object.clone();
 
                     // Build admission request with potentially mutated object.
                     // K8s splits resource/subresource in the admission review request.
@@ -1444,7 +1609,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                             .map(|m| m.to_string())
                             .unwrap_or_else(|| format!("Denied by webhook {}", webhook.name));
 
-                        return Ok((AdmissionResponse::Deny(reason), object));
+                        return Ok((AdmissionResponse::Deny(reason), object, should_reinvoke));
                     }
 
                     // Apply patches
@@ -1485,183 +1650,21 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                         all_patches.extend(patches);
                     }
 
-                    // Record snapshot for IfNeeded reinvocation. Snapshot is the
-                    // object state *after* this webhook's own patches were
-                    // applied — reinvocation triggers only when a *later*
-                    // webhook in the chain mutates it.
+                    // dispatcher.go:192-198: a webhook whose patch changed the
+                    // object requires every previously invoked IfNeeded webhook
+                    // to be reinvoked and asks the reinvoker for a second pass;
+                    // an IfNeeded webhook is then remembered as reinvocable.
+                    if object != object_before_call {
+                        reinvoke_ctx.require_reinvoking_previously_invoked_plugins();
+                        should_reinvoke = true;
+                    }
                     if matches!(
                         webhook.reinvocation_policy,
                         Some(ReinvocationPolicy::IfNeeded)
                     ) {
-                        if let Some(ref obj) = object {
-                            reinvoke_candidates.push((webhook.clone(), obj.clone()));
-                        }
+                        reinvoke_ctx.add_reinvocable_webhook_to_previously_invoked(webhook_uid);
                     }
                 }
-            }
-        }
-
-        // Second pass: reinvoke IfNeeded webhooks whose snapshot diverges from
-        // the current object. K8s performs exactly one extra round of
-        // reinvocations to bound work — webhooks invoked here do not themselves
-        // trigger a third round.
-        for (webhook, snapshot) in reinvoke_candidates {
-            // Skip if the object was removed by a later webhook, or if it is
-            // unchanged from this webhook's last snapshot (no reinvocation needed).
-            match object.as_ref() {
-                None => continue,
-                Some(o) if *o == snapshot => continue,
-                _ => {}
-            }
-
-            info!(
-                "Reinvoking mutating webhook {} (reinvocationPolicy=IfNeeded) — object changed since last call",
-                webhook.name
-            );
-
-            // Re-evaluate objectSelector against the *current* object so we
-            // don't reinvoke when the object no longer matches.
-            if let Some(ref obj_selector) = webhook.object_selector {
-                let obj_labels: std::collections::HashMap<String, String> = object
-                    .as_ref()
-                    .and_then(|o| o.pointer("/metadata/labels"))
-                    .and_then(|l| l.as_object())
-                    .map(|labels_obj| {
-                        labels_obj
-                            .iter()
-                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let obj_matches = obj_selector
-                    .match_labels
-                    .as_ref()
-                    .map(|ml| ml.iter().all(|(k, v)| obj_labels.get(k) == Some(v)))
-                    .unwrap_or(true);
-                if !obj_matches {
-                    debug!(
-                        "Skipping reinvocation of {} — object labels no longer match objectSelector",
-                        webhook.name
-                    );
-                    continue;
-                }
-            }
-
-            let (wire_gvr, sub_resource) = if let Some(idx) = gvr.resource.find('/') {
-                (
-                    GroupVersionResource {
-                        group: gvr.group.clone(),
-                        version: gvr.version.clone(),
-                        resource: gvr.resource[..idx].to_string(),
-                    },
-                    Some(gvr.resource[idx + 1..].to_string()),
-                )
-            } else {
-                (gvr.clone(), None)
-            };
-
-            let request = AdmissionReviewRequest {
-                uid: uuid::Uuid::new_v4().to_string(),
-                kind: gvk.clone(),
-                resource: wire_gvr.clone(),
-                sub_resource: sub_resource.clone(),
-                request_kind: Some(gvk.clone()),
-                request_resource: Some(wire_gvr),
-                request_sub_resource: sub_resource,
-                name: name.to_string(),
-                namespace: namespace.map(|s| s.to_string()),
-                operation: operation.clone(),
-                user_info: user_info.clone(),
-                object: object.clone(),
-                old_object: old_object.clone(),
-                dry_run: None,
-                options: None,
-            };
-
-            let raw_url = self.client.build_webhook_url(&webhook.client_config)?;
-            let resolved_url =
-                AdmissionWebhookClient::resolve_service_url(&raw_url, &self.storage).await;
-            let timeout = resolve_webhook_timeout(webhook.timeout_seconds);
-            let review = AdmissionReview::new_request(request.clone());
-            let ca_decoded = webhook.client_config.ca_bundle.as_ref().map(|s| {
-                use base64::Engine;
-                base64::engine::general_purpose::STANDARD
-                    .decode(s)
-                    .unwrap_or_else(|_| s.as_bytes().to_vec())
-            });
-            let ca_bundle_ref = ca_decoded.as_deref();
-            let response = match self
-                .client
-                .call_webhook_with_ca(&resolved_url, &review, timeout, ca_bundle_ref)
-                .await
-            {
-                Ok(resp) => resp,
-                Err(e) => {
-                    let fp = webhook
-                        .failure_policy
-                        .as_ref()
-                        .unwrap_or(&FailurePolicy::Fail);
-                    match fp {
-                        FailurePolicy::Ignore => {
-                            warn!(
-                                "Reinvoked mutating webhook {} failed (Ignore): {}",
-                                webhook.name, e
-                            );
-                            continue;
-                        }
-                        _ => return Err(e),
-                    }
-                }
-            };
-
-            if let Some(warnings) = &response.warnings {
-                all_warnings.extend(warnings.clone());
-            }
-
-            if !response.allowed {
-                let reason = response
-                    .status
-                    .as_ref()
-                    .and_then(|s| {
-                        s.message
-                            .as_ref()
-                            .filter(|m| !m.is_empty())
-                            .or(s.reason.as_ref())
-                    })
-                    .map(|m| m.to_string())
-                    .unwrap_or_else(|| format!("Denied by webhook {}", webhook.name));
-                return Ok((AdmissionResponse::Deny(reason), object));
-            }
-
-            if let Some(patch_base64) = &response.patch {
-                use base64::Engine;
-                let patch_bytes = base64::engine::general_purpose::STANDARD
-                    .decode(patch_base64)
-                    .map_err(|e| {
-                        rusternetes_common::Error::InvalidResource(format!(
-                            "Failed to decode webhook patch: {}",
-                            e
-                        ))
-                    })?;
-                let patch_str = String::from_utf8(patch_bytes).map_err(|e| {
-                    rusternetes_common::Error::InvalidResource(format!(
-                        "Failed to parse webhook patch as UTF-8: {}",
-                        e
-                    ))
-                })?;
-                let patches: Vec<PatchOperation> =
-                    serde_json::from_str(&patch_str).map_err(|e| {
-                        rusternetes_common::Error::InvalidResource(format!(
-                            "Failed to parse webhook patch as JSON: {}",
-                            e
-                        ))
-                    })?;
-                if let Some(ref mut obj) = object {
-                    for patch in &patches {
-                        apply_json_patch(obj, patch)?;
-                    }
-                }
-                all_patches.extend(patches);
             }
         }
 
@@ -1689,7 +1692,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
             AdmissionResponse::AllowWithPatch(all_patches)
         };
 
-        Ok((response, object))
+        Ok((response, object, should_reinvoke))
     }
 
     /// Look up the CRD for the given GVR and prune any field the mutating
@@ -2375,6 +2378,38 @@ mod tests {
     use rusternetes_common::resources::RuleWithOperations;
     use rusternetes_storage::memory::MemoryStorage;
     use serde_json::json;
+
+    // webhook/testing/testcase.go "match & reinvoke if needed policy" /
+    // "match & never reinvoke policy": an IfNeeded webhook is remembered, a
+    // later mutation makes it due, and a Never webhook is never added.
+    #[test]
+    fn reinvoke_context_if_needed_webhook_is_due_after_a_later_mutation() {
+        let mut rc = WebhookReinvokeContext::default();
+        rc.add_reinvocable_webhook_to_previously_invoked("cfg/addLabel/0".into());
+        assert!(!rc.should_reinvoke_webhook("cfg/addLabel/0"));
+        rc.require_reinvoking_previously_invoked_plugins();
+        assert!(rc.should_reinvoke_webhook("cfg/addLabel/0"));
+        assert!(!rc.should_reinvoke_webhook("cfg/removeLabel/0"));
+        // reinvocationcontext.go:59-69: the invoked set starts over.
+        rc.require_reinvoking_previously_invoked_plugins();
+        assert!(rc.should_reinvoke_webhook("cfg/addLabel/0"));
+    }
+
+    // reinvocationcontext.go:40-50: the last output is a snapshot; a nil
+    // object only equals a nil last output.
+    #[test]
+    fn reinvoke_context_detects_output_changes_since_last_invocation() {
+        let mut rc = WebhookReinvokeContext::default();
+        assert!(!rc.is_output_changed_since_last_webhook_invocation(&None));
+        let mut obj = Some(json!({"metadata": {"labels": {"a": "1"}}}));
+        assert!(rc.is_output_changed_since_last_webhook_invocation(&obj));
+        rc.set_last_webhook_invocation_output(obj.clone());
+        assert!(!rc.is_output_changed_since_last_webhook_invocation(&obj));
+        obj.as_mut().unwrap()["metadata"]["labels"]["b"] = json!("2");
+        assert!(rc.is_output_changed_since_last_webhook_invocation(&obj));
+        rc.set_last_webhook_invocation_output(None);
+        assert!(rc.is_output_changed_since_last_webhook_invocation(&obj));
+    }
 
     // ===== Timeout Resolution Tests =====
 
