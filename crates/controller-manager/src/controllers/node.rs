@@ -118,6 +118,9 @@ pub struct NodeController<S: Storage> {
     node_health: Arc<std::sync::Mutex<HashMap<String, NodeHealthData>>>,
     /// Nodes `seed_first_seen_for_test` declared long-observed.
     backdated: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// `nodesToRetry` (:242): nodes whose Ready -> NotReady transition could
+    /// not finish MarkPodsNotReady and must be retried on the next pass.
+    nodes_to_retry: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 /// `nodeHealthData` (node_lifecycle_controller.go:168-173). `status` is kept
@@ -147,6 +150,14 @@ impl LeaseObservation {
             _ => false,
         }
     }
+}
+
+/// The `switch` of updateNodeFunc (node_lifecycle_controller.go:752-763):
+/// MarkPodsNotReady runs on the Ready -> not-Ready transition (the first case
+/// `fallthrough`s into the second's body) or when a previous attempt failed
+/// (`nodesToRetry`) and the observed Ready is not True.
+fn should_mark_pods_not_ready(current: &str, observed: &str, needs_retry: bool) -> bool {
+    (current != "True" && observed == "True") || (needs_retry && observed != "True")
 }
 
 /// `apiequality.Semantic.DeepEqual` over two conditions.
@@ -215,6 +226,7 @@ impl<S: Storage + 'static> NodeController<S> {
             clock_offset: Arc::new(std::sync::Mutex::new(Duration::zero())),
             node_health: Arc::new(std::sync::Mutex::new(HashMap::new())),
             backdated: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            nodes_to_retry: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -481,7 +493,13 @@ impl<S: Storage + 'static> NodeController<S> {
         if node_ready {
             return Ok(());
         }
-        // UpdatePodCondition: only write when the status actually changes.
+        self.mark_pod_not_ready(&pod_key, &mut pod).await
+    }
+
+    /// One pod's share of `MarkPodsNotReady` (controller_utils.go:121-155):
+    /// `UpdatePodCondition` only writes when the Ready status actually
+    /// changes; NotFound means the pod is already gone.
+    async fn mark_pod_not_ready(&self, pod_key: &str, pod: &mut Pod) -> Result<()> {
         let Some(cond) = pod
             .status
             .as_mut()
@@ -495,9 +513,37 @@ impl<S: Storage + 'static> NodeController<S> {
         }
         cond.status = "False".to_string();
         cond.last_transition_time = Some(Utc::now());
-        match self.storage.update(&pod_key, &pod).await {
+        match self.storage.update(pod_key, &*pod).await {
             Ok(_) | Err(rusternetes_common::Error::NotFound(_)) => Ok(()),
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// `controllerutil.MarkPodsNotReady` (controller_utils.go:121-155): pods
+    /// are tried one by one and failures are aggregated, not short-circuited.
+    async fn mark_pods_not_ready(&self, pods: Vec<Pod>, node_name: &str) -> Result<()> {
+        let mut errs: Vec<String> = Vec::new();
+        for mut pod in pods {
+            // Defensive check, also needed for tests.
+            if pod.spec.as_ref().and_then(|s| s.node_name.as_deref()) != Some(node_name) {
+                continue;
+            }
+            let Some(ns) = pod.metadata.namespace.clone() else {
+                continue;
+            };
+            let key = build_key("pods", Some(&ns), &pod.metadata.name);
+            if let Err(e) = self.mark_pod_not_ready(&key, &mut pod).await {
+                warn!(
+                    "Failed to update status for pod {}/{}: {}",
+                    ns, pod.metadata.name, e
+                );
+                errs.push(e.to_string());
+            }
+        }
+        if errs.is_empty() {
+            Ok(())
+        } else {
+            Err(rusternetes_common::Error::Internal(errs.join("; ")).into())
         }
     }
 
@@ -644,6 +690,8 @@ impl<S: Storage + 'static> NodeController<S> {
         for name in deleted {
             debug!("Controller observed a Node deletion {}", name);
             self.evictor.lock().await.known_node_set.remove(&name);
+            // :430 `nc.nodesToRetry.Delete(node.Name)`
+            self.nodes_to_retry.lock().unwrap().remove(&name);
         }
     }
 
@@ -696,7 +744,6 @@ impl<S: Storage + 'static> NodeController<S> {
             }
         };
         let node = &node;
-        let _ = observed_ready;
 
         // The Ready status after this pass.
         let ready_status = current_ready
@@ -712,13 +759,51 @@ impl<S: Storage + 'static> NodeController<S> {
         // the pressure-condition transition times observable.
         self.reconcile_condition_transitions(node).await?;
 
-        // Not-ready/unreachable NoExecute taints are NOT applied here: like
-        // upstream they go through the zone's rate-limited queue
-        // (`processTaintBaseEviction`, :781) and are drained by
-        // `do_no_execute_tainting_pass`.
+        // updateNodeFunc :733-766. Not-ready/unreachable NoExecute taints are
+        // NOT applied here: like upstream they go through the zone's
+        // rate-limited queue (`processTaintBaseEviction`, :781) and are drained
+        // by `do_no_execute_tainting_pass`.
         if current_ready.is_some() {
+            let transitioned = ready_status != "True" && observed_ready.status == "True";
+            let pods = match self.pods_on_node(node_name).await {
+                Ok(p) => p,
+                Err(e) => {
+                    error!("Unable to list pods of node {}: {}", node_name, e);
+                    if transitioned {
+                        // If error happened during node status transition
+                        // (Ready -> NotReady) we need to mark node for retry to
+                        // force MarkPodsNotReady execution in the next
+                        // iteration (:743-747).
+                        self.nodes_to_retry
+                            .lock()
+                            .unwrap()
+                            .insert(node_name.clone());
+                    }
+                    return Ok(Some(self.observation(node, ready_status)));
+                }
+            };
             self.process_taint_base_eviction(node, ready_status).await;
+
+            let needs_retry = self.nodes_to_retry.lock().unwrap().contains(node_name);
+            if should_mark_pods_not_ready(ready_status, &observed_ready.status, needs_retry) {
+                if transitioned {
+                    // Report node event only once when status changed.
+                    info!("Node {} event: NodeNotReady", node_name);
+                }
+                if let Err(e) = self.mark_pods_not_ready(pods, node_name).await {
+                    error!(
+                        "Unable to mark all pods NotReady on node {}; queuing for retry: {}",
+                        node_name, e
+                    );
+                    self.nodes_to_retry
+                        .lock()
+                        .unwrap()
+                        .insert(node_name.clone());
+                    return Ok(Some(self.observation(node, ready_status)));
+                }
+            }
         }
+        self.nodes_to_retry.lock().unwrap().remove(node_name);
 
         // Evict pods from nodes that have been NotReady for too long. Only
         // once the throttled pass has actually tainted the node, so a
@@ -732,7 +817,11 @@ impl<S: Storage + 'static> NodeController<S> {
             self.evict_pods_from_node(node_name).await?;
         }
 
-        Ok(Some(NodeObservation {
+        Ok(Some(self.observation(node, ready_status)))
+    }
+
+    fn observation(&self, node: &Node, ready_status: &str) -> NodeObservation {
+        NodeObservation {
             zone: get_zone_key(node),
             ready: ready_status == "True",
             excluded_from_disruption: node
@@ -740,7 +829,16 @@ impl<S: Storage + 'static> NodeController<S> {
                 .labels
                 .as_ref()
                 .is_some_and(|l| l.contains_key(LABEL_NODE_DISRUPTION_EXCLUSION)),
-        }))
+        }
+    }
+
+    /// `nc.getPodsAssignedToNode` (the pod indexer by `spec.nodeName`).
+    async fn pods_on_node(&self, node_name: &str) -> Result<Vec<Pod>> {
+        let pods: Vec<Pod> = self.storage.list("/registry/pods/").await?;
+        Ok(pods
+            .into_iter()
+            .filter(|p| p.spec.as_ref().and_then(|s| s.node_name.as_deref()) == Some(node_name))
+            .collect())
     }
 
     /// `processTaintBaseEviction` (:781-815).
@@ -2251,6 +2349,33 @@ mod tests {
         }
     }
 
+    /// The switch of updateNodeFunc (:752-763), every (current, observed,
+    /// needsRetry) combination.
+    #[test]
+    fn should_mark_pods_not_ready_follows_update_node_func_switch() {
+        // (current, observed, needs_retry, want)
+        let table = [
+            ("True", "True", false, false),
+            ("True", "True", true, false),
+            ("False", "True", false, true),
+            ("Unknown", "True", false, true),
+            ("Unknown", "False", false, false),
+            // a failed earlier attempt is retried while observed stays not Ready
+            ("Unknown", "False", true, true),
+            ("Unknown", "Unknown", true, true),
+            // recovered node: nothing to mark
+            ("True", "Unknown", true, true),
+            ("True", "False", false, false),
+        ];
+        for (current, observed, retry, want) in table {
+            assert_eq!(
+                should_mark_pods_not_ready(current, observed, retry),
+                want,
+                "current={current} observed={observed} retry={retry}"
+            );
+        }
+    }
+
     fn pod_ready(status: &str) -> Pod {
         let mut p = pod_on("n1");
         p.status.as_mut().unwrap().conditions.as_mut().unwrap()[0].status = status.to_string();
@@ -2277,10 +2402,7 @@ mod tests {
             .await
             .unwrap();
         storage
-            .create(
-                &build_key("pods", Some("default"), "p"),
-                &pod_ready("True"),
-            )
+            .create(&build_key("pods", Some("default"), "p"), &pod_ready("True"))
             .await
             .unwrap();
         c.monitor_node_health().await.unwrap();
