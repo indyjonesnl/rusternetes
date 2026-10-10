@@ -824,6 +824,21 @@ fn translate_mount_propagation(mode: Option<&str>) -> i32 {
     }
 }
 
+/// Port of upstream `resolveRecursiveReadOnly`
+/// (`pkg/kubelet/kubelet_pods.go:2831-2853`). STUB (red commit).
+pub fn resolve_recursive_read_only(
+    _vm: &rusternetes_common::resources::pod::VolumeMount,
+    _runtime_supports_rro: bool,
+) -> Result<bool, String> {
+    Ok(false)
+}
+
+/// Port of `runtimeHandlerSupportsRecursiveReadOnlyMounts`
+/// (`pkg/kubelet/kubelet_pods.go:2815-2828`). STUB (red commit).
+pub fn runtime_handler_supports_rro(_name: &str, _handlers: &[v1::RuntimeHandler]) -> bool {
+    false
+}
+
 /// Build the CRI mounts for a container.
 ///
 /// `env` is the container's fully-resolved environment: upstream expands
@@ -1880,6 +1895,71 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.mounts.len(), 1);
         assert_eq!(cfg.mounts[0].host_path, "/host/data/nested/sub");
+    }
+
+    #[test]
+    fn resolve_rro_matches_upstream() {
+        use rusternetes_common::resources::pod::VolumeMount;
+        let vm = |ro: bool, rro: Option<&str>, prop: Option<&str>| VolumeMount {
+            name: "v".into(),
+            mount_path: "/v".into(),
+            read_only: Some(ro),
+            sub_path: None,
+            sub_path_expr: None,
+            mount_propagation: prop.map(str::to_string),
+            recursive_read_only: rro.map(str::to_string),
+        };
+        // nil / Disabled -> false, no error even when not read-only.
+        assert_eq!(
+            resolve_recursive_read_only(&vm(false, None, None), true),
+            Ok(false)
+        );
+        assert_eq!(
+            resolve_recursive_read_only(&vm(false, Some("Disabled"), None), true),
+            Ok(false)
+        );
+        // Enabled/IfPossible require readOnly.
+        assert!(resolve_recursive_read_only(&vm(false, Some("Enabled"), None), true).is_err());
+        assert!(resolve_recursive_read_only(&vm(false, Some("IfPossible"), None), true).is_err());
+        // ...and propagation None (unset or "None").
+        assert!(resolve_recursive_read_only(
+            &vm(true, Some("Enabled"), Some("HostToContainer")),
+            true
+        )
+        .is_err());
+        assert_eq!(
+            resolve_recursive_read_only(&vm(true, Some("Enabled"), Some("None")), true),
+            Ok(true)
+        );
+        // IfPossible follows runtime support; Enabled errors without it.
+        assert_eq!(
+            resolve_recursive_read_only(&vm(true, Some("IfPossible"), None), true),
+            Ok(true)
+        );
+        assert_eq!(
+            resolve_recursive_read_only(&vm(true, Some("IfPossible"), None), false),
+            Ok(false)
+        );
+        assert!(resolve_recursive_read_only(&vm(true, Some("Enabled"), None), false).is_err());
+        assert!(resolve_recursive_read_only(&vm(true, Some("Bogus"), None), true).is_err());
+    }
+
+    #[test]
+    fn runtime_handler_rro_support_matches_upstream() {
+        let h = |name: &str, rro: bool| v1::RuntimeHandler {
+            name: name.into(),
+            features: Some(v1::RuntimeHandlerFeatures {
+                recursive_read_only_mounts: rro,
+                ..Default::default()
+            }),
+        };
+        // Empty list (runtime cannot list handlers) -> false.
+        assert!(!runtime_handler_supports_rro("", &[]));
+        let hs = [h("", true), h("gvisor", false)];
+        assert!(runtime_handler_supports_rro("", &hs));
+        assert!(!runtime_handler_supports_rro("gvisor", &hs));
+        // Unknown handler -> false.
+        assert!(!runtime_handler_supports_rro("nope", &hs));
     }
 
     #[test]
