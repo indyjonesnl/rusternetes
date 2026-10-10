@@ -47,6 +47,8 @@ pub struct EventRecorder<S: Storage + ?Sized> {
     /// call; the guard is always dropped before any `await`, so no storage I/O
     /// ever happens while holding it.
     correlator: Arc<Mutex<EventCorrelator<RealClock>>>,
+    /// Seconds an event lives after each write; `0` = no expiry.
+    event_ttl: u64,
 }
 
 impl<S: Storage + ?Sized> Clone for EventRecorder<S> {
@@ -54,6 +56,7 @@ impl<S: Storage + ?Sized> Clone for EventRecorder<S> {
         Self {
             storage: Arc::clone(&self.storage),
             correlator: Arc::clone(&self.correlator),
+            event_ttl: self.event_ttl,
         }
     }
 }
@@ -65,7 +68,14 @@ impl<S: Storage + ?Sized> EventRecorder<S> {
         Self {
             storage,
             correlator: Arc::new(Mutex::new(EventCorrelator::new(RealClock))),
+            event_ttl: 0,
         }
+    }
+
+    /// Override the event TTL in seconds (`--event-ttl`); `0` disables expiry.
+    pub fn with_event_ttl(mut self, seconds: u64) -> Self {
+        self.event_ttl = seconds;
+        self
     }
 
     /// Emit an event about `involved` from `source`.
@@ -229,6 +239,32 @@ mod tests {
         let event_name = Event::generate_name(&obj, reason);
         let key = format!("/registry/events/{}/{}", ns, event_name);
         storage.get::<Event>(&key).await.ok()
+    }
+
+    #[tokio::test]
+    async fn recorded_events_expire_after_the_event_ttl() {
+        let storage = Arc::new(MemoryStorage::new());
+        let recorder = EventRecorder::new(Arc::clone(&storage)).with_event_ttl(1);
+        let involved = obj_ref("web", "default");
+        recorder
+            .event(&involved, &source(), EventType::Normal, "Started", "m")
+            .await
+            .unwrap();
+        assert!(stored(&storage, "default", "web", "Started")
+            .await
+            .is_some());
+        // A recurrence rewrites the object and must re-arm the lease.
+        recorder
+            .event(&involved, &source(), EventType::Normal, "Started", "m2")
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert!(
+            stored(&storage, "default", "web", "Started")
+                .await
+                .is_none(),
+            "in-process events must carry the event TTL like API-written ones"
+        );
     }
 
     #[tokio::test]
