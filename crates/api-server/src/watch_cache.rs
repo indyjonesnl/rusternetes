@@ -948,6 +948,83 @@ mod tests {
             .is_ok());
     }
 
+    /// Mock backend with real replay semantics: `watch_since(rev)` yields every
+    /// retained event with revision >= rev, then tails (stays open).
+    struct ReplaySource {
+        events: Vec<WatchEvent>,
+        head: i64,
+    }
+
+    #[async_trait]
+    impl WatchSource for ReplaySource {
+        async fn watch_from_now(&self, _prefix: &str) -> rusternetes_common::Result<WatchStream> {
+            panic!("non-zero head: loop must use watch_since");
+        }
+
+        async fn watch_since(
+            &self,
+            _prefix: &str,
+            revision: i64,
+        ) -> rusternetes_common::Result<WatchStream> {
+            let replay: Vec<_> = self
+                .events
+                .iter()
+                .filter(|e| match e {
+                    WatchEvent::Added(_, v)
+                    | WatchEvent::Modified(_, v)
+                    | WatchEvent::Deleted(_, v) => extract_rv(v) >= revision,
+                })
+                .cloned()
+                .map(Ok)
+                .collect();
+            Ok(Box::pin(futures::stream::iter(replay).chain(
+                futures::stream::pending::<Result<WatchEvent, rusternetes_common::Error>>(),
+            )))
+        }
+
+        async fn head_revision(&self) -> i64 {
+            self.head
+        }
+    }
+
+    // #3071: the e2e framework's waitForServiceAccountInNamespace lists the
+    // (empty) prefix at rv R, then watches from R. The controller's create
+    // (rv R+2) lands after the list; the watch must replay it EXACTLY once —
+    // for the first watcher of the prefix (which creates the shared watch) and
+    // for a later watcher, whichever of ring/live broadcast it is served from.
+    #[tokio::test]
+    async fn watch_from_list_rv_replays_later_create_exactly_once() {
+        let key = "/registry/serviceaccounts/ns-a/default".to_string();
+        let value = r#"{"metadata":{"name":"default","resourceVersion":"3159"}}"#.to_string();
+        let source = Arc::new(ReplaySource {
+            events: vec![WatchEvent::Added(key.clone(), value)],
+            head: 3159,
+        });
+        let cache = WatchCache::from_source(source);
+        let prefix = "/registry/serviceaccounts/ns-a/";
+
+        for round in 0..3 {
+            let (history, rx) = cache
+                .subscribe_from_checked(prefix, 3157)
+                .await
+                .expect("watch from the client's list rv must be served");
+            let mut stream = broadcast_to_stream_with_history(history, rx, 3157);
+            let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .unwrap_or_else(|_| panic!("round {round}: Added event was skipped"))
+                .expect("stream ended")
+                .expect("event error");
+            assert!(
+                matches!(&first, WatchEvent::Added(k, _) if *k == key),
+                "round {round}: expected Added, got {first:?}"
+            );
+            let dup = tokio::time::timeout(Duration::from_millis(300), stream.next()).await;
+            assert!(dup.is_err(), "round {round}: event delivered twice");
+            // Later rounds hit the populated ring instead of the live path.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     // Regression (#1165 wedge): a broadcast subscriber that lags must be
     // TERMINATED with a Gone error (→ handler sends a 410 ERROR event, client
     // relists), never silently skipped past — a silently dropped MODIFIED

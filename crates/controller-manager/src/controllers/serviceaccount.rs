@@ -156,43 +156,33 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
         });
 
         loop {
+            // List-then-watch from the list's revision. Port of the reflector's
+            // `ListAndWatch` (staging/src/k8s.io/client-go/tools/cache/reflector.go:
+            // list, then watch from the LIST's resourceVersion): nothing
+            // committed between the list and the watch is missed. The revision
+            // is read BEFORE the list so the replay can only overlap the list,
+            // never gap it (duplicates are absorbed by the work queue). #3071.
+            let list_rev = match self.storage.current_revision().await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!("Failed to read storage revision: {}, retrying", e);
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
             self.enqueue_all(&queue).await;
 
-            let prefix = build_prefix("serviceaccounts", None);
-            let watch_result = self.storage.watch(&prefix).await;
-            let mut watch = match watch_result {
-                Ok(w) => w,
-                Err(e) => {
-                    tracing::error!("Failed to establish watch: {}, retrying", e);
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    continue;
-                }
-            };
-
-            // Token Secrets are populated / reaped on Secret events too
-            // (TokensController's secret informer, tokens_controller.go:108-131).
-            let secret_prefix = build_prefix("secrets", None);
-            let mut secret_watch = match self.storage.watch(&secret_prefix).await {
-                Ok(w) => w,
-                Err(e) => {
-                    tracing::error!("Failed to establish secret watch: {}, retrying", e);
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    continue;
-                }
-            };
-
-            // Namespace informer: upstream registers AddFunc/UpdateFunc
-            // (serviceaccounts_controller.go `NewServiceAccountsController`,
-            // `namespaceAdded` / `namespaceUpdated`) that enqueue the namespace.
-            let ns_prefix = build_prefix("namespaces", None);
-            let mut ns_watch = match self.storage.watch(&ns_prefix).await {
-                Ok(w) => w,
-                Err(e) => {
-                    tracing::error!("Failed to establish namespace watch: {}, retrying", e);
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    continue;
-                }
-            };
+            let (mut watch, mut secret_watch, mut ns_watch) =
+                match self.open_watches(list_rev).await {
+                    Ok(w) => w,
+                    Err(e) => {
+                        // A compacted/too-old revision (Gone) is handled the way
+                        // the reflector does: relist and watch again.
+                        tracing::error!("Failed to establish watches: {}, relisting", e);
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        continue;
+                    }
+                };
 
             let mut resync = tokio::time::interval(std::time::Duration::from_secs(30));
             resync.tick().await;
@@ -252,6 +242,36 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
                 }
             }
         }
+    }
+
+    /// Open the ServiceAccount, Secret and Namespace watches, each replaying
+    /// every event committed after `list_rev` (the revision observed before
+    /// the preceding list). Namespace informer: upstream registers
+    /// AddFunc/UpdateFunc (`namespaceAdded` / `namespaceUpdated`) that enqueue
+    /// the namespace; token Secrets are populated / reaped on Secret events too
+    /// (TokensController's secret informer, tokens_controller.go:108-131).
+    async fn open_watches(
+        &self,
+        list_rev: i64,
+    ) -> Result<(
+        rusternetes_storage::WatchStream,
+        rusternetes_storage::WatchStream,
+        rusternetes_storage::WatchStream,
+    )> {
+        let from = list_rev + 1;
+        let sa = self
+            .storage
+            .watch_from_revision(&build_prefix("serviceaccounts", None), from)
+            .await?;
+        let secrets = self
+            .storage
+            .watch_from_revision(&build_prefix("secrets", None), from)
+            .await?;
+        let namespaces = self
+            .storage
+            .watch_from_revision(&build_prefix("namespaces", None), from)
+            .await?;
+        Ok((sa, secrets, namespaces))
     }
 
     /// Main reconciliation loop - ensures all namespaces have default ServiceAccounts
@@ -766,5 +786,41 @@ mod tests {
         }
         handle.abort();
         assert!(found, "default SA not created within 5s of namespace add");
+    }
+
+    /// #3071: a namespace created AFTER the list revision but BEFORE the
+    /// watches open (the list-then-watch gap) must still surface as a namespace
+    /// event. Reflector `ListAndWatch` watches from the list's resourceVersion;
+    /// a revision-less watch only tails future events and would miss it until
+    /// the 30s resync.
+    #[tokio::test]
+    async fn namespace_created_in_list_watch_gap_is_replayed() {
+        use futures::StreamExt;
+        use rusternetes_common::resources::Namespace;
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ServiceAccountController::new(storage.clone());
+
+        let list_rev = storage.current_revision().await.unwrap();
+        // The list happens here; the namespace then lands in the gap.
+        let ns: Namespace = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Namespace",
+            "metadata": {"name": "gap-ns"}
+        }))
+        .unwrap();
+        storage
+            .create(&build_key("namespaces", None, "gap-ns"), &ns)
+            .await
+            .unwrap();
+
+        let (_sa, _secrets, mut ns_watch) = controller.open_watches(list_rev).await.unwrap();
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(2), ns_watch.next())
+            .await
+            .expect("namespace created in the gap was never delivered")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            namespace_event_key(&ev).as_deref(),
+            Some("serviceaccounts/gap-ns/default")
+        );
     }
 }
