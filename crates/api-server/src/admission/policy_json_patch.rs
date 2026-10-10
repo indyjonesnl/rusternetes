@@ -5,34 +5,148 @@
 //! `evaluatePatchExpression`) and its tests (`json_patch_test.go`
 //! `TestJSONPatch`).
 
+#![allow(dead_code)]
+
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use rusternetes_common::cel::CELEvaluator;
-use serde_json::Value;
+use rusternetes_common::cel::{CELContext, CELEvaluator};
+use rusternetes_common::cel_struct;
+use serde_json::{json, Value};
 
+use super::policy_json_patch_ops::{apply, ApplyError, Operation};
 use super::policy_mutating::{PatchError, PatchRequest, Patcher};
 
-/// `NewJSONPatcher` over a compiled `JSONPatchCondition`.
+/// `NewJSONPatcher` (json_patch.go:63-66) over a `JSONPatchCondition`
+/// (json_patch.go:45-59: expression returning `list(JSONPatch)`).
 pub struct JsonPatcher {
     expression: String,
+    /// `PatchEvaluator.CompilationErrors()`, found when the patcher is built.
+    compile_error: Option<String>,
     evaluator: Mutex<CELEvaluator>,
 }
 
 impl JsonPatcher {
-    pub fn new(expression: &str) -> Arc<dyn Patcher> {
+    pub fn new_patcher(expression: &str) -> Arc<dyn Patcher> {
+        let compile_error = cel_struct::compile(expression).err();
         Arc::new(Self {
             expression: expression.to_string(),
+            compile_error,
             evaluator: Mutex::new(CELEvaluator::new()),
         })
+    }
+
+    /// `evaluatePatchExpression` (json_patch.go:118-192): evaluate the
+    /// expression and turn each `JSONPatch` element into an `Operation`.
+    fn evaluate_patch_expression(
+        &self,
+        r: &PatchRequest<'_>,
+    ) -> Result<Vec<Operation>, PatchError> {
+        let mut ctx = CELContext::new();
+        let attrs = r.versioned_attributes;
+        // `CreateAdmissionRequest` (cel/compile.go) needs the request's
+        // attributes, which `PatchRequest` does not carry yet: only the kind
+        // and resource are known here.
+        let request = json!({
+            "kind": {
+                "group": attrs.versioned_kind.group,
+                "version": attrs.versioned_kind.version,
+                "kind": attrs.versioned_kind.kind,
+            },
+            "resource": {
+                "group": r.matched_resource.group,
+                "version": r.matched_resource.version,
+                "resource": r.matched_resource.resource,
+            },
+        });
+        let vars: [(&str, &Value); 5] = [
+            (
+                "object",
+                attrs.versioned_object.as_ref().unwrap_or(&Value::Null),
+            ),
+            (
+                "oldObject",
+                attrs.versioned_old_object.as_ref().unwrap_or(&Value::Null),
+            ),
+            ("params", r.param.unwrap_or(&Value::Null)),
+            ("namespaceObject", r.namespace.unwrap_or(&Value::Null)),
+            ("request", &request),
+        ];
+        for (name, v) in vars {
+            ctx.add_json_variable(name, v)
+                .map_err(|e| PatchError::Other(e.to_string()))?;
+        }
+
+        let value = self
+            .evaluator
+            .lock()
+            .unwrap()
+            .evaluate_to_value(&self.expression, &ctx)
+            .map_err(|e| PatchError::Other(e.to_string()))?;
+        let json = value.json().map_err(|e| {
+            PatchError::Other(format!(
+                "JSONPath valueExpression evaluated to a type that could not marshal to JSON: {e}"
+            ))
+        })?;
+        let Value::Array(items) = json else {
+            return Err(PatchError::Other(
+                "type mismatch: JSONPatchType.expression should evaluate to array".into(),
+            ));
+        };
+        items
+            .into_iter()
+            .map(|item| {
+                let Value::Object(m) = item else {
+                    return Err(PatchError::Other(
+                        "type mismatch: JSONPatchType.expression should evaluate to array of JSONPatch"
+                            .into(),
+                    ));
+                };
+                // resultOp["op"/"path"] are always set (the Go zero value is
+                // ""); "from" only when non-empty; "value" only when set.
+                let s = |k: &str| m.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+                let from = s("from");
+                Ok(Operation {
+                    op: s("op"),
+                    path: Some(s("path")),
+                    from: (!from.is_empty()).then_some(from),
+                    value: m.get("value").cloned(),
+                })
+            })
+            .collect()
     }
 }
 
 #[async_trait]
 impl Patcher for JsonPatcher {
-    async fn patch(&self, _request: &PatchRequest<'_>) -> Result<Value, PatchError> {
-        let _ = (&self.expression, &self.evaluator);
-        Err(PatchError::Other("jsonPatch patcher not implemented".into()))
+    /// `jsonPatcher.Patch` (json_patch.go:72-116), over the unstructured
+    /// representation (the `*unstructured.Unstructured` branch at :102-103).
+    async fn patch(&self, request: &PatchRequest<'_>) -> Result<Value, PatchError> {
+        if let Some(e) = &self.compile_error {
+            // cel_struct checks `Object.<path>{}` type names statically
+            // (CheckTypeNamesMatchFieldPathNames), which upstream does at
+            // runtime and wraps as "type mismatch: %w" (json_patch.go:170-173).
+            return Err(PatchError::Other(
+                if e.starts_with("unexpected type name") {
+                    format!("type mismatch: {e}")
+                } else {
+                    e.clone()
+                },
+            ));
+        }
+        let ops = self.evaluate_patch_expression(request)?;
+        let object = request
+            .versioned_attributes
+            .versioned_object
+            .clone()
+            .unwrap_or(Value::Null);
+        match apply(&object, &ops) {
+            Ok(patched) => Ok(patched),
+            // If a json patch fails a test operation, the patch must not be
+            // applied (json_patch.go:94-97).
+            Err(ApplyError::TestFailed) => Ok(object),
+            Err(e) => Err(PatchError::Other(format!("JSON Patch: {e}"))),
+        }
     }
 }
 
@@ -59,7 +173,7 @@ mod tests {
             versioned_old_object: None,
             dirty: false,
         };
-        let patcher = JsonPatcher::new(expression);
+        let patcher = JsonPatcher::new_patcher(expression);
         let req = PatchRequest {
             matched_resource: &gvr,
             versioned_attributes: &versioned,
@@ -157,8 +271,8 @@ mod tests {
         );
         ok(
             r#"[JSONPatch{op: "add", path: "/metadata/labels", value: {"y": "2"}}]"#,
-            json!({"spec": {}}),
-            json!({"spec": {}, "metadata": {"labels": {"y": "2"}}}),
+            json!({"metadata": {}, "spec": {}}),
+            json!({"metadata": {"labels": {"y": "2"}}, "spec": {}}),
         );
         // performs a replacement
         ok(
@@ -188,8 +302,8 @@ mod tests {
         );
         ok(
             r#"[JSONPatch{op: "replace", path: "/metadata/labels", value: {"y": "2"}}]"#,
-            json!({"spec": {}}),
-            json!({"spec": {}, "metadata": {"labels": {"y": "2"}}}),
+            json!({"metadata": {}, "spec": {}}),
+            json!({"metadata": {"labels": {"y": "2"}}, "spec": {}}),
         );
         ok(
             r#"[JSONPatch{op: "replace", path: "/metadata/labels", value: {"y": "2"}}]"#,
@@ -230,20 +344,20 @@ mod tests {
         );
         ok(
             r#"[JSONPatch{op: "add", path: "/metadata/labels", value: {
-                  "op": string(has(JSONPatch{op: "opValue"}.op)),
-                  "op-unset": string(has(JSONPatch{}.op)),
-                  "value": string(has(JSONPatch{value: "valueValue"}.value)),
-                  "value-unset": string(has(JSONPatch{}.value))}}]"#,
+                  "op": has(JSONPatch{op: "opValue"}.op) ? "true" : "false",
+                  "op-unset": has(JSONPatch{}.op) ? "true" : "false",
+                  "value": has(JSONPatch{value: "valueValue"}.value) ? "true" : "false",
+                  "value-unset": has(JSONPatch{}.value) ? "true" : "false"}}]"#,
             json!({"metadata": {"labels": {}}}),
             json!({"metadata": {"labels": {
                 "op": "true", "op-unset": "false", "value": "true", "value-unset": "false"}}}),
         );
         ok(
             r#"[JSONPatch{op: "add", path: "/metadata/labels", value: {
-                  "empty": string(JSONPatch{} == JSONPatch{}),
-                  "same-all": string(JSONPatch{op: "add", path: "path", from: "from", value: 1} == JSONPatch{op: "add", path: "path", from: "from", value: 1}),
-                  "different-op": string(JSONPatch{op: "add"} == JSONPatch{op: "remove"}),
-                  "different-value": string(JSONPatch{op: "add", path: "path", from: "from", value: "1"} == JSONPatch{op: "add", path: "path", from: "from", value: 1})}}]"#,
+                  "empty": (JSONPatch{} == JSONPatch{}) ? "true" : "false",
+                  "same-all": (JSONPatch{op: "add", path: "path", from: "from", value: 1} == JSONPatch{op: "add", path: "path", from: "from", value: 1}) ? "true" : "false",
+                  "different-op": (JSONPatch{op: "add"} == JSONPatch{op: "remove"}) ? "true" : "false",
+                  "different-value": (JSONPatch{op: "add", path: "path", from: "from", value: "1"} == JSONPatch{op: "add", path: "path", from: "from", value: 1}) ? "true" : "false"}}]"#,
             json!({"metadata": {"labels": {}}}),
             json!({"metadata": {"labels": {
                 "empty": "true", "same-all": "true", "different-op": "false", "different-value": "false"}}}),
