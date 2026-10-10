@@ -1232,6 +1232,30 @@ pub fn strip_false_extensions(value: &mut serde_json::Value) {
 mod tests {
     use super::*;
 
+    /// Refs #3057: admissionregistration.k8s.io/v1 kinds must be published in
+    /// /openapi/v2 under their `io.k8s.api.admissionregistration.v1.<Kind>` key
+    /// with the right group/version/kind extension.
+    #[test]
+    fn swagger_defines_admissionregistration_v1_kinds() {
+        let spec = build_swagger_spec_for_crds(&[]);
+        let defs = spec["definitions"].as_object().unwrap();
+        for kind in [
+            "MutatingWebhookConfiguration",
+            "ValidatingWebhookConfiguration",
+            "ValidatingAdmissionPolicy",
+            "ValidatingAdmissionPolicyBinding",
+        ] {
+            let def = defs
+                .get(&format!("io.k8s.api.admissionregistration.v1.{kind}"))
+                .unwrap_or_else(|| panic!("{kind} missing from v2 definitions"));
+            assert_eq!(
+                def["x-kubernetes-group-version-kind"][0]["group"],
+                "admissionregistration.k8s.io"
+            );
+            assert_eq!(def["x-kubernetes-group-version-kind"][0]["version"], "v1");
+        }
+    }
+
     #[test]
     fn test_strip_false_extensions_removes_defaults() {
         // Test v2 conversion behavior matching K8s:

@@ -1076,6 +1076,28 @@ mod tests {
             .contains_key("/apis/apps/v1/namespaces/{namespace}/deployments"));
     }
 
+    /// Refs #3057: v3 component schemas for admissionregistration.k8s.io/v1
+    /// kinds carry the real group/version (not core/v1).
+    #[test]
+    fn spec_defines_admissionregistration_v1_kinds() {
+        let spec = serde_json::to_value(generate_openapi_spec()).unwrap();
+        let schemas = spec["components"]["schemas"].as_object().unwrap();
+        for kind in [
+            "MutatingWebhookConfiguration",
+            "ValidatingWebhookConfiguration",
+            "ValidatingAdmissionPolicy",
+            "ValidatingAdmissionPolicyBinding",
+        ] {
+            let s = schemas
+                .get(&format!("io.k8s.api.admissionregistration.v1.{kind}"))
+                .unwrap_or_else(|| panic!("{kind} missing from v3 schemas"));
+            let g = &s["x-kubernetes-group-version-kind"][0];
+            assert_eq!(g["group"], "admissionregistration.k8s.io");
+            assert_eq!(g["version"], "v1");
+            assert_eq!(g["kind"], kind);
+        }
+    }
+
     #[test]
     fn test_spec_serialization() {
         let spec = generate_openapi_spec();
