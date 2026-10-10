@@ -673,6 +673,7 @@ impl Storage for EtcdStorage {
         // emit all of them — not just the first one.
         // IMPORTANT: Move `watcher` into the closure to keep the watch alive.
         // Dropping it closes the gRPC stream, which terminates the watch.
+        let sizes = self.sizes.clone();
         let watch_stream = stream.flat_map(move |watch_resp| {
             let _ = &watcher;
             let events: Vec<Result<WatchEvent>> = match watch_resp {
@@ -682,6 +683,18 @@ impl Storage for EtcdStorage {
                             .kv()
                             .map(|kv| kv.key_str().unwrap_or("").to_string())
                             .unwrap_or_default();
+                        // Feed the size estimator like upstream's watch loop
+                        // (storage/etcd3/watcher.go:408-415) (#2991).
+                        if let Some(kv) = event.kv() {
+                            match event.event_type() {
+                                etcd_client::EventType::Put => {
+                                    sizes.update_key(&key, kv.value().len(), kv.mod_revision())
+                                }
+                                etcd_client::EventType::Delete => {
+                                    sizes.delete_key(&key, kv.mod_revision())
+                                }
+                            }
+                        }
                         match event.event_type() {
                             etcd_client::EventType::Put => {
                                 let raw_value = event
@@ -758,6 +771,7 @@ impl Storage for EtcdStorage {
         // Use flat_map to handle multiple events per etcd watch response.
         // IMPORTANT: Move `watcher` into the closure to keep the watch alive.
         // Dropping it closes the gRPC stream, which terminates the watch.
+        let sizes = self.sizes.clone();
         let watch_stream = stream.flat_map(move |watch_resp| {
             let _ = &watcher;
             let events: Vec<Result<WatchEvent>> = match watch_resp {
@@ -770,6 +784,18 @@ impl Storage for EtcdStorage {
                             .map(|kv| kv.key_str().unwrap_or("").to_string())
                             .unwrap_or_default();
 
+                        // Feed the size estimator like upstream's watch loop
+                        // (storage/etcd3/watcher.go:408-415) (#2991).
+                        if let Some(kv) = event.kv() {
+                            match event.event_type() {
+                                etcd_client::EventType::Put => {
+                                    sizes.update_key(&key, kv.value().len(), kv.mod_revision())
+                                }
+                                etcd_client::EventType::Delete => {
+                                    sizes.delete_key(&key, kv.mod_revision())
+                                }
+                            }
+                        }
                         match event.event_type() {
                             etcd_client::EventType::Put => {
                                 let raw_value = event
