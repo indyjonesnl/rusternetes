@@ -38,7 +38,7 @@ use chrono::{DateTime, Duration, Utc};
 use crate::label_selector::{LabelOperator, LabelRequirement};
 use crate::quantity::{Format, Quantity};
 use crate::resources::{
-    PersistentVolumeClaim, Pod, PodAffinityTerm, ResourceQuotaSpec,
+    ContainerStatus, PersistentVolumeClaim, Pod, PodAffinityTerm, ResourceQuotaSpec,
     ScopedResourceSelectorRequirement,
 };
 use crate::types::{Phase, ResourceRequirements};
@@ -332,9 +332,8 @@ fn side(resources: Option<&ResourceRequirements>, requests: bool) -> ResourceLis
 /// quota: a pod whose init container asks for `4Gi` and whose app container asks
 /// for `1Gi` occupies `4Gi` at its peak.
 ///
-/// The `UseStatusResources` arm of upstream's version is not ported: it reads
-/// actuated figures out of `status.containerStatuses` to price an in-place
-/// resize in flight, and quota here is computed from `spec`.
+/// This is the `UseStatusResources: false` form; quota's [`pod_usage`] uses
+/// [`aggregate_container_resources_opts`] with it on.
 pub fn aggregate_container_resources(pod: &Pod, requests: bool) -> ResourceList {
     aggregate_container_resources_non_missing(pod, requests, None)
 }
@@ -364,20 +363,112 @@ pub fn aggregate_container_resources_non_missing(
     requests: bool,
     non_missing: Option<&ResourceList>,
 ) -> ResourceList {
+    aggregate_container_resources_opts(pod, requests, non_missing, false)
+}
+
+/// `IsPodResizeInfeasible` (`helpers.go:302-309`): the first
+/// `PodResizePending` condition decides, by its reason.
+fn is_pod_resize_infeasible(pod: &Pod) -> bool {
+    pod.status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .and_then(|c| c.iter().find(|c| c.condition_type == "PodResizePending"))
+        .is_some_and(|c| c.reason.as_deref() == Some("Infeasible"))
+}
+
+/// `determineEffectiveRequests` / `determineEffectiveLimits`
+/// (`helpers.go:285-299`): what a container is charged while an in-place
+/// resize may be in flight. Requests are the per-resource max of spec,
+/// actuated and allocated (actuated and allocated only when the resize is
+/// infeasible); limits the max of spec and actuated (actuated only when
+/// infeasible). Applied only when the status carries `resources`
+/// (`found && cs.Resources != nil`).
+fn effective_with_status(
+    pod: &Pod,
+    own: ResourceList,
+    status: Option<&ContainerStatus>,
+    requests: bool,
+) -> ResourceList {
+    let Some(cs) = status.filter(|cs| cs.resources.is_some()) else {
+        return own;
+    };
+    let actuated = side(cs.resources.as_ref(), requests);
+    let allocated = if requests {
+        cs.allocated_resources
+            .as_ref()
+            .map(parse_resource_list)
+            .unwrap_or_default()
+    } else {
+        ResourceList::new()
+    };
+    let infeasible = is_pod_resize_infeasible(pod);
+    match (requests, infeasible) {
+        (true, true) => max(&actuated, &allocated),
+        (true, false) => max(&max(&own, &actuated), &allocated),
+        (false, true) => actuated,
+        (false, false) => max(&own, &actuated),
+    }
+}
+
+/// [`aggregate_container_resources_non_missing`] with upstream's
+/// `UseStatusResources` option (`AggregateContainerRequests`
+/// `helpers.go:191-278`, `AggregateContainerLimits` `:382-455`): app
+/// containers, and restartable init containers only, are priced from their
+/// `status.containerStatuses` / `initContainerStatuses` entry (matched by
+/// name) via [`effective_with_status`].
+pub fn aggregate_container_resources_opts(
+    pod: &Pod,
+    requests: bool,
+    non_missing: Option<&ResourceList>,
+    use_status: bool,
+) -> ResourceList {
     let Some(spec) = &pod.spec else {
         return ResourceList::new();
     };
 
+    // Init statuses are inserted after app statuses, so they win a name clash.
+    let mut statuses: HashMap<&str, &ContainerStatus> = HashMap::new();
+    if use_status {
+        if let Some(status) = &pod.status {
+            for cs in status
+                .container_statuses
+                .iter()
+                .flatten()
+                .chain(status.init_container_statuses.iter().flatten())
+            {
+                statuses.insert(cs.name.as_str(), cs);
+            }
+        }
+    }
+
     let mut total = ResourceList::new();
     for container in &spec.containers {
-        let own = apply_non_missing(side(container.resources.as_ref(), requests), non_missing);
+        let mut own = side(container.resources.as_ref(), requests);
+        if use_status {
+            own = effective_with_status(
+                pod,
+                own,
+                statuses.get(container.name.as_str()).copied(),
+                requests,
+            );
+        }
+        let own = apply_non_missing(own, non_missing);
         total = add(&total, &own);
     }
 
     let mut restartable = ResourceList::new();
     let mut init_max = ResourceList::new();
     for container in spec.init_containers.iter().flatten() {
-        let own = apply_non_missing(side(container.resources.as_ref(), requests), non_missing);
+        let mut own = side(container.resources.as_ref(), requests);
+        if use_status && is_restartable_init(container.restart_policy.as_ref()) {
+            own = effective_with_status(
+                pod,
+                own,
+                statuses.get(container.name.as_str()).copied(),
+                requests,
+            );
+        }
+        let own = apply_non_missing(own, non_missing);
         let effective = if is_restartable_init(container.restart_policy.as_ref()) {
             total = add(&total, &own);
             restartable = add(&restartable, &own);
@@ -400,14 +491,23 @@ pub fn aggregate_container_resources_non_missing(
 /// (`SkipPodLevelResources: !Enabled(PodLevelResources)`,
 /// `pkg/quota/v1/evaluator/core/pods.go:403-404`; `helpers.go:155`).
 pub fn pod_requests(pod: &Pod) -> ResourceList {
-    pod_requests_non_missing(pod, None)
+    pod_requests_opts(pod, None, false)
 }
 
 /// [`pod_requests`] with upstream's `NonMissingContainerRequests` option
 /// (`helpers.go:56`), used by the scheduler for `Non0CPU`/`Non0Mem`
 /// (`pkg/scheduler/framework/types.go:722-745`).
 pub fn pod_requests_non_missing(pod: &Pod, non_missing: Option<&ResourceList>) -> ResourceList {
-    let mut reqs = aggregate_container_resources_non_missing(pod, true, non_missing);
+    pod_requests_opts(pod, non_missing, false)
+}
+
+/// [`pod_requests`] with upstream's `UseStatusResources` option.
+pub fn pod_requests_opts(
+    pod: &Pod,
+    non_missing: Option<&ResourceList>,
+    use_status: bool,
+) -> ResourceList {
+    let mut reqs = aggregate_container_resources_opts(pod, true, non_missing, use_status);
     let Some(spec) = &pod.spec else {
         return reqs;
     };
@@ -440,7 +540,12 @@ pub fn pod_requests_non_missing(pod: &Pod, non_missing: Option<&ResourceList>) -
 /// (`:366-373`): a resource the pod does not limit must not acquire a limit
 /// equal to the overhead alone.
 pub fn pod_limits(pod: &Pod) -> ResourceList {
-    let mut limits = aggregate_container_resources(pod, false);
+    pod_limits_opts(pod, false)
+}
+
+/// [`pod_limits`] with upstream's `UseStatusResources` option.
+pub fn pod_limits_opts(pod: &Pod, use_status: bool) -> ResourceList {
+    let mut limits = aggregate_container_resources_opts(pod, false, None, use_status);
     let Some(spec) = &pod.spec else {
         return limits;
     };
@@ -603,9 +708,16 @@ pub fn pod_usage(pod: &Pod, now: DateTime<Utc>) -> ResourceList {
     if !is_quota_charged(pod, now) {
         return usage;
     }
+    // `UseStatusResources: Enabled(InPlacePodVerticalScaling)`
+    // (`pods.go:400-402`).
+    let use_status =
+        crate::feature_gates::enabled(crate::feature_gates::Feature::InPlacePodVerticalScaling);
     add(
         &usage,
-        &pod_compute_usage(&pod_requests(pod), &pod_limits(pod)),
+        &pod_compute_usage(
+            &pod_requests_opts(pod, None, use_status),
+            &pod_limits_opts(pod, use_status),
+        ),
     )
 }
 
