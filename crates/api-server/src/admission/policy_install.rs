@@ -96,12 +96,23 @@ impl TypeConverters for RegistryTypeConverters {
 /// defaulting (`handlers::defaults`, the ports of the `SetDefaults_*`
 /// functions in `pkg/apis/*/v*/defaults.go`).
 ///
-/// Upstream `Scheme.Default(obj)` (apimachinery `runtime/scheme.go`) looks the
-/// defaulting func up by the object's Go type and does nothing when none is
-/// registered; here the kind comes from the object's own `apiVersion`/`kind`.
-/// The typed defaulters work on our resource structs, so the defaulted form is
-/// merged back fill-missing-only: fields the typed form does not model survive
-/// a mutation and a field a patch set is never overwritten.
+/// Upstream, staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/mutating/
+/// dispatcher.go:274 (`dispatchOne`, after `patcher.Patch` and the typed
+/// conversion at :268-272):
+/// `o.GetObjectDefaulter().Default(newVersionedObject)`
+/// and staging/src/k8s.io/apimachinery/pkg/runtime/scheme.go:355-359:
+/// `if fn, ok := s.defaulterFuncs[reflect.TypeOf(src)]; ok { fn(src) }`
+/// i.e. defaulting is looked up by the object's type and is a no-op when none
+/// is registered (so an `*unstructured.Unstructured` custom resource is not
+/// defaulted here either). Here the kind comes from the object's own
+/// `apiVersion`/`kind`. Defaulting funcs only set unset fields, so the
+/// defaulted typed form is merged back fill-missing-only; this is equivalent
+/// to in-place defaulting and keeps fields our structs do not model. Upstream's
+/// dispatcher_test.go:627-630 registers a fake `AddTypeDefaultingFunc` for
+/// `appsv1.Deployment` (strategy type) to observe defaulting after a patch,
+/// which `defaulter_defaults_a_deployment_after_patch` mirrors. The covered
+/// kinds are the `SetDefaults_*` ports that exist in `handlers::defaults`;
+/// upstream registers defaulters for every built-in kind.
 pub struct SchemeObjectDefaulter;
 
 fn default_typed<T>(object: &mut Value, f: impl FnOnce(&mut T))
