@@ -251,7 +251,7 @@ impl EtcdStorage {
             let resp = client
                 .txn(txn)
                 .await
-                .map_err(|e| Error::Storage(format!("Failed to update resource: {}", e)))?;
+                .map_err(|e| write_error("Failed to update resource", e))?;
             if resp.succeeded() {
                 return Ok(resp.header().map(|h| h.revision()).unwrap_or(0));
             }
@@ -412,7 +412,7 @@ impl Storage for EtcdStorage {
         let txn_resp = client
             .txn(txn)
             .await
-            .map_err(|e| Error::Storage(format!("Failed to create resource: {}", e)))?;
+            .map_err(|e| write_error("Failed to create resource", e))?;
 
         if !txn_resp.succeeded() {
             return Err(Error::AlreadyExists(key.to_string()));
@@ -502,7 +502,7 @@ impl Storage for EtcdStorage {
             let txn_resp = client
                 .txn(txn)
                 .await
-                .map_err(|e| Error::Storage(format!("Failed to update resource: {}", e)))?;
+                .map_err(|e| write_error("Failed to update resource", e))?;
 
             if !txn_resp.succeeded() {
                 // Get the current resourceVersion from the failed txn's else branch
@@ -878,6 +878,37 @@ impl Storage for EtcdStorage {
     }
 }
 
+/// Classify a failed write. Upstream hands the raw etcd error to the handlers,
+/// whose `isTooLargeError` (endpoints/handlers/rest.go:457-471) matches either
+///
+/// ```text
+/// etcdErr.Code() == grpccodes.InvalidArgument && etcdErr.Error() == "etcdserver: request is too large"
+/// grpcErr.GRPCStatus().Code() == grpccodes.ResourceExhausted && strings.Contains(grpcErr.GRPCStatus().Message(), "trying to send message larger than max")
+/// ```
+///
+/// so the same two are tagged [`Error::StorageTooLarge`] here.
+fn write_error(what: &str, e: etcd_client::Error) -> Error {
+    let too_large = match &e {
+        etcd_client::Error::GRpcStatus(status) => status_is_too_large(status),
+        _ => false,
+    };
+    let msg = format!("{what}: {e}");
+    if too_large {
+        Error::StorageTooLarge(msg)
+    } else {
+        Error::Storage(msg)
+    }
+}
+
+fn status_is_too_large(status: &tonic::Status) -> bool {
+    (status.code() == tonic::Code::InvalidArgument
+        && status.message() == "etcdserver: request is too large")
+        || (status.code() == tonic::Code::ResourceExhausted
+            && status
+                .message()
+                .contains("trying to send message larger than max"))
+}
+
 // Implement AuthzStorage for EtcdStorage
 #[async_trait]
 impl AuthzStorage for EtcdStorage {
@@ -959,6 +990,49 @@ impl AuthzStorage for EtcdStorage {
 
 #[cfg(test)]
 mod tests {
+    /// rest.go:457-471, and the table in TestIsTooLargeError-style coverage:
+    /// both upstream matches are too large, nothing else is.
+    #[test]
+    fn too_large_status_matches_upstream_is_too_large_error() {
+        use tonic::{Code, Status};
+        assert!(status_is_too_large(&Status::new(
+            Code::InvalidArgument,
+            "etcdserver: request is too large"
+        )));
+        assert!(status_is_too_large(&Status::new(
+            Code::ResourceExhausted,
+            "grpc: trying to send message larger than max (3145800 vs. 2097152)"
+        )));
+        // Right message, wrong code; right code, other message.
+        assert!(!status_is_too_large(&Status::new(
+            Code::Internal,
+            "etcdserver: request is too large"
+        )));
+        assert!(!status_is_too_large(&Status::new(
+            Code::InvalidArgument,
+            "etcdserver: key is not provided"
+        )));
+        assert!(!status_is_too_large(&Status::new(
+            Code::ResourceExhausted,
+            "etcdserver: too many requests"
+        )));
+    }
+
+    #[test]
+    fn write_error_tags_only_too_large_grpc_statuses() {
+        let big = etcd_client::Error::GRpcStatus(tonic::Status::new(
+            tonic::Code::InvalidArgument,
+            "etcdserver: request is too large",
+        ));
+        assert!(write_error("Failed to update resource", big).is_too_large_error());
+        let other = etcd_client::Error::GRpcStatus(tonic::Status::new(
+            tonic::Code::Unavailable,
+            "etcdserver: leader changed",
+        ));
+        let e = write_error("Failed to update resource", other);
+        assert!(matches!(e, Error::Storage(_)));
+    }
+
     use super::*;
     use serde::{Deserialize, Serialize};
 

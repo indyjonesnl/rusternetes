@@ -186,6 +186,9 @@ pub async fn list_ingressclasses(
     }
 
     let prefix = build_prefix("ingressclasses", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut ingress_classes: Vec<IngressClass> = state.storage.list(&prefix).await?;
     crate::handlers::filtering::apply_selectors(&mut ingress_classes, &params)?;
 

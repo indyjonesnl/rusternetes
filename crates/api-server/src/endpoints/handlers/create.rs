@@ -12,7 +12,7 @@ use rusternetes_common::{Error, Result};
 use super::admission::{Admission, CreateValidation};
 use super::rest::{
     authorize, decode, dedup_owner_references_and_add_warning, dry_run_param, is_dry_run,
-    respond_object, RequestScope,
+    respond_object, retry_without_managed_fields_if_too_large, RequestScope,
 };
 use crate::fieldmanager::manager_or_user_agent;
 use crate::registry::generic;
@@ -98,15 +98,27 @@ pub async fn create_resource<T: Object>(
         admission: &admission,
         authorize_create: false,
     };
-    let out = scope
-        .store
-        .create(
-            &ctx,
-            obj,
-            Some(&validation),
-            &generic::CreateOptions { dry_run },
-        )
-        .await?;
+    // create.go:211-218: a write refused for its size is retried once without
+    // managedFields.
+    let out = retry_without_managed_fields_if_too_large(|strip| {
+        let mut attempt = obj.clone();
+        if strip {
+            attempt.metadata_mut().managed_fields = None;
+        }
+        let (ctx, validation) = (&ctx, &validation);
+        async move {
+            scope
+                .store
+                .create(
+                    ctx,
+                    attempt,
+                    Some(validation),
+                    &generic::CreateOptions { dry_run },
+                )
+                .await
+        }
+    })
+    .await?;
 
     Ok(respond_object(scope, StatusCode::CREATED, &out, &ctx))
 }

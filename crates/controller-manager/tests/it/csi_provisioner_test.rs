@@ -8,7 +8,7 @@
 
 use rusternetes_common::resources::service_account::ObjectReference;
 use rusternetes_common::resources::volume::*;
-use rusternetes_common::resources::{Event, PersistentVolume, PersistentVolumeClaim};
+use rusternetes_common::resources::{Event, PersistentVolume, PersistentVolumeClaim, Secret};
 use rusternetes_common::types::{ObjectMeta, TypeMeta};
 use rusternetes_controller_manager::controllers::csi_provisioner::CsiProvisioner;
 use rusternetes_controller_manager::controllers::dynamic_provisioner::DynamicProvisionerController;
@@ -36,6 +36,11 @@ struct Fake {
     /// `None` echoes the requested size; `Some(n)` reports `n` bytes.
     capacity: Option<i64>,
     create_code: Option<tonic::Code>,
+    delete_code: Option<tonic::Code>,
+    /// Controller capabilities beyond CREATE_DELETE_VOLUME.
+    extra_caps: Vec<controller_service_capability::rpc::Type>,
+    /// A driver that ignores `volume_content_source` (it must echo it).
+    drop_content_source: bool,
 }
 
 impl Fake {
@@ -44,7 +49,20 @@ impl Fake {
             rec: Default::default(),
             capacity: None,
             create_code: None,
+            delete_code: None,
+            extra_caps: vec![],
+            drop_content_source: false,
         }
+    }
+
+    /// A driver that can restore snapshots and clone volumes.
+    fn with_content_sources() -> Self {
+        let mut f = Self::new();
+        f.extra_caps = vec![
+            controller_service_capability::rpc::Type::CreateDeleteSnapshot,
+            controller_service_capability::rpc::Type::CloneVolume,
+        ];
+        f
     }
 }
 
@@ -72,14 +90,17 @@ impl Controller for Fake {
         &self,
         _r: Request<ControllerGetCapabilitiesRequest>,
     ) -> Result<Response<ControllerGetCapabilitiesResponse>, Status> {
+        let mut types = vec![controller_service_capability::rpc::Type::CreateDeleteVolume];
+        types.extend(self.extra_caps.iter().copied());
         Ok(Response::new(ControllerGetCapabilitiesResponse {
-            capabilities: vec![ControllerServiceCapability {
-                r#type: Some(controller_service_capability::Type::Rpc(
-                    controller_service_capability::Rpc {
-                        r#type: controller_service_capability::rpc::Type::CreateDeleteVolume as i32,
-                    },
-                )),
-            }],
+            capabilities: types
+                .into_iter()
+                .map(|t| ControllerServiceCapability {
+                    r#type: Some(controller_service_capability::Type::Rpc(
+                        controller_service_capability::Rpc { r#type: t as i32 },
+                    )),
+                })
+                .collect(),
         }))
     }
     async fn create_volume(
@@ -97,6 +118,11 @@ impl Controller for Fake {
                 capacity_bytes: self.capacity.unwrap_or(required),
                 volume_id: "vol-1".into(),
                 volume_context: [("shape".to_string(), "round".to_string())].into(),
+                content_source: if self.drop_content_source {
+                    None
+                } else {
+                    req.volume_content_source.clone()
+                },
                 ..Default::default()
             }),
         }))
@@ -106,6 +132,9 @@ impl Controller for Fake {
         r: Request<DeleteVolumeRequest>,
     ) -> Result<Response<DeleteVolumeResponse>, Status> {
         self.rec.lock().unwrap().delete_volume.push(r.into_inner());
+        if let Some(c) = self.delete_code {
+            return Err(Status::new(c, "fake delete failure"));
+        }
         Ok(Response::new(DeleteVolumeResponse {}))
     }
     async fn create_snapshot(
@@ -466,4 +495,803 @@ async fn the_pv_controller_annotates_claims_for_an_external_provisioner() {
         .any(|e| e.reason == "ExternalProvisioning"));
     // ... and the in-tree path does not create a PV for it.
     assert!(pv(&storage).await.is_none());
+}
+
+// ---- data sources (#2963): getVolumeContentSource / getPVCSource /
+// getSnapshotSource (external-provisioner controller.go:1184 / :1198 / :1289),
+// the clone / snapshot-protection finalizers (:1054 / :1070 / :1097) and
+// Provision's "volume content source missing" cleanup (:931-:945).
+
+const SNAP_GROUP: &str = "snapshot.storage.k8s.io";
+const SNAP_UID: &str = "snap-uid-1";
+const CLONE_FINALIZER: &str = "provisioner.storage.kubernetes.io/cloning-protection";
+const SNAP_FINALIZER: &str =
+    "provisioner.storage.kubernetes.io/volumesnapshot-as-source-protection";
+
+fn snapshot_claim() -> PersistentVolumeClaim {
+    let mut c = claim(&[(ANN, DRIVER)]);
+    c.spec.data_source = Some(TypedLocalObjectReference {
+        api_group: Some(SNAP_GROUP.into()),
+        kind: "VolumeSnapshot".into(),
+        name: "snap".into(),
+    });
+    c
+}
+
+fn clone_claim() -> PersistentVolumeClaim {
+    let mut c = claim(&[(ANN, DRIVER)]);
+    c.spec.data_source = Some(TypedLocalObjectReference {
+        api_group: None,
+        kind: "PersistentVolumeClaim".into(),
+        name: "src".into(),
+    });
+    c
+}
+
+fn snapshot(ready: bool, restore_size: Option<&str>) -> VolumeSnapshot {
+    let mut meta = ObjectMeta::new("snap").with_namespace("ns1");
+    meta.uid = SNAP_UID.into();
+    VolumeSnapshot {
+        type_meta: TypeMeta {
+            kind: "VolumeSnapshot".into(),
+            api_version: "snapshot.storage.k8s.io/v1".into(),
+        },
+        metadata: meta,
+        spec: Default::default(),
+        status: Some(VolumeSnapshotStatus {
+            bound_volume_snapshot_content_name: Some("snapcontent-1".into()),
+            creation_time: None,
+            ready_to_use: Some(ready),
+            restore_size: restore_size.map(String::from),
+            error: None,
+        }),
+    }
+}
+
+fn snapshot_content(driver: &str, handle: Option<&str>) -> VolumeSnapshotContent {
+    VolumeSnapshotContent {
+        type_meta: TypeMeta {
+            kind: "VolumeSnapshotContent".into(),
+            api_version: "snapshot.storage.k8s.io/v1".into(),
+        },
+        metadata: ObjectMeta::new("snapcontent-1"),
+        spec: VolumeSnapshotContentSpec {
+            driver: driver.into(),
+            volume_snapshot_ref: ObjectReference {
+                name: Some("snap".into()),
+                namespace: Some("ns1".into()),
+                uid: Some(SNAP_UID.into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        status: Some(VolumeSnapshotContentStatus {
+            snapshot_handle: handle.map(String::from),
+            creation_time: None,
+            ready_to_use: Some(true),
+            restore_size: None,
+            error: None,
+        }),
+    }
+}
+
+async fn put_snapshot(storage: &MemoryStorage, s: &VolumeSnapshot, c: &VolumeSnapshotContent) {
+    storage
+        .create(&build_key("volumesnapshots", Some("ns1"), "snap"), s)
+        .await
+        .unwrap();
+    storage
+        .create(
+            &build_key("volumesnapshotcontents", None, "snapcontent-1"),
+            c,
+        )
+        .await
+        .unwrap();
+}
+
+async fn snapshot_finalizers(storage: &MemoryStorage) -> Vec<String> {
+    let s: VolumeSnapshot = storage
+        .get(&build_key("volumesnapshots", Some("ns1"), "snap"))
+        .await
+        .unwrap();
+    s.metadata.finalizers.unwrap_or_default()
+}
+
+/// A bound CSI source PVC `src` and its Bound PV `pv-src`.
+async fn put_source_pvc(storage: &MemoryStorage, driver: &str, size: &str) {
+    let mut meta = ObjectMeta::new("src").with_namespace("ns1");
+    meta.uid = "src-uid".into();
+    let mut src = claim(&[]);
+    src.metadata = meta;
+    src.spec.volume_name = Some("pv-src".into());
+    src.spec.resources.requests = Some([("storage".to_string(), size.to_string())].into());
+    src.status = Some(PersistentVolumeClaimStatus {
+        phase: PersistentVolumeClaimPhase::Bound,
+        ..Default::default()
+    });
+    storage
+        .create(
+            &build_key("persistentvolumeclaims", Some("ns1"), "src"),
+            &src,
+        )
+        .await
+        .unwrap();
+    let pv = PersistentVolume {
+        type_meta: TypeMeta {
+            kind: "PersistentVolume".into(),
+            api_version: "v1".into(),
+        },
+        metadata: ObjectMeta::new("pv-src"),
+        spec: PersistentVolumeSpec {
+            csi: Some(CSIVolumeSource {
+                driver: driver.into(),
+                volume_handle: Some("vol-src".into()),
+                ..Default::default()
+            }),
+            claim_ref: Some(ObjectReference {
+                kind: Some("PersistentVolumeClaim".into()),
+                namespace: Some("ns1".into()),
+                name: Some("src".into()),
+                uid: Some("src-uid".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        status: Some(PersistentVolumeStatus {
+            phase: PersistentVolumePhase::Bound,
+            message: None,
+            reason: None,
+            last_phase_transition_time: None,
+        }),
+    };
+    storage
+        .create(&build_key("persistentvolumes", None, "pv-src"), &pv)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_snapshot_data_source_becomes_a_snapshot_content_source() {
+    let (storage, p, rec, _d) = env(Fake::with_content_sources(), storage_class(None)).await;
+    put_snapshot(
+        &storage,
+        &snapshot(true, Some("1Gi")),
+        &snapshot_content(DRIVER, Some("snap-handle-1")),
+    )
+    .await;
+    p.sync_claim(&snapshot_claim()).await.unwrap();
+
+    let reqs = rec.lock().unwrap().create_volume.clone();
+    assert_eq!(reqs.len(), 1);
+    match reqs[0]
+        .volume_content_source
+        .as_ref()
+        .and_then(|s| s.r#type.as_ref())
+    {
+        Some(volume_content_source::Type::Snapshot(s)) => {
+            assert_eq!(s.snapshot_id, "snap-handle-1")
+        }
+        other => panic!("expected a snapshot content source, got {other:?}"),
+    }
+    assert!(pv(&storage).await.is_some());
+    // setSnapshotFinalizer ran before CreateVolume; removeSnapshotFinalizer
+    // after the PV was built (Provision, :1043-:1049).
+    assert!(!snapshot_finalizers(&storage)
+        .await
+        .contains(&SNAP_FINALIZER.to_string()));
+}
+
+#[tokio::test]
+async fn a_snapshot_is_protected_while_its_volume_is_not_yet_provisioned() {
+    let mut fake = Fake::with_content_sources();
+    fake.create_code = Some(tonic::Code::Unavailable);
+    let (storage, p, _rec, _d) = env(fake, storage_class(None)).await;
+    put_snapshot(
+        &storage,
+        &snapshot(true, None),
+        &snapshot_content(DRIVER, Some("h")),
+    )
+    .await;
+    p.sync_claim(&snapshot_claim()).await.unwrap_err();
+    assert!(snapshot_finalizers(&storage)
+        .await
+        .contains(&SNAP_FINALIZER.to_string()));
+}
+
+/// `--prevent-volume-mode-conversion` (default on): a Block claim over a
+/// Filesystem snapshot needs the allow-volume-mode-change annotation.
+#[tokio::test]
+async fn a_volume_mode_conversion_needs_the_snapshot_content_annotation() {
+    let (storage, p, rec, _d) = env(Fake::with_content_sources(), storage_class(None)).await;
+    let mut content = snapshot_content(DRIVER, Some("h"));
+    content.spec.source_volume_mode = Some("Filesystem".into());
+    put_snapshot(&storage, &snapshot(true, None), &content).await;
+    let mut c = snapshot_claim();
+    c.spec.volume_mode = Some(PersistentVolumeMode::Block);
+    let err = p.sync_claim(&c).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("modifies the mode of the source volume but does not have permission"),
+        "{err}"
+    );
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+
+    content
+        .metadata
+        .annotations
+        .get_or_insert_with(Default::default)
+        .insert(
+            "snapshot.storage.kubernetes.io/allow-volume-mode-change".into(),
+            "true".into(),
+        );
+    storage
+        .update(
+            &build_key("volumesnapshotcontents", None, "snapcontent-1"),
+            &content,
+        )
+        .await
+        .unwrap();
+    p.sync_claim(&c).await.unwrap();
+    assert_eq!(rec.lock().unwrap().create_volume.len(), 1);
+}
+
+#[tokio::test]
+async fn an_unready_snapshot_is_not_restored() {
+    let (storage, p, rec, _d) = env(Fake::with_content_sources(), storage_class(None)).await;
+    put_snapshot(
+        &storage,
+        &snapshot(false, None),
+        &snapshot_content(DRIVER, Some("h")),
+    )
+    .await;
+    let err = p.sync_claim(&snapshot_claim()).await.unwrap_err();
+    assert!(
+        err.to_string().contains("snapshot snap is not Ready"),
+        "{err}"
+    );
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+}
+
+#[tokio::test]
+async fn a_snapshot_of_another_driver_is_refused() {
+    let (storage, p, rec, _d) = env(Fake::with_content_sources(), storage_class(None)).await;
+    put_snapshot(
+        &storage,
+        &snapshot(true, None),
+        &snapshot_content("other.csi.io", Some("h")),
+    )
+    .await;
+    let err = p.sync_claim(&snapshot_claim()).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("is not handled by CSI driver of StorageClass fast"),
+        "{err}"
+    );
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+}
+
+#[tokio::test]
+async fn a_snapshot_without_a_handle_is_refused() {
+    let (storage, p, rec, _d) = env(Fake::with_content_sources(), storage_class(None)).await;
+    put_snapshot(
+        &storage,
+        &snapshot(true, None),
+        &snapshot_content(DRIVER, None),
+    )
+    .await;
+    let err = p.sync_claim(&snapshot_claim()).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("snapshot handle snap is not available"),
+        "{err}"
+    );
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+}
+
+#[tokio::test]
+async fn a_claim_smaller_than_the_snapshot_restore_size_is_refused() {
+    let (storage, p, rec, _d) = env(Fake::with_content_sources(), storage_class(None)).await;
+    put_snapshot(
+        &storage,
+        &snapshot(true, Some("2Gi")),
+        &snapshot_content(DRIVER, Some("h")),
+    )
+    .await;
+    let err = p.sync_claim(&snapshot_claim()).await.unwrap_err();
+    assert!(err.to_string().contains("is less than the size"), "{err}");
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+}
+
+#[tokio::test]
+async fn a_snapshot_data_source_of_the_wrong_api_group_is_rejected() {
+    let (_storage, p, rec, _d) = env(Fake::with_content_sources(), storage_class(None)).await;
+    let mut c = snapshot_claim();
+    c.spec.data_source.as_mut().unwrap().api_group = Some("example.com".into());
+    let err = p.sync_claim(&c).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("the PVC source does not belong to the right APIGroup"),
+        "{err}"
+    );
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+}
+
+#[tokio::test]
+async fn a_snapshot_source_needs_create_delete_snapshot() {
+    let (storage, p, rec, _d) = env(Fake::new(), storage_class(None)).await;
+    put_snapshot(
+        &storage,
+        &snapshot(true, None),
+        &snapshot_content(DRIVER, Some("h")),
+    )
+    .await;
+    let err = p.sync_claim(&snapshot_claim()).await.unwrap_err();
+    assert!(err.to_string().contains("CREATE_DELETE_SNAPSHOT"), "{err}");
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+}
+
+#[tokio::test]
+async fn a_pvc_data_source_becomes_a_volume_content_source_and_is_protected() {
+    let (storage, p, rec, _d) = env(Fake::with_content_sources(), storage_class(None)).await;
+    put_source_pvc(&storage, DRIVER, "1Gi").await;
+    p.sync_claim(&clone_claim()).await.unwrap();
+
+    let reqs = rec.lock().unwrap().create_volume.clone();
+    assert_eq!(reqs.len(), 1);
+    match reqs[0]
+        .volume_content_source
+        .as_ref()
+        .and_then(|s| s.r#type.as_ref())
+    {
+        Some(volume_content_source::Type::Volume(v)) => assert_eq!(v.volume_id, "vol-src"),
+        other => panic!("expected a volume content source, got {other:?}"),
+    }
+    assert!(pv(&storage).await.is_some());
+    // setCloneFinalizer (:1054): the source stays until the clone is bound.
+    let src: PersistentVolumeClaim = storage
+        .get(&build_key("persistentvolumeclaims", Some("ns1"), "src"))
+        .await
+        .unwrap();
+    assert!(src
+        .metadata
+        .finalizers
+        .unwrap_or_default()
+        .contains(&CLONE_FINALIZER.to_string()));
+}
+
+#[tokio::test]
+async fn a_clone_smaller_than_its_source_is_refused() {
+    let (storage, p, rec, _d) = env(Fake::with_content_sources(), storage_class(None)).await;
+    put_source_pvc(&storage, DRIVER, "2Gi").await;
+    let err = p.sync_claim(&clone_claim()).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("must be greater than or equal in size to the specified PVC data source"),
+        "{err}"
+    );
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+}
+
+#[tokio::test]
+async fn a_clone_of_another_drivers_volume_is_refused() {
+    let (storage, p, rec, _d) = env(Fake::with_content_sources(), storage_class(None)).await;
+    put_source_pvc(&storage, "other.csi.io", "1Gi").await;
+    let err = p.sync_claim(&clone_claim()).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("claim in dataSource not bound or invalid"),
+        "{err}"
+    );
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+}
+
+#[tokio::test]
+async fn a_clone_needs_clone_volume() {
+    let (storage, p, rec, _d) = env(Fake::new(), storage_class(None)).await;
+    put_source_pvc(&storage, DRIVER, "1Gi").await;
+    let err = p.sync_claim(&clone_claim()).await.unwrap_err();
+    assert!(err.to_string().contains("CLONE_VOLUME"), "{err}");
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+}
+
+/// Provision :931-:945: a driver that ignores the content source has made a
+/// blank volume; delete it and retry in the background.
+#[tokio::test]
+async fn a_volume_without_the_requested_content_source_is_deleted() {
+    let mut fake = Fake::with_content_sources();
+    fake.drop_content_source = true;
+    let (storage, p, rec, _d) = env(fake, storage_class(None)).await;
+    put_source_pvc(&storage, DRIVER, "1Gi").await;
+    let err = p.sync_claim(&clone_claim()).await.unwrap_err();
+    assert!(
+        err.to_string().contains("volume content source missing"),
+        "{err}"
+    );
+    let del = rec.lock().unwrap().delete_volume.clone();
+    assert_eq!(del.len(), 1);
+    assert_eq!(del[0].volume_id, "vol-1");
+    assert!(pv(&storage).await.is_none());
+}
+
+/// `dataSource` (:2096): the cross-namespace form needs the
+/// CrossNamespaceVolumeDataSource gate, off here.
+#[tokio::test]
+async fn a_data_source_ref_namespace_needs_the_cross_namespace_gate() {
+    let (_storage, p, rec, _d) = env(Fake::with_content_sources(), storage_class(None)).await;
+    let mut c = clone_claim();
+    c.spec.data_source = None;
+    c.spec.data_source_ref = Some(TypedObjectReference {
+        api_group: None,
+        kind: "PersistentVolumeClaim".into(),
+        name: "src".into(),
+        namespace: Some("other".into()),
+    });
+    let err = p.sync_claim(&c).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("CrossNamespaceVolumeDataSource feature is disabled"),
+        "{err}"
+    );
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+}
+
+// ---- delete path (#2965) ----------------------------------------------------
+//
+// sig-storage-lib-external-provisioner `controller/controller.go`:
+// `syncVolume` (:1149), `isProvisionerForVolume` (:1175),
+// `handleProtectionFinalizer` (:1203), `shouldDelete` (:1285),
+// `deleteVolumeOperation` (:1636); external-provisioner
+// `pkg/controller/controller.go` `Delete` (:1390), `handleSecretsForDeletion`,
+// `canDeleteVolume` (:1526).
+
+const FINALIZER: &str = "external-provisioner.volume.kubernetes.io/finalizer";
+
+fn csi_pv(
+    name: &str,
+    phase: PersistentVolumePhase,
+    policy: PersistentVolumeReclaimPolicy,
+) -> PersistentVolume {
+    let mut meta = ObjectMeta::new(name);
+    meta.annotations = Some(
+        [(
+            "pv.kubernetes.io/provisioned-by".to_string(),
+            DRIVER.to_string(),
+        )]
+        .into(),
+    );
+    meta.finalizers = Some(vec![FINALIZER.to_string()]);
+    PersistentVolume {
+        type_meta: TypeMeta {
+            kind: "PersistentVolume".into(),
+            api_version: "v1".into(),
+        },
+        metadata: meta,
+        spec: PersistentVolumeSpec {
+            persistent_volume_reclaim_policy: Some(policy),
+            csi: Some(CSIVolumeSource {
+                driver: DRIVER.into(),
+                volume_handle: Some("vol-1".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        status: Some(PersistentVolumeStatus {
+            phase,
+            ..Default::default()
+        }),
+    }
+}
+
+async fn put_pv(storage: &MemoryStorage, pv: &PersistentVolume) {
+    storage
+        .create(&build_key("persistentvolumes", None, &pv.metadata.name), pv)
+        .await
+        .unwrap();
+}
+
+async fn get_pv(storage: &MemoryStorage, name: &str) -> Option<PersistentVolume> {
+    storage
+        .get(&build_key("persistentvolumes", None, name))
+        .await
+        .ok()
+}
+
+fn deleted(rec: &Arc<Mutex<Recorded>>) -> Vec<DeleteVolumeRequest> {
+    rec.lock().unwrap().delete_volume.clone()
+}
+
+#[tokio::test]
+async fn a_released_delete_pv_is_deleted_and_its_finalizer_released() {
+    let (storage, p, rec, _d) = env(Fake::new(), storage_class(None)).await;
+    let pv = csi_pv(
+        "pv1",
+        PersistentVolumePhase::Released,
+        PersistentVolumeReclaimPolicy::Delete,
+    );
+    put_pv(&storage, &pv).await;
+    p.sync_volume(&pv).await.unwrap();
+    let reqs = deleted(&rec);
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].volume_id, "vol-1");
+    assert!(get_pv(&storage, "pv1").await.is_none(), "PV removed");
+}
+
+#[tokio::test]
+async fn a_pv_that_should_not_be_deleted_is_left_alone() {
+    let (storage, p, rec, _d) = env(Fake::new(), storage_class(None)).await;
+    let cases = [
+        // `shouldDelete`: Retain reclaim policy.
+        (
+            "retain",
+            PersistentVolumePhase::Released,
+            PersistentVolumeReclaimPolicy::Retain,
+        ),
+        // `shouldDelete`: not Released.
+        (
+            "bound",
+            PersistentVolumePhase::Bound,
+            PersistentVolumeReclaimPolicy::Delete,
+        ),
+        (
+            "failed",
+            PersistentVolumePhase::Failed,
+            PersistentVolumeReclaimPolicy::Delete,
+        ),
+    ];
+    for (name, phase, policy) in cases {
+        let pv = csi_pv(name, phase, policy);
+        put_pv(&storage, &pv).await;
+        p.sync_volume(&pv).await.unwrap();
+        assert!(get_pv(&storage, name).await.is_some(), "{name} kept");
+    }
+    assert!(deleted(&rec).is_empty());
+
+    // `shouldDelete`: "The finalizer was removed, i.e. the volume has been
+    // already deleted."
+    let mut pv = csi_pv(
+        "gone",
+        PersistentVolumePhase::Released,
+        PersistentVolumeReclaimPolicy::Delete,
+    );
+    pv.metadata.finalizers = None;
+    pv.metadata.deletion_timestamp = Some(chrono::Utc::now());
+    put_pv(&storage, &pv).await;
+    p.sync_volume(&pv).await.unwrap();
+    assert!(deleted(&rec).is_empty());
+}
+
+#[tokio::test]
+async fn another_drivers_pv_is_not_ours_to_delete() {
+    let (storage, p, rec, _d) = env(Fake::new(), storage_class(None)).await;
+    let mut pv = csi_pv(
+        "other",
+        PersistentVolumePhase::Released,
+        PersistentVolumeReclaimPolicy::Delete,
+    );
+    pv.metadata
+        .annotations
+        .as_mut()
+        .unwrap()
+        .insert("pv.kubernetes.io/provisioned-by".into(), "other.csi".into());
+    put_pv(&storage, &pv).await;
+    p.sync_volume(&pv).await.unwrap();
+    assert!(deleted(&rec).is_empty());
+    assert!(get_pv(&storage, "other").await.is_some());
+
+    // A statically provisioned CSI PV is ours iff `spec.csi.driver` is.
+    let mut stat = csi_pv(
+        "static",
+        PersistentVolumePhase::Released,
+        PersistentVolumeReclaimPolicy::Delete,
+    );
+    stat.metadata.annotations = None;
+    put_pv(&storage, &stat).await;
+    p.sync_volume(&stat).await.unwrap();
+    assert_eq!(deleted(&rec).len(), 1);
+}
+
+#[tokio::test]
+async fn the_protection_finalizer_follows_the_reclaim_policy() {
+    let (storage, p, rec, _d) = env(Fake::new(), storage_class(None)).await;
+
+    // Bound + Delete: the finalizer is added.
+    let mut pv = csi_pv(
+        "bound",
+        PersistentVolumePhase::Bound,
+        PersistentVolumeReclaimPolicy::Delete,
+    );
+    pv.metadata.finalizers = None;
+    put_pv(&storage, &pv).await;
+    p.sync_volume(&pv).await.unwrap();
+    let got = get_pv(&storage, "bound").await.unwrap();
+    assert_eq!(got.metadata.finalizers, Some(vec![FINALIZER.to_string()]));
+
+    // Reclaim policy changed to Retain: the finalizer is removed.
+    let pv = csi_pv(
+        "retained",
+        PersistentVolumePhase::Bound,
+        PersistentVolumeReclaimPolicy::Retain,
+    );
+    put_pv(&storage, &pv).await;
+    p.sync_volume(&pv).await.unwrap();
+    let got = get_pv(&storage, "retained").await.unwrap();
+    assert!(got.metadata.finalizers.unwrap_or_default().is_empty());
+    assert!(deleted(&rec).is_empty());
+}
+
+fn with_secret_annotations(mut pv: PersistentVolume) -> PersistentVolume {
+    let ann = pv.metadata.annotations.as_mut().unwrap();
+    ann.insert(
+        "volume.kubernetes.io/provisioner-deletion-secret-name".into(),
+        "creds".into(),
+    );
+    ann.insert(
+        "volume.kubernetes.io/provisioner-deletion-secret-namespace".into(),
+        "sec-ns".into(),
+    );
+    pv
+}
+
+#[tokio::test]
+async fn deletion_secrets_come_from_the_provisioner_annotations() {
+    let (storage, p, rec, _d) = env(Fake::new(), storage_class(None)).await;
+    let secret =
+        Secret::new("creds", "sec-ns").with_data([("user".to_string(), b"admin".to_vec())].into());
+    storage
+        .create(&build_key("secrets", Some("sec-ns"), "creds"), &secret)
+        .await
+        .unwrap();
+    let pv = with_secret_annotations(csi_pv(
+        "pv1",
+        PersistentVolumePhase::Released,
+        PersistentVolumeReclaimPolicy::Delete,
+    ));
+    put_pv(&storage, &pv).await;
+    p.sync_volume(&pv).await.unwrap();
+    let reqs = deleted(&rec);
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(
+        reqs[0].secrets.get("user").map(String::as_str),
+        Some("admin")
+    );
+}
+
+#[tokio::test]
+async fn a_missing_deletion_secret_does_not_block_deletion() {
+    // "Continue with deletion, as the secret may have already been deleted."
+    let (storage, p, rec, _d) = env(Fake::new(), storage_class(None)).await;
+    let pv = with_secret_annotations(csi_pv(
+        "pv1",
+        PersistentVolumePhase::Released,
+        PersistentVolumeReclaimPolicy::Delete,
+    ));
+    put_pv(&storage, &pv).await;
+    p.sync_volume(&pv).await.unwrap();
+    assert_eq!(deleted(&rec).len(), 1);
+    assert!(deleted(&rec)[0].secrets.is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_delete_volume_keeps_the_pv_and_warns() {
+    let mut fake = Fake::new();
+    fake.delete_code = Some(tonic::Code::Internal);
+    let (storage, p, _rec, _d) = env(fake, storage_class(None)).await;
+    let pv = csi_pv(
+        "pv1",
+        PersistentVolumePhase::Released,
+        PersistentVolumeReclaimPolicy::Delete,
+    );
+    put_pv(&storage, &pv).await;
+    p.sync_volume(&pv).await.unwrap_err();
+    let got = get_pv(&storage, "pv1")
+        .await
+        .expect("PV kept for the retry");
+    assert_eq!(got.metadata.finalizers, Some(vec![FINALIZER.to_string()]));
+    assert!(events(&storage)
+        .await
+        .iter()
+        .any(|e| e.reason == "VolumeFailedDelete"));
+}
+
+#[tokio::test]
+async fn an_attached_volume_postpones_deletion_without_failing_it() {
+    // `canDeleteVolume` (controller.go:1526): only when the driver can
+    // PUBLISH_UNPUBLISH_VOLUME (csi-provisioner.go:312).
+    let mut fake = Fake::new();
+    fake.extra_caps = vec![controller_service_capability::rpc::Type::PublishUnpublishVolume];
+    let (storage, p, rec, _d) = env(fake, storage_class(None)).await;
+    let va = rusternetes_common::resources::csi::VolumeAttachment {
+        type_meta: TypeMeta {
+            kind: "VolumeAttachment".into(),
+            api_version: "storage.k8s.io/v1".into(),
+        },
+        metadata: ObjectMeta::new("va1"),
+        spec: rusternetes_common::resources::csi::VolumeAttachmentSpec {
+            attacher: DRIVER.into(),
+            node_name: "node-1".into(),
+            source: rusternetes_common::resources::csi::VolumeAttachmentSource {
+                persistent_volume_name: Some("pv1".into()),
+                inline_volume_spec: None,
+            },
+        },
+        status: None,
+    };
+    storage
+        .create(&build_key("volumeattachments", None, "va1"), &va)
+        .await
+        .unwrap();
+    let pv = csi_pv(
+        "pv1",
+        PersistentVolumePhase::Released,
+        PersistentVolumeReclaimPolicy::Delete,
+    );
+    put_pv(&storage, &pv).await;
+    let err = p.sync_volume(&pv).await.unwrap_err();
+    assert!(
+        err.to_string().contains("still attached to node node-1"),
+        "{err}"
+    );
+    assert!(deleted(&rec).is_empty());
+    assert!(get_pv(&storage, "pv1").await.is_some());
+    let evs = events(&storage).await;
+    assert!(evs.iter().any(|e| e.reason == "VolumeDelete"));
+    assert!(!evs.iter().any(|e| e.reason == "VolumeFailedDelete"));
+}
+
+// ---- infeasible slow retry (#2965) ---------------------------------------------
+//
+// lib `delayProvisioningIfRecentlyInfeasible` (:1545), `markForSlowRetry`
+// (:1566), `slowset.SlowSet` (csi-lib-utils).
+
+#[tokio::test]
+async fn an_infeasible_claim_is_not_retried_until_the_slow_set_expires() {
+    let mut fake = Fake::new();
+    fake.create_code = Some(tonic::Code::InvalidArgument);
+    let (storage, p, rec, _d) = env(fake, storage_class(None)).await;
+    let c = claim(&[(ANN, DRIVER)]);
+    p.sync_claim(&c).await.unwrap_err();
+    assert_eq!(rec.lock().unwrap().create_volume.len(), 1);
+
+    // Second sync: delayed, the driver is not asked again.
+    let err = p.sync_claim(&c).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("skipping volume provisioning for pvc"),
+        "{err}"
+    );
+    assert_eq!(rec.lock().unwrap().create_volume.len(), 1);
+
+    // A replaced StorageClass (new UID) clears the delay (:1555-1558).
+    let mut sc = storage_class(None);
+    sc.metadata.uid = "new-class-uid".into();
+    storage
+        .update(&build_key("storageclasses", None, "fast"), &sc)
+        .await
+        .unwrap();
+    p.sync_claim(&c).await.unwrap_err();
+    assert_eq!(rec.lock().unwrap().create_volume.len(), 2);
+}
+
+#[tokio::test]
+async fn the_slow_set_expires_after_the_retry_interval_max() {
+    let mut fake = Fake::new();
+    fake.create_code = Some(tonic::Code::InvalidArgument);
+    let (_storage, p, rec, _d) = env(fake, storage_class(None)).await;
+    let p = p.with_retry_interval_max(std::time::Duration::from_millis(150));
+    let c = claim(&[(ANN, DRIVER)]);
+    p.sync_claim(&c).await.unwrap_err();
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    p.sync_claim(&c).await.unwrap_err();
+    assert_eq!(rec.lock().unwrap().create_volume.len(), 2);
+}
+
+#[tokio::test]
+async fn a_non_infeasible_failure_is_not_slow_retried() {
+    let mut fake = Fake::new();
+    fake.create_code = Some(tonic::Code::Internal);
+    let (_storage, p, rec, _d) = env(fake, storage_class(None)).await;
+    let c = claim(&[(ANN, DRIVER)]);
+    p.sync_claim(&c).await.unwrap_err();
+    p.sync_claim(&c).await.unwrap_err();
+    assert_eq!(rec.lock().unwrap().create_volume.len(), 2);
 }

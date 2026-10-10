@@ -292,6 +292,9 @@ pub async fn list_validating_admission_policies(
     }
 
     let prefix = build_prefix("validatingadmissionpolicies", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut policies = state
         .storage
         .list::<ValidatingAdmissionPolicy>(&prefix)
@@ -438,6 +441,9 @@ pub async fn list_validating_admission_policy_bindings(
     }
 
     let prefix = build_prefix("validatingadmissionpolicybindings", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut bindings = state
         .storage
         .list::<ValidatingAdmissionPolicyBinding>(&prefix)

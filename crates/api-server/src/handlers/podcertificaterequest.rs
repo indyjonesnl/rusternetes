@@ -242,6 +242,9 @@ async fn list_in(
         Decision::Deny(reason) => return Err(Error::Forbidden(reason)),
     }
 
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let prefix = build_prefix("podcertificaterequests", namespace.as_deref());
     let mut items = state.storage.list::<PodCertificateRequest>(&prefix).await?;
 

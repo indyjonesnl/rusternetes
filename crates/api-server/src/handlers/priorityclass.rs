@@ -178,6 +178,9 @@ pub async fn list(
     }
 
     let prefix = build_prefix("priorityclasses", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut priority_classes = state.storage.list::<PriorityClass>(&prefix).await?;
 
     // Apply field and label selector filtering

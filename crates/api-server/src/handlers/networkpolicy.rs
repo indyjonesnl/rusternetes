@@ -212,6 +212,9 @@ pub async fn list(
     }
 
     let prefix = build_prefix("networkpolicies", Some(&namespace));
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut network_policies: Vec<NetworkPolicy> = state.storage.list(&prefix).await?;
 
     // Apply field and label selector filtering
@@ -279,6 +282,9 @@ pub async fn list_all_networkpolicies(
     }
 
     let prefix = build_prefix("networkpolicies", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut network_policies = state.storage.list::<NetworkPolicy>(&prefix).await?;
 
     // Apply field and label selector filtering

@@ -207,6 +207,9 @@ pub async fn list(
     }
 
     let prefix = build_prefix("limitranges", Some(&namespace));
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut limit_ranges = state.storage.list::<LimitRange>(&prefix).await?;
 
     // Apply field and label selector filtering
@@ -248,6 +251,9 @@ pub async fn list_all(
     }
 
     let prefix = build_prefix("limitranges", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut limit_ranges = state.storage.list::<LimitRange>(&prefix).await?;
 
     // Apply field and label selector filtering

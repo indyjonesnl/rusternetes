@@ -1943,7 +1943,41 @@ impl<S: Storage + 'static> JobController<S> {
                     let failed_count = all_failed_index_set.len() as i32;
                     (completed_count + failed_count) >= completions
                 }));
-        let is_failed = early_failed || index_failed;
+
+        // `pastActiveDeadline` (job_controller.go:1595-1602) is one more failure
+        // scenario feeding the single finishedCondition (:968-970): evaluated
+        // only when nothing else finished the Job (:963), false while
+        // suspended or before startTime, and `duration >= allowedDuration`.
+        let deadline_exceeded = !early_failed
+            && persisted_success.is_none()
+            && !job_suspended
+            && job
+                .spec
+                .active_deadline_seconds
+                .zip(job.status.as_ref().and_then(|s| s.start_time))
+                .is_some_and(|(deadline, start)| {
+                    chrono::Utc::now().signed_duration_since(start)
+                        >= chrono::Duration::seconds(deadline)
+                });
+        let is_failed = early_failed || deadline_exceeded || index_failed;
+
+        // `job_controller.go:970-973`: when no scenario finished the Job and
+        // the deadline has not passed, `jm.queue.AddAfter(key,
+        // activeDeadlineSeconds - Since(startTime))` so the deadline fires on
+        // time. Goes through `request_requeue` (clamped to SyncJobBatchPeriod).
+        if !early_failed && !deadline_exceeded && persisted_success.is_none() && !job_suspended {
+            if let Some((deadline, start)) = job
+                .spec
+                .active_deadline_seconds
+                .zip(job.status.as_ref().and_then(|s| s.start_time))
+            {
+                let remaining = chrono::Duration::seconds(deadline)
+                    - chrono::Utc::now().signed_duration_since(start);
+                if let Ok(remaining) = remaining.to_std() {
+                    self.request_requeue(namespace, name, remaining);
+                }
+            }
+        }
 
         // Check if Job is complete
         // For indexed jobs, check number of distinct succeeded indexes
@@ -1953,93 +1987,6 @@ impl<S: Storage + 'static> JobController<S> {
             } else {
                 succeeded >= completions
             };
-
-        // Handle activeDeadlineSeconds — fail the job if it has been active too long
-        // (`pastActiveDeadline` is false while suspended, :1596, and is evaluated only when no failure and no
-        // pre-existing SuccessCriteriaMet decided the Job first, :970-973.)
-        if let Some(deadline) = job
-            .spec
-            .active_deadline_seconds
-            .filter(|_| !early_failed && persisted_success.is_none() && !job_suspended)
-        {
-            if let Some(start) = job.status.as_ref().and_then(|s| s.start_time) {
-                let elapsed = chrono::Utc::now()
-                    .signed_duration_since(start)
-                    .num_seconds();
-                if elapsed > deadline {
-                    warn!(
-                        "Job {}/{} exceeded activeDeadlineSeconds ({} > {})",
-                        namespace, name, elapsed, deadline
-                    );
-                    // `deleteActivePods` + the finish gate
-                    // (job_controller.go:1002-1007).
-                    let (may_finish, deleted_ready, deleted, derr) = self
-                        .delete_active_pods_for_finish(
-                            &exp_key,
-                            namespace,
-                            &job_pods,
-                            satisfied_expectations,
-                        )
-                        .await;
-                    // `enactJobFinished` (job_controller.go:1520-1524): hold the
-                    // terminal Failed condition back while terminating pods
-                    // remain; only FailureTarget is published meanwhile.
-                    let terminating = count_unfinished_pods(&job_pods);
-                    let existing_conditions =
-                        job.status.as_ref().and_then(|s| s.conditions.clone());
-                    let conditions = if may_finish {
-                        Some(enact_job_finished(
-                            failed_job_conditions(
-                                "DeadlineExceeded".to_string(),
-                                format!(
-                                    "Job was active longer than specified deadline of {} seconds",
-                                    deadline
-                                ),
-                            ),
-                            terminating,
-                        ))
-                    } else {
-                        existing_conditions
-                    };
-                    job.status = Some(JobStatus {
-                        active: Some(active - deleted),
-                        succeeded: status_succeeded,
-                        failed: status_failed,
-                        conditions,
-                        start_time: job.status.as_ref().and_then(|s| s.start_time),
-                        // completionTime is valid ONLY on a Complete job
-                        // (validation.go:505-513: "cannot set completionTime
-                        // when there is no Complete=True condition").
-                        completion_time: None,
-                        ready: Some(ready - deleted_ready),
-                        terminating: if terminating > 0 {
-                            Some(terminating)
-                        } else {
-                            None
-                        },
-                        completed_indexes: completed_indexes.clone(),
-                        failed_indexes: None,
-                        uncounted_terminated_pods: uncounted_status.clone(),
-                        observed_generation: job.metadata.generation,
-                    });
-                    let key = format!("/registry/jobs/{}/{}", namespace, name);
-                    self.flush_status_and_release(
-                        &key,
-                        &job_tracking_key,
-                        namespace,
-                        job,
-                        &pods_to_release,
-                        &job_pods,
-                        backoff_update.as_ref(),
-                    )
-                    .await?;
-                    return match derr {
-                        Some(e) => Err(e),
-                        None => Ok(()),
-                    };
-                }
-            }
-        }
 
         // Preserve the existing start_time if the job was already started
         let existing_start_time = job.status.as_ref().and_then(|s| s.start_time);
@@ -2252,6 +2199,14 @@ impl<S: Storage + 'static> JobController<S> {
             // Determine failure reason
             let (reason, message) = if let Some((r, m)) = persisted_failure.clone() {
                 (r, m)
+            } else if deadline_exceeded {
+                (
+                    "DeadlineExceeded".to_string(),
+                    format!(
+                        "Job was active longer than specified deadline of {} seconds",
+                        job.spec.active_deadline_seconds.unwrap_or_default()
+                    ),
+                )
             } else if pod_failure_policy_triggered {
                 ("PodFailurePolicy".to_string(), pod_failure_message.clone())
             } else if max_failed_indexes_exceeded {
@@ -7665,5 +7620,103 @@ mod tests {
             "{:?}",
             got.status
         );
+    }
+
+    // ---- #2841: one finishedCondition path ----
+
+    /// `pastActiveDeadline` (job_controller.go:1601): `duration >= allowedDuration`.
+    /// A Job active for exactly the deadline has exceeded it.
+    #[tokio::test]
+    async fn deadline_is_exceeded_at_exactly_the_deadline() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job("dlb", "default", 1, 1);
+        job.spec.active_deadline_seconds = Some(10);
+        job.status = Some(JobStatus {
+            start_time: Some(chrono::Utc::now() - chrono::Duration::seconds(10)),
+            ..Default::default()
+        });
+        let key = "/registry/jobs/default/dlb";
+        storage.create(key, &job).await.unwrap();
+        let c = JobController::new(storage.clone());
+        reconcile_settled(&c, &storage, key).await;
+        let got: Job = storage.get(key).await.unwrap();
+        let failed = cond_of(&got, "Failed").expect("deadline reached => Failed");
+        assert_eq!(failed.reason.as_deref(), Some("DeadlineExceeded"));
+    }
+
+    /// `syncJob` (job_controller.go:970-973): while a Job has not yet passed
+    /// `activeDeadlineSeconds` (and is not suspended), the sync is re-enqueued
+    /// `AddAfter(key, deadline - Since(startTime))` so the deadline fires on
+    /// time rather than at the next unrelated event.
+    #[tokio::test]
+    async fn unexpired_deadline_requeues_for_the_remaining_time() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job("dlr", "default", 1, 1);
+        job.spec.active_deadline_seconds = Some(100);
+        job.status = Some(JobStatus {
+            start_time: Some(chrono::Utc::now() - chrono::Duration::seconds(40)),
+            ..Default::default()
+        });
+        storage
+            .create("/registry/jobs/default/dlr", &job)
+            .await
+            .unwrap();
+        let c = JobController::new(storage.clone());
+        c.reconcile(&mut job).await.unwrap();
+        let d = c
+            .take_requeue_delay("default", "dlr")
+            .expect("an unexpired deadline must request a delayed requeue");
+        assert!(
+            d > Duration::from_secs(55) && d <= Duration::from_secs(60),
+            "{d:?}"
+        );
+    }
+
+    /// Suspended Jobs never requeue for the deadline (:971 `!jobSuspended`).
+    #[tokio::test]
+    async fn suspended_job_does_not_requeue_for_deadline() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job("dls", "default", 1, 1);
+        job.spec.active_deadline_seconds = Some(100);
+        job.spec.suspend = Some(true);
+        job.status = Some(JobStatus {
+            start_time: Some(chrono::Utc::now() - chrono::Duration::seconds(40)),
+            ..Default::default()
+        });
+        storage
+            .create("/registry/jobs/default/dls", &job)
+            .await
+            .unwrap();
+        let c = JobController::new(storage.clone());
+        c.reconcile(&mut job).await.unwrap();
+        assert!(c.take_requeue_delay("default", "dls").is_none());
+    }
+
+    /// The deadline is a failure scenario evaluated before completions
+    /// (job_controller.go:968-970, `complete` at :1035 only when
+    /// finishedCondition is nil): a Job past its deadline fails even if every
+    /// completion has already succeeded.
+    #[tokio::test]
+    async fn deadline_outranks_completions() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut job = make_job("dlc", "default", 1, 1);
+        job.spec.active_deadline_seconds = Some(10);
+        job.status = Some(JobStatus {
+            start_time: Some(chrono::Utc::now() - chrono::Duration::seconds(60)),
+            ..Default::default()
+        });
+        let key = "/registry/jobs/default/dlc";
+        storage.create(key, &job).await.unwrap();
+        let p = make_pod("s", "default", Phase::Succeeded, "dlc", "job-uid-1");
+        storage
+            .create("/registry/pods/default/s", &p)
+            .await
+            .unwrap();
+        let c = JobController::new(storage.clone());
+        reconcile_settled(&c, &storage, key).await;
+        let got: Job = storage.get(key).await.unwrap();
+        assert!(cond_of(&got, "Complete").is_none(), "{:?}", got.status);
+        let failed = cond_of(&got, "Failed").expect("deadline outranks completions");
+        assert_eq!(failed.reason.as_deref(), Some("DeadlineExceeded"));
     }
 }

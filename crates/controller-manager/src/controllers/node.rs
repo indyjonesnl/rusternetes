@@ -1,3 +1,4 @@
+use crate::controllers::node_lifecycle_metrics;
 use crate::controllers::node_lifecycle_queue::{
     RateLimitedTimedQueue, RateLimiter, TimedValue, EVICTION_RATE_LIMITER_BURST,
     NODE_EVICTION_PERIOD,
@@ -528,6 +529,8 @@ impl<S: Storage + 'static> NodeController<S> {
         let mut ev = self.evictor.lock().await;
         if !ev.zone_states.contains_key(&zone) {
             ev.zone_states.insert(zone.clone(), ZoneState::Initial);
+            // Init the metric for the new zone (:1233-1235).
+            node_lifecycle_metrics::init_evictions(&zone);
             ev.zone_no_execute_tainter.insert(
                 zone,
                 Arc::new(RateLimitedTimedQueue::new(RateLimiter::token_bucket(
@@ -752,6 +755,104 @@ impl<S: Storage + 'static> NodeController<S> {
         Ok(())
     }
 
+    /// `doNoScheduleTaintingPass` (node_lifecycle_controller.go:540-589):
+    /// derive the NoSchedule taints the node's conditions call for
+    /// (`nodeConditionToTaintKeyStatusMap`, :87-104) plus `unschedulable`,
+    /// diff them (`taintutils.TaintSetDiff`) against the NoSchedule taints
+    /// the controller owns (`taintKeyToNodeConditionMap`, :106-113; a user's
+    /// own NoSchedule taints are left alone) and apply the difference via
+    /// `SwapNodeControllerTaint`. This is what clears the
+    /// `not-ready:NoSchedule` taint the api-server's NodeTaint admission
+    /// stamps at registration once the node is Ready (#3003).
+    async fn do_no_schedule_tainting_pass(&self, node: &Node) -> Result<()> {
+        // nodeConditionToTaintKeyStatusMap
+        fn condition_taint(cond_type: &str, status: &str) -> Option<&'static str> {
+            match (cond_type, status) {
+                ("Ready", "False") => Some("node.kubernetes.io/not-ready"),
+                ("Ready", "Unknown") => Some("node.kubernetes.io/unreachable"),
+                ("MemoryPressure", "True") => Some("node.kubernetes.io/memory-pressure"),
+                ("DiskPressure", "True") => Some("node.kubernetes.io/disk-pressure"),
+                ("NetworkUnavailable", "True") => Some("node.kubernetes.io/network-unavailable"),
+                ("PIDPressure", "True") => Some("node.kubernetes.io/pid-pressure"),
+                _ => None,
+            }
+        }
+        // taintKeyToNodeConditionMap + the unschedulable key.
+        const OWNED: [&str; 7] = [
+            "node.kubernetes.io/not-ready",
+            "node.kubernetes.io/unreachable",
+            "node.kubernetes.io/network-unavailable",
+            "node.kubernetes.io/memory-pressure",
+            "node.kubernetes.io/disk-pressure",
+            "node.kubernetes.io/pid-pressure",
+            "node.kubernetes.io/unschedulable",
+        ];
+
+        let mut want: Vec<&'static str> = node
+            .status
+            .as_ref()
+            .and_then(|s| s.conditions.as_ref())
+            .map(|cs| {
+                cs.iter()
+                    .filter_map(|c| condition_taint(&c.condition_type, &c.status))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if node.spec.as_ref().and_then(|s| s.unschedulable) == Some(true) {
+            want.push("node.kubernetes.io/unschedulable");
+        }
+
+        let have: Vec<&str> = node
+            .spec
+            .as_ref()
+            .and_then(|s| s.taints.as_ref())
+            .map(|ts| {
+                ts.iter()
+                    .filter(|t| t.effect == "NoSchedule" && OWNED.contains(&t.key.as_str()))
+                    .map(|t| t.key.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let to_add: Vec<&str> = want.iter().copied().filter(|k| !have.contains(k)).collect();
+        let to_del: Vec<&str> = have.iter().copied().filter(|k| !want.contains(k)).collect();
+        if to_add.is_empty() && to_del.is_empty() {
+            return Ok(());
+        }
+
+        // SwapNodeControllerTaint: stamp timeAdded, add, then delete.
+        let node_key = build_key("nodes", None, &node.metadata.name);
+        let mut stored: Node = self.storage.get(&node_key).await?;
+        let spec = stored
+            .spec
+            .get_or_insert(rusternetes_common::resources::NodeSpec {
+                pod_cidr: None,
+                pod_cidrs: None,
+                provider_id: None,
+                unschedulable: None,
+                taints: None,
+            });
+        let taints = spec.taints.get_or_insert_with(Vec::new);
+        for key in &to_add {
+            if !taints
+                .iter()
+                .any(|t| t.key == *key && t.effect == "NoSchedule")
+            {
+                taints.push(Taint {
+                    key: (*key).to_string(),
+                    value: None,
+                    effect: "NoSchedule".to_string(),
+                    time_added: Some(Utc::now()),
+                });
+            }
+        }
+        taints.retain(|t| !(t.effect == "NoSchedule" && to_del.contains(&t.key.as_str())));
+        if taints.is_empty() {
+            spec.taints = None;
+        }
+        self.storage.update(&node_key, &stored).await?;
+        Ok(())
+    }
+
     /// `SwapNodeControllerTaint`
     /// (pkg/controller/util/node/controller_utils.go:194-226): stamp
     /// `timeAdded`, add-or-update the new taint (`taintutils.AddOrUpdateTaint`
@@ -874,6 +975,10 @@ impl<S: Storage + 'static> NodeController<S> {
                             opposite,
                         )
                         .await;
+                    if ok {
+                        // Count the number of evictions (:654-658).
+                        node_lifecycle_metrics::inc_evictions(&get_zone_key(&node));
+                    }
                     (ok, std::time::Duration::ZERO)
                 })
                 .await;
@@ -898,7 +1003,8 @@ impl<S: Storage + 'static> NodeController<S> {
         let mut new_zone_states: HashMap<String, ZoneState> = HashMap::new();
         let mut all_are_fully_disrupted = true;
         for (k, v) in &zone_to_conditions {
-            let (_unhealthy, new_state) = self.eviction.compute_zone_state(v);
+            let (unhealthy, new_state) = self.eviction.compute_zone_state(v);
+            node_lifecycle_metrics::set_zone_stats(k, v.len(), unhealthy);
             if new_state != ZoneState::FullDisruption {
                 all_are_fully_disrupted = false;
             }
@@ -906,14 +1012,28 @@ impl<S: Storage + 'static> NodeController<S> {
             zone_states.entry(k.clone()).or_insert(ZoneState::Initial);
         }
 
+        // DELIBERATE DEVIATION from node_lifecycle_controller.go:1015-1028.
+        // Upstream drops emptied zones and checks `v != stateFullDisruption`
+        // in ONE loop over a Go map, `break`ing at the first non-full zone.
+        // Go's map order is random, so an emptied zone visited after the
+        // break is neither cleared nor deleted; later `newZoneStates[k]`
+        // reads then yield Go's zero value silently, but an indexed Rust
+        // `HashMap` panics (flaky `emptied_zone_metrics_reset`). Drop the
+        // emptied zones in a separate pass first so the outcome is order
+        // independent.
+        let emptied: Vec<String> = zone_states
+            .keys()
+            .filter(|k| !zone_to_conditions.contains_key(*k))
+            .cloned()
+            .collect();
+        for k in emptied {
+            node_lifecycle_metrics::clear_zone(&k);
+            zone_states.remove(&k);
+        }
+
         let mut all_was_fully_disrupted = true;
-        let keys: Vec<String> = zone_states.keys().cloned().collect();
-        for k in keys {
-            if !zone_to_conditions.contains_key(&k) {
-                zone_states.remove(&k);
-                continue;
-            }
-            if zone_states[&k] != ZoneState::FullDisruption {
+        for v in zone_states.values() {
+            if *v != ZoneState::FullDisruption {
                 all_was_fully_disrupted = false;
                 break;
             }
@@ -1038,6 +1158,11 @@ impl<S: Storage + 'static> NodeController<S> {
     /// node_lifecycle_controller.go:516): shutdown taint, Lease, allocatable.
     async fn process_node(&self, node: &Node) -> Result<()> {
         let node_name = &node.metadata.name;
+        // `doNoScheduleTaintingPass` runs ahead of everything else in the
+        // worker and is not subject to the startup grace period.
+        if let Err(e) = self.do_no_schedule_tainting_pass(node).await {
+            error!("Failed to taint NoSchedule on node {}: {}", node_name, e);
+        }
         if self.in_startup_grace(node_name) {
             return Ok(());
         }
@@ -2330,5 +2455,143 @@ mod tests {
                 .collect::<Vec<_>>(),
             [ZoneState::Normal]
         );
+    }
+
+    fn metric_zone(zone: &str) -> String {
+        get_zone_key(&znode("x", zone, "True", 0))
+    }
+
+    /// `handleDisruption` (:1001-1004) sets zoneSize / zoneHealth /
+    /// unhealthyNodes per zone; `addPodEvictorForNewZone` (:1235) seeds
+    /// `evictions_total` at 0. Upstream has no test for these series; the
+    /// expected values follow its formulas verbatim.
+    #[tokio::test]
+    async fn monitor_publishes_zone_metrics() {
+        use crate::controllers::node_lifecycle_metrics as m;
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::with_eviction_config(storage.clone(), fast_config());
+        put(&storage, &c, &znode("m0", "metrics-zone-a", "True", 0)).await;
+        put(&storage, &c, &znode("m1", "metrics-zone-a", "True", 0)).await;
+        put(&storage, &c, &znode("m2", "metrics-zone-a", "True", 0)).await;
+        put(
+            &storage,
+            &c,
+            &znode("m3", "metrics-zone-a", "False", SECS_STALE),
+        )
+        .await;
+        c.monitor_node_health().await.unwrap();
+
+        let z = metric_zone("metrics-zone-a");
+        assert_eq!(m::zone_size(&z), Some(4.0));
+        assert_eq!(m::unhealthy_nodes(&z), Some(1.0));
+        assert_eq!(m::zone_health(&z), Some(75.0));
+        assert_eq!(m::evictions_total(&z), 0);
+        assert!(m::gather().contains("node_collector_evictions_total"));
+    }
+
+    /// `doNoExecuteTaintingPass` (:655-658): a successful taint swap counts
+    /// one eviction for the node's zone.
+    #[tokio::test]
+    async fn tainting_pass_counts_evictions() {
+        use crate::controllers::node_lifecycle_metrics as m;
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::with_eviction_config(storage.clone(), fast_config());
+        put(
+            &storage,
+            &c,
+            &znode("e0", "metrics-zone-b", "Unknown", SECS_STALE),
+        )
+        .await;
+        put(&storage, &c, &znode("e1", "metrics-zone-b", "True", 0)).await;
+        c.monitor_node_health().await.unwrap();
+        c.do_no_execute_tainting_pass().await;
+        assert_eq!(m::evictions_total(&metric_zone("metrics-zone-b")), 1);
+    }
+
+    /// `handleDisruption` (:1016-1021): a zone with no nodes left reads
+    /// size 0, health 100, unhealthy 0.
+    #[tokio::test]
+    async fn emptied_zone_metrics_reset() {
+        use crate::controllers::node_lifecycle_metrics as m;
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::with_eviction_config(storage.clone(), fast_config());
+        put(
+            &storage,
+            &c,
+            &znode("r0", "metrics-zone-c", "False", SECS_STALE),
+        )
+        .await;
+        put(&storage, &c, &znode("r1", "metrics-zone-c", "True", 0)).await;
+        put(&storage, &c, &znode("r2", "metrics-zone-d", "True", 0)).await;
+        c.monitor_node_health().await.unwrap();
+        let z = metric_zone("metrics-zone-c");
+        assert_eq!(m::zone_size(&z), Some(2.0));
+
+        storage
+            .delete(&build_key("nodes", None, "r0"))
+            .await
+            .unwrap();
+        storage
+            .delete(&build_key("nodes", None, "r1"))
+            .await
+            .unwrap();
+        c.monitor_node_health().await.unwrap();
+        assert_eq!(m::zone_size(&z), Some(0.0));
+        assert_eq!(m::zone_health(&z), Some(100.0));
+        assert_eq!(m::unhealthy_nodes(&z), Some(0.0));
+    }
+
+    fn noschedule(key: &str) -> (String, String) {
+        (key.to_string(), "NoSchedule".to_string())
+    }
+
+    /// TestNoScheduleTaintingPass shape (node_lifecycle_controller_test.go
+    /// TestTaintNodeByCondition): a real api-server's NodeTaint admission
+    /// stamps `not-ready:NoSchedule` at registration; once the node reports
+    /// Ready=True the per-node pass must remove it (#3003).
+    #[tokio::test]
+    async fn no_schedule_not_ready_taint_cleared_when_ready() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::with_eviction_config(storage.clone(), fast_config());
+        let mut n = znode("node0", "zone1", "True", 0);
+        n.spec = serde_json::from_value(serde_json::json!({
+            "taints": [
+                {"key": "node.kubernetes.io/not-ready", "effect": "NoSchedule"},
+                {"key": "example.com/user", "effect": "NoSchedule"}
+            ]
+        }))
+        .unwrap();
+        put(&storage, &c, &n).await;
+        c.reconcile_all().await.unwrap();
+        assert_eq!(
+            taint_keys(&storage, "node0").await,
+            [noschedule("example.com/user")]
+        );
+    }
+
+    /// Ready=False -> not-ready:NoSchedule; Ready=Unknown -> unreachable;
+    /// spec.unschedulable -> unschedulable; pressure condition True -> its taint.
+    #[tokio::test]
+    async fn no_schedule_taints_follow_conditions() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::with_eviction_config(storage.clone(), fast_config());
+        put(&storage, &c, &znode("ok", "zone1", "True", 0)).await;
+        put(&storage, &c, &znode("nr", "zone1", "False", 0)).await;
+        let mut cordoned = znode("cordon", "zone1", "True", 0);
+        cordoned.spec = serde_json::from_value(serde_json::json!({"unschedulable": true})).unwrap();
+        put(&storage, &c, &cordoned).await;
+        for n in ["nr", "cordon"] {
+            let node: Node = storage.get(&build_key("nodes", None, n)).await.unwrap();
+            c.process_node(&node).await.unwrap();
+        }
+        assert_eq!(
+            taint_keys(&storage, "nr").await,
+            [noschedule("node.kubernetes.io/not-ready")]
+        );
+        assert_eq!(
+            taint_keys(&storage, "cordon").await,
+            [noschedule("node.kubernetes.io/unschedulable")]
+        );
+        assert!(taint_keys(&storage, "ok").await.is_empty());
     }
 }

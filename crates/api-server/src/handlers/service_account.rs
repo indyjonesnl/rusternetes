@@ -231,6 +231,9 @@ pub async fn list(
     }
 
     let prefix = build_prefix("serviceaccounts", Some(&namespace));
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut service_accounts: Vec<ServiceAccount> = state.storage.list(&prefix).await?;
 
     // Apply field and label selector filtering
@@ -294,6 +297,9 @@ pub async fn list_all_serviceaccounts(
     }
 
     let prefix = build_prefix("serviceaccounts", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut service_accounts = state.storage.list::<ServiceAccount>(&prefix).await?;
 
     // Apply field and label selector filtering

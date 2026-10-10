@@ -108,6 +108,9 @@ pub async fn list_csinodes(
     }
 
     let prefix = build_prefix("csinodes", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut nodes = state.storage.list::<CSINode>(&prefix).await?;
 
     // Apply field and label selector filtering

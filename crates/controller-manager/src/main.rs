@@ -80,6 +80,17 @@ struct Args {
     #[arg(long)]
     csi_controller_publish_readonly: bool,
 
+    /// `--prevent-volume-mode-conversion` of external-provisioner
+    /// (csi-provisioner.go:112, default true).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    csi_prevent_volume_mode_conversion: bool,
+
+    /// `--retry-interval-max` of external-provisioner
+    /// (csi-provisioner.go:84, default 5m): the retry backoff cap and how long
+    /// an infeasible claim is delayed.
+    #[arg(long, default_value = "5m", value_parser = parse_clean_up_period)]
+    csi_retry_interval_max: std::time::Duration,
+
     /// Storage backend: "etcd" or "sqlite"
     #[arg(long, default_value = "etcd")]
     storage_backend: String,
@@ -756,7 +767,9 @@ async fn main() -> Result<()> {
             )
             .with_default_fs_type(args.csi_default_fstype.clone())
             .with_extra_create_metadata(args.csi_extra_create_metadata)
-            .with_controller_publish_read_only(args.csi_controller_publish_readonly),
+            .with_controller_publish_read_only(args.csi_controller_publish_readonly)
+            .with_prevent_volume_mode_conversion(args.csi_prevent_volume_mode_conversion)
+            .with_retry_interval_max(args.csi_retry_interval_max),
         );
         spawn_controller!("CSI provisioner", leader_elector, {
             let controller = provisioner.clone();

@@ -199,6 +199,9 @@ pub async fn list_runtimeclasses(
     }
 
     let prefix = build_prefix("runtimeclasses", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut runtime_classes: Vec<RuntimeClass> = state.storage.list(&prefix).await?;
 
     // Apply field and label selector filtering

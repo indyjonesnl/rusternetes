@@ -20,7 +20,8 @@ use rusternetes_common::{Error, Result};
 
 use super::admission::{Admission, CreateValidation, MutatingAdmission, UpdateValidation};
 use super::rest::{
-    authorize, check_name, dry_run_param, is_dry_run, respond_object, ApplyFn, RequestScope,
+    authorize, check_name, dry_run_param, is_dry_run, respond_object,
+    retry_without_managed_fields_if_too_large, ApplyFn, RequestScope,
 };
 use crate::fieldmanager::manager_or_user_agent;
 use crate::patch::{apply_patch, PatchType};
@@ -138,24 +139,6 @@ pub async fn patch_resource<T: Object>(
         dry_run,
     };
 
-    let patcher = Patcher {
-        manager: manager_or_user_agent(options.field_manager.as_deref()),
-        scope,
-        mechanism,
-        name,
-        namespace,
-        params,
-        content_type,
-        body,
-    };
-    let transformers: Vec<Box<dyn TransformFunc<T> + '_>> = vec![
-        Box::new(patcher),
-        Box::new(MutatingAdmission {
-            admission: &admission,
-            scope,
-        }),
-    ];
-    let obj_info = DefaultUpdatedObjectInfo::new(None, transformers);
     let create_validation = CreateValidation {
         admission: &admission,
         authorize_create: true,
@@ -163,18 +146,54 @@ pub async fn patch_resource<T: Object>(
     let update_validation = UpdateValidation {
         admission: &admission,
     };
-    let (out, created) = scope
-        .store
-        .update(
+    // patch.go:710-726: a write refused for its size is retried once with a
+    // trailing transformer that clears managedFields, except for an apply
+    // patch, whose managedFields are the point of the request.
+    let is_apply = matches!(mechanism, Mechanism::Apply { .. });
+    let (out, created) = retry_without_managed_fields_if_too_large(|strip| {
+        let strip = strip && !is_apply;
+        let (ctx, admission, mechanism, create_validation, update_validation) = (
             &ctx,
-            name,
-            &obj_info,
-            Some(&create_validation),
-            Some(&update_validation),
-            force_allow_create,
-            &generic::UpdateOptions { dry_run },
-        )
-        .await?;
+            &admission,
+            &mechanism,
+            &create_validation,
+            &update_validation,
+        );
+        let manager = manager_or_user_agent(options.field_manager.as_deref());
+        async move {
+            let patcher = Patcher {
+                manager,
+                scope,
+                mechanism,
+                name,
+                namespace,
+                params,
+                content_type,
+                body,
+            };
+            let mut transformers: Vec<Box<dyn TransformFunc<T> + '_>> = vec![
+                Box::new(patcher),
+                Box::new(MutatingAdmission { admission, scope }),
+            ];
+            if strip {
+                transformers.push(Box::new(ClearManagedFields));
+            }
+            let obj_info = DefaultUpdatedObjectInfo::new(None, transformers);
+            scope
+                .store
+                .update(
+                    ctx,
+                    name,
+                    &obj_info,
+                    Some(create_validation),
+                    Some(update_validation),
+                    force_allow_create,
+                    &generic::UpdateOptions { dry_run },
+                )
+                .await
+        }
+    })
+    .await?;
 
     let status = if created {
         StatusCode::CREATED
@@ -194,12 +213,30 @@ enum Mechanism<T> {
     },
 }
 
+/// The trailing transformer of the too-large retry (patch.go:715-722):
+/// `accessor.SetManagedFields(nil)`.
+struct ClearManagedFields;
+
+#[async_trait]
+impl<T: Object> TransformFunc<T> for ClearManagedFields {
+    async fn transform(
+        &self,
+        _ctx: &RequestContext,
+        new: Option<T>,
+        _old: Option<&T>,
+    ) -> Result<T> {
+        let mut obj = new.ok_or_else(|| Error::Internal("no object to update".to_string()))?;
+        obj.metadata_mut().managed_fields = None;
+        Ok(obj)
+    }
+}
+
 /// `patcher.applyPatch` (patch.go:581-621) as a `TransformFunc`.
 struct Patcher<'a, T: Object> {
     /// `managerOrUserAgent(options.FieldManager, userAgent)`.
     manager: String,
     scope: &'a RequestScope<T>,
-    mechanism: Mechanism<T>,
+    mechanism: &'a Mechanism<T>,
     name: &'a str,
     namespace: Option<&'a str>,
     params: &'a HashMap<String, String>,
@@ -349,7 +386,7 @@ impl<T: Object> Patcher<'_, T> {
 impl<T: Object> TransformFunc<T> for Patcher<'_, T> {
     async fn transform(&self, ctx: &RequestContext, _new: Option<T>, old: Option<&T>) -> Result<T> {
         let current = old.filter(|o| !o.metadata().uid.is_empty());
-        let mut obj = match (&self.mechanism, current) {
+        let mut obj = match (self.mechanism, current) {
             (Mechanism::Apply { apply, options }, current) => {
                 self.apply(ctx, *apply, options, current)?
             }

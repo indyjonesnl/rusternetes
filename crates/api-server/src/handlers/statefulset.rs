@@ -378,6 +378,9 @@ pub async fn list(
     }
 
     let prefix = build_prefix("statefulsets", Some(&namespace));
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut statefulsets: Vec<StatefulSet> = state.storage.list(&prefix).await?;
 
     // Apply field and label selector filtering
@@ -442,6 +445,9 @@ pub async fn list_all_statefulsets(
     }
 
     let prefix = build_prefix("statefulsets", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut statefulsets = state.storage.list::<StatefulSet>(&prefix).await?;
 
     // Apply field and label selector filtering

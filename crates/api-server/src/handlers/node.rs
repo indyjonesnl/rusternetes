@@ -285,6 +285,9 @@ pub async fn list(
     }
 
     let prefix = build_prefix("nodes", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut nodes: Vec<Node> = state.storage.list(&prefix).await?;
 
     // Apply field and label selector filtering

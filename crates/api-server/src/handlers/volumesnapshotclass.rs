@@ -176,6 +176,9 @@ pub async fn list_volumesnapshotclasses(
     }
 
     let prefix = build_prefix("volumesnapshotclasses", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut vscs = state.storage.list::<VolumeSnapshotClass>(&prefix).await?;
 
     // Apply field and label selector filtering

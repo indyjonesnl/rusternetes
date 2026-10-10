@@ -176,6 +176,9 @@ pub async fn list_storageclasses(
     }
 
     let prefix = build_prefix("storageclasses", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut scs = state.storage.list::<StorageClass>(&prefix).await?;
 
     // Apply field and label selector filtering

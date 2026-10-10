@@ -276,6 +276,9 @@ pub async fn list(
     }
 
     let prefix = build_prefix("ingresses", Some(&namespace));
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut ingresses: Vec<Ingress> = state.storage.list(&prefix).await?;
 
     // Apply field and label selector filtering
@@ -339,6 +342,9 @@ pub async fn list_all_ingresses(
     }
 
     let prefix = build_prefix("ingresses", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut ingresses = state.storage.list::<Ingress>(&prefix).await?;
 
     // Apply field and label selector filtering

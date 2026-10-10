@@ -333,7 +333,7 @@ pub fn validate_custom_resource_definition_spec(
     spec: &CustomResourceDefinitionSpec,
     fld_path: &Path,
 ) -> ErrorList {
-    validate_custom_resource_definition_spec_opts(spec, true, fld_path)
+    validate_custom_resource_definition_spec_opts(spec, true, true, fld_path)
 }
 
 /// [`validate_custom_resource_definition_spec`] with
@@ -341,9 +341,11 @@ pub fn validate_custom_resource_definition_spec(
 fn validate_custom_resource_definition_spec_opts(
     spec: &CustomResourceDefinitionSpec,
     allow_invalid_ca_bundle: bool,
+    require_structural_schema: bool,
     fld_path: &Path,
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
+    let mut require_structural_schema = require_structural_schema;
 
     // group (`:356-362`).
     let group_path = fld_path.child("group");
@@ -377,6 +379,27 @@ fn validate_custom_resource_definition_spec_opts(
         ResourceScope::Cluster | ResourceScope::Namespaced => {}
     }
 
+    // `validation.go:366-368`: enabling pruning requires structural schemas.
+    // v1 carries `preserveUnknownFields` as a plain bool, so absent is false.
+    if spec.preserve_unknown_fields != Some(true) {
+        require_structural_schema = true;
+    }
+    // `validation.go:391-396` (`allowDefaults` is true for every caller).
+    if spec_has_defaults(spec) {
+        require_structural_schema = true;
+        if spec.preserve_unknown_fields == Some(true) {
+            errs.push(Error::invalid(
+                &fld_path.child("preserveUnknownFields"),
+                true,
+                "must be false in order to use defaults in the schema",
+            ));
+        }
+    }
+    // `validation.go:397-399`.
+    if spec_has_kubernetes_extensions(spec) {
+        require_structural_schema = true;
+    }
+
     // versions (`:398-414`).
     let versions_path = fld_path.child("versions");
     let mut storage_flag_count = 0usize;
@@ -396,6 +419,14 @@ fn validate_custom_resource_definition_spec_opts(
                 &vp.child("name"),
                 version.name.clone(),
                 msgs.join(","),
+            ));
+        }
+
+        if let Some(schema) = &version.schema {
+            errs.extend(validate_custom_resource_definition_validation(
+                &schema.open_apiv3_schema,
+                require_structural_schema,
+                &vp.child("schema"),
             ));
         }
 
@@ -444,6 +475,150 @@ fn validate_custom_resource_definition_spec_opts(
     ));
 
     errs
+}
+
+/// The `openAPIV3Schema` half of `validateCustomResourceDefinitionValidation`
+/// (`validation.go:954-982`): when `requireStructuralSchema` holds, the schema
+/// must convert (`NewStructural`) and pass `ValidateStructural`.
+///
+/// ```go
+/// if ss, err := structuralschema.NewStructural(schema); err != nil {
+///     structuralSchemaInitErrs = append(structuralSchemaInitErrs, field.Invalid(fldPath.Child("openAPIV3Schema"), "", err.Error()))
+/// } else if validationErrors := structuralschema.ValidateStructural(fldPath.Child("openAPIV3Schema"), ss); len(validationErrors) > 0 {
+///     allErrs = append(allErrs, validationErrors...)
+/// }
+/// ...
+/// if len(allErrs) == 0 && len(structuralSchemaInitErrs) > 0 {
+///     allErrs = append(allErrs, structuralSchemaInitErrs...)
+/// }
+/// ```
+///
+/// Not ported here (tracked separately): `ValidateDefaults` (`:963`), the
+/// `ValidateCustomResourceDefinitionOpenAPISchema` walk (`:973`) and CEL cost.
+/// Because that walk is absent, the init errors are shown whenever
+/// `ValidateStructural` found nothing.
+///
+/// Deviation, stated deliberately: the typed model decodes an absent
+/// `openAPIV3Schema` (`schema: {}`) as the zero schema, which upstream sees as
+/// a nil pointer and skips (`:914-916`); the zero schema is skipped the same way.
+fn validate_custom_resource_definition_validation(
+    schema: &JSONSchemaProps,
+    require_structural_schema: bool,
+    fld_path: &Path,
+) -> ErrorList {
+    if !require_structural_schema || *schema == JSONSchemaProps::default() {
+        return Vec::new();
+    }
+    let schema_path = fld_path.child("openAPIV3Schema");
+    match crate::validation::structural::new_structural(schema) {
+        Err(msg) => vec![Error::invalid(&schema_path, String::new(), msg)],
+        Ok(ss) => crate::validation::structural::validate_structural(&schema_path, &ss),
+    }
+}
+
+/// `schemaIsNonStructural` (`validation.go:1769-1777`).
+fn schema_is_non_structural(schema: &JSONSchemaProps) -> bool {
+    match crate::validation::structural::new_structural(schema) {
+        Err(_) => true,
+        Ok(ss) => {
+            !crate::validation::structural::validate_structural(&Path::new(""), &ss).is_empty()
+        }
+    }
+}
+
+/// `specHasNonStructuralSchema` (`validation.go:1757-1768`), over the versions
+/// (v1 has no top-level `spec.validation`).
+fn spec_has_non_structural_schema(spec: &CustomResourceDefinitionSpec) -> bool {
+    spec.versions.iter().any(|v| {
+        v.schema.as_ref().is_some_and(|s| {
+            s.open_apiv3_schema != JSONSchemaProps::default()
+                && schema_is_non_structural(&s.open_apiv3_schema)
+        })
+    })
+}
+
+/// `HasSchemaWith` (`validation.go:1626-1636`).
+fn has_schema_with(
+    spec: &CustomResourceDefinitionSpec,
+    pred: &dyn Fn(&JSONSchemaProps) -> bool,
+) -> bool {
+    spec.versions.iter().any(|v| {
+        v.schema
+            .as_ref()
+            .is_some_and(|s| schema_has(&s.open_apiv3_schema, pred))
+    })
+}
+
+/// `specHasDefaults` (`validation.go:1616-1624`).
+fn spec_has_defaults(spec: &CustomResourceDefinitionSpec) -> bool {
+    has_schema_with(spec, &|s| s.default.is_some())
+}
+
+/// `specHasKubernetesExtensions` / `schemaHasKubernetesExtensions`
+/// (`validation.go:1730-1746`).
+fn spec_has_kubernetes_extensions(spec: &CustomResourceDefinitionSpec) -> bool {
+    has_schema_with(spec, &|s| {
+        s.x_kubernetes_embedded_resource == Some(true)
+            || s.x_kubernetes_preserve_unknown_fields.is_some()
+            || s.x_kubernetes_int_or_string == Some(true)
+            || s.x_kubernetes_list_map_keys
+                .as_ref()
+                .is_some_and(|k| !k.is_empty())
+            || s.x_kubernetes_list_type.is_some()
+            || s.x_kubernetes_validations
+                .as_ref()
+                .is_some_and(|v| !v.is_empty())
+    })
+}
+
+/// `SchemaHas` (`validation.go:1659-1730`): `pred` on the schema or any
+/// sub-schema.
+fn schema_has(s: &JSONSchemaProps, pred: &dyn Fn(&JSONSchemaProps) -> bool) -> bool {
+    use crate::resources::JSONSchemaPropsOrArray;
+    if pred(s) {
+        return true;
+    }
+    match s.items.as_deref() {
+        Some(JSONSchemaPropsOrArray::Schema(i)) if schema_has(i, pred) => return true,
+        Some(JSONSchemaPropsOrArray::Schemas(l)) if l.iter().any(|i| schema_has(i, pred)) => {
+            return true
+        }
+        _ => {}
+    }
+    let lists = [&s.all_of, &s.any_of, &s.one_of];
+    if lists.iter().any(|l| {
+        l.as_ref()
+            .is_some_and(|l| l.iter().any(|i| schema_has(i, pred)))
+    }) {
+        return true;
+    }
+    if s.not.as_deref().is_some_and(|n| schema_has(n, pred)) {
+        return true;
+    }
+    let maps = [&s.properties, &s.pattern_properties, &s.definitions];
+    if maps.iter().any(|m| {
+        m.as_ref()
+            .is_some_and(|m| m.values().any(|i| schema_has(i, pred)))
+    }) {
+        return true;
+    }
+    for or_bool in [&s.additional_properties, &s.additional_items] {
+        if let Some(JSONSchemaPropsOrBool::Schema(i)) = or_bool.as_deref() {
+            if schema_has(i, pred) {
+                return true;
+            }
+        }
+    }
+    if let Some(deps) = &s.dependencies {
+        for d in deps.values() {
+            if let crate::resources::JSONSchemaPropsOrStringArray::Schema(i) = d {
+                if schema_has(i, pred) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// The spec-level required names (`validation.go:456-470`) on top of
@@ -1134,6 +1309,9 @@ pub fn validate_custom_resource_definition_update(
     errs.extend(validate_custom_resource_definition_spec_opts(
         &crd.spec,
         allow_invalid_ca_bundle(old),
+        // `requireStructuralSchema(&oldObj.Spec)` (`validation.go:228`, `:1749`):
+        // don't tighten validation on existing persisted data.
+        !spec_has_non_structural_schema(&old.spec),
         &spec_path,
     ));
     errs.extend(validate_custom_resource_definition_spec_update(
@@ -1464,3 +1642,7 @@ AiEAhWF2/JiVNXisqXic1Dfy761y8wW/Io2IJoBMvcYxo4E=
         assert!(validate_custom_resource_definition_update(&new, &old).is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "crd_structural_tests.rs"]
+mod structural_schema_tests;

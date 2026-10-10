@@ -387,7 +387,7 @@ async fn test_taint_based_evictions() {
         .expect("not-ready taint must be applied to NotReady node");
     let not_ready = taints
         .iter()
-        .find(|t| t.key == "node.kubernetes.io/not-ready")
+        .find(|t| t.key == "node.kubernetes.io/not-ready" && t.effect == "NoExecute")
         .expect("node.kubernetes.io/not-ready taint must exist");
     assert_eq!(
         not_ready.effect, "NoExecute",

@@ -65,6 +65,9 @@ const GET_BLOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3)
 /// `resourceVersionTooHighRetrySeconds` (storage/cacher/watch_cache.go).
 const RESOURCE_VERSION_TOO_HIGH_RETRY_SECONDS: i32 = 1;
 
+/// Upper bound between revision re-reads when no watch event arrives.
+const FRESHNESS_RECHECK: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// The freshness wait shared by `Store::get` and the list handlers: see
 /// [`Store::wait_until_fresh`] for the upstream citations.
 pub async fn wait_until_resource_version<S: Storage + ?Sized>(
@@ -86,20 +89,44 @@ pub async fn wait_until_resource_version<S: Storage + ?Sized>(
             )])
         })?,
     };
+    // `waitUntilFreshAndBlock` (storage/cacher/watch_cache.go:448-488): wait
+    // on a condition that every processed event broadcasts, until
+    // `blockTimeout`. The Storage trait has no cache to hang a condvar on, so
+    // the broadcast is the storage's own watch stream: any write advances the
+    // revision and wakes the waiter. The stream is opened BEFORE the first
+    // revision read so a write in between is not a lost wake-up
+    // (`w.cond.Wait()` is likewise entered with the lock held).
+    // Deviation: a bounded re-check (`FRESHNESS_RECHECK`) also runs, because a
+    // backend's watch may lag or end while its revision still advances.
     let start = tokio::time::Instant::now();
+    let mut events = storage.watch("/registry/").await.ok();
     loop {
         let current = storage.current_revision().await?.max(0) as u64;
         if current >= want {
             return Ok(());
         }
-        if start.elapsed() >= GET_BLOCK_TIMEOUT {
+        let elapsed = start.elapsed();
+        if elapsed >= GET_BLOCK_TIMEOUT {
             return Err(too_large_resource_version(
                 want,
                 current,
                 RESOURCE_VERSION_TOO_HIGH_RETRY_SECONDS,
             ));
         }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let nap = (GET_BLOCK_TIMEOUT - elapsed).min(FRESHNESS_RECHECK);
+        match events.as_mut() {
+            Some(stream) => {
+                tokio::select! {
+                    ev = futures::StreamExt::next(stream) => {
+                        if ev.is_none() {
+                            events = None;
+                        }
+                    }
+                    _ = tokio::time::sleep(nap) => {}
+                }
+            }
+            None => tokio::time::sleep(nap).await,
+        }
     }
 }
 

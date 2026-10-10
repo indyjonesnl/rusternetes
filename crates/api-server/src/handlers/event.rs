@@ -366,6 +366,9 @@ pub async fn list(
         }
     }
 
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let prefix = build_prefix("events", Some(&namespace));
     let mut events: Vec<Event> = state.storage.list(&prefix).await?;
 
@@ -431,6 +434,9 @@ pub async fn list_all(
             return Err(rusternetes_common::Error::Forbidden(reason));
         }
     }
+
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
     let prefix = build_prefix("events", None);
     let mut events: Vec<Event> = state.storage.list(&prefix).await?;
@@ -513,6 +519,9 @@ pub async fn list_events_v1(
         }
     }
 
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let prefix = build_prefix("events", Some(&namespace));
     let mut events: Vec<Event> = state.storage.list(&prefix).await?;
     crate::handlers::filtering::apply_selectors(&mut events, &params)?;
@@ -575,6 +584,9 @@ pub async fn list_all_events_v1(
             return Err(rusternetes_common::Error::Forbidden(reason));
         }
     }
+
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
     let prefix = build_prefix("events", None);
     let mut events: Vec<Event> = state.storage.list(&prefix).await?;

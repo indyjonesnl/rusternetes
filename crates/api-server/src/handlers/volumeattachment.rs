@@ -132,6 +132,9 @@ pub async fn list_volumeattachments(
     }
 
     let prefix = build_prefix("volumeattachments", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut vas = state.storage.list::<VolumeAttachment>(&prefix).await?;
 
     // Apply field and label selector filtering

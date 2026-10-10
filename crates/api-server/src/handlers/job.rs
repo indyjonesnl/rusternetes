@@ -290,6 +290,9 @@ pub async fn list(
     }
 
     let prefix = build_prefix("jobs", Some(&namespace));
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut jobs: Vec<Job> = state.storage.list(&prefix).await?;
 
     // Apply field and label selector filtering
@@ -353,6 +356,9 @@ pub async fn list_all_jobs(
     }
 
     let prefix = build_prefix("jobs", None);
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+
     let mut jobs = state.storage.list::<Job>(&prefix).await?;
 
     // Apply field and label selector filtering
