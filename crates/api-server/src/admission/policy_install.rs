@@ -23,7 +23,7 @@ use rusternetes_storage::Storage;
 use serde_json::Value;
 
 use super::policy_dispatch::ParamScope;
-use super::policy_mutating::{NamespaceObjects, TypeConverters};
+use super::policy_mutating::{NamespaceObjects, ObjectDefaulter, TypeConverters};
 use super::policy_source::{RestMapper, RestMapping};
 
 /// `meta.RESTMapper` over the resources this server serves.
@@ -89,6 +89,100 @@ impl TypeConverters for RegistryTypeConverters {
     fn has_type_converter(&self, kind: &GroupVersionKind) -> bool {
         rusternetes_discovery::resolve_kind_to_resource(&kind.group, &kind.version, &kind.kind)
             .is_some()
+    }
+}
+
+/// `ObjectInterfaces.GetObjectDefaulter()` over the registry's per-kind
+/// defaulting (`handlers::defaults`, the ports of the `SetDefaults_*`
+/// functions in `pkg/apis/*/v*/defaults.go`).
+///
+/// Upstream, staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/mutating/
+/// dispatcher.go:274 (`dispatchOne`, after `patcher.Patch` and the typed
+/// conversion at :268-272):
+/// `o.GetObjectDefaulter().Default(newVersionedObject)`
+/// and staging/src/k8s.io/apimachinery/pkg/runtime/scheme.go:355-359:
+/// `if fn, ok := s.defaulterFuncs[reflect.TypeOf(src)]; ok { fn(src) }`
+/// i.e. defaulting is looked up by the object's type and is a no-op when none
+/// is registered (so an `*unstructured.Unstructured` custom resource is not
+/// defaulted here either). Here the kind comes from the object's own
+/// `apiVersion`/`kind`. Defaulting funcs only set unset fields, so the
+/// defaulted typed form is merged back fill-missing-only; this is equivalent
+/// to in-place defaulting and keeps fields our structs do not model. Upstream's
+/// dispatcher_test.go:627-630 registers a fake `AddTypeDefaultingFunc` for
+/// `appsv1.Deployment` (strategy type) to observe defaulting after a patch,
+/// which `defaulter_defaults_a_deployment_after_patch` mirrors. The covered
+/// kinds are the `SetDefaults_*` ports that exist in `handlers::defaults`;
+/// upstream registers defaulters for every built-in kind.
+pub struct SchemeObjectDefaulter;
+
+fn default_typed<T>(object: &mut Value, f: impl FnOnce(&mut T))
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    let Ok(mut typed) = serde_json::from_value::<T>(object.clone()) else {
+        return;
+    };
+    f(&mut typed);
+    if let Ok(defaulted) = serde_json::to_value(&typed) {
+        fill_missing(object, &defaulted);
+    }
+}
+
+/// Copy into `target` every value `source` has and `target` lacks.
+fn fill_missing(target: &mut Value, source: &Value) {
+    match (target, source) {
+        (Value::Object(t), Value::Object(s)) => {
+            for (k, sv) in s {
+                match t.get_mut(k) {
+                    Some(tv) => fill_missing(tv, sv),
+                    None => {
+                        t.insert(k.clone(), sv.clone());
+                    }
+                }
+            }
+        }
+        (Value::Array(t), Value::Array(s)) if t.len() == s.len() => {
+            for (tv, sv) in t.iter_mut().zip(s) {
+                fill_missing(tv, sv);
+            }
+        }
+        _ => {}
+    }
+}
+
+impl ObjectDefaulter for SchemeObjectDefaulter {
+    fn default_object(&self, object: &mut Value) {
+        use crate::handlers::defaults as d;
+        use rusternetes_common::resources as r;
+        let api_version = object["apiVersion"].as_str().unwrap_or_default();
+        let group = api_version.split_once('/').map_or("", |(g, _)| g);
+        let kind = object["kind"].as_str().unwrap_or_default().to_string();
+        match (group, kind.as_str()) {
+            ("", "Pod") => default_typed::<r::Pod>(object, |p| {
+                if let Some(spec) = p.spec.as_mut() {
+                    d::apply_pod_spec_defaults(spec);
+                    d::apply_pod_defaults(spec);
+                }
+            }),
+            ("", "ReplicationController") => {
+                default_typed(object, d::apply_replicationcontroller_defaults)
+            }
+            ("", "Service") => default_typed(object, d::apply_service_defaults),
+            ("", "LimitRange") => default_typed(object, d::apply_limit_range_defaults),
+            ("", "PersistentVolumeClaim") => {
+                default_typed::<r::volume::PersistentVolumeClaim>(object, |c| {
+                    d::apply_pvc_spec_defaults(&mut c.spec)
+                })
+            }
+            ("apps", "Deployment") => default_typed(object, d::apply_deployment_defaults),
+            ("apps", "DaemonSet") => default_typed(object, d::apply_daemonset_defaults),
+            ("apps", "StatefulSet") => default_typed(object, d::apply_statefulset_defaults),
+            ("apps", "ReplicaSet") => default_typed(object, d::apply_replicaset_defaults),
+            ("batch", "Job") => default_typed(object, d::apply_job_defaults),
+            ("batch", "CronJob") => default_typed(object, d::apply_cronjob_defaults),
+            // No registered defaulting func: Scheme.Default is a no-op.
+            _ => {}
+        }
     }
 }
 
@@ -158,6 +252,43 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+    }
+
+    #[test]
+    fn defaulter_defaults_a_deployment_after_patch() {
+        // Scheme.Default runs SetDefaults_Deployment and the pod template's.
+        let mut o = serde_json::json!({
+            "apiVersion": "apps/v1", "kind": "Deployment",
+            "metadata": {"name": "d"},
+            "spec": {"selector": {"matchLabels": {"a": "b"}},
+                "template": {"metadata": {"labels": {"a": "b"}},
+                    "spec": {"containers": [{"name": "c", "image": "i", "customField": true}]}}}
+        });
+        SchemeObjectDefaulter.default_object(&mut o);
+        assert_eq!(o["spec"]["strategy"]["type"], "RollingUpdate");
+        assert_eq!(o["spec"]["template"]["spec"]["restartPolicy"], "Always");
+        // Fields the typed form does not know survive.
+        assert_eq!(
+            o["spec"]["template"]["spec"]["containers"][0]["customField"],
+            true
+        );
+    }
+
+    #[test]
+    fn defaulter_leaves_set_values_and_unknown_kinds_alone() {
+        let mut o = serde_json::json!({
+            "apiVersion": "example.com/v1", "kind": "Widget", "spec": {"a": 1}
+        });
+        let before = o.clone();
+        SchemeObjectDefaulter.default_object(&mut o);
+        assert_eq!(o, before);
+        let mut p = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod", "metadata": {"name": "p"},
+            "spec": {"restartPolicy": "Never", "containers": [{"name": "c", "image": "i"}]}
+        });
+        SchemeObjectDefaulter.default_object(&mut p);
+        assert_eq!(p["spec"]["restartPolicy"], "Never");
+        assert_eq!(p["spec"]["enableServiceLinks"], true);
     }
 
     #[test]
