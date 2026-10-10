@@ -210,7 +210,7 @@ fn add_topology(pv: &mut PersistentVolume, key: &str, zones: &[String]) -> Resul
     let required = pv
         .spec
         .node_affinity
-        .get_or_insert_with(|| VolumeNodeAffinity { required: None })
+        .get_or_insert(VolumeNodeAffinity { required: None })
         .required
         .get_or_insert_with(|| NodeSelector {
             node_selector_terms: Vec::new(),
