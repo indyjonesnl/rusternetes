@@ -8,7 +8,6 @@
 //! watches are still served here directly.
 
 use crate::endpoints::handlers::RequestScope;
-use crate::handlers::validating_admission_policy::store_crud_handlers;
 use crate::registry::admissionregistration::webhookconfiguration::{mutating, validating};
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
@@ -25,6 +24,157 @@ use rusternetes_common::{
 use rusternetes_storage::{build_prefix, Storage};
 use std::sync::Arc;
 use tracing::debug;
+
+/// The six CRUD handlers of a webhook-configuration resource: the same
+/// `endpoints::handlers` calls as
+/// [`crate::handlers::validating_admission_policy::store_crud_handlers`], with
+/// the response run through `endpoints::negotiate` (upstream's
+/// `transformResponseObject` serializer choice, `endpoints/handlers/response.go`)
+/// so `Accept: application/vnd.kubernetes.protobuf` gets a protobuf body.
+macro_rules! webhook_crud_handlers {
+    (
+        scope: $scope:ident,
+        create: $create:ident,
+        get: $get:ident,
+        update: $update:ident,
+        patch: $patch:ident,
+        delete: $delete:ident,
+        deletecollection: $deletecollection:ident $(,)?
+    ) => {
+        pub async fn $create(
+            State(state): State<Arc<ApiServerState>>,
+            Extension(auth_ctx): Extension<AuthContext>,
+            axum::extract::Query(params): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >,
+            headers: axum::http::HeaderMap,
+            body: axum::body::Bytes,
+        ) -> Result<Response> {
+            let out = crate::endpoints::handlers::create_resource(
+                &state,
+                &$scope(&state),
+                &auth_ctx.user,
+                None,
+                &params,
+                &body,
+            )
+            .await?;
+            Ok(crate::endpoints::handlers::negotiate(&headers, out).await)
+        }
+
+        pub async fn $get(
+            State(state): State<Arc<ApiServerState>>,
+            Extension(auth_ctx): Extension<AuthContext>,
+            axum::extract::Path(name): axum::extract::Path<String>,
+            axum::extract::Query(params): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >,
+            headers: axum::http::HeaderMap,
+        ) -> Result<Response> {
+            let out = crate::endpoints::handlers::get_resource(
+                &state,
+                &$scope(&state),
+                &auth_ctx.user,
+                None,
+                &name,
+                &params,
+            )
+            .await?;
+            Ok(crate::endpoints::handlers::negotiate(&headers, out).await)
+        }
+
+        pub async fn $update(
+            State(state): State<Arc<ApiServerState>>,
+            Extension(auth_ctx): Extension<AuthContext>,
+            axum::extract::Path(name): axum::extract::Path<String>,
+            axum::extract::Query(params): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >,
+            headers: axum::http::HeaderMap,
+            body: axum::body::Bytes,
+        ) -> Result<Response> {
+            let out = crate::endpoints::handlers::update_resource(
+                &state,
+                &$scope(&state),
+                &auth_ctx.user,
+                None,
+                &name,
+                &params,
+                &body,
+            )
+            .await?;
+            Ok(crate::endpoints::handlers::negotiate(&headers, out).await)
+        }
+
+        pub async fn $patch(
+            State(state): State<Arc<ApiServerState>>,
+            Extension(auth_ctx): Extension<AuthContext>,
+            axum::extract::Path(name): axum::extract::Path<String>,
+            axum::extract::Query(params): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >,
+            headers: axum::http::HeaderMap,
+            body: axum::body::Bytes,
+        ) -> Result<Response> {
+            let out = crate::endpoints::handlers::patch_resource(
+                &state,
+                &$scope(&state),
+                &auth_ctx.user,
+                None,
+                &name,
+                &params,
+                crate::handlers::validating_admission_policy::patch_content_type(&headers),
+                &body,
+            )
+            .await?;
+            Ok(crate::endpoints::handlers::negotiate(&headers, out).await)
+        }
+
+        pub async fn $delete(
+            State(state): State<Arc<ApiServerState>>,
+            Extension(auth_ctx): Extension<AuthContext>,
+            axum::extract::Path(name): axum::extract::Path<String>,
+            axum::extract::Query(params): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >,
+            headers: axum::http::HeaderMap,
+            body: axum::body::Bytes,
+        ) -> Result<Response> {
+            let out = crate::endpoints::handlers::delete_resource(
+                &state,
+                &$scope(&state),
+                &auth_ctx.user,
+                None,
+                &name,
+                &params,
+                &body,
+            )
+            .await?;
+            Ok(crate::endpoints::handlers::negotiate(&headers, out).await)
+        }
+
+        pub async fn $deletecollection(
+            State(state): State<Arc<ApiServerState>>,
+            Extension(auth_ctx): Extension<AuthContext>,
+            axum::extract::Query(params): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >,
+            headers: axum::http::HeaderMap,
+            body: axum::body::Bytes,
+        ) -> Result<Response> {
+            let out = crate::endpoints::handlers::delete_collection(
+                &state,
+                &$scope(&state),
+                &auth_ctx.user,
+                None,
+                &params,
+                &body,
+            )
+            .await?;
+            Ok(crate::endpoints::handlers::negotiate(&headers, out).await)
+        }
+    };
+}
 
 // ===== ValidatingWebhookConfiguration =====
 
@@ -49,7 +199,7 @@ fn validating_scope(state: &ApiServerState) -> RequestScope<ValidatingWebhookCon
     }
 }
 
-store_crud_handlers!(
+webhook_crud_handlers!(
     scope: validating_scope,
     create: create_validating_webhook,
     get: get_validating_webhook,
@@ -63,6 +213,7 @@ pub async fn list_validating_webhooks(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Response> {
     if crate::handlers::watch::is_watch_request(&params) {
         let watch_params = crate::handlers::watch::watch_params_from_query(&params);
@@ -110,7 +261,7 @@ pub async fn list_validating_webhooks(
         crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
             .await,
     );
-    Ok(Json(list).into_response())
+    Ok(crate::endpoints::handlers::negotiate(&headers, Json(list).into_response()).await)
 }
 
 // ===== MutatingWebhookConfiguration =====
@@ -136,7 +287,7 @@ fn mutating_scope(state: &ApiServerState) -> RequestScope<MutatingWebhookConfigu
     }
 }
 
-store_crud_handlers!(
+webhook_crud_handlers!(
     scope: mutating_scope,
     create: create_mutating_webhook,
     get: get_mutating_webhook,
@@ -150,6 +301,7 @@ pub async fn list_mutating_webhooks(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Response> {
     if crate::handlers::watch::is_watch_request(&params) {
         let watch_params = crate::handlers::watch::watch_params_from_query(&params);
@@ -197,5 +349,5 @@ pub async fn list_mutating_webhooks(
         crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
             .await,
     );
-    Ok(Json(list).into_response())
+    Ok(crate::endpoints::handlers::negotiate(&headers, Json(list).into_response()).await)
 }
