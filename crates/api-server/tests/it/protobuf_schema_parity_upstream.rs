@@ -429,7 +429,13 @@ pub(crate) fn compare_types(ours: &FieldType, theirs: &LogicalType) -> Option<St
         // Messages — names should match (after stripping any nested prefix)
         (FieldType::Message(ours_name), LogicalType::Message(their_name))
         | (FieldType::InlineMessage(ours_name), LogicalType::Message(their_name)) => {
-            if ours_name == their_name {
+            // A group-qualified reference (`autoscaling/v1.ObjectMetricSource`)
+            // names the same upstream message as its simple name.
+            let ours_simple = match ours_name.rsplit_once('.') {
+                Some((prefix, simple)) if prefix.contains('/') => simple,
+                _ => ours_name.as_str(),
+            };
+            if ours_simple == their_name {
                 None
             } else {
                 Some(format!(
