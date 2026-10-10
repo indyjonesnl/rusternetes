@@ -654,24 +654,27 @@ impl<S: Storage + 'static> EndpointsController<S> {
         labels.insert(LABEL_MANAGED_BY.to_string(), CONTROLLER_NAME.to_string());
         endpoints.metadata.labels = Some(labels);
 
-        // Try to update first, if it doesn't exist, create it
-        match self.storage.update(&endpoints_key, &endpoints).await {
-            Ok(updated) => {
+        // endpoints_controller.go:455,503-508: `createEndpoints` is decided from
+        // the object read, never by trying an Update first. An Update of an
+        // Endpoints this controller just built carries a client-minted UID,
+        // which the server turns into a UID precondition against the absent
+        // object (rest.DefaultUpdatedObjectInfo.Preconditions) -> Conflict
+        // forever, so the Endpoints was never created over the API (#3075).
+        match &existing {
+            None => {
+                self.storage.create(&endpoints_key, &endpoints).await?;
+            }
+            Some(cur) => {
+                let updated = self.storage.update(&endpoints_key, &endpoints).await?;
                 // endpoints_controller.go:539-541: track the replaced resource
                 // version so a lagging read of it is recognised as stale.
-                if let Some(cur) = &existing {
-                    if updated.metadata.resource_version != cur.metadata.resource_version {
-                        if let Some(rv) = cur.metadata.resource_version.as_deref() {
-                            self.stale_endpoints_tracker
-                                .stale(namespace, service_name, rv);
-                        }
+                if updated.metadata.resource_version != cur.metadata.resource_version {
+                    if let Some(rv) = cur.metadata.resource_version.as_deref() {
+                        self.stale_endpoints_tracker
+                            .stale(namespace, service_name, rv);
                     }
                 }
             }
-            Err(rusternetes_common::Error::NotFound(_)) => {
-                self.storage.create(&endpoints_key, &endpoints).await?;
-            }
-            Err(e) => return Err(e.into()),
         }
 
         debug!(
