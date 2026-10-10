@@ -15,6 +15,7 @@ use crate::advanced::{
     NodeScore,
 };
 use crate::data_plane::{ApiBackend, DataPlane};
+use crate::volume_binding::{self, PreFilterOutcome};
 
 pub struct Scheduler<S: Storage + Send + Sync + 'static = StorageBackend> {
     /// All reads/writes flow through the data plane — either storage directly
@@ -784,6 +785,32 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         // 6. Calculate resource scores
         // 7. Select node with highest score
 
+        // Phase 0: VolumeBinding PreFilter (volume_binding.go PreFilter). A pod
+        // with a missing/lost/deleting PVC or an unbound Immediate claim is
+        // UnschedulableAndUnresolvable; the pod is retried on the next resync.
+        let volume_ctx = if volume_binding::pod_references_pvcs(pod) {
+            let ns = pod.metadata.namespace.as_deref().unwrap_or("default");
+            match self.data.list_volume_snapshot(ns).await {
+                Ok(snap) => match volume_binding::pre_filter(pod, &snap) {
+                    PreFilterOutcome::Skip => None,
+                    PreFilterOutcome::Ready(claims) => Some((snap, claims)),
+                    PreFilterOutcome::Unresolvable(m) | PreFilterOutcome::Error(m) => {
+                        debug!(
+                            "VolumeBinding PreFilter rejected pod {}/{}: {}",
+                            ns, pod.metadata.name, m
+                        );
+                        return None;
+                    }
+                },
+                Err(e) => {
+                    warn!("VolumeBinding: failed to list volume objects: {}", e);
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+
         // Phase 1: Filter schedulable nodes
         let schedulable_nodes: Vec<&Node> = nodes
             .iter()
@@ -865,6 +892,41 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
 
         if port_ok_nodes.is_empty() {
             debug!("No nodes without hostPort conflicts");
+            return None;
+        }
+
+        // Phase 4c: VolumeBinding Filter (FindPodVolumes) — bound PV node
+        // affinity, matching/provisionable unbound WaitForFirstConsumer claims.
+        let port_ok_nodes: Vec<&Node> = match volume_ctx {
+            Some((snap, claims)) => port_ok_nodes
+                .into_iter()
+                .filter(
+                    |node| match volume_binding::find_pod_volumes(pod, &claims, node, &snap) {
+                        Ok((_, reasons)) if reasons.is_empty() => true,
+                        Ok((_, reasons)) => {
+                            debug!(
+                                "Node {} rejected for pod {}: {}",
+                                node.metadata.name,
+                                pod.metadata.name,
+                                reasons.join(", ")
+                            );
+                            false
+                        }
+                        Err(e) => {
+                            debug!(
+                                "VolumeBinding filter error on node {} for pod {}: {}",
+                                node.metadata.name, pod.metadata.name, e
+                            );
+                            false
+                        }
+                    },
+                )
+                .collect(),
+            None => port_ok_nodes,
+        };
+
+        if port_ok_nodes.is_empty() {
+            debug!("No nodes satisfy the pod's volume requirements");
             return None;
         }
 
@@ -1910,6 +1972,78 @@ mod tests {
             .iter()
             .any(|c| c.condition_type == "PodScheduled" && c.status == "True");
         assert!(has_scheduled, "Pod should have PodScheduled=True condition");
+    }
+
+    /// VolumeBinding wiring (#3017): a pod whose PVC does not exist is
+    /// UnschedulableAndUnresolvable; once a bound PVC whose PV fits only
+    /// `node-2` exists, the pod lands on `node-2`.
+    #[tokio::test]
+    async fn test_volume_binding_filters_nodes_by_pv_affinity() {
+        let storage = Arc::new(MemoryStorage::new());
+        let scheduler =
+            Scheduler::new_with_name(storage.clone(), 1, "default-scheduler".to_string());
+        for n in ["node-1", "node-2"] {
+            let mut node = make_node(n);
+            node.metadata.labels =
+                Some(HashMap::from([("kubernetes.io/hostname".into(), n.into())]));
+            storage
+                .create(&format!("/registry/nodes/{n}"), &node)
+                .await
+                .unwrap();
+        }
+        let mut pod = make_pending_pod("vol-pod", "default");
+        pod.spec.as_mut().unwrap().volumes = Some(vec![serde_json::from_value(
+            serde_json::json!({"name": "v", "persistentVolumeClaim": {"claimName": "claim"}}),
+        )
+        .unwrap()]);
+        storage
+            .create("/registry/pods/default/vol-pod", &pod)
+            .await
+            .unwrap();
+
+        scheduler.schedule_pending_pods().await.unwrap();
+        let p: Pod = storage.get("/registry/pods/default/vol-pod").await.unwrap();
+        assert!(
+            p.spec.as_ref().and_then(|s| s.node_name.as_ref()).is_none(),
+            "pod with a missing PVC must not be scheduled"
+        );
+
+        let pvc: rusternetes_common::resources::PersistentVolumeClaim =
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                "metadata": {"name": "claim", "namespace": "default",
+                    "annotations": {"pv.kubernetes.io/bind-completed": "yes"}},
+                "spec": {"volumeName": "pv1", "storageClassName": "std",
+                    "resources": {"requests": {"storage": "1Gi"}}},
+                "status": {"phase": "Bound"}
+            }))
+            .unwrap();
+        storage
+            .create("/registry/persistentvolumeclaims/default/claim", &pvc)
+            .await
+            .unwrap();
+        let pv: rusternetes_common::resources::PersistentVolume =
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "v1", "kind": "PersistentVolume",
+                "metadata": {"name": "pv1"},
+                "spec": {"capacity": {"storage": "1Gi"}, "accessModes": ["ReadWriteOnce"],
+                    "storageClassName": "std", "hostPath": {"path": "/x"},
+                    "nodeAffinity": {"required": {"nodeSelectorTerms": [{"matchExpressions": [
+                        {"key": "kubernetes.io/hostname", "operator": "In", "values": ["node-2"]}]}]}}},
+                "status": {"phase": "Bound"}
+            }))
+            .unwrap();
+        storage
+            .create("/registry/persistentvolumes/pv1", &pv)
+            .await
+            .unwrap();
+
+        scheduler.schedule_pending_pods().await.unwrap();
+        let p: Pod = storage.get("/registry/pods/default/vol-pod").await.unwrap();
+        assert_eq!(
+            p.spec.as_ref().and_then(|s| s.node_name.as_deref()),
+            Some("node-2")
+        );
     }
 
     #[tokio::test]

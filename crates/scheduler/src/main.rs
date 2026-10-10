@@ -12,6 +12,7 @@ mod framework;
 #[allow(dead_code)]
 mod plugins;
 mod scheduler;
+mod volume_binding;
 
 use anyhow::Result;
 use axum::{routing::get, Router};
