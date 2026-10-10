@@ -15171,4 +15171,105 @@ mod tests {
             "kubeletEndpoint.Port must survive protobuf encode/decode"
         );
     }
+
+    /// autoscaling/v1 generated.proto layouts differ from autoscaling/v2 for
+    /// the metric messages and HPA spec/status; each must be reachable through
+    /// a qualified `autoscaling/v1.<Name>` key (#3085).
+    #[test]
+    fn autoscaling_v1_qualified_keys_use_v1_layout() {
+        let reg = ProtoRegistry::new();
+        let cases: Vec<(&str, Value)> = vec![
+            (
+                "ExternalMetricSource",
+                json!({"metricName":"m","metricSelector":{"matchLabels":{"a":"b"}},"targetValue":"1","targetAverageValue":"2"}),
+            ),
+            (
+                "ExternalMetricStatus",
+                json!({"metricName":"m","metricSelector":{"matchLabels":{"a":"b"}},"currentValue":"1","currentAverageValue":"2"}),
+            ),
+            (
+                "ObjectMetricSource",
+                json!({"target":{"kind":"Deployment","name":"d","apiVersion":"apps/v1"},"metricName":"m","targetValue":"1","selector":{"matchLabels":{"a":"b"}},"averageValue":"2"}),
+            ),
+            (
+                "ObjectMetricStatus",
+                json!({"target":{"kind":"Deployment","name":"d","apiVersion":"apps/v1"},"metricName":"m","currentValue":"1","selector":{"matchLabels":{"a":"b"}},"averageValue":"2"}),
+            ),
+            (
+                "PodsMetricSource",
+                json!({"metricName":"m","targetAverageValue":"2","selector":{"matchLabels":{"a":"b"}}}),
+            ),
+            (
+                "PodsMetricStatus",
+                json!({"metricName":"m","currentAverageValue":"2","selector":{"matchLabels":{"a":"b"}}}),
+            ),
+            (
+                "ResourceMetricSource",
+                json!({"name":"cpu","targetAverageUtilization":50,"targetAverageValue":"2"}),
+            ),
+            (
+                "ResourceMetricStatus",
+                json!({"name":"cpu","currentAverageUtilization":50,"currentAverageValue":"2"}),
+            ),
+            (
+                "ContainerResourceMetricSource",
+                json!({"name":"cpu","targetAverageUtilization":50,"targetAverageValue":"2","container":"c"}),
+            ),
+            (
+                "ContainerResourceMetricStatus",
+                json!({"name":"cpu","currentAverageUtilization":50,"currentAverageValue":"2","container":"c"}),
+            ),
+            (
+                "HorizontalPodAutoscalerSpec",
+                json!({"scaleTargetRef":{"kind":"Deployment","name":"d","apiVersion":"apps/v1"},"minReplicas":1,"maxReplicas":5,"targetCPUUtilizationPercentage":80}),
+            ),
+            (
+                "HorizontalPodAutoscalerStatus",
+                json!({"observedGeneration":3,"currentReplicas":2,"desiredReplicas":3,"currentCPUUtilizationPercentage":70}),
+            ),
+            (
+                "MetricSpec",
+                json!({"type":"Pods","pods":{"metricName":"m","targetAverageValue":"2"}}),
+            ),
+            (
+                "MetricStatus",
+                json!({"type":"Pods","pods":{"metricName":"m","currentAverageValue":"2"}}),
+            ),
+            (
+                "HorizontalPodAutoscaler",
+                json!({"metadata":{"name":"h"},"spec":{"maxReplicas":5,"targetCPUUtilizationPercentage":80},"status":{"currentCPUUtilizationPercentage":70}}),
+            ),
+            (
+                "HorizontalPodAutoscalerList",
+                json!({"metadata":{},"items":[{"metadata":{"name":"h"},"spec":{"maxReplicas":5,"targetCPUUtilizationPercentage":80}}]}),
+            ),
+        ];
+        for (name, v) in cases {
+            let key = format!("autoscaling/v1.{name}");
+            let bytes = reg
+                .encode_message(&key, &v)
+                .unwrap_or_else(|| panic!("no qualified registry key {key}"));
+            let back = reg.decode_message(&key, &bytes).unwrap();
+            assert_eq!(back, v, "{key} must round-trip with the v1 layout");
+        }
+    }
+
+    /// apiregistration/v1 ServiceReference is `{namespace=1,name=2,port=3}`
+    /// (no `path`), reachable via a qualified key (#3086).
+    #[test]
+    fn apiregistration_v1_service_reference_qualified_key() {
+        let reg = ProtoRegistry::new();
+        let key = "apiregistration.k8s.io/v1.ServiceReference";
+        let v = json!({"namespace":"ns","name":"svc","port":443});
+        let bytes = reg
+            .encode_message(key, &v)
+            .unwrap_or_else(|| panic!("no qualified registry key {key}"));
+        // field 3 varint (tag 0x18), not field 4 (0x20)
+        assert!(bytes.windows(2).any(|w| w == [0x18, 0xbb]), "{bytes:?}");
+        assert_eq!(reg.decode_message(key, &bytes).unwrap(), v);
+        // APIServiceSpec.service uses it.
+        let spec = json!({"service":{"namespace":"ns","name":"svc","port":443},"group":"g","version":"v1"});
+        let b = reg.encode_message("APIServiceSpec", &spec).unwrap();
+        assert_eq!(reg.decode_message("APIServiceSpec", &b).unwrap(), spec);
+    }
 }
