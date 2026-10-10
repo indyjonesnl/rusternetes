@@ -370,6 +370,9 @@ pub struct CriContainerRuntime {
     /// `cluster_dns` => pods inherit the node's resolv.conf.
     cluster_dns: Vec<String>,
     cluster_domain: String,
+    /// Host resolver file (`--resolv-conf`, upstream default `/etc/resolv.conf`)
+    /// used as the base of every pod's DNS config (`dns.go` `ResolverConfig`).
+    resolv_conf: String,
     /// Node allocatable (`cpu`/`memory`/`ephemeral-storage`/`hugepages-*`),
     /// used to default unset resourceFieldRef LIMITS into downward-API env
     /// (upstream `MergeContainerResourceLimits`). Empty leaves such vars unset.
@@ -396,6 +399,7 @@ impl CriContainerRuntime {
             service_port: "443".to_string(),
             cluster_dns: Vec::new(),
             cluster_domain: "cluster.local".to_string(),
+            resolv_conf: "/etc/resolv.conf".to_string(),
             node_allocatable: std::collections::HashMap::new(),
         })
     }
@@ -468,6 +472,25 @@ impl CriContainerRuntime {
             self.cluster_domain = cluster_domain.to_string();
         }
         self
+    }
+
+    /// Override the host resolver file used as the DNS base (`--resolv-conf`).
+    #[must_use]
+    pub fn with_resolv_conf(mut self, path: &str) -> Self {
+        self.resolv_conf = path.to_string();
+        self
+    }
+
+    /// Upstream `Configurer.GetPodDNS`: host resolv.conf base + policy/dnsConfig.
+    fn pod_dns(&self, pod: &Pod) -> anyhow::Result<v1::DnsConfig> {
+        let host = translate::read_host_dns_config(&self.resolv_conf)
+            .map_err(|e| anyhow::anyhow!("reading {}: {e}", self.resolv_conf))?;
+        Ok(translate::get_pod_dns(
+            pod,
+            &self.cluster_dns,
+            &self.cluster_domain,
+            &host,
+        ))
     }
 
     /// Attach a [`VolumeManager`](crate::volumes::VolumeManager) so `start_pod`
@@ -592,8 +615,7 @@ impl CriContainerRuntime {
             .ok_or_else(|| anyhow::anyhow!("no sandbox for pod {}", pod.metadata.name))?;
         let log_dir = self.log_dir_for(pod);
         let mut sandbox_cfg = translate::sandbox_config(pod, &log_dir);
-        sandbox_cfg.dns_config =
-            translate::dns_config(pod, &self.cluster_dns, &self.cluster_domain);
+        sandbox_cfg.dns_config = Some(self.pod_dns(pod)?);
         let mut cri = self.cri.clone();
         self.create_and_start_container(
             &mut cri,
@@ -1188,8 +1210,7 @@ impl CriContainerRuntime {
         let host_paths = self.create_pod_volumes(pod).await?;
 
         let mut sandbox_cfg = translate::sandbox_config(pod, &log_dir);
-        sandbox_cfg.dns_config =
-            translate::dns_config(pod, &self.cluster_dns, &self.cluster_domain);
+        sandbox_cfg.dns_config = Some(self.pod_dns(pod)?);
         // Append volume-derived supplemental groups to the sandbox SC too
         // (upstream `generatePodSandboxLinuxConfig` also applies them), so the
         // pod's namespace/group set is consistent across sandbox and containers.
