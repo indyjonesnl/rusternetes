@@ -15,6 +15,7 @@ pub mod memory;
 pub mod metadata;
 #[cfg(any(feature = "sqlite", feature = "redis"))]
 pub mod rhino;
+pub mod size_estimator;
 pub mod workqueue;
 
 // Re-export MemoryStorage for convenient testing

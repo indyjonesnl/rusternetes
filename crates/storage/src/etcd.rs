@@ -38,6 +38,10 @@ pub struct EtcdStorage {
     page_size: i64,
     /// Grants the leases TTL'd writes attach (`etcd3.store.leaseManager`).
     leases: Arc<LeaseManager>,
+    /// Per-key object sizes behind `Storage::stats` (stats.go
+    /// `resourceSizeEstimator`), fed by the reads and writes that hold the
+    /// encoded value.
+    sizes: Arc<crate::size_estimator::SizeEstimator>,
 }
 
 /// `defaultLeaseReuseDurationSeconds` and `defaultLeaseMaxObjectCount`
@@ -162,6 +166,7 @@ impl EtcdStorage {
             page_size: DEFAULT_LIST_PAGE_SIZE,
             compact_revision: Arc::new(AtomicI64::new(0)),
             leases: Arc::new(LeaseManager::new()),
+            sizes: Default::default(),
         })
     }
 
@@ -312,6 +317,7 @@ impl EtcdStorage {
                     .value_str()
                     .map_err(|e| Error::Storage(format!("Invalid UTF-8 in value: {}", e)))?;
                 let mod_revision = kv.mod_revision();
+                self.sizes.update_key(key_str, json.len(), mod_revision);
 
                 // Inject resourceVersion and deserialize in one step
                 let json_with_rv = Self::inject_resource_version(json, mod_revision);
@@ -420,6 +426,8 @@ impl Storage for EtcdStorage {
         // the read-back GET this used to carry was always redundant.
         let mod_revision = txn_resp.header().map(|h| h.revision()).unwrap_or(0);
 
+        self.sizes.update_key(key, json.len(), mod_revision);
+
         // Inject resourceVersion and deserialize
         let json_with_rv = Self::inject_resource_version(&json, mod_revision);
         serde_json::from_str(&json_with_rv).map_err(Error::Serialization)
@@ -442,6 +450,7 @@ impl Storage for EtcdStorage {
                 .map_err(|e| Error::Storage(format!("Invalid UTF-8 in value: {}", e)))?;
 
             let mod_revision = kv.mod_revision();
+            self.sizes.update_key(key, json.len(), mod_revision);
             let json_with_rv = Self::inject_resource_version(json, mod_revision);
             serde_json::from_str(&json_with_rv).map_err(Error::Serialization)
         } else {
@@ -523,6 +532,7 @@ impl Storage for EtcdStorage {
             // Single-op success branch: the header revision is the new
             // mod_revision.
             let mod_revision = txn_resp.header().map(|h| h.revision()).unwrap_or(0);
+            self.sizes.update_key(key, json.len(), mod_revision);
 
             let json_with_rv = Self::inject_resource_version(&json, mod_revision);
             serde_json::from_str(&json_with_rv).map_err(Error::Serialization)
@@ -532,6 +542,7 @@ impl Storage for EtcdStorage {
             let mod_revision = self.put_guaranteed(key, &json, ttl).await?;
 
             debug!("Updated resource at key: {}", key);
+            self.sizes.update_key(key, json.len(), mod_revision);
 
             let json_with_rv = Self::inject_resource_version(&json, mod_revision);
             serde_json::from_str(&json_with_rv).map_err(Error::Serialization)
@@ -570,6 +581,8 @@ impl Storage for EtcdStorage {
                 .map_err(|e| Error::Storage(format!("Failed to delete resource: {}", e)))?;
             if resp.succeeded() {
                 debug!("Deleted resource at key: {}", key);
+                let rev = resp.header().map(|h| h.revision()).unwrap_or(0);
+                self.sizes.delete_key(key, rev);
                 return Ok(());
             }
         }
@@ -594,6 +607,46 @@ impl Storage for EtcdStorage {
         T: Serialize + DeserializeOwned + Send + Sync,
     {
         self.list_inner(prefix, Some(revision)).await
+    }
+
+    /// `storage/etcd3/stats.go` `resourceSizeEstimator.Stats`: a keys-only
+    /// read of the prefix for the count, the average size from the per-key
+    /// cache. Walks the range in pages like `list_inner`.
+    async fn stats(&self, prefix: &str) -> Result<crate::ResourceStats> {
+        let mut client = self.client.clone();
+        let page_size = self.page_size;
+        let range_end = prefix_range_end(prefix.as_bytes());
+        let mut next_start: Vec<u8> = prefix.as_bytes().to_vec();
+        let mut keys: Vec<String> = Vec::new();
+        loop {
+            let opts = GetOptions::new()
+                .with_range(range_end.clone())
+                .with_limit(page_size)
+                .with_keys_only();
+            let resp = client
+                .get(next_start.clone(), Some(opts))
+                .await
+                .map_err(|e| Error::Storage(format!("Failed to list keys: {}", e)))?;
+            let kvs = resp.kvs();
+            for kv in kvs {
+                keys.push(
+                    kv.key_str()
+                        .map_err(|e| Error::Storage(format!("Invalid UTF-8 in key: {}", e)))?
+                        .to_string(),
+                );
+            }
+            if (kvs.len() as i64) < page_size {
+                break;
+            }
+            match kvs.last() {
+                Some(last) => {
+                    next_start = last.key().to_vec();
+                    next_start.push(0);
+                }
+                None => break,
+            }
+        }
+        Ok(self.sizes.stats(prefix, &keys))
     }
 
     async fn watch_from_revision(&self, prefix: &str, revision: i64) -> Result<WatchStream> {
