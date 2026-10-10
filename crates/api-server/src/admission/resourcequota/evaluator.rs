@@ -41,6 +41,9 @@ pub trait Evaluator: Send + Sync {
     /// whole request because the `status` subresource decides on the objects
     /// (persistent_volume_claims.go:96-111).
     fn handles(&self, a: &Attributes<'_>) -> bool;
+    /// `GroupResource`: the resource this evaluator tracks, which
+    /// `filterLimitedResourcesByGroupResource` compares against.
+    fn group_resource(&self) -> GroupResource;
     /// `MatchingResources`: the subset of `input` this evaluator tracks.
     fn matching_resources(&self, input: &[String]) -> Vec<String>;
     /// `Usage`: what `obj` consumes.
@@ -147,6 +150,7 @@ pub fn object_count_quota_resource_name_for(gr: &GroupResource) -> String {
 /// `objectCountEvaluator` (evaluator.go:258-340): one of each resource name
 /// per object, charged on CREATE only.
 pub struct ObjectCountEvaluator {
+    group_resource: GroupResource,
     resource_names: Vec<String>,
 }
 
@@ -157,11 +161,18 @@ impl ObjectCountEvaluator {
         if let Some(alias) = alias {
             resource_names.push(alias.to_string());
         }
-        Self { resource_names }
+        Self {
+            group_resource: gr.clone(),
+            resource_names,
+        }
     }
 }
 
 impl Evaluator for ObjectCountEvaluator {
+    fn group_resource(&self) -> GroupResource {
+        self.group_resource.clone()
+    }
+
     /// evaluator.go:275-282: count objects on create, never on a
     /// subresource.
     fn handles(&self, a: &Attributes<'_>) -> bool {
@@ -191,6 +202,10 @@ const SERVICES_LOAD_BALANCERS: &str = "services.loadbalancers";
 pub struct ServiceEvaluator;
 
 impl Evaluator for ServiceEvaluator {
+    fn group_resource(&self) -> GroupResource {
+        GroupResource::new("", "services")
+    }
+
     /// services.go:67-75: create and update, since a type change moves
     /// usage between node ports and load balancers.
     fn handles(&self, a: &Attributes<'_>) -> bool {
@@ -248,6 +263,10 @@ impl Evaluator for ServiceEvaluator {
 pub struct PersistentVolumeClaimEvaluator;
 
 impl Evaluator for PersistentVolumeClaimEvaluator {
+    fn group_resource(&self) -> GroupResource {
+        GroupResource::new("", "persistentvolumeclaims")
+    }
+
     /// persistent_volume_claims.go:96-111: create and update of the claim
     /// itself; on `status`, only an update that `RequiresQuotaReplenish`
     /// (an object that does not decode is not handled).
@@ -353,6 +372,10 @@ fn decode_pod(obj: &Value) -> Result<Pod, String> {
 pub struct PodEvaluator;
 
 impl Evaluator for PodEvaluator {
+    fn group_resource(&self) -> GroupResource {
+        GroupResource::new("", "pods")
+    }
+
     /// `Handles` (pods.go:179-199): a create, a `resize`, and an update only
     /// when the pod moves between the Terminating scopes. Anything it cannot
     /// decode is not handled.

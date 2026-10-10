@@ -13,11 +13,14 @@
 //! ([`crate::admission::lock_namespace_quota`]) serialises them, and the
 //! optimistic status update is the cross-api-server guard, as upstream's is.
 //!
-//! `LimitedResources` (the admission configuration's
-//! `limitedResources`) is not configurable here, so it is always empty, as
-//! in upstream's default configuration.
+//! `LimitedResources` (the admission configuration's `limitedResources`) is
+//! read from the `ResourceQuota` entry of `--admission-control-config-file`
+//! ([`config`]); empty by default, as in upstream.
 
+pub mod config;
 pub mod evaluator;
+
+pub use config::LimitedResource;
 
 use std::collections::HashMap;
 
@@ -27,6 +30,8 @@ use rusternetes_common::resources::ResourceQuota;
 use rusternetes_common::{Error, Result};
 use rusternetes_storage::{build_key, build_prefix, Storage};
 use serde_json::Value;
+
+use rusternetes_common::resources::ScopedResourceSelectorRequirement;
 
 use self::evaluator::{status_hard_names, Evaluator};
 use crate::registry::rest::GroupResource;
@@ -92,16 +97,18 @@ pub(crate) fn pretty_print_resource_names(names: &[String]) -> String {
 }
 
 /// `CheckRequest` (controller.go:470-633): whether `a` fits every quota, and
-/// the quotas with the usage it would add. `LimitedResources` is empty, so
-/// the limited-by-default and limited-scope checks never fire.
+/// the quotas with the usage it would add. `limited` is the configuration's
+/// `LimitedResources`.
 pub fn check_request(
     quotas: &[ResourceQuota],
     a: &Attributes<'_>,
     evaluator: &dyn Evaluator,
+    limited: &[LimitedResource],
 ) -> std::result::Result<Vec<ResourceQuota>, QuotaError> {
     if !evaluator.handles(a) {
         return Ok(quotas.to_vec());
     }
+    let limited_scopes: Vec<ScopedResourceSelectorRequirement> = Vec::new();
 
     // The quotas pertinent to this request (controller.go:505-536).
     let mut interesting: Vec<usize> = Vec::new();
@@ -201,8 +208,7 @@ pub fn check_request(
     }
 
     // Every limited scope needs a covering quota scope (controller.go:
-    // 617-625). `LimitedResources` is empty, so no scope is limited.
-    let limited_scopes = Vec::new();
+    // 617-625).
     let uncovered = evaluator
         .uncovered_quota_scopes(&limited_scopes, &restricted_scopes)
         .map_err(QuotaError::Other)?;
@@ -270,10 +276,11 @@ async fn check_quotas<S: Storage>(
     mut quotas: Vec<ResourceQuota>,
     a: &Attributes<'_>,
     evaluator: &dyn Evaluator,
+    limited: &[LimitedResource],
     mut remaining_retries: u32,
 ) -> std::result::Result<(), QuotaError> {
     loop {
-        let new_quotas = check_request(&quotas, a, evaluator)?;
+        let new_quotas = check_request(&quotas, a, evaluator, limited)?;
         if a.dry_run {
             return Ok(());
         }
@@ -327,6 +334,16 @@ pub async fn evaluate<S: Storage>(
     evaluator: &dyn Evaluator,
     a: &Attributes<'_>,
 ) -> std::result::Result<(), QuotaError> {
+    evaluate_with(storage, evaluator, a, config::installed_limited_resources()).await
+}
+
+/// [`evaluate`] with an explicit `LimitedResources` configuration.
+pub async fn evaluate_with<S: Storage>(
+    storage: &S,
+    evaluator: &dyn Evaluator,
+    a: &Attributes<'_>,
+    limited: &[LimitedResource],
+) -> std::result::Result<(), QuotaError> {
     if a.namespace.is_empty() || !evaluator.handles(a) {
         return Ok(());
     }
@@ -335,10 +352,11 @@ pub async fn evaluate<S: Storage>(
     let quotas = get_quotas(storage, a.namespace)
         .await
         .map_err(|e| QuotaError::Other(e.to_string()))?;
-    if quotas.is_empty() {
+    // `limitedResourcesDisabled` (controller.go:200-201).
+    if quotas.is_empty() && limited.is_empty() {
         return Ok(());
     }
-    check_quotas(storage, quotas, a, evaluator, 3).await
+    check_quotas(storage, quotas, a, evaluator, limited, 3).await
 }
 
 /// `admission.NewForbidden` (apiserver/pkg/admission/errors.go:53-63):
