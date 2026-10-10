@@ -640,7 +640,7 @@ async fn test_content_type_apply_patch_yaml_routes_to_ssa() {
     let (status, response_body) = send_with_ct(
         router,
         Method::PATCH,
-        "/api/v1/namespaces/default/pods/ssa-pod?fieldManager=test-mgr",
+        "/api/v1/namespaces/default/pods/ssa-pod?fieldManager=test-mgr&force=true",
         "application/apply-patch+yaml",
         serde_json::to_vec(&apply_doc).unwrap(),
     )
