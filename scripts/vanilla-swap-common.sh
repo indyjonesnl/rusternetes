@@ -1256,6 +1256,26 @@ vs_dump_test_failure_diagnostics() {
       || true
   done
 
+  # The `-l component=...` selectors above print "No resources found" in the
+  # kind-based legs (runs 37999791963, 38023885826), so a stuck GC spec left no
+  # controller-manager evidence (#3005). Read the static pods' logs through the
+  # node's CRI instead, and keep the GC lines: error lines such as
+  # "orphanDependents for ... failed" / "removeOrphanFinalizer for ... failed"
+  # (pkg/controller/garbagecollector/garbagecollector.go:755,761) are what say
+  # why an owner never lost its `orphan` finalizer.
+  local node cid
+  while IFS= read -r node; do
+    case "$node" in *control-plane) ;; *) continue ;; esac
+    for component in kube-controller-manager kube-apiserver; do
+      cid="$(docker exec "$node" crictl ps -a --name "$component" -q 2>/dev/null | head -n1)"
+      [ -n "$cid" ] || continue
+      echo "--- crictl ${component} on ${node}: GC / orphan / error lines (last 3000) ---" >&2
+      docker exec "$node" crictl logs --tail 3000 "$cid" 2>&1 \
+        | grep -Ei 'garbagecollector|garbage_collector|orphan|finaliz| E[0-9]{4} ' \
+        | tail -n 120 >&2 || true
+    done
+  done < <(docker ps --filter "name=^${cluster}-" --format '{{.Names}}' 2>/dev/null)
+
   echo "--- pods (all namespaces) ---" >&2
   KUBECONFIG="$kubeconfig" kubectl get pods -A -o wide >&2 2>&1 || true
 
