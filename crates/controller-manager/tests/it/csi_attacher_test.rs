@@ -285,27 +285,28 @@ async fn attach_publishes_and_marks_attached() {
     );
     assert_eq!(got.metadata.annotations.unwrap()[NODE_ID_ANN], "csi-node-1");
 
-    let rec = e.rec.lock().unwrap();
-    assert_eq!(rec.publish.len(), 1);
-    let req = &rec.publish[0];
-    assert_eq!(req.volume_id, "vol-1");
-    assert_eq!(req.node_id, "csi-node-1");
-    assert!(!req.readonly);
-    assert_eq!(req.volume_context["shape"], "round");
-    assert_eq!(req.secrets["token"], "s3cret");
-    let cap = req.volume_capability.as_ref().unwrap();
-    match cap.access_type.as_ref().unwrap() {
-        volume_capability::AccessType::Mount(m) => {
-            assert_eq!(m.fs_type, "xfs");
-            assert_eq!(m.mount_flags, vec!["noatime".to_string()]);
+    {
+        let rec = e.rec.lock().unwrap();
+        assert_eq!(rec.publish.len(), 1);
+        let req = &rec.publish[0];
+        assert_eq!(req.volume_id, "vol-1");
+        assert_eq!(req.node_id, "csi-node-1");
+        assert!(!req.readonly);
+        assert_eq!(req.volume_context["shape"], "round");
+        assert_eq!(req.secrets["token"], "s3cret");
+        let cap = req.volume_capability.as_ref().unwrap();
+        match cap.access_type.as_ref().unwrap() {
+            volume_capability::AccessType::Mount(m) => {
+                assert_eq!(m.fs_type, "xfs");
+                assert_eq!(m.mount_flags, vec!["noatime".to_string()]);
+            }
+            other => panic!("expected mount, got {other:?}"),
         }
-        other => panic!("expected mount, got {other:?}"),
+        assert_eq!(
+            cap.access_mode.as_ref().unwrap().mode,
+            volume_capability::access_mode::Mode::SingleNodeWriter as i32
+        );
     }
-    assert_eq!(
-        cap.access_mode.as_ref().unwrap().mode,
-        volume_capability::access_mode::Mode::SingleNodeWriter as i32
-    );
-    drop(rec);
 
     // The PV is protected from deletion while attached
     // (`addPVFinalizer`, csi_handler.go:342-363).
@@ -396,12 +397,13 @@ async fn detach_unpublishes_and_releases_the_object() {
     mark_deleting(&e).await;
     e.attacher.reconcile_all().await.unwrap();
 
-    let rec = e.rec.lock().unwrap();
-    assert_eq!(rec.unpublish.len(), 1);
-    assert_eq!(rec.unpublish[0].volume_id, "vol-1");
-    assert_eq!(rec.unpublish[0].node_id, "csi-node-1");
-    assert_eq!(rec.unpublish[0].secrets["token"], "s3cret");
-    drop(rec);
+    {
+        let rec = e.rec.lock().unwrap();
+        assert_eq!(rec.unpublish.len(), 1);
+        assert_eq!(rec.unpublish[0].volume_id, "vol-1");
+        assert_eq!(rec.unpublish[0].node_id, "csi-node-1");
+        assert_eq!(rec.unpublish[0].secrets["token"], "s3cret");
+    }
     let key = build_key("volumeattachments", None, "va1");
     assert!(
         e.storage.get::<VolumeAttachment>(&key).await.is_err(),
