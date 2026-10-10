@@ -182,7 +182,7 @@ const MAX_DNS_SEARCH_LIST_CHARS: usize = 2048;
 /// Upstream `utilvalidation.DNS1123SubdomainMaxLength`.
 const DNS1123_SUBDOMAIN_MAX_LENGTH: usize = 253;
 /// Upstream `maxResolvConfLength` (`dns.go:56`).
-pub const MAX_RESOLV_CONF_LENGTH: u64 = 10 * 1 << 20;
+pub const MAX_RESOLV_CONF_LENGTH: u64 = 10 << 20;
 
 /// Upstream `appendOptions` (`dns.go:357`): later options override earlier ones
 /// of the same name (the part before `:`). Order is first-seen (Go's map
