@@ -771,11 +771,15 @@ mod stats_tests {
     //! (#2869; upstream `storage/etcd3/stats.go` `resourceSizeEstimator.Stats`),
     //! not a list that decodes and re-encodes every object once a minute.
     use super::*;
-    use rhino::backend::{Backend, KeyValue, Result as BResult, WatchResult};
+    use futures::StreamExt;
+    use rhino::backend::{Backend, Event, KeyValue, Result as BResult, WatchResult};
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
 
     #[derive(Default)]
     struct Recording {
+        /// Events the backend watch replays, one batch.
+        watch_events: Mutex<Vec<Event>>,
         saw_keys_only: AtomicBool,
         saw_value_read: AtomicBool,
     }
@@ -858,7 +862,14 @@ mod stats_tests {
             unimplemented!()
         }
         async fn watch(&self, _: &str, _: i64) -> BResult<WatchResult> {
-            unimplemented!()
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            let batch = std::mem::take(&mut *self.watch_events.lock().unwrap());
+            tx.send(batch).await.unwrap();
+            Ok(WatchResult {
+                current_revision: 9,
+                compact_revision: 0,
+                events: rx,
+            })
         }
         async fn db_size(&self) -> BResult<i64> {
             Ok(0)
@@ -902,5 +913,68 @@ mod stats_tests {
             !s.backend.saw_value_read.load(Ordering::SeqCst),
             "stats must not read object values"
         );
+    }
+
+    fn put(key: &str, value: &[u8], rev: i64, create: bool) -> Event {
+        Event {
+            delete: false,
+            create,
+            kv: kv(key, value, rev),
+            prev_kv: None,
+        }
+    }
+
+    async fn drain(s: &RhinoStorage<Recording>) {
+        let mut w = Storage::watch_from_revision(s, "/registry/pods/", 1)
+            .await
+            .unwrap();
+        while w.next().await.is_some() {}
+    }
+
+    /// Upstream feeds the estimator from watch events
+    /// (`storage/etcd3/watcher.go:408-415`: `UpdateKey` on PUT, `DeleteKey`
+    /// on DELETE), so a resource nobody lists/gets/writes still reports a
+    /// size (#2991).
+    #[tokio::test]
+    async fn watch_put_event_feeds_the_size_estimator() {
+        let value = br#"{"metadata":{"name":"a"},"spec":{}}"#;
+        let b = Recording::default();
+        b.watch_events
+            .lock()
+            .unwrap()
+            .push(put("/registry/pods/ns/a", value, 10, true));
+        let s = RhinoStorage {
+            backend: Arc::new(b),
+            bus: None,
+            sizes: Default::default(),
+        };
+        drain(&s).await;
+        let st = Storage::stats(&s, "/registry/pods/").await.unwrap();
+        assert_eq!(st.estimated_average_object_size_bytes, value.len() as i64);
+    }
+
+    #[tokio::test]
+    async fn watch_delete_event_drops_the_key_from_the_size_estimator() {
+        let value = br#"{"metadata":{"name":"a"},"spec":{}}"#;
+        let b = Recording::default();
+        b.watch_events.lock().unwrap().extend([
+            put("/registry/pods/ns/a", value, 10, true),
+            Event {
+                delete: true,
+                create: false,
+                kv: kv("/registry/pods/ns/a", b"", 11),
+                prev_kv: Some(kv("/registry/pods/ns/a", value, 10)),
+            },
+        ]);
+        let s = RhinoStorage {
+            backend: Arc::new(b),
+            bus: None,
+            sizes: Default::default(),
+        };
+        drain(&s).await;
+        // Recording lists keys a and b; only b's size is unknown, and a's
+        // delete must have evicted its cached size.
+        let st = Storage::stats(&s, "/registry/pods/").await.unwrap();
+        assert_eq!(st.estimated_average_object_size_bytes, 0);
     }
 }
