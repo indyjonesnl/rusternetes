@@ -5,7 +5,7 @@ use rusternetes_common::resources::volume::{
 };
 use rusternetes_common::resources::{
     EventSource, EventType, PersistentVolume, PersistentVolumeClaim, PersistentVolumeStatus,
-    StorageClass, VolumeSnapshot, VolumeSnapshotContent,
+    StorageClass,
 };
 use rusternetes_common::types::{ObjectMeta, TypeMeta};
 use rusternetes_storage::{build_key, extract_key, EventRecorder, Storage, WorkQueue};
@@ -14,6 +14,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
 use tracing::{debug, error, info, warn};
+
+/// `hostPathPluginName` (pkg/volume/hostpath/host_path.go:77), the plugin
+/// that backs this controller's provisioners.
+const HOSTPATH_PLUGIN_NAME: &str = "kubernetes.io/host-path";
 
 pub struct DynamicProvisionerController<S: Storage> {
     storage: Arc<S>,
@@ -25,6 +29,36 @@ impl<S: Storage + 'static> DynamicProvisionerController<S> {
         Self {
             recorder: EventRecorder::new(Arc::clone(&storage)),
             storage,
+        }
+    }
+
+    /// `ctrl.eventRecorder.Event(claim, v1.EventTypeWarning,
+    /// events.ProvisioningFailed, strerr)` (pv_controller.go:1632).
+    async fn record_provisioning_failed(&self, pvc: &PersistentVolumeClaim, msg: &str) {
+        let involved = ObjectReference {
+            kind: Some("PersistentVolumeClaim".to_string()),
+            namespace: pvc.metadata.namespace.clone(),
+            name: Some(pvc.metadata.name.clone()),
+            uid: Some(pvc.metadata.uid.clone()),
+            api_version: Some("v1".to_string()),
+            ..Default::default()
+        };
+        let source = EventSource {
+            component: "persistentvolume-controller".to_string(),
+            host: None,
+        };
+        if let Err(e) = self
+            .recorder
+            .event(
+                &involved,
+                &source,
+                EventType::Warning,
+                "ProvisioningFailed",
+                msg,
+            )
+            .await
+        {
+            warn!("failed to record ProvisioningFailed event: {e}");
         }
     }
 
@@ -307,7 +341,22 @@ impl<S: Storage + 'static> DynamicProvisionerController<S> {
             return Ok(());
         }
 
-        // Create the PV (with snapshot restore if dataSource is specified)
+        // provisionClaimOperation, pv_controller.go:1628-1636: only the CSI
+        // plugin can provision a claim with a dataSource. Cloning and
+        // snapshot restore belong to the external provisioner
+        // (CSI CreateVolume with a VolumeContentSource) and volume populators,
+        // not to kube-controller-manager. Every in-tree plugin here (hostpath)
+        // is non-CSI, so refuse and record the warning event.
+        if pvc.spec.data_source.is_some() {
+            let msg = format!(
+                "plugin \"{}\" is not a CSI plugin. Only CSI plugin can provision a claim with a datasource",
+                HOSTPATH_PLUGIN_NAME
+            );
+            self.record_provisioning_failed(pvc, &msg).await;
+            return Err(anyhow::anyhow!(msg));
+        }
+
+        // Create the PV
         let pv = self
             .create_pv_for_pvc(&storage_class, pvc, &pv_name)
             .await?;
@@ -363,30 +412,11 @@ impl<S: Storage + 'static> DynamicProvisionerController<S> {
 
         let volume_path = format!("{}/{}", base_path, pv_name);
 
-        // Check if this PVC is being restored from a snapshot
-        let snapshot_source_path = if let Some(data_source) = &pvc.spec.data_source {
-            self.handle_snapshot_restore(data_source, namespace, &volume_path)
-                .await?
-        } else {
-            None
-        };
-
-        let message = if snapshot_source_path.is_some() {
-            Some("Dynamically provisioned from snapshot".to_string())
-        } else {
-            Some("Dynamically provisioned".to_string())
-        };
+        let message = Some("Dynamically provisioned".to_string());
 
         info!(
-            "Creating PV {} with path {} and capacity {}{}",
-            pv_name,
-            volume_path,
-            requested_storage,
-            if snapshot_source_path.is_some() {
-                " (restored from snapshot)"
-            } else {
-                ""
-            }
+            "Creating PV {} with path {} and capacity {}",
+            pv_name, volume_path, requested_storage
         );
 
         // Validate provisioner type
@@ -483,91 +513,6 @@ impl<S: Storage + 'static> DynamicProvisionerController<S> {
         };
 
         Ok(pv)
-    }
-
-    /// Handle snapshot restore by validating the snapshot and returning the source path
-    async fn handle_snapshot_restore(
-        &self,
-        data_source: &rusternetes_common::resources::volume::TypedLocalObjectReference,
-        namespace: &str,
-        target_path: &str,
-    ) -> Result<Option<String>> {
-        // Check if data source is a VolumeSnapshot
-        if data_source.kind != "VolumeSnapshot" {
-            warn!(
-                "Unsupported dataSource kind: {}. Only VolumeSnapshot is supported for restore.",
-                data_source.kind
-            );
-            return Ok(None);
-        }
-
-        let snapshot_name = &data_source.name;
-        info!(
-            "PVC is requesting restore from VolumeSnapshot {}/{}",
-            namespace, snapshot_name
-        );
-
-        // Get the VolumeSnapshot
-        let snapshot_key = build_key("volumesnapshots", Some(namespace), snapshot_name);
-        let snapshot: VolumeSnapshot =
-            self.storage.get(&snapshot_key).await.with_context(|| {
-                format!("VolumeSnapshot {}/{} not found", namespace, snapshot_name)
-            })?;
-
-        // Ensure snapshot is ready to use
-        let ready = snapshot
-            .status
-            .as_ref()
-            .and_then(|s| s.ready_to_use)
-            .unwrap_or(false);
-
-        if !ready {
-            return Err(anyhow::anyhow!(
-                "VolumeSnapshot {}/{} is not ready to use",
-                namespace,
-                snapshot_name
-            ));
-        }
-
-        // Get the bound VolumeSnapshotContent
-        let content_name = snapshot
-            .status
-            .as_ref()
-            .and_then(|s| s.bound_volume_snapshot_content_name.as_ref())
-            .context("VolumeSnapshot has no bound VolumeSnapshotContent")?;
-
-        let content_key = build_key("volumesnapshotcontents", None, content_name);
-        let content: VolumeSnapshotContent = self
-            .storage
-            .get(&content_key)
-            .await
-            .with_context(|| format!("VolumeSnapshotContent {} not found", content_name))?;
-
-        // Get the snapshot handle (this would be the path to the snapshot data)
-        let snapshot_handle = content
-            .status
-            .as_ref()
-            .and_then(|s| s.snapshot_handle.as_ref())
-            .context("VolumeSnapshotContent has no snapshot handle")?;
-
-        info!(
-            "Restoring from snapshot {} (handle: {}) to {}",
-            content_name, snapshot_handle, target_path
-        );
-
-        // In a real implementation, this would:
-        // 1. Copy data from the snapshot location to the new volume location
-        // 2. For hostpath volumes, this could be a directory copy
-        // 3. For CSI volumes, this would invoke the CSI driver's CreateVolumeFromSnapshot
-
-        // For now, we'll just log the operation and mark it as successful
-        // The actual data copy would be handled by the CSI driver or volume plugin
-        info!(
-            "Snapshot restore simulated: {} -> {}. In production, this would copy snapshot data.",
-            snapshot_handle, target_path
-        );
-
-        Ok(Some(snapshot_handle.clone()))
     }
 }
 
