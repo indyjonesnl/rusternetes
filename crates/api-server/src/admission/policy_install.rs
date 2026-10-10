@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rusternetes_common::admission::GroupVersionKind;
+use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
 use rusternetes_common::resources::Namespace;
 use rusternetes_common::Error;
 use rusternetes_storage::Storage;
@@ -24,15 +24,39 @@ use serde_json::Value;
 
 use super::policy_dispatch::ParamScope;
 use super::policy_mutating::{NamespaceObjects, TypeConverters};
-use super::policy_plugin::HookSource;
 use super::policy_source::{RestMapper, RestMapping};
 
 /// `meta.RESTMapper` over the resources this server serves.
 pub struct DiscoveryRestMapper;
 
 impl RestMapper for DiscoveryRestMapper {
-    fn rest_mapping(&self, _group: &str, _kind: &str, _version: &str) -> Result<RestMapping, String> {
-        Err("unimplemented".into())
+    /// `RESTMapping(GroupKind, version)`: a kind that is not served is
+    /// upstream's `NoKindMatchError`.
+    fn rest_mapping(&self, group: &str, kind: &str, version: &str) -> Result<RestMapping, String> {
+        let (resource, namespaced) =
+            rusternetes_discovery::resolve_kind_to_resource_and_scope(group, version, kind)
+                .ok_or_else(|| {
+                    format!(
+                        "no matches for kind \"{kind}\" in version \"{}\"",
+                        if group.is_empty() {
+                            version.to_string()
+                        } else {
+                            format!("{group}/{version}")
+                        }
+                    )
+                })?;
+        Ok(RestMapping {
+            resource: GroupVersionResource {
+                group: group.to_string(),
+                version: version.to_string(),
+                resource,
+            },
+            scope: if namespaced {
+                ParamScope::Namespace
+            } else {
+                ParamScope::Root
+            },
+        })
     }
 }
 
@@ -49,9 +73,12 @@ impl<S: Storage> StorageNamespaceObjects<S> {
 
 #[async_trait]
 impl<S: Storage> NamespaceObjects for StorageNamespaceObjects<S> {
-    async fn get_namespace(&self, _name: &str) -> Result<Value, Error> {
-        let _ = (&self.storage, std::marker::PhantomData::<Namespace>);
-        Err(Error::Internal("unimplemented".into()))
+    async fn get_namespace(&self, name: &str) -> Result<Value, Error> {
+        let ns: Namespace = self
+            .storage
+            .get(&rusternetes_storage::build_key("namespaces", None, name))
+            .await?;
+        serde_json::to_value(ns).map_err(|e| Error::Internal(e.to_string()))
     }
 }
 
@@ -59,8 +86,9 @@ impl<S: Storage> NamespaceObjects for StorageNamespaceObjects<S> {
 pub struct RegistryTypeConverters;
 
 impl TypeConverters for RegistryTypeConverters {
-    fn has_type_converter(&self, _kind: &GroupVersionKind) -> bool {
-        false
+    fn has_type_converter(&self, kind: &GroupVersionKind) -> bool {
+        rusternetes_discovery::resolve_kind_to_resource(&kind.group, &kind.version, &kind.kind)
+            .is_some()
     }
 }
 
@@ -108,7 +136,10 @@ mod tests {
         let mut ns = Namespace::new("team-a");
         ns.metadata.labels = Some([("env".to_string(), "dev".to_string())].into());
         storage
-            .create(&rusternetes_storage::build_key("namespaces", None, "team-a"), &ns)
+            .create(
+                &rusternetes_storage::build_key("namespaces", None, "team-a"),
+                &ns,
+            )
             .await
             .unwrap();
         let got = StorageNamespaceObjects::new(storage)
