@@ -4,6 +4,7 @@
 //! (`mutating/plugin.go` `InspectFeatureGates`).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -26,6 +27,7 @@ use rusternetes_common::feature_gates::{with_feature, Feature};
 use rusternetes_common::observability::MetricsRegistry;
 use rusternetes_common::resources::mutating_admission_policy::{
     MutatingAdmissionPolicyBindingSpec, MutatingAdmissionPolicySpec, Mutation, PatchType,
+    ReinvocationPolicyType,
 };
 use rusternetes_common::resources::validating_admission_policy::{
     MatchPolicyType, NamedRuleWithOperations, OperationType, RuleWithOperations,
@@ -115,8 +117,18 @@ impl Patcher for SetLabel {
     }
 }
 
+type Hook = PolicyHook<MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding, MutatingEvaluator>;
+
 fn plugin() -> Arc<MutatingPolicyPlugin> {
-    let mut p = MutatingAdmissionPolicy::new("p");
+    plugin_with(vec![hook("p", None, Arc::new(SetLabel))])
+}
+
+fn hook(
+    name: &str,
+    reinvocation: Option<ReinvocationPolicyType>,
+    patcher: Arc<dyn Patcher>,
+) -> Hook {
+    let mut p = MutatingAdmissionPolicy::new(name);
     p.spec = Some(MutatingAdmissionPolicySpec {
         match_constraints: Some(MatchResources {
             namespace_selector: Some(LabelSelector::default()),
@@ -139,26 +151,30 @@ fn plugin() -> Arc<MutatingPolicyPlugin> {
             apply_configuration: None,
             json_patch: None,
         }]),
+        reinvocation_policy: reinvocation,
         ..Default::default()
     });
-    let mut b = MutatingAdmissionPolicyBinding::new("b");
+    let mut b = MutatingAdmissionPolicyBinding::new(&format!("{name}-b"));
     b.spec = Some(MutatingAdmissionPolicyBindingSpec {
-        policy_name: Some("p".into()),
+        policy_name: Some(name.into()),
         ..Default::default()
     });
-    let hook = PolicyHook {
+    PolicyHook {
         policy: p,
         bindings: vec![b],
         param_store: None,
         param_scope: ParamScope::Root,
         evaluator: MutatingEvaluator {
             matcher: None,
-            mutators: vec![Some(Arc::new(SetLabel))],
+            mutators: vec![Some(patcher)],
         },
         configuration_error: None,
-    };
+    }
+}
+
+fn plugin_with(hooks: Vec<Hook>) -> Arc<MutatingPolicyPlugin> {
     Arc::new(MutatingPolicyPlugin {
-        source: Arc::new(Source(Arc::new(vec![hook]))),
+        source: Arc::new(Source(Arc::new(hooks))),
         namespaces: Arc::new(Fakes),
         mapper: Arc::new(Fakes),
         namespace_objects: Arc::new(Fakes),
@@ -168,6 +184,10 @@ fn plugin() -> Arc<MutatingPolicyPlugin> {
 }
 
 fn state(install: bool) -> ApiServerState {
+    state_with(install.then(plugin))
+}
+
+fn state_with(plugin: Option<Arc<MutatingPolicyPlugin>>) -> ApiServerState {
     let backend = Arc::new(StorageBackend::Memory(Arc::new(MemoryStorage::new())));
     let s = ApiServerState::new(
         backend,
@@ -176,10 +196,9 @@ fn state(install: bool) -> ApiServerState {
         Arc::new(MetricsRegistry::new()),
         true,
     );
-    if install {
-        s.with_mutating_admission_policy(plugin())
-    } else {
-        s
+    match plugin {
+        Some(p) => s.with_mutating_admission_policy(p),
+        None => s,
     }
 }
 
@@ -246,4 +265,66 @@ async fn gate_on_without_an_installed_plugin_is_a_no_op() {
     let _g = with_feature(Feature::MutatingAdmissionPolicy, true);
     let cm = admit(&state(false), Operation::Create).await;
     assert_eq!(labels(&cm), None);
+}
+
+/// Adds `key=value` to the labels and counts its invocations.
+struct Counting {
+    key: &'static str,
+    calls: Arc<AtomicUsize>,
+}
+#[async_trait]
+impl Patcher for Counting {
+    async fn patch(&self, r: &PatchRequest<'_>) -> Result<Value, PatchError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let mut o = r.versioned_attributes.versioned_object.clone().unwrap();
+        o["metadata"]["labels"][self.key] = json!("yes");
+        Ok(o)
+    }
+}
+
+fn counting(
+    name: &str,
+    policy: Option<ReinvocationPolicyType>,
+    key: &'static str,
+) -> (Hook, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let patcher = Arc::new(Counting {
+        key,
+        calls: calls.clone(),
+    });
+    (hook(name, policy, patcher), calls)
+}
+
+/// reinvocation.go `reinvoker.Admit`: a later mutation sets
+/// `ShouldReinvoke`, the chain runs a second time, and a policy with
+/// `reinvocationPolicy: IfNeeded` is run again.
+#[tokio::test]
+#[serial]
+async fn if_needed_policy_is_reinvoked_after_a_later_mutation() {
+    let _g = with_feature(Feature::MutatingAdmissionPolicy, true);
+    let (first, first_calls) = counting("first", Some(ReinvocationPolicyType::IfNeeded), "a");
+    let (second, second_calls) = counting("second", Some(ReinvocationPolicyType::Never), "b");
+    let state = state_with(Some(plugin_with(vec![first, second])));
+    let cm = admit(&state, Operation::Create).await;
+    assert_eq!(first_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        labels(&cm),
+        Some(HashMap::from([
+            ("a".to_string(), "yes".to_string()),
+            ("b".to_string(), "yes".to_string())
+        ]))
+    );
+}
+
+/// `reinvocationPolicy: Never` is not remembered, so it is not rerun.
+#[tokio::test]
+#[serial]
+async fn never_policy_is_not_reinvoked() {
+    let _g = with_feature(Feature::MutatingAdmissionPolicy, true);
+    let (first, first_calls) = counting("first", Some(ReinvocationPolicyType::Never), "a");
+    let (second, _) = counting("second", Some(ReinvocationPolicyType::Never), "b");
+    let state = state_with(Some(plugin_with(vec![first, second])));
+    admit(&state, Operation::Create).await;
+    assert_eq!(first_calls.load(Ordering::SeqCst), 1);
 }
