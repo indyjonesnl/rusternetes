@@ -26,7 +26,8 @@ use std::collections::HashMap;
 
 use rusternetes_common::resources::pod::HostAlias;
 use rusternetes_common::resources::{
-    Container, ContainerState, ContainerStatus, Pod, PodSpec, PodStatus, ResourceFieldSelector,
+    Container, ContainerState, ContainerStateTerminated, ContainerStatus, Pod, PodSpec, PodStatus,
+    ResourceFieldSelector,
 };
 use rusternetes_common::types::{ObjectMeta, ResourceRequirements, TypeMeta};
 use rusternetes_kubelet::downward_api::{
@@ -766,8 +767,12 @@ fn pod_terminated_state_for_log_lookup_propagates_exit_code() {
     let state = lifecycle::terminated_state_from_exit(0, None, None);
     let status = make_terminated_status("app", state);
     match status.state.as_ref().unwrap() {
-        ContainerState::Terminated {
-            exit_code, reason, ..
+        ContainerState {
+            terminated:
+                Some(ContainerStateTerminated {
+                    exit_code, reason, ..
+                }),
+            ..
         } => {
             assert_eq!(*exit_code, 0);
             assert_eq!(reason.as_deref(), Some("Completed"));
@@ -784,8 +789,12 @@ fn pod_terminated_state_for_log_lookup_propagates_exit_code() {
 fn pod_terminated_state_surfaces_nonzero_exit_with_error_reason() {
     let state = lifecycle::terminated_state_from_exit(42, None, None);
     match state {
-        ContainerState::Terminated {
-            exit_code, reason, ..
+        ContainerState {
+            terminated:
+                Some(ContainerStateTerminated {
+                    exit_code, reason, ..
+                }),
+            ..
         } => {
             assert_eq!(exit_code, 42);
             assert_eq!(reason.as_deref(), Some("Error"));

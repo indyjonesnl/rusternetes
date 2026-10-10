@@ -8,8 +8,8 @@
 //! pkg/kubelet/kubelet_pods.go, pkg/kubelet/prober/prober_manager.go
 
 use rusternetes_common::resources::{
-    Container, ContainerState, ContainerStatus, HTTPGetAction, Lifecycle, LifecycleHandler, Pod,
-    PodSpec, PodStatus,
+    Container, ContainerState, ContainerStateTerminated, ContainerStateWaiting, ContainerStatus,
+    HTTPGetAction, Lifecycle, LifecycleHandler, Pod, PodSpec, PodStatus,
 };
 use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
 use rusternetes_kubelet::kubelet::finalize_terminated_pod_storage;
@@ -106,14 +106,17 @@ fn make_pod(name: &str, restart_policy: &str, init: Vec<Container>, app: Vec<Con
 fn terminated_container_status(name: &str, exit_code: i32) -> ContainerStatus {
     ContainerStatus {
         name: name.to_string(),
-        state: Some(ContainerState::Terminated {
-            exit_code,
-            reason: Some(if exit_code == 0 { "Completed" } else { "Error" }.to_string()),
-            message: None,
-            started_at: None,
-            finished_at: None,
-            container_id: None,
-            signal: None,
+        state: Some(ContainerState {
+            terminated: Some(ContainerStateTerminated {
+                exit_code,
+                reason: Some(if exit_code == 0 { "Completed" } else { "Error" }.to_string()),
+                message: None,
+                started_at: None,
+                finished_at: None,
+                container_id: None,
+                signal: None,
+            }),
+            ..Default::default()
         }),
         ready: false, // deliberately false — tests verify the fixup
         restart_count: 0,
@@ -134,9 +137,12 @@ fn terminated_container_status(name: &str, exit_code: i32) -> ContainerStatus {
 fn waiting_container_status(name: &str, reason: &str) -> ContainerStatus {
     ContainerStatus {
         name: name.to_string(),
-        state: Some(ContainerState::Waiting {
-            reason: Some(reason.to_string()),
-            message: None,
+        state: Some(ContainerState {
+            waiting: Some(ContainerStateWaiting {
+                reason: Some(reason.to_string()),
+                message: None,
+            }),
+            ..Default::default()
         }),
         ready: false,
         restart_count: 0,
@@ -162,7 +168,11 @@ fn waiting_container_status(name: &str, reason: &str) -> ContainerStatus {
 fn fixup_init_container_ready(status: &mut PodStatus) {
     if let Some(ref mut ics) = status.init_container_statuses {
         for ic in ics.iter_mut() {
-            if let Some(ContainerState::Terminated { exit_code, .. }) = &ic.state {
+            if let Some(ContainerState {
+                terminated: Some(ContainerStateTerminated { exit_code, .. }),
+                ..
+            }) = &ic.state
+            {
                 if *exit_code == 0 {
                     ic.ready = true;
                 }
@@ -214,7 +224,11 @@ fn init_container_ready_true_when_terminated_exit_0() {
     let mut status = terminated_container_status("init-0", 0);
 
     // Apply the K8s rule
-    if let Some(ContainerState::Terminated { exit_code, .. }) = &status.state {
+    if let Some(ContainerState {
+        terminated: Some(ContainerStateTerminated { exit_code, .. }),
+        ..
+    }) = &status.state
+    {
         if *exit_code == 0 {
             status.ready = true;
         }
@@ -230,7 +244,11 @@ fn init_container_ready_true_when_terminated_exit_0() {
 fn init_container_not_ready_when_terminated_nonzero() {
     let mut status = terminated_container_status("init-0", 1);
 
-    if let Some(ContainerState::Terminated { exit_code, .. }) = &status.state {
+    if let Some(ContainerState {
+        terminated: Some(ContainerStateTerminated { exit_code, .. }),
+        ..
+    }) = &status.state
+    {
         if *exit_code == 0 {
             status.ready = true;
         }
@@ -303,8 +321,13 @@ fn init_container_synthesize_completed_when_docker_removed() {
 
     // The init container shows Waiting but app containers are running/created.
     // This means the init container completed but was GC'd by Docker.
-    let should_synthesize =
-        matches!(&init_status.state, Some(ContainerState::Waiting { .. })) && app_containers_exist;
+    let should_synthesize = matches!(
+        &init_status.state,
+        Some(ContainerState {
+            waiting: Some(ContainerStateWaiting { .. }),
+            ..
+        })
+    ) && app_containers_exist;
 
     assert!(
         should_synthesize,
@@ -1135,14 +1158,17 @@ fn already_started_ephemeral_container_not_restarted() {
             phase: Some(Phase::Running),
             ephemeral_container_statuses: Some(vec![ContainerStatus {
                 name: "debugger".to_string(),
-                state: Some(ContainerState::Terminated {
-                    exit_code: 0,
-                    reason: Some("Completed".to_string()),
-                    message: None,
-                    started_at: None,
-                    finished_at: None,
-                    container_id: None,
-                    signal: None,
+                state: Some(ContainerState {
+                    terminated: Some(ContainerStateTerminated {
+                        exit_code: 0,
+                        reason: Some("Completed".to_string()),
+                        message: None,
+                        started_at: None,
+                        finished_at: None,
+                        container_id: None,
+                        signal: None,
+                    }),
+                    ..Default::default()
                 }),
                 ready: false,
                 restart_count: 0,

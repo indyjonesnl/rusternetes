@@ -1,5 +1,6 @@
 use rusternetes_common::resources::{
-    Container, ContainerState, ContainerStatus, EphemeralContainer, Pod, PodSpec, PodStatus,
+    Container, ContainerState, ContainerStateRunning, ContainerStateWaiting, ContainerStatus,
+    EphemeralContainer, Pod, PodSpec, PodStatus,
 };
 use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
 
@@ -93,8 +94,11 @@ fn create_running_pod(name: &str) -> Pod {
             start_time: None,
             container_statuses: Some(vec![ContainerStatus {
                 name: "main".to_string(),
-                state: Some(ContainerState::Running {
-                    started_at: Some("2024-01-01T00:00:00Z".to_string()),
+                state: Some(ContainerState {
+                    running: Some(ContainerStateRunning {
+                        started_at: Some("2024-01-01T00:00:00Z".to_string()),
+                    }),
+                    ..Default::default()
                 }),
                 ready: true,
                 restart_count: 0,
@@ -298,8 +302,11 @@ fn test_ephemeral_container_status() {
     if let Some(ref mut status) = pod.status {
         status.ephemeral_container_statuses = Some(vec![ContainerStatus {
             name: "debugger".to_string(),
-            state: Some(ContainerState::Running {
-                started_at: Some("2024-01-01T00:05:00Z".to_string()),
+            state: Some(ContainerState {
+                running: Some(ContainerStateRunning {
+                    started_at: Some("2024-01-01T00:05:00Z".to_string()),
+                }),
+                ..Default::default()
             }),
             ready: true,
             restart_count: 0,
@@ -326,7 +333,10 @@ fn test_ephemeral_container_status() {
     assert_eq!(ephemeral_statuses[0].name, "debugger");
     assert!(matches!(
         ephemeral_statuses[0].state,
-        Some(ContainerState::Running { .. })
+        Some(ContainerState {
+            running: Some(ContainerStateRunning { .. }),
+            ..
+        })
     ));
 }
 
@@ -445,9 +455,12 @@ fn test_ephemeral_container_lifecycle() {
     if let Some(ref mut status) = pod.status {
         status.ephemeral_container_statuses = Some(vec![ContainerStatus {
             name: "debugger".to_string(),
-            state: Some(ContainerState::Waiting {
-                reason: Some("ContainerCreating".to_string()),
-                message: None,
+            state: Some(ContainerState {
+                waiting: Some(ContainerStateWaiting {
+                    reason: Some("ContainerCreating".to_string()),
+                    message: None,
+                }),
+                ..Default::default()
             }),
             ready: false,
             restart_count: 0,
@@ -470,15 +483,21 @@ fn test_ephemeral_container_lifecycle() {
     let ephemeral_statuses = status.ephemeral_container_statuses.as_ref().unwrap();
     assert!(matches!(
         ephemeral_statuses[0].state,
-        Some(ContainerState::Waiting { .. })
+        Some(ContainerState {
+            waiting: Some(ContainerStateWaiting { .. }),
+            ..
+        })
     ));
 
     // Simulate ephemeral container running
     if let Some(ref mut status) = pod.status {
         status.ephemeral_container_statuses = Some(vec![ContainerStatus {
             name: "debugger".to_string(),
-            state: Some(ContainerState::Running {
-                started_at: Some("2024-01-01T00:10:00Z".to_string()),
+            state: Some(ContainerState {
+                running: Some(ContainerStateRunning {
+                    started_at: Some("2024-01-01T00:10:00Z".to_string()),
+                }),
+                ..Default::default()
             }),
             ready: true,
             restart_count: 0,
@@ -501,7 +520,10 @@ fn test_ephemeral_container_lifecycle() {
     let ephemeral_statuses = status.ephemeral_container_statuses.as_ref().unwrap();
     assert!(matches!(
         ephemeral_statuses[0].state,
-        Some(ContainerState::Running { .. })
+        Some(ContainerState {
+            running: Some(ContainerStateRunning { .. }),
+            ..
+        })
     ));
     assert!(ephemeral_statuses[0].ready);
 }

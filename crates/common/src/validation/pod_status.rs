@@ -12,7 +12,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::resources::pod::{ContainerState, ContainerStatus, PodCondition, PodIP};
+use crate::resources::pod::{
+    ContainerState, ContainerStateTerminated, ContainerStatus, PodCondition, PodIP,
+};
 use crate::resources::{Binding, Container, Pod, PodSpec};
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::is_qualified_name;
@@ -575,7 +577,10 @@ fn container_should_restart(container: &Container, spec: &PodSpec, exit_code: i3
 
 fn terminated_exit_code(status: &ContainerStatus) -> Option<i32> {
     match status.state {
-        Some(ContainerState::Terminated { exit_code, .. }) => Some(exit_code),
+        Some(ContainerState {
+            terminated: Some(ContainerStateTerminated { exit_code, .. }),
+            ..
+        }) => Some(exit_code),
         _ => None,
     }
 }

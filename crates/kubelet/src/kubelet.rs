@@ -4,8 +4,9 @@ use crate::lifecycle::{phase_is_terminal, should_skip_phase_write};
 use anyhow::Result;
 use rusternetes_common::{
     resources::{
-        ContainerState, ContainerStatus, Node, NodeAddress, NodeSpec, NodeStatus, Pod,
-        PodCondition, PodIP, PodStatus, Taint, Toleration,
+        ContainerState, ContainerStateRunning, ContainerStateTerminated, ContainerStateWaiting,
+        ContainerStatus, Node, NodeAddress, NodeSpec, NodeStatus, Pod, PodCondition, PodIP,
+        PodStatus, Taint, Toleration,
     },
     types::Phase,
 };
@@ -249,7 +250,10 @@ fn init_container_completed_successfully(
         .map(|status| {
             matches!(
                 &status.state,
-                Some(ContainerState::Terminated { exit_code: 0, .. })
+                Some(ContainerState {
+                    terminated: Some(ContainerStateTerminated { exit_code: 0, .. }),
+                    ..
+                })
             )
         })
         .unwrap_or(false)
@@ -317,7 +321,7 @@ fn init_container_failed_terminally(pod: &Pod, init_statuses: Option<&[Container
                         .is_some_and(|status| {
                             matches!(
                                 &status.state,
-                                Some(ContainerState::Terminated { exit_code, .. }) if *exit_code != 0
+                                Some(ContainerState { terminated: Some(ContainerStateTerminated { exit_code, .. }), .. }) if *exit_code != 0
                             )
                         })
             })
@@ -341,7 +345,15 @@ fn pod_volumes_released(pod: &Pod) -> bool {
             .iter()
             .flatten()
             .chain(status.init_container_statuses.iter().flatten())
-            .any(|c| matches!(c.state, Some(ContainerState::Running { .. })))
+            .any(|c| {
+                matches!(
+                    c.state,
+                    Some(ContainerState {
+                        running: Some(ContainerStateRunning { .. }),
+                        ..
+                    })
+                )
+            })
 }
 
 fn deadline_exceeded_terminal(status: Option<&PodStatus>) -> bool {
@@ -2871,8 +2883,10 @@ impl Kubelet {
                         // Succeeded, all init containers must have completed.
                         if let Some(ref mut ics) = status.init_container_statuses {
                             for ic in ics.iter_mut() {
-                                if let Some(ContainerState::Terminated { exit_code, .. }) =
-                                    &ic.state
+                                if let Some(ContainerState {
+                                    terminated: Some(ContainerStateTerminated { exit_code, .. }),
+                                    ..
+                                }) = &ic.state
                                 {
                                     if *exit_code == 0 {
                                         ic.ready = true;
@@ -2880,14 +2894,17 @@ impl Kubelet {
                                     }
                                 } else {
                                     // Docker removed the container — mark as completed
-                                    ic.state = Some(ContainerState::Terminated {
-                                        exit_code: 0,
-                                        reason: Some("Completed".to_string()),
-                                        message: None,
-                                        started_at: None,
-                                        finished_at: None,
-                                        container_id: None,
-                                        signal: None,
+                                    ic.state = Some(ContainerState {
+                                        terminated: Some(ContainerStateTerminated {
+                                            exit_code: 0,
+                                            reason: Some("Completed".to_string()),
+                                            message: None,
+                                            started_at: None,
+                                            finished_at: None,
+                                            container_id: None,
+                                            signal: None,
+                                        }),
+                                        ..Default::default()
                                     });
                                     ic.ready = true;
                                     ic.started = Some(true);
@@ -3461,15 +3478,25 @@ impl Kubelet {
                                             // lastState) would hang the test.
                                             if matches!(
                                                 st.state,
-                                                Some(ContainerState::Terminated { .. })
+                                                Some(ContainerState {
+                                                    terminated: Some(
+                                                        ContainerStateTerminated { .. }
+                                                    ),
+                                                    ..
+                                                })
                                             ) {
                                                 st.last_state = st.state.take();
-                                                st.state = Some(ContainerState::Waiting {
-                                                    reason: Some("CrashLoopBackOff".to_string()),
-                                                    message: Some(
-                                                        "back-off restarting failed container"
-                                                            .to_string(),
-                                                    ),
+                                                st.state = Some(ContainerState {
+                                                    waiting: Some(ContainerStateWaiting {
+                                                        reason: Some(
+                                                            "CrashLoopBackOff".to_string(),
+                                                        ),
+                                                        message: Some(
+                                                            "back-off restarting failed container"
+                                                                .to_string(),
+                                                        ),
+                                                    }),
+                                                    ..Default::default()
                                                 });
                                                 st.ready = false;
                                                 st.started = Some(false);
@@ -3806,11 +3833,14 @@ impl Kubelet {
                                                     name: c.name.clone(),
                                                     ready: false,
                                                     restart_count: 0,
-                                                    state: Some(ContainerState::Waiting {
-                                                        reason: Some(
-                                                            "ContainerCreating".to_string(),
-                                                        ),
-                                                        message: None,
+                                                    state: Some(ContainerState {
+                                                        waiting: Some(ContainerStateWaiting {
+                                                            reason: Some(
+                                                                "ContainerCreating".to_string(),
+                                                            ),
+                                                            message: None,
+                                                        }),
+                                                        ..Default::default()
                                                     }),
                                                     last_state: None,
                                                     image: Some(c.image.clone()),
@@ -3868,9 +3898,12 @@ impl Kubelet {
                                                 name: c.name.clone(),
                                                 ready: false,
                                                 restart_count: 0,
-                                                state: Some(ContainerState::Waiting {
-                                                    reason: Some(reason.clone()),
-                                                    message: Some(err_msg.clone()),
+                                                state: Some(ContainerState {
+                                                    waiting: Some(ContainerStateWaiting {
+                                                        reason: Some(reason.clone()),
+                                                        message: Some(err_msg.clone()),
+                                                    }),
+                                                    ..Default::default()
                                                 }),
                                                 last_state: None,
                                                 image: Some(c.image.clone()),
@@ -4025,9 +4058,12 @@ impl Kubelet {
                                                     name: c.name.clone(),
                                                     ready: false,
                                                     restart_count: 0,
-                                                    state: Some(ContainerState::Waiting {
-                                                        reason: Some(app_reason.to_string()),
-                                                        message: app_message.clone(),
+                                                    state: Some(ContainerState {
+                                                        waiting: Some(ContainerStateWaiting {
+                                                            reason: Some(app_reason.to_string()),
+                                                            message: app_message.clone(),
+                                                        }),
+                                                        ..Default::default()
                                                     }),
                                                     last_state: None,
                                                     image: Some(c.image.clone()),
@@ -4093,7 +4129,7 @@ impl Kubelet {
                     .and_then(|s| s.container_statuses.as_ref())
                     .is_some_and(|statuses| {
                         statuses.iter().any(|cs| {
-                            matches!(&cs.state, Some(ContainerState::Waiting { reason: Some(r), .. }) if r == "CreateContainerError" || r == "CreateContainerConfigError")
+                            matches!(&cs.state, Some(ContainerState { waiting: Some(ContainerStateWaiting { reason: Some(r), .. }), .. }) if r == "CreateContainerError" || r == "CreateContainerConfigError")
                         })
                     });
 
@@ -4403,12 +4439,18 @@ impl Kubelet {
                         if let Ok(container_statuses) = self.get_container_statuses(pod).await {
                             let all_terminated = !container_statuses.is_empty()
                                 && container_statuses.iter().all(|cs| {
-                                    matches!(cs.state, Some(ContainerState::Terminated { .. }))
+                                    matches!(
+                                        cs.state,
+                                        Some(ContainerState {
+                                            terminated: Some(ContainerStateTerminated { .. }),
+                                            ..
+                                        })
+                                    )
                                 });
 
                             if all_terminated && restart_policy == "Never" {
                                 let any_failed = container_statuses.iter().any(|cs| {
-                                    matches!(cs.state, Some(ContainerState::Terminated { exit_code, .. }) if exit_code != 0)
+                                    matches!(cs.state, Some(ContainerState { terminated: Some(ContainerStateTerminated { exit_code, .. }), .. }) if exit_code != 0)
                                 });
                                 let terminal_phase = if any_failed {
                                     Phase::Failed
@@ -4459,7 +4501,7 @@ impl Kubelet {
 
                             if all_terminated && restart_policy == "OnFailure" {
                                 let any_failed = container_statuses.iter().any(|cs| {
-                                    matches!(cs.state, Some(ContainerState::Terminated { exit_code, .. }) if exit_code != 0)
+                                    matches!(cs.state, Some(ContainerState { terminated: Some(ContainerStateTerminated { exit_code, .. }), .. }) if exit_code != 0)
                                 });
 
                                 if !any_failed {
@@ -4845,12 +4887,18 @@ impl Kubelet {
 
                             let all_terminated = !container_statuses.is_empty()
                                 && container_statuses.iter().all(|cs| {
-                                    matches!(cs.state, Some(ContainerState::Terminated { .. }))
+                                    matches!(
+                                        cs.state,
+                                        Some(ContainerState {
+                                            terminated: Some(ContainerStateTerminated { .. }),
+                                            ..
+                                        })
+                                    )
                                 });
 
                             if all_terminated && restart_policy == "Never" {
                                 let any_failed = container_statuses.iter().any(|cs| {
-                                    matches!(cs.state, Some(ContainerState::Terminated { exit_code, .. }) if exit_code != 0)
+                                    matches!(cs.state, Some(ContainerState { terminated: Some(ContainerStateTerminated { exit_code, .. }), .. }) if exit_code != 0)
                                 });
                                 let terminal_phase = if any_failed {
                                     Phase::Failed
@@ -4899,7 +4947,7 @@ impl Kubelet {
 
                             if all_terminated && restart_policy == "OnFailure" {
                                 let any_failed = container_statuses.iter().any(|cs| {
-                                    matches!(cs.state, Some(ContainerState::Terminated { exit_code, .. }) if exit_code != 0)
+                                    matches!(cs.state, Some(ContainerState { terminated: Some(ContainerStateTerminated { exit_code, .. }), .. }) if exit_code != 0)
                                 });
 
                                 if any_failed {
@@ -5067,7 +5115,7 @@ impl Kubelet {
                     .as_ref()
                     .map(|statuses| {
                         statuses.iter().any(|cs| {
-                            matches!(cs.state, Some(ContainerState::Terminated { exit_code, .. }) if exit_code != 0)
+                            matches!(cs.state, Some(ContainerState { terminated: Some(ContainerStateTerminated { exit_code, .. }), .. }) if exit_code != 0)
                         })
                     })
                     .unwrap_or(false);
@@ -5366,11 +5414,22 @@ impl Kubelet {
                         {
                             cs.restart_count = cs.restart_count.max(entry.restart_count);
                         }
-                        if matches!(cs.state, Some(ContainerState::Terminated { .. })) {
+                        if matches!(
+                            cs.state,
+                            Some(ContainerState {
+                                terminated: Some(ContainerStateTerminated { .. }),
+                                ..
+                            })
+                        ) {
                             cs.last_state = cs.state.take();
-                            cs.state = Some(ContainerState::Waiting {
-                                reason: Some("CrashLoopBackOff".to_string()),
-                                message: Some("Back-off restarting failed container".to_string()),
+                            cs.state = Some(ContainerState {
+                                waiting: Some(ContainerStateWaiting {
+                                    reason: Some("CrashLoopBackOff".to_string()),
+                                    message: Some(
+                                        "Back-off restarting failed container".to_string(),
+                                    ),
+                                }),
+                                ..Default::default()
                             });
                             cs.ready = false;
                             cs.started = Some(false);
@@ -5530,9 +5589,12 @@ impl Kubelet {
                     name: container.name.clone(),
                     ready: false,
                     restart_count: 0,
-                    state: Some(ContainerState::Waiting {
-                        reason: Some("PodInitializing".to_string()),
-                        message: None,
+                    state: Some(ContainerState {
+                        waiting: Some(ContainerStateWaiting {
+                            reason: Some("PodInitializing".to_string()),
+                            message: None,
+                        }),
+                        ..Default::default()
                     }),
                     last_state: None,
                     image: Some(container.image.clone()),
@@ -5757,7 +5819,11 @@ impl Kubelet {
     fn fixup_init_container_ready(status: &mut PodStatus) {
         if let Some(ref mut ics) = status.init_container_statuses {
             for ic in ics.iter_mut() {
-                if let Some(ContainerState::Terminated { exit_code, .. }) = &ic.state {
+                if let Some(ContainerState {
+                    terminated: Some(ContainerStateTerminated { exit_code, .. }),
+                    ..
+                }) = &ic.state
+                {
                     if *exit_code == 0 {
                         ic.ready = true;
                         ic.started = Some(true);
@@ -5924,14 +5990,17 @@ impl Kubelet {
                     name: ic.name.clone(),
                     ready: true,
                     restart_count: 0,
-                    state: Some(ContainerState::Terminated {
-                        exit_code: 0,
-                        signal: None,
-                        reason: Some("Completed".to_string()),
-                        message: None,
-                        started_at: None,
-                        finished_at: None,
-                        container_id: None,
+                    state: Some(ContainerState {
+                        terminated: Some(ContainerStateTerminated {
+                            exit_code: 0,
+                            signal: None,
+                            reason: Some("Completed".to_string()),
+                            message: None,
+                            started_at: None,
+                            finished_at: None,
+                            container_id: None,
+                        }),
+                        ..Default::default()
                     }),
                     last_state: None,
                     image: Some(ic.image.clone()),
@@ -6999,7 +7068,8 @@ mod tests {
     }
     use rusternetes_common::resources::pod::{PodCondition, PodSpec};
     use rusternetes_common::resources::{
-        Container, ContainerState, ContainerStatus, Pod, PodStatus,
+        Container, ContainerState, ContainerStateRunning, ContainerStateTerminated,
+        ContainerStateWaiting, ContainerStatus, Pod, PodStatus,
     };
     use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
 
@@ -7131,14 +7201,17 @@ mod tests {
                     name: "init1".to_string(),
                     ready: false,
                     restart_count: 0,
-                    state: Some(ContainerState::Terminated {
-                        exit_code: 1,
-                        reason: Some("Error".to_string()),
-                        message: None,
-                        started_at: None,
-                        finished_at: None,
-                        container_id: None,
-                        signal: None,
+                    state: Some(ContainerState {
+                        terminated: Some(ContainerStateTerminated {
+                            exit_code: 1,
+                            reason: Some("Error".to_string()),
+                            message: None,
+                            started_at: None,
+                            finished_at: None,
+                            container_id: None,
+                            signal: None,
+                        }),
+                        ..Default::default()
                     }),
                     last_state: None,
                     image: Some("busybox:latest".to_string()),
@@ -7195,9 +7268,12 @@ mod tests {
                     name: "agnhost-container".to_string(),
                     ready: false,
                     restart_count: 0,
-                    state: Some(ContainerState::Waiting {
-                        reason: Some("ContainerCreating".to_string()),
-                        message: None,
+                    state: Some(ContainerState {
+                        waiting: Some(ContainerStateWaiting {
+                            reason: Some("ContainerCreating".to_string()),
+                            message: None,
+                        }),
+                        ..Default::default()
                     }),
                     last_state: None,
                     image: Some("registry.k8s.io/e2e-test-images/agnhost:2.59".to_string()),
@@ -7258,14 +7334,17 @@ mod tests {
             name: "init1".to_string(),
             ready: false,
             restart_count: 0,
-            state: Some(ContainerState::Terminated {
-                exit_code: 1,
-                reason: Some("Error".to_string()),
-                message: None,
-                started_at: None,
-                finished_at: None,
-                container_id: None,
-                signal: None,
+            state: Some(ContainerState {
+                terminated: Some(ContainerStateTerminated {
+                    exit_code: 1,
+                    reason: Some("Error".to_string()),
+                    message: None,
+                    started_at: None,
+                    finished_at: None,
+                    container_id: None,
+                    signal: None,
+                }),
+                ..Default::default()
             }),
             last_state: None,
             image: Some("busybox:latest".to_string()),
@@ -7315,14 +7394,17 @@ mod tests {
             name: "init1".to_string(),
             ready: true,
             restart_count: 0,
-            state: Some(ContainerState::Terminated {
-                exit_code: 0,
-                reason: Some("Completed".to_string()),
-                message: None,
-                started_at: None,
-                finished_at: None,
-                container_id: None,
-                signal: None,
+            state: Some(ContainerState {
+                terminated: Some(ContainerStateTerminated {
+                    exit_code: 0,
+                    reason: Some("Completed".to_string()),
+                    message: None,
+                    started_at: None,
+                    finished_at: None,
+                    container_id: None,
+                    signal: None,
+                }),
+                ..Default::default()
             }),
             last_state: None,
             image: Some("busybox:latest".to_string()),
@@ -7404,14 +7486,17 @@ mod tests {
                 name: "init1".to_string(),
                 ready: false,
                 restart_count: 0,
-                state: Some(ContainerState::Terminated {
-                    exit_code: 1,
-                    reason: Some("Error".to_string()),
-                    message: None,
-                    started_at: None,
-                    finished_at: None,
-                    container_id: None,
-                    signal: None,
+                state: Some(ContainerState {
+                    terminated: Some(ContainerStateTerminated {
+                        exit_code: 1,
+                        reason: Some("Error".to_string()),
+                        message: None,
+                        started_at: None,
+                        finished_at: None,
+                        container_id: None,
+                        signal: None,
+                    }),
+                    ..Default::default()
                 }),
                 last_state: None,
                 image: Some("busybox:latest".to_string()),
@@ -7429,9 +7514,12 @@ mod tests {
                 name: "init2".to_string(),
                 ready: false,
                 restart_count: 0,
-                state: Some(ContainerState::Waiting {
-                    reason: Some("PodInitializing".to_string()),
-                    message: None,
+                state: Some(ContainerState {
+                    waiting: Some(ContainerStateWaiting {
+                        reason: Some("PodInitializing".to_string()),
+                        message: None,
+                    }),
+                    ..Default::default()
                 }),
                 last_state: None,
                 image: Some("busybox:latest".to_string()),
@@ -7482,10 +7570,10 @@ mod tests {
             .expect("app container status must be present");
         assert!(matches!(
             app_status.state,
-            Some(ContainerState::Waiting {
+            Some(ContainerState { waiting: Some(ContainerStateWaiting {
                 reason: Some(ref reason),
                 ..
-            }) if reason == "PodInitializing"
+            }), .. }) if reason == "PodInitializing"
         ));
     }
 
@@ -7769,8 +7857,11 @@ mod tests {
             image: Some("nginx:latest".to_string()),
             image_id: None,
             container_id: Some("docker://abc123".to_string()),
-            state: Some(ContainerState::Running {
-                started_at: Some("2024-01-01T00:00:00Z".to_string()),
+            state: Some(ContainerState {
+                running: Some(ContainerStateRunning {
+                    started_at: Some("2024-01-01T00:00:00Z".to_string()),
+                }),
+                ..Default::default()
             }),
             started: None,
             allocated_resources: None,
@@ -7989,7 +8080,10 @@ mod tests {
     fn test_container_status_running_state_prevents_premature_submission() {
         let status = make_running_container_status("app");
         match &status.state {
-            Some(ContainerState::Running { .. }) => {
+            Some(ContainerState {
+                running: Some(ContainerStateRunning { .. }),
+                ..
+            }) => {
                 // This state correctly signals "still running" to sonobuoy-worker
             }
             other => panic!("Expected Running state, got {:?}", other),
@@ -8009,9 +8103,12 @@ mod tests {
             image: Some("nginx:latest".to_string()),
             image_id: None,
             container_id: None,
-            state: Some(ContainerState::Waiting {
-                reason: Some("ContainerCreating".to_string()),
-                message: None,
+            state: Some(ContainerState {
+                waiting: Some(ContainerStateWaiting {
+                    reason: Some("ContainerCreating".to_string()),
+                    message: None,
+                }),
+                ..Default::default()
             }),
             started: None,
             allocated_resources: None,
@@ -8021,7 +8118,13 @@ mod tests {
             volume_mounts: None,
             stop_signal: None,
         };
-        let is_terminated = matches!(status.state, Some(ContainerState::Terminated { .. }));
+        let is_terminated = matches!(
+            status.state,
+            Some(ContainerState {
+                terminated: Some(ContainerStateTerminated { .. }),
+                ..
+            })
+        );
         assert!(
             !is_terminated,
             "Waiting container is not terminated — sonobuoy-worker should wait"
@@ -8214,8 +8317,11 @@ mod tests {
                 name: "app".to_string(),
                 ready: true,
                 restart_count: 0,
-                state: Some(ContainerState::Running {
-                    started_at: Some("2024-01-01T00:00:00Z".to_string()),
+                state: Some(ContainerState {
+                    running: Some(ContainerStateRunning {
+                        started_at: Some("2024-01-01T00:00:00Z".to_string()),
+                    }),
+                    ..Default::default()
                 }),
                 last_state: None,
                 image: Some("nginx:latest".to_string()),
@@ -8410,7 +8516,13 @@ mod tests {
                             .map(|s| {
                                 matches!(
                                     &s.state,
-                                    Some(ContainerState::Terminated { exit_code: 0, .. })
+                                    Some(ContainerState {
+                                        terminated: Some(ContainerStateTerminated {
+                                            exit_code: 0,
+                                            ..
+                                        }),
+                                        ..
+                                    })
                                 )
                             })
                             .unwrap_or(false);
@@ -8447,21 +8559,27 @@ mod tests {
         let init_statuses = vec![
             init_status(
                 "init1",
-                ContainerState::Terminated {
-                    exit_code: 1,
-                    signal: None,
-                    reason: Some("Error".to_string()),
-                    message: None,
-                    started_at: Some("2026-01-01T00:00:00Z".to_string()),
-                    finished_at: Some("2026-01-01T00:00:01Z".to_string()),
-                    container_id: Some("docker://abc123".to_string()),
+                ContainerState {
+                    terminated: Some(ContainerStateTerminated {
+                        exit_code: 1,
+                        signal: None,
+                        reason: Some("Error".to_string()),
+                        message: None,
+                        started_at: Some("2026-01-01T00:00:00Z".to_string()),
+                        finished_at: Some("2026-01-01T00:00:01Z".to_string()),
+                        container_id: Some("docker://abc123".to_string()),
+                    }),
+                    ..Default::default()
                 },
             ),
             init_status(
                 "init2",
-                ContainerState::Waiting {
-                    reason: Some("PodInitializing".to_string()),
-                    message: None,
+                ContainerState {
+                    waiting: Some(ContainerStateWaiting {
+                        reason: Some("PodInitializing".to_string()),
+                        message: None,
+                    }),
+                    ..Default::default()
                 },
             ),
         ];
@@ -8534,26 +8652,32 @@ mod tests {
             status.init_container_statuses = Some(vec![
                 init_status(
                     "init1",
-                    ContainerState::Terminated {
-                        exit_code: 0,
-                        signal: None,
-                        reason: Some("Completed".to_string()),
-                        message: None,
-                        started_at: None,
-                        finished_at: None,
-                        container_id: None,
+                    ContainerState {
+                        terminated: Some(ContainerStateTerminated {
+                            exit_code: 0,
+                            signal: None,
+                            reason: Some("Completed".to_string()),
+                            message: None,
+                            started_at: None,
+                            finished_at: None,
+                            container_id: None,
+                        }),
+                        ..Default::default()
                     },
                 ),
                 init_status(
                     "init2",
-                    ContainerState::Terminated {
-                        exit_code: 1,
-                        signal: None,
-                        reason: Some("Error".to_string()),
-                        message: None,
-                        started_at: None,
-                        finished_at: None,
-                        container_id: None,
+                    ContainerState {
+                        terminated: Some(ContainerStateTerminated {
+                            exit_code: 1,
+                            signal: None,
+                            reason: Some("Error".to_string()),
+                            message: None,
+                            started_at: None,
+                            finished_at: None,
+                            container_id: None,
+                        }),
+                        ..Default::default()
                     },
                 ),
             ]);

@@ -501,7 +501,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_succeeded_pod_emits_completed_not_started() {
-        use rusternetes_common::resources::ContainerState;
+        use rusternetes_common::resources::{ContainerState, ContainerStateTerminated};
         use rusternetes_common::types::Phase;
         use rusternetes_storage::MemoryStorage;
 
@@ -521,14 +521,17 @@ mod tests {
                     name: "main".to_string(),
                     ready: false,
                     restart_count: 0,
-                    state: Some(ContainerState::Terminated {
-                        exit_code: 0,
-                        signal: None,
-                        reason: Some("Completed".to_string()),
-                        message: None,
-                        started_at: None,
-                        finished_at: None,
-                        container_id: None,
+                    state: Some(ContainerState {
+                        terminated: Some(ContainerStateTerminated {
+                            exit_code: 0,
+                            signal: None,
+                            reason: Some("Completed".to_string()),
+                            message: None,
+                            started_at: None,
+                            finished_at: None,
+                            container_id: None,
+                        }),
+                        ..Default::default()
                     }),
                     last_state: None,
                     image: Some("busybox".to_string()),
@@ -567,7 +570,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_failed_pod_emits_failed_not_started() {
-        use rusternetes_common::resources::ContainerState;
+        use rusternetes_common::resources::{ContainerState, ContainerStateTerminated};
         use rusternetes_common::types::Phase;
         use rusternetes_storage::MemoryStorage;
 
@@ -584,14 +587,17 @@ mod tests {
                     name: "main".to_string(),
                     ready: false,
                     restart_count: 0,
-                    state: Some(ContainerState::Terminated {
-                        exit_code: 1,
-                        signal: None,
-                        reason: Some("Error".to_string()),
-                        message: None,
-                        started_at: None,
-                        finished_at: None,
-                        container_id: None,
+                    state: Some(ContainerState {
+                        terminated: Some(ContainerStateTerminated {
+                            exit_code: 1,
+                            signal: None,
+                            reason: Some("Error".to_string()),
+                            message: None,
+                            started_at: None,
+                            finished_at: None,
+                            container_id: None,
+                        }),
+                        ..Default::default()
                     }),
                     last_state: None,
                     image: Some("busybox".to_string()),

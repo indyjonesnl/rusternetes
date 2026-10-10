@@ -1,5 +1,6 @@
 use rusternetes_common::resources::{
-    Container, ContainerState, ContainerStatus, Pod, PodSpec, PodStatus,
+    Container, ContainerState, ContainerStateRunning, ContainerStateTerminated, ContainerStatus,
+    Pod, PodSpec, PodStatus,
 };
 use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
 
@@ -163,8 +164,11 @@ fn test_init_container_status_sequence() {
         init_container_statuses: Some(vec![
             ContainerStatus {
                 name: "init-0".to_string(),
-                state: Some(ContainerState::Running {
-                    started_at: Some("2024-01-01T00:00:00Z".to_string()),
+                state: Some(ContainerState {
+                    running: Some(ContainerStateRunning {
+                        started_at: Some("2024-01-01T00:00:00Z".to_string()),
+                    }),
+                    ..Default::default()
                 }),
                 ready: false,
                 restart_count: 0,
@@ -199,7 +203,10 @@ fn test_init_container_status_sequence() {
     assert_eq!(init_statuses[0].name, "init-0");
     assert!(matches!(
         init_statuses[0].state,
-        Some(ContainerState::Running { .. })
+        Some(ContainerState {
+            running: Some(ContainerStateRunning { .. }),
+            ..
+        })
     ));
     assert!(!init_statuses[0].ready); // Init containers are never "ready"
 }
@@ -223,14 +230,17 @@ fn test_init_containers_completed_app_starting() {
         init_container_statuses: Some(vec![
             ContainerStatus {
                 name: "init-0".to_string(),
-                state: Some(ContainerState::Terminated {
-                    exit_code: 0,
-                    reason: Some("Completed".to_string()),
-                    signal: None,
-                    message: None,
-                    started_at: None,
-                    finished_at: None,
-                    container_id: None,
+                state: Some(ContainerState {
+                    terminated: Some(ContainerStateTerminated {
+                        exit_code: 0,
+                        reason: Some("Completed".to_string()),
+                        signal: None,
+                        message: None,
+                        started_at: None,
+                        finished_at: None,
+                        container_id: None,
+                    }),
+                    ..Default::default()
                 }),
                 ready: false,
                 restart_count: 0,
@@ -248,14 +258,17 @@ fn test_init_containers_completed_app_starting() {
             },
             ContainerStatus {
                 name: "init-1".to_string(),
-                state: Some(ContainerState::Terminated {
-                    exit_code: 0,
-                    reason: Some("Completed".to_string()),
-                    signal: None,
-                    message: None,
-                    started_at: None,
-                    finished_at: None,
-                    container_id: None,
+                state: Some(ContainerState {
+                    terminated: Some(ContainerStateTerminated {
+                        exit_code: 0,
+                        reason: Some("Completed".to_string()),
+                        signal: None,
+                        message: None,
+                        started_at: None,
+                        finished_at: None,
+                        container_id: None,
+                    }),
+                    ..Default::default()
                 }),
                 ready: false,
                 restart_count: 0,
@@ -274,8 +287,11 @@ fn test_init_containers_completed_app_starting() {
         ]),
         container_statuses: Some(vec![ContainerStatus {
             name: "app-0".to_string(),
-            state: Some(ContainerState::Running {
-                started_at: Some("2024-01-01T00:00:11Z".to_string()),
+            state: Some(ContainerState {
+                running: Some(ContainerStateRunning {
+                    started_at: Some("2024-01-01T00:00:11Z".to_string()),
+                }),
+                ..Default::default()
             }),
             ready: true,
             restart_count: 0,
@@ -308,8 +324,12 @@ fn test_init_containers_completed_app_starting() {
 
     for init_status in init_statuses {
         match &init_status.state {
-            Some(ContainerState::Terminated {
-                exit_code, reason, ..
+            Some(ContainerState {
+                terminated:
+                    Some(ContainerStateTerminated {
+                        exit_code, reason, ..
+                    }),
+                ..
             }) => {
                 assert_eq!(*exit_code, 0, "Init container should exit with code 0");
                 assert_eq!(*reason, Some("Completed".to_string()));
@@ -323,7 +343,10 @@ fn test_init_containers_completed_app_starting() {
     assert_eq!(app_statuses.len(), 1);
     assert!(matches!(
         app_statuses[0].state,
-        Some(ContainerState::Running { .. })
+        Some(ContainerState {
+            running: Some(ContainerStateRunning { .. }),
+            ..
+        })
     ));
     assert!(app_statuses[0].ready);
 }
@@ -346,14 +369,17 @@ fn test_init_container_failure_blocks_app() {
         host_i_ps: None,
         init_container_statuses: Some(vec![ContainerStatus {
             name: "init-0".to_string(),
-            state: Some(ContainerState::Terminated {
-                exit_code: 1,
-                reason: Some("Error".to_string()),
-                signal: None,
-                message: None,
-                started_at: None,
-                finished_at: None,
-                container_id: None,
+            state: Some(ContainerState {
+                terminated: Some(ContainerStateTerminated {
+                    exit_code: 1,
+                    reason: Some("Error".to_string()),
+                    signal: None,
+                    message: None,
+                    started_at: None,
+                    finished_at: None,
+                    container_id: None,
+                }),
+                ..Default::default()
             }),
             ready: false,
             restart_count: 1,
@@ -385,8 +411,12 @@ fn test_init_container_failure_blocks_app() {
     // Init container should have failed
     let init_statuses = status.init_container_statuses.as_ref().unwrap();
     match &init_statuses[0].state {
-        Some(ContainerState::Terminated {
-            exit_code, reason, ..
+        Some(ContainerState {
+            terminated:
+                Some(ContainerStateTerminated {
+                    exit_code, reason, ..
+                }),
+            ..
         }) => {
             assert_eq!(*exit_code, 1, "Init container should exit with code 1");
             assert_eq!(*reason, Some("Error".to_string()));
@@ -416,14 +446,17 @@ fn test_init_container_restart_count() {
         host_i_ps: None,
         init_container_statuses: Some(vec![ContainerStatus {
             name: "init-0".to_string(),
-            state: Some(ContainerState::Terminated {
-                exit_code: 1,
-                reason: Some("Error".to_string()),
-                signal: None,
-                message: None,
-                started_at: None,
-                finished_at: None,
-                container_id: None,
+            state: Some(ContainerState {
+                terminated: Some(ContainerStateTerminated {
+                    exit_code: 1,
+                    reason: Some("Error".to_string()),
+                    signal: None,
+                    message: None,
+                    started_at: None,
+                    finished_at: None,
+                    container_id: None,
+                }),
+                ..Default::default()
             }),
             ready: false,
             restart_count: 5, // Container has restarted 5 times

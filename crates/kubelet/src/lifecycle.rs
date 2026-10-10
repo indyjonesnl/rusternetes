@@ -18,7 +18,7 @@
 //!     codes surface as `reason="Error"`, 137 as `reason="OOMKilled"`
 //!     (unless the runtime supplied a specific `error` string).
 
-use rusternetes_common::resources::{ContainerState, Lifecycle, Pod};
+use rusternetes_common::resources::{ContainerState, ContainerStateTerminated, Lifecycle, Pod};
 use rusternetes_common::types::Phase;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -448,14 +448,17 @@ pub fn terminated_state_from_exit(
             .filter(|e| !e.is_empty())
             .unwrap_or_else(|| "Error".to_string())
     };
-    ContainerState::Terminated {
-        exit_code: exit_code as i32,
-        signal: None,
-        reason: Some(reason),
-        message: termination_message,
-        started_at: None,
-        finished_at: None,
-        container_id: None,
+    ContainerState {
+        terminated: Some(ContainerStateTerminated {
+            exit_code: exit_code as i32,
+            signal: None,
+            reason: Some(reason),
+            message: termination_message,
+            started_at: None,
+            finished_at: None,
+            container_id: None,
+        }),
+        ..Default::default()
     }
 }
 
@@ -661,7 +664,10 @@ mod tests {
     fn docker_error_overrides_reason_for_137() {
         let state = terminated_state_from_exit(137, Some("ContainerCannotRun".into()), None);
         match state {
-            ContainerState::Terminated { reason, .. } => {
+            ContainerState {
+                terminated: Some(ContainerStateTerminated { reason, .. }),
+                ..
+            } => {
                 assert_eq!(reason.as_deref(), Some("ContainerCannotRun"));
             }
             _ => panic!("expected Terminated"),

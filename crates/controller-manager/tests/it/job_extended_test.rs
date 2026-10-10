@@ -708,14 +708,17 @@ async fn job_with_pod_failure_policy_fail_job_should_fail_on_exit_code() {
                 name: "task".to_string(),
                 ready: false,
                 restart_count: 0,
-                state: Some(ContainerState::Terminated {
-                    exit_code: 1,
-                    signal: None,
-                    reason: Some("Error".to_string()),
-                    message: None,
-                    started_at: None,
-                    finished_at: None,
-                    container_id: None,
+                state: Some(ContainerState {
+                    terminated: Some(ContainerStateTerminated {
+                        exit_code: 1,
+                        signal: None,
+                        reason: Some("Error".to_string()),
+                        message: None,
+                        started_at: None,
+                        finished_at: None,
+                        container_id: None,
+                    }),
+                    ..Default::default()
                 }),
                 last_state: None,
                 image: None,
@@ -1178,14 +1181,17 @@ async fn job_with_pod_failure_policy_fail_index_should_mark_only_that_index_fail
             name: "task".to_string(),
             ready: false,
             restart_count: 0,
-            state: Some(ContainerState::Terminated {
-                exit_code: 42,
-                signal: None,
-                reason: Some("Error".to_string()),
-                message: None,
-                started_at: None,
-                finished_at: None,
-                container_id: None,
+            state: Some(ContainerState {
+                terminated: Some(ContainerStateTerminated {
+                    exit_code: 42,
+                    signal: None,
+                    reason: Some("Error".to_string()),
+                    message: None,
+                    started_at: None,
+                    finished_at: None,
+                    container_id: None,
+                }),
+                ..Default::default()
             }),
             last_state: None,
             image: None,
@@ -1281,14 +1287,17 @@ async fn job_with_pod_failure_policy_count_should_count_toward_backoff_limit() {
             name: "task".to_string(),
             ready: false,
             restart_count: 0,
-            state: Some(ContainerState::Terminated {
-                exit_code: 7,
-                signal: None,
-                reason: Some("Error".to_string()),
-                message: None,
-                started_at: None,
-                finished_at: None,
-                container_id: None,
+            state: Some(ContainerState {
+                terminated: Some(ContainerStateTerminated {
+                    exit_code: 7,
+                    signal: None,
+                    reason: Some("Error".to_string()),
+                    message: None,
+                    started_at: None,
+                    finished_at: None,
+                    container_id: None,
+                }),
+                ..Default::default()
             }),
             last_state: None,
             image: None,

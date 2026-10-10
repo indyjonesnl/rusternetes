@@ -21,7 +21,9 @@
 
 use async_trait::async_trait;
 use rusternetes_common::{
-    resources::{Container, ContainerState, ContainerStatus, Pod, PodSpec, PodStatus},
+    resources::{
+        Container, ContainerState, ContainerStateWaiting, ContainerStatus, Pod, PodSpec, PodStatus,
+    },
     types::{ObjectMeta, Phase, TypeMeta},
     Error,
 };
@@ -274,9 +276,12 @@ async fn test_7881f80_create_container_error_persisted_after_cas_conflict() {
         name: "main".to_string(),
         ready: false,
         restart_count: 0,
-        state: Some(ContainerState::Waiting {
-            reason: Some("CreateContainerError".to_string()),
-            message: Some("failed to create container: invalid image reference".to_string()),
+        state: Some(ContainerState {
+            waiting: Some(ContainerStateWaiting {
+                reason: Some("CreateContainerError".to_string()),
+                message: Some("failed to create container: invalid image reference".to_string()),
+            }),
+            ..Default::default()
         }),
         last_state: None,
         image: Some("nginx:latest".to_string()),
@@ -332,7 +337,10 @@ async fn test_7881f80_create_container_error_persisted_after_cas_conflict() {
 
     let state = main_status.state.as_ref().expect("state must be set");
     match state {
-        ContainerState::Waiting { reason, .. } => {
+        ContainerState {
+            waiting: Some(ContainerStateWaiting { reason, .. }),
+            ..
+        } => {
             assert_eq!(
                 reason.as_deref(),
                 Some("CreateContainerError"),
@@ -360,7 +368,7 @@ async fn test_7881f80_create_container_error_persisted_after_cas_conflict() {
     assert!(
         matches!(
             &final_main.state,
-            Some(ContainerState::Waiting { reason, .. }) if reason.as_deref() == Some("CreateContainerError")
+            Some(ContainerState { waiting: Some(ContainerStateWaiting { reason, .. }), .. }) if reason.as_deref() == Some("CreateContainerError")
         ),
         "CreateContainerError must persist in final storage read"
     );

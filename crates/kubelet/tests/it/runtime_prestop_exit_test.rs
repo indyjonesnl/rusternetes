@@ -30,8 +30,8 @@
 //! block of `runtime.rs` without requiring a live Docker daemon.
 
 use rusternetes_common::resources::{
-    Container, ContainerState, ContainerStatus, ExecAction, Lifecycle, LifecycleHandler, Pod,
-    PodSpec,
+    Container, ContainerState, ContainerStateTerminated, ContainerStatus, ExecAction, Lifecycle,
+    LifecycleHandler, Pod, PodSpec,
 };
 use rusternetes_common::types::{ObjectMeta, TypeMeta};
 use rusternetes_kubelet::lifecycle;
@@ -119,8 +119,12 @@ fn make_pod_with_prestop(name: &str, grace_period: i64) -> Pod {
 fn exit_code_zero_propagates_as_completed() {
     let state = lifecycle::terminated_state_from_exit(0, None, None);
     match state {
-        ContainerState::Terminated {
-            exit_code, reason, ..
+        ContainerState {
+            terminated:
+                Some(ContainerStateTerminated {
+                    exit_code, reason, ..
+                }),
+            ..
         } => {
             assert_eq!(exit_code, 0, "exit code 0 must round-trip verbatim");
             assert_eq!(
@@ -139,8 +143,12 @@ fn nonzero_exit_code_propagates_with_error_reason() {
     // exitCode=42 and reason="Error" in containerStatuses[].state.terminated.
     let state = lifecycle::terminated_state_from_exit(42, None, None);
     match state {
-        ContainerState::Terminated {
-            exit_code, reason, ..
+        ContainerState {
+            terminated:
+                Some(ContainerStateTerminated {
+                    exit_code, reason, ..
+                }),
+            ..
         } => {
             assert_eq!(
                 exit_code, 42,
@@ -163,8 +171,12 @@ fn exit_code_137_propagates_as_oom_killed_by_default() {
     // field overrides it (e.g. user-supplied StopSignal).
     let state = lifecycle::terminated_state_from_exit(137, None, None);
     match state {
-        ContainerState::Terminated {
-            exit_code, reason, ..
+        ContainerState {
+            terminated:
+                Some(ContainerStateTerminated {
+                    exit_code, reason, ..
+                }),
+            ..
         } => {
             assert_eq!(exit_code, 137);
             assert_eq!(
@@ -202,8 +214,12 @@ fn exit_code_propagates_through_container_status_struct() {
     };
 
     match status.state.as_ref().expect("state present") {
-        ContainerState::Terminated {
-            exit_code, reason, ..
+        ContainerState {
+            terminated:
+                Some(ContainerStateTerminated {
+                    exit_code, reason, ..
+                }),
+            ..
         } => {
             assert_eq!(*exit_code, 1);
             assert_eq!(reason.as_deref(), Some("Error"));
