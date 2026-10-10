@@ -5,6 +5,7 @@ pub mod certificate_signing_request;
 pub mod cidrset_metrics;
 pub mod clusterrole_aggregation;
 pub mod cronjob;
+pub mod csi_attacher;
 pub mod csi_provisioner;
 pub mod csi_topology;
 pub mod daemonset;
