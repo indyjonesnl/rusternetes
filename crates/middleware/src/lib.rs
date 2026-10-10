@@ -1421,8 +1421,21 @@ pub async fn normalize_content_type_middleware(
         if response_ct.starts_with("application/json") {
             let (parts, body) = response.into_parts();
             if let Ok(json_bytes) = axum::body::to_bytes(body, 10 * 1024 * 1024).await {
-                let encoder = crate::response::encoder_for(&opt_in);
-                let pb = encoder.encode(&json_bytes, opt_in.api_version, opt_in.kind);
+                let pb = if opt_in.is_from_body() {
+                    let tm: serde_json::Value =
+                        serde_json::from_slice(&json_bytes).unwrap_or_default();
+                    let api_version = tm["apiVersion"].as_str().unwrap_or_default();
+                    let kind = tm["kind"].as_str().unwrap_or_default();
+                    match crate::response::encode_native(&json_bytes, api_version, kind) {
+                        Some(pb) => pb,
+                        // No registered schema: keep the JSON response rather
+                        // than a protobuf envelope client-go cannot decode.
+                        None => return Ok(Response::from_parts(parts, Body::from(json_bytes))),
+                    }
+                } else {
+                    let encoder = crate::response::encoder_for(&opt_in);
+                    encoder.encode(&json_bytes, opt_in.api_version, opt_in.kind)
+                };
                 let mut resp = Response::from_parts(parts, Body::from(pb));
                 resp.headers_mut().insert(
                     axum::http::header::CONTENT_TYPE,

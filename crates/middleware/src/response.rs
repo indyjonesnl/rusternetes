@@ -172,6 +172,21 @@ impl NativeProtoOptIn {
     pub const fn pod_list() -> Self {
         Self::new("v1", "PodList")
     }
+
+    /// Opt-in for any resource response: the `apiVersion`/`kind` are read from
+    /// the response body (`transformResponseObject`, endpoints/handlers/
+    /// response.go, serialises every object through the negotiated codec,
+    /// which stamps the GVK from the scheme). The middleware only re-encodes
+    /// when a protobuf schema is registered for that GVK and otherwise leaves
+    /// the JSON response alone.
+    pub const fn from_body() -> Self {
+        Self::new("", "")
+    }
+
+    /// Whether this opt-in defers the type to the response body.
+    pub fn is_from_body(&self) -> bool {
+        self.kind.is_empty()
+    }
 }
 
 /// Strategy for turning a JSON-serialised resource into the bytes that a
@@ -290,9 +305,14 @@ impl ProtoEncoder for NativePodProtoEncoder {
 /// The only fallback is for a kind with NO registered schema at all (which no
 /// current opt-in hits): we still emit a parsable envelope rather than 500.
 pub fn encode_native_or_wrapped(json: &[u8], api_version: &str, kind: &str) -> Vec<u8> {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(json) else {
-        return wrap_json_in_protobuf_envelope(json, api_version, kind);
-    };
+    encode_native(json, api_version, kind)
+        .unwrap_or_else(|| wrap_json_in_protobuf_envelope(json, api_version, kind))
+}
+
+/// [`encode_native_or_wrapped`] without the JSON-in-`raw` fallback: `None`
+/// when the body is not a JSON object or no schema is registered for the kind.
+pub fn encode_native(json: &[u8], api_version: &str, kind: &str) -> Option<Vec<u8>> {
+    let value = serde_json::from_slice::<serde_json::Value>(json).ok()?;
     // Resolve the schema by the group-qualified key `{apiVersion}.{kind}` FIRST,
     // then the bare kind. Bare kind alone collides across API groups — e.g.
     // `TokenRequest` exists both as the CSI `{audience, expirationSeconds}` pair
@@ -303,13 +323,10 @@ pub fn encode_native_or_wrapped(json: &[u8], api_version: &str, kind: &str) -> V
     // token request", #1667). Kinds registered only under the bare name (Pod, …)
     // fall through to the second lookup unchanged.
     let qualified = format!("{api_version}.{kind}");
-    let encoded = rusternetes_protobuf::PROTO_REGISTRY
+    let raw = rusternetes_protobuf::PROTO_REGISTRY
         .encode_message(&qualified, &value)
-        .or_else(|| rusternetes_protobuf::PROTO_REGISTRY.encode_message(kind, &value));
-    match encoded {
-        Some(raw) => wrap_native_proto_in_envelope(&raw, api_version, kind),
-        None => wrap_json_in_protobuf_envelope(json, api_version, kind),
-    }
+        .or_else(|| rusternetes_protobuf::PROTO_REGISTRY.encode_message(kind, &value))?;
+    Some(wrap_native_proto_in_envelope(&raw, api_version, kind))
 }
 
 /// Build a K8s `runtime.Unknown` envelope around an already-encoded native

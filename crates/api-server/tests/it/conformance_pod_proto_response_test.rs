@@ -338,18 +338,17 @@ async fn get_pod_with_client_go_default_accept_returns_protobuf() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Non-opted-in resource still falls back to JSON
+// 6. Every endpoints-framework resource negotiates protobuf (no per-kind opt-in)
 // ---------------------------------------------------------------------------
 
-/// ConfigMap has not opted in to native-protobuf yet, so a protobuf
-/// `Accept` against `/api/v1/namespaces/X/configmaps` must still produce
-/// JSON. This is the safety property: the opt-in mechanism must NOT
-/// silently widen to resources whose handlers have not been updated.
+/// Upstream's `transformResponseObject` picks the serializer from `Accept`
+/// for every resource (apiserver/pkg/endpoints/handlers/response.go), so a
+/// ConfigMap GET with a protobuf `Accept` is answered with the `k8s\0`
+/// envelope too, with no per-handler opt-in (#3057).
 #[tokio::test]
-async fn configmap_get_without_opt_in_falls_back_to_json() {
+async fn configmap_get_negotiates_protobuf_without_per_kind_opt_in() {
     let (mem, router) = spawn_router();
 
-    // Seed a ConfigMap.
     let cm = json!({
         "apiVersion": "v1",
         "kind": "ConfigMap",
@@ -370,13 +369,10 @@ async fn configmap_get_without_opt_in_falls_back_to_json() {
 
     assert_eq!(status, StatusCode::OK);
     assert!(
-        ct.starts_with("application/json"),
-        "ConfigMap is not opted in; must fall back to JSON; got {ct}"
+        ct.starts_with("application/vnd.kubernetes.protobuf"),
+        "ConfigMap must negotiate protobuf; got {ct}"
     );
-    assert!(
-        !body.starts_with(PROTOBUF_MAGIC),
-        "non-opted-in resource must not produce protobuf envelope"
-    );
+    assert!(body.starts_with(PROTOBUF_MAGIC));
 }
 
 // ---------------------------------------------------------------------------
