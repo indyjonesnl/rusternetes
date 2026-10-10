@@ -4,11 +4,11 @@
 //! `TypeConverters`, and the `HookSource` adapter over a `PolicySource`.
 //!
 //! Ported from `staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/`:
-//! - `generic/plugin.go` `ValidateInitialization` (:100-170): the plugin is
+//! - `generic/plugin.go` `ValidateInitialization` (:137-198): the plugin is
 //!   handed the REST mapper (`SetRESTMapper`), the namespace informer
 //!   (`SetExternalKubeInformerFactory`) and the object-interfaces
 //!   (`SetObjectInterfaces`), then `source.Run` is started.
-//! - `mutating/dispatcher.go` `dispatchOne` (:223-269): a kind with no type
+//! - `mutating/dispatcher.go` `dispatchOne` (:229-279, the nil type converter check at :244-245): a kind with no type
 //!   converter is a 503 `Resource kind ... not found`.
 
 #![allow(dead_code)]
