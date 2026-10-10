@@ -39,6 +39,7 @@ on:
       - 'scripts/gen-vanilla-swap-workflows.sh'
       - 'scripts/update-badge.sh'
       - 'scripts/tests/test-vanilla-swap-workflows-sync.sh'
+      - 'scripts/tests/test-vanilla-swap-focus-order.sh'
       - 'scripts/tests/test-update-badge.sh'
       - 'scripts/tests/test-badge-publish-guard.sh'
       - '.github/workflows/vanilla-swap-*.yml'
@@ -101,6 +102,8 @@ jobs:
         run: bash scripts/tests/test-target-workflows-sync.sh
       - name: Per-module vanilla-swap workflow drift
         run: bash scripts/tests/test-vanilla-swap-workflows-sync.sh
+      - name: Vanilla-swap focus accepts both tag orders
+        run: bash scripts/tests/test-vanilla-swap-focus-order.sh
       - name: Badge publisher unit tests
         run: bash scripts/tests/test-update-badge.sh
       - name: Badge publish guard (main only)
