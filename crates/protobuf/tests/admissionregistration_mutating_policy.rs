@@ -23,7 +23,10 @@ fn mutating_admission_policy_messages_registered_with_upstream_numbers() {
     assert_eq!(field(&r, "MutatingAdmissionPolicy", 2).0, "spec");
     assert_eq!(field(&r, "MutatingAdmissionPolicyBinding", 2).0, "spec");
     assert_eq!(field(&r, "MutatingAdmissionPolicyList", 2).0, "items");
-    assert_eq!(field(&r, "MutatingAdmissionPolicyBindingList", 2).0, "items");
+    assert_eq!(
+        field(&r, "MutatingAdmissionPolicyBindingList", 2).0,
+        "items"
+    );
     assert_eq!(field(&r, "MutatingAdmissionPolicySpec", 4).0, "mutations");
     assert_eq!(
         field(&r, "MutatingAdmissionPolicySpec", 7).0,

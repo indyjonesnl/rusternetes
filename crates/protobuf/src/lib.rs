@@ -2944,6 +2944,7 @@ impl ProtoRegistry {
         Self::register_scheduling_v1(&mut schemas);
         Self::register_apiextensions_v1(&mut schemas);
         Self::register_admissionregistration_v1(&mut schemas);
+        Self::register_admissionregistration_mutating_policy(&mut schemas);
         Self::register_core_v1_status_networking(&mut schemas);
         Self::register_apimachinery_meta_v1(&mut schemas);
         Self::register_networking_v1(&mut schemas);
@@ -3639,6 +3640,76 @@ impl ProtoRegistry {
                 ]),
             },
         );
+    }
+
+    /// `admissionregistration.k8s.io/{v1alpha1,v1beta1}` MutatingAdmissionPolicy
+    /// family. Both versions' `generated.proto` declare identical messages
+    /// (`k8s.io/api/admissionregistration/v1beta1/generated.proto`), so one
+    /// bare-name entry serves both. Reuses the v1 `ParamKind`, `ParamRef`,
+    /// `MatchResources`, `MatchCondition` and `Variable` entries (same numbers).
+    fn register_admissionregistration_mutating_policy(
+        schemas: &mut HashMap<String, MessageSchema>,
+    ) {
+        let msg = |n: &str| FieldType::Message(n.into());
+        let rep = |n: &str| FieldType::Repeated(Box::new(FieldType::Message(n.into())));
+        let mut put = |name: &str, fields: Vec<(u32, &str, FieldType)>| {
+            schemas.insert(
+                name.into(),
+                MessageSchema {
+                    fields: fields
+                        .into_iter()
+                        .map(|(n, f, t)| (n, (f.to_string(), t)))
+                        .collect(),
+                },
+            );
+        };
+        put(
+            "MutatingAdmissionPolicy",
+            vec![
+                (1, "metadata", msg("ObjectMeta")),
+                (2, "spec", msg("MutatingAdmissionPolicySpec")),
+            ],
+        );
+        put(
+            "MutatingAdmissionPolicyBinding",
+            vec![
+                (1, "metadata", msg("ObjectMeta")),
+                (2, "spec", msg("MutatingAdmissionPolicyBindingSpec")),
+            ],
+        );
+        put(
+            "MutatingAdmissionPolicySpec",
+            vec![
+                (1, "paramKind", msg("ParamKind")),
+                (2, "matchConstraints", msg("MatchResources")),
+                (3, "variables", rep("Variable")),
+                (4, "mutations", rep("Mutation")),
+                (5, "failurePolicy", FieldType::String),
+                (6, "matchConditions", rep("MatchCondition")),
+                (7, "reinvocationPolicy", FieldType::String),
+            ],
+        );
+        put(
+            "MutatingAdmissionPolicyBindingSpec",
+            vec![
+                (1, "policyName", FieldType::String),
+                (2, "paramRef", msg("ParamRef")),
+                (3, "matchResources", msg("MatchResources")),
+            ],
+        );
+        put(
+            "Mutation",
+            vec![
+                (2, "patchType", FieldType::String),
+                (3, "applyConfiguration", msg("ApplyConfiguration")),
+                (4, "jsonPatch", msg("JSONPatch")),
+            ],
+        );
+        put(
+            "ApplyConfiguration",
+            vec![(1, "expression", FieldType::String)],
+        );
+        put("JSONPatch", vec![(1, "expression", FieldType::String)]);
     }
 
     fn register_core_v1_status_networking(schemas: &mut HashMap<String, MessageSchema>) {
@@ -10569,6 +10640,16 @@ impl ProtoRegistry {
         schemas.insert(
             "ValidatingWebhookConfigurationList".into(),
             list_schema("ValidatingWebhookConfiguration"),
+        );
+
+        // admissionregistration/v1alpha1 + v1beta1 (identical shapes)
+        schemas.insert(
+            "MutatingAdmissionPolicyList".into(),
+            list_schema("MutatingAdmissionPolicy"),
+        );
+        schemas.insert(
+            "MutatingAdmissionPolicyBindingList".into(),
+            list_schema("MutatingAdmissionPolicyBinding"),
         );
 
         // coordination/v1
