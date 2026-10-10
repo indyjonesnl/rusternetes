@@ -22,8 +22,8 @@ while IFS=$'\x1f' read -r module target focus; do
   case "$focus" in *'\[sig-'*) ;; *) continue ;; esac
   conf_focus="$(jq -r --arg t "$target" '.[] | select(.name==$t) | .focus' "$CONF")"
   [ -n "$conf_focus" ] || fail "$module: target '$target' not in ci/conformance/targets.json"
-  fwd="[$target] Foo bar [Conformance]"
-  rev="[Conformance] Foo [$target] bar"
+  fwd="[$target] Services Foo [Conformance]"
+  rev="[Conformance] Foo [$target] Services bar"
   printf '%s\n' "$fwd" | grep -Eq -- "$focus" || fail "$module: focus misses forward order: $focus"
   printf '%s\n' "$rev" | grep -Eq -- "$focus" || fail "$module: focus misses reversed order [Conformance].*[$target]: $focus"
   checked=$((checked + 1))
