@@ -5,6 +5,7 @@ pub mod certificate_signing_request;
 pub mod cidrset_metrics;
 pub mod clusterrole_aggregation;
 pub mod cronjob;
+pub mod csi_attacher;
 pub mod csi_provisioner;
 pub mod csi_topology;
 pub mod daemonset;
@@ -62,7 +63,6 @@ pub mod ttl_controller;
 #[cfg(test)]
 pub mod uid_precondition_double;
 #[allow(dead_code)]
-pub mod volume_attachment;
 pub mod volume_expansion;
 pub mod volume_snapshot;
 pub mod vpa;

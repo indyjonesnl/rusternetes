@@ -68,6 +68,12 @@ struct Args {
     #[arg(long = "csi-provisioner", value_name = "DRIVER=SOCKET")]
     csi_provisioners: Vec<String>,
 
+    /// Run a CSI external-attacher for a driver: `<driver-name>=<controller
+    /// socket path>` (the sidecar's `--csi-address` + `--attacher`).
+    /// Repeatable.
+    #[arg(long = "csi-attacher", value_name = "DRIVER=SOCKET")]
+    csi_attachers: Vec<String>,
+
     /// `--default-fstype` of external-provisioner, for every `--csi-provisioner`.
     #[arg(long, default_value = "")]
     csi_default_fstype: String,
@@ -789,6 +795,29 @@ async fn main() -> Result<()> {
             async move {
                 if let Err(e) = controller.run().await {
                     tracing::error!("CSI provisioner error: {}", e);
+                }
+            }
+        });
+    }
+
+    // Start one CSI external-attacher per `--csi-attacher` driver.
+    for spec in &args.csi_attachers {
+        let Some((driver, socket)) = spec.split_once('=') else {
+            anyhow::bail!("--csi-attacher {spec:?}: expected <driver-name>=<socket path>");
+        };
+        let attacher = Arc::new(
+            controllers::csi_attacher::CsiAttacher::new(
+                storage.clone(),
+                driver,
+                rusternetes_csi::controller_client::CsiControllerClient::with_endpoint(socket),
+            )
+            .with_default_fs_type(args.csi_default_fstype.clone()),
+        );
+        spawn_controller!("CSI attacher", leader_elector, {
+            let controller = attacher.clone();
+            async move {
+                if let Err(e) = controller.run().await {
+                    tracing::error!("CSI attacher error: {e}");
                 }
             }
         });

@@ -29,6 +29,8 @@ service Identity {
 service Controller {
   rpc CreateVolume (CreateVolumeRequest) returns (CreateVolumeResponse) {}
   rpc DeleteVolume (DeleteVolumeRequest) returns (DeleteVolumeResponse) {}
+  rpc ControllerPublishVolume (ControllerPublishVolumeRequest) returns (ControllerPublishVolumeResponse) {}
+  rpc ControllerUnpublishVolume (ControllerUnpublishVolumeRequest) returns (ControllerUnpublishVolumeResponse) {}
   rpc ControllerGetCapabilities (ControllerGetCapabilitiesRequest) returns (ControllerGetCapabilitiesResponse) {}
   rpc CreateSnapshot (CreateSnapshotRequest) returns (CreateSnapshotResponse) {}
   rpc DeleteSnapshot (DeleteSnapshotRequest) returns (DeleteSnapshotResponse) {}
@@ -288,6 +290,28 @@ message DeleteVolumeRequest {
 }
 
 message DeleteVolumeResponse {}
+
+// CSI spec v1.x field numbers (container-storage-interface/spec csi.proto).
+message ControllerPublishVolumeRequest {
+  string volume_id = 1;
+  string node_id = 2;
+  VolumeCapability volume_capability = 3;
+  bool readonly = 4;
+  map<string, string> secrets = 5;
+  map<string, string> volume_context = 6;
+}
+
+message ControllerPublishVolumeResponse {
+  map<string, string> publish_context = 1;
+}
+
+message ControllerUnpublishVolumeRequest {
+  string volume_id = 1;
+  string node_id = 2;
+  map<string, string> secrets = 3;
+}
+
+message ControllerUnpublishVolumeResponse {}
 
 message CreateSnapshotRequest {
   string source_volume_id = 1;
