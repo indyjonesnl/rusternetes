@@ -251,11 +251,17 @@ async fn main() -> Result<()> {
     if let Some(path) = &args.admission_control_config_file {
         let yaml = std::fs::read_to_string(path)
             .with_context(|| format!("reading --admission-control-config-file {path}"))?;
-        let exemptions = admission::PodSecurityExemptions::from_admission_configuration(&yaml)
-            .map_err(|e| anyhow::anyhow!("parsing {path}: {e}"))?;
+        let exemptions = admission::PodSecurityExemptions::from_admission_configuration(
+            &yaml,
+            std::path::Path::new(path),
+        )
+        .map_err(|e| anyhow::anyhow!("parsing {path}: {e}"))?;
         admission::install_pod_security_exemptions(exemptions);
-        let limited = admission::resourcequota::config::from_admission_configuration(&yaml)
-            .map_err(|e| anyhow::anyhow!("parsing {path}: {e}"))?;
+        let limited = admission::resourcequota::config::from_admission_configuration(
+            &yaml,
+            std::path::Path::new(path),
+        )
+        .map_err(|e| anyhow::anyhow!("parsing {path}: {e}"))?;
         admission::resourcequota::config::install_limited_resources(limited);
     }
 

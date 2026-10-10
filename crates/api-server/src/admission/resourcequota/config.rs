@@ -77,7 +77,10 @@ pub fn load_configuration(yaml: &str) -> Result<Vec<LimitedResource>, String> {
 /// The `ResourceQuota` entry of an `AdmissionConfiguration` document
 /// (`--admission-control-config-file`), its inline `configuration`. No such
 /// entry means nothing is limited (the plugin's default configuration).
-pub fn from_admission_configuration(yaml: &str) -> Result<Vec<LimitedResource>, String> {
+pub fn from_admission_configuration(
+    yaml: &str,
+    _config_file: &std::path::Path,
+) -> Result<Vec<LimitedResource>, String> {
     let doc: serde_json::Value = serde_yaml::from_str(yaml).map_err(|e| e.to_string())?;
     let Some(cfg) = doc
         .get("plugins")
