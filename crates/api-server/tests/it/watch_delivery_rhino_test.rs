@@ -478,3 +478,55 @@ async fn rhino_sqlite_watchlist_never_loses_concurrent_default_sa() {
     let _ = std::fs::remove_file(&db_path);
     assert!(lost.is_empty(), "lost default SA:\n{}", lost.join("\n"));
 }
+
+/// #3018: the kubelet's status PATCH (strategic merge) stores a waiting
+/// containerStatus; every later read over rhino/SQLite must show it.
+#[tokio::test]
+async fn pod_status_patch_container_statuses_visible_on_rhino_reads() {
+    let (state, db_path) = make_sqlite_state().await;
+    let router = build_router(state, None);
+    let (s, b) = send(
+        &router,
+        Method::POST,
+        "/api/v1/namespaces",
+        Some(&json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":"default"}})),
+    )
+    .await;
+    assert!(s.is_success() || s == StatusCode::CONFLICT, "{s} {b}");
+    let pod = json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"p"},
+        "spec":{"nodeName":"n","containers":[{"name":"c","image":"busybox"}]}});
+    let (s, b) = send(
+        &router,
+        Method::POST,
+        "/api/v1/namespaces/default/pods",
+        Some(&pod),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let patch = json!({"metadata":{"uid": b["metadata"]["uid"]},"status":{
+        "containerStatuses":[{"name":"c","image":"busybox","imageID":"","ready":false,
+            "restartCount":0,"lastState":{},"state":{"waiting":{"reason":"ContainerCreating"}}}],
+        "phase":"Pending"}});
+    let req = Request::builder()
+        .method(Method::PATCH)
+        .uri("/api/v1/namespaces/default/pods/p/status")
+        .header("content-type", "application/strategic-merge-patch+json")
+        .body(Body::from(serde_json::to_vec(&patch).unwrap()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    for uri in [
+        "/api/v1/namespaces/default/pods/p",
+        "/api/v1/namespaces/default/pods/p?resourceVersion=0",
+        "/api/v1/namespaces/default/pods/p/status",
+    ] {
+        let (s, got) = send(&router, Method::GET, uri, None).await;
+        assert_eq!(s, StatusCode::OK, "{uri}");
+        assert_eq!(
+            got["status"]["containerStatuses"][0]["state"]["waiting"]["reason"],
+            "ContainerCreating",
+            "{uri}: {got}"
+        );
+    }
+    let _ = std::fs::remove_file(&db_path);
+}
