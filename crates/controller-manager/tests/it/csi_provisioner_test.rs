@@ -155,6 +155,18 @@ impl Controller for Fake {
         }
         Ok(Response::new(DeleteVolumeResponse {}))
     }
+    async fn controller_publish_volume(
+        &self,
+        _r: Request<ControllerPublishVolumeRequest>,
+    ) -> Result<Response<ControllerPublishVolumeResponse>, Status> {
+        Err(Status::unimplemented("not part of the provisioner"))
+    }
+    async fn controller_unpublish_volume(
+        &self,
+        _r: Request<ControllerUnpublishVolumeRequest>,
+    ) -> Result<Response<ControllerUnpublishVolumeResponse>, Status> {
+        Err(Status::unimplemented("not part of the provisioner"))
+    }
     async fn create_snapshot(
         &self,
         _r: Request<CreateSnapshotRequest>,

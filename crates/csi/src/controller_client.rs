@@ -23,10 +23,11 @@ use proto::controller_service_capability::rpc::Type as ControllerRpc;
 use proto::identity_client::IdentityClient;
 use proto::plugin_capability::service::Type as PluginService;
 use proto::{
-    ControllerGetCapabilitiesRequest, CreateSnapshotRequest, CreateVolumeRequest,
+    ControllerGetCapabilitiesRequest, ControllerPublishVolumeRequest,
+    ControllerUnpublishVolumeRequest, CreateSnapshotRequest, CreateVolumeRequest,
     DeleteSnapshotRequest, DeleteVolumeRequest, GetPluginCapabilitiesRequest, Snapshot, Volume,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 use tonic::transport::{Channel, Endpoint, Uri};
@@ -316,6 +317,32 @@ impl CsiControllerClient {
             .map(|_| ())
     }
 
+    /// `ControllerPublishVolume` as external-attacher's `attacher.Attach`
+    /// (`pkg/attacher/attacher.go:57-72`): the request is sent as given and
+    /// `rsp.PublishContext` is returned. No capability gate here -- the
+    /// attacher picks its handler from `PUBLISH_UNPUBLISH_VOLUME` before any
+    /// call is made (`cmd/csi-attacher/main.go:231-261`).
+    pub async fn controller_publish_volume(
+        &self,
+        req: ControllerPublishVolumeRequest,
+    ) -> Result<HashMap<String, String>, ControllerError> {
+        let resp = self
+            .call(ControllerClient::new(self.channel()?).controller_publish_volume(req))
+            .await?;
+        Ok(resp.publish_context)
+    }
+
+    /// `ControllerUnpublishVolume` as `attacher.Detach`
+    /// (`pkg/attacher/attacher.go:74-83`). Idempotent per the CSI spec.
+    pub async fn controller_unpublish_volume(
+        &self,
+        req: ControllerUnpublishVolumeRequest,
+    ) -> Result<(), ControllerError> {
+        self.call(ControllerClient::new(self.channel()?).controller_unpublish_volume(req))
+            .await
+            .map(|_| ())
+    }
+
     /// `CreateSnapshot`, gated on `CREATE_DELETE_SNAPSHOT` (external-snapshotter).
     pub async fn create_snapshot(
         &self,
@@ -477,6 +504,18 @@ mod tests {
         ) -> Result<Response<DeleteVolumeResponse>, Status> {
             self.rec.lock().unwrap().delete_volume.push(r.into_inner());
             Ok(Response::new(DeleteVolumeResponse {}))
+        }
+        async fn controller_publish_volume(
+            &self,
+            _r: Request<ControllerPublishVolumeRequest>,
+        ) -> Result<Response<ControllerPublishVolumeResponse>, Status> {
+            Err(Status::unimplemented("not exercised"))
+        }
+        async fn controller_unpublish_volume(
+            &self,
+            _r: Request<ControllerUnpublishVolumeRequest>,
+        ) -> Result<Response<ControllerUnpublishVolumeResponse>, Status> {
+            Err(Status::unimplemented("not exercised"))
         }
         async fn create_snapshot(
             &self,
