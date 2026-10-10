@@ -156,6 +156,18 @@ jobs:
         if: steps.rust.outputs.changed == 'true'
         run: cargo nextest run --workspace --features rusternetes-api-server/sqlite --locked --no-fail-fast --status-level fail
 
+      - name: Wire-format coverage report (warnings only)
+        # Passing nextest tests hide their output, so the gaps (protobuf
+        # registry vs the bundled upstream generated.proto snapshots, and a
+        # per-served-resource protobuf / OpenAPI v2 / v3 check) are surfaced
+        # as ::warning annotations plus a full table in the job summary.
+        # Re-runs the one report test from the binary the previous step
+        # already compiled (same --workspace + feature set => no rebuild).
+        # NEVER fails the job on a gap: the script exits 0 unless the harness
+        # itself breaks (discovery unreachable, proto unparseable).
+        if: steps.rust.outputs.changed == 'true'
+        run: bash scripts/wire-format-coverage.sh
+
       - name: sccache stats
         # Compilation cache hit-rate, for visibility. sccache itself is
         # configured cluster-side via the runner pod env (RUSTC_WRAPPER +

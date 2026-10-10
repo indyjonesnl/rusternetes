@@ -42,7 +42,7 @@ use std::path::{Path, PathBuf};
 
 const UPSTREAM_DIR: &str = "proto/upstream/v1.35";
 
-const PROTO_FILES: &[&str] = &[
+pub(crate) const PROTO_FILES: &[&str] = &[
     "k8s.io/api/core/v1/generated.proto",
     "k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto",
     "k8s.io/api/apps/v1/generated.proto",
@@ -189,7 +189,7 @@ fn collect_qualified(
 ///     it is set, otherwise mapping the scalar `r#type()` enum;
 ///   - collapsing a `Repeated(MapEntry)` field into a logical `Map(K, V)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum LogicalType {
+pub(crate) enum LogicalType {
     Scalar(Scalar),
     Message(String),
     /// Map field, value is the value type (key is always string in K8s usage).
@@ -198,7 +198,7 @@ enum LogicalType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Scalar {
+pub(crate) enum Scalar {
     String,
     Int,
     Bool,
@@ -207,9 +207,9 @@ enum Scalar {
 }
 
 #[derive(Debug, Clone)]
-struct UpstreamField {
-    name: String,
-    logical: LogicalType,
+pub(crate) struct UpstreamField {
+    pub(crate) name: String,
+    pub(crate) logical: LogicalType,
 }
 
 /// Indexed view: message simple name -> (field number -> upstream field).
@@ -218,7 +218,7 @@ type UpstreamIndex = BTreeMap<String, BTreeMap<u32, UpstreamField>>;
 /// Set of synthetic map-entry message names (one per `map<>` field). We skip
 /// these when listing "messages we don't register yet" — they are an
 /// implementation detail of the proto encoding.
-type MapEntryNames = BTreeSet<String>;
+pub(crate) type MapEntryNames = BTreeSet<String>;
 
 /// Strip the package prefix off a fully-qualified `type_name`, e.g.
 /// `.k8s.io.apimachinery.pkg.util.intstr.IntOrString` → `IntOrString`.
@@ -244,7 +244,10 @@ fn scalar_from_proto_type(t: ProtoType) -> Option<Scalar> {
 /// Build the logical type for a single field. `parent_msg_simple` is the
 /// simple name of the enclosing message — needed to disambiguate the
 /// synthetic `<Parent>.<Field>Entry` map types from regular messages.
-fn build_logical(field: &FieldDescriptorProto, map_entries: &MapEntryNames) -> LogicalType {
+pub(crate) fn build_logical(
+    field: &FieldDescriptorProto,
+    map_entries: &MapEntryNames,
+) -> LogicalType {
     let repeated = field.label() == Label::Repeated;
 
     let base = if !field.type_name().is_empty() {
@@ -274,7 +277,7 @@ fn build_logical(field: &FieldDescriptorProto, map_entries: &MapEntryNames) -> L
 /// Compute the set of synthetic map-entry message names across all bundled
 /// proto files. Walks every nested type and returns the simple names that
 /// have `options.map_entry == true`.
-fn collect_map_entries(files: &[FileDescriptorProto]) -> MapEntryNames {
+pub(crate) fn collect_map_entries(files: &[FileDescriptorProto]) -> MapEntryNames {
     let mut out = BTreeSet::new();
     for file in files {
         for msg in &file.message_type {
@@ -297,7 +300,7 @@ fn collect_map_entries_in(msg: &DescriptorProto, out: &mut MapEntryNames) {
 
 /// For a given map-entry message descriptor, return the value-side
 /// logical type.
-fn map_value_type(entry: &DescriptorProto, map_entries: &MapEntryNames) -> LogicalType {
+pub(crate) fn map_value_type(entry: &DescriptorProto, map_entries: &MapEntryNames) -> LogicalType {
     // Map entry messages always have exactly two fields: key (1) and
     // value (2). Pull the value type.
     for f in &entry.field {
@@ -403,7 +406,7 @@ fn walk_collect(msg: &DescriptorProto, out: &mut HashMap<String, DescriptorProto
 
 /// Compare our [`FieldType`] against an upstream [`LogicalType`]. Returns
 /// `None` on match, or `Some(reason)` on mismatch.
-fn compare_types(ours: &FieldType, theirs: &LogicalType) -> Option<String> {
+pub(crate) fn compare_types(ours: &FieldType, theirs: &LogicalType) -> Option<String> {
     match (ours, theirs) {
         // Scalars
         (FieldType::String, LogicalType::Scalar(Scalar::String)) => None,
@@ -520,7 +523,7 @@ const REGISTRY_SKIP: &[&str] = &[
 /// strips `$` prefixes, kebab-case dashes, and PascalCases the first
 /// letter to derive a Go field name. Both names describe the same
 /// field number — only their string differs.
-fn intentional_field_skip(msg: &str, field_number: u32) -> bool {
+pub(crate) fn intentional_field_skip(msg: &str, field_number: u32) -> bool {
     match (msg, field_number) {
         // `TypeMeta` exists in two upstream packages with different
         // field layouts:
