@@ -975,6 +975,66 @@ pub fn resolve_kind_to_resource(group: &str, version: &str, kind: &str) -> Optio
         .and_then(|r| r["resource"].as_str().map(str::to_string))
 }
 
+/// One `RegisterKindFor` call (installer.go:1127) for a built-in resource or
+/// subresource this server serves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredKind {
+    pub group: String,
+    pub version: String,
+    pub resource: String,
+    /// `""` for the main resource.
+    pub subresource: String,
+    /// The `fqKindToRegister`.
+    pub kind_group: String,
+    pub kind_version: String,
+    pub kind: String,
+}
+
+/// Every built-in `resource[/subresource] -> kind` this server serves.
+///
+/// installer.go:1127 registers each resource and subresource it installs under
+/// its group version, with the kind it serves; the aggregated discovery
+/// documents this crate serves are exactly that list (resources, with their
+/// subresources nested), so they are the registry's source here.
+pub fn registered_kinds() -> Vec<RegisteredKind> {
+    let mut group_versions: Vec<(String, String)> = vec![
+        ("".to_string(), "v1".to_string()),
+        ("autoscaling".to_string(), "v1".to_string()),
+    ];
+    for (group, version) in get_api_group_names() {
+        group_versions.push((group.to_string(), version.to_string()));
+        if group_v1beta1_served(group) {
+            group_versions.push((group.to_string(), "v1beta1".to_string()));
+        }
+    }
+    let text = |v: &serde_json::Value, k: &str| v[k].as_str().unwrap_or("").to_string();
+    let mut out = Vec::new();
+    for (group, version) in group_versions {
+        for entry in get_aggregated_resources_for_group_uncategorized(&group, &version) {
+            let resource = text(&entry, "resource");
+            let mut push = |subresource: &str, kind: &serde_json::Value| {
+                out.push(RegisteredKind {
+                    group: group.clone(),
+                    version: version.clone(),
+                    resource: resource.clone(),
+                    subresource: subresource.to_string(),
+                    kind_group: text(kind, "group"),
+                    kind_version: text(kind, "version"),
+                    kind: text(kind, "kind"),
+                });
+            };
+            push("", &entry["responseKind"]);
+            for sub in entry["subresources"].as_array().into_iter().flatten() {
+                push(
+                    sub["subresource"].as_str().unwrap_or(""),
+                    &sub["responseKind"],
+                );
+            }
+        }
+    }
+    out
+}
+
 /// Build aggregated discovery resource entries for a given API group.
 /// Returns a list of resource objects in the apidiscovery.k8s.io/v2 format.
 /// In v2, subresources are nested inside their parent resource's "subresources" array,
