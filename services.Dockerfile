@@ -298,6 +298,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # without an extra COPY pass.
 COPY crates/admission-webhook/src    crates/admission-webhook/src
 COPY crates/api-server/src           crates/api-server/src
+COPY crates/api-server/openapi       crates/api-server/openapi
 COPY crates/api-server/tests         crates/api-server/tests
 COPY crates/cloud-providers/src      crates/cloud-providers/src
 COPY crates/middleware/src           crates/middleware/src

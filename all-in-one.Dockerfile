@@ -204,6 +204,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # CRATE-ENUMERATION (3/3): real source COPYs, per crate.
 COPY rusternetes/crates/admission-webhook/src    ./crates/admission-webhook/src
 COPY rusternetes/crates/api-server/src           ./crates/api-server/src
+COPY rusternetes/crates/api-server/openapi       ./crates/api-server/openapi
 COPY rusternetes/crates/api-server/tests         ./crates/api-server/tests
 COPY rusternetes/crates/cloud-providers/src      ./crates/cloud-providers/src
 COPY rusternetes/crates/client/src               ./crates/client/src
