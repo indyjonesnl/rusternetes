@@ -15,6 +15,7 @@ use crate::advanced::{
     NodeScore,
 };
 use crate::data_plane::{ApiBackend, DataPlane};
+use crate::diagnosis::{fit_error_message, Diagnosis};
 use crate::volume_binding::{self, PreFilterOutcome};
 
 pub struct Scheduler<S: Storage + Send + Sync + 'static = StorageBackend> {
@@ -424,10 +425,10 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         }
 
         // Try to schedule
-        if let Some(node) = self
-            .select_node(&pod, &nodes, &all_pods, &priority_classes)
-            .await
-        {
+        let (selected, diagnosis) = self
+            .select_node_diag(&pod, &nodes, &all_pods, &priority_classes)
+            .await;
+        if let Some(node) = selected {
             if let Err(e) = self.bind_pod_to_node(pod, &node.metadata.name).await {
                 error!("Failed to bind pod {}/{} to node: {}", ns, name, e);
             }
@@ -467,10 +468,17 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             // FailedScheduling event for the pod, so without it they time out.
             // The recorder's correlator dedups across cycles, matching upstream
             // recorder.Eventf(pod, Warning, "FailedScheduling", …).
-            let msg = format!(
-                "0/{} nodes are available: no nodes match the pod's scheduling requirements.",
-                nodes.len()
-            );
+            // Aggregate per-plugin reasons (VolumeBinding etc.) the way
+            // upstream FitError.Error() does; fall back to the generic text
+            // when no plugin recorded a reason.
+            let msg = if diagnosis.is_empty() {
+                format!(
+                    "0/{} nodes are available: no nodes match the pod's scheduling requirements.",
+                    nodes.len()
+                )
+            } else {
+                fit_error_message(nodes.len(), &diagnosis)
+            };
             self.emit_pod_event(&pod, EventType::Warning, "FailedScheduling", &msg)
                 .await;
         }
@@ -589,29 +597,29 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             // 5-second timeout per pod — if scheduling takes longer (e.g.,
             // complex preemption calculation), skip and retry next cycle.
             let schedule_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                if let Some(node) = self
-                    .select_node(&pod, &nodes, &all_pods, &priority_classes)
-                    .await
-                {
+                let (selected, diag) = self
+                    .select_node_diag(&pod, &nodes, &all_pods, &priority_classes)
+                    .await;
+                if let Some(node) = selected {
                     if let Err(e) = self
                         .bind_pod_to_node(pod.clone(), &node.metadata.name)
                         .await
                     {
                         error!("Failed to bind pod to node: {}", e);
                     }
-                    return true;
+                    return (true, diag);
                 }
-                false
+                (false, diag)
             })
             .await;
 
-            match schedule_result {
-                Ok(true) => {
+            let diagnosis: Diagnosis = match schedule_result {
+                Ok((true, _)) => {
                     // Pod bound — re-read all_pods so next pod sees updated state
                     all_pods = self.data.list_pods().await.unwrap_or_default();
                     continue;
                 }
-                Ok(false) => {} // No node found, try preemption below
+                Ok((false, d)) => d, // No node found, try preemption below
                 Err(_) => {
                     warn!(
                         "Scheduling timed out for pod {}/{}, will retry",
@@ -620,7 +628,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     );
                     continue;
                 }
-            }
+            };
 
             {
                 // No suitable node found, try preemption if pod has priority
@@ -725,10 +733,14 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     );
                     // Set pod condition to Unschedulable so tests can observe it
                     let pod_ns = pod.metadata.namespace.as_deref().unwrap_or("default");
-                    let sched_message = format!(
-                        "0/{} nodes are available: no node matched the scheduling constraints",
-                        nodes.len()
-                    );
+                    let sched_message = if diagnosis.is_empty() {
+                        format!(
+                            "0/{} nodes are available: no node matched the scheduling constraints",
+                            nodes.len()
+                        )
+                    } else {
+                        fit_error_message(nodes.len(), &diagnosis)
+                    };
                     let pod_key =
                         rusternetes_storage::build_key("pods", Some(pod_ns), &pod.metadata.name);
                     let msg = sched_message.clone();
@@ -769,12 +781,29 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         Ok(())
     }
 
-    async fn select_node(
+    /// `select_node` plus the scheduling `Diagnosis` (upstream
+    /// `framework.Diagnosis`) used to build the `FailedScheduling` message.
+    async fn select_node_diag(
         &self,
         pod: &Pod,
         nodes: &[Node],
         all_pods: &[Pod],
         priority_classes: &HashMap<String, PriorityClass>,
+    ) -> (Option<Node>, Diagnosis) {
+        let mut diag = Diagnosis::default();
+        let picked = self
+            .select_node_inner(pod, nodes, all_pods, priority_classes, &mut diag)
+            .await;
+        (picked, diag)
+    }
+
+    async fn select_node_inner(
+        &self,
+        pod: &Pod,
+        nodes: &[Node],
+        all_pods: &[Pod],
+        priority_classes: &HashMap<String, PriorityClass>,
+        diag: &mut Diagnosis,
     ) -> Option<Node> {
         // Advanced scheduling algorithm:
         // 1. Filter out unschedulable nodes
@@ -795,6 +824,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     PreFilterOutcome::Skip => None,
                     PreFilterOutcome::Ready(claims) => Some((snap, claims)),
                     PreFilterOutcome::Unresolvable(m) | PreFilterOutcome::Error(m) => {
+                        diag.pre_filter_msg = m.clone();
                         debug!(
                             "VolumeBinding PreFilter rejected pod {}/{}: {}",
                             ns, pod.metadata.name, m
@@ -904,6 +934,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     |node| match volume_binding::find_pod_volumes(pod, &claims, node, &snap) {
                         Ok((_, reasons)) if reasons.is_empty() => true,
                         Ok((_, reasons)) => {
+                            diag.add_node_reasons(reasons.iter().map(|r| r.to_string()));
                             debug!(
                                 "Node {} rejected for pod {}: {}",
                                 node.metadata.name,

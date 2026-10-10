@@ -27,8 +27,25 @@ impl Diagnosis {
 
 /// Port of `FitError.Error()`.
 pub fn fit_error_message(num_all_nodes: usize, d: &Diagnosis) -> String {
-    let _ = (num_all_nodes, d);
-    String::new()
+    let mut msg = format!("0/{} nodes are available:", num_all_nodes);
+    if !d.pre_filter_msg.is_empty() {
+        // PreFilter returned unschedulable; the framework stamps the same
+        // status on every node, so node reasons would only duplicate it.
+        msg.push_str(&format!(" {}.", d.pre_filter_msg));
+        return msg;
+    }
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for r in &d.node_reasons {
+        *counts.entry(r.as_str()).or_insert(0) += 1;
+    }
+    let mut parts: Vec<String> = counts.iter().map(|(k, v)| format!("{} {}", v, k)).collect();
+    parts.sort();
+    if parts.is_empty() {
+        // upstream: no histogram -> message ends after the colon-less prefix
+        return format!("0/{} nodes are available.", num_all_nodes);
+    }
+    msg.push_str(&format!(" {}.", parts.join(", ")));
+    msg
 }
 
 #[cfg(test)]
