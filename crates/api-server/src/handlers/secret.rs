@@ -22,7 +22,7 @@ use rusternetes_common::{
     resources::{PodSpec, Secret},
     List, Result,
 };
-use rusternetes_storage::{build_prefix, Storage};
+use rusternetes_storage::build_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
@@ -281,14 +281,17 @@ pub async fn list(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let mut secrets: Vec<Secret> = state.storage.list(&prefix).await?;
+    let mut secrets: Vec<Secret> =
+        crate::handlers::list_options::list_items(&*state.storage, &prefix, &params).await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut secrets, &params)?;
 
     let mut list = List::new("SecretList", "v1", secrets);
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list).into_response())
 }
 
@@ -347,13 +350,17 @@ pub async fn list_all_secrets(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let mut secrets = state.storage.list::<Secret>(&prefix).await?;
+    let mut secrets =
+        crate::handlers::list_options::list_items::<Secret, _>(&*state.storage, &prefix, &params)
+            .await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut secrets, &params)?;
 
     let mut list = List::new("SecretList", "v1", secrets);
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list).into_response())
 }

@@ -405,8 +405,10 @@ pub async fn list(
     crate::handlers::filtering::apply_selectors(&mut hpas, &params)?;
 
     let mut list = List::new("HorizontalPodAutoscalerList", "autoscaling/v2", hpas);
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     let mut value = serde_json::to_value(&list)
         .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
     to_served_json(&uri, &mut value);
@@ -462,8 +464,10 @@ pub async fn list_all(
     crate::handlers::filtering::apply_selectors(&mut hpas, &params)?;
 
     let mut list = List::new("HorizontalPodAutoscalerList", "autoscaling/v2", hpas);
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     let mut value = serde_json::to_value(&list)
         .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
     to_served_json(&uri, &mut value);

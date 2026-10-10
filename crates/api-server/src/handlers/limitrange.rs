@@ -23,7 +23,7 @@ use rusternetes_common::{
     resources::LimitRange,
     List, Result,
 };
-use rusternetes_storage::{build_prefix, Storage};
+use rusternetes_storage::build_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
@@ -210,14 +210,21 @@ pub async fn list(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let mut limit_ranges = state.storage.list::<LimitRange>(&prefix).await?;
+    let mut limit_ranges = crate::handlers::list_options::list_items::<LimitRange, _>(
+        &*state.storage,
+        &prefix,
+        &params,
+    )
+    .await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut limit_ranges, &params)?;
 
     let mut list = List::new("LimitRangeList", "v1", limit_ranges);
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list).into_response())
 }
 
@@ -254,13 +261,20 @@ pub async fn list_all(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let mut limit_ranges = state.storage.list::<LimitRange>(&prefix).await?;
+    let mut limit_ranges = crate::handlers::list_options::list_items::<LimitRange, _>(
+        &*state.storage,
+        &prefix,
+        &params,
+    )
+    .await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut limit_ranges, &params)?;
 
     let mut list = List::new("LimitRangeList", "v1", limit_ranges);
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list).into_response())
 }

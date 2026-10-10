@@ -23,7 +23,7 @@ use rusternetes_common::{
     resources::EndpointSlice,
     List, Result,
 };
-use rusternetes_storage::{build_prefix, Storage};
+use rusternetes_storage::build_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
@@ -209,7 +209,12 @@ pub async fn list_endpointslices(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &list_options).await?;
 
-    let mut endpointslices = state.storage.list::<EndpointSlice>(&prefix).await?;
+    let mut endpointslices = crate::handlers::list_options::list_items::<EndpointSlice, _>(
+        &*state.storage,
+        &prefix,
+        &list_options,
+    )
+    .await?;
 
     // Apply field and label selector filtering
     let mut params_map = HashMap::new();
@@ -222,8 +227,14 @@ pub async fn list_endpointslices(
     crate::handlers::filtering::apply_selectors(&mut endpointslices, &params_map)?;
 
     let mut list = List::new("EndpointSliceList", "discovery.k8s.io/v1", endpointslices);
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(
+            &state.storage,
+            &list_options,
+            &list.items,
+        )
+        .await,
+    );
     Ok(Json(list).into_response())
 }
 
@@ -263,7 +274,12 @@ pub async fn list_all_endpointslices(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &list_options).await?;
 
-    let mut endpointslices = state.storage.list::<EndpointSlice>(&prefix).await?;
+    let mut endpointslices = crate::handlers::list_options::list_items::<EndpointSlice, _>(
+        &*state.storage,
+        &prefix,
+        &list_options,
+    )
+    .await?;
 
     // Apply field and label selector filtering
     let mut params_map = HashMap::new();
@@ -276,7 +292,13 @@ pub async fn list_all_endpointslices(
     crate::handlers::filtering::apply_selectors(&mut endpointslices, &params_map)?;
 
     let mut list = List::new("EndpointSliceList", "discovery.k8s.io/v1", endpointslices);
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(
+            &state.storage,
+            &list_options,
+            &list.items,
+        )
+        .await,
+    );
     Ok(Json(list).into_response())
 }

@@ -30,7 +30,7 @@ use rusternetes_common::{
     resources::{Event, EventList, EventV1, EventV1List},
     Result,
 };
-use rusternetes_storage::{build_prefix, Storage};
+use rusternetes_storage::build_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
@@ -370,7 +370,8 @@ pub async fn list(
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
     let prefix = build_prefix("events", Some(&namespace));
-    let mut events: Vec<Event> = state.storage.list(&prefix).await?;
+    let mut events: Vec<Event> =
+        crate::handlers::list_options::list_items(&*state.storage, &prefix, &params).await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut events, &params)?;
@@ -439,7 +440,8 @@ pub async fn list_all(
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
     let prefix = build_prefix("events", None);
-    let mut events: Vec<Event> = state.storage.list(&prefix).await?;
+    let mut events: Vec<Event> =
+        crate::handlers::list_options::list_items(&*state.storage, &prefix, &params).await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut events, &params)?;
@@ -523,7 +525,8 @@ pub async fn list_events_v1(
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
     let prefix = build_prefix("events", Some(&namespace));
-    let mut events: Vec<Event> = state.storage.list(&prefix).await?;
+    let mut events: Vec<Event> =
+        crate::handlers::list_options::list_items(&*state.storage, &prefix, &params).await?;
     crate::handlers::filtering::apply_selectors(&mut events, &params)?;
 
     // Answer in the events.k8s.io/v1 schema, not the stored core one with a
@@ -589,7 +592,8 @@ pub async fn list_all_events_v1(
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
     let prefix = build_prefix("events", None);
-    let mut events: Vec<Event> = state.storage.list(&prefix).await?;
+    let mut events: Vec<Event> =
+        crate::handlers::list_options::list_items(&*state.storage, &prefix, &params).await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut events, &params)?;

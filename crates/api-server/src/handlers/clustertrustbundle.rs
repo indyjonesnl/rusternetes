@@ -26,7 +26,7 @@ use rusternetes_common::{
     resources::ClusterTrustBundle,
     Error, List, Result,
 };
-use rusternetes_storage::{build_prefix, Storage};
+use rusternetes_storage::build_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -192,7 +192,12 @@ pub async fn list_clustertrustbundles(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let mut items = state.storage.list::<ClusterTrustBundle>(&prefix).await?;
+    let mut items = crate::handlers::list_options::list_items::<ClusterTrustBundle, _>(
+        &*state.storage,
+        &prefix,
+        &params,
+    )
+    .await?;
     crate::handlers::filtering::apply_selectors(&mut items, &params)?;
 
     let mut list = List::new(
@@ -200,7 +205,9 @@ pub async fn list_clustertrustbundles(
         "certificates.k8s.io/v1beta1",
         items,
     );
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list).into_response())
 }

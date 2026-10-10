@@ -26,7 +26,7 @@ use rusternetes_common::{
     resources::Service,
     List, Result,
 };
-use rusternetes_storage::{build_prefix, Storage};
+use rusternetes_storage::build_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
@@ -342,7 +342,12 @@ pub async fn list(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &list_options).await?;
 
-    let mut services = state.storage.list::<Service>(&prefix).await?;
+    let mut services = crate::handlers::list_options::list_items::<Service, _>(
+        &*state.storage,
+        &prefix,
+        &list_options,
+    )
+    .await?;
     // `Store.Decorator` on every listed item (`Store.List` store.go:381-383;
     // `defaultOnReadServiceList` storage.go:243-252).
     services
@@ -362,8 +367,12 @@ pub async fn list(
     // The list RV must never fall below an item this same list returns.
     // Upstream gets both from one etcd range response; here the store
     // revision and the items are read separately, so take the max (#1825).
-    let resource_version =
-        crate::handlers::list_collection_resource_version(&state.storage, &services).await;
+    let resource_version = crate::handlers::list_options::list_resource_version(
+        &state.storage,
+        &list_options,
+        &services,
+    )
+    .await;
 
     // Check if table format is requested
     let accept = headers.get("accept").and_then(|v| v.to_str().ok());
@@ -378,8 +387,14 @@ pub async fn list(
 
     // Wrap in proper List object
     let mut list = List::new("ServiceList", "v1", services);
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(
+            &state.storage,
+            &list_options,
+            &list.items,
+        )
+        .await,
+    );
     Ok(Json(list).into_response())
 }
 
@@ -422,7 +437,12 @@ pub async fn list_all_services(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &list_options).await?;
 
-    let mut services = state.storage.list::<Service>(&prefix).await?;
+    let mut services = crate::handlers::list_options::list_items::<Service, _>(
+        &*state.storage,
+        &prefix,
+        &list_options,
+    )
+    .await?;
     // `Store.Decorator` on every listed item (`Store.List` store.go:381-383;
     // `defaultOnReadServiceList` storage.go:243-252).
     services
@@ -442,8 +462,12 @@ pub async fn list_all_services(
     // The list RV must never fall below an item this same list returns.
     // Upstream gets both from one etcd range response; here the store
     // revision and the items are read separately, so take the max (#1825).
-    let resource_version =
-        crate::handlers::list_collection_resource_version(&state.storage, &services).await;
+    let resource_version = crate::handlers::list_options::list_resource_version(
+        &state.storage,
+        &list_options,
+        &services,
+    )
+    .await;
 
     // Check if table format is requested
     let accept = headers.get("accept").and_then(|v| v.to_str().ok());
@@ -457,7 +481,13 @@ pub async fn list_all_services(
     }
 
     let mut list = List::new("ServiceList", "v1", services);
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(
+            &state.storage,
+            &list_options,
+            &list.items,
+        )
+        .await,
+    );
     Ok(Json(list).into_response())
 }

@@ -22,7 +22,7 @@ use rusternetes_common::{
     resources::{ClusterRole, ClusterRoleBinding, Role, RoleBinding},
     List, Result,
 };
-use rusternetes_storage::{build_prefix, Storage};
+use rusternetes_storage::build_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
@@ -219,14 +219,18 @@ pub async fn list_roles(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let mut roles = state.storage.list::<Role>(&prefix).await?;
+    let mut roles =
+        crate::handlers::list_options::list_items::<Role, _>(&*state.storage, &prefix, &params)
+            .await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut roles, &params)?;
 
     let mut list = List::new("RoleList", "rbac.authorization.k8s.io/v1", roles);
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list).into_response())
 }
 
@@ -265,14 +269,18 @@ pub async fn list_all_roles(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let mut roles = state.storage.list::<Role>(&prefix).await?;
+    let mut roles =
+        crate::handlers::list_options::list_items::<Role, _>(&*state.storage, &prefix, &params)
+            .await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut roles, &params)?;
 
     let mut list = List::new("RoleList", "rbac.authorization.k8s.io/v1", roles);
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list).into_response())
 }
 
@@ -442,7 +450,12 @@ pub async fn list_rolebindings(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let mut rolebindings = state.storage.list::<RoleBinding>(&prefix).await?;
+    let mut rolebindings = crate::handlers::list_options::list_items::<RoleBinding, _>(
+        &*state.storage,
+        &prefix,
+        &params,
+    )
+    .await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut rolebindings, &params)?;
@@ -452,8 +465,10 @@ pub async fn list_rolebindings(
         "rbac.authorization.k8s.io/v1",
         rolebindings,
     );
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list).into_response())
 }
 
@@ -494,7 +509,12 @@ pub async fn list_all_rolebindings(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let mut rolebindings = state.storage.list::<RoleBinding>(&prefix).await?;
+    let mut rolebindings = crate::handlers::list_options::list_items::<RoleBinding, _>(
+        &*state.storage,
+        &prefix,
+        &params,
+    )
+    .await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut rolebindings, &params)?;
@@ -504,8 +524,10 @@ pub async fn list_all_rolebindings(
         "rbac.authorization.k8s.io/v1",
         rolebindings,
     );
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list).into_response())
 }
 
@@ -672,7 +694,12 @@ pub async fn list_clusterroles(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let mut clusterroles = state.storage.list::<ClusterRole>(&prefix).await?;
+    let mut clusterroles = crate::handlers::list_options::list_items::<ClusterRole, _>(
+        &*state.storage,
+        &prefix,
+        &params,
+    )
+    .await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut clusterroles, &params)?;
@@ -682,8 +709,10 @@ pub async fn list_clusterroles(
         "rbac.authorization.k8s.io/v1",
         clusterroles,
     );
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list).into_response())
 }
 
@@ -847,7 +876,13 @@ pub async fn list_clusterrolebindings(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let mut clusterrolebindings = state.storage.list::<ClusterRoleBinding>(&prefix).await?;
+    let mut clusterrolebindings =
+        crate::handlers::list_options::list_items::<ClusterRoleBinding, _>(
+            &*state.storage,
+            &prefix,
+            &params,
+        )
+        .await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut clusterrolebindings, &params)?;
@@ -857,7 +892,9 @@ pub async fn list_clusterrolebindings(
         "rbac.authorization.k8s.io/v1",
         clusterrolebindings,
     );
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list).into_response())
 }

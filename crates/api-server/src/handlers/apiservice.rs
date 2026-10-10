@@ -24,7 +24,7 @@ use rusternetes_common::{
     resources::APIService,
     List, Result,
 };
-use rusternetes_storage::{build_prefix, Storage};
+use rusternetes_storage::build_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -264,14 +264,21 @@ pub async fn list_apiservices(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let mut items = state.storage.list::<APIService>(&prefix).await?;
+    let mut items = crate::handlers::list_options::list_items::<APIService, _>(
+        &*state.storage,
+        &prefix,
+        &params,
+    )
+    .await?;
 
     // `?labelSelector=` / `?fieldSelector=` narrow the list, as upstream's
     // `Store.List` does through its predicate.
     crate::handlers::filtering::apply_selectors(&mut items, &params)?;
 
     let mut list = List::new("APIServiceList", "apiregistration.k8s.io/v1", items);
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list).into_response())
 }

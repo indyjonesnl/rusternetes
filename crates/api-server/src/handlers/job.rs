@@ -23,7 +23,7 @@ use rusternetes_common::{
     resources::Job,
     List, Result,
 };
-use rusternetes_storage::{build_prefix, Storage};
+use rusternetes_storage::build_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
@@ -293,14 +293,17 @@ pub async fn list(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let mut jobs: Vec<Job> = state.storage.list(&prefix).await?;
+    let mut jobs: Vec<Job> =
+        crate::handlers::list_options::list_items(&*state.storage, &prefix, &params).await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut jobs, &params)?;
 
     let mut list = List::new("JobList", "batch/v1", jobs);
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list).into_response())
 }
 
@@ -359,14 +362,18 @@ pub async fn list_all_jobs(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let mut jobs = state.storage.list::<Job>(&prefix).await?;
+    let mut jobs =
+        crate::handlers::list_options::list_items::<Job, _>(&*state.storage, &prefix, &params)
+            .await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut jobs, &params)?;
 
     let mut list = List::new("JobList", "batch/v1", jobs);
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list).into_response())
 }
 

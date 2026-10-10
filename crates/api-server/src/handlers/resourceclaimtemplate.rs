@@ -23,7 +23,7 @@ use rusternetes_common::{
     resources::ResourceClaimTemplate,
     List, Result,
 };
-use rusternetes_storage::{build_prefix, Storage};
+use rusternetes_storage::build_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -155,13 +155,16 @@ pub async fn list_resourceclaimtemplates(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let mut templates: Vec<ResourceClaimTemplate> = state.storage.list(&prefix).await?;
+    let mut templates: Vec<ResourceClaimTemplate> =
+        crate::handlers::list_options::list_items(&*state.storage, &prefix, &params).await?;
 
     crate::handlers::filtering::apply_selectors(&mut templates, &params)?;
 
     let mut list = List::new("ResourceClaimTemplateList", "resource.k8s.io/v1", templates);
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list).into_response())
 }
 
@@ -219,13 +222,16 @@ pub async fn list_all_resourceclaimtemplates(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let mut templates: Vec<ResourceClaimTemplate> = state.storage.list(&prefix).await?;
+    let mut templates: Vec<ResourceClaimTemplate> =
+        crate::handlers::list_options::list_items(&*state.storage, &prefix, &params).await?;
 
     crate::handlers::filtering::apply_selectors(&mut templates, &params)?;
 
     let mut list = List::new("ResourceClaimTemplateList", "resource.k8s.io/v1", templates);
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list).into_response())
 }
 

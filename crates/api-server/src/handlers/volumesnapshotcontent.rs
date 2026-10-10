@@ -23,7 +23,7 @@ use rusternetes_common::{
     resources::VolumeSnapshotContent,
     List, Result,
 };
-use rusternetes_storage::{build_prefix, Storage};
+use rusternetes_storage::build_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
@@ -271,7 +271,12 @@ pub async fn list_volumesnapshotcontents(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let mut vscs = state.storage.list::<VolumeSnapshotContent>(&prefix).await?;
+    let mut vscs = crate::handlers::list_options::list_items::<VolumeSnapshotContent, _>(
+        &*state.storage,
+        &prefix,
+        &params,
+    )
+    .await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut vscs, &params)?;
@@ -281,7 +286,9 @@ pub async fn list_volumesnapshotcontents(
         "snapshot.storage.k8s.io/v1",
         vscs,
     );
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(axum::response::IntoResponse::into_response(Json(list)))
 }

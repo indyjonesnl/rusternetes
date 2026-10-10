@@ -23,7 +23,7 @@ use rusternetes_common::{
     resources::{ReplicationController, Scale},
     List, Result,
 };
-use rusternetes_storage::{build_prefix, Storage};
+use rusternetes_storage::build_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
@@ -365,7 +365,12 @@ pub async fn list_replicationcontrollers(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let mut rcs = state.storage.list::<ReplicationController>(&prefix).await?;
+    let mut rcs = crate::handlers::list_options::list_items::<ReplicationController, _>(
+        &*state.storage,
+        &prefix,
+        &params,
+    )
+    .await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut rcs, &params)?;
@@ -374,7 +379,7 @@ pub async fn list_replicationcontrollers(
     // Upstream gets both from one etcd range response; here the store
     // revision and the items are read separately, so take the max (#1825).
     let resource_version =
-        crate::handlers::list_collection_resource_version(&state.storage, &rcs).await;
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &rcs).await;
 
     // Check if table format is requested
     let accept = headers.get("accept").and_then(|v| v.to_str().ok());
@@ -388,8 +393,10 @@ pub async fn list_replicationcontrollers(
     }
 
     let mut list = List::new("ReplicationControllerList", "v1", rcs);
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list).into_response())
 }
 
@@ -429,7 +436,12 @@ pub async fn list_all_replicationcontrollers(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let mut rcs = state.storage.list::<ReplicationController>(&prefix).await?;
+    let mut rcs = crate::handlers::list_options::list_items::<ReplicationController, _>(
+        &*state.storage,
+        &prefix,
+        &params,
+    )
+    .await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut rcs, &params)?;
@@ -438,7 +450,7 @@ pub async fn list_all_replicationcontrollers(
     // Upstream gets both from one etcd range response; here the store
     // revision and the items are read separately, so take the max (#1825).
     let resource_version =
-        crate::handlers::list_collection_resource_version(&state.storage, &rcs).await;
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &rcs).await;
 
     // Check if table format is requested
     let accept = headers.get("accept").and_then(|v| v.to_str().ok());
@@ -452,7 +464,9 @@ pub async fn list_all_replicationcontrollers(
     }
 
     let mut list = List::new("ReplicationControllerList", "v1", rcs);
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list).into_response())
 }

@@ -31,7 +31,7 @@ use rusternetes_common::{
     resources::{MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding},
     Error, List, Result,
 };
-use rusternetes_storage::{build_prefix, Storage};
+use rusternetes_storage::build_prefix;
 use std::sync::Arc;
 
 /// The 404 of a resource whose storage was not installed because the
@@ -110,10 +110,14 @@ pub async fn list_mutating_admission_policies(
     }
 
     let prefix = build_prefix("mutatingadmissionpolicies", None);
-    let mut items = state
-        .storage
-        .list::<MutatingAdmissionPolicy>(&prefix)
-        .await?;
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+    let mut items = crate::handlers::list_options::list_items::<MutatingAdmissionPolicy, _>(
+        &*state.storage,
+        &prefix,
+        &params,
+    )
+    .await?;
     crate::handlers::filtering::apply_selectors(&mut items, &params)?;
 
     let mut list = List::new(
@@ -121,8 +125,10 @@ pub async fn list_mutating_admission_policies(
         "admissionregistration.k8s.io/v1beta1",
         items,
     );
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list).into_response())
 }
 
@@ -187,10 +193,14 @@ pub async fn list_mutating_admission_policy_bindings(
     }
 
     let prefix = build_prefix("mutatingadmissionpolicybindings", None);
-    let mut items = state
-        .storage
-        .list::<MutatingAdmissionPolicyBinding>(&prefix)
-        .await?;
+    // ValidateListOptions + the resourceVersion floor (#2683).
+    crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
+    let mut items = crate::handlers::list_options::list_items::<MutatingAdmissionPolicyBinding, _>(
+        &*state.storage,
+        &prefix,
+        &params,
+    )
+    .await?;
     crate::handlers::filtering::apply_selectors(&mut items, &params)?;
 
     let mut list = List::new(
@@ -198,7 +208,9 @@ pub async fn list_mutating_admission_policy_bindings(
         "admissionregistration.k8s.io/v1beta1",
         items,
     );
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list).into_response())
 }

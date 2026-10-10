@@ -27,7 +27,7 @@ use rusternetes_common::{
     resources::podcertificaterequest::PodCertificateRequest,
     Error, List, Result,
 };
-use rusternetes_storage::{build_prefix, Storage};
+use rusternetes_storage::build_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -246,7 +246,12 @@ async fn list_in(
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
     let prefix = build_prefix("podcertificaterequests", namespace.as_deref());
-    let mut items = state.storage.list::<PodCertificateRequest>(&prefix).await?;
+    let mut items = crate::handlers::list_options::list_items::<PodCertificateRequest, _>(
+        &*state.storage,
+        &prefix,
+        &params,
+    )
+    .await?;
 
     // `getAttrs` (storage.go) makes spec.signerName / spec.podName /
     // spec.nodeName selectable next to the metadata fields; the selectors run
@@ -258,8 +263,10 @@ async fn list_in(
         "certificates.k8s.io/v1beta1",
         items,
     );
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list).into_response())
 }
 

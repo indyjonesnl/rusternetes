@@ -23,7 +23,7 @@ use rusternetes_common::{
     resources::{Deployment, Scale},
     List, Result,
 };
-use rusternetes_storage::{build_prefix, Storage};
+use rusternetes_storage::build_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
@@ -382,7 +382,8 @@ pub async fn list(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let mut deployments: Vec<Deployment> = state.storage.list(&prefix).await?;
+    let mut deployments: Vec<Deployment> =
+        crate::handlers::list_options::list_items(&*state.storage, &prefix, &params).await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut deployments, &params)?;
@@ -391,7 +392,8 @@ pub async fn list(
     // Upstream gets both from one etcd range response; here the store
     // revision and the items are read separately, so take the max (#1825).
     let resource_version =
-        crate::handlers::list_collection_resource_version(&state.storage, &deployments).await;
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &deployments)
+            .await;
 
     // Check if table format is requested
     let accept = headers.get("accept").and_then(|v| v.to_str().ok());
@@ -405,8 +407,10 @@ pub async fn list(
     }
 
     let mut list = List::new("DeploymentList", "apps/v1", deployments);
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list).into_response())
 }
 
@@ -466,7 +470,12 @@ pub async fn list_all_deployments(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let mut deployments = state.storage.list::<Deployment>(&prefix).await?;
+    let mut deployments = crate::handlers::list_options::list_items::<Deployment, _>(
+        &*state.storage,
+        &prefix,
+        &params,
+    )
+    .await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut deployments, &params)?;
@@ -475,7 +484,8 @@ pub async fn list_all_deployments(
     // Upstream gets both from one etcd range response; here the store
     // revision and the items are read separately, so take the max (#1825).
     let resource_version =
-        crate::handlers::list_collection_resource_version(&state.storage, &deployments).await;
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &deployments)
+            .await;
 
     // Check if table format is requested
     let accept = headers.get("accept").and_then(|v| v.to_str().ok());
@@ -489,7 +499,9 @@ pub async fn list_all_deployments(
     }
 
     let mut list = List::new("DeploymentList", "apps/v1", deployments);
-    list.metadata.resource_version =
-        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
+    list.metadata.resource_version = Some(
+        crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
+            .await,
+    );
     Ok(Json(list).into_response())
 }
