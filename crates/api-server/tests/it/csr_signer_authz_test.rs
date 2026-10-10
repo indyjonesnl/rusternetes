@@ -351,3 +351,119 @@ async fn a_status_update_that_changes_nothing_needs_no_sign() {
     let (status, body) = put_json_bearer(&state, &format!("{CSRS}/c1/status"), &token, &csr).await;
     assert_eq!(status, 200, "{body}");
 }
+
+// ---- PodCertificateRequest `/status` "sign" check (#2634) -----------------
+//
+// pkg/registry/certificates/podcertificaterequest/strategy.go:153-167
+// (`StatusStrategy.ValidateUpdate`): a caller changing any status field needs
+// `sign` on the old object's `spec.signerName`, checked through
+// `certauthorization.IsAuthorizedForSignerName`. Driven through the real
+// router and the real `RBACAuthorizer`.
+
+const PCRS: &str = "/apis/certificates.k8s.io/v1beta1/namespaces/ns/podcertificaterequests";
+const PCR_SIGNER: &str = "example.com/foo";
+
+fn pcr_body() -> Value {
+    json!({"apiVersion": "certificates.k8s.io/v1beta1", "kind": "PodCertificateRequest",
+           "metadata": {"name": "foo", "namespace": "ns", "uid": "pcr-uid"},
+           "spec": {"signerName": PCR_SIGNER, "podName": "p", "podUID": "pod-uid",
+                    "serviceAccountName": "sa", "serviceAccountUID": "sa-uid",
+                    "nodeName": "n", "nodeUID": "node-uid"}})
+}
+
+/// `csr-user` holds `update` on `podcertificaterequests/status` plus `extra`;
+/// the PCR is seeded straight through storage.
+async fn pcr_setup(extra: Vec<PolicyRule>) -> (TestApiServer, String) {
+    let state = spawn_state();
+    let uid = seed_sa(&state, "kube-system", "csr-user").await;
+    let token = mint_sa_token("kube-system", "csr-user", &uid);
+    let mut rules = vec![rule(
+        &["get", "update", "patch"],
+        &["certificates.k8s.io"],
+        &["podcertificaterequests", "podcertificaterequests/status"],
+    )];
+    rules.extend(extra);
+    seed_controller_role(&state, "csr-user", rules).await;
+    let pcr: rusternetes_common::resources::podcertificaterequest::PodCertificateRequest =
+        serde_json::from_value(pcr_body()).unwrap();
+    state
+        .storage
+        .create(
+            &build_key("podcertificaterequests", Some("ns"), "foo"),
+            &pcr,
+        )
+        .await
+        .unwrap();
+    (state, token)
+}
+
+async fn put_pcr_status(state: &TestApiServer, token: &str) -> (u16, Value) {
+    let (s, _, _, mut body) = state
+        .send_with_headers(
+            "GET",
+            &format!("{PCRS}/foo"),
+            &[("authorization", &format!("Bearer {token}"))],
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    body["status"] = json!({"conditions": [{"type": "Denied", "status": "True",
+        "reason": "Test", "message": "denied",
+        "lastTransitionTime": "2026-01-01T00:00:00Z"}]});
+    put_json_bearer(state, &format!("{PCRS}/foo/status"), token, &body).await
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn pcr_status_update_without_sign_is_forbidden() {
+    let _gate = rusternetes_common::feature_gates::with_feature(
+        rusternetes_common::feature_gates::Feature::PodCertificateRequest,
+        true,
+    );
+    let (state, token) = pcr_setup(vec![]).await;
+    let (status, body) = put_pcr_status(&state, &token).await;
+    assert_eq!(status, 403, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains(r#"is not permitted to "sign" for signer "example.com/foo""#),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn pcr_status_update_with_sign_on_signer_is_allowed() {
+    let _gate = rusternetes_common::feature_gates::with_feature(
+        rusternetes_common::feature_gates::Feature::PodCertificateRequest,
+        true,
+    );
+    let (state, token) = pcr_setup(vec![signers_rule("sign", &[PCR_SIGNER])]).await;
+    let (status, body) = put_pcr_status(&state, &token).await;
+    assert_eq!(status, 200, "{body}");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn pcr_status_update_with_sign_on_domain_wildcard_is_allowed() {
+    let _gate = rusternetes_common::feature_gates::with_feature(
+        rusternetes_common::feature_gates::Feature::PodCertificateRequest,
+        true,
+    );
+    let (state, token) = pcr_setup(vec![signers_rule("sign", &["example.com/*"])]).await;
+    let (status, body) = put_pcr_status(&state, &token).await;
+    assert_eq!(status, 200, "{body}");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn pcr_status_update_with_sign_on_other_signer_is_forbidden() {
+    let _gate = rusternetes_common::feature_gates::with_feature(
+        rusternetes_common::feature_gates::Feature::PodCertificateRequest,
+        true,
+    );
+    let (state, token) = pcr_setup(vec![signers_rule("sign", &["example.com/other"])]).await;
+    let (status, body) = put_pcr_status(&state, &token).await;
+    assert_eq!(status, 403, "{body}");
+}
