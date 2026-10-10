@@ -2954,6 +2954,7 @@ impl ProtoRegistry {
         Self::register_networking_v1(&mut schemas);
         Self::register_autoscaling_v2(&mut schemas);
         Self::register_autoscaling_v1(&mut schemas);
+        Self::register_autoscaling_v1_qualified(&mut schemas);
         Self::register_batch_v1(&mut schemas);
         Self::register_core_v1_container_runtime(&mut schemas);
         Self::register_core_v1_kinds(&mut schemas);
@@ -5462,6 +5463,178 @@ impl ProtoRegistry {
                     (2, ("selector".into(), FieldType::String)),
                 ]),
             },
+        );
+    }
+
+    /// Qualified `autoscaling/v1.<Name>` schemas whose layout differs from the
+    /// bare autoscaling/v2 entries. Field numbers verbatim from
+    /// k8s.io/api/autoscaling/v1/generated.proto (release-1.35). The v1 HPA
+    /// kind, list, spec/status and MetricSpec/MetricStatus resolve through
+    /// `{apiVersion}.{kind}` (see `encode_native` / `decode_k8s_resource`).
+    fn register_autoscaling_v1_qualified(schemas: &mut HashMap<String, MessageSchema>) {
+        use FieldType as F;
+        const P: &str = "autoscaling/v1.";
+        let q = |n: &str| F::Message(format!("{P}{n}"));
+        let m = |n: &str| F::Message(n.into());
+        let mut add = |name: &str, fields: Vec<(u32, &str, FieldType)>| {
+            schemas.insert(
+                format!("{P}{name}"),
+                MessageSchema {
+                    fields: fields
+                        .into_iter()
+                        .map(|(n, j, t)| (n, (j.to_string(), t)))
+                        .collect(),
+                },
+            );
+        };
+        let xref = || m("CrossVersionObjectReference");
+        add(
+            "ContainerResourceMetricSource",
+            vec![
+                (1, "name", F::String),
+                (2, "targetAverageUtilization", F::Int),
+                (3, "targetAverageValue", F::Quantity),
+                (5, "container", F::String),
+            ],
+        );
+        add(
+            "ContainerResourceMetricStatus",
+            vec![
+                (1, "name", F::String),
+                (2, "currentAverageUtilization", F::Int),
+                (3, "currentAverageValue", F::Quantity),
+                (4, "container", F::String),
+            ],
+        );
+        add(
+            "ExternalMetricSource",
+            vec![
+                (1, "metricName", F::String),
+                (2, "metricSelector", m("LabelSelector")),
+                (3, "targetValue", F::Quantity),
+                (4, "targetAverageValue", F::Quantity),
+            ],
+        );
+        add(
+            "ExternalMetricStatus",
+            vec![
+                (1, "metricName", F::String),
+                (2, "metricSelector", m("LabelSelector")),
+                (3, "currentValue", F::Quantity),
+                (4, "currentAverageValue", F::Quantity),
+            ],
+        );
+        add(
+            "ObjectMetricSource",
+            vec![
+                (1, "target", xref()),
+                (2, "metricName", F::String),
+                (3, "targetValue", F::Quantity),
+                (4, "selector", m("LabelSelector")),
+                (5, "averageValue", F::Quantity),
+            ],
+        );
+        add(
+            "ObjectMetricStatus",
+            vec![
+                (1, "target", xref()),
+                (2, "metricName", F::String),
+                (3, "currentValue", F::Quantity),
+                (4, "selector", m("LabelSelector")),
+                (5, "averageValue", F::Quantity),
+            ],
+        );
+        add(
+            "PodsMetricSource",
+            vec![
+                (1, "metricName", F::String),
+                (2, "targetAverageValue", F::Quantity),
+                (3, "selector", m("LabelSelector")),
+            ],
+        );
+        add(
+            "PodsMetricStatus",
+            vec![
+                (1, "metricName", F::String),
+                (2, "currentAverageValue", F::Quantity),
+                (3, "selector", m("LabelSelector")),
+            ],
+        );
+        add(
+            "ResourceMetricSource",
+            vec![
+                (1, "name", F::String),
+                (2, "targetAverageUtilization", F::Int),
+                (3, "targetAverageValue", F::Quantity),
+            ],
+        );
+        add(
+            "ResourceMetricStatus",
+            vec![
+                (1, "name", F::String),
+                (2, "currentAverageUtilization", F::Int),
+                (3, "currentAverageValue", F::Quantity),
+            ],
+        );
+        add(
+            "MetricSpec",
+            vec![
+                (1, "type", F::String),
+                (2, "object", q("ObjectMetricSource")),
+                (3, "pods", q("PodsMetricSource")),
+                (4, "resource", q("ResourceMetricSource")),
+                (5, "external", q("ExternalMetricSource")),
+                (7, "containerResource", q("ContainerResourceMetricSource")),
+            ],
+        );
+        add(
+            "MetricStatus",
+            vec![
+                (1, "type", F::String),
+                (2, "object", q("ObjectMetricStatus")),
+                (3, "pods", q("PodsMetricStatus")),
+                (4, "resource", q("ResourceMetricStatus")),
+                (5, "external", q("ExternalMetricStatus")),
+                (7, "containerResource", q("ContainerResourceMetricStatus")),
+            ],
+        );
+        add(
+            "HorizontalPodAutoscalerSpec",
+            vec![
+                (1, "scaleTargetRef", xref()),
+                (2, "minReplicas", F::Int),
+                (3, "maxReplicas", F::Int),
+                (4, "targetCPUUtilizationPercentage", F::Int),
+            ],
+        );
+        add(
+            "HorizontalPodAutoscalerStatus",
+            vec![
+                (1, "observedGeneration", F::Int),
+                (2, "lastScaleTime", m("Time")),
+                (3, "currentReplicas", F::Int),
+                (4, "desiredReplicas", F::Int),
+                (5, "currentCPUUtilizationPercentage", F::Int),
+            ],
+        );
+        add(
+            "HorizontalPodAutoscaler",
+            vec![
+                (1, "metadata", m("ObjectMeta")),
+                (2, "spec", q("HorizontalPodAutoscalerSpec")),
+                (3, "status", q("HorizontalPodAutoscalerStatus")),
+            ],
+        );
+        add(
+            "HorizontalPodAutoscalerList",
+            vec![
+                (1, "metadata", m("ListMeta")),
+                (
+                    2,
+                    "items",
+                    F::Repeated(Box::new(q("HorizontalPodAutoscaler"))),
+                ),
+            ],
         );
     }
 
@@ -9923,10 +10096,10 @@ impl ProtoRegistry {
                         (
                             // apiregistration's ServiceReference has a different
                             // proto layout (port at field 3, no path) than the
-                            // admissionregistration/CRD one — use a distinct schema
+                            // admissionregistration/CRD one — use a group-qualified schema
                             // key so they don't clobber each other in the registry.
                             "service".into(),
-                            FieldType::Message("APIServiceReference".into()),
+                            FieldType::Message("apiregistration.k8s.io/v1.ServiceReference".into()),
                         ),
                     ),
                     (2, ("group".into(), FieldType::String)),
@@ -9977,9 +10150,12 @@ impl ProtoRegistry {
         // "ServiceReference" registry key, so this one clobbered the webhook/CRD
         // schema — breaking webhook clientConfig.service decode (path dropped,
         // port read from the path's first byte). Keyed separately as
-        // "APIServiceReference" and referenced only by APIServiceSpec.service.
+        // "apiregistration.k8s.io/v1.ServiceReference" (group-qualified, like
+        // the other ambiguous names) and referenced only by
+        // APIServiceSpec.service. Upstream: kube-aggregator
+        // apis/apiregistration/v1/generated.proto `message ServiceReference`.
         schemas.insert(
-            "APIServiceReference".into(),
+            "apiregistration.k8s.io/v1.ServiceReference".into(),
             MessageSchema {
                 fields: HashMap::from([
                     (1, ("namespace".into(), FieldType::String)),
