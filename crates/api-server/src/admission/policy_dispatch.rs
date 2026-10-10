@@ -541,6 +541,15 @@ where
                 Ok(true) => {}
             }
 
+            // Here the binding matches. The versioned attributes are built now
+            // and cached, to be reused during the delegate's hook calls
+            // (policy_dispatcher.go:152-160). A failure is a policy-level
+            // config error: the binding is not named.
+            if let Err(e) = versioned.versioned_attribute(attr, &matched.kind) {
+                policy_errors.push(config_error(&hook.policy, None, e));
+                continue;
+            }
+
             // Collect params for this binding.
             let params = match collect_params(
                 hook.policy.param_kind(),
