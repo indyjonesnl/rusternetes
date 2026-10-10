@@ -53,7 +53,7 @@ pub const PLUGIN_NAME: &str = "MutatingAdmissionPolicy";
 /// Upstream's `Value`/`SetValue` store is keyed by plugin name.
 #[derive(Debug, Default)]
 pub struct ReinvocationContext {
-    is_reinvoke: bool,
+    is_reinvoke: AtomicBool,
     should_reinvoke: AtomicBool,
     values: Mutex<HashMap<String, PolicyReinvokeContext>>,
 }
@@ -61,12 +61,16 @@ pub struct ReinvocationContext {
 impl ReinvocationContext {
     pub fn new(is_reinvoke: bool) -> Self {
         Self {
-            is_reinvoke,
+            is_reinvoke: AtomicBool::new(is_reinvoke),
             ..Default::default()
         }
     }
     pub fn is_reinvoke(&self) -> bool {
-        self.is_reinvoke
+        self.is_reinvoke.load(Ordering::SeqCst)
+    }
+    /// `SetIsReinvoke`: called by the reinvoker before the second pass.
+    pub fn set_is_reinvoke(&self) {
+        self.is_reinvoke.store(true, Ordering::SeqCst);
     }
     pub fn set_should_reinvoke(&self) {
         self.should_reinvoke.store(true, Ordering::SeqCst);

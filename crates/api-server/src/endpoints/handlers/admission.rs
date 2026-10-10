@@ -670,16 +670,15 @@ impl Admission<'_> {
     /// source is installed in the state: nothing changes (not even a
     /// round-trip through JSON) otherwise.
     ///
-    /// Deviation: one dispatch, no reinvocation loop
-    /// (apiserver/pkg/admission/reinvocation.go); tracked in #2910's
-    /// follow-ups.
+    /// `reinvocation` is the request's `a.GetReinvocationContext()`, shared
+    /// by both passes of [`Self::admit`].
     async fn admit_mutating_policy<T: Object>(
         &self,
         op: &Operation,
         obj: T,
         old: Option<&T>,
+        reinvocation: &std::sync::Arc<crate::admission::policy_mutating::ReinvocationContext>,
     ) -> Result<T> {
-        use crate::admission::policy_mutating::ReinvocationContext;
         use crate::admission::policy_plugin::MutatingPolicyPlugin;
 
         if !MutatingPolicyPlugin::handles(op) || !MutatingPolicyPlugin::enabled() {
@@ -699,12 +698,7 @@ impl Admission<'_> {
             object: Some(before.clone()),
             old_object: old.map(to_value).transpose()?,
         };
-        plugin
-            .admit(
-                &mut attr,
-                std::sync::Arc::new(ReinvocationContext::new(false)),
-            )
-            .await?;
+        plugin.admit(&mut attr, reinvocation.clone()).await?;
         match attr.object {
             Some(after) if after != before => serde_json::from_value(after).map_err(|e| {
                 Error::Internal(format!(
@@ -715,24 +709,61 @@ impl Admission<'_> {
         }
     }
 
-    /// The mutating plugins: `MutationInterface.Admit`.
+    /// The mutating plugins behind the reinvoker: `reinvoker.Admit`
+    /// (staging/src/k8s.io/apiserver/pkg/admission/reinvocation.go:34-50).
+    /// The chain runs once; when a plugin asked for reinvocation
+    /// (`a.GetReinvocationContext().ShouldReinvoke()`) it runs a second time
+    /// after `SetIsReinvoke`, and each plugin decides from its own
+    /// reinvocation context what to rerun.
+    ///
+    /// Deviation: the mutating webhooks run on the first pass only. The
+    /// webhook manager keeps its own reinvocation state (one second round
+    /// among IfNeeded webhooks inside a single call) instead of a
+    /// `webhookReinvokeContext` in the shared context, so a webhook is not
+    /// rerun because a policy or in-tree plugin changed the object after it
+    /// (webhook/mutating/dispatcher.go:115-119). Tracked as a follow-up of
+    /// #3014.
     pub async fn admit<T: Object>(&self, op: Operation, obj: T, old: Option<&T>) -> Result<T> {
+        use crate::admission::policy_mutating::ReinvocationContext;
+        let reinvocation = std::sync::Arc::new(ReinvocationContext::new(false));
+        let obj = self.admit_chain(&op, obj, old, &reinvocation).await?;
+        if !reinvocation.should_reinvoke() {
+            return Ok(obj);
+        }
+        reinvocation.set_is_reinvoke();
+        self.admit_chain(&op, obj, old, &reinvocation).await
+    }
+
+    /// One pass of the mutating chain (`mutator.Admit`).
+    async fn admit_chain<T: Object>(
+        &self,
+        op: &Operation,
+        obj: T,
+        old: Option<&T>,
+        reinvocation: &std::sync::Arc<crate::admission::policy_mutating::ReinvocationContext>,
+    ) -> Result<T> {
         // MutatingAdmissionPolicy is first (plugins.go:106-110), ahead of
         // the webhooks; the in-tree plugins in `AllOrderedPlugins` precede
         // all four, and they are kept ahead of it here as before.
-        let obj = self.admit_in_tree(&op, obj).await?;
-        let obj = self.admit_mutating_policy(&op, obj, old).await?;
+        let obj = self.admit_in_tree(op, obj).await?;
+        let obj = self
+            .admit_mutating_policy(op, obj, old, reinvocation)
+            .await?;
+        if reinvocation.is_reinvoke() {
+            return Ok(obj);
+        }
         let name = obj.metadata().name.clone();
+        let before_webhooks = to_value(&obj)?;
         let (response, mutated) = self
             .state
             .webhook_manager
             .run_mutating_webhooks_with_dryrun(
-                &op,
+                op,
                 self.kind,
                 &self.request_resource(),
                 self.namespace,
                 &name,
-                Some(to_value(&obj)?),
+                Some(before_webhooks.clone()),
                 old.map(to_value).transpose()?,
                 &self.user_info(),
                 self.dry_run,
@@ -742,11 +773,18 @@ impl Admission<'_> {
             return Err(denied(reason));
         }
         match mutated {
-            Some(value) => serde_json::from_value(value).map_err(|e| {
-                Error::Internal(format!(
-                    "failed to decode the object mutated by admission: {e}"
-                ))
-            }),
+            Some(value) => {
+                // webhook/mutating/dispatcher.go:192-196: a webhook that
+                // changed the object asks for reinvocation.
+                if value != before_webhooks {
+                    reinvocation.set_should_reinvoke();
+                }
+                serde_json::from_value(value).map_err(|e| {
+                    Error::Internal(format!(
+                        "failed to decode the object mutated by admission: {e}"
+                    ))
+                })
+            }
             None => Ok(obj),
         }
     }
