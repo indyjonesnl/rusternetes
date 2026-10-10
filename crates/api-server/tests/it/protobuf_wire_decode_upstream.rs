@@ -12,6 +12,14 @@
 //! generated Unmarshal rejected the body with
 //! `proto: wrong wireType = 0 for field FailedIndexes`.
 //!
+//! Coverage classes: messages with a qualified key or an unambiguous bare key
+//! are a HARD gate. Messages whose bare name is shared by several groups with
+//! no qualified key (checked against the single bare entry), and the
+//! formerly skip-listed `Validation`/`Variable`/`JSONSchemaProps`, are
+//! WARNING-ONLY (`ambiguous_and_formerly_skipped_messages_wire_check_warn_only`,
+//! `::warning` under GitHub Actions); gaps are tracked in #3057. Enum values
+//! are not checked: k8s protos declare enum-like fields as `string`.
+//!
 //! The decoder mirrors the checks of the gogo-generated `Unmarshal` in
 //! `staging/src/k8s.io/api/batch/v1/generated.pb.go` (wire type must match the
 //! field's declared type), and additionally requires that every value we sent
@@ -55,6 +63,50 @@ fn special(t: &str) -> bool {
     )
 }
 
+/// JSON key the registry uses for an upstream field. Upstream's Go field
+/// names diverge from the JSON names for a few messages (protoc-gen-go
+/// derives `schema`/`ref`/`xKubernetesFoo`/`jSONSchemas`, and PascalCase
+/// `Name`/`Expression`); the parity test covers them with its
+/// name-aware `intentional_field_skip`. The synthesized input and the decoded
+/// output are both keyed by the JSON name so the registry can be exercised.
+fn jname(msg: &str, field: &str) -> String {
+    // Only the formerly skip-listed messages are renamed; every other
+    // message (e.g. core/v1 `DaemonEndpoint.Port`) is keyed by its proto name.
+    if !matches!(
+        msg,
+        "Validation" | "Variable" | "JSONSchemaProps" | "JSONSchemaPropsOrArray"
+    ) {
+        return field.to_string();
+    }
+    match (msg, field) {
+        ("JSONSchemaProps", "schema") => return "$schema".into(),
+        ("JSONSchemaProps", "ref") => return "$ref".into(),
+        ("JSONSchemaPropsOrArray", "jSONSchemas") => return "jsonSchemas".into(),
+        _ => {}
+    }
+    if let Some(rest) = field.strip_prefix("xKubernetes") {
+        let mut out = String::from("x-kubernetes");
+        for c in rest.chars() {
+            if c.is_ascii_uppercase() {
+                out.push('-');
+                out.push(c.to_ascii_lowercase());
+            } else {
+                out.push(c);
+            }
+        }
+        return out;
+    }
+    let mut cs = field.chars();
+    match cs.next() {
+        Some(c) if c.is_ascii_uppercase() => format!("{}{}", c.to_ascii_lowercase(), cs.as_str()),
+        _ => field.to_string(),
+    }
+}
+
+fn simple(fq: &str) -> &str {
+    fq.rsplit('.').next().unwrap_or(fq)
+}
+
 struct Ctx<'a> {
     msgs: &'a Msgs,
 }
@@ -86,7 +138,7 @@ impl Ctx<'_> {
         let mut o = Map::new();
         for f in &m.field {
             if let Some(v) = self.synth_field(f, stack) {
-                o.insert(f.name().to_string(), v);
+                o.insert(jname(simple(fq), f.name()), v);
             }
         }
         Value::Object(o)
@@ -182,7 +234,8 @@ impl Ctx<'_> {
             };
             let repeated = f.label() == Label::Repeated;
             let ew = expected_wire(f);
-            let name = f.name();
+            let jn = jname(simple(fq), f.name());
+            let name = jn.as_str();
             if repeated && wt == 2 && ew != 2 {
                 // packed repeated scalars
                 let n = varint(b, &mut i)? as usize;
@@ -324,29 +377,64 @@ fn diff(path: &str, want: &Value, got: &Value, out: &mut Vec<String>) {
     }
 }
 
+/// How a registry key was found for an upstream message.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Resolution {
+    /// Qualified key, or a bare key that is unambiguous (unique simple name
+    /// across the bundled files, or core/apimachinery). A failure is a hard
+    /// failure: this is the original gate.
+    Direct,
+    /// Bare simple name shared by several groups with NO qualified key: the
+    /// single bare registry entry is checked against each group's descriptor.
+    /// Previously skipped, so a wrong field number was invisible. Failures
+    /// are warnings (tracked in #3057), not test failures.
+    AmbiguousBare,
+    /// Simple name on the old skip list (Go field names differ from JSON
+    /// names; now handled by `jname`). Failures are warnings.
+    NewlyCovered,
+}
+
 /// Registry key for an upstream message, if the registry plausibly carries it.
-/// Qualified key first; bare key only when the simple name is unique across
-/// all bundled files, or the message lives in core/v1.
+/// Qualified key first; then the bare key (see [`Resolution`]).
 fn registry_key(
     reg: &ProtoRegistry,
     prefix: &str,
     name: &str,
     counts: &BTreeMap<String, usize>,
-) -> Option<String> {
+) -> Option<(String, Resolution)> {
     let q = format!("{prefix}.{name}");
     if !prefix.is_empty() && reg.encode_message(&q, &json!({})).is_some() {
-        return Some(q);
+        return Some((q, Resolution::Direct));
     }
+    reg.encode_message(name, &json!({}))?;
     let unique = counts.get(name).copied().unwrap_or(0) == 1;
-    if (prefix.is_empty() || unique) && reg.encode_message(name, &json!({})).is_some() {
-        return Some(name.to_string());
-    }
-    None
+    let res = if prefix.is_empty() || unique {
+        Resolution::Direct
+    } else {
+        Resolution::AmbiguousBare
+    };
+    Some((name.to_string(), res))
 }
 
-/// Run the wire check for every registered upstream message. Returns
-/// (checked, failures keyed by `<proto file>::<Message>`).
-pub(crate) fn run_wire_check() -> (usize, BTreeMap<String, Vec<String>>) {
+/// Messages previously skipped wholesale (Go field names differ from the JSON
+/// names the registry is keyed by).
+const FORMERLY_SKIPPED: &[&str] = &["Validation", "Variable", "JSONSchemaProps"];
+
+#[derive(Default)]
+pub(crate) struct WireResults {
+    /// Messages checked in the hard-gated (`Direct`) class.
+    pub checked: usize,
+    /// Hard failures keyed by `<proto file>::<Message>`.
+    pub fails: BTreeMap<String, Vec<String>>,
+    /// Messages checked in the warning-only classes.
+    pub soft_checked: usize,
+    /// Warning-only failures keyed by `<proto file>::<Message>`, with the
+    /// reason the message is warning-only.
+    pub warns: BTreeMap<String, Vec<String>>,
+}
+
+/// Run the wire check for every upstream message that has a registry entry.
+pub(crate) fn run_wire_check_full() -> WireResults {
     let files = parse_all_files();
     let mut msgs: Msgs = HashMap::new();
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
@@ -360,8 +448,7 @@ pub(crate) fn run_wire_check() -> (usize, BTreeMap<String, Vec<String>>) {
     }
     let ctx = Ctx { msgs: &msgs };
     let reg = ProtoRegistry::new();
-    let mut checked = 0;
-    let mut fails: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut out = WireResults::default();
     for f in &files {
         let prefix = qualified_prefix_for(f.name());
         for m in &f.message_type {
@@ -369,16 +456,12 @@ pub(crate) fn run_wire_check() -> (usize, BTreeMap<String, Vec<String>>) {
             if special(&fq) {
                 continue;
             }
-            // Go-field-name vs JSON-name divergence (covered by the name-aware
-            // `intentional_field_skip` in the parity test): the synthesized
-            // input uses proto names, which the JSON-keyed registry cannot match.
-            if matches!(m.name(), "Validation" | "Variable" | "JSONSchemaProps") {
-                continue;
-            }
-            let Some(key) = registry_key(&reg, prefix, m.name(), &counts) else {
+            let Some((key, mut res)) = registry_key(&reg, prefix, m.name(), &counts) else {
                 continue;
             };
-            checked += 1;
+            if FORMERLY_SKIPPED.contains(&m.name()) && res == Resolution::Direct {
+                res = Resolution::NewlyCovered;
+            }
             let label = format!("{}::{}", f.name(), m.name());
             let input = ctx.synth_msg(&fq, &mut vec![fq.clone()]);
             let bytes = reg.encode_message(&key, &input).unwrap();
@@ -390,12 +473,64 @@ pub(crate) fn run_wire_check() -> (usize, BTreeMap<String, Vec<String>>) {
             // `selfLink` was removed from the API in 1.20 and is intentionally
             // never populated; dropping it is not lossy.
             errs.retain(|e| !e.ends_with("/selfLink: dropped"));
-            if !errs.is_empty() {
-                fails.insert(label, errs);
+            if res == Resolution::Direct {
+                out.checked += 1;
+                if !errs.is_empty() {
+                    out.fails.insert(label, errs);
+                }
+            } else {
+                out.soft_checked += 1;
+                if !errs.is_empty() {
+                    let why = match res {
+                        Resolution::AmbiguousBare => format!(
+                            "no qualified registry key `{prefix}.{}`; checked against bare key `{key}`",
+                            m.name()
+                        ),
+                        _ => "formerly skip-listed (Go/JSON field-name divergence)".to_string(),
+                    };
+                    let mut v = vec![why];
+                    v.extend(errs);
+                    out.warns.insert(label, v);
+                }
             }
         }
     }
-    (checked, fails)
+    out
+}
+
+/// Back-compat shape: (checked, hard failures).
+pub(crate) fn run_wire_check() -> (usize, BTreeMap<String, Vec<String>>) {
+    let r = run_wire_check_full();
+    (r.checked, r.fails)
+}
+
+#[test]
+fn ambiguous_and_formerly_skipped_messages_wire_check_warn_only() {
+    let r = run_wire_check_full();
+    eprintln!(
+        "wire check (warning-only classes): {} messages, {} warnings",
+        r.soft_checked,
+        r.warns.len()
+    );
+    for (k, v) in &r.warns {
+        let msg = format!(
+            "{k}: {}",
+            v.iter().take(4).cloned().collect::<Vec<_>>().join("; ")
+        );
+        if std::env::var("GITHUB_ACTIONS").is_ok() {
+            println!(
+                "::warning title=Wire decode (ambiguous/skip-listed)::{msg} (tracked in #3057)"
+            );
+        } else {
+            eprintln!("WARN {msg}");
+        }
+    }
+    // Coverage must actually grow: a regression to the old skip behaviour
+    // (checking nothing here) would silently hide wrong field numbers again.
+    assert!(
+        r.soft_checked > 0,
+        "ambiguous/skip-listed messages are no longer wire-checked"
+    );
 }
 
 #[test]
