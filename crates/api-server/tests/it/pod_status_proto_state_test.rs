@@ -137,3 +137,41 @@ async fn kubelet_status_patches_waiting_then_running_apply() {
     assert_eq!(s, StatusCode::OK, "{b}");
     assert!(b["status"]["containerStatuses"][0]["state"]["waiting"].is_null());
 }
+
+/// #3018: every read shape the kubelet (and the vanilla-swap dump) uses must
+/// show the containerStatuses the status PATCH stored.
+#[tokio::test]
+async fn status_patch_container_statuses_visible_on_every_read_shape() {
+    let api = TestApiServer::new();
+    let p = json!({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "p"},
+        "spec": {"nodeName": "n", "containers": [{"name": "c", "image": "busybox"}]}});
+    let (s, b) = api.post("/api/v1/namespaces/default/pods", &p).await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let first = json!({"metadata": {"uid": b["metadata"]["uid"]}, "status": {
+        "containerStatuses": [container_status(json!({"waiting": {"reason": "ContainerCreating"}}))],
+        "phase": "Pending"}});
+    let (s, patched) = smp_status(&api, &first).await;
+    assert_eq!(s, StatusCode::OK, "{patched}");
+    assert!(patched["status"]["containerStatuses"][0]["state"]["waiting"].is_object());
+    for url in [
+        POD.to_string(),
+        format!("{POD}?resourceVersion=0"),
+        format!("{POD}/status"),
+        format!("{POD}/status?resourceVersion=0"),
+    ] {
+        let (s, got) = api.get(&url).await;
+        assert_eq!(s, StatusCode::OK, "{url}");
+        assert_eq!(
+            got["status"]["containerStatuses"][0]["state"]["waiting"]["reason"],
+            "ContainerCreating",
+            "{url}: {got}"
+        );
+    }
+    let (_, list) = api
+        .get("/api/v1/namespaces/default/pods?fieldSelector=metadata.name%3Dp")
+        .await;
+    assert!(
+        list["items"][0]["status"]["containerStatuses"][0]["state"]["waiting"].is_object(),
+        "{list}"
+    );
+}
