@@ -24,6 +24,7 @@
 //! over-threshold message to the aggregate "(combined from similar events)"
 //! form.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rusternetes_common::event_correlator::{
@@ -39,6 +40,34 @@ use crate::Storage;
 /// `EventTTL: 1 * time.Hour`), in seconds. Single source for the API server's
 /// event store and for in-process recorders.
 pub const DEFAULT_EVENT_TTL_SECONDS: u64 = 3600;
+
+/// The `--event-ttl` in force for this process, in seconds.
+///
+/// Upstream threads one server-side value into the event store once
+/// (`pkg/controlplane/apiserver/config.go:299` `EventTTL:                opts.EventTTL,`
+/// -> `pkg/controlplane/apiserver/apis.go:51` `EventTTL:                    c.Extra.EventTTL,`
+/// -> `pkg/controlplane/instance.go:434` `eventsrest.RESTStorageProvider{TTL: c.ControlPlane.EventTTL},`
+/// -> `pkg/registry/core/event/storage/storage.go:42-44`
+/// `TTLFunc: func(runtime.Object, uint64, bool) (uint64, error) { return ttl, nil }`),
+/// so every event writer is governed by it. In-process recorders (controller-manager,
+/// kubelet, scheduler, api-server bootstrap/repair) write storage directly and are
+/// constructed in ~20 places across crates; the all-in-one binary is one process with
+/// one `--event-ttl`, so it is held here once and [`EventRecorder::new`] reads it.
+/// Standalone components keep the upstream default (they have no server-side source).
+/// Deliberate deviation from upstream's plumbing; the semantics (one TTL for all
+/// event writes) are the same.
+static PROCESS_EVENT_TTL: AtomicU64 = AtomicU64::new(DEFAULT_EVENT_TTL_SECONDS);
+
+/// Set the process-wide event TTL in seconds (`0` = no expiry). Call before
+/// constructing recorders; the all-in-one binary calls it with `--event-ttl`.
+pub fn set_process_event_ttl(seconds: u64) {
+    PROCESS_EVENT_TTL.store(seconds, Ordering::Relaxed);
+}
+
+/// The process-wide event TTL in seconds.
+pub fn process_event_ttl() -> u64 {
+    PROCESS_EVENT_TTL.load(Ordering::Relaxed)
+}
 
 /// Records Kubernetes events on behalf of a component, routing each emission
 /// through a shared [`EventCorrelator`] before writing to `storage`.
@@ -73,7 +102,7 @@ impl<S: Storage + ?Sized> EventRecorder<S> {
         Self {
             storage,
             correlator: Arc::new(Mutex::new(EventCorrelator::new(RealClock))),
-            event_ttl: DEFAULT_EVENT_TTL_SECONDS,
+            event_ttl: process_event_ttl(),
         }
     }
 
@@ -279,6 +308,28 @@ mod tests {
                 .await
                 .is_none(),
             "in-process events must carry the event TTL like API-written ones"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_recorders_follow_the_process_event_ttl() {
+        // Mutates the process-wide TTL only for the instant between set and
+        // `new()` (restored immediately); no other test here waits on expiry.
+        set_process_event_ttl(1);
+        let storage = Arc::new(MemoryStorage::new());
+        let recorder = EventRecorder::new(Arc::clone(&storage));
+        set_process_event_ttl(DEFAULT_EVENT_TTL_SECONDS);
+        let involved = obj_ref("ttl-web", "default");
+        recorder
+            .event(&involved, &source(), EventType::Normal, "Started", "m")
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert!(
+            stored(&storage, "default", "ttl-web", "Started")
+                .await
+                .is_none(),
+            "a recorder built by EventRecorder::new must use the configured --event-ttl"
         );
     }
 

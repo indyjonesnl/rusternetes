@@ -6,7 +6,7 @@ use rusternetes_common::{
         Event, EventType, Node, ObjectReference, Service, ServiceType,
     },
 };
-use rusternetes_storage::event_recorder::DEFAULT_EVENT_TTL_SECONDS;
+use rusternetes_storage::event_recorder::process_event_ttl;
 use rusternetes_storage::{extract_key, Storage, WorkQueue};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -641,7 +641,7 @@ impl<S: Storage + 'static> LoadBalancerController<S> {
             });
             if let Err(e) = self
                 .storage
-                .update_with_ttl(&key, &existing, DEFAULT_EVENT_TTL_SECONDS)
+                .update_with_ttl(&key, &existing, process_event_ttl())
                 .await
             {
                 warn!(
@@ -661,7 +661,7 @@ impl<S: Storage + 'static> LoadBalancerController<S> {
         );
         if let Err(e) = self
             .storage
-            .create_with_ttl(&key, &event, DEFAULT_EVENT_TTL_SECONDS)
+            .create_with_ttl(&key, &event, process_event_ttl())
             .await
         {
             warn!(
