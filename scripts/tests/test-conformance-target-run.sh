@@ -156,6 +156,14 @@ J
 J
   ;;
   nojunit) : ;;  # produce nothing
+  # A wedged hydrophone (#1635): never returns (40s stands in for forever; the
+  # assertions below require the kill to land well inside that). hangjunit has
+  # already written its junit (suite finished, the log follow never hit EOF).
+  hang) sleep 40 ;;
+  hangjunit) cat > "$out/junit_01.xml" <<'J'
+<testsuite><testcase name="x" status="passed"></testcase></testsuite>
+J
+  sleep 40 ;;
 esac
 exit 0
 EOF
@@ -326,6 +334,51 @@ case "$HELPER" in
   *api-server*) ok "capture_component_logs captures the api-server log" ;;
   *) bad "capture_component_logs must capture the api-server log" ;;
 esac
+
+# --- a hung hydrophone is killed and the run still reports (#1635) ----------
+# hydrophone follows the conformance pod's logs to detect completion; when that
+# never hits EOF it blocks forever and the job burns its whole budget (and, when
+# the runner is lost, GitHub's timeout-minutes cannot save it). The script must
+# bound the call itself and carry on to junit parsing / diagnostics.
+if ! command -v timeout >/dev/null 2>&1; then
+  ok "SKIP hang tests: no coreutils timeout on this machine"
+else
+  t0=$(date +%s)
+  set +e
+  out_hang=$(HYDROPHONE_TIMEOUT=2 HYDROPHONE_KILL_AFTER=1 FAKE_MODE=hang run_cli --target sig-node \
+      --kubeconfig "$KC" --hydrophone "$FAKE" --output-dir "$TMP/ohang" 2>&1)
+  rc_hang=$?
+  set -e
+  elapsed=$(( $(date +%s) - t0 ))
+  [ "$elapsed" -lt 20 ] && ok "hung hydrophone is killed (took ${elapsed}s)" \
+    || bad "hung hydrophone not bounded (took ${elapsed}s)"
+  [ "$rc_hang" -eq 1 ] && ok "hang with no junit => exit 1 (infra failure)" \
+    || bad "hang with no junit exit=$rc_hang (want 1)"
+  echo "$out_hang" | grep -q "hydrophone timed out" \
+    && ok "timeout is named in the log" || bad "timeout not reported: $out_hang"
+  echo "$out_hang" | grep -q "NO junit produced" \
+    && ok "script proceeds past the kill to the junit verdict" \
+    || bad "script did not reach the junit verdict after the kill"
+
+  # Suite had finished: junit exists, only the log follow hung. Still a result.
+  set +e
+  out_hj=$(HYDROPHONE_TIMEOUT=2 HYDROPHONE_KILL_AFTER=1 FAKE_MODE=hangjunit run_cli --target sig-node \
+      --kubeconfig "$KC" --hydrophone "$FAKE" --output-dir "$TMP/ohangj" 2>&1)
+  rc_hj=$?
+  set -e
+  [ "$rc_hj" -eq 0 ] && [ "$(gho passed)" = "1" ] \
+    && ok "hang after junit written => results salvaged (exit 0, passed=1)" \
+    || bad "hang-after-junit exit=$rc_hj passed=$(gho passed): $out_hj"
+
+  # Default must fit inside the workflow's timeout-minutes with bring-up room.
+  def="$(grep -oE 'HYDROPHONE_TIMEOUT:-[0-9]+' "$RUNNER" | head -1 | grep -oE '[0-9]+$')"
+  job="$(grep -oE 'timeout-minutes: [0-9]+' "$REPO_ROOT/.github/workflows/conformance-target.yml" | head -1 | grep -oE '[0-9]+')"
+  if [ -n "$def" ] && [ -n "$job" ] && [ "$def" -le $(( job * 60 - 1800 )) ]; then
+    ok "default HYDROPHONE_TIMEOUT (${def}s) leaves >=30min of the ${job}min job budget"
+  else
+    bad "default HYDROPHONE_TIMEOUT '${def:-unset}' must be <= job budget ${job:-?}min minus 30min"
+  fi
+fi
 
 echo
 if [ "$failcnt" -eq 0 ]; then echo "PASS: conformance-target-run ($pass checks)"; else echo "FAILED: $failcnt of $((pass + failcnt))" >&2; exit 1; fi
