@@ -127,6 +127,23 @@ impl Set {
         out
     }
 
+    /// `Set.Iterate`: every member path, in order.
+    pub fn members(&self) -> Vec<Vec<String>> {
+        fn walk(node: &Set, path: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+            if node.member {
+                out.push(path.clone());
+            }
+            for (k, child) in &node.children {
+                path.push(k.clone());
+                walk(child, path, out);
+                path.pop();
+            }
+        }
+        let mut out = Vec::new();
+        walk(self, &mut Vec::new(), &mut out);
+        out
+    }
+
     /// `SetToFields` (fields.go): the `FieldsV1` object.
     pub fn to_fields_v1(&self) -> Value {
         let mut map = Map::new();
@@ -175,7 +192,7 @@ impl Set {
 
 /// What the (absent) schema would say about a field.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum FieldKind {
+pub(super) enum FieldKind {
     Struct,
     /// A granular map (`labels`): the map itself is a member.
     Map,
@@ -185,7 +202,7 @@ enum FieldKind {
     ScalarSet,
 }
 
-fn field_kind(name: &str) -> FieldKind {
+pub(super) fn field_kind(name: &str) -> FieldKind {
     match name {
         "labels" | "annotations" | "data" | "binaryData" | "stringData" | "nodeSelector"
         | "matchLabels" | "limits" | "requests" | "capacity" | "allocatable" => FieldKind::Map,
@@ -324,7 +341,7 @@ impl Fields {
 
 /// `k:{"name":"x"}`: the item's key fields as a sorted JSON object, `None`
 /// when the item lacks one (the list is then not associative).
-fn key_element(keys: &[&str], item: &Value) -> Option<String> {
+pub(super) fn key_element(keys: &[&str], item: &Value) -> Option<String> {
     let obj = item.as_object()?;
     let mut sorted = BTreeMap::new();
     for key in keys {

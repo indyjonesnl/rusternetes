@@ -199,27 +199,24 @@ pub fn apply_secret(
     apply_via_schema::<Secret>(current, desired, &SECRET_SCHEMA, opts)
 }
 
-/// Apply through the older, schema-less engine in
-/// `rusternetes_common::server_side_apply`, for resources the leaf-schema
+/// Apply through the field manager's Apply path
+/// ([`crate::fieldmanager::FieldManager::apply_value`], a port of
+/// structured-merge-diff's `Updater.Apply`), for resources the leaf-schema
 /// engine above cannot describe yet (nested specs such as Deployment's).
-/// It is the engine those resources already applied with; the generic
-/// endpoints only change who calls it. Unlike the bespoke patch path it does
-/// not write `kubectl.kubernetes.io/last-applied-configuration`: that
-/// annotation belongs to kubectl's client-side apply, and upstream's
+/// Ownership is tracked per field path in real `FieldsV1`, the same
+/// `Set`/`Managed` types the Update path decodes. Unlike the bespoke patch
+/// path it does not write `kubectl.kubernetes.io/last-applied-configuration`:
+/// that annotation belongs to kubectl's client-side apply, and upstream's
 /// `FieldManager.Apply` never sets it.
 pub fn apply_legacy<T: Serialize + DeserializeOwned>(
     current: Option<&T>,
     desired: &Value,
     opts: &ApplyOptions,
 ) -> Result<ApplyOutcome<T>, ApplyError> {
-    use rusternetes_common::server_side_apply::{server_side_apply, ApplyParams, ApplyResult};
-
     let current = current
         .map(serde_json::to_value)
         .transpose()
         .map_err(|e| ApplyError::Internal(e.to_string()))?;
-    let mut params = ApplyParams::new(opts.field_manager.clone());
-    params.force = opts.force;
     // The set for the version being applied (`f.groupVersion`; the apply body
     // must carry it, structuredmerge.go Apply).
     let version = desired
@@ -227,24 +224,50 @@ pub fn apply_legacy<T: Serialize + DeserializeOwned>(
         .or_else(|| current.as_ref().and_then(|c| c.get("apiVersion")))
         .and_then(Value::as_str)
         .unwrap_or_default();
-    params.reset_fields = opts.reset_fields.for_version(version).to_vec();
-    match server_side_apply(current.as_ref(), desired, &params)
-        .map_err(|e| ApplyError::Internal(e.to_string()))?
-    {
-        ApplyResult::Success(applied) => {
+    let field_manager =
+        crate::fieldmanager::FieldManager::new(version, None, opts.reset_fields.clone());
+    match field_manager.apply_value(current.as_ref(), desired, &opts.field_manager, opts.force) {
+        Ok(mut applied) => {
+            // The system-owned metadata is the live object's, whatever the
+            // applied configuration says.
+            if let (Some(meta), Some(live)) = (
+                applied.get_mut("metadata").and_then(Value::as_object_mut),
+                current
+                    .as_ref()
+                    .and_then(|c| c.get("metadata"))
+                    .and_then(Value::as_object),
+            ) {
+                for key in [
+                    "uid",
+                    "resourceVersion",
+                    "generation",
+                    "creationTimestamp",
+                    "deletionTimestamp",
+                    "deletionGracePeriodSeconds",
+                ] {
+                    match live.get(key) {
+                        Some(v) => {
+                            meta.insert(key.to_string(), v.clone());
+                        }
+                        None => {
+                            meta.remove(key);
+                        }
+                    }
+                }
+            }
             let object = serde_json::from_value(applied)
                 .map_err(|e| ApplyError::invalid_body(std::any::type_name::<T>(), e.to_string()))?;
             Ok(ApplyOutcome::Applied {
                 object: Box::new(object),
             })
         }
-        ApplyResult::Conflicts(conflicts) => Ok(ApplyOutcome::Conflicts(
+        Err(conflicts) => Ok(ApplyOutcome::Conflicts(
             conflicts
                 .into_iter()
                 .map(|c| PathConflict {
-                    path: c.field,
-                    current_manager: c.current_manager,
-                    applying_manager: c.applying_manager,
+                    path: c.path,
+                    current_manager: c.manager,
+                    applying_manager: opts.field_manager.clone(),
                 })
                 .collect(),
         )),

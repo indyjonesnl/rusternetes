@@ -22,13 +22,14 @@
 //! `create.go:199`, `update.go:160-167`, `patch.go:372` and `:466`, each with
 //! `managerOrUserAgent` (`create.go:259-282`).
 //!
-//! Server-side apply writes its own entry (`crate::ssa`); this is the other
-//! half, for every write that is not an apply.
+//! Server-side apply is [`apply`]; this is the other half, for every write
+//! that is not an apply.
 //!
 //! DEVIATIONS, deliberate: (1) the field sets come from [`fieldset`]'s
 //! name-driven walker, not the OpenAPI schema; (2) one version per kind is
 //! served here, so upstream's per-manager `versionConverter` is the identity.
 
+pub mod apply;
 pub mod fieldset;
 
 use std::collections::BTreeMap;
