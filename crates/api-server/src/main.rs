@@ -86,6 +86,12 @@ struct Args {
     service_node_port_range:
         rusternetes_api_server::registry::core::service::portallocator::PortRange,
 
+    /// Comma-separated `Gate=bool` pairs, e.g.
+    /// `CrossNamespaceVolumeDataSource=true` (upstream `--feature-gates`,
+    /// component-base/featuregate/feature_gate.go `AddFlag`/`Set`).
+    #[arg(long, default_value = "")]
+    feature_gates: String,
+
     /// Address to bind to
     #[arg(long, default_value = "0.0.0.0:6443")]
     bind_address: String,
@@ -241,9 +247,16 @@ async fn install_audit_from_flags(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// Apply `--feature-gates`; mirrors the scheduler binary.
+fn apply_feature_gates(value: &str) -> Result<()> {
+    rusternetes_common::feature_gates::set_from_str(value)
+        .map_err(|e| anyhow::anyhow!("invalid --feature-gates: {e}"))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    apply_feature_gates(&args.feature_gates)?;
     // `validateClusterIPFlags`: refuse to start on a bad range.
     let service_ranges =
         registry::core::service::ipranges::ServiceIpRanges::parse(&args.service_cluster_ip_range)
