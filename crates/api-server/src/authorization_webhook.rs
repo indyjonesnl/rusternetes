@@ -12,8 +12,8 @@
 //! - `pkg/kubeapiserver/options/authorization.go` (flags :179-192, Validate
 //!   :142-160, `ToAuthorizationConfiguration` :270-290).
 //!
-//! Not ported (tracked separately): `matchConditions` (CEL; legacy flags never
-//! set any) and the webhook metrics. Selector attributes
+//! `matchConditions` live in `authorization_match_conditions.rs` (#3161; legacy
+//! flags never set any). The webhook metrics are not ported. Selector attributes
 //! (`AuthorizeWithSelectors`) are ported: webhook.go:312-402.
 
 use async_trait::async_trait;
@@ -588,6 +588,7 @@ pub struct WebhookAuthorizer {
     unauthorized_ttl: Duration,
     retry_backoff: Backoff,
     failure_policy: FailurePolicy,
+    match_conditions: Option<crate::authorization_match_conditions::CelMatcher>,
 }
 
 impl WebhookAuthorizer {
@@ -617,7 +618,19 @@ impl WebhookAuthorizer {
             unauthorized_ttl,
             retry_backoff,
             failure_policy,
+            match_conditions: None,
         })
+    }
+
+    /// Compile and install `matchConditions` (`newWithBackoff`, webhook.go:118-127).
+    pub fn with_match_conditions(
+        mut self,
+        conditions: &[crate::authorization_match_conditions::WebhookMatchCondition],
+    ) -> anyhow::Result<Self> {
+        self.match_conditions =
+            crate::authorization_match_conditions::CelMatcher::compile(conditions)
+                .map_err(|errs| anyhow::anyhow!(errs.join("; ")))?;
+        Ok(self)
     }
 
     /// The legacy-flags path of `ToAuthorizationConfiguration` +
@@ -822,6 +835,32 @@ fn label_selector_to_authorization_api(
     (!out.is_empty()).then_some(out)
 }
 
+/// `convertObjectToUnstructured` (authorization/cel/compile.go): every string
+/// attribute is present even when empty; `extra` is never null.
+fn cel_request(spec: &SarSpec) -> serde_json::Value {
+    let mut ret = serde_json::json!({
+        "user": spec.user,
+        "groups": spec.groups,
+        "uid": spec.uid,
+        "extra": spec.extra,
+    });
+    if let Some(r) = &spec.resource_attributes {
+        ret["resourceAttributes"] = serde_json::json!({
+            "namespace": r.namespace,
+            "verb": r.verb,
+            "group": r.group,
+            "version": r.version,
+            "resource": r.resource,
+            "subresource": r.subresource,
+            "name": r.name,
+        });
+    }
+    if let Some(n) = &spec.non_resource_attributes {
+        ret["nonResourceAttributes"] = serde_json::json!({"verb": n.verb, "path": n.path});
+    }
+    ret
+}
+
 /// `shouldCache` (webhook.go:537-547): requester-controlled attributes that are
 /// too large may be a DoS attempt, so they skip the cache.
 fn should_cache(attr: &RequestAttributes) -> bool {
@@ -852,6 +891,20 @@ impl Authorizer for WebhookAuthorizer {
     /// `WebhookAuthorizer.Authorize` (webhook.go:188-299).
     async fn authorize_opinion(&self, attrs: &RequestAttributes) -> AuthzResult<Opinion> {
         let spec = spec_from(attrs);
+        // Match conditions run before the webhook (webhook.go:207-222): an error
+        // (with no FALSE) yields decisionOnError, a FALSE yields NoOpinion.
+        if let Some(m) = &self.match_conditions {
+            match m.eval(&cel_request(&spec)) {
+                Err(e) => return Ok(self.decision_on_error(e)),
+                Ok(false) => {
+                    return Ok(Opinion::NoOpinion {
+                        reason: String::new(),
+                        error: None,
+                    })
+                }
+                Ok(true) => {}
+            }
+        }
         let key = match serde_json::to_string(&spec) {
             Ok(k) => k,
             Err(e) => return Ok(self.decision_on_error(e.to_string())),
