@@ -28,6 +28,7 @@ const PVC_UID: &str = "5f4e3d2c-1111-2222-3333-444455556666";
 struct Recorded {
     create_volume: Vec<CreateVolumeRequest>,
     delete_volume: Vec<DeleteVolumeRequest>,
+    get_capacity: Vec<GetCapacityRequest>,
 }
 
 #[derive(Clone)]
@@ -45,6 +46,9 @@ struct Fake {
     topology: bool,
     /// `Volume.accessible_topology` of the CreateVolume response.
     accessible_topology: Vec<Topology>,
+    /// `GetCapacityResponse.AvailableCapacity` (controller_test.go:2724-2729:
+    /// 1 TiB unless a case sets `capacity`).
+    available_capacity: i64,
 }
 
 impl Fake {
@@ -58,6 +62,7 @@ impl Fake {
             drop_content_source: false,
             topology: false,
             accessible_topology: vec![],
+            available_capacity: 1 << 40,
         }
     }
 
@@ -119,6 +124,15 @@ impl Controller for Fake {
                     )),
                 })
                 .collect(),
+        }))
+    }
+    async fn get_capacity(
+        &self,
+        r: Request<GetCapacityRequest>,
+    ) -> Result<Response<GetCapacityResponse>, Status> {
+        self.rec.lock().unwrap().get_capacity.push(r.into_inner());
+        Ok(Response::new(GetCapacityResponse {
+            available_capacity: self.available_capacity,
         }))
     }
     async fn list_volumes(
@@ -1863,6 +1877,8 @@ fn node_deployment(topology: Option<&[(&str, &str)]>) -> NodeDeployment {
     NodeDeployment {
         node_name: "foo".into(),
         immediate_binding: false,
+        base_delay: std::time::Duration::ZERO,
+        max_delay: std::time::Duration::ZERO,
         accessible_topology: topology.map(|t| {
             t.iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -1908,6 +1924,150 @@ async fn node_deployment_ignores_an_unassigned_claim_without_immediate_binding()
     p.sync_claim(&claim(&[(ANN, DRIVER)])).await.unwrap();
     assert!(rec.lock().unwrap().create_volume.is_empty());
     assert!(pv(&storage).await.is_none());
+}
+
+// `--node-deployment-immediate-binding`: `checkNode` (controller.go:1602-1690),
+// `checkCapacity` (:1692-1740) and `becomeOwner` (:1742-1858). Upstream cases
+// "distributed immediate, ..." (controller_test.go:2183-2340).
+
+fn immediate_deployment(base_delay: std::time::Duration) -> NodeDeployment {
+    NodeDeployment {
+        immediate_binding: true,
+        base_delay,
+        max_delay: base_delay,
+        ..node_deployment(None)
+    }
+}
+
+async fn put_claim(storage: &MemoryStorage, c: &PersistentVolumeClaim) -> PersistentVolumeClaim {
+    storage
+        .create(&build_key("persistentvolumeclaims", Some("ns1"), "data"), c)
+        .await
+        .unwrap()
+}
+
+async fn selected_node_of(storage: &MemoryStorage) -> Option<String> {
+    let c: PersistentVolumeClaim = storage
+        .get(&build_key("persistentvolumeclaims", Some("ns1"), "data"))
+        .await
+        .unwrap();
+    c.metadata
+        .annotations
+        .unwrap_or_default()
+        .get(SELECTED)
+        .cloned()
+}
+
+#[tokio::test]
+async fn immediate_unassigned_claim_makes_this_node_the_owner() {
+    // "distributed immediate, no node selected": not provisioned yet, but
+    // the selected-node annotation is set (becomeOwner's PVC update).
+    let (storage, p, rec, _d) = env(
+        Fake::new(),
+        storage_class(Some(VolumeBindingMode::Immediate)),
+    )
+    .await;
+    put_node(&storage, "foo", Some("foo"), true).await;
+    let p = p.with_node_deployment(immediate_deployment(std::time::Duration::ZERO));
+    let c = put_claim(&storage, &claim(&[(ANN, DRIVER)])).await;
+    p.sync_claim(&c).await.unwrap();
+    assert!(
+        rec.lock().unwrap().create_volume.is_empty(),
+        "not owner yet"
+    );
+    assert_eq!(selected_node_of(&storage).await.as_deref(), Some("foo"));
+    // checkCapacity asked the driver once (no topology capability: one nil topology).
+    assert_eq!(rec.lock().unwrap().get_capacity.len(), 1);
+}
+
+#[tokio::test]
+async fn immediate_unassigned_claim_without_capacity_is_not_taken() {
+    // "distributed immediate, no capacity": GetCapacity reports less than
+    // the 1Gi request, so the annotation stays unset.
+    let mut fake = Fake::new();
+    fake.available_capacity = (1 << 30) - 1;
+    let (storage, p, rec, _d) = env(fake, storage_class(Some(VolumeBindingMode::Immediate))).await;
+    put_node(&storage, "foo", Some("foo"), true).await;
+    let p = p.with_node_deployment(immediate_deployment(std::time::Duration::ZERO));
+    let c = put_claim(&storage, &claim(&[(ANN, DRIVER)])).await;
+    p.sync_claim(&c).await.unwrap();
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+    assert_eq!(selected_node_of(&storage).await, None);
+}
+
+fn allowed_zone(sc: &mut StorageClass, zone: &str) {
+    sc.allowed_topologies = Some(vec![TopologySelectorTerm {
+        match_label_expressions: Some(vec![TopologySelectorLabelRequirement {
+            key: "topology.example.com/zone".into(),
+            values: vec![zone.into()],
+        }]),
+    }]);
+}
+
+#[tokio::test]
+async fn immediate_allowed_topologies_matching_this_node_make_it_the_owner() {
+    let mut sc = storage_class(Some(VolumeBindingMode::Immediate));
+    allowed_zone(&mut sc, "foo");
+    let (storage, p, _rec, _d) = env(Fake::with_topology(), sc).await;
+    put_node(&storage, "foo", Some("foo"), true).await;
+    let p = p.with_node_deployment(immediate_deployment(std::time::Duration::ZERO));
+    let c = put_claim(&storage, &claim(&[(ANN, DRIVER)])).await;
+    p.sync_claim(&c).await.unwrap();
+    assert_eq!(selected_node_of(&storage).await.as_deref(), Some("foo"));
+}
+
+#[tokio::test]
+async fn immediate_allowed_topologies_not_matching_this_node_are_left_alone() {
+    // "distributed immediate, allowed topologies not okay": generating the
+    // accessibility requirements fails, so this node does not try to own it.
+    let mut sc = storage_class(Some(VolumeBindingMode::Immediate));
+    allowed_zone(&mut sc, "bar");
+    let (storage, p, rec, _d) = env(Fake::with_topology(), sc).await;
+    put_node(&storage, "foo", Some("foo"), true).await;
+    let p = p.with_node_deployment(immediate_deployment(std::time::Duration::ZERO));
+    let c = put_claim(&storage, &claim(&[(ANN, DRIVER)])).await;
+    p.sync_claim(&c).await.unwrap();
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+    assert!(rec.lock().unwrap().get_capacity.is_empty());
+    assert_eq!(selected_node_of(&storage).await, None);
+}
+
+#[tokio::test]
+async fn immediate_claim_taken_by_another_node_while_waiting_is_not_overwritten() {
+    // becomeOwner polls the claim every max(BaseDelay/100, 10ms) and gives up
+    // as soon as another node is selected.
+    let (storage, p, rec, _d) = env(
+        Fake::new(),
+        storage_class(Some(VolumeBindingMode::Immediate)),
+    )
+    .await;
+    put_node(&storage, "foo", Some("foo"), true).await;
+    let p = p.with_node_deployment(immediate_deployment(std::time::Duration::from_secs(2)));
+    let c = put_claim(&storage, &claim(&[(ANN, DRIVER)])).await;
+    let s2 = storage.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut other: PersistentVolumeClaim = s2
+            .get(&build_key("persistentvolumeclaims", Some("ns1"), "data"))
+            .await
+            .unwrap();
+        other
+            .metadata
+            .annotations
+            .get_or_insert_with(Default::default)
+            .insert(SELECTED.into(), "bar".into());
+        s2.update(
+            &build_key("persistentvolumeclaims", Some("ns1"), "data"),
+            &other,
+        )
+        .await
+        .unwrap();
+    });
+    let started = std::time::Instant::now();
+    p.sync_claim(&c).await.unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    assert_eq!(selected_node_of(&storage).await.as_deref(), Some("bar"));
+    assert!(rec.lock().unwrap().get_capacity.is_empty());
 }
 
 fn with_affinity(mut pv: PersistentVolume, key: &str, value: &str) -> PersistentVolume {

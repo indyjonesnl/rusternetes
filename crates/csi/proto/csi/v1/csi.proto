@@ -32,6 +32,7 @@ service Controller {
   rpc ControllerPublishVolume (ControllerPublishVolumeRequest) returns (ControllerPublishVolumeResponse) {}
   rpc ControllerUnpublishVolume (ControllerUnpublishVolumeRequest) returns (ControllerUnpublishVolumeResponse) {}
   rpc ListVolumes (ListVolumesRequest) returns (ListVolumesResponse) {}
+  rpc GetCapacity (GetCapacityRequest) returns (GetCapacityResponse) {}
   rpc ControllerGetCapabilities (ControllerGetCapabilitiesRequest) returns (ControllerGetCapabilitiesResponse) {}
   rpc CreateSnapshot (CreateSnapshotRequest) returns (CreateSnapshotResponse) {}
   rpc DeleteSnapshot (DeleteSnapshotRequest) returns (DeleteSnapshotResponse) {}
@@ -268,6 +269,20 @@ message Volume {
   map<string, string> volume_context = 3;
   VolumeContentSource content_source = 4;
   repeated Topology accessible_topology = 5;
+}
+
+// GetCapacity (csi.proto). `maximum_volume_size` / `minimum_volume_size`
+// (fields 2, 3, `google.protobuf.Int64Value`) are omitted: unknown fields are
+// skipped on the wire and external-provisioner only reads `available_capacity`
+// (controller.go:1683-1684).
+message GetCapacityRequest {
+  repeated VolumeCapability volume_capabilities = 1;
+  map<string, string> parameters = 2;
+  Topology accessible_topology = 3;
+}
+
+message GetCapacityResponse {
+  int64 available_capacity = 1;
 }
 
 // ListVolumes (csi.proto, checked against the vendored Go bindings in
