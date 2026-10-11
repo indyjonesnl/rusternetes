@@ -13,8 +13,8 @@
 //!   :142-160, `ToAuthorizationConfiguration` :270-290).
 //!
 //! Not ported (tracked separately): `matchConditions` (CEL; legacy flags never
-//! set any), selector attributes (`AuthorizeWithSelectors`; `RequestAttributes`
-//! carries no selectors) and the webhook metrics.
+//! set any) and the webhook metrics. Selector attributes
+//! (`AuthorizeWithSelectors`) are ported: webhook.go:312-402.
 
 use async_trait::async_trait;
 use rusternetes_common::auth::UserInfo;
@@ -410,6 +410,7 @@ struct SarSpec {
 }
 
 #[derive(Debug, Serialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
 struct SarResourceAttributes {
     #[serde(skip_serializing_if = "String::is_empty")]
     namespace: String,
@@ -425,6 +426,32 @@ struct SarResourceAttributes {
     subresource: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    field_selector: Option<SarFieldSelector>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label_selector: Option<SarLabelSelector>,
+}
+
+/// `authorizationv1.FieldSelectorAttributes`.
+#[derive(Debug, Serialize, Default, Clone)]
+struct SarFieldSelector {
+    requirements: Vec<SarSelectorRequirement>,
+}
+
+/// `authorizationv1.LabelSelectorAttributes`.
+#[derive(Debug, Serialize, Default, Clone)]
+struct SarLabelSelector {
+    requirements: Vec<SarSelectorRequirement>,
+}
+
+/// `metav1.FieldSelectorRequirement` / `metav1.LabelSelectorRequirement`
+/// (same wire shape: key, operator, values omitempty).
+#[derive(Debug, Serialize, Clone)]
+struct SarSelectorRequirement {
+    key: String,
+    operator: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    values: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Default, Clone)]
@@ -706,7 +733,7 @@ fn is_connection_reset(e: &reqwest::Error) -> bool {
 }
 
 /// `convertToSARExtra` + the user / attributes half of `Authorize`
-/// (webhook.go:189-206, `resourceAttributesFrom` :301-329 minus selectors; Version :306).
+/// (webhook.go:189-206, `resourceAttributesFrom` :301-329; Version :306).
 fn spec_from(attr: &RequestAttributes) -> SarSpec {
     let user: &UserInfo = &attr.user;
     let mut spec = SarSpec {
@@ -734,9 +761,65 @@ fn spec_from(attr: &RequestAttributes) -> SarSpec {
             resource: attr.resource.clone(),
             subresource: attr.subresource.clone().unwrap_or_default(),
             name: attr.name.clone().unwrap_or_default(),
+            // webhook.go:312-326 (`AuthorizeWithSelectors`, GA and locked on
+            // since 1.34). Requirements are used even when parsing reported an
+            // error: selectors only narrow, so a subset is safe.
+            field_selector: field_selector_to_authorization_api(attr)
+                .map(|requirements| SarFieldSelector { requirements }),
+            label_selector: label_selector_to_authorization_api(attr)
+                .map(|requirements| SarLabelSelector { requirements }),
         });
     }
     spec
+}
+
+/// `fieldSelectorToAuthorizationAPI` (webhook.go:331-366). `None` is upstream's
+/// `len(requirements) == 0`: the broader unrestricted action is checked.
+fn field_selector_to_authorization_api(
+    attr: &RequestAttributes,
+) -> Option<Vec<SarSelectorRequirement>> {
+    use rusternetes_common::field_selector::FieldOperator;
+    let out: Vec<_> = attr
+        .field_selector_requirements
+        .iter()
+        .map(|r| SarSelectorRequirement {
+            key: r.field().to_string(),
+            operator: match r.operator() {
+                FieldOperator::Equals => "In",
+                FieldOperator::NotEquals => "NotIn",
+            },
+            values: vec![r.value().to_string()],
+        })
+        .collect();
+    (!out.is_empty()).then_some(out)
+}
+
+/// `labelSelectorToAuthorizationAPI` (webhook.go:368-402).
+fn label_selector_to_authorization_api(
+    attr: &RequestAttributes,
+) -> Option<Vec<SarSelectorRequirement>> {
+    use rusternetes_common::label_selector::LabelOperator;
+    let out: Vec<_> = attr
+        .label_selector_requirements
+        .iter()
+        .filter_map(|r| {
+            let operator = match r.operator() {
+                LabelOperator::Equals | LabelOperator::DoubleEquals | LabelOperator::In => "In",
+                LabelOperator::NotEquals | LabelOperator::NotIn => "NotIn",
+                LabelOperator::Exists => "Exists",
+                LabelOperator::DoesNotExist => "DoesNotExist",
+                // Ignore: requirements are AND'd, so dropping an unknown one
+                // only broadens the checked action.
+                LabelOperator::GreaterThan | LabelOperator::LessThan => return None,
+            };
+            Some(SarSelectorRequirement {
+                key: r.key().to_string(),
+                operator,
+                values: r.values().map(<[String]>::to_vec).unwrap_or_default(),
+            })
+        })
+        .collect();
+    (!out.is_empty()).then_some(out)
 }
 
 /// `shouldCache` (webhook.go:537-547): requester-controlled attributes that are

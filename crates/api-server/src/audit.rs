@@ -394,12 +394,14 @@ pub fn request_info(method: &Method, path: &str, query: Option<&str>) -> Attribu
 
     // specialVerbs = {"proxy", "watch"}; "proxy" allows no subresources.
     let mut no_subresources = false;
+    let mut verb_via_path_prefix = false;
     if parts[0] == "proxy" || parts[0] == "watch" {
         if parts.len() < 2 {
             a.is_resource_request = false;
             return a;
         }
         a.verb = parts[0].to_string();
+        verb_via_path_prefix = true;
         no_subresources = parts[0] == "proxy";
         parts = &parts[1..];
     } else {
@@ -447,6 +449,21 @@ pub fn request_info(method: &Method, path: &str, query: Option<&str>) -> Attribu
     }
     if a.name.is_empty() && a.verb == "delete" {
         a.verb = "deletecollection".to_string();
+    }
+    // requestinfo.go:261-275 (`AuthorizeWithSelectors`, GA and locked on since
+    // 1.34). Not supported on the deprecated verb-via-path mechanism; read
+    // straight off the query so an undecodable sibling parameter cannot lose
+    // them. `req.URL.Query()[k][0]` is the first occurrence.
+    if !verb_via_path_prefix && matches!(a.verb.as_str(), "list" | "watch" | "deletecollection") {
+        let first = |key: &str| {
+            query.and_then(|q| {
+                url::form_urlencoded::parse(q.as_bytes())
+                    .find(|(k, _)| k == key)
+                    .map(|(_, v)| v.into_owned())
+            })
+        };
+        a.field_selector = first("fieldSelector").unwrap_or_default();
+        a.label_selector = first("labelSelector").unwrap_or_default();
     }
     a
 }

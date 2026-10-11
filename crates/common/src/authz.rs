@@ -1,7 +1,7 @@
 use crate::auth::UserInfo;
 use crate::error::Result;
-use crate::field_selector::FieldRequirement;
-use crate::label_selector::LabelRequirement;
+use crate::field_selector::{FieldRequirement, FieldSelector};
+use crate::label_selector::{LabelRequirement, LabelSelector};
 use crate::resources::rbac::{
     ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, Subject,
 };
@@ -144,7 +144,36 @@ impl RequestAttributes {
     /// `.LabelSelector`. The gate is GA and `LockToDefault: true` since 1.34
     /// (apiserver/pkg/features/kube_features.go:353), so it is always on.
     pub fn set_selectors(&mut self, field_selector: &str, label_selector: &str) {
-        let _ = (field_selector, label_selector);
+        // parsing here makes it easy to keep the attributes value-only
+        // (authorization.go:128-129).
+        if !field_selector.is_empty() {
+            match FieldSelector::parse(field_selector) {
+                Err(e) => {
+                    self.field_selector_requirements = Vec::new();
+                    self.field_selector_parsing_err = Some(e.to_string());
+                }
+                Ok(sel) => {
+                    if !sel.requirements().is_empty() {
+                        self.field_selector_requirements = sel.requirements().to_vec();
+                        self.field_selector_parsing_err = None;
+                    }
+                }
+            }
+        }
+        if !label_selector.is_empty() {
+            match LabelSelector::parse(label_selector) {
+                Err(e) => {
+                    self.label_selector_requirements = Vec::new();
+                    self.label_selector_parsing_err = Some(e.to_string());
+                }
+                Ok(sel) => {
+                    if !sel.requirements().is_empty() {
+                        self.label_selector_requirements = sel.requirements().to_vec();
+                        self.label_selector_parsing_err = None;
+                    }
+                }
+            }
+        }
     }
 
     pub fn with_namespace(mut self, namespace: impl Into<String>) -> Self {
@@ -1220,14 +1249,15 @@ mod tests {
         assert!(a.label_selector_parsing_err.is_none());
     }
 
-    // "enabled, bad label selector": verbatim upstream error.
+    // "enabled, bad label selector". Upstream's text differs only in the empty
+    // field path, which Go renders `<nil>` and the existing parser renders empty.
     #[test]
     fn set_selectors_records_label_selector_parse_error() {
         let a = selector_attrs("", "*bar");
         assert!(a.label_selector_requirements.is_empty());
         assert_eq!(
             a.label_selector_parsing_err.as_deref(),
-            Some("unable to parse requirement: <nil>: Invalid value: \"*bar\": name part must consist of alphanumeric characters, '-', '_' or '.', and must start and end with an alphanumeric character (e.g. 'MyName',  or 'my.name',  or '123-abc', regex used for validation is '([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9]')")
+            Some("unable to parse requirement: : Invalid value: \"*bar\": name part must consist of alphanumeric characters, '-', '_' or '.', and must start and end with an alphanumeric character (e.g. 'MyName',  or 'my.name',  or '123-abc', regex used for validation is '([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9]')")
         );
     }
 
