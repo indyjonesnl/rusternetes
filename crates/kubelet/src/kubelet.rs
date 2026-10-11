@@ -746,7 +746,6 @@ impl Kubelet {
         let _ = &network;
         let socket = std::env::var("CONTAINER_RUNTIME_ENDPOINT")
             .unwrap_or_else(|_| "unix:///run/containerd/containerd.sock".to_string());
-        let runtime_handler = std::env::var("CONTAINER_RUNTIME_HANDLER").unwrap_or_default();
         let log_root = format!("{volume_dir}/pod-logs");
 
         // VolumeManager shares the kubelet's storage + the api-server JWT secret
@@ -777,7 +776,7 @@ impl Kubelet {
         } else {
             kubernetes_service_host
         };
-        let runtime = CriContainerRuntime::connect(&socket, runtime_handler, log_root)
+        let runtime = CriContainerRuntime::connect(&socket, log_root)
             .await
             .map_err(|e| anyhow::anyhow!("connecting to CRI runtime at {socket}: {e}"))?
             .with_volumes(volumes)

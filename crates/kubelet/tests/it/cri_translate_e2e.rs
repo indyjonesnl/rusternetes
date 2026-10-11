@@ -203,10 +203,9 @@ async fn cri_container_runtime_lifecycle() {
         eprintln!("RUSTERNETES_CRI_SOCKET unset; skipping runtime lifecycle e2e");
         return;
     };
-    let handler = std::env::var("RUSTERNETES_CRI_RUNTIME_HANDLER").unwrap_or_default();
 
     let log_root = std::env::temp_dir().join("rusternetes-cri-runtime");
-    let runtime = CriContainerRuntime::connect(&socket, handler, log_root.to_string_lossy())
+    let runtime = CriContainerRuntime::connect(&socket, log_root.to_string_lossy())
         .await
         .expect("connect runtime");
 
@@ -357,7 +356,6 @@ async fn emptydir_volume_provisioned_and_mounted() {
         eprintln!("RUSTERNETES_CRI_SOCKET unset; skipping volume e2e");
         return;
     };
-    let handler = std::env::var("RUSTERNETES_CRI_RUNTIME_HANDLER").unwrap_or_default();
 
     let vol_base = std::env::temp_dir().join("rusternetes-cri-volbase");
     std::fs::create_dir_all(&vol_base).expect("vol base");
@@ -368,7 +366,7 @@ async fn emptydir_volume_provisioned_and_mounted() {
     );
 
     let log_root = std::env::temp_dir().join("rusternetes-cri-vol");
-    let runtime = CriContainerRuntime::connect(&socket, handler, log_root.to_string_lossy())
+    let runtime = CriContainerRuntime::connect(&socket, log_root.to_string_lossy())
         .await
         .expect("connect")
         .with_volumes(vm);
@@ -476,9 +474,8 @@ async fn liveness_probe_drives_check_liveness() {
         eprintln!("RUSTERNETES_CRI_SOCKET unset; skipping liveness e2e");
         return;
     };
-    let handler = std::env::var("RUSTERNETES_CRI_RUNTIME_HANDLER").unwrap_or_default();
     let log_root = std::env::temp_dir().join("rusternetes-cri-live");
-    let runtime = CriContainerRuntime::connect(&socket, handler, log_root.to_string_lossy())
+    let runtime = CriContainerRuntime::connect(&socket, log_root.to_string_lossy())
         .await
         .expect("connect");
 
@@ -566,10 +563,9 @@ async fn init_container_runs_before_app() {
         eprintln!("RUSTERNETES_CRI_SOCKET unset; skipping init-container e2e");
         return;
     };
-    let handler = std::env::var("RUSTERNETES_CRI_RUNTIME_HANDLER").unwrap_or_default();
 
     let log_root = std::env::temp_dir().join("rusternetes-cri-init");
-    let runtime = CriContainerRuntime::connect(&socket, handler, log_root.to_string_lossy())
+    let runtime = CriContainerRuntime::connect(&socket, log_root.to_string_lossy())
         .await
         .expect("connect runtime");
 
