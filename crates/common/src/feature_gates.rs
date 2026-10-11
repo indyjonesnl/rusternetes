@@ -249,6 +249,11 @@ impl Feature {
         }
     }
 
+    /// `LockToDefault` in upstream's spec. Only gates modelled as GA-locked.
+    const fn locked_to_default(self) -> bool {
+        matches!(self, Feature::RelaxedDNSSearchValidation)
+    }
+
     /// Upstream-derived default for the v1.35 target.
     const fn default_enabled(self) -> bool {
         match self {
@@ -467,8 +472,62 @@ pub fn reset_to_defaults() {
 /// Parse a `--feature-gates` value and apply it. Port of
 /// `featureGate.Set` / `SetFromMap`
 /// (staging/src/k8s.io/component-base/featuregate/feature_gate.go:340-359, 440-469).
-pub fn set_from_str(_value: &str) -> Result<(), String> {
-    Ok(())
+pub fn set_from_str(value: &str) -> Result<(), String> {
+    let mut m: Vec<(String, bool)> = Vec::new();
+    for s in value.split(',') {
+        if s.is_empty() {
+            continue;
+        }
+        let (k, v) = match s.split_once('=') {
+            Some((k, v)) => (k.trim(), v.trim()),
+            None => return Err(format!("missing bool value for {}", s.trim())),
+        };
+        let b = match v {
+            "1" | "t" | "T" | "TRUE" | "true" | "True" => true,
+            "0" | "f" | "F" | "FALSE" | "false" | "False" => false,
+            _ => return Err(format!(
+                "invalid value of {k}={v}, err: strconv.ParseBool: parsing {v:?}: invalid syntax"
+            )),
+        };
+        m.push((k.to_string(), b));
+    }
+    set_from_map(&m)
+}
+
+/// `featureGate.SetFromMap` + `unsafeSetFromMap` (feature_gate.go:374-469):
+/// an unknown gate returns immediately (:385-389); a gate locked to its
+/// default accumulates an error (:391-394); changes are persisted only when
+/// no error occurred (:463-466). Multiple errors aggregate as `[a, b]`
+/// (`utilerrors.NewAggregate`).
+///
+/// Gap: upstream's `AllAlpha`/`AllBeta` specials, PreAlpha rejection and
+/// emulation versions are not modelled (no per-gate prerelease metadata).
+fn set_from_map(m: &[(String, bool)]) -> Result<(), String> {
+    let mut errs: Vec<String> = Vec::new();
+    let mut staged: Vec<(Feature, bool)> = Vec::new();
+    for (k, v) in m {
+        let Some(&f) = ALL_FEATURES.iter().find(|f| format!("{f:?}") == *k) else {
+            return Err(format!("unrecognized feature gate: {k}"));
+        };
+        if f.locked_to_default() && f.default_enabled() != *v {
+            errs.push(format!(
+                "cannot set feature gate {k} to {v}, feature is locked to {}",
+                f.default_enabled()
+            ));
+            continue;
+        }
+        staged.push((f, *v));
+    }
+    match errs.len() {
+        0 => {
+            for (f, v) in staged {
+                set(f, v);
+            }
+            Ok(())
+        }
+        1 => Err(errs.remove(0)),
+        _ => Err(format!("[{}]", errs.join(", "))),
+    }
 }
 
 /// RAII guard that restores `feature` to its prior value on drop. Use in tests
