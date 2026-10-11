@@ -17,6 +17,15 @@ fn pod(name: &str) -> Value {
     })
 }
 
+/// A Burstable pod whose container carries cpu, memory and ephemeral-storage.
+fn resizable_pod(name: &str) -> Value {
+    let mut p = pod(name);
+    p["spec"]["containers"][0]["resources"] = json!({"requests": {
+        "cpu": "100m", "memory": "100Mi", "ephemeral-storage": "1Gi"
+    }});
+    p
+}
+
 fn scheduled_pod(name: &str) -> Value {
     let mut p = pod(name);
     p["spec"]["nodeName"] = json!("node-1");
@@ -268,7 +277,9 @@ async fn a_patch_cannot_change_container_resources() {
 #[tokio::test]
 async fn a_resize_patch_changes_only_the_resources() {
     let api = TestApiServer::new();
-    create(&api, &pod("p1")).await;
+    // Burstable already: a resize may not change the QoS class
+    // (ValidatePodResize, validation.go:6232).
+    create(&api, &resizable_pod("p1")).await;
     let patch = json!({"spec": {"containers": [
         {"name": "c", "image": "other", "resources": {"requests": {"cpu": "500m"}}}
     ]}});
@@ -568,6 +579,119 @@ async fn kubelet_status_patch_tolerates_running_and_waiting_both_set() {
     // Go stores both keys: the merge only replaces what the patch names.
     assert!(
         st.get("running").is_some() && st.get("waiting").is_some(),
+        "{body}"
+    );
+}
+
+/// `validatePodResizeContainerOrdering` (validation.go:6348-6370).
+#[tokio::test]
+async fn a_resize_cannot_rename_a_container() {
+    let api = TestApiServer::new();
+    let created = create(&api, &resizable_pod("p1")).await;
+    let mut update = created.clone();
+    update["spec"]["containers"][0]["name"] = json!("renamed");
+    let (s, body) = api.put(&format!("{PODS}/p1/resize"), &update).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let msg = body["message"].as_str().unwrap();
+    assert!(
+        msg.contains("spec.containers[0].name") && msg.contains("renamed or reordered on resize"),
+        "{body}"
+    );
+}
+
+/// `validateContainerResize` (validation.go:6497-6511): requests and limits
+/// cannot be removed on resize.
+#[tokio::test]
+async fn a_resize_cannot_remove_a_resource_request() {
+    let api = TestApiServer::new();
+    let created = create(&api, &resizable_pod("p1")).await;
+    let mut update = created.clone();
+    update["spec"]["containers"][0]["resources"]["requests"] =
+        json!({"cpu": "100m", "ephemeral-storage": "1Gi"});
+    let (s, body) = api.put(&format!("{PODS}/p1/resize"), &update).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["message"].as_str().unwrap().contains(
+            "spec.containers[0].resources.requests: Forbidden: resource requests cannot be removed"
+        ),
+        "{body}"
+    );
+}
+
+/// `dropCPUMemoryResourcesFromContainer` + the DeepEqual (validation.go:6217-6346):
+/// only cpu and memory are mutable.
+#[tokio::test]
+async fn a_resize_can_only_change_cpu_and_memory() {
+    let api = TestApiServer::new();
+    let created = create(&api, &resizable_pod("p1")).await;
+    let mut update = created.clone();
+    update["spec"]["containers"][0]["resources"]["requests"]["ephemeral-storage"] = json!("2Gi");
+    let (s, body) = api.put(&format!("{PODS}/p1/resize"), &update).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("only cpu and memory resources are mutable"),
+        "{body}"
+    );
+}
+
+/// `ValidatePodResize` (validation.go:6217-6346): the QoS class may not change.
+#[tokio::test]
+async fn a_resize_cannot_change_the_qos_class() {
+    let api = TestApiServer::new();
+    let created = create(&api, &pod("p1")).await;
+    let mut update = created.clone();
+    update["spec"]["containers"][0]["resources"] = json!({"requests": {"cpu": "100m"}});
+    let (s, body) = api.put(&format!("{PODS}/p1/resize"), &update).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("Pod QOS Class may not change as a result of resizing"),
+        "{body}"
+    );
+}
+
+/// `ValidatePodResize` (validation.go:6217-6346): windows pods are refused.
+#[tokio::test]
+async fn a_windows_pod_cannot_be_resized() {
+    let api = TestApiServer::new();
+    let mut body = resizable_pod("p1");
+    body["spec"]["os"] = json!({"name": "windows"});
+    let created = create(&api, &body).await;
+    let mut update = created.clone();
+    update["spec"]["containers"][0]["resources"]["requests"]["cpu"] = json!("200m");
+    let (s, body) = api.put(&format!("{PODS}/p1/resize"), &update).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("windows pods cannot be resized"),
+        "{body}"
+    );
+}
+
+/// `ValidatePodEphemeralContainersUpdate` runs `validatePodMetadataAndSpec`
+/// (validation.go:6187), which validates the new ephemeral containers.
+#[tokio::test]
+async fn an_invalid_ephemeral_container_is_rejected() {
+    let api = TestApiServer::new();
+    let created = create(&api, &pod("p1")).await;
+    let mut update = created.clone();
+    update["spec"]["ephemeralContainers"] = json!([{"name": "Bad_Name", "image": "busybox"}]);
+    let (s, body) = api
+        .put(&format!("{PODS}/p1/ephemeralcontainers"), &update)
+        .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("spec.ephemeralContainers[0].name"),
         "{body}"
     );
 }
