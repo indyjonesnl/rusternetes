@@ -701,10 +701,9 @@ impl<S: Storage + 'static> RangeAllocator<S> {
             match set.allocate_next() {
                 Ok(c) => allocated.push(c),
                 Err(e) => {
-                    // Deviation from upstream, which leaks the CIDRs already
-                    // taken from earlier sets (and again on every requeue):
-                    // nothing was written, so handing them back is safe.
-                    self.release_allocated(&allocated);
+                    // Ported exactly from range_allocator.go:316-339
+                    // (AllocateOrOccupyCIDR): the CIDRs already taken from
+                    // earlier sets are NOT released here (upstream leaks them).
                     self.record_node_status_change(node, "CIDRNotAvailable")
                         .await;
                     anyhow::bail!("failed to allocate cidr from cluster cidr at idx:{idx}: {e}");
@@ -762,15 +761,12 @@ impl<S: Storage + 'static> RangeAllocator<S> {
         let node: Node = match self.storage.get(&key).await {
             Ok(n) => n,
             Err(e) => {
-                // Deviation from upstream, which leaks the CIDR here: nothing
-                // was written, so handing it back is always safe.
+                // Ported exactly from range_allocator.go:395-399
+                // (updateCIDRsAllocation): log and return the lister error
+                // without releasing allocatedCIDRs (upstream leaks them).
                 error!(
                     "Failed while getting node {node_name} for updating Node.Spec.PodCIDRs: {e}"
                 );
-                self.release_allocated(&allocated);
-                if matches!(e, Error::NotFound(_)) {
-                    return Ok(());
-                }
                 return Err(e.into());
             }
         };
@@ -1506,14 +1502,17 @@ mod tests {
     }
 
     // updateCIDRsAllocation: node vanished between allocate and write.
+    // pkg/controller/nodeipam/ipam/range_allocator.go:395-399 returns the
+    // lister error WITHOUT releasing allocatedCIDRs (leaked, by design).
     #[tokio::test]
-    async fn allocation_for_vanished_node_is_released() {
+    async fn allocation_for_vanished_node_leaks_and_errors_like_upstream() {
         let storage = Arc::new(MemoryStorage::new());
         let ra = allocator(&storage, "10.10.0.0/16", 24, &[]).unwrap();
-        ra.allocate_or_occupy_cidr(&node_with_cidr("ghost", None))
+        assert!(ra
+            .allocate_or_occupy_cidr(&node_with_cidr("ghost", None))
             .await
-            .unwrap();
-        assert_eq!(ra.cidr_sets[0].allocated(), 0);
+            .is_err());
+        assert_eq!(ra.cidr_sets[0].allocated(), 1);
     }
 
     // updateCIDRsAllocation: "Node already has a CIDR allocated. Releasing the new one".
@@ -1846,11 +1845,10 @@ mod tests {
         );
     }
 
-    // Deviation from upstream (which leaks the set-0 CIDR when set 1 is
-    // exhausted, then again on every rate-limited retry): nothing was
-    // written, so the earlier allocations are handed back.
+    // range_allocator.go:316-339 AllocateOrOccupyCIDR returns the set-1 error
+    // without releasing set 0's CIDR (leaked, again on every retry).
     #[tokio::test]
-    async fn dual_stack_partial_allocation_failure_releases_earlier_sets() {
+    async fn dual_stack_partial_allocation_failure_leaks_earlier_sets_like_upstream() {
         let storage = Arc::new(MemoryStorage::new());
         let n = node_with_cidrs("node0", &[]);
         put(&storage, &n).await;
@@ -1864,7 +1862,9 @@ mod tests {
         ra.cidr_sets[1].allocate_next().unwrap();
         ra.cidr_sets[1].allocate_next().unwrap();
         assert!(ra.allocate_or_occupy_cidr(&n).await.is_err());
-        assert_eq!(ra.cidr_sets[0].allocated(), 0);
+        assert_eq!(ra.cidr_sets[0].allocated(), 1);
+        assert!(ra.allocate_or_occupy_cidr(&n).await.is_err());
+        assert_eq!(ra.cidr_sets[0].allocated(), 2);
         assert!(cidrs_of(&storage, "node0").await.is_empty());
         let events: Vec<Event> = storage.list(&build_prefix("events", None)).await.unwrap();
         assert!(events.iter().any(|e| e.reason == "CIDRNotAvailable"));
