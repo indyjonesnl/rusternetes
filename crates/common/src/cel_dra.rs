@@ -50,6 +50,23 @@ const DEVICE_ATTRIBUTE_MAX_VALUE_LENGTH: u64 = 64;
 /// `apiservercel.QuantityDeclType` minimum size (`apiserver/pkg/cel/types.go:588`).
 const QUANTITY_SIZE: u64 = 8;
 
+/// `cel.bind(var, init, result)` (`ext/bindings.go` `celBind`; the parser
+/// crate has no such macro, so the call form is recognised here): the
+/// receiver must be the bare `cel` namespace identifier and the variable a
+/// simple identifier.
+fn bind_parts(c: &cel::common::ast::CallExpr) -> Option<(&str, &IdedExpr, &IdedExpr)> {
+    if c.func_name != "bind" || c.args.len() != 3 {
+        return None;
+    }
+    if !matches!(c.target.as_deref().map(|t| &t.expr), Some(Expr::Ident(n)) if n == "cel") {
+        return None;
+    }
+    match &c.args[0].expr {
+        Expr::Ident(v) => Some((v.as_str(), &c.args[1], &c.args[2])),
+        _ => None,
+    }
+}
+
 /// The outcome of compiling a selector.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectorCompilation {
@@ -404,7 +421,19 @@ impl<'a> Checker<'a> {
                     _ => Ty::Dyn,
                 }
             }
-            Expr::Call(c) => self.infer_call(c, scope),
+            Expr::Call(c) => match bind_parts(c) {
+                Some((var, init, result)) => {
+                    // `.bind` consumes one `.` of the source, as any receiver call does.
+                    self.take_dot();
+                    let init_ty = self.infer(init, scope);
+                    let pushed = scope.len();
+                    scope.push((var.to_string(), init_ty));
+                    let out = self.infer(result, scope);
+                    scope.truncate(pushed);
+                    out
+                }
+                None => self.infer_call(c, scope),
+            },
             Expr::Comprehension(c) => {
                 let range = self.infer(&c.iter_range, scope);
                 let _dot = self.take_dot();
@@ -893,7 +922,10 @@ impl<'a> Coster<'a> {
                 self.paths.insert(e.id, p);
                 sum
             }
-            Expr::Call(_) => self.cost_call(e),
+            Expr::Call(c) => match bind_parts(c) {
+                Some((var, init, result)) => self.cost_bind(e, var, init, result),
+                None => self.cost_call(e),
+            },
             Expr::List(l) => {
                 let mut sum = Cost::default();
                 let mut item = Size {
@@ -962,7 +994,7 @@ impl<'a> Coster<'a> {
                     && matches!(&c.loop_cond.expr, Expr::Literal(LiteralValue::Boolean(b)) if !*b.inner())
                     && c.accu_var != "@result";
                 if is_bind {
-                    return self.cost_bind(e, c);
+                    return self.cost_bind(e, &c.accu_var, &c.accu_init, &c.result);
                 }
                 self.cost_comprehension(e, c)
             }
@@ -977,12 +1009,15 @@ impl<'a> Coster<'a> {
         self.push(name, LocalVar { path, size, entry });
     }
 
-    fn cost_bind(&mut self, e: &IdedExpr, c: &cel::common::ast::ComprehensionExpr) -> Cost {
-        let mut sum = self.cost(&c.iter_range).add(self.cost(&c.accu_init));
-        self.push_local(&c.accu_var, &c.accu_init);
-        sum = sum.add(self.cost(&c.result));
-        self.pop(&c.accu_var);
-        self.copy_estimates(e, &c.result);
+    /// `coster.costBind` (`checker/cost.go:710`). The range of the expanded
+    /// bind comprehension is an empty list literal (`ext/bindings.go:182-190`),
+    /// whose creation cost is retained ("Binds are lazily initialized").
+    fn cost_bind(&mut self, e: &IdedExpr, var: &str, init: &IdedExpr, result: &IdedExpr) -> Cost {
+        let mut sum = Cost::fixed(LIST_CREATE_BASE).add(self.cost(init));
+        self.push_local(var, init);
+        sum = sum.add(self.cost(result));
+        self.pop(var);
+        self.copy_estimates(e, result);
         sum
     }
 
