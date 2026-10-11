@@ -337,7 +337,7 @@ async fn ask_sar(
         &body,
     )
     .await;
-    assert_eq!(status, 200, "SAR HTTP must succeed, got {status}: {resp}");
+    assert_eq!(status, 201, "SAR HTTP must succeed, got {status}: {resp}");
     let allowed = resp["status"]["allowed"].as_bool().unwrap_or(false);
     let reason = resp["status"]["reason"].as_str().unwrap_or("").to_string();
     (allowed, reason)
@@ -1329,7 +1329,7 @@ async fn rbac_resource_names_restrict_rule_to_named_objects() {
         &sar,
     )
     .await;
-    assert_eq!(status, 200, "SAR HTTP must succeed: {resp}");
+    assert_eq!(status, 201, "SAR HTTP must succeed: {resp}");
     assert_eq!(
         resp["status"]["allowed"], true,
         "named resource MUST be allowed: {resp}"
@@ -1344,7 +1344,7 @@ async fn rbac_resource_names_restrict_rule_to_named_objects() {
         &sar,
     )
     .await;
-    assert_eq!(status, 200, "SAR HTTP must succeed: {resp}");
+    assert_eq!(status, 201, "SAR HTTP must succeed: {resp}");
     assert_eq!(
         resp["status"]["allowed"], false,
         "unnamed resource MUST be denied: {resp}"

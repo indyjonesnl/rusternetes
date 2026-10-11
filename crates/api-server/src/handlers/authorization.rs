@@ -1,6 +1,7 @@
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
     extract::{Path, State},
+    http::StatusCode,
     Extension, Json,
 };
 use rusternetes_common::dump::DumpingJson;
@@ -22,7 +23,7 @@ pub async fn create_subject_access_review(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     DumpingJson(mut sar): DumpingJson<SubjectAccessReview>,
-) -> Result<Json<SubjectAccessReview>> {
+) -> Result<(StatusCode, Json<SubjectAccessReview>)> {
     info!("Creating subject access review");
 
     // Check authorization - creating a SubjectAccessReview requires impersonation privileges
@@ -103,7 +104,7 @@ pub async fn create_subject_access_review(
         },
     });
 
-    Ok(Json(sar))
+    Ok((StatusCode::CREATED, Json(sar)))
 }
 
 /// Create a SelfSubjectAccessReview (authorization.k8s.io/v1)
@@ -113,7 +114,7 @@ pub async fn create_self_subject_access_review(
     Extension(auth_ctx): Extension<AuthContext>,
     headers: axum::http::HeaderMap,
     DumpingJson(mut ssar): DumpingJson<SelfSubjectAccessReview>,
-) -> Result<Json<SelfSubjectAccessReview>> {
+) -> Result<(StatusCode, Json<SelfSubjectAccessReview>)> {
     info!(
         "Creating self subject access review for user: {}",
         auth_ctx.user.username
@@ -200,7 +201,7 @@ pub async fn create_self_subject_access_review(
         },
     });
 
-    Ok(Json(ssar))
+    Ok((StatusCode::CREATED, Json(ssar)))
 }
 
 /// Create a LocalSubjectAccessReview (authorization.k8s.io/v1)
@@ -210,7 +211,7 @@ pub async fn create_local_subject_access_review(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     DumpingJson(mut lsar): DumpingJson<LocalSubjectAccessReview>,
-) -> Result<Json<LocalSubjectAccessReview>> {
+) -> Result<(StatusCode, Json<LocalSubjectAccessReview>)> {
     info!(
         "Creating local subject access review in namespace: {}",
         namespace
@@ -304,7 +305,7 @@ pub async fn create_local_subject_access_review(
         },
     });
 
-    Ok(Json(lsar))
+    Ok((StatusCode::CREATED, Json(lsar)))
 }
 
 /// Create a SelfSubjectRulesReview (authorization.k8s.io/v1)
@@ -313,7 +314,7 @@ pub async fn create_self_subject_rules_review(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     DumpingJson(mut ssrr): DumpingJson<SelfSubjectRulesReview>,
-) -> Result<Json<SelfSubjectRulesReview>> {
+) -> Result<(StatusCode, Json<SelfSubjectRulesReview>)> {
     info!(
         "Creating self subject rules review for user: {} in namespace: {}",
         auth_ctx.user.username, ssrr.spec.namespace
@@ -352,7 +353,7 @@ pub async fn create_self_subject_rules_review(
         evaluation_error: None,
     });
 
-    Ok(Json(ssrr))
+    Ok((StatusCode::CREATED, Json(ssrr)))
 }
 
 #[cfg(test)]
