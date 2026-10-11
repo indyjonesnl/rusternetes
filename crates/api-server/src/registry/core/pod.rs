@@ -877,6 +877,7 @@ impl BindingRest {
         ctx: &RequestContext,
         name: &str,
         binding: &Binding,
+        create_validation: Option<&dyn crate::registry::rest::ValidateObject<Binding>>,
         dry_run: bool,
     ) -> rusternetes_common::Result<()> {
         use rusternetes_common::Error;
@@ -890,6 +891,11 @@ impl BindingRest {
         let errs = rusternetes_common::validation::pod_status::validate_pod_binding(binding);
         if !errs.is_empty() {
             return Err(Error::Invalid(errs));
+        }
+        // storage.go:191-195: `createValidation` sees the Binding, after
+        // `ValidatePodBinding`.
+        if let Some(validation) = create_validation {
+            validation.validate(ctx, binding).await?;
         }
         self.assign_pod(ctx, binding, dry_run).await
     }

@@ -30,6 +30,16 @@ impl HasMetadata for rusternetes_common::resources::Namespace {
     }
 }
 
+impl HasMetadata for rusternetes_common::resources::Binding {
+    fn metadata(&self) -> &rusternetes_common::types::ObjectMeta {
+        &self.metadata
+    }
+
+    fn metadata_mut(&mut self) -> &mut rusternetes_common::types::ObjectMeta {
+        &mut self.metadata
+    }
+}
+
 impl HasMetadata for rusternetes_common::resources::Pod {
     fn metadata(&self) -> &rusternetes_common::types::ObjectMeta {
         &self.metadata

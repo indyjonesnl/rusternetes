@@ -120,7 +120,7 @@ async fn validating_webhook_on_pods_binding_sees_the_binding_and_can_deny() {
     assert_eq!(s, StatusCode::FORBIDDEN, "{out}");
     assert!(out.to_string().contains("binding denied"), "{out}");
 
-    let seen = seen.lock().unwrap();
+    let seen = std::mem::take(&mut *seen.lock().unwrap());
     assert_eq!(seen.len(), 1, "webhook must be called exactly once");
     let req = &seen[0];
     assert_eq!(req["operation"], "CREATE");
