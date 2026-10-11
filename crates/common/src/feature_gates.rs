@@ -942,4 +942,54 @@ mod tests {
             .starts_with("invalid value of AllAlpha"));
         reset_to_defaults();
     }
+
+    // kube_features.go: InPlacePodVerticalScaling at 1.35 is
+    // `Default: true, PreRelease: GA, LockToDefault: true`.
+    #[test]
+    #[serial]
+    fn in_place_pod_vertical_scaling_is_locked_to_default() {
+        reset_to_defaults();
+        assert_eq!(
+            set_from_str("InPlacePodVerticalScaling=false").unwrap_err(),
+            "cannot set feature gate InPlacePodVerticalScaling to false, feature is locked to true"
+        );
+        assert!(enabled(Feature::InPlacePodVerticalScaling));
+    }
+
+    // A gate that is locked must be GA (or Deprecated) in upstream; guard the
+    // per-gate audit against drifting from the prerelease table.
+    #[test]
+    fn locked_gates_are_ga_and_default_on() {
+        for f in ALL_FEATURES {
+            if f.locked_to_default() {
+                assert_eq!(f.prerelease(), PreRelease::Ga, "{f:?}");
+                assert!(f.default_enabled(), "{f:?}");
+            }
+        }
+    }
+
+    // feature_gate.go:418-434 (AddDependencies check). kube_features.go:2166+:
+    // MatchLabelKeysInPodTopologySpreadSelectorMerge: {MatchLabelKeysInPodTopologySpread}.
+    #[test]
+    #[serial]
+    fn dependencies_checked_after_set() {
+        reset_to_defaults();
+        assert_eq!(
+            set_from_str("MatchLabelKeysInPodTopologySpread=false").unwrap_err(),
+            "MatchLabelKeysInPodTopologySpreadSelectorMerge is enabled, but depends on features that are disabled: [MatchLabelKeysInPodTopologySpread]"
+        );
+        assert!(enabled(Feature::MatchLabelKeysInPodTopologySpread));
+        // Disabling both together is fine.
+        set_from_str(
+            "MatchLabelKeysInPodTopologySpread=false,MatchLabelKeysInPodTopologySpreadSelectorMerge=false",
+        )
+        .unwrap();
+        // DRADeviceTaintRules -> DRADeviceTaints; ClusterTrustBundleProjection -> ClusterTrustBundle.
+        assert_eq!(
+            set_from_str("DRADeviceTaintRules=true").unwrap_err(),
+            "DRADeviceTaintRules is enabled, but depends on features that are disabled: [DRADeviceTaints]"
+        );
+        assert!(set_from_str("DRADeviceTaintRules=true,DRADeviceTaints=true").is_ok());
+        reset_to_defaults();
+    }
 }
