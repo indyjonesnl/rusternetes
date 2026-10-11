@@ -75,7 +75,11 @@ async fn a_binding_with_no_target_name_reports_a_field_path() {
             })),
         )
         .await;
-    assert_eq!(status.as_u16(), 422, "must be Invalid: {body}");
+    assert_eq!(status.as_u16(), 500, "aggregate error, not Invalid: {body}");
+    assert!(
+        body.get("reason").is_none(),
+        "reason Unknown is omitted: {body}"
+    );
     assert!(
         body["message"]
             .as_str()
