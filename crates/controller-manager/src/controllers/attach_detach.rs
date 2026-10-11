@@ -42,9 +42,14 @@
 //!   reset the timer (`:342-346`). `verifySafeToDetach` has no equivalent
 //!   here (`VerifyVolumesAreAttached` is not ported).
 //!
-//! NOT ported (tracked on #3053): the multi-attach event, CSI migration of
-//! in-tree volumes, ephemeral inline CSI volumes (never attachable,
-//! `CanAttach`).
+//! - `.../reconciler/reconciler.go` `reportMultiAttachError` (`:376`), reported
+//!   once per volume/node (`MultiAttachErrorReported`, `:352`, reset when the
+//!   volume leaves the desired state of world), message from
+//!   `operation_executor.go` `GenerateMsg` (`:361`) / `generateVolumeMsg`
+//!   (`:320`); tests `reconciler_test.go` `Test_ReportMultiAttachError` (`:1279`).
+//!
+//! NOT ported (tracked on #3053): CSI migration of in-tree volumes, ephemeral
+//! inline CSI volumes (never attachable, `CanAttach`).
 //! Off by default; enabled with `--attach-detach-controller`.
 
 use super::pv_binder::is_pod_terminated;
@@ -54,16 +59,18 @@ use rusternetes_common::resources::csi::{
     CSIDriver, VolumeAttachment, VolumeAttachmentSource, VolumeAttachmentSpec,
 };
 use rusternetes_common::resources::node::AttachedVolume;
+use rusternetes_common::resources::service_account::ObjectReference;
 use rusternetes_common::resources::volume::{
     PersistentVolumeAccessMode, PersistentVolumeClaimPhase,
 };
+use rusternetes_common::resources::{EventSource, EventType};
 use rusternetes_common::resources::{Node, PersistentVolume, PersistentVolumeClaim, Pod};
 use rusternetes_common::types::{ObjectMeta, TypeMeta};
 use rusternetes_common::Error;
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_key, build_prefix, EventRecorder, Storage};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -94,6 +101,65 @@ struct Wanted {
     node: String,
     /// `IsMultiAttachAllowed(spec)`.
     multi_attach: bool,
+    /// `VolumeToAttach.ScheduledPods`: the pods that need this volume on `node`.
+    scheduled_pods: Vec<ObjectReference>,
+    /// `VolumeSpec.Name()` (the PV name), used in event messages.
+    spec_name: String,
+}
+
+fn pod_ref(pod: &Pod) -> ObjectReference {
+    ObjectReference {
+        kind: Some("Pod".to_string()),
+        namespace: pod.metadata.namespace.clone(),
+        name: Some(pod.metadata.name.clone()),
+        uid: Some(pod.metadata.uid.clone()),
+        api_version: Some("v1".to_string()),
+        resource_version: pod.metadata.resource_version.clone(),
+        field_path: None,
+    }
+}
+
+/// The event message each of `scheduled` (namespace, name) gets from
+/// `reportMultiAttachError` (`reconciler.go:376-433`). `holders` are the
+/// `(namespace, name)` of the pods using the volume on the other nodes
+/// (`GetVolumePodsOnNodes`). Messages are built by `GenerateMsg`
+/// (`operation_executor.go:361`, `generateVolumeMsg` `:320`).
+fn multi_attach_messages(
+    spec_name: &str,
+    scheduled: &[(String, String)],
+    holders: &[(String, String)],
+) -> Vec<String> {
+    let generate = |suffix: &str| format!("Multi-Attach error for volume \"{spec_name}\" {suffix}");
+    if holders.is_empty() {
+        // "We did not find any pods that requests the volume."
+        let simple = generate(
+            "Volume is already exclusively attached to one node and can't be attached to another",
+        );
+        return scheduled.iter().map(|_| simple.clone()).collect();
+    }
+    scheduled
+        .iter()
+        .map(|(ns, _)| {
+            // Each pod gets a custom message: a namespace's user must not see
+            // pod names from other namespaces.
+            let local: Vec<&str> = holders
+                .iter()
+                .filter(|(n, _)| n == ns)
+                .map(|(_, name)| name.as_str())
+                .collect();
+            let other = holders.len() - local.len();
+            let msg = if !local.is_empty() {
+                let mut m = format!("Volume is already used by pod(s) {}", local.join(", "));
+                if other > 0 {
+                    m = format!("{m} and {other} pod(s) in different namespaces");
+                }
+                m
+            } else {
+                format!("Volume is already used by {other} pod(s) in different namespaces")
+            };
+            generate(&msg)
+        })
+        .collect()
 }
 
 /// `IsMultiAttachAllowed` for a persistent volume (`util.go:615-628`).
@@ -122,12 +188,18 @@ pub struct AttachDetachController<S: Storage> {
     disable_force_detach_on_timeout: bool,
     /// `actualStateOfWorld` `detachRequestedTime`, keyed by VolumeAttachment name.
     detach_requested: std::sync::Mutex<HashMap<String, std::time::Instant>>,
+    recorder: EventRecorder<S>,
+    /// `MultiAttachErrorReported`: attachment names already reported. Pruned to
+    /// the desired state each reconcile (upstream's flag lives on the DSW entry).
+    multi_attach_reported: Mutex<HashSet<String>>,
 }
 
 impl<S: Storage + 'static> AttachDetachController<S> {
     pub fn new(storage: Arc<S>) -> Self {
         Self {
+            recorder: EventRecorder::new(Arc::clone(&storage)),
             storage,
+            multi_attach_reported: Mutex::new(HashSet::new()),
             max_wait_for_unmount: DEFAULT_MAX_WAIT_FOR_UNMOUNT,
             disable_force_detach_on_timeout: false,
             detach_requested: Default::default(),
@@ -257,16 +329,18 @@ impl<S: Storage + 'static> AttachDetachController<S> {
                     continue;
                 }
                 let handle = csi.volume_handle.clone().unwrap_or_default();
-                out.insert(
-                    attachment_name(&handle, &csi.driver, &node),
-                    Wanted {
+                let w = out
+                    .entry(attachment_name(&handle, &csi.driver, &node))
+                    .or_insert_with(|| Wanted {
+                        spec_name: pv_name.clone(),
                         pv_name,
                         driver: csi.driver.clone(),
                         handle,
                         node: node.clone(),
                         multi_attach: multi_attach_allowed(pv),
-                    },
-                );
+                        scheduled_pods: vec![],
+                    });
+                w.scheduled_pods.push(pod_ref(pod));
             }
         }
         out
@@ -323,6 +397,60 @@ impl<S: Storage + 'static> AttachDetachController<S> {
     }
 
     /// One pass of `reconciler.reconcile`: detaches, then attaches.
+    /// `reportMultiAttachError` (`reconciler.go:376-433`): a Warning
+    /// `FailedAttachVolume` event on every pod waiting for `w`, naming the pods
+    /// that hold the volume on `other_nodes`.
+    async fn report_multi_attach_error(
+        &self,
+        w: &Wanted,
+        other_nodes: &[&str],
+        desired: &HashMap<String, Wanted>,
+    ) {
+        // GetVolumePodsOnNodes(otherNodes, volumeName).
+        let mut holders: Vec<(String, String)> = vec![];
+        for node in other_nodes {
+            for other in desired.values() {
+                if other.pv_name == w.pv_name && other.node == *node {
+                    for p in &other.scheduled_pods {
+                        holders.push((
+                            p.namespace.clone().unwrap_or_default(),
+                            p.name.clone().unwrap_or_default(),
+                        ));
+                    }
+                }
+            }
+        }
+        let scheduled: Vec<(String, String)> = w
+            .scheduled_pods
+            .iter()
+            .map(|p| {
+                (
+                    p.namespace.clone().unwrap_or_default(),
+                    p.name.clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+        let msgs = multi_attach_messages(&w.spec_name, &scheduled, &holders);
+        let source = EventSource {
+            component: "attachdetach-controller".to_string(),
+            host: None,
+        };
+        for (pod, msg) in w.scheduled_pods.iter().zip(msgs) {
+            if let Err(e) = self
+                .recorder
+                .event(pod, &source, EventType::Warning, "FailedAttachVolume", &msg)
+                .await
+            {
+                warn!("Failed to record FailedAttachVolume event: {e}");
+            }
+        }
+        // "Log all pods for system admin."
+        warn!(
+            "Multi-Attach error: volume {} is already attached to {:?}, used by pods {:?}",
+            w.spec_name, other_nodes, holders
+        );
+    }
+
     pub async fn reconcile_all(&self) -> Result<()> {
         let pods: Vec<Pod> = self.storage.list(&build_prefix("pods", None)).await?;
         let pvcs: Vec<PersistentVolumeClaim> = self
@@ -491,6 +619,11 @@ impl<S: Storage + 'static> AttachDetachController<S> {
                 .or_default()
                 .push(va.spec.node_name.as_str());
         }
+        // The flag lives on the DSW entry upstream: it goes when the volume does.
+        self.multi_attach_reported
+            .lock()
+            .unwrap()
+            .retain(|n| desired.contains_key(n));
         let mut names: Vec<_> = desired.keys().collect();
         names.sort();
         for name in names {
@@ -506,10 +639,20 @@ impl<S: Storage + 'static> AttachDetachController<S> {
                     .get(w.pv_name.as_str())
                     .is_some_and(|n| n.iter().any(|n| *n != w.node))
             {
-                warn!(
-                    "Multi-Attach: volume {} is already attached to another node, not attaching to {}",
-                    w.pv_name, w.node
-                );
+                let first = self
+                    .multi_attach_reported
+                    .lock()
+                    .unwrap()
+                    .insert(name.clone());
+                if first {
+                    let mut other_nodes: Vec<&str> = attached_on
+                        .get(w.pv_name.as_str())
+                        .map(|n| n.iter().copied().filter(|n| *n != w.node).collect())
+                        .unwrap_or_default();
+                    other_nodes.sort();
+                    self.report_multi_attach_error(w, &other_nodes, &desired)
+                        .await;
+                }
                 continue;
             }
             let va = VolumeAttachment {
@@ -572,5 +715,58 @@ impl<S: Storage + 'static> AttachDetachController<S> {
             anyhow::bail!("unable to update {failed} nodes");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::multi_attach_messages;
+
+    /// `Test_ReportMultiAttachError` (`reconciler_test.go:1279`): ns1/pod1 is
+    /// the pod being attached, `others` use the volume on other nodes.
+    fn run(others: &[(&str, &str)]) -> Vec<String> {
+        let holders: Vec<(String, String)> = others
+            .iter()
+            .map(|(n, p)| (n.to_string(), p.to_string()))
+            .collect();
+        multi_attach_messages("volume-name", &[("ns1".into(), "pod1".into())], &holders)
+    }
+
+    const PFX: &str = "Multi-Attach error for volume \"volume-name\" ";
+
+    #[test]
+    fn no_pods_use_the_volume() {
+        assert_eq!(
+            run(&[]),
+            vec![format!("{PFX}Volume is already exclusively attached to one node and can't be attached to another")]
+        );
+    }
+
+    #[test]
+    fn pods_in_the_same_namespace() {
+        assert_eq!(
+            run(&[("ns1", "pod2")]),
+            vec![format!("{PFX}Volume is already used by pod(s) pod2")]
+        );
+    }
+
+    #[test]
+    fn pods_in_another_namespace() {
+        assert_eq!(
+            run(&[("ns2", "pod2")]),
+            vec![format!(
+                "{PFX}Volume is already used by 1 pod(s) in different namespaces"
+            )]
+        );
+    }
+
+    #[test]
+    fn pods_in_same_and_another_namespace() {
+        assert_eq!(
+            run(&[("ns2", "pod2"), ("ns1", "pod3")]),
+            vec![format!(
+                "{PFX}Volume is already used by pod(s) pod3 and 1 pod(s) in different namespaces"
+            )]
+        );
     }
 }
