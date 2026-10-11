@@ -221,3 +221,32 @@ async fn match_condition_metrics() {
         0
     );
 }
+
+/// webhook.go:236-249: `case ctx.Err() != nil: metricsResult = "canceled"`.
+/// Rust has no request context; the analogue of a cancelled ctx is the
+/// authorize future being dropped (client disconnect / request timeout) while
+/// the webhook call is in flight (#3217).
+#[tokio::test]
+async fn dropped_in_flight_call_records_canceled() {
+    async fn slow(Json(_): Json<Value>) -> &'static str {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        "{}"
+    }
+    let app = Router::new().route("/t", post(slow));
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/t", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+
+    let a = authorizer(&url, "m-cancel", FailurePolicy::NoOpinion, &[]);
+    let r = tokio::time::timeout(Duration::from_millis(200), a.authorize_opinion(&attrs())).await;
+    assert!(r.is_err(), "call should still be in flight");
+    let l = [("name", "m-cancel"), ("result", "canceled")];
+    assert_eq!(
+        sample("apiserver_authorization_webhook_evaluations_total", &l),
+        1
+    );
+    assert_eq!(
+        sample("apiserver_authorization_webhook_duration_seconds", &l),
+        1
+    );
+}
