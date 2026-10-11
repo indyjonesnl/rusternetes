@@ -372,6 +372,7 @@ mod list_options_all_routes_test;
 mod list_resource_version_match_exact_test;
 mod metrics_label_selector_test;
 mod networking_store_test;
+mod pod_binding_admission_test;
 mod pod_status_proto_state_test;
 mod portforward_connect_admission_test;
 mod run_seeds_default_rbac_test;

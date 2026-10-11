@@ -391,6 +391,9 @@ pub async fn create_binding(
     Query(params): Query<HashMap<String, String>>,
     body: Bytes,
 ) -> Result<Response> {
+    use crate::endpoints::handlers::admission::{Admission, CreateValidation};
+    use rusternetes_common::admission::Operation;
+
     info!("Creating binding for pod {}/{}", namespace, name);
     let scope = scope(&state, Some("binding"));
     endpoints::authorize(
@@ -419,10 +422,32 @@ pub async fn create_binding(
     let ctx = RequestContext::new(Some(&namespace))
         .with_user(&auth_ctx.user)
         .with_name(&name);
+    // `CreateNamedResource` (create.go): mutating admission on the Binding,
+    // then the storage's create with validating admission as its callback.
+    // The in-tree `PodTopologyLabels` plugin is among the mutators
+    // (`admitBinding`), so it runs on the Binding first.
     admit_binding_topology_labels(&state, &mut binding).await?;
-
+    let kind = GroupVersionKind {
+        group: String::new(),
+        version: "v1".to_string(),
+        kind: "Binding".to_string(),
+    };
+    let admission = Admission {
+        state: &state,
+        kind: &kind,
+        resource: &scope.resource,
+        subresource: scope.subresource,
+        namespace: Some(&namespace),
+        user: &auth_ctx.user,
+        dry_run,
+    };
+    let binding = admission.admit(Operation::Create, binding, None).await?;
+    let validation = CreateValidation {
+        admission: &admission,
+        authorize_create: false,
+    };
     pod::BindingRest::new(state.storage.clone())
-        .create(&ctx, &name, &binding, dry_run)
+        .create(&ctx, &name, &binding, Some(&validation), dry_run)
         .await?;
     Ok(endpoints::respond(
         axum::http::StatusCode::CREATED,
