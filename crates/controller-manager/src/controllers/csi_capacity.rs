@@ -1,0 +1,863 @@
+//! CSIStorageCapacity publisher (#3214, overlaps #3201), a port of
+//! kubernetes-csi/external-provisioner v6.4.0 `pkg/capacity/capacity.go`
+//! (`Controller`) and `pkg/capacity/topology/{topology,nodes}.go`
+//! (`Segment`, `nodeTopology.sync`).
+//!
+//! The Go controller is event/queue driven. This port keeps its *decisions*
+//! (which `(topology segment, StorageClass)` pairs get an object, when an
+//! object is created / updated / deleted, ownership and labels) as one
+//! level-triggered `reconcile` pass over `Storage`; wiring it into a run loop
+//! is tracked separately.
+
+// Not yet driven by a run loop; wiring is tracked in #3219.
+#![allow(dead_code)]
+
+use rusternetes_common::quantity::{Format, Quantity};
+use rusternetes_common::resources::csi::{CSINode, CSIStorageCapacity};
+use rusternetes_common::resources::volume::LabelSelector;
+use rusternetes_common::resources::volume::{NodeSelectorTerm, StorageClass, VolumeBindingMode};
+use rusternetes_common::resources::Node;
+use rusternetes_common::types::{ObjectMeta, OwnerReference, TypeMeta};
+use rusternetes_common::{Error, Result};
+use rusternetes_csi::controller_client::CsiControllerClient;
+use rusternetes_csi::proto::{GetCapacityRequest, GetCapacityResponse, Topology};
+use rusternetes_storage::{build_key, build_prefix, Storage};
+use std::cmp::Ordering;
+use std::collections::HashMap;
+
+/// `DriverNameLabel` (capacity.go:51).
+pub const DRIVER_NAME_LABEL: &str = "csi.storage.k8s.io/drivername";
+/// `ManagedByLabel` (capacity.go:52).
+pub const MANAGED_BY_LABEL: &str = "csi.storage.k8s.io/managed-by";
+
+/// `topology.SegmentEntry`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SegmentEntry {
+    pub key: String,
+    pub value: String,
+}
+
+/// `topology.Segment`: entries sorted by key, keys unique.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct Segment(Vec<SegmentEntry>);
+
+impl Segment {
+    /// `sort.Sort(&segment)` after building from entries.
+    pub fn from_entries(mut entries: Vec<SegmentEntry>) -> Self {
+        entries.sort_by(|a, b| (&a.key, &a.value).cmp(&(&b.key, &b.value)));
+        Segment(entries)
+    }
+
+    pub fn entries(&self) -> &[SegmentEntry] {
+        &self.0
+    }
+
+    /// `Segment.Compare` (topology.go:57-71): fewer entries is smaller, then
+    /// entry by entry (key, then value).
+    ///
+    /// ```text
+    /// if len(s) < len(other) { return -1 }
+    /// if len(s) > len(other) { return 1 }
+    /// for i := range s { cmp := s[i].Compare(other[i]); if cmp != 0 { return cmp } }
+    /// ```
+    pub fn compare(&self, other: &Segment) -> Ordering {
+        self.0.len().cmp(&other.0.len()).then_with(|| {
+            self.0
+                .iter()
+                .zip(&other.0)
+                .map(|(a, b)| (&a.key, &a.value).cmp(&(&b.key, &b.value)))
+                .find(|o| *o != Ordering::Equal)
+                .unwrap_or(Ordering::Equal)
+        })
+    }
+
+    /// `Segment.GetLabelMap` (topology.go:98-109). A Rust `Segment` is never
+    /// the Go nil segment, so this is always the (possibly empty) map.
+    pub fn label_map(&self) -> HashMap<String, String> {
+        self.0
+            .iter()
+            .map(|e| (e.key.clone(), e.value.clone()))
+            .collect()
+    }
+
+    /// `Segment.GetLabelSelector` (topology.go:91-96): `MatchLabels` only.
+    pub fn label_selector(&self) -> LabelSelector {
+        LabelSelector {
+            match_labels: Some(self.label_map()),
+            match_expressions: None,
+        }
+    }
+}
+
+/// `termToSegment` (capacity.go:458-478).
+pub fn term_to_segment(term: &NodeSelectorTerm) -> std::result::Result<Segment, String> {
+    if term.match_fields.as_ref().is_some_and(|f| !f.is_empty()) {
+        return Err(format!("MatchFields not empty: {:?}", term.match_fields));
+    }
+    let mut entries = Vec::new();
+    for m in term.match_expressions.iter().flatten() {
+        if m.operator != "In" {
+            return Err(format!("unexpected operator: {}", m.operator));
+        }
+        let values = m.values.as_deref().unwrap_or_default();
+        if values.len() != 1 {
+            return Err(format!("need exactly one label value, got: {values:?}"));
+        }
+        entries.push(SegmentEntry {
+            key: m.key.clone(),
+            value: values[0].clone(),
+        });
+    }
+    Ok(Segment::from_entries(entries))
+}
+
+/// `nodeTopology.sync` (nodes.go:268-341), minus the callback diffing: one
+/// segment per distinct label tuple over the nodes the driver runs on.
+/// `driverTopologyKeys` (nodes.go:197-208) is `None` only when the driver is
+/// absent from the CSINode; present without keys it is the empty segment.
+pub fn discover_segments(csi_nodes: &[CSINode], nodes: &[Node], driver_name: &str) -> Vec<Segment> {
+    let mut segments: Vec<Segment> = Vec::new();
+    'node: for csi_node in csi_nodes {
+        let Some(driver) = csi_node.spec.drivers.iter().find(|d| d.name == driver_name) else {
+            // Driver not running on node, ignore it.
+            continue;
+        };
+        let Some(node) = nodes
+            .iter()
+            .find(|n| n.metadata.name == csi_node.metadata.name)
+        else {
+            // Obsolete CSINode object? Ignore it.
+            continue;
+        };
+        let mut keys = driver.topology_keys.clone().unwrap_or_default();
+        keys.sort();
+        let mut entries = Vec::new();
+        for key in keys {
+            let Some(value) = node.metadata.labels.as_ref().and_then(|l| l.get(&key)) else {
+                // Kubelet recorded the key in CSINode but the Node label is
+                // not there yet: ignore the node until the node update.
+                continue 'node;
+            };
+            entries.push(SegmentEntry {
+                key,
+                value: value.clone(),
+            });
+        }
+        let new_segment = Segment::from_entries(entries);
+        if !segments
+            .iter()
+            .any(|s| s.compare(&new_segment) == Ordering::Equal)
+        {
+            segments.push(new_segment);
+        }
+    }
+    segments
+}
+
+/// `CSICapacityClient` (capacity.go:136-138).
+#[allow(async_fn_in_trait)]
+pub trait CapacityClient {
+    async fn get_capacity(
+        &self,
+        req: GetCapacityRequest,
+    ) -> std::result::Result<GetCapacityResponse, String>;
+}
+
+impl CapacityClient for CsiControllerClient {
+    async fn get_capacity(
+        &self,
+        req: GetCapacityRequest,
+    ) -> std::result::Result<GetCapacityResponse, String> {
+        self.get_capacity_response(req)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// The `Controller` fields that decide what gets published.
+pub struct CapacityController<'a, S: Storage, C: CapacityClient> {
+    pub storage: &'a S,
+    pub client: &'a C,
+    pub driver_name: String,
+    pub owner: Option<OwnerReference>,
+    pub managed_by_id: String,
+    pub owner_namespace: String,
+    pub immediate_binding: bool,
+}
+
+/// `WorkItem` (capacity.go:96-99) with the StorageClass resolved.
+struct WorkItem<'s> {
+    segment: &'s Segment,
+    sc: &'s StorageClass,
+}
+
+impl WorkItem<'_> {
+    /// `WorkItem.equals` (capacity.go:101-104).
+    fn equals(&self, c: &CSIStorageCapacity) -> bool {
+        c.storage_class_name == self.sc.metadata.name
+            && c.node_topology.as_ref().is_some_and(|t| {
+                t.match_labels.as_ref() == Some(&self.segment.label_map())
+                    && t.match_expressions.as_ref().is_none_or(|e| e.is_empty())
+            })
+    }
+}
+
+/// `Quantity.Value()` of the stored string; `None` when unparseable.
+fn quantity_value(q: &str) -> Option<i128> {
+    Quantity::parse(q).ok().map(|q| q.value())
+}
+
+/// `sizesAreEqual` (capacity.go:841-849).
+fn sizes_are_equal(expected: Option<&str>, actual: Option<&str>) -> bool {
+    match (expected, actual) {
+        (None, None) => true,
+        (Some(a), Some(b)) => quantity_value(a).is_some() && quantity_value(a) == quantity_value(b),
+        _ => false,
+    }
+}
+
+/// `resource.NewQuantity(v, resource.BinarySI)` rendered for the wire.
+fn binary_si(v: i64) -> String {
+    Quantity::from_value(v, Format::BinarySI).canonical_string()
+}
+
+impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
+    /// `isManaged` (capacity.go:828-831).
+    fn is_managed(&self, c: &CSIStorageCapacity) -> bool {
+        c.metadata.labels.as_ref().is_some_and(|l| {
+            l.get(DRIVER_NAME_LABEL) == Some(&self.driver_name)
+                && l.get(MANAGED_BY_LABEL) == Some(&self.managed_by_id)
+        })
+    }
+
+    /// `isOwnedByUs` (capacity.go:817-824): a *controller* reference with our UID.
+    fn is_owned_by_us(&self, c: &CSIStorageCapacity) -> bool {
+        let Some(owner) = &self.owner else {
+            return false;
+        };
+        c.metadata
+            .owner_references
+            .iter()
+            .flatten()
+            .any(|o| o.controller == Some(true) && o.uid == owner.uid)
+    }
+
+    /// One pass of `onTopologyChanges` (:365-391) + `onCAddOrUpdate`
+    /// (:539-587) + `syncCapacity` (:586-715): publish, update and delete
+    /// objects until they match `segments` x the driver's StorageClasses.
+    pub async fn reconcile(&self, segments: &[Segment]) -> Result<()> {
+        let classes: Vec<StorageClass> = self
+            .storage
+            .list(&build_prefix("storageclasses", None))
+            .await?;
+        let mut items = Vec::new();
+        for sc in &classes {
+            if sc.provisioner != self.driver_name {
+                continue;
+            }
+            // :379-381
+            if !self.immediate_binding
+                && sc.volume_binding_mode == Some(VolumeBindingMode::Immediate)
+            {
+                continue;
+            }
+            for segment in segments {
+                items.push(WorkItem { segment, sc });
+            }
+        }
+
+        let existing: Vec<CSIStorageCapacity> = self
+            .storage
+            .list(&build_prefix(
+                "csistoragecapacities",
+                Some(&self.owner_namespace),
+            ))
+            .await?;
+        // Match each managed object to the first item it fits; foreign objects
+        // are ignored (:547-562) and everything else is obsolete or a
+        // duplicate and is deleted (:582-585).
+        let mut matched: Vec<Option<CSIStorageCapacity>> = vec![None; items.len()];
+        for c in existing {
+            if !self.is_managed(&c) {
+                continue;
+            }
+            match items
+                .iter()
+                .enumerate()
+                .find(|(i, it)| matched[*i].is_none() && it.equals(&c))
+            {
+                Some((i, _)) => matched[i] = Some(c),
+                None => self.delete_capacity(&c).await?,
+            }
+        }
+
+        let mut first_err = None;
+        for (item, current) in items.iter().zip(matched) {
+            if let Err(e) = self.sync_capacity(item, current).await {
+                first_err.get_or_insert(e);
+            }
+        }
+        first_err.map_or(Ok(()), Err)
+    }
+
+    /// `syncCapacity` (:586-715).
+    async fn sync_capacity(
+        &self,
+        item: &WorkItem<'_>,
+        current: Option<CSIStorageCapacity>,
+    ) -> Result<()> {
+        // :599-604 — the assumption is that the capacity is independent of the
+        // capabilities, hence no VolumeCapabilities.
+        let req = GetCapacityRequest {
+            parameters: item.sc.parameters.clone().unwrap_or_default(),
+            volume_capabilities: Vec::new(),
+            accessible_topology: Some(Topology {
+                segments: item.segment.label_map(),
+            }),
+        };
+        let resp = self.client.get_capacity(req).await.map_err(|e| {
+            Error::Internal(format!(
+                "CSI GetCapacity for {}/{:?}: {e}",
+                item.sc.metadata.name,
+                item.segment.entries()
+            ))
+        })?;
+        let quantity = binary_si(resp.available_capacity);
+        let maximum_volume_size = resp.maximum_volume_size.map(binary_si);
+
+        match current {
+            None => {
+                let obj = self.new_capacity(item, quantity, maximum_volume_size);
+                let name = obj.metadata.name.clone();
+                self.storage
+                    .create(
+                        &build_key("csistoragecapacities", Some(&self.owner_namespace), &name),
+                        &obj,
+                    )
+                    .await?;
+            }
+            Some(c)
+                if sizes_are_equal(c.capacity.as_deref(), Some(&quantity))
+                    && sizes_are_equal(
+                        c.maximum_volume_size.as_deref(),
+                        maximum_volume_size.as_deref(),
+                    )
+                    && (self.owner.is_none() || self.is_owned_by_us(&c)) => {}
+            Some(mut c) => {
+                c.capacity = Some(quantity);
+                c.maximum_volume_size = maximum_volume_size;
+                if let Some(owner) = &self.owner {
+                    if !self.is_owned_by_us(&c) {
+                        c.metadata
+                            .owner_references
+                            .get_or_insert_with(Vec::new)
+                            .push(owner.clone());
+                    }
+                }
+                self.storage
+                    .update(
+                        &build_key(
+                            "csistoragecapacities",
+                            Some(&self.owner_namespace),
+                            &c.metadata.name,
+                        ),
+                        &c,
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The create path of `syncCapacity` (:621-640): a brand-new object. Kept
+    /// apart from the update path, which must write a clone of the stored
+    /// object (upstream's `capacity.DeepCopy()`, :661) so the PUT carries the
+    /// stored uid / resourceVersion.
+    fn new_capacity(
+        &self,
+        item: &WorkItem<'_>,
+        quantity: String,
+        maximum_volume_size: Option<String>,
+    ) -> CSIStorageCapacity {
+        let mut labels = HashMap::new();
+        labels.insert(DRIVER_NAME_LABEL.to_string(), self.driver_name.clone());
+        labels.insert(MANAGED_BY_LABEL.to_string(), self.managed_by_id.clone());
+        // `GenerateName: "csisc-"`; the API server fills the suffix on
+        // the HTTP path, direct storage must do it itself.
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let name = format!("csisc-{}", &suffix[..5]);
+        let mut metadata = ObjectMeta::new(name.clone())
+            .with_namespace(&self.owner_namespace)
+            .with_labels(labels);
+        metadata.generate_name = Some("csisc-".to_string());
+        if let Some(owner) = &self.owner {
+            metadata.owner_references = Some(vec![owner.clone()]);
+        }
+        CSIStorageCapacity {
+            type_meta: TypeMeta {
+                kind: "CSIStorageCapacity".to_string(),
+                api_version: "storage.k8s.io/v1".to_string(),
+            },
+            metadata,
+            storage_class_name: item.sc.metadata.name.clone(),
+            capacity: Some(quantity),
+            maximum_volume_size,
+            node_topology: Some(item.segment.label_selector()),
+        }
+    }
+
+    /// `deleteCapacity` (:717-725): NotFound is success.
+    async fn delete_capacity(&self, c: &CSIStorageCapacity) -> Result<()> {
+        match self
+            .storage
+            .delete(&build_key(
+                "csistoragecapacities",
+                Some(&self.owner_namespace),
+                &c.metadata.name,
+            ))
+            .await
+        {
+            Err(Error::NotFound(_)) => Ok(()),
+            r => r,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusternetes_common::resources::csi::{CSINodeDriver, CSINodeSpec};
+    use rusternetes_common::resources::volume::{
+        NodeSelectorRequirement, StorageClass, VolumeBindingMode,
+    };
+    use rusternetes_common::types::{ObjectMeta, TypeMeta};
+    use rusternetes_storage::build_key;
+    use rusternetes_storage::memory::MemoryStorage;
+    use std::sync::Mutex;
+
+    const DRIVER: &str = "my-csi-driver";
+    const NS: &str = "kube-system";
+    const MANAGED: &str = "instance-1";
+
+    fn seg(pairs: &[(&str, &str)]) -> Segment {
+        Segment::from_entries(
+            pairs
+                .iter()
+                .map(|(k, v)| SegmentEntry {
+                    key: k.to_string(),
+                    value: v.to_string(),
+                })
+                .collect(),
+        )
+    }
+
+    fn req(key: &str, op: &str, vals: &[&str]) -> NodeSelectorRequirement {
+        NodeSelectorRequirement {
+            key: key.into(),
+            operator: op.into(),
+            values: Some(vals.iter().map(|v| v.to_string()).collect()),
+        }
+    }
+
+    // ---- TestTermToSegment (capacity_test.go:1686-1797) ----
+
+    #[test]
+    fn term_to_segment_rejects_match_fields() {
+        let t = NodeSelectorTerm {
+            match_expressions: None,
+            match_fields: Some(vec![req("name", "In", &["worker-1"])]),
+        };
+        assert!(term_to_segment(&t).is_err());
+    }
+
+    #[test]
+    fn term_to_segment_rejects_non_in_operator_and_multi_values() {
+        let t = |r| NodeSelectorTerm {
+            match_expressions: Some(vec![r]),
+            match_fields: None,
+        };
+        assert!(term_to_segment(&t(req("segment", "NotIn", &["a"]))).is_err());
+        assert!(term_to_segment(&t(req("segment", "In", &["a", "b"]))).is_err());
+    }
+
+    #[test]
+    fn term_to_segment_sorts_entries() {
+        let t = NodeSelectorTerm {
+            match_expressions: Some(vec![
+                req("zone", "In", &["X"]),
+                req("segment", "In", &["a"]),
+            ]),
+            match_fields: None,
+        };
+        assert_eq!(
+            term_to_segment(&t).unwrap(),
+            seg(&[("segment", "a"), ("zone", "X")])
+        );
+    }
+
+    // ---- Segment ----
+
+    #[test]
+    fn segment_compare_is_length_first_then_entrywise() {
+        // topology.go:57-71: fewer keys is smaller before any value is looked at.
+        let short = seg(&[("z", "9")]);
+        let long = seg(&[("a", "1"), ("b", "1")]);
+        assert_eq!(short.compare(&long), Ordering::Less);
+        assert_eq!(long.compare(&short), Ordering::Greater);
+        assert_eq!(long.compare(&long.clone()), Ordering::Equal);
+        assert_eq!(
+            seg(&[("a", "1")]).compare(&seg(&[("a", "2")])),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn segment_label_selector_is_match_labels_only() {
+        let s = seg(&[("a", "1"), ("b", "2")]);
+        let sel = s.label_selector();
+        assert_eq!(sel.match_labels.unwrap(), s.label_map());
+        assert!(sel.match_expressions.is_none());
+        assert_eq!(s.label_map().len(), 2);
+    }
+
+    // ---- nodeTopology.sync (nodes_test.go TestNodeTopology) ----
+
+    fn csi_node(name: &str, driver: &str, keys: Option<Vec<&str>>) -> CSINode {
+        CSINode {
+            type_meta: TypeMeta::default(),
+            metadata: ObjectMeta::new(name),
+            spec: CSINodeSpec {
+                drivers: vec![CSINodeDriver {
+                    name: driver.into(),
+                    node_id: name.into(),
+                    topology_keys: keys.map(|k| k.into_iter().map(String::from).collect()),
+                    allocatable: None,
+                }],
+            },
+        }
+    }
+
+    fn node(name: &str, labels: &[(&str, &str)]) -> Node {
+        let mut n = Node::new(name);
+        n.metadata.labels = Some(
+            labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        );
+        n
+    }
+
+    #[test]
+    fn discover_segments_dedups_and_skips_other_drivers_and_missing_labels() {
+        let csi_nodes = vec![
+            csi_node("n1", DRIVER, Some(vec!["B", "A"])),
+            csi_node("n2", DRIVER, Some(vec!["A", "B"])),
+            csi_node("n3", "other-driver", Some(vec!["A", "B"])),
+            // label B not on the Node yet: ignored until the node update.
+            csi_node("n4", DRIVER, Some(vec!["A", "B"])),
+            // CSINode without a Node: obsolete, ignored.
+            csi_node("n5", DRIVER, Some(vec!["A", "B"])),
+            // driver without topology keys: the empty segment (matches all nodes).
+            csi_node("n6", DRIVER, None),
+        ];
+        let nodes = vec![
+            node("n1", &[("A", "x"), ("B", "y")]),
+            node("n2", &[("A", "x"), ("B", "y")]),
+            node("n3", &[("A", "x"), ("B", "y")]),
+            node("n4", &[("A", "x")]),
+            node("n6", &[]),
+        ];
+        let mut got = discover_segments(&csi_nodes, &nodes, DRIVER);
+        got.sort_by(|a, b| a.compare(b));
+        assert_eq!(
+            got,
+            vec![Segment::default(), seg(&[("A", "x"), ("B", "y")])]
+        );
+    }
+
+    // ---- capacity reconcile (capacity_test.go TestCapacityController) ----
+
+    #[derive(Default)]
+    struct FakeClient {
+        capacity: Mutex<i64>,
+        max: Mutex<Option<i64>>,
+        requests: Mutex<Vec<GetCapacityRequest>>,
+    }
+
+    impl CapacityClient for FakeClient {
+        async fn get_capacity(
+            &self,
+            req: GetCapacityRequest,
+        ) -> std::result::Result<GetCapacityResponse, String> {
+            self.requests.lock().unwrap().push(req);
+            Ok(GetCapacityResponse {
+                available_capacity: *self.capacity.lock().unwrap(),
+                maximum_volume_size: *self.max.lock().unwrap(),
+                ..Default::default()
+            })
+        }
+    }
+
+    fn sc(name: &str, provisioner: &str, mode: Option<VolumeBindingMode>) -> StorageClass {
+        StorageClass {
+            type_meta: TypeMeta::default(),
+            metadata: ObjectMeta::new(name),
+            provisioner: provisioner.into(),
+            parameters: Some([("foo".to_string(), "bar".to_string())].into()),
+            reclaim_policy: None,
+            volume_binding_mode: mode,
+            allowed_topologies: None,
+            allow_volume_expansion: None,
+            mount_options: None,
+        }
+    }
+
+    fn owner() -> OwnerReference {
+        let mut o = OwnerReference::new("apps/v1", "Deployment", "csi-ctrl", "owner-uid");
+        o.controller = Some(true);
+        o
+    }
+
+    async fn put_sc(st: &MemoryStorage, s: StorageClass) {
+        st.create(&build_key("storageclasses", None, &s.metadata.name), &s)
+            .await
+            .unwrap();
+    }
+
+    async fn list_caps(st: &MemoryStorage) -> Vec<CSIStorageCapacity> {
+        st.list::<CSIStorageCapacity>(&format!("/registry/csistoragecapacities/{NS}/"))
+            .await
+            .unwrap()
+    }
+
+    fn ctl<'a>(
+        st: &'a MemoryStorage,
+        cl: &'a FakeClient,
+        immediate: bool,
+    ) -> CapacityController<'a, MemoryStorage, FakeClient> {
+        CapacityController {
+            storage: st,
+            client: cl,
+            driver_name: DRIVER.into(),
+            owner: Some(owner()),
+            managed_by_id: MANAGED.into(),
+            owner_namespace: NS.into(),
+            immediate_binding: immediate,
+        }
+    }
+
+    #[tokio::test]
+    async fn publishes_one_object_per_segment_and_class_with_labels_owner_and_sizes() {
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        *cl.capacity.lock().unwrap() = 1 << 30;
+        *cl.max.lock().unwrap() = Some(1 << 20);
+        put_sc(&st, sc("late-sc", DRIVER, None)).await;
+        put_sc(&st, sc("foreign-sc", "other-driver", None)).await;
+        let segs = vec![seg(&[("zone", "a")]), seg(&[("zone", "b")])];
+        ctl(&st, &cl, false).reconcile(&segs).await.unwrap();
+
+        let caps = list_caps(&st).await;
+        assert_eq!(caps.len(), 2);
+        for c in &caps {
+            assert!(c.metadata.name.starts_with("csisc-"));
+            assert_eq!(c.metadata.namespace.as_deref(), Some(NS));
+            assert_eq!(c.storage_class_name, "late-sc");
+            assert_eq!(c.capacity.as_deref(), Some("1Gi"));
+            assert_eq!(c.maximum_volume_size.as_deref(), Some("1Mi"));
+            let l = c.metadata.labels.as_ref().unwrap();
+            assert_eq!(l[DRIVER_NAME_LABEL], DRIVER);
+            assert_eq!(l[MANAGED_BY_LABEL], MANAGED);
+            let o = &c.metadata.owner_references.as_ref().unwrap()[0];
+            assert_eq!(o.uid, "owner-uid");
+        }
+        // capacity.go:599-604: the request carries the class parameters and
+        // the segment as AccessibleTopology, and no VolumeCapabilities.
+        let reqs = cl.requests.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        assert!(reqs.iter().all(|r| r.parameters["foo"] == "bar"
+            && r.volume_capabilities.is_empty()
+            && r.accessible_topology.is_some()));
+    }
+
+    #[tokio::test]
+    async fn unchanged_object_is_not_rewritten_and_changed_capacity_is_updated() {
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        *cl.capacity.lock().unwrap() = 100;
+        put_sc(&st, sc("late-sc", DRIVER, None)).await;
+        let segs = vec![seg(&[("zone", "a")])];
+        let c = ctl(&st, &cl, false);
+        c.reconcile(&segs).await.unwrap();
+        let first = list_caps(&st).await.remove(0);
+
+        c.reconcile(&segs).await.unwrap();
+        let same = list_caps(&st).await.remove(0);
+        assert_eq!(
+            first.metadata.resource_version,
+            same.metadata.resource_version
+        );
+
+        *cl.capacity.lock().unwrap() = 200;
+        c.reconcile(&segs).await.unwrap();
+        let caps = list_caps(&st).await;
+        assert_eq!(caps.len(), 1, "update, not a second object");
+        assert_eq!(caps[0].metadata.name, first.metadata.name);
+        assert_eq!(caps[0].capacity.as_deref(), Some("200"));
+    }
+
+    #[tokio::test]
+    async fn update_keeps_the_stored_identity() {
+        // The API server's Store turns a non-empty metadata.uid on a PUT into
+        // a UID precondition (rest/update.go:188-203): the update must carry
+        // the stored uid and creationTimestamp, as upstream's DeepCopy does.
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        put_sc(&st, sc("late-sc", DRIVER, None)).await;
+        let segs = vec![seg(&[("zone", "a")])];
+        let c = ctl(&st, &cl, false);
+        c.reconcile(&segs).await.unwrap();
+        let before = list_caps(&st).await.remove(0);
+        *cl.capacity.lock().unwrap() = 7;
+        c.reconcile(&segs).await.unwrap();
+        let after = list_caps(&st).await.remove(0);
+        assert_eq!(after.capacity.as_deref(), Some("7"));
+        assert_eq!(after.metadata.uid, before.metadata.uid);
+        assert_eq!(
+            after.metadata.creation_timestamp,
+            before.metadata.creation_timestamp
+        );
+    }
+
+    #[tokio::test]
+    async fn max_volume_size_change_and_missing_owner_trigger_update() {
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        *cl.capacity.lock().unwrap() = 100;
+        put_sc(&st, sc("late-sc", DRIVER, None)).await;
+        let segs = vec![seg(&[])];
+        let c = ctl(&st, &cl, false);
+        c.reconcile(&segs).await.unwrap();
+
+        // capacity.go:643-650: MaximumVolumeSize differs -> update.
+        *cl.max.lock().unwrap() = Some(10);
+        c.reconcile(&segs).await.unwrap();
+        assert_eq!(
+            list_caps(&st).await[0].maximum_volume_size.as_deref(),
+            Some("10")
+        );
+
+        // capacity.go:641 / 660-662: owner reference stripped -> re-added.
+        let mut obj = list_caps(&st).await.remove(0);
+        obj.metadata.owner_references = None;
+        st.update(
+            &build_key("csistoragecapacities", Some(NS), &obj.metadata.name),
+            &obj,
+        )
+        .await
+        .unwrap();
+        c.reconcile(&segs).await.unwrap();
+        let o = list_caps(&st)
+            .await
+            .remove(0)
+            .metadata
+            .owner_references
+            .unwrap();
+        assert_eq!(o.len(), 1);
+        assert_eq!(o[0].uid, "owner-uid");
+    }
+
+    #[tokio::test]
+    async fn obsolete_duplicate_and_unmanaged_objects() {
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        *cl.capacity.lock().unwrap() = 5;
+        put_sc(&st, sc("late-sc", DRIVER, None)).await;
+        let c = ctl(&st, &cl, false);
+        let both = vec![seg(&[("zone", "a")]), seg(&[("zone", "b")])];
+        c.reconcile(&both).await.unwrap();
+        assert_eq!(list_caps(&st).await.len(), 2);
+
+        // A foreign object (other managed-by) must survive (capacity.go:782-786).
+        let mut foreign = list_caps(&st).await.remove(0);
+        foreign.metadata.name = "foreign".into();
+        foreign.metadata.uid = "foreign-uid".into();
+        foreign
+            .metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert(MANAGED_BY_LABEL.into(), "someone-else".into());
+        st.create(
+            &build_key("csistoragecapacities", Some(NS), "foreign"),
+            &foreign,
+        )
+        .await
+        .unwrap();
+        // A duplicate of a managed one: "should never happen, but ... clean that up".
+        let mut dup = list_caps(&st)
+            .await
+            .into_iter()
+            .find(|x| x.metadata.name != "foreign")
+            .unwrap();
+        dup.metadata.name = "dup".into();
+        dup.metadata.uid = "dup-uid".into();
+        st.create(&build_key("csistoragecapacities", Some(NS), "dup"), &dup)
+            .await
+            .unwrap();
+
+        // Segment b disappears -> its object goes; the duplicate goes too.
+        c.reconcile(&both[..1]).await.unwrap();
+        let names: Vec<_> = list_caps(&st)
+            .await
+            .into_iter()
+            .map(|c| c.metadata.name)
+            .collect();
+        assert!(names.contains(&"foreign".to_string()));
+        assert_eq!(
+            names.len(),
+            2,
+            "one managed object + the foreign one: {names:?}"
+        );
+
+        // Storage class gone -> everything managed goes.
+        st.delete(&build_key("storageclasses", None, "late-sc"))
+            .await
+            .unwrap();
+        c.reconcile(&both[..1]).await.unwrap();
+        let names: Vec<_> = list_caps(&st)
+            .await
+            .into_iter()
+            .map(|c| c.metadata.name)
+            .collect();
+        assert_eq!(names, vec!["foreign".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn immediate_binding_classes_are_skipped_unless_enabled() {
+        // capacity.go:379-381 (onTopologyChanges) and :412-415 (onSCAddOrUpdate).
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        put_sc(&st, sc("imm", DRIVER, Some(VolumeBindingMode::Immediate))).await;
+        put_sc(
+            &st,
+            sc(
+                "late",
+                DRIVER,
+                Some(VolumeBindingMode::WaitForFirstConsumer),
+            ),
+        )
+        .await;
+        let segs = vec![seg(&[("zone", "a")])];
+        ctl(&st, &cl, false).reconcile(&segs).await.unwrap();
+        let classes: Vec<_> = list_caps(&st)
+            .await
+            .into_iter()
+            .map(|c| c.storage_class_name)
+            .collect();
+        assert_eq!(classes, vec!["late".to_string()]);
+        ctl(&st, &cl, true).reconcile(&segs).await.unwrap();
+        assert_eq!(list_caps(&st).await.len(), 2);
+    }
+}
