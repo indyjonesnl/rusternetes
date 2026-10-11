@@ -35,6 +35,11 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[command(about = "Rusternetes — all-in-one Kubernetes in a single binary")]
 #[command(version)]
 struct Args {
+    /// Comma-separated `Gate=bool` pairs, e.g. `StorageCapacityScoring=true`
+    /// (upstream `--feature-gates`, component-base featuregate `Set`).
+    #[arg(long, default_value = "")]
+    feature_gates: String,
+
     /// Storage backend: "sqlite", "etcd", or "redis"
     #[arg(long, default_value = "sqlite")]
     storage_backend: String,
@@ -215,8 +220,17 @@ fn main() -> Result<()> {
         .block_on(async_main())
 }
 
+/// Apply `--feature-gates` process-wide. Port of `featureGate.Set`
+/// (staging/src/k8s.io/component-base/featuregate/feature_gate.go:340-359).
+fn apply_feature_gates(args: &Args) -> Result<()> {
+    rusternetes_common::feature_gates::set_from_str(&args.feature_gates)
+        .map_err(|e| anyhow::anyhow!("invalid --feature-gates: {e}"))?;
+    Ok(())
+}
+
 async fn async_main() -> Result<()> {
     let args = Args::parse();
+    apply_feature_gates(&args)?;
 
     rusternetes_common::tracing::init_basic_tracing("rusternetes", &args.log_level)?;
 
@@ -524,6 +538,10 @@ mod feature_gates_flag_tests {
     fn feature_gates_flag_rejects_unknown_gate() {
         reset_to_defaults();
         let err = apply_feature_gates(&parse("--feature-gates=fooBarBaz=true")).unwrap_err();
-        assert!(err.to_string().contains("unrecognized feature gate: fooBarBaz"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("unrecognized feature gate: fooBarBaz"),
+            "{err}"
+        );
     }
 }
