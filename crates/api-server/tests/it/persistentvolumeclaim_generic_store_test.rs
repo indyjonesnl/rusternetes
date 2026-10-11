@@ -102,6 +102,32 @@ async fn a_data_source_is_mirrored_into_data_source_ref() {
     );
 }
 
+/// `DropDisabledFields` (util.go:37-58): with `CrossNamespaceVolumeDataSource`
+/// off (the default) a cross-namespace `dataSourceRef` is dropped on create;
+/// with it on (#3149) it is kept.
+#[tokio::test]
+async fn cross_namespace_data_source_ref_follows_the_gate() {
+    use rusternetes_common::feature_gates::{with_feature, Feature};
+    let mut body = pvc("c-xns", "1Gi");
+    body["spec"]["dataSourceRef"] = json!({
+        "apiGroup": "snapshot.storage.k8s.io", "kind": "VolumeSnapshot",
+        "name": "snap", "namespace": "other"
+    });
+
+    {
+        let _g = with_feature(Feature::CrossNamespaceVolumeDataSource, false);
+        let api = TestApiServer::new();
+        let out = create(&api, &body).await;
+        assert!(out["spec"].get("dataSourceRef").is_none(), "{out}");
+    }
+    {
+        let _g = with_feature(Feature::CrossNamespaceVolumeDataSource, true);
+        let api = TestApiServer::new();
+        let out = create(&api, &body).await;
+        assert_eq!(out["spec"]["dataSourceRef"]["namespace"], "other", "{out}");
+    }
+}
+
 /// `GetWarningsForPersistentVolumeClaimSpec` (util.go:214-236).
 #[tokio::test]
 async fn a_fractional_byte_request_warns() {

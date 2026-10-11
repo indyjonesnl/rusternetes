@@ -870,6 +870,19 @@ fn fixtures() -> Vec<Fixture> {
                 }
             }),
         ),
+        // ---- gateway.networking.k8s.io/v1beta1 ---------------------------
+        f(
+            "gateway.networking.k8s.io",
+            "v1beta1",
+            "referencegrants",
+            json!({
+                "metadata": { "name": "sweep-refgrant" },
+                "spec": {
+                    "from": [{ "group": "", "kind": "PersistentVolumeClaim", "namespace": NS }],
+                    "to": [{ "group": "snapshot.storage.k8s.io", "kind": "VolumeSnapshot" }]
+                }
+            }),
+        ),
         // ---- scheduling.k8s.io/v1 ---------------------------------------
         f(
             "scheduling.k8s.io",

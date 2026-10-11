@@ -51,7 +51,11 @@ fn drop_disabled_fields(
         .and_then(|r| r.namespace.as_deref())
         .is_some_and(|ns| !ns.is_empty());
     let ref_in_use = old.is_some_and(|o| o.data_source_ref.is_some());
-    if cross_namespace && !ref_in_use {
+    if !rusternetes_common::feature_gates::enabled(
+        rusternetes_common::feature_gates::Feature::CrossNamespaceVolumeDataSource,
+    ) && cross_namespace
+        && !ref_in_use
+    {
         spec.data_source_ref = None;
     }
 }

@@ -525,6 +525,18 @@ pub async fn get_api_groups(
                 version: "v1".to_string(),
             },
         },
+        // gateway.networking.k8s.io API group (ReferenceGrant only)
+        APIGroup {
+            name: "gateway.networking.k8s.io".to_string(),
+            versions: vec![GroupVersionForDiscovery {
+                group_version: "gateway.networking.k8s.io/v1beta1".to_string(),
+                version: "v1beta1".to_string(),
+            }],
+            preferred_version: GroupVersionForDiscovery {
+                group_version: "gateway.networking.k8s.io/v1beta1".to_string(),
+                version: "v1beta1".to_string(),
+            },
+        },
         // scheduling.k8s.io API group
         APIGroup {
             name: "scheduling.k8s.io".to_string(),
@@ -910,6 +922,7 @@ fn get_api_group_names() -> Vec<(&'static str, &'static str)> {
         ("rbac.authorization.k8s.io", "v1"),
         ("storage.k8s.io", "v1"),
         ("snapshot.storage.k8s.io", "v1"),
+        ("gateway.networking.k8s.io", "v1beta1"),
         ("scheduling.k8s.io", "v1"),
         ("apiextensions.k8s.io", "v1"),
         ("admissionregistration.k8s.io", "v1"),
@@ -1763,6 +1776,15 @@ fn get_aggregated_resources_for_group_uncategorized(
                 vec![],
             ),
         ],
+        "gateway.networking.k8s.io" => vec![res_with_short(
+            "referencegrants",
+            "referencegrant",
+            "ReferenceGrant",
+            true,
+            all_verbs,
+            vec![],
+            Some(vec!["refgrant"]),
+        )],
         "metrics.k8s.io" => vec![
             res(
                 "nodes",
@@ -3819,6 +3841,45 @@ pub async fn get_snapshot_v1_resources() -> (StatusCode, Json<APIResourceList>) 
         kind: "APIResourceList".to_string(),
         api_version: "v1".to_string(),
         group_version: "snapshot.storage.k8s.io/v1".to_string(),
+        resources,
+    };
+
+    (StatusCode::OK, Json(resource_list))
+}
+
+/// GET /apis/gateway.networking.k8s.io/v1beta1
+/// The `ReferenceGrant` CRD of kubernetes-sigs/gateway-api
+/// (`config/crd/standard/gateway.networking.k8s.io_referencegrants.yaml`:
+/// namespaced, `shortNames: [refgrant]`, `categories: [gateway-api]`, no
+/// subresources).
+pub async fn get_gateway_v1beta1_resources() -> (StatusCode, Json<APIResourceList>) {
+    let resources = vec![APIResource {
+        name: "referencegrants".to_string(),
+        singular_name: "referencegrant".to_string(),
+        namespaced: true,
+        kind: "ReferenceGrant".to_string(),
+        verbs: [
+            "create",
+            "delete",
+            "deletecollection",
+            "get",
+            "list",
+            "patch",
+            "update",
+            "watch",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect(),
+        short_names: Some(vec!["refgrant".to_string()]),
+        categories: Some(vec!["gateway-api".to_string()]),
+        storage_version_hash: None,
+    }];
+
+    let resource_list = APIResourceList {
+        kind: "APIResourceList".to_string(),
+        api_version: "v1".to_string(),
+        group_version: "gateway.networking.k8s.io/v1beta1".to_string(),
         resources,
     };
 

@@ -216,7 +216,8 @@ pub use volume::{
     DeletionPolicy, ISCSIVolumeSource, NFSVolumeSource, PersistentVolume,
     PersistentVolumeAccessMode, PersistentVolumeClaim, PersistentVolumeClaimSpec,
     PersistentVolumeClaimStatus, PersistentVolumePhase, PersistentVolumeSpec,
-    PersistentVolumeStatus, StorageClass, TypedObjectReference, VolumeBindingMode, VolumeSnapshot,
+    PersistentVolumeStatus, ReferenceGrant, ReferenceGrantFrom, ReferenceGrantSpec,
+    ReferenceGrantTo, StorageClass, TypedObjectReference, VolumeBindingMode, VolumeSnapshot,
     VolumeSnapshotClass, VolumeSnapshotContent, VolumeSnapshotContentSpec,
     VolumeSnapshotContentStatus, VolumeSnapshotSource, VolumeSnapshotSpec, VolumeSnapshotStatus,
 };

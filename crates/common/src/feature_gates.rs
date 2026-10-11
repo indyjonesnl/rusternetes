@@ -201,6 +201,12 @@ pub enum Feature {
     /// Upstream gate `StorageCapacityScoring` (1.33 Alpha, off; `pkg/features/kube_features.go:1820-1822`).
     /// Enables the scheduler VolumeBinding Score extension point.
     StorageCapacityScoring,
+
+    /// Upstream gate `CrossNamespaceVolumeDataSource` (1.26 Alpha, off;
+    /// `pkg/features/kube_features.go:1223-1225`). When off, the PVC strategy
+    /// drops a cross-namespace `spec.dataSourceRef` unless the old claim already
+    /// had a `dataSourceRef` (`pkg/api/persistentvolumeclaim/util.go:37-58`).
+    CrossNamespaceVolumeDataSource,
 }
 
 impl Feature {
@@ -246,6 +252,7 @@ impl Feature {
             Feature::MutatingAdmissionPolicy => 36,
             Feature::DeploymentReplicaSetTerminatingReplicas => 37,
             Feature::StorageCapacityScoring => 38,
+            Feature::CrossNamespaceVolumeDataSource => 39,
         }
     }
 
@@ -328,6 +335,8 @@ impl Feature {
             Feature::DeploymentReplicaSetTerminatingReplicas => true,
             // 1.33 Alpha, off (pkg/features/kube_features.go:1820-1822)
             Feature::StorageCapacityScoring => false,
+            // 1.26 Alpha, off (pkg/features/kube_features.go:1223-1225)
+            Feature::CrossNamespaceVolumeDataSource => false,
         }
     }
 }
@@ -383,6 +392,7 @@ pub const ALL_FEATURES: &[Feature] = &[
     Feature::MutatingAdmissionPolicy,
     Feature::DeploymentReplicaSetTerminatingReplicas,
     Feature::StorageCapacityScoring,
+    Feature::CrossNamespaceVolumeDataSource,
 ];
 
 /// Total number of feature gates. Derived from [`ALL_FEATURES`].
@@ -436,6 +446,7 @@ static STATES: [AtomicBool; NUM_FEATURES] = [
     AtomicBool::new(Feature::MutatingAdmissionPolicy.default_enabled()),
     AtomicBool::new(Feature::DeploymentReplicaSetTerminatingReplicas.default_enabled()),
     AtomicBool::new(Feature::StorageCapacityScoring.default_enabled()),
+    AtomicBool::new(Feature::CrossNamespaceVolumeDataSource.default_enabled()),
 ];
 
 /// Returns whether `feature` is currently enabled in this process.
