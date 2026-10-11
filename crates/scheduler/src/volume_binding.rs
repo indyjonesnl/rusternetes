@@ -54,14 +54,14 @@ pub enum PreFilterOutcome {
 }
 
 #[derive(Clone)]
-#[allow(dead_code)] // read by AssumePodVolumes/BindPodVolumes (follow-up #3017 steps 2-3)
+
 pub struct BindingInfo {
     pub pv: PersistentVolume,
     pub pvc: PersistentVolumeClaim,
 }
 
 #[derive(Clone)]
-#[allow(dead_code)] // read by AssumePodVolumes/BindPodVolumes (follow-up #3017 steps 2-3)
+
 pub struct DynamicProvision {
     pub pvc: PersistentVolumeClaim,
     pub node_capacity: Option<CSIStorageCapacity>,
@@ -73,13 +73,13 @@ pub struct PodVolumes {
     pub dynamic_provisions: Vec<DynamicProvision>,
 }
 
-const ANN_SELECTED_NODE: &str = "volume.kubernetes.io/selected-node";
+pub(crate) const ANN_SELECTED_NODE: &str = "volume.kubernetes.io/selected-node";
 const ANN_BIND_COMPLETED: &str = "pv.kubernetes.io/bind-completed";
 const ANN_BETA_STORAGE_CLASS: &str = "volume.beta.kubernetes.io/storage-class";
 /// `volume.NotSupportedProvisioner` (pkg/volume/util/storageclass.go).
 const NOT_SUPPORTED_PROVISIONER: &str = "kubernetes.io/no-provisioner";
 
-fn pvc_key(pvc: &PersistentVolumeClaim) -> String {
+pub(crate) fn pvc_key(pvc: &PersistentVolumeClaim) -> String {
     format!(
         "{}/{}",
         pvc.metadata.namespace.as_deref().unwrap_or(""),
@@ -134,7 +134,10 @@ fn ephemeral_claim_name(pod: &Pod, vol_name: &str) -> String {
 
 /// `ephemeral.VolumeIsForPod` (`ephemeral.go:49-56`): the PVC must be in the
 /// pod's namespace and controlled (`metav1.IsControlledBy`) by the pod.
-fn ephemeral_volume_is_for_pod(pod: &Pod, pvc: &PersistentVolumeClaim) -> Result<(), String> {
+pub(crate) fn ephemeral_volume_is_for_pod(
+    pod: &Pod,
+    pvc: &PersistentVolumeClaim,
+) -> Result<(), String> {
     let controlled = pvc.metadata.namespace == pod.metadata.namespace
         && pvc.metadata.owner_references.as_ref().is_some_and(|refs| {
             refs.iter()
@@ -155,7 +158,7 @@ fn ephemeral_volume_is_for_pod(pod: &Pod, pvc: &PersistentVolumeClaim) -> Result
 
 /// The PVC name a pod volume refers to, and whether it is a generic ephemeral
 /// volume. `None` for volumes that do not use a PVC.
-fn volume_pvc_name(pod: &Pod, vol: &Volume) -> Option<(String, bool)> {
+pub(crate) fn volume_pvc_name(pod: &Pod, vol: &Volume) -> Option<(String, bool)> {
     if let Some(p) = vol.persistent_volume_claim.as_ref() {
         Some((p.claim_name.clone(), false))
     } else if vol.ephemeral.is_some() {
@@ -190,7 +193,7 @@ pub fn pod_references_pvcs(pod: &Pod) -> bool {
         .any(|v| v.persistent_volume_claim.is_some() || v.ephemeral.is_some())
 }
 
-fn pod_volumes(pod: &Pod) -> &[Volume] {
+pub(crate) fn pod_volumes(pod: &Pod) -> &[Volume] {
     pod.spec
         .as_ref()
         .and_then(|s| s.volumes.as_deref())
@@ -236,7 +239,7 @@ fn pod_has_pvcs(pod: &Pod, snap: &VolumeSnapshot) -> Result<bool, String> {
 }
 
 /// `isPVCFullyBound` (binder.go:775-777).
-fn is_pvc_fully_bound(pvc: &PersistentVolumeClaim) -> bool {
+pub(crate) fn is_pvc_fully_bound(pvc: &PersistentVolumeClaim) -> bool {
     pvc.spec
         .volume_name
         .as_deref()
@@ -348,7 +351,7 @@ fn check_pv_node_affinity(pv: &PersistentVolume, node: &Node) -> bool {
 }
 
 /// `IsVolumeBoundToClaim` (pv_helpers.go:159-169).
-fn is_volume_bound_to_claim(pv: &PersistentVolume, pvc: &PersistentVolumeClaim) -> bool {
+pub(crate) fn is_volume_bound_to_claim(pv: &PersistentVolume, pvc: &PersistentVolumeClaim) -> bool {
     let Some(cr) = pv.spec.claim_ref.as_ref() else {
         return false;
     };
