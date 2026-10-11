@@ -25,6 +25,67 @@ use std::sync::Mutex;
 /// Sort after construction for `compare`/`subset` to work.
 pub type TopologyTerm = Vec<(String, String)>;
 
+/// `VolumeIsAccessible` (topology.go:85-99): whether the volume's required
+/// node affinity is satisfied by a node whose labels are the topology
+/// segments the driver reported in `NodeGetInfo`. No topology, no affinity or
+/// no `required` selector means "all volumes accessible".
+///
+/// The match is `corev1helpers.MatchNodeSelectorTerms` against a Node that
+/// has only those labels: terms are OR'd; an empty term matches nothing;
+/// `matchFields` sees `metadata.name` as "" (the node has no name); a term
+/// with an invalid requirement does not match.
+pub fn volume_is_accessible(
+    affinity: Option<&VolumeNodeAffinity>,
+    node_topology: Option<&HashMap<String, String>>,
+) -> bool {
+    let (Some(labels), Some(required)) =
+        (node_topology, affinity.and_then(|a| a.required.as_ref()))
+    else {
+        return true;
+    };
+    required.node_selector_terms.iter().any(|term| {
+        let exprs = term.match_expressions.as_deref().unwrap_or(&[]);
+        let fields = term.match_fields.as_deref().unwrap_or(&[]);
+        if exprs.is_empty() && fields.is_empty() {
+            return false;
+        }
+        exprs
+            .iter()
+            .all(|r| requirement_matches(r, labels.get(&r.key).map(String::as_str)))
+            && fields
+                .iter()
+                .all(|r| requirement_matches(r, (r.key == "metadata.name").then_some("")))
+    })
+}
+
+/// One `NodeSelectorRequirement` as `labels.Selector` evaluates it
+/// (`NodeSelectorRequirementsAsSelector`, component-helpers
+/// `scheduling/corev1/nodeaffinity`).
+fn requirement_matches(r: &NodeSelectorRequirement, value: Option<&str>) -> bool {
+    let values = r.values.as_deref().unwrap_or(&[]);
+    match r.operator.as_str() {
+        "In" => !values.is_empty() && value.is_some_and(|v| values.iter().any(|x| x == v)),
+        "NotIn" => !values.is_empty() && !value.is_some_and(|v| values.iter().any(|x| x == v)),
+        "Exists" => values.is_empty() && value.is_some(),
+        "DoesNotExist" => values.is_empty() && value.is_none(),
+        "Gt" | "Lt" => {
+            let [bound] = values else { return false };
+            let Ok(bound) = bound.parse::<i64>() else {
+                return false;
+            };
+            let Some(Ok(v)) = value.map(str::parse::<i64>) else {
+                return false;
+            };
+            if r.operator == "Gt" {
+                v > bound
+            } else {
+                v < bound
+            }
+        }
+        _ => false,
+    }
+}
+
 /// `GenerateVolumeNodeAffinity` (topology.go:54-80). Map iteration order is
 /// random in Go; keys are sorted here so the PV is deterministic.
 pub fn generate_volume_node_affinity(accessible: &[Topology]) -> Option<VolumeNodeAffinity> {
@@ -1103,5 +1164,57 @@ mod tests {
         let reg = registered_topology_keys(&nodes, DRIVER);
         assert_eq!(reg.len(), 3);
         assert!(!reg.contains_key("d"));
+    }
+
+    fn affinity(terms: Vec<NodeSelectorTerm>) -> VolumeNodeAffinity {
+        VolumeNodeAffinity {
+            required: Some(NodeSelector {
+                node_selector_terms: terms,
+            }),
+        }
+    }
+
+    fn req_term(key: &str, op: &str, values: &[&str]) -> NodeSelectorTerm {
+        NodeSelectorTerm {
+            match_expressions: Some(vec![NodeSelectorRequirement {
+                key: key.into(),
+                operator: op.into(),
+                values: Some(values.iter().map(|v| v.to_string()).collect()),
+            }]),
+            match_fields: None,
+        }
+    }
+
+    /// `VolumeIsAccessible` (topology.go:85-99).
+    #[test]
+    fn volume_is_accessible_follows_match_node_selector_terms() {
+        let topo: HashMap<String, String> = [("zone".to_string(), "a".to_string())].into();
+        // No topology / no affinity / no required => accessible.
+        assert!(volume_is_accessible(
+            Some(&affinity(vec![req_term("zone", "In", &["b"])])),
+            None
+        ));
+        assert!(volume_is_accessible(None, Some(&topo)));
+        assert!(volume_is_accessible(
+            Some(&VolumeNodeAffinity { required: None }),
+            Some(&topo)
+        ));
+        let acc = |terms| volume_is_accessible(Some(&affinity(terms)), Some(&topo));
+        assert!(acc(vec![req_term("zone", "In", &["a"])]));
+        assert!(!acc(vec![req_term("zone", "In", &["b"])]));
+        // Terms are OR'd.
+        assert!(acc(vec![
+            req_term("zone", "In", &["b"]),
+            req_term("zone", "Exists", &[])
+        ]));
+        assert!(acc(vec![req_term("zone", "NotIn", &["b"])]));
+        assert!(!acc(vec![req_term("rack", "Exists", &[])]));
+        assert!(acc(vec![req_term("rack", "DoesNotExist", &[])]));
+        // An empty term matches nothing; no terms match nothing.
+        assert!(!acc(vec![NodeSelectorTerm {
+            match_expressions: None,
+            match_fields: None
+        }]));
+        assert!(!acc(vec![]));
     }
 }
