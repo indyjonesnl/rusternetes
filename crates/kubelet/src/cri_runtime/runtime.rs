@@ -375,6 +375,9 @@ pub struct CriContainerRuntime {
     resolv_conf: String,
     /// Node name, the `nodeRef` of upstream's DNS `Configurer` (node events).
     node_name: String,
+    /// Node IPs (upstream `Configurer.nodeIPs`) used for the localhost
+    /// nameserver fallback when `--resolv-conf` is empty (`dns.go:431-447`).
+    node_ips: Vec<String>,
     /// Node allocatable (`cpu`/`memory`/`ephemeral-storage`/`hugepages-*`),
     /// used to default unset resourceFieldRef LIMITS into downward-API env
     /// (upstream `MergeContainerResourceLimits`). Empty leaves such vars unset.
@@ -403,6 +406,7 @@ impl CriContainerRuntime {
             cluster_domain: "cluster.local".to_string(),
             resolv_conf: "/etc/resolv.conf".to_string(),
             node_name: String::new(),
+            node_ips: Vec::new(),
             node_allocatable: std::collections::HashMap::new(),
         })
     }
@@ -488,6 +492,13 @@ impl CriContainerRuntime {
     #[must_use]
     pub fn with_node_name(mut self, name: &str) -> Self {
         self.node_name = name.to_string();
+        self
+    }
+
+    /// Set the node IPs (`Configurer.nodeIPs`) for the DNS localhost fallback.
+    #[must_use]
+    pub fn with_node_ips(mut self, ips: Vec<String>) -> Self {
+        self.node_ips = ips;
         self
     }
 
@@ -4020,6 +4031,31 @@ mod tests {
         );
         // Missing RuntimeClass fails the sandbox (`kuberuntime_sandbox.go:60-63`).
         assert!(rt.sandbox_runtime_handler(&mk(Some("nope"))).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn pod_dns_empty_resolv_conf_uses_node_ip_family_for_localhost() {
+        use rusternetes_common::resources::pod::PodSpec;
+        // dns.go:431-447: --resolv-conf="" appends ::1 per IPv6 node IP and
+        // 127.0.0.1 per IPv4 node IP.
+        let rt = CriContainerRuntime::connect(
+            "/tmp/rusternetes-test-missing-cri.sock",
+            "h",
+            "/tmp/rusternetes-test-logs",
+        )
+        .await
+        .unwrap()
+        .with_resolv_conf("")
+        .with_node_ips(vec!["fd00::1".to_string()]);
+        let pod = Pod::new(
+            "p",
+            PodSpec {
+                dns_policy: Some("Default".to_string()),
+                ..Default::default()
+            },
+        );
+        let dns = rt.pod_dns(&pod).await.unwrap();
+        assert_eq!(dns.servers, vec!["::1".to_string()]);
     }
 
     #[tokio::test]
