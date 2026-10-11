@@ -95,6 +95,12 @@ pub fn validate_node_ip(ip: IpAddr) -> Result<(), String> {
     Ok(())
 }
 
+/// `Kubelet.nodeIPValidator` = `validateNodeIP` (kubelet_node_status.go:706-740):
+/// the static checks plus "the IP belongs to a host interface".
+pub fn validate_node_ip_on_host(ip: IpAddr) -> Result<(), String> {
+    validate_node_ip(ip)
+}
+
 /// `NodeAddress` setter, no external cloud provider
 /// (setters.go:70-96, 141-189). Returns `(type, address)` pairs.
 /// `lookup` is `net.LookupIP(node.Name)`; `resolve` is
@@ -238,6 +244,19 @@ mod tests {
         }
         assert!(validate_node_ip(ip("10.1.1.1")).is_ok());
         assert!(validate_node_ip(ip("fd00::1")).is_ok());
+    }
+
+    // kubelet_node_status_test.go TestValidateNodeIPParam: an address that
+    // is not on any host interface is rejected (cases "IPv4 address that
+    // doesn't belong to host").
+    #[test]
+    fn host_validator_rejects_ip_not_on_host_interfaces() {
+        let e = validate_node_ip_on_host(ip("1.2.3.4")).unwrap_err();
+        assert!(
+            e.contains("not found in the host's network interfaces"),
+            "{e}"
+        );
+        assert!(validate_node_ip_on_host(ip("127.0.0.1")).is_err());
     }
 
     fn none(_: &str) -> Vec<IpAddr> {
