@@ -16,6 +16,7 @@ use rusternetes_csi::proto::identity_server::{Identity, IdentityServer};
 use rusternetes_csi::proto::*;
 use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tonic::{Request, Response, Status};
 
@@ -36,6 +37,10 @@ struct Fake {
     publish_readonly: bool,
     publish_code: Option<tonic::Code>,
     unpublish_code: Option<tonic::Code>,
+    /// LIST_VOLUMES + LIST_VOLUMES_PUBLISHED_NODES reported.
+    list_published: bool,
+    /// What `ListVolumes` reports: volume ID -> published node IDs.
+    published: HashMap<String, Vec<String>>,
 }
 
 impl Fake {
@@ -46,6 +51,8 @@ impl Fake {
             publish_readonly: false,
             publish_code: None,
             unpublish_code: None,
+            list_published: true,
+            published: HashMap::new(),
         }
     }
 }
@@ -82,6 +89,10 @@ impl Controller for Fake {
         if self.publish_readonly {
             types.push(T::PublishReadonly);
         }
+        if self.list_published {
+            types.push(T::ListVolumes);
+            types.push(T::ListVolumesPublishedNodes);
+        }
         Ok(Response::new(ControllerGetCapabilitiesResponse {
             capabilities: types
                 .into_iter()
@@ -114,6 +125,27 @@ impl Controller for Fake {
             return Err(Status::new(c, "fake unpublish failure"));
         }
         Ok(Response::new(ControllerUnpublishVolumeResponse {}))
+    }
+    async fn list_volumes(
+        &self,
+        _r: Request<ListVolumesRequest>,
+    ) -> Result<Response<ListVolumesResponse>, Status> {
+        Ok(Response::new(ListVolumesResponse {
+            entries: self
+                .published
+                .iter()
+                .map(|(id, nodes)| list_volumes_response::Entry {
+                    volume: Some(Volume {
+                        volume_id: id.clone(),
+                        ..Default::default()
+                    }),
+                    status: Some(list_volumes_response::VolumeStatus {
+                        published_node_ids: nodes.clone(),
+                    }),
+                })
+                .collect(),
+            next_token: String::new(),
+        }))
     }
     async fn create_volume(
         &self,
@@ -711,5 +743,133 @@ async fn migratable_pv_with_matching_migrated_to_keeps_finalizer() {
     assert_eq!(
         pv.metadata.finalizers.unwrap(),
         vec![GCE_FINALIZER.to_string()]
+    );
+}
+
+// ---- ReconcileVA (csi_handler.go:122-210) -----------------------------------
+//
+// Cases mirror `TestCSIHandlerReconcileVA` (`csi_handler_test.go:1472-1540`).
+
+fn published(volume: &str, node: &str) -> HashMap<String, Vec<String>> {
+    HashMap::from([(volume.to_string(), vec![node.to_string()])])
+}
+
+/// Attach `va1`, then run one ReconcileVA + one ordinary pass.
+async fn attach_then_reconcile_va(e: &Env) {
+    seed(e, false).await;
+    e.attacher.reconcile_all().await.unwrap();
+    assert!(va(e).await.status.unwrap().attached);
+    assert_eq!(e.rec.lock().unwrap().publish.len(), 1);
+    e.attacher.reconcile_va().await.unwrap();
+    e.attacher.reconcile_all().await.unwrap();
+}
+
+/// "va attached actual state not attached": the driver no longer lists the
+/// volume as published to the node, so the VA is force-synced and the attach is
+/// issued again even though `status.attached` is true (`:191-207`, `:257`).
+#[tokio::test]
+async fn reconcile_va_reattaches_when_driver_does_not_list_it_published() {
+    let e = start(Fake::new());
+    attach_then_reconcile_va(&e).await;
+    assert_eq!(e.rec.lock().unwrap().publish.len(), 2);
+    // consumeForceSync: the intention is spent after one processing.
+    e.attacher.reconcile_all().await.unwrap();
+    assert_eq!(e.rec.lock().unwrap().publish.len(), 2);
+}
+
+/// "va attached actual state attached": nothing to do.
+#[tokio::test]
+async fn reconcile_va_leaves_a_consistent_attachment_alone() {
+    let mut f = Fake::new();
+    f.published = published("vol-1", "csi-node-1");
+    let e = start(f);
+    attach_then_reconcile_va(&e).await;
+    assert_eq!(e.rec.lock().unwrap().publish.len(), 1);
+}
+
+/// "va not attached actual state attached": a VolumeAttachment that is being
+/// deleted but whose volume the driver still reports published is force-synced
+/// into a detach, though it carries no finalizer (`:289`).
+#[tokio::test]
+async fn reconcile_va_detaches_a_deleted_va_the_driver_still_publishes() {
+    let mut f = Fake::new();
+    f.published = published("vol-1", "csi-node-1");
+    let e = start(f);
+    seed(&e, false).await;
+    mark_deleting(&e).await;
+    e.attacher.reconcile_all().await.unwrap();
+    assert!(e.rec.lock().unwrap().unpublish.is_empty());
+    e.attacher.reconcile_va().await.unwrap();
+    e.attacher.reconcile_all().await.unwrap();
+    let rec = e.rec.lock().unwrap();
+    assert_eq!(rec.unpublish.len(), 1);
+    assert_eq!(rec.unpublish[0].volume_id, "vol-1");
+    assert_eq!(rec.unpublish[0].node_id, "csi-node-1");
+}
+
+/// "no volume attachments but existing lister response results in no action".
+#[tokio::test]
+async fn reconcile_va_with_no_attachments_does_nothing() {
+    let mut f = Fake::new();
+    f.published = published("vol-1", "csi-node-1");
+    let e = start(f);
+    e.attacher.reconcile_va().await.unwrap();
+    e.attacher.reconcile_all().await.unwrap();
+    let rec = e.rec.lock().unwrap();
+    assert!(rec.publish.is_empty() && rec.unpublish.is_empty());
+}
+
+/// `main.go:335`: the reconciler is only on for a driver reporting BOTH
+/// LIST_VOLUMES and LIST_VOLUMES_PUBLISHED_NODES; otherwise an empty listing
+/// must not be read as "nothing is published".
+#[tokio::test]
+async fn reconcile_va_is_off_without_list_volumes_published_nodes() {
+    let mut f = Fake::new();
+    f.list_published = false;
+    let e = start(f);
+    attach_then_reconcile_va(&e).await;
+    assert_eq!(e.rec.lock().unwrap().publish.len(), 1);
+}
+
+/// `RepairVolumeHandle` (`csi_handler.go:175-186`): an in-tree GCE PD whose
+/// translated handle is `projects/UNSPECIFIED/zones/UNSPECIFIED/disks/d` is
+/// compared against the driver listing under the repaired handle
+/// (`projects/p1/zones/us-central1-c/disks/d`, project and zone from the node
+/// ID), so a consistent attachment is not re-published.
+#[tokio::test]
+async fn reconcile_va_repairs_a_migrated_volume_handle() {
+    let node = "projects/p1/zones/us-central1-c/instances/n1";
+    let mut f = Fake::new();
+    f.published = published("projects/p1/zones/us-central1-c/disks/d", node);
+    let e = start(f);
+    put(
+        &e.storage,
+        "persistentvolumes",
+        None,
+        "pv1",
+        json!({"apiVersion": "v1", "kind": "PersistentVolume",
+               "metadata": {"name": "pv1", "uid": "pv-uid"},
+               "spec": {"accessModes": ["ReadWriteOnce"],
+                        "gcePersistentDisk": {"pdName": "d", "fsType": "ext4"}}}),
+    )
+    .await;
+    put(
+        &e.storage,
+        "csinodes",
+        None,
+        "node-1",
+        json!({"apiVersion": "storage.k8s.io/v1", "kind": "CSINode",
+               "metadata": {"name": "node-1"},
+               "spec": {"drivers": [{"name": DRIVER, "nodeID": node}]}}),
+    )
+    .await;
+    let mut v = va_json("va1", DRIVER);
+    v["status"] = json!({"attached": true});
+    put(&e.storage, "volumeattachments", None, "va1", v).await;
+    e.attacher.reconcile_va().await.unwrap();
+    e.attacher.reconcile_all().await.unwrap();
+    assert!(
+        e.rec.lock().unwrap().publish.is_empty(),
+        "repaired handle matches the listing: no forced re-attach"
     );
 }

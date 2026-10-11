@@ -273,6 +273,11 @@ impl<S: Storage + 'static> CsiAttacher<S> {
         }
     }
 
+    /// STUB (red phase).
+    pub async fn reconcile_va(&self) -> Result<()> {
+        Ok(())
+    }
+
     async fn caps(&self) -> Result<Caps> {
         self.capabilities
             .get_or_try_init(|| async {

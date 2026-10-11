@@ -13,7 +13,7 @@
 // holds exactly the Node-service RPCs the kubelet's volume plugin calls
 // (`pkg/volume/csi/csi_client.go`), plus the Identity.GetPluginCapabilities and
 // Controller (CreateVolume/DeleteVolume/ControllerGetCapabilities/
-// CreateSnapshot/DeleteSnapshot) RPCs of the external-provisioner client. The `csi_secret` field option is omitted: it
+// CreateSnapshot/DeleteSnapshot/ListVolumes) RPCs of the external-provisioner client. The `csi_secret` field option is omitted: it
 // only drives log redaction in Go's `protosanitizer` and has no wire effect.
 // Replace with the verbatim file when the spec repo is vendored.
 
@@ -31,6 +31,7 @@ service Controller {
   rpc DeleteVolume (DeleteVolumeRequest) returns (DeleteVolumeResponse) {}
   rpc ControllerPublishVolume (ControllerPublishVolumeRequest) returns (ControllerPublishVolumeResponse) {}
   rpc ControllerUnpublishVolume (ControllerUnpublishVolumeRequest) returns (ControllerUnpublishVolumeResponse) {}
+  rpc ListVolumes (ListVolumesRequest) returns (ListVolumesResponse) {}
   rpc ControllerGetCapabilities (ControllerGetCapabilitiesRequest) returns (ControllerGetCapabilitiesResponse) {}
   rpc CreateSnapshot (CreateSnapshotRequest) returns (CreateSnapshotResponse) {}
   rpc DeleteSnapshot (DeleteSnapshotRequest) returns (DeleteSnapshotResponse) {}
@@ -267,6 +268,27 @@ message Volume {
   map<string, string> volume_context = 3;
   VolumeContentSource content_source = 4;
   repeated Topology accessible_topology = 5;
+}
+
+// ListVolumes (csi.proto, checked against the vendored Go bindings in
+// kubernetes/vendor/github.com/container-storage-interface/spec csi.pb.go
+// :2478-2657). `VolumeStatus.volume_condition` (field 2) is omitted: unknown
+// fields are skipped on the wire and the attacher only reads published_node_ids.
+message ListVolumesRequest {
+  int32 max_entries = 1;
+  string starting_token = 2;
+}
+
+message ListVolumesResponse {
+  message VolumeStatus {
+    repeated string published_node_ids = 1;
+  }
+  message Entry {
+    Volume volume = 1;
+    VolumeStatus status = 2;
+  }
+  repeated Entry entries = 1;
+  string next_token = 2;
 }
 
 message CreateVolumeRequest {
