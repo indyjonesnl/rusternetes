@@ -316,9 +316,17 @@ impl Feature {
         }
     }
 
-    /// `LockToDefault` in upstream's spec. Only gates modelled as GA-locked.
+    /// `LockToDefault` in the gate's v1.35 spec. Audited against every
+    /// modelled gate in `pkg/features/kube_features.go`: only these two carry
+    /// `LockToDefault: true`
+    /// (`RelaxedDNSSearchValidation` {1.34, true, GA, LockToDefault: true},
+    /// `InPlacePodVerticalScaling` {1.35, true, GA, LockToDefault: true});
+    /// the zpages / apiserver gates are not locked.
     const fn locked_to_default(self) -> bool {
-        matches!(self, Feature::RelaxedDNSSearchValidation)
+        matches!(
+            self,
+            Feature::RelaxedDNSSearchValidation | Feature::InPlacePodVerticalScaling
+        )
     }
 
     /// Upstream-derived default for the v1.35 target.
@@ -617,14 +625,86 @@ pub fn set_from_str(value: &str) -> Result<(), String> {
 /// no error occurred (:463-466). Multiple errors aggregate as `[a, b]`
 /// (`utilerrors.NewAggregate`).
 ///
-/// Gap: emulation versions and feature dependencies are not modelled.
+/// After the per-gate pass, the dependency check (:418-434) runs against the
+/// resulting state (see [`check_dependencies`]).
+///
+/// Gap: emulation versions are not modelled.
 fn set_from_map(m: &[(String, bool)]) -> Result<(), String> {
-    for (name, v) in resolve_gates(m, &known_gates())? {
+    let resolved = resolve_gates(m, &known_gates())?;
+    check_dependencies(|f| {
+        let name = format!("{f:?}");
+        resolved
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map_or_else(|| enabled(f), |(_, v)| *v)
+    })?;
+    for (name, v) in resolved {
         if let Some(&f) = ALL_FEATURES.iter().find(|f| format!("{f:?}") == name) {
+            // feature_gate.go:407-411
+            match f.prerelease() {
+                PreRelease::Deprecated => tracing::warn!(
+                    "Setting deprecated feature gate {name}={v}. It will be removed in a future release."
+                ),
+                PreRelease::Ga => tracing::warn!(
+                    "Setting GA feature gate {name}={v}. It will be removed in a future release."
+                ),
+                _ => {}
+            }
             set(f, v);
         }
     }
     Ok(())
+}
+
+/// `defaultKubernetesFeatureGateDependencies` (pkg/features/kube_features.go:2166+)
+/// restricted to gates this crate models; an edge to an unmodelled gate
+/// (e.g. `DynamicResourceAllocation`) cannot be evaluated and is omitted.
+const DEPENDENCIES: &[(Feature, &[Feature])] = &[
+    (
+        Feature::ClusterTrustBundleProjection,
+        &[Feature::ClusterTrustBundle],
+    ),
+    (Feature::DRADeviceTaintRules, &[Feature::DRADeviceTaints]),
+    (
+        Feature::InPlacePodLevelResourcesVerticalScaling,
+        &[
+            Feature::InPlacePodVerticalScaling,
+            Feature::PodLevelResources,
+            Feature::NodeDeclaredFeatures,
+        ],
+    ),
+    (
+        Feature::MatchLabelKeysInPodTopologySpreadSelectorMerge,
+        &[Feature::MatchLabelKeysInPodTopologySpread],
+    ),
+];
+
+/// Dependency validation of `unsafeSetFromMap` (feature_gate.go:418-436): every
+/// enabled gate must have all its dependencies enabled. Errors aggregate like
+/// `utilerrors.NewAggregate`. `is_enabled` yields the post-set state.
+fn check_dependencies(is_enabled: impl Fn(Feature) -> bool) -> Result<(), String> {
+    let mut errs = Vec::new();
+    for (feature, deps) in DEPENDENCIES {
+        if !is_enabled(*feature) {
+            continue;
+        }
+        let disabled: Vec<String> = deps
+            .iter()
+            .filter(|d| !is_enabled(**d))
+            .map(|d| format!("{d:?}"))
+            .collect();
+        if !disabled.is_empty() {
+            errs.push(format!(
+                "{feature:?} is enabled, but depends on features that are disabled: [{}]",
+                disabled.join(" ")
+            ));
+        }
+    }
+    match errs.len() {
+        0 => Ok(()),
+        1 => Err(errs.remove(0)),
+        _ => Err(format!("[{}]", errs.join(", "))),
+    }
 }
 
 /// The pure body of `unsafeSetFromMap` (feature_gate.go:381-418) including the
