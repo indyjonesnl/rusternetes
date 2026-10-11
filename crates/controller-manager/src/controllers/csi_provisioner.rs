@@ -2223,21 +2223,16 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
         volume_id: &str,
         provisioner_credentials: &HashMap<String, String>,
     ) -> Result<()> {
-        let mut last = None;
-        for _ in 0..DELETE_VOLUME_RETRY_COUNT {
-            match self
-                .client
-                .delete_volume(DeleteVolumeRequest {
+        self.client
+            .delete_volume_with_retries(
+                DeleteVolumeRequest {
                     volume_id: volume_id.to_string(),
                     secrets: provisioner_credentials.clone(),
-                })
-                .await
-            {
-                Ok(()) => return Ok(()),
-                Err(e) => last = Some(e),
-            }
-        }
-        Err(anyhow::Error::new(last.expect("retry count is non-zero")))
+                },
+                DELETE_VOLUME_RETRY_COUNT,
+            )
+            .await
+            .map_err(anyhow::Error::new)
     }
 
     /// `Provision` (controller.go:838-1052).
