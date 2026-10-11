@@ -3,6 +3,7 @@ pub mod admission;
 pub mod audit;
 pub mod authorization_webhook;
 pub mod authorizer;
+pub mod request_scope;
 pub use rusternetes_admission_webhook as admission_webhook;
 pub mod apiserver_identity;
 pub mod autoregister;

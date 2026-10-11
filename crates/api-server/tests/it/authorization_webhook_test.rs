@@ -566,3 +566,55 @@ async fn sends_resource_attributes_version() {
     let got = mock.lock().unwrap().last.clone().unwrap();
     assert_eq!(got["spec"]["resourceAttributes"]["version"], "v1");
 }
+
+// GetAuthorizerAttributes (filters/authorization.go:119-120) takes
+// APIGroup/APIVersion from the request's RequestInfo; handlers here build
+// attributes without a version, so the request's RequestInfo supplies it (#3159).
+async fn version_sent(
+    info: rusternetes_api_server::audit::Attributes,
+    a: RequestAttributes,
+) -> Value {
+    let mock = allowing_mock();
+    let url = serve(mock.clone()).await;
+    let wh = authorizer(&url, "v1", Duration::ZERO, FailurePolicy::NoOpinion);
+    rusternetes_api_server::request_scope::with_request_info(info, async {
+        wh.authorize_opinion(&a).await.unwrap()
+    })
+    .await;
+    let got = mock.lock().unwrap().last.clone().unwrap();
+    got["spec"]["resourceAttributes"]["version"].clone()
+}
+
+fn pods_info() -> rusternetes_api_server::audit::Attributes {
+    rusternetes_api_server::audit::request_info(
+        &axum::http::Method::GET,
+        "/api/v1/namespaces/kittensandponies/pods/p",
+        None,
+    )
+}
+
+#[tokio::test]
+async fn request_info_supplies_missing_version() {
+    assert_eq!(version_sent(pods_info(), resource("jane")).await, "v1");
+}
+
+#[tokio::test]
+async fn explicit_version_wins_over_request_info() {
+    let a = RequestAttributes {
+        api_version: "v2".into(),
+        ..resource("jane")
+    };
+    assert_eq!(version_sent(pods_info(), a).await, "v2");
+}
+
+#[tokio::test]
+async fn request_info_ignored_for_a_different_resource() {
+    // An internal check (e.g. escalation) on another resource must not inherit
+    // the request's version.
+    let a = RequestAttributes {
+        namespace: Some("kittensandponies".into()),
+        ..RequestAttributes::new(user("jane"), "get", "secrets")
+    };
+    // Empty `version` is omitted from the wire (omitempty).
+    assert!(version_sent(pods_info(), a).await.is_null());
+}
