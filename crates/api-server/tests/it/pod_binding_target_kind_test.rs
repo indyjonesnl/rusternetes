@@ -40,10 +40,38 @@ async fn binding_rejects_non_node_target_kind() {
     let (code, body) = state
         .post(&binding_uri("p-bad"), &binding("p-bad", "Pod", "node-a"))
         .await;
+    // BindingREST.Create returns `errs.ToAggregate()` (storage.go:189), not an
+    // APIStatus, so ErrorToAPIStatus's default arm (status.go:60-82) renders a
+    // 500 with reason Unknown ("", omitted), the aggregate text as message and
+    // no details.
+    assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["kind"], "Status");
+    assert_eq!(body["status"], "Failure");
+    assert_eq!(body["code"], 500);
+    assert!(
+        body.get("reason").is_none(),
+        "reason Unknown is omitted: {body}"
+    );
+    assert!(body.get("details").is_none(), "no details: {body}");
     assert_eq!(
-        code,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "non-Node target.kind must be rejected: {body}"
+        body["message"],
+        "target.kind: Unsupported value: \"Pod\": supported values: \"Node\", \"<empty>\""
+    );
+}
+
+#[tokio::test]
+async fn binding_multiple_errors_render_as_bracketed_aggregate() {
+    let state = TestApiServer::new();
+    let (code, _) = state.post(&pods_uri(), &pod("p-two")).await;
+    assert_eq!(code, StatusCode::CREATED);
+    // ToAggregate message for several errors is "[a, b]" (errors.go:70-96).
+    let (code, body) = state
+        .post(&binding_uri("p-two"), &binding("p-two", "Pod", ""))
+        .await;
+    assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(
+        body["message"],
+        "[target.kind: Unsupported value: \"Pod\": supported values: \"Node\", \"<empty>\", target.name: Required value]"
     );
 }
 

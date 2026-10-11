@@ -176,6 +176,33 @@ impl Error {
         )))
     }
 
+    /// `errs.ToAggregate()` returned from a REST storage method as a plain
+    /// `error` (e.g. `BindingREST.Create`,
+    /// `pkg/registry/core/pod/storage/storage.go:189`). It is not an
+    /// `APIStatus`, so `ErrorToAPIStatus`'s default arm
+    /// (`apiserver/pkg/endpoints/handlers/responsewriters/status.go:60-82`)
+    /// renders HTTP 500, reason `StatusReasonUnknown` (`""`, omitted on the
+    /// wire), `Message: err.Error()` and no details. The message is
+    /// `aggregate.Error()` (`apimachinery/pkg/util/errors/errors.go:70-96`):
+    /// one error as itself, several deduplicated as `[a, b]`.
+    pub fn aggregate(errs: &ErrorList) -> Error {
+        let mut msgs: Vec<String> = Vec::new();
+        for e in errs {
+            let m = e.to_string();
+            if !msgs.contains(&m) {
+                msgs.push(m);
+            }
+        }
+        let message = if msgs.len() == 1 {
+            msgs.remove(0)
+        } else {
+            format!("[{}]", msgs.join(", "))
+        };
+        let mut status = crate::types::Status::failure(message, "", 500);
+        status.reason = None;
+        Error::Status(Box::new(status))
+    }
+
     /// Returns the machine-readable reason string matching Kubernetes StatusReason values
     pub fn reason(&self) -> &str {
         match self {

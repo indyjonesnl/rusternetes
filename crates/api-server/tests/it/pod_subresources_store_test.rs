@@ -512,7 +512,7 @@ async fn binding_needs_a_target_name() {
     let api = TestApiServer::new();
     create(&api, &pod("p1")).await;
     let (s, out) = api.post(&binding_uri("p1"), &binding("p1", "")).await;
-    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{out}");
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "{out}"); // storage.go:189 aggregate
     assert!(
         out["message"].as_str().unwrap().contains("target.name"),
         "{out}"
