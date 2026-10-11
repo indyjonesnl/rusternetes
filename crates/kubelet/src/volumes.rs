@@ -195,6 +195,16 @@ impl VolumeManager {
         if let Some(m) = pod_certificate_manager.clone() {
             kubelet_host = kubelet_host.with_pod_certificate_manager(m);
         }
+        // The CSIDriver informer the CSI plugin's lister reads
+        // (`pkg/kubelet/kubelet.go` builds it and hands it to the volume host).
+        // Only a kubelet with an API to read from and a runtime to run it on
+        // has one; otherwise the plugin sees upstream's nil lister.
+        if let (Some(storage), Ok(rt)) = (storage.clone(), tokio::runtime::Handle::try_current()) {
+            let lister = crate::volume_plugins::csi_driver_lister::CsiDriverLister::new();
+            let l = lister.clone();
+            rt.spawn(async move { l.run(storage).await });
+            kubelet_host = kubelet_host.with_csi_driver_lister(lister);
+        }
         let host: Arc<dyn crate::volume_plugins::VolumeHost> = Arc::new(kubelet_host);
         let plugin_mgr = Arc::new(crate::volume_plugins::VolumePluginMgr::new(vec![
             Box::new(crate::volume_plugins::empty_dir::EmptyDirPlugin::new(

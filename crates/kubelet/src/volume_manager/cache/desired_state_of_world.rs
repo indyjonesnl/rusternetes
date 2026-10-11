@@ -909,25 +909,13 @@ fn get_volume_plugin_name_with_driver(plugin: &dyn VolumePlugin, spec: &Spec<'_>
     }
 
     // It's a CSI volume
-    let driver_name = get_csi_driver_name(spec).unwrap_or_else(|err| {
+    let driver_name = crate::volume_plugins::csi::get_csi_driver_name(spec).unwrap_or_else(|err| {
         // In theory this is unreachable - such volume would not pass validation.
         debug!(%err, "failed to get CSI driver name from volume spec");
         "unknown".to_string()
     });
     // `/` is used to separate plugin + CSI driver in util::get_unique_volume_name() too
     format!("{plugin_name}/{driver_name}")
-}
-
-/// Port of `csi.GetCSIDriverName` (`pkg/volume/csi/csi_util.go:182-196`):
-/// the inline source's driver if present, else the PV source's, else an error.
-fn get_csi_driver_name(spec: &Spec<'_>) -> Result<String, String> {
-    if let Some(vol_src) = &spec.volume.csi {
-        return Ok(vol_src.driver.clone());
-    }
-    if let Some(pv_src) = spec.persistent_volume.and_then(|pv| pv.spec.csi.as_ref()) {
-        return Ok(pv_src.driver.clone());
-    }
-    Err("volume source not found in volume.Spec".to_string())
 }
 
 /// Port of `getVolumeAccessMode` (`desired_state_of_world.go:695-716`).

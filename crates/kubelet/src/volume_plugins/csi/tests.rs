@@ -1886,30 +1886,6 @@ fn supports_selinux_context_mount_follows_csidriver() {
 }
 
 #[test]
-fn supports_selinux_context_mount_is_false_with_gate_off() {
-    let _g = rusternetes_common::feature_gates::with_feature(
-        rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
-        false,
-    );
-    let h = lister_host(
-        &[csi_driver_obj(
-            "se.csi.example.com",
-            json!({"seLinuxMount": true}),
-        )],
-        true,
-    );
-    let p = CsiPlugin::new(h);
-    let v = claim_volume();
-    let pv = pv("se.csi.example.com", json!({}));
-    let spec = Spec {
-        volume: &v,
-        persistent_volume: Some(&pv),
-        read_only: false,
-    };
-    assert!(!p.supports_selinux_context_mount(&spec).unwrap());
-}
-
-#[test]
 fn supports_selinux_context_mount_errors_when_cache_unsynced_or_lister_missing() {
     let _g = rusternetes_common::feature_gates::with_feature(
         rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,

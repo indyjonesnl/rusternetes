@@ -106,6 +106,20 @@ impl CsiPlugin {
     /// what runs; our `Spec.volume` is always set (see `plugin.rs`), so the
     /// PV-first order here reproduces upstream's result for every reachable
     /// state. The CSI directory is keyed on this name, which is why it matters.
+    /// `csiPlugin.getCSIDriver` (`csi_plugin.go:873-890`): the host's lister
+    /// after `WaitForCacheSync` (`volume_host.go:175-188`). We cannot block in
+    /// a synchronous plugin method, so an unsynced cache is the same error
+    /// upstream's failed wait returns. `Ok(None)` is `apierrors.IsNotFound`.
+    fn get_csi_driver(&self, driver: &str) -> Result<Option<CSIDriver>> {
+        let Some(lister) = self.host.csi_driver_lister() else {
+            return Err(anyhow!("CSIDriver lister does not exist"));
+        };
+        if !lister.has_synced() {
+            return Err(anyhow!("failed to wait for cache sync for CSIDriverLister"));
+        }
+        Ok(lister.get(driver))
+    }
+
     fn spec_name(spec: &Spec<'_>) -> String {
         match spec.persistent_volume {
             Some(pv) => pv.metadata.name.clone(),
@@ -168,20 +182,37 @@ impl VolumePlugin for CsiPlugin {
         Some(self)
     }
 
-    /// `RequiresRemount` (`csi_plugin.go:457-460`): upstream consults the
-    /// CSIDriver lister and returns `false` when it is nil. We have no lister,
-    /// which is exactly that nil case.
-    fn requires_remount(&self, _spec: &Spec<'_>) -> bool {
-        false
+    /// `RequiresRemount` (`csi_plugin.go:457-472`): the driver's
+    /// `CSIDriver.Spec.RequiresRepublish`. Every failure to learn it is
+    /// "Failed to mark ... as republish required" and answers `false`.
+    fn requires_remount(&self, spec: &Spec<'_>) -> bool {
+        if self.host.csi_driver_lister().is_none() {
+            return false;
+        }
+        let Ok(driver_name) = get_csi_driver_name(spec) else {
+            return false;
+        };
+        match self.get_csi_driver(&driver_name) {
+            Ok(Some(d)) => d.spec.requires_republish.unwrap_or(false),
+            _ => false,
+        }
     }
 
-    /// `SupportsSELinuxContextMount` (`csi_plugin.go:637-...`): upstream looks
-    /// the driver up in the CSIDriver lister to read its `SELinuxMount` field.
-    /// With no lister we cannot answer `true` for any driver, so this reports
-    /// `false` — the same answer upstream gives for a driver that does not
-    /// declare `seLinuxMount: true`, which is the default.
-    fn supports_selinux_context_mount(&self, _spec: &Spec<'_>) -> Result<bool> {
-        Ok(false)
+    /// `SupportsSELinuxContextMount` (`csi_plugin.go:637-660`): with the
+    /// `SELinuxMountReadWriteOncePod` gate, the driver's
+    /// `CSIDriver.Spec.SELinuxMount`; a missing CSIDriver is `(false, nil)`,
+    /// any other lookup failure is the error.
+    fn supports_selinux_context_mount(&self, spec: &Spec<'_>) -> Result<bool> {
+        if !rusternetes_common::feature_gates::enabled(
+            rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
+        ) {
+            return Ok(false);
+        }
+        let driver = get_csi_driver_name(spec).map_err(|e| anyhow!(e))?;
+        match self.get_csi_driver(&driver)? {
+            Some(d) => Ok(d.spec.se_linux_mount.unwrap_or(false)),
+            None => Ok(false),
+        }
     }
 
     /// `CanSupport` (`csi_plugin.go:447-455`):
@@ -1615,3 +1646,15 @@ mod expander;
 
 #[cfg(test)]
 mod tests;
+
+/// Port of `csi.GetCSIDriverName` (`pkg/volume/csi/csi_util.go:182-196`):
+/// the inline source's driver if present, else the PV source's, else an error.
+pub(crate) fn get_csi_driver_name(spec: &Spec<'_>) -> Result<String, String> {
+    if let Some(vol_src) = &spec.volume.csi {
+        return Ok(vol_src.driver.clone());
+    }
+    if let Some(pv_src) = spec.persistent_volume.and_then(|pv| pv.spec.csi.as_ref()) {
+        return Ok(pv_src.driver.clone());
+    }
+    Err("volume source not found in volume.Spec".to_string())
+}
