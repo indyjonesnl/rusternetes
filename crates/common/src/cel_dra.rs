@@ -55,16 +55,21 @@ const QUANTITY_SIZE: u64 = 8;
 /// receiver must be the bare `cel` namespace identifier and the variable a
 /// simple identifier.
 fn bind_parts(c: &cel::common::ast::CallExpr) -> Option<(&str, &IdedExpr, &IdedExpr)> {
-    if c.func_name != "bind" || c.args.len() != 3 {
-        return None;
-    }
-    if !matches!(c.target.as_deref().map(|t| &t.expr), Some(Expr::Ident(n)) if n == "cel") {
+    if !is_bind_call(c) {
         return None;
     }
     match &c.args[0].expr {
         Expr::Ident(v) => Some((v.as_str(), &c.args[1], &c.args[2])),
         _ => None,
     }
+}
+
+/// The `cel.bind(_, _, _)` call shape (`celBind` is only reached for the bare
+/// `cel` namespace receiver and three arguments).
+fn is_bind_call(c: &cel::common::ast::CallExpr) -> bool {
+    c.func_name == "bind"
+        && c.args.len() == 3
+        && matches!(c.target.as_deref().map(|t| &t.expr), Some(Expr::Ident(n)) if n == "cel")
 }
 
 /// The outcome of compiling a selector.
@@ -431,6 +436,27 @@ impl<'a> Checker<'a> {
                     let out = self.infer(result, scope);
                     scope.truncate(pushed);
                     out
+                }
+                None if is_bind_call(c) => {
+                    // ext/bindings.go:172-179 celBind: a non-identifier
+                    // variable is a macro error at the variable's position
+                    // (approximated by the argument start; cel-go uses the
+                    // expression ID, which for operators is the operator).
+                    let dot = self.take_dot();
+                    let at = dot.and_then(|d| {
+                        let rest: Vec<(usize, char)> =
+                            self.source.chars().enumerate().skip(d).collect();
+                        let open = rest.iter().position(|(_, ch)| *ch == '(')?;
+                        rest[open + 1..]
+                            .iter()
+                            .find(|(_, ch)| !ch.is_whitespace())
+                            .map(|(i, _)| *i)
+                    });
+                    self.report(
+                        at,
+                        "cel.bind() variable names must be simple identifiers".into(),
+                    );
+                    Ty::Dyn
                 }
                 None => self.infer_call(c, scope),
             },
