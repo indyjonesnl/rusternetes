@@ -2749,6 +2749,11 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         // impersonation, before authorization (server/config.go:1015-1043).
         // Added before the audit layer so it runs inside it; absent unless
         // --enable-priority-and-fairness installed it.
+        // `InstrumentRouteFunc` wraps the route itself (inside APF), so it
+        // counts every request the handler chain serves.
+        protected_routes = protected_routes.layer(axum_middleware::from_fn(
+            crate::apiserver_request_metrics::instrument_request,
+        ));
         if let Some(apf) = crate::flow_control_filter::installed() {
             protected_routes = protected_routes.layer(axum_middleware::from_fn_with_state(
                 apf,
@@ -2802,6 +2807,11 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         // impersonation, before authorization (server/config.go:1015-1043).
         // Added before the audit layer so it runs inside it; absent unless
         // --enable-priority-and-fairness installed it.
+        // `InstrumentRouteFunc` wraps the route itself (inside APF), so it
+        // counts every request the handler chain serves.
+        protected_routes = protected_routes.layer(axum_middleware::from_fn(
+            crate::apiserver_request_metrics::instrument_request,
+        ));
         if let Some(apf) = crate::flow_control_filter::installed() {
             protected_routes = protected_routes.layer(axum_middleware::from_fn_with_state(
                 apf,
