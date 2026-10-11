@@ -706,7 +706,7 @@ fn is_connection_reset(e: &reqwest::Error) -> bool {
 }
 
 /// `convertToSARExtra` + the user / attributes half of `Authorize`
-/// (webhook.go:189-206, `resourceAttributesFrom` :301-329 minus selectors).
+/// (webhook.go:189-206, `resourceAttributesFrom` :301-329 minus selectors; Version :306).
 fn spec_from(attr: &RequestAttributes) -> SarSpec {
     let user: &UserInfo = &attr.user;
     let mut spec = SarSpec {
@@ -730,8 +730,7 @@ fn spec_from(attr: &RequestAttributes) -> SarSpec {
             namespace: attr.namespace.clone().unwrap_or_default(),
             verb: attr.verb.clone(),
             group: attr.api_group.clone(),
-            // `RequestAttributes` carries no API version.
-            version: String::new(),
+            version: attr.api_version.clone(),
             resource: attr.resource.clone(),
             subresource: attr.subresource.clone().unwrap_or_default(),
             name: attr.name.clone().unwrap_or_default(),
@@ -746,6 +745,7 @@ fn should_cache(attr: &RequestAttributes) -> bool {
     let size = attr.namespace.as_deref().map_or(0, str::len)
         + attr.verb.len()
         + attr.api_group.len()
+        + attr.api_version.len()
         + attr.resource.len()
         + attr.subresource.as_deref().map_or(0, str::len)
         + attr.name.as_deref().map_or(0, str::len)
