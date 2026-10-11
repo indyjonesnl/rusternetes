@@ -408,17 +408,15 @@ impl RestUpdateStrategy<Pod> for Strategy {
 
     /// strategy.go:143-150: `ValidatePodUpdate`.
     fn validate_update(&self, _ctx: &RequestContext, obj: &Pod, old: &Pod) -> ErrorList {
-        let mut errs =
-            validate_object_meta_update(&obj.metadata, &old.metadata, &Path::new("metadata"));
-        errs.extend(
-            rusternetes_common::validation::pod_status::validate_pod_metadata_annotations(
-                obj,
-                Some(old),
-            ),
+        use rusternetes_common::feature_gates::{enabled, Feature};
+        let mut errs = rusternetes_common::validation::pod::validate_pod_update(
+            obj,
+            old,
+            enabled(Feature::RelaxedDNSSearchValidation),
+            false,
         );
         if let (Some(old_spec), Some(new_spec)) = (old.spec.as_ref(), obj.spec.as_ref()) {
             errs.extend(validate_node_name_immutable(old_spec, new_spec));
-            errs.extend(validate_spec_update(old_spec, new_spec, false));
         }
         errs
     }

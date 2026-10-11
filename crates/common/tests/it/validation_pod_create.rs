@@ -1497,3 +1497,69 @@ mod pod_update_fidelity {
         );
     }
 }
+
+// `ValidatePodUpdate` as a whole (validation.go:5695-5698): ObjectMeta update
+// rules plus `validatePodMetadataAndSpec` (:4500-4530), which re-runs the
+// create-time metadata/spec rules on every update. An object stored while
+// invalid therefore stays un-updatable until fixed.
+mod pod_update_whole {
+    use super::*;
+    use rusternetes_common::validation::pod::validate_pod_update;
+
+    fn pod(name: &str, image: &str) -> Pod {
+        let mut p = pod_with_spec(minimal_spec(vec![minimal_container(name, image)]));
+        p.metadata.uid = "u".to_string();
+        p.metadata.resource_version = Some("1".to_string());
+        p
+    }
+
+    #[test]
+    fn image_only_change_is_valid() {
+        let old = pod("c", "nginx");
+        let new = pod("c", "nginx:2");
+        let errs = validate_pod_update(&new, &old, true, false);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    // validatePodMetadataAndSpec -> ValidatePodSpec -> validateContainers
+    // (validation.go:4510): an invalid container name is refused even when the
+    // update leaves it untouched.
+    #[test]
+    fn unchanged_invalid_container_name_is_refused() {
+        let old = pod("Bad_Name", "nginx");
+        let new = pod("Bad_Name", "nginx:2");
+        let errs = validate_pod_update(&new, &old, true, false);
+        assert!(
+            errs.iter().any(|e| e.field == "spec.containers[0].name"),
+            "{errs:?}"
+        );
+    }
+
+    // validatePodMetadataAndSpec -> ValidateObjectMeta(..., ValidatePodName)
+    #[test]
+    fn unchanged_invalid_pod_name_is_refused() {
+        let mut old = pod("c", "nginx");
+        old.metadata.name = "Bad_Pod".to_string();
+        let mut new = pod("c", "nginx:2");
+        new.metadata.name = "Bad_Pod".to_string();
+        let errs = validate_pod_update(&new, &old, true, false);
+        assert!(errs.iter().any(|e| e.field == "metadata.name"), "{errs:?}");
+    }
+
+    // An ephemeral container added through the subresource must not trip the
+    // create-only "cannot be set on create" rule on a later update.
+    #[test]
+    fn ephemeral_containers_are_not_create_only_on_update() {
+        use rusternetes_common::resources::pod::EphemeralContainer;
+        let mut old = pod("c", "nginx");
+        old.spec.as_mut().unwrap().ephemeral_containers = Some(vec![EphemeralContainer {
+            name: "dbg".to_string(),
+            image: "busybox".to_string(),
+            ..Default::default()
+        }]);
+        let mut new = old.clone();
+        new.spec.as_mut().unwrap().containers[0].image = "nginx:2".to_string();
+        let errs = validate_pod_update(&new, &old, true, false);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+}

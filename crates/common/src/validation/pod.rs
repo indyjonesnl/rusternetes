@@ -153,6 +153,99 @@ pub fn validate_pod_create(pod: &Pod, allow_relaxed_dns_search: bool) -> ErrorLi
     errs
 }
 
+/// The pod-only half of `validatePodMetadataAndSpec` (validation.go:4511-4527):
+/// a projected `serviceAccountToken` needs `serviceAccountName`, and
+/// `validateContainersOnlyForPod` (:4424-4440) rejects whitespace-padded images.
+fn validate_pod_only_rules(spec: &PodSpec, spec_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if spec
+        .service_account_name
+        .as_deref()
+        .unwrap_or("")
+        .is_empty()
+    {
+        for (vi, volume) in spec.volumes.iter().flatten().enumerate() {
+            let path = spec_path.child("volumes").index(vi).child("projected");
+            if let Some(projected) = volume.projected.as_ref() {
+                for (si, source) in projected.sources.iter().flatten().enumerate() {
+                    if source.service_account_token.is_some() {
+                        errs.push(Error::forbidden(
+                            &path.child("sources").index(si).child("serviceAccountToken"),
+                            "must not be specified when serviceAccountName is not set",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let only_for_pod = |containers: &[Container], path: Path| {
+        let mut out: ErrorList = Vec::new();
+        for (i, c) in containers.iter().enumerate() {
+            if c.image.trim().len() != c.image.len() {
+                out.push(Error::invalid(
+                    &path.index(i).child("image"),
+                    c.image.clone(),
+                    "must not have leading or trailing whitespace",
+                ));
+            }
+        }
+        out
+    };
+    errs.extend(only_for_pod(
+        &spec.containers,
+        spec_path.child("containers"),
+    ));
+    errs.extend(only_for_pod(
+        spec.init_containers.as_deref().unwrap_or(&[]),
+        spec_path.child("initContainers"),
+    ));
+    errs
+}
+
+/// `ValidatePodUpdate` (validation.go:5695-5838): `ValidateObjectMetaUpdate`,
+/// `validatePodMetadataAndSpec` (:4500-4530), the annotation update rules
+/// (`ValidatePodSpecificAnnotationUpdates`) and the update fence
+/// (`validate_pod_spec_update`). The options come from the old spec/metadata
+/// (`GetValidationOptionsFromPodSpecAndMeta`, pkg/api/pod/util.go:411).
+pub fn validate_pod_update(
+    new: &Pod,
+    old: &Pod,
+    allow_relaxed_dns_search: bool,
+    is_ephemeral_subresource: bool,
+) -> ErrorList {
+    let meta_path = Path::new("metadata");
+    let spec_path = Path::new("spec");
+    let mut errs = crate::validation::objectmeta::validate_object_meta_update(
+        &new.metadata,
+        &old.metadata,
+        &meta_path,
+    );
+    // validatePodMetadataAndSpec: ValidateObjectMeta with ValidatePodName,
+    // the annotation rules (validate_pod_metadata_annotations also runs the
+    // update-only annotation rules), then ValidatePodSpec.
+    errs.extend(crate::validation::objectmeta::validate_object_meta(
+        &new.metadata,
+        true,
+        crate::validation::objectmeta::name_is_dns_subdomain,
+        &meta_path,
+    ));
+    errs.extend(crate::validation::pod_status::validate_pod_metadata_annotations(new, Some(old)));
+    if let Some(spec) = new.spec.as_ref() {
+        errs.extend(validate_pod_spec_for(
+            spec,
+            &spec_path,
+            allow_relaxed_dns_search,
+            allow_taint_toleration_comparison_operators(old.spec.as_ref()),
+            false,
+        ));
+        errs.extend(validate_pod_only_rules(spec, &spec_path));
+    }
+    if let (Some(o), Some(n)) = (old.spec.as_ref(), new.spec.as_ref()) {
+        errs.extend(validate_pod_spec_update(o, n, is_ephemeral_subresource));
+    }
+    errs
+}
+
 /// Mirrors upstream `ValidatePodSpec`
 /// (`pkg/apis/core/validation/validation.go`, release-1.35).
 ///
@@ -164,6 +257,27 @@ pub fn validate_pod_spec(
     fld_path: &Path,
     allow_relaxed_dns_search: bool,
     allow_taint_toleration_comparison_operators: bool,
+) -> ErrorList {
+    validate_pod_spec_for(
+        spec,
+        fld_path,
+        allow_relaxed_dns_search,
+        allow_taint_toleration_comparison_operators,
+        true,
+    )
+}
+
+/// `validate_pod_spec` with the create-only rule made optional:
+/// `ephemeralContainers` "cannot be set on create" is a create-time rule
+/// (strategy.go `PrepareForCreate`), not part of `ValidatePodSpec`, so
+/// `ValidatePodUpdate` (validation.go:5698 -> `validatePodMetadataAndSpec`
+/// :4509) must not apply it.
+fn validate_pod_spec_for(
+    spec: &PodSpec,
+    fld_path: &Path,
+    allow_relaxed_dns_search: bool,
+    allow_taint_toleration_comparison_operators: bool,
+    forbid_ephemeral_containers: bool,
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     let containers_path = fld_path.child("containers");
@@ -240,7 +354,7 @@ pub fn validate_pod_spec(
     // Ephemeral containers are forbidden on create.
     // Upstream: `pkg/registry/core/pod/strategy.go PrepareForCreate`.
     if let Some(ref ecs) = spec.ephemeral_containers {
-        if !ecs.is_empty() {
+        if forbid_ephemeral_containers && !ecs.is_empty() {
             errs.push(Error::forbidden(
                 &fld_path.child("ephemeralContainers"),
                 "cannot be set on create",
