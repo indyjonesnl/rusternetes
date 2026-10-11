@@ -60,3 +60,6 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 dhat = { version = "0.3", optional = true }
 mimalloc = { version = "0.1", optional = true }
+
+[dev-dependencies]
+serial_test = { workspace = true }

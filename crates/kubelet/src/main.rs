@@ -118,6 +118,11 @@ use tracing::{info, warn};
 #[command(about = "Rusternetes Kubelet - Node agent that manages containers", long_about = None)]
 #[command(version)]
 struct Args {
+    /// Comma-separated `Gate=bool` pairs, e.g. `StorageCapacityScoring=true`
+    /// (upstream `--feature-gates`, component-base featuregate `Set`).
+    #[arg(long, default_value = "")]
+    feature_gates: String,
+
     /// Node name
     #[arg(long)]
     node_name: String,
@@ -323,9 +328,18 @@ fn build_eviction_manager(
     Ok(EvictionManager::with_config(thresholds, transition_period))
 }
 
+/// Apply `--feature-gates` process-wide. Port of `featureGate.Set`
+/// (staging/src/k8s.io/component-base/featuregate/feature_gate.go:340-359).
+fn apply_feature_gates(args: &Args) -> Result<()> {
+    rusternetes_common::feature_gates::set_from_str(&args.feature_gates)
+        .map_err(|e| anyhow::anyhow!("invalid --feature-gates: {e}"))?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    apply_feature_gates(&args)?;
 
     // Load configuration file if specified
     let config_file = if let Some(config_path) = &args.config {
@@ -692,4 +706,41 @@ async fn main() -> Result<()> {
     kubelet.run().await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod feature_gates_flag_tests {
+    use super::*;
+    use rusternetes_common::feature_gates::{enabled, reset_to_defaults, Feature};
+    use serial_test::serial;
+
+    fn parse(gates: &str) -> Args {
+        let mut v: Vec<&str> = vec!["kubelet", "--node-name", "n"];
+        v.push(gates);
+        Args::try_parse_from(v).unwrap()
+    }
+
+    /// Upstream `--feature-gates` (component-base featuregate `Set`,
+    /// feature_gate.go:340-359) is applied process-wide from the flag.
+    #[test]
+    #[serial]
+    fn feature_gates_flag_applies() {
+        reset_to_defaults();
+        apply_feature_gates(&parse("--feature-gates=StorageCapacityScoring=true")).unwrap();
+        assert!(enabled(Feature::StorageCapacityScoring));
+        reset_to_defaults();
+    }
+
+    /// feature_gate.go:385-389.
+    #[test]
+    #[serial]
+    fn feature_gates_flag_rejects_unknown_gate() {
+        reset_to_defaults();
+        let err = apply_feature_gates(&parse("--feature-gates=fooBarBaz=true")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unrecognized feature gate: fooBarBaz"),
+            "{err}"
+        );
+    }
 }

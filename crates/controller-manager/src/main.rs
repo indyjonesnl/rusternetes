@@ -59,6 +59,11 @@ use tracing::{error, info, warn};
 #[command(name = "rusternetes-controller-manager")]
 #[command(about = "Rusternetes Controller Manager - Runs controller loops")]
 struct Args {
+    /// Comma-separated `Gate=bool` pairs, e.g. `StorageCapacityScoring=true`
+    /// (upstream `--feature-gates`, component-base featuregate `Set`).
+    #[arg(long, default_value = "")]
+    feature_gates: String,
+
     /// Etcd endpoints (comma-separated)
     #[arg(long, default_value = "http://localhost:2379")]
     etcd_servers: String,
@@ -126,8 +131,9 @@ struct Args {
     #[arg(long)]
     csi_strict_topology: bool,
 
-    /// `CrossNamespaceVolumeDataSource` feature gate (alpha, default off):
-    /// honour `dataSourceRef.namespace` when a ReferenceGrant allows it.
+    /// Deprecated alias for `--feature-gates=CrossNamespaceVolumeDataSource=true`
+    /// (alpha, default off): honour `dataSourceRef.namespace` when a
+    /// ReferenceGrant allows it.
     #[arg(long)]
     csi_cross_namespace_volume_data_source: bool,
 
@@ -500,9 +506,26 @@ async fn run_api_mode(args: Args) -> Result<()> {
     rusternetes_controller_manager::run_with_api(client, config).await
 }
 
+/// Apply `--feature-gates` process-wide. Port of `featureGate.Set`
+/// (staging/src/k8s.io/component-base/featuregate/feature_gate.go:340-359).
+fn apply_feature_gates(args: &Args) -> Result<()> {
+    rusternetes_common::feature_gates::set_from_str(&args.feature_gates)
+        .map_err(|e| anyhow::anyhow!("invalid --feature-gates: {e}"))?;
+    // #3190: legacy alias for the CrossNamespaceVolumeDataSource gate; the
+    // provisioner reads the gate (upstream has only the gate).
+    if args.csi_cross_namespace_volume_data_source {
+        rusternetes_common::feature_gates::set(
+            rusternetes_common::feature_gates::Feature::CrossNamespaceVolumeDataSource,
+            true,
+        );
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    apply_feature_gates(&args)?;
 
     rusternetes_common::tracing::init_basic_tracing("controller-manager", &args.log_level)?;
 
@@ -881,7 +904,9 @@ async fn main() -> Result<()> {
                 .with_prevent_volume_mode_conversion(args.csi_prevent_volume_mode_conversion)
                 .with_retry_interval_max(args.csi_retry_interval_max)
                 .with_cross_namespace_volume_data_source(
-                    args.csi_cross_namespace_volume_data_source,
+                    rusternetes_common::feature_gates::enabled(
+                        rusternetes_common::feature_gates::Feature::CrossNamespaceVolumeDataSource,
+                    ),
                 )
                 .with_strict_topology(args.csi_strict_topology)
                 .with_immediate_topology(args.csi_immediate_topology),
@@ -1377,5 +1402,64 @@ mod default_rate_limit_tests {
             .with_rate_limit(args.kube_api_qps, args.kube_api_burst);
         let c = skeleton.for_controller("x");
         assert!(c.qps() <= 0.0, "per-controller client must be unlimited");
+    }
+}
+
+#[cfg(test)]
+mod feature_gates_flag_tests {
+    use super::*;
+    use rusternetes_common::feature_gates::{enabled, reset_to_defaults, Feature};
+    use serial_test::serial;
+
+    fn parse(gates: &str) -> Args {
+        let mut v: Vec<&str> = vec!["controller-manager"];
+        v.push(gates);
+        Args::try_parse_from(v).unwrap()
+    }
+
+    /// Upstream `--feature-gates` (component-base featuregate `Set`,
+    /// feature_gate.go:340-359) is applied process-wide from the flag.
+    #[test]
+    #[serial]
+    fn feature_gates_flag_applies() {
+        reset_to_defaults();
+        apply_feature_gates(&parse("--feature-gates=StorageCapacityScoring=true")).unwrap();
+        assert!(enabled(Feature::StorageCapacityScoring));
+        reset_to_defaults();
+    }
+
+    /// feature_gate.go:385-389.
+    #[test]
+    #[serial]
+    fn feature_gates_flag_rejects_unknown_gate() {
+        reset_to_defaults();
+        let err = apply_feature_gates(&parse("--feature-gates=fooBarBaz=true")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unrecognized feature gate: fooBarBaz"),
+            "{err}"
+        );
+    }
+
+    /// #3190: the legacy CSI flag is an alias for the gate; the provisioner
+    /// reads the gate.
+    #[test]
+    #[serial]
+    fn csi_cross_namespace_flag_aliases_gate() {
+        reset_to_defaults();
+        let args = Args::try_parse_from([
+            "controller-manager",
+            "--csi-cross-namespace-volume-data-source",
+        ])
+        .unwrap();
+        apply_feature_gates(&args).unwrap();
+        assert!(enabled(Feature::CrossNamespaceVolumeDataSource));
+        reset_to_defaults();
+        apply_feature_gates(&parse(
+            "--feature-gates=CrossNamespaceVolumeDataSource=true",
+        ))
+        .unwrap();
+        assert!(enabled(Feature::CrossNamespaceVolumeDataSource));
+        reset_to_defaults();
     }
 }
