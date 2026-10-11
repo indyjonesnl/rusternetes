@@ -352,7 +352,11 @@ pub mod k8s_time_map {
 #[derive(Default)]
 pub struct ObjectMeta {
     /// Name must be unique within a namespace
-    #[serde(default, deserialize_with = "deserialize_null_string")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_string",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub name: String,
 
     /// GenerateName is an optional prefix used to generate a unique name when Name is empty.
