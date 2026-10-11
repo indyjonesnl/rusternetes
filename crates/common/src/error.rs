@@ -188,7 +188,8 @@ impl Error {
             Error::Storage(_) | Error::StorageTooLarge(_) => "InternalError",
             Error::Network(_) => "ServiceUnavailable",
             Error::Authentication(_) => "Unauthorized",
-            Error::Authorization(_) => "Forbidden",
+            // endpoints/filters/authorization.go:87-91 (InternalError).
+            Error::Authorization(_) => "InternalError",
             Error::Forbidden(_) => "Forbidden",
             Error::Conflict(_) => "Conflict",
             Error::TooManyRequests(_) => "TooManyRequests",
@@ -267,7 +268,15 @@ impl axum::response::IntoResponse for Error {
             // which is reserved for semantic field-validation errors).
             Error::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg, "BadRequest", None),
             Error::Authentication(msg) => (StatusCode::UNAUTHORIZED, msg, "Unauthorized", None),
-            Error::Authorization(msg) => (StatusCode::FORBIDDEN, msg, "Forbidden", None),
+            // An authorizer evaluation error (no Allow, no explicit Deny) is a
+            // 500, endpoints/filters/authorization.go:87-91; denials are
+            // `Error::Forbidden`.
+            Error::Authorization(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                msg,
+                "InternalError",
+                None,
+            ),
             Error::Forbidden(msg) => (StatusCode::FORBIDDEN, msg, "Forbidden", None),
             Error::Conflict(msg) => {
                 let details = extract_resource_details(&msg);
@@ -536,6 +545,19 @@ fn extract_resource_details_for_invalid(msg: &str) -> Option<crate::types::Statu
 
 #[cfg(all(test, feature = "axum-support"))]
 mod tests {
+    // endpoints/filters/authorization.go:87-91: an authorizer error that did not
+    // come with an Allow is `responsewriters.InternalError` (500), not Forbidden.
+    #[test]
+    fn authorizer_error_is_a_500_internal_error() {
+        use axum::response::IntoResponse;
+        let e = Error::Authorization("webhook failed".into());
+        assert_eq!(e.reason(), "InternalError");
+        assert_eq!(
+            e.into_response().status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
     #[test]
     fn too_large_storage_error_is_recognised_and_is_a_500() {
         use axum::response::IntoResponse;

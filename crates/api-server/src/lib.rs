@@ -1,6 +1,7 @@
 pub mod abac;
 pub mod admission;
 pub mod audit;
+pub mod authorization_match_conditions;
 pub mod authorization_webhook;
 pub mod authorizer;
 pub use rusternetes_admission_webhook as admission_webhook;
