@@ -49,3 +49,38 @@ pub fn api_version_for(attr: &RequestAttributes) -> String {
         .flatten()
         .unwrap_or_default()
 }
+
+/// `attr` with the current request's selectors, parsed as
+/// `GetAuthorizerAttributes` does (filters/authorization.go:126-150,
+/// `AuthorizeWithSelectors`, GA and locked on since 1.34). As with
+/// [`api_version_for`], only when `attr` is about the request's own
+/// resource and verb, and the caller has not set selectors itself.
+pub fn with_request_selectors(attr: &RequestAttributes) -> std::borrow::Cow<'_, RequestAttributes> {
+    use std::borrow::Cow;
+    if !attr.field_selector_requirements.is_empty()
+        || attr.field_selector_parsing_err.is_some()
+        || !attr.label_selector_requirements.is_empty()
+        || attr.label_selector_parsing_err.is_some()
+    {
+        return Cow::Borrowed(attr);
+    }
+    let selectors = REQUEST_INFO
+        .try_with(|info| {
+            (info.is_resource_request
+                && info.resource == attr.resource
+                && info.api_group == attr.api_group
+                && info.verb == attr.verb
+                && (!info.field_selector.is_empty() || !info.label_selector.is_empty()))
+            .then(|| (info.field_selector.clone(), info.label_selector.clone()))
+        })
+        .ok()
+        .flatten();
+    match selectors {
+        Some((field, label)) => {
+            let mut a = attr.clone();
+            a.set_selectors(&field, &label);
+            Cow::Owned(a)
+        }
+        None => Cow::Borrowed(attr),
+    }
+}
