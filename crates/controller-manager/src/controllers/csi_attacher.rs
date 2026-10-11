@@ -997,6 +997,24 @@ mod tests {
         );
     }
 
+    /// `--reconcile-sync` (`main.go:76`) sets the ReconcileVA period.
+    #[tokio::test]
+    async fn reconcile_sync_flag_sets_next_reconcile() {
+        let a = CsiAttacher::new(
+            Arc::new(rusternetes_storage::memory::MemoryStorage::new()),
+            "d.example.com",
+            CsiControllerClient::with_endpoint("/nonexistent.sock"),
+        )
+        .with_reconcile_sync(Duration::from_secs(7))
+        .with_max_entries(5);
+        let mut next = Instant::now();
+        let before = Instant::now();
+        a.reconcile_va_if_due(&mut next).await;
+        assert!(next >= before + Duration::from_secs(7));
+        assert!(next < before + Duration::from_secs(30));
+        assert_eq!(a.max_entries, 5);
+    }
+
     #[test]
     fn backoff_is_exponential_and_capped() {
         // 1s, 2s, 4s ... capped at 5m (`ItemExponentialFailureRateLimiter`).
