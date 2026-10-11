@@ -6,6 +6,7 @@ pub mod framework;
 #[allow(dead_code)]
 pub mod plugins;
 pub mod scheduler;
+pub mod scheduler_config;
 pub mod volume_assume;
 pub mod volume_bind;
 pub mod volume_binding;

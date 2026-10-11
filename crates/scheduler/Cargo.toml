@@ -37,6 +37,7 @@ uuid.workspace = true
 serial_test = { workspace = true }
 async-trait.workspace = true
 chrono.workspace = true
+serde_yaml.workspace = true
 
 [dev-dependencies]
 uuid.workspace = true
