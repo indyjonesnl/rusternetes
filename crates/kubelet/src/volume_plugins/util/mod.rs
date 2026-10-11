@@ -5,6 +5,7 @@
 //! `pkg/volume/util/util.go` is ~900 lines of which this is a small slice.
 
 pub mod hostutil;
+pub mod mount_ops;
 pub mod mount_utils;
 pub mod nested_volumes;
 pub mod node_expander;
