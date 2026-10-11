@@ -6929,6 +6929,66 @@ mod tests {
         assert!(ready_heartbeat(&storage).await > old + chrono::Duration::seconds(20));
     }
 
+    /// #3261: NoExecute eviction belongs to kube-controller-manager's
+    /// taint-eviction controller alone. Upstream's kubelet has no taint
+    /// handling in its node-status path: `tryUpdateNodeStatus`
+    /// (pkg/kubelet/kubelet_node_status.go:483) only builds and patches node
+    /// status, and `grep -rni noexecute pkg/kubelet/kubelet_node_status.go`
+    /// has no match. A kubelet heartbeat must therefore leave pods on a
+    /// NoExecute-tainted node untouched (running or terminal alike).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn node_status_sync_does_not_evict_for_noexecute_taints() {
+        use rusternetes_common::resources::{Node, Pod};
+        use rusternetes_storage::{build_key, Storage, StorageBackend};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(StorageBackend::new_memory());
+        let k = status_gate_kubelet(&dir, storage.clone()).await;
+
+        let nkey = build_key("nodes", None, "node-gate");
+        let mut n: Node = storage.get(&nkey).await.unwrap();
+        n.spec.as_mut().unwrap().taints = Some(vec![
+            serde_json::from_value(serde_json::json!({
+                "key": "t", "effect": "NoExecute",
+                "timeAdded": chrono::Utc::now().to_rfc3339()
+            }))
+            .unwrap(),
+        ]);
+        storage.update(&nkey, &n).await.unwrap();
+
+        for (name, phase) in [("running", "Running"), ("done", "Succeeded")] {
+            let pod: Pod = serde_json::from_value(serde_json::json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": name, "namespace": "default", "uid": format!("u-{name}")},
+                "spec": {"nodeName": "node-gate", "containers": [{"name": "c", "image": "i"}]},
+                "status": {"phase": phase}
+            }))
+            .unwrap();
+            storage
+                .create(&build_key("pods", Some("default"), name), &pod)
+                .await
+                .unwrap();
+        }
+
+        k.update_node_status().await.unwrap();
+
+        for name in ["running", "done"] {
+            let pod: Pod = storage
+                .get(&build_key("pods", Some("default"), name))
+                .await
+                .unwrap();
+            assert!(
+                pod.metadata.deletion_timestamp.is_none(),
+                "kubelet must not evict pod {name}: eviction is the taint-eviction controller's job"
+            );
+            assert_ne!(
+                pod.status.as_ref().and_then(|s| s.reason.as_deref()),
+                Some("Evicted"),
+                "pod {name}"
+            );
+        }
+    }
+
     /// `nodeStatusReportFrequency` is configurable and defaults to 5m
     /// (v1beta1/defaults.go).
     #[tokio::test]
