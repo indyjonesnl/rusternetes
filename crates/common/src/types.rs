@@ -352,7 +352,11 @@ pub mod k8s_time_map {
 #[derive(Default)]
 pub struct ObjectMeta {
     /// Name must be unique within a namespace
-    #[serde(default, deserialize_with = "deserialize_null_string")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_string",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub name: String,
 
     /// GenerateName is an optional prefix used to generate a unique name when Name is empty.
@@ -1347,6 +1351,17 @@ pub struct ManagedFieldsEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// metav1.ObjectMeta: `Name string `json:"name,omitempty"``
+    /// (staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/types.go) — an empty
+    /// name is dropped from the wire form (#2942).
+    #[test]
+    fn empty_object_meta_name_is_omitted_from_json() {
+        let v = serde_json::to_value(ObjectMeta::default()).unwrap();
+        assert!(v.get("name").is_none(), "got {v}");
+        let v = serde_json::to_value(ObjectMeta::new("x")).unwrap();
+        assert_eq!(v["name"], "x");
+    }
 
     fn sel(json: serde_json::Value) -> LabelSelector {
         serde_json::from_value(json).unwrap()
