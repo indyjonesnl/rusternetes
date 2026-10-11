@@ -1783,3 +1783,123 @@ mod exhausted {
         );
     }
 }
+
+// ---- RequiresRemount / SupportsSELinuxContextMount lister reads -----------
+//
+// Upstream has no unit test for these two (grep RequiresRemount over
+// pkg/volume/csi/*_test.go is empty); the cases follow the code at
+// `csi_plugin.go:457-472` and `:637-660`.
+
+fn lister_host(
+    drivers: &[serde_json::Value],
+    synced: bool,
+) -> Arc<crate::volume_plugins::KubeletVolumeHost> {
+    let lister = crate::volume_plugins::csi_driver_lister::CsiDriverLister::new();
+    for d in drivers {
+        lister.insert(serde_json::from_value(d.clone()).unwrap());
+    }
+    if synced {
+        lister.mark_synced();
+    }
+    Arc::new(
+        crate::volume_plugins::KubeletVolumeHost::new(
+            "/var/lib/rusternetes".to_string(),
+            None,
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            HashMap::new(),
+        )
+        .with_csi_driver_lister(lister),
+    )
+}
+
+fn csi_driver_obj(name: &str, spec: serde_json::Value) -> serde_json::Value {
+    json!({"apiVersion": "storage.k8s.io/v1", "kind": "CSIDriver",
+           "metadata": {"name": name}, "spec": spec})
+}
+
+#[test]
+fn requires_remount_follows_csidriver_requires_republish() {
+    let h = lister_host(
+        &[
+            csi_driver_obj("rep.csi.example.com", json!({"requiresRepublish": true})),
+            csi_driver_obj("norep.csi.example.com", json!({"requiresRepublish": false})),
+        ],
+        true,
+    );
+    let p = CsiPlugin::new(h);
+    let v = claim_volume();
+    let yes = pv("rep.csi.example.com", json!({}));
+    let no = pv("norep.csi.example.com", json!({}));
+    let unknown = pv("missing.csi.example.com", json!({}));
+    let spec = |pv| Spec {
+        volume: &v,
+        persistent_volume: Some(pv),
+        read_only: false,
+    };
+    assert!(p.requires_remount(&spec(&yes)));
+    assert!(!p.requires_remount(&spec(&no)));
+    // getCSIDriver NotFound -> "Failed to mark ... as republish required" -> false.
+    assert!(!p.requires_remount(&spec(&unknown)));
+}
+
+#[test]
+fn requires_remount_is_false_without_a_lister() {
+    // `if p.csiDriverLister == nil { return false }` (csi_plugin.go:458).
+    let p = plugin();
+    let v = claim_volume();
+    let pv = pv("rep.csi.example.com", json!({}));
+    let spec = Spec {
+        volume: &v,
+        persistent_volume: Some(&pv),
+        read_only: false,
+    };
+    assert!(!p.requires_remount(&spec));
+}
+
+#[test]
+fn supports_selinux_context_mount_follows_csidriver() {
+    let _g = rusternetes_common::feature_gates::with_feature(
+        rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
+        true,
+    );
+    let h = lister_host(
+        &[
+            csi_driver_obj("se.csi.example.com", json!({"seLinuxMount": true})),
+            csi_driver_obj("nose.csi.example.com", json!({"seLinuxMount": false})),
+        ],
+        true,
+    );
+    let p = CsiPlugin::new(h);
+    let v = claim_volume();
+    let yes = pv("se.csi.example.com", json!({}));
+    let no = pv("nose.csi.example.com", json!({}));
+    let unknown = pv("missing.csi.example.com", json!({}));
+    let spec = |pv| Spec {
+        volume: &v,
+        persistent_volume: Some(pv),
+        read_only: false,
+    };
+    assert!(p.supports_selinux_context_mount(&spec(&yes)).unwrap());
+    assert!(!p.supports_selinux_context_mount(&spec(&no)).unwrap());
+    // apierrors.IsNotFound -> (false, nil).
+    assert!(!p.supports_selinux_context_mount(&spec(&unknown)).unwrap());
+}
+
+#[test]
+fn supports_selinux_context_mount_errors_when_cache_unsynced_or_lister_missing() {
+    let _g = rusternetes_common::feature_gates::with_feature(
+        rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
+        true,
+    );
+    let v = claim_volume();
+    let pv = pv("se.csi.example.com", json!({}));
+    let spec = Spec {
+        volume: &v,
+        persistent_volume: Some(&pv),
+        read_only: false,
+    };
+    // getCSIDriver: WaitForCacheSync fails / "CSIDriver lister does not exist".
+    let unsynced = CsiPlugin::new(lister_host(&[], false));
+    assert!(unsynced.supports_selinux_context_mount(&spec).is_err());
+    assert!(plugin().supports_selinux_context_mount(&spec).is_err());
+}
