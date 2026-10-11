@@ -730,7 +730,7 @@ fn spec_from(attr: &RequestAttributes) -> SarSpec {
             namespace: attr.namespace.clone().unwrap_or_default(),
             verb: attr.verb.clone(),
             group: attr.api_group.clone(),
-            version: attr.api_version.clone(),
+            version: crate::request_scope::api_version_for(attr),
             resource: attr.resource.clone(),
             subresource: attr.subresource.clone().unwrap_or_default(),
             name: attr.name.clone().unwrap_or_default(),

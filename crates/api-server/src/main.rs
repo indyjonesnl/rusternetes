@@ -46,6 +46,9 @@ mod post_start_hooks;
 mod prometheus_client;
 #[allow(dead_code)]
 mod registry;
+// The task-local is read by the lib's webhook authorizer, so the bin must
+// install it through the lib's module, not a second copy (#3159).
+use rusternetes_api_server::request_scope;
 #[allow(dead_code)]
 mod storage_readiness_hook;
 pub use rusternetes_protobuf as protobuf;

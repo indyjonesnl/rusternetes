@@ -30,7 +30,22 @@ pub async fn request_info_middleware(
     with_request_info(info, next.run(req)).await
 }
 
-/// `Attributes.GetAPIVersion` for `attr`.
+/// `Attributes.GetAPIVersion` for `attr`: the version the caller set, else the
+/// current request's `RequestInfo.APIVersion` when `attr` is about that
+/// request's own resource. A check on another resource (an escalation or
+/// signer check inside the request) must not inherit the request's version.
 pub fn api_version_for(attr: &RequestAttributes) -> String {
-    attr.api_version.clone()
+    if !attr.api_version.is_empty() {
+        return attr.api_version.clone();
+    }
+    REQUEST_INFO
+        .try_with(|info| {
+            (info.is_resource_request
+                && info.resource == attr.resource
+                && info.api_group == attr.api_group)
+                .then(|| info.api_version.clone())
+        })
+        .ok()
+        .flatten()
+        .unwrap_or_default()
 }
