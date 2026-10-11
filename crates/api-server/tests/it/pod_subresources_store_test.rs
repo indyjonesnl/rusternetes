@@ -11,6 +11,14 @@ use serde_json::{json, Value};
 
 const PODS: &str = "/api/v1/namespaces/default/pods";
 
+/// A Burstable pod: `ValidatePodResize` refuses a resize that changes the QoS
+/// class (validation.go:6217), so a resize starts from a pod with a request.
+fn burstable_pod(name: &str) -> Value {
+    let mut p = pod(name);
+    p["spec"]["containers"][0]["resources"] = json!({"requests": {"cpu": "100m"}});
+    p
+}
+
 fn pod(name: &str) -> Value {
     json!({
         "apiVersion": "v1", "kind": "Pod",
@@ -647,7 +655,7 @@ async fn binding_copies_the_node_topology_labels() {
 #[tokio::test]
 async fn resize_put_changes_only_the_resources() {
     let api = TestApiServer::new();
-    let created = create(&api, &pod("p1")).await;
+    let created = create(&api, &burstable_pod("p1")).await;
     let mut update = created.clone();
     update["spec"]["containers"][0]["image"] = json!("other");
     update["spec"]["containers"][0]["resources"] = json!({"requests": {"cpu": "500m"}});
@@ -678,7 +686,7 @@ async fn resize_put_refuses_a_renamed_container() {
 #[tokio::test]
 async fn resize_put_without_a_resource_version_is_unconditional() {
     let api = TestApiServer::new();
-    let created = create(&api, &pod("p1")).await;
+    let created = create(&api, &burstable_pod("p1")).await;
     let mut seeded = stored(&api, "p1").await;
     seeded["status"]["phase"] = json!("Running");
     put_stored(&api, "p1", &seeded).await;
