@@ -251,6 +251,17 @@ pub fn monitor_request(req: &RequestMeta, component: &str, code: u16) {
         .inc();
 }
 
+/// `InstrumentRouteFunc` (metrics.go:633-650), as a middleware. STUB.
+pub async fn instrument_request(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    next.run(req).await
+}
+
+/// STUB.
+pub fn record_request_abort(_req: &RequestMeta) {}
+
 /// `RecordDroppedRequest` (metrics.go:508-526): the request was rejected via
 /// `http.TooManyRequests`; counted in `apiserver_request_total` with code 429.
 pub fn record_dropped_request(req: &RequestMeta, component: &str, _is_mutating: bool) {
@@ -485,5 +496,114 @@ mod tests {
                 "{name}{{request_kind={kind}}}"
             );
         }
+    }
+
+    async fn serve(method: &str, path: &str, body: &'static str) -> axum::response::Response {
+        use tower::ServiceExt;
+        let app = axum::Router::new()
+            .fallback(move || async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                body
+            })
+            .layer(axum::middleware::from_fn(instrument_request));
+        app.oneshot(
+            axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    // InstrumentRouteFunc -> MonitorRequest (metrics.go:633-650, 599-603):
+    // the general layer counts requests with no APF in the chain.
+    #[tokio::test]
+    async fn instrument_layer_counts_request_total() {
+        let l = [
+            ("verb", "LIST"),
+            ("resource", "instrumentedthings"),
+            ("scope", "namespace"),
+            ("code", "200"),
+        ];
+        let before = sample("apiserver_request_total", &l);
+        serve("GET", "/api/v1/namespaces/default/instrumentedthings", "ok").await;
+        assert_eq!(sample("apiserver_request_total", &l), before + 1.0);
+    }
+
+    // Long-running non-watch requests (skipped by APF, :90-95) are counted.
+    #[tokio::test]
+    async fn instrument_layer_counts_long_running_non_watch() {
+        let l = [
+            ("verb", "CONNECT"),
+            ("resource", "pods"),
+            ("subresource", "exec"),
+            ("code", "200"),
+        ];
+        let before = sample("apiserver_request_total", &l);
+        serve("GET", "/api/v1/namespaces/default/pods/p/exec", "ok").await;
+        assert_eq!(sample("apiserver_request_total", &l), before + 1.0);
+    }
+
+    // Requests with no resource info (RequestInfo{Verb: Method, Path}) are
+    // counted with empty group/version/resource/scope (metrics.go:591-594).
+    #[tokio::test]
+    async fn instrument_layer_counts_non_resource_request() {
+        let l = [
+            ("verb", "GET"),
+            ("resource", ""),
+            ("scope", ""),
+            ("code", "200"),
+        ];
+        let before = sample("apiserver_request_total", &l);
+        serve("GET", "/healthz", "ok").await;
+        assert!(sample("apiserver_request_total", &l) >= before + 1.0);
+    }
+
+    // requestLatencies (metrics.go:104-118, :609): observed with the elapsed time.
+    #[tokio::test]
+    async fn instrument_layer_observes_request_duration() {
+        use crate::flow_control::metric_test_util::sample_sum;
+        let l = [("resource", "durationthings"), ("verb", "LIST")];
+        let before = sample("apiserver_request_duration_seconds", &l);
+        serve("GET", "/api/v1/namespaces/default/durationthings", "ok").await;
+        assert_eq!(
+            sample("apiserver_request_duration_seconds", &l),
+            before + 1.0
+        );
+        assert!(sample_sum("apiserver_request_duration_seconds", &l) >= 0.02);
+    }
+
+    // responseSizes (metrics.go:152-162, :625-628): read requests only.
+    #[tokio::test]
+    async fn instrument_layer_observes_response_size_for_reads_only() {
+        use crate::flow_control::metric_test_util::{has_series, sample_sum};
+        serve("GET", "/api/v1/namespaces/default/sizedthings", "12345").await;
+        assert_eq!(
+            sample_sum(
+                "apiserver_response_sizes",
+                &[("resource", "sizedthings"), ("verb", "LIST")]
+            ),
+            5.0
+        );
+        serve("POST", "/api/v1/namespaces/default/postedthings", "123").await;
+        assert!(!has_series(
+            "apiserver_response_sizes",
+            &[("resource", "postedthings")]
+        ));
+    }
+
+    // RecordRequestAbort (metrics.go:496-506).
+    #[test]
+    fn request_abort_counts_aborts_total() {
+        let l = [
+            ("verb", "LIST"),
+            ("resource", "abortedthings"),
+            ("scope", "namespace"),
+        ];
+        let before = sample("apiserver_request_aborts_total", &l);
+        record_request_abort(&meta("abortedthings"));
+        assert_eq!(sample("apiserver_request_aborts_total", &l), before + 1.0);
     }
 }
