@@ -149,12 +149,19 @@ pub trait Patcher: Send + Sync {
 pub struct MatchResult {
     pub matches: bool,
     pub error: Option<String>,
+    /// `FailedConditionName`: the first condition that evaluated to false.
+    pub failed_condition_name: Option<String>,
 }
 
 /// `matchconditions.Matcher.Match` over the versioned attributes.
 #[async_trait]
 pub trait ConditionMatcher: Send + Sync {
-    async fn matches(&self, versioned: &VersionedAttributes, param: Option<&Value>) -> MatchResult;
+    async fn matches(
+        &self,
+        attributes: &Attributes,
+        versioned: &VersionedAttributes,
+        param: Option<&Value>,
+    ) -> MatchResult;
 }
 
 /// compilation.go `PolicyEvaluator`: the compiled match conditions and one
@@ -173,8 +180,8 @@ pub struct MutatingEvaluator {
 /// mismatch. `spec.variables` are composited into every patcher
 /// (`CompileAndStoreVariables`, :44).
 ///
-/// Not yet ported (tracked in #3113): the `matchConditions` matcher
-/// (:47-54, `matchconditions.NewMatcher`), so `matcher` is always `None`.
+/// `spec.matchConditions` compile to a `matchconditions.NewMatcher`
+/// (:47-54) with matcherKind "policy", matcherType "validate".
 pub fn compile_policy(policy: &MutatingAdmissionPolicy) -> MutatingEvaluator {
     use super::policy_apply_config::ApplyConfigPatcher;
     use super::policy_json_patch::JsonPatcher;
@@ -211,10 +218,16 @@ pub fn compile_policy(policy: &MutatingAdmissionPolicy) -> MutatingEvaluator {
             _ => {}
         }
     }
-    MutatingEvaluator {
-        matcher: None,
-        mutators,
-    }
+    // Compile matchers (compilation.go:47-54).
+    let matcher: Option<Arc<dyn ConditionMatcher>> = match spec.match_conditions.as_deref() {
+        Some(conds) if !conds.is_empty() => Some(super::policy_match_conditions::new_matcher(
+            conds,
+            &variables,
+            spec.failure_policy.as_ref(),
+        )),
+        _ => None,
+    };
+    MutatingEvaluator { matcher, mutators }
 }
 
 /// `patch.TypeConverterManager.GetTypeConverter != nil`.
@@ -426,7 +439,9 @@ impl MutatingDispatcher {
                 .map_err(Error::Internal)?;
 
             if let Some(matcher) = &invocation.evaluator.matcher {
-                let result = matcher.matches(current, invocation.param.as_ref()).await;
+                let result = matcher
+                    .matches(attr, current, invocation.param.as_ref())
+                    .await;
                 if let Some(err) = result.error {
                     policy_errors.push(config_error(err, invocation));
                     continue;
@@ -657,7 +672,12 @@ mod tests {
     struct Cond(Box<dyn Fn(&Value) -> MatchResult + Send + Sync>);
     #[async_trait]
     impl ConditionMatcher for Cond {
-        async fn matches(&self, v: &VersionedAttributes, _: Option<&Value>) -> MatchResult {
+        async fn matches(
+            &self,
+            _: &Attributes,
+            v: &VersionedAttributes,
+            _: Option<&Value>,
+        ) -> MatchResult {
             (self.0)(v.versioned_object.as_ref().unwrap())
         }
     }
@@ -830,6 +850,7 @@ mod tests {
         ev.matcher = Some(cond(|o| MatchResult {
             matches: o["metadata"]["labels"]["environment"] == json!("production"),
             error: None,
+            ..Default::default()
         }));
         run(&dispatcher(ctx()), &mut a, &[c1, case("policy2", ev)])
             .await
@@ -849,6 +870,7 @@ mod tests {
         ev.matcher = Some(cond(|_| MatchResult {
             matches: false,
             error: None,
+            ..Default::default()
         }));
         let before = a.object.clone();
         let errs = run(&dispatcher(ctx()), &mut a, &[case("policy1", ev)])
@@ -865,6 +887,7 @@ mod tests {
         ev.matcher = Some(cond(|_| MatchResult {
             matches: false,
             error: Some("boom".into()),
+            ..Default::default()
         }));
         let c2 = case("policy2", mutators(vec![set_label("p2", "y")]));
         let errs = run(&dispatcher(ctx()), &mut a, &[case("policy1", ev), c2])
@@ -1227,5 +1250,18 @@ mod tests {
             ],
         );
         assert!(ev.mutators.is_empty());
+    }
+
+    /// compilation.go:47-54: `spec.matchConditions` compile to a matcher.
+    #[test]
+    fn compile_policy_builds_matcher_from_match_conditions() {
+        use rusternetes_common::resources::admission_webhook::MatchCondition;
+        let mut p = policy("p", 0, None);
+        assert!(compile_policy(&p).matcher.is_none());
+        p.spec.as_mut().unwrap().match_conditions = Some(vec![MatchCondition {
+            name: "c".into(),
+            expression: "object.metadata.name == 'x'".into(),
+        }]);
+        assert!(compile_policy(&p).matcher.is_some());
     }
 }

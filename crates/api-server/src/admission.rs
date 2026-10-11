@@ -9,6 +9,7 @@ pub mod policy_dispatch;
 pub mod policy_install;
 pub mod policy_json_patch;
 pub mod policy_json_patch_ops;
+pub mod policy_match_conditions;
 pub mod policy_matching;
 pub mod policy_mutating;
 pub mod policy_plugin;
