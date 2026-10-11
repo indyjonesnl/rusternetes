@@ -794,3 +794,74 @@ async fn strict_apply_refuses_a_duplicate_yaml_key() {
         "{text}"
     );
 }
+
+/// `fieldValidation` defaults to Warn: the pruner's unknown field paths
+/// (`structuralpruning.PruneWithOptions` with `TrackUnknownFieldPaths`,
+/// customresource_handler.go:1427-1435) feed a `StrictDecodingError`
+/// (:1338-1342), which `addStrictDecodingWarnings` (rest.go:439-446) turns
+/// into one `unknown field "<path>"` warning each, sorted
+/// (pruning/algorithm.go:42 `sort.Strings`).
+#[tokio::test]
+async fn warn_mode_reports_the_pruned_unknown_fields_of_a_custom_resource() {
+    let api = TestApiServer::new();
+    install(
+        &api,
+        &crd("widgets", "Widget", "Namespaced", false, typed_schema()),
+    )
+    .await;
+    let mut body = widget("w1");
+    body["extra"] = json!("nope");
+    body["spec"]["bogus"] = json!({ "a": 1 });
+    let (status, headers, bytes, out) = api
+        .send_full(
+            "POST",
+            &ns_path("widgets"),
+            Some("application/json"),
+            None,
+            Some(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert!(out["spec"].get("bogus").is_none(), "{out}");
+    let warnings: Vec<String> = headers
+        .get_all("warning")
+        .iter()
+        .map(|v| v.to_str().unwrap_or_default().to_string())
+        .collect();
+    let joined = warnings.join("\n");
+    assert!(joined.contains(r#"unknown field \"extra\""#), "{joined:?}");
+    assert!(
+        joined.contains(r#"unknown field \"spec.bogus\""#),
+        "{joined:?}"
+    );
+}
+
+/// A schema that preserves unknown fields (`TestPrune` "preserve unknown
+/// fields", algorithm_test.go) has nothing to warn about.
+#[tokio::test]
+async fn warn_mode_is_silent_for_a_preserving_custom_resource() {
+    let api = TestApiServer::new();
+    install(
+        &api,
+        &crd("widgets", "Widget", "Namespaced", false, open_schema()),
+    )
+    .await;
+    let mut body = widget("w1");
+    body["extra"] = json!("kept");
+    let (status, headers, _, _) = api
+        .send_full(
+            "POST",
+            &ns_path("widgets"),
+            Some("application/json"),
+            None,
+            Some(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(headers.get_all("warning").iter().count(), 0, "{headers:?}");
+}
