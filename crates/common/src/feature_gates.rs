@@ -263,6 +263,59 @@ impl Feature {
         }
     }
 
+    /// Upstream `PreRelease` of the spec at the v1.35 target, i.e. the last
+    /// entry of the gate's versioned spec list (`pkg/features/kube_features.go`,
+    /// `staging/src/k8s.io/apiserver/pkg/features/kube_features.go`,
+    /// `staging/src/k8s.io/component-base/zpages/features/kube_features.go`).
+    /// Consumed by the `AllAlpha`/`AllBeta` specials and PreAlpha rejection in
+    /// [`set_from_str`].
+    const fn prerelease(self) -> PreRelease {
+        match self {
+            Feature::RelaxedDNSSearchValidation | Feature::InPlacePodVerticalScaling => {
+                PreRelease::Ga
+            }
+            Feature::PodTopologyLabelsAdmission
+            | Feature::SELinuxMountReadWriteOncePod
+            | Feature::SELinuxMount
+            | Feature::SELinuxChangePolicy
+            | Feature::MaxUnavailableStatefulSet
+            | Feature::DRAResourceClaimDeviceStatus
+            | Feature::ClusterTrustBundleProjection
+            | Feature::PodCertificateRequest
+            | Feature::PodLevelResources
+            | Feature::MatchLabelKeysInPodTopologySpread
+            | Feature::MatchLabelKeysInPodTopologySpreadSelectorMerge
+            | Feature::PodDeletionCost
+            | Feature::ClusterTrustBundle
+            | Feature::APIServerIdentity
+            | Feature::StorageVersionMigrator
+            | Feature::KubeletCrashLoopBackOffMax
+            | Feature::WatchCacheInitializationPostStartHook
+            | Feature::MutableCSINodeAllocatableCount
+            | Feature::MutatingAdmissionPolicy
+            | Feature::DeploymentReplicaSetTerminatingReplicas => PreRelease::Beta,
+            Feature::NodeDeclaredFeatures
+            | Feature::DRADeviceTaints
+            | Feature::DRAPartitionableDevices
+            | Feature::DRADeviceBindingConditions
+            | Feature::DRAConsumableCapacity
+            | Feature::InPlacePodLevelResourcesVerticalScaling
+            | Feature::DRAExtendedResource
+            | Feature::ContainerStopSignals
+            | Feature::ResourceHealthStatus
+            | Feature::GenericWorkload
+            | Feature::TaintTolerationComparisonOperators
+            | Feature::DRADeviceTaintRules
+            | Feature::ComponentFlagz
+            | Feature::ComponentStatusz
+            | Feature::StorageVersionAPI
+            | Feature::ReduceDefaultCrashLoopBackOffDecay
+            | Feature::StorageCapacityScoring
+            | Feature::CrossNamespaceVolumeDataSource
+            | Feature::RuntimeClassInImageCriApi => PreRelease::Alpha,
+        }
+    }
+
     /// `LockToDefault` in upstream's spec. Only gates modelled as GA-locked.
     const fn locked_to_default(self) -> bool {
         matches!(self, Feature::RelaxedDNSSearchValidation)
@@ -491,6 +544,46 @@ pub fn reset_to_defaults() {
     }
 }
 
+/// `featuregate.prerelease` (feature_gate.go:130-141).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreRelease {
+    PreAlpha,
+    Alpha,
+    Beta,
+    Ga,
+    Deprecated,
+}
+
+/// Name of the special "all alpha gates" toggle (feature_gate.go:51).
+const ALL_ALPHA_GATE: &str = "AllAlpha";
+/// Name of the special "all beta gates" toggle (feature_gate.go:57).
+const ALL_BETA_GATE: &str = "AllBeta";
+/// Emulation version and its min-compatibility version (emulation - 1 minor,
+/// `NewVersionedFeatureGate` feature_gate.go:305-308) quoted by the PreAlpha error.
+const EMULATION_VERSION: &str = "1.35";
+const MIN_COMPATIBILITY_VERSION: &str = "1.34";
+
+/// One known gate as seen by [`resolve_gates`]; the model of upstream's
+/// `known` map entry reduced to what `unsafeSetFromMap` reads.
+struct KnownGate {
+    name: String,
+    pre_release: PreRelease,
+    default: bool,
+    locked_to_default: bool,
+}
+
+fn known_gates() -> Vec<KnownGate> {
+    ALL_FEATURES
+        .iter()
+        .map(|f| KnownGate {
+            name: format!("{f:?}"),
+            pre_release: f.prerelease(),
+            default: f.default_enabled(),
+            locked_to_default: f.locked_to_default(),
+        })
+        .collect()
+}
+
 /// Parse a `--feature-gates` value and apply it. Port of
 /// `featureGate.Set` / `SetFromMap`
 /// (staging/src/k8s.io/component-base/featuregate/feature_gate.go:340-359, 440-469).
@@ -524,34 +617,70 @@ pub fn set_from_str(value: &str) -> Result<(), String> {
 /// no error occurred (:463-466). Multiple errors aggregate as `[a, b]`
 /// (`utilerrors.NewAggregate`).
 ///
-/// Gap: upstream's `AllAlpha`/`AllBeta` specials, PreAlpha rejection and
-/// emulation versions are not modelled (no per-gate prerelease metadata).
+/// Gap: emulation versions and feature dependencies are not modelled.
 fn set_from_map(m: &[(String, bool)]) -> Result<(), String> {
+    for (name, v) in resolve_gates(m, &known_gates())? {
+        if let Some(&f) = ALL_FEATURES.iter().find(|f| format!("{f:?}") == name) {
+            set(f, v);
+        }
+    }
+    Ok(())
+}
+
+/// The pure body of `unsafeSetFromMap` (feature_gate.go:381-418) including the
+/// `special` handling of `AllAlpha`/`AllBeta` (:396-400, `setUnsetAlphaGates` /
+/// `setUnsetBetaGates` :270-296) and PreAlpha rejection (:401-404). Returns the
+/// gates to set; special toggles only fill gates the caller did not set
+/// explicitly, so an explicit value wins whatever the order in `m`.
+fn resolve_gates(m: &[(String, bool)], known: &[KnownGate]) -> Result<Vec<(String, bool)>, String> {
     let mut errs: Vec<String> = Vec::new();
-    let mut staged: Vec<(Feature, bool)> = Vec::new();
+    let mut enabled: Vec<(String, bool)> = Vec::new();
+    let mut specials: Vec<(PreRelease, bool)> = Vec::new();
     for (k, v) in m {
-        let Some(&f) = ALL_FEATURES.iter().find(|f| format!("{f:?}") == *k) else {
-            return Err(format!("unrecognized feature gate: {k}"));
+        let special = match k.as_str() {
+            ALL_ALPHA_GATE => Some(PreRelease::Alpha),
+            ALL_BETA_GATE => Some(PreRelease::Beta),
+            _ => None,
         };
-        if f.locked_to_default() && f.default_enabled() != *v {
+        let gate = known.iter().find(|g| g.name == *k);
+        if gate.is_none() && special.is_none() {
+            return Err(format!("unrecognized feature gate: {k}"));
+        }
+        // The specials are never locked (default false, Alpha/Beta spec).
+        if let Some(g) = gate {
+            if g.locked_to_default && g.default != *v {
+                errs.push(format!(
+                    "cannot set feature gate {k} to {v}, feature is locked to {}",
+                    g.default
+                ));
+                continue;
+            }
+        }
+        if let Some(pre) = special {
+            specials.push((pre, *v));
+            continue;
+        }
+        if gate.is_some_and(|g| g.pre_release == PreRelease::PreAlpha) {
             errs.push(format!(
-                "cannot set feature gate {k} to {v}, feature is locked to {}",
-                f.default_enabled()
+                "cannot set feature gate {k} to {v}, feature is PreAlpha at emulated version {EMULATION_VERSION}, min compatibility version {MIN_COMPATIBILITY_VERSION}"
             ));
             continue;
         }
-        staged.push((f, *v));
+        enabled.push((k.clone(), *v));
     }
     match errs.len() {
-        0 => {
-            for (f, v) in staged {
-                set(f, v);
-            }
-            Ok(())
-        }
-        1 => Err(errs.remove(0)),
-        _ => Err(format!("[{}]", errs.join(", "))),
+        0 => {}
+        1 => return Err(errs.remove(0)),
+        _ => return Err(format!("[{}]", errs.join(", "))),
     }
+    for (pre, val) in specials {
+        for g in known {
+            if g.pre_release == pre && !enabled.iter().any(|(n, _)| *n == g.name) {
+                enabled.push((g.name.clone(), val));
+            }
+        }
+    }
+    Ok(enabled)
 }
 
 /// RAII guard that restores `feature` to its prior value on drop. Use in tests
@@ -707,6 +836,110 @@ mod tests {
         assert!(enabled(Feature::StorageCapacityScoring));
         set_from_str("StorageCapacityScoring=0").unwrap();
         assert!(!enabled(Feature::StorageCapacityScoring));
+        reset_to_defaults();
+    }
+
+    // feature_gate_test.go TestFeatureGateFlag "AllAlpha=true" / "AllBeta=true":
+    // the special gates flip every Alpha (resp. Beta) gate not set explicitly.
+    #[test]
+    #[serial]
+    fn all_alpha_and_all_beta_toggle_by_prerelease() {
+        reset_to_defaults();
+        // StorageCapacityScoring: Alpha, default off. PodDeletionCost: Beta, default on.
+        // MaxUnavailableStatefulSet: Beta, default off.
+        set_from_str("AllAlpha=true").unwrap();
+        assert!(enabled(Feature::StorageCapacityScoring));
+        assert!(enabled(Feature::DRADeviceTaints));
+        assert!(
+            !enabled(Feature::MaxUnavailableStatefulSet),
+            "Beta untouched"
+        );
+        reset_to_defaults();
+        set_from_str("AllBeta=true").unwrap();
+        assert!(enabled(Feature::MaxUnavailableStatefulSet));
+        assert!(!enabled(Feature::StorageCapacityScoring), "Alpha untouched");
+        reset_to_defaults();
+        set_from_str("AllBeta=false").unwrap();
+        assert!(!enabled(Feature::PodDeletionCost));
+        reset_to_defaults();
+    }
+
+    // "TestAlpha=false,AllAlpha=true" and "AllAlpha=true,TestAlpha=false":
+    // explicit wins regardless of order.
+    #[test]
+    #[serial]
+    fn explicit_gate_overrides_all_alpha_in_either_order() {
+        for arg in [
+            "StorageCapacityScoring=false,AllAlpha=true",
+            "AllAlpha=true,StorageCapacityScoring=false",
+        ] {
+            reset_to_defaults();
+            set_from_str(arg).unwrap();
+            assert!(!enabled(Feature::StorageCapacityScoring), "{arg}");
+            assert!(enabled(Feature::DRADeviceTaints), "{arg}");
+        }
+        reset_to_defaults();
+    }
+
+    fn synthetic() -> Vec<KnownGate> {
+        let g = |n: &str, pre, locked| KnownGate {
+            name: n.into(),
+            pre_release: pre,
+            default: false,
+            locked_to_default: locked,
+        };
+        vec![
+            g("TestAlpha", PreRelease::Alpha, false),
+            g("TestBeta", PreRelease::Beta, false),
+            g("TestPreAlpha", PreRelease::PreAlpha, false),
+            g("TestLockedFalse", PreRelease::Ga, true),
+        ]
+    }
+
+    fn m(args: &[(&str, bool)]) -> Vec<(String, bool)> {
+        args.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    // feature_gate_test.go:806-807 / 824-825: PreAlpha gates are rejected,
+    // and AllAlpha never enables them.
+    #[test]
+    fn pre_alpha_rejected_and_untouched_by_all_alpha() {
+        let k = synthetic();
+        assert_eq!(
+            resolve_gates(&m(&[("TestPreAlpha", true)]), &k).unwrap_err(),
+            "cannot set feature gate TestPreAlpha to true, feature is PreAlpha at emulated version 1.35, min compatibility version 1.34"
+        );
+        let mut got = resolve_gates(&m(&[("AllAlpha", true)]), &k).unwrap();
+        got.sort();
+        assert_eq!(got, vec![("TestAlpha".to_string(), true)]);
+    }
+
+    // "TestBeta=true,AllAlpha=false" and "TestAlpha=true,AllBeta=false".
+    #[test]
+    fn specials_do_not_cross_prerelease() {
+        let k = synthetic();
+        let mut got = resolve_gates(&m(&[("TestBeta", true), ("AllAlpha", false)]), &k).unwrap();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("TestAlpha".to_string(), false),
+                ("TestBeta".to_string(), true)
+            ]
+        );
+        assert!(resolve_gates(&m(&[("TestLockedFalse", true)]), &k)
+            .unwrap_err()
+            .contains("locked to false"));
+    }
+
+    // "AllAlpha=banana" -> parse error, nothing applied.
+    #[test]
+    #[serial]
+    fn all_alpha_bad_value_errors() {
+        reset_to_defaults();
+        assert!(set_from_str("AllAlpha=banana")
+            .unwrap_err()
+            .starts_with("invalid value of AllAlpha"));
         reset_to_defaults();
     }
 }
