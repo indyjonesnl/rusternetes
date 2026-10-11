@@ -701,10 +701,9 @@ impl<S: Storage + 'static> RangeAllocator<S> {
             match set.allocate_next() {
                 Ok(c) => allocated.push(c),
                 Err(e) => {
-                    // Deviation from upstream, which leaks the CIDRs already
-                    // taken from earlier sets (and again on every requeue):
-                    // nothing was written, so handing them back is safe.
-                    self.release_allocated(&allocated);
+                    // Ported exactly from range_allocator.go:316-339
+                    // (AllocateOrOccupyCIDR): the CIDRs already taken from
+                    // earlier sets are NOT released here (upstream leaks them).
                     self.record_node_status_change(node, "CIDRNotAvailable")
                         .await;
                     anyhow::bail!("failed to allocate cidr from cluster cidr at idx:{idx}: {e}");
@@ -762,15 +761,12 @@ impl<S: Storage + 'static> RangeAllocator<S> {
         let node: Node = match self.storage.get(&key).await {
             Ok(n) => n,
             Err(e) => {
-                // Deviation from upstream, which leaks the CIDR here: nothing
-                // was written, so handing it back is always safe.
+                // Ported exactly from range_allocator.go:395-399
+                // (updateCIDRsAllocation): log and return the lister error
+                // without releasing allocatedCIDRs (upstream leaks them).
                 error!(
                     "Failed while getting node {node_name} for updating Node.Spec.PodCIDRs: {e}"
                 );
-                self.release_allocated(&allocated);
-                if matches!(e, Error::NotFound(_)) {
-                    return Ok(());
-                }
                 return Err(e.into());
             }
         };
