@@ -30,13 +30,16 @@
 //! external-provisioner `Delete` / `handleSecretsForDeletion` /
 //! `canDeleteVolume`) and the slow-retry set for infeasible
 //! (`InvalidArgument`) requests (`delayProvisioningIfRecentlyInfeasible`,
-//! `markForSlowRetry`, csi-lib-utils `slowset`). NOT ported here: CSI
-//! migration of in-tree PVs (`IsPVMigratable` / `TranslateInTreePVToCSI`).
+//! `markForSlowRetry`, csi-lib-utils `slowset`). CSI migration of in-tree PVs
+//! on delete (`IsPVMigratable` / `TranslateInTreePVToCSI`, #2993) uses the
+//! shared `CsiTranslator`; the in-tree StorageClass translation behind
+//! `--supports-migration-from-in-tree-plugin` is NOT ported.
 
 use super::csi_topology::{
     generate_volume_node_affinity, TopologyError, TopologyInputs, TopologyStore,
 };
 use anyhow::{anyhow, Context, Result};
+use rusternetes_common::csi_translation::CsiTranslator;
 use rusternetes_common::quantity::{Format, Quantity};
 use rusternetes_common::resources::csi::{VolumeAttachment, VolumeAttributesClass};
 use rusternetes_common::resources::service_account::ObjectReference;
@@ -1229,6 +1232,23 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
         &self,
         volume: &PersistentVolume,
     ) -> std::result::Result<(), DeleteFailure> {
+        // controller.go:1396-1408: "we end up here only if CSI migration is
+        // enabled in-tree ... causing in-tree PV controller to yield deletion
+        // of PVs with in-tree source to external provisioner". The PV is
+        // translated with the shared `CsiTranslator`
+        // (`TranslateInTreePVToCSI`). The in-tree StorageClass translation in
+        // `getSecretsFromSC` only applies with
+        // `--supports-migration-from-in-tree-plugin`, which is not ported.
+        let translator = CsiTranslator::new();
+        let translated;
+        let volume = if translator.is_pv_migratable(volume) {
+            translated = translator
+                .translate_in_tree_pv_to_csi(volume)
+                .map_err(|e| anyhow!(e))?;
+            &translated
+        } else {
+            volume
+        };
         let Some(csi) = volume.spec.csi.as_ref() else {
             return Err(anyhow!("invalid CSI PV").into());
         };
