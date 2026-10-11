@@ -65,6 +65,11 @@ impl StorageReadinessHook {
         }
     }
 
+    #[cfg(test)]
+    fn registered(&self) -> Vec<String> {
+        self.checks.lock().unwrap().keys().cloned().collect()
+    }
+
     /// `check`: true once every registered check passes (:59-75).
     pub fn check(&self) -> bool {
         let checks = self.checks.lock().unwrap();
@@ -105,6 +110,23 @@ fn gate_enabled() -> bool {
     rusternetes_common::feature_gates::enabled(
         rusternetes_common::feature_gates::Feature::WatchCacheInitializationPostStartHook,
     )
+}
+
+/// `metav1.GroupVersionResource.String()`
+/// (`staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/group_version.go:56-61`):
+/// `group + "/" + version + ", Resource=" + resource`.
+pub fn gvr_string(group: &str, version: &str, resource: &str) -> String {
+    format!("{group}/{version}, Resource={resource}")
+}
+
+/// Every GVR registered through `registerStorageReadinessCheck`.
+pub fn storage_readiness_gvrs() -> Vec<String> {
+    Vec::new()
+}
+
+/// `registerStorageReadinessCheck` for every served group.
+pub fn register_resource_storages(hook: &StorageReadinessHook, ready: Arc<AtomicBool>) {
+    let _ = (hook, ready);
 }
 
 /// Wire the hook for this api-server and register it (server.go:315-317).
@@ -199,6 +221,44 @@ mod tests {
         h.register_storage("g", || Ok(()));
         h.register_storage("g", || Err("second".into()));
         assert!(h.check());
+    }
+
+    /// genericapiserver.go:932-947: one `RegisterStorage` per resource GVR,
+    /// keyed by `GroupVersionResource.String()`.
+    #[test]
+    fn one_check_per_resource_gvr() {
+        let gvrs = storage_readiness_gvrs();
+        assert!(gvrs.contains(&"/v1, Resource=pods".to_string()));
+        assert!(gvrs.contains(&"apps/v1, Resource=deployments".to_string()));
+        // Subresources and non-storage-backed virtual REST are not registered.
+        assert!(!gvrs
+            .iter()
+            .any(|g| g.contains('/') && g.ends_with("/status")));
+        assert!(!gvrs.iter().any(|g| g.ends_with("Resource=tokenreviews")));
+        assert!(!gvrs
+            .iter()
+            .any(|g| g.ends_with("Resource=subjectaccessreviews")));
+        let h = StorageReadinessHook::new(Duration::from_secs(1));
+        let ready = Arc::new(AtomicBool::new(false));
+        register_resource_storages(&h, ready.clone());
+        assert_eq!(h.registered(), {
+            let mut v = gvrs.clone();
+            v.sort();
+            v.dedup();
+            v
+        });
+        assert!(!h.check());
+        ready.store(true, Ordering::SeqCst);
+        assert!(h.check());
+    }
+
+    #[test]
+    fn gvr_string_matches_metav1() {
+        assert_eq!(
+            gvr_string("apps", "v1", "deployments"),
+            "apps/v1, Resource=deployments"
+        );
+        assert_eq!(gvr_string("", "v1", "pods"), "/v1, Resource=pods");
     }
 
     /// server.go:315-317: absent by default, present when the gate is on.
