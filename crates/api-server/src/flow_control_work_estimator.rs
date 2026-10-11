@@ -348,7 +348,7 @@ impl WorkEstimator {
     fn estimate_mutating(
         &self,
         info: &RequestInfo,
-        _flow_schema: &str,
+        flow_schema: &str,
         priority_level: &str,
     ) -> WorkEstimate {
         let cfg = &self.config;
@@ -376,7 +376,8 @@ impl WorkEstimator {
         }
 
         let watch_count = (self.watch_count_getter)(info);
-        // (metrics.ObserveWatchCount: not ported, see module docs.)
+        // :78
+        crate::flow_control_metrics::observe_watch_count(priority_level, flow_schema, watch_count);
 
         // :549-596
         let mut final_seats: u64 = 0;
@@ -631,6 +632,28 @@ mod tests {
                 c.name
             );
         }
+    }
+
+    /// mutating_work_estimator.go:78 `metrics.ObserveWatchCount`.
+    #[test]
+    fn mutating_estimate_observes_the_watch_count() {
+        use crate::flow_control::metric_test_util::{sample, sample_sum};
+        let est = WorkEstimator::new(
+            Box::new(|_| Ok(Stats::default())),
+            Box::new(|_| 5),
+            WorkEstimatorConfig::default(),
+            Box::new(|_| 10),
+        );
+        let info = RequestInfo {
+            verb: "create".into(),
+            resource: "pods".into(),
+            ..Default::default()
+        };
+        est.estimate_work(Some(&info), "", "wc-fs", "wc-pl");
+        let l = [("priority_level", "wc-pl"), ("flow_schema", "wc-fs")];
+        let name = "apiserver_flowcontrol_watch_count_samples";
+        assert_eq!(sample(name, &l), 1.0);
+        assert_eq!(sample_sum(name, &l), 5.0);
     }
 
     /// First row of `TestWorkEstimator` ("request has no RequestInfo, expect

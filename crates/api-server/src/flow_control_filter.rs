@@ -38,9 +38,10 @@
 //! - Metrics: the counters, queue/executing gauges and wait/execution/seat
 //!   histograms are ported (`flow_control_metrics`, #2809), and so are the
 //!   timing-ratio histograms (seat/request utilization, read-vs-write) and the
-//!   limit/demand gauges (#2960). Not ported: `demand_seats`,
-//!   `RecordDroppedRequest`/`RecordRequestTermination`, the queueset R/S
-//!   gauges and a few counters (see the module doc of `flow_control_metrics`).
+//!   limit/demand gauges (#2960), `demand_seats`, the queueset R/S gauges and
+//!   counters, and `watch_count_samples` (#2987). Not ported:
+//!   `RecordDroppedRequest`/`RecordRequestTermination` (see the module doc of
+//!   `flow_control_metrics`).
 //! - `getRequestWaitContext` has no request deadline to take 1/4 of (we have no
 //!   `WithRequestDeadline`/timeout filter), so the default limit applies:
 //!   `RequestTimeout/4` = 15s (config.go:445, :1027).
