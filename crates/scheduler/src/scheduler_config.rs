@@ -158,6 +158,20 @@ pub fn volume_binding_args_from_config(
     }
 }
 
+/// Read `--config` / `--scheduler-config` and resolve the `VolumeBinding` args
+/// (upstream `Options.ConfigFile`, cmd/kube-scheduler/app/options/options.go:203,
+/// then `LoadConfigFromFile`). Shared by the standalone and all-in-one
+/// binaries. The `StorageCapacityScoring` gate is read from the process-wide
+/// feature gates, so apply `--feature-gates` first.
+pub fn load_volume_binding_args(path: &str) -> Result<VolumeBindingArgs, String> {
+    let doc = std::fs::read_to_string(path).map_err(|e| format!("reading config {path}: {e}"))?;
+    let scoring = rusternetes_common::feature_gates::enabled(
+        rusternetes_common::feature_gates::Feature::StorageCapacityScoring,
+    );
+    volume_binding_args_from_config(&doc, scoring)
+        .map_err(|e| format!("invalid config {path}: {e}"))
+}
+
 /// `validateFunctionShape` (validation_pluginargs.go:176-211).
 fn validate_function_shape(shape: &[UtilizationShapePoint], path: &Path) -> ErrorList {
     const MIN_UTILIZATION: i32 = 0;

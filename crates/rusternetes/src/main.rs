@@ -120,6 +120,12 @@ struct Args {
     #[arg(long, default_value = "2")]
     scheduler_interval: u64,
 
+    /// Path to a KubeSchedulerConfiguration file (upstream kube-scheduler
+    /// `--config`). Only `profiles[0].pluginConfig[VolumeBinding].args` is
+    /// consumed, as in the standalone scheduler binary (#3202).
+    #[arg(long)]
+    scheduler_config: Option<String>,
+
     /// Kubelet sync interval in seconds
     #[arg(long, default_value = "3")]
     kubelet_sync_interval: u64,
@@ -228,9 +234,24 @@ fn apply_feature_gates(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// Build the embedded scheduler config, loading `--scheduler-config` when set.
+fn scheduler_config_from_args(args: &Args) -> Result<rusternetes_scheduler::SchedulerConfig> {
+    let volume_binding_args = match &args.scheduler_config {
+        Some(path) => rusternetes_scheduler::scheduler_config::load_volume_binding_args(path)
+            .map_err(|e| anyhow::anyhow!("--scheduler-config: {e}"))?,
+        None => Default::default(),
+    };
+    Ok(rusternetes_scheduler::SchedulerConfig {
+        interval: args.scheduler_interval,
+        volume_binding_args,
+    })
+}
+
 async fn async_main() -> Result<()> {
     let args = Args::parse();
     apply_feature_gates(&args)?;
+    // Gates first: the StorageCapacityScoring default for VolumeBinding args reads them.
+    let sched_config = scheduler_config_from_args(&args)?;
 
     rusternetes_common::tracing::init_basic_tracing("rusternetes", &args.log_level)?;
 
@@ -342,9 +363,6 @@ async fn async_main() -> Result<()> {
     let loopback_url = format!("{loopback_scheme}://127.0.0.1:{api_port}");
 
     // --- Scheduler ---
-    let sched_config = rusternetes_scheduler::SchedulerConfig {
-        interval: args.scheduler_interval,
-    };
     let sched_client = Arc::new(rusternetes_client::http::ApiClient::new(
         &loopback_url,
         args.tls,

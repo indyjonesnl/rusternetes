@@ -116,15 +116,8 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("invalid --feature-gates: {e}"))?;
 
     let volume_binding_args = match &args.config {
-        Some(path) => {
-            let doc = std::fs::read_to_string(path)
-                .map_err(|e| anyhow::anyhow!("reading --config {path}: {e}"))?;
-            let scoring = rusternetes_common::feature_gates::enabled(
-                rusternetes_common::feature_gates::Feature::StorageCapacityScoring,
-            );
-            scheduler_config::volume_binding_args_from_config(&doc, scoring)
-                .map_err(|e| anyhow::anyhow!("invalid --config {path}: {e}"))?
-        }
+        Some(path) => scheduler_config::load_volume_binding_args(path)
+            .map_err(|e| anyhow::anyhow!("--config: {e}"))?,
         None => scheduler_config::VolumeBindingArgs::default(),
     };
 

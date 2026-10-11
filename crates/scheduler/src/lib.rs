@@ -18,6 +18,8 @@ use tracing::info;
 /// Configuration for the scheduler component.
 pub struct SchedulerConfig {
     pub interval: u64,
+    /// Resolved `VolumeBinding` plugin args (from `--scheduler-config`).
+    pub volume_binding_args: scheduler_config::VolumeBindingArgs,
 }
 
 /// Run the scheduler component.
@@ -27,7 +29,10 @@ pub struct SchedulerConfig {
 pub async fn run(storage: Arc<StorageBackend>, config: SchedulerConfig) -> anyhow::Result<()> {
     info!("Starting Rusternetes Scheduler");
 
-    let scheduler = Arc::new(scheduler::Scheduler::new(storage, config.interval));
+    let scheduler = Arc::new(
+        scheduler::Scheduler::new(storage, config.interval)
+            .with_volume_binding_args(&config.volume_binding_args),
+    );
     scheduler.run().await?;
 
     Ok(())
@@ -49,11 +54,10 @@ pub async fn run_with_api(
 
     let scheduler_name = "default-scheduler".to_string();
     let backend = data_plane::ApiBackend::new(client, &scheduler_name);
-    let scheduler = Arc::new(scheduler::Scheduler::new_api(
-        backend,
-        config.interval,
-        scheduler_name,
-    ));
+    let scheduler = Arc::new(
+        scheduler::Scheduler::new_api(backend, config.interval, scheduler_name)
+            .with_volume_binding_args(&config.volume_binding_args),
+    );
     scheduler.run().await?;
 
     Ok(())
