@@ -49,6 +49,11 @@ struct Args {
     #[arg(long, default_value = "info")]
     log_level: String,
 
+    /// Comma-separated `Gate=bool` pairs, e.g. `StorageCapacityScoring=true`
+    /// (upstream `--feature-gates`, component-base featuregate `Set`).
+    #[arg(long, default_value = "")]
+    feature_gates: String,
+
     /// Scheduling interval in seconds
     #[arg(long, default_value = "2")]
     interval: u64,
@@ -98,6 +103,9 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     rusternetes_common::tracing::init_basic_tracing("scheduler", &args.log_level)?;
+
+    rusternetes_common::feature_gates::set_from_str(&args.feature_gates)
+        .map_err(|e| anyhow::anyhow!("invalid --feature-gates: {e}"))?;
 
     info!(
         "Starting Rusternetes Scheduler {}",
