@@ -405,11 +405,30 @@ impl UpdatedObjectInfo<CustomResourceDefinition> for ControllerUpdate<'_> {
 pub struct CrdRest {
     store: Store<CustomResourceDefinition, StorageBackend>,
     status_store: Store<CustomResourceDefinition, StorageBackend>,
-    /// The nonstructuralschema and apiapproval controllers' memos.
-    conditions: super::condition_controllers::ConditionControllers,
+    /// The controllers' workqueue and the condition controllers' memos.
+    controllers: Arc<super::controller_queue::CrdControllers>,
 }
 
 impl CrdRest {
+    /// The Store over `storage`, with the controllers it feeds.
+    pub fn with_controllers(
+        storage: Arc<StorageBackend>,
+        controllers: Arc<super::controller_queue::CrdControllers>,
+    ) -> Self {
+        Self {
+            store: new_store(storage.clone()),
+            status_store: new_status_store(storage),
+            controllers,
+        }
+    }
+
+    /// The informer's event handler: queue the CRD for the controllers
+    /// (naming_controller.go:343-363), starting their worker on first use.
+    fn enqueue(&self, name: &str) {
+        self.controllers.ensure_started(self.store.storage.clone());
+        self.controllers.add(name);
+    }
+
     fn ctx() -> RequestContext {
         RequestContext::new(None)
     }
@@ -503,59 +522,71 @@ impl CrdRest {
         let Some(crd) = self.get_crd(name).await? else {
             return Ok(());
         };
-        if self.conditions.sync_non_structural(&crd).is_some() {
+        if self
+            .controllers
+            .conditions
+            .sync_non_structural(&crd)
+            .is_some()
+        {
             let written = self
                 .update_status(name, &|old| {
-                    self.conditions
+                    self.controllers
+                        .conditions
                         .sync_non_structural(old)
                         .unwrap_or_else(|| old.clone())
                 })
                 .await?;
             if let Some(out) = written {
-                self.conditions.record_non_structural(&out);
+                self.controllers.conditions.record_non_structural(&out);
             }
         }
-        if self.conditions.sync_api_approval(&crd).is_some() {
+        if self
+            .controllers
+            .conditions
+            .sync_api_approval(&crd)
+            .is_some()
+        {
             let written = self
                 .update_status(name, &|old| {
-                    self.conditions
+                    self.controllers
+                        .conditions
                         .sync_api_approval(old)
                         .unwrap_or_else(|| old.clone())
                 })
                 .await?;
             if let Some(out) = written {
-                self.conditions.record_api_approval(&out);
+                self.controllers.conditions.record_api_approval(&out);
             }
         }
         Ok(())
     }
 
-    /// `requeueAllOtherGroupCRDs` (naming_controller.go:76-103): a CRD that
+    /// `requeueAllOtherGroupCRDs` (naming_controller.go:383-401): a CRD that
     /// changed or freed its names may unblock the others of its group.
     async fn sync_group_except(&self, group: &str, except: &str) -> Result<()> {
         for other in self.group_crds(group).await? {
             if other.metadata.name != except {
-                self.sync_one(&other.metadata.name).await?;
+                self.enqueue(&other.metadata.name);
             }
         }
         Ok(())
     }
 
-    /// What the informer-driven controllers do after a CRD is written. They
-    /// run independently of the request, so a failure here is logged, not
-    /// returned.
-    async fn run_controllers(&self, name: &str, group: &str) {
-        let result = async {
-            let names_changed = self.sync_one(name).await?;
-            if names_changed {
+    /// One key off the controllers' queue: the naming controller's `sync`,
+    /// the establishing controller's and the condition controllers'. A CRD
+    /// that is gone has freed its names, so its group is reconsidered
+    /// (naming_controller.go:241-249).
+    pub(super) async fn process_one(&self, name: &str) -> Result<()> {
+        let Some(crd) = self.get_crd(name).await? else {
+            if let Some((_, group)) = name.split_once('.') {
                 self.sync_group_except(group, name).await?;
             }
-            Result::Ok(())
+            return Ok(());
+        };
+        if self.sync_one(name).await? {
+            self.sync_group_except(&crd.spec.group, name).await?;
         }
-        .await;
-        if let Err(e) = result {
-            warn!("customresourcedefinition {name}: controllers failed: {e}");
-        }
+        Ok(())
     }
 
     /// One CRD as the informer-driven controllers see it on a resync: the
@@ -572,7 +603,7 @@ impl CrdRest {
         }
         self.finalize(name).await?;
         if self.get_crd(name).await?.is_none() {
-            self.conditions.forget(name);
+            self.controllers.conditions.forget(name);
         }
         Ok(())
     }
@@ -907,12 +938,10 @@ impl RestStorage<CustomResourceDefinition> for CrdRest {
         if options.dry_run {
             return Ok(created);
         }
-        self.run_controllers(&created.metadata.name, &created.spec.group)
-            .await;
-        Ok(self
-            .get_crd(&created.metadata.name)
-            .await?
-            .unwrap_or(created))
+        // The create event wakes the controllers; the response is the object
+        // as written, without their conditions.
+        self.enqueue(&created.metadata.name);
+        Ok(created)
     }
 
     async fn update(
@@ -939,8 +968,8 @@ impl RestStorage<CustomResourceDefinition> for CrdRest {
         if options.dry_run {
             return Ok((updated, created));
         }
-        self.run_controllers(name, &updated.spec.group).await;
-        Ok((self.get_crd(name).await?.unwrap_or(updated), created))
+        self.enqueue(name);
+        Ok((updated, created))
     }
 
     /// `REST.Delete` (etcd.go:84-176).
@@ -1011,7 +1040,7 @@ impl RestStorage<CustomResourceDefinition> for CrdRest {
                     warn!("customresourcedefinition {name}: finalizer failed: {e}");
                 }
                 if self.get_crd(name).await?.is_none() {
-                    self.conditions.forget(name);
+                    self.controllers.conditions.forget(name);
                 }
                 let _ = self.sync_group_except(&out.spec.group, name).await;
             }
@@ -1025,7 +1054,7 @@ impl RestStorage<CustomResourceDefinition> for CrdRest {
                 warn!("customresourcedefinition {name}: finalizer failed: {e}");
             }
             if self.get_crd(name).await?.is_none() {
-                self.conditions.forget(name);
+                self.controllers.conditions.forget(name);
                 let _ = self.sync_group_except(&crd.spec.group, name).await;
                 return Ok((Deleted::Object(crd), false));
             }
@@ -1053,7 +1082,7 @@ impl RestStorage<CustomResourceDefinition> for CrdRest {
         let dry_run = options.dry_run.as_ref().is_some_and(|d| !d.is_empty());
         if !dry_run {
             for crd in &deleted.items {
-                self.conditions.forget(&crd.metadata.name);
+                self.controllers.conditions.forget(&crd.metadata.name);
                 let _ = self
                     .sync_group_except(&crd.spec.group, &crd.metadata.name)
                     .await;
@@ -1212,9 +1241,9 @@ impl ControllerRateLimiter {
 /// `wait.UntilWithContext(ctx, c.runWorker, time.Second)`, :280-282). A CRD
 /// left Terminating by a restart or a failed `delete_instances` is retried.
 ///
-/// Deviation: upstream's controllers also react to each watch event; here the
-/// write path runs them inline (see [`super::controllers`]), so only the
-/// resync-driven half is a task.
+/// Upstream's controllers also react to each watch event; here a CRD write
+/// queues the CRD on the workqueue of `controller_queue.rs`, so this task is
+/// the resync-driven half. (The finalizer still runs inline in `REST.Delete`.)
 ///
 /// Registered as the `start-apiextensions-controllers` post-start hook
 /// (apiserver.go:228-261: `go <controller>.Run(...)` for each, `return nil`).
@@ -1323,11 +1352,7 @@ fn spawn_resync_loop(storage: Arc<StorageBackend>) -> tokio::task::JoinHandle<()
 
 /// The CRD endpoint's storage: [`CrdRest`] over [`new_store`].
 pub fn new_rest(storage: Arc<StorageBackend>) -> CrdRest {
-    CrdRest {
-        store: new_store(storage.clone()),
-        status_store: new_status_store(storage),
-        conditions: Default::default(),
-    }
+    CrdRest::with_controllers(storage, Default::default())
 }
 
 #[cfg(test)]

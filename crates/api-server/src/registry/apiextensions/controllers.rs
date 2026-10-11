@@ -12,17 +12,16 @@
 //! of `pkg/apis/apiextensions/helpers.go` they share.
 //!
 //! Upstream runs them as informer-driven controllers started by a post-start
-//! hook of the apiextensions-apiserver. Here the api-server runs the same
-//! functions inline after the write that would have woken them, through the
-//! `/status` store (see `CrdRest` in `customresourcedefinition.rs`), so a
-//! CRD is established before the creating request returns. That is the one
-//! deliberate deviation of the mechanism; the logic is upstream's.
+//! hook of the apiextensions-apiserver. Here a CRD write enqueues the CRD on
+//! a workqueue (`controller_queue.rs`) that a worker drains, running the same
+//! functions through the `/status` store (see `CrdRest` in
+//! `customresourcedefinition.rs`), so the create response is not Established
+//! and the condition arrives on a later update, as upstream's does.
 //!
 //! The `nonstructuralschema` and `apiapproval` controllers live in
 //! `condition_controllers.rs`.
 //!
-//! Not modelled: the `InvalidCABundle` check of the establishing
-//! controller; the finalizer's `OverlappingBuiltInResources` skip. The
+//! Not modelled: the finalizer's `OverlappingBuiltInResources` skip. The
 //! finalizer's wait for the instances to be gone is ported, and instances are
 //! deleted through their store, so one holding a finalizer keeps the CRD
 //! Terminating until it is really gone.
@@ -357,15 +356,39 @@ pub fn sync_establishing(crd: &CustomResourceDefinition) -> Option<CustomResourc
         return None;
     }
     let mut out = crd.clone();
-    set_crd_condition(
-        &mut out,
+    // If the conversion webhook CABundle is invalid, set the Established
+    // condition to false and provide a reason (:143-158).
+    let invalid_ca_bundle = crd
+        .spec
+        .conversion
+        .as_ref()
+        .and_then(|c| c.webhook.as_ref())
+        .and_then(|w| w.client_config.ca_bundle.as_deref())
+        .is_some_and(rusternetes_common::validation::crd::is_invalid_ca_bundle);
+    let established = if invalid_ca_bundle {
+        condition(
+            ESTABLISHED,
+            "False",
+            "InvalidCABundle",
+            "The conversion webhook CABundle is invalid",
+        )
+    } else {
         condition(
             ESTABLISHED,
             "True",
             "InitialNamesAccepted",
             "the initial names have been accepted",
-        ),
-    );
+        )
+    };
+    // The same condition again is no write: an update that changes nothing
+    // makes no new revision upstream, so no event for the controllers to
+    // loop on.
+    if invalid_ca_bundle
+        && is_crd_condition_equivalent(Some(&established), find_crd_condition(crd, ESTABLISHED))
+    {
+        return None;
+    }
+    set_crd_condition(&mut out, established);
     Some(out)
 }
 

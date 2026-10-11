@@ -37,10 +37,44 @@ fn message(body: &Value) -> &str {
     body["message"].as_str().unwrap_or_default()
 }
 
-async fn create(api: &TestApiServer, body: &Value) -> Value {
+/// The create response itself: the controllers (naming, establishing, ...)
+/// run asynchronously after it, so it carries none of their conditions
+/// (establish/establishing_controller.go).
+async fn create_raw(api: &TestApiServer, body: &Value) -> Value {
     let (status, out) = api.post(CRDS, body).await;
     assert_eq!(status, StatusCode::CREATED, "create: {out}");
     out
+}
+
+/// Create, then wait for the controllers to settle: the CRD has its
+/// NamesAccepted condition and its revision stops moving.
+async fn create(api: &TestApiServer, body: &Value) -> Value {
+    let name = create_raw(api, body).await["metadata"]["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    settle(api, &name).await
+}
+
+async fn settle(api: &TestApiServer, name: &str) -> Value {
+    let mut last = None;
+    let mut stable = 0;
+    for _ in 0..300 {
+        let (status, out) = api.get(&format!("{CRDS}/{name}")).await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        let rv = out["metadata"]["resourceVersion"].clone();
+        if condition(&out, "NamesAccepted").is_some() && last.as_ref() == Some(&rv) {
+            stable += 1;
+            if stable >= 3 {
+                return out;
+            }
+        } else {
+            stable = 0;
+        }
+        last = Some(rv);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("controllers never settled {name}");
 }
 
 fn condition<'a>(crd: &'a Value, kind: &str) -> Option<&'a Value> {
@@ -99,7 +133,12 @@ async fn create_discards_a_client_status_and_starts_generation_at_one() {
         "storedVersions": ["v9"],
         "conditions": [{"type": "Established", "status": "True"}]
     });
-    let out = create(&api, &body).await;
+    let raw = create_raw(&api, &body).await;
+    assert_eq!(raw["metadata"]["generation"], 1, "{raw}");
+    assert_eq!(raw["status"]["storedVersions"], json!(["v1"]), "{raw}");
+    assert!(raw["status"]["acceptedNames"].is_null(), "{raw}");
+    assert!(condition(&raw, "Established").is_none(), "{raw}");
+    let out = settle(&api, "widgets.example.com").await;
     assert_eq!(out["metadata"]["generation"], 1, "{out}");
     assert_eq!(out["status"]["storedVersions"], json!(["v1"]), "{out}");
     assert_eq!(out["status"]["acceptedNames"]["plural"], "widgets", "{out}");

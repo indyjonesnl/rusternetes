@@ -42,7 +42,10 @@ fn scope(
             Some(_) => Box::new(customresourcedefinition::new_status_store(
                 state.storage.clone(),
             )),
-            None => Box::new(customresourcedefinition::new_rest(state.storage.clone())),
+            None => Box::new(customresourcedefinition::CrdRest::with_controllers(
+                state.storage.clone(),
+                state.crd_controllers.clone(),
+            )),
         };
     RequestScope {
         kind: GroupVersionKind {

@@ -961,6 +961,12 @@ fn validate_ca_bundle_field(bundle: &str, path: &Path) -> ErrorList {
     validate_ca_bundle_with_value(path, &bytes, bundle)
 }
 
+/// `len(webhook.ValidateCABundle(field.NewPath(""), caBundle)) > 0`, the
+/// establishing controller's check (`establishing_controller.go:143-148`).
+pub fn is_invalid_ca_bundle(bundle: &str) -> bool {
+    !validate_ca_bundle_field(bundle, &Path::new("")).is_empty()
+}
+
 /// `webhook.ValidateCABundle` (`apiserver/pkg/util/webhook/validation.go:29-36`).
 /// The bad value is the `[]byte`, which upstream marshals to JSON as base64.
 #[cfg(test)]

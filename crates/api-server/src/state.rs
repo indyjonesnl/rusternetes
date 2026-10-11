@@ -42,6 +42,9 @@ pub struct ApiServerState {
     /// `Admission::admit` while `Feature::MutatingAdmissionPolicy` is on.
     /// `None` until a policy source is installed.
     pub mutating_admission_policy: Option<Arc<MutatingPolicyPlugin>>,
+    /// The CRD naming/establishing/condition controllers' workqueue: a CRD
+    /// write queues its name, a worker (started on first use) drains it.
+    pub crd_controllers: Arc<crate::registry::apiextensions::controller_queue::CrdControllers>,
 }
 
 /// `newServiceIPAllocators`' NodePort half (storage_core.go:484-495): one
@@ -110,6 +113,7 @@ impl ApiServerState {
             prometheus_client: None,
             event_ttl: crate::registry::core::event::DEFAULT_EVENT_TTL_SECONDS,
             mutating_admission_policy: None,
+            crd_controllers: Default::default(),
         }
     }
 
