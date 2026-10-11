@@ -688,6 +688,68 @@ fn storage_bytes(q: Option<&String>) -> i64 {
         .map_or(0, |q| q.value() as i64)
 }
 
+/// `internalNodeDeployment.rateLimiter` (controller.go:271-274,
+/// `ratelimiter.go`): `workqueue.ItemExponentialFailureRateLimiter` (base
+/// `BaseDelay`, cap `MaxDelay`) with `rateLimiterWithJitter.When` subtracting
+/// a random share of `BaseDelay`. Keyed by claim UID; the value also keeps the
+/// queue key so a deleted claim can be forgotten (the informer `DeleteFunc`
+/// at controller.go:429-441).
+struct OwnerRateLimiter {
+    base: Duration,
+    max: Duration,
+    /// claim UID -> (queue key, failures).
+    failures: Mutex<HashMap<String, (String, u32)>>,
+}
+
+impl OwnerRateLimiter {
+    fn new(base: Duration, max: Duration) -> Self {
+        Self {
+            base,
+            max,
+            failures: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// `NumRequeues`.
+    fn num_requeues(&self, uid: &str) -> u32 {
+        self.failures.lock().unwrap().get(uid).map_or(0, |e| e.1)
+    }
+
+    /// `rateLimiterWithJitter.When` over `ItemExponentialFailureRateLimiter.When`.
+    fn when(&self, uid: &str, key: &str) -> Duration {
+        let exp = {
+            let mut f = self.failures.lock().unwrap();
+            let e = f.entry(uid.to_string()).or_insert((key.to_string(), 0));
+            let exp = e.1;
+            e.1 = e.1.saturating_add(1);
+            exp
+        };
+        let backoff = self.base.as_nanos() as f64 * 2f64.powi(exp.min(2000) as i32);
+        let delay = if backoff > i64::MAX as f64 || backoff as u128 > self.max.as_nanos() {
+            self.max
+        } else {
+            Duration::from_nanos(backoff as u64)
+        };
+        let jitter =
+            Duration::from_nanos((self.base.as_nanos() as f64 * rand::random::<f64>()) as u64);
+        if jitter > delay {
+            Duration::ZERO
+        } else {
+            delay - jitter
+        }
+    }
+
+    /// `Forget`.
+    fn forget(&self, uid: &str) {
+        self.failures.lock().unwrap().remove(uid);
+    }
+
+    /// Informer `DeleteFunc`: the claim behind `key` is gone.
+    fn forget_key(&self, key: &str) {
+        self.failures.lock().unwrap().retain(|_, e| e.0 != key);
+    }
+}
+
 /// What `prepareProvision` returns.
 struct Prepared {
     fs_type: String,
@@ -743,6 +805,8 @@ pub struct CsiProvisioner<S: Storage> {
     translator: CsiTranslator,
     /// `nodeDeployment`; `None` = central deployment.
     node_deployment: Option<NodeDeployment>,
+    /// `internalNodeDeployment.rateLimiter`; set with `node_deployment`.
+    owner_limiter: Option<OwnerRateLimiter>,
 }
 
 impl<S: Storage + 'static> CsiProvisioner<S> {
@@ -794,6 +858,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             pvc_node_store: TopologyStore::new(),
             capabilities: tokio::sync::OnceCell::new(),
             node_deployment: None,
+            owner_limiter: None,
         }
     }
 
@@ -832,6 +897,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
     /// deployment (that needs a per-node CSI driver `NodeGetInfo`).
     #[allow(dead_code)]
     pub fn with_node_deployment(mut self, nd: NodeDeployment) -> Self {
+        self.owner_limiter = Some(OwnerRateLimiter::new(nd.base_delay, nd.max_delay));
         self.node_deployment = Some(nd);
         self
     }
@@ -961,12 +1027,10 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
 
     /// `checkNode` (controller.go:1602-1690): with a node deployment, whether
     /// this instance is responsible for the claim. `sc` is looked up when
-    /// `None` (only needed while no node is selected).
-    ///
-    /// Not ported: for an unassigned claim on an Immediate class with
-    /// `ImmediateBinding` on, upstream checks `allowedTopologies` and calls
-    /// `becomeOwner` (node.go: capacity check, PVC update) and still returns
-    /// false; here such a claim is simply not owned (tracked in #3140).
+    /// `None` (only needed while no node is selected). For an unassigned
+    /// claim on an Immediate class (with `ImmediateBinding` on) this tries to
+    /// `becomeOwner` and still returns false: the owner is found when the
+    /// updated claim comes back through the queue.
     async fn check_node(
         &self,
         claim: &PersistentVolumeClaim,
@@ -978,15 +1042,251 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
         match annotation(&claim.metadata, ANN_SELECTED_NODE).map(String::as_str) {
             None | Some("") => {
                 // `p.scLister.Get(...)`: a lookup failure is an error.
-                if sc.is_none() {
-                    self.get_storage_class(&claim_class(claim)).await?;
+                let fetched;
+                let sc = match sc {
+                    Some(sc) => sc,
+                    None => {
+                        fetched = self.get_storage_class(&claim_class(claim)).await?;
+                        &fetched
+                    }
+                };
+                if sc.volume_binding_mode != Some(VolumeBindingMode::Immediate)
+                    || !nd.immediate_binding
+                {
+                    return Ok(false);
                 }
+                // "If the storage class has AllowedTopologies set, then it
+                // must match our own. We can find out by trying to create
+                // accessibility requirements. If that fails, we should not
+                // become the owner."
+                let allowed = sc.allowed_topologies.as_deref().unwrap_or_default();
+                if !allowed.is_empty() && self.driver_capabilities().await?.supports_topology() {
+                    let node: rusternetes_common::resources::Node = self
+                        .storage
+                        .get(&build_key("nodes", None, &nd.node_name))
+                        .await
+                        .map_err(|_| anyhow!("node {:?} not found", nd.node_name))?;
+                    if let Err(e) = (TopologyInputs {
+                        storage: &*self.storage,
+                        store: &self.pvc_node_store,
+                        driver_name: &self.driver_name,
+                        pvc_uid: &claim.metadata.uid,
+                        pvc_name: &claim.metadata.name,
+                        allowed_topologies: allowed,
+                        selected_node_name: &node.metadata.name,
+                        strict_topology: self.strict_topology,
+                        immediate_topology: self.immediate_topology,
+                    })
+                    .generate_accessibility_requirements()
+                    .await
+                    {
+                        debug!(
+                            "ignoring PVC {}/{}, allowed topologies is not compatible: {e:?}",
+                            claim.metadata.namespace.as_deref().unwrap_or(""),
+                            claim.metadata.name
+                        );
+                        return Ok(false);
+                    }
+                }
+                // "Try to select the current node if there is a chance of it
+                // being created there, i.e. there is currently enough free
+                // space (checked in becomeOwner)."
+                self.become_owner(nd, claim).await.map_err(|e| {
+                    anyhow!(
+                        "PVC {}/{}: {e:#}",
+                        claim.metadata.namespace.as_deref().unwrap_or(""),
+                        claim.metadata.name
+                    )
+                })?;
+                // "We are now either the owner or someone else is."
                 Ok(false)
             }
             // "Our node is selected."
             Some(n) if n == nd.node_name => Ok(true),
             // "Some other node is selected, ignore it."
             Some(_) => Ok(false),
+        }
+    }
+
+    /// `checkCapacity` (controller.go:1692-1740): whether the driver reports
+    /// enough free space on `selected_node` for the claim, computed from the
+    /// same parameters provisioning would use.
+    async fn check_capacity(
+        &self,
+        claim: &PersistentVolumeClaim,
+        selected_node: &str,
+    ) -> Result<bool> {
+        let requested = claim
+            .spec
+            .resources
+            .requests
+            .as_ref()
+            .and_then(|r| r.get("storage"));
+        let vol_size_bytes = storage_bytes(requested);
+        if vol_size_bytes == 0 {
+            // "Nothing to check."
+            return Ok(true);
+        }
+        let Some(class) = claim.spec.storage_class_name.as_deref() else {
+            return Err(anyhow!("empty storage class name"));
+        };
+        let sc = self.get_storage_class(class).await?;
+        let node: rusternetes_common::resources::Node = self
+            .storage
+            .get(&build_key("nodes", None, selected_node))
+            .await
+            .map_err(|_| anyhow!("node {selected_node:?} not found"))?;
+        let pv_name =
+            make_volume_name(VOLUME_NAME_PREFIX, &claim.metadata.uid).map_err(|e| anyhow!(e))?;
+        let prepared = self
+            .prepare_provision(claim, &sc, &node.metadata.name, &pv_name)
+            .await
+            .map_err(|(_, f)| match f {
+                Failure::Error(e) => e,
+                Failure::Ignored(m) => anyhow!(m),
+                Failure::Stop => anyhow!("provisioning stopped"),
+            })?;
+        // "In practice, we expect exactly one entry here once a node has been
+        // selected. But we have to be prepared for more than one (=> check
+        // all, success if there is at least one) and none (no node selected
+        // => check once without topology)."
+        let mut topologies: Vec<Option<rusternetes_csi::proto::Topology>> = vec![None];
+        if let Some(req) = prepared
+            .req
+            .accessibility_requirements
+            .as_ref()
+            .filter(|r| !r.requisite.is_empty())
+        {
+            topologies = req.requisite.iter().cloned().map(Some).collect();
+        }
+        for topology in topologies {
+            let available = self
+                .client
+                .get_capacity(rusternetes_csi::proto::GetCapacityRequest {
+                    volume_capabilities: prepared.req.volume_capabilities.clone(),
+                    parameters: prepared.req.parameters.clone(),
+                    accessible_topology: topology,
+                })
+                .await
+                .map_err(|e| anyhow!("GetCapacity: {e}"))?;
+            if vol_size_bytes <= available {
+                // "Enough capacity at the moment."
+                return Ok(true);
+            }
+        }
+        // "Currently not enough capacity anywhere."
+        Ok(false)
+    }
+
+    /// `becomeOwner` (controller.go:1742-1858): after a jittered, per-claim
+    /// exponential delay (new claims wait a short random time, claims we
+    /// already conflicted on wait longer), and unless another node got
+    /// selected meanwhile, check capacity and set this node as the claim's
+    /// `volume.kubernetes.io/selected-node`. A conflicting update restarts the
+    /// attempt (upstream recurses).
+    async fn become_owner(&self, nd: &NodeDeployment, claim: &PersistentVolumeClaim) -> Result<()> {
+        let limiter = self
+            .owner_limiter
+            .as_ref()
+            .expect("owner_limiter is set with node_deployment");
+        let ns = claim.metadata.namespace.as_deref().unwrap_or("");
+        let key = build_key("persistentvolumeclaims", Some(ns), &claim.metadata.name);
+        let uid = claim.metadata.uid.as_str();
+        loop {
+            let requeues = limiter.num_requeues(uid);
+            let delay = limiter.when(uid, &Self::queue_key(claim));
+            debug!(
+                "will try to become owner of PVC {ns}/{} with resource version {:?} in {delay:?} (attempt #{requeues})",
+                claim.metadata.name, claim.metadata.resource_version
+            );
+            // "When the base delay is high we also should check less often.
+            // With multiple provisioners running in parallel, it becomes more
+            // likely that one of them became the owner quickly, so we don't
+            // want to check too slowly either."
+            let poll = std::cmp::max(nd.base_delay / 100, Duration::from_millis(10));
+            let sleep = tokio::time::sleep(delay);
+            tokio::pin!(sleep);
+            let mut ticker = tokio::time::interval(poll);
+            ticker.tick().await; // the first tick fires immediately
+            let check = || async {
+                let current: PersistentVolumeClaim = self
+                    .storage
+                    .get(&key)
+                    .await
+                    .map_err(|e| anyhow!("PVC not found: {e}"))?;
+                if current.metadata.uid != claim.metadata.uid {
+                    return Err(anyhow!("PVC was replaced"));
+                }
+                let taken = annotation(&current.metadata, ANN_SELECTED_NODE)
+                    .is_some_and(|n| !n.is_empty() && *n != nd.node_name);
+                Ok::<_, anyhow::Error>((taken, current))
+            };
+            let (stop, mut current) = loop {
+                tokio::select! {
+                    _ = &mut sleep => break check().await?,
+                    _ = ticker.tick() => {
+                        // "Abort the waiting early if we know that someone
+                        // else is the owner."
+                        let r = check().await?;
+                        if r.0 {
+                            break r;
+                        }
+                    }
+                }
+            };
+            if stop {
+                // "Some other instance was faster and we don't need to
+                // provision for this PVC. If the PVC needs to be
+                // rescheduled, we start the delay from scratch."
+                limiter.forget(uid);
+                return Ok(());
+            }
+            // "Check capacity as late as possible before trying to become the
+            // owner, because that is a relatively expensive operation." A
+            // failed check still proceeds, so that provisioning can surface
+            // the problem to the user.
+            match self.check_capacity(claim, &nd.node_name).await {
+                Err(e) => debug!(
+                    "proceeding with becoming owner although the capacity check failed: {e:#}"
+                ),
+                Ok(false) => {
+                    debug!("not enough capacity for PVC {ns}/{}", claim.metadata.name);
+                    return Ok(());
+                }
+                Ok(true) => {}
+            }
+            let annotations = current
+                .metadata
+                .annotations
+                .get_or_insert_with(Default::default);
+            if annotations.get(ANN_SELECTED_NODE).map(String::as_str) == Some(nd.node_name.as_str())
+            {
+                // "A mere sanity check. Should not happen."
+                return Ok(());
+            }
+            annotations.insert(ANN_SELECTED_NODE.to_string(), nd.node_name.clone());
+            match self.storage.update(&key, &current).await {
+                Ok(_) => {
+                    // "Successfully became owner. Future delays will be smaller again."
+                    limiter.forget(uid);
+                    return Ok(());
+                }
+                // "Lost the race or some other concurrent modification.
+                // Repeat the attempt." The next attempt uses a longer delay
+                // and most likely stops quickly once it sees the owner.
+                Err(rusternetes_common::Error::Conflict(_)) => {
+                    debug!(
+                        "conflict during PVC {ns}/{} update, will try again",
+                        claim.metadata.name
+                    );
+                }
+                Err(e) => {
+                    return Err(anyhow!(
+                        "selecting node {:?} for PVC failed: {e}",
+                        nd.node_name
+                    ))
+                }
+            }
         }
     }
 
@@ -2774,7 +3074,12 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
                     .cloned();
                 match in_progress {
                     Some(c) => c,
-                    None => return Ok(()),
+                    None => {
+                        if let Some(l) = &self.owner_limiter {
+                            l.forget_key(key);
+                        }
+                        return Ok(());
+                    }
                 }
             }
         };
@@ -3159,6 +3464,23 @@ mod tests {
         assert_eq!(make_volume_name("pvc", "abc-1").unwrap(), "pvc-abc-1");
         assert!(make_volume_name("", "abc").is_err());
         assert!(make_volume_name("pvc", "").is_err());
+    }
+
+    /// `TestRateLimiter` (ratelimiter_test.go:25-35), plus the exponential
+    /// growth and `Forget`.
+    #[test]
+    fn owner_rate_limiter_stays_within_max_and_forgets() {
+        let max = Duration::from_secs(10);
+        let l = OwnerRateLimiter::new(Duration::from_secs(1), max);
+        for _ in 0..100 {
+            assert!(l.when("uid", "k") <= max);
+        }
+        assert_eq!(l.num_requeues("uid"), 100);
+        l.forget_key("k");
+        assert_eq!(l.num_requeues("uid"), 0);
+        // Zero base delay (the tests): no wait at all.
+        let z = OwnerRateLimiter::new(Duration::ZERO, Duration::ZERO);
+        assert_eq!(z.when("u", "k"), Duration::ZERO);
     }
 
     #[test]
