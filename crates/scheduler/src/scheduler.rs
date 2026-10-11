@@ -41,6 +41,13 @@ pub struct Scheduler<S: Storage + Send + Sync + 'static = StorageBackend> {
     /// preemptor just freed before the informer catches up, and preemption
     /// live-locks. Mirrors upstream's in-memory `SchedulingQueue` nominator.
     nominations: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    /// Long-lived VolumeBinding assume caches (`volumeBinder.pvCache` /
+    /// `pvcCache`), refreshed from the volume listers every cycle.
+    volume_binder: Arc<std::sync::Mutex<crate::volume_assume::VolumeBinder>>,
+    /// `VolumeBindingArgs.BindTimeoutSeconds` (default 600).
+    pub(crate) volume_bind_timeout: Duration,
+    /// Poll interval of `BindPodVolumes` (1s upstream).
+    pub(crate) volume_bind_poll: Duration,
 }
 
 impl Scheduler<StorageBackend> {
@@ -58,6 +65,9 @@ impl Scheduler<StorageBackend> {
             interval: Duration::from_secs(interval_secs),
             scheduler_name,
             nominations: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            volume_binder: Arc::default(),
+            volume_bind_timeout: crate::volume_bind::DEFAULT_BIND_TIMEOUT,
+            volume_bind_poll: crate::volume_bind::BIND_POLL_INTERVAL,
         }
     }
 }
@@ -70,6 +80,9 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             interval: Duration::from_secs(interval_secs),
             scheduler_name,
             nominations: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            volume_binder: Arc::default(),
+            volume_bind_timeout: crate::volume_bind::DEFAULT_BIND_TIMEOUT,
+            volume_bind_poll: crate::volume_bind::BIND_POLL_INTERVAL,
         }
     }
 
@@ -425,12 +438,18 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         }
 
         // Try to schedule
-        let (selected, diagnosis) = self
-            .select_node_diag(&pod, &nodes, &all_pods, &priority_classes)
+        let (selected, chosen_volumes, diagnosis) = self
+            .select_node_diag_volumes(&pod, &nodes, &all_pods, &priority_classes)
             .await;
         if let Some(node) = selected {
-            if let Err(e) = self.bind_pod_to_node(pod, &node.metadata.name).await {
+            if let Err(e) = self
+                .reserve_prebind_bind(pod, &node.metadata.name, chosen_volumes)
+                .await
+            {
                 error!("Failed to bind pod {}/{} to node: {}", ns, name, e);
+                // Return the error so the work queue retries with backoff
+                // (handleBindingCycleError re-queues the pod upstream).
+                return Err(e);
             }
         } else if let Some((node_name, victims)) = self
             .try_preempt(&pod, &nodes, &all_pods, &priority_classes, &pdbs)
@@ -790,11 +809,119 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         all_pods: &[Pod],
         priority_classes: &HashMap<String, PriorityClass>,
     ) -> (Option<Node>, Diagnosis) {
+        let (picked, _vols, diag) = self
+            .select_node_diag_volumes(pod, nodes, all_pods, priority_classes)
+            .await;
+        (picked, diag)
+    }
+
+    /// Feed the assume caches (the informer feed upstream), then PreFilter.
+    fn sync_and_pre_filter(
+        &self,
+        ns: &str,
+        pod: &Pod,
+        snap: &volume_binding::VolumeSnapshot,
+    ) -> PreFilterOutcome {
+        self.volume_binder
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .sync_namespace(ns, snap);
+        volume_binding::pre_filter(pod, snap)
+    }
+
+    /// `select_node_diag` that also returns the chosen node's `PodVolumes`
+    /// (`stateData.podVolumesByNode[node]`), which Reserve/PreBind consume.
+    async fn select_node_diag_volumes(
+        &self,
+        pod: &Pod,
+        nodes: &[Node],
+        all_pods: &[Pod],
+        priority_classes: &HashMap<String, PriorityClass>,
+    ) -> (Option<Node>, Option<volume_binding::PodVolumes>, Diagnosis) {
         let mut diag = Diagnosis::default();
         let picked = self
             .select_node_inner(pod, nodes, all_pods, priority_classes, &mut diag)
             .await;
-        (picked, diag)
+        match picked {
+            Some((node, vols)) => (Some(node), vols, diag),
+            None => (None, None, diag),
+        }
+    }
+
+    /// Reserve -> PreBindPreFlight/PreBind -> Bind for the VolumeBinding plugin,
+    /// in `schedulingCycle`/`bindingCycle` order (schedule_one.go:211 Reserve,
+    /// :327 RunPreBindPlugins, :332 bind; any failure runs Unreserve:
+    /// :213 and `handleBindingCycleError` :368).
+    ///
+    /// Deviation: upstream runs the binding cycle in a goroutine
+    /// (schedule_one.go:123); here it runs inline in the work-queue worker, so
+    /// a pod waiting on its PV controller occupies a worker for up to
+    /// BindTimeoutSeconds.
+    async fn reserve_prebind_bind(
+        &self,
+        pod: Pod,
+        node_name: &str,
+        vols: Option<volume_binding::PodVolumes>,
+    ) -> rusternetes_common::Result<()> {
+        use crate::volume_bind::{self as vb, PreBindPreFlight, VolumeBindingState};
+        let ns = pod
+            .metadata
+            .namespace
+            .clone()
+            .unwrap_or_else(|| "default".into());
+        let mut state = VolumeBindingState::default();
+        if let Some(v) = vols {
+            state.pod_volumes_by_node.insert(node_name.to_string(), v);
+        }
+        let env = vb::DataPlaneBinderEnv {
+            binder: &self.volume_binder,
+            data: &self.data,
+            namespace: ns,
+        };
+
+        // Reserve (volume_binding.go:531-553)
+        {
+            let mut b = self.volume_binder.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(e) = vb::reserve(&mut b, &mut state, &pod, node_name) {
+                drop(b);
+                // schedule_one.go:213 — Unreserve on a failed Reserve.
+                vb::unreserve(&env, &state, node_name);
+                return Err(rusternetes_common::Error::Internal(format!(
+                    "VolumeBinding Reserve failed: {e}"
+                )));
+            }
+        }
+
+        // PreBindPreFlight + PreBind (volume_binding.go:555-601)
+        let prebind = match vb::pre_bind_preflight(&state, node_name) {
+            Ok(PreBindPreFlight::Skip) => Ok(()),
+            Ok(PreBindPreFlight::Run) => {
+                vb::pre_bind(
+                    &env,
+                    &mut state,
+                    &pod,
+                    node_name,
+                    self.volume_bind_timeout,
+                    self.volume_bind_poll,
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        };
+        if let Err(e) = prebind {
+            // handleBindingCycleError (schedule_one.go:368)
+            vb::unreserve(&env, &state, node_name);
+            return Err(rusternetes_common::Error::Internal(format!(
+                "running PreBind plugin \"VolumeBinding\": {e}"
+            )));
+        }
+
+        // Bind (schedule_one.go:332)
+        if let Err(e) = self.bind_pod_to_node(pod, node_name).await {
+            vb::unreserve(&env, &state, node_name);
+            return Err(e);
+        }
+        Ok(())
     }
 
     async fn select_node_inner(
@@ -804,7 +931,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         all_pods: &[Pod],
         priority_classes: &HashMap<String, PriorityClass>,
         diag: &mut Diagnosis,
-    ) -> Option<Node> {
+    ) -> Option<(Node, Option<volume_binding::PodVolumes>)> {
         // Advanced scheduling algorithm:
         // 1. Filter out unschedulable nodes
         // 2. Check taints and tolerations
@@ -820,7 +947,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         let volume_ctx = if volume_binding::pod_references_pvcs(pod) {
             let ns = pod.metadata.namespace.as_deref().unwrap_or("default");
             match self.data.list_volume_snapshot(ns).await {
-                Ok(snap) => match volume_binding::pre_filter(pod, &snap) {
+                Ok(snap) => match self.sync_and_pre_filter(ns, pod, &snap) {
                     PreFilterOutcome::Skip => None,
                     PreFilterOutcome::Ready(claims) => Some((snap, claims)),
                     PreFilterOutcome::Unresolvable(m) | PreFilterOutcome::Error(m) => {
@@ -1094,10 +1221,14 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             best_node_name, node_scores[0].score, pod.metadata.name
         );
 
+        // `state.podVolumesByNode[nodeName]` (volume_binding.go:537) is carried
+        // to Reserve/PreBind for the chosen node only.
+        let chosen_volumes = pod_volumes_by_node.remove(best_node_name);
         nodes
             .iter()
             .find(|n| &n.metadata.name == best_node_name)
             .cloned()
+            .map(|n| (n, chosen_volumes))
     }
 
     fn matches_node_selector(&self, node: &Node, selector: &HashMap<String, String>) -> bool {
@@ -2192,6 +2323,151 @@ mod tests {
             p.spec.as_ref().and_then(|s| s.node_name.as_deref()),
             Some("node-2")
         );
+    }
+
+    /// Fixture: two nodes, a WaitForFirstConsumer class, an unbound claim and
+    /// one static PV on node-2, plus a pod using the claim.
+    async fn wffc_fixture(storage: &Arc<MemoryStorage>) {
+        for n in ["node-1", "node-2"] {
+            let mut node = make_node(n);
+            node.metadata.labels =
+                Some(HashMap::from([("kubernetes.io/hostname".into(), n.into())]));
+            storage
+                .create(&format!("/registry/nodes/{n}"), &node)
+                .await
+                .unwrap();
+        }
+        let class: rusternetes_common::resources::StorageClass =
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "storage.k8s.io/v1", "kind": "StorageClass",
+                "metadata": {"name": "wait"},
+                "provisioner": "kubernetes.io/no-provisioner",
+                "volumeBindingMode": "WaitForFirstConsumer"
+            }))
+            .unwrap();
+        storage
+            .create("/registry/storageclasses/wait", &class)
+            .await
+            .unwrap();
+        let pvc: rusternetes_common::resources::PersistentVolumeClaim =
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                "metadata": {"name": "claim", "namespace": "default", "uid": "claim-uid"},
+                "spec": {"storageClassName": "wait",
+                    "resources": {"requests": {"storage": "1Gi"}}},
+                "status": {"phase": "Pending"}
+            }))
+            .unwrap();
+        storage
+            .create("/registry/persistentvolumeclaims/default/claim", &pvc)
+            .await
+            .unwrap();
+        let pv: rusternetes_common::resources::PersistentVolume =
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "v1", "kind": "PersistentVolume",
+                "metadata": {"name": "pv-node-2"},
+                "spec": {"capacity": {"storage": "1Gi"}, "accessModes": ["ReadWriteOnce"],
+                    "storageClassName": "wait", "hostPath": {"path": "/x"},
+                    "nodeAffinity": {"required": {"nodeSelectorTerms": [{"matchExpressions": [
+                        {"key": "kubernetes.io/hostname", "operator": "In", "values": ["node-2"]}]}]}}},
+                "status": {"phase": "Available"}
+            }))
+            .unwrap();
+        storage
+            .create("/registry/persistentvolumes/pv-node-2", &pv)
+            .await
+            .unwrap();
+        let mut pod = make_pending_pod("wffc-pod", "default");
+        pod.spec.as_mut().unwrap().volumes = Some(vec![serde_json::from_value(
+            serde_json::json!({"name": "v", "persistentVolumeClaim": {"claimName": "claim"}}),
+        )
+        .unwrap()]);
+        storage
+            .create("/registry/pods/default/wffc-pod", &pod)
+            .await
+            .unwrap();
+    }
+
+    /// Reserve -> PreBind -> Bind (schedule_one.go:211, :327, :332): the pod is
+    /// only bound once PreBind has written the PV claimRef and the PV
+    /// controller (simulated here) has completed the PVC binding.
+    #[tokio::test]
+    async fn test_try_schedule_pod_prebinds_volumes_before_binding_pod() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut scheduler =
+            Scheduler::new_with_name(storage.clone(), 1, "default-scheduler".to_string());
+        scheduler.volume_bind_timeout = Duration::from_secs(10);
+        scheduler.volume_bind_poll = Duration::from_millis(20);
+        wffc_fixture(&storage).await;
+
+        // PV controller: once the scheduler has set claimRef, bind the PVC.
+        let st = storage.clone();
+        let controller = tokio::spawn(async move {
+            for _ in 0..250 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let pv: rusternetes_common::resources::PersistentVolume = st
+                    .get("/registry/persistentvolumes/pv-node-2")
+                    .await
+                    .unwrap();
+                if pv.spec.claim_ref.is_some() {
+                    let mut pvc: rusternetes_common::resources::PersistentVolumeClaim = st
+                        .get("/registry/persistentvolumeclaims/default/claim")
+                        .await
+                        .unwrap();
+                    pvc.spec.volume_name = Some("pv-node-2".into());
+                    pvc.metadata
+                        .annotations
+                        .get_or_insert_with(HashMap::new)
+                        .insert("pv.kubernetes.io/bind-completed".into(), "yes".into());
+                    st.update("/registry/persistentvolumeclaims/default/claim", &pvc)
+                        .await
+                        .unwrap();
+                    return;
+                }
+            }
+        });
+
+        scheduler
+            .try_schedule_pod("pods/default/wffc-pod")
+            .await
+            .unwrap();
+        controller.await.unwrap();
+
+        let pv: rusternetes_common::resources::PersistentVolume = storage
+            .get("/registry/persistentvolumes/pv-node-2")
+            .await
+            .unwrap();
+        let cr = pv.spec.claim_ref.expect("PreBind must set the PV claimRef");
+        assert_eq!(cr.name.as_deref(), Some("claim"));
+        let p: Pod = storage
+            .get("/registry/pods/default/wffc-pod")
+            .await
+            .unwrap();
+        assert_eq!(
+            p.spec.as_ref().and_then(|s| s.node_name.as_deref()),
+            Some("node-2")
+        );
+    }
+
+    /// A PreBind failure (BindTimeoutSeconds elapsed without the PV controller
+    /// binding) must leave the pod unscheduled and return an error so the
+    /// work queue retries (handleBindingCycleError, schedule_one.go:356-368).
+    #[tokio::test]
+    async fn test_try_schedule_pod_prebind_timeout_leaves_pod_unbound() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut scheduler =
+            Scheduler::new_with_name(storage.clone(), 1, "default-scheduler".to_string());
+        scheduler.volume_bind_timeout = Duration::from_millis(200);
+        scheduler.volume_bind_poll = Duration::from_millis(20);
+        wffc_fixture(&storage).await;
+
+        let r = scheduler.try_schedule_pod("pods/default/wffc-pod").await;
+        assert!(r.is_err(), "PreBind timeout must surface as an error");
+        let p: Pod = storage
+            .get("/registry/pods/default/wffc-pod")
+            .await
+            .unwrap();
+        assert!(p.spec.as_ref().and_then(|s| s.node_name.as_ref()).is_none());
     }
 
     #[tokio::test]

@@ -7,6 +7,7 @@ pub mod framework;
 pub mod plugins;
 pub mod scheduler;
 pub mod volume_assume;
+pub mod volume_bind;
 pub mod volume_binding;
 
 use rusternetes_storage::StorageBackend;

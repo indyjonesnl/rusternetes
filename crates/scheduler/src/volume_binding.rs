@@ -331,7 +331,7 @@ pub fn pre_filter(pod: &Pod, snap: &VolumeSnapshot) -> PreFilterOutcome {
 
 /// `volume.CheckNodeAffinity` (helpers.go:68-83). Upstream matches against a
 /// node carrying only labels, so `matchFields` never sees a name.
-fn check_pv_node_affinity(pv: &PersistentVolume, node: &Node) -> bool {
+pub(crate) fn check_pv_node_affinity(pv: &PersistentVolume, node: &Node) -> bool {
     let Some(required) = pv
         .spec
         .node_affinity
@@ -512,7 +512,7 @@ fn is_plugin_migrated_to_csi_on_node(plugin_name: &str, csi_node: Option<&CSINod
 
 /// `tryTranslatePVToCSI` (binder.go:1108-1139): translate the in-tree PV to
 /// CSI when its plugin is migrated on this node, else return it unmodified.
-fn try_translate_pv_to_csi<'a>(
+pub(crate) fn try_translate_pv_to_csi<'a>(
     pv: &'a PersistentVolume,
     csi_node: Option<&CSINode>,
 ) -> Result<std::borrow::Cow<'a, PersistentVolume>, String> {
