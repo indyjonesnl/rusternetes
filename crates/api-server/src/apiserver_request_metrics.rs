@@ -8,10 +8,12 @@
 //! `server/filters/maxinflight.go`'s `requestWatermark` (:56-84) and
 //! `startWatermarkMaintenance` (:92-104).
 //!
-//! DEVIATION: this server has no general request-instrumentation filter yet,
-//! so `apiserver_request_total` is only incremented by
-//! [`record_dropped_request`] (the 429s); upstream also increments it per
-//! served request in `MonitorRequest`.
+//! DEVIATION: this server has no general request-instrumentation filter, so
+//! the `MonitorRequest` counter increment ([`monitor_request`]) is called from
+//! the APF filter for requests it admits (plus the 429s via
+//! [`record_dropped_request`]); requests the filter skips (long-running
+//! non-watch, no request info) are not counted, and the latency / response
+//! size histograms are not ported.
 
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Duration;
@@ -219,9 +221,9 @@ fn clean_dry_run(query: &str) -> String {
     values.join(",")
 }
 
-/// `RecordDroppedRequest` (metrics.go:508-526): the request was rejected via
-/// `http.TooManyRequests`; counted in `apiserver_request_total` with code 429.
-pub fn record_dropped_request(req: &RequestMeta, component: &str, _is_mutating: bool) {
+/// The `requestCounter` increment of `MonitorRequest` (metrics.go:599-603):
+/// every request that reached a handler is counted with its response code.
+pub fn monitor_request(req: &RequestMeta, component: &str, code: u16) {
     let scope = clean_scope(req);
     let dry_run = clean_dry_run(&req.query);
     let verb = reported_verb(req, scope);
@@ -244,9 +246,15 @@ pub fn record_dropped_request(req: &RequestMeta, component: &str, _is_mutating: 
             &req.subresource,
             scope,
             component,
-            "429",
+            &code.to_string(),
         ])
         .inc();
+}
+
+/// `RecordDroppedRequest` (metrics.go:508-526): the request was rejected via
+/// `http.TooManyRequests`; counted in `apiserver_request_total` with code 429.
+pub fn record_dropped_request(req: &RequestMeta, component: &str, _is_mutating: bool) {
+    monitor_request(req, component, 429);
 }
 
 /// `RecordRequestTermination` (metrics.go:532-549): the request was

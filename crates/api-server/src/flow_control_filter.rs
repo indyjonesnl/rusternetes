@@ -570,6 +570,8 @@ pub async fn priority_and_fairness<S: Storage + 'static>(
             // (apf_filter.go:171-177); `maybe_reap` re-checks that the level
             // is quiescing and its queueset idle.
             f.engine.maybe_reap(&classification.priority_level);
+            // `MonitorRequest` (endpoints/metrics/metrics.go:603).
+            apiserver_request_metrics::monitor_request(&meta, COMPONENT, resp.status().as_u16());
             set_response_headers(&classification, &mut resp);
             resp
         }
@@ -1212,6 +1214,29 @@ mod tests {
         assert!(sample("apiserver_request_total", &l) >= r0 + 1.0);
         gate.notify_one();
         held.await.unwrap().unwrap();
+    }
+
+    // MonitorRequest (endpoints/metrics/metrics.go:603): every served request
+    // increments `apiserver_request_total` with its real response code, not
+    // just the 429s.
+    #[tokio::test]
+    async fn served_request_counts_apiserver_request_total_with_status_code() {
+        use crate::flow_control::metric_test_util::sample;
+        let l = [
+            ("verb", "GET"),
+            ("resource", "namespaces"),
+            ("scope", "resource"),
+            ("component", "apiserver"),
+            ("code", "200"),
+        ];
+        let before = sample("apiserver_request_total", &l);
+        let app = app(10, Duration::from_millis(50), none_hook(), bob()).await;
+        let resp = app
+            .oneshot(get_req("/api/v1/namespaces/default"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(sample("apiserver_request_total", &l) >= before + 1.0);
     }
 
     // httplog.AddKeyValue(ctx, "apf_pl", truncateLogField(pl.Name)) (:119).
