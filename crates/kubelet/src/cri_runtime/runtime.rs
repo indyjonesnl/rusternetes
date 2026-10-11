@@ -672,9 +672,37 @@ impl CriContainerRuntime {
         Ok(())
     }
 
-    /// Runtime handler for the pod's `RunPodSandbox`.
-    async fn sandbox_runtime_handler(&self, _pod: &Pod) -> anyhow::Result<String> {
-        Ok(self.runtime_handler.clone())
+    /// Runtime handler for the pod's `RunPodSandbox`
+    /// (`CreatePodSandbox`, `pkg/kubelet/kuberuntime/kuberuntime_sandbox.go:58-68`):
+    /// `runtimeClassManager.LookupRuntimeHandler(pod.Spec.RuntimeClassName)`,
+    /// where a lookup failure fails the sandbox. Without storage (no manager,
+    /// `if m.runtimeClassManager != nil`) the node default is used.
+    ///
+    /// Deliberate deviation: upstream resolves "no runtimeClassName" to `""`;
+    /// we keep the node-configured `CONTAINER_RUNTIME_HANDLER` there so
+    /// existing deployments that rely on it keep working.
+    async fn sandbox_runtime_handler(&self, pod: &Pod) -> anyhow::Result<String> {
+        let Some(storage) = self.volumes.as_ref().and_then(|v| v.storage.as_ref()) else {
+            return Ok(self.runtime_handler.clone());
+        };
+        let class = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.runtime_class_name.as_deref());
+        let handler = super::host_policy::lookup_runtime_handler(storage.as_ref(), class)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to create sandbox for pod \"{}/{}\": {e}",
+                    pod.metadata.namespace.as_deref().unwrap_or_default(),
+                    pod.metadata.name
+                )
+            })?;
+        if handler.is_empty() {
+            Ok(self.runtime_handler.clone())
+        } else {
+            Ok(handler)
+        }
     }
 
     /// Create and start a single container in the pod's existing sandbox. Used
@@ -1318,7 +1346,7 @@ impl CriContainerRuntime {
                 sc.supplemental_groups.extend(extra_groups);
             }
         }
-        let handler = self.runtime_handler.clone();
+        let handler = self.sandbox_runtime_handler(pod).await?;
 
         let mut cri = self.cri.clone();
         // Idempotent: reuse a ready sandbox if one already exists for this pod
