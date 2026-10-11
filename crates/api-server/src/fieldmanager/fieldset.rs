@@ -192,7 +192,7 @@ impl Set {
 
 /// What the (absent) schema would say about a field.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum FieldKind {
+pub(crate) enum FieldKind {
     Struct,
     /// A granular map (`labels`): the map itself is a member.
     Map,
@@ -205,7 +205,7 @@ pub(super) enum FieldKind {
     Atomic,
 }
 
-pub(super) fn field_kind(name: &str) -> FieldKind {
+pub(crate) fn field_kind(name: &str) -> FieldKind {
     match name {
         "labels" | "annotations" | "data" | "binaryData" | "stringData" | "nodeSelector"
         | "matchLabels" | "limits" | "requests" | "capacity" | "allocatable" => FieldKind::Map,
