@@ -242,9 +242,20 @@ impl CriClient {
 
     /// Look up an image's status; `None` if the runtime does not have it.
     pub async fn image_status(&mut self, image: &str, verbose: bool) -> Result<Option<v1::Image>> {
+        self.image_status_for_handler(image, "", verbose).await
+    }
+
+    /// [`Self::image_status`] with `ImageSpec.runtime_handler` set (KEP-4216).
+    pub async fn image_status_for_handler(
+        &mut self,
+        image: &str,
+        runtime_handler: &str,
+        verbose: bool,
+    ) -> Result<Option<v1::Image>> {
         let request = v1::ImageStatusRequest {
             image: Some(v1::ImageSpec {
                 image: image.to_string(),
+                runtime_handler: runtime_handler.to_string(),
                 ..Default::default()
             }),
             verbose,

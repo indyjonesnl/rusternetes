@@ -207,6 +207,12 @@ pub enum Feature {
     /// drops a cross-namespace `spec.dataSourceRef` unless the old claim already
     /// had a `dataSourceRef` (`pkg/api/persistentvolumeclaim/util.go:37-58`).
     CrossNamespaceVolumeDataSource,
+
+    /// Upstream gate `RuntimeClassInImageCriApi` (1.29 Alpha, off;
+    /// `pkg/features/kube_features.go:1729-1731`; name at `:858`). When on, the
+    /// kubelet passes the pod RuntimeClass handler in `ImageSpec.runtime_handler`
+    /// (`kuberuntime_container.go:177-190` `getPodRuntimeHandler`).
+    RuntimeClassInImageCriApi,
 }
 
 impl Feature {
@@ -253,6 +259,7 @@ impl Feature {
             Feature::DeploymentReplicaSetTerminatingReplicas => 37,
             Feature::StorageCapacityScoring => 38,
             Feature::CrossNamespaceVolumeDataSource => 39,
+            Feature::RuntimeClassInImageCriApi => 40,
         }
     }
 
@@ -342,6 +349,8 @@ impl Feature {
             Feature::StorageCapacityScoring => false,
             // 1.26 Alpha, off (pkg/features/kube_features.go:1223-1225)
             Feature::CrossNamespaceVolumeDataSource => false,
+            // 1.29 Alpha, off (kube_features.go:1729-1731).
+            Feature::RuntimeClassInImageCriApi => false,
         }
     }
 }
@@ -398,6 +407,7 @@ pub const ALL_FEATURES: &[Feature] = &[
     Feature::DeploymentReplicaSetTerminatingReplicas,
     Feature::StorageCapacityScoring,
     Feature::CrossNamespaceVolumeDataSource,
+    Feature::RuntimeClassInImageCriApi,
 ];
 
 /// Total number of feature gates. Derived from [`ALL_FEATURES`].
@@ -452,6 +462,7 @@ static STATES: [AtomicBool; NUM_FEATURES] = [
     AtomicBool::new(Feature::DeploymentReplicaSetTerminatingReplicas.default_enabled()),
     AtomicBool::new(Feature::StorageCapacityScoring.default_enabled()),
     AtomicBool::new(Feature::CrossNamespaceVolumeDataSource.default_enabled()),
+    AtomicBool::new(Feature::RuntimeClassInImageCriApi.default_enabled()),
 ];
 
 /// Returns whether `feature` is currently enabled in this process.
