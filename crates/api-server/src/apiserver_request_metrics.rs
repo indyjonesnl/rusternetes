@@ -25,10 +25,11 @@
 //! counter, deprecated-API gauge or field-validation histogram; (4) nothing
 //! calls [`record_request_abort`] yet (no timeout / abort filter).
 
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
 use prometheus::{register, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts};
+use rusternetes_common::latency_trackers::{with_latency_trackers, LatencyTrackers};
 
 /// The request fields `RecordDroppedRequest`/`RecordRequestTermination` read
 /// from `*http.Request` and `*request.RequestInfo`.
@@ -171,6 +172,34 @@ static REQUEST_LATENCIES: LazyLock<HistogramVec> = LazyLock::new(|| {
         ],
     )
 });
+
+/// `requestSloLatencies` (metrics.go:110-124, deprecated since 1.27) and
+/// `requestSliLatencies` (:125-139): latency not counting webhook and APF
+/// queue-wait time.
+fn sli_histogram(name: &str) -> HistogramVec {
+    histogram_vec(
+        name,
+        "Response latency distribution (not counting webhook duration and priority & fairness queue wait times) in seconds for each verb, group, version, resource, subresource, scope and component.",
+        vec![
+            0.05, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0,
+            15.0, 20.0, 30.0, 45.0, 60.0,
+        ],
+        &[
+            "verb",
+            "group",
+            "version",
+            "resource",
+            "subresource",
+            "scope",
+            "component",
+        ],
+    )
+}
+
+static REQUEST_SLO_LATENCIES: LazyLock<HistogramVec> =
+    LazyLock::new(|| sli_histogram("request_slo_duration_seconds"));
+static REQUEST_SLI_LATENCIES: LazyLock<HistogramVec> =
+    LazyLock::new(|| sli_histogram("request_sli_duration_seconds"));
 
 /// `responseSizes` (metrics.go:152-162): `ExponentialBuckets(1000, 10.0, 7)`.
 static RESPONSE_SIZES: LazyLock<HistogramVec> = LazyLock::new(|| {
@@ -334,6 +363,7 @@ pub fn monitor_request(
     code: u16,
     elapsed: Duration,
     resp_size: u64,
+    excluded: Option<Duration>,
 ) {
     count_request(req, component, code);
     let scope = clean_scope(req);
@@ -352,6 +382,26 @@ pub fn monitor_request(
             component,
         ])
         .observe(elapsed.as_secs_f64());
+    // `if wd, ok := LatencyTrackersFrom(ctx); ok && dryRun == ""` (:620-625):
+    // the latency minus webhook and APF queue-wait time.
+    if let (Some(excluded), "") = (excluded, dry_run.as_str()) {
+        let sli = elapsed.as_secs_f64() - excluded.as_secs_f64();
+        let labels = [
+            verb.as_str(),
+            group,
+            version,
+            resource,
+            req.subresource.as_str(),
+            scope,
+            component,
+        ];
+        REQUEST_SLO_LATENCIES
+            .with_label_values(&labels)
+            .observe(sli);
+        REQUEST_SLI_LATENCIES
+            .with_label_values(&labels)
+            .observe(sli);
+    }
     // "We are only interested in response sizes of read requests." (:624)
     if verb == "GET" || verb == "LIST" {
         RESPONSE_SIZES
@@ -417,7 +467,13 @@ pub async fn instrument_request(
     use axum::body::HttpBody;
     let meta = request_meta(&req);
     let started = std::time::Instant::now();
-    let resp = next.run(req).await;
+    // `WithLatencyTrackers` (filters/webhook_duration.go:36-61) installs the
+    // trackers for every request except watches.
+    let trackers = (meta.verb != "watch").then(|| Arc::new(LatencyTrackers::new()));
+    let resp = match &trackers {
+        Some(t) => with_latency_trackers(t.clone(), next.run(req)).await,
+        None => next.run(req).await,
+    };
     let size = resp
         .headers()
         .get(axum::http::header::CONTENT_LENGTH)
@@ -430,6 +486,7 @@ pub async fn instrument_request(
         resp.status().as_u16(),
         started.elapsed(),
         size,
+        trackers.map(|t| t.excluded_latency()),
     );
     resp
 }
@@ -582,6 +639,85 @@ mod tests {
             resource: resource.into(),
             ..Default::default()
         }
+    }
+
+    // MonitorRequest (metrics.go:619-625): the SLI latency is the elapsed time
+    // minus webhook and APF queue-wait time, only when trackers exist and the
+    // request is not a dry run.
+    #[test]
+    fn sli_duration_excludes_webhook_and_queue_wait() {
+        use crate::flow_control::metric_test_util::{sample, sample_sum};
+        let l = [("resource", "slithings"), ("component", "apiserver")];
+        monitor_request(
+            &meta("slithings"),
+            "apiserver",
+            200,
+            Duration::from_secs(5),
+            0,
+            Some(Duration::from_secs(3)),
+        );
+        assert_eq!(sample("apiserver_request_sli_duration_seconds", &l), 1.0);
+        assert_eq!(
+            sample_sum("apiserver_request_sli_duration_seconds", &l),
+            2.0
+        );
+        assert_eq!(
+            sample_sum("apiserver_request_slo_duration_seconds", &l),
+            2.0
+        );
+        // No trackers (a watch): not observed.
+        monitor_request(
+            &meta("slithings"),
+            "apiserver",
+            200,
+            Duration::from_secs(5),
+            0,
+            None,
+        );
+        // Dry run: not observed.
+        let mut dry = meta("slithings");
+        dry.query = "dryRun=All".into();
+        monitor_request(
+            &dry,
+            "apiserver",
+            200,
+            Duration::from_secs(5),
+            0,
+            Some(Duration::ZERO),
+        );
+        assert_eq!(sample("apiserver_request_sli_duration_seconds", &l), 1.0);
+    }
+
+    // `WithLatencyTrackers` + `TrackAPFQueueWaitLatency`: instrument_request
+    // installs trackers so APF queue wait is subtracted.
+    #[tokio::test]
+    async fn instrument_request_installs_trackers() {
+        use axum::{body::Body, http::Request, middleware, routing::get, Router};
+        use tower::ServiceExt;
+        async fn handler() -> &'static str {
+            rusternetes_common::latency_trackers::track_apf_queue_wait_latency(
+                Duration::from_secs(100),
+            );
+            "ok"
+        }
+        let app = Router::new()
+            .route("/api/v1/namespaces/default/instrthings", get(handler))
+            .layer(middleware::from_fn(instrument_request));
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/namespaces/default/instrthings")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let sum = crate::flow_control::metric_test_util::sample_sum(
+            "apiserver_request_sli_duration_seconds",
+            &[("resource", "instrthings")],
+        );
+        // elapsed (~0) - 100s of queue wait.
+        assert!(sum < -99.0, "sli sum {sum}");
     }
 
     // RecordDroppedRequest (metrics.go:508-526): `apiserver_request_total`

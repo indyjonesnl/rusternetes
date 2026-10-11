@@ -41,9 +41,12 @@ impl DurationTracker {
     }
 
     /// `TrackDuration` (:79-84).
-    pub fn track_duration(&self, _d: Duration) {
-        let _ = self.aggregate;
-        todo!()
+    pub fn track_duration(&self, d: Duration) {
+        let mut l = self.latency.lock().unwrap_or_else(|e| e.into_inner());
+        *l = match self.aggregate {
+            Aggregate::Sum => *l + d,
+            Aggregate::Max => (*l).max(d),
+        };
     }
 
     /// `Track` (:62-77): time `f` and aggregate its duration.
