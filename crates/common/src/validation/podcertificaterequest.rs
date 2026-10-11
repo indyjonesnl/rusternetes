@@ -7,15 +7,10 @@
 //! (:936-989) and `apivalidation.ValidateUserAnnotations`
 //! (`pkg/apis/core/validation/validation.go:146-156`).
 //!
-//! Deliberate deviations (the Rust crypto stack differs from Go's):
-//! * RSA-PSS verification: Go calls `rsa.VerifyPSS(.., nil)` (salt length
-//!   auto-detected). The `rsa` crate needs the salt length up front, so the
-//!   two lengths a signer produces in practice are tried: the maximum
-//!   (`PSSSaltLengthAuto` on sign) and the digest length
-//!   (`PSSSaltLengthEqualsHash`).
-//! * `mail.ParseAddress` on SAN e-mail addresses is approximated by a
-//!   structural check (single `@`, non-empty local/domain, no whitespace or
-//!   angle brackets).
+//! RSA-PSS proof-of-possession is verified exactly like Go's
+//! `rsa.VerifyPSS(.., nil)` (salt length auto-detected, see
+//! [`verify_rsa_pss`]) and SAN e-mail addresses go through a port of Go's
+//! `net/mail.ParseAddress` ([`crate::validation::gomail`]).
 
 use crate::resources::podcertificaterequest::{
     PodCertificateRequest, PodCertificateRequestStatus, CONDITION_TYPE_DENIED,
@@ -353,19 +348,93 @@ fn left_pad(digest: &[u8], len: usize) -> Vec<u8> {
     out
 }
 
-/// `rsa.VerifyPSS(pub, crypto.SHA256, digest, sig, nil)`. See the module doc
-/// for the salt-length deviation.
+/// MGF1 with SHA-256 XORed into `db` (crypto/internal/fips140/rsa/pkcs1v22.go
+/// `mgf1XOR`).
+fn mgf1_xor(db: &mut [u8], seed: &[u8]) {
+    for (counter, chunk) in db.chunks_mut(32).enumerate() {
+        let mut h = Sha256::new();
+        h.update(seed);
+        h.update((counter as u32).to_be_bytes());
+        for (b, m) in chunk.iter_mut().zip(h.finalize()) {
+            *b ^= m;
+        }
+    }
+}
+
+/// `rsa.VerifyPSS(pub, crypto.SHA256, digest, sig, nil)`: a port of
+/// `verifyPSS` (crypto/internal/fips140/rsa/pkcs1v22.go:326) and
+/// `emsaPSSVerify` (:147) with `sLen = pssSaltLengthAutodetect` (:145), where
+/// the salt length is recovered from the position of the 0x01 delimiter in DB
+/// (:197-204).
 fn verify_rsa_pss(pk: &rsa::RsaPublicKey, digest: &[u8], sig: &[u8]) -> bool {
     use rsa::traits::PublicKeyParts;
-    let em_len = (pk.n().bits() - 1).div_ceil(8);
-    let max_salt = em_len.saturating_sub(digest.len() + 2);
-    [max_salt, digest.len()].into_iter().any(|salt_len| {
-        let vk = rsa::pss::VerifyingKey::<Sha256>::new_with_salt_len(pk.clone(), salt_len);
-        let Ok(sig) = rsa::pss::Signature::try_from(sig) else {
+    use rsa::BigUint;
+    const H_LEN: usize = 32;
+
+    // checkPublicKey (rsa.go:336): odd modulus, 2 <= e, e odd.
+    let (n, e) = (pk.n(), pk.e());
+    let odd = |x: &BigUint| x.to_bytes_be().last().is_some_and(|b| b & 1 == 1);
+    if !odd(n) || *e < BigUint::from(2u8) || !odd(e) {
+        return false;
+    }
+    // len(sig) != pub.Size() -> ErrVerification
+    if sig.len() != pk.size() {
+        return false;
+    }
+    let em_bits = n.bits() - 1;
+    let em_len = em_bits.div_ceil(8);
+    // encrypt(pub, sig): sig^e mod n, error if sig >= n.
+    let c = BigUint::from_bytes_be(sig);
+    if &c >= n {
+        return false;
+    }
+    let m = c.modpow(e, n).to_bytes_be();
+    // Left-pad to the modulus size, then strip leading zeroes beyond emLen
+    // (:352-357).
+    let mut em = vec![0u8; pk.size().saturating_sub(m.len())];
+    em.extend_from_slice(&m);
+    while em.len() > em_len && !em.is_empty() {
+        if em[0] != 0 {
             return false;
-        };
-        rsa::signature::hazmat::PrehashVerifier::verify_prehash(&vk, digest, &sig).is_ok()
-    })
+        }
+        em.remove(0);
+    }
+    if em.len() != em_len || digest.len() != H_LEN {
+        return false;
+    }
+
+    // emsaPSSVerify, sLen == auto. Step 3 with sLen = -1: emLen < hLen + 1.
+    if em_len < H_LEN + 1 {
+        return false;
+    }
+    if em[em_len - 1] != 0xbc {
+        return false;
+    }
+    let (masked_db, rest) = em.split_at_mut(em_len - H_LEN - 1);
+    let h = &rest[..H_LEN];
+    let bit_mask: u8 = 0xff >> (8 * em_len - em_bits);
+    if masked_db[0] & !bit_mask != 0 {
+        return false;
+    }
+    let db = masked_db;
+    mgf1_xor(db, h);
+    db[0] &= bit_mask;
+
+    let Some(ps_idx) = db.iter().position(|&b| b == 0x01) else {
+        return false;
+    };
+    let s_len = db.len() - ps_idx - 1;
+    let ps_len = em_len - H_LEN - s_len - 2;
+    if db[..ps_len].iter().any(|&b| b != 0) || db[ps_len] != 0x01 {
+        return false;
+    }
+    let salt = &db[db.len() - s_len..];
+
+    let mut hh = Sha256::new();
+    hh.update([0u8; 8]);
+    hh.update(digest);
+    hh.update(salt);
+    hh.finalize().as_slice() == h
 }
 
 /// `ValidatePodCertificateRequestUpdate` (validation.go:733-744): all spec
@@ -456,18 +525,6 @@ fn pem_blocks(chain: &str) -> Vec<(String, Vec<u8>)> {
         rest = &body_and_rest[end + end_marker.len()..];
     }
     out
-}
-
-/// Structural stand-in for Go's `mail.ParseAddress` on a bare address.
-fn is_valid_email(addr: &str) -> bool {
-    let mut parts = addr.splitn(2, '@');
-    let (local, domain) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
-    !local.is_empty()
-        && !domain.is_empty()
-        && !domain.contains('@')
-        && !addr
-            .chars()
-            .any(|c| c.is_whitespace() || "<>(),;:\\\"".contains(c))
 }
 
 /// Go's `PublicKey.Equal` over two SPKIs.
@@ -668,7 +725,9 @@ fn validate_issued(
                         ));
                     }
                 }
-                GeneralName::RFC822Name(email) if !is_valid_email(email) => {
+                GeneralName::RFC822Name(email)
+                    if !crate::validation::gomail::parse_address_ok(email) =>
+                {
                     errs.push(Error::invalid(
                         &chain_path,
                         email.to_string(),
