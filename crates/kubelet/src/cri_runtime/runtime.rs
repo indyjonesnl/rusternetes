@@ -4053,10 +4053,13 @@ mod tests {
                 .unwrap(),
             "runsc"
         );
-        // No class: node-configured default is kept (documented deviation).
+        // No class resolves to "" (`runtimeclass_manager.go:61-65`: "The default
+        // RuntimeClass always resolves to the empty runtime handler"); no
+        // node-level CONTAINER_RUNTIME_HANDLER fallback (#3263).
+        assert_eq!(rt.sandbox_runtime_handler(&mk(None)).await.unwrap(), "");
         assert_eq!(
-            rt.sandbox_runtime_handler(&mk(None)).await.unwrap(),
-            "node-default"
+            rt.sandbox_runtime_handler(&mk(Some(""))).await.unwrap(),
+            ""
         );
         // Missing RuntimeClass fails the sandbox (`kuberuntime_sandbox.go:60-63`).
         assert!(rt.sandbox_runtime_handler(&mk(Some("nope"))).await.is_err());
