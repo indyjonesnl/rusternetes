@@ -191,6 +191,7 @@ static RESPONSE_SIZES: LazyLock<HistogramVec> = LazyLock::new(|| {
 });
 
 /// `requestAbortsTotal` (metrics.go:243-252).
+#[allow(dead_code)] // only used by record_request_abort; see #3192
 static REQUEST_ABORTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     counter_vec(
         "request_aborts_total",
@@ -368,6 +369,7 @@ pub fn monitor_request(
 }
 
 /// `RecordRequestAbort` (metrics.go:496-506).
+#[allow(dead_code)] // no timeout/abort filter to call it yet; wiring tracked in #3192
 pub fn record_request_abort(req: &RequestMeta) {
     let scope = clean_scope(req);
     let verb = reported_verb(req, scope);
