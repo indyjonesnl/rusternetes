@@ -204,6 +204,32 @@ pub fn node_addresses(
     Ok(vec![internal(ip_addr), host])
 }
 
+/// The InternalIP list the kubelet advertises: the `NodeAddress` setter
+/// result, falling back to `detect` (the legacy single-IPv4 path) when the
+/// setter errors or yields no InternalIP. `Never empty`.
+pub fn effective_internal_ips(
+    configured: &[IpAddr],
+    validate: &dyn Fn(IpAddr) -> Result<(), String>,
+    hostname: &str,
+    lookup: &dyn Fn(&str) -> Vec<IpAddr>,
+    resolve: &dyn Fn(Option<IpAddr>) -> Option<IpAddr>,
+    detect: &dyn Fn() -> String,
+) -> Vec<String> {
+    if !configured.is_empty() {
+        if let Ok(addrs) = node_addresses(configured, validate, hostname, lookup, resolve) {
+            let ips: Vec<String> = addrs
+                .into_iter()
+                .filter(|(t, _)| t == "InternalIP")
+                .map(|(_, a)| a)
+                .collect();
+            if !ips.is_empty() {
+                return ips;
+            }
+        }
+    }
+    vec![detect()]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,5 +426,35 @@ mod tests {
     #[test]
     fn address_nothing_found_errors() {
         assert!(node_addresses(&[], &validate_node_ip, "h", &none, &|_| None).is_err());
+    }
+
+    // setters.go:163-179 runs with NO --node-ip too: an IPv6-only host (DNS
+    // yields only a valid v6 address) advertises it instead of 127.0.0.1 (#3186).
+    #[test]
+    fn effective_ips_without_node_ip_uses_ipv6_only_lookup() {
+        let lk = |_: &str| vec![ip("fd00::9")];
+        let got = effective_internal_ips(
+            &[],
+            &validate_node_ip,
+            "h",
+            &lk,
+            &|_| None,
+            &|| "127.0.0.1".to_string(),
+        );
+        assert_eq!(got, vec!["fd00::9".to_string()]);
+    }
+
+    #[test]
+    fn effective_ips_without_node_ip_prefers_ipv4_and_falls_back_to_detect() {
+        let lk = |_: &str| vec![ip("fd00::9"), ip("10.0.0.9")];
+        let d = || "127.0.0.1".to_string();
+        assert_eq!(
+            effective_internal_ips(&[], &validate_node_ip, "h", &lk, &|_| None, &d),
+            vec!["10.0.0.9".to_string()]
+        );
+        assert_eq!(
+            effective_internal_ips(&[], &validate_node_ip, "h", &none, &|_| None, &d),
+            vec!["127.0.0.1".to_string()]
+        );
     }
 }
