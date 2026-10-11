@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use rusternetes_common::admission::Operation as AdmissionOperation;
 use rusternetes_common::cel::{CELContext, CELEvaluator};
-use rusternetes_common::cel_struct;
+use rusternetes_common::cel_struct::{self, TypeCheck};
 use serde_json::{json, Value};
 
 use super::policy_json_patch_ops::{apply, ApplyError, Operation};
@@ -57,7 +57,13 @@ impl JsonPatcher {
         &self,
         r: &PatchRequest<'_>,
     ) -> Result<Vec<Operation>, PatchError> {
-        let json = evaluate_expression(&self.evaluator, &self.expression, &self.variables, r)?;
+        let json = evaluate_expression(
+            &self.evaluator,
+            &self.expression,
+            &self.variables,
+            r,
+            TypeCheck::JsonPatchValues,
+        )?;
         Self::operations_from(json)
     }
 
@@ -99,6 +105,7 @@ pub(super) fn evaluate_expression(
     expression: &str,
     variables: &[(String, String)],
     r: &PatchRequest<'_>,
+    check: TypeCheck,
 ) -> Result<Value, PatchError> {
     {
         let mut ctx = CELContext::new();
@@ -129,33 +136,53 @@ pub(super) fn evaluate_expression(
         // evaluated up front in declaration order, so a variable can read the
         // ones declared before it, and a failure is only reported when the
         // expression actually reads that variable.
-        let mut bound = serde_json::Map::new();
+        // The values are bound with their `Object{}` type markers, so
+        // `CheckTypeNamesMatchFieldPathNames` still sees a struct reaching a
+        // field through a variable (as the lazily evaluated ObjectVal does).
+        let mut bound: std::collections::HashMap<cel::objects::Key, cel::Value> =
+            std::collections::HashMap::new();
+        let bind =
+            |ctx: &mut CELContext,
+             bound: &std::collections::HashMap<cel::objects::Key, cel::Value>| {
+                ctx.add_variable(
+                    "variables".to_string(),
+                    cel::Value::Map(cel::objects::Map {
+                        map: Arc::new(bound.clone()),
+                    }),
+                );
+            };
         let mut failed: Vec<(&str, String)> = Vec::new();
-        ctx.add_json_variable("variables", &Value::Object(bound.clone()))
-            .map_err(|e| PatchError::Other(e.to_string()))?;
+        bind(&mut ctx, &bound);
         for (name, expr) in variables {
             let result = evaluator
-                .evaluate_to_value(expr, &ctx)
+                .evaluate_to_value_raw(expr, &ctx)
                 .map_err(|e| e.to_string())
-                .and_then(|v| v.json().map_err(|e| e.to_string()));
+                .and_then(|v| {
+                    // Fails a value that cannot marshal to JSON.
+                    cel_struct::strip_type_markers(&v)
+                        .json()
+                        .map_err(|e| e.to_string())?;
+                    Ok(v)
+                });
             match result {
                 Ok(v) => {
-                    bound.insert(name.clone(), v);
-                    ctx.add_json_variable("variables", &Value::Object(bound.clone()))
-                        .map_err(|e| PatchError::Other(e.to_string()))?;
+                    bound.insert(cel::objects::Key::from(name.as_str()), v);
+                    bind(&mut ctx, &bound);
                 }
                 Err(e) => failed.push((name, composited_failure(&failed, expr, name, e))),
             }
         }
 
-        let value = evaluator.evaluate_to_value(expression, &ctx).map_err(|e| {
-            PatchError::Other(
-                match failed.iter().find(|(n, _)| reads_variable(expression, n)) {
-                    Some((_, msg)) => msg.clone(),
-                    None => e.to_string(),
-                },
-            )
-        })?;
+        let value = evaluator
+            .evaluate_to_value_checked(expression, &ctx, check)
+            .map_err(|e| {
+                PatchError::Other(
+                    match failed.iter().find(|(n, _)| reads_variable(expression, n)) {
+                        Some((_, msg)) => msg.clone(),
+                        None => e.to_string(),
+                    },
+                )
+            })?;
         value.json().map_err(|e| {
             PatchError::Other(format!(
                 "JSONPath valueExpression evaluated to a type that could not marshal to JSON: {e}"

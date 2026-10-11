@@ -112,6 +112,45 @@ impl CELEvaluator {
             .map_err(|e| anyhow!("Failed to execute CEL expression '{}': {}", expression, e))
     }
 
+    /// Like [`Self::evaluate_to_value`] but keeps the `Object{}` type
+    /// markers, for values that are bound into another evaluation.
+    pub fn evaluate_to_value_raw(
+        &mut self,
+        expression: &str,
+        context: &CELContext,
+    ) -> Result<Value> {
+        let program = self.compiled(expression)?;
+        let mut cel_context = cel_struct::new_context();
+        for (key, value) in &context.variables {
+            let _ = cel_context.add_variable(key.clone(), value.clone());
+        }
+        cel_struct::execute_raw(program, &cel_context)
+            .map_err(|e| anyhow!("Failed to execute CEL expression '{}': {}", expression, e))
+    }
+
+    /// Evaluate a MAP patch expression and run upstream's
+    /// `CheckTypeNamesMatchFieldPathNames` on the result; a mismatch is
+    /// `unexpected type name ...` (the caller adds `type mismatch: `).
+    pub fn evaluate_to_value_checked(
+        &mut self,
+        expression: &str,
+        context: &CELContext,
+        mode: cel_struct::TypeCheck,
+    ) -> Result<Value> {
+        let program = self.compiled(expression)?;
+        let mut cel_context = cel_struct::new_context();
+        for (key, value) in &context.variables {
+            let _ = cel_context.add_variable(key.clone(), value.clone());
+        }
+        cel_struct::execute_checked(program, &cel_context, mode).map_err(|e| {
+            if e.starts_with("unexpected type name") {
+                anyhow!("type mismatch: {e}")
+            } else {
+                anyhow!("Failed to execute CEL expression '{}': {}", expression, e)
+            }
+        })
+    }
+
     /// Type-check a CEL expression without executing it
     pub fn type_check(&mut self, expression: &str) -> Result<()> {
         cel_struct::compile(expression)

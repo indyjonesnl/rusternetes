@@ -190,3 +190,25 @@ fn object_is_not_equal_to_a_plain_map() {
         json!(true)
     );
 }
+
+/// `CheckTypeNamesMatchFieldPathNames` on an evaluated JSONPatch `value`
+/// (json_patch.go:162-173) and ApplyConfiguration root (smd.go:99-102).
+#[test]
+fn type_names_are_checked_on_the_evaluated_result() {
+    use rusternetes_common::cel_struct::{compile, execute_checked, new_context, TypeCheck};
+    let run = |src: &str, mode| execute_checked(&compile(src).unwrap(), &new_context(), mode);
+    let ok = run(
+        r#"[JSONPatch{op: "add", path: "/spec", value: Object{a: Object.a{}}}]"#,
+        TypeCheck::JsonPatchValues,
+    );
+    assert!(ok.is_ok(), "{ok:?}");
+    let err = run(
+        r#"[JSONPatch{op: "add", path: "/spec", value: Object{a: [1].map(x, Object.b{})}}]"#,
+        TypeCheck::JsonPatchValues,
+    )
+    .unwrap_err();
+    assert!(err.contains("unexpected type name \"Object.b\", expected \"Object.a\""));
+    // reached through a function, not a literal field: only a runtime check sees it
+    let err = run("Object{a: [1].map(x, Object.zzz{})[0]}", TypeCheck::Root).unwrap_err();
+    assert!(err.contains("\"Object.zzz\""), "{err}");
+}

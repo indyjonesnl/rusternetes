@@ -28,20 +28,31 @@
 //! `Context` does not have, and a `Context` function cannot intercept it
 //! because `Expr::Struct` is not a call.
 //!
-//! Known divergences from cel-go, all benign: type-name path checking only
-//! follows literal nesting (struct fields, list elements, map values and
-//! ternary branches), not a struct reaching a field through a variable or
-//! function; an unset `JSONPatch` `op`/`path`/`from` is an absent key rather
-//! than `""`; `Object{}` is a CEL map, so its `type()` is `map`.
+//! `Object{}` values stay CEL maps (so field select, `in`, `size`, ... work)
+//! but carry their type name under the reserved key `TYPE_KEY`, which makes
+//! them unequal to a plain map and to an Object of another type, as
+//! `ObjectVal.Equal` (`dynamic/objects.go:147-155`) does. The marker travels
+//! with the value through variables and functions, so
+//! `CheckTypeNamesMatchFieldPathNames` runs on the *evaluated* result
+//! ([`execute_checked`]); [`execute`] strips the markers.
+//!
+//! Known divergences from cel-go, all benign: an unset `JSONPatch`
+//! `op`/`path`/`from` is an absent key rather than `""` (the patcher reads an
+//! absent key as `""`, as `jsonpatch.go` does); `type(Object{})` and
+//! `size()`/iteration see the marker key, as `Object{}` is a CEL map.
 
 use cel::common::ast::{
     CallExpr, EntryExpr, Expr, IdedEntryExpr, IdedExpr, LiteralValue, MapEntryExpr, MapExpr,
 };
 use cel::common::types::CelString;
+use cel::objects::Key;
 use cel::{Context, ExecutionError, Program, Value};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::Arc;
 
 const OBJECT_TYPE_NAME: &str = "Object";
+/// Reserved map key carrying an `Object{}` value's type name.
+const TYPE_KEY: &str = "\u{1}objectType";
 const JSON_PATCH_TYPE_NAME: &str = "JSONPatch";
 /// Guard on a JSONPatch `op`/`path`/`from` value (jsonpatch.go:51-66).
 const JSON_PATCH_STRING_FN: &str = "__jsonPatchString";
@@ -151,11 +162,125 @@ pub fn compile(source: &str) -> Result<CompiledExpression, String> {
     Ok(CompiledExpression(expr))
 }
 
-/// Evaluate with a context from [`new_context`]. Never panics.
-pub fn execute(expr: &CompiledExpression, ctx: &Context) -> Result<Value, String> {
+/// Evaluate with a context from [`new_context`], keeping the `Object{}` type
+/// markers (for values that are bound back into another evaluation). Never
+/// panics.
+pub fn execute_raw(expr: &CompiledExpression, ctx: &Context) -> Result<Value, String> {
     match catch_unwind(AssertUnwindSafe(|| ctx.resolve(&expr.0))) {
         Ok(r) => r.map_err(|e| e.to_string()),
         Err(_) => Err("CEL evaluation failed unexpectedly".to_string()),
+    }
+}
+
+/// Evaluate with a context from [`new_context`]; the result is a plain CEL
+/// value without type markers. Never panics.
+pub fn execute(expr: &CompiledExpression, ctx: &Context) -> Result<Value, String> {
+    execute_raw(expr, ctx).map(|v| strip_type_markers(&v))
+}
+
+/// What the evaluated result of a MAP patch expression is checked as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TypeCheck {
+    /// An `ApplyConfiguration` result: the root `Object` (smd.go:99-102).
+    Root,
+    /// A `JSONPatch` list: each `value` that is an `Object` (json_patch.go:162-173).
+    JsonPatchValues,
+}
+
+/// [`execute_raw`], then `CheckTypeNamesMatchFieldPathNames`
+/// (`dynamic/objects.go:180-215`) as the MAP patchers apply it, then strip the
+/// markers. A mismatch is `unexpected type name ...`; the caller adds the
+/// `type mismatch: ` prefix.
+pub fn execute_checked(
+    expr: &CompiledExpression,
+    ctx: &Context,
+    mode: TypeCheck,
+) -> Result<Value, String> {
+    let v = execute_raw(expr, ctx)?;
+    let mut errs = Vec::new();
+    match mode {
+        TypeCheck::Root => {
+            if let Some(tn) = type_name(&v) {
+                type_check(&v, tn, &mut errs);
+            }
+        }
+        TypeCheck::JsonPatchValues => {
+            if let Value::List(items) = &v {
+                for item in items.iter() {
+                    if let Value::Map(m) = item {
+                        if let Some(val) = m.map.get(&Key::from("value")) {
+                            if let Some(tn) = type_name(val) {
+                                type_check(val, tn, &mut errs);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !errs.is_empty() {
+        return Err(errs.join("\n"));
+    }
+    Ok(strip_type_markers(&v))
+}
+
+/// The `Object{}` type name of `v`, if it is one.
+fn type_name(v: &Value) -> Option<&str> {
+    match v {
+        Value::Map(m) => match m.map.get(&Key::from(TYPE_KEY)) {
+            Some(Value::String(s)) => Some(s.as_str()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn is_type_key(k: &Key) -> bool {
+    matches!(k, Key::String(s) if s.as_str() == TYPE_KEY)
+}
+
+/// `typeCheck` (dynamic/objects.go:184-214): an Object's children under
+/// `<field>` must be named `<path>.<field>`; intermediate maps and lists are
+/// unnamed and keep the path.
+fn type_check(v: &Value, path: &str, errs: &mut Vec<String>) {
+    match v {
+        Value::Map(m) => {
+            if let Some(tn) = type_name(v) {
+                if tn != path {
+                    errs.push(format!(
+                        "unexpected type name \"{tn}\", expected \"{path}\", which matches field name path from root Object type"
+                    ));
+                }
+                let mut fields: Vec<_> = m.map.iter().filter(|(k, _)| !is_type_key(k)).collect();
+                fields.sort_by_key(|(k, _)| format!("{k:?}"));
+                for (k, f) in fields {
+                    if let Key::String(k) = k {
+                        type_check(f, &format!("{path}.{k}"), errs);
+                    }
+                }
+            } else {
+                m.map.values().for_each(|f| type_check(f, path, errs));
+            }
+        }
+        Value::List(l) => l.iter().for_each(|f| type_check(f, path, errs)),
+        _ => {}
+    }
+}
+
+/// Remove the type marker from every Object in `v`.
+pub fn strip_type_markers(v: &Value) -> Value {
+    match v {
+        Value::Map(m) => {
+            let map = m
+                .map
+                .iter()
+                .filter(|(k, _)| !is_type_key(k))
+                .map(|(k, v)| (k.clone(), strip_type_markers(v)))
+                .collect();
+            Value::Map(cel::objects::Map { map: Arc::new(map) })
+        }
+        Value::List(l) => Value::List(Arc::new(l.iter().map(strip_type_markers).collect())),
+        other => other.clone(),
     }
 }
 
@@ -250,7 +375,17 @@ fn rewrite(e: &mut IdedExpr, expected: Option<&str>) -> Result<(), String> {
                     }
                 }
             }
-            let mut entries = Vec::with_capacity(s.entries.len());
+            let mut entries = Vec::with_capacity(s.entries.len() + 1);
+            if is_object {
+                entries.push(IdedEntryExpr {
+                    id: 0,
+                    expr: EntryExpr::MapEntry(MapEntryExpr {
+                        key: str_lit(TYPE_KEY),
+                        value: str_lit(&name),
+                        optional: false,
+                    }),
+                });
+            }
             for entry in std::mem::take(&mut s.entries) {
                 let IdedEntryExpr { id, expr } = entry;
                 let EntryExpr::StructField(mut f) = expr else {

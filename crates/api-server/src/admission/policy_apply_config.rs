@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use rusternetes_common::cel::CELEvaluator;
-use rusternetes_common::cel_struct;
+use rusternetes_common::cel_struct::{self, TypeCheck};
 use serde_json::{Map, Value};
 
 use super::policy_json_patch::evaluate_expression;
@@ -63,7 +63,13 @@ impl Patcher for ApplyConfigPatcher {
                 },
             ));
         }
-        let value = evaluate_expression(&self.evaluator, &self.expression, &self.variables, r)?;
+        let value = evaluate_expression(
+            &self.evaluator,
+            &self.expression,
+            &self.variables,
+            r,
+            TypeCheck::Root,
+        )?;
         // smd.go:87-90, :104-107: the compiler ensures an `Object`.
         let Value::Object(mut patch) = value else {
             return Err(PatchError::Other(format!(
