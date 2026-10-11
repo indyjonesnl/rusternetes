@@ -1649,46 +1649,31 @@ impl Kubelet {
 
     /// The node's InternalIP address(es), in `--node-ip` order: feeds
     /// `status.addresses`, pod `hostIP(s)` and DNS `Configurer.nodeIPs`.
-    /// With `--node-ip` set this is the `NodeAddress` setter result
-    /// (setters.go:141-189; deviation: the `Hostname` entry is added by the
-    /// caller). Without it, or when the setter fails, falls back to
-    /// [`Self::detect_internal_ip`] (the pre-existing single-IPv4 path).
+    /// This is the `NodeAddress` setter result (setters.go:141-189;
+    /// deviation: the `Hostname` entry is added by the caller), with or
+    /// without `--node-ip` (an IPv6-only host advertises its v6 address).
+    /// When the setter fails, falls back to [`Self::detect_internal_ip`].
     /// Never empty. Memoized: stable for the kubelet's lifetime.
     fn effective_node_ips() -> &'static [String] {
         static NODE_IPS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
         NODE_IPS.get_or_init(|| {
-            let configured = crate::node_ip::configured_node_ips();
-            if !configured.is_empty() {
-                let host = std::env::var("HOSTNAME").unwrap_or_default();
-                let lookup = |h: &str| -> Vec<std::net::IpAddr> {
-                    std::net::ToSocketAddrs::to_socket_addrs(&(h, 0u16))
-                        .map(|a| a.map(|s| s.ip()).collect())
-                        .unwrap_or_default()
-                };
-                let resolve = |_: Option<std::net::IpAddr>| -> Option<std::net::IpAddr> {
-                    Self::detect_internal_ip().parse().ok()
-                };
-                match crate::node_ip::node_addresses(
-                    configured,
-                    &crate::node_ip::validate_node_ip_on_host,
-                    &host,
-                    &lookup,
-                    &resolve,
-                ) {
-                    Ok(addrs) => {
-                        let ips: Vec<String> = addrs
-                            .into_iter()
-                            .filter(|(t, _)| t == "InternalIP")
-                            .map(|(_, a)| a)
-                            .collect();
-                        if !ips.is_empty() {
-                            return ips;
-                        }
-                    }
-                    Err(e) => warn!("--node-ip rejected, falling back to detection: {e}"),
-                }
-            }
-            vec![Self::detect_internal_ip()]
+            let host = std::env::var("HOSTNAME").unwrap_or_default();
+            let lookup = |h: &str| -> Vec<std::net::IpAddr> {
+                std::net::ToSocketAddrs::to_socket_addrs(&(h, 0u16))
+                    .map(|a| a.map(|s| s.ip()).collect())
+                    .unwrap_or_default()
+            };
+            let resolve = |_: Option<std::net::IpAddr>| -> Option<std::net::IpAddr> {
+                Self::detect_internal_ip().parse().ok()
+            };
+            crate::node_ip::effective_internal_ips(
+                crate::node_ip::configured_node_ips(),
+                &crate::node_ip::validate_node_ip_on_host,
+                &host,
+                &lookup,
+                &resolve,
+                &Self::detect_internal_ip,
+            )
         })
     }
 
