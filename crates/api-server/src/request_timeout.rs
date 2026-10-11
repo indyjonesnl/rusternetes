@@ -8,27 +8,180 @@
 //! (`server/config.go:1065-1071`): inside request-info, outside everything
 //! else.
 //!
-//! STUB: tests first (see the follow-up commit for the implementation).
+//! DEVIATIONS: (1) Go runs the handler in a goroutine and lets it finish after
+//! the 504 is written; here the handler future is dropped at the deadline
+//! (a cancelled future cannot write to the dead response anyway), so
+//! `RecordRequestPostTimeout` / `PostTimeoutHandlerOK|Panic` have no
+//! analogue. (2) Go distinguishes "handler has written the header" via
+//! `baseTimeoutWriter.wroteHeader`; here the handler has "started the
+//! response" once it returns a `Response`, after which only the body can still
+//! run past the deadline. That is the abort case: the body stream is failed
+//! (hyper drops the connection, the analogue of `panic(http.ErrAbortHandler)`)
+//! and `RecordRequestAbort` is called, as `WithPanicRecovery` does
+//! (wrap.go:44-48). (3) A negative `?timeout=` parses to a zero duration,
+//! which selects the default exactly as a negative one does upstream
+//! (`userSpecifiedTimeout > 0`).
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
+use axum::body::Body;
 use axum::extract::Request;
+use axum::http::{header, StatusCode};
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
+use futures::StreamExt;
+use rusternetes_common::types::{Status, StatusDetails};
+
+use crate::apiserver_request_metrics::{
+    record_request_abort, record_request_termination, request_meta, RequestMeta,
+};
+use crate::flow_control_filter::{is_long_running, DEFAULT_REQUEST_TIMEOUT};
+
+/// `invalidTimeoutInURL` (request_deadline.go:41).
+const INVALID_TIMEOUT_IN_URL: &str = "invalid timeout specified in the request URL";
+
+/// `--request-timeout` (`ServerRunOptions.RequestTimeout`, config.go:445),
+/// the `requestTimeoutMaximum` of `WithRequestDeadline`.
+static REQUEST_TIMEOUT: OnceLock<Duration> = OnceLock::new();
+
+/// Set `--request-timeout`; the first call wins.
+pub fn set_request_timeout(d: Duration) {
+    let _ = REQUEST_TIMEOUT.set(d);
+}
+
+fn request_timeout() -> Duration {
+    REQUEST_TIMEOUT
+        .get()
+        .copied()
+        .unwrap_or(DEFAULT_REQUEST_TIMEOUT)
+}
 
 /// `parseTimeout` (request_deadline.go:155-167): the user's `?timeout=`.
-pub fn parse_timeout(_query: Option<&str>) -> Result<Option<Duration>, String> {
-    Ok(None)
+pub fn parse_timeout(query: Option<&str>) -> Result<Option<Duration>, String> {
+    let value = query
+        .and_then(|q| {
+            url::form_urlencoded::parse(q.as_bytes())
+                .find(|(k, _)| k == "timeout")
+                .map(|(_, v)| v.into_owned())
+        })
+        .unwrap_or_default();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let ns = rusternetes_common::go_duration::parse_go_duration(&value)
+        .map_err(|e| format!("{INVALID_TIMEOUT_IN_URL} - {e}"))?;
+    Ok(Some(Duration::from_nanos(u64::try_from(ns).unwrap_or(0))))
 }
 
-/// The deadline `withRequestDeadline` sets (request_deadline.go:81-89).
-pub fn request_deadline(_query: Option<&str>, max: Duration) -> Result<Duration, String> {
-    Ok(max)
+/// The deadline `withRequestDeadline` sets (request_deadline.go:81-89): the
+/// user's timeout when it is positive and below the maximum, else the maximum.
+pub fn request_deadline(query: Option<&str>, max: Duration) -> Result<Duration, String> {
+    Ok(match parse_timeout(query)? {
+        Some(user) if user > Duration::ZERO && user < max => user,
+        _ => max,
+    })
 }
 
-/// `WithRequestDeadline` + `WithTimeoutForNonLongRunningRequests`.
+fn status_response(code: StatusCode, status: Status) -> Response {
+    (
+        code,
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_vec(&status).unwrap_or_default(),
+    )
+        .into_response()
+}
+
+/// `apierrors.NewTimeoutError("request did not complete within the allotted
+/// timeout", 0)` (errors.go:401-411).
+fn timeout_error() -> Response {
+    let details = StatusDetails {
+        name: None,
+        group: None,
+        kind: None,
+        uid: None,
+        causes: None,
+        retry_after_seconds: Some(0),
+    };
+    status_response(
+        StatusCode::GATEWAY_TIMEOUT,
+        Status::failure_with_details(
+            "Timeout: request did not complete within the allotted timeout",
+            "Timeout",
+            504,
+            details,
+        ),
+    )
+}
+
+/// `WithRequestDeadline` (request_deadline.go:54-102) +
+/// `WithTimeoutForNonLongRunningRequests` / `timeoutHandler.ServeHTTP`
+/// (timeout.go:36-150).
 pub async fn request_timeout_middleware(req: Request, next: Next) -> Response {
-    next.run(req).await
+    let started = tokio::time::Instant::now();
+    let meta = request_meta(&req);
+    if is_long_running(
+        &meta.verb,
+        meta.is_resource_request,
+        &meta.subresource,
+        &meta.path,
+    ) {
+        return next.run(req).await;
+    }
+    let timeout = match request_deadline(req.uri().query(), request_timeout()) {
+        Ok(t) => t,
+        Err(msg) => {
+            return status_response(
+                StatusCode::BAD_REQUEST,
+                Status::failure(msg, "BadRequest", 400),
+            )
+        }
+    };
+    let deadline = started + timeout;
+    match tokio::time::timeout_at(deadline, next.run(req)).await {
+        Err(_) => {
+            // `postTimeoutFn` (timeout.go:56-58).
+            record_request_termination(&meta, "apiserver", 504);
+            timeout_error()
+        }
+        Ok(resp) => abort_body_at(resp, deadline, meta),
+    }
+}
+
+/// The handler already started its response, so a 504 can no longer be sent:
+/// fail the body at the deadline (`panic(http.ErrAbortHandler)`,
+/// timeout.go:255-275) and count the abort (wrap.go:44-48).
+fn abort_body_at(resp: Response, deadline: tokio::time::Instant, meta: RequestMeta) -> Response {
+    let (parts, body) = resp.into_parts();
+    let state = (
+        Box::pin(body.into_data_stream()),
+        Box::pin(tokio::time::sleep_until(deadline)),
+        meta,
+        false,
+    );
+    let stream = futures::stream::unfold(state, |(mut data, mut sleep, meta, done)| async move {
+        if done {
+            return None;
+        }
+        // Ready data wins over an expired deadline: a handler that has already
+        // written is not timed out until its next blocked write.
+        tokio::select! {
+            biased;
+            item = data.next() => {
+                let item = item?.map_err(std::io::Error::other);
+                Some((item, (data, sleep, meta, false)))
+            }
+            _ = &mut sleep => {
+                record_request_abort(&meta);
+                let err = std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "request did not complete within the allotted timeout",
+                );
+                Some((Err(err), (data, sleep, meta, true)))
+            }
+        }
+    });
+    Response::from_parts(parts, Body::from_stream(stream))
 }
 
 #[cfg(test)]
@@ -172,7 +325,10 @@ mod tests {
             .fallback(|| async {
                 let stream = futures::stream::unfold(0u8, |i| async move {
                     if i == 0 {
-                        Some((Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"a")), 1))
+                        Some((
+                            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"a")),
+                            1,
+                        ))
                     } else {
                         tokio::time::sleep(Duration::from_secs(5)).await;
                         None

@@ -2875,6 +2875,11 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
     ))
     .layer(TraceLayer::new_for_http())
     .with_state(state)
+    // `WithRequestDeadline` + `WithTimeoutForNonLongRunningRequests`: inside
+    // request-info, outside every other filter (server/config.go:1065-1071).
+    .layer(axum::middleware::from_fn(
+        crate::request_timeout::request_timeout_middleware,
+    ))
     .layer(axum::middleware::from_fn(
         crate::middleware::capture_payload,
     ))

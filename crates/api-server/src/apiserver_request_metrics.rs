@@ -22,8 +22,9 @@
 //! than bytes written; (3) `request_sli_duration_seconds` /
 //! `request_slo_duration_seconds` (:119-149) are not ported (no latency
 //! trackers for webhook / APF-wait time), nor is the `apiserver_self`
-//! counter, deprecated-API gauge or field-validation histogram; (4) nothing
-//! calls [`record_request_abort`] yet (no timeout / abort filter).
+//! counter, deprecated-API gauge or field-validation histogram. [`record_request_abort`]
+//! is called by the timeout filter (`request_timeout`) when a response body
+//! outlives the request deadline.
 
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
@@ -220,7 +221,6 @@ static RESPONSE_SIZES: LazyLock<HistogramVec> = LazyLock::new(|| {
 });
 
 /// `requestAbortsTotal` (metrics.go:243-252).
-#[allow(dead_code)] // only used by record_request_abort; see #3192
 static REQUEST_ABORTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     counter_vec(
         "request_aborts_total",
@@ -419,7 +419,6 @@ pub fn monitor_request(
 }
 
 /// `RecordRequestAbort` (metrics.go:496-506).
-#[allow(dead_code)] // no timeout/abort filter to call it yet; wiring tracked in #3192
 pub fn record_request_abort(req: &RequestMeta) {
     let scope = clean_scope(req);
     let verb = reported_verb(req, scope);
@@ -437,7 +436,7 @@ pub fn record_request_abort(req: &RequestMeta) {
 
 /// `NewRequestInfo`-derived [`RequestMeta`]; a request without resource info
 /// reports `RequestInfo{Verb: req.Method, Path: req.URL.Path}` (:591-594).
-fn request_meta(req: &axum::extract::Request) -> RequestMeta {
+pub(crate) fn request_meta(req: &axum::extract::Request) -> RequestMeta {
     let attrs = crate::audit::request_info(req.method(), req.uri().path(), req.uri().query());
     RequestMeta {
         method: req.method().as_str().to_string(),
