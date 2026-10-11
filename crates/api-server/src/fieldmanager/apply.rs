@@ -215,7 +215,7 @@ impl FieldManager {
 /// `TypedValue.Merge` (typed/merge.go): maps merge key by key, associative
 /// lists by item key, sets by union; scalars and atomic lists are replaced by
 /// the config.
-fn merge_values(live: &Value, config: &Value, name: &str) -> Value {
+pub(crate) fn merge_values(live: &Value, config: &Value, name: &str) -> Value {
     match (live, config) {
         (Value::Object(_), Value::Object(_)) if field_kind(name) == FieldKind::Atomic => {
             config.clone()
@@ -242,9 +242,17 @@ fn merge_values(live: &Value, config: &Value, name: &str) -> Value {
                 match (lk, ck) {
                     (Some(lk), Some(ck)) => {
                         let mut out: Vec<Value> = Vec::with_capacity(l.len());
+                        let mut merged_keys: Vec<&String> = Vec::new();
                         for (item, key) in l.iter().zip(&lk) {
                             match ck.iter().position(|k| k == key) {
-                                Some(i) => out.push(merge_values(item, &c[i], "")),
+                                // A live list with duplicate keys is consolidated
+                                // into one merged entry (smd_test.go:
+                                // "apply configuration modify existing env variable").
+                                Some(_) if merged_keys.contains(&key) => {}
+                                Some(i) => {
+                                    merged_keys.push(key);
+                                    out.push(merge_values(item, &c[i], ""));
+                                }
                                 None => out.push(item.clone()),
                             }
                         }
