@@ -2006,3 +2006,98 @@ async fn orphan_cleanup_retries_delete_volume_five_times() {
     assert!(err.to_string().contains("volume is orphaned"));
     assert_eq!(deleted(&rec).len(), 5);
 }
+
+// ---- cross-namespace dataSourceRef (#2981) ----------------------------------
+//
+// external-provisioner `pkg/controller/controller.go` `dataSource` (:2096) and
+// `IsGranted` (`pkg/controller/util.go:12`, tests `util_test.go:53`).
+
+fn xns_claim() -> PersistentVolumeClaim {
+    let mut c = claim(&[(ANN, DRIVER)]);
+    c.metadata.namespace = Some("other".into());
+    c.spec.data_source = None;
+    c.spec.data_source_ref = Some(TypedObjectReference {
+        api_group: None,
+        kind: "PersistentVolumeClaim".into(),
+        name: "src".into(),
+        namespace: Some("ns1".into()),
+    });
+    c
+}
+
+async fn put_grant(storage: &MemoryStorage, from_ns: &str, to_name: Option<&str>) {
+    let g = ReferenceGrant {
+        metadata: ObjectMeta::new("grant").with_namespace("ns1"),
+        spec: ReferenceGrantSpec {
+            from: vec![ReferenceGrantFrom {
+                group: String::new(),
+                kind: "PersistentVolumeClaim".into(),
+                namespace: from_ns.into(),
+            }],
+            to: vec![ReferenceGrantTo {
+                group: String::new(),
+                kind: "PersistentVolumeClaim".into(),
+                name: to_name.map(String::from),
+            }],
+        },
+        ..Default::default()
+    };
+    storage
+        .create(&build_key("referencegrants", Some("ns1"), "grant"), &g)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_granted_cross_namespace_data_source_ref_provisions() {
+    let (storage, p, rec, _d) = env(Fake::with_content_sources(), storage_class(None)).await;
+    let p = p.with_cross_namespace_volume_data_source(true);
+    put_source_pvc(&storage, DRIVER, "1Gi").await;
+    put_grant(&storage, "other", None).await;
+    p.sync_claim(&xns_claim()).await.unwrap();
+    assert_eq!(rec.lock().unwrap().create_volume.len(), 1);
+}
+
+#[tokio::test]
+async fn an_ungranted_cross_namespace_data_source_ref_is_refused() {
+    let (storage, p, rec, _d) = env(Fake::with_content_sources(), storage_class(None)).await;
+    let p = p.with_cross_namespace_volume_data_source(true);
+    put_source_pvc(&storage, DRIVER, "1Gi").await;
+    put_grant(&storage, "wrong-ns", None).await;
+    let err = p.sync_claim(&xns_claim()).await.unwrap_err();
+    assert!(
+        err.to_string().contains(
+            "accessing ns1/src of PersistentVolumeClaim dataSource from other/data isn't allowed"
+        ),
+        "{err}"
+    );
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+}
+
+#[tokio::test]
+async fn a_grant_naming_another_object_does_not_allow() {
+    let (storage, p, rec, _d) = env(Fake::with_content_sources(), storage_class(None)).await;
+    let p = p.with_cross_namespace_volume_data_source(true);
+    put_source_pvc(&storage, DRIVER, "1Gi").await;
+    put_grant(&storage, "other", Some("not-src")).await;
+    assert!(p.sync_claim(&xns_claim()).await.is_err());
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+}
+
+/// Provision arm (:937-:941): a cross-namespace ref also needs the driver to
+/// return a content source.
+#[tokio::test]
+async fn a_cross_namespace_ref_without_content_source_is_cleaned_up() {
+    let mut fake = Fake::with_content_sources();
+    fake.drop_content_source = true;
+    let (storage, p, rec, _d) = env(fake, storage_class(None)).await;
+    let p = p.with_cross_namespace_volume_data_source(true);
+    put_source_pvc(&storage, DRIVER, "1Gi").await;
+    put_grant(&storage, "other", None).await;
+    let err = p.sync_claim(&xns_claim()).await.unwrap_err();
+    assert!(
+        err.to_string().contains("volume content source missing"),
+        "{err}"
+    );
+    assert_eq!(rec.lock().unwrap().delete_volume.len(), 1);
+}

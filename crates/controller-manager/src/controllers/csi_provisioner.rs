@@ -46,8 +46,8 @@ use rusternetes_common::resources::csi::{VolumeAttachment, VolumeAttributesClass
 use rusternetes_common::resources::service_account::ObjectReference;
 use rusternetes_common::resources::volume::{
     CSIVolumeSource, PersistentVolumeAccessMode, PersistentVolumeClaimPhase, PersistentVolumeMode,
-    PersistentVolumePhase, PersistentVolumeReclaimPolicy, SecretReference, StorageClass,
-    VolumeBindingMode, VolumeSnapshot, VolumeSnapshotContent,
+    PersistentVolumePhase, PersistentVolumeReclaimPolicy, ReferenceGrant, SecretReference,
+    StorageClass, VolumeBindingMode, VolumeSnapshot, VolumeSnapshotContent,
 };
 use rusternetes_common::resources::{
     EventSource, EventType, PersistentVolume, PersistentVolumeClaim, PersistentVolumeSpec,
@@ -596,10 +596,13 @@ struct DataSource {
 }
 
 /// `dataSource` (controller.go:2096-2142). The cross-namespace branch needs
-/// the `CrossNamespaceVolumeDataSource` gate (alpha, off by default) and a
-/// ReferenceGrant check (`IsGranted`); neither is ported (#2981), so, as with
-/// the gate disabled, a `dataSourceRef.namespace` is refused.
-fn data_source(claim: &PersistentVolumeClaim) -> std::result::Result<Option<DataSource>, String> {
+/// the `CrossNamespaceVolumeDataSource` gate (alpha, off by default); with it
+/// off a `dataSourceRef.namespace` is refused. The ReferenceGrant check
+/// (`IsGranted`) is `is_granted`.
+fn data_source(
+    claim: &PersistentVolumeClaim,
+    cross_namespace_gate: bool,
+) -> std::result::Result<Option<DataSource>, String> {
     let ns = claim.metadata.namespace.clone().unwrap_or_default();
     if let Some(d) = &claim.spec.data_source {
         return Ok(Some(DataSource {
@@ -610,17 +613,66 @@ fn data_source(claim: &PersistentVolumeClaim) -> std::result::Result<Option<Data
         }));
     }
     if let Some(d) = &claim.spec.data_source_ref {
-        if d.namespace.as_deref().is_some_and(|n| !n.is_empty()) {
+        if !cross_namespace_gate && d.namespace.as_deref().is_some_and(|n| !n.is_empty()) {
             return Err("dataSourceRef namespace specified but the CrossNamespaceVolumeDataSource feature is disabled".to_string());
         }
         return Ok(Some(DataSource {
             kind: d.kind.clone(),
             name: d.name.clone(),
             api_group: d.api_group.clone().unwrap_or_default(),
-            namespace: ns,
+            // controller.go:2117-2121: a nil namespace is the claim's own.
+            namespace: d.namespace.clone().unwrap_or(ns),
         }));
     }
     Ok(None)
+}
+
+/// `IsGranted` (external-provisioner `pkg/controller/util.go:12-55`): does
+/// any ReferenceGrant in the data source's namespace let this claim's
+/// namespace reference the `dataSourceRef`?
+fn is_granted(
+    claim: &PersistentVolumeClaim,
+    grants: &[ReferenceGrant],
+) -> std::result::Result<(), String> {
+    let r = claim
+        .spec
+        .data_source_ref
+        .as_ref()
+        .expect("is_granted: dataSourceRef");
+    let ref_ns = r.namespace.clone().unwrap_or_default();
+    let claim_ns = claim.metadata.namespace.clone().unwrap_or_default();
+    for grant in grants {
+        // The ReferenceGrant must live in the dataSourceRef's namespace.
+        if grant.metadata.namespace.as_deref().unwrap_or("") != ref_ns {
+            continue;
+        }
+        // Skip unrelated grants by their From.
+        if !grant.spec.from.iter().any(|f| {
+            f.group.is_empty() && f.kind == "PersistentVolumeClaim" && f.namespace == claim_ns
+        }) {
+            continue;
+        }
+        for to in &grant.spec.to {
+            let group_ok = match &r.api_group {
+                Some(g) => to.group == *g,
+                None => to.group.is_empty(),
+            };
+            if !group_ok || to.kind != r.kind {
+                continue;
+            }
+            if to
+                .name
+                .as_deref()
+                .is_none_or(|n| n.is_empty() || n == r.name)
+            {
+                return Ok(());
+            }
+        }
+    }
+    Err(format!(
+        "accessing {}/{} of {} dataSource from {}/{} isn't allowed",
+        ref_ns, r.name, r.kind, claim_ns, claim.metadata.name
+    ))
 }
 
 /// `Quantity.Value()` of a `storage` entry, `0` when absent (Go's zero value).
@@ -669,6 +721,8 @@ pub struct CsiProvisioner<S: Storage> {
     slow_set: Mutex<HashMap<String, SlowEntry>>,
     /// `--strict-topology` (csi-provisioner.go:91, default false).
     strict_topology: bool,
+    /// `CrossNamespaceVolumeDataSource` feature gate (alpha, default off).
+    cross_namespace_data_source: bool,
     /// `--immediate-topology` (csi-provisioner.go:92, default true).
     immediate_topology: bool,
     /// `pvcNodeStore` (cache.go `InMemoryStore`), keyed by PVC UID.
@@ -709,6 +763,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             retry_interval_max: RETRY_INTERVAL_MAX,
             slow_set: Mutex::new(HashMap::new()),
             strict_topology: false,
+            cross_namespace_data_source: false,
             immediate_topology: true,
             pvc_node_store: TopologyStore::new(),
             capabilities: tokio::sync::OnceCell::new(),
@@ -760,6 +815,12 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
     /// `RetryIntervalMax` (`--retry-interval-max`).
     pub fn with_retry_interval_max(mut self, max: Duration) -> Self {
         self.retry_interval_max = max;
+        self
+    }
+
+    /// `CrossNamespaceVolumeDataSource` feature gate.
+    pub fn with_cross_namespace_volume_data_source(mut self, on: bool) -> Self {
+        self.cross_namespace_data_source = on;
         self
     }
 
@@ -1610,7 +1671,24 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
 
         // dataSource normalisation + required capabilities (:586-:625).
         let mut rc = RequiredCapabilities::default();
-        let data_source = data_source(claim).map_err(fin)?;
+        let data_source = data_source(claim, self.cross_namespace_data_source).map_err(fin)?;
+        // In case of cross namespace data source, check if it accepts
+        // references (:2129-:2139).
+        if let Some(ds) = &data_source {
+            if Some(ds.namespace.as_str()) != claim.metadata.namespace.as_deref() {
+                let grants: Vec<ReferenceGrant> = self
+                    .storage
+                    .list(&format!("/registry/referencegrants/{}/", ds.namespace))
+                    .await
+                    .map_err(|e| {
+                        fin(format!(
+                            "error getting ReferenceGrants in {} namespace from api server: {e}",
+                            ds.namespace
+                        ))
+                    })?;
+                is_granted(claim, &grants).map_err(fin)?;
+            }
+        }
         if let Some(ds) = &data_source {
             // PVC.Spec.DataSource.Name is the name of the VolumeSnapshot API object
             if ds.name.is_empty() {
@@ -2361,10 +2439,18 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
         }
 
         // A data source must come back in the volume's content source
-        // (:931-:945): without it the driver made a blank volume. (The
-        // cross-namespace dataSourceRef arm of the condition is unreachable,
-        // see `data_source`.)
-        if claim.spec.data_source.is_some() && vol.content_source.is_none() {
+        // (:937-:951): without it the driver made a blank volume. A
+        // cross-namespace dataSourceRef counts too, behind the gate.
+        if (claim.spec.data_source.is_some()
+            || (self.cross_namespace_data_source
+                && claim
+                    .spec
+                    .data_source_ref
+                    .as_ref()
+                    .and_then(|r| r.namespace.as_deref())
+                    .is_some_and(|n| !n.is_empty())))
+            && vol.content_source.is_none()
+        {
             let mut source_err = "volume content source missing".to_string();
             if let Err(e) = self
                 .cleanup_volume(&vol.volume_id, &provisioner_credentials)

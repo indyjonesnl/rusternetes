@@ -997,3 +997,52 @@ mod tests {
         let _deserialized: PersistentVolumeClaim = serde_json::from_str(&json).unwrap();
     }
 }
+
+/// `ReferenceGrant` (`gateway.networking.k8s.io/v1beta1`,
+/// sigs.k8s.io/gateway-api `apis/v1beta1/referencegrant_types.go`): the
+/// object a namespace owner creates to let objects in other namespaces
+/// reference its own. Only what external-provisioner's `IsGranted`
+/// (`pkg/controller/util.go:12`) reads is modelled.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ReferenceGrant {
+    #[serde(flatten)]
+    pub type_meta: TypeMeta,
+    #[serde(default)]
+    pub metadata: ObjectMeta,
+    #[serde(default)]
+    pub spec: ReferenceGrantSpec,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ReferenceGrantSpec {
+    #[serde(default)]
+    pub from: Vec<ReferenceGrantFrom>,
+    #[serde(default)]
+    pub to: Vec<ReferenceGrantTo>,
+}
+
+/// `ReferenceGrantFrom`: group/kind/namespace of the referring objects.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ReferenceGrantFrom {
+    #[serde(default)]
+    pub group: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub namespace: String,
+}
+
+/// `ReferenceGrantTo`: group/kind (and optionally name) of the referents.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ReferenceGrantTo {
+    #[serde(default)]
+    pub group: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
