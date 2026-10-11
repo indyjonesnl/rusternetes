@@ -26,16 +26,15 @@
 //!   and the `schemaobjectmeta.Validate` embedded-resource check, which
 //!   Rusternetes' schema validator does not implement.
 //!
-//! Deviation from upstream, deliberate: upstream's request decoder
-//! (`schemaCoercingDecoder`, customresource_handler.go:1321-1346) prunes and
-//! defaults the object as it is decoded, so admission webhooks see the coerced
-//! object and `fieldValidation=Strict` learns the unknown fields from the
-//! pruning. Rusternetes' endpoint handlers decode with a plain `fn` hook that
-//! cannot carry a CRD, so [`Strategy::prepare_for_create`] /
-//! [`Strategy::prepare_for_update`] default and prune instead — after the
-//! mutating webhooks, which is where the re-decode of a webhook's patch
-//! (patch.go / mutating dispatcher) puts them upstream too — and
-//! [`CustomResourceRest`] runs the strict-field checks before that pruning.
+//! Decode-time coercion. Upstream's request decoder (`schemaCoercingDecoder`,
+//! customresource_handler.go:1321-1346) prunes and defaults the object as it
+//! is decoded, so admission webhooks see the coerced object.
+//! [`CustomResourceRest`] carries that as `RestStorage::decode_coerce`, which
+//! the endpoint handlers run wherever they decode a body (the request body,
+//! a patched object, a webhook's patched object), and the strict-field
+//! verdict as `RestStorage::decode_strict`, judged on the body before the
+//! pruning. The strategies no longer prune. Not ported: the
+//! `StrictDecodingError` for Warn mode (`unknownFieldPaths` from the pruner).
 
 use std::sync::Arc;
 
@@ -374,7 +373,6 @@ impl RestCreateStrategy<CustomResource> for Strategy {
             obj.status = None;
         }
         obj.metadata.generation = Some(1);
-        self.coerce(obj);
     }
 
     /// `Validate` (strategy.go:208-230, validator.go:44-58).
@@ -429,7 +427,6 @@ impl RestUpdateStrategy<CustomResource> for Strategy {
         if self.status_enabled() {
             obj.status = old.status.clone();
         }
-        self.coerce(obj);
         if non_metadata(obj) != non_metadata(old) {
             obj.metadata.generation = Some(old.metadata.generation.unwrap_or(0) + 1);
         }
@@ -700,33 +697,20 @@ impl CustomResourceRest {
     }
 }
 
-/// An [`UpdatedObjectInfo`] whose object — a PUT's body, or a patch applied
-/// to the stored object, after mutating admission — goes through the strict
-/// checks before the Store sees it.
-struct CheckedUpdate<'a> {
-    inner: &'a dyn UpdatedObjectInfo<CustomResource>,
-    rest: &'a CustomResourceRest,
-}
-
-#[async_trait]
-impl UpdatedObjectInfo<CustomResource> for CheckedUpdate<'_> {
-    fn preconditions(&self) -> Option<Preconditions> {
-        self.inner.preconditions()
-    }
-
-    async fn updated_object(
-        &self,
-        ctx: &RequestContext,
-        old: Option<&CustomResource>,
-    ) -> Result<CustomResource> {
-        let obj = self.inner.updated_object(ctx, old).await?;
-        self.rest.check_write(&obj)?;
-        Ok(obj)
-    }
-}
-
 #[async_trait]
 impl RestStorage<CustomResource> for CustomResourceRest {
+    /// `schemaCoercingDecoder.Decode` + `unstructuredDefaulter.Default`
+    /// (customresource_handler.go:1189-1200, 1321-1346): the body is
+    /// defaulted and pruned as it is decoded, so admission sees the result.
+    fn decode_coerce(&self, obj: &mut CustomResource) {
+        self.strategy.coerce(obj);
+    }
+
+    /// The strict-decoding verdict, on the body as sent.
+    fn decode_strict(&self, obj: &CustomResource) -> Result<()> {
+        self.check_write(obj)
+    }
+
     fn qualified_resource(&self) -> &GroupResource {
         &self.store.qualified_resource
     }
@@ -752,7 +736,6 @@ impl RestStorage<CustomResource> for CustomResourceRest {
         create_validation: Option<&dyn ValidateObject<CustomResource>>,
         options: &CreateOptions,
     ) -> Result<CustomResource> {
-        self.check_write(&obj)?;
         self.store
             .create(ctx, obj, create_validation, options)
             .await
@@ -768,15 +751,11 @@ impl RestStorage<CustomResource> for CustomResourceRest {
         force_allow_create: bool,
         options: &UpdateOptions,
     ) -> Result<(CustomResource, bool)> {
-        let checked = CheckedUpdate {
-            inner: obj_info,
-            rest: self,
-        };
         self.store
             .update(
                 ctx,
                 name,
-                &checked,
+                obj_info,
                 create_validation,
                 update_validation,
                 force_allow_create,
