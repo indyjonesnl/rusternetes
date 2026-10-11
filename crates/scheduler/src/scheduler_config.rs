@@ -109,6 +109,8 @@ struct KubeSchedulerConfiguration {
 #[serde(rename_all = "camelCase")]
 struct Profile {
     #[serde(default)]
+    scheduler_name: Option<String>,
+    #[serde(default)]
     plugin_config: Vec<PluginConfig>,
 }
 
@@ -131,6 +133,7 @@ pub fn volume_binding_args_from_config(
 ) -> Result<VolumeBindingArgs, String> {
     let cfg: KubeSchedulerConfiguration =
         serde_yaml::from_str(doc).map_err(|e| format!("invalid scheduler config: {e}"))?;
+    let mut errs = validate_profiles(&cfg);
     let mut args = VolumeBindingArgs::default();
     let mut path = Path::new("profiles").index(0);
     if let Some(profile) = cfg.profiles.first() {
@@ -146,7 +149,7 @@ pub fn volume_binding_args_from_config(
         }
     }
     args.set_defaults(storage_capacity_scoring);
-    let errs = args.validate(&path, storage_capacity_scoring);
+    errs.extend(args.validate(&path, storage_capacity_scoring));
     if errs.is_empty() {
         Ok(args)
     } else {
@@ -156,6 +159,38 @@ pub fn volume_binding_args_from_config(
             .collect::<Vec<_>>()
             .join(", "))
     }
+}
+
+/// Duplicate checks of `ValidateKubeSchedulerConfiguration` (validation.go:58-67,
+/// duplicate `schedulerName`, defaulting to `default-scheduler` per
+/// v1/defaults.go SetDefaults_KubeSchedulerProfile) and `validatePluginConfig`
+/// (validation.go:189-197, `seenPluginConfig`, per profile).
+fn validate_profiles(cfg: &KubeSchedulerConfiguration) -> ErrorList {
+    let profiles_path = Path::new("profiles");
+    let mut errs = ErrorList::new();
+    let mut seen_profiles: Vec<&str> = Vec::new();
+    for (i, profile) in cfg.profiles.iter().enumerate() {
+        let path = profiles_path.index(i);
+        let name = profile
+            .scheduler_name
+            .as_deref()
+            .unwrap_or("default-scheduler");
+        if seen_profiles.contains(&name) {
+            errs.push(field::Error::duplicate(&path.child("schedulerName"), name));
+        }
+        seen_profiles.push(name);
+        let mut seen: Vec<&str> = Vec::new();
+        for (j, pc) in profile.plugin_config.iter().enumerate() {
+            if seen.contains(&pc.name.as_str()) {
+                errs.push(field::Error::duplicate(
+                    &path.child("pluginConfig").index(j),
+                    pc.name.as_str(),
+                ));
+            }
+            seen.push(&pc.name);
+        }
+    }
+    errs
 }
 
 /// Read `--config` / `--scheduler-config` and resolve the `VolumeBinding` args
