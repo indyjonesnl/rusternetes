@@ -1,3 +1,4 @@
+use crate::volume_plugins::csi_driver_lister::CsiDriverLister;
 use rusternetes_common::auth::TokenManager;
 use rusternetes_storage::StorageBackend;
 use std::collections::HashMap;
@@ -63,6 +64,14 @@ pub trait VolumeHost: Send + Sync {
     fn pod_certificate_manager(&self) -> Option<&Arc<dyn crate::podcertificate::Manager>> {
         None
     }
+
+    /// `KubeletVolumeHost.CSIDriverLister` (`plugins.go`,
+    /// `pkg/kubelet/volume_host.go:166-168`). `None` is upstream's nil
+    /// lister, the state `csiPlugin.Init` logs "CSIDriverLister not found"
+    /// for (`csi_plugin.go:305-308`).
+    fn csi_driver_lister(&self) -> Option<&CsiDriverLister> {
+        None
+    }
 }
 
 /// The kubelet's `VolumeHost`. Owns clones of the three values
@@ -73,6 +82,7 @@ pub struct KubeletVolumeHost {
     token_manager: TokenManager,
     node_allocatable: HashMap<String, String>,
     pod_certificate_manager: Option<Arc<dyn crate::podcertificate::Manager>>,
+    csi_driver_lister: Option<CsiDriverLister>,
 }
 
 impl KubeletVolumeHost {
@@ -88,7 +98,15 @@ impl KubeletVolumeHost {
             token_manager,
             node_allocatable,
             pod_certificate_manager: None,
+            csi_driver_lister: None,
         }
+    }
+
+    /// Attach the `CSIDriver` lister (`kubeletVolumeHost.csiDriverLister`,
+    /// `volume_host.go:166`).
+    pub fn with_csi_driver_lister(mut self, lister: CsiDriverLister) -> Self {
+        self.csi_driver_lister = Some(lister);
+        self
     }
 
     /// Attach the kubelet's pod certificate manager
@@ -103,6 +121,10 @@ impl KubeletVolumeHost {
 }
 
 impl VolumeHost for KubeletVolumeHost {
+    fn csi_driver_lister(&self) -> Option<&CsiDriverLister> {
+        self.csi_driver_lister.as_ref()
+    }
+
     fn get_pod_volume_dir(&self, pod_uid: &str, plugin_name: &str, volume_name: &str) -> String {
         crate::pod_dirs::get_pod_volume_dir(
             &self.volumes_base_path,
