@@ -23,8 +23,57 @@ use rusternetes_storage::Storage;
 use serde_json::Value;
 
 use super::policy_dispatch::ParamScope;
-use super::policy_mutating::{NamespaceObjects, ObjectDefaulter, TypeConverters};
-use super::policy_source::{RestMapper, RestMapping};
+use super::policy_mutating::{
+    compile_policy, MutatingEvaluator, NamespaceObjects, ObjectDefaulter, TypeConverters,
+};
+use super::policy_source::{Informer, ParamInformerFactory, PolicySource, RestMapper, RestMapping};
+use rusternetes_common::resources::mutating_admission_policy::{
+    MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding,
+};
+
+/// The mutating plugin's policy source, compiling every policy with
+/// [`compile_policy`].
+///
+/// Upstream, staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/
+/// mutating/plugin.go:98-103 (`NewPlugin`):
+/// ```text
+/// return generic.NewPolicySource(
+///     ...
+///     compilePolicy,
+/// ```
+/// into generic/policy_source.go:108-117 `NewPolicySource(..., compiler func(P) E, ...)`.
+/// `compilePolicyLocked` (generic/policy_source.go:485-500) caches the compiled
+/// evaluator per policy key and returns it by value on every sync:
+/// ```text
+/// compiledPolicy, wasCompiled := s.compiledPolicies[key]
+/// if !wasCompiled ||
+///     compiledPolicy.policyVersion != policyMeta.GetResourceVersion() {
+///     compiledPolicy = compiledPolicyEntry[E]{
+///         policyVersion: policyMeta.GetResourceVersion(),
+///         evaluator:     s.compiler(policySpec),
+///     }
+///     s.compiledPolicies[key] = compiledPolicy
+/// }
+/// return compiledPolicy.evaluator
+/// ```
+/// `E` is the `PolicyEvaluator` interface/pointer, so the "copy" shares the
+/// compiled matcher and patchers. `MutatingEvaluator: Clone` (Arc fields)
+/// reproduces exactly that sharing; `PolicySource::compile_policy_locked`
+/// requires `E: Clone` for the same cache-and-return step.
+pub fn new_mutating_policy_source(
+    policy_informer: Arc<dyn Informer<MutatingAdmissionPolicy>>,
+    binding_informer: Arc<dyn Informer<MutatingAdmissionPolicyBinding>>,
+    param_factory: Arc<dyn ParamInformerFactory>,
+    rest_mapper: Arc<dyn RestMapper>,
+) -> Arc<PolicySource<MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding, MutatingEvaluator>> {
+    PolicySource::new(
+        policy_informer,
+        binding_informer,
+        compile_policy,
+        param_factory,
+        rest_mapper,
+    )
+}
 
 /// `meta.RESTMapper` over the resources this server serves.
 pub struct DiscoveryRestMapper;
@@ -198,6 +247,81 @@ mod tests {
             version: v.into(),
             kind: k.into(),
         }
+    }
+
+    #[tokio::test]
+    async fn mutating_source_compiles_policies_with_compile_policy() {
+        use super::super::policy_source::{StorageInformer, StorageParamInformerFactory};
+        let storage = Arc::new(MemoryStorage::new());
+        storage
+            .create(
+                "/registry/mutatingadmissionpolicies/p",
+                &serde_json::json!({
+                    "apiVersion": "admissionregistration.k8s.io/v1beta1",
+                    "kind": "MutatingAdmissionPolicy",
+                    "metadata": {"name": "p"},
+                    "spec": {
+                        "matchConditions": [{"name": "c", "expression": "true"}],
+                        "mutations": [{
+                            "patchType": "JSONPatch",
+                            "jsonPatch": {"expression": "[]"}
+                        }]
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        storage
+            .create(
+                "/registry/mutatingadmissionpolicybindings/b",
+                &serde_json::json!({
+                    "apiVersion": "admissionregistration.k8s.io/v1beta1",
+                    "kind": "MutatingAdmissionPolicyBinding",
+                    "metadata": {"name": "b"},
+                    "spec": {"policyName": "p"}
+                }),
+            )
+            .await
+            .unwrap();
+        let policies = StorageInformer::<MutatingAdmissionPolicy>::new("mutatingadmissionpolicies");
+        let bindings = StorageInformer::<MutatingAdmissionPolicyBinding>::new(
+            "mutatingadmissionpolicybindings",
+        );
+        let source = new_mutating_policy_source(
+            policies.clone(),
+            bindings.clone(),
+            Arc::new(StorageParamInformerFactory::new(storage.clone(), |_| {
+                String::new()
+            })),
+            Arc::new(DiscoveryRestMapper),
+        );
+        let tasks = [
+            tokio::spawn(policies.run(storage.clone())),
+            tokio::spawn(bindings.run(storage.clone())),
+            tokio::spawn({
+                let s = source.clone();
+                async move {
+                    let _ = s.run().await;
+                }
+            }),
+        ];
+        let mut hooks = None;
+        for _ in 0..500 {
+            if source.has_synced() {
+                hooks = source.hooks().filter(|h| !h.is_empty());
+                if hooks.is_some() {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        for t in &tasks {
+            t.abort();
+        }
+        let hooks = hooks.expect("hooks compiled within 5s");
+        // compile_policy built the patcher and the matchConditions matcher.
+        assert_eq!(hooks[0].evaluator.mutators.len(), 1);
+        assert!(hooks[0].evaluator.matcher.is_some());
     }
 
     #[test]

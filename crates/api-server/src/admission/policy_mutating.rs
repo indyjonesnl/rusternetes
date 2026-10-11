@@ -166,7 +166,7 @@ pub trait ConditionMatcher: Send + Sync {
 
 /// compilation.go `PolicyEvaluator`: the compiled match conditions and one
 /// patcher per mutation (`None` is a nil patcher).
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct MutatingEvaluator {
     pub matcher: Option<Arc<dyn ConditionMatcher>>,
     pub mutators: Vec<Option<Arc<dyn Patcher>>>,
