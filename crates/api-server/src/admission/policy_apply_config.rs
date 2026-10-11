@@ -317,6 +317,39 @@ mod tests {
         );
     }
 
+    // smd_test.go "apply configuration with invalid field name": the typed
+    // conversion of the patch rejects undeclared fields.
+    #[test]
+    fn invalid_field_name_is_rejected() {
+        let err = run(
+            "Object{spec: Object.spec{replicasx: 1}}",
+            json!({"spec": {"replicas": 1,
+                "selector": {"matchLabels": {"a": "b"}},
+                "template": {"metadata": {"labels": {"a": "b"}},
+                    "spec": {"containers": [{"name": "c", "image": "i"}]}}}}),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "error applying patch: failed to convert patch object to typed object: .spec.replicasx: field not declared in schema"
+        );
+    }
+
+    #[test]
+    fn declared_fields_still_apply() {
+        let out = run(
+            "Object{spec: Object.spec{replicas: 3}}",
+            json!({"spec": {"replicas": 1,
+                "selector": {"matchLabels": {"a": "b"}},
+                "template": {"metadata": {"labels": {"a": "b"}},
+                    "spec": {"containers": [{"name": "c", "image": "i"}]}}}}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(out["spec"]["replicas"], json!(3));
+    }
+
     #[test]
     fn invalid_type_name_is_rejected() {
         let err = run(
