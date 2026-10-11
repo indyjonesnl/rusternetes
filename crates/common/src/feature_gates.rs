@@ -485,9 +485,11 @@ pub fn set_from_str(value: &str) -> Result<(), String> {
         let b = match v {
             "1" | "t" | "T" | "TRUE" | "true" | "True" => true,
             "0" | "f" | "F" | "FALSE" | "false" | "False" => false,
-            _ => return Err(format!(
+            _ => {
+                return Err(format!(
                 "invalid value of {k}={v}, err: strconv.ParseBool: parsing {v:?}: invalid syntax"
-            )),
+            ))
+            }
         };
         m.push((k.to_string(), b));
     }
