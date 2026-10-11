@@ -11,7 +11,7 @@ use rusternetes_common::resources::volume::{
     VolumeBindingMode,
 };
 use rusternetes_common::resources::{
-    CSIDriver, CSIStorageCapacity, Node, PersistentVolume, PersistentVolumeClaim, Pod,
+    CSIDriver, CSINode, CSIStorageCapacity, Node, PersistentVolume, PersistentVolumeClaim, Pod,
     StorageClass, Volume,
 };
 use rusternetes_common::types::{label_selector_as_selector, LabelSelector};
@@ -33,6 +33,8 @@ pub struct VolumeSnapshot {
     pub classes: Vec<StorageClass>,
     pub csi_drivers: Vec<CSIDriver>,
     pub csi_capacities: Vec<CSIStorageCapacity>,
+    /// CSINode lister (binder.go `csiNodeLister`); read by checkBoundClaims.
+    pub csi_nodes: Vec<CSINode>,
 }
 
 #[derive(Default, Clone)]
@@ -170,6 +172,9 @@ impl VolumeSnapshot {
     }
     fn pv(&self, name: &str) -> Option<&PersistentVolume> {
         self.pvs.iter().find(|v| v.metadata.name == name)
+    }
+    fn csi_node(&self, name: &str) -> Option<&CSINode> {
+        self.csi_nodes.iter().find(|c| c.metadata.name == name)
     }
     fn class(&self, name: &str) -> Option<&StorageClass> {
         self.classes.iter().find(|c| c.metadata.name == name)
@@ -1054,6 +1059,55 @@ mod tests {
         assert_eq!(r, vec![ERR_REASON_NODE_CONFLICT]);
     }
 
+    fn gce_bound_snapshot(csi_node_annotations: Option<Value>) -> VolumeSnapshot {
+        let mut pv = pv("pv1", "std", "1Gi", Some(json!({"required": {"nodeSelectorTerms": [
+            {"matchExpressions": [{"key": "topology.kubernetes.io/zone", "operator": "In", "values": ["a"]}]}]}})));
+        pv.spec.host_path = None;
+        pv.spec.gce_persistent_disk = serde_json::from_value(json!({"pdName": "d1"})).unwrap();
+        let mut s = VolumeSnapshot {
+            pvcs: vec![bound_pvc("foo", "pv1")],
+            pvs: vec![pv],
+            ..Default::default()
+        };
+        if let Some(ann) = csi_node_annotations {
+            s.csi_nodes = vec![serde_json::from_value(json!({
+                "apiVersion": "storage.k8s.io/v1", "kind": "CSINode",
+                "metadata": {"name": "n1", "annotations": ann}, "spec": {"drivers": []}
+            }))
+            .unwrap()];
+        }
+        s
+    }
+
+    // binder.go checkBoundClaims -> tryTranslatePVToCSI: the PV's zone
+    // affinity is rewritten to the CSI topology key when the node's CSINode
+    // lists the plugin as migrated, so a node carrying only the CSI key matches.
+    #[test]
+    fn migrated_in_tree_pv_affinity_is_translated_for_csi_node() {
+        let s = gce_bound_snapshot(Some(json!({
+            "storage.alpha.kubernetes.io/migrated-plugins": "kubernetes.io/gce-pd"
+        })));
+        let p = pod_with_pvc("foo");
+        let (_, r) = filter(&p, &node("n1", json!({"topology.gke.io/zone": "a"})), &s);
+        assert!(r.is_empty(), "{r:?}");
+    }
+
+    #[test]
+    fn unmigrated_in_tree_pv_affinity_is_untouched() {
+        let p = pod_with_pvc("foo");
+        let n = node("n1", json!({"topology.gke.io/zone": "a"}));
+        for s in [
+            gce_bound_snapshot(None),
+            gce_bound_snapshot(Some(json!({}))),
+            gce_bound_snapshot(Some(json!({
+                "storage.alpha.kubernetes.io/migrated-plugins": "kubernetes.io/aws-ebs"
+            }))),
+        ] {
+            let (_, r) = filter(&p, &n, &s);
+            assert_eq!(r, vec![ERR_REASON_NODE_CONFLICT]);
+        }
+    }
+
     #[test]
     fn bound_pvc_with_missing_pv_reports_pv_not_exist() {
         let s = VolumeSnapshot {
@@ -1656,6 +1710,7 @@ mod tests {
                 node_capacity("node-b", "wait-cap", "50Gi"),
                 node_capacity("node-c", "wait-cap", "10Gi"),
             ],
+            ..Default::default()
         };
         let got = run_scores(
             &pod_with_claims(&["pvc-dynamic", "pvc-static"]),

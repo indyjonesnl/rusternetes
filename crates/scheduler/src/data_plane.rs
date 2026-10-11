@@ -249,6 +249,7 @@ impl<S: Storage + Send + Sync + 'static> DataPlane<S> {
                     classes: s.list(&build_prefix("storageclasses", None)).await?,
                     csi_drivers: s.list(&build_prefix("csidrivers", None)).await?,
                     csi_capacities: s.list(&build_prefix("csistoragecapacities", None)).await?,
+                    csi_nodes: s.list(&build_prefix("csinodes", None)).await?,
                 })
             }
             DataPlane::Api(a) => {
@@ -270,6 +271,10 @@ impl<S: Storage + Send + Sync + 'static> DataPlane<S> {
                         .map_err(get_err_to_common)?,
                     csi_capacities: c
                         .get_list("/apis/storage.k8s.io/v1/csistoragecapacities")
+                        .await
+                        .map_err(get_err_to_common)?,
+                    csi_nodes: c
+                        .get_list("/apis/storage.k8s.io/v1/csinodes")
                         .await
                         .map_err(get_err_to_common)?,
                 })
