@@ -17,11 +17,12 @@
 //! - the write is skipped when the result equals the current rules (:118-120);
 //! - `Run` starts 5 workers (`cmd/kube-controller-manager/app/rbac.go`).
 //!
-//! Deviations (Rusternetes-only): the apply (`ClusterRoles().Apply` with field
-//! manager `clusterrole-aggregation-controller`, :123-132) is a direct storage
-//! `update` carrying the resourceVersion read in the sync, i.e. upstream's own
-//! `updateClusterRoles` fallback (:134-142), because controllers here write the
-//! store directly. A 5s periodic resync stands in for the informer's resync.
+//! The write is `Storage::apply` (`ClusterRoles().Apply` with field manager
+//! `clusterrole-aggregation-controller`, force, :123-132): a real apply PATCH
+//! against an api-server, the shared apply engine on direct backends.
+//! Deviation (Rusternetes-only): the `IsUnsupportedMediaType` fallback to
+//! `Update` (:109-113, :134-142) is not ported; apply is always available. A 5s
+//! periodic resync stands in for the informer's resync.
 
 use futures::StreamExt;
 use rusternetes_common::resources::{ClusterRole, PolicyRule};
@@ -35,6 +36,9 @@ use tracing::{debug, error, info, warn};
 /// Number of sync workers (`Run(ctx, 5)` in
 /// `cmd/kube-controller-manager/app/rbac.go`).
 const WORKERS: usize = 5;
+
+/// `metav1.ApplyOptions{FieldManager: ...}` (:131).
+const FIELD_MANAGER: &str = "clusterrole-aggregation-controller";
 
 /// Periodic resync, so a missed watch event is still repaired.
 const RESYNC: Duration = Duration::from_secs(5);
@@ -135,6 +139,28 @@ impl<S: Storage + 'static> ClusterRoleAggregationController<S> {
         Ok(())
     }
 
+    /// `applyClusterRoles` (:123-132): `rbacv1ac.ClusterRole(name).
+    /// WithRules(...)` applied with `ApplyOptions{FieldManager:
+    /// "clusterrole-aggregation-controller", Force: true}`.
+    async fn apply_cluster_roles(
+        &self,
+        key: &str,
+        name: &str,
+        new_rules: &[PolicyRule],
+    ) -> Result<()> {
+        let apply_config = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "metadata": {"name": name},
+            "rules": new_rules,
+        });
+        let _: ClusterRole = self
+            .storage
+            .apply(key, &apply_config, FIELD_MANAGER, true, None)
+            .await?;
+        Ok(())
+    }
+
     /// `syncClusterRole` (:74-121).
     pub async fn sync_cluster_role(&self, name: &str) -> Result<()> {
         let key = build_key("clusterroles", None, name);
@@ -177,9 +203,7 @@ impl<S: Storage + 'static> ClusterRoleAggregationController<S> {
             return Ok(());
         }
 
-        let mut updated = shared.clone();
-        updated.rules = new_rules;
-        self.storage.update(&key, &updated).await?;
+        self.apply_cluster_roles(&key, name, &new_rules).await?;
         debug!("ClusterRoleAggregator: updated rules of {}", name);
         Ok(())
     }

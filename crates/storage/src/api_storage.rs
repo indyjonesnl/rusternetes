@@ -694,6 +694,33 @@ impl Storage for ApiStorage {
         serde_json::from_value(patched).map_err(Error::Serialization)
     }
 
+    async fn apply<T>(
+        &self,
+        key: &str,
+        apply_config: &Value,
+        field_manager: &str,
+        force: bool,
+        subresource: Option<&str>,
+    ) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        let sub = subresource.map(|s| format!("/{s}")).unwrap_or_default();
+        let path = format!(
+            "{}{}?fieldManager={}&force={}",
+            self.object_path(key).await?,
+            sub,
+            field_manager,
+            force
+        );
+        let applied: Value = self
+            .client
+            .patch(&path, apply_config, "application/apply-patch+json")
+            .await
+            .map_err(map_write_err)?;
+        serde_json::from_value(applied).map_err(Error::Serialization)
+    }
+
     async fn patch_status_strategic_merge<T>(
         &self,
         key: &str,
@@ -1808,6 +1835,73 @@ mod tests {
             "{req}"
         );
         assert!(req.contains(r#""podCIDRs":["10.0.0.0/24"]"#), "{req}");
+    }
+
+    /// `Apply(..., ApplyOptions{FieldManager, Force})` (here `ApplyStatus`) is a PATCH with the apply
+    /// content type and `fieldManager`/`force` query parameters.
+    #[tokio::test]
+    async fn apply_sends_an_apply_patch_with_manager_and_force() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut chunk).await.unwrap();
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf).to_string();
+                if let Some(h) = text.find("\r\n\r\n") {
+                    let len = text[..h]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= h + 4 + len {
+                        break;
+                    }
+                }
+            }
+            let body =
+                r#"{"apiVersion":"v1","kind":"ClusterRole","metadata":{"name":"agg"},"rules":[]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&buf).to_string()
+        });
+        let client = Arc::new(ApiClient::new(&format!("http://{addr}"), false, None).unwrap());
+        let storage = ApiStorage::new(client);
+        let cfg = serde_json::json!({"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole", "metadata": {"name": "agg"}, "rules": []});
+        let out: Value = storage
+            .apply(
+                "/registry/clusterroles/agg",
+                &cfg,
+                "clusterrole-aggregation-controller",
+                true,
+                Some("status"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["metadata"]["name"], "agg");
+        let req = server.await.unwrap();
+        let first = req.lines().next().unwrap();
+        assert_eq!(
+            first,
+            "PATCH /apis/rbac.authorization.k8s.io/v1/clusterroles/agg/status?fieldManager=clusterrole-aggregation-controller&force=true HTTP/1.1",
+            "{req}"
+        );
+        assert!(
+            req.to_ascii_lowercase()
+                .contains("content-type: application/apply-patch+json"),
+            "{req}"
+        );
     }
 
     /// `patch_status_strategic_merge` PATCHes `/status` with the
