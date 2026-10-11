@@ -41,6 +41,13 @@ pub struct Scheduler<S: Storage + Send + Sync + 'static = StorageBackend> {
     /// preemptor just freed before the informer catches up, and preemption
     /// live-locks. Mirrors upstream's in-memory `SchedulingQueue` nominator.
     nominations: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    /// Long-lived VolumeBinding assume caches (`volumeBinder.pvCache` /
+    /// `pvcCache`), refreshed from the volume listers every cycle.
+    volume_binder: Arc<std::sync::Mutex<crate::volume_assume::VolumeBinder>>,
+    /// `VolumeBindingArgs.BindTimeoutSeconds` (default 600).
+    pub(crate) volume_bind_timeout: Duration,
+    /// Poll interval of `BindPodVolumes` (1s upstream).
+    pub(crate) volume_bind_poll: Duration,
 }
 
 impl Scheduler<StorageBackend> {
@@ -58,6 +65,9 @@ impl Scheduler<StorageBackend> {
             interval: Duration::from_secs(interval_secs),
             scheduler_name,
             nominations: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            volume_binder: Arc::default(),
+            volume_bind_timeout: crate::volume_bind::DEFAULT_BIND_TIMEOUT,
+            volume_bind_poll: crate::volume_bind::BIND_POLL_INTERVAL,
         }
     }
 }
@@ -70,6 +80,9 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             interval: Duration::from_secs(interval_secs),
             scheduler_name,
             nominations: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            volume_binder: Arc::default(),
+            volume_bind_timeout: crate::volume_bind::DEFAULT_BIND_TIMEOUT,
+            volume_bind_poll: crate::volume_bind::BIND_POLL_INTERVAL,
         }
     }
 
@@ -2192,6 +2205,151 @@ mod tests {
             p.spec.as_ref().and_then(|s| s.node_name.as_deref()),
             Some("node-2")
         );
+    }
+
+    /// Fixture: two nodes, a WaitForFirstConsumer class, an unbound claim and
+    /// one static PV on node-2, plus a pod using the claim.
+    async fn wffc_fixture(storage: &Arc<MemoryStorage>) {
+        for n in ["node-1", "node-2"] {
+            let mut node = make_node(n);
+            node.metadata.labels =
+                Some(HashMap::from([("kubernetes.io/hostname".into(), n.into())]));
+            storage
+                .create(&format!("/registry/nodes/{n}"), &node)
+                .await
+                .unwrap();
+        }
+        let class: rusternetes_common::resources::StorageClass =
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "storage.k8s.io/v1", "kind": "StorageClass",
+                "metadata": {"name": "wait"},
+                "provisioner": "kubernetes.io/no-provisioner",
+                "volumeBindingMode": "WaitForFirstConsumer"
+            }))
+            .unwrap();
+        storage
+            .create("/registry/storageclasses/wait", &class)
+            .await
+            .unwrap();
+        let pvc: rusternetes_common::resources::PersistentVolumeClaim =
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                "metadata": {"name": "claim", "namespace": "default", "uid": "claim-uid"},
+                "spec": {"storageClassName": "wait",
+                    "resources": {"requests": {"storage": "1Gi"}}},
+                "status": {"phase": "Pending"}
+            }))
+            .unwrap();
+        storage
+            .create("/registry/persistentvolumeclaims/default/claim", &pvc)
+            .await
+            .unwrap();
+        let pv: rusternetes_common::resources::PersistentVolume =
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "v1", "kind": "PersistentVolume",
+                "metadata": {"name": "pv-node-2"},
+                "spec": {"capacity": {"storage": "1Gi"}, "accessModes": ["ReadWriteOnce"],
+                    "storageClassName": "wait", "hostPath": {"path": "/x"},
+                    "nodeAffinity": {"required": {"nodeSelectorTerms": [{"matchExpressions": [
+                        {"key": "kubernetes.io/hostname", "operator": "In", "values": ["node-2"]}]}]}}},
+                "status": {"phase": "Available"}
+            }))
+            .unwrap();
+        storage
+            .create("/registry/persistentvolumes/pv-node-2", &pv)
+            .await
+            .unwrap();
+        let mut pod = make_pending_pod("wffc-pod", "default");
+        pod.spec.as_mut().unwrap().volumes = Some(vec![serde_json::from_value(
+            serde_json::json!({"name": "v", "persistentVolumeClaim": {"claimName": "claim"}}),
+        )
+        .unwrap()]);
+        storage
+            .create("/registry/pods/default/wffc-pod", &pod)
+            .await
+            .unwrap();
+    }
+
+    /// Reserve -> PreBind -> Bind (schedule_one.go:211, :327, :332): the pod is
+    /// only bound once PreBind has written the PV claimRef and the PV
+    /// controller (simulated here) has completed the PVC binding.
+    #[tokio::test]
+    async fn test_try_schedule_pod_prebinds_volumes_before_binding_pod() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut scheduler =
+            Scheduler::new_with_name(storage.clone(), 1, "default-scheduler".to_string());
+        scheduler.volume_bind_timeout = Duration::from_secs(10);
+        scheduler.volume_bind_poll = Duration::from_millis(20);
+        wffc_fixture(&storage).await;
+
+        // PV controller: once the scheduler has set claimRef, bind the PVC.
+        let st = storage.clone();
+        let controller = tokio::spawn(async move {
+            for _ in 0..250 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let pv: rusternetes_common::resources::PersistentVolume = st
+                    .get("/registry/persistentvolumes/pv-node-2")
+                    .await
+                    .unwrap();
+                if pv.spec.claim_ref.is_some() {
+                    let mut pvc: rusternetes_common::resources::PersistentVolumeClaim = st
+                        .get("/registry/persistentvolumeclaims/default/claim")
+                        .await
+                        .unwrap();
+                    pvc.spec.volume_name = Some("pv-node-2".into());
+                    pvc.metadata
+                        .annotations
+                        .get_or_insert_with(HashMap::new)
+                        .insert("pv.kubernetes.io/bind-completed".into(), "yes".into());
+                    st.update("/registry/persistentvolumeclaims/default/claim", &pvc)
+                        .await
+                        .unwrap();
+                    return;
+                }
+            }
+        });
+
+        scheduler
+            .try_schedule_pod("pods/default/wffc-pod")
+            .await
+            .unwrap();
+        controller.await.unwrap();
+
+        let pv: rusternetes_common::resources::PersistentVolume = storage
+            .get("/registry/persistentvolumes/pv-node-2")
+            .await
+            .unwrap();
+        let cr = pv.spec.claim_ref.expect("PreBind must set the PV claimRef");
+        assert_eq!(cr.name.as_deref(), Some("claim"));
+        let p: Pod = storage
+            .get("/registry/pods/default/wffc-pod")
+            .await
+            .unwrap();
+        assert_eq!(
+            p.spec.as_ref().and_then(|s| s.node_name.as_deref()),
+            Some("node-2")
+        );
+    }
+
+    /// A PreBind failure (BindTimeoutSeconds elapsed without the PV controller
+    /// binding) must leave the pod unscheduled and return an error so the
+    /// work queue retries (handleBindingCycleError, schedule_one.go:356-368).
+    #[tokio::test]
+    async fn test_try_schedule_pod_prebind_timeout_leaves_pod_unbound() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut scheduler =
+            Scheduler::new_with_name(storage.clone(), 1, "default-scheduler".to_string());
+        scheduler.volume_bind_timeout = Duration::from_millis(200);
+        scheduler.volume_bind_poll = Duration::from_millis(20);
+        wffc_fixture(&storage).await;
+
+        let r = scheduler.try_schedule_pod("pods/default/wffc-pod").await;
+        assert!(r.is_err(), "PreBind timeout must surface as an error");
+        let p: Pod = storage
+            .get("/registry/pods/default/wffc-pod")
+            .await
+            .unwrap();
+        assert!(p.spec.as_ref().and_then(|s| s.node_name.as_ref()).is_none());
     }
 
     #[tokio::test]
