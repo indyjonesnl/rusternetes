@@ -786,7 +786,7 @@ impl Kubelet {
             .with_cluster_dns(&cluster_dns, &cluster_domain)
             .with_node_name(&node_name)
             // Configurer.nodeIPs (dns.go): the kubelet's node InternalIP.
-            .with_node_ips(vec![Self::node_internal_ip().to_string()])
+            .with_node_ips(Self::effective_node_ips().to_vec())
             .with_node_allocatable(node_allocatable_map());
 
         // Resolve the runtime identity once via the CRI Version RPC so
@@ -1525,16 +1525,19 @@ impl Kubelet {
                 );
                 conditions
             }),
-            addresses: Some(vec![
-                NodeAddress {
-                    address_type: "InternalIP".to_string(),
-                    address: Self::detect_internal_ip(),
-                },
-                NodeAddress {
-                    address_type: "Hostname".to_string(),
-                    address: self.node_name.clone(),
-                },
-            ]),
+            addresses: Some(
+                Self::effective_node_ips()
+                    .iter()
+                    .map(|ip| NodeAddress {
+                        address_type: "InternalIP".to_string(),
+                        address: ip.clone(),
+                    })
+                    .chain(std::iter::once(NodeAddress {
+                        address_type: "Hostname".to_string(),
+                        address: self.node_name.clone(),
+                    }))
+                    .collect(),
+            ),
             node_info: Some(rusternetes_common::resources::NodeSystemInfo {
                 machine_id: format!("rusternetes-{}", self.node_name),
                 system_uuid: format!("rusternetes-{}", self.node_name),
@@ -1641,8 +1644,46 @@ impl Kubelet {
     /// the IP shells out / does DNS, so memoize — it is stable for the kubelet's
     /// lifetime.
     fn node_internal_ip() -> &'static str {
-        static NODE_IP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-        NODE_IP.get_or_init(Self::detect_internal_ip)
+        &Self::effective_node_ips()[0]
+    }
+
+    /// The node's InternalIP address(es), in `--node-ip` order: feeds
+    /// `status.addresses`, pod `hostIP(s)` and DNS `Configurer.nodeIPs`.
+    /// With `--node-ip` set this is the `NodeAddress` setter result
+    /// (setters.go:141-189; deviation: the `Hostname` entry is added by the
+    /// caller). Without it, or when the setter fails, falls back to
+    /// [`Self::detect_internal_ip`] (the pre-existing single-IPv4 path).
+    /// Never empty. Memoized: stable for the kubelet's lifetime.
+    fn effective_node_ips() -> &'static [String] {
+        static NODE_IPS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        NODE_IPS.get_or_init(|| {
+            let configured = crate::node_ip::configured_node_ips();
+            if !configured.is_empty() {
+                let host = std::env::var("HOSTNAME").unwrap_or_default();
+                let lookup = |h: &str| -> Vec<std::net::IpAddr> {
+                    std::net::ToSocketAddrs::to_socket_addrs(&(h, 0u16))
+                        .map(|a| a.map(|s| s.ip()).collect())
+                        .unwrap_or_default()
+                };
+                let resolve = |_: Option<std::net::IpAddr>| -> Option<std::net::IpAddr> {
+                    Self::detect_internal_ip().parse().ok()
+                };
+                match crate::node_ip::node_addresses(configured, &host, &lookup, &resolve) {
+                    Ok(addrs) => {
+                        let ips: Vec<String> = addrs
+                            .into_iter()
+                            .filter(|(t, _)| t == "InternalIP")
+                            .map(|(_, a)| a)
+                            .collect();
+                        if !ips.is_empty() {
+                            return ips;
+                        }
+                    }
+                    Err(e) => warn!("--node-ip rejected, falling back to detection: {e}"),
+                }
+            }
+            vec![Self::detect_internal_ip()]
+        })
     }
 
     async fn update_node_status(&self) -> Result<()> {
@@ -1736,12 +1777,14 @@ impl Kubelet {
         if let Some(ref mut status) = node.status {
             let addresses = status.addresses.get_or_insert_with(Vec::new);
             if addresses.is_empty() {
-                let ip = Self::detect_internal_ip();
-                if ip != "127.0.0.1" {
-                    addresses.push(rusternetes_common::resources::NodeAddress {
-                        address_type: "InternalIP".to_string(),
-                        address: ip,
-                    });
+                let ips = Self::effective_node_ips();
+                if ips[0] != "127.0.0.1" {
+                    for ip in ips {
+                        addresses.push(rusternetes_common::resources::NodeAddress {
+                            address_type: "InternalIP".to_string(),
+                            address: ip.clone(),
+                        });
+                    }
                     addresses.push(rusternetes_common::resources::NodeAddress {
                         address_type: "Hostname".to_string(),
                         address: self.node_name.clone(),

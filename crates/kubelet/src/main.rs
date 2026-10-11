@@ -36,6 +36,7 @@ mod kubelet;
 mod labels;
 #[allow(dead_code)]
 mod lifecycle;
+mod node_ip;
 mod node_status;
 // Wired in main below; the full surface is only reachable from lib users/tests.
 #[allow(dead_code)]
@@ -152,6 +153,12 @@ struct Args {
     /// Metrics server port
     #[arg(long)]
     metrics_port: Option<u16>,
+
+    /// IP address (or dual-stack pair "v4,v6") of the node (upstream
+    /// `--node-ip`). Unspecified (`0.0.0.0`/`::`) selects the address family
+    /// only. Parsed with `ParseNodeIPArgument` semantics.
+    #[arg(long)]
+    node_ip: Option<String>,
 
     /// Cluster DNS service IP address (dynamically discovered if not provided)
     #[arg(long)]
@@ -355,6 +362,17 @@ async fn main() -> Result<()> {
         .split(',')
         .map(|s| s.trim().to_string())
         .collect();
+
+    // RunKubelet: ParseNodeIPArgument(kubeServer.NodeIP, kubeServer.CloudProvider)
+    // (cmd/kubelet/app/server.go:1216-1222). No cloud provider here.
+    if let Some(raw) = args.node_ip.as_deref() {
+        let (ips, invalid) = node_ip::parse_node_ip_argument(raw, "")
+            .map_err(|e| anyhow::anyhow!("bad --node-ip {raw:?}: {e}"))?;
+        if !invalid.is_empty() {
+            tracing::warn!("Could not parse some node IP(s), ignoring them: {invalid:?}");
+        }
+        node_ip::set_configured_node_ips(ips);
+    }
 
     // Build eviction manager from CLI flags BEFORE consuming `args` into
     // RuntimeConfig::build — that call moves out several String fields.
