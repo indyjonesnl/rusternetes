@@ -22,9 +22,7 @@ use rusternetes_common::types::Phase;
 use rusternetes_common::types::{LabelSelector, LabelSelectorRequirement};
 use rusternetes_common::validation::field::{Error as FieldError, ErrorList, Path};
 use rusternetes_common::validation::metav1::{get_warnings_for_ip, is_dns1123_label};
-use rusternetes_common::validation::objectmeta::{
-    name_is_dns_subdomain, validate_object_meta, validate_object_meta_update,
-};
+use rusternetes_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
 use rusternetes_common::Status;
 use rusternetes_storage::StorageBackend;
 
@@ -98,13 +96,6 @@ fn update_pod_generation(new: &mut Pod, old: &Pod) {
     if !semantic_equal(&new.spec, &old.spec) {
         new.metadata.generation = Some(old.metadata.generation.unwrap_or(0) + 1);
     }
-}
-
-/// `ValidatePodUpdate` (validation.go:5695-5836) for the spec fields the
-/// update fence guards; the fence itself is shared with the other pod
-/// validators in `common`.
-fn validate_spec_update(old: &PodSpec, new: &PodSpec, ephemeral: bool) -> ErrorList {
-    rusternetes_common::validation::pod::validate_pod_spec_update(old, new, ephemeral)
 }
 
 /// `ValidatePodUpdate`'s `spec.nodeName` rule: once bound, a pod's node may
