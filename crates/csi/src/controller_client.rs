@@ -325,16 +325,30 @@ impl CsiControllerClient {
         req: DeleteVolumeRequest,
         attempts: usize,
     ) -> Result<(), ControllerError> {
-        let mut last = None;
-        for _ in 0..attempts {
-            match self.delete_volume(req.clone()).await {
-                Ok(()) => return Ok(()),
-                Err(e) => last = Some(e),
+        // One `context.WithTimeout(ctx, p.timeout)` (:2077) spans every
+        // attempt; past the deadline the Go calls fail immediately, i.e. the
+        // result is the DeadlineExceeded status.
+        let run = async {
+            let mut last = None;
+            for _ in 0..attempts {
+                if req.volume_id.is_empty() {
+                    return Err(ControllerError::InvalidArgument(
+                        "DeleteVolume: volume_id must be set".into(),
+                    ));
+                }
+                let mut client = ControllerClient::new(self.channel()?);
+                match client.delete_volume(req.clone()).await {
+                    Ok(_) => return Ok(()),
+                    Err(s) => last = Some(ControllerError::Grpc(Box::new(s))),
+                }
             }
-        }
-        match last {
-            Some(e) => Err(e),
-            None => Ok(()),
+            last.map_or(Ok(()), Err)
+        };
+        match tokio::time::timeout(self.timeout, run).await {
+            Ok(r) => r,
+            Err(_) => Err(ControllerError::Grpc(Box::new(
+                tonic::Status::deadline_exceeded("context deadline exceeded"),
+            ))),
         }
     }
 
