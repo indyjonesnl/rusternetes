@@ -1525,6 +1525,17 @@ mod tests {
         }
     }
 
+    /// `ext/bindings.go` `celBind`: a non-identifier variable is a macro
+    /// error, not an ordinary call.
+    #[test]
+    fn cel_bind_non_identifier_variable_is_a_compile_error() {
+        let d = invalid("cel.bind(1, device.driver, true)").unwrap();
+        assert_eq!(
+            d,
+            "compilation failed: ERROR: <input>:1:10: cel.bind() variable names must be simple identifiers\n | cel.bind(1, device.driver, true)\n | .........^"
+        );
+    }
+
     #[test]
     fn index_key_type_mismatch_reports_position() {
         let d = invalid("device.attributes[true].someBoolean").unwrap();
