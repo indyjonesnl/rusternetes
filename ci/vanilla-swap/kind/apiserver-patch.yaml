@@ -54,6 +54,8 @@ template: |
           - "--tls-cert-file=/etc/kubernetes/pki/apiserver.crt"
           - "--tls-key-file=/etc/kubernetes/pki/apiserver.key"
           - "--client-ca-file=/etc/kubernetes/pki/ca.crt"
+          # Default is AlwaysAllow like upstream (#3266); kubeadm passes this.
+          - "--authorization-mode=Node,RBAC"
           - "--storage-backend=sqlite"
           - "--data-dir=/tmp/rusternetes/api-server.db"
         volumeMounts:

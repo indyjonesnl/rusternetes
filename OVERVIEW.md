@@ -171,6 +171,7 @@ rusternetes-api-server [OPTIONS]
 | `--tls-san` | `localhost,127.0.0.1` | SANs for the self-signed cert (comma-separated) |
 | `--client-ca-file` | — | Client CA for mTLS client-certificate auth |
 | `--skip-auth` | `false` | **INSECURE** — skip authn/authz (development only) |
+| `--authorization-mode` | `AlwaysAllow` | Ordered authorizers (AlwaysAllow,AlwaysDeny,ABAC,Webhook,RBAC,Node); pass `Node,RBAC` to enforce RBAC |
 | `--prometheus-url` | — | Prometheus URL for custom-metrics HPA |
 | `--console-dir` | — | Path to the console SPA build; enables the web console at `/console/` |
 
@@ -478,7 +479,7 @@ kubelet + kube-proxy on each worker, all pointed at the same storage endpoint
 
 ```bash
 # control-plane host
-./target/release/api-server --bind-address 0.0.0.0:6443 --etcd-servers http://STORE:2379 --tls --tls-cert-file ... --tls-key-file ...
+./target/release/api-server --bind-address 0.0.0.0:6443 --etcd-servers http://STORE:2379 --tls --tls-cert-file ... --tls-key-file ... --authorization-mode=Node,RBAC
 ./target/release/scheduler           --etcd-servers http://STORE:2379
 ./target/release/controller-manager  --etcd-servers http://STORE:2379
 ./target/release/rusternetes-dns     --etcd-servers http://STORE:2379

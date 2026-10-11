@@ -431,7 +431,7 @@ By default, `--skip-auth` is enabled — all requests are treated as admin with 
    kubectl config set-credentials rusternetes-admin --token="$TOKEN"
    ```
 
-4. **Restart without `--skip-auth`** — edit `docker-compose.yml` to remove the `--skip-auth` line, rebuild, and redeploy the API server.
+4. **Restart without `--skip-auth`** — edit `docker-compose.yml` to replace the `--skip-auth` line with `--authorization-mode=Node,RBAC` (the default mode is `AlwaysAllow`), rebuild, and redeploy the API server.
 
 5. **Verify**: `curl -k https://localhost:6443/api/v1/pods` should return 401 Unauthorized.
 

@@ -37,8 +37,9 @@ pub const AUTHORIZATION_MODE_CHOICES: [&str; 6] = [
 #[derive(clap::Args, Debug, Clone, Default)]
 pub struct AuthorizationArgs {
     /// Ordered list of plug-ins to do authorization on secure port.
-    /// Comma-delimited list of: AlwaysAllow,AlwaysDeny,ABAC,Webhook,RBAC,Node
-    /// (`AddFlags`, authorization.go:166-168). Defaults to Node,RBAC.
+    /// Defaults to AlwaysAllow. Comma-delimited list of:
+    /// AlwaysAllow,AlwaysDeny,ABAC,Webhook,RBAC,Node (`AddFlags`,
+    /// authorization.go:173-175).
     #[arg(long = "authorization-mode", value_delimiter = ',')]
     pub authorization_mode: Vec<String>,
 
@@ -60,12 +61,14 @@ pub fn is_valid_authorization_mode(mode: &str) -> bool {
 /// `BuiltInAuthorizationOptions.Complete`
 /// (pkg/kubeapiserver/options/authorization.go:88-96).
 ///
-/// Deliberate deviation: upstream defaults an empty list to `AlwaysAllow`;
-/// rusternetes keeps its established `Node,RBAC` default (what kubeadm sets
-/// for a real cluster, and what #1664/#2679 rely on).
+/// No deviation (#3266): an empty list defaults to `AlwaysAllow`, exactly like
+/// upstream (`--authorization-config` is not implemented, so its half of the
+/// `len(AuthorizationConfigurationFile) == 0` condition is always true).
+/// Deployments that want RBAC must pass `--authorization-mode=Node,RBAC`
+/// explicitly, as kubeadm does.
 pub fn complete_authorization_modes(modes: &[String]) -> Vec<String> {
     if modes.is_empty() {
-        return vec![MODE_NODE.to_string(), MODE_RBAC.to_string()];
+        return vec![MODE_ALWAYS_ALLOW.to_string()];
     }
     modes.to_vec()
 }

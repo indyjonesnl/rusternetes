@@ -356,7 +356,7 @@ rusternetes-api-server \
       <ul>
         <li>Connects to the storage backend (etcd, SQLite, or Redis)</li>
         <li>Initializes the TokenManager with RS256 keys or HMAC fallback</li>
-        <li>Sets up RBAC authorization (or AlwaysAllow if <code>--skip-auth</code>)</li>
+        <li>Sets up the authorizer chain from <code>--authorization-mode</code> (default <code>AlwaysAllow</code>, like upstream; pass <code>Node,RBAC</code> to enforce RBAC). <code>--skip-auth</code> forces AlwaysAllow</li>
         <li>Bootstraps the <code>kubernetes</code> Service Endpoints with the server's IP</li>
         <li>Creates the default ServiceCIDR (<code>10.96.0.0/12</code>)</li>
         <li>Pre-allocates ClusterIPs from existing services to prevent collisions</li>
