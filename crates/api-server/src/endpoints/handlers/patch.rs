@@ -407,7 +407,9 @@ impl<T: Object> TransformFunc<T> for Patcher<'_, T> {
         };
 
         // The patched object is decoded, and so defaulted and converted, as a
-        // request body is (patch.go:357-363, :792).
+        // request body is (patch.go:357-363, :792); a strict decode judges it
+        // before the pruning.
+        self.scope.store.decode_strict(&obj)?;
         self.scope.convert(&mut obj);
 
         let uid = &obj.metadata().uid;

@@ -743,6 +743,20 @@ pub trait RestStorage<T: Object>: Send + Sync {
         crate::ssa::ResetFields::new()
     }
 
+    /// What the request codec does to a body for a storage whose codec depends
+    /// on the served type's own definition: a custom resource's
+    /// `schemaCoercingDecoder` + `unstructuredDefaulter`
+    /// (customresource_handler.go:1189-1200, 1321-1346). Runs wherever
+    /// `RequestScope::convert` does. Nothing for every other storage.
+    fn decode_coerce(&self, _obj: &mut T) {}
+
+    /// The decoder's strict-decoding verdict on a body, judged before
+    /// [`Self::decode_coerce`] prunes the unknown fields away
+    /// (`schemaCoercingDecoder.Decode`, customresource_handler.go:1338-1342).
+    fn decode_strict(&self, _obj: &T) -> Result<()> {
+        Ok(())
+    }
+
     /// `rest.Getter`.
     async fn get(
         &self,

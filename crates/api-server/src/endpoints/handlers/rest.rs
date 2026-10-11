@@ -106,6 +106,7 @@ impl<T: Object> RequestScope<T> {
         if let Some(convert) = self.convert_to_internal {
             convert(obj);
         }
+        self.store.decode_coerce(obj);
     }
 
     /// `scope.FieldManager` (installer.go:697-722 `NewDefaultFieldManager`):
@@ -216,6 +217,7 @@ pub(super) fn decode<T: Object>(
     // Strictness judges the body against the served version's fields, so it
     // runs before conversion drops any of them.
     let warnings = crate::handlers::validation::validate_strict_fields(params, body, &obj)?;
+    scope.store.decode_strict(&obj)?;
     scope.convert(&mut obj);
     Ok((obj, warnings))
 }
