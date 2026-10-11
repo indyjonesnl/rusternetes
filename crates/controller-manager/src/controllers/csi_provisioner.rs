@@ -669,6 +669,8 @@ pub struct CsiProvisioner<S: Storage> {
     slow_set: Mutex<HashMap<String, SlowEntry>>,
     /// `--strict-topology` (csi-provisioner.go:91, default false).
     strict_topology: bool,
+    /// `CrossNamespaceVolumeDataSource` feature gate (alpha, default off).
+    cross_namespace_data_source: bool,
     /// `--immediate-topology` (csi-provisioner.go:92, default true).
     immediate_topology: bool,
     /// `pvcNodeStore` (cache.go `InMemoryStore`), keyed by PVC UID.
@@ -709,6 +711,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             retry_interval_max: RETRY_INTERVAL_MAX,
             slow_set: Mutex::new(HashMap::new()),
             strict_topology: false,
+            cross_namespace_data_source: false,
             immediate_topology: true,
             pvc_node_store: TopologyStore::new(),
             capabilities: tokio::sync::OnceCell::new(),
@@ -760,6 +763,12 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
     /// `RetryIntervalMax` (`--retry-interval-max`).
     pub fn with_retry_interval_max(mut self, max: Duration) -> Self {
         self.retry_interval_max = max;
+        self
+    }
+
+    /// `CrossNamespaceVolumeDataSource` feature gate.
+    pub fn with_cross_namespace_volume_data_source(mut self, on: bool) -> Self {
+        self.cross_namespace_data_source = on;
         self
     }
 
