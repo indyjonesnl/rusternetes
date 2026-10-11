@@ -830,19 +830,18 @@ async fn alloc_cluster_ips<S: Storage>(
     Ok(())
 }
 
-/// `txnAllocClusterIPs` (alloc.go:305-338). Unlike upstream, an allocation
-/// that fails after the first family was taken gives that one back rather
-/// than leaving it to the repair loop.
+/// `txnAllocClusterIPs` (alloc.go:305-338). As upstream does (alloc.go:
+/// 306-312: `allocated, err := al.allocClusterIPs(service, dryRun); if err
+/// != nil { return nil, err }`), an allocation that fails after an earlier
+/// family was taken does NOT give that one back: the IPAddress repair loop
+/// (`ipallocator::repair`) reclaims it.
 pub async fn txn_alloc_cluster_ips<S: Storage>(
     pa: &Arc<ClusterIpAllocators<S>>,
     service: &mut Service,
     dry_run: bool,
 ) -> Result<ClusterIpTxn<S>> {
     let mut txn = ClusterIpTxn::new(pa, dry_run);
-    if let Err(e) = alloc_cluster_ips(&mut txn, service).await {
-        txn.revert().await;
-        return Err(e);
-    }
+    alloc_cluster_ips(&mut txn, service).await?;
     Ok(txn)
 }
 
