@@ -318,6 +318,26 @@ impl CsiControllerClient {
             .map(|_| ())
     }
 
+    /// `cleanupVolume` (`controller.go:2074-2086`): up to `attempts` DeleteVolume
+    /// calls, stopping at the first success, returning the last error.
+    pub async fn delete_volume_with_retries(
+        &self,
+        req: DeleteVolumeRequest,
+        attempts: usize,
+    ) -> Result<(), ControllerError> {
+        let mut last = None;
+        for _ in 0..attempts {
+            match self.delete_volume(req.clone()).await {
+                Ok(()) => return Ok(()),
+                Err(e) => last = Some(e),
+            }
+        }
+        match last {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     /// `ControllerPublishVolume` as external-attacher's `attacher.Attach`
     /// (`pkg/attacher/attacher.go:57-72`): the request is sent as given and
     /// `rsp.PublishContext` is returned. No capability gate here -- the
@@ -466,6 +486,8 @@ mod tests {
         ctrl_caps: Vec<ControllerRpc>,
         create_code: Option<tonic::Code>,
         delay: Duration,
+        delete_delay: Duration,
+        delete_code: Option<tonic::Code>,
         /// `starting_token` -> page served for it.
         list_pages: HashMap<String, ListVolumesResponse>,
     }
@@ -483,6 +505,8 @@ mod tests {
                 ],
                 create_code: None,
                 delay: Duration::ZERO,
+                delete_delay: Duration::ZERO,
+                delete_code: None,
                 list_pages: HashMap::new(),
             }
         }
@@ -552,6 +576,10 @@ mod tests {
             r: Request<DeleteVolumeRequest>,
         ) -> Result<Response<DeleteVolumeResponse>, Status> {
             self.rec.lock().unwrap().delete_volume.push(r.into_inner());
+            tokio::time::sleep(self.delete_delay).await;
+            if let Some(c) = self.delete_code {
+                return Err(Status::new(c, "fake delete failure"));
+            }
             Ok(Response::new(DeleteVolumeResponse {}))
         }
         async fn list_volumes(
@@ -835,6 +863,53 @@ mod tests {
                 .unwrap_err(),
             ControllerError::InvalidArgument(_)
         ));
+    }
+
+    // `cleanupVolume` (controller.go:2074-2086) makes ONE
+    // `context.WithTimeout(ctx, p.timeout)` and runs all
+    // `deleteVolumeRetryCount` attempts under it: once the deadline passes the
+    // remaining attempts fail at once, so a slow driver costs `timeout`, not
+    // `attempts * timeout`.
+    #[tokio::test]
+    async fn delete_volume_retries_share_one_timeout() {
+        let mut f = Fake::full();
+        f.delete_delay = Duration::from_millis(150);
+        f.delete_code = Some(tonic::Code::Internal);
+        let (_d, client, rec) = start(f);
+        let client = client.with_timeout(Duration::from_millis(400));
+        let req = DeleteVolumeRequest {
+            volume_id: "vol-1".into(),
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let err = client.delete_volume_with_retries(req, 5).await.unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_millis(600),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(err.status().unwrap().code(), tonic::Code::DeadlineExceeded);
+        assert!(rec.lock().unwrap().delete_volume.len() < 5);
+    }
+
+    #[tokio::test]
+    async fn delete_volume_retries_stop_at_first_success_and_try_five_times() {
+        let (_d, client, rec) = start(Fake::full());
+        let req = DeleteVolumeRequest {
+            volume_id: "vol-1".into(),
+            ..Default::default()
+        };
+        client
+            .delete_volume_with_retries(req.clone(), 5)
+            .await
+            .unwrap();
+        assert_eq!(rec.lock().unwrap().delete_volume.len(), 1);
+
+        let mut f = Fake::full();
+        f.delete_code = Some(tonic::Code::Internal);
+        let (_d, client, rec) = start(f);
+        client.delete_volume_with_retries(req, 5).await.unwrap_err();
+        assert_eq!(rec.lock().unwrap().delete_volume.len(), 5);
     }
 
     #[tokio::test]
