@@ -1155,6 +1155,52 @@ async fn the_protection_finalizer_follows_the_reclaim_policy() {
     assert!(deleted(&rec).is_empty());
 }
 
+/// `TestDeleteMigration` "normal migration" (controller_test.go:7160):
+/// a migratable in-tree PV is translated to CSI and `DeleteVolume` carries the
+/// translated handle; a native CSI PV is passed through ("no migration").
+#[tokio::test]
+async fn a_migratable_in_tree_pv_is_translated_before_delete() {
+    let (storage, p, rec, _d) = env(Fake::new(), storage_class(None)).await;
+    let mut pv = csi_pv(
+        "pv1",
+        PersistentVolumePhase::Released,
+        PersistentVolumeReclaimPolicy::Delete,
+    );
+    pv.spec.csi = None;
+    pv.spec.gce_persistent_disk = Some(GCEPersistentDiskVolumeSource {
+        pd_name: "disk-1".into(),
+        ..Default::default()
+    });
+    pv.metadata
+        .annotations
+        .as_mut()
+        .unwrap()
+        .insert("pv.kubernetes.io/migrated-to".into(), DRIVER.into());
+    put_pv(&storage, &pv).await;
+    p.sync_volume(&pv).await.unwrap();
+    let reqs = deleted(&rec);
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(
+        reqs[0].volume_id,
+        "projects/UNSPECIFIED/zones/UNSPECIFIED/disks/disk-1"
+    );
+    assert!(get_pv(&storage, "pv1").await.is_none(), "PV removed");
+}
+
+#[tokio::test]
+async fn a_non_migratable_pv_without_csi_source_is_invalid() {
+    let (storage, p, rec, _d) = env(Fake::new(), storage_class(None)).await;
+    let mut pv = csi_pv(
+        "pv1",
+        PersistentVolumePhase::Released,
+        PersistentVolumeReclaimPolicy::Delete,
+    );
+    pv.spec.csi = None;
+    put_pv(&storage, &pv).await;
+    assert!(p.sync_volume(&pv).await.is_err());
+    assert!(deleted(&rec).is_empty());
+}
+
 fn with_secret_annotations(mut pv: PersistentVolume) -> PersistentVolume {
     let ann = pv.metadata.annotations.as_mut().unwrap();
     ann.insert(
