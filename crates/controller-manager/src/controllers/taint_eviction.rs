@@ -891,7 +891,8 @@ async fn delete_pod_handler<S: Storage + 'static>(
 
 /// `addConditionAndDeletePod` (taint_eviction.go:129): publish the
 /// `DisruptionTarget` condition on the STATUS subresource, then DELETE the pod.
-/// The eviction must NOT stamp deletionTimestamp itself: the field is immutable
+/// Like upstream (taint_eviction.go:129-153) there is no skip for pods that are
+/// already terminating or live in kube-system. The eviction must NOT stamp deletionTimestamp itself: the field is immutable
 /// on update, so an api-server that enforces that rejects the write.
 async fn add_condition_and_delete_pod<S: Storage>(
     storage: &S,
@@ -900,17 +901,6 @@ async fn add_condition_and_delete_pod<S: Storage>(
 ) -> Result<()> {
     let key = build_key("pods", Some(namespace), name);
     let mut pod = storage.get::<Pod>(&key).await?;
-
-    // Pre-existing deviation, kept from the previous implementation (upstream
-    // has no such skip): leave pods already terminating and kube-system pods
-    // alone.
-    if pod.metadata.deletion_timestamp.is_some() {
-        return Ok(());
-    }
-    if namespace == "kube-system" {
-        debug!("Skipping eviction of system pod {namespace}/{name}");
-        return Ok(());
-    }
 
     let status = pod.status.get_or_insert_with(Default::default);
     let conditions = status.conditions.get_or_insert_with(Vec::new);
@@ -1706,5 +1696,52 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(800)).await;
         assert!(storage.peak() > 1, "node updates ran on one worker only");
         ctl.shutdown().await;
+    }
+
+    /// #3275: upstream `addConditionAndDeletePod` (taint_eviction.go:129-153)
+    /// has no kube-system skip: the DisruptionTarget condition is patched and
+    /// the pod deleted like any other.
+    #[tokio::test]
+    async fn add_condition_and_delete_pod_does_not_skip_kube_system() {
+        let storage = MemoryStorage::new();
+        let mut p = pod("sys", "node-1");
+        p.metadata.namespace = Some("kube-system".to_string());
+        let key = build_key("pods", Some("kube-system"), "sys");
+        storage.create(&key, &p).await.unwrap();
+
+        add_condition_and_delete_pod(&storage, "sys", "kube-system")
+            .await
+            .unwrap();
+
+        let got = storage.get::<Pod>(&key).await;
+        let patched = got.as_ref().map_or(true, |p| {
+            p.status
+                .as_ref()
+                .and_then(|s| s.conditions.as_ref())
+                .is_some_and(|c| c.iter().any(|c| c.condition_type == "DisruptionTarget"))
+        });
+        let deleted = got.map_or(true, |p| p.metadata.deletion_timestamp.is_some());
+        assert!(patched && deleted, "patched={patched} deleted={deleted}");
+    }
+
+    /// #3275: upstream has no deletionTimestamp skip either; the condition is
+    /// still patched onto an already-terminating pod.
+    #[tokio::test]
+    async fn add_condition_and_delete_pod_does_not_skip_terminating() {
+        let storage = MemoryStorage::new();
+        let mut p = pod("term", "node-1");
+        p.metadata.deletion_timestamp = Some(Utc::now());
+        let key = build_key("pods", Some("default"), "term");
+        storage.create(&key, &p).await.unwrap();
+
+        add_condition_and_delete_pod(&storage, "term", "default")
+            .await
+            .unwrap();
+
+        let got = storage.get::<Pod>(&key).await.unwrap();
+        assert!(got
+            .status
+            .and_then(|s| s.conditions)
+            .is_some_and(|c| c.iter().any(|c| c.condition_type == "DisruptionTarget")));
     }
 }
