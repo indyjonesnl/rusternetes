@@ -378,4 +378,37 @@ mod tests {
         c.sync_cluster_role("missing").await.unwrap();
         assert_eq!(rules_of(&s, "plain").await, vec![rule(&["get"], &["pods"])]);
     }
+
+    /// `applyClusterRoles` (clusterroleaggregation_controller.go:123-132):
+    /// `ClusterRoles().Apply(..., ApplyOptions{FieldManager:
+    /// "clusterrole-aggregation-controller", Force: true})`, so the aggregated
+    /// ClusterRole carries an `Apply` managedFields entry for that manager
+    /// owning `rules`.
+    #[tokio::test]
+    async fn the_write_is_a_server_side_apply_by_the_upstream_field_manager() {
+        let s = Arc::new(MemoryStorage::new());
+        put(
+            &s,
+            &role("child", &[("l", "x")], vec![rule(&["get"], &["pods"])]),
+        )
+        .await;
+        put(&s, &aggregating("parent", vec![selector("l", "x")])).await;
+        ClusterRoleAggregationController::new(s.clone())
+            .sync_cluster_role("parent")
+            .await
+            .unwrap();
+        let v: serde_json::Value = s
+            .get(&build_key("clusterroles", None, "parent"))
+            .await
+            .unwrap();
+        let mf = v["metadata"]["managedFields"]
+            .as_array()
+            .expect("managedFields");
+        let e = mf
+            .iter()
+            .find(|e| e["manager"] == "clusterrole-aggregation-controller")
+            .expect("entry for clusterrole-aggregation-controller");
+        assert_eq!(e["operation"], "Apply");
+        assert!(e["fieldsV1"].get("rules").is_some(), "{e}");
+    }
 }
