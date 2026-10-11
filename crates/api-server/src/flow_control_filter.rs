@@ -570,6 +570,8 @@ pub async fn priority_and_fairness<S: Storage + 'static>(
             // (apf_filter.go:171-177); `maybe_reap` re-checks that the level
             // is quiescing and its queueset idle.
             f.engine.maybe_reap(&classification.priority_level);
+            // `MonitorRequest` (endpoints/metrics/metrics.go:603).
+            apiserver_request_metrics::monitor_request(&meta, COMPONENT, resp.status().as_u16());
             set_response_headers(&classification, &mut resp);
             resp
         }
