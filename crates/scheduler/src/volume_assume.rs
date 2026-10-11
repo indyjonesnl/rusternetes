@@ -17,7 +17,8 @@ use crate::volume_binding::{
     ephemeral_volume_is_for_pod, is_pvc_fully_bound, is_volume_bound_to_claim, pod_volumes,
     volume_pvc_name, BindingInfo, DynamicProvision, PodVolumes, VolumeSnapshot, ANN_SELECTED_NODE,
 };
-use rusternetes_common::resources::{PersistentVolume, PersistentVolumeClaim, Pod};
+use rusternetes_common::resources::service_account::ObjectReference;
+use rusternetes_common::resources::{PersistentVolume, PersistentVolumeClaim, Pod, Volume};
 use std::collections::HashMap;
 
 /// `volume.AnnBoundByController` (pv_helpers.go).
@@ -99,51 +100,110 @@ impl<T: Assumable> AssumeCache<T> {
         Self::default()
     }
 
-    /// `AssumeCache.add` (informer add/update).
+    /// `getObjVersion`: `strconv.ParseInt(resourceVersion, 10, 64)`.
+    fn obj_version(key: &str, obj: &T) -> Result<i64, AssumeError> {
+        obj.resource_version().parse::<i64>().map_err(|_| {
+            AssumeError::Other(format!(
+                "error parsing ResourceVersion {:?} for {} {:?}",
+                obj.resource_version(),
+                T::DESCRIPTION,
+                key
+            ))
+        })
+    }
+
+    /// `AssumeCache.add` (informer add/update), assume_cache.go:226-271.
     pub fn add(&mut self, obj: &T) {
-        let _ = obj;
-        todo!()
+        let key = obj.cache_key();
+        if let Some(info) = self.objs.get(&key) {
+            let (Ok(new_version), Ok(stored_version)) = (
+                Self::obj_version(&key, obj),
+                Self::obj_version(&key, &info.latest),
+            ) else {
+                return;
+            };
+            // Only update object if version is newer. This is so we don't
+            // override assumed objects due to informer resync.
+            if new_version <= stored_version {
+                return;
+            }
+        }
+        self.objs.insert(
+            key,
+            ObjInfo {
+                latest: obj.clone(),
+                api: obj.clone(),
+            },
+        );
     }
 
-    /// `AssumeCache.delete`.
+    /// `AssumeCache.delete`, assume_cache.go:277-313.
     pub fn delete(&mut self, key: &str) {
-        let _ = key;
-        todo!()
+        self.objs.remove(key);
     }
 
-    /// Feed a fresh lister listing: add/update every object, delete the rest.
+    /// Feed a fresh lister listing (what the informer would deliver as
+    /// add/update/delete events): add/update every object, delete the rest.
     pub fn sync(&mut self, objs: &[T]) {
-        let _ = objs;
-        todo!()
+        let present: std::collections::HashSet<String> =
+            objs.iter().map(|o| o.cache_key()).collect();
+        self.objs.retain(|k, _| present.contains(k));
+        for o in objs {
+            self.add(o);
+        }
+    }
+
+    fn obj_info(&self, key: &str) -> Result<&ObjInfo<T>, AssumeError> {
+        self.objs.get(key).ok_or_else(|| AssumeError::NotFound {
+            type_name: T::DESCRIPTION,
+            key: key.to_string(),
+        })
     }
 
     /// `AssumeCache.Get`: the latest (possibly assumed) object.
     pub fn get(&self, key: &str) -> Result<&T, AssumeError> {
-        let _ = key;
-        todo!()
+        Ok(&self.obj_info(key)?.latest)
     }
 
     /// `AssumeCache.GetAPIObj`: the informer's version.
     pub fn get_api_obj(&self, key: &str) -> Result<&T, AssumeError> {
-        let _ = key;
-        todo!()
+        Ok(&self.obj_info(key)?.api)
     }
 
-    /// `AssumeCache.List` without an index.
+    /// `AssumeCache.List` without an index: latest objects.
     pub fn list(&self) -> Vec<&T> {
-        todo!()
+        self.objs.values().map(|i| &i.latest).collect()
     }
 
-    /// `AssumeCache.Assume`.
+    /// `AssumeCache.Assume`, assume_cache.go:434-470: the version of the
+    /// object must be greater or equal to the current object.
     pub fn assume(&mut self, obj: &T) -> Result<(), AssumeError> {
-        let _ = obj;
-        todo!()
+        let key = obj.cache_key();
+        let info = self.obj_info(&key)?;
+        let new_version = Self::obj_version(&key, obj)?;
+        let stored_version = Self::obj_version(&key, &info.latest)?;
+        if new_version < stored_version {
+            return Err(AssumeError::Other(format!(
+                "{} {:?} is out of sync (stored: {}, assume: {})",
+                T::DESCRIPTION,
+                key,
+                stored_version,
+                new_version
+            )));
+        }
+        // Only update the cached object.
+        if let Some(info) = self.objs.get_mut(&key) {
+            info.latest = obj.clone();
+        }
+        Ok(())
     }
 
-    /// `AssumeCache.Restore`.
+    /// `AssumeCache.Restore`, assume_cache.go:472-486. A missing object is
+    /// expected (it may have been deleted) and is a no-op.
     pub fn restore(&mut self, key: &str) {
-        let _ = key;
-        todo!()
+        if let Some(info) = self.objs.get_mut(key) {
+            info.latest = info.api.clone();
+        }
     }
 }
 
@@ -152,8 +212,51 @@ pub fn get_bind_volume_to_claim(
     pv: &PersistentVolume,
     pvc: &PersistentVolumeClaim,
 ) -> Result<(PersistentVolume, bool), String> {
-    let _ = (pv, pvc, ANN_BOUND_BY_CONTROLLER, is_volume_bound_to_claim);
-    todo!()
+    let mut dirty = false;
+
+    // Check if the volume was already bound (either by user or by controller).
+    let should_set_bound_by_controller = !is_volume_bound_to_claim(pv, pvc);
+
+    // The volume from method args can be pointing to watcher cache. We must
+    // not modify these, therefore create a copy.
+    let mut clone = pv.clone();
+
+    // Bind the volume to the claim if it is not bound yet.
+    let already = pv.spec.claim_ref.as_ref().is_some_and(|cr| {
+        cr.name.as_deref() == Some(pvc.metadata.name.as_str())
+            && cr.namespace.as_deref() == pvc.metadata.namespace.as_deref()
+            && cr.uid.as_deref().unwrap_or("") == pvc.metadata.uid
+    });
+    if !already {
+        // `reference.GetReference(scheme.Scheme, claim)`.
+        clone.spec.claim_ref = Some(ObjectReference {
+            kind: Some("PersistentVolumeClaim".to_string()),
+            namespace: pvc.metadata.namespace.clone(),
+            name: Some(pvc.metadata.name.clone()),
+            uid: Some(pvc.metadata.uid.clone()),
+            api_version: Some("v1".to_string()),
+            resource_version: pvc.metadata.resource_version.clone(),
+            field_path: None,
+        });
+        dirty = true;
+    }
+
+    // Set AnnBoundByController if it is not set yet.
+    let has_ann = clone
+        .metadata
+        .annotations
+        .as_ref()
+        .is_some_and(|a| a.contains_key(ANN_BOUND_BY_CONTROLLER));
+    if should_set_bound_by_controller && !has_ann {
+        clone
+            .metadata
+            .annotations
+            .get_or_insert_with(HashMap::new)
+            .insert(ANN_BOUND_BY_CONTROLLER.to_string(), "yes".to_string());
+        dirty = true;
+    }
+
+    Ok((clone, dirty))
 }
 
 /// The `pvCache` / `pvcCache` pair of `volumeBinder`.
@@ -170,20 +273,36 @@ impl VolumeBinder {
 
     /// Refresh both caches from the listers (the informer feed).
     pub fn sync(&mut self, snap: &VolumeSnapshot) {
-        let _ = snap;
-        todo!()
+        self.pv_cache.sync(&snap.pvs);
+        self.pvc_cache.sync(&snap.pvcs);
+    }
+
+    /// `isVolumeBound` + `isPVCBound` + `isPVCFullyBound` (binder.go:724-778),
+    /// reading the PVC through the assume cache. Errors count as "not bound".
+    fn is_volume_bound(&self, pod: &Pod, vol: &Volume) -> bool {
+        let Some((name, is_ephemeral)) = volume_pvc_name(pod, vol) else {
+            return true;
+        };
+        let ns = pod.metadata.namespace.as_deref().unwrap_or("");
+        let key = if ns.is_empty() {
+            name
+        } else {
+            format!("{ns}/{name}")
+        };
+        let Ok(pvc) = self.pvc_cache.get(&key) else {
+            return false;
+        };
+        if is_ephemeral && ephemeral_volume_is_for_pod(pod, pvc).is_err() {
+            return false;
+        }
+        is_pvc_fully_bound(pvc)
     }
 
     /// `arePodVolumesBound` (binder.go:780-788).
     pub fn are_pod_volumes_bound(&self, pod: &Pod) -> bool {
-        let _ = (
-            pod,
-            is_pvc_fully_bound,
-            ephemeral_volume_is_for_pod,
-            pod_volumes,
-            volume_pvc_name,
-        );
-        todo!()
+        pod_volumes(pod)
+            .iter()
+            .all(|v| self.is_volume_bound(pod, v))
     }
 
     /// `AssumePodVolumes` (binder.go:401-460). Returns `allFullyBound`.
@@ -193,19 +312,79 @@ impl VolumeBinder {
         node_name: &str,
         vols: &mut PodVolumes,
     ) -> Result<bool, String> {
-        let _ = (pod, node_name, vols, ANN_SELECTED_NODE);
-        todo!()
+        if self.are_pod_volumes_bound(pod) {
+            return Ok(true);
+        }
+
+        // Assume PV.
+        let mut new_bindings: Vec<BindingInfo> = Vec::new();
+        for binding in &vols.static_bindings {
+            let (new_pv, dirty) = match get_bind_volume_to_claim(&binding.pv, &binding.pvc) {
+                Ok(r) => r,
+                Err(e) => {
+                    self.revert_assumed_pvs(&new_bindings);
+                    return Err(e);
+                }
+            };
+            if dirty {
+                if let Err(e) = self.pv_cache.assume(&new_pv) {
+                    self.revert_assumed_pvs(&new_bindings);
+                    return Err(e.to_string());
+                }
+            }
+            new_bindings.push(BindingInfo {
+                pv: new_pv,
+                pvc: binding.pvc.clone(),
+            });
+        }
+
+        // Assume PVCs.
+        let mut new_provisioned: Vec<DynamicProvision> = Vec::new();
+        for dp in &vols.dynamic_provisions {
+            // The claims from method args can be pointing to watcher cache.
+            // We must not modify these, therefore create a copy.
+            let mut claim = dp.pvc.clone();
+            claim
+                .metadata
+                .annotations
+                .get_or_insert_with(HashMap::new)
+                .insert(ANN_SELECTED_NODE.to_string(), node_name.to_string());
+            if let Err(e) = self.pvc_cache.assume(&claim) {
+                self.revert_assumed_pvs(&new_bindings);
+                self.revert_assumed_pvcs(new_provisioned.iter().map(|d| &d.pvc));
+                return Err(e.to_string());
+            }
+            new_provisioned.push(DynamicProvision {
+                pvc: claim,
+                node_capacity: None,
+            });
+        }
+
+        vols.static_bindings = new_bindings;
+        vols.dynamic_provisions = new_provisioned;
+        Ok(false)
     }
 
     /// `RevertAssumedPodVolumes` (binder.go:463-467).
     pub fn revert_assumed_pod_volumes(&mut self, vols: &PodVolumes) {
-        let _ = vols;
-        todo!()
+        self.revert_assumed_pvs(&vols.static_bindings);
+        self.revert_assumed_pvcs(vols.dynamic_provisions.iter().map(|d| &d.pvc));
+    }
+
+    /// `revertAssumedPVs` (binder.go:964-968).
+    fn revert_assumed_pvs(&mut self, bindings: &[BindingInfo]) {
+        for b in bindings {
+            self.pv_cache.restore(&b.pv.cache_key());
+        }
+    }
+
+    /// `revertAssumedPVCs` (binder.go:970-974).
+    fn revert_assumed_pvcs<'a>(&mut self, claims: impl Iterator<Item = &'a PersistentVolumeClaim>) {
+        for c in claims {
+            self.pvc_cache.restore(&c.cache_key());
+        }
     }
 }
-
-#[allow(dead_code)]
-fn _types(_: &BindingInfo, _: &DynamicProvision) {}
 
 #[cfg(test)]
 mod tests {
