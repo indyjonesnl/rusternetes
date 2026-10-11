@@ -333,6 +333,7 @@ mod vap_validation_test;
 mod volume_integration_test;
 mod volumeattachment_handler_test;
 mod volumeattachment_update_immutable_test;
+mod referencegrant_store_test;
 mod volumesnapshot_decode_when_absent_test;
 mod volumesnapshot_handler_test;
 mod volumesnapshot_store_test;
