@@ -276,6 +276,39 @@ pub enum Feature {
 
     /// Upstream gate `RestartAllContainersOnContainerExits`: pkg/features/kube_features.go:1720-1722 (1.35 Alpha, off). Modelled so `DEPENDENCIES` can reference it (#3222).
     RestartAllContainersOnContainerExits,
+
+    /// Upstream gate `ServiceAccountTokenNodeBinding`: pkg/features/kube_features.go:1784-1788 (1.33 GA + LockToDefault). Modelled so `DEPENDENCIES` can reference it (#3231).
+    ServiceAccountTokenNodeBinding,
+
+    /// Upstream gate `ServiceAccountTokenNodeBindingValidation`: pkg/features/kube_features.go:1790-1794 (1.32 GA + LockToDefault). Modelled so `DEPENDENCIES` can reference it (#3231).
+    ServiceAccountTokenNodeBindingValidation,
+
+    /// Upstream gate `UserNamespacesHostNetworkSupport`: pkg/features/kube_features.go:1890-1892 (1.35 Alpha, off). Modelled so `DEPENDENCIES` can reference it (#3231).
+    UserNamespacesHostNetworkSupport,
+
+    /// Upstream gate `WindowsCPUAndMemoryAffinity`: pkg/features/kube_features.go:1922-1924 (1.32 Alpha, off). Modelled so `DEPENDENCIES` can reference it (#3231).
+    WindowsCPUAndMemoryAffinity,
+
+    /// Upstream gate `WindowsGracefulNodeShutdown`: pkg/features/kube_features.go:1926-1929 (1.34 Beta, on). Modelled so `DEPENDENCIES` can reference it (#3231).
+    WindowsGracefulNodeShutdown,
+
+    /// Upstream gate `UnknownVersionInteroperabilityProxy`: staging/src/k8s.io/apiserver/pkg/features/kube_features.go:490-492 (1.28 Alpha, off). Modelled so `DEPENDENCIES` can reference it (#3231).
+    UnknownVersionInteroperabilityProxy,
+
+    /// Upstream gate `DeclarativeValidation`: staging/src/k8s.io/apiserver/pkg/features/kube_features.go:384-386 (1.33 Beta, on). Modelled so `DEPENDENCIES` can reference it (#3231).
+    DeclarativeValidation,
+
+    /// Upstream gate `DeclarativeValidationTakeover`: staging/src/k8s.io/apiserver/pkg/features/kube_features.go:388-390 (1.33 Beta, off). Modelled so `DEPENDENCIES` can reference it (#3231).
+    DeclarativeValidationTakeover,
+
+    /// Upstream gate `StructuredAuthenticationConfiguration`: staging/src/k8s.io/apiserver/pkg/features/kube_features.go:461-465 (1.34 GA + LockToDefault). Modelled so `DEPENDENCIES` can reference it (#3231).
+    StructuredAuthenticationConfiguration,
+
+    /// Upstream gate `StructuredAuthenticationConfigurationEgressSelector`: staging/src/k8s.io/apiserver/pkg/features/kube_features.go:467-469 (1.34 Beta, on). Modelled so `DEPENDENCIES` can reference it (#3231).
+    StructuredAuthenticationConfigurationEgressSelector,
+
+    /// Upstream gate `StructuredAuthenticationConfigurationJWKSMetrics`: staging/src/k8s.io/apiserver/pkg/features/kube_features.go:471-473 (1.35 Beta, on). Modelled so `DEPENDENCIES` can reference it (#3231).
+    StructuredAuthenticationConfigurationJWKSMetrics,
 }
 
 impl Feature {
@@ -344,6 +377,17 @@ impl Feature {
             Feature::DRASchedulerFilterTimeout => 59,
             Feature::ContainerRestartRules => 60,
             Feature::RestartAllContainersOnContainerExits => 61,
+            Feature::ServiceAccountTokenNodeBinding => 62,
+            Feature::ServiceAccountTokenNodeBindingValidation => 63,
+            Feature::UserNamespacesHostNetworkSupport => 64,
+            Feature::WindowsCPUAndMemoryAffinity => 65,
+            Feature::WindowsGracefulNodeShutdown => 66,
+            Feature::UnknownVersionInteroperabilityProxy => 67,
+            Feature::DeclarativeValidation => 68,
+            Feature::DeclarativeValidationTakeover => 69,
+            Feature::StructuredAuthenticationConfiguration => 70,
+            Feature::StructuredAuthenticationConfigurationEgressSelector => 71,
+            Feature::StructuredAuthenticationConfigurationJWKSMetrics => 72,
         }
     }
 
@@ -364,7 +408,10 @@ impl Feature {
             | Feature::DisableAllocatorDualWrite
             | Feature::MemoryManager
             | Feature::PodLifecycleSleepAction
-            | Feature::PodLifecycleSleepActionAllowZero => PreRelease::Ga,
+            | Feature::PodLifecycleSleepActionAllowZero
+            | Feature::ServiceAccountTokenNodeBinding
+            | Feature::ServiceAccountTokenNodeBindingValidation
+            | Feature::StructuredAuthenticationConfiguration => PreRelease::Ga,
             Feature::InPlacePodVerticalScalingAllocatedStatus => PreRelease::Deprecated,
             Feature::PodTopologyLabelsAdmission
             | Feature::SELinuxMountReadWriteOncePod
@@ -393,7 +440,12 @@ impl Feature {
             | Feature::DRAAdminAccess
             | Feature::DRAPrioritizedList
             | Feature::DRASchedulerFilterTimeout
-            | Feature::ContainerRestartRules => PreRelease::Beta,
+            | Feature::ContainerRestartRules
+            | Feature::WindowsGracefulNodeShutdown
+            | Feature::DeclarativeValidation
+            | Feature::DeclarativeValidationTakeover
+            | Feature::StructuredAuthenticationConfigurationEgressSelector
+            | Feature::StructuredAuthenticationConfigurationJWKSMetrics => PreRelease::Beta,
             Feature::NodeDeclaredFeatures
             | Feature::DRADeviceTaints
             | Feature::DRAPartitionableDevices
@@ -416,7 +468,10 @@ impl Feature {
             | Feature::GangScheduling
             | Feature::InPlacePodVerticalScalingExclusiveCPUs
             | Feature::InPlacePodVerticalScalingExclusiveMemory
-            | Feature::RestartAllContainersOnContainerExits => PreRelease::Alpha,
+            | Feature::RestartAllContainersOnContainerExits
+            | Feature::UserNamespacesHostNetworkSupport
+            | Feature::WindowsCPUAndMemoryAffinity
+            | Feature::UnknownVersionInteroperabilityProxy => PreRelease::Alpha,
         }
     }
 
@@ -439,6 +494,9 @@ impl Feature {
                 | Feature::MemoryManager
                 | Feature::PodLifecycleSleepAction
                 | Feature::PodLifecycleSleepActionAllowZero
+                | Feature::ServiceAccountTokenNodeBinding
+                | Feature::ServiceAccountTokenNodeBindingValidation
+                | Feature::StructuredAuthenticationConfiguration
         )
     }
 
@@ -567,6 +625,28 @@ impl Feature {
             Feature::ContainerRestartRules => true,
             // pkg/features/kube_features.go:1720-1722 (1.35 Alpha, off)
             Feature::RestartAllContainersOnContainerExits => false,
+            // pkg/features/kube_features.go:1784-1788 (1.33 GA + LockToDefault)
+            Feature::ServiceAccountTokenNodeBinding => true,
+            // pkg/features/kube_features.go:1790-1794 (1.32 GA + LockToDefault)
+            Feature::ServiceAccountTokenNodeBindingValidation => true,
+            // pkg/features/kube_features.go:1890-1892 (1.35 Alpha, off)
+            Feature::UserNamespacesHostNetworkSupport => false,
+            // pkg/features/kube_features.go:1922-1924 (1.32 Alpha, off)
+            Feature::WindowsCPUAndMemoryAffinity => false,
+            // pkg/features/kube_features.go:1926-1929 (1.34 Beta, on)
+            Feature::WindowsGracefulNodeShutdown => true,
+            // staging/src/k8s.io/apiserver/pkg/features/kube_features.go:490-492 (1.28 Alpha, off)
+            Feature::UnknownVersionInteroperabilityProxy => false,
+            // staging/src/k8s.io/apiserver/pkg/features/kube_features.go:384-386 (1.33 Beta, on)
+            Feature::DeclarativeValidation => true,
+            // staging/src/k8s.io/apiserver/pkg/features/kube_features.go:388-390 (1.33 Beta, off)
+            Feature::DeclarativeValidationTakeover => false,
+            // staging/src/k8s.io/apiserver/pkg/features/kube_features.go:461-465 (1.34 GA + LockToDefault)
+            Feature::StructuredAuthenticationConfiguration => true,
+            // staging/src/k8s.io/apiserver/pkg/features/kube_features.go:467-469 (1.34 Beta, on)
+            Feature::StructuredAuthenticationConfigurationEgressSelector => true,
+            // staging/src/k8s.io/apiserver/pkg/features/kube_features.go:471-473 (1.35 Beta, on)
+            Feature::StructuredAuthenticationConfigurationJWKSMetrics => true,
         }
     }
 }
@@ -645,6 +725,17 @@ pub const ALL_FEATURES: &[Feature] = &[
     Feature::DRASchedulerFilterTimeout,
     Feature::ContainerRestartRules,
     Feature::RestartAllContainersOnContainerExits,
+    Feature::ServiceAccountTokenNodeBinding,
+    Feature::ServiceAccountTokenNodeBindingValidation,
+    Feature::UserNamespacesHostNetworkSupport,
+    Feature::WindowsCPUAndMemoryAffinity,
+    Feature::WindowsGracefulNodeShutdown,
+    Feature::UnknownVersionInteroperabilityProxy,
+    Feature::DeclarativeValidation,
+    Feature::DeclarativeValidationTakeover,
+    Feature::StructuredAuthenticationConfiguration,
+    Feature::StructuredAuthenticationConfigurationEgressSelector,
+    Feature::StructuredAuthenticationConfigurationJWKSMetrics,
 ];
 
 /// Total number of feature gates. Derived from [`ALL_FEATURES`].
@@ -721,6 +812,17 @@ static STATES: [AtomicBool; NUM_FEATURES] = [
     AtomicBool::new(Feature::DRASchedulerFilterTimeout.default_enabled()),
     AtomicBool::new(Feature::ContainerRestartRules.default_enabled()),
     AtomicBool::new(Feature::RestartAllContainersOnContainerExits.default_enabled()),
+    AtomicBool::new(Feature::ServiceAccountTokenNodeBinding.default_enabled()),
+    AtomicBool::new(Feature::ServiceAccountTokenNodeBindingValidation.default_enabled()),
+    AtomicBool::new(Feature::UserNamespacesHostNetworkSupport.default_enabled()),
+    AtomicBool::new(Feature::WindowsCPUAndMemoryAffinity.default_enabled()),
+    AtomicBool::new(Feature::WindowsGracefulNodeShutdown.default_enabled()),
+    AtomicBool::new(Feature::UnknownVersionInteroperabilityProxy.default_enabled()),
+    AtomicBool::new(Feature::DeclarativeValidation.default_enabled()),
+    AtomicBool::new(Feature::DeclarativeValidationTakeover.default_enabled()),
+    AtomicBool::new(Feature::StructuredAuthenticationConfiguration.default_enabled()),
+    AtomicBool::new(Feature::StructuredAuthenticationConfigurationEgressSelector.default_enabled()),
+    AtomicBool::new(Feature::StructuredAuthenticationConfigurationJWKSMetrics.default_enabled()),
 ];
 
 /// Returns whether `feature` is currently enabled in this process.
@@ -855,7 +957,7 @@ fn set_from_map(m: &[(String, bool)]) -> Result<(), String> {
 
 /// `defaultKubernetesFeatureGateDependencies` (pkg/features/kube_features.go:2166-2420)
 /// restricted to non-empty entries whose gates are all modelled in
-/// [`Feature`] (#3222); the rest are tracked in a follow-up issue. `AuthorizeNodeWithSelectors: {genericfeatures.AuthorizeWithSelectors}`
+/// [`Feature`] (#3222); the remainder of the map has no modelled sources (#3231). `AuthorizeNodeWithSelectors: {genericfeatures.AuthorizeWithSelectors}`
 /// comes from the same map.
 const DEPENDENCIES: &[(Feature, &[Feature])] = &[
     (
@@ -955,6 +1057,38 @@ const DEPENDENCIES: &[(Feature, &[Feature])] = &[
             Feature::ContainerRestartRules,
             Feature::NodeDeclaredFeatures,
         ],
+    ),
+    (
+        Feature::DeclarativeValidationTakeover,
+        &[Feature::DeclarativeValidation],
+    ),
+    (
+        Feature::ServiceAccountTokenNodeBinding,
+        &[Feature::ServiceAccountTokenNodeBindingValidation],
+    ),
+    (
+        Feature::StructuredAuthenticationConfigurationEgressSelector,
+        &[Feature::StructuredAuthenticationConfiguration],
+    ),
+    (
+        Feature::StructuredAuthenticationConfigurationJWKSMetrics,
+        &[Feature::StructuredAuthenticationConfiguration],
+    ),
+    (
+        Feature::UnknownVersionInteroperabilityProxy,
+        &[Feature::APIServerIdentity],
+    ),
+    (
+        Feature::UserNamespacesHostNetworkSupport,
+        &[Feature::UserNamespacesSupport],
+    ),
+    (
+        Feature::WindowsCPUAndMemoryAffinity,
+        &[Feature::MemoryManager],
+    ),
+    (
+        Feature::WindowsGracefulNodeShutdown,
+        &[Feature::GracefulNodeShutdown],
     ),
 ];
 
@@ -1369,7 +1503,7 @@ mod tests {
         reset_to_defaults();
         assert_eq!(
             set_from_str("GracefulNodeShutdown=false").unwrap_err(),
-            "GracefulNodeShutdownBasedOnPodPriority is enabled, but depends on features that are disabled: [GracefulNodeShutdown]"
+            "[GracefulNodeShutdownBasedOnPodPriority is enabled, but depends on features that are disabled: [GracefulNodeShutdown], WindowsGracefulNodeShutdown is enabled, but depends on features that are disabled: [GracefulNodeShutdown]]"
         );
         reset_to_defaults();
         assert_eq!(
@@ -1392,6 +1526,59 @@ mod tests {
         assert_eq!(
             set_from_str("DynamicResourceAllocation=false").unwrap_err(),
             "cannot set feature gate DynamicResourceAllocation to false, feature is locked to true"
+        );
+        reset_to_defaults();
+    }
+
+    // kube_features.go:2166+ edges from #3231 whose source gate was unmodelled:
+    // UserNamespacesHostNetworkSupport -> UserNamespacesSupport,
+    // WindowsCPUAndMemoryAffinity -> MemoryManager,
+    // WindowsGracefulNodeShutdown -> GracefulNodeShutdown,
+    // ServiceAccountTokenNodeBinding -> ServiceAccountTokenNodeBindingValidation,
+    // DeclarativeValidationTakeover -> DeclarativeValidation,
+    // StructuredAuthenticationConfiguration{EgressSelector,JWKSMetrics} ->
+    // StructuredAuthenticationConfiguration,
+    // UnknownVersionInteroperabilityProxy -> APIServerIdentity.
+    #[test]
+    #[serial]
+    fn dependency_edges_with_newly_modelled_sources() {
+        reset_to_defaults();
+        for (src, dep) in [
+            ("UserNamespacesHostNetworkSupport", "UserNamespacesSupport"),
+            ("UnknownVersionInteroperabilityProxy", "APIServerIdentity"),
+            ("DeclarativeValidationTakeover", "DeclarativeValidation"),
+            ("WindowsCPUAndMemoryAffinity", "MemoryManager"),
+        ] {
+            reset_to_defaults();
+            // Enable the source and disable its dependency; MemoryManager is
+            // locked on so it is covered by the enabled-dependency case below.
+            if dep == "MemoryManager" {
+                assert!(set_from_str(&format!("{src}=true")).is_ok(), "{src}");
+                continue;
+            }
+            let err = set_from_str(&format!("{src}=true,{dep}=false")).unwrap_err();
+            assert!(
+                err.contains(&format!(
+                    "{src} is enabled, but depends on features that are disabled: [{dep}]"
+                )),
+                "{err}"
+            );
+        }
+        reset_to_defaults();
+        assert_eq!(
+            set_from_str("GracefulNodeShutdown=false").unwrap_err(),
+            "[GracefulNodeShutdownBasedOnPodPriority is enabled, but depends on features that are disabled: [GracefulNodeShutdown], WindowsGracefulNodeShutdown is enabled, but depends on features that are disabled: [GracefulNodeShutdown]]"
+        );
+        reset_to_defaults();
+        // GA + LockToDefault gates (kube_features.go:1784-1794,
+        // apiserver kube_features.go:461-465).
+        assert_eq!(
+            set_from_str("ServiceAccountTokenNodeBindingValidation=false").unwrap_err(),
+            "cannot set feature gate ServiceAccountTokenNodeBindingValidation to false, feature is locked to true"
+        );
+        assert_eq!(
+            set_from_str("StructuredAuthenticationConfiguration=false").unwrap_err(),
+            "cannot set feature gate StructuredAuthenticationConfiguration to false, feature is locked to true"
         );
         reset_to_defaults();
     }
