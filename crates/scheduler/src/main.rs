@@ -13,6 +13,9 @@ mod framework;
 #[allow(dead_code)]
 mod plugins;
 mod scheduler;
+#[allow(dead_code)] // library API surface (informer delete/new); partly unused by the binary
+mod volume_assume;
+mod volume_bind;
 mod volume_binding;
 
 use anyhow::Result;

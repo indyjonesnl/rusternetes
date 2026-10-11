@@ -39,7 +39,10 @@ use std::sync::Arc;
 use rusternetes_client::events::ClientEventRecorder;
 use rusternetes_client::http::{ApiClient, GetError};
 use rusternetes_client::reflector::Reflector;
-use rusternetes_common::resources::{EventType, Node, Pod, PodDisruptionBudget, PriorityClass};
+use rusternetes_common::resources::{
+    CSINode, EventType, Node, PersistentVolume, PersistentVolumeClaim, Pod, PodDisruptionBudget,
+    PriorityClass,
+};
 use rusternetes_common::{Error, Result};
 use rusternetes_storage::{build_key, Storage};
 use serde_json::json;
@@ -291,6 +294,61 @@ impl<S: Storage + Send + Sync + 'static> DataPlane<S> {
                 .get(&ApiBackend::pod_path(ns, name))
                 .await
                 .map_err(get_err_to_common),
+        }
+    }
+
+    /// `kubeClient.CoreV1().PersistentVolumes().Update` (binder.go:553).
+    pub async fn update_pv(&self, pv: &PersistentVolume) -> Result<PersistentVolume> {
+        match self {
+            DataPlane::Storage(s) => {
+                s.update(&build_key("persistentvolumes", None, &pv.metadata.name), pv)
+                    .await
+            }
+            DataPlane::Api(a) => a
+                .client
+                .put(
+                    &format!("/api/v1/persistentvolumes/{}", pv.metadata.name),
+                    pv,
+                )
+                .await
+                .map_err(api_err_to_common),
+        }
+    }
+
+    /// `kubeClient.CoreV1().PersistentVolumeClaims(ns).Update` (binder.go:578).
+    pub async fn update_pvc(&self, pvc: &PersistentVolumeClaim) -> Result<PersistentVolumeClaim> {
+        let ns = pvc.metadata.namespace.as_deref().unwrap_or("default");
+        match self {
+            DataPlane::Storage(s) => {
+                s.update(
+                    &build_key("persistentvolumeclaims", Some(ns), &pvc.metadata.name),
+                    pvc,
+                )
+                .await
+            }
+            DataPlane::Api(a) => a
+                .client
+                .put(
+                    &format!(
+                        "/api/v1/namespaces/{ns}/persistentvolumeclaims/{}",
+                        pvc.metadata.name
+                    ),
+                    pvc,
+                )
+                .await
+                .map_err(api_err_to_common),
+        }
+    }
+
+    /// `csiNodeLister.Get`; `None` when absent (upstream tolerates it).
+    pub async fn get_csi_node(&self, name: &str) -> Option<CSINode> {
+        match self {
+            DataPlane::Storage(s) => s.get(&build_key("csinodes", None, name)).await.ok(),
+            DataPlane::Api(a) => a
+                .client
+                .get(&format!("/apis/storage.k8s.io/v1/csinodes/{name}"))
+                .await
+                .ok(),
         }
     }
 

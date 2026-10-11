@@ -14,9 +14,11 @@
 //! `podLister`). Go's nil-vs-empty slice distinction ("failed to get cached
 //! bindings") has no equivalent with Rust `Vec`s and is not ported.
 
+use crate::data_plane::DataPlane;
+use crate::volume_assume::VolumeBinder;
 use crate::volume_binding::{
     check_pv_node_affinity, is_pvc_fully_bound, pvc_key, try_translate_pv_to_csi, BindingInfo,
-    PodVolumes, ANN_SELECTED_NODE,
+    DynamicProvision, PodVolumes, ANN_SELECTED_NODE,
 };
 use rusternetes_common::resources::{CSINode, Node, PersistentVolume, PersistentVolumeClaim, Pod};
 use std::collections::HashMap;
@@ -68,6 +70,10 @@ pub trait BinderEnv: Send + Sync {
     async fn node(&self, name: &str) -> Result<Node, String>;
     /// `csiNodeLister.Get`; absence is tolerated.
     async fn csi_node(&self, name: &str) -> Option<CSINode>;
+    /// Feed the assume caches a fresh listing. Go's informers do this
+    /// continuously; `bind_pod_volumes` calls it before every poll so the
+    /// objects written by `bind_api_update` become visible to `check_bindings`.
+    async fn refresh(&self) {}
     /// `podLister.Pods(ns).Get`: `Ok(false)` is NotFound, `Err` any other error.
     async fn pod_exists(&self, pod: &Pod) -> Result<bool, String>;
 }
@@ -317,6 +323,7 @@ pub async fn bind_pod_volumes(
     let poll = async {
         loop {
             tokio::time::sleep(poll_interval).await;
+            env.refresh().await;
             if check_bindings(env, pod, bindings, &claims_to_provision).await? {
                 return Ok::<(), String>(());
             }
@@ -325,6 +332,111 @@ pub async fn bind_pod_volumes(
     match tokio::time::timeout(bind_timeout, poll).await {
         Ok(r) => r.map_err(|e| format!("binding volumes: {e}")),
         Err(_) => Err("binding volumes: context deadline exceeded".to_string()),
+    }
+}
+
+/// `Reserve` (volume_binding.go:531-553): assume the chosen node's PodVolumes
+/// and record `allBound` in the cycle state. A node without PodVolumes (pod
+/// without PVCs) is trivially all-bound.
+pub fn reserve(
+    binder: &mut VolumeBinder,
+    state: &mut VolumeBindingState,
+    pod: &Pod,
+    node_name: &str,
+) -> Result<(), String> {
+    match state.pod_volumes_by_node.get_mut(node_name) {
+        Some(vols) => {
+            state.all_bound = binder.assume_pod_volumes(pod, node_name, vols)?;
+        }
+        // may not exist if the pod does not reference any PVC
+        None => state.all_bound = true,
+    }
+    Ok(())
+}
+
+/// [`BinderEnv`] over the scheduler's long-lived [`VolumeBinder`] caches and
+/// [`DataPlane`] (storage or api-server).
+pub struct DataPlaneBinderEnv<'a, S: rusternetes_storage::Storage + Send + Sync + 'static> {
+    pub binder: &'a std::sync::Mutex<VolumeBinder>,
+    pub data: &'a DataPlane<S>,
+    /// Namespace of the pod being bound (scopes the PVC listing).
+    pub namespace: String,
+}
+
+#[async_trait::async_trait]
+impl<S: rusternetes_storage::Storage + Send + Sync + 'static> BinderEnv
+    for DataPlaneBinderEnv<'_, S>
+{
+    async fn update_pv(&self, pv: &PersistentVolume) -> Result<PersistentVolume, String> {
+        self.data.update_pv(pv).await.map_err(|e| e.to_string())
+    }
+    async fn update_pvc(
+        &self,
+        pvc: &PersistentVolumeClaim,
+    ) -> Result<PersistentVolumeClaim, String> {
+        self.data.update_pvc(pvc).await.map_err(|e| e.to_string())
+    }
+    fn pv_api_obj(&self, name: &str) -> Result<PersistentVolume, CacheError> {
+        let b = self.binder.lock().unwrap_or_else(|e| e.into_inner());
+        b.pv_cache.get_api_obj(name).cloned().map_err(cache_error)
+    }
+    fn pvc_api_obj(&self, key: &str) -> Result<PersistentVolumeClaim, CacheError> {
+        let b = self.binder.lock().unwrap_or_else(|e| e.into_inner());
+        b.pvc_cache.get_api_obj(key).cloned().map_err(cache_error)
+    }
+    fn revert_assumed_pvs(&self, bindings: &[BindingInfo]) {
+        let mut b = self.binder.lock().unwrap_or_else(|e| e.into_inner());
+        b.revert_assumed_pod_volumes(&PodVolumes {
+            static_bindings: bindings.to_vec(),
+            dynamic_provisions: vec![],
+        });
+    }
+    fn revert_assumed_pvcs(&self, claims: &[PersistentVolumeClaim]) {
+        let mut b = self.binder.lock().unwrap_or_else(|e| e.into_inner());
+        b.revert_assumed_pod_volumes(&PodVolumes {
+            static_bindings: vec![],
+            dynamic_provisions: claims
+                .iter()
+                .map(|pvc| DynamicProvision {
+                    pvc: pvc.clone(),
+                    node_capacity: None,
+                })
+                .collect(),
+        });
+    }
+    async fn node(&self, name: &str) -> Result<Node, String> {
+        let nodes = self.data.list_nodes().await.map_err(|e| e.to_string())?;
+        nodes
+            .into_iter()
+            .find(|n| n.metadata.name == name)
+            .ok_or_else(|| format!("node {name:?} not found"))
+    }
+    async fn csi_node(&self, name: &str) -> Option<CSINode> {
+        self.data.get_csi_node(name).await
+    }
+    async fn refresh(&self) {
+        match self.data.list_volume_snapshot(&self.namespace).await {
+            Ok(snap) => {
+                let mut b = self.binder.lock().unwrap_or_else(|e| e.into_inner());
+                b.sync_namespace(&self.namespace, &snap);
+            }
+            Err(e) => tracing::warn!("VolumeBinding: failed to refresh volume caches: {e}"),
+        }
+    }
+    async fn pod_exists(&self, pod: &Pod) -> Result<bool, String> {
+        let ns = pod.metadata.namespace.as_deref().unwrap_or("default");
+        match self.data.get_pod(ns, &pod.metadata.name).await {
+            Ok(_) => Ok(true),
+            Err(rusternetes_common::Error::NotFound(_)) => Ok(false),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
+fn cache_error(e: crate::volume_assume::AssumeError) -> CacheError {
+    match e {
+        crate::volume_assume::AssumeError::NotFound { .. } => CacheError::NotFound(e.to_string()),
+        other => CacheError::Other(other.to_string()),
     }
 }
 
@@ -961,6 +1073,15 @@ mod tests {
     }
 
     // ---- PreBindPreFlight / PreBind / Unreserve (volume_binding.go) ----
+
+    #[test]
+    fn reserve_without_pod_volumes_marks_all_bound() {
+        // volume_binding.go:549-551: "may not exist if the pod does not reference any PVC"
+        let mut b = VolumeBinder::new();
+        let mut s = VolumeBindingState::default();
+        reserve(&mut b, &mut s, &pod("node1"), "node1").unwrap();
+        assert!(s.all_bound);
+    }
 
     #[test]
     fn preflight_skips_when_all_bound() {

@@ -145,9 +145,16 @@ impl<T: Assumable> AssumeCache<T> {
     /// Feed a fresh lister listing (what the informer would deliver as
     /// add/update/delete events): add/update every object, delete the rest.
     pub fn sync(&mut self, objs: &[T]) {
+        self.sync_scoped(objs, |_| true);
+    }
+
+    /// `sync` for a listing that only covers part of the key space (the PVCs of
+    /// one namespace): objects outside `in_scope` are left untouched, so an
+    /// assumed PVC of another namespace survives the refresh.
+    pub fn sync_scoped(&mut self, objs: &[T], in_scope: impl Fn(&str) -> bool) {
         let present: std::collections::HashSet<String> =
             objs.iter().map(|o| o.cache_key()).collect();
-        self.objs.retain(|k, _| present.contains(k));
+        self.objs.retain(|k, _| !in_scope(k) || present.contains(k));
         for o in objs {
             self.add(o);
         }
@@ -275,6 +282,15 @@ impl VolumeBinder {
     pub fn sync(&mut self, snap: &VolumeSnapshot) {
         self.pv_cache.sync(&snap.pvs);
         self.pvc_cache.sync(&snap.pvcs);
+    }
+
+    /// `sync` for a snapshot whose PVC list is limited to namespace `ns`
+    /// (`DataPlane::list_volume_snapshot`): PVs are global, PVCs are scoped.
+    pub fn sync_namespace(&mut self, ns: &str, snap: &VolumeSnapshot) {
+        self.pv_cache.sync(&snap.pvs);
+        let prefix = format!("{ns}/");
+        self.pvc_cache
+            .sync_scoped(&snap.pvcs, |k| k.starts_with(&prefix));
     }
 
     /// `isVolumeBound` + `isPVCBound` + `isPVCFullyBound` (binder.go:724-778),
