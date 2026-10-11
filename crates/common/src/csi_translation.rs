@@ -7,12 +7,12 @@
 //! and AWS EBS; the other in-tree plugins of `translate.go:34-42` (Cinder,
 //! AzureDisk, AzureFile, vSphere, Portworx) are tracked follow-ups.
 //!
-//! NOT ported: `TranslateCSIPVToInTree`, `TranslateInTreeStorageClassToCSI`
-//! and `TranslateInTreeInlineVolumeToCSI` (tracked follow-ups).
+//! NOT ported: `TranslateCSIPVToInTree` and `TranslateInTreeInlineVolumeToCSI` (tracked follow-ups).
 
 use crate::resources::volume::{
     CSIVolumeSource, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm,
-    PersistentVolumeAccessMode, VolumeNodeAffinity,
+    PersistentVolumeAccessMode, StorageClass, TopologySelectorLabelRequirement,
+    TopologySelectorTerm, VolumeNodeAffinity,
 };
 use crate::resources::PersistentVolume;
 use std::collections::{BTreeSet, HashMap};
@@ -83,6 +83,17 @@ impl CsiTranslator {
             "could not find in-tree plugin translation logic for {:?}",
             copied.metadata.name
         ))
+    }
+
+    /// `TranslateInTreeStorageClassToCSI` (`translate.go:54-63`); the input is
+    /// not modified.
+    pub fn translate_in_tree_storage_class_to_csi(
+        &self,
+        in_tree_plugin_name: &str,
+        sc: &StorageClass,
+    ) -> Result<StorageClass, String> {
+        let _ = (in_tree_plugin_name, sc);
+        Err("not implemented".to_string())
     }
 
     /// `IsPVMigratable` (`translate.go:176-183`).
@@ -573,6 +584,121 @@ mod tests {
 
     const ZONE_BETA: &str = "failure-domain.beta.kubernetes.io/zone";
     const ZONE_GA: &str = "topology.kubernetes.io/zone";
+
+    fn sc(params: &[(&str, &str)], topo: Option<Vec<TopologySelectorTerm>>) -> StorageClass {
+        StorageClass {
+            type_meta: TypeMeta::default(),
+            metadata: ObjectMeta::new("sc"),
+            provisioner: String::new(),
+            parameters: Some(
+                params
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            ),
+            reclaim_policy: None,
+            volume_binding_mode: None,
+            allowed_topologies: topo,
+            allow_volume_expansion: None,
+            mount_options: None,
+        }
+    }
+
+    fn topo(key: &str, values: &[&str]) -> Option<Vec<TopologySelectorTerm>> {
+        Some(vec![TopologySelectorTerm {
+            match_label_expressions: Some(vec![TopologySelectorLabelRequirement {
+                key: key.into(),
+                values: values.iter().map(|v| v.to_string()).collect(),
+            }]),
+        }])
+    }
+
+    fn sc_eq(a: &StorageClass, b: &StorageClass) -> bool {
+        a.parameters == b.parameters
+            && serde_json::to_value(&a.allowed_topologies).unwrap()
+                == serde_json::to_value(&b.allowed_topologies).unwrap()
+    }
+
+    /// `TestTranslatePDInTreeStorageClassToCSI` (`plugins/gce_pd_test.go:38`).
+    #[test]
+    fn gce_pd_storage_class_translation_matches_upstream_table() {
+        let t = CsiTranslator::new();
+        let tr = |c: &StorageClass| {
+            t.translate_in_tree_storage_class_to_csi(GCE_PD_IN_TREE_PLUGIN_NAME, c)
+        };
+        let ok = |input: StorageClass, exp: StorageClass| {
+            let got = tr(&input).expect("translates");
+            assert!(sc_eq(&got, &exp), "got {got:?}, want {exp:?}");
+        };
+        ok(sc(&[("foo", "bar")], None), sc(&[("foo", "bar")], None));
+        ok(
+            sc(&[("fstype", "myfs")], None),
+            sc(&[("csi.storage.k8s.io/fstype", "myfs")], None),
+        );
+        ok(sc(&[], None), sc(&[], None));
+        ok(
+            sc(&[("zone", "foo")], None),
+            sc(&[], topo(GCE_PD_TOPOLOGY_KEY, &["foo"])),
+        );
+        ok(
+            sc(&[("zones", "foo,bar,baz")], None),
+            sc(&[], topo(GCE_PD_TOPOLOGY_KEY, &["foo", "bar", "baz"])),
+        );
+        ok(
+            sc(&[], topo(GCE_PD_TOPOLOGY_KEY, &["foo"])),
+            sc(&[], topo(GCE_PD_TOPOLOGY_KEY, &["foo"])),
+        );
+        ok(
+            sc(&[], topo(LABEL_FAILURE_DOMAIN_BETA_ZONE, &["foo"])),
+            sc(&[], topo(GCE_PD_TOPOLOGY_KEY, &["foo"])),
+        );
+        assert!(tr(&sc(&[("zone", "foo")], topo(GCE_PD_TOPOLOGY_KEY, &["foo"]))).is_err());
+    }
+
+    /// `TestTranslateEBSInTreeStorageClassToCSI` (`plugins/aws_ebs_test.go:83`).
+    #[test]
+    fn aws_ebs_storage_class_translation_matches_upstream_table() {
+        let t = CsiTranslator::new();
+        let tr = |c: &StorageClass| {
+            t.translate_in_tree_storage_class_to_csi(AWS_EBS_IN_TREE_PLUGIN_NAME, c)
+        };
+        let ok = |input: StorageClass, exp: StorageClass| {
+            let got = tr(&input).expect("translates");
+            assert!(sc_eq(&got, &exp), "got {got:?}, want {exp:?}");
+        };
+        ok(sc(&[("foo", "bar")], None), sc(&[("foo", "bar")], None));
+        ok(sc(&[], None), sc(&[], None));
+        ok(
+            sc(&[("fstype", "ext3")], None),
+            sc(&[("csi.storage.k8s.io/fstype", "ext3")], None),
+        );
+        ok(
+            sc(&[("iopsPerGB", "100")], None),
+            sc(
+                &[("iopsPerGB", "100"), ("allowautoiopspergbincrease", "true")],
+                None,
+            ),
+        );
+        ok(
+            sc(&[("zones", "a,b")], None),
+            sc(&[], topo(AWS_EBS_TOPOLOGY_KEY, &["a", "b"])),
+        );
+    }
+
+    /// `TranslateInTreeStorageClassToCSI` (`translate.go:60-62`): an unknown
+    /// plugin name is an error; the input class is never modified
+    /// (`sc.DeepCopy()`, :55).
+    #[test]
+    fn storage_class_translation_rejects_unknown_plugin_and_keeps_input() {
+        let t = CsiTranslator::new();
+        let input = sc(&[("fstype", "x")], None);
+        assert!(t
+            .translate_in_tree_storage_class_to_csi("kubernetes.io/nope", &input)
+            .unwrap_err()
+            .contains("could not find in-tree storage class parameter translation logic"));
+        let _ = t.translate_in_tree_storage_class_to_csi(GCE_PD_IN_TREE_PLUGIN_NAME, &input);
+        assert_eq!(input.parameters.unwrap().get("fstype").unwrap(), "x");
+    }
 
     fn blank_pv(name: &str) -> PersistentVolume {
         PersistentVolume {
