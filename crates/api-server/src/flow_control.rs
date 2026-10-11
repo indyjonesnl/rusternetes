@@ -1856,6 +1856,55 @@ mod tests {
             .unwrap()
     }
 
+    // presyncFlowSchemaStatus / digestFlowSchemasLocked
+    // (apf_controller.go:956-985, :773): the Dangling condition of every
+    // FlowSchema reflects whether its priority-level reference exists, and
+    // syncOne writes it (:613).
+    async fn dangling_of(st: &Arc<MemoryStorage>, name: &str) -> Option<rusternetes_common::resources::flowcontrol::FlowSchemaCondition> {
+        let fs: FlowSchema = st
+            .get(&build_key("flowschemas", None, name))
+            .await
+            .unwrap();
+        fs.status
+            .and_then(|s| s.conditions)
+            .and_then(|c| c.into_iter().find(|c| c.type_ == "Dangling"))
+    }
+
+    fn fs_ref(name: &str, pl: &str) -> FlowSchema {
+        let mut fs = mandatory_flow_schema("catch-all").unwrap();
+        fs.metadata = ObjectMeta::new(name);
+        fs.spec.priority_level_configuration.name = pl.to_string();
+        fs.spec.matching_precedence = 500;
+        fs
+    }
+
+    #[tokio::test]
+    async fn sync_one_writes_dangling_conditions() {
+        let st = Arc::new(MemoryStorage::new());
+        put_pl(&st, &named_pl("a", 4, 2)).await;
+        for fs in [fs_ref("good", "a"), fs_ref("bad", "nope")] {
+            st.create(&build_key("flowschemas", None, &fs.metadata.name), &fs)
+                .await
+                .unwrap();
+        }
+        let e = FlowControlEngine::with_limits(st.clone(), 100, 0);
+        e.sync_one().await.unwrap();
+        let good = dangling_of(&st, "good").await.expect("good has a condition");
+        assert_eq!(good.status, "False");
+        assert_eq!(good.reason.as_deref(), Some("Found"));
+        assert_eq!(
+            good.message.as_deref(),
+            Some("This FlowSchema references the PriorityLevelConfiguration object named \"a\" and it exists")
+        );
+        let bad = dangling_of(&st, "bad").await.expect("bad has a condition");
+        assert_eq!(bad.status, "True");
+        assert_eq!(bad.reason.as_deref(), Some("NotFound"));
+        assert_eq!(
+            bad.message.as_deref(),
+            Some("This FlowSchema references the PriorityLevelConfiguration object named \"nope\" but there is no such object")
+        );
+    }
+
     #[tokio::test]
     async fn removed_idle_level_is_dropped() {
         let (st, e) = level_a_engine().await;
