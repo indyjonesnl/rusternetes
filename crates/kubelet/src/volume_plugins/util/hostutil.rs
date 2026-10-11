@@ -4,8 +4,11 @@ use std::io;
 
 /// `HostUtil.GetOwner` (`hostutil_linux.go:267-274`): the uid and gid of
 /// `pathname` after symlink evaluation.
-pub fn get_owner(_pathname: &str) -> io::Result<(i64, i64)> {
-    todo!()
+pub fn get_owner(pathname: &str) -> io::Result<(i64, i64)> {
+    use std::os::unix::fs::MetadataExt;
+    let realpath = std::fs::canonicalize(pathname)?;
+    let md = std::fs::metadata(realpath)?;
+    Ok((md.uid() as i64, md.gid() as i64))
 }
 
 #[cfg(test)]
