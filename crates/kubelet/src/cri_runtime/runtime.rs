@@ -349,7 +349,6 @@ pub fn sandbox_filter_by_namespaced_name(
 pub struct CriContainerRuntime {
     cri: CriClient,
     /// Runtime class passed to `RunPodSandbox` (e.g. `crun`); empty = default.
-    runtime_handler: String,
     /// Root under which per-pod log directories are created.
     log_root: String,
     /// Provisions host-side pod volumes. `None` keeps `start_pod` volume-less
@@ -385,17 +384,11 @@ pub struct CriContainerRuntime {
 }
 
 impl CriContainerRuntime {
-    /// Connect to the CRI runtime at `socket` and use `runtime_handler` for new
-    /// sandboxes. `log_root` is the base dir for per-pod container logs.
-    pub async fn connect(
-        socket: impl AsRef<Path>,
-        runtime_handler: impl Into<String>,
-        log_root: impl Into<String>,
-    ) -> Result<Self> {
+    /// Connect to the CRI runtime at `socket`. `log_root` is the base dir for per-pod container logs.
+    pub async fn connect(socket: impl AsRef<Path>, log_root: impl Into<String>) -> Result<Self> {
         let cri = CriClient::connect(socket).await?;
         Ok(Self {
             cri,
-            runtime_handler: runtime_handler.into(),
             log_root: log_root.into(),
             volumes: None,
             probe_states: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -689,23 +682,22 @@ impl CriContainerRuntime {
     }
 
     /// Runtime handler for the pod's `RunPodSandbox`
-    /// (`CreatePodSandbox`, `pkg/kubelet/kuberuntime/kuberuntime_sandbox.go:58-68`):
-    /// `runtimeClassManager.LookupRuntimeHandler(pod.Spec.RuntimeClassName)`,
-    /// where a lookup failure fails the sandbox. Without storage (no manager,
-    /// `if m.runtimeClassManager != nil`) the node default is used.
-    ///
-    /// Deliberate deviation: upstream resolves "no runtimeClassName" to `""`;
-    /// we keep the node-configured `CONTAINER_RUNTIME_HANDLER` there so
-    /// existing deployments that rely on it keep working.
+    /// (`CreatePodSandbox`, `pkg/kubelet/kuberuntime/kuberuntime_sandbox.go:56-68`):
+    /// `runtimeHandler := ""`, then, `if m.runtimeClassManager != nil`,
+    /// `LookupRuntimeHandler(pod.Spec.RuntimeClassName)`, where a lookup
+    /// failure fails the sandbox. No runtimeClassName resolves to `""`
+    /// (`runtimeclass_manager.go:61-65`); there is no node-level default
+    /// handler (the former `CONTAINER_RUNTIME_HANDLER` fallback is removed,
+    /// #3263; configure the CRI default runtime or use a RuntimeClass).
     async fn sandbox_runtime_handler(&self, pod: &Pod) -> anyhow::Result<String> {
         let Some(storage) = self.volumes.as_ref().and_then(|v| v.storage.as_ref()) else {
-            return Ok(self.runtime_handler.clone());
+            return Ok(String::new());
         };
         let class = pod
             .spec
             .as_ref()
             .and_then(|s| s.runtime_class_name.as_deref());
-        let handler = super::host_policy::lookup_runtime_handler(storage.as_ref(), class)
+        super::host_policy::lookup_runtime_handler(storage.as_ref(), class)
             .await
             .map_err(|e| {
                 anyhow::anyhow!(
@@ -713,12 +705,7 @@ impl CriContainerRuntime {
                     pod.metadata.namespace.as_deref().unwrap_or_default(),
                     pod.metadata.name
                 )
-            })?;
-        if handler.is_empty() {
-            Ok(self.runtime_handler.clone())
-        } else {
-            Ok(handler)
-        }
+            })
     }
 
     /// `getPodRuntimeHandler` (`kuberuntime_container.go:177-190`): the runtime
@@ -3332,7 +3319,6 @@ mod tests {
     async fn apply_readiness_updates_restartable_init_sidecars_only() {
         let runtime = CriContainerRuntime::connect(
             "/tmp/rusternetes-test-missing-cri.sock",
-            "",
             "/tmp/rusternetes-test-logs",
         )
         .await
@@ -3502,7 +3488,6 @@ mod tests {
                 .await;
         let runtime = CriContainerRuntime::connect(
             "/tmp/rusternetes-test-missing-cri.sock",
-            "",
             "/tmp/rusternetes-test-logs",
         )
         .await
@@ -3534,7 +3519,6 @@ mod tests {
                 .await;
         let runtime = CriContainerRuntime::connect(
             "/tmp/rusternetes-test-missing-cri.sock",
-            "",
             "/tmp/rusternetes-test-logs",
         )
         .await
@@ -3627,7 +3611,6 @@ mod tests {
         let (port, rx) = spawn_lifecycle_hook_https_server().await;
         let runtime = CriContainerRuntime::connect(
             "/tmp/rusternetes-test-missing-cri.sock",
-            "",
             "/tmp/rusternetes-test-logs",
         )
         .await
@@ -3666,7 +3649,6 @@ mod tests {
         let port = spawn_http_probe_redirect_server().await;
         let runtime = CriContainerRuntime::connect(
             "/tmp/rusternetes-test-missing-cri.sock",
-            "",
             "/tmp/rusternetes-test-logs",
         )
         .await
@@ -3697,7 +3679,6 @@ mod tests {
         let storage = Arc::new(StorageBackend::new_memory());
         let runtime = CriContainerRuntime::connect(
             "/tmp/rusternetes-test-missing-cri.sock",
-            "",
             "/tmp/rusternetes-test-logs",
         )
         .await
@@ -3884,7 +3865,6 @@ mod tests {
         let storage = Arc::new(StorageBackend::new_memory());
         let runtime = CriContainerRuntime::connect(
             "/tmp/rusternetes-test-missing-cri.sock",
-            "",
             "/tmp/rusternetes-test-logs",
         )
         .await
@@ -3955,7 +3935,6 @@ mod tests {
         let storage = Arc::new(StorageBackend::new_memory());
         let runtime = CriContainerRuntime::connect(
             "/tmp/rusternetes-test-missing-cri.sock",
-            "",
             "/tmp/rusternetes-test-logs",
         )
         .await
@@ -4031,7 +4010,6 @@ mod tests {
         );
         let rt = CriContainerRuntime::connect(
             "/tmp/rusternetes-test-missing-cri.sock",
-            "node-default",
             "/tmp/rusternetes-test-logs",
         )
         .await
@@ -4053,11 +4031,11 @@ mod tests {
                 .unwrap(),
             "runsc"
         );
-        // No class: node-configured default is kept (documented deviation).
-        assert_eq!(
-            rt.sandbox_runtime_handler(&mk(None)).await.unwrap(),
-            "node-default"
-        );
+        // No class resolves to "" (`runtimeclass_manager.go:61-65`: "The default
+        // RuntimeClass always resolves to the empty runtime handler"); no
+        // node-level CONTAINER_RUNTIME_HANDLER fallback (#3263).
+        assert_eq!(rt.sandbox_runtime_handler(&mk(None)).await.unwrap(), "");
+        assert_eq!(rt.sandbox_runtime_handler(&mk(Some(""))).await.unwrap(), "");
         // Missing RuntimeClass fails the sandbox (`kuberuntime_sandbox.go:60-63`).
         assert!(rt.sandbox_runtime_handler(&mk(Some("nope"))).await.is_err());
     }
@@ -4083,7 +4061,6 @@ mod tests {
         );
         let rt = CriContainerRuntime::connect(
             "/tmp/rusternetes-test-missing-cri.sock",
-            "node-default",
             "/tmp/rusternetes-test-logs",
         )
         .await
@@ -4136,7 +4113,6 @@ mod tests {
         // 127.0.0.1 per IPv4 node IP.
         let rt = CriContainerRuntime::connect(
             "/tmp/rusternetes-test-missing-cri.sock",
-            "h",
             "/tmp/rusternetes-test-logs",
         )
         .await
@@ -4161,7 +4137,6 @@ mod tests {
         let storage = Arc::new(StorageBackend::new_memory());
         let runtime = CriContainerRuntime::connect(
             "/tmp/rusternetes-test-missing-cri.sock",
-            "",
             "/tmp/rusternetes-test-logs",
         )
         .await
@@ -4365,13 +4340,10 @@ mod tests {
             }
         });
 
-        let runtime = CriContainerRuntime::connect(
-            sock_path.to_str().unwrap(),
-            "",
-            "/tmp/rusternetes-test-logs",
-        )
-        .await
-        .unwrap();
+        let runtime =
+            CriContainerRuntime::connect(sock_path.to_str().unwrap(), "/tmp/rusternetes-test-logs")
+                .await
+                .unwrap();
 
         let (pod, container) = lifecycle_test_pod_and_container();
         let handler = rusternetes_common::resources::pod::LifecycleHandler {
