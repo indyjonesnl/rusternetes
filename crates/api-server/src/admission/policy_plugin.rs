@@ -17,6 +17,7 @@
 use std::sync::Arc;
 
 use rusternetes_common::admission::Operation;
+use rusternetes_common::authz::Authorizer;
 use rusternetes_common::resources::{MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding};
 use rusternetes_common::Error;
 
@@ -48,6 +49,8 @@ pub struct MutatingPolicyPlugin {
     pub namespace_objects: Arc<dyn NamespaceObjects>,
     pub type_converters: Arc<dyn TypeConverters>,
     pub defaulter: Arc<dyn ObjectDefaulter>,
+    /// The request authorizer handed to the dispatcher (`d.authz`).
+    pub authorizer: Arc<dyn Authorizer>,
 }
 
 /// generic/plugin.go:46-52 `admissionResources`: the CEL-based admission
@@ -126,6 +129,7 @@ impl MutatingPolicyPlugin {
             type_converters: self.type_converters.clone(),
             defaulter: self.defaulter.clone(),
             reinvocation,
+            authz: self.authorizer.clone(),
         };
         dispatch(&matcher, attr, &hooks, &delegate).await
     }
@@ -134,6 +138,7 @@ impl MutatingPolicyPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusternetes_common::authz::AlwaysAllowAuthorizer;
     use std::collections::HashMap;
 
     use async_trait::async_trait;
@@ -315,6 +320,7 @@ mod tests {
             namespace_objects: Arc::new(Namespaces),
             type_converters: Arc::new(Converters),
             defaulter: Arc::new(NoDefaults),
+            authorizer: Arc::new(AlwaysAllowAuthorizer),
         }
     }
     fn ctx() -> Arc<ReinvocationContext> {

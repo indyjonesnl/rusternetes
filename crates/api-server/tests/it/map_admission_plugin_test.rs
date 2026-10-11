@@ -180,6 +180,7 @@ fn plugin_with(hooks: Vec<Hook>) -> Arc<MutatingPolicyPlugin> {
         namespace_objects: Arc::new(Fakes),
         type_converters: Arc::new(Fakes),
         defaulter: Arc::new(Fakes),
+        authorizer: Arc::new(rusternetes_common::authz::AlwaysAllowAuthorizer),
     })
 }
 
