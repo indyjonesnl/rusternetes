@@ -1919,6 +1919,7 @@ async fn node_deployment_deletes_a_volume_accessible_on_its_node() {
     p.sync_volume(&pv).await.unwrap();
     assert_eq!(deleted(&rec).len(), 1);
     assert!(get_pv(&storage, "pv1").await.is_none());
+}
 
 // `cleanupVolume` (controller.go:2074-2086): `delReq.Secrets =
 // provisionerCredentials`, the credentials CreateVolume was sent with
