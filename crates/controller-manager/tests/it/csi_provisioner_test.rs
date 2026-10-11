@@ -1805,3 +1805,118 @@ async fn resource_exhausted_with_a_selected_node_reschedules() {
         .unwrap_or_default()
         .contains_key(SELECTED_NODE));
 }
+
+// `--node-deployment` (controller.go:1411-1422 `Delete`, :1602-1690
+// `checkNode`). Upstream cases: "distributed, right node selected",
+// "distributed, no node selected", "distributed, wrong node selected"
+// (controller_test.go:2106-2182).
+
+use rusternetes_controller_manager::controllers::csi_provisioner::NodeDeployment;
+
+fn node_deployment(topology: Option<&[(&str, &str)]>) -> NodeDeployment {
+    NodeDeployment {
+        node_name: "foo".into(),
+        immediate_binding: false,
+        accessible_topology: topology.map(|t| {
+            t.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        }),
+    }
+}
+
+const SELECTED: &str = "volume.kubernetes.io/selected-node";
+
+#[tokio::test]
+async fn node_deployment_provisions_only_for_its_own_selected_node() {
+    let wffc = || storage_class(Some(VolumeBindingMode::WaitForFirstConsumer));
+    // Right node selected.
+    let (storage, p, rec, _d) = env(Fake::new(), wffc()).await;
+    let p = p.with_node_deployment(node_deployment(None));
+    p.sync_claim(&claim(&[(ANN, DRIVER), (SELECTED, "foo")]))
+        .await
+        .unwrap();
+    assert_eq!(rec.lock().unwrap().create_volume.len(), 1);
+    assert!(pv(&storage).await.is_some());
+
+    // Wrong node selected: "Some other node is selected, ignore it."
+    let (storage, p, rec, _d) = env(Fake::new(), wffc()).await;
+    let p = p.with_node_deployment(node_deployment(None));
+    p.sync_claim(&claim(&[(ANN, DRIVER), (SELECTED, "bar")]))
+        .await
+        .unwrap();
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+    assert!(pv(&storage).await.is_none());
+}
+
+#[tokio::test]
+async fn node_deployment_ignores_an_unassigned_claim_without_immediate_binding() {
+    // Immediate class, no selected node, ImmediateBinding off: checkNode
+    // returns false (`!p.nodeDeployment.ImmediateBinding`).
+    let (storage, p, rec, _d) = env(
+        Fake::new(),
+        storage_class(Some(VolumeBindingMode::Immediate)),
+    )
+    .await;
+    let p = p.with_node_deployment(node_deployment(None));
+    p.sync_claim(&claim(&[(ANN, DRIVER)])).await.unwrap();
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+    assert!(pv(&storage).await.is_none());
+}
+
+fn with_affinity(mut pv: PersistentVolume, key: &str, value: &str) -> PersistentVolume {
+    pv.spec.node_affinity = Some(VolumeNodeAffinity {
+        required: Some(NodeSelector {
+            node_selector_terms: vec![NodeSelectorTerm {
+                match_expressions: Some(vec![NodeSelectorRequirement {
+                    key: key.into(),
+                    operator: "In".into(),
+                    values: Some(vec![value.into()]),
+                }]),
+                match_fields: None,
+            }],
+        }),
+    });
+    pv
+}
+
+#[tokio::test]
+async fn node_deployment_does_not_delete_a_volume_of_another_node() {
+    // VolumeIsAccessible false => IgnoredError "PV was not provisioned on
+    // this node": no DeleteVolume, PV and its finalizer untouched.
+    let (storage, p, rec, _d) = env(Fake::new(), storage_class(None)).await;
+    let p = p.with_node_deployment(node_deployment(Some(&[("topology/node", "foo")])));
+    let pv = with_affinity(
+        csi_pv(
+            "pv1",
+            PersistentVolumePhase::Released,
+            PersistentVolumeReclaimPolicy::Delete,
+        ),
+        "topology/node",
+        "bar",
+    );
+    put_pv(&storage, &pv).await;
+    p.sync_volume(&pv).await.unwrap();
+    assert!(deleted(&rec).is_empty());
+    let kept = get_pv(&storage, "pv1").await.expect("PV kept");
+    assert_eq!(kept.metadata.finalizers, Some(vec![FINALIZER.to_string()]));
+}
+
+#[tokio::test]
+async fn node_deployment_deletes_a_volume_accessible_on_its_node() {
+    let (storage, p, rec, _d) = env(Fake::new(), storage_class(None)).await;
+    let p = p.with_node_deployment(node_deployment(Some(&[("topology/node", "foo")])));
+    let pv = with_affinity(
+        csi_pv(
+            "pv1",
+            PersistentVolumePhase::Released,
+            PersistentVolumeReclaimPolicy::Delete,
+        ),
+        "topology/node",
+        "foo",
+    );
+    put_pv(&storage, &pv).await;
+    p.sync_volume(&pv).await.unwrap();
+    assert_eq!(deleted(&rec).len(), 1);
+    assert!(get_pv(&storage, "pv1").await.is_none());
+}

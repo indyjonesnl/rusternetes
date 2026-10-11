@@ -34,7 +34,8 @@
 //! migration of in-tree PVs (`IsPVMigratable` / `TranslateInTreePVToCSI`).
 
 use super::csi_topology::{
-    generate_volume_node_affinity, TopologyError, TopologyInputs, TopologyStore,
+    generate_volume_node_affinity, volume_is_accessible, TopologyError, TopologyInputs,
+    TopologyStore,
 };
 use anyhow::{anyhow, Context, Result};
 use rusternetes_common::quantity::{Format, Quantity};
@@ -148,6 +149,22 @@ const PV_SAVE_MAX: Duration = Duration::from_secs(1000);
 /// default 100; this process runs fewer, the claims are cheap).
 const WORKERS: usize = 8;
 
+/// `NodeDeployment` (external-provisioner `pkg/controller/node.go`) as far as
+/// the `--node-deployment` mode needs it: the node this instance serves and
+/// the driver's `NodeGetInfo` topology.
+#[derive(Debug, Clone, Default)]
+pub struct NodeDeployment {
+    /// `NodeName`.
+    pub node_name: String,
+    /// `ImmediateBinding` (`--node-deployment-immediate-binding`).
+    /// Read by `becomeOwner`, not ported yet (#3140).
+    #[allow(dead_code)]
+    pub immediate_binding: bool,
+    /// `NodeInfo.AccessibleTopology.Segments`; `None` = the driver reported
+    /// no topology.
+    pub accessible_topology: Option<HashMap<String, String>>,
+}
+
 /// Why a provisioning step stopped without an error to retry.
 #[derive(Debug)]
 enum Failure {
@@ -166,10 +183,12 @@ impl From<anyhow::Error> for Failure {
 
 type Outcome<T> = std::result::Result<T, (ProvisioningState, Failure)>;
 
-/// Why `csiProvisioner.Delete` stopped. (`IgnoredError` is only returned for
-/// a node deployment, which is not ported.)
+/// Why `csiProvisioner.Delete` stopped.
 #[derive(Debug)]
 enum DeleteFailure {
+    /// `controller.IgnoredError`: "PV was not provisioned on this node"
+    /// (node deployment only).
+    Ignored(String),
     /// `controller.VolumeInUseError`: postponed, not failed.
     InUse(String),
     Error(anyhow::Error),
@@ -652,6 +671,8 @@ pub struct CsiProvisioner<S: Storage> {
     /// `pvcNodeStore` (cache.go `InMemoryStore`), keyed by PVC UID.
     pvc_node_store: TopologyStore,
     capabilities: tokio::sync::OnceCell<DriverCapabilities>,
+    /// `nodeDeployment`; `None` = central deployment.
+    node_deployment: Option<NodeDeployment>,
 }
 
 impl<S: Storage + 'static> CsiProvisioner<S> {
@@ -688,7 +709,18 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             immediate_topology: true,
             pvc_node_store: TopologyStore::new(),
             capabilities: tokio::sync::OnceCell::new(),
+            node_deployment: None,
         }
+    }
+
+    /// `--node-deployment`: run as the per-node instance of a distributed
+    /// deployment.
+    /// Library entry point: no controller-manager flag selects node
+    /// deployment (that needs a per-node CSI driver `NodeGetInfo`).
+    #[allow(dead_code)]
+    pub fn with_node_deployment(mut self, nd: NodeDeployment) -> Self {
+        self.node_deployment = Some(nd);
+        self
     }
 
     /// `--strict-topology`: pass only the selected node's topology.
@@ -808,6 +840,37 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             .map_err(|_| anyhow!("storageClass {name:?} not found"))
     }
 
+    /// `checkNode` (controller.go:1602-1690): with a node deployment, whether
+    /// this instance is responsible for the claim. `sc` is looked up when
+    /// `None` (only needed while no node is selected).
+    ///
+    /// Not ported: for an unassigned claim on an Immediate class with
+    /// `ImmediateBinding` on, upstream checks `allowedTopologies` and calls
+    /// `becomeOwner` (node.go: capacity check, PVC update) and still returns
+    /// false; here such a claim is simply not owned (tracked in #3140).
+    async fn check_node(
+        &self,
+        claim: &PersistentVolumeClaim,
+        sc: Option<&StorageClass>,
+    ) -> Result<bool> {
+        let Some(nd) = &self.node_deployment else {
+            return Ok(true);
+        };
+        match annotation(&claim.metadata, ANN_SELECTED_NODE).map(String::as_str) {
+            None | Some("") => {
+                // `p.scLister.Get(...)`: a lookup failure is an error.
+                if sc.is_none() {
+                    self.get_storage_class(&claim_class(claim)).await?;
+                }
+                Ok(false)
+            }
+            // "Our node is selected."
+            Some(n) if n == nd.node_name => Ok(true),
+            // "Some other node is selected, ignore it."
+            Some(_) => Ok(false),
+        }
+    }
+
     /// `shouldProvision` (lib controller.go:1242-1283) behind the
     /// `Qualifier` (`ShouldProvision`, external-provisioner
     /// controller.go:1557-1592; no node deployment, so `checkNode` is always
@@ -828,6 +891,18 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             && migrated_to.map(String::as_str) != Some(self.driver_name.as_str())
         {
             return Ok(false);
+        }
+        // "check that we are (or can become) the owner if there are multiple
+        // provisioner instances"; an error is only logged, "let a provisioning
+        // attempt start" (controller.go:1576-1590).
+        match self.check_node(claim, None).await {
+            Ok(false) => return Ok(false),
+            Ok(true) => {}
+            Err(e) => debug!(
+                "trying to become an owner of PVC {}/{} in advance failed, will try again during provisioning: {e:#}",
+                claim.metadata.namespace.as_deref().unwrap_or(""),
+                claim.metadata.name
+            ),
         }
         let class = self.get_storage_class(&claim_class(claim)).await?;
         if matches!(
@@ -1138,6 +1213,12 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
         let object = Self::volume_ref(volume);
         match self.delete_csi_volume(volume).await {
             Ok(()) => {}
+            Err(DeleteFailure::Ignored(reason)) => {
+                // "Delete ignored, do nothing and hope another provisioner
+                // will delete it." (lib controller.go deleteVolumeOperation)
+                debug!("Volume deletion ignored: {reason}");
+                return Ok(());
+            }
             Err(DeleteFailure::InUse(reason)) => {
                 // "Volume is still in use, retry later without treating it
                 // as a failure."
@@ -1232,6 +1313,19 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
         let Some(csi) = volume.spec.csi.as_ref() else {
             return Err(anyhow!("invalid CSI PV").into());
         };
+        // "If we run on a single node, then we shouldn't delete volumes that
+        // we didn't create. In practice, that means that the volume is
+        // accessible (only!) on this node." (controller.go:1411-1422)
+        if let Some(nd) = &self.node_deployment {
+            if !volume_is_accessible(
+                volume.spec.node_affinity.as_ref(),
+                nd.accessible_topology.as_ref(),
+            ) {
+                return Err(DeleteFailure::Ignored(
+                    "PV was not provisioned on this node".into(),
+                ));
+            }
+        }
         // `volumeHandleToId`
         let volume_id = csi.volume_handle.clone().unwrap_or_default();
 
@@ -2143,6 +2237,31 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
                     self.driver_name
                 )),
             ));
+        }
+
+        // "The same check already ran in ShouldProvision, but perhaps it
+        // couldn't complete due to some unexpected error." (:857-866)
+        match self.check_node(claim, Some(sc)).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err((
+                    ProvisioningState::NoChange,
+                    Failure::Ignored(format!(
+                        "not responsible for provisioning of PVC {}/{} because it is not assigned to node {:?}",
+                        claim.metadata.namespace.as_deref().unwrap_or(""),
+                        claim.metadata.name,
+                        self.node_deployment
+                            .as_ref()
+                            .map_or("", |n| n.node_name.as_str())
+                    )),
+                ))
+            }
+            Err(e) => {
+                return Err((
+                    ProvisioningState::NoChange,
+                    Failure::Error(anyhow!("node check failed: {e:#}")),
+                ))
+            }
         }
 
         // prepareProvision returns ProvisioningNoChange alongside its
