@@ -35,8 +35,9 @@
 //! (`ConcurrencyDenominator`, ratioed gauges,
 //! `NotePriorityLevelConcurrencyAdjustment`: #2809). FlowSchema Dangling
 //! status updates are ported (#2949, `presyncFlowSchemaStatus`,
-//! `digestConfigObjects`, `shouldDelayUpdate`) but written by direct
-//! read-modify-write rather than server-side apply.
+//! `digestConfigObjects`, `shouldDelayUpdate`) and written with
+//! `Storage::apply` (`ApplyStatus`, field manager
+//! `api-priority-and-fairness-config-consumer-v1`, force; #3271).
 //!
 //! Quiescing (#2769): `digest` ports `digestNewPLsLocked` (broken specs are
 //! ignored), `processOldPLsLocked` (an undesired level that is still busy is
@@ -301,6 +302,9 @@ struct Config {
     /// without going back to storage.
     inputs: (Vec<PriorityLevelConfiguration>, Vec<FlowSchema>),
 }
+
+/// `ConfigConsumerAsFieldManager` (apf_filter.go:42).
+const CONFIG_CONSUMER_AS_FIELD_MANAGER: &str = "api-priority-and-fairness-config-consumer-v1";
 
 /// `fsStatusUpdate` (apf_controller.go:580-584): a buffered FlowSchema status
 /// update.
@@ -1316,27 +1320,30 @@ impl<S: Storage> FlowControlEngine<S> {
         }
     }
 
-    /// `apply` (apf_controller.go:628-635): write the one Dangling condition
-    /// into the FlowSchema's status. Upstream server-side-applies it with
-    /// `Force` under the controller's field manager, which owns only that
-    /// condition; here the condition of that type is replaced in the stored
-    /// object, leaving any other condition alone (DEVIATION: a direct
-    /// read-modify-write instead of an `ApplyStatus` through the API).
+    /// `apply` (apf_controller.go:628-635): `ApplyStatus` of the one Dangling
+    /// condition with `ApplyOptions{FieldManager: asFieldManager, Force:
+    /// true}`; `toFlowSchemaApplyConfiguration` (:637-650) builds the apply
+    /// configuration `FlowSchema(name).WithStatus(WithConditions(condition))`.
+    /// `asFieldManager` is `ConfigConsumerAsFieldManager` (apf_filter.go:42,
+    /// passed at :98).
     async fn apply_status(&self, fsu: &FsStatusUpdate) -> rusternetes_common::Result<()> {
         let key = build_key("flowschemas", None, &fsu.flow_schema);
-        let mut fs: FlowSchema = self.storage.get(&key).await?;
-        let conditions = fs
-            .status
-            .get_or_insert(
-                rusternetes_common::resources::flowcontrol::FlowSchemaStatus { conditions: None },
+        let apply_config = serde_json::json!({
+            "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+            "kind": "FlowSchema",
+            "metadata": {"name": fsu.flow_schema},
+            "status": {"conditions": [fsu.condition]},
+        });
+        let _: FlowSchema = self
+            .storage
+            .apply(
+                &key,
+                &apply_config,
+                CONFIG_CONSUMER_AS_FIELD_MANAGER,
+                true,
+                Some("status"),
             )
-            .conditions
-            .get_or_insert_with(Vec::new);
-        match conditions.iter_mut().find(|c| c.type_ == "Dangling") {
-            Some(c) => *c = fsu.condition.clone(),
-            None => conditions.push(fsu.condition.clone()),
-        }
-        self.storage.update(&key, &fs).await?;
+            .await?;
         Ok(())
     }
 
