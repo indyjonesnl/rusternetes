@@ -98,7 +98,51 @@ pub fn validate_node_ip(ip: IpAddr) -> Result<(), String> {
 /// `Kubelet.nodeIPValidator` = `validateNodeIP` (kubelet_node_status.go:706-740):
 /// the static checks plus "the IP belongs to a host interface".
 pub fn validate_node_ip_on_host(ip: IpAddr) -> Result<(), String> {
-    validate_node_ip(ip)
+    validate_node_ip(ip)?;
+    // `net.InterfaceAddrs()` + `ip.Equal(nodeIP)`.
+    if host_interface_ips()?.contains(&ip) {
+        return Ok(());
+    }
+    Err(format!(
+        "node IP: \"{ip}\" not found in the host's network interfaces"
+    ))
+}
+
+/// `net.InterfaceAddrs()`: every unicast address of every host interface
+/// (getifaddrs(3), as Go's netlink/`interfaceAddrTable` does on Linux).
+fn host_interface_ips() -> Result<Vec<IpAddr>, String> {
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills `head` with a list that freeifaddrs releases.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let mut out = Vec::new();
+    let mut cur = head;
+    while !cur.is_null() {
+        // SAFETY: `cur` is a live node of the list returned above.
+        let ifa = unsafe { &*cur };
+        if !ifa.ifa_addr.is_null() {
+            // SAFETY: ifa_addr points at a sockaddr whose family tags its
+            // concrete type (sockaddr_in / sockaddr_in6).
+            match i32::from(unsafe { (*ifa.ifa_addr).sa_family }) {
+                libc::AF_INET => {
+                    let sa = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+                    out.push(IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(
+                        sa.sin_addr.s_addr,
+                    ))));
+                }
+                libc::AF_INET6 => {
+                    let sa = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in6) };
+                    out.push(IpAddr::V6(std::net::Ipv6Addr::from(sa.sin6_addr.s6_addr)));
+                }
+                _ => {}
+            }
+        }
+        cur = ifa.ifa_next;
+    }
+    // SAFETY: `head` came from getifaddrs and is freed exactly once.
+    unsafe { libc::freeifaddrs(head) };
+    Ok(out)
 }
 
 /// `NodeAddress` setter, no external cloud provider
@@ -107,6 +151,7 @@ pub fn validate_node_ip_on_host(ip: IpAddr) -> Result<(), String> {
 /// `resolveAddressFunc(nodeIP)` (default-route address of the family).
 pub fn node_addresses(
     node_ips: &[IpAddr],
+    validate: &dyn Fn(IpAddr) -> Result<(), String>,
     hostname: &str,
     lookup: &dyn Fn(&str) -> Vec<IpAddr>,
     resolve: &dyn Fn(Option<IpAddr>) -> Option<IpAddr>,
@@ -118,10 +163,10 @@ pub fn node_addresses(
     let secondary_specified = secondary.is_some_and(|ip| !ip.is_unspecified());
 
     if let (true, Some(ip)) = (node_ip_specified, node_ip) {
-        validate_node_ip(ip).map_err(|e| format!("failed to validate nodeIP: {e}"))?;
+        validate(ip).map_err(|e| format!("failed to validate nodeIP: {e}"))?;
     }
     if let (true, Some(ip)) = (secondary_specified, secondary) {
-        validate_node_ip(ip).map_err(|e| format!("failed to validate secondaryNodeIP: {e}"))?;
+        validate(ip).map_err(|e| format!("failed to validate secondaryNodeIP: {e}"))?;
     }
 
     let internal = |a: IpAddr| ("InternalIP".to_string(), a.to_string());
@@ -142,7 +187,7 @@ pub fn node_addresses(
         ip_addr = Some(a);
     } else {
         for a in lookup(hostname) {
-            if validate_node_ip(a).is_ok() {
+            if validate(a).is_ok() {
                 if a.is_ipv4() == prefer_ipv4 {
                     ip_addr = Some(a);
                     break;
@@ -259,6 +304,16 @@ mod tests {
         assert!(validate_node_ip_on_host(ip("127.0.0.1")).is_err());
     }
 
+    // Same test: every real interface address validates.
+    #[test]
+    fn host_validator_accepts_interface_addresses() {
+        for a in host_interface_ips().unwrap() {
+            if validate_node_ip(a).is_ok() {
+                assert!(validate_node_ip_on_host(a).is_ok(), "{a}");
+            }
+        }
+    }
+
     fn none(_: &str) -> Vec<IpAddr> {
         vec![]
     }
@@ -266,7 +321,7 @@ mod tests {
     // setters_test.go TestNodeAddress: single --node-ip
     #[test]
     fn address_single_node_ip() {
-        let r = node_addresses(&[ip("fd00::5")], "h", &none, &|_| None).unwrap();
+        let r = node_addresses(&[ip("fd00::5")], &validate_node_ip, "h", &none, &|_| None).unwrap();
         assert_eq!(
             r,
             vec![
@@ -279,7 +334,14 @@ mod tests {
     // setters_test.go: dual --node-ips => two InternalIPs then Hostname
     #[test]
     fn address_dual_stack() {
-        let r = node_addresses(&[ip("10.0.0.2"), ip("fd00::2")], "h", &none, &|_| None).unwrap();
+        let r = node_addresses(
+            &[ip("10.0.0.2"), ip("fd00::2")],
+            &validate_node_ip,
+            "h",
+            &none,
+            &|_| None,
+        )
+        .unwrap();
         assert_eq!(
             r,
             vec![
@@ -293,15 +355,24 @@ mod tests {
     // setters_test.go: invalid (loopback / multicast) node IP errors
     #[test]
     fn address_invalid_node_ip_errors() {
-        assert!(node_addresses(&[ip("127.0.0.1")], "h", &none, &|_| None).is_err());
-        assert!(node_addresses(&[ip("10.0.0.2"), ip("ff02::1")], "h", &none, &|_| None).is_err());
+        assert!(
+            node_addresses(&[ip("127.0.0.1")], &validate_node_ip, "h", &none, &|_| None).is_err()
+        );
+        assert!(node_addresses(
+            &[ip("10.0.0.2"), ip("ff02::1")],
+            &validate_node_ip,
+            "h",
+            &none,
+            &|_| None
+        )
+        .is_err());
     }
 
     // setters_test.go: no nodeIP prefers IPv4 from the DNS lookup
     #[test]
     fn address_no_node_ip_prefers_ipv4_lookup() {
         let lk = |_: &str| vec![ip("fd00::9"), ip("10.0.0.9")];
-        let r = node_addresses(&[], "h", &lk, &|_| None).unwrap();
+        let r = node_addresses(&[], &validate_node_ip, "h", &lk, &|_| None).unwrap();
         assert_eq!(r[0], ("InternalIP".into(), "10.0.0.9".into()));
     }
 
@@ -309,22 +380,25 @@ mod tests {
     #[test]
     fn address_unspecified_ipv6_prefers_ipv6_and_resolves() {
         let lk = |_: &str| vec![ip("10.0.0.9"), ip("fd00::9")];
-        let r = node_addresses(&[ip("::")], "h", &lk, &|_| None).unwrap();
+        let r = node_addresses(&[ip("::")], &validate_node_ip, "h", &lk, &|_| None).unwrap();
         assert_eq!(r[0], ("InternalIP".into(), "fd00::9".into()));
-        let r = node_addresses(&[ip("0.0.0.0")], "h", &none, &|_| Some(ip("10.9.9.9"))).unwrap();
+        let r = node_addresses(&[ip("0.0.0.0")], &validate_node_ip, "h", &none, &|_| {
+            Some(ip("10.9.9.9"))
+        })
+        .unwrap();
         assert_eq!(r[0], ("InternalIP".into(), "10.9.9.9".into()));
     }
 
     // setters.go:160: a hostname that is itself an IP is used
     #[test]
     fn address_hostname_ip_literal_used() {
-        let r = node_addresses(&[], "10.2.2.2", &none, &|_| None).unwrap();
+        let r = node_addresses(&[], &validate_node_ip, "10.2.2.2", &none, &|_| None).unwrap();
         assert_eq!(r[0], ("InternalIP".into(), "10.2.2.2".into()));
     }
 
     // setters.go:181: nothing found => error
     #[test]
     fn address_nothing_found_errors() {
-        assert!(node_addresses(&[], "h", &none, &|_| None).is_err());
+        assert!(node_addresses(&[], &validate_node_ip, "h", &none, &|_| None).is_err());
     }
 }

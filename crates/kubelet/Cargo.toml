@@ -59,6 +59,7 @@ prost-types.workspace = true
 http = "1"
 tar = "0.4"
 sysinfo = "0.32"
+libc = "0.2"
 rustix = { version = "1", features = ["fs"] }
 async-trait = { workspace = true }
 # CSI Node-service client dials the driver's unix socket (same connector shape
