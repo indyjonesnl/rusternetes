@@ -165,6 +165,11 @@ pub struct MutatingEvaluator {
     pub mutators: Vec<Option<Arc<dyn Patcher>>>,
 }
 
+/// compilation.go `compilePolicy` (:34-81).
+pub fn compile_policy(_policy: &MutatingAdmissionPolicy) -> MutatingEvaluator {
+    MutatingEvaluator::default()
+}
+
 /// `patch.TypeConverterManager.GetTypeConverter != nil`.
 pub trait TypeConverters: Send + Sync {
     fn has_type_converter(&self, kind: &GroupVersionKind) -> bool;
@@ -1056,5 +1061,124 @@ mod tests {
         assert!(!rc.with_policy_context(|c| {
             c.is_output_changed_since_last_policy_invocation(a.object.as_ref())
         }));
+    }
+
+    fn compiled_policy(variables: &[(&str, &str)], mutations: Vec<Mutation>) -> MutatingEvaluator {
+        use rusternetes_common::resources::validating_admission_policy::Variable;
+        let mut p = MutatingAdmissionPolicy::new("p");
+        p.spec = Some(MutatingAdmissionPolicySpec {
+            variables: Some(
+                variables
+                    .iter()
+                    .map(|(n, e)| Variable {
+                        name: n.to_string(),
+                        expression: e.to_string(),
+                    })
+                    .collect(),
+            ),
+            mutations: Some(mutations),
+            ..Default::default()
+        });
+        compile_policy(&p)
+    }
+    fn json_mutation(expr: &str) -> Mutation {
+        use rusternetes_common::resources::mutating_admission_policy::JsonPatch;
+        Mutation {
+            patch_type: Some(PatchType::JsonPatch),
+            json_patch: Some(JsonPatch {
+                expression: expr.into(),
+            }),
+            apply_configuration: None,
+        }
+    }
+    fn apply_mutation(expr: &str) -> Mutation {
+        use rusternetes_common::resources::mutating_admission_policy::ApplyConfiguration;
+        Mutation {
+            patch_type: Some(PatchType::ApplyConfiguration),
+            apply_configuration: Some(ApplyConfiguration {
+                expression: expr.into(),
+            }),
+            json_patch: None,
+        }
+    }
+    async fn patch_with(p: &Arc<dyn Patcher>, object: Value) -> Result<Value, PatchError> {
+        let a = attr(object.clone());
+        let gvr = deployment_gvr();
+        let v = VersionedAttributes {
+            versioned_kind: deployment_gvk(),
+            versioned_object: Some(object),
+            versioned_old_object: None,
+            dirty: false,
+        };
+        p.patch(&PatchRequest {
+            matched_resource: &gvr,
+            versioned_attributes: &v,
+            attributes: &a,
+            param: None,
+            namespace: None,
+        })
+        .await
+    }
+
+    /// compilation.go:57-72: one patcher per mutation, in order, JSONPatch
+    /// and applyConfiguration compiled by `patch.NewJSONPatcher` /
+    /// `patch.NewApplyConfigurationPatcher`.
+    #[tokio::test]
+    async fn compile_policy_builds_one_real_patcher_per_mutation_in_order() {
+        let ev = compiled_policy(
+            &[],
+            vec![
+                json_mutation(r#"[JSONPatch{op: "add", path: "/spec/replicas", value: 3}]"#),
+                apply_mutation(r#"Object{metadata: Object.metadata{labels: {"a": "1"}}}"#),
+            ],
+        );
+        assert!(ev.matcher.is_none());
+        assert_eq!(ev.mutators.len(), 2);
+        let first = patch_with(ev.mutators[0].as_ref().unwrap(), deployment(None))
+            .await
+            .unwrap();
+        assert_eq!(first["spec"]["replicas"], json!(3));
+        let second = patch_with(ev.mutators[1].as_ref().unwrap(), first)
+            .await
+            .unwrap();
+        assert_eq!(second["metadata"]["labels"]["a"], json!("1"));
+        assert_eq!(second["spec"]["replicas"], json!(3));
+    }
+
+    /// compilation.go:44: `CompileAndStoreVariables`; patchers read `variables.*`.
+    #[tokio::test]
+    async fn compile_policy_binds_spec_variables_into_every_patcher() {
+        let ev = compiled_policy(
+            &[("n", "5")],
+            vec![json_mutation(
+                r#"[JSONPatch{op: "add", path: "/spec/replicas", value: variables.n}]"#,
+            )],
+        );
+        let out = patch_with(ev.mutators[0].as_ref().unwrap(), deployment(None))
+            .await
+            .unwrap();
+        assert_eq!(out["spec"]["replicas"], json!(5));
+    }
+
+    /// compilation.go:59,66: a mutation whose payload is nil is skipped, so
+    /// the dispatcher's length check reports it.
+    #[test]
+    fn compile_policy_skips_mutations_without_a_payload() {
+        let ev = compiled_policy(
+            &[],
+            vec![
+                Mutation {
+                    patch_type: Some(PatchType::JsonPatch),
+                    json_patch: None,
+                    apply_configuration: None,
+                },
+                Mutation {
+                    patch_type: Some(PatchType::Unknown("X".into())),
+                    json_patch: None,
+                    apply_configuration: None,
+                },
+            ],
+        );
+        assert!(ev.mutators.is_empty());
     }
 }
