@@ -1395,4 +1395,55 @@ mod tests {
         );
         reset_to_defaults();
     }
+
+    // kube_features.go:2166+ edges from #3231 whose source gate was unmodelled:
+    // UserNamespacesHostNetworkSupport -> UserNamespacesSupport,
+    // WindowsCPUAndMemoryAffinity -> MemoryManager,
+    // WindowsGracefulNodeShutdown -> GracefulNodeShutdown,
+    // ServiceAccountTokenNodeBinding -> ServiceAccountTokenNodeBindingValidation,
+    // DeclarativeValidationTakeover -> DeclarativeValidation,
+    // StructuredAuthenticationConfiguration{EgressSelector,JWKSMetrics} ->
+    // StructuredAuthenticationConfiguration,
+    // UnknownVersionInteroperabilityProxy -> APIServerIdentity.
+    #[test]
+    #[serial]
+    fn dependency_edges_with_newly_modelled_sources() {
+        reset_to_defaults();
+        for (src, dep) in [
+            ("UserNamespacesHostNetworkSupport", "UserNamespacesSupport"),
+            ("UnknownVersionInteroperabilityProxy", "APIServerIdentity"),
+            ("DeclarativeValidationTakeover", "DeclarativeValidation"),
+            ("WindowsCPUAndMemoryAffinity", "MemoryManager"),
+        ] {
+            reset_to_defaults();
+            // Enable the source and disable its dependency; MemoryManager is
+            // locked on so it is covered by the enabled-dependency case below.
+            if dep == "MemoryManager" {
+                assert!(set_from_str(&format!("{src}=true")).is_ok(), "{src}");
+                continue;
+            }
+            let err = set_from_str(&format!("{src}=true,{dep}=false")).unwrap_err();
+            assert_eq!(
+                err,
+                format!("{src} is enabled, but depends on features that are disabled: [{dep}]")
+            );
+        }
+        reset_to_defaults();
+        assert_eq!(
+            set_from_str("GracefulNodeShutdown=false").unwrap_err(),
+            "[GracefulNodeShutdownBasedOnPodPriority is enabled, but depends on features that are disabled: [GracefulNodeShutdown], WindowsGracefulNodeShutdown is enabled, but depends on features that are disabled: [GracefulNodeShutdown]]"
+        );
+        reset_to_defaults();
+        // GA + LockToDefault gates (kube_features.go:1784-1794,
+        // apiserver kube_features.go:461-465).
+        assert_eq!(
+            set_from_str("ServiceAccountTokenNodeBindingValidation=false").unwrap_err(),
+            "cannot set feature gate ServiceAccountTokenNodeBindingValidation to false, feature is locked to true"
+        );
+        assert_eq!(
+            set_from_str("StructuredAuthenticationConfiguration=false").unwrap_err(),
+            "cannot set feature gate StructuredAuthenticationConfiguration to false, feature is locked to true"
+        );
+        reset_to_defaults();
+    }
 }
