@@ -477,6 +477,8 @@ impl<S: Storage + 'static> DynamicProvisionerController<S> {
                 iscsi: None,
                 local: None,
                 csi: None,
+                gce_persistent_disk: None,
+                aws_elastic_block_store: None,
                 access_modes: pvc.spec.access_modes.clone(),
                 persistent_volume_reclaim_policy: Some(reclaim_policy),
                 storage_class_name: Some(storage_class.metadata.name.clone()),

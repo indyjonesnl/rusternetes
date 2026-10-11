@@ -87,9 +87,46 @@ pub struct PersistentVolumeSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub csi: Option<CSIVolumeSource>,
 
+    /// In-tree GCE PD source (`core/v1 PersistentVolumeSource.gcePersistentDisk`);
+    /// kept so the CSI migration translator can see it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gce_persistent_disk: Option<GCEPersistentDiskVolumeSource>,
+
+    /// In-tree AWS EBS source (`core/v1 PersistentVolumeSource.awsElasticBlockStore`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aws_elastic_block_store: Option<AWSElasticBlockStoreVolumeSource>,
+
     /// volumeAttributesClassName may be used to set the VolumeAttributesClass used by this claim
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume_attributes_class_name: Option<String>,
+}
+
+/// `core/v1 GCEPersistentDiskVolumeSource`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GCEPersistentDiskVolumeSource {
+    #[serde(default, rename = "pdName")]
+    pub pd_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fs_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
+}
+
+/// `core/v1 AWSElasticBlockStoreVolumeSource`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AWSElasticBlockStoreVolumeSource {
+    #[serde(default, rename = "volumeID")]
+    pub volume_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fs_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -886,6 +923,8 @@ mod tests {
                 iscsi: None,
                 local: None,
                 csi: None,
+                gce_persistent_disk: None,
+                aws_elastic_block_store: None,
                 access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
                 persistent_volume_reclaim_policy: Some(PersistentVolumeReclaimPolicy::Retain),
                 storage_class_name: Some("manual".to_string()),

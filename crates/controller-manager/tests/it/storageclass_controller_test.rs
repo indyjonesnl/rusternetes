@@ -246,6 +246,8 @@ async fn test_storageclass_mount_options_propagation_to_pv() {
             m
         },
         spec: PersistentVolumeSpec {
+            gce_persistent_disk: None,
+            aws_elastic_block_store: None,
             capacity,
             host_path: Some(HostPathVolumeSource {
                 path: "/tmp/test-pv/needs-mount-opts".to_string(),

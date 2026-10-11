@@ -14,9 +14,12 @@
 //! `PersistentVolume`. Any other driver gets the trivial handler (every
 //! attachment is marked attached, no finalizer, no RPC).
 //!
+//! In-tree PVs are translated to CSI with the shared csi-translation-lib port
+//! (`rusternetes_common::csi_translation`, #3047).
+//!
 //! NOT ported here, each a tracked follow-up on #1460: `ReconcileVA`
-//! (`--reconcile-sync`, needs `ListVolumes` which the CSI proto subset lacks),
-//! CSI migration of in-tree PVs (`translator`), and the creation of
+//! (`--reconcile-sync`, needs `ListVolumes` which the CSI proto subset lacks;
+//! it is also the only caller of `RepairVolumeHandle`), and the creation of
 //! `VolumeAttachment`s themselves (the AttachDetachController half, upstream
 //! `pkg/volume/csi/csi_attacher.go` `Attach`).
 
@@ -24,6 +27,7 @@ use super::csi_provisioner::to_csi_access_mode;
 use super::pvc_protection::update_or_reap;
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
+use rusternetes_common::csi_translation::CsiTranslator;
 use rusternetes_common::resources::csi::{
     CSINode, VolumeAttachment, VolumeAttachmentStatus, VolumeError,
 };
@@ -346,7 +350,8 @@ impl<S: Storage + 'static> CsiAttacher<S> {
                     .add_pv_finalizer(pv)
                     .await
                     .map_err(|e| anyhow!("could not add PersistentVolume finalizer: {e}"))?;
-                pv.spec
+                // `IsPVMigratable` -> `TranslateInTreePVToCSI` (`:455-461`).
+                translate_pv(pv)?.spec
             }
             (None, Some(inline)) => {
                 if inline.csi.is_none() {
@@ -484,7 +489,10 @@ impl<S: Storage + 'static> CsiAttacher<S> {
                     "both InlineCSIVolumeSource and PersistentVolumeName specified in VA source"
                 ))
             }
-            (Some(pv_name), None) => self.get_pv(pv_name).await?.spec,
+            (Some(pv_name), None) => {
+                // `IsPVMigratable` -> `TranslateInTreePVToCSI` (`:550-556`).
+                translate_pv(self.get_pv(pv_name).await?)?.spec
+            }
             (None, Some(inline)) => {
                 if inline.csi.is_none() {
                     return Err(anyhow!("inline volume spec contains nil CSI source"));
@@ -579,9 +587,9 @@ impl<S: Storage + 'static> CsiAttacher<S> {
         Ok(self.storage.update(&key, &pv).await?)
     }
 
-    /// `SyncNewOrUpdatedPersistentVolume` (`csi_handler.go:647-722`), minus the
-    /// migration branch: a PV being deleted that still carries this driver's
-    /// finalizer loses it once no VolumeAttachment references the PV.
+    /// `SyncNewOrUpdatedPersistentVolume` (`csi_handler.go:647-722`): a PV that
+    /// [`process_finalizers`] selects loses this driver's finalizer once no
+    /// VolumeAttachment references the PV.
     async fn sync_persistent_volumes(&self) -> Result<()> {
         let finalizer = finalizer_name(&self.driver_name);
         let pvs: Vec<PersistentVolume> = self
@@ -590,14 +598,7 @@ impl<S: Storage + 'static> CsiAttacher<S> {
             .await?;
         let candidates: Vec<PersistentVolume> = pvs
             .into_iter()
-            .filter(|pv| {
-                pv.metadata.deletion_timestamp.is_some()
-                    && pv
-                        .metadata
-                        .finalizers
-                        .as_ref()
-                        .is_some_and(|f| f.contains(&finalizer))
-            })
+            .filter(|pv| process_finalizers(pv, &self.driver_name))
             .collect();
         if candidates.is_empty() {
             return Ok(());
@@ -719,6 +720,53 @@ fn empty_status() -> VolumeAttachmentStatus {
         attach_error: None,
         detach_error: None,
     }
+}
+
+/// `annMigratedTo` (`controller.go:44`).
+const ANN_MIGRATED_TO: &str = "pv.kubernetes.io/migrated-to";
+
+/// The `IsPVMigratable` + `TranslateInTreePVToCSI` pair that `csiAttach`,
+/// `csiDetach` and `getProcessedPVSpec` apply to a PV read from the lister
+/// (`csi_handler.go:411-416`, `:455-461`, `:550-556`).
+fn translate_pv(pv: PersistentVolume) -> Result<PersistentVolume> {
+    let translator = CsiTranslator::new();
+    if translator.is_pv_migratable(&pv) {
+        return translator
+            .translate_in_tree_pv_to_csi(&pv)
+            .map_err(|e| anyhow!("failed to translate in tree pv to CSI: {e}"));
+    }
+    Ok(pv)
+}
+
+/// `processFinalizers` (`controller.go:264-283`), which also subsumes the
+/// no-deletion-timestamp gate of `SyncNewOrUpdatedPersistentVolume`
+/// (`csi_handler.go:647-679`): a PV carrying this attacher's finalizer is
+/// processed when it is being deleted, or when it is an in-tree PV that lacks
+/// a matching `pv.kubernetes.io/migrated-to` annotation (CSI migration is off
+/// or rolled back, so control of the PV goes back to kube-controller-manager).
+fn process_finalizers(pv: &PersistentVolume, driver_name: &str) -> bool {
+    let finalizer = finalizer_name(driver_name);
+    if !pv
+        .metadata
+        .finalizers
+        .as_ref()
+        .is_some_and(|f| f.contains(&finalizer))
+    {
+        return false;
+    }
+    if pv.metadata.deletion_timestamp.is_some() {
+        return true;
+    }
+    if CsiTranslator::new().is_pv_migratable(pv) {
+        // migrated-to annotation detected, keep the finalizer
+        return pv
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get(ANN_MIGRATED_TO))
+            .is_none_or(|d| d != driver_name);
+    }
+    false
 }
 
 /// `getCSISource` (`csi_handler.go:389-397`).
