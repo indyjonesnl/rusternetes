@@ -17,11 +17,16 @@
 //! In-tree PVs are translated to CSI with the shared csi-translation-lib port
 //! (`rusternetes_common::csi_translation`, #3047).
 //!
-//! NOT ported here, each a tracked follow-up on #1460: `ReconcileVA`
-//! (`--reconcile-sync`, needs `ListVolumes` which the CSI proto subset lacks;
-//! it is also the only caller of `RepairVolumeHandle`), and the creation of
-//! `VolumeAttachment`s themselves (the AttachDetachController half, upstream
-//! `pkg/volume/csi/csi_attacher.go` `Attach`).
+//! `ReconcileVA` (`--reconcile-sync`, `csi_handler.go:122-210`) compares the
+//! driver's `ListVolumes` published nodes (only for a driver reporting
+//! `LIST_VOLUMES` and `LIST_VOLUMES_PUBLISHED_NODES`, `main.go:335`) with
+//! `VolumeAttachment.status.attached` and force-syncs a mismatch
+//! (`setForceSync` / `consumeForceSync`, `:212-232`); it is the only caller of
+//! `RepairVolumeHandle`.
+//!
+//! NOT ported here: the creation of `VolumeAttachment`s themselves (the
+//! AttachDetachController half, upstream `pkg/volume/csi/csi_attacher.go`
+//! `Attach`).
 
 use super::csi_provisioner::to_csi_access_mode;
 use super::pvc_protection::update_or_reap;
@@ -45,7 +50,7 @@ use rusternetes_csi::proto::{
     ControllerPublishVolumeRequest, ControllerUnpublishVolumeRequest, VolumeCapability,
 };
 use rusternetes_storage::{build_key, build_prefix, Storage};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
@@ -60,6 +65,11 @@ const RETRY_INTERVAL_MAX: Duration = Duration::from_secs(300);
 pub const ATTACH_TIMEOUT: Duration = Duration::from_secs(15);
 /// `--worker-threads` (`main.go:71`).
 const WORKERS: usize = 10;
+/// `--reconcile-sync` (`main.go:76`): the resync interval of the
+/// VolumeAttachment reconciler.
+const RECONCILE_SYNC: Duration = Duration::from_secs(60);
+/// `--max-entries`: `ListVolumes` page size; 0 lets the driver pick.
+const MAX_ENTRIES: i32 = 0;
 /// Resync when no event arrives; also bounds how late a backed-off retry runs.
 const RESYNC: Duration = Duration::from_secs(15);
 
@@ -109,6 +119,9 @@ struct Caps {
     attach: bool,
     read_only: bool,
     single_node_multi_writer: bool,
+    /// `supportsListVolumesPublishedNodes` (`main.go:335`): `LIST_VOLUMES` and
+    /// `LIST_VOLUMES_PUBLISHED_NODES`.
+    list_volumes_published_nodes: bool,
 }
 
 impl Caps {
@@ -122,6 +135,9 @@ impl Caps {
                     .contains(&ControllerRpc::PublishUnpublishVolume),
             read_only: c.controller.contains(&ControllerRpc::PublishReadonly),
             single_node_multi_writer: c.controller.contains(&ControllerRpc::SingleNodeMultiWriter),
+            list_volumes_published_nodes: c.controller.contains(&ControllerRpc::ListVolumes)
+                && c.controller
+                    .contains(&ControllerRpc::ListVolumesPublishedNodes),
         }
     }
 }
@@ -138,6 +154,10 @@ pub struct CsiAttacher<S: Storage> {
     retries: Mutex<HashMap<String, (u32, Instant)>>,
     retry_start: Duration,
     retry_max: Duration,
+    /// `forceSync` (`csi_handler.go:73`): VolumeAttachments whose next
+    /// processing must attach or detach even when `status.attached` /
+    /// the finalizer already show the desired state.
+    force_sync: Mutex<HashSet<String>>,
 }
 
 impl<S: Storage + 'static> CsiAttacher<S> {
@@ -155,6 +175,7 @@ impl<S: Storage + 'static> CsiAttacher<S> {
             retries: Mutex::new(HashMap::new()),
             retry_start: RETRY_INTERVAL_START,
             retry_max: RETRY_INTERVAL_MAX,
+            force_sync: Mutex::new(HashSet::new()),
         }
     }
 
@@ -170,7 +191,11 @@ impl<S: Storage + 'static> CsiAttacher<S> {
     /// resync tick, runs one reconcile pass.
     pub async fn run(self: Arc<Self>) -> Result<()> {
         info!("Starting CSI attacher for driver {}", self.driver_name);
+        // `wait.UntilWithContext(ctx, ReconcileVA, reconcileSync)`
+        // (`controller.go:153-164`): runs at once, then every interval.
+        let mut next_reconcile_va = Instant::now();
         loop {
+            self.reconcile_va_if_due(&mut next_reconcile_va).await;
             if let Err(e) = self.reconcile_all().await {
                 error!("CSI attacher {}: reconcile failed: {e:#}", self.driver_name);
             }
@@ -189,7 +214,9 @@ impl<S: Storage + 'static> CsiAttacher<S> {
                 }
             };
             loop {
-                let wake = self.next_wake();
+                let wake = self
+                    .next_wake()
+                    .min(next_reconcile_va.saturating_duration_since(Instant::now()));
                 let again = tokio::select! {
                     ev = va_watch.next() => matches!(ev, Some(Ok(_))),
                     ev = pv_watch.next() => matches!(ev, Some(Ok(_))),
@@ -198,10 +225,26 @@ impl<S: Storage + 'static> CsiAttacher<S> {
                 if !again {
                     break;
                 }
+                // Same task as the pass below, so a forced re-sync never races
+                // the ordinary one (`csi_handler.go:201-204`).
+                self.reconcile_va_if_due(&mut next_reconcile_va).await;
                 if let Err(e) = self.reconcile_all().await {
                     error!("CSI attacher {}: reconcile failed: {e:#}", self.driver_name);
                 }
             }
+        }
+    }
+
+    async fn reconcile_va_if_due(&self, next: &mut Instant) {
+        if Instant::now() < *next {
+            return;
+        }
+        *next = Instant::now() + RECONCILE_SYNC;
+        if let Err(e) = self.reconcile_va().await {
+            error!(
+                "CSI attacher {}: failed to reconcile VolumeAttachment: {e:#}",
+                self.driver_name
+            );
         }
     }
 
@@ -239,7 +282,21 @@ impl<S: Storage + 'static> CsiAttacher<S> {
         self.sync_persistent_volumes().await
     }
 
+    /// `setForceSync` (`csi_handler.go:212-219`).
+    fn set_force_sync(&self, name: &str) {
+        self.force_sync.lock().unwrap().insert(name.to_string());
+    }
+
+    /// `consumeForceSync` (`csi_handler.go:221-232`): true once per request.
+    fn consume_force_sync(&self, name: &str) -> bool {
+        self.force_sync.lock().unwrap().remove(name)
+    }
+
     fn due(&self, name: &str) -> bool {
+        // `vaQueue.Add` ignores the rate limiter: a forced VA runs at once.
+        if self.force_sync.lock().unwrap().contains(name) {
+            return true;
+        }
         self.retries
             .lock()
             .unwrap()
@@ -273,9 +330,150 @@ impl<S: Storage + 'static> CsiAttacher<S> {
         }
     }
 
-    /// STUB (red phase).
+    /// `ReconcileVA` (`csi_handler.go:122-210`): list the volumes of the CSI
+    /// driver and compare, per VolumeAttachment of this driver, whether the
+    /// volume is published to the node with `status.attached`. A mismatch
+    /// force-syncs the VolumeAttachment ("we avoid UPDATE on the VA or forcing
+    /// a direct attach/detach as to avoid race conditions with the main
+    /// attacher queue", `:201-204`): the next [`Self::reconcile_all`] pass
+    /// attaches or detaches it regardless of its recorded state.
+    ///
+    /// Only for a driver that reports `LIST_VOLUMES`,
+    /// `LIST_VOLUMES_PUBLISHED_NODES` and `PUBLISH_UNPUBLISH_VOLUME`
+    /// (`main.go:231-266`; the trivial handler has no reconciler).
     pub async fn reconcile_va(&self) -> Result<()> {
+        let caps = self.caps().await?;
+        if !caps.attach || !caps.list_volumes_published_nodes {
+            return Ok(());
+        }
+        debug!("Reconciling VolumeAttachments with driver backend state");
+        let vas: Vec<VolumeAttachment> = self
+            .storage
+            .list(&build_prefix("volumeattachments", None))
+            .await
+            .map_err(|_| anyhow!("failed to list all VolumeAttachment objects"))?;
+        let published = self
+            .client
+            .list_volumes(MAX_ENTRIES)
+            .await
+            .map_err(|e| anyhow!("failed to ListVolumes: {e}"))?;
+        for va in vas {
+            // skip VolumeAttachments of other CSI drivers
+            if va.spec.attacher != self.driver_name {
+                continue;
+            }
+            let name = &va.metadata.name;
+            let node_id = match self.node_id(&va.spec.node_name, Some(&va)).await {
+                Ok(n) => n,
+                Err(e) => {
+                    error!("Failed to find node ID err: {e:#}");
+                    continue;
+                }
+            };
+            let spec = match self.processed_pv_spec(&va).await {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("Failed to get PV Spec: {e:#}");
+                    continue;
+                }
+            };
+            let source = match csi_source(&spec) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("Failed to get CSI Source: {e:#}");
+                    continue;
+                }
+            };
+            // `GetVolumeHandle` (`util.go`): the handle must be set.
+            let mut volume_handle = match source.volume_handle.as_deref() {
+                Some(h) if !h.is_empty() => h.to_string(),
+                _ => {
+                    error!("Failed to get volume handle: volume handle of {name} is empty");
+                    continue;
+                }
+            };
+            let attached = va.status.as_ref().is_some_and(|s| s.attached);
+
+            // If volume driver has corresponding in-tree plugin, generate a
+            // correct volumehandle.
+            match self.is_migratable(&va).await {
+                Err(e) => {
+                    error!(
+                        "Failed to check if migratable for volume handle {volume_handle} \
+                         (sourceDriver {}): {e:#}",
+                        source.driver
+                    );
+                    continue;
+                }
+                Ok(true) => {
+                    match CsiTranslator::new().repair_volume_handle(
+                        &source.driver,
+                        &volume_handle,
+                        &node_id,
+                    ) {
+                        Ok(h) => volume_handle = h,
+                        Err(e) => {
+                            error!(
+                                "Failed to repair volume handle {volume_handle} for driver {}: {e}",
+                                source.driver
+                            );
+                            continue;
+                        }
+                    }
+                }
+                Ok(false) => {}
+            }
+
+            // Check whether the volume is published to this node.
+            let found = published
+                .get(&volume_handle)
+                .is_some_and(|nodes| nodes.contains(&node_id));
+
+            // If the ListVolumes attached status is different, force a re-sync.
+            if attached != found {
+                error!(
+                    "VolumeAttachment attached status and actual state do not match. Adding back \
+                     to VolumeAttachment queue for forced reprocessing: VolumeAttachment={name} \
+                     volumeHandle={volume_handle} attachedStatus={attached} found={found}"
+                );
+                self.set_force_sync(name);
+            }
+        }
         Ok(())
+    }
+
+    /// `getProcessedPVSpec` (`csi_handler.go`): the CSI-translated PV spec, or
+    /// the inline volume spec.
+    async fn processed_pv_spec(&self, va: &VolumeAttachment) -> Result<PersistentVolumeSpec> {
+        match (
+            &va.spec.source.persistent_volume_name,
+            &va.spec.source.inline_volume_spec,
+        ) {
+            (Some(_), Some(_)) => Err(anyhow!(
+                "both InlineCSIVolumeSource and PersistentVolumeName specified in VA source"
+            )),
+            (Some(pv_name), None) => Ok(translate_pv(self.get_pv(pv_name).await?)?.spec),
+            (None, Some(inline)) => Ok(inline.clone()),
+            (None, None) => Err(anyhow!(
+                "neither InlineCSIVolumeSource nor PersistentVolumeName specified in VA source"
+            )),
+        }
+    }
+
+    /// `isMigratable` (`csi_handler.go:372-387`): could the PV (or inline
+    /// volume) behind the VA have migrated from in-tree to CSI.
+    async fn is_migratable(&self, va: &VolumeAttachment) -> Result<bool> {
+        if let Some(pv_name) = &va.spec.source.persistent_volume_name {
+            let pv = self.get_pv(pv_name).await?;
+            Ok(CsiTranslator::new().is_pv_migratable(&pv))
+        } else if let Some(inline) = &va.spec.source.inline_volume_spec {
+            if inline.csi.is_none() {
+                return Err(anyhow!("inline volume spec contains nil CSI source"));
+            }
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     async fn caps(&self) -> Result<Caps> {
@@ -298,7 +496,9 @@ impl<S: Storage + 'static> CsiAttacher<S> {
     /// (`trivial_handler.go:49-65`) for a driver that cannot publish.
     async fn sync_attach(&self, va: &VolumeAttachment) -> Result<()> {
         let attached = va.status.as_ref().is_some_and(|s| s.attached);
-        if attached {
+        // Always consume, like `!h.consumeForceSync(...) && ...` (`:257`).
+        let force = self.consume_force_sync(&va.metadata.name);
+        if !force && attached {
             // Volume is attached and no force sync, there is nothing to be done.
             return Ok(());
         }
@@ -468,7 +668,8 @@ impl<S: Storage + 'static> CsiAttacher<S> {
             .finalizers
             .as_ref()
             .is_some_and(|f| f.contains(&finalizer));
-        if !has_finalizer {
+        let force = self.consume_force_sync(&va.metadata.name);
+        if !force && !has_finalizer {
             // The attachment is already detached.
             return Ok(());
         }

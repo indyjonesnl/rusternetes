@@ -345,14 +345,47 @@ impl CsiControllerClient {
     }
 
     /// `CSIVolumeLister.ListVolumes` (external-attacher `pkg/attacher/lister.go:41-69`):
-    /// pages through `ListVolumes` and returns volume ID -> published node IDs.
-    /// STUB (red phase): see the commit that follows.
+    /// pages through `ListVolumes` (`StartingToken` / `NextToken`, `MaxEntries`
+    /// = `--max-entries`) and returns volume ID -> published node IDs. Entries
+    /// without a volume or a status are skipped (`:55-57`). Each page is one
+    /// operation under the client timeout; an error fails the whole listing
+    /// (`:50-52`), never yielding a partial map.
     pub async fn list_volumes(
         &self,
-        _max_entries: i32,
+        max_entries: i32,
     ) -> Result<HashMap<String, Vec<String>>, ControllerError> {
-        let _ = ListVolumesRequest::default();
-        Ok(HashMap::new())
+        let mut published = HashMap::new();
+        let mut token = String::new();
+        loop {
+            let resp = self
+                .call(
+                    ControllerClient::new(self.channel()?).list_volumes(ListVolumesRequest {
+                        starting_token: token,
+                        max_entries,
+                    }),
+                )
+                .await
+                .map_err(|e| match e {
+                    ControllerError::Grpc(s) => {
+                        ControllerError::Grpc(Box::new(tonic::Status::new(
+                            s.code(),
+                            format!("failed to list volumes: {}", s.message()),
+                        )))
+                    }
+                    other => other,
+                })?;
+            for e in resp.entries {
+                let (Some(volume), Some(status)) = (e.volume, e.status) else {
+                    continue;
+                };
+                published.insert(volume.volume_id, status.published_node_ids);
+            }
+            token = resp.next_token;
+            if token.is_empty() {
+                break;
+            }
+        }
+        Ok(published)
     }
 
     /// `CreateSnapshot`, gated on `CREATE_DELETE_SNAPSHOT` (external-snapshotter).
