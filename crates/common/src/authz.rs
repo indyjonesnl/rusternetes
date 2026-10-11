@@ -59,6 +59,10 @@ pub struct RequestAttributes {
     /// The API group of the resource
     pub api_group: String,
 
+    /// The API version of the resource (upstream `Attributes.GetAPIVersion`,
+    /// `authorizer/interfaces.go`). Empty when the caller did not set it.
+    pub api_version: String,
+
     /// The resource type (pods, services, deployments, etc.)
     pub resource: String,
 
@@ -82,6 +86,7 @@ impl RequestAttributes {
             verb: verb.into(),
             namespace: None,
             api_group: String::new(),
+            api_version: String::new(),
             resource: resource.into(),
             name: None,
             subresource: None,
@@ -100,6 +105,7 @@ impl RequestAttributes {
             verb: verb.into(),
             namespace: None,
             api_group: String::new(),
+            api_version: String::new(),
             resource: String::new(),
             name: None,
             subresource: None,
@@ -115,6 +121,11 @@ impl RequestAttributes {
 
     pub fn with_api_group(mut self, api_group: impl Into<String>) -> Self {
         self.api_group = api_group.into();
+        self
+    }
+
+    pub fn with_api_version(mut self, api_version: impl Into<String>) -> Self {
+        self.api_version = api_version.into();
         self
     }
 
