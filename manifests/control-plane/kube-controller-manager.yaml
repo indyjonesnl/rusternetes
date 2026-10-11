@@ -55,6 +55,10 @@ spec:
     # with the allocator flags when ALLOCATE_NODE_CIDRS is set in its environment
     # (the Calico stack does this — see compose.calico.yml), and otherwise
     # strips it. Off by default, so conformance/sqlite/etcd stacks are unchanged.
+    # @CSI_ATTACH_ARGS@ works the same way for CSI_ATTACHERS (comma-separated
+    # DRIVER=SOCKET -> one --csi-attacher each) and ATTACH_DETACH_CONTROLLER=1
+    # (--attach-detach-controller); both off by default (#3128). The driver
+    # sockets must be reachable from the pod (add a hostPath volume).
     args:
     - "--api-server-url"
     - "https://api-server:6443"
@@ -63,6 +67,7 @@ spec:
     - "--sync-interval"
     - "5"
 @NODE_IPAM_ARGS@
+@CSI_ATTACH_ARGS@
     volumeMounts:
     - name: certs
       mountPath: "@CERTS_PATH@"

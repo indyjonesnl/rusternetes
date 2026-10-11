@@ -140,6 +140,19 @@ pub struct ControllerManagerConfig {
     /// (`pkg/controller/serviceaccount/config/v1alpha1/defaults.go:44`:
     /// 365 days; see `DEFAULT_CLEAN_UP_PERIOD`).
     pub legacy_sa_token_clean_up_period: std::time::Duration,
+    /// One CSI external-attacher per `(driver name, controller socket)`: the
+    /// `--csi-attacher DRIVER=SOCKET` flag of the standalone binary (#1460).
+    /// Upstream runs each external-attacher as its own sidecar per driver
+    /// (kubernetes-csi/external-attacher `cmd/csi-attacher/main.go`,
+    /// `--csi-address`), so there is one attacher per entry. Empty = none.
+    pub csi_attachers: Vec<(String, String)>,
+    /// Run the AttachDetachController (#3048), the `VolumeAttachment`-creating
+    /// consumer of the attacher. Upstream registers it unconditionally
+    /// (`cmd/kube-controller-manager/app/core.go:351-357`,
+    /// `persistentvolume-attach-detach-controller`); here it stays opt-in
+    /// (`--attach-detach-controller`), matching the standalone binary, because
+    /// it is only useful together with a CSI attacher.
+    pub attach_detach_controller: bool,
 }
 
 /// Run the controller-manager against a storage backend directly (all-in-one
@@ -333,6 +346,32 @@ where
             error!("Dynamic Provisioner controller error: {}", e);
         }
     }));
+
+    // One CSI external-attacher per driver (#3128), mirroring the standalone
+    // binary's `--csi-attacher` loop.
+    for (driver, socket) in &config.csi_attachers {
+        let s = storage_for("CSIAttacher");
+        let attacher = Arc::new(controllers::csi_attacher::CsiAttacher::new(
+            s,
+            driver,
+            rusternetes_csi::controller_client::CsiControllerClient::with_endpoint(socket),
+        ));
+        handles.push(tokio::spawn(async move {
+            if let Err(e) = attacher.run().await {
+                error!("CSI attacher error: {e}");
+            }
+        }));
+    }
+
+    if config.attach_detach_controller {
+        let s = storage_for("AttachDetach");
+        let c = Arc::new(controllers::attach_detach::AttachDetachController::new(s));
+        handles.push(tokio::spawn(async move {
+            if let Err(e) = c.run().await {
+                error!("AttachDetach controller error: {e}");
+            }
+        }));
+    }
 
     let s = storage_for("VolumeSnapshot");
     handles.push(tokio::spawn(async move {
@@ -675,6 +714,8 @@ mod per_controller_client_tests {
                 node_ipam: None,
                 legacy_sa_token_clean_up_period:
                     controllers::legacy_serviceaccount_token_cleaner::DEFAULT_CLEAN_UP_PERIOD,
+                csi_attachers: Vec::new(),
+                attach_detach_controller: false,
             },
         );
         for h in &handles {
@@ -706,5 +747,52 @@ mod per_controller_client_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod csi_attach_wiring_tests {
+    use super::*;
+    use rusternetes_storage::MemoryStorage;
+
+    fn count(csi_attachers: Vec<(String, String)>, attach_detach_controller: bool) -> usize {
+        let storage = Arc::new(MemoryStorage::new());
+        let handles = spawn_controllers(
+            |_| storage.clone(),
+            ControllerManagerConfig {
+                sync_interval: 3600,
+                metrics_config: None,
+                ca_cert_pem: None,
+                node_ipam: None,
+                legacy_sa_token_clean_up_period:
+                    controllers::legacy_serviceaccount_token_cleaner::DEFAULT_CLEAN_UP_PERIOD,
+                csi_attachers,
+                attach_detach_controller,
+            },
+        );
+        for h in &handles {
+            h.abort();
+        }
+        handles.len()
+    }
+
+    /// #3128: the all-in-one / API-mode controller set starts the CSI
+    /// external-attacher (one per driver) and the AttachDetachController only
+    /// when asked, exactly like the standalone binary's `--csi-attacher` /
+    /// `--attach-detach-controller` (both opt-in).
+    #[tokio::test]
+    async fn csi_attacher_and_attach_detach_are_opt_in() {
+        let base = count(Vec::new(), false);
+        assert_eq!(count(Vec::new(), true), base + 1);
+        let one = vec![(
+            "hostpath.csi.k8s.io".to_string(),
+            "/tmp/csi.sock".to_string(),
+        )];
+        assert_eq!(count(one.clone(), false), base + 1);
+        let two = vec![
+            one[0].clone(),
+            ("b.csi".to_string(), "/tmp/b.sock".to_string()),
+        ];
+        assert_eq!(count(two, true), base + 3);
     }
 }
