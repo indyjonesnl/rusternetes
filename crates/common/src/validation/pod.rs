@@ -1056,7 +1056,7 @@ fn validate_sysctls(sc: &PodSecurityContext, fld_path: &Path) -> ErrorList {
 ///
 /// Mirrors upstream `validateContainer` / `validateInitContainer`
 /// (`pkg/apis/core/validation/validation.go`, release-1.35).
-fn validate_container(
+pub(crate) fn validate_container(
     c: &Container,
     is_init: bool,
     volume_names: &HashSet<&str>,

@@ -35,9 +35,6 @@ use crate::registry::rest::{
     RestUpdateStrategy, TransformFunc, UpdatedObjectInfo,
 };
 
-/// `api.MirrorPodAnnotationKey`.
-const MIRROR_POD_ANNOTATION_KEY: &str = "kubernetes.io/config.mirror";
-
 /// What decoding a Pod does beyond the field mapping: `SetDefaults_PodSpec`,
 /// `SetDefaults_Container` and `SetDefaults_Probe` (pkg/apis/core/v1/
 /// defaults.go), and the Pod-only defaults (`enableServiceLinks`, limits to
@@ -614,83 +611,17 @@ impl RestUpdateStrategy<Pod> for EphemeralContainersStrategy {
         update_pod_generation(obj, old);
     }
 
-    /// `ValidatePodEphemeralContainersUpdate` (validation.go:6181-6212):
-    /// existing ephemeral containers may be neither removed nor changed.
+    /// `ValidatePodEphemeralContainersUpdate` (validation.go:6181-6212),
+    /// ported in `validation::pod_subresource`.
     fn validate_update(&self, _ctx: &RequestContext, obj: &Pod, old: &Pod) -> ErrorList {
-        let mut errs =
-            validate_object_meta_update(&obj.metadata, &old.metadata, &Path::new("metadata"));
-        // static pods don't support ephemeral containers #113935
-        if old
-            .metadata
-            .annotations
-            .as_ref()
-            .is_some_and(|a| a.contains_key(MIRROR_POD_ANNOTATION_KEY))
-        {
-            return vec![FieldError::forbidden(
-                &Path::new(""),
-                "static pods do not support ephemeral containers",
-            )];
-        }
-        let new_containers = obj
-            .spec
-            .as_ref()
-            .and_then(|s| s.ephemeral_containers.as_deref())
-            .unwrap_or(&[]);
-        let old_containers = old
-            .spec
-            .as_ref()
-            .and_then(|s| s.ephemeral_containers.as_deref())
-            .unwrap_or(&[]);
-        let spec_path = Path::new("spec").child("ephemeralContainers");
-        for old_container in old_containers {
-            match new_containers.iter().find(|c| c.name == old_container.name) {
-                None => errs.push(FieldError::forbidden(
-                    &spec_path,
-                    format!(
-                        "existing ephemeral containers {:?} may not be removed\n",
-                        old_container.name
-                    ),
-                )),
-                Some(new_container)
-                    if !semantic_equal(
-                        &with_plain_bools_unset(old_container),
-                        &with_plain_bools_unset(new_container),
-                    ) =>
-                {
-                    errs.push(FieldError::forbidden(
-                        &spec_path,
-                        format!(
-                            "existing ephemeral containers {:?} may not be changed\n",
-                            old_container.name
-                        ),
-                    ))
-                }
-                Some(_) => {}
-            }
-        }
-        errs
+        rusternetes_common::validation::pod_subresource::validate_pod_ephemeral_containers_update(
+            obj, old,
+        )
     }
 
     fn allow_unconditional_update(&self) -> bool {
         true
     }
-}
-
-/// `Stdin`, `StdinOnce` and `TTY` are plain `bool`s in `v1.EphemeralContainerCommon`
-/// and `core.EphemeralContainerCommon` (core/v1/types.go), so `false` and
-/// absent are one value to `apiequality.Semantic.DeepEqual`. They are
-/// `Option<bool>` here, and the protobuf client writes every one of them
-/// (`stdinOnce: false`), so an unchanged container reads back different (#2382).
-fn with_plain_bools_unset(
-    c: &rusternetes_common::resources::pod::EphemeralContainer,
-) -> rusternetes_common::resources::pod::EphemeralContainer {
-    let mut c = c.clone();
-    for b in [&mut c.stdin, &mut c.stdin_once, &mut c.tty] {
-        if *b == Some(false) {
-            *b = None;
-        }
-    }
-    c
 }
 
 /// `podResizeStrategy` (strategy.go:357-): the update strategy of `/resize`.
@@ -782,45 +713,10 @@ impl RestUpdateStrategy<Pod> for ResizeStrategy {
         }
     }
 
-    /// `ValidatePodResize` (validation.go:6217-): only `resources` and
-    /// `resizePolicy` of the containers may differ, so those are reset to the
-    /// old values before the update fence compares the specs.
+    /// `ValidatePodResize` (validation.go:6217-6346), ported in
+    /// `validation::pod_subresource`.
     fn validate_update(&self, _ctx: &RequestContext, obj: &Pod, old: &Pod) -> ErrorList {
-        let mut errs =
-            validate_object_meta_update(&obj.metadata, &old.metadata, &Path::new("metadata"));
-        if old
-            .metadata
-            .annotations
-            .as_ref()
-            .is_some_and(|a| a.contains_key(MIRROR_POD_ANNOTATION_KEY))
-        {
-            return vec![FieldError::forbidden(
-                &Path::new(""),
-                "static pods cannot be resized",
-            )];
-        }
-        if let (Some(old_spec), Some(new_spec)) = (old.spec.as_ref(), obj.spec.as_ref()) {
-            let mut munged = new_spec.clone();
-            for (i, c) in munged.containers.iter_mut().enumerate() {
-                if let Some(o) = old_spec.containers.get(i) {
-                    c.resources = o.resources.clone();
-                    c.resize_policy = o.resize_policy.clone();
-                }
-            }
-            if let (Some(old_init), Some(new_init)) = (
-                old_spec.init_containers.as_ref(),
-                munged.init_containers.as_mut(),
-            ) {
-                for (i, c) in new_init.iter_mut().enumerate() {
-                    if let Some(o) = old_init.get(i) {
-                        c.resources = o.resources.clone();
-                        c.resize_policy = o.resize_policy.clone();
-                    }
-                }
-            }
-            errs.extend(validate_spec_update(old_spec, &munged, false));
-        }
-        errs
+        rusternetes_common::validation::pod_subresource::validate_pod_resize(obj, old)
     }
 
     fn allow_unconditional_update(&self) -> bool {
