@@ -513,7 +513,7 @@ impl CriContainerRuntime {
             &self.cluster_domain,
             &host,
             &self.resolv_conf,
-            &[],
+            &self.node_ips,
         );
         for ev in events {
             match ev.target {
