@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use rusternetes_common::cel::CELEvaluator;
-use rusternetes_common::cel_struct;
+use rusternetes_common::cel_struct::{self, TypeCheck};
 use serde_json::{Map, Value};
 
 use super::policy_json_patch::evaluate_expression;
@@ -63,7 +63,13 @@ impl Patcher for ApplyConfigPatcher {
                 },
             ));
         }
-        let value = evaluate_expression(&self.evaluator, &self.expression, &self.variables, r)?;
+        let value = evaluate_expression(
+            &self.evaluator,
+            &self.expression,
+            &self.variables,
+            r,
+            TypeCheck::Root,
+        )?;
         // smd.go:87-90, :104-107: the compiler ensures an `Object`.
         let Value::Object(mut patch) = value else {
             return Err(PatchError::Other(format!(
@@ -318,6 +324,37 @@ mod tests {
         .unwrap_err();
         assert!(
             err.contains("type mismatch: unexpected type name \"Object.specx\", expected \"Object.spec\", which matches field name path from root Object type"),
+            "{err}"
+        );
+    }
+
+    // `CheckTypeNamesMatchFieldPathNames` runs on the EVALUATED ObjectVal
+    // (smd.go:99-102), so a struct reaching a field through a composited
+    // variable is checked too (#2944).
+    #[test]
+    fn type_name_mismatch_through_a_variable_is_rejected() {
+        let versioned = VersionedAttributes {
+            versioned_kind: GroupVersionKind {
+                group: "apps".into(),
+                version: "v1".into(),
+                kind: "Deployment".into(),
+            },
+            versioned_object: Some(json!({"spec": {"replicas": 1}})),
+            versioned_old_object: None,
+            dirty: false,
+        };
+        let gvr = GroupVersionResource {
+            group: "apps".into(),
+            version: "v1".into(),
+            resource: "deployments".into(),
+        };
+        let p = ApplyConfigPatcher::new_patcher_with_variables(
+            "Object{spec: variables.s}",
+            &[("s".to_string(), "Object.wrong{replicas: 2}".to_string())],
+        );
+        let err = run_with(p, versioned, gvr).unwrap_err();
+        assert!(
+            err.contains("type mismatch: unexpected type name \"Object.wrong\", expected \"Object.spec\", which matches field name path from root Object type"),
             "{err}"
         );
     }
