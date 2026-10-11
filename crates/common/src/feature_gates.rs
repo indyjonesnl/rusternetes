@@ -1072,4 +1072,48 @@ mod tests {
         assert!(set_from_str("DRADeviceTaintRules=true,DRADeviceTaints=true").is_ok());
         reset_to_defaults();
     }
+
+    // kube_features.go:2166+ edges whose target was previously unmodelled
+    // (#3222): GangScheduling -> GenericWorkload,
+    // GracefulNodeShutdownBasedOnPodPriority -> GracefulNodeShutdown,
+    // RestartAllContainersOnContainerExits -> {ContainerRestartRules,
+    // NodeDeclaredFeatures}.
+    #[test]
+    #[serial]
+    fn dependencies_on_formerly_unmodelled_gates() {
+        reset_to_defaults();
+        assert_eq!(
+            set_from_str("GangScheduling=true").unwrap_err(),
+            "GangScheduling is enabled, but depends on features that are disabled: [GenericWorkload]"
+        );
+        assert!(set_from_str("GangScheduling=true,GenericWorkload=true").is_ok());
+        reset_to_defaults();
+        assert_eq!(
+            set_from_str("GracefulNodeShutdown=false").unwrap_err(),
+            "GracefulNodeShutdownBasedOnPodPriority is enabled, but depends on features that are disabled: [GracefulNodeShutdown]"
+        );
+        reset_to_defaults();
+        assert_eq!(
+            set_from_str("RestartAllContainersOnContainerExits=true").unwrap_err(),
+            "RestartAllContainersOnContainerExits is enabled, but depends on features that are disabled: [NodeDeclaredFeatures]"
+        );
+        assert!(set_from_str(
+            "RestartAllContainersOnContainerExits=true,NodeDeclaredFeatures=true"
+        )
+        .is_ok());
+        reset_to_defaults();
+    }
+
+    // DynamicResourceAllocation is GA + LockToDefault in 1.35
+    // (kube_features.go:1293-1296), so it can not be switched off.
+    #[test]
+    #[serial]
+    fn dynamic_resource_allocation_is_locked_on() {
+        reset_to_defaults();
+        assert_eq!(
+            set_from_str("DynamicResourceAllocation=false").unwrap_err(),
+            "cannot set feature gate DynamicResourceAllocation to false, feature is locked to true"
+        );
+        reset_to_defaults();
+    }
 }
