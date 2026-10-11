@@ -30,6 +30,7 @@ pub mod coordination;
 pub mod core;
 pub mod discovery;
 pub mod flowcontrol;
+pub mod gateway;
 pub mod generic;
 pub mod metadata;
 pub mod names;

@@ -92,6 +92,8 @@ const LIST_URLS: &[&str] = &[
     "/apis/rbac.authorization.k8s.io/v1/rolebindings",
     "/apis/rbac.authorization.k8s.io/v1/roles",
     "/apis/resource.k8s.io/v1/deviceclasses",
+    "/apis/gateway.networking.k8s.io/v1beta1/namespaces/default/referencegrants",
+    "/apis/gateway.networking.k8s.io/v1beta1/referencegrants",
     "/apis/resource.k8s.io/v1/namespaces/default/resourceclaims",
     "/apis/resource.k8s.io/v1/namespaces/default/resourceclaimtemplates",
     "/apis/resource.k8s.io/v1/resourceclaims",
