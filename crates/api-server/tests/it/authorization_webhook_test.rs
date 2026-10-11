@@ -184,6 +184,62 @@ async fn v1beta1_version_sends_a_v1beta1_review() {
     assert_eq!(got["spec"]["user"], "jane");
 }
 
+// resourceAttributesFrom (webhook.go:312-326) with fieldSelectorToAuthorizationAPI
+// / labelSelectorToAuthorizationAPI (webhook.go:331-402).
+#[tokio::test]
+async fn sends_selector_attributes() {
+    let mock = allowing_mock();
+    let url = serve(mock.clone()).await;
+    let wh = authorizer(&url, "v1", Duration::ZERO, FailurePolicy::NoOpinion);
+    let mut a = resource("jane");
+    a.verb = "list".into();
+    a.set_selectors(
+        "foo=bar,baz!=qux",
+        "a=b,c!=d,e in (f,g),h notin (i),j,!k,l>3",
+    );
+    assert!(is_allow(&wh.authorize_opinion(&a).await.unwrap()));
+    let got = mock.lock().unwrap().last.clone().unwrap();
+    assert_eq!(
+        got["spec"]["resourceAttributes"]["fieldSelector"],
+        json!({"requirements": [
+            {"key": "foo", "operator": "In", "values": ["bar"]},
+            {"key": "baz", "operator": "NotIn", "values": ["qux"]},
+        ]})
+    );
+    // `l>3` (Gt) is dropped: requirements are AND'd, so ignoring is safe.
+    assert_eq!(
+        got["spec"]["resourceAttributes"]["labelSelector"],
+        json!({"requirements": [
+            {"key": "a", "operator": "In", "values": ["b"]},
+            {"key": "c", "operator": "NotIn", "values": ["d"]},
+            {"key": "e", "operator": "In", "values": ["f", "g"]},
+            {"key": "h", "operator": "NotIn", "values": ["i"]},
+            {"key": "j", "operator": "Exists"},
+            {"key": "k", "operator": "DoesNotExist"},
+        ]})
+    );
+}
+
+// webhook.go:312-326: an unparsable selector yields no requirements, so the
+// broader unrestricted action is checked; nothing is sent.
+#[tokio::test]
+async fn omits_selectors_that_failed_to_parse_or_are_all_unknown() {
+    let mock = allowing_mock();
+    let url = serve(mock.clone()).await;
+    let wh = authorizer(&url, "v1", Duration::ZERO, FailurePolicy::NoOpinion);
+    let mut a = resource("jane");
+    a.verb = "list".into();
+    a.set_selectors("*bar", "l>3");
+    assert!(is_allow(&wh.authorize_opinion(&a).await.unwrap()));
+    let got = mock.lock().unwrap().last.clone().unwrap();
+    assert!(got["spec"]["resourceAttributes"]
+        .get("fieldSelector")
+        .is_none());
+    assert!(got["spec"]["resourceAttributes"]
+        .get("labelSelector")
+        .is_none());
+}
+
 // subjectAccessReviewInterfaceFromConfig (webhook.go:470-476).
 #[test]
 fn unsupported_version_is_rejected() {

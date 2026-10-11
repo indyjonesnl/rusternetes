@@ -1,5 +1,7 @@
 use crate::auth::UserInfo;
 use crate::error::Result;
+use crate::field_selector::FieldRequirement;
+use crate::label_selector::LabelRequirement;
 use crate::resources::rbac::{
     ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, Subject,
 };
@@ -77,6 +79,20 @@ pub struct RequestAttributes {
 
     /// Whether this is a non-resource request
     pub is_non_resource_request: bool,
+
+    /// `AttributesRecord.FieldSelectorRequirements`
+    /// (apiserver/pkg/authorization/authorizer/interfaces.go): the parsed
+    /// `fieldSelector` of a list/watch/deletecollection request.
+    pub field_selector_requirements: Vec<FieldRequirement>,
+
+    /// `AttributesRecord.FieldSelectorParsingErr`.
+    pub field_selector_parsing_err: Option<String>,
+
+    /// `AttributesRecord.LabelSelectorRequirements`.
+    pub label_selector_requirements: Vec<LabelRequirement>,
+
+    /// `AttributesRecord.LabelSelectorParsingErr`.
+    pub label_selector_parsing_err: Option<String>,
 }
 
 impl RequestAttributes {
@@ -92,6 +108,10 @@ impl RequestAttributes {
             subresource: None,
             path: None,
             is_non_resource_request: false,
+            field_selector_requirements: Vec::new(),
+            field_selector_parsing_err: None,
+            label_selector_requirements: Vec::new(),
+            label_selector_parsing_err: None,
         }
     }
 
@@ -111,7 +131,20 @@ impl RequestAttributes {
             subresource: None,
             path: Some(path.into()),
             is_non_resource_request: true,
+            field_selector_requirements: Vec::new(),
+            field_selector_parsing_err: None,
+            label_selector_requirements: Vec::new(),
+            label_selector_parsing_err: None,
         }
+    }
+
+    /// The `AuthorizeWithSelectors` block of `WithAuthorization`'s
+    /// `GetAuthorizerAttributes` (apiserver/pkg/endpoints/filters/authorization.go:126-150).
+    /// `field_selector` / `label_selector` are `RequestInfo.FieldSelector` /
+    /// `.LabelSelector`. The gate is GA and `LockToDefault: true` since 1.34
+    /// (apiserver/pkg/features/kube_features.go:353), so it is always on.
+    pub fn set_selectors(&mut self, field_selector: &str, label_selector: &str) {
+        let _ = (field_selector, label_selector);
     }
 
     pub fn with_namespace(mut self, namespace: impl Into<String>) -> Self {
@@ -1143,6 +1176,60 @@ impl Authorizer for WebhookAuthorizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn selector_attrs(field: &str, label: &str) -> RequestAttributes {
+        let mut a = RequestAttributes::new(
+            UserInfo {
+                username: "alice".into(),
+                uid: String::new(),
+                groups: vec![],
+                extra: Default::default(),
+            },
+            "list",
+            "jobs",
+        );
+        a.set_selectors(field, label);
+        a
+    }
+
+    // authorization_test.go TestGetAuthorizerAttributes "enabled, good field selector".
+    #[test]
+    fn set_selectors_parses_good_field_selector() {
+        let a = selector_attrs("foo==bar", "");
+        assert_eq!(a.field_selector_requirements.len(), 1);
+        assert_eq!(a.field_selector_requirements[0].field(), "foo");
+        assert_eq!(a.field_selector_requirements[0].value(), "bar");
+        assert!(a.field_selector_parsing_err.is_none());
+        assert!(a.label_selector_requirements.is_empty());
+    }
+
+    // "enabled, bad field selector": requirements nil, error recorded.
+    #[test]
+    fn set_selectors_records_field_selector_parse_error() {
+        let a = selector_attrs("*bar", "");
+        assert!(a.field_selector_requirements.is_empty());
+        assert!(a.field_selector_parsing_err.is_some());
+    }
+
+    // "enabled, good label selector".
+    #[test]
+    fn set_selectors_parses_good_label_selector() {
+        let a = selector_attrs("", "foo==bar");
+        assert_eq!(a.label_selector_requirements.len(), 1);
+        assert_eq!(a.label_selector_requirements[0].key(), "foo");
+        assert!(a.label_selector_parsing_err.is_none());
+    }
+
+    // "enabled, bad label selector": verbatim upstream error.
+    #[test]
+    fn set_selectors_records_label_selector_parse_error() {
+        let a = selector_attrs("", "*bar");
+        assert!(a.label_selector_requirements.is_empty());
+        assert_eq!(
+            a.label_selector_parsing_err.as_deref(),
+            Some("unable to parse requirement: <nil>: Invalid value: \"*bar\": name part must consist of alphanumeric characters, '-', '_' or '.', and must start and end with an alphanumeric character (e.g. 'MyName',  or 'my.name',  or '123-abc', regex used for validation is '([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9]')")
+        );
+    }
 
     #[test]
     fn test_policy_rule_matching() {
