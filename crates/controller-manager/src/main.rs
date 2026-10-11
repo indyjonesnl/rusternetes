@@ -1243,6 +1243,60 @@ async fn main() -> Result<()> {
 }
 
 #[cfg(test)]
+mod csi_node_deployment_flag_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// external-provisioner v6.4.0 csi-provisioner.go:106-109: off by default,
+    /// immediate binding on, base delay 20s, max delay 60s.
+    #[test]
+    fn node_deployment_flag_defaults_match_upstream() {
+        let args = Args::try_parse_from(["controller-manager"]).unwrap();
+        assert!(!args.csi_node_deployment);
+        assert!(args.csi_node_deployment_immediate_binding);
+        assert_eq!(args.csi_node_deployment_base_delay, Duration::from_secs(20));
+        assert_eq!(args.csi_node_deployment_max_delay, Duration::from_secs(60));
+        assert!(node_deployment_settings(&args, None).unwrap().is_none());
+    }
+
+    /// csi-provisioner.go:147-149: `--node-deployment` without NODE_NAME is fatal.
+    #[test]
+    fn node_deployment_requires_node_name() {
+        let args = Args::try_parse_from(["controller-manager", "--csi-node-deployment"]).unwrap();
+        let err = node_deployment_settings(&args, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("NODE_NAME"), "{err}");
+        let err = node_deployment_settings(&args, Some(String::new()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("NODE_NAME"), "{err}");
+    }
+
+    /// csi-provisioner.go:321-328: NodeName/ImmediateBinding/BaseDelay/MaxDelay
+    /// come straight from the flags.
+    #[test]
+    fn node_deployment_settings_carry_the_flags() {
+        let args = Args::try_parse_from([
+            "controller-manager",
+            "--csi-node-deployment",
+            "--csi-node-deployment-immediate-binding=false",
+            "--csi-node-deployment-base-delay=5s",
+            "--csi-node-deployment-max-delay=2m",
+        ])
+        .unwrap();
+        let nd = node_deployment_settings(&args, Some("node-1".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(nd.node_name, "node-1");
+        assert!(!nd.immediate_binding);
+        assert_eq!(nd.base_delay, Duration::from_secs(5));
+        assert_eq!(nd.max_delay, Duration::from_secs(120));
+        assert!(nd.accessible_topology.is_none());
+    }
+}
+
+#[cfg(test)]
 mod default_rate_limit_tests {
     use super::*;
     use rusternetes_client::http::ApiClient;
