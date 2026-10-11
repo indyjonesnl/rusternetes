@@ -464,6 +464,13 @@ pub fn reset_to_defaults() {
     }
 }
 
+/// Parse a `--feature-gates` value and apply it. Port of
+/// `featureGate.Set` / `SetFromMap`
+/// (staging/src/k8s.io/component-base/featuregate/feature_gate.go:340-359, 440-469).
+pub fn set_from_str(_value: &str) -> Result<(), String> {
+    Ok(())
+}
+
 /// RAII guard that restores `feature` to its prior value on drop. Use in tests
 /// to scope a gate flip to a single test body.
 ///
@@ -567,5 +574,56 @@ mod tests {
             assert!(!enabled(Feature::PodTopologyLabelsAdmission));
         }
         assert!(enabled(Feature::PodTopologyLabelsAdmission));
+    }
+
+    #[test]
+    #[serial]
+    fn set_from_str_applies_and_skips_empty() {
+        reset_to_defaults();
+        set_from_str("StorageCapacityScoring=true,,PodDeletionCost=false").unwrap();
+        assert!(enabled(Feature::StorageCapacityScoring));
+        assert!(!enabled(Feature::PodDeletionCost));
+        set_from_str("").unwrap();
+        reset_to_defaults();
+    }
+
+    #[test]
+    #[serial]
+    fn set_from_str_errors_match_upstream_and_apply_nothing() {
+        reset_to_defaults();
+        // feature_gate.go:348-350
+        assert_eq!(
+            set_from_str("StorageCapacityScoring").unwrap_err(),
+            "missing bool value for StorageCapacityScoring"
+        );
+        // feature_gate.go:353-355 (strconv.ParseBool error text)
+        assert_eq!(
+            set_from_str("StorageCapacityScoring=banana").unwrap_err(),
+            "invalid value of StorageCapacityScoring=banana, err: strconv.ParseBool: parsing \"banana\": invalid syntax"
+        );
+        // feature_gate.go:387
+        assert_eq!(
+            set_from_str("fooBarBaz=true").unwrap_err(),
+            "unrecognized feature gate: fooBarBaz"
+        );
+        // feature_gate.go:392 (LockToDefault)
+        assert_eq!(
+            set_from_str("RelaxedDNSSearchValidation=false").unwrap_err(),
+            "cannot set feature gate RelaxedDNSSearchValidation to false, feature is locked to true"
+        );
+        // feature_gate.go:463-466: nothing persisted when any error occurred.
+        assert!(set_from_str("StorageCapacityScoring=true,fooBarBaz=true").is_err());
+        assert!(!enabled(Feature::StorageCapacityScoring));
+    }
+
+    #[test]
+    #[serial]
+    fn set_from_str_parse_bool_and_whitespace() {
+        reset_to_defaults();
+        set_from_str(" StorageCapacityScoring = T ").unwrap();
+        assert!(enabled(Feature::StorageCapacityScoring));
+        set_from_str("StorageCapacityScoring=0").unwrap();
+        assert!(!enabled(Feature::StorageCapacityScoring));
+        reset_to_defaults();
     }
 }
