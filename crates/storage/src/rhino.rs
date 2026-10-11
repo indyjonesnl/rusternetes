@@ -124,7 +124,42 @@ impl<B: Backend> RhinoStorage<B> {
 
     /// Attach an in-process event bus. After this, writes publish and `watch()`
     /// serves from the bus. Call only in single-writer (all-in-one) processes.
+    ///
+    /// With a bus, `watch()` never reaches the backend, so rhino's lazy
+    /// "start on first watch" TTL loop would never run and its reaped keys
+    /// would never be seen (#3027). Start the background tasks now and forward
+    /// each TTL-reaped key to the bus as `Deleted`, as etcd does: lease expiry
+    /// is an ordinary DELETE watch event (etcd3/watcher.go `parseEvent`; kine's
+    /// `ttl` writes real delete rows that its watch emits). Needs a tokio
+    /// runtime; without one the bus is attached but expiry is not forwarded.
     pub fn set_event_bus(&mut self, bus: crate::EventBus) {
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            // Subscribe before starting so no reaped key can be missed.
+            let expired = self.backend.subscribe_expired();
+            let backend = self.backend.clone();
+            let sizes = self.sizes.clone();
+            let forward_bus = bus.clone();
+            rt.spawn(async move {
+                backend.start_background().await;
+                let Some(mut rx) = expired else { return };
+                loop {
+                    match rx.recv().await {
+                        Ok(event) => {
+                            let rev = event.kv.mod_revision;
+                            sizes.delete_key(&event.kv.key, rev);
+                            let prev = event.prev_kv.as_ref().unwrap_or(&event.kv);
+                            let raw = String::from_utf8_lossy(&prev.value).to_string();
+                            let prev_value = Self::inject_resource_version(&raw, rev);
+                            forward_bus.publish(WatchEvent::Deleted(event.kv.key, prev_value));
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            error!("TTL expiry forwarder lagged, {n} Deleted events dropped");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    }
+                }
+            });
+        }
         self.bus = Some(bus);
     }
 
