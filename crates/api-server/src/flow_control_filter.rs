@@ -570,8 +570,8 @@ pub async fn priority_and_fairness<S: Storage + 'static>(
             // (apf_filter.go:171-177); `maybe_reap` re-checks that the level
             // is quiescing and its queueset idle.
             f.engine.maybe_reap(&classification.priority_level);
-            // `MonitorRequest` (endpoints/metrics/metrics.go:603).
-            apiserver_request_metrics::monitor_request(&meta, COMPONENT, resp.status().as_u16());
+            // `MonitorRequest` runs in `apiserver_request_metrics::instrument_request`,
+            // which wraps every route (InstrumentRouteFunc), not only admitted ones.
             set_response_headers(&classification, &mut resp);
             resp
         }
@@ -996,6 +996,10 @@ mod tests {
                 get(|| async { "x" }),
             )
             .route("/api/v1/watch/namespaces", get(|| async { "w" }))
+            // As in router.rs: InstrumentRouteFunc sits inside APF.
+            .layer(axum::middleware::from_fn(
+                crate::apiserver_request_metrics::instrument_request,
+            ))
             .layer(from_fn_with_state(
                 filter,
                 priority_and_fairness::<MemoryStorage>,
@@ -1216,8 +1220,8 @@ mod tests {
         held.await.unwrap().unwrap();
     }
 
-    // MonitorRequest (endpoints/metrics/metrics.go:603): every served request
-    // increments `apiserver_request_total` with its real response code, not
+    // MonitorRequest (endpoints/metrics/metrics.go:603) via the instrument
+    // layer: every served request increments `apiserver_request_total` with its real response code, not
     // just the 429s.
     #[tokio::test]
     async fn served_request_counts_apiserver_request_total_with_status_code() {

@@ -8,17 +8,27 @@
 //! `server/filters/maxinflight.go`'s `requestWatermark` (:56-84) and
 //! `startWatermarkMaintenance` (:92-104).
 //!
-//! DEVIATION: this server has no general request-instrumentation filter, so
-//! the `MonitorRequest` counter increment ([`monitor_request`]) is called from
-//! the APF filter for requests it admits (plus the 429s via
-//! [`record_dropped_request`]); requests the filter skips (long-running
-//! non-watch, no request info) are not counted, and the latency / response
-//! size histograms are not ported.
+//! General instrumentation: [`instrument_request`] is the middleware
+//! counterpart of `InstrumentRouteFunc` (metrics.go:633-650); it wraps every
+//! protected route (so long-running non-watch and no-resource-info requests
+//! are counted whether or not APF is installed) and calls [`monitor_request`]
+//! (:590-629) with the elapsed time and response size. Also ported:
+//! `requestLatencies` (:104-118), `responseSizes` (:152-162),
+//! `requestAbortsTotal` (:243-252) and `RecordRequestAbort` (:496-506).
+//!
+//! DEVIATIONS: (1) the elapsed time of a watch is the time to response
+//! headers, since the body streams after the handler returns; (2) response
+//! size is the declared/exact body length (zero for unsized streams) rather
+//! than bytes written; (3) `request_sli_duration_seconds` /
+//! `request_slo_duration_seconds` (:119-149) are not ported (no latency
+//! trackers for webhook / APF-wait time), nor is the `apiserver_self`
+//! counter, deprecated-API gauge or field-validation histogram; (4) nothing
+//! calls [`record_request_abort`] yet (no timeout / abort filter).
 
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
-use prometheus::{register, IntCounterVec, IntGaugeVec, Opts};
+use prometheus::{register, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts};
 
 /// The request fields `RecordDroppedRequest`/`RecordRequestTermination` read
 /// from `*http.Request` and `*request.RequestInfo`.
@@ -140,6 +150,67 @@ static CURRENT_INQUEUE_REQUESTS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     )
 });
 
+/// `requestLatencies` (metrics.go:104-118).
+static REQUEST_LATENCIES: LazyLock<HistogramVec> = LazyLock::new(|| {
+    histogram_vec(
+        "request_duration_seconds",
+        "Response latency distribution in seconds for each verb, dry run value, group, version, resource, subresource, scope and component.",
+        vec![
+            0.005, 0.025, 0.05, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0,
+            8.0, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0,
+        ],
+        &[
+            "verb",
+            "dry_run",
+            "group",
+            "version",
+            "resource",
+            "subresource",
+            "scope",
+            "component",
+        ],
+    )
+});
+
+/// `responseSizes` (metrics.go:152-162): `ExponentialBuckets(1000, 10.0, 7)`.
+static RESPONSE_SIZES: LazyLock<HistogramVec> = LazyLock::new(|| {
+    histogram_vec(
+        "response_sizes",
+        "Response size distribution in bytes for each group, version, verb, resource, subresource, scope and component.",
+        prometheus::exponential_buckets(1000.0, 10.0, 7).expect("valid buckets"),
+        &[
+            "verb",
+            "group",
+            "version",
+            "resource",
+            "subresource",
+            "scope",
+            "component",
+        ],
+    )
+});
+
+/// `requestAbortsTotal` (metrics.go:243-252).
+static REQUEST_ABORTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    counter_vec(
+        "request_aborts_total",
+        "Number of requests which apiserver aborted possibly due to a timeout, for each group, version, verb, resource, subresource and scope",
+        &["verb", "group", "version", "resource", "subresource", "scope"],
+    )
+});
+
+fn histogram_vec(name: &str, help: &str, buckets: Vec<f64>, labels: &[&str]) -> HistogramVec {
+    let h = HistogramVec::new(
+        HistogramOpts::new(name, help)
+            .namespace(APISERVER)
+            .buckets(buckets),
+        labels,
+    )
+    .expect("valid metric");
+    let _ = register(Box::new(h.clone()));
+    h
+}
+
 /// `CleanScope` (metrics.go:684-696).
 fn clean_scope(r: &RequestMeta) -> &'static str {
     if !r.name.is_empty() || r.verb == "create" {
@@ -221,13 +292,8 @@ fn clean_dry_run(query: &str) -> String {
     values.join(",")
 }
 
-/// The `requestCounter` increment of `MonitorRequest` (metrics.go:599-603):
-/// every request that reached a handler is counted with its response code.
-pub fn monitor_request(req: &RequestMeta, component: &str, code: u16) {
-    let scope = clean_scope(req);
-    let dry_run = clean_dry_run(&req.query);
-    let verb = reported_verb(req, scope);
-    let (group, version, resource) = if req.is_resource_request {
+fn resource_gvr(req: &RequestMeta) -> (&str, &str, &str) {
+    if req.is_resource_request {
         (
             req.api_group.as_str(),
             req.api_version.as_str(),
@@ -235,7 +301,15 @@ pub fn monitor_request(req: &RequestMeta, component: &str, code: u16) {
         )
     } else {
         ("", "", "")
-    };
+    }
+}
+
+/// The `requestCounter` increment of `MonitorRequest` (metrics.go:599-603).
+fn count_request(req: &RequestMeta, component: &str, code: u16) {
+    let scope = clean_scope(req);
+    let dry_run = clean_dry_run(&req.query);
+    let verb = reported_verb(req, scope);
+    let (group, version, resource) = resource_gvr(req);
     REQUEST_COUNTER
         .with_label_values(&[
             &verb,
@@ -251,21 +325,117 @@ pub fn monitor_request(req: &RequestMeta, component: &str, code: u16) {
         .inc();
 }
 
-/// `InstrumentRouteFunc` (metrics.go:633-650), as a middleware. STUB.
+/// `MonitorRequest` (metrics.go:590-629): count the request, observe its
+/// latency and, for reads, its response size.
+pub fn monitor_request(
+    req: &RequestMeta,
+    component: &str,
+    code: u16,
+    elapsed: Duration,
+    resp_size: u64,
+) {
+    count_request(req, component, code);
+    let scope = clean_scope(req);
+    let dry_run = clean_dry_run(&req.query);
+    let verb = reported_verb(req, scope);
+    let (group, version, resource) = resource_gvr(req);
+    REQUEST_LATENCIES
+        .with_label_values(&[
+            &verb,
+            &dry_run,
+            group,
+            version,
+            resource,
+            &req.subresource,
+            scope,
+            component,
+        ])
+        .observe(elapsed.as_secs_f64());
+    // "We are only interested in response sizes of read requests." (:624)
+    if verb == "GET" || verb == "LIST" {
+        RESPONSE_SIZES
+            .with_label_values(&[
+                &verb,
+                group,
+                version,
+                resource,
+                &req.subresource,
+                scope,
+                component,
+            ])
+            .observe(resp_size as f64);
+    }
+}
+
+/// `RecordRequestAbort` (metrics.go:496-506).
+pub fn record_request_abort(req: &RequestMeta) {
+    let scope = clean_scope(req);
+    let verb = reported_verb(req, scope);
+    REQUEST_ABORTS_TOTAL
+        .with_label_values(&[
+            &verb,
+            &req.api_group,
+            &req.api_version,
+            &req.resource,
+            &req.subresource,
+            scope,
+        ])
+        .inc();
+}
+
+/// `NewRequestInfo`-derived [`RequestMeta`]; a request without resource info
+/// reports `RequestInfo{Verb: req.Method, Path: req.URL.Path}` (:591-594).
+fn request_meta(req: &axum::extract::Request) -> RequestMeta {
+    let attrs = crate::audit::request_info(req.method(), req.uri().path(), req.uri().query());
+    RequestMeta {
+        method: req.method().as_str().to_string(),
+        query: req.uri().query().unwrap_or("").to_string(),
+        path: attrs.path,
+        apply_patch: req
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .is_some_and(|v| v.as_bytes() == b"application/apply-patch+yaml"),
+        is_resource_request: attrs.is_resource_request,
+        verb: attrs.verb,
+        namespace: attrs.namespace,
+        name: attrs.name,
+        api_group: attrs.api_group,
+        api_version: attrs.api_version,
+        resource: attrs.resource,
+        subresource: attrs.subresource,
+    }
+}
+
+/// `InstrumentRouteFunc` (metrics.go:633-650) as a middleware: time the inner
+/// handler and call [`monitor_request`].
 pub async fn instrument_request(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    next.run(req).await
+    use axum::body::HttpBody;
+    let meta = request_meta(&req);
+    let started = std::time::Instant::now();
+    let resp = next.run(req).await;
+    let size = resp
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok()?.parse().ok())
+        .or_else(|| resp.body().size_hint().exact())
+        .unwrap_or(0);
+    monitor_request(
+        &meta,
+        "apiserver",
+        resp.status().as_u16(),
+        started.elapsed(),
+        size,
+    );
+    resp
 }
-
-/// STUB.
-pub fn record_request_abort(_req: &RequestMeta) {}
 
 /// `RecordDroppedRequest` (metrics.go:508-526): the request was rejected via
 /// `http.TooManyRequests`; counted in `apiserver_request_total` with code 429.
 pub fn record_dropped_request(req: &RequestMeta, component: &str, _is_mutating: bool) {
-    monitor_request(req, component, 429);
+    count_request(req, component, 429);
 }
 
 /// `RecordRequestTermination` (metrics.go:532-549): the request was
