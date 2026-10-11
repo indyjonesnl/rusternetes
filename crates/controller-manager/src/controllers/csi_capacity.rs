@@ -416,18 +416,21 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
     /// (:539-587) + `syncCapacity` (:586-715): publish, update and delete
     /// objects until they match `segments` x the driver's StorageClasses.
     pub async fn reconcile(&self, segments: &[Segment]) -> Result<()> {
-        self.reconcile_with_stats(segments).await.1
+        let (stats, r) = self.reconcile_with_stats(segments).await;
+        super::csi_capacity_metrics::publish(&self.driver_name, stats);
+        r
     }
 
-    /// `reconcile` plus the gauge values of the pass (stub).
+    /// `reconcile` plus the gauge values of the pass, as
+    /// `getObjectsGoal/Current/Obsolete` (capacity.go:769-807) would report
+    /// them right after it: `obsolete` is what is left after the deletions.
     async fn reconcile_with_stats(&self, segments: &[Segment]) -> (CapacityStats, Result<()>) {
-        (
-            CapacityStats::default(),
-            self.reconcile_inner(segments).await,
-        )
+        let mut stats = CapacityStats::default();
+        let r = self.reconcile_inner(segments, &mut stats).await;
+        (stats, r)
     }
 
-    async fn reconcile_inner(&self, segments: &[Segment]) -> Result<()> {
+    async fn reconcile_inner(&self, segments: &[Segment], stats: &mut CapacityStats) -> Result<()> {
         let classes: Vec<StorageClass> = self
             .storage
             .list(&build_prefix("storageclasses", None))
@@ -459,6 +462,7 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
         // are ignored (:547-562) and everything else is obsolete or a
         // duplicate and is deleted (:582-585).
         let mut matched: Vec<Option<CSIStorageCapacity>> = vec![None; items.len()];
+        let mut first_err = None;
         for c in existing {
             if !self.is_managed(&c) {
                 continue;
@@ -469,14 +473,25 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
                 .find(|(i, it)| matched[*i].is_none() && it.equals(&c))
             {
                 Some((i, _)) => matched[i] = Some(c),
-                None => self.delete_capacity(&c).await?,
+                // A failed delete leaves the object obsolete (:792-807).
+                None => {
+                    if let Err(e) = self.delete_capacity(&c).await {
+                        stats.obsolete += 1;
+                        first_err.get_or_insert(e);
+                    }
+                }
             }
         }
 
-        let mut first_err = None;
+        stats.goal = items.len() as i64;
         for (item, current) in items.iter().zip(matched) {
-            if let Err(e) = self.sync_capacity(item, current).await {
-                first_err.get_or_insert(e);
+            let existed = current.is_some();
+            match self.sync_capacity(item, current).await {
+                Ok(created) => stats.current += i64::from(existed || created),
+                Err(e) => {
+                    stats.current += i64::from(existed);
+                    first_err.get_or_insert(e);
+                }
             }
         }
         first_err.map_or(Ok(()), Err)
@@ -487,7 +502,7 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
         &self,
         item: &WorkItem<'_>,
         current: Option<CSIStorageCapacity>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // :599-604 — the assumption is that the capacity is independent of the
         // capabilities, hence no VolumeCapabilities.
         let req = GetCapacityRequest {
@@ -517,6 +532,7 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
                         &obj,
                     )
                     .await?;
+                return Ok(true);
             }
             Some(c)
                 if sizes_are_equal(c.capacity.as_deref(), Some(&quantity))
@@ -548,7 +564,7 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
                     .await?;
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     /// The create path of `syncCapacity` (:621-640): a brand-new object. Kept
