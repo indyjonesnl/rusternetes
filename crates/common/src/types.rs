@@ -1348,6 +1348,17 @@ pub struct ManagedFieldsEntry {
 mod tests {
     use super::*;
 
+    /// metav1.ObjectMeta: `Name string `json:"name,omitempty"``
+    /// (staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/types.go) — an empty
+    /// name is dropped from the wire form (#2942).
+    #[test]
+    fn empty_object_meta_name_is_omitted_from_json() {
+        let v = serde_json::to_value(ObjectMeta::default()).unwrap();
+        assert!(v.get("name").is_none(), "got {v}");
+        let v = serde_json::to_value(ObjectMeta::new("x")).unwrap();
+        assert_eq!(v["name"], "x");
+    }
+
     fn sel(json: serde_json::Value) -> LabelSelector {
         serde_json::from_value(json).unwrap()
     }
