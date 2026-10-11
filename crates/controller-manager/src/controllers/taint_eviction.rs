@@ -1331,6 +1331,29 @@ mod tests {
         }
     }
 
+    /// #3261: terminal pods get no special treatment. Upstream
+    /// `taint_eviction.go` never reads `pod.Status.Phase`
+    /// (`grep -n "Phase\|IsPodTerminal" pkg/controller/tainteviction/taint_eviction.go`
+    /// has no match), so an untolerated Succeeded/Failed pod on a NoExecute
+    /// tainted node is evicted like any other (the kubelet used to skip them).
+    #[tokio::test]
+    async fn terminal_pods_are_evicted_like_any_other() {
+        for phase in ["Succeeded", "Failed"] {
+            let mut p = pod("pod1", "node1");
+            p.status.as_mut().unwrap().phase = Some(match phase {
+                "Succeeded" => rusternetes_common::types::Phase::Succeeded,
+                _ => rusternetes_common::types::Phase::Failed,
+            });
+            let f = Fixture::new(vec![p]).await;
+            let n = node("node1", &[1]);
+            f.put_node(&n).await;
+            f.ctl.node_updated(None, Some(&n)).await;
+            f.verify("pod1", true, true).await;
+            eprintln!("ok: {phase}");
+            f.ctl.shutdown().await;
+        }
+    }
+
     /// `TestDeleteNode`.
     #[tokio::test]
     async fn delete_node() {
