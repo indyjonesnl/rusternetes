@@ -697,6 +697,9 @@ impl Admission<'_> {
             operation: op.clone(),
             object: Some(before.clone()),
             old_object: old.map(to_value).transpose()?,
+            user_info: Some(self.user.clone()),
+            dry_run: self.dry_run,
+            operation_options: None,
         };
         plugin.admit(&mut attr, reinvocation.clone()).await?;
         match attr.object {

@@ -45,6 +45,13 @@ pub struct Attributes {
     pub operation: Operation,
     pub object: Option<Value>,
     pub old_object: Option<Value>,
+    /// `GetUserInfo`; `None` is upstream's nil `user.Info`.
+    pub user_info: Option<rusternetes_common::auth::UserInfo>,
+    /// `IsDryRun`.
+    pub dry_run: bool,
+    /// `GetOperationOptions` (the `CreateOptions`/`UpdateOptions`/
+    /// `DeleteOptions` of the request), as JSON.
+    pub operation_options: Option<Value>,
 }
 
 /// `runtime.EquivalentResourceMapper`.
@@ -501,6 +508,9 @@ mod tests {
             operation: op,
             object: None,
             old_object: None,
+            user_info: None,
+            dry_run: false,
+            operation_options: None,
         }
     }
 

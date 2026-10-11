@@ -542,6 +542,9 @@ mod tests {
             operation: Operation::Create,
             object: Some(object),
             old_object: None,
+            user_info: None,
+            dry_run: false,
+            operation_options: None,
         }
     }
 

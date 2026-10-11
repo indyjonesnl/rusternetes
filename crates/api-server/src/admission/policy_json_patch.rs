@@ -212,15 +212,31 @@ fn composited_failure(failed: &[(&str, String)], expr: &str, name: &str, err: St
 /// `CreateAdmissionRequest` (admission/plugin/cel/condition.go:115-175):
 /// `Object`/`OldObject` are left unset, the kind/resource are the matched
 /// equivalents and `requestKind`/`requestResource` the request's own.
-/// `Attributes` does not carry the user, dry-run flag or operation options
-/// yet, so `userInfo` is empty (a nil `UserInfo` upstream), `dryRun` is
-/// false and `options` is absent. Unlike the unstructured conversion,
-/// empty `subResource`/`name`/`namespace` are kept as `""`.
+/// `userInfo` is `authenticationv1.UserInfo` (every field `omitempty`, so a
+/// nil user is `{}`), `dryRun` is `attr.IsDryRun()` and `options` is
+/// `attr.GetOperationOptions()` (omitted when there are none). Unlike the
+/// unstructured conversion, empty `subResource`/`name`/`namespace` are kept
+/// as `""`.
 fn create_admission_request(r: &PatchRequest<'_>) -> Value {
     let attr = r.attributes;
     let k = &r.versioned_attributes.versioned_kind;
     let res = r.matched_resource;
-    json!({
+    let mut user_info = serde_json::Map::new();
+    if let Some(u) = &attr.user_info {
+        if !u.username.is_empty() {
+            user_info.insert("username".into(), json!(u.username));
+        }
+        if !u.uid.is_empty() {
+            user_info.insert("uid".into(), json!(u.uid));
+        }
+        if !u.groups.is_empty() {
+            user_info.insert("groups".into(), json!(u.groups));
+        }
+        if !u.extra.is_empty() {
+            user_info.insert("extra".into(), json!(u.extra));
+        }
+    }
+    let mut request = json!({
         "kind": {"group": k.group, "version": k.version, "kind": k.kind},
         "resource": {"group": res.group, "version": res.version, "resource": res.resource},
         "subResource": attr.subresource,
@@ -241,9 +257,13 @@ fn create_admission_request(r: &PatchRequest<'_>) -> Value {
             AdmissionOperation::Delete => "DELETE",
             AdmissionOperation::Connect => "CONNECT",
         },
-        "userInfo": {},
-        "dryRun": false,
-    })
+        "userInfo": user_info,
+        "dryRun": attr.dry_run,
+    });
+    if let Some(options) = &attr.operation_options {
+        request["options"] = options.clone();
+    }
+    request
 }
 
 #[async_trait]
@@ -306,6 +326,9 @@ mod tests {
             operation: AdmissionOperation::Create,
             object: Some(object.clone()),
             old_object: None,
+            user_info: None,
+            dry_run: false,
+            operation_options: None,
         }
     }
 
@@ -620,6 +643,43 @@ mod tests {
                 "subResource": "scale", "requestSubResource": "scale",
                 "requestKind": "Deployment", "requestResource": "deployments",
                 "dryRun": "false"
+            }}})
+        );
+    }
+
+    // `CreateAdmissionRequest` (condition.go:128-153, :172-174): userInfo,
+    // dryRun and options come from the request's attributes.
+    #[test]
+    fn request_variable_carries_user_dry_run_and_options() {
+        let object = json!({"metadata": {}});
+        let mut attrs = attributes(&object);
+        attrs.user_info = Some(rusternetes_common::auth::UserInfo {
+            username: "alice".into(),
+            uid: "u1".into(),
+            groups: vec!["g1".into()],
+            extra: [("k".to_string(), vec!["v".to_string()])].into(),
+        });
+        attrs.dry_run = true;
+        attrs.operation_options = Some(json!({"fieldManager": "fm"}));
+        let got = run_with(
+            JsonPatcher::new_patcher(
+                r#"[JSONPatch{op: "add", path: "/metadata/annotations", value: {
+                    "user": request.userInfo.username,
+                    "uid": request.userInfo.uid,
+                    "group": request.userInfo.groups[0],
+                    "extra": request.userInfo.extra["k"][0],
+                    "dryRun": request.dryRun ? "true" : "false",
+                    "fm": request.options.fieldManager
+                }}]"#,
+            ),
+            object,
+            &attrs,
+        );
+        assert_eq!(
+            got.unwrap(),
+            json!({"metadata": {"annotations": {
+                "user": "alice", "uid": "u1", "group": "g1", "extra": "v",
+                "dryRun": "true", "fm": "fm"
             }}})
         );
     }

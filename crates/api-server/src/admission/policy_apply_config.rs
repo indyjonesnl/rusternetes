@@ -197,6 +197,9 @@ mod tests {
             operation: Operation::Update,
             object: versioned.versioned_object.clone(),
             old_object: versioned.versioned_old_object.clone(),
+            user_info: None,
+            dry_run: false,
+            operation_options: None,
         };
         let req = PatchRequest {
             matched_resource: &gvr,

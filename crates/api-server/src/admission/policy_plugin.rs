@@ -252,6 +252,9 @@ mod tests {
                 "metadata": {"name": "cm", "namespace": "default"},
             })),
             old_object: None,
+            user_info: None,
+            dry_run: false,
+            operation_options: None,
         }
     }
     fn match_resources(group: &str, resource: &str) -> MatchResources {
