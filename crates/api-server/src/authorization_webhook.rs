@@ -685,8 +685,33 @@ impl WebhookAuthorizer {
     /// Times the attempt and records `RecordWebhookEvaluation` /
     /// `RecordWebhookDuration` (webhook.go:236-254).
     async fn call(&self, spec: &SarSpec) -> std::result::Result<SarStatus, CallError> {
+        // `case ctx.Err() != nil: metricsResult = "canceled"` (webhook.go:
+        // 241-242). Rust has no request context: the request being cancelled
+        // is the future being dropped mid-call, which this guard records.
+        struct CanceledGuard<'a> {
+            name: &'a str,
+            start: Instant,
+            armed: bool,
+        }
+        impl Drop for CanceledGuard<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    crate::authorization_webhook_metrics::record_webhook_round_trip(
+                        self.name,
+                        "canceled",
+                        self.start.elapsed(),
+                    );
+                }
+            }
+        }
         let start = Instant::now();
+        let mut guard = CanceledGuard {
+            name: &self.name,
+            start,
+            armed: true,
+        };
         let out = self.call_once(spec).await;
+        guard.armed = false;
         let result = match &out {
             Ok(_) => "success",
             Err(e) => e.result,

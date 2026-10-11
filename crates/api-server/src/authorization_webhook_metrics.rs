@@ -8,8 +8,8 @@
 //!
 //! DEVIATIONS: kube-apiserver passes `NoopRequestMetrics` for the webhook
 //! request total/latency (`kubeapiserverWebhookMetrics`, reload.go:182-189),
-//! so those are not ported either. The `canceled` result needs a cancelled
-//! request context; a dropped future records nothing here.
+//! so those are not ported either. The `canceled` result has no request
+//! context to inspect; a future dropped mid-call records it (#3217).
 
 use prometheus::{register, HistogramOpts, HistogramVec, IntCounterVec, Opts};
 use std::sync::LazyLock;
