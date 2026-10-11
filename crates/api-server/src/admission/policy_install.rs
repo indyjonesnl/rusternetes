@@ -35,10 +35,31 @@ use rusternetes_common::resources::mutating_admission_policy::{
 /// [`compile_policy`].
 ///
 /// Upstream, staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/
-/// mutating/plugin.go `NewPlugin` hands `compilePolicy` (compilation.go:34) to
-/// `generic.NewPolicySource` as the compiler, so every
-/// `compilePolicyLocked` (policy_source.go:470-501) yields a
-/// `PolicyEvaluator` with the real patchers and the matchConditions matcher.
+/// mutating/plugin.go:98-103 (`NewPlugin`):
+/// ```text
+/// return generic.NewPolicySource(
+///     ...
+///     compilePolicy,
+/// ```
+/// into generic/policy_source.go:108-117 `NewPolicySource(..., compiler func(P) E, ...)`.
+/// `compilePolicyLocked` (generic/policy_source.go:485-500) caches the compiled
+/// evaluator per policy key and returns it by value on every sync:
+/// ```text
+/// compiledPolicy, wasCompiled := s.compiledPolicies[key]
+/// if !wasCompiled ||
+///     compiledPolicy.policyVersion != policyMeta.GetResourceVersion() {
+///     compiledPolicy = compiledPolicyEntry[E]{
+///         policyVersion: policyMeta.GetResourceVersion(),
+///         evaluator:     s.compiler(policySpec),
+///     }
+///     s.compiledPolicies[key] = compiledPolicy
+/// }
+/// return compiledPolicy.evaluator
+/// ```
+/// `E` is the `PolicyEvaluator` interface/pointer, so the "copy" shares the
+/// compiled matcher and patchers. `MutatingEvaluator: Clone` (Arc fields)
+/// reproduces exactly that sharing; `PolicySource::compile_policy_locked`
+/// requires `E: Clone` for the same cache-and-return step.
 pub fn new_mutating_policy_source(
     policy_informer: Arc<dyn Informer<MutatingAdmissionPolicy>>,
     binding_informer: Arc<dyn Informer<MutatingAdmissionPolicyBinding>>,
