@@ -391,9 +391,21 @@ impl CsiControllerClient {
     /// `GetCapacity` (external-provisioner `controller.go:1676-1684`'s
     /// `p.csiClient.GetCapacity`): the driver's `AvailableCapacity` in bytes.
     pub async fn get_capacity(&self, req: GetCapacityRequest) -> Result<i64, ControllerError> {
-        self.call(ControllerClient::new(self.channel()?).get_capacity(req))
+        self.get_capacity_response(req)
             .await
             .map(|r| r.available_capacity)
+    }
+
+    /// `GetCapacity` returning the whole response: the capacity controller
+    /// (external-provisioner `pkg/capacity/capacity.go:606-614`) publishes
+    /// `AvailableCapacity` as `Capacity` and the optional `MaximumVolumeSize`
+    /// (`None` when the driver leaves the `Int64Value` unset).
+    pub async fn get_capacity_response(
+        &self,
+        req: GetCapacityRequest,
+    ) -> Result<crate::proto::GetCapacityResponse, ControllerError> {
+        self.call(ControllerClient::new(self.channel()?).get_capacity(req))
+            .await
     }
 
     /// `CSIVolumeLister.ListVolumes` (external-attacher `pkg/attacher/lister.go:41-69`):
@@ -621,7 +633,6 @@ mod tests {
             _r: Request<GetCapacityRequest>,
         ) -> Result<Response<GetCapacityResponse>, Status> {
             self.capacity
-                .clone()
                 .map(Response::new)
                 .ok_or_else(|| Status::unimplemented("not exercised"))
         }
