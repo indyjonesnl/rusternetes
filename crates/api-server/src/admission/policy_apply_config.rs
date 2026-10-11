@@ -322,6 +322,37 @@ mod tests {
         );
     }
 
+    // `CheckTypeNamesMatchFieldPathNames` runs on the EVALUATED ObjectVal
+    // (smd.go:99-102), so a struct reaching a field through a composited
+    // variable is checked too (#2944).
+    #[test]
+    fn type_name_mismatch_through_a_variable_is_rejected() {
+        let versioned = VersionedAttributes {
+            versioned_kind: GroupVersionKind {
+                group: "apps".into(),
+                version: "v1".into(),
+                kind: "Deployment".into(),
+            },
+            versioned_object: Some(json!({"spec": {"replicas": 1}})),
+            versioned_old_object: None,
+            dirty: false,
+        };
+        let gvr = GroupVersionResource {
+            group: "apps".into(),
+            version: "v1".into(),
+            resource: "deployments".into(),
+        };
+        let p = ApplyConfigPatcher::new_patcher_with_variables(
+            "Object{spec: variables.s}",
+            &[("s".to_string(), "Object.wrong{replicas: 2}".to_string())],
+        );
+        let err = run_with(p, versioned, gvr).unwrap_err();
+        assert!(
+            err.contains("type mismatch: unexpected type name \"Object.wrong\", expected \"Object.spec\", which matches field name path from root Object type"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn non_object_result_is_rejected() {
         let err = run(r#""I'm a teapot!""#, json!({}), None).unwrap_err();

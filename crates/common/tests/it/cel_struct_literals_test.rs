@@ -175,3 +175,18 @@ fn hostile_input_never_panics() {
         assert!(r.is_ok(), "{expr} panicked");
     }
 }
+
+/// `ObjectVal.Equal` (`dynamic/objects.go:147-155`): an Object never equals a
+/// plain map, and two Objects are equal only with the same type name (#2944).
+#[test]
+fn object_is_not_equal_to_a_plain_map() {
+    assert_eq!(eval("Object{a: 1} == {'a': 1}").unwrap(), json!(false));
+    assert_eq!(
+        eval("Object.spec{a: 1} == Object.status{a: 1}").unwrap(),
+        json!(false)
+    );
+    assert_eq!(
+        eval("Object.spec{a: 1} == Object.spec{a: 1}").unwrap(),
+        json!(true)
+    );
+}
