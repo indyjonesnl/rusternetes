@@ -3568,42 +3568,55 @@ mod dispatch_tests {
         }
     }
 
-    /// An unimplemented kind (nfs, iscsi, image, ...) matches no plugin.
-    /// `create_volume` applies the documented empty-directory fallback rather
-    /// than erroring, and `plugin_name_for_volume` reports the same
-    /// `UNSUPPORTED_PLUGIN` segment that fallback directory sits under — the
-    /// other half of the #1967 invariant.
+    /// #3262: an unimplemented kind (nfs, iscsi, fc, gitRepo, image) matches no
+    /// plugin. Upstream's desired-state populator fails the volume with
+    /// `failed to get Plugin from volumeSpec for volume %q err=%v`
+    /// (`desired_state_of_world.go:272-277`) over `ErrNoPluginMatched`
+    /// (`plugins.go:72`), and the pod waits in ContainerCreating. No empty
+    /// directory may be provisioned, and the error must classify as a wait.
     #[tokio::test]
-    async fn an_unimplemented_kind_falls_back_to_unsupported() {
+    async fn an_unimplemented_kind_fails_with_no_volume_plugin_matched() {
         let tmp = tempfile::tempdir().unwrap();
         let vm = VolumeManager::new(
             tmp.path().to_string_lossy().to_string(),
             None,
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
         );
-        let v = volume(
-            "nfs-vol",
-            json!({"nfs": {"server": "10.0.0.1", "path": "/export"}}),
-        );
-
-        assert_eq!(
-            vm.plugin_name_for_volume(&v),
-            crate::pod_dirs::UNSUPPORTED_PLUGIN
-        );
-
         let pod: Pod = serde_json::from_value(json!({
             "metadata": {"name": "p", "namespace": "default", "uid": "uid-nfs"},
-            "spec": {"containers": []}
+            "spec": {"containers": [{"name": "c", "image": "i",
+                "volumeMounts": [{"name": "nfs-vol", "mountPath": "/m"}]}],
+                "volumes": [{"name": "nfs-vol", "nfs": {"server": "10.0.0.1", "path": "/export"}}]}
         }))
         .unwrap();
-        let path = vm.create_volume(&pod, &v).await.unwrap();
-        assert!(
-            path.contains(&crate::pod_dirs::escape_qualified_name(
-                crate::pod_dirs::UNSUPPORTED_PLUGIN
-            )),
-            "path {path} should sit under the unsupported-plugin segment"
+
+        let err = vm.create_pod_volumes(&pod).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "failed to get Plugin from volumeSpec for volume \"nfs-vol\" err=no volume plugin matched"
         );
-        assert!(std::path::Path::new(&path).is_dir());
+        assert!(crate::lifecycle::is_volume_wait_error(&err.to_string()));
+        assert!(!tmp.path().join("pods").exists(), "no fallback dir");
+    }
+
+    /// Upstream only processes volumes a container mounts
+    /// (`desired_state_of_world_populator.go:293-298`, "Skipping unused
+    /// volume"), so an unused unsupported volume does not fail the pod.
+    #[tokio::test]
+    async fn an_unused_unimplemented_kind_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(
+            tmp.path().to_string_lossy().to_string(),
+            None,
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-nfs"},
+            "spec": {"containers": [{"name": "c", "image": "i"}],
+                "volumes": [{"name": "nfs-vol", "nfs": {"server": "s", "path": "/e"}}]}
+        }))
+        .unwrap();
+        assert!(vm.create_pod_volumes(&pod).await.unwrap().is_empty());
     }
 
     /// The case the ordered if-else this replaced silently resolved: two

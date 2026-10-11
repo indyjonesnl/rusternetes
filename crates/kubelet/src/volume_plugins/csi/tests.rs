@@ -373,6 +373,33 @@ async fn mount_device_with_an_unregistered_driver_is_transient() {
     ));
 }
 
+/// #3262: an inline volume whose driver is not registered is a transient
+/// failure, exactly as for a PersistentVolume: `csi_mounter.go:106-109`
+/// ("mounter.SetUpAt failed to get CSI client") applies to every lifecycle
+/// mode. No placeholder directory may be created.
+#[tokio::test]
+async fn set_up_of_an_unregistered_inline_driver_is_transient() {
+    let f = fx("inlineunreg", &[], None).await;
+    let v: Volume = serde_json::from_value(
+        json!({"name": "eph", "csi": {"driver": "nobody-inline.csi.example.com"}}),
+    )
+    .unwrap();
+    let spec = Spec {
+        volume: &v,
+        persistent_volume: None,
+        read_only: false,
+    };
+    let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
+    let err = m.set_up().await.unwrap_err();
+    assert!(matches!(
+        err.downcast_ref::<CsiError>(),
+        Some(CsiError::Transient(_))
+    ));
+    assert!(err
+        .to_string()
+        .contains("mounter.SetUpAt failed to get CSI client"));
+}
+
 /// `CanDeviceMount` (`csi_plugin.go:702-715`): persistent yes, ephemeral no.
 #[test]
 fn can_device_mount_is_persistent_only() {
