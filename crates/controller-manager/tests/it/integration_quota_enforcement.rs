@@ -200,9 +200,14 @@ async fn test_quota() {
 
     // status.hard must be preserved verbatim from spec.hard.
     let hard_status = status.hard.expect("status.hard must mirror spec.hard");
-    assert_eq!(
-        hard_status.get("pods").map(String::as_str),
-        Some("1000"),
+    // Compare parsed values, as upstream does (`Quantity.Cmp`): the wire form
+    // is canonicalised (`1000` marshals as `1k`, quantity.go:694).
+    let hard_pods = rusternetes_common::quantity::Quantity::parse(
+        hard_status.get("pods").expect("status.hard.pods"),
+    )
+    .unwrap();
+    assert!(
+        hard_pods.value_eq(&rusternetes_common::quantity::Quantity::parse("1000").unwrap()),
         "status.hard.pods must mirror spec.hard.pods"
     );
 }
