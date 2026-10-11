@@ -33,8 +33,10 @@
 //!
 //! DELIBERATE DEVIATIONS (tracked as follow-up issues): no metrics
 //! (`ConcurrencyDenominator`, ratioed gauges,
-//! `NotePriorityLevelConcurrencyAdjustment`: #2809) and no FlowSchema status
-//! updates.
+//! `NotePriorityLevelConcurrencyAdjustment`: #2809). FlowSchema Dangling
+//! status updates are ported (#2949, `presyncFlowSchemaStatus`,
+//! `digestConfigObjects`, `shouldDelayUpdate`) but written by direct
+//! read-modify-write rather than server-side apply.
 //!
 //! Quiescing (#2769): `digest` ports `digestNewPLsLocked` (broken specs are
 //! ignored), `processOldPLsLocked` (an undesired level that is still busy is
@@ -48,9 +50,9 @@
 //! are equivalent either way.
 
 use rusternetes_common::resources::flowcontrol::{
-    FlowDistinguisherMethodType, FlowSchema, FlowSchemaSubject, LimitResponseType,
-    NonResourcePolicyRule, PolicyRulesWithSubjects, PriorityLevelConfiguration, PriorityLevelType,
-    ResourcePolicyRule, SubjectKind,
+    FlowDistinguisherMethodType, FlowSchema, FlowSchemaCondition, FlowSchemaSubject,
+    LimitResponseType, NonResourcePolicyRule, PolicyRulesWithSubjects, PriorityLevelConfiguration,
+    PriorityLevelType, ResourcePolicyRule, SubjectKind,
 };
 use rusternetes_common::validation::flowcontrol_bootstrap::{
     mandatory_flow_schema, mandatory_priority_level_configuration,
@@ -298,6 +300,73 @@ struct Config {
     /// The objects this config was digested from, so a reap can re-digest
     /// without going back to storage.
     inputs: (Vec<PriorityLevelConfiguration>, Vec<FlowSchema>),
+}
+
+/// `fsStatusUpdate` (apf_controller.go:580-584): a buffered FlowSchema status
+/// update.
+#[derive(Debug, Clone)]
+pub struct FsStatusUpdate {
+    /// Name of the FlowSchema to update.
+    pub flow_schema: String,
+    pub condition: FlowSchemaCondition,
+    pub old_value: FlowSchemaCondition,
+}
+
+/// `updateAttempt` (apf_controller.go:196-199).
+struct UpdateAttempt {
+    time_updated: Duration,
+    updated_items: std::collections::HashSet<String>,
+}
+
+/// `presyncFlowSchemaStatus` (apf_controller.go:956-985): the update, if any,
+/// that makes the FlowSchema's Dangling condition reflect whether its
+/// priority-level reference exists. `now` is the transition time to record.
+fn presync_flow_schema_status(
+    fs: &FlowSchema,
+    is_dangling: bool,
+    pl_name: &str,
+    now: String,
+) -> Option<FsStatusUpdate> {
+    let dangling_condition = fs
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .and_then(|c| c.iter().find(|c| c.type_ == "Dangling"))
+        .cloned()
+        .unwrap_or_else(|| FlowSchemaCondition {
+            type_: "Dangling".to_string(),
+            ..Default::default()
+        });
+    let (desired_status, desired_reason, desired_message) = if is_dangling {
+        (
+            "True",
+            "NotFound",
+            format!("This FlowSchema references the PriorityLevelConfiguration object named {pl_name:?} but there is no such object"),
+        )
+    } else {
+        (
+            "False",
+            "Found",
+            format!("This FlowSchema references the PriorityLevelConfiguration object named {pl_name:?} and it exists"),
+        )
+    };
+    if dangling_condition.status == desired_status
+        && dangling_condition.reason.as_deref().unwrap_or("") == desired_reason
+        && dangling_condition.message.as_deref().unwrap_or("") == desired_message
+    {
+        return None;
+    }
+    Some(FsStatusUpdate {
+        flow_schema: fs.metadata.name.clone(),
+        condition: FlowSchemaCondition {
+            type_: "Dangling".to_string(),
+            status: desired_status.to_string(),
+            last_transition_time: Some(now),
+            reason: Some(desired_reason.to_string()),
+            message: Some(desired_message),
+        },
+        old_value: dangling_condition,
+    })
 }
 
 /// Result of classification.
@@ -932,6 +1001,8 @@ pub struct FlowControlEngine<S: Storage> {
     /// The clock queuesets and seat-demand integrators read.
     clock: Arc<dyn Clock>,
     config: RwLock<Arc<Config>>,
+    /// `mostRecentUpdates` (apf_controller.go:119-126), newest first.
+    most_recent_updates: Mutex<Vec<UpdateAttempt>>,
 }
 
 impl<S: Storage> FlowControlEngine<S> {
@@ -958,6 +1029,7 @@ impl<S: Storage> FlowControlEngine<S> {
             server_cl,
             clock,
             config,
+            most_recent_updates: Mutex::new(Vec::new()),
         }
     }
 
@@ -1004,7 +1076,10 @@ impl<S: Storage> FlowControlEngine<S> {
     /// [`Self::initialize`] a failed list is an error, so that the caller
     /// requeues rate-limited (`processNextWorkItem`, :517-520) instead of
     /// digesting an empty configuration.
-    pub async fn sync_one(&self) -> Result<(), Box<dyn std::error::Error>> {
+    ///
+    /// Returns `specificDelay`: when non-zero the caller requeues the item
+    /// after that long instead of forgetting its failures (:521-522).
+    pub async fn sync_one(&self) -> Result<Duration, Box<dyn std::error::Error>> {
         let pls: Vec<PriorityLevelConfiguration> = self
             .storage
             .list(&build_key("prioritylevelconfigurations", None, ""))
@@ -1015,8 +1090,7 @@ impl<S: Storage> FlowControlEngine<S> {
             .list(&build_key("flowschemas", None, ""))
             .await
             .map_err(|e| format!("unable to list FlowSchema objects: {e}"))?;
-        self.digest_config_objects(pls, fss);
-        Ok(())
+        self.digest_and_update_status(pls, fss).await
     }
 
     /// First matching FlowSchema in precedence order; `catch-all` is always
@@ -1126,15 +1200,144 @@ impl<S: Storage> FlowControlEngine<S> {
             .map(|l| l.nominal_cl)
     }
 
-    /// `lockAndDigestConfigObjects` (apf_controller.go:595).
+    /// `lockAndDigestConfigObjects` (apf_controller.go:595-632): digest the
+    /// objects and return the FlowSchema status updates to perform once the
+    /// lock is released (`meal.fsStatusUpdates`).
     pub fn digest_config_objects(
         &self,
         pls: Vec<PriorityLevelConfiguration>,
         fss: Vec<FlowSchema>,
-    ) {
+    ) -> Vec<FsStatusUpdate> {
+        // `meal.digestNewPLsLocked`: broken levels are pretended absent, and
+        // `digestFlowSchemasLocked` judges each FlowSchema's reference
+        // against exactly that set (`meal.newPLStates`, :767), before old
+        // levels are held over and mandatory ones imagined.
+        let good: std::collections::HashSet<&str> = pls
+            .iter()
+            .filter(|pl| validate_pl(pl).is_ok())
+            .map(|pl| pl.metadata.name.as_str())
+            .collect();
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let updates: Vec<FsStatusUpdate> = fss
+            .iter()
+            .filter_map(|fs| {
+                let pl_name = &fs.spec.priority_level_configuration.name;
+                presync_flow_schema_status(
+                    fs,
+                    !good.contains(pl_name.as_str()),
+                    pl_name,
+                    now.clone(),
+                )
+            })
+            .collect();
         let mut cfg = self.config.write().unwrap();
         let next = digest(pls, fss, self.server_cl, Some(&cfg), &self.clock);
         *cfg = Arc::new(next);
+        updates
+    }
+
+    /// `shouldDelayUpdate` (apf_controller.go:651-670): whether the
+    /// FlowSchema has been updated too often (more than 5 times in the past
+    /// minute).
+    fn should_delay_update(&self, name: &str) -> bool {
+        let mut recent = self.most_recent_updates.lock().unwrap();
+        let one_minute_ago = self.clock.now().checked_sub(Duration::from_secs(60));
+        let mut n = 0;
+        for idx in 0..recent.len() {
+            if one_minute_ago.is_some_and(|t| t > recent[idx].time_updated) {
+                // this and the remaining items are no longer relevant
+                recent.truncate(idx);
+                return false;
+            }
+            if recent[idx].updated_items.contains(name) {
+                n += 1;
+                if n > 5 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// `digestConfigObjects` (apf_controller.go:589-626): digest, then write
+    /// the buffered FlowSchema status updates with the lock released.
+    /// Returns `suggestedDelay` (non-zero when an update was skipped for being
+    /// too frequent) or the aggregated write errors.
+    async fn digest_and_update_status(
+        &self,
+        pls: Vec<PriorityLevelConfiguration>,
+        fss: Vec<FlowSchema>,
+    ) -> Result<Duration, Box<dyn std::error::Error>> {
+        let updates = self.digest_config_objects(pls, fss);
+        let mut errs: Vec<String> = Vec::new();
+        let mut updated_items = std::collections::HashSet::new();
+        let mut suggested_delay = Duration::ZERO;
+        for fsu in updates {
+            // if we should skip this name, indicate we will need a delay,
+            // but continue with other entries
+            if self.should_delay_update(&fsu.flow_schema) {
+                if suggested_delay.is_zero() {
+                    use rand::Rng;
+                    suggested_delay = Duration::from_secs(30 + rand::rng().random_range(0..45));
+                }
+                continue;
+            }
+            updated_items.insert(fsu.flow_schema.clone());
+            tracing::debug!(
+                "writing Condition {:?} to FlowSchema {}, previous value was {:?}",
+                fsu.condition,
+                fsu.flow_schema,
+                fsu.old_value
+            );
+            if let Err(e) = self.apply_status(&fsu).await {
+                if matches!(e, rusternetes_common::Error::NotFound(_)) {
+                    // This object has been deleted. A notification is
+                    // coming and nothing more needs to be done here.
+                } else {
+                    errs.push(format!(
+                        "failed to set a status.condition for FlowSchema {}: {}",
+                        fsu.flow_schema, e
+                    ));
+                }
+            }
+        }
+        // `addUpdateResult`
+        self.most_recent_updates.lock().unwrap().insert(
+            0,
+            UpdateAttempt {
+                time_updated: self.clock.now(),
+                updated_items,
+            },
+        );
+        if errs.is_empty() {
+            Ok(suggested_delay)
+        } else {
+            Err(errs.join("; ").into())
+        }
+    }
+
+    /// `apply` (apf_controller.go:628-635): write the one Dangling condition
+    /// into the FlowSchema's status. Upstream server-side-applies it with
+    /// `Force` under the controller's field manager, which owns only that
+    /// condition; here the condition of that type is replaced in the stored
+    /// object, leaving any other condition alone (DEVIATION: a direct
+    /// read-modify-write instead of an `ApplyStatus` through the API).
+    async fn apply_status(&self, fsu: &FsStatusUpdate) -> rusternetes_common::Result<()> {
+        let key = build_key("flowschemas", None, &fsu.flow_schema);
+        let mut fs: FlowSchema = self.storage.get(&key).await?;
+        let conditions = fs
+            .status
+            .get_or_insert(
+                rusternetes_common::resources::flowcontrol::FlowSchemaStatus { conditions: None },
+            )
+            .conditions
+            .get_or_insert_with(Vec::new);
+        match conditions.iter_mut().find(|c| c.type_ == "Dangling") {
+            Some(c) => *c = fsu.condition.clone(),
+            None => conditions.push(fsu.condition.clone()),
+        }
+        self.storage.update(&key, &fs).await?;
+        Ok(())
     }
 
     /// `updateBorrowing` (apf_controller.go:393): run every
@@ -1854,6 +2057,107 @@ mod tests {
         e.execute(&cls("x", pl, "d"), 1, Duration::from_millis(50))
             .await
             .unwrap()
+    }
+
+    // presyncFlowSchemaStatus / digestFlowSchemasLocked
+    // (apf_controller.go:956-985, :773): the Dangling condition of every
+    // FlowSchema reflects whether its priority-level reference exists, and
+    // syncOne writes it (:613).
+    async fn dangling_of(
+        st: &Arc<MemoryStorage>,
+        name: &str,
+    ) -> Option<rusternetes_common::resources::flowcontrol::FlowSchemaCondition> {
+        let fs: FlowSchema = st.get(&build_key("flowschemas", None, name)).await.unwrap();
+        fs.status
+            .and_then(|s| s.conditions)
+            .and_then(|c| c.into_iter().find(|c| c.type_ == "Dangling"))
+    }
+
+    fn fs_ref(name: &str, pl: &str) -> FlowSchema {
+        let mut fs = mandatory_flow_schema("catch-all").unwrap();
+        fs.metadata = ObjectMeta::new(name);
+        fs.spec.priority_level_configuration.name = pl.to_string();
+        fs.spec.matching_precedence = 500;
+        fs
+    }
+
+    #[tokio::test]
+    async fn sync_one_writes_dangling_conditions() {
+        let st = Arc::new(MemoryStorage::new());
+        put_pl(&st, &named_pl("a", 4, 2)).await;
+        for fs in [fs_ref("good", "a"), fs_ref("bad", "nope")] {
+            st.create(&build_key("flowschemas", None, &fs.metadata.name), &fs)
+                .await
+                .unwrap();
+        }
+        let e = FlowControlEngine::with_limits(st.clone(), 100, 0);
+        e.sync_one().await.unwrap();
+        let good = dangling_of(&st, "good")
+            .await
+            .expect("good has a condition");
+        assert_eq!(good.status, "False");
+        assert_eq!(good.reason.as_deref(), Some("Found"));
+        assert_eq!(
+            good.message.as_deref(),
+            Some("This FlowSchema references the PriorityLevelConfiguration object named \"a\" and it exists")
+        );
+        let bad = dangling_of(&st, "bad").await.expect("bad has a condition");
+        assert_eq!(bad.status, "True");
+        assert_eq!(bad.reason.as_deref(), Some("NotFound"));
+        assert_eq!(
+            bad.message.as_deref(),
+            Some("This FlowSchema references the PriorityLevelConfiguration object named \"nope\" but there is no such object")
+        );
+    }
+
+    #[tokio::test]
+    async fn dangling_condition_already_current_is_not_rewritten() {
+        let st = Arc::new(MemoryStorage::new());
+        put_pl(&st, &named_pl("a", 4, 2)).await;
+        let fs = fs_ref("good", "a");
+        st.create(&build_key("flowschemas", None, "good"), &fs)
+            .await
+            .unwrap();
+        let e = FlowControlEngine::with_limits(st.clone(), 100, 0);
+        e.sync_one().await.unwrap();
+        let first = dangling_of(&st, "good").await.unwrap();
+        // presyncFlowSchemaStatus returns early when status/reason/message
+        // already match, so the transition time is untouched.
+        let ups = e.digest_config_objects(
+            vec![named_pl("a", 4, 2)],
+            vec![st
+                .get(&build_key("flowschemas", None, "good"))
+                .await
+                .unwrap()],
+        );
+        assert!(ups.is_empty(), "{ups:?}");
+        assert_eq!(
+            serde_json::to_value(dangling_of(&st, "good").await.unwrap()).unwrap(),
+            serde_json::to_value(first).unwrap()
+        );
+    }
+
+    // shouldDelayUpdate (apf_controller.go:651-670): more than 5 updates of
+    // one FlowSchema in the past minute delays the next.
+    #[test]
+    fn should_delay_update_after_five_updates_in_a_minute() {
+        let e = engine();
+        {
+            let mut r = e.most_recent_updates.lock().unwrap();
+            for _ in 0..5 {
+                r.push(UpdateAttempt {
+                    time_updated: e.clock.now(),
+                    updated_items: ["x".to_string()].into_iter().collect(),
+                });
+            }
+        }
+        assert!(!e.should_delay_update("x"), "5 is allowed");
+        e.most_recent_updates.lock().unwrap().push(UpdateAttempt {
+            time_updated: e.clock.now(),
+            updated_items: ["x".to_string()].into_iter().collect(),
+        });
+        assert!(e.should_delay_update("x"), "6th is delayed");
+        assert!(!e.should_delay_update("y"));
     }
 
     #[tokio::test]

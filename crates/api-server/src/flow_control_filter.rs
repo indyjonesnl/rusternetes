@@ -683,8 +683,8 @@ impl ConfigEventFilter {
 /// (pkg/controlplane/apiserver/config.go:159), but the handlers' `UpdateFunc`
 /// drops a resync (old == new), so it never reloads anything; there is
 /// therefore no periodic wake-up here and an idle cluster does not poll.
-/// `specificDelay` (FlowSchema status-update conflicts, :520-523) is not
-/// ported: the status writer is not part of this controller yet.
+/// `specificDelay` (:521-522) requeues after that delay without recording a
+/// failure.
 pub fn spawn_config_reloader<S: Storage + 'static>(
     engine: Arc<FlowControlEngine<S>>,
 ) -> tokio::task::JoinHandle<()> {
@@ -707,7 +707,7 @@ pub fn spawn_config_reloader<S: Storage + 'static>(
 async fn run_config_worker<Sync, SyncFut, Watch, WatchFut>(mut sync: Sync, mut watch: Watch)
 where
     Sync: FnMut() -> SyncFut,
-    SyncFut: std::future::Future<Output = Result<(), String>>,
+    SyncFut: std::future::Future<Output = Result<Duration, String>>,
     Watch: FnMut(String) -> WatchFut,
     WatchFut: std::future::Future<Output = Option<rusternetes_storage::WatchStream>>,
 {
@@ -742,7 +742,12 @@ where
         if queued {
             queued = false;
             match sync().await {
-                Ok(()) => {
+                // `case specificDelay > 0: AddAfter(obj, specificDelay)`
+                // (:521-522): requeue after the delay, failures not forgotten.
+                Ok(delay) if !delay.is_zero() => {
+                    retry_at = Some(tokio::time::Instant::now() + delay);
+                }
+                Ok(_) => {
                     limiter.forget(CONFIG_QUEUE_KEY);
                     // A watch still down must be retried even with nothing
                     // queued, or the worker would sleep forever.
@@ -1697,7 +1702,7 @@ mod tests {
                     if c.len() < 4 {
                         Err("boom".to_string())
                     } else {
-                        Ok(())
+                        Ok(Duration::ZERO)
                     }
                 }
             },
@@ -1724,7 +1729,7 @@ mod tests {
                 let c = c.clone();
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
+                    Ok(Duration::ZERO)
                 }
             },
             move |prefix: String| {
