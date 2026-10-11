@@ -213,6 +213,69 @@ pub enum Feature {
     /// kubelet passes the pod RuntimeClass handler in `ImageSpec.runtime_handler`
     /// (`kuberuntime_container.go:177-190` `getPodRuntimeHandler`).
     RuntimeClassInImageCriApi,
+
+    /// Upstream gate `DynamicResourceAllocation`: pkg/features/kube_features.go:1293-1296 (1.34 GA, 1.35 GA + LockToDefault). Modelled so `DEPENDENCIES` can reference it (#3222).
+    DynamicResourceAllocation,
+
+    /// Upstream gate `AuthorizeWithSelectors`: staging/src/k8s.io/apiserver/pkg/features/kube_features.go:350-354 (1.34 GA + LockToDefault). Modelled so `DEPENDENCIES` can reference it (#3222).
+    AuthorizeWithSelectors,
+
+    /// Upstream gate `AuthorizeNodeWithSelectors`: pkg/features/kube_features.go:1147-1149 (1.34 GA + LockToDefault). Modelled so `DEPENDENCIES` can reference it (#3222).
+    AuthorizeNodeWithSelectors,
+
+    /// Upstream gate `MultiCIDRServiceAllocator`: pkg/features/kube_features.go:1531-1534 (1.34 GA + LockToDefault). Modelled so `DEPENDENCIES` can reference it (#3222).
+    MultiCIDRServiceAllocator,
+
+    /// Upstream gate `DisableAllocatorDualWrite`: pkg/features/kube_features.go:1276-1279 (1.35 GA + LockToDefault). Modelled so `DEPENDENCIES` can reference it (#3222).
+    DisableAllocatorDualWrite,
+
+    /// Upstream gate `GangScheduling`: pkg/features/kube_features.go:1318 (1.35 Alpha, off). Modelled so `DEPENDENCIES` can reference it (#3222).
+    GangScheduling,
+
+    /// Upstream gate `GracefulNodeShutdown`: pkg/features/kube_features.go:1331-1332 (1.21 Beta, on). Modelled so `DEPENDENCIES` can reference it (#3222).
+    GracefulNodeShutdown,
+
+    /// Upstream gate `GracefulNodeShutdownBasedOnPodPriority`: pkg/features/kube_features.go:1336-1337 (1.24 Beta, on). Modelled so `DEPENDENCIES` can reference it (#3222).
+    GracefulNodeShutdownBasedOnPodPriority,
+
+    /// Upstream gate `InPlacePodVerticalScalingAllocatedStatus`: pkg/features/kube_features.go:1383-1384 (1.33 Deprecated, off). Modelled so `DEPENDENCIES` can reference it (#3222).
+    InPlacePodVerticalScalingAllocatedStatus,
+
+    /// Upstream gate `InPlacePodVerticalScalingExclusiveCPUs`: pkg/features/kube_features.go:1388 (1.32 Alpha, off). Modelled so `DEPENDENCIES` can reference it (#3222).
+    InPlacePodVerticalScalingExclusiveCPUs,
+
+    /// Upstream gate `InPlacePodVerticalScalingExclusiveMemory`: pkg/features/kube_features.go:1392 (1.34 Alpha, off). Modelled so `DEPENDENCIES` can reference it (#3222).
+    InPlacePodVerticalScalingExclusiveMemory,
+
+    /// Upstream gate `MemoryManager`: pkg/features/kube_features.go:1521-1523 (1.32 GA + LockToDefault). Modelled so `DEPENDENCIES` can reference it (#3222).
+    MemoryManager,
+
+    /// Upstream gate `PodLifecycleSleepAction`: pkg/features/kube_features.go:1618-1620 (1.34 GA + LockToDefault). Modelled so `DEPENDENCIES` can reference it (#3222).
+    PodLifecycleSleepAction,
+
+    /// Upstream gate `PodLifecycleSleepActionAllowZero`: pkg/features/kube_features.go:1624-1626 (1.34 GA + LockToDefault). Modelled so `DEPENDENCIES` can reference it (#3222).
+    PodLifecycleSleepActionAllowZero,
+
+    /// Upstream gate `ProcMountType`: pkg/features/kube_features.go:1670-1673 (1.33 Beta, on). Modelled so `DEPENDENCIES` can reference it (#3222).
+    ProcMountType,
+
+    /// Upstream gate `UserNamespacesSupport`: pkg/features/kube_features.go:1894-1897 (1.33 Beta, on). Modelled so `DEPENDENCIES` can reference it (#3222).
+    UserNamespacesSupport,
+
+    /// Upstream gate `DRAAdminAccess`: pkg/features/kube_features.go:1227-1230 (1.34 Beta, on). Modelled so `DEPENDENCIES` can reference it (#3222).
+    DRAAdminAccess,
+
+    /// Upstream gate `DRAPrioritizedList`: pkg/features/kube_features.go:1256-1259 (1.34 Beta, on). Modelled so `DEPENDENCIES` can reference it (#3222).
+    DRAPrioritizedList,
+
+    /// Upstream gate `DRASchedulerFilterTimeout`: pkg/features/kube_features.go:1266-1268 (1.34 Beta, on). Modelled so `DEPENDENCIES` can reference it (#3222).
+    DRASchedulerFilterTimeout,
+
+    /// Upstream gate `ContainerRestartRules`: pkg/features/kube_features.go:1214-1217 (1.35 Beta, on). Modelled so `DEPENDENCIES` can reference it (#3222).
+    ContainerRestartRules,
+
+    /// Upstream gate `RestartAllContainersOnContainerExits`: pkg/features/kube_features.go:1720-1722 (1.35 Alpha, off). Modelled so `DEPENDENCIES` can reference it (#3222).
+    RestartAllContainersOnContainerExits,
 }
 
 impl Feature {
@@ -260,6 +323,27 @@ impl Feature {
             Feature::StorageCapacityScoring => 38,
             Feature::CrossNamespaceVolumeDataSource => 39,
             Feature::RuntimeClassInImageCriApi => 40,
+            Feature::DynamicResourceAllocation => 41,
+            Feature::AuthorizeWithSelectors => 42,
+            Feature::AuthorizeNodeWithSelectors => 43,
+            Feature::MultiCIDRServiceAllocator => 44,
+            Feature::DisableAllocatorDualWrite => 45,
+            Feature::GangScheduling => 46,
+            Feature::GracefulNodeShutdown => 47,
+            Feature::GracefulNodeShutdownBasedOnPodPriority => 48,
+            Feature::InPlacePodVerticalScalingAllocatedStatus => 49,
+            Feature::InPlacePodVerticalScalingExclusiveCPUs => 50,
+            Feature::InPlacePodVerticalScalingExclusiveMemory => 51,
+            Feature::MemoryManager => 52,
+            Feature::PodLifecycleSleepAction => 53,
+            Feature::PodLifecycleSleepActionAllowZero => 54,
+            Feature::ProcMountType => 55,
+            Feature::UserNamespacesSupport => 56,
+            Feature::DRAAdminAccess => 57,
+            Feature::DRAPrioritizedList => 58,
+            Feature::DRASchedulerFilterTimeout => 59,
+            Feature::ContainerRestartRules => 60,
+            Feature::RestartAllContainersOnContainerExits => 61,
         }
     }
 
@@ -271,9 +355,17 @@ impl Feature {
     /// [`set_from_str`].
     const fn prerelease(self) -> PreRelease {
         match self {
-            Feature::RelaxedDNSSearchValidation | Feature::InPlacePodVerticalScaling => {
-                PreRelease::Ga
-            }
+            Feature::RelaxedDNSSearchValidation
+            | Feature::InPlacePodVerticalScaling
+            | Feature::DynamicResourceAllocation
+            | Feature::AuthorizeWithSelectors
+            | Feature::AuthorizeNodeWithSelectors
+            | Feature::MultiCIDRServiceAllocator
+            | Feature::DisableAllocatorDualWrite
+            | Feature::MemoryManager
+            | Feature::PodLifecycleSleepAction
+            | Feature::PodLifecycleSleepActionAllowZero => PreRelease::Ga,
+            Feature::InPlacePodVerticalScalingAllocatedStatus => PreRelease::Deprecated,
             Feature::PodTopologyLabelsAdmission
             | Feature::SELinuxMountReadWriteOncePod
             | Feature::SELinuxMount
@@ -293,7 +385,15 @@ impl Feature {
             | Feature::WatchCacheInitializationPostStartHook
             | Feature::MutableCSINodeAllocatableCount
             | Feature::MutatingAdmissionPolicy
-            | Feature::DeploymentReplicaSetTerminatingReplicas => PreRelease::Beta,
+            | Feature::DeploymentReplicaSetTerminatingReplicas
+            | Feature::GracefulNodeShutdown
+            | Feature::GracefulNodeShutdownBasedOnPodPriority
+            | Feature::ProcMountType
+            | Feature::UserNamespacesSupport
+            | Feature::DRAAdminAccess
+            | Feature::DRAPrioritizedList
+            | Feature::DRASchedulerFilterTimeout
+            | Feature::ContainerRestartRules => PreRelease::Beta,
             Feature::NodeDeclaredFeatures
             | Feature::DRADeviceTaints
             | Feature::DRAPartitionableDevices
@@ -312,7 +412,11 @@ impl Feature {
             | Feature::ReduceDefaultCrashLoopBackOffDecay
             | Feature::StorageCapacityScoring
             | Feature::CrossNamespaceVolumeDataSource
-            | Feature::RuntimeClassInImageCriApi => PreRelease::Alpha,
+            | Feature::RuntimeClassInImageCriApi
+            | Feature::GangScheduling
+            | Feature::InPlacePodVerticalScalingExclusiveCPUs
+            | Feature::InPlacePodVerticalScalingExclusiveMemory
+            | Feature::RestartAllContainersOnContainerExits => PreRelease::Alpha,
         }
     }
 
@@ -325,7 +429,16 @@ impl Feature {
     const fn locked_to_default(self) -> bool {
         matches!(
             self,
-            Feature::RelaxedDNSSearchValidation | Feature::InPlacePodVerticalScaling
+            Feature::RelaxedDNSSearchValidation
+                | Feature::InPlacePodVerticalScaling
+                | Feature::DynamicResourceAllocation
+                | Feature::AuthorizeWithSelectors
+                | Feature::AuthorizeNodeWithSelectors
+                | Feature::MultiCIDRServiceAllocator
+                | Feature::DisableAllocatorDualWrite
+                | Feature::MemoryManager
+                | Feature::PodLifecycleSleepAction
+                | Feature::PodLifecycleSleepActionAllowZero
         )
     }
 
@@ -412,6 +525,48 @@ impl Feature {
             Feature::CrossNamespaceVolumeDataSource => false,
             // 1.29 Alpha, off (kube_features.go:1729-1731).
             Feature::RuntimeClassInImageCriApi => false,
+            // pkg/features/kube_features.go:1293-1296 (1.34 GA, 1.35 GA + LockToDefault)
+            Feature::DynamicResourceAllocation => true,
+            // staging/src/k8s.io/apiserver/pkg/features/kube_features.go:350-354 (1.34 GA + LockToDefault)
+            Feature::AuthorizeWithSelectors => true,
+            // pkg/features/kube_features.go:1147-1149 (1.34 GA + LockToDefault)
+            Feature::AuthorizeNodeWithSelectors => true,
+            // pkg/features/kube_features.go:1531-1534 (1.34 GA + LockToDefault)
+            Feature::MultiCIDRServiceAllocator => true,
+            // pkg/features/kube_features.go:1276-1279 (1.35 GA + LockToDefault)
+            Feature::DisableAllocatorDualWrite => true,
+            // pkg/features/kube_features.go:1318 (1.35 Alpha, off)
+            Feature::GangScheduling => false,
+            // pkg/features/kube_features.go:1331-1332 (1.21 Beta, on)
+            Feature::GracefulNodeShutdown => true,
+            // pkg/features/kube_features.go:1336-1337 (1.24 Beta, on)
+            Feature::GracefulNodeShutdownBasedOnPodPriority => true,
+            // pkg/features/kube_features.go:1383-1384 (1.33 Deprecated, off)
+            Feature::InPlacePodVerticalScalingAllocatedStatus => false,
+            // pkg/features/kube_features.go:1388 (1.32 Alpha, off)
+            Feature::InPlacePodVerticalScalingExclusiveCPUs => false,
+            // pkg/features/kube_features.go:1392 (1.34 Alpha, off)
+            Feature::InPlacePodVerticalScalingExclusiveMemory => false,
+            // pkg/features/kube_features.go:1521-1523 (1.32 GA + LockToDefault)
+            Feature::MemoryManager => true,
+            // pkg/features/kube_features.go:1618-1620 (1.34 GA + LockToDefault)
+            Feature::PodLifecycleSleepAction => true,
+            // pkg/features/kube_features.go:1624-1626 (1.34 GA + LockToDefault)
+            Feature::PodLifecycleSleepActionAllowZero => true,
+            // pkg/features/kube_features.go:1670-1673 (1.33 Beta, on)
+            Feature::ProcMountType => true,
+            // pkg/features/kube_features.go:1894-1897 (1.33 Beta, on)
+            Feature::UserNamespacesSupport => true,
+            // pkg/features/kube_features.go:1227-1230 (1.34 Beta, on)
+            Feature::DRAAdminAccess => true,
+            // pkg/features/kube_features.go:1256-1259 (1.34 Beta, on)
+            Feature::DRAPrioritizedList => true,
+            // pkg/features/kube_features.go:1266-1268 (1.34 Beta, on)
+            Feature::DRASchedulerFilterTimeout => true,
+            // pkg/features/kube_features.go:1214-1217 (1.35 Beta, on)
+            Feature::ContainerRestartRules => true,
+            // pkg/features/kube_features.go:1720-1722 (1.35 Alpha, off)
+            Feature::RestartAllContainersOnContainerExits => false,
         }
     }
 }
@@ -469,6 +624,27 @@ pub const ALL_FEATURES: &[Feature] = &[
     Feature::StorageCapacityScoring,
     Feature::CrossNamespaceVolumeDataSource,
     Feature::RuntimeClassInImageCriApi,
+    Feature::DynamicResourceAllocation,
+    Feature::AuthorizeWithSelectors,
+    Feature::AuthorizeNodeWithSelectors,
+    Feature::MultiCIDRServiceAllocator,
+    Feature::DisableAllocatorDualWrite,
+    Feature::GangScheduling,
+    Feature::GracefulNodeShutdown,
+    Feature::GracefulNodeShutdownBasedOnPodPriority,
+    Feature::InPlacePodVerticalScalingAllocatedStatus,
+    Feature::InPlacePodVerticalScalingExclusiveCPUs,
+    Feature::InPlacePodVerticalScalingExclusiveMemory,
+    Feature::MemoryManager,
+    Feature::PodLifecycleSleepAction,
+    Feature::PodLifecycleSleepActionAllowZero,
+    Feature::ProcMountType,
+    Feature::UserNamespacesSupport,
+    Feature::DRAAdminAccess,
+    Feature::DRAPrioritizedList,
+    Feature::DRASchedulerFilterTimeout,
+    Feature::ContainerRestartRules,
+    Feature::RestartAllContainersOnContainerExits,
 ];
 
 /// Total number of feature gates. Derived from [`ALL_FEATURES`].
@@ -524,6 +700,27 @@ static STATES: [AtomicBool; NUM_FEATURES] = [
     AtomicBool::new(Feature::StorageCapacityScoring.default_enabled()),
     AtomicBool::new(Feature::CrossNamespaceVolumeDataSource.default_enabled()),
     AtomicBool::new(Feature::RuntimeClassInImageCriApi.default_enabled()),
+    AtomicBool::new(Feature::DynamicResourceAllocation.default_enabled()),
+    AtomicBool::new(Feature::AuthorizeWithSelectors.default_enabled()),
+    AtomicBool::new(Feature::AuthorizeNodeWithSelectors.default_enabled()),
+    AtomicBool::new(Feature::MultiCIDRServiceAllocator.default_enabled()),
+    AtomicBool::new(Feature::DisableAllocatorDualWrite.default_enabled()),
+    AtomicBool::new(Feature::GangScheduling.default_enabled()),
+    AtomicBool::new(Feature::GracefulNodeShutdown.default_enabled()),
+    AtomicBool::new(Feature::GracefulNodeShutdownBasedOnPodPriority.default_enabled()),
+    AtomicBool::new(Feature::InPlacePodVerticalScalingAllocatedStatus.default_enabled()),
+    AtomicBool::new(Feature::InPlacePodVerticalScalingExclusiveCPUs.default_enabled()),
+    AtomicBool::new(Feature::InPlacePodVerticalScalingExclusiveMemory.default_enabled()),
+    AtomicBool::new(Feature::MemoryManager.default_enabled()),
+    AtomicBool::new(Feature::PodLifecycleSleepAction.default_enabled()),
+    AtomicBool::new(Feature::PodLifecycleSleepActionAllowZero.default_enabled()),
+    AtomicBool::new(Feature::ProcMountType.default_enabled()),
+    AtomicBool::new(Feature::UserNamespacesSupport.default_enabled()),
+    AtomicBool::new(Feature::DRAAdminAccess.default_enabled()),
+    AtomicBool::new(Feature::DRAPrioritizedList.default_enabled()),
+    AtomicBool::new(Feature::DRASchedulerFilterTimeout.default_enabled()),
+    AtomicBool::new(Feature::ContainerRestartRules.default_enabled()),
+    AtomicBool::new(Feature::RestartAllContainersOnContainerExits.default_enabled()),
 ];
 
 /// Returns whether `feature` is currently enabled in this process.
@@ -628,7 +825,7 @@ pub fn set_from_str(value: &str) -> Result<(), String> {
 /// After the per-gate pass, the dependency check (:418-434) runs against the
 /// resulting state (see [`check_dependencies`]).
 ///
-/// Gap: emulation versions are not modelled.
+/// Gap: emulation versions are not modelled (tracked separately).
 fn set_from_map(m: &[(String, bool)]) -> Result<(), String> {
     let resolved = resolve_gates(m, &known_gates())?;
     check_dependencies(|f| {
@@ -656,15 +853,64 @@ fn set_from_map(m: &[(String, bool)]) -> Result<(), String> {
     Ok(())
 }
 
-/// `defaultKubernetesFeatureGateDependencies` (pkg/features/kube_features.go:2166+)
-/// restricted to gates this crate models; an edge to an unmodelled gate
-/// (e.g. `DynamicResourceAllocation`) cannot be evaluated and is omitted.
+/// `defaultKubernetesFeatureGateDependencies` (pkg/features/kube_features.go:2166-2420)
+/// restricted to non-empty entries whose gates are all modelled in
+/// [`Feature`] (#3222); the rest are tracked in a follow-up issue. `AuthorizeNodeWithSelectors: {genericfeatures.AuthorizeWithSelectors}`
+/// comes from the same map.
 const DEPENDENCIES: &[(Feature, &[Feature])] = &[
+    (
+        Feature::AuthorizeNodeWithSelectors,
+        &[Feature::AuthorizeWithSelectors],
+    ),
     (
         Feature::ClusterTrustBundleProjection,
         &[Feature::ClusterTrustBundle],
     ),
+    (
+        Feature::DRAAdminAccess,
+        &[Feature::DynamicResourceAllocation],
+    ),
+    (
+        Feature::DRAConsumableCapacity,
+        &[Feature::DynamicResourceAllocation],
+    ),
+    (
+        Feature::DRADeviceBindingConditions,
+        &[
+            Feature::DynamicResourceAllocation,
+            Feature::DRAResourceClaimDeviceStatus,
+        ],
+    ),
     (Feature::DRADeviceTaintRules, &[Feature::DRADeviceTaints]),
+    (
+        Feature::DRADeviceTaints,
+        &[Feature::DynamicResourceAllocation],
+    ),
+    (
+        Feature::DRAExtendedResource,
+        &[Feature::DynamicResourceAllocation],
+    ),
+    (
+        Feature::DRAPartitionableDevices,
+        &[Feature::DynamicResourceAllocation],
+    ),
+    (
+        Feature::DRAPrioritizedList,
+        &[Feature::DynamicResourceAllocation],
+    ),
+    (
+        Feature::DRASchedulerFilterTimeout,
+        &[Feature::DynamicResourceAllocation],
+    ),
+    (
+        Feature::DisableAllocatorDualWrite,
+        &[Feature::MultiCIDRServiceAllocator],
+    ),
+    (Feature::GangScheduling, &[Feature::GenericWorkload]),
+    (
+        Feature::GracefulNodeShutdownBasedOnPodPriority,
+        &[Feature::GracefulNodeShutdown],
+    ),
     (
         Feature::InPlacePodLevelResourcesVerticalScaling,
         &[
@@ -674,8 +920,41 @@ const DEPENDENCIES: &[(Feature, &[Feature])] = &[
         ],
     ),
     (
+        Feature::InPlacePodVerticalScalingAllocatedStatus,
+        &[Feature::InPlacePodVerticalScaling],
+    ),
+    (
+        Feature::InPlacePodVerticalScalingExclusiveCPUs,
+        &[Feature::InPlacePodVerticalScaling],
+    ),
+    (
+        Feature::InPlacePodVerticalScalingExclusiveMemory,
+        &[Feature::InPlacePodVerticalScaling, Feature::MemoryManager],
+    ),
+    (
         Feature::MatchLabelKeysInPodTopologySpreadSelectorMerge,
         &[Feature::MatchLabelKeysInPodTopologySpread],
+    ),
+    (
+        Feature::PodCertificateRequest,
+        &[Feature::AuthorizeNodeWithSelectors],
+    ),
+    (
+        Feature::PodLifecycleSleepActionAllowZero,
+        &[Feature::PodLifecycleSleepAction],
+    ),
+    (Feature::ProcMountType, &[Feature::UserNamespacesSupport]),
+    (
+        Feature::ResourceHealthStatus,
+        &[Feature::DynamicResourceAllocation],
+    ),
+    (Feature::StorageVersionAPI, &[Feature::APIServerIdentity]),
+    (
+        Feature::RestartAllContainersOnContainerExits,
+        &[
+            Feature::ContainerRestartRules,
+            Feature::NodeDeclaredFeatures,
+        ],
     ),
 ];
 
