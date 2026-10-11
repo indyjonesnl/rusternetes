@@ -660,13 +660,19 @@ impl CriContainerRuntime {
         &self,
         image: &str,
         pull_policy: Option<&str>,
-        _event_ctx: Option<(&Pod, &str)>,
+        event_ctx: Option<(&Pod, &str)>,
     ) -> anyhow::Result<()> {
         let policy = pull_policy.unwrap_or("IfNotPresent");
         let mut cri = self.cri.clone();
+        // `EnsureImageExists` (`images/image_manager.go:194`): the pod runtime
+        // handler goes in the ImageSpec of both ImageStatus and PullImage.
+        let handler = self.pod_runtime_handler(event_ctx.map(|(p, _)| p)).await?;
 
         if policy != "Always" {
-            let present = cri.image_status(image, false).await?.is_some();
+            let present = cri
+                .image_status_for_handler(image, &handler, false)
+                .await?
+                .is_some();
             if present {
                 return Ok(());
             }
@@ -678,8 +684,7 @@ impl CriContainerRuntime {
                 }));
             }
         }
-        cri.pull_image(image, Some(&self.runtime_handler), None)
-            .await?;
+        cri.pull_image(image, Some(&handler), None).await?;
         Ok(())
     }
 
@@ -719,8 +724,25 @@ impl CriContainerRuntime {
     /// `getPodRuntimeHandler` (`kuberuntime_container.go:177-190`): the runtime
     /// handler passed to image RPCs. Empty unless `RuntimeClassInImageCriApi`.
     async fn pod_runtime_handler(&self, pod: Option<&Pod>) -> anyhow::Result<String> {
-        let _ = pod;
-        Ok(String::new())
+        use rusternetes_common::feature_gates::{enabled, Feature};
+        if !enabled(Feature::RuntimeClassInImageCriApi) {
+            return Ok(String::new());
+        }
+        let class = pod
+            .and_then(|p| p.spec.as_ref())
+            .and_then(|s| s.runtime_class_name.as_deref())
+            .filter(|c| !c.is_empty());
+        let (Some(class), Some(storage)) = (
+            class,
+            self.volumes.as_ref().and_then(|v| v.storage.as_ref()),
+        ) else {
+            return Ok(String::new());
+        };
+        super::host_policy::lookup_runtime_handler(storage.as_ref(), Some(class))
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to lookup runtimeHandler for runtimeClassName {class}: {e}")
+            })
     }
 
     /// Create and start a single container in the pod's existing sandbox. Used
