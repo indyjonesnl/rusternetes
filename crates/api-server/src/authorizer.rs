@@ -240,12 +240,21 @@ mod tests {
     }
 
     #[test]
-    fn complete_defaults_to_node_rbac() {
-        assert_eq!(complete_authorization_modes(&[]), modes(&["Node", "RBAC"]));
+    fn complete_defaults_to_always_allow_like_upstream() {
+        // authorization.go:92-94: no modes (and no --authorization-config) => AlwaysAllow.
+        assert_eq!(complete_authorization_modes(&[]), modes(&["AlwaysAllow"]));
         assert_eq!(
             complete_authorization_modes(&modes(&["RBAC"])),
             modes(&["RBAC"])
         );
+    }
+
+    /// With no `--authorization-mode` the built chain allows everything
+    /// (upstream default AlwaysAllow); Node,RBAC must be passed explicitly.
+    #[tokio::test]
+    async fn no_modes_builds_always_allow_chain() {
+        let a = build(&[]).unwrap();
+        assert!(allowed(&a, pods(user("nobody", &[]))).await);
     }
 
     #[test]
