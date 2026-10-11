@@ -48,6 +48,11 @@ const JSON_PATCH_STRING_FN: &str = "__jsonPatchString";
 /// Guard on an Object field value: map keys must be strings
 /// (`convertField`, dynamic/objects.go:240-258).
 const OBJECT_FIELD_FN: &str = "__objectField";
+/// `jsonpatch.escapeKey` (apiserver `pkg/cel/library/jsonpatch.go:57-62`).
+/// The interpreter parses `jsonpatch.escapeKey(x)` as a member call on the
+/// identifier `jsonpatch`; [`rewrite`] turns it into a global call of this
+/// dotted name.
+const JSON_PATCH_ESCAPE_KEY_FN: &str = "jsonpatch.escapeKey";
 
 /// A compiled CEL expression whose struct initializers have been rewritten.
 pub struct CompiledExpression(IdedExpr);
@@ -66,6 +71,30 @@ pub fn new_context() -> Context<'static> {
                         "unexpected type {} for JSONPatchType string field",
                         kind(&other)
                     ),
+                )),
+            }
+        },
+    );
+    // jsonpatch.go:76-80 `jsonPatchReplacer` ("/" -> "~1", "~" -> "~0"; the
+    // replacer is a single pass, so "~" is not re-escaped after "/").
+    ctx.add_function(
+        JSON_PATCH_ESCAPE_KEY_FN,
+        |v: Value| -> Result<Value, ExecutionError> {
+            match v {
+                Value::String(s) => {
+                    let mut out = String::with_capacity(s.len());
+                    for c in s.chars() {
+                        match c {
+                            '/' => out.push_str("~1"),
+                            '~' => out.push_str("~0"),
+                            c => out.push(c),
+                        }
+                    }
+                    Ok(Value::String(std::sync::Arc::new(out)))
+                }
+                other => Err(ExecutionError::function_error(
+                    JSON_PATCH_ESCAPE_KEY_FN,
+                    format!("no such overload for {}", kind(&other)),
                 )),
             }
         },
@@ -160,6 +189,16 @@ fn rewrite(e: &mut IdedExpr, expected: Option<&str>) -> Result<(), String> {
         Expr::Ident(_) | Expr::Literal(_) => Ok(()),
         Expr::Select(s) => rewrite(&mut s.operand, None),
         Expr::Call(c) => {
+            if c.func_name == "escapeKey"
+                && c.args.len() == 1
+                && matches!(
+                    c.target.as_deref().map(|t| &t.expr),
+                    Some(Expr::Ident(n)) if n == "jsonpatch"
+                )
+            {
+                c.target = None;
+                c.func_name = JSON_PATCH_ESCAPE_KEY_FN.to_string();
+            }
             if let Some(t) = c.target.as_mut() {
                 rewrite(t, None)?;
             }

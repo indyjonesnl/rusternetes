@@ -10,6 +10,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use rusternetes_common::admission::Operation as AdmissionOperation;
 use rusternetes_common::cel::{CELContext, CELEvaluator};
 use rusternetes_common::cel_struct;
 use serde_json::{json, Value};
@@ -23,6 +24,9 @@ pub struct JsonPatcher {
     expression: String,
     /// `PatchEvaluator.CompilationErrors()`, found when the patcher is built.
     compile_error: Option<String>,
+    /// `spec.variables`, `(name, expression)` in declaration order
+    /// (`CompositionEnv.CompiledVariables`, cel/composition.go).
+    variables: Vec<(String, String)>,
     evaluator: Mutex<CELEvaluator>,
 }
 
@@ -36,12 +40,13 @@ impl JsonPatcher {
     /// declaration order.
     pub fn new_patcher_with_variables(
         expression: &str,
-        _variables: &[(String, String)],
+        variables: &[(String, String)],
     ) -> Arc<dyn Patcher> {
         let compile_error = cel_struct::compile(expression).err();
         Arc::new(Self {
             expression: expression.to_string(),
             compile_error,
+            variables: variables.to_vec(),
             evaluator: Mutex::new(CELEvaluator::new()),
         })
     }
@@ -52,7 +57,7 @@ impl JsonPatcher {
         &self,
         r: &PatchRequest<'_>,
     ) -> Result<Vec<Operation>, PatchError> {
-        let json = evaluate_expression(&self.evaluator, &self.expression, r)?;
+        let json = evaluate_expression(&self.evaluator, &self.expression, &self.variables, r)?;
         Self::operations_from(json)
     }
 
@@ -92,26 +97,13 @@ impl JsonPatcher {
 pub(super) fn evaluate_expression(
     evaluator: &Mutex<CELEvaluator>,
     expression: &str,
+    variables: &[(String, String)],
     r: &PatchRequest<'_>,
 ) -> Result<Value, PatchError> {
     {
         let mut ctx = CELContext::new();
         let attrs = r.versioned_attributes;
-        // `CreateAdmissionRequest` (cel/compile.go) needs the request's
-        // attributes, which `PatchRequest` does not carry yet: only the kind
-        // and resource are known here.
-        let request = json!({
-            "kind": {
-                "group": attrs.versioned_kind.group,
-                "version": attrs.versioned_kind.version,
-                "kind": attrs.versioned_kind.kind,
-            },
-            "resource": {
-                "group": r.matched_resource.group,
-                "version": r.matched_resource.version,
-                "resource": r.matched_resource.resource,
-            },
-        });
+        let request = create_admission_request(r);
         let vars: [(&str, &Value); 5] = [
             (
                 "object",
@@ -130,17 +122,101 @@ pub(super) fn evaluate_expression(
                 .map_err(|e| PatchError::Other(e.to_string()))?;
         }
 
-        let value = evaluator
-            .lock()
-            .unwrap()
-            .evaluate_to_value(expression, &ctx)
+        let mut evaluator = evaluator.lock().unwrap();
+        // `compositionContext.Variables` binds `variables` as a lazy map: a
+        // variable is evaluated when read and may read the others
+        // (variableAccessor.Callback, composition.go). Here they are
+        // evaluated up front in declaration order, so a variable can read the
+        // ones declared before it, and a failure is only reported when the
+        // expression actually reads that variable.
+        let mut bound = serde_json::Map::new();
+        let mut failed: Vec<(&str, String)> = Vec::new();
+        ctx.add_json_variable("variables", &Value::Object(bound.clone()))
             .map_err(|e| PatchError::Other(e.to_string()))?;
+        for (name, expr) in variables {
+            let result = evaluator
+                .evaluate_to_value(expr, &ctx)
+                .map_err(|e| e.to_string())
+                .and_then(|v| v.json().map_err(|e| e.to_string()));
+            match result {
+                Ok(v) => {
+                    bound.insert(name.clone(), v);
+                    ctx.add_json_variable("variables", &Value::Object(bound.clone()))
+                        .map_err(|e| PatchError::Other(e.to_string()))?;
+                }
+                Err(e) => failed.push((name, composited_failure(&failed, expr, name, e))),
+            }
+        }
+
+        let value = evaluator.evaluate_to_value(expression, &ctx).map_err(|e| {
+            PatchError::Other(
+                match failed.iter().find(|(n, _)| reads_variable(expression, n)) {
+                    Some((_, msg)) => msg.clone(),
+                    None => e.to_string(),
+                },
+            )
+        })?;
         value.json().map_err(|e| {
             PatchError::Other(format!(
                 "JSONPath valueExpression evaluated to a type that could not marshal to JSON: {e}"
             ))
         })
     }
+}
+
+/// Whether `expression` reads `variables.<name>` / `variables["name"]`.
+fn reads_variable(expression: &str, name: &str) -> bool {
+    expression.contains(&format!("variables.{name}"))
+        || expression.contains(&format!("variables[\"{name}\"]"))
+        || expression.contains(&format!("variables['{name}']"))
+}
+
+/// `types.NewErr("composited variable %q fails to evaluate: %v", ...)`
+/// (composition.go `variableAccessor.Callback`). When the variable failed
+/// because it read another failed variable, that variable's failure is
+/// reported instead, as the lazy map would surface it.
+fn composited_failure(failed: &[(&str, String)], expr: &str, name: &str, err: String) -> String {
+    if let Some((_, msg)) = failed.iter().find(|(n, _)| reads_variable(expr, n)) {
+        return msg.clone();
+    }
+    format!("composited variable {name:?} fails to evaluate: {err}")
+}
+
+/// `CreateAdmissionRequest` (admission/plugin/cel/condition.go:115-175):
+/// `Object`/`OldObject` are left unset, the kind/resource are the matched
+/// equivalents and `requestKind`/`requestResource` the request's own.
+/// `Attributes` does not carry the user, dry-run flag or operation options
+/// yet, so `userInfo` is empty (a nil `UserInfo` upstream), `dryRun` is
+/// false and `options` is absent. Unlike the unstructured conversion,
+/// empty `subResource`/`name`/`namespace` are kept as `""`.
+fn create_admission_request(r: &PatchRequest<'_>) -> Value {
+    let attr = r.attributes;
+    let k = &r.versioned_attributes.versioned_kind;
+    let res = r.matched_resource;
+    json!({
+        "kind": {"group": k.group, "version": k.version, "kind": k.kind},
+        "resource": {"group": res.group, "version": res.version, "resource": res.resource},
+        "subResource": attr.subresource,
+        "requestKind": {
+            "group": attr.kind.group, "version": attr.kind.version, "kind": attr.kind.kind,
+        },
+        "requestResource": {
+            "group": attr.resource.group,
+            "version": attr.resource.version,
+            "resource": attr.resource.resource,
+        },
+        "requestSubResource": attr.subresource,
+        "name": attr.name,
+        "namespace": attr.namespace,
+        "operation": match attr.operation {
+            AdmissionOperation::Create => "CREATE",
+            AdmissionOperation::Update => "UPDATE",
+            AdmissionOperation::Delete => "DELETE",
+            AdmissionOperation::Connect => "CONNECT",
+        },
+        "userInfo": {},
+        "dryRun": false,
+    })
 }
 
 #[async_trait]
@@ -181,7 +257,8 @@ mod tests {
     use super::*;
     use crate::admission::policy_matching::Attributes;
     use crate::admission::policy_mutating::VersionedAttributes;
-    use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource, Operation};
+    use rusternetes_common::admission::Operation as AdmissionOperation;
+    use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
     use serde_json::json;
 
     fn attributes(object: &Value) -> Attributes {
@@ -199,7 +276,7 @@ mod tests {
             subresource: "".into(),
             namespace: "default".into(),
             name: "d1".into(),
-            operation: Operation::Create,
+            operation: AdmissionOperation::Create,
             object: Some(object.clone()),
             old_object: None,
         }
@@ -491,7 +568,7 @@ mod tests {
     fn request_variable_carries_attributes() {
         let object = json!({"metadata": {}});
         let mut attrs = attributes(&object);
-        attrs.operation = Operation::Update;
+        attrs.operation = AdmissionOperation::Update;
         attrs.subresource = "scale".into();
         let got = run_with(
             JsonPatcher::new_patcher(

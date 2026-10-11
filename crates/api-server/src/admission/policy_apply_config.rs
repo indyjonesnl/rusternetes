@@ -24,14 +24,25 @@ pub struct ApplyConfigPatcher {
     expression: String,
     /// `expressionEvaluator.CompilationErrors()`, found when built.
     compile_error: Option<String>,
+    /// `spec.variables`, `(name, expression)` in declaration order.
+    variables: Vec<(String, String)>,
     evaluator: Mutex<CELEvaluator>,
 }
 
 impl ApplyConfigPatcher {
     pub fn new_patcher(expression: &str) -> Arc<dyn Patcher> {
+        Self::new_patcher_with_variables(expression, &[])
+    }
+
+    /// With the policy's composited `variables` (cel/composition.go).
+    pub fn new_patcher_with_variables(
+        expression: &str,
+        variables: &[(String, String)],
+    ) -> Arc<dyn Patcher> {
         Arc::new(Self {
             expression: expression.to_string(),
             compile_error: cel_struct::compile(expression).err(),
+            variables: variables.to_vec(),
             evaluator: Mutex::new(CELEvaluator::new()),
         })
     }
@@ -52,7 +63,7 @@ impl Patcher for ApplyConfigPatcher {
                 },
             ));
         }
-        let value = evaluate_expression(&self.evaluator, &self.expression, r)?;
+        let value = evaluate_expression(&self.evaluator, &self.expression, &self.variables, r)?;
         // smd.go:87-90, :104-107: the compiler ensures an `Object`.
         let Value::Object(mut patch) = value else {
             return Err(PatchError::Other(format!(
@@ -140,8 +151,9 @@ fn find_atomics(path: &mut String, name: &str, v: &Value, out: &mut Vec<String>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admission::policy_matching::Attributes;
     use crate::admission::policy_mutating::VersionedAttributes;
-    use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
+    use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource, Operation};
     use serde_json::json;
 
     /// `TestApplyConfiguration` harness: a Deployment `Create` with the
@@ -162,10 +174,28 @@ mod tests {
             versioned_old_object: old,
             dirty: false,
         };
-        let patcher = ApplyConfigPatcher::new_patcher(expression);
+        run_with(ApplyConfigPatcher::new_patcher(expression), versioned, gvr)
+    }
+
+    fn run_with(
+        patcher: Arc<dyn Patcher>,
+        versioned: VersionedAttributes,
+        gvr: GroupVersionResource,
+    ) -> Result<Value, String> {
+        let attributes = Attributes {
+            kind: versioned.versioned_kind.clone(),
+            resource: gvr.clone(),
+            subresource: "".into(),
+            namespace: "default".into(),
+            name: "d1".into(),
+            operation: Operation::Update,
+            object: versioned.versioned_object.clone(),
+            old_object: versioned.versioned_old_object.clone(),
+        };
         let req = PatchRequest {
             matched_resource: &gvr,
             versioned_attributes: &versioned,
+            attributes: &attributes,
             param: None,
             namespace: None,
         };
@@ -329,6 +359,38 @@ mod tests {
         assert_eq!(
             got["spec"]["template"]["spec"]["containers"][0]["env"],
             json!([{"name": "test", "value": "c"}, {"name": "foo", "value": "bar"}])
+        );
+    }
+
+    // The request's attributes and composited variables reach the apply
+    // configuration expression too (smd.go:67-116 evaluates through the same
+    // `ForInput` as json_patch.go).
+    #[test]
+    fn request_and_variables_are_bound() {
+        let versioned = VersionedAttributes {
+            versioned_kind: GroupVersionKind {
+                group: "apps".into(),
+                version: "v1".into(),
+                kind: "Deployment".into(),
+            },
+            versioned_object: Some(json!({"metadata": {"name": "d1"}})),
+            versioned_old_object: None,
+            dirty: false,
+        };
+        let gvr = GroupVersionResource {
+            group: "apps".into(),
+            version: "v1".into(),
+            resource: "deployments".into(),
+        };
+        let p = ApplyConfigPatcher::new_patcher_with_variables(
+            r#"Object{metadata: Object.metadata{
+                 labels: {"op": request.operation, "ns": request.namespace, "v": variables.n}}}"#,
+            &[("n".to_string(), "object.metadata.name + '-x'".to_string())],
+        );
+        let got = run_with(p, versioned, gvr).unwrap();
+        assert_eq!(
+            got["metadata"]["labels"],
+            json!({"op": "UPDATE", "ns": "default", "v": "d1-x"})
         );
     }
 }
