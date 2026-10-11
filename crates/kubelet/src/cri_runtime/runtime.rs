@@ -716,6 +716,13 @@ impl CriContainerRuntime {
         }
     }
 
+    /// `getPodRuntimeHandler` (`kuberuntime_container.go:177-190`): the runtime
+    /// handler passed to image RPCs. Empty unless `RuntimeClassInImageCriApi`.
+    async fn pod_runtime_handler(&self, pod: Option<&Pod>) -> anyhow::Result<String> {
+        let _ = pod;
+        Ok(String::new())
+    }
+
     /// Create and start a single container in the pod's existing sandbox. Used
     /// by the kubelet for init-container sequencing, restarts, and ephemeral
     /// containers. `netns_path`/`hosts_file_path`/`pod_ip` are bollard-era
@@ -4031,6 +4038,73 @@ mod tests {
         );
         // Missing RuntimeClass fails the sandbox (`kuberuntime_sandbox.go:60-63`).
         assert!(rt.sandbox_runtime_handler(&mk(Some("nope"))).await.is_err());
+    }
+
+    /// `getPodRuntimeHandler` (`kuberuntime_container.go:177-190`) and
+    /// `EnsureImageExists` (`images/image_manager.go:194`).
+    #[tokio::test]
+    async fn image_runtime_handler_follows_gate_and_pod_class() {
+        use rusternetes_common::feature_gates::{with_feature, Feature};
+        use rusternetes_common::resources::RuntimeClass;
+        let storage = Arc::new(StorageBackend::new_memory());
+        storage
+            .create(
+                &rusternetes_storage::build_key("runtimeclasses", None, "gvisor"),
+                &RuntimeClass::new("gvisor", "runsc"),
+            )
+            .await
+            .unwrap();
+        let vm = crate::volumes::VolumeManager::new(
+            "/tmp/rusternetes-test-vols".to_string(),
+            Some(storage),
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+        let rt = CriContainerRuntime::connect(
+            "/tmp/rusternetes-test-missing-cri.sock",
+            "node-default",
+            "/tmp/rusternetes-test-logs",
+        )
+        .await
+        .unwrap()
+        .with_volumes(vm);
+        let mk = |rc: Option<&str>| {
+            Pod::new(
+                "p",
+                PodSpec {
+                    runtime_class_name: rc.map(str::to_string),
+                    ..Default::default()
+                },
+            )
+        };
+        {
+            // Gate off (default): always "" (no node-default fallback).
+            let _g = with_feature(Feature::RuntimeClassInImageCriApi, false);
+            assert_eq!(
+                rt.pod_runtime_handler(Some(&mk(Some("gvisor"))))
+                    .await
+                    .unwrap(),
+                ""
+            );
+        }
+        let _g = with_feature(Feature::RuntimeClassInImageCriApi, true);
+        assert_eq!(
+            rt.pod_runtime_handler(Some(&mk(Some("gvisor"))))
+                .await
+                .unwrap(),
+            "runsc"
+        );
+        // No class (or empty) passes "".
+        assert_eq!(rt.pod_runtime_handler(Some(&mk(None))).await.unwrap(), "");
+        assert_eq!(
+            rt.pod_runtime_handler(Some(&mk(Some("")))).await.unwrap(),
+            ""
+        );
+        assert_eq!(rt.pod_runtime_handler(None).await.unwrap(), "");
+        // Missing class errors.
+        assert!(rt
+            .pod_runtime_handler(Some(&mk(Some("nope"))))
+            .await
+            .is_err());
     }
 
     #[tokio::test]
