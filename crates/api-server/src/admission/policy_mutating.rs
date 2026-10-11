@@ -127,6 +127,10 @@ pub enum PatchError {
 pub struct PatchRequest<'a> {
     pub matched_resource: &'a GroupVersionResource,
     pub versioned_attributes: &'a VersionedAttributes,
+    /// The request's `admission.Attributes`, which upstream threads to the
+    /// patcher via `Patch`'s caller (`CreateAdmissionRequest(
+    /// versionedAttributes.Attributes, ...)`, json_patch.go:76-82).
+    pub attributes: &'a Attributes,
     /// `OptionalVariables.VersionedParams`.
     pub param: Option<&'a Value>,
     /// The request's `v1.Namespace`; `None` for a cluster-scoped request.
@@ -242,6 +246,7 @@ impl MutatingDispatcher {
     async fn dispatch_one(
         &self,
         patcher: Option<&Arc<dyn Patcher>>,
+        attributes: &Attributes,
         versioned: &mut VersionedAttributes,
         namespace: Option<&Value>,
         resource: &GroupVersionResource,
@@ -271,6 +276,7 @@ impl MutatingDispatcher {
             .patch(&PatchRequest {
                 matched_resource: resource,
                 versioned_attributes: versioned,
+                attributes,
                 param,
                 namespace,
             })
@@ -410,6 +416,7 @@ impl MutatingDispatcher {
                 if let Err(err) = self
                     .dispatch_one(
                         patcher,
+                        attr,
                         current,
                         namespace.as_ref(),
                         &invocation.resource,

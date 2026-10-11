@@ -28,6 +28,16 @@ pub struct JsonPatcher {
 
 impl JsonPatcher {
     pub fn new_patcher(expression: &str) -> Arc<dyn Patcher> {
+        Self::new_patcher_with_variables(expression, &[])
+    }
+
+    /// `CompositedCompiler.CompileMutatingEvaluator` (cel/composition.go):
+    /// `variables` are the policy's `spec.variables`, `(name, expression)` in
+    /// declaration order.
+    pub fn new_patcher_with_variables(
+        expression: &str,
+        _variables: &[(String, String)],
+    ) -> Arc<dyn Patcher> {
         let compile_error = cel_struct::compile(expression).err();
         Arc::new(Self {
             expression: expression.to_string(),
@@ -169,11 +179,37 @@ impl Patcher for JsonPatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admission::policy_matching::Attributes;
     use crate::admission::policy_mutating::VersionedAttributes;
-    use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
+    use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource, Operation};
     use serde_json::json;
 
-    fn run(expression: &str, object: Value) -> Result<Value, String> {
+    fn attributes(object: &Value) -> Attributes {
+        Attributes {
+            kind: GroupVersionKind {
+                group: "apps".into(),
+                version: "v1".into(),
+                kind: "Deployment".into(),
+            },
+            resource: GroupVersionResource {
+                group: "apps".into(),
+                version: "v1".into(),
+                resource: "deployments".into(),
+            },
+            subresource: "".into(),
+            namespace: "default".into(),
+            name: "d1".into(),
+            operation: Operation::Create,
+            object: Some(object.clone()),
+            old_object: None,
+        }
+    }
+
+    fn run_with(
+        patcher: Arc<dyn Patcher>,
+        object: Value,
+        attributes: &Attributes,
+    ) -> Result<Value, String> {
         let gvr = GroupVersionResource {
             group: "apps".into(),
             version: "v1".into(),
@@ -189,10 +225,10 @@ mod tests {
             versioned_old_object: None,
             dirty: false,
         };
-        let patcher = JsonPatcher::new_patcher(expression);
         let req = PatchRequest {
             matched_resource: &gvr,
             versioned_attributes: &versioned,
+            attributes,
             param: None,
             namespace: None,
         };
@@ -203,6 +239,11 @@ mod tests {
             PatchError::Status(e) => e.to_string(),
             PatchError::Other(m) => m,
         })
+    }
+
+    fn run(expression: &str, object: Value) -> Result<Value, String> {
+        let attrs = attributes(&object);
+        run_with(JsonPatcher::new_patcher(expression), object, &attrs)
     }
 
     fn ok(expression: &str, object: Value, expected: Value) {
@@ -429,5 +470,101 @@ mod tests {
             o.clone(),
         );
         assert_eq!(o, json!({"spec": {"replicas": 1}}));
+    }
+
+    // json_patch_test.go: "JSONPatch key escaping".
+    #[test]
+    fn json_patch_key_escaping() {
+        ok(
+            r#"[
+                JSONPatch{op: "add", path: "/metadata/labels", value: {}},
+                JSONPatch{op: "add", path: "/metadata/labels/" + jsonpatch.escapeKey("k8s.io/x~y"), value: "true"}
+            ]"#,
+            json!({"metadata": {"labels": {}}}),
+            json!({"metadata": {"labels": {"k8s.io/x~y": "true"}}}),
+        );
+    }
+
+    // `CreateAdmissionRequest` (admission/plugin/cel/condition.go:115-175)
+    // fills the `request` variable from the request's attributes.
+    #[test]
+    fn request_variable_carries_attributes() {
+        let object = json!({"metadata": {}});
+        let mut attrs = attributes(&object);
+        attrs.operation = Operation::Update;
+        attrs.subresource = "scale".into();
+        let got = run_with(
+            JsonPatcher::new_patcher(
+                r#"[JSONPatch{op: "add", path: "/metadata/annotations", value: {
+                    "operation": request.operation,
+                    "name": request.name,
+                    "namespace": request.namespace,
+                    "subResource": request.subResource,
+                    "requestSubResource": request.requestSubResource,
+                    "requestKind": request.requestKind.kind,
+                    "requestResource": request.requestResource.resource,
+                    "dryRun": request.dryRun ? "true" : "false"
+                }}]"#,
+            ),
+            object,
+            &attrs,
+        );
+        assert_eq!(
+            got.unwrap(),
+            json!({"metadata": {"annotations": {
+                "operation": "UPDATE", "name": "d1", "namespace": "default",
+                "subResource": "scale", "requestSubResource": "scale",
+                "requestKind": "Deployment", "requestResource": "deployments",
+                "dryRun": "false"
+            }}})
+        );
+    }
+
+    fn vars(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect()
+    }
+
+    // composition.go: `variables.<name>` is bound, and a variable may
+    // reference the ones declared before it.
+    #[test]
+    fn variables_are_bound() {
+        let object = json!({"metadata": {"name": "d1"}});
+        let attrs = attributes(&object);
+        let p = JsonPatcher::new_patcher_with_variables(
+            r#"[JSONPatch{op: "add", path: "/metadata/labels", value: {"x": variables.m}}]"#,
+            &vars(&[
+                ("n", "object.metadata.name + '-x'"),
+                ("m", "variables.n + '!'"),
+            ]),
+        );
+        assert_eq!(
+            run_with(p, object, &attrs).unwrap(),
+            json!({"metadata": {"name": "d1", "labels": {"x": "d1-x!"}}})
+        );
+    }
+
+    // `variableAccessor.Callback` is lazy: a failing variable only fails the
+    // evaluation when the expression reads it.
+    #[test]
+    fn failing_variable_only_fails_when_used() {
+        let object = json!({"metadata": {"name": "d1"}});
+        let attrs = attributes(&object);
+        let decls = vars(&[("bad", "object.spec.nope.deeper")]);
+        let unused = JsonPatcher::new_patcher_with_variables(
+            r#"[JSONPatch{op: "add", path: "/metadata/labels", value: {}}]"#,
+            &decls,
+        );
+        assert!(run_with(unused, object.clone(), &attrs).is_ok());
+        let used = JsonPatcher::new_patcher_with_variables(
+            r#"[JSONPatch{op: "add", path: "/metadata/labels", value: {"x": variables.bad}}]"#,
+            &decls,
+        );
+        let err = run_with(used, object, &attrs).unwrap_err();
+        assert!(
+            err.contains(r#"composited variable "bad" fails to evaluate"#),
+            "{err}"
+        );
     }
 }
