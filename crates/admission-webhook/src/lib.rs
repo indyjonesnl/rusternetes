@@ -5,6 +5,7 @@
 
 pub mod cel_evaluators;
 
+use rusternetes_common::latency_trackers::latency_trackers_from_context;
 use rusternetes_common::{
     admission::{
         AdmissionResponse, AdmissionReview, AdmissionReviewRequest, AdmissionReviewResponse,
@@ -1061,12 +1062,18 @@ impl<S: Storage> AdmissionWebhookManager<S> {
             let failure_policy = inv.failure_policy.clone();
             let uid = inv.request.uid.clone();
 
+            // Task-locals do not cross `spawn`: carry the trackers in.
+            let trackers = latency_trackers_from_context();
             handles.push(tokio::spawn(async move {
                 let client = AdmissionWebhookClient::new();
                 let ca_ref = ca_data.as_deref();
-                let result = client
-                    .call_webhook_with_ca(&url, &review, timeout, ca_ref)
-                    .await;
+                let call = client.call_webhook_with_ca(&url, &review, timeout, ca_ref);
+                // `wd.ValidatingWebhookTracker.Track(do)`
+                // (validating/dispatcher.go:298-301).
+                let result = match &trackers {
+                    Some(wd) => wd.validating_webhook.track(call).await,
+                    None => call.await,
+                };
                 (webhook_name, failure_policy, uid, result)
             }));
         }
@@ -1551,11 +1558,19 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                             .unwrap_or_else(|_| s.as_bytes().to_vec())
                     });
                     let ca_bundle = ca_decoded.as_deref();
-                    let response = match self
-                        .client
-                        .call_webhook_with_ca(&resolved_url, &review, timeout, ca_bundle)
-                        .await
-                    {
+                    // `wd.MutatingWebhookTracker.Track(do)`
+                    // (mutating/dispatcher.go:298-301).
+                    let call = self.client.call_webhook_with_ca(
+                        &resolved_url,
+                        &review,
+                        timeout,
+                        ca_bundle,
+                    );
+                    let call_result = match latency_trackers_from_context() {
+                        Some(wd) => wd.mutating_webhook.track(call).await,
+                        None => call.await,
+                    };
+                    let response = match call_result {
                         Ok(resp) => {
                             info!(
                                 "Webhook {} response: allowed={}, url={}",
@@ -4094,6 +4109,68 @@ mod tests {
                 reinvocation_policy: None,
             }]),
         }
+    }
+
+    /// `ValidatingWebhookTracker.Track` (validating/dispatcher.go:298-301):
+    /// the webhook call is attributed to the request's latency trackers even
+    /// though it runs on a spawned task.
+    #[tokio::test]
+    async fn test_validating_webhook_call_is_tracked() {
+        use rusternetes_common::latency_trackers::{with_latency_trackers, LatencyTrackers};
+        let allow = AdmissionReviewResponse {
+            uid: String::new(),
+            allowed: true,
+            status: None,
+            patch: None,
+            patch_type: None,
+            audit_annotations: None,
+            warnings: None,
+        };
+        let (url, handle) = spawn_webhook_server(allow).await;
+        let storage = Arc::new(MemoryStorage::new());
+        let config = make_validating_config("allow-pods", &url, pods_rule());
+        storage
+            .create(
+                "/registry/validatingwebhookconfigurations/allow-pods",
+                &config,
+            )
+            .await
+            .unwrap();
+        let manager = AdmissionWebhookManager::new(storage);
+        let gvk = GroupVersionKind {
+            group: "".into(),
+            version: "v1".into(),
+            kind: "Pod".into(),
+        };
+        let gvr = GroupVersionResource {
+            group: "".into(),
+            version: "v1".into(),
+            resource: "pods".into(),
+        };
+        let user = UserInfo {
+            username: "alice".into(),
+            uid: "1".into(),
+            groups: vec![],
+        };
+        let trackers = Arc::new(LatencyTrackers::new());
+        with_latency_trackers(trackers.clone(), async {
+            manager
+                .run_validating_webhooks(
+                    &Operation::Create,
+                    &gvk,
+                    &gvr,
+                    Some("default"),
+                    "p",
+                    Some(json!({"metadata": {"name": "p", "namespace": "default"}})),
+                    None,
+                    &user,
+                )
+                .await
+                .unwrap();
+        })
+        .await;
+        handle.abort();
+        assert!(!trackers.validating_webhook.get_latency().is_zero());
     }
 
     #[tokio::test]

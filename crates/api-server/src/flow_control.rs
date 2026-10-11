@@ -873,6 +873,13 @@ impl Drop for InQueue {
     }
 }
 
+/// `observeQueueWaitTime` (apf_filter.go:198-201): the waiting-duration
+/// metric plus `TrackAPFQueueWaitLatency` for the SLI latency.
+fn observe_queue_wait_time(pl: &str, fs: &str, execute: bool, wait: Duration) {
+    fcmetrics::observe_waiting_duration(pl, fs, execute, wait);
+    rusternetes_common::latency_trackers::track_apf_queue_wait_latency(wait);
+}
+
 /// A dispatched request's executing gauges (`AddRequestsExecuting` +
 /// `AddSeatConcurrencyInUse`, queueset.go:678, :724, :866, :878) and its
 /// execution duration (apf_filter.go:187-191).
@@ -1247,7 +1254,7 @@ impl<S: Storage> FlowControlEngine<S> {
                     drop(in_queue);
                     // `observeQueueWaitTime(..., FormatBool(req != nil), ...)`
                     // (apf_filter.go:183-185).
-                    fcmetrics::observe_waiting_duration(pl, fs, true, since.elapsed());
+                    observe_queue_wait_time(pl, fs, true, since.elapsed());
                 }
                 exec.note_dispatched();
                 // `AddDispatch` (apf_filter.go:187).
@@ -1262,7 +1269,7 @@ impl<S: Storage> FlowControlEngine<S> {
                     drop(in_queue);
                     // `if queued && !executed` (apf_filter.go:199-201); `req`
                     // is non-nil here, so `execute` is "true" as upstream.
-                    fcmetrics::observe_waiting_duration(pl, fs, true, since.elapsed());
+                    observe_queue_wait_time(pl, fs, true, since.elapsed());
                 }
                 // `AddReject(..., "time-out")` (queueset.go:433).
                 fcmetrics::add_reject(pl, fs, "time-out");
