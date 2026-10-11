@@ -442,4 +442,30 @@ profiles:
         assert!(err.contains("missing.yaml"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // #3207: validatePluginConfig seenPluginConfig (validation.go:189-197);
+    // validation_test.go "duplicated-plugin-config" -> profiles[0].pluginConfig[1].
+    #[test]
+    fn duplicate_plugin_config_rejected() {
+        let doc = "profiles:\n- pluginConfig:\n  - name: VolumeBinding\n  - name: VolumeBinding\n";
+        let err = volume_binding_args_from_config(doc, false).unwrap_err();
+        assert!(
+            err.contains("profiles[0].pluginConfig[1]: Duplicate value"),
+            "{err}"
+        );
+        // Same name in different profiles is fine.
+        let ok = "profiles:\n- schedulerName: a\n  pluginConfig:\n  - name: X\n- schedulerName: b\n  pluginConfig:\n  - name: X\n";
+        assert!(volume_binding_args_from_config(ok, false).is_ok());
+    }
+
+    // validation.go:58-67: duplicate schedulerName across profiles.
+    #[test]
+    fn duplicate_scheduler_name_rejected() {
+        let doc = "profiles:\n- schedulerName: a\n- schedulerName: a\n";
+        let err = volume_binding_args_from_config(doc, false).unwrap_err();
+        assert!(
+            err.contains("profiles[1].schedulerName: Duplicate value"),
+            "{err}"
+        );
+    }
 }
