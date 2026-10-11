@@ -785,6 +785,8 @@ impl Kubelet {
             .with_service_host(service_host, "443")
             .with_cluster_dns(&cluster_dns, &cluster_domain)
             .with_node_name(&node_name)
+            // Configurer.nodeIPs (dns.go): the kubelet's node InternalIP.
+            .with_node_ips(vec![Self::node_internal_ip().to_string()])
             .with_node_allocatable(node_allocatable_map());
 
         // Resolve the runtime identity once via the CRI Version RPC so
