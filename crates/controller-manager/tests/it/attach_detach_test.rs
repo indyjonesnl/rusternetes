@@ -485,3 +485,85 @@ async fn out_of_service_taint_detaches_mounted_volume_immediately() {
     c.reconcile_all().await.unwrap();
     assert!(vas(&s).await.is_empty());
 }
+
+// ---- reportMultiAttachError (reconciler.go:376, Test_ReportMultiAttachError
+// reconciler_test.go:1279) ----
+
+async fn pod_events(s: &MemoryStorage, pod: &str) -> Vec<(String, String, String)> {
+    let events: Vec<rusternetes_common::resources::Event> = s
+        .list(&rusternetes_storage::build_prefix("events", Some("ns")))
+        .await
+        .unwrap_or_default();
+    events
+        .into_iter()
+        .filter(|e| e.involved_object.name.as_deref() == Some(pod))
+        .map(|e| (format!("{:?}", e.event_type), e.reason, e.message))
+        .collect()
+}
+
+/// pod `a` holds the RWO volume on node-1; `b` (node-2) is blocked.
+async fn blocked_setup(s: &Arc<MemoryStorage>, keep_a: bool) {
+    seed_node(s, "node-1", Some(&unique())).await;
+    seed_node(s, "node-2", None).await;
+    seed_volume(s, json!(["ReadWriteOnce"])).await;
+    put(
+        s,
+        "pods",
+        Some("ns"),
+        "a",
+        pod("a", "node-1", "claim", "Running"),
+    )
+    .await;
+    controller(s).reconcile_all().await.unwrap();
+    if !keep_a {
+        // The pod is gone but the node still reports the volume in use, so the
+        // attachment stays.
+        s.delete(&build_key("pods", Some("ns"), "a")).await.unwrap();
+    }
+    put(
+        s,
+        "pods",
+        Some("ns"),
+        "b",
+        pod("b", "node-2", "claim", "Running"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn multi_attach_event_names_the_pod_holding_the_volume() {
+    let s = Arc::new(MemoryStorage::new());
+    blocked_setup(&s, true).await;
+    controller(&s).reconcile_all().await.unwrap();
+    let ev = pod_events(&s, "b").await;
+    assert_eq!(ev.len(), 1, "{ev:?}");
+    assert_eq!(ev[0].1, "FailedAttachVolume");
+    assert_eq!(
+        ev[0].2,
+        "Multi-Attach error for volume \"pv1\" Volume is already used by pod(s) a"
+    );
+}
+
+#[tokio::test]
+async fn multi_attach_event_without_holder_pods_is_the_simple_message() {
+    let s = Arc::new(MemoryStorage::new());
+    blocked_setup(&s, false).await;
+    controller(&s).reconcile_all().await.unwrap();
+    let ev = pod_events(&s, "b").await;
+    assert_eq!(ev.len(), 1, "{ev:?}");
+    assert_eq!(
+        ev[0].2,
+        "Multi-Attach error for volume \"pv1\" Volume is already exclusively attached to one node and can't be attached to another"
+    );
+}
+
+#[tokio::test]
+async fn multi_attach_error_is_reported_once_per_volume_and_node() {
+    // `if !volumeToAttach.MultiAttachErrorReported` (reconciler.go:352).
+    let s = Arc::new(MemoryStorage::new());
+    blocked_setup(&s, true).await;
+    let c = controller(&s);
+    c.reconcile_all().await.unwrap();
+    c.reconcile_all().await.unwrap();
+    assert_eq!(pod_events(&s, "b").await.len(), 1);
+}
