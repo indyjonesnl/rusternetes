@@ -23,9 +23,9 @@
 //!
 //! Not modelled: the `InvalidCABundle` check of the establishing
 //! controller; the finalizer's `OverlappingBuiltInResources` skip. The
-//! finalizer's wait for the instances to be gone is ported, but instances are
-//! removed from storage directly (finalizers and all), so it sees them go at
-//! once.
+//! finalizer's wait for the instances to be gone is ported, and instances are
+//! deleted through their store, so one holding a finalizer keeps the CRD
+//! Terminating until it is really gone.
 
 use std::collections::HashSet;
 

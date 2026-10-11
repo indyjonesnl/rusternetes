@@ -35,7 +35,7 @@ use rusternetes_common::validation::crd::{
 };
 use rusternetes_common::validation::field::{Error as FieldError, ErrorList, Path};
 use rusternetes_common::{Error, Result};
-use rusternetes_storage::{build_key, build_prefix, Storage, StorageBackend};
+use rusternetes_storage::{build_prefix, Storage, StorageBackend};
 use tracing::warn;
 
 use super::controllers::{
@@ -654,8 +654,9 @@ impl CrdRest {
     }
 
     /// `deleteInstances` (crd_finalizer.go:181-273): the stored instances of
-    /// the CRD are removed straight from storage, where upstream issues
-    /// `DeleteCollection` per namespace; then, as upstream, wait until a list
+    /// the CRD are deleted through its instance store, one delete per instance
+    /// where upstream issues `DeleteCollection` per namespace (an instance
+    /// with a finalizer is only marked for deletion); then, as upstream, wait until a list
     /// of them comes back empty (:253-272). The `Err` carries the
     /// `Terminating` condition upstream returns with its error.
     async fn delete_instances(
@@ -671,7 +672,6 @@ impl CrdRest {
         let failed = |reason: &str, message: String, e: Error| {
             Box::new((condition(TERMINATING, "True", reason, &message), e))
         };
-        let resource_type = instance_resource_type(crd);
         let items = self.list_instances(crd).await.map_err(|e| {
             failed(
                 "InstanceDeletionFailed",
@@ -679,10 +679,40 @@ impl CrdRest {
                 e,
             )
         })?;
+        // `GetCustomResourceListerCollectionDeleter(crd)` (crd_finalizer.go:
+        // 183): the instance store of the CRD, so a delete honours the
+        // instance's finalizers and graceful deletion like a request would.
+        let storage_version = crd
+            .spec
+            .versions
+            .iter()
+            .find(|v| v.storage)
+            .map(|v| v.name.clone())
+            .unwrap_or_default();
+        let instances = super::customresource::new_store(
+            self.store.storage.clone(),
+            Arc::new(crd.clone()),
+            &storage_version,
+            false,
+        );
+        // `DeleteCollection(nsCtx, ValidateAllObjectFunc, nil, nil)`: nil
+        // options, not `DeleteOptions::default()` (which is the API's 30s
+        // grace and background propagation).
+        let no_options = DeleteOptions {
+            propagation_policy: None,
+            grace_period_seconds: None,
+            preconditions: None,
+            orphan_dependents: None,
+            dry_run: None,
+            ignore_store_read_error_with_cluster_breaking_potential: None,
+        };
         for (namespace, name) in items {
-            let key = build_key(&resource_type, namespace.as_deref(), &name);
-            match self.store.storage.delete(&key).await {
-                Ok(()) | Err(Error::NotFound(_)) => {}
+            let ctx = RequestContext::new(namespace.as_deref());
+            match instances
+                .delete(&ctx, &name, None, no_options.clone())
+                .await
+            {
+                Ok(_) | Err(Error::NotFound(_)) => {}
                 Err(e) => {
                     return Err(failed(
                         "InstanceDeletionFailed",
