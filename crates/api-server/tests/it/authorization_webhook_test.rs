@@ -618,3 +618,43 @@ async fn request_info_ignored_for_a_different_resource() {
     // Empty `version` is omitted from the wire (omitempty).
     assert!(version_sent(pods_info(), a).await.is_null());
 }
+
+// The router layer (not a direct with_request_info call) must carry the
+// request's RequestInfo to the webhook spec (#3159).
+#[tokio::test]
+async fn request_info_middleware_reaches_webhook_spec() {
+    use tower::ServiceExt;
+    let mock = allowing_mock();
+    let url = serve(mock.clone()).await;
+    let wh = Arc::new(authorizer(
+        &url,
+        "v1",
+        Duration::ZERO,
+        FailurePolicy::NoOpinion,
+    ));
+    let app = Router::new()
+        .route(
+            "/api/v1/namespaces/:ns/pods/:name",
+            axum::routing::get(move || {
+                let wh = wh.clone();
+                async move {
+                    let _ = wh.authorize_opinion(&resource("jane")).await;
+                    "ok"
+                }
+            }),
+        )
+        .layer(axum::middleware::from_fn(
+            rusternetes_api_server::request_scope::request_info_middleware,
+        ));
+    let resp = app
+        .oneshot(
+            axum::http::Request::get("/api/v1/namespaces/kittensandponies/pods/p")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let got = mock.lock().unwrap().last.clone().unwrap();
+    assert_eq!(got["spec"]["resourceAttributes"]["version"], "v1");
+}
