@@ -926,6 +926,7 @@ pub struct ResourceRequirements {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt_map",
         deserialize_with = "deserialize_quantity_map"
     )]
     pub limits: Option<HashMap<String, String>>,
@@ -933,6 +934,7 @@ pub struct ResourceRequirements {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt_map",
         deserialize_with = "deserialize_quantity_map"
     )]
     pub requests: Option<HashMap<String, String>>,

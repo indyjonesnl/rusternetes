@@ -75,6 +75,7 @@ pub struct NodeStatus {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt_map",
         deserialize_with = "crate::types::deserialize_quantity_map"
     )]
     pub capacity: Option<HashMap<String, String>>,
@@ -82,6 +83,7 @@ pub struct NodeStatus {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt_map",
         deserialize_with = "crate::types::deserialize_quantity_map"
     )]
     pub allocatable: Option<HashMap<String, String>>,

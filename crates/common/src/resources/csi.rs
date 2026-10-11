@@ -282,11 +282,21 @@ pub struct CSIStorageCapacity {
     pub storage_class_name: String,
 
     /// capacity is the value reported by the CSI driver in its GetCapacityResponse
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt",
+        deserialize_with = "crate::quantity::wire::deserialize_opt"
+    )]
     pub capacity: Option<String>,
 
     /// maximumVolumeSize is the value reported by the CSI driver in its GetCapacityResponse
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt",
+        deserialize_with = "crate::quantity::wire::deserialize_opt"
+    )]
     pub maximum_volume_size: Option<String>,
 
     /// nodeTopology defines which nodes have access to the storage

@@ -46,6 +46,7 @@ pub struct ResourceQuotaSpec {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt_map",
         deserialize_with = "crate::types::deserialize_quantity_map"
     )]
     pub hard: Option<HashMap<String, String>>,
@@ -93,6 +94,7 @@ pub struct ResourceQuotaStatus {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt_map",
         deserialize_with = "crate::types::deserialize_quantity_map"
     )]
     pub hard: Option<HashMap<String, String>>,
@@ -101,6 +103,7 @@ pub struct ResourceQuotaStatus {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt_map",
         deserialize_with = "crate::types::deserialize_quantity_map"
     )]
     pub used: Option<HashMap<String, String>>,
@@ -159,6 +162,7 @@ pub struct LimitRangeItem {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt_map",
         deserialize_with = "crate::types::deserialize_quantity_map"
     )]
     pub max: Option<HashMap<String, String>>,
@@ -167,6 +171,7 @@ pub struct LimitRangeItem {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt_map",
         deserialize_with = "crate::types::deserialize_quantity_map"
     )]
     pub min: Option<HashMap<String, String>>,
@@ -175,6 +180,7 @@ pub struct LimitRangeItem {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt_map",
         deserialize_with = "crate::types::deserialize_quantity_map"
     )]
     pub default: Option<HashMap<String, String>>,
@@ -183,6 +189,7 @@ pub struct LimitRangeItem {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt_map",
         deserialize_with = "crate::types::deserialize_quantity_map"
     )]
     pub default_request: Option<HashMap<String, String>>,
@@ -191,6 +198,7 @@ pub struct LimitRangeItem {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt_map",
         deserialize_with = "crate::types::deserialize_quantity_map"
     )]
     pub max_limit_request_ratio: Option<HashMap<String, String>>,

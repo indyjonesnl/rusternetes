@@ -149,6 +149,7 @@ pub struct PodSpec {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt_map",
         deserialize_with = "crate::types::deserialize_quantity_map"
     )]
     pub overhead: Option<HashMap<String, String>>,
@@ -1271,7 +1272,12 @@ pub struct EmptyDirVolumeSource {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub medium: Option<String>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt",
+        deserialize_with = "crate::quantity::wire::deserialize_opt"
+    )]
     pub size_limit: Option<String>,
 }
 
@@ -1547,7 +1553,12 @@ pub struct PodStatus {
     pub resize: Option<String>,
 
     /// Total compute resources actually allocated to the pod (pod-level resize)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt_map",
+        deserialize_with = "crate::types::deserialize_quantity_map"
+    )]
     pub allocated_resources: Option<HashMap<String, String>>,
 
     /// Compute resources the kubelet enforces for the pod (pod-level resize)
@@ -1609,6 +1620,7 @@ pub struct ContainerStatus {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt_map",
         deserialize_with = "crate::types::deserialize_quantity_map"
     )]
     pub allocated_resources: Option<HashMap<String, String>>,

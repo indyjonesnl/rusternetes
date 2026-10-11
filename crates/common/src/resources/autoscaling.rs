@@ -283,7 +283,12 @@ pub struct MetricTarget {
     pub value: Option<String>,
 
     /// AverageValue is the target value of the average of the metric across all pods
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt",
+        deserialize_with = "crate::quantity::wire::deserialize_opt"
+    )]
     pub average_value: Option<String>,
 
     /// AverageUtilization is the target value of the average resource utilization (percentage)
@@ -488,7 +493,12 @@ pub struct MetricValueStatus {
     pub value: Option<String>,
 
     /// AverageValue is the current value of the average of the metric
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt",
+        deserialize_with = "crate::quantity::wire::deserialize_opt"
+    )]
     pub average_value: Option<String>,
 
     /// AverageUtilization is the current value of the average resource utilization (percentage)
@@ -613,11 +623,21 @@ pub struct ContainerResourcePolicy {
     pub mode: Option<String>,
 
     /// MinAllowed specifies the minimum resource amounts
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt_map",
+        deserialize_with = "crate::types::deserialize_quantity_map"
+    )]
     pub min_allowed: Option<std::collections::HashMap<String, String>>,
 
     /// MaxAllowed specifies the maximum resource amounts
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt_map",
+        deserialize_with = "crate::types::deserialize_quantity_map"
+    )]
     pub max_allowed: Option<std::collections::HashMap<String, String>>,
 
     /// ControlledResources specifies which resource types are controlled (cpu, memory)
