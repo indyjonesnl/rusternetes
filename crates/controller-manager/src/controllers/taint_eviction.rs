@@ -891,7 +891,8 @@ async fn delete_pod_handler<S: Storage + 'static>(
 
 /// `addConditionAndDeletePod` (taint_eviction.go:129): publish the
 /// `DisruptionTarget` condition on the STATUS subresource, then DELETE the pod.
-/// The eviction must NOT stamp deletionTimestamp itself: the field is immutable
+/// Like upstream (taint_eviction.go:129-153) there is no skip for pods that are
+/// already terminating or live in kube-system. The eviction must NOT stamp deletionTimestamp itself: the field is immutable
 /// on update, so an api-server that enforces that rejects the write.
 async fn add_condition_and_delete_pod<S: Storage>(
     storage: &S,
@@ -900,17 +901,6 @@ async fn add_condition_and_delete_pod<S: Storage>(
 ) -> Result<()> {
     let key = build_key("pods", Some(namespace), name);
     let mut pod = storage.get::<Pod>(&key).await?;
-
-    // Pre-existing deviation, kept from the previous implementation (upstream
-    // has no such skip): leave pods already terminating and kube-system pods
-    // alone.
-    if pod.metadata.deletion_timestamp.is_some() {
-        return Ok(());
-    }
-    if namespace == "kube-system" {
-        debug!("Skipping eviction of system pod {namespace}/{name}");
-        return Ok(());
-    }
 
     let status = pod.status.get_or_insert_with(Default::default);
     let conditions = status.conditions.get_or_insert_with(Vec::new);
