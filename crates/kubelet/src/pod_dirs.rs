@@ -66,16 +66,12 @@ pub fn escape_qualified_name(name: &str) -> String {
     name.replace('/', "~")
 }
 
-/// Rusternetes-specific: the plugin segment used for volume types we do not
-/// implement natively (nfs, iscsi, image, …).
-///
-/// **This is a deliberate deviation from upstream** (CLAUDE.md rule 8).
-/// Upstream's `FindPluginBySpec` returns an error for an unsupported volume and
-/// the pod fails to start; `create_volume` instead provisions an empty
-/// directory so the pod can run. That fallback predates this module — it is
-/// preserved here rather than introduced. The `rusternetes.io/` prefix
-/// guarantees the segment can never collide with a real `kubernetes.io/` plugin
-/// if one of these types is implemented properly later.
+/// Rusternetes-specific: the plugin segment used only to *locate* (cleanup,
+/// resync) a volume no plugin claims (nfs, iscsi, …). Since #3262 such a volume
+/// is never provisioned: `create_volume` fails like upstream's
+/// `FindPluginBySpec` (`pkg/volume/plugins.go:659`) instead of creating an
+/// empty directory under this segment. The `rusternetes.io/` prefix keeps it
+/// from colliding with a real `kubernetes.io/` plugin.
 pub const UNSUPPORTED_PLUGIN: &str = "rusternetes.io/unsupported";
 
 /// `<root>/pods` — `getPodsDir` (`kubelet_getters.go:60-62`).

@@ -351,6 +351,11 @@ pub fn is_volume_wait_error(err_msg: &str) -> bool {
             || err_msg.contains("ConfigMap")
             || err_msg.contains("PersistentVolumeClaim")))
         || err_msg.contains("is not bound to a volume")
+        // `desired_state_of_world.go:272-277` over `ErrNoPluginMatched`
+        // (`plugins.go:72`): the pod waits, it is not failed (#3262).
+        || err_msg.contains("err=no volume plugin matched")
+        // `csi_mounter.go:106-109`: a missing CSI driver is transient.
+        || err_msg.contains("mounter.SetUpAt failed to get CSI client")
 }
 
 pub fn container_reason_from_error_message(err_msg: &str) -> Option<&'static str> {
@@ -485,8 +490,8 @@ mod tests {
         // Real start failures must NOT be treated as volume waits.
         assert!(!is_volume_wait_error("CreateContainerConfigError: bad env"));
         assert!(!is_volume_wait_error("port is already allocated"));
-        assert!(!is_volume_wait_error(
-            "PersistentVolume does not have a hostPath volume source"
+        assert!(is_volume_wait_error(
+            "failed to get Plugin from volumeSpec for volume \"v\" err=no volume plugin matched"
         ));
     }
 

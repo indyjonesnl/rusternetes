@@ -989,28 +989,6 @@ async fn set_up_publishes_an_inline_volume_on_a_registered_driver() {
     assert!(calls.stage.is_empty(), "inline volumes are never staged");
 }
 
-/// Deviation preserved from the pre-plugin `create_volume`: an inline volume
-/// whose driver is NOT registered keeps the placeholder directory instead of
-/// failing the pod (upstream would fail with "no CSIDriver object").
-#[tokio::test]
-async fn inline_volume_on_an_unregistered_driver_keeps_the_placeholder_dir() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().to_string_lossy().to_string();
-    let p = CsiPlugin::new(host(&root, None));
-    let v: Volume = serde_json::from_value(
-        json!({"name": "eph", "csi": {"driver": "not-registered-inline.example.com"}}),
-    )
-    .unwrap();
-    let spec = Spec {
-        volume: &v,
-        persistent_volume: None,
-        read_only: false,
-    };
-    let m = p.new_mounter(&spec, &pod()).await.unwrap();
-    m.set_up().await.unwrap();
-    assert!(std::path::Path::new(&m.get_path()).is_dir());
-}
-
 // ---- TearDown --------------------------------------------------------------
 
 /// `TestUnmounterTeardown` (`csi_mounter_test.go:1172`): the unmounter reloads
