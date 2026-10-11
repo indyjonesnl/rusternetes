@@ -118,6 +118,11 @@ struct Args {
     #[arg(long)]
     csi_strict_topology: bool,
 
+    /// `CrossNamespaceVolumeDataSource` feature gate (alpha, default off):
+    /// honour `dataSourceRef.namespace` when a ReferenceGrant allows it.
+    #[arg(long)]
+    csi_cross_namespace_volume_data_source: bool,
+
     /// `--immediate-topology` of external-provisioner (csi-provisioner.go:92,
     /// default true): immediate binding passes the aggregated cluster
     /// topology, or none when disabled.
@@ -806,6 +811,7 @@ async fn main() -> Result<()> {
             .with_controller_publish_read_only(args.csi_controller_publish_readonly)
             .with_prevent_volume_mode_conversion(args.csi_prevent_volume_mode_conversion)
             .with_retry_interval_max(args.csi_retry_interval_max)
+            .with_cross_namespace_volume_data_source(args.csi_cross_namespace_volume_data_source)
             .with_strict_topology(args.csi_strict_topology)
             .with_immediate_topology(args.csi_immediate_topology),
         );

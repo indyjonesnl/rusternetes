@@ -2005,6 +2005,7 @@ async fn orphan_cleanup_retries_delete_volume_five_times() {
         .expect_err("capacity shortfall must error");
     assert!(err.to_string().contains("volume is orphaned"));
     assert_eq!(deleted(&rec).len(), 5);
+}
 
 // ---- cross-namespace dataSourceRef (#2981) ----------------------------------
 //
