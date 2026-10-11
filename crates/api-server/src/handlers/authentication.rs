@@ -166,7 +166,7 @@ pub async fn create_token_request(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, service_account_name)): Path<(String, String)>,
     body: Bytes,
-) -> Result<Json<TokenRequest>> {
+) -> Result<(axum::http::StatusCode, Json<TokenRequest>)> {
     // Parse the body manually — the K8s client may send protobuf or JSON with extra
     // fields that Axum's Json<T> extractor rejects with a 422, which is not a proper
     // Kubernetes Status error.  Manual parsing gives us control over the error response.
@@ -400,7 +400,10 @@ pub async fn create_token_request(
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
     });
 
-    Ok(Json(token_request))
+    // Upstream's generic create handler answers 201:
+    // staging/src/k8s.io/apiserver/pkg/endpoints/handlers/create.go:227
+    //   code := http.StatusCreated
+    Ok((axum::http::StatusCode::CREATED, Json(token_request)))
 }
 
 /// Create a SelfSubjectReview (authentication.k8s.io/v1)

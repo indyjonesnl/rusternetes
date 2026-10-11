@@ -352,7 +352,7 @@ async fn service_account_token_request_then_token_review_authenticates() {
         }),
     )
     .await;
-    assert_eq!(status, 200, "TokenRequest must succeed: {body}");
+    assert_eq!(status, 201, "TokenRequest must succeed: {body}");
     let token = body["status"]["token"]
         .as_str()
         .filter(|t| !t.is_empty())
@@ -423,7 +423,7 @@ async fn token_review_user_info_matches_upstream_serviceaccount_userinfo() {
         }),
     )
     .await;
-    assert_eq!(status, 200, "TokenRequest must succeed: {body}");
+    assert_eq!(status, 201, "TokenRequest must succeed: {body}");
     let token = body["status"]["token"].as_str().expect("token");
 
     let (status, review_body) = post_json(
@@ -589,7 +589,7 @@ async fn token_request_with_bound_pod_ref_includes_pod_and_node_extras() {
         }),
     )
     .await;
-    assert_eq!(status, 200, "bound TokenRequest must succeed: {body}");
+    assert_eq!(status, 201, "bound TokenRequest must succeed: {body}");
     let token = body["status"]["token"]
         .as_str()
         .filter(|t| !t.is_empty())

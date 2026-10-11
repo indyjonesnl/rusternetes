@@ -283,7 +283,7 @@ async fn token_request_records_pod_and_node_binding() {
         json!({"apiVersion": "v1", "kind": "Pod", "name": "p", "uid": "pod-uid"}),
     )
     .await;
-    assert_eq!(st, 200, "{body}");
+    assert_eq!(st, 201, "{body}");
     let p = payload(body["status"]["token"].as_str().unwrap());
     assert_eq!(p["kubernetes.io"]["pod"]["name"], "p");
     assert_eq!(p["kubernetes.io"]["pod"]["uid"], "pod-uid");
@@ -301,7 +301,7 @@ async fn token_request_records_secret_and_node_binding() {
         json!({"apiVersion": "v1", "kind": "Secret", "name": "sec"}),
     )
     .await;
-    assert_eq!(st, 200, "{body}");
+    assert_eq!(st, 201, "{body}");
     let p = payload(body["status"]["token"].as_str().unwrap());
     assert_eq!(p["kubernetes.io"]["secret"]["uid"], "sec-uid");
 
@@ -310,7 +310,7 @@ async fn token_request_records_secret_and_node_binding() {
         json!({"apiVersion": "v1", "kind": "Node", "name": "n1"}),
     )
     .await;
-    assert_eq!(st, 200, "{body}");
+    assert_eq!(st, 201, "{body}");
     let p = payload(body["status"]["token"].as_str().unwrap());
     assert_eq!(p["kubernetes.io"]["node"]["uid"], "node-uid");
     assert!(p["kubernetes.io"].get("pod").is_none());

@@ -50,7 +50,7 @@ async fn token_expiration_valid_accepted() {
     make_sa(&state, "sa-b").await;
     let (code, body) = state.post(&token_uri("sa-b"), &token_req(3600)).await;
     assert!(
-        code == StatusCode::OK || code == StatusCode::CREATED,
+        code == StatusCode::CREATED,
         "valid expirationSeconds must succeed: {code} {body}"
     );
     assert!(
@@ -108,10 +108,7 @@ async fn token_expiration_clamped_to_max_2714() {
     make_sa(&state, "sa-max").await;
     let before = chrono::Utc::now().timestamp();
     let (code, body) = state.post(&token_uri("sa-max"), &token_req(86_400)).await;
-    assert!(
-        code == StatusCode::OK || code == StatusCode::CREATED,
-        "{code} {body}"
-    );
+    assert!(code == StatusCode::CREATED, "{code} {body}");
     let ts = chrono::DateTime::parse_from_rfc3339(
         body["status"]["expirationTimestamp"].as_str().unwrap(),
     )
