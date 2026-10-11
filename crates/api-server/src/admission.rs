@@ -6,6 +6,7 @@ pub mod pod_security_namespace;
 pub mod pod_security_policy;
 pub mod policy_dispatch;
 pub mod policy_install;
+pub mod policy_apply_config;
 pub mod policy_json_patch;
 pub mod policy_json_patch_ops;
 pub mod policy_matching;

@@ -42,6 +42,49 @@ impl JsonPatcher {
         &self,
         r: &PatchRequest<'_>,
     ) -> Result<Vec<Operation>, PatchError> {
+        let json = evaluate_expression(&self.evaluator, &self.expression, r)?;
+        Self::operations_from(json)
+    }
+
+    fn operations_from(json: Value) -> Result<Vec<Operation>, PatchError> {
+        let Value::Array(items) = json else {
+            return Err(PatchError::Other(
+                "type mismatch: JSONPatchType.expression should evaluate to array".into(),
+            ));
+        };
+        items
+            .into_iter()
+            .map(|item| {
+                let Value::Object(m) = item else {
+                    return Err(PatchError::Other(
+                        "type mismatch: JSONPatchType.expression should evaluate to array of JSONPatch"
+                            .into(),
+                    ));
+                };
+                // resultOp["op"/"path"] are always set (the Go zero value is
+                // ""); "from" only when non-empty; "value" only when set.
+                let s = |k: &str| m.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+                let from = s("from");
+                Ok(Operation {
+                    op: s("op"),
+                    path: Some(s("path")),
+                    from: (!from.is_empty()).then_some(from),
+                    value: m.get("value").cloned(),
+                })
+            })
+            .collect()
+    }
+}
+
+/// The shared half of `jsonPatcher.evaluatePatchExpression` and
+/// `applyConfigPatcher.Patch`: bind `object`/`oldObject`/`params`/
+/// `namespaceObject`/`request`, evaluate, and marshal the result to JSON.
+pub(super) fn evaluate_expression(
+    evaluator: &Mutex<CELEvaluator>,
+    expression: &str,
+    r: &PatchRequest<'_>,
+) -> Result<Value, PatchError> {
+    {
         let mut ctx = CELContext::new();
         let attrs = r.versioned_attributes;
         // `CreateAdmissionRequest` (cel/compile.go) needs the request's
@@ -77,43 +120,16 @@ impl JsonPatcher {
                 .map_err(|e| PatchError::Other(e.to_string()))?;
         }
 
-        let value = self
-            .evaluator
+        let value = evaluator
             .lock()
             .unwrap()
-            .evaluate_to_value(&self.expression, &ctx)
+            .evaluate_to_value(expression, &ctx)
             .map_err(|e| PatchError::Other(e.to_string()))?;
-        let json = value.json().map_err(|e| {
+        value.json().map_err(|e| {
             PatchError::Other(format!(
                 "JSONPath valueExpression evaluated to a type that could not marshal to JSON: {e}"
             ))
-        })?;
-        let Value::Array(items) = json else {
-            return Err(PatchError::Other(
-                "type mismatch: JSONPatchType.expression should evaluate to array".into(),
-            ));
-        };
-        items
-            .into_iter()
-            .map(|item| {
-                let Value::Object(m) = item else {
-                    return Err(PatchError::Other(
-                        "type mismatch: JSONPatchType.expression should evaluate to array of JSONPatch"
-                            .into(),
-                    ));
-                };
-                // resultOp["op"/"path"] are always set (the Go zero value is
-                // ""); "from" only when non-empty; "value" only when set.
-                let s = |k: &str| m.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-                let from = s("from");
-                Ok(Operation {
-                    op: s("op"),
-                    path: Some(s("path")),
-                    from: (!from.is_empty()).then_some(from),
-                    value: m.get("value").cloned(),
-                })
-            })
-            .collect()
+        })
     }
 }
 
