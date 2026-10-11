@@ -544,4 +544,26 @@ mod feature_gates_flag_tests {
             "{err}"
         );
     }
+
+    /// #3202: all-in-one accepts --scheduler-config like the standalone
+    /// scheduler's --config.
+    #[test]
+    #[serial]
+    fn scheduler_config_flag_feeds_volume_binding_args() {
+        let dir = std::env::temp_dir().join(format!("aio-sched-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("c.yaml");
+        std::fs::write(
+            &f,
+            "profiles:\n- pluginConfig:\n  - name: VolumeBinding\n    args:\n      bindTimeoutSeconds: 7\n",
+        )
+        .unwrap();
+        let args = Args::try_parse_from(["rusternetes", "--scheduler-config", f.to_str().unwrap()])
+            .unwrap();
+        let cfg = scheduler_config_from_args(&args).unwrap();
+        assert_eq!(cfg.volume_binding_args.bind_timeout_seconds, Some(7));
+        let none = scheduler_config_from_args(&parse("--scheduler-interval=3")).unwrap();
+        assert_eq!(none.interval, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

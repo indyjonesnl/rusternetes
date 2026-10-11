@@ -401,4 +401,31 @@ profiles:
             .collect();
         assert_eq!(got, want);
     }
+
+    // #3202: file loader shared by the scheduler binary and the all-in-one
+    // binary (--scheduler-config).
+    #[test]
+    fn load_from_file_reads_defaults_and_validates() {
+        let dir = std::env::temp_dir().join(format!("sched-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ok = dir.join("ok.yaml");
+        std::fs::write(
+            &ok,
+            "profiles:\n- pluginConfig:\n  - name: VolumeBinding\n    args:\n      bindTimeoutSeconds: 42\n",
+        )
+        .unwrap();
+        let a = load_volume_binding_args(ok.to_str().unwrap()).unwrap();
+        assert_eq!(a.bind_timeout_seconds, Some(42));
+        let bad = dir.join("bad.yaml");
+        std::fs::write(
+            &bad,
+            "profiles:\n- pluginConfig:\n  - name: VolumeBinding\n    args:\n      bindTimeoutSeconds: -1\n",
+        )
+        .unwrap();
+        let err = load_volume_binding_args(bad.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("bindTimeoutSeconds"), "{err}");
+        let err = load_volume_binding_args(dir.join("missing.yaml").to_str().unwrap()).unwrap_err();
+        assert!(err.contains("missing.yaml"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
