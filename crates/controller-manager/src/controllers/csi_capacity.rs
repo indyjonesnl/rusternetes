@@ -9,6 +9,7 @@
 //! level-triggered `reconcile` pass over `Storage`; wiring it into a run loop
 //! is `run_capacity_loop`, started from `main.rs` (#3219).
 
+use super::csi_capacity_metrics::CapacityStats;
 use rusternetes_common::quantity::{Format, Quantity};
 use rusternetes_common::resources::csi::{CSINode, CSIStorageCapacity};
 use rusternetes_common::resources::volume::LabelSelector;
@@ -415,6 +416,21 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
     /// (:539-587) + `syncCapacity` (:586-715): publish, update and delete
     /// objects until they match `segments` x the driver's StorageClasses.
     pub async fn reconcile(&self, segments: &[Segment]) -> Result<()> {
+        let (stats, r) = self.reconcile_with_stats(segments).await;
+        super::csi_capacity_metrics::publish(&self.driver_name, stats);
+        r
+    }
+
+    /// `reconcile` plus the gauge values of the pass, as
+    /// `getObjectsGoal/Current/Obsolete` (capacity.go:769-807) would report
+    /// them right after it: `obsolete` is what is left after the deletions.
+    async fn reconcile_with_stats(&self, segments: &[Segment]) -> (CapacityStats, Result<()>) {
+        let mut stats = CapacityStats::default();
+        let r = self.reconcile_inner(segments, &mut stats).await;
+        (stats, r)
+    }
+
+    async fn reconcile_inner(&self, segments: &[Segment], stats: &mut CapacityStats) -> Result<()> {
         let classes: Vec<StorageClass> = self
             .storage
             .list(&build_prefix("storageclasses", None))
@@ -446,6 +462,7 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
         // are ignored (:547-562) and everything else is obsolete or a
         // duplicate and is deleted (:582-585).
         let mut matched: Vec<Option<CSIStorageCapacity>> = vec![None; items.len()];
+        let mut first_err = None;
         for c in existing {
             if !self.is_managed(&c) {
                 continue;
@@ -456,14 +473,25 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
                 .find(|(i, it)| matched[*i].is_none() && it.equals(&c))
             {
                 Some((i, _)) => matched[i] = Some(c),
-                None => self.delete_capacity(&c).await?,
+                // A failed delete leaves the object obsolete (:792-807).
+                None => {
+                    if let Err(e) = self.delete_capacity(&c).await {
+                        stats.obsolete += 1;
+                        first_err.get_or_insert(e);
+                    }
+                }
             }
         }
 
-        let mut first_err = None;
+        stats.goal = items.len() as i64;
         for (item, current) in items.iter().zip(matched) {
-            if let Err(e) = self.sync_capacity(item, current).await {
-                first_err.get_or_insert(e);
+            let existed = current.is_some();
+            match self.sync_capacity(item, current).await {
+                Ok(created) => stats.current += i64::from(existed || created),
+                Err(e) => {
+                    stats.current += i64::from(existed);
+                    first_err.get_or_insert(e);
+                }
             }
         }
         first_err.map_or(Ok(()), Err)
@@ -474,7 +502,7 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
         &self,
         item: &WorkItem<'_>,
         current: Option<CSIStorageCapacity>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // :599-604 — the assumption is that the capacity is independent of the
         // capabilities, hence no VolumeCapabilities.
         let req = GetCapacityRequest {
@@ -504,6 +532,7 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
                         &obj,
                     )
                     .await?;
+                return Ok(true);
             }
             Some(c)
                 if sizes_are_equal(c.capacity.as_deref(), Some(&quantity))
@@ -535,7 +564,7 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
                     .await?;
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     /// The create path of `syncCapacity` (:621-640): a brand-new object. Kept
@@ -848,6 +877,63 @@ mod tests {
         assert!(reqs.iter().all(|r| r.parameters["foo"] == "bar"
             && r.volume_capabilities.is_empty()
             && r.accessible_topology.is_some()));
+    }
+
+    #[tokio::test]
+    async fn stats_count_goal_current_and_obsolete() {
+        // capacity.go:769-807: goal = work items, current = items with an
+        // object, obsolete = managed objects matching no item.
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        put_sc(&st, sc("late-sc", DRIVER, None)).await;
+        let c = ctl(&st, &cl, false);
+        let (s, r) = c
+            .reconcile_with_stats(&[seg(&[("zone", "a")]), seg(&[("zone", "b")])])
+            .await;
+        r.unwrap();
+        // Every object is created in this pass, so each item has one now.
+        assert_eq!(
+            s,
+            CapacityStats {
+                goal: 2,
+                current: 2,
+                obsolete: 0
+            }
+        );
+
+        // Zone b disappears: its object is deleted in this pass, so nothing
+        // obsolete remains afterwards.
+        let (s, r) = c.reconcile_with_stats(&[seg(&[("zone", "a")])]).await;
+        r.unwrap();
+        assert_eq!(
+            s,
+            CapacityStats {
+                goal: 1,
+                current: 1,
+                obsolete: 0
+            }
+        );
+        assert_eq!(list_caps(&st).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reconcile_publishes_the_gauges_per_driver() {
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        put_sc(&st, sc("late-sc", DRIVER, None)).await;
+        ctl(&st, &cl, false)
+            .reconcile(&[seg(&[("zone", "a")])])
+            .await
+            .unwrap();
+        let out = super::super::csi_capacity_metrics::gather();
+        for (n, v) in [
+            ("csistoragecapacities_desired_goal", 1),
+            ("csistoragecapacities_desired_current", 1),
+            ("csistoragecapacities_obsolete", 0),
+        ] {
+            let want = format!("{n}{{driver_name=\"{DRIVER}\"}} {v}");
+            assert!(out.contains(&want), "{want} missing in:\n{out}");
+        }
     }
 
     #[tokio::test]
