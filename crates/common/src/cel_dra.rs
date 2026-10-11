@@ -1586,7 +1586,7 @@ mod tests {
             (r#"device.driver == "dra.example.com""#.into(), 4),
             (format!("{a}.name"), 4),
             (format!(r#"{a}["name"]"#), 4),
-            // `cel.bind` (want 15) is not costed: the parser has no bind macro, tracked in a follow-up issue.
+            (r#"cel.bind(dra, device.attributes["dra.example.com"], dra.name)"#.into(), 15),
             (format!("{a}.name > 0"), 5),
             (format!(r#"{a}.name == "fish""#), 5),
             (format!(r#"{a}.name.isGreaterThan(semver("0.0.1"))"#), 6),
