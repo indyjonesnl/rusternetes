@@ -884,11 +884,11 @@ impl BindingRest {
                 "name in URL does not match name in Binding object".to_string(),
             ));
         }
-        // TODO upstream: "move me to a binding strategy". An aggregate error
-        // is a 500 there; the 422 with causes is kept (#1939).
+        // storage.go:188-190: `return nil, errs.ToAggregate()` - a plain
+        // error, so a 500 (see `Error::aggregate`), not a 422.
         let errs = rusternetes_common::validation::pod_status::validate_pod_binding(binding);
         if !errs.is_empty() {
-            return Err(Error::Invalid(errs));
+            return Err(Error::aggregate(&errs));
         }
         // storage.go:191-195: `createValidation` sees the Binding, after
         // `ValidatePodBinding`.
