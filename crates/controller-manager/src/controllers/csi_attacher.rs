@@ -68,7 +68,7 @@ const WORKERS: usize = 10;
 /// `--reconcile-sync` (`main.go:76`): the resync interval of the
 /// VolumeAttachment reconciler.
 const RECONCILE_SYNC: Duration = Duration::from_secs(60);
-/// `--max-entries`: `ListVolumes` page size; 0 lets the driver pick.
+/// `--max-entries` default (`main.go:72`): `ListVolumes` page size; 0 lets the driver pick.
 const MAX_ENTRIES: i32 = 0;
 /// Resync when no event arrives; also bounds how late a backed-off retry runs.
 const RESYNC: Duration = Duration::from_secs(15);
@@ -158,6 +158,10 @@ pub struct CsiAttacher<S: Storage> {
     /// processing must attach or detach even when `status.attached` /
     /// the finalizer already show the desired state.
     force_sync: Mutex<HashSet<String>>,
+    /// `--reconcile-sync` (`main.go:76`).
+    reconcile_sync: Duration,
+    /// `--max-entries` (`main.go:72`).
+    max_entries: i32,
 }
 
 impl<S: Storage + 'static> CsiAttacher<S> {
@@ -176,7 +180,21 @@ impl<S: Storage + 'static> CsiAttacher<S> {
             retry_start: RETRY_INTERVAL_START,
             retry_max: RETRY_INTERVAL_MAX,
             force_sync: Mutex::new(HashSet::new()),
+            reconcile_sync: RECONCILE_SYNC,
+            max_entries: MAX_ENTRIES,
         }
+    }
+
+    /// `--reconcile-sync`: resync interval of the VolumeAttachment reconciler.
+    pub fn with_reconcile_sync(mut self, interval: Duration) -> Self {
+        self.reconcile_sync = interval;
+        self
+    }
+
+    /// `--max-entries`: `ListVolumes` page size, 0 means no limit.
+    pub fn with_max_entries(mut self, max_entries: i32) -> Self {
+        self.max_entries = max_entries;
+        self
     }
 
     /// `--default-fstype`.
@@ -239,7 +257,7 @@ impl<S: Storage + 'static> CsiAttacher<S> {
         if Instant::now() < *next {
             return;
         }
-        *next = Instant::now() + RECONCILE_SYNC;
+        *next = Instant::now() + self.reconcile_sync;
         if let Err(e) = self.reconcile_va().await {
             error!(
                 "CSI attacher {}: failed to reconcile VolumeAttachment: {e:#}",
@@ -354,7 +372,7 @@ impl<S: Storage + 'static> CsiAttacher<S> {
             .map_err(|_| anyhow!("failed to list all VolumeAttachment objects"))?;
         let published = self
             .client
-            .list_volumes(MAX_ENTRIES)
+            .list_volumes(self.max_entries)
             .await
             .map_err(|e| anyhow!("failed to ListVolumes: {e}"))?;
         for va in vas {
