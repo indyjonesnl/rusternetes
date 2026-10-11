@@ -54,6 +54,7 @@ mod storage_readiness_hook;
 pub use rusternetes_protobuf as protobuf;
 #[allow(dead_code)]
 mod fieldmanager;
+mod request_timeout;
 #[allow(dead_code)]
 mod response;
 mod router;
@@ -187,6 +188,21 @@ struct Args {
     #[arg(long, default_value_t = false)]
     enable_priority_and_fairness: bool,
 
+    /// `--request-timeout` (server/config.go:445): the maximum a
+    /// non-long-running request may take (`WithRequestDeadline`); a request's
+    /// own `?timeout=` can only shorten it.
+    #[arg(
+        long,
+        default_value = "1m0s",
+        value_parser = |s: &str| -> Result<std::time::Duration, String> {
+            let ns = rusternetes_common::go_duration::parse_go_duration(s)?;
+            u64::try_from(ns)
+                .map(std::time::Duration::from_nanos)
+                .map_err(|_| format!("negative duration {s:?} is not allowed"))
+        }
+    )]
+    request_timeout: std::time::Duration,
+
     /// `--max-requests-inflight` (server/config.go:443): with
     /// `--max-mutating-requests-inflight` this is the server concurrency limit
     /// APF divides between priority levels.
@@ -256,6 +272,7 @@ fn apply_feature_gates(value: &str) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    request_timeout::set_request_timeout(args.request_timeout);
     apply_feature_gates(&args.feature_gates)?;
     // `validateClusterIPFlags`: refuse to start on a bad range.
     let service_ranges =
