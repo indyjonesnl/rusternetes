@@ -153,6 +153,25 @@ pub fn validate_pod_create(pod: &Pod, allow_relaxed_dns_search: bool) -> ErrorLi
     errs
 }
 
+/// `ValidatePodUpdate` (validation.go:5695-5838).
+pub fn validate_pod_update(
+    new: &Pod,
+    old: &Pod,
+    _allow_relaxed_dns_search: bool,
+    is_ephemeral_subresource: bool,
+) -> ErrorList {
+    let mut errs = crate::validation::objectmeta::validate_object_meta_update(
+        &new.metadata,
+        &old.metadata,
+        &Path::new("metadata"),
+    );
+    errs.extend(crate::validation::pod_status::validate_pod_metadata_annotations(new, Some(old)));
+    if let (Some(o), Some(n)) = (old.spec.as_ref(), new.spec.as_ref()) {
+        errs.extend(validate_pod_spec_update(o, n, is_ephemeral_subresource));
+    }
+    errs
+}
+
 /// Mirrors upstream `ValidatePodSpec`
 /// (`pkg/apis/core/validation/validation.go`, release-1.35).
 ///
