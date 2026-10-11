@@ -391,9 +391,21 @@ impl CsiControllerClient {
     /// `GetCapacity` (external-provisioner `controller.go:1676-1684`'s
     /// `p.csiClient.GetCapacity`): the driver's `AvailableCapacity` in bytes.
     pub async fn get_capacity(&self, req: GetCapacityRequest) -> Result<i64, ControllerError> {
-        self.call(ControllerClient::new(self.channel()?).get_capacity(req))
+        self.get_capacity_response(req)
             .await
             .map(|r| r.available_capacity)
+    }
+
+    /// `GetCapacity` returning the whole response: the capacity controller
+    /// (external-provisioner `pkg/capacity/capacity.go:606-614`) publishes
+    /// `AvailableCapacity` as `Capacity` and the optional `MaximumVolumeSize`
+    /// (`None` when the driver leaves the `Int64Value` unset).
+    pub async fn get_capacity_response(
+        &self,
+        req: GetCapacityRequest,
+    ) -> Result<crate::proto::GetCapacityResponse, ControllerError> {
+        self.call(ControllerClient::new(self.channel()?).get_capacity(req))
+            .await
     }
 
     /// `CSIVolumeLister.ListVolumes` (external-attacher `pkg/attacher/lister.go:41-69`):
@@ -522,6 +534,7 @@ mod tests {
         delete_code: Option<tonic::Code>,
         /// `starting_token` -> page served for it.
         list_pages: HashMap<String, ListVolumesResponse>,
+        capacity: Option<GetCapacityResponse>,
     }
 
     impl Fake {
@@ -540,6 +553,7 @@ mod tests {
                 delete_delay: Duration::ZERO,
                 delete_code: None,
                 list_pages: HashMap::new(),
+                capacity: None,
             }
         }
     }
@@ -618,7 +632,9 @@ mod tests {
             &self,
             _r: Request<GetCapacityRequest>,
         ) -> Result<Response<GetCapacityResponse>, Status> {
-            Err(Status::unimplemented("not exercised"))
+            self.capacity
+                .map(Response::new)
+                .ok_or_else(|| Status::unimplemented("not exercised"))
         }
         async fn list_volumes(
             &self,
@@ -1066,5 +1082,38 @@ mod tests {
         let (_d, client, _rec) = start(Fake::full());
         let err = client.list_volumes(0).await.unwrap_err();
         assert!(err.to_string().contains("failed to list volumes"), "{err}");
+    }
+
+    /// external-provisioner `pkg/capacity/capacity.go:606-614` reads
+    /// `AvailableCapacity` and the optional `MaximumVolumeSize` (an
+    /// `Int64Value`, nil when the driver leaves it unset).
+    #[tokio::test]
+    async fn get_capacity_response_surfaces_maximum_volume_size() {
+        let mut fake = Fake::full();
+        fake.capacity = Some(GetCapacityResponse {
+            available_capacity: 10,
+            maximum_volume_size: Some(7),
+            minimum_volume_size: Some(3),
+        });
+        let (_d, client, _rec) = start(fake);
+        let r = client
+            .get_capacity_response(GetCapacityRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(r.available_capacity, 10);
+        assert_eq!(r.maximum_volume_size, Some(7));
+        assert_eq!(r.minimum_volume_size, Some(3));
+
+        let mut fake = Fake::full();
+        fake.capacity = Some(GetCapacityResponse {
+            available_capacity: 10,
+            ..Default::default()
+        });
+        let (_d, client, _rec) = start(fake);
+        let r = client
+            .get_capacity_response(GetCapacityRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(r.maximum_volume_size, None);
     }
 }
