@@ -115,6 +115,9 @@ pub struct ApplyOptions {
     /// `NewDefaultFieldManager(..., resetFields)` argument
     /// (`endpoints/installer.go:697-722`).
     pub reset_fields: ResetFields,
+    /// The subresource being applied (`/status`, `/scale`); upstream
+    /// `buildManagerInfoManager.subresource` (buildmanagerinfo.go:55-61).
+    pub subresource: Option<String>,
 }
 
 impl ApplyOptions {
@@ -123,7 +126,13 @@ impl ApplyOptions {
             field_manager: field_manager.into(),
             force: false,
             reset_fields: ResetFields::new(),
+            subresource: None,
         }
+    }
+
+    pub fn with_subresource(mut self, subresource: Option<&str>) -> Self {
+        self.subresource = subresource.map(str::to_string);
+        self
     }
 
     pub fn with_reset_fields(mut self, reset_fields: ResetFields) -> Self {
@@ -224,8 +233,11 @@ pub fn apply_legacy<T: Serialize + DeserializeOwned>(
         .or_else(|| current.as_ref().and_then(|c| c.get("apiVersion")))
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let field_manager =
-        crate::fieldmanager::FieldManager::new(version, None, opts.reset_fields.clone());
+    let field_manager = crate::fieldmanager::FieldManager::new(
+        version,
+        opts.subresource.as_deref(),
+        opts.reset_fields.clone(),
+    );
     match field_manager.apply_value(current.as_ref(), desired, &opts.field_manager, opts.force) {
         Ok(mut applied) => {
             // The system-owned metadata is the live object's, whatever the
@@ -989,6 +1001,24 @@ mod tests {
                 .map(|e| e["manager"].as_str().unwrap())
                 .collect();
             assert!(managers.contains(&"a"), "{managers:?}");
+        }
+
+        /// #3039 item 1: a `/status` or `/scale` apply records the
+        /// subresource in the entry (buildmanagerinfo.go:55-61), so it is a
+        /// different manager identity from the main-resource apply.
+        #[test]
+        fn subresource_apply_entry_carries_the_subresource() {
+            let a = applied(
+                apply_legacy::<Lease>(
+                    None,
+                    &lease(json!({"holderIdentity": "a"})),
+                    &ApplyOptions::new("a").with_subresource(Some("status")),
+                )
+                .unwrap(),
+            );
+            let v = serde_json::to_value(&a).unwrap();
+            let entry = &v["metadata"]["managedFields"][0];
+            assert_eq!(entry["subresource"], "status", "{entry}");
         }
     }
 }
