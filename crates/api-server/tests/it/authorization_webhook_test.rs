@@ -714,3 +714,84 @@ async fn request_info_middleware_reaches_webhook_spec() {
     let got = mock.lock().unwrap().last.clone().unwrap();
     assert_eq!(got["spec"]["resourceAttributes"]["version"], "v1");
 }
+
+// GetAuthorizerAttributes (filters/authorization.go:126-150) parses the
+// request's fieldSelector/labelSelector into the attributes; the router layer
+// must carry them to the webhook spec (#3160).
+#[tokio::test]
+async fn request_selectors_reach_webhook_spec_via_middleware() {
+    use tower::ServiceExt;
+    let mock = allowing_mock();
+    let url = serve(mock.clone()).await;
+    let wh = Arc::new(authorizer(
+        &url,
+        "v1",
+        Duration::ZERO,
+        FailurePolicy::NoOpinion,
+    ));
+    let app = Router::new()
+        .route(
+            "/api/v1/namespaces/:ns/pods",
+            axum::routing::get(move || {
+                let wh = wh.clone();
+                async move {
+                    let a = RequestAttributes {
+                        verb: "list".into(),
+                        ..resource("jane")
+                    };
+                    let _ = wh.authorize_opinion(&a).await;
+                    "ok"
+                }
+            }),
+        )
+        .layer(axum::middleware::from_fn(
+            rusternetes_api_server::request_scope::request_info_middleware,
+        ));
+    let resp = app
+        .oneshot(
+            axum::http::Request::get(
+                "/api/v1/namespaces/kittensandponies/pods?fieldSelector=spec.nodeName%3Dn1&labelSelector=app%3Dweb",
+            )
+            .body(axum::body::Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let got = mock.lock().unwrap().last.clone().unwrap();
+    let ra = &got["spec"]["resourceAttributes"];
+    assert_eq!(ra["verb"], "list");
+    assert_eq!(
+        ra["fieldSelector"],
+        json!({"requirements": [{"key": "spec.nodeName", "operator": "In", "values": ["n1"]}]})
+    );
+    assert_eq!(
+        ra["labelSelector"],
+        json!({"requirements": [{"key": "app", "operator": "In", "values": ["web"]}]})
+    );
+}
+
+// A check on another resource inside the request must not inherit its selectors.
+#[tokio::test]
+async fn request_selectors_ignored_for_a_different_resource() {
+    let mock = allowing_mock();
+    let url = serve(mock.clone()).await;
+    let wh = authorizer(&url, "v1", Duration::ZERO, FailurePolicy::NoOpinion);
+    let info = rusternetes_api_server::audit::request_info(
+        &axum::http::Method::GET,
+        "/api/v1/namespaces/kittensandponies/pods",
+        Some("labelSelector=app%3Dweb"),
+    );
+    let a = RequestAttributes {
+        verb: "list".into(),
+        ..RequestAttributes::new(user("jane"), "list", "secrets")
+    };
+    rusternetes_api_server::request_scope::with_request_info(info, async {
+        wh.authorize_opinion(&a).await.unwrap()
+    })
+    .await;
+    let got = mock.lock().unwrap().last.clone().unwrap();
+    assert!(got["spec"]["resourceAttributes"]
+        .get("labelSelector")
+        .is_none());
+}
