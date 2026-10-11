@@ -95,6 +95,11 @@ fn build_instance(
         if stack.iter().any(|n| n == name) {
             return Value::Null; // recursive type -> stop
         }
+        // `resource.Quantity` is a typed scalar upstream (`ParseQuantity`
+        // rejects the generic "x" dummy), so supply a valid one (#2956).
+        if name.ends_with("resource.Quantity") || name == "Quantity" {
+            return Value::String("1".to_string());
+        }
         if let Some(target) = defs.get(name) {
             stack.push(name.to_string());
             // Children of this $ref are described by `name` — use it as context.

@@ -245,7 +245,12 @@ pub enum TolerationOperator {
 /// `{requests: map[QualifiedName]resource.Quantity}`, json `requests,omitempty`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct CapacityRequirements {
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        serialize_with = "crate::quantity::wire::serialize_btree_map",
+        deserialize_with = "crate::quantity::wire::deserialize_btree_map"
+    )]
     pub requests: BTreeMap<String, String>,
 }
 
@@ -414,7 +419,9 @@ pub struct DeviceRequestAllocationResult {
     #[serde(
         rename = "consumedCapacity",
         default,
-        skip_serializing_if = "Option::is_none"
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt_btree_map",
+        deserialize_with = "crate::quantity::wire::deserialize_opt_btree_map"
     )]
     pub consumed_capacity: Option<BTreeMap<String, String>>,
 }
@@ -798,6 +805,10 @@ pub struct DeviceAttribute {
 #[serde(rename_all = "camelCase")]
 pub struct DeviceCapacity {
     /// Value defines how much capacity the device has
+    #[serde(
+        serialize_with = "crate::quantity::wire::serialize",
+        deserialize_with = "crate::quantity::wire::deserialize"
+    )]
     pub value: String, // resource.Quantity as string
 
     /// RequestPolicy defines how capacity must be consumed
@@ -813,11 +824,22 @@ pub struct DeviceCapacity {
 #[serde(rename_all = "camelCase")]
 pub struct CapacityRequestPolicy {
     /// Default specifies default consumed amount
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt",
+        deserialize_with = "crate::quantity::wire::deserialize_opt"
+    )]
     pub default: Option<String>,
 
     /// ValidValues defines acceptable quantity values
-    #[serde(rename = "validValues", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        rename = "validValues",
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        serialize_with = "crate::quantity::wire::serialize_vec",
+        deserialize_with = "crate::quantity::wire::deserialize_vec"
+    )]
     pub valid_values: Vec<String>,
 
     /// ValidRange defines an acceptable quantity value range
@@ -833,15 +855,30 @@ pub struct CapacityRequestPolicy {
 #[serde(rename_all = "camelCase")]
 pub struct CapacityRequestPolicyRange {
     /// Min specifies minimum capacity allowed
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt",
+        deserialize_with = "crate::quantity::wire::deserialize_opt"
+    )]
     pub min: Option<String>,
 
     /// Max defines upper limit for capacity
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt",
+        deserialize_with = "crate::quantity::wire::deserialize_opt"
+    )]
     pub max: Option<String>,
 
     /// Step defines step size between valid capacity amounts
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt",
+        deserialize_with = "crate::quantity::wire::deserialize_opt"
+    )]
     pub step: Option<String>,
 }
 
@@ -917,6 +954,10 @@ pub struct CounterSet {
 #[serde(rename_all = "camelCase")]
 pub struct Counter {
     /// Value defines how much of a counter is available
+    #[serde(
+        serialize_with = "crate::quantity::wire::serialize",
+        deserialize_with = "crate::quantity::wire::deserialize"
+    )]
     pub value: String, // resource.Quantity as string
 }
 

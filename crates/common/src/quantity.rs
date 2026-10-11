@@ -656,6 +656,139 @@ fn interpret_suffix(suffix: &str) -> Option<SuffixKind> {
     }
 }
 
+/// serde adapters for fields that hold a `resource.Quantity` as a `String`.
+///
+/// Port of upstream `Quantity.MarshalJSON` (`quantity.go:694`: emit
+/// `CanonicalizeBytes`, so `1024Mi` -> `1Gi`, `1000m` -> `1`, `0Mi` -> `0`) and
+/// `Quantity.UnmarshalJSON` (`quantity.go:733`: `null` is a no-op, a string or a
+/// bare number is parsed with `ParseQuantity` after `TrimSpace`, anything
+/// unparsable is a decode error).
+///
+/// Serialising an unparsable string emits it unchanged rather than failing:
+/// every value that came from the wire was validated on decode, and a
+/// serializer cannot report a semantic error the way Go's `MarshalJSON` never
+/// can for a parsed `Quantity`.
+pub mod wire {
+    use super::Quantity;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::{BTreeMap, HashMap};
+
+    /// Canonical string for `s`, or `s` itself when it does not parse.
+    pub fn canonicalize(s: &str) -> String {
+        match Quantity::parse(s.trim()) {
+            Ok(q) => q.canonical_string(),
+            Err(_) => s.to_string(),
+        }
+    }
+
+    /// Validate a decoded JSON scalar; `None` for `null`.
+    fn scalar<E: serde::de::Error>(v: serde_json::Value) -> Result<Option<String>, E> {
+        let s = match v {
+            serde_json::Value::Null => return Ok(None),
+            serde_json::Value::String(s) => s,
+            serde_json::Value::Number(n) => n.to_string(),
+            other => {
+                return Err(E::custom(format!(
+                    "Quantity must be a string or number, got {other}"
+                )))
+            }
+        };
+        Quantity::parse(s.trim()).map_err(|e| E::custom(format!("invalid Quantity {s:?}: {e}")))?;
+        Ok(Some(s))
+    }
+
+    pub fn serialize<S: Serializer>(v: &str, s: S) -> Result<S::Ok, S::Error> {
+        canonicalize(v).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+        let v = serde_json::Value::deserialize(d)?;
+        Ok(scalar(v)?.unwrap_or_default())
+    }
+
+    pub fn serialize_opt<S: Serializer>(v: &Option<String>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(v) => s.serialize_str(&canonicalize(v)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize_opt<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+        let v = serde_json::Value::deserialize(d)?;
+        scalar(v)
+    }
+
+    pub fn serialize_vec<S: Serializer>(v: &[String], s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(v.iter().map(|x| canonicalize(x)))
+    }
+
+    pub fn deserialize_vec<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+        let items = Vec::<serde_json::Value>::deserialize(d)?;
+        let mut out = Vec::with_capacity(items.len());
+        for v in items {
+            if let Some(s) = scalar(v)? {
+                out.push(s);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn serialize_map<S: Serializer>(
+        m: &HashMap<String, String>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        s.collect_map(m.iter().map(|(k, v)| (k, canonicalize(v))))
+    }
+
+    pub fn deserialize_map<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<HashMap<String, String>, D::Error> {
+        Ok(crate::types::deserialize_quantity_map(d)?.unwrap_or_default())
+    }
+
+    pub fn serialize_opt_map<S: Serializer>(
+        m: &Option<HashMap<String, String>>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        match m {
+            Some(m) => serialize_map(m, s),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn serialize_opt_btree_map<S: Serializer>(
+        m: &Option<BTreeMap<String, String>>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        match m {
+            Some(m) => serialize_btree_map(m, s),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize_opt_btree_map<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<BTreeMap<String, String>>, D::Error> {
+        Ok(crate::types::deserialize_quantity_map(d)?.map(|m| m.into_iter().collect()))
+    }
+
+    pub fn serialize_btree_map<S: Serializer>(
+        m: &BTreeMap<String, String>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        s.collect_map(m.iter().map(|(k, v)| (k, canonicalize(v))))
+    }
+
+    pub fn deserialize_btree_map<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<BTreeMap<String, String>, D::Error> {
+        Ok(crate::types::deserialize_quantity_map(d)?
+            .unwrap_or_default()
+            .into_iter()
+            .collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

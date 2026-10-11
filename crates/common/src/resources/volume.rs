@@ -31,7 +31,12 @@ pub struct PersistentVolumeSpec {
     /// `PersistentVolumeSpec.Capacity` is `+optional` / `json:",omitempty"`,
     /// so a PV may be posted without it (e.g. the CSI status conformance
     /// test). Default to an empty map rather than failing to decode.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "HashMap::is_empty",
+        serialize_with = "crate::quantity::wire::serialize_map",
+        deserialize_with = "crate::quantity::wire::deserialize_map"
+    )]
     pub capacity: HashMap<String, String>,
 
     /// Access modes. Optional on the wire (`+optional` upstream); default to
@@ -418,12 +423,14 @@ pub struct ResourceRequirements {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt_map",
         deserialize_with = "crate::types::deserialize_quantity_map"
     )]
     pub limits: Option<HashMap<String, String>>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt_map",
         deserialize_with = "crate::types::deserialize_quantity_map"
     )]
     pub requests: Option<HashMap<String, String>>,
@@ -483,6 +490,7 @@ pub struct PersistentVolumeClaimStatus {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt_map",
         deserialize_with = "crate::types::deserialize_quantity_map"
     )]
     pub capacity: Option<HashMap<String, String>>,
@@ -493,6 +501,7 @@ pub struct PersistentVolumeClaimStatus {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt_map",
         deserialize_with = "crate::types::deserialize_quantity_map"
     )]
     pub allocated_resources: Option<HashMap<String, String>>,

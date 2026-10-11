@@ -24,6 +24,7 @@ mod null_field_deserialization_test;
 mod qos_pod_class;
 mod quantity_decode_test;
 mod quantity_normalization_test;
+mod quantity_wire_canonical_test;
 mod query_bool_guard;
 mod roundtrip_apps_v1;
 mod roundtrip_batch;
