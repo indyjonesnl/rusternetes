@@ -148,6 +148,20 @@ const PV_SAVE_MAX: Duration = Duration::from_secs(1000);
 /// default 100; this process runs fewer, the claims are cheap).
 const WORKERS: usize = 8;
 
+/// `NodeDeployment` (external-provisioner `pkg/controller/node.go`) as far as
+/// the `--node-deployment` mode needs it: the node this instance serves and
+/// the driver's `NodeGetInfo` topology.
+#[derive(Debug, Clone, Default)]
+pub struct NodeDeployment {
+    /// `NodeName`.
+    pub node_name: String,
+    /// `ImmediateBinding` (`--node-deployment-immediate-binding`).
+    pub immediate_binding: bool,
+    /// `NodeInfo.AccessibleTopology.Segments`; `None` = the driver reported
+    /// no topology.
+    pub accessible_topology: Option<HashMap<String, String>>,
+}
+
 /// Why a provisioning step stopped without an error to retry.
 #[derive(Debug)]
 enum Failure {
@@ -652,6 +666,8 @@ pub struct CsiProvisioner<S: Storage> {
     /// `pvcNodeStore` (cache.go `InMemoryStore`), keyed by PVC UID.
     pvc_node_store: TopologyStore,
     capabilities: tokio::sync::OnceCell<DriverCapabilities>,
+    /// `nodeDeployment`; `None` = central deployment.
+    node_deployment: Option<NodeDeployment>,
 }
 
 impl<S: Storage + 'static> CsiProvisioner<S> {
@@ -688,7 +704,15 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             immediate_topology: true,
             pvc_node_store: TopologyStore::new(),
             capabilities: tokio::sync::OnceCell::new(),
+            node_deployment: None,
         }
+    }
+
+    /// `--node-deployment`: run as the per-node instance of a distributed
+    /// deployment.
+    pub fn with_node_deployment(mut self, nd: NodeDeployment) -> Self {
+        self.node_deployment = Some(nd);
+        self
     }
 
     /// `--strict-topology`: pass only the selected node's topology.
