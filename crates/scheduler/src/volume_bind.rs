@@ -14,7 +14,10 @@
 //! `podLister`). Go's nil-vs-empty slice distinction ("failed to get cached
 //! bindings") has no equivalent with Rust `Vec`s and is not ported.
 
-use crate::volume_binding::{BindingInfo, PodVolumes};
+use crate::volume_binding::{
+    check_pv_node_affinity, is_pvc_fully_bound, pvc_key, try_translate_pv_to_csi, BindingInfo,
+    PodVolumes, ANN_SELECTED_NODE,
+};
 use rusternetes_common::resources::{CSINode, Node, PersistentVolume, PersistentVolumeClaim, Pod};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -83,50 +86,285 @@ pub enum PreBindPreFlight {
     Run,
 }
 
+fn pod_name(pod: &Pod) -> String {
+    format!(
+        "{}/{}",
+        pod.metadata.namespace.as_deref().unwrap_or(""),
+        pod.metadata.name
+    )
+}
+
+/// `APIObjectVersioner.ObjectResourceVersion` (api_object_versioner.go:73-82):
+/// empty is 0; a parse failure is a coder error upstream (it panics), surfaced
+/// here as an `Err`.
+fn object_resource_version(rv: Option<&str>) -> Result<u64, String> {
+    match rv {
+        None | Some("") => Ok(0),
+        Some(v) => v
+            .parse::<u64>()
+            .map_err(|e| format!("invalid resource version {v:?}: {e}")),
+    }
+}
+
+/// `bindAPIUpdate` (binder.go:521-597): write the assumed PV claimRefs and
+/// the selected-node PVC annotations, replacing each slice entry with the
+/// object the API server returned. Entries not yet written when an update
+/// fails are reverted in the assume caches (the deferred func at :536-545).
 pub async fn bind_api_update(
-    _env: &dyn BinderEnv,
-    _pod: &Pod,
-    _bindings: &mut [BindingInfo],
-    _claims_to_provision: &mut [PersistentVolumeClaim],
+    env: &dyn BinderEnv,
+    bindings: &mut [BindingInfo],
+    claims_to_provision: &mut [PersistentVolumeClaim],
 ) -> Result<(), String> {
-    Err("not implemented".into())
+    let mut last_processed_binding = 0;
+    let mut last_processed_provisioning = 0;
+    let result = async {
+        // Do the actual prebinding. Let the PV controller take care of the
+        // rest. There is no API rollback if the actual binding fails.
+        for binding in bindings.iter_mut() {
+            let new_pv = env.update_pv(&binding.pv).await?;
+            // Save updated object from apiserver for later checking.
+            binding.pv = new_pv;
+            last_processed_binding += 1;
+        }
+        // Update claims objects to trigger volume provisioning. The PV
+        // controller signals back by removing annotations if provisioning fails.
+        for claim in claims_to_provision.iter_mut() {
+            let new_claim = env.update_pvc(claim).await?;
+            *claim = new_claim;
+            last_processed_provisioning += 1;
+        }
+        Ok(())
+    }
+    .await;
+    // only revert assumed cached updates for volumes we haven't successfully
+    // bound / claims we haven't updated
+    if last_processed_binding < bindings.len() {
+        env.revert_assumed_pvs(&bindings[last_processed_binding..]);
+    }
+    if last_processed_provisioning < claims_to_provision.len() {
+        env.revert_assumed_pvcs(&claims_to_provision[last_processed_provisioning..]);
+    }
+    result
 }
 
+/// `volume.CheckNodeAffinity` failure text (helpers.go:79).
+const ERR_NO_MATCHING_TERMS: &str = "no matching NodeSelectorTerms";
+
+/// `checkBindings` (binder.go:607-722). `Ok(true)` when every PVC is fully
+/// bound, `Ok(false)` to keep waiting, `Err` when binding must be retried.
+/// Reads the API objects held by the assume caches, not the (possibly
+/// re-assumed) cached ones.
 pub async fn check_bindings(
-    _env: &dyn BinderEnv,
-    _pod: &Pod,
-    _bindings: &[BindingInfo],
-    _claims_to_provision: &[PersistentVolumeClaim],
+    env: &dyn BinderEnv,
+    pod: &Pod,
+    bindings: &[BindingInfo],
+    claims_to_provision: &[PersistentVolumeClaim],
 ) -> Result<bool, String> {
-    Err("not implemented".into())
+    let node_name = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.node_name.as_deref())
+        .unwrap_or("");
+    let node = env
+        .node(node_name)
+        .await
+        .map_err(|e| format!("failed to get node {node_name:?}: {e}"))?;
+    // Upstream tolerates a missing CSINode ("TODO: return the error once
+    // CSINode is created by default").
+    let csi_node = env.csi_node(&node.metadata.name).await;
+
+    // When pod is deleted, binding operation should be cancelled. There is no
+    // need to check PV/PVC bindings any more.
+    match env.pod_exists(pod).await {
+        Ok(false) => {
+            return Err(format!(
+                "pod does not exist any more: pods {:?} not found",
+                pod.metadata.name
+            ))
+        }
+        Ok(true) => {}
+        Err(e) => {
+            tracing::error!(pod = %pod_name(pod), error = %e, "Failed to get pod from the lister")
+        }
+    }
+
+    for binding in bindings {
+        let pv = env
+            .pv_api_obj(&binding.pv.metadata.name)
+            .map_err(|e| format!("failed to check binding: {e}"))?;
+        let pvc = env
+            .pvc_api_obj(&pvc_key(&binding.pvc))
+            .map_err(|e| format!("failed to check binding: {e}"))?;
+
+        // Because we updated PV in apiserver, skip if API object is older and
+        // wait for the new API object propagated from apiserver.
+        if object_resource_version(binding.pv.metadata.resource_version.as_deref())?
+            > object_resource_version(pv.metadata.resource_version.as_deref())?
+        {
+            return Ok(false);
+        }
+
+        let pv = try_translate_pv_to_csi(&pv, csi_node.as_ref())
+            .map_err(|e| format!("failed to translate pv to csi: {e}"))?;
+
+        // Check PV's node affinity (the node might not have the proper label)
+        if !check_pv_node_affinity(&pv, &node) {
+            return Err(format!(
+                "pv {:?} node affinity doesn't match node {:?}: {ERR_NO_MATCHING_TERMS}",
+                pv.metadata.name, node.metadata.name
+            ));
+        }
+
+        // Check if pv.ClaimRef got dropped by unbindVolume()
+        if pv
+            .spec
+            .claim_ref
+            .as_ref()
+            .is_none_or(|cr| cr.uid.as_deref().unwrap_or("").is_empty())
+        {
+            return Err(format!("ClaimRef got reset for pv {:?}", pv.metadata.name));
+        }
+
+        // Check if pvc is fully bound
+        if !is_pvc_fully_bound(&pvc) {
+            return Ok(false);
+        }
+    }
+
+    for claim in claims_to_provision {
+        let pvc = env
+            .pvc_api_obj(&pvc_key(claim))
+            .map_err(|e| format!("failed to check provisioning pvc: {e}"))?;
+
+        if object_resource_version(claim.metadata.resource_version.as_deref())?
+            > object_resource_version(pvc.metadata.resource_version.as_deref())?
+        {
+            return Ok(false);
+        }
+
+        // Check if selectedNode annotation is still set
+        let Some(ann) = pvc.metadata.annotations.as_ref() else {
+            return Err(format!(
+                "selectedNode annotation reset for PVC {:?}",
+                pvc.metadata.name
+            ));
+        };
+        if ann.get(ANN_SELECTED_NODE).map(String::as_str).unwrap_or("") != node_name {
+            // If provisioner fails to provision a volume, selectedNode
+            // annotation will be removed to signal back to the scheduler to retry.
+            return Err(format!(
+                "provisioning failed for PVC {:?}",
+                pvc.metadata.name
+            ));
+        }
+
+        // If the PVC is bound to a PV, check its node affinity
+        if let Some(pv_name) = pvc.spec.volume_name.as_deref().filter(|v| !v.is_empty()) {
+            let pv = match env.pv_api_obj(pv_name) {
+                Ok(pv) => pv,
+                // We tolerate NotFound here: the PV is possibly not found
+                // because of API delay, so check next time. If it was deleted
+                // the PVC will be unbound eventually.
+                Err(CacheError::NotFound(_)) => return Ok(false),
+                Err(e) => return Err(format!("failed to get pv {pv_name:?} from cache: {e}")),
+            };
+            let pv = try_translate_pv_to_csi(&pv, csi_node.as_ref())?;
+            if !check_pv_node_affinity(&pv, &node) {
+                return Err(format!(
+                    "pv {:?} node affinity doesn't match node {:?}: {ERR_NO_MATCHING_TERMS}",
+                    pv.metadata.name, node.metadata.name
+                ));
+            }
+        }
+
+        // Check if pvc is fully bound
+        if !is_pvc_fully_bound(&pvc) {
+            return Ok(false);
+        }
+    }
+
+    // All pvs and pvcs that we operated on are bound
+    Ok(true)
 }
 
+/// `BindPodVolumes` (binder.go:479-514): make the API updates, then poll
+/// `checkBindings` every `poll_interval` (first check after one interval,
+/// `PollUntilContextTimeout` with `immediate=false`) until `bind_timeout`.
 pub async fn bind_pod_volumes(
-    _env: &dyn BinderEnv,
-    _pod: &Pod,
-    _vols: &mut PodVolumes,
-    _bind_timeout: Duration,
-    _poll_interval: Duration,
+    env: &dyn BinderEnv,
+    pod: &Pod,
+    vols: &mut PodVolumes,
+    bind_timeout: Duration,
+    poll_interval: Duration,
 ) -> Result<(), String> {
-    Err("not implemented".into())
+    // convertDynamicProvisionsToPVCs (binder.go:469-476)
+    let mut claims_to_provision: Vec<PersistentVolumeClaim> = vols
+        .dynamic_provisions
+        .iter()
+        .map(|d| d.pvc.clone())
+        .collect();
+
+    // Start API operations
+    let r = bind_api_update(env, &mut vols.static_bindings, &mut claims_to_provision).await;
+    // Go shares these objects by pointer, so the API-returned copies stay in
+    // PodVolumes; mirror that.
+    for (d, c) in vols.dynamic_provisions.iter_mut().zip(&claims_to_provision) {
+        d.pvc = c.clone();
+    }
+    r?;
+
+    let bindings = &vols.static_bindings;
+    let poll = async {
+        loop {
+            tokio::time::sleep(poll_interval).await;
+            if check_bindings(env, pod, bindings, &claims_to_provision).await? {
+                return Ok::<(), String>(());
+            }
+        }
+    };
+    match tokio::time::timeout(bind_timeout, poll).await {
+        Ok(r) => r.map_err(|e| format!("binding volumes: {e}")),
+        Err(_) => Err("binding volumes: context deadline exceeded".to_string()),
+    }
 }
 
+/// `PreBindPreFlight` (volume_binding.go:555-568).
 pub fn pre_bind_preflight(
-    _state: &VolumeBindingState,
-    _node_name: &str,
+    state: &VolumeBindingState,
+    node_name: &str,
 ) -> Result<PreBindPreFlight, String> {
-    Err("not implemented".into())
+    if state.all_bound {
+        // no need to bind volumes
+        return Ok(PreBindPreFlight::Skip);
+    }
+    if !state.pod_volumes_by_node.contains_key(node_name) {
+        return Err(format!("{ERR_NO_POD_VOLUME_FOR_NODE} {node_name:?}"));
+    }
+    Ok(PreBindPreFlight::Run)
 }
 
+/// `PreBind` (volume_binding.go:570-601). Upstream runs it on the assumed pod
+/// (`spec.nodeName` already set), which `checkBindings` reads.
 pub async fn pre_bind(
-    _env: &dyn BinderEnv,
-    _state: &mut VolumeBindingState,
-    _pod: &Pod,
-    _node_name: &str,
-    _bind_timeout: Duration,
-    _poll_interval: Duration,
+    env: &dyn BinderEnv,
+    state: &mut VolumeBindingState,
+    pod: &Pod,
+    node_name: &str,
+    bind_timeout: Duration,
+    poll_interval: Duration,
 ) -> Result<(), String> {
-    Err("not implemented".into())
+    if state.all_bound {
+        // no need to bind volumes
+        return Ok(());
+    }
+    let Some(vols) = state.pod_volumes_by_node.get_mut(node_name) else {
+        return Err(format!("{ERR_NO_POD_VOLUME_FOR_NODE} {node_name:?}"));
+    };
+    let mut assumed = pod.clone();
+    if let Some(spec) = assumed.spec.as_mut() {
+        spec.node_name = Some(node_name.to_string());
+    }
+    bind_pod_volumes(env, &assumed, vols, bind_timeout, poll_interval).await
 }
 
 /// `Unreserve` (volume_binding.go:603-615): idempotent, no-op when the node has
@@ -171,7 +409,13 @@ mod tests {
     }
 
     /// PV on `zone`, optionally pre-bound to the claim `claim` (uid `<claim>-uid`).
-    fn pv(name: &str, rv: &str, zone: &str, claim: Option<&str>, claim_uid: &str) -> PersistentVolume {
+    fn pv(
+        name: &str,
+        rv: &str,
+        zone: &str,
+        claim: Option<&str>,
+        claim_uid: &str,
+    ) -> PersistentVolume {
         let mut spec = json!({
             "capacity": {"storage": "1Gi"}, "accessModes": ["ReadWriteOnce"],
             "storageClassName": "wait", "hostPath": {"path": "/x"},
@@ -258,12 +502,19 @@ mod tests {
                 .insert(pv.metadata.name.clone(), pv.clone());
         }
         fn put_pvc(&self, pvc: &PersistentVolumeClaim) {
-            self.pvcs.lock().unwrap().insert(pvc_key_t(pvc), pvc.clone());
+            self.pvcs
+                .lock()
+                .unwrap()
+                .insert(pvc_key_t(pvc), pvc.clone());
         }
     }
 
     fn pvc_key_t(p: &PersistentVolumeClaim) -> String {
-        format!("{}/{}", p.metadata.namespace.as_deref().unwrap_or(""), p.metadata.name)
+        format!(
+            "{}/{}",
+            p.metadata.namespace.as_deref().unwrap_or(""),
+            p.metadata.name
+        )
     }
 
     #[async_trait::async_trait]
@@ -297,20 +548,14 @@ mod tests {
             Ok(new)
         }
         fn pv_api_obj(&self, name: &str) -> Result<PersistentVolume, CacheError> {
-            self.pvs
-                .lock()
-                .unwrap()
-                .get(name)
-                .cloned()
-                .ok_or_else(|| CacheError::NotFound(format!("v1.PersistentVolume {name:?} does not exist")))
+            self.pvs.lock().unwrap().get(name).cloned().ok_or_else(|| {
+                CacheError::NotFound(format!("v1.PersistentVolume {name:?} does not exist"))
+            })
         }
         fn pvc_api_obj(&self, key: &str) -> Result<PersistentVolumeClaim, CacheError> {
-            self.pvcs
-                .lock()
-                .unwrap()
-                .get(key)
-                .cloned()
-                .ok_or_else(|| CacheError::NotFound(format!("v1.PersistentVolumeClaim {key:?} does not exist")))
+            self.pvcs.lock().unwrap().get(key).cloned().ok_or_else(|| {
+                CacheError::NotFound(format!("v1.PersistentVolumeClaim {key:?} does not exist"))
+            })
         }
         fn revert_assumed_pvs(&self, bindings: &[BindingInfo]) {
             let mut r = self.reverted_pvs.lock().unwrap();
@@ -345,7 +590,13 @@ mod tests {
         pv("pv-node1a", "1", "a", None, "")
     }
     fn pv1a_bound() -> PersistentVolume {
-        pv("pv-node1a", "1", "a", Some("unbound-pvc"), "unbound-pvc-uid")
+        pv(
+            "pv-node1a",
+            "1",
+            "a",
+            Some("unbound-pvc"),
+            "unbound-pvc-uid",
+        )
     }
     fn provisioned() -> PersistentVolumeClaim {
         pvc("provisioned-pvc", "1", "", json!({}))
@@ -359,7 +610,7 @@ mod tests {
     #[tokio::test]
     async fn bind_api_update_nothing_to_bind() {
         let env = FakeEnv::new();
-        let r = bind_api_update(&*env, &pod("node1"), &mut [], &mut []).await;
+        let r = bind_api_update(&*env, &mut [], &mut []).await;
         assert!(r.is_ok(), "{r:?}");
     }
 
@@ -368,11 +619,12 @@ mod tests {
         let env = FakeEnv::new();
         env.put_pv(&pv1a());
         let mut b = [binding(&unbound(), &pv1a_bound())];
-        bind_api_update(&*env, &pod("node1"), &mut b, &mut [])
-            .await
-            .unwrap();
+        bind_api_update(&*env, &mut b, &mut []).await.unwrap();
         let api = env.pv_api_obj("pv-node1a").unwrap();
-        assert_eq!(api.spec.claim_ref.as_ref().unwrap().name.as_deref(), Some("unbound-pvc"));
+        assert_eq!(
+            api.spec.claim_ref.as_ref().unwrap().name.as_deref(),
+            Some("unbound-pvc")
+        );
         // "Save updated object from apiserver for later checking."
         assert_eq!(b[0].pv.metadata.resource_version.as_deref(), Some("2"));
         assert!(env.reverted_pvs.lock().unwrap().is_empty());
@@ -385,12 +637,24 @@ mod tests {
         let pv1b = pv("pv-node1b", "1", "a", None, "");
         env.put_pv(&pv1a());
         env.put_pv(&with_rv(&pv1b, "2"));
-        let pv1b_bound = pv("pv-node1b", "1", "a", Some("unbound-pvc2"), "unbound-pvc2-uid");
+        let pv1b_bound = pv(
+            "pv-node1b",
+            "1",
+            "a",
+            Some("unbound-pvc2"),
+            "unbound-pvc2-uid",
+        );
         let pvc2 = pvc("unbound-pvc2", "1", "", json!({}));
-        let mut b = [binding(&unbound(), &pv1a_bound()), binding(&pvc2, &pv1b_bound)];
-        let r = bind_api_update(&*env, &pod("node1"), &mut b, &mut []).await;
+        let mut b = [
+            binding(&unbound(), &pv1a_bound()),
+            binding(&pvc2, &pv1b_bound),
+        ];
+        let r = bind_api_update(&*env, &mut b, &mut []).await;
         assert!(r.is_err());
-        assert_eq!(*env.reverted_pvs.lock().unwrap(), vec!["pv-node1b".to_string()]);
+        assert_eq!(
+            *env.reverted_pvs.lock().unwrap(),
+            vec!["pv-node1b".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -398,12 +662,14 @@ mod tests {
         let env = FakeEnv::new();
         env.put_pvc(&provisioned());
         let mut c = [provisioned_ann()];
-        bind_api_update(&*env, &pod("node1"), &mut [], &mut c)
-            .await
-            .unwrap();
+        bind_api_update(&*env, &mut [], &mut c).await.unwrap();
         let api = env.pvc_api_obj("testns/provisioned-pvc").unwrap();
         assert_eq!(
-            api.metadata.annotations.unwrap().get("volume.kubernetes.io/selected-node").map(String::as_str),
+            api.metadata
+                .annotations
+                .unwrap()
+                .get("volume.kubernetes.io/selected-node")
+                .map(String::as_str),
             Some("node1")
         );
         assert_eq!(c[0].metadata.resource_version.as_deref(), Some("2"));
@@ -420,15 +686,22 @@ mod tests {
         let p2_ann = pvc("provisioned-pvc2", "1", "", selected("node1"));
         let mut b = [binding(&unbound(), &pv1a_bound())];
         let mut c = [provisioned_ann(), p2_ann];
-        let r = bind_api_update(&*env, &pod("node1"), &mut b, &mut c).await;
+        let r = bind_api_update(&*env, &mut b, &mut c).await;
         assert!(r.is_err());
         assert!(env.reverted_pvs.lock().unwrap().is_empty());
-        assert_eq!(*env.reverted_pvcs.lock().unwrap(), vec!["provisioned-pvc2".to_string()]);
+        assert_eq!(
+            *env.reverted_pvcs.lock().unwrap(),
+            vec!["provisioned-pvc2".to_string()]
+        );
     }
 
     // ---- TestCheckBindings ----
 
-    async fn check(env: &FakeEnv, b: &[BindingInfo], c: &[PersistentVolumeClaim]) -> Result<bool, String> {
+    async fn check(
+        env: &FakeEnv,
+        b: &[BindingInfo],
+        c: &[PersistentVolumeClaim],
+    ) -> Result<bool, String> {
         check_bindings(env, &pod("node1"), b, c).await
     }
 
@@ -482,7 +755,10 @@ mod tests {
         assert_eq!(e, "ClaimRef got reset for pv \"pv-node1a\"");
 
         // claimRef present but UID empty
-        env.put_pv(&with_rv(&pv("pv-node1a", "1", "a", Some("unbound-pvc"), ""), "2"));
+        env.put_pv(&with_rv(
+            &pv("pv-node1a", "1", "a", Some("unbound-pvc"), ""),
+            "2",
+        ));
         let e = check(&env, &b, &[]).await.unwrap_err();
         assert_eq!(e, "ClaimRef got reset for pv \"pv-node1a\"");
     }
@@ -508,7 +784,10 @@ mod tests {
         env.put_pvc(&pvc("unbound-pvc", "1", "pv-node1a", bound_ann()));
         let b = [binding(&unbound(), &pv1a_bound())];
         let e = check(&env, &b, &[]).await.unwrap_err();
-        assert!(e.starts_with("pv \"pv-node1a\" node affinity doesn't match node \"node1\": "), "{e}");
+        assert!(
+            e.starts_with("pv \"pv-node1a\" node affinity doesn't match node \"node1\": "),
+            "{e}"
+        );
     }
 
     #[tokio::test]
@@ -552,7 +831,10 @@ mod tests {
         let env = FakeEnv::new();
         env.put_pvc(&pvc("provisioned-pvc", "1", "", Value::Null));
         let e = check(&env, &[], &c).await.unwrap_err();
-        assert_eq!(e, "selectedNode annotation reset for PVC \"provisioned-pvc\"");
+        assert_eq!(
+            e,
+            "selectedNode annotation reset for PVC \"provisioned-pvc\""
+        );
 
         // selected-node dropped / wrong node => provisioner failed
         for ann in [json!({"x": "y"}), selected("wrong-node")] {
@@ -582,9 +864,15 @@ mod tests {
     async fn bind_pod_volumes_nothing_to_bind() {
         let env = FakeEnv::new();
         let mut v = vols(vec![], vec![]);
-        bind_pod_volumes(&*env, &pod("node1"), &mut v, Duration::from_millis(200), FAST)
-            .await
-            .unwrap();
+        bind_pod_volumes(
+            &*env,
+            &pod("node1"),
+            &mut v,
+            Duration::from_millis(200),
+            FAST,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -594,9 +882,15 @@ mod tests {
         env.put_pvc(&pvc("unbound-pvc", "1", "pv-node1a", bound_ann()));
         let mut v = vols(vec![binding(&unbound(), &pv1a_bound())], vec![]);
         // Update bumps the PV to RV 2 and saves it; the check then sees it equal.
-        bind_pod_volumes(&*env, &pod("node1"), &mut v, Duration::from_millis(500), FAST)
-            .await
-            .unwrap();
+        bind_pod_volumes(
+            &*env,
+            &pod("node1"),
+            &mut v,
+            Duration::from_millis(500),
+            FAST,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -621,9 +915,15 @@ mod tests {
         env.put_pv(&pv1a());
         env.put_pvc(&unbound());
         let mut v = vols(vec![binding(&unbound(), &pv1a_bound())], vec![]);
-        let e = bind_pod_volumes(&*env, &pod("node1"), &mut v, Duration::from_millis(150), FAST)
-            .await
-            .unwrap_err();
+        let e = bind_pod_volumes(
+            &*env,
+            &pod("node1"),
+            &mut v,
+            Duration::from_millis(150),
+            FAST,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(e, "binding volumes: context deadline exceeded");
     }
 
@@ -654,7 +954,10 @@ mod tests {
         let e = bind_pod_volumes(&*env, &pod("node1"), &mut v, Duration::from_secs(5), FAST)
             .await
             .unwrap_err();
-        assert!(e.starts_with("binding volumes: pod does not exist any more"), "{e}");
+        assert!(
+            e.starts_with("binding volumes: pod does not exist any more"),
+            "{e}"
+        );
     }
 
     // ---- PreBindPreFlight / PreBind / Unreserve (volume_binding.go) ----
@@ -674,7 +977,8 @@ mod tests {
         let e = pre_bind_preflight(&s, "node1").unwrap_err();
         assert_eq!(e, format!("{ERR_NO_POD_VOLUME_FOR_NODE} \"node1\""));
         let mut s = s;
-        s.pod_volumes_by_node.insert("node1".into(), PodVolumes::default());
+        s.pod_volumes_by_node
+            .insert("node1".into(), PodVolumes::default());
         assert_eq!(pre_bind_preflight(&s, "node1"), Ok(PreBindPreFlight::Run));
     }
 
@@ -685,15 +989,29 @@ mod tests {
             all_bound: true,
             ..Default::default()
         };
-        pre_bind(&*env, &mut s, &pod(""), "node1", Duration::from_millis(50), FAST)
-            .await
-            .unwrap();
+        pre_bind(
+            &*env,
+            &mut s,
+            &pod(""),
+            "node1",
+            Duration::from_millis(50),
+            FAST,
+        )
+        .await
+        .unwrap();
         assert_eq!(*env.pv_updates.lock().unwrap(), 0);
 
         s.all_bound = false;
-        let e = pre_bind(&*env, &mut s, &pod(""), "node1", Duration::from_millis(50), FAST)
-            .await
-            .unwrap_err();
+        let e = pre_bind(
+            &*env,
+            &mut s,
+            &pod(""),
+            "node1",
+            Duration::from_millis(50),
+            FAST,
+        )
+        .await
+        .unwrap_err();
         assert!(e.starts_with(ERR_NO_POD_VOLUME_FOR_NODE), "{e}");
     }
 
@@ -709,9 +1027,16 @@ mod tests {
             "node1".into(),
             vols(vec![binding(&unbound(), &pv1a_bound())], vec![]),
         );
-        pre_bind(&*env, &mut s, &pod(""), "node1", Duration::from_millis(500), FAST)
-            .await
-            .unwrap();
+        pre_bind(
+            &*env,
+            &mut s,
+            &pod(""),
+            "node1",
+            Duration::from_millis(500),
+            FAST,
+        )
+        .await
+        .unwrap();
         let saved = &s.pod_volumes_by_node["node1"].static_bindings[0].pv;
         assert_eq!(saved.metadata.resource_version.as_deref(), Some("2"));
     }
@@ -724,10 +1049,19 @@ mod tests {
         assert!(env.reverted_pvs.lock().unwrap().is_empty());
         s.pod_volumes_by_node.insert(
             "node1".into(),
-            vols(vec![binding(&unbound(), &pv1a_bound())], vec![provisioned_ann()]),
+            vols(
+                vec![binding(&unbound(), &pv1a_bound())],
+                vec![provisioned_ann()],
+            ),
         );
         unreserve(&*env, &s, "node1");
-        assert_eq!(*env.reverted_pvs.lock().unwrap(), vec!["pv-node1a".to_string()]);
-        assert_eq!(*env.reverted_pvcs.lock().unwrap(), vec!["provisioned-pvc".to_string()]);
+        assert_eq!(
+            *env.reverted_pvs.lock().unwrap(),
+            vec!["pv-node1a".to_string()]
+        );
+        assert_eq!(
+            *env.reverted_pvcs.lock().unwrap(),
+            vec!["provisioned-pvc".to_string()]
+        );
     }
 }
