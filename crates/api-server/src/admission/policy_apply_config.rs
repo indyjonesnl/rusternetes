@@ -104,10 +104,51 @@ impl Patcher for ApplyConfigPatcher {
 /// `failed to convert patch object to typed object: .spec.replicasx: field not
 /// declared in schema` check. This tree has no per-type schema; like
 /// `fieldmanager::fieldset` the shapes come from the field-name table in
-/// `field_kind`, and unknown fields are not rejected (tracked in #3111).
+/// `field_kind`; undeclared fields are rejected only for built-in kinds with a
+/// Rust type (`undeclared_field`; rest tracked in #3129).
 pub fn apply_structured_merge_diff(original: &Value, patch: &Value) -> Result<Value, String> {
+    let merged = merge_values(original, patch, "");
+    // `typeConverter.ObjectToTyped(patch)` (smd.go:128-131) precedes
+    // `validatePatch`.
+    if let Some(path) = undeclared_field(original, &merged, patch) {
+        return Err(format!(
+            "failed to convert patch object to typed object: .{path}: field not declared in schema"
+        ));
+    }
     validate_patch(patch).map_err(|e| format!("invalid ApplyConfiguration: {e}"))?;
-    Ok(merge_values(original, patch, ""))
+    Ok(merged)
+}
+
+/// First field the patch introduces that the object's type does not declare:
+/// typed conversion's `field not declared in schema` (structured-merge-diff
+/// `typed/helpers.go` `ValidationError`). Only built-in kinds with a Rust type
+/// are checked; the type's declared fields stand in for the OpenAPI schema
+/// (rest tracked in #3129). The patch alone cannot be deserialized (required
+/// fields), so the merged object is checked and fields already undeclared in
+/// the original are ignored.
+fn undeclared_field(original: &Value, merged: &Value, patch: &Value) -> Option<String> {
+    let unknown = |v: &Value| -> Option<Vec<String>> {
+        use crate::handlers::validation::find_unknown_fields_via_schema as f;
+        use rusternetes_common::resources as r;
+        let kind = patch.get("kind")?.as_str()?;
+        let api = patch.get("apiVersion")?.as_str()?;
+        Some(match (api, kind) {
+            ("apps/v1", "Deployment") => f::<r::Deployment>(v),
+            ("apps/v1", "ReplicaSet") => f::<r::ReplicaSet>(v),
+            ("apps/v1", "StatefulSet") => f::<r::StatefulSet>(v),
+            ("apps/v1", "DaemonSet") => f::<r::DaemonSet>(v),
+            ("batch/v1", "Job") => f::<r::Job>(v),
+            ("batch/v1", "CronJob") => f::<r::CronJob>(v),
+            ("v1", "Pod") => f::<r::Pod>(v),
+            ("v1", "Service") => f::<r::Service>(v),
+            ("v1", "ConfigMap") => f::<r::ConfigMap>(v),
+            _ => return None,
+        })
+    };
+    let before = unknown(original)?;
+    unknown(merged)?
+        .into_iter()
+        .find(|p| !p.is_empty() && !before.contains(p))
 }
 
 /// `validatePatch` (smd.go:173-179).
