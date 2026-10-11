@@ -552,3 +552,119 @@ fn status_issued_lifetime_limits() {
         "leaf certificate lifetime must be >= 1 hour",
     );
 }
+
+// -------------------------------------- Go-parity: PSS salt / mail.ParseAddress
+
+const RSA3072_PUB_GO: &str = "MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEA0j1CcC7KwDnOhN0vnHLaWgQJQOCJnwNnqWve9db3fgrg7vTil7RfF0kuAxIRUl0DsTgbHWsrRh92YO9eLoIboeomfK9SHgsDKIhCrizapAzKeBizcSPT0rgnUyIfKlomJ6K/wX8wp76rYOgJ7MpOcvHFb+W9y6d0fpVuMkEnSfUdWPynH2AND3btUeyr3P0Welwl8jQAJrdbSrjsU6+Af38Kr5zjEHz0CcbmES7Ro0dddSKzJHyl3/hKQQA0S4e4jFiNAWxZsHUUqwKZ9d5skhnwTmCs8ph01HSz7YY1TfY2bRquQV2HAudvWHNRRP71YQy66ORnj3dtR/vj3cpW3Rqn20PyruEv1Upqvwc5MMCa/SXpjwJtRSPz5K70jmStwFv4EqXAykOmssAotbH2R3gqslCPOfPd2oBe4bdrBLo0n7ad6oSDrcJ2H7ahvh20+1Y6QFyOdf02jnvKC7kWTZq23WiR4NjBFfXJ0XigtLWCgATerGVSNS9keeFQCgc3AgMBAAE=";
+/// Generated with Go `rsa.SignPSS(.., &PSSOptions{SaltLength: n})` over
+/// sha256("pod-uid-1"); `rsa.VerifyPSS(.., nil)` auto-detects each of them.
+const RSA3072_GO_SIG_SALT_0: &str = "CrIiaT20FqQRxz7OsALSmL9ZepyB7KIWb99j7OBXJ/ZblBr4JFJ71Fm9w159RYcOCfG3gZAJz2Qz5n/1CIYaor8uEYn+H/+iaeYlFpzu5V1UWCtFPGx6a6wCk5684EONpRQcQUmwPJ+B8P7VPkVTf3SyWNcF8R64tGstZ8RSXd4ue/Ph7xB/pWdZNzXFDLiYsQ6sL+54AMAlREn9J+DV5ceuDM/oHFQ9Uu6Ql0aYOohi7fwY981LXVJC64M9MuCJ+6lK8YDbQP7DDKMkvV6xTwF76I4qph2ht1CgnZdHPOq+MxgNe0nEnDI14X2cm0MgnUV4UBmivMcjSVdmbgWR0zbgVFdXRN57nt3AB7RL+68sw+kifkpVOMNSUGJBpE54myRdgqIARpFKN8s1Q1wZIMTDeK1N29npTjGfcsZ79YbCUjN+T4JdjQQwQNb0ToyPK8eZvN2VevIciUs5FWjY3Cg+79tDetzdYQCr0pNq8RKehGUNIrp1LSrU6sVx2hYH";
+const RSA3072_GO_SIG_SALT_20: &str = "N5iwSUjO0avaFo63yZtA60ZD5r+lJFRN+q4F9l2KETa9glzK9A7Ki5uC5OlELXevQZBJhJOc2STw/xlhrpioFJk8JCye8fl3aTXqwY/+ahkna98W5kAVDoi3P1yrHEVOXheND+wDdMgS1I/HPkRVV+HWnaJQf0gCGTQQuREbWPoFQhSAQVAiZ5IaHgdpiqA3bM8a1B+qwBhhrZOFA/M6eEtT7jcION8sJovEzpdJBhRLd6N0bkxFTAkPFL6jTLx9y/EG9iqKEyofGS9BW7WZUm4jeVsv9Nvg92p+BK0db8VJjzrx6xVmElOvy6NoyrKKC1yVGJSMTcN+clnfCEMaLqLnzY6HfcbVzI0iazrzY6Zp19OVCBa42pSPZp6eNktjdIH8/HYoze0h9MYKw9hd6Hj23VmEIk53nd0G0A3lh+LhSq3C48L2Gi5N6vBft53Hm1QjbKihV6tIQkMxB63cGsdf8IN0G11idNIyUsI4dke6V/2Z8CBHqgCkQA6oNlXv";
+const RSA3072_GO_SIG_SALT_48: &str = "Z3ClY3oATI7ShUc1gg+49Hszh0CtxCzXGpfATC2weV1fUQMZiF8IAUOJ+9QJwKi2upzsb2jSPD7zsHi2CDcgsSI13guhlJhsLRenvPIOM3h+8poRmF8jooUw+HhTkY4GeNax0WWM9W6kYyodbYEWK5JroGwcNS5GFaw26rMjplySY0rEHyNoWA8BgNGwTU7M4MLGrIp4bBZrCLIUVuZFm/BGnDgVJR1HB8+Zp66hgDbpIYuyhRwS3n9gLCvVg+/v66d40n/iwmlu/ObBoQ/xP7md7QmHD7TKmt4X9rK6KA4iprWeAr+vsF8OvaokI8oxr0Oxx5ThdNOJeMpmG1FkPLLUIojLt7zK/csurdpaBUn6gdQYMHQz5CINAXXSuQKzpKANuw7fsk/xs7F2BqO1lZzEBGedCKmhWBDrjMZDnHw0uhycMLAoBztH0tRoVTBc211BbTIQZffBxJU8wI4/lhs9uyQ17dvWNQDvv+fgm93FVTaSfM8yMXQ93tH08RAJ";
+
+/// `rsa.VerifyPSS(.., nil)` auto-detects the salt length
+/// (crypto/internal/fips140/rsa/pkcs1v22.go: `pssSaltLengthAutodetect`).
+#[test]
+fn create_rsa_pss_any_salt_length_is_accepted() {
+    for (name, sig) in [
+        ("salt0", RSA3072_GO_SIG_SALT_0),
+        ("salt20", RSA3072_GO_SIG_SALT_20),
+        ("salt48", RSA3072_GO_SIG_SALT_48),
+    ] {
+        let errs = validate_pod_certificate_request_create(&pcr(b64d(RSA3072_PUB_GO), b64d(sig)));
+        assert!(errs.is_empty(), "{name}: {:?}", msgs(&errs));
+    }
+}
+
+#[test]
+fn create_rsa_pss_corrupted_signature_is_rejected() {
+    for sig in [RSA3072_GO_SIG_SALT_0, RSA3072_GO_SIG_SALT_20] {
+        let mut sig = b64d(sig);
+        sig[100] ^= 1;
+        let errs = validate_pod_certificate_request_create(&pcr(b64d(RSA3072_PUB_GO), sig));
+        assert_has(&errs, "could not verify proof-of-possession signature");
+    }
+    // Wrong length is ErrVerification before any maths.
+    let mut sig = b64d(RSA3072_GO_SIG_SALT_20);
+    sig.pop();
+    let errs = validate_pod_certificate_request_create(&pcr(b64d(RSA3072_PUB_GO), sig));
+    assert_has(&errs, "could not verify proof-of-possession signature");
+}
+
+fn status_errs_with_email(email: &str) -> Vec<String> {
+    let old = valid();
+    let mut new = issued(&spki_of(&old), ymdh(1, 0), ymdh(2, 0));
+    let email = email.to_string();
+    new.status.certificate_chain = issue(&spki_of(&old), ymdh(1, 0), ymdh(2, 0), |p| {
+        p.subject_alt_names
+            .push(rcgen::SanType::Rfc822Name(email.try_into().unwrap()));
+    });
+    msgs(&validate_pod_certificate_request_status_update(
+        &new,
+        &old,
+        now(),
+    ))
+}
+
+/// Oracle: output of Go 1.25 `mail.ParseAddress(s)` (err == nil) for each
+/// input, run against /usr/local/go/src/net/mail/message.go.
+#[test]
+fn status_issued_email_matches_go_mail_parse_address() {
+    const MSG: &str = "leaf certificate should not contain invalid EmailAddress";
+    let table: &[(&str, bool)] = &[
+        ("joe@example.com", true),
+        ("Joe Q <joe@example.com>", true),
+        ("<joe@example.com>", true),
+        ("\"joe smith\"@example.com", true),
+        ("joe@example.com (Joe)", true),
+        ("(c) joe@example.com", false),
+        ("joe@[1.2.3.4]", true),
+        ("joe@[::1]", true),
+        ("j.o.e@example.com", true),
+        ("=?utf-8?q?Joe?= <joe@example.com>", true),
+        ("joe@example", true),
+        ("email@@address", false),
+        ("joe", false),
+        ("joe@", false),
+        ("@example.com", false),
+        ("joe@[bogus]", false),
+        ("joe@[1.2.3.4", false),
+        ("a..b@example.com", false),
+        (".a@example.com", false),
+        ("a.@example.com", false),
+        ("Joe Q joe@example.com", false),
+        ("joe@example.com extra", false),
+        ("\"\"@example.com", false),
+        ("joe@example.com (unclosed", false),
+        ("<joe@example.com", false),
+        ("a@b, c@d", false),
+        ("=?x-unknown?q?Joe?= (=?x-unknown?q?x?=) a@b", false),
+        ("=?x-unknown?q?Joe?= <a@b>", false),
+        ("Joe =?x-unknown?q?Joe?= <a@b>", true),
+        ("joe@example.com (=?x-unknown?q?x?=)", false),
+        ("joe@example.com (=?utf-8?q?x?=)", true),
+        ("g: a@b;", true),
+        ("g:;", false),
+        ("g: a@b, c@d;", false),
+        ("a@b (c (nested) d)", true),
+        ("joe@[01.2.3.4]", false),
+        ("joe@[1.2.3.4] (x", false),
+        ("\"a\\\"b\"@x.y", true),
+        ("Joe <joe@example.com> x", false),
+        ("joe @ example.com", false),
+        (" joe@example.com ", true),
+        ("=?utf-8?b?Sm9l?= <a@b>", true),
+        ("=?utf-8?b?Sm9?= <a@b>", true),
+        ("joe@exa mple.com", false),
+        ("a@b.", false),
+        ("a@.b", false),
+        ("a@b..c", false),
+        ("<>", false),
+        ("<a@b>c@d", false),
+    ];
+    for (addr, ok) in table {
+        let m = status_errs_with_email(addr);
+        let bad = m.iter().any(|e| e.contains(MSG));
+        assert_eq!(!bad, *ok, "{addr:?}: Go accepts={ok}, errors: {m:?}");
+    }
+}
