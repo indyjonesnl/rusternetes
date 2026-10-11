@@ -1214,6 +1214,29 @@ mod tests {
         held.await.unwrap().unwrap();
     }
 
+    // MonitorRequest (endpoints/metrics/metrics.go:603): every served request
+    // increments `apiserver_request_total` with its real response code, not
+    // just the 429s.
+    #[tokio::test]
+    async fn served_request_counts_apiserver_request_total_with_status_code() {
+        use crate::flow_control::metric_test_util::sample;
+        let l = [
+            ("verb", "GET"),
+            ("resource", "namespaces"),
+            ("scope", "resource"),
+            ("component", "apiserver"),
+            ("code", "200"),
+        ];
+        let before = sample("apiserver_request_total", &l);
+        let app = app(10, Duration::from_millis(50), none_hook(), bob()).await;
+        let resp = app
+            .oneshot(get_req("/api/v1/namespaces/default"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(sample("apiserver_request_total", &l) >= before + 1.0);
+    }
+
     // httplog.AddKeyValue(ctx, "apf_pl", truncateLogField(pl.Name)) (:119).
     #[test]
     fn truncate_log_field_caps_at_64() {
