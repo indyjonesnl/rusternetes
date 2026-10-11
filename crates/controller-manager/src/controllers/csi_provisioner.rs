@@ -33,7 +33,11 @@
 //! `markForSlowRetry`, csi-lib-utils `slowset`). CSI migration of in-tree PVs
 //! on delete (`IsPVMigratable` / `TranslateInTreePVToCSI`, #2993) uses the
 //! shared `CsiTranslator`; the in-tree StorageClass translation behind
-//! `--supports-migration-from-in-tree-plugin` is NOT ported.
+//! `--supports-migration-from-in-tree-plugin` (#3142) is ported: the
+//! in-tree StorageClass translation in `prepareProvision` and
+//! `getSecretsFromSC`, and `AdditionalProvisionerNames`. NOT ported: the
+//! `markAsMigrated` gRPC additional-info (:2092) and `TranslateCSIPVToInTree`
+//! (:1024).
 
 use super::csi_topology::{
     generate_volume_node_affinity, volume_is_accessible, TopologyError, TopologyInputs,
@@ -728,6 +732,12 @@ pub struct CsiProvisioner<S: Storage> {
     /// `pvcNodeStore` (cache.go `InMemoryStore`), keyed by PVC UID.
     pvc_node_store: TopologyStore,
     capabilities: tokio::sync::OnceCell<DriverCapabilities>,
+    /// `supportsMigrationFromInTreePluginName` (controller.go:289): the
+    /// in-tree plugin this driver replaces, or empty. Derived from the driver
+    /// name (csi-provisioner.go:248-256) rather than from a flag.
+    supports_migration_from_in_tree_plugin: String,
+    /// `translator` (controller.go:292).
+    translator: CsiTranslator,
     /// `nodeDeployment`; `None` = central deployment.
     node_deployment: Option<NodeDeployment>,
 }
@@ -746,10 +756,23 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             rand::random::<u32>() % 10000,
             driver_name
         );
+        // csi-provisioner.go:248-256: `translator.IsMigratedCSIDriverByName` ->
+        // `GetInTreeNameFromCSIName`.
+        let translator = CsiTranslator::new();
+        let supports_migration_from_in_tree_plugin =
+            if translator.is_migrated_csi_driver_by_name(&driver_name) {
+                translator
+                    .get_in_tree_name_from_csi_name(&driver_name)
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
         Self {
             recorder: EventRecorder::new(Arc::clone(&storage)),
             storage,
             driver_name,
+            supports_migration_from_in_tree_plugin,
+            translator,
             client,
             identity,
             default_fs_type: String::new(),
@@ -769,6 +792,35 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             capabilities: tokio::sync::OnceCell::new(),
             node_deployment: None,
         }
+    }
+
+    /// `if p.supportsMigrationFromInTreePluginName != ""` ... `sc.Provisioner ==
+    /// p.supportsMigrationFromInTreePluginName` ... `TranslateInTreeStorageClassToCSI`
+    /// (controller.go:591-606 in `prepareProvision`, :1489-1495 in
+    /// `getSecretsFromSC`). Returns the class to use and whether it was
+    /// translated (`migratedVolume` for `prepareProvision`).
+    fn translate_class_if_migrating<'a>(
+        &self,
+        sc: &'a StorageClass,
+        translated: &'a mut Option<StorageClass>,
+    ) -> std::result::Result<&'a StorageClass, String> {
+        if !self.supports_migration_from_in_tree_plugin.is_empty()
+            && sc.provisioner == self.supports_migration_from_in_tree_plugin
+        {
+            debug!(
+                "translating storage class for in-tree plugin {} to CSI",
+                sc.provisioner
+            );
+            let t = self
+                .translator
+                .translate_in_tree_storage_class_to_csi(
+                    &self.supports_migration_from_in_tree_plugin,
+                    sc,
+                )
+                .map_err(|e| format!("failed to translate storage class: {e}"))?;
+            return Ok(translated.insert(t));
+        }
+        Ok(sc)
     }
 
     /// `--node-deployment`: run as the per-node instance of a distributed
@@ -1040,7 +1092,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             .get_storage_class(&class_name)
             .await
             .map_err(|e| (ProvisioningState::Finished, Failure::Error(e)))?;
-        if class.provisioner != self.driver_name {
+        if !self.known_provisioner(&class.provisioner) {
             error!(
                 "Unknown provisioner {:?} requested in claim's StorageClass",
                 class.provisioner
@@ -1171,9 +1223,13 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
 
     // ---- delete path -----------------------------------------------------------
 
-    /// `knownProvisioner` (lib controller.go:1233-1238); no additional names.
+    /// `knownProvisioner` (lib controller.go:1233-1238), with
+    /// `AdditionalProvisionerNames([supportsMigrationFromInTreePluginName])`
+    /// (csi-provisioner.go:412-414).
     fn known_provisioner(&self, name: &str) -> bool {
         name == self.driver_name
+            || (!self.supports_migration_from_in_tree_plugin.is_empty()
+                && name == self.supports_migration_from_in_tree_plugin)
     }
 
     /// `isProvisionerForVolume` (lib controller.go:1175-1201).
@@ -1378,12 +1434,11 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
         // enabled in-tree ... causing in-tree PV controller to yield deletion
         // of PVs with in-tree source to external provisioner". The PV is
         // translated with the shared `CsiTranslator`
-        // (`TranslateInTreePVToCSI`). The in-tree StorageClass translation in
-        // `getSecretsFromSC` only applies with
-        // `--supports-migration-from-in-tree-plugin`, which is not ported.
+        // (`TranslateInTreePVToCSI`).
         let translator = CsiTranslator::new();
         let translated;
-        let volume = if translator.is_pv_migratable(volume) {
+        let migrated_volume = translator.is_pv_migratable(volume);
+        let volume = if migrated_volume {
             translated = translator
                 .translate_in_tree_pv_to_csi(volume)
                 .map_err(|e| anyhow!(e))?;
@@ -1417,7 +1472,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
         check_driver_capabilities(caps, &RequiredCapabilities::default())
             .map_err(anyhow::Error::new)?;
 
-        let secrets = self.secrets_for_deletion(volume).await?;
+        let secrets = self.secrets_for_deletion(volume, migrated_volume).await?;
         self.can_delete_volume(volume, caps).await?;
 
         // One DeleteVolume under the client's `--timeout`.
@@ -1432,6 +1487,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
     async fn secrets_for_deletion(
         &self,
         volume: &PersistentVolume,
+        migrated_volume: bool,
     ) -> Result<HashMap<String, String>> {
         let name = annotation(&volume.metadata, ANN_DELETION_SECRET_NAME);
         let namespace = annotation(&volume.metadata, ANN_DELETION_SECRET_NAMESPACE);
@@ -1464,6 +1520,16 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
         }
         match self.get_storage_class(&class_name).await {
             Ok(class) => {
+                // controller.go:1489-1495: "if migratedVolume && storageClass.
+                // Provisioner == supportsMigrationFromInTreePluginName" the
+                // class is translated, and a failure is returned as is.
+                let mut translated = None;
+                let class = if migrated_volume {
+                    self.translate_class_if_migrating(&class, &mut translated)
+                        .map_err(|e| anyhow!(e))?
+                } else {
+                    &class
+                };
                 if volume.spec.claim_ref.is_none() {
                     warn!(
                         "claim reference does not exists in volume: {}, proceeding to delete without secrets.",
@@ -1689,6 +1755,13 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
                 is_granted(claim, &grants).map_err(fin)?;
             }
         }
+        // controller.go:590-606: translate an in-tree class when this driver
+        // replaces its plugin. (`markAsMigrated`'s gRPC additional-info and
+        // `TranslateCSIPVToInTree` on the result are not ported.)
+        let mut translated_sc = None;
+        let sc = self
+            .translate_class_if_migrating(sc, &mut translated_sc)
+            .map_err(fin)?;
         if let Some(ds) = &data_source {
             // PVC.Spec.DataSource.Name is the name of the VolumeSnapshot API object
             if ds.name.is_empty() {

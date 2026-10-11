@@ -2101,3 +2101,127 @@ async fn a_cross_namespace_ref_without_content_source_is_cleaned_up() {
     );
     assert_eq!(rec.lock().unwrap().delete_volume.len(), 1);
 }
+
+// ---- --supports-migration-from-in-tree-plugin (#3142) ---------------------------
+
+const GCE_DRIVER: &str = "pd.csi.storage.gke.io";
+const GCE_IN_TREE: &str = "kubernetes.io/gce-pd";
+
+/// A provisioner for the GCE PD CSI driver, whose name makes
+/// `IsMigratedCSIDriverByName` true (csi-provisioner.go:250-255), over a
+/// class naming the in-tree plugin.
+async fn migrating_env(
+    sc_params: &[(&str, &str)],
+) -> (
+    Arc<MemoryStorage>,
+    CsiProvisioner<MemoryStorage>,
+    Arc<Mutex<Recorded>>,
+    tempfile::TempDir,
+) {
+    let mut sc = with_params(storage_class(None), sc_params);
+    sc.parameters
+        .as_mut()
+        .unwrap()
+        .remove("csi.storage.k8s.io/fstype");
+    sc.provisioner = GCE_IN_TREE.into();
+    let storage = Arc::new(MemoryStorage::new());
+    storage
+        .create(&build_key("storageclasses", None, "fast"), &sc)
+        .await
+        .unwrap();
+    let (dir, client, rec) = start(Fake::new());
+    let p = CsiProvisioner::new(storage.clone(), GCE_DRIVER, client);
+    (storage, p, rec, dir)
+}
+
+/// `prepareProvision` (controller.go:590-605): a class naming the in-tree
+/// plugin is translated, so the in-tree `fstype` parameter becomes the CSI
+/// fsType; the PV records the class provisioner (lib controller.go:1475
+/// `knownProvisioner` accepts the in-tree name).
+#[tokio::test]
+async fn an_in_tree_class_is_translated_when_provisioning() {
+    let (storage, p, rec, _d) = migrating_env(&[("fstype", "ext3")]).await;
+    p.sync_claim(&claim(&[(ANN, GCE_DRIVER)])).await.unwrap();
+    let reqs = rec.lock().unwrap().create_volume.clone();
+    assert_eq!(reqs.len(), 1, "CreateVolume issued");
+    assert_eq!(
+        reqs[0].parameters.get("type").map(String::as_str),
+        Some("ssd")
+    );
+    assert!(!reqs[0].parameters.contains_key("fstype"));
+    match reqs[0].volume_capabilities[0].access_type.as_ref().unwrap() {
+        volume_capability::AccessType::Mount(m) => assert_eq!(m.fs_type, "ext3"),
+        other => panic!("expected mount, got {other:?}"),
+    }
+    let pv = pv(&storage).await.expect("PV created");
+    assert_eq!(
+        pv.metadata
+            .annotations
+            .as_ref()
+            .unwrap()
+            .get("pv.kubernetes.io/provisioned-by")
+            .map(String::as_str),
+        Some(GCE_IN_TREE)
+    );
+}
+
+/// A failing translation fails the provisioning (controller.go:601-603
+/// "failed to translate storage class").
+#[tokio::test]
+async fn an_untranslatable_in_tree_class_fails_provisioning() {
+    let (storage, p, rec, _d) = migrating_env(&[("zone", "us-central1-a")]).await;
+    let mut sc: StorageClass = storage
+        .get(&build_key("storageclasses", None, "fast"))
+        .await
+        .unwrap();
+    sc.allowed_topologies = Some(vec![TopologySelectorTerm {
+        match_label_expressions: Some(vec![TopologySelectorLabelRequirement {
+            key: "topology.gke.io/zone".into(),
+            values: vec!["a".into()],
+        }]),
+    }]);
+    storage
+        .update(&build_key("storageclasses", None, "fast"), &sc)
+        .await
+        .unwrap();
+    let _ = p.sync_claim(&claim(&[(ANN, GCE_DRIVER)])).await;
+    assert!(rec.lock().unwrap().create_volume.is_empty());
+}
+
+/// `getSecretsFromSC` (controller.go:1489-1495): for a migrated PV the class
+/// is translated, and a translation error aborts the delete.
+#[tokio::test]
+async fn deleting_a_migrated_pv_translates_its_class_and_propagates_errors() {
+    let (storage, p, rec, _d) = migrating_env(&[("zone", "us-central1-a")]).await;
+    let mut sc: StorageClass = storage
+        .get(&build_key("storageclasses", None, "fast"))
+        .await
+        .unwrap();
+    sc.allowed_topologies = Some(vec![TopologySelectorTerm {
+        match_label_expressions: Some(vec![TopologySelectorLabelRequirement {
+            key: "topology.gke.io/zone".into(),
+            values: vec!["a".into()],
+        }]),
+    }]);
+    storage
+        .update(&build_key("storageclasses", None, "fast"), &sc)
+        .await
+        .unwrap();
+    let mut pv = csi_pv(
+        "pv1",
+        PersistentVolumePhase::Released,
+        PersistentVolumeReclaimPolicy::Delete,
+    );
+    pv.spec.csi = None;
+    pv.spec.gce_persistent_disk = Some(GCEPersistentDiskVolumeSource {
+        pd_name: "disk-1".into(),
+        ..Default::default()
+    });
+    pv.spec.storage_class_name = Some("fast".into());
+    let ann = pv.metadata.annotations.as_mut().unwrap();
+    ann.insert("pv.kubernetes.io/provisioned-by".into(), GCE_IN_TREE.into());
+    ann.insert("pv.kubernetes.io/migrated-to".into(), GCE_DRIVER.into());
+    put_pv(&storage, &pv).await;
+    assert!(p.sync_volume(&pv).await.is_err());
+    assert!(deleted(&rec).is_empty());
+}
