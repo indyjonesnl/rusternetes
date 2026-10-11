@@ -259,6 +259,10 @@ pub struct Attributes {
     pub resource: String,
     pub subresource: String,
     pub name: String,
+    /// `RequestInfo.FieldSelector`: the unparsed `fieldSelector` query value.
+    pub field_selector: String,
+    /// `RequestInfo.LabelSelector`: the unparsed `labelSelector` query value.
+    pub label_selector: String,
 }
 
 /// `ruleMatches` (checker.go:95-133).
@@ -390,12 +394,14 @@ pub fn request_info(method: &Method, path: &str, query: Option<&str>) -> Attribu
 
     // specialVerbs = {"proxy", "watch"}; "proxy" allows no subresources.
     let mut no_subresources = false;
+    let mut verb_via_path_prefix = false;
     if parts[0] == "proxy" || parts[0] == "watch" {
         if parts.len() < 2 {
             a.is_resource_request = false;
             return a;
         }
         a.verb = parts[0].to_string();
+        verb_via_path_prefix = true;
         no_subresources = parts[0] == "proxy";
         parts = &parts[1..];
     } else {
@@ -443,6 +449,21 @@ pub fn request_info(method: &Method, path: &str, query: Option<&str>) -> Attribu
     }
     if a.name.is_empty() && a.verb == "delete" {
         a.verb = "deletecollection".to_string();
+    }
+    // requestinfo.go:261-275 (`AuthorizeWithSelectors`, GA and locked on since
+    // 1.34). Not supported on the deprecated verb-via-path mechanism; read
+    // straight off the query so an undecodable sibling parameter cannot lose
+    // them. `req.URL.Query()[k][0]` is the first occurrence.
+    if !verb_via_path_prefix && matches!(a.verb.as_str(), "list" | "watch" | "deletecollection") {
+        let first = |key: &str| {
+            query.and_then(|q| {
+                url::form_urlencoded::parse(q.as_bytes())
+                    .find(|(k, _)| k == key)
+                    .map(|(_, v)| v.into_owned())
+            })
+        };
+        a.field_selector = first("fieldSelector").unwrap_or_default();
+        a.label_selector = first("labelSelector").unwrap_or_default();
     }
     a
 }
@@ -889,6 +910,105 @@ rules:
         let a = request_info(&Method::GET, "/healthz", None);
         assert!(!a.is_resource_request);
         assert_eq!(a.verb, "get");
+    }
+
+    // requestinfo_test.go TestSelectorParsing (name, verb, fieldSelector, labelSelector).
+    #[test]
+    fn request_info_selector_parsing_matches_upstream() {
+        let cases: &[(&str, &str, &str, &str, &str, &str)] = &[
+            ("/apis/g/v/resource", "", "", "list", "", ""),
+            (
+                "/apis/g/v/resource",
+                "fieldSelector=metadata.name=name1",
+                "name1",
+                "list",
+                "metadata.name=name1",
+                "",
+            ),
+            (
+                "/apis/g/v/resource",
+                "watch=true&fieldSelector=metadata.name=name1",
+                "name1",
+                "watch",
+                "metadata.name=name1",
+                "",
+            ),
+            (
+                "/apis/g/v/resource",
+                "fieldSelector=foo=bar&labelSelector=baz=qux",
+                "",
+                "list",
+                "foo=bar",
+                "baz=qux",
+            ),
+            (
+                "/apis/g/v/resource",
+                "fieldSelector=metadata.name=name1,foo",
+                "",
+                "list",
+                "metadata.name=name1,foo",
+                "",
+            ),
+            (
+                "/apis/g/v/resource",
+                "fieldSelector=metadata.name=name1,foo&watch=false",
+                "",
+                "list",
+                "metadata.name=name1,foo",
+                "",
+            ),
+            (
+                "/apis/g/v/resource",
+                "fieldSelector=metadata.name=foo&fieldSelector=metadata.name=bar&labelSelector=foo=bar&labelSelector=foo=baz",
+                "foo",
+                "list",
+                "metadata.name=foo",
+                "foo=bar",
+            ),
+            (
+                "/apis/g/v/resource/name",
+                "fieldSelector=foo=bar&labelSelector=foo=bar",
+                "name",
+                "get",
+                "",
+                "",
+            ),
+            (
+                "/apis/g/v/watch/resource",
+                "fieldSelector=metadata.name=foo&labelSelector=foo=bar",
+                "",
+                "watch",
+                "",
+                "",
+            ),
+            (
+                "/apis/g/v/watch/resource/name",
+                "fieldSelector=metadata.name=foo&labelSelector=foo=bar",
+                "name",
+                "watch",
+                "",
+                "",
+            ),
+        ];
+        for (path, query, name, verb, field, label) in cases {
+            let a = request_info(&Method::GET, path, Some(query));
+            assert_eq!(
+                (
+                    &a.name[..],
+                    &a.verb[..],
+                    &a.field_selector[..],
+                    &a.label_selector[..]
+                ),
+                (*name, *verb, *field, *label),
+                "{path}?{query}"
+            );
+        }
+        // deletecollection supports selectors too (verbsWithSelectors).
+        let a = request_info(&Method::DELETE, "/api/v1/pods", Some("labelSelector=a=b"));
+        assert_eq!(
+            (a.verb.as_str(), a.label_selector.as_str()),
+            ("deletecollection", "a=b")
+        );
     }
 
     #[test]
