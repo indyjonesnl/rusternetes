@@ -1919,4 +1919,43 @@ async fn node_deployment_deletes_a_volume_accessible_on_its_node() {
     p.sync_volume(&pv).await.unwrap();
     assert_eq!(deleted(&rec).len(), 1);
     assert!(get_pv(&storage, "pv1").await.is_none());
+
+// `cleanupVolume` (controller.go:2074-2086): `delReq.Secrets =
+// provisionerCredentials`, the credentials CreateVolume was sent with
+// (`provisionerCredentials := req.Secrets`, :875).
+#[tokio::test]
+async fn orphan_cleanup_delete_volume_carries_the_provisioner_credentials() {
+    let mut fake = Fake::new();
+    fake.capacity = Some(1 << 20);
+    let sc = with_params(storage_class(None), &secret_params());
+    let (storage, p, rec, _d) = env(fake, sc).await;
+    put_secret(&storage, "ns1", "prov-data", "token", "s3cret").await;
+    let err = p
+        .sync_claim(&claim(&[(ANN, DRIVER), ("example.com/np", "np-secret")]))
+        .await
+        .expect_err("capacity shortfall must error");
+    assert!(err.to_string().contains("less than requested capacity"));
+    let del = deleted(&rec);
+    assert_eq!(del.len(), 1);
+    assert_eq!(
+        del[0].secrets.get("token").map(String::as_str),
+        Some("s3cret"),
+        "cleanup DeleteVolume must carry the provisioner credentials"
+    );
+}
+
+// `cleanupVolume` retries DeleteVolume `deleteVolumeRetryCount` (5) times on
+// error (controller.go:141, :2079).
+#[tokio::test]
+async fn orphan_cleanup_retries_delete_volume_five_times() {
+    let mut fake = Fake::new();
+    fake.capacity = Some(1 << 20);
+    fake.delete_code = Some(tonic::Code::Internal);
+    let (_storage, p, rec, _d) = env(fake, storage_class(None)).await;
+    let err = p
+        .sync_claim(&claim(&[(ANN, DRIVER)]))
+        .await
+        .expect_err("capacity shortfall must error");
+    assert!(err.to_string().contains("volume is orphaned"));
+    assert_eq!(deleted(&rec).len(), 5);
 }
