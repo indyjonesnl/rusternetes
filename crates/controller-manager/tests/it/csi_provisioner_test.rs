@@ -121,6 +121,12 @@ impl Controller for Fake {
                 .collect(),
         }))
     }
+    async fn list_volumes(
+        &self,
+        _r: Request<ListVolumesRequest>,
+    ) -> Result<Response<ListVolumesResponse>, Status> {
+        Err(Status::unimplemented("not exercised"))
+    }
     async fn create_volume(
         &self,
         r: Request<CreateVolumeRequest>,

@@ -25,7 +25,8 @@ use proto::plugin_capability::service::Type as PluginService;
 use proto::{
     ControllerGetCapabilitiesRequest, ControllerPublishVolumeRequest,
     ControllerUnpublishVolumeRequest, CreateSnapshotRequest, CreateVolumeRequest,
-    DeleteSnapshotRequest, DeleteVolumeRequest, GetPluginCapabilitiesRequest, Snapshot, Volume,
+    DeleteSnapshotRequest, DeleteVolumeRequest, GetPluginCapabilitiesRequest, ListVolumesRequest,
+    Snapshot, Volume,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -343,6 +344,50 @@ impl CsiControllerClient {
             .map(|_| ())
     }
 
+    /// `CSIVolumeLister.ListVolumes` (external-attacher `pkg/attacher/lister.go:41-69`):
+    /// pages through `ListVolumes` (`StartingToken` / `NextToken`, `MaxEntries`
+    /// = `--max-entries`) and returns volume ID -> published node IDs. Entries
+    /// without a volume or a status are skipped (`:55-57`). Each page is one
+    /// operation under the client timeout; an error fails the whole listing
+    /// (`:50-52`), never yielding a partial map.
+    pub async fn list_volumes(
+        &self,
+        max_entries: i32,
+    ) -> Result<HashMap<String, Vec<String>>, ControllerError> {
+        let mut published = HashMap::new();
+        let mut token = String::new();
+        loop {
+            let resp = self
+                .call(
+                    ControllerClient::new(self.channel()?).list_volumes(ListVolumesRequest {
+                        starting_token: token,
+                        max_entries,
+                    }),
+                )
+                .await
+                .map_err(|e| match e {
+                    ControllerError::Grpc(s) => {
+                        ControllerError::Grpc(Box::new(tonic::Status::new(
+                            s.code(),
+                            format!("failed to list volumes: {}", s.message()),
+                        )))
+                    }
+                    other => other,
+                })?;
+            for e in resp.entries {
+                let (Some(volume), Some(status)) = (e.volume, e.status) else {
+                    continue;
+                };
+                published.insert(volume.volume_id, status.published_node_ids);
+            }
+            token = resp.next_token;
+            if token.is_empty() {
+                break;
+            }
+        }
+        Ok(published)
+    }
+
     /// `CreateSnapshot`, gated on `CREATE_DELETE_SNAPSHOT` (external-snapshotter).
     pub async fn create_snapshot(
         &self,
@@ -411,6 +456,7 @@ mod tests {
         delete_volume: Vec<DeleteVolumeRequest>,
         create_snapshot: Vec<CreateSnapshotRequest>,
         delete_snapshot: Vec<DeleteSnapshotRequest>,
+        list_volumes: Vec<ListVolumesRequest>,
     }
 
     #[derive(Clone)]
@@ -420,6 +466,8 @@ mod tests {
         ctrl_caps: Vec<ControllerRpc>,
         create_code: Option<tonic::Code>,
         delay: Duration,
+        /// `starting_token` -> page served for it.
+        list_pages: HashMap<String, ListVolumesResponse>,
     }
 
     impl Fake {
@@ -435,6 +483,7 @@ mod tests {
                 ],
                 create_code: None,
                 delay: Duration::ZERO,
+                list_pages: HashMap::new(),
             }
         }
     }
@@ -504,6 +553,21 @@ mod tests {
         ) -> Result<Response<DeleteVolumeResponse>, Status> {
             self.rec.lock().unwrap().delete_volume.push(r.into_inner());
             Ok(Response::new(DeleteVolumeResponse {}))
+        }
+        async fn list_volumes(
+            &self,
+            r: Request<ListVolumesRequest>,
+        ) -> Result<Response<ListVolumesResponse>, Status> {
+            self.rec
+                .lock()
+                .unwrap()
+                .list_volumes
+                .push(r.get_ref().clone());
+            self.list_pages
+                .get(&r.get_ref().starting_token)
+                .cloned()
+                .map(Response::new)
+                .ok_or_else(|| Status::aborted("unknown starting_token"))
         }
         async fn controller_publish_volume(
             &self,
@@ -815,5 +879,79 @@ mod tests {
         assert!(caps.supports_topology());
         assert!(caps.controller.contains(&ControllerRpc::CloneVolume));
         assert!(caps.plugin.contains(&PluginService::ControllerService));
+    }
+
+    fn entry(id: &str, nodes: &[&str]) -> list_volumes_response::Entry {
+        list_volumes_response::Entry {
+            volume: Some(Volume {
+                volume_id: id.into(),
+                ..Default::default()
+            }),
+            status: Some(list_volumes_response::VolumeStatus {
+                published_node_ids: nodes.iter().map(|n| n.to_string()).collect(),
+            }),
+        }
+    }
+
+    /// `CSIVolumeLister.ListVolumes` (`pkg/attacher/lister.go:41-69`): follows
+    /// `next_token` until empty, passes `max_entries`, maps volume ID to its
+    /// published nodes and skips entries lacking a volume or a status.
+    #[tokio::test]
+    async fn list_volumes_pages_and_maps_published_nodes() {
+        let mut f = Fake::full();
+        f.list_pages.insert(
+            String::new(),
+            ListVolumesResponse {
+                entries: vec![
+                    entry("v1", &["n1", "n2"]),
+                    list_volumes_response::Entry {
+                        volume: Some(Volume {
+                            volume_id: "no-status".into(),
+                            ..Default::default()
+                        }),
+                        status: None,
+                    },
+                ],
+                next_token: "t2".into(),
+            },
+        );
+        f.list_pages.insert(
+            "t2".into(),
+            ListVolumesResponse {
+                entries: vec![
+                    entry("v2", &[]),
+                    list_volumes_response::Entry {
+                        volume: None,
+                        status: Some(Default::default()),
+                    },
+                ],
+                next_token: String::new(),
+            },
+        );
+        let (_d, client, rec) = start(f);
+        let got = client.list_volumes(7).await.unwrap();
+        assert_eq!(
+            got,
+            HashMap::from([
+                ("v1".to_string(), vec!["n1".to_string(), "n2".to_string()]),
+                ("v2".to_string(), vec![]),
+            ])
+        );
+        let reqs = rec.lock().unwrap().list_volumes.clone();
+        assert_eq!(
+            reqs.iter()
+                .map(|r| (r.starting_token.as_str(), r.max_entries))
+                .collect::<Vec<_>>(),
+            vec![("", 7), ("t2", 7)]
+        );
+    }
+
+    /// A driver error is surfaced (`failed to list volumes: ...`), not an
+    /// empty map: an empty map would read as "nothing is published".
+    #[tokio::test]
+    async fn list_volumes_error_is_not_an_empty_listing() {
+        let (_d, client, _rec) = start(Fake::full());
+        let err = client.list_volumes(0).await.unwrap_err();
+        assert!(err.to_string().contains("failed to list volumes"), "{err}");
     }
 }
