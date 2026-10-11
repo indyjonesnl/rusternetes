@@ -1228,4 +1228,17 @@ mod tests {
         );
         assert!(ev.mutators.is_empty());
     }
+
+    /// compilation.go:47-54: `spec.matchConditions` compile to a matcher.
+    #[test]
+    fn compile_policy_builds_matcher_from_match_conditions() {
+        use rusternetes_common::resources::admission_webhook::MatchCondition;
+        let mut p = policy("p", 0, None);
+        assert!(compile_policy(&p).matcher.is_none());
+        p.spec.as_mut().unwrap().match_conditions = Some(vec![MatchCondition {
+            name: "c".into(),
+            expression: "object.metadata.name == 'x'".into(),
+        }]);
+        assert!(compile_policy(&p).matcher.is_some());
+    }
 }
