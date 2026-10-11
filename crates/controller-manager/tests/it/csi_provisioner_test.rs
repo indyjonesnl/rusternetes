@@ -133,6 +133,7 @@ impl Controller for Fake {
         self.rec.lock().unwrap().get_capacity.push(r.into_inner());
         Ok(Response::new(GetCapacityResponse {
             available_capacity: self.available_capacity,
+            ..Default::default()
         }))
     }
     async fn list_volumes(
