@@ -306,6 +306,9 @@ mod tests {
             operation: AdmissionOperation::Create,
             object: Some(object.clone()),
             old_object: None,
+            user_info: None,
+            dry_run: false,
+            operation_options: None,
         }
     }
 
@@ -620,6 +623,43 @@ mod tests {
                 "subResource": "scale", "requestSubResource": "scale",
                 "requestKind": "Deployment", "requestResource": "deployments",
                 "dryRun": "false"
+            }}})
+        );
+    }
+
+    // `CreateAdmissionRequest` (condition.go:128-153, :172-174): userInfo,
+    // dryRun and options come from the request's attributes.
+    #[test]
+    fn request_variable_carries_user_dry_run_and_options() {
+        let object = json!({"metadata": {}});
+        let mut attrs = attributes(&object);
+        attrs.user_info = Some(rusternetes_common::auth::UserInfo {
+            username: "alice".into(),
+            uid: "u1".into(),
+            groups: vec!["g1".into()],
+            extra: [("k".to_string(), vec!["v".to_string()])].into(),
+        });
+        attrs.dry_run = true;
+        attrs.operation_options = Some(json!({"fieldManager": "fm"}));
+        let got = run_with(
+            JsonPatcher::new_patcher(
+                r#"[JSONPatch{op: "add", path: "/metadata/annotations", value: {
+                    "user": request.userInfo.username,
+                    "uid": request.userInfo.uid,
+                    "group": request.userInfo.groups[0],
+                    "extra": request.userInfo.extra["k"][0],
+                    "dryRun": request.dryRun ? "true" : "false",
+                    "fm": request.options.fieldManager
+                }}]"#,
+            ),
+            object,
+            &attrs,
+        );
+        assert_eq!(
+            got.unwrap(),
+            json!({"metadata": {"annotations": {
+                "user": "alice", "uid": "u1", "group": "g1", "extra": "v",
+                "dryRun": "true", "fm": "fm"
             }}})
         );
     }

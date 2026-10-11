@@ -1020,6 +1020,9 @@ mod tests {
             operation: Operation::Create,
             object: Some(json!({"metadata": {"name": "p"}})),
             old_object: None,
+            user_info: None,
+            dry_run: false,
+            operation_options: None,
         }
     }
     fn match_pods() -> MatchResources {
