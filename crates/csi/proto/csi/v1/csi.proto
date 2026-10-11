@@ -21,6 +21,7 @@ syntax = "proto3";
 package csi.v1;
 
 import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
 
 service Identity {
   rpc GetPluginCapabilities (GetPluginCapabilitiesRequest) returns (GetPluginCapabilitiesResponse) {}
@@ -281,8 +282,11 @@ message GetCapacityRequest {
   Topology accessible_topology = 3;
 }
 
+// Fields 2/3 per vendored csi.pb.go:3044,3060 (OPTIONAL, MUST NOT be negative).
 message GetCapacityResponse {
   int64 available_capacity = 1;
+  google.protobuf.Int64Value maximum_volume_size = 2;
+  google.protobuf.Int64Value minimum_volume_size = 3;
 }
 
 // ListVolumes (csi.proto, checked against the vendored Go bindings in
