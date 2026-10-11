@@ -6,7 +6,7 @@ use rusternetes_common::{
     resources::{
         ContainerState, ContainerStateRunning, ContainerStateTerminated, ContainerStateWaiting,
         ContainerStatus, Node, NodeAddress, NodeSpec, NodeStatus, Pod, PodCondition, PodIP,
-        PodStatus, Taint, Toleration,
+        PodStatus,
     },
     types::Phase,
 };
@@ -22,91 +22,6 @@ use std::{
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
-
-/// Does a single toleration tolerate `taint`?
-///
-/// Mirrors upstream `(*v1.Toleration).ToleratesTaint`
-/// (staging/src/k8s.io/api/core/v1/toleration.go:52): empty effect matches all
-/// effects, empty key matches all keys, operator `Exists` matches all values,
-/// empty/`Equal` operator requires value equality. Comparison operators
-/// (`Lt`/`Gt`) are not used by node taints and are treated as non-matching.
-fn toleration_tolerates_taint(t: &Toleration, taint: &Taint) -> bool {
-    if let Some(effect) = t.effect.as_deref() {
-        if !effect.is_empty() && effect != taint.effect {
-            return false;
-        }
-    }
-    if let Some(key) = t.key.as_deref() {
-        if !key.is_empty() && key != taint.key {
-            return false;
-        }
-    }
-    match t.operator.as_deref().unwrap_or("Equal") {
-        "Exists" => true,
-        "Equal" | "" => t.value == taint.value,
-        _ => false,
-    }
-}
-
-/// Decide whether a pod must be evicted *now* for a single NoExecute `taint`.
-///
-/// Mirrors upstream `pkg/controller/tainteviction/taint_eviction.go`
-/// (`processPodOnNode` + `getMinTolerationTime`, lines 451-490 / 160-182) as
-/// closely as a poll loop allows — we have no persistent work-queue timer, so
-/// instead of `startTime = now` we derive elapsed time from the taint's
-/// `time_added` set by the node controller:
-///
-/// - No matching toleration → not tolerated → evict now (true).
-/// - Any matching toleration with `tolerationSeconds <= 0` → evict now
-///   (`getMinTolerationTime` returns 0 mid-iteration, before nil entries).
-/// - No matching toleration carries `tolerationSeconds` → tolerated forever
-///   (`getMinTolerationTime` returns -1) → never evict (false). A nil entry
-///   alongside a timed one does NOT mean forever — the timed minimum wins.
-/// - Otherwise evict once `now - time_added >= min(tolerationSeconds)`.
-/// - `time_added: None` → treat as just-added: a matching *timed* toleration is
-///   still within its grace period, so do not evict yet (the caller logs once).
-///
-/// Returns true iff the pod should be evicted because of this taint.
-fn noexecute_eviction_due(
-    tolerations: &[Toleration],
-    taint: &Taint,
-    now: chrono::DateTime<chrono::Utc>,
-) -> bool {
-    let matching: Vec<&Toleration> = tolerations
-        .iter()
-        .filter(|t| toleration_tolerates_taint(t, taint))
-        .collect();
-
-    // No toleration matches → the taint is not tolerated at all → evict now.
-    if matching.is_empty() {
-        return true;
-    }
-
-    // getMinTolerationTime evaluation order (taint_eviction.go:167-181): a
-    // tolerationSeconds <= 0 short-circuits to "evict now" DURING iteration,
-    // before any nil (= tolerate forever) entry is considered; only if no
-    // toleration carries tolerationSeconds at all does it return -1 (forever).
-    let mut min_secs: Option<i64> = None;
-    for t in &matching {
-        if let Some(secs) = t.toleration_seconds {
-            if secs <= 0 {
-                return true;
-            }
-            min_secs = Some(min_secs.map_or(secs, |m| m.min(secs)));
-        }
-    }
-
-    // No matching toleration has tolerationSeconds → tolerated forever.
-    let Some(min_secs) = min_secs else {
-        return false;
-    };
-
-    match taint.time_added {
-        // time_added not yet stamped: treat as just-added, still within grace.
-        None => false,
-        Some(added) => (now - added).num_seconds() >= min_secs,
-    }
-}
 
 /// Pod worker state machine matching K8s pkg/kubelet/pod_workers.go.
 ///
@@ -1891,107 +1806,6 @@ impl Kubelet {
         if !active_signals.is_empty() {
             if let Err(e) = self.handle_eviction(&active_signals).await {
                 error!("Error handling eviction: {}", e);
-            }
-        }
-
-        // Check for NoExecute taints and evict pods that don't tolerate them.
-        // Re-read the node to get the freshest taint state — a test may have
-        // removed taints between the initial read and this check.
-        let fresh_node: Node = self.storage.get(&key).await.unwrap_or(node.clone());
-        if let Some(ref spec) = fresh_node.spec {
-            if let Some(ref taints) = spec.taints {
-                let no_execute_taints: Vec<_> =
-                    taints.iter().filter(|t| t.effect == "NoExecute").collect();
-                if !no_execute_taints.is_empty() {
-                    let pod_prefix = build_prefix("pods", None);
-                    let all_pods: Vec<Pod> =
-                        self.storage.list(&pod_prefix).await.unwrap_or_default();
-                    let now = chrono::Utc::now();
-                    for pod in &all_pods {
-                        if pod.spec.as_ref().and_then(|s| s.node_name.as_ref())
-                            != Some(&self.node_name)
-                        {
-                            continue;
-                        }
-                        if pod.metadata.is_being_deleted() {
-                            continue;
-                        }
-                        // Skip terminal (Succeeded/Failed) pods. They have no
-                        // running containers for the taint to protect, and our
-                        // sweep ultimately leads to STORAGE REMOVAL (via the
-                        // TerminatedPod worker path) — unlike upstream's
-                        // taint-eviction controller, which issues an API DELETE
-                        // that still honors finalizers/observability windows.
-                        // Upstream pkg/controller/tainteviction/taint_eviction.go
-                        // has no explicit terminal-pod skip (its work queue keys
-                        // off the node taint, not pod phase); we add one here
-                        // because destroying a Succeeded pod's status erases
-                        // state conformance tests still need to read (#442).
-                        let is_terminal = pod
-                            .status
-                            .as_ref()
-                            .and_then(|s| s.phase.as_ref())
-                            .map(|p| matches!(p, Phase::Succeeded | Phase::Failed))
-                            .unwrap_or(false);
-                        if is_terminal {
-                            continue;
-                        }
-                        let empty_tols: Vec<Toleration> = Vec::new();
-                        let tolerations = pod
-                            .spec
-                            .as_ref()
-                            .and_then(|s| s.tolerations.as_ref())
-                            .unwrap_or(&empty_tols);
-                        for taint in &no_execute_taints {
-                            if taint.time_added.is_none()
-                                && tolerations.iter().any(|t| {
-                                    toleration_tolerates_taint(t, taint)
-                                        && t.toleration_seconds.is_some()
-                                })
-                            {
-                                debug!(
-                                    "NoExecute taint {:?} on node {} has no timeAdded; \
-                                     deferring timed-toleration eviction of pod {}/{}",
-                                    taint.key,
-                                    self.node_name,
-                                    pod.metadata.namespace.as_deref().unwrap_or("default"),
-                                    pod.metadata.name,
-                                );
-                            }
-                            if noexecute_eviction_due(tolerations, taint, now) {
-                                info!(
-                                    "Evicting pod {}/{} due to NoExecute taint {:?}",
-                                    pod.metadata.namespace.as_deref().unwrap_or("default"),
-                                    pod.metadata.name,
-                                    taint.key
-                                );
-                                let mut evicted = pod.clone();
-                                evicted.metadata.deletion_timestamp = Some(chrono::Utc::now());
-                                let status = evicted.status.get_or_insert_with(Default::default);
-                                status.phase = Some(Phase::Failed);
-                                status.reason = Some("Evicted".to_string());
-                                status.message = Some("Taint-based eviction".to_string());
-                                let pod_key = build_key(
-                                    "pods",
-                                    evicted.metadata.namespace.as_deref(),
-                                    &evicted.metadata.name,
-                                );
-                                // Mode-aware graceful eviction (#1284): storage
-                                // mode persists deletionTimestamp+status via the
-                                // whole-pod write; API mode can't (the api-server
-                                // owns deletionTimestamp on a PUT) so it stamps
-                                // /status then issues a real DELETE-with-grace.
-                                let grace = pod
-                                    .spec
-                                    .as_ref()
-                                    .and_then(|s| s.termination_grace_period_seconds)
-                                    .unwrap_or(30);
-                                let _ = self.storage.evict_pod(&pod_key, &evicted, grace).await;
-                                break;
-                            }
-                        }
-                    }
-                }
             }
         }
 
@@ -6316,120 +6130,6 @@ pub fn build_managed_hosts_content(
     Some(content)
 }
 
-#[cfg(test)]
-mod taint_eviction_tests {
-    use super::{noexecute_eviction_due, Taint, Toleration};
-
-    fn no_execute_taint(time_added_secs_ago: Option<i64>) -> Taint {
-        Taint {
-            key: "node.kubernetes.io/not-ready".to_string(),
-            value: Some("".to_string()),
-            effect: "NoExecute".to_string(),
-            time_added: time_added_secs_ago
-                .map(|s| chrono::Utc::now() - chrono::Duration::seconds(s)),
-        }
-    }
-
-    fn default_toleration(secs: Option<i64>) -> Toleration {
-        Toleration {
-            key: Some("node.kubernetes.io/not-ready".to_string()),
-            operator: Some("Exists".to_string()),
-            value: None,
-            effect: Some("NoExecute".to_string()),
-            toleration_seconds: secs,
-        }
-    }
-
-    #[test]
-    fn untolerated_pod_is_due() {
-        let taint = no_execute_taint(Some(10));
-        assert!(noexecute_eviction_due(&[], &taint, chrono::Utc::now()));
-    }
-
-    #[test]
-    fn exists_toleration_no_seconds_never_due() {
-        let taint = no_execute_taint(Some(10_000));
-        let tols = vec![default_toleration(None)];
-        assert!(!noexecute_eviction_due(&tols, &taint, chrono::Utc::now()));
-    }
-
-    #[test]
-    fn timed_toleration_within_grace_not_due() {
-        // 300s toleration, taint added 10s ago → still within grace.
-        let taint = no_execute_taint(Some(10));
-        let tols = vec![default_toleration(Some(300))];
-        assert!(!noexecute_eviction_due(&tols, &taint, chrono::Utc::now()));
-    }
-
-    #[test]
-    fn timed_toleration_past_grace_is_due() {
-        // 300s toleration, taint added 400s ago → grace expired.
-        let taint = no_execute_taint(Some(400));
-        let tols = vec![default_toleration(Some(300))];
-        assert!(noexecute_eviction_due(&tols, &taint, chrono::Utc::now()));
-    }
-
-    #[test]
-    fn time_added_none_with_timed_toleration_not_due() {
-        // Taint just added (no timeAdded) + matching timed toleration → grace
-        // has not elapsed, so the pod is not yet evicted.
-        let taint = no_execute_taint(None);
-        let tols = vec![default_toleration(Some(300))];
-        assert!(!noexecute_eviction_due(&tols, &taint, chrono::Utc::now()));
-    }
-
-    #[test]
-    fn time_added_none_untolerated_still_due() {
-        // No matching toleration is independent of timeAdded → evict.
-        let taint = no_execute_taint(None);
-        assert!(noexecute_eviction_due(&[], &taint, chrono::Utc::now()));
-    }
-
-    #[test]
-    fn non_matching_key_toleration_does_not_count() {
-        let taint = no_execute_taint(Some(10));
-        let tols = vec![Toleration {
-            key: Some("other-key".to_string()),
-            operator: Some("Exists".to_string()),
-            value: None,
-            effect: Some("NoExecute".to_string()),
-            toleration_seconds: None,
-        }];
-        assert!(noexecute_eviction_due(&tols, &taint, chrono::Utc::now()));
-    }
-
-    #[test]
-    fn zero_or_negative_toleration_seconds_is_due() {
-        let taint = no_execute_taint(Some(1));
-        let tols = vec![default_toleration(Some(0))];
-        assert!(noexecute_eviction_due(&tols, &taint, chrono::Utc::now()));
-    }
-
-    #[test]
-    fn zero_seconds_short_circuits_over_forever_toleration() {
-        // Mirror upstream getMinTolerationTime (taint_eviction.go:167-181):
-        // a tolerationSeconds <= 0 returns 0 (evict now) DURING iteration,
-        // before a nil/forever toleration is ever considered.
-        let taint = no_execute_taint(Some(1));
-        let tols = vec![default_toleration(None), default_toleration(Some(0))];
-        assert!(noexecute_eviction_due(&tols, &taint, chrono::Utc::now()));
-        // Order-independent: same result with the entries swapped.
-        let tols = vec![default_toleration(Some(0)), default_toleration(None)];
-        assert!(noexecute_eviction_due(&tols, &taint, chrono::Utc::now()));
-    }
-
-    #[test]
-    fn forever_plus_timed_toleration_uses_timed_minimum() {
-        // Upstream getMinTolerationTime skips nil entries (it does NOT treat
-        // them as forever when a timed entry exists): nil + 300s → min 300s.
-        let tols = vec![default_toleration(None), default_toleration(Some(300))];
-        let fresh = no_execute_taint(Some(10));
-        assert!(!noexecute_eviction_due(&tols, &fresh, chrono::Utc::now()));
-        let expired = no_execute_taint(Some(400));
-        assert!(noexecute_eviction_due(&tols, &expired, chrono::Utc::now()));
-    }
-}
-
 /// Create-or-update a metrics.k8s.io object the kubelet publishes.
 ///
 /// Upstream never PUTs metrics objects (metrics-server serves them from
@@ -6926,6 +6626,64 @@ mod tests {
         storage.update_status(&key, &n).await.unwrap();
         k.update_node_status().await.unwrap();
         assert!(ready_heartbeat(&storage).await > old + chrono::Duration::seconds(20));
+    }
+
+    /// #3261: NoExecute eviction belongs to kube-controller-manager's
+    /// taint-eviction controller alone. Upstream's kubelet has no taint
+    /// handling in its node-status path: `tryUpdateNodeStatus`
+    /// (pkg/kubelet/kubelet_node_status.go:483) only builds and patches node
+    /// status, and `grep -rni noexecute pkg/kubelet/kubelet_node_status.go`
+    /// has no match. A kubelet heartbeat must therefore leave pods on a
+    /// NoExecute-tainted node untouched (running or terminal alike).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn node_status_sync_does_not_evict_for_noexecute_taints() {
+        use rusternetes_common::resources::{Node, Pod};
+        use rusternetes_storage::{build_key, Storage, StorageBackend};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(StorageBackend::new_memory());
+        let k = status_gate_kubelet(&dir, storage.clone()).await;
+
+        let nkey = build_key("nodes", None, "node-gate");
+        let mut n: Node = storage.get(&nkey).await.unwrap();
+        n.spec.as_mut().unwrap().taints = Some(vec![serde_json::from_value(serde_json::json!({
+            "key": "t", "effect": "NoExecute",
+            "timeAdded": chrono::Utc::now().to_rfc3339()
+        }))
+        .unwrap()]);
+        storage.update(&nkey, &n).await.unwrap();
+
+        for (name, phase) in [("running", "Running"), ("done", "Succeeded")] {
+            let pod: Pod = serde_json::from_value(serde_json::json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": name, "namespace": "default", "uid": format!("u-{name}")},
+                "spec": {"nodeName": "node-gate", "containers": [{"name": "c", "image": "i"}]},
+                "status": {"phase": phase}
+            }))
+            .unwrap();
+            storage
+                .create(&build_key("pods", Some("default"), name), &pod)
+                .await
+                .unwrap();
+        }
+
+        k.update_node_status().await.unwrap();
+
+        for name in ["running", "done"] {
+            let pod: Pod = storage
+                .get(&build_key("pods", Some("default"), name))
+                .await
+                .unwrap();
+            assert!(
+                pod.metadata.deletion_timestamp.is_none(),
+                "kubelet must not evict pod {name}: eviction is the taint-eviction controller's job"
+            );
+            assert_ne!(
+                pod.status.as_ref().and_then(|s| s.reason.as_deref()),
+                Some("Evicted"),
+                "pod {name}"
+            );
+        }
     }
 
     /// `nodeStatusReportFrequency` is configurable and defaults to 5m
