@@ -503,4 +503,49 @@ profiles:
             "{err}"
         );
     }
+
+    // validation.go:58-67 -> field.Duplicate(path.Child("schedulerName"),
+    // profilesPath.Index(idx).Child("schedulerName")): the bad value is a
+    // *field.Path, which json.Marshal renders as `{}` (errors.go:92-97).
+    #[test]
+    fn duplicate_scheduler_name_value_renders_like_go() {
+        let doc = "profiles:\n- schedulerName: a\n- schedulerName: a\n";
+        let err = volume_binding_args_from_config(doc, false).unwrap_err();
+        assert_eq!(err, "profiles[1].schedulerName: Duplicate value: {}");
+    }
+
+    // v1/defaults.go:116-119: the default name is only applied to a single
+    // profile; validation.go:141-144 then requires a name on the rest
+    // (validation_test.go "scheduler-name-not-set" -> profiles[1].schedulerName).
+    #[test]
+    fn unnamed_profile_required_when_multiple() {
+        let doc = "profiles:\n- schedulerName: a\n- pluginConfig: []\n";
+        let err = volume_binding_args_from_config(doc, false).unwrap_err();
+        assert_eq!(err, "profiles[1].schedulerName: Required value");
+        let one = "profiles:\n- pluginConfig: []\n";
+        assert!(volume_binding_args_from_config(one, false).is_ok());
+    }
+
+    // validation.go:86-92 validatePercentageOfNodesToScore, top level and
+    // per profile (validation_test.go "bad-percentage-of-nodes-to-score",
+    // "greater-than-100-profile-percentage-of-nodes-to-score").
+    #[test]
+    fn percentage_of_nodes_to_score_range() {
+        let err = volume_binding_args_from_config("percentageOfNodesToScore: 101\n", false)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            "percentageOfNodesToScore: Invalid value: 101: not in valid range [0-100]"
+        );
+        let err = volume_binding_args_from_config(
+            "profiles:\n- schedulerName: a\n- schedulerName: b\n  percentageOfNodesToScore: -1\n",
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "profiles[1].percentageOfNodesToScore: Invalid value: -1: not in valid range [0-100]"
+        );
+        assert!(volume_binding_args_from_config("percentageOfNodesToScore: 100\n", false).is_ok());
+    }
 }
