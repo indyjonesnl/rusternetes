@@ -551,3 +551,18 @@ fn go_durations_parse() {
     assert!(parse_go_duration("5").is_err());
     assert!(parse_go_duration("abc").is_err());
 }
+
+// resourceAttributesFrom (webhook.go:306) sends Version: attr.GetAPIVersion().
+#[tokio::test]
+async fn sends_resource_attributes_version() {
+    let mock = allowing_mock();
+    let url = serve(mock.clone()).await;
+    let wh = authorizer(&url, "v1", Duration::ZERO, FailurePolicy::NoOpinion);
+    let a = RequestAttributes {
+        api_version: "v1".into(),
+        ..resource("jane")
+    };
+    assert!(is_allow(&wh.authorize_opinion(&a).await.unwrap()));
+    let got = mock.lock().unwrap().last.clone().unwrap();
+    assert_eq!(got["spec"]["resourceAttributes"]["version"], "v1");
+}
