@@ -397,7 +397,7 @@ fn format_ignored_path(path: &serde_ignored::Path<'_>) -> String {
 /// back out to the outer callback. The diff-based helper below covers
 /// that gap (it only inspects the canonical round-trip output, so it's
 /// unaffected by flatten internals).
-fn find_unknown_fields_via_schema<T>(original: &serde_json::Value) -> Vec<String>
+pub(crate) fn find_unknown_fields_via_schema<T>(original: &serde_json::Value) -> Vec<String>
 where
     T: serde::de::DeserializeOwned,
 {
