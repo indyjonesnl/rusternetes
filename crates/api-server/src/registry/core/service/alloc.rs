@@ -830,19 +830,18 @@ async fn alloc_cluster_ips<S: Storage>(
     Ok(())
 }
 
-/// `txnAllocClusterIPs` (alloc.go:305-338). Unlike upstream, an allocation
-/// that fails after the first family was taken gives that one back rather
-/// than leaving it to the repair loop.
+/// `txnAllocClusterIPs` (alloc.go:305-338). As upstream does (alloc.go:
+/// 306-312: `allocated, err := al.allocClusterIPs(service, dryRun); if err
+/// != nil { return nil, err }`), an allocation that fails after an earlier
+/// family was taken does NOT give that one back: the IPAddress repair loop
+/// (`ipallocator::repair`) reclaims it.
 pub async fn txn_alloc_cluster_ips<S: Storage>(
     pa: &Arc<ClusterIpAllocators<S>>,
     service: &mut Service,
     dry_run: bool,
 ) -> Result<ClusterIpTxn<S>> {
     let mut txn = ClusterIpTxn::new(pa, dry_run);
-    if let Err(e) = alloc_cluster_ips(&mut txn, service).await {
-        txn.revert().await;
-        return Err(e);
-    }
+    alloc_cluster_ips(&mut txn, service).await?;
     Ok(txn)
 }
 
@@ -1284,5 +1283,37 @@ mod tests {
             .unwrap();
         settle(op, &Ok(())).await;
         assert!(!pa.has(hc).await);
+    }
+
+    /// `txnAllocClusterIPs` (alloc.go:305-312) returns `nil, err` when
+    /// `allocClusterIPs` fails and never releases what `allocIPs`
+    /// (alloc.go:395-451) already took for an earlier family: the repair loop
+    /// reclaims it. A dual-stack create whose IPv6 family cannot be served
+    /// therefore leaves the IPv4 address allocated.
+    #[tokio::test]
+    async fn failed_cluster_ip_alloc_leaves_partial_allocation_to_repair() {
+        use rusternetes_common::resources::ServiceCIDR;
+        use rusternetes_storage::{build_key, MemoryStorage};
+
+        let storage = Arc::new(MemoryStorage::new());
+        // Only the IPv4 family has a ServiceCIDR, so the IPv6 allocation
+        // fails after the IPv4 one succeeded.
+        let sc = ServiceCIDR::new("v4", vec!["10.0.0.0/24".to_string()]);
+        storage
+            .create(&build_key("servicecidrs", None, "v4"), &sc)
+            .await
+            .unwrap();
+        let pa = Arc::new(ClusterIpAllocators::new(
+            storage,
+            &[IPFamily::IPv4, IPFamily::IPv6],
+        ));
+        let mut s = svc(json!({
+            "type": "ClusterIP",
+            "ipFamilies": ["IPv4", "IPv6"],
+            "ports": [{"port": 80, "protocol": "TCP"}],
+        }));
+        assert!(txn_alloc_cluster_ips(&pa, &mut s, false).await.is_err());
+        let v4 = pa.get(&IPFamily::IPv4).unwrap();
+        assert_eq!(v4.used().await, 1, "the partial allocation is not released");
     }
 }
