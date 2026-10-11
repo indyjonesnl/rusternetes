@@ -672,6 +672,11 @@ impl CriContainerRuntime {
         Ok(())
     }
 
+    /// Runtime handler for the pod's `RunPodSandbox`.
+    async fn sandbox_runtime_handler(&self, _pod: &Pod) -> anyhow::Result<String> {
+        Ok(self.runtime_handler.clone())
+    }
+
     /// Create and start a single container in the pod's existing sandbox. Used
     /// by the kubelet for init-container sequencing, restarts, and ephemeral
     /// containers. `netns_path`/`hosts_file_path`/`pod_ip` are bollard-era
@@ -3940,6 +3945,55 @@ mod tests {
     /// Warning event lands with the generic, secret-safe message and that the
     /// returned error is the `PostStartHookError`, which the callers propagate
     /// via `?` to fail the start.
+    #[tokio::test]
+    async fn sandbox_handler_resolves_pod_runtime_class() {
+        use rusternetes_common::resources::RuntimeClass;
+        let storage = Arc::new(StorageBackend::new_memory());
+        storage
+            .create(
+                &rusternetes_storage::build_key("runtimeclasses", None, "gvisor"),
+                &RuntimeClass::new("gvisor", "runsc"),
+            )
+            .await
+            .unwrap();
+        let vm = crate::volumes::VolumeManager::new(
+            "/tmp/rusternetes-test-vols".to_string(),
+            Some(storage),
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+        let rt = CriContainerRuntime::connect(
+            "/tmp/rusternetes-test-missing-cri.sock",
+            "node-default",
+            "/tmp/rusternetes-test-logs",
+        )
+        .await
+        .unwrap()
+        .with_volumes(vm);
+        let mk = |rc: Option<&str>| {
+            Pod::new(
+                "p",
+                PodSpec {
+                    runtime_class_name: rc.map(str::to_string),
+                    ..Default::default()
+                },
+            )
+        };
+        // `kuberuntime_sandbox.go:58` LookupRuntimeHandler(pod.Spec.RuntimeClassName)
+        assert_eq!(
+            rt.sandbox_runtime_handler(&mk(Some("gvisor")))
+                .await
+                .unwrap(),
+            "runsc"
+        );
+        // No class: node-configured default is kept (documented deviation).
+        assert_eq!(
+            rt.sandbox_runtime_handler(&mk(None)).await.unwrap(),
+            "node-default"
+        );
+        // Missing RuntimeClass fails the sandbox (`kuberuntime_sandbox.go:60-63`).
+        assert!(rt.sandbox_runtime_handler(&mk(Some("nope"))).await.is_err());
+    }
+
     #[tokio::test]
     async fn failed_post_start_hook_emits_event_and_returns_error() {
         use rusternetes_common::resources::pod::PodSpec;
