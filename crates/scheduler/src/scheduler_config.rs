@@ -158,6 +158,20 @@ pub fn volume_binding_args_from_config(
     }
 }
 
+/// Read `--config` / `--scheduler-config` and resolve the `VolumeBinding` args
+/// (upstream `Options.ConfigFile`, cmd/kube-scheduler/app/options/options.go:203,
+/// then `LoadConfigFromFile`). Shared by the standalone and all-in-one
+/// binaries. The `StorageCapacityScoring` gate is read from the process-wide
+/// feature gates, so apply `--feature-gates` first.
+pub fn load_volume_binding_args(path: &str) -> Result<VolumeBindingArgs, String> {
+    let doc = std::fs::read_to_string(path).map_err(|e| format!("reading config {path}: {e}"))?;
+    let scoring = rusternetes_common::feature_gates::enabled(
+        rusternetes_common::feature_gates::Feature::StorageCapacityScoring,
+    );
+    volume_binding_args_from_config(&doc, scoring)
+        .map_err(|e| format!("invalid config {path}: {e}"))
+}
+
 /// `validateFunctionShape` (validation_pluginargs.go:176-211).
 fn validate_function_shape(shape: &[UtilizationShapePoint], path: &Path) -> ErrorList {
     const MIN_UTILIZATION: i32 = 0;
@@ -400,5 +414,32 @@ profiles:
             .map(|p| (p.utilization, p.score))
             .collect();
         assert_eq!(got, want);
+    }
+
+    // #3202: file loader shared by the scheduler binary and the all-in-one
+    // binary (--scheduler-config).
+    #[test]
+    fn load_from_file_reads_defaults_and_validates() {
+        let dir = std::env::temp_dir().join(format!("sched-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ok = dir.join("ok.yaml");
+        std::fs::write(
+            &ok,
+            "profiles:\n- pluginConfig:\n  - name: VolumeBinding\n    args:\n      bindTimeoutSeconds: 42\n",
+        )
+        .unwrap();
+        let a = load_volume_binding_args(ok.to_str().unwrap()).unwrap();
+        assert_eq!(a.bind_timeout_seconds, Some(42));
+        let bad = dir.join("bad.yaml");
+        std::fs::write(
+            &bad,
+            "profiles:\n- pluginConfig:\n  - name: VolumeBinding\n    args:\n      bindTimeoutSeconds: -1\n",
+        )
+        .unwrap();
+        let err = load_volume_binding_args(bad.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("bindTimeoutSeconds"), "{err}");
+        let err = load_volume_binding_args(dir.join("missing.yaml").to_str().unwrap()).unwrap_err();
+        assert!(err.contains("missing.yaml"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
