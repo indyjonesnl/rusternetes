@@ -137,6 +137,26 @@ struct Args {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     csi_immediate_topology: bool,
 
+    /// `--node-deployment` of external-provisioner (csi-provisioner.go:106):
+    /// deploy together with a CSI driver on a node to manage node-local
+    /// volumes. Needs the `NODE_NAME` environment variable and a driver
+    /// socket that serves the CSI Node service.
+    #[arg(long)]
+    csi_node_deployment: bool,
+
+    /// `--node-deployment-immediate-binding` (csi-provisioner.go:107,
+    /// default true).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    csi_node_deployment_immediate_binding: bool,
+
+    /// `--node-deployment-base-delay` (csi-provisioner.go:108, default 20s).
+    #[arg(long, default_value = "20s", value_parser = parse_clean_up_period)]
+    csi_node_deployment_base_delay: std::time::Duration,
+
+    /// `--node-deployment-max-delay` (csi-provisioner.go:109, default 60s).
+    #[arg(long, default_value = "60s", value_parser = parse_clean_up_period)]
+    csi_node_deployment_max_delay: std::time::Duration,
+
     /// Storage backend: "etcd" or "sqlite"
     #[arg(long, default_value = "etcd")]
     storage_backend: String,
@@ -301,6 +321,31 @@ fn parse_clean_up_period(s: &str) -> Result<std::time::Duration, String> {
     u64::try_from(nanos)
         .map(std::time::Duration::from_nanos)
         .map_err(|_| format!("negative duration {s:?}"))
+}
+
+/// The `NodeDeployment` literal of csi-provisioner.go:321-328 (everything but
+/// `NodeInfo`, which `GetNodeInfo` fills in from the driver), or `None`
+/// without `--csi-node-deployment`. `node_name` is the `NODE_NAME` environment
+/// variable, fatal when empty (csi-provisioner.go:146-149).
+fn node_deployment_settings(
+    args: &Args,
+    node_name: Option<String>,
+) -> Result<Option<controllers::csi_provisioner::NodeDeployment>> {
+    if !args.csi_node_deployment {
+        return Ok(None);
+    }
+    let node_name = node_name.filter(|n| !n.is_empty()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "The NODE_NAME environment variable must be set when using --csi-node-deployment."
+        )
+    })?;
+    Ok(Some(controllers::csi_provisioner::NodeDeployment {
+        node_name,
+        immediate_binding: args.csi_node_deployment_immediate_binding,
+        base_delay: args.csi_node_deployment_base_delay,
+        max_delay: args.csi_node_deployment_max_delay,
+        accessible_topology: None,
+    }))
 }
 
 /// Resolve node-IPAM flags into `(cluster_cidr, mask_sizes, service_cidr)`, or `None` when
@@ -565,6 +610,7 @@ async fn main() -> Result<()> {
 
         let identity = args
             .leader_election_identity
+            .clone()
             .unwrap_or_else(|| format!("controller-manager-{}", uuid::Uuid::new_v4()));
 
         let config = LeaderElectionConfig {
@@ -808,20 +854,37 @@ async fn main() -> Result<()> {
         let Some((driver, socket)) = spec.split_once('=') else {
             anyhow::bail!("--csi-provisioner {spec:?}: expected <driver-name>=<socket path>");
         };
+        let mut node_deployment = node_deployment_settings(&args, std::env::var("NODE_NAME").ok())?;
+        if let Some(nd) = node_deployment.as_mut() {
+            // `ctrl.GetNodeInfo` (controller.go:350-355); failure is fatal
+            // (csi-provisioner.go:330-332).
+            let info =
+                rusternetes_csi::controller_client::CsiControllerClient::with_endpoint(socket)
+                    .get_node_info()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to get node info from CSI driver: {e}"))?;
+            nd.accessible_topology = info.accessible_topology.map(|t| t.segments);
+        }
+        let mut provisioner = controllers::csi_provisioner::CsiProvisioner::new(
+            storage.clone(),
+            driver,
+            rusternetes_csi::controller_client::CsiControllerClient::with_endpoint(socket),
+        );
+        if let Some(nd) = node_deployment {
+            provisioner = provisioner.with_node_deployment(nd);
+        }
         let provisioner = Arc::new(
-            controllers::csi_provisioner::CsiProvisioner::new(
-                storage.clone(),
-                driver,
-                rusternetes_csi::controller_client::CsiControllerClient::with_endpoint(socket),
-            )
-            .with_default_fs_type(args.csi_default_fstype.clone())
-            .with_extra_create_metadata(args.csi_extra_create_metadata)
-            .with_controller_publish_read_only(args.csi_controller_publish_readonly)
-            .with_prevent_volume_mode_conversion(args.csi_prevent_volume_mode_conversion)
-            .with_retry_interval_max(args.csi_retry_interval_max)
-            .with_cross_namespace_volume_data_source(args.csi_cross_namespace_volume_data_source)
-            .with_strict_topology(args.csi_strict_topology)
-            .with_immediate_topology(args.csi_immediate_topology),
+            provisioner
+                .with_default_fs_type(args.csi_default_fstype.clone())
+                .with_extra_create_metadata(args.csi_extra_create_metadata)
+                .with_controller_publish_read_only(args.csi_controller_publish_readonly)
+                .with_prevent_volume_mode_conversion(args.csi_prevent_volume_mode_conversion)
+                .with_retry_interval_max(args.csi_retry_interval_max)
+                .with_cross_namespace_volume_data_source(
+                    args.csi_cross_namespace_volume_data_source,
+                )
+                .with_strict_topology(args.csi_strict_topology)
+                .with_immediate_topology(args.csi_immediate_topology),
         );
         spawn_controller!("CSI provisioner", leader_elector, {
             let controller = provisioner.clone();
