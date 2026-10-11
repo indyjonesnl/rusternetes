@@ -168,3 +168,17 @@ fn compile_validation() {
     let e = CelMatcher::compile(&[mc("request.user ==")]).unwrap_err();
     assert!(e[0].contains("compilation failed"), "{e:?}");
 }
+
+// compile.go:189-203 (`MatchCondition.ReturnTypes` is `[bool]`): a non-bool
+// expression is rejected at compile time, not at evaluation (#3265).
+#[test]
+fn non_bool_expression_is_a_compile_error() {
+    let e = CelMatcher::compile(&[mc("6")]).unwrap_err();
+    assert_eq!(
+        e,
+        vec![
+            r#"matchConditions[0].expression: Invalid value: "6": must evaluate to bool but got int"#
+        ],
+        "{e:?}"
+    );
+}

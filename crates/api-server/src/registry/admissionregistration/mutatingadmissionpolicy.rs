@@ -433,6 +433,23 @@ mod tests {
         );
     }
 
+    /// `MatchCondition.ReturnTypes` is `[bool]` (matcher.go:49-51), checked by
+    /// `CompileCELExpression` (compile.go:189-203) (#3265).
+    #[test]
+    fn create_rejects_a_non_bool_match_condition() {
+        let mut p = valid();
+        p.spec.as_mut().unwrap().match_conditions =
+            Some(serde_json::from_value(json!([{"name": "c", "expression": "6"}])).unwrap());
+        let errs = RestCreateStrategy::validate(&Strategy, &RequestContext::new(None), &p);
+        assert!(
+            messages(&errs).contains(
+                r#"spec.matchConditions[0].expression: Invalid value: "6": must evaluate to bool but got int"#
+            ),
+            "{}",
+            messages(&errs)
+        );
+    }
+
     /// `validateMatchCondition` (validation.go:984-997) under the mutating
     /// policy's `spec.matchConditions`.
     #[test]
