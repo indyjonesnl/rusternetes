@@ -7,10 +7,7 @@
 //! (which `(topology segment, StorageClass)` pairs get an object, when an
 //! object is created / updated / deleted, ownership and labels) as one
 //! level-triggered `reconcile` pass over `Storage`; wiring it into a run loop
-//! is tracked separately.
-
-// Not yet driven by a run loop; wiring is tracked in #3219.
-#![allow(dead_code)]
+//! is `run_capacity_loop`, started from `main.rs` (#3219).
 
 use rusternetes_common::quantity::{Format, Quantity};
 use rusternetes_common::resources::csi::{CSINode, CSIStorageCapacity};
@@ -90,6 +87,8 @@ impl Segment {
 }
 
 /// `termToSegment` (capacity.go:458-478).
+// Only exercised by tests until StorageClass.allowedTopologies filtering lands (#3234).
+#[allow(dead_code)]
 pub fn term_to_segment(term: &NodeSelectorTerm) -> std::result::Result<Segment, String> {
     if term.match_fields.as_ref().is_some_and(|f| !f.is_empty()) {
         return Err(format!("MatchFields not empty: {:?}", term.match_fields));
@@ -171,6 +170,176 @@ impl CapacityClient for CsiControllerClient {
         self.get_capacity_response(req)
             .await
             .map_err(|e| e.to_string())
+    }
+}
+
+/// `getNameWithMaxLength` (cmd/csi-provisioner/util.go:30-60) with
+/// `hash` = FNV-1a 32 as 8 hex chars (util.go:63-70).
+pub fn name_with_max_length(base: &str, suffix: &str, max_length: usize) -> String {
+    fn hash(s: &str) -> String {
+        let mut h: u32 = 0x811c9dc5;
+        for b in s.bytes() {
+            h ^= u32::from(b);
+            h = h.wrapping_mul(0x01000193);
+        }
+        format!("{h:08x}")
+    }
+    let name = if base.is_empty() {
+        suffix.to_string()
+    } else {
+        format!("{base}-{suffix}")
+    };
+    if name.len() <= max_length {
+        return name;
+    }
+    let base_length = max_length as isize - 10 - suffix.len() as isize;
+    if base_length <= 0 {
+        let mut short = hash(&name);
+        let prefix_len = base.len().min(max_length.saturating_sub(9));
+        let prefix = &base[..prefix_len];
+        if !prefix.is_empty() {
+            short = format!("{prefix}-{}", hash(&name));
+        }
+        short.truncate(max_length);
+        return short;
+    }
+    format!("{}-{}-{suffix}", &base[..base_length as usize], hash(base))
+}
+
+/// `managedByID` (csi-provisioner.go:507-510); `DNS1035LabelMaxLength` is 63.
+pub fn managed_by_id(node_name: Option<&str>) -> String {
+    match node_name {
+        Some(n) => name_with_max_length("external-provisioner", n, 63),
+        None => "external-provisioner".to_string(),
+    }
+}
+
+/// `topology.NewFixedNodeTopology` input (csi-provisioner.go:495-504): the
+/// single segment of the node's `AccessibleTopology` (possibly empty).
+pub fn fixed_segment(accessible_topology: Option<&HashMap<String, String>>) -> Segment {
+    Segment::from_entries(
+        accessible_topology
+            .into_iter()
+            .flatten()
+            .map(|(k, v)| SegmentEntry {
+                key: k.clone(),
+                value: v.clone(),
+            })
+            .collect(),
+    )
+}
+
+/// `owner.Lookup` (pkg/owner/owner.go:37-100): walk `levels` controlling
+/// owners up from the starting object; `levels == 0` returns the object
+/// itself. Only apiVersion, kind, name and uid are set; controller is true.
+pub async fn lookup_owner<S: Storage>(
+    storage: &S,
+    namespace: &str,
+    name: &str,
+    api_version: &str,
+    kind: &str,
+    levels: i32,
+) -> Result<OwnerReference> {
+    let (mut api_version, mut kind, mut name, mut levels) = (
+        api_version.to_string(),
+        kind.to_string(),
+        name.to_string(),
+        levels,
+    );
+    loop {
+        let resource = match kind.as_str() {
+            "Pod" => "pods",
+            "ReplicaSet" => "replicasets",
+            "ReplicationController" => "replicationcontrollers",
+            "StatefulSet" => "statefulsets",
+            "DaemonSet" => "daemonsets",
+            "Deployment" => "deployments",
+            "Job" => "jobs",
+            "CronJob" => "cronjobs",
+            other => {
+                return Err(Error::Internal(format!(
+                    "look up owner: unsupported kind {other}"
+                )))
+            }
+        };
+        let obj: serde_json::Value = storage
+            .get(&build_key(resource, Some(namespace), &name))
+            .await
+            .map_err(|e| Error::Internal(format!("get object: {e}")))?;
+        let meta = obj.get("metadata");
+        let str_of = |v: Option<&serde_json::Value>, k: &str| {
+            v.and_then(|m| m.get(k))
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        if levels == 0 {
+            let mut o = OwnerReference::new(&api_version, &kind, &name, str_of(meta, "uid"));
+            o.controller = Some(true);
+            return Ok(o);
+        }
+        let controller = meta
+            .and_then(|m| m.get("ownerReferences"))
+            .and_then(|r| r.as_array())
+            .into_iter()
+            .flatten()
+            .find(|o| o.get("controller").and_then(|c| c.as_bool()) == Some(true));
+        let Some(owner) = controller else {
+            return Err(Error::Internal(format!(
+                "{api_version}/{kind} {name:?} in namespace {namespace:?} has no controlling owner, cannot unwind the ownership further"
+            )));
+        };
+        let o_api = str_of(Some(owner), "apiVersion");
+        let o_kind = str_of(Some(owner), "kind");
+        let o_name = str_of(Some(owner), "name");
+        if levels == 1 {
+            let mut o = OwnerReference::new(&o_api, &o_kind, &o_name, str_of(Some(owner), "uid"));
+            o.controller = Some(true);
+            return Ok(o);
+        }
+        (api_version, kind, name, levels) = (o_api, o_kind, o_name, levels - 1);
+    }
+}
+
+/// How the topology is obtained (`topology.Informer`): discovered from
+/// CSINode/Node, or the fixed segment of node-deployment mode.
+#[derive(Clone)]
+pub enum TopologySource {
+    Discovered,
+    Fixed(Segment),
+}
+
+/// One tick of the publisher: `onTopologyChanges` input, then `reconcile`.
+pub async fn capacity_tick<S: Storage, C: CapacityClient>(
+    ctl: &CapacityController<'_, S, C>,
+    topology: &TopologySource,
+) -> Result<()> {
+    let segments = match topology {
+        TopologySource::Fixed(s) => vec![s.clone()],
+        TopologySource::Discovered => {
+            let csi_nodes: Vec<CSINode> = ctl.storage.list(&build_prefix("csinodes", None)).await?;
+            let nodes: Vec<Node> = ctl.storage.list(&build_prefix("nodes", None)).await?;
+            discover_segments(&csi_nodes, &nodes, &ctl.driver_name)
+        }
+    };
+    ctl.reconcile(&segments).await
+}
+
+/// `Controller.Run` (capacity.go:255): `pollCapacities` re-syncs every object
+/// each `poll_interval` (`wait.UntilWithContext`). Deviation: topology and
+/// StorageClass changes are picked up on the next tick rather than from
+/// informer events, and there is one worker (`--csi-capacity-threads` is
+/// accepted for flag parity only).
+pub async fn run_capacity_loop<S: Storage, C: CapacityClient>(
+    ctl: &CapacityController<'_, S, C>,
+    topology: &TopologySource,
+    poll_interval: std::time::Duration,
+) {
+    loop {
+        if let Err(e) = capacity_tick(ctl, topology).await {
+            tracing::error!("CSIStorageCapacity publisher ({}): {e}", ctl.driver_name);
+        }
+        tokio::time::sleep(poll_interval).await;
     }
 }
 
@@ -859,5 +1028,71 @@ mod tests {
         assert_eq!(classes, vec!["late".to_string()]);
         ctl(&st, &cl, true).reconcile(&segs).await.unwrap();
         assert_eq!(list_caps(&st).await.len(), 2);
+    }
+
+    #[test]
+    fn managed_by_id_matches_upstream_naming() {
+        assert_eq!(managed_by_id(None), "external-provisioner");
+        assert_eq!(managed_by_id(Some("node-1")), "external-provisioner-node-1");
+        let long = "n".repeat(80);
+        let id = managed_by_id(Some(&long));
+        assert!(id.len() <= 63, "{id}");
+    }
+
+    #[tokio::test]
+    async fn lookup_owner_walks_controller_chain() {
+        use serde_json::json;
+        let st = MemoryStorage::new();
+        st.create(
+            &build_key("pods", Some(NS), "p"),
+            &json!({"metadata":{"name":"p","uid":"pu","ownerReferences":[
+                {"apiVersion":"apps/v1","kind":"ReplicaSet","name":"rs","uid":"rsu","controller":true}]}}),
+        )
+        .await
+        .unwrap();
+        st.create(
+            &build_key("replicasets", Some(NS), "rs"),
+            &json!({"metadata":{"name":"rs","uid":"rsu","ownerReferences":[
+                {"apiVersion":"apps/v1","kind":"Deployment","name":"d","uid":"du","controller":true}]}}),
+        )
+        .await
+        .unwrap();
+        let o0 = lookup_owner(&st, NS, "p", "v1", "Pod", 0).await.unwrap();
+        assert_eq!((o0.kind.as_str(), o0.uid.as_str()), ("Pod", "pu"));
+        let o1 = lookup_owner(&st, NS, "p", "v1", "Pod", 1).await.unwrap();
+        assert_eq!((o1.kind.as_str(), o1.uid.as_str()), ("ReplicaSet", "rsu"));
+        let o2 = lookup_owner(&st, NS, "p", "v1", "Pod", 2).await.unwrap();
+        assert_eq!((o2.kind.as_str(), o2.uid.as_str()), ("Deployment", "du"));
+        assert_eq!(o2.controller, Some(true));
+        assert!(lookup_owner(&st, NS, "p", "v1", "Pod", 3).await.is_err());
+    }
+
+    #[test]
+    fn fixed_segment_sorts_entries() {
+        let m: HashMap<String, String> = [
+            ("b".to_string(), "2".to_string()),
+            ("a".to_string(), "1".to_string()),
+        ]
+        .into();
+        assert_eq!(fixed_segment(Some(&m)), seg(&[("a", "1"), ("b", "2")]));
+        assert_eq!(fixed_segment(None), Segment::default());
+    }
+
+    #[tokio::test]
+    async fn capacity_tick_discovers_segments_from_csinodes() {
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        put_sc(&st, sc("late-sc", DRIVER, None)).await;
+        let c = ctl(&st, &cl, false);
+        // No CSINodes: no segments, nothing published.
+        capacity_tick(&c, &TopologySource::Discovered)
+            .await
+            .unwrap();
+        assert!(list_caps(&st).await.is_empty());
+        // Fixed topology publishes exactly one object.
+        capacity_tick(&c, &TopologySource::Fixed(seg(&[("zone", "a")])))
+            .await
+            .unwrap();
+        assert_eq!(list_caps(&st).await.len(), 1);
     }
 }
