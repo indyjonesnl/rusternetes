@@ -211,6 +211,7 @@ mod persistentvolumeclaim_generic_store_test;
 mod persistentvolumeclaim_handler_test;
 mod plc_update_validation_test;
 mod pod_affinity_validation_test;
+mod pod_binding_field_validation_test;
 mod pod_binding_target_kind_test;
 mod pod_certificate_request_test;
 mod pod_container_decodes_when_absent_test;
