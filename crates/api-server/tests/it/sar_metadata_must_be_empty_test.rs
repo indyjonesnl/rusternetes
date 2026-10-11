@@ -268,3 +268,51 @@ async fn a_protobuf_review_with_go_zero_scalars_is_accepted() {
     let text = String::from_utf8_lossy(&bytes);
     assert!(status.is_success(), "{status} {text}");
 }
+
+/// Upstream's generic create handler answers `http.StatusCreated` for every
+/// create, including the virtual review kinds
+/// (`staging/src/k8s.io/apiserver/pkg/endpoints/handlers/create.go:227`,
+/// `code := http.StatusCreated`; `subjectaccessreview.REST.Create` returns a
+/// plain object, not a `metav1.Status`). #2930.
+#[tokio::test]
+async fn review_creates_answer_201_created() {
+    let api = TestApiServer::new();
+    let cases = [
+        (
+            SAR,
+            json!({"apiVersion":"authorization.k8s.io/v1","kind":"SubjectAccessReview",
+                "spec":{"user":"alice","resourceAttributes":resource_attributes("default")}}),
+        ),
+        (
+            SSAR,
+            json!({"apiVersion":"authorization.k8s.io/v1","kind":"SelfSubjectAccessReview",
+                "spec":{"resourceAttributes":resource_attributes("default")}}),
+        ),
+        (
+            LSAR,
+            json!({"apiVersion":"authorization.k8s.io/v1","kind":"LocalSubjectAccessReview",
+                "metadata":{"namespace":"default"},
+                "spec":{"user":"alice","resourceAttributes":resource_attributes("default")}}),
+        ),
+        (
+            "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews",
+            json!({"apiVersion":"authorization.k8s.io/v1","kind":"SelfSubjectRulesReview",
+                "spec":{"namespace":"default"}}),
+        ),
+        (
+            "/apis/authentication.k8s.io/v1/tokenreviews",
+            json!({"apiVersion":"authentication.k8s.io/v1","kind":"TokenReview",
+                "spec":{"token":"not-a-token"}}),
+        ),
+        (
+            "/apis/authentication.k8s.io/v1/selfsubjectreviews",
+            json!({"apiVersion":"authentication.k8s.io/v1","kind":"SelfSubjectReview"}),
+        ),
+    ];
+    for (path, body) in cases {
+        let (status, resp) = api
+            .send("POST", path, Some("application/json"), Some(&body))
+            .await;
+        assert_eq!(status.as_u16(), 201, "{path}: {status} {resp}");
+    }
+}

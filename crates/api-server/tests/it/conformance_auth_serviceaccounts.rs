@@ -1327,7 +1327,7 @@ async fn subject_access_review_non_resource_url_returns_allowed() {
         &sar,
     )
     .await;
-    assert_eq!(status, 200, "SAR non-resource must return 200: {body}");
+    assert_eq!(status, 201, "SAR non-resource must return 200: {body}");
     assert!(
         body["status"]["allowed"].is_boolean(),
         "status.allowed must be a boolean: {body}"
@@ -1384,8 +1384,8 @@ async fn self_subject_review_reflects_the_impersonated_identity() {
     .await;
 
     assert_eq!(
-        status, 200,
-        "impersonated SelfSubjectReview must return 200: {body}"
+        status, 201,
+        "impersonated SelfSubjectReview must return 201: {body}"
     );
 
     // The effective (impersonated) identity must be reflected back.
@@ -1460,7 +1460,7 @@ async fn impersonation_applies_groups_uid_and_extra() {
     )
     .await;
 
-    assert_eq!(status, 200, "impersonated review must return 200: {body}");
+    assert_eq!(status, 201, "impersonated review must return 200: {body}");
     assert_eq!(body["status"]["userInfo"]["username"], impersonated_user);
     assert_eq!(
         body["status"]["userInfo"]["uid"], "abc-123-uid",
@@ -1575,7 +1575,7 @@ async fn token_request_audience_is_reflected_in_token_review() {
         &review,
     )
     .await;
-    assert_eq!(status, 200, "TokenReview must return 200: {review_body}");
+    assert_eq!(status, 201, "TokenReview must return 200: {review_body}");
     assert_eq!(
         review_body["status"]["authenticated"], true,
         "Token must authenticate: {review_body}"

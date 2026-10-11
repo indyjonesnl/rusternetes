@@ -23,7 +23,11 @@ pub async fn create_token_review(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     DumpingJson(mut token_review): DumpingJson<TokenReview>,
-) -> Result<(axum::http::HeaderMap, Json<TokenReview>)> {
+) -> Result<(
+    axum::http::StatusCode,
+    axum::http::HeaderMap,
+    Json<TokenReview>,
+)> {
     info!("Creating token review");
 
     // Check authorization - creating a TokenReview requires impersonation privileges
@@ -152,7 +156,7 @@ pub async fn create_token_review(
     crate::audit::add_audit_annotations(&observations.audit_annotations);
     let mut headers = axum::http::HeaderMap::new();
     observations.append_warning_headers(&mut headers);
-    Ok((headers, Json(token_review)))
+    Ok((axum::http::StatusCode::CREATED, headers, Json(token_review)))
 }
 
 /// Create a TokenRequest (authentication.k8s.io/v1)
@@ -405,7 +409,7 @@ pub async fn create_self_subject_review(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     DumpingJson(mut self_subject_review): DumpingJson<SelfSubjectReview>,
-) -> Result<Json<SelfSubjectReview>> {
+) -> Result<(axum::http::StatusCode, Json<SelfSubjectReview>)> {
     info!("Creating self subject review for user: {:?}", auth_ctx.user);
 
     // Check authorization - creating a SelfSubjectReview is always allowed
@@ -426,7 +430,7 @@ pub async fn create_self_subject_review(
         }),
     });
 
-    Ok(Json(self_subject_review))
+    Ok((axum::http::StatusCode::CREATED, Json(self_subject_review)))
 }
 
 #[cfg(test)]

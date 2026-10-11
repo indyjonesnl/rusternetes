@@ -198,7 +198,7 @@ async fn mtls_client_cert_resolves_user_anonymous_and_token() {
         .build()
         .unwrap();
     let (status, ui) = self_subject_review(&anon_client, &base, None).await;
-    assert_eq!(status, 200, "anonymous SSR status; userInfo={ui:?}");
+    assert_eq!(status, 201, "anonymous SSR status; userInfo={ui:?}");
     assert_eq!(
         ui.get("username").and_then(Value::as_str),
         Some("system:anonymous"),
@@ -215,7 +215,7 @@ async fn mtls_client_cert_resolves_user_anonymous_and_token() {
         .build()
         .unwrap();
     let (status, ui) = self_subject_review(&cert_client, &base, None).await;
-    assert_eq!(status, 200, "cert SSR status; userInfo={ui:?}");
+    assert_eq!(status, 201, "cert SSR status; userInfo={ui:?}");
     assert_eq!(
         ui.get("username").and_then(Value::as_str),
         Some("test-user"),
@@ -249,7 +249,7 @@ async fn mtls_client_cert_resolves_user_anonymous_and_token() {
         .build()
         .unwrap();
     let (status, ui) = self_subject_review(&token_client, &base, Some(&token)).await;
-    assert_eq!(status, 200, "token SSR status; userInfo={ui:?}");
+    assert_eq!(status, 201, "token SSR status; userInfo={ui:?}");
     assert_eq!(
         ui.get("username").and_then(Value::as_str),
         Some("system:serviceaccount:kube-system:probe-sa"),

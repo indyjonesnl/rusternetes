@@ -369,7 +369,7 @@ async fn service_account_token_request_then_token_review_authenticates() {
         }),
     )
     .await;
-    assert_eq!(status, 200, "TokenReview must succeed: {review_body}");
+    assert_eq!(status, 201, "TokenReview must succeed: {review_body}");
     assert_eq!(
         review_body["status"]["authenticated"], true,
         "TokenReview must authenticate the freshly-minted SA token: {review_body}"
@@ -437,7 +437,7 @@ async fn token_review_user_info_matches_upstream_serviceaccount_userinfo() {
         }),
     )
     .await;
-    assert_eq!(status, 200, "TokenReview must succeed: {review_body}");
+    assert_eq!(status, 201, "TokenReview must succeed: {review_body}");
 
     // MakeUsername(namespace, name) = "system:serviceaccount:" + ns + ":" + name.
     assert_eq!(
@@ -606,7 +606,7 @@ async fn token_request_with_bound_pod_ref_includes_pod_and_node_extras() {
         }),
     )
     .await;
-    assert_eq!(status, 200, "TokenReview must succeed: {review_body}");
+    assert_eq!(status, 201, "TokenReview must succeed: {review_body}");
 
     // 1 + 2
     assert_eq!(review_body["status"]["authenticated"], true);
@@ -685,7 +685,7 @@ async fn token_review_rejects_invalid_token() {
         &review,
     )
     .await;
-    assert_eq!(status, 200, "TokenReview must always return 200: {body}");
+    assert_eq!(status, 201, "TokenReview must always return 200: {body}");
     assert_eq!(
         body["status"]["authenticated"], false,
         "invalid token must NOT authenticate: {body}"
@@ -722,7 +722,7 @@ async fn self_subject_review_returns_calling_user_info() {
         &req,
     )
     .await;
-    assert_eq!(status, 200, "SelfSubjectReview must succeed: {body}");
+    assert_eq!(status, 201, "SelfSubjectReview must succeed: {body}");
     let username = body["status"]["userInfo"]["username"]
         .as_str()
         .expect("userInfo.username");
@@ -871,7 +871,7 @@ async fn subject_access_review_agrees_with_the_impersonated_request() {
             }),
         )
         .await;
-        assert_eq!(s, 200, "SAR must succeed: {sar}");
+        assert_eq!(s, 201, "SAR must succeed: {sar}");
         let sar_allowed = sar["status"]["allowed"]
             .as_bool()
             .unwrap_or_else(|| panic!("status.allowed must be a boolean: {sar}"));
@@ -920,7 +920,7 @@ async fn subject_access_review_agrees_with_the_impersonated_request() {
             }),
         )
         .await;
-        assert_eq!(s, 200, "LSAR must succeed: {lsar}");
+        assert_eq!(s, 201, "LSAR must succeed: {lsar}");
         let lsar_allowed = lsar["status"]["allowed"]
             .as_bool()
             .unwrap_or_else(|| panic!("status.allowed must be a boolean: {lsar}"));
@@ -962,7 +962,7 @@ async fn self_subject_access_review_returns_decision() {
         &ssar,
     )
     .await;
-    assert_eq!(status, 200, "SSAR must succeed: {body}");
+    assert_eq!(status, 201, "SSAR must succeed: {body}");
     assert_eq!(
         body["status"]["allowed"], true,
         "AlwaysAllow must permit: {body}"
@@ -992,7 +992,7 @@ async fn self_subject_rules_review_returns_rule_arrays() {
         &ssrr,
     )
     .await;
-    assert_eq!(status, 200, "SSRR must succeed: {body}");
+    assert_eq!(status, 201, "SSRR must succeed: {body}");
     assert!(
         body["status"]["resourceRules"].is_array(),
         "resourceRules must be an array: {body}"
