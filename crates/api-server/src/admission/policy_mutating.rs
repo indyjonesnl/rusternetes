@@ -166,8 +166,55 @@ pub struct MutatingEvaluator {
 }
 
 /// compilation.go `compilePolicy` (:34-81).
-pub fn compile_policy(_policy: &MutatingAdmissionPolicy) -> MutatingEvaluator {
-    MutatingEvaluator::default()
+///
+/// Builds one patcher per mutation, in order. A mutation whose payload is
+/// absent (or whose `patchType` is neither supported value) is skipped, as
+/// upstream's `switch` does (:57-72); the dispatcher then reports the count
+/// mismatch. `spec.variables` are composited into every patcher
+/// (`CompileAndStoreVariables`, :44).
+///
+/// Not yet ported (tracked in #3113): the `matchConditions` matcher
+/// (:47-54, `matchconditions.NewMatcher`), so `matcher` is always `None`.
+pub fn compile_policy(policy: &MutatingAdmissionPolicy) -> MutatingEvaluator {
+    use super::policy_apply_config::ApplyConfigPatcher;
+    use super::policy_json_patch::JsonPatcher;
+    use rusternetes_common::resources::mutating_admission_policy::PatchType;
+
+    let Some(spec) = policy.spec.as_ref() else {
+        return MutatingEvaluator::default();
+    };
+    let variables: Vec<(String, String)> = spec
+        .variables
+        .iter()
+        .flatten()
+        .map(|v| (v.name.clone(), v.expression.clone()))
+        .collect();
+    let mut mutators: Vec<Option<Arc<dyn Patcher>>> = Vec::new();
+    for m in spec.mutations.iter().flatten() {
+        match m.patch_type {
+            Some(PatchType::JsonPatch) => {
+                if let Some(j) = &m.json_patch {
+                    mutators.push(Some(JsonPatcher::new_patcher_with_variables(
+                        &j.expression,
+                        &variables,
+                    )));
+                }
+            }
+            Some(PatchType::ApplyConfiguration) => {
+                if let Some(a) = &m.apply_configuration {
+                    mutators.push(Some(ApplyConfigPatcher::new_patcher_with_variables(
+                        &a.expression,
+                        &variables,
+                    )));
+                }
+            }
+            _ => {}
+        }
+    }
+    MutatingEvaluator {
+        matcher: None,
+        mutators,
+    }
 }
 
 /// `patch.TypeConverterManager.GetTypeConverter != nil`.
