@@ -163,6 +163,31 @@ struct Args {
     #[arg(long, default_value = "60s", value_parser = parse_clean_up_period)]
     csi_node_deployment_max_delay: std::time::Duration,
 
+    /// `--enable-capacity` of external-provisioner (csi-provisioner.go:101):
+    /// publish CSIStorageCapacity objects from the driver's GetCapacity for
+    /// every `--csi-provisioner`. Needs the `NAMESPACE` environment variable
+    /// (and `POD_NAME` unless the ownerref level is negative).
+    #[arg(long)]
+    csi_enable_capacity: bool,
+
+    /// `--capacity-for-immediate-binding` (csi-provisioner.go:102).
+    #[arg(long)]
+    csi_capacity_for_immediate_binding: bool,
+
+    /// `--capacity-poll-interval` (csi-provisioner.go:103, default 1m).
+    #[arg(long, default_value = "1m", value_parser = parse_clean_up_period)]
+    csi_capacity_poll_interval: std::time::Duration,
+
+    /// `--capacity-ownerref-level` (csi-provisioner.go:104, default 1): -1 no
+    /// owner, 0 the pod itself, 1 its StatefulSet/DaemonSet, 2 a Deployment.
+    #[arg(long, default_value_t = 1, allow_hyphen_values = true)]
+    csi_capacity_ownerref_level: i32,
+
+    /// `--capacity-threads` (csi-provisioner.go:88, default 1). Accepted for
+    /// flag parity; the publisher is one level-triggered pass per poll.
+    #[arg(long, default_value_t = 1)]
+    csi_capacity_threads: u32,
+
     /// Storage backend: "etcd" or "sqlite"
     #[arg(long, default_value = "etcd")]
     storage_backend: String,
@@ -893,6 +918,7 @@ async fn main() -> Result<()> {
             driver,
             rusternetes_csi::controller_client::CsiControllerClient::with_endpoint(socket),
         );
+        let capacity_node_deployment = node_deployment.clone();
         if let Some(nd) = node_deployment {
             provisioner = provisioner.with_node_deployment(nd);
         }
@@ -911,6 +937,75 @@ async fn main() -> Result<()> {
                 .with_strict_topology(args.csi_strict_topology)
                 .with_immediate_topology(args.csi_immediate_topology),
         );
+        if args.csi_enable_capacity {
+            // csi-provisioner.go:464-486: NAMESPACE required; POD_NAME unless level < 0.
+            let namespace = std::env::var("NAMESPACE").unwrap_or_default();
+            if namespace.is_empty() {
+                anyhow::bail!("need NAMESPACE env variable for CSIStorageCapacity objects");
+            }
+            let owner = if args.csi_capacity_ownerref_level >= 0 {
+                let pod_name = std::env::var("POD_NAME").unwrap_or_default();
+                if pod_name.is_empty() {
+                    anyhow::bail!(
+                        "need POD_NAME env variable to determine CSIStorageCapacity owner"
+                    );
+                }
+                Some(
+                    controllers::csi_capacity::lookup_owner(
+                        &*storage,
+                        &namespace,
+                        &pod_name,
+                        "v1",
+                        "Pod",
+                        args.csi_capacity_ownerref_level,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("look up owner(s) of pod: {e}"))?,
+                )
+            } else {
+                None
+            };
+            let (topology, node) = match &capacity_node_deployment {
+                Some(nd) => (
+                    controllers::csi_capacity::TopologySource::Fixed(
+                        controllers::csi_capacity::fixed_segment(nd.accessible_topology.as_ref()),
+                    ),
+                    Some(nd.node_name.clone()),
+                ),
+                None => (controllers::csi_capacity::TopologySource::Discovered, None),
+            };
+            let managed_by_id = controllers::csi_capacity::managed_by_id(node.as_deref());
+            let immediate_binding = args.csi_capacity_for_immediate_binding;
+            let poll = args.csi_capacity_poll_interval;
+            let cap_storage = storage.clone();
+            let cap_driver = driver.to_string();
+            let cap_socket = socket.to_string();
+            spawn_controller!("CSI capacity publisher", leader_elector, {
+                let storage = cap_storage.clone();
+                let driver = cap_driver.clone();
+                let socket = cap_socket.clone();
+                let owner = owner.clone();
+                let managed_by_id = managed_by_id.clone();
+                let namespace = namespace.clone();
+                let topology = topology.clone();
+                async move {
+                    let client =
+                        rusternetes_csi::controller_client::CsiControllerClient::with_endpoint(
+                            socket,
+                        );
+                    let ctl = controllers::csi_capacity::CapacityController {
+                        storage: &*storage,
+                        client: &client,
+                        driver_name: driver,
+                        owner,
+                        managed_by_id,
+                        owner_namespace: namespace,
+                        immediate_binding,
+                    };
+                    controllers::csi_capacity::run_capacity_loop(&ctl, &topology, poll).await;
+                }
+            });
+        }
         spawn_controller!("CSI provisioner", leader_elector, {
             let controller = provisioner.clone();
             async move {
@@ -1461,5 +1556,40 @@ mod feature_gates_flag_tests {
         .unwrap();
         assert!(enabled(Feature::CrossNamespaceVolumeDataSource));
         reset_to_defaults();
+    }
+}
+
+#[cfg(test)]
+mod csi_capacity_flag_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// external-provisioner v6.4.0 csi-provisioner.go:88,101-104 defaults.
+    #[test]
+    fn capacity_flag_defaults_match_upstream() {
+        let args = Args::try_parse_from(["controller-manager"]).unwrap();
+        assert!(!args.csi_enable_capacity);
+        assert!(!args.csi_capacity_for_immediate_binding);
+        assert_eq!(args.csi_capacity_poll_interval, Duration::from_secs(60));
+        assert_eq!(args.csi_capacity_ownerref_level, 1);
+        assert_eq!(args.csi_capacity_threads, 1);
+    }
+
+    #[test]
+    fn capacity_flags_parse() {
+        let args = Args::try_parse_from([
+            "controller-manager",
+            "--csi-enable-capacity",
+            "--csi-capacity-for-immediate-binding",
+            "--csi-capacity-poll-interval=5s",
+            "--csi-capacity-ownerref-level=-1",
+            "--csi-capacity-threads=3",
+        ])
+        .unwrap();
+        assert!(args.csi_enable_capacity);
+        assert!(args.csi_capacity_for_immediate_binding);
+        assert_eq!(args.csi_capacity_poll_interval, Duration::from_secs(5));
+        assert_eq!(args.csi_capacity_ownerref_level, -1);
+        assert_eq!(args.csi_capacity_threads, 3);
     }
 }
