@@ -10,7 +10,7 @@ use rusternetes_api_server::authorization_webhook::{
     Backoff, FailurePolicy, WebhookAuthorizer, WebhookClientConfig,
 };
 use rusternetes_common::auth::UserInfo;
-use rusternetes_common::authz::RequestAttributes;
+use rusternetes_common::authz::{Authorizer, RequestAttributes};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,8 +20,10 @@ async fn review(State(code): State<Arc<u16>>, Json(body): Json<Value>) -> axum::
     if *code != 200 {
         return (StatusCode::from_u16(*code).unwrap(), "err").into_response();
     }
-    Json(json!({"apiVersion": body["apiVersion"], "kind": "SubjectAccessReview",
-        "status": {"allowed": true}}))
+    Json(
+        json!({"apiVersion": body["apiVersion"], "kind": "SubjectAccessReview",
+        "status": {"allowed": true}}),
+    )
     .into_response()
 }
 
@@ -82,20 +84,21 @@ fn attrs() -> RequestAttributes {
 /// labels include `labels`.
 fn sample(metric: &str, labels: &[(&str, &str)]) -> u64 {
     for f in prometheus::gather() {
-        if f.get_name() != metric {
+        if f.name() != metric {
             continue;
         }
         for m in f.get_metric() {
             let l: Vec<_> = m
                 .get_label()
                 .iter()
-                .map(|p| (p.get_name(), p.get_value()))
+                .map(|p| (p.name(), p.value()))
                 .collect();
             if labels.iter().all(|x| l.contains(x)) {
-                return if m.has_histogram() {
-                    m.get_histogram().get_sample_count()
+                let h = m.get_histogram().get_sample_count();
+                return if h > 0 {
+                    h
                 } else {
-                    m.get_counter().get_value() as u64
+                    m.get_counter().value() as u64
                 };
             }
         }

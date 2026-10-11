@@ -13,7 +13,8 @@
 //!   :142-160, `ToAuthorizationConfiguration` :270-290).
 //!
 //! `matchConditions` live in `authorization_match_conditions.rs` (#3161; legacy
-//! flags never set any). The webhook metrics are not ported. Selector attributes
+//! flags never set any). The webhook metrics live in
+//! `authorization_webhook_metrics.rs` (#3165). Selector attributes
 //! (`AuthorizeWithSelectors`) are ported: webhook.go:312-402.
 
 use async_trait::async_trait;
@@ -577,6 +578,14 @@ impl ExpireCache {
 struct CallError {
     message: String,
     retry: bool,
+    /// `metricsResult` (webhook.go:240-249): "timeout" or "error".
+    result: &'static str,
+}
+
+/// The failure of a whole backoff run: the last attempt's message and result.
+struct BackoffError {
+    message: String,
+    result: &'static str,
 }
 
 pub struct WebhookAuthorizer {
@@ -589,6 +598,9 @@ pub struct WebhookAuthorizer {
     retry_backoff: Backoff,
     failure_policy: FailurePolicy,
     match_conditions: Option<crate::authorization_match_conditions::CelMatcher>,
+    /// `AuthorizerConfiguration.name`, the metrics label (legacy flags use
+    /// `defaultWebhookName`, options/authorization.go:41).
+    name: String,
 }
 
 impl WebhookAuthorizer {
@@ -619,7 +631,14 @@ impl WebhookAuthorizer {
             retry_backoff,
             failure_policy,
             match_conditions: None,
+            name: "default".to_string(),
         })
+    }
+
+    /// The authorizer's configured name (`New`'s `name`, webhook.go:108).
+    pub fn with_name(mut self, name: &str) -> Self {
+        self.name = name.to_string();
+        self
     }
 
     /// Compile and install `matchConditions` (`newWithBackoff`, webhook.go:118-127).
@@ -629,7 +648,8 @@ impl WebhookAuthorizer {
     ) -> anyhow::Result<Self> {
         self.match_conditions =
             crate::authorization_match_conditions::CelMatcher::compile(conditions)
-                .map_err(|errs| anyhow::anyhow!(errs.join("; ")))?;
+                .map_err(|errs| anyhow::anyhow!(errs.join("; ")))?
+                .map(|m| m.with_metrics("Webhook", &self.name));
         Ok(self)
     }
 
@@ -662,7 +682,24 @@ impl WebhookAuthorizer {
     }
 
     /// One attempt: POST the review, read the status.
+    /// Times the attempt and records `RecordWebhookEvaluation` /
+    /// `RecordWebhookDuration` (webhook.go:236-254).
     async fn call(&self, spec: &SarSpec) -> std::result::Result<SarStatus, CallError> {
+        let start = Instant::now();
+        let out = self.call_once(spec).await;
+        let result = match &out {
+            Ok(_) => "success",
+            Err(e) => e.result,
+        };
+        crate::authorization_webhook_metrics::record_webhook_round_trip(
+            &self.name,
+            result,
+            start.elapsed(),
+        );
+        out
+    }
+
+    async fn call_once(&self, spec: &SarSpec) -> std::result::Result<SarStatus, CallError> {
         let body = SarRequest {
             api_version: self.version.api_version(),
             kind: "SubjectAccessReview",
@@ -681,6 +718,7 @@ impl WebhookAuthorizer {
         }
         let resp = req.send().await.map_err(|e| CallError {
             retry: is_connection_reset(&e),
+            result: if e.is_timeout() { "timeout" } else { "error" },
             message: e.to_string(),
         })?;
         let status = resp.status();
@@ -697,11 +735,18 @@ impl WebhookAuthorizer {
             return Err(CallError {
                 message: format!("webhook returned HTTP {status}"),
                 retry,
+                // `statusCode == http.StatusGatewayTimeout` / apierrors.IsTimeout.
+                result: if matches!(status.as_u16(), 504 | 408) {
+                    "timeout"
+                } else {
+                    "error"
+                },
             });
         }
         let parsed: SarResponse = resp.json().await.map_err(|e| CallError {
             message: format!("decoding webhook response: {e}"),
             retry: false,
+            result: if e.is_timeout() { "timeout" } else { "error" },
         })?;
         Ok(parsed.status)
     }
@@ -709,15 +754,25 @@ impl WebhookAuthorizer {
     /// `webhook.WithExponentialBackoff` (util/webhook/webhook.go:105-135) over
     /// `wait.ExponentialBackoffWithContext`: at most `steps` attempts, sleeping
     /// between them; a non-retriable error ends it at once.
-    async fn call_with_backoff(&self, spec: &SarSpec) -> std::result::Result<SarStatus, String> {
+    async fn call_with_backoff(
+        &self,
+        spec: &SarSpec,
+    ) -> std::result::Result<SarStatus, BackoffError> {
         let mut backoff = self.retry_backoff.clone();
-        let mut last = String::new();
+        let mut last = BackoffError {
+            message: String::new(),
+            result: "error",
+        };
         while backoff.steps > 0 {
             match self.call(spec).await {
                 Ok(s) => return Ok(s),
                 Err(e) => {
-                    last = e.message;
-                    if !e.retry {
+                    last = BackoffError {
+                        message: e.message,
+                        result: e.result,
+                    };
+                    let retry = e.retry;
+                    if !retry {
                         return Err(last);
                     }
                 }
@@ -916,8 +971,15 @@ impl Authorizer for WebhookAuthorizer {
             let status = match self.call_with_backoff(&spec).await {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::error!("Failed to make webhook authorizer request: {e}");
-                    return Ok(self.decision_on_error(e));
+                    tracing::error!("Failed to make webhook authorizer request: {}", e.message);
+                    // webhook.go:262-266: the parent context is never cancelled
+                    // here, so NoOpinion always counts as a fail open.
+                    if matches!(self.failure_policy, FailurePolicy::NoOpinion) {
+                        crate::authorization_webhook_metrics::record_webhook_fail_open(
+                            &self.name, e.result,
+                        );
+                    }
+                    return Ok(self.decision_on_error(e.message));
                 }
             };
             if should_cache(attrs) {
