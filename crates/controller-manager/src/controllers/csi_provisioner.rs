@@ -164,9 +164,12 @@ pub struct NodeDeployment {
     /// `NodeName`.
     pub node_name: String,
     /// `ImmediateBinding` (`--node-deployment-immediate-binding`).
-    /// Read by `becomeOwner`, not ported yet (#3140).
-    #[allow(dead_code)]
     pub immediate_binding: bool,
+    /// `BaseDelay` (`--node-deployment-base-delay`, default 20s): the
+    /// initial wait before trying to own an immediate-binding claim.
+    pub base_delay: Duration,
+    /// `MaxDelay` (`--node-deployment-max-delay`, default 60s).
+    pub max_delay: Duration,
     /// `NodeInfo.AccessibleTopology.Segments`; `None` = the driver reported
     /// no topology.
     pub accessible_topology: Option<HashMap<String, String>>,
