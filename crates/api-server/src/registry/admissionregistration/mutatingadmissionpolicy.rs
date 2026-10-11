@@ -107,7 +107,7 @@ fn compile_errors(obj: &MutatingAdmissionPolicy, ignore_match_conditions: bool) 
                     .child("matchConditions")
                     .index(i)
                     .child("expression");
-                errs.extend(compile_error(expression, &env, ExpectedOutput::Any, &path));
+                errs.extend(compile_error(expression, &env, ExpectedOutput::Bool, &path));
             }
         }
     }

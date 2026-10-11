@@ -6,13 +6,16 @@
 //! :778-820. Selector attributes are not carried by `RequestAttributes`, so
 //! `fieldSelector` / `labelSelector` are never populated.
 //!
-//! Deliberate deviation: upstream compiles against a typed CEL environment and
-//! rejects non-bool expressions at compile time (`compile.go` :95-110);
-//! Rusternetes' CEL has no typed environment (see
-//! `rusternetes_common::cel::compile_failure`), so a non-bool result is
-//! reported at evaluation time, which `Eval` already treats as an error.
+//! Upstream compiles against a typed CEL environment. Rusternetes' CEL has no
+//! typed environment (see `rusternetes_common::cel::compile_failure`), so the
+//! compile-time output-type check (`compile.go` :189-203, `ReturnTypes` is
+//! `[bool]`) covers only the expression shapes whose type is known without
+//! inference (`rusternetes_common::cel_env::output_type_failure`); any other
+//! non-bool result is still reported at evaluation, which `Eval` treats as an
+//! error.
 
 use rusternetes_common::cel::{compile_failure, CELContext, CELEvaluator};
+use rusternetes_common::cel_env::{output_type_failure, ExpectedOutput};
 use std::collections::HashSet;
 use std::sync::Mutex;
 
@@ -63,7 +66,9 @@ impl CelMatcher {
                 errs.push(format!("{path}: Duplicate value: {:?}", c.expression));
                 continue;
             }
-            if let Some(e) = compile_failure(&c.expression) {
+            if let Some(e) = compile_failure(&c.expression)
+                .or_else(|| output_type_failure(&c.expression, ExpectedOutput::Bool))
+            {
                 errs.push(format!("{path}: Invalid value: {:?}: {e}", c.expression));
                 continue;
             }
