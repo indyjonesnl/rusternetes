@@ -373,6 +373,8 @@ pub struct CriContainerRuntime {
     /// Host resolver file (`--resolv-conf`, upstream default `/etc/resolv.conf`)
     /// used as the base of every pod's DNS config (`dns.go` `ResolverConfig`).
     resolv_conf: String,
+    /// Node name, the `nodeRef` of upstream's DNS `Configurer` (node events).
+    node_name: String,
     /// Node allocatable (`cpu`/`memory`/`ephemeral-storage`/`hugepages-*`),
     /// used to default unset resourceFieldRef LIMITS into downward-API env
     /// (upstream `MergeContainerResourceLimits`). Empty leaves such vars unset.
@@ -400,6 +402,7 @@ impl CriContainerRuntime {
             cluster_dns: Vec::new(),
             cluster_domain: "cluster.local".to_string(),
             resolv_conf: "/etc/resolv.conf".to_string(),
+            node_name: String::new(),
             node_allocatable: std::collections::HashMap::new(),
         })
     }
@@ -481,16 +484,89 @@ impl CriContainerRuntime {
         self
     }
 
-    /// Upstream `Configurer.GetPodDNS`: host resolv.conf base + policy/dnsConfig.
-    fn pod_dns(&self, pod: &Pod) -> anyhow::Result<v1::DnsConfig> {
+    /// Set the node name used as the involved object of node-scoped DNS events.
+    #[must_use]
+    pub fn with_node_name(mut self, name: &str) -> Self {
+        self.node_name = name.to_string();
+        self
+    }
+
+    /// Upstream `Configurer.GetPodDNS`: host resolv.conf base + policy/dnsConfig,
+    /// recording the `MissingClusterDNS` / `DNSConfigForming` events it raises.
+    async fn pod_dns(&self, pod: &Pod) -> anyhow::Result<v1::DnsConfig> {
         let host = translate::read_host_dns_config(&self.resolv_conf)
             .map_err(|e| anyhow::anyhow!("reading {}: {e}", self.resolv_conf))?;
-        Ok(translate::get_pod_dns(
+        let (dns, events) = translate::get_pod_dns_with_events(
             pod,
             &self.cluster_dns,
             &self.cluster_domain,
             &host,
-        ))
+            &self.resolv_conf,
+            &[],
+        );
+        for ev in events {
+            match ev.target {
+                translate::DnsEventTarget::Pod => {
+                    self.emit_event(
+                        pod,
+                        None,
+                        ev.reason,
+                        rusternetes_common::resources::EventType::Warning,
+                        &ev.message,
+                    )
+                    .await
+                }
+                translate::DnsEventTarget::Node => {
+                    self.emit_node_event(ev.reason, &ev.message).await
+                }
+            }
+        }
+        Ok(dns)
+    }
+
+    /// Record a Warning event against this node (upstream `Configurer.nodeRef`:
+    /// kind Node, name = uid = node name).
+    async fn emit_node_event(&self, reason: &str, message: &str) {
+        let Some(recorder) = &self.event_recorder else {
+            return;
+        };
+        let involved = rusternetes_common::resources::ObjectReference {
+            kind: Some("Node".to_string()),
+            namespace: None,
+            name: Some(self.node_name.clone()),
+            uid: Some(self.node_name.clone()),
+            api_version: Some("v1".to_string()),
+            resource_version: None,
+            field_path: None,
+        };
+        let source = rusternetes_common::resources::EventSource {
+            component: crate::events::KUBELET_COMPONENT.to_string(),
+            host: Some(self.node_name.clone()).filter(|n| !n.is_empty()),
+        };
+        let _ = recorder
+            .event(
+                &involved,
+                &source,
+                rusternetes_common::resources::EventType::Warning,
+                reason,
+                message,
+            )
+            .await;
+    }
+
+    /// Upstream `kl.dnsConfigurer.CheckLimitsForResolvConf` (`dns.go:178`),
+    /// invoked once at sync-loop start when `--resolv-conf` is non-empty
+    /// (`kubelet.go:2524`).
+    pub async fn check_limits_for_resolv_conf(&self) {
+        if self.resolv_conf.is_empty() {
+            return;
+        }
+        if let Some(msg) =
+            translate::check_limits_for_resolv_conf(&self.resolv_conf, &self.cluster_domain)
+        {
+            tracing::warn!("CheckLimitsForResolvConf: {msg}");
+            self.emit_node_event("CheckLimitsForResolvConf", &msg).await;
+        }
     }
 
     /// Attach a [`VolumeManager`](crate::volumes::VolumeManager) so `start_pod`
@@ -615,7 +691,7 @@ impl CriContainerRuntime {
             .ok_or_else(|| anyhow::anyhow!("no sandbox for pod {}", pod.metadata.name))?;
         let log_dir = self.log_dir_for(pod);
         let mut sandbox_cfg = translate::sandbox_config(pod, &log_dir);
-        sandbox_cfg.dns_config = Some(self.pod_dns(pod)?);
+        sandbox_cfg.dns_config = Some(self.pod_dns(pod).await?);
         let mut cri = self.cri.clone();
         self.create_and_start_container(
             &mut cri,
@@ -1223,7 +1299,7 @@ impl CriContainerRuntime {
         let host_paths = self.create_pod_volumes(pod).await?;
 
         let mut sandbox_cfg = translate::sandbox_config(pod, &log_dir);
-        sandbox_cfg.dns_config = Some(self.pod_dns(pod)?);
+        sandbox_cfg.dns_config = Some(self.pod_dns(pod).await?);
         // Append volume-derived supplemental groups to the sandbox SC too
         // (upstream `generatePodSandboxLinuxConfig` also applies them), so the
         // pod's namespace/group set is consistent across sandbox and containers.

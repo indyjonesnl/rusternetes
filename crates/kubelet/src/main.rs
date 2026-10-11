@@ -157,6 +157,13 @@ struct Args {
     #[arg(long)]
     cluster_dns: Option<String>,
 
+    /// Resolver configuration file used as the basis for the container DNS
+    /// resolution configuration (upstream `--resolv-conf`, default
+    /// `/etc/resolv.conf`). Empty disables the host base: pods get a localhost
+    /// nameserver.
+    #[arg(long, default_value = "/etc/resolv.conf")]
+    resolv_conf: String,
+
     /// Cluster domain suffix
     #[arg(long, default_value = "cluster.local")]
     cluster_domain: String,
@@ -529,6 +536,7 @@ async fn main() -> Result<()> {
             args.allowed_unsafe_sysctls.clone(),
         )
         .await?
+        .with_resolv_conf(&args.resolv_conf)
         .with_pod_manifest_path(args.pod_manifest_path.clone())
         .with_node_status_update_frequency(node_status_update_frequency)
         .with_file_check_frequency(file_check_frequency)
