@@ -327,31 +327,8 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
 
         match current {
             None => {
-                let mut labels = HashMap::new();
-                labels.insert(DRIVER_NAME_LABEL.to_string(), self.driver_name.clone());
-                labels.insert(MANAGED_BY_LABEL.to_string(), self.managed_by_id.clone());
-                // `GenerateName: "csisc-"`; the API server fills the suffix on
-                // the HTTP path, direct storage must do it itself.
-                let suffix = uuid::Uuid::new_v4().simple().to_string();
-                let name = format!("csisc-{}", &suffix[..5]);
-                let mut metadata = ObjectMeta::new(name.clone())
-                    .with_namespace(&self.owner_namespace)
-                    .with_labels(labels);
-                metadata.generate_name = Some("csisc-".to_string());
-                if let Some(owner) = &self.owner {
-                    metadata.owner_references = Some(vec![owner.clone()]);
-                }
-                let obj = CSIStorageCapacity {
-                    type_meta: TypeMeta {
-                        kind: "CSIStorageCapacity".to_string(),
-                        api_version: "storage.k8s.io/v1".to_string(),
-                    },
-                    metadata,
-                    storage_class_name: item.sc.metadata.name.clone(),
-                    capacity: Some(quantity),
-                    maximum_volume_size,
-                    node_topology: Some(item.segment.label_selector()),
-                };
+                let obj = self.new_capacity(item, quantity, maximum_volume_size);
+                let name = obj.metadata.name.clone();
                 self.storage
                     .create(
                         &build_key("csistoragecapacities", Some(&self.owner_namespace), &name),
@@ -390,6 +367,43 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
             }
         }
         Ok(())
+    }
+
+    /// The create path of `syncCapacity` (:621-640): a brand-new object. Kept
+    /// apart from the update path, which must write a clone of the stored
+    /// object (upstream's `capacity.DeepCopy()`, :661) so the PUT carries the
+    /// stored uid / resourceVersion.
+    fn new_capacity(
+        &self,
+        item: &WorkItem<'_>,
+        quantity: String,
+        maximum_volume_size: Option<String>,
+    ) -> CSIStorageCapacity {
+        let mut labels = HashMap::new();
+        labels.insert(DRIVER_NAME_LABEL.to_string(), self.driver_name.clone());
+        labels.insert(MANAGED_BY_LABEL.to_string(), self.managed_by_id.clone());
+        // `GenerateName: "csisc-"`; the API server fills the suffix on
+        // the HTTP path, direct storage must do it itself.
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let name = format!("csisc-{}", &suffix[..5]);
+        let mut metadata = ObjectMeta::new(name.clone())
+            .with_namespace(&self.owner_namespace)
+            .with_labels(labels);
+        metadata.generate_name = Some("csisc-".to_string());
+        if let Some(owner) = &self.owner {
+            metadata.owner_references = Some(vec![owner.clone()]);
+        }
+        CSIStorageCapacity {
+            type_meta: TypeMeta {
+                kind: "CSIStorageCapacity".to_string(),
+                api_version: "storage.k8s.io/v1".to_string(),
+            },
+            metadata,
+            storage_class_name: item.sc.metadata.name.clone(),
+            capacity: Some(quantity),
+            maximum_volume_size,
+            node_topology: Some(item.segment.label_selector()),
+        }
     }
 
     /// `deleteCapacity` (:717-725): NotFound is success.
@@ -691,6 +705,29 @@ mod tests {
         assert_eq!(caps.len(), 1, "update, not a second object");
         assert_eq!(caps[0].metadata.name, first.metadata.name);
         assert_eq!(caps[0].capacity.as_deref(), Some("200"));
+    }
+
+    #[tokio::test]
+    async fn update_keeps_the_stored_identity() {
+        // The API server's Store turns a non-empty metadata.uid on a PUT into
+        // a UID precondition (rest/update.go:188-203): the update must carry
+        // the stored uid and creationTimestamp, as upstream's DeepCopy does.
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        put_sc(&st, sc("late-sc", DRIVER, None)).await;
+        let segs = vec![seg(&[("zone", "a")])];
+        let c = ctl(&st, &cl, false);
+        c.reconcile(&segs).await.unwrap();
+        let before = list_caps(&st).await.remove(0);
+        *cl.capacity.lock().unwrap() = 7;
+        c.reconcile(&segs).await.unwrap();
+        let after = list_caps(&st).await.remove(0);
+        assert_eq!(after.capacity.as_deref(), Some("7"));
+        assert_eq!(after.metadata.uid, before.metadata.uid);
+        assert_eq!(
+            after.metadata.creation_timestamp,
+            before.metadata.creation_timestamp
+        );
     }
 
     #[tokio::test]
