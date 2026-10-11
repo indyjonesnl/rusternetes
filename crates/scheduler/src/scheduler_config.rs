@@ -8,8 +8,8 @@
 //! - `pkg/scheduler/framework/plugins/volumebinding/volume_binding.go:642-653`
 //!   (shape scaled by `MaxNodeScore / MaxCustomPriorityScore`).
 
-use crate::volume_binding::FunctionShapePoint;
-use rusternetes_common::validation::field::{ErrorList, Path};
+use crate::volume_binding::{FunctionShapePoint, MAX_CUSTOM_PRIORITY_SCORE, MAX_NODE_SCORE};
+use rusternetes_common::validation::field::{self, ErrorList, Path};
 use serde::{Deserialize, Serialize};
 
 /// `config.UtilizationShapePoint` (pkg/scheduler/apis/config/types.go).
@@ -30,24 +30,176 @@ pub struct VolumeBindingArgs {
     pub shape: Option<Vec<UtilizationShapePoint>>,
 }
 
+/// `DefaultBindTimeoutSeconds` (v1/defaults.go:193-194).
+const DEFAULT_BIND_TIMEOUT_SECONDS: i64 = 600;
+
 impl VolumeBindingArgs {
     /// `SetDefaults_VolumeBindingArgs` (v1/defaults.go:192-208).
     pub fn set_defaults(&mut self, storage_capacity_scoring: bool) {
-        let _ = storage_capacity_scoring;
-        todo!()
+        if self.bind_timeout_seconds.is_none() {
+            self.bind_timeout_seconds = Some(DEFAULT_BIND_TIMEOUT_SECONDS);
+        }
+        if self.shape.as_ref().is_none_or(|s| s.is_empty()) && storage_capacity_scoring {
+            self.shape = Some(vec![
+                UtilizationShapePoint {
+                    utilization: 0,
+                    score: MAX_CUSTOM_PRIORITY_SCORE as i32,
+                },
+                UtilizationShapePoint {
+                    utilization: 100,
+                    score: 0,
+                },
+            ]);
+        }
     }
 
     /// `ValidateVolumeBindingArgsWithOptions` (validation_pluginargs.go:274-290).
     pub fn validate(&self, path: &Path, allow_storage_capacity_scoring: bool) -> ErrorList {
-        let _ = (path, allow_storage_capacity_scoring);
-        todo!()
+        let mut errs = ErrorList::new();
+        let timeout = self.bind_timeout_seconds.unwrap_or(0);
+        if timeout < 0 {
+            errs.push(field::Error::invalid(
+                &path.child("bindTimeoutSeconds"),
+                timeout,
+                "invalid BindTimeoutSeconds, should not be a negative value",
+            ));
+        }
+        if allow_storage_capacity_scoring {
+            errs.extend(validate_function_shape(
+                self.shape.as_deref().unwrap_or(&[]),
+                &path.child("shape"),
+            ));
+        } else if let Some(shape) = &self.shape {
+            // When the feature is off, return an error if the config is not nil.
+            // This prevents unexpected configuration from taking effect when the
+            // feature turns on in the future.
+            errs.push(field::Error::invalid(
+                &path.child("shape"),
+                field::BadValue::marshal(shape),
+                "unexpected field `shape`, remove it or turn on the feature gate StorageCapacityScoring",
+            ));
+        }
+        errs
     }
 
     /// volume_binding.go:642-653: the scorer shape, each score scaled by
     /// `MaxNodeScore / MaxCustomPriorityScore`.
     pub fn scorer_shape(&self) -> Vec<FunctionShapePoint> {
-        todo!()
+        self.shape
+            .iter()
+            .flatten()
+            .map(|p| FunctionShapePoint {
+                utilization: p.utilization as i64,
+                score: p.score as i64 * (MAX_NODE_SCORE / MAX_CUSTOM_PRIORITY_SCORE),
+            })
+            .collect()
     }
+}
+
+/// The slice of `KubeSchedulerConfiguration` the scheduler reads
+/// (`profiles[].pluginConfig[]`, pkg/scheduler/apis/config/types.go).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KubeSchedulerConfiguration {
+    #[serde(default)]
+    profiles: Vec<Profile>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Profile {
+    #[serde(default)]
+    plugin_config: Vec<PluginConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PluginConfig {
+    name: String,
+    #[serde(default)]
+    args: Option<serde_yaml::Value>,
+}
+
+/// Extract, default and validate the `VolumeBinding` plugin args from a
+/// `KubeSchedulerConfiguration` document (YAML or JSON). `Ok(defaults)` when the
+/// document has no `VolumeBinding` pluginConfig. `Err` carries the aggregated
+/// validation errors, mirroring `ValidateVolumeBindingArgs` run per profile
+/// (validation.go ValidateKubeSchedulerConfiguration; only the first profile is
+/// consulted because Rusternetes runs a single `default-scheduler` profile).
+pub fn volume_binding_args_from_config(
+    doc: &str,
+    storage_capacity_scoring: bool,
+) -> Result<VolumeBindingArgs, String> {
+    let cfg: KubeSchedulerConfiguration =
+        serde_yaml::from_str(doc).map_err(|e| format!("invalid scheduler config: {e}"))?;
+    let mut args = VolumeBindingArgs::default();
+    let mut path = Path::new("profiles").index(0);
+    if let Some(profile) = cfg.profiles.first() {
+        for (i, pc) in profile.plugin_config.iter().enumerate() {
+            if pc.name == "VolumeBinding" {
+                path = path.child("pluginConfig").index(i).child("args");
+                if let Some(v) = &pc.args {
+                    args = serde_yaml::from_value(v.clone())
+                        .map_err(|e| format!("{path}: invalid VolumeBindingArgs: {e}"))?;
+                }
+                break;
+            }
+        }
+    }
+    args.set_defaults(storage_capacity_scoring);
+    let errs = args.validate(&path, storage_capacity_scoring);
+    if errs.is_empty() {
+        Ok(args)
+    } else {
+        Err(errs
+            .iter()
+            .map(|e| format!("{}: {}", e.field, e.error_body()))
+            .collect::<Vec<_>>()
+            .join(", "))
+    }
+}
+
+/// `validateFunctionShape` (validation_pluginargs.go:176-211).
+fn validate_function_shape(shape: &[UtilizationShapePoint], path: &Path) -> ErrorList {
+    const MIN_UTILIZATION: i32 = 0;
+    const MAX_UTILIZATION: i32 = 100;
+    const MIN_SCORE: i32 = 0;
+    const MAX_SCORE: i32 = MAX_CUSTOM_PRIORITY_SCORE as i32;
+
+    let mut errs = ErrorList::new();
+    if shape.is_empty() {
+        errs.push(field::Error::required(
+            path,
+            "at least one point must be specified",
+        ));
+        return errs;
+    }
+    for i in 1..shape.len() {
+        if shape[i - 1].utilization >= shape[i].utilization {
+            errs.push(field::Error::invalid(
+                &path.index(i).child("utilization"),
+                shape[i].utilization,
+                "values must be sorted in increasing order",
+            ));
+            break;
+        }
+    }
+    for (i, point) in shape.iter().enumerate() {
+        if point.utilization < MIN_UTILIZATION || point.utilization > MAX_UTILIZATION {
+            errs.push(field::Error::invalid(
+                &path.index(i).child("utilization"),
+                point.utilization,
+                format!("not in valid range [{MIN_UTILIZATION}, {MAX_UTILIZATION}]"),
+            ));
+        }
+        if point.score < MIN_SCORE || point.score > MAX_SCORE {
+            errs.push(field::Error::invalid(
+                &path.index(i).child("score"),
+                point.score,
+                format!("not in valid range [{MIN_SCORE}, {MAX_SCORE}]"),
+            ));
+        }
+    }
+    errs
 }
 
 #[cfg(test)]
@@ -161,6 +313,44 @@ mod tests {
         let p = Path::new("profiles").index(0).child("args");
         let errs = args(-1, None).validate(&p, false);
         assert_eq!(errs[0].field, "profiles[0].args.bindTimeoutSeconds");
+    }
+
+    #[test]
+    fn config_doc_custom_shape_gate_on() {
+        let doc = r#"
+apiVersion: kubescheduler.config.k8s.io/v1
+kind: KubeSchedulerConfiguration
+profiles:
+- schedulerName: default-scheduler
+  pluginConfig:
+  - name: VolumeBinding
+    args:
+      bindTimeoutSeconds: 30
+      shape:
+      - utilization: 0
+        score: 0
+      - utilization: 100
+        score: 10
+"#;
+        let a = volume_binding_args_from_config(doc, true).unwrap();
+        assert_eq!(a, args(30, Some(vec![pt(0, 0), pt(100, 10)])));
+    }
+
+    #[test]
+    fn config_doc_shape_with_gate_off_rejected() {
+        let doc = "profiles:\n- pluginConfig:\n  - name: VolumeBinding\n    args:\n      shape:\n      - {utilization: 0, score: 1}\n";
+        let err = volume_binding_args_from_config(doc, false).unwrap_err();
+        assert!(
+            err.contains("profiles[0].pluginConfig[0].args.shape"),
+            "{err}"
+        );
+        assert!(err.contains("StorageCapacityScoring"), "{err}");
+    }
+
+    #[test]
+    fn config_doc_without_volume_binding_gets_defaults() {
+        let a = volume_binding_args_from_config("profiles: []\n", true).unwrap();
+        assert_eq!(a, args(600, Some(vec![pt(0, 10), pt(100, 0)])));
     }
 
     // v1/defaults_test.go TestPluginArgsDefaults, VolumeBindingArgs cases.

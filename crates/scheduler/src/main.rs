@@ -13,6 +13,7 @@ mod framework;
 #[allow(dead_code)]
 mod plugins;
 mod scheduler;
+mod scheduler_config;
 #[allow(dead_code)] // library API surface (informer delete/new); partly unused by the binary
 mod volume_assume;
 mod volume_bind;
@@ -53,6 +54,13 @@ struct Args {
     /// (upstream `--feature-gates`, component-base featuregate `Set`).
     #[arg(long, default_value = "")]
     feature_gates: String,
+
+    /// Path to a KubeSchedulerConfiguration file (YAML/JSON). Only
+    /// `profiles[0].pluginConfig[VolumeBinding].args` (bindTimeoutSeconds,
+    /// shape) is consumed; it is defaulted and validated like upstream's
+    /// SetDefaults_VolumeBindingArgs / ValidateVolumeBindingArgs.
+    #[arg(long)]
+    config: Option<String>,
 
     /// Scheduling interval in seconds
     #[arg(long, default_value = "2")]
@@ -107,6 +115,19 @@ async fn main() -> Result<()> {
     rusternetes_common::feature_gates::set_from_str(&args.feature_gates)
         .map_err(|e| anyhow::anyhow!("invalid --feature-gates: {e}"))?;
 
+    let volume_binding_args = match &args.config {
+        Some(path) => {
+            let doc = std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("reading --config {path}: {e}"))?;
+            let scoring = rusternetes_common::feature_gates::enabled(
+                rusternetes_common::feature_gates::Feature::StorageCapacityScoring,
+            );
+            scheduler_config::volume_binding_args_from_config(&doc, scoring)
+                .map_err(|e| anyhow::anyhow!("invalid --config {path}: {e}"))?
+        }
+        None => scheduler_config::VolumeBindingArgs::default(),
+    };
+
     info!(
         "Starting Rusternetes Scheduler {}",
         rusternetes_common::build_info::version_line()
@@ -117,7 +138,7 @@ async fn main() -> Result<()> {
     // the binding subresource + status + events. Resolve the api-server URL and
     // CA from --kubeconfig (preferred) or the explicit flags.
     if args.api_server_url.is_some() || args.kubeconfig.is_some() {
-        return run_api_mode(args).await;
+        return run_api_mode(args, &volume_binding_args).await;
     }
 
     let storage_config = match args.storage_backend.as_str() {
@@ -183,7 +204,9 @@ async fn main() -> Result<()> {
             }
         });
 
-        let scheduler = Arc::new(Scheduler::new(storage, args.interval));
+        let scheduler = Arc::new(
+            Scheduler::new(storage, args.interval).with_volume_binding_args(&volume_binding_args),
+        );
         loop {
             while !elector.is_leader().await {
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
@@ -200,7 +223,9 @@ async fn main() -> Result<()> {
         }
     } else {
         warn!("Leader election disabled - running in single-instance mode");
-        let scheduler = Arc::new(Scheduler::new(storage, args.interval));
+        let scheduler = Arc::new(
+            Scheduler::new(storage, args.interval).with_volume_binding_args(&volume_binding_args),
+        );
         scheduler.run().await?;
     }
 
@@ -211,7 +236,10 @@ async fn main() -> Result<()> {
 /// the api-server URL + CA from `--kubeconfig` (preferred) or the explicit
 /// `--api-server-url` flag, builds the [`ApiBackend`] (client + informers +
 /// event recorder) and runs the single-instance scheduling loop.
-async fn run_api_mode(args: Args) -> Result<()> {
+async fn run_api_mode(
+    args: Args,
+    volume_binding_args: &scheduler_config::VolumeBindingArgs,
+) -> Result<()> {
     use rusternetes_client::http::ApiClient;
     use rusternetes_client::kubeconfig::KubeConfig;
 
@@ -270,7 +298,10 @@ async fn run_api_mode(args: Args) -> Result<()> {
 
     let scheduler_name = "default-scheduler".to_string();
     let backend = data_plane::ApiBackend::new(client, &scheduler_name);
-    let scheduler = Arc::new(Scheduler::new_api(backend, args.interval, scheduler_name));
+    let scheduler = Arc::new(
+        Scheduler::new_api(backend, args.interval, scheduler_name)
+            .with_volume_binding_args(volume_binding_args),
+    );
     info!("Scheduler starting (API mode, single instance, no leader election)");
     scheduler.run().await?;
     Ok(())

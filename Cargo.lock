@@ -4733,6 +4733,7 @@ dependencies = [
  "rusternetes-test-support",
  "serde",
  "serde_json",
+ "serde_yaml",
  "serial_test",
  "tokio",
  "tracing",

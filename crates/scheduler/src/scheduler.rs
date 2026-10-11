@@ -46,6 +46,9 @@ pub struct Scheduler<S: Storage + Send + Sync + 'static = StorageBackend> {
     volume_binder: Arc<std::sync::Mutex<crate::volume_assume::VolumeBinder>>,
     /// `VolumeBindingArgs.BindTimeoutSeconds` (default 600).
     pub(crate) volume_bind_timeout: Duration,
+    /// Scorer shape built from `VolumeBindingArgs.Shape` (volume_binding.go:642-653),
+    /// already scaled to `MaxNodeScore`. Defaults to `volume_binding::default_shape()`.
+    pub(crate) volume_shape: Vec<volume_binding::FunctionShapePoint>,
     /// Poll interval of `BindPodVolumes` (1s upstream).
     pub(crate) volume_bind_poll: Duration,
 }
@@ -67,6 +70,7 @@ impl Scheduler<StorageBackend> {
             nominations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             volume_binder: Arc::default(),
             volume_bind_timeout: crate::volume_bind::DEFAULT_BIND_TIMEOUT,
+            volume_shape: volume_binding::default_shape(),
             volume_bind_poll: crate::volume_bind::BIND_POLL_INTERVAL,
         }
     }
@@ -82,8 +86,25 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             nominations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             volume_binder: Arc::default(),
             volume_bind_timeout: crate::volume_bind::DEFAULT_BIND_TIMEOUT,
+            volume_shape: volume_binding::default_shape(),
             volume_bind_poll: crate::volume_bind::BIND_POLL_INTERVAL,
         }
+    }
+
+    /// Apply validated `VolumeBindingArgs` (see `scheduler_config`): the bind
+    /// timeout and the capacity-scoring shape.
+    pub fn with_volume_binding_args(
+        mut self,
+        args: &crate::scheduler_config::VolumeBindingArgs,
+    ) -> Self {
+        if let Some(secs) = args.bind_timeout_seconds {
+            self.volume_bind_timeout = Duration::from_secs(secs.max(0) as u64);
+        }
+        let shape = args.scorer_shape();
+        if !shape.is_empty() {
+            self.volume_shape = shape;
+        }
+        self
     }
 
     /// Record a preemption nomination synchronously (in-memory) and persist it
@@ -1104,9 +1125,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         let volume_scorer = if scoring_enabled
             && !volume_binding::pre_score_skip(&pod_volumes_by_node, scoring_enabled)
         {
-            Some(volume_binding::build_scorer_function(
-                &volume_binding::default_shape(),
-            ))
+            Some(volume_binding::build_scorer_function(&self.volume_shape))
         } else {
             None
         };
