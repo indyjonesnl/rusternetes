@@ -25,8 +25,8 @@ use proto::plugin_capability::service::Type as PluginService;
 use proto::{
     ControllerGetCapabilitiesRequest, ControllerPublishVolumeRequest,
     ControllerUnpublishVolumeRequest, CreateSnapshotRequest, CreateVolumeRequest,
-    DeleteSnapshotRequest, DeleteVolumeRequest, GetPluginCapabilitiesRequest, ListVolumesRequest,
-    Snapshot, Volume,
+    DeleteSnapshotRequest, DeleteVolumeRequest, GetCapacityRequest, GetPluginCapabilitiesRequest,
+    ListVolumesRequest, Snapshot, Volume,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -378,6 +378,14 @@ impl CsiControllerClient {
             .map(|_| ())
     }
 
+    /// `GetCapacity` (external-provisioner `controller.go:1676-1684`'s
+    /// `p.csiClient.GetCapacity`): the driver's `AvailableCapacity` in bytes.
+    pub async fn get_capacity(&self, req: GetCapacityRequest) -> Result<i64, ControllerError> {
+        self.call(ControllerClient::new(self.channel()?).get_capacity(req))
+            .await
+            .map(|r| r.available_capacity)
+    }
+
     /// `CSIVolumeLister.ListVolumes` (external-attacher `pkg/attacher/lister.go:41-69`):
     /// pages through `ListVolumes` (`StartingToken` / `NextToken`, `MaxEntries`
     /// = `--max-entries`) and returns volume ID -> published node IDs. Entries
@@ -595,6 +603,12 @@ mod tests {
                 return Err(Status::new(c, "fake delete failure"));
             }
             Ok(Response::new(DeleteVolumeResponse {}))
+        }
+        async fn get_capacity(
+            &self,
+            _r: Request<GetCapacityRequest>,
+        ) -> Result<Response<GetCapacityResponse>, Status> {
+            Err(Status::unimplemented("not exercised"))
         }
         async fn list_volumes(
             &self,

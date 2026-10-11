@@ -28,6 +28,7 @@ const PVC_UID: &str = "5f4e3d2c-1111-2222-3333-444455556666";
 struct Recorded {
     create_volume: Vec<CreateVolumeRequest>,
     delete_volume: Vec<DeleteVolumeRequest>,
+    get_capacity: Vec<GetCapacityRequest>,
 }
 
 #[derive(Clone)]
@@ -45,6 +46,9 @@ struct Fake {
     topology: bool,
     /// `Volume.accessible_topology` of the CreateVolume response.
     accessible_topology: Vec<Topology>,
+    /// `GetCapacityResponse.AvailableCapacity` (controller_test.go:2724-2729:
+    /// 1 TiB unless a case sets `capacity`).
+    available_capacity: i64,
 }
 
 impl Fake {
@@ -58,6 +62,7 @@ impl Fake {
             drop_content_source: false,
             topology: false,
             accessible_topology: vec![],
+            available_capacity: 1 << 40,
         }
     }
 
@@ -119,6 +124,15 @@ impl Controller for Fake {
                     )),
                 })
                 .collect(),
+        }))
+    }
+    async fn get_capacity(
+        &self,
+        r: Request<GetCapacityRequest>,
+    ) -> Result<Response<GetCapacityResponse>, Status> {
+        self.rec.lock().unwrap().get_capacity.push(r.into_inner());
+        Ok(Response::new(GetCapacityResponse {
+            available_capacity: self.available_capacity,
         }))
     }
     async fn list_volumes(

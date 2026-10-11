@@ -126,6 +126,12 @@ impl Controller for Fake {
         }
         Ok(Response::new(ControllerUnpublishVolumeResponse {}))
     }
+    async fn get_capacity(
+        &self,
+        _r: Request<GetCapacityRequest>,
+    ) -> Result<Response<GetCapacityResponse>, Status> {
+        Err(Status::unimplemented("not exercised"))
+    }
     async fn list_volumes(
         &self,
         _r: Request<ListVolumesRequest>,
