@@ -415,6 +415,8 @@ async fn main() -> Result<()> {
             flow_control_stats_poller::COUNT_METRIC_POLL_PERIOD,
             stop_rx,
         ));
+        // `StartPriorityAndFairnessWatermarkMaintenance` (priority-and-fairness.go:358-363).
+        apiserver_request_metrics::start_watermark_maintenance();
         flow_control_filter::install_flow_control(apf);
         info!("API Priority and Fairness enabled");
     }
