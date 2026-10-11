@@ -233,8 +233,11 @@ pub fn apply_legacy<T: Serialize + DeserializeOwned>(
         .or_else(|| current.as_ref().and_then(|c| c.get("apiVersion")))
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let field_manager =
-        crate::fieldmanager::FieldManager::new(version, None, opts.reset_fields.clone());
+    let field_manager = crate::fieldmanager::FieldManager::new(
+        version,
+        opts.subresource.as_deref(),
+        opts.reset_fields.clone(),
+    );
     match field_manager.apply_value(current.as_ref(), desired, &opts.field_manager, opts.force) {
         Ok(mut applied) => {
             // The system-owned metadata is the live object's, whatever the
