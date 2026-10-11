@@ -8,6 +8,7 @@ pub mod clusterrole_aggregation;
 pub mod cronjob;
 pub mod csi_attacher;
 pub mod csi_capacity;
+pub mod csi_capacity_metrics;
 pub mod csi_provisioner;
 pub mod csi_topology;
 pub mod daemonset;
@@ -147,5 +148,6 @@ pub fn gather_metrics() -> String {
     let mut out = cidrset_metrics::gather();
     out.push_str(&ephemeral_volume_metrics::gather());
     out.push_str(&node_lifecycle_metrics::gather());
+    out.push_str(&csi_capacity_metrics::gather());
     out
 }

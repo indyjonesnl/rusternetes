@@ -9,6 +9,7 @@
 //! level-triggered `reconcile` pass over `Storage`; wiring it into a run loop
 //! is `run_capacity_loop`, started from `main.rs` (#3219).
 
+use super::csi_capacity_metrics::CapacityStats;
 use rusternetes_common::quantity::{Format, Quantity};
 use rusternetes_common::resources::csi::{CSINode, CSIStorageCapacity};
 use rusternetes_common::resources::volume::LabelSelector;
@@ -415,6 +416,18 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
     /// (:539-587) + `syncCapacity` (:586-715): publish, update and delete
     /// objects until they match `segments` x the driver's StorageClasses.
     pub async fn reconcile(&self, segments: &[Segment]) -> Result<()> {
+        self.reconcile_with_stats(segments).await.1
+    }
+
+    /// `reconcile` plus the gauge values of the pass (stub).
+    async fn reconcile_with_stats(&self, segments: &[Segment]) -> (CapacityStats, Result<()>) {
+        (
+            CapacityStats::default(),
+            self.reconcile_inner(segments).await,
+        )
+    }
+
+    async fn reconcile_inner(&self, segments: &[Segment]) -> Result<()> {
         let classes: Vec<StorageClass> = self
             .storage
             .list(&build_prefix("storageclasses", None))
@@ -848,6 +861,63 @@ mod tests {
         assert!(reqs.iter().all(|r| r.parameters["foo"] == "bar"
             && r.volume_capabilities.is_empty()
             && r.accessible_topology.is_some()));
+    }
+
+    #[tokio::test]
+    async fn stats_count_goal_current_and_obsolete() {
+        // capacity.go:769-807: goal = work items, current = items with an
+        // object, obsolete = managed objects matching no item.
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        put_sc(&st, sc("late-sc", DRIVER, None)).await;
+        let c = ctl(&st, &cl, false);
+        let (s, r) = c
+            .reconcile_with_stats(&[seg(&[("zone", "a")]), seg(&[("zone", "b")])])
+            .await;
+        r.unwrap();
+        // Every object is created in this pass, so each item has one now.
+        assert_eq!(
+            s,
+            CapacityStats {
+                goal: 2,
+                current: 2,
+                obsolete: 0
+            }
+        );
+
+        // Zone b disappears: its object is deleted in this pass, so nothing
+        // obsolete remains afterwards.
+        let (s, r) = c.reconcile_with_stats(&[seg(&[("zone", "a")])]).await;
+        r.unwrap();
+        assert_eq!(
+            s,
+            CapacityStats {
+                goal: 1,
+                current: 1,
+                obsolete: 0
+            }
+        );
+        assert_eq!(list_caps(&st).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reconcile_publishes_the_gauges_per_driver() {
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        put_sc(&st, sc("late-sc", DRIVER, None)).await;
+        ctl(&st, &cl, false)
+            .reconcile(&[seg(&[("zone", "a")])])
+            .await
+            .unwrap();
+        let out = super::super::csi_capacity_metrics::gather();
+        for (n, v) in [
+            ("csistoragecapacities_desired_goal", 1),
+            ("csistoragecapacities_desired_current", 1),
+            ("csistoragecapacities_obsolete", 0),
+        ] {
+            let want = format!("{n}{{driver_name=\"{DRIVER}\"}} {v}");
+            assert!(out.contains(&want), "{want} missing in:\n{out}");
+        }
     }
 
     #[tokio::test]
