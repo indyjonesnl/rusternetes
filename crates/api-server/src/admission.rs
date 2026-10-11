@@ -1,3 +1,4 @@
+pub mod caching_authorizer;
 pub mod certificates;
 pub mod config;
 pub mod pod_security_api;
