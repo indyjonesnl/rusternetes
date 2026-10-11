@@ -1463,3 +1463,38 @@ mod feature_gates_flag_tests {
         reset_to_defaults();
     }
 }
+
+#[cfg(test)]
+mod csi_capacity_flag_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// external-provisioner v6.4.0 csi-provisioner.go:88,101-104 defaults.
+    #[test]
+    fn capacity_flag_defaults_match_upstream() {
+        let args = Args::try_parse_from(["controller-manager"]).unwrap();
+        assert!(!args.csi_enable_capacity);
+        assert!(!args.csi_capacity_for_immediate_binding);
+        assert_eq!(args.csi_capacity_poll_interval, Duration::from_secs(60));
+        assert_eq!(args.csi_capacity_ownerref_level, 1);
+        assert_eq!(args.csi_capacity_threads, 1);
+    }
+
+    #[test]
+    fn capacity_flags_parse() {
+        let args = Args::try_parse_from([
+            "controller-manager",
+            "--csi-enable-capacity",
+            "--csi-capacity-for-immediate-binding",
+            "--csi-capacity-poll-interval=5s",
+            "--csi-capacity-ownerref-level=-1",
+            "--csi-capacity-threads=3",
+        ])
+        .unwrap();
+        assert!(args.csi_enable_capacity);
+        assert!(args.csi_capacity_for_immediate_binding);
+        assert_eq!(args.csi_capacity_poll_interval, Duration::from_secs(5));
+        assert_eq!(args.csi_capacity_ownerref_level, -1);
+        assert_eq!(args.csi_capacity_threads, 3);
+    }
+}
