@@ -10,6 +10,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use rusternetes_common::admission::Operation as AdmissionOperation;
 use rusternetes_common::cel::{CELContext, CELEvaluator};
 use rusternetes_common::cel_struct;
 use serde_json::{json, Value};
@@ -23,15 +24,29 @@ pub struct JsonPatcher {
     expression: String,
     /// `PatchEvaluator.CompilationErrors()`, found when the patcher is built.
     compile_error: Option<String>,
+    /// `spec.variables`, `(name, expression)` in declaration order
+    /// (`CompositionEnv.CompiledVariables`, cel/composition.go).
+    variables: Vec<(String, String)>,
     evaluator: Mutex<CELEvaluator>,
 }
 
 impl JsonPatcher {
     pub fn new_patcher(expression: &str) -> Arc<dyn Patcher> {
+        Self::new_patcher_with_variables(expression, &[])
+    }
+
+    /// `CompositedCompiler.CompileMutatingEvaluator` (cel/composition.go):
+    /// `variables` are the policy's `spec.variables`, `(name, expression)` in
+    /// declaration order.
+    pub fn new_patcher_with_variables(
+        expression: &str,
+        variables: &[(String, String)],
+    ) -> Arc<dyn Patcher> {
         let compile_error = cel_struct::compile(expression).err();
         Arc::new(Self {
             expression: expression.to_string(),
             compile_error,
+            variables: variables.to_vec(),
             evaluator: Mutex::new(CELEvaluator::new()),
         })
     }
@@ -42,7 +57,7 @@ impl JsonPatcher {
         &self,
         r: &PatchRequest<'_>,
     ) -> Result<Vec<Operation>, PatchError> {
-        let json = evaluate_expression(&self.evaluator, &self.expression, r)?;
+        let json = evaluate_expression(&self.evaluator, &self.expression, &self.variables, r)?;
         Self::operations_from(json)
     }
 
@@ -82,26 +97,13 @@ impl JsonPatcher {
 pub(super) fn evaluate_expression(
     evaluator: &Mutex<CELEvaluator>,
     expression: &str,
+    variables: &[(String, String)],
     r: &PatchRequest<'_>,
 ) -> Result<Value, PatchError> {
     {
         let mut ctx = CELContext::new();
         let attrs = r.versioned_attributes;
-        // `CreateAdmissionRequest` (cel/compile.go) needs the request's
-        // attributes, which `PatchRequest` does not carry yet: only the kind
-        // and resource are known here.
-        let request = json!({
-            "kind": {
-                "group": attrs.versioned_kind.group,
-                "version": attrs.versioned_kind.version,
-                "kind": attrs.versioned_kind.kind,
-            },
-            "resource": {
-                "group": r.matched_resource.group,
-                "version": r.matched_resource.version,
-                "resource": r.matched_resource.resource,
-            },
-        });
+        let request = create_admission_request(r);
         let vars: [(&str, &Value); 5] = [
             (
                 "object",
@@ -120,17 +122,101 @@ pub(super) fn evaluate_expression(
                 .map_err(|e| PatchError::Other(e.to_string()))?;
         }
 
-        let value = evaluator
-            .lock()
-            .unwrap()
-            .evaluate_to_value(expression, &ctx)
+        let mut evaluator = evaluator.lock().unwrap();
+        // `compositionContext.Variables` binds `variables` as a lazy map: a
+        // variable is evaluated when read and may read the others
+        // (variableAccessor.Callback, composition.go). Here they are
+        // evaluated up front in declaration order, so a variable can read the
+        // ones declared before it, and a failure is only reported when the
+        // expression actually reads that variable.
+        let mut bound = serde_json::Map::new();
+        let mut failed: Vec<(&str, String)> = Vec::new();
+        ctx.add_json_variable("variables", &Value::Object(bound.clone()))
             .map_err(|e| PatchError::Other(e.to_string()))?;
+        for (name, expr) in variables {
+            let result = evaluator
+                .evaluate_to_value(expr, &ctx)
+                .map_err(|e| e.to_string())
+                .and_then(|v| v.json().map_err(|e| e.to_string()));
+            match result {
+                Ok(v) => {
+                    bound.insert(name.clone(), v);
+                    ctx.add_json_variable("variables", &Value::Object(bound.clone()))
+                        .map_err(|e| PatchError::Other(e.to_string()))?;
+                }
+                Err(e) => failed.push((name, composited_failure(&failed, expr, name, e))),
+            }
+        }
+
+        let value = evaluator.evaluate_to_value(expression, &ctx).map_err(|e| {
+            PatchError::Other(
+                match failed.iter().find(|(n, _)| reads_variable(expression, n)) {
+                    Some((_, msg)) => msg.clone(),
+                    None => e.to_string(),
+                },
+            )
+        })?;
         value.json().map_err(|e| {
             PatchError::Other(format!(
                 "JSONPath valueExpression evaluated to a type that could not marshal to JSON: {e}"
             ))
         })
     }
+}
+
+/// Whether `expression` reads `variables.<name>` / `variables["name"]`.
+fn reads_variable(expression: &str, name: &str) -> bool {
+    expression.contains(&format!("variables.{name}"))
+        || expression.contains(&format!("variables[\"{name}\"]"))
+        || expression.contains(&format!("variables['{name}']"))
+}
+
+/// `types.NewErr("composited variable %q fails to evaluate: %v", ...)`
+/// (composition.go `variableAccessor.Callback`). When the variable failed
+/// because it read another failed variable, that variable's failure is
+/// reported instead, as the lazy map would surface it.
+fn composited_failure(failed: &[(&str, String)], expr: &str, name: &str, err: String) -> String {
+    if let Some((_, msg)) = failed.iter().find(|(n, _)| reads_variable(expr, n)) {
+        return msg.clone();
+    }
+    format!("composited variable {name:?} fails to evaluate: {err}")
+}
+
+/// `CreateAdmissionRequest` (admission/plugin/cel/condition.go:115-175):
+/// `Object`/`OldObject` are left unset, the kind/resource are the matched
+/// equivalents and `requestKind`/`requestResource` the request's own.
+/// `Attributes` does not carry the user, dry-run flag or operation options
+/// yet, so `userInfo` is empty (a nil `UserInfo` upstream), `dryRun` is
+/// false and `options` is absent. Unlike the unstructured conversion,
+/// empty `subResource`/`name`/`namespace` are kept as `""`.
+fn create_admission_request(r: &PatchRequest<'_>) -> Value {
+    let attr = r.attributes;
+    let k = &r.versioned_attributes.versioned_kind;
+    let res = r.matched_resource;
+    json!({
+        "kind": {"group": k.group, "version": k.version, "kind": k.kind},
+        "resource": {"group": res.group, "version": res.version, "resource": res.resource},
+        "subResource": attr.subresource,
+        "requestKind": {
+            "group": attr.kind.group, "version": attr.kind.version, "kind": attr.kind.kind,
+        },
+        "requestResource": {
+            "group": attr.resource.group,
+            "version": attr.resource.version,
+            "resource": attr.resource.resource,
+        },
+        "requestSubResource": attr.subresource,
+        "name": attr.name,
+        "namespace": attr.namespace,
+        "operation": match attr.operation {
+            AdmissionOperation::Create => "CREATE",
+            AdmissionOperation::Update => "UPDATE",
+            AdmissionOperation::Delete => "DELETE",
+            AdmissionOperation::Connect => "CONNECT",
+        },
+        "userInfo": {},
+        "dryRun": false,
+    })
 }
 
 #[async_trait]
@@ -169,11 +255,38 @@ impl Patcher for JsonPatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admission::policy_matching::Attributes;
     use crate::admission::policy_mutating::VersionedAttributes;
+    use rusternetes_common::admission::Operation as AdmissionOperation;
     use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
     use serde_json::json;
 
-    fn run(expression: &str, object: Value) -> Result<Value, String> {
+    fn attributes(object: &Value) -> Attributes {
+        Attributes {
+            kind: GroupVersionKind {
+                group: "apps".into(),
+                version: "v1".into(),
+                kind: "Deployment".into(),
+            },
+            resource: GroupVersionResource {
+                group: "apps".into(),
+                version: "v1".into(),
+                resource: "deployments".into(),
+            },
+            subresource: "".into(),
+            namespace: "default".into(),
+            name: "d1".into(),
+            operation: AdmissionOperation::Create,
+            object: Some(object.clone()),
+            old_object: None,
+        }
+    }
+
+    fn run_with(
+        patcher: Arc<dyn Patcher>,
+        object: Value,
+        attributes: &Attributes,
+    ) -> Result<Value, String> {
         let gvr = GroupVersionResource {
             group: "apps".into(),
             version: "v1".into(),
@@ -189,10 +302,10 @@ mod tests {
             versioned_old_object: None,
             dirty: false,
         };
-        let patcher = JsonPatcher::new_patcher(expression);
         let req = PatchRequest {
             matched_resource: &gvr,
             versioned_attributes: &versioned,
+            attributes,
             param: None,
             namespace: None,
         };
@@ -203,6 +316,11 @@ mod tests {
             PatchError::Status(e) => e.to_string(),
             PatchError::Other(m) => m,
         })
+    }
+
+    fn run(expression: &str, object: Value) -> Result<Value, String> {
+        let attrs = attributes(&object);
+        run_with(JsonPatcher::new_patcher(expression), object, &attrs)
     }
 
     fn ok(expression: &str, object: Value, expected: Value) {
@@ -429,5 +547,101 @@ mod tests {
             o.clone(),
         );
         assert_eq!(o, json!({"spec": {"replicas": 1}}));
+    }
+
+    // json_patch_test.go: "JSONPatch key escaping".
+    #[test]
+    fn json_patch_key_escaping() {
+        ok(
+            r#"[
+                JSONPatch{op: "add", path: "/metadata/labels", value: {}},
+                JSONPatch{op: "add", path: "/metadata/labels/" + jsonpatch.escapeKey("k8s.io/x~y"), value: "true"}
+            ]"#,
+            json!({"metadata": {"labels": {}}}),
+            json!({"metadata": {"labels": {"k8s.io/x~y": "true"}}}),
+        );
+    }
+
+    // `CreateAdmissionRequest` (admission/plugin/cel/condition.go:115-175)
+    // fills the `request` variable from the request's attributes.
+    #[test]
+    fn request_variable_carries_attributes() {
+        let object = json!({"metadata": {}});
+        let mut attrs = attributes(&object);
+        attrs.operation = AdmissionOperation::Update;
+        attrs.subresource = "scale".into();
+        let got = run_with(
+            JsonPatcher::new_patcher(
+                r#"[JSONPatch{op: "add", path: "/metadata/annotations", value: {
+                    "operation": request.operation,
+                    "name": request.name,
+                    "namespace": request.namespace,
+                    "subResource": request.subResource,
+                    "requestSubResource": request.requestSubResource,
+                    "requestKind": request.requestKind.kind,
+                    "requestResource": request.requestResource.resource,
+                    "dryRun": request.dryRun ? "true" : "false"
+                }}]"#,
+            ),
+            object,
+            &attrs,
+        );
+        assert_eq!(
+            got.unwrap(),
+            json!({"metadata": {"annotations": {
+                "operation": "UPDATE", "name": "d1", "namespace": "default",
+                "subResource": "scale", "requestSubResource": "scale",
+                "requestKind": "Deployment", "requestResource": "deployments",
+                "dryRun": "false"
+            }}})
+        );
+    }
+
+    fn vars(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect()
+    }
+
+    // composition.go: `variables.<name>` is bound, and a variable may
+    // reference the ones declared before it.
+    #[test]
+    fn variables_are_bound() {
+        let object = json!({"metadata": {"name": "d1"}});
+        let attrs = attributes(&object);
+        let p = JsonPatcher::new_patcher_with_variables(
+            r#"[JSONPatch{op: "add", path: "/metadata/labels", value: {"x": variables.m}}]"#,
+            &vars(&[
+                ("n", "object.metadata.name + '-x'"),
+                ("m", "variables.n + '!'"),
+            ]),
+        );
+        assert_eq!(
+            run_with(p, object, &attrs).unwrap(),
+            json!({"metadata": {"name": "d1", "labels": {"x": "d1-x!"}}})
+        );
+    }
+
+    // `variableAccessor.Callback` is lazy: a failing variable only fails the
+    // evaluation when the expression reads it.
+    #[test]
+    fn failing_variable_only_fails_when_used() {
+        let object = json!({"metadata": {"name": "d1"}});
+        let attrs = attributes(&object);
+        let decls = vars(&[("bad", "object.spec.nope.deeper")]);
+        let unused = JsonPatcher::new_patcher_with_variables(
+            r#"[JSONPatch{op: "add", path: "/metadata/labels", value: {}}]"#,
+            &decls,
+        );
+        assert!(run_with(unused, object.clone(), &attrs).is_ok());
+        let used = JsonPatcher::new_patcher_with_variables(
+            r#"[JSONPatch{op: "add", path: "/metadata/labels", value: {"x": variables.bad}}]"#,
+            &decls,
+        );
+        let err = run_with(used, object, &attrs).unwrap_err();
+        assert!(
+            err.contains(r#"composited variable "bad" fails to evaluate"#),
+            "{err}"
+        );
     }
 }
