@@ -56,8 +56,11 @@ pub struct MutationEnv {
 /// `ExpressionAccessor.ReturnTypes()` of the compiled expression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpectedOutput {
-    /// No constraint (match conditions, variables).
+    /// No constraint (variables).
     Any,
+    /// `MatchCondition.ReturnTypes()` is `[cel.BoolType]`
+    /// (`admission/plugin/webhook/matchconditions/matcher.go:49-51`).
+    Bool,
     /// `ApplyConfigurationCondition` (smd.go:52).
     Object,
     /// `JSONPatchCondition` (json_patch.go:57).
@@ -223,6 +226,7 @@ impl Checker<'_> {
 fn output_mismatch(root: &IdedExpr, expected: ExpectedOutput) -> Option<String> {
     let want = match expected {
         ExpectedOutput::Any => return None,
+        ExpectedOutput::Bool => "bool",
         ExpectedOutput::Object => "Object",
         ExpectedOutput::JsonPatchList => "list(JSONPatch)",
     };
@@ -237,10 +241,34 @@ fn output_mismatch(root: &IdedExpr, expected: ExpectedOutput) -> Option<String> 
             LiteralValue::UInt(_) => "uint",
         },
         Expr::Map(_) => "map(dyn, dyn)",
+        // Only where no list can match: `list(JSONPatch)` needs the element
+        // type, which is inference.
+        Expr::List(_) if expected == ExpectedOutput::Bool => "list(dyn)",
         Expr::Call(c) if is_bool_operator(&c.func_name) => "bool",
         _ => return None,
     };
+    // `ast.OutputType().IsExactType(returnType)`: nothing to report when the
+    // inferred type is the wanted one.
+    if got == want {
+        return None;
+    }
     Some(format!("must evaluate to {want} but got {got}"))
+}
+
+/// The output-type half of `CompileCELExpression` (compile.go:189-203) on its
+/// own, for the environments that are not modelled declaration by declaration
+/// (webhook and authorization `matchConditions`): `Some(detail)` when the
+/// expression parses and its output type is known, without inference, to
+/// differ from `expected`. A syntax error is not reported here; the caller's
+/// compile reports it first.
+pub fn output_type_failure(expression: &str, expected: ExpectedOutput) -> Option<String> {
+    let source = expression.to_string();
+    let program = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cel::Program::compile(&source)
+    }))
+    .ok()?
+    .ok()?;
+    output_mismatch(program.expression(), expected)
 }
 
 fn is_bool_operator(name: &str) -> bool {
@@ -351,6 +379,34 @@ mod tests {
             m.starts_with("must evaluate to list(JSONPatch) but got"),
             "{m}"
         );
+    }
+
+    /// `MatchCondition.ReturnTypes` (matcher.go:49-51) + compile.go:189-203.
+    #[test]
+    fn bool_output_is_enforced_only_where_the_type_is_known() {
+        let e = env();
+        assert_eq!(
+            fail("6", &e, ExpectedOutput::Bool),
+            "must evaluate to bool but got int"
+        );
+        assert_eq!(
+            fail("'a'", &e, ExpectedOutput::Bool),
+            "must evaluate to bool but got string"
+        );
+        for ok in [
+            "true",
+            "1 < 2",
+            "object.spec",
+            "size(object.a) > 0",
+            "!false",
+        ] {
+            assert_eq!(fail(ok, &e, ExpectedOutput::Bool), "", "{ok}");
+        }
+        assert_eq!(
+            output_type_failure("6", ExpectedOutput::Bool).as_deref(),
+            Some("must evaluate to bool but got int")
+        );
+        assert_eq!(output_type_failure("1 <", ExpectedOutput::Bool), None);
     }
 
     #[test]

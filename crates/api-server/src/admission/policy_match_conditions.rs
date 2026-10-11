@@ -11,9 +11,9 @@
 //!
 //! Deviations: the CEL cost budget (`RuntimeCELCostBudgetMatchConditions`),
 //! the request authorizer binding (`NewCachingAuthorizer`, #3196) and the
-//! `admissionmetrics` observations are not ported; a non-`bool` result is an
-//! evaluation error here, where upstream rejects it at compile time
-//! (`ReturnTypes`).
+//! `admissionmetrics` observations are not ported. A non-`bool` result is an
+//! evaluation error here; the compile-time rejection (`ReturnTypes`) happens at
+//! policy / configuration validation (`cel_env::output_type_failure`).
 
 use std::sync::{Arc, Mutex};
 

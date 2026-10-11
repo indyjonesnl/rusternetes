@@ -323,6 +323,36 @@ async fn a_webhooks_change_bumps_the_configuration_generation() {
     }
 }
 
+/// `TestValidateValidatingWebhookConfiguration` "must evaluate to bool"
+/// (pkg/apis/admissionregistration/validation/validation_test.go:792-803):
+/// `webhooks[0].matchConditions[0].expression: Invalid value: "6": must
+/// evaluate to bool` (#3265).
+#[tokio::test]
+async fn a_non_bool_match_condition_is_a_field_error() {
+    let api = TestApiServer::new();
+    let mut h = hook("a.example.com");
+    h["matchConditions"] = json!([{"name": "n", "expression": "6"}]);
+    let (s, body) = api
+        .post(
+            VWC,
+            &config("ValidatingWebhookConfiguration", "v1", vec![h]),
+        )
+        .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let cause = &body["details"]["causes"][0];
+    assert_eq!(
+        cause["field"], "webhooks[0].matchConditions[0].expression",
+        "{body}"
+    );
+    assert!(
+        cause["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(r#"Invalid value: "6": must evaluate to bool but got int"#),
+        "{body}"
+    );
+}
+
 /// An unparsable `matchConditions` expression is a field error on
 /// `webhooks[0].matchConditions[0].expression` (validateMatchCondition,
 /// validation.go:989 -> validateMatchConditionsExpression).

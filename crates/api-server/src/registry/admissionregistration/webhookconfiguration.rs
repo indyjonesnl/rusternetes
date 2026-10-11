@@ -25,6 +25,7 @@ use crate::registry::rest::{
 };
 
 pub(super) use rusternetes_common::cel::compile_failure;
+use rusternetes_common::cel_env::{output_type_failure, ExpectedOutput};
 
 /// The compile half of `validateMatchCondition` (validation.go:984-997): each
 /// non-blank `matchConditions[j].expression` of each webhook, as a
@@ -40,7 +41,9 @@ fn match_condition_compile_errors<'a>(
             if expression.is_empty() {
                 continue;
             }
-            if let Some(detail) = compile_failure(expression) {
+            if let Some(detail) = compile_failure(expression)
+                .or_else(|| output_type_failure(expression, ExpectedOutput::Bool))
+            {
                 errs.push(Error::invalid(
                     &Path::new("webhooks")
                         .index(i)

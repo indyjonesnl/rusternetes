@@ -107,7 +107,7 @@ fn compile_errors(obj: &MutatingAdmissionPolicy, ignore_match_conditions: bool) 
                     .child("matchConditions")
                     .index(i)
                     .child("expression");
-                errs.extend(compile_error(expression, &env, ExpectedOutput::Any, &path));
+                errs.extend(compile_error(expression, &env, ExpectedOutput::Bool, &path));
             }
         }
     }
@@ -427,6 +427,23 @@ mod tests {
         assert!(
             messages(&errs).contains(
                 r#"spec.variables[0].expression: Invalid value: "///": compilation failed"#
+            ),
+            "{}",
+            messages(&errs)
+        );
+    }
+
+    /// `MatchCondition.ReturnTypes` is `[bool]` (matcher.go:49-51), checked by
+    /// `CompileCELExpression` (compile.go:189-203) (#3265).
+    #[test]
+    fn create_rejects_a_non_bool_match_condition() {
+        let mut p = valid();
+        p.spec.as_mut().unwrap().match_conditions =
+            Some(serde_json::from_value(json!([{"name": "c", "expression": "6"}])).unwrap());
+        let errs = RestCreateStrategy::validate(&Strategy, &RequestContext::new(None), &p);
+        assert!(
+            messages(&errs).contains(
+                r#"spec.matchConditions[0].expression: Invalid value: "6": must evaluate to bool but got int"#
             ),
             "{}",
             messages(&errs)
