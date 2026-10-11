@@ -26,6 +26,9 @@ pub struct WebhookMatchCondition {
 pub struct CelMatcher {
     expressions: Vec<String>,
     evaluator: Mutex<CELEvaluator>,
+    /// `CELMatcher.AuthorizerType` / `AuthorizerName`; metrics are reported
+    /// only when set (matcher.go:35-42, :51-54).
+    metrics_identity: Option<(String, String)>,
 }
 
 impl std::fmt::Debug for CelMatcher {
@@ -75,7 +78,15 @@ impl CelMatcher {
         Ok(Some(Self {
             expressions,
             evaluator: Mutex::new(CELEvaluator::new()),
+            metrics_identity: None,
         }))
+    }
+
+    /// `cm.AuthorizerType = "Webhook"; cm.AuthorizerName = name; cm.Metrics = am`
+    /// (webhook.go:123-126).
+    pub fn with_metrics(mut self, authorizer_type: &str, authorizer_name: &str) -> Self {
+        self.metrics_identity = Some((authorizer_type.to_string(), authorizer_name.to_string()));
+        self
     }
 
     /// `CELMatcher.Eval` (matcher.go:46-93): `request` is the
@@ -83,6 +94,30 @@ impl CelMatcher {
     /// returns at once (even after an earlier error); otherwise any error fails
     /// the evaluation; otherwise true.
     pub fn eval(&self, request: &serde_json::Value) -> Result<bool, String> {
+        let start = std::time::Instant::now();
+        let out = self.eval_inner(request);
+        if let Some((t, n)) = &self.metrics_identity {
+            // matcher.go:51-82: duration always, failure when any expression
+            // errored (even if a later FALSE excluded), exclusion on FALSE.
+            crate::authorization_webhook_metrics::record_match_condition_evaluation(
+                t,
+                n,
+                start.elapsed(),
+            );
+            match &out {
+                Ok(false) => {
+                    crate::authorization_webhook_metrics::record_match_condition_exclusion(t, n)
+                }
+                Err(_) => {
+                    crate::authorization_webhook_metrics::record_match_condition_failure(t, n)
+                }
+                Ok(true) => {}
+            }
+        }
+        out
+    }
+
+    fn eval_inner(&self, request: &serde_json::Value) -> Result<bool, String> {
         let mut ctx = CELContext::new();
         ctx.add_json_variable("request", request)
             .map_err(|e| e.to_string())?;

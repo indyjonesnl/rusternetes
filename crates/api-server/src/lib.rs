@@ -3,6 +3,7 @@ pub mod admission;
 pub mod audit;
 pub mod authorization_match_conditions;
 pub mod authorization_webhook;
+pub mod authorization_webhook_metrics;
 pub mod authorizer;
 pub mod request_scope;
 pub use rusternetes_admission_webhook as admission_webhook;
