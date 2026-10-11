@@ -20,10 +20,10 @@
 //!   to a typed object, and the typed `ConvertToVersion` after a patch
 //!   (dispatcher.go:253-260), are identities here; so is the final
 //!   `Convert(versioned, attributes.GetObject())` (:211).
-//! - `NewCachingAuthorizer` and the `celmetrics` observations
-//!   (`ObserveRejection` / `ObserveAdmission`) are not ported yet; the
-//!   authorizer reaches CEL through the `Patcher` once the `patch/` package
-//!   exists.
+//! - The `celmetrics` observations (`ObserveRejection` / `ObserveAdmission`)
+//!   are not ported yet (#3229). `NewCachingAuthorizer` is (#3228,
+//!   `caching_authorizer.rs`) and reaches the matcher; it reaches CEL through
+//!   the `Patcher` once the `patch/` package exists.
 //! - `CompositionEnv.CreateContext` (:131-133) belongs to the CEL compiler and
 //!   is the evaluator's business, not the dispatcher's.
 
@@ -35,11 +35,13 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
+use rusternetes_common::authz::Authorizer;
 use rusternetes_common::resources::mutating_admission_policy::ReinvocationPolicyType;
 use rusternetes_common::resources::{MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding};
 use rusternetes_common::Error;
 use serde_json::Value;
 
+use super::caching_authorizer::new_caching_authorizer;
 use super::policy_dispatch::{
     BindingAccessor, DispatchDelegate, NamespacedName, PolicyAccessor, PolicyError,
     PolicyInvocation, PolicyKey, PolicyReinvokeContext, VersionedAttributeAccessor,
@@ -161,6 +163,7 @@ pub trait ConditionMatcher: Send + Sync {
         attributes: &Attributes,
         versioned: &VersionedAttributes,
         param: Option<&Value>,
+        authz: &dyn Authorizer,
     ) -> MatchResult;
 }
 
@@ -254,6 +257,9 @@ pub struct MutatingDispatcher {
     pub defaulter: Arc<dyn ObjectDefaulter>,
     /// `a.GetReinvocationContext()`.
     pub reinvocation: Arc<ReinvocationContext>,
+    /// `d.authz`: the request authorizer, wrapped per `dispatchInvocations`
+    /// call in `NewCachingAuthorizer` (dispatcher.go:135).
+    pub authz: Arc<dyn Authorizer>,
 }
 
 /// dispatcher.go `keyFor` (:271-300).
@@ -368,6 +374,8 @@ impl MutatingDispatcher {
         >],
     ) -> Result<Vec<PolicyError>, Error> {
         let reinvoke = &self.reinvocation;
+        // dispatcher.go:135.
+        let authz = new_caching_authorizer(self.authz.clone());
         let mut last_kind: Option<GroupVersionKind> = None;
 
         if reinvoke.is_reinvoke()
@@ -440,7 +448,7 @@ impl MutatingDispatcher {
 
             if let Some(matcher) = &invocation.evaluator.matcher {
                 let result = matcher
-                    .matches(attr, current, invocation.param.as_ref())
+                    .matches(attr, current, invocation.param.as_ref(), &authz)
                     .await;
                 if let Some(err) = result.error {
                     policy_errors.push(config_error(err, invocation));
@@ -677,6 +685,7 @@ mod tests {
             _: &Attributes,
             v: &VersionedAttributes,
             _: Option<&Value>,
+            _: &dyn Authorizer,
         ) -> MatchResult {
             (self.0)(v.versioned_object.as_ref().unwrap())
         }
@@ -766,6 +775,7 @@ mod tests {
             type_converters: Arc::new(AllConverters),
             defaulter: Arc::new(DefaultStrategy),
             reinvocation,
+            authz: Arc::new(rusternetes_common::authz::AlwaysAllowAuthorizer),
         }
     }
     async fn run(

@@ -10,14 +10,16 @@
 //! order.
 //!
 //! Deviations: the CEL cost budget (`RuntimeCELCostBudgetMatchConditions`),
-//! the request authorizer binding (`NewCachingAuthorizer`, #3196) and the
-//! `admissionmetrics` observations are not ported. A non-`bool` result is an
+//! `admissionmetrics` observations are not ported. The request authorizer
+//! (`Match`'s `authz` argument, a `NewCachingAuthorizer` from the dispatcher,
+//! #3228) is accepted but unused until the CEL `authorizer` library is bound. A non-`bool` result is an
 //! evaluation error here; the compile-time rejection (`ReturnTypes`) happens at
 //! policy / configuration validation (`cel_env::output_type_failure`).
 
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use rusternetes_common::authz::Authorizer;
 use rusternetes_common::cel::CELEvaluator;
 use rusternetes_common::cel_struct::TypeCheck;
 use rusternetes_common::resources::admission_webhook::MatchCondition;
@@ -104,6 +106,7 @@ impl ConditionMatcher for Matcher {
         attributes: &Attributes,
         versioned: &VersionedAttributes,
         param: Option<&Value>,
+        _authz: &dyn Authorizer,
     ) -> MatchResult {
         let results = match self.filter.for_input(attributes, versioned, param).await {
             Ok(r) => r,
@@ -212,6 +215,7 @@ mod tests {
     use super::*;
     use rusternetes_common::admission::Operation;
     use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
+    use rusternetes_common::authz::AlwaysAllowAuthorizer;
     use serde_json::json;
 
     struct Fake {
@@ -428,7 +432,7 @@ mod tests {
                 }),
                 policy.as_ref(),
             );
-            let r = m.matches(&a, &v, None).await;
+            let r = m.matches(&a, &v, None, &AlwaysAllowAuthorizer).await;
             // A failed fake-evaluator call matches nothing, so `matches` is
             // false there (the Go case's `shouldMatch` is not asserted for
             // errors).
@@ -464,7 +468,7 @@ mod tests {
             &[("lbl".into(), "object.metadata.labels.a".into())],
             None,
         );
-        let r = m.matches(&a, &v, None).await;
+        let r = m.matches(&a, &v, None, &AlwaysAllowAuthorizer).await;
         assert!(r.matches && r.error.is_none(), "{r:?}");
     }
 
@@ -480,7 +484,7 @@ mod tests {
             &[],
             None,
         );
-        let r = m.matches(&a, &v, None).await;
+        let r = m.matches(&a, &v, None, &AlwaysAllowAuthorizer).await;
         assert!(!r.matches);
         assert_eq!(r.failed_condition_name.as_deref(), Some("name"));
     }
@@ -489,15 +493,17 @@ mod tests {
     async fn cel_errors_follow_failure_policy() {
         let (a, v) = attrs(Some(json!({"metadata": {"name": "y"}})));
         let conds = [cond("bad", "object.nope.deeper == 1"), cond("ok", "true")];
-        let r = new_matcher(&conds, &[], None).matches(&a, &v, None).await;
+        let r = new_matcher(&conds, &[], None)
+            .matches(&a, &v, None, &AlwaysAllowAuthorizer)
+            .await;
         assert!(r.error.is_some() && !r.matches, "{r:?}");
         let r = new_matcher(&conds, &[], Some(&FailurePolicy::Ignore))
-            .matches(&a, &v, None)
+            .matches(&a, &v, None, &AlwaysAllowAuthorizer)
             .await;
         assert!(r.error.is_none() && !r.matches, "{r:?}");
         // A non-bool result is an evaluation error too.
         let r = new_matcher(&[cond("n", "1 + 1")], &[], None)
-            .matches(&a, &v, None)
+            .matches(&a, &v, None, &AlwaysAllowAuthorizer)
             .await;
         assert!(r.error.is_some(), "{r:?}");
     }
@@ -511,8 +517,16 @@ mod tests {
             None,
         );
         let p = json!({"spec": {"name": "x"}});
-        assert!(m.matches(&a, &v, Some(&p)).await.matches);
+        assert!(
+            m.matches(&a, &v, Some(&p), &AlwaysAllowAuthorizer)
+                .await
+                .matches
+        );
         let p2 = json!({"spec": {"name": "z"}});
-        assert!(!m.matches(&a, &v, Some(&p2)).await.matches);
+        assert!(
+            !m.matches(&a, &v, Some(&p2), &AlwaysAllowAuthorizer)
+                .await
+                .matches
+        );
     }
 }
