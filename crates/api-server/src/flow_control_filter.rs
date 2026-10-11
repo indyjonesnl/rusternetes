@@ -61,6 +61,7 @@ use axum::response::{IntoResponse, Response};
 use futures::{FutureExt, StreamExt};
 use rusternetes_storage::{Storage, StorageBackend};
 
+use crate::apiserver_request_metrics::{self, RequestMeta};
 use crate::audit::request_info;
 use crate::flow_control::{Classification, FlowControlEngine, FlowControlPermit, RequestDigest};
 use crate::flow_control_object_count::ObjectCountTracker;
@@ -106,6 +107,26 @@ pub fn request_wait_limit(
         limit = MAX_REQUEST_WAIT;
     }
     (arrived_at + limit).saturating_duration_since(now)
+}
+
+/// `epmetrics.APIServerComponent` (endpoints/metrics/metrics.go:53).
+const COMPONENT: &str = "apiserver";
+
+/// `nonMutatingRequestVerbs` (server/filters/maxinflight.go:46).
+const NON_MUTATING_REQUEST_VERBS: &[&str] = &["get", "list", "watch"];
+
+/// `truncateLogField` (priority-and-fairness.go:61-68).
+pub fn truncate_log_field(s: &str) -> &str {
+    const MAX_FIELD_LOG_LENGTH: usize = 64;
+    if s.len() > MAX_FIELD_LOG_LENGTH {
+        // Back off to a char boundary (Go slices bytes; Rust must not split a char).
+        let mut end = MAX_FIELD_LOG_LENGTH;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        return &s[..end];
+    }
+    s
 }
 
 // ---------------------------------------------------------------------
@@ -407,6 +428,8 @@ async fn serve_watch<S: Storage + 'static>(
         .watch_tracker
         .register_watch(&info, req.uri().query().unwrap_or(""));
 
+    // `startedAt := time.Now()` (priority-and-fairness.go:201) in `execute`.
+    let started_at = Instant::now();
     let signal = InitializationSignal::new();
     let handler = scope_signal(signal.clone(), next.run(req));
     tokio::pin!(handler);
@@ -423,6 +446,9 @@ async fn serve_watch<S: Storage + 'static>(
         }
     };
     drop(permit);
+    // `defer httplog.AddKeyValue(ctx, "apf_init_latency", time.Since(startedAt))`
+    // (:203-205).
+    tracing::debug!(apf_init_latency = ?started_at.elapsed(), "APF watch initialized");
     match forget {
         Some(forget) => forget_watch_with_body(resp, forget),
         None => resp,
@@ -436,6 +462,12 @@ pub async fn priority_and_fairness<S: Storage + 'static>(
     next: Next,
 ) -> Response {
     let attrs = request_info(req.method(), req.uri().path(), req.uri().query());
+    let method = req.method().clone();
+    let query = req.uri().query().unwrap_or("").to_string();
+    let apply_patch = req
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .is_some_and(|v| v.as_bytes() == b"application/apply-patch+yaml");
     let user = req
         .extensions()
         .get::<rusternetes_middleware::AuthContext>()
@@ -490,6 +522,35 @@ pub async fn priority_and_fairness<S: Storage + 'static>(
         estimate.max_seats(),
     );
 
+    // `httplog.AddKeyValue(ctx, "apf_pl"/"apf_fs"/"apf_iseats"/"apf_fseats"/
+    // "apf_additionalLatency", ...)` (priority-and-fairness.go:119-120,
+    // :135-137). There is no httplog request line to attach them to, so they
+    // are one structured event carrying the same keys.
+    tracing::debug!(
+        apf_pl = truncate_log_field(&classification.priority_level),
+        apf_fs = truncate_log_field(&classification.flow_schema),
+        apf_iseats = estimate.initial_seats,
+        apf_fseats = estimate.final_seats,
+        apf_additional_latency = ?estimate.additional_latency,
+        "APF classified request"
+    );
+
+    let meta = RequestMeta {
+        method: method.as_str().to_string(),
+        query,
+        path: attrs.path.clone(),
+        apply_patch,
+        is_resource_request: attrs.is_resource_request,
+        verb: attrs.verb.clone(),
+        namespace: attrs.namespace.clone(),
+        name: attrs.name.clone(),
+        api_group: attrs.api_group.clone(),
+        api_version: attrs.api_version.clone(),
+        resource: attrs.resource.clone(),
+        subresource: attrs.subresource.clone(),
+    };
+    let is_mutating = !NON_MUTATING_REQUEST_VERBS.contains(&attrs.verb.as_str());
+
     let wait = request_wait_limit(Instant::now(), None, None, f.default_wait_limit);
     match f
         .engine
@@ -514,6 +575,12 @@ pub async fn priority_and_fairness<S: Storage + 'static>(
         }
         Err(_) => {
             // `!served` (:297-319): headers, then 429 with an adaptive Retry-After.
+            apiserver_request_metrics::record_dropped_request(&meta, COMPONENT, is_mutating);
+            apiserver_request_metrics::record_request_termination(
+                &meta,
+                COMPONENT,
+                StatusCode::TOO_MANY_REQUESTS.as_u16(),
+            );
             f.dropped
                 .record_dropped_request(&classification.priority_level);
             let mut resp =
@@ -1107,6 +1174,52 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(resp.headers().contains_key(HEADER_PRIORITY_LEVEL_UID));
+    }
+
+    // priority-and-fairness.go:311-312: a 429 records the dropped request and
+    // the termination (TestApfRejectRequest checks both metrics exist).
+    #[tokio::test]
+    async fn rejected_request_records_dropped_and_termination_metrics() {
+        use crate::flow_control::metric_test_util::sample;
+        let l = [
+            ("verb", "GET"),
+            ("resource", "namespaces"),
+            ("scope", "resource"),
+            ("component", "apiserver"),
+            ("code", "429"),
+        ];
+        let (t0, r0) = (
+            sample("apiserver_request_terminations_total", &l),
+            sample("apiserver_request_total", &l),
+        );
+        let gate = Arc::new(Notify::new());
+        let first = Arc::new(AtomicUsize::new(0));
+        let (g, f) = (gate.clone(), first.clone());
+        let hook: Arc<dyn Fn() -> Option<Arc<Notify>> + Send + Sync> =
+            Arc::new(move || (f.fetch_add(1, Ordering::SeqCst) == 0).then(|| g.clone()));
+        let app = app(1, Duration::from_millis(50), hook, bob()).await;
+        let a = app.clone();
+        let held =
+            tokio::spawn(async move { a.oneshot(get_req("/api/v1/namespaces/default")).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let resp = app
+            .clone()
+            .oneshot(get_req("/api/v1/namespaces/default"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(sample("apiserver_request_terminations_total", &l) >= t0 + 1.0);
+        assert!(sample("apiserver_request_total", &l) >= r0 + 1.0);
+        gate.notify_one();
+        held.await.unwrap().unwrap();
+    }
+
+    // httplog.AddKeyValue(ctx, "apf_pl", truncateLogField(pl.Name)) (:119).
+    #[test]
+    fn truncate_log_field_caps_at_64() {
+        assert_eq!(truncate_log_field("short"), "short");
+        let long = "x".repeat(100);
+        assert_eq!(truncate_log_field(&long).len(), 64);
     }
 
     #[tokio::test]

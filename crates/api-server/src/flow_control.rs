@@ -854,6 +854,7 @@ impl InQueue {
         // `noteWaitingDelta(1)` (priority-and-fairness.go:150-156).
         fcmetrics::add_level_waiting(priority_level, 1.0);
         fcmetrics::add_read_write(fcmetrics::Phase::Waiting, mutating, 1);
+        crate::apiserver_request_metrics::note_waiting_delta(mutating, 1);
         Self {
             priority_level: priority_level.to_string(),
             flow_schema: flow_schema.to_string(),
@@ -868,6 +869,7 @@ impl Drop for InQueue {
         fcmetrics::add_in_queues(&self.priority_level, &self.flow_schema, -1, -self.seats);
         fcmetrics::add_level_waiting(&self.priority_level, -1.0);
         fcmetrics::add_read_write(fcmetrics::Phase::Waiting, self.mutating, -1);
+        crate::apiserver_request_metrics::note_waiting_delta(self.mutating, -1);
     }
 }
 
@@ -890,6 +892,7 @@ impl ExecutionMetrics {
         // (queueset.go:680-681, :726-727) and `noteExecutingDelta(1)`.
         fcmetrics::add_level_executing(priority_level, 1.0, seats as f64);
         fcmetrics::add_read_write(fcmetrics::Phase::Executing, mutating, 1);
+        crate::apiserver_request_metrics::note_executing_delta(mutating, 1);
         Self {
             priority_level: priority_level.to_string(),
             flow_schema: flow_schema.to_string(),
@@ -906,6 +909,7 @@ impl Drop for ExecutionMetrics {
         fcmetrics::add_executing(&self.priority_level, &self.flow_schema, -1, -self.seats);
         fcmetrics::add_level_executing(&self.priority_level, -1.0, -(self.seats as f64));
         fcmetrics::add_read_write(fcmetrics::Phase::Executing, self.mutating, -1);
+        crate::apiserver_request_metrics::note_executing_delta(self.mutating, -1);
         fcmetrics::observe_execution_duration(
             &self.priority_level,
             &self.flow_schema,
