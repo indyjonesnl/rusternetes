@@ -1668,7 +1668,13 @@ impl Kubelet {
                 let resolve = |_: Option<std::net::IpAddr>| -> Option<std::net::IpAddr> {
                     Self::detect_internal_ip().parse().ok()
                 };
-                match crate::node_ip::node_addresses(configured, &host, &lookup, &resolve) {
+                match crate::node_ip::node_addresses(
+                    configured,
+                    &crate::node_ip::validate_node_ip_on_host,
+                    &host,
+                    &lookup,
+                    &resolve,
+                ) {
                     Ok(addrs) => {
                         let ips: Vec<String> = addrs
                             .into_iter()

@@ -4636,6 +4636,7 @@ dependencies = [
  "http-body-util",
  "hyper-util",
  "inotify",
+ "libc",
  "mimalloc",
  "p256",
  "p384",
