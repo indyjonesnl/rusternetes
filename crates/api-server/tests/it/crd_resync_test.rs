@@ -118,3 +118,65 @@ async fn resync_establishes_a_crd_without_conditions() {
         );
     }
 }
+
+/// An instance carrying its own finalizer is not removed from storage by the
+/// CRD cleanup: `deleteInstances` issues `DeleteCollection` through the
+/// instance store (crd_finalizer.go:236-251), which only stamps
+/// `deletionTimestamp` while a finalizer is present, and the CRD stays
+/// Terminating until the instance is really gone (:253-272) (#2129).
+#[tokio::test]
+async fn cleanup_waits_for_an_instance_with_a_finalizer() {
+    let api = TestApiServer::new();
+    let (status, out) = api
+        .post(
+            "/api/v1/namespaces",
+            &json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "default"}}),
+        )
+        .await;
+    assert!(
+        status.is_success() || status == StatusCode::CONFLICT,
+        "{out}"
+    );
+    let (status, out) = api.post(CRDS, &widget_crd()).await;
+    assert_eq!(status, StatusCode::CREATED, "{out}");
+    let cr = "/apis/example.com/v1/namespaces/default/widgets";
+    let (status, out) = api
+        .post(
+            cr,
+            &json!({"apiVersion": "example.com/v1", "kind": "Widget",
+                    "metadata": {"name": "w1", "finalizers": ["example.com/hold"]}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{out}");
+
+    let key = build_key("customresourcedefinitions", None, "widgets.example.com");
+    let mut stored: Value = api.storage.get(&key).await.unwrap();
+    stored["metadata"]["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
+    stored["metadata"]["finalizers"] = json!([FINALIZER]);
+    api.storage.update(&key, &stored).await.unwrap();
+
+    let backend = Arc::new(StorageBackend::Memory(api.storage.clone()));
+    let resync = tokio::spawn(async move { new_rest(backend).resync().await });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // The instance is still there, marked for deletion; the CRD is too.
+    let ikey = build_key("example_com_widgets", Some("default"), "w1");
+    let inst: Value = api
+        .storage
+        .get(&ikey)
+        .await
+        .expect("instance must survive while its finalizer is set");
+    assert!(
+        inst["metadata"]["deletionTimestamp"].is_string(),
+        "instance not marked for deletion: {inst}"
+    );
+    let (status, out) = api.get(&format!("{CRDS}/widgets.example.com")).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+
+    // The instance's controller drops the finalizer; the CRD then goes.
+    api.storage.delete(&ikey).await.unwrap();
+    let failed = resync.await.unwrap();
+    assert!(failed.is_empty(), "resync failed for {failed:?}");
+    let (status, out) = api.get(&format!("{CRDS}/widgets.example.com")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{out}");
+}
