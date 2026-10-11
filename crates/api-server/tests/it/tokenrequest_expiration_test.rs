@@ -108,10 +108,7 @@ async fn token_expiration_clamped_to_max_2714() {
     make_sa(&state, "sa-max").await;
     let before = chrono::Utc::now().timestamp();
     let (code, body) = state.post(&token_uri("sa-max"), &token_req(86_400)).await;
-    assert!(
-        code == StatusCode::CREATED,
-        "{code} {body}"
-    );
+    assert!(code == StatusCode::CREATED, "{code} {body}");
     let ts = chrono::DateTime::parse_from_rfc3339(
         body["status"]["expirationTimestamp"].as_str().unwrap(),
     )
