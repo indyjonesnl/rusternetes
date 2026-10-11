@@ -419,9 +419,17 @@ pub async fn create_binding(
     let dry_run = endpoints::is_dry_run(options.dry_run.as_deref());
 
     let mut binding: Binding = decode_request_body(&body)?;
+    // `CreateNamedResource` (create.go:119-140): the strict serializer is used
+    // for Warn (the default, `fieldValidation("")`) and Strict; Warn turns the
+    // strict decoding errors into warnings, Strict rejects them.
+    let decode_warnings =
+        crate::handlers::validation::validate_strict_fields(&params, &body, &binding)?;
     let ctx = RequestContext::new(Some(&namespace))
         .with_user(&auth_ctx.user)
         .with_name(&name);
+    for warning in decode_warnings {
+        ctx.add_warning(warning);
+    }
     // `CreateNamedResource` (create.go): mutating admission on the Binding,
     // then the storage's create with validating admission as its callback.
     // The in-tree `PodTopologyLabels` plugin is among the mutators
