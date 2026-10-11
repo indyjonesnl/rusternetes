@@ -2110,6 +2110,34 @@ mod tests {
         );
     }
 
+    /// `apply` (apf_controller.go:628-635): `ApplyStatus` with
+    /// `ApplyOptions{FieldManager: asFieldManager, Force: true}`, where
+    /// `asFieldManager` is `ConfigConsumerAsFieldManager`
+    /// (apf_filter.go:42, `"api-priority-and-fairness-config-consumer-v1"`).
+    #[tokio::test]
+    async fn dangling_status_is_applied_by_the_config_consumer_field_manager() {
+        let st = Arc::new(MemoryStorage::new());
+        put_pl(&st, &named_pl("a", 4, 2)).await;
+        let fs = fs_ref("good", "a");
+        st.create(&build_key("flowschemas", None, "good"), &fs)
+            .await
+            .unwrap();
+        let e = FlowControlEngine::with_limits(st.clone(), 100, 0);
+        e.sync_one().await.unwrap();
+        let v: serde_json::Value = st
+            .get(&build_key("flowschemas", None, "good"))
+            .await
+            .unwrap();
+        let mf = v["metadata"]["managedFields"]
+            .as_array()
+            .expect("managedFields");
+        let entry = mf
+            .iter()
+            .find(|m| m["manager"] == "api-priority-and-fairness-config-consumer-v1")
+            .expect("entry for the config consumer");
+        assert_eq!(entry["operation"], "Apply");
+    }
+
     #[tokio::test]
     async fn dangling_condition_already_current_is_not_rewritten() {
         let st = Arc::new(MemoryStorage::new());
