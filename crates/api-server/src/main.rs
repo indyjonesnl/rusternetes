@@ -527,3 +527,30 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusternetes_common::feature_gates::{self, Feature};
+
+    /// `--feature-gates` must parse and be applicable (upstream
+    /// `featureGate.AddFlag`, component-base/featuregate/feature_gate.go:912).
+    #[test]
+    fn feature_gates_flag_enables_cross_namespace_volume_data_source() {
+        let args = Args::try_parse_from([
+            "api-server",
+            "--feature-gates=CrossNamespaceVolumeDataSource=true",
+        ])
+        .expect("--feature-gates must be accepted");
+        let _guard = feature_gates::with_feature(Feature::CrossNamespaceVolumeDataSource, false);
+        apply_feature_gates(&args.feature_gates).unwrap();
+        assert!(feature_gates::enabled(
+            Feature::CrossNamespaceVolumeDataSource
+        ));
+    }
+
+    #[test]
+    fn feature_gates_flag_rejects_unknown_gate() {
+        assert!(apply_feature_gates("NoSuchGate=true").is_err());
+    }
+}
