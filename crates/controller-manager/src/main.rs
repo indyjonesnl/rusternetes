@@ -94,6 +94,14 @@ struct Args {
     #[arg(long, default_value = "")]
     csi_default_fstype: String,
 
+    /// `--reconcile-sync` of external-attacher (`main.go:76`), in seconds.
+    #[arg(long, default_value_t = 60)]
+    csi_attacher_reconcile_sync_seconds: u64,
+
+    /// `--max-entries` of external-attacher (`main.go:72`); 0 means no limit.
+    #[arg(long, default_value_t = 0)]
+    csi_attacher_max_entries: i32,
+
     /// `--extra-create-metadata` of external-provisioner.
     #[arg(long)]
     csi_extra_create_metadata: bool,
@@ -836,7 +844,11 @@ async fn main() -> Result<()> {
                 driver,
                 rusternetes_csi::controller_client::CsiControllerClient::with_endpoint(socket),
             )
-            .with_default_fs_type(args.csi_default_fstype.clone()),
+            .with_default_fs_type(args.csi_default_fstype.clone())
+            .with_reconcile_sync(std::time::Duration::from_secs(
+                args.csi_attacher_reconcile_sync_seconds,
+            ))
+            .with_max_entries(args.csi_attacher_max_entries),
         );
         spawn_controller!("CSI attacher", leader_elector, {
             let controller = attacher.clone();
