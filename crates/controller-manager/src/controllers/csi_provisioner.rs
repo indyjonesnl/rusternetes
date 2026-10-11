@@ -2216,15 +2216,20 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
         }
     }
 
-    /// `cleanupVolume` (controller.go:2074-2086).
-    async fn cleanup_volume(&self, volume_id: &str) -> Result<()> {
+    /// `cleanupVolume` (controller.go:2074-2086): `delReq.Secrets =
+    /// provisionerCredentials`, then up to `deleteVolumeRetryCount` attempts.
+    async fn cleanup_volume(
+        &self,
+        volume_id: &str,
+        provisioner_credentials: &HashMap<String, String>,
+    ) -> Result<()> {
         let mut last = None;
         for _ in 0..DELETE_VOLUME_RETRY_COUNT {
             match self
                 .client
                 .delete_volume(DeleteVolumeRequest {
                     volume_id: volume_id.to_string(),
-                    ..Default::default()
+                    secrets: provisioner_credentials.clone(),
                 })
                 .await
             {
@@ -2301,6 +2306,8 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             .await?;
         let vol_size_bytes = req.capacity_range.as_ref().map_or(0, |c| c.required_bytes);
         let vol_caps = req.volume_capabilities.clone();
+        // `provisionerCredentials := req.Secrets` (controller.go:875).
+        let provisioner_credentials = req.secrets.clone();
 
         let supports_topology = self
             .driver_capabilities()
@@ -2342,7 +2349,10 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             let mut cap_err = format!(
                 "created volume capacity {resp_cap} less than requested capacity {vol_size_bytes}"
             );
-            if let Err(e) = self.cleanup_volume(&vol.volume_id).await {
+            if let Err(e) = self
+                .cleanup_volume(&vol.volume_id, &provisioner_credentials)
+                .await
+            {
                 cap_err = format!(
                     "{cap_err}. Cleanup of volume {pv_name} failed, volume is orphaned: {e}"
                 );
@@ -2361,7 +2371,10 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
         // see `data_source`.)
         if claim.spec.data_source.is_some() && vol.content_source.is_none() {
             let mut source_err = "volume content source missing".to_string();
-            if let Err(e) = self.cleanup_volume(&vol.volume_id).await {
+            if let Err(e) = self
+                .cleanup_volume(&vol.volume_id, &provisioner_credentials)
+                .await
+            {
                 source_err = format!(
                     "{source_err}. cleanup of volume {pv_name} failed, volume is orphaned: {e}"
                 );
