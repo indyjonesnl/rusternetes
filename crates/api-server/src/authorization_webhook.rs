@@ -735,6 +735,7 @@ fn is_connection_reset(e: &reqwest::Error) -> bool {
 /// `convertToSARExtra` + the user / attributes half of `Authorize`
 /// (webhook.go:189-206, `resourceAttributesFrom` :301-329; Version :306).
 fn spec_from(attr: &RequestAttributes) -> SarSpec {
+    let attr = &*crate::request_scope::with_request_selectors(attr);
     let user: &UserInfo = &attr.user;
     let mut spec = SarSpec {
         user: user.username.clone(),
