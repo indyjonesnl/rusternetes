@@ -244,6 +244,16 @@ impl CsiControllerClient {
         }
     }
 
+    /// Port of `GetNodeInfo` (external-provisioner `controller.go:350-355`):
+    /// `NodeGetInfo` on the driver's socket, used by `--node-deployment`.
+    pub async fn get_node_info(&self) -> Result<proto::NodeGetInfoResponse, ControllerError> {
+        self.call(
+            proto::node_client::NodeClient::new(self.channel()?)
+                .node_get_info(proto::NodeGetInfoRequest {}),
+        )
+        .await
+    }
+
     /// Port of `GetDriverCapabilities` (`controller.go:331-348`) with
     /// `rpc.GetPluginCapabilities` / `rpc.GetControllerCapabilities`
     /// (csi-lib-utils `rpc/common.go`): only supported capabilities are kept.
