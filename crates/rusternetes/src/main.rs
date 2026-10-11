@@ -61,6 +61,16 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0:6443")]
     bind_address: String,
 
+    /// Run a CSI external-attacher for a driver: `<driver-name>=<controller
+    /// socket path>`. Repeatable. Same flag as the standalone controller-manager.
+    #[arg(long = "csi-attacher", value_name = "DRIVER=SOCKET")]
+    csi_attachers: Vec<String>,
+
+    /// Run the CSI half of the AttachDetachController (#3048). Off by default;
+    /// enable together with `--csi-attacher`.
+    #[arg(long = "attach-detach-controller", default_value_t = false)]
+    attach_detach_controller: bool,
+
     /// Node name for the embedded kubelet
     #[arg(long, default_value = "node-1")]
     node_name: String,
@@ -351,6 +361,18 @@ async fn async_main() -> Result<()> {
                 insecure_skip_tls_verify: true,
             }
         });
+    // `--csi-attacher DRIVER=SOCKET`, same spec as the standalone binary (#3128).
+    let csi_attachers = args
+        .csi_attachers
+        .iter()
+        .map(|spec| {
+            spec.split_once('=')
+                .map(|(d, s)| (d.to_string(), s.to_string()))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("--csi-attacher {spec:?}: expected <driver-name>=<socket path>")
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let cm_config = rusternetes_controller_manager::ControllerManagerConfig {
         sync_interval: args.sync_interval,
         metrics_config,
@@ -358,6 +380,8 @@ async fn async_main() -> Result<()> {
         // All-in-one does not expose node-IPAM flags; pod-CIDR allocation is a
         // multi-node compose concern (flannel stack runs the standalone CM).
         node_ipam: None,
+        csi_attachers,
+        attach_detach_controller: args.attach_detach_controller,
         legacy_sa_token_clean_up_period:
             rusternetes_controller_manager::controllers::legacy_serviceaccount_token_cleaner::DEFAULT_CLEAN_UP_PERIOD,
     };

@@ -50,6 +50,11 @@ services:
       - "--tls-key-file"
       - "/etc/kubernetes/pki/api-server.key"
       - "--skip-auth"
+      # CSI attach/detach (#3128), off by default; needs a CSI driver socket
+      # mounted into this container:
+      #   - "--csi-attacher"
+      #   - "<driver-name>=/path/to/csi.sock"
+      #   - "--attach-detach-controller"
       # kube-proxy now runs in-process (no `--disable-proxy`). The image
       # ships iptables / iproute2 for that — see all-in-one.Dockerfile.
       - "--console-dir"

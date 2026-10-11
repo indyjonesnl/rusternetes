@@ -308,6 +308,20 @@ if [ -d "$PROJECT_ROOT/manifests/control-plane" ]; then
     else
         node_ipam_args=''
     fi
+    # CSI external-attacher(s) + AttachDetachController for the controller-manager
+    # (#3128): CSI_ATTACHERS="drv1=/sock1,drv2=/sock2" -> one --csi-attacher each;
+    # ATTACH_DETACH_CONTROLLER=1 -> --attach-detach-controller. Both off by default.
+    csi_attach_args=''
+    if [ -n "${CSI_ATTACHERS:-}" ]; then
+        IFS=',' read -r -a _csi_specs <<< "$CSI_ATTACHERS"
+        for _spec in "${_csi_specs[@]}"; do
+            csi_attach_args+='    - "--csi-attacher"\n    - "'"${_spec}"'"\n'
+        done
+    fi
+    if [ "${ATTACH_DETACH_CONTROLLER:-}" = "1" ]; then
+        csi_attach_args+='    - "--attach-detach-controller"\n'
+    fi
+    csi_attach_args="${csi_attach_args%\\n}"
     for src in "$PROJECT_ROOT/manifests/control-plane/"*.yaml; do
         [ -e "$src" ] || continue
         dst="$PROJECT_ROOT/.rusternetes/manifests/$(basename "$src")"
@@ -323,6 +337,11 @@ if [ -d "$PROJECT_ROOT/manifests/control-plane" ]; then
             sed -i "s|@NODE_IPAM_ARGS@|${node_ipam_args}|" "$dst"
         else
             sed -i '/@NODE_IPAM_ARGS@/d' "$dst"
+        fi
+        if [ -n "$csi_attach_args" ]; then
+            sed -i "s|@CSI_ATTACH_ARGS@|${csi_attach_args}|" "$dst"
+        else
+            sed -i '/@CSI_ATTACH_ARGS@/d' "$dst"
         fi
         echo "  $(basename "$src") -> $dst (image: $cp_image)"
         # Local build path: the image only exists in the docker/podman daemon —

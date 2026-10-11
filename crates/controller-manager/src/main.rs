@@ -385,6 +385,9 @@ async fn run_api_mode(args: Args) -> Result<()> {
     );
     let config = rusternetes_controller_manager::ControllerManagerConfig {
         sync_interval: args.sync_interval,
+        // The standalone binary spawns these itself (with leader election).
+        csi_attachers: Vec::new(),
+        attach_detach_controller: false,
         // Route HPA metric fetches through the same kubeconfig-derived
         // credentials as the data plane (CA + bearer token, honouring the
         // insecure flag) instead of the default mTLS client cert under
