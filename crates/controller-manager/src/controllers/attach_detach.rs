@@ -33,9 +33,18 @@
 //!   other entry alone. Upstream's `devicePath` is `""` for CSI (`Attach`
 //!   returns `""`, `csi_attacher.go:138`).
 //!
-//! NOT ported (tracked on #3053): force-detach on unhealthy node / `out-of-service` taint,
-//! the multi-attach event, CSI migration of in-tree volumes, ephemeral inline
-//! CSI volumes (never attachable, `CanAttach`), `maxWaitForUnmountDuration`.
+//! - force detach (`reconciler.go:205-260`): `SetDetachRequestTime` starts a
+//!   per-attachment timer; a volume still in `volumesInUse` is detached anyway
+//!   when the node is not Ready and `maxWaitForUnmountDuration` (default 6m,
+//!   `attach_detach_controller.go:92`) expired (unless
+//!   `disableForceDetachOnTimeout`), or the node has the
+//!   `node.kubernetes.io/out-of-service` taint. Re-desired attached volumes
+//!   reset the timer (`:342-346`). `verifySafeToDetach` has no equivalent
+//!   here (`VerifyVolumesAreAttached` is not ported).
+//!
+//! NOT ported (tracked on #3053): the multi-attach event, CSI migration of
+//! in-tree volumes, ephemeral inline CSI volumes (never attachable,
+//! `CanAttach`).
 //! Off by default; enabled with `--attach-detach-controller`.
 
 use super::pv_binder::is_pod_terminated;
@@ -101,13 +110,38 @@ fn multi_attach_allowed(pv: &PersistentVolume) -> bool {
     })
 }
 
+/// `ReconcilerMaxWaitForUnmountDuration` default
+/// (`attach_detach_controller.go:92`).
+pub const DEFAULT_MAX_WAIT_FOR_UNMOUNT: Duration = Duration::from_secs(6 * 60);
+
 pub struct AttachDetachController<S: Storage> {
     storage: Arc<S>,
+    /// `maxWaitForUnmountDuration`.
+    max_wait_for_unmount: Duration,
+    /// `disableForceDetachOnTimeout`.
+    disable_force_detach_on_timeout: bool,
+    /// `actualStateOfWorld` `detachRequestedTime`, keyed by VolumeAttachment name.
+    detach_requested: std::sync::Mutex<HashMap<String, std::time::Instant>>,
 }
 
 impl<S: Storage + 'static> AttachDetachController<S> {
     pub fn new(storage: Arc<S>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            max_wait_for_unmount: DEFAULT_MAX_WAIT_FOR_UNMOUNT,
+            disable_force_detach_on_timeout: false,
+            detach_requested: Default::default(),
+        }
+    }
+
+    pub fn with_max_wait_for_unmount(mut self, d: Duration) -> Self {
+        self.max_wait_for_unmount = d;
+        self
+    }
+
+    pub fn with_disable_force_detach_on_timeout(mut self, v: bool) -> Self {
+        self.disable_force_detach_on_timeout = v;
+        self
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
@@ -360,21 +394,62 @@ impl<S: Storage + 'static> AttachDetachController<S> {
             if desired.contains_key(&va.metadata.name) || va.metadata.deletion_timestamp.is_some() {
                 continue;
             }
-            // MountedByNode: node.status.volumesInUse (reconciler.go:231).
+            // SetDetachRequestTime (reconciler.go:205): first request starts
+            // the timer, later ones return the elapsed time.
+            let elapsed = {
+                let mut m = self.detach_requested.lock().unwrap();
+                m.entry(va.metadata.name.clone())
+                    .or_insert_with(std::time::Instant::now)
+                    .elapsed()
+            };
+            let max_wait_expired = elapsed > self.max_wait_for_unmount;
+            let node = node_list
+                .iter()
+                .find(|n| n.metadata.name == va.spec.node_name);
+            // nodeIsHealthy (:151-157): util/node.IsNodeReady; a node that
+            // cannot be read is not healthy.
+            let healthy = node.is_some_and(|n| {
+                n.status
+                    .as_ref()
+                    .and_then(|s| s.conditions.as_ref())
+                    .and_then(|c| c.iter().find(|c| c.condition_type == "Ready"))
+                    .is_some_and(|c| c.status == "True")
+            });
+            // :223-231
+            let force_timeout_expired = max_wait_expired && !self.disable_force_detach_on_timeout;
+            let force_detach = !healthy && force_timeout_expired;
+            // hasOutOfServiceTaint (:143-149), v1.TaintNodeOutOfService.
+            let out_of_service = node
+                .and_then(|n| n.spec.as_ref())
+                .and_then(|s| s.taints.as_ref())
+                .is_some_and(|t| {
+                    t.iter()
+                        .any(|t| t.key == "node.kubernetes.io/out-of-service")
+                });
+            // MountedByNode: node.status.volumesInUse (reconciler.go:231-239).
             let driver = pv.spec.csi.as_ref().map_or("", |c| c.driver.as_str());
             let unique = unique_volume_name(driver, handle);
-            let mounted = node_list
-                .iter()
-                .find(|n| n.metadata.name == va.spec.node_name)
+            let mounted = node
                 .and_then(|n| n.status.as_ref())
                 .and_then(|s| s.volumes_in_use.as_ref())
                 .is_some_and(|u| u.contains(&unique));
-            if mounted {
+            if mounted && !force_detach && !out_of_service {
                 debug!(
                     "Cannot detach volume {unique} from {}: still mounted",
                     va.spec.node_name
                 );
                 continue;
+            }
+            if mounted {
+                info!(
+                    "force detaching volume {unique} from {}: {}",
+                    va.spec.node_name,
+                    if force_detach {
+                        "maxWaitForUnmountDuration expired on an unhealthy node"
+                    } else {
+                        "node has out-of-service taint"
+                    }
+                );
             }
             // reconciler.go:245-265: drop the volume from the report and
             // update the node first; if that fails skip the detach and keep
@@ -397,6 +472,10 @@ impl<S: Storage + 'static> AttachDetachController<S> {
             self.storage
                 .delete_gracefully(&build_key("volumeattachments", None, &va.metadata.name))
                 .await?;
+            self.detach_requested
+                .lock()
+                .unwrap()
+                .remove(&va.metadata.name);
             info!(
                 "deleted VolumeAttachment {} (volume {unique}, node {})",
                 va.metadata.name, va.spec.node_name
@@ -417,6 +496,9 @@ impl<S: Storage + 'static> AttachDetachController<S> {
         for name in names {
             let w = &desired[name];
             if existing.contains(name.as_str()) {
+                // AttachStateAttached: "touch it to reset detachRequestedTime"
+                // (reconciler.go:342-346).
+                self.detach_requested.lock().unwrap().remove(name);
                 continue;
             }
             if !w.multi_attach

@@ -80,6 +80,16 @@ struct Args {
     #[arg(long = "attach-detach-controller", default_value_t = false)]
     attach_detach_controller: bool,
 
+    /// `AttachDetachControllerConfiguration.ReconcilerMaxWaitForUnmountDuration`
+    /// (default 6m): how long a volume still mounted on an unhealthy node is
+    /// kept attached before it is force detached.
+    #[arg(long, default_value = "360")]
+    attach_detach_max_wait_for_unmount_seconds: u64,
+
+    /// `AttachDetachControllerConfiguration.DisableForceDetachOnTimeout`.
+    #[arg(long, default_value_t = false)]
+    attach_detach_disable_force_detach_on_timeout: bool,
+
     /// `--default-fstype` of external-provisioner, for every `--csi-provisioner`.
     #[arg(long, default_value = "")]
     csi_default_fstype: String,
@@ -831,9 +841,15 @@ async fn main() -> Result<()> {
 
     // AttachDetachController (#3048), opt-in.
     if args.attach_detach_controller {
-        let attach_detach = Arc::new(controllers::attach_detach::AttachDetachController::new(
-            storage.clone(),
-        ));
+        let attach_detach = Arc::new(
+            controllers::attach_detach::AttachDetachController::new(storage.clone())
+                .with_max_wait_for_unmount(std::time::Duration::from_secs(
+                    args.attach_detach_max_wait_for_unmount_seconds,
+                ))
+                .with_disable_force_detach_on_timeout(
+                    args.attach_detach_disable_force_detach_on_timeout,
+                ),
+        );
         spawn_controller!("AttachDetach controller", leader_elector, {
             let controller = attach_detach.clone();
             async move {
