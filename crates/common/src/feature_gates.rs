@@ -709,4 +709,57 @@ mod tests {
         assert!(!enabled(Feature::StorageCapacityScoring));
         reset_to_defaults();
     }
+
+    // feature_gate_test.go TestFeatureGateFlag "AllAlpha=true" / "AllBeta=true":
+    // the special gates flip every Alpha (resp. Beta) gate not set explicitly.
+    #[test]
+    #[serial]
+    fn all_alpha_and_all_beta_toggle_by_prerelease() {
+        reset_to_defaults();
+        // StorageCapacityScoring: Alpha, default off. PodDeletionCost: Beta, default on.
+        // MaxUnavailableStatefulSet: Beta, default off.
+        set_from_str("AllAlpha=true").unwrap();
+        assert!(enabled(Feature::StorageCapacityScoring));
+        assert!(enabled(Feature::DRADeviceTaints));
+        assert!(
+            !enabled(Feature::MaxUnavailableStatefulSet),
+            "Beta untouched"
+        );
+        reset_to_defaults();
+        set_from_str("AllBeta=true").unwrap();
+        assert!(enabled(Feature::MaxUnavailableStatefulSet));
+        assert!(!enabled(Feature::StorageCapacityScoring), "Alpha untouched");
+        reset_to_defaults();
+        set_from_str("AllBeta=false").unwrap();
+        assert!(!enabled(Feature::PodDeletionCost));
+        reset_to_defaults();
+    }
+
+    // "TestAlpha=false,AllAlpha=true" and "AllAlpha=true,TestAlpha=false":
+    // explicit wins regardless of order.
+    #[test]
+    #[serial]
+    fn explicit_gate_overrides_all_alpha_in_either_order() {
+        for arg in [
+            "StorageCapacityScoring=false,AllAlpha=true",
+            "AllAlpha=true,StorageCapacityScoring=false",
+        ] {
+            reset_to_defaults();
+            set_from_str(arg).unwrap();
+            assert!(!enabled(Feature::StorageCapacityScoring), "{arg}");
+            assert!(enabled(Feature::DRADeviceTaints), "{arg}");
+        }
+        reset_to_defaults();
+    }
+
+    // "AllAlpha=banana" -> parse error, nothing applied.
+    #[test]
+    #[serial]
+    fn all_alpha_bad_value_errors() {
+        reset_to_defaults();
+        assert!(set_from_str("AllAlpha=banana")
+            .unwrap_err()
+            .starts_with("invalid value of AllAlpha"));
+        reset_to_defaults();
+    }
 }
