@@ -1506,14 +1506,17 @@ mod tests {
     }
 
     // updateCIDRsAllocation: node vanished between allocate and write.
+    // pkg/controller/nodeipam/ipam/range_allocator.go:395-399 returns the
+    // lister error WITHOUT releasing allocatedCIDRs (leaked, by design).
     #[tokio::test]
-    async fn allocation_for_vanished_node_is_released() {
+    async fn allocation_for_vanished_node_leaks_and_errors_like_upstream() {
         let storage = Arc::new(MemoryStorage::new());
         let ra = allocator(&storage, "10.10.0.0/16", 24, &[]).unwrap();
-        ra.allocate_or_occupy_cidr(&node_with_cidr("ghost", None))
+        assert!(ra
+            .allocate_or_occupy_cidr(&node_with_cidr("ghost", None))
             .await
-            .unwrap();
-        assert_eq!(ra.cidr_sets[0].allocated(), 0);
+            .is_err());
+        assert_eq!(ra.cidr_sets[0].allocated(), 1);
     }
 
     // updateCIDRsAllocation: "Node already has a CIDR allocated. Releasing the new one".
@@ -1846,11 +1849,10 @@ mod tests {
         );
     }
 
-    // Deviation from upstream (which leaks the set-0 CIDR when set 1 is
-    // exhausted, then again on every rate-limited retry): nothing was
-    // written, so the earlier allocations are handed back.
+    // range_allocator.go:316-339 AllocateOrOccupyCIDR returns the set-1 error
+    // without releasing set 0's CIDR (leaked, again on every retry).
     #[tokio::test]
-    async fn dual_stack_partial_allocation_failure_releases_earlier_sets() {
+    async fn dual_stack_partial_allocation_failure_leaks_earlier_sets_like_upstream() {
         let storage = Arc::new(MemoryStorage::new());
         let n = node_with_cidrs("node0", &[]);
         put(&storage, &n).await;
@@ -1864,7 +1866,9 @@ mod tests {
         ra.cidr_sets[1].allocate_next().unwrap();
         ra.cidr_sets[1].allocate_next().unwrap();
         assert!(ra.allocate_or_occupy_cidr(&n).await.is_err());
-        assert_eq!(ra.cidr_sets[0].allocated(), 0);
+        assert_eq!(ra.cidr_sets[0].allocated(), 1);
+        assert!(ra.allocate_or_occupy_cidr(&n).await.is_err());
+        assert_eq!(ra.cidr_sets[0].allocated(), 2);
         assert!(cidrs_of(&storage, "node0").await.is_empty());
         let events: Vec<Event> = storage.list(&build_prefix("events", None)).await.unwrap();
         assert!(events.iter().any(|e| e.reason == "CIDRNotAvailable"));
