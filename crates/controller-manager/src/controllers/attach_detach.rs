@@ -101,13 +101,41 @@ fn multi_attach_allowed(pv: &PersistentVolume) -> bool {
     })
 }
 
+/// `ReconcilerMaxWaitForUnmountDuration` default
+/// (`attach_detach_controller.go:92`).
+pub const DEFAULT_MAX_WAIT_FOR_UNMOUNT: Duration = Duration::from_secs(6 * 60);
+
 pub struct AttachDetachController<S: Storage> {
     storage: Arc<S>,
+    /// `maxWaitForUnmountDuration`.
+    #[allow(dead_code)]
+    max_wait_for_unmount: Duration,
+    /// `disableForceDetachOnTimeout`.
+    #[allow(dead_code)]
+    disable_force_detach_on_timeout: bool,
+    /// `actualStateOfWorld` `detachRequestedTime`, keyed by VolumeAttachment name.
+    #[allow(dead_code)]
+    detach_requested: std::sync::Mutex<HashMap<String, std::time::Instant>>,
 }
 
 impl<S: Storage + 'static> AttachDetachController<S> {
     pub fn new(storage: Arc<S>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            max_wait_for_unmount: DEFAULT_MAX_WAIT_FOR_UNMOUNT,
+            disable_force_detach_on_timeout: false,
+            detach_requested: Default::default(),
+        }
+    }
+
+    pub fn with_max_wait_for_unmount(mut self, d: Duration) -> Self {
+        self.max_wait_for_unmount = d;
+        self
+    }
+
+    pub fn with_disable_force_detach_on_timeout(mut self, v: bool) -> Self {
+        self.disable_force_detach_on_timeout = v;
+        self
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {

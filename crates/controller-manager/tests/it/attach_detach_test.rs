@@ -377,3 +377,111 @@ async fn volume_still_mounted_stays_reported_attached() {
     assert_eq!(vas(&s).await.len(), 1);
     assert_eq!(node_attached(&s, "node-1").await, vec![unique()]);
 }
+
+// ---- force detach (reconciler.go:200-300) ----
+
+const WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// A node whose volume is still mounted (volumesInUse) with the given Ready
+/// status and optional out-of-service taint.
+async fn seed_mounted_node(s: &MemoryStorage, ready: &str, taint: bool) {
+    let mut node = json!({
+        "apiVersion": "v1", "kind": "Node",
+        "metadata": {"name": "node-1"},
+        "spec": {},
+        "status": {
+            "volumesInUse": [unique()],
+            "conditions": [{"type": "Ready", "status": ready}]
+        }
+    });
+    if taint {
+        node["spec"]["taints"] =
+            json!([{"key": "node.kubernetes.io/out-of-service", "effect": "NoExecute"}]);
+    }
+    put(s, "nodes", None, "node-1", node).await;
+}
+
+/// Attach, then delete the pod so the volume becomes undesired.
+async fn attach_then_orphan(s: &Arc<MemoryStorage>, c: &AttachDetachController<MemoryStorage>) {
+    seed_volume(s, json!(["ReadWriteOnce"])).await;
+    seed_pod_p(s).await;
+    c.reconcile_all().await.unwrap();
+    assert_eq!(vas(s).await.len(), 1);
+    s.delete(&build_key("pods", Some("ns"), "p")).await.unwrap();
+}
+
+#[tokio::test]
+async fn force_detaches_mounted_volume_on_unhealthy_node_after_timeout() {
+    // Test_Run_OneVolumeDetachOnUnhealthyNode
+    let s = Arc::new(MemoryStorage::new());
+    seed_mounted_node(&s, "False", false).await;
+    let c = controller(&s).with_max_wait_for_unmount(WAIT);
+    attach_then_orphan(&s, &c).await;
+
+    c.reconcile_all().await.unwrap(); // sets detachRequestedTime
+    assert_eq!(
+        vas(&s).await.len(),
+        1,
+        "not before maxWaitForUnmountDuration"
+    );
+    tokio::time::sleep(WAIT * 2).await;
+    c.reconcile_all().await.unwrap();
+    assert!(vas(&s).await.is_empty());
+}
+
+#[tokio::test]
+async fn does_not_force_detach_mounted_volume_on_healthy_node() {
+    // "the volume will be detached even after the maxWaitForUnmountDuration
+    // expires as volume is not unmounted and the node is healthy" (sic: kept)
+    let s = Arc::new(MemoryStorage::new());
+    seed_mounted_node(&s, "True", false).await;
+    let c = controller(&s).with_max_wait_for_unmount(WAIT);
+    attach_then_orphan(&s, &c).await;
+    c.reconcile_all().await.unwrap();
+    tokio::time::sleep(WAIT * 2).await;
+    c.reconcile_all().await.unwrap();
+    assert_eq!(vas(&s).await.len(), 1);
+}
+
+#[tokio::test]
+async fn re_desired_volume_resets_detach_request_time() {
+    // attachDesiredVolumes: AttachStateAttached => ResetDetachRequestTime.
+    let s = Arc::new(MemoryStorage::new());
+    seed_mounted_node(&s, "False", false).await;
+    let c = controller(&s).with_max_wait_for_unmount(WAIT);
+    attach_then_orphan(&s, &c).await;
+    c.reconcile_all().await.unwrap();
+    tokio::time::sleep(WAIT * 2).await;
+    seed_pod_p(&s).await; // wanted again before the next pass
+    c.reconcile_all().await.unwrap();
+    s.delete(&build_key("pods", Some("ns"), "p")).await.unwrap();
+    c.reconcile_all().await.unwrap(); // timer restarts here
+    assert_eq!(vas(&s).await.len(), 1);
+}
+
+#[tokio::test]
+async fn force_detach_timeout_can_be_disabled() {
+    // Test_Run_OneVolumeDetachOnUnhealthyNodeWithForceDetachOnUnmountDisabled
+    let s = Arc::new(MemoryStorage::new());
+    seed_mounted_node(&s, "False", false).await;
+    let c = controller(&s)
+        .with_max_wait_for_unmount(WAIT)
+        .with_disable_force_detach_on_timeout(true);
+    attach_then_orphan(&s, &c).await;
+    c.reconcile_all().await.unwrap();
+    tokio::time::sleep(WAIT * 2).await;
+    c.reconcile_all().await.unwrap();
+    assert_eq!(vas(&s).await.len(), 1);
+}
+
+#[tokio::test]
+async fn out_of_service_taint_detaches_mounted_volume_immediately() {
+    // Test_Run_OneVolumeDetachOnOutOfServiceTaintedNode; the taint applies even
+    // when the node is healthy and with force-detach disabled.
+    let s = Arc::new(MemoryStorage::new());
+    seed_mounted_node(&s, "True", true).await;
+    let c = controller(&s).with_disable_force_detach_on_timeout(true);
+    attach_then_orphan(&s, &c).await;
+    c.reconcile_all().await.unwrap();
+    assert!(vas(&s).await.is_empty());
+}
