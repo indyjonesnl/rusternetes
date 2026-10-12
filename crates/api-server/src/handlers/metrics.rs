@@ -11,17 +11,9 @@ use rusternetes_common::{
 };
 use rusternetes_storage::{build_key, build_prefix, Storage};
 
-/// `metrics.k8s.io/v1beta1` NodeMetrics TypeMeta. Flattened into the struct
+/// `metrics.k8s.io/v1beta1` PodMetrics TypeMeta. Flattened into the struct
 /// since #1916, so responses still name their type while a body that omits it
 /// still decodes.
-fn node_metrics_type_meta() -> rusternetes_common::types::TypeMeta {
-    rusternetes_common::types::TypeMeta {
-        api_version: "metrics.k8s.io/v1beta1".to_string(),
-        kind: "NodeMetrics".to_string(),
-    }
-}
-
-/// As [`node_metrics_type_meta`], for PodMetrics.
 fn pod_metrics_type_meta() -> rusternetes_common::types::TypeMeta {
     rusternetes_common::types::TypeMeta {
         api_version: "metrics.k8s.io/v1beta1".to_string(),
@@ -197,62 +189,21 @@ pub async fn list_node_metrics(
 
     crate::handlers::validate_synthesized_list_options(&params)?;
 
-    // metrics-server pkg/api/node.go builds NodeMetrics with the source
-    // node's labels; selectors match those, so overlay them from the Node.
+    // metrics-server pkg/api/node.go List: list the nodes, then
+    // pkg/storage/node.go GetMetrics, which `continue`s past a node with no
+    // stored point (no zero-usage entry) and labels each result with
+    // `Labels: node.Labels`; getMetrics sorts by name.
     let nodes_prefix = build_prefix("nodes", None);
     let nodes: Vec<rusternetes_common::resources::Node> =
         state.storage.as_ref().list(&nodes_prefix).await?;
-    let node_labels: HashMap<String, HashMap<String, String>> = nodes
-        .iter()
-        .filter_map(|n| {
-            n.metadata
-                .labels
-                .clone()
-                .map(|l| (n.metadata.name.clone(), l))
-        })
-        .collect();
-
-    // Read all node metrics from storage
-    let mut metrics: Vec<NodeMetrics> = state
-        .storage
-        .as_ref()
-        .list("/registry/metrics.k8s.io/nodes/")
-        .await
-        .unwrap_or_default();
-
-    // If no metrics in storage yet, return empty entries for each node
-    if metrics.is_empty() {
-        let mut metrics_list = Vec::new();
-        for node in nodes {
-            let mut usage = BTreeMap::new();
-            usage.insert("cpu".to_string(), "0m".to_string());
-            usage.insert("memory".to_string(), "0Mi".to_string());
-            metrics_list.push(NodeMetrics {
-                type_meta: node_metrics_type_meta(),
-                metadata: rusternetes_common::types::ObjectMeta {
-                    creation_timestamp: Some(Utc::now()),
-                    labels: node.metadata.labels.clone(),
-                    ..rusternetes_common::types::ObjectMeta::new(node.metadata.name.clone())
-                },
-                timestamp: Utc::now(),
-                window: "30s".to_string(),
-                usage,
-            });
-        }
-        // store.go ListPredicate: apply label/field selectors.
-        crate::handlers::filtering::apply_selectors(&mut metrics_list, &params)?;
-        let mut list = List::new("NodeMetricsList", "metrics.k8s.io/v1beta1", metrics_list);
-        list.metadata.resource_version = Some(
-            crate::handlers::list_collection_resource_version(&state.storage, &list.items).await,
-        );
-        return Ok(Json(list));
-    }
-
-    for m in metrics.iter_mut() {
-        if let Some(l) = node_labels.get(&m.metadata.name) {
-            m.metadata.labels = Some(l.clone());
+    let mut metrics: Vec<NodeMetrics> = Vec::new();
+    for node in &nodes {
+        if let Some(m) = node_metrics(state.storage.as_ref(), node).await {
+            metrics.push(m);
         }
     }
+    metrics.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
+    // store.go ListPredicate: apply label/field selectors.
     crate::handlers::filtering::apply_selectors(&mut metrics, &params)?;
     let mut list = List::new("NodeMetricsList", "metrics.k8s.io/v1beta1", metrics);
     list.metadata.resource_version =
@@ -603,7 +554,10 @@ mod overlay_tests {
 
         // Kubelet-published sample without labels.
         let stored = NodeMetrics {
-            type_meta: node_metrics_type_meta(),
+            type_meta: rusternetes_common::types::TypeMeta {
+                api_version: "metrics.k8s.io/v1beta1".to_string(),
+                kind: "NodeMetrics".to_string(),
+            },
             metadata: rusternetes_common::types::ObjectMeta::new("n1"),
             timestamp: Utc::now(),
             window: "30s".to_string(),
