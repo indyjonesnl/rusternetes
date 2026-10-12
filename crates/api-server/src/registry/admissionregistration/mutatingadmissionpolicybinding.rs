@@ -22,8 +22,8 @@ use crate::registry::generic::store::{
 use crate::registry::generic::Store;
 use crate::registry::rbac::policybased::Noop;
 use crate::registry::rest::{
-    GroupResource, NamespaceScopedStrategy, RequestContext, RestCreateStrategy, RestDeleteStrategy,
-    RestUpdateStrategy,
+    with_group_kind, GroupResource, NamespaceScopedStrategy, RequestContext, RestCreateStrategy,
+    RestDeleteStrategy, RestUpdateStrategy,
 };
 
 /// `SetObjectDefaults_MutatingAdmissionPolicyBinding`
@@ -249,5 +249,67 @@ mod tests {
         changed.spec.as_mut().unwrap().policy_name = Some("other".to_string());
         strategy.prepare_for_update(&ctx, &mut changed, &old);
         assert_eq!(changed.metadata.generation, Some(3));
+    }
+}
+
+#[cfg(test)]
+mod invalid_status_tests {
+    use super::*;
+    use rusternetes_common::auth::UserInfo;
+    use rusternetes_common::authz::AlwaysDenyAuthorizer;
+
+    /// `MutatingAdmissionPolicyBinding` strategy `Validate` appends the authz error as a
+    /// `field.Forbidden`, and `BeforeCreate` / `BeforeUpdate` wrap the list in
+    /// `errors.NewInvalid(kind.GroupKind(), name, errs)`
+    /// (rest/create.go:130-137, rest/update.go:131-141; errors.go:284-312), so
+    /// the status is `<Kind>.<group> "<name>" is invalid: ...` with details.
+    #[tokio::test]
+    async fn authz_denial_is_a_new_invalid_status() {
+        let obj: MutatingAdmissionPolicyBinding = serde_json::from_value(serde_json::json!({"apiVersion": "admissionregistration.k8s.io/v1", "kind": "MutatingAdmissionPolicyBinding", "metadata": {"name": "foo"}, "spec": {
+            "policyName": "p.example.com",
+            "paramRef": {"name": "x", "parameterNotFoundAction": "Deny"}}})).unwrap();
+        let hook = ParamRefAuthz {
+            authorizer: Arc::new(AlwaysDenyAuthorizer),
+            storage: Arc::new(StorageBackend::Memory(Arc::new(
+                rusternetes_storage::MemoryStorage::new(),
+            ))),
+        };
+        let user = UserInfo {
+            username: "alice".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        };
+        let ctx = RequestContext::new(None).with_user(&user);
+        let Err(Error::Status(st)) = hook
+            .begin_create(&ctx, &mut obj.clone(), &CreateOptions::default())
+            .await
+        else {
+            panic!("expected a Status error from begin_create")
+        };
+        assert_eq!(st.code, Some(422));
+        assert_eq!(st.reason.as_deref(), Some("Invalid"));
+        let msg = st.message.clone().unwrap_or_default();
+        assert!(
+            msg.starts_with(r#"MutatingAdmissionPolicyBinding.admissionregistration.k8s.io "foo" is invalid: spec.paramRef: Forbidden: "#),
+            "{msg}"
+        );
+        let d = st.details.unwrap();
+        assert_eq!(d.group.as_deref(), Some("admissionregistration.k8s.io"));
+        assert_eq!(d.kind.as_deref(), Some("MutatingAdmissionPolicyBinding"));
+        assert_eq!(d.name.as_deref(), Some("foo"));
+
+        let Err(Error::Status(st)) = hook
+            .begin_update(
+                &ctx,
+                &mut obj.clone(),
+                &mut MutatingAdmissionPolicyBinding::new("foo"),
+                &UpdateOptions::default(),
+            )
+            .await
+        else {
+            panic!("expected a Status error from begin_update")
+        };
+        assert_eq!(st.reason.as_deref(), Some("Invalid"));
     }
 }
