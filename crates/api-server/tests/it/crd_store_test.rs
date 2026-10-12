@@ -327,6 +327,77 @@ async fn deleting_a_crd_deletes_its_instances() {
     assert_eq!(out["items"].as_array().map(Vec::len), Some(0), "{out}");
 }
 
+/// The CRD finalizer runs off its own workqueue, not inside the DELETE
+/// (finalizer/crd_finalizer.go:57-61 queue, :102-105 AddFunc/UpdateFunc
+/// enqueue, :296-308 `processNextWorkItem`): `REST.Delete` returns right after
+/// the deletionTimestamp+finalizer write while `deleteInstances` is still
+/// waiting on an instance that holds a finalizer (:253-267); the CRD goes
+/// once the instance does.
+#[tokio::test]
+async fn delete_returns_before_the_finalizer_drains_the_instances() {
+    let api = TestApiServer::new();
+    let (status, out) = api
+        .post(
+            "/api/v1/namespaces",
+            &json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "default"}}),
+        )
+        .await;
+    assert!(
+        status.is_success() || status == StatusCode::CONFLICT,
+        "{out}"
+    );
+    create(&api, &crd("widgets", "Widget", "example.com")).await;
+    let cr = "/apis/example.com/v1/namespaces/default/widgets";
+    let (status, out) = api
+        .post(
+            cr,
+            &json!({"apiVersion": "example.com/v1", "kind": "Widget",
+                "metadata": {"name": "w1", "finalizers": ["example.com/hold"]}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{out}");
+
+    let crd_url = format!("{CRDS}/widgets.example.com");
+    let (status, out) =
+        tokio::time::timeout(std::time::Duration::from_secs(3), api.delete(&crd_url))
+            .await
+            .expect("DELETE must not wait for the CRD finalizer");
+    assert_eq!(status, StatusCode::OK, "{out}");
+
+    // The finalizer is working: Terminating, the CRD still there.
+    let mut terminating = None;
+    for _ in 0..100 {
+        let (status, out) = api.get(&crd_url).await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        if condition(&out, "Terminating").is_some_and(|c| c["status"] == "True") {
+            terminating = Some(out);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let out = terminating.expect("the finalizer never set Terminating");
+    assert_eq!(
+        condition(&out, "Terminating").unwrap()["reason"],
+        "InstanceDeletionInProgress",
+        "{out}"
+    );
+
+    // Releasing the instance lets the finalizer finish (polled every 5s).
+    let (status, mut inst) = api.get(&format!("{cr}/w1")).await;
+    assert_eq!(status, StatusCode::OK, "{inst}");
+    inst["metadata"]["finalizers"] = json!([]);
+    let (status, out) = api.put(&format!("{cr}/w1"), &inst).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    for _ in 0..400 {
+        let (status, _) = api.get(&crd_url).await;
+        if status == StatusCode::NOT_FOUND {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the CRD was never finalized");
+}
+
 /// `REST.Delete` (etcd.go:97-110): a UID precondition that does not match
 /// is a conflict.
 #[tokio::test]
