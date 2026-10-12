@@ -10,6 +10,7 @@ pub mod cel_env;
 pub mod cel_struct;
 pub mod cloud_provider;
 pub mod clusterauthenticationtrust;
+pub mod compatibility;
 pub mod csi_translation;
 pub mod defaults;
 pub mod deletion;

@@ -50,10 +50,27 @@ struct Args {
     #[arg(long, default_value = "info")]
     log_level: String,
 
-    /// Comma-separated `Gate=bool` pairs, e.g. `StorageCapacityScoring=true`
-    /// (upstream `--feature-gates`, component-base featuregate `Set`).
-    #[arg(long, default_value = "")]
-    feature_gates: String,
+    /// Comma-separated `[component:]Gate=bool` pairs, e.g.
+    /// `StorageCapacityScoring=true` or `kube:StorageCapacityScoring=true`;
+    /// may be repeated (upstream `--feature-gates`,
+    /// compatibility/registry.go:249-253). The component prefix defaults to
+    /// `kube`; do not mix prefixed and unprefixed pairs.
+    #[arg(long)]
+    feature_gates: Vec<String>,
+
+    /// The version the component emulates (APIs, features, ...), as
+    /// `[component=]major.minor`, e.g. `--emulated-version=1.34`. Options are:
+    /// kube=1.32..1.35(default:1.35) (upstream `--emulated-version`,
+    /// compatibility/registry.go:231-236).
+    #[arg(long, value_delimiter = ',')]
+    emulated_version: Vec<String>,
+
+    /// The min version of control plane components the server should be
+    /// compatible with; must be <= `--emulated-version`. Options are:
+    /// kube=1.32..1.35(default:1.34) (upstream `--min-compatibility-version`,
+    /// compatibility/registry.go:243-247).
+    #[arg(long, value_delimiter = ',')]
+    min_compatibility_version: Vec<String>,
 
     /// Path to a KubeSchedulerConfiguration file (YAML/JSON). Only
     /// `profiles[0].pluginConfig[VolumeBinding].args` (bindTimeoutSeconds,
@@ -112,8 +129,14 @@ async fn main() -> Result<()> {
 
     rusternetes_common::tracing::init_basic_tracing("scheduler", &args.log_level)?;
 
-    rusternetes_common::feature_gates::set_from_str(&args.feature_gates)
-        .map_err(|e| anyhow::anyhow!("invalid --feature-gates: {e}"))?;
+    // `ComponentGlobalsRegistry.Set()` (cmd/kube-scheduler/app/server.go:105) then
+    // options `Validate` (compatibility/registry.go:430-451).
+    rusternetes_common::compatibility::apply_flags(
+        &args.emulated_version,
+        &args.min_compatibility_version,
+        &args.feature_gates,
+    )
+    .map_err(|e| anyhow::anyhow!("invalid --feature-gates/--emulated-version: {e}"))?;
 
     let volume_binding_args = match &args.config {
         Some(path) => scheduler_config::load_volume_binding_args(path)
