@@ -87,12 +87,16 @@ pub fn observe_match_condition_eval_error(
     step_type: &str,
     operation: &str,
 ) {
-    let _ = (name, kind, step_type, operation);
+    MATCH_CONDITION_EVAL_ERRORS
+        .with_label_values(&[name, kind, step_type, operation])
+        .inc();
 }
 
 /// `ObserveMatchConditionExclusion` (:323-326).
 pub fn observe_match_condition_exclusion(name: &str, kind: &str, step_type: &str, operation: &str) {
-    let _ = (name, kind, step_type, operation);
+    MATCH_CONDITION_EXCLUSIONS
+        .with_label_values(&[name, kind, step_type, operation])
+        .inc();
 }
 
 /// `ObserveMatchConditionEvaluationTime` (:328-331).
@@ -103,7 +107,9 @@ pub fn observe_match_condition_evaluation_time(
     step_type: &str,
     operation: &str,
 ) {
-    let _ = (elapsed, name, kind, step_type, operation);
+    MATCH_CONDITION_EVALUATION_SECONDS
+        .with_label_values(&[name, kind, step_type, operation])
+        .observe(elapsed.as_secs_f64());
 }
 
 #[cfg(test)]

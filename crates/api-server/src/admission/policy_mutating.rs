@@ -20,8 +20,9 @@
 //!   to a typed object, and the typed `ConvertToVersion` after a patch
 //!   (dispatcher.go:253-260), are identities here; so is the final
 //!   `Convert(versioned, attributes.GetObject())` (:211).
-//! - The `celmetrics` observations (`ObserveRejection` / `ObserveAdmission`)
-//!   are not ported yet (#3229). `NewCachingAuthorizer` is (#3228,
+//! - The `celmetrics` observations (`ObserveRejection` / `ObserveAdmission`,
+//!   dispatcher.go:196, :205) are ported (#3229, `policy_mutating_metrics.rs`).
+//!   `NewCachingAuthorizer` is (#3228,
 //!   `caching_authorizer.rs`) and reaches the matcher; it reaches CEL through
 //!   the `Patcher` once the `patch/` package exists.
 //! - `CompositionEnv.CreateContext` (:131-133) belongs to the CEL compiler and
@@ -32,6 +33,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
@@ -47,7 +49,7 @@ use super::policy_dispatch::{
     PolicyInvocation, PolicyKey, PolicyReinvokeContext, VersionedAttributeAccessor,
 };
 use super::policy_matching::Attributes;
-use super::policy_mutating_metrics::MutationErrorType;
+use super::policy_mutating_metrics::{observe_admission, observe_rejection, MutationErrorType};
 
 /// mutating/plugin.go `PluginName`.
 pub const PLUGIN_NAME: &str = "MutatingAdmissionPolicy";
@@ -237,8 +239,14 @@ pub fn compile_policy(policy: &MutatingAdmissionPolicy) -> MutatingEvaluator {
 
 /// errors.go `ErrorType`.
 pub fn error_type(err: Option<&str>) -> MutationErrorType {
-    let _ = err;
-    MutationErrorType::InvalidError
+    match err {
+        None => MutationErrorType::NoError,
+        Some(e) if e.starts_with("compilation") => MutationErrorType::CompileError,
+        Some(e) if e.starts_with("validation failed due to running out of cost budget") => {
+            MutationErrorType::OutOfBudget
+        }
+        Some(_) => MutationErrorType::InvalidError,
+    }
 }
 
 /// `patch.TypeConverterManager.GetTypeConverter != nil`.
@@ -496,7 +504,8 @@ impl MutatingDispatcher {
                 }
 
                 let patcher = invocation.evaluator.mutators[mutation_index].as_ref();
-                if let Err(err) = self
+                let start_time = Instant::now();
+                let result = self
                     .dispatch_one(
                         patcher,
                         attr,
@@ -505,8 +514,21 @@ impl MutatingDispatcher {
                         &invocation.resource,
                         invocation.param.as_ref(),
                     )
-                    .await
-                {
+                    .await;
+                let elapsed = start_time.elapsed();
+                if let Err(err) = result {
+                    // dispatcher.go:196: ObserveRejection precedes the
+                    // StatusError / config-error split.
+                    let message = match &err {
+                        PatchError::Status(e) => e.to_string(),
+                        PatchError::Other(m) => m.clone(),
+                    };
+                    observe_rejection(
+                        elapsed,
+                        PolicyAccessor::name(invocation.policy),
+                        BindingAccessor::name(invocation.binding),
+                        error_type(Some(&message)),
+                    );
                     match err {
                         PatchError::Status(e) => return Err(e),
                         PatchError::Other(m) => {
@@ -514,6 +536,14 @@ impl MutatingDispatcher {
                             continue;
                         }
                     }
+                } else {
+                    // dispatcher.go:205.
+                    observe_admission(
+                        elapsed,
+                        PolicyAccessor::name(invocation.policy),
+                        BindingAccessor::name(invocation.binding),
+                        MutationErrorType::NoError,
+                    );
                 }
             }
             let current = versioned

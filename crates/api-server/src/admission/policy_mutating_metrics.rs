@@ -75,6 +75,14 @@ pub(crate) static POLICY_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
     h
 });
 
+fn record(elapsed: Duration, policy: &str, binding: &str, error_type: MutationErrorType) {
+    let labels = [policy, binding, error_type.as_str()];
+    POLICY_CHECK.with_label_values(&labels).inc();
+    POLICY_LATENCY
+        .with_label_values(&labels)
+        .observe(elapsed.as_secs_f64());
+}
+
 /// `ObserveAdmission` (:100-104).
 pub fn observe_admission(
     elapsed: Duration,
@@ -82,7 +90,7 @@ pub fn observe_admission(
     binding: &str,
     error_type: MutationErrorType,
 ) {
-    let _ = (elapsed, policy, binding, error_type);
+    record(elapsed, policy, binding, error_type);
 }
 
 /// `ObserveRejection` (:106-110).
@@ -92,7 +100,7 @@ pub fn observe_rejection(
     binding: &str,
     error_type: MutationErrorType,
 ) {
-    let _ = (elapsed, policy, binding, error_type);
+    record(elapsed, policy, binding, error_type);
 }
 
 #[cfg(test)]

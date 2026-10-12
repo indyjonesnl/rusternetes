@@ -9,16 +9,21 @@
 //! (`namespaceObject` is nil, :98), and `Match` then reads the results in
 //! order.
 //!
-//! Deviations: the CEL cost budget (`RuntimeCELCostBudgetMatchConditions`),
-//! `admissionmetrics` observations are not ported. The request authorizer
+//! The `admissionmetrics` observations (matcher.go:88, :113, :116, :125) are
+//! ported (#3229, `admission_metrics.rs`).
+//!
+//! Deviations: the CEL cost budget (`RuntimeCELCostBudgetMatchConditions`)
+//! is not ported. The request authorizer
 //! (`Match`'s `authz` argument, a `NewCachingAuthorizer` from the dispatcher,
 //! #3228) is accepted but unused until the CEL `authorizer` library is bound. A non-`bool` result is an
 //! evaluation error here; the compile-time rejection (`ReturnTypes`) happens at
 //! policy / configuration validation (`cel_env::output_type_failure`).
 
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use async_trait::async_trait;
+use rusternetes_common::admission::Operation;
 use rusternetes_common::authz::Authorizer;
 use rusternetes_common::cel::CELEvaluator;
 use rusternetes_common::cel_struct::TypeCheck;
@@ -26,7 +31,10 @@ use rusternetes_common::resources::admission_webhook::MatchCondition;
 use rusternetes_common::resources::validating_admission_policy::FailurePolicy;
 use serde_json::Value;
 
-use super::admission_metrics::{KIND_POLICY, STEP_VALIDATE};
+use super::admission_metrics::{
+    observe_match_condition_eval_error, observe_match_condition_evaluation_time, KIND_POLICY,
+    STEP_VALIDATE,
+};
 use super::policy_json_patch::evaluate_expression;
 use super::policy_matching::Attributes;
 use super::policy_mutating::{
@@ -106,6 +114,16 @@ pub fn new_matcher(
     )
 }
 
+/// `string(versionedAttr.GetOperation())`: `admission.Operation` values.
+fn operation_str(op: &Operation) -> &'static str {
+    match op {
+        Operation::Create => "CREATE",
+        Operation::Update => "UPDATE",
+        Operation::Delete => "DELETE",
+        Operation::Connect => "CONNECT",
+    }
+}
+
 /// `utilerrors.NewAggregate(...).Error()`.
 fn aggregate(errors: &[String]) -> String {
     match errors {
@@ -124,9 +142,21 @@ impl ConditionMatcher for Matcher {
         param: Option<&Value>,
         _authz: &dyn Authorizer,
     ) -> MatchResult {
+        let t = Instant::now();
+        let operation = operation_str(&attributes.operation);
+        let observe_time = |t: Instant| {
+            observe_match_condition_evaluation_time(
+                t.elapsed(),
+                &self.object_name,
+                &self.matcher_kind,
+                &self.matcher_type,
+                operation,
+            )
+        };
         let results = match self.filter.for_input(attributes, versioned, param).await {
             Ok(r) => r,
             Err(err) => {
+                observe_time(t);
                 // filter returning error is unexpected and not an evaluation
                 // error. Fail fails the request; Ignore skips the policy.
                 return if self.ignore {
@@ -143,9 +173,18 @@ impl ConditionMatcher for Matcher {
         let mut errors: Vec<String> = Vec::new();
         for r in &results {
             match &r.result {
-                Err(e) => errors.push(e.clone()),
+                Err(e) => {
+                    errors.push(e.clone());
+                    observe_match_condition_eval_error(
+                        &self.object_name,
+                        &self.matcher_kind,
+                        &self.matcher_type,
+                        operation,
+                    );
+                }
                 // If any condition false, skip calling webhook always
                 Ok(false) => {
+                    observe_time(t);
                     return MatchResult {
                         matches: false,
                         error: None,
@@ -156,6 +195,7 @@ impl ConditionMatcher for Matcher {
             }
         }
         if !errors.is_empty() {
+            observe_time(t);
             // If mix of true and eval errors then resort to fail policy.
             return if self.ignore {
                 MatchResult::default()
@@ -229,7 +269,6 @@ impl ConditionEvaluator for CelConditions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusternetes_common::admission::Operation;
     use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
     use rusternetes_common::authz::AlwaysAllowAuthorizer;
     use serde_json::json;
