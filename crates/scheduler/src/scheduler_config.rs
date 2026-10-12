@@ -9,7 +9,7 @@
 //!   (shape scaled by `MaxNodeScore / MaxCustomPriorityScore`).
 
 use crate::volume_binding::{FunctionShapePoint, MAX_CUSTOM_PRIORITY_SCORE, MAX_NODE_SCORE};
-use rusternetes_common::validation::field::{self, ErrorList, Path};
+use rusternetes_common::validation::field::{self, BadValue, ErrorList, Path};
 use serde::{Deserialize, Serialize};
 
 /// `config.UtilizationShapePoint` (pkg/scheduler/apis/config/types.go).
@@ -103,6 +103,8 @@ impl VolumeBindingArgs {
 struct KubeSchedulerConfiguration {
     #[serde(default)]
     profiles: Vec<Profile>,
+    #[serde(default)]
+    percentage_of_nodes_to_score: Option<i32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -110,6 +112,8 @@ struct KubeSchedulerConfiguration {
 struct Profile {
     #[serde(default)]
     scheduler_name: Option<String>,
+    #[serde(default)]
+    percentage_of_nodes_to_score: Option<i32>,
     #[serde(default)]
     plugin_config: Vec<PluginConfig>,
 }
@@ -161,24 +165,32 @@ pub fn volume_binding_args_from_config(
     }
 }
 
-/// Duplicate checks of `ValidateKubeSchedulerConfiguration` (validation.go:58-67,
-/// duplicate `schedulerName`, defaulting to `default-scheduler` per
-/// v1/defaults.go SetDefaults_KubeSchedulerProfile) and `validatePluginConfig`
-/// (validation.go:189-197, `seenPluginConfig`, per profile).
+/// Profile checks of `ValidateKubeSchedulerConfiguration` (validation.go:58-67)
+/// and `validateKubeSchedulerProfile` (validation.go:141-149): required
+/// `schedulerName`, `percentageOfNodesToScore` range, duplicate
+/// `schedulerName`, and `validatePluginConfig` (validation.go:189-197,
+/// `seenPluginConfig`). The default name is applied only to a single profile
+/// (v1/defaults.go:116-119 SetDefaults_KubeSchedulerConfiguration), and an
+/// empty profile list gets one default profile (:111-113).
 fn validate_profiles(cfg: &KubeSchedulerConfiguration) -> ErrorList {
     let profiles_path = Path::new("profiles");
     let mut errs = ErrorList::new();
-    let mut seen_profiles: Vec<&str> = Vec::new();
+    let single = cfg.profiles.len() <= 1;
+    let mut existing: Vec<&str> = Vec::new();
     for (i, profile) in cfg.profiles.iter().enumerate() {
         let path = profiles_path.index(i);
-        let name = profile
-            .scheduler_name
-            .as_deref()
-            .unwrap_or("default-scheduler");
-        if seen_profiles.contains(&name) {
-            errs.push(field::Error::duplicate(&path.child("schedulerName"), name));
+        let name = match (&profile.scheduler_name, single) {
+            (Some(n), _) => n.as_str(),
+            (None, true) => "default-scheduler",
+            (None, false) => "",
+        };
+        if name.is_empty() {
+            errs.push(field::Error::required(&path.child("schedulerName"), ""));
         }
-        seen_profiles.push(name);
+        errs.extend(validate_percentage_of_nodes_to_score(
+            &path.child("percentageOfNodesToScore"),
+            profile.percentage_of_nodes_to_score,
+        ));
         let mut seen: Vec<&str> = Vec::new();
         for (j, pc) in profile.plugin_config.iter().enumerate() {
             if seen.contains(&pc.name.as_str()) {
@@ -186,11 +198,35 @@ fn validate_profiles(cfg: &KubeSchedulerConfiguration) -> ErrorList {
                     &path.child("pluginConfig").index(j),
                     pc.name.as_str(),
                 ));
+            } else {
+                seen.push(&pc.name);
             }
-            seen.push(&pc.name);
         }
+        if existing.contains(&name) {
+            // The bad value is a *field.Path, which json.Marshal renders as
+            // `{}` (apimachinery field/errors.go:92-97).
+            errs.push(field::Error::duplicate(
+                &path.child("schedulerName"),
+                BadValue::Marshaled("{}".to_string()),
+            ));
+        }
+        existing.push(name);
     }
+    errs.extend(validate_percentage_of_nodes_to_score(
+        &Path::new("percentageOfNodesToScore"),
+        cfg.percentage_of_nodes_to_score,
+    ));
     errs
+}
+
+/// `validatePercentageOfNodesToScore` (validation.go:86-92).
+fn validate_percentage_of_nodes_to_score(path: &Path, pct: Option<i32>) -> ErrorList {
+    match pct {
+        Some(v) if !(0..=100).contains(&v) => {
+            vec![field::Error::invalid(path, v, "not in valid range [0-100]")]
+        }
+        _ => ErrorList::new(),
+    }
 }
 
 /// Read `--config` / `--scheduler-config` and resolve the `VolumeBinding` args
@@ -502,5 +538,50 @@ profiles:
             err.contains("profiles[1].schedulerName: Duplicate value"),
             "{err}"
         );
+    }
+
+    // validation.go:58-67 -> field.Duplicate(path.Child("schedulerName"),
+    // profilesPath.Index(idx).Child("schedulerName")): the bad value is a
+    // *field.Path, which json.Marshal renders as `{}` (errors.go:92-97).
+    #[test]
+    fn duplicate_scheduler_name_value_renders_like_go() {
+        let doc = "profiles:\n- schedulerName: a\n- schedulerName: a\n";
+        let err = volume_binding_args_from_config(doc, false).unwrap_err();
+        assert_eq!(err, "profiles[1].schedulerName: Duplicate value: {}");
+    }
+
+    // v1/defaults.go:116-119: the default name is only applied to a single
+    // profile; validation.go:141-144 then requires a name on the rest
+    // (validation_test.go "scheduler-name-not-set" -> profiles[1].schedulerName).
+    #[test]
+    fn unnamed_profile_required_when_multiple() {
+        let doc = "profiles:\n- schedulerName: a\n- pluginConfig: []\n";
+        let err = volume_binding_args_from_config(doc, false).unwrap_err();
+        assert_eq!(err, "profiles[1].schedulerName: Required value");
+        let one = "profiles:\n- pluginConfig: []\n";
+        assert!(volume_binding_args_from_config(one, false).is_ok());
+    }
+
+    // validation.go:86-92 validatePercentageOfNodesToScore, top level and
+    // per profile (validation_test.go "bad-percentage-of-nodes-to-score",
+    // "greater-than-100-profile-percentage-of-nodes-to-score").
+    #[test]
+    fn percentage_of_nodes_to_score_range() {
+        let err =
+            volume_binding_args_from_config("percentageOfNodesToScore: 101\n", false).unwrap_err();
+        assert_eq!(
+            err,
+            "percentageOfNodesToScore: Invalid value: 101: not in valid range [0-100]"
+        );
+        let err = volume_binding_args_from_config(
+            "profiles:\n- schedulerName: a\n- schedulerName: b\n  percentageOfNodesToScore: -1\n",
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "profiles[1].percentageOfNodesToScore: Invalid value: -1: not in valid range [0-100]"
+        );
+        assert!(volume_binding_args_from_config("percentageOfNodesToScore: 100\n", false).is_ok());
     }
 }
