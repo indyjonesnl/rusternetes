@@ -858,4 +858,54 @@ profiles:
         let ok = "profiles:\n- pluginConfig:\n  - name: DefaultPreemption\n    args:\n      minCandidateNodesAbsolute: 0\n  - name: InterPodAffinity\n";
         assert!(volume_binding_args_from_config(ok, false).is_ok());
     }
+
+    // validation.go:155-160 validatePluginConfig -> ValidateNodeAffinityArgs,
+    // ValidateNodeResourcesBalancedAllocationArgs, ValidatePodTopologySpreadArgs.
+    #[test]
+    fn config_doc_node_affinity_balanced_allocation_pts_validated() {
+        let doc = "profiles:
+- pluginConfig:
+  - name: NodeAffinity
+    args:
+      addedAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+          - matchExpressions:
+            - {key: invalid/label/key, operator: In, values: [v]}
+  - name: NodeResourcesBalancedAllocation
+    args:
+      resources:
+      - {name: cpu, weight: 2}
+  - name: PodTopologySpread
+    args:
+      defaultingType: System
+      defaultConstraints:
+      - {maxSkew: 1, topologyKey: key, whenUnsatisfiable: DoNotSchedule}
+";
+        let err = volume_binding_args_from_config(doc, false).unwrap_err();
+        assert!(err.contains("profiles[0].pluginConfig[0].args.addedAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].key: Invalid value: \"invalid/label/key\""), "{err}");
+        assert!(
+            err.contains(
+                "profiles[0].pluginConfig[1].args.resources[0].weight: Invalid value: 2: must be 1"
+            ),
+            "{err}"
+        );
+        assert!(
+            err.contains("profiles[0].pluginConfig[2].args.defaultingType: Invalid value: \"System\": when .defaultConstraints are not empty"),
+            "{err}"
+        );
+    }
+
+    // NewFit (noderesources/fit.go:193) validates with a nil path; the
+    // validation.go:158 map key is "NodeResourcesFitArgs", so the profile
+    // pass never reaches it.
+    #[test]
+    fn config_doc_node_resources_fit_validated_at_plugin_init() {
+        let doc = "profiles:\n- pluginConfig:\n  - name: NodeResourcesFit\n    args:\n      scoringStrategy:\n        type: Invalid\n";
+        let err = volume_binding_args_from_config(doc, false).unwrap_err();
+        assert!(
+            err.contains("scoringStrategy.type: Unsupported value: \"Invalid\": supported values: \"LeastAllocated\", \"MostAllocated\", \"RequestedToCapacityRatio\""),
+            "{err}"
+        );
+    }
 }
