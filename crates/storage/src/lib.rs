@@ -218,6 +218,33 @@ pub trait Storage: Send + Sync {
         patch_via_update(self, key, patch).await
     }
 
+    /// Server-side apply `apply_config` as `field_manager`: the client-go
+    /// `Apply(ctx, applyConfig, metav1.ApplyOptions{FieldManager, Force})`
+    /// verb (e.g. `ClusterRoles().Apply` at
+    /// `pkg/controller/clusterroleaggregation/clusterroleaggregation_controller.go:123-132`,
+    /// `FieldManager: "clusterrole-aggregation-controller", Force: true`).
+    ///
+    /// API-backed storage sends a real `PATCH` with `Content-Type:
+    /// application/apply-patch+json`, `fieldManager` and `force` query
+    /// parameters, so the api-server's field manager records the `Apply`
+    /// managedFields entry. Direct backends have no api-server in the path, so
+    /// the default re-reads and runs the shared apply engine
+    /// (`rusternetes_common::server_side_apply`), creating the object when it
+    /// does not exist (as SSA does), CAS-retrying on [`Error::Conflict`].
+    async fn apply<T>(
+        &self,
+        key: &str,
+        apply_config: &serde_json::Value,
+        field_manager: &str,
+        force: bool,
+        subresource: Option<&str>,
+    ) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        apply_via_update(self, key, apply_config, field_manager, force, subresource).await
+    }
+
     /// PATCH the `/status` subresource with a strategic-merge `patch`
     /// (`Nodes().Patch(ctx, name, types.StrategicMergePatchType, patchBytes,
     /// metav1.PatchOptions{}, "status")`, `nodeutil.PatchNodeStatus`,
@@ -702,6 +729,60 @@ where
     )))
 }
 
+/// Body of the default [`Storage::apply`].
+async fn apply_via_update<S, T>(
+    storage: &S,
+    key: &str,
+    apply_config: &serde_json::Value,
+    field_manager: &str,
+    force: bool,
+    _subresource: Option<&str>,
+) -> Result<T>
+where
+    S: Storage + ?Sized,
+    T: Serialize + DeserializeOwned + Send + Sync,
+{
+    use rusternetes_common::server_side_apply::{server_side_apply, ApplyParams, ApplyResult};
+    const MAX_ATTEMPTS: usize = 8;
+    let mut params = ApplyParams::new(field_manager.to_string());
+    if force {
+        params = params.with_force();
+    }
+    for attempt in 0..MAX_ATTEMPTS {
+        let current: Option<serde_json::Value> = match storage.get(key).await {
+            Ok(v) => Some(v),
+            Err(Error::NotFound(_)) => None,
+            Err(e) => return Err(e),
+        };
+        let applied = match server_side_apply(current.as_ref(), apply_config, &params)
+            .map_err(|e| Error::InvalidResource(format!("apply {key}: {e}")))?
+        {
+            ApplyResult::Success(v) => v,
+            ApplyResult::Conflicts(c) => {
+                return Err(Error::Conflict(format!(
+                    "Apply failed with {} conflict(s) for {key}",
+                    c.len()
+                )))
+            }
+        };
+        let written = if current.is_some() {
+            storage.update::<serde_json::Value>(key, &applied).await
+        } else {
+            storage.create::<serde_json::Value>(key, &applied).await
+        };
+        match written {
+            Ok(v) => return serde_json::from_value(v).map_err(Error::Serialization),
+            Err(Error::Conflict(_) | Error::AlreadyExists(_)) if attempt + 1 < MAX_ATTEMPTS => {
+                continue
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(Error::Conflict(format!(
+        "apply: exhausted {MAX_ATTEMPTS} CAS retries for {key}"
+    )))
+}
+
 /// Body of the default [`Storage::patch_status_strategic_merge`]: re-read the
 /// object, apply `patch` with the shared strategic-merge applier
 /// (`strategicpatch.StrategicMergePatch`,
@@ -865,6 +946,22 @@ impl<S: Storage> Storage for std::sync::Arc<S> {
         T: Serialize + DeserializeOwned + Send + Sync,
     {
         (**self).patch_strategic_merge(key, patch).await
+    }
+
+    async fn apply<T>(
+        &self,
+        key: &str,
+        apply_config: &serde_json::Value,
+        field_manager: &str,
+        force: bool,
+        subresource: Option<&str>,
+    ) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        (**self)
+            .apply(key, apply_config, field_manager, force, subresource)
+            .await
     }
 
     async fn patch_status_strategic_merge<T>(
@@ -1404,6 +1501,28 @@ impl Storage for StorageBackend {
             #[cfg(feature = "api-client")]
             StorageBackend::Api(s) => Storage::patch_strategic_merge(s, key, patch).await,
             _ => patch_via_update(self, key, patch).await,
+        }
+    }
+
+    /// `Api` sends a real apply PATCH; every other variant runs the default
+    /// apply loop over `StorageBackend::{get,update,create}`.
+    async fn apply<T>(
+        &self,
+        key: &str,
+        apply_config: &serde_json::Value,
+        field_manager: &str,
+        force: bool,
+        subresource: Option<&str>,
+    ) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        match self {
+            #[cfg(feature = "api-client")]
+            StorageBackend::Api(s) => {
+                Storage::apply(s, key, apply_config, field_manager, force, subresource).await
+            }
+            _ => apply_via_update(self, key, apply_config, field_manager, force, subresource).await,
         }
     }
 
