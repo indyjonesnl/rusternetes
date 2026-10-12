@@ -137,6 +137,30 @@ async fn put_with_a_different_name_is_a_bad_request() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{out}");
 }
 
+/// `errors.NewInvalid(autoscaling.Kind("Scale"), deployment.Name, errs)`
+/// (storage.go:457): the Invalid Status names the Scale kind and the name.
+#[tokio::test]
+async fn put_with_negative_replicas_is_an_invalid_scale_status() {
+    let api = TestApiServer::new();
+    create(&api, "s-neg").await;
+    let (_, mut scale) = api.get(&scale_uri("s-neg")).await;
+    scale["spec"]["replicas"] = json!(-1);
+    let (status, out) = api.put(&scale_uri("s-neg"), &scale).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{out}");
+    assert_eq!(
+        out["message"],
+        "Scale.autoscaling \"s-neg\" is invalid: spec.replicas: Invalid value: -1: must be greater than or equal to 0",
+        "{out}"
+    );
+    assert_eq!(out["details"]["kind"], "Scale", "{out}");
+    assert_eq!(out["details"]["group"], "autoscaling", "{out}");
+    assert_eq!(out["details"]["name"], "s-neg", "{out}");
+    assert_eq!(
+        out["details"]["causes"][0]["field"], "spec.replicas",
+        "{out}"
+    );
+}
+
 /// A PATCH is applied to the Scale, not the Deployment, then goes through
 /// the same `ScaleREST.Update`.
 #[tokio::test]

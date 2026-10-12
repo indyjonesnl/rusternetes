@@ -1391,12 +1391,19 @@ impl<P: EvictionPodStore, C: PdbClient> EvictionRest<P, C> {
             .and_then(|o| o.ignore_store_read_error_with_cluster_breaking_potential)
             .unwrap_or(false)
         {
-            return Err(Error::Invalid(vec![FieldError::invalid(
-                &Path::new("deleteOptions")
-                    .child("ignoreStoreReadErrorWithClusterBreakingPotential"),
-                true,
-                "can not be set for pod eviction, try after removing the option",
-            )]));
+            // `errors.NewInvalid(v1Eviction.GroupKind(), name, errs)`
+            // (eviction.go:143).
+            return Err(Error::new_invalid(
+                "policy",
+                "Eviction",
+                name,
+                vec![FieldError::invalid(
+                    &Path::new("deleteOptions")
+                        .child("ignoreStoreReadErrorWithClusterBreakingPotential"),
+                    true,
+                    "can not be set for pod eviction, try after removing the option",
+                )],
+            ));
         }
 
         let original_delete_options = propagate_dry_run(&mut eviction, options)?;

@@ -892,17 +892,27 @@ async fn test_eviction_with_delete_options() {
             .await;
         if case.invalid {
             match result {
-                Err(Error::Invalid(errs)) => {
-                    assert_eq!(errs.len(), 1, "{}", case.name);
+                // `errors.NewInvalid(v1Eviction.GroupKind(), name, errs)`
+                // (eviction.go:143): kind/name prefix, details and causes.
+                Err(Error::Status(st)) => {
+                    assert_eq!(st.reason.as_deref(), Some("Invalid"), "{}", case.name);
                     assert_eq!(
-                        errs[0].field,
-                        "deleteOptions.ignoreStoreReadErrorWithClusterBreakingPotential",
+                        st.message.as_deref(),
+                        Some(
+                            "Eviction.policy \"foo\" is invalid: deleteOptions.ignoreStoreReadErrorWithClusterBreakingPotential: Invalid value: true: can not be set for pod eviction, try after removing the option"
+                        ),
                         "{}",
                         case.name
                     );
+                    let d = st.details.as_ref().expect("details");
+                    assert_eq!(d.kind.as_deref(), Some("Eviction"), "{}", case.name);
+                    assert_eq!(d.group.as_deref(), Some("policy"), "{}", case.name);
+                    assert_eq!(d.name.as_deref(), Some("foo"), "{}", case.name);
+                    let causes = d.causes.as_ref().expect("causes");
+                    assert_eq!(causes.len(), 1, "{}", case.name);
                     assert_eq!(
-                        errs[0].detail,
-                        "can not be set for pod eviction, try after removing the option",
+                        causes[0].field.as_deref(),
+                        Some("deleteOptions.ignoreStoreReadErrorWithClusterBreakingPotential"),
                         "{}",
                         case.name
                     );
