@@ -4515,6 +4515,70 @@ mod tests {
     use super::*;
     use axum::http::HeaderValue;
 
+    /// customresource_discovery_controller.go:105 — a CRD that is not
+    /// `Established` contributes nothing to discovery.
+    #[tokio::test]
+    async fn crd_group_is_not_discoverable_until_established() {
+        use rusternetes_storage::Storage;
+        let storage = std::sync::Arc::new(rusternetes_storage::StorageBackend::new_memory());
+        let crd = |name: &str, group: &str, established: &str| {
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": {"name": name},
+                "spec": {"group": group, "scope": "Namespaced",
+                    "names": {"plural": "foos", "kind": "Foo"},
+                    "versions": [{"name": "v1", "served": true, "storage": true}]},
+                "status": {"conditions": [{"type": "Established", "status": established}]}
+            })
+        };
+        let k1 = rusternetes_storage::build_key(
+            "customresourcedefinitions",
+            None,
+            "foos.pending.example.com",
+        );
+        storage
+            .create(
+                &k1,
+                &crd("foos.pending.example.com", "pending.example.com", "False"),
+            )
+            .await
+            .unwrap();
+        let k2 = rusternetes_storage::build_key(
+            "customresourcedefinitions",
+            None,
+            "foos.ready.example.com",
+        );
+        storage
+            .create(
+                &k2,
+                &crd("foos.ready.example.com", "ready.example.com", "True"),
+            )
+            .await
+            .unwrap();
+
+        let resp = get_api_group(
+            Some(storage.clone()),
+            axum::extract::Path("pending.example.com".to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+        let resp = get_api_group(
+            Some(storage.clone()),
+            axum::extract::Path("ready.example.com".to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let resp = get_api_groups(Some(storage.clone()), HeaderMap::new()).await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("ready.example.com"));
+        assert!(!text.contains("pending.example.com"));
+    }
+
     #[test]
     fn resolve_kind_finds_the_resource_serving_a_kind() {
         // resolver/resolver.go:36-60
