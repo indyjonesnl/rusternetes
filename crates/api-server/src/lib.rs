@@ -369,12 +369,19 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(6443);
 
+    let crd_controllers = Default::default();
     startup::register_post_start_hooks(
         storage.clone(),
         api_port,
         service_ranges.api_server_service_ip(),
         service_ranges.cidrs(),
         ca_cert_pem.as_deref(),
+        {
+            let c = Arc::clone(&crd_controllers);
+            move |s| {
+                registry::apiextensions::customresourcedefinition::start_controllers(s, c);
+            }
+        },
     )
     .await;
 
@@ -401,6 +408,7 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
         )
         .with_service_cluster_ip_ranges(&service_ranges)
         .with_ca_cert(ca_cert_pem)
+        .with_crd_controllers(crd_controllers)
         .with_service_node_port_range(config.service_node_port_range)
         .with_event_ttl(config.event_ttl)
         .with_prometheus_client(prom_client),

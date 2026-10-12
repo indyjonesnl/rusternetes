@@ -23,6 +23,7 @@ pub async fn register_post_start_hooks(
     service_ip: std::net::IpAddr,
     service_cidrs: Vec<String>,
     ca_cert_pem: Option<&str>,
+    spawn_crd_resync: impl FnOnce(Arc<StorageBackend>),
 ) {
     if let Err(e) =
         bootstrap::bootstrap_kubernetes_service(storage.clone(), api_port, service_ip).await
@@ -68,9 +69,13 @@ pub async fn register_post_start_hooks(
         rusternetes_discovery::delegate_listed_paths(),
     );
 
+    // The caller owns the CRD controllers (the same `CrdControllers` its
+    // `ApiServerState` feeds from requests): `lib.rs` and the binary each
+    // compile their own `registry`, so the hook is passed in rather than named
+    // here.
     // CRD controllers' resync (upstream post-start hook, apiextensions-apiserver
     // pkg/apiserver/apiserver.go:244-252): retries a CRD left Terminating.
-    registry::apiextensions::customresourcedefinition::spawn_resync(storage.clone());
+    spawn_crd_resync(storage.clone());
     // crd-informer-synced (apiserver.go:263): not ready until the CRDs are readable.
     registry::apiextensions::customresourcedefinition::spawn_crd_informer_synced_hook(
         storage.clone(),
@@ -145,7 +150,8 @@ mod startup_hooks_single_path {
         "bootstrap::spawn_",
         "bootstrap::start_default_servicecidr_controller",
         "bootstrap::bootstrap_extension_apiserver_authentication_rbac",
-        "spawn_resync(",
+        // `start_controllers(` is the one exception: the entry points pass it
+        // in as a closure (see `spawn_crd_resync`), each over its own state.
         "spawn_crd_informer_synced_hook(",
         "spawn_legacy_token_tracking_controller(",
         "spawn_identity_hooks(",

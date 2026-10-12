@@ -39,8 +39,9 @@ fn scope(
 ) -> RequestScope<CustomResourceDefinition> {
     let store: Box<dyn crate::registry::rest::RestStorage<CustomResourceDefinition>> =
         match subresource {
-            Some(_) => Box::new(customresourcedefinition::new_status_store(
+            Some(_) => Box::new(customresourcedefinition::CrdStatusRest::with_controllers(
                 state.storage.clone(),
+                state.crd_controllers.clone(),
             )),
             None => Box::new(customresourcedefinition::CrdRest::with_controllers(
                 state.storage.clone(),
