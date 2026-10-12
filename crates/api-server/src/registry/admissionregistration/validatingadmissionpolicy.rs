@@ -25,8 +25,8 @@ use crate::registry::generic::store::{
 use crate::registry::generic::Store;
 use crate::registry::rbac::policybased::Noop;
 use crate::registry::rest::{
-    reset_object_meta_for_status, GroupResource, NamespaceScopedStrategy, RequestContext,
-    RestCreateStrategy, RestDeleteStrategy, RestUpdateStrategy,
+    reset_object_meta_for_status, with_group_kind, GroupResource, NamespaceScopedStrategy,
+    RequestContext, RestCreateStrategy, RestDeleteStrategy, RestUpdateStrategy,
 };
 
 /// `SetObjectDefaults_ValidatingAdmissionPolicy`
@@ -182,7 +182,11 @@ impl BeginCreate<ValidatingAdmissionPolicy> for ParamKindAuthz {
             let errs =
                 authorize_param_kind(ctx, self.authorizer.as_ref(), &self.storage, obj, None).await;
             if !errs.is_empty() {
-                return Err(Error::Invalid(errs));
+                return Err(with_group_kind(
+                    Error::Invalid(errs),
+                    "admissionregistration.k8s.io",
+                    obj,
+                ));
             }
         }
         Ok(Box::new(Noop))
@@ -203,7 +207,11 @@ impl BeginUpdate<ValidatingAdmissionPolicy> for ParamKindAuthz {
                 authorize_param_kind(ctx, self.authorizer.as_ref(), &self.storage, obj, Some(old))
                     .await;
             if !errs.is_empty() {
-                return Err(Error::Invalid(errs));
+                return Err(with_group_kind(
+                    Error::Invalid(errs),
+                    "admissionregistration.k8s.io",
+                    obj,
+                ));
             }
         }
         Ok(Box::new(Noop))
@@ -237,4 +245,69 @@ pub fn new_stores(
     store.begin_create = Some(hook.clone());
     store.begin_update = Some(hook);
     (store, status)
+}
+
+#[cfg(test)]
+mod invalid_status_tests {
+    use super::*;
+    use rusternetes_common::auth::UserInfo;
+    use rusternetes_common::authz::AlwaysDenyAuthorizer;
+
+    /// `ValidatingAdmissionPolicy` strategy `Validate` appends the authz error as a
+    /// `field.Forbidden`, and `BeforeCreate` / `BeforeUpdate` wrap the list in
+    /// `errors.NewInvalid(kind.GroupKind(), name, errs)`
+    /// (rest/create.go:130-137, rest/update.go:131-141; errors.go:284-312), so
+    /// the status is `<Kind>.<group> "<name>" is invalid: ...` with details.
+    #[tokio::test]
+    async fn authz_denial_is_a_new_invalid_status() {
+        let obj: ValidatingAdmissionPolicy = serde_json::from_value(serde_json::json!({"apiVersion": "admissionregistration.k8s.io/v1", "kind": "ValidatingAdmissionPolicy", "metadata": {"name": "foo"}, "spec": {
+            "paramKind": {"kind": "ReplicaLimit", "apiVersion": "rules.example.com/v1"},
+            "matchConstraints": {"matchPolicy": "Exact", "objectSelector": {}, "namespaceSelector": {}, "resourceRules": [{"operations": ["CREATE"], "apiGroups": ["a"], "apiVersions": ["a"], "resources": ["a"]}]},
+            "validations": [{"expression": "true"}],
+            "failurePolicy": "Fail"}})).unwrap();
+        assert!(validate(&obj).is_empty(), "{:?}", validate(&obj));
+        let hook = ParamKindAuthz {
+            authorizer: Arc::new(AlwaysDenyAuthorizer),
+            storage: Arc::new(StorageBackend::Memory(Arc::new(
+                rusternetes_storage::MemoryStorage::new(),
+            ))),
+        };
+        let user = UserInfo {
+            username: "alice".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        };
+        let ctx = RequestContext::new(None).with_user(&user);
+        let Err(Error::Status(st)) = hook
+            .begin_create(&ctx, &mut obj.clone(), &CreateOptions::default())
+            .await
+        else {
+            panic!("expected a Status error from begin_create")
+        };
+        assert_eq!(st.code, Some(422));
+        assert_eq!(st.reason.as_deref(), Some("Invalid"));
+        let msg = st.message.clone().unwrap_or_default();
+        assert!(
+            msg.starts_with(r#"ValidatingAdmissionPolicy.admissionregistration.k8s.io "foo" is invalid: spec.paramKind: Forbidden: "#),
+            "{msg}"
+        );
+        let d = st.details.unwrap();
+        assert_eq!(d.group.as_deref(), Some("admissionregistration.k8s.io"));
+        assert_eq!(d.kind.as_deref(), Some("ValidatingAdmissionPolicy"));
+        assert_eq!(d.name.as_deref(), Some("foo"));
+
+        let Err(Error::Status(st)) = hook
+            .begin_update(
+                &ctx,
+                &mut obj.clone(),
+                &mut ValidatingAdmissionPolicy::new("foo"),
+                &UpdateOptions::default(),
+            )
+            .await
+        else {
+            panic!("expected a Status error from begin_update")
+        };
+        assert_eq!(st.reason.as_deref(), Some("Invalid"));
+    }
 }
