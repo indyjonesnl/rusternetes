@@ -35,10 +35,27 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[command(about = "Rusternetes — all-in-one Kubernetes in a single binary")]
 #[command(version)]
 struct Args {
-    /// Comma-separated `Gate=bool` pairs, e.g. `StorageCapacityScoring=true`
-    /// (upstream `--feature-gates`, component-base featuregate `Set`).
-    #[arg(long, default_value = "")]
-    feature_gates: String,
+    /// Comma-separated `[component:]Gate=bool` pairs, e.g.
+    /// `StorageCapacityScoring=true` or `kube:StorageCapacityScoring=true`;
+    /// may be repeated (upstream `--feature-gates`,
+    /// compatibility/registry.go:249-253). The component prefix defaults to
+    /// `kube`; do not mix prefixed and unprefixed pairs.
+    #[arg(long)]
+    feature_gates: Vec<String>,
+
+    /// The version the component emulates (APIs, features, ...), as
+    /// `[component=]major.minor`, e.g. `--emulated-version=1.34`. Options are:
+    /// kube=1.32..1.35(default:1.35) (upstream `--emulated-version`,
+    /// compatibility/registry.go:231-236).
+    #[arg(long, value_delimiter = ',')]
+    emulated_version: Vec<String>,
+
+    /// The min version of control plane components the server should be
+    /// compatible with; must be <= `--emulated-version`. Options are:
+    /// kube=1.32..1.35(default:1.34) (upstream `--min-compatibility-version`,
+    /// compatibility/registry.go:243-247).
+    #[arg(long, value_delimiter = ',')]
+    min_compatibility_version: Vec<String>,
 
     /// Storage backend: "sqlite", "etcd", or "redis"
     #[arg(long, default_value = "sqlite")]
@@ -226,11 +243,16 @@ fn main() -> Result<()> {
         .block_on(async_main())
 }
 
-/// Apply `--feature-gates` process-wide. Port of `featureGate.Set`
-/// (staging/src/k8s.io/component-base/featuregate/feature_gate.go:340-359).
+/// Apply `--emulated-version`, `--min-compatibility-version` and
+/// `--feature-gates` process-wide: `ComponentGlobalsRegistry.Set()` then
+/// `Validate()` (staging/src/k8s.io/component-base/compatibility/registry.go:344-451).
 fn apply_feature_gates(args: &Args) -> Result<()> {
-    rusternetes_common::feature_gates::set_from_str(&args.feature_gates)
-        .map_err(|e| anyhow::anyhow!("invalid --feature-gates: {e}"))?;
+    rusternetes_common::compatibility::apply_flags(
+        &args.emulated_version,
+        &args.min_compatibility_version,
+        &args.feature_gates,
+    )
+    .map_err(|e| anyhow::anyhow!("invalid --feature-gates/--emulated-version: {e}"))?;
     Ok(())
 }
 

@@ -87,11 +87,27 @@ struct Args {
     service_node_port_range:
         rusternetes_api_server::registry::core::service::portallocator::PortRange,
 
-    /// Comma-separated `Gate=bool` pairs, e.g.
-    /// `CrossNamespaceVolumeDataSource=true` (upstream `--feature-gates`,
-    /// component-base/featuregate/feature_gate.go `AddFlag`/`Set`).
-    #[arg(long, default_value = "")]
-    feature_gates: String,
+    /// Comma-separated `[component:]Gate=bool` pairs, e.g.
+    /// `StorageCapacityScoring=true` or `kube:StorageCapacityScoring=true`;
+    /// may be repeated (upstream `--feature-gates`,
+    /// compatibility/registry.go:249-253). The component prefix defaults to
+    /// `kube`; do not mix prefixed and unprefixed pairs.
+    #[arg(long)]
+    feature_gates: Vec<String>,
+
+    /// The version the component emulates (APIs, features, ...), as
+    /// `[component=]major.minor`, e.g. `--emulated-version=1.34`. Options are:
+    /// kube=1.32..1.35(default:1.35) (upstream `--emulated-version`,
+    /// compatibility/registry.go:231-236).
+    #[arg(long, value_delimiter = ',')]
+    emulated_version: Vec<String>,
+
+    /// The min version of control plane components the server should be
+    /// compatible with; must be <= `--emulated-version`. Options are:
+    /// kube=1.32..1.35(default:1.34) (upstream `--min-compatibility-version`,
+    /// compatibility/registry.go:243-247).
+    #[arg(long, value_delimiter = ',')]
+    min_compatibility_version: Vec<String>,
 
     /// Address to bind to
     #[arg(long, default_value = "0.0.0.0:6443")]
@@ -263,17 +279,24 @@ async fn install_audit_from_flags(args: &Args) -> Result<()> {
     Ok(())
 }
 
-/// Apply `--feature-gates`; mirrors the scheduler binary.
-fn apply_feature_gates(value: &str) -> Result<()> {
-    rusternetes_common::feature_gates::set_from_str(value)
-        .map_err(|e| anyhow::anyhow!("invalid --feature-gates: {e}"))
+/// Apply `--emulated-version`, `--min-compatibility-version` and
+/// `--feature-gates`: `ComponentGlobalsRegistry.Set()` then `Validate()`
+/// (cmd/kube-apiserver/app/server.go:84-87; staging/src/k8s.io/component-base/compatibility/registry.go:344-451).
+fn apply_feature_gates(args: &Args) -> Result<()> {
+    rusternetes_common::compatibility::apply_flags(
+        &args.emulated_version,
+        &args.min_compatibility_version,
+        &args.feature_gates,
+    )
+    .map(|_| ())
+    .map_err(|e| anyhow::anyhow!("invalid --feature-gates/--emulated-version: {e}"))
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
     request_timeout::set_request_timeout(args.request_timeout);
-    apply_feature_gates(&args.feature_gates)?;
+    apply_feature_gates(&args)?;
     // `validateClusterIPFlags`: refuse to start on a bad range.
     let service_ranges =
         registry::core::service::ipranges::ServiceIpRanges::parse(&args.service_cluster_ip_range)
@@ -574,21 +597,58 @@ mod tests {
     /// `--feature-gates` must parse and be applicable (upstream
     /// `featureGate.AddFlag`, component-base/featuregate/feature_gate.go:912).
     #[test]
+    #[serial_test::serial]
     fn feature_gates_flag_enables_cross_namespace_volume_data_source() {
+        feature_gates::reset_to_defaults();
         let args = Args::try_parse_from([
             "api-server",
             "--feature-gates=CrossNamespaceVolumeDataSource=true",
         ])
         .expect("--feature-gates must be accepted");
         let _guard = feature_gates::with_feature(Feature::CrossNamespaceVolumeDataSource, false);
-        apply_feature_gates(&args.feature_gates).unwrap();
+        apply_feature_gates(&args).unwrap();
         assert!(feature_gates::enabled(
             Feature::CrossNamespaceVolumeDataSource
         ));
+        feature_gates::reset_to_defaults();
+    }
+
+    /// `--emulated-version` / `--min-compatibility-version` reach the gates
+    /// (compatibility/registry.go:344-428): a 1.35-only gate is PreAlpha at 1.34.
+    #[test]
+    #[serial_test::serial]
+    fn emulated_version_flag_changes_gate_defaults() {
+        feature_gates::reset_to_defaults();
+        let args = Args::try_parse_from([
+            "api-server",
+            "--emulated-version=1.34",
+            "--min-compatibility-version=1.33",
+        ])
+        .unwrap();
+        apply_feature_gates(&args).unwrap();
+        assert_eq!(
+            feature_gates::emulation_version().to_string(),
+            "1.34",
+            "emulation version"
+        );
+        assert!(!feature_gates::enabled(
+            Feature::StructuredAuthenticationConfigurationJWKSMetrics
+        ));
+        let args = Args::try_parse_from(["api-server", "--emulated-version=1.30"]).unwrap();
+        let err = apply_feature_gates(&args).unwrap_err().to_string();
+        assert!(
+            err.contains("emulation version 1.30 is not between [1.32, 1.35]"),
+            "{err}"
+        );
+        feature_gates::reset_to_defaults();
     }
 
     #[test]
+    #[serial_test::serial]
     fn feature_gates_flag_rejects_unknown_gate() {
-        assert!(apply_feature_gates("NoSuchGate=true").is_err());
+        feature_gates::reset_to_defaults();
+        let args = Args::try_parse_from(["api-server", "--feature-gates=NoSuchGate=true"]).unwrap();
+        assert!(apply_feature_gates(&args).is_err());
+        feature_gates::reset_to_defaults();
     }
 }

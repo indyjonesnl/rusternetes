@@ -59,10 +59,27 @@ use tracing::{error, info, warn};
 #[command(name = "rusternetes-controller-manager")]
 #[command(about = "Rusternetes Controller Manager - Runs controller loops")]
 struct Args {
-    /// Comma-separated `Gate=bool` pairs, e.g. `StorageCapacityScoring=true`
-    /// (upstream `--feature-gates`, component-base featuregate `Set`).
-    #[arg(long, default_value = "")]
-    feature_gates: String,
+    /// Comma-separated `[component:]Gate=bool` pairs, e.g.
+    /// `StorageCapacityScoring=true` or `kube:StorageCapacityScoring=true`;
+    /// may be repeated (upstream `--feature-gates`,
+    /// compatibility/registry.go:249-253). The component prefix defaults to
+    /// `kube`; do not mix prefixed and unprefixed pairs.
+    #[arg(long)]
+    feature_gates: Vec<String>,
+
+    /// The version the component emulates (APIs, features, ...), as
+    /// `[component=]major.minor`, e.g. `--emulated-version=1.34`. Options are:
+    /// kube=1.32..1.35(default:1.35) (upstream `--emulated-version`,
+    /// compatibility/registry.go:231-236).
+    #[arg(long, value_delimiter = ',')]
+    emulated_version: Vec<String>,
+
+    /// The min version of control plane components the server should be
+    /// compatible with; must be <= `--emulated-version`. Options are:
+    /// kube=1.32..1.35(default:1.34) (upstream `--min-compatibility-version`,
+    /// compatibility/registry.go:243-247).
+    #[arg(long, value_delimiter = ',')]
+    min_compatibility_version: Vec<String>,
 
     /// Etcd endpoints (comma-separated)
     #[arg(long, default_value = "http://localhost:2379")]
@@ -531,11 +548,17 @@ async fn run_api_mode(args: Args) -> Result<()> {
     rusternetes_controller_manager::run_with_api(client, config).await
 }
 
-/// Apply `--feature-gates` process-wide. Port of `featureGate.Set`
-/// (staging/src/k8s.io/component-base/featuregate/feature_gate.go:340-359).
+/// Apply `--emulated-version`, `--min-compatibility-version` and
+/// `--feature-gates` process-wide: `ComponentGlobalsRegistry.Set()`
+/// (cmd/kube-controller-manager/app/controllermanager.go:124) then `Validate`
+/// (staging/src/k8s.io/component-base/compatibility/registry.go:344-451).
 fn apply_feature_gates(args: &Args) -> Result<()> {
-    rusternetes_common::feature_gates::set_from_str(&args.feature_gates)
-        .map_err(|e| anyhow::anyhow!("invalid --feature-gates: {e}"))?;
+    rusternetes_common::compatibility::apply_flags(
+        &args.emulated_version,
+        &args.min_compatibility_version,
+        &args.feature_gates,
+    )
+    .map_err(|e| anyhow::anyhow!("invalid --feature-gates/--emulated-version: {e}"))?;
     // #3190: legacy alias for the CrossNamespaceVolumeDataSource gate; the
     // provisioner reads the gate (upstream has only the gate).
     if args.csi_cross_namespace_volume_data_source {

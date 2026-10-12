@@ -395,8 +395,10 @@ impl Feature {
     /// entry of the gate's versioned spec list (`pkg/features/kube_features.go`,
     /// `staging/src/k8s.io/apiserver/pkg/features/kube_features.go`,
     /// `staging/src/k8s.io/component-base/zpages/features/kube_features.go`).
-    /// Consumed by the `AllAlpha`/`AllBeta` specials and PreAlpha rejection in
-    /// [`set_from_str`].
+    /// Only the cross-check in `version_history_agrees_with_v1_35_summaries`
+    /// reads it: the specials and PreAlpha rejection resolve the spec at the
+    /// emulated version via [`Feature::spec_at_versions`].
+    #[cfg(test)]
     const fn prerelease(self) -> PreRelease {
         match self {
             Feature::RelaxedDNSSearchValidation
