@@ -164,8 +164,16 @@ pub fn update_event_enqueues(
     let mut new_copy = new.clone();
     old_copy.metadata.resource_version = None;
     new_copy.metadata.resource_version = None;
-    remove_crd_condition(&mut old_copy, TERMINATING);
-    remove_crd_condition(&mut new_copy, TERMINATING);
+    // `RemoveCRDCondition` (helpers.go) leaves an empty, non-nil condition
+    // list on both copies whatever they held; `status` is a Go value, here an
+    // `Option`.
+    for copy in [&mut old_copy, &mut new_copy] {
+        remove_crd_condition(copy, TERMINATING);
+        copy.status
+            .get_or_insert_with(Default::default)
+            .conditions
+            .get_or_insert_with(Vec::new);
+    }
     old_copy != new_copy
 }
 
