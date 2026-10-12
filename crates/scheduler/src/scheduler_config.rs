@@ -1687,4 +1687,101 @@ profiles:
             "profiles[0].pluginConfig[0].args: Invalid value: null: has to match plugin args"
         );
     }
+
+    // validation_test.go TestValidateKubeSchedulerConfiguration
+    // "bad-parallelism-invalid-value": parallelism 0 -> Invalid.
+    #[test]
+    fn parallelism_must_be_positive() {
+        let err = volume_binding_args_from_config("parallelism: 0\n", false).unwrap_err();
+        assert_eq!(
+            err,
+            "parallelism: Invalid value: 0: should be an integer value greater than zero"
+        );
+        assert!(volume_binding_args_from_config("parallelism: 8\n", false).is_ok());
+        // Unset defaults to 16 (v1/defaults.go:108-110).
+        assert!(volume_binding_args_from_config("{}\n", false).is_ok());
+    }
+
+    // validation.go:70-77
+    #[test]
+    fn backoff_seconds_validated() {
+        let err =
+            volume_binding_args_from_config("podInitialBackoffSeconds: 0\n", false).unwrap_err();
+        assert!(
+            err.starts_with("podInitialBackoffSeconds: Invalid value: 0: must be greater than 0")
+        );
+        let err = volume_binding_args_from_config(
+            "podInitialBackoffSeconds: 5\npodMaxBackoffSeconds: 2\n",
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "podMaxBackoffSeconds: Invalid value: 2: must be greater than or equal to PodInitialBackoffSeconds"
+        );
+        // Defaults 1 / 10; a lone max below the default initial is rejected.
+        let err = volume_binding_args_from_config("podMaxBackoffSeconds: 0\n", false).unwrap_err();
+        assert!(err.starts_with("podMaxBackoffSeconds: Invalid value: 0:"));
+    }
+
+    // "invalid-plugins": removed plugins in plugins.<stage>.enabled.
+    #[test]
+    fn removed_plugins_in_plugin_sets_rejected() {
+        let doc = "profiles:\n- plugins:\n    score:\n      enabled:\n      - name: AzureDiskLimits\n      - name: PodTopologySpread\n      - name: GCEPDLimits\n";
+        let err = volume_binding_args_from_config(doc, false).unwrap_err();
+        let v = "was invalid in version \"kubescheduler.config.k8s.io/v1\" (KubeSchedulerConfiguration is version \"kubescheduler.config.k8s.io/v1\")";
+        assert_eq!(
+            err,
+            format!(
+                "profiles[0].plugins.score.enabled[0]: Invalid value: \"AzureDiskLimits\": {v}, profiles[0].plugins.score.enabled[2]: Invalid value: \"GCEPDLimits\": {v}"
+            )
+        );
+        // "valid-plugins"
+        let ok = "profiles:\n- plugins:\n    score:\n      enabled:\n      - {name: PodTopologySpread, weight: 2}\n";
+        assert!(volume_binding_args_from_config(ok, false).is_ok());
+        // Disabled entries and multiPoint are not checked (validation.go:166-182).
+        let ok = "profiles:\n- plugins:\n    score:\n      disabled:\n      - name: AzureDiskLimits\n    multiPoint:\n      enabled:\n      - name: EBSLimits\n";
+        assert!(volume_binding_args_from_config(ok, false).is_ok());
+    }
+
+    // "different-queue-sort"
+    #[test]
+    fn queue_sort_must_match_across_profiles() {
+        let doc = "profiles:\n- schedulerName: a\n  plugins: {queueSort: {enabled: [{name: PrioritySort}]}}\n- schedulerName: b\n  plugins: {queueSort: {enabled: [{name: AnotherSort}]}}\n";
+        let err = volume_binding_args_from_config(doc, false).unwrap_err();
+        assert_eq!(
+            err,
+            "profiles[1].plugins.queueSort: Invalid value: {\"Enabled\":[{\"Name\":\"AnotherSort\",\"Weight\":0}],\"Disabled\":null}: must be the same for all profiles"
+        );
+        // "one-empty-queue-sort": second profile has no plugins at all.
+        let doc = "profiles:\n- schedulerName: a\n  plugins: {queueSort: {enabled: [{name: PrioritySort}]}}\n- schedulerName: b\n";
+        let err = volume_binding_args_from_config(doc, false).unwrap_err();
+        assert!(err.starts_with("profiles[1].plugins.queueSort: Invalid value:"));
+        // Same queue sort everywhere is fine.
+        let doc = "profiles:\n- schedulerName: a\n  plugins: {queueSort: {enabled: [{name: PrioritySort}]}}\n- schedulerName: b\n  plugins: {queueSort: {enabled: [{name: PrioritySort}]}}\n";
+        assert!(volume_binding_args_from_config(doc, false).is_ok());
+    }
+
+    // validation.go:221-228: only one queue sort plugin may be enabled.
+    #[test]
+    fn only_one_queue_sort_enabled() {
+        let doc = "profiles:\n- plugins: {queueSort: {enabled: [{name: A}, {name: B}]}}\n";
+        let err = volume_binding_args_from_config(doc, false).unwrap_err();
+        assert_eq!(
+            err,
+            "profiles[0].plugins.queueSort.Enabled: Invalid value: 2: only one queue sort plugin can be enabled"
+        );
+    }
+
+    // "mismatch-queue-sort": queueSort pluginConfig args must match too
+    // (validation.go:243-247).
+    #[test]
+    fn queue_sort_plugin_config_must_match() {
+        let doc = "profiles:\n- schedulerName: a\n  plugins: {queueSort: {enabled: [{name: S}]}}\n  pluginConfig: [{name: S, args: {x: 1}}]\n- schedulerName: b\n  plugins: {queueSort: {enabled: [{name: S}]}}\n  pluginConfig: [{name: S, args: {x: 2}}]\n";
+        let err = volume_binding_args_from_config(doc, false).unwrap_err();
+        assert_eq!(
+            err,
+            "profiles[1].pluginConfig.args: Invalid value: {\"x\":2}: queueSort must be the same for all profiles"
+        );
+    }
 }
