@@ -16,6 +16,7 @@
 
 use rusternetes_common::cel::{compile_failure, CELContext, CELEvaluator};
 use rusternetes_common::cel_env::{output_type_failure, ExpectedOutput};
+use rusternetes_common::validation::field::{BadValue, Error as FieldError, ErrorList, Path};
 use std::collections::HashSet;
 use std::sync::Mutex;
 
@@ -46,45 +47,64 @@ impl CelMatcher {
     /// `compileMatchConditions` (validation.go:778-820); `Ok(None)` when no
     /// condition remains. Errors carry upstream's `field.ErrorType` wording.
     pub fn compile(conditions: &[WebhookMatchCondition]) -> Result<Option<Self>, Vec<String>> {
-        let mut errs = Vec::new();
+        let (matcher, errs) = Self::compile_at(conditions, &Path::default());
+        if errs.is_empty() {
+            Ok(matcher)
+        } else {
+            Err(errs.iter().map(|e| e.to_string()).collect())
+        }
+    }
+
+    /// `compileMatchConditions` with its `fldPath` (validation.go:778-821):
+    /// the matcher built from the conditions that compiled, plus every field
+    /// error, exactly as upstream returns both. `ValidateWebhookConfiguration`
+    /// passes the authorizer's path (:766).
+    pub fn compile_at(
+        conditions: &[WebhookMatchCondition],
+        fld_path: &Path,
+    ) -> (Option<Self>, ErrorList) {
+        let mut errs = ErrorList::new();
+        let match_conditions = fld_path.child("matchConditions");
         if conditions.len() > 64 {
-            errs.push(format!(
-                "matchConditions: Too many: {}: must have at most 64 items",
-                conditions.len()
-            ));
-            return Err(errs);
+            // `field.TooMany(fldPath.Child("matchConditions"), len, 64)`
+            // (validation.go:785) carries the actual quantity as the bad value
+            // (errors.go:294-302); `Error::too_many` has no such parameter.
+            let mut e = FieldError::too_many(&match_conditions, 64);
+            e.bad_value = BadValue::I64(conditions.len() as i64);
+            errs.push(e);
+            return (None, errs);
         }
         let mut seen = HashSet::new();
         let mut expressions = Vec::new();
         for (i, c) in conditions.iter().enumerate() {
-            let path = format!("matchConditions[{i}].expression");
+            let path = match_conditions.index(i).child("expression");
             if c.expression.trim().is_empty() {
-                errs.push(format!("{path}: Required value"));
+                errs.push(FieldError::required(&path, ""));
                 continue;
             }
             if !seen.insert(c.expression.as_str()) {
-                errs.push(format!("{path}: Duplicate value: {:?}", c.expression));
+                errs.push(FieldError::duplicate(&path, c.expression.as_str()));
                 continue;
             }
             if let Some(e) = compile_failure(&c.expression)
                 .or_else(|| output_type_failure(&c.expression, ExpectedOutput::Bool))
             {
-                errs.push(format!("{path}: Invalid value: {:?}: {e}", c.expression));
+                errs.push(FieldError::invalid(&path, c.expression.as_str(), e));
                 continue;
             }
             expressions.push(c.expression.clone());
         }
-        if !errs.is_empty() {
-            return Err(errs);
-        }
         if expressions.is_empty() {
-            return Ok(None);
+            return (None, errs);
         }
-        Ok(Some(Self {
-            expressions,
-            evaluator: Mutex::new(CELEvaluator::new()),
-            metrics_identity: None,
-        }))
+        (
+            Some(Self {
+                expressions,
+                evaluator: Mutex::new(CELEvaluator::new()),
+                metrics_identity: None,
+            }),
+            errs,
+        )
     }
 
     /// `cm.AuthorizerType = "Webhook"; cm.AuthorizerName = name; cm.Metrics = am`

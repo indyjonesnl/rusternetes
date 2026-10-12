@@ -6,8 +6,11 @@
 //! `ValidateAuthorizationConfiguration` :642 / `ValidateWebhookConfiguration`
 //! :694) and `pkg/kubeapiserver/authorizer/config.go` `LoadAndValidateData`.
 
-use crate::authorization_match_conditions::WebhookMatchCondition;
-use rusternetes_common::validation::field::{ErrorList, Path};
+use crate::authorization_match_conditions::{CelMatcher, WebhookMatchCondition};
+use crate::authorizer::{AUTHORIZATION_MODE_CHOICES, MODE_WEBHOOK};
+use rusternetes_common::go_duration::{format_go_duration, parse_go_duration};
+use rusternetes_common::validation::field::{BadValue, Error as FieldError, ErrorList, Path};
+use rusternetes_common::validation::metav1::is_dns1123_subdomain;
 use std::collections::BTreeSet;
 
 /// `AuthorizerType` `Webhook` (types.go).
@@ -57,27 +60,542 @@ pub struct WebhookConnectionInfo {
     pub kube_config_file: Option<String>,
 }
 
-/// `load.LoadFromData`.
-pub fn load_from_data(_data: &[u8]) -> Result<AuthorizationConfiguration, String> {
-    Err("not implemented".to_string())
+/// `runtime.NewScheme()`'s name, `GetNameFromCallsite` of load.go:32
+/// (`scheme = runtime.NewScheme()`), as it prints in kube-apiserver builds
+/// (the `vendor/` prefix is trimmed).
+const SCHEME_NAME: &str = "k8s.io/apiserver/pkg/apis/apiserver/load/load.go:32";
+/// The group `install.Install` registers (`apiserver.config.k8s.io`) and its
+/// versions (`v1alpha1`, `v1beta1`, `v1`; the three are field-for-field
+/// identical, as are their defaulters).
+const GROUP: &str = "apiserver.config.k8s.io";
+const VERSIONS: [&str; 3] = ["v1alpha1", "v1beta1", "v1"];
+const KIND: &str = "AuthorizationConfiguration";
+
+/// The versioned wire shape (`v1alpha1`/`v1beta1`/`v1` `types.go`).
+#[derive(Debug, Default, serde::Deserialize)]
+struct ExtConfiguration {
+    #[serde(default)]
+    authorizers: Option<Vec<ExtAuthorizer>>,
 }
 
-/// `validation.ValidateAuthorizationConfiguration`.
+#[derive(Debug, Default, serde::Deserialize)]
+struct ExtAuthorizer {
+    #[serde(default, rename = "type")]
+    type_: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    webhook: Option<ExtWebhook>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct ExtWebhook {
+    #[serde(default, rename = "authorizedTTL")]
+    authorized_ttl: Option<String>,
+    #[serde(default, rename = "cacheAuthorizedRequests")]
+    cache_authorized_requests: Option<bool>,
+    #[serde(default, rename = "unauthorizedTTL")]
+    unauthorized_ttl: Option<String>,
+    #[serde(default, rename = "cacheUnauthorizedRequests")]
+    cache_unauthorized_requests: Option<bool>,
+    #[serde(default)]
+    timeout: Option<String>,
+    #[serde(default, rename = "subjectAccessReviewVersion")]
+    subject_access_review_version: Option<String>,
+    #[serde(default, rename = "matchConditionSubjectAccessReviewVersion")]
+    match_condition_subject_access_review_version: Option<String>,
+    #[serde(default, rename = "failurePolicy")]
+    failure_policy: Option<String>,
+    #[serde(default, rename = "connectionInfo")]
+    connection_info: Option<ExtConnectionInfo>,
+    #[serde(default, rename = "matchConditions")]
+    match_conditions: Option<Vec<ExtMatchCondition>>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct ExtConnectionInfo {
+    #[serde(default, rename = "type")]
+    type_: Option<String>,
+    #[serde(default, rename = "kubeConfigFile")]
+    kube_config_file: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct ExtMatchCondition {
+    #[serde(default)]
+    expression: Option<String>,
+}
+
+/// Which json keys each object level accepts (the json tags above); the strict
+/// decoder (`serializer.EnableStrict`, load.go:33) is case-sensitive.
+const TOP_KEYS: [&str; 3] = ["apiVersion", "kind", "authorizers"];
+const AUTHORIZER_KEYS: [&str; 3] = ["type", "name", "webhook"];
+const WEBHOOK_KEYS: [&str; 10] = [
+    "authorizedTTL",
+    "cacheAuthorizedRequests",
+    "unauthorizedTTL",
+    "cacheUnauthorizedRequests",
+    "timeout",
+    "subjectAccessReviewVersion",
+    "matchConditionSubjectAccessReviewVersion",
+    "failurePolicy",
+    "connectionInfo",
+    "matchConditions",
+];
+const CONNECTION_KEYS: [&str; 2] = ["type", "kubeConfigFile"];
+const MATCH_CONDITION_KEYS: [&str; 1] = ["expression"];
+
+/// `unknown field "<path>"` for every key not in `known`, in document order;
+/// `descend` is called for each known key's value.
+fn unknown_fields(
+    v: &serde_yaml::Value,
+    path: &str,
+    known: &[&str],
+    out: &mut Vec<String>,
+    mut descend: impl FnMut(&str, &serde_yaml::Value, &str, &mut Vec<String>),
+) {
+    let Some(map) = v.as_mapping() else { return };
+    for (k, val) in map {
+        let Some(key) = k.as_str() else { continue };
+        let full = if path.is_empty() {
+            key.to_string()
+        } else {
+            format!("{path}.{key}")
+        };
+        if known.contains(&key) {
+            descend(key, val, &full, out);
+        } else {
+            out.push(format!("unknown field \"{full}\""));
+        }
+    }
+}
+
+fn each_item(
+    v: &serde_yaml::Value,
+    path: &str,
+    out: &mut Vec<String>,
+    mut each: impl FnMut(&serde_yaml::Value, &str, &mut Vec<String>),
+) {
+    if let Some(seq) = v.as_sequence() {
+        for (i, item) in seq.iter().enumerate() {
+            each(item, &format!("{path}[{i}]"), out);
+        }
+    }
+}
+
+fn strict_errors(doc: &serde_yaml::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    unknown_fields(doc, "", &TOP_KEYS, &mut out, |key, val, full, out| {
+        if key != "authorizers" {
+            return;
+        }
+        each_item(val, full, out, |a, p, out| {
+            unknown_fields(a, p, &AUTHORIZER_KEYS, out, |key, val, full, out| {
+                if key != "webhook" {
+                    return;
+                }
+                unknown_fields(
+                    val,
+                    full,
+                    &WEBHOOK_KEYS,
+                    out,
+                    |key, val, full, out| match key {
+                        "connectionInfo" => {
+                            unknown_fields(val, full, &CONNECTION_KEYS, out, |_, _, _, _| {})
+                        }
+                        "matchConditions" => each_item(val, full, out, |m, p, out| {
+                            unknown_fields(m, p, &MATCH_CONDITION_KEYS, out, |_, _, _, _| {})
+                        }),
+                        _ => {}
+                    },
+                );
+            });
+        });
+    });
+    out
+}
+
+/// `metav1.Duration.UnmarshalJSON`: the string is `time.ParseDuration`'d.
+fn ext_duration(v: &Option<String>) -> Result<i64, String> {
+    match v {
+        None => Ok(0),
+        Some(s) => parse_go_duration(s),
+    }
+}
+
+const DEFAULT_AUTHORIZED_TTL: i64 = 5 * 60 * 1_000_000_000;
+const DEFAULT_UNAUTHORIZED_TTL: i64 = 30 * 1_000_000_000;
+
+/// `SetDefaults_WebhookConfiguration` (v1/defaults.go:54-67, identical in
+/// v1alpha1/v1beta1) followed by the generated external-to-internal
+/// conversion.
+fn convert_webhook(w: ExtWebhook) -> Result<WebhookConfiguration, String> {
+    let mut authorized_ttl = ext_duration(&w.authorized_ttl)?;
+    let mut unauthorized_ttl = ext_duration(&w.unauthorized_ttl)?;
+    if authorized_ttl == 0 {
+        authorized_ttl = DEFAULT_AUTHORIZED_TTL;
+    }
+    if unauthorized_ttl == 0 {
+        unauthorized_ttl = DEFAULT_UNAUTHORIZED_TTL;
+    }
+    let conn = w.connection_info.unwrap_or_default();
+    Ok(WebhookConfiguration {
+        authorized_ttl,
+        cache_authorized_requests: w.cache_authorized_requests.unwrap_or(true),
+        unauthorized_ttl,
+        cache_unauthorized_requests: w.cache_unauthorized_requests.unwrap_or(true),
+        timeout: ext_duration(&w.timeout)?,
+        subject_access_review_version: w.subject_access_review_version.unwrap_or_default(),
+        match_condition_subject_access_review_version: w
+            .match_condition_subject_access_review_version
+            .unwrap_or_default(),
+        failure_policy: w.failure_policy.unwrap_or_default(),
+        connection_info: WebhookConnectionInfo {
+            type_: conn.type_.unwrap_or_default(),
+            kube_config_file: conn.kube_config_file,
+        },
+        match_conditions: w
+            .match_conditions
+            .unwrap_or_default()
+            .into_iter()
+            .map(|m| WebhookMatchCondition {
+                expression: m.expression.unwrap_or_default(),
+            })
+            .collect(),
+    })
+}
+
+/// `load.LoadFromData` (load.go:61-82). Empty data is the default (empty)
+/// configuration. Otherwise: kind and apiVersion are required (json.go:197-200,
+/// kind first), the (group, version, kind) must be registered, unknown fields
+/// are a `strict decoding error` (load.go:33), then the versioned defaults are
+/// applied and the object converted to the internal type.
+pub fn load_from_data(data: &[u8]) -> Result<AuthorizationConfiguration, String> {
+    if data.is_empty() {
+        return Ok(AuthorizationConfiguration::default());
+    }
+    let text = String::from_utf8_lossy(data);
+    let doc: serde_yaml::Value = serde_yaml::from_str(&text)
+        .map_err(|e| format!("couldn't get version/kind; json parse error: {e}"))?;
+    let field = |name: &str| {
+        doc.get(name)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let (kind, api_version) = (field("kind"), field("apiVersion"));
+    if kind.is_empty() {
+        return Err(format!("Object 'Kind' is missing in '{text}'"));
+    }
+    if api_version.is_empty() {
+        return Err(format!("Object 'apiVersion' is missing in '{text}'"));
+    }
+    let registered = kind == KIND
+        && VERSIONS
+            .iter()
+            .any(|v| api_version == format!("{GROUP}/{v}"));
+    if !registered {
+        return Err(format!(
+            "no kind {kind:?} is registered for version {api_version:?} in scheme {SCHEME_NAME:?}"
+        ));
+    }
+    let unknown = strict_errors(&doc);
+    if !unknown.is_empty() {
+        return Err(format!("strict decoding error: {}", unknown.join(", ")));
+    }
+    let ext: ExtConfiguration = serde_yaml::from_value(doc)
+        .map_err(|e| format!("couldn't get version/kind; json parse error: {e}"))?;
+    let mut authorizers = Vec::new();
+    for a in ext.authorizers.unwrap_or_default() {
+        authorizers.push(AuthorizerConfiguration {
+            type_: a.type_.unwrap_or_default(),
+            name: a.name.unwrap_or_default(),
+            webhook: a.webhook.map(convert_webhook).transpose()?,
+        });
+    }
+    Ok(AuthorizationConfiguration { authorizers })
+}
+
+/// Go's text for an `os` error (`syscall.Errno.Error()`), lowercased.
+pub(crate) fn go_io_error(e: &std::io::Error) -> String {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => "no such file or directory".to_string(),
+        std::io::ErrorKind::PermissionDenied => "permission denied".to_string(),
+        _ => {
+            let s = e.to_string();
+            let s = s.split(" (os error").next().unwrap_or(&s);
+            let mut c = s.chars();
+            match c.next() {
+                Some(f) => f.to_lowercase().collect::<String>() + c.as_str(),
+                None => String::new(),
+            }
+        }
+    }
+}
+
+/// `validation.ValidateAuthorizationConfiguration` (validation.go:642-692).
 pub fn validate_authorization_configuration(
-    _fld_path: &Path,
-    _c: &AuthorizationConfiguration,
-    _known_types: &BTreeSet<String>,
-    _repeatable_types: &BTreeSet<String>,
+    fld_path: &Path,
+    c: &AuthorizationConfiguration,
+    known_types: &BTreeSet<String>,
+    repeatable_types: &BTreeSet<String>,
 ) -> ErrorList {
-    Vec::new()
+    let mut errs = ErrorList::new();
+    if c.authorizers.is_empty() {
+        errs.push(FieldError::required(
+            &fld_path.child("authorizers"),
+            "at least one authorization mode must be defined",
+        ));
+    }
+    let mut seen_types = BTreeSet::new();
+    let mut seen_names = BTreeSet::new();
+    for (i, a) in c.authorizers.iter().enumerate() {
+        let fld_path = fld_path.child("authorizers").index(i);
+        let a_type = a.type_.as_str();
+        if a_type.is_empty() {
+            errs.push(FieldError::required(&fld_path.child("type"), ""));
+            continue;
+        }
+        if !known_types.contains(a_type) {
+            let known: Vec<&String> = known_types.iter().collect();
+            errs.push(FieldError::not_supported(
+                &fld_path.child("type"),
+                a_type,
+                &known,
+            ));
+            continue;
+        }
+        if seen_types.contains(a_type) && !repeatable_types.contains(a_type) {
+            errs.push(FieldError::duplicate(&fld_path.child("type"), a_type));
+            continue;
+        }
+        seen_types.insert(a_type.to_string());
+
+        if a.name.is_empty() {
+            errs.push(FieldError::required(&fld_path.child("name"), ""));
+        } else if seen_names.contains(&a.name) {
+            errs.push(FieldError::duplicate(
+                &fld_path.child("name"),
+                a.name.as_str(),
+            ));
+        } else {
+            let name_errs = is_dns1123_subdomain(&a.name);
+            if !name_errs.is_empty() {
+                errs.push(FieldError::invalid(
+                    &fld_path.child("name"),
+                    a.name.as_str(),
+                    format!("authorizer name is invalid: {}", name_errs.join(", ")),
+                ));
+            }
+        }
+        seen_names.insert(a.name.clone());
+
+        if a.type_ == TYPE_WEBHOOK {
+            match &a.webhook {
+                None => {
+                    errs.push(FieldError::required(
+                        &fld_path.child("webhook"),
+                        "required when type=Webhook",
+                    ));
+                    continue;
+                }
+                Some(w) => errs.extend(validate_webhook_configuration(&fld_path, w)),
+            }
+        } else if a.webhook.is_some() {
+            errs.push(FieldError::invalid(
+                &fld_path.child("webhook"),
+                "non-null",
+                "may only be specified when type=Webhook",
+            ));
+        }
+    }
+    errs
 }
 
-/// `authorizer.LoadAndValidateData`.
+/// `validation.ValidateWebhookConfiguration` (validation.go:694-770). Like
+/// upstream, `fld_path` is the AUTHORIZER's path (the caller does not descend
+/// into `webhook`), so errors read `authorizers[0].timeout`.
+pub fn validate_webhook_configuration(fld_path: &Path, c: &WebhookConfiguration) -> ErrorList {
+    let mut errs = ErrorList::new();
+    if c.timeout == 0 {
+        errs.push(FieldError::required(&fld_path.child("timeout"), ""));
+    } else if c.timeout > 30 * 1_000_000_000 || c.timeout < 0 {
+        errs.push(FieldError::invalid(
+            &fld_path.child("timeout"),
+            format_go_duration(c.timeout),
+            "must be > 0s and <= 30s",
+        ));
+    }
+    if c.authorized_ttl == 0 {
+        errs.push(FieldError::required(&fld_path.child("authorizedTTL"), ""));
+    } else if c.authorized_ttl < 0 {
+        errs.push(FieldError::invalid(
+            &fld_path.child("authorizedTTL"),
+            format_go_duration(c.authorized_ttl),
+            "must be > 0s",
+        ));
+    }
+    if c.unauthorized_ttl == 0 {
+        errs.push(FieldError::required(&fld_path.child("unauthorizedTTL"), ""));
+    } else if c.unauthorized_ttl < 0 {
+        errs.push(FieldError::invalid(
+            &fld_path.child("unauthorizedTTL"),
+            format_go_duration(c.unauthorized_ttl),
+            "must be > 0s",
+        ));
+    }
+    let sar = fld_path.child("subjectAccessReviewVersion");
+    match c.subject_access_review_version.as_str() {
+        "" => errs.push(FieldError::required(&sar, "")),
+        "v1" | "v1beta1" => {}
+        v => errs.push(FieldError::not_supported(&sar, v, &["v1", "v1beta1"])),
+    }
+    let mc_sar = fld_path.child("matchConditionSubjectAccessReviewVersion");
+    match c.match_condition_subject_access_review_version.as_str() {
+        "" => {
+            if !c.match_conditions.is_empty() {
+                errs.push(FieldError::required(
+                    &mc_sar,
+                    "required if match conditions are specified",
+                ));
+            }
+        }
+        "v1" => {}
+        v => errs.push(FieldError::not_supported(&mc_sar, v, &["v1"])),
+    }
+    let fp = fld_path.child("failurePolicy");
+    match c.failure_policy.as_str() {
+        "" => errs.push(FieldError::required(&fp, "")),
+        FAILURE_POLICY_NO_OPINION | FAILURE_POLICY_DENY => {}
+        v => errs.push(FieldError::not_supported(&fp, v, &["NoOpinion", "Deny"])),
+    }
+    let conn_type = fld_path.child("connectionInfo").child("type");
+    let conn_file = fld_path.child("connectionInfo").child("kubeConfigFile");
+    match c.connection_info.type_.as_str() {
+        "" => errs.push(FieldError::required(&conn_type, "")),
+        CONNECTION_INFO_TYPE_IN_CLUSTER => {
+            if let Some(f) = &c.connection_info.kube_config_file {
+                errs.push(FieldError::invalid(
+                    &conn_file,
+                    f.as_str(),
+                    "can only be set when type=KubeConfigFile",
+                ));
+            }
+        }
+        CONNECTION_INFO_TYPE_KUBE_CONFIG_FILE => {
+            match c.connection_info.kube_config_file.as_deref() {
+                None | Some("") => errs.push(FieldError::required(&conn_file, "")),
+                Some(f) if !std::path::Path::new(f).is_absolute() => errs.push(
+                    FieldError::invalid(&conn_file, f, "must be an absolute path"),
+                ),
+                Some(f) => match std::fs::metadata(f) {
+                    Err(e) => errs.push(FieldError::invalid(
+                        &conn_file,
+                        f,
+                        format!("error loading file: stat {f}: {}", go_io_error(&e)),
+                    )),
+                    Ok(m) if !m.is_file() => {
+                        errs.push(FieldError::invalid(&conn_file, f, "must be a regular file"))
+                    }
+                    Ok(_) => {}
+                },
+            }
+        }
+        _ => errs.push(FieldError::not_supported(
+            &conn_type,
+            BadValue::marshal(&c.connection_info),
+            &[
+                CONNECTION_INFO_TYPE_IN_CLUSTER,
+                CONNECTION_INFO_TYPE_KUBE_CONFIG_FILE,
+            ],
+        )),
+    }
+    // `compileMatchConditions(..., StructuredAuthorizationConfiguration
+    // enabled)` (:766): the gate is GA and locked on in 1.35.
+    let (_, mc_errs) = CelMatcher::compile_at(&c.match_conditions, fld_path);
+    errs.extend(mc_errs);
+    errs
+}
+
+/// `utilerrors.NewAggregate(...).Error()` (errors.go: duplicates removed, one
+/// message verbatim, several as `[a, b]`).
+pub(crate) fn aggregate_error(msgs: Vec<String>) -> String {
+    let mut seen = BTreeSet::new();
+    let uniq: Vec<String> = msgs
+        .into_iter()
+        .filter(|m| seen.insert(m.clone()))
+        .collect();
+    if uniq.len() == 1 {
+        uniq[0].clone()
+    } else {
+        format!("[{}]", uniq.join(", "))
+    }
+}
+
+/// `GetNameForAuthorizerMode` (config.go): the lower-cased mode name.
+pub fn name_for_authorizer_mode(mode: &str) -> String {
+    mode.to_lowercase()
+}
+
+/// `authorizer.LoadAndValidateData` (config.go): load, validate with the known
+/// modes and only `Webhook` repeatable, then require that each non-Webhook
+/// authorizer is named after its type and that every
+/// `require_non_webhook_types` entry is present.
 pub fn load_and_validate_data(
-    _data: &[u8],
-    _require_non_webhook_types: &BTreeSet<String>,
+    data: &[u8],
+    require_non_webhook_types: &BTreeSet<String>,
 ) -> Result<AuthorizationConfiguration, String> {
-    Err("not implemented".to_string())
+    let config = load_from_data(data)
+        .map_err(|e| format!("failed to load AuthorizationConfiguration from file: {e}"))?;
+    let known: BTreeSet<String> = AUTHORIZATION_MODE_CHOICES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let repeatable: BTreeSet<String> = [MODE_WEBHOOK.to_string()].into_iter().collect();
+    let errors =
+        validate_authorization_configuration(&Path::default(), &config, &known, &repeatable);
+    if !errors.is_empty() {
+        return Err(aggregate_error(
+            errors.iter().map(|e| e.to_string()).collect(),
+        ));
+    }
+    let mut all_errors = Vec::new();
+    let mut seen_modes = BTreeSet::new();
+    for a in &config.authorizers {
+        if a.type_ == MODE_WEBHOOK {
+            continue;
+        }
+        seen_modes.insert(a.type_.clone());
+        let expected = name_for_authorizer_mode(&a.type_);
+        if expected != a.name {
+            all_errors.push(format!(
+                "expected name {expected} for authorizer {} instead of {}",
+                a.type_, a.name
+            ));
+        }
+    }
+    let missing: Vec<&str> = require_non_webhook_types
+        .difference(&seen_modes)
+        .map(|s| s.as_str())
+        .collect();
+    if !missing.is_empty() {
+        all_errors.push(format!("missing required types: [{}]", missing.join(" ")));
+    }
+    if !all_errors.is_empty() {
+        return Err(aggregate_error(all_errors));
+    }
+    Ok(config)
+}
+
+/// `authorizer.LoadAndValidateFile`: the file's contents are returned with the
+/// configuration (`InitialAuthorizationConfigurationData`).
+pub fn load_and_validate_file(
+    path: &str,
+    require_non_webhook_types: &BTreeSet<String>,
+) -> Result<(AuthorizationConfiguration, String), String> {
+    let data = std::fs::read(path).map_err(|e| format!("open {path}: {}", go_io_error(&e)))?;
+    let config = load_and_validate_data(&data, require_non_webhook_types)?;
+    Ok((config, String::from_utf8_lossy(&data).into_owned()))
 }
 
 #[cfg(test)]
@@ -279,7 +797,11 @@ authorizers:
         }
     }
 
-    fn one(type_: &str, name: &str, webhook: Option<WebhookConfiguration>) -> AuthorizationConfiguration {
+    fn one(
+        type_: &str,
+        name: &str,
+        webhook: Option<WebhookConfiguration>,
+    ) -> AuthorizationConfiguration {
         AuthorizationConfiguration {
             authorizers: vec![AuthorizerConfiguration {
                 type_: type_.into(),
@@ -301,7 +823,11 @@ authorizers:
     }
 
     fn webhook_errs(w: WebhookConfiguration) -> Vec<String> {
-        validate(&one("Webhook", "default", Some(w)), &["Webhook"], &["Webhook"])
+        validate(
+            &one("Webhook", "default", Some(w)),
+            &["Webhook"],
+            &["Webhook"],
+        )
     }
 
     #[test]
@@ -345,10 +871,17 @@ authorizers:
             vec![r#"authorizers[1].name: Duplicate value: "foo""#]
         );
         assert!(validate(&one("Foo", "myauthorizer", None), &["Foo"], &["Webhook"]).is_empty());
-        assert!(
-            validate(&one("Foo", "foo.example.domain", None), &["Foo"], &["Webhook"]).is_empty()
+        assert!(validate(
+            &one("Foo", "foo.example.domain", None),
+            &["Foo"],
+            &["Webhook"]
+        )
+        .is_empty());
+        let bad = validate(
+            &one("Foo", "FOO.example.domain", None),
+            &["Foo"],
+            &["Webhook"],
         );
-        let bad = validate(&one("Foo", "FOO.example.domain", None), &["Foo"], &["Webhook"]);
         assert_eq!(bad.len(), 1);
         assert!(
             bad[0].starts_with(
@@ -428,7 +961,9 @@ authorizers:
                 &["Foo"],
                 &["Webhook"]
             ),
-            vec![r#"authorizers[0].webhook: Invalid value: "non-null": may only be specified when type=Webhook"#]
+            vec![
+                r#"authorizers[0].webhook: Invalid value: "non-null": may only be specified when type=Webhook"#
+            ]
         );
     }
 
@@ -436,7 +971,10 @@ authorizers:
     fn webhook_timeout() {
         let mut w = good_webhook();
         w.timeout = 0;
-        assert_eq!(webhook_errs(w), vec!["authorizers[0].timeout: Required value"]);
+        assert_eq!(
+            webhook_errs(w),
+            vec!["authorizers[0].timeout: Required value"]
+        );
         for (d, shown) in [(-30 * SEC, "-30s"), (60 * SEC, "1m0s")] {
             let mut w = good_webhook();
             w.timeout = d;
@@ -453,7 +991,10 @@ authorizers:
     fn webhook_ttls() {
         let mut w = good_webhook();
         w.authorized_ttl = 0;
-        assert_eq!(webhook_errs(w), vec!["authorizers[0].authorizedTTL: Required value"]);
+        assert_eq!(
+            webhook_errs(w),
+            vec!["authorizers[0].authorizedTTL: Required value"]
+        );
         let mut w = good_webhook();
         w.authorized_ttl = -30 * SEC;
         assert_eq!(
@@ -462,7 +1003,10 @@ authorizers:
         );
         let mut w = good_webhook();
         w.unauthorized_ttl = 0;
-        assert_eq!(webhook_errs(w), vec!["authorizers[0].unauthorizedTTL: Required value"]);
+        assert_eq!(
+            webhook_errs(w),
+            vec!["authorizers[0].unauthorizedTTL: Required value"]
+        );
         let mut w = good_webhook();
         w.unauthorized_ttl = -30 * SEC;
         assert_eq!(
@@ -483,7 +1027,9 @@ authorizers:
         w.subject_access_review_version = "v2beta1".into();
         assert_eq!(
             webhook_errs(w),
-            vec![r#"authorizers[0].subjectAccessReviewVersion: Unsupported value: "v2beta1": supported values: "v1", "v1beta1""#]
+            vec![
+                r#"authorizers[0].subjectAccessReviewVersion: Unsupported value: "v2beta1": supported values: "v1", "v1beta1""#
+            ]
         );
         // v1beta1 is a valid subjectAccessReviewVersion.
         let mut w = good_webhook();
@@ -507,7 +1053,9 @@ authorizers:
         w.match_condition_subject_access_review_version = "v1beta1".into();
         assert_eq!(
             webhook_errs(w),
-            vec![r#"authorizers[0].matchConditionSubjectAccessReviewVersion: Unsupported value: "v1beta1": supported values: "v1""#]
+            vec![
+                r#"authorizers[0].matchConditionSubjectAccessReviewVersion: Unsupported value: "v1beta1": supported values: "v1""#
+            ]
         );
     }
 
@@ -515,12 +1063,17 @@ authorizers:
     fn webhook_failure_policy() {
         let mut w = good_webhook();
         w.failure_policy = String::new();
-        assert_eq!(webhook_errs(w), vec!["authorizers[0].failurePolicy: Required value"]);
+        assert_eq!(
+            webhook_errs(w),
+            vec!["authorizers[0].failurePolicy: Required value"]
+        );
         let mut w = good_webhook();
         w.failure_policy = "AlwaysAllow".into();
         assert_eq!(
             webhook_errs(w),
-            vec![r#"authorizers[0].failurePolicy: Unsupported value: "AlwaysAllow": supported values: "NoOpinion", "Deny""#]
+            vec![
+                r#"authorizers[0].failurePolicy: Unsupported value: "AlwaysAllow": supported values: "NoOpinion", "Deny""#
+            ]
         );
         let mut w = good_webhook();
         w.failure_policy = "Deny".into();
@@ -540,13 +1093,17 @@ authorizers:
         w.connection_info.type_ = "ExternalClusterConfig".into();
         assert_eq!(
             webhook_errs(w),
-            vec![r#"authorizers[0].connectionInfo.type: Unsupported value: {"Type":"ExternalClusterConfig","KubeConfigFile":null}: supported values: "InClusterConfig", "KubeConfigFile""#]
+            vec![
+                r#"authorizers[0].connectionInfo.type: Unsupported value: {"Type":"ExternalClusterConfig","KubeConfigFile":null}: supported values: "InClusterConfig", "KubeConfigFile""#
+            ]
         );
         let mut w = good_webhook();
         w.connection_info.kube_config_file = Some(String::new());
         assert_eq!(
             webhook_errs(w),
-            vec![r#"authorizers[0].connectionInfo.kubeConfigFile: Invalid value: "": can only be set when type=KubeConfigFile"#]
+            vec![
+                r#"authorizers[0].connectionInfo.kubeConfigFile: Invalid value: "": can only be set when type=KubeConfigFile"#
+            ]
         );
         let mut w = good_webhook();
         w.connection_info.type_ = "KubeConfigFile".into();
@@ -559,7 +1116,9 @@ authorizers:
         w.connection_info.kube_config_file = Some("../some/relative/path/kubeconfig".into());
         assert_eq!(
             webhook_errs(w),
-            vec![r#"authorizers[0].connectionInfo.kubeConfigFile: Invalid value: "../some/relative/path/kubeconfig": must be an absolute path"#]
+            vec![
+                r#"authorizers[0].connectionInfo.kubeConfigFile: Invalid value: "../some/relative/path/kubeconfig": must be an absolute path"#
+            ]
         );
         let f = tempfile_path("kc");
         std::fs::write(&f, "x").unwrap();
@@ -582,7 +1141,9 @@ authorizers:
         w.connection_info.kube_config_file = Some("/tmp".into());
         assert_eq!(
             webhook_errs(w),
-            vec![r#"authorizers[0].connectionInfo.kubeConfigFile: Invalid value: "/tmp": must be a regular file"#]
+            vec![
+                r#"authorizers[0].connectionInfo.kubeConfigFile: Invalid value: "/tmp": must be a regular file"#
+            ]
         );
         let _ = std::fs::remove_file(f);
     }
@@ -611,7 +1172,9 @@ authorizers:
         w.match_conditions = vec![c.clone(), c];
         assert_eq!(
             webhook_errs(w),
-            vec![r#"authorizers[0].matchConditions[1].expression: Duplicate value: "request.user == 'admin'""#]
+            vec![
+                r#"authorizers[0].matchConditions[1].expression: Duplicate value: "request.user == 'admin'""#
+            ]
         );
     }
 
@@ -650,7 +1213,8 @@ authorizers:
 
     #[test]
     fn load_and_validate_builtin_authorizer_names_must_be_lowercased_type() {
-        let ok = format!("{HDR}authorizers:\n- type: Node\n  name: node\n- type: RBAC\n  name: rbac\n");
+        let ok =
+            format!("{HDR}authorizers:\n- type: Node\n  name: node\n- type: RBAC\n  name: rbac\n");
         let c = load_and_validate_data(ok.as_bytes(), &set(&[])).unwrap();
         assert_eq!(c.authorizers.len(), 2);
 
@@ -683,9 +1247,7 @@ authorizers:
 
     #[test]
     fn load_and_validate_aggregates_multiple_errors() {
-        let two = format!(
-            "{HDR}authorizers:\n- type: RBAC\n  name: a\n- type: Node\n  name: b\n"
-        );
+        let two = format!("{HDR}authorizers:\n- type: RBAC\n  name: a\n- type: Node\n  name: b\n");
         assert_eq!(
             load_and_validate_data(two.as_bytes(), &set(&[])).unwrap_err(),
             "[expected name rbac for authorizer RBAC instead of a, expected name node for authorizer Node instead of b]"
