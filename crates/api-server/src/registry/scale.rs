@@ -85,7 +85,14 @@ impl<P: Object> UpdatedObjectInfo<P> for ScaleUpdatedObjectInfo<'_, P> {
 
         let errs = validate_scale(&scale);
         if !errs.is_empty() {
-            return Err(Error::Invalid(errs));
+            // `errors.NewInvalid(autoscaling.Kind("Scale"), deployment.Name,
+            // errs)` (storage.go:457; same in replicaset/statefulset/rc).
+            return Err(Error::new_invalid(
+                "autoscaling",
+                "Scale",
+                &scale.metadata.name,
+                errs,
+            ));
         }
 
         // "validate precondition if specified (resourceVersion matching is
