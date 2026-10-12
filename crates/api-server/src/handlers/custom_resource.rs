@@ -45,22 +45,34 @@ async fn serving_crd(
     plural: &str,
     subresource: Option<&str>,
 ) -> Result<Arc<CustomResourceDefinition>> {
-    let not_found = || {
-        rusternetes_common::Error::NotFound(
-            "the server could not find the requested resource".to_string(),
-        )
-    };
     let crd = get_crd_for_resource(state, &format!("{plural}.{group}"))
         .await
-        .map_err(|_| not_found())?;
+        .map_err(|_| serving_not_found())?;
+    check_serving(&crd, version, subresource)?;
+    Ok(Arc::new(crd))
+}
+
+fn serving_not_found() -> rusternetes_common::Error {
+    rusternetes_common::Error::NotFound(
+        "the server could not find the requested resource".to_string(),
+    )
+}
+
+/// The version/subresource/condition gates of `crdHandler.ServeHTTP`
+/// (customresource_handler.go:283-293 and :299-352).
+fn check_serving(
+    crd: &CustomResourceDefinition,
+    version: &str,
+    subresource: Option<&str>,
+) -> Result<()> {
     let served = crd
         .spec
         .versions
         .iter()
         .find(|v| v.name == version)
-        .ok_or_else(not_found)?;
+        .ok_or_else(serving_not_found)?;
     if !served.served {
-        return Err(not_found());
+        return Err(serving_not_found());
     }
     if subresource == Some("status")
         && !served
@@ -68,9 +80,9 @@ async fn serving_crd(
             .as_ref()
             .is_some_and(|s| s.status.is_some())
     {
-        return Err(not_found());
+        return Err(serving_not_found());
     }
-    Ok(Arc::new(crd))
+    Ok(())
 }
 
 /// The `RequestScope` of a custom resource (or its `/status`) at one served
@@ -1164,6 +1176,38 @@ mod tests {
             status: None,
             extra: Default::default(),
         }
+    }
+
+    fn crd_with_conditions(conds: &[(&str, &str)]) -> CustomResourceDefinition {
+        let mut crd = create_test_crd();
+        crd.status = Some(
+            rusternetes_common::resources::CustomResourceDefinitionStatus {
+                conditions: Some(
+                    conds
+                        .iter()
+                        .map(|(t, s)| {
+                            serde_json::from_value(json!({"type": t, "status": s})).unwrap()
+                        })
+                        .collect(),
+                ),
+                accepted_names: None,
+                stored_versions: None,
+            },
+        );
+        crd
+    }
+
+    /// customresource_handler.go:288-293: neither NamesAccepted nor
+    /// Established true -> delegate (404).
+    #[test]
+    fn check_serving_requires_names_accepted_or_established() {
+        assert!(check_serving(&create_test_crd(), "v1", None).is_err());
+        let c = crd_with_conditions(&[("NamesAccepted", "False"), ("Established", "False")]);
+        assert!(check_serving(&c, "v1", None).is_err());
+        let c = crd_with_conditions(&[("NamesAccepted", "True")]);
+        assert!(check_serving(&c, "v1", None).is_ok());
+        let c = crd_with_conditions(&[("Established", "True")]);
+        assert!(check_serving(&c, "v1", None).is_ok());
     }
 
     #[test]
