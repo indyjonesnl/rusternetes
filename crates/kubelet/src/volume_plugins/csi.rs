@@ -85,11 +85,8 @@ impl LifecycleMode {
 /// `NodePublishVolume`) against the driver registered in
 /// [`super::csi_drivers_store`].
 ///
-/// **Deliberate deviation (inline arm only):** an inline volume whose driver is
-/// not registered keeps the pre-plugin behaviour — a placeholder directory —
-/// rather than failing as upstream does ("no CSIDriver object",
-/// `csi_mounter.go:550`). A PersistentVolume never falls back: an unregistered
-/// driver is a transient failure, so a pod cannot start with an empty volume.
+/// An unregistered driver is a transient failure for both arms
+/// (`csi_mounter.go:106-109`); no placeholder directory is created (#3262).
 pub struct CsiPlugin {
     host: Arc<dyn VolumeHost>,
 }
@@ -973,17 +970,6 @@ impl Mounter for CsiMounter {
 
         let client = match CsiDriverClient::new(&self.driver_name) {
             Ok(c) => c,
-            // DEVIATION (inline arm only, see `CsiPlugin`): keep the
-            // placeholder directory the pre-plugin `create_volume` produced.
-            Err(e) if matches!(self.source, Source::Inline(_)) => {
-                debug!("kubernetes.io/csi: {e}; creating placeholder for inline volume");
-                std::fs::create_dir_all(dir).context("Failed to create CSI volume directory")?;
-                info!(
-                    "Created CSI ephemeral volume {} at {} (managed by CSI driver)",
-                    self.spec_name, dir_str
-                );
-                return Ok(());
-            }
             // Treat the absence of the CSI driver as a transient error
             // (https://github.com/kubernetes/kubernetes/issues/120268).
             Err(e) => {

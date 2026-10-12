@@ -165,6 +165,44 @@ fn pvc_read_only(volume: &rusternetes_common::resources::Volume) -> bool {
         .unwrap_or(false)
 }
 
+/// `failed to get Plugin from volumeSpec for volume %q err=%v` wrapping
+/// `ErrNoPluginMatched` (`desired_state_of_world.go:272-277`,
+/// `plugins.go:72`). `lifecycle::is_volume_wait_error` classifies it as a wait
+/// so the pod stays in ContainerCreating.
+#[derive(Debug)]
+pub(crate) struct NoPluginForVolume(pub String);
+
+impl std::fmt::Display for NoPluginForVolume {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "failed to get Plugin from volumeSpec for volume {:?} err=no volume plugin matched",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for NoPluginForVolume {}
+
+/// `util.GetPodVolumeNames` (`pkg/volume/util/util.go:507-537`): a volume is
+/// used when any container (init, regular, ephemeral) mounts or maps it.
+fn pod_uses_volume(pod: &Pod, name: &str) -> bool {
+    let Some(spec) = pod.spec.as_ref() else {
+        return false;
+    };
+    spec.containers
+        .iter()
+        .chain(spec.init_containers.iter().flatten())
+        .any(|c| {
+            c.volume_mounts.iter().flatten().any(|v| v.name == name)
+                || c.volume_devices.iter().flatten().any(|v| v.name == name)
+        })
+        || spec.ephemeral_containers.iter().flatten().any(|c| {
+            c.volume_mounts.iter().flatten().any(|v| v.name == name)
+                || c.volume_devices.iter().flatten().any(|v| v.name == name)
+        })
+}
+
 impl VolumeManager {
     /// Construct a `VolumeManager` from the same three values the bollard
     /// `ContainerRuntime` already carries.
@@ -836,7 +874,19 @@ impl VolumeManager {
 
         if let Some(volumes) = &pod.spec.as_ref().unwrap().volumes {
             for volume in volumes {
-                let volume_path = self.create_volume(pod, volume).await?;
+                let volume_path = match self.create_volume(pod, volume).await {
+                    Ok(p) => p,
+                    // `desired_state_of_world_populator.go:293-298`: a volume
+                    // no container mounts is "Skipping unused volume", so it
+                    // never reaches `FindPluginBySpec`.
+                    Err(e)
+                        if e.downcast_ref::<NoPluginForVolume>().is_some()
+                            && !pod_uses_volume(pod, &volume.name) =>
+                    {
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
                 volume_paths.insert(volume.name.clone(), volume_path);
             }
         }
@@ -1312,43 +1362,14 @@ impl VolumeManager {
                 rec.attributes = attributes;
                 Ok(path)
             }
-            Err(crate::volume_plugins::PluginLookupError::NoPluginMatched) if pv.is_some() => {
-                // Preserve the pre-registry message: today only a
-                // hostPath-sourced PV resolves, so "no plugin matched" for a
-                // resolved PV means it has no hostPath source. `lifecycle.rs`
-                // documents this exact string as a non-wait error.
-                Err(anyhow::anyhow!(
-                    "PersistentVolume does not have a hostPath volume source"
-                ))
-            }
-            // DEVIATION from upstream, preserved from the pre-registry
-            // `create_volume` and documented at
-            // `pod_dirs::UNSUPPORTED_PLUGIN`: upstream fails the pod for an
-            // unimplemented inline kind (nfs, iscsi, image, ...); we
-            // provision an empty directory so it can run instead. Kept at
-            // this call site rather than inside the registry — a catch-all
-            // plugin cannot know whether another plugin already matched, so
-            // it would trip `MultipleMatched` on every volume — so the
-            // registry stays a faithful port and this is one match arm to
-            // delete once every kind is implemented.
+            // Upstream: the populator's `AddPodToVolume` fails the volume and
+            // the pod waits in ContainerCreating
+            // (`desired_state_of_world.go:272-277`,
+            // `desired_state_of_world_populator.go:310-315`); there is no
+            // fallback directory (#3262). Covers a PV-resolved spec too (e.g.
+            // an nfs-sourced PersistentVolume).
             Err(crate::volume_plugins::PluginLookupError::NoPluginMatched) => {
-                warn!(
-                    "Unknown volume type for volume {}, creating empty directory as fallback (volume debug: downward_api={}, empty_dir={}, host_path={}, config_map={}, secret={}, projected={}, pvc={}, csi={}, ephemeral={})",
-                    volume.name,
-                    volume.downward_api.is_some(),
-                    volume.empty_dir.is_some(),
-                    volume.host_path.is_some(),
-                    volume.config_map.is_some(),
-                    volume.secret.is_some(),
-                    volume.projected.is_some(),
-                    volume.persistent_volume_claim.is_some(),
-                    volume.csi.is_some(),
-                    volume.ephemeral.is_some(),
-                );
-                let volume_dir = self.pod_volume_dir(pod, volume);
-                std::fs::create_dir_all(&volume_dir)
-                    .context("Failed to create fallback volume directory")?;
-                Ok(volume_dir)
+                Err(NoPluginForVolume(volume.name.clone()).into())
             }
             // A volume declaring two sources (e.g. both emptyDir and
             // configMap) previously resolved silently, first-arm-wins, under
@@ -3430,7 +3451,7 @@ mod pvc_resolution_tests {
             .unwrap_err();
         assert_eq!(
             err.to_string(),
-            "PersistentVolume does not have a hostPath volume source"
+            "failed to get Plugin from volumeSpec for volume \"claimed\" err=no volume plugin matched"
         );
     }
 }
@@ -3536,10 +3557,8 @@ mod dispatch_tests {
             // `projected` is not storage-free: upstream's SetUpAt fails with
             // "kube client is not configured" without a client, so its
             // plugin-dir dispatch is asserted by the projected tests.
-            (
-                volume("f", json!({"csi": {"driver": "d"}})),
-                crate::pod_dirs::plugin::CSI,
-            ),
+            // An inline `csi` volume needs a registered driver (#3262), so
+            // its dispatch is covered by the csi plugin tests.
             (
                 volume("g", json!({"hostPath": {"path": "/tmp"}})),
                 crate::pod_dirs::plugin::HOST_PATH,
@@ -3568,42 +3587,55 @@ mod dispatch_tests {
         }
     }
 
-    /// An unimplemented kind (nfs, iscsi, image, ...) matches no plugin.
-    /// `create_volume` applies the documented empty-directory fallback rather
-    /// than erroring, and `plugin_name_for_volume` reports the same
-    /// `UNSUPPORTED_PLUGIN` segment that fallback directory sits under — the
-    /// other half of the #1967 invariant.
+    /// #3262: an unimplemented kind (nfs, iscsi, fc, gitRepo, image) matches no
+    /// plugin. Upstream's desired-state populator fails the volume with
+    /// `failed to get Plugin from volumeSpec for volume %q err=%v`
+    /// (`desired_state_of_world.go:272-277`) over `ErrNoPluginMatched`
+    /// (`plugins.go:72`), and the pod waits in ContainerCreating. No empty
+    /// directory may be provisioned, and the error must classify as a wait.
     #[tokio::test]
-    async fn an_unimplemented_kind_falls_back_to_unsupported() {
+    async fn an_unimplemented_kind_fails_with_no_volume_plugin_matched() {
         let tmp = tempfile::tempdir().unwrap();
         let vm = VolumeManager::new(
             tmp.path().to_string_lossy().to_string(),
             None,
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
         );
-        let v = volume(
-            "nfs-vol",
-            json!({"nfs": {"server": "10.0.0.1", "path": "/export"}}),
-        );
-
-        assert_eq!(
-            vm.plugin_name_for_volume(&v),
-            crate::pod_dirs::UNSUPPORTED_PLUGIN
-        );
-
         let pod: Pod = serde_json::from_value(json!({
             "metadata": {"name": "p", "namespace": "default", "uid": "uid-nfs"},
-            "spec": {"containers": []}
+            "spec": {"containers": [{"name": "c", "image": "i",
+                "volumeMounts": [{"name": "nfs-vol", "mountPath": "/m"}]}],
+                "volumes": [{"name": "nfs-vol", "nfs": {"server": "10.0.0.1", "path": "/export"}}]}
         }))
         .unwrap();
-        let path = vm.create_volume(&pod, &v).await.unwrap();
-        assert!(
-            path.contains(&crate::pod_dirs::escape_qualified_name(
-                crate::pod_dirs::UNSUPPORTED_PLUGIN
-            )),
-            "path {path} should sit under the unsupported-plugin segment"
+
+        let err = vm.create_pod_volumes(&pod).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "failed to get Plugin from volumeSpec for volume \"nfs-vol\" err=no volume plugin matched"
         );
-        assert!(std::path::Path::new(&path).is_dir());
+        assert!(crate::lifecycle::is_volume_wait_error(&err.to_string()));
+        assert!(!tmp.path().join("pods").exists(), "no fallback dir");
+    }
+
+    /// Upstream only processes volumes a container mounts
+    /// (`desired_state_of_world_populator.go:293-298`, "Skipping unused
+    /// volume"), so an unused unsupported volume does not fail the pod.
+    #[tokio::test]
+    async fn an_unused_unimplemented_kind_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(
+            tmp.path().to_string_lossy().to_string(),
+            None,
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-nfs"},
+            "spec": {"containers": [{"name": "c", "image": "i"}],
+                "volumes": [{"name": "nfs-vol", "nfs": {"server": "s", "path": "/e"}}]}
+        }))
+        .unwrap();
+        assert!(vm.create_pod_volumes(&pod).await.unwrap().is_empty());
     }
 
     /// The case the ordered if-else this replaced silently resolved: two

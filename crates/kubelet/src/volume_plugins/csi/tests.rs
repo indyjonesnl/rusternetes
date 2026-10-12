@@ -373,6 +373,33 @@ async fn mount_device_with_an_unregistered_driver_is_transient() {
     ));
 }
 
+/// #3262: an inline volume whose driver is not registered is a transient
+/// failure, exactly as for a PersistentVolume: `csi_mounter.go:106-109`
+/// ("mounter.SetUpAt failed to get CSI client") applies to every lifecycle
+/// mode. No placeholder directory may be created.
+#[tokio::test]
+async fn set_up_of_an_unregistered_inline_driver_is_transient() {
+    let f = fx("inlineunreg", &[], None).await;
+    let v: Volume = serde_json::from_value(
+        json!({"name": "eph", "csi": {"driver": "nobody-inline.csi.example.com"}}),
+    )
+    .unwrap();
+    let spec = Spec {
+        volume: &v,
+        persistent_volume: None,
+        read_only: false,
+    };
+    let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
+    let err = m.set_up().await.unwrap_err();
+    assert!(matches!(
+        err.downcast_ref::<CsiError>(),
+        Some(CsiError::Transient(_))
+    ));
+    assert!(err
+        .to_string()
+        .contains("mounter.SetUpAt failed to get CSI client"));
+}
+
 /// `CanDeviceMount` (`csi_plugin.go:702-715`): persistent yes, ephemeral no.
 #[test]
 fn can_device_mount_is_persistent_only() {
@@ -960,28 +987,6 @@ async fn set_up_publishes_an_inline_volume_on_a_registered_driver() {
         "inline secret ref uses the pod's namespace"
     );
     assert!(calls.stage.is_empty(), "inline volumes are never staged");
-}
-
-/// Deviation preserved from the pre-plugin `create_volume`: an inline volume
-/// whose driver is NOT registered keeps the placeholder directory instead of
-/// failing the pod (upstream would fail with "no CSIDriver object").
-#[tokio::test]
-async fn inline_volume_on_an_unregistered_driver_keeps_the_placeholder_dir() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().to_string_lossy().to_string();
-    let p = CsiPlugin::new(host(&root, None));
-    let v: Volume = serde_json::from_value(
-        json!({"name": "eph", "csi": {"driver": "not-registered-inline.example.com"}}),
-    )
-    .unwrap();
-    let spec = Spec {
-        volume: &v,
-        persistent_volume: None,
-        read_only: false,
-    };
-    let m = p.new_mounter(&spec, &pod()).await.unwrap();
-    m.set_up().await.unwrap();
-    assert!(std::path::Path::new(&m.get_path()).is_dir());
 }
 
 // ---- TearDown --------------------------------------------------------------
