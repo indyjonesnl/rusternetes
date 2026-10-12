@@ -51,6 +51,26 @@ pub struct AuthorizationArgs {
     /// `--authorization-webhook-*` (#2895).
     #[command(flatten)]
     pub webhook: crate::authorization_webhook::AuthorizationWebhookArgs,
+
+    /// File with Authorization Configuration to configure the authorizer
+    /// chain. This flag is mutually exclusive with the other
+    /// --authorization-mode and --authorization-webhook-* flags (`AddFlags`,
+    /// authorization.go:194-197; `AuthorizationConfigurationFile`, #3294).
+    #[arg(long = "authorization-config", default_value = "")]
+    pub authorization_config: String,
+
+    /// `AreLegacyFlagsSet` (authorization.go:200-211): whether any of
+    /// `--authorization-mode` / `--authorization-webhook-config-file` /
+    /// `-version` / `-cache-authorized-ttl` / `-cache-unauthorized-ttl` was
+    /// given on the command line (pflag `fs.Changed`; NOT
+    /// `--authorization-policy-file`). Set by [`Self::mark_legacy_flags_set`].
+    #[arg(skip)]
+    pub legacy_flags_set: bool,
+}
+
+impl AuthorizationArgs {
+    /// Fill [`Self::legacy_flags_set`] from the parsed command line.
+    pub fn mark_legacy_flags_set(&mut self, _matches: &clap::ArgMatches) {}
 }
 
 /// `IsValidAuthorizationMode` (modes.go:41).
@@ -66,7 +86,7 @@ pub fn is_valid_authorization_mode(mode: &str) -> bool {
 /// `len(AuthorizationConfigurationFile) == 0` condition is always true).
 /// Deployments that want RBAC must pass `--authorization-mode=Node,RBAC`
 /// explicitly, as kubeadm does.
-pub fn complete_authorization_modes(modes: &[String]) -> Vec<String> {
+pub fn complete_authorization_modes(_config_file: &str, modes: &[String]) -> Vec<String> {
     if modes.is_empty() {
         return vec![MODE_ALWAYS_ALLOW.to_string()];
     }
@@ -128,7 +148,7 @@ pub fn build_authorizer_with_webhook<S: AuthzStorage + 'static>(
     policy_file: &str,
     webhook: &crate::authorization_webhook::AuthorizationWebhookArgs,
 ) -> anyhow::Result<Arc<dyn Authorizer>> {
-    let modes = complete_authorization_modes(modes);
+    let modes = complete_authorization_modes("", modes);
     let mut errs = validate_authorization_modes(&modes, policy_file);
     errs.extend(crate::authorization_webhook::validate_webhook_args(
         &modes, webhook,
@@ -155,6 +175,30 @@ pub fn build_authorizer_with_webhook<S: AuthzStorage + 'static>(
         }
     }
     Ok(Arc::new(superuser_then(chain)))
+}
+
+/// The `--authorization-config` branch of `BuiltInAuthorizationOptions.Validate`
+/// / `ToAuthorizationConfig` (authorization.go:110-127, :232-247): the legacy
+/// flags must be unset, then the file is loaded and validated with no opinion
+/// about required modes. Returns the configuration and the file's data.
+pub fn load_authorization_config(
+    _config_file: &str,
+    _legacy_flags_set: bool,
+) -> Result<(crate::authorization_config::AuthorizationConfiguration, String), String> {
+    Err("not implemented".to_string())
+}
+
+/// [`build_authorizer_with_webhook`] with `--authorization-config`.
+pub fn build_authorizer_with_config<S: AuthzStorage + 'static>(
+    storage: Arc<S>,
+    skip_auth: bool,
+    modes: &[String],
+    policy_file: &str,
+    webhook: &crate::authorization_webhook::AuthorizationWebhookArgs,
+    _config_file: &str,
+    _legacy_flags_set: bool,
+) -> anyhow::Result<Arc<dyn Authorizer>> {
+    build_authorizer_with_webhook(storage, skip_auth, modes, policy_file, webhook)
 }
 
 #[cfg(test)]
@@ -245,9 +289,9 @@ mod tests {
     #[test]
     fn complete_defaults_to_always_allow_like_upstream() {
         // authorization.go:92-94: no modes (and no --authorization-config) => AlwaysAllow.
-        assert_eq!(complete_authorization_modes(&[]), modes(&["AlwaysAllow"]));
+        assert_eq!(complete_authorization_modes("", &[]), modes(&["AlwaysAllow"]));
         assert_eq!(
-            complete_authorization_modes(&modes(&["RBAC"])),
+            complete_authorization_modes("", &modes(&["RBAC"])),
             modes(&["RBAC"])
         );
     }
@@ -385,14 +429,168 @@ mod tests {
         );
     }
 
+    // ---- --authorization-config (#3294) --------------------------------
+
+    const CFG_HDR: &str = "apiVersion: apiserver.config.k8s.io/v1\nkind: AuthorizationConfiguration\nauthorizers:\n";
+
+    fn config_file(authorizers: &str) -> String {
+        policy_file(&format!("{CFG_HDR}{authorizers}"))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn build_cfg(
+        cfg: &str,
+        modes_: &[&str],
+        legacy: bool,
+    ) -> anyhow::Result<Arc<dyn Authorizer>> {
+        build_authorizer_with_config(
+            Arc::new(MemoryStorage::new()),
+            false,
+            &modes(modes_),
+            "",
+            &Default::default(),
+            cfg,
+            legacy,
+        )
+    }
+
+    // authorization.go:92: the AlwaysAllow default only applies without a file.
+    #[test]
+    fn complete_does_not_default_when_a_config_file_is_given() {
+        assert_eq!(complete_authorization_modes("/some/file", &[]), Vec::<String>::new());
+        assert_eq!(complete_authorization_modes("", &[]), modes(&["AlwaysAllow"]));
+    }
+
+    // authorization.go:117-119.
+    #[test]
+    fn config_file_is_mutually_exclusive_with_the_legacy_flags() {
+        let f = config_file("- type: RBAC\n  name: rbac\n");
+        assert_eq!(
+            load_authorization_config(&f, true).unwrap_err(),
+            "--authorization-config can not be specified when --authorization-mode or --authorization-webhook-* flags are defined"
+        );
+        let e = build_cfg(&f, &["RBAC"], true).err().unwrap().to_string();
+        assert!(e.contains("--authorization-config can not be specified"), "{e}");
+        let _ = std::fs::remove_file(&f);
+    }
+
+    // authorization.go:122-125: LoadAndValidateFile errors surface verbatim.
+    #[test]
+    fn config_file_errors_surface() {
+        assert_eq!(
+            load_authorization_config("/nonexistent/authz.yaml", false).unwrap_err(),
+            "open /nonexistent/authz.yaml: no such file or directory"
+        );
+        let f = config_file("- type: Webhook\n  name: w\n");
+        let e = load_authorization_config(&f, false).unwrap_err();
+        assert!(
+            e.starts_with("authorizers[0].webhook: Required value: required when type=Webhook"),
+            "{e}"
+        );
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn config_file_loads_and_returns_its_data() {
+        let f = config_file("- type: Node\n  name: node\n- type: RBAC\n  name: rbac\n");
+        let (c, data) = load_authorization_config(&f, false).unwrap();
+        assert_eq!(c.authorizers.len(), 2);
+        assert!(data.starts_with("apiVersion: apiserver.config.k8s.io/v1"));
+        let _ = std::fs::remove_file(&f);
+    }
+
+    // The configured authorizers replace the default: no --authorization-mode
+    // and a config of AlwaysDeny must NOT fall back to AlwaysAllow.
+    #[tokio::test]
+    async fn config_file_drives_the_chain() {
+        let f = config_file("- type: AlwaysDeny\n  name: alwaysdeny\n");
+        let a = build_cfg(&f, &[], false).unwrap();
+        assert!(!allowed(&a, pods(user("alice", &[]))).await);
+        assert!(allowed(&a, pods(user("admin", &["system:masters"]))).await);
+        let _ = std::fs::remove_file(&f);
+
+        let f = config_file("- type: AlwaysDeny\n  name: alwaysdeny\n- type: AlwaysAllow\n  name: alwaysallow\n");
+        let a = build_cfg(&f, &[], false).unwrap();
+        assert!(allowed(&a, pods(user("alice", &[]))).await);
+        let _ = std::fs::remove_file(&f);
+
+        let f = config_file("- type: Node\n  name: node\n- type: RBAC\n  name: rbac\n");
+        let a = build_cfg(&f, &[], false).unwrap();
+        let kubelet =
+            RequestAttributes::new(user("system:node:n1", &["system:nodes"]), "get", "nodes")
+                .with_name("n1");
+        assert!(allowed(&a, kubelet).await);
+        assert!(!allowed(&a, pods(user("alice", &[]))).await);
+        let _ = std::fs::remove_file(&f);
+    }
+
+    // config.go:97-99 / reload.go ABAC: the policy file flag still applies.
+    #[tokio::test]
+    async fn config_file_abac_uses_the_policy_file_flag() {
+        let policy = policy_file(
+            "{\"apiVersion\":\"abac.authorization.kubernetes.io/v1beta1\",\"kind\":\"Policy\",\"spec\":{\"user\":\"alice\",\"namespace\":\"*\",\"resource\":\"*\",\"apiGroup\":\"*\",\"readonly\":true}}\n",
+        );
+        let f = config_file("- type: ABAC\n  name: abac\n");
+        let a = build_authorizer_with_config(
+            Arc::new(MemoryStorage::new()),
+            false,
+            &[],
+            policy.to_str().unwrap(),
+            &Default::default(),
+            &f,
+            false,
+        )
+        .unwrap();
+        assert!(allowed(&a, pods(user("alice", &[]))).await);
+        assert!(!allowed(&a, pods(user("bob", &[]))).await);
+        let _ = std::fs::remove_file(&f);
+        let _ = std::fs::remove_file(&policy);
+    }
+
+    #[test]
+    fn invalid_config_file_fails_the_build() {
+        let f = config_file("- type: RBAC\n  name: wrong\n");
+        let e = build_cfg(&f, &[], false).err().unwrap().to_string();
+        assert!(e.contains("expected name rbac for authorizer RBAC instead of wrong"), "{e}");
+        let _ = std::fs::remove_file(&f);
+    }
+
     mod args {
         use super::super::AuthorizationArgs;
-        use clap::Parser;
+        use clap::{CommandFactory, FromArgMatches, Parser};
 
         #[derive(Parser, Debug)]
         struct Wrap {
             #[command(flatten)]
             a: AuthorizationArgs,
+        }
+
+        fn parsed(argv: &[&str]) -> AuthorizationArgs {
+            let m = Wrap::command().get_matches_from(argv);
+            let mut w = Wrap::from_arg_matches(&m).unwrap();
+            w.a.mark_legacy_flags_set(&m);
+            w.a
+        }
+
+        // authorization.go:200-211: pflag `Changed`, so even a flag set to its
+        // default value counts; the policy file and --authorization-config don't.
+        #[test]
+        fn legacy_flags_set_follows_the_command_line() {
+            assert!(!parsed(&["x"]).legacy_flags_set);
+            assert!(!parsed(&["x", "--authorization-config=/c"]).legacy_flags_set);
+            assert!(!parsed(&["x", "--authorization-policy-file=/p"]).legacy_flags_set);
+            for flag in [
+                "--authorization-mode=RBAC",
+                "--authorization-webhook-config-file=/w",
+                "--authorization-webhook-version=v1beta1",
+                "--authorization-webhook-cache-authorized-ttl=5m",
+                "--authorization-webhook-cache-unauthorized-ttl=30s",
+            ] {
+                let a = parsed(&["x", "--authorization-config=/c", flag]);
+                assert!(a.legacy_flags_set, "{flag}");
+                assert_eq!(a.authorization_config, "/c");
+            }
         }
 
         #[test]
