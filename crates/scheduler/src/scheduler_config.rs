@@ -9,7 +9,12 @@
 //!   (shape scaled by `MaxNodeScore / MaxCustomPriorityScore`).
 
 use crate::volume_binding::{FunctionShapePoint, MAX_CUSTOM_PRIORITY_SCORE, MAX_NODE_SCORE};
+use rusternetes_common::label_selector::{LabelOperator, LabelRequirement};
+use rusternetes_common::resources::pod::{
+    NodeAffinity, NodeSelectorRequirement, NodeSelectorTerm, TopologySpreadConstraint,
+};
 use rusternetes_common::validation::field::{self, BadValue, ErrorList, Path};
+use rusternetes_common::validation::metav1::validate_label_name;
 use serde::{Deserialize, Serialize};
 
 /// `config.UtilizationShapePoint` (pkg/scheduler/apis/config/types.go).
@@ -183,6 +188,412 @@ impl InterPodAffinityArgs {
     }
 }
 
+/// `configv1.ResourceSpec` / `config.ResourceSpec`
+/// (staging/src/k8s.io/kube-scheduler/config/v1/types_pluginargs.go).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResourceSpec {
+    pub name: String,
+    #[serde(default)]
+    pub weight: i64,
+}
+
+/// `defaultResourceSpec` (v1/defaults.go:33-36).
+fn default_resource_spec() -> Vec<ResourceSpec> {
+    vec![
+        ResourceSpec {
+            name: "cpu".to_string(),
+            weight: 1,
+        },
+        ResourceSpec {
+            name: "memory".to_string(),
+            weight: 1,
+        },
+    ]
+}
+
+/// `config.NodeResourcesBalancedAllocationArgs`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NodeResourcesBalancedAllocationArgs {
+    #[serde(default)]
+    pub resources: Vec<ResourceSpec>,
+}
+
+impl NodeResourcesBalancedAllocationArgs {
+    /// `SetDefaults_NodeResourcesBalancedAllocationArgs` (v1/defaults.go:210-221).
+    pub fn set_defaults(&mut self) {
+        if self.resources.is_empty() {
+            self.resources = default_resource_spec();
+            return;
+        }
+        // If the weight is not set or it is explicitly set to 0, then apply the
+        // default weight(1) instead.
+        for r in &mut self.resources {
+            if r.weight == 0 {
+                r.weight = 1;
+            }
+        }
+    }
+
+    /// `ValidateNodeResourcesBalancedAllocationArgs`
+    /// (validation_pluginargs.go:224-238). Run after `set_defaults`.
+    pub fn validate(&self, path: &Path) -> ErrorList {
+        let mut errs = ErrorList::new();
+        let mut seen: Vec<&str> = Vec::new();
+        for (i, r) in self.resources.iter().enumerate() {
+            let rp = path.child("resources").index(i);
+            if seen.contains(&r.name.as_str()) {
+                errs.push(field::Error::duplicate(&rp.child("name"), r.name.as_str()));
+            } else {
+                seen.push(&r.name);
+            }
+            if r.weight != 1 {
+                errs.push(field::Error::invalid(
+                    &rp.child("weight"),
+                    r.weight,
+                    "must be 1",
+                ));
+            }
+        }
+        errs
+    }
+}
+
+/// `config.PodTopologySpreadArgs`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PodTopologySpreadArgs {
+    #[serde(default)]
+    pub default_constraints: Vec<TopologySpreadConstraint>,
+    #[serde(default)]
+    pub defaulting_type: String,
+}
+
+impl PodTopologySpreadArgs {
+    /// `SetDefaults_PodTopologySpreadArgs` (v1/defaults.go:223-227).
+    pub fn set_defaults(&mut self) {
+        if self.defaulting_type.is_empty() {
+            self.defaulting_type = "System".to_string();
+        }
+    }
+
+    /// `ValidatePodTopologySpreadArgs` (validation_pluginargs.go:99-129) with
+    /// `validateDefaultingType` (:132-140), `validateTopologyKey` (:142-149),
+    /// `validateWhenUnsatisfiable` (:151-161) and `validateConstraintNotRepeat`
+    /// (:163-171). Run after `set_defaults`.
+    pub fn validate(&self, path: &Path) -> ErrorList {
+        let mut errs = ErrorList::new();
+        let dt_path = path.child("defaultingType");
+        let dt = self.defaulting_type.as_str();
+        if dt != "System" && dt != "List" {
+            errs.push(field::Error::not_supported(
+                &dt_path,
+                dt,
+                &["System", "List"],
+            ));
+        } else if dt == "System" && !self.default_constraints.is_empty() {
+            errs.push(field::Error::invalid(
+                &dt_path,
+                dt,
+                "when .defaultConstraints are not empty",
+            ));
+        }
+        let constraints_path = path.child("defaultConstraints");
+        for (i, c) in self.default_constraints.iter().enumerate() {
+            let p = constraints_path.index(i);
+            if c.max_skew <= 0 {
+                errs.push(field::Error::invalid(
+                    &p.child("maxSkew"),
+                    c.max_skew,
+                    "not in valid range (0, inf)",
+                ));
+            }
+            let tk = p.child("topologyKey");
+            if c.topology_key.is_empty() {
+                errs.push(field::Error::required(&tk, "can not be empty"));
+            } else {
+                errs.extend(validate_label_name(&c.topology_key, &tk));
+            }
+            let wu = p.child("whenUnsatisfiable");
+            if c.when_unsatisfiable.is_empty() {
+                errs.push(field::Error::required(&wu, "can not be empty"));
+            } else if c.when_unsatisfiable != "DoNotSchedule"
+                && c.when_unsatisfiable != "ScheduleAnyway"
+            {
+                errs.push(field::Error::not_supported(
+                    &wu,
+                    c.when_unsatisfiable.as_str(),
+                    &["DoNotSchedule", "ScheduleAnyway"],
+                ));
+            }
+            if c.label_selector.is_some() {
+                errs.push(field::Error::forbidden(
+                    &p.child("labelSelector"),
+                    "constraint must not define a selector, as they deduced for each pod",
+                ));
+            }
+            if self.default_constraints[..i].iter().any(|o| {
+                o.topology_key == c.topology_key && o.when_unsatisfiable == c.when_unsatisfiable
+            }) {
+                errs.push(field::Error::duplicate(
+                    &constraints_path.index(i),
+                    format!("{{{}, {}}}", c.topology_key, c.when_unsatisfiable),
+                ));
+            }
+        }
+        errs
+    }
+}
+
+/// `config.NodeAffinityArgs`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NodeAffinityArgs {
+    #[serde(default)]
+    pub added_affinity: Option<NodeAffinity>,
+}
+
+impl NodeAffinityArgs {
+    /// `ValidateNodeAffinityArgs` (validation_pluginargs.go:241-259), which
+    /// runs `nodeaffinity.NewNodeSelector` / `NewPreferredSchedulingTerms`
+    /// (component-helpers/scheduling/corev1/nodeaffinity/nodeaffinity.go:40-55,
+    /// :112-131) over the added affinity and reports their parse errors. There
+    /// is no `SetDefaults_NodeAffinityArgs` upstream.
+    pub fn validate(&self, path: &Path) -> ErrorList {
+        let mut errs = ErrorList::new();
+        let Some(affinity) = &self.added_affinity else {
+            return errs;
+        };
+        if let Some(ns) = &affinity.required_during_scheduling_ignored_during_execution {
+            let p = path
+                .child("addedAffinity")
+                .child("requiredDuringSchedulingIgnoredDuringExecution")
+                .child("nodeSelectorTerms");
+            for (i, term) in ns.node_selector_terms.iter().enumerate() {
+                // nil or empty term selects no objects (nodeaffinity.go:60-63).
+                if is_empty_node_selector_term(term) {
+                    continue;
+                }
+                errs.extend(node_selector_term_errors(term, &p.index(i)));
+            }
+        }
+        if let Some(terms) = &affinity.preferred_during_scheduling_ignored_during_execution {
+            let p = path
+                .child("addedAffinity")
+                .child("preferredDuringSchedulingIgnoredDuringExecution");
+            for (i, term) in terms.iter().enumerate() {
+                // nodeaffinity.go:119: a 0 weight or empty term skips parsing.
+                if term.weight == 0 || is_empty_node_selector_term(&term.preference) {
+                    continue;
+                }
+                errs.extend(node_selector_term_errors(&term.preference, &p.index(i)));
+            }
+        }
+        errs
+    }
+}
+
+/// `isEmptyNodeSelectorTerm` (nodeaffinity.go:135-137).
+fn is_empty_node_selector_term(term: &NodeSelectorTerm) -> bool {
+    term.match_expressions.as_ref().is_none_or(|v| v.is_empty())
+        && term.match_fields.as_ref().is_none_or(|v| v.is_empty())
+}
+
+/// `newNodeSelectorTerm`'s `parseErrs` (nodeaffinity.go:170-188).
+fn node_selector_term_errors(term: &NodeSelectorTerm, path: &Path) -> ErrorList {
+    let mut errs = ErrorList::new();
+    if let Some(exprs) = term.match_expressions.as_ref().filter(|v| !v.is_empty()) {
+        errs.extend(requirements_as_selector_errors(
+            exprs,
+            &path.child("matchExpressions"),
+        ));
+    }
+    if let Some(fields) = term.match_fields.as_ref().filter(|v| !v.is_empty()) {
+        errs.extend(requirements_as_field_selector_errors(
+            fields,
+            &path.child("matchFields"),
+        ));
+    }
+    errs
+}
+
+/// `nodeSelectorRequirementsAsSelector` errors (nodeaffinity.go:214-257).
+fn requirements_as_selector_errors(reqs: &[NodeSelectorRequirement], path: &Path) -> ErrorList {
+    const VALID: [&str; 6] = ["In", "NotIn", "Exists", "DoesNotExist", "Gt", "Lt"];
+    let mut errs = ErrorList::new();
+    for (i, expr) in reqs.iter().enumerate() {
+        let p = path.index(i);
+        let op = match expr.operator.as_str() {
+            "In" => LabelOperator::In,
+            "NotIn" => LabelOperator::NotIn,
+            "Exists" => LabelOperator::Exists,
+            "DoesNotExist" => LabelOperator::DoesNotExist,
+            "Gt" => LabelOperator::GreaterThan,
+            "Lt" => LabelOperator::LessThan,
+            other => {
+                errs.push(field::Error::not_supported(
+                    &p.child("operator"),
+                    other,
+                    &VALID,
+                ));
+                continue;
+            }
+        };
+        errs.extend(LabelRequirement::validate_at(
+            &p,
+            &expr.key,
+            op,
+            expr.values.as_deref().unwrap_or(&[]),
+        ));
+    }
+    errs
+}
+
+/// `nodeSelectorRequirementsAsFieldSelector` errors (nodeaffinity.go:260-297).
+fn requirements_as_field_selector_errors(
+    reqs: &[NodeSelectorRequirement],
+    path: &Path,
+) -> ErrorList {
+    const VALID: [&str; 2] = ["In", "NotIn"];
+    let mut errs = ErrorList::new();
+    for (i, expr) in reqs.iter().enumerate() {
+        let p = path.index(i);
+        match expr.operator.as_str() {
+            "In" | "NotIn" => {
+                if expr.values.as_ref().is_none_or(|v| v.len() != 1) {
+                    // A nil Go slice marshals to `null`, an empty one to `[]`.
+                    let bad = match &expr.values {
+                        Some(v) => BadValue::from(v.clone()),
+                        None => BadValue::Json(serde_json::Value::Null),
+                    };
+                    errs.push(field::Error::invalid(
+                        &p.child("values"),
+                        bad,
+                        "must have one element",
+                    ));
+                }
+            }
+            other => errs.push(field::Error::not_supported(
+                &p.child("operator"),
+                other,
+                &VALID,
+            )),
+        }
+    }
+    errs
+}
+
+/// `config.ScoringStrategy`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScoringStrategy {
+    #[serde(default, rename = "type")]
+    pub strategy_type: String,
+    #[serde(default)]
+    pub resources: Vec<ResourceSpec>,
+    #[serde(default)]
+    pub requested_to_capacity_ratio: Option<RequestedToCapacityRatioParam>,
+}
+
+/// `config.RequestedToCapacityRatioParam`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RequestedToCapacityRatioParam {
+    #[serde(default)]
+    pub shape: Vec<UtilizationShapePoint>,
+}
+
+/// `config.NodeResourcesFitArgs`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NodeResourcesFitArgs {
+    #[serde(default)]
+    pub ignored_resources: Vec<String>,
+    #[serde(default)]
+    pub ignored_resource_groups: Vec<String>,
+    #[serde(default)]
+    pub scoring_strategy: Option<ScoringStrategy>,
+}
+
+impl NodeResourcesFitArgs {
+    /// `SetDefaults_NodeResourcesFitArgs` (v1/defaults.go:229-244). Note the
+    /// strategy `type` is only defaulted together with a nil `scoringStrategy`.
+    pub fn set_defaults(&mut self) {
+        let strategy = self
+            .scoring_strategy
+            .get_or_insert_with(|| ScoringStrategy {
+                strategy_type: "LeastAllocated".to_string(),
+                resources: default_resource_spec(),
+                requested_to_capacity_ratio: None,
+            });
+        if strategy.resources.is_empty() {
+            // If no resources specified, use the default set.
+            strategy.resources.extend(default_resource_spec());
+        }
+        for r in &mut strategy.resources {
+            if r.weight == 0 {
+                r.weight = 1;
+            }
+        }
+    }
+
+    /// `ValidateNodeResourcesFitArgs` (validation_pluginargs.go:295-336) with
+    /// `validateResources` (:213-222).
+    pub fn validate(&self, path: &Path) -> ErrorList {
+        let mut errs = ErrorList::new();
+        let res_path = path.child("ignoredResources");
+        for (i, res) in self.ignored_resources.iter().enumerate() {
+            errs.extend(validate_label_name(res, &res_path.index(i)));
+        }
+        let group_path = path.child("ignoredResourceGroups");
+        for (i, group) in self.ignored_resource_groups.iter().enumerate() {
+            let p = group_path.index(i);
+            if group.contains('/') {
+                errs.push(field::Error::invalid(
+                    &p,
+                    group.as_str(),
+                    "resource group name can't contain '/'",
+                ));
+            }
+            errs.extend(validate_label_name(group, &p));
+        }
+        let strategy_path = path.child("scoringStrategy");
+        if let Some(s) = &self.scoring_strategy {
+            // supportedScoringStrategyTypes, as `sets.List` (sorted).
+            const SUPPORTED: [&str; 3] = [
+                "LeastAllocated",
+                "MostAllocated",
+                "RequestedToCapacityRatio",
+            ];
+            if !SUPPORTED.contains(&s.strategy_type.as_str()) {
+                errs.push(field::Error::not_supported(
+                    &strategy_path.child("type"),
+                    s.strategy_type.as_str(),
+                    &SUPPORTED,
+                ));
+            }
+            let resources_path = strategy_path.child("resources");
+            for (i, r) in s.resources.iter().enumerate() {
+                if r.weight <= 0 || r.weight > 100 {
+                    errs.push(field::Error::invalid(
+                        &resources_path.index(i).child("weight"),
+                        r.weight,
+                        format!("resource weight of {} not in valid range (0, 100]", r.name),
+                    ));
+                }
+            }
+            if let Some(rtcr) = &s.requested_to_capacity_ratio {
+                errs.extend(validate_function_shape(
+                    &rtcr.shape,
+                    &strategy_path.child("shape"),
+                ));
+            }
+        }
+        errs
+    }
+}
+
 /// `v1.SchemeGroupVersion.String()` (pkg/scheduler/apis/config/v1/register.go);
 /// the only config version served, so it is both the removed-plugin version
 /// and the configuration's version in `isPluginInvalid` messages.
@@ -237,7 +648,7 @@ pub fn volume_binding_args_from_config(
 ) -> Result<VolumeBindingArgs, String> {
     let cfg: KubeSchedulerConfiguration =
         serde_yaml::from_str(doc).map_err(|e| format!("invalid scheduler config: {e}"))?;
-    let mut errs = validate_profiles(&cfg)?;
+    let (mut errs, init_errs) = validate_profiles(&cfg)?;
     let mut args = VolumeBindingArgs::default();
     let mut path = Path::new("profiles").index(0);
     if let Some(profile) = cfg.profiles.first() {
@@ -254,6 +665,9 @@ pub fn volume_binding_args_from_config(
     }
     args.set_defaults(storage_capacity_scoring);
     errs.extend(args.validate(&path, storage_capacity_scoring));
+    if errs.is_empty() {
+        errs = init_errs;
+    }
     if errs.is_empty() {
         Ok(args)
     } else {
@@ -272,9 +686,12 @@ pub fn volume_binding_args_from_config(
 /// `seenPluginConfig`). The default name is applied only to a single profile
 /// (v1/defaults.go:116-119 SetDefaults_KubeSchedulerConfiguration), and an
 /// empty profile list gets one default profile (:111-113).
-fn validate_profiles(cfg: &KubeSchedulerConfiguration) -> Result<ErrorList, String> {
+fn validate_profiles(cfg: &KubeSchedulerConfiguration) -> Result<(ErrorList, ErrorList), String> {
     let profiles_path = Path::new("profiles");
     let mut errs = ErrorList::new();
+    // Errors from plugin construction (`New*`), which only runs once the
+    // configuration validated.
+    let mut init_errs = ErrorList::new();
     let single = cfg.profiles.len() <= 1;
     let mut existing: Vec<&str> = Vec::new();
     for (i, profile) in cfg.profiles.iter().enumerate() {
@@ -324,6 +741,41 @@ fn validate_profiles(cfg: &KubeSchedulerConfiguration) -> Result<ErrorList, Stri
                     a.set_defaults();
                     errs.extend(a.validate(&args_path));
                 }
+                "NodeAffinity" => {
+                    let a: NodeAffinityArgs = decode_args(pc, &args_path)?;
+                    errs.extend(a.validate(&args_path));
+                }
+                "NodeResourcesBalancedAllocation" => {
+                    let mut a: NodeResourcesBalancedAllocationArgs = decode_args(pc, &args_path)?;
+                    a.set_defaults();
+                    errs.extend(a.validate(&args_path));
+                }
+                "PodTopologySpread" => {
+                    let mut a: PodTopologySpreadArgs = decode_args(pc, &args_path)?;
+                    a.set_defaults();
+                    errs.extend(a.validate(&args_path));
+                }
+                // validation.go:158 keys this validator "NodeResourcesFitArgs"
+                // (sic), never the plugin's name "NodeResourcesFit", and its
+                // args type can never match (args decode by `name + "Args"`,
+                // kube-scheduler/config/v1/types.go:272), so upstream reports
+                // a type mismatch for that name (validation.go:199-203) and
+                // does NOT validate NodeResourcesFit's args in this pass. They
+                // are validated when the plugin is constructed instead (NewFit,
+                // fit.go:193), collected in `init_errs`.
+                "NodeResourcesFitArgs" => {
+                    errs.push(field::Error::invalid(
+                        &args_path,
+                        BadValue::marshal(&pc.args),
+                        "has to match plugin args",
+                    ));
+                }
+                "NodeResourcesFit" => {
+                    let mut a: NodeResourcesFitArgs = decode_args(pc, &args_path)?;
+                    a.set_defaults();
+                    // `ValidateNodeResourcesFitArgs(nil, args)`: nil path.
+                    init_errs.extend(a.validate(&Path::default()));
+                }
                 _ => {}
             }
         }
@@ -341,7 +793,7 @@ fn validate_profiles(cfg: &KubeSchedulerConfiguration) -> Result<ErrorList, Stri
         &Path::new("percentageOfNodesToScore"),
         cfg.percentage_of_nodes_to_score,
     ));
-    Ok(errs)
+    Ok((errs, init_errs))
 }
 
 fn decode_args<T: serde::de::DeserializeOwned + Default>(
@@ -857,5 +1309,382 @@ profiles:
         ), "{err}");
         let ok = "profiles:\n- pluginConfig:\n  - name: DefaultPreemption\n    args:\n      minCandidateNodesAbsolute: 0\n  - name: InterPodAffinity\n";
         assert!(volume_binding_args_from_config(ok, false).is_ok());
+    }
+
+    // validation.go:155-160 validatePluginConfig -> ValidateNodeAffinityArgs,
+    // ValidateNodeResourcesBalancedAllocationArgs, ValidatePodTopologySpreadArgs.
+    #[test]
+    fn config_doc_node_affinity_balanced_allocation_pts_validated() {
+        let doc = "profiles:
+- pluginConfig:
+  - name: NodeAffinity
+    args:
+      addedAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+          - matchExpressions:
+            - {key: invalid/label/key, operator: In, values: [v]}
+  - name: NodeResourcesBalancedAllocation
+    args:
+      resources:
+      - {name: cpu, weight: 2}
+  - name: PodTopologySpread
+    args:
+      defaultingType: System
+      defaultConstraints:
+      - {maxSkew: 1, topologyKey: key, whenUnsatisfiable: DoNotSchedule}
+";
+        let err = volume_binding_args_from_config(doc, false).unwrap_err();
+        assert!(err.contains("profiles[0].pluginConfig[0].args.addedAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].key: Invalid value: \"invalid/label/key\""), "{err}");
+        assert!(
+            err.contains(
+                "profiles[0].pluginConfig[1].args.resources[0].weight: Invalid value: 2: must be 1"
+            ),
+            "{err}"
+        );
+        assert!(
+            err.contains("profiles[0].pluginConfig[2].args.defaultingType: Invalid value: \"System\": when .defaultConstraints are not empty"),
+            "{err}"
+        );
+    }
+
+    // NewFit (noderesources/fit.go:193) validates with a nil path; the
+    // validation.go:158 map key is "NodeResourcesFitArgs", so the profile
+    // pass never reaches it.
+    #[test]
+    fn config_doc_node_resources_fit_validated_at_plugin_init() {
+        let doc = "profiles:\n- pluginConfig:\n  - name: NodeResourcesFit\n    args:\n      scoringStrategy:\n        type: Invalid\n";
+        let err = volume_binding_args_from_config(doc, false).unwrap_err();
+        assert!(
+            err.contains("scoringStrategy.type: Unsupported value: \"Invalid\": supported values: \"LeastAllocated\", \"MostAllocated\", \"RequestedToCapacityRatio\""),
+            "{err}"
+        );
+    }
+
+    fn yaml<T: serde::de::DeserializeOwned>(s: &str) -> T {
+        serde_yaml::from_str(s).unwrap()
+    }
+
+    fn fs(errs: &ErrorList) -> Vec<(ErrorType, String)> {
+        summary(errs)
+    }
+
+    fn et(t: ErrorType, f: &str) -> (ErrorType, String) {
+        (t, f.to_string())
+    }
+
+    // validation_pluginargs_test.go TestValidatePodTopologySpreadArgs
+    #[test]
+    fn pts_args_cases() {
+        let c = |extra: &str| {
+            format!("defaultingType: List\ndefaultConstraints:\n- {{maxSkew: 1, topologyKey: node, whenUnsatisfiable: DoNotSchedule{extra}}}\n")
+        };
+        let run = |doc: &str| yaml::<PodTopologySpreadArgs>(doc).validate(&Path::default());
+        assert!(run("defaultingType: List\ndefaultConstraints:\n- {maxSkew: 1, topologyKey: node, whenUnsatisfiable: DoNotSchedule}\n- {maxSkew: 2, topologyKey: zone, whenUnsatisfiable: ScheduleAnyway}\n").is_empty());
+        let e = run("defaultingType: List\ndefaultConstraints:\n- {maxSkew: -1, topologyKey: node, whenUnsatisfiable: DoNotSchedule}\n");
+        assert_eq!(
+            fs(&e),
+            vec![et(ErrorType::Invalid, "defaultConstraints[0].maxSkew")]
+        );
+        let e = run("defaultingType: List\ndefaultConstraints:\n- {maxSkew: 1, topologyKey: '', whenUnsatisfiable: DoNotSchedule}\n");
+        assert_eq!(
+            fs(&e),
+            vec![et(ErrorType::Required, "defaultConstraints[0].topologyKey")]
+        );
+        let e = run("defaultingType: List\ndefaultConstraints:\n- {maxSkew: 1, topologyKey: node, whenUnsatisfiable: ''}\n");
+        assert_eq!(
+            fs(&e),
+            vec![et(
+                ErrorType::Required,
+                "defaultConstraints[0].whenUnsatisfiable"
+            )]
+        );
+        let e = run("defaultingType: List\ndefaultConstraints:\n- {maxSkew: 1, topologyKey: node, whenUnsatisfiable: unknown action}\n");
+        assert_eq!(
+            fs(&e),
+            vec![et(
+                ErrorType::NotSupported,
+                "defaultConstraints[0].whenUnsatisfiable"
+            )]
+        );
+        let e = run("defaultingType: List\ndefaultConstraints:\n- {maxSkew: 1, topologyKey: node, whenUnsatisfiable: DoNotSchedule}\n- {maxSkew: 2, topologyKey: node, whenUnsatisfiable: DoNotSchedule}\n");
+        assert_eq!(
+            fs(&e),
+            vec![et(ErrorType::Duplicate, "defaultConstraints[1]")]
+        );
+        assert_eq!(
+            e[0].error_body(),
+            "Duplicate value: \"{node, DoNotSchedule}\""
+        );
+        let e = run(&c(", labelSelector: {matchLabels: {a: b}}"));
+        assert_eq!(
+            fs(&e),
+            vec![et(
+                ErrorType::Forbidden,
+                "defaultConstraints[0].labelSelector"
+            )]
+        );
+        assert!(run("defaultingType: List\n").is_empty());
+        assert!(run("defaultingType: System\n").is_empty());
+        let e = run("defaultingType: unknown\n");
+        assert_eq!(fs(&e), vec![et(ErrorType::NotSupported, "defaultingType")]);
+        let e = run("defaultingType: System\ndefaultConstraints:\n- {maxSkew: 1, topologyKey: key, whenUnsatisfiable: DoNotSchedule}\n");
+        assert_eq!(fs(&e), vec![et(ErrorType::Invalid, "defaultingType")]);
+    }
+
+    // defaults_test.go TestPluginArgsDefaults "PodTopologySpreadArgs ..."
+    #[test]
+    fn pts_args_defaults() {
+        let mut a: PodTopologySpreadArgs = yaml("{}");
+        a.set_defaults();
+        assert_eq!(a.defaulting_type, "System");
+        assert!(a.default_constraints.is_empty());
+        let mut a: PodTopologySpreadArgs = yaml(
+            "defaultConstraints:\n- {topologyKey: planet, whenUnsatisfiable: DoNotSchedule, maxSkew: 2}\n",
+        );
+        a.set_defaults();
+        assert_eq!(a.defaulting_type, "System");
+        assert_eq!(a.default_constraints.len(), 1);
+        assert_eq!(a.default_constraints[0].max_skew, 2);
+    }
+
+    // validation_pluginargs_test.go TestValidateNodeResourcesBalancedAllocationArgs
+    #[test]
+    fn balanced_allocation_args_cases() {
+        let run =
+            |doc: &str| yaml::<NodeResourcesBalancedAllocationArgs>(doc).validate(&Path::default());
+        assert!(run("resources: [{name: cpu, weight: 1}, {name: memory, weight: 1}]").is_empty());
+        let e = run("resources: [{name: cpu, weight: 2}, {name: memory, weight: 1}]");
+        assert_eq!(fs(&e), vec![et(ErrorType::Invalid, "resources[0].weight")]);
+        let e = run("resources: [{name: cpu, weight: 1}, {name: cpu, weight: 1}]");
+        assert_eq!(fs(&e), vec![et(ErrorType::Duplicate, "resources[1].name")]);
+    }
+
+    // defaults_test.go TestPluginArgsDefaults "NodeResourcesBalancedAllocationArgs ..."
+    #[test]
+    fn balanced_allocation_args_defaults() {
+        let mut a: NodeResourcesBalancedAllocationArgs = yaml("{}");
+        a.set_defaults();
+        assert_eq!(a.resources, default_resource_spec());
+        let mut a: NodeResourcesBalancedAllocationArgs = yaml(
+            "resources: [{name: cpu}, {name: scalar.io/scalar0}, {name: scalar.io/scalar1, weight: 1}]",
+        );
+        a.set_defaults();
+        assert!(a.resources.iter().all(|r| r.weight == 1));
+        assert_eq!(a.resources.len(), 3);
+    }
+
+    // validation_pluginargs_test.go TestValidateNodeAffinityArgs
+    #[test]
+    fn node_affinity_args_cases() {
+        let run = |doc: &str| yaml::<NodeAffinityArgs>(doc).validate(&Path::default());
+        assert!(run("{}").is_empty());
+        let valid = "addedAffinity:
+  requiredDuringSchedulingIgnoredDuringExecution:
+    nodeSelectorTerms:
+    - matchExpressions: [{key: label-1, operator: In, values: [label-1-val]}]
+  preferredDuringSchedulingIgnoredDuringExecution:
+  - weight: 1
+    preference:
+      matchFields: [{key: metadata.name, operator: In, values: [node-1]}]
+";
+        assert!(run(valid).is_empty());
+        let invalid = "addedAffinity:
+  requiredDuringSchedulingIgnoredDuringExecution:
+    nodeSelectorTerms:
+    - matchExpressions: [{key: invalid/label/key, operator: In, values: [label-1-val]}]
+  preferredDuringSchedulingIgnoredDuringExecution:
+  - weight: 1
+    preference:
+      matchFields: [{key: metadata.name, operator: In, values: [node-1, node-2]}]
+";
+        let e = run(invalid);
+        assert_eq!(
+            fs(&e),
+            vec![
+                et(ErrorType::Invalid, "addedAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].key"),
+                et(ErrorType::Invalid, "addedAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].matchFields[0].values"),
+            ]
+        );
+        assert_eq!(
+            e[1].error_body(),
+            "Invalid value: [\"node-1\",\"node-2\"]: must have one element"
+        );
+        // nodeSelectorRequirementsAsSelector: unknown operator, Gt value, fields operator.
+        let e = run("addedAffinity:\n  requiredDuringSchedulingIgnoredDuringExecution:\n    nodeSelectorTerms:\n    - matchExpressions: [{key: a, operator: Bogus}, {key: b, operator: Gt, values: [x]}]\n      matchFields: [{key: metadata.name, operator: Exists}]\n");
+        assert_eq!(
+            fs(&e),
+            vec![
+                et(ErrorType::NotSupported, "addedAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].operator"),
+                et(ErrorType::Invalid, "addedAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[1].values[0]"),
+                et(ErrorType::NotSupported, "addedAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchFields[0].operator"),
+            ]
+        );
+        // nodeaffinity.go:119: zero weight / empty terms are not parsed.
+        assert!(run("addedAffinity:\n  preferredDuringSchedulingIgnoredDuringExecution:\n  - weight: 0\n    preference:\n      matchExpressions: [{key: bad/key/x, operator: In, values: [v]}]\n  - weight: 1\n    preference: {}\n").is_empty());
+    }
+
+    // validation_pluginargs_test.go TestValidateFitArgs
+    #[test]
+    fn fit_args_cases() {
+        let default = "scoringStrategy: {type: LeastAllocated, resources: [{name: cpu, weight: 1}, {name: memory, weight: 1}]}\n";
+        let run = |extra: &str| {
+            yaml::<NodeResourcesFitArgs>(&format!("{extra}{default}")).validate(&Path::default())
+        };
+        let detail = |e: &ErrorList| {
+            e.iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join("|")
+        };
+        let long = "a".repeat(64);
+        assert!(
+            detail(&run(&format!("ignoredResources: [longvalue{long}]\n")))
+                .contains("name part must be no more than 63 bytes")
+        );
+        assert!(detail(&run("ignoredResources: ['example.com/']\n"))
+            .contains("name part must be non-empty"));
+        assert!(detail(&run("ignoredResources: [example.com/aaa/bbb]\n"))
+            .contains("a valid label key must consist of"));
+        assert!(run("ignoredResources: [example.com]\n").is_empty());
+        assert!(run("ignoredResourceGroups: [example.com]\n").is_empty());
+        assert!(detail(&run("ignoredResourceGroups: ['example.com/']\n"))
+            .contains("name part must be non-empty"));
+        assert!(detail(&run(&format!("ignoredResourceGroups: [{long}]\n")))
+            .contains("name part must be no more than 63 bytes"));
+        assert!(detail(&run("ignoredResourceGroups: [example.com/aa]\n"))
+            .contains("resource group name can't contain '/'"));
+        let e = yaml::<NodeResourcesFitArgs>("scoringStrategy: {type: Invalid}\n")
+            .validate(&Path::default());
+        assert!(
+            detail(&e).contains("Unsupported value: \"Invalid\""),
+            "{}",
+            detail(&e)
+        );
+    }
+
+    // validation_pluginargs_test.go TestValidate{Least,Most}AllocatedScoringStrategy
+    // and TestValidateRequestedToCapacityRatioScoringStrategy
+    #[test]
+    fn fit_scoring_strategy_cases() {
+        let run = |doc: &str| yaml::<NodeResourcesFitArgs>(doc).validate(&Path::default());
+        for ty in ["LeastAllocated", "MostAllocated"] {
+            assert!(run(&format!("scoringStrategy: {{type: {ty}}}")).is_empty());
+            assert!(run(&format!("scoringStrategy: {{type: {ty}, resources: [{{name: cpu, weight: 1}}, {{name: memory, weight: 10}}]}}")).is_empty());
+            for w in [0, 101, -1] {
+                let e = run(&format!(
+                    "scoringStrategy: {{type: {ty}, resources: [{{name: cpu, weight: {w}}}]}}"
+                ));
+                assert_eq!(
+                    fs(&e),
+                    vec![et(
+                        ErrorType::Invalid,
+                        "scoringStrategy.resources[0].weight"
+                    )]
+                );
+                assert_eq!(
+                    e[0].detail,
+                    "resource weight of cpu not in valid range (0, 100]"
+                );
+            }
+        }
+        let rt = "RequestedToCapacityRatio";
+        let e = run(&format!("scoringStrategy: {{type: {rt}}}\n"));
+        // validateFunctionShape is only run when requestedToCapacityRatio is set.
+        assert!(e.is_empty());
+        let e = run(&format!(
+            "scoringStrategy: {{type: {rt}, requestedToCapacityRatio: {{}}}}\n"
+        ));
+        assert_eq!(
+            fs(&e),
+            vec![et(ErrorType::Required, "scoringStrategy.shape")]
+        );
+        let shaped = |shape: &str, res: &str| {
+            run(&format!("scoringStrategy: {{type: {rt}, resources: [{res}], requestedToCapacityRatio: {{shape: [{shape}]}}}}"))
+        };
+        let ok = "{utilization: 30, score: 3}";
+        let e = shaped(ok, "{name: cpu, weight: 101}");
+        assert_eq!(
+            fs(&e),
+            vec![et(
+                ErrorType::Invalid,
+                "scoringStrategy.resources[0].weight"
+            )]
+        );
+        let e = shaped("{utilization: -1, score: 3}", "");
+        assert_eq!(
+            fs(&e),
+            vec![et(
+                ErrorType::Invalid,
+                "scoringStrategy.shape[0].utilization"
+            )]
+        );
+        let e = shaped("{utilization: 101, score: 3}", "");
+        assert_eq!(
+            fs(&e),
+            vec![et(
+                ErrorType::Invalid,
+                "scoringStrategy.shape[0].utilization"
+            )]
+        );
+        let e = shaped(
+            "{utilization: 10, score: 1}, {utilization: 10, score: 2}",
+            "",
+        );
+        assert_eq!(
+            fs(&e),
+            vec![et(
+                ErrorType::Invalid,
+                "scoringStrategy.shape[1].utilization"
+            )]
+        );
+        let e = shaped("{utilization: 30, score: -1}", "");
+        assert_eq!(
+            fs(&e),
+            vec![et(ErrorType::Invalid, "scoringStrategy.shape[0].score")]
+        );
+        let e = shaped("{utilization: 30, score: 11}", "");
+        assert_eq!(
+            fs(&e),
+            vec![et(ErrorType::Invalid, "scoringStrategy.shape[0].score")]
+        );
+    }
+
+    // defaults_test.go TestPluginArgsDefaults "NodeResourcesFitArgs ..."
+    #[test]
+    fn fit_args_defaults() {
+        let mut a: NodeResourcesFitArgs = yaml("{}");
+        a.set_defaults();
+        assert_eq!(
+            a.scoring_strategy,
+            Some(ScoringStrategy {
+                strategy_type: "LeastAllocated".into(),
+                resources: default_resource_spec(),
+                requested_to_capacity_ratio: None,
+            })
+        );
+        let mut a: NodeResourcesFitArgs = yaml("scoringStrategy: {type: MostAllocated}");
+        a.set_defaults();
+        let s = a.scoring_strategy.unwrap();
+        assert_eq!(s.strategy_type, "MostAllocated");
+        assert_eq!(s.resources, default_resource_spec());
+        // The type is NOT defaulted when a strategy is given without one.
+        let mut a: NodeResourcesFitArgs = yaml("scoringStrategy: {resources: [{name: cpu}]}");
+        a.set_defaults();
+        let s = a.scoring_strategy.unwrap();
+        assert_eq!(s.strategy_type, "");
+        assert_eq!(s.resources[0].weight, 1);
+    }
+
+    // validation.go:158 keys the Fit validator "NodeResourcesFitArgs": a
+    // pluginConfig of that name always fails the type check (validation.go:199-203).
+    #[test]
+    fn plugin_config_named_node_resources_fit_args_has_to_match() {
+        let doc = "profiles:\n- pluginConfig:\n  - name: NodeResourcesFitArgs\n";
+        let err = volume_binding_args_from_config(doc, false).unwrap_err();
+        assert_eq!(
+            err,
+            "profiles[0].pluginConfig[0].args: Invalid value: null: has to match plugin args"
+        );
     }
 }
