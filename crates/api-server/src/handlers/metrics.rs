@@ -149,6 +149,7 @@ async fn node_metrics_or_fallback<S: Storage>(
     let name = &node.metadata.name;
     let metrics_key = format!("/registry/metrics.k8s.io/nodes/{}", name);
     if let Ok(mut metrics) = storage.get::<NodeMetrics>(&metrics_key).await {
+        metrics.metadata.labels = node.metadata.labels.clone();
         return metrics;
     }
     // No metrics yet — return zeros
@@ -159,47 +160,12 @@ async fn node_metrics_or_fallback<S: Storage>(
         type_meta: node_metrics_type_meta(),
         metadata: rusternetes_common::types::ObjectMeta {
             creation_timestamp: Some(Utc::now()),
+            labels: node.metadata.labels.clone(),
             ..rusternetes_common::types::ObjectMeta::new(name.clone())
         },
         timestamp: Utc::now(),
         window: "30s".to_string(),
         usage,
-    }
-}
-
-#[cfg(test)]
-mod overlay_tests {
-    use super::*;
-    use rusternetes_common::resources::Node;
-    use rusternetes_storage::memory::MemoryStorage;
-
-    /// metrics-server `pkg/storage/node.go:57-62` builds each NodeMetrics with
-    /// `Labels: node.Labels`, so a GET carries the node's labels whether the
-    /// stored sample has labels or not (the kubelet publishes none).
-    #[tokio::test]
-    async fn node_metrics_carry_node_labels() {
-        let storage = MemoryStorage::new();
-        let mut node = Node::new("n1");
-        node.metadata.labels = Some(HashMap::from([("zone".to_string(), "a".to_string())]));
-
-        // No stored sample: the zero-usage fallback.
-        let m = node_metrics_or_fallback(&storage, &node).await;
-        assert_eq!(m.metadata.labels, node.metadata.labels);
-
-        // Kubelet-published sample without labels.
-        let stored = NodeMetrics {
-            type_meta: node_metrics_type_meta(),
-            metadata: rusternetes_common::types::ObjectMeta::new("n1"),
-            timestamp: Utc::now(),
-            window: "30s".to_string(),
-            usage: BTreeMap::new(),
-        };
-        storage
-            .create("/registry/metrics.k8s.io/nodes/n1", &stored)
-            .await
-            .unwrap();
-        let m = node_metrics_or_fallback(&storage, &node).await;
-        assert_eq!(m.metadata.labels, node.metadata.labels);
     }
 }
 
@@ -605,5 +571,41 @@ mod tests {
         let list = result.unwrap().0;
         assert_eq!(list.items.len(), 1);
         assert_eq!(list.items[0].metadata.name, "test-pod");
+    }
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::*;
+    use rusternetes_common::resources::Node;
+    use rusternetes_storage::memory::MemoryStorage;
+
+    /// metrics-server `pkg/storage/node.go:57-62` builds each NodeMetrics with
+    /// `Labels: node.Labels`, so a GET carries the node's labels whether the
+    /// stored sample has labels or not (the kubelet publishes none).
+    #[tokio::test]
+    async fn node_metrics_carry_node_labels() {
+        let storage = MemoryStorage::new();
+        let mut node = Node::new("n1");
+        node.metadata.labels = Some(HashMap::from([("zone".to_string(), "a".to_string())]));
+
+        // No stored sample: the zero-usage fallback.
+        let m = node_metrics_or_fallback(&storage, &node).await;
+        assert_eq!(m.metadata.labels, node.metadata.labels);
+
+        // Kubelet-published sample without labels.
+        let stored = NodeMetrics {
+            type_meta: node_metrics_type_meta(),
+            metadata: rusternetes_common::types::ObjectMeta::new("n1"),
+            timestamp: Utc::now(),
+            window: "30s".to_string(),
+            usage: BTreeMap::new(),
+        };
+        storage
+            .create("/registry/metrics.k8s.io/nodes/n1", &stored)
+            .await
+            .unwrap();
+        let m = node_metrics_or_fallback(&storage, &node).await;
+        assert_eq!(m.metadata.labels, node.metadata.labels);
     }
 }
