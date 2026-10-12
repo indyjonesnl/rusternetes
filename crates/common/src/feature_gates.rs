@@ -841,6 +841,34 @@ pub fn set(feature: Feature, value: bool) -> bool {
     STATES[feature.idx()].swap(value, Ordering::Relaxed)
 }
 
+/// `featureGate.EmulationVersion` (feature_gate.go:828).
+pub fn emulation_version() -> Version {
+    todo!()
+}
+
+/// `featureGate.MinCompatibilityVersion` (feature_gate.go:832).
+pub fn min_compatibility_version() -> Version {
+    todo!()
+}
+
+/// `SetEmulationVersionAndMinCompatibilityVersion` (feature_gate.go:791-826).
+pub fn set_emulation_version_and_min_compatibility_version(
+    _emulation_version: Version,
+    _min_compatibility_version: Version,
+) -> Result<(), String> {
+    todo!()
+}
+
+/// `featureGate.SetEmulationVersion` (feature_gate.go:787-789).
+pub fn set_emulation_version(_emulation_version: Version) -> Result<(), String> {
+    todo!()
+}
+
+/// `featureGate.Validate` (feature_gate.go:362-372).
+pub fn validate() -> Vec<String> {
+    todo!()
+}
+
 /// Reset every feature gate to its rusternetes default. Useful between tests
 /// that flip gates without going through [`FeatureGuard`].
 ///
@@ -2045,6 +2073,133 @@ mod tests {
             set_from_str("StructuredAuthenticationConfiguration=false").unwrap_err(),
             "cannot set feature gate StructuredAuthenticationConfiguration to false, feature is locked to true"
         );
+        reset_to_defaults();
+    }
+
+    // ---- --emulated-version (feature_gate_test.go TestVersionedFeatureGateFlag /
+    // SetEmulationVersionAndMinCompatibilityVersion) ----
+
+    const JWKS: Feature = Feature::StructuredAuthenticationConfigurationJWKSMetrics;
+
+    #[test]
+    #[serial]
+    fn emulation_version_re_resolves_every_default() {
+        reset_to_defaults();
+        for minor in 31..=35 {
+            let emu = Version::major_minor(1, minor);
+            set_emulation_version(emu).unwrap();
+            assert_eq!(emulation_version(), emu);
+            assert_eq!(min_compatibility_version(), emu.subtract_minor(1));
+            for &f in ALL_FEATURES {
+                assert_eq!(enabled(f), f.spec_at(emu).default, "{f:?} at {emu}");
+            }
+        }
+        reset_to_defaults();
+        // JWKSMetrics is introduced (Beta, on) in 1.35, so it is PreAlpha/off at 1.34.
+        assert!(enabled(JWKS));
+        set_emulation_version(Version::major_minor(1, 34)).unwrap();
+        assert!(!enabled(JWKS));
+        reset_to_defaults();
+    }
+
+    #[test]
+    #[serial]
+    fn prealpha_error_quotes_emulated_and_min_compat_versions() {
+        reset_to_defaults();
+        set_emulation_version(Version::major_minor(1, 34)).unwrap();
+        assert_eq!(
+            set_from_str("StructuredAuthenticationConfigurationJWKSMetrics=true").unwrap_err(),
+            "cannot set feature gate StructuredAuthenticationConfigurationJWKSMetrics to true, feature is PreAlpha at emulated version 1.34, min compatibility version 1.33"
+        );
+        reset_to_defaults();
+    }
+
+    #[test]
+    #[serial]
+    fn explicit_gate_survives_emulation_version_change() {
+        reset_to_defaults();
+        let f = Feature::PodTopologyLabelsAdmission;
+        assert!(f.spec_at(Version::major_minor(1, 34)).pre_release != PreRelease::PreAlpha);
+        set_from_str("PodTopologyLabelsAdmission=false").unwrap();
+        set_emulation_version(Version::major_minor(1, 34)).unwrap();
+        assert!(!enabled(f));
+        set_emulation_version(Version::major_minor(1, 35)).unwrap();
+        assert!(!enabled(f));
+        reset_to_defaults();
+    }
+
+    // feature_gate.go:821-824: nothing is persisted when the explicit
+    // gates are invalid at the new version.
+    #[test]
+    #[serial]
+    fn emulation_version_change_rejected_when_explicit_gate_becomes_prealpha() {
+        reset_to_defaults();
+        set_from_str("StructuredAuthenticationConfigurationJWKSMetrics=true").unwrap();
+        let err = set_emulation_version(Version::major_minor(1, 34)).unwrap_err();
+        assert!(
+            err.contains(
+                "feature is PreAlpha at emulated version 1.34, min compatibility version 1.33"
+            ),
+            "{err}"
+        );
+        assert_eq!(emulation_version(), Version::major_minor(1, 35));
+        assert!(enabled(JWKS));
+        reset_to_defaults();
+    }
+
+    // feature_gate.go:446-453: enabledRaw accumulates, and `enabled` is
+    // recomputed from all of it, so an earlier explicit value beats a later
+    // AllBeta.
+    #[test]
+    #[serial]
+    fn raw_gates_accumulate_across_set_calls() {
+        reset_to_defaults();
+        set_from_str("PodTopologyLabelsAdmission=false").unwrap();
+        set_from_str("AllBeta=true").unwrap();
+        assert!(!enabled(Feature::PodTopologyLabelsAdmission));
+        reset_to_defaults();
+    }
+
+    #[test]
+    #[serial]
+    fn all_alpha_is_re_evaluated_at_the_emulated_version() {
+        reset_to_defaults();
+        set_from_str("AllAlpha=true").unwrap();
+        let emu = Version::major_minor(1, 34);
+        set_emulation_version(emu).unwrap();
+        for &f in ALL_FEATURES {
+            let s = f.spec_at(emu);
+            let want = if s.pre_release == PreRelease::Alpha {
+                true
+            } else {
+                s.default
+            };
+            assert_eq!(enabled(f), want, "{f:?}");
+        }
+        reset_to_defaults();
+    }
+
+    #[test]
+    #[serial]
+    fn reset_to_defaults_restores_versions() {
+        set_emulation_version_and_min_compatibility_version(
+            Version::major_minor(1, 33),
+            Version::major_minor(1, 33),
+        )
+        .unwrap();
+        assert_eq!(min_compatibility_version(), Version::major_minor(1, 33));
+        reset_to_defaults();
+        assert_eq!(emulation_version(), Version::major_minor(1, 35));
+        assert_eq!(min_compatibility_version(), Version::major_minor(1, 34));
+    }
+
+    #[test]
+    #[serial]
+    fn validate_reports_gates_invalid_at_the_current_version() {
+        reset_to_defaults();
+        assert!(validate().is_empty());
+        set_from_str("PodTopologyLabelsAdmission=false").unwrap();
+        assert!(validate().is_empty());
         reset_to_defaults();
     }
 }
