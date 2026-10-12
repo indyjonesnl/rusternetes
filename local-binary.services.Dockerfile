@@ -32,7 +32,7 @@ COPY target/release/api-server /app/api-server
 EXPOSE 6443
 
 ENTRYPOINT ["/app/api-server"]
-CMD ["--bind-address", "0.0.0.0:6443", "--etcd-servers", "http://etcd:2379"]
+CMD ["--bind-address", "0.0.0.0:6443", "--etcd-servers", "http://etcd:2379", "--authorization-mode", "Node,RBAC"]
 
 # ---------------------------------------------------------------------
 # kubelet

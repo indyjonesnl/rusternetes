@@ -16,13 +16,14 @@
 #   --tls-cert-file           -> --tls-cert-file
 #   --tls-private-key-file    -> --tls-key-file
 #   --client-ca-file          -> --client-ca-file
+#   --authorization-mode      -> --authorization-mode
 #   --secure-port             -> port of --bind-address=0.0.0.0:<port>
 #   --advertise-address       -> folded into --bind-address (rusternetes binds 0.0.0.0)
 #   (implicit)                -> --storage-backend=etcd --tls
 #
 # Everything else is DROPPED and logged — those are the rusternetes-api-server
 # capability gaps this harness exists to surface (SA-token keys, front-proxy /
-# aggregation, authz-mode, admission plugins, kubelet client certs, egress
+# aggregation, admission plugins, kubelet client certs, egress
 # selector, api-audiences, cipher suites, ...).
 set -eu
 
@@ -39,6 +40,7 @@ ETCD=""
 CERT=""
 KEY=""
 CA=""
+AUTHZ=""
 PORT=6443
 DROPPED=""
 
@@ -52,6 +54,8 @@ while [ $# -gt 0 ]; do
     --tls-private-key-file)   KEY="$2"; shift ;;
     --client-ca-file=*)       CA="${1#*=}" ;;
     --client-ca-file)         CA="$2"; shift ;;
+    --authorization-mode=*)   AUTHZ="${1#*=}" ;;
+    --authorization-mode)     AUTHZ="$2"; shift ;;
     --secure-port=*)          PORT="${1#*=}" ;;
     --secure-port)            PORT="$2"; shift ;;
     --advertise-address=*)    : ;;   # rusternetes binds 0.0.0.0; advertise n/a
@@ -107,6 +111,8 @@ set -- --storage-backend=etcd --tls --bind-address="0.0.0.0:${PORT}" \
 [ -n "$CERT" ] && set -- "$@" --tls-cert-file="$CERT"
 [ -n "$KEY" ]  && set -- "$@" --tls-key-file="$KEY"
 [ -n "$CA" ]   && set -- "$@" --client-ca-file="$CA"
+# Upstream default is AlwaysAllow (#3266): forward k0s's Node,RBAC explicitly.
+[ -n "$AUTHZ" ] && set -- "$@" --authorization-mode="$AUTHZ"
 
 # Absolute path: the k0s supervisor launches the apiserver with a minimal PATH
 # that excludes /usr/local/bin (a bare name yields exit 127 "not found").

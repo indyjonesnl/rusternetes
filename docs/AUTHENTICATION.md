@@ -110,9 +110,9 @@ kubectl config set-context rusternetes --user=rusternetes-admin
 
 ### Step 4: Restart without `--skip-auth`
 
-Now restart the API server without `--skip-auth`. All requests will require a valid token.
+Now restart the API server without `--skip-auth`, with `--authorization-mode=Node,RBAC`. All requests will require a valid token. The default `--authorization-mode` is `AlwaysAllow` (as in upstream kube-apiserver), so without that flag every authenticated user is authorized for everything.
 
-**Compose cluster:** Edit the compose file, remove the `--skip-auth` line from the api-server command, then:
+**Compose cluster:** Edit the compose file, replace the `--skip-auth` line in the api-server command with `--authorization-mode=Node,RBAC`, then:
 
 ```bash
 podman compose build api-server
@@ -122,7 +122,7 @@ podman compose up -d api-server
 **All-in-one binary:**
 
 ```bash
-rusternetes --skip-auth=false --data-dir ./cluster.db
+rusternetes --skip-auth=false --authorization-mode=Node,RBAC --data-dir ./cluster.db
 ```
 
 **Verify:** `curl -k https://localhost:6443/api/v1/pods` should return 401/403.
@@ -231,7 +231,7 @@ A login page that prompts for a token and stores it in sessionStorage is planned
 
 Before exposing a rusternetes cluster to a network:
 
-- [ ] Remove `--skip-auth` from the API server command
+- [ ] Remove `--skip-auth` from the API server command and pass `--authorization-mode=Node,RBAC` (the default is `AlwaysAllow`)
 - [ ] Generate RSA signing keys for ServiceAccount tokens
 - [ ] Enable TLS (`--tls` with cert/key files or `--tls-self-signed`)
 - [ ] Create an admin ServiceAccount and ClusterRoleBinding
@@ -262,6 +262,7 @@ rusternetes \
   --tls-cert-file server.crt \
   --tls-key-file server.key \
   --client-ca-file ca.crt \
+  --authorization-mode=Node,RBAC \
   --skip-auth=false
 
 # Configure kubectl
@@ -279,6 +280,7 @@ The `--client-ca-file` flag tells the API server to require client certificates 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--skip-auth` | `true` (all-in-one) / `false` (standalone) | Skip authentication and authorization |
+| `--authorization-mode` | `AlwaysAllow` | Ordered, comma-delimited authorizers: AlwaysAllow,AlwaysDeny,ABAC,Webhook,RBAC,Node. Pass `Node,RBAC` for a secured cluster |
 | `--jwt-secret` | `rusternetes-secret-change-in-production` | HMAC secret for JWT signing (fallback when no RSA keys) |
 | `--tls` | `false` | Enable TLS/HTTPS |
 | `--tls-cert-file` | — | Path to TLS certificate (PEM) |

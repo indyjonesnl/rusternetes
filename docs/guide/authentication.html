@@ -223,7 +223,7 @@ kubectl config set-context rusternetes --user=rusternetes-admin</code>
           <span class="code-dot green"></span>
           <span class="code-lang">Terminal</span>
         </div>
-        <code>rusternetes --skip-auth=false --data-dir ./cluster.db
+        <code>rusternetes --skip-auth=false --authorization-mode=Node,RBAC --data-dir ./cluster.db
 
 <span class="c"># Verify authentication works</span>
 kubectl get pods                      <span class="c"># should work with token</span>
@@ -257,7 +257,7 @@ openssl x509 -req -in admin.csr -CA ca.crt -CAkey ca.key \
 <span class="c"># Start with mTLS</span>
 rusternetes \
   --tls --tls-cert-file server.crt --tls-key-file server.key \
-  --client-ca-file ca.crt --skip-auth=false
+  --client-ca-file ca.crt --authorization-mode=Node,RBAC --skip-auth=false
 
 <span class="c"># Configure kubectl with client cert</span>
 kubectl config set-credentials admin \

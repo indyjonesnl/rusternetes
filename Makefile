@@ -132,7 +132,7 @@ dev-exec-%: ## Execute a shell in a running container (e.g., make dev-exec-api-s
 
 # Local Binary Execution
 run-api-server: ## Run API server locally
-	cargo run --bin api-server -- --bind-address 0.0.0.0:6443 --etcd-servers http://localhost:2379
+	cargo run --bin api-server -- --bind-address 0.0.0.0:6443 --etcd-servers http://localhost:2379 --authorization-mode=Node,RBAC
 
 run-scheduler: ## Run scheduler locally
 	cargo run --bin scheduler -- --etcd-servers http://localhost:2379
