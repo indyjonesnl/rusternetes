@@ -616,11 +616,98 @@ struct KubeSchedulerConfiguration {
     profiles: Vec<Profile>,
     #[serde(default)]
     percentage_of_nodes_to_score: Option<i32>,
+    /// v1/defaults.go:108-110 defaults a nil value to 16.
+    #[serde(default)]
+    parallelism: Option<i32>,
+    /// v1/defaults.go:158-160 defaults a nil value to 1.
+    #[serde(default)]
+    pod_initial_backoff_seconds: Option<i64>,
+    /// v1/defaults.go:162-164 defaults a nil value to 10.
+    #[serde(default)]
+    pod_max_backoff_seconds: Option<i64>,
+}
+
+/// `config.Plugin` (pkg/scheduler/apis/config/types.go). The internal type has
+/// no json tags, so a marshalled bad value uses the Go field names.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+struct Plugin {
+    name: String,
+    #[serde(default)]
+    weight: Option<i32>,
+}
+
+/// `config.PluginSet`. `apiequality.Semantic.DeepEqual` treats nil and empty
+/// slices as equal, which `Vec` equality already does.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+struct PluginSet {
+    #[serde(default)]
+    enabled: Vec<Plugin>,
+    #[serde(default)]
+    disabled: Vec<Plugin>,
+}
+
+impl PluginSet {
+    /// `json.Marshal` of the internal `config.PluginSet` (no json tags; a nil
+    /// slice marshals as `null`).
+    fn go_json(&self) -> String {
+        fn list(v: &[Plugin]) -> String {
+            if v.is_empty() {
+                return "null".to_string();
+            }
+            let items: Vec<String> = v
+                .iter()
+                .map(|p| {
+                    let name = serde_json::Value::String(p.name.clone());
+                    format!("{{\"Name\":{name},\"Weight\":{}}}", p.weight.unwrap_or(0))
+                })
+                .collect();
+            format!("[{}]", items.join(","))
+        }
+        // Struct field order, which serde_json's map would sort away.
+        format!(
+            "{{\"Enabled\":{},\"Disabled\":{}}}",
+            list(&self.enabled),
+            list(&self.disabled)
+        )
+    }
+}
+
+/// The extension points `validatePluginConfig` iterates
+/// (validation.go:166-182). `multiPoint` is deliberately absent, as upstream.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Plugins {
+    #[serde(default)]
+    pre_enqueue: PluginSet,
+    #[serde(default)]
+    queue_sort: PluginSet,
+    #[serde(default)]
+    pre_filter: PluginSet,
+    #[serde(default)]
+    filter: PluginSet,
+    #[serde(default)]
+    post_filter: PluginSet,
+    #[serde(default)]
+    pre_score: PluginSet,
+    #[serde(default)]
+    score: PluginSet,
+    #[serde(default)]
+    reserve: PluginSet,
+    #[serde(default)]
+    permit: PluginSet,
+    #[serde(default)]
+    pre_bind: PluginSet,
+    #[serde(default)]
+    bind: PluginSet,
+    #[serde(default)]
+    post_bind: PluginSet,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Profile {
+    #[serde(default)]
+    plugins: Option<Plugins>,
     #[serde(default)]
     scheduler_name: Option<String>,
     #[serde(default)]
@@ -692,6 +779,15 @@ fn validate_profiles(cfg: &KubeSchedulerConfiguration) -> Result<(ErrorList, Err
     // Errors from plugin construction (`New*`), which only runs once the
     // configuration validated.
     let mut init_errs = ErrorList::new();
+    // validation.go:52-54; nil defaults to 16 (v1/defaults.go:108-110).
+    let parallelism = cfg.parallelism.unwrap_or(16);
+    if parallelism <= 0 {
+        errs.push(field::Error::invalid(
+            &Path::new("parallelism"),
+            parallelism,
+            "should be an integer value greater than zero",
+        ));
+    }
     let single = cfg.profiles.len() <= 1;
     let mut existing: Vec<&str> = Vec::new();
     for (i, profile) in cfg.profiles.iter().enumerate() {
@@ -708,6 +804,37 @@ fn validate_profiles(cfg: &KubeSchedulerConfiguration) -> Result<(ErrorList, Err
             &path.child("percentageOfNodesToScore"),
             profile.percentage_of_nodes_to_score,
         ));
+        // validatePluginConfig's stagesToPluginSet loop (validation.go:166-182).
+        if let Some(pl) = &profile.plugins {
+            let plugins_path = path.child("plugins");
+            for (stage, set) in [
+                ("preEnqueue", &pl.pre_enqueue),
+                ("queueSort", &pl.queue_sort),
+                ("preFilter", &pl.pre_filter),
+                ("filter", &pl.filter),
+                ("postFilter", &pl.post_filter),
+                ("preScore", &pl.pre_score),
+                ("score", &pl.score),
+                ("reserve", &pl.reserve),
+                ("permit", &pl.permit),
+                ("preBind", &pl.pre_bind),
+                ("bind", &pl.bind),
+                ("postBind", &pl.post_bind),
+            ] {
+                // validatePluginSetForInvalidPlugins (validation.go:129-137).
+                for (k, plugin) in set.enabled.iter().enumerate() {
+                    if INVALID_PLUGINS_V1.contains(&plugin.name.as_str()) {
+                        errs.push(field::Error::invalid(
+                            &plugins_path.child(stage).child("enabled").index(k),
+                            plugin.name.as_str(),
+                            format!(
+                                "was invalid in version \"{CONFIG_API_VERSION}\" (KubeSchedulerConfiguration is version \"{CONFIG_API_VERSION}\")"
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
         let mut seen: Vec<&str> = Vec::new();
         for (j, pc) in profile.plugin_config.iter().enumerate() {
             let pc_path = path.child("pluginConfig").index(j);
@@ -789,11 +916,87 @@ fn validate_profiles(cfg: &KubeSchedulerConfiguration) -> Result<(ErrorList, Err
         }
         existing.push(name);
     }
+    if !cfg.profiles.is_empty() {
+        errs.extend(validate_common_queue_sort(&profiles_path, &cfg.profiles));
+    }
     errs.extend(validate_percentage_of_nodes_to_score(
         &Path::new("percentageOfNodesToScore"),
         cfg.percentage_of_nodes_to_score,
     ));
+    // validation.go:70-77.
+    let initial = cfg.pod_initial_backoff_seconds.unwrap_or(1);
+    let max = cfg.pod_max_backoff_seconds.unwrap_or(10);
+    if initial <= 0 {
+        errs.push(field::Error::invalid(
+            &Path::new("podInitialBackoffSeconds"),
+            initial,
+            "must be greater than 0",
+        ));
+    }
+    if max < initial {
+        errs.push(field::Error::invalid(
+            &Path::new("podMaxBackoffSeconds"),
+            max,
+            "must be greater than or equal to PodInitialBackoffSeconds",
+        ));
+    }
     Ok((errs, init_errs))
+}
+
+/// `validateCommonQueueSort` (validation.go:219-254).
+fn validate_common_queue_sort(path: &Path, profiles: &[Profile]) -> ErrorList {
+    let mut errs = ErrorList::new();
+    let mut canon = PluginSet::default();
+    let mut queue_sort_name = "";
+    let mut queue_sort_args: Option<&serde_yaml::Value> = None;
+    if let Some(pl) = &profiles[0].plugins {
+        canon = pl.queue_sort.clone();
+        if let Some(first) = pl.queue_sort.enabled.first() {
+            queue_sort_name = first.name.as_str();
+        }
+        let length = pl.queue_sort.enabled.len();
+        if length > 1 {
+            errs.push(field::Error::invalid(
+                &path
+                    .index(0)
+                    .child("plugins")
+                    .child("queueSort")
+                    .child("Enabled"),
+                length as i32,
+                "only one queue sort plugin can be enabled",
+            ));
+        }
+    }
+    // No `break`: the last matching config wins, as upstream.
+    for cfg in &profiles[0].plugin_config {
+        if !queue_sort_name.is_empty() && cfg.name == queue_sort_name {
+            queue_sort_args = cfg.args.as_ref();
+        }
+    }
+    for (i, profile) in profiles.iter().enumerate().skip(1) {
+        let curr = profile
+            .plugins
+            .as_ref()
+            .map(|p| p.queue_sort.clone())
+            .unwrap_or_default();
+        if canon != curr {
+            errs.push(field::Error::invalid(
+                &path.index(i).child("plugins").child("queueSort"),
+                BadValue::Marshaled(curr.go_json()),
+                "must be the same for all profiles",
+            ));
+        }
+        for cfg in &profile.plugin_config {
+            if cfg.name == queue_sort_name && queue_sort_args != cfg.args.as_ref() {
+                errs.push(field::Error::invalid(
+                    &path.index(i).child("pluginConfig").child("args"),
+                    BadValue::marshal(&cfg.args),
+                    "queueSort must be the same for all profiles",
+                ));
+            }
+        }
+    }
+    errs
 }
 
 fn decode_args<T: serde::de::DeserializeOwned + Default>(
