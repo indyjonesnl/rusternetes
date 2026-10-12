@@ -86,3 +86,27 @@ async fn node_metrics_list_honours_label_selector() {
     assert_eq!(s.as_u16(), 200, "{b}");
     assert_eq!(names(&b), vec!["n-web"]);
 }
+
+/// #3327: metrics-server `pkg/api/node.go` `Get` returns
+/// `errors.NewNotFound(m.groupResource, name)` when no metrics exist for the
+/// node, rather than a synthesized zero-usage object. `NewNotFound`
+/// (`apimachinery/pkg/api/errors/errors.go`) renders
+/// `{group-resource} "{name}" not found` with `details.group`/`kind`/`name`.
+/// `kubectl top node <name>` therefore reports NotFound for a node without a
+/// sample.
+#[tokio::test]
+async fn node_metrics_get_without_sample_is_not_found() {
+    let api = TestApiServer::new();
+    seed(&api).await;
+    let (s, b) = api.get("/apis/metrics.k8s.io/v1beta1/nodes/n-web").await;
+    assert_eq!(s.as_u16(), 404, "{b}");
+    assert_eq!(b["kind"], "Status", "{b}");
+    assert_eq!(b["reason"], "NotFound", "{b}");
+    assert_eq!(
+        b["message"], "nodemetrics.metrics.k8s.io \"n-web\" not found",
+        "{b}"
+    );
+    assert_eq!(b["details"]["group"], "metrics.k8s.io", "{b}");
+    assert_eq!(b["details"]["kind"], "nodemetrics", "{b}");
+    assert_eq!(b["details"]["name"], "n-web", "{b}");
+}
