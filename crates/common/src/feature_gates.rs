@@ -481,6 +481,7 @@ impl Feature {
     /// (`RelaxedDNSSearchValidation` {1.34, true, GA, LockToDefault: true},
     /// `InPlacePodVerticalScaling` {1.35, true, GA, LockToDefault: true});
     /// the zpages / apiserver gates are not locked.
+    #[cfg(test)]
     const fn locked_to_default(self) -> bool {
         matches!(
             self,
@@ -957,18 +958,276 @@ impl KnownGate {
     }
 }
 
+/// One `{Version: 1.<minor>, Default, PreRelease, LockToDefault}` row of a
+/// gate's `VersionedSpecs`.
+const fn spec(
+    minor: u32,
+    default: bool,
+    pre_release: PreRelease,
+    lock_to_default: bool,
+) -> FeatureSpec {
+    FeatureSpec {
+        default,
+        lock_to_default,
+        pre_release,
+        version: Version::major_minor(1, minor),
+        min_compatibility_version: None,
+    }
+}
+
 impl Feature {
-    /// The gate's `VersionedSpecs`, ascending by version.
+    /// The gate's `VersionedSpecs`, ascending by version: the spec list of
+    /// the gate in `defaultVersionedKubernetesFeatureGates`
+    /// (release-1.35: `pkg/features/kube_features.go:1123`,
+    /// `staging/src/k8s.io/apiserver/pkg/features/kube_features.go:309`,
+    /// `staging/src/k8s.io/component-base/zpages/features/kube_features.go:38`
+    /// `featureGates()`), transcribed verbatim: each row is
+    /// `{Version: 1.<minor>, Default, PreRelease, LockToDefault}`. No
+    /// upstream 1.35 spec sets `MinCompatibilityVersion`.
     fn specs(self) -> Vec<FeatureSpec> {
-        // Gap (#3232): per-gate introduction versions are not modelled, so
-        // the single modelled spec (the one at v1.35) is valid from 0.0.
-        vec![FeatureSpec {
-            default: self.default_enabled(),
-            lock_to_default: self.locked_to_default(),
-            pre_release: self.prerelease(),
-            version: Version::major_minor(0, 0),
-            min_compatibility_version: None,
-        }]
+        match self {
+            Feature::RelaxedDNSSearchValidation => vec![
+                spec(32, false, PreRelease::Alpha, false),
+                spec(33, true, PreRelease::Beta, false),
+                spec(34, true, PreRelease::Ga, true),
+            ],
+            Feature::PodTopologyLabelsAdmission => vec![
+                spec(33, false, PreRelease::Alpha, false),
+                spec(35, true, PreRelease::Beta, false),
+            ],
+            Feature::NodeDeclaredFeatures => vec![spec(35, false, PreRelease::Alpha, false)],
+            Feature::InPlacePodVerticalScaling => vec![
+                spec(27, false, PreRelease::Alpha, false),
+                spec(33, true, PreRelease::Beta, false),
+                spec(35, true, PreRelease::Ga, true),
+            ],
+            Feature::SELinuxMountReadWriteOncePod => vec![
+                spec(25, false, PreRelease::Alpha, false),
+                spec(27, false, PreRelease::Beta, false),
+                spec(28, true, PreRelease::Beta, false),
+            ],
+            Feature::SELinuxMount => vec![
+                spec(30, false, PreRelease::Alpha, false),
+                spec(33, false, PreRelease::Beta, false),
+            ],
+            Feature::SELinuxChangePolicy => vec![
+                spec(32, false, PreRelease::Alpha, false),
+                spec(33, true, PreRelease::Beta, false),
+            ],
+            Feature::MaxUnavailableStatefulSet => vec![
+                spec(24, false, PreRelease::Alpha, false),
+                spec(35, false, PreRelease::Beta, false),
+            ],
+            Feature::DRADeviceTaints => vec![spec(33, false, PreRelease::Alpha, false)],
+            Feature::DRAPartitionableDevices => vec![spec(33, false, PreRelease::Alpha, false)],
+            Feature::DRADeviceBindingConditions => vec![spec(34, false, PreRelease::Alpha, false)],
+            Feature::DRAConsumableCapacity => vec![spec(34, false, PreRelease::Alpha, false)],
+            Feature::DRAResourceClaimDeviceStatus => vec![
+                spec(32, false, PreRelease::Alpha, false),
+                spec(33, true, PreRelease::Beta, false),
+            ],
+            Feature::InPlacePodLevelResourcesVerticalScaling => {
+                vec![spec(35, false, PreRelease::Alpha, false)]
+            }
+            Feature::DRAExtendedResource => vec![spec(34, false, PreRelease::Alpha, false)],
+            Feature::ClusterTrustBundleProjection => vec![
+                spec(29, false, PreRelease::Alpha, false),
+                spec(33, false, PreRelease::Beta, false),
+            ],
+            Feature::PodCertificateRequest => vec![
+                spec(34, false, PreRelease::Alpha, false),
+                spec(35, false, PreRelease::Beta, false),
+            ],
+            Feature::ContainerStopSignals => vec![spec(33, false, PreRelease::Alpha, false)],
+            Feature::ResourceHealthStatus => vec![spec(31, false, PreRelease::Alpha, false)],
+            Feature::GenericWorkload => vec![spec(35, false, PreRelease::Alpha, false)],
+            Feature::TaintTolerationComparisonOperators => {
+                vec![spec(35, false, PreRelease::Alpha, false)]
+            }
+            Feature::PodLevelResources => vec![
+                spec(32, false, PreRelease::Alpha, false),
+                spec(34, true, PreRelease::Beta, false),
+            ],
+            Feature::MatchLabelKeysInPodTopologySpread => vec![
+                spec(25, false, PreRelease::Alpha, false),
+                spec(27, true, PreRelease::Beta, false),
+            ],
+            Feature::MatchLabelKeysInPodTopologySpreadSelectorMerge => {
+                vec![spec(34, true, PreRelease::Beta, false)]
+            }
+            Feature::PodDeletionCost => vec![
+                spec(21, false, PreRelease::Alpha, false),
+                spec(22, true, PreRelease::Beta, false),
+            ],
+            Feature::ClusterTrustBundle => vec![
+                spec(27, false, PreRelease::Alpha, false),
+                spec(33, false, PreRelease::Beta, false),
+            ],
+            Feature::DRADeviceTaintRules => vec![spec(35, false, PreRelease::Alpha, false)],
+            Feature::ComponentFlagz => vec![spec(32, false, PreRelease::Alpha, false)],
+            Feature::ComponentStatusz => vec![spec(32, false, PreRelease::Alpha, false)],
+            Feature::StorageVersionAPI => vec![spec(20, false, PreRelease::Alpha, false)],
+            Feature::APIServerIdentity => vec![
+                spec(20, false, PreRelease::Alpha, false),
+                spec(26, true, PreRelease::Beta, false),
+            ],
+            Feature::StorageVersionMigrator => vec![
+                spec(30, false, PreRelease::Alpha, false),
+                spec(35, false, PreRelease::Beta, false),
+            ],
+            Feature::KubeletCrashLoopBackOffMax => vec![
+                spec(32, false, PreRelease::Alpha, false),
+                spec(35, true, PreRelease::Beta, false),
+            ],
+            Feature::ReduceDefaultCrashLoopBackOffDecay => {
+                vec![spec(33, false, PreRelease::Alpha, false)]
+            }
+            Feature::WatchCacheInitializationPostStartHook => {
+                vec![spec(31, false, PreRelease::Beta, false)]
+            }
+            Feature::MutableCSINodeAllocatableCount => vec![
+                spec(33, false, PreRelease::Alpha, false),
+                spec(34, false, PreRelease::Beta, false),
+                spec(35, true, PreRelease::Beta, false),
+            ],
+            Feature::MutatingAdmissionPolicy => vec![
+                spec(32, false, PreRelease::Alpha, false),
+                spec(34, false, PreRelease::Beta, false),
+            ],
+            Feature::DeploymentReplicaSetTerminatingReplicas => vec![
+                spec(33, false, PreRelease::Alpha, false),
+                spec(35, true, PreRelease::Beta, false),
+            ],
+            Feature::StorageCapacityScoring => vec![spec(33, false, PreRelease::Alpha, false)],
+            Feature::CrossNamespaceVolumeDataSource => {
+                vec![spec(26, false, PreRelease::Alpha, false)]
+            }
+            Feature::RuntimeClassInImageCriApi => vec![spec(29, false, PreRelease::Alpha, false)],
+            Feature::DynamicResourceAllocation => vec![
+                spec(26, false, PreRelease::Alpha, false),
+                spec(32, false, PreRelease::Beta, false),
+                spec(34, true, PreRelease::Ga, false),
+                spec(35, true, PreRelease::Ga, true),
+            ],
+            Feature::AuthorizeWithSelectors => vec![
+                spec(31, false, PreRelease::Alpha, false),
+                spec(32, true, PreRelease::Beta, false),
+                spec(34, true, PreRelease::Ga, true),
+            ],
+            Feature::AuthorizeNodeWithSelectors => vec![
+                spec(31, false, PreRelease::Alpha, false),
+                spec(32, true, PreRelease::Beta, false),
+                spec(34, true, PreRelease::Ga, true),
+            ],
+            Feature::MultiCIDRServiceAllocator => vec![
+                spec(27, false, PreRelease::Alpha, false),
+                spec(31, false, PreRelease::Beta, false),
+                spec(33, true, PreRelease::Ga, false),
+                spec(34, true, PreRelease::Ga, true),
+            ],
+            Feature::DisableAllocatorDualWrite => vec![
+                spec(31, false, PreRelease::Alpha, false),
+                spec(33, false, PreRelease::Beta, false),
+                spec(34, true, PreRelease::Ga, false),
+                spec(35, true, PreRelease::Ga, true),
+            ],
+            Feature::GangScheduling => vec![spec(35, false, PreRelease::Alpha, false)],
+            Feature::GracefulNodeShutdown => vec![
+                spec(20, false, PreRelease::Alpha, false),
+                spec(21, true, PreRelease::Beta, false),
+            ],
+            Feature::GracefulNodeShutdownBasedOnPodPriority => vec![
+                spec(23, false, PreRelease::Alpha, false),
+                spec(24, true, PreRelease::Beta, false),
+            ],
+            Feature::InPlacePodVerticalScalingAllocatedStatus => vec![
+                spec(32, false, PreRelease::Alpha, false),
+                spec(33, false, PreRelease::Deprecated, false),
+            ],
+            Feature::InPlacePodVerticalScalingExclusiveCPUs => {
+                vec![spec(32, false, PreRelease::Alpha, false)]
+            }
+            Feature::InPlacePodVerticalScalingExclusiveMemory => {
+                vec![spec(34, false, PreRelease::Alpha, false)]
+            }
+            Feature::MemoryManager => vec![
+                spec(21, false, PreRelease::Alpha, false),
+                spec(22, true, PreRelease::Beta, false),
+                spec(32, true, PreRelease::Ga, true),
+            ],
+            Feature::PodLifecycleSleepAction => vec![
+                spec(29, false, PreRelease::Alpha, false),
+                spec(30, true, PreRelease::Beta, false),
+                spec(34, true, PreRelease::Ga, true),
+            ],
+            Feature::PodLifecycleSleepActionAllowZero => vec![
+                spec(32, false, PreRelease::Alpha, false),
+                spec(33, true, PreRelease::Beta, false),
+                spec(34, true, PreRelease::Ga, true),
+            ],
+            Feature::ProcMountType => vec![
+                spec(12, false, PreRelease::Alpha, false),
+                spec(31, false, PreRelease::Beta, false),
+                spec(33, true, PreRelease::Beta, false),
+            ],
+            Feature::UserNamespacesSupport => vec![
+                spec(25, false, PreRelease::Alpha, false),
+                spec(30, false, PreRelease::Beta, false),
+                spec(33, true, PreRelease::Beta, false),
+            ],
+            Feature::DRAAdminAccess => vec![
+                spec(32, false, PreRelease::Alpha, false),
+                spec(34, true, PreRelease::Beta, false),
+            ],
+            Feature::DRAPrioritizedList => vec![
+                spec(33, false, PreRelease::Alpha, false),
+                spec(34, true, PreRelease::Beta, false),
+            ],
+            Feature::DRASchedulerFilterTimeout => vec![spec(34, true, PreRelease::Beta, false)],
+            Feature::ContainerRestartRules => vec![
+                spec(34, false, PreRelease::Alpha, false),
+                spec(35, true, PreRelease::Beta, false),
+            ],
+            Feature::RestartAllContainersOnContainerExits => {
+                vec![spec(35, false, PreRelease::Alpha, false)]
+            }
+            Feature::ServiceAccountTokenNodeBinding => vec![
+                spec(29, false, PreRelease::Alpha, false),
+                spec(31, true, PreRelease::Beta, false),
+                spec(33, true, PreRelease::Ga, true),
+            ],
+            Feature::ServiceAccountTokenNodeBindingValidation => vec![
+                spec(29, false, PreRelease::Alpha, false),
+                spec(30, true, PreRelease::Beta, false),
+                spec(32, true, PreRelease::Ga, true),
+            ],
+            Feature::UserNamespacesHostNetworkSupport => {
+                vec![spec(35, false, PreRelease::Alpha, false)]
+            }
+            Feature::WindowsCPUAndMemoryAffinity => vec![spec(32, false, PreRelease::Alpha, false)],
+            Feature::WindowsGracefulNodeShutdown => vec![
+                spec(32, false, PreRelease::Alpha, false),
+                spec(34, true, PreRelease::Beta, false),
+            ],
+            Feature::UnknownVersionInteroperabilityProxy => {
+                vec![spec(28, false, PreRelease::Alpha, false)]
+            }
+            Feature::DeclarativeValidation => vec![spec(33, true, PreRelease::Beta, false)],
+            Feature::DeclarativeValidationTakeover => {
+                vec![spec(33, false, PreRelease::Beta, false)]
+            }
+            Feature::StructuredAuthenticationConfiguration => vec![
+                spec(29, false, PreRelease::Alpha, false),
+                spec(30, true, PreRelease::Beta, false),
+                spec(34, true, PreRelease::Ga, true),
+            ],
+            Feature::StructuredAuthenticationConfigurationEgressSelector => {
+                vec![spec(34, true, PreRelease::Beta, false)]
+            }
+            Feature::StructuredAuthenticationConfigurationJWKSMetrics => {
+                vec![spec(35, true, PreRelease::Beta, false)]
+            }
+        }
     }
 
     /// `featureSpecAtEmulationAndMinCompatVersion(known[f], emulation, nil)`.
@@ -1578,6 +1837,26 @@ mod tests {
                 .spec_at(v(1, 34))
                 .lock_to_default
         );
+    }
+
+    // The version history is the source of truth; the per-gate v1.35
+    // summaries (`prerelease`/`default_enabled`/`locked_to_default`) must
+    // equal the spec resolved at the target emulation version, and the
+    // resolution must not depend on the min-compatibility version (no 1.35
+    // spec sets MinCompatibilityVersion).
+    #[test]
+    fn version_history_agrees_with_v1_35_summaries() {
+        for f in ALL_FEATURES {
+            let s = f.spec_at(EMULATION_VERSION);
+            assert_eq!(s.pre_release, f.prerelease(), "{f:?}");
+            assert_eq!(s.default, f.default_enabled(), "{f:?}");
+            assert_eq!(s.lock_to_default, f.locked_to_default(), "{f:?}");
+            assert!(f
+                .specs()
+                .iter()
+                .all(|x| x.min_compatibility_version.is_none()));
+            assert!(f.specs().windows(2).all(|w| w[0].version < w[1].version));
+        }
     }
 
     // version.go:259-276: SubtractMinor saturates at 0.
