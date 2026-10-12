@@ -31,6 +31,21 @@ pub fn apply_field_selector<T: Serialize>(
     Ok(())
 }
 
+/// Reject a malformed `labelSelector` the way `ListResource` does: its
+/// `metainternalversion.ParameterCodec` decode (`labels.Parse`) fails and the
+/// handler answers `errors.NewBadRequest(err.Error())`
+/// (`apiserver/pkg/endpoints/handlers/get.go`). For lists that never filter by
+/// the selector themselves (custom/external metrics).
+pub fn validate_label_selector_param(
+    params: &HashMap<String, String>,
+) -> Result<(), rusternetes_common::Error> {
+    if let Some(s) = params.get("labelSelector") {
+        LabelSelector::parse(s)
+            .map_err(|e| rusternetes_common::Error::BadRequest(e.to_string()))?;
+    }
+    Ok(())
+}
+
 /// Apply label selector filtering to a list of resources.
 ///
 /// Uses direct struct field access for label matching when possible,
