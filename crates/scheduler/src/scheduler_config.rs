@@ -584,4 +584,142 @@ profiles:
         );
         assert!(volume_binding_args_from_config("percentageOfNodesToScore: 100\n", false).is_ok());
     }
+
+    fn dp(pct: i32, abs: i32) -> DefaultPreemptionArgs {
+        DefaultPreemptionArgs {
+            min_candidate_nodes_percentage: Some(pct),
+            min_candidate_nodes_absolute: Some(abs),
+        }
+    }
+
+    // validation_pluginargs_test.go TestValidateDefaultPreemptionArgs
+    #[test]
+    fn default_preemption_valid_default() {
+        assert!(dp(10, 100).validate(&Path::default()).is_empty());
+    }
+
+    #[test]
+    fn default_preemption_percentage_out_of_range() {
+        for pct in [-1, 900] {
+            let errs = dp(pct, 100).validate(&Path::default());
+            assert_eq!(
+                summary(&errs),
+                vec![(
+                    ErrorType::Invalid,
+                    "minCandidateNodesPercentage".to_string()
+                )]
+            );
+            assert_eq!(errs[0].detail, "not in valid range [0, 100]");
+        }
+    }
+
+    #[test]
+    fn default_preemption_negative_absolute() {
+        let errs = dp(20, -1).validate(&Path::default());
+        assert_eq!(
+            summary(&errs),
+            vec![(ErrorType::Invalid, "minCandidateNodesAbsolute".to_string())]
+        );
+        assert_eq!(errs[0].detail, "not in valid range [0, inf)");
+    }
+
+    #[test]
+    fn default_preemption_all_zero() {
+        let errs = dp(0, 0).validate(&Path::default());
+        assert_eq!(
+            summary(&errs),
+            vec![
+                (
+                    ErrorType::Invalid,
+                    "minCandidateNodesPercentage".to_string()
+                ),
+                (ErrorType::Invalid, "minCandidateNodesAbsolute".to_string()),
+            ]
+        );
+        assert_eq!(
+            errs[0].detail,
+            "cannot be zero at the same time as minCandidateNodesAbsolute"
+        );
+        assert_eq!(
+            errs[1].detail,
+            "cannot be zero at the same time as minCandidateNodesPercentage"
+        );
+    }
+
+    #[test]
+    fn default_preemption_one_zero_ok() {
+        assert!(dp(0, 100).validate(&Path::default()).is_empty());
+        assert!(dp(10, 0).validate(&Path::default()).is_empty());
+    }
+
+    // v1/defaults.go SetDefaults_DefaultPreemptionArgs
+    #[test]
+    fn default_preemption_defaults() {
+        let mut a = DefaultPreemptionArgs::default();
+        a.set_defaults();
+        assert_eq!(a, dp(10, 100));
+        let mut b = dp(0, 5);
+        b.set_defaults();
+        assert_eq!(b, dp(0, 5));
+    }
+
+    // validation_pluginargs_test.go TestValidateInterPodAffinityArgs
+    #[test]
+    fn inter_pod_affinity_weight_range() {
+        let ok = |w| {
+            InterPodAffinityArgs {
+                hard_pod_affinity_weight: Some(w),
+            }
+            .validate(&Path::default())
+        };
+        assert!(ok(10).is_empty());
+        assert!(ok(0).is_empty());
+        assert!(ok(100).is_empty());
+        for w in [-1, 101] {
+            let errs = ok(w);
+            assert_eq!(
+                summary(&errs),
+                vec![(ErrorType::Invalid, "hardPodAffinityWeight".to_string())]
+            );
+            assert_eq!(errs[0].detail, "not in valid range [0, 100]");
+        }
+    }
+
+    // v1/defaults.go SetDefaults_InterPodAffinityArgs
+    #[test]
+    fn inter_pod_affinity_defaults() {
+        let mut a = InterPodAffinityArgs::default();
+        a.set_defaults();
+        assert_eq!(a.hard_pod_affinity_weight, Some(1));
+        let mut b = InterPodAffinityArgs {
+            hard_pod_affinity_weight: Some(0),
+        };
+        b.set_defaults();
+        assert_eq!(b.hard_pod_affinity_weight, Some(0));
+    }
+
+    // validation.go:107-135 isPluginInvalid + validatePluginConfig
+    #[test]
+    fn removed_plugin_config_rejected() {
+        let doc = "profiles:\n- pluginConfig:\n  - name: AzureDiskLimits\n";
+        let err = volume_binding_args_from_config(doc, false).unwrap_err();
+        assert_eq!(
+            err,
+            "profiles[0].pluginConfig[0]: Invalid value: \"AzureDiskLimits\": was invalid in version \"kubescheduler.config.k8s.io/v1\" (KubeSchedulerConfiguration is version \"kubescheduler.config.k8s.io/v1\")"
+        );
+    }
+
+    #[test]
+    fn config_doc_default_preemption_and_inter_pod_affinity_validated() {
+        let doc = "profiles:\n- pluginConfig:\n  - name: DefaultPreemption\n    args:\n      minCandidateNodesPercentage: 0\n      minCandidateNodesAbsolute: 0\n  - name: InterPodAffinity\n    args:\n      hardPodAffinityWeight: 101\n";
+        let err = volume_binding_args_from_config(doc, false).unwrap_err();
+        assert!(err.contains(
+            "profiles[0].pluginConfig[0].args.minCandidateNodesPercentage: Invalid value: 0: cannot be zero at the same time as minCandidateNodesAbsolute"
+        ), "{err}");
+        assert!(err.contains(
+            "profiles[0].pluginConfig[1].args.hardPodAffinityWeight: Invalid value: 101: not in valid range [0, 100]"
+        ), "{err}");
+        let ok = "profiles:\n- pluginConfig:\n  - name: DefaultPreemption\n    args:\n      minCandidateNodesAbsolute: 0\n  - name: InterPodAffinity\n";
+        assert!(volume_binding_args_from_config(ok, false).is_ok());
+    }
 }
