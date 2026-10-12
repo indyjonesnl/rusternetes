@@ -828,6 +828,11 @@ static STATES: [AtomicBool; NUM_FEATURES] = [
 
 /// Returns whether `feature` is currently enabled in this process.
 pub fn enabled(feature: Feature) -> bool {
+    // `unsafeRecordQueried` (feature_gate.go:846-855).
+    let queried = &QUERIED[feature.idx()];
+    if !queried.load(Ordering::Relaxed) {
+        queried.store(true, Ordering::Relaxed);
+    }
     STATES[feature.idx()].load(Ordering::Relaxed)
 }
 
@@ -840,33 +845,158 @@ pub fn enabled(feature: Feature) -> bool {
 pub fn set(feature: Feature, value: bool) -> bool {
     STATES[feature.idx()].swap(value, Ordering::Relaxed)
 }
+/// The mutable half of upstream's `featureGate` that is not a per-gate
+/// atomic: `emulationVersion`, `minCompatibilityVersion` and `enabledRaw`
+/// (feature_gate.go:216-240). Process-wide, like the gates themselves.
+struct GateConfig {
+    emulation_version: Version,
+    min_compatibility_version: Version,
+    /// `enabledRaw`: every key/value ever passed to `Set`/`SetFromMap`, in
+    /// first-set order; a later value for the same key replaces the earlier one.
+    enabled_raw: Vec<(String, bool)>,
+}
+
+static CONFIG: std::sync::Mutex<GateConfig> = std::sync::Mutex::new(GateConfig {
+    emulation_version: EMULATION_VERSION,
+    min_compatibility_version: MIN_COMPATIBILITY_VERSION,
+    enabled_raw: Vec::new(),
+});
+
+/// `f.queriedFeatures` (feature_gate.go:846-855): gates read through
+/// [`enabled`] since the last emulation-version change.
+static QUERIED: [AtomicBool; NUM_FEATURES] = [const { AtomicBool::new(false) }; NUM_FEATURES];
+
+fn config() -> std::sync::MutexGuard<'static, GateConfig> {
+    CONFIG.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// `featureGate.EmulationVersion` (feature_gate.go:828).
 pub fn emulation_version() -> Version {
-    todo!()
+    config().emulation_version
 }
 
 /// `featureGate.MinCompatibilityVersion` (feature_gate.go:832).
 pub fn min_compatibility_version() -> Version {
-    todo!()
+    config().min_compatibility_version
+}
+
+/// `featureEnabled` (feature_gate.go:857-869) for one gate: an explicit value
+/// from `enabled`, else the spec default at the versions.
+fn feature_enabled(
+    f: Feature,
+    enabled: &[(String, bool)],
+    emulation: Version,
+    min_compat: Version,
+) -> bool {
+    let name = format!("{f:?}");
+    if let Some((_, v)) = enabled.iter().find(|(n, _)| *n == name) {
+        return *v;
+    }
+    f.spec_at_versions(emulation, min_compat).default
+}
+
+/// Store the result of `unsafeSetFromMap`: explicit values win, every other
+/// gate takes its spec default at the versions (`enabled` is a sparse map in
+/// upstream; here the per-gate atomics hold the resolved view).
+fn store_states(enabled: &[(String, bool)], emulation: Version, min_compat: Version) {
+    for &f in ALL_FEATURES {
+        STATES[f.idx()].store(
+            feature_enabled(f, enabled, emulation, min_compat),
+            Ordering::Relaxed,
+        );
+    }
+}
+
+/// `unsafeSetFromMap` over `raw` at the given versions, including the
+/// dependency check (feature_gate.go:374-436); returns the sparse `enabled` map.
+fn unsafe_set_from_map(
+    raw: &[(String, bool)],
+    emulation: Version,
+    min_compat: Version,
+) -> Result<Vec<(String, bool)>, String> {
+    let resolved = resolve_gates(raw, &known_gates(), emulation, min_compat)?;
+    check_dependencies(|f| feature_enabled(f, &resolved, emulation, min_compat))?;
+    Ok(resolved)
+}
+
+/// `enabledAlphaFeatures` (compatibility/registry.go:453-461): gates that are
+/// Alpha at the emulated version and currently enabled.
+pub fn enabled_alpha_features() -> Vec<String> {
+    let (emulation, min_compat) = {
+        let cfg = config();
+        (cfg.emulation_version, cfg.min_compatibility_version)
+    };
+    ALL_FEATURES
+        .iter()
+        .filter(|f| {
+            f.spec_at_versions(emulation, min_compat).pre_release == PreRelease::Alpha
+                && STATES[f.idx()].load(Ordering::Relaxed)
+        })
+        .map(|f| format!("{f:?}"))
+        .collect()
 }
 
 /// `SetEmulationVersionAndMinCompatibilityVersion` (feature_gate.go:791-826).
 pub fn set_emulation_version_and_min_compatibility_version(
-    _emulation_version: Version,
-    _min_compatibility_version: Version,
+    emulation_version: Version,
+    min_compatibility_version: Version,
 ) -> Result<(), String> {
-    todo!()
+    let mut cfg = config();
+    if emulation_version == cfg.emulation_version
+        && min_compatibility_version == cfg.min_compatibility_version
+    {
+        return Ok(());
+    }
+    tracing::debug!(
+        "set feature gate emulationVersion to {emulation_version}, minCompatibilityVersion to {min_compatibility_version}"
+    );
+    // The enabled map is reset whenever emulationVersion is changed (:809-811).
+    let enabled = unsafe_set_from_map(
+        &cfg.enabled_raw,
+        emulation_version,
+        min_compatibility_version,
+    )?;
+    for &f in ALL_FEATURES {
+        if !QUERIED[f.idx()].load(Ordering::Relaxed) {
+            continue;
+        }
+        let new_val = feature_enabled(f, &enabled, emulation_version, min_compatibility_version);
+        let old_val = STATES[f.idx()].load(Ordering::Relaxed);
+        if new_val != old_val {
+            tracing::warn!(
+                "SetEmulationVersionAndMinCompatibilityVersion will change already queried feature:{f:?} from {old_val} to {new_val}"
+            );
+        }
+    }
+    store_states(&enabled, emulation_version, min_compatibility_version);
+    cfg.emulation_version = emulation_version;
+    cfg.min_compatibility_version = min_compatibility_version;
+    for q in &QUERIED {
+        q.store(false, Ordering::Relaxed);
+    }
+    Ok(())
 }
 
 /// `featureGate.SetEmulationVersion` (feature_gate.go:787-789).
-pub fn set_emulation_version(_emulation_version: Version) -> Result<(), String> {
-    todo!()
+pub fn set_emulation_version(emulation_version: Version) -> Result<(), String> {
+    set_emulation_version_and_min_compatibility_version(
+        emulation_version,
+        emulation_version.subtract_minor(1),
+    )
 }
 
-/// `featureGate.Validate` (feature_gate.go:362-372).
+/// `featureGate.Validate` (feature_gate.go:362-372): the flag gates checked at
+/// the current emulated version.
 pub fn validate() -> Vec<String> {
-    todo!()
+    let cfg = config();
+    match unsafe_set_from_map(
+        &cfg.enabled_raw,
+        cfg.emulation_version,
+        cfg.min_compatibility_version,
+    ) {
+        Ok(_) => Vec::new(),
+        Err(e) => vec![e],
+    }
 }
 
 /// Reset every feature gate to its rusternetes default. Useful between tests
@@ -875,8 +1005,13 @@ pub fn validate() -> Vec<String> {
 /// Iterates [`ALL_FEATURES`] so adding a new gate requires only the enum +
 /// `ALL_FEATURES` entry — no per-call-site fix-ups.
 pub fn reset_to_defaults() {
+    let mut cfg = config();
+    cfg.emulation_version = EMULATION_VERSION;
+    cfg.min_compatibility_version = MIN_COMPATIBILITY_VERSION;
+    cfg.enabled_raw.clear();
     for &f in ALL_FEATURES {
         STATES[f.idx()].store(f.default_enabled(), Ordering::Relaxed);
+        QUERIED[f.idx()].store(false, Ordering::Relaxed);
     }
 }
 
@@ -960,8 +1095,9 @@ pub fn feature_spec_at_emulation_and_min_compat_version(
 const ALL_ALPHA_GATE: &str = "AllAlpha";
 /// Name of the special "all beta gates" toggle (feature_gate.go:57).
 const ALL_BETA_GATE: &str = "AllBeta";
-/// Emulation version and its min-compatibility version (emulation - 1 minor,
-/// `NewVersionedFeatureGate` feature_gate.go:305-308) quoted by the PreAlpha error.
+/// Default emulation version (`DefaultKubeBinaryVersion`, component-base/version/base.go:63)
+/// and its min-compatibility version (emulation - 1 minor,
+/// `NewVersionedFeatureGate` feature_gate.go:305-308).
 const EMULATION_VERSION: Version = Version::major_minor(1, 35);
 const MIN_COMPATIBILITY_VERSION: Version = Version::major_minor(1, 34);
 
@@ -977,12 +1113,8 @@ struct KnownGate {
 impl KnownGate {
     /// `featureSpecAtEmulationAndMinCompatVersion(known[key], emulationVersion,
     /// minCompatibilityVersion)` (feature_gate.go:387).
-    fn spec(&self) -> FeatureSpec {
-        feature_spec_at_emulation_and_min_compat_version(
-            &self.specs,
-            EMULATION_VERSION,
-            Some(MIN_COMPATIBILITY_VERSION),
-        )
+    fn spec(&self, emulation: Version, min_compat: Version) -> FeatureSpec {
+        feature_spec_at_emulation_and_min_compat_version(&self.specs, emulation, Some(min_compat))
     }
 }
 
@@ -1258,6 +1390,11 @@ impl Feature {
         }
     }
 
+    /// `featureSpecAtEmulationAndMinCompatVersion(known[f], emulation, minCompat)`.
+    fn spec_at_versions(self, emulation: Version, min_compat: Version) -> FeatureSpec {
+        feature_spec_at_emulation_and_min_compat_version(&self.specs(), emulation, Some(min_compat))
+    }
+
     /// `featureSpecAtEmulationAndMinCompatVersion(known[f], emulation, nil)`.
     pub fn spec_at(self, emulation: Version) -> FeatureSpec {
         feature_spec_at_emulation_and_min_compat_version(&self.specs(), emulation, None)
@@ -1310,20 +1447,24 @@ pub fn set_from_str(value: &str) -> Result<(), String> {
 /// After the per-gate pass, the dependency check (:418-434) runs against the
 /// resulting state (see [`check_dependencies`]).
 ///
-/// Gap: per-gate introduction versions and `--emulated-version` are not modelled (#3232).
 fn set_from_map(m: &[(String, bool)]) -> Result<(), String> {
-    let resolved = resolve_gates(m, &known_gates())?;
-    check_dependencies(|f| {
-        let name = format!("{f:?}");
-        resolved
-            .iter()
-            .find(|(n, _)| *n == name)
-            .map_or_else(|| enabled(f), |(_, v)| *v)
-    })?;
-    for (name, v) in resolved {
-        if let Some(&f) = ALL_FEATURES.iter().find(|f| format!("{f:?}") == name) {
-            // feature_gate.go:407-411
-            match f.prerelease() {
+    let mut cfg = config();
+    // Update enabledRaw first (feature_gate.go:446-453): it is saved even
+    // when the values turn out to be invalid, because the emulation version
+    // may not be final yet.
+    for (k, v) in m {
+        match cfg.enabled_raw.iter_mut().find(|(n, _)| n == k) {
+            Some(slot) => slot.1 = *v,
+            None => cfg.enabled_raw.push((k.clone(), *v)),
+        }
+    }
+    let (emulation, min_compat) = (cfg.emulation_version, cfg.min_compatibility_version);
+    // `unsafeSetFromMap(enabled, enabledRaw, ...)` (:456): over ALL raw values.
+    let resolved = unsafe_set_from_map(&cfg.enabled_raw, emulation, min_compat)?;
+    // feature_gate.go:407-411
+    for (name, v) in &cfg.enabled_raw {
+        if let Some(&f) = ALL_FEATURES.iter().find(|f| format!("{f:?}") == *name) {
+            match f.spec_at_versions(emulation, min_compat).pre_release {
                 PreRelease::Deprecated => tracing::warn!(
                     "Setting deprecated feature gate {name}={v}. It will be removed in a future release."
                 ),
@@ -1332,9 +1473,9 @@ fn set_from_map(m: &[(String, bool)]) -> Result<(), String> {
                 ),
                 _ => {}
             }
-            set(f, v);
         }
     }
+    store_states(&resolved, emulation, min_compat);
     Ok(())
 }
 
@@ -1508,7 +1649,12 @@ fn check_dependencies(is_enabled: impl Fn(Feature) -> bool) -> Result<(), String
 /// `setUnsetBetaGates` :270-296) and PreAlpha rejection (:401-404). Returns the
 /// gates to set; special toggles only fill gates the caller did not set
 /// explicitly, so an explicit value wins whatever the order in `m`.
-fn resolve_gates(m: &[(String, bool)], known: &[KnownGate]) -> Result<Vec<(String, bool)>, String> {
+fn resolve_gates(
+    m: &[(String, bool)],
+    known: &[KnownGate],
+    emulation: Version,
+    min_compat: Version,
+) -> Result<Vec<(String, bool)>, String> {
     let mut errs: Vec<String> = Vec::new();
     let mut enabled: Vec<(String, bool)> = Vec::new();
     let mut specials: Vec<(PreRelease, bool)> = Vec::new();
@@ -1524,7 +1670,7 @@ fn resolve_gates(m: &[(String, bool)], known: &[KnownGate]) -> Result<Vec<(Strin
         }
         // The specials are never locked (default false, Alpha/Beta spec).
         if let Some(g) = gate {
-            let spec = g.spec();
+            let spec = g.spec(emulation, min_compat);
             if spec.lock_to_default && spec.default != *v {
                 errs.push(format!(
                     "cannot set feature gate {k} to {v}, feature is locked to {}",
@@ -1537,9 +1683,9 @@ fn resolve_gates(m: &[(String, bool)], known: &[KnownGate]) -> Result<Vec<(Strin
             specials.push((pre, *v));
             continue;
         }
-        if gate.is_some_and(|g| g.spec().pre_release == PreRelease::PreAlpha) {
+        if gate.is_some_and(|g| g.spec(emulation, min_compat).pre_release == PreRelease::PreAlpha) {
             errs.push(format!(
-                "cannot set feature gate {k} to {v}, feature is PreAlpha at emulated version {EMULATION_VERSION}, min compatibility version {MIN_COMPATIBILITY_VERSION}"
+                "cannot set feature gate {k} to {v}, feature is PreAlpha at emulated version {emulation}, min compatibility version {min_compat}"
             ));
             continue;
         }
@@ -1552,7 +1698,9 @@ fn resolve_gates(m: &[(String, bool)], known: &[KnownGate]) -> Result<Vec<(Strin
     }
     for (pre, val) in specials {
         for g in known {
-            if g.spec().pre_release == pre && !enabled.iter().any(|(n, _)| *n == g.name) {
+            if g.spec(emulation, min_compat).pre_release == pre
+                && !enabled.iter().any(|(n, _)| *n == g.name)
+            {
                 enabled.push((g.name.clone(), val));
             }
         }
@@ -1690,19 +1838,26 @@ mod tests {
             set_from_str("StorageCapacityScoring=banana").unwrap_err(),
             "invalid value of StorageCapacityScoring=banana, err: strconv.ParseBool: parsing \"banana\": invalid syntax"
         );
+        // feature_gate.go:446-453: enabledRaw keeps the rejected key, so every
+        // later Set would fail on it too (upstream tests build a fresh gate per
+        // case); reset between error cases.
+        reset_to_defaults();
         // feature_gate.go:387
         assert_eq!(
             set_from_str("fooBarBaz=true").unwrap_err(),
             "unrecognized feature gate: fooBarBaz"
         );
+        reset_to_defaults();
         // feature_gate.go:392 (LockToDefault)
         assert_eq!(
             set_from_str("RelaxedDNSSearchValidation=false").unwrap_err(),
             "cannot set feature gate RelaxedDNSSearchValidation to false, feature is locked to true"
         );
+        reset_to_defaults();
         // feature_gate.go:463-466: nothing persisted when any error occurred.
         assert!(set_from_str("StorageCapacityScoring=true,fooBarBaz=true").is_err());
         assert!(!enabled(Feature::StorageCapacityScoring));
+        reset_to_defaults();
     }
 
     #[test]
@@ -1791,10 +1946,16 @@ mod tests {
     fn pre_alpha_rejected_and_untouched_by_all_alpha() {
         let k = synthetic();
         assert_eq!(
-            resolve_gates(&m(&[("TestPreAlpha", true)]), &k).unwrap_err(),
+            resolve_gates(&m(&[("TestPreAlpha", true)]), &k, EMULATION_VERSION, MIN_COMPATIBILITY_VERSION).unwrap_err(),
             "cannot set feature gate TestPreAlpha to true, feature is PreAlpha at emulated version 1.35, min compatibility version 1.34"
         );
-        let mut got = resolve_gates(&m(&[("AllAlpha", true)]), &k).unwrap();
+        let mut got = resolve_gates(
+            &m(&[("AllAlpha", true)]),
+            &k,
+            EMULATION_VERSION,
+            MIN_COMPATIBILITY_VERSION,
+        )
+        .unwrap();
         got.sort();
         assert_eq!(got, vec![("TestAlpha".to_string(), true)]);
     }
@@ -1904,7 +2065,13 @@ mod tests {
     #[test]
     fn specials_do_not_cross_prerelease() {
         let k = synthetic();
-        let mut got = resolve_gates(&m(&[("TestBeta", true), ("AllAlpha", false)]), &k).unwrap();
+        let mut got = resolve_gates(
+            &m(&[("TestBeta", true), ("AllAlpha", false)]),
+            &k,
+            EMULATION_VERSION,
+            MIN_COMPATIBILITY_VERSION,
+        )
+        .unwrap();
         got.sort();
         assert_eq!(
             got,
@@ -1913,9 +2080,14 @@ mod tests {
                 ("TestBeta".to_string(), true)
             ]
         );
-        assert!(resolve_gates(&m(&[("TestLockedFalse", true)]), &k)
-            .unwrap_err()
-            .contains("locked to false"));
+        assert!(resolve_gates(
+            &m(&[("TestLockedFalse", true)]),
+            &k,
+            EMULATION_VERSION,
+            MIN_COMPATIBILITY_VERSION
+        )
+        .unwrap_err()
+        .contains("locked to false"));
     }
 
     // "AllAlpha=banana" -> parse error, nothing applied.
@@ -2069,6 +2241,7 @@ mod tests {
             set_from_str("ServiceAccountTokenNodeBindingValidation=false").unwrap_err(),
             "cannot set feature gate ServiceAccountTokenNodeBindingValidation to false, feature is locked to true"
         );
+        reset_to_defaults(); // enabledRaw keeps the rejected key (feature_gate.go:446-453)
         assert_eq!(
             set_from_str("StructuredAuthenticationConfiguration=false").unwrap_err(),
             "cannot set feature gate StructuredAuthenticationConfiguration to false, feature is locked to true"
