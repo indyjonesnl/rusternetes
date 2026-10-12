@@ -5,11 +5,13 @@
 //! `getBindMountOptions` (`mount_linux.go:116`), `Mounter.Mount*`/`doMount`/
 //! `bindMountSensitive` and `Mounter.Unmount`/`checkUmountError`.
 //!
-//! Not ported (tracked in #3193): `UnmountWithForce`, `CleanupMountPoint`,
-//! `detectSystemd`/`detectSafeNotMountedBehavior` probing (the caller states
+//! Also ported for the nfs plugin (#3286): `UnmountWithForce`/`tryUnmount`/
+//! `forceUmount`, `CanSafelySkipMountPointCheck`, `IsLikelyNotMountPoint`
+//! (the `isLikelyNotMountPointStat` fallback, not the statx fast path) and
+//! `CleanupMountPoint`/`CleanupMountWithForce` (`mount_helper_common.go`).
+//!
+//! Not ported (tracked in #3193): `detectSystemd`/`detectSafeNotMountedBehavior` probing (the caller states
 //! `try_systemd`/`safe_not_mounted` explicitly), containerized mounter path.
-
-#![allow(dead_code)]
 
 use std::io;
 use std::process::Command;
@@ -219,6 +221,40 @@ fn detect_systemd() -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// `detectSafeNotMountedBehavior` (`mount_linux.go:307-331`): does `umount` of
+/// a path that is not mounted say "not mounted"? When it does, the mount point
+/// check before an unmount can be skipped. Process-global, so probed once.
+pub fn detect_safe_not_mounted_behavior() -> bool {
+    static SAFE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SAFE.get_or_init(|| {
+        // `os.MkdirTemp("", "kubelet-detect-safe-umount")`
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let dir = std::env::temp_dir().join(format!(
+            "kubelet-detect-safe-umount{}-{nanos}",
+            std::process::id()
+        ));
+        if std::fs::create_dir(&dir).is_err() {
+            return false;
+        }
+        let safe = match Command::new("umount").arg(&dir).output() {
+            Ok(out) if !out.status.success() => {
+                let output = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                output.contains(ERR_NOT_MOUNTED)
+            }
+            _ => false,
+        };
+        let _ = std::fs::remove_dir(&dir);
+        safe
+    })
 }
 
 /// Port of `mount.Mounter` (`mount_linux.go:60-70`) restricted to what the
@@ -441,6 +477,119 @@ impl Mounter {
         )
     }
 
+    /// `CanSafelySkipMountPointCheck` (`mount_linux.go:505-508`).
+    pub fn can_safely_skip_mount_point_check(&self) -> bool {
+        self.with_safe_not_mounted_behavior
+    }
+
+    /// `IsLikelyNotMountPoint` via `isLikelyNotMountPointStat`
+    /// (`mount_linux.go:443-458`), the fallback upstream takes when `statx` is
+    /// unsupported: a different device from the parent means a mount point.
+    pub fn is_likely_not_mount_point(&self, file: &str) -> io::Result<bool> {
+        use std::os::unix::fs::MetadataExt;
+        let st = std::fs::metadata(file)?;
+        let parent = std::path::Path::new(file.strip_suffix('/').unwrap_or(file))
+            .parent()
+            .map(|p| {
+                if p.as_os_str().is_empty() {
+                    std::path::Path::new(".")
+                } else {
+                    p
+                }
+            })
+            .unwrap_or_else(|| std::path::Path::new("/"));
+        let root = std::fs::metadata(parent)?;
+        Ok(st.dev() == root.dev())
+    }
+
+    /// `UnmountWithForce` (`mount_linux.go:411-423`): plain `umount`, then
+    /// `umount -f` once `umount_timeout` has elapsed.
+    pub fn unmount_with_force(
+        &self,
+        target: &str,
+        umount_timeout: std::time::Duration,
+    ) -> io::Result<()> {
+        match self.try_unmount(target, umount_timeout) {
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                tracing::info!("Timed out waiting for unmount of {target}, trying with -f");
+                self.force_umount(target)
+            }
+            other => other,
+        }
+    }
+
+    /// `tryUnmount` (`mount_linux.go:880-898`): `umount` bounded by a context
+    /// deadline; `TimedOut` stands in for `context.DeadlineExceeded`.
+    fn try_unmount(&self, target: &str, timeout: std::time::Duration) -> io::Result<()> {
+        use std::io::Read;
+        use std::process::Stdio;
+        tracing::debug!("Unmounting {target}");
+        let mut child = Command::new("umount")
+            .arg(target)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        // CombinedOutput: drain both pipes concurrently with the wait.
+        let mut out = child.stdout.take();
+        let mut err = child.stderr.take();
+        let reader = std::thread::spawn(move || {
+            let mut buf = String::new();
+            let mut tmp = Vec::new();
+            if let Some(o) = out.as_mut() {
+                let _ = o.read_to_end(&mut tmp);
+            }
+            if let Some(e) = err.as_mut() {
+                let _ = e.read_to_end(&mut tmp);
+            }
+            buf.push_str(&String::from_utf8_lossy(&tmp));
+            buf
+        });
+        let deadline = std::time::Instant::now() + timeout;
+        let status = loop {
+            if let Some(st) = child.try_wait()? {
+                break st;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "context deadline exceeded",
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let output = reader.join().unwrap_or_default();
+        if status.success() {
+            return Ok(());
+        }
+        check_umount_error(
+            target,
+            &output,
+            &status.to_string(),
+            self.with_safe_not_mounted_behavior,
+        )
+    }
+
+    /// `forceUmount` (`mount_linux.go:900-907`).
+    fn force_umount(&self, target: &str) -> io::Result<()> {
+        let out = Command::new("umount").args(["-f", target]).output()?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        check_umount_error(
+            target,
+            &output,
+            &out.status.to_string(),
+            self.with_safe_not_mounted_behavior,
+        )
+    }
+
     /// `Unmount` (`mount_linux.go:400-408`).
     pub fn unmount(&self, target: &str) -> io::Result<()> {
         tracing::debug!("Unmounting {target}");
@@ -459,6 +608,114 @@ impl Mounter {
             &out.status.to_string(),
             self.with_safe_not_mounted_behavior,
         )
+    }
+}
+
+/// `CleanupMountPoint` (`mount_helper_common.go:30-41`): unmount `mount_path`
+/// and delete the remaining directory if successful.
+pub fn cleanup_mount_point(
+    mount_path: &str,
+    mounter: &Mounter,
+    extensive_mount_point_check: bool,
+) -> io::Result<()> {
+    cleanup_impl(mount_path, mounter, extensive_mount_point_check, |m, p| {
+        m.unmount(p)
+    })
+}
+
+/// `CleanupMountWithForce` (`mount_helper_common.go:43-83`): as
+/// [`cleanup_mount_point`], but unmounts with [`Mounter::unmount_with_force`].
+pub fn cleanup_mount_with_force(
+    mount_path: &str,
+    mounter: &Mounter,
+    extensive_mount_point_check: bool,
+    umount_timeout: std::time::Duration,
+) -> io::Result<()> {
+    cleanup_impl(mount_path, mounter, extensive_mount_point_check, |m, p| {
+        m.unmount_with_force(p, umount_timeout)
+    })
+}
+
+/// The body `CleanupMountPoint`/`doCleanupMountPoint` and `CleanupMountWithForce`
+/// share (`mount_helper_common.go:30-120`); they differ only in the unmount call.
+fn cleanup_impl(
+    mount_path: &str,
+    mounter: &Mounter,
+    extensive: bool,
+    unmount: impl Fn(&Mounter, &str) -> io::Result<()>,
+) -> io::Result<()> {
+    let (exists, path_err) = super::mount_utils::path_exists(mount_path);
+    if !exists && path_err.is_none() {
+        tracing::warn!("Warning: mount cleanup skipped because path does not exist: {mount_path}");
+        return Ok(());
+    }
+    let corrupted = path_err
+        .as_ref()
+        .is_some_and(super::mount_utils::is_corrupted_mnt);
+    if let Some(e) = path_err {
+        if !corrupted {
+            return Err(io::Error::other(format!("Error checking path: {e}")));
+        }
+    }
+    if corrupted || mounter.can_safely_skip_mount_point_check() {
+        tracing::debug!(
+            "unmounting {mount_path:?} (corruptedMount: {corrupted}, mounterCanSkipMountPointChecks: {})",
+            mounter.can_safely_skip_mount_point_check()
+        );
+        unmount(mounter, mount_path)?;
+        return remove_path(mount_path);
+    }
+
+    // `if err != nil || notMnt { return err }`: not a mount point means it has
+    // just been removed.
+    if remove_path_if_not_mount_point(mount_path, mounter, extensive)? {
+        return Ok(());
+    }
+
+    tracing::debug!("{mount_path:?} is a mountpoint, unmounting");
+    unmount(mounter, mount_path)?;
+
+    // `if notMnt { return err }`: a check/remove error and "not a mount point"
+    // both return here; only a path that is still a mount point falls through.
+    if remove_path_if_not_mount_point(mount_path, mounter, extensive)? {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "failed to cleanup mount point {mount_path}"
+    )))
+}
+
+/// `removePathIfNotMountPoint` (`mount_helper_common.go:131-155`).
+fn remove_path_if_not_mount_point(
+    mount_path: &str,
+    mounter: &Mounter,
+    extensive: bool,
+) -> io::Result<bool> {
+    let checked = if extensive {
+        super::mount_utils::is_not_mount_point(mount_path)
+    } else {
+        mounter.is_likely_not_mount_point(mount_path)
+    };
+    match checked {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            tracing::debug!("{mount_path:?} does not exist");
+            Ok(true)
+        }
+        Err(e) => Err(e),
+        Ok(true) => {
+            tracing::debug!("{mount_path:?} is not a mountpoint, deleting");
+            std::fs::remove_dir(mount_path).map(|()| true)
+        }
+        Ok(false) => Ok(false),
+    }
+}
+
+/// `removePath` (`mount_helper_common.go:157-165`).
+fn remove_path(mount_path: &str) -> io::Result<()> {
+    tracing::debug!("Deleting path {mount_path:?}");
+    match std::fs::remove_dir(mount_path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
     }
 }
 
@@ -646,5 +903,45 @@ mod tests {
         assert!(e
             .to_string()
             .starts_with("unmount failed: exit 32\nUnmounting arguments: /t\nOutput: "));
+    }
+
+    // `CleanupMountPoint` / `CleanupMountWithForce` (`mount_helper_common.go`)
+    // on paths that are not mount points: a missing path is skipped, a plain
+    // directory is removed.
+    #[test]
+    fn cleanup_skips_a_missing_path_and_removes_a_plain_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = Mounter::new("", false, false);
+        let missing = tmp.path().join("missing").to_string_lossy().to_string();
+        cleanup_mount_point(&missing, &m, true).unwrap();
+        cleanup_mount_with_force(&missing, &m, true, std::time::Duration::from_secs(1)).unwrap();
+
+        let dir = tmp.path().join("d");
+        std::fs::create_dir(&dir).unwrap();
+        cleanup_mount_point(&dir.to_string_lossy(), &m, true).unwrap();
+        assert!(!dir.exists());
+
+        std::fs::create_dir(&dir).unwrap();
+        cleanup_mount_with_force(
+            &dir.to_string_lossy(),
+            &m,
+            false,
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(!dir.exists());
+    }
+
+    // `removePathIfNotMountPoint`: a non-empty directory that is not a mount
+    // point surfaces `os.Remove`'s error.
+    #[test]
+    fn cleanup_surfaces_a_remove_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = Mounter::new("", false, false);
+        let dir = tmp.path().join("d");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("f"), b"x").unwrap();
+        assert!(cleanup_mount_point(&dir.to_string_lossy(), &m, true).is_err());
+        assert!(dir.exists());
     }
 }

@@ -213,7 +213,7 @@ pub fn is_corrupted_mnt(err: &io::Error) -> bool {
 }
 
 /// `PathExists` (`mount_helper_unix.go`): `(exists, err)`.
-fn path_exists(path: &str) -> (bool, Option<io::Error>) {
+pub(crate) fn path_exists(path: &str) -> (bool, Option<io::Error>) {
     match std::fs::metadata(path) {
         Ok(_) => (true, None),
         Err(e) if e.kind() == io::ErrorKind::NotFound => (false, None),

@@ -263,6 +263,48 @@ pub fn fs_group_from(pod: &Pod) -> Option<i64> {
         .and_then(|sc| sc.fs_group)
 }
 
+/// `v1.MountOptionAnnotation` (`staging/src/k8s.io/api/core/v1/annotation_key_constants.go`).
+pub const MOUNT_OPTION_ANNOTATION: &str = "volume.beta.kubernetes.io/mount-options";
+
+/// Port of `MountOptionFromSpec` (`pkg/volume/util/util.go:187-203`): the
+/// PersistentVolume's mount options (beta annotation first, then
+/// `spec.mountOptions`) joined with `options`; `options` alone for a spec
+/// without a PV or without mount options.
+pub fn mount_option_from_spec(spec: &Spec<'_>, options: &[String]) -> Vec<String> {
+    if let Some(pv) = spec.persistent_volume {
+        // Use beta annotation first
+        if let Some(mo) = pv
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get(MOUNT_OPTION_ANNOTATION))
+        {
+            let mo_list: Vec<String> = mo.split(',').map(str::to_string).collect();
+            return join_mount_options(&mo_list, options);
+        }
+        if let Some(mo) = pv.spec.mount_options.as_ref().filter(|m| !m.is_empty()) {
+            return join_mount_options(mo, options);
+        }
+    }
+    options.to_vec()
+}
+
+/// Port of `JoinMountOptions` (`pkg/volume/util/util.go:205-219`): the union of
+/// both lists, sorted and de-duplicated (`sets.List`); empty user options are
+/// dropped, empty system options are kept.
+pub fn join_mount_options(user_options: &[String], system_options: &[String]) -> Vec<String> {
+    let mut all: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for o in user_options {
+        if !o.is_empty() {
+            all.insert(o.clone());
+        }
+    }
+    for o in system_options {
+        all.insert(o.clone());
+    }
+    all.into_iter().collect()
+}
+
 /// The `volume.ReconstructedVolume{Spec: volume.NewSpecFromVolume(&v1.Volume{
 /// Name: name, VolumeSource: ...})}` every non-CSI `ConstructVolumeSpec`
 /// returns. `source` is the one-key JSON object of the `VolumeSource` field.
