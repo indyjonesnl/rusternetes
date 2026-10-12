@@ -22,9 +22,8 @@
 //! The `nonstructuralschema` and `apiapproval` controllers live in
 //! `condition_controllers.rs`.
 //!
-//! Not modelled: the finalizer's `OverlappingBuiltInResources` skip. The
-//! finalizer's wait for the instances to be gone is ported, and instances are
-//! deleted through their store, so one holding a finalizer keeps the CRD
+//! The finalizer's wait for the instances to be gone is ported, and instances
+//! are deleted through their store, so one holding a finalizer keeps the CRD
 //! Terminating until it is really gone.
 
 use std::collections::HashSet;

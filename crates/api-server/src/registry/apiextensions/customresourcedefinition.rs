@@ -921,7 +921,19 @@ impl CrdRest {
 
         // Now we can start deleting items. No need to delete if not
         // established.
-        let terminating = if is_crd_condition_true(&crd, ESTABLISHED) {
+        // "Skip deletion, explain why, and proceed to remove the finalizer and
+        // delete the CRD" (crd_finalizer.go:140-146).
+        let terminating = if finalizer_queue::overlapping_built_in_resource(
+            &crd.spec.group,
+            &crd.spec.names.plural,
+        ) {
+            condition(
+                TERMINATING,
+                "False",
+                "OverlappingBuiltInResource",
+                "instances overlap with built-in resources in storage",
+            )
+        } else if is_crd_condition_true(&crd, ESTABLISHED) {
             match self.delete_instances(&crd).await {
                 Ok(()) => condition(
                     TERMINATING,

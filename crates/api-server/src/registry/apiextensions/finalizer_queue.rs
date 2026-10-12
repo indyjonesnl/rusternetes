@@ -135,6 +135,17 @@ impl FinalizerQueue {
     }
 }
 
+/// `OverlappingBuiltInResources` (crd_finalizer.go:50-56): the built-in
+/// resources whose storage a CRD of the same group and plural would share, so
+/// the finalizer must not delete the "instances" it finds there.
+pub fn overlapping_built_in_resource(group: &str, plural: &str) -> bool {
+    matches!(
+        (group, plural),
+        ("apiregistration.k8s.io", "apiservices")
+            | ("apiextensions.k8s.io", "customresourcedefinitions")
+    )
+}
+
 /// `addCustomResourceDefinition` (crd_finalizer.go:332-339): "only queue
 /// deleted things".
 pub fn add_event_enqueues(crd: &CustomResourceDefinition) -> bool {
@@ -189,6 +200,24 @@ mod tests {
         c.metadata.deletion_timestamp = Some(chrono::Utc::now());
         c.metadata.finalizers = Some(vec![CUSTOM_RESOURCE_CLEANUP_FINALIZER.into()]);
         c
+    }
+
+    /// `OverlappingBuiltInResources` (crd_finalizer.go:50-56).
+    #[test]
+    fn overlapping_built_in_resources_match_upstream() {
+        assert!(overlapping_built_in_resource(
+            "apiregistration.k8s.io",
+            "apiservices"
+        ));
+        assert!(overlapping_built_in_resource(
+            "apiextensions.k8s.io",
+            "customresourcedefinitions"
+        ));
+        assert!(!overlapping_built_in_resource("example.com", "widgets"));
+        assert!(!overlapping_built_in_resource(
+            "apiextensions.k8s.io",
+            "apiservices"
+        ));
     }
 
     /// `AddFunc` queues only deleted CRDs that still hold the finalizer.
