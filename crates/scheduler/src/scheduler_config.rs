@@ -96,6 +96,106 @@ impl VolumeBindingArgs {
     }
 }
 
+/// `config.DefaultPreemptionArgs` / `configv1.DefaultPreemptionArgs`
+/// (pkg/scheduler/apis/config/types_pluginargs.go).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DefaultPreemptionArgs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_candidate_nodes_percentage: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_candidate_nodes_absolute: Option<i32>,
+}
+
+impl DefaultPreemptionArgs {
+    /// `SetDefaults_DefaultPreemptionArgs` (v1/defaults.go:177-184).
+    pub fn set_defaults(&mut self) {
+        self.min_candidate_nodes_percentage.get_or_insert(10);
+        self.min_candidate_nodes_absolute.get_or_insert(100);
+    }
+
+    /// `ValidateDefaultPreemptionArgs` (validation_pluginargs.go:41-57), with
+    /// `validateMinCandidateNodesPercentage` (:61-66) and
+    /// `validateMinCandidateNodesAbsolute` (:70-75). Run after `set_defaults`.
+    pub fn validate(&self, path: &Path) -> ErrorList {
+        let mut errs = ErrorList::new();
+        let pct = self.min_candidate_nodes_percentage.unwrap_or(0);
+        let abs = self.min_candidate_nodes_absolute.unwrap_or(0);
+        let pct_path = path.child("minCandidateNodesPercentage");
+        let abs_path = path.child("minCandidateNodesAbsolute");
+        if !(0..=100).contains(&pct) {
+            errs.push(field::Error::invalid(
+                &pct_path,
+                pct,
+                "not in valid range [0, 100]",
+            ));
+        }
+        if abs < 0 {
+            errs.push(field::Error::invalid(
+                &abs_path,
+                abs,
+                "not in valid range [0, inf)",
+            ));
+        }
+        if pct == 0 && abs == 0 {
+            errs.push(field::Error::invalid(
+                &pct_path,
+                pct,
+                "cannot be zero at the same time as minCandidateNodesAbsolute",
+            ));
+            errs.push(field::Error::invalid(
+                &abs_path,
+                abs,
+                "cannot be zero at the same time as minCandidateNodesPercentage",
+            ));
+        }
+        errs
+    }
+}
+
+/// `config.InterPodAffinityArgs` / `configv1.InterPodAffinityArgs`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InterPodAffinityArgs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_pod_affinity_weight: Option<i32>,
+}
+
+impl InterPodAffinityArgs {
+    /// `SetDefaults_InterPodAffinityArgs` (v1/defaults.go:186-190).
+    pub fn set_defaults(&mut self) {
+        self.hard_pod_affinity_weight.get_or_insert(1);
+    }
+
+    /// `ValidateInterPodAffinityArgs` / `validateHardPodAffinityWeight`
+    /// (validation_pluginargs.go:88-104). Run after `set_defaults`.
+    pub fn validate(&self, path: &Path) -> ErrorList {
+        let w = self.hard_pod_affinity_weight.unwrap_or(0);
+        if (0..=100).contains(&w) {
+            ErrorList::new()
+        } else {
+            vec![field::Error::invalid(
+                &path.child("hardPodAffinityWeight"),
+                w,
+                "not in valid range [0, 100]",
+            )]
+        }
+    }
+}
+
+/// `v1.SchemeGroupVersion.String()` (pkg/scheduler/apis/config/v1/register.go);
+/// the only config version served, so it is both the removed-plugin version
+/// and the configuration's version in `isPluginInvalid` messages.
+const CONFIG_API_VERSION: &str = "kubescheduler.config.k8s.io/v1";
+
+/// `invalidPluginsByVersion` for v1 (validation.go:104-114).
+const INVALID_PLUGINS_V1: [&str; 4] = [
+    "AzureDiskLimits",
+    "CinderLimits",
+    "EBSLimits",
+    "GCEPDLimits",
+];
+
 /// The slice of `KubeSchedulerConfiguration` the scheduler reads
 /// (`profiles[].pluginConfig[]`, pkg/scheduler/apis/config/types.go).
 #[derive(Debug, Default, Deserialize)]
@@ -137,7 +237,7 @@ pub fn volume_binding_args_from_config(
 ) -> Result<VolumeBindingArgs, String> {
     let cfg: KubeSchedulerConfiguration =
         serde_yaml::from_str(doc).map_err(|e| format!("invalid scheduler config: {e}"))?;
-    let mut errs = validate_profiles(&cfg);
+    let mut errs = validate_profiles(&cfg)?;
     let mut args = VolumeBindingArgs::default();
     let mut path = Path::new("profiles").index(0);
     if let Some(profile) = cfg.profiles.first() {
@@ -172,7 +272,7 @@ pub fn volume_binding_args_from_config(
 /// `seenPluginConfig`). The default name is applied only to a single profile
 /// (v1/defaults.go:116-119 SetDefaults_KubeSchedulerConfiguration), and an
 /// empty profile list gets one default profile (:111-113).
-fn validate_profiles(cfg: &KubeSchedulerConfiguration) -> ErrorList {
+fn validate_profiles(cfg: &KubeSchedulerConfiguration) -> Result<ErrorList, String> {
     let profiles_path = Path::new("profiles");
     let mut errs = ErrorList::new();
     let single = cfg.profiles.len() <= 1;
@@ -193,13 +293,38 @@ fn validate_profiles(cfg: &KubeSchedulerConfiguration) -> ErrorList {
         ));
         let mut seen: Vec<&str> = Vec::new();
         for (j, pc) in profile.plugin_config.iter().enumerate() {
+            let pc_path = path.child("pluginConfig").index(j);
             if seen.contains(&pc.name.as_str()) {
-                errs.push(field::Error::duplicate(
-                    &path.child("pluginConfig").index(j),
-                    pc.name.as_str(),
-                ));
+                errs.push(field::Error::duplicate(&pc_path, pc.name.as_str()));
             } else {
                 seen.push(&pc.name);
+            }
+            if INVALID_PLUGINS_V1.contains(&pc.name.as_str()) {
+                errs.push(field::Error::invalid(
+                    &pc_path,
+                    pc.name.as_str(),
+                    format!(
+                        "was invalid in version \"{CONFIG_API_VERSION}\" (KubeSchedulerConfiguration is version \"{CONFIG_API_VERSION}\")"
+                    ),
+                ));
+                continue;
+            }
+            let args_path = pc_path.child("args");
+            // The args are decoded by plugin name (scheme/scheme.go), so the
+            // "has to match plugin args" type-mismatch branch
+            // (validation.go:199-203) is unreachable here.
+            match pc.name.as_str() {
+                "DefaultPreemption" => {
+                    let mut a: DefaultPreemptionArgs = decode_args(pc, &args_path)?;
+                    a.set_defaults();
+                    errs.extend(a.validate(&args_path));
+                }
+                "InterPodAffinity" => {
+                    let mut a: InterPodAffinityArgs = decode_args(pc, &args_path)?;
+                    a.set_defaults();
+                    errs.extend(a.validate(&args_path));
+                }
+                _ => {}
             }
         }
         if existing.contains(&name) {
@@ -216,7 +341,18 @@ fn validate_profiles(cfg: &KubeSchedulerConfiguration) -> ErrorList {
         &Path::new("percentageOfNodesToScore"),
         cfg.percentage_of_nodes_to_score,
     ));
-    errs
+    Ok(errs)
+}
+
+fn decode_args<T: serde::de::DeserializeOwned + Default>(
+    pc: &PluginConfig,
+    path: &Path,
+) -> Result<T, String> {
+    match &pc.args {
+        Some(v) => serde_yaml::from_value(v.clone())
+            .map_err(|e| format!("{path}: invalid {} args: {e}", pc.name)),
+        None => Ok(T::default()),
+    }
 }
 
 /// `validatePercentageOfNodesToScore` (validation.go:86-92).
