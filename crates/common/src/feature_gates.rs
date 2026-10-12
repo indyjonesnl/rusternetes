@@ -861,22 +861,100 @@ pub enum PreRelease {
     Deprecated,
 }
 
+/// `k8s.io/apimachinery/pkg/util/version.Version` reduced to major.minor
+/// (`MajorMinor`; patch/pre-release are never used by gate specs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Version {
+    pub major: u32,
+    pub minor: u32,
+}
+
+impl Version {
+    pub const fn major_minor(major: u32, minor: u32) -> Self {
+        Self { major, minor }
+    }
+
+    /// `SubtractMinor` / `OffsetMinor` (apimachinery/pkg/util/version/version.go:259-276):
+    /// the minor saturates at 0.
+    pub fn subtract_minor(self, diff: u32) -> Self {
+        Self::major_minor(self.major, self.minor.saturating_sub(diff))
+    }
+}
+
+impl std::fmt::Display for Version {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.major, self.minor)
+    }
+}
+
+/// `FeatureSpec` (feature_gate.go:74-110) reduced to the fields read by
+/// [`feature_spec_at_emulation_and_min_compat_version`] and `unsafeSetFromMap`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeatureSpec {
+    pub default: bool,
+    pub lock_to_default: bool,
+    pub pre_release: PreRelease,
+    pub version: Version,
+    pub min_compatibility_version: Option<Version>,
+}
+
+/// `featureSpecAtEmulationAndMinCompatVersion` (feature_gate.go:882-902).
+/// `specs` must be sorted ascending by `version` (`sort.Sort(VersionedSpecs)`).
+pub fn feature_spec_at_emulation_and_min_compat_version(
+    specs: &[FeatureSpec],
+    emulation_version: Version,
+    min_compatibility_version: Option<Version>,
+) -> FeatureSpec {
+    let min_compatibility_version =
+        min_compatibility_version.unwrap_or_else(|| emulation_version.subtract_minor(1));
+    for spec in specs.iter().rev() {
+        if spec.version > emulation_version {
+            continue;
+        }
+        if let Some(spec_min) = spec.min_compatibility_version {
+            if min_compatibility_version < spec_min {
+                continue;
+            }
+        }
+        return *spec;
+    }
+    FeatureSpec {
+        default: false,
+        lock_to_default: false,
+        pre_release: PreRelease::PreAlpha,
+        version: Version::major_minor(0, 0),
+        min_compatibility_version: None,
+    }
+}
+
 /// Name of the special "all alpha gates" toggle (feature_gate.go:51).
 const ALL_ALPHA_GATE: &str = "AllAlpha";
 /// Name of the special "all beta gates" toggle (feature_gate.go:57).
 const ALL_BETA_GATE: &str = "AllBeta";
 /// Emulation version and its min-compatibility version (emulation - 1 minor,
 /// `NewVersionedFeatureGate` feature_gate.go:305-308) quoted by the PreAlpha error.
-const EMULATION_VERSION: &str = "1.35";
-const MIN_COMPATIBILITY_VERSION: &str = "1.34";
+const EMULATION_VERSION: Version = Version::major_minor(1, 35);
+const MIN_COMPATIBILITY_VERSION: Version = Version::major_minor(1, 34);
 
 /// One known gate as seen by [`resolve_gates`]; the model of upstream's
 /// `known` map entry reduced to what `unsafeSetFromMap` reads.
 struct KnownGate {
     name: String,
-    pre_release: PreRelease,
-    default: bool,
-    locked_to_default: bool,
+    /// `VersionedSpecs`, ascending by version. Empty = no spec at or below any
+    /// emulation version, i.e. PreAlpha.
+    specs: Vec<FeatureSpec>,
+}
+
+impl KnownGate {
+    /// `featureSpecAtEmulationAndMinCompatVersion(known[key], emulationVersion,
+    /// minCompatibilityVersion)` (feature_gate.go:387).
+    fn spec(&self) -> FeatureSpec {
+        feature_spec_at_emulation_and_min_compat_version(
+            &self.specs,
+            EMULATION_VERSION,
+            Some(MIN_COMPATIBILITY_VERSION),
+        )
+    }
 }
 
 fn known_gates() -> Vec<KnownGate> {
@@ -884,9 +962,19 @@ fn known_gates() -> Vec<KnownGate> {
         .iter()
         .map(|f| KnownGate {
             name: format!("{f:?}"),
-            pre_release: f.prerelease(),
-            default: f.default_enabled(),
-            locked_to_default: f.locked_to_default(),
+            // Gap (#3232): per-gate introduction versions are not modelled, so
+            // the single modelled spec (the one at v1.35) is valid from 0.0.
+            specs: if f.prerelease() == PreRelease::PreAlpha {
+                vec![]
+            } else {
+                vec![FeatureSpec {
+                    default: f.default_enabled(),
+                    lock_to_default: f.locked_to_default(),
+                    pre_release: f.prerelease(),
+                    version: Version::major_minor(0, 0),
+                    min_compatibility_version: None,
+                }]
+            },
         })
         .collect()
 }
@@ -927,7 +1015,7 @@ pub fn set_from_str(value: &str) -> Result<(), String> {
 /// After the per-gate pass, the dependency check (:418-434) runs against the
 /// resulting state (see [`check_dependencies`]).
 ///
-/// Gap: emulation versions are not modelled (tracked separately).
+/// Gap: per-gate introduction versions and `--emulated-version` are not modelled (#3232).
 fn set_from_map(m: &[(String, bool)]) -> Result<(), String> {
     let resolved = resolve_gates(m, &known_gates())?;
     check_dependencies(|f| {
@@ -1141,10 +1229,11 @@ fn resolve_gates(m: &[(String, bool)], known: &[KnownGate]) -> Result<Vec<(Strin
         }
         // The specials are never locked (default false, Alpha/Beta spec).
         if let Some(g) = gate {
-            if g.locked_to_default && g.default != *v {
+            let spec = g.spec();
+            if spec.lock_to_default && spec.default != *v {
                 errs.push(format!(
                     "cannot set feature gate {k} to {v}, feature is locked to {}",
-                    g.default
+                    spec.default
                 ));
                 continue;
             }
@@ -1153,7 +1242,7 @@ fn resolve_gates(m: &[(String, bool)], known: &[KnownGate]) -> Result<Vec<(Strin
             specials.push((pre, *v));
             continue;
         }
-        if gate.is_some_and(|g| g.pre_release == PreRelease::PreAlpha) {
+        if gate.is_some_and(|g| g.spec().pre_release == PreRelease::PreAlpha) {
             errs.push(format!(
                 "cannot set feature gate {k} to {v}, feature is PreAlpha at emulated version {EMULATION_VERSION}, min compatibility version {MIN_COMPATIBILITY_VERSION}"
             ));
@@ -1168,7 +1257,7 @@ fn resolve_gates(m: &[(String, bool)], known: &[KnownGate]) -> Result<Vec<(Strin
     }
     for (pre, val) in specials {
         for g in known {
-            if g.pre_release == pre && !enabled.iter().any(|(n, _)| *n == g.name) {
+            if g.spec().pre_release == pre && !enabled.iter().any(|(n, _)| *n == g.name) {
                 enabled.push((g.name.clone(), val));
             }
         }
@@ -1377,9 +1466,17 @@ mod tests {
     fn synthetic() -> Vec<KnownGate> {
         let g = |n: &str, pre, locked| KnownGate {
             name: n.into(),
-            pre_release: pre,
-            default: false,
-            locked_to_default: locked,
+            specs: if pre == PreRelease::PreAlpha {
+                vec![]
+            } else {
+                vec![FeatureSpec {
+                    default: false,
+                    lock_to_default: locked,
+                    pre_release: pre,
+                    version: Version::major_minor(0, 0),
+                    min_compatibility_version: None,
+                }]
+            },
         };
         vec![
             g("TestAlpha", PreRelease::Alpha, false),
@@ -1405,6 +1502,55 @@ mod tests {
         let mut got = resolve_gates(&m(&[("AllAlpha", true)]), &k).unwrap();
         got.sort();
         assert_eq!(got, vec![("TestAlpha".to_string(), true)]);
+    }
+
+    // feature_gate_test.go:1684-1745 TestFeatureSpecAtEmulationAndMinCompatVersion.
+    #[test]
+    fn feature_spec_at_emulation_and_min_compat_version_table() {
+        let v = Version::major_minor;
+        let spec = |ver, default, pre_release, min| FeatureSpec {
+            default,
+            lock_to_default: false,
+            pre_release,
+            version: ver,
+            min_compatibility_version: min,
+        };
+        let alpha = spec(v(1, 25), false, PreRelease::Alpha, None);
+        let beta = spec(v(1, 25), false, PreRelease::Beta, Some(v(1, 25)));
+        let ga = spec(v(1, 29), true, PreRelease::Ga, Some(v(1, 25)));
+        let pre = spec(v(0, 0), false, PreRelease::PreAlpha, None);
+        let specs = [alpha, beta, ga];
+        let cases = [
+            (v(1, 30), None, ga),
+            (v(1, 29), None, ga),
+            (v(1, 28), None, beta),
+            (v(1, 26), None, beta),
+            (v(1, 25), Some(v(1, 25)), beta),
+            (v(1, 25), None, alpha),
+            (v(1, 24), None, pre),
+            (v(1, 26), Some(v(1, 23)), alpha),
+            (v(1, 29), Some(v(1, 23)), alpha),
+        ];
+        for (i, (emu, min, want)) in cases.into_iter().enumerate() {
+            assert_eq!(
+                feature_spec_at_emulation_and_min_compat_version(&specs, emu, min),
+                want,
+                "case {i}: emulation {emu}"
+            );
+        }
+    }
+
+    // version.go:259-276: SubtractMinor saturates at 0.
+    #[test]
+    fn subtract_minor_saturates() {
+        assert_eq!(
+            Version::major_minor(1, 35).subtract_minor(1).to_string(),
+            "1.34"
+        );
+        assert_eq!(
+            Version::major_minor(1, 0).subtract_minor(1).to_string(),
+            "1.0"
+        );
     }
 
     // "TestBeta=true,AllAlpha=false" and "TestAlpha=true,AllBeta=false".
