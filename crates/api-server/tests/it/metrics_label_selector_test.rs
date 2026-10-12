@@ -80,11 +80,63 @@ async fn pod_metrics_list_honours_label_selector() {
 async fn node_metrics_list_honours_label_selector() {
     let api = TestApiServer::new();
     seed(&api).await;
+    // Only nodes with a published sample are listed (pkg/storage/node.go).
+    publish_node_sample(&api, "n-web").await;
+    publish_node_sample(&api, "n-other").await;
     let (s, b) = api
         .get("/apis/metrics.k8s.io/v1beta1/nodes?labelSelector=role%3Dweb")
         .await;
     assert_eq!(s.as_u16(), 200, "{b}");
     assert_eq!(names(&b), vec!["n-web"]);
+}
+
+/// Publish a kubelet-style (label-less) NodeMetrics sample for `name`.
+async fn publish_node_sample(api: &TestApiServer, name: &str) {
+    use rusternetes_storage::Storage;
+    let sample: rusternetes_common::resources::NodeMetrics = serde_json::from_value(json!({
+        "apiVersion": "metrics.k8s.io/v1beta1",
+        "kind": "NodeMetrics",
+        "metadata": {"name": name},
+        "timestamp": "2026-10-12T00:00:00Z",
+        "window": "30s",
+        "usage": {"cpu": "10m", "memory": "10Mi"}
+    }))
+    .unwrap();
+    api.storage
+        .create(&format!("/registry/metrics.k8s.io/nodes/{name}"), &sample)
+        .await
+        .unwrap();
+}
+
+/// #3327: metrics-server `pkg/storage/node.go` `GetMetrics` does `continue`
+/// for a node with no stored point, and `pkg/api/node.go` `List` returns
+/// exactly those results: a node without a sample is absent from the list,
+/// not listed with zero usage. A node WITH a sample still honours the
+/// selector and carries the node's labels.
+#[tokio::test]
+async fn node_metrics_list_omits_nodes_without_sample() {
+    let api = TestApiServer::new();
+    seed(&api).await;
+    publish_node_sample(&api, "n-web").await;
+    let (s, b) = api.get("/apis/metrics.k8s.io/v1beta1/nodes").await;
+    assert_eq!(s.as_u16(), 200, "{b}");
+    assert_eq!(names(&b), vec!["n-web"], "{b}");
+    assert_eq!(b["items"][0]["metadata"]["labels"]["role"], "web", "{b}");
+
+    let (_, b) = api
+        .get("/apis/metrics.k8s.io/v1beta1/nodes?labelSelector=role%3Ddb")
+        .await;
+    assert!(names(&b).is_empty(), "{b}");
+
+    let (s, b) = api.get("/apis/metrics.k8s.io/v1beta1/nodes/n-web").await;
+    assert_eq!(s.as_u16(), 200, "{b}");
+
+    // No node has a sample: an empty list, not one zero-usage entry per node.
+    let bare = TestApiServer::new();
+    seed(&bare).await;
+    let (s, b) = bare.get("/apis/metrics.k8s.io/v1beta1/nodes").await;
+    assert_eq!(s.as_u16(), 200, "{b}");
+    assert!(names(&b).is_empty(), "{b}");
 }
 
 /// #3327: metrics-server `pkg/api/node.go` `Get` returns
