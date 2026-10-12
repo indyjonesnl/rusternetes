@@ -130,7 +130,11 @@ impl BeginCreate<ValidatingAdmissionPolicyBinding> for ParamRefAuthz {
             let errs = authorize_param_ref(ctx, self.authorizer.as_ref(), &self.storage, obj, None)
                 .await?;
             if !errs.is_empty() {
-                return Err(Error::Invalid(errs));
+                return Err(with_group_kind(
+                    Error::Invalid(errs),
+                    "admissionregistration.k8s.io",
+                    obj,
+                ));
             }
         }
         Ok(Box::new(Noop))
@@ -151,7 +155,11 @@ impl BeginUpdate<ValidatingAdmissionPolicyBinding> for ParamRefAuthz {
                 authorize_param_ref(ctx, self.authorizer.as_ref(), &self.storage, obj, Some(old))
                     .await?;
             if !errs.is_empty() {
-                return Err(Error::Invalid(errs));
+                return Err(with_group_kind(
+                    Error::Invalid(errs),
+                    "admissionregistration.k8s.io",
+                    obj,
+                ));
             }
         }
         Ok(Box::new(Noop))

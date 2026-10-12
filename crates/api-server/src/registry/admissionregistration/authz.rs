@@ -19,6 +19,12 @@
 //! the built-in kinds and reads the CustomResourceDefinitions in storage for
 //! the rest. A kind it cannot resolve is authorized on resource `*`, which is
 //! what upstream does when `Resolve` fails.
+//!
+//! The hooks return the denial as `errors.NewInvalid(<kind>.<group>, name, errs)`:
+//! the strategies append `field.Forbidden(spec.paramKind|paramRef, err.Error())`
+//! (validatingadmissionpolicy/strategy.go:87-89, :113-115; the binding's and the
+//! mutating twins' likewise) and `BeforeCreate`/`BeforeUpdate` wrap the list
+//! (rest/create.go, rest/update.go; errors.go `NewInvalid`).
 
 use rusternetes_common::auth::UserInfo;
 use rusternetes_common::authz::{Authorizer, Decision, RequestAttributes};

@@ -134,7 +134,11 @@ impl BeginCreate<MutatingAdmissionPolicyBinding> for ParamRefAuthz {
             )
             .await?;
             if !errs.is_empty() {
-                return Err(Error::Invalid(errs));
+                return Err(with_group_kind(
+                    Error::Invalid(errs),
+                    "admissionregistration.k8s.io",
+                    obj,
+                ));
             }
         }
         Ok(Box::new(Noop))
@@ -160,7 +164,11 @@ impl BeginUpdate<MutatingAdmissionPolicyBinding> for ParamRefAuthz {
             )
             .await?;
             if !errs.is_empty() {
-                return Err(Error::Invalid(errs));
+                return Err(with_group_kind(
+                    Error::Invalid(errs),
+                    "admissionregistration.k8s.io",
+                    obj,
+                ));
             }
         }
         Ok(Box::new(Noop))

@@ -25,8 +25,8 @@ use crate::registry::generic::store::{
 use crate::registry::generic::Store;
 use crate::registry::rbac::policybased::Noop;
 use crate::registry::rest::{
-    reset_object_meta_for_status, GroupResource, NamespaceScopedStrategy, RequestContext,
-    RestCreateStrategy, RestDeleteStrategy, RestUpdateStrategy,
+    reset_object_meta_for_status, with_group_kind, GroupResource, NamespaceScopedStrategy,
+    RequestContext, RestCreateStrategy, RestDeleteStrategy, RestUpdateStrategy,
 };
 
 /// `SetObjectDefaults_ValidatingAdmissionPolicy`
@@ -182,7 +182,11 @@ impl BeginCreate<ValidatingAdmissionPolicy> for ParamKindAuthz {
             let errs =
                 authorize_param_kind(ctx, self.authorizer.as_ref(), &self.storage, obj, None).await;
             if !errs.is_empty() {
-                return Err(Error::Invalid(errs));
+                return Err(with_group_kind(
+                    Error::Invalid(errs),
+                    "admissionregistration.k8s.io",
+                    obj,
+                ));
             }
         }
         Ok(Box::new(Noop))
@@ -203,7 +207,11 @@ impl BeginUpdate<ValidatingAdmissionPolicy> for ParamKindAuthz {
                 authorize_param_kind(ctx, self.authorizer.as_ref(), &self.storage, obj, Some(old))
                     .await;
             if !errs.is_empty() {
-                return Err(Error::Invalid(errs));
+                return Err(with_group_kind(
+                    Error::Invalid(errs),
+                    "admissionregistration.k8s.io",
+                    obj,
+                ));
             }
         }
         Ok(Box::new(Noop))
@@ -290,7 +298,12 @@ mod invalid_status_tests {
         assert_eq!(d.name.as_deref(), Some("foo"));
 
         let Err(Error::Status(st)) = hook
-            .begin_update(&ctx, &mut obj.clone(), &mut ValidatingAdmissionPolicy::new("foo"), &UpdateOptions::default())
+            .begin_update(
+                &ctx,
+                &mut obj.clone(),
+                &mut ValidatingAdmissionPolicy::new("foo"),
+                &UpdateOptions::default(),
+            )
             .await
         else {
             panic!("expected a Status error from begin_update")
