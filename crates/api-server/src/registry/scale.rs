@@ -198,3 +198,68 @@ impl<P: Object> RestStorage<Scale> for ScaleRest<P> {
         Ok((self.to_scale(&obj)?, false))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::apps::deployment::new_scale_rest;
+    use rusternetes_common::resources::Deployment;
+    use std::sync::Arc;
+
+    /// A request whose new Scale is fixed.
+    struct Fixed(Scale);
+
+    #[async_trait]
+    impl UpdatedObjectInfo<Scale> for Fixed {
+        fn preconditions(&self) -> Option<Preconditions> {
+            None
+        }
+        async fn updated_object(&self, _: &RequestContext, _: Option<&Scale>) -> Result<Scale> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// storage.go:455-458: `errors.NewInvalid(autoscaling.Kind("Scale"),
+    /// deployment.Name, errs)` — the Status names the Scale kind in the
+    /// autoscaling group and the parent's name, not a bare aggregate.
+    #[tokio::test]
+    async fn invalid_scale_is_a_new_invalid_status_for_autoscaling_scale() {
+        let rest = new_scale_rest(Arc::new(StorageBackend::Memory(Arc::new(
+            rusternetes_storage::MemoryStorage::new(),
+        ))));
+        let deployment: Deployment = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "web", "namespace": "default"},
+            "spec": {"replicas": 1, "selector": {"matchLabels": {"a": "b"}},
+                     "template": {"metadata": {"labels": {"a": "b"}}, "spec": {"containers": []}}}
+        }))
+        .unwrap();
+        let mut scale = (rest.scalable.to_scale)(&deployment).unwrap();
+        scale.spec.replicas = -1;
+        let info = ScaleUpdatedObjectInfo {
+            name: "web",
+            request: &Fixed(scale),
+            rest: &rest,
+        };
+        let err = info
+            .updated_object(&RequestContext::new(Some("default")), Some(&deployment))
+            .await
+            .unwrap_err();
+        let Error::Status(st) = err else {
+            panic!("expected a Status, got {err:?}")
+        };
+        assert_eq!(st.code, Some(422));
+        assert_eq!(st.reason.as_deref(), Some("Invalid"));
+        let d = st.details.expect("details");
+        assert_eq!(d.kind.as_deref(), Some("Scale"));
+        assert_eq!(d.group.as_deref(), Some("autoscaling"));
+        assert_eq!(d.name.as_deref(), Some("web"));
+        assert!(
+            st.message
+                .as_deref()
+                .unwrap()
+                .starts_with(r#"Scale.autoscaling "web" is invalid: "#),
+            "{:?}",
+            st.message
+        );
+    }
+}
