@@ -85,7 +85,15 @@ impl<P: Object> UpdatedObjectInfo<P> for ScaleUpdatedObjectInfo<'_, P> {
 
         let errs = validate_scale(&scale);
         if !errs.is_empty() {
-            return Err(Error::Invalid(errs));
+            // storage.go:455-458: `errors.NewInvalid(autoscaling.Kind("Scale"),
+            // deployment.Name, errs)`; the other three resources' stores do
+            // the same with their own object's name.
+            return Err(Error::new_invalid(
+                "autoscaling",
+                "Scale",
+                &obj.metadata().name,
+                errs,
+            ));
         }
 
         // "validate precondition if specified (resourceVersion matching is
