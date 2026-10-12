@@ -957,24 +957,32 @@ impl KnownGate {
     }
 }
 
+impl Feature {
+    /// The gate's `VersionedSpecs`, ascending by version.
+    fn specs(self) -> Vec<FeatureSpec> {
+        // Gap (#3232): per-gate introduction versions are not modelled, so
+        // the single modelled spec (the one at v1.35) is valid from 0.0.
+        vec![FeatureSpec {
+            default: self.default_enabled(),
+            lock_to_default: self.locked_to_default(),
+            pre_release: self.prerelease(),
+            version: Version::major_minor(0, 0),
+            min_compatibility_version: None,
+        }]
+    }
+
+    /// `featureSpecAtEmulationAndMinCompatVersion(known[f], emulation, nil)`.
+    pub fn spec_at(self, emulation: Version) -> FeatureSpec {
+        feature_spec_at_emulation_and_min_compat_version(&self.specs(), emulation, None)
+    }
+}
+
 fn known_gates() -> Vec<KnownGate> {
     ALL_FEATURES
         .iter()
         .map(|f| KnownGate {
             name: format!("{f:?}"),
-            // Gap (#3232): per-gate introduction versions are not modelled, so
-            // the single modelled spec (the one at v1.35) is valid from 0.0.
-            specs: if f.prerelease() == PreRelease::PreAlpha {
-                vec![]
-            } else {
-                vec![FeatureSpec {
-                    default: f.default_enabled(),
-                    lock_to_default: f.locked_to_default(),
-                    pre_release: f.prerelease(),
-                    version: Version::major_minor(0, 0),
-                    min_compatibility_version: None,
-                }]
-            },
+            specs: f.specs(),
         })
         .collect()
 }
@@ -1538,6 +1546,38 @@ mod tests {
                 "case {i}: emulation {emu}"
             );
         }
+    }
+
+    // pkg/features/kube_features.go defaultVersionedKubernetesFeatureGates:
+    // real gates resolve through their version history.
+    #[test]
+    fn real_gate_specs_resolve_by_emulation_version() {
+        let v = Version::major_minor;
+        // GenericWorkload: {1.35, false, Alpha} only.
+        assert_eq!(
+            Feature::GenericWorkload.spec_at(v(1, 34)).pre_release,
+            PreRelease::PreAlpha
+        );
+        assert_eq!(
+            Feature::GenericWorkload.spec_at(v(1, 35)).pre_release,
+            PreRelease::Alpha
+        );
+        // DRAAdminAccess: {1.32 Alpha off}, {1.34 Beta on}.
+        let s = Feature::DRAAdminAccess.spec_at(v(1, 33));
+        assert_eq!((s.pre_release, s.default), (PreRelease::Alpha, false));
+        let s = Feature::DRAAdminAccess.spec_at(v(1, 35));
+        assert_eq!((s.pre_release, s.default), (PreRelease::Beta, true));
+        // RelaxedDNSSearchValidation: GA + LockToDefault only from 1.34.
+        assert!(
+            !Feature::RelaxedDNSSearchValidation
+                .spec_at(v(1, 33))
+                .lock_to_default
+        );
+        assert!(
+            Feature::RelaxedDNSSearchValidation
+                .spec_at(v(1, 34))
+                .lock_to_default
+        );
     }
 
     // version.go:259-276: SubtractMinor saturates at 0.
