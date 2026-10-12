@@ -229,7 +229,7 @@ pub trait Storage: Send + Sync {
     /// parameters, so the api-server's field manager records the `Apply`
     /// managedFields entry. Direct backends have no api-server in the path, so
     /// the default re-reads and runs the shared apply engine
-    /// (`rusternetes_common::server_side_apply`), creating the object when it
+    /// (`rusternetes_common::fieldmanager`, the engine the api-server applies with), creating the object when it
     /// does not exist (as SSA does), CAS-retrying on [`Error::Conflict`].
     async fn apply<T>(
         &self,
