@@ -131,17 +131,33 @@ async fn crd_is_served_and_discoverable_immediately_after_create() {
     .await;
     assert_eq!(s, StatusCode::CREATED, "CRD create failed: {body}");
 
-    // Established immediately (the conformance helper waits on this first).
-    let conditions = body
-        .pointer("/status/conditions")
-        .and_then(|c| c.as_array())
-        .expect("status.conditions present right after create");
+    // Established shortly after (the conformance helper waits on this first):
+    // the controllers run asynchronously, so not in the create response.
+    let name = body
+        .pointer("/metadata/name")
+        .and_then(|n| n.as_str())
+        .unwrap()
+        .to_string();
+    let mut established = false;
+    for _ in 0..300 {
+        let (_, got) = send(&router, Method::GET, &format!("{CRDS_URI}/{name}"), None).await;
+        established = got
+            .pointer("/status/conditions")
+            .and_then(|c| c.as_array())
+            .is_some_and(|c| {
+                c.iter().any(|c| {
+                    c.get("type").and_then(|t| t.as_str()) == Some("Established")
+                        && c.get("status").and_then(|t| t.as_str()) == Some("True")
+                })
+            });
+        if established {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     assert!(
-        conditions.iter().any(
-            |c| c.get("type").and_then(|t| t.as_str()) == Some("Established")
-                && c.get("status").and_then(|t| t.as_str()) == Some("True")
-        ),
-        "Established=True must be set immediately: {conditions:?}"
+        established,
+        "Established=True must be set shortly after create"
     );
 
     // (a) legacy APIGroupList includes the new group.

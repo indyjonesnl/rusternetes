@@ -84,6 +84,27 @@ async fn get(router: &TestApiServer, uri: &str) -> (u16, Value) {
     (status.as_u16(), value)
 }
 
+/// The CRD once the naming and establishing controllers have set their
+/// conditions. They run asynchronously after the create
+/// (`establish/establishing_controller.go`), as the e2e framework's
+/// `WaitForEstablishedCRD` expects.
+async fn established_crd(router: &TestApiServer, name: &str) -> Value {
+    let uri = format!("/apis/apiextensions.k8s.io/v1/customresourcedefinitions/{name}");
+    for _ in 0..300 {
+        let (_, body) = get(router, &uri).await;
+        let has = |t: &str, s: &str| {
+            body["status"]["conditions"]
+                .as_array()
+                .is_some_and(|c| c.iter().any(|c| c["type"] == t && c["status"] == s))
+        };
+        if has("Established", "True") && has("NamesAccepted", "True") {
+            return body;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("{name} never became Established");
+}
+
 async fn delete(router: &TestApiServer, uri: &str) -> (u16, Value) {
     let (status, value) = router.delete(uri).await;
     (status.as_u16(), value)
@@ -220,7 +241,9 @@ async fn crd_create_and_delete_round_trip() {
         "CRD create must return 201 Created, body={body}"
     );
     assert_eq!(body["metadata"]["name"], "foos.example.com");
-    // status conditions must be initialised on create (Established + NamesAccepted)
+    // The controllers set the conditions (Established + NamesAccepted)
+    // asynchronously after the create, not in its response.
+    let body = established_crd(&router, "foos.example.com").await;
     let conditions = body["status"]["conditions"]
         .as_array()
         .expect("status.conditions present on create");
@@ -414,6 +437,7 @@ async fn crd_status_subresource_get_update_patch() {
     )
     .await;
     assert_eq!(s, 201);
+    established_crd(&router, "gizmos.example.com").await;
 
     // GET /status returns the resource with its status block.
     let (status, body) = get(

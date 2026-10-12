@@ -66,7 +66,21 @@ async fn create(api: &TestApiServer, plural: &str, kind: &str) -> String {
         )
         .await;
     assert!(status.is_success(), "create must succeed: {status} {body}");
-    format!("{CRDS}/{plural}.example.com")
+    let url = format!("{CRDS}/{plural}.example.com");
+    // The establishing controller runs asynchronously after the create
+    // (establish/establishing_controller.go), so wait for its condition.
+    for _ in 0..300 {
+        let (_, got) = api.get(&url).await;
+        let established = got["status"]["conditions"].as_array().is_some_and(|c| {
+            c.iter()
+                .any(|c| c["type"] == "Established" && c["status"] == "True")
+        });
+        if established {
+            return url;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("{url} never became Established");
 }
 
 async fn patch(api: &TestApiServer, url: &str, body: Value) -> (u16, Value) {
