@@ -861,6 +861,59 @@ pub enum PreRelease {
     Deprecated,
 }
 
+/// `k8s.io/apimachinery/pkg/util/version.Version` reduced to major.minor
+/// (`MajorMinor`; patch/pre-release are never used by gate specs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Version {
+    pub major: u32,
+    pub minor: u32,
+}
+
+impl Version {
+    pub const fn major_minor(major: u32, minor: u32) -> Self {
+        Self { major, minor }
+    }
+
+    /// `SubtractMinor` / `OffsetMinor` (apimachinery/pkg/util/version/version.go:259-276):
+    /// the minor saturates at 0.
+    pub fn subtract_minor(self, diff: u32) -> Self {
+        let minor = if diff < self.minor {
+            self.minor - diff
+        } else {
+            0
+        };
+        Self::major_minor(self.major, minor)
+    }
+}
+
+impl std::fmt::Display for Version {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.major, self.minor)
+    }
+}
+
+/// `FeatureSpec` (feature_gate.go:74-110) reduced to the fields read by
+/// [`feature_spec_at_emulation_and_min_compat_version`] and `unsafeSetFromMap`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeatureSpec {
+    pub default: bool,
+    pub lock_to_default: bool,
+    pub pre_release: PreRelease,
+    pub version: Version,
+    pub min_compatibility_version: Option<Version>,
+}
+
+/// `featureSpecAtEmulationAndMinCompatVersion` (feature_gate.go:882-902).
+/// `specs` must be sorted ascending by `version` (`sort.Sort(VersionedSpecs)`).
+pub fn feature_spec_at_emulation_and_min_compat_version(
+    specs: &[FeatureSpec],
+    emulation_version: Version,
+    min_compatibility_version: Option<Version>,
+) -> FeatureSpec {
+    let _ = (specs, emulation_version, min_compatibility_version);
+    todo!()
+}
+
 /// Name of the special "all alpha gates" toggle (feature_gate.go:51).
 const ALL_ALPHA_GATE: &str = "AllAlpha";
 /// Name of the special "all beta gates" toggle (feature_gate.go:57).
@@ -1405,6 +1458,55 @@ mod tests {
         let mut got = resolve_gates(&m(&[("AllAlpha", true)]), &k).unwrap();
         got.sort();
         assert_eq!(got, vec![("TestAlpha".to_string(), true)]);
+    }
+
+    // feature_gate_test.go:1684-1745 TestFeatureSpecAtEmulationAndMinCompatVersion.
+    #[test]
+    fn feature_spec_at_emulation_and_min_compat_version_table() {
+        let v = Version::major_minor;
+        let spec = |ver, default, pre_release, min| FeatureSpec {
+            default,
+            lock_to_default: false,
+            pre_release,
+            version: ver,
+            min_compatibility_version: min,
+        };
+        let alpha = spec(v(1, 25), false, PreRelease::Alpha, None);
+        let beta = spec(v(1, 25), false, PreRelease::Beta, Some(v(1, 25)));
+        let ga = spec(v(1, 29), true, PreRelease::Ga, Some(v(1, 25)));
+        let pre = spec(v(0, 0), false, PreRelease::PreAlpha, None);
+        let specs = [alpha, beta, ga];
+        let cases = [
+            (v(1, 30), None, ga),
+            (v(1, 29), None, ga),
+            (v(1, 28), None, beta),
+            (v(1, 26), None, beta),
+            (v(1, 25), Some(v(1, 25)), beta),
+            (v(1, 25), None, alpha),
+            (v(1, 24), None, pre),
+            (v(1, 26), Some(v(1, 23)), alpha),
+            (v(1, 29), Some(v(1, 23)), alpha),
+        ];
+        for (i, (emu, min, want)) in cases.into_iter().enumerate() {
+            assert_eq!(
+                feature_spec_at_emulation_and_min_compat_version(&specs, emu, min),
+                want,
+                "case {i}: emulation {emu}"
+            );
+        }
+    }
+
+    // version.go:259-276: SubtractMinor saturates at 0.
+    #[test]
+    fn subtract_minor_saturates() {
+        assert_eq!(
+            Version::major_minor(1, 35).subtract_minor(1).to_string(),
+            "1.34"
+        );
+        assert_eq!(
+            Version::major_minor(1, 0).subtract_minor(1).to_string(),
+            "1.0"
+        );
     }
 
     // "TestBeta=true,AllAlpha=false" and "TestAlpha=true,AllBeta=false".
