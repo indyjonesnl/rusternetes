@@ -274,6 +274,9 @@ struct UserSpec {
 #[derive(Debug, Clone)]
 pub struct WebhookClientConfig {
     server: String,
+    /// `clientConfig.Timeout`: `defaultRequestTimeout` unless the
+    /// configuration sets one (reload.go:134-136).
+    timeout: Duration,
     ca_pem: Option<Vec<u8>>,
     insecure_skip_tls_verify: bool,
     /// client certificate chain + key, concatenated PEM.
@@ -356,6 +359,7 @@ impl WebhookClientConfig {
         };
         Ok(Self {
             server: cluster.server.clone(),
+            timeout: REQUEST_TIMEOUT,
             ca_pem: pem_from(
                 &cluster.certificate_authority_data,
                 &cluster.certificate_authority,
@@ -372,8 +376,17 @@ impl WebhookClientConfig {
         })
     }
 
+    /// `if Timeout.Duration != 0 { clientConfig.Timeout = ... }`
+    /// (reload.go:134-136).
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        if !timeout.is_zero() {
+            self.timeout = timeout;
+        }
+        self
+    }
+
     fn build_client(&self) -> anyhow::Result<reqwest::Client> {
-        let mut b = reqwest::Client::builder().timeout(REQUEST_TIMEOUT);
+        let mut b = reqwest::Client::builder().timeout(self.timeout);
         if self.insecure_skip_tls_verify {
             b = b.danger_accept_invalid_certs(true);
         }
@@ -669,6 +682,50 @@ impl WebhookAuthorizer {
             Backoff::default_auth_webhook(),
             FailurePolicy::NoOpinion,
         )
+    }
+
+    /// The Webhook case of `newForConfig` (reload.go:124-167) for an
+    /// `AuthorizationConfiguration` authorizer named `name`.
+    ///
+    /// Upstream dereferences `ConnectionInfo.KubeConfigFile` unconditionally
+    /// (reload.go:129), so `type: InClusterConfig` (whose `kubeConfigFile`
+    /// validation requires to be nil) panics with a nil-pointer dereference at
+    /// startup; replicated as a startup error with Go's panic text (no
+    /// divergence by decision, #3294).
+    pub fn from_configuration(
+        name: &str,
+        w: &crate::authorization_config::WebhookConfiguration,
+    ) -> anyhow::Result<Self> {
+        let Some(kubeconfig) = &w.connection_info.kube_config_file else {
+            anyhow::bail!("runtime error: invalid memory address or nil pointer dereference");
+        };
+        let client_config = WebhookClientConfig::load(Path::new(kubeconfig))?
+            .with_timeout(Duration::from_nanos(w.timeout.max(0) as u64));
+        let failure_policy = match w.failure_policy.as_str() {
+            crate::authorization_config::FAILURE_POLICY_NO_OPINION => FailurePolicy::NoOpinion,
+            crate::authorization_config::FAILURE_POLICY_DENY => FailurePolicy::Deny,
+            other => anyhow::bail!("unknown failurePolicy {other:?}"),
+        };
+        let authorized_ttl = if w.cache_authorized_requests {
+            Duration::from_nanos(w.authorized_ttl.max(0) as u64)
+        } else {
+            Duration::ZERO
+        };
+        let unauthorized_ttl = if w.cache_unauthorized_requests {
+            Duration::from_nanos(w.unauthorized_ttl.max(0) as u64)
+        } else {
+            Duration::ZERO
+        };
+        Self::new(
+            client_config,
+            &w.subject_access_review_version,
+            authorized_ttl,
+            unauthorized_ttl,
+            Backoff::default_auth_webhook(),
+            failure_policy,
+        )?
+        .with_name(name)
+        .with_match_conditions(&w.match_conditions)
     }
 
     fn decision_on_error(&self, error: String) -> Opinion {

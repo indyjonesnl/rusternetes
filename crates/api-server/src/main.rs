@@ -271,7 +271,12 @@ fn apply_feature_gates(value: &str) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    // `fs.Changed` for the legacy authorization flags needs the raw matches.
+    let matches = <Args as clap::CommandFactory>::command().get_matches();
+    let mut args = <Args as clap::FromArgMatches>::from_arg_matches(&matches)
+        .map_err(|e| e.exit())
+        .unwrap();
+    args.authorization.mark_legacy_flags_set(&matches);
     request_timeout::set_request_timeout(args.request_timeout);
     apply_feature_gates(&args.feature_gates)?;
     // `validateClusterIPFlags`: refuse to start on a bad range.
@@ -344,12 +349,14 @@ async fn main() -> Result<()> {
         warn!("⚠️  Using AlwaysAllowAuthorizer - all requests will be permitted");
         warn!("⚠️  This should ONLY be used in development/testing environments");
     }
-    let authorizer = rusternetes_api_server::authorizer::build_authorizer_with_webhook(
+    let authorizer = rusternetes_api_server::authorizer::build_authorizer_with_config(
         storage.clone(),
         args.skip_auth,
         &args.authorization.authorization_mode,
         &args.authorization.authorization_policy_file,
         &args.authorization.webhook,
+        &args.authorization.authorization_config,
+        args.authorization.legacy_flags_set,
     )?;
 
     // Initialize Metrics Registry
@@ -370,6 +377,8 @@ async fn main() -> Result<()> {
         authorization_mode: args.authorization.authorization_mode.clone(),
         authorization_policy_file: args.authorization.authorization_policy_file.clone(),
         authorization_webhook: args.authorization.webhook.clone(),
+        authorization_config: args.authorization.authorization_config.clone(),
+        authorization_legacy_flags_set: args.authorization.legacy_flags_set,
         ..Default::default()
     };
     let prepared_tls = rusternetes_api_server::prepare_tls_for_config(&api_config)?;

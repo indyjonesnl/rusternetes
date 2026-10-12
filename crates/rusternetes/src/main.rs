@@ -248,7 +248,12 @@ fn scheduler_config_from_args(args: &Args) -> Result<rusternetes_scheduler::Sche
 }
 
 async fn async_main() -> Result<()> {
-    let args = Args::parse();
+    // `fs.Changed` for the legacy authorization flags needs the raw matches.
+    let matches = <Args as clap::CommandFactory>::command().get_matches();
+    let mut args = <Args as clap::FromArgMatches>::from_arg_matches(&matches)
+        .map_err(|e| e.exit())
+        .unwrap();
+    args.authorization.mark_legacy_flags_set(&matches);
     apply_feature_gates(&args)?;
     // Gates first: the StorageCapacityScoring default for VolumeBinding args reads them.
     let sched_config = scheduler_config_from_args(&args)?;
@@ -331,6 +336,8 @@ async fn async_main() -> Result<()> {
         authorization_mode: args.authorization.authorization_mode.clone(),
         authorization_policy_file: args.authorization.authorization_policy_file.clone(),
         authorization_webhook: args.authorization.webhook.clone(),
+        authorization_config: args.authorization.authorization_config.clone(),
+        authorization_legacy_flags_set: args.authorization.legacy_flags_set,
         ..Default::default()
     };
     let prepared_tls = rusternetes_api_server::prepare_tls_for_config(&api_config)?;

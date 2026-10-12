@@ -70,7 +70,18 @@ pub struct AuthorizationArgs {
 
 impl AuthorizationArgs {
     /// Fill [`Self::legacy_flags_set`] from the parsed command line.
-    pub fn mark_legacy_flags_set(&mut self, _matches: &clap::ArgMatches) {}
+    pub fn mark_legacy_flags_set(&mut self, matches: &clap::ArgMatches) {
+        use clap::parser::ValueSource;
+        self.legacy_flags_set = [
+            "authorization_mode",
+            "authorization_webhook_config_file",
+            "authorization_webhook_version",
+            "authorization_webhook_cache_authorized_ttl",
+            "authorization_webhook_cache_unauthorized_ttl",
+        ]
+        .iter()
+        .any(|id| matches.value_source(id) == Some(ValueSource::CommandLine));
+    }
 }
 
 /// `IsValidAuthorizationMode` (modes.go:41).
@@ -82,12 +93,12 @@ pub fn is_valid_authorization_mode(mode: &str) -> bool {
 /// (pkg/kubeapiserver/options/authorization.go:88-96).
 ///
 /// No deviation (#3266): an empty list defaults to `AlwaysAllow`, exactly like
-/// upstream (`--authorization-config` is not implemented, so its half of the
-/// `len(AuthorizationConfigurationFile) == 0` condition is always true).
+/// upstream, but only when no `--authorization-config` file is given
+/// (`len(AuthorizationConfigurationFile) == 0 && len(Modes) == 0`, #3294).
 /// Deployments that want RBAC must pass `--authorization-mode=Node,RBAC`
 /// explicitly, as kubeadm does.
-pub fn complete_authorization_modes(_config_file: &str, modes: &[String]) -> Vec<String> {
-    if modes.is_empty() {
+pub fn complete_authorization_modes(config_file: &str, modes: &[String]) -> Vec<String> {
+    if config_file.is_empty() && modes.is_empty() {
         return vec![MODE_ALWAYS_ALLOW.to_string()];
     }
     modes.to_vec()
@@ -148,57 +159,106 @@ pub fn build_authorizer_with_webhook<S: AuthzStorage + 'static>(
     policy_file: &str,
     webhook: &crate::authorization_webhook::AuthorizationWebhookArgs,
 ) -> anyhow::Result<Arc<dyn Authorizer>> {
-    let modes = complete_authorization_modes("", modes);
-    let mut errs = validate_authorization_modes(&modes, policy_file);
-    errs.extend(crate::authorization_webhook::validate_webhook_args(
-        &modes, webhook,
-    ));
-    if !errs.is_empty() {
-        anyhow::bail!("invalid authorization options: {}", errs.join("; "));
-    }
-    if skip_auth {
-        return Ok(Arc::new(AlwaysAllowAuthorizer));
-    }
-    let mut chain: Vec<Arc<dyn Authorizer>> = Vec::new();
-    for mode in &modes {
-        match mode.as_str() {
-            MODE_NODE => chain.push(Arc::new(NodeAuthorizer)),
-            MODE_ALWAYS_ALLOW => chain.push(Arc::new(AlwaysAllowAuthorizer)),
-            MODE_ALWAYS_DENY => chain.push(Arc::new(AlwaysDenyAuthorizer)),
-            // config.go:126-130 `abac.NewFromFile(config.PolicyFile)`.
-            MODE_ABAC => chain.push(Arc::new(PolicyList::new_from_file(Path::new(policy_file))?)),
-            MODE_RBAC => chain.push(Arc::new(RBACAuthorizer::new(storage.clone()))),
-            MODE_WEBHOOK => chain.push(Arc::new(
-                crate::authorization_webhook::WebhookAuthorizer::from_args(webhook)?,
-            )),
-            other => anyhow::bail!("authorization-mode {other} is not supported yet"),
-        }
-    }
-    Ok(Arc::new(superuser_then(chain)))
+    build_authorizer_with_config(storage, skip_auth, modes, policy_file, webhook, "", false)
 }
 
 /// The `--authorization-config` branch of `BuiltInAuthorizationOptions.Validate`
 /// / `ToAuthorizationConfig` (authorization.go:110-127, :232-247): the legacy
 /// flags must be unset, then the file is loaded and validated with no opinion
-/// about required modes. Returns the configuration and the file's data.
+/// about required modes (`LoadAndValidateFile(file, compiler, nil)`). Returns
+/// the configuration and the file's data.
+///
+/// `StructuredAuthorizationConfiguration` (the gate checked at :105 / :236) is
+/// GA and locked on in 1.35, so that check cannot fire.
 pub fn load_authorization_config(
-    _config_file: &str,
-    _legacy_flags_set: bool,
-) -> Result<(crate::authorization_config::AuthorizationConfiguration, String), String> {
-    Err("not implemented".to_string())
+    config_file: &str,
+    legacy_flags_set: bool,
+) -> Result<
+    (
+        crate::authorization_config::AuthorizationConfiguration,
+        String,
+    ),
+    String,
+> {
+    if legacy_flags_set {
+        return Err("--authorization-config can not be specified when --authorization-mode or --authorization-webhook-* flags are defined".to_string());
+    }
+    crate::authorization_config::load_and_validate_file(config_file, &Default::default())
 }
 
-/// [`build_authorizer_with_webhook`] with `--authorization-config`.
+/// [`build_authorizer_with_webhook`] with `--authorization-config`: `Complete`
+/// (authorization.go:88-96, the AlwaysAllow default only without a file),
+/// `Validate` (:99-163, the file branch returning early), then the chain
+/// (reload.go:97-176) from the file's authorizers instead of the modes.
+///
+/// ABAC still reads `--authorization-policy-file` (`config.PolicyFile`,
+/// config.go:126-130). Hot reload of the file (`runReload`, reload.go:197-)
+/// and `InstrumentedAuthorizer` metrics are not ported.
 pub fn build_authorizer_with_config<S: AuthzStorage + 'static>(
     storage: Arc<S>,
     skip_auth: bool,
     modes: &[String],
     policy_file: &str,
     webhook: &crate::authorization_webhook::AuthorizationWebhookArgs,
-    _config_file: &str,
-    _legacy_flags_set: bool,
+    config_file: &str,
+    legacy_flags_set: bool,
 ) -> anyhow::Result<Arc<dyn Authorizer>> {
-    build_authorizer_with_webhook(storage, skip_auth, modes, policy_file, webhook)
+    use crate::authorization_webhook::WebhookAuthorizer;
+    let modes = complete_authorization_modes(config_file, modes);
+    let configured = if config_file.is_empty() {
+        let mut errs = validate_authorization_modes(&modes, policy_file);
+        errs.extend(crate::authorization_webhook::validate_webhook_args(
+            &modes, webhook,
+        ));
+        if !errs.is_empty() {
+            anyhow::bail!("invalid authorization options: {}", errs.join("; "));
+        }
+        None
+    } else {
+        let (config, _data) = load_authorization_config(config_file, legacy_flags_set)
+            .map_err(|e| anyhow::anyhow!("invalid authorization options: {e}"))?;
+        Some(config)
+    };
+    if skip_auth {
+        return Ok(Arc::new(AlwaysAllowAuthorizer));
+    }
+    // The legacy flags are `buildAuthorizationConfiguration`'s input
+    // (authorization.go:250-290): the same chain as a file of the same shape.
+    let mut chain: Vec<Arc<dyn Authorizer>> = Vec::new();
+    let mut push = |mode: &str,
+                    webhook_config: Option<(
+        &str,
+        &crate::authorization_config::WebhookConfiguration,
+    )>|
+     -> anyhow::Result<()> {
+        match mode {
+            MODE_NODE => chain.push(Arc::new(NodeAuthorizer)),
+            MODE_ALWAYS_ALLOW => chain.push(Arc::new(AlwaysAllowAuthorizer)),
+            MODE_ALWAYS_DENY => chain.push(Arc::new(AlwaysDenyAuthorizer)),
+            // config.go:126-130 `abac.NewFromFile(config.PolicyFile)`.
+            MODE_ABAC => chain.push(Arc::new(PolicyList::new_from_file(Path::new(policy_file))?)),
+            MODE_RBAC => chain.push(Arc::new(RBACAuthorizer::new(storage.clone()))),
+            MODE_WEBHOOK => chain.push(Arc::new(match webhook_config {
+                Some((name, w)) => WebhookAuthorizer::from_configuration(name, w)?,
+                None => WebhookAuthorizer::from_args(webhook)?,
+            })),
+            other => anyhow::bail!("unknown authorization mode {other} specified"),
+        }
+        Ok(())
+    };
+    match &configured {
+        Some(config) => {
+            for a in &config.authorizers {
+                push(&a.type_, a.webhook.as_ref().map(|w| (a.name.as_str(), w)))?;
+            }
+        }
+        None => {
+            for mode in &modes {
+                push(mode, None)?;
+            }
+        }
+    }
+    Ok(Arc::new(superuser_then(chain)))
 }
 
 #[cfg(test)]
@@ -289,7 +349,10 @@ mod tests {
     #[test]
     fn complete_defaults_to_always_allow_like_upstream() {
         // authorization.go:92-94: no modes (and no --authorization-config) => AlwaysAllow.
-        assert_eq!(complete_authorization_modes("", &[]), modes(&["AlwaysAllow"]));
+        assert_eq!(
+            complete_authorization_modes("", &[]),
+            modes(&["AlwaysAllow"])
+        );
         assert_eq!(
             complete_authorization_modes("", &modes(&["RBAC"])),
             modes(&["RBAC"])
@@ -431,7 +494,8 @@ mod tests {
 
     // ---- --authorization-config (#3294) --------------------------------
 
-    const CFG_HDR: &str = "apiVersion: apiserver.config.k8s.io/v1\nkind: AuthorizationConfiguration\nauthorizers:\n";
+    const CFG_HDR: &str =
+        "apiVersion: apiserver.config.k8s.io/v1\nkind: AuthorizationConfiguration\nauthorizers:\n";
 
     fn config_file(authorizers: &str) -> String {
         policy_file(&format!("{CFG_HDR}{authorizers}"))
@@ -439,11 +503,7 @@ mod tests {
             .into_owned()
     }
 
-    fn build_cfg(
-        cfg: &str,
-        modes_: &[&str],
-        legacy: bool,
-    ) -> anyhow::Result<Arc<dyn Authorizer>> {
+    fn build_cfg(cfg: &str, modes_: &[&str], legacy: bool) -> anyhow::Result<Arc<dyn Authorizer>> {
         build_authorizer_with_config(
             Arc::new(MemoryStorage::new()),
             false,
@@ -458,8 +518,14 @@ mod tests {
     // authorization.go:92: the AlwaysAllow default only applies without a file.
     #[test]
     fn complete_does_not_default_when_a_config_file_is_given() {
-        assert_eq!(complete_authorization_modes("/some/file", &[]), Vec::<String>::new());
-        assert_eq!(complete_authorization_modes("", &[]), modes(&["AlwaysAllow"]));
+        assert_eq!(
+            complete_authorization_modes("/some/file", &[]),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            complete_authorization_modes("", &[]),
+            modes(&["AlwaysAllow"])
+        );
     }
 
     // authorization.go:117-119.
@@ -471,7 +537,10 @@ mod tests {
             "--authorization-config can not be specified when --authorization-mode or --authorization-webhook-* flags are defined"
         );
         let e = build_cfg(&f, &["RBAC"], true).err().unwrap().to_string();
-        assert!(e.contains("--authorization-config can not be specified"), "{e}");
+        assert!(
+            e.contains("--authorization-config can not be specified"),
+            "{e}"
+        );
         let _ = std::fs::remove_file(&f);
     }
 
@@ -510,7 +579,9 @@ mod tests {
         assert!(allowed(&a, pods(user("admin", &["system:masters"]))).await);
         let _ = std::fs::remove_file(&f);
 
-        let f = config_file("- type: AlwaysDeny\n  name: alwaysdeny\n- type: AlwaysAllow\n  name: alwaysallow\n");
+        let f = config_file(
+            "- type: AlwaysDeny\n  name: alwaysdeny\n- type: AlwaysAllow\n  name: alwaysallow\n",
+        );
         let a = build_cfg(&f, &[], false).unwrap();
         assert!(allowed(&a, pods(user("alice", &[]))).await);
         let _ = std::fs::remove_file(&f);
@@ -552,7 +623,10 @@ mod tests {
     fn invalid_config_file_fails_the_build() {
         let f = config_file("- type: RBAC\n  name: wrong\n");
         let e = build_cfg(&f, &[], false).err().unwrap().to_string();
-        assert!(e.contains("expected name rbac for authorizer RBAC instead of wrong"), "{e}");
+        assert!(
+            e.contains("expected name rbac for authorizer RBAC instead of wrong"),
+            "{e}"
+        );
         let _ = std::fs::remove_file(&f);
     }
 

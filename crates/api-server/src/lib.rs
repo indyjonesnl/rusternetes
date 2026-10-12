@@ -186,6 +186,11 @@ pub struct ApiServerConfig {
     pub authorization_policy_file: String,
     /// `--authorization-webhook-*` (#2895).
     pub authorization_webhook: authorization_webhook::AuthorizationWebhookArgs,
+    /// `--authorization-config` (#3294); mutually exclusive with the legacy
+    /// flags above.
+    pub authorization_config: String,
+    /// `AreLegacyFlagsSet` (authorization.go:200-211).
+    pub authorization_legacy_flags_set: bool,
     pub prometheus_url: Option<String>,
     /// Path to the console SPA build directory. When set, the API server
     /// serves the console UI at `/console/` and falls back to `index.html`
@@ -300,6 +305,8 @@ impl Default for ApiServerConfig {
             authorization_mode: Vec::new(),
             authorization_policy_file: String::new(),
             authorization_webhook: Default::default(),
+            authorization_config: String::new(),
+            authorization_legacy_flags_set: false,
             prometheus_url: None,
             console_dir: None,
             client_ca_file: None,
@@ -333,12 +340,14 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
     if config.skip_auth {
         warn!("Authentication and authorization disabled - insecure mode");
     }
-    let authorizer = authorizer::build_authorizer_with_webhook(
+    let authorizer = authorizer::build_authorizer_with_config(
         storage.clone(),
         config.skip_auth,
         &config.authorization_mode,
         &config.authorization_policy_file,
         &config.authorization_webhook,
+        &config.authorization_config,
+        config.authorization_legacy_flags_set,
     )?;
 
     let metrics = Arc::new(MetricsRegistry::new().with_api_server_metrics()?);
