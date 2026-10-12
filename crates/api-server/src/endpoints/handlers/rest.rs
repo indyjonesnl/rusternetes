@@ -216,8 +216,21 @@ pub(super) fn decode<T: Object>(
 
     // Strictness judges the body against the served version's fields, so it
     // runs before conversion drops any of them.
-    let warnings = crate::handlers::validation::validate_strict_fields(params, body, &obj)?;
+    let mut warnings = crate::handlers::validation::validate_strict_fields(params, body, &obj)?;
     scope.store.decode_strict(&obj)?;
+    // Warn: the codec's StrictDecodingError is only warned about
+    // (rest.go:439-446 addStrictDecodingWarnings).
+    if crate::handlers::validation::FieldValidationMode::from_query(params)
+        == crate::handlers::validation::FieldValidationMode::Warn
+    {
+        warnings.extend(
+            scope
+                .store
+                .decode_unknown_fields(&obj)
+                .into_iter()
+                .map(|field| format!("unknown field \"{field}\"")),
+        );
+    }
     scope.convert(&mut obj);
     Ok((obj, warnings))
 }

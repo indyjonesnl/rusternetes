@@ -333,6 +333,34 @@ impl Strategy {
         prune_custom_resource(&self.crd, &self.version, cr);
     }
 
+    /// The paths `structuralpruning.PruneWithOptions(u.Object,
+    /// structuralSchemas[gv.Version], true, {TrackUnknownFieldPaths})` reports
+    /// (customresource_handler.go:1427-1435), skipped when the CRD has
+    /// `preserveUnknownFields` (:1426). Unknown `metadata` fields
+    /// (`schemaobjectmeta`, :1415-1421, :1439-1446) are not ported yet.
+    fn unknown_fields(&self, cr: &CustomResource) -> Vec<String> {
+        if self.crd.spec.preserve_unknown_fields == Some(true) {
+            return Vec::new();
+        }
+        let Some(schema) = self.crd_version().and_then(|v| v.schema.as_ref()) else {
+            return Vec::new();
+        };
+        let Ok(structural) =
+            rusternetes_common::validation::structural::new_structural(&schema.open_apiv3_schema)
+        else {
+            return Vec::new();
+        };
+        let Ok(mut value) = serde_json::to_value(cr) else {
+            return Vec::new();
+        };
+        rusternetes_common::validation::structural::prune::prune_with_options(
+            &mut value,
+            Some(&structural),
+            true,
+            true,
+        )
+    }
+
     /// The object's schema and CEL errors, as field errors.
     fn schema_errors(&self, cr: &CustomResource, old: Option<&CustomResource>) -> ErrorList {
         let mut errs = Vec::new();
@@ -709,6 +737,11 @@ impl RestStorage<CustomResource> for CustomResourceRest {
     /// The strict-decoding verdict, on the body as sent.
     fn decode_strict(&self, obj: &CustomResource) -> Result<()> {
         self.check_write(obj)
+    }
+
+    /// `unstructuredSchemaCoercer.apply` (customresource_handler.go:1427-1435).
+    fn decode_unknown_fields(&self, obj: &CustomResource) -> Vec<String> {
+        self.strategy.unknown_fields(obj)
     }
 
     fn qualified_resource(&self) -> &GroupResource {

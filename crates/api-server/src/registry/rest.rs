@@ -757,6 +757,16 @@ pub trait RestStorage<T: Object>: Send + Sync {
         Ok(())
     }
 
+    /// The unknown field paths the decoder's pruner reports for a body
+    /// (`structuralpruning.PruneWithOptions` with `TrackUnknownFieldPaths`,
+    /// customresource_handler.go:1427-1435), which `schemaCoercingDecoder`
+    /// returns inside a `StrictDecodingError` (:1338-1342). Judged on the
+    /// body as sent, before [`Self::decode_coerce`]. Nothing for every other
+    /// storage.
+    fn decode_unknown_fields(&self, _obj: &T) -> Vec<String> {
+        Vec::new()
+    }
+
     /// `rest.Getter`.
     async fn get(
         &self,
