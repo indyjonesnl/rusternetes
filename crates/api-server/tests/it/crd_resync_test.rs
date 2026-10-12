@@ -56,6 +56,7 @@ async fn resync_finalizes_a_crd_left_terminating() {
     );
     let (status, out) = api.post(CRDS, &widget_crd()).await;
     assert_eq!(status, StatusCode::CREATED, "{out}");
+    api.wait_crd_established("widgets.example.com").await;
     let cr = "/apis/example.com/v1/namespaces/default/widgets";
     let (status, out) = api
         .post(
@@ -139,6 +140,7 @@ async fn cleanup_waits_for_an_instance_with_a_finalizer() {
     );
     let (status, out) = api.post(CRDS, &widget_crd()).await;
     assert_eq!(status, StatusCode::CREATED, "{out}");
+    api.wait_crd_established("widgets.example.com").await;
     let cr = "/apis/example.com/v1/namespaces/default/widgets";
     let (status, out) = api
         .post(

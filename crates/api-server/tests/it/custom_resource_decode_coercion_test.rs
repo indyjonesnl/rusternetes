@@ -78,6 +78,7 @@ async fn a_mutating_webhook_is_sent_the_pruned_and_defaulted_object() {
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{out}");
+    api.wait_crd_established(&format!("widgets.{GROUP}")).await;
 
     let seen = Arc::new(Mutex::new(Vec::new()));
     let (url, _stop) = start_webhook(seen.clone()).await;

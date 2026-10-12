@@ -98,6 +98,9 @@ async fn watch_v2_converts_stored_v1_objects_and_honors_field_selector() {
         .await,
         StatusCode::CREATED
     );
+    router
+        .wait_crd_established(&format!("crontabs.{GROUP}"))
+        .await;
 
     // Two CRs, stored at the storage version v1.
     let base = format!("/apis/{GROUP}/v1/namespaces/default/crontabs");
@@ -150,6 +153,9 @@ async fn watch_v2_without_selector_converts_all_objects() {
         &two_version_crd(),
     )
     .await;
+    router
+        .wait_crd_established(&format!("crontabs.{GROUP}"))
+        .await;
 
     let base = format!("/apis/{GROUP}/v1/namespaces/default/crontabs");
     post_json(&router, &base, &crontab("a", "blue")).await;
