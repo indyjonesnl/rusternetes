@@ -385,12 +385,19 @@ async fn main() -> Result<()> {
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(6443);
 
+    let crd_controllers = Default::default();
     rusternetes_api_server::startup::register_post_start_hooks(
         storage.clone(),
         api_port,
         service_ranges.api_server_service_ip(),
         service_ranges.cidrs(),
         ca_cert_pem.as_deref(),
+        {
+            let c = Arc::clone(&crd_controllers);
+            move |s| {
+                registry::apiextensions::customresourcedefinition::start_controllers(s, c);
+            }
+        },
     )
     .await;
 
@@ -459,6 +466,7 @@ async fn main() -> Result<()> {
         ApiServerState::new(storage, token_manager, authorizer, metrics, args.skip_auth)
             .with_service_cluster_ip_ranges(&service_ranges)
             .with_ca_cert(ca_cert_pem)
+            .with_crd_controllers(crd_controllers)
             .with_service_node_port_range(registry::core::service::portallocator::PortRange {
                 base: args.service_node_port_range.base,
                 size: args.service_node_port_range.size,

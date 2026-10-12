@@ -133,3 +133,30 @@ async fn invalid_ca_bundle_is_not_established() {
         "{got2}"
     );
 }
+
+/// A write through the `/status` store is an informer update event too
+/// (naming_controller.go:359-363, establishing_controller.go:71-73), so it
+/// wakes the controllers: a status write that unsets `Established` is
+/// repaired promptly, not on the 5 minute resync (#3297).
+#[tokio::test]
+async fn status_write_wakes_the_controllers() {
+    let api = TestApiServer::new();
+    let (status, out) = api.post(CRDS, &widget_crd()).await;
+    assert_eq!(status, StatusCode::CREATED, "{out}");
+    let name = "widgets.example.com";
+    let mut got = wait_for(&api, name, |c| {
+        condition(c, "Established").is_some_and(|e| e["status"] == "True")
+    })
+    .await;
+    for c in got["status"]["conditions"].as_array_mut().unwrap() {
+        if c["type"] == "Established" {
+            c["status"] = json!("False");
+        }
+    }
+    let (status, out) = api.put(&format!("{CRDS}/{name}/status"), &got).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    wait_for(&api, name, |c| {
+        condition(c, "Established").is_some_and(|e| e["status"] == "True")
+    })
+    .await;
+}

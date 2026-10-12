@@ -16,7 +16,7 @@
 //! for that name, as upstream's single-worker controllers do. The worker is
 //! woken by the add (no polling), so a CRD is established within one
 //! scheduling round of its create. The 5 minute resync
-//! (`customresourcedefinition::spawn_resync`) remains the backstop.
+//! (`customresourcedefinition::start_controllers`) remains the backstop.
 //!
 //! Deviation: upstream's `masterCount > 1` 5 second `QueueCRD` delay
 //! (`customresource_handler.go:486-494`) is not modelled; this api-server is

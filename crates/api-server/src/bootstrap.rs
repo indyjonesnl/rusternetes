@@ -2928,7 +2928,10 @@ mod post_start_hook_registration_tests {
         let storage = Arc::new(StorageBackend::new_memory());
         spawn_endpoint_reconciler(storage.clone(), 6443, super::test_service_ip());
         spawn_apiservice_availability_controller(storage.clone());
-        crate::registry::apiextensions::customresourcedefinition::spawn_resync(storage.clone());
+        crate::registry::apiextensions::customresourcedefinition::start_controllers(
+            storage.clone(),
+            Default::default(),
+        );
         crate::registry::apiextensions::customresourcedefinition::spawn_crd_informer_synced_hook(
             storage.clone(),
         );

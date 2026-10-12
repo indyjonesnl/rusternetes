@@ -117,6 +117,17 @@ impl ApiServerState {
         }
     }
 
+    /// Share `controllers` with the post-start hook that resyncs them, so
+    /// the request path and the resync feed one queue (apiserver.go:244-252:
+    /// one set of controllers).
+    pub fn with_crd_controllers(
+        mut self,
+        controllers: Arc<crate::registry::apiextensions::controller_queue::CrdControllers>,
+    ) -> Self {
+        self.crd_controllers = controllers;
+        self
+    }
+
     /// Use `pr` as the NodePort range (`--service-node-port-range`,
     /// cmd/kube-apiserver/app/options/options.go:124), rebuilding the
     /// allocator and the registry the repair loop shares with it

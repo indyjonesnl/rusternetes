@@ -378,6 +378,27 @@ pub fn new_status_store(
     new_store(storage).with_update_strategy(Arc::new(StatusStrategy))
 }
 
+/// `StatusREST` (etcd.go:179-187) with the informer's update event: a write
+/// through `/status` queues the CRD for the controllers
+/// (`UpdateFunc` -> `queue.Add(key)`, naming_controller.go:359-363,
+/// establishing_controller.go:71-73), as one through [`CrdRest`] does.
+pub struct CrdStatusRest {
+    store: Store<CustomResourceDefinition, StorageBackend>,
+    controllers: Arc<super::controller_queue::CrdControllers>,
+}
+
+impl CrdStatusRest {
+    pub fn with_controllers(
+        storage: Arc<StorageBackend>,
+        controllers: Arc<super::controller_queue::CrdControllers>,
+    ) -> Self {
+        Self {
+            store: new_status_store(storage),
+            controllers,
+        }
+    }
+}
+
 /// An update whose new object is computed from the stored one — a controller
 /// writing through `UpdateStatus`.
 struct ControllerUpdate<'a> {
@@ -1059,7 +1080,12 @@ impl RestStorage<CustomResourceDefinition> for CrdRest {
                 return Ok((Deleted::Object(crd), false));
             }
         }
-        RestStorage::delete(&self.store, ctx, name, delete_validation, options).await
+        let out = RestStorage::delete(&self.store, ctx, name, delete_validation, options).await?;
+        // `DeleteFunc` -> `queue.Add(key)` (naming_controller.go:365-379).
+        if !dry_run {
+            self.enqueue(name);
+        }
+        Ok(out)
     }
 
     /// `Store.DeleteCollection` deletes through the embedded Store, not
@@ -1086,9 +1112,89 @@ impl RestStorage<CustomResourceDefinition> for CrdRest {
                 let _ = self
                     .sync_group_except(&crd.spec.group, &crd.metadata.name)
                     .await;
+                self.enqueue(&crd.metadata.name);
             }
         }
         Ok(deleted)
+    }
+}
+
+#[async_trait]
+impl RestStorage<CustomResourceDefinition> for CrdStatusRest {
+    fn qualified_resource(&self) -> &GroupResource {
+        self.store.qualified_resource()
+    }
+
+    fn namespace_scoped(&self) -> bool {
+        RestStorage::namespace_scoped(&self.store)
+    }
+
+    async fn get(
+        &self,
+        ctx: &RequestContext,
+        name: &str,
+        options: &crate::registry::generic::GetOptions,
+    ) -> Result<CustomResourceDefinition> {
+        RestStorage::get(&self.store, ctx, name, options).await
+    }
+
+    async fn create(
+        &self,
+        ctx: &RequestContext,
+        obj: CustomResourceDefinition,
+        create_validation: Option<&dyn ValidateObject<CustomResourceDefinition>>,
+        options: &CreateOptions,
+    ) -> Result<CustomResourceDefinition> {
+        RestStorage::create(&self.store, ctx, obj, create_validation, options).await
+    }
+
+    async fn update(
+        &self,
+        ctx: &RequestContext,
+        name: &str,
+        obj_info: &dyn UpdatedObjectInfo<CustomResourceDefinition>,
+        create_validation: Option<&dyn ValidateObject<CustomResourceDefinition>>,
+        update_validation: Option<&dyn ValidateObjectUpdate<CustomResourceDefinition>>,
+        force_allow_create: bool,
+        options: &UpdateOptions,
+    ) -> Result<(CustomResourceDefinition, bool)> {
+        let out = RestStorage::update(
+            &self.store,
+            ctx,
+            name,
+            obj_info,
+            create_validation,
+            update_validation,
+            force_allow_create,
+            options,
+        )
+        .await?;
+        if !options.dry_run {
+            self.controllers.ensure_started(self.store.storage.clone());
+            self.controllers.add(name);
+        }
+        Ok(out)
+    }
+
+    async fn delete(
+        &self,
+        ctx: &RequestContext,
+        name: &str,
+        delete_validation: Option<&dyn ValidateObject<CustomResourceDefinition>>,
+        options: DeleteOptions,
+    ) -> Result<(Deleted<CustomResourceDefinition>, bool)> {
+        RestStorage::delete(&self.store, ctx, name, delete_validation, options).await
+    }
+
+    async fn delete_collection(
+        &self,
+        ctx: &RequestContext,
+        delete_validation: Option<&dyn ValidateObject<CustomResourceDefinition>>,
+        options: &DeleteOptions,
+        list_options: &std::collections::HashMap<String, String>,
+    ) -> Result<crate::registry::rest::DeletedCollection<CustomResourceDefinition>> {
+        RestStorage::delete_collection(&self.store, ctx, delete_validation, options, list_options)
+            .await
     }
 }
 
@@ -1247,11 +1353,14 @@ impl ControllerRateLimiter {
 ///
 /// Registered as the `start-apiextensions-controllers` post-start hook
 /// (apiserver.go:228-261: `go <controller>.Run(...)` for each, `return nil`).
-pub fn spawn_resync(storage: Arc<StorageBackend>) -> tokio::task::JoinHandle<()> {
+pub fn start_controllers(
+    storage: Arc<StorageBackend>,
+    controllers: Arc<super::controller_queue::CrdControllers>,
+) -> tokio::task::JoinHandle<()> {
     crate::post_start_hooks::spawn_starting_hook(
         crate::bootstrap::APIEXTENSIONS_CONTROLLERS_HOOK,
         move || {
-            spawn_resync_loop(storage);
+            start_controllers_loop(storage, controllers);
         },
     )
 }
@@ -1289,9 +1398,13 @@ pub fn spawn_crd_informer_synced_hook(storage: Arc<StorageBackend>) -> tokio::ta
     })
 }
 
-fn spawn_resync_loop(storage: Arc<StorageBackend>) -> tokio::task::JoinHandle<()> {
+fn start_controllers_loop(
+    storage: Arc<StorageBackend>,
+    controllers: Arc<super::controller_queue::CrdControllers>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let rest = new_rest(storage);
+        // The one set of controllers (queue + memos) the request path uses.
+        let rest = CrdRest::with_controllers(storage, controllers);
         // Each controller's `workqueue.DefaultTypedControllerRateLimiter`
         // (one per queue upstream; this timer task is the shared retry queue).
         let mut limiter = ControllerRateLimiter::new();
