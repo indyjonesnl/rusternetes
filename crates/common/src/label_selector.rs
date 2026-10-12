@@ -530,12 +530,16 @@ pub struct LabelRequirement {
 }
 
 impl LabelRequirement {
-    /// Port of `NewRequirement` (selector.go:171-222). Returns the aggregated
-    /// field-error message (upstream `allErrs.ToAggregate()`) on failure.
-    /// The unsupported-operator arm is unreachable: the operator is a closed enum.
-    pub fn new(key: &str, op: LabelOperator, vals: Vec<String>) -> Result<Self, String> {
+    /// The error list of `NewRequirement(key, op, vals, field.WithPath(path))`
+    /// (selector.go:185-225), before `ToAggregate`: callers that report field
+    /// paths (e.g. `nodeaffinity.NewNodeSelector`) need the typed errors.
+    pub fn validate_at(
+        path: &Path,
+        key: &str,
+        op: LabelOperator,
+        vals: &[String],
+    ) -> Vec<FieldError> {
         let mut all_errs: Vec<FieldError> = Vec::new();
-        let path = Path::default();
         if let Err(e) = validate_label_key(key, &path.child("key")) {
             all_errs.push(e);
         }
@@ -545,7 +549,7 @@ impl LabelRequirement {
                 if vals.is_empty() {
                     all_errs.push(FieldError::invalid(
                         &value_path,
-                        BadValue::from(vals.clone()),
+                        BadValue::from(vals),
                         "for 'in', 'notin' operators, values set can't be empty",
                     ));
                 }
@@ -554,7 +558,7 @@ impl LabelRequirement {
                 if vals.len() != 1 {
                     all_errs.push(FieldError::invalid(
                         &value_path,
-                        BadValue::from(vals.clone()),
+                        BadValue::from(vals),
                         "exact-match compatibility requires one single value",
                     ));
                 }
@@ -563,7 +567,7 @@ impl LabelRequirement {
                 if !vals.is_empty() {
                     all_errs.push(FieldError::invalid(
                         &value_path,
-                        BadValue::from(vals.clone()),
+                        BadValue::from(vals),
                         "values set must be empty for exists and does not exist",
                     ));
                 }
@@ -572,7 +576,7 @@ impl LabelRequirement {
                 if vals.len() != 1 {
                     all_errs.push(FieldError::invalid(
                         &value_path,
-                        BadValue::from(vals.clone()),
+                        BadValue::from(vals),
                         "for 'Gt', 'Lt' operators, exactly one value is required",
                     ));
                 }
@@ -592,6 +596,14 @@ impl LabelRequirement {
                 all_errs.push(e);
             }
         }
+        all_errs
+    }
+
+    /// Port of `NewRequirement` (selector.go:171-222). Returns the aggregated
+    /// field-error message (upstream `allErrs.ToAggregate()`) on failure.
+    /// The unsupported-operator arm is unreachable: the operator is a closed enum.
+    pub fn new(key: &str, op: LabelOperator, vals: Vec<String>) -> Result<Self, String> {
+        let all_errs = Self::validate_at(&Path::default(), key, op, &vals);
         if !all_errs.is_empty() {
             return Err(aggregate_message(&all_errs));
         }
