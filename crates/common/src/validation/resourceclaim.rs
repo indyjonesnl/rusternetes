@@ -972,4 +972,196 @@ mod tests {
             "{errs:?}"
         );
     }
+
+    // ---- status-update validators for the gated fields -------------------
+    //
+    // Ports of cases in `validation_resourceclaim_test.go`
+    // (`TestValidateClaimStatusUpdate`, release-1.35).
+
+    const GOOD_SHARE_ID: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+
+    fn status_errs(status: serde_json::Value) -> Vec<String> {
+        let spec = claim(serde_json::json!({
+            "requests": [{"name": "r", "exactly": {"deviceClassName": "c.example.com", "allocationMode": "ExactCount", "count": 1}}]
+        }));
+        let status: ResourceClaimStatus = serde_json::from_value(status).unwrap();
+        validate_resource_claim_status_update(
+            &status,
+            &ResourceClaimStatus::default(),
+            &spec.spec.devices,
+            false,
+            &Path::new("status"),
+        )
+        .into_iter()
+        .map(|e| e.to_string())
+        .collect()
+    }
+
+    fn result(extra: serde_json::Value) -> serde_json::Value {
+        let mut r = serde_json::json!({
+            "request": "r", "driver": "d.example.com", "pool": "p", "device": "x"
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            r[k] = v.clone();
+        }
+        r
+    }
+
+    fn allocated(results: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({"devices": {"results": results}})
+    }
+
+    fn device(extra: serde_json::Value) -> serde_json::Value {
+        let mut d = serde_json::json!({"driver": "d.example.com", "pool": "p", "device": "x"});
+        for (k, v) in extra.as_object().unwrap() {
+            d[k] = v.clone();
+        }
+        d
+    }
+
+    /// `invalid-add-allocated-status-mismatch-share-id` (:2185-2215): the
+    /// identity includes the shareID and the bad value is the JSON-marshalled
+    /// `SharedDeviceID` struct (errors.go:84-107 `default:` arm).
+    #[test]
+    fn device_status_share_id_must_match_allocated_share() {
+        let e = status_errs(serde_json::json!({
+            "allocation": allocated(vec![result(serde_json::json!({"shareID": GOOD_SHARE_ID}))]),
+            "devices": [device(serde_json::json!({"shareID": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"}))],
+        }));
+        assert_eq!(
+            e,
+            vec![
+                r#"status.devices[0]: Invalid value: {"Driver":"d.example.com","Pool":"p","Device":"x","ShareID":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"}: must be an allocated device in the claim"#
+            ]
+        );
+    }
+
+    /// `invalid-device-status-duplicate-with-share-id` (:1427-1455).
+    #[test]
+    fn device_status_duplicate_includes_share_id() {
+        let d = device(serde_json::json!({"shareID": GOOD_SHARE_ID}));
+        let e = status_errs(serde_json::json!({
+            "allocation": allocated(vec![result(serde_json::json!({"shareID": GOOD_SHARE_ID}))]),
+            "devices": [d.clone(), d],
+        }));
+        assert_eq!(
+            e,
+            vec![format!(
+                r#"status.devices[1]: Duplicate value: {{"Driver":"d.example.com","Pool":"p","Device":"x","ShareID":"{GOOD_SHARE_ID}"}}"#
+            )]
+        );
+    }
+
+    /// `invalid-add-allocated-status-invalid-share-id` (:2221-2275).
+    #[test]
+    fn share_id_must_be_a_normalized_uuid() {
+        let e = status_errs(serde_json::json!({
+            "allocation": allocated(vec![
+                result(serde_json::json!({"shareID": "a"})),
+                result(serde_json::json!({"shareID": "Aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"})),
+            ]),
+            "devices": [
+                device(serde_json::json!({"shareID": "a"})),
+                device(serde_json::json!({"shareID": "Aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"})),
+            ],
+        }));
+        for want in [
+            r#"status.devices[0].shareID: Invalid value: "a": error validating uid: invalid UUID length: 1"#,
+            "status.devices[1].shareID: Invalid value: \"Aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\": uid must be in RFC 4122 normalized form, `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` with lowercase hexadecimal characters",
+            r#"status.allocation.devices.results[0].shareID: Invalid value: "a": error validating uid: invalid UUID length: 1"#,
+            "status.allocation.devices.results[1].shareID: Invalid value: \"Aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\": uid must be in RFC 4122 normalized form, `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` with lowercase hexadecimal characters",
+        ] {
+            assert!(e.iter().any(|m| m == want), "missing {want}\n in {e:#?}");
+        }
+    }
+
+    /// `invalid-network-device-status` (:1456-1490).
+    #[test]
+    fn network_device_data_is_validated() {
+        let e = status_errs(serde_json::json!({
+            "allocation": allocated(vec![result(serde_json::json!({}))]),
+            "devices": [device(serde_json::json!({"networkData": {
+                "interfaceName": "x".repeat(257),
+                "hardwareAddress": "x".repeat(129),
+                "ips": ["300.9.8.0/24", "010.009.008.000/24", "2001:0db8::1/64"],
+            }}))],
+        }));
+        assert_eq!(
+            e,
+            vec![
+                "status.devices[0].networkData.interfaceName: Too long: may not be more than 256 bytes".to_string(),
+                "status.devices[0].networkData.hardwareAddress: Too long: may not be more than 128 bytes".to_string(),
+                r#"status.devices[0].networkData.ips[0]: Invalid value: "300.9.8.0/24": must be a valid address in CIDR form, (e.g. 10.9.8.7/24 or 2001:db8::1/64)"#.to_string(),
+                r#"status.devices[0].networkData.ips[1]: Invalid value: "010.009.008.000/24": must be in canonical form ("10.9.8.0/24")"#.to_string(),
+                r#"status.devices[0].networkData.ips[2]: Invalid value: "2001:0db8::1/64": must be in canonical form ("2001:db8::1/64")"#.to_string(),
+            ]
+        );
+    }
+
+    /// `invalid-device-status-duplicate` (:1396-1425) and the ips cap from
+    /// `invalid-data-device-status-limits` (:1510).
+    #[test]
+    fn network_device_data_ips_unique_and_capped() {
+        let e = status_errs(serde_json::json!({
+            "allocation": allocated(vec![result(serde_json::json!({}))]),
+            "devices": [device(serde_json::json!({"networkData": {
+                "ips": ["2001:db8::1/64", "2001:db8::1/64"],
+            }}))],
+        }));
+        assert_eq!(
+            e,
+            vec![r#"status.devices[0].networkData.ips[1]: Duplicate value: "2001:db8::1/64""#]
+        );
+        let ips: Vec<String> = (0..17).map(|i| format!("10.9.8.{i}/24")).collect();
+        let e = status_errs(serde_json::json!({
+            "allocation": allocated(vec![result(serde_json::json!({}))]),
+            "devices": [device(serde_json::json!({"networkData": {"ips": ips}}))],
+        }));
+        assert_eq!(
+            e,
+            vec!["status.devices[0].networkData.ips: Too many: 17: must have at most 16 items"]
+        );
+    }
+
+    /// `invalid-data-device-status-limits` (:1514-1545): `data` over
+    /// `AllocatedDeviceStatusDataMaxLength` (types.go:1779) is `TooLong`.
+    #[test]
+    fn device_status_data_is_bounded_and_must_be_an_object() {
+        let big = serde_json::json!({"str": "x".repeat(10 * 1024)});
+        let e = status_errs(serde_json::json!({
+            "allocation": allocated(vec![result(serde_json::json!({}))]),
+            "devices": [device(serde_json::json!({"data": big}))],
+        }));
+        assert_eq!(
+            e,
+            vec!["status.devices[0].data: Too long: may not be more than 10240 bytes"]
+        );
+        let e = status_errs(serde_json::json!({
+            "allocation": allocated(vec![result(serde_json::json!({}))]),
+            "devices": [device(serde_json::json!({"data": [1]}))],
+        }));
+        assert_eq!(
+            e,
+            vec![
+                r#"status.devices[0].data: Invalid value: "<value omitted>": must be a valid JSON object"#
+            ]
+        );
+    }
+
+    /// `validateDeviceRequestAllocationResult` runs
+    /// `validateDeviceBindingParameters` on the result path (:509-520).
+    #[test]
+    fn allocation_result_binding_parameters_are_validated() {
+        let e = status_errs(serde_json::json!({
+            "allocation": allocated(vec![result(serde_json::json!({
+                "bindingConditions": ["a"],
+            }))]),
+        }));
+        assert_eq!(
+            e,
+            vec![
+                r#"status.allocation.devices.results[0].bindingFailureConditions: Invalid value: null: bindingFailureConditions are required to use bindingConditions"#
+            ]
+        );
+    }
 }

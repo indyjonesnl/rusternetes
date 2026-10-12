@@ -487,6 +487,42 @@ pub struct AllocatedDeviceStatus {
     /// Conditions represents the latest observation of the device
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<DeviceCondition>,
+
+    /// `AllocatedDeviceStatus.Data` (`staging/src/k8s.io/api/resource/v1/types.go`,
+    /// a `*runtime.RawExtension`): driver-specific device data, a JSON object.
+    /// `validateDeviceStatus` checks it (`validation.go:1272-1294`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+
+    /// `AllocatedDeviceStatus.NetworkData` (`types.go`).
+    #[serde(
+        rename = "networkData",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub network_data: Option<NetworkDeviceData>,
+}
+
+/// `NetworkDeviceData` (`staging/src/k8s.io/api/resource/v1/types.go:1984-2018`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkDeviceData {
+    #[serde(
+        rename = "interfaceName",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub interface_name: String,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ips: Vec<String>,
+
+    #[serde(
+        rename = "hardwareAddress",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub hardware_address: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
