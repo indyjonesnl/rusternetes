@@ -132,41 +132,50 @@ pub async fn get_node_metrics(
     let node_key = build_key("nodes", None, &name);
     let node: rusternetes_common::resources::Node = state.storage.as_ref().get(&node_key).await?;
 
-    Ok(Json(
-        node_metrics_or_fallback(state.storage.as_ref(), &node).await,
+    // metrics-server pkg/api/node.go Get: when no metrics exist for the node
+    // it returns `errors.NewNotFound(m.groupResource, name)` -- no zero-usage
+    // fallback object.
+    match node_metrics(state.storage.as_ref(), &node).await {
+        Some(m) => Ok(Json(m)),
+        None => Err(node_metrics_not_found(&name)),
+    }
+}
+
+/// `errors.NewNotFound(schema.GroupResource{Group: "metrics.k8s.io",
+/// Resource: "nodemetrics"}, name)` (apimachinery/pkg/api/errors/errors.go):
+/// message `nodemetrics.metrics.k8s.io "<name>" not found`, details carrying
+/// group, kind (= resource) and name.
+fn node_metrics_not_found(name: &str) -> rusternetes_common::Error {
+    let details = rusternetes_common::types::StatusDetails {
+        name: Some(name.to_string()),
+        group: Some("metrics.k8s.io".to_string()),
+        kind: Some("nodemetrics".to_string()),
+        uid: None,
+        causes: None,
+        retry_after_seconds: None,
+    };
+    rusternetes_common::Error::Status(Box::new(
+        rusternetes_common::types::Status::failure_with_details(
+            format!("nodemetrics.metrics.k8s.io \"{name}\" not found"),
+            "NotFound",
+            404,
+            details,
+        ),
     ))
 }
 
-/// Return the kubelet-published `NodeMetrics` for `node`, or zero usage when
-/// none has been published yet. Either way the result carries the node's
-/// labels: metrics-server builds each NodeMetrics with `Labels: node.Labels`
-/// (pkg/storage/node.go:57-62), and the kubelet publishes its sample without
-/// labels.
-async fn node_metrics_or_fallback<S: Storage>(
+/// Return the kubelet-published `NodeMetrics` for `node` carrying the node's
+/// labels, or `None` when no sample exists. metrics-server builds each
+/// NodeMetrics with `Labels: node.Labels` (pkg/storage/node.go:57-62); the
+/// kubelet publishes its sample without labels.
+async fn node_metrics<S: Storage>(
     storage: &S,
     node: &rusternetes_common::resources::Node,
-) -> NodeMetrics {
-    let name = &node.metadata.name;
-    let metrics_key = format!("/registry/metrics.k8s.io/nodes/{}", name);
-    if let Ok(mut metrics) = storage.get::<NodeMetrics>(&metrics_key).await {
-        metrics.metadata.labels = node.metadata.labels.clone();
-        return metrics;
-    }
-    // No metrics yet — return zeros
-    let mut usage = BTreeMap::new();
-    usage.insert("cpu".to_string(), "0m".to_string());
-    usage.insert("memory".to_string(), "0Mi".to_string());
-    NodeMetrics {
-        type_meta: node_metrics_type_meta(),
-        metadata: rusternetes_common::types::ObjectMeta {
-            creation_timestamp: Some(Utc::now()),
-            labels: node.metadata.labels.clone(),
-            ..rusternetes_common::types::ObjectMeta::new(name.clone())
-        },
-        timestamp: Utc::now(),
-        window: "30s".to_string(),
-        usage,
-    }
+) -> Option<NodeMetrics> {
+    let metrics_key = format!("/registry/metrics.k8s.io/nodes/{}", node.metadata.name);
+    let mut metrics = storage.get::<NodeMetrics>(&metrics_key).await.ok()?;
+    metrics.metadata.labels = node.metadata.labels.clone();
+    Some(metrics)
 }
 
 /// List metrics for all nodes.
@@ -589,9 +598,8 @@ mod overlay_tests {
         let mut node = Node::new("n1");
         node.metadata.labels = Some(HashMap::from([("zone".to_string(), "a".to_string())]));
 
-        // No stored sample: the zero-usage fallback.
-        let m = node_metrics_or_fallback(&storage, &node).await;
-        assert_eq!(m.metadata.labels, node.metadata.labels);
+        // No stored sample: None (Get answers NotFound).
+        assert!(node_metrics(&storage, &node).await.is_none());
 
         // Kubelet-published sample without labels.
         let stored = NodeMetrics {
@@ -605,7 +613,7 @@ mod overlay_tests {
             .create("/registry/metrics.k8s.io/nodes/n1", &stored)
             .await
             .unwrap();
-        let m = node_metrics_or_fallback(&storage, &node).await;
+        let m = node_metrics(&storage, &node).await.unwrap();
         assert_eq!(m.metadata.labels, node.metadata.labels);
     }
 }
