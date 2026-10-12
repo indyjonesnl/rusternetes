@@ -1,3 +1,4 @@
+pub mod admission_metrics;
 pub mod caching_authorizer;
 pub mod certificates;
 pub mod config;
@@ -13,6 +14,7 @@ pub mod policy_json_patch_ops;
 pub mod policy_match_conditions;
 pub mod policy_matching;
 pub mod policy_mutating;
+pub mod policy_mutating_metrics;
 pub mod policy_plugin;
 pub mod policy_registry;
 pub mod policy_source;
