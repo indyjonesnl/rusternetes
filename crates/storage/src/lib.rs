@@ -729,42 +729,59 @@ where
     )))
 }
 
-/// Body of the default [`Storage::apply`].
+/// Body of the default [`Storage::apply`]: the api-server's server-side apply
+/// run in-process, so a direct backend writes the same object a real server
+/// would. `FieldManager.Apply`
+/// (staging/src/k8s.io/apimachinery/pkg/util/managedfields/internal/fieldmanager.go:183-209)
+/// over `Updater.Apply` (sigs.k8s.io/structured-merge-diff/v6/merge/update.go:209-254),
+/// via the same `rusternetes_common::fieldmanager` the api-server's apply
+/// handlers use (`ssa::apply_legacy`): structured `fieldsV1`, list-map merge by
+/// key (e.g. `status.conditions` by `type`). Creates the object when absent
+/// (apply creates, `handlers/patch.go` `applyPatcher`), CAS-retrying on
+/// [`Error::Conflict`].
+///
+/// No registry strategy sits in front of a direct backend, so no
+/// reset-fields are applied; `subresource` is recorded in the manager's entry
+/// as the api-server does.
 async fn apply_via_update<S, T>(
     storage: &S,
     key: &str,
     apply_config: &serde_json::Value,
     field_manager: &str,
     force: bool,
-    _subresource: Option<&str>,
+    subresource: Option<&str>,
 ) -> Result<T>
 where
     S: Storage + ?Sized,
     T: Serialize + DeserializeOwned + Send + Sync,
 {
-    use rusternetes_common::server_side_apply::{server_side_apply, ApplyParams, ApplyResult};
+    use rusternetes_common::fieldmanager::apply::retain_live_system_metadata;
+    use rusternetes_common::fieldmanager::{FieldManager, ResetFields};
     const MAX_ATTEMPTS: usize = 8;
-    let mut params = ApplyParams::new(field_manager.to_string());
-    if force {
-        params = params.with_force();
-    }
     for attempt in 0..MAX_ATTEMPTS {
         let current: Option<serde_json::Value> = match storage.get(key).await {
             Ok(v) => Some(v),
             Err(Error::NotFound(_)) => None,
             Err(e) => return Err(e),
         };
-        let applied = match server_side_apply(current.as_ref(), apply_config, &params)
-            .map_err(|e| Error::InvalidResource(format!("apply {key}: {e}")))?
-        {
-            ApplyResult::Success(v) => v,
-            ApplyResult::Conflicts(c) => {
-                return Err(Error::Conflict(format!(
-                    "Apply failed with {} conflict(s) for {key}",
-                    c.len()
-                )))
-            }
-        };
+        // The version being applied (`f.groupVersion`; the apply body carries it).
+        let version = apply_config
+            .get("apiVersion")
+            .or_else(|| current.as_ref().and_then(|c| c.get("apiVersion")))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let manager = FieldManager::new(version, subresource, ResetFields::new());
+        let mut applied =
+            match manager.apply_value(current.as_ref(), apply_config, field_manager, force) {
+                Ok(v) => v,
+                Err(conflicts) => {
+                    return Err(Error::Conflict(format!(
+                        "Apply failed with {} conflict(s) for {key}",
+                        conflicts.len()
+                    )))
+                }
+            };
+        retain_live_system_metadata(&mut applied, current.as_ref());
         let written = if current.is_some() {
             storage.update::<serde_json::Value>(key, &applied).await
         } else {

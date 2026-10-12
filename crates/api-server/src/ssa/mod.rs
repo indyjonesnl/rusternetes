@@ -69,36 +69,7 @@ use self::merge::{
     merge_string_map_group, LeafGroup, OwnedPaths, PathConflict, ResourceLeafSchema,
     CONFIGMAP_SCHEMA, SECRET_SCHEMA,
 };
-
-/// `map[fieldpath.APIVersion]*fieldpath.Set`: what a strategy resets on write,
-/// per `group/version` (`rest.ResetFieldsStrategy.GetResetFields`,
-/// apiserver/pkg/registry/rest/rest.go:385-389). Each set is a list of field
-/// paths (`fieldpath.MakePathOrDie("status")` is `["status"]`).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ResetFields(BTreeMap<String, Vec<Vec<String>>>);
-
-impl ResetFields {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Add the set reset in `api_version` (`"networking.k8s.io/v1"`).
-    pub fn with(mut self, api_version: &str, paths: &[&[&str]]) -> Self {
-        self.0.insert(
-            api_version.to_string(),
-            paths
-                .iter()
-                .map(|p| p.iter().map(|s| s.to_string()).collect())
-                .collect(),
-        );
-        self
-    }
-
-    /// `GetResetFields()[version]`: empty when the version has no entry.
-    pub fn for_version(&self, api_version: &str) -> &[Vec<String>] {
-        self.0.get(api_version).map(Vec::as_slice).unwrap_or(&[])
-    }
-}
+pub use rusternetes_common::fieldmanager::ResetFields;
 
 /// Per-request SSA options sourced from query parameters.
 ///
@@ -240,33 +211,10 @@ pub fn apply_legacy<T: Serialize + DeserializeOwned>(
     );
     match field_manager.apply_value(current.as_ref(), desired, &opts.field_manager, opts.force) {
         Ok(mut applied) => {
-            // The system-owned metadata is the live object's, whatever the
-            // applied configuration says.
-            if let (Some(meta), Some(live)) = (
-                applied.get_mut("metadata").and_then(Value::as_object_mut),
-                current
-                    .as_ref()
-                    .and_then(|c| c.get("metadata"))
-                    .and_then(Value::as_object),
-            ) {
-                for key in [
-                    "uid",
-                    "resourceVersion",
-                    "generation",
-                    "creationTimestamp",
-                    "deletionTimestamp",
-                    "deletionGracePeriodSeconds",
-                ] {
-                    match live.get(key) {
-                        Some(v) => {
-                            meta.insert(key.to_string(), v.clone());
-                        }
-                        None => {
-                            meta.remove(key);
-                        }
-                    }
-                }
-            }
+            rusternetes_common::fieldmanager::apply::retain_live_system_metadata(
+                &mut applied,
+                current.as_ref(),
+            );
             let object = serde_json::from_value(applied)
                 .map_err(|e| ApplyError::invalid_body(std::any::type_name::<T>(), e.to_string()))?;
             Ok(ApplyOutcome::Applied {

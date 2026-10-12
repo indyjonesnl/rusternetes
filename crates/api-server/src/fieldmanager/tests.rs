@@ -5,6 +5,8 @@ use rusternetes_common::resources::ConfigMap;
 use serde_json::{json, Value};
 
 use super::fieldset::{Fields, Set};
+use rusternetes_common::fieldmanager::{cap_update_managers, DEFAULT_MAX_UPDATE_MANAGERS};
+
 use super::*;
 
 fn cm(data: Value) -> ConfigMap {

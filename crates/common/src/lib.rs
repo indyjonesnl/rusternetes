@@ -21,6 +21,7 @@ pub mod error;
 pub mod event_correlator;
 pub mod feature_gates;
 pub mod field_selector;
+pub mod fieldmanager;
 pub mod go_duration;
 pub mod label_selector;
 pub mod latency_trackers;
