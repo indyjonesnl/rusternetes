@@ -1,4 +1,5 @@
 use crate::volume_plugins::csi_driver_lister::CsiDriverLister;
+use crate::volume_plugins::util::mount_ops::Mounter;
 use rusternetes_common::auth::TokenManager;
 use rusternetes_storage::StorageBackend;
 use std::collections::HashMap;
@@ -61,6 +62,11 @@ pub trait VolumeHost: Send + Sync {
     /// implemented by `pkg/kubelet/volume_host.go`): the kubelet's pod
     /// certificate manager. `None` is upstream's `NoOpManager` situation
     /// (static / detached kubelet), whose bundle call fails "unimplemented".
+    /// `VolumeHost.GetMounter` (`pkg/volume/plugins.go`): the kubelet's
+    /// `mount.Interface`, `mount.New(s.ExperimentalMounterPath)`
+    /// (`cmd/kubelet/app/server.go:487`).
+    fn get_mounter(&self) -> &Mounter;
+
     fn pod_certificate_manager(&self) -> Option<&Arc<dyn crate::podcertificate::Manager>> {
         None
     }
@@ -83,6 +89,7 @@ pub struct KubeletVolumeHost {
     node_allocatable: HashMap<String, String>,
     pod_certificate_manager: Option<Arc<dyn crate::podcertificate::Manager>>,
     csi_driver_lister: Option<CsiDriverLister>,
+    mounter: Mounter,
 }
 
 impl KubeletVolumeHost {
@@ -99,6 +106,13 @@ impl KubeletVolumeHost {
             node_allocatable,
             pod_certificate_manager: None,
             csi_driver_lister: None,
+            // `mount.New("")`: systemd tried, safe-not-mounted detected
+            // (`mount_linux.go:79-85`).
+            mounter: Mounter::new(
+                "",
+                true,
+                crate::volume_plugins::util::mount_ops::detect_safe_not_mounted_behavior(),
+            ),
         }
     }
 
@@ -156,6 +170,10 @@ impl VolumeHost for KubeletVolumeHost {
 
     fn get_volumes_base_path(&self) -> &str {
         &self.volumes_base_path
+    }
+
+    fn get_mounter(&self) -> &Mounter {
+        &self.mounter
     }
 
     fn pod_certificate_manager(&self) -> Option<&Arc<dyn crate::podcertificate::Manager>> {

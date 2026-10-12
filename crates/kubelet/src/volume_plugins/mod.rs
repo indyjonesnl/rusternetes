@@ -20,6 +20,7 @@ pub mod host_path;
 pub mod local;
 #[cfg(test)]
 mod mounter_args_tests;
+pub mod nfs;
 pub mod nodeinfomanager;
 pub mod plugin;
 pub mod projected;

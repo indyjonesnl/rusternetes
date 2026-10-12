@@ -252,6 +252,8 @@ impl VolumeManager {
                 host.clone(),
             )),
             Box::new(crate::volume_plugins::local::LocalPlugin::new(host.clone())),
+            // `nfs.ProbeVolumePlugins` (`cmd/kubelet/app/plugins.go`).
+            Box::new(crate::volume_plugins::nfs::NfsPlugin::new(host.clone())),
             Box::new(crate::volume_plugins::config_map::ConfigMapPlugin::new(
                 host.clone(),
             )),
@@ -3599,9 +3601,15 @@ mod dispatch_tests {
             None,
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
         );
-        let v = volume("n", json!({"nfs": {"server": "10.0.0.1", "path": "/export"}}));
+        let v = volume(
+            "n",
+            json!({"nfs": {"server": "10.0.0.1", "path": "/export"}}),
+        );
         assert_eq!(vm.plugin_name_for_volume(&v), "kubernetes.io/nfs");
-        assert!(vm.plugin_mgr.find_plugin_by_name("kubernetes.io/nfs").is_ok());
+        assert!(vm
+            .plugin_mgr
+            .find_plugin_by_name("kubernetes.io/nfs")
+            .is_ok());
     }
 
     /// #3262: an unimplemented kind (iscsi, fc, gitRepo, image) matches no
