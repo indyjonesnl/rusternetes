@@ -26,6 +26,7 @@ use rusternetes_common::resources::admission_webhook::MatchCondition;
 use rusternetes_common::resources::validating_admission_policy::FailurePolicy;
 use serde_json::Value;
 
+use super::admission_metrics::{KIND_POLICY, STEP_VALIDATE};
 use super::policy_json_patch::evaluate_expression;
 use super::policy_matching::Attributes;
 use super::policy_mutating::{
@@ -58,24 +59,36 @@ pub struct Matcher {
     filter: Arc<dyn ConditionEvaluator>,
     /// `Fail` unless `Ignore` (a nil policy is `Fail`, :46-51).
     ignore: bool,
+    matcher_kind: String,
+    matcher_type: String,
+    object_name: String,
 }
 
 /// matcher.go `NewMatcher` (:44-58) over an arbitrary evaluator.
 pub fn new_matcher_with(
     filter: Arc<dyn ConditionEvaluator>,
     fail_policy: Option<&FailurePolicy>,
+    matcher_kind: &str,
+    matcher_type: &str,
+    object_name: &str,
 ) -> Arc<dyn ConditionMatcher> {
     Arc::new(Matcher {
         filter,
         ignore: matches!(fail_policy, Some(FailurePolicy::Ignore)),
+        matcher_kind: matcher_kind.to_string(),
+        matcher_type: matcher_type.to_string(),
+        object_name: object_name.to_string(),
     })
 }
 
-/// `NewMatcher` over compiled CEL `matchConditions` (compilation.go:47-54).
+/// `NewMatcher` over compiled CEL `matchConditions` (compilation.go:47-54),
+/// with matcherKind "policy" and matcherType "validate" as there;
+/// `object_name` is `policy.Name`.
 pub fn new_matcher(
     conditions: &[MatchCondition],
     variables: &[(String, String)],
     fail_policy: Option<&FailurePolicy>,
+    object_name: &str,
 ) -> Arc<dyn ConditionMatcher> {
     new_matcher_with(
         Arc::new(CelConditions {
@@ -87,6 +100,9 @@ pub fn new_matcher(
             evaluator: Mutex::new(CELEvaluator::new()),
         }),
         fail_policy,
+        KIND_POLICY,
+        STEP_VALIDATE,
+        object_name,
     )
 }
 
@@ -431,6 +447,9 @@ mod tests {
                     throw_error: throw,
                 }),
                 policy.as_ref(),
+                KIND_POLICY,
+                STEP_VALIDATE,
+                "test",
             );
             let r = m.matches(&a, &v, None, &AlwaysAllowAuthorizer).await;
             // A failed fake-evaluator call matches nothing, so `matches` is
@@ -467,6 +486,7 @@ mod tests {
             ],
             &[("lbl".into(), "object.metadata.labels.a".into())],
             None,
+            "test",
         );
         let r = m.matches(&a, &v, None, &AlwaysAllowAuthorizer).await;
         assert!(r.matches && r.error.is_none(), "{r:?}");
@@ -483,6 +503,7 @@ mod tests {
             ],
             &[],
             None,
+            "test",
         );
         let r = m.matches(&a, &v, None, &AlwaysAllowAuthorizer).await;
         assert!(!r.matches);
@@ -493,16 +514,16 @@ mod tests {
     async fn cel_errors_follow_failure_policy() {
         let (a, v) = attrs(Some(json!({"metadata": {"name": "y"}})));
         let conds = [cond("bad", "object.nope.deeper == 1"), cond("ok", "true")];
-        let r = new_matcher(&conds, &[], None)
+        let r = new_matcher(&conds, &[], None, "test")
             .matches(&a, &v, None, &AlwaysAllowAuthorizer)
             .await;
         assert!(r.error.is_some() && !r.matches, "{r:?}");
-        let r = new_matcher(&conds, &[], Some(&FailurePolicy::Ignore))
+        let r = new_matcher(&conds, &[], Some(&FailurePolicy::Ignore), "test")
             .matches(&a, &v, None, &AlwaysAllowAuthorizer)
             .await;
         assert!(r.error.is_none() && !r.matches, "{r:?}");
         // A non-bool result is an evaluation error too.
-        let r = new_matcher(&[cond("n", "1 + 1")], &[], None)
+        let r = new_matcher(&[cond("n", "1 + 1")], &[], None, "test")
             .matches(&a, &v, None, &AlwaysAllowAuthorizer)
             .await;
         assert!(r.error.is_some(), "{r:?}");
@@ -515,6 +536,7 @@ mod tests {
             &[cond("p", "params.spec.name == object.metadata.name")],
             &[],
             None,
+            "test",
         );
         let p = json!({"spec": {"name": "x"}});
         assert!(
@@ -528,5 +550,78 @@ mod tests {
                 .await
                 .matches
         );
+    }
+
+    /// `(eval errors, evaluation-time samples)` for `name` / CREATE.
+    fn observed(name: &str) -> (u64, u64) {
+        use crate::admission::admission_metrics::{
+            MATCH_CONDITION_EVALUATION_SECONDS, MATCH_CONDITION_EVAL_ERRORS,
+        };
+        let l = [name, KIND_POLICY, STEP_VALIDATE, "CREATE"];
+        (
+            MATCH_CONDITION_EVAL_ERRORS.with_label_values(&l).get(),
+            MATCH_CONDITION_EVALUATION_SECONDS
+                .with_label_values(&l)
+                .get_sample_count(),
+        )
+    }
+
+    async fn match_named(
+        name: &str,
+        evals: Vec<EvaluationResult>,
+        throw: bool,
+        p: Option<FailurePolicy>,
+    ) {
+        let (a, v) = attrs(None);
+        let m = new_matcher_with(
+            Arc::new(Fake {
+                evaluations: evals,
+                throw_error: throw,
+            }),
+            p.as_ref(),
+            KIND_POLICY,
+            STEP_VALIDATE,
+            name,
+        );
+        m.matches(&a, &v, None, &AlwaysAllowAuthorizer).await;
+    }
+
+    /// matcher.go:87-89: a filter error observes the evaluation time but is
+    /// "not an evaluation error so not incrementing metric here".
+    #[tokio::test]
+    async fn filter_error_observes_time_not_eval_error() {
+        match_named("m-filter-err", vec![], true, None).await;
+        assert_eq!(observed("m-filter-err"), (0, 1));
+    }
+
+    /// matcher.go:111-119, :124-126: each eval error counts, and a false
+    /// condition observes the time once.
+    #[tokio::test]
+    async fn eval_errors_count_each_and_false_observes_time() {
+        match_named("m-mixed", vec![e(), e(), f("c")], false, None).await;
+        assert_eq!(observed("m-mixed"), (2, 1));
+    }
+
+    /// matcher.go:124-126: errors with no false condition observe the time
+    /// once, whatever the failure policy.
+    #[tokio::test]
+    async fn eval_errors_without_false_observe_time_once() {
+        match_named("m-errs-fail", vec![t(""), e()], false, None).await;
+        assert_eq!(observed("m-errs-fail"), (1, 1));
+        match_named(
+            "m-errs-ignore",
+            vec![t(""), e()],
+            false,
+            Some(FailurePolicy::Ignore),
+        )
+        .await;
+        assert_eq!(observed("m-errs-ignore"), (1, 1));
+    }
+
+    /// matcher.go:136-142: all conditions true observes nothing.
+    #[tokio::test]
+    async fn all_true_observes_nothing() {
+        match_named("m-true", vec![t(""), t("")], false, None).await;
+        assert_eq!(observed("m-true"), (0, 0));
     }
 }

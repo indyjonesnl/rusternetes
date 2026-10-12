@@ -47,6 +47,7 @@ use super::policy_dispatch::{
     PolicyInvocation, PolicyKey, PolicyReinvokeContext, VersionedAttributeAccessor,
 };
 use super::policy_matching::Attributes;
+use super::policy_mutating_metrics::MutationErrorType;
 
 /// mutating/plugin.go `PluginName`.
 pub const PLUGIN_NAME: &str = "MutatingAdmissionPolicy";
@@ -227,10 +228,17 @@ pub fn compile_policy(policy: &MutatingAdmissionPolicy) -> MutatingEvaluator {
             conds,
             &variables,
             spec.failure_policy.as_ref(),
+            PolicyAccessor::name(policy),
         )),
         _ => None,
     };
     MutatingEvaluator { matcher, mutators }
+}
+
+/// errors.go `ErrorType`.
+pub fn error_type(err: Option<&str>) -> MutationErrorType {
+    let _ = err;
+    MutationErrorType::InvalidError
 }
 
 /// `patch.TypeConverterManager.GetTypeConverter != nil`.
@@ -1273,5 +1281,70 @@ mod tests {
             expression: "object.metadata.name == 'x'".into(),
         }]);
         assert!(compile_policy(&p).matcher.is_some());
+    }
+
+    fn mutation_metrics(
+        policy: &str,
+        et: crate::admission::policy_mutating_metrics::MutationErrorType,
+    ) -> (u64, u64) {
+        use crate::admission::policy_mutating_metrics::{POLICY_CHECK, POLICY_LATENCY};
+        let l = [policy, "binding", et.as_str()];
+        (
+            POLICY_CHECK.with_label_values(&l).get(),
+            POLICY_LATENCY.with_label_values(&l).get_sample_count(),
+        )
+    }
+
+    /// dispatcher.go:205: a successful mutation observes admission with
+    /// `MutationNoError`.
+    #[tokio::test]
+    async fn successful_mutation_observes_admission() {
+        use crate::admission::policy_mutating_metrics::MutationErrorType::*;
+        let mut a = attr(deployment(None));
+        let c = case("metrics-ok", mutators(vec![set_label("a", "1")]));
+        run(&dispatcher(ctx()), &mut a, &[c]).await.unwrap();
+        assert_eq!(mutation_metrics("metrics-ok", NoError), (1, 1));
+        assert_eq!(mutation_metrics("metrics-ok", InvalidError), (0, 0));
+    }
+
+    /// dispatcher.go:196: a failing mutation observes a rejection, typed by
+    /// `ErrorType(err)`, whether it becomes a config error or a status error.
+    #[tokio::test]
+    async fn failing_mutation_observes_rejection() {
+        use crate::admission::policy_mutating_metrics::MutationErrorType::*;
+        let mut a = attr(deployment(None));
+        let c = case(
+            "metrics-cfg",
+            mutators(vec![patcher(|_| Err(PatchError::Other("cel: bad".into())))]),
+        );
+        run(&dispatcher(ctx()), &mut a, &[c]).await.unwrap();
+        assert_eq!(mutation_metrics("metrics-cfg", InvalidError), (1, 1));
+        assert_eq!(mutation_metrics("metrics-cfg", NoError), (0, 0));
+
+        let c = case(
+            "metrics-status",
+            mutators(vec![patcher(|_| {
+                Err(PatchError::Status(Error::Forbidden("no".into())))
+            })]),
+        );
+        run(&dispatcher(ctx()), &mut a, &[c]).await.unwrap_err();
+        assert_eq!(mutation_metrics("metrics-status", InvalidError), (1, 1));
+    }
+
+    /// errors.go `ErrorType`.
+    #[test]
+    fn error_type_decodes_the_message_prefix() {
+        use crate::admission::policy_mutating_metrics::MutationErrorType::*;
+        assert_eq!(error_type(None), NoError);
+        assert_eq!(error_type(Some("compilation failed: x")), CompileError);
+        assert_eq!(
+            error_type(Some(
+                "validation failed due to running out of cost budget, no further validation rules will be run"
+            )),
+            OutOfBudget
+        );
+        assert_eq!(error_type(Some("anything else")), InvalidError);
+        // Prefix match only: "compilation" must lead the message.
+        assert_eq!(error_type(Some("x compilation")), InvalidError);
     }
 }
