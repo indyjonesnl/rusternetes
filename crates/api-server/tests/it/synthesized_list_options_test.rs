@@ -11,6 +11,29 @@
 
 use rusternetes_test_support::harness::TestApiServer;
 
+/// #2180 item 2: `ListResource` decodes `labelSelector` with
+/// `metainternalversion.ParameterCodec` (`Convert_string_To_labels_Selector`
+/// -> `labels.Parse`) and answers a malformed selector with
+/// `errors.NewBadRequest(err.Error())`
+/// (`apiserver/pkg/endpoints/handlers/get.go`). The custom/external metrics
+/// handlers silently dropped unparseable selectors instead.
+#[tokio::test]
+async fn custom_and_external_metrics_reject_malformed_label_selector() {
+    let api = TestApiServer::new();
+    for base in [
+        "/apis/custom.metrics.k8s.io/v1beta2/namespaces/default/pods/qps",
+        "/apis/external.metrics.k8s.io/v1beta1/namespaces/default/qps",
+    ] {
+        let (s, b) = api
+            .get(&format!("{base}?labelSelector=a%3D%3D%3Db%3D%3D"))
+            .await;
+        assert_eq!(s.as_u16(), 400, "{base}: {b}");
+        assert_eq!(b["reason"], "BadRequest", "{base}: {b}");
+        let (s, b) = api.get(&format!("{base}?labelSelector=app%3Dweb")).await;
+        assert!(s.is_success(), "{base} valid selector: {s} {b}");
+    }
+}
+
 #[tokio::test]
 async fn synthesized_lists_reject_invalid_list_options() {
     let api = TestApiServer::new();
