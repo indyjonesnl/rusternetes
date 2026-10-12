@@ -1367,7 +1367,7 @@ impl VolumeManager {
             // (`desired_state_of_world.go:272-277`,
             // `desired_state_of_world_populator.go:310-315`); there is no
             // fallback directory (#3262). Covers a PV-resolved spec too (e.g.
-            // an nfs-sourced PersistentVolume).
+            // an iscsi-sourced PersistentVolume).
             Err(crate::volume_plugins::PluginLookupError::NoPluginMatched) => {
                 Err(NoPluginForVolume(volume.name.clone()).into())
             }
@@ -3587,7 +3587,24 @@ mod dispatch_tests {
         }
     }
 
-    /// #3262: an unimplemented kind (nfs, iscsi, fc, gitRepo, image) matches no
+    /// `nfs.ProbeVolumePlugins` is registered by the kubelet
+    /// (`cmd/kubelet/app/plugins.go`), so an `nfs` volume resolves to the
+    /// `kubernetes.io/nfs` plugin (`pkg/volume/nfs/nfs.go:66`) instead of
+    /// failing with `no volume plugin matched` (#3286).
+    #[test]
+    fn an_nfs_volume_is_claimed_by_the_nfs_plugin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(
+            tmp.path().to_string_lossy().to_string(),
+            None,
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+        let v = volume("n", json!({"nfs": {"server": "10.0.0.1", "path": "/export"}}));
+        assert_eq!(vm.plugin_name_for_volume(&v), "kubernetes.io/nfs");
+        assert!(vm.plugin_mgr.find_plugin_by_name("kubernetes.io/nfs").is_ok());
+    }
+
+    /// #3262: an unimplemented kind (iscsi, fc, gitRepo, image) matches no
     /// plugin. Upstream's desired-state populator fails the volume with
     /// `failed to get Plugin from volumeSpec for volume %q err=%v`
     /// (`desired_state_of_world.go:272-277`) over `ErrNoPluginMatched`
@@ -3602,17 +3619,17 @@ mod dispatch_tests {
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
         );
         let pod: Pod = serde_json::from_value(json!({
-            "metadata": {"name": "p", "namespace": "default", "uid": "uid-nfs"},
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-iscsi"},
             "spec": {"containers": [{"name": "c", "image": "i",
-                "volumeMounts": [{"name": "nfs-vol", "mountPath": "/m"}]}],
-                "volumes": [{"name": "nfs-vol", "nfs": {"server": "10.0.0.1", "path": "/export"}}]}
+                "volumeMounts": [{"name": "iscsi-vol", "mountPath": "/m"}]}],
+                "volumes": [{"name": "iscsi-vol", "iscsi": {"targetPortal": "10.0.0.1", "iqn": "iqn.x", "lun": 0}}]}
         }))
         .unwrap();
 
         let err = vm.create_pod_volumes(&pod).await.unwrap_err();
         assert_eq!(
             err.to_string(),
-            "failed to get Plugin from volumeSpec for volume \"nfs-vol\" err=no volume plugin matched"
+            "failed to get Plugin from volumeSpec for volume \"iscsi-vol\" err=no volume plugin matched"
         );
         assert!(crate::lifecycle::is_volume_wait_error(&err.to_string()));
         assert!(!tmp.path().join("pods").exists(), "no fallback dir");
@@ -3630,9 +3647,9 @@ mod dispatch_tests {
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
         );
         let pod: Pod = serde_json::from_value(json!({
-            "metadata": {"name": "p", "namespace": "default", "uid": "uid-nfs"},
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-iscsi"},
             "spec": {"containers": [{"name": "c", "image": "i"}],
-                "volumes": [{"name": "nfs-vol", "nfs": {"server": "s", "path": "/e"}}]}
+                "volumes": [{"name": "iscsi-vol", "iscsi": {"targetPortal": "s", "iqn": "iqn.x", "lun": 0}}]}
         }))
         .unwrap();
         assert!(vm.create_pod_volumes(&pod).await.unwrap().is_empty());
