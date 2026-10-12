@@ -73,12 +73,14 @@ async fn resync_finalizes_a_crd_left_terminating() {
     stored["metadata"]["finalizers"] = json!([FINALIZER]);
     api.storage.update(&key, &stored).await.unwrap();
 
+    // The resync queues the CRD on the finalizer's workqueue
+    // (crd_finalizer.go:348-352); its workers do the rest.
     let backend = Arc::new(StorageBackend::Memory(api.storage.clone()));
-    let failed = new_rest(backend).resync().await;
+    let rest = new_rest(backend);
+    let failed = rest.resync().await;
     assert!(failed.is_empty(), "resync failed for {failed:?}");
-
-    let (status, out) = api.get(&format!("{CRDS}/widgets.example.com")).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{out}");
+    wait_until_gone(&api).await;
+    drop(rest);
     let leftover: Vec<Value> = api
         .storage
         .list(&rusternetes_storage::build_prefix(
@@ -156,7 +158,9 @@ async fn cleanup_waits_for_an_instance_with_a_finalizer() {
     api.storage.update(&key, &stored).await.unwrap();
 
     let backend = Arc::new(StorageBackend::Memory(api.storage.clone()));
-    let resync = tokio::spawn(async move { new_rest(backend).resync().await });
+    let rest = new_rest(backend);
+    let failed = rest.resync().await;
+    assert!(failed.is_empty(), "resync failed for {failed:?}");
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // The instance is still there, marked for deletion; the CRD is too.
@@ -175,8 +179,20 @@ async fn cleanup_waits_for_an_instance_with_a_finalizer() {
 
     // The instance's controller drops the finalizer; the CRD then goes.
     api.storage.delete(&ikey).await.unwrap();
-    let failed = resync.await.unwrap();
-    assert!(failed.is_empty(), "resync failed for {failed:?}");
+    wait_until_gone(&api).await;
+    drop(rest);
+}
+
+/// The finalizer's drain poll runs every 5s (crd_finalizer.go:253), so wait
+/// a little longer than that.
+async fn wait_until_gone(api: &TestApiServer) {
+    for _ in 0..300 {
+        let (status, _) = api.get(&format!("{CRDS}/widgets.example.com")).await;
+        if status == StatusCode::NOT_FOUND {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     let (status, out) = api.get(&format!("{CRDS}/widgets.example.com")).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{out}");
 }

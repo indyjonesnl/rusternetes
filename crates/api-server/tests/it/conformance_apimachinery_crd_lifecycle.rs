@@ -277,12 +277,20 @@ async fn crd_create_and_delete_round_trip() {
         "CRD delete must succeed, got {status}"
     );
 
-    // After delete, GET returns 404
-    let (status, _) = get(
-        &router,
-        "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/foos.example.com",
-    )
-    .await;
+    // The CRD finalizer runs off its own queue (crd_finalizer.go:73-76), so
+    // the CRD goes shortly after the delete returns: GET returns 404.
+    let mut status = 0;
+    for _ in 0..200 {
+        (status, _) = get(
+            &router,
+            "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/foos.example.com",
+        )
+        .await;
+        if status == 404 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     assert_eq!(status, 404, "deleted CRD must 404 on GET");
 }
 

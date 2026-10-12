@@ -31,7 +31,8 @@ use tokio::sync::Notify;
 use tracing::warn;
 
 use super::condition_controllers::ConditionControllers;
-use super::customresourcedefinition::{ControllerRateLimiter, CrdRest};
+use super::customresourcedefinition::{ControllerRateLimiter, CrdRest, CRD_FINALIZER_WORKERS};
+use super::finalizer_queue::FinalizerQueue;
 
 #[derive(Default)]
 struct Queue {
@@ -46,6 +47,9 @@ pub struct CrdControllers {
     notify: Arc<Notify>,
     started: AtomicBool,
     limiter: Mutex<ControllerRateLimiter>,
+    /// The CRD finalizer's own workqueue (crd_finalizer.go:73-76), drained by
+    /// [`CRD_FINALIZER_WORKERS`] workers.
+    pub(super) finalizer: Arc<FinalizerQueue>,
     pub(super) conditions: ConditionControllers,
 }
 
@@ -56,6 +60,7 @@ impl Default for CrdControllers {
             notify: Arc::new(Notify::new()),
             started: AtomicBool::new(false),
             limiter: Mutex::new(ControllerRateLimiter::new()),
+            finalizer: Arc::default(),
             conditions: ConditionControllers::default(),
         }
     }
@@ -65,6 +70,7 @@ impl Drop for CrdControllers {
     /// Wake the worker so it sees the controllers are gone and exits.
     fn drop(&mut self) {
         self.notify.notify_one();
+        self.finalizer.wake_all();
     }
 }
 
@@ -112,6 +118,36 @@ impl CrdControllers {
         Some(name)
     }
 
+    /// `runWorker` / `processNextWorkItem` (crd_finalizer.go:292-318): take a
+    /// key off the finalizer queue, run `sync`, `Forget` the key on success or
+    /// `AddRateLimited` it on error, then `Done`. The worker holds the
+    /// controllers only weakly: when the last handle goes, it exits.
+    fn spawn_finalizer_worker(self: &Arc<Self>, storage: Arc<StorageBackend>) {
+        let weak = Arc::downgrade(self);
+        let queue = self.finalizer.clone();
+        tokio::spawn(async move {
+            loop {
+                let Some(controllers) = weak.upgrade() else {
+                    return;
+                };
+                let Some(key) = queue.get() else {
+                    drop(controllers);
+                    queue.notified().await;
+                    continue;
+                };
+                let rest = CrdRest::with_controllers(storage.clone(), controllers.clone());
+                match rest.process_finalizer_key(&key).await {
+                    Ok(()) => queue.forget(&key),
+                    Err(e) => {
+                        warn!("customresourcedefinition {key}: finalizer failed: {e}");
+                        queue.add_rate_limited(&key);
+                    }
+                }
+                queue.done(&key);
+            }
+        });
+    }
+
     /// The worker, started once on the first add through a [`CrdRest`]
     /// (`go wait.UntilWithContext(ctx, c.runWorker, time.Second)`). It holds
     /// the controllers only weakly: when the last handle goes, it exits.
@@ -122,6 +158,11 @@ impl CrdControllers {
             .is_err()
         {
             return;
+        }
+        // `for i := 0; i < workers; i++ { go wait.UntilWithContext(ctx,
+        // c.runWorker, time.Second) }` (crd_finalizer.go:283-285).
+        for _ in 0..CRD_FINALIZER_WORKERS {
+            self.spawn_finalizer_worker(storage.clone());
         }
         let weak = Arc::downgrade(self);
         let notify = self.notify.clone();

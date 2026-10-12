@@ -5,3 +5,4 @@ pub mod controller_queue;
 pub mod controllers;
 pub mod customresource;
 pub mod customresourcedefinition;
+pub mod finalizer_queue;

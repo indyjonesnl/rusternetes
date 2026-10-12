@@ -318,8 +318,18 @@ async fn deleting_a_crd_deletes_its_instances() {
             .is_some_and(|f| f.contains(&json!("customresourcecleanup.apiextensions.k8s.io"))),
         "{out}"
     );
-    let (status, _) = api.get(&format!("{CRDS}/widgets.example.com")).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    // The finalizer runs off its own queue (crd_finalizer.go:73-76), so the
+    // CRD goes shortly after the answer, not with it.
+    let mut gone = false;
+    for _ in 0..200 {
+        let (status, _) = api.get(&format!("{CRDS}/widgets.example.com")).await;
+        if status == StatusCode::NOT_FOUND {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(gone, "the CRD was never finalized");
 
     create(&api, &crd("widgets", "Widget", "example.com")).await;
     let (status, out) = api.get(cr).await;
@@ -369,7 +379,10 @@ async fn delete_returns_before_the_finalizer_drains_the_instances() {
     for _ in 0..100 {
         let (status, out) = api.get(&crd_url).await;
         assert_eq!(status, StatusCode::OK, "{out}");
-        if condition(&out, "Terminating").is_some_and(|c| c["status"] == "True") {
+        // (`REST.Delete` itself leaves `InstanceDeletionPending`, etcd.go:116-174.)
+        if condition(&out, "Terminating")
+            .is_some_and(|c| c["status"] == "True" && c["reason"] == "InstanceDeletionInProgress")
+        {
             terminating = Some(out);
             break;
         }
