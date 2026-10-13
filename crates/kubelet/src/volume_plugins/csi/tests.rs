@@ -1908,3 +1908,103 @@ fn supports_selinux_context_mount_errors_when_cache_unsynced_or_lister_missing()
     assert!(unsynced.supports_selinux_context_mount(&spec).is_err());
     assert!(plugin().supports_selinux_context_mount(&spec).is_err());
 }
+
+// ---- CanAttach (csi_plugin.go:675-700, skipAttach :858-871) ----------------
+//
+// Cases follow `TestPluginCanAttach` (`csi_plugin_test.go:861-911`) plus the
+// `skipAttach` arms upstream's code takes (CSIDriver absent / attachRequired
+// unset / lister unsynced).
+
+fn can_attach_of(
+    p: &CsiPlugin,
+    vol: &Volume,
+    pv: Option<&rusternetes_common::resources::PersistentVolume>,
+) -> Result<bool> {
+    p.can_attach(&Spec {
+        volume: vol,
+        persistent_volume: pv,
+        read_only: false,
+    })
+}
+
+#[test]
+fn can_attach_ephemeral_inline_is_false() {
+    // "non-attachable inline": ephemeral mode short-circuits (`:681-684`).
+    let p = CsiPlugin::new(lister_host(
+        &[csi_driver_obj(
+            "inline.csi.example.com",
+            json!({"attachRequired": true}),
+        )],
+        true,
+    ));
+    let inline: Volume =
+        serde_json::from_value(json!({"name": "v", "csi": {"driver": "inline.csi.example.com"}}))
+            .unwrap();
+    assert!(!can_attach_of(&p, &inline, None).unwrap());
+}
+
+#[test]
+fn can_attach_pv_follows_csidriver_attach_required() {
+    let p = CsiPlugin::new(lister_host(
+        &[
+            csi_driver_obj("attach.csi.example.com", json!({"attachRequired": true})),
+            csi_driver_obj("noattach.csi.example.com", json!({"attachRequired": false})),
+            csi_driver_obj("unset.csi.example.com", json!({})),
+        ],
+        true,
+    ));
+    let v = claim_volume();
+    // "attachable PV"
+    assert!(can_attach_of(&p, &v, Some(&pv("attach.csi.example.com", json!({})))).unwrap());
+    // skipAttach: AttachRequired == false.
+    assert!(!can_attach_of(&p, &v, Some(&pv("noattach.csi.example.com", json!({})))).unwrap());
+    // AttachRequired nil does not skip.
+    assert!(can_attach_of(&p, &v, Some(&pv("unset.csi.example.com", json!({})))).unwrap());
+    // "Don't skip attach if CSIDriver does not exist" (`:861-864`).
+    assert!(can_attach_of(&p, &v, Some(&pv("missing.csi.example.com", json!({})))).unwrap());
+}
+
+#[test]
+fn can_attach_incomplete_spec_is_an_error() {
+    // "incomplete spec": getVolumeLifecycleMode -> getSourceFromSpec fails
+    // with "volume source not found in volume.Spec" (`csi_util.go:161`).
+    let p = CsiPlugin::new(lister_host(&[], true));
+    let v = claim_volume();
+    let err = can_attach_of(&p, &v, None).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("volume source not found in volume.Spec"),
+        "{err}"
+    );
+}
+
+#[test]
+fn can_attach_surfaces_an_unsynced_lister_error() {
+    // skipAttach returns any non-NotFound getCSIDriver error (`:861-862`).
+    let p = CsiPlugin::new(lister_host(&[], false));
+    let v = claim_volume();
+    assert!(can_attach_of(&p, &v, Some(&pv("d.csi.example.com", json!({})))).is_err());
+}
+
+#[test]
+fn registry_finds_csi_as_attachable_only_when_can_attach() {
+    // `FindAttachablePluginBySpec` (`plugins.go:805-818`).
+    let h = lister_host(
+        &[csi_driver_obj(
+            "noattach.csi.example.com",
+            json!({"attachRequired": false}),
+        )],
+        true,
+    );
+    let mgr = crate::volume_plugins::VolumePluginMgr::new(vec![Box::new(CsiPlugin::new(h))]);
+    let v = claim_volume();
+    let yes = pv("other.csi.example.com", json!({}));
+    let no = pv("noattach.csi.example.com", json!({}));
+    let spec = |pv| Spec {
+        volume: &v,
+        persistent_volume: Some(pv),
+        read_only: false,
+    };
+    assert!(mgr.find_attachable_plugin_by_spec(&spec(&yes)).is_some());
+    assert!(mgr.find_attachable_plugin_by_spec(&spec(&no)).is_none());
+}

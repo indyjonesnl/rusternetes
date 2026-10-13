@@ -122,21 +122,18 @@ pub trait VolumePlugin: Send + Sync {
     /// `SupportsSELinuxContextMount` (`plugins.go:180`).
     fn supports_selinux_context_mount(&self, spec: &Spec<'_>) -> Result<bool>;
 
-    /// True when upstream's `FindAttachablePluginBySpec` would return this
-    /// plugin for `spec` (`plugins.go:805-818`).
+    /// `AttachableVolumePlugin.CanAttach` (`plugins.go:232-234`), with the
+    /// type assertion to `AttachableVolumePlugin` folded in as the default:
+    /// a plugin that is not attachable answers `Ok(false)`, as upstream's
+    /// `FindAttachablePluginBySpec` (`plugins.go:805-818`) does when the
+    /// assertion fails. Only CSI implements it; every other plugin this crate
+    /// registers is not an `AttachableVolumePlugin` upstream either.
     ///
-    /// **Deliberate collapse.** Upstream type-asserts the plugin to
-    /// `volume.AttachableVolumePlugin`, then calls `CanAttach(spec)`, and
-    /// `util.IsAttachableVolume` additionally requires `NewAttacher()` to
-    /// succeed (`pkg/volume/util/util.go:635-645`). We have neither the
-    /// sub-interface nor an `Attacher` type, and inventing them to hold one
-    /// boolean would be worse than stating the predicate directly. Every
-    /// plugin this crate registers answers `false`, which is the same answer
-    /// upstream gives for all seven of them. When an attachable plugin lands,
-    /// this becomes `self.as_attachable().is_some_and(|a| a.can_attach(spec))`
-    /// and the branch that reads it does not move.
-    fn can_attach(&self, _spec: &Spec<'_>) -> bool {
-        false
+    /// Deliberate collapse (kept): `util.IsAttachableVolume` also requires
+    /// `NewAttacher()` to succeed (`util.go:635-645`); we have no `Attacher`
+    /// type (the kubelet never attaches), so that check is not made.
+    fn can_attach(&self, _spec: &Spec<'_>) -> Result<bool> {
+        Ok(false)
     }
 
     /// True when upstream's `FindDeviceMountablePluginBySpec` would return
