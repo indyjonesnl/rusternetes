@@ -24,8 +24,10 @@ pub struct Scheduler<S: Storage + Send + Sync + 'static = StorageBackend> {
     /// `data_plane.rs` for the classification of the original 22 storage sites.
     data: DataPlane<S>,
     interval: Duration,
-    /// Name of this scheduler (default "default-scheduler")
-    scheduler_name: String,
+    /// Scheduling profiles by scheduler name (`Scheduler.Profiles`,
+    /// pkg/scheduler/scheduler.go). A single `default-scheduler` profile unless
+    /// the configuration lists more.
+    pub(crate) profiles: crate::profile::Map,
     /// Unified event recorder for STORAGE mode — the scheduler is the source of
     /// truth for the `Scheduled` / `FailedScheduling` events, routed through the
     /// shared `EventCorrelator` (dedup/count/series + spam-filter) like
@@ -44,67 +46,65 @@ pub struct Scheduler<S: Storage + Send + Sync + 'static = StorageBackend> {
     /// Long-lived VolumeBinding assume caches (`volumeBinder.pvCache` /
     /// `pvcCache`), refreshed from the volume listers every cycle.
     volume_binder: Arc<std::sync::Mutex<crate::volume_assume::VolumeBinder>>,
-    /// `VolumeBindingArgs.BindTimeoutSeconds` (default 600).
-    pub(crate) volume_bind_timeout: Duration,
-    /// Scorer shape built from `VolumeBindingArgs.Shape` (volume_binding.go:642-653),
-    /// already scaled to `MaxNodeScore`. Defaults to `volume_binding::default_shape()`.
-    pub(crate) volume_shape: Vec<volume_binding::FunctionShapePoint>,
     /// Poll interval of `BindPodVolumes` (1s upstream).
     pub(crate) volume_bind_poll: Duration,
 }
 
 impl Scheduler<StorageBackend> {
-    pub fn new(storage: Arc<StorageBackend>, interval_secs: u64) -> Self {
-        Self::new_with_name(storage, interval_secs, "default-scheduler".to_string())
-    }
-
-    /// Construct an api-server-backed scheduler (in-cluster static pod mode).
-    /// Reads come from the pods/nodes informers; writes go through the binding
-    /// subresource + status PUT; events POST to `/api/v1/.../events`.
-    pub fn new_api(api: ApiBackend, interval_secs: u64, scheduler_name: String) -> Self {
+    /// Construct an api-server-backed scheduler (in-cluster static pod mode)
+    /// over the given profiles. Reads come from the pods/nodes informers;
+    /// writes go through the binding subresource + status PUT; events POST to
+    /// `/api/v1/.../events`.
+    pub fn new_api_with_profiles(
+        api: ApiBackend,
+        interval_secs: u64,
+        profiles: crate::profile::Map,
+    ) -> Self {
         Self {
             data: DataPlane::Api(api),
             recorder: None,
             interval: Duration::from_secs(interval_secs),
-            scheduler_name,
+            profiles,
             nominations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             volume_binder: Arc::default(),
-            volume_bind_timeout: crate::volume_bind::DEFAULT_BIND_TIMEOUT,
-            volume_shape: volume_binding::default_shape(),
             volume_bind_poll: crate::volume_bind::BIND_POLL_INTERVAL,
         }
     }
 }
 
+/// A map holding one defaulted profile named `scheduler_name`.
+#[allow(dead_code)] // test/library helper behind `new_with_name`
+fn single_profile(scheduler_name: &str) -> crate::profile::Map {
+    crate::profile::Map::new_map(vec![crate::profile::Profile::named(scheduler_name)])
+        .expect("a single named, defaulted profile is always valid")
+}
+
 impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
+    #[allow(dead_code)] // library/test API; the binary builds profiles from config
     pub fn new_with_name(storage: Arc<S>, interval_secs: u64, scheduler_name: String) -> Self {
+        Self::new_with_profiles(storage, interval_secs, single_profile(&scheduler_name))
+    }
+
+    /// Construct over a multi-profile [`crate::profile::Map`].
+    pub fn new_with_profiles(
+        storage: Arc<S>,
+        interval_secs: u64,
+        profiles: crate::profile::Map,
+    ) -> Self {
         Self {
             recorder: Some(EventRecorder::new(Arc::clone(&storage))),
             data: DataPlane::Storage(storage),
             interval: Duration::from_secs(interval_secs),
-            scheduler_name,
+            profiles,
             nominations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             volume_binder: Arc::default(),
-            volume_bind_timeout: crate::volume_bind::DEFAULT_BIND_TIMEOUT,
-            volume_shape: volume_binding::default_shape(),
             volume_bind_poll: crate::volume_bind::BIND_POLL_INTERVAL,
         }
     }
 
-    /// Apply validated `VolumeBindingArgs` (see `scheduler_config`): the bind
-    /// timeout and the capacity-scoring shape.
-    pub fn with_volume_binding_args(
-        mut self,
-        args: &crate::scheduler_config::VolumeBindingArgs,
-    ) -> Self {
-        if let Some(secs) = args.bind_timeout_seconds {
-            self.volume_bind_timeout = Duration::from_secs(secs.max(0) as u64);
-        }
-        let shape = args.scorer_shape();
-        if !shape.is_empty() {
-            self.volume_shape = shape;
-        }
-        self
+    /// `frameworkForPod` (schedule_one.go:390-396).
+    pub(crate) fn profile_for(&self, pod: &Pod) -> Result<&crate::profile::Profile, String> {
+        self.profiles.framework_for_pod(pod)
     }
 
     /// Record a preemption nomination synchronously (in-memory) and persist it
@@ -157,11 +157,21 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         noms.retain(|k, _| live.contains(k));
     }
 
-    /// Emit a pod-scoped event through the unified recorder, sourced from this
-    /// scheduler (`source.component = scheduler_name`). Errors are logged, never
-    /// propagated — a failed event must not abort a bind/scheduling decision.
+    /// `responsibleForPod` (eventhandlers.go:474-476):
+    /// `profiles.HandlesSchedulerName(pod.Spec.SchedulerName)`.
+    fn responsible_for_pod(&self, pod: &Pod) -> bool {
+        self.profiles
+            .handles_scheduler_name(crate::profile::pod_scheduler_name(pod))
+    }
+
+    /// Emit a pod-scoped event through the unified recorder, sourced from the
+    /// pod's profile (`source.component` = its `schedulerName`, the recorder
+    /// `NewRecorderFactory` builds per profile, profile.go:85-90). Errors are
+    /// logged, never propagated — a failed event must not abort a
+    /// bind/scheduling decision.
     async fn emit_pod_event(&self, pod: &Pod, event_type: EventType, reason: &str, message: &str) {
         let ns = pod.metadata.namespace.as_deref().unwrap_or("default");
+        let component = crate::profile::pod_scheduler_name(pod);
         // API mode: POST through the data plane's client recorder.
         if let Some(recorder) = self.recorder.as_ref() {
             let involved = ObjectReference {
@@ -174,7 +184,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 field_path: None,
             };
             let source = EventSource {
-                component: self.scheduler_name.clone(),
+                component: component.to_string(),
                 host: None,
             };
             if let Err(e) = recorder
@@ -189,6 +199,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         } else {
             self.data
                 .emit_event_api(
+                    component,
                     ns,
                     reason,
                     message,
@@ -237,8 +248,9 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         use futures::StreamExt;
 
         info!(
-            "Scheduler '{}' started (watch-based, resync every {:?})",
-            self.scheduler_name, self.interval
+            "Scheduler profiles {:?} started (watch-based, resync every {:?})",
+            self.profiles.names(),
+            self.interval
         );
 
         let queue = WorkQueue::new();
@@ -413,13 +425,16 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         if !is_pending {
             return Ok(()); // not pending
         }
-        let pod_scheduler = pod
-            .spec
-            .as_ref()
-            .and_then(|s| s.scheduler_name.as_deref())
-            .unwrap_or("default-scheduler");
-        if pod_scheduler != self.scheduler_name {
+        // `responsibleForPod` (eventhandlers.go:474-476): only pods naming one
+        // of our profiles enter the queue.
+        if !self.responsible_for_pod(&pod) {
             return Ok(()); // wrong scheduler
+        }
+        // `frameworkForPod` (schedule_one.go:85-92): cannot fail after the
+        // check above; upstream logs and drops the pod if it does.
+        if let Err(e) = self.profile_for(&pod) {
+            error!(error = %e, pod = key, "Error occurred");
+            return Ok(());
         }
 
         // Get nodes and all pods for scheduling context
@@ -490,7 +505,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 name
             );
             for victim in &victims {
-                if let Err(e) = self.evict_pod(victim).await {
+                if let Err(e) = self.evict_pod(&pod, victim).await {
                     error!(
                         "Failed to evict victim pod {}/{}: {}",
                         victim.metadata.namespace.as_deref().unwrap_or("default"),
@@ -566,15 +581,9 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     return false;
                 }
 
-                // Check if pod is assigned to this scheduler
-                // If schedulerName is not specified, defaults to "default-scheduler"
-                let pod_scheduler_name = p
-                    .spec
-                    .as_ref()
-                    .and_then(|s| s.scheduler_name.as_deref())
-                    .unwrap_or("default-scheduler");
-
-                pod_scheduler_name == self.scheduler_name
+                // `responsibleForPod` (eventhandlers.go:474-476): the pod's
+                // schedulerName (default "default-scheduler") names a profile.
+                self.responsible_for_pod(p)
             })
             .cloned()
             .collect();
@@ -686,7 +695,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
 
                     // Evict lower-priority pods
                     for victim in &pods_to_evict {
-                        if let Err(e) = self.evict_pod(victim).await {
+                        if let Err(e) = self.evict_pod(&pod, victim).await {
                             error!(
                                 "Failed to evict pod {}/{}: {}",
                                 victim.metadata.namespace.as_deref().unwrap_or("default"),
@@ -885,6 +894,10 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         vols: Option<volume_binding::PodVolumes>,
     ) -> rusternetes_common::Result<()> {
         use crate::volume_bind::{self as vb, PreBindPreFlight, VolumeBindingState};
+        let bind_timeout = self
+            .profile_for(&pod)
+            .map_err(rusternetes_common::Error::Internal)?
+            .volume_bind_timeout;
         let ns = pod
             .metadata
             .namespace
@@ -922,7 +935,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     &mut state,
                     &pod,
                     node_name,
-                    self.volume_bind_timeout,
+                    bind_timeout,
                     self.volume_bind_poll,
                 )
                 .await
@@ -1119,13 +1132,18 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         // VolumeBinding PreScore (volume_binding.go:456-468): `pl.scorer` is
         // only built when StorageCapacityScoring is on (volume_binding.go:642-653);
         // otherwise, or when PreScore says Skip, Score is not run.
+        // Per-profile VolumeBindingArgs.Shape (the pod's own framework).
+        let volume_shape = self
+            .profile_for(pod)
+            .map(|p| p.volume_shape.clone())
+            .unwrap_or_else(|_| volume_binding::default_shape());
         let scoring_enabled = rusternetes_common::feature_gates::enabled(
             rusternetes_common::feature_gates::Feature::StorageCapacityScoring,
         );
         let volume_scorer = if scoring_enabled
             && !volume_binding::pre_score_skip(&pod_volumes_by_node, scoring_enabled)
         {
-            Some(volume_binding::build_scorer_function(&self.volume_shape))
+            Some(volume_binding::build_scorer_function(&volume_shape))
         } else {
             None
         };
@@ -1510,7 +1528,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
     /// `util.DeletePod` (`cs.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, ...)`,
     /// pkg/scheduler/util/utils.go:137-138). Matching on name alone evicted a
     /// same-named pod in every other namespace too (#2477).
-    async fn evict_pod(&self, victim: &Pod) -> rusternetes_common::Result<()> {
+    async fn evict_pod(&self, preemptor: &Pod, victim: &Pod) -> rusternetes_common::Result<()> {
         let pod_name = victim.metadata.name.as_str();
         let victim_ns = victim.metadata.namespace.as_deref().unwrap_or("default");
         let all_pods: Vec<Pod> = self.data.list_pods().await?;
@@ -1540,7 +1558,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                         // Add DisruptionTarget condition (K8s conformance requirement)
                         let disruption_condition =
                             crate::data_plane::preemption_disruption_condition(
-                                &self.scheduler_name,
+                                crate::profile::pod_scheduler_name(preemptor),
                             );
                         let conditions = status.conditions.get_or_insert_with(Vec::new);
                         conditions.push(disruption_condition);
@@ -2263,7 +2281,11 @@ mod tests {
     /// VolumeBinding Score wiring (#3036), StorageCapacityScoring on: with the
     /// default shape (utilization 0 -> 100, 100 -> 0) the node whose static
     /// PV leaves more room wins even though `node-1` would win the tie-break.
+    // `serial`: it flips a process-global feature gate that
+    // `scheduler_config::tests::wired_into_validate_profiles` (also serial)
+    // resets; unserialised, plain `cargo test` raced them.
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_volume_binding_score_prefers_node_with_more_free_capacity() {
         let _gate = rusternetes_common::feature_gates::with_feature(
             rusternetes_common::feature_gates::Feature::StorageCapacityScoring,
@@ -2415,7 +2437,11 @@ mod tests {
         let storage = Arc::new(MemoryStorage::new());
         let mut scheduler =
             Scheduler::new_with_name(storage.clone(), 1, "default-scheduler".to_string());
-        scheduler.volume_bind_timeout = Duration::from_secs(10);
+        scheduler
+            .profiles
+            .get_mut("default-scheduler")
+            .unwrap()
+            .volume_bind_timeout = Duration::from_secs(10);
         scheduler.volume_bind_poll = Duration::from_millis(20);
         wffc_fixture(&storage).await;
 
@@ -2476,7 +2502,11 @@ mod tests {
         let storage = Arc::new(MemoryStorage::new());
         let mut scheduler =
             Scheduler::new_with_name(storage.clone(), 1, "default-scheduler".to_string());
-        scheduler.volume_bind_timeout = Duration::from_millis(200);
+        scheduler
+            .profiles
+            .get_mut("default-scheduler")
+            .unwrap()
+            .volume_bind_timeout = Duration::from_millis(200);
         scheduler.volume_bind_poll = Duration::from_millis(20);
         wffc_fixture(&storage).await;
 
@@ -2628,6 +2658,97 @@ mod tests {
         );
     }
 
+    /// #3346: with several profiles the scheduler schedules every pod whose
+    /// `spec.schedulerName` names a profile (`responsibleForPod`,
+    /// eventhandlers.go:474-476), reports each Scheduled event under that
+    /// profile's name (`NewRecorderFactory`, profile.go:85-90), and leaves pods
+    /// of unknown scheduler names alone.
+    #[tokio::test]
+    async fn test_multi_profile_routes_pods_by_scheduler_name() {
+        use rusternetes_common::resources::{Event, ObjectReference};
+        let storage = Arc::new(MemoryStorage::new());
+        let profiles = crate::profile::Map::new_map(vec![
+            crate::profile::Profile::named("default-scheduler"),
+            crate::profile::Profile::named("my-sched"),
+        ])
+        .unwrap();
+        let scheduler = Scheduler::new_with_profiles(storage.clone(), 1, profiles);
+        storage
+            .create("/registry/nodes/node-1", &make_node("node-1"))
+            .await
+            .unwrap();
+        for (name, sn) in [
+            ("p-default", "default-scheduler"),
+            ("p-mine", "my-sched"),
+            ("p-other", "other-sched"),
+        ] {
+            let mut pod = make_pending_pod(name, "default");
+            pod.metadata.uid = format!("{name}-uid");
+            pod.spec.as_mut().unwrap().scheduler_name = Some(sn.to_string());
+            storage
+                .create(&format!("/registry/pods/default/{name}"), &pod)
+                .await
+                .unwrap();
+        }
+        scheduler.schedule_pending_pods().await.unwrap();
+        let node_of = |name: &'static str| {
+            let storage = storage.clone();
+            async move {
+                storage
+                    .get::<Pod>(&format!("/registry/pods/default/{name}"))
+                    .await
+                    .unwrap()
+                    .spec
+                    .and_then(|s| s.node_name)
+            }
+        };
+        assert_eq!(node_of("p-default").await.as_deref(), Some("node-1"));
+        assert_eq!(node_of("p-mine").await.as_deref(), Some("node-1"));
+        assert_eq!(node_of("p-other").await, None);
+        for (name, comp) in [("p-default", "default-scheduler"), ("p-mine", "my-sched")] {
+            let involved = ObjectReference {
+                kind: Some("Pod".to_string()),
+                namespace: Some("default".to_string()),
+                name: Some(name.to_string()),
+                uid: Some(format!("{name}-uid")),
+                api_version: Some("v1".to_string()),
+                resource_version: None,
+                field_path: None,
+            };
+            let key = format!(
+                "/registry/events/default/{}",
+                Event::generate_name(&involved, "Scheduled")
+            );
+            let ev: Event = storage.get(&key).await.unwrap();
+            assert_eq!(ev.source.component, comp, "{name}");
+        }
+    }
+
+    /// #3346: the `VolumeBinding` bind timeout is read from the pod's own
+    /// profile (each profile has its own framework + plugin args).
+    #[tokio::test]
+    async fn test_profile_for_pod_resolves_per_profile_args() {
+        let mut slow = crate::profile::Profile::named("slow");
+        slow.volume_bind_timeout = Duration::from_secs(7);
+        let profiles = crate::profile::Map::new_map(vec![
+            crate::profile::Profile::named("default-scheduler"),
+            slow,
+        ])
+        .unwrap();
+        let scheduler = Scheduler::new_with_profiles(Arc::new(MemoryStorage::new()), 1, profiles);
+        let mut pod = make_pending_pod("x", "default");
+        pod.spec.as_mut().unwrap().scheduler_name = Some("slow".to_string());
+        assert_eq!(
+            scheduler.profile_for(&pod).unwrap().volume_bind_timeout,
+            Duration::from_secs(7)
+        );
+        pod.spec.as_mut().unwrap().scheduler_name = Some("nope".to_string());
+        assert_eq!(
+            scheduler.profile_for(&pod).unwrap_err(),
+            "profile not found for scheduler name \"nope\""
+        );
+    }
+
     #[tokio::test]
     async fn test_scheduler_does_not_reschedule_already_scheduled_pod() {
         let storage = Arc::new(MemoryStorage::new());
@@ -2713,7 +2834,9 @@ mod tests {
             .unwrap();
 
         // Evict the pod (private method, accessible from within the module)
-        scheduler.evict_pod(&low_pod).await.unwrap();
+        let mut preemptor = make_pending_pod("high-pod", "default");
+        preemptor.spec.as_mut().unwrap().scheduler_name = Some("my-sched".to_string());
+        scheduler.evict_pod(&preemptor, &low_pod).await.unwrap();
 
         // The pod should still exist in storage with:
         // 1. deletionTimestamp set
@@ -2751,6 +2874,11 @@ mod tests {
         );
         let dt = disruption.unwrap();
         assert_eq!(dt.status, "True");
+        // preemption.go:191: the PREEMPTOR's scheduler name, not a global one.
+        assert_eq!(
+            dt.message.as_deref(),
+            Some("my-sched: preempting to accommodate a higher priority pod")
+        );
         assert_eq!(dt.reason.as_deref(), Some("PreemptionByScheduler"));
     }
 
@@ -2773,7 +2901,8 @@ mod tests {
         }
         let victim: Pod = storage.get("/registry/pods/ns-a/w").await.unwrap();
 
-        scheduler.evict_pod(&victim).await.unwrap();
+        let preemptor = make_pending_pod("high-pod", "ns-c");
+        scheduler.evict_pod(&preemptor, &victim).await.unwrap();
 
         let a: Pod = storage.get("/registry/pods/ns-a/w").await.unwrap();
         let b: Pod = storage.get("/registry/pods/ns-b/w").await.unwrap();

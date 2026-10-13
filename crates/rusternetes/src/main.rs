@@ -265,14 +265,19 @@ fn apply_feature_gates(args: &Args) -> Result<()> {
 
 /// Build the embedded scheduler config, loading `--scheduler-config` when set.
 fn scheduler_config_from_args(args: &Args) -> Result<rusternetes_scheduler::SchedulerConfig> {
-    let volume_binding_args = match &args.scheduler_config {
-        Some(path) => rusternetes_scheduler::scheduler_config::load_volume_binding_args(path)
+    let profiles = match &args.scheduler_config {
+        Some(path) => rusternetes_scheduler::scheduler_config::load_profiles(path)
             .map_err(|e| anyhow::anyhow!("--scheduler-config: {e}"))?,
-        None => Default::default(),
+        None => rusternetes_scheduler::profile::Map::new_map(vec![
+            rusternetes_scheduler::profile::Profile::named(
+                rusternetes_scheduler::profile::DEFAULT_SCHEDULER_NAME,
+            ),
+        ])
+        .map_err(|e| anyhow::anyhow!(e))?,
     };
     Ok(rusternetes_scheduler::SchedulerConfig {
         interval: args.scheduler_interval,
-        volume_binding_args,
+        profiles,
     })
 }
 
@@ -618,7 +623,13 @@ mod feature_gates_flag_tests {
         let args = Args::try_parse_from(["rusternetes", "--scheduler-config", f.to_str().unwrap()])
             .unwrap();
         let cfg = scheduler_config_from_args(&args).unwrap();
-        assert_eq!(cfg.volume_binding_args.bind_timeout_seconds, Some(7));
+        assert_eq!(
+            cfg.profiles
+                .get("default-scheduler")
+                .unwrap()
+                .volume_bind_timeout,
+            std::time::Duration::from_secs(7)
+        );
         let none = scheduler_config_from_args(&parse("--scheduler-interval=3")).unwrap();
         assert_eq!(none.interval, 3);
         let _ = std::fs::remove_dir_all(&dir);

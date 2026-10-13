@@ -118,7 +118,8 @@ type PodReflector = Arc<Reflector<Pod, fn(&Pod) -> String>>;
 type NodeReflector = Arc<Reflector<Node, fn(&Node) -> String>>;
 type PriorityClassReflector = Arc<Reflector<PriorityClass, fn(&PriorityClass) -> String>>;
 
-/// The api-server-backed data plane: client + informers + event recorder.
+/// The api-server-backed data plane: client + informers. Event recorders are
+/// built per profile via [`ApiBackend::new_recorder`].
 pub struct ApiBackend {
     pub(crate) client: Arc<ApiClient>,
     pub(crate) pods: PodReflector,
@@ -128,13 +129,12 @@ pub struct ApiBackend {
     /// collapsing pod priorities to 0 and breaking preemption ordering. A
     /// local informer store is always complete and current.
     pub(crate) priority_classes: PriorityClassReflector,
-    pub(crate) recorder: ClientEventRecorder,
 }
 
 impl ApiBackend {
     /// Wire an API backend from a connected [`ApiClient`]. Builds the pods and
     /// nodes reflectors over `/api/v1/pods` and `/api/v1/nodes`.
-    pub fn new(client: Arc<ApiClient>, scheduler_name: &str) -> Self {
+    pub fn new(client: Arc<ApiClient>) -> Self {
         use rusternetes_client::reflector::ApiListWatch;
         let pods_lw = Arc::new(ApiListWatch::new(Arc::clone(&client), "/api/v1/pods"));
         let nodes_lw = Arc::new(ApiListWatch::new(Arc::clone(&client), "/api/v1/nodes"));
@@ -152,14 +152,19 @@ impl ApiBackend {
             pc_lw,
             priority_class_store_key as fn(&PriorityClass) -> String,
         ));
-        let recorder = ClientEventRecorder::new(Arc::clone(&client), scheduler_name.to_string());
         Self {
             client,
             pods,
             nodes,
             priority_classes,
-            recorder,
         }
+    }
+
+    /// `RecorderFactory` (profile.go:35, `NewRecorderFactory` :85-90): an
+    /// event recorder whose reporting controller is the profile's scheduler
+    /// name.
+    pub(crate) fn new_recorder(&self, scheduler_name: &str) -> ClientEventRecorder {
+        ClientEventRecorder::new(Arc::clone(&self.client), scheduler_name.to_string())
     }
 
     fn pod_path(ns: &str, name: &str) -> String {
@@ -558,6 +563,7 @@ impl<S: Storage + Send + Sync + 'static> DataPlane<S> {
     /// mode and only routes through here in API mode.
     pub async fn emit_event_api(
         &self,
+        component: &str,
         ns: &str,
         reason: &str,
         message: &str,
@@ -569,7 +575,7 @@ impl<S: Storage + Send + Sync + 'static> DataPlane<S> {
                 EventType::Normal => "Normal",
                 EventType::Warning => "Warning",
             };
-            a.recorder
+            a.new_recorder(component)
                 .event(ns, reason, message, type_str, involved)
                 .await;
         }
