@@ -24,7 +24,7 @@ fail=0
 stage_body() {
   awk -v pat="$2" '
     on && /^FROM / { exit }
-    $0 ~ pat { on=1 }
+    $0 == pat { on=1 }
     on { print }
   ' "$1"
 }
@@ -44,10 +44,10 @@ check_stage() {
   fi
 }
 
-check_stage services.Dockerfile '^FROM debian:sid-slim AS kubelet' 'kubelet'
-check_stage local-binary.services.Dockerfile '^FROM debian:sid-slim AS kubelet' 'kubelet'
-check_stage all-in-one.Dockerfile '^FROM debian:sid-slim$' 'runtime (in-process kubelet)'
-check_stage node.Dockerfile '^FROM \$\{CONTAINERD_IMAGE\}' 'node (kubelet + containerd)'
+check_stage services.Dockerfile "FROM debian:sid-slim AS kubelet" 'kubelet'
+check_stage local-binary.services.Dockerfile "FROM debian:sid-slim AS kubelet" 'kubelet'
+check_stage all-in-one.Dockerfile "FROM debian:sid-slim" 'runtime (in-process kubelet)'
+check_stage node.Dockerfile 'FROM ${CONTAINERD_IMAGE}' 'node (kubelet + containerd)'
 
 if [ "$fail" -ne 0 ]; then
   exit 1
