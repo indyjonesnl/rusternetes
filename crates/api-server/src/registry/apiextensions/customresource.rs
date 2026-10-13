@@ -329,8 +329,37 @@ impl Strategy {
         if cr.kind.is_empty() {
             cr.kind = self.crd.spec.names.kind.clone();
         }
+        self.prune_non_nullable_nulls(cr);
         apply_schema_defaults(&self.crd, &self.version, cr);
         prune_custom_resource(&self.crd, &self.version, cr);
+    }
+
+    /// `structuraldefaulting.PruneNonNullableNullsWithoutDefaults(u.Object,
+    /// v.structuralSchemas[gv.Version])` (customresource_handler.go:1439),
+    /// run only when `!v.preserveUnknownFields` (:1432) and before the
+    /// defaulter, as the decoder precedes `unstructuredDefaulter`.
+    fn prune_non_nullable_nulls(&self, cr: &mut CustomResource) {
+        if self.crd.spec.preserve_unknown_fields == Some(true) {
+            return;
+        }
+        let Some(schema) = self.crd_version().and_then(|v| v.schema.as_ref()) else {
+            return;
+        };
+        let Ok(structural) =
+            rusternetes_common::validation::structural::new_structural(&schema.open_apiv3_schema)
+        else {
+            return;
+        };
+        let Ok(mut value) = serde_json::to_value(&*cr) else {
+            return;
+        };
+        rusternetes_common::validation::structural::prunenulls::prune_non_nullable_nulls_without_defaults(
+            &mut value,
+            Some(&structural),
+        );
+        if let Ok(pruned) = serde_json::from_value(value) {
+            *cr = pruned;
+        }
     }
 
     /// The paths `structuralpruning.PruneWithOptions(u.Object,
@@ -1263,12 +1292,12 @@ mod prune_nulls_tests {
     }
 
     /// customresource_handler.go:1439: non-nullable nulls without a default
-    /// are removed at decode; nullable ones are kept; defaulted ones get
+    /// are removed at decode; nullable ones are kept; absent defaulted ones get
     /// their default.
     #[test]
     fn decode_prunes_non_nullable_nulls_without_defaults() {
         let mut obj = cr(json!({
-            "plain": null, "nullable": null, "defaulted": null,
+            "plain": null, "nullable": null,
             "nested": {"inner": null}
         }));
         strategy(false).coerce(&mut obj);
