@@ -354,3 +354,77 @@ async fn admin_access_in_a_status_allocation_needs_the_namespace_label() {
         }
     }
 }
+
+/// `resourceclaimStrategy.Validate` (resourceclaim/strategy.go:100-105) and
+/// `resourceClaimTemplateStrategy.Validate` (resourceclaimtemplate/strategy.go:
+/// 62-66) append `AuthorizedForAdmin`'s errors to the validation errors, so one
+/// 422 reports both; the admin error comes first.
+#[tokio::test]
+async fn admin_access_error_joins_the_validation_errors() {
+    let api = TestApiServer::new();
+    let n = json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "plain"}});
+    let (s, body) = api.post("/api/v1/namespaces", &n).await;
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+
+    let mut c = claim("c1");
+    c["metadata"]["namespace"] = json!("plain");
+    c["spec"]["devices"]["requests"][0]["exactly"]["adminAccess"] = json!(true);
+    c["spec"]["devices"]["requests"][0]["exactly"]["deviceClassName"] = json!("");
+    let (s, body) = api
+        .post(
+            "/apis/resource.k8s.io/v1/namespaces/plain/resourceclaims",
+            &c,
+        )
+        .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let msg = body["message"].as_str().unwrap();
+    let admin = msg.find("spec.devices.requests[0].adminAccess: Forbidden");
+    let other = msg.find("deviceClassName: Required");
+    assert!(admin.is_some() && other.is_some(), "{body}");
+    assert!(admin < other, "admin error comes first: {body}");
+
+    let mut t = template("t1");
+    t["metadata"]["namespace"] = json!("plain");
+    t["spec"]["spec"]["devices"]["requests"][0]["exactly"]["adminAccess"] = json!(true);
+    t["spec"]["spec"]["devices"]["requests"][0]["exactly"]["deviceClassName"] = json!("");
+    let (s, body) = api
+        .post(
+            "/apis/resource.k8s.io/v1/namespaces/plain/resourceclaimtemplates",
+            &t,
+        )
+        .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let msg = body["message"].as_str().unwrap();
+    assert!(
+        // `AuthorizedForAdmin` hardcodes the `spec.devices.requests` path, also
+        // for a template, whose requests live under `spec.spec` (utils.go:47).
+        msg.contains("spec.devices.requests[0].adminAccess: Forbidden")
+            && msg.contains("deviceClassName: Required"),
+        "{body}"
+    );
+}
+
+/// `resourceclaimStatusStrategy.ValidateUpdate` (strategy.go:196-198) appends
+/// `ValidateResourceClaimStatusUpdate`'s errors to `AuthorizedForAdminStatus`'s.
+#[tokio::test]
+async fn admin_access_status_error_joins_the_validation_errors() {
+    let api = TestApiServer::new();
+    let n = json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "plain"}});
+    let (s, body) = api.post("/api/v1/namespaces", &n).await;
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+    let uri = "/apis/resource.k8s.io/v1/namespaces/plain/resourceclaims";
+    let mut c = claim("c1");
+    c["metadata"]["namespace"] = json!("plain");
+    let (s, created) = api.post(uri, &c).await;
+    assert_eq!(s, StatusCode::CREATED, "{created}");
+    let mut update = created.clone();
+    update["status"] = json!({"allocation": {"devices": {"results": [
+        {"request": "req", "driver": "", "pool": "p", "device": "d", "adminAccess": true}]}}});
+    let (s, body) = api.put(&format!("{uri}/c1/status"), &update).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let msg = body["message"].as_str().unwrap();
+    assert!(
+        msg.contains("results[0].adminAccess: Forbidden") && msg.contains("results[0].driver"),
+        "{body}"
+    );
+}

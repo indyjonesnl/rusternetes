@@ -6,7 +6,6 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use rusternetes_common::resources::ResourceClaimTemplate;
 use rusternetes_common::validation::field::{ErrorList, Path};
 use rusternetes_common::validation::objectmeta::{
@@ -15,49 +14,20 @@ use rusternetes_common::validation::objectmeta::{
 use rusternetes_common::validation::resourceclaim::{
     validate_resource_claim_template, validate_resource_claim_template_update,
 };
-use rusternetes_common::Result;
 use rusternetes_storage::StorageBackend;
 
 use super::admin::authorized_for_admin;
 use super::spec::drop_disabled_fields;
-use crate::registry::generic::store::{BeginCreate, CreateOptions, Finish};
 use crate::registry::generic::Store;
 use crate::registry::rest::{
     GroupResource, NamespaceScopedStrategy, RequestContext, RestCreateStrategy, RestDeleteStrategy,
-    RestUpdateStrategy,
+    RestUpdateStrategy, ValidateFuture,
 };
 
-struct AdminCheck {
+/// `resourceClaimTemplateStrategy` (strategy.go:35-52).
+pub struct Strategy {
     storage: Arc<StorageBackend>,
 }
-
-struct Noop;
-
-#[async_trait]
-impl Finish for Noop {
-    async fn finish(self: Box<Self>, _success: bool) {}
-}
-
-#[async_trait]
-impl BeginCreate<ResourceClaimTemplate> for AdminCheck {
-    async fn begin_create(
-        &self,
-        ctx: &RequestContext,
-        obj: &mut ResourceClaimTemplate,
-        _options: &CreateOptions,
-    ) -> Result<Box<dyn Finish>> {
-        let ns = ctx
-            .namespace
-            .clone()
-            .or_else(|| obj.metadata.namespace.clone())
-            .unwrap_or_default();
-        authorized_for_admin(&self.storage, &obj.spec.spec.devices.requests, &ns).await?;
-        Ok(Box::new(Noop))
-    }
-}
-
-/// `resourceClaimTemplateStrategy` (strategy.go:35-52).
-pub struct Strategy;
 
 impl NamespaceScopedStrategy for Strategy {
     fn namespace_scoped(&self) -> bool {
@@ -68,6 +38,22 @@ impl NamespaceScopedStrategy for Strategy {
 impl RestCreateStrategy<ResourceClaimTemplate> for Strategy {
     fn prepare_for_create(&self, _ctx: &RequestContext, obj: &mut ResourceClaimTemplate) {
         drop_disabled_fields(&mut obj.spec.spec, None);
+    }
+
+    /// `AuthorizedForAdmin` (strategy.go:64), ahead of the validation errors.
+    fn validate_async<'a>(
+        &'a self,
+        ctx: &'a RequestContext,
+        obj: &'a ResourceClaimTemplate,
+    ) -> ValidateFuture<'a> {
+        Box::pin(async move {
+            let ns = ctx
+                .namespace
+                .clone()
+                .or_else(|| obj.metadata.namespace.clone())
+                .unwrap_or_default();
+            authorized_for_admin(&self.storage, &obj.spec.spec.devices.requests, &ns).await
+        })
     }
 
     /// `ValidateResourceClaimTemplate` (validation.go:605-609): ObjectMeta with
@@ -128,9 +114,8 @@ pub fn new_store(storage: Arc<StorageBackend>) -> Store<ResourceClaimTemplate, S
     let mut store = Store::new(
         storage.clone(),
         GroupResource::new("resource.k8s.io", "resourceclaimtemplates"),
-        Arc::new(Strategy),
+        Arc::new(Strategy { storage }),
     );
     store.return_deleted_object = true;
-    store.begin_create = Some(Arc::new(AdminCheck { storage }));
     store
 }

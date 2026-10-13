@@ -859,6 +859,7 @@ impl<T: Object, S: Storage> Store<T, S> {
         options: &CreateOptions,
     ) -> Result<T> {
         before_create(self.create_strategy.as_ref(), ctx, &mut obj)
+            .await
             .map_err(|e| with_group_kind(e, &self.qualified_resource.group, &obj))?;
 
         // At this point the object is fully formed: run the validators the
@@ -1424,6 +1425,7 @@ impl<T: Object, S: Storage> UpdateAttempt<'_, T, S> {
         self.creating = true;
         self.creating_obj = Some(obj.clone());
         before_create(self.store.create_strategy.as_ref(), self.ctx, &mut obj)
+            .await
             .map_err(|e| with_group_kind(e, &self.store.qualified_resource.group, &obj))?;
         if let Some(v) = self.create_validation {
             v.validate(self.ctx, &obj).await?;
@@ -1440,6 +1442,7 @@ impl<T: Object, S: Storage> UpdateAttempt<'_, T, S> {
             &mut obj,
             existing,
         )
+        .await
         .map_err(|e| with_group_kind(e, &self.store.qualified_resource.group, &obj))?;
 
         if let Some(v) = self.update_validation {
