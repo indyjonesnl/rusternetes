@@ -11,7 +11,7 @@
 
 use rusternetes_common::cel::{compile_failure, CELContext, CELEvaluator};
 use rusternetes_common::cel_authz::compile_authorization_expression;
-use rusternetes_common::validation::field::{BadValue, Error as FieldError, ErrorList, Path};
+use rusternetes_common::validation::field::{Error as FieldError, ErrorList, Path};
 use std::collections::HashSet;
 use std::sync::Mutex;
 
@@ -65,12 +65,12 @@ impl CelMatcher {
         let mut errs = ErrorList::new();
         let match_conditions = fld_path.child("matchConditions");
         if conditions.len() > 64 {
-            // `field.TooMany(fldPath.Child("matchConditions"), len, 64)`
-            // (validation.go:785) carries the actual quantity as the bad value
-            // (errors.go:294-302); `Error::too_many` has no such parameter.
-            let mut e = FieldError::too_many(&match_conditions, 64);
-            e.bad_value = BadValue::I64(conditions.len() as i64);
-            errs.push(e);
+            // `field.TooMany(fldPath.Child("matchConditions"), len, 64)` (validation.go:785)
+            errs.push(FieldError::too_many(
+                &match_conditions,
+                conditions.len(),
+                64,
+            ));
             return (None, errs);
         }
         let mut seen = HashSet::new();

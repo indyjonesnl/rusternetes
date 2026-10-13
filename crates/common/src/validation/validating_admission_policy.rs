@@ -437,7 +437,11 @@ pub(crate) fn validate_path_segment_name(name: &str) -> Vec<String> {
 pub fn validate_match_conditions(conditions: &[MatchCondition], fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     if conditions.len() > MAX_MATCH_CONDITIONS {
-        errs.push(Error::too_many(fld_path, MAX_MATCH_CONDITIONS));
+        errs.push(Error::too_many(
+            fld_path,
+            conditions.len(),
+            MAX_MATCH_CONDITIONS,
+        ));
     }
     let mut names: HashSet<&str> = HashSet::new();
     for (i, condition) in conditions.iter().enumerate() {

@@ -142,7 +142,11 @@ fn validate_device_claim(claim: &DeviceClaim, fld_path: &Path) -> ErrorList {
     let requests_path = fld_path.child("requests");
 
     if claim.requests.len() > DEVICE_REQUESTS_MAX_SIZE {
-        errs.push(Error::too_many(&requests_path, DEVICE_REQUESTS_MAX_SIZE));
+        errs.push(Error::too_many(
+            &requests_path,
+            claim.requests.len(),
+            DEVICE_REQUESTS_MAX_SIZE,
+        ));
     }
 
     let mut seen: HashSet<&str> = HashSet::new();
@@ -183,7 +187,11 @@ fn validate_device_claim(claim: &DeviceClaim, fld_path: &Path) -> ErrorList {
             (false, true) => {
                 let fa_path = rp.child("firstAvailable");
                 if request.first_available.len() > FIRST_AVAILABLE_MAX_SIZE {
-                    errs.push(Error::too_many(&fa_path, FIRST_AVAILABLE_MAX_SIZE));
+                    errs.push(Error::too_many(
+                        &fa_path,
+                        request.first_available.len(),
+                        FIRST_AVAILABLE_MAX_SIZE,
+                    ));
                 }
                 let mut sub_seen: HashSet<&str> = HashSet::new();
                 for (j, sub) in request.first_available.iter().enumerate() {
@@ -217,7 +225,11 @@ fn validate_device_claim(claim: &DeviceClaim, fld_path: &Path) -> ErrorList {
     // `config` (`validateDeviceClaim`, `validation.go:155-158`).
     let config_path = fld_path.child("config");
     if claim.config.len() > DEVICE_CONFIG_MAX_SIZE {
-        errs.push(Error::too_many(&config_path, DEVICE_CONFIG_MAX_SIZE));
+        errs.push(Error::too_many(
+            &config_path,
+            claim.config.len(),
+            DEVICE_CONFIG_MAX_SIZE,
+        ));
     }
     for (i, config) in claim.config.iter().enumerate() {
         errs.extend(validate_device_claim_configuration(
@@ -265,7 +277,11 @@ pub fn validate_resource_claim_status_update(
     // (`validateResourceClaimUserReference`, `:468-481`).
     let reserved_path = fld_path.child("reservedFor");
     if status.reserved_for.len() > RESERVED_FOR_MAX_SIZE {
-        errs.push(Error::too_many(&reserved_path, RESERVED_FOR_MAX_SIZE));
+        errs.push(Error::too_many(
+            &reserved_path,
+            status.reserved_for.len(),
+            RESERVED_FOR_MAX_SIZE,
+        ));
     }
     let mut seen_uids: HashSet<&str> = HashSet::new();
     for (i, consumer) in status.reserved_for.iter().enumerate() {
@@ -381,7 +397,11 @@ fn validate_allocation_result(
 
     let results_path = devices_path.child("results");
     if allocation.devices.results.len() > ALLOCATION_RESULTS_MAX_SIZE {
-        errs.push(Error::too_many(&results_path, ALLOCATION_RESULTS_MAX_SIZE));
+        errs.push(Error::too_many(
+            &results_path,
+            allocation.devices.results.len(),
+            ALLOCATION_RESULTS_MAX_SIZE,
+        ));
     }
     for (i, result) in allocation.devices.results.iter().enumerate() {
         errs.extend(validate_device_request_allocation_result(
@@ -394,7 +414,11 @@ fn validate_allocation_result(
     // The config cap is `2 * DeviceConfigMaxSize` — class plus claim (`:500`).
     let config_path = devices_path.child("config");
     if allocation.devices.config.len() > 2 * DEVICE_CONFIG_MAX_SIZE {
-        errs.push(Error::too_many(&config_path, 2 * DEVICE_CONFIG_MAX_SIZE));
+        errs.push(Error::too_many(
+            &config_path,
+            allocation.devices.config.len(),
+            2 * DEVICE_CONFIG_MAX_SIZE,
+        ));
     }
     for (i, config) in allocation.devices.config.iter().enumerate() {
         errs.extend(validate_device_allocation_configuration(
@@ -463,7 +487,11 @@ fn validate_device_allocation_configuration(
 
     let requests_path = fld_path.child("requests");
     if config.requests.len() > DEVICE_REQUESTS_MAX_SIZE {
-        errs.push(Error::too_many(&requests_path, DEVICE_REQUESTS_MAX_SIZE));
+        errs.push(Error::too_many(
+            &requests_path,
+            config.requests.len(),
+            DEVICE_REQUESTS_MAX_SIZE,
+        ));
     }
     let mut seen: HashSet<&str> = HashSet::new();
     for (i, name) in config.requests.iter().enumerate() {
@@ -492,7 +520,11 @@ fn validate_device_allocation_configuration(
 pub(crate) fn validate_selector_slice(selectors: &[DeviceSelector], fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     if selectors.len() > DEVICE_SELECTORS_MAX_SIZE {
-        errs.push(Error::too_many(fld_path, DEVICE_SELECTORS_MAX_SIZE));
+        errs.push(Error::too_many(
+            fld_path,
+            selectors.len(),
+            DEVICE_SELECTORS_MAX_SIZE,
+        ));
     }
     for (i, selector) in selectors.iter().enumerate() {
         let sp = fld_path.index(i);
@@ -540,7 +572,11 @@ fn validate_tolerations(tolerations: &[DeviceToleration], fld_path: &Path) -> Er
     let mut errs: ErrorList = Vec::new();
     let path = fld_path.child("tolerations");
     if tolerations.len() > DEVICE_TOLERATIONS_MAX_LENGTH {
-        errs.push(Error::too_many(&path, DEVICE_TOLERATIONS_MAX_LENGTH));
+        errs.push(Error::too_many(
+            &path,
+            tolerations.len(),
+            DEVICE_TOLERATIONS_MAX_LENGTH,
+        ));
     }
     for (i, toleration) in tolerations.iter().enumerate() {
         errs.extend(validate_device_toleration(toleration, &path.index(i)));
@@ -604,7 +640,11 @@ fn validate_device_claim_configuration(
     let mut errs: ErrorList = Vec::new();
     let requests_path = fld_path.child("requests");
     if config.requests.len() > DEVICE_REQUESTS_MAX_SIZE {
-        errs.push(Error::too_many(&requests_path, DEVICE_REQUESTS_MAX_SIZE));
+        errs.push(Error::too_many(
+            &requests_path,
+            config.requests.len(),
+            DEVICE_REQUESTS_MAX_SIZE,
+        ));
     }
     let mut seen: HashSet<&str> = HashSet::new();
     for (i, name) in config.requests.iter().enumerate() {
@@ -803,6 +843,7 @@ fn validate_device_status(
     if device.conditions.len() > ALLOCATED_DEVICE_STATUS_MAX_CONDITIONS {
         errs.push(Error::too_many(
             &fld_path.child("conditions"),
+            device.conditions.len(),
             ALLOCATED_DEVICE_STATUS_MAX_CONDITIONS,
         ));
     }
@@ -868,7 +909,7 @@ fn validate_network_device_data(data: &NetworkDeviceData, fld_path: &Path) -> Er
     let ips_path = fld_path.child("ips");
     if data.ips.len() > NETWORK_DEVICE_DATA_MAX_IPS {
         errs.push(
-            Error::too_many_with_actual(&ips_path, data.ips.len(), NETWORK_DEVICE_DATA_MAX_IPS)
+            Error::too_many(&ips_path, data.ips.len(), NETWORK_DEVICE_DATA_MAX_IPS)
                 .with_origin("maxItems"),
         );
         return errs;

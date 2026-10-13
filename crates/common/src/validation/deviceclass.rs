@@ -37,6 +37,7 @@ fn validate_device_class_spec(spec: &DeviceClassSpec, fld_path: &Path) -> ErrorL
     if spec.config.len() > DEVICE_CONFIG_MAX_SIZE {
         errs.push(Error::too_many(
             &fld_path.child("config"),
+            spec.config.len(),
             DEVICE_CONFIG_MAX_SIZE,
         ));
     }

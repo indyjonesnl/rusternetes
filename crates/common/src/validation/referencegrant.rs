@@ -86,7 +86,7 @@ fn validate_item_count(len: usize, path: &Path) -> ErrorList {
             format!("{path} in body should have at least 1 items"),
         )]
     } else if len > MAX_ITEMS {
-        vec![Error::too_many(path, MAX_ITEMS)]
+        vec![Error::too_many(path, len, MAX_ITEMS)]
     } else {
         Vec::new()
     }

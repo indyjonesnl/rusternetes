@@ -173,7 +173,11 @@ fn validate_resource_slice_spec(spec: &ResourceSliceSpec, fld_path: &Path) -> Er
         RESOURCE_SLICE_MAX_DEVICES
     };
     if spec.devices.len() > max_devices {
-        errs.push(Error::too_many(&devices_path, max_devices));
+        errs.push(Error::too_many(
+            &devices_path,
+            spec.devices.len(),
+            max_devices,
+        ));
     }
     let mut seen: HashSet<&str> = HashSet::new();
     for (i, device) in spec.devices.iter().enumerate() {
@@ -210,7 +214,11 @@ fn validate_device(device: &Device, fld_path: &Path) -> ErrorList {
 
     let taints_path = fld_path.child("taints");
     if device.taints.len() > DEVICE_TAINTS_MAX_LENGTH {
-        errs.push(Error::too_many(&taints_path, DEVICE_TAINTS_MAX_LENGTH));
+        errs.push(Error::too_many(
+            &taints_path,
+            device.taints.len(),
+            DEVICE_TAINTS_MAX_LENGTH,
+        ));
     }
     for (i, taint) in device.taints.iter().enumerate() {
         errs.extend(validate_device_taint(taint, &taints_path.index(i)));
@@ -220,6 +228,7 @@ fn validate_device(device: &Device, fld_path: &Path) -> ErrorList {
     if device.consumes_counters.len() > MAX_COUNTER_CONSUMPTIONS_PER_DEVICE {
         errs.push(Error::too_many(
             &consumes_path,
+            device.consumes_counters.len(),
             MAX_COUNTER_CONSUMPTIONS_PER_DEVICE,
         ));
     }
@@ -277,7 +286,11 @@ pub(crate) fn validate_device_binding_parameters(
         (binding_failure_conditions, &bfc_path),
     ] {
         if list.len() > BINDING_CONDITIONS_MAX_SIZE {
-            errs.push(Error::too_many(path, BINDING_CONDITIONS_MAX_SIZE));
+            errs.push(Error::too_many(
+                path,
+                list.len(),
+                BINDING_CONDITIONS_MAX_SIZE,
+            ));
         } else {
             for (i, c) in list.iter().enumerate() {
                 errs.extend(validate_label_name(c, &path.index(i)));
@@ -413,7 +426,7 @@ fn validate_counters(len: usize, fld_path: &Path) -> ErrorList {
         return vec![Error::required(fld_path, "")];
     }
     if len > MAX_COUNTERS_PER_SET {
-        return vec![Error::too_many(fld_path, MAX_COUNTERS_PER_SET)];
+        return vec![Error::too_many(fld_path, len, MAX_COUNTERS_PER_SET)];
     }
     Vec::new()
 }
