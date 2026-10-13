@@ -69,8 +69,6 @@ const INTEGER_RESOURCES: &[&str] = &[
 
 const HUGEPAGES_PREFIX: &str = "hugepages-";
 const REQUESTS_HUGEPAGES_PREFIX: &str = "requests.hugepages-";
-const DEFAULT_REQUESTS_PREFIX: &str = "requests.";
-const NATIVE_NAMESPACE_PREFIX: &str = "kubernetes.io/";
 
 /// `helper.IsQuotaHugePageResourceName`.
 fn is_quota_hugepage_resource_name(name: &str) -> bool {
@@ -82,18 +80,9 @@ fn is_standard_quota_resource_name(name: &str) -> bool {
     STANDARD_QUOTA_RESOURCES.contains(&name) || is_quota_hugepage_resource_name(name)
 }
 
-/// `helper.IsNativeResource`: unprefixed names, or names in `kubernetes.io/`.
-fn is_native_resource(name: &str) -> bool {
-    !name.contains('/') || name.contains(NATIVE_NAMESPACE_PREFIX)
-}
-
-/// `helper.IsExtendedResourceName`.
+/// `helper.IsExtendedResourceName`; shared port in [`crate::quota`].
 fn is_extended_resource_name(name: &str) -> bool {
-    if is_native_resource(name) || name.starts_with(DEFAULT_REQUESTS_PREFIX) {
-        return false;
-    }
-    let name_for_quota = format!("{DEFAULT_REQUESTS_PREFIX}{name}");
-    is_qualified_name(&name_for_quota).is_empty()
+    crate::quota::is_extended_resource_name(name)
 }
 
 /// `helper.IsIntegerResourceName`.

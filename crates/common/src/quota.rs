@@ -268,10 +268,11 @@ pub fn is_hugepage_resource_name(name: &str) -> bool {
     name.starts_with(HUGEPAGES_PREFIX)
 }
 
-/// True when the name contains `kubernetes.io/`. Upstream
-/// `v1helper.IsPrefixedNativeResource`.
+/// True when the name contains `kubernetes.io/` (`strings.Contains`, not a
+/// prefix check). Upstream `v1helper.IsPrefixedNativeResource`
+/// (`pkg/apis/core/v1/helper/helpers.go:51-55`).
 pub fn is_prefixed_native_resource(name: &str) -> bool {
-    name.starts_with(KUBERNETES_IO_PREFIX)
+    name.contains(KUBERNETES_IO_PREFIX)
 }
 
 /// True for a resource that is native to Kubernetes: either unqualified (no
@@ -281,15 +282,16 @@ pub fn is_native_resource_name(name: &str) -> bool {
     !name.contains('/') || is_prefixed_native_resource(name)
 }
 
-/// True for an extended resource — a non-native, non-`requests.`-prefixed
-/// name, which quota tracks only under `requests.<name>`. Upstream
-/// `v1helper.IsExtendedResourceName`.
-///
-/// Upstream additionally runs `IsQualifiedName` on `requests.<name>`; that
-/// validation lives in `crate::validation` and every name reaching here has
-/// already been through pod validation, so the shape check is not repeated.
+/// True for an extended resource: not native, not `requests.`-prefixed (to
+/// avoid confusion with the quota convention), and `requests.<name>` satisfies
+/// `IsQualifiedName`. Upstream `v1helper.IsExtendedResourceName`
+/// (`pkg/apis/core/v1/helper/helpers.go:34-49`).
 pub fn is_extended_resource_name(name: &str) -> bool {
-    !is_native_resource_name(name) && !name.starts_with(REQUESTS_PREFIX)
+    if is_native_resource_name(name) || name.starts_with(REQUESTS_PREFIX) {
+        return false;
+    }
+    let name_for_quota = format!("{REQUESTS_PREFIX}{name}");
+    crate::validation::metav1::is_qualified_name(&name_for_quota).is_empty()
 }
 
 // ---------------------------------------------------------------------------
