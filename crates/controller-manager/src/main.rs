@@ -619,12 +619,19 @@ async fn run_api_mode(args: Args) -> Result<()> {
 /// (cmd/kube-controller-manager/app/controllermanager.go:124) then `Validate`
 /// (staging/src/k8s.io/component-base/compatibility/registry.go:344-451).
 fn apply_feature_gates(args: &Args) -> Result<()> {
-    rusternetes_common::compatibility::apply_flags(
+    let effective_version = rusternetes_common::compatibility::apply_flags(
         &args.emulated_version,
         &args.min_compatibility_version,
         &args.feature_gates,
     )
     .map_err(|e| anyhow::anyhow!("invalid --feature-gates/--emulated-version: {e}"))?;
+    // `ComponentGlobalsRegistry.AddMetrics()`
+    // (cmd/kube-controller-manager/app/controllermanager.go:146;
+    // component-base/compatibility/registry.go:123-131): record `version_info`.
+    rusternetes_common::compat_version_metrics::add_metrics(
+        rusternetes_common::compatibility::DEFAULT_KUBE_COMPONENT,
+        &effective_version,
+    );
     // #3190: legacy alias for the CrossNamespaceVolumeDataSource gate; the
     // provisioner reads the gate (upstream has only the gate).
     if args.csi_cross_namespace_volume_data_source {

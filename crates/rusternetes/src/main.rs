@@ -247,12 +247,19 @@ fn main() -> Result<()> {
 /// `--feature-gates` process-wide: `ComponentGlobalsRegistry.Set()` then
 /// `Validate()` (staging/src/k8s.io/component-base/compatibility/registry.go:344-451).
 fn apply_feature_gates(args: &Args) -> Result<()> {
-    rusternetes_common::compatibility::apply_flags(
+    let effective_version = rusternetes_common::compatibility::apply_flags(
         &args.emulated_version,
         &args.min_compatibility_version,
         &args.feature_gates,
     )
     .map_err(|e| anyhow::anyhow!("invalid --feature-gates/--emulated-version: {e}"))?;
+    // `ComponentGlobalsRegistry.AddMetrics()` as in each component's server.go
+    // (kube-apiserver :116, kube-controller-manager :146, kube-scheduler :165);
+    // component-base/compatibility/registry.go:123-131: record `version_info`.
+    rusternetes_common::compat_version_metrics::add_metrics(
+        rusternetes_common::compatibility::DEFAULT_KUBE_COMPONENT,
+        &effective_version,
+    );
     Ok(())
 }
 
