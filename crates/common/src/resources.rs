@@ -133,7 +133,7 @@ pub use dra::{
     DeviceClassConfiguration, DeviceClassList, DeviceClassSpec, DeviceCondition, DeviceConstraint,
     DeviceCounterConsumption, DeviceRequest, DeviceRequestAllocationResult, DeviceSelector,
     DeviceSubRequest, DeviceTaint, DeviceTaintEffect, DeviceToleration, ExactDeviceRequest,
-    FullyQualifiedName, OpaqueDeviceConfiguration, QualifiedName, ResourceClaim,
+    FullyQualifiedName, NetworkDeviceData, OpaqueDeviceConfiguration, QualifiedName, ResourceClaim,
     ResourceClaimConsumerReference, ResourceClaimList, ResourceClaimSpec, ResourceClaimStatus,
     ResourceClaimTemplate, ResourceClaimTemplateList, ResourceClaimTemplateSpec, ResourcePool,
     ResourceSlice, ResourceSliceList, ResourceSliceSpec, TolerationOperator,

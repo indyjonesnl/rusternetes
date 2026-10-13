@@ -249,6 +249,17 @@ fn validate_device(device: &Device, fld_path: &Path) -> ErrorList {
 /// (`pkg/apis/resource/types.go:254-255`).
 const BINDING_CONDITIONS_MAX_SIZE: usize = 4;
 
+/// The bad value for an empty list. Upstream passes the Go slice itself, a
+/// `[]string(nil)` when the field was absent, which `json.Marshal`s as `null`
+/// (`validation_resourceclaim_test.go:1968`, `validation_resourceslice_test.go:977`).
+fn nil_slice(list: &[String]) -> serde_json::Value {
+    if list.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::from(list.to_vec())
+    }
+}
+
 /// Port of upstream `validateDeviceBindingParameters`
 /// (`pkg/apis/resource/validation/validation.go:1450-1485`), shared with
 /// `AllocationResult` validation upstream. `validateSlice` short-circuits on
@@ -297,14 +308,14 @@ pub(crate) fn validate_device_binding_parameters(
     if binding_conditions.is_empty() && !binding_failure_conditions.is_empty() {
         errs.push(Error::invalid(
             &bc_path,
-            binding_conditions.to_vec(),
+            nil_slice(binding_conditions),
             "bindingConditions are required to use bindingFailureConditions",
         ));
     }
     if binding_failure_conditions.is_empty() && !binding_conditions.is_empty() {
         errs.push(Error::invalid(
             &bfc_path,
-            binding_failure_conditions.to_vec(),
+            nil_slice(binding_failure_conditions),
             "bindingFailureConditions are required to use bindingConditions",
         ));
     }
