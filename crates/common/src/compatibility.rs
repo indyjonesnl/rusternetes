@@ -334,6 +334,81 @@ impl EffectiveVersion {
 }
 
 /// `String` (version.go:90-97).
+/// `apimachinery/pkg/version.Info` (types.go:21-37). The four emulation /
+/// min-compatibility fields are `omitempty`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct VersionInfo {
+    pub major: String,
+    pub minor: String,
+    pub git_version: String,
+    pub git_commit: String,
+    pub git_tree_state: String,
+    pub build_date: String,
+    pub go_version: String,
+    pub compiler: String,
+    pub platform: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub emulation_major: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub emulation_minor: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub min_compatibility_major: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub min_compatibility_minor: String,
+}
+
+/// `baseversion.Get()` (component-base/version/base.go): the build-stamped
+/// info. Rusternetes stamps these as constants.
+fn base_version_get() -> VersionInfo {
+    VersionInfo {
+        major: "1".to_string(),
+        minor: "35".to_string(),
+        git_version: "v1.35.0".to_string(),
+        git_commit: "rusternetes-v0.1.0".to_string(),
+        git_tree_state: "clean".to_string(),
+        build_date: "2026-03-10T00:00:00Z".to_string(),
+        go_version: "rust1.83".to_string(),
+        compiler: "rustc".to_string(),
+        platform: "linux/amd64".to_string(),
+        ..Default::default()
+    }
+}
+
+impl EffectiveVersion {
+    /// `effectiveVersion.Info` (version.go:168-190). The binary version is
+    /// never nil here (see `from_string`), so there is no nil return.
+    pub fn info(&self) -> VersionInfo {
+        let mut info = base_version_get();
+        info.major = self.binary_version.major.to_string();
+        info.minor = self.binary_version.minor.to_string();
+        if info.git_version.is_empty() {
+            info.git_version = self.binary_version.to_string();
+        }
+        info.emulation_major = self.emulation_version.major.to_string();
+        info.emulation_minor = self.emulation_version.minor.to_string();
+        info.min_compatibility_major = self.min_compatibility_version.major.to_string();
+        info.min_compatibility_minor = self.min_compatibility_version.minor.to_string();
+        info
+    }
+}
+
+static CURRENT_EFFECTIVE_VERSION: std::sync::RwLock<Option<EffectiveVersion>> =
+    std::sync::RwLock::new(None);
+
+/// The process-wide `kube` effective version, the analogue of
+/// `DefaultComponentGlobalsRegistry.EffectiveVersionFor(kube)` that
+/// `routes.Version{Version: c.EffectiveVersion.Info()}` reads
+/// (apiserver/pkg/server/config.go:1129). Before `apply_flags` runs it is the
+/// default build version.
+pub fn current_effective_version() -> EffectiveVersion {
+    CURRENT_EFFECTIVE_VERSION
+        .read()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_else(default_build_effective_version)
+}
+
 impl std::fmt::Display for EffectiveVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -563,6 +638,9 @@ pub fn apply_flags(
     registry.set()?;
     if let Some(e) = aggregate(registry.validate()) {
         return Err(e);
+    }
+    if let Ok(mut g) = CURRENT_EFFECTIVE_VERSION.write() {
+        *g = Some(registry.effective_version.clone());
     }
     Ok(registry.effective_version)
 }
