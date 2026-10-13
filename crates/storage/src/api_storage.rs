@@ -42,6 +42,10 @@
 use crate::{Storage, WatchEvent, WatchStream};
 use async_trait::async_trait;
 use futures::StreamExt;
+use rusternetes_client::api_status::{
+    is_already_exists, is_bad_request, is_conflict, is_forbidden, is_invalid, is_not_found,
+    is_unsupported_media_type,
+};
 use rusternetes_client::http::{ApiClient, GetError, KubernetesList};
 use rusternetes_client::watch::{watch_stream, WatchEvent as ClientWatchEvent};
 use rusternetes_common::{Error, Result};
@@ -527,17 +531,20 @@ fn map_write_err(e: anyhow::Error) -> Error {
     // lookup address` — instead of collapsing to just "Failed to send POST
     // request" (M2b worker-registration opaque-error hunt).
     let s = format!("{e:#}");
-    if s.contains("(AlreadyExists)") {
+    // Typed mapping via the Status code + reason `ApiClient` now carries
+    // (client-go `StatusError`); each predicate is the apimachinery
+    // `errors.Is*` incl. its `knownReasons` code fallback (errors.go:529-684).
+    if is_already_exists(&e) {
         Error::AlreadyExists(s)
-    } else if s.contains("(Conflict)") {
+    } else if is_conflict(&e) {
         Error::Conflict(s)
-    } else if s.contains("(NotFound)") {
+    } else if is_not_found(&e) {
         Error::NotFound(s)
-    } else if s.contains("(Invalid)") || s.contains("(BadRequest)") {
+    } else if is_invalid(&e) || is_bad_request(&e) {
         Error::BadRequest(s)
-    } else if s.contains("(Forbidden)") {
+    } else if is_forbidden(&e) {
         Error::Forbidden(s)
-    } else if s.contains("(UnsupportedMediaType)") {
+    } else if is_unsupported_media_type(&e) {
         // `apierrors.IsUnsupportedMediaType` (apimachinery/pkg/api/errors/errors.go:607-615):
         // the client half of the apply -> Update fallback (#3351).
         Error::UnsupportedMediaType(s)
@@ -1391,7 +1398,11 @@ mod tests {
 
     #[test]
     fn map_write_err_maps_unsupported_media_type() {
-        let e = anyhow::anyhow!("Error from server (UnsupportedMediaType): Apply not supported");
+        let e = anyhow::Error::new(rusternetes_client::api_status::ApiStatusError {
+            code: 415,
+            reason: "UnsupportedMediaType".into(),
+            message: "Error from server (UnsupportedMediaType): Apply not supported".into(),
+        });
         assert!(matches!(map_write_err(e), Error::UnsupportedMediaType(_)));
     }
 
@@ -1457,7 +1468,7 @@ mod tests {
     async fn write_err_known_reason_not_overridden_by_code() {
         let e = post_err(
             "415 Unsupported Media Type",
-            r#"{"kind":"Status","reason":"Forbidden","message":"x","code":415}"#,
+            r#"{"kind":"Status","status":"Failure","reason":"Forbidden","message":"x","code":415}"#,
         )
         .await;
         assert!(matches!(e, Error::Forbidden(_)), "{e:?}");
@@ -1471,13 +1482,13 @@ mod tests {
         assert!(matches!(e, Error::AlreadyExists(_)), "{e:?}");
         let e = post_err(
             "422 Unprocessable Entity",
-            r#"{"kind":"Status","message":"bad","code":422}"#,
+            r#"{"kind":"Status","status":"Failure","message":"bad","code":422}"#,
         )
         .await;
         assert!(matches!(e, Error::BadRequest(_)), "{e:?}");
         let e = post_err(
             "404 Not Found",
-            r#"{"kind":"Status","message":"m","code":404}"#,
+            r#"{"kind":"Status","status":"Failure","message":"m","code":404}"#,
         )
         .await;
         assert!(matches!(e, Error::NotFound(_)), "{e:?}");

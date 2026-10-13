@@ -73,18 +73,46 @@ impl std::error::Error for GetError {}
 /// When the body parses as such, surface a clean upstream-`kubectl`-style
 /// message: `Error from server (AlreadyExists): <message>`. Otherwise fall
 /// back to the raw status + body text.
-fn format_status_error(status: reqwest::StatusCode, body: &str) -> anyhow::Error {
+///
+/// The error is a typed [`crate::api_status::ApiStatusError`] carrying the
+/// `Status` code + reason (client-go `StatusError`): the body's Status wins
+/// when it is a `Failure` Status (rest/request.go:1489-1511), otherwise the
+/// reason is derived from the HTTP code (`NewGenericServerResponse`,
+/// apimachinery errors.go:437-493).
+fn format_status_error(
+    status: reqwest::StatusCode,
+    verb: &reqwest::Method,
+    body: &str,
+) -> anyhow::Error {
+    use crate::api_status::{generic_reason_for_code, ApiStatusError};
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
-        if v.get("kind").and_then(|k| k.as_str()) == Some("Status") {
+        if v.get("kind").and_then(|k| k.as_str()) == Some("Status")
+            && v.get("status").and_then(|s| s.as_str()) == Some("Failure")
+        {
             let reason = v.get("reason").and_then(|r| r.as_str()).unwrap_or("");
             let message = v.get("message").and_then(|m| m.as_str()).unwrap_or(body);
-            if !reason.is_empty() {
-                return anyhow::anyhow!("Error from server ({reason}): {message}");
-            }
-            return anyhow::anyhow!("Error from server: {message}");
+            let code = v
+                .get("code")
+                .and_then(|c| c.as_u64())
+                .and_then(|c| u16::try_from(c).ok())
+                .unwrap_or(0);
+            let text = if reason.is_empty() {
+                format!("Error from server: {message}")
+            } else {
+                format!("Error from server ({reason}): {message}")
+            };
+            return anyhow::Error::new(ApiStatusError {
+                code,
+                reason: reason.to_string(),
+                message: text,
+            });
         }
     }
-    anyhow::anyhow!("request failed with status {status}: {body}")
+    anyhow::Error::new(ApiStatusError {
+        code: status.as_u16(),
+        reason: generic_reason_for_code(status.as_u16(), verb.as_str()).to_string(),
+        message: format!("request failed with status {status}: {body}"),
+    })
 }
 
 impl ApiClient {
@@ -271,7 +299,11 @@ impl ApiClient {
 
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(GetError::Other(format_status_error(status, &body)));
+            return Err(GetError::Other(format_status_error(
+                status,
+                &reqwest::Method::GET,
+                &body,
+            )));
         }
 
         response
@@ -334,7 +366,7 @@ impl ApiClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(format_status_error(status, &body));
+            return Err(format_status_error(status, &reqwest::Method::POST, &body));
         }
 
         response.json().await.context("Failed to parse response")
@@ -354,7 +386,7 @@ impl ApiClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(format_status_error(status, &body));
+            return Err(format_status_error(status, &reqwest::Method::PUT, &body));
         }
 
         response.json().await.context("Failed to parse response")
@@ -399,7 +431,7 @@ impl ApiClient {
 
         if !status.is_success() && status != StatusCode::NOT_FOUND {
             let body = response.text().await.unwrap_or_default();
-            return Err(format_status_error(status, &body));
+            return Err(format_status_error(status, &reqwest::Method::DELETE, &body));
         }
 
         Ok(status)
@@ -446,7 +478,7 @@ impl ApiClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(format_status_error(status, &body));
+            return Err(format_status_error(status, &reqwest::Method::PATCH, &body));
         }
 
         response.json().await.context("Failed to parse response")
@@ -544,7 +576,7 @@ mod tests {
     #[test]
     fn test_format_status_error_already_exists() {
         let body = r#"{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"AlreadyExists","message":"configmaps \"f5-cm\" already exists","code":409}"#;
-        let err = format_status_error(StatusCode::CONFLICT, body);
+        let err = format_status_error(StatusCode::CONFLICT, &reqwest::Method::POST, body);
         assert_eq!(
             err.to_string(),
             "Error from server (AlreadyExists): configmaps \"f5-cm\" already exists"
@@ -554,7 +586,7 @@ mod tests {
     #[test]
     fn test_format_status_error_not_found() {
         let body = r#"{"kind":"Status","status":"Failure","reason":"NotFound","message":"pods \"x\" not found","code":404}"#;
-        let err = format_status_error(StatusCode::NOT_FOUND, body);
+        let err = format_status_error(StatusCode::NOT_FOUND, &reqwest::Method::POST, body);
         assert_eq!(
             err.to_string(),
             "Error from server (NotFound): pods \"x\" not found"
@@ -565,14 +597,18 @@ mod tests {
     fn test_format_status_error_no_reason() {
         // A Status object without a reason field still surfaces the message.
         let body = r#"{"kind":"Status","status":"Failure","message":"something bad","code":500}"#;
-        let err = format_status_error(StatusCode::INTERNAL_SERVER_ERROR, body);
+        let err = format_status_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &reqwest::Method::POST,
+            body,
+        );
         assert_eq!(err.to_string(), "Error from server: something bad");
     }
 
     #[test]
     fn test_format_status_error_non_status_body_falls_back() {
         let body = "plain text gateway error";
-        let err = format_status_error(StatusCode::BAD_GATEWAY, body);
+        let err = format_status_error(StatusCode::BAD_GATEWAY, &reqwest::Method::POST, body);
         assert_eq!(
             err.to_string(),
             "request failed with status 502 Bad Gateway: plain text gateway error"
@@ -582,7 +618,11 @@ mod tests {
     #[test]
     fn test_format_status_error_non_json_body_falls_back() {
         let body = "<html>503</html>";
-        let err = format_status_error(StatusCode::SERVICE_UNAVAILABLE, body);
+        let err = format_status_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &reqwest::Method::POST,
+            body,
+        );
         assert_eq!(
             err.to_string(),
             "request failed with status 503 Service Unavailable: <html>503</html>"
