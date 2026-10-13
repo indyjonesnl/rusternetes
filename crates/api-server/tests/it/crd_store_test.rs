@@ -287,7 +287,6 @@ async fn status_update_keeps_the_spec_and_validates_accepted_names() {
 #[tokio::test]
 async fn deleting_a_crd_deletes_its_instances() {
     let api = TestApiServer::new();
-    // Instances are found namespace by namespace, so the namespace exists.
     let (status, out) = api
         .post(
             "/api/v1/namespaces",

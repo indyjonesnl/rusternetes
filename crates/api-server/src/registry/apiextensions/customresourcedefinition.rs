@@ -771,45 +771,38 @@ impl CrdRest {
 
     /// The stored instances of the CRD as `(namespace, name)`: upstream's
     /// `crClient.List(ctx, nil)` (crd_finalizer.go:195, :255). A stored
-    /// instance does not record its namespace, only its key does, so a
-    /// namespaced CRD's instances are found namespace by namespace.
+    /// instance carries its `metadata.namespace`; one without is listed with
+    /// none, as upstream's `GetNamespace()` is empty.
     async fn list_instances(
         &self,
         crd: &CustomResourceDefinition,
     ) -> Result<Vec<(Option<String>, String)>> {
         let resource_type = instance_resource_type(crd);
-        let namespaced = crd.spec.scope == rusternetes_common::resources::ResourceScope::Namespaced;
-        let namespaces: Vec<Option<String>> = if namespaced {
-            let all: Vec<serde_json::Value> = self
-                .store
-                .storage
-                .list(&build_prefix("namespaces", None))
-                .await?;
-            all.iter()
-                .filter_map(|ns| ns.pointer("/metadata/name")?.as_str().map(str::to_string))
-                .map(Some)
-                .collect()
-        } else {
-            vec![None]
-        };
-        let mut out = Vec::new();
-        for namespace in namespaces {
-            let prefix = build_prefix(&resource_type, namespace.as_deref());
-            let items: Vec<serde_json::Value> = self.store.storage.list(&prefix).await?;
-            for item in items {
-                if let Some(name) = item.pointer("/metadata/name").and_then(|v| v.as_str()) {
-                    out.push((namespace.clone(), name.to_string()));
-                }
-            }
-        }
-        Ok(out)
+        let items: Vec<serde_json::Value> = self
+            .store
+            .storage
+            .list(&build_prefix(&resource_type, None))
+            .await?;
+        Ok(items
+            .iter()
+            .filter_map(|item| {
+                let name = item.pointer("/metadata/name")?.as_str()?.to_string();
+                // `metadata.GetNamespace()`; empty means no namespace.
+                let namespace = item
+                    .pointer("/metadata/namespace")
+                    .and_then(|v| v.as_str())
+                    .filter(|n| !n.is_empty())
+                    .map(str::to_string);
+                Some((namespace, name))
+            })
+            .collect())
     }
 
     /// `deleteInstances` (crd_finalizer.go:181-273): the stored instances of
-    /// the CRD are deleted through its instance store, one delete per instance
-    /// where upstream issues `DeleteCollection` per namespace (an instance
-    /// with a finalizer is only marked for deletion); then, as upstream, wait until a list
-    /// of them comes back empty (:253-272). The `Err` carries the
+    /// the CRD are deleted through its instance store, one `DeleteCollection`
+    /// per namespace (:204-229; an instance with a finalizer is only marked
+    /// for deletion); then wait until a list of them comes back empty
+    /// (:253-272). The `Err` carries the
     /// `Terminating` condition upstream returns with its error.
     async fn delete_instances(
         &self,
@@ -858,22 +851,30 @@ impl CrdRest {
             dry_run: None,
             ignore_store_read_error_with_cluster_breaking_potential: None,
         };
-        for (namespace, name) in items {
-            let ctx = RequestContext::new(namespace.as_deref());
-            match instances
-                .delete(&ctx, &name, None, no_options.clone())
+        issue_delete_collections(&items, |ctx| {
+            let instances = &instances;
+            let no_options = &no_options;
+            async move {
+                // `DeleteCollection(nsCtx, rest.ValidateAllObjectFunc, nil, nil)`.
+                RestStorage::delete_collection(
+                    instances,
+                    &ctx,
+                    None,
+                    no_options,
+                    &Default::default(),
+                )
                 .await
-            {
-                Ok(_) | Err(Error::NotFound(_)) => {}
-                Err(e) => {
-                    return Err(failed(
-                        "InstanceDeletionFailed",
-                        format!("could not issue all deletes: {e}"),
-                        e,
-                    ))
-                }
+                .map(|_| ())
             }
-        }
+        })
+        .await
+        .map_err(|msg| {
+            failed(
+                "InstanceDeletionFailed",
+                format!("could not issue all deletes: {msg}"),
+                Error::Internal(msg),
+            )
+        })?;
         poll_until_gone(INSTANCE_DRAIN_INTERVAL, INSTANCE_DRAIN_TIMEOUT, || async {
             Ok(self.list_instances(crd).await?.len())
         })
@@ -973,16 +974,44 @@ impl CrdRest {
 }
 
 /// The `DeleteCollection` loop of `deleteInstances` (crd_finalizer.go:
-/// 204-229).
+/// 204-229): one call per namespace found among the listed instances
+/// ("don't retry deleting the same namespace", :216-219), a failure noted and
+/// the loop continued (:222-225), the failures returned as
+/// `utilerrors.NewAggregate(deleteErrors)` (:227), whose `Error()`
+/// (apimachinery/pkg/util/errors/errors.go:70-96) is a lone message bare and
+/// several as `[a, b]`, a repeated message once.
 pub async fn issue_delete_collections<F, Fut>(
-    _items: &[(Option<String>, String)],
-    _delete_collection: F,
+    items: &[(Option<String>, String)],
+    mut delete_collection: F,
 ) -> std::result::Result<(), String>
 where
     F: FnMut(RequestContext) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    Ok(())
+    let mut deleted_namespaces = std::collections::HashSet::new();
+    let mut messages: Vec<String> = Vec::new();
+    for (namespace, _) in items {
+        if !deleted_namespaces.insert(namespace.clone()) {
+            continue;
+        }
+        if let Err(e) = delete_collection(RequestContext::new(namespace.as_deref())).await {
+            messages.push(e.to_string());
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    let unique: Vec<&String> = messages.iter().filter(|m| seen.insert(*m)).collect();
+    match unique.len() {
+        0 => Ok(()),
+        1 => Err(unique[0].clone()),
+        _ => Err(format!(
+            "[{}]",
+            unique
+                .iter()
+                .map(|m| m.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
 }
 
 /// The storage resource type of a CRD's instances.
