@@ -537,6 +537,10 @@ fn map_write_err(e: anyhow::Error) -> Error {
         Error::BadRequest(s)
     } else if s.contains("(Forbidden)") {
         Error::Forbidden(s)
+    } else if s.contains("(UnsupportedMediaType)") {
+        // `apierrors.IsUnsupportedMediaType` (apimachinery/pkg/api/errors/errors.go:607-615):
+        // the client half of the apply -> Update fallback (#3351).
+        Error::UnsupportedMediaType(s)
     } else {
         Error::Storage(s)
     }

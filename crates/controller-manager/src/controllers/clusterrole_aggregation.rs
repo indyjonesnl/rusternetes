@@ -20,9 +20,10 @@
 //! The write is `Storage::apply` (`ClusterRoles().Apply` with field manager
 //! `clusterrole-aggregation-controller`, force, :123-132): a real apply PATCH
 //! against an api-server, the shared apply engine on direct backends.
-//! Deviation (Rusternetes-only): the `IsUnsupportedMediaType` fallback to
-//! `Update` (:109-113, :134-142) is not ported; apply is always available. A 5s
-//! periodic resync stands in for the informer's resync.
+//! When the apply is rejected as `UnsupportedMediaType` (a server without
+//! Server Side Apply) the sync falls back to `Update` (`syncClusterRole`
+//! :132-141, `updateClusterRoles` :152-160). A 5s periodic resync stands in
+//! for the informer's resync.
 
 use futures::StreamExt;
 use rusternetes_common::resources::{ClusterRole, PolicyRule};
@@ -161,6 +162,20 @@ impl<S: Storage + 'static> ClusterRoleAggregationController<S> {
         Ok(())
     }
 
+    /// `updateClusterRoles` (:152-160): `Update` of a copy of the ClusterRole
+    /// with `Rules` replaced by the aggregate.
+    async fn update_cluster_roles(
+        &self,
+        key: &str,
+        shared: &ClusterRole,
+        new_rules: &[PolicyRule],
+    ) -> Result<()> {
+        let mut cluster_role = shared.clone();
+        cluster_role.rules = new_rules.to_vec();
+        let _: ClusterRole = self.storage.update(key, &cluster_role).await?;
+        Ok(())
+    }
+
     /// `syncClusterRole` (:74-121).
     pub async fn sync_cluster_role(&self, name: &str) -> Result<()> {
         let key = build_key("clusterroles", None, name);
@@ -203,7 +218,15 @@ impl<S: Storage + 'static> ClusterRoleAggregationController<S> {
             return Ok(());
         }
 
-        self.apply_cluster_roles(&key, name, &new_rules).await?;
+        let mut result = self.apply_cluster_roles(&key, name, &new_rules).await;
+        if matches!(
+            result,
+            Err(rusternetes_common::Error::UnsupportedMediaType(_))
+        ) {
+            // `errors.IsUnsupportedMediaType(err)` -> `updateClusterRoles` (:133-141).
+            result = self.update_cluster_roles(&key, &shared, &new_rules).await;
+        }
+        result?;
         debug!("ClusterRoleAggregator: updated rules of {}", name);
         Ok(())
     }
@@ -440,7 +463,7 @@ mod tests {
         assert!(e["fieldsV1"].get("rules").is_none(), "{e}");
     }
 
-    /// `IsUnsupportedMediaType` fallback (clusterroleaggregation_controller.go:133-142):
+    /// `IsUnsupportedMediaType` fallback (clusterroleaggregation_controller.go:133-141):
     /// when the server rejects the apply PATCH, the controller falls back to
     /// `Update` of the ClusterRole with `Rules` replaced by the aggregate.
     #[tokio::test]
