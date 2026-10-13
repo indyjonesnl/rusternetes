@@ -42,7 +42,6 @@ pub mod quota;
 pub mod resources;
 pub mod sa_keys;
 pub mod schema_validation;
-pub mod server_side_apply;
 pub mod serviceaccount;
 pub mod tls;
 pub mod tolerations;

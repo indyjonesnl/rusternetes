@@ -23,9 +23,10 @@
 //! - `immutable: true` post-create fence (enforced by the HTTP handler that
 //!   calls SSA, not by the merge core itself).
 //!
-//! The PATCH handlers for Pod / Deployment / Service / etc. continue to
-//! delegate to the legacy [`rusternetes_common::server_side_apply`] codepath
-//! which uses top-level string-keyed ownership. The schema mechanism is
+//! The PATCH handlers for Pod / Deployment / Service / etc. delegate to
+//! [`apply_legacy`], which applies through the field manager
+//! (`rusternetes_common::fieldmanager`) with per-path `FieldsV1` ownership.
+//! The schema mechanism is
 //! deliberately a thin curated alternative to the upstream OpenAPI-driven
 //! type converter
 //! (`staging/src/k8s.io/apimachinery/pkg/util/managedfields/internal/typeconverter.go`)
