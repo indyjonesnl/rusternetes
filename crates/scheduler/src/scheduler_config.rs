@@ -11,6 +11,7 @@
 use crate::volume_binding::{FunctionShapePoint, MAX_CUSTOM_PRIORITY_SCORE, MAX_NODE_SCORE};
 use rusternetes_common::go_duration::format_go_duration;
 use rusternetes_common::label_selector::{LabelOperator, LabelRequirement};
+use rusternetes_common::quota::is_extended_resource_name;
 use rusternetes_common::resources::pod::{
     NodeAffinity, NodeSelectorRequirement, NodeSelectorTerm, TopologySpreadConstraint,
 };
@@ -1162,21 +1163,6 @@ fn validate_extended_resource_name(path: &Path, name: &str) -> ErrorList {
         ));
     }
     errs
-}
-
-/// `v1helper.IsNativeResource` (pkg/apis/core/v1/helper/helpers.go:60-63):
-/// `IsPrefixedNativeResource` is a `Contains` check on `kubernetes.io/`
-/// (helpers.go:53-55), not a prefix check.
-fn is_native_resource(name: &str) -> bool {
-    !name.contains('/') || name.contains("kubernetes.io/")
-}
-
-/// `v1helper.IsExtendedResourceName` (pkg/apis/core/v1/helper/helpers.go:39-49).
-fn is_extended_resource_name(name: &str) -> bool {
-    if is_native_resource(name) || name.starts_with("requests.") {
-        return false;
-    }
-    is_qualified_name(&format!("requests.{name}")).is_empty()
 }
 
 /// `validateCommonQueueSort` (validation.go:219-254).

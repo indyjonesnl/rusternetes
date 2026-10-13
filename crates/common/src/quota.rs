@@ -1120,6 +1120,9 @@ mod tests {
         assert!(!is_extended_resource_name("example.com/-bad"));
         assert!(!is_extended_resource_name("example.com/a/b"));
         assert!(!is_extended_resource_name("example.kubernetes.io/foo"));
+        // helpers.go:40: unqualified and `requests.`-prefixed names are never extended.
+        assert!(!is_extended_resource_name("cpu"));
+        assert!(!is_extended_resource_name("requests.example.com/foo"));
     }
 
     use super::*;
