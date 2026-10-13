@@ -15,7 +15,7 @@ use rusternetes_common::resources::pod::{
     NodeAffinity, NodeSelectorRequirement, NodeSelectorTerm, TopologySpreadConstraint,
 };
 use rusternetes_common::validation::field::{self, BadValue, ErrorList, Path};
-use rusternetes_common::validation::metav1::validate_label_name;
+use rusternetes_common::validation::metav1::{is_qualified_name, validate_label_name};
 use serde::{Deserialize, Serialize};
 
 /// `config.UtilizationShapePoint` (pkg/scheduler/apis/config/types.go).
@@ -747,6 +747,32 @@ struct KubeSchedulerConfiguration {
     /// v1/defaults.go:162-164 defaults a nil value to 10.
     #[serde(default)]
     pod_max_backoff_seconds: Option<i64>,
+    /// `extenders` (kube-scheduler/config/v1/types.go:317 `Extender`). v1
+    /// defaults.go sets nothing for extenders.
+    #[serde(default)]
+    extenders: Vec<Extender>,
+}
+
+/// The validated slice of `config.Extender` (kube-scheduler/config/v1/types.go:317).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Extender {
+    #[serde(default)]
+    prioritize_verb: String,
+    #[serde(default)]
+    weight: i64,
+    #[serde(default)]
+    bind_verb: String,
+    #[serde(default)]
+    managed_resources: Vec<ExtenderManagedResource>,
+}
+
+/// `config.ExtenderManagedResource` (kube-scheduler/config/v1/types.go:362).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtenderManagedResource {
+    #[serde(default)]
+    name: String,
 }
 
 /// `config.Plugin` (pkg/scheduler/apis/config/types.go). The internal type has
@@ -1071,7 +1097,86 @@ fn validate_profiles(cfg: &KubeSchedulerConfiguration) -> Result<(ErrorList, Err
             "must be greater than or equal to PodInitialBackoffSeconds",
         ));
     }
+    // validation.go:82.
+    errs.extend(validate_extenders(&Path::new("extenders"), &cfg.extenders));
     Ok((errs, init_errs))
+}
+
+/// `validateExtenders` (validation.go:256-286).
+fn validate_extenders(fld_path: &Path, extenders: &[Extender]) -> ErrorList {
+    let mut errs = ErrorList::new();
+    let mut binders = 0;
+    let mut managed: Vec<&str> = Vec::new();
+    for (i, extender) in extenders.iter().enumerate() {
+        let path = fld_path.index(i);
+        if !extender.prioritize_verb.is_empty() && extender.weight <= 0 {
+            errs.push(field::Error::invalid(
+                &path.child("weight"),
+                extender.weight,
+                "must have a positive weight applied to it",
+            ));
+        }
+        if !extender.bind_verb.is_empty() {
+            binders += 1;
+        }
+        for (j, resource) in extender.managed_resources.iter().enumerate() {
+            let mr_path = path.child("managedResources").index(j);
+            errs.extend(validate_extended_resource_name(
+                &mr_path.child("name"),
+                &resource.name,
+            ));
+            if managed.contains(&resource.name.as_str()) {
+                errs.push(field::Error::invalid(
+                    &mr_path.child("name"),
+                    resource.name.as_str(),
+                    "duplicate extender managed resource name",
+                ));
+            }
+            managed.push(&resource.name);
+        }
+    }
+    if binders > 1 {
+        errs.push(field::Error::invalid(
+            fld_path,
+            format!("found {binders} extenders implementing bind"),
+            "only one extender can implement bind",
+        ));
+    }
+    errs
+}
+
+/// `validateExtendedResourceName` (validation.go:290-301).
+fn validate_extended_resource_name(path: &Path, name: &str) -> ErrorList {
+    let mut errs: ErrorList = is_qualified_name(name)
+        .into_iter()
+        .map(|msg| field::Error::invalid(path, name, msg))
+        .collect();
+    if !errs.is_empty() {
+        return errs;
+    }
+    if !is_extended_resource_name(name) {
+        errs.push(field::Error::invalid(
+            path,
+            name,
+            "is an invalid extended resource name",
+        ));
+    }
+    errs
+}
+
+/// `v1helper.IsNativeResource` (pkg/apis/core/v1/helper/helpers.go:60-63):
+/// `IsPrefixedNativeResource` is a `Contains` check on `kubernetes.io/`
+/// (helpers.go:53-55), not a prefix check.
+fn is_native_resource(name: &str) -> bool {
+    !name.contains('/') || name.contains("kubernetes.io/")
+}
+
+/// `v1helper.IsExtendedResourceName` (pkg/apis/core/v1/helper/helpers.go:39-49).
+fn is_extended_resource_name(name: &str) -> bool {
+    if is_native_resource(name) || name.starts_with("requests.") {
+        return false;
+    }
+    is_qualified_name(&format!("requests.{name}")).is_empty()
 }
 
 /// `validateCommonQueueSort` (validation.go:219-254).
@@ -1515,7 +1620,9 @@ profiles:
             "{err}"
         );
         assert!(
-            err.contains("extenders[0].managedResources[3].name: Invalid value: \"bad name/x\": prefix part"),
+            err.contains(
+                "extenders[0].managedResources[3].name: Invalid value: \"bad name/x\": prefix part"
+            ),
             "{err}"
         );
         assert!(
