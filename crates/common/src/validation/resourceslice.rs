@@ -322,17 +322,12 @@ pub(crate) fn validate_device_binding_parameters(
     errs
 }
 
-/// Upstream aliases `validateDeviceName` and `validateCounterName` to
+/// Port of upstream `validateDeviceName`, an alias of
 /// `corevalidation.ValidateDNS1123Label`
-/// (`pkg/apis/resource/validation/validation.go:73,76`), which reports an empty
-/// name as an invalid label rather than as `Required`. Rusternetes already
-/// answered a nameless device with `Required`, and a client can act on either,
-/// so the empty case keeps the clearer `Required` and everything else takes
-/// upstream's label check.
+/// (`pkg/apis/resource/validation/validation.go:73`;
+/// `pkg/apis/core/validation/validation.go:158-164`). It has no empty-name
+/// branch, so an empty name is an Invalid label (bad value `""`), not Required.
 pub(crate) fn validate_device_name(name: &str, fld_path: &Path) -> ErrorList {
-    if name.is_empty() {
-        return vec![Error::required(fld_path, "")];
-    }
     is_dns1123_label(name)
         .into_iter()
         .map(|msg| Error::invalid(fld_path, name.to_string(), msg))
