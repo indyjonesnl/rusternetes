@@ -4296,4 +4296,156 @@ mod tests {
             super::super::host_policy::default_masked_paths()
         );
     }
+
+    /// `makeMounts` image-volume arm (`pkg/kubelet/kubelet_pods.go:327-330`)
+    /// and the CRI `Mount` the kuberuntime builds from it
+    /// (`kuberuntime_container.go:487-496`): with the `ImageVolume` gate on, a
+    /// volume the kubelet pulled gets `Mount.image` + `Mount.image_sub_path`
+    /// and NO `host_path` (cri-api: "host_path ... Has to be empty if the
+    /// image field below is provided"); the image mount is read-only because
+    /// the image plugin's mounter is (`image.go:75-81`).
+    fn image_volume_container(sub_path: Option<&str>) -> Container {
+        use rusternetes_common::resources::pod::VolumeMount;
+        let vm = |name: &str, path: &str, sub: Option<&str>| VolumeMount {
+            name: name.to_string(),
+            mount_path: path.to_string(),
+            read_only: None,
+            sub_path: sub.map(str::to_string),
+            sub_path_expr: None,
+            mount_propagation: None,
+            recursive_read_only: None,
+        };
+        Container {
+            name: "c".to_string(),
+            image: "busybox".to_string(),
+            volume_mounts: Some(vec![
+                vm("img", "/data", sub_path),
+                vm("plain", "/plain", None),
+            ]),
+            ..Default::default()
+        }
+    }
+
+    fn pulled_image() -> HashMap<String, v1::ImageSpec> {
+        HashMap::from([(
+            "img".to_string(),
+            v1::ImageSpec {
+                image: "sha256:abc".to_string(),
+                user_specified_image: "quay.io/a/b:1".to_string(),
+                ..Default::default()
+            },
+        )])
+    }
+
+    fn image_host_paths() -> HashMap<String, String> {
+        HashMap::from([
+            ("img".to_string(), String::new()),
+            ("plain".to_string(), "/host/plain".to_string()),
+        ])
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn an_image_volume_mount_carries_the_image_not_a_host_path() {
+        let _g = rusternetes_common::feature_gates::with_feature(
+            rusternetes_common::feature_gates::Feature::ImageVolume,
+            true,
+        );
+        let c = image_volume_container(Some("dir/sub"));
+        let attrs = HashMap::from([(
+            "img".to_string(),
+            MountAttrs {
+                read_only: true,
+                selinux_relabel: false,
+            },
+        )]);
+        let m = mounts_with(
+            &c,
+            &image_host_paths(),
+            &HashMap::new(),
+            &attrs,
+            false,
+            false,
+            &pulled_image(),
+        )
+        .unwrap();
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0].container_path, "/data");
+        assert_eq!(m[0].host_path, "");
+        assert_eq!(m[0].image, Some(pulled_image().remove("img").unwrap()));
+        assert_eq!(m[0].image_sub_path, "dir/sub");
+        assert!(m[0].readonly);
+        // A volume the kubelet did not pull is an ordinary host mount.
+        assert_eq!(m[1].host_path, "/host/plain");
+        assert_eq!(m[1].image, None);
+        assert_eq!(m[1].image_sub_path, "");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn an_image_volume_without_a_sub_path_has_an_empty_image_sub_path() {
+        let _g = rusternetes_common::feature_gates::with_feature(
+            rusternetes_common::feature_gates::Feature::ImageVolume,
+            true,
+        );
+        let c = image_volume_container(None);
+        let m = mounts_with(
+            &c,
+            &image_host_paths(),
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+            false,
+            &pulled_image(),
+        )
+        .unwrap();
+        assert!(m[0].image.is_some());
+        assert_eq!(m[0].image_sub_path, "");
+    }
+
+    /// `makeMounts` consults `imageVolumes` only when
+    /// `features.ImageVolume` is enabled (`kubelet_pods.go:327`).
+    #[test]
+    #[serial_test::serial]
+    fn the_image_volume_gate_off_ignores_pulled_images() {
+        let _g = rusternetes_common::feature_gates::with_feature(
+            rusternetes_common::feature_gates::Feature::ImageVolume,
+            false,
+        );
+        let c = image_volume_container(None);
+        let m = mounts_with(
+            &c,
+            &image_host_paths(),
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+            false,
+            &pulled_image(),
+        )
+        .unwrap();
+        assert_eq!(m[0].image, None);
+        assert_eq!(m[0].image_sub_path, "");
+    }
+
+    /// The subPath guards run before the image arm (`kubelet_pods.go:317-325`
+    /// precede `:327`), so an escaping subPath still fails.
+    #[test]
+    #[serial_test::serial]
+    fn an_image_volume_sub_path_is_still_validated() {
+        let _g = rusternetes_common::feature_gates::with_feature(
+            rusternetes_common::feature_gates::Feature::ImageVolume,
+            true,
+        );
+        let c = image_volume_container(Some("../escape"));
+        assert!(mounts_with(
+            &c,
+            &image_host_paths(),
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+            false,
+            &pulled_image(),
+        )
+        .is_err());
+    }
 }

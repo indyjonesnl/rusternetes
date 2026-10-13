@@ -17,6 +17,7 @@ pub mod downward_api;
 pub mod empty_dir;
 pub mod host;
 pub mod host_path;
+pub mod image;
 pub mod local;
 #[cfg(test)]
 mod mounter_args_tests;
