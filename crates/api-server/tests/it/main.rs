@@ -371,6 +371,7 @@ mod workload_template_decodes_when_absent_test;
 mod workload_template_drop_disabled_test;
 
 mod connect_mutating_admission_test;
+mod custom_external_metrics_selectors_test;
 mod list_exact_all_handlers_test;
 mod list_options_all_routes_test;
 mod list_resource_version_match_exact_test;
