@@ -46,7 +46,8 @@ fn selectable_fields_without_a_schema_are_invalid() {
 }
 
 /// `validation.go:314-317`: a schema `NewStructural` rejects is reported at the
-/// literal single path element `schema.openAPIV3Schema`.
+/// version path plus the literal single element `schema.openAPIV3Schema`, in
+/// addition to the structural-schema error of `validateCustomResourceDefinitionValidation`.
 #[test]
 fn unconvertible_schema_reports_at_schema_dot_openapi_path() {
     let bad = json!({
@@ -54,12 +55,15 @@ fn unconvertible_schema_reports_at_schema_dot_openapi_path() {
         "properties": {"foo": {"type": "string"}},
         "items": [{"type": "string"}]
     });
-    let errs = selectable_errs(&crd_with_version(Some(bad.clone()), &[]));
-    assert!(errs.is_empty(), "no selectableFields, no check: {errs:?}");
-    let errs = selectable_errs(&crd_with_version(Some(bad), &[".foo"]));
+    let c = crd_with_version(Some(bad), &[".foo"]);
+    let errs: Vec<String> = validate_custom_resource_definition_spec(&c.spec, &Path::new("spec"))
+        .iter()
+        .map(|e| e.to_string())
+        .collect();
+    assert_eq!(errs.len(), 2, "{errs:?}");
     assert!(
         errs.iter().any(|e| e.starts_with(
-            "spec.versions[0].selectableFields.schema.openAPIV3Schema: Invalid value: \"\": OpenAPIV3Schema 'items' must be a schema, but is an array"
+            "spec.versions[0].schema.openAPIV3Schema: Invalid value: \"\": OpenAPIV3Schema 'items' must be a schema, but is an array"
         )),
         "{errs:?}"
     );
