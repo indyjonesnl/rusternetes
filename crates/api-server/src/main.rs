@@ -283,13 +283,19 @@ async fn install_audit_from_flags(args: &Args) -> Result<()> {
 /// `--feature-gates`: `ComponentGlobalsRegistry.Set()` then `Validate()`
 /// (cmd/kube-apiserver/app/server.go:84-87; staging/src/k8s.io/component-base/compatibility/registry.go:344-451).
 fn apply_feature_gates(args: &Args) -> Result<()> {
-    rusternetes_common::compatibility::apply_flags(
+    let effective_version = rusternetes_common::compatibility::apply_flags(
         &args.emulated_version,
         &args.min_compatibility_version,
         &args.feature_gates,
     )
-    .map(|_| ())
-    .map_err(|e| anyhow::anyhow!("invalid --feature-gates/--emulated-version: {e}"))
+    .map_err(|e| anyhow::anyhow!("invalid --feature-gates/--emulated-version: {e}"))?;
+    // `ComponentGlobalsRegistry.AddMetrics()` (cmd/kube-apiserver/app/server.go:116;
+    // component-base/compatibility/registry.go:123-131): record `version_info`.
+    rusternetes_common::compat_version_metrics::add_metrics(
+        rusternetes_common::compatibility::DEFAULT_KUBE_COMPONENT,
+        &effective_version,
+    );
+    Ok(())
 }
 
 #[tokio::main]

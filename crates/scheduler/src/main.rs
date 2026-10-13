@@ -131,12 +131,18 @@ async fn main() -> Result<()> {
 
     // `ComponentGlobalsRegistry.Set()` (cmd/kube-scheduler/app/server.go:105) then
     // options `Validate` (compatibility/registry.go:430-451).
-    rusternetes_common::compatibility::apply_flags(
+    let effective_version = rusternetes_common::compatibility::apply_flags(
         &args.emulated_version,
         &args.min_compatibility_version,
         &args.feature_gates,
     )
     .map_err(|e| anyhow::anyhow!("invalid --feature-gates/--emulated-version: {e}"))?;
+    // `ComponentGlobalsRegistry.AddMetrics()` (cmd/kube-scheduler/app/server.go:165;
+    // component-base/compatibility/registry.go:123-131): record `version_info`.
+    rusternetes_common::compat_version_metrics::add_metrics(
+        rusternetes_common::compatibility::DEFAULT_KUBE_COMPONENT,
+        &effective_version,
+    );
 
     let volume_binding_args = match &args.config {
         Some(path) => scheduler_config::load_volume_binding_args(path)

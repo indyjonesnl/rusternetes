@@ -145,9 +145,31 @@ pub async fn check_resource_quota<S: rusternetes_storage::Storage>(
 /// Every controller's Prometheus series in text exposition format: the
 /// `legacyregistry` equivalent served on the controller-manager `/metrics`.
 pub fn gather_metrics() -> String {
+    use prometheus::Encoder;
     let mut out = cidrset_metrics::gather();
     out.push_str(&ephemeral_volume_metrics::gather());
     out.push_str(&node_lifecycle_metrics::gather());
     out.push_str(&csi_capacity_metrics::gather());
+    // Process-global `legacyregistry` (prometheus default registry): holds
+    // `version_info` from `ComponentGlobalsRegistry.AddMetrics()`
+    // (cmd/kube-controller-manager/app/controllermanager.go:146).
+    let mut buf = Vec::new();
+    prometheus::TextEncoder::new()
+        .encode(&prometheus::default_registry().gather(), &mut buf)
+        .expect("text encode");
+    out.push_str(&String::from_utf8(buf).expect("utf8"));
     out
+}
+
+#[cfg(test)]
+mod gather_metrics_tests {
+    #[test]
+    fn serves_version_info_from_default_registry() {
+        rusternetes_common::compat_version_metrics::record_compat_version_info(
+            "kube", "1.35", "1.35", "1.34",
+        );
+        assert!(super::gather_metrics().contains(
+            "version_info{binary=\"1.35\",component=\"kube\",emulation=\"1.35\",min_compat=\"1.34\"} 1"
+        ));
+    }
 }
