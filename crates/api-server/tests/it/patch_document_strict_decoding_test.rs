@@ -177,6 +177,7 @@ async fn custom_resource_merge_patch_duplicate_key_strict() {
         )
         .await;
     assert_eq!(s, StatusCode::CREATED, "{out}");
+    api.wait_crd_established(&format!("widgets.{GROUP}")).await;
     let base = format!("/apis/{GROUP}/v1/namespaces/default/widgets");
     let (s, out) = api
         .post(

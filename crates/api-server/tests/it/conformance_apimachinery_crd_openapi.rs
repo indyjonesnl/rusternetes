@@ -80,6 +80,14 @@ fn spawn_state() -> TestApiServer {
 async fn seed_crd(state: &TestApiServer, crd_body: &Value) {
     use rusternetes_storage::Storage;
     let name = crd_body["metadata"]["name"].as_str().expect("crd name");
+    // A CRD already held by a cluster is Established; custom resources are
+    // 404 until then (customresource_handler.go:288-293).
+    let mut crd_body = crd_body.clone();
+    crd_body["status"] = serde_json::json!({"conditions": [
+        {"type": "NamesAccepted", "status": "True"},
+        {"type": "Established", "status": "True"}
+    ]});
+    let crd_body = &crd_body;
     state
         .storage
         .create(
@@ -93,6 +101,13 @@ async fn seed_crd(state: &TestApiServer, crd_body: &Value) {
 /// POST the given CRD JSON. Returns `(status, body)`.
 async fn post_crd(state: &TestApiServer, crd_body: &Value) -> (u16, Value) {
     let (status, value) = state.post(CRDS_URI, crd_body).await;
+    // `WaitForEstablishedCRD`: custom resources are 404 until Established
+    // (customresource_handler.go:288-293).
+    if status.is_success() {
+        state
+            .wait_crd_established(value["metadata"]["name"].as_str().unwrap())
+            .await;
+    }
     (status.as_u16(), value)
 }
 

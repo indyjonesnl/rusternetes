@@ -70,6 +70,9 @@ async fn cr_status_update_is_delivered_to_watchers() {
         .0,
         StatusCode::CREATED
     );
+    router
+        .wait_crd_established(&format!("widgets.{GROUP}"))
+        .await;
 
     let base = format!("/apis/{GROUP}/v1/namespaces/default/widgets");
     let (sc, _) = send(

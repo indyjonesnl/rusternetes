@@ -234,6 +234,26 @@ async fn list_registered_apiservice_groups_with_storage(
     out
 }
 
+/// `IsCRDConditionTrue(crd, Established)` over a stored CRD document.
+/// customresource_discovery_controller.go:105 `sync` skips every CRD that is
+/// not Established, so its group/versions/resources are not in discovery:
+///
+/// ```go
+/// if !apiextensionshelpers.IsCRDConditionTrue(crd, apiextensionsv1.Established) {
+///     continue
+/// }
+/// ```
+pub fn crd_established(crd: &serde_json::Value) -> bool {
+    crd.pointer("/status/conditions")
+        .and_then(|c| c.as_array())
+        .is_some_and(|cs| {
+            cs.iter().any(|c| {
+                c.get("type").and_then(|t| t.as_str()) == Some("Established")
+                    && c.get("status").and_then(|t| t.as_str()) == Some("True")
+            })
+        })
+}
+
 /// GET /apis
 /// Returns the list of API groups available
 pub async fn get_api_groups(
@@ -314,7 +334,7 @@ pub async fn get_api_groups(
                     "update",
                     "watch",
                 ];
-                for crd in &crds {
+                for crd in crds.iter().filter(|c| crd_established(c)) {
                     let group = crd.pointer("/spec/group").and_then(|v| v.as_str());
                     let names = crd.pointer("/spec/names");
                     let versions_arr = crd.pointer("/spec/versions").and_then(|v| v.as_array());
@@ -796,7 +816,7 @@ pub async fn get_api_groups(
         if let Ok(crds) = storage.list::<serde_json::Value>(&crd_prefix).await {
             let mut seen_groups: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
-            for crd in &crds {
+            for crd in crds.iter().filter(|c| crd_established(c)) {
                 let group = crd.pointer("/spec/group").and_then(|v| v.as_str());
                 let versions_arr = crd.pointer("/spec/versions").and_then(|v| v.as_array());
                 if let (Some(group), Some(versions_arr)) = (group, versions_arr) {
@@ -1924,7 +1944,7 @@ pub async fn get_api_group(
         let crd_prefix = rusternetes_storage::build_prefix("customresourcedefinitions", None);
         if let Ok(crds) = storage.list::<serde_json::Value>(&crd_prefix).await {
             let mut versions: Vec<GroupVersionForDiscovery> = Vec::new();
-            for crd in &crds {
+            for crd in crds.iter().filter(|c| crd_established(c)) {
                 if crd.pointer("/spec/group").and_then(|v| v.as_str()) != Some(group.as_str()) {
                     continue;
                 }
@@ -4514,6 +4534,70 @@ mod listed_paths_tests {
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+
+    /// customresource_discovery_controller.go:105 — a CRD that is not
+    /// `Established` contributes nothing to discovery.
+    #[tokio::test]
+    async fn crd_group_is_not_discoverable_until_established() {
+        use rusternetes_storage::Storage;
+        let storage = std::sync::Arc::new(rusternetes_storage::StorageBackend::new_memory());
+        let crd = |name: &str, group: &str, established: &str| {
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": {"name": name},
+                "spec": {"group": group, "scope": "Namespaced",
+                    "names": {"plural": "foos", "kind": "Foo"},
+                    "versions": [{"name": "v1", "served": true, "storage": true}]},
+                "status": {"conditions": [{"type": "Established", "status": established}]}
+            })
+        };
+        let k1 = rusternetes_storage::build_key(
+            "customresourcedefinitions",
+            None,
+            "foos.pending.example.com",
+        );
+        storage
+            .create(
+                &k1,
+                &crd("foos.pending.example.com", "pending.example.com", "False"),
+            )
+            .await
+            .unwrap();
+        let k2 = rusternetes_storage::build_key(
+            "customresourcedefinitions",
+            None,
+            "foos.ready.example.com",
+        );
+        storage
+            .create(
+                &k2,
+                &crd("foos.ready.example.com", "ready.example.com", "True"),
+            )
+            .await
+            .unwrap();
+
+        let resp = get_api_group(
+            Some(storage.clone()),
+            axum::extract::Path("pending.example.com".to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+        let resp = get_api_group(
+            Some(storage.clone()),
+            axum::extract::Path("ready.example.com".to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let resp = get_api_groups(Some(storage.clone()), HeaderMap::new()).await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("ready.example.com"));
+        assert!(!text.contains("pending.example.com"));
+    }
 
     #[test]
     fn resolve_kind_finds_the_resource_serving_a_kind() {

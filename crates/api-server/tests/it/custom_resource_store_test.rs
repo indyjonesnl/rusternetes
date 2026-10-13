@@ -60,6 +60,8 @@ fn typed_schema() -> Value {
 async fn install(api: &TestApiServer, crd: &Value) {
     let (status, out) = api.post(CRDS, crd).await;
     assert_eq!(status, StatusCode::CREATED, "install CRD: {out}");
+    api.wait_crd_established(crd["metadata"]["name"].as_str().unwrap())
+        .await;
 }
 
 fn ns_path(plural: &str) -> String {

@@ -12,6 +12,9 @@
 #![allow(dead_code)]
 
 use crate::endpoints::handlers::{self as endpoints, RequestScope};
+use crate::registry::apiextensions::controllers::{
+    find_crd_condition, ESTABLISHED, NAMES_ACCEPTED,
+};
 use crate::registry::apiextensions::customresource::{
     new_scale_rest, CustomResourceRest, StrictMode,
 };
@@ -23,6 +26,7 @@ use axum::{
     Extension, Json,
 };
 use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
+use rusternetes_common::validation::crd::is_crd_condition_true;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::{CustomResource, CustomResourceDefinition, Scale},
@@ -45,22 +49,34 @@ async fn serving_crd(
     plural: &str,
     subresource: Option<&str>,
 ) -> Result<Arc<CustomResourceDefinition>> {
-    let not_found = || {
-        rusternetes_common::Error::NotFound(
-            "the server could not find the requested resource".to_string(),
-        )
-    };
     let crd = get_crd_for_resource(state, &format!("{plural}.{group}"))
         .await
-        .map_err(|_| not_found())?;
+        .map_err(|_| serving_not_found())?;
+    check_serving(&crd, version, subresource)?;
+    Ok(Arc::new(crd))
+}
+
+fn serving_not_found() -> rusternetes_common::Error {
+    rusternetes_common::Error::NotFound(
+        "the server could not find the requested resource".to_string(),
+    )
+}
+
+/// The version/subresource/condition gates of `crdHandler.ServeHTTP`
+/// (customresource_handler.go:283-293 and :299-352).
+fn check_serving(
+    crd: &CustomResourceDefinition,
+    version: &str,
+    subresource: Option<&str>,
+) -> Result<()> {
     let served = crd
         .spec
         .versions
         .iter()
         .find(|v| v.name == version)
-        .ok_or_else(not_found)?;
+        .ok_or_else(serving_not_found)?;
     if !served.served {
-        return Err(not_found());
+        return Err(serving_not_found());
     }
     if subresource == Some("status")
         && !served
@@ -68,9 +84,40 @@ async fn serving_crd(
             .as_ref()
             .is_some_and(|s| s.status.is_some())
     {
-        return Err(not_found());
+        return Err(serving_not_found());
     }
-    Ok(Arc::new(crd))
+    // customresource_handler.go:288-293 — "There is a small chance that a CRD
+    // is being served because NamesAccepted condition is true, but it becomes
+    // 'unserved' because another names update leads to a conflict and
+    // EstablishingController wasn't fast enough to put the CRD into the
+    // Established condition. We accept this as the problem is small and
+    // self-healing."
+    //
+    //   if !apiextensionshelpers.IsCRDConditionTrue(crd, apiextensionsv1.NamesAccepted) &&
+    //       !apiextensionshelpers.IsCRDConditionTrue(crd, apiextensionsv1.Established) {
+    //       r.delegate.ServeHTTP(w, req)   // -> 404
+    //       return
+    //   }
+    if !is_crd_condition_true(crd, NAMES_ACCEPTED) && !is_crd_condition_true(crd, ESTABLISHED) {
+        return Err(serving_not_found());
+    }
+    Ok(())
+}
+
+/// customresource_handler.go:381-387, the `create` verb: a CRD whose
+/// Established condition transitioned under two seconds ago holds the create
+/// for two seconds, so a follow-up get/update/delete served by an apiserver
+/// that has not yet observed Established does not 404.
+///
+///   justCreated := time.Since(apiextensionshelpers.FindCRDCondition(crd, apiextensionsv1.Established).LastTransitionTime.Time) < 2*time.Second
+///   if justCreated {
+///       time.Sleep(2 * time.Second)
+///   }
+fn just_created(crd: &CustomResourceDefinition) -> bool {
+    find_crd_condition(crd, ESTABLISHED)
+        .and_then(|c| c.last_transition_time.as_deref())
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .is_some_and(|t| chrono::Utc::now().signed_duration_since(t) < chrono::Duration::seconds(2))
 }
 
 /// The `RequestScope` of a custom resource (or its `/status`) at one served
@@ -148,6 +195,9 @@ pub async fn create_custom_resource(
 ) -> Result<Response> {
     info!("Creating custom resource {group}/{version}/{plural}");
     let crd = serving_crd(&state, &group, &version, &plural, None).await?;
+    if just_created(&crd) {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
     endpoints::create_resource(
         &state,
         &scope(&state, &crd, &version, None, strict_mode(&params, false)),
@@ -195,8 +245,7 @@ pub async fn list_custom_resources(
     debug!("Listing custom resources {}/{}/{}", group, version, plural);
 
     // Find the CRD for this resource type
-    let crd_name = format!("{}.{}", plural, group);
-    let crd = get_crd_for_resource(&state, &crd_name).await?;
+    let crd = serving_crd(&state, &group, &version, &plural, None).await?;
 
     // Check authorization
     let attrs = if let Some(ref ns) = namespace {
@@ -329,8 +378,7 @@ pub async fn watch_custom_resources(
     namespace: Option<String>,
     watch_params: crate::handlers::watch::WatchParams,
 ) -> Result<axum::response::Response> {
-    let crd_name = format!("{plural}.{group}");
-    let crd = get_crd_for_resource(&state, &crd_name).await?;
+    let crd = serving_crd(&state, group, version, plural, None).await?;
 
     // Same selectable-path gate LIST applies: reject selectors on paths the
     // CRD version did not declare via `x-kubernetes-selectable-fields`.
@@ -1164,6 +1212,38 @@ mod tests {
             status: None,
             extra: Default::default(),
         }
+    }
+
+    fn crd_with_conditions(conds: &[(&str, &str)]) -> CustomResourceDefinition {
+        let mut crd = create_test_crd();
+        crd.status = Some(
+            rusternetes_common::resources::CustomResourceDefinitionStatus {
+                conditions: Some(
+                    conds
+                        .iter()
+                        .map(|(t, s)| {
+                            serde_json::from_value(json!({"type": t, "status": s})).unwrap()
+                        })
+                        .collect(),
+                ),
+                accepted_names: None,
+                stored_versions: None,
+            },
+        );
+        crd
+    }
+
+    /// customresource_handler.go:288-293: neither NamesAccepted nor
+    /// Established true -> delegate (404).
+    #[test]
+    fn check_serving_requires_names_accepted_or_established() {
+        assert!(check_serving(&create_test_crd(), "v1", None).is_err());
+        let c = crd_with_conditions(&[("NamesAccepted", "False"), ("Established", "False")]);
+        assert!(check_serving(&c, "v1", None).is_err());
+        let c = crd_with_conditions(&[("NamesAccepted", "True")]);
+        assert!(check_serving(&c, "v1", None).is_ok());
+        let c = crd_with_conditions(&[("Established", "True")]);
+        assert!(check_serving(&c, "v1", None).is_ok());
     }
 
     #[test]

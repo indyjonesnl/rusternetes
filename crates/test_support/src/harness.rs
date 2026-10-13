@@ -236,6 +236,29 @@ impl TestApiServer {
         self.send("GET", uri, None, None).await
     }
 
+    /// Wait until the CRD's naming and establishing controllers have set
+    /// `NamesAccepted` and `Established`, as the e2e framework's
+    /// `WaitForEstablishedCRD` does before a test uses the resource
+    /// (`apiextensions-apiserver/test/integration/fixtures/resources.go`
+    /// `WaitForEstablishedCRD`). Custom resource requests are 404 until then
+    /// (`customresource_handler.go:288-293`).
+    pub async fn wait_crd_established(&self, name: &str) {
+        let uri = format!("/apis/apiextensions.k8s.io/v1/customresourcedefinitions/{name}");
+        for _ in 0..500 {
+            let (_, body) = self.get(&uri).await;
+            let has = |t: &str| {
+                body["status"]["conditions"]
+                    .as_array()
+                    .is_some_and(|c| c.iter().any(|c| c["type"] == t && c["status"] == "True"))
+            };
+            if has("Established") {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("{name} never became Established");
+    }
+
     /// POST a JSON body.
     pub async fn post(&self, uri: &str, body: &Value) -> (StatusCode, Value) {
         self.send("POST", uri, Some("application/json"), Some(body))

@@ -54,6 +54,14 @@ fn spawn_router() -> TestApiServer {
 
 async fn post_json(router: &TestApiServer, uri: &str, body: &Value) -> (u16, Value) {
     let (status, value) = router.post(uri, body).await;
+    // The e2e framework's `WaitForEstablishedCRD` after every CRD create:
+    // custom resources are 404 until Established
+    // (customresource_handler.go:288-293).
+    if status.is_success() && uri.ends_with("/customresourcedefinitions") {
+        router
+            .wait_crd_established(value["metadata"]["name"].as_str().unwrap())
+            .await;
+    }
     (status.as_u16(), value)
 }
 

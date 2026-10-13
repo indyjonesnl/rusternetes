@@ -206,7 +206,11 @@ async fn custom_resource_fallback(
         let crds: Vec<CustomResourceDefinition> =
             state.storage.list(&prefix).await.unwrap_or_default();
         let mut resources = Vec::new();
-        for crd in &crds {
+        // customresource_discovery_controller.go:105: only Established CRDs
+        // are in discovery.
+        for crd in crds.iter().filter(|c| {
+            rusternetes_common::validation::crd::is_crd_condition_true(c, "Established")
+        }) {
             if crd.spec.group != group_name {
                 continue;
             }

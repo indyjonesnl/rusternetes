@@ -275,6 +275,10 @@ async fn unknown_group_trailing_slash_is_404_until_crd_created() {
     )
     .await;
     assert_eq!(s, StatusCode::CREATED);
+    // Discovery lists only Established CRDs
+    // (customresource_discovery_controller.go:105); the e2e framework waits
+    // for it (`WaitForEstablishedCRD`).
+    router.wait_crd_established("widgets.w.example.com").await;
 
     // After create, the same trailing-slash lookup resolves the CRD's group.
     let (s, grp) = send(&router, Method::GET, "/apis/w.example.com/", None).await;
@@ -316,6 +320,7 @@ async fn discovery_reflects_served_versions_only() {
     )
     .await;
     assert_eq!(s, StatusCode::CREATED);
+    router.wait_crd_established("multis.m.example.com").await;
 
     // Trailing-slash group lists exactly the served versions.
     let (s, grp) = send(&router, Method::GET, &format!("/apis/{group}/"), None).await;
