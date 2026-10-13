@@ -48,6 +48,7 @@ mod validation_deployment;
 mod validation_dra_unknown_enums;
 mod validation_endpoints;
 mod validation_endpointslice;
+mod validation_too_many_actual;
 mod validation_endpointslice_update;
 mod validation_flowschema;
 mod validation_hpa;

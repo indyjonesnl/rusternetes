@@ -183,4 +183,18 @@ mod tests {
         g.spec.to[0].name = Some(String::new());
         assert_eq!(validate_reference_grant(&g).len(), 1);
     }
+
+    /// `validate.MaxItems` -> `field.TooMany(fldPath, len(value), max)`
+    /// (`apimachinery/pkg/api/validate/limits.go:43`) carries the actual count.
+    #[test]
+    fn too_many_from_items_reports_actual_count() {
+        let mut g = valid();
+        let item = g.spec.from[0].clone();
+        g.spec.from = vec![item; 17];
+        let errs = validate_reference_grant(&g);
+        assert_eq!(
+            errs.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+            vec!["spec.from: Too many: 17: must have at most 16 items"]
+        );
+    }
 }

@@ -54,7 +54,7 @@ fn cases() -> Vec<(&'static str, Value, &'static str)> {
         (
             "more than 64 matchConditions",
             sixty_five_conditions(),
-            "webhooks[0].matchConditions: Too many: must have at most 64 items",
+            "webhooks[0].matchConditions: Too many: 65: must have at most 64 items",
         ),
         (
             "a matchCondition with no name",
