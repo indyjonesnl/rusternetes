@@ -16,6 +16,12 @@ FROM ${CONTAINERD_IMAGE}
 
 COPY --from=kubeletbin /app/kubelet /usr/local/bin/kubelet
 
+# The kubelet runs in THIS image, so it needs /sbin/mount.nfs for the nfs
+# volume plugin (#3333); see services.Dockerfile. mount(8) is in the base.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nfs-common \
+    && rm -rf /var/lib/apt/lists/*
+
 # Pod networking comes from Calico (installed by its DaemonSet into
 # /etc/cni/net.d + /opt/cni/bin at runtime), so drop the standalone bridge conf
 # the containerd image ships — otherwise both configs would race.

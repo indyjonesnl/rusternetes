@@ -407,12 +407,23 @@ CMD ["--bind-address", "0.0.0.0:6443", "--etcd-servers", "http://etcd:2379"]
 # ---------------------------------------------------------------------
 FROM debian:sid-slim AS kubelet
 
+# nfs-common provides /sbin/mount.nfs, the helper `mount -t nfs` execs for the
+# nfs volume plugin (#3333). mount(8)/umount come from the base util-linux.
+# Upstream's mount-utils execs plain `mount`/`umount`
+# (staging/src/k8s.io/mount-utils/mount_linux.go: `exec.Command("umount", ...)`,
+# defaultMountCommand "mount") and leaves the nfs helper to the host; kind's
+# node image installs it (`nfs-common` in images/base/Dockerfile). Hosts
+# without an NFS server/client are unaffected: the helper is only exec'd when a
+# pod uses an nfs volume. Installed with --no-install-recommends in its own
+# apt step: ~+4.7 MiB on disk (rpcbind, libnfsidmap, libtirpc, ...), versus
+# ~+47 MiB if recommends were pulled in.
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
     iproute2 \
     iptables \
     curl \
+    && apt-get install -y --no-install-recommends nfs-common \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
