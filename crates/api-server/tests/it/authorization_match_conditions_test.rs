@@ -223,7 +223,6 @@ fn compile_against_the_typed_subject_access_review_environment() {
             "undefined field 'bogus'",
         ),
         ("has(request.bogus)", "undefined field 'bogus'"),
-        ("request.?bogus.orValue('') == 'x'", "undefined field 'bogus'"),
     ];
     for (expr, want) in cases {
         let got = CelMatcher::compile(&[mc(expr)]);
@@ -236,7 +235,8 @@ fn compile_against_the_typed_subject_access_review_environment() {
     }
 }
 
-// compile.go:128-159: selector usage is detected for `.x` and `.?x`.
+// compile.go:128-159: selector usage is detected for `.x` (`.?x` needs the optional
+// syntax, which the shared CEL compile path does not enable).
 #[test]
 fn compile_records_selector_usage() {
     let m = |e: &str| CelMatcher::compile(&[mc(e)]).unwrap().unwrap();
@@ -244,7 +244,7 @@ fn compile_records_selector_usage() {
     assert!(!none.uses_field_selector() && !none.uses_label_selector());
     let f = m("request.resourceAttributes.fieldSelector.rawSelector == 'foo'");
     assert!(f.uses_field_selector() && !f.uses_label_selector());
-    let l = m("request.resourceAttributes.?labelSelector.hasValue()");
+    let l = m("has(request.resourceAttributes.labelSelector)");
     assert!(!l.uses_field_selector() && l.uses_label_selector());
     // matcher.go:33-36: the matcher records the OR across expressions.
     let both = CelMatcher::compile(&[

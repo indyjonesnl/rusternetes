@@ -975,7 +975,15 @@ fn label_selector_to_authorization_api(
 
 /// `convertObjectToUnstructured` (authorization/cel/compile.go): every string
 /// attribute is present even when empty; `extra` is never null.
-fn cel_request(spec: &SarSpec) -> serde_json::Value {
+///
+/// `convertObjectToUnstructured` (compile.go:270-336): the selectors are
+/// included only when an expression uses them (`includeFieldSelector` /
+/// `includeLabelSelector`).
+fn cel_request(
+    spec: &SarSpec,
+    include_field_selector: bool,
+    include_label_selector: bool,
+) -> serde_json::Value {
     let mut ret = serde_json::json!({
         "user": spec.user,
         "groups": spec.groups,
@@ -983,7 +991,7 @@ fn cel_request(spec: &SarSpec) -> serde_json::Value {
         "extra": spec.extra,
     });
     if let Some(r) = &spec.resource_attributes {
-        ret["resourceAttributes"] = serde_json::json!({
+        let mut ra = serde_json::json!({
             "namespace": r.namespace,
             "verb": r.verb,
             "group": r.group,
@@ -992,6 +1000,22 @@ fn cel_request(spec: &SarSpec) -> serde_json::Value {
             "subresource": r.subresource,
             "name": r.name,
         });
+        // compile.go:293-325.
+        if include_field_selector {
+            if let Some(fs) = &r.field_selector {
+                if !fs.requirements.is_empty() {
+                    ra["fieldSelector"] = serde_json::json!({"requirements": fs.requirements});
+                }
+            }
+        }
+        if include_label_selector {
+            if let Some(ls) = &r.label_selector {
+                if !ls.requirements.is_empty() {
+                    ra["labelSelector"] = serde_json::json!({"requirements": ls.requirements});
+                }
+            }
+        }
+        ret["resourceAttributes"] = ra;
     }
     if let Some(n) = &spec.non_resource_attributes {
         ret["nonResourceAttributes"] = serde_json::json!({"verb": n.verb, "path": n.path});
@@ -1032,7 +1056,11 @@ impl Authorizer for WebhookAuthorizer {
         // Match conditions run before the webhook (webhook.go:207-222): an error
         // (with no FALSE) yields decisionOnError, a FALSE yields NoOpinion.
         if let Some(m) = &self.match_conditions {
-            match m.eval(&cel_request(&spec)) {
+            match m.eval(&cel_request(
+                &spec,
+                m.uses_field_selector(),
+                m.uses_label_selector(),
+            )) {
                 Err(e) => return Ok(self.decision_on_error(e)),
                 Ok(false) => {
                     return Ok(Opinion::NoOpinion {

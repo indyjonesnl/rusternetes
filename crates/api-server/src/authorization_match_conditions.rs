@@ -3,19 +3,14 @@
 //! Ported from `staging/src/k8s.io/apiserver/pkg/authorization/cel/`
 //! (`matcher.go` `CELMatcher.Eval`, `compile.go` `convertObjectToUnstructured`)
 //! and `pkg/apis/apiserver/validation/validation.go` `compileMatchConditions`
-//! :778-820. Selector attributes are not carried by `RequestAttributes`, so
-//! `fieldSelector` / `labelSelector` are never populated.
-//!
-//! Upstream compiles against a typed CEL environment. Rusternetes' CEL has no
-//! typed environment (see `rusternetes_common::cel::compile_failure`), so the
-//! compile-time output-type check (`compile.go` :189-203, `ReturnTypes` is
-//! `[bool]`) covers only the expression shapes whose type is known without
-//! inference (`rusternetes_common::cel_env::output_type_failure`); any other
-//! non-bool result is still reported at evaluation, which `Eval` treats as an
-//! error.
+//! :778-820. The typed environment is `rusternetes_common::cel_authz`
+//! (`compile.go` `mustBuildEnv`, :173-268): declarations, field selection and
+//! selector-usage detection are ported; cel-go's type inference is not (the
+//! `cel` crate has no checker), so an expression whose output type needs
+//! inference is still reported at evaluation, which `Eval` treats as an error.
 
 use rusternetes_common::cel::{compile_failure, CELContext, CELEvaluator};
-use rusternetes_common::cel_env::{output_type_failure, ExpectedOutput};
+use rusternetes_common::cel_authz::compile_authorization_expression;
 use rusternetes_common::validation::field::{BadValue, Error as FieldError, ErrorList, Path};
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -33,6 +28,10 @@ pub struct CelMatcher {
     /// `CELMatcher.AuthorizerType` / `AuthorizerName`; metrics are reported
     /// only when set (matcher.go:35-42, :51-54).
     metrics_identity: Option<(String, String)>,
+    /// `CELMatcher.UsesFieldSelector` / `UsesLabelSelector` (matcher.go:33-36):
+    /// the OR over every expression's `CompilationResult`.
+    uses_field_selector: bool,
+    uses_label_selector: bool,
 }
 
 impl std::fmt::Debug for CelMatcher {
@@ -76,6 +75,7 @@ impl CelMatcher {
         }
         let mut seen = HashSet::new();
         let mut expressions = Vec::new();
+        let (mut uses_field_selector, mut uses_label_selector) = (false, false);
         for (i, c) in conditions.iter().enumerate() {
             let path = match_conditions.index(i).child("expression");
             if c.expression.trim().is_empty() {
@@ -86,11 +86,20 @@ impl CelMatcher {
                 errs.push(FieldError::duplicate(&path, c.expression.as_str()));
                 continue;
             }
-            if let Some(e) = compile_failure(&c.expression)
-                .or_else(|| output_type_failure(&c.expression, ExpectedOutput::Bool))
-            {
+            if let Some(e) = compile_failure(&c.expression) {
                 errs.push(FieldError::invalid(&path, c.expression.as_str(), e));
                 continue;
+            }
+            // compile.go:81-171 against the typed environment.
+            match compile_authorization_expression(&c.expression) {
+                Ok(u) => {
+                    uses_field_selector |= u.uses_field_selector;
+                    uses_label_selector |= u.uses_label_selector;
+                }
+                Err(e) => {
+                    errs.push(FieldError::invalid(&path, c.expression.as_str(), e));
+                    continue;
+                }
             }
             expressions.push(c.expression.clone());
         }
@@ -102,6 +111,8 @@ impl CelMatcher {
                 expressions,
                 evaluator: Mutex::new(CELEvaluator::new()),
                 metrics_identity: None,
+                uses_field_selector,
+                uses_label_selector,
             }),
             errs,
         )
@@ -109,12 +120,12 @@ impl CelMatcher {
 
     /// `CELMatcher.UsesFieldSelector`.
     pub fn uses_field_selector(&self) -> bool {
-        false
+        self.uses_field_selector
     }
 
     /// `CELMatcher.UsesLabelSelector`.
     pub fn uses_label_selector(&self) -> bool {
-        false
+        self.uses_label_selector
     }
 
     /// `cm.AuthorizerType = "Webhook"; cm.AuthorizerName = name; cm.Metrics = am`
