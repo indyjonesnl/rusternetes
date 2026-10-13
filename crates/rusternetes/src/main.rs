@@ -612,9 +612,24 @@ async fn async_main() -> Result<()> {
 /// `newPersistentVolumeBinderController` (`cmd/kube-controller-manager/app/core.go:322-325`)
 /// probes the volume plugins; failure aborts startup.
 fn recycler_config_from_args(
-    _args: &Args,
+    args: &Args,
 ) -> anyhow::Result<rusternetes_controller_manager::controllers::pv_recycler::RecyclerConfig> {
-    Ok(Default::default())
+    use rusternetes_controller_manager::controllers::pv_recycler::{
+        PersistentVolumeRecyclerConfiguration, RecyclerConfig,
+    };
+    RecyclerConfig::from_configuration(&PersistentVolumeRecyclerConfiguration {
+        minimum_timeout_nfs: args.pv_recycler_minimum_timeout_nfs,
+        pod_template_file_path_nfs: args.pv_recycler_pod_template_filepath_nfs.clone(),
+        increment_timeout_nfs: args.pv_recycler_increment_timeout_nfs,
+        minimum_timeout_host_path: args.pv_recycler_minimum_timeout_hostpath,
+        pod_template_file_path_host_path: args.pv_recycler_pod_template_filepath_hostpath.clone(),
+        increment_timeout_host_path: args.pv_recycler_timeout_increment_hostpath,
+    })
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "failed to probe volume plugins when starting persistentvolume controller: {e}"
+        )
+    })
 }
 
 #[cfg(test)]
