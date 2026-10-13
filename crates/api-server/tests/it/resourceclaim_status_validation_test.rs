@@ -100,11 +100,9 @@ fn cases() -> Vec<(&'static str, Value, &'static str)> {
             json!({ "allocation": { "devices": { "results": [{
                 "request": "req", "driver": "dra.example.com", "pool": "pool-1"
             }] } } }),
-            // `validate_device_name` answers an empty name with `Required`
-            // rather than upstream's invalid-label message — a deliberate,
-            // documented divergence that predates this slice
-            // (`validation/resourceslice.rs`).
-            "status.allocation.devices.results[0].device: Required value",
+            // Upstream `validateDeviceName` = `ValidateDNS1123Label`, so an
+            // empty name is an invalid label, not Required.
+            "status.allocation.devices.results[0].device: Invalid value: \"\"",
         ),
         (
             "an allocation config with no source",

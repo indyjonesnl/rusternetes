@@ -465,6 +465,22 @@ mod tests {
             .collect()
     }
 
+    /// Upstream `validateDeviceName = corevalidation.ValidateDNS1123Label`
+    /// (`pkg/apis/resource/validation/validation.go:73`) has no empty-name
+    /// branch, so an empty name is an Invalid label, never Required.
+    #[test]
+    fn empty_device_name_is_invalid_label_not_required() {
+        let e = validate_device_name(
+            "",
+            &Path::new("spec").child("devices").index(0).child("name"),
+        );
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert_eq!(
+            e[0].to_string(),
+            "spec.devices[0].name: Invalid value: \"\": a lowercase RFC 1123 label must consist of lower case alphanumeric characters or '-', and must start and end with an alphanumeric character (e.g. 'my-name',  or '123-abc', regex used for validation is '[a-z0-9]([-a-z0-9]*[a-z0-9])?')"
+        );
+    }
+
     #[test]
     fn valid_slice_passes() {
         assert!(validate_resource_slice(&slice(base())).is_empty());
