@@ -486,7 +486,11 @@ fn node_ipam_params(args: &Args) -> Result<Option<(String, NodeCidrMaskSizes, Op
 /// Serve `gather()` on `GET /metrics` (upstream serves the `legacyregistry` on
 /// the same path of the controller-manager's secure port). A bind failure is
 /// logged, not fatal: metrics must not take the controllers down.
-fn spawn_metrics_server(port: u16, gather: fn() -> String) {
+fn spawn_metrics_server(
+    port: u16,
+    gather: fn() -> String,
+    effective_version: rusternetes_common::compatibility::EffectiveVersion,
+) {
     if port == 0 {
         return;
     }
@@ -495,6 +499,15 @@ fn spawn_metrics_server(port: u16, gather: fn() -> String) {
             "/metrics",
             axum::routing::get(move || async move { gather() }),
         );
+        // `statusz.Install` behind the `ComponentStatusz` gate
+        // (cmd/kube-controller-manager/app/controllermanager.go:225-234), with
+        // `ComponentGlobalsRegistry.EffectiveVersionFor(DefaultKubeComponent)`
+        // and the listed paths of the mux (here only `/metrics`).
+        let app =
+            rusternetes_common::statusz::install_if_enabled(app, "kube-controller-manager", || {
+                rusternetes_common::statusz::Registry::new(Some(effective_version))
+                    .with_listed_paths(vec!["/metrics".to_string()])
+            });
         let addr = format!("0.0.0.0:{port}");
         match tokio::net::TcpListener::bind(&addr).await {
             Ok(listener) => {
@@ -508,7 +521,10 @@ fn spawn_metrics_server(port: u16, gather: fn() -> String) {
     });
 }
 
-async fn run_api_mode(args: Args) -> Result<()> {
+async fn run_api_mode(
+    args: Args,
+    effective_version: rusternetes_common::compatibility::EffectiveVersion,
+) -> Result<()> {
     use rusternetes_client::http::ApiClient;
     use rusternetes_client::kubeconfig::KubeConfig;
 
@@ -517,6 +533,7 @@ async fn run_api_mode(args: Args) -> Result<()> {
     spawn_metrics_server(
         args.metrics_port,
         rusternetes_controller_manager::controllers::gather_metrics,
+        effective_version,
     );
 
     let (ca_pem, kube_insecure, token, client_cert, client_key) =
@@ -618,7 +635,7 @@ async fn run_api_mode(args: Args) -> Result<()> {
 /// `--feature-gates` process-wide: `ComponentGlobalsRegistry.Set()`
 /// (cmd/kube-controller-manager/app/controllermanager.go:124) then `Validate`
 /// (staging/src/k8s.io/component-base/compatibility/registry.go:344-451).
-fn apply_feature_gates(args: &Args) -> Result<()> {
+fn apply_feature_gates(args: &Args) -> Result<rusternetes_common::compatibility::EffectiveVersion> {
     let effective_version = rusternetes_common::compatibility::apply_flags(
         &args.emulated_version,
         &args.min_compatibility_version,
@@ -640,13 +657,13 @@ fn apply_feature_gates(args: &Args) -> Result<()> {
             true,
         );
     }
-    Ok(())
+    Ok(effective_version)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    apply_feature_gates(&args)?;
+    let effective_version = apply_feature_gates(&args)?;
 
     rusternetes_common::tracing::init_basic_tracing("controller-manager", &args.log_level)?;
 
@@ -656,10 +673,14 @@ async fn main() -> Result<()> {
             "Starting Rusternetes Controller Manager (API mode) {}",
             rusternetes_common::build_info::version_line()
         );
-        return run_api_mode(args).await;
+        return run_api_mode(args, effective_version).await;
     }
 
-    spawn_metrics_server(args.metrics_port, controllers::gather_metrics);
+    spawn_metrics_server(
+        args.metrics_port,
+        controllers::gather_metrics,
+        effective_version,
+    );
 
     info!(
         "Starting Rusternetes Controller Manager {}",
