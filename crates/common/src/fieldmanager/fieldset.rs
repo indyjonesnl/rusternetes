@@ -192,7 +192,7 @@ impl Set {
 
 /// What the (absent) schema would say about a field.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FieldKind {
+pub enum FieldKind {
     Struct,
     /// A granular map (`labels`): the map itself is a member.
     Map,
@@ -205,7 +205,7 @@ pub(crate) enum FieldKind {
     Atomic,
 }
 
-pub(crate) fn field_kind(name: &str) -> FieldKind {
+pub fn field_kind(name: &str) -> FieldKind {
     match name {
         "labels" | "annotations" | "data" | "binaryData" | "stringData" | "nodeSelector"
         | "matchLabels" | "limits" | "requests" | "capacity" | "allocatable" => FieldKind::Map,
@@ -346,7 +346,7 @@ impl Fields {
 
 /// `k:{"name":"x"}`: the item's key fields as a sorted JSON object, `None`
 /// when the item lacks one (the list is then not associative).
-pub(super) fn key_element(keys: &[&str], item: &Value) -> Option<String> {
+pub fn key_element(keys: &[&str], item: &Value) -> Option<String> {
     let obj = item.as_object()?;
     let mut sorted = BTreeMap::new();
     for key in keys {

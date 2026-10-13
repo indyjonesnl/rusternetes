@@ -38,6 +38,36 @@ use super::{
 /// `skipNonAppliedManager.beforeApplyManagerName` (skipnonapplied.go:47).
 const BEFORE_FIRST_APPLY: &str = "before-first-apply";
 
+/// The system-owned metadata is the live object's, whatever the applied
+/// configuration says (the registry strategy's `PrepareForUpdate` /
+/// `BeforeCreate` own these on a real server). Shared by the api-server's
+/// apply and the direct storage backends' apply (#3292).
+pub fn retain_live_system_metadata(applied: &mut Value, live: Option<&Value>) {
+    if let (Some(meta), Some(live)) = (
+        applied.get_mut("metadata").and_then(Value::as_object_mut),
+        live.and_then(|c| c.get("metadata"))
+            .and_then(Value::as_object),
+    ) {
+        for key in [
+            "uid",
+            "resourceVersion",
+            "generation",
+            "creationTimestamp",
+            "deletionTimestamp",
+            "deletionGracePeriodSeconds",
+        ] {
+            match live.get(key) {
+                Some(v) => {
+                    meta.insert(key.to_string(), v.clone());
+                }
+                None => {
+                    meta.remove(key);
+                }
+            }
+        }
+    }
+}
+
 /// One `merge.Conflict`: a path owned by another manager.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyConflict {
@@ -215,7 +245,7 @@ impl FieldManager {
 /// `TypedValue.Merge` (typed/merge.go): maps merge key by key, associative
 /// lists by item key, sets by union; scalars and atomic lists are replaced by
 /// the config.
-pub(crate) fn merge_values(live: &Value, config: &Value, name: &str) -> Value {
+pub fn merge_values(live: &Value, config: &Value, name: &str) -> Value {
     match (live, config) {
         (Value::Object(_), Value::Object(_)) if field_kind(name) == FieldKind::Atomic => {
             config.clone()

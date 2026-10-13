@@ -433,6 +433,10 @@ mod tests {
             .find(|e| e["manager"] == "clusterrole-aggregation-controller")
             .expect("entry for clusterrole-aggregation-controller");
         assert_eq!(e["operation"], "Apply");
-        assert!(e["fieldsV1"].get("rules").is_some(), "{e}");
+        // Structured fieldsV1, as ApiStorage gets from a real server (#3292):
+        // `f:rules` (an atomic list owns the whole field), not the former
+        // top-level-key `{"rules": true}`.
+        assert!(e["fieldsV1"].get("f:rules").is_some(), "{e}");
+        assert!(e["fieldsV1"].get("rules").is_none(), "{e}");
     }
 }
