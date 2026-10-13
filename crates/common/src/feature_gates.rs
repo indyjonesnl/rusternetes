@@ -309,6 +309,13 @@ pub enum Feature {
 
     /// Upstream gate `StructuredAuthenticationConfigurationJWKSMetrics`: staging/src/k8s.io/apiserver/pkg/features/kube_features.go:471-473 (1.35 Beta, on). Modelled so `DEPENDENCIES` can reference it (#3231).
     StructuredAuthenticationConfigurationJWKSMetrics,
+
+    /// Upstream gate `ImageVolume` (1.31 Alpha, 1.33 Beta, 1.35 Beta on;
+    /// `pkg/features/kube_features.go:1366-1370`, name at `:389`). When on, the
+    /// kubelet pulls each `image` volume and hands the runtime a CRI
+    /// `Mount.image` (`kuberuntime_manager.go:1813-1850` `getImageVolumes`,
+    /// `kubelet_pods.go:327-330` `makeMounts`).
+    ImageVolume,
 }
 
 impl Feature {
@@ -388,6 +395,7 @@ impl Feature {
             Feature::StructuredAuthenticationConfiguration => 70,
             Feature::StructuredAuthenticationConfigurationEgressSelector => 71,
             Feature::StructuredAuthenticationConfigurationJWKSMetrics => 72,
+            Feature::ImageVolume => 73,
         }
     }
 
@@ -447,7 +455,8 @@ impl Feature {
             | Feature::DeclarativeValidation
             | Feature::DeclarativeValidationTakeover
             | Feature::StructuredAuthenticationConfigurationEgressSelector
-            | Feature::StructuredAuthenticationConfigurationJWKSMetrics => PreRelease::Beta,
+            | Feature::StructuredAuthenticationConfigurationJWKSMetrics
+            | Feature::ImageVolume => PreRelease::Beta,
             Feature::NodeDeclaredFeatures
             | Feature::DRADeviceTaints
             | Feature::DRAPartitionableDevices
@@ -650,6 +659,8 @@ impl Feature {
             Feature::StructuredAuthenticationConfigurationEgressSelector => true,
             // staging/src/k8s.io/apiserver/pkg/features/kube_features.go:471-473 (1.35 Beta, on)
             Feature::StructuredAuthenticationConfigurationJWKSMetrics => true,
+            // 1.35 Beta, on (pkg/features/kube_features.go:1366-1370)
+            Feature::ImageVolume => true,
         }
     }
 }
@@ -739,6 +750,7 @@ pub const ALL_FEATURES: &[Feature] = &[
     Feature::StructuredAuthenticationConfiguration,
     Feature::StructuredAuthenticationConfigurationEgressSelector,
     Feature::StructuredAuthenticationConfigurationJWKSMetrics,
+    Feature::ImageVolume,
 ];
 
 /// Total number of feature gates. Derived from [`ALL_FEATURES`].
@@ -826,6 +838,7 @@ static STATES: [AtomicBool; NUM_FEATURES] = [
     AtomicBool::new(Feature::StructuredAuthenticationConfiguration.default_enabled()),
     AtomicBool::new(Feature::StructuredAuthenticationConfigurationEgressSelector.default_enabled()),
     AtomicBool::new(Feature::StructuredAuthenticationConfigurationJWKSMetrics.default_enabled()),
+    AtomicBool::new(Feature::ImageVolume.default_enabled()),
 ];
 
 /// Returns whether `feature` is currently enabled in this process.
@@ -1389,6 +1402,11 @@ impl Feature {
             Feature::StructuredAuthenticationConfigurationJWKSMetrics => {
                 vec![spec(35, true, PreRelease::Beta, false)]
             }
+            Feature::ImageVolume => vec![
+                spec(31, false, PreRelease::Alpha, false),
+                spec(33, false, PreRelease::Beta, false),
+                spec(35, true, PreRelease::Beta, false),
+            ],
         }
     }
 

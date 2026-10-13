@@ -655,6 +655,22 @@ impl CriContainerRuntime {
         pull_policy: Option<&str>,
         event_ctx: Option<(&Pod, &str)>,
     ) -> anyhow::Result<()> {
+        self.ensure_image_ref(image, pull_policy, event_ctx)
+            .await
+            .map(|_| ())
+    }
+
+    /// [`Self::ensure_image`] returning the image reference upstream's
+    /// `EnsureImageExists` returns (`images/image_manager.go:194`): the
+    /// `ImageStatus` image id when the image is already present, else the
+    /// `PullImageResponse.image_ref`. An image volume's `Mount.image.image` is
+    /// this value (`kuberuntime_manager.go:1840`).
+    pub async fn ensure_image_ref(
+        &self,
+        image: &str,
+        pull_policy: Option<&str>,
+        event_ctx: Option<(&Pod, &str)>,
+    ) -> anyhow::Result<String> {
         let policy = pull_policy.unwrap_or("IfNotPresent");
         let mut cri = self.cri.clone();
         // `EnsureImageExists` (`images/image_manager.go:194`): the pod runtime
@@ -662,12 +678,9 @@ impl CriContainerRuntime {
         let handler = self.pod_runtime_handler(event_ctx.map(|(p, _)| p)).await?;
 
         if policy != "Always" {
-            let present = cri
-                .image_status_for_handler(image, &handler, false)
-                .await?
-                .is_some();
-            if present {
-                return Ok(());
+            let present = cri.image_status_for_handler(image, &handler, false).await?;
+            if let Some(present) = present {
+                return Ok(present.id);
             }
             if policy == "Never" {
                 // Absent and pulling disallowed. The typed error lets the
@@ -677,8 +690,55 @@ impl CriContainerRuntime {
                 }));
             }
         }
-        cri.pull_image(image, Some(&handler), None).await?;
-        Ok(())
+        Ok(cri.pull_image(image, Some(&handler), None).await?)
+    }
+
+    /// Port of `getImageVolumes` (`kuberuntime_manager.go:1813-1850`): pull
+    /// every `image` volume of the pod once, honoring each volume's
+    /// `pullPolicy`, keeping a per-volume result so that a container which
+    /// does not mount a failed volume still starts
+    /// ([`to_kube_container_image_volumes`] fails late, per container). Empty
+    /// when the `ImageVolume` gate is off (`:1815-1817`). Errors only when the
+    /// pod runtime handler cannot be resolved (`:1819-1823`).
+    pub(crate) async fn get_image_volumes(&self, pod: &Pod) -> anyhow::Result<ImageVolumePulls> {
+        use rusternetes_common::feature_gates::{enabled, Feature};
+        let mut res = ImageVolumePulls::new();
+        if !enabled(Feature::ImageVolume) {
+            return Ok(res);
+        }
+        let handler = self.pod_runtime_handler(Some(pod)).await?;
+        let volumes = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.volumes.as_deref())
+            .unwrap_or_default();
+        for volume in volumes {
+            let Some(image) = volume.image.as_ref() else {
+                continue;
+            };
+            let reference = image.reference.clone().unwrap_or_default();
+            match self
+                .ensure_image_ref(&reference, image.pull_policy.as_deref(), Some((pod, "")))
+                .await
+            {
+                Ok(image_ref) => {
+                    res.insert(
+                        volume.name.clone(),
+                        Ok(v1::ImageSpec {
+                            image: image_ref,
+                            user_specified_image: reference,
+                            runtime_handler: handler.clone(),
+                            annotations: pod.metadata.annotations.clone().unwrap_or_default(),
+                        }),
+                    );
+                }
+                Err(e) => {
+                    warn!("Failed to ensure image for volume {}: {e:#}", volume.name);
+                    res.insert(volume.name.clone(), Err(Arc::new(e)));
+                }
+            }
+        }
+        Ok(res)
     }
 
     /// Runtime handler for the pod's `RunPodSandbox`
@@ -753,6 +813,7 @@ impl CriContainerRuntime {
         let mut sandbox_cfg = translate::sandbox_config(pod, &log_dir);
         sandbox_cfg.dns_config = Some(self.pod_dns(pod).await?);
         let mut cri = self.cri.clone();
+        let image_volume_pulls = self.get_image_volumes(pod).await?;
         self.create_and_start_container(
             &mut cri,
             pod,
@@ -760,6 +821,7 @@ impl CriContainerRuntime {
             &sandbox_id,
             &sandbox_cfg,
             volume_paths,
+            &image_volume_pulls,
         )
         .await?;
         Ok(())
@@ -830,6 +892,7 @@ impl CriContainerRuntime {
 
     /// Create and start one container from its translated config, returning its
     /// id. Pulls the image on behalf of the sandbox first.
+    #[allow(clippy::too_many_arguments)]
     async fn create_and_start_container(
         &self,
         cri: &mut CriClient,
@@ -838,7 +901,13 @@ impl CriContainerRuntime {
         sandbox_id: &str,
         sandbox_cfg: &v1::PodSandboxConfig,
         host_paths: &std::collections::HashMap<String, String>,
+        image_volume_pulls: &ImageVolumePulls,
     ) -> anyhow::Result<String> {
+        // `toKubeContainerImageVolumes` (`kuberuntime_manager.go:1652`): "We
+        // fail late here to populate the ErrImagePull and ImagePullBackOff
+        // correctly to the end user." Before the container's own image pull,
+        // as `startContainer` follows it.
+        let image_volumes = to_kube_container_image_volumes(image_volume_pulls, container)?;
         // Honor the image pull policy (also surfaces ErrImageNeverPull).
         self.ensure_image(
             &container.image,
@@ -952,6 +1021,7 @@ impl CriContainerRuntime {
             node_allocatable,
             &mount_attrs,
             supports_rro,
+            &image_volumes,
         )
         .map_err(|msg| {
             anyhow::anyhow!(
@@ -1412,6 +1482,10 @@ impl CriContainerRuntime {
             }
         };
 
+        // `getImageVolumes` (`kuberuntime_manager.go:1622`): once per sync,
+        // after the sandbox exists and before any container starts.
+        let image_volume_pulls = self.get_image_volumes(pod).await?;
+
         // Plain init containers run sequentially to completion before app
         // containers. Restartable init containers (sidecars) start here too,
         // but they do not gate app startup and are not waited to completion.
@@ -1425,6 +1499,7 @@ impl CriContainerRuntime {
                         &sandbox_id,
                         &sandbox_cfg,
                         &host_paths,
+                        &image_volume_pulls,
                     )
                     .await?;
                 if is_restartable_init_container(container) {
@@ -1460,6 +1535,7 @@ impl CriContainerRuntime {
                 &sandbox_id,
                 &sandbox_cfg,
                 &host_paths,
+                &image_volume_pulls,
             )
             .await?;
         }
@@ -2962,6 +3038,53 @@ fn exec_probe_passed(exit_code: Option<i32>) -> bool {
     exit_code == Some(0)
 }
 
+/// `imageVolumePulls` (`kuberuntime_manager.go:1769`): the pull result of each
+/// image volume by volume name. `imageVolumePullResult` is `{spec, err, msg}`;
+/// the Rust `Result` carries the same, with the message in the error.
+pub(crate) type ImageVolumePulls =
+    std::collections::HashMap<String, std::result::Result<v1::ImageSpec, Arc<anyhow::Error>>>;
+
+/// Port of `toKubeContainerImageVolumes` (`kuberuntime_manager.go:1778-1810`):
+/// the image volumes of one container's `volumeMounts`. A volume the
+/// container does not mount is left out; if any mounted volume failed to
+/// pull, the container fails with the last such error.
+///
+/// Not ported: the `FailedToCreateContainer` event and `SyncResult.Fail`
+/// (`:1792-1800`, `:1804-1806`): the returned error reaches the kubelet's
+/// container-start failure path, which records the waiting reason.
+pub(crate) fn to_kube_container_image_volumes(
+    pulls: &ImageVolumePulls,
+    container: &Container,
+) -> anyhow::Result<std::collections::HashMap<String, v1::ImageSpec>> {
+    let mut image_volumes = std::collections::HashMap::new();
+    if pulls.is_empty() {
+        return Ok(image_volumes);
+    }
+    let mut last_err: Option<anyhow::Error> = None;
+    for vm in container.volume_mounts.iter().flatten() {
+        match pulls.get(&vm.name) {
+            None => continue,
+            Some(Err(e)) => {
+                // `anyhow::Error` is not `Clone`: rebuild it, keeping the typed
+                // `ErrImageNeverPull` the kubelet maps to a waiting reason.
+                last_err = Some(
+                    match e.downcast_ref::<crate::lifecycle::ImageNeverPullError>() {
+                        Some(never) => anyhow::Error::new(never.clone()),
+                        None => anyhow::anyhow!("{e:#}"),
+                    },
+                );
+            }
+            Some(Ok(spec)) => {
+                image_volumes.insert(vm.name.clone(), spec.clone());
+            }
+        }
+    }
+    match last_err {
+        Some(e) => Err(e),
+        None => Ok(image_volumes),
+    }
+}
+
 /// Create the host-side directory for every subPath mount in `cfg` before the
 /// runtime bind-mounts it.
 ///
@@ -2987,7 +3110,10 @@ fn create_sub_path_dirs(
         let Some(root) = host_paths
             .values()
             .filter(|root| {
-                mount.host_path.len() > root.len()
+                // An image volume's `GetPath` is empty (`image.go:83`): it is
+                // no volume root, and every absolute path would match it.
+                !root.is_empty()
+                    && mount.host_path.len() > root.len()
                     && mount.host_path.starts_with(*root)
                     && mount.host_path.as_bytes()[root.len()] == b'/'
             })
@@ -4389,5 +4515,135 @@ mod tests {
             result.is_err(),
             "exec lifecycle handler must return Err when CRI is unresponsive for HANDLER_TIMEOUT"
         );
+    }
+
+    /// Port of `TestToKubeContainerImageVolumes`
+    /// (`kuberuntime_manager_test.go:3717-3783`).
+    #[test]
+    fn to_kube_container_image_volumes_cases() {
+        use rusternetes_common::resources::pod::VolumeMount;
+        let spec1 = v1::ImageSpec {
+            image: "image-1".into(),
+            ..Default::default()
+        };
+        let spec2 = v1::ImageSpec {
+            image: "image-2".into(),
+            ..Default::default()
+        };
+        let container = |names: &[&str]| Container {
+            volume_mounts: Some(
+                names
+                    .iter()
+                    .map(|n| VolumeMount {
+                        name: n.to_string(),
+                        mount_path: format!("/{n}"),
+                        read_only: None,
+                        sub_path: None,
+                        sub_path_expr: None,
+                        mount_propagation: None,
+                        recursive_read_only: None,
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+
+        // "empty volumes"
+        let none = ImageVolumePulls::new();
+        assert!(
+            to_kube_container_image_volumes(&none, &Container::default())
+                .unwrap()
+                .is_empty()
+        );
+
+        // "multiple volumes"
+        let mut pulls = ImageVolumePulls::new();
+        pulls.insert("volume-1".into(), Ok(spec1.clone()));
+        pulls.insert("volume-2".into(), Ok(spec2.clone()));
+        let got =
+            to_kube_container_image_volumes(&pulls, &container(&["volume-1", "volume-2"])).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got["volume-1"], spec1);
+        assert_eq!(got["volume-2"], spec2);
+
+        // "not matching volume"
+        let mut other = ImageVolumePulls::new();
+        other.insert("different".into(), Ok(spec1.clone()));
+        assert!(
+            to_kube_container_image_volumes(&other, &container(&["volume-1"]))
+                .unwrap()
+                .is_empty()
+        );
+
+        // "error in pull result": the container that mounts it fails, with
+        // the pull error verbatim; a container that does not still starts.
+        let mut failed = ImageVolumePulls::new();
+        failed.insert(
+            "volume-1".into(),
+            Err(Arc::new(anyhow::anyhow!("pull failed"))),
+        );
+        let err = to_kube_container_image_volumes(&failed, &container(&["volume-1"])).unwrap_err();
+        assert_eq!(err.to_string(), "pull failed");
+        assert!(to_kube_container_image_volumes(&failed, &container(&["x"]))
+            .unwrap()
+            .is_empty());
+    }
+
+    /// `getImageVolumes`' `"multiple volumes but one failed to pull"` case
+    /// (`kuberuntime_manager_test.go:3846-3855`): the Never-policy failure
+    /// stays the typed `ErrImageNeverPull` the kubelet maps to a waiting
+    /// reason, with upstream's message.
+    #[test]
+    fn a_never_pull_failure_keeps_its_type_and_message() {
+        use rusternetes_common::resources::pod::VolumeMount;
+        let mut pulls = ImageVolumePulls::new();
+        pulls.insert(
+            "volume-2".into(),
+            Err(Arc::new(anyhow::Error::new(
+                crate::lifecycle::ImageNeverPullError {
+                    image: "image".into(),
+                },
+            ))),
+        );
+        let c = Container {
+            volume_mounts: Some(vec![VolumeMount {
+                name: "volume-2".into(),
+                mount_path: "/v".into(),
+                read_only: None,
+                sub_path: None,
+                sub_path_expr: None,
+                mount_propagation: None,
+                recursive_read_only: None,
+            }]),
+            ..Default::default()
+        };
+        let err = to_kube_container_image_volumes(&pulls, &c).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            r#"Container image "image" is not present with pull policy of Never"#
+        );
+        assert_eq!(
+            crate::lifecycle::reason_from_anyhow(&err),
+            Some("ErrImageNeverPull")
+        );
+    }
+
+    /// An image volume's `GetPath` is empty (`image.go:83`) so its entry in
+    /// the volume-path map must not be taken for a volume root that every
+    /// absolute subPath mount "lives under".
+    #[test]
+    fn an_empty_volume_root_is_not_a_sub_path_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("not-created");
+        let host_paths = std::collections::HashMap::from([("img".to_string(), String::new())]);
+        let cfg = v1::ContainerConfig {
+            mounts: vec![v1::Mount {
+                host_path: missing.to_string_lossy().to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        create_sub_path_dirs("c", &host_paths, &cfg);
+        assert!(!missing.exists());
     }
 }

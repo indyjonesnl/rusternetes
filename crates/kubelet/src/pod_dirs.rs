@@ -53,6 +53,8 @@ pub mod plugin {
     pub const CSI: &str = "kubernetes.io/csi";
     /// `pkg/volume/nfs/nfs.go:66`
     pub const NFS: &str = "kubernetes.io/nfs";
+    /// `pkg/volume/image/image.go:41`
+    pub const IMAGE: &str = "kubernetes.io/image";
     /// `pkg/volume/hostpath/host_path.go:77`
     pub const HOST_PATH: &str = "kubernetes.io/host-path";
     /// `pkg/volume/local/local.go:64`

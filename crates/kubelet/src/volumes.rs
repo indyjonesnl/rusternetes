@@ -254,6 +254,8 @@ impl VolumeManager {
             Box::new(crate::volume_plugins::local::LocalPlugin::new(host.clone())),
             // `nfs.ProbeVolumePlugins` (`cmd/kubelet/app/plugins.go`).
             Box::new(crate::volume_plugins::nfs::NfsPlugin::new(host.clone())),
+            // `image.ProbeVolumePlugins` (`cmd/kubelet/app/plugins.go`).
+            Box::new(crate::volume_plugins::image::ImagePlugin::new()),
             Box::new(crate::volume_plugins::config_map::ConfigMapPlugin::new(
                 host.clone(),
             )),
@@ -3612,7 +3614,31 @@ mod dispatch_tests {
             .is_ok());
     }
 
-    /// #3262: an unimplemented kind (iscsi, fc, gitRepo, image) matches no
+    /// `image.ProbeVolumePlugins` is registered by the kubelet
+    /// (`cmd/kubelet/app/plugins.go`), so an `image` volume resolves to the
+    /// `kubernetes.io/image` stub plugin (`pkg/volume/image/image.go:41`)
+    /// instead of failing with `no volume plugin matched` (#3290), and
+    /// provisioning it makes no directory: `GetPath` is empty (`image.go:83`).
+    #[tokio::test]
+    async fn an_image_volume_is_claimed_by_the_image_plugin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(
+            tmp.path().to_string_lossy().to_string(),
+            None,
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+        let v = volume("i", json!({"image": {"reference": "quay.io/a/b:1"}}));
+        assert_eq!(vm.plugin_name_for_volume(&v), "kubernetes.io/image");
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-image"},
+            "spec": {"containers": []}
+        }))
+        .unwrap();
+        assert_eq!(vm.create_volume(&pod, &v).await.unwrap(), "");
+        assert!(!tmp.path().join("pods").exists(), "no directory is made");
+    }
+
+    /// #3262: an unimplemented kind (iscsi, fc, gitRepo) matches no
     /// plugin. Upstream's desired-state populator fails the volume with
     /// `failed to get Plugin from volumeSpec for volume %q err=%v`
     /// (`desired_state_of_world.go:272-277`) over `ErrNoPluginMatched`
