@@ -9,6 +9,7 @@
 //!   (shape scaled by `MaxNodeScore / MaxCustomPriorityScore`).
 
 use crate::volume_binding::{FunctionShapePoint, MAX_CUSTOM_PRIORITY_SCORE, MAX_NODE_SCORE};
+use rusternetes_common::go_duration::format_go_duration;
 use rusternetes_common::label_selector::{LabelOperator, LabelRequirement};
 use rusternetes_common::resources::pod::{
     NodeAffinity, NodeSelectorRequirement, NodeSelectorTerm, TopologySpreadConstraint,
@@ -594,6 +595,127 @@ impl NodeResourcesFitArgs {
     }
 }
 
+/// `metav1.Duration` as signed Go nanoseconds: JSON string parsed by
+/// `time.ParseDuration` (apimachinery meta/v1/duration.go `UnmarshalJSON`).
+/// Signed because validation must see negative values.
+mod metav1_duration_nanos {
+    use rusternetes_common::go_duration::{format_go_duration, parse_go_duration};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Option<i64>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(n) => s.serialize_str(&format_go_duration(*n)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
+        match Option::<String>::deserialize(d)? {
+            Some(s) => parse_go_duration(&s)
+                .map(Some)
+                .map_err(serde::de::Error::custom),
+            None => Ok(None),
+        }
+    }
+}
+
+const NANOS_PER_SECOND: i64 = 1_000_000_000;
+
+/// `configv1.DynamicResourcesFilterTimeoutDefault` (kube-scheduler/config/v1/types.go:463).
+const DYNAMIC_RESOURCES_FILTER_TIMEOUT_DEFAULT: i64 = 10 * NANOS_PER_SECOND;
+/// `configv1.DynamicResourcesBindingTimeoutDefault` (kube-scheduler/config/v1/types.go:464).
+const DYNAMIC_RESOURCES_BINDING_TIMEOUT_DEFAULT: i64 = 600 * NANOS_PER_SECOND;
+
+/// The scheduler features `ValidateDynamicResourcesArgs` and
+/// `SetDefaults_DynamicResourcesArgs` consult (`feature.Features` /
+/// `feature.DefaultFeatureGate`), as nanosecond-free plain flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DynamicResourcesFeatures {
+    pub dra_scheduler_filter_timeout: bool,
+    pub dra_device_binding_conditions: bool,
+    pub dra_resource_claim_device_status: bool,
+}
+
+impl DynamicResourcesFeatures {
+    /// `NewSchedulerFeaturesFromGates(feature.DefaultFeatureGate)` (validation.go:162)
+    /// for the three gates used here.
+    pub fn from_gates() -> Self {
+        use rusternetes_common::feature_gates::{enabled, Feature};
+        Self {
+            dra_scheduler_filter_timeout: enabled(Feature::DRASchedulerFilterTimeout),
+            dra_device_binding_conditions: enabled(Feature::DRADeviceBindingConditions),
+            dra_resource_claim_device_status: enabled(Feature::DRAResourceClaimDeviceStatus),
+        }
+    }
+}
+
+/// `config.DynamicResourcesArgs` (types_pluginargs.go); timeouts are Go
+/// nanoseconds.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DynamicResourcesArgs {
+    #[serde(default, with = "metav1_duration_nanos")]
+    pub filter_timeout: Option<i64>,
+    #[serde(default, with = "metav1_duration_nanos")]
+    pub binding_timeout: Option<i64>,
+}
+
+impl DynamicResourcesArgs {
+    /// `SetDefaults_DynamicResourcesArgs` (v1/defaults.go:247-257): the filter
+    /// timeout defaults only with `DRASchedulerFilterTimeout`, the binding
+    /// timeout only with both `DRADeviceBindingConditions` and
+    /// `DRAResourceClaimDeviceStatus`.
+    pub fn set_defaults(&mut self, fts: DynamicResourcesFeatures) {
+        if self.filter_timeout.is_none() && fts.dra_scheduler_filter_timeout {
+            self.filter_timeout = Some(DYNAMIC_RESOURCES_FILTER_TIMEOUT_DEFAULT);
+        }
+        if self.binding_timeout.is_none()
+            && fts.dra_device_binding_conditions
+            && fts.dra_resource_claim_device_status
+        {
+            self.binding_timeout = Some(DYNAMIC_RESOURCES_BINDING_TIMEOUT_DEFAULT);
+        }
+    }
+
+    /// `ValidateDynamicResourcesArgs` (validation_pluginargs.go:336-363).
+    /// Unlike the REST API, setting a field whose feature is disabled is an
+    /// error. The bad value is a `*metav1.Duration`, marshalled as its
+    /// `Duration.String()` JSON string.
+    pub fn validate(&self, path: &Path, fts: DynamicResourcesFeatures) -> ErrorList {
+        let mut errs = ErrorList::new();
+        let bad = |n: i64| BadValue::marshal(&format_go_duration(n));
+        if fts.dra_scheduler_filter_timeout {
+            if let Some(n) = self.filter_timeout.filter(|n| *n < 0) {
+                errs.push(field::Error::invalid(
+                    &path.child("filterTimeout"),
+                    bad(n),
+                    "must be zero or positive",
+                ));
+            }
+        } else if self.filter_timeout.is_some() {
+            errs.push(field::Error::forbidden(
+                &path.child("filterTimeout"),
+                "DRASchedulingFilterTimeout feature gate is disabled",
+            ));
+        }
+        if fts.dra_device_binding_conditions && fts.dra_resource_claim_device_status {
+            if let Some(n) = self.binding_timeout.filter(|n| *n < NANOS_PER_SECOND) {
+                errs.push(field::Error::invalid(
+                    &path.child("bindingTimeout"),
+                    bad(n),
+                    "must be at least 1 second",
+                ));
+            }
+        } else if self.binding_timeout.is_some() {
+            errs.push(field::Error::forbidden(
+                &path.child("bindingTimeout"),
+                "DRADeviceBindingConditions or DRAResourceClaimDeviceStatus feature gate is disabled",
+            ));
+        }
+        errs
+    }
+}
+
 /// `v1.SchemeGroupVersion.String()` (pkg/scheduler/apis/config/v1/register.go);
 /// the only config version served, so it is both the removed-plugin version
 /// and the configuration's version in `isPluginInvalid` messages.
@@ -890,6 +1012,15 @@ fn validate_profiles(cfg: &KubeSchedulerConfiguration) -> Result<(ErrorList, Err
                 // does NOT validate NodeResourcesFit's args in this pass. They
                 // are validated when the plugin is constructed instead (NewFit,
                 // fit.go:193), collected in `init_errs`.
+                // validation.go:161-163 validates DynamicResourcesArgs with
+                // the default feature gates; defaults (v1/defaults.go:247)
+                // are applied first by the scheme.
+                "DynamicResources" => {
+                    let mut a: DynamicResourcesArgs = decode_args(pc, &args_path)?;
+                    let fts = DynamicResourcesFeatures::from_gates();
+                    a.set_defaults(fts);
+                    errs.extend(a.validate(&args_path, fts));
+                }
                 "NodeResourcesFitArgs" => {
                     errs.push(field::Error::invalid(
                         &args_path,
@@ -1986,5 +2117,141 @@ profiles:
             err,
             "profiles[1].pluginConfig.args: Invalid value: {\"x\":2}: queueSort must be the same for all profiles"
         );
+    }
+
+    // validation_pluginargs_test.go TestValidateDynamicResourcesArgs
+    // (:1159-1275). Detail is ignored upstream (ignoreBadValueDetail), so
+    // type and field are pinned.
+    mod dynamic_resources {
+        use super::*;
+
+        const SEC: i64 = 1_000_000_000;
+
+        fn fts(filter: bool, binding_cond: bool, device_status: bool) -> DynamicResourcesFeatures {
+            DynamicResourcesFeatures {
+                dra_scheduler_filter_timeout: filter,
+                dra_device_binding_conditions: binding_cond,
+                dra_resource_claim_device_status: device_status,
+            }
+        }
+        const ALL: fn() -> DynamicResourcesFeatures = || fts(true, true, true);
+
+        fn a(filter: Option<i64>, binding: Option<i64>) -> DynamicResourcesArgs {
+            DynamicResourcesArgs {
+                filter_timeout: filter,
+                binding_timeout: binding,
+            }
+        }
+
+        fn check(
+            args: DynamicResourcesArgs,
+            f: DynamicResourcesFeatures,
+            want: &[(ErrorType, &str)],
+        ) {
+            let errs = args.validate(&Path::default(), f);
+            let got: Vec<(ErrorType, String)> = summary(&errs);
+            let want: Vec<(ErrorType, String)> =
+                want.iter().map(|(t, p)| (*t, p.to_string())).collect();
+            assert_eq!(got, want, "{errs:?}");
+        }
+
+        #[test]
+        fn valid_default_and_disabled() {
+            check(a(Some(10 * SEC), Some(600 * SEC)), ALL(), &[]);
+            check(a(None, None), ALL(), &[]);
+        }
+
+        #[test]
+        fn negative_filter_timeout() {
+            let errs = a(Some(-SEC), None).validate(&Path::default(), ALL());
+            assert_eq!(errs[0].detail, "must be zero or positive");
+            check(
+                a(Some(-SEC), None),
+                ALL(),
+                &[(ErrorType::Invalid, "filterTimeout")],
+            );
+        }
+
+        #[test]
+        fn negative_filter_timeout_gate_disabled() {
+            let errs = a(Some(-SEC), None).validate(&Path::default(), fts(false, true, true));
+            assert_eq!(
+                errs[0].detail,
+                "DRASchedulingFilterTimeout feature gate is disabled"
+            );
+            check(
+                a(Some(-SEC), None),
+                fts(false, true, true),
+                &[(ErrorType::Forbidden, "filterTimeout")],
+            );
+        }
+
+        #[test]
+        fn binding_timeout_cases() {
+            check(a(None, Some(30 * SEC)), ALL(), &[]);
+            check(
+                a(None, Some(0)),
+                ALL(),
+                &[(ErrorType::Invalid, "bindingTimeout")],
+            );
+            check(
+                a(None, Some(-SEC)),
+                ALL(),
+                &[(ErrorType::Invalid, "bindingTimeout")],
+            );
+            let errs = a(None, Some(0)).validate(&Path::default(), ALL());
+            assert_eq!(errs[0].detail, "must be at least 1 second");
+            for f in [fts(true, false, true), fts(true, true, false)] {
+                check(
+                    a(None, Some(SEC)),
+                    f,
+                    &[(ErrorType::Forbidden, "bindingTimeout")],
+                );
+            }
+        }
+
+        // v1/defaults.go:247-257
+        #[test]
+        fn defaults_follow_gates() {
+            let mut x = DynamicResourcesArgs::default();
+            x.set_defaults(ALL());
+            assert_eq!(x, a(Some(10 * SEC), Some(600 * SEC)));
+            let mut x = DynamicResourcesArgs::default();
+            x.set_defaults(fts(false, true, true));
+            assert_eq!(x, a(None, Some(600 * SEC)));
+            for f in [fts(true, false, true), fts(true, true, false)] {
+                let mut x = DynamicResourcesArgs::default();
+                x.set_defaults(f);
+                assert_eq!(x, a(Some(10 * SEC), None));
+            }
+            // Explicit values are kept.
+            let mut x = a(Some(0), Some(SEC));
+            x.set_defaults(ALL());
+            assert_eq!(x, a(Some(0), Some(SEC)));
+        }
+
+        // validation.go:161-163 wiring: a negative filterTimeout in
+        // pluginConfig is rejected end to end; absent args validate clean
+        // with the default gates (defaults then validate).
+        #[test]
+        #[serial_test::serial]
+        fn wired_into_validate_profiles() {
+            rusternetes_common::feature_gates::reset_to_defaults();
+            let bad = "profiles:\n- pluginConfig:\n  - name: DynamicResources\n    args:\n      filterTimeout: -1s\n";
+            let err = volume_binding_args_from_config(bad, false).unwrap_err();
+            assert!(
+                err.contains("profiles[0].pluginConfig[0].args.filterTimeout: Invalid value"),
+                "{err}"
+            );
+            assert!(err.contains("must be zero or positive"), "{err}");
+            let bad = "profiles:\n- pluginConfig:\n  - name: DynamicResources\n    args:\n      bindingTimeout: 1s\n";
+            let err = volume_binding_args_from_config(bad, false).unwrap_err();
+            assert!(
+                err.contains("profiles[0].pluginConfig[0].args.bindingTimeout: Forbidden"),
+                "{err}"
+            );
+            let ok = "profiles:\n- pluginConfig:\n  - name: DynamicResources\n";
+            assert!(volume_binding_args_from_config(ok, false).is_ok());
+        }
     }
 }
