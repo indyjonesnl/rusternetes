@@ -157,12 +157,11 @@ fn immutable<T: serde::Serialize>(path: &Path, value: &T) -> Error {
 /// scalar. Uniqueness is on the *resolved* path (`path.String()`), so two
 /// spellings of the same field collide.
 ///
-/// `schema` is `None` when `NewStructural` failed; upstream then passes a nil
-/// `*Structural` to `ValidFieldPath`, which dereferences it (a Go panic, a 500
-/// from the panic-recovery filter). Rust has no nil dereference, so the one
-/// deliberate divergence is that a non-empty `jsonPath` is skipped in that
-/// case; the `NewStructural` error itself is reported by the caller exactly as
-/// upstream does (`validation.go:315-316`).
+/// `schema` is `None` when `NewStructural` failed: upstream appends the error
+/// and still passes the nil `*Structural` on (`validation.go:314-317`), so
+/// `ValidFieldPath` nil-dereferences it on the first `.` token. That is
+/// replicated as a real panic (see [`valid_field_path`]); the api-server's
+/// outermost panic-recovery layer turns it into upstream's 500.
 pub fn validate_custom_resource_selectable_fields(
     selectable_fields: &[SelectableField],
     schema: Option<&Structural>,
@@ -178,10 +177,6 @@ pub fn validate_custom_resource_selectable_fields(
             errs.push(Error::required(&sp, ""));
             continue;
         }
-        let Some(schema) = schema else {
-            continue;
-        };
-
         let (path, found) = match valid_field_path(&selectable.json_path, schema) {
             Ok(resolved) => resolved,
             Err(e) => {
@@ -256,15 +251,17 @@ type ResolvedFieldPath<'a> = (Vec<(String, bool)>, Option<&'a Structural>);
 /// Returns the resolved path (`(name, is_key)` per element: `Child` or `Key`)
 /// and the schema of the leaf, which is `None` after stepping into a
 /// boolean-only `additionalProperties` (`AdditionalProperties.Structural` is
-/// nil there). Stepping *through* that nil is a Go nil dereference upstream;
-/// here it is reported as `does not refer to a valid field`. Every error
+/// nil there). Stepping *through* a nil schema panics, as the Go does: the
+/// `.` arm evaluates `if schema.Properties != nil {` (`:660`) on the nil
+/// `*Structural` (nil from a failed `NewStructural`, or from
+/// `schema = schema.AdditionalProperties.Structural` at `:566`). Every error
 /// string is upstream's, because a client reads them.
 fn valid_field_path<'a>(
     json_path: &str,
-    schema: &'a Structural,
+    schema: Option<&'a Structural>,
 ) -> Result<ResolvedFieldPath<'a>, String> {
     let mut path: Vec<(String, bool)> = Vec::new();
-    let mut schema: Option<&Structural> = Some(schema);
+    let mut schema: Option<&Structural> = schema;
     let mut tokens = tokenize_field_path(json_path).into_iter();
 
     while let Some(token) = tokens.next() {
@@ -276,7 +273,9 @@ fn valid_field_path<'a>(
                     return Err("unexpected end of JSON path".to_string());
                 };
                 let invalid = || "does not refer to a valid field".to_string();
-                let current = schema.ok_or_else(invalid)?;
+                // Go nil-pointer dereference at `schema/cel/validation.go:660`.
+                let current = schema
+                    .expect("runtime error: invalid memory address or nil pointer dereference");
                 // `if schema.Properties != nil ... else if
                 // schema.AdditionalProperties != nil` (`:660-666`);
                 // `NewStructural` only sets `Properties` when non-empty.
