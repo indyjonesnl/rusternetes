@@ -99,12 +99,12 @@ fn pod_metrics_decodes_without_type_meta_and_keeps_its_namespace() {
 fn the_custom_and_external_metric_values_decode_without_type_meta() {
     let value: MetricValue = serde_json::from_value(json!({
         "describedObject": { "kind": "Pod", "name": "web-0", "namespace": "default" },
-        "metricName": "requests-per-second",
+        "metric": { "name": "requests-per-second" },
         "timestamp": "2026-09-08T10:05:00Z",
         "value": "10",
     }))
     .expect("MetricValue must decode without apiVersion/kind");
-    assert_eq!(value.metric_name, "requests-per-second");
+    assert_eq!(value.metric.name, "requests-per-second");
 
     let external: ExternalMetricValue = serde_json::from_value(json!({
         "metricName": "queue-depth",

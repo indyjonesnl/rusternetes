@@ -105,7 +105,10 @@ async fn custom_metric_identifier_echoes_the_metric_selector() {
     assert!(s.is_success(), "{s} {b}");
     let sel = &b["items"][0]["metric"]["selector"];
     assert_eq!(sel["matchExpressions"][0]["key"], "foo", "{b}");
-    assert_eq!(sel["matchExpressions"][0]["operator"], "DoesNotExist", "{b}");
+    assert_eq!(
+        sel["matchExpressions"][0]["operator"], "DoesNotExist",
+        "{b}"
+    );
 }
 
 #[tokio::test]
@@ -127,7 +130,9 @@ async fn custom_named_route_with_star_is_the_wildcard_list() {
 async fn custom_namespace_route_is_a_metric_value_list_for_the_namespace() {
     let api = TestApiServer::new();
     namespace(&api, "team-a").await;
-    let (s, b) = api.get(&format!("{CM}/namespaces/team-a/metrics/qps")).await;
+    let (s, b) = api
+        .get(&format!("{CM}/namespaces/team-a/metrics/qps"))
+        .await;
     assert!(s.is_success(), "{s} {b}");
     assert_eq!(b["kind"], "MetricValueList", "{b}");
     assert_eq!(b["items"].as_array().unwrap().len(), 1, "{b}");

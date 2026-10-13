@@ -11,7 +11,9 @@ use chrono::Utc;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     label_selector::LabelSelector,
-    resources::custom_metrics::{MetricSelector, MetricValue, MetricValueList, ObjectReference},
+    resources::custom_metrics::{
+        MetricIdentifier, MetricSelector, MetricValue, MetricValueList, ObjectReference,
+    },
     Result,
 };
 use rusternetes_storage::{build_key, build_prefix, Storage};
@@ -44,15 +46,16 @@ fn storage_resource(resource: &str) -> &str {
 }
 
 /// The provider's object lookup: names of the `resource` objects in
-/// `namespace` matching `selector` (`helpers.ListObjectNames`,
-/// pkg/provider/helpers/helpers.go; `GetMetricBySelector` runs it first).
+/// `namespace` (none for a root-scoped resource) matching `selector`
+/// (`helpers.ListObjectNames`, pkg/provider/helpers/helpers.go:74-107;
+/// `GetMetricBySelector` runs it first).
 async fn selected_object_names(
     state: &ApiServerState,
-    namespace: &str,
+    namespace: Option<&str>,
     resource: &str,
     selector: &LabelSelector,
 ) -> Result<Vec<String>> {
-    let prefix = build_prefix(storage_resource(resource), Some(namespace));
+    let prefix = build_prefix(storage_resource(resource), namespace);
     let objects: Vec<serde_json::Value> = state.storage.as_ref().list(&prefix).await?;
     let mut names: Vec<String> = objects
         .iter()
@@ -63,8 +66,10 @@ async fn selected_object_names(
     Ok(names)
 }
 
+/// `test-adapter/provider/provider.go:238-262` `metricFor`: the
+/// `DescribedObject` reference, `Metric{Name, Selector}`, no `WindowSeconds`.
 fn metric_value(
-    namespace: &str,
+    namespace: Option<&str>,
     resource: &str,
     name: String,
     metric_name: &str,
@@ -74,16 +79,30 @@ fn metric_value(
     MetricValue {
         type_meta: metric_value_type_meta("MetricValue"),
         described_object: ObjectReference {
-            kind: capitalize(resource),
-            namespace: Some(namespace.to_string()),
+            kind: described_kind(resource),
+            namespace: namespace.map(str::to_string),
             name,
             api_version: Some("v1".to_string()),
         },
-        metric_name: metric_name.to_string(),
+        metric: MetricIdentifier {
+            name: metric_name.to_string(),
+            selector,
+        },
         timestamp: Utc::now(),
-        window: Some("60s".to_string()),
+        window_seconds: None,
         value,
-        selector,
+    }
+}
+
+/// The `Kind` of the described object. Upstream resolves it with
+/// `helpers.ReferenceFor` (RESTMapper `KindFor`); the RESTMapper port is
+/// tracked in #3390, so `namespaces` keeps its known kind and everything
+/// else keeps the previous capitalised-resource form.
+fn described_kind(resource: &str) -> String {
+    if resource == "namespaces" {
+        "Namespace".to_string()
+    } else {
+        capitalize(resource)
     }
 }
 
@@ -93,10 +112,11 @@ fn metric_value(
 /// custom-metrics-apiserver test adapter (`test-adapter/provider/provider.go:
 /// 215-235`): the object must exist (`NewMetricNotFoundForError`) and the
 /// series, which carries no labels, must satisfy the metric label selector
-/// (`NewMetricNotFoundForSelectorError`).
+/// (`NewMetricNotFoundForSelectorError`). `namespace` is `None` for a
+/// root-scoped resource (`Namespaced: namespace != ""`, reststorage.go:140).
 async fn get_metric_by_name(
     state: &ApiServerState,
-    namespace: &str,
+    namespace: Option<&str>,
     resource: &str,
     name: &str,
     metric_name: &str,
@@ -104,10 +124,25 @@ async fn get_metric_by_name(
 ) -> Result<MetricValue> {
     let value = if let Some(ref prometheus_client) = state.prometheus_client {
         let matchers = matchers_for(metric_selector)?;
-        match prometheus_client
-            .query_object_metric(metric_name, namespace, resource, name, &matchers)
-            .await
-        {
+        let queried = match namespace {
+            Some(ns) => {
+                prometheus_client
+                    .query_object_metric(metric_name, ns, resource, name, &matchers)
+                    .await
+            }
+            // The metric describing a namespace itself.
+            None if resource == "namespaces" => {
+                prometheus_client
+                    .query_namespace_metric(metric_name, name, &matchers)
+                    .await
+            }
+            None => {
+                prometheus_client
+                    .query_cluster_metric(metric_name, resource, name, &matchers)
+                    .await
+            }
+        };
+        match queried {
             Ok(v) => v,
             Err(e) => {
                 warn!(
@@ -118,7 +153,7 @@ async fn get_metric_by_name(
             }
         }
     } else {
-        let key = build_key(storage_resource(resource), Some(namespace), name);
+        let key = build_key(storage_resource(resource), namespace, name);
         if state
             .storage
             .as_ref()
@@ -148,7 +183,97 @@ async fn get_metric_by_name(
     ))
 }
 
-/// Get a custom metric value for a specific object
+/// The one `REST.List` every custom.metrics route runs
+/// (`pkg/apiserver/installer/cmhandlers.go:160-247` installs the root-scoped,
+/// namespaced and `namespaces/{namespace}/metrics/{name}` routes on
+/// `ListResourceWithOptions`, get.go:41-140). `route_name` is the object
+/// named by the path; get.go:98-125 treats it as a `metadata.name` field
+/// selector entry, and `name == "*"` is `handleWildcardOp` (reststorage.go:
+/// 96-123).
+async fn list_op(
+    state: &ApiServerState,
+    namespace: Option<&str>,
+    resource: &str,
+    route_name: Option<&str>,
+    metric_name: &str,
+    params: &HashMap<String, String>,
+) -> Result<MetricValueList> {
+    crate::handlers::validate_synthesized_list_options(params)?;
+    // get.go:84-126 decode, then reststorage.go List.
+    let opts = decode_list_options(params, route_name)?;
+    let metric_selector = decode_metric_label_selector(params)?;
+
+    let items = match opts.name.as_deref().filter(|n| *n != "*") {
+        // `name != "*"`: handleIndividualOp; the object labelSelector is not
+        // consulted, and the single value is wrapped in a list
+        // (reststorage.go:146-148).
+        Some(name) => vec![
+            get_metric_by_name(
+                state,
+                namespace,
+                resource,
+                name,
+                metric_name,
+                &metric_selector,
+            )
+            .await?,
+        ],
+        // handleWildcardOp -> GetMetricBySelector(namespace, selector, ...).
+        None => {
+            let objects =
+                selected_object_names(state, namespace, resource, &opts.object_selector).await?;
+            let mut series: Vec<(String, String)> = Vec::new();
+            if let Some(ref prometheus_client) = state.prometheus_client {
+                let matchers = matchers_for(&metric_selector)?;
+                // A root-scoped list has no namespace label to pin.
+                match prometheus_client
+                    .query_list_metric(metric_name, namespace.unwrap_or(""), resource, &matchers)
+                    .await
+                {
+                    Ok(mut found) => {
+                        for object in objects {
+                            if let Some(value) = found.remove(&object) {
+                                series.push((object, value));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to query Prometheus for list metric {}: {}. Using fallback values.",
+                            metric_name, e
+                        );
+                    }
+                }
+            } else if metric_selector.matches(&HashMap::new()) {
+                // Test-adapter series model: every selected object has a
+                // series without labels (provider.go metricsFor/valueFor).
+                series.extend(objects.into_iter().map(|o| (o, "100".to_string())));
+            }
+            if series.is_empty() {
+                Vec::new()
+            } else {
+                let echo = metric_selector_echo(&metric_selector)?;
+                series
+                    .into_iter()
+                    .map(|(name, value)| {
+                        metric_value(namespace, resource, name, metric_name, value, echo.clone())
+                    })
+                    .collect()
+            }
+        }
+    };
+
+    Ok(MetricValueList {
+        type_meta: metric_value_type_meta("MetricValueList"),
+        // `metav1.ListMeta`. The bespoke predecessor carried only `selfLink`,
+        // which upstream stopped populating on every object in 1.20 (#1916).
+        metadata: rusternetes_common::types::ListMeta::default(),
+        items,
+    })
+}
+
+/// `GET .../namespaces/{namespace}/{resource}/{name}/{metric}`: a named
+/// object (or `*`), answered as a `MetricValueList`.
 pub async fn get_custom_metric(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -159,7 +284,7 @@ pub async fn get_custom_metric(
         String,
     )>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<MetricValue>> {
+) -> Result<Json<MetricValueList>> {
     info!(
         "Getting custom metric {} for {}/{}/{}",
         metric_name, namespace, resource_type, resource_name
@@ -176,18 +301,14 @@ pub async fn get_custom_metric(
         return Err(rusternetes_common::Error::Forbidden(reason));
     }
 
-    // ListResource decode: a fieldSelector naming another object is a 400.
-    decode_list_options(&params, Some(&resource_name))?;
-    let metric_selector = decode_metric_label_selector(&params)?;
-
     Ok(Json(
-        get_metric_by_name(
+        list_op(
             &state,
-            &namespace,
+            Some(&namespace),
             &resource_type,
-            &resource_name,
+            Some(&resource_name),
             &metric_name,
-            &metric_selector,
+            &params,
         )
         .await?,
     ))
@@ -215,93 +336,27 @@ pub async fn list_custom_metrics(
         return Err(rusternetes_common::Error::Forbidden(reason));
     }
 
-    crate::handlers::validate_synthesized_list_options(&params)?;
-    // get.go:84-126 decode, then reststorage.go List.
-    let opts = decode_list_options(&params, None)?;
-    let metric_selector = decode_metric_label_selector(&params)?;
-
-    let items = if let Some(name) = opts.name.as_deref() {
-        // `name != "*"`: handleIndividualOp; the object labelSelector is not
-        // consulted.
-        vec![
-            get_metric_by_name(
-                &state,
-                &namespace,
-                &resource_type,
-                name,
-                &metric_name,
-                &metric_selector,
-            )
-            .await?,
-        ]
-    } else {
-        // handleWildcardOp -> GetMetricBySelector(namespace, selector, ...).
-        let objects =
-            selected_object_names(&state, &namespace, &resource_type, &opts.object_selector)
-                .await?;
-        let mut series: Vec<(String, String)> = Vec::new();
-        if let Some(ref prometheus_client) = state.prometheus_client {
-            let matchers = matchers_for(&metric_selector)?;
-            match prometheus_client
-                .query_list_metric(&metric_name, &namespace, &resource_type, &matchers)
-                .await
-            {
-                Ok(mut found) => {
-                    for object in objects {
-                        if let Some(value) = found.remove(&object) {
-                            series.push((object, value));
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to query Prometheus for list metric {}: {}. Using fallback values.",
-                        metric_name, e
-                    );
-                }
-            }
-        } else if metric_selector.matches(&HashMap::new()) {
-            // Test-adapter series model: every selected object has a series
-            // without labels (provider.go metricsFor/valueFor).
-            series.extend(objects.into_iter().map(|o| (o, "100".to_string())));
-        }
-        if series.is_empty() {
-            Vec::new()
-        } else {
-            let echo = metric_selector_echo(&metric_selector)?;
-            series
-                .into_iter()
-                .map(|(name, value)| {
-                    metric_value(
-                        &namespace,
-                        &resource_type,
-                        name,
-                        &metric_name,
-                        value,
-                        echo.clone(),
-                    )
-                })
-                .collect()
-        }
-    };
-
-    let metric_list = MetricValueList {
-        type_meta: metric_value_type_meta("MetricValueList"),
-        // `metav1.ListMeta`. The bespoke predecessor carried only `selfLink`,
-        // which upstream stopped populating on every object in 1.20 (#1916).
-        metadata: rusternetes_common::types::ListMeta::default(),
-        items,
-    };
-
-    Ok(Json(metric_list))
+    Ok(Json(
+        list_op(
+            &state,
+            Some(&namespace),
+            &resource_type,
+            None,
+            &metric_name,
+            &params,
+        )
+        .await?,
+    ))
 }
 
-/// Get a custom metric value for a namespace-scoped metric
+/// `GET .../namespaces/{namespace}/metrics/{metric}`: get.go:49-58 rewrites
+/// it to resource `namespaces`, name = the namespace, no namespace scope.
 pub async fn get_namespace_metric(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, metric_name)): Path<(String, String)>,
-) -> Result<Json<MetricValue>> {
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<MetricValueList>> {
     debug!("Getting namespace metric {} for {}", metric_name, namespace);
 
     // Check authorization
@@ -314,50 +369,26 @@ pub async fn get_namespace_metric(
         return Err(rusternetes_common::Error::Forbidden(reason));
     }
 
-    // Query Prometheus for namespace metric (or use mock data if Prometheus not configured)
-    let value = if let Some(ref prometheus_client) = state.prometheus_client {
-        match prometheus_client
-            .query_namespace_metric(&metric_name, &namespace)
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(
-                    "Failed to query Prometheus for namespace metric {}: {}. Using fallback value.",
-                    metric_name, e
-                );
-                "0".to_string()
-            }
-        }
-    } else {
-        // Fallback mock value when Prometheus is not configured
-        "500".to_string()
-    };
-
-    let metric_value = MetricValue {
-        type_meta: metric_value_type_meta("MetricValue"),
-        described_object: ObjectReference {
-            kind: "Namespace".to_string(),
-            namespace: None,
-            name: namespace,
-            api_version: Some("v1".to_string()),
-        },
-        metric_name: metric_name.clone(),
-        timestamp: Utc::now(),
-        window: Some("60s".to_string()),
-        value,
-        selector: None,
-    };
-
-    Ok(Json(metric_value))
+    Ok(Json(
+        list_op(
+            &state,
+            None,
+            "namespaces",
+            Some(&namespace),
+            &metric_name,
+            &params,
+        )
+        .await?,
+    ))
 }
 
-/// Get a custom metric value for a cluster-scoped metric
+/// `GET .../{resource}/{name}/{metric}`: a root-scoped object.
 pub async fn get_cluster_metric(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((resource_type, resource_name, metric_name)): Path<(String, String, String)>,
-) -> Result<Json<MetricValue>> {
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<MetricValueList>> {
     info!(
         "Getting cluster metric {} for {}/{}",
         metric_name, resource_type, resource_name
@@ -373,47 +404,17 @@ pub async fn get_cluster_metric(
         return Err(rusternetes_common::Error::Forbidden(reason));
     }
 
-    // Query Prometheus for cluster-scoped metric (or use mock data if Prometheus not configured)
-    let value = if let Some(ref prometheus_client) = state.prometheus_client {
-        match prometheus_client
-            .query_cluster_metric(
-                &metric_name,
-                &resource_type,
-                &resource_name,
-                &[], // No additional matchers
-            )
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(
-                    "Failed to query Prometheus for cluster metric {}: {}. Using fallback value.",
-                    metric_name, e
-                );
-                "0".to_string()
-            }
-        }
-    } else {
-        // Fallback mock value when Prometheus is not configured
-        "200".to_string()
-    };
-
-    let metric_value = MetricValue {
-        type_meta: metric_value_type_meta("MetricValue"),
-        described_object: ObjectReference {
-            kind: capitalize(&resource_type),
-            namespace: None,
-            name: resource_name,
-            api_version: Some("v1".to_string()),
-        },
-        metric_name: metric_name.clone(),
-        timestamp: Utc::now(),
-        window: Some("60s".to_string()),
-        value,
-        selector: None,
-    };
-
-    Ok(Json(metric_value))
+    Ok(Json(
+        list_op(
+            &state,
+            None,
+            &resource_type,
+            Some(&resource_name),
+            &metric_name,
+            &params,
+        )
+        .await?,
+    ))
 }
 
 /// Helper function to capitalize the first letter of a string
