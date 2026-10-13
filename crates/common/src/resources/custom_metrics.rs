@@ -49,6 +49,9 @@ pub struct ObjectReference {
 pub struct MetricSelector {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub match_labels: Option<BTreeMap<String, String>>,
+    /// `metav1.LabelSelector.MatchExpressions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_expressions: Option<Vec<crate::types::LabelSelectorRequirement>>,
 }
 
 /// MetricValueList contains a list of metric values
@@ -111,6 +114,7 @@ mod tests {
             value: "100".to_string(),
             selector: Some(MetricSelector {
                 match_labels: Some(BTreeMap::from([("app".to_string(), "nginx".to_string())])),
+                match_expressions: None,
             }),
         };
 

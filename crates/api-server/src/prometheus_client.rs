@@ -5,11 +5,85 @@
 
 use anyhow::{Context, Result};
 use prometheus_http_query::Client;
+use rusternetes_common::label_selector::{LabelOperator, LabelSelector};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
+
+/// Escape a value for a PromQL double-quoted string literal.
+fn promql_string(v: &str) -> String {
+    v.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+/// Map a metric label selector onto PromQL series matchers.
+///
+/// Rusternetes-only (there is no in-tree Prometheus provider upstream; the
+/// custom-metrics-apiserver library hands the parsed `labels.Selector` to the
+/// provider, `pkg/provider/interfaces.go`). Semantics follow
+/// `labels.Requirement.Matches` (apimachinery selector.go): `in`/`notin` are
+/// anchored alternations (PromQL regex matchers are fully anchored), `exists`
+/// is a non-empty match and `!key` an empty one (an absent label is the empty
+/// string in PromQL, which is what `notin`/`!=` need as well). `gt`/`lt` have
+/// no PromQL label matcher, so they are an error rather than silently dropped.
+pub fn promql_matchers(selector: &LabelSelector) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for r in selector.requirements() {
+        // Prometheus label names are `[a-zA-Z_][a-zA-Z0-9_]*`; exporters map
+        // every other label-key character to `_`.
+        let key: String = r
+            .key()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let vals = r.values().unwrap_or(&[]);
+        let alt = || {
+            vals.iter()
+                .map(|v| promql_string(&regex_escape(v)))
+                .collect::<Vec<_>>()
+                .join("|")
+        };
+        out.push(match r.operator() {
+            LabelOperator::Equals | LabelOperator::DoubleEquals => {
+                format!(
+                    "{key}=\"{}\"",
+                    promql_string(vals.first().map_or("", |v| v))
+                )
+            }
+            LabelOperator::NotEquals => {
+                format!(
+                    "{key}!=\"{}\"",
+                    promql_string(vals.first().map_or("", |v| v))
+                )
+            }
+            LabelOperator::In => format!("{key}=~\"{}\"", alt()),
+            LabelOperator::NotIn => format!("{key}!~\"{}\"", alt()),
+            LabelOperator::Exists => format!("{key}=~\".+\""),
+            LabelOperator::DoesNotExist => format!("{key}=\"\""),
+            op @ (LabelOperator::GreaterThan | LabelOperator::LessThan) => {
+                anyhow::bail!(
+                    "label selector operator {op} cannot be expressed as a PromQL matcher"
+                )
+            }
+        });
+    }
+    Ok(out)
+}
+
+/// Escape RE2 metacharacters so a label value matches literally.
+fn regex_escape(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for c in v.chars() {
+        if "\\.+*?()|[]{}^$".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
 
 /// Prometheus client for custom metrics queries
 pub struct PrometheusClient {
@@ -58,18 +132,23 @@ impl PrometheusClient {
     /// * `namespace` - Kubernetes namespace
     /// * `resource_type` - Type of resource (e.g., "pods", "services")
     /// * `resource_name` - Name of the resource
-    /// * `labels` - Additional label selectors
+    /// * `matchers` - PromQL label matchers from the metric label selector (see [`promql_matchers`])
     pub async fn query_object_metric(
         &self,
         metric_name: &str,
         namespace: &str,
         resource_type: &str,
         resource_name: &str,
-        labels: Option<&HashMap<String, String>>,
+        matchers: &[String],
     ) -> Result<String> {
         // Build PromQL query
-        let query =
-            self.build_object_query(metric_name, namespace, resource_type, resource_name, labels);
+        let query = self.build_object_query(
+            metric_name,
+            namespace,
+            resource_type,
+            resource_name,
+            matchers,
+        );
 
         debug!("Querying Prometheus for object metric: {}", query);
 
@@ -97,10 +176,10 @@ impl PrometheusClient {
         metric_name: &str,
         namespace: &str,
         resource_type: &str,
-        labels: Option<&HashMap<String, String>>,
+        matchers: &[String],
     ) -> Result<HashMap<String, String>> {
         // Build PromQL query without specific resource name
-        let query = self.build_list_query(metric_name, namespace, resource_type, labels);
+        let query = self.build_list_query(metric_name, namespace, resource_type, matchers);
 
         debug!("Querying Prometheus for list metric: {}", query);
 
@@ -164,7 +243,7 @@ impl PrometheusClient {
         metric_name: &str,
         resource_type: &str,
         resource_name: &str,
-        labels: Option<&HashMap<String, String>>,
+        matchers: &[String],
     ) -> Result<String> {
         // Build PromQL query without namespace
         let mut label_selectors = vec![];
@@ -174,12 +253,8 @@ impl PrometheusClient {
             label_selectors.push(format!("{}=\"{}\"", name_label, resource_name));
         }
 
-        // Add additional labels
-        if let Some(labels_map) = labels {
-            for (key, value) in labels_map {
-                label_selectors.push(format!("{}=\"{}\"", key, value));
-            }
-        }
+        // Add the metric label selector's matchers
+        label_selectors.extend(matchers.iter().cloned());
 
         let query = if label_selectors.is_empty() {
             metric_name.to_string()
@@ -211,14 +286,10 @@ impl PrometheusClient {
         &self,
         metric_name: &str,
         namespace: &str,
-        labels: Option<&HashMap<String, String>>,
+        matchers: &[String],
     ) -> Result<String> {
         let mut label_selectors = vec![format!("namespace=\"{}\"", namespace)];
-        if let Some(labels_map) = labels {
-            for (key, value) in labels_map {
-                label_selectors.push(format!("{}=\"{}\"", key, value));
-            }
-        }
+        label_selectors.extend(matchers.iter().cloned());
         let query = format!("sum({}{{{}}})", metric_name, label_selectors.join(","));
 
         debug!("Querying Prometheus for external metric: {}", query);
@@ -239,7 +310,7 @@ impl PrometheusClient {
         namespace: &str,
         resource_type: &str,
         resource_name: &str,
-        labels: Option<&HashMap<String, String>>,
+        matchers: &[String],
     ) -> String {
         let mut label_selectors = vec![format!("namespace=\"{}\"", namespace)];
 
@@ -248,12 +319,8 @@ impl PrometheusClient {
             label_selectors.push(format!("{}=\"{}\"", name_label, resource_name));
         }
 
-        // Add additional labels
-        if let Some(labels_map) = labels {
-            for (key, value) in labels_map {
-                label_selectors.push(format!("{}=\"{}\"", key, value));
-            }
-        }
+        // Add the metric label selector's matchers
+        label_selectors.extend(matchers.iter().cloned());
 
         format!("{}{{{}}}", metric_name, label_selectors.join(","))
     }
@@ -264,7 +331,7 @@ impl PrometheusClient {
         metric_name: &str,
         namespace: &str,
         resource_type: &str,
-        labels: Option<&HashMap<String, String>>,
+        matchers: &[String],
     ) -> String {
         let mut label_selectors = vec![format!("namespace=\"{}\"", namespace)];
 
@@ -277,12 +344,8 @@ impl PrometheusClient {
             }
         }
 
-        // Add additional labels
-        if let Some(labels_map) = labels {
-            for (key, value) in labels_map {
-                label_selectors.push(format!("{}=\"{}\"", key, value));
-            }
-        }
+        // Add the metric label selector's matchers
+        label_selectors.extend(matchers.iter().cloned());
 
         format!("{}{{{}}}", metric_name, label_selectors.join(","))
     }
@@ -412,7 +475,7 @@ mod tests {
         let client = PrometheusClient::new("http://localhost:9090").unwrap();
 
         let query =
-            client.build_object_query("http_requests_total", "default", "pods", "nginx-pod", None);
+            client.build_object_query("http_requests_total", "default", "pods", "nginx-pod", &[]);
 
         assert!(query.contains("namespace=\"default\""));
         assert!(query.contains("pod=\"nginx-pod\""));
@@ -423,16 +486,15 @@ mod tests {
     fn test_build_object_query_with_labels() {
         let client = PrometheusClient::new("http://localhost:9090").unwrap();
 
-        let mut labels = HashMap::new();
-        labels.insert("app".to_string(), "nginx".to_string());
-        labels.insert("env".to_string(), "production".to_string());
+        let labels =
+            promql_matchers(&LabelSelector::parse("app=nginx,env=production").unwrap()).unwrap();
 
         let query = client.build_object_query(
             "custom_metric",
             "kube-system",
             "services",
             "kube-dns",
-            Some(&labels),
+            &labels,
         );
 
         assert!(query.contains("namespace=\"kube-system\""));
@@ -442,10 +504,22 @@ mod tests {
     }
 
     #[test]
+    fn promql_matchers_cover_set_based_requirements() {
+        let m = |s: &str| promql_matchers(&LabelSelector::parse(s).unwrap()).unwrap();
+        assert_eq!(m("a=b"), ["a=\"b\""]);
+        assert_eq!(m("a!=b"), ["a!=\"b\""]);
+        assert_eq!(m("a in (x,y.z)"), ["a=~\"x|y\\\\.z\""]);
+        assert_eq!(m("a notin (x)"), ["a!~\"x\""]);
+        assert_eq!(m("a"), ["a=~\".+\""]);
+        assert_eq!(m("!a"), ["a=\"\""]);
+        assert!(promql_matchers(&LabelSelector::parse("a>1").unwrap()).is_err());
+    }
+
+    #[test]
     fn test_build_list_query() {
         let client = PrometheusClient::new("http://localhost:9090").unwrap();
 
-        let query = client.build_list_query("memory_usage_bytes", "default", "pods", None);
+        let query = client.build_list_query("memory_usage_bytes", "default", "pods", &[]);
 
         assert!(query.contains("namespace=\"default\""));
         assert!(query.contains("memory_usage_bytes"));
