@@ -216,9 +216,13 @@ impl PrometheusClient {
         &self,
         metric_name: &str,
         namespace: &str,
+        matchers: &[String],
     ) -> Result<String> {
-        // Build PromQL query for namespace-level metric
-        let query = format!("sum({}{{namespace=\"{}\"}})", metric_name, namespace);
+        // Build PromQL query for namespace-level metric, narrowed by the
+        // metric label selector's matchers.
+        let mut label_selectors = vec![format!("namespace=\"{}\"", namespace)];
+        label_selectors.extend(matchers.iter().cloned());
+        let query = format!("sum({}{{{}}})", metric_name, label_selectors.join(","));
 
         debug!("Querying Prometheus for namespace metric: {}", query);
 

@@ -139,7 +139,7 @@ async fn the_metrics_response_types_decode_when_fields_are_absent() {
     };
 
     let value: MetricValue = serde_json::from_value(json!({})).expect("MetricValue");
-    assert!(value.metric_name.is_empty());
+    assert!(value.metric.name.is_empty());
     assert!(value.value.is_empty());
     assert!(value.described_object.kind.is_empty());
 

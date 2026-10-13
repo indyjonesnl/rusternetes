@@ -523,14 +523,25 @@ impl MetricsClient for HttpMetricsClient {
         namespace: &str,
         object_ref: &CrossVersionObjectReference,
     ) -> Result<(i64, DateTime<Utc>)> {
-        let url = format!(
-            "{}/apis/custom.metrics.k8s.io/v1beta2/namespaces/{}/{}/{}/{}",
-            self.base,
-            namespace,
-            object_ref.kind.to_lowercase(),
-            object_ref.name,
-            metric
-        );
+        // `RootScopedMetrics().GetForObject` for a core `Namespace` reads
+        // `namespaces/{ns}/metrics/{metric}` (client-go `getForNamespace`,
+        // versioned_client.go:103-133); the object name is the HPA's own
+        // namespace there.
+        let url = if object_ref.kind == "Namespace" {
+            format!(
+                "{}/apis/custom.metrics.k8s.io/v1beta2/namespaces/{}/metrics/{}",
+                self.base, namespace, metric
+            )
+        } else {
+            format!(
+                "{}/apis/custom.metrics.k8s.io/v1beta2/namespaces/{}/{}/{}/{}",
+                self.base,
+                namespace,
+                object_ref.kind.to_lowercase(),
+                object_ref.name,
+                metric
+            )
+        };
         let body: serde_json::Value = self
             .http
             .get(&url)
@@ -539,7 +550,20 @@ impl MetricsClient for HttpMetricsClient {
             .error_for_status()?
             .json()
             .await?;
-        let value = body
+        // The API answers a `MetricValueList`; client-go requires exactly one
+        // item (versioned_client.go:222-256, `GetForObject`).
+        let items = body
+            .get("items")
+            .and_then(|v| v.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if items.len() != 1 {
+            anyhow::bail!(
+                "the custom metrics API server returned {} results when we asked for exactly one",
+                items.len()
+            );
+        }
+        let value = items[0]
             .get("value")
             .and_then(|v| v.as_str())
             .map(|q| parse_quantity_milli(q, metric))
