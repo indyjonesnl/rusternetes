@@ -882,12 +882,42 @@ pub fn volume_binding_args_from_config(
     doc: &str,
     storage_capacity_scoring: bool,
 ) -> Result<VolumeBindingArgs, String> {
-    let cfg: KubeSchedulerConfiguration =
+    let (_, args) = resolve_profiles(doc, storage_capacity_scoring)?
+        .into_iter()
+        .next()
+        .expect("resolve_profiles always yields at least one profile");
+    Ok(args)
+}
+
+/// Build the scheduling profiles of a `KubeSchedulerConfiguration` document
+/// (`profile.NewMap` over `cfg.Profiles`, scheduler.go `New`): every profile is
+/// defaulted and validated, then indexed by scheduler name.
+pub fn profiles_from_config(
+    doc: &str,
+    storage_capacity_scoring: bool,
+) -> Result<crate::profile::Map, String> {
+    let resolved = resolve_profiles(doc, storage_capacity_scoring)?;
+    crate::profile::Map::new_map(resolved.into_iter().map(|(p, _)| p).collect())
+}
+
+/// Default + validate every profile (an empty list yields the one default
+/// profile, v1/defaults.go:111-113), returning each with its resolved
+/// `VolumeBindingArgs`.
+fn resolve_profiles(
+    doc: &str,
+    storage_capacity_scoring: bool,
+) -> Result<Vec<(crate::profile::Profile, VolumeBindingArgs)>, String> {
+    let mut cfg: KubeSchedulerConfiguration =
         serde_yaml::from_str(doc).map_err(|e| format!("invalid scheduler config: {e}"))?;
     let (mut errs, init_errs) = validate_profiles(&cfg)?;
-    let mut args = VolumeBindingArgs::default();
-    let mut path = Path::new("profiles").index(0);
-    if let Some(profile) = cfg.profiles.first() {
+    if cfg.profiles.is_empty() {
+        cfg.profiles.push(Profile::default());
+    }
+    let single = cfg.profiles.len() == 1;
+    let mut resolved = Vec::new();
+    for (idx, profile) in cfg.profiles.iter().enumerate() {
+        let mut args = VolumeBindingArgs::default();
+        let mut path = Path::new("profiles").index(idx);
         for (i, pc) in profile.plugin_config.iter().enumerate() {
             if pc.name == "VolumeBinding" {
                 path = path.child("pluginConfig").index(i).child("args");
@@ -898,14 +928,37 @@ pub fn volume_binding_args_from_config(
                 break;
             }
         }
+        args.set_defaults(storage_capacity_scoring);
+        errs.extend(args.validate(&path, storage_capacity_scoring));
+        // SetDefaults_KubeSchedulerConfiguration names only a lone profile.
+        let name = match (&profile.scheduler_name, single) {
+            (Some(n), _) => n.clone(),
+            (None, true) => crate::profile::DEFAULT_SCHEDULER_NAME.to_string(),
+            (None, false) => String::new(),
+        };
+        let queue_sort = profile
+            .plugins
+            .as_ref()
+            .and_then(|p| p.queue_sort.enabled.first())
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| crate::profile::DEFAULT_QUEUE_SORT.to_string());
+        // The last matching pluginConfig wins, as validateCommonQueueSort.
+        let queue_sort_args = profile
+            .plugin_config
+            .iter()
+            .rfind(|pc| pc.name == queue_sort)
+            .and_then(|pc| pc.args.as_ref())
+            .and_then(|v| serde_json::to_value(v).ok());
+        let mut p = crate::profile::Profile::named(&name).with_volume_binding_args(&args);
+        p.queue_sort = queue_sort;
+        p.queue_sort_args = queue_sort_args;
+        resolved.push((p, args));
     }
-    args.set_defaults(storage_capacity_scoring);
-    errs.extend(args.validate(&path, storage_capacity_scoring));
     if errs.is_empty() {
         errs = init_errs;
     }
     if errs.is_empty() {
-        Ok(args)
+        Ok(resolved)
     } else {
         Err(errs
             .iter()
@@ -1256,6 +1309,16 @@ pub fn load_volume_binding_args(path: &str) -> Result<VolumeBindingArgs, String>
         .map_err(|e| format!("invalid config {path}: {e}"))
 }
 
+/// [`load_volume_binding_args`] for every profile: read the file and build the
+/// scheduler-name-indexed [`crate::profile::Map`].
+pub fn load_profiles(path: &str) -> Result<crate::profile::Map, String> {
+    let doc = std::fs::read_to_string(path).map_err(|e| format!("reading config {path}: {e}"))?;
+    let scoring = rusternetes_common::feature_gates::enabled(
+        rusternetes_common::feature_gates::Feature::StorageCapacityScoring,
+    );
+    profiles_from_config(&doc, scoring).map_err(|e| format!("invalid config {path}: {e}"))
+}
+
 /// `validateFunctionShape` (validation_pluginargs.go:176-211).
 fn validate_function_shape(shape: &[UtilizationShapePoint], path: &Path) -> ErrorList {
     const MIN_UTILIZATION: i32 = 0;
@@ -1498,6 +1561,37 @@ profiles:
             .map(|p| (p.utilization, p.score))
             .collect();
         assert_eq!(got, want);
+    }
+
+    // #3346: every profile becomes a runtime profile (profile.NewMap), each
+    // with its own VolumeBinding args; an empty config yields the default one.
+    #[test]
+    fn profiles_from_config_builds_one_runtime_profile_each() {
+        let m = profiles_from_config("", false).unwrap();
+        assert_eq!(m.names(), vec!["default-scheduler"]);
+        let doc = "profiles:\n\
+            - schedulerName: a\n  pluginConfig:\n  - name: VolumeBinding\n    args:\n      bindTimeoutSeconds: 7\n\
+            - schedulerName: b\n";
+        let m = profiles_from_config(doc, false).unwrap();
+        assert_eq!(m.names(), vec!["a", "b"]);
+        assert_eq!(
+            m.get("a").unwrap().volume_bind_timeout,
+            std::time::Duration::from_secs(7)
+        );
+        assert_eq!(
+            m.get("b").unwrap().volume_bind_timeout,
+            std::time::Duration::from_secs(600)
+        );
+        assert_eq!(m.get("a").unwrap().queue_sort, "PrioritySort");
+        // Per-profile VolumeBinding validation reports the profile's own path.
+        let bad = "profiles:\n\
+            - schedulerName: a\n\
+            - schedulerName: b\n  pluginConfig:\n  - name: VolumeBinding\n    args:\n      bindTimeoutSeconds: -1\n";
+        let err = profiles_from_config(bad, false).unwrap_err();
+        assert!(
+            err.contains("profiles[1].pluginConfig[0].args.bindTimeoutSeconds"),
+            "{err}"
+        );
     }
 
     // #3202: file loader shared by the scheduler binary and the all-in-one

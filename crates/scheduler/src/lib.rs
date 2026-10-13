@@ -19,8 +19,9 @@ use tracing::info;
 /// Configuration for the scheduler component.
 pub struct SchedulerConfig {
     pub interval: u64,
-    /// Resolved `VolumeBinding` plugin args (from `--scheduler-config`).
-    pub volume_binding_args: scheduler_config::VolumeBindingArgs,
+    /// Scheduling profiles by scheduler name (from `--scheduler-config`);
+    /// a single `default-scheduler` profile by default.
+    pub profiles: profile::Map,
 }
 
 /// Run the scheduler component.
@@ -30,10 +31,11 @@ pub struct SchedulerConfig {
 pub async fn run(storage: Arc<StorageBackend>, config: SchedulerConfig) -> anyhow::Result<()> {
     info!("Starting Rusternetes Scheduler");
 
-    let scheduler = Arc::new(
-        scheduler::Scheduler::new(storage, config.interval)
-            .with_volume_binding_args(&config.volume_binding_args),
-    );
+    let scheduler = Arc::new(scheduler::Scheduler::new_with_profiles(
+        storage,
+        config.interval,
+        config.profiles,
+    ));
     scheduler.run().await?;
 
     Ok(())
@@ -53,12 +55,12 @@ pub async fn run_with_api(
 ) -> anyhow::Result<()> {
     info!("Starting Rusternetes Scheduler (API mode)");
 
-    let scheduler_name = "default-scheduler".to_string();
-    let backend = data_plane::ApiBackend::new(client, &scheduler_name);
-    let scheduler = Arc::new(
-        scheduler::Scheduler::new_api(backend, config.interval, scheduler_name)
-            .with_volume_binding_args(&config.volume_binding_args),
-    );
+    let backend = data_plane::ApiBackend::new(client);
+    let scheduler = Arc::new(scheduler::Scheduler::new_api_with_profiles(
+        backend,
+        config.interval,
+        config.profiles,
+    ));
     scheduler.run().await?;
 
     Ok(())

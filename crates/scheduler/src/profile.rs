@@ -74,14 +74,50 @@ pub struct Map {
 impl Map {
     /// `NewMap` (profile.go:45-58) with `cfgValidator.validate` (:93-123).
     pub fn new_map(cfgs: Vec<Profile>) -> Result<Map, String> {
-        let _ = cfgs;
-        todo!()
+        let mut m = Map::default();
+        // cfgValidator{m: m}: the first profile's queue sort (:93-123).
+        let mut queue_sort: Option<(String, Option<serde_json::Value>)> = None;
+        for cfg in cfgs {
+            if cfg.scheduler_name.is_empty() {
+                return Err("scheduler name is needed".to_string());
+            }
+            if !cfg.has_plugins {
+                return Err(format!(
+                    "plugins required for profile with scheduler name {:?}",
+                    cfg.scheduler_name
+                ));
+            }
+            if m.profiles.contains_key(&cfg.scheduler_name) {
+                return Err(format!(
+                    "duplicate profile with scheduler name {:?}",
+                    cfg.scheduler_name
+                ));
+            }
+            match &queue_sort {
+                None => queue_sort = Some((cfg.queue_sort.clone(), cfg.queue_sort_args.clone())),
+                Some((first, first_args)) => {
+                    if *first != cfg.queue_sort {
+                        return Err(format!(
+                            "different queue sort plugins for profile {:?}: {:?}, first: {:?}",
+                            cfg.scheduler_name, cfg.queue_sort, first
+                        ));
+                    }
+                    if *first_args != cfg.queue_sort_args {
+                        return Err(format!(
+                            "different queue sort plugin args for profile {:?}",
+                            cfg.scheduler_name
+                        ));
+                    }
+                }
+            }
+            m.profiles.insert(cfg.scheduler_name.clone(), cfg);
+        }
+        Ok(m)
     }
 
     /// `HandlesSchedulerName` (profile.go:67-70).
     pub fn handles_scheduler_name(&self, name: &str) -> bool {
-        let _ = name;
-        todo!()
+        self.profiles.contains_key(name)
     }
 
     pub fn get(&self, name: &str) -> Option<&Profile> {
@@ -109,8 +145,10 @@ impl Map {
 
     /// `Scheduler.frameworkForPod` (schedule_one.go:390-396).
     pub fn framework_for_pod(&self, pod: &Pod) -> Result<&Profile, String> {
-        let _ = pod;
-        todo!()
+        let name = pod_scheduler_name(pod);
+        self.profiles
+            .get(name)
+            .ok_or_else(|| format!("profile not found for scheduler name {name:?}"))
     }
 }
 

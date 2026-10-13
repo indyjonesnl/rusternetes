@@ -12,8 +12,10 @@ mod diagnosis;
 mod framework;
 #[allow(dead_code)]
 mod plugins;
+#[allow(dead_code)] // library API surface (Map accessors); partly unused by the binary
 mod profile;
 mod scheduler;
+#[allow(dead_code)] // library API surface (single-profile loaders); partly unused by the binary
 mod scheduler_config;
 #[allow(dead_code)] // library API surface (informer delete/new); partly unused by the binary
 mod volume_assume;
@@ -73,10 +75,10 @@ struct Args {
     #[arg(long, value_delimiter = ',')]
     min_compatibility_version: Vec<String>,
 
-    /// Path to a KubeSchedulerConfiguration file (YAML/JSON). Only
-    /// `profiles[0].pluginConfig[VolumeBinding].args` (bindTimeoutSeconds,
-    /// shape) is consumed; it is defaulted and validated like upstream's
-    /// SetDefaults_VolumeBindingArgs / ValidateVolumeBindingArgs.
+    /// Path to a KubeSchedulerConfiguration file (YAML/JSON). Every profile is
+    /// defaulted and validated like upstream (`profile.NewMap`); a pod is
+    /// scheduled by the profile named in its `spec.schedulerName`, using that
+    /// profile's `VolumeBinding` args (bindTimeoutSeconds, shape).
     #[arg(long)]
     config: Option<String>,
 
@@ -139,10 +141,14 @@ async fn main() -> Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("invalid --feature-gates/--emulated-version: {e}"))?;
 
-    let volume_binding_args = match &args.config {
-        Some(path) => scheduler_config::load_volume_binding_args(path)
-            .map_err(|e| anyhow::anyhow!("--config: {e}"))?,
-        None => scheduler_config::VolumeBindingArgs::default(),
+    let profiles = match &args.config {
+        Some(path) => {
+            scheduler_config::load_profiles(path).map_err(|e| anyhow::anyhow!("--config: {e}"))?
+        }
+        None => profile::Map::new_map(vec![profile::Profile::named(
+            profile::DEFAULT_SCHEDULER_NAME,
+        )])
+        .map_err(|e| anyhow::anyhow!(e))?,
     };
 
     info!(
@@ -155,7 +161,7 @@ async fn main() -> Result<()> {
     // the binding subresource + status + events. Resolve the api-server URL and
     // CA from --kubeconfig (preferred) or the explicit flags.
     if args.api_server_url.is_some() || args.kubeconfig.is_some() {
-        return run_api_mode(args, &volume_binding_args).await;
+        return run_api_mode(args, &profiles).await;
     }
 
     let storage_config = match args.storage_backend.as_str() {
@@ -221,9 +227,11 @@ async fn main() -> Result<()> {
             }
         });
 
-        let scheduler = Arc::new(
-            Scheduler::new(storage, args.interval).with_volume_binding_args(&volume_binding_args),
-        );
+        let scheduler = Arc::new(Scheduler::new_with_profiles(
+            storage,
+            args.interval,
+            profiles.clone(),
+        ));
         loop {
             while !elector.is_leader().await {
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
@@ -240,9 +248,11 @@ async fn main() -> Result<()> {
         }
     } else {
         warn!("Leader election disabled - running in single-instance mode");
-        let scheduler = Arc::new(
-            Scheduler::new(storage, args.interval).with_volume_binding_args(&volume_binding_args),
-        );
+        let scheduler = Arc::new(Scheduler::new_with_profiles(
+            storage,
+            args.interval,
+            profiles.clone(),
+        ));
         scheduler.run().await?;
     }
 
@@ -253,10 +263,7 @@ async fn main() -> Result<()> {
 /// the api-server URL + CA from `--kubeconfig` (preferred) or the explicit
 /// `--api-server-url` flag, builds the [`ApiBackend`] (client + informers +
 /// event recorder) and runs the single-instance scheduling loop.
-async fn run_api_mode(
-    args: Args,
-    volume_binding_args: &scheduler_config::VolumeBindingArgs,
-) -> Result<()> {
+async fn run_api_mode(args: Args, profiles: &profile::Map) -> Result<()> {
     use rusternetes_client::http::ApiClient;
     use rusternetes_client::kubeconfig::KubeConfig;
 
@@ -313,12 +320,12 @@ async fn run_api_mode(
         None,
     )?);
 
-    let scheduler_name = "default-scheduler".to_string();
-    let backend = data_plane::ApiBackend::new(client, &scheduler_name);
-    let scheduler = Arc::new(
-        Scheduler::new_api(backend, args.interval, scheduler_name)
-            .with_volume_binding_args(volume_binding_args),
-    );
+    let backend = data_plane::ApiBackend::new(client);
+    let scheduler = Arc::new(Scheduler::new_api_with_profiles(
+        backend,
+        args.interval,
+        profiles.clone(),
+    ));
     info!("Scheduler starting (API mode, single instance, no leader election)");
     scheduler.run().await?;
     Ok(())
