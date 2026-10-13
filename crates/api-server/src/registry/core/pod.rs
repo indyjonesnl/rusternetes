@@ -642,8 +642,9 @@ fn drop_non_resize_updates_for_containers(new: &[Container], old: &[Container]) 
     merged
 }
 
-/// `dropNonResizeUpdates` (strategy.go:386-435), without the pod-level
-/// resources of the alpha `InPlacePodLevelResourcesVerticalScaling` gate.
+/// `dropNonResizeUpdates` (strategy.go:362-392): everything but the
+/// containers' resources/resizePolicy and, with
+/// `InPlacePodLevelResourcesVerticalScaling` on, the pod-level resources.
 fn drop_non_resize_updates(new: &mut Pod, old: &Pod) {
     let (Some(new_spec), Some(old_spec)) = (new.spec.as_ref(), old.spec.as_ref()) else {
         return;
@@ -660,7 +661,17 @@ fn drop_non_resize_updates(new: &mut Pod, old: &Pod) {
         drop_non_resize_updates_for_containers(&new_spec.containers, &old_spec.containers);
     let init_containers = drop_non_resize_updates_for_containers(new_init, old_init);
 
+    // Preserve the incoming pod-level resources from the new pod object.
+    let new_pod_resources = new_spec.resources.clone();
+
     let mut spec = old_spec.clone();
+    // With InPlacePodLevelResourcesVerticalScaling on, restore the saved
+    // pod-level resources to the new pod's spec (strategy.go:376-380).
+    if rusternetes_common::feature_gates::enabled(
+        rusternetes_common::feature_gates::Feature::InPlacePodLevelResourcesVerticalScaling,
+    ) {
+        spec.resources = new_pod_resources;
+    }
     spec.containers = containers;
     if spec.init_containers.is_some() {
         spec.init_containers = Some(init_containers);
@@ -1836,6 +1847,37 @@ mod tests {
         };
         assert!(Strategy.check_graceful_delete(&ctx(), pod, &mut options));
         options.grace_period_seconds
+    }
+
+    /// `dropNonResizeUpdates` (strategy.go:376-380): pod-level resources of
+    /// the new pod survive only with InPlacePodLevelResourcesVerticalScaling.
+    #[test]
+    #[serial_test::serial]
+    fn drop_non_resize_updates_keeps_pod_level_resources_only_with_the_gate() {
+        let old = pod(serde_json::json!({"resources": {"requests": {"cpu": "1"}}}));
+        let new = pod(serde_json::json!({"resources": {"requests": {"cpu": "2"}}}));
+        let cpu = |p: &Pod| {
+            p.spec
+                .as_ref()
+                .unwrap()
+                .resources
+                .as_ref()
+                .unwrap()
+                .requests
+                .as_ref()
+                .unwrap()["cpu"]
+                .clone()
+        };
+        let mut n = new.clone();
+        drop_non_resize_updates(&mut n, &old);
+        assert_eq!(cpu(&n), "1");
+        let _g = rusternetes_common::feature_gates::with_feature(
+            rusternetes_common::feature_gates::Feature::InPlacePodLevelResourcesVerticalScaling,
+            true,
+        );
+        let mut n = new.clone();
+        drop_non_resize_updates(&mut n, &old);
+        assert_eq!(cpu(&n), "2");
     }
 
     fn annotated(ann: serde_json::Value) -> Pod {

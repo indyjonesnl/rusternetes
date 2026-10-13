@@ -3,10 +3,10 @@
 //! `ValidatePodResize` (`pkg/apis/core/validation/validation.go:6181-6523`,
 //! release-1.35) with their helpers.
 //!
-//! Not ported: the `InPlacePodLevelResourcesVerticalScaling` branch
-//! (`validatePodLevelResourcesResize`, validation.go:6384-6412). The gate is
-//! alpha and off in v1.35 (kube_features.go:1372), so a pod with pod-level
-//! resources is refused exactly as upstream does with the gate off.
+//! The `InPlacePodLevelResourcesVerticalScaling` branch
+//! (`validatePodLevelResourcesResize`, validation.go:6384-6412) runs when the
+//! gate is on; it is alpha and off by default in v1.35 (kube_features.go:1372),
+//! so a pod with pod-level resources is then refused as upstream does.
 
 use std::collections::{HashMap, HashSet};
 
@@ -21,22 +21,31 @@ use crate::validation::objectmeta::{
     name_is_dns_subdomain, validate_object_meta, validate_object_meta_update,
 };
 use crate::validation::pod::{validate_container, validate_pod_create};
-use crate::validation::pod_status::validate_pod_metadata_annotations;
+use crate::validation::pod_status::validate_pod_metadata_annotations_with_opts;
 
 /// `core.MirrorPodAnnotationKey`.
 const MIRROR_POD_ANNOTATION_KEY: &str = "kubernetes.io/config.mirror";
 
 /// `validatePodMetadataAndSpec` (validation.go:4500-4530), the part that
-/// `ValidatePodUpdate` shares with the subresource validators. `old` selects
-/// the `ValidatePodSpecificAnnotationUpdates` half (validation.go:5699).
-fn validate_pod_metadata_and_spec(pod: &Pod, old: Option<&Pod>) -> ErrorList {
+/// `ValidatePodUpdate` shares with the subresource validators. `old` supplies the
+/// `GetValidationOptionsFromPodSpecAndMeta` options; `run_annotation_updates`
+/// selects the `ValidatePodSpecificAnnotationUpdates` half (validation.go:5699).
+fn validate_pod_metadata_and_spec(
+    pod: &Pod,
+    old: Option<&Pod>,
+    run_annotation_updates: bool,
+) -> ErrorList {
     let mut errs = validate_object_meta(
         &pod.metadata,
         true,
         name_is_dns_subdomain,
         &Path::new("metadata"),
     );
-    errs.extend(validate_pod_metadata_annotations(pod, old));
+    errs.extend(validate_pod_metadata_annotations_with_opts(
+        pod,
+        old,
+        run_annotation_updates,
+    ));
     // `ValidatePodSpec` (validation.go:4643) validates the ephemeral
     // containers; "cannot be set on create" belongs to `ValidatePodCreate`
     // (validation.go:5605-5608), not to `validatePodMetadataAndSpec`.
@@ -116,15 +125,13 @@ fn validate_ephemeral_containers(spec: &PodSpec, fld_path: &Path) -> ErrorList {
                 errs.push(Error::forbidden(&idx_path.child(name), MSG));
             }
         };
+        set(ec.ports.is_some(), "ports", &mut errs);
         set(
-            ec.ports.as_ref().is_some_and(|v| !v.is_empty()),
-            "ports",
-            &mut errs,
-        );
-        set(
+            // `reflect.DeepEqual(field, zero)` (validation.go:3799): a present
+            // but empty map counts as set; only nil is the zero value.
             ec.resources
                 .as_ref()
-                .is_some_and(|r| !semantic_equal(r, &empty_requirements())),
+                .is_some_and(|r| r.limits.is_some() || r.requests.is_some() || r.claims.is_some()),
             "resources",
             &mut errs,
         );
@@ -132,16 +139,10 @@ fn validate_ephemeral_containers(spec: &PodSpec, fld_path: &Path) -> ErrorList {
         set(ec.readiness_probe.is_some(), "readinessProbe", &mut errs);
         set(ec.startup_probe.is_some(), "startupProbe", &mut errs);
         set(ec.lifecycle.is_some(), "lifecycle", &mut errs);
-        set(
-            ec.resize_policy.as_ref().is_some_and(|v| !v.is_empty()),
-            "resizePolicy",
-            &mut errs,
-        );
+        set(ec.resize_policy.is_some(), "resizePolicy", &mut errs);
         set(ec.restart_policy.is_some(), "restartPolicy", &mut errs);
         set(
-            ec.restart_policy_rules
-                .as_ref()
-                .is_some_and(|v| !v.is_empty()),
+            ec.restart_policy_rules.is_some(),
             "restartPolicyRules",
             &mut errs,
         );
@@ -199,7 +200,7 @@ pub fn validate_pod_ephemeral_containers_update(new: &Pod, old: &Pod) -> ErrorLi
         validate_object_meta_update(&new.metadata, &old.metadata, &Path::new("metadata"));
     // `validate_pod_metadata_and_spec` with `old` also runs
     // `ValidatePodSpecificAnnotationUpdates` (validation.go:6189).
-    errs.extend(validate_pod_metadata_and_spec(new, Some(old)));
+    errs.extend(validate_pod_metadata_and_spec(new, Some(old), true));
 
     // static pods don't support ephemeral containers #113935
     if is_mirror_pod(old) {
@@ -280,7 +281,7 @@ pub fn validate_pod_resize(new: &Pod, old: &Pod) -> ErrorList {
     // Part 1: validate newPod's spec and updates to metadata.
     let mut errs =
         validate_object_meta_update(&new.metadata, &old.metadata, &Path::new("metadata"));
-    errs.extend(validate_pod_metadata_and_spec(new, None));
+    errs.extend(validate_pod_metadata_and_spec(new, Some(old), false));
 
     // static pods cannot be resized.
     if is_mirror_pod(old) {
@@ -325,22 +326,36 @@ pub fn validate_pod_resize(new: &Pod, old: &Pod) -> ErrorList {
         ));
     }
 
-    // Part 2: pod-level resources. The InPlacePodLevelResourcesVerticalScaling
-    // gate is off in v1.35 (see the module doc).
+    // Part 2: validate that changes between pod-level resources in
+    // oldPod.Spec.Resources and newPod.Spec.Resources are allowed
+    // (validation.go:6240-6264).
     let is_pod_level_resources_set = |s: &PodSpec| {
         s.resources.as_ref().is_some_and(|r| {
             r.requests.as_ref().map_or(0, |m| m.len()) + r.limits.as_ref().map_or(0, |m| m.len())
                 > 0
         })
     };
-    if is_pod_level_resources_set(old_spec) || is_pod_level_resources_set(new_spec) {
-        errs.push(Error::forbidden(
-            &Path::new(""),
-            "resize of pods with pod-level resources is forbidden when InPlacePodLevelResourcesVerticalScalingEnabled feature gate is disabled",
-        ));
-        return errs;
-    }
     let mut new_spec_copy = new_spec.clone();
+    if is_pod_level_resources_set(old_spec) || is_pod_level_resources_set(new_spec) {
+        // pods with pod-level resources cannot be resized without the
+        // InPlacePodLevelResourcesVerticalScaling feature gate being enabled.
+        if !enabled(Feature::InPlacePodLevelResourcesVerticalScaling) {
+            errs.push(Error::forbidden(
+                &Path::new(""),
+                "resize of pods with pod-level resources is forbidden when InPlacePodLevelResourcesVerticalScalingEnabled feature gate is disabled",
+            ));
+            return errs;
+        }
+
+        // `new_spec_copy` is passed by reference to allow its `resources` to
+        // be mutated, which is required for an intermediate validation step.
+        errs.extend(validate_pod_level_resources_resize(
+            new_spec,
+            old_spec,
+            &mut new_spec_copy,
+            &spec_path,
+        ));
+    }
 
     // Part 3: container resources. The rest assumes the containers are in
     // the same order, so proceed only if that holds.
@@ -495,6 +510,79 @@ fn validate_pod_resize_container_ordering(
 }
 
 type ResourceList = Option<HashMap<String, String>>;
+
+/// `validatePodLevelResourcesResize` (validation.go:6384-6412): pod-level
+/// resources may not be removed, and only cpu and memory may change.
+fn validate_pod_level_resources_resize(
+    new_spec: &PodSpec,
+    old_spec: &PodSpec,
+    spec_to_mutate: &mut PodSpec,
+    spec_path: &Path,
+) -> ErrorList {
+    let mut errs = Vec::new();
+
+    if old_spec.resources.is_some() && new_spec.resources.is_none() {
+        errs.push(Error::forbidden(
+            &spec_path.child("resources"),
+            "pod-level resources cannot be removed",
+        ));
+        return errs;
+    }
+
+    if let (Some(old_res), Some(new_res)) =
+        (old_spec.resources.as_ref(), new_spec.resources.as_ref())
+    {
+        if resources_removed(&new_res.requests, &old_res.requests) {
+            errs.push(Error::forbidden(
+                &spec_path.child("resources").child("requests"),
+                "pod-level resource requests cannot be removed",
+            ));
+        }
+        if resources_removed(&new_res.limits, &old_res.limits) {
+            errs.push(Error::forbidden(
+                &spec_path.child("resources").child("limits"),
+                "pod-level resource limits cannot be removed",
+            ));
+        }
+    }
+
+    spec_to_mutate.resources = drop_cpu_memory_resource_requirements_updates(
+        spec_to_mutate.resources.take(),
+        old_spec.resources.as_ref(),
+    );
+
+    if !semantic_equal(&spec_to_mutate.resources, &old_spec.resources) {
+        // This likely means that the user has made changes to pod-level
+        // resources other than CPU and memory.
+        errs.push(Error::forbidden(
+            spec_path,
+            "only cpu and memory resources are mutable at pod-level",
+        ));
+    }
+    errs
+}
+
+/// `dropCPUMemoryResourceRequirementsUpdates` (validation.go:6447-6476): the
+/// cpu and memory come from the old pod's `resources`; the whole block is nil
+/// when the old one was nil and nothing but empty lists remain.
+fn drop_cpu_memory_resource_requirements_updates(
+    resources: Option<ResourceRequirements>,
+    old: Option<&ResourceRequirements>,
+) -> Option<ResourceRequirements> {
+    let mut resources = resources?;
+    let old_reqs = old.and_then(|o| o.requests.clone());
+    let old_lims = old.and_then(|o| o.limits.clone());
+    resources.requests = drop_cpu_memory_updates(&resources.requests, &old_reqs);
+    resources.limits = drop_cpu_memory_updates(&resources.limits, &old_lims);
+    if old.is_none()
+        && resources.requests.as_ref().is_none_or(|m| m.is_empty())
+        && resources.limits.as_ref().is_none_or(|m| m.is_empty())
+        && resources.claims.as_ref().is_none_or(|c| c.is_empty())
+    {
+        return None;
+    }
+    Some(resources)
+}
 
 /// `dropCPUMemoryUpdates` (validation.go:6414-6436).
 fn drop_cpu_memory_updates(list: &ResourceList, old: &ResourceList) -> ResourceList {
@@ -676,6 +764,7 @@ mod tests {
     /// `ValidatePodResize` with pod-level resources and the
     /// `InPlacePodLevelResourcesVerticalScaling` gate off (validation.go:6247).
     #[test]
+    #[serial_test::serial]
     fn pod_level_resources_cannot_be_resized_with_the_gate_off() {
         let old = pod(serde_json::json!({
             "metadata": {"name": "p"},
@@ -978,10 +1067,8 @@ mod tests {
         // removing the pod-level resources block.
         let mut removed = new.clone();
         removed.spec.as_mut().unwrap().resources = None;
-        assert_eq!(
-            resize_errs(&old, &removed),
-            vec!["spec.resources: pod-level resources cannot be removed"]
-        );
+        assert!(resize_errs(&old, &removed)
+            .contains(&"spec.resources: pod-level resources cannot be removed".to_string()));
         // removing requests.
         let no_req = mk_pl(json!({"limits": {"cpu": "1"}}));
         assert!(resize_errs(&old, &no_req).contains(
