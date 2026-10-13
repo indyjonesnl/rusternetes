@@ -807,6 +807,9 @@ pub struct CsiProvisioner<S: Storage> {
     node_deployment: Option<NodeDeployment>,
     /// `internalNodeDeployment.rateLimiter`; set with `node_deployment`.
     owner_limiter: Option<OwnerRateLimiter>,
+    /// The `ctx` that `Run(ctx)` hands to `checkNode`/`becomeOwner`
+    /// (controller.go:1606, :1676, :1749); `true` once cancelled.
+    shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 impl<S: Storage + 'static> CsiProvisioner<S> {
@@ -859,7 +862,15 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             capabilities: tokio::sync::OnceCell::new(),
             node_deployment: None,
             owner_limiter: None,
+            shutdown: tokio::sync::watch::channel(false).0,
         }
+    }
+
+    /// Cancel the provisioner's `ctx` (the context `Run(ctx)` passes down to
+    /// `becomeOwner`, controller.go:1676, :1749): in-flight `become_owner`
+    /// waits abort and `run` returns.
+    pub fn shutdown(&self) {
+        self.shutdown.send_replace(true);
     }
 
     /// `if p.supportsMigrationFromInTreePluginName != ""` ... `sc.Provisioner ==
@@ -1221,8 +1232,18 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
                     .is_some_and(|n| !n.is_empty() && *n != nd.node_name);
                 Ok::<_, anyhow::Error>((taken, current))
             };
+            let mut ctx = self.shutdown.subscribe();
             let (stop, mut current) = loop {
                 tokio::select! {
+                    // controller.go:1781-1782: `case <-ctx.Done(): return
+                    // errors.New("timed out waiting to become PVC owner")`.
+                    // Go's select picks randomly among ready cases (the
+                    // `sleep` context is a child of `ctx`, so it is ready
+                    // too); either outcome is valid there, we always abort.
+                    biased;
+                    _ = cancelled(&mut ctx) => {
+                        return Err(anyhow!("timed out waiting to become PVC owner"));
+                    }
                     _ = &mut sleep => break check().await?,
                     _ = ticker.tick() => {
                         // "Abort the waiting early if we know that someone
@@ -3214,7 +3235,11 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             }
         });
 
+        let mut ctx = self.shutdown.subscribe();
         loop {
+            if *ctx.borrow() {
+                return Ok(());
+            }
             self.enqueue_all(&queue).await;
             let prefix = rusternetes_storage::build_prefix("persistentvolumeclaims", None);
             let mut watch = match self.storage.watch(&prefix).await {
@@ -3230,6 +3255,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             let mut broken = false;
             while !broken {
                 tokio::select! {
+                    _ = cancelled(&mut ctx) => return Ok(()),
                     event = watch.next() => match event {
                         Some(Ok(ev)) => queue.add(extract_key(&ev)).await,
                         Some(Err(e)) => { warn!("Watch error: {e}, reconnecting"); broken = true; }
@@ -3255,6 +3281,12 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             Err(e) => error!("Failed to list persistentvolumeclaims: {e}"),
         }
     }
+}
+
+/// `<-ctx.Done()`. The `Ref` returned by `wait_for` must not live across an
+/// await in the caller, hence the wrapper.
+async fn cancelled(ctx: &mut tokio::sync::watch::Receiver<bool>) {
+    let _ = ctx.wait_for(|c| *c).await;
 }
 
 /// `NewItemExponentialFailureRateLimiter(5ms, 1000s)`: `base * 2^(n-1)`.

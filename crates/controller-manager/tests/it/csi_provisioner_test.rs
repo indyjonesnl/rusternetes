@@ -2074,6 +2074,31 @@ async fn immediate_claim_taken_by_another_node_while_waiting_is_not_overwritten(
     assert!(rec.lock().unwrap().get_capacity.is_empty());
 }
 
+/// controller.go:1781-1782 (external-provisioner v6.4.0): `case
+/// <-ctx.Done(): return errors.New("timed out waiting to become PVC owner")`,
+/// wrapped by checkNode (:1676-1677) as `PVC <ns>/<name>: <err>` and by
+/// Provision (:860) as `node check failed: <err>`.
+#[tokio::test]
+async fn become_owner_aborts_when_the_provisioner_is_shut_down() {
+    let (storage, p, _rec, _d) = env(
+        Fake::new(),
+        storage_class(Some(VolumeBindingMode::Immediate)),
+    )
+    .await;
+    put_node(&storage, "foo", Some("foo"), true).await;
+    let p = p.with_node_deployment(immediate_deployment(std::time::Duration::from_secs(30)));
+    let c = put_claim(&storage, &claim(&[(ANN, DRIVER)])).await;
+    p.shutdown();
+    let started = std::time::Instant::now();
+    let err = p.sync_claim(&c).await.unwrap_err();
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert_eq!(
+        format!("{err:#}"),
+        "node check failed: PVC ns1/data: timed out waiting to become PVC owner"
+    );
+    assert_eq!(selected_node_of(&storage).await, None);
+}
+
 fn with_affinity(mut pv: PersistentVolume, key: &str, value: &str) -> PersistentVolume {
     pv.spec.node_affinity = Some(VolumeNodeAffinity {
         required: Some(NodeSelector {

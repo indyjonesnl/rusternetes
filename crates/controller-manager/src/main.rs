@@ -997,6 +997,7 @@ async fn main() -> Result<()> {
     });
 
     // Start one CSI external-provisioner per `--csi-provisioner` driver.
+    let mut csi_provisioner_handles = Vec::new();
     for spec in &args.csi_provisioners {
         let Some((driver, socket)) = spec.split_once('=') else {
             anyhow::bail!("--csi-provisioner {spec:?}: expected <driver-name>=<socket path>");
@@ -1105,6 +1106,7 @@ async fn main() -> Result<()> {
                 }
             });
         }
+        csi_provisioner_handles.push(provisioner.clone());
         spawn_controller!("CSI provisioner", leader_elector, {
             let controller = provisioner.clone();
             async move {
@@ -1520,6 +1522,10 @@ async fn main() -> Result<()> {
     // Keep the main thread alive
     tokio::signal::ctrl_c().await?;
     info!("Shutting down controller manager");
+    // Cancel the context Run(ctx) hands to each provisioner (controller.go:1749).
+    for p in &csi_provisioner_handles {
+        p.shutdown();
+    }
 
     Ok(())
 }
