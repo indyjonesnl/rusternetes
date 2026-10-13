@@ -133,6 +133,41 @@ struct Args {
     #[arg(long, default_value = "5")]
     sync_interval: u64,
 
+    /// The file path to a pod definition used as a template for NFS persistent
+    /// volume recycling (`--pv-recycler-pod-template-filepath-nfs`,
+    /// `options/persistentvolumebindercontroller.go:37`).
+    #[arg(long, default_value = "")]
+    pv_recycler_pod_template_filepath_nfs: String,
+
+    /// The minimum ActiveDeadlineSeconds to use for an NFS Recycler pod.
+    #[arg(long, default_value_t = 300)]
+    pv_recycler_minimum_timeout_nfs: i32,
+
+    /// the increment of time added per Gi to ActiveDeadlineSeconds for an NFS
+    /// scrubber pod.
+    #[arg(long, default_value_t = 30)]
+    pv_recycler_increment_timeout_nfs: i32,
+
+    /// The file path to a pod definition used as a template for HostPath
+    /// persistent volume recycling. This is for development and testing only
+    /// and will not work in a multi-node cluster.
+    #[arg(long, default_value = "")]
+    pv_recycler_pod_template_filepath_hostpath: String,
+
+    /// The minimum ActiveDeadlineSeconds to use for a HostPath Recycler pod.
+    /// This is for development and testing only and will not work in a
+    /// multi-node cluster.
+    #[arg(long, default_value_t = 60)]
+    pv_recycler_minimum_timeout_hostpath: i32,
+
+    /// the increment of time added per Gi to ActiveDeadlineSeconds for a
+    /// HostPath scrubber pod. This is for development and testing only and
+    /// will not work in a multi-node cluster. (Upstream registers this one as
+    /// `--pv-recycler-timeout-increment-hostpath`:
+    /// `persistentvolumebindercontroller.go:42`.)
+    #[arg(long, default_value_t = 30)]
+    pv_recycler_timeout_increment_hostpath: i32,
+
     /// Scheduler interval in seconds
     #[arg(long, default_value = "2")]
     scheduler_interval: u64,
@@ -291,6 +326,8 @@ async fn async_main() -> Result<()> {
     apply_feature_gates(&args)?;
     // Gates first: the StorageCapacityScoring default for VolumeBinding args reads them.
     let sched_config = scheduler_config_from_args(&args)?;
+    // Built before `args` is partially moved below.
+    let pv_recycler = recycler_config_from_args(&args)?;
 
     rusternetes_common::tracing::init_basic_tracing("rusternetes", &args.log_level)?;
 
@@ -448,9 +485,9 @@ async fn async_main() -> Result<()> {
         .collect::<Result<Vec<_>, _>>()?;
     let cm_config = rusternetes_controller_manager::ControllerManagerConfig {
         sync_interval: args.sync_interval,
-        // The all-in-one binary does not expose the `--pv-recycler-*` flags;
-        // upstream's flag defaults apply.
-        pv_recycler: Default::default(),
+        // `newPersistentVolumeBinderController` (core.go:322-325): a bad
+        // recycler template aborts startup.
+        pv_recycler,
         metrics_config,
         ca_cert_pem: cm_ca_pem,
         // All-in-one does not expose node-IPAM flags; pod-CIDR allocation is a
@@ -569,6 +606,77 @@ async fn async_main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The recycler plugin config the `--pv-recycler-*` flags describe, built as
+/// `newPersistentVolumeBinderController` (`cmd/kube-controller-manager/app/core.go:322-325`)
+/// probes the volume plugins; failure aborts startup.
+fn recycler_config_from_args(
+    _args: &Args,
+) -> anyhow::Result<rusternetes_controller_manager::controllers::pv_recycler::RecyclerConfig> {
+    Ok(Default::default())
+}
+
+#[cfg(test)]
+mod pv_recycler_flag_tests {
+    use super::*;
+
+    /// `persistentvolumebindercontroller.go:37-42` names; defaults
+    /// `config/v1alpha1/defaults.go:81-92` (hostPath increment flag is
+    /// `--pv-recycler-timeout-increment-hostpath`).
+    #[test]
+    fn recycler_flags_parse_with_upstream_names_and_defaults() {
+        let a = Args::try_parse_from(["rusternetes"]).unwrap();
+        assert_eq!(a.pv_recycler_minimum_timeout_nfs, 300);
+        assert_eq!(a.pv_recycler_increment_timeout_nfs, 30);
+        assert_eq!(a.pv_recycler_minimum_timeout_hostpath, 60);
+        assert_eq!(a.pv_recycler_timeout_increment_hostpath, 30);
+        assert_eq!(a.pv_recycler_pod_template_filepath_nfs, "");
+        assert_eq!(a.pv_recycler_pod_template_filepath_hostpath, "");
+        let a = Args::try_parse_from([
+            "rusternetes",
+            "--pv-recycler-minimum-timeout-nfs=1",
+            "--pv-recycler-increment-timeout-nfs=2",
+            "--pv-recycler-minimum-timeout-hostpath=3",
+            "--pv-recycler-timeout-increment-hostpath=4",
+            "--pv-recycler-pod-template-filepath-nfs=/a",
+            "--pv-recycler-pod-template-filepath-hostpath=/b",
+        ])
+        .unwrap();
+        assert_eq!(a.pv_recycler_minimum_timeout_nfs, 1);
+        assert_eq!(a.pv_recycler_increment_timeout_nfs, 2);
+        assert_eq!(a.pv_recycler_minimum_timeout_hostpath, 3);
+        assert_eq!(a.pv_recycler_timeout_increment_hostpath, 4);
+        assert_eq!(a.pv_recycler_pod_template_filepath_nfs, "/a");
+        assert_eq!(a.pv_recycler_pod_template_filepath_hostpath, "/b");
+    }
+
+    #[test]
+    fn recycler_timeouts_reach_config() {
+        let a = Args::try_parse_from([
+            "rusternetes",
+            "--pv-recycler-minimum-timeout-nfs=11",
+            "--pv-recycler-timeout-increment-hostpath=7",
+        ])
+        .unwrap();
+        let c = recycler_config_from_args(&a).unwrap();
+        assert_eq!(c.nfs.recycler_minimum_timeout, 11);
+        assert_eq!(c.host_path.recycler_timeout_increment, 7);
+    }
+
+    /// core.go:324's wrapper around the plugin probe error.
+    #[test]
+    fn bad_template_file_aborts_startup() {
+        let a = Args::try_parse_from([
+            "rusternetes",
+            "--pv-recycler-pod-template-filepath-nfs=/nonexistent/pod.yaml",
+        ])
+        .unwrap();
+        let err = recycler_config_from_args(&a).unwrap_err();
+        assert!(err.to_string().starts_with(
+            "failed to probe volume plugins when starting persistentvolume controller: failed to read file path /nonexistent/pod.yaml: "
+        ), "{err}");
+    }
 }
 
 #[cfg(test)]
