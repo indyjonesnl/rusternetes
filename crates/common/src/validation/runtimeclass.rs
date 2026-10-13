@@ -49,10 +49,6 @@ const STANDARD_RESOURCES: &[&str] = &[
 const HUGEPAGES_PREFIX: &str = "hugepages-";
 /// Upstream `core.ResourceRequestsHugePagesPrefix`.
 const REQUESTS_HUGEPAGES_PREFIX: &str = "requests.hugepages-";
-/// Upstream `core.ResourceDefaultNamespacePrefix` (`kubernetes.io/`).
-const DEFAULT_NAMESPACE_PREFIX: &str = "kubernetes.io/";
-/// Upstream `core.DefaultResourceRequestsPrefix` (`requests.`).
-const DEFAULT_RESOURCE_REQUESTS_PREFIX: &str = "requests.";
 
 /// Mirrors upstream `IsHugePageResourceName`.
 fn is_huge_page_resource_name(name: &str) -> bool {
@@ -74,20 +70,14 @@ fn is_standard_container_resource_name(name: &str) -> bool {
     STANDARD_CONTAINER_RESOURCES.contains(&name) || is_huge_page_resource_name(name)
 }
 
-/// Mirrors upstream `IsNativeResource`: partially-qualified (no `/`) names are
-/// implicitly in the `kubernetes.io/` namespace.
+/// `IsNativeResource`; shared port in [`crate::quota`].
 fn is_native_resource(name: &str) -> bool {
-    !name.contains('/') || name.contains(DEFAULT_NAMESPACE_PREFIX)
+    crate::quota::is_native_resource_name(name)
 }
 
-/// Mirrors upstream `IsExtendedResourceName`.
+/// `IsExtendedResourceName`; shared port in [`crate::quota`].
 fn is_extended_resource_name(name: &str) -> bool {
-    if is_native_resource(name) || name.starts_with(DEFAULT_RESOURCE_REQUESTS_PREFIX) {
-        return false;
-    }
-    // Ensure it satisfies IsQualifiedName after conversion into a quota name.
-    let name_for_quota = format!("{DEFAULT_RESOURCE_REQUESTS_PREFIX}{name}");
-    is_qualified_name(&name_for_quota).is_empty()
+    crate::quota::is_extended_resource_name(name)
 }
 
 /// Mirrors upstream `validateResourceName` (`pkg/apis/core/validation`):
