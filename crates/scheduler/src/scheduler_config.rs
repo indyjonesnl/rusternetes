@@ -15,7 +15,7 @@ use rusternetes_common::resources::pod::{
     NodeAffinity, NodeSelectorRequirement, NodeSelectorTerm, TopologySpreadConstraint,
 };
 use rusternetes_common::validation::field::{self, BadValue, ErrorList, Path};
-use rusternetes_common::validation::metav1::validate_label_name;
+use rusternetes_common::validation::metav1::{is_qualified_name, validate_label_name};
 use serde::{Deserialize, Serialize};
 
 /// `config.UtilizationShapePoint` (pkg/scheduler/apis/config/types.go).
@@ -747,6 +747,32 @@ struct KubeSchedulerConfiguration {
     /// v1/defaults.go:162-164 defaults a nil value to 10.
     #[serde(default)]
     pod_max_backoff_seconds: Option<i64>,
+    /// `extenders` (kube-scheduler/config/v1/types.go:317 `Extender`). v1
+    /// defaults.go sets nothing for extenders.
+    #[serde(default)]
+    extenders: Vec<Extender>,
+}
+
+/// The validated slice of `config.Extender` (kube-scheduler/config/v1/types.go:317).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Extender {
+    #[serde(default)]
+    prioritize_verb: String,
+    #[serde(default)]
+    weight: i64,
+    #[serde(default)]
+    bind_verb: String,
+    #[serde(default)]
+    managed_resources: Vec<ExtenderManagedResource>,
+}
+
+/// `config.ExtenderManagedResource` (kube-scheduler/config/v1/types.go:362).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtenderManagedResource {
+    #[serde(default)]
+    name: String,
 }
 
 /// `config.Plugin` (pkg/scheduler/apis/config/types.go). The internal type has
@@ -1071,7 +1097,86 @@ fn validate_profiles(cfg: &KubeSchedulerConfiguration) -> Result<(ErrorList, Err
             "must be greater than or equal to PodInitialBackoffSeconds",
         ));
     }
+    // validation.go:82.
+    errs.extend(validate_extenders(&Path::new("extenders"), &cfg.extenders));
     Ok((errs, init_errs))
+}
+
+/// `validateExtenders` (validation.go:256-286).
+fn validate_extenders(fld_path: &Path, extenders: &[Extender]) -> ErrorList {
+    let mut errs = ErrorList::new();
+    let mut binders = 0;
+    let mut managed: Vec<&str> = Vec::new();
+    for (i, extender) in extenders.iter().enumerate() {
+        let path = fld_path.index(i);
+        if !extender.prioritize_verb.is_empty() && extender.weight <= 0 {
+            errs.push(field::Error::invalid(
+                &path.child("weight"),
+                extender.weight,
+                "must have a positive weight applied to it",
+            ));
+        }
+        if !extender.bind_verb.is_empty() {
+            binders += 1;
+        }
+        for (j, resource) in extender.managed_resources.iter().enumerate() {
+            let mr_path = path.child("managedResources").index(j);
+            errs.extend(validate_extended_resource_name(
+                &mr_path.child("name"),
+                &resource.name,
+            ));
+            if managed.contains(&resource.name.as_str()) {
+                errs.push(field::Error::invalid(
+                    &mr_path.child("name"),
+                    resource.name.as_str(),
+                    "duplicate extender managed resource name",
+                ));
+            }
+            managed.push(&resource.name);
+        }
+    }
+    if binders > 1 {
+        errs.push(field::Error::invalid(
+            fld_path,
+            format!("found {binders} extenders implementing bind"),
+            "only one extender can implement bind",
+        ));
+    }
+    errs
+}
+
+/// `validateExtendedResourceName` (validation.go:290-301).
+fn validate_extended_resource_name(path: &Path, name: &str) -> ErrorList {
+    let mut errs: ErrorList = is_qualified_name(name)
+        .into_iter()
+        .map(|msg| field::Error::invalid(path, name, msg))
+        .collect();
+    if !errs.is_empty() {
+        return errs;
+    }
+    if !is_extended_resource_name(name) {
+        errs.push(field::Error::invalid(
+            path,
+            name,
+            "is an invalid extended resource name",
+        ));
+    }
+    errs
+}
+
+/// `v1helper.IsNativeResource` (pkg/apis/core/v1/helper/helpers.go:60-63):
+/// `IsPrefixedNativeResource` is a `Contains` check on `kubernetes.io/`
+/// (helpers.go:53-55), not a prefix check.
+fn is_native_resource(name: &str) -> bool {
+    !name.contains('/') || name.contains("kubernetes.io/")
+}
+
+/// `v1helper.IsExtendedResourceName` (pkg/apis/core/v1/helper/helpers.go:39-49).
+fn is_extended_resource_name(name: &str) -> bool {
+    if is_native_resource(name) || name.starts_with("requests.") {
+        return false;
+    }
+    is_qualified_name(&format!("requests.{name}")).is_empty()
 }
 
 /// `validateCommonQueueSort` (validation.go:219-254).
@@ -1449,6 +1554,81 @@ profiles:
         // Same name in different profiles is fine.
         let ok = "profiles:\n- schedulerName: a\n  pluginConfig:\n  - name: X\n- schedulerName: b\n  pluginConfig:\n  - name: X\n";
         assert!(volume_binding_args_from_config(ok, false).is_ok());
+    }
+
+    // #3345: validateExtenders (validation.go:256-286). validation_test.go
+    // "extender-negative-weight" -> extenders[0].weight.
+    #[test]
+    fn extender_negative_weight_rejected() {
+        let doc = "extenders:\n- urlPrefix: http://x\n  prioritizeVerb: prioritize\n  weight: -1\n";
+        let err = volume_binding_args_from_config(doc, false).unwrap_err();
+        assert_eq!(
+            err,
+            "extenders[0].weight: Invalid value: -1: must have a positive weight applied to it"
+        );
+        // Weight is only checked when a prioritizeVerb is set (validation.go:263).
+        let ok = "extenders:\n- urlPrefix: http://x\n  weight: -1\n";
+        assert!(volume_binding_args_from_config(ok, false).is_ok());
+        let ok = "extenders:\n- urlPrefix: http://x\n  prioritizeVerb: p\n  weight: 1\n";
+        assert!(volume_binding_args_from_config(ok, false).is_ok());
+    }
+
+    // "extender-duplicate-managed-resources" -> extenders[0].managedResources[1].name.
+    #[test]
+    fn extender_duplicate_managed_resource_rejected() {
+        let doc = "extenders:\n- urlPrefix: http://x\n  managedResources:\n  - name: example.com/foo\n  - name: example.com/foo\n";
+        let err = volume_binding_args_from_config(doc, false).unwrap_err();
+        assert_eq!(
+            err,
+            "extenders[0].managedResources[1].name: Invalid value: \"example.com/foo\": duplicate extender managed resource name"
+        );
+    }
+
+    // "extender-duplicate-bind" -> extenders (validation.go:281-283).
+    #[test]
+    fn extender_duplicate_bind_rejected() {
+        let doc = "extenders:\n- urlPrefix: http://x\n  bindVerb: foo\n- urlPrefix: http://y\n  bindVerb: bar\n";
+        let err = volume_binding_args_from_config(doc, false).unwrap_err();
+        assert_eq!(
+            err,
+            "extenders: Invalid value: \"found 2 extenders implementing bind\": only one extender can implement bind"
+        );
+    }
+
+    // validateExtendedResourceName (validation.go:290-301): qualified-name
+    // errors short-circuit; native names are not extended resources.
+    #[test]
+    fn extender_managed_resource_name_must_be_extended() {
+        let doc = "extenders:\n- urlPrefix: http://x\n  managedResources:\n  - name: cpu\n  - name: kubernetes.io/foo\n  - name: requests.example.com/foo\n  - name: \"bad name/x\"\n";
+        let err = volume_binding_args_from_config(doc, false).unwrap_err();
+        assert!(
+            err.contains(
+                "extenders[0].managedResources[0].name: Invalid value: \"cpu\": is an invalid extended resource name"
+            ),
+            "{err}"
+        );
+        assert!(
+            err.contains(
+                "extenders[0].managedResources[1].name: Invalid value: \"kubernetes.io/foo\": is an invalid extended resource name"
+            ),
+            "{err}"
+        );
+        assert!(
+            err.contains(
+                "extenders[0].managedResources[2].name: Invalid value: \"requests.example.com/foo\": is an invalid extended resource name"
+            ),
+            "{err}"
+        );
+        assert!(
+            err.contains(
+                "extenders[0].managedResources[3].name: Invalid value: \"bad name/x\": prefix part"
+            ),
+            "{err}"
+        );
+        assert!(
+            !err.contains("managedResources[3].name: Invalid value: \"bad name/x\": is an invalid"),
+            "{err}"
+        );
     }
 
     // validation.go:58-67: duplicate schedulerName across profiles.
