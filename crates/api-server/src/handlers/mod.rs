@@ -20,6 +20,7 @@ pub mod deployment;
 pub mod deviceclass;
 pub mod external_metrics;
 pub mod list_options;
+pub mod metric_selectors;
 pub use rusternetes_discovery as discovery;
 pub mod aggregator;
 pub mod apiservice;

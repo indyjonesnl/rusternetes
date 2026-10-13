@@ -6,10 +6,10 @@ use axum::{
 use chrono::Utc;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
+    label_selector::LabelOperator,
     resources::{ExternalMetricValue, ExternalMetricValueList},
     Result,
 };
-use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -22,12 +22,6 @@ fn external_metric_type_meta(kind: &str) -> rusternetes_common::types::TypeMeta 
 }
 use tracing::{info, warn};
 
-#[derive(Debug, Deserialize)]
-pub struct ExternalMetricQuery {
-    #[serde(rename = "labelSelector")]
-    label_selector: Option<String>,
-}
-
 /// GET /apis/external.metrics.k8s.io/v1beta1/namespaces/{namespace}/{metric}
 ///
 /// Lists values for a global (external) metric. The HPA controller's `External`
@@ -37,7 +31,6 @@ pub async fn list_external_metrics(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, metric_name)): Path<(String, String)>,
-    Query(query): Query<ExternalMetricQuery>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<ExternalMetricValueList>> {
     info!(
@@ -56,28 +49,21 @@ pub async fn list_external_metrics(
     }
 
     crate::handlers::validate_synthesized_list_options(&params)?;
-    crate::handlers::filtering::validate_label_selector_param(&params)?;
 
-    // Parse the label selector into both a map (for Prometheus) and the labels
-    // echoed back on each metric value.
-    let label_map: Option<HashMap<String, String>> = query.label_selector.as_ref().map(|sel| {
-        sel.split(',')
-            .filter_map(|pair| {
-                let mut parts = pair.splitn(2, '=');
-                match (parts.next(), parts.next()) {
-                    (Some(k), Some(v)) => Some((k.trim().to_string(), v.trim().to_string())),
-                    _ => None,
-                }
-            })
-            .collect()
-    });
-    let metric_labels: Option<BTreeMap<String, String>> = label_map
-        .as_ref()
-        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+    // external_metrics/reststorage.go:73-77: `options.LabelSelector` (decoded
+    // by ListResource; a parse failure is a 400) is the metric selector.
+    let metric_selector = crate::handlers::metric_selectors::decode_label_selector(&params)?;
 
-    let value = if let Some(ref prometheus_client) = state.prometheus_client {
-        match prometheus_client
-            .query_external_metric(&metric_name, &namespace, label_map.as_ref())
+    // `GetExternalMetric` (provider.go:312-327): a series whose labels do not
+    // satisfy the selector is not returned. The built-in series carries no
+    // labels. With Prometheus the selector becomes series matchers (the
+    // Rusternetes-only mapping of `prometheus_client::promql_matchers`), and
+    // the labels echoed are the ones the selector pins by equality.
+    let (value, metric_labels) = if let Some(ref prometheus_client) = state.prometheus_client {
+        let matchers = crate::prometheus_client::promql_matchers(&metric_selector)
+            .map_err(|e| crate::handlers::metric_selectors::unknown_error(e.to_string()))?;
+        let value = match prometheus_client
+            .query_external_metric(&metric_name, &namespace, &matchers)
             .await
         {
             Ok(v) => v,
@@ -88,20 +74,37 @@ pub async fn list_external_metrics(
                 );
                 "0".to_string()
             }
-        }
-    } else {
+        };
+        let pinned: BTreeMap<String, String> = metric_selector
+            .requirements()
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.operator(),
+                    LabelOperator::Equals | LabelOperator::DoubleEquals
+                )
+            })
+            .filter_map(|r| Some((r.key().to_string(), r.values()?.first()?.clone())))
+            .collect();
+        (Some(value), (!pinned.is_empty()).then_some(pinned))
+    } else if metric_selector.matches(&HashMap::new()) {
         // Fallback mock value when Prometheus is not configured.
-        "100".to_string()
+        (Some("100".to_string()), None)
+    } else {
+        (None, None)
     };
 
-    let items = vec![ExternalMetricValue {
-        type_meta: external_metric_type_meta("ExternalMetricValue"),
-        metric_name: metric_name.clone(),
-        metric_labels,
-        timestamp: Utc::now(),
-        window: Some("60s".to_string()),
-        value,
-    }];
+    let items: Vec<ExternalMetricValue> = value
+        .into_iter()
+        .map(|value| ExternalMetricValue {
+            type_meta: external_metric_type_meta("ExternalMetricValue"),
+            metric_name: metric_name.clone(),
+            metric_labels: metric_labels.clone(),
+            timestamp: Utc::now(),
+            window: Some("60s".to_string()),
+            value,
+        })
+        .collect();
 
     let list = ExternalMetricValueList {
         type_meta: external_metric_type_meta("ExternalMetricValueList"),
