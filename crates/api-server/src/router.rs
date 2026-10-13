@@ -2896,4 +2896,23 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
     .layer(axum::middleware::from_fn(
         crate::handlers::list_options::list_snapshot_middleware,
     ))
+    // `WithPanicRecovery` (apiserver/pkg/server/filters/wrap.go:30-58): the
+    // outermost recovery; a panicking handler answers `http.Error(w,
+    // "This request caused apiserver to panic. Look in the logs for
+    // details.", 500)` instead of dropping the connection.
+    .layer(tower_http::catch_panic::CatchPanicLayer::custom(
+        |_panic: Box<dyn std::any::Any + Send + 'static>| {
+            tracing::error!("apiserver panic'd");
+            // `http.Error`: text/plain body plus a trailing newline.
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    "text/plain; charset=utf-8",
+                )],
+                "This request caused apiserver to panic. Look in the logs for details.\n",
+            )
+                .into_response()
+        },
+    ))
 }
