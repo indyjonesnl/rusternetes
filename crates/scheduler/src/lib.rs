@@ -5,6 +5,7 @@ pub mod diagnosis;
 pub mod framework;
 #[allow(dead_code)]
 pub mod plugins;
+pub mod profile;
 pub mod scheduler;
 pub mod scheduler_config;
 pub mod volume_assume;

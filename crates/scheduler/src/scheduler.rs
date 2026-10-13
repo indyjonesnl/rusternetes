@@ -91,6 +91,22 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         }
     }
 
+    /// Construct over a multi-profile [`crate::profile::Map`].
+    pub fn new_with_profiles(
+        storage: Arc<S>,
+        interval_secs: u64,
+        profiles: crate::profile::Map,
+    ) -> Self {
+        let first = profiles.names().first().map(|s| s.to_string()).unwrap();
+        Self::new_with_name(storage, interval_secs, first)
+    }
+
+    /// `frameworkForPod` (schedule_one.go:390-396).
+    pub(crate) fn profile_for(&self, pod: &Pod) -> Result<&crate::profile::Profile, String> {
+        let _ = pod;
+        Err("unimplemented".into())
+    }
+
     /// Apply validated `VolumeBindingArgs` (see `scheduler_config`): the bind
     /// timeout and the capacity-scoring shape.
     pub fn with_volume_binding_args(
@@ -2625,6 +2641,97 @@ mod tests {
         assert_eq!(
             ev.message,
             "Successfully assigned default/sched-pod to node-1"
+        );
+    }
+
+    /// #3346: with several profiles the scheduler schedules every pod whose
+    /// `spec.schedulerName` names a profile (`responsibleForPod`,
+    /// eventhandlers.go:474-476), reports each Scheduled event under that
+    /// profile's name (`NewRecorderFactory`, profile.go:79-84), and leaves pods
+    /// of unknown scheduler names alone.
+    #[tokio::test]
+    async fn test_multi_profile_routes_pods_by_scheduler_name() {
+        use rusternetes_common::resources::{Event, ObjectReference};
+        let storage = Arc::new(MemoryStorage::new());
+        let profiles = crate::profile::Map::new_map(vec![
+            crate::profile::Profile::named("default-scheduler"),
+            crate::profile::Profile::named("my-sched"),
+        ])
+        .unwrap();
+        let scheduler = Scheduler::new_with_profiles(storage.clone(), 1, profiles);
+        storage
+            .create("/registry/nodes/node-1", &make_node("node-1"))
+            .await
+            .unwrap();
+        for (name, sn) in [
+            ("p-default", "default-scheduler"),
+            ("p-mine", "my-sched"),
+            ("p-other", "other-sched"),
+        ] {
+            let mut pod = make_pending_pod(name, "default");
+            pod.metadata.uid = format!("{name}-uid");
+            pod.spec.as_mut().unwrap().scheduler_name = Some(sn.to_string());
+            storage
+                .create(&format!("/registry/pods/default/{name}"), &pod)
+                .await
+                .unwrap();
+        }
+        scheduler.schedule_pending_pods().await.unwrap();
+        let node_of = |name: &'static str| {
+            let storage = storage.clone();
+            async move {
+                storage
+                    .get::<Pod>(&format!("/registry/pods/default/{name}"))
+                    .await
+                    .unwrap()
+                    .spec
+                    .and_then(|s| s.node_name)
+            }
+        };
+        assert_eq!(node_of("p-default").await.as_deref(), Some("node-1"));
+        assert_eq!(node_of("p-mine").await.as_deref(), Some("node-1"));
+        assert_eq!(node_of("p-other").await, None);
+        for (name, comp) in [("p-default", "default-scheduler"), ("p-mine", "my-sched")] {
+            let involved = ObjectReference {
+                kind: Some("Pod".to_string()),
+                namespace: Some("default".to_string()),
+                name: Some(name.to_string()),
+                uid: Some(format!("{name}-uid")),
+                api_version: Some("v1".to_string()),
+                resource_version: None,
+                field_path: None,
+            };
+            let key = format!(
+                "/registry/events/default/{}",
+                Event::generate_name(&involved, "Scheduled")
+            );
+            let ev: Event = storage.get(&key).await.unwrap();
+            assert_eq!(ev.source.component, comp, "{name}");
+        }
+    }
+
+    /// #3346: the `VolumeBinding` bind timeout is read from the pod's own
+    /// profile (each profile has its own framework + plugin args).
+    #[tokio::test]
+    async fn test_profile_for_pod_resolves_per_profile_args() {
+        let mut slow = crate::profile::Profile::named("slow");
+        slow.volume_bind_timeout = Duration::from_secs(7);
+        let profiles = crate::profile::Map::new_map(vec![
+            crate::profile::Profile::named("default-scheduler"),
+            slow,
+        ])
+        .unwrap();
+        let scheduler = Scheduler::new_with_profiles(Arc::new(MemoryStorage::new()), 1, profiles);
+        let mut pod = make_pending_pod("x", "default");
+        pod.spec.as_mut().unwrap().scheduler_name = Some("slow".to_string());
+        assert_eq!(
+            scheduler.profile_for(&pod).unwrap().volume_bind_timeout,
+            Duration::from_secs(7)
+        );
+        pod.spec.as_mut().unwrap().scheduler_name = Some("nope".to_string());
+        assert_eq!(
+            scheduler.profile_for(&pod).unwrap_err(),
+            "profile not found for scheduler name \"nope\""
         );
     }
 

@@ -12,6 +12,7 @@ mod diagnosis;
 mod framework;
 #[allow(dead_code)]
 mod plugins;
+mod profile;
 mod scheduler;
 mod scheduler_config;
 #[allow(dead_code)] // library API surface (informer delete/new); partly unused by the binary
