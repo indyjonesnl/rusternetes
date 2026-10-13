@@ -106,8 +106,12 @@ impl ApiServerState {
             storage,
             token_manager,
             bootstrap_token_manager: Arc::new(BootstrapTokenManager::new()),
-            unfiltered_authorizer: authorizer.clone(),
-            authorizer,
+            // `WithAuthorization` records its metrics around every authorize
+            // call (filters/authorization.go:57-99).
+            authorizer: rusternetes_common::authz_filter_metrics::filter_instrumented(
+                authorizer.clone(),
+            ),
+            unfiltered_authorizer: authorizer,
             metrics,
             skip_auth,
             cluster_ip_allocators,

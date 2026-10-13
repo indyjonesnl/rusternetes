@@ -222,8 +222,10 @@ fn policy_scope(
     state: &ApiServerState,
     subresource: Option<&'static str>,
 ) -> RequestScope<ValidatingAdmissionPolicy> {
-    let (store, status_store) =
-        validatingadmissionpolicy::new_stores(state.storage.clone(), state.authorizer.clone());
+    let (store, status_store) = validatingadmissionpolicy::new_stores(
+        state.storage.clone(),
+        state.unfiltered_authorizer.clone(),
+    );
     RequestScope {
         kind: GroupVersionKind {
             group: "admissionregistration.k8s.io".to_string(),
@@ -394,7 +396,7 @@ fn binding_scope(state: &ApiServerState) -> RequestScope<ValidatingAdmissionPoli
         subresource: None,
         store: Box::new(validatingadmissionpolicybinding::new_store(
             state.storage.clone(),
-            state.authorizer.clone(),
+            state.unfiltered_authorizer.clone(),
         )),
         apply: Some(crate::ssa::apply_legacy::<ValidatingAdmissionPolicyBinding>),
         convert_to_internal: Some(validatingadmissionpolicybinding::convert_to_internal),

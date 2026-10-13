@@ -3,6 +3,7 @@ pub mod affinity;
 pub mod audit;
 pub mod auth;
 pub mod authz;
+pub mod authz_filter_metrics;
 pub mod build_info;
 pub mod cel;
 pub mod cel_dra;

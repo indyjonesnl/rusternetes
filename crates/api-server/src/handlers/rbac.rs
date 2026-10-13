@@ -62,7 +62,7 @@ fn role_scope(state: &ApiServerState) -> RequestScope<Role> {
         subresource: None,
         store: Box::new(role::new_store(
             state.storage.clone(),
-            state.authorizer.clone(),
+            state.unfiltered_authorizer.clone(),
         )),
         apply: Some(crate::ssa::apply_legacy::<Role>),
         convert_to_internal: None,
@@ -293,7 +293,7 @@ fn rolebinding_scope(state: &ApiServerState) -> RequestScope<RoleBinding> {
         subresource: None,
         store: Box::new(rolebinding::new_store(
             state.storage.clone(),
-            state.authorizer.clone(),
+            state.unfiltered_authorizer.clone(),
         )),
         apply: Some(crate::ssa::apply_legacy::<RoleBinding>),
         convert_to_internal: Some(rolebinding::convert_to_internal),
@@ -540,7 +540,7 @@ fn clusterrole_scope(state: &ApiServerState) -> RequestScope<ClusterRole> {
         subresource: None,
         store: Box::new(clusterrole::new_store(
             state.storage.clone(),
-            state.authorizer.clone(),
+            state.unfiltered_authorizer.clone(),
         )),
         apply: Some(crate::ssa::apply_legacy::<ClusterRole>),
         convert_to_internal: None,
@@ -725,7 +725,7 @@ fn clusterrolebinding_scope(state: &ApiServerState) -> RequestScope<ClusterRoleB
         subresource: None,
         store: Box::new(clusterrolebinding::new_store(
             state.storage.clone(),
-            state.authorizer.clone(),
+            state.unfiltered_authorizer.clone(),
         )),
         apply: Some(crate::ssa::apply_legacy::<ClusterRoleBinding>),
         convert_to_internal: Some(clusterrolebinding::convert_to_internal),

@@ -92,7 +92,7 @@ pub async fn create_subject_access_review(
     };
 
     // Perform the authorization check
-    let decision = state.authorizer.authorize(&check_attrs).await?;
+    let decision = state.unfiltered_authorizer.authorize(&check_attrs).await?;
 
     sar.status = Some(SubjectAccessReviewStatus {
         allowed: matches!(decision, Decision::Allow),
@@ -189,7 +189,7 @@ pub async fn create_self_subject_access_review(
     };
 
     // Perform the authorization check
-    let decision = state.authorizer.authorize(&check_attrs).await?;
+    let decision = state.unfiltered_authorizer.authorize(&check_attrs).await?;
 
     ssar.status = Some(SubjectAccessReviewStatus {
         allowed: matches!(decision, Decision::Allow),
@@ -293,7 +293,7 @@ pub async fn create_local_subject_access_review(
     };
 
     // Perform the authorization check
-    let decision = state.authorizer.authorize(&check_attrs).await?;
+    let decision = state.unfiltered_authorizer.authorize(&check_attrs).await?;
 
     lsar.status = Some(SubjectAccessReviewStatus {
         allowed: matches!(decision, Decision::Allow),
