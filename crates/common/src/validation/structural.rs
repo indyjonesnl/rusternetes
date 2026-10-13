@@ -15,17 +15,12 @@
 //! The consumer is the `NonStructuralSchema` condition
 //! (`nonstructuralschema_controller.go:102-122`).
 //!
-//! Deviations, stated deliberately:
+//! `pattern` is checked by [`crate::validation::go_regexp::compile`], a port
+//! of Go's `regexp/syntax` parser, so the error text is Go's.
 //!
-//! - `properties` are a `BTreeMap` (upstream: a Go map walked in random order,
-//!   with the resulting errors then sorted by message). The final sort is
-//!   ported, so output order is the same.
-//! - `pattern` is compiled with the Rust `regex` crate (RE2-like, as Go's
-//!   `regexp` is); the *wording* of the compile error after
-//!   `must be a valid regular expression, but isn't:` is the Rust crate's, not
-//!   Go's.
-//! - Not ported: `ToKubeOpenAPI`/`kubeopenapi.go`, `unfold.go`, `skeleton.go`
-//!   and the visitor helpers; nothing in Rusternetes consumes them yet.
+//! `properties` are a `BTreeMap` (upstream: a Go map walked in random order,
+//! with the resulting errors then sorted by message); the final sort is
+//! ported, so output order is the same.
 
 use std::collections::BTreeMap;
 
@@ -678,7 +673,7 @@ fn validate_value_validation(
     ));
 
     if !v.pattern.is_empty() {
-        if let Err(e) = regex::Regex::new(&v.pattern) {
+        if let Err(e) = crate::validation::go_regexp::compile(&v.pattern) {
             all_errs.push(Error::invalid(
                 &fld_path.child("pattern"),
                 v.pattern.as_str(),

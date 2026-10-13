@@ -24,6 +24,7 @@ pub mod events;
 pub mod field;
 pub mod flowcontrol_bootstrap;
 pub mod flowschema;
+pub mod go_regexp;
 pub mod gomail;
 pub mod hpa;
 pub mod ingress;
