@@ -8,6 +8,7 @@ pub mod cel;
 pub mod cel_dra;
 pub mod cel_env;
 pub mod cel_struct;
+pub mod cel_versions;
 pub mod cloud_provider;
 pub mod clusterauthenticationtrust;
 pub mod compatibility;
