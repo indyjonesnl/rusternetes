@@ -6,12 +6,14 @@
 //! here a process-global [`Registry`] plays that role (same pattern as
 //! [`super::cidrset_metrics`]) and is served by `gather_metrics`.
 //!
-//! Only the four series the controller sets today are ported:
-//! `zone_health`, `zone_size`, `unhealthy_nodes_in_zone`, `evictions_total`.
-//! The two `update_*_health_duration_seconds` histograms belong to
-//! `tryUpdateNodeHealth`, which this controller does not have.
+//! All six series are ported: `zone_health`, `zone_size`,
+//! `unhealthy_nodes_in_zone`, `evictions_total` and the two
+//! `update_*_health_duration_seconds` histograms (`tryUpdateNodeHealth`'s).
 
-use prometheus::{Encoder, GaugeVec, IntCounterVec, Opts, Registry, TextEncoder};
+use prometheus::{
+    exponential_buckets, Encoder, GaugeVec, Histogram, HistogramOpts, IntCounterVec, Opts,
+    Registry, TextEncoder,
+};
 use std::sync::LazyLock;
 
 const SUBSYSTEM: &str = "node_collector";
@@ -27,6 +29,8 @@ struct Series {
     zone_size: GaugeVec,
     unhealthy_nodes: GaugeVec,
     evictions_total: IntCounterVec,
+    update_node_health: Histogram,
+    update_all_nodes_health: Histogram,
 }
 
 static SERIES: LazyLock<Series> = LazyLock::new(|| {
@@ -63,6 +67,32 @@ static SERIES: LazyLock<Series> = LazyLock::new(|| {
         LABEL,
     )
     .expect("valid opts");
+    // metrics.go:75-92: `ExponentialBuckets(0.001, 4, 8)` (1ms -> ~15s) and
+    // `ExponentialBuckets(0.01, 4, 8)` (10ms -> ~3m).
+    let update_node_health = Histogram::with_opts(
+        HistogramOpts::new(
+            "update_node_health_duration_seconds",
+            "Duration in seconds for NodeController to update the health of a single node.",
+        )
+        .subsystem(SUBSYSTEM)
+        .buckets(exponential_buckets(0.001, 4.0, 8).expect("valid buckets")),
+    )
+    .expect("valid opts");
+    let update_all_nodes_health = Histogram::with_opts(
+        HistogramOpts::new(
+            "update_all_nodes_health_duration_seconds",
+            "Duration in seconds for NodeController to update the health of all nodes.",
+        )
+        .subsystem(SUBSYSTEM)
+        .buckets(exponential_buckets(0.01, 4.0, 8).expect("valid buckets")),
+    )
+    .expect("valid opts");
+    registry
+        .register(Box::new(update_node_health.clone()))
+        .expect("register once");
+    registry
+        .register(Box::new(update_all_nodes_health.clone()))
+        .expect("register once");
     registry
         .register(Box::new(zone_health.clone()))
         .expect("register once");
@@ -81,8 +111,30 @@ static SERIES: LazyLock<Series> = LazyLock::new(|| {
         zone_size,
         unhealthy_nodes,
         evictions_total,
+        update_node_health,
+        update_all_nodes_health,
     }
 });
+
+/// `updateNodeHealthDuration.Observe(..)` (`node_lifecycle_controller.go:699-701`).
+pub fn observe_update_node_health(seconds: f64) {
+    SERIES.update_node_health.observe(seconds);
+}
+
+/// `updateAllNodesHealthDuration.Observe(..)` (`node_lifecycle_controller.go:672-674`).
+pub fn observe_update_all_nodes_health(seconds: f64) {
+    SERIES.update_all_nodes_health.observe(seconds);
+}
+
+#[cfg(test)]
+pub fn update_node_health_count() -> u64 {
+    SERIES.update_node_health.get_sample_count()
+}
+
+#[cfg(test)]
+pub fn update_all_nodes_health_count() -> u64 {
+    SERIES.update_all_nodes_health.get_sample_count()
+}
 
 /// `zoneSize/zoneHealth/unhealthyNodes.WithLabelValues(zone).Set(..)`
 /// (`node_lifecycle_controller.go:1001-1004`).
