@@ -185,6 +185,25 @@ async fn removing_a_non_webhook_type_is_refused() {
     assert!(allowed(&a).await);
 }
 
+// newForConfig (reload.go:107-110 and siblings): a type that was not enabled
+// at startup cannot be added by a reload.
+#[tokio::test]
+async fn adding_a_type_not_enabled_at_startup_is_refused() {
+    let d = dir();
+    let allow = serve(true).await;
+    let cfg = d.join("authz.yaml");
+    write(&cfg, &webhook(&kubeconfig(&d, "a", &allow)));
+    let a = build(&cfg);
+    assert!(allowed(&a).await);
+    let before = counter(RELOADS, "status", "failure");
+    let rbac = "- type: RBAC\n  name: rbac\n";
+    write(
+        &cfg,
+        &format!("{}{rbac}", webhook(&kubeconfig(&d, "b", &allow))),
+    );
+    assert!(counter_reaches(RELOADS, "status", "failure", before + 1.0).await);
+}
+
 // authorizationmetrics.InstrumentedAuthorizer (metrics.go:57-86).
 #[tokio::test]
 async fn terminal_decisions_are_counted_by_type_name_decision() {
