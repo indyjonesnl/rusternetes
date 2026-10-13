@@ -1562,6 +1562,45 @@ mod tests {
         );
     }
 
+    /// `celBind` reports at `varIdent.ID()` (ext/bindings.go:178): the ID of
+    /// an operator-led expression is its operator token (parser.go:469-760:
+    /// `.` of a select, `(` of a call, `[` of an index, the binary operator,
+    /// `?` of a conditional, the middle `||`/`&&` of a balanced chain).
+    #[test]
+    fn cel_bind_non_identifier_error_column_is_the_expression_id_offset() {
+        let col = |arg: &str| -> usize {
+            let d = invalid(&format!("cel.bind({arg}, 1, true)")).unwrap();
+            let rest = d
+                .split("<input>:1:")
+                .nth(1)
+                .unwrap_or_else(|| panic!("{d}"));
+            rest.split(':').next().unwrap().parse().unwrap()
+        };
+        // arg starts at column 10.
+        for (arg, want) in [
+            ("1", 10),
+            ("-1", 10),
+            ("a.b", 11),
+            ("f(x)", 11),
+            ("x.size()", 16),
+            ("a + b", 12),
+            ("a * b + c", 16),
+            ("a < b", 12),
+            ("a in b", 12),
+            ("a[0]", 11),
+            ("!a", 10),
+            ("-a", 10),
+            ("[1]", 10),
+            ("a ? b : c", 12),
+            ("a || b || c", 17),
+            ("a && b", 12),
+            ("(a.b)", 12),
+            ("\"s,\".size()", 19),
+        ] {
+            assert_eq!(col(arg), want, "{arg}");
+        }
+    }
+
     #[test]
     fn index_key_type_mismatch_reports_position() {
         let d = invalid("device.attributes[true].someBoolean").unwrap();
