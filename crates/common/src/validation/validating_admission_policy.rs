@@ -803,3 +803,44 @@ fn validate_field_ref(field_ref: &str, fld_path: &Path) -> ErrorList {
     }
     Vec::new()
 }
+
+#[cfg(test)]
+mod field_ref_tests {
+    use super::*;
+
+    /// Upstream `TestValidateValidatingAdmissionPolicyStatus`
+    /// (`validation_test.go:4150-4199`): "type checking bad json path" expects
+    /// `invalid JSONPath: invalid array index foo`; the good path and the two
+    /// `Required value` cases accept/reject as before.
+    #[test]
+    fn field_ref_bad_json_path_is_invalid() {
+        let path = Path::new("fieldRef");
+        let errs = validate_field_ref("spec[foo]", &path);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert_eq!(
+            errs[0].to_string(),
+            "fieldRef: Invalid value: \"spec[foo]\": invalid JSONPath: invalid array index foo"
+        );
+    }
+
+    #[test]
+    fn field_ref_good_and_missing() {
+        let path = Path::new("fieldRef");
+        assert!(validate_field_ref("spec.validations[0].expression", &path).is_empty());
+        assert_eq!(
+            validate_field_ref("  ", &path)[0].to_string(),
+            "fieldRef: Required value"
+        );
+    }
+
+    /// The bad value is the TRIMMED fieldRef (`validation.go:1288`).
+    #[test]
+    fn field_ref_invalid_reports_trimmed_value() {
+        let path = Path::new("fieldRef");
+        let errs = validate_field_ref("  spec[foo]  ", &path);
+        assert_eq!(
+            errs[0].to_string(),
+            "fieldRef: Invalid value: \"spec[foo]\": invalid JSONPath: invalid array index foo"
+        );
+    }
+}
