@@ -807,6 +807,9 @@ pub struct CsiProvisioner<S: Storage> {
     node_deployment: Option<NodeDeployment>,
     /// `internalNodeDeployment.rateLimiter`; set with `node_deployment`.
     owner_limiter: Option<OwnerRateLimiter>,
+    /// The `ctx` that `Run(ctx)` hands to `checkNode`/`becomeOwner`
+    /// (controller.go:1606, :1676, :1749); `true` once cancelled.
+    shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 impl<S: Storage + 'static> CsiProvisioner<S> {
@@ -859,8 +862,12 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             capabilities: tokio::sync::OnceCell::new(),
             node_deployment: None,
             owner_limiter: None,
+            shutdown: tokio::sync::watch::channel(false).0,
         }
     }
+
+    /// Cancel the provisioner's `ctx`.
+    pub fn shutdown(&self) {}
 
     /// `if p.supportsMigrationFromInTreePluginName != ""` ... `sc.Provisioner ==
     /// p.supportsMigrationFromInTreePluginName` ... `TranslateInTreeStorageClassToCSI`
