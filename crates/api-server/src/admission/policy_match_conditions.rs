@@ -663,4 +663,310 @@ mod tests {
         match_named("m-true", vec![t(""), t("")], false, None).await;
         assert_eq!(observed("m-true"), (0, 0));
     }
+
+    /// The `authorizer` library in `matchConditions`: ported from
+    /// `admission/plugin/cel/condition_test.go` `TestCondition`
+    /// ("test authorizer ..." cases, :478-785), evaluated through the matcher
+    /// that hands `Match`'s `authz` to the activation (matcher.go:80-86).
+    mod authorizer_library {
+        use super::*;
+        use rusternetes_common::auth::UserInfo;
+        use rusternetes_common::authz::{Decision, Opinion, RequestAttributes};
+        use rusternetes_common::Error;
+
+        type Outcome = Result<Opinion, String>;
+
+        /// `fakeAuthorizer`: the `expect` attributes get `match_result`, any
+        /// other request gets `default_result`.
+        struct Fake {
+            expect: Option<RequestAttributes>,
+            match_result: Outcome,
+            default_result: Outcome,
+        }
+
+        impl Fake {
+            fn allow_match(expect: RequestAttributes) -> Self {
+                Self {
+                    expect: Some(expect),
+                    match_result: Ok(Opinion::Allow),
+                    default_result: Ok(Opinion::Deny(String::new())),
+                }
+            }
+            /// `denyAll`.
+            fn deny_all() -> Self {
+                Self {
+                    expect: None,
+                    match_result: Ok(Opinion::Allow),
+                    default_result: Ok(Opinion::Deny("fake reason".into())),
+                }
+            }
+            /// `errorAll`.
+            fn error_all() -> Self {
+                Self {
+                    expect: None,
+                    match_result: Ok(Opinion::Allow),
+                    default_result: Err("fake authz error".into()),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl Authorizer for Fake {
+            async fn authorize(
+                &self,
+                attrs: &RequestAttributes,
+            ) -> rusternetes_common::Result<Decision> {
+                match self.authorize_opinion(attrs).await? {
+                    Opinion::Allow => Ok(Decision::Allow),
+                    Opinion::Deny(r) => Ok(Decision::Deny(r)),
+                    Opinion::NoOpinion { reason, .. } => Ok(Decision::Deny(reason)),
+                }
+            }
+            async fn authorize_opinion(
+                &self,
+                attrs: &RequestAttributes,
+            ) -> rusternetes_common::Result<Opinion> {
+                let matched = self
+                    .expect
+                    .as_ref()
+                    .is_some_and(|e| format!("{e:?}") == format!("{attrs:?}"));
+                let r = if matched {
+                    &self.match_result
+                } else {
+                    &self.default_result
+                };
+                r.clone().map_err(Error::Authorization)
+            }
+            async fn get_user_rules(
+                &self,
+                _: &UserInfo,
+                _: &str,
+            ) -> rusternetes_common::Result<(
+                Vec<rusternetes_common::resources::ResourceRule>,
+                Vec<rusternetes_common::resources::NonResourceRule>,
+            )> {
+                Ok((vec![], vec![]))
+            }
+        }
+
+        fn no_user() -> UserInfo {
+            UserInfo {
+                username: String::new(),
+                uid: String::new(),
+                groups: vec![],
+                extra: Default::default(),
+            }
+        }
+
+        fn endpoints_attrs(subresource: &str) -> (Attributes, VersionedAttributes) {
+            let (mut a, v) = attrs(Some(json!({"metadata": {"name": "endpoints1"}})));
+            a.resource = GroupVersionResource {
+                group: String::new(),
+                version: "v1".into(),
+                resource: "endpoints".into(),
+            };
+            a.subresource = subresource.into();
+            a.name = "endpoints1".into();
+            (a, v)
+        }
+
+        fn resource(verb: &str) -> RequestAttributes {
+            let mut r = RequestAttributes::new(no_user(), verb, "endpoints");
+            r.api_version = "*".into();
+            r
+        }
+
+        fn deployments(verb: &str) -> RequestAttributes {
+            let mut r = resource(verb);
+            r.api_group = "apps".into();
+            r.resource = "deployments".into();
+            r.subresource = Some("status".into());
+            r.namespace = Some("test".into());
+            r.name = Some("backend".into());
+            r
+        }
+
+        /// Each expression is matched as its own single condition.
+        async fn eval(
+            exprs: &[&str],
+            attrs: (Attributes, VersionedAttributes),
+            authz: Fake,
+        ) -> Vec<Result<bool, String>> {
+            let authz: Arc<dyn Authorizer> = Arc::new(authz);
+            let mut out = Vec::new();
+            for e in exprs {
+                let m = new_matcher(&[cond("c", e)], &[], None, "test");
+                let r = m.matches(&attrs.0, &attrs.1, None, authz.as_ref()).await;
+                out.push(match (r.error, r.matches) {
+                    (Some(e), _) => Err(e),
+                    (None, m) => Ok(m),
+                });
+            }
+            out
+        }
+
+        #[tokio::test]
+        async fn allow_resource_check() {
+            let r = eval(
+                &[
+                    "authorizer.group('').resource('endpoints').check('create').allowed()",
+                    "!authorizer.group('').resource('endpoints').check('create').errored()",
+                ],
+                endpoints_attrs(""),
+                Fake::allow_match(resource("create")),
+            )
+            .await;
+            assert_eq!(r, vec![Ok(true), Ok(true)]);
+        }
+
+        #[tokio::test]
+        async fn allow_resource_check_with_all_fields() {
+            let mut want = deployments("create");
+            want.set_selectors("foo=bar", "apple=banana");
+            assert!(!want.field_selector_requirements.is_empty());
+            assert!(!want.label_selector_requirements.is_empty());
+            let r = eval(
+                &["authorizer.group('apps').resource('deployments').fieldSelector('foo=bar').labelSelector('apple=banana').subresource('status').namespace('test').name('backend').check('create').allowed()"],
+                endpoints_attrs(""),
+                Fake::allow_match(want),
+            )
+            .await;
+            assert_eq!(r, vec![Ok(true)]);
+        }
+
+        #[tokio::test]
+        async fn allow_resource_check_with_selector_parse_failures() {
+            let mut want = deployments("create");
+            want.set_selectors("foo badoperator bar", "apple badoperator banana");
+            assert!(want.field_selector_parsing_err.is_some());
+            assert!(want.label_selector_parsing_err.is_some());
+            let r = eval(
+                &["authorizer.group('apps').resource('deployments').fieldSelector('foo badoperator bar').labelSelector('apple badoperator banana').subresource('status').namespace('test').name('backend').check('create').allowed()"],
+                endpoints_attrs(""),
+                Fake::allow_match(want),
+            )
+            .await;
+            assert_eq!(r, vec![Ok(true)]);
+        }
+
+        #[tokio::test]
+        async fn not_allowed_when_one_field_differs() {
+            let mut want = deployments("create");
+            want.resource = "deployments-xxxx".into();
+            let r = eval(
+                &["authorizer.group('apps').resource('deployments').subresource('status').namespace('test').name('backend').check('create').allowed() == false"],
+                endpoints_attrs(""),
+                Fake::allow_match(want),
+            )
+            .await;
+            assert_eq!(r, vec![Ok(true)]);
+        }
+
+        #[tokio::test]
+        async fn reason() {
+            let r = eval(
+                &["authorizer.group('').resource('endpoints').check('create').reason() == 'fake reason'"],
+                endpoints_attrs(""),
+                Fake::deny_all(),
+            )
+            .await;
+            assert_eq!(r, vec![Ok(true)]);
+        }
+
+        #[tokio::test]
+        async fn error() {
+            let r = eval(
+                &[
+                    "authorizer.group('').resource('endpoints').check('create').errored()",
+                    "authorizer.group('').resource('endpoints').check('create').error() == 'fake authz error'",
+                    "!authorizer.group('').resource('endpoints').check('create').allowed()",
+                ],
+                endpoints_attrs(""),
+                Fake::error_all(),
+            )
+            .await;
+            assert_eq!(r, vec![Ok(true), Ok(true), Ok(true)]);
+        }
+
+        #[tokio::test]
+        async fn path_check() {
+            let want = RequestAttributes::new_non_resource(no_user(), "get", "/healthz");
+            let r = eval(
+                &[
+                    "authorizer.path('/healthz').check('get').allowed()",
+                    "authorizer.path('/other').check('get').allowed() == false",
+                ],
+                endpoints_attrs(""),
+                Fake::allow_match(want),
+            )
+            .await;
+            assert_eq!(r, vec![Ok(true), Ok(true)]);
+            let r = eval(
+                &["authorizer.path('/healthz').check('get').allowed() == false"],
+                endpoints_attrs(""),
+                Fake::deny_all(),
+            )
+            .await;
+            assert_eq!(r, vec![Ok(true)]);
+        }
+
+        #[tokio::test]
+        async fn request_resource() {
+            let mut want = resource("custom-verb");
+            want.namespace = Some("default".into());
+            want.name = Some("endpoints1".into());
+            let r = eval(
+                &["authorizer.requestResource.check('custom-verb').allowed()"],
+                endpoints_attrs(""),
+                Fake::allow_match(want.clone()),
+            )
+            .await;
+            assert_eq!(r, vec![Ok(true)]);
+            want.subresource = Some("status".into());
+            let r = eval(
+                &["authorizer.requestResource.check('custom-verb').allowed()"],
+                endpoints_attrs("status"),
+                Fake::allow_match(want),
+            )
+            .await;
+            assert_eq!(r, vec![Ok(true)]);
+        }
+
+        #[tokio::test]
+        async fn service_account() {
+            let mut want = resource("custom-verb");
+            want.user = UserInfo {
+                username: "system:serviceaccount:default:test-serviceaccount".into(),
+                uid: String::new(),
+                groups: vec![
+                    "system:serviceaccounts".into(),
+                    "system:serviceaccounts:default".into(),
+                ],
+                extra: Default::default(),
+            };
+            want.namespace = Some("default".into());
+            want.name = Some("endpoints1".into());
+            let r = eval(
+                &["authorizer.serviceAccount('default', 'test-serviceaccount').group('').resource('endpoints').namespace('default').name('endpoints1').check('custom-verb').allowed()"],
+                endpoints_attrs(""),
+                Fake::allow_match(want),
+            )
+            .await;
+            assert_eq!(r, vec![Ok(true)]);
+        }
+
+        /// authz.go:383-385, :404-432, :445-447: argument validation errors.
+        #[tokio::test]
+        async fn argument_validation_errors() {
+            for e in [
+                "authorizer.path('  ').check('get').allowed()",
+                "authorizer.group('').resource('  ').check('get').allowed()",
+                "authorizer.serviceAccount('not@a#valid!namespace', 'ok').group('').resource('pods').check('get').allowed()",
+                "authorizer.serviceAccount('ns', 'invalid@*name').group('').resource('pods').check('get').allowed()",
+            ] {
+                let r = eval(&[e], endpoints_attrs(""), Fake::deny_all()).await;
+                assert!(r[0].is_err(), "{e}: {r:?}");
+            }
+        }
+    }
 }
