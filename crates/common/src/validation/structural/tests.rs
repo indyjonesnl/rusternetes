@@ -629,7 +629,9 @@ fn pattern_must_compile() {
     }));
     assert_eq!(
         msgs(&validate_structural(&root(), &s)),
-        [r#"spec.versions[0].schema.openAPIV3Schema.properties[a].pattern: Invalid value: "(": must be a valid regular expression, but isn't: error parsing regexp: missing closing ): `(`"#]
+        [
+            r#"spec.versions[0].schema.openAPIV3Schema.properties[a].pattern: Invalid value: "(": must be a valid regular expression, but isn't: error parsing regexp: missing closing ): `(`"#
+        ]
     );
 }
 
