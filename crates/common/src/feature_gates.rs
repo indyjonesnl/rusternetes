@@ -2395,4 +2395,31 @@ mod tests {
         assert!(validate().is_empty());
         reset_to_defaults();
     }
+
+    // #3321: gates registered upstream but consumed by no rusternetes code
+    // are still known to `--feature-gates` (feature_gate.go:385-389 only
+    // rejects names absent from `known`).
+    #[test]
+    #[serial]
+    fn unconsumed_upstream_gates_are_recognised() {
+        reset_to_defaults();
+        // pkg/features/kube_features.go SidecarContainers: 1.33 GA + LockToDefault(true).
+        set_from_str("SidecarContainers=true").unwrap();
+        // staging/src/k8s.io/apiextensions-apiserver/pkg/features/kube_features.go
+        set_from_str("CRDValidationRatcheting=true").unwrap();
+        // staging/src/k8s.io/component-base/logs/api/v1/kube_features.go
+        set_from_str("ContextualLogging=false").unwrap();
+        reset_to_defaults();
+    }
+
+    #[test]
+    #[serial]
+    fn unconsumed_upstream_gates_honour_lock_to_default() {
+        reset_to_defaults();
+        assert_eq!(
+            set_from_str("SidecarContainers=false").unwrap_err(),
+            "cannot set feature gate SidecarContainers to false, feature is locked to true"
+        );
+        reset_to_defaults();
+    }
 }
