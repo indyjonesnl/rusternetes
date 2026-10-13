@@ -12,8 +12,8 @@
 //! leaves the applier may touch. The SSA driver
 //! ([`super::apply_via_schema`]) iterates the schema rather than hard-coding
 //! ConfigMap-specific groups. Today ConfigMap and Secret are registered;
-//! other resources still go through the legacy
-//! [`rusternetes_common::server_side_apply`] codepath.
+//! other resources go through [`super::apply_legacy`], which applies via the
+//! field manager (`rusternetes_common::fieldmanager`).
 //!
 //! The full upstream merge algorithm in
 //! `staging/src/k8s.io/apimachinery/pkg/util/managedfields/internal/typeconverter.go`
