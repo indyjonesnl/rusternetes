@@ -1064,8 +1064,8 @@ mod tests {
             Ok(self.supports_selinux)
         }
 
-        fn can_attach(&self, _spec: &Spec<'_>) -> bool {
-            self.attachable
+        fn can_attach(&self, _spec: &Spec<'_>) -> Result<bool> {
+            Ok(self.attachable)
         }
 
         fn can_device_mount(&self, _spec: &Spec<'_>) -> bool {

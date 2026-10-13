@@ -67,7 +67,7 @@ impl VolumePluginMgr {
     /// discards the error and tests only for a non-nil plugin.
     pub fn find_attachable_plugin_by_spec(&self, spec: &Spec<'_>) -> Option<&dyn VolumePlugin> {
         let plugin = self.find_plugin_by_spec(spec).ok()?;
-        plugin.can_attach(spec).then_some(plugin)
+        matches!(plugin.can_attach(spec), Ok(true)).then_some(plugin)
     }
 
     /// Port of `FindDeviceMountablePluginBySpec` (`pkg/volume/plugins.go:836-849`).
