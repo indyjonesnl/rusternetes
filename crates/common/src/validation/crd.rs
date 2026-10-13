@@ -1652,3 +1652,7 @@ AiEAhWF2/JiVNXisqXic1Dfy761y8wW/Io2IJoBMvcYxo4E=
 #[cfg(test)]
 #[path = "crd_structural_tests.rs"]
 mod structural_schema_tests;
+
+#[cfg(test)]
+#[path = "crd_selectable_tests.rs"]
+mod selectable_fields_tests;
