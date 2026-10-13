@@ -972,6 +972,19 @@ impl CrdRest {
     }
 }
 
+/// The `DeleteCollection` loop of `deleteInstances` (crd_finalizer.go:
+/// 204-229).
+pub async fn issue_delete_collections<F, Fut>(
+    _items: &[(Option<String>, String)],
+    _delete_collection: F,
+) -> std::result::Result<(), String>
+where
+    F: FnMut(RequestContext) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    Ok(())
+}
+
 /// The storage resource type of a CRD's instances.
 fn instance_resource_type(crd: &CustomResourceDefinition) -> String {
     format!(
@@ -1908,5 +1921,74 @@ mod tests {
         assert!(l.when_at("fresh", now) > Duration::from_secs(5));
         l.forget("a");
         assert_eq!(l.num_requeues("a"), 0);
+    }
+
+    fn items(v: &[(&str, &str)]) -> Vec<(Option<String>, String)> {
+        v.iter()
+            .map(|(ns, n)| (Some(ns.to_string()), n.to_string()))
+            .collect()
+    }
+
+    /// "don't retry deleting the same namespace" (crd_finalizer.go:216-219):
+    /// one `DeleteCollection` per namespace among the listed instances.
+    #[tokio::test]
+    async fn one_delete_collection_per_namespace() {
+        let calls = std::sync::Mutex::new(Vec::new());
+        let r = issue_delete_collections(
+            &items(&[("a", "x"), ("a", "y"), ("b", "z"), ("a", "w")]),
+            |ctx| {
+                calls.lock().unwrap().push(ctx.namespace.clone());
+                async { Ok(()) }
+            },
+        )
+        .await;
+        assert_eq!(r, Ok(()));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![Some("a".to_string()), Some("b".to_string())]
+        );
+    }
+
+    /// Failures do not stop the loop (`continue`, :222-225) and are returned as
+    /// `utilerrors.NewAggregate(deleteErrors)` (:227): one prints bare,
+    /// several as `[a, b]` with repeated messages once (errors.go:70-96).
+    #[tokio::test]
+    async fn delete_collection_errors_are_aggregated() {
+        let calls = std::sync::Mutex::new(0);
+        let r = issue_delete_collections(
+            &items(&[("a", "x"), ("b", "y"), ("c", "z"), ("d", "w")]),
+            |ctx| {
+                *calls.lock().unwrap() += 1;
+                let ns = ctx.namespace.clone().unwrap();
+                async move {
+                    match ns.as_str() {
+                        "a" | "d" => Err(Error::Internal("boom".into())),
+                        "b" => Err(Error::Internal("bang".into())),
+                        _ => Ok(()),
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(*calls.lock().unwrap(), 4);
+        assert_eq!(
+            r,
+            Err(format!(
+                "[{}, {}]",
+                Error::Internal("boom".into()),
+                Error::Internal("bang".into())
+            ))
+        );
+        let one = issue_delete_collections(&items(&[("a", "x")]), |_| async {
+            Err(Error::Internal("boom".into()))
+        })
+        .await;
+        assert_eq!(one, Err(Error::Internal("boom".into()).to_string()));
+        // Two identical messages collapse to one, printed bare.
+        let same = issue_delete_collections(&items(&[("a", "x"), ("b", "y")]), |_| async {
+            Err(Error::Internal("boom".into()))
+        })
+        .await;
+        assert_eq!(same, Err(Error::Internal("boom".into()).to_string()));
     }
 }
