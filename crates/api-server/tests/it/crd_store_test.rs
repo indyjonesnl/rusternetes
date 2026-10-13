@@ -337,6 +337,43 @@ async fn deleting_a_crd_deletes_its_instances() {
     assert_eq!(out["items"].as_array().map(Vec::len), Some(0), "{out}");
 }
 
+/// `deleteInstances` lists every instance of the CRD (`crClient.List(ctx,
+/// nil)`, crd_finalizer.go:195) and issues one `DeleteCollection` per
+/// namespace found among them (:206-229), whether or not a Namespace object
+/// exists for it: an instance in a namespace with no Namespace object is
+/// deleted too, so a recreated CRD does not resurrect it.
+#[tokio::test]
+async fn deleting_a_crd_deletes_instances_in_every_namespace() {
+    let api = TestApiServer::new();
+    create(&api, &crd("widgets", "Widget", "example.com")).await;
+    let cr = "/apis/example.com/v1/namespaces/ghost/widgets";
+    let (status, out) = api
+        .post(
+            cr,
+            &json!({"apiVersion": "example.com/v1", "kind": "Widget", "metadata": {"name": "w1"}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{out}");
+
+    let (status, out) = api.delete(&format!("{CRDS}/widgets.example.com")).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let mut gone = false;
+    for _ in 0..200 {
+        let (status, _) = api.get(&format!("{CRDS}/widgets.example.com")).await;
+        if status == StatusCode::NOT_FOUND {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(gone, "the CRD was never finalized");
+
+    create(&api, &crd("widgets", "Widget", "example.com")).await;
+    let (status, out) = api.get(cr).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["items"].as_array().map(Vec::len), Some(0), "{out}");
+}
+
 /// The CRD finalizer runs off its own workqueue, not inside the DELETE
 /// (finalizer/crd_finalizer.go:57-61 queue, :102-105 AddFunc/UpdateFunc
 /// enqueue, :296-308 `processNextWorkItem`): `REST.Delete` returns right after
