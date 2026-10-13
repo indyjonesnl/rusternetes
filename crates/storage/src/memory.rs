@@ -47,6 +47,11 @@ pub struct MemoryStorage {
     /// Number of remaining update() calls that will return Error::Conflict
     /// before delegating to the real update. Used by tests to inject CAS conflicts.
     conflict_update_count: Arc<AtomicUsize>,
+    /// When set, `apply()` answers `Error::UnsupportedMediaType` (a server
+    /// without Server Side Apply rejecting the apply PATCH, `415`). Test hook.
+    reject_apply: Arc<std::sync::atomic::AtomicBool>,
+    /// Number of `apply()` calls made (rejected or not). Test hook.
+    apply_calls: Arc<AtomicUsize>,
     /// Highest compacted revision. Continue tokens issued before this RV are
     /// rejected with `Error::Gone`. Used by chunking tests to simulate the
     /// etcd compaction window.
@@ -88,6 +93,8 @@ impl MemoryStorage {
             data: Arc::new(RwLock::new(HashMap::new())),
             bus: crate::EventBus::new(crate::event_bus::DEFAULT_CAPACITY),
             conflict_update_count: Arc::new(AtomicUsize::new(0)),
+            reject_apply: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            apply_calls: Arc::new(AtomicUsize::new(0)),
             compacted_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             // etcd's first revision is 1; 0 means "unset" on the wire.
             revision: Arc::new(std::sync::atomic::AtomicI64::new(1)),
@@ -212,6 +219,18 @@ impl MemoryStorage {
     pub fn inject_conflicts(&self, n: usize) {
         self.conflict_update_count.store(n, Ordering::SeqCst);
     }
+
+    /// Make every `apply()` fail with `Error::UnsupportedMediaType`, as an
+    /// api-server without Server Side Apply does. Used by tests of callers
+    /// that fall back to `Update` on `IsUnsupportedMediaType`.
+    pub fn reject_apply_as_unsupported_media_type(&self, reject: bool) {
+        self.reject_apply.store(reject, Ordering::SeqCst);
+    }
+
+    /// Number of `apply()` calls made so far.
+    pub fn apply_calls(&self) -> usize {
+        self.apply_calls.load(Ordering::SeqCst)
+    }
 }
 
 impl Default for MemoryStorage {
@@ -222,6 +241,26 @@ impl Default for MemoryStorage {
 
 #[async_trait]
 impl Storage for MemoryStorage {
+    async fn apply<T>(
+        &self,
+        key: &str,
+        apply_config: &serde_json::Value,
+        field_manager: &str,
+        force: bool,
+        subresource: Option<&str>,
+    ) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        self.apply_calls.fetch_add(1, Ordering::SeqCst);
+        if self.reject_apply.load(Ordering::SeqCst) {
+            return Err(Error::UnsupportedMediaType(
+                "Apply not supported".to_string(),
+            ));
+        }
+        crate::apply_via_update(self, key, apply_config, field_manager, force, subresource).await
+    }
+
     async fn create<T>(&self, key: &str, value: &T) -> Result<T>
     where
         T: Serialize + DeserializeOwned + Send + Sync,

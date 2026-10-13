@@ -537,6 +537,10 @@ fn map_write_err(e: anyhow::Error) -> Error {
         Error::BadRequest(s)
     } else if s.contains("(Forbidden)") {
         Error::Forbidden(s)
+    } else if s.contains("(UnsupportedMediaType)") {
+        // `apierrors.IsUnsupportedMediaType` (apimachinery/pkg/api/errors/errors.go:607-615):
+        // the client half of the apply -> Update fallback (#3351).
+        Error::UnsupportedMediaType(s)
     } else {
         Error::Storage(s)
     }
@@ -1383,6 +1387,12 @@ mod tests {
             storage_key_for("nodes", false, &cobj).unwrap(),
             "/registry/nodes/node-1"
         );
+    }
+
+    #[test]
+    fn map_write_err_maps_unsupported_media_type() {
+        let e = anyhow::anyhow!("Error from server (UnsupportedMediaType): Apply not supported");
+        assert!(matches!(map_write_err(e), Error::UnsupportedMediaType(_)));
     }
 
     // A transport failure (e.g. the kubelet POSTing a Node to an unresolvable
