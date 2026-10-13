@@ -22,7 +22,9 @@
 //!      estimated cost budget — sufficient to reject obviously expensive
 //!      rules at compile time and runaway evaluations at runtime.
 
-use rusternetes_common::cel_versions::{default_compatibility_version, EnvSet};
+use rusternetes_common::cel_versions::{
+    compile_failure, default_compatibility_version, EnvSet, EnvType,
+};
 use rusternetes_common::resources::{CustomResource, CustomResourceDefinition, JSONSchemaProps};
 use rusternetes_common::schema_validation::PathSeg;
 use rusternetes_common::{CELContext, CELEvaluator, Error, Result};
@@ -233,8 +235,8 @@ pub fn validate_crd_rules(schema: &JSONSchemaProps) -> Result<()> {
 /// `preexisting` are compiled in the stored environment.
 pub fn validate_crd_rules_in(
     schema: &JSONSchemaProps,
-    _env_set: &EnvSet,
-    _preexisting: &HashSet<String>,
+    env_set: &EnvSet,
+    preexisting: &HashSet<String>,
 ) -> Result<()> {
     let rules = collect_rules(schema);
     for r in &rules {
@@ -242,6 +244,20 @@ pub fn validate_crd_rules_in(
             return Err(Error::InvalidResource(format!(
                 "x-kubernetes-validations rule exceeded the estimated cost limit: {}",
                 r.rule
+            )));
+        }
+        // `preexistingExpressions.RuleEnv` (apiextensions validation.go:158-163):
+        // a rule already stored on the CRD compiles in `StoredExpressions`,
+        // any other in `NewExpressions` at the compatibility version.
+        let env = if preexisting.contains(&r.rule) {
+            EnvType::StoredExpressions
+        } else {
+            EnvType::NewExpressions
+        };
+        if let Some(detail) = compile_failure(&r.rule, env_set, env) {
+            return Err(Error::InvalidResource(format!(
+                "x-kubernetes-validations rule is invalid: {}: {}",
+                r.rule, detail
             )));
         }
         // Compile-time syntax check.

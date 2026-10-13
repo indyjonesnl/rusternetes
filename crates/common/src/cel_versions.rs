@@ -418,7 +418,10 @@ fn first_undeclared(e: &IdedExpr, set: &EnvSet, env: EnvType) -> Option<String> 
             // calls; they are the `TwoVarComprehensions` library's.
             if c.target.is_some()
                 && c.args.len() == 3
-                && matches!(c.func_name.as_str(), "all" | "exists" | "existsOne" | "exists_one")
+                && matches!(
+                    c.func_name.as_str(),
+                    "all" | "exists" | "existsOne" | "exists_one"
+                )
                 && !set.two_var_comprehensions(env)
             {
                 return Some(c.func_name.clone());
@@ -436,7 +439,10 @@ fn first_undeclared(e: &IdedExpr, set: &EnvSet, env: EnvType) -> Option<String> 
             }
             (!set.declares(env, &c.func_name)).then(|| c.func_name.clone())
         }
-        Expr::List(l) => l.elements.iter().find_map(|a| first_undeclared(a, set, env)),
+        Expr::List(l) => l
+            .elements
+            .iter()
+            .find_map(|a| first_undeclared(a, set, env)),
         Expr::Map(m) => m
             .entries
             .iter()
@@ -497,7 +503,11 @@ mod tests {
             Default::default();
         for o in sorted {
             if let Some(r) = o.removed {
-                assert!(o.introduced < r, "{}: Introduced must be < Removed", o.library);
+                assert!(
+                    o.introduced < r,
+                    "{}: Introduced must be < Removed",
+                    o.library
+                );
             }
             let t = tracked.entry(o.library).or_default();
             assert!(
@@ -550,7 +560,13 @@ mod tests {
     #[test]
     fn stored_expressions_declare_every_library() {
         let e = EnvSet::must_base_env_set(v(31));
-        for f in ["semver", "lists.range", "format.named", "isCIDR", "quantity"] {
+        for f in [
+            "semver",
+            "lists.range",
+            "format.named",
+            "isCIDR",
+            "quantity",
+        ] {
             assert!(e.declares(EnvType::StoredExpressions, f), "{f}");
         }
         assert!(e.two_var_comprehensions(EnvType::StoredExpressions));
@@ -563,7 +579,9 @@ mod tests {
     #[test]
     fn always_present_and_shared_names() {
         let e = EnvSet::must_base_env_set(v(31));
-        for f in ["isSorted", "sum", "indexOf", "find", "isURL", "charAt", "trim"] {
+        for f in [
+            "isSorted", "sum", "indexOf", "find", "isURL", "charAt", "trim",
+        ] {
             assert!(e.declares(EnvType::NewExpressions, f), "{f}");
         }
         for f in ["isGreaterThan", "compareTo", "isLessThan"] {
@@ -593,20 +611,41 @@ mod tests {
 
     #[test]
     fn a_call_to_an_undeclared_function_is_reported() {
-        let m = fails("semver('1.2.3').major() > 0", v(32), EnvType::NewExpressions);
+        let m = fails(
+            "semver('1.2.3').major() > 0",
+            v(32),
+            EnvType::NewExpressions,
+        );
         assert_eq!(
             m,
             "compilation failed: ERROR: <input>: undeclared reference to 'semver' (in container '')"
         );
-        assert_eq!(fails("semver('1.2.3').major() > 0", v(33), EnvType::NewExpressions), "");
-        assert_eq!(fails("semver('1.2.3').major() > 0", v(32), EnvType::StoredExpressions), "");
+        assert_eq!(
+            fails(
+                "semver('1.2.3').major() > 0",
+                v(33),
+                EnvType::NewExpressions
+            ),
+            ""
+        );
+        assert_eq!(
+            fails(
+                "semver('1.2.3').major() > 0",
+                v(32),
+                EnvType::StoredExpressions
+            ),
+            ""
+        );
         // Member calls and nested calls are checked.
         let m = fails("[1].all(x, x.isSemver())", v(32), EnvType::NewExpressions);
         assert!(m.contains("undeclared reference to 'isSemver'"), "{m}");
         // Namespaced functions are matched on `ns.name`.
         let m = fails("sets.contains([1], [1])", v(28), EnvType::NewExpressions);
         assert!(m.contains("undeclared reference to 'sets.contains'"), "{m}");
-        assert_eq!(fails("sets.contains([1], [1])", v(31), EnvType::NewExpressions), "");
+        assert_eq!(
+            fails("sets.contains([1], [1])", v(31), EnvType::NewExpressions),
+            ""
+        );
         // Unknown names are not this module's concern.
         assert_eq!(fails("size(self) > 0", v(31), EnvType::NewExpressions), "");
     }
