@@ -8,7 +8,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use rusternetes_common::feature_gates::{self, Feature};
 use rusternetes_common::resources::dra::ResourceClaimStatus;
 use rusternetes_common::resources::ResourceClaim;
@@ -19,18 +18,14 @@ use rusternetes_common::validation::objectmeta::{
 use rusternetes_common::validation::resourceclaim::{
     validate_resource_claim, validate_resource_claim_status_update, validate_resource_claim_update,
 };
-use rusternetes_common::Result;
 use rusternetes_storage::StorageBackend;
 
 use super::admin::{authorized_for_admin, authorized_for_admin_status};
 use super::spec::drop_disabled_fields as drop_disabled_spec_fields;
-use crate::registry::generic::store::{
-    BeginCreate, BeginUpdate, CreateOptions, Finish, UpdateOptions,
-};
 use crate::registry::generic::Store;
 use crate::registry::rest::{
     reset_object_meta_for_status, GroupResource, NamespaceScopedStrategy, RequestContext,
-    RestCreateStrategy, RestDeleteStrategy, RestUpdateStrategy,
+    RestCreateStrategy, RestDeleteStrategy, RestUpdateStrategy, ValidateFuture,
 };
 
 /// A Go `resource.ResourceClaimStatus{}`: the status is a value, so it always
@@ -144,70 +139,10 @@ fn drop_deallocated_status_devices(new: &mut ResourceClaim, old: &ResourceClaim)
     }
 }
 
-/// Hook running the `AuthorizedForAdmin` check before the create strategy.
-struct AdminCheck {
-    storage: Arc<StorageBackend>,
-}
-
-struct Noop;
-
-#[async_trait]
-impl Finish for Noop {
-    async fn finish(self: Box<Self>, _success: bool) {}
-}
-
-#[async_trait]
-impl BeginCreate<ResourceClaim> for AdminCheck {
-    async fn begin_create(
-        &self,
-        ctx: &RequestContext,
-        obj: &mut ResourceClaim,
-        _options: &CreateOptions,
-    ) -> Result<Box<dyn Finish>> {
-        let ns = ctx
-            .namespace
-            .clone()
-            .or_else(|| obj.metadata.namespace.clone())
-            .unwrap_or_default();
-        authorized_for_admin(&self.storage, &obj.spec.devices.requests, &ns).await?;
-        Ok(Box::new(Noop))
-    }
-}
-
-/// Hook running `AuthorizedForAdminStatus` before the status update strategy
-/// (strategy.go:190-196).
-struct AdminStatusCheck {
-    storage: Arc<StorageBackend>,
-}
-
-#[async_trait]
-impl BeginUpdate<ResourceClaim> for AdminStatusCheck {
-    async fn begin_update(
-        &self,
-        ctx: &RequestContext,
-        obj: &mut ResourceClaim,
-        old: &mut ResourceClaim,
-        _options: &UpdateOptions,
-    ) -> Result<Box<dyn Finish>> {
-        let results = |c: &ResourceClaim| {
-            c.status
-                .as_ref()
-                .and_then(|s| s.allocation.as_ref())
-                .map(|a| a.devices.results.clone())
-                .unwrap_or_default()
-        };
-        let ns = ctx
-            .namespace
-            .clone()
-            .or_else(|| obj.metadata.namespace.clone())
-            .unwrap_or_default();
-        authorized_for_admin_status(&self.storage, &results(obj), &results(old), &ns).await?;
-        Ok(Box::new(Noop))
-    }
-}
-
 /// `resourceclaimStrategy` (strategy.go:47-67).
-pub struct Strategy;
+pub struct Strategy {
+    storage: Arc<StorageBackend>,
+}
 
 impl NamespaceScopedStrategy for Strategy {
     fn namespace_scoped(&self) -> bool {
@@ -220,6 +155,22 @@ impl RestCreateStrategy<ResourceClaim> for Strategy {
     fn prepare_for_create(&self, _ctx: &RequestContext, obj: &mut ResourceClaim) {
         obj.status = empty_status();
         drop_disabled_spec_fields(&mut obj.spec, None);
+    }
+
+    /// `AuthorizedForAdmin` (strategy.go:102), ahead of the validation errors.
+    fn validate_async<'a>(
+        &'a self,
+        ctx: &'a RequestContext,
+        obj: &'a ResourceClaim,
+    ) -> ValidateFuture<'a> {
+        Box::pin(async move {
+            let ns = ctx
+                .namespace
+                .clone()
+                .or_else(|| obj.metadata.namespace.clone())
+                .unwrap_or_default();
+            authorized_for_admin(&self.storage, &obj.spec.devices.requests, &ns).await
+        })
     }
 
     /// `ValidateResourceClaim` (validation.go:109-113): ObjectMeta with
@@ -277,7 +228,9 @@ impl RestUpdateStrategy<ResourceClaim> for Strategy {
 impl RestDeleteStrategy<ResourceClaim> for Strategy {}
 
 /// `resourceclaimStatusStrategy` (strategy.go:140-217).
-pub struct StatusStrategy;
+pub struct StatusStrategy {
+    storage: Arc<StorageBackend>,
+}
 
 impl NamespaceScopedStrategy for StatusStrategy {
     fn namespace_scoped(&self) -> bool {
@@ -302,6 +255,31 @@ impl RestUpdateStrategy<ResourceClaim> for StatusStrategy {
         reset_object_meta_for_status(&mut obj.metadata, &old.metadata);
         drop_disabled_status_fields(obj, old);
         drop_deallocated_status_devices(obj, old); // NOP if fields got dropped, so last.
+    }
+
+    /// `AuthorizedForAdminStatus` (strategy.go:190-196), ahead of the
+    /// validation errors.
+    fn validate_update_async<'a>(
+        &'a self,
+        ctx: &'a RequestContext,
+        obj: &'a ResourceClaim,
+        old: &'a ResourceClaim,
+    ) -> ValidateFuture<'a> {
+        Box::pin(async move {
+            let results = |c: &ResourceClaim| {
+                c.status
+                    .as_ref()
+                    .and_then(|s| s.allocation.as_ref())
+                    .map(|a| a.devices.results.clone())
+                    .unwrap_or_default()
+            };
+            let ns = ctx
+                .namespace
+                .clone()
+                .or_else(|| obj.metadata.namespace.clone())
+                .unwrap_or_default();
+            authorized_for_admin_status(&self.storage, &results(obj), &results(old), &ns).await
+        })
     }
 
     /// `ValidateResourceClaimStatusUpdate` (validation.go:127-132).
@@ -339,14 +317,12 @@ pub fn new_stores(
     let mut store = Store::new(
         storage.clone(),
         GroupResource::new("resource.k8s.io", "resourceclaims"),
-        Arc::new(Strategy),
+        Arc::new(Strategy {
+            storage: storage.clone(),
+        }),
     );
     store.return_deleted_object = true;
-    store.begin_create = Some(Arc::new(AdminCheck {
-        storage: storage.clone(),
-    }));
-    let mut status = store.with_update_strategy(Arc::new(StatusStrategy));
-    status.begin_update = Some(Arc::new(AdminStatusCheck { storage }));
+    let status = store.with_update_strategy(Arc::new(StatusStrategy { storage }));
     (store, status)
 }
 

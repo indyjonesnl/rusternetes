@@ -140,6 +140,10 @@ impl RequestContext {
 // Strategy interfaces
 // ---------------------------------------------------------------------------
 
+/// Future returned by the strategies' async validation hooks.
+pub type ValidateFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = ErrorList> + Send + 'a>>;
+
 /// `NamespaceScopedStrategy` (rest/create.go:180-184).
 pub trait NamespaceScopedStrategy {
     fn namespace_scoped(&self) -> bool;
@@ -159,6 +163,15 @@ pub trait RestCreateStrategy<T>: NamespaceScopedStrategy + Send + Sync {
     /// generation, drop disabled fields.
     fn prepare_for_create(&self, ctx: &RequestContext, obj: &mut T);
     fn validate(&self, ctx: &RequestContext, obj: &T) -> ErrorList;
+    /// The part of upstream's `Validate` that must call out to the server (a
+    /// namespace read through a client: `resourceutils.AuthorizedForAdmin`,
+    /// resourceclaim/strategy.go:102). Upstream's `Validate` is
+    /// `allErrs := <that call>; append(allErrs, validation...)`, so these
+    /// errors come first and join the synchronous [`Self::validate`] errors in
+    /// one `Invalid`. Our `validate` is synchronous, hence the split.
+    fn validate_async<'a>(&'a self, _ctx: &'a RequestContext, _obj: &'a T) -> ValidateFuture<'a> {
+        Box::pin(async { Vec::new() })
+    }
     fn warnings_on_create(&self, _ctx: &RequestContext, _obj: &T) -> Vec<String> {
         Vec::new()
     }
@@ -172,6 +185,17 @@ pub trait RestUpdateStrategy<T>: NamespaceScopedStrategy + Send + Sync {
     /// spec on `/status`) from `old`, and bump generation when warranted.
     fn prepare_for_update(&self, ctx: &RequestContext, obj: &mut T, old: &T);
     fn validate_update(&self, ctx: &RequestContext, obj: &T, old: &T) -> ErrorList;
+    /// The server-calling part of `ValidateUpdate`
+    /// (`resourceutils.AuthorizedForAdminStatus`, resourceclaim/strategy.go:196);
+    /// see [`RestCreateStrategy::validate_async`].
+    fn validate_update_async<'a>(
+        &'a self,
+        _ctx: &'a RequestContext,
+        _obj: &'a T,
+        _old: &'a T,
+    ) -> ValidateFuture<'a> {
+        Box::pin(async { Vec::new() })
+    }
     fn warnings_on_update(&self, _ctx: &RequestContext, _obj: &T, _old: &T) -> Vec<String> {
         Vec::new()
     }
@@ -361,7 +385,7 @@ pub(crate) fn with_group_kind<T: Object>(err: Error, group: &str, obj: &T) -> Er
 ///
 /// Expects [`fill_object_meta_system_fields`] and name generation to have run
 /// already — the Store does both before calling this, and this only checks.
-pub fn before_create<T: Object>(
+pub async fn before_create<T: Object>(
     strategy: &dyn RestCreateStrategy<T>,
     ctx: &RequestContext,
     obj: &mut T,
@@ -381,7 +405,8 @@ pub fn before_create<T: Object>(
 
     strategy.prepare_for_create(ctx, obj);
 
-    let errs = strategy.validate(ctx, obj);
+    let mut errs = strategy.validate_async(ctx, obj).await;
+    errs.extend(strategy.validate(ctx, obj));
     if !errs.is_empty() {
         return Err(Error::Invalid(errs));
     }
@@ -417,7 +442,7 @@ fn validate_common_fields(meta: &ObjectMeta, old_meta: &ObjectMeta, namespaced: 
 }
 
 /// `BeforeUpdate` (rest/update.go:107-167).
-pub fn before_update<T: Object>(
+pub async fn before_update<T: Object>(
     strategy: &dyn RestUpdateStrategy<T>,
     ctx: &RequestContext,
     obj: &mut T,
@@ -455,6 +480,7 @@ pub fn before_update<T: Object>(
     }
 
     let mut errs = validate_common_fields(obj.metadata(), old_meta, strategy.namespace_scoped());
+    errs.extend(strategy.validate_update_async(ctx, obj, old).await);
     errs.extend(strategy.validate_update(ctx, obj, old));
     if !errs.is_empty() {
         // Upstream also calls `RecordDuplicateValidationErrors` here, which
@@ -914,14 +940,15 @@ mod tests {
 
     /// `BeforeCreate` refuses an object the Store did not fill: it checks, it
     /// does not fill (create.go:102-104).
-    #[test]
-    fn before_create_requires_system_metadata() {
+    #[tokio::test]
+    async fn before_create_requires_system_metadata() {
         let mut obj = cm("a");
         let err = before_create(
             &Plain { namespaced: true },
             &RequestContext::new(Some("ns")),
             &mut obj,
         )
+        .await
         .unwrap_err();
         assert!(
             err.to_string()
@@ -932,25 +959,29 @@ mod tests {
 
     /// The namespace comes from the request; a conflicting one in the body is
     /// a 400 (upstream `TestBeforeCreate`-style cases in meta_test.go).
-    #[test]
-    fn before_create_takes_the_request_namespace_and_rejects_a_mismatch() {
+    #[tokio::test]
+    async fn before_create_takes_the_request_namespace_and_rejects_a_mismatch() {
         let ctx = RequestContext::new(Some("ns"));
         let mut obj = cm("a");
         fill_object_meta_system_fields(&mut obj.metadata);
-        before_create(&Plain { namespaced: true }, &ctx, &mut obj).unwrap();
+        before_create(&Plain { namespaced: true }, &ctx, &mut obj)
+            .await
+            .unwrap();
         assert_eq!(obj.metadata.namespace.as_deref(), Some("ns"));
         assert_eq!(ctx.warnings(), vec!["a warning".to_string()]);
 
         let mut other = cm("b");
         other.metadata.namespace = Some("elsewhere".to_string());
         fill_object_meta_system_fields(&mut other.metadata);
-        let err = before_create(&Plain { namespaced: true }, &ctx, &mut other).unwrap_err();
+        let err = before_create(&Plain { namespaced: true }, &ctx, &mut other)
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::BadRequest(_)), "{err:?}");
     }
 
     /// A cluster-scoped strategy clears a namespace the client sent.
-    #[test]
-    fn before_create_clears_the_namespace_of_a_cluster_scoped_object() {
+    #[tokio::test]
+    async fn before_create_clears_the_namespace_of_a_cluster_scoped_object() {
         let mut obj = cm("a");
         obj.metadata.namespace = Some("ns".to_string());
         fill_object_meta_system_fields(&mut obj.metadata);
@@ -959,14 +990,15 @@ mod tests {
             &RequestContext::new(Some("ns")),
             &mut obj,
         )
+        .await
         .unwrap();
         assert_eq!(obj.metadata.namespace, None);
     }
 
     /// `BeforeUpdate` restores what a client may not change, generation first
     /// (update.go:127-146).
-    #[test]
-    fn before_update_restores_server_owned_metadata() {
+    #[tokio::test]
+    async fn before_update_restores_server_owned_metadata() {
         let ctx = RequestContext::new(Some("ns"));
         let mut old = cm("a");
         old.metadata.namespace = Some("ns".to_string());
@@ -980,7 +1012,9 @@ mod tests {
         let mut new = cm("a");
         new.metadata.resource_version = Some("7".to_string());
         new.metadata.generation = Some(1);
-        before_update(&Plain { namespaced: true }, &ctx, &mut new, &old).unwrap();
+        before_update(&Plain { namespaced: true }, &ctx, &mut new, &old)
+            .await
+            .unwrap();
         assert_eq!(new.metadata.uid, "uid-1");
         assert_eq!(new.metadata.generation, Some(4));
         assert_eq!(
@@ -996,8 +1030,8 @@ mod tests {
 
     /// A UID that does not match is not rewritten; it fails the common
     /// metadata validation as an immutable field.
-    #[test]
-    fn before_update_rejects_a_changed_uid() {
+    #[tokio::test]
+    async fn before_update_rejects_a_changed_uid() {
         let mut old = cm("a");
         old.metadata.namespace = Some("ns".to_string());
         old.metadata.uid = "uid-1".to_string();
@@ -1010,6 +1044,7 @@ mod tests {
             &mut new,
             &old,
         )
+        .await
         .unwrap_err();
         let Error::Invalid(errs) = err else {
             panic!("{err:?}")

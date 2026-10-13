@@ -371,7 +371,10 @@ async fn admin_access_error_joins_the_validation_errors() {
     c["spec"]["devices"]["requests"][0]["exactly"]["adminAccess"] = json!(true);
     c["spec"]["devices"]["requests"][0]["exactly"]["deviceClassName"] = json!("");
     let (s, body) = api
-        .post("/apis/resource.k8s.io/v1/namespaces/plain/resourceclaims", &c)
+        .post(
+            "/apis/resource.k8s.io/v1/namespaces/plain/resourceclaims",
+            &c,
+        )
         .await;
     assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     let msg = body["message"].as_str().unwrap();
@@ -393,7 +396,9 @@ async fn admin_access_error_joins_the_validation_errors() {
     assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     let msg = body["message"].as_str().unwrap();
     assert!(
-        msg.contains("spec.spec.devices.requests[0].adminAccess: Forbidden")
+        // `AuthorizedForAdmin` hardcodes the `spec.devices.requests` path, also
+        // for a template, whose requests live under `spec.spec` (utils.go:47).
+        msg.contains("spec.devices.requests[0].adminAccess: Forbidden")
             && msg.contains("deviceClassName: Required"),
         "{body}"
     );

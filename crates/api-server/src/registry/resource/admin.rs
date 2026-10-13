@@ -3,35 +3,33 @@
 //! `resource.kubernetes.io/admin-access: "true"` label on the containing
 //! namespace.
 //!
-//! Upstream runs these inside the strategy's `Validate` / `ValidateUpdate`
-//! (resourceclaim/strategy.go:190-198 for the status strategy), which can read
-//! the namespace through a client. Our strategies are synchronous, so the
-//! checks run from the Store's `BeginCreate` / `BeginUpdate` hooks instead; the
-//! only difference is that a failure is reported before the other validation
-//! errors rather than together with them.
+//! Upstream calls these from the strategies' `Validate` / `ValidateUpdate`
+//! (resourceclaim/strategy.go:102, :196; resourceclaimtemplate/strategy.go:64)
+//! and appends their errors ahead of the validation errors. Ours are driven
+//! from the strategies' `validate_async` / `validate_update_async` hooks, which
+//! `before_create` / `before_update` join with the synchronous validators.
 
 use rusternetes_common::resources::dra::{DeviceRequest, DeviceRequestAllocationResult};
 use rusternetes_common::resources::Namespace;
-use rusternetes_common::validation::field::{Error as FieldError, Path};
+use rusternetes_common::validation::field::{Error as FieldError, ErrorList, Path};
 use rusternetes_storage::{build_key, Storage, StorageBackend};
 
 /// `resource.DRAAdminNamespaceLabelKey` (pkg/apis/resource/types.go:778).
 const ADMIN_NAMESPACE_LABEL_KEY: &str = "resource.kubernetes.io/admin-access";
 
 /// The namespace check both functions share (utils.go:53-63).
-async fn check_namespace(
-    storage: &StorageBackend,
-    namespace: &str,
-    path: &Path,
-) -> rusternetes_common::Result<()> {
-    let ns: Namespace = storage
-        .get(&build_key("namespaces", None, namespace))
-        .await
-        .map_err(|e| {
-            rusternetes_common::Error::Internal(format!(
-                "{path}: could not retrieve namespace to verify admin access: {e}"
-            ))
-        })?;
+async fn check_namespace(storage: &StorageBackend, namespace: &str, path: &Path) -> ErrorList {
+    let ns: Namespace = match storage.get(&build_key("namespaces", None, namespace)).await {
+        Ok(ns) => ns,
+        // `field.InternalError(adminAccessPath, fmt.Errorf("could not retrieve
+        // namespace to verify admin access: %w", err))` (utils.go:54-56).
+        Err(e) => {
+            return vec![FieldError::internal(
+                path,
+                format!("could not retrieve namespace to verify admin access: {e}"),
+            )]
+        }
+    };
     let labelled = ns
         .metadata
         .labels
@@ -39,16 +37,14 @@ async fn check_namespace(
         .and_then(|l| l.get(ADMIN_NAMESPACE_LABEL_KEY))
         .is_some_and(|v| v == "true");
     if labelled {
-        Ok(())
+        Vec::new()
     } else {
-        Err(rusternetes_common::Error::Invalid(vec![
-            FieldError::forbidden(
-                path,
-                format!(
-                    "admin access to devices requires the `{ADMIN_NAMESPACE_LABEL_KEY}: true` label on the containing namespace"
-                ),
+        vec![FieldError::forbidden(
+            path,
+            format!(
+                "admin access to devices requires the `{ADMIN_NAMESPACE_LABEL_KEY}: true` label on the containing namespace"
             ),
-        ]))
+        )]
     }
 }
 
@@ -58,7 +54,7 @@ pub async fn authorized_for_admin(
     storage: &StorageBackend,
     requests: &[DeviceRequest],
     namespace: &str,
-) -> rusternetes_common::Result<()> {
+) -> ErrorList {
     for (i, r) in requests.iter().enumerate() {
         if r.exactly
             .as_ref()
@@ -72,7 +68,7 @@ pub async fn authorized_for_admin(
             return check_namespace(storage, namespace, &path).await;
         }
     }
-    Ok(())
+    Vec::new()
 }
 
 /// `adminRequested` (utils.go:93-101): the first result with `adminAccess`
@@ -98,12 +94,12 @@ pub async fn authorized_for_admin_status(
     new: &[DeviceRequestAllocationResult],
     old: &[DeviceRequestAllocationResult],
     namespace: &str,
-) -> rusternetes_common::Result<()> {
+) -> ErrorList {
     if admin_requested(old).is_some() {
-        return Ok(());
+        return Vec::new();
     }
     match admin_requested(new) {
         Some(path) => check_namespace(storage, namespace, &path).await,
-        None => Ok(()),
+        None => Vec::new(),
     }
 }
