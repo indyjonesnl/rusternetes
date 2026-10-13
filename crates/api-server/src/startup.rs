@@ -16,13 +16,24 @@ use rusternetes_storage::{Storage, StorageBackend};
 use std::sync::Arc;
 use tracing::{info, warn};
 
+/// What the ClusterAuthenticationTrust controller publishes
+/// (`ClusterAuthenticationInfo`, pkg/controlplane/apiserver/config.go:344-357).
+#[derive(Clone, Copy, Default)]
+pub struct ClusterAuthnInputs<'a> {
+    pub ca_cert_pem: Option<&'a str>,
+    /// `--client-ca-file`.
+    pub client_ca_file: Option<&'a str>,
+    /// `--requestheader-*`, when `--requestheader-client-ca-file` is set.
+    pub request_header: Option<&'a crate::request_header_authentication::RequestHeaderTrust>,
+}
+
 /// Bootstrap objects and register every apiserver post-start hook/controller.
 pub async fn register_post_start_hooks(
     storage: Arc<StorageBackend>,
     api_port: u16,
     service_ip: std::net::IpAddr,
     service_cidrs: Vec<String>,
-    ca_cert_pem: Option<&str>,
+    authn: ClusterAuthnInputs<'_>,
     spawn_crd_resync: impl FnOnce(Arc<StorageBackend>),
 ) {
     if let Err(e) =
@@ -105,7 +116,11 @@ pub async fn register_post_start_hooks(
     }
     bootstrap::spawn_cluster_authentication_trust_controller(
         storage.clone(),
-        bootstrap::cluster_authentication_info(ca_cert_pem),
+        bootstrap::cluster_authentication_info(
+            authn.ca_cert_pem,
+            authn.client_ca_file,
+            authn.request_header,
+        ),
     );
 
     // Create default StorageClass (like k3s/kind ship with a default)

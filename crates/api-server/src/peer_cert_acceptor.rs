@@ -118,7 +118,7 @@ where
 
     fn accept(&self, stream: I, service: S) -> Self::Future {
         let inner = self.inner.clone();
-        let _front_proxy = self.front_proxy.clone();
+        let front_proxy = self.front_proxy.clone();
         Box::pin(async move {
             let (tls_stream, service) = inner.accept(stream, service).await?;
 
@@ -132,9 +132,31 @@ where
                 .map(|certs| certs.iter().map(|c| c.as_ref().to_vec()).collect())
                 .unwrap_or_default();
 
-            let _ = chain_verifies;
-            let service = Extension(PeerCertificates(Arc::new(chain))).layer(service);
-            let service = Extension(None::<FrontProxyConnection>).layer(service);
+            // With front-proxy authentication the handshake trusted the union
+            // of both CA bundles, so the chain is re-verified per
+            // authenticator (x509.Verifier). `PeerCertificates` then carries
+            // only what the `--client-ca-file` x509 authenticator accepts.
+            let (peer_chain, connection) = match &front_proxy {
+                None => (chain, None),
+                Some(trust) => {
+                    let connection = FrontProxyConnection {
+                        config: trust.config.clone(),
+                        verified_by_request_header_ca: chain_verifies(
+                            trust.request_header_ca.as_ref(),
+                            &chain,
+                        ),
+                        verified_by_client_ca: trust
+                            .client_ca
+                            .as_ref()
+                            .map(|v| chain_verifies(v.as_ref(), &chain)),
+                        presented: Arc::new(chain),
+                    };
+                    (connection.x509_chain(), Some(connection))
+                }
+            };
+
+            let service = Extension(PeerCertificates(Arc::new(peer_chain))).layer(service);
+            let service = Extension(connection).layer(service);
             Ok((tls_stream, service))
         })
     }

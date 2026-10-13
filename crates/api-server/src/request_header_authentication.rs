@@ -176,6 +176,25 @@ impl RequestHeaderAuthenticationArgs {
     }
 }
 
+impl RequestHeaderAuthenticationArgs {
+    /// Startup path: validate (including the `--client-ca-file` overlap rule),
+    /// then resolve. An invalid flag set refuses to start, like upstream's
+    /// aggregated `Validate()` errors.
+    pub fn resolve(
+        &self,
+        client_ca_file: Option<&str>,
+    ) -> anyhow::Result<Option<RequestHeaderTrust>> {
+        let errs = self.validate_with_client_ca(client_ca_file);
+        if !errs.is_empty() {
+            anyhow::bail!(
+                "invalid front-proxy authentication options: {}",
+                errs.join("; ")
+            );
+        }
+        self.to_trust()
+    }
+}
+
 /// The resolved front-proxy configuration (upstream
 /// `authenticatorfactory.RequestHeaderConfig`).
 #[derive(Clone, Debug)]
@@ -183,6 +202,39 @@ pub struct RequestHeaderTrust {
     pub config: Arc<RequestHeaderConfig>,
     /// `--requestheader-client-ca-file`.
     pub client_ca_file: String,
+}
+
+/// The CA bundles the TLS handshake must trust: `--client-ca-file` plus
+/// `--requestheader-client-ca-file` (`ApplyClientCert`,
+/// staging/src/k8s.io/apiserver/pkg/server/config.go:535-548). Empty means no
+/// client-cert authentication at all.
+pub fn client_ca_files<'a>(
+    client_ca_file: Option<&'a str>,
+    trust: Option<&'a RequestHeaderTrust>,
+) -> Vec<&'a str> {
+    client_ca_file
+        .filter(|c| !c.is_empty())
+        .into_iter()
+        .chain(trust.map(|t| t.client_ca_file.as_str()))
+        .collect()
+}
+
+/// The per-connection acceptor for a listener whose TLS config trusts
+/// [`client_ca_files`].
+pub fn peer_cert_acceptor(
+    rustls_config: axum_server::tls_rustls::RustlsConfig,
+    client_ca_file: Option<&str>,
+    trust: Option<&RequestHeaderTrust>,
+) -> anyhow::Result<crate::peer_cert_acceptor::PeerCertAcceptor> {
+    let acceptor = crate::peer_cert_acceptor::PeerCertAcceptor::new(rustls_config);
+    match trust {
+        None => Ok(acceptor),
+        Some(t) => acceptor.with_request_header(
+            t.config.clone(),
+            &t.client_ca_file,
+            client_ca_file.filter(|c| !c.is_empty()),
+        ),
+    }
 }
 
 #[cfg(test)]

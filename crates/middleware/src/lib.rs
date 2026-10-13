@@ -178,6 +178,23 @@ pub fn user_from_client_cert_der(der_chain: &[Vec<u8>]) -> Option<UserInfo> {
     Some(UserInfo::from_cert_identity(&common_name, &organizations))
 }
 
+/// `AuthenticatedGroupAdder.AuthenticateRequest`
+/// (staging/src/k8s.io/apiserver/pkg/authentication/group/authenticated_group_adder.go:41-63):
+/// append `system:authenticated` unless the user is `system:anonymous` or
+/// already carries `system:authenticated` / `system:unauthenticated`.
+fn add_authenticated_group(mut user: UserInfo) -> UserInfo {
+    if user.username == "system:anonymous"
+        || user
+            .groups
+            .iter()
+            .any(|g| g == "system:authenticated" || g == "system:unauthenticated")
+    {
+        return user;
+    }
+    user.groups.push("system:authenticated".to_string());
+    user
+}
+
 /// One thing the caller is asking to impersonate, paired with the authorization
 /// attributes that must be allowed against the *original* caller before the
 /// switch is applied. Mirrors `buildImpersonationRequests` upstream.
@@ -932,6 +949,39 @@ pub async fn auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Result<Response, Response> {
+    // The authenticator chain, in upstream's order
+    // (pkg/kubeapiserver/authenticator/config.go:113-211): request-header
+    // (front proxy), then x509 client cert, then bearer tokens, then anonymous.
+    // `union.New` collects an authenticator's error and moves on; if nothing
+    // succeeds the errors fail the request (`union.NewFailOnError` with
+    // anonymous, config.go:242-246), so an error is a 401, never anonymous.
+    let front_proxy = request
+        .extensions()
+        .get::<Option<request_header::FrontProxyConnection>>()
+        .cloned()
+        .flatten();
+    let mut authn_error: Option<String> = None;
+    let mut front_proxy_user = None;
+    let mut x509_ok = true;
+    if let Some(conn) = &front_proxy {
+        match conn.authenticate(request.headers_mut()) {
+            Ok(user) => front_proxy_user = user,
+            Err(e) => authn_error = Some(e),
+        }
+        if let Some(e) = conn.x509_error() {
+            x509_ok = false;
+            authn_error.get_or_insert(e);
+        }
+    }
+    let cert_user = if front_proxy_user.is_none() && x509_ok {
+        request
+            .extensions()
+            .get::<PeerCertificates>()
+            .and_then(|certs| user_from_client_cert_der(&certs.0))
+    } else {
+        None
+    };
+
     // Extract Bearer token from Authorization header
     let auth_header = request
         .headers()
@@ -940,7 +990,18 @@ pub async fn auth_middleware(
         .unwrap_or("");
 
     let mut observations = AuthObservations::default();
-    let user = if let Some(token) = auth_header.strip_prefix("Bearer ") {
+    let user = if let Some(user) = front_proxy_user {
+        // group.NewAuthenticatedGroupAdder wraps the whole union (config.go:240).
+        debug!("Authenticated user (front proxy): {}", user.username);
+        add_authenticated_group(user)
+    } else if let Some(user) = cert_user {
+        // The client presented a certificate that verifies against
+        // --client-ca-file. Map CN→user / O→groups (x509 authn, #1129). This
+        // is how the in-cluster system:kube-scheduler cert is honored once
+        // --skip-auth is dropped.
+        debug!("Authenticated user (client cert): {}", user.username);
+        user
+    } else if let Some(token) = auth_header.strip_prefix("Bearer ") {
         // Skip "Bearer "
 
         // Try to validate as a service account token first
@@ -981,22 +1042,23 @@ pub async fn auth_middleware(
             warn!("Invalid token");
             return Err((StatusCode::UNAUTHORIZED, "Invalid token").into_response());
         }
-    } else if let Some(user) = request
-        .extensions()
-        .get::<PeerCertificates>()
-        .and_then(|certs| user_from_client_cert_der(&certs.0))
-    {
-        // No bearer token, but the client presented a certificate the TLS layer
-        // verified against --client-ca-file. Map CN→user / O→groups (x509 authn,
-        // #1129). This is how the in-cluster system:kube-scheduler cert is
-        // honored once --skip-auth is dropped.
-        debug!("Authenticated user (client cert): {}", user.username);
-        user
+    } else if let Some(err) = authn_error {
+        warn!("Rejecting request: {}", err);
+        return Err((StatusCode::UNAUTHORIZED, "Unauthorized").into_response());
     } else {
         // Anonymous user
         debug!("Anonymous request");
         UserInfo::anonymous()
     };
+
+    // `WithAuthentication` deletes the standard front-proxy headers, and any
+    // custom ones, from every request that got past authentication so nothing
+    // downstream can mistake them for a verified identity
+    // (staging/src/k8s.io/apiserver/pkg/endpoints/filters/authentication.go:91-109).
+    request_header::standard_request_header_config().clear_headers(request.headers_mut());
+    if let Some(conn) = &front_proxy {
+        conn.config.clear_headers(request.headers_mut());
+    }
 
     // Apply inbound impersonation headers. The authenticated caller must hold
     // the `impersonate` verb on each requested subject; on success the

@@ -208,6 +208,8 @@ pub struct ApiServerConfig {
     /// OPTIONAL — bearer-token clients still connect; presenting one is just an
     /// additional way to authenticate.
     pub client_ca_file: Option<String>,
+    /// `--requestheader-*` front-proxy authentication flags (#3414).
+    pub request_header: request_header_authentication::RequestHeaderAuthenticationArgs,
     /// Preloaded/generated TLS material. Embedded callers can set this after
     /// calling [`prepare_tls_for_config`] so the CA handed to other components
     /// matches the certificate served by the API server.
@@ -352,6 +354,7 @@ impl Default for ApiServerConfig {
             prometheus_url: None,
             console_dir: None,
             client_ca_file: None,
+            request_header: Default::default(),
             prepared_tls: None,
             service_node_port_range:
                 registry::core::service::portallocator::DEFAULT_SERVICE_NODE_PORT_RANGE,
@@ -373,6 +376,11 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
     let service_ranges =
         registry::core::service::ipranges::ServiceIpRanges::parse(&config.service_cluster_ip_range)
             .map_err(|e| anyhow::anyhow!(e))?;
+
+    // `--requestheader-*` (#3414): validated before anything starts.
+    let request_header = config
+        .request_header
+        .resolve(config.client_ca_file.as_deref())?;
 
     let token_manager = Arc::new(
         TokenManager::new_auto(config.jwt_secret.as_bytes())
@@ -427,7 +435,11 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
         api_port,
         service_ranges.api_server_service_ip(),
         service_ranges.cidrs(),
-        ca_cert_pem.as_deref(),
+        startup::ClusterAuthnInputs {
+            ca_cert_pem: ca_cert_pem.as_deref(),
+            client_ca_file: config.client_ca_file.as_deref(),
+            request_header: request_header.as_ref(),
+        },
         {
             let c = Arc::clone(&crd_controllers);
             move |s| {
@@ -480,13 +492,17 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
             .ok_or_else(|| anyhow::anyhow!("TLS config unavailable"))?
             .into_tls_config();
 
-        let client_cert_authn = config.client_ca_file.is_some();
-        let server_config = if let Some(ref client_ca) = config.client_ca_file {
+        let client_cas = request_header_authentication::client_ca_files(
+            config.client_ca_file.as_deref(),
+            request_header.as_ref(),
+        );
+        let client_cert_authn = !client_cas.is_empty();
+        let server_config = if client_cert_authn {
             info!(
-                "Client certificate authentication enabled (CA: {})",
-                client_ca
+                "Client certificate authentication enabled (CAs: {})",
+                client_cas.join(", ")
             );
-            tls_config.into_mtls_server_config(client_ca)?
+            tls_config.into_mtls_server_config_for_cas(&client_cas)?
         } else {
             tls_config.into_server_config()?
         };
@@ -497,7 +513,11 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
             // mTLS: serve via PeerCertAcceptor so the verified client cert reaches
             // handlers for x509 authn (CN→user / O→groups, #1129).
             let mut server = axum_server::bind(addr).acceptor(
-                crate::peer_cert_acceptor::PeerCertAcceptor::new(rustls_config),
+                request_header_authentication::peer_cert_acceptor(
+                    rustls_config,
+                    config.client_ca_file.as_deref(),
+                    request_header.as_ref(),
+                )?,
             );
             server
                 .http_builder()
