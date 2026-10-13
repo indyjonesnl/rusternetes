@@ -6,7 +6,6 @@ use axum::{
 use chrono::Utc;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
-    label_selector::LabelOperator,
     resources::{ExternalMetricValue, ExternalMetricValueList},
     Result,
 };
@@ -54,54 +53,47 @@ pub async fn list_external_metrics(
     // by ListResource; a parse failure is a 400) is the metric selector.
     let metric_selector = crate::handlers::metric_selectors::decode_label_selector(&params)?;
 
-    // `GetExternalMetric` (provider.go:312-327): a series whose labels do not
-    // satisfy the selector is not returned. The built-in series carries no
-    // labels. With Prometheus the selector becomes series matchers (the
-    // Rusternetes-only mapping of `prometheus_client::promql_matchers`), and
-    // the labels echoed are the ones the selector pins by equality.
-    let (value, metric_labels) = if let Some(ref prometheus_client) = state.prometheus_client {
-        let matchers = crate::prometheus_client::promql_matchers(&metric_selector)
-            .map_err(|e| crate::handlers::metric_selectors::unknown_error(e.to_string()))?;
-        let value = match prometheus_client
-            .query_external_metric(&metric_name, &namespace, &matchers)
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(
+    // `GetExternalMetric` (provider.go:312-327): one value per series whose
+    // labels satisfy the selector, each carrying that series' labels. The
+    // built-in series carries no labels. With Prometheus the selector becomes
+    // series matchers (the Rusternetes-only mapping of
+    // `prometheus_client::promql_matchers`) and every matching series is
+    // returned with its own labels.
+    let series: Vec<(Option<BTreeMap<String, String>>, String)> =
+        if let Some(ref prometheus_client) = state.prometheus_client {
+            let matchers = crate::prometheus_client::promql_matchers(&metric_selector)
+                .map_err(|e| crate::handlers::metric_selectors::unknown_error(e.to_string()))?;
+            match prometheus_client
+                .query_external_series(&metric_name, &namespace, &matchers)
+                .await
+            {
+                Ok(found) => found
+                    .into_iter()
+                    .map(|s| (Some(s.labels), s.value))
+                    .collect(),
+                Err(e) => {
+                    warn!(
                     "Failed to query Prometheus for external metric {}: {}. Using fallback value.",
                     metric_name, e
                 );
-                "0".to_string()
+                    vec![(None, "0".to_string())]
+                }
             }
+        } else if metric_selector.matches(&HashMap::new()) {
+            // Fallback mock value when Prometheus is not configured.
+            vec![(None, "100".to_string())]
+        } else {
+            Vec::new()
         };
-        let pinned: BTreeMap<String, String> = metric_selector
-            .requirements()
-            .iter()
-            .filter(|r| {
-                matches!(
-                    r.operator(),
-                    LabelOperator::Equals | LabelOperator::DoubleEquals
-                )
-            })
-            .filter_map(|r| Some((r.key().to_string(), r.values()?.first()?.clone())))
-            .collect();
-        (Some(value), (!pinned.is_empty()).then_some(pinned))
-    } else if metric_selector.matches(&HashMap::new()) {
-        // Fallback mock value when Prometheus is not configured.
-        (Some("100".to_string()), None)
-    } else {
-        (None, None)
-    };
 
-    let items: Vec<ExternalMetricValue> = value
+    let items: Vec<ExternalMetricValue> = series
         .into_iter()
-        .map(|value| ExternalMetricValue {
+        .map(|(metric_labels, value)| ExternalMetricValue {
             type_meta: external_metric_type_meta("ExternalMetricValue"),
             metric_name: metric_name.clone(),
-            metric_labels: metric_labels.clone(),
+            metric_labels,
             timestamp: Utc::now(),
-            window: Some("60s".to_string()),
+            window_seconds: None,
             value,
         })
         .collect();

@@ -283,28 +283,39 @@ impl PrometheusClient {
         Ok(value)
     }
 
-    /// Query an external metric (external.metrics.k8s.io). External metrics are
-    /// not tied to a Kubernetes object; the result is summed across all series
-    /// matching the namespace and any additional label selectors.
-    pub async fn query_external_metric(
+    /// Query an external metric as one value per matching series, each with
+    /// that series' labels (`GetExternalMetric` returns one
+    /// `ExternalMetricValue` per series, custom-metrics-apiserver
+    /// test-adapter/provider/provider.go:312-327). Nothing is summed (the
+    /// previous query wrapped the selector in `sum(...)`).
+    pub async fn query_external_series(
         &self,
         metric_name: &str,
         namespace: &str,
         matchers: &[String],
-    ) -> Result<String> {
+    ) -> Result<Vec<ExternalSeries>> {
         let mut label_selectors = vec![format!("namespace=\"{}\"", namespace)];
         label_selectors.extend(matchers.iter().cloned());
-        let query = format!("sum({}{{{}}})", metric_name, label_selectors.join(","));
+        let query = format!("{}{{{}}}", metric_name, label_selectors.join(","));
 
-        debug!("Querying Prometheus for external metric: {}", query);
+        debug!("Querying Prometheus for external metric series: {}", query);
 
-        if let Some(cached_value) = self.get_cached(&query).await {
-            return Ok(cached_value);
+        let response = self
+            .client
+            .query(&query)
+            .get()
+            .await
+            .context("Failed to execute Prometheus query")?;
+        let mut series = Vec::new();
+        if let Some(instant_vector) = response.data().as_vector() {
+            for sample in instant_vector {
+                series.push(external_series_from_sample(
+                    sample.metric(),
+                    &sample.sample().value().to_string(),
+                ));
+            }
         }
-        let value = self.execute_instant_query(&query).await?;
-        self.cache_value(&query, &value, Duration::from_secs(60))
-            .await;
-        Ok(value)
+        Ok(series)
     }
 
     /// Build PromQL query for a specific object
@@ -448,6 +459,31 @@ impl PrometheusClient {
     }
 }
 
+/// One series of an external metric: its labels and value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExternalSeries {
+    pub labels: std::collections::BTreeMap<String, String>,
+    pub value: String,
+}
+
+/// The labels an `ExternalMetricValue` carries for a Prometheus sample. The
+/// `__name__` label is the metric name, which `ExternalMetricValue.metricName`
+/// already reports (Rusternetes-only Prometheus mapping; the upstream test
+/// adapter has no Prometheus).
+pub fn external_series_from_sample(
+    metric: &HashMap<String, String>,
+    value: &str,
+) -> ExternalSeries {
+    ExternalSeries {
+        labels: metric
+            .iter()
+            .filter(|(k, _)| k.as_str() != "__name__")
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        value: value.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,6 +541,23 @@ mod tests {
         assert!(query.contains("service=\"kube-dns\""));
         assert!(query.contains("app=\"nginx\""));
         assert!(query.contains("env=\"production\""));
+    }
+
+    #[test]
+    fn external_series_carry_their_labels_without_the_metric_name() {
+        let metric: HashMap<String, String> = [
+            ("__name__", "queue_depth"),
+            ("queue", "worker"),
+            ("namespace", "default"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let s = external_series_from_sample(&metric, "42");
+        assert_eq!(s.value, "42");
+        assert_eq!(s.labels.len(), 2);
+        assert_eq!(s.labels["queue"], "worker");
+        assert!(!s.labels.contains_key("__name__"));
     }
 
     #[test]
