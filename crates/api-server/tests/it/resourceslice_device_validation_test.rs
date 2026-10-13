@@ -61,7 +61,7 @@ fn cases() -> Vec<(&'static str, Value, &'static str)> {
         (
             "a device with no name",
             with_device(json!({})),
-            "spec.devices[0].name: Required value",
+            "spec.devices[0].name: Invalid value: \"\"",
         ),
         (
             "a device name that is not a DNS-1123 label",
