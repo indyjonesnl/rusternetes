@@ -125,6 +125,7 @@ pub async fn list_custom_metrics(
     }
 
     crate::handlers::validate_synthesized_list_options(&params)?;
+    crate::handlers::filtering::validate_label_selector_param(&params)?;
 
     // Parse label selector if provided
     let (selector, label_map) = if let Some(label_selector) = query.label_selector {

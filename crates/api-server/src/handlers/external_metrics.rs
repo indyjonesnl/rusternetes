@@ -56,6 +56,7 @@ pub async fn list_external_metrics(
     }
 
     crate::handlers::validate_synthesized_list_options(&params)?;
+    crate::handlers::filtering::validate_label_selector_param(&params)?;
 
     // Parse the label selector into both a map (for Prometheus) and the labels
     // echoed back on each metric value.
