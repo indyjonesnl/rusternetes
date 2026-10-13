@@ -1223,3 +1223,66 @@ impl RestStorage<Scale> for CustomResourceScaleRest {
         Ok((scale, false))
     }
 }
+
+#[cfg(test)]
+mod prune_nulls_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn strategy(preserve_unknown_fields: bool) -> Strategy {
+        let crd: CustomResourceDefinition = serde_json::from_value(json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {"name": "widgets.stable.example.com"},
+            "spec": {
+                "group": "stable.example.com", "scope": "Namespaced",
+                "preserveUnknownFields": preserve_unknown_fields,
+                "names": {"plural": "widgets", "kind": "Widget", "listKind": "WidgetList"},
+                "versions": [{"name": "v1", "served": true, "storage": true,
+                    "schema": {"openAPIV3Schema": {"type": "object", "properties": {
+                        "spec": {"type": "object", "properties": {
+                            "plain": {"type": "string"},
+                            "nullable": {"type": "string", "nullable": true},
+                            "defaulted": {"type": "string", "default": "d"},
+                            "nested": {"type": "object", "properties": {
+                                "inner": {"type": "integer"}}}
+                        }}
+                    }}}}]
+            }
+        }))
+        .unwrap();
+        Strategy::new(Arc::new(crd), "v1")
+    }
+
+    fn cr(spec: serde_json::Value) -> CustomResource {
+        serde_json::from_value(json!({
+            "apiVersion": "stable.example.com/v1", "kind": "Widget",
+            "metadata": {"name": "w"}, "spec": spec
+        }))
+        .unwrap()
+    }
+
+    /// customresource_handler.go:1439: non-nullable nulls without a default
+    /// are removed at decode; nullable ones are kept; defaulted ones get
+    /// their default.
+    #[test]
+    fn decode_prunes_non_nullable_nulls_without_defaults() {
+        let mut obj = cr(json!({
+            "plain": null, "nullable": null, "defaulted": null,
+            "nested": {"inner": null}
+        }));
+        strategy(false).coerce(&mut obj);
+        assert_eq!(
+            obj.spec.unwrap(),
+            json!({"nullable": null, "defaulted": "d", "nested": {}})
+        );
+    }
+
+    /// customresource_handler.go:1432: only when `!preserveUnknownFields`.
+    #[test]
+    fn preserve_unknown_fields_skips_null_pruning() {
+        let mut obj = cr(json!({"plain": null}));
+        strategy(true).coerce(&mut obj);
+        assert_eq!(obj.spec.unwrap(), json!({"plain": null, "defaulted": "d"}));
+    }
+}
