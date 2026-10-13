@@ -292,6 +292,336 @@ fn operator_offsets(source: &str) -> (Vec<usize>, Vec<usize>) {
     (brackets, dots)
 }
 
+/// The character offset of the expression ID of the root of the CEL
+/// expression that starts at `start`: the position cel-go reports an error
+/// "at" an expression (`MacroExprFactory.NewError(expr.ID(), ..)`).
+///
+/// Ported from the `parser.go` visitors (cel-go `parser/parser.go:469-760`,
+/// grammar `parser/gen/CEL.g4:24-100`). An expression's ID is the token the
+/// visitor passes to `helper.id`: the `?` of a conditional, the operator of a
+/// `||`/`&&`/relation/calc, the first `!`/`-` of an odd-length unary chain,
+/// the `.` of a select, the `(` of a call (global or member), the `[` of an
+/// index, the `[`/`{` of a list/map/message literal, and the token start of an
+/// identifier or literal (a literal's sign included). `||`/`&&` chains are
+/// balanced (`logicManager.balancedTree`, helper.go:305-322): the root is
+/// operator `len(ops)/2`. Parentheses add no node. `None` when the text is not
+/// a well-formed expression, so the caller keeps its fallback.
+fn cel_root_id_offset(source: &str, start: usize) -> Option<usize> {
+    #[derive(Clone, PartialEq)]
+    enum Tok {
+        Word(String),
+        Num,
+        Str,
+        Punct(&'static str),
+    }
+    const PUNCTS: [&str; 24] = [
+        "<=", ">=", "==", "!=", "&&", "||", "(", ")", "[", "]", "{", "}", ".", ",", ":", "?", "!",
+        "-", "+", "*", "/", "%", "<", ">",
+    ];
+    let chars: Vec<char> = source.chars().collect();
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    let mut toks: Vec<(Tok, usize)> = Vec::new();
+    let mut i = start;
+    while i < chars.len() {
+        let c = chars[i];
+        let after_operand = matches!(
+            toks.last(),
+            Some((
+                Tok::Word(_) | Tok::Num | Tok::Str | Tok::Punct(")" | "]" | "}"),
+                _
+            ))
+        );
+        let next_is_digit = chars.get(i + 1).is_some_and(|d| d.is_ascii_digit());
+        // A string prefix (`r`, `b`, `rb`, `br`, any case) right before a quote.
+        let prefix_len = chars[i..]
+            .iter()
+            .take_while(|ch| matches!(ch, 'r' | 'R' | 'b' | 'B'))
+            .count();
+        let is_string = c == '"'
+            || c == '\''
+            || (prefix_len > 0
+                && prefix_len <= 2
+                && matches!(chars.get(i + prefix_len), Some('"' | '\'')));
+        if c.is_whitespace() {
+            i += 1;
+        } else if c == '/' && chars.get(i + 1) == Some(&'/') {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+        } else if c.is_ascii_digit() || (c == '.' && next_is_digit && !after_operand) {
+            let at = i;
+            while i < chars.len() {
+                let ch = chars[i];
+                let exp_sign = matches!(ch, '+' | '-')
+                    && matches!(chars[i - 1], 'e' | 'E')
+                    && chars.get(i + 1).is_some_and(|d| d.is_ascii_digit());
+                let frac_dot = ch == '.' && chars.get(i + 1).is_some_and(|d| d.is_ascii_digit());
+                if ident(ch) || exp_sign || frac_dot {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            toks.push((Tok::Num, at));
+        } else if is_string {
+            let at = i;
+            let raw = chars[i..i + prefix_len]
+                .iter()
+                .any(|ch| matches!(ch, 'r' | 'R'));
+            i += prefix_len;
+            let q = chars[i];
+            let n = if chars.get(i + 1) == Some(&q) && chars.get(i + 2) == Some(&q) {
+                3
+            } else {
+                1
+            };
+            i += n;
+            loop {
+                if i >= chars.len() {
+                    return None;
+                }
+                if chars[i] == '\\' && !raw {
+                    i += 2;
+                } else if chars[i] == q
+                    && (n == 1 || (chars.get(i + 1) == Some(&q) && chars.get(i + 2) == Some(&q)))
+                {
+                    i += n;
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+            toks.push((Tok::Str, at));
+        } else if ident(c) {
+            let at = i;
+            while i < chars.len() && ident(chars[i]) {
+                i += 1;
+            }
+            toks.push((Tok::Word(chars[at..i].iter().collect()), at));
+        } else {
+            let p = PUNCTS.iter().find(|p| {
+                p.chars()
+                    .enumerate()
+                    .all(|(k, pc)| chars.get(i + k) == Some(&pc))
+            })?;
+            toks.push((Tok::Punct(p), i));
+            i += p.len();
+        }
+    }
+
+    struct P {
+        toks: Vec<(Tok, usize)>,
+        at: usize,
+    }
+    impl P {
+        fn punct(&self, p: &str) -> bool {
+            matches!(self.toks.get(self.at), Some((Tok::Punct(q), _)) if *q == p)
+        }
+        fn pos(&self) -> Option<usize> {
+            self.toks.get(self.at).map(|t| t.1)
+        }
+        fn eat(&mut self, p: &str) -> Option<usize> {
+            if !self.punct(p) {
+                return None;
+            }
+            let pos = self.pos();
+            self.at += 1;
+            pos
+        }
+        /// `exprList` / `mapInitializerList`: comma separated items up to
+        /// (not including) `close`.
+        fn list(&mut self, close: &str, pairs: bool) -> Option<()> {
+            while !self.punct(close) {
+                self.eat("?");
+                self.expr()?;
+                if pairs {
+                    self.eat(":")?;
+                    self.expr()?;
+                }
+                if self.eat(",").is_none() {
+                    break;
+                }
+            }
+            Some(())
+        }
+        fn expr(&mut self) -> Option<usize> {
+            let e = self.chain(true)?;
+            if let Some(q) = self.eat("?") {
+                self.chain(true)?;
+                self.eat(":")?;
+                self.expr()?;
+                return Some(q);
+            }
+            Some(e)
+        }
+        /// `conditionalOr` (`or`) / `conditionalAnd`: a balanced chain.
+        fn chain(&mut self, or: bool) -> Option<usize> {
+            let (op, mut ops) = (if or { "||" } else { "&&" }, Vec::new());
+            let first = self.operand(or)?;
+            while let Some(p) = self.eat(op) {
+                ops.push(p);
+                self.operand(or)?;
+            }
+            Some(if ops.is_empty() {
+                first
+            } else {
+                ops[ops.len() / 2]
+            })
+        }
+        fn operand(&mut self, or: bool) -> Option<usize> {
+            if or {
+                self.chain(false)
+            } else {
+                self.relation()
+            }
+        }
+        fn rel_op(&self) -> bool {
+            match self.toks.get(self.at) {
+                Some((Tok::Punct(p), _)) => ["<", "<=", ">=", ">", "==", "!="].contains(p),
+                Some((Tok::Word(w), _)) => w == "in",
+                _ => false,
+            }
+        }
+        /// Left-associative levels: the root is the last operator.
+        fn relation(&mut self) -> Option<usize> {
+            let mut root = self.add()?;
+            while self.rel_op() {
+                root = self.pos()?;
+                self.at += 1;
+                self.add()?;
+            }
+            Some(root)
+        }
+        fn add(&mut self) -> Option<usize> {
+            let mut root = self.mul()?;
+            while self.punct("+") || self.punct("-") {
+                root = self.pos()?;
+                self.at += 1;
+                self.mul()?;
+            }
+            Some(root)
+        }
+        fn mul(&mut self) -> Option<usize> {
+            let mut root = self.unary()?;
+            while self.punct("*") || self.punct("/") || self.punct("%") {
+                root = self.pos()?;
+                self.at += 1;
+                self.unary()?;
+            }
+            Some(root)
+        }
+        fn unary(&mut self) -> Option<usize> {
+            let first = self.pos()?;
+            for op in ["!", "-"] {
+                // A `-` directly before a number is the literal's sign.
+                let signed = op == "-" && matches!(self.toks.get(self.at + 1), Some((Tok::Num, _)));
+                if self.punct(op) && !signed {
+                    let mut n = 0;
+                    while self.eat(op).is_some() {
+                        n += 1;
+                    }
+                    let inner = self.member()?;
+                    return Some(if n % 2 == 0 { inner } else { first });
+                }
+            }
+            self.member()
+        }
+        fn member(&mut self) -> Option<usize> {
+            let mut root = self.primary()?;
+            loop {
+                if let Some(dot) = self.eat(".") {
+                    self.eat("?");
+                    if !matches!(self.toks.get(self.at), Some((Tok::Word(_), _))) {
+                        return None;
+                    }
+                    self.at += 1;
+                    root = match self.eat("(") {
+                        Some(open) => {
+                            self.list(")", false)?;
+                            self.eat(")")?;
+                            open
+                        }
+                        None => dot,
+                    };
+                } else if let Some(open) = self.eat("[") {
+                    self.eat("?");
+                    self.expr()?;
+                    self.eat("]")?;
+                    root = open;
+                } else {
+                    return Some(root);
+                }
+            }
+        }
+        fn primary(&mut self) -> Option<usize> {
+            if self.eat("(").is_some() {
+                let inner = self.expr()?;
+                self.eat(")")?;
+                return Some(inner);
+            }
+            if let Some(open) = self.eat("[") {
+                self.list("]", false)?;
+                self.eat("]")?;
+                return Some(open);
+            }
+            if let Some(open) = self.eat("{") {
+                self.list("}", true)?;
+                self.eat("}")?;
+                return Some(open);
+            }
+            self.eat(".");
+            match self.toks.get(self.at).cloned() {
+                Some((Tok::Num | Tok::Str, pos)) => {
+                    self.at += 1;
+                    Some(pos)
+                }
+                Some((Tok::Punct("-"), pos)) => {
+                    // the sign of a numeric literal
+                    self.at += 1;
+                    if matches!(self.toks.get(self.at), Some((Tok::Num, _))) {
+                        self.at += 1;
+                        Some(pos)
+                    } else {
+                        None
+                    }
+                }
+                Some((Tok::Word(_), pos)) => {
+                    // `a.b.C{..}` (CreateMessage): the ID is the `{`.
+                    let mut j = self.at + 1;
+                    while matches!(self.toks.get(j), Some((Tok::Punct("."), _)))
+                        && matches!(self.toks.get(j + 1), Some((Tok::Word(_), _)))
+                    {
+                        j += 2;
+                    }
+                    if let Some((Tok::Punct("{"), open)) = self.toks.get(j).cloned() {
+                        self.at = j + 1;
+                        while !self.punct("}") {
+                            self.eat("?");
+                            self.at += 1; // field name
+                            self.eat(":")?;
+                            self.expr()?;
+                            if self.eat(",").is_none() {
+                                break;
+                            }
+                        }
+                        self.eat("}")?;
+                        return Some(open);
+                    }
+                    self.at += 1;
+                    if let Some(open) = self.eat("(") {
+                        self.list(")", false)?;
+                        self.eat(")")?;
+                        return Some(open);
+                    }
+                    Some(pos)
+                }
+                _ => None,
+            }
+        }
+    }
+    P { toks, at: 0 }.expr()
+}
+
 struct Checker<'a> {
     source: &'a str,
     brackets: Vec<usize>,
@@ -439,18 +769,19 @@ impl<'a> Checker<'a> {
                 }
                 None if is_bind_call(c) => {
                     // ext/bindings.go:172-179 celBind: a non-identifier
-                    // variable is a macro error at the variable's position
-                    // (approximated by the argument start; cel-go uses the
-                    // expression ID, which for operators is the operator).
+                    // variable is a macro error at `varIdent.ID()`, the
+                    // argument's expression ID (`cel_root_id_offset`); the
+                    // argument start when its text cannot be re-read.
                     let dot = self.take_dot();
                     let at = dot.and_then(|d| {
                         let rest: Vec<(usize, char)> =
                             self.source.chars().enumerate().skip(d).collect();
                         let open = rest.iter().position(|(_, ch)| *ch == '(')?;
-                        rest[open + 1..]
+                        let arg_start = rest[open + 1..]
                             .iter()
                             .find(|(_, ch)| !ch.is_whitespace())
-                            .map(|(i, _)| *i)
+                            .map(|(i, _)| *i)?;
+                        Some(cel_root_id_offset(self.source, arg_start).unwrap_or(arg_start))
                     });
                     self.report(
                         at,
@@ -1595,6 +1926,11 @@ mod tests {
             ("a || b || c", 17),
             ("a && b", 12),
             ("(a.b)", 12),
+            ("{1: 2}", 10),
+            ("1.5 + 2e-3", 14),
+            ("!!a", 12),
+            ("a.b.c", 13),
+            ("a.f(1, 2)", 13),
             ("\"s,\".size()", 19),
         ] {
             assert_eq!(col(arg), want, "{arg}");
