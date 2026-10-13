@@ -436,6 +436,9 @@ async fn async_main() -> Result<()> {
         .collect::<Result<Vec<_>, _>>()?;
     let cm_config = rusternetes_controller_manager::ControllerManagerConfig {
         sync_interval: args.sync_interval,
+        // The all-in-one binary does not expose the `--pv-recycler-*` flags;
+        // upstream's flag defaults apply.
+        pv_recycler: Default::default(),
         metrics_config,
         ca_cert_pem: cm_ca_pem,
         // All-in-one does not expose node-IPAM flags; pod-CIDR allocation is a

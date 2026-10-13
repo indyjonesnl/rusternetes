@@ -231,6 +231,9 @@ pub struct PVBinderController<S: Storage> {
     /// operations currently running, so one is never started twice
     /// (`scheduleOperation`, `pv_controller.go:1895-1914`).
     running_operations: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// The recycler `VolumeConfig` of the hostPath and NFS plugins
+    /// (`ProbeProvisionableRecyclableVolumePlugins`, `plugins.go:100-120`).
+    recycler_config: Arc<super::pv_recycler::RecyclerConfig>,
 }
 
 impl<S: Storage + 'static> PVBinderController<S> {
@@ -239,7 +242,15 @@ impl<S: Storage + 'static> PVBinderController<S> {
             recorder: EventRecorder::new(Arc::clone(&storage)),
             storage,
             running_operations: Arc::default(),
+            recycler_config: Arc::default(),
         }
+    }
+
+    /// Use the recycler plugin config built from the `--pv-recycler-*` flags
+    /// (`newPersistentVolumeBinderController`, `core.go:322`).
+    pub fn with_recycler_config(mut self, config: super::pv_recycler::RecyclerConfig) -> Self {
+        self.recycler_config = Arc::new(config);
+        self
     }
 
     /// A handle for a detached volume operation: shares storage, recorder and
@@ -250,6 +261,7 @@ impl<S: Storage + 'static> PVBinderController<S> {
             storage: Arc::clone(&self.storage),
             recorder: self.recorder.clone(),
             running_operations: Arc::clone(&self.running_operations),
+            recycler_config: Arc::clone(&self.recycler_config),
         }
     }
 
@@ -968,7 +980,8 @@ impl<S: Storage + 'static> PVBinderController<S> {
         }
 
         // Find a plugin.
-        let Some(pod) = super::pv_recycler::recycler_pod_for_volume(&volume) else {
+        let Some(pod) = super::pv_recycler::recycler_pod_for_volume(&volume, &self.recycler_config)
+        else {
             // No recycler found. Emit an event and mark the volume Failed.
             if let Err(e) = self
                 .update_volume_phase_with_event(
