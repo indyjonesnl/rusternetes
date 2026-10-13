@@ -278,6 +278,19 @@ fn validate_pod_specific_annotation_updates(new: &Pod, old: &Pod, fld_path: &Pat
 /// off with the gate, and on an update only when the old annotations were
 /// already invalid.
 pub fn validate_pod_metadata_annotations(pod: &Pod, old: Option<&Pod>) -> ErrorList {
+    validate_pod_metadata_annotations_with_opts(pod, old, old.is_some())
+}
+
+/// The same, with the options source (`old`, for
+/// `GetValidationOptionsFromPodSpecAndMeta`) split from whether
+/// `ValidatePodSpecificAnnotationUpdates` runs. `ValidatePodResize`
+/// (validation.go:6217-6222) derives its options from the old pod but never
+/// runs the update half.
+pub fn validate_pod_metadata_annotations_with_opts(
+    pod: &Pod,
+    old: Option<&Pod>,
+    run_annotation_updates: bool,
+) -> ErrorList {
     let fld_path = Path::new("metadata").child("annotations");
     let empty = HashMap::new();
     let annotations = pod.metadata.annotations.as_ref().unwrap_or(&empty);
@@ -298,7 +311,7 @@ pub fn validate_pod_metadata_annotations(pod: &Pod, old: Option<&Pod>) -> ErrorL
         &fld_path,
         allow_invalid_pod_deletion_cost,
     );
-    if let Some(old) = old {
+    if let Some(old) = old.filter(|_| run_annotation_updates) {
         errs.extend(validate_pod_specific_annotation_updates(
             pod, old, &fld_path,
         ));
