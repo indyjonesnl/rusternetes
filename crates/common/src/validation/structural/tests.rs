@@ -627,11 +627,45 @@ fn pattern_must_compile() {
         "type": "object",
         "properties": {"a": {"type": "string", "pattern": "("}}
     }));
-    let got = msgs(&validate_structural(&root(), &s));
-    assert_eq!(got.len(), 1, "{got:?}");
-    assert!(got[0].starts_with(
-        r#"spec.versions[0].schema.openAPIV3Schema.properties[a].pattern: Invalid value: "(": must be a valid regular expression, but isn't: "#
-    ));
+    assert_eq!(
+        msgs(&validate_structural(&root(), &s)),
+        [r#"spec.versions[0].schema.openAPIV3Schema.properties[a].pattern: Invalid value: "(": must be a valid regular expression, but isn't: error parsing regexp: missing closing ): `(`"#]
+    );
+}
+
+/// The wording is Go's `*syntax.Error` text (`regexp/syntax/parse.go`,
+/// `func (e *Error) Error()`): `error parsing regexp: <code>: `<expr>``.
+/// Expected strings were produced by `regexp.Compile` under Go 1.25.9.
+#[test]
+fn pattern_compile_errors_use_go_wording() {
+    let cases: &[(&str, &str)] = &[
+        ("(abc", "missing closing ): `(abc`"),
+        ("abc)", "unexpected ): `abc)`"),
+        ("a**", "invalid nested repetition operator: `**`"),
+        ("*", "missing argument to repetition operator: `*`"),
+        ("a{1001}", "invalid repeat count: `{1001}`"),
+        ("(a{600}){2}", "invalid repeat count: `{2}`"),
+        ("[a", "missing closing ]: `[a`"),
+        ("[z-a]", "invalid character class range: `z-a`"),
+        ("[[:foo:]]", "invalid character class range: `[:foo:]`"),
+        ("\\q", "invalid escape sequence: `\\q`"),
+        ("\\", "trailing backslash at end of expression: ``"),
+        ("\\p{Foo}", "invalid character class range: `\\p{Foo}`"),
+        ("(?z)", "invalid or unsupported Perl syntax: `(?z`"),
+        ("(?<=x)", "invalid named capture: `(?<=x)`"),
+        ("(?=x)", "invalid or unsupported Perl syntax: `(?=`"),
+    ];
+    for (pattern, want) in cases {
+        let s = structural(json!({
+            "type": "object",
+            "properties": {"a": {"type": "string", "pattern": pattern}}
+        }));
+        let got = msgs(&validate_structural(&root(), &s));
+        let want = format!(
+            "spec.versions[0].schema.openAPIV3Schema.properties[a].pattern: Invalid value: {pattern:?}: must be a valid regular expression, but isn't: error parsing regexp: {want}"
+        );
+        assert_eq!(got, [want], "pattern {pattern:?}");
+    }
 }
 
 #[test]
