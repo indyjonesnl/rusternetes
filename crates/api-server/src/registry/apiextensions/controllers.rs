@@ -6,7 +6,8 @@
 //! - `pkg/controller/establish/establishing_controller.go` (`sync`): the
 //!   `Established` condition,
 //! - `pkg/controller/finalizer/crd_finalizer.go` (`sync`): the `Terminating`
-//!   condition around deleting the instances,
+//!   condition around deleting the instances (its queue, event filters and
+//!   workers are in `finalizer_queue.rs`),
 //!
 //! all under `staging/src/k8s.io/apiextensions-apiserver/`, plus the helpers
 //! of `pkg/apis/apiextensions/helpers.go` they share.
@@ -21,9 +22,8 @@
 //! The `nonstructuralschema` and `apiapproval` controllers live in
 //! `condition_controllers.rs`.
 //!
-//! Not modelled: the finalizer's `OverlappingBuiltInResources` skip. The
-//! finalizer's wait for the instances to be gone is ported, and instances are
-//! deleted through their store, so one holding a finalizer keeps the CRD
+//! The finalizer's wait for the instances to be gone is ported, and instances
+//! are deleted through their store, so one holding a finalizer keeps the CRD
 //! Terminating until it is really gone.
 
 use std::collections::HashSet;

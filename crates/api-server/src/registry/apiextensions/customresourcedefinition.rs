@@ -42,6 +42,7 @@ use super::controllers::{
     self, condition, crd_has_finalizer, crd_remove_finalizer, set_crd_condition, ESTABLISHED,
     TERMINATING,
 };
+use super::finalizer_queue;
 use crate::registry::generic::{CreateOptions, Deleted, Store, UpdateOptions};
 use crate::registry::rest::{
     GroupResource, NamespaceScopedStrategy, RequestContext, RestCreateStrategy, RestDeleteStrategy,
@@ -399,10 +400,39 @@ impl CrdStatusRest {
     }
 }
 
+/// The informer's event handlers of the CRD finalizer: `AddFunc` for a
+/// create (`old` is `None`), `UpdateFunc` otherwise
+/// (crd_finalizer.go:332-366); a CRD they accept is queued on the
+/// finalizer's workqueue, whose workers are started on first use.
+fn finalizer_event(
+    controllers: &Arc<super::controller_queue::CrdControllers>,
+    storage: &Arc<StorageBackend>,
+    old: Option<&CustomResourceDefinition>,
+    new: &CustomResourceDefinition,
+) {
+    // A write that changed nothing makes no new revision, so no event (the
+    // informer only sees revisions); the same revision is the resync, which
+    // `resync_one` delivers itself.
+    if old.is_some_and(|o| o.metadata.resource_version == new.metadata.resource_version) {
+        return;
+    }
+    let enqueue = match old {
+        None => finalizer_queue::add_event_enqueues(new),
+        Some(old) => finalizer_queue::update_event_enqueues(old, new),
+    };
+    if enqueue {
+        controllers.ensure_started(storage.clone());
+        controllers.finalizer.add(&new.metadata.name);
+    }
+}
+
 /// An update whose new object is computed from the stored one — a controller
 /// writing through `UpdateStatus`.
 struct ControllerUpdate<'a> {
     compute: &'a (dyn Fn(&CustomResourceDefinition) -> CustomResourceDefinition + Send + Sync),
+    /// The stored object the last attempt was computed from: the informer's
+    /// `oldObj` for the write's event.
+    old: std::sync::Mutex<Option<CustomResourceDefinition>>,
 }
 
 #[async_trait]
@@ -417,7 +447,44 @@ impl UpdatedObjectInfo<CustomResourceDefinition> for ControllerUpdate<'_> {
         old: Option<&CustomResourceDefinition>,
     ) -> Result<CustomResourceDefinition> {
         let old = old.ok_or_else(|| Error::NotFound("customresourcedefinition".to_string()))?;
+        *self.old.lock().unwrap_or_else(|e| e.into_inner()) = Some(old.clone());
         Ok((self.compute)(old))
+    }
+}
+
+/// An update that remembers the stored object it was applied to: the
+/// informer's `oldObj` for the event the write causes.
+struct RecordOld<'a> {
+    inner: &'a dyn UpdatedObjectInfo<CustomResourceDefinition>,
+    old: std::sync::Mutex<Option<CustomResourceDefinition>>,
+}
+
+impl<'a> RecordOld<'a> {
+    fn new(inner: &'a dyn UpdatedObjectInfo<CustomResourceDefinition>) -> Self {
+        Self {
+            inner,
+            old: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn take(&self) -> Option<CustomResourceDefinition> {
+        self.old.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+#[async_trait]
+impl UpdatedObjectInfo<CustomResourceDefinition> for RecordOld<'_> {
+    fn preconditions(&self) -> Option<Preconditions> {
+        self.inner.preconditions()
+    }
+
+    async fn updated_object(
+        &self,
+        ctx: &RequestContext,
+        old: Option<&CustomResourceDefinition>,
+    ) -> Result<CustomResourceDefinition> {
+        *self.old.lock().unwrap_or_else(|e| e.into_inner()) = old.cloned();
+        self.inner.updated_object(ctx, old).await
     }
 }
 
@@ -450,6 +517,26 @@ impl CrdRest {
         self.controllers.add(name);
     }
 
+    fn finalizer_event(
+        &self,
+        old: Option<&CustomResourceDefinition>,
+        new: &CustomResourceDefinition,
+    ) {
+        finalizer_event(&self.controllers, &self.store.storage, old, new);
+    }
+
+    /// `sync` (crd_finalizer.go:112-179) for one key off the finalizer's
+    /// queue. A CRD it removed is a `DeleteFunc` for the other controllers
+    /// (naming_controller.go:365-379): its names are free again.
+    pub(super) async fn process_finalizer_key(&self, name: &str) -> Result<()> {
+        self.finalize(name).await?;
+        if self.get_crd(name).await?.is_none() {
+            self.controllers.conditions.forget(name);
+            self.enqueue(name);
+        }
+        Ok(())
+    }
+
     fn ctx() -> RequestContext {
         RequestContext::new(None)
     }
@@ -464,8 +551,11 @@ impl CrdRest {
         name: &str,
         compute: &(dyn Fn(&CustomResourceDefinition) -> CustomResourceDefinition + Send + Sync),
     ) -> Result<Option<CustomResourceDefinition>> {
-        let update = ControllerUpdate { compute };
-        match self
+        let update = ControllerUpdate {
+            compute,
+            old: std::sync::Mutex::new(None),
+        };
+        let result = self
             .status_store
             .update(
                 &Self::ctx(),
@@ -476,9 +566,15 @@ impl CrdRest {
                 false,
                 &UpdateOptions::default(),
             )
-            .await
-        {
-            Ok((out, _)) => Ok(Some(out)),
+            .await;
+        match result {
+            Ok((out, _)) => {
+                // The write is an informer event for the finalizer too (its
+                // own `UpdateStatus` calls included).
+                let old = update.old.lock().unwrap_or_else(|e| e.into_inner()).take();
+                self.finalizer_event(old.as_ref(), &out);
+                Ok(Some(out))
+            }
             Err(Error::NotFound(_)) | Err(Error::Conflict(_)) => Ok(None),
             Err(e) => Err(e),
         }
@@ -613,8 +709,8 @@ impl CrdRest {
     /// One CRD as the informer-driven controllers see it on a resync: the
     /// naming and establishing controllers' `sync` (their `UpdateFunc`
     /// enqueues every update, resyncs included - naming_controller.go:359-363),
-    /// then the finalizer's, which only acts on a CRD that is being deleted
-    /// and still holds the cleanup finalizer (crd_finalizer.go:330-335).
+    /// then the finalizer's event, which queues a CRD that is being deleted
+    /// and still holds the cleanup finalizer (crd_finalizer.go:341-352).
     pub async fn resync_one(&self, name: &str) -> Result<()> {
         let Some(crd) = self.get_crd(name).await? else {
             return Ok(());
@@ -622,9 +718,13 @@ impl CrdRest {
         if self.sync_one(name).await? {
             self.sync_group_except(&crd.spec.group, name).await?;
         }
-        self.finalize(name).await?;
-        if self.get_crd(name).await?.is_none() {
-            self.controllers.conditions.forget(name);
+        // The finalizer's `UpdateFunc` for a resync, `oldObj` being `newObj`
+        // (crd_finalizer.go:348-352): "always requeue resyncs just in case".
+        if let Some(crd) = self.get_crd(name).await? {
+            if finalizer_queue::update_event_enqueues(&crd, &crd) {
+                self.controllers.ensure_started(self.store.storage.clone());
+                self.controllers.finalizer.add(name);
+            }
         }
         Ok(())
     }
@@ -821,7 +921,19 @@ impl CrdRest {
 
         // Now we can start deleting items. No need to delete if not
         // established.
-        let terminating = if is_crd_condition_true(&crd, ESTABLISHED) {
+        // "Skip deletion, explain why, and proceed to remove the finalizer and
+        // delete the CRD" (crd_finalizer.go:140-146).
+        let terminating = if finalizer_queue::overlapping_built_in_resource(
+            &crd.spec.group,
+            &crd.spec.names.plural,
+        ) {
+            condition(
+                TERMINATING,
+                "False",
+                "OverlappingBuiltInResource",
+                "instances overlap with built-in resources in storage",
+            )
+        } else if is_crd_condition_true(&crd, ESTABLISHED) {
             match self.delete_instances(&crd).await {
                 Ok(()) => condition(
                     TERMINATING,
@@ -962,6 +1074,7 @@ impl RestStorage<CustomResourceDefinition> for CrdRest {
         // The create event wakes the controllers; the response is the object
         // as written, without their conditions.
         self.enqueue(&created.metadata.name);
+        self.finalizer_event(None, &created);
         Ok(created)
     }
 
@@ -975,11 +1088,12 @@ impl RestStorage<CustomResourceDefinition> for CrdRest {
         force_allow_create: bool,
         options: &UpdateOptions,
     ) -> Result<(CustomResourceDefinition, bool)> {
+        let recorded = RecordOld::new(obj_info);
         let (updated, created) = RestStorage::update(
             &self.store,
             ctx,
             name,
-            obj_info,
+            &recorded,
             create_validation,
             update_validation,
             force_allow_create,
@@ -990,6 +1104,7 @@ impl RestStorage<CustomResourceDefinition> for CrdRest {
             return Ok((updated, created));
         }
         self.enqueue(name);
+        self.finalizer_event(recorded.take().as_ref(), &updated);
         Ok((updated, created))
     }
 
@@ -1055,31 +1170,14 @@ impl RestStorage<CustomResourceDefinition> for CrdRest {
                 )
                 .await?;
             if !dry_run {
-                // The CRD finalizer is informer-driven upstream; here the
-                // delete that woke it runs it.
-                if let Err(e) = self.finalize(name).await {
-                    warn!("customresourcedefinition {name}: finalizer failed: {e}");
-                }
-                if self.get_crd(name).await?.is_none() {
-                    self.controllers.conditions.forget(name);
-                }
-                let _ = self.sync_group_except(&out.spec.group, name).await;
+                // The update that stamped the deletion is the informer event
+                // that wakes the CRD finalizer (crd_finalizer.go:341-366); its
+                // workers run off their own queue, so this returns now.
+                self.finalizer_event(Some(&crd), &out);
             }
             return Ok((Deleted::Object(out), false));
         }
 
-        // A CRD whose first delete did not finish (the finalizer failed)
-        // gets another go, as the controller's resync would give it.
-        if !dry_run && crd_has_finalizer(&crd, CUSTOM_RESOURCE_CLEANUP_FINALIZER) {
-            if let Err(e) = self.finalize(name).await {
-                warn!("customresourcedefinition {name}: finalizer failed: {e}");
-            }
-            if self.get_crd(name).await?.is_none() {
-                self.controllers.conditions.forget(name);
-                let _ = self.sync_group_except(&crd.spec.group, name).await;
-                return Ok((Deleted::Object(crd), false));
-            }
-        }
         let out = RestStorage::delete(&self.store, ctx, name, delete_validation, options).await?;
         // `DeleteFunc` -> `queue.Add(key)` (naming_controller.go:365-379).
         if !dry_run {
@@ -1158,11 +1256,12 @@ impl RestStorage<CustomResourceDefinition> for CrdStatusRest {
         force_allow_create: bool,
         options: &UpdateOptions,
     ) -> Result<(CustomResourceDefinition, bool)> {
+        let recorded = RecordOld::new(obj_info);
         let out = RestStorage::update(
             &self.store,
             ctx,
             name,
-            obj_info,
+            &recorded,
             create_validation,
             update_validation,
             force_allow_create,
@@ -1172,6 +1271,9 @@ impl RestStorage<CustomResourceDefinition> for CrdStatusRest {
         if !options.dry_run {
             self.controllers.ensure_started(self.store.storage.clone());
             self.controllers.add(name);
+            let old = recorded.take();
+            let new = out.0.clone();
+            finalizer_event(&self.controllers, &self.store.storage, old.as_ref(), &new);
         }
         Ok(out)
     }
@@ -1349,7 +1451,8 @@ impl ControllerRateLimiter {
 ///
 /// Upstream's controllers also react to each watch event; here a CRD write
 /// queues the CRD on the workqueue of `controller_queue.rs`, so this task is
-/// the resync-driven half. (The finalizer still runs inline in `REST.Delete`.)
+/// the resync-driven half. The finalizer has its own queue and workers
+/// (`finalizer_queue.rs`), fed by the same writes.
 ///
 /// Registered as the `start-apiextensions-controllers` post-start hook
 /// (apiserver.go:228-261: `go <controller>.Run(...)` for each, `return nil`).

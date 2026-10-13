@@ -565,7 +565,22 @@ async fn deleted_crd_is_removed_from_openapi_v2() {
         del
     );
 
-    let v2_after = get_openapi_v2(&state).await;
+    // The CRD finalizer runs off its own queue (crd_finalizer.go:73-76): the
+    // definition goes once the CRD does, shortly after the delete returns.
+    let mut v2_after = get_openapi_v2(&state).await;
+    for _ in 0..200 {
+        if !v2_after
+            .pointer("/definitions")
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key(&def_key("example.com", "v1", "Foo"))
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        v2_after = get_openapi_v2(&state).await;
+    }
     let defs = v2_after
         .pointer("/definitions")
         .unwrap()
