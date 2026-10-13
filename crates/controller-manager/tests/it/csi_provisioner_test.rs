@@ -2076,7 +2076,8 @@ async fn immediate_claim_taken_by_another_node_while_waiting_is_not_overwritten(
 
 /// controller.go:1781-1782 (external-provisioner v6.4.0): `case
 /// <-ctx.Done(): return errors.New("timed out waiting to become PVC owner")`,
-/// wrapped by checkNode (:1676-1677) as `PVC <ns>/<name>: <err>`.
+/// wrapped by checkNode (:1676-1677) as `PVC <ns>/<name>: <err>` and by
+/// Provision (:860) as `node check failed: <err>`.
 #[tokio::test]
 async fn become_owner_aborts_when_the_provisioner_is_shut_down() {
     let (storage, p, _rec, _d) = env(
@@ -2093,7 +2094,7 @@ async fn become_owner_aborts_when_the_provisioner_is_shut_down() {
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
     assert_eq!(
         format!("{err:#}"),
-        "PVC ns1/data: timed out waiting to become PVC owner"
+        "node check failed: PVC ns1/data: timed out waiting to become PVC owner"
     );
     assert_eq!(selected_node_of(&storage).await, None);
 }
