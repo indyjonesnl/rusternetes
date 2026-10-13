@@ -761,6 +761,19 @@ mod avoid_pods_tests {
         assert!(errs[0].detail.contains("must point to a controller"));
     }
 
+    // validatePreferAvoidPodsEntry (validation.go:5121-5135) dereferences
+    // `*PodController.Controller` unchecked: an owner reference without
+    // `controller` is a nil-pointer dereference, i.e. a Go panic that
+    // `WithPanicRecovery` turns into a 500 (#3378).
+    #[test]
+    #[should_panic(expected = "nil pointer dereference")]
+    fn unset_controller_panics_like_upstream_nil_deref() {
+        let raw = r#"{"preferAvoidPods":[{"podSignature":{"podController":{
+            "apiVersion":"v1","kind":"ReplicationController","name":"foo",
+            "uid":"abcdef123456"}}}]}"#;
+        let _ = validate_node(&node_with_avoid(raw));
+    }
+
     #[test]
     fn undecodable_annotation_is_invalid_at_avoid_pods() {
         let f = fields("not json");
