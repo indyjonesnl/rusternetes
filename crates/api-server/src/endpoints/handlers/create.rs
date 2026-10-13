@@ -93,7 +93,7 @@ pub async fn create_resource<T: Object>(
     obj = admission.admit(Operation::Create, obj, None).await?;
     dedup_owner_references_and_add_warning(&mut obj, &ctx, true);
     // The dispatcher decodes a webhook's patched object like a request body.
-    scope.convert(&mut obj);
+    scope.convert(&mut obj)?;
     let validation = CreateValidation {
         admission: &admission,
         authorize_create: false,

@@ -973,7 +973,7 @@ impl<T: Object> TransformFunc<T> for MutatingAdmission<'_, T> {
                     .await?
             }
         };
-        self.scope.convert(&mut obj);
+        self.scope.convert(&mut obj)?;
         // Dedup owner references again after mutating admission:
         // update.go:185-189 and patch.go:691-697 (`patch` only dedups here).
         super::rest::dedup_owner_references_and_add_warning(&mut obj, ctx, true);

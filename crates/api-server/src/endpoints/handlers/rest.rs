@@ -102,11 +102,11 @@ impl<T: Object> RequestScope<T> {
     }
 
     /// Run [`Self::convert_to_internal`] on a freshly built object.
-    pub(super) fn convert(&self, obj: &mut T) {
+    pub(super) fn convert(&self, obj: &mut T) -> Result<()> {
         if let Some(convert) = self.convert_to_internal {
             convert(obj);
         }
-        self.store.decode_coerce(obj);
+        self.store.decode_coerce(obj)
     }
 
     /// `scope.FieldManager` (installer.go:697-722 `NewDefaultFieldManager`):
@@ -231,7 +231,7 @@ pub(super) fn decode<T: Object>(
                 .map(|field| format!("unknown field \"{field}\"")),
         );
     }
-    scope.convert(&mut obj);
+    scope.convert(&mut obj)?;
     Ok((obj, warnings))
 }
 

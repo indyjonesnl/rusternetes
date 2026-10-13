@@ -748,7 +748,9 @@ pub trait RestStorage<T: Object>: Send + Sync {
     /// `schemaCoercingDecoder` + `unstructuredDefaulter`
     /// (customresource_handler.go:1189-1200, 1321-1346). Runs wherever
     /// `RequestScope::convert` does. Nothing for every other storage.
-    fn decode_coerce(&self, _obj: &mut T) {}
+    fn decode_coerce(&self, _obj: &mut T) -> Result<()> {
+        Ok(())
+    }
 
     /// The decoder's strict-decoding verdict on a body, judged before
     /// [`Self::decode_coerce`] prunes the unknown fields away

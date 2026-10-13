@@ -410,7 +410,7 @@ impl<T: Object> TransformFunc<T> for Patcher<'_, T> {
         // request body is (patch.go:357-363, :792); a strict decode judges it
         // before the pruning.
         self.scope.store.decode_strict(&obj)?;
-        self.scope.convert(&mut obj);
+        self.scope.convert(&mut obj)?;
 
         let uid = &obj.metadata().uid;
         if !uid.is_empty() && current.is_none() {
