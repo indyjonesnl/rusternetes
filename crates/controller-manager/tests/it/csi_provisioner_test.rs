@@ -2045,25 +2045,28 @@ async fn immediate_claim_taken_by_another_node_while_waiting_is_not_overwritten(
     put_node(&storage, "foo", Some("foo"), true).await;
     let p = p.with_node_deployment(immediate_deployment(std::time::Duration::from_secs(2)));
     let c = put_claim(&storage, &claim(&[(ANN, DRIVER)])).await;
-    let s2 = storage.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let mut other: PersistentVolumeClaim = s2
-            .get(&build_key("persistentvolumeclaims", Some("ns1"), "data"))
-            .await
-            .unwrap();
-        other
-            .metadata
-            .annotations
-            .get_or_insert_with(Default::default)
-            .insert(SELECTED.into(), "bar".into());
-        s2.update(
+    // Deterministic ordering instead of a racing sleeping task: the claim
+    // handed to sync_claim is the (stale) informer copy without a selected
+    // node, while the API already holds the claim owned by node "bar".
+    // becomeOwner re-reads the claim on every poll AND when the (random,
+    // `BaseDelay - jitter`, possibly ~0) delay elapses, so whichever fires
+    // first it must observe "bar" and back off.
+    let mut other: PersistentVolumeClaim = storage
+        .get(&build_key("persistentvolumeclaims", Some("ns1"), "data"))
+        .await
+        .unwrap();
+    other
+        .metadata
+        .annotations
+        .get_or_insert_with(Default::default)
+        .insert(SELECTED.into(), "bar".into());
+    storage
+        .update(
             &build_key("persistentvolumeclaims", Some("ns1"), "data"),
             &other,
         )
         .await
         .unwrap();
-    });
     let started = std::time::Instant::now();
     p.sync_claim(&c).await.unwrap();
     assert!(started.elapsed() < std::time::Duration::from_secs(1));
