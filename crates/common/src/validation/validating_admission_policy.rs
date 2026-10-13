@@ -787,19 +787,62 @@ fn validate_expression_warnings(warnings: &[ExpressionWarning], fld_path: &Path)
     errs
 }
 
-/// Upstream `validateFieldRef` (`validation.go:1287-1297`).
-///
-/// Deviation, stated deliberately: upstream also runs the reference through
-/// `jsonpath.New("spec").Parse("{" + fieldRef + "}")` and answers a parse
-/// failure with `invalid JSONPath: <err>`. Rusternetes has no JSONPath parser
-/// (`validation/crd.rs::validate_simple_json_path` implements upstream's
-/// *simple* dotted-path rule, which is a different and stricter grammar), so
-/// only the `Required` half is ported. Upstream's own comment on the rest —
-/// "no further checks, for an easier upgrade/rollback" — is the reason this is
-/// the safe half to keep: the parse is the lenient part.
+/// Upstream `validateFieldRef` (`validation.go:1287-1298`): the trimmed
+/// reference must be non-empty, then must parse as a JSONPath action
+/// (`jsonpath.New("spec").Parse("{" + fieldRef + "}")`, ported in
+/// `crate::jsonpath`). "No further checks, for an easier upgrade/rollback."
 fn validate_field_ref(field_ref: &str, fld_path: &Path) -> ErrorList {
-    if field_ref.trim().is_empty() {
+    let field_ref = field_ref.trim();
+    if field_ref.is_empty() {
         return vec![Error::required(fld_path, "")];
     }
+    if let Err(e) = crate::jsonpath::parse("spec", &format!("{{{field_ref}}}")) {
+        return vec![Error::invalid(
+            fld_path,
+            field_ref,
+            format!("invalid JSONPath: {e}"),
+        )];
+    }
     Vec::new()
+}
+
+#[cfg(test)]
+mod field_ref_tests {
+    use super::*;
+
+    /// Upstream `TestValidateValidatingAdmissionPolicyStatus`
+    /// (`validation_test.go:4150-4199`): "type checking bad json path" expects
+    /// `invalid JSONPath: invalid array index foo`; the good path and the two
+    /// `Required value` cases accept/reject as before.
+    #[test]
+    fn field_ref_bad_json_path_is_invalid() {
+        let path = Path::new("fieldRef");
+        let errs = validate_field_ref("spec[foo]", &path);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert_eq!(
+            errs[0].to_string(),
+            "fieldRef: Invalid value: \"spec[foo]\": invalid JSONPath: invalid array index foo"
+        );
+    }
+
+    #[test]
+    fn field_ref_good_and_missing() {
+        let path = Path::new("fieldRef");
+        assert!(validate_field_ref("spec.validations[0].expression", &path).is_empty());
+        assert_eq!(
+            validate_field_ref("  ", &path)[0].to_string(),
+            "fieldRef: Required value"
+        );
+    }
+
+    /// The bad value is the TRIMMED fieldRef (`validation.go:1288`).
+    #[test]
+    fn field_ref_invalid_reports_trimmed_value() {
+        let path = Path::new("fieldRef");
+        let errs = validate_field_ref("  spec[foo]  ", &path);
+        assert_eq!(
+            errs[0].to_string(),
+            "fieldRef: Invalid value: \"spec[foo]\": invalid JSONPath: invalid array index foo"
+        );
+    }
 }

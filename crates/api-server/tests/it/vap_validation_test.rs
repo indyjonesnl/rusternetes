@@ -384,6 +384,11 @@ async fn a_bad_policy_status_answers_422_with_a_field_path() {
             "status.typeChecking.expressionWarnings[0].fieldRef: Required value",
         ),
         (
+            "an expression warning whose fieldRef is not a valid JSONPath",
+            json!({ "typeChecking": { "expressionWarnings": [{ "fieldRef": "spec[foo]", "warning": "w" }] } }),
+            "status.typeChecking.expressionWarnings[0].fieldRef: Invalid value: \"spec[foo]\": invalid JSONPath: invalid array index foo",
+        ),
+        (
             "a condition with an unsupported status",
             json!({ "conditions": [{
                 "type": "TypeChecked", "status": "Maybe", "reason": "Checked",
