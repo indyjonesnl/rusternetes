@@ -1167,6 +1167,7 @@ fn mounts(
     env: &HashMap<String, String>,
     attrs: &HashMap<String, MountAttrs>,
     supports_rro: bool,
+    image_volumes: &HashMap<String, v1::ImageSpec>,
 ) -> Result<Vec<v1::Mount>, String> {
     mounts_with(
         container,
@@ -1175,6 +1176,7 @@ fn mounts(
         attrs,
         crate::go_selinux::get_enabled(),
         supports_rro,
+        image_volumes,
     )
 }
 
@@ -1190,6 +1192,10 @@ pub struct MountAttrs {
 
 /// [`mounts`] with the SELinux gate (`selinux.GetEnabled()`) injected so tests
 /// can exercise both sides of it.
+///
+/// `image_volumes` is `makeMounts`' `imageVolumes` argument
+/// (`kubelet_pods.go:277`): the image volumes the kubelet pulled for this
+/// container, by volume name.
 fn mounts_with(
     container: &Container,
     host_paths: &HashMap<String, String>,
@@ -1197,6 +1203,7 @@ fn mounts_with(
     attrs: &HashMap<String, MountAttrs>,
     selinux_enabled: bool,
     supports_rro: bool,
+    image_volumes: &HashMap<String, v1::ImageSpec>,
 ) -> Result<Vec<v1::Mount>, String> {
     let Some(vms) = container.volume_mounts.as_ref() else {
         return Ok(Vec::new());
@@ -1207,9 +1214,42 @@ fn mounts_with(
     // mount carries `SELinuxRelabel` (`kubelet_pods.go:296-300`).
     let mut relabelled: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for vm in vms.iter() {
+        // `if imageVolumes != nil && ImageVolume enabled { image =
+        // imageVolumes[mount.Name] }` (`kubelet_pods.go:327-330`).
+        let image = if rusternetes_common::feature_gates::enabled(
+            rusternetes_common::feature_gates::Feature::ImageVolume,
+        ) {
+            image_volumes.get(&vm.name)
+        } else {
+            None
+        };
         // A mount whose volume did not resolve to a host path is skipped, as
-        // before — the volume manager reports that separately.
-        let Some(host) = host_paths.get(&vm.name) else {
+        // before — the volume manager reports that separately. An image
+        // mount has no host path (`image == nil` guards `GetPath`,
+        // `kubelet_pods.go:332-335`).
+        let Some(host) = host_paths.get(&vm.name).filter(|_| image.is_none()) else {
+            if let Some(image) = image {
+                // The subPath guards (`kubelet_pods.go:308-325`) run before
+                // the image arm; `imageSubPath = subPath` (`:329`).
+                let sub_path = resolve_sub_path(vm, env)?;
+                let rro = resolve_recursive_read_only(vm, supports_rro)?;
+                let a = attrs.get(&vm.name).copied().unwrap_or_default();
+                let relabel_volume = a.selinux_relabel && relabelled.insert(vm.name.as_str());
+                out.push(v1::Mount {
+                    container_path: vm.mount_path.clone(),
+                    host_path: String::new(),
+                    readonly: vm.read_only.unwrap_or(false) || a.read_only,
+                    selinux_relabel: crate::go_selinux::relabel_if_enabled(
+                        relabel_volume,
+                        selinux_enabled,
+                    ),
+                    propagation: translate_mount_propagation(vm.mount_propagation.as_deref()),
+                    recursive_read_only: rro,
+                    image: Some(image.clone()),
+                    image_sub_path: sub_path.unwrap_or_default(),
+                    ..Default::default()
+                });
+            }
             continue;
         };
         let sub_path = resolve_sub_path(vm, env)?;
@@ -1654,6 +1694,7 @@ pub fn container_config_with_allocatable(
         node_allocatable,
         &HashMap::new(),
         false,
+        &HashMap::new(),
     )
 }
 
@@ -1670,6 +1711,7 @@ pub fn container_config_with_mounts(
     node_allocatable: Option<&HashMap<String, String>>,
     mount_attrs: &HashMap<String, MountAttrs>,
     supports_rro: bool,
+    image_volumes: &HashMap<String, v1::ImageSpec>,
 ) -> Result<v1::ContainerConfig, String> {
     let mut labels = pod_labels(pod);
     labels.insert(labels::CONTAINER_NAME.to_string(), container.name.clone());
@@ -1708,7 +1750,14 @@ pub fn container_config_with_mounts(
         args: expand_all(container.args.clone().unwrap_or_default(), &env_map),
         working_dir: container.working_dir.clone().unwrap_or_default(),
         envs,
-        mounts: mounts(container, host_paths, &env_map, mount_attrs, supports_rro)?,
+        mounts: mounts(
+            container,
+            host_paths,
+            &env_map,
+            mount_attrs,
+            supports_rro,
+            image_volumes,
+        )?,
         labels,
         log_path: format!("{}.log", container.name),
         linux,
@@ -2145,7 +2194,16 @@ mod tests {
                 selinux_relabel: false,
             },
         )]);
-        let m = mounts_with(&c, &host_paths, &HashMap::new(), &attrs, true, false).unwrap();
+        let m = mounts_with(
+            &c,
+            &host_paths,
+            &HashMap::new(),
+            &attrs,
+            true,
+            false,
+            &HashMap::new(),
+        )
+        .unwrap();
         assert!(m[0].readonly, "disk /etc/hosts must be forced read-only");
         assert!(m[1].readonly);
         assert!(!m[2].readonly, "disk4 has no attributes: stays read-write");
@@ -2161,6 +2219,7 @@ mod tests {
             &HashMap::new(),
             true,
             false,
+            &HashMap::new(),
         )
         .unwrap();
         assert_eq!(
@@ -2182,7 +2241,16 @@ mod tests {
                 selinux_relabel: true,
             },
         )]);
-        let on = mounts_with(&c, &host_paths, &HashMap::new(), &attrs, true, false).unwrap();
+        let on = mounts_with(
+            &c,
+            &host_paths,
+            &HashMap::new(),
+            &attrs,
+            true,
+            false,
+            &HashMap::new(),
+        )
+        .unwrap();
         assert!(on[0].selinux_relabel);
         // Once per volume: `vol.SELinuxLabeled = true` after the first mount.
         assert!(
@@ -2190,7 +2258,16 @@ mod tests {
             "second mount of disk is already labeled"
         );
         assert!(!on[2].selinux_relabel);
-        let off = mounts_with(&c, &host_paths, &HashMap::new(), &attrs, false, false).unwrap();
+        let off = mounts_with(
+            &c,
+            &host_paths,
+            &HashMap::new(),
+            &attrs,
+            false,
+            false,
+            &HashMap::new(),
+        )
+        .unwrap();
         assert!(off.iter().all(|m| !m.selinux_relabel));
     }
 
@@ -2312,9 +2389,25 @@ mod tests {
             ..Default::default()
         };
         let hp = HashMap::from([("v".to_string(), "/host/v".to_string())]);
-        let ok = mounts(&c, &hp, &HashMap::new(), &HashMap::new(), true).unwrap();
+        let ok = mounts(
+            &c,
+            &hp,
+            &HashMap::new(),
+            &HashMap::new(),
+            true,
+            &HashMap::new(),
+        )
+        .unwrap();
         assert!(ok[0].recursive_read_only && ok[0].readonly);
-        assert!(mounts(&c, &hp, &HashMap::new(), &HashMap::new(), false).is_err());
+        assert!(mounts(
+            &c,
+            &hp,
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+            &HashMap::new()
+        )
+        .is_err());
     }
 
     #[test]
@@ -2338,7 +2431,16 @@ mod tests {
         let host_paths = HashMap::from([("v".to_string(), "/host/v".to_string())]);
         let mut prop = |mode: Option<&str>| -> i32 {
             c.volume_mounts = Some(vec![mk(mode)]);
-            mounts(&c, &host_paths, &HashMap::new(), &HashMap::new(), false).unwrap()[0].propagation
+            mounts(
+                &c,
+                &host_paths,
+                &HashMap::new(),
+                &HashMap::new(),
+                false,
+                &HashMap::new(),
+            )
+            .unwrap()[0]
+                .propagation
         };
         assert_eq!(
             prop(Some("HostToContainer")),

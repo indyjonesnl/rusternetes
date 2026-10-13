@@ -254,6 +254,8 @@ impl VolumeManager {
             Box::new(crate::volume_plugins::local::LocalPlugin::new(host.clone())),
             // `nfs.ProbeVolumePlugins` (`cmd/kubelet/app/plugins.go`).
             Box::new(crate::volume_plugins::nfs::NfsPlugin::new(host.clone())),
+            // `image.ProbeVolumePlugins` (`cmd/kubelet/app/plugins.go`).
+            Box::new(crate::volume_plugins::image::ImagePlugin::new()),
             Box::new(crate::volume_plugins::config_map::ConfigMapPlugin::new(
                 host.clone(),
             )),
