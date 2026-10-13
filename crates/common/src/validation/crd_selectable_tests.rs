@@ -55,12 +55,15 @@ fn unconvertible_schema_reports_at_schema_dot_openapi_path() {
         "properties": {"foo": {"type": "string"}},
         "items": [{"type": "string"}]
     });
-    let c = crd_with_version(Some(bad), &[".foo"]);
+    // `foo` (no leading delimiter) takes the `default:` arm of the token
+    // switch (`schema/cel/validation.go:670-671`) and never dereferences the
+    // nil schema, so only the errors are produced.
+    let c = crd_with_version(Some(bad), &["foo"]);
     let errs: Vec<String> = validate_custom_resource_definition_spec(&c.spec, &Path::new("spec"))
         .iter()
         .map(|e| e.to_string())
         .collect();
-    assert_eq!(errs.len(), 2, "{errs:?}");
+    assert_eq!(errs.len(), 3, "{errs:?}");
     assert!(
         errs.iter().any(|e| e.starts_with(
             "spec.versions[0].schema.openAPIV3Schema: Invalid value: \"\": OpenAPIV3Schema 'items' must be a schema, but is an array"
@@ -139,4 +142,34 @@ fn nested_resolution_and_duplicates() {
     assert_eq!(errs.len(), 2, "{errs:?}");
     assert!(errs[0].starts_with("spec.versions[0].selectableFields[1].jsonPath: Invalid value"));
     assert!(errs[1].starts_with("spec.versions[0].selectableFields[2].jsonPath: Duplicate value"));
+}
+
+/// `NewStructural` failed, so `schema` is a nil `*Structural`
+/// (`validation.go:314-316` appends the error and carries on), and
+/// `ValidFieldPath` evaluates `schema.Properties` (`schema/cel/validation.go:660`:
+/// `if schema.Properties != nil {`) on the first `.` token: a Go nil-pointer
+/// panic, which the apiserver's panic-recovery filter turns into a 500.
+#[test]
+#[should_panic]
+fn nil_structural_after_new_structural_failure_panics() {
+    let bad = json!({
+        "type": "object",
+        "properties": {"foo": {"type": "string"}},
+        "items": [{"type": "string"}]
+    });
+    let c = crd_with_version(Some(bad), &[".foo"]);
+    let _ = validate_custom_resource_definition_spec(&c.spec, &Path::new("spec"));
+}
+
+/// `additionalProperties: true` makes `schema = schema.AdditionalProperties.Structural`
+/// nil (`schema/cel/validation.go:566`); the next `.` token evaluates
+/// `schema.Properties` (`:660`) on it: a Go nil-pointer panic.
+#[test]
+#[should_panic]
+fn stepping_through_bool_additional_properties_panics() {
+    let c = crd_with_version(
+        Some(json!({"type": "object", "additionalProperties": true})),
+        &[".a.b"],
+    );
+    let _ = validate_custom_resource_definition_spec(&c.spec, &Path::new("spec"));
 }
