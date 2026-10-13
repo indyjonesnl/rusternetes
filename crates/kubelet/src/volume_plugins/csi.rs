@@ -87,6 +87,12 @@ impl LifecycleMode {
 ///
 /// An unregistered driver is a transient failure for both arms
 /// (`csi_mounter.go:106-109`); no placeholder directory is created (#3262).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VolumeLifecycleMode {
+    Persistent,
+    Ephemeral,
+}
+
 pub struct CsiPlugin {
     host: Arc<dyn VolumeHost>,
 }
@@ -115,6 +121,33 @@ impl CsiPlugin {
             return Err(anyhow!("failed to wait for cache sync for CSIDriverLister"));
         }
         Ok(lister.get(driver))
+    }
+
+    /// `skipAttach` (`csi_plugin.go:858-871`): `AttachRequired == false` on the
+    /// driver's `CSIDriver`. A missing CSIDriver does not skip attach; any
+    /// other `getCSIDriver` error is returned.
+    fn skip_attach(&self, driver: &str) -> Result<bool> {
+        match self.get_csi_driver(driver)? {
+            None => Ok(false),
+            Some(d) => Ok(d.spec.attach_required == Some(false)),
+        }
+    }
+
+    /// `getVolumeLifecycleMode` (`csi_plugin.go:892-904`): an inline
+    /// `CSIVolumeSource` is ephemeral, a PV source persistent, neither is
+    /// `getSourceFromSpec`'s "volume source not found in volume.Spec"
+    /// (`csi_util.go:161`).
+    fn get_volume_lifecycle_mode(spec: &Spec<'_>) -> Result<VolumeLifecycleMode> {
+        if spec.volume.csi.is_some() {
+            return Ok(VolumeLifecycleMode::Ephemeral);
+        }
+        if spec
+            .persistent_volume
+            .is_some_and(|pv| pv.spec.csi.is_some())
+        {
+            return Ok(VolumeLifecycleMode::Persistent);
+        }
+        Err(anyhow!("volume source not found in volume.Spec"))
     }
 
     fn spec_name(spec: &Spec<'_>) -> String {
@@ -154,6 +187,22 @@ impl VolumePlugin for CsiPlugin {
             source.driver,
             source.volume_handle.as_deref().unwrap_or_default()
         ))
+    }
+
+    /// `CanAttach` (`csi_plugin.go:675-700`): an ephemeral (inline) volume is
+    /// never attached; otherwise the volume is attachable unless its driver's
+    /// `CSIDriver` says `attachRequired: false` (`skipAttach`, `:858-871`).
+    fn can_attach(&self, spec: &Spec<'_>) -> Result<bool> {
+        let mode = Self::get_volume_lifecycle_mode(spec)?;
+        if mode == VolumeLifecycleMode::Ephemeral {
+            debug!(
+                "kubernetes.io/csi: plugin.CanAttach = false, ephemeral mode detected for spec {}",
+                spec.name()
+            );
+            return Ok(false);
+        }
+        let pv_src = pv_source_from_spec(spec)?;
+        Ok(!self.skip_attach(&pv_src.driver)?)
     }
 
     /// `CanDeviceMount` (`csi_plugin.go:702-715`): an ephemeral (inline) volume
