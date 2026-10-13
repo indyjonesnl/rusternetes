@@ -107,6 +107,16 @@ impl CelMatcher {
         )
     }
 
+    /// `CELMatcher.UsesFieldSelector`.
+    pub fn uses_field_selector(&self) -> bool {
+        false
+    }
+
+    /// `CELMatcher.UsesLabelSelector`.
+    pub fn uses_label_selector(&self) -> bool {
+        false
+    }
+
     /// `cm.AuthorizerType = "Webhook"; cm.AuthorizerName = name; cm.Metrics = am`
     /// (webhook.go:123-126).
     pub fn with_metrics(mut self, authorizer_type: &str, authorizer_name: &str) -> Self {
