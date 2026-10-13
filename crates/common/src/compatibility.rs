@@ -873,4 +873,87 @@ mod tests {
         assert_eq!(e.emulation_version(), v(1, 33));
         feature_gates::reset_to_defaults();
     }
+
+    // version_test.go TestInfo
+    #[test]
+    fn effective_version_info() {
+        // (name, binary, emulation, minCompat, [major, minor, emuMaj, emuMin, mcMaj, mcMin])
+        type Case = (
+            &'static str,
+            &'static str,
+            &'static str,
+            &'static str,
+            [&'static str; 6],
+        );
+        let cases: [Case; 5] = [
+            (
+                "normal case",
+                "v1.34.0",
+                "v1.32.0",
+                "v1.31.0",
+                ["1", "34", "1", "32", "1", "31"],
+            ),
+            (
+                "default min compatibility version is emulation version - 1",
+                "v1.34.0",
+                "v1.32.0",
+                "",
+                ["1", "34", "1", "32", "1", "31"],
+            ),
+            (
+                "emulation version same as binary version",
+                "v1.34.0",
+                "v1.34.0",
+                "",
+                ["1", "34", "1", "34", "1", "33"],
+            ),
+            (
+                "with pre-release and build metadata",
+                "v1.34.0-alpha.1+abc123",
+                "v1.32.0",
+                "",
+                ["1", "34", "1", "32", "1", "31"],
+            ),
+            (
+                "override default min compatibility version",
+                "v1.34.0",
+                "v1.32.0",
+                "v1.32.0",
+                ["1", "34", "1", "32", "1", "32"],
+            ),
+        ];
+        for (name, bin, emu, mc, want) in cases {
+            let mut e = EffectiveVersion::from_string(bin, "", "").unwrap();
+            if !emu.is_empty() {
+                e.set_emulation_version(parse_version(emu).unwrap().major_minor());
+            }
+            if !mc.is_empty() {
+                e.set_min_compatibility_version(parse_version(mc).unwrap().major_minor());
+            }
+            let info = e.info();
+            let got = [
+                info.major.as_str(),
+                info.minor.as_str(),
+                info.emulation_major.as_str(),
+                info.emulation_minor.as_str(),
+                info.min_compatibility_major.as_str(),
+                info.min_compatibility_minor.as_str(),
+            ];
+            assert_eq!(got, want, "{name}");
+        }
+    }
+
+    // apimachinery version/types.go:27-34: the four emulation fields are `omitempty`.
+    #[test]
+    fn version_info_json_field_names() {
+        let v = serde_json::to_value(default_build_effective_version().info()).unwrap();
+        assert_eq!(v["emulationMajor"], "1");
+        assert_eq!(v["emulationMinor"], "35");
+        assert_eq!(v["minCompatibilityMajor"], "1");
+        assert_eq!(v["minCompatibilityMinor"], "34");
+        let v = serde_json::to_value(VersionInfo::default()).unwrap();
+        assert!(v.get("emulationMajor").is_none());
+        assert!(v.get("minCompatibilityMinor").is_none());
+        assert_eq!(v["major"], "");
+    }
 }
