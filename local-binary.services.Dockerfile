@@ -39,12 +39,15 @@ CMD ["--bind-address", "0.0.0.0:6443", "--etcd-servers", "http://etcd:2379", "--
 # ---------------------------------------------------------------------
 FROM debian:sid-slim AS kubelet
 
+# nfs-common = /sbin/mount.nfs for the nfs volume plugin (#3333); see
+# services.Dockerfile. Own apt step so recommends are not pulled in.
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
     iproute2 \
     iptables \
     curl \
+    && apt-get install -y --no-install-recommends nfs-common \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

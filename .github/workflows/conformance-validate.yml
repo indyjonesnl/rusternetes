@@ -62,6 +62,11 @@ on:
       - 'scripts/tests/test-ghcr-overlays.sh'
       - 'scripts/tests/test-dockerfile-crate-enumeration.sh'
       - 'scripts/tests/test-dockerfile-multiarch.sh'
+      - 'scripts/tests/test-kubelet-image-mount-deps.sh'
+      - 'services.Dockerfile'
+      - 'local-binary.services.Dockerfile'
+      - 'all-in-one.Dockerfile'
+      - 'node.Dockerfile'
       # cluster-topology + bring-up guards: the per-node netns topology
       # (#1691/#1695) and the node IPAM its CNI depends on (#1697). Both are
       # config-only invariants no unit test sees, which surface hours later as
@@ -119,6 +124,9 @@ jobs:
       # test existed but was wired into no workflow at all.
       - name: Dockerfile multi-arch test
         run: bash scripts/tests/test-dockerfile-multiarch.sh
+      # #3333: kubelet images must ship /sbin/mount.nfs (nfs-common).
+      - name: Kubelet image mount-deps test
+        run: bash scripts/tests/test-kubelet-image-mount-deps.sh
       # ubuntu-latest ships docker, so the compose-topology test's
       # `docker compose config` render runs here (it self-skips without docker).
       - name: Per-node netns topology test

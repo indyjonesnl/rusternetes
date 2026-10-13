@@ -262,7 +262,10 @@ RUN apt-get update && apt-get install -y \
     libssl3 \
     iptables \
     iproute2 \
+    && apt-get install -y --no-install-recommends nfs-common \
     && rm -rf /var/lib/apt/lists/*
+# ^ nfs-common = /sbin/mount.nfs for the in-process kubelet's nfs volume
+# plugin (#3333); see services.Dockerfile. Own apt step: no recommends.
 
 WORKDIR /app
 
