@@ -1385,6 +1385,12 @@ mod tests {
         );
     }
 
+    #[test]
+    fn map_write_err_maps_unsupported_media_type() {
+        let e = anyhow::anyhow!("Error from server (UnsupportedMediaType): Apply not supported");
+        assert!(matches!(map_write_err(e), Error::UnsupportedMediaType(_)));
+    }
+
     // A transport failure (e.g. the kubelet POSTing a Node to an unresolvable
     // api-server host) arrives as an anyhow error whose *source* carries the
     // actionable detail (DNS / connect / TLS). `map_write_err` must preserve

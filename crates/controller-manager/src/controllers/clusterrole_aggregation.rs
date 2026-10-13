@@ -439,4 +439,34 @@ mod tests {
         assert!(e["fieldsV1"].get("f:rules").is_some(), "{e}");
         assert!(e["fieldsV1"].get("rules").is_none(), "{e}");
     }
+
+    /// `IsUnsupportedMediaType` fallback (clusterroleaggregation_controller.go:133-142):
+    /// when the server rejects the apply PATCH, the controller falls back to
+    /// `Update` of the ClusterRole with `Rules` replaced by the aggregate.
+    #[tokio::test]
+    async fn unsupported_media_type_on_apply_falls_back_to_update() {
+        let s = Arc::new(MemoryStorage::new());
+        put(
+            &s,
+            &role("child", &[("l", "x")], vec![rule(&["get"], &["pods"])]),
+        )
+        .await;
+        put(&s, &aggregating("parent", vec![selector("l", "x")])).await;
+        s.reject_apply_as_unsupported_media_type(true);
+        ClusterRoleAggregationController::new(s.clone())
+            .sync_cluster_role("parent")
+            .await
+            .unwrap();
+        assert_eq!(s.apply_calls(), 1);
+        assert_eq!(
+            rules_of(&s, "parent").await,
+            vec![rule(&["get"], &["pods"])]
+        );
+        let v: serde_json::Value = s
+            .get(&build_key("clusterroles", None, "parent"))
+            .await
+            .unwrap();
+        // The fallback is an Update, not an Apply.
+        assert!(v["aggregationRule"].is_object(), "{v}");
+    }
 }
