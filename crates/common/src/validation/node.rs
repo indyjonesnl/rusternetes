@@ -170,8 +170,11 @@ struct PodController {
 /// annotation value; decoding mirrors
 /// `GetAvoidPodsFromNodeAnnotations` (component-helpers/scheduling/corev1/helpers.go:52-61).
 ///
-/// Deviation: upstream dereferences `PodController.Controller` unchecked and
-/// would panic when it is unset; here an unset value is treated as `false`.
+/// Like upstream, `*PodController.Controller` is dereferenced unchecked
+/// (validation.go:5126): an owner reference without `controller` is a Go
+/// nil-pointer dereference, replicated as a panic. The api-server's
+/// panic-recovery layer (`WithPanicRecovery`,
+/// apiserver/pkg/server/filters/wrap.go:56) turns it into a 500.
 fn validate_avoid_pods_in_node_annotations(raw: &str, fld_path: &Path) -> ErrorList {
     let avoids = match serde_json::from_str::<AvoidPods>(raw) {
         Ok(a) => a,
@@ -193,7 +196,10 @@ fn validate_avoid_pods_in_node_annotations(raw: &str, fld_path: &Path) -> ErrorL
         {
             None => errs.push(Error::required(&idx_path.child("PodSignature"), "")),
             Some(controller) => {
-                if controller.controller != Some(true) {
+                let is_controller = controller
+                    .controller
+                    .expect("runtime error: invalid memory address or nil pointer dereference");
+                if !is_controller {
                     errs.push(Error::invalid(
                         &idx_path
                             .child("PodSignature")
@@ -759,6 +765,19 @@ mod avoid_pods_tests {
             format!("metadata.annotations.{KEY}[0].PodSignature.PodController.Controller")
         );
         assert!(errs[0].detail.contains("must point to a controller"));
+    }
+
+    // validatePreferAvoidPodsEntry (validation.go:5121-5135) dereferences
+    // `*PodController.Controller` unchecked: an owner reference without
+    // `controller` is a nil-pointer dereference, i.e. a Go panic that
+    // `WithPanicRecovery` turns into a 500 (#3378).
+    #[test]
+    #[should_panic(expected = "nil pointer dereference")]
+    fn unset_controller_panics_like_upstream_nil_deref() {
+        let raw = r#"{"preferAvoidPods":[{"podSignature":{"podController":{
+            "apiVersion":"v1","kind":"ReplicationController","name":"foo",
+            "uid":"abcdef123456"}}}]}"#;
+        let _ = validate_node(&node_with_avoid(raw));
     }
 
     #[test]

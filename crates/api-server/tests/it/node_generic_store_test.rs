@@ -54,6 +54,34 @@ fn message(body: &Value) -> &str {
     body["message"].as_str().unwrap_or_default()
 }
 
+/// `validatePreferAvoidPodsEntry` (validation.go:5126) dereferences
+/// `*PodController.Controller` unchecked; the Go panic is answered by
+/// `WithPanicRecovery` (apiserver/pkg/server/filters/wrap.go:56) with a plain
+/// text 500 (#3378).
+#[tokio::test]
+async fn avoid_pods_without_controller_panics_into_a_500() {
+    let api = TestApiServer::new();
+    let mut body = node("n-avoid");
+    body["metadata"]["annotations"] = json!({
+        "scheduler.alpha.kubernetes.io/preferAvoidPods":
+            r#"{"preferAvoidPods":[{"podSignature":{"podController":{"kind":"ReplicationController","name":"foo"}}}]}"#
+    });
+    let (status, _, raw, _) = api
+        .send_full(
+            "POST",
+            NODES,
+            Some("application/json"),
+            None,
+            Some(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        String::from_utf8_lossy(&raw),
+        "This request caused apiserver to panic. Look in the logs for details.\n"
+    );
+}
+
 /// Nodes keep a client-set status on create (strategy.go:95), and
 /// `SetDefaults_NodeStatus` (v1/defaults.go:346-354) fills allocatable from
 /// capacity.
