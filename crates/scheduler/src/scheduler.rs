@@ -166,7 +166,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
 
     /// Emit a pod-scoped event through the unified recorder, sourced from the
     /// pod's profile (`source.component` = its `schedulerName`, the recorder
-    /// `NewRecorderFactory` builds per profile, profile.go:79-84). Errors are
+    /// `NewRecorderFactory` builds per profile, profile.go:85-90). Errors are
     /// logged, never propagated — a failed event must not abort a
     /// bind/scheduling decision.
     async fn emit_pod_event(&self, pod: &Pod, event_type: EventType, reason: &str, message: &str) {
@@ -2661,7 +2661,7 @@ mod tests {
     /// #3346: with several profiles the scheduler schedules every pod whose
     /// `spec.schedulerName` names a profile (`responsibleForPod`,
     /// eventhandlers.go:474-476), reports each Scheduled event under that
-    /// profile's name (`NewRecorderFactory`, profile.go:79-84), and leaves pods
+    /// profile's name (`NewRecorderFactory`, profile.go:85-90), and leaves pods
     /// of unknown scheduler names alone.
     #[tokio::test]
     async fn test_multi_profile_routes_pods_by_scheduler_name() {

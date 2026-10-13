@@ -160,7 +160,7 @@ impl ApiBackend {
         }
     }
 
-    /// `RecorderFactory` (profile.go:34-35, `NewRecorderFactory` :79-84): an
+    /// `RecorderFactory` (profile.go:35, `NewRecorderFactory` :85-90): an
     /// event recorder whose reporting controller is the profile's scheduler
     /// name.
     pub(crate) fn new_recorder(&self, scheduler_name: &str) -> ClientEventRecorder {

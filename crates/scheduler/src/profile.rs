@@ -72,10 +72,10 @@ pub struct Map {
 }
 
 impl Map {
-    /// `NewMap` (profile.go:45-58) with `cfgValidator.validate` (:93-123).
+    /// `NewMap` (profile.go:49-65) with `cfgValidator.validate` (:98-129).
     pub fn new_map(cfgs: Vec<Profile>) -> Result<Map, String> {
         let mut m = Map::default();
-        // cfgValidator{m: m}: the first profile's queue sort (:93-123).
+        // cfgValidator{m: m}: the first profile's queue sort (profile.go:98-129).
         let mut queue_sort: Option<(String, Option<serde_json::Value>)> = None;
         for cfg in cfgs {
             if cfg.scheduler_name.is_empty() {
