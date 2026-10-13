@@ -268,11 +268,17 @@ pub fn is_hugepage_resource_name(name: &str) -> bool {
     name.starts_with(HUGEPAGES_PREFIX)
 }
 
+/// True when the name contains `kubernetes.io/`. Upstream
+/// `v1helper.IsPrefixedNativeResource`.
+pub fn is_prefixed_native_resource(name: &str) -> bool {
+    name.starts_with(KUBERNETES_IO_PREFIX)
+}
+
 /// True for a resource that is native to Kubernetes: either unqualified (no
 /// `/`) or under the `kubernetes.io/` namespace. Upstream
 /// `v1helper.IsNativeResource`.
 pub fn is_native_resource_name(name: &str) -> bool {
-    !name.contains('/') || name.starts_with(KUBERNETES_IO_PREFIX)
+    !name.contains('/') || is_prefixed_native_resource(name)
 }
 
 /// True for an extended resource — a non-native, non-`requests.`-prefixed
@@ -1083,6 +1089,37 @@ pub fn pvc_requires_quota_replenish(
 
 #[cfg(test)]
 mod tests {
+    // Port of TestIsNativeResource (pkg/apis/core/v1/helper/helpers_test.go:29-66)
+    #[test]
+    fn is_native_resource_matches_upstream_cases() {
+        for (name, want) in [
+            ("pod.alpha.kubernetes.io/opaque-int-resource-foo", true),
+            ("kubernetes.io/resource-foo", true),
+            ("foo", true),
+            ("a/b", false),
+            ("", true),
+        ] {
+            assert_eq!(is_native_resource_name(name), want, "{name:?}");
+        }
+    }
+
+    // helpers.go:51-55 uses strings.Contains, not HasPrefix.
+    #[test]
+    fn is_prefixed_native_resource_uses_contains() {
+        assert!(is_prefixed_native_resource("kubernetes.io/foo"));
+        assert!(is_prefixed_native_resource("example.kubernetes.io/foo"));
+        assert!(!is_prefixed_native_resource("example.com/foo"));
+    }
+
+    // helpers.go:39-49: IsQualifiedName("requests."+name) must hold.
+    #[test]
+    fn is_extended_resource_name_requires_qualified_quota_name() {
+        assert!(is_extended_resource_name("example.com/dongle"));
+        assert!(!is_extended_resource_name("example.com/-bad"));
+        assert!(!is_extended_resource_name("example.com/a/b"));
+        assert!(!is_extended_resource_name("example.kubernetes.io/foo"));
+    }
+
     use super::*;
     use crate::resources::{Container, PodSpec};
 
