@@ -22,9 +22,13 @@
 //!      estimated cost budget — sufficient to reject obviously expensive
 //!      rules at compile time and runaway evaluations at runtime.
 
+use rusternetes_common::cel_versions::{
+    compile_failure, default_compatibility_version, EnvSet, EnvType,
+};
 use rusternetes_common::resources::{CustomResource, CustomResourceDefinition, JSONSchemaProps};
 use rusternetes_common::schema_validation::PathSeg;
 use rusternetes_common::{CELContext, CELEvaluator, Error, Result};
+use std::collections::HashSet;
 
 /// Default per-rule estimated cost budget (K8s default = 10M tokens).
 const DEFAULT_RULE_COST_LIMIT: u64 = 10_000_000;
@@ -220,12 +224,40 @@ pub fn estimate_cost(rule: &str) -> u64 {
 /// Returns an error if any rule is malformed (compile error), references an
 /// unknown property at the same level, or exceeds the estimated-cost budget.
 pub fn validate_crd_rules(schema: &JSONSchemaProps) -> Result<()> {
+    validate_crd_rules_in(
+        schema,
+        &EnvSet::must_base_env_set(default_compatibility_version()),
+        &HashSet::new(),
+    )
+}
+
+/// `validate_crd_rules` against an explicit environment set; rules in
+/// `preexisting` are compiled in the stored environment.
+pub fn validate_crd_rules_in(
+    schema: &JSONSchemaProps,
+    env_set: &EnvSet,
+    preexisting: &HashSet<String>,
+) -> Result<()> {
     let rules = collect_rules(schema);
     for r in &rules {
         if estimate_cost(&r.rule) > DEFAULT_RULE_COST_LIMIT {
             return Err(Error::InvalidResource(format!(
                 "x-kubernetes-validations rule exceeded the estimated cost limit: {}",
                 r.rule
+            )));
+        }
+        // `preexistingExpressions.RuleEnv` (apiextensions validation.go:158-163):
+        // a rule already stored on the CRD compiles in `StoredExpressions`,
+        // any other in `NewExpressions` at the compatibility version.
+        let env = if preexisting.contains(&r.rule) {
+            EnvType::StoredExpressions
+        } else {
+            EnvType::NewExpressions
+        };
+        if let Some(detail) = compile_failure(&r.rule, env_set, env) {
+            return Err(Error::InvalidResource(format!(
+                "x-kubernetes-validations rule is invalid: {}: {}",
+                r.rule, detail
             )));
         }
         // Compile-time syntax check.
@@ -623,6 +655,7 @@ fn correlate_old_item(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusternetes_common::feature_gates::Version;
     use serde_json::json;
 
     fn schema_with_rule(rule: &str, message: &str) -> JSONSchemaProps {
@@ -641,6 +674,33 @@ mod tests {
             }
         });
         serde_json::from_value(raw).expect("schema deserialises")
+    }
+
+    /// `preexistingExpressions.RuleEnv` (validation.go:158-163): a new rule is
+    /// compiled in `NewExpressions` at `DefaultCompatibilityVersion()`, so a
+    /// library introduced after the min-compatibility version is undeclared.
+    #[test]
+    fn new_rules_are_compiled_at_the_compatibility_version() {
+        let schema = schema_with_rule("semver('1.2.3').major() > 0", "m");
+        let at_1_32 = EnvSet::must_base_env_set(Version::major_minor(1, 32));
+        let err = validate_crd_rules_in(&schema, &at_1_32, &HashSet::new()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("undeclared reference to 'semver' (in container '')"),
+            "{err}"
+        );
+        let at_1_33 = EnvSet::must_base_env_set(Version::major_minor(1, 33));
+        assert!(validate_crd_rules_in(&schema, &at_1_33, &HashSet::new()).is_ok());
+    }
+
+    /// A rule already stored on the CRD is compiled in `StoredExpressions`.
+    #[test]
+    fn preexisting_rules_are_compiled_in_the_stored_environment() {
+        let rule = "semver('1.2.3').major() > 0";
+        let schema = schema_with_rule(rule, "m");
+        let at_1_32 = EnvSet::must_base_env_set(Version::major_minor(1, 32));
+        let pre: HashSet<String> = [rule.to_string()].into();
+        assert!(validate_crd_rules_in(&schema, &at_1_32, &pre).is_ok());
     }
 
     #[test]
