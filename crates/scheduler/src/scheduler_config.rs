@@ -1451,6 +1451,79 @@ profiles:
         assert!(volume_binding_args_from_config(ok, false).is_ok());
     }
 
+    // #3345: validateExtenders (validation.go:256-286). validation_test.go
+    // "extender-negative-weight" -> extenders[0].weight.
+    #[test]
+    fn extender_negative_weight_rejected() {
+        let doc = "extenders:\n- urlPrefix: http://x\n  prioritizeVerb: prioritize\n  weight: -1\n";
+        let err = volume_binding_args_from_config(doc, false).unwrap_err();
+        assert_eq!(
+            err,
+            "extenders[0].weight: Invalid value: -1: must have a positive weight applied to it"
+        );
+        // Weight is only checked when a prioritizeVerb is set (validation.go:263).
+        let ok = "extenders:\n- urlPrefix: http://x\n  weight: -1\n";
+        assert!(volume_binding_args_from_config(ok, false).is_ok());
+        let ok = "extenders:\n- urlPrefix: http://x\n  prioritizeVerb: p\n  weight: 1\n";
+        assert!(volume_binding_args_from_config(ok, false).is_ok());
+    }
+
+    // "extender-duplicate-managed-resources" -> extenders[0].managedResources[1].name.
+    #[test]
+    fn extender_duplicate_managed_resource_rejected() {
+        let doc = "extenders:\n- urlPrefix: http://x\n  managedResources:\n  - name: example.com/foo\n  - name: example.com/foo\n";
+        let err = volume_binding_args_from_config(doc, false).unwrap_err();
+        assert_eq!(
+            err,
+            "extenders[0].managedResources[1].name: Invalid value: \"example.com/foo\": duplicate extender managed resource name"
+        );
+    }
+
+    // "extender-duplicate-bind" -> extenders (validation.go:281-283).
+    #[test]
+    fn extender_duplicate_bind_rejected() {
+        let doc = "extenders:\n- urlPrefix: http://x\n  bindVerb: foo\n- urlPrefix: http://y\n  bindVerb: bar\n";
+        let err = volume_binding_args_from_config(doc, false).unwrap_err();
+        assert_eq!(
+            err,
+            "extenders: Invalid value: \"found 2 extenders implementing bind\": only one extender can implement bind"
+        );
+    }
+
+    // validateExtendedResourceName (validation.go:290-301): qualified-name
+    // errors short-circuit; native names are not extended resources.
+    #[test]
+    fn extender_managed_resource_name_must_be_extended() {
+        let doc = "extenders:\n- urlPrefix: http://x\n  managedResources:\n  - name: cpu\n  - name: kubernetes.io/foo\n  - name: requests.example.com/foo\n  - name: \"bad name/x\"\n";
+        let err = volume_binding_args_from_config(doc, false).unwrap_err();
+        assert!(
+            err.contains(
+                "extenders[0].managedResources[0].name: Invalid value: \"cpu\": is an invalid extended resource name"
+            ),
+            "{err}"
+        );
+        assert!(
+            err.contains(
+                "extenders[0].managedResources[1].name: Invalid value: \"kubernetes.io/foo\": is an invalid extended resource name"
+            ),
+            "{err}"
+        );
+        assert!(
+            err.contains(
+                "extenders[0].managedResources[2].name: Invalid value: \"requests.example.com/foo\": is an invalid extended resource name"
+            ),
+            "{err}"
+        );
+        assert!(
+            err.contains("extenders[0].managedResources[3].name: Invalid value: \"bad name/x\": prefix part"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("managedResources[3].name: Invalid value: \"bad name/x\": is an invalid"),
+            "{err}"
+        );
+    }
+
     // validation.go:58-67: duplicate schedulerName across profiles.
     #[test]
     fn duplicate_scheduler_name_rejected() {
