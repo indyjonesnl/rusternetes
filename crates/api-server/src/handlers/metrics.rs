@@ -3,103 +3,51 @@ use axum::{
     extract::{Path, Query, State},
     Extension, Json,
 };
-use chrono::Utc;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
-    resources::{ContainerMetrics, NodeMetrics, PodMetrics},
+    resources::{NodeMetrics, PodMetrics},
     List, Result,
 };
 use rusternetes_storage::{build_key, build_prefix, Storage};
 
-/// `metrics.k8s.io/v1beta1` PodMetrics TypeMeta. Flattened into the struct
-/// since #1916, so responses still name their type while a body that omits it
-/// still decodes.
-fn pod_metrics_type_meta() -> rusternetes_common::types::TypeMeta {
-    rusternetes_common::types::TypeMeta {
-        api_version: "metrics.k8s.io/v1beta1".to_string(),
-        kind: "PodMetrics".to_string(),
-    }
-}
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
 
-/// Build per-container usage from a pod's resource requests/limits.
-///
-/// Fallback only: used when the kubelet has not yet published live
-/// `PodMetrics` to storage. Reports `requests` (then `limits`, then a small
-/// default) as a stand-in so `kubectl top` / HPA see a non-zero value during
-/// the startup window.
-fn fabricate_containers(pod: &rusternetes_common::resources::Pod) -> Vec<ContainerMetrics> {
-    let mut containers = Vec::new();
-    if let Some(spec) = &pod.spec {
-        for container in &spec.containers {
-            let mut usage = BTreeMap::new();
-            let cpu = container
-                .resources
-                .as_ref()
-                .and_then(|r| r.requests.as_ref())
-                .and_then(|req| req.get("cpu"))
-                .or_else(|| {
-                    container
-                        .resources
-                        .as_ref()
-                        .and_then(|r| r.limits.as_ref())
-                        .and_then(|lim| lim.get("cpu"))
-                })
-                .cloned()
-                .unwrap_or_else(|| "100m".to_string());
-            let memory = container
-                .resources
-                .as_ref()
-                .and_then(|r| r.requests.as_ref())
-                .and_then(|req| req.get("memory"))
-                .or_else(|| {
-                    container
-                        .resources
-                        .as_ref()
-                        .and_then(|r| r.limits.as_ref())
-                        .and_then(|lim| lim.get("memory"))
-                })
-                .cloned()
-                .unwrap_or_else(|| "128Mi".to_string());
-            usage.insert("cpu".to_string(), cpu);
-            usage.insert("memory".to_string(), memory);
-            containers.push(ContainerMetrics {
-                name: container.name.clone(),
-                usage,
-            });
-        }
-    }
-    containers
-}
-
-/// Return live `PodMetrics` published by the kubelet, or synthesize from the
-/// pod spec when none have been published yet.
-async fn pod_metrics_or_fallback<S: Storage>(
+/// Return the kubelet-published `PodMetrics` for `pod` carrying the pod's
+/// labels, or `None` when no sample exists. metrics-server
+/// pkg/storage/pod.go `GetMetrics` does `continue` for a pod with no stored
+/// point (no fabricated entry) and builds each result with
+/// `Labels: pod.Labels` (pkg/storage/pod.go:86-92); the kubelet publishes its
+/// sample without labels.
+async fn pod_metrics<S: Storage>(
     storage: &S,
     namespace: &str,
     pod: &rusternetes_common::resources::Pod,
-) -> PodMetrics {
-    let name = &pod.metadata.name;
-    let key = format!("/registry/metrics.k8s.io/pods/{}/{}", namespace, name);
-    if let Ok(mut metrics) = storage.get::<PodMetrics>(&key).await {
-        // metrics-server pkg/api/pod.go builds PodMetrics with the source
-        // pod's labels, so selectors match the pod's labels.
-        metrics.metadata.labels = pod.metadata.labels.clone();
-        return metrics;
-    }
-    PodMetrics {
-        type_meta: pod_metrics_type_meta(),
-        metadata: rusternetes_common::types::ObjectMeta {
-            creation_timestamp: Some(Utc::now()),
-            labels: pod.metadata.labels.clone(),
-            ..rusternetes_common::types::ObjectMeta::new(name.clone()).with_namespace(namespace)
-        },
-        timestamp: Utc::now(),
-        window: "30s".to_string(),
-        containers: fabricate_containers(pod),
-    }
+) -> Option<PodMetrics> {
+    let key = format!(
+        "/registry/metrics.k8s.io/pods/{}/{}",
+        namespace, pod.metadata.name
+    );
+    let mut metrics = storage.get::<PodMetrics>(&key).await.ok()?;
+    metrics.metadata.labels = pod.metadata.labels.clone();
+    Some(metrics)
+}
+
+/// metrics-server pkg/api/pod.go `getMetrics` sorts results by namespace,
+/// then name (lines 172-177).
+fn sort_pod_metrics(metrics: &mut [PodMetrics]) {
+    metrics.sort_by(|a, b| {
+        (&a.metadata.namespace, &a.metadata.name).cmp(&(&b.metadata.namespace, &b.metadata.name))
+    });
+}
+
+/// `errors.NewNotFound(m.groupResource, fmt.Sprintf("%s/%s", namespace,
+/// name))` with `groupResource = metrics.Resource("podmetrics")`
+/// (metrics-server pkg/api/pod.go:135, pkg/api/install.go:61): message
+/// `podmetrics.metrics.k8s.io "<namespace>/<name>" not found`.
+fn pod_metrics_not_found(namespace: &str, name: &str) -> rusternetes_common::Error {
+    metrics_not_found("podmetrics", &format!("{namespace}/{name}"))
 }
 
 /// Get metrics for a specific node.
@@ -138,17 +86,21 @@ pub async fn get_node_metrics(
 /// message `nodemetrics.metrics.k8s.io "<name>" not found`, details carrying
 /// group, kind (= resource) and name.
 fn node_metrics_not_found(name: &str) -> rusternetes_common::Error {
+    metrics_not_found("nodemetrics", name)
+}
+
+fn metrics_not_found(resource: &str, name: &str) -> rusternetes_common::Error {
     let details = rusternetes_common::types::StatusDetails {
         name: Some(name.to_string()),
         group: Some("metrics.k8s.io".to_string()),
-        kind: Some("nodemetrics".to_string()),
+        kind: Some(resource.to_string()),
         uid: None,
         causes: None,
         retry_after_seconds: None,
     };
     rusternetes_common::Error::Status(Box::new(
         rusternetes_common::types::Status::failure_with_details(
-            format!("nodemetrics.metrics.k8s.io \"{name}\" not found"),
+            format!("{resource}.metrics.k8s.io \"{name}\" not found"),
             "NotFound",
             404,
             details,
@@ -234,8 +186,12 @@ pub async fn get_pod_metrics(
     let pod_key = build_key("pods", Some(&namespace), &name);
     let pod: rusternetes_common::resources::Pod = state.storage.as_ref().get(&pod_key).await?;
 
-    let metrics = pod_metrics_or_fallback(state.storage.as_ref(), &namespace, &pod).await;
-    Ok(Json(metrics))
+    // metrics-server pkg/api/pod.go Get: `len(ms) == 0` returns NotFound
+    // (lines 134-136) -- no fabricated object.
+    match pod_metrics(state.storage.as_ref(), &namespace, &pod).await {
+        Some(m) => Ok(Json(m)),
+        None => Err(pod_metrics_not_found(&namespace, &name)),
+    }
 }
 
 /// List metrics for all pods in a namespace
@@ -266,9 +222,11 @@ pub async fn list_pod_metrics(
     let mut metrics_list = Vec::new();
 
     for pod in pods {
-        let metrics = pod_metrics_or_fallback(state.storage.as_ref(), &namespace, &pod).await;
-        metrics_list.push(metrics);
+        if let Some(m) = pod_metrics(state.storage.as_ref(), &namespace, &pod).await {
+            metrics_list.push(m);
+        }
     }
+    sort_pod_metrics(&mut metrics_list);
 
     // store.go ListPredicate: apply label/field selectors.
     crate::handlers::filtering::apply_selectors(&mut metrics_list, &params)?;
@@ -310,11 +268,12 @@ pub async fn list_all_pod_metrics(
             state.storage.as_ref().list(&pods_prefix).await?;
 
         for pod in pods {
-            let metrics =
-                pod_metrics_or_fallback(state.storage.as_ref(), &ns.metadata.name, &pod).await;
-            metrics_list.push(metrics);
+            if let Some(m) = pod_metrics(state.storage.as_ref(), &ns.metadata.name, &pod).await {
+                metrics_list.push(m);
+            }
         }
     }
+    sort_pod_metrics(&mut metrics_list);
 
     // store.go ListPredicate: apply label/field selectors.
     crate::handlers::filtering::apply_selectors(&mut metrics_list, &params)?;
@@ -537,8 +496,10 @@ mod tests {
 #[cfg(test)]
 mod overlay_tests {
     use super::*;
+    use chrono::Utc;
     use rusternetes_common::resources::Node;
     use rusternetes_storage::memory::MemoryStorage;
+    use std::collections::BTreeMap;
 
     /// metrics-server `pkg/storage/node.go:57-62` builds each NodeMetrics with
     /// `Labels: node.Labels`, so a GET carries the node's labels whether the
