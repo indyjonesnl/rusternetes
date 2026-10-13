@@ -310,13 +310,18 @@ pub fn spawn_identity_lease_gc(storage: Arc<StorageBackend>) -> tokio::task::Joi
 }
 
 /// Both hooks, wired once for every startup path.
-pub fn spawn_identity_hooks(storage: Arc<StorageBackend>) {
-    let hostname = std::fs::read_to_string("/etc/hostname")
+/// The host name `apiserver_id` is derived from.
+pub fn hostname() -> String {
+    std::fs::read_to_string("/etc/hostname")
         .map(|s| s.trim().to_string())
         .ok()
         .filter(|s| !s.is_empty())
         .or_else(|| std::env::var("HOSTNAME").ok())
-        .unwrap_or_else(|| "localhost".to_string());
+        .unwrap_or_else(|| "localhost".to_string())
+}
+
+pub fn spawn_identity_hooks(storage: Arc<StorageBackend>) {
+    let hostname = hostname();
     spawn_identity_lease_controller(storage.clone(), hostname);
     spawn_identity_lease_gc(storage);
 }

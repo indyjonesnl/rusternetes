@@ -4311,6 +4311,7 @@ dependencies = [
  "hyper 1.9.0",
  "hyper-util",
  "indexmap 2.14.0",
+ "inotify",
  "ipnet",
  "jsonwebtoken",
  "mimalloc",

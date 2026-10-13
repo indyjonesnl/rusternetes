@@ -8,6 +8,10 @@
 //! all-in-one binary) call [`build_authorizer`] so they cannot diverge (#2679).
 
 use crate::abac::PolicyList;
+use crate::authorization_config::{
+    name_for_authorizer_mode, AuthorizationConfiguration, AuthorizerConfiguration,
+};
+use crate::authorization_reload::ChainBuilder;
 use rusternetes_common::authz::{
     superuser_then, AlwaysAllowAuthorizer, AlwaysDenyAuthorizer, Authorizer, AuthzStorage,
     NodeAuthorizer, RBACAuthorizer,
@@ -192,8 +196,10 @@ pub fn load_authorization_config(
 /// (reload.go:97-176) from the file's authorizers instead of the modes.
 ///
 /// ABAC still reads `--authorization-policy-file` (`config.PolicyFile`,
-/// config.go:126-130). Hot reload of the file (`runReload`, reload.go:197-)
-/// and `InstrumentedAuthorizer` metrics are not ported.
+/// config.go:126-130). With a file, the result is a
+/// [`ReloadableAuthorizer`](crate::authorization_reload::ReloadableAuthorizer)
+/// that watches it (`Config.New`, config.go:157-159; must be called inside a
+/// tokio runtime).
 pub fn build_authorizer_with_config<S: AuthzStorage + 'static>(
     storage: Arc<S>,
     skip_auth: bool,
@@ -203,9 +209,8 @@ pub fn build_authorizer_with_config<S: AuthzStorage + 'static>(
     config_file: &str,
     legacy_flags_set: bool,
 ) -> anyhow::Result<Arc<dyn Authorizer>> {
-    use crate::authorization_webhook::WebhookAuthorizer;
     let modes = complete_authorization_modes(config_file, modes);
-    let configured = if config_file.is_empty() {
+    let (configuration, initial_data) = if config_file.is_empty() {
         let mut errs = validate_authorization_modes(&modes, policy_file);
         errs.extend(crate::authorization_webhook::validate_webhook_args(
             &modes, webhook,
@@ -213,52 +218,124 @@ pub fn build_authorizer_with_config<S: AuthzStorage + 'static>(
         if !errs.is_empty() {
             anyhow::bail!("invalid authorization options: {}", errs.join("; "));
         }
-        None
+        // `buildAuthorizationConfiguration` (authorization.go:250-290): the
+        // legacy flags are the same chain as a file of the same shape.
+        (
+            AuthorizationConfiguration {
+                authorizers: modes
+                    .iter()
+                    .map(|mode| AuthorizerConfiguration {
+                        type_: mode.clone(),
+                        name: if mode == MODE_WEBHOOK {
+                            DEFAULT_WEBHOOK_NAME.to_string()
+                        } else {
+                            name_for_authorizer_mode(mode)
+                        },
+                        webhook: None,
+                    })
+                    .collect(),
+            },
+            String::new(),
+        )
     } else {
-        let (config, _data) = load_authorization_config(config_file, legacy_flags_set)
-            .map_err(|e| anyhow::anyhow!("invalid authorization options: {e}"))?;
-        Some(config)
+        load_authorization_config(config_file, legacy_flags_set)
+            .map_err(|e| anyhow::anyhow!("invalid authorization options: {e}"))?
     };
     if skip_auth {
         return Ok(Arc::new(AlwaysAllowAuthorizer));
     }
-    // The legacy flags are `buildAuthorizationConfiguration`'s input
-    // (authorization.go:250-290): the same chain as a file of the same shape.
-    let mut chain: Vec<Arc<dyn Authorizer>> = Vec::new();
-    let mut push = |mode: &str,
-                    webhook_config: Option<(
-        &str,
-        &crate::authorization_config::WebhookConfiguration,
-    )>|
-     -> anyhow::Result<()> {
-        match mode {
-            MODE_NODE => chain.push(Arc::new(NodeAuthorizer)),
-            MODE_ALWAYS_ALLOW => chain.push(Arc::new(AlwaysAllowAuthorizer)),
-            MODE_ALWAYS_DENY => chain.push(Arc::new(AlwaysDenyAuthorizer)),
-            // config.go:126-130 `abac.NewFromFile(config.PolicyFile)`.
-            MODE_ABAC => chain.push(Arc::new(PolicyList::new_from_file(Path::new(policy_file))?)),
-            MODE_RBAC => chain.push(Arc::new(RBACAuthorizer::new(storage.clone()))),
-            MODE_WEBHOOK => chain.push(Arc::new(match webhook_config {
-                Some((name, w)) => WebhookAuthorizer::from_configuration(name, w)?,
-                None => WebhookAuthorizer::from_args(webhook)?,
-            })),
-            other => anyhow::bail!("unknown authorization mode {other} specified"),
-        }
-        Ok(())
+
+    // Config.New (config.go:84-145): authorizers that persist across reloads.
+    let mut factory = ChainFactory {
+        node: None,
+        rbac: None,
+        abac: None,
+        legacy_webhook: webhook.clone(),
     };
-    match &configured {
-        Some(config) => {
-            for a in &config.authorizers {
-                push(&a.type_, a.webhook.as_ref().map(|w| (a.name.as_str(), w)))?;
+    for a in &configuration.authorizers {
+        match a.type_.as_str() {
+            MODE_NODE => factory.node = Some(Arc::new(NodeAuthorizer)),
+            // config.go:126-130 `abac.NewFromFile(config.PolicyFile)`.
+            MODE_ABAC => {
+                factory.abac = Some(Arc::new(PolicyList::new_from_file(Path::new(policy_file))?))
             }
-        }
-        None => {
-            for mode in &modes {
-                push(mode, None)?;
-            }
+            MODE_RBAC => factory.rbac = Some(Arc::new(RBACAuthorizer::new(storage.clone()))),
+            _ => {}
         }
     }
-    Ok(Arc::new(superuser_then(chain)))
+    let factory = Arc::new(factory);
+    let initial = factory.new_for_config(&configuration)?;
+    if config_file.is_empty() {
+        return Ok(initial);
+    }
+    let reloadable = crate::authorization_reload::ReloadableAuthorizer::new(
+        config_file,
+        crate::apiserver_identity::apiserver_id(&crate::apiserver_identity::hostname()),
+        configuration,
+        initial_data.into_bytes(),
+        initial,
+        factory,
+    );
+    reloadable.spawn_reload();
+    Ok(reloadable)
+}
+
+/// `defaultWebhookName` (authorization.go).
+const DEFAULT_WEBHOOK_NAME: &str = "default";
+
+/// `newForConfig` (reload.go:97-176) with the authorizers that
+/// `Config.New` builds once and reuses across reloads.
+struct ChainFactory {
+    node: Option<Arc<dyn Authorizer>>,
+    rbac: Option<Arc<dyn Authorizer>>,
+    abac: Option<Arc<dyn Authorizer>>,
+    /// `--authorization-webhook-*`, for a Webhook entry without its own
+    /// configuration (the legacy-flags path).
+    legacy_webhook: crate::authorization_webhook::AuthorizationWebhookArgs,
+}
+
+impl crate::authorization_reload::ChainBuilder for ChainFactory {
+    fn new_for_config(
+        &self,
+        config: &AuthorizationConfiguration,
+    ) -> anyhow::Result<Arc<dyn Authorizer>> {
+        use crate::authorization_metrics::instrumented_authorizer as instrument;
+        use crate::authorization_webhook::WebhookAuthorizer;
+        if config.authorizers.is_empty() {
+            anyhow::bail!("at least one authorization mode must be passed");
+        }
+        // The privileged-groups authorizer is not instrumented upstream either.
+        let mut chain: Vec<Arc<dyn Authorizer>> = Vec::new();
+        for a in &config.authorizers {
+            let mode = a.type_.as_str();
+            let delegate: Arc<dyn Authorizer> = match mode {
+                MODE_NODE => self.node.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "authorizer type Node is not allowed if it was not enabled at initial server startup"
+                    )
+                })?,
+                MODE_ALWAYS_ALLOW => Arc::new(AlwaysAllowAuthorizer),
+                MODE_ALWAYS_DENY => Arc::new(AlwaysDenyAuthorizer),
+                MODE_ABAC => self.abac.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "authorizer type ABAC is not allowed if it was not enabled at initial server startup"
+                    )
+                })?,
+                MODE_WEBHOOK => Arc::new(match &a.webhook {
+                    Some(w) => WebhookAuthorizer::from_configuration(&a.name, w)?,
+                    None => WebhookAuthorizer::from_args(&self.legacy_webhook)?,
+                }),
+                MODE_RBAC => self.rbac.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "authorizer type RBAC is not allowed if it was not enabled at initial server startup"
+                    )
+                })?,
+                other => anyhow::bail!("unknown authorization mode {other} specified"),
+            };
+            chain.push(instrument(mode, &a.name, delegate));
+        }
+        Ok(Arc::new(superuser_then(chain)))
+    }
 }
 
 #[cfg(test)]
