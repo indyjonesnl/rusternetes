@@ -329,8 +329,37 @@ impl Strategy {
         if cr.kind.is_empty() {
             cr.kind = self.crd.spec.names.kind.clone();
         }
+        self.prune_non_nullable_nulls(cr);
         apply_schema_defaults(&self.crd, &self.version, cr);
         prune_custom_resource(&self.crd, &self.version, cr);
+    }
+
+    /// `structuraldefaulting.PruneNonNullableNullsWithoutDefaults(u.Object,
+    /// v.structuralSchemas[gv.Version])` (customresource_handler.go:1439),
+    /// run only when `!v.preserveUnknownFields` (:1432) and before the
+    /// defaulter, as the decoder precedes `unstructuredDefaulter`.
+    fn prune_non_nullable_nulls(&self, cr: &mut CustomResource) {
+        if self.crd.spec.preserve_unknown_fields == Some(true) {
+            return;
+        }
+        let Some(schema) = self.crd_version().and_then(|v| v.schema.as_ref()) else {
+            return;
+        };
+        let Ok(structural) =
+            rusternetes_common::validation::structural::new_structural(&schema.open_apiv3_schema)
+        else {
+            return;
+        };
+        let Ok(mut value) = serde_json::to_value(&*cr) else {
+            return;
+        };
+        rusternetes_common::validation::structural::prunenulls::prune_non_nullable_nulls_without_defaults(
+            &mut value,
+            Some(&structural),
+        );
+        if let Ok(pruned) = serde_json::from_value(value) {
+            *cr = pruned;
+        }
     }
 
     /// The paths `structuralpruning.PruneWithOptions(u.Object,
@@ -1221,5 +1250,68 @@ impl RestStorage<Scale> for CustomResourceScaleRest {
             other => other,
         })?;
         Ok((scale, false))
+    }
+}
+
+#[cfg(test)]
+mod prune_nulls_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn strategy(preserve_unknown_fields: bool) -> Strategy {
+        let crd: CustomResourceDefinition = serde_json::from_value(json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {"name": "widgets.stable.example.com"},
+            "spec": {
+                "group": "stable.example.com", "scope": "Namespaced",
+                "preserveUnknownFields": preserve_unknown_fields,
+                "names": {"plural": "widgets", "kind": "Widget", "listKind": "WidgetList"},
+                "versions": [{"name": "v1", "served": true, "storage": true,
+                    "schema": {"openAPIV3Schema": {"type": "object", "properties": {
+                        "spec": {"type": "object", "properties": {
+                            "plain": {"type": "string"},
+                            "nullable": {"type": "string", "nullable": true},
+                            "defaulted": {"type": "string", "default": "d"},
+                            "nested": {"type": "object", "properties": {
+                                "inner": {"type": "integer"}}}
+                        }}
+                    }}}}]
+            }
+        }))
+        .unwrap();
+        Strategy::new(Arc::new(crd), "v1")
+    }
+
+    fn cr(spec: serde_json::Value) -> CustomResource {
+        serde_json::from_value(json!({
+            "apiVersion": "stable.example.com/v1", "kind": "Widget",
+            "metadata": {"name": "w"}, "spec": spec
+        }))
+        .unwrap()
+    }
+
+    /// customresource_handler.go:1439: non-nullable nulls without a default
+    /// are removed at decode; nullable ones are kept; absent defaulted ones get
+    /// their default.
+    #[test]
+    fn decode_prunes_non_nullable_nulls_without_defaults() {
+        let mut obj = cr(json!({
+            "plain": null, "nullable": null,
+            "nested": {"inner": null}
+        }));
+        strategy(false).coerce(&mut obj);
+        assert_eq!(
+            obj.spec.unwrap(),
+            json!({"nullable": null, "defaulted": "d", "nested": {}})
+        );
+    }
+
+    /// customresource_handler.go:1432: only when `!preserveUnknownFields`.
+    #[test]
+    fn preserve_unknown_fields_skips_null_pruning() {
+        let mut obj = cr(json!({"plain": null}));
+        strategy(true).coerce(&mut obj);
+        assert_eq!(obj.spec.unwrap(), json!({"plain": null, "defaulted": "d"}));
     }
 }
