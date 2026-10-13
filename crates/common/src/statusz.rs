@@ -322,7 +322,7 @@ struct Accept {
 /// `acceptSlice.Less`; for the <= 12 clauses `insertionSort` handles in
 /// `pdqsort` this is an insertion sort, which is what is used here.
 fn parse_accept(header: &str) -> Vec<Accept> {
-    fn split_once_sep<'a>(s: &'a str, sep: char) -> (&'a str, &'a str) {
+    fn split_once_sep(s: &str, sep: char) -> (&str, &str) {
         match s.find(sep) {
             Some(i) => (&s[..i], &s[i + 1..]),
             None => (s, ""),

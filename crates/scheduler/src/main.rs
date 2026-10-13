@@ -126,6 +126,20 @@ struct Args {
     leader_election_lease_duration: u64,
 }
 
+/// `statusz.Install` behind the `ComponentStatusz` gate
+/// (cmd/kube-scheduler/app/server.go:394-396). Upstream builds the registry from
+/// `compatibility.DefaultBuildEffectiveVersion()` (not the flag-derived
+/// effective version) and `pathRecorderMux.ListedPaths()`; the only path this
+/// server lists is `/metrics`.
+fn install_statusz(app: Router) -> Router {
+    rusternetes_common::statusz::install_if_enabled(app, "kube-scheduler", || {
+        rusternetes_common::statusz::Registry::new(Some(
+            rusternetes_common::compatibility::default_build_effective_version(),
+        ))
+        .with_listed_paths(vec!["/metrics".to_string()])
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -198,7 +212,9 @@ async fn main() -> Result<()> {
     info!("Starting metrics server on {}", metrics_addr);
 
     tokio::spawn(async move {
-        let app = Router::new().route("/metrics", get(|| async move { metrics_clone.gather() }));
+        let app = install_statusz(
+            Router::new().route("/metrics", get(|| async move { metrics_clone.gather() })),
+        );
         let listener = tokio::net::TcpListener::bind(&metrics_addr).await.unwrap();
         axum::serve(listener, app).await.unwrap();
     });
@@ -279,7 +295,9 @@ async fn run_api_mode(args: Args, profiles: &profile::Map) -> Result<()> {
     let metrics_addr = format!("0.0.0.0:{}", args.metrics_port);
     info!("Starting metrics server on {}", metrics_addr);
     tokio::spawn(async move {
-        let app = Router::new().route("/metrics", get(|| async move { metrics_clone.gather() }));
+        let app = install_statusz(
+            Router::new().route("/metrics", get(|| async move { metrics_clone.gather() })),
+        );
         let listener = tokio::net::TcpListener::bind(&metrics_addr).await.unwrap();
         axum::serve(listener, app).await.unwrap();
     });
