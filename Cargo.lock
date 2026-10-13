@@ -4483,6 +4483,7 @@ dependencies = [
  "rustls 0.23.40",
  "serde",
  "serde_json",
+ "serde_yaml",
  "serial_test",
  "sha2 0.10.9",
  "tempfile",

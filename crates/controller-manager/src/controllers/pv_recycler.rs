@@ -19,14 +19,155 @@ use rusternetes_common::types::Phase;
 use rusternetes_storage::{build_key, Storage, WatchEvent};
 use std::sync::Arc;
 
-/// `MinimumTimeoutHostPath` default (`defaults.go:87-89`).
-pub const MINIMUM_TIMEOUT_HOST_PATH: i64 = 60;
-/// `IncrementTimeoutHostPath` default (`defaults.go:90-92`).
-pub const INCREMENT_TIMEOUT_HOST_PATH: i64 = 30;
-/// `MinimumTimeoutNFS` default (`defaults.go:81-83`).
-pub const MINIMUM_TIMEOUT_NFS: i64 = 300;
-/// `IncrementTimeoutNFS` default (`defaults.go:84-86`).
-pub const INCREMENT_TIMEOUT_NFS: i64 = 30;
+/// `PersistentVolumeRecyclerConfiguration`
+/// (`pkg/controller/volume/persistentvolume/config/types.go:54-`), the part the
+/// `--pv-recycler-*` flags set (`options/persistentvolumebindercontroller.go:37-42`).
+/// `Default` is `RecommendedDefaultPersistentVolumeRecyclerConfiguration`
+/// (`config/v1alpha1/defaults.go:81-92`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistentVolumeRecyclerConfiguration {
+    pub minimum_timeout_nfs: i32,
+    pub pod_template_file_path_nfs: String,
+    pub increment_timeout_nfs: i32,
+    pub minimum_timeout_host_path: i32,
+    pub pod_template_file_path_host_path: String,
+    pub increment_timeout_host_path: i32,
+}
+
+impl Default for PersistentVolumeRecyclerConfiguration {
+    fn default() -> Self {
+        Self {
+            minimum_timeout_nfs: 300,
+            pod_template_file_path_nfs: String::new(),
+            increment_timeout_nfs: 30,
+            minimum_timeout_host_path: 60,
+            pod_template_file_path_host_path: String::new(),
+            increment_timeout_host_path: 30,
+        }
+    }
+}
+
+/// The recycler part of `volume.VolumeConfig` (`pkg/volume/plugins.go`):
+/// `RecyclerMinimumTimeout`, `RecyclerTimeoutIncrement`, `RecyclerPodTemplate`.
+#[derive(Debug, Clone)]
+pub struct VolumeConfig {
+    pub recycler_minimum_timeout: i64,
+    pub recycler_timeout_increment: i64,
+    pub recycler_pod_template: Pod,
+}
+
+impl VolumeConfig {
+    pub fn host_path_default() -> Self {
+        let c = PersistentVolumeRecyclerConfiguration::default();
+        Self {
+            recycler_minimum_timeout: c.minimum_timeout_host_path.into(),
+            recycler_timeout_increment: c.increment_timeout_host_path.into(),
+            recycler_pod_template: new_persistent_volume_recycler_pod_template(),
+        }
+    }
+
+    pub fn nfs_default() -> Self {
+        let c = PersistentVolumeRecyclerConfiguration::default();
+        Self {
+            recycler_minimum_timeout: c.minimum_timeout_nfs.into(),
+            recycler_timeout_increment: c.increment_timeout_nfs.into(),
+            recycler_pod_template: new_persistent_volume_recycler_pod_template(),
+        }
+    }
+}
+
+/// The `VolumeConfig` of each recyclable plugin, as built by
+/// `ProbeProvisionableRecyclableVolumePlugins`
+/// (`cmd/kube-controller-manager/app/plugins.go:100-120`).
+#[derive(Debug, Clone)]
+pub struct RecyclerConfig {
+    pub host_path: VolumeConfig,
+    pub nfs: VolumeConfig,
+}
+
+impl Default for RecyclerConfig {
+    fn default() -> Self {
+        Self {
+            host_path: VolumeConfig::host_path_default(),
+            nfs: VolumeConfig::nfs_default(),
+        }
+    }
+}
+
+impl RecyclerConfig {
+    /// The recycler half of `ProbeProvisionableRecyclableVolumePlugins`
+    /// (`plugins.go:100-120`): hostPath first, then NFS; either template file
+    /// failing to load aborts (`return nil, err`).
+    pub fn from_configuration(
+        config: &PersistentVolumeRecyclerConfiguration,
+    ) -> Result<Self, String> {
+        let mut host_path = VolumeConfig {
+            recycler_minimum_timeout: config.minimum_timeout_host_path.into(),
+            recycler_timeout_increment: config.increment_timeout_host_path.into(),
+            recycler_pod_template: new_persistent_volume_recycler_pod_template(),
+        };
+        attempt_to_load_recycler(&config.pod_template_file_path_host_path, &mut host_path)
+            .inspect_err(|e| {
+                tracing::error!(
+                    "Could not create hostpath recycler pod from file {}: {}",
+                    config.pod_template_file_path_host_path,
+                    e
+                )
+            })?;
+        let mut nfs = VolumeConfig {
+            recycler_minimum_timeout: config.minimum_timeout_nfs.into(),
+            recycler_timeout_increment: config.increment_timeout_nfs.into(),
+            recycler_pod_template: new_persistent_volume_recycler_pod_template(),
+        };
+        attempt_to_load_recycler(&config.pod_template_file_path_nfs, &mut nfs).inspect_err(
+            |e| {
+                tracing::error!(
+                    "Could not create NFS recycler pod from file {}: {}",
+                    config.pod_template_file_path_nfs,
+                    e
+                )
+            },
+        )?;
+        Ok(Self { host_path, nfs })
+    }
+}
+
+/// `AttemptToLoadRecycler` (`cmd/kube-controller-manager/app/plugins.go:147-163`):
+/// decode a pod from `path` for use as the recycler of a volume; an empty path
+/// leaves the config untouched.
+pub fn attempt_to_load_recycler(path: &str, config: &mut VolumeConfig) -> Result<(), String> {
+    if !path.is_empty() {
+        let recycler_pod = load_pod_from_file(path)?;
+        validate_recycler_pod_template(&recycler_pod)
+            .map_err(|e| format!("pod specification ({path}): {e}"))?;
+        config.recycler_pod_template = recycler_pod;
+    }
+    Ok(())
+}
+
+/// `ValidateRecyclerPodTemplate` (`pkg/volume/plugins.go:1016-1026`): at least
+/// one volume must be defined in the recycle pod template.
+pub fn validate_recycler_pod_template(pod: &Pod) -> Result<(), String> {
+    let volumes = pod.spec.as_ref().and_then(|s| s.volumes.as_ref());
+    if volumes.map_or(0, |v| v.len()) < 1 {
+        return Err("does not contain any volume(s)".to_string());
+    }
+    Ok(())
+}
+
+/// `LoadPodFromFile` (`pkg/volume/util/util.go:128-146`). The Go codec decodes
+/// YAML or JSON; `serde_yaml` reads both.
+pub fn load_pod_from_file(file_path: &str) -> Result<Pod, String> {
+    if file_path.is_empty() {
+        return Err("file path not specified".to_string());
+    }
+    let pod_def = std::fs::read(file_path)
+        .map_err(|e| format!("failed to read file path {file_path}: {e}"))?;
+    if pod_def.is_empty() {
+        return Err(format!("file was empty: {file_path}"));
+    }
+    serde_yaml::from_slice::<Pod>(&pod_def).map_err(|e| format!("failed decoding file: {e}"))
+}
 
 /// `CalculateTimeoutForVolume` (`pkg/volume/util/util.go:152-162`): the
 /// greater of `minimum_timeout` and `increment` seconds per whole Gi of the
@@ -123,14 +264,19 @@ pub fn new_persistent_volume_recycler_pod_template() -> Pod {
 }
 
 /// `hostPathPlugin.Recycle` pod construction (`host_path.go:156-169`).
-pub fn host_path_recycler_pod(pv: &PersistentVolume) -> Result<Pod, String> {
+pub fn host_path_recycler_pod(pv: &PersistentVolume, config: &VolumeConfig) -> Result<Pod, String> {
     use rusternetes_common::resources::pod::HostPathVolumeSource;
     let Some(hp) = pv.spec.host_path.as_ref() else {
         return Err("spec.PersistentVolume.Spec.HostPath is nil".to_string());
     };
-    let mut pod = new_persistent_volume_recycler_pod_template();
-    let timeout =
-        calculate_timeout_for_volume(MINIMUM_TIMEOUT_HOST_PATH, INCREMENT_TIMEOUT_HOST_PATH, pv);
+    // `pod := plugin.config.RecyclerPodTemplate` (a clone: Rust expression of
+    // the shared pointer upstream mutates).
+    let mut pod = config.recycler_pod_template.clone();
+    let timeout = calculate_timeout_for_volume(
+        config.recycler_minimum_timeout,
+        config.recycler_timeout_increment,
+        pv,
+    );
     let spec = pod.spec.as_mut().expect("template has a spec");
     spec.active_deadline_seconds = Some(timeout);
     spec.volumes.as_mut().unwrap()[0].host_path = Some(HostPathVolumeSource {
@@ -141,12 +287,16 @@ pub fn host_path_recycler_pod(pv: &PersistentVolume) -> Result<Pod, String> {
 }
 
 /// `nfsPlugin.Recycle` pod construction (`nfs.go:156-171`).
-pub fn nfs_recycler_pod(pv: &PersistentVolume) -> Result<Pod, String> {
+pub fn nfs_recycler_pod(pv: &PersistentVolume, config: &VolumeConfig) -> Result<Pod, String> {
     let Some(nfs) = pv.spec.nfs.as_ref() else {
         return Err("spec.PersistentVolumeSource.NFS is nil".to_string());
     };
-    let mut pod = new_persistent_volume_recycler_pod_template();
-    let timeout = calculate_timeout_for_volume(MINIMUM_TIMEOUT_NFS, INCREMENT_TIMEOUT_NFS, pv);
+    let mut pod = config.recycler_pod_template.clone();
+    let timeout = calculate_timeout_for_volume(
+        config.recycler_minimum_timeout,
+        config.recycler_timeout_increment,
+        pv,
+    );
     pod.metadata.generate_name = Some("pv-recycler-nfs-".to_string());
     let spec = pod.spec.as_mut().expect("template has a spec");
     spec.active_deadline_seconds = Some(timeout);
@@ -158,11 +308,14 @@ pub fn nfs_recycler_pod(pv: &PersistentVolume) -> Result<Pod, String> {
 /// first, then NFS (the two recyclable plugins registered at
 /// `cmd/kube-controller-manager/app/plugins.go:67-120`). `None` means no
 /// recycler plugin matches.
-pub fn recycler_pod_for_volume(pv: &PersistentVolume) -> Option<Result<Pod, String>> {
+pub fn recycler_pod_for_volume(
+    pv: &PersistentVolume,
+    config: &RecyclerConfig,
+) -> Option<Result<Pod, String>> {
     if pv.spec.host_path.is_some() {
-        Some(host_path_recycler_pod(pv))
+        Some(host_path_recycler_pod(pv, &config.host_path))
     } else if pv.spec.nfs.is_some() {
-        Some(nfs_recycler_pod(pv))
+        Some(nfs_recycler_pod(pv, &config.nfs))
     } else {
         None
     }
@@ -446,6 +599,10 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    fn json(p: &Pod) -> serde_json::Value {
+        serde_json::to_value(p).unwrap()
+    }
+
     fn pv_with_capacity(capacity: &str) -> PersistentVolume {
         let mut pv: PersistentVolume = serde_json::from_value(serde_json::json!({
             "apiVersion": "v1", "kind": "PersistentVolume",
@@ -501,7 +658,7 @@ mod tests {
     #[test]
     fn host_path_recycler_pod_matches_upstream_template() {
         let pv = pv_with_capacity("5Gi");
-        let pod = host_path_recycler_pod(&pv).unwrap();
+        let pod = host_path_recycler_pod(&pv, &VolumeConfig::host_path_default()).unwrap();
         assert_eq!(pod.metadata.generate_name.as_deref(), Some("pv-recycler-"));
         assert_eq!(pod.metadata.namespace.as_deref(), Some("default"));
         let spec = pod.spec.unwrap();
@@ -541,7 +698,7 @@ mod tests {
             path: "/exp".to_string(),
             read_only: None,
         });
-        let pod = nfs_recycler_pod(&pv).unwrap();
+        let pod = nfs_recycler_pod(&pv, &VolumeConfig::nfs_default()).unwrap();
         assert_eq!(
             pod.metadata.generate_name.as_deref(),
             Some("pv-recycler-nfs-")
@@ -557,14 +714,199 @@ mod tests {
         let mut pv = pv_with_capacity("1Gi");
         pv.spec.host_path = None;
         assert_eq!(
-            host_path_recycler_pod(&pv).unwrap_err(),
+            host_path_recycler_pod(&pv, &VolumeConfig::host_path_default()).unwrap_err(),
             "spec.PersistentVolume.Spec.HostPath is nil"
         );
         assert_eq!(
-            nfs_recycler_pod(&pv).unwrap_err(),
+            nfs_recycler_pod(&pv, &VolumeConfig::nfs_default()).unwrap_err(),
             "spec.PersistentVolumeSource.NFS is nil"
         );
-        assert!(recycler_pod_for_volume(&pv).is_none());
+        assert!(recycler_pod_for_volume(&pv, &RecyclerConfig::default()).is_none());
+    }
+
+    // ---- pkg/volume/plugins_test.go Test_ValidatePodTemplate ----
+
+    #[test]
+    fn validate_recycler_pod_template_requires_a_volume() {
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod", "metadata": {"name": "p"},
+            "spec": {"volumes": [{"name": "vol"}], "containers": []},
+        }))
+        .unwrap();
+        assert_eq!(validate_recycler_pod_template(&pod), Ok(()));
+        // The default recycle pod template is valid.
+        assert_eq!(
+            validate_recycler_pod_template(&new_persistent_volume_recycler_pod_template()),
+            Ok(())
+        );
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod", "metadata": {"name": "p"},
+            "spec": {"containers": [{"name": "pv-recycler", "image": "x"}]},
+        }))
+        .unwrap();
+        assert_eq!(
+            validate_recycler_pod_template(&pod).unwrap_err(),
+            "does not contain any volume(s)"
+        );
+    }
+
+    // ---- cmd/kube-controller-manager/app/plugins.go AttemptToLoadRecycler ----
+
+    const CUSTOM_TEMPLATE: &str = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  generateName: custom-recycler-
+spec:
+  restartPolicy: Never
+  volumes:
+  - name: vol
+  containers:
+  - name: scrub
+    image: example/scrub:1
+"#;
+
+    #[test]
+    fn attempt_to_load_recycler_empty_path_keeps_default_template() {
+        let mut cfg = VolumeConfig::nfs_default();
+        attempt_to_load_recycler("", &mut cfg).unwrap();
+        assert_eq!(
+            json(&cfg.recycler_pod_template),
+            json(&new_persistent_volume_recycler_pod_template())
+        );
+    }
+
+    #[test]
+    fn attempt_to_load_recycler_loads_and_validates_the_template() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pod.yaml");
+        std::fs::write(&path, CUSTOM_TEMPLATE).unwrap();
+        let mut cfg = VolumeConfig::nfs_default();
+        attempt_to_load_recycler(path.to_str().unwrap(), &mut cfg).unwrap();
+        assert_eq!(
+            cfg.recycler_pod_template.metadata.generate_name.as_deref(),
+            Some("custom-recycler-")
+        );
+
+        // A template without volumes: "pod specification (<path>): ..."
+        let bad = dir.path().join("bad.yaml");
+        std::fs::write(
+            &bad,
+            "apiVersion: v1\nkind: Pod\nmetadata:\n  name: p\nspec:\n  containers:\n  - name: c\n    image: i\n",
+        )
+        .unwrap();
+        let mut cfg = VolumeConfig::nfs_default();
+        let err = attempt_to_load_recycler(bad.to_str().unwrap(), &mut cfg).unwrap_err();
+        assert_eq!(
+            err,
+            format!(
+                "pod specification ({}): does not contain any volume(s)",
+                bad.display()
+            )
+        );
+        // A failed load leaves the config untouched.
+        assert_eq!(
+            json(&cfg.recycler_pod_template),
+            json(&new_persistent_volume_recycler_pod_template())
+        );
+    }
+
+    /// `LoadPodFromFile` (`pkg/volume/util/util.go:128-146`) errors.
+    #[test]
+    fn load_pod_from_file_errors() {
+        assert_eq!(
+            load_pod_from_file("").unwrap_err(),
+            "file path not specified"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.yaml");
+        let err = load_pod_from_file(missing.to_str().unwrap()).unwrap_err();
+        assert!(
+            err.starts_with(&format!("failed to read file path {}: ", missing.display())),
+            "{err}"
+        );
+        let empty = dir.path().join("empty.yaml");
+        std::fs::write(&empty, "").unwrap();
+        assert_eq!(
+            load_pod_from_file(empty.to_str().unwrap()).unwrap_err(),
+            format!("file was empty: {}", empty.display())
+        );
+        let junk = dir.path().join("junk.yaml");
+        std::fs::write(&junk, "spec: [").unwrap();
+        assert!(load_pod_from_file(junk.to_str().unwrap())
+            .unwrap_err()
+            .starts_with("failed decoding file: "));
+    }
+
+    // ---- ProbeProvisionableRecyclableVolumePlugins config (plugins.go:100-120) ----
+
+    #[test]
+    fn recycler_config_defaults_match_upstream_flag_defaults() {
+        let c = PersistentVolumeRecyclerConfiguration::default();
+        assert_eq!(
+            (
+                c.minimum_timeout_nfs,
+                c.increment_timeout_nfs,
+                c.minimum_timeout_host_path,
+                c.increment_timeout_host_path
+            ),
+            (300, 30, 60, 30)
+        );
+        let r = RecyclerConfig::from_configuration(&c).unwrap();
+        let d = RecyclerConfig::default();
+        assert_eq!(
+            r.nfs.recycler_minimum_timeout,
+            d.nfs.recycler_minimum_timeout
+        );
+        assert_eq!(
+            json(&r.host_path.recycler_pod_template),
+            json(&d.host_path.recycler_pod_template)
+        );
+    }
+
+    #[test]
+    fn recycler_config_flows_timeouts_and_templates_into_pods() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pod.yaml");
+        std::fs::write(&path, CUSTOM_TEMPLATE).unwrap();
+        let c = PersistentVolumeRecyclerConfiguration {
+            minimum_timeout_nfs: 1000,
+            increment_timeout_nfs: 10,
+            pod_template_file_path_nfs: path.to_str().unwrap().to_string(),
+            minimum_timeout_host_path: 90,
+            increment_timeout_host_path: 5,
+            pod_template_file_path_host_path: String::new(),
+        };
+        let r = RecyclerConfig::from_configuration(&c).unwrap();
+        let mut pv = pv_with_capacity("1Gi");
+        let pod = host_path_recycler_pod(&pv, &r.host_path).unwrap();
+        assert_eq!(pod.spec.unwrap().active_deadline_seconds, Some(90));
+        pv.spec.host_path = None;
+        pv.spec.nfs = Some(rusternetes_common::resources::volume::NFSVolumeSource {
+            server: "s".to_string(),
+            path: "/e".to_string(),
+            read_only: None,
+        });
+        let pod = nfs_recycler_pod(&pv, &r.nfs).unwrap();
+        // nfs.go:164 forces the generateName even over a loaded template.
+        assert_eq!(
+            pod.metadata.generate_name.as_deref(),
+            Some("pv-recycler-nfs-")
+        );
+        let spec = pod.spec.unwrap();
+        assert_eq!(spec.active_deadline_seconds, Some(1000));
+        assert_eq!(spec.containers[0].name, "scrub");
+    }
+
+    #[test]
+    fn recycler_config_fails_on_a_bad_template_path() {
+        let c = PersistentVolumeRecyclerConfiguration {
+            pod_template_file_path_host_path: "/nonexistent/pod.yaml".to_string(),
+            ..Default::default()
+        };
+        assert!(RecyclerConfig::from_configuration(&c)
+            .unwrap_err()
+            .starts_with("failed to read file path /nonexistent/pod.yaml: "));
     }
 
     // ---- recycler_client_test.go TestRecyclerPod ----

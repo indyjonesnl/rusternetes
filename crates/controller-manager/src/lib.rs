@@ -125,6 +125,9 @@ pub async fn supervise_controller<F, Fut>(
 /// Configuration for the controller-manager component.
 pub struct ControllerManagerConfig {
     pub sync_interval: u64,
+    /// Recycler plugin config of the PV binder, from the `--pv-recycler-*`
+    /// flags (`ProbeProvisionableRecyclableVolumePlugins`, `plugins.go:100-120`).
+    pub pv_recycler: controllers::pv_recycler::RecyclerConfig,
     /// Metrics client config for the HPA controller. When `None`,
     /// `HttpMetricsConfig::default()` is used (api-server:6443 + /etc/kubernetes/pki).
     pub metrics_config: Option<HttpMetricsConfig>,
@@ -308,8 +311,9 @@ where
     }));
 
     let s = storage_for("PVBinder");
+    let pv_recycler = config.pv_recycler.clone();
     handles.push(tokio::spawn(async move {
-        let c = Arc::new(PVBinderController::new(s));
+        let c = Arc::new(PVBinderController::new(s).with_recycler_config(pv_recycler));
         if let Err(e) = c.run().await {
             error!("PV/PVC Binder controller error: {}", e);
         }
@@ -709,6 +713,7 @@ mod per_controller_client_tests {
             },
             ControllerManagerConfig {
                 sync_interval: 3600,
+                pv_recycler: Default::default(),
                 metrics_config: None,
                 ca_cert_pem: None,
                 node_ipam: None,
@@ -761,6 +766,7 @@ mod csi_attach_wiring_tests {
             |_| storage.clone(),
             ControllerManagerConfig {
                 sync_interval: 3600,
+                pv_recycler: Default::default(),
                 metrics_config: None,
                 ca_cert_pem: None,
                 node_ipam: None,

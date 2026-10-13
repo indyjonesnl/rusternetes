@@ -55,6 +55,33 @@ use rusternetes_storage::{StorageBackend, StorageConfig};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
+/// The recycler plugin config the flags describe, built the way
+/// `newPersistentVolumeBinderController` (`core.go:322-325`) probes the volume
+/// plugins: a template file that fails to load/validate aborts startup.
+/// A macro because the bin's own `mod controllers` and the library crate each
+/// carry a distinct copy of `pv_recycler`.
+macro_rules! recycler_config {
+    ($args:expr, $module:path) => {{
+        use $module::{PersistentVolumeRecyclerConfiguration, RecyclerConfig};
+        let args: &Args = $args;
+        RecyclerConfig::from_configuration(&PersistentVolumeRecyclerConfiguration {
+            minimum_timeout_nfs: args.pv_recycler_minimum_timeout_nfs,
+            pod_template_file_path_nfs: args.pv_recycler_pod_template_filepath_nfs.clone(),
+            increment_timeout_nfs: args.pv_recycler_increment_timeout_nfs,
+            minimum_timeout_host_path: args.pv_recycler_minimum_timeout_hostpath,
+            pod_template_file_path_host_path: args
+                .pv_recycler_pod_template_filepath_hostpath
+                .clone(),
+            increment_timeout_host_path: args.pv_recycler_timeout_increment_hostpath,
+        })
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to probe volume plugins when starting persistentvolume controller: {e}"
+            )
+        })
+    }};
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "rusternetes-controller-manager")]
 #[command(about = "Rusternetes Controller Manager - Runs controller loops")]
@@ -220,6 +247,41 @@ struct Args {
     /// Controller sync interval in seconds
     #[arg(long, default_value = "5")]
     sync_interval: u64,
+
+    /// The file path to a pod definition used as a template for NFS persistent
+    /// volume recycling (`--pv-recycler-pod-template-filepath-nfs`,
+    /// `options/persistentvolumebindercontroller.go:37`).
+    #[arg(long, default_value = "")]
+    pv_recycler_pod_template_filepath_nfs: String,
+
+    /// The minimum ActiveDeadlineSeconds to use for an NFS Recycler pod.
+    #[arg(long, default_value_t = 300)]
+    pv_recycler_minimum_timeout_nfs: i32,
+
+    /// the increment of time added per Gi to ActiveDeadlineSeconds for an NFS
+    /// scrubber pod.
+    #[arg(long, default_value_t = 30)]
+    pv_recycler_increment_timeout_nfs: i32,
+
+    /// The file path to a pod definition used as a template for HostPath
+    /// persistent volume recycling. This is for development and testing only
+    /// and will not work in a multi-node cluster.
+    #[arg(long, default_value = "")]
+    pv_recycler_pod_template_filepath_hostpath: String,
+
+    /// The minimum ActiveDeadlineSeconds to use for a HostPath Recycler pod.
+    /// This is for development and testing only and will not work in a
+    /// multi-node cluster.
+    #[arg(long, default_value_t = 60)]
+    pv_recycler_minimum_timeout_hostpath: i32,
+
+    /// the increment of time added per Gi to ActiveDeadlineSeconds for a
+    /// HostPath scrubber pod. This is for development and testing only and
+    /// will not work in a multi-node cluster. (Upstream registers this one as
+    /// `--pv-recycler-timeout-increment-hostpath`, not `-increment-timeout-`:
+    /// `persistentvolumebindercontroller.go:42`.)
+    #[arg(long, default_value_t = 30)]
+    pv_recycler_timeout_increment_hostpath: i32,
 
     /// Cloud provider (aws, gcp, azure, or none)
     #[arg(long)]
@@ -501,6 +563,10 @@ async fn run_api_mode(args: Args) -> Result<()> {
     );
     let config = rusternetes_controller_manager::ControllerManagerConfig {
         sync_interval: args.sync_interval,
+        pv_recycler: recycler_config!(
+            &args,
+            rusternetes_controller_manager::controllers::pv_recycler
+        )?,
         // The standalone binary spawns these itself (with leader election).
         csi_attachers: Vec::new(),
         attach_detach_controller: false,
@@ -865,7 +931,10 @@ async fn main() -> Result<()> {
     });
 
     // Start PV/PVC Binder controller
-    let pv_binder_controller = Arc::new(PVBinderController::new(storage.clone()));
+    let pv_binder_controller = Arc::new(
+        PVBinderController::new(storage.clone())
+            .with_recycler_config(recycler_config!(&args, controllers::pv_recycler)?),
+    );
     spawn_controller!("PV/PVC Binder controller", leader_elector, {
         let controller = pv_binder_controller.clone();
         async move {
@@ -1614,5 +1683,54 @@ mod csi_capacity_flag_tests {
         assert_eq!(args.csi_capacity_poll_interval, Duration::from_secs(5));
         assert_eq!(args.csi_capacity_ownerref_level, -1);
         assert_eq!(args.csi_capacity_threads, 3);
+    }
+}
+
+#[cfg(test)]
+mod pv_recycler_flag_tests {
+    use super::*;
+
+    /// `persistentvolumebindercontroller.go:37-42` flag names; defaults from
+    /// `config/v1alpha1/defaults.go:81-92`. Note the hostPath increment flag is
+    /// `--pv-recycler-timeout-increment-hostpath` upstream.
+    #[test]
+    fn recycler_flag_defaults_and_names_match_upstream() {
+        let args = Args::try_parse_from(["controller-manager"]).unwrap();
+        assert_eq!(args.pv_recycler_minimum_timeout_nfs, 300);
+        assert_eq!(args.pv_recycler_increment_timeout_nfs, 30);
+        assert_eq!(args.pv_recycler_minimum_timeout_hostpath, 60);
+        assert_eq!(args.pv_recycler_timeout_increment_hostpath, 30);
+        assert_eq!(args.pv_recycler_pod_template_filepath_nfs, "");
+        assert_eq!(args.pv_recycler_pod_template_filepath_hostpath, "");
+        let args = Args::try_parse_from([
+            "controller-manager",
+            "--pv-recycler-minimum-timeout-nfs=1",
+            "--pv-recycler-increment-timeout-nfs=2",
+            "--pv-recycler-minimum-timeout-hostpath=3",
+            "--pv-recycler-timeout-increment-hostpath=4",
+            "--pv-recycler-pod-template-filepath-nfs=/a",
+            "--pv-recycler-pod-template-filepath-hostpath=/b",
+        ])
+        .unwrap();
+        assert_eq!(args.pv_recycler_minimum_timeout_nfs, 1);
+        assert_eq!(args.pv_recycler_increment_timeout_nfs, 2);
+        assert_eq!(args.pv_recycler_minimum_timeout_hostpath, 3);
+        assert_eq!(args.pv_recycler_timeout_increment_hostpath, 4);
+        assert_eq!(args.pv_recycler_pod_template_filepath_nfs, "/a");
+        assert_eq!(args.pv_recycler_pod_template_filepath_hostpath, "/b");
+    }
+
+    /// A bad template file aborts startup with core.go:324's wrapper.
+    #[test]
+    fn bad_template_file_aborts_controller_start() {
+        let args = Args::try_parse_from([
+            "controller-manager",
+            "--pv-recycler-pod-template-filepath-nfs=/nonexistent/pod.yaml",
+        ])
+        .unwrap();
+        let err = recycler_config!(&args, controllers::pv_recycler).unwrap_err();
+        assert!(err.to_string().starts_with(
+            "failed to probe volume plugins when starting persistentvolume controller: failed to read file path /nonexistent/pod.yaml: "
+        ));
     }
 }
