@@ -599,6 +599,7 @@ fn is_restartable_init_container(c: &Container) -> bool {
 mod tests {
     use super::*;
     use crate::resources::PodStatus;
+    use serde_json::json;
 
     fn pod(value: serde_json::Value) -> Pod {
         serde_json::from_value(value).unwrap()
@@ -947,6 +948,102 @@ mod tests {
         assert_eq!(
             errs[0].detail,
             "static pods do not support ephemeral containers"
+        );
+    }
+
+    /// A pod with pod-level resources (`mkPodWithPodLevelResources`-style).
+    fn mk_pl(pod_res: serde_json::Value) -> Pod {
+        pod(serde_json::json!({
+            "metadata": {"name": "pod", "namespace": "ns", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{"name": "c", "image": "busybox"}],
+                "resources": pod_res
+            }
+        }))
+    }
+
+    /// `validatePodLevelResourcesResize` (validation.go:6384-6412) with the
+    /// `InPlacePodLevelResourcesVerticalScaling` gate on.
+    #[test]
+    #[serial_test::serial]
+    fn pod_level_resize_with_the_gate_on() {
+        let _g = crate::feature_gates::with_feature(
+            Feature::InPlacePodLevelResourcesVerticalScaling,
+            true,
+        );
+        let old = mk_pl(json!({"requests": {"cpu": "1"}, "limits": {"cpu": "1"}}));
+        // cpu/memory are mutable.
+        let new = mk_pl(json!({"requests": {"cpu": "1"}, "limits": {"cpu": "2"}}));
+        assert_eq!(resize_errs(&old, &new), Vec::<String>::new());
+        // removing the pod-level resources block.
+        let mut removed = new.clone();
+        removed.spec.as_mut().unwrap().resources = None;
+        assert_eq!(
+            resize_errs(&old, &removed),
+            vec!["spec.resources: pod-level resources cannot be removed"]
+        );
+        // removing requests.
+        let no_req = mk_pl(json!({"limits": {"cpu": "1"}}));
+        assert!(resize_errs(&old, &no_req).contains(
+            &"spec.resources.requests: pod-level resource requests cannot be removed".to_string()
+        ));
+        // only cpu and memory are mutable.
+        let storage_old = mk_pl(json!({"requests": {"cpu": "1"}}));
+        let storage_new = mk_pl(json!({"requests": {"cpu": "1", "ephemeral-storage": "1Gi"}}));
+        assert!(resize_errs(&storage_old, &storage_new)
+            .contains(&"spec: only cpu and memory resources are mutable at pod-level".to_string()));
+    }
+
+    /// `ValidatePodResize` -> `validatePodMetadataAndSpec(newPod, opts)`: opts
+    /// come from the old pod (`GetValidationOptionsFromPodSpecAndMeta`), so an
+    /// already-invalid pod-deletion-cost annotation stays tolerated.
+    #[test]
+    fn resize_tolerates_invalid_deletion_cost_already_on_old_pod() {
+        let mut p = mk(json!({"cpu": "1"}), json!({"cpu": "1"}), json!({}));
+        p.metadata.annotations = Some(HashMap::from([(
+            "controller.kubernetes.io/pod-deletion-cost".to_string(),
+            "abc".to_string(),
+        )]));
+        assert_eq!(resize_errs(&p, &p), Vec::<String>::new());
+    }
+
+    /// `reflect.DeepEqual(field, zero)` (validation.go:3799): a non-nil empty
+    /// slice or map is "set", unlike nil.
+    #[test]
+    fn ephemeral_allow_list_treats_empty_but_present_as_set() {
+        let with = |ec: serde_json::Value| {
+            pod(json!({
+                "metadata": {"name": "pod", "namespace": "ns", "resourceVersion": "1"},
+                "spec": {"containers": [{"name": "cnt", "image": "busybox"}],
+                         "ephemeralContainers": [ec]}
+            }))
+        };
+        let empty = pod(json!({
+            "metadata": {"name": "pod", "namespace": "ns", "resourceVersion": "1"},
+            "spec": {"containers": [{"name": "cnt", "image": "busybox"}]}
+        }));
+        for (key, val) in [
+            ("ports", json!([])),
+            ("resizePolicy", json!([])),
+            ("restartPolicyRules", json!([])),
+            ("resources", json!({"limits": {}})),
+        ] {
+            let mut ec = json!({"name": "e", "image": "busybox"});
+            ec[key] = val;
+            let errs = validate_pod_ephemeral_containers_update(&with(ec), &empty);
+            assert!(
+                errs.iter()
+                    .any(|e| e.field == format!("spec.ephemeralContainers[0].{key}")
+                        && e.detail == "cannot be set for an Ephemeral Container"),
+                "{key}: {errs:?}"
+            );
+        }
+        // an empty resources block is the zero value.
+        let ec = json!({"name": "e", "image": "busybox", "resources": {}});
+        let errs = validate_pod_ephemeral_containers_update(&with(ec), &empty);
+        assert!(
+            errs.iter().all(|e| !e.field.ends_with("resources")),
+            "{errs:?}"
         );
     }
 }
