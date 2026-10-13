@@ -9,6 +9,7 @@
 //!   (shape scaled by `MaxNodeScore / MaxCustomPriorityScore`).
 
 use crate::volume_binding::{FunctionShapePoint, MAX_CUSTOM_PRIORITY_SCORE, MAX_NODE_SCORE};
+use rusternetes_common::go_duration::format_go_duration;
 use rusternetes_common::label_selector::{LabelOperator, LabelRequirement};
 use rusternetes_common::resources::pod::{
     NodeAffinity, NodeSelectorRequirement, NodeSelectorTerm, TopologySpreadConstraint,
@@ -660,12 +661,58 @@ pub struct DynamicResourcesArgs {
 }
 
 impl DynamicResourcesArgs {
-    /// `SetDefaults_DynamicResourcesArgs` (v1/defaults.go:247-257).
-    pub fn set_defaults(&mut self, _fts: DynamicResourcesFeatures) {}
+    /// `SetDefaults_DynamicResourcesArgs` (v1/defaults.go:247-257): the filter
+    /// timeout defaults only with `DRASchedulerFilterTimeout`, the binding
+    /// timeout only with both `DRADeviceBindingConditions` and
+    /// `DRAResourceClaimDeviceStatus`.
+    pub fn set_defaults(&mut self, fts: DynamicResourcesFeatures) {
+        if self.filter_timeout.is_none() && fts.dra_scheduler_filter_timeout {
+            self.filter_timeout = Some(DYNAMIC_RESOURCES_FILTER_TIMEOUT_DEFAULT);
+        }
+        if self.binding_timeout.is_none()
+            && fts.dra_device_binding_conditions
+            && fts.dra_resource_claim_device_status
+        {
+            self.binding_timeout = Some(DYNAMIC_RESOURCES_BINDING_TIMEOUT_DEFAULT);
+        }
+    }
 
     /// `ValidateDynamicResourcesArgs` (validation_pluginargs.go:336-363).
-    pub fn validate(&self, _path: &Path, _fts: DynamicResourcesFeatures) -> ErrorList {
-        ErrorList::new()
+    /// Unlike the REST API, setting a field whose feature is disabled is an
+    /// error. The bad value is a `*metav1.Duration`, marshalled as its
+    /// `Duration.String()` JSON string.
+    pub fn validate(&self, path: &Path, fts: DynamicResourcesFeatures) -> ErrorList {
+        let mut errs = ErrorList::new();
+        let bad = |n: i64| BadValue::marshal(&format_go_duration(n));
+        if fts.dra_scheduler_filter_timeout {
+            if let Some(n) = self.filter_timeout.filter(|n| *n < 0) {
+                errs.push(field::Error::invalid(
+                    &path.child("filterTimeout"),
+                    bad(n),
+                    "must be zero or positive",
+                ));
+            }
+        } else if self.filter_timeout.is_some() {
+            errs.push(field::Error::forbidden(
+                &path.child("filterTimeout"),
+                "DRASchedulingFilterTimeout feature gate is disabled",
+            ));
+        }
+        if fts.dra_device_binding_conditions && fts.dra_resource_claim_device_status {
+            if let Some(n) = self.binding_timeout.filter(|n| *n < NANOS_PER_SECOND) {
+                errs.push(field::Error::invalid(
+                    &path.child("bindingTimeout"),
+                    bad(n),
+                    "must be at least 1 second",
+                ));
+            }
+        } else if self.binding_timeout.is_some() {
+            errs.push(field::Error::forbidden(
+                &path.child("bindingTimeout"),
+                "DRADeviceBindingConditions or DRAResourceClaimDeviceStatus feature gate is disabled",
+            ));
+        }
+        errs
     }
 }
 
@@ -965,6 +1012,15 @@ fn validate_profiles(cfg: &KubeSchedulerConfiguration) -> Result<(ErrorList, Err
                 // does NOT validate NodeResourcesFit's args in this pass. They
                 // are validated when the plugin is constructed instead (NewFit,
                 // fit.go:193), collected in `init_errs`.
+                // validation.go:161-163 validates DynamicResourcesArgs with
+                // the default feature gates; defaults (v1/defaults.go:247)
+                // are applied first by the scheme.
+                "DynamicResources" => {
+                    let mut a: DynamicResourcesArgs = decode_args(pc, &args_path)?;
+                    let fts = DynamicResourcesFeatures::from_gates();
+                    a.set_defaults(fts);
+                    errs.extend(a.validate(&args_path, fts));
+                }
                 "NodeResourcesFitArgs" => {
                     errs.push(field::Error::invalid(
                         &args_path,
