@@ -1,0 +1,72 @@
+// Dumps every versioned feature gate (and the dependency map) that a
+// kube-apiserver registers on utilfeature.DefaultMutableFeatureGate, as JSON.
+// Copied into <kubernetes>/hack/zzdump/main.go by scripts/gen-feature-gate-table.sh
+// (never committed upstream-side).
+//
+// Registration sites reached by the imports below (release-1.35):
+//   - k8s.io/kubernetes/pkg/features init(): defaultVersionedKubernetesFeatureGates
+//     + defaultKubernetesFeatureGateDependencies (pkg/features/kube_features.go),
+//     which pulls in apiserver features (staging/.../apiserver/pkg/features),
+//     zpages features, controller-manager (kcm) features and the client-go gates
+//     (clientfeatures.AddVersionedFeaturesToExistingFeatureGates).
+//   - apiextensions-apiserver features init().
+//   - logsapi.AddFeatureGates / metricsfeatures.AddFeatureGates, called from
+//     cmd/kube-apiserver/app/server.go:66 and cmd/kube-controller-manager.
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"sort"
+
+	_ "k8s.io/apiextensions-apiserver/pkg/features"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	logsapi "k8s.io/component-base/logs/api/v1"
+	metricsfeatures "k8s.io/component-base/metrics/features"
+	_ "k8s.io/kubernetes/pkg/features"
+)
+
+type spec struct {
+	Version   string `json:"version"`
+	Default   bool   `json:"default"`
+	Pre       string `json:"pre"`
+	Lock      bool   `json:"lock"`
+	MinCompat string `json:"min_compat,omitempty"`
+}
+type gate struct {
+	Name  string   `json:"name"`
+	Specs []spec   `json:"specs"`
+	Deps  []string `json:"deps"`
+}
+
+func main() {
+	g := utilfeature.DefaultMutableFeatureGate
+	if err := logsapi.AddFeatureGates(g); err != nil {
+		panic(err)
+	}
+	if err := metricsfeatures.AddFeatureGates(g); err != nil {
+		panic(err)
+	}
+	deps := g.Dependencies()
+	var out []gate
+	for k, v := range g.GetAllVersioned() {
+		e := gate{Name: string(k)}
+		for _, s := range v {
+			sp := spec{Version: s.Version.String(), Default: s.Default, Pre: string(s.PreRelease), Lock: s.LockToDefault}
+			if s.MinCompatibilityVersion != nil {
+				sp.MinCompat = s.MinCompatibilityVersion.String()
+			}
+			e.Specs = append(e.Specs, sp)
+		}
+		for _, d := range deps[k] {
+			e.Deps = append(e.Deps, string(d))
+		}
+		sort.Strings(e.Deps)
+		out = append(out, e)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	b, _ := json.MarshalIndent(out, "", " ")
+	os.Stdout.Write(b)
+	fmt.Println()
+}
