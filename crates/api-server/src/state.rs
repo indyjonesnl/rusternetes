@@ -20,6 +20,11 @@ pub struct ApiServerState {
     pub token_manager: Arc<TokenManager>,
     pub bootstrap_token_manager: Arc<BootstrapTokenManager>,
     pub authorizer: Arc<dyn Authorizer>,
+    /// The authorizer without the `WithAuthorization` filter metrics: for the
+    /// callers that reach the authorizer outside the filter (the reviewed
+    /// subject of a SubjectAccessReview, impersonation, admission, RBAC
+    /// escalation checks).
+    pub unfiltered_authorizer: Arc<dyn Authorizer>,
     pub metrics: Arc<MetricsRegistry>,
     pub skip_auth: bool,
     /// The ClusterIP allocator of the primary (IPv4) family: IPAddress
@@ -101,6 +106,7 @@ impl ApiServerState {
             storage,
             token_manager,
             bootstrap_token_manager: Arc::new(BootstrapTokenManager::new()),
+            unfiltered_authorizer: authorizer.clone(),
             authorizer,
             metrics,
             skip_auth,

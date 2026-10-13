@@ -3,6 +3,7 @@ pub mod admission;
 pub mod audit;
 pub mod authorization_config;
 pub mod authorization_config_metrics;
+pub mod authorization_filter_metrics;
 pub mod authorization_match_conditions;
 pub mod authorization_metrics;
 pub mod authorization_reload;
