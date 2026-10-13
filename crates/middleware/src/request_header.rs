@@ -16,12 +16,74 @@ use rusternetes_common::auth::UserInfo;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// The DER chain the TLS layer verified against `--requestheader-client-ca-file`
-/// (leaf first). Injected per connection by the api-server's acceptor, separate
-/// from `PeerCertificates` (which is the `--client-ca-file` verdict) because
-/// upstream verifies the two authenticators against their own CA bundles.
+/// Per-connection front-proxy state, injected by the api-server's acceptor as
+/// `Option<FrontProxyConnection>` (`Some` only when `--requestheader-client-ca-file`
+/// is set).
+///
+/// The TLS handshake trusts the union of `--client-ca-file` and
+/// `--requestheader-client-ca-file` (`ApplyClientCert`, server/config.go:535-548),
+/// so which authenticator a presented cert is valid for is decided afterwards,
+/// per authenticator, against that authenticator's own CA bundle
+/// (`x509.Verifier`, x509.go:229-255). The acceptor records both verdicts here.
 #[derive(Clone, Debug)]
-pub struct FrontProxyPeerCertificates(pub Arc<Vec<Vec<u8>>>);
+pub struct FrontProxyConnection {
+    pub config: Arc<RequestHeaderConfig>,
+    /// The chain the client presented, leaf first (empty: no client cert).
+    pub presented: Arc<Vec<Vec<u8>>>,
+    /// The chain verifies against `--requestheader-client-ca-file`.
+    pub verified_by_request_header_ca: bool,
+    /// `Some(verdict)` when `--client-ca-file` is set (x509 authentication
+    /// enabled, config.go:128); `None` when it is not.
+    pub verified_by_client_ca: Option<bool>,
+}
+
+impl FrontProxyConnection {
+    /// The chain `PeerCertificates` should carry: only what the x509
+    /// authenticator would accept.
+    pub fn x509_chain(&self) -> Vec<Vec<u8>> {
+        if self.verified_by_client_ca == Some(true) {
+            self.presented.as_ref().clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// `Verifier.AuthenticateRequest` around the header authenticator
+    /// (x509.go:230-255 over requestheader.go:131-150).
+    ///
+    /// `Ok(None)` is "not ok, no error" (union moves on); `Err` is an
+    /// authenticator error (the union collects it, and fails the request
+    /// if no later authenticator succeeds).
+    pub fn authenticate(&self, headers: &mut HeaderMap) -> Result<Option<UserInfo>, String> {
+        let Some(leaf) = self.presented.first() else {
+            return Ok(None);
+        };
+        if !self.verified_by_request_header_ca {
+            return Err("x509: certificate signed by unknown authority".to_string());
+        }
+        // verifySubject reads pkix.Name.CommonName (the last CN attribute).
+        let cn = x509_parser::parse_x509_certificate(leaf)
+            .ok()
+            .and_then(|(_, c)| {
+                c.subject()
+                    .iter_common_name()
+                    .last()
+                    .and_then(|a| a.as_str().ok().map(str::to_string))
+            })
+            .unwrap_or_default();
+        self.config.verify_subject(&cn)?;
+        Ok(self.config.authenticate(headers))
+    }
+
+    /// The x509 authenticator's verdict on this connection's chain
+    /// (`x509.Verifier` with `CommonNameUserConversion`): `Err` when x509 is
+    /// enabled and the presented chain does not verify against
+    /// `--client-ca-file`.
+    pub fn x509_error(&self) -> Option<String> {
+        (self.verified_by_client_ca == Some(false) && !self.presented.is_empty())
+            .then(|| "x509: certificate signed by unknown authority".to_string())
+    }
+}
 
 /// `headerrequest` configuration: header names are matched case-insensitively.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

@@ -26,9 +26,40 @@ use std::sync::Arc;
 use axum::Extension;
 use axum_server::accept::Accept;
 use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
+use rusternetes_middleware::request_header::{FrontProxyConnection, RequestHeaderConfig};
 use rusternetes_middleware::PeerCertificates;
+use rustls::pki_types::{CertificateDer, UnixTime};
+use rustls::server::danger::ClientCertVerifier;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tower::Layer;
+
+/// What the acceptor needs to split a handshake-verified chain between the two
+/// authenticators that upstream keeps separate (`x509.Verifier` per CA,
+/// `pkg/kubeapiserver/authenticator/config.go:113-131`).
+#[derive(Clone)]
+struct FrontProxyTrust {
+    config: Arc<RequestHeaderConfig>,
+    request_header_ca: Arc<dyn ClientCertVerifier>,
+    /// `None` when `--client-ca-file` is unset: x509 authentication is then
+    /// disabled (`config.ClientCAContentProvider != nil`, config.go:128).
+    client_ca: Option<Arc<dyn ClientCertVerifier>>,
+}
+
+/// Whether `chain` (leaf first) verifies against `verifier`'s CA bundle
+/// (`Certificate.Verify` with the presented intermediates, x509.go:235-250).
+fn chain_verifies(verifier: &dyn ClientCertVerifier, chain: &[Vec<u8>]) -> bool {
+    let Some((leaf, rest)) = chain.split_first() else {
+        return false;
+    };
+    let leaf = CertificateDer::from(leaf.as_slice());
+    let intermediates: Vec<CertificateDer<'_>> = rest
+        .iter()
+        .map(|c| CertificateDer::from(c.as_slice()))
+        .collect();
+    verifier
+        .verify_client_cert(&leaf, &intermediates, UnixTime::now())
+        .is_ok()
+}
 
 /// A TLS acceptor that injects the verified client-cert chain as a
 /// [`PeerCertificates`] request extension. Drop-in replacement for the acceptor
@@ -36,6 +67,7 @@ use tower::Layer;
 #[derive(Clone)]
 pub struct PeerCertAcceptor {
     inner: RustlsAcceptor,
+    front_proxy: Option<FrontProxyTrust>,
 }
 
 impl PeerCertAcceptor {
@@ -43,7 +75,31 @@ impl PeerCertAcceptor {
     pub fn new(config: RustlsConfig) -> Self {
         Self {
             inner: RustlsAcceptor::new(config),
+            front_proxy: None,
         }
+    }
+
+    /// Enable request-header (front-proxy) authentication. The `RustlsConfig`
+    /// must trust the union of `client_ca_file` and `request_header_ca_file`
+    /// (`TlsConfig::into_mtls_server_config_for_cas`); this acceptor then
+    /// decides, per connection, which authenticator the presented chain is
+    /// valid for.
+    pub fn with_request_header(
+        mut self,
+        config: Arc<RequestHeaderConfig>,
+        request_header_ca_file: &str,
+        client_ca_file: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        self.front_proxy = Some(FrontProxyTrust {
+            config,
+            request_header_ca: rusternetes_common::tls::client_cert_verifier_for_ca_file(
+                request_header_ca_file,
+            )?,
+            client_ca: client_ca_file
+                .map(rusternetes_common::tls::client_cert_verifier_for_ca_file)
+                .transpose()?,
+        });
+        Ok(self)
     }
 }
 
@@ -55,11 +111,14 @@ where
     // Project the stream/service types through the wrapped acceptor + the
     // Extension layer so we never have to name `TlsStream` / `AddExtension`.
     type Stream = <RustlsAcceptor as Accept<I, S>>::Stream;
-    type Service = <Extension<PeerCertificates> as Layer<S>>::Service;
+    type Service = <Extension<Option<FrontProxyConnection>> as Layer<
+        <Extension<PeerCertificates> as Layer<S>>::Service,
+    >>::Service;
     type Future = Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send>>;
 
     fn accept(&self, stream: I, service: S) -> Self::Future {
         let inner = self.inner.clone();
+        let _front_proxy = self.front_proxy.clone();
         Box::pin(async move {
             let (tls_stream, service) = inner.accept(stream, service).await?;
 
@@ -73,7 +132,9 @@ where
                 .map(|certs| certs.iter().map(|c| c.as_ref().to_vec()).collect())
                 .unwrap_or_default();
 
+            let _ = chain_verifies;
             let service = Extension(PeerCertificates(Arc::new(chain))).layer(service);
+            let service = Extension(None::<FrontProxyConnection>).layer(service);
             Ok((tls_stream, service))
         })
     }

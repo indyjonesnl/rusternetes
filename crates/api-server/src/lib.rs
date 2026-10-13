@@ -45,6 +45,7 @@ pub mod peer_cert_acceptor;
 pub mod post_start_hooks;
 pub mod prometheus_client;
 pub mod registry;
+pub mod request_header_authentication;
 pub mod storage_readiness_hook;
 pub use rusternetes_protobuf as protobuf;
 #[allow(dead_code)]

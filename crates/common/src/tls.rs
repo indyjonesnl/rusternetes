@@ -124,15 +124,21 @@ impl TlsConfig {
         self,
         client_ca_cert_path: &str,
     ) -> Result<Arc<rustls::ServerConfig>> {
-        // Load client CA certificate
-        let client_ca_pem =
-            std::fs::read(client_ca_cert_path).context("Failed to read client CA certificate")?;
-        let client_ca_certs = rustls_pemfile::certs(&mut client_ca_pem.as_slice())
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("Failed to parse client CA certificate")?;
+        self.into_mtls_server_config_for_cas(&[client_ca_cert_path])
+    }
 
-        let mut client_auth_roots = rustls::RootCertStore::empty();
-        client_auth_roots.add_parsable_certificates(client_ca_certs);
+    /// [`Self::into_mtls_server_config`] trusting the union of several client
+    /// CA bundles. Upstream builds the TLS `ClientCAs` pool from the union of
+    /// `--client-ca-file` and `--requestheader-client-ca-file`
+    /// (`AuthenticationInfo.ApplyClientCert`,
+    /// staging/src/k8s.io/apiserver/pkg/server/config.go:535-548); which
+    /// authenticator a presented cert is honoured by is decided per request
+    /// against that authenticator's own CA (`x509.Verifier`).
+    pub fn into_mtls_server_config_for_cas(
+        self,
+        client_ca_cert_paths: &[&str],
+    ) -> Result<Arc<rustls::ServerConfig>> {
+        let client_auth_roots = load_ca_roots(client_ca_cert_paths)?;
 
         // `allow_unauthenticated` makes the client certificate OPTIONAL, matching
         // upstream apiserver semantics: `--client-ca-file` *enables* x509
@@ -160,6 +166,47 @@ impl TlsConfig {
 
         Ok(Arc::new(config))
     }
+}
+
+/// Read PEM CA bundle files into one root store (the union of the bundles).
+fn load_ca_roots(paths: &[&str]) -> Result<rustls::RootCertStore> {
+    let mut roots = rustls::RootCertStore::empty();
+    for path in paths {
+        let pem = std::fs::read(path)
+            .with_context(|| format!("Failed to read client CA certificate {path}"))?;
+        let certs = rustls_pemfile::certs(&mut pem.as_slice())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .with_context(|| format!("Failed to parse client CA certificate {path}"))?;
+        roots.add_parsable_certificates(certs);
+    }
+    Ok(roots)
+}
+
+/// A client-certificate verifier over one CA bundle file, for deciding which
+/// authenticator a presented cert belongs to. Mirrors the per-authenticator
+/// `VerifyOptions` of `x509.Verifier` (x509.go:229-255), as opposed to the
+/// union pool used for the TLS handshake.
+pub fn client_cert_verifier_for_ca_file(
+    ca_path: &str,
+) -> Result<Arc<dyn rustls::server::danger::ClientCertVerifier>> {
+    ensure_crypto_provider();
+    let roots = load_ca_roots(&[ca_path])?;
+    rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .context("Failed to build client cert verifier")
+}
+
+/// Whether two PEM bundles share an identical certificate
+/// (`certificatesOverlap`, pkg/kubeapiserver/options/authentication.go:329-338).
+pub fn ca_files_overlap(a: &str, b: &str) -> Result<bool> {
+    let read = |p: &str| -> Result<Vec<CertificateDer<'static>>> {
+        let pem = std::fs::read(p).with_context(|| format!("Failed to read {p}"))?;
+        rustls_pemfile::certs(&mut pem.as_slice())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .with_context(|| format!("Failed to parse {p}"))
+    };
+    let (a, b) = (read(a)?, read(b)?);
+    Ok(a.iter().any(|x| b.iter().any(|y| x == y)))
 }
 
 /// TLS configuration for clients
