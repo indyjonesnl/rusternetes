@@ -1891,7 +1891,7 @@ fn supports_selinux_context_mount_follows_csidriver() {
 }
 
 #[test]
-fn supports_selinux_context_mount_errors_when_cache_unsynced_or_lister_missing() {
+fn supports_selinux_context_mount_errors_when_lister_missing() {
     let _g = rusternetes_common::feature_gates::with_feature(
         rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
         true,
@@ -1903,9 +1903,9 @@ fn supports_selinux_context_mount_errors_when_cache_unsynced_or_lister_missing()
         persistent_volume: Some(&pv),
         read_only: false,
     };
-    // getCSIDriver: WaitForCacheSync fails / "CSIDriver lister does not exist".
-    let unsynced = CsiPlugin::new(lister_host(&[], false));
-    assert!(unsynced.supports_selinux_context_mount(&spec).is_err());
+    // getCSIDriver: "CSIDriver lister does not exist". (An unsynced cache
+    // blocks in WaitForCacheSync rather than erroring; see the `waits_for`
+    // tests below.)
     assert!(plugin().supports_selinux_context_mount(&spec).is_err());
 }
 
@@ -1976,14 +1976,6 @@ fn can_attach_incomplete_spec_is_an_error() {
             .contains("volume source not found in volume.Spec"),
         "{err}"
     );
-}
-
-#[test]
-fn can_attach_surfaces_an_unsynced_lister_error() {
-    // skipAttach returns any non-NotFound getCSIDriver error (`:861-862`).
-    let p = CsiPlugin::new(lister_host(&[], false));
-    let v = claim_volume();
-    assert!(can_attach_of(&p, &v, Some(&pv("d.csi.example.com", json!({})))).is_err());
 }
 
 #[test]
@@ -2108,6 +2100,6 @@ fn can_attach_waits_for_cache_sync() {
     });
     let v = claim_volume();
     let r = can_attach_of(&p, &v, Some(&pv("noattach.csi.example.com", json!({}))));
-    assert_eq!(r.unwrap(), false);
+    assert!(!r.unwrap());
     t.join().unwrap();
 }

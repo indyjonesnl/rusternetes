@@ -110,16 +110,14 @@ impl CsiPlugin {
     /// PV-first order here reproduces upstream's result for every reachable
     /// state. The CSI directory is keyed on this name, which is why it matters.
     /// `csiPlugin.getCSIDriver` (`csi_plugin.go:873-890`): the host's lister
-    /// after `WaitForCacheSync` (`volume_host.go:175-188`). We cannot block in
-    /// a synchronous plugin method, so an unsynced cache is the same error
-    /// upstream's failed wait returns. `Ok(None)` is `apierrors.IsNotFound`.
+    /// after `WaitForCacheSync` (`volume_host.go:175-188`), which blocks until
+    /// the CSIDriver informer has synced (`wait.NeverStop`: it never fails
+    /// while a lister exists). `Ok(None)` is `apierrors.IsNotFound`.
     fn get_csi_driver(&self, driver: &str) -> Result<Option<CSIDriver>> {
         let Some(lister) = self.host.csi_driver_lister() else {
             return Err(anyhow!("CSIDriver lister does not exist"));
         };
-        if !lister.has_synced() {
-            return Err(anyhow!("failed to wait for cache sync for CSIDriverLister"));
-        }
+        lister.wait_for_cache_sync();
         Ok(lister.get(driver))
     }
 

@@ -16,6 +16,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+/// `syncedPollPeriod` (`shared_informer.go:337`).
+const SYNCED_POLL_PERIOD: Duration = Duration::from_millis(100);
+
 #[derive(Default)]
 struct Inner {
     drivers: RwLock<HashMap<String, CSIDriver>>,
@@ -36,6 +39,31 @@ impl CsiDriverLister {
     /// `csiDriversSynced` (`volume_host.go:170-172`).
     pub fn has_synced(&self) -> bool {
         self.inner.synced.load(Ordering::SeqCst)
+    }
+
+    /// `kubeletVolumeHost.WaitForCacheSync` (`volume_host.go:175-188`) ->
+    /// `cache.WaitForCacheSync(wait.NeverStop, csiDriversSynced)`
+    /// (`client-go/tools/cache/shared_informer.go:384-400`): poll every
+    /// `syncedPollPeriod` (100ms, `:337`), immediately first, and never give up
+    /// (`wait.NeverStop`), so this blocks until the informer has synced.
+    ///
+    /// Plugin methods are synchronous as upstream's are, so this blocks the
+    /// calling thread. On a multi-thread runtime the thread is handed back to
+    /// the scheduler first (`block_in_place`) so the task running [`Self::run`]
+    /// is not starved.
+    pub fn wait_for_cache_sync(&self) {
+        use tokio::runtime::{Handle, RuntimeFlavor};
+        let poll = || {
+            while !self.has_synced() {
+                std::thread::sleep(SYNCED_POLL_PERIOD);
+            }
+        };
+        match Handle::try_current() {
+            Ok(h) if h.runtime_flavor() == RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(poll)
+            }
+            _ => poll(),
+        }
     }
 
     pub fn mark_synced(&self) {
