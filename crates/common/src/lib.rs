@@ -44,6 +44,7 @@ pub mod qos;
 pub mod quantity;
 pub mod query;
 pub mod quota;
+pub mod resource_encoding;
 pub mod resources;
 pub mod sa_keys;
 pub mod schema_validation;
