@@ -228,7 +228,7 @@ struct Args {
     csi_capacity_ownerref_level: i32,
 
     /// `--capacity-threads` (csi-provisioner.go:88, default 1). Accepted for
-    /// flag parity; the publisher is one level-triggered pass per poll.
+    /// flag parity (#3547).
     #[arg(long, default_value_t = 1)]
     csi_capacity_threads: u32,
 
