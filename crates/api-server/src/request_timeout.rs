@@ -149,6 +149,13 @@ pub async fn request_timeout_middleware(req: Request, next: Next) -> Response {
         }
     };
     let deadline = started + timeout;
+    // `context.WithDeadline(ctx, started.Add(timeout))` (request_deadline.go:91-96):
+    // what `getRequestWaitContext` reads in APF.
+    let mut req = req;
+    req.extensions_mut().insert(RequestDeadline {
+        received_at: started.into_std(),
+        deadline: deadline.into_std(),
+    });
     match tokio::time::timeout_at(deadline, next.run(req)).await {
         Err(_) => {
             // `postTimeoutFn` (timeout.go:56-58).

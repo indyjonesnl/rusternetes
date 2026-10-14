@@ -42,8 +42,9 @@
 //!   counters, and `watch_count_samples` (#2987). Not ported:
 //!   `RecordDroppedRequest`/`RecordRequestTermination` (see the module doc of
 //!   `flow_control_metrics`).
-//! - `getRequestWaitContext` has no request deadline to take 1/4 of (we have no
-//!   `WithRequestDeadline`/timeout filter), so the default limit applies:
+//! - `getRequestWaitContext` takes 1/4 of the deadline `WithRequestDeadline`
+//!   put on the request (`request_timeout::RequestDeadline`, incl. a user
+//!   `?timeout=`); long-running requests carry none and get the default limit,
 //!   `RequestTimeout/4` = 15s (config.go:445, :1027).
 //! - Public routes (health probes, discovery, metrics) are not behind the
 //!   filter; upstream sends the probes to the `exempt` level and discovery to a
@@ -462,6 +463,13 @@ pub async fn priority_and_fairness<S: Storage + 'static>(
     next: Next,
 ) -> Response {
     let attrs = request_info(req.method(), req.uri().path(), req.uri().query());
+    // `ctx.Deadline()` / `ReceivedTimestampFrom(ctx)`, set by
+    // `WithRequestDeadline` (request_timeout.rs); absent for long-running
+    // requests.
+    let request_deadline = req
+        .extensions()
+        .get::<crate::request_timeout::RequestDeadline>()
+        .copied();
     let method = req.method().clone();
     let query = req.uri().query().unwrap_or("").to_string();
     let apply_patch = req
@@ -551,7 +559,12 @@ pub async fn priority_and_fairness<S: Storage + 'static>(
     };
     let is_mutating = !NON_MUTATING_REQUEST_VERBS.contains(&attrs.verb.as_str());
 
-    let wait = request_wait_limit(Instant::now(), None, None, f.default_wait_limit);
+    let wait = request_wait_limit(
+        Instant::now(),
+        request_deadline.map(|d| d.received_at),
+        request_deadline.map(|d| d.deadline),
+        f.default_wait_limit,
+    );
     match f
         .engine
         .execute_with_estimate(&classification, &estimate, wait)
