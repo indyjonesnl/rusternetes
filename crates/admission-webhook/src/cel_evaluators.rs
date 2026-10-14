@@ -272,6 +272,17 @@ impl AuditAnnotationEvaluator {
     }
 }
 
+/// The request authorizer a policy plugin evaluates with: the caching
+/// authorizer the dispatcher hands every `Validate` (dispatcher.go:117, 221)
+/// and the request's user (`versionedAttr.GetUserInfo()`, activation.go:53-54).
+#[derive(Clone)]
+pub struct VapAuthorizer {
+    pub user: rusternetes_common::auth::UserInfo,
+    pub authorizer: std::sync::Arc<dyn rusternetes_common::authz::Authorizer>,
+    /// `versionedAttr.GetSubresource()`.
+    pub subresource: String,
+}
+
 /// Build a CEL activation context with the standard VAP variables:
 /// `object`, `oldObject`, `request`, and `params`.
 ///

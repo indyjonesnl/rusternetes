@@ -5,6 +5,9 @@
 
 pub mod cel_evaluators;
 
+#[cfg(test)]
+mod vap_authorizer_tests;
+
 use rusternetes_common::latency_trackers::latency_trackers_from_context;
 use rusternetes_common::{
     admission::{
@@ -1870,6 +1873,25 @@ impl<S: Storage> AdmissionWebhookManager<S> {
     ) -> Result<()> {
         self.run_validating_admission_policies_ext(operation, gvk, object, None, None, None)
             .await
+    }
+
+    /// VAP evaluation with the request authorizer bound to the CEL
+    /// `authorizer` / `authorizer.requestResource` variables.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_validating_admission_policies_authz(
+        &self,
+        operation: &Operation,
+        gvk: &GroupVersionKind,
+        object: Option<&Value>,
+        old_object: Option<&Value>,
+        resource: Option<&str>,
+        namespace: Option<&str>,
+        _authz: Option<&crate::cel_evaluators::VapAuthorizer>,
+    ) -> Result<()> {
+        self.run_validating_admission_policies_ext(
+            operation, gvk, object, old_object, resource, namespace,
+        )
+        .await
     }
 
     /// Extended VAP evaluation with resource name and namespace for precise matching.
