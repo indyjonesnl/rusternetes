@@ -615,3 +615,7 @@ mod tests {
         assert!(ips.contains(&"10.0.0.2"));
     }
 }
+
+#[cfg(test)]
+#[path = "proxy_failure_tests.rs"]
+mod failure_tests;
