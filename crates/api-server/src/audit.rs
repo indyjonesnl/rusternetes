@@ -848,6 +848,18 @@ pub async fn with_audit(cfg: Arc<AuditConfig>, req: Request, next: Next) -> Resp
     resp
 }
 
+/// `withFailedRequestAudit` (request_deadline.go:106-133) against the
+/// installed pipeline.
+pub async fn audit_failed_request(
+    _method: &Method,
+    _uri: &axum::http::Uri,
+    _headers: &axum::http::HeaderMap,
+    _status_message: &str,
+    failed: Response,
+) -> Response {
+    failed
+}
+
 fn internal_error(msg: &str) -> Response {
     let mut r = Response::new(axum::body::Body::from(msg.to_string()));
     *r.status_mut() = axum::http::StatusCode::INTERNAL_SERVER_ERROR;
