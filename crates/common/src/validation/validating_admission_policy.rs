@@ -32,6 +32,20 @@ use crate::validation::metav1::{
 use crate::validation::webhookconfiguration::{to_metav1_selector, validate_rule_parts};
 use std::collections::HashSet;
 
+/// `ignoreValidatingAdmissionPolicyMatchConditions` (`validation.go:619-628`):
+/// true when no update could invalidate a previously-valid match condition,
+/// i.e. `paramKind` and `matchConditions` are unchanged
+/// (`equality.Semantic.DeepEqual`, under which nil and empty lists are equal).
+pub fn ignore_validating_admission_policy_match_conditions(
+    new: &ValidatingAdmissionPolicy,
+    old: &ValidatingAdmissionPolicy,
+) -> bool {
+    let new = new.spec.clone().unwrap_or_default();
+    let old = old.spec.clone().unwrap_or_default();
+    new.param_kind == old.param_kind
+        && new.match_conditions.unwrap_or_default() == old.match_conditions.unwrap_or_default()
+}
+
 /// `maxAuditAnnotations` (`validation.go:47`).
 const MAX_AUDIT_ANNOTATIONS: usize = 20;
 /// `maxAuditAnnotationValueExpressionLength` (`validation.go:49`).

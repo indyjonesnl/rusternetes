@@ -6,15 +6,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use rusternetes_common::authz::Authorizer;
+use rusternetes_common::cel_env::{mutation_env_failure, ExpectedOutput, MutationEnv};
 use rusternetes_common::{Error, Result};
 
 use rusternetes_common::resources::validating_admission_policy::ValidatingAdmissionPolicyStatus;
 use rusternetes_common::resources::ValidatingAdmissionPolicy;
-use rusternetes_common::validation::field::{ErrorList, Path};
+use rusternetes_common::validation::field::{Error as FieldError, ErrorList, Path};
 use rusternetes_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
 use rusternetes_common::validation::validating_admission_policy::{
-    set_defaults_validating_admission_policy, validate_validating_admission_policy,
-    validate_validating_admission_policy_status_update,
+    ignore_validating_admission_policy_match_conditions, set_defaults_validating_admission_policy,
+    validate_validating_admission_policy, validate_validating_admission_policy_status_update,
 };
 use rusternetes_storage::StorageBackend;
 
@@ -61,6 +62,44 @@ fn validate(obj: &ValidatingAdmissionPolicy) -> ErrorList {
     errs
 }
 
+/// The CEL compile of `spec.matchConditions` in
+/// `validateValidatingAdmissionPolicySpec` (validation.go:800-802): each
+/// non-blank expression goes through `validateMatchConditionsExpression`
+/// (:1100-1112) and `convertCELErrorToValidationError` (:1073-1085) unless
+/// `ignore_match_conditions` (`ignoreValidatingAdmissionPolicyMatchConditions`,
+/// :619-628). The stateless compiler has `params` only with a `paramKind`
+/// (`allowParamsInMatchConditions`, :788) and no `variables`; the output must
+/// be `bool` (`MatchCondition.ReturnTypes`, matcher.go:49-51;
+/// compile.go:189-203). Inference-dependent output types are #3277.
+fn compile_errors(obj: &ValidatingAdmissionPolicy, ignore_match_conditions: bool) -> ErrorList {
+    let mut errs = ErrorList::new();
+    let Some(spec) = &obj.spec else {
+        return errs;
+    };
+    if ignore_match_conditions {
+        return errs;
+    }
+    let env = MutationEnv {
+        has_params: spec.param_kind.is_some(),
+        has_patch_types: false,
+        variables: None,
+    };
+    for (i, c) in spec.match_conditions.iter().flatten().enumerate() {
+        let expression = c.expression.trim();
+        if expression.is_empty() {
+            continue;
+        }
+        if let Some(detail) = mutation_env_failure(expression, &env, ExpectedOutput::Bool) {
+            let path = Path::new("spec")
+                .child("matchConditions")
+                .index(i)
+                .child("expression");
+            errs.push(FieldError::invalid(&path, expression.to_string(), detail));
+        }
+    }
+    errs
+}
+
 /// `validatingAdmissionPolicyStrategy` (strategy.go:36-45).
 pub struct Strategy;
 
@@ -79,7 +118,9 @@ impl RestCreateStrategy<ValidatingAdmissionPolicy> for Strategy {
     }
 
     fn validate(&self, _ctx: &RequestContext, obj: &ValidatingAdmissionPolicy) -> ErrorList {
-        validate(obj)
+        let mut errs = validate(obj);
+        errs.extend(compile_errors(obj, false));
+        errs
     }
 }
 
@@ -108,9 +149,14 @@ impl RestUpdateStrategy<ValidatingAdmissionPolicy> for Strategy {
         &self,
         _ctx: &RequestContext,
         obj: &ValidatingAdmissionPolicy,
-        _old: &ValidatingAdmissionPolicy,
+        old: &ValidatingAdmissionPolicy,
     ) -> ErrorList {
-        validate(obj)
+        let mut errs = validate(obj);
+        errs.extend(compile_errors(
+            obj,
+            ignore_validating_admission_policy_match_conditions(obj, old),
+        ));
+        errs
     }
 
     /// strategy.go:111-113.
@@ -178,7 +224,7 @@ impl BeginCreate<ValidatingAdmissionPolicy> for ParamKindAuthz {
         obj: &mut ValidatingAdmissionPolicy,
         _options: &CreateOptions,
     ) -> Result<Box<dyn Finish>> {
-        if validate(obj).is_empty() {
+        if validate(obj).is_empty() && compile_errors(obj, false).is_empty() {
             let errs =
                 authorize_param_kind(ctx, self.authorizer.as_ref(), &self.storage, obj, None).await;
             if !errs.is_empty() {
@@ -202,7 +248,13 @@ impl BeginUpdate<ValidatingAdmissionPolicy> for ParamKindAuthz {
         old: &mut ValidatingAdmissionPolicy,
         _options: &UpdateOptions,
     ) -> Result<Box<dyn Finish>> {
-        if validate(obj).is_empty() {
+        if validate(obj).is_empty()
+            && compile_errors(
+                obj,
+                ignore_validating_admission_policy_match_conditions(obj, old),
+            )
+            .is_empty()
+        {
             let errs =
                 authorize_param_kind(ctx, self.authorizer.as_ref(), &self.storage, obj, Some(old))
                     .await;
@@ -309,5 +361,83 @@ mod invalid_status_tests {
             panic!("expected a Status error from begin_update")
         };
         assert_eq!(st.reason.as_deref(), Some("Invalid"));
+    }
+}
+
+#[cfg(test)]
+mod match_condition_compile_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn policy(match_conditions: serde_json::Value) -> ValidatingAdmissionPolicy {
+        serde_json::from_value(json!({"apiVersion": "admissionregistration.k8s.io/v1", "kind": "ValidatingAdmissionPolicy", "metadata": {"name": "foo"}, "spec": {
+            "matchConstraints": {"matchPolicy": "Exact", "objectSelector": {}, "namespaceSelector": {}, "resourceRules": [{"operations": ["CREATE"], "apiGroups": ["a"], "apiVersions": ["a"], "resources": ["a"]}]},
+            "validations": [{"expression": "true"}],
+            "matchConditions": match_conditions,
+            "failurePolicy": "Fail"}})).unwrap()
+    }
+
+    fn messages(errs: &ErrorList) -> String {
+        errs.iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// `validateMatchConditionsExpression` (validation.go:1100-1112) compiles
+    /// with `MatchCondition.ReturnTypes = [bool]` (matcher.go:49-51), and
+    /// `CompileCELExpression` rejects another output type (compile.go:189-203)
+    /// (#3265).
+    #[test]
+    fn create_rejects_a_non_bool_match_condition() {
+        let p = policy(json!([{"name": "c", "expression": "6"}]));
+        let errs = RestCreateStrategy::validate(&Strategy, &RequestContext::new(None), &p);
+        assert!(
+            messages(&errs).contains(
+                r#"spec.matchConditions[0].expression: Invalid value: "6": must evaluate to bool but got int"#
+            ),
+            "{}",
+            messages(&errs)
+        );
+    }
+
+    /// `validateMatchCondition` (validation.go:984-997).
+    #[test]
+    fn create_rejects_a_match_condition_that_does_not_compile() {
+        let p = policy(json!([{"name": "c", "expression": "///"}]));
+        let errs = RestCreateStrategy::validate(&Strategy, &RequestContext::new(None), &p);
+        assert!(
+            messages(&errs).contains(
+                r#"spec.matchConditions[0].expression: Invalid value: "///": compilation failed"#
+            ),
+            "{}",
+            messages(&errs)
+        );
+    }
+
+    #[test]
+    fn create_accepts_a_bool_match_condition() {
+        let p = policy(json!([{"name": "c", "expression": "object.metadata.name == 'x'"}]));
+        let errs = RestCreateStrategy::validate(&Strategy, &RequestContext::new(None), &p);
+        assert!(errs.is_empty(), "{}", messages(&errs));
+    }
+
+    /// `ignoreValidatingAdmissionPolicyMatchConditions` (validation.go:619-628):
+    /// unchanged `matchConditions` / `paramKind` are not compiled again; a
+    /// change is.
+    #[test]
+    fn update_skips_unchanged_match_conditions_only() {
+        let old = policy(json!([{"name": "c", "expression": "6"}]));
+        let unchanged = old.clone();
+        let ctx = RequestContext::new(None);
+        let errs = RestUpdateStrategy::validate_update(&Strategy, &ctx, &unchanged, &old);
+        assert!(errs.is_empty(), "{}", messages(&errs));
+        let changed = policy(json!([{"name": "c", "expression": "7"}]));
+        let errs = RestUpdateStrategy::validate_update(&Strategy, &ctx, &changed, &old);
+        assert!(
+            messages(&errs).contains("spec.matchConditions[0].expression"),
+            "{}",
+            messages(&errs)
+        );
     }
 }
