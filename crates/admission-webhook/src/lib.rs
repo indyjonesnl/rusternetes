@@ -1875,25 +1875,6 @@ impl<S: Storage> AdmissionWebhookManager<S> {
             .await
     }
 
-    /// VAP evaluation with the request authorizer bound to the CEL
-    /// `authorizer` / `authorizer.requestResource` variables.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn run_validating_admission_policies_authz(
-        &self,
-        operation: &Operation,
-        gvk: &GroupVersionKind,
-        object: Option<&Value>,
-        old_object: Option<&Value>,
-        resource: Option<&str>,
-        namespace: Option<&str>,
-        _authz: Option<&crate::cel_evaluators::VapAuthorizer>,
-    ) -> Result<()> {
-        self.run_validating_admission_policies_ext(
-            operation, gvk, object, old_object, resource, namespace,
-        )
-        .await
-    }
-
     /// Extended VAP evaluation with resource name and namespace for precise matching.
     pub async fn run_validating_admission_policies_ext(
         &self,
@@ -1903,6 +1884,27 @@ impl<S: Storage> AdmissionWebhookManager<S> {
         old_object: Option<&Value>,
         resource: Option<&str>,
         namespace: Option<&str>,
+    ) -> Result<()> {
+        self.run_validating_admission_policies_authz(
+            operation, gvk, object, old_object, resource, namespace, None,
+        )
+        .await
+    }
+
+    /// VAP evaluation with the request authorizer bound to the CEL
+    /// `authorizer` / `authorizer.requestResource` variables
+    /// (`Validate`'s `authz`, validator.go:77, 85, 104). `None` is
+    /// `inputs.Authorizer == nil` (activation.go:52): neither is bound.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_validating_admission_policies_authz(
+        &self,
+        operation: &Operation,
+        gvk: &GroupVersionKind,
+        object: Option<&Value>,
+        old_object: Option<&Value>,
+        resource: Option<&str>,
+        namespace: Option<&str>,
+        authz: Option<&crate::cel_evaluators::VapAuthorizer>,
     ) -> Result<()> {
         use rusternetes_common::CELEvaluator;
 
@@ -2001,8 +2003,31 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                 .and_then(|o| o.pointer("/metadata/name"))
                 .and_then(|n| n.as_str())
                 .unwrap_or("");
+            // The request's name (`attr.GetName()`): the object's, else the
+            // old object's on DELETE.
+            let request_name = if obj_name.is_empty() {
+                old_object
+                    .and_then(|o| o.pointer("/metadata/name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+            } else {
+                obj_name
+            };
+            let authz_user = authz.map(|a| UserInfo {
+                username: a.user.username.clone(),
+                uid: a.user.uid.clone(),
+                groups: a.user.groups.clone(),
+            });
             let match_conditions_pass = self.evaluate_match_conditions(
-                policy, object, old_object, operation, gvk, namespace, obj_name, None,
+                policy,
+                object,
+                old_object,
+                operation,
+                gvk,
+                namespace,
+                obj_name,
+                authz_user.as_ref(),
+                authz.map(|a| (a, derived_resource.as_str(), request_name)),
             );
             if !match_conditions_pass {
                 continue;
@@ -2037,9 +2062,16 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                 },
                 "namespace": namespace.unwrap_or(""),
                 "name": object.and_then(|o| o.get("metadata")).and_then(|m| m.get("name")).and_then(|n| n.as_str()).unwrap_or(""),
-                "userInfo": {
-                    "username": "system:admin",
-                    "groups": ["system:masters", "system:authenticated"],
+                "userInfo": match &authz_user {
+                    Some(u) => serde_json::json!({
+                        "username": u.username,
+                        "uid": u.uid,
+                        "groups": u.groups,
+                    }),
+                    None => serde_json::json!({
+                        "username": "system:admin",
+                        "groups": ["system:masters", "system:authenticated"],
+                    }),
                 },
             });
             let _ = context.add_json_variable("request", &request_val);
@@ -2115,6 +2147,21 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                 }
             }
 
+            // activation.go:52-55: `authorizer` and `authorizer.requestResource`
+            // exist only when `inputs.Authorizer != nil`; plugin.go:118 and
+            // validator.go:85, 104 give them to the variables, matchConditions,
+            // validations and auditAnnotations.
+            if let Some(a) = authz {
+                crate::cel_evaluators::bind_authorizer(
+                    &mut context,
+                    a,
+                    &gvk.group,
+                    &derived_resource,
+                    namespace.unwrap_or(""),
+                    request_name,
+                );
+            }
+
             // Evaluate spec.variables, building a "variables" Map for CEL access.
             // CEL expressions reference variables as `variables.NAME`, which means
             // "variables" must be a Map variable in the CEL context.
@@ -2164,6 +2211,16 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                 }
             }
 
+            // `messageExpression` is compiled with `HasAuthorizer: false`
+            // (plugin.go:119) and bound without it (validator.go:105, 122).
+            let mut message_context = context.clone();
+            message_context
+                .variables
+                .remove(rusternetes_common::cel_authz_library::AUTHORIZER_VAR);
+            message_context
+                .variables
+                .remove(rusternetes_common::cel_authz_library::REQUEST_RESOURCE_AUTHORIZER_VAR);
+
             // Check failure policy
             let failure_policy = policy
                 .get("spec")
@@ -2190,13 +2247,15 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                         validation.get("messageExpression").and_then(|m| m.as_str());
                     let static_message = validation.get("message").and_then(|m| m.as_str());
 
-                    let outcome = crate::cel_evaluators::ValidationEvaluator::evaluate_one(
-                        expression,
-                        message_expression,
-                        static_message,
-                        &mut evaluator,
-                        &context,
-                    );
+                    let outcome =
+                        crate::cel_evaluators::ValidationEvaluator::evaluate_one_with_message_context(
+                            expression,
+                            message_expression,
+                            static_message,
+                            &mut evaluator,
+                            &context,
+                            &message_context,
+                        );
 
                     match outcome {
                         crate::cel_evaluators::ValidationOutcome::Pass => {
@@ -2338,6 +2397,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
         namespace: Option<&str>,
         name: &str,
         user_info: Option<&UserInfo>,
+        authz: Option<(&crate::cel_evaluators::VapAuthorizer, &str, &str)>,
     ) -> bool {
         let raw_conditions = match policy
             .get("spec")
@@ -2361,8 +2421,24 @@ impl<S: Storage> AdmissionWebhookManager<S> {
         );
 
         let mut evaluator = crate::cel_evaluators::MatchConditionEvaluator::new();
+        let mut context = match crate::cel_evaluators::build_context(&request, None) {
+            Ok(ctx) => ctx,
+            Err(_) => return false,
+        };
+        // matcher.go:80-86: `Match`'s `authz` becomes
+        // `OptionalVariableBindings.Authorizer`.
+        if let Some((a, resource, request_name)) = authz {
+            crate::cel_evaluators::bind_authorizer(
+                &mut context,
+                a,
+                &gvk.group,
+                resource,
+                namespace.unwrap_or(""),
+                request_name,
+            );
+        }
         matches!(
-            evaluator.evaluate(&conditions, &request, None),
+            evaluator.evaluate_with_context(&conditions, &context),
             crate::cel_evaluators::MatchOutcome::Matched
         )
     }

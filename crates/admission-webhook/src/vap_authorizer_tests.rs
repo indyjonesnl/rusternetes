@@ -146,10 +146,11 @@ async fn audit_annotations_bind_authorizer() {
     let m = manager(json!({
         "validations": [{"expression": "true"}],
         "auditAnnotations": [{"key": "k", "valueExpression":
-            "string(authorizer.group('').resource('configmaps').check('get').allowed())"}]
+            "authorizer.group('').resource('configmaps').check('get').allowed() ? 'yes' : 'no'"}]
     }))
     .await;
-    assert!(run(&m, Some(&authz(AlwaysAllowAuthorizer))).await.is_ok());
+    let r = run(&m, Some(&authz(AlwaysAllowAuthorizer))).await;
+    assert!(r.is_ok(), "{r:?}");
 }
 
 #[tokio::test]

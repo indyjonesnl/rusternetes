@@ -37,7 +37,8 @@
 //! * `variables`      - lazily-evaluated `spec.variables` map (callers supply)
 //! * `namespaceObject`- the Namespace object (callers supply when available)
 //!
-//! `authorizer` and request-options (`dryRun`, `options`) are **not** populated
+//! `authorizer` is bound by [`bind_authorizer`] (activation.go:52-55) when the
+//! caller has a request authorizer; request-options (`dryRun`, `options`) are **not** populated
 //! by these evaluators; callers that need them should layer them on top of the
 //! [`CELContext`] returned from [`build_context`] before invoking the evaluator.
 //!
@@ -207,6 +208,29 @@ impl ValidationEvaluator {
         evaluator: &mut CELEvaluator,
         context: &CELContext,
     ) -> ValidationOutcome {
+        Self::evaluate_one_with_message_context(
+            expression,
+            message_expression,
+            static_message,
+            evaluator,
+            context,
+            context,
+        )
+    }
+
+    /// [`Self::evaluate_one`] with the `messageExpression` evaluated against
+    /// its own activation: `compilePolicy` declares the messageExpressions
+    /// with `HasAuthorizer: false` (plugin.go:119) and `Validate` binds them
+    /// `OptionalVariableBindings{VersionedParams}` only (validator.go:105,
+    /// 122), so `message_context` carries no `authorizer`.
+    pub fn evaluate_one_with_message_context(
+        expression: &str,
+        message_expression: Option<&str>,
+        static_message: Option<&str>,
+        evaluator: &mut CELEvaluator,
+        context: &CELContext,
+        message_context: &CELContext,
+    ) -> ValidationOutcome {
         let trimmed = expression.trim();
         if trimmed.is_empty() {
             // An empty expression cannot fail — upstream treats it as no-op (Pass).
@@ -216,8 +240,12 @@ impl ValidationEvaluator {
         match evaluator.evaluate(trimmed, context) {
             Ok(true) => ValidationOutcome::Pass,
             Ok(false) => {
-                let message =
-                    resolve_message(message_expression, static_message, evaluator, context);
+                let message = resolve_message(
+                    message_expression,
+                    static_message,
+                    evaluator,
+                    message_context,
+                );
                 ValidationOutcome::Fail { message }
             }
             Err(e) => ValidationOutcome::Error {
@@ -283,14 +311,46 @@ pub struct VapAuthorizer {
     pub subresource: String,
 }
 
+/// Bind `authorizer` and `authorizer.requestResource` (activation.go:52-55):
+/// `NewAuthorizerVal(versionedAttr.GetUserInfo(), inputs.Authorizer)` and
+/// `NewResourceAuthorizerVal(...)`, whose `Resource` is the request's own
+/// resource (`GetResource().Group`, `.Resource`, `GetSubresource`,
+/// `GetNamespace`, `GetName`).
+pub fn bind_authorizer(
+    context: &mut CELContext,
+    authz: &VapAuthorizer,
+    group: &str,
+    resource: &str,
+    namespace: &str,
+    name: &str,
+) {
+    use rusternetes_common::cel_authz_library as lib;
+    context.add_variable(
+        lib::AUTHORIZER_VAR.to_string(),
+        lib::new_authorizer_val(&authz.user, authz.authorizer.clone()),
+    );
+    context.add_variable(
+        lib::REQUEST_RESOURCE_AUTHORIZER_VAR.to_string(),
+        lib::new_resource_authorizer_val(
+            &authz.user,
+            authz.authorizer.clone(),
+            group,
+            resource,
+            &authz.subresource,
+            namespace,
+            name,
+        ),
+    );
+}
+
 /// Build a CEL activation context with the standard VAP variables:
 /// `object`, `oldObject`, `request`, and `params`.
 ///
 /// Mirrors upstream `admission/plugin/cel/compile.go`'s activation. Callers
 /// that need `variables` or `namespaceObject` should call
 /// [`CELContext::add_variable`] / [`CELContext::add_json_variable`] on the
-/// returned context. `authorizer` is not modelled here (no rusternetes
-/// equivalent yet) and is therefore documented as out-of-scope.
+/// returned context. `authorizer` is layered on with [`bind_authorizer`] (no
+/// request authorizer reaches this function).
 pub fn build_context(
     request: &AdmissionRequest,
     params: Option<&Value>,
