@@ -33,7 +33,7 @@ use rusternetes_common::validation::crd::{
     validate_custom_resource_definition_update, validate_update_custom_resource_definition_status,
     CUSTOM_RESOURCE_CLEANUP_FINALIZER,
 };
-use rusternetes_common::validation::field::{Error as FieldError, ErrorList, Path};
+use rusternetes_common::validation::field::{ErrorList, Path};
 use rusternetes_common::{Error, Result};
 use rusternetes_storage::{build_prefix, Storage, StorageBackend};
 use tracing::warn;
@@ -101,35 +101,26 @@ fn schema_rule_errors_in(
     old: Option<&CustomResourceDefinition>,
     env_set: &rusternetes_common::cel_versions::EnvSet,
 ) -> ErrorList {
-    // `findPreexistingExpressions(&oldObj.Spec)` (validation.go:241); nil on
-    // create (validation.go:153).
+    // `findPreexistingExpressions(&oldObj.Spec)` (validation.go:241); empty
+    // on create (validation.go:153).
     let preexisting = old
-        .map(|o| crate::handlers::cel_validation::find_preexisting_rules(&o.spec))
+        .map(|o| crate::handlers::cel_validation::find_preexisting_expressions(&o.spec))
         .unwrap_or_default();
     let mut errs = Vec::new();
     for (i, version) in crd.spec.versions.iter().enumerate() {
         let Some(validation) = &version.schema else {
             continue;
         };
-        if let Err(e) = crate::handlers::cel_validation::validate_crd_rules_in(
+        errs.extend(crate::handlers::cel_validation::validate_crd_schema_rules(
             &validation.open_apiv3_schema,
+            &Path::new("spec")
+                .child("versions")
+                .index(i)
+                .child("schema")
+                .child("openAPIV3Schema"),
             env_set,
             &preexisting,
-        ) {
-            let detail = match e {
-                Error::InvalidResource(msg) => msg,
-                other => other.to_string(),
-            };
-            errs.push(FieldError::invalid(
-                &Path::new("spec")
-                    .child("versions")
-                    .index(i)
-                    .child("schema")
-                    .child("openAPIV3Schema"),
-                String::new(),
-                detail,
-            ));
-        }
+        ));
     }
     errs
 }
