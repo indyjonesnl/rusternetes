@@ -18,7 +18,7 @@ use std::fmt;
 
 /// Reasons in `knownReasons` (errors.go:47-68). A reason outside this set
 /// (including "" / `Unknown`) lets the HTTP code decide.
-const KNOWN_REASONS: &[&str] = &[
+pub const KNOWN_REASONS: &[&str] = &[
     "Unauthorized",
     "Forbidden",
     "NotFound",
