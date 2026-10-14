@@ -1565,6 +1565,37 @@ mod tests {
     }
 
     #[test]
+    fn test_smp_replace_directive_deletes_all_items_from_merging_list() {
+        // patch_test.go:370-377 "delete all items from merging list":
+        // mergeSliceWithSpecialElements (patch.go:1548-1587) returns the
+        // patch minus its `$patch: replace` element.
+        let original = json!({"mergingList": [{"name": "1"}, {"name": "2"}]});
+        let patch = json!({"mergingList": [{"$patch": "replace"}]});
+        let r = apply_strategic_merge_patch(&original, &patch).unwrap();
+        assert_eq!(r, json!({"mergingList": []}));
+    }
+
+    #[test]
+    fn test_smp_replace_directive_replaces_merging_list_with_patch_items() {
+        // Same function: the items beside `$patch: replace` become the list
+        // (what fixupPatchForNodeStatusAddresses emits for status.addresses,
+        // component-helpers/node/util/status.go:84-130).
+        let original = json!({"status": {"addresses": [
+            {"type": "InternalIP", "address": "9.9.9.9"}]}});
+        let patch = json!({"status": {"addresses": [
+            {"type": "InternalIP", "address": "10.1.1.1"},
+            {"type": "Hostname", "address": "n"},
+            {"$patch": "replace"}]}});
+        let r = apply_strategic_merge_patch(&original, &patch).unwrap();
+        assert_eq!(
+            r,
+            json!({"status": {"addresses": [
+                {"type": "InternalIP", "address": "10.1.1.1"},
+                {"type": "Hostname", "address": "n"}]}})
+        );
+    }
+
+    #[test]
     fn test_smp_set_element_order_lists_of_maps_mismatch_errors() {
         // validatePatchWithSetOrderList (patch.go:1018).
         let r = apply_strategic_merge_patch(
