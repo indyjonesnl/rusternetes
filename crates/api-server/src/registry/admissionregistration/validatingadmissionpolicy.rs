@@ -6,15 +6,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use rusternetes_common::authz::Authorizer;
+use rusternetes_common::cel_env::{mutation_env_failure, ExpectedOutput, MutationEnv};
 use rusternetes_common::{Error, Result};
 
 use rusternetes_common::resources::validating_admission_policy::ValidatingAdmissionPolicyStatus;
 use rusternetes_common::resources::ValidatingAdmissionPolicy;
-use rusternetes_common::validation::field::{ErrorList, Path};
+use rusternetes_common::validation::field::{Error as FieldError, ErrorList, Path};
 use rusternetes_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
 use rusternetes_common::validation::validating_admission_policy::{
-    set_defaults_validating_admission_policy, validate_validating_admission_policy,
-    validate_validating_admission_policy_status_update,
+    ignore_validating_admission_policy_match_conditions, set_defaults_validating_admission_policy,
+    validate_validating_admission_policy, validate_validating_admission_policy_status_update,
 };
 use rusternetes_storage::StorageBackend;
 
@@ -61,6 +62,44 @@ fn validate(obj: &ValidatingAdmissionPolicy) -> ErrorList {
     errs
 }
 
+/// The CEL compile of `spec.matchConditions` in
+/// `validateValidatingAdmissionPolicySpec` (validation.go:800-802): each
+/// non-blank expression goes through `validateMatchConditionsExpression`
+/// (:1100-1112) and `convertCELErrorToValidationError` (:1073-1085) unless
+/// `ignore_match_conditions` (`ignoreValidatingAdmissionPolicyMatchConditions`,
+/// :619-628). The stateless compiler has `params` only with a `paramKind`
+/// (`allowParamsInMatchConditions`, :788) and no `variables`; the output must
+/// be `bool` (`MatchCondition.ReturnTypes`, matcher.go:49-51;
+/// compile.go:189-203). Inference-dependent output types are #3277.
+fn compile_errors(obj: &ValidatingAdmissionPolicy, ignore_match_conditions: bool) -> ErrorList {
+    let mut errs = ErrorList::new();
+    let Some(spec) = &obj.spec else {
+        return errs;
+    };
+    if ignore_match_conditions {
+        return errs;
+    }
+    let env = MutationEnv {
+        has_params: spec.param_kind.is_some(),
+        has_patch_types: false,
+        variables: None,
+    };
+    for (i, c) in spec.match_conditions.iter().flatten().enumerate() {
+        let expression = c.expression.trim();
+        if expression.is_empty() {
+            continue;
+        }
+        if let Some(detail) = mutation_env_failure(expression, &env, ExpectedOutput::Bool) {
+            let path = Path::new("spec")
+                .child("matchConditions")
+                .index(i)
+                .child("expression");
+            errs.push(FieldError::invalid(&path, expression.to_string(), detail));
+        }
+    }
+    errs
+}
+
 /// `validatingAdmissionPolicyStrategy` (strategy.go:36-45).
 pub struct Strategy;
 
@@ -79,7 +118,9 @@ impl RestCreateStrategy<ValidatingAdmissionPolicy> for Strategy {
     }
 
     fn validate(&self, _ctx: &RequestContext, obj: &ValidatingAdmissionPolicy) -> ErrorList {
-        validate(obj)
+        let mut errs = validate(obj);
+        errs.extend(compile_errors(obj, false));
+        errs
     }
 }
 
@@ -108,9 +149,14 @@ impl RestUpdateStrategy<ValidatingAdmissionPolicy> for Strategy {
         &self,
         _ctx: &RequestContext,
         obj: &ValidatingAdmissionPolicy,
-        _old: &ValidatingAdmissionPolicy,
+        old: &ValidatingAdmissionPolicy,
     ) -> ErrorList {
-        validate(obj)
+        let mut errs = validate(obj);
+        errs.extend(compile_errors(
+            obj,
+            ignore_validating_admission_policy_match_conditions(obj, old),
+        ));
+        errs
     }
 
     /// strategy.go:111-113.
@@ -178,7 +224,7 @@ impl BeginCreate<ValidatingAdmissionPolicy> for ParamKindAuthz {
         obj: &mut ValidatingAdmissionPolicy,
         _options: &CreateOptions,
     ) -> Result<Box<dyn Finish>> {
-        if validate(obj).is_empty() {
+        if validate(obj).is_empty() && compile_errors(obj, false).is_empty() {
             let errs =
                 authorize_param_kind(ctx, self.authorizer.as_ref(), &self.storage, obj, None).await;
             if !errs.is_empty() {
@@ -202,7 +248,13 @@ impl BeginUpdate<ValidatingAdmissionPolicy> for ParamKindAuthz {
         old: &mut ValidatingAdmissionPolicy,
         _options: &UpdateOptions,
     ) -> Result<Box<dyn Finish>> {
-        if validate(obj).is_empty() {
+        if validate(obj).is_empty()
+            && compile_errors(
+                obj,
+                ignore_validating_admission_policy_match_conditions(obj, old),
+            )
+            .is_empty()
+        {
             let errs =
                 authorize_param_kind(ctx, self.authorizer.as_ref(), &self.storage, obj, Some(old))
                     .await;

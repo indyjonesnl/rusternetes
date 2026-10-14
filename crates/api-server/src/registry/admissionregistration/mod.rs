@@ -6,8 +6,10 @@
 //! - CEL compilation of a policy's `validations`, `variables`,
 //!   `auditAnnotations` and `messageExpression`, and the type-checking
 //!   controller that fills `status.typeChecking` (#1442). The
-//!   `matchConditions` of the two webhook configurations are compiled, as
-//!   `validateMatchConditionsExpression` does.
+//!   `matchConditions` of the two webhook configurations and of a
+//!   ValidatingAdmissionPolicy are compiled, as
+//!   `validateMatchConditionsExpression` does (output type `bool` only where
+//!   no type inference is needed, #3277).
 //! - `MutatingAdmissionPolicy` (`admissionregistration.k8s.io/v1beta1`,
 //!   served only under the `MutatingAdmissionPolicy` gate): those expressions
 //!   are parsed (syntax errors) with the update-time
