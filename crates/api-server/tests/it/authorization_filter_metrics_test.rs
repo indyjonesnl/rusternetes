@@ -1,4 +1,4 @@
-//! `WithAuthorization` filter metrics (#3386).
+//! `WithAuthorization` filter metrics (#3386, #3444).
 //!
 //! Ported from `endpoints/filters/metrics_test.go`
 //! `TestRecordAuthorizationMetricsMetrics`: result is `allowed` when the
@@ -24,7 +24,7 @@ struct Fake(Result<Opinion>);
 impl Authorizer for Fake {
     async fn authorize(&self, a: &RequestAttributes) -> Result<Decision> {
         match self.authorize_opinion(a).await? {
-            Opinion::Allow => Ok(Decision::Allow),
+            Opinion::Allow(_) => Ok(Decision::Allow),
             Opinion::Deny(r) => Ok(Decision::Deny(r)),
             Opinion::NoOpinion {
                 reason,
@@ -102,11 +102,14 @@ fn duration_count(r: &str) -> u64 {
         .sum()
 }
 
-#[tokio::test]
-async fn filter_records_every_result_label() {
-    let _g = LOCK.lock().await;
+// `recordAuthorizationMetrics` (metrics.go:106-122): the result label for each
+// outcome, `allowed` winning over an error.
+#[test]
+fn record_authorization_metrics_labels_every_result() {
+    use rusternetes_common::authz_filter_metrics::record_authorization_metrics;
+    use std::time::Duration;
     let cases: Vec<(&str, Result<Opinion>)> = vec![
-        ("allowed", Ok(Opinion::Allow)),
+        ("allowed", Ok(Opinion::Allow(String::new()))),
         ("denied", Ok(Opinion::Deny("no".into()))),
         (
             "error",
@@ -122,35 +125,30 @@ async fn filter_records_every_result_label() {
                 error: None,
             }),
         ),
+        (
+            "error",
+            Err(rusternetes_common::Error::Authorization("boom".into())),
+        ),
     ];
     for (label, op) in cases {
-        let s = state(op);
         let (a0, d0) = (attempts(label), duration_count(label));
-        let _ = s.authorizer.authorize(&attrs()).await;
-        // Other tests authorize through states in this process: at least one.
+        record_authorization_metrics(&op, Duration::from_millis(1));
+        // Other tests record in this process: at least one.
         assert!(attempts(label) > a0, "{label}");
         assert!(duration_count(label) > d0, "{label}");
     }
 }
 
-// An authorizer that errors outright is recorded as `error`.
+// The handlers still authorize their own requests behind the filter; those
+// calls are not the filter's attempt and must not be counted (upstream counts
+// one per request). Uses the `error` label, which no other test in this
+// process produces through a state.
 #[tokio::test]
-async fn authorizer_error_is_the_error_label() {
+async fn handler_authorizers_do_not_record() {
     let _g = LOCK.lock().await;
     let s = state(Err(rusternetes_common::Error::Authorization("boom".into())));
     let a0 = attempts("error");
     let _ = s.authorizer.authorize(&attrs()).await;
-    assert!(attempts("error") > a0);
-}
-
-// SubjectAccessReview subjects, impersonation and admission do not pass the
-// filter upstream, so they must not be counted. Uses the `error` label, which
-// no other test in this process produces.
-#[tokio::test]
-async fn unfiltered_authorizer_is_not_recorded() {
-    let _g = LOCK.lock().await;
-    let s = state(Err(rusternetes_common::Error::Authorization("boom".into())));
-    let a0 = attempts("error");
     let _ = s.unfiltered_authorizer.authorize(&attrs()).await;
     assert_eq!(attempts("error"), a0);
 }

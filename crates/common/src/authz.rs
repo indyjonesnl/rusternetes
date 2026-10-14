@@ -219,7 +219,10 @@ pub enum Decision {
 /// [`Authorizer::authorize_opinion`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum Opinion {
-    Allow,
+    /// `DecisionAllow` with the authorizer's reason (e.g. RBAC's `RBAC:
+    /// allowed by ...`), which `WithAuthorization` records as the
+    /// `authorization.k8s.io/reason` audit annotation.
+    Allow(String),
     /// An explicit deny: the union stops here (union.go returns on `Deny`).
     Deny(String),
     /// No decision; the union asks the next authorizer. `error` is the error
@@ -240,7 +243,7 @@ pub trait Authorizer: Send + Sync {
     /// `Deny` to `NoOpinion`, the established meaning of `Deny` here.
     async fn authorize_opinion(&self, attrs: &RequestAttributes) -> Result<Opinion> {
         Ok(match self.authorize(attrs).await? {
-            Decision::Allow => Opinion::Allow,
+            Decision::Allow => Opinion::Allow(String::new()),
             Decision::Deny(reason) => Opinion::NoOpinion {
                 reason,
                 error: None,
@@ -966,7 +969,7 @@ impl Authorizer for UnionAuthorizer {
         let mut errors = Vec::new();
         for authorizer in &self.authorizers {
             match authorizer.authorize_opinion(attrs).await? {
-                Opinion::Allow => return Ok(Decision::Allow),
+                Opinion::Allow(_) => return Ok(Decision::Allow),
                 Opinion::Deny(reason) => return Ok(Decision::Deny(reason)),
                 Opinion::NoOpinion { reason, error } => {
                     reasons.push(reason);
@@ -978,6 +981,27 @@ impl Authorizer for UnionAuthorizer {
             return Err(crate::error::Error::Authorization(errors.join("; ")));
         }
         Ok(Decision::Deny(reasons.join("; ")))
+    }
+
+    /// union.go `unionAuthzHandler.Authorize`: the first Allow or Deny
+    /// decides, with its reason; otherwise NoOpinion with the reasons joined
+    /// and any errors that came with them.
+    async fn authorize_opinion(&self, attrs: &RequestAttributes) -> Result<Opinion> {
+        let mut reasons = Vec::new();
+        let mut errors = Vec::new();
+        for authorizer in &self.authorizers {
+            match authorizer.authorize_opinion(attrs).await? {
+                Opinion::NoOpinion { reason, error } => {
+                    reasons.push(reason);
+                    errors.extend(error);
+                }
+                decided => return Ok(decided),
+            }
+        }
+        Ok(Opinion::NoOpinion {
+            reason: reasons.join("; "),
+            error: (!errors.is_empty()).then(|| errors.join("; ")),
+        })
     }
 
     async fn get_user_rules(

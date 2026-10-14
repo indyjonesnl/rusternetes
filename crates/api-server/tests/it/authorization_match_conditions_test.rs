@@ -101,7 +101,7 @@ async fn all_true_conditions_call_the_webhook() {
         ],
     );
     let o = a.authorize_opinion(&alice()).await.unwrap();
-    assert!(matches!(o, Opinion::Allow), "{o:?}");
+    assert!(matches!(o, Opinion::Allow(_)), "{o:?}");
     assert_eq!(n.load(Ordering::SeqCst), 1);
 }
 
@@ -270,6 +270,6 @@ async fn selector_requirements_are_visible_to_match_conditions() {
     attrs.verb = "list".into();
     attrs.set_selectors("metadata.name=x", "");
     let o = a.authorize_opinion(&attrs).await.unwrap();
-    assert!(matches!(o, Opinion::Allow), "{o:?}");
+    assert!(matches!(o, Opinion::Allow(_)), "{o:?}");
     assert_eq!(n.load(Ordering::SeqCst), 1);
 }

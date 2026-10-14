@@ -2758,6 +2758,13 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         protected_routes = protected_routes.layer(axum_middleware::from_fn(
             crate::apiserver_request_metrics::instrument_request,
         ));
+        // WithAuthorization is the innermost filter: after authentication,
+        // audit, impersonation and priority-and-fairness, around the handler
+        // (server/config.go:1015-1043).
+        protected_routes = protected_routes.layer(axum_middleware::from_fn_with_state(
+            state.authorizer.clone(),
+            crate::authorization_filter::with_authorization,
+        ));
         if let Some(apf) = crate::flow_control_filter::installed() {
             protected_routes = protected_routes.layer(axum_middleware::from_fn_with_state(
                 apf,
@@ -2815,6 +2822,13 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         // counts every request the handler chain serves.
         protected_routes = protected_routes.layer(axum_middleware::from_fn(
             crate::apiserver_request_metrics::instrument_request,
+        ));
+        // WithAuthorization is the innermost filter: after authentication,
+        // audit, impersonation and priority-and-fairness, around the handler
+        // (server/config.go:1015-1043).
+        protected_routes = protected_routes.layer(axum_middleware::from_fn_with_state(
+            state.authorizer.clone(),
+            crate::authorization_filter::with_authorization,
         ));
         if let Some(apf) = crate::flow_control_filter::installed() {
             protected_routes = protected_routes.layer(axum_middleware::from_fn_with_state(

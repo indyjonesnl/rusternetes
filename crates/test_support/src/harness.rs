@@ -302,6 +302,7 @@ impl Default for TestApiServer {
 pub struct TestApiServerBuilder {
     skip_auth: bool,
     rbac: bool,
+    authorizer: Option<Arc<dyn Authorizer>>,
     secret: Vec<u8>,
     ca_cert_pem: Option<String>,
     service_cluster_ip_range: String,
@@ -314,6 +315,7 @@ impl Default for TestApiServerBuilder {
         Self {
             skip_auth: true,
             rbac: false,
+            authorizer: None,
             secret: b"test-secret".to_vec(),
             ca_cert_pem: None,
             service_cluster_ip_range: String::new(),
@@ -342,6 +344,12 @@ impl TestApiServerBuilder {
     /// the default allow-all authorizer.
     pub fn rbac(mut self) -> Self {
         self.rbac = true;
+        self
+    }
+
+    /// Use this authorizer instead of the allow-all or RBAC one.
+    pub fn authorizer(mut self, authorizer: Arc<dyn Authorizer>) -> Self {
+        self.authorizer = Some(authorizer);
         self
     }
 
@@ -380,7 +388,9 @@ impl TestApiServerBuilder {
             self.token_manager
                 .unwrap_or_else(|| TokenManager::new(&self.secret)),
         );
-        let authorizer: Arc<dyn Authorizer> = if self.rbac {
+        let authorizer: Arc<dyn Authorizer> = if let Some(a) = self.authorizer {
+            a
+        } else if self.rbac {
             Arc::new(RBACAuthorizer::new(backend.clone()))
         } else {
             Arc::new(AlwaysAllowAuthorizer)

@@ -20,10 +20,11 @@ pub struct ApiServerState {
     pub token_manager: Arc<TokenManager>,
     pub bootstrap_token_manager: Arc<BootstrapTokenManager>,
     pub authorizer: Arc<dyn Authorizer>,
-    /// The authorizer without the `WithAuthorization` filter metrics: for the
-    /// callers that reach the authorizer outside the filter (the reviewed
-    /// subject of a SubjectAccessReview, impersonation, admission, RBAC
-    /// escalation checks).
+    /// The authorizer for the callers that reach it outside the
+    /// `WithAuthorization` filter (the reviewed subject of a
+    /// SubjectAccessReview, impersonation, admission, RBAC escalation
+    /// checks). The same authorizer as [`Self::authorizer`]; neither records
+    /// the filter's metrics.
     pub unfiltered_authorizer: Arc<dyn Authorizer>,
     pub metrics: Arc<MetricsRegistry>,
     pub skip_auth: bool,
@@ -102,15 +103,15 @@ impl ApiServerState {
             &ServiceIpRanges::default().families(),
         ));
 
+        rusternetes_common::authz_filter_metrics::register_metrics();
         Self {
             storage,
             token_manager,
             bootstrap_token_manager: Arc::new(BootstrapTokenManager::new()),
-            // `WithAuthorization` records its metrics around every authorize
-            // call (filters/authorization.go:57-99).
-            authorizer: rusternetes_common::authz_filter_metrics::filter_instrumented(
-                authorizer.clone(),
-            ),
+            // The `WithAuthorization` filter records the metrics, once per
+            // request (authorization_filter.rs); the per-handler checks that
+            // remain must not count again.
+            authorizer: authorizer.clone(),
             unfiltered_authorizer: authorizer,
             metrics,
             skip_auth,

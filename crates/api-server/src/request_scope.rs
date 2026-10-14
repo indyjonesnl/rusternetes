@@ -10,6 +10,11 @@
 //! consumed instead of at ~200 call sites.
 
 use crate::audit::{request_info, Attributes};
+
+/// `request.RequestInfo`. The api-server binary compiles its own copy of
+/// `crate::audit`, so code compiled into both must name the type through
+/// here (the lib's), which is what the task-local holds.
+pub type RequestInfo = Attributes;
 use rusternetes_common::authz::RequestAttributes;
 
 tokio::task_local! {
@@ -19,6 +24,12 @@ tokio::task_local! {
 /// Serve `fut` with `info` as the current request's `RequestInfo`.
 pub async fn with_request_info<F: std::future::Future>(info: Attributes, fut: F) -> F::Output {
     REQUEST_INFO.scope(info, fut).await
+}
+
+/// `request.RequestInfoFrom(ctx)`: the current request's `RequestInfo`, if
+/// [`request_info_middleware`] ran for it.
+pub fn current_request_info() -> Option<Attributes> {
+    REQUEST_INFO.try_with(|info| info.clone()).ok()
 }
 
 /// Axum layer: install `NewRequestInfo` of each request.
