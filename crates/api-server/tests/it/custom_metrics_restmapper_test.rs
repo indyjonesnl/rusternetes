@@ -164,8 +164,7 @@ async fn not_found_message_names_the_normalized_group_resource() {
         .await;
     assert_eq!(s.as_u16(), 404, "{b}");
     assert_eq!(
-        b["message"],
-        "the server could not find the metric qps for deployments.apps nope",
+        b["message"], "the server could not find the metric qps for deployments.apps nope",
         "{b}"
     );
 }

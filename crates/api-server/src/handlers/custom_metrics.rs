@@ -16,6 +16,9 @@ use rusternetes_common::{
     },
     Result,
 };
+use rusternetes_discovery::restmapper::{
+    is_builtin_group, new_discovery_rest_mapper, served_group_resources, Gvr, PriorityRestMapper,
+};
 use rusternetes_storage::{build_key, build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -39,23 +42,143 @@ fn matchers_for(metric_selector: &LabelSelector) -> Result<Vec<String>> {
         .map_err(|e| unknown_error(e.to_string()))
 }
 
-/// The storage collection for a request `resource`, which `requestInfo`
-/// carries as `plural[.group]` (reststorage.go:110-113 `ParseGroupResource`).
-fn storage_resource(resource: &str) -> &str {
-    resource.split('.').next().unwrap_or(resource)
+/// `schema.GroupResource`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GroupResource {
+    group: String,
+    resource: String,
 }
 
-/// The provider's object lookup: names of the `resource` objects in
-/// `namespace` (none for a root-scoped resource) matching `selector`
+impl GroupResource {
+    /// `schema.ParseGroupResource` (apimachinery/pkg/runtime/schema/
+    /// group_version.go:87-92), applied to the request's `plural[.group]`
+    /// resource (reststorage.go:110-113).
+    fn parse(raw: &str) -> Self {
+        match raw.split_once('.') {
+            Some((resource, group)) => Self {
+                group: group.to_string(),
+                resource: resource.to_string(),
+            },
+            None => Self {
+                group: String::new(),
+                resource: raw.to_string(),
+            },
+        }
+    }
+
+    fn with_version_empty(&self) -> Gvr {
+        Gvr::new(&self.group, "", &self.resource)
+    }
+}
+
+/// `GroupResource.String()`: `resource`, or `resource.group`.
+impl std::fmt::Display for GroupResource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.group.is_empty() {
+            f.write_str(&self.resource)
+        } else {
+            write!(f, "{}.{}", self.resource, self.group)
+        }
+    }
+}
+
+/// The provider's RESTMapper: `restmapper.NewDiscoveryRESTMapper` over the
+/// served discovery (`pkg/dynamicmapper/mapper.go:65-78`
+/// `RegenerateMappings`), here the built-in groups plus the groups of the
+/// established CustomResourceDefinitions.
+async fn rest_mapper(state: &ApiServerState) -> Result<PriorityRestMapper> {
+    let crds: Vec<serde_json::Value> = state
+        .storage
+        .as_ref()
+        .list(&build_prefix("customresourcedefinitions", None))
+        .await?;
+    Ok(new_discovery_rest_mapper(&served_group_resources(&crds)))
+}
+
+/// `CustomMetricInfo.Normalized` (pkg/provider/interfaces.go:55-68): the
+/// group-resource resolved to its plural, which must also have a singular.
+/// The mapper's error is returned as-is (an APIStatus-less error: 500
+/// `Unknown`, `ErrorToAPIStatus`).
+fn normalized(mapper: &PriorityRestMapper, info: &GroupResource) -> Result<GroupResource> {
+    let resolved = mapper
+        .resource_for(&info.with_version_empty())
+        .map_err(|e| unknown_error(e.to_string()))?;
+    let normalized = GroupResource {
+        group: resolved.group,
+        resource: resolved.resource,
+    };
+    mapper
+        .resource_singularizer(&normalized.resource)
+        .map_err(|e| unknown_error(e.to_string()))?;
+    Ok(normalized)
+}
+
+/// `helpers.ResourceFor` (pkg/provider/helpers/helpers.go:36-49): the first
+/// of `ResourcesFor`, for listing the matching objects.
+fn resource_for(mapper: &PriorityRestMapper, info: &GroupResource) -> Result<GroupResource> {
+    let wrap = |e: String| {
+        unknown_error(format!(
+            "unable to find preferred version to list matching resource names: {e}"
+        ))
+    };
+    let resources = mapper
+        .resources_for(&info.with_version_empty())
+        .map_err(|e| wrap(e.to_string()))?;
+    let first = resources.into_iter().next().ok_or_else(|| {
+        wrap(format!(
+            "no fully versioned resources known for group-resource {info}"
+        ))
+    })?;
+    Ok(GroupResource {
+        group: first.group,
+        resource: first.resource,
+    })
+}
+
+/// `helpers.ReferenceFor` (helpers.go:55-69): the `DescribedObject` from
+/// `mapper.KindFor`. `APIVersion` is `kind.Group + "/" + kind.Version`, so the
+/// core group yields `/v1` (upstream behaviour, kept).
+fn reference_for(
+    mapper: &PriorityRestMapper,
+    namespace: Option<&str>,
+    name: &str,
+    info: &GroupResource,
+) -> Result<ObjectReference> {
+    let kind = mapper
+        .kind_for(&info.with_version_empty())
+        .map_err(|e| unknown_error(e.to_string()))?;
+    Ok(ObjectReference {
+        kind: kind.kind,
+        namespace: namespace.map(str::to_string),
+        name: name.to_string(),
+        api_version: Some(format!("{}/{}", kind.group, kind.version)),
+    })
+}
+
+/// The storage collection holding a resolved group-resource: built-in
+/// resources are keyed by their plural, custom resources by
+/// `<group>_<plural>` (`handlers::custom_resource`).
+fn storage_collection(gr: &GroupResource) -> String {
+    if is_builtin_group(&gr.group) {
+        gr.resource.clone()
+    } else {
+        format!("{}_{}", gr.group.replace('.', "_"), gr.resource)
+    }
+}
+
+/// The provider's object lookup: names of the objects of the group-resource
+/// in `namespace` (none for a root-scoped resource) matching `selector`
 /// (`helpers.ListObjectNames`, pkg/provider/helpers/helpers.go:74-107;
 /// `GetMetricBySelector` runs it first).
 async fn selected_object_names(
     state: &ApiServerState,
+    mapper: &PriorityRestMapper,
     namespace: Option<&str>,
-    resource: &str,
+    info: &GroupResource,
     selector: &LabelSelector,
 ) -> Result<Vec<String>> {
-    let prefix = build_prefix(storage_resource(resource), namespace);
+    let res = resource_for(mapper, info)?;
+    let prefix = build_prefix(&storage_collection(&res), namespace);
     let objects: Vec<serde_json::Value> = state.storage.as_ref().list(&prefix).await?;
     let mut names: Vec<String> = objects
         .iter()
@@ -69,21 +192,14 @@ async fn selected_object_names(
 /// `test-adapter/provider/provider.go:238-262` `metricFor`: the
 /// `DescribedObject` reference, `Metric{Name, Selector}`, no `WindowSeconds`.
 fn metric_value(
-    namespace: Option<&str>,
-    resource: &str,
-    name: String,
+    described_object: ObjectReference,
     metric_name: &str,
     value: String,
     selector: Option<MetricSelector>,
 ) -> MetricValue {
     MetricValue {
         type_meta: metric_value_type_meta("MetricValue"),
-        described_object: ObjectReference {
-            kind: described_kind(resource),
-            namespace: namespace.map(str::to_string),
-            name,
-            api_version: Some("v1".to_string()),
-        },
+        described_object,
         metric: MetricIdentifier {
             name: metric_name.to_string(),
             selector,
@@ -94,36 +210,30 @@ fn metric_value(
     }
 }
 
-/// The `Kind` of the described object. Upstream resolves it with
-/// `helpers.ReferenceFor` (RESTMapper `KindFor`); the RESTMapper port is
-/// tracked in #3390, so `namespaces` keeps its known kind and everything
-/// else keeps the previous capitalised-resource form.
-fn described_kind(resource: &str) -> String {
-    if resource == "namespaces" {
-        "Namespace".to_string()
-    } else {
-        capitalize(resource)
-    }
-}
-
 /// `GetMetricByName` (handleIndividualOp, reststorage.go:136-149).
 ///
 /// Prometheus when configured. Otherwise the built-in series model of the
 /// custom-metrics-apiserver test adapter (`test-adapter/provider/provider.go:
-/// 215-235`): the object must exist (`NewMetricNotFoundForError`) and the
-/// series, which carries no labels, must satisfy the metric label selector
-/// (`NewMetricNotFoundForSelectorError`). `namespace` is `None` for a
-/// root-scoped resource (`Namespaced: namespace != ""`, reststorage.go:140).
+/// 215-235`): the group-resource is normalized first (`valueFor`), the object
+/// must exist (`NewMetricNotFoundForError`) and the series, which carries no
+/// labels, must satisfy the metric label selector
+/// (`NewMetricNotFoundForSelectorError`); `metricFor` then builds the
+/// `DescribedObject` with `ReferenceFor` from the request's group-resource.
+/// `namespace` is `None` for a root-scoped resource (`Namespaced: namespace
+/// != ""`, reststorage.go:140).
 async fn get_metric_by_name(
     state: &ApiServerState,
+    mapper: &PriorityRestMapper,
     namespace: Option<&str>,
-    resource: &str,
+    info: &GroupResource,
     name: &str,
     metric_name: &str,
     metric_selector: &LabelSelector,
 ) -> Result<MetricValue> {
+    let normalized = normalized(mapper, info)?;
     let value = if let Some(ref prometheus_client) = state.prometheus_client {
         let matchers = matchers_for(metric_selector)?;
+        let resource = normalized.resource.as_str();
         let queried = match namespace {
             Some(ns) => {
                 prometheus_client
@@ -131,7 +241,7 @@ async fn get_metric_by_name(
                     .await
             }
             // The metric describing a namespace itself.
-            None if resource == "namespaces" => {
+            None if resource == "namespaces" && normalized.group.is_empty() => {
                 prometheus_client
                     .query_namespace_metric(metric_name, name, &matchers)
                     .await
@@ -153,7 +263,7 @@ async fn get_metric_by_name(
             }
         }
     } else {
-        let key = build_key(storage_resource(resource), namespace, name);
+        let key = build_key(&storage_collection(&normalized), namespace, name);
         if state
             .storage
             .as_ref()
@@ -162,25 +272,19 @@ async fn get_metric_by_name(
             .is_err()
         {
             return Err(metric_not_found(format!(
-                "the server could not find the metric {metric_name} for {resource} {name}"
+                "the server could not find the metric {metric_name} for {normalized} {name}"
             )));
         }
         if !metric_selector.matches(&HashMap::new()) {
             return Err(metric_not_found(format!(
-                "the server could not find the metric {metric_name} for {resource} {name} with selector {metric_selector}"
+                "the server could not find the metric {metric_name} for {normalized} {name} with selector {metric_selector}"
             )));
         }
         "100".to_string()
     };
+    let reference = reference_for(mapper, namespace, name, info)?;
     let echo = metric_selector_echo(metric_selector)?;
-    Ok(metric_value(
-        namespace,
-        resource,
-        name.to_string(),
-        metric_name,
-        value,
-        echo,
-    ))
+    Ok(metric_value(reference, metric_name, value, echo))
 }
 
 /// The one `REST.List` every custom.metrics route runs
@@ -202,6 +306,9 @@ async fn list_op(
     // get.go:84-126 decode, then reststorage.go List.
     let opts = decode_list_options(params, route_name)?;
     let metric_selector = decode_metric_label_selector(params)?;
+    // reststorage.go:110-113.
+    let info = GroupResource::parse(resource);
+    let mapper = rest_mapper(state).await?;
 
     let items = match opts.name.as_deref().filter(|n| *n != "*") {
         // `name != "*"`: handleIndividualOp; the object labelSelector is not
@@ -210,8 +317,9 @@ async fn list_op(
         Some(name) => vec![
             get_metric_by_name(
                 state,
+                &mapper,
                 namespace,
-                resource,
+                &info,
                 name,
                 metric_name,
                 &metric_selector,
@@ -221,7 +329,19 @@ async fn list_op(
         // handleWildcardOp -> GetMetricBySelector(namespace, selector, ...).
         None => {
             let objects =
-                selected_object_names(state, namespace, resource, &opts.object_selector).await?;
+                selected_object_names(state, &mapper, namespace, &info, &opts.object_selector)
+                    .await?;
+            // `metricsFor` runs `valueFor` (-> `Normalized`) per object and
+            // returns anything but a NotFound; nothing to look up, nothing to
+            // fail.
+            let normalized = if objects.is_empty() {
+                None
+            } else {
+                Some(normalized(&mapper, &info)?)
+            };
+            let resource = normalized
+                .as_ref()
+                .map_or(resource, |n| n.resource.as_str());
             let mut series: Vec<(String, String)> = Vec::new();
             if let Some(ref prometheus_client) = state.prometheus_client {
                 let matchers = matchers_for(&metric_selector)?;
@@ -253,12 +373,13 @@ async fn list_op(
                 Vec::new()
             } else {
                 let echo = metric_selector_echo(&metric_selector)?;
-                series
-                    .into_iter()
-                    .map(|(name, value)| {
-                        metric_value(namespace, resource, name, metric_name, value, echo.clone())
-                    })
-                    .collect()
+                let mut out = Vec::with_capacity(series.len());
+                for (name, value) in series {
+                    // `metricFor` (provider.go:238-262).
+                    let reference = reference_for(&mapper, namespace, &name, &info)?;
+                    out.push(metric_value(reference, metric_name, value, echo.clone()));
+                }
+                out
             }
         }
     };
@@ -417,19 +538,6 @@ pub async fn get_cluster_metric(
     ))
 }
 
-/// Helper function to capitalize the first letter of a string
-fn capitalize(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        None => String::new(),
-        Some(first) => {
-            let mut result = first.to_uppercase().to_string();
-            result.push_str(&chars.as_str().to_lowercase());
-            result
-        }
-    }
-}
-
 #[cfg(test)]
 #[cfg(feature = "integration-tests")] // Disable tests that require full setup
 mod tests {
@@ -548,13 +656,5 @@ mod tests {
         assert_eq!(metric.metric_name, "cpu_usage");
         assert_eq!(metric.described_object.kind, "Namespace");
         assert_eq!(metric.described_object.name, "default");
-    }
-
-    #[tokio::test]
-    async fn test_capitalize() {
-        assert_eq!(capitalize("pods"), "Pods");
-        assert_eq!(capitalize("Pods"), "Pods");
-        assert_eq!(capitalize(""), "");
-        assert_eq!(capitalize("p"), "P");
     }
 }

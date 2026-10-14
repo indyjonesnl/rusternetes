@@ -6,6 +6,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+pub mod restmapper;
+
 /// Version information (`apimachinery/pkg/version.Info`).
 pub use rusternetes_common::compatibility::VersionInfo;
 
