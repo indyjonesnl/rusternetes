@@ -85,6 +85,7 @@ async fn create_test_pv(storage: &MemoryStorage, name: &str) -> PersistentVolume
         spec: PersistentVolumeSpec {
             gce_persistent_disk: None,
             aws_elastic_block_store: None,
+            fc: None,
             capacity,
             host_path: Some(HostPathVolumeSource {
                 path: format!("/tmp/test-pv/{}", name),

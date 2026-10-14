@@ -531,6 +531,7 @@ async fn test_snapshot_workflow() {
         spec: PersistentVolumeSpec {
             gce_persistent_disk: None,
             aws_elastic_block_store: None,
+            fc: None,
             capacity: capacity.clone(),
             host_path: Some(volume::HostPathVolumeSource {
                 path: "/tmp/test-pv/data-pv".to_string(),

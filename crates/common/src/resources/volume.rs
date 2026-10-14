@@ -86,6 +86,10 @@ pub struct PersistentVolumeSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub iscsi: Option<ISCSIVolumeSource>,
 
+    /// FibreChannel source (`core/v1 PersistentVolumeSource.fc`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fc: Option<FCVolumeSource>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local: Option<LocalVolumeSource>,
 
@@ -206,6 +210,27 @@ pub struct ISCSIVolumeSource {
     /// custom iSCSI Initiator Name
     #[serde(skip_serializing_if = "Option::is_none")]
     pub initiator_name: Option<String>,
+}
+
+/// `core/v1 FCVolumeSource` (`staging/src/k8s.io/api/core/v1/types.go`): a
+/// Fibre Channel volume. Exactly one of `targetWWNs` (with `lun`) or `wwids`
+/// is set.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FCVolumeSource {
+    #[serde(
+        default,
+        rename = "targetWWNs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub target_wwns: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lun: Option<i32>,
+    #[serde(default, rename = "fsType", skip_serializing_if = "Option::is_none")]
+    pub fs_type: Option<String>,
+    #[serde(default, rename = "readOnly", skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wwids: Option<Vec<String>>,
 }
 
 /// SecretReference represents a Secret reference by name and namespace.
@@ -934,6 +959,7 @@ mod tests {
                 csi: None,
                 gce_persistent_disk: None,
                 aws_elastic_block_store: None,
+                fc: None,
                 access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
                 persistent_volume_reclaim_policy: Some(PersistentVolumeReclaimPolicy::Retain),
                 storage_class_name: Some("manual".to_string()),

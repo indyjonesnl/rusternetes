@@ -43,6 +43,7 @@ fn create_test_pv(name: &str, capacity: &str) -> PersistentVolume {
         spec: PersistentVolumeSpec {
             gce_persistent_disk: None,
             aws_elastic_block_store: None,
+            fc: None,
             capacity: capacity_map,
             host_path: Some(HostPathVolumeSource {
                 path: "/mnt/data".to_string(),
