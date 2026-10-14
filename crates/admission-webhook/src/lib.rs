@@ -105,6 +105,135 @@ pub(crate) fn resolve_webhook_timeout(timeout_seconds: Option<i32>) -> Duration 
     Duration::from_secs(secs)
 }
 
+/// An `ErrCallingWebhook` (webhook/util/error.go): the call itself failed,
+/// with the HTTP status upstream's `ErrCallingWebhook.Status` carries. A
+/// transport, timeout, decode or verification failure is not a `StatusError`
+/// to client-go, so the dispatcher builds `NewServiceUnavailable` (503)
+/// (validating/dispatcher.go:281-290, mutating/dispatcher.go:303-317).
+#[derive(Debug)]
+struct CallFailure {
+    error: rusternetes_common::Error,
+    /// `int(err.Status.ErrStatus.Code)`, for the metrics.
+    code: i32,
+}
+
+impl From<rusternetes_common::Error> for CallFailure {
+    fn from(error: rusternetes_common::Error) -> Self {
+        Self { error, code: 503 }
+    }
+}
+
+/// The metrics one webhook call reports, as the dispatchers' `switch err.(type)`
+/// does (validating/dispatcher.go:176-196, mutating/dispatcher.go:170-191,
+/// :203-215): an `ErrCallingWebhook` is rejected unless the policy is Ignore
+/// (which fails open instead), an `ErrWebhookRejection` is a `no_error`
+/// rejection with the webhook's status code (`ToStatusErr` makes it at least
+/// 400, errors/statuserror.go:31-34), and success is a 200.
+fn observe_webhook_call(
+    name: &str,
+    operation: &Operation,
+    step_type: &str,
+    elapsed: Duration,
+    result: &std::result::Result<AdmissionReviewResponse, CallFailure>,
+    ignore_client_call_failures: bool,
+) {
+    use admission_metrics::{
+        observe_webhook, observe_webhook_fail_open, observe_webhook_rejection,
+        WebhookRejectionErrorType,
+    };
+    let op = admission_metrics::operation_label(operation);
+    match result {
+        Err(f) => {
+            let rejected = !ignore_client_call_failures;
+            if rejected {
+                observe_webhook_rejection(
+                    name,
+                    step_type,
+                    op,
+                    WebhookRejectionErrorType::CallingWebhookError,
+                    f.code,
+                );
+            }
+            observe_webhook(name, elapsed, rejected, operation, step_type, f.code);
+            if ignore_client_call_failures {
+                observe_webhook_fail_open(name, step_type);
+            }
+        }
+        Ok(response) if !response.allowed => {
+            let code = response
+                .status
+                .as_ref()
+                .and_then(|s| s.code)
+                .unwrap_or(0)
+                .max(400);
+            observe_webhook_rejection(
+                name,
+                step_type,
+                op,
+                WebhookRejectionErrorType::NoError,
+                code,
+            );
+            observe_webhook(name, elapsed, true, operation, step_type, code);
+        }
+        Ok(_) => observe_webhook(name, elapsed, false, operation, step_type, 200),
+    }
+}
+
+/// The metrics of a mutating webhook whose response patch failed
+/// (mutating/dispatcher.go:327-358): an undecodable patch is an
+/// `ErrCallingWebhook` with `NewServiceUnavailable` (503), one that does not
+/// apply a `NewInternalError`, which the dispatcher's `default` arm counts as
+/// an `apiserver_internal_error` with code 0.
+fn observe_webhook_patch_failure(
+    name: &str,
+    operation: &Operation,
+    elapsed: Duration,
+    calling_webhook_error: bool,
+    ignore_client_call_failures: bool,
+) {
+    use admission_metrics::{
+        observe_webhook, observe_webhook_rejection, WebhookRejectionErrorType, STEP_ADMIT,
+    };
+    let op = admission_metrics::operation_label(operation);
+    if calling_webhook_error {
+        let rejected = !ignore_client_call_failures;
+        if rejected {
+            observe_webhook_rejection(
+                name,
+                STEP_ADMIT,
+                op,
+                WebhookRejectionErrorType::CallingWebhookError,
+                503,
+            );
+        }
+        observe_webhook(name, elapsed, rejected, operation, STEP_ADMIT, 503);
+    } else {
+        observe_webhook_internal_error(name, operation, STEP_ADMIT, elapsed);
+    }
+}
+
+/// The dispatchers' `default` arm (validating/dispatcher.go:189-193,
+/// mutating/dispatcher.go:184-188): any error that is neither
+/// `ErrCallingWebhook` nor `ErrWebhookRejection` -- among them the
+/// `NewDryRunUnsupportedErr` a webhook with side effects raises for a dry-run
+/// request (errors/statuserror.go:62-65) -- is rejected as an
+/// `apiserver_internal_error` with code 0.
+fn observe_webhook_internal_error(
+    name: &str,
+    operation: &Operation,
+    step_type: &str,
+    elapsed: Duration,
+) {
+    admission_metrics::observe_webhook_rejection(
+        name,
+        step_type,
+        admission_metrics::operation_label(operation),
+        admission_metrics::WebhookRejectionErrorType::ApiServerInternalError,
+        0,
+    );
+    admission_metrics::observe_webhook(name, elapsed, true, operation, step_type, 0);
+}
+
 /// Admission webhook client for calling external webhooks
 pub struct AdmissionWebhookClient {
     #[allow(dead_code)]
@@ -235,6 +364,20 @@ impl AdmissionWebhookClient {
         timeout: Duration,
         ca_bundle: Option<&[u8]>,
     ) -> Result<AdmissionReviewResponse> {
+        self.call_webhook_coded(url, review, timeout, ca_bundle)
+            .await
+            .map_err(|f| f.error)
+    }
+
+    /// [`Self::call_webhook_with_ca`] keeping the status code upstream's
+    /// `ErrCallingWebhook.Status` carries (see [`CallFailure`]).
+    async fn call_webhook_coded(
+        &self,
+        url: &str,
+        review: &AdmissionReview,
+        timeout: Duration,
+        ca_bundle: Option<&[u8]>,
+    ) -> std::result::Result<AdmissionReviewResponse, CallFailure> {
         // Outer tokio deadline mirrors K8s admissionContext.WithTimeout — if the
         // entire call exceeds the budget, the future is dropped/aborted.
         // K8s ref: staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/generic/webhook.go
@@ -263,7 +406,8 @@ impl AdmissionWebhookClient {
                 "failed to call webhook: context deadline exceeded querying {}?timeout={}s",
                 url,
                 timeout.as_secs()
-            ))),
+            ))
+            .into()),
         }
     }
 
@@ -273,7 +417,7 @@ impl AdmissionWebhookClient {
         review: &AdmissionReview,
         timeout: Duration,
         ca_bundle: Option<&[u8]>,
-    ) -> Result<AdmissionReviewResponse> {
+    ) -> std::result::Result<AdmissionReviewResponse, CallFailure> {
         // K8s appends ?timeout={seconds}s to the webhook URL so the backend
         // knows how long it has. Tests check for this in error messages.
         // K8s ref: staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/request/admissionreview.go
@@ -365,10 +509,16 @@ impl AdmissionWebhookClient {
         })?;
 
         if !response.status().is_success() {
-            return Err(rusternetes_common::Error::Network(format!(
-                "Webhook returned status: {}",
-                response.status()
-            )));
+            // client-go turns a non-2xx response into a `StatusError` with the
+            // HTTP code, which `ErrCallingWebhook.Status` keeps
+            // (validating/dispatcher.go:281-285).
+            return Err(CallFailure {
+                code: i32::from(response.status().as_u16()),
+                error: rusternetes_common::Error::Network(format!(
+                    "Webhook returned status: {}",
+                    response.status()
+                )),
+            });
         }
 
         let body_bytes = response.bytes().await.map_err(|e| {
@@ -389,7 +539,8 @@ impl AdmissionWebhookClient {
         if body_bytes.is_empty() {
             return Err(rusternetes_common::Error::Network(
                 "Webhook returned empty response body".to_string(),
-            ));
+            )
+            .into());
         }
 
         // Try parsing as AdmissionReview first, fall back to parsing as raw Value
@@ -444,6 +595,7 @@ impl AdmissionWebhookClient {
             rusternetes_common::Error::Network(
                 "Webhook response missing response field".to_string(),
             )
+            .into()
         })
     }
 
@@ -695,6 +847,8 @@ pub struct AdmissionWebhookManager<S: Storage> {
 impl<S: Storage> AdmissionWebhookManager<S> {
     /// Create a new admission webhook manager
     pub fn new(storage: Arc<S>) -> Self {
+        // metrics.go:260-268 registers the families at package init.
+        admission_metrics::register_all();
         Self {
             storage,
             client: AdmissionWebhookClient::new(),
@@ -974,6 +1128,12 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                             SideEffectClass::Some | SideEffectClass::Unknown
                         )
                     {
+                        observe_webhook_internal_error(
+                            &webhook.name,
+                            operation,
+                            admission_metrics::STEP_VALIDATING_WEBHOOK,
+                            Duration::ZERO,
+                        );
                         return Ok(AdmissionResponse::Deny(format!(
                             "admission webhook {:?} does not support dry run",
                             webhook.name
@@ -1065,20 +1225,38 @@ impl<S: Storage> AdmissionWebhookManager<S> {
             let webhook_name = inv.webhook_name.clone();
             let failure_policy = inv.failure_policy.clone();
             let uid = inv.request.uid.clone();
+            let operation = operation.clone();
 
             // Task-locals do not cross `spawn`: carry the trackers in.
             let trackers = latency_trackers_from_context();
             handles.push(tokio::spawn(async move {
                 let client = AdmissionWebhookClient::new();
                 let ca_ref = ca_data.as_deref();
-                let call = client.call_webhook_with_ca(&url, &review, timeout, ca_ref);
+                let t = std::time::Instant::now();
+                let call = client.call_webhook_coded(&url, &review, timeout, ca_ref);
                 // `wd.ValidatingWebhookTracker.Track(do)`
                 // (validating/dispatcher.go:298-301).
                 let result = match &trackers {
                     Some(wd) => wd.validating_webhook.track(call).await,
                     None => call.await,
                 };
-                (webhook_name, failure_policy, uid, result)
+                // The metrics are observed in the per-webhook goroutine
+                // (validating/dispatcher.go:174-209), so every webhook of the
+                // request is counted, not only those before the first denial.
+                observe_webhook_call(
+                    &webhook_name,
+                    &operation,
+                    admission_metrics::STEP_VALIDATING_WEBHOOK,
+                    t.elapsed(),
+                    &result,
+                    matches!(failure_policy, FailurePolicy::Ignore),
+                );
+                (
+                    webhook_name,
+                    failure_policy,
+                    uid,
+                    result.map_err(|f| f.error),
+                )
             }));
         }
 
@@ -1499,6 +1677,12 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                             SideEffectClass::Some | SideEffectClass::Unknown
                         )
                     {
+                        observe_webhook_internal_error(
+                            &webhook.name,
+                            operation,
+                            admission_metrics::STEP_ADMIT,
+                            Duration::ZERO,
+                        );
                         return Ok((
                             AdmissionResponse::Deny(format!(
                                 "admission webhook {:?} does not support dry run",
@@ -1564,17 +1748,32 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                     let ca_bundle = ca_decoded.as_deref();
                     // `wd.MutatingWebhookTracker.Track(do)`
                     // (mutating/dispatcher.go:298-301).
-                    let call = self.client.call_webhook_with_ca(
-                        &resolved_url,
-                        &review,
-                        timeout,
-                        ca_bundle,
-                    );
+                    let started = std::time::Instant::now();
+                    let call =
+                        self.client
+                            .call_webhook_coded(&resolved_url, &review, timeout, ca_bundle);
                     let call_result = match latency_trackers_from_context() {
                         Some(wd) => wd.mutating_webhook.track(call).await,
                         None => call.await,
                     };
-                    let response = match call_result {
+                    let ignore_client_call_failures =
+                        matches!(webhook.failure_policy, Some(FailurePolicy::Ignore));
+                    // dispatcher.go:169-191: a failed or denied call is
+                    // observed here; a successful one once its patch has been
+                    // applied (the timer in upstream spans
+                    // `callAttrMutatingHook`, which applies it).
+                    let observed_success_later = matches!(&call_result, Ok(r) if r.allowed);
+                    if !observed_success_later {
+                        observe_webhook_call(
+                            &webhook.name,
+                            operation,
+                            admission_metrics::STEP_ADMIT,
+                            started.elapsed(),
+                            &call_result,
+                            ignore_client_call_failures,
+                        );
+                    }
+                    let response = match call_result.map_err(|f| f.error) {
                         Ok(resp) => {
                             info!(
                                 "Webhook {} response: allowed={}, url={}",
@@ -1631,43 +1830,84 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                         return Ok((AdmissionResponse::Deny(reason), object, should_reinvoke));
                     }
 
-                    // Apply patches
-                    if let Some(patch_base64) = &response.patch {
+                    // Apply patches. The call is observed once this is done
+                    // (see above); a patch that cannot be decoded is an
+                    // `ErrCallingWebhook` (503), one that cannot be applied an
+                    // internal error (mutating/dispatcher.go:327-358).
+                    let patch_outcome: std::result::Result<
+                        Vec<PatchOperation>,
+                        (rusternetes_common::Error, bool),
+                    > = (|| {
+                        let Some(patch_base64) = &response.patch else {
+                            return Ok(Vec::new());
+                        };
                         // Decode base64 patch
                         use base64::Engine;
                         let patch_bytes = base64::engine::general_purpose::STANDARD
                             .decode(patch_base64)
                             .map_err(|e| {
-                                rusternetes_common::Error::InvalidResource(format!(
-                                    "Failed to decode webhook patch: {}",
-                                    e
-                                ))
+                                (
+                                    rusternetes_common::Error::InvalidResource(format!(
+                                        "Failed to decode webhook patch: {}",
+                                        e
+                                    )),
+                                    true,
+                                )
                             })?;
 
                         let patch_str = String::from_utf8(patch_bytes).map_err(|e| {
-                            rusternetes_common::Error::InvalidResource(format!(
-                                "Failed to parse webhook patch as UTF-8: {}",
-                                e
-                            ))
+                            (
+                                rusternetes_common::Error::InvalidResource(format!(
+                                    "Failed to parse webhook patch as UTF-8: {}",
+                                    e
+                                )),
+                                true,
+                            )
                         })?;
 
                         let patches: Vec<PatchOperation> = serde_json::from_str(&patch_str)
                             .map_err(|e| {
-                                rusternetes_common::Error::InvalidResource(format!(
-                                    "Failed to parse webhook patch as JSON: {}",
-                                    e
-                                ))
+                                (
+                                    rusternetes_common::Error::InvalidResource(format!(
+                                        "Failed to parse webhook patch as JSON: {}",
+                                        e
+                                    )),
+                                    true,
+                                )
                             })?;
 
                         // Apply patches to object
                         if let Some(ref mut obj) = object {
                             for patch in &patches {
-                                apply_json_patch(obj, patch)?;
+                                apply_json_patch(obj, patch).map_err(|e| (e, false))?;
                             }
                         }
-
-                        all_patches.extend(patches);
+                        Ok(patches)
+                    })();
+                    let patches = match patch_outcome {
+                        Ok(p) => p,
+                        Err((e, calling_webhook_error)) => {
+                            observe_webhook_patch_failure(
+                                &webhook.name,
+                                operation,
+                                started.elapsed(),
+                                calling_webhook_error,
+                                ignore_client_call_failures,
+                            );
+                            return Err(e);
+                        }
+                    };
+                    if observed_success_later {
+                        observe_webhook_call(
+                            &webhook.name,
+                            operation,
+                            admission_metrics::STEP_ADMIT,
+                            started.elapsed(),
+                            &Ok(response.clone()),
+                            ignore_client_call_failures,
+                        );
                     }
+                    all_patches.extend(patches);
 
                     // dispatcher.go:192-198: a webhook whose patch changed the
                     // object requires every previously invoked IfNeeded webhook
