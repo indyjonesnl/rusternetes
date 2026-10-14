@@ -248,6 +248,7 @@ mod tests {
             attributes: &attributes,
             param: None,
             namespace: None,
+            authorizer: None,
         };
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()

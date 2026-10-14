@@ -22,9 +22,9 @@
 //!   `Convert(versioned, attributes.GetObject())` (:211).
 //! - The `celmetrics` observations (`ObserveRejection` / `ObserveAdmission`,
 //!   dispatcher.go:196, :205) are ported (#3229, `policy_mutating_metrics.rs`).
-//!   `NewCachingAuthorizer` is (#3228,
-//!   `caching_authorizer.rs`) and reaches the matcher; it reaches CEL through
-//!   the `Patcher` once the `patch/` package exists.
+//!   `NewCachingAuthorizer` is (#3228, `caching_authorizer.rs`) and reaches
+//!   the matcher and, as `OptionalVariables.Authorizer`, the `Patcher`; the CEL
+//!   `authorizer` library it feeds is `rusternetes_common::cel_authz_library` (#3300).
 //! - `CompositionEnv.CreateContext` (:131-133) belongs to the CEL compiler and
 //!   is the evaluator's business, not the dispatcher's.
 
@@ -127,6 +127,13 @@ pub enum PatchError {
     Other(String),
 }
 
+/// `cel.OptionalVariableBindings` (cel/interface.go:73-83), as passed to
+/// `dispatchOne` (mutating/dispatcher.go:190).
+pub struct OptionalVariableBindings<'a> {
+    pub versioned_params: Option<&'a Value>,
+    pub authorizer: Arc<dyn Authorizer>,
+}
+
 /// `patch.Request` (patch/interface.go:35-44), minus the object interfaces
 /// and type converter the JSON representation does not need.
 pub struct PatchRequest<'a> {
@@ -140,6 +147,10 @@ pub struct PatchRequest<'a> {
     pub param: Option<&'a Value>,
     /// The request's `v1.Namespace`; `None` for a cluster-scoped request.
     pub namespace: Option<&'a Value>,
+    /// `OptionalVariables.Authorizer` (cel/interface.go:80-83): the
+    /// dispatcher's caching authorizer; binds the CEL `authorizer` and
+    /// `authorizer.requestResource` variables when set (activation.go:52-55).
+    pub authorizer: Option<Arc<dyn Authorizer>>,
 }
 
 /// `patch.Patcher` (patch/interface.go:29-33). `patch` returns a modified
@@ -166,7 +177,7 @@ pub trait ConditionMatcher: Send + Sync {
         attributes: &Attributes,
         versioned: &VersionedAttributes,
         param: Option<&Value>,
-        authz: &dyn Authorizer,
+        authz: Arc<dyn Authorizer>,
     ) -> MatchResult;
 }
 
@@ -337,8 +348,12 @@ impl MutatingDispatcher {
         versioned: &mut VersionedAttributes,
         namespace: Option<&Value>,
         resource: &GroupVersionResource,
-        param: Option<&Value>,
+        optional_variables: OptionalVariableBindings<'_>,
     ) -> Result<(), PatchError> {
+        let OptionalVariableBindings {
+            versioned_params: param,
+            authorizer: authz,
+        } = optional_variables;
         let Some(patcher) = patcher else {
             // internal error. this should not happen
             return Err(PatchError::Status(Error::Internal(
@@ -366,6 +381,7 @@ impl MutatingDispatcher {
                 attributes,
                 param,
                 namespace,
+                authorizer: Some(authz),
             })
             .await?;
         self.defaulter.default_object(&mut new_object);
@@ -391,7 +407,7 @@ impl MutatingDispatcher {
     ) -> Result<Vec<PolicyError>, Error> {
         let reinvoke = &self.reinvocation;
         // dispatcher.go:135.
-        let authz = new_caching_authorizer(self.authz.clone());
+        let authz: Arc<dyn Authorizer> = Arc::new(new_caching_authorizer(self.authz.clone()));
         let mut last_kind: Option<GroupVersionKind> = None;
 
         if reinvoke.is_reinvoke()
@@ -464,7 +480,7 @@ impl MutatingDispatcher {
 
             if let Some(matcher) = &invocation.evaluator.matcher {
                 let result = matcher
-                    .matches(attr, current, invocation.param.as_ref(), &authz)
+                    .matches(attr, current, invocation.param.as_ref(), authz.clone())
                     .await;
                 if let Some(err) = result.error {
                     policy_errors.push(config_error(err, invocation));
@@ -512,7 +528,10 @@ impl MutatingDispatcher {
                         current,
                         namespace.as_ref(),
                         &invocation.resource,
-                        invocation.param.as_ref(),
+                        OptionalVariableBindings {
+                            versioned_params: invocation.param.as_ref(),
+                            authorizer: authz.clone(),
+                        },
                     )
                     .await;
                 let elapsed = start_time.elapsed();
@@ -723,7 +742,7 @@ mod tests {
             _: &Attributes,
             v: &VersionedAttributes,
             _: Option<&Value>,
-            _: &dyn Authorizer,
+            _: Arc<dyn Authorizer>,
         ) -> MatchResult {
             (self.0)(v.versioned_object.as_ref().unwrap())
         }
@@ -1234,6 +1253,7 @@ mod tests {
             attributes: &a,
             param: None,
             namespace: None,
+            authorizer: None,
         })
         .await
     }
