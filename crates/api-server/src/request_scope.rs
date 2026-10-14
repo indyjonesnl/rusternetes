@@ -21,6 +21,12 @@ pub async fn with_request_info<F: std::future::Future>(info: Attributes, fut: F)
     REQUEST_INFO.scope(info, fut).await
 }
 
+/// `request.RequestInfoFrom(ctx)`: the current request's `RequestInfo`, if
+/// [`request_info_middleware`] ran for it.
+pub fn current_request_info() -> Option<Attributes> {
+    REQUEST_INFO.try_with(|info| info.clone()).ok()
+}
+
 /// Axum layer: install `NewRequestInfo` of each request.
 pub async fn request_info_middleware(
     req: axum::extract::Request,

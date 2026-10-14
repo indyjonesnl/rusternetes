@@ -5,20 +5,14 @@
 //! `recordAuthorizationMetrics` :106-122) as called by `withAuthorization`
 //! (`filters/authorization.go:57-99`).
 //!
-//! Unlike upstream, which authorizes once in the `WithAuthorization` filter,
-//! each Rusternetes handler authorizes its own request through
-//! `ApiServerState::authorizer`. That field holds the authorizer wrapped by
-//! [`filter_instrumented`]; callers that reach the authorizer outside the
-//! upstream filter use `ApiServerState::unfiltered_authorizer`.
+//! The api-server's `WithAuthorization` filter (`authorization_filter.rs`)
+//! calls [`record_authorization_metrics`] once per request.
 
-use crate::auth::UserInfo;
-use crate::authz::{Authorizer, Decision, Opinion, RequestAttributes};
-use crate::resources::{NonResourceRule, ResourceRule};
+use crate::authz::Opinion;
 use crate::Result;
-use async_trait::async_trait;
 use prometheus::{register, HistogramOpts, HistogramVec, IntCounterVec, Opts};
-use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant};
+use std::sync::LazyLock;
+use std::time::Duration;
 
 /// `allowedLabel` / `deniedLabel` / `noOpinionLabel` / `errorLabel`
 /// (metrics.go:42-46).
@@ -76,44 +70,8 @@ pub fn record_authorization_metrics(result: &Result<Opinion>, elapsed: Duration)
         .observe(elapsed.as_secs_f64());
 }
 
-/// Wraps the authorizer the request handlers call, recording the filter's
-/// attempt counter and duration histogram.
-pub fn filter_instrumented(delegate: Arc<dyn Authorizer>) -> Arc<dyn Authorizer> {
+/// Register the metrics, so they are exposed before the first request.
+pub fn register_metrics() {
     LazyLock::force(&ATTEMPTS);
     LazyLock::force(&LATENCY);
-    Arc::new(FilterInstrumentedAuthorizer { delegate })
-}
-
-struct FilterInstrumentedAuthorizer {
-    delegate: Arc<dyn Authorizer>,
-}
-
-#[async_trait]
-impl Authorizer for FilterInstrumentedAuthorizer {
-    async fn authorize(&self, attrs: &RequestAttributes) -> Result<Decision> {
-        match self.authorize_opinion(attrs).await? {
-            Opinion::Allow(_) => Ok(Decision::Allow),
-            Opinion::Deny(reason) => Ok(Decision::Deny(reason)),
-            Opinion::NoOpinion { reason, error } => match error {
-                Some(e) => Err(crate::error::Error::Authorization(e)),
-                None => Ok(Decision::Deny(reason)),
-            },
-        }
-    }
-
-    /// authorization.go:64-77: time the call, record, then act on it.
-    async fn authorize_opinion(&self, attrs: &RequestAttributes) -> Result<Opinion> {
-        let start = Instant::now();
-        let result = self.delegate.authorize_opinion(attrs).await;
-        record_authorization_metrics(&result, start.elapsed());
-        result
-    }
-
-    async fn get_user_rules(
-        &self,
-        user: &UserInfo,
-        namespace: &str,
-    ) -> Result<(Vec<ResourceRule>, Vec<NonResourceRule>)> {
-        self.delegate.get_user_rules(user, namespace).await
-    }
 }
