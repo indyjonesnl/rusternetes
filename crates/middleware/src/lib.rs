@@ -1,5 +1,6 @@
 pub mod cbor;
 pub mod response;
+pub mod secure_serving;
 pub mod table;
 
 use axum::{
