@@ -633,7 +633,7 @@ fn spec_has_kubernetes_extensions(spec: &CustomResourceDefinitionSpec) -> bool {
 
 /// `SchemaHas` (`validation.go:1659-1730`): `pred` on the schema or any
 /// sub-schema.
-fn schema_has(s: &JSONSchemaProps, pred: &dyn Fn(&JSONSchemaProps) -> bool) -> bool {
+pub fn schema_has(s: &JSONSchemaProps, pred: &dyn Fn(&JSONSchemaProps) -> bool) -> bool {
     use crate::resources::JSONSchemaPropsOrArray;
     if pred(s) {
         return true;

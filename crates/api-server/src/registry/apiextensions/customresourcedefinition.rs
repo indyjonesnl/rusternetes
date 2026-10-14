@@ -98,21 +98,24 @@ fn schema_rule_errors(
 /// [`schema_rule_errors`] against an explicit environment set.
 fn schema_rule_errors_in(
     crd: &CustomResourceDefinition,
-    _old: Option<&CustomResourceDefinition>,
+    old: Option<&CustomResourceDefinition>,
     env_set: &rusternetes_common::cel_versions::EnvSet,
 ) -> ErrorList {
+    // `findPreexistingExpressions(&oldObj.Spec)` (validation.go:241); nil on
+    // create (validation.go:153).
+    let preexisting = old
+        .map(|o| crate::handlers::cel_validation::find_preexisting_rules(&o.spec))
+        .unwrap_or_default();
     let mut errs = Vec::new();
     for (i, version) in crd.spec.versions.iter().enumerate() {
         let Some(validation) = &version.schema else {
             continue;
         };
-        if let Err(e) =
-            crate::handlers::cel_validation::validate_crd_rules_in(
-                &validation.open_apiv3_schema,
-                env_set,
-                &std::collections::HashSet::new(),
-            )
-        {
+        if let Err(e) = crate::handlers::cel_validation::validate_crd_rules_in(
+            &validation.open_apiv3_schema,
+            env_set,
+            &preexisting,
+        ) {
             let detail = match e {
                 Error::InvalidResource(msg) => msg,
                 other => other.to_string(),
