@@ -45,6 +45,8 @@ const MAX_COUNTERS_PER_SET: usize = 32;
 /// (`pkg/apis/resource/validation/validation.go:1389`).
 const DEVICE_TAINT_EFFECTS: &[&str] = &["NoExecute", "NoSchedule", "None"];
 const RESOURCE_SLICE_MAX_DEVICES: usize = 128;
+/// `ResourceSliceMaxCounterSets` (`pkg/apis/resource/types.go:259`).
+const RESOURCE_SLICE_MAX_COUNTER_SETS: usize = 8;
 const RESOURCE_SLICE_MAX_DEVICES_WITH_COUNTERS: usize = 64;
 
 /// Validate a `ResourceSlice` on create. Mirrors upstream `ValidateResourceSlice`
@@ -190,8 +192,17 @@ fn validate_resource_slice_spec(spec: &ResourceSliceSpec, fld_path: &Path) -> Er
     }
 
     // sharedCounters (upstream `validateResourceSliceSpec` runs `validateSet`
-    // over them with `validateCounterSet`, validation.go:754-770).
+    // over them with `validateCounterSet`, validation.go:723-727). The size
+    // check short-circuits (`validateSet`, :1198-1204).
     let shared_path = fld_path.child("sharedCounters");
+    if spec.shared_counters.len() > RESOURCE_SLICE_MAX_COUNTER_SETS {
+        errs.push(too_many_max_items(
+            &shared_path,
+            spec.shared_counters.len(),
+            RESOURCE_SLICE_MAX_COUNTER_SETS,
+        ));
+        return errs;
+    }
     let mut seen_sets: HashSet<&str> = HashSet::new();
     for (i, set) in spec.shared_counters.iter().enumerate() {
         let sp = shared_path.index(i);
