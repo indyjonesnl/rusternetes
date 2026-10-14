@@ -1355,6 +1355,7 @@ impl<S: Storage + 'static> DeploymentController<S> {
                 );
             }
             Err(e) => {
+                // `case errors.IsAlreadyExists(err):` — deployment/sync.go:235.
                 if super::is_already_exists(&e) {
                     debug!(
                         "ReplicaSet {}/{} already exists, skipping creation",

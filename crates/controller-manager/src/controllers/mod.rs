@@ -175,17 +175,21 @@ mod gather_metrics_tests {
 }
 
 /// `apierrors.IsAlreadyExists(err)` for a storage create error
-/// (apimachinery/pkg/api/errors/errors.go `IsAlreadyExists`, release-1.35).
+/// (staging/src/k8s.io/apimachinery/pkg/api/errors/errors.go:542-544,
+/// `ReasonForError(err) == metav1.StatusReasonAlreadyExists`): the decision
+/// is the typed reason, never the message text. Storage backends map their
+/// create-conflict to `Error::AlreadyExists` (memory.rs, etcd.rs, rhino.rs
+/// `KeyExists`, api_storage.rs `map_write_err`).
 pub(crate) fn is_already_exists(e: &rusternetes_common::Error) -> bool {
-    let text = e.to_string();
-    text.contains("already exists") || text.contains("AlreadyExists")
+    matches!(e, rusternetes_common::Error::AlreadyExists(_))
 }
 
 /// [`is_already_exists`] for an `anyhow::Error` carrying a storage error
 /// (`create_pod` helpers return `anyhow::Result`).
+/// Like `errors.As`, `downcast_ref` sees through `.context(..)` wrappers.
 pub(crate) fn is_already_exists_anyhow(e: &anyhow::Error) -> bool {
-    let text = e.to_string();
-    text.contains("already exists") || text.contains("AlreadyExists")
+    e.downcast_ref::<rusternetes_common::Error>()
+        .is_some_and(is_already_exists)
 }
 
 #[cfg(test)]
