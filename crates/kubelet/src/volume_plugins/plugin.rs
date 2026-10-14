@@ -206,8 +206,12 @@ pub trait VolumePlugin: Send + Sync {
 /// PV-backed spec. Our [`Spec`] borrows a mandatory `Volume`, so the owned parts
 /// are returned and the caller builds the `Spec`; for the PV arm `volume` is a
 /// placeholder named after the PV (see `Spec::name`'s inherited deviation).
+///
+/// `volume` is `None` where upstream returns the zero `ReconstructedVolume{}`
+/// (nil `Spec`, e.g. the `image` plugin, `image.go:71-73`); the reconstructor
+/// then fails with "got nil" (`reconstruct_common.go:292-295`).
 pub struct ReconstructedVolume {
-    pub volume: Volume,
+    pub volume: Option<Volume>,
     pub persistent_volume: Option<PersistentVolume>,
 }
 

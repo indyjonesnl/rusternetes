@@ -1146,7 +1146,7 @@ async fn construct_volume_spec_rebuilds_a_persistent_spec() {
     assert_eq!(csi.driver, f.driver);
     assert_eq!(csi.volume_handle.as_deref(), Some("vol-1"));
     assert_eq!(rebuilt.metadata.name, "pv1");
-    assert_eq!(rec.volume.name, "pv1");
+    assert_eq!(rec.volume.as_ref().unwrap().name, "pv1");
 }
 
 /// `TestPluginConstructVolumeSpecWithInline` (`csi_plugin_test.go:436`): an
@@ -1168,8 +1168,11 @@ async fn construct_volume_spec_rebuilds_an_inline_spec() {
         .construct_volume_spec("vol", dir.to_str().unwrap())
         .unwrap();
     assert!(rec.persistent_volume.is_none());
-    assert_eq!(rec.volume.name, "inl");
-    assert_eq!(rec.volume.csi.as_ref().unwrap().driver, f.driver);
+    assert_eq!(rec.volume.as_ref().unwrap().name, "inl");
+    assert_eq!(
+        rec.volume.as_ref().unwrap().csi.as_ref().unwrap().driver,
+        f.driver
+    );
 }
 
 #[tokio::test]
