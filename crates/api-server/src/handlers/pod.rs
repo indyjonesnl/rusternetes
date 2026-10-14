@@ -585,7 +585,9 @@ async fn admit_binding_topology_labels(
     binding: &mut Binding,
 ) -> Result<()> {
     use rusternetes_common::feature_gates::{enabled, Feature};
-    if !enabled(Feature::PodTopologyLabelsAdmission) {
+    if !crate::admission::plugins::enabled("PodTopologyLabels")
+        || !enabled(Feature::PodTopologyLabelsAdmission)
+    {
         return Ok(());
     }
     // other fields are not set by the default scheduler for the binding

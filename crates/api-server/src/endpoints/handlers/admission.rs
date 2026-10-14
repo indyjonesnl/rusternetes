@@ -37,6 +37,7 @@ use rusternetes_common::{Error, Result};
 use rusternetes_storage::Storage;
 
 use super::rest::{authorize, RequestScope};
+use crate::admission::plugins::enabled as plugin_enabled;
 use crate::admission::{resourcequota, storage_object_in_use_protection};
 use crate::registry::rest::{
     GroupResource, Object, RequestContext, TransformFunc, ValidateObject, ValidateObjectUpdate,
@@ -135,7 +136,8 @@ impl Admission<'_> {
         }
         // NodeRestriction.Admit (admission.go:228-229): a node's request on
         // any operation or subresource of a PodCertificateRequest.
-        if self.resource.group == "certificates.k8s.io"
+        if plugin_enabled("NodeRestriction")
+            && self.resource.group == "certificates.k8s.io"
             && self.resource.resource == "podcertificaterequests"
         {
             let pcr: rusternetes_common::resources::podcertificaterequest::PodCertificateRequest =
@@ -160,7 +162,7 @@ impl Admission<'_> {
             return Ok(obj);
         }
         let mut obj = obj;
-        if self.is_core("persistentvolumeclaims") {
+        if plugin_enabled("DefaultStorageClass") && self.is_core("persistentvolumeclaims") {
             let mut pvc: PersistentVolumeClaim = recast(&obj)?;
             crate::admission::set_default_storage_class(&self.state.storage, &mut pvc)
                 .await
@@ -170,7 +172,10 @@ impl Admission<'_> {
         // `StorageObjectInUseProtection` follows `DefaultStorageClass` in
         // `AllOrderedPlugins` (plugins.go:69-100); it acts on the resource
         // itself, never a subresource (admission.go `admitPV`/`admitPVC`).
-        if self.subresource.is_none() && self.resource.group.is_empty() {
+        if plugin_enabled("StorageObjectInUseProtection")
+            && self.subresource.is_none()
+            && self.resource.group.is_empty()
+        {
             if let Some(finalizer) =
                 storage_object_in_use_protection::finalizer_for(&self.resource.resource)
             {
@@ -195,21 +200,35 @@ impl Admission<'_> {
         old: Option<&T>,
     ) -> Result<()> {
         if let (Operation::Update, Some(obj), Some(old)) = (op, obj, old) {
-            self.validate_csr_signer(obj, old).await?;
+            // `approval` is CertificateApproval's, `status` CertificateSigning's.
+            let plugin = match self.subresource {
+                Some("approval") => "CertificateApproval",
+                _ => "CertificateSigning",
+            };
+            if plugin_enabled(plugin) {
+                self.validate_csr_signer(obj, old).await?;
+            }
             self.validate_pcr_signer(obj, old).await?;
         }
         if let (Operation::Create, Some(obj)) = (op, obj) {
-            self.validate_csr_subject(obj)?;
+            if plugin_enabled("CertificateSubjectRestriction") {
+                self.validate_csr_subject(obj)?;
+            }
         }
         if let (Operation::Create | Operation::Update, Some(obj)) = (op, obj) {
-            self.validate_ctb_attest(obj, old).await?;
+            if plugin_enabled("ClusterTrustBundleAttest") {
+                self.validate_ctb_attest(obj, old).await?;
+            }
         }
         // PodSecurity `ValidateNamespace` (pod-security-admission/admission/
         // admission.go:229-327): label validation, and the existing pods
         // checked against a tightened enforce level.
-        if let (Operation::Create | Operation::Update, Some(obj), true) =
-            (op, obj, self.is_core("namespaces"))
-        {
+        if let (Operation::Create | Operation::Update, Some(obj), true, true) = (
+            op,
+            obj,
+            self.is_core("namespaces"),
+            plugin_enabled("PodSecurity"),
+        ) {
             let ns: rusternetes_common::resources::Namespace = recast(obj)?;
             let old_ns: Option<rusternetes_common::resources::Namespace> =
                 if *op == Operation::Update {
@@ -231,7 +250,8 @@ impl Admission<'_> {
             (op, obj, self.namespace)
         {
             let r = &self.resource;
-            if !(r.group.is_empty() && r.resource == "pods")
+            if plugin_enabled("PodSecurity")
+                && !(r.group.is_empty() && r.resource == "pods")
                 && crate::admission::pod_security_controller::has_pod_spec(&r.group, &r.resource)
             {
                 let value = serde_json::to_value(obj)
@@ -260,11 +280,14 @@ impl Admission<'_> {
         }
         // `Priority` sits ahead of `LimitRanger` in `AllOrderedPlugins`
         // (plugins.go:69-100).
-        self.validate_priority(op, obj).await?;
+        if plugin_enabled("Priority") {
+            self.validate_priority(op, obj).await?;
+        }
         let (Some(obj), Some(namespace)) = (obj, self.namespace) else {
             return Ok(());
         };
-        if !matches!(op, Operation::Create | Operation::Update)
+        if !plugin_enabled("LimitRanger")
+            || !matches!(op, Operation::Create | Operation::Update)
             || !self.is_core("persistentvolumeclaims")
             || old.is_some_and(|o| o.metadata().deletion_timestamp.is_some())
         {
@@ -411,7 +434,10 @@ impl Admission<'_> {
         if *op == Operation::Update {
             // DefaultTolerationSeconds registers for Create AND Update
             // (plugin/pkg/admission/defaulttolerationseconds/admission.go:86).
-            if let Some(spec) = pod.spec.as_mut() {
+            if let (Some(spec), true) = (
+                pod.spec.as_mut(),
+                plugin_enabled("DefaultTolerationSeconds"),
+            ) {
                 rusternetes_common::tolerations::add_default_tolerations(spec);
             }
             return Ok(pod);
@@ -424,45 +450,58 @@ impl Admission<'_> {
         };
         let storage = &self.state.storage;
 
-        crate::handlers::node_restriction::admit_pod_create(
-            &**storage,
-            &rusternetes_middleware::AuthContext {
-                user: self.user.clone(),
-            },
-            &pod,
-        )
-        .await?;
+        if plugin_enabled("NodeRestriction") {
+            crate::handlers::node_restriction::admit_pod_create(
+                &**storage,
+                &rusternetes_middleware::AuthContext {
+                    user: self.user.clone(),
+                },
+                &pod,
+            )
+            .await?;
+        }
 
         // LimitRanger.Admit (plugin/pkg/admission/limitranger/admission.go).
-        let limit_ranges: Vec<rusternetes_common::resources::LimitRange> = storage
-            .list(&rusternetes_storage::build_prefix(
-                "limitranges",
-                Some(namespace),
-            ))
-            .await
-            .unwrap_or_default();
-        match crate::admission::apply_limit_range_with(&mut pod, &limit_ranges) {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(self.forbidden(&name, "Pod violates LimitRange constraints"));
-            }
-            Err(e) => {
-                tracing::warn!("Error checking LimitRange for pod {namespace}/{name}: {e}");
+        if plugin_enabled("LimitRanger") {
+            let limit_ranges: Vec<rusternetes_common::resources::LimitRange> = storage
+                .list(&rusternetes_storage::build_prefix(
+                    "limitranges",
+                    Some(namespace),
+                ))
+                .await
+                .unwrap_or_default();
+            match crate::admission::apply_limit_range_with(&mut pod, &limit_ranges) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(self.forbidden(&name, "Pod violates LimitRange constraints"));
+                }
+                Err(e) => {
+                    tracing::warn!("Error checking LimitRange for pod {namespace}/{name}: {e}");
+                }
             }
         }
 
         // ServiceAccount.Admit: a failure to inject does not fail the pod.
-        if let Err(e) =
-            crate::admission::inject_service_account_token(storage, namespace, &mut pod).await
-        {
-            tracing::warn!("Error injecting service account token for pod {namespace}/{name}: {e}");
+        if plugin_enabled("ServiceAccount") {
+            if let Err(e) =
+                crate::admission::inject_service_account_token(storage, namespace, &mut pod).await
+            {
+                tracing::warn!(
+                    "Error injecting service account token for pod {namespace}/{name}: {e}"
+                );
+            }
         }
 
-        self.admit_pod_priority(&mut pod).await?;
+        if plugin_enabled("Priority") {
+            self.admit_pod_priority(&mut pod).await?;
+        }
 
         // DefaultTolerationSeconds: the NotReady/Unreachable NoExecute
         // tolerations (tolerationSeconds: 300), unless the pod has them.
-        if let Some(spec) = pod.spec.as_mut() {
+        if let (Some(spec), true) = (
+            pod.spec.as_mut(),
+            plugin_enabled("DefaultTolerationSeconds"),
+        ) {
             rusternetes_common::tolerations::add_default_tolerations(spec);
         }
 
@@ -472,7 +511,7 @@ impl Admission<'_> {
             .spec
             .as_ref()
             .and_then(|s| s.runtime_class_name.clone())
-            .filter(|n| !n.is_empty());
+            .filter(|n| !n.is_empty() && plugin_enabled("RuntimeClass"));
         if let Some(rc_name) = runtime_class {
             let rc_key = rusternetes_storage::build_key("runtimeclasses", None, &rc_name);
             let Ok(rc) = storage.get::<serde_json::Value>(&rc_key).await else {
@@ -501,9 +540,11 @@ impl Admission<'_> {
         // admission.go:123-148; after RuntimeClass in plugins.go:98): a pod
         // created with `spec.nodeName` gets the node's topology labels,
         // overwriting its own.
-        if rusternetes_common::feature_gates::enabled(
-            rusternetes_common::feature_gates::Feature::PodTopologyLabelsAdmission,
-        ) {
+        if plugin_enabled("PodTopologyLabels")
+            && rusternetes_common::feature_gates::enabled(
+                rusternetes_common::feature_gates::Feature::PodTopologyLabelsAdmission,
+            )
+        {
             let node_name = pod
                 .spec
                 .as_ref()
@@ -597,7 +638,7 @@ impl Admission<'_> {
         let storage = &self.state.storage;
         match op {
             Operation::Delete => {
-                if let Some(old) = old {
+                if let (Some(old), true) = (old, plugin_enabled("NodeRestriction")) {
                     crate::handlers::node_restriction::admit_pod_delete(
                         &rusternetes_middleware::AuthContext {
                             user: self.user.clone(),
@@ -608,11 +649,13 @@ impl Admission<'_> {
             }
             Operation::Create => {
                 if let (Some(pod), Some(namespace)) = (obj, self.namespace) {
-                    if crate::admission::PodSecurityAdmission::should_evaluate(
-                        self.subresource,
-                        None,
-                        pod,
-                    ) {
+                    if plugin_enabled("PodSecurity")
+                        && crate::admission::PodSecurityAdmission::should_evaluate(
+                            self.subresource,
+                            None,
+                            pod,
+                        )
+                    {
                         // Warn mode: the request is admitted with warnings
                         // (AdmissionResponse.Warnings -> warning.AddWarning).
                         let outcome = crate::admission::PodSecurityAdmission::new()
@@ -632,11 +675,13 @@ impl Admission<'_> {
                 // PodSecurity `ValidatePod` on UPDATE
                 // (pod-security-admission/admission/admission.go:370-388).
                 if let (Some(pod), Some(old), Some(namespace)) = (obj, old, self.namespace) {
-                    if crate::admission::PodSecurityAdmission::should_evaluate(
-                        self.subresource,
-                        Some(old),
-                        pod,
-                    ) {
+                    if plugin_enabled("PodSecurity")
+                        && crate::admission::PodSecurityAdmission::should_evaluate(
+                            self.subresource,
+                            Some(old),
+                            pod,
+                        )
+                    {
                         // Warn mode: the request is admitted with warnings
                         // (AdmissionResponse.Warnings -> warning.AddWarning).
                         let outcome = crate::admission::PodSecurityAdmission::new()
@@ -647,7 +692,9 @@ impl Admission<'_> {
                             ctx.add_warning(w);
                         }
                     }
-                    if self.subresource == Some("resize") {
+                    if self.subresource == Some("resize")
+                        && plugin_enabled("NodeDeclaredFeatureValidator")
+                    {
                         crate::handlers::pod_subresources::check_node_declared_features_for_resize(
                             storage.as_ref(),
                             old,
@@ -681,7 +728,10 @@ impl Admission<'_> {
     ) -> Result<T> {
         use crate::admission::policy_plugin::MutatingPolicyPlugin;
 
-        if !MutatingPolicyPlugin::handles(op) || !MutatingPolicyPlugin::enabled() {
+        if !plugin_enabled("MutatingAdmissionPolicy")
+            || !MutatingPolicyPlugin::handles(op)
+            || !MutatingPolicyPlugin::enabled()
+        {
             return Ok(obj);
         }
         let Some(plugin) = self.state.mutating_admission_policy.as_ref() else {
@@ -749,6 +799,9 @@ impl Admission<'_> {
         let obj = self
             .admit_mutating_policy(op, obj, old, reinvocation)
             .await?;
+        if !plugin_enabled("MutatingAdmissionWebhook") {
+            return Ok(obj);
+        }
         let name = obj.metadata().name.clone();
         let before_webhooks = to_value(&obj)?;
         // dispatcher.go:106-113: this plugin's context lives in the shared
@@ -821,37 +874,44 @@ impl Admission<'_> {
         let obj = obj.map(to_value).transpose()?;
         let old = old.map(to_value).transpose()?;
 
-        self.state
-            .webhook_manager
-            .run_validating_admission_policies_ext(
-                &op,
-                self.kind,
-                obj.as_ref(),
-                old.as_ref(),
-                Some(&self.request_resource().resource),
-                self.namespace,
-            )
-            .await?;
-
-        if let AdmissionResponse::Deny(reason) = self
-            .state
-            .webhook_manager
-            .run_validating_webhooks_with_dryrun(
-                &op,
-                self.kind,
-                &self.request_resource(),
-                self.namespace,
-                &name,
-                obj.clone(),
-                old.clone(),
-                &self.user_info(),
-                self.dry_run,
-            )
-            .await?
-        {
-            return Err(denied(&reason));
+        if plugin_enabled("ValidatingAdmissionPolicy") {
+            self.state
+                .webhook_manager
+                .run_validating_admission_policies_ext(
+                    &op,
+                    self.kind,
+                    obj.as_ref(),
+                    old.as_ref(),
+                    Some(&self.request_resource().resource),
+                    self.namespace,
+                )
+                .await?;
         }
 
+        if plugin_enabled("ValidatingAdmissionWebhook") {
+            if let AdmissionResponse::Deny(reason) = self
+                .state
+                .webhook_manager
+                .run_validating_webhooks_with_dryrun(
+                    &op,
+                    self.kind,
+                    &self.request_resource(),
+                    self.namespace,
+                    &name,
+                    obj.clone(),
+                    old.clone(),
+                    &self.user_info(),
+                    self.dry_run,
+                )
+                .await?
+            {
+                return Err(denied(&reason));
+            }
+        }
+
+        if !plugin_enabled("ResourceQuota") {
+            return Ok(());
+        }
         self.validate_quota(op, &name, obj.as_ref(), old.as_ref())
             .await
     }

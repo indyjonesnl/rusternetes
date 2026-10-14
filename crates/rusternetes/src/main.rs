@@ -254,6 +254,11 @@ struct Args {
     /// `--authorization-mode` (#2854).
     #[command(flatten)]
     authorization: rusternetes_api_server::authorizer::AuthorizationArgs,
+
+    /// `--enable-admission-plugins` / `--disable-admission-plugins` /
+    /// `--admission-control` (#3415).
+    #[command(flatten)]
+    admission: rusternetes_api_server::admission::plugins::AdmissionArgs,
 }
 
 fn main() -> Result<()> {
@@ -323,6 +328,9 @@ async fn async_main() -> Result<()> {
         .map_err(|e| e.exit())
         .unwrap();
     args.authorization.mark_legacy_flags_set(&matches);
+    args.admission
+        .validate_and_install()
+        .map_err(|e| anyhow::anyhow!("invalid admission flags: {e}"))?;
     apply_feature_gates(&args)?;
     // Gates first: the StorageCapacityScoring default for VolumeBinding args reads them.
     let sched_config = scheduler_config_from_args(&args)?;
