@@ -254,6 +254,9 @@ impl Default for HttpMetricsConfig {
 pub struct HttpMetricsClient {
     base: String,
     http: Client,
+    /// `qualResourceForKind` results (`Kind.group` -> `resource[.group]`); the
+    /// upstream REST mapper is likewise discovery-backed and cached.
+    resources: std::sync::Mutex<HashMap<String, String>>,
 }
 
 impl HttpMetricsClient {
@@ -315,6 +318,7 @@ impl HttpMetricsClient {
         Ok(Self {
             base: cfg.api_server_url.trim_end_matches('/').to_string(),
             http,
+            resources: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -487,147 +491,294 @@ impl MetricsClient for HttpMetricsClient {
             .await
     }
 
+    /// `customMetricsClient.GetRawMetric` (metrics/client.go:119-150):
+    /// `NamespacedMetrics(ns).GetForObjects(Pod, selector, metricName,
+    /// metricSelector)` (custom_metrics/versioned_client.go:226-251).
     async fn get_raw_metric(
         &self,
         metric: &str,
         namespace: &str,
-        _selector: &LabelSelector,
-        _metric_selector: &str,
+        selector: &LabelSelector,
+        metric_selector: &str,
     ) -> Result<PodMetricsInfo> {
-        let url = format!(
-            "{}/apis/custom.metrics.k8s.io/v1beta2/namespaces/{}/pods/*/{}",
-            self.base, namespace, metric
-        );
-        let body: serde_json::Value = self
-            .http
-            .get(&url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        let mut info = PodMetricsInfo::new();
-        let now = Utc::now();
-        if let Some(items) = body.get("items").and_then(|v| v.as_array()) {
-            for item in items {
-                let name = item
-                    .get("describedObject")
-                    .and_then(|o| o.get("name"))
-                    .and_then(|n| n.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let value = item
-                    .get("value")
-                    .and_then(|v| v.as_str())
-                    .map(|q| parse_quantity_milli(q, metric))
-                    .unwrap_or(0);
-                info.insert(
-                    name,
-                    PodMetric {
-                        value,
-                        utilization: None,
-                        timestamp: now,
-                        window: METRIC_SERVER_DEFAULT_METRIC_WINDOW,
-                    },
-                );
-            }
+        let body = self
+            .raw_metric_body(metric, namespace, selector, metric_selector)
+            .await
+            .map_err(|e| anyhow::anyhow!("unable to fetch metrics from custom metrics API: {e}"))?;
+        let items = items_of(&body);
+        if items.is_empty() {
+            anyhow::bail!("no metrics returned from custom metrics API");
         }
-        if info.is_empty() {
-            anyhow::bail!("no custom pod metrics for {metric}");
+
+        let mut info = PodMetricsInfo::new();
+        for m in items {
+            // client.go:136-139: `windowSeconds` or `metricServerDefaultMetricWindow`.
+            let window = match m.get("windowSeconds").and_then(|w| w.as_i64()) {
+                Some(w) => std::time::Duration::from_secs(w.max(0) as u64),
+                None => METRIC_SERVER_DEFAULT_METRIC_WINDOW,
+            };
+            let name = m
+                .get("describedObject")
+                .and_then(|o| o.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or_default()
+                .to_string();
+            info.insert(
+                name,
+                PodMetric {
+                    value: item_value(m, metric),
+                    utilization: None,
+                    timestamp: item_timestamp(m)?,
+                    window,
+                },
+            );
         }
         Ok(info)
     }
 
+    /// `customMetricsClient.GetObjectMetric` (metrics/client.go:152-170).
     async fn get_object_metric(
         &self,
         metric: &str,
         namespace: &str,
         object_ref: &CrossVersionObjectReference,
-        _metric_selector: &str,
+        metric_selector: &str,
     ) -> Result<(i64, DateTime<Utc>)> {
-        // `RootScopedMetrics().GetForObject` for a core `Namespace` reads
-        // `namespaces/{ns}/metrics/{metric}` (client-go `getForNamespace`,
-        // versioned_client.go:103-133); the object name is the HPA's own
-        // namespace there.
-        let url = if object_ref.kind == "Namespace" {
+        self.object_metric_item(metric, namespace, object_ref, metric_selector)
+            .await
+            .map_err(|e| anyhow::anyhow!("unable to fetch metrics from custom metrics API: {e}"))
+    }
+
+    /// `externalMetricsClient.GetExternalMetric` (metrics/client.go:204-226):
+    /// `NamespacedMetrics(ns).List(metricName, selector)`
+    /// (external_metrics/client.go:84-100); the timestamp is `Items[0]`'s.
+    async fn get_external_metric(
+        &self,
+        metric: &str,
+        namespace: &str,
+        metric_selector: &str,
+    ) -> Result<(Vec<i64>, DateTime<Utc>)> {
+        let url = format!(
+            "{}/apis/external.metrics.k8s.io/v1beta1/namespaces/{}/{}",
+            self.base, namespace, metric
+        );
+        let body = self
+            .get_json(&url, &[("labelSelector", metric_selector)])
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("unable to fetch metrics from external metrics API: {e}")
+            })?;
+        let items = items_of(&body);
+        if items.is_empty() {
+            anyhow::bail!("no metrics returned from external metrics API");
+        }
+        let values = items.iter().map(|m| item_value(m, metric)).collect();
+        Ok((values, item_timestamp(&items[0])?))
+    }
+}
+
+/// `MetricValueList.Items` / `ExternalMetricValueList.Items`.
+fn items_of(body: &serde_json::Value) -> &[serde_json::Value] {
+    body.get("items")
+        .and_then(|v| v.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+}
+
+/// `m.Value.MilliValue()` for one metric item.
+fn item_value(item: &serde_json::Value, metric: &str) -> i64 {
+    item.get("value")
+        .and_then(|v| v.as_str())
+        .map(|q| parse_quantity_milli(q, metric))
+        .unwrap_or(0)
+}
+
+/// `m.Timestamp.Time` for one metric item.
+fn item_timestamp(item: &serde_json::Value) -> Result<DateTime<Utc>> {
+    let raw = item
+        .get("timestamp")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| anyhow::anyhow!("metric item has no timestamp"))?;
+    Ok(DateTime::parse_from_rfc3339(raw)
+        .map_err(|e| anyhow::anyhow!("invalid metric timestamp {raw:?}: {e}"))?
+        .with_timezone(&Utc))
+}
+
+impl HttpMetricsClient {
+    /// GET `url` with the non-empty `params` as the query string (an empty
+    /// `omitempty` option is not encoded by `VersionedParams`) and decode JSON.
+    async fn get_json(&self, url: &str, params: &[(&str, &str)]) -> Result<serde_json::Value> {
+        let params: Vec<(&str, &str)> = params
+            .iter()
+            .copied()
+            .filter(|(_, v)| !v.is_empty())
+            .collect();
+        Ok(self
+            .http
+            .get(url)
+            .query(&params)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// `GetForObjects(Pod, selector, metricName, metricSelector)`:
+    /// `resource/pods/*/metric?labelSelector=..&metricLabelSelector=..`.
+    async fn raw_metric_body(
+        &self,
+        metric: &str,
+        namespace: &str,
+        selector: &LabelSelector,
+        metric_selector: &str,
+    ) -> Result<serde_json::Value> {
+        let resource = self.qual_resource_for_kind("", "Pod").await?;
+        let selector = selector
+            .as_selector_string()
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let url = format!(
+            "{}/apis/custom.metrics.k8s.io/v1beta2/namespaces/{}/{}/*/{}",
+            self.base, namespace, resource, metric
+        );
+        self.get_json(
+            &url,
+            &[
+                ("labelSelector", selector.as_str()),
+                ("metricLabelSelector", metric_selector),
+            ],
+        )
+        .await
+    }
+
+    /// `GetForObject` for a namespaced object, or `getForNamespace` for a core
+    /// `Namespace` (versioned_client.go:103-133,180-215); exactly one item.
+    async fn object_metric_item(
+        &self,
+        metric: &str,
+        namespace: &str,
+        object_ref: &CrossVersionObjectReference,
+        metric_selector: &str,
+    ) -> Result<(i64, DateTime<Utc>)> {
+        // `schema.FromAPIVersionAndKind` (metrics/client.go:153).
+        let group = group_of(object_ref.api_version.as_deref().unwrap_or_default());
+        let url = if object_ref.kind == "Namespace" && group.is_empty() {
+            // NB: the object name is ignored, `CrossVersionObjectReference`
+            // cannot escape the HPA's namespace (client.go:158-160).
             format!(
                 "{}/apis/custom.metrics.k8s.io/v1beta2/namespaces/{}/metrics/{}",
                 self.base, namespace, metric
             )
         } else {
+            let resource = self.qual_resource_for_kind(group, &object_ref.kind).await?;
             format!(
                 "{}/apis/custom.metrics.k8s.io/v1beta2/namespaces/{}/{}/{}/{}",
-                self.base,
-                namespace,
-                object_ref.kind.to_lowercase(),
-                object_ref.name,
-                metric
+                self.base, namespace, resource, object_ref.name, metric
             )
         };
-        let body: serde_json::Value = self
-            .http
-            .get(&url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
+        let body = self
+            .get_json(&url, &[("metricLabelSelector", metric_selector)])
             .await?;
-        // The API answers a `MetricValueList`; client-go requires exactly one
-        // item (versioned_client.go:222-256, `GetForObject`).
-        let items = body
-            .get("items")
-            .and_then(|v| v.as_array())
-            .map(Vec::as_slice)
-            .unwrap_or_default();
+        // versioned_client.go:134-139: exactly one item.
+        let items = items_of(&body);
         if items.len() != 1 {
             anyhow::bail!(
                 "the custom metrics API server returned {} results when we asked for exactly one",
                 items.len()
             );
         }
-        let value = items[0]
-            .get("value")
-            .and_then(|v| v.as_str())
-            .map(|q| parse_quantity_milli(q, metric))
-            .ok_or_else(|| anyhow::anyhow!("object metric {metric} missing value"))?;
-        Ok((value, Utc::now()))
+        Ok((item_value(&items[0], metric), item_timestamp(&items[0])?))
     }
 
-    async fn get_external_metric(
-        &self,
-        metric: &str,
-        namespace: &str,
-        _metric_selector: &str,
-    ) -> Result<(Vec<i64>, DateTime<Utc>)> {
-        // external.metrics.k8s.io is not implemented server-side (deferred).
-        let url = format!(
-            "{}/apis/external.metrics.k8s.io/v1beta1/namespaces/{}/{}",
-            self.base, namespace, metric
-        );
-        let body: serde_json::Value = self
-            .http
-            .get(&url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        let values = body
-            .get("items")
-            .and_then(|v| v.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|i| i.get("value").and_then(|v| v.as_str()))
-                    .map(|q| parse_quantity_milli(q, metric))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        if values.is_empty() {
-            anyhow::bail!("no external metric values for {metric}");
+    /// `customMetricsClient.qualResourceForKind` (versioned_client.go:84-92):
+    /// the REST mapping of `GroupKind` (preferred version first, no version
+    /// constraint) as `resource[.group]`. The mapper upstream is a discovery
+    /// REST mapper over the same api-server, so resolve it through discovery.
+    async fn qual_resource_for_kind(&self, group: &str, kind: &str) -> Result<String> {
+        let key = format!("{kind}.{group}");
+        if let Some(hit) = self.resources.lock().unwrap().get(&key) {
+            return Ok(hit.clone());
         }
-        Ok((values, Utc::now()))
+        let gk = if group.is_empty() {
+            kind.to_string()
+        } else {
+            format!("{kind}.{group}")
+        };
+        let no_match = || {
+            anyhow::anyhow!(
+                "unable to map kind {gk} to resource: no matches for kind \"{kind}\" in group \"{group}\""
+            )
+        };
+        // Versions of the group, preferred first (restmapper priority order).
+        let versions: Vec<String> = if group.is_empty() {
+            vec!["v1".to_string()]
+        } else {
+            let url = format!("{}/apis/{}", self.base, group);
+            let resp = self.http.get(&url).send().await?;
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                return Err(no_match());
+            }
+            let doc: serde_json::Value = resp.error_for_status()?.json().await?;
+            let preferred = doc
+                .get("preferredVersion")
+                .and_then(|p| p.get("version"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let mut all: Vec<String> = doc
+                .get("versions")
+                .and_then(|v| v.as_array())
+                .map(|vs| {
+                    vs.iter()
+                        .filter_map(|v| v.get("version").and_then(|v| v.as_str()))
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Some(p) = preferred {
+                all.retain(|v| *v != p);
+                all.insert(0, p);
+            }
+            all
+        };
+        for version in versions {
+            let url = if group.is_empty() {
+                format!("{}/api/{}", self.base, version)
+            } else {
+                format!("{}/apis/{}/{}", self.base, group, version)
+            };
+            let list = self.get_json(&url, &[]).await?;
+            let found = list
+                .get("resources")
+                .and_then(|r| r.as_array())
+                .and_then(|rs| {
+                    rs.iter().find(|r| {
+                        r.get("kind").and_then(|k| k.as_str()) == Some(kind)
+                            && r.get("name")
+                                .and_then(|n| n.as_str())
+                                .is_some_and(|n| !n.contains('/'))
+                    })
+                })
+                .and_then(|r| r.get("name").and_then(|n| n.as_str()));
+            if let Some(name) = found {
+                let qualified = if group.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{name}.{group}")
+                };
+                self.resources
+                    .lock()
+                    .unwrap()
+                    .insert(key, qualified.clone());
+                return Ok(qualified);
+            }
+        }
+        Err(no_match())
     }
+}
+
+/// `schema.ParseGroupVersion(apiVersion).Group`.
+fn group_of(api_version: &str) -> &str {
+    api_version.split_once('/').map_or("", |(g, _)| g)
 }
 
 /// Parse a k8s quantity to an integer in units consistent per resource so a
@@ -848,6 +999,19 @@ mod tests {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
     }
 
+    fn core_discovery() -> (&'static str, serde_json::Value) {
+        (
+            "/api/v1",
+            serde_json::json!({
+                "kind": "APIResourceList", "groupVersion": "v1",
+                "resources": [
+                    {"name": "pods", "kind": "Pod", "namespaced": true},
+                    {"name": "pods/log", "kind": "Pod", "namespaced": true},
+                ],
+            }),
+        )
+    }
+
     fn apps_discovery() -> Vec<(&'static str, serde_json::Value)> {
         vec![
             (
@@ -882,17 +1046,21 @@ mod tests {
             metric_item("web-0", "5", "2026-01-01T00:00:10Z", Some(30)),
             metric_item("web-1", "7", "2026-01-01T00:00:20Z", None),
         ]});
-        let (url, seen) = stub_api_server(vec![(
-            "/apis/custom.metrics.k8s.io/v1beta2/namespaces/ns/pods/*/qps",
-            body,
-        )])
+        let (url, seen) = stub_api_server(vec![
+            core_discovery(),
+            (
+                "/apis/custom.metrics.k8s.io/v1beta2/namespaces/ns/pods/*/qps",
+                body,
+            ),
+        ])
         .await;
         let info = client_for(url)
             .get_raw_metric("qps", "ns", &pod_selector("web"), "env=prod")
             .await
             .unwrap();
         let reqs = seen.lock().unwrap().clone();
-        assert_eq!(reqs.len(), 1);
+        // The first request is the REST-mapper discovery of `Pod`.
+        let reqs = &reqs[reqs.len() - 1..];
         assert_eq!(
             reqs[0].1.get("labelSelector").map(String::as_str),
             Some("app=web")
@@ -914,10 +1082,13 @@ mod tests {
         let body = serde_json::json!({"kind": "MetricValueList", "items": [
             metric_item("web-0", "5", "2026-01-01T00:00:10Z", None),
         ]});
-        let (url, seen) = stub_api_server(vec![(
-            "/apis/custom.metrics.k8s.io/v1beta2/namespaces/ns/pods/*/qps",
-            body,
-        )])
+        let (url, seen) = stub_api_server(vec![
+            core_discovery(),
+            (
+                "/apis/custom.metrics.k8s.io/v1beta2/namespaces/ns/pods/*/qps",
+                body,
+            ),
+        ])
         .await;
         client_for(url)
             .get_raw_metric("qps", "ns", &pod_selector("web"), "")
@@ -930,10 +1101,13 @@ mod tests {
     /// client.go:122-128 error texts.
     #[tokio::test]
     async fn raw_metric_error_texts_match_upstream() {
-        let (url, _) = stub_api_server(vec![(
-            "/apis/custom.metrics.k8s.io/v1beta2/namespaces/ns/pods/*/qps",
-            serde_json::json!({"kind": "MetricValueList", "items": []}),
-        )])
+        let (url, _) = stub_api_server(vec![
+            core_discovery(),
+            (
+                "/apis/custom.metrics.k8s.io/v1beta2/namespaces/ns/pods/*/qps",
+                serde_json::json!({"kind": "MetricValueList", "items": []}),
+            ),
+        ])
         .await;
         let c = client_for(url);
         let err = c

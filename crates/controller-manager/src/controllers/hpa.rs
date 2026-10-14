@@ -643,7 +643,9 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
                 let info = self
                     .metrics_client
                     .get_raw_metric(&p.metric.name, namespace, &selector, &metric_selector)
-                    .await?;
+                    .await
+                    // replica_calculator.go:185 `GetMetricReplicas`.
+                    .map_err(|e| anyhow::anyhow!("unable to get metric {}: {e}", p.metric.name))?;
                 let (replicas, avg) = calc::get_metric_replicas(&info, current_replicas, target)?;
                 let status = MetricStatus {
                     metric_type: "Pods".into(),
@@ -685,7 +687,18 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
                         &o.described_object,
                         &metric_selector,
                     )
-                    .await?;
+                    .await
+                    // replica_calculator.go:272 `GetObjectMetricReplicas`
+                    // (the message order is upstream's).
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "unable to get metric {}: {} on {} {}/{e}",
+                            o.metric.name,
+                            o.described_object.kind,
+                            namespace,
+                            o.described_object.name
+                        )
+                    })?;
                 let (replicas, v) =
                     calc::get_object_metric_replicas(value, current_replicas, target)?;
                 // Report the field matching the target type: AverageValue
@@ -737,7 +750,16 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
                 let (values, _) = self
                     .metrics_client
                     .get_external_metric(&e.metric.name, namespace, &metric_selector)
-                    .await?;
+                    .await
+                    // replica_calculator.go:361 `GetExternalMetricReplicas`.
+                    .map_err(|err| {
+                        anyhow::anyhow!(
+                            "unable to get external metric {}/{}/{}: {err}",
+                            namespace,
+                            e.metric.name,
+                            go_label_selector_string(e.metric.selector.as_ref())
+                        )
+                    })?;
                 let (replicas, sum) = calc::get_external_metric_replicas(&values, target)?;
                 // k8s reports currentAverageValue = sum / currentReplicas for an
                 // AverageValue target (the scaling math already used the per-pod
@@ -961,6 +983,32 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
 
         Ok(())
     }
+}
+
+/// `fmt.Sprintf("%+v", *metav1.LabelSelector)`: the generated `String()`
+/// (apimachinery/pkg/apis/meta/v1/generated.pb.go:3157-3194).
+fn go_label_selector_string(sel: Option<&rusternetes_common::types::LabelSelector>) -> String {
+    let Some(sel) = sel else {
+        return "nil".to_string();
+    };
+    let mut exprs = String::from("[]LabelSelectorRequirement{");
+    for r in sel.match_expressions.iter().flatten() {
+        exprs.push_str(&format!(
+            "LabelSelectorRequirement{{Key:{},Operator:{},Values:[{}],}},",
+            r.key,
+            r.operator,
+            r.values.as_deref().unwrap_or_default().join(" ")
+        ));
+    }
+    exprs.push('}');
+    let mut labels: Vec<_> = sel.match_labels.iter().flatten().collect();
+    labels.sort();
+    let mut map = String::from("map[string]string{");
+    for (k, v) in labels {
+        map.push_str(&format!("{k}: {v},"));
+    }
+    map.push('}');
+    format!("&LabelSelector{{MatchLabels:{map},MatchExpressions:{exprs},}}")
 }
 
 fn parse_target_avg(t: &rusternetes_common::resources::MetricTarget) -> Result<i64> {
@@ -1206,6 +1254,31 @@ mod tests {
             .expect("container_resource status");
         assert_eq!(cr.container, "app");
         assert_eq!(cr.current.average_utilization, Some(100));
+    }
+
+    /// `%+v` of a `*metav1.LabelSelector` is the generated `String()`
+    /// (generated.pb.go:3157-3182), so the external-metric error text matches.
+    #[test]
+    fn go_label_selector_string_matches_generated_string() {
+        assert_eq!(go_label_selector_string(None), "nil");
+        let sel = rusternetes_common::types::LabelSelector {
+            match_labels: Some(
+                [
+                    ("b".to_string(), "2".to_string()),
+                    ("a".to_string(), "1".to_string()),
+                ]
+                .into(),
+            ),
+            match_expressions: Some(vec![rusternetes_common::types::LabelSelectorRequirement {
+                key: "k".into(),
+                operator: "In".into(),
+                values: Some(vec!["x".into(), "y".into()]),
+            }]),
+        };
+        assert_eq!(
+            go_label_selector_string(Some(&sel)),
+            "&LabelSelector{MatchLabels:map[string]string{a: 1,b: 2,},MatchExpressions:[]LabelSelectorRequirement{LabelSelectorRequirement{Key:k,Operator:In,Values:[x y],},},}"
+        );
     }
 
     #[tokio::test]
