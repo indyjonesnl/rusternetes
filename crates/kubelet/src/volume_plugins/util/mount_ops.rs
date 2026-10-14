@@ -482,10 +482,23 @@ impl Mounter {
         self.with_safe_not_mounted_behavior
     }
 
-    /// `IsLikelyNotMountPoint` via `isLikelyNotMountPointStat`
-    /// (`mount_linux.go:443-458`), the fallback upstream takes when `statx` is
-    /// unsupported: a different device from the parent means a mount point.
+    /// `isLikelyNotMountPointStatx` (`mount_linux.go:460-486`).
+    pub(crate) fn is_likely_not_mount_point_statx_with(
+        file: &str,
+        statx_fn: impl Fn(&str) -> Result<StatxInfo, StatxError>,
+    ) -> Result<bool, StatxError> {
+        let _ = (file, statx_fn);
+        unimplemented!()
+    }
+
+    /// `IsLikelyNotMountPoint` (`mount_linux.go:495-503`).
     pub fn is_likely_not_mount_point(&self, file: &str) -> io::Result<bool> {
+        self.is_likely_not_mount_point_stat(file)
+    }
+
+    /// `isLikelyNotMountPointStat` (`mount_linux.go:443-458`), the fallback
+    /// `IsLikelyNotMountPoint` takes when `statx` is unsupported: a different device from the parent means a mount point.
+    pub fn is_likely_not_mount_point_stat(&self, file: &str) -> io::Result<bool> {
         use std::os::unix::fs::MetadataExt;
         let st = std::fs::metadata(file)?;
         let parent = std::path::Path::new(file.strip_suffix('/').unwrap_or(file))
@@ -731,9 +744,97 @@ fn statfs_flags(path: &str) -> io::Result<u64> {
     Ok(s.f_flag as u64)
 }
 
+/// Subset of `unix.Statx_t` that `isLikelyNotMountPointStatx` reads.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct StatxInfo {
+    pub attributes: u64,
+    pub attributes_mask: u64,
+    pub dev_major: u32,
+    pub dev_minor: u32,
+}
+
+/// `errStatxNotSupport` (`mount_linux.go:61`) or any other statx error.
+#[derive(Debug)]
+pub(crate) enum StatxError {
+    NotSupported,
+    Io(io::Error),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn info(attrs: u64, mask: u64, major: u32, minor: u32) -> StatxInfo {
+        StatxInfo {
+            attributes: attrs,
+            attributes_mask: mask,
+            dev_major: major,
+            dev_minor: minor,
+        }
+    }
+    const ROOT: u64 = libc::STATX_ATTR_MOUNT_ROOT as u64;
+
+    // mount_linux.go:468-477: MOUNT_ROOT supported and set => mount point,
+    // parent never statted.
+    #[test]
+    fn statx_mount_root_attr_set_is_mount_point() {
+        let r = Mounter::is_likely_not_mount_point_statx_with("/a/b", |f| {
+            assert_eq!(f, "/a/b", "parent must not be statted");
+            Ok(info(ROOT, ROOT, 1, 1))
+        });
+        assert!(!r.unwrap());
+    }
+
+    // mount_linux.go:474-475: supported but clear => not a mount point.
+    #[test]
+    fn statx_mount_root_attr_clear_is_not_mount_point() {
+        let r = Mounter::is_likely_not_mount_point_statx_with("/a/b", |f| {
+            assert_eq!(f, "/a/b");
+            Ok(info(0, ROOT, 1, 1))
+        });
+        assert!(r.unwrap());
+    }
+
+    // mount_linux.go:480-485: mask lacks MOUNT_ROOT => compare against the
+    // parent (trailing slash trimmed) by dev major/minor.
+    #[test]
+    fn statx_without_mount_root_compares_parent_dev() {
+        let f = |same: bool| {
+            move |p: &str| match p {
+                "/a/b/" | "/a/b" => Ok(info(0, 0, 8, 1)),
+                "/a" => Ok(info(0, 0, 8, if same { 1 } else { 2 })),
+                o => panic!("unexpected {o}"),
+            }
+        };
+        assert!(Mounter::is_likely_not_mount_point_statx_with("/a/b/", f(true)).unwrap());
+        assert!(!Mounter::is_likely_not_mount_point_statx_with("/a/b/", f(false)).unwrap());
+    }
+
+    // mount_linux.go:464-466, 481-483: statx errors propagate.
+    #[test]
+    fn statx_errors_propagate() {
+        let r = Mounter::is_likely_not_mount_point_statx_with("/a/b", |_| {
+            Err(StatxError::NotSupported)
+        });
+        assert!(matches!(r, Err(StatxError::NotSupported)));
+        let r = Mounter::is_likely_not_mount_point_statx_with("/a/b", |p| {
+            if p == "/a/b" {
+                Ok(info(0, 0, 1, 1))
+            } else {
+                Err(StatxError::Io(io::Error::from_raw_os_error(libc::ENOENT)))
+            }
+        });
+        assert!(matches!(r, Err(StatxError::Io(_))));
+    }
+
+    // mount_linux.go:495-503 through the real syscall.
+    #[test]
+    fn real_statx_mount_points() {
+        let m = Mounter::new("", false, false);
+        assert!(!m.is_likely_not_mount_point("/proc").unwrap());
+        assert!(m.is_likely_not_mount_point("/proc/self").unwrap());
+        assert!(m.is_likely_not_mount_point("/nonexistent-xyz").is_err());
+    }
 
     // TestMakeBindOpts (mount_test.go:27)
     #[test]
