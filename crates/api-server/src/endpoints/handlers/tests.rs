@@ -346,3 +346,104 @@ mod too_large_retry {
         assert_eq!(calls, 2);
     }
 }
+
+/// `--enable-admission-plugins` / `--disable-admission-plugins` choose the
+/// chain (apiserver/pkg/server/options/admission.go `enabledPluginNames`):
+/// NodeRestriction is off by default (pkg/kubeapiserver/options/plugins.go
+/// `DefaultOffAdmissionPlugins`), so a node's non-mirror pod is admitted, and
+/// it is refused once the plugin is enabled.
+mod admission_plugin_selection {
+    use std::sync::Arc;
+
+    use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource, Operation};
+    use rusternetes_common::auth::{TokenManager, UserInfo};
+    use rusternetes_common::authz::{AlwaysAllowAuthorizer, Authorizer};
+    use rusternetes_common::observability::MetricsRegistry;
+    use rusternetes_common::resources::Pod;
+    use rusternetes_storage::StorageBackend;
+
+    use crate::admission::plugins::EnabledForTest;
+    use crate::endpoints::handlers::admission::Admission;
+    use crate::state::ApiServerState;
+
+    fn state() -> ApiServerState {
+        ApiServerState::new(
+            Arc::new(StorageBackend::new_memory()),
+            Arc::new(TokenManager::new(b"test-secret")),
+            Arc::new(AlwaysAllowAuthorizer) as Arc<dyn Authorizer>,
+            Arc::new(MetricsRegistry::new()),
+            true,
+        )
+    }
+
+    async fn user_creates_plain_pod(username: &str) -> rusternetes_common::Result<Pod> {
+        let state = state();
+        let kind = GroupVersionKind {
+            group: String::new(),
+            version: "v1".into(),
+            kind: "Pod".into(),
+        };
+        let resource = GroupVersionResource {
+            group: String::new(),
+            version: "v1".into(),
+            resource: "pods".into(),
+        };
+        let user = UserInfo {
+            username: username.into(),
+            uid: String::new(),
+            groups: if username.starts_with("system:node:") {
+                vec!["system:nodes".into()]
+            } else {
+                vec![]
+            },
+            extra: Default::default(),
+        };
+        let admission = Admission {
+            state: &state,
+            kind: &kind,
+            resource: &resource,
+            subresource: None,
+            namespace: Some("default"),
+            user: &user,
+            dry_run: false,
+        };
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "default"},
+            "spec": {"nodeName": "node-1", "containers": [{"name": "c", "image": "i"}]}
+        }))
+        .unwrap();
+        admission.admit(Operation::Create, pod, None).await
+    }
+
+    async fn node_creates_plain_pod() -> rusternetes_common::Result<Pod> {
+        user_creates_plain_pod("system:node:node-1").await
+    }
+
+    #[tokio::test]
+    async fn node_restriction_is_off_by_default() {
+        node_creates_plain_pod()
+            .await
+            .expect("NodeRestriction is default-off");
+    }
+
+    #[tokio::test]
+    async fn node_restriction_runs_when_enabled() {
+        let _g = EnabledForTest::new(&["NodeRestriction"]);
+        let err = node_creates_plain_pod().await.unwrap_err();
+        assert!(err.to_string().contains("mirror pods"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn priority_stops_when_disabled() {
+        let _g = EnabledForTest::new(&[]);
+        let pod = user_creates_plain_pod("alice").await.unwrap();
+        assert_eq!(pod.spec.unwrap().priority, None, "Priority is off");
+    }
+
+    #[tokio::test]
+    async fn priority_runs_by_default() {
+        let pod = user_creates_plain_pod("alice").await.unwrap();
+        assert_eq!(pod.spec.unwrap().priority, Some(0), "Priority is on");
+    }
+}
