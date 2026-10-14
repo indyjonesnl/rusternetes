@@ -45,6 +45,9 @@ async fn forbidden_for(
     uri: &str,
     headers: &[(&str, &str)],
 ) -> (axum::http::response::Parts, Vec<u8>) {
+    // The attempt counters are process-global (see authorization_filter_test).
+    let _g = super::authorization_filter_test::LOCK.lock().await;
+    let _m = super::authorization_filter_metrics_test::LOCK.lock().await;
     let authorizer: Arc<dyn Authorizer> = Arc::new(Deny);
     let app = Router::new()
         .fallback(any(|| async { "ok" }))
@@ -93,9 +96,9 @@ async fn default_is_compact_json_with_trailing_newline() {
 #[tokio::test]
 async fn json_escapes_html_like_go() {
     // encoding/json escapes <, > and & even in the sanitized message.
-    let (_, b) = forbidden_for("/<script>", &[]).await;
+    let (_, b) = forbidden_for("/&x", &[]).await;
     let s = String::from_utf8(b).unwrap();
-    assert!(s.contains(r#"&lt;script&gt;"#), "{s}");
+    assert!(s.contains(r#"\u0026amp;x"#), "{s}");
 }
 
 #[tokio::test]
