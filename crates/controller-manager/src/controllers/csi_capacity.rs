@@ -10,6 +10,7 @@
 //! is `run_capacity_loop`, started from `main.rs` (#3219).
 
 use super::csi_capacity_metrics::CapacityStats;
+use super::csi_capacity_refresh::ItemKey;
 use rusternetes_common::quantity::{Format, Quantity};
 use rusternetes_common::resources::csi::{CSINode, CSIStorageCapacity};
 use rusternetes_common::resources::volume::LabelSelector;
@@ -88,8 +89,6 @@ impl Segment {
 }
 
 /// `termToSegment` (capacity.go:458-478).
-// Only exercised by tests until StorageClass.allowedTopologies filtering lands (#3234).
-#[allow(dead_code)]
 pub fn term_to_segment(term: &NodeSelectorTerm) -> std::result::Result<Segment, String> {
     if term.match_fields.as_ref().is_some_and(|f| !f.is_empty()) {
         return Err(format!("MatchFields not empty: {:?}", term.match_fields));
@@ -326,21 +325,37 @@ pub async fn capacity_tick<S: Storage, C: CapacityClient>(
     ctl.reconcile(&segments).await
 }
 
-/// `Controller.Run` (capacity.go:255): `pollCapacities` re-syncs every object
-/// each `poll_interval` (`wait.UntilWithContext`). Deviation: topology and
-/// StorageClass changes are picked up on the next tick rather than from
-/// informer events, and there is one worker (`--csi-capacity-threads` is
-/// accepted for flag parity only).
+/// `Controller.Run` (capacity.go:232-259): `pollCapacities` re-syncs every
+/// object each `poll_interval` (`wait.UntilWithContext`), and the queue fed by
+/// `refreshTopology`/`refreshSC` (provision.go) is worked off in between with
+/// per-item exponential backoff. Deviation: topology and StorageClass changes
+/// are picked up by the poll tick rather than from informer events, and there
+/// is one worker (`--csi-capacity-threads` is accepted for flag parity only).
 pub async fn run_capacity_loop<S: Storage, C: CapacityClient>(
     ctl: &CapacityController<'_, S, C>,
     topology: &TopologySource,
     poll_interval: std::time::Duration,
+    retry_interval_start: std::time::Duration,
+    retry_interval_max: std::time::Duration,
 ) {
+    let mut next_poll = tokio::time::Instant::now();
     loop {
-        if let Err(e) = capacity_tick(ctl, topology).await {
-            tracing::error!("CSIStorageCapacity publisher ({}): {e}", ctl.driver_name);
+        if tokio::time::Instant::now() >= next_poll {
+            if let Err(e) = capacity_tick(ctl, topology).await {
+                tracing::error!("CSIStorageCapacity publisher ({}): {e}", ctl.driver_name);
+            }
+            next_poll = tokio::time::Instant::now() + poll_interval;
         }
-        tokio::time::sleep(poll_interval).await;
+        ctl.sync_queued(retry_interval_start, retry_interval_max)
+            .await;
+        let mut wake = next_poll;
+        if let Some(d) = ctl.refresher.next_delayed() {
+            wake = wake.min(tokio::time::Instant::from_std(d));
+        }
+        tokio::select! {
+            _ = tokio::time::sleep_until(wake) => {}
+            _ = ctl.refresher.notified() => {}
+        }
     }
 }
 
@@ -453,6 +468,18 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
             }
         }
 
+        // `addWorkItem` / `removeWorkItem` (:469-513): the refresh triggers
+        // look items up in this set.
+        self.refresher.set_capacities(
+            items
+                .iter()
+                .map(|i| ItemKey {
+                    segment: i.segment.clone(),
+                    storage_class_name: i.sc.metadata.name.clone(),
+                })
+                .collect(),
+        );
+
         let existing: Vec<CSIStorageCapacity> = self
             .storage
             .list(&build_prefix(
@@ -499,8 +526,59 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
         first_err.map_or(Ok(()), Err)
     }
 
-    pub async fn sync_queued(&self, _start: std::time::Duration, _max: std::time::Duration) {
-        todo!()
+    /// `runWorker` / `processNextWorkItem` (capacity.go:525-560) for the items
+    /// currently queued: success is `Forget`, failure is `AddRateLimited`
+    /// (`NewTypedItemExponentialFailureRateLimiter(retryIntervalStart,
+    /// retryIntervalMax)`, csi-provisioner.go:528).
+    pub async fn sync_queued(&self, start: std::time::Duration, max: std::time::Duration) {
+        while let Some(key) = self.refresher.pop() {
+            match self.sync_item(&key).await {
+                Ok(()) => self.refresher.forget(&key),
+                Err(e) => {
+                    tracing::error!("CSIStorageCapacity publisher ({}): {e}", self.driver_name);
+                    let d = self.refresher.add_rate_limited(key, start, max);
+                    tracing::warn!("Retrying after {d:?}");
+                }
+            }
+        }
+    }
+
+    /// `syncCapacity(ctx, item)` (:564-672) for one queued item.
+    async fn sync_item(&self, key: &ItemKey) -> Result<()> {
+        // :572-583: "The item was removed in the meantime."
+        if !self.refresher.is_capacity(key) {
+            return Ok(());
+        }
+        // :585-593: a missing StorageClass is "another indication that the
+        // value is no longer needed".
+        let sc: StorageClass = match self
+            .storage
+            .get(&build_key("storageclasses", None, &key.storage_class_name))
+            .await
+        {
+            Ok(sc) => sc,
+            Err(Error::NotFound(_)) => return Ok(()),
+            Err(e) => {
+                return Err(Error::Internal(format!(
+                    "retrieve storage class for {key:?}: {e}"
+                )))
+            }
+        };
+        let item = WorkItem {
+            segment: &key.segment,
+            sc: &sc,
+        };
+        let existing: Vec<CSIStorageCapacity> = self
+            .storage
+            .list(&build_prefix(
+                "csistoragecapacities",
+                Some(&self.owner_namespace),
+            ))
+            .await?;
+        let current = existing
+            .into_iter()
+            .find(|c| self.is_managed(c) && item.equals(c));
+        self.sync_capacity(&item, current).await.map(|_| ())
     }
 
     /// `syncCapacity` (:586-715).

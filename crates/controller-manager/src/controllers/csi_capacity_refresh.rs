@@ -35,41 +35,149 @@ struct State {
 
 impl CapacityRefresher {
     pub fn new() -> Self {
-        todo!()
+        Self {
+            state: Mutex::new(State::default()),
+            notify: Notify::new(),
+        }
     }
-    pub fn set_capacities(&self, _items: HashSet<ItemKey>) {
-        todo!()
+
+    /// `addWorkItem` / `removeWorkItem` (capacity.go:469-513) collapsed to the
+    /// level-triggered pass: `items` is the full set of objects that are
+    /// supposed to exist. Items that dropped out stay queued, as upstream
+    /// leaves them in the workqueue; `syncCapacity` then finds them gone.
+    pub fn set_capacities(&self, items: HashSet<ItemKey>) {
+        self.state.lock().unwrap().capacities = items;
     }
-    pub fn is_capacity(&self, _key: &ItemKey) -> bool {
-        todo!()
+
+    /// The `found` of `syncCapacity`'s `c.capacities[item]` lookup (:572-583).
+    pub fn is_capacity(&self, key: &ItemKey) -> bool {
+        self.state.lock().unwrap().capacities.contains(key)
     }
-    pub fn refresh_topology(&self, _affinity: &VolumeNodeAffinity) {
-        todo!()
+
+    /// `queue.Add`: a workqueue holds each item at most once.
+    fn add(&self, st: &mut State, key: ItemKey) {
+        if !st.queue.contains(&key) {
+            st.queue.push_back(key);
+        }
+        self.notify.notify_one();
     }
-    pub fn refresh_sc(&self, _storage_class_name: &str) {
-        todo!()
+
+    /// `refreshTopology` (capacity.go:409-431): enqueue every item whose
+    /// segment equals one of the affinity's terms. The affinity is expected to
+    /// come from `GenerateVolumeNodeAffinity`.
+    pub fn refresh_topology(&self, affinity: &VolumeNodeAffinity) {
+        let Some(selector) = &affinity.required else {
+            tracing::error!(
+                "Capacity Controller: skipping refresh: unexpected VolumeNodeAffinity, missing NodeSelectorTerms: {affinity:?}"
+            );
+            return;
+        };
+        let mut st = self.state.lock().unwrap();
+        for term in &selector.node_selector_terms {
+            let segment = match super::csi_capacity::term_to_segment(term) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(
+                        "Capacity Controller: skipping refresh: unexpected node selector term {term:?}: {e}"
+                    );
+                    continue;
+                }
+            };
+            let matching: Vec<ItemKey> = st
+                .capacities
+                .iter()
+                .filter(|i| i.segment == segment)
+                .cloned()
+                .collect();
+            for item in matching {
+                tracing::trace!("Capacity Controller: enqueuing {item:?} because of the topology");
+                self.add(&mut st, item);
+            }
+        }
     }
+
+    /// `refreshSC` (capacity.go:455-466).
+    pub fn refresh_sc(&self, storage_class_name: &str) {
+        let mut st = self.state.lock().unwrap();
+        let matching: Vec<ItemKey> = st
+            .capacities
+            .iter()
+            .filter(|i| i.storage_class_name == storage_class_name)
+            .cloned()
+            .collect();
+        for item in matching {
+            tracing::trace!("Capacity Controller: enqueuing {item:?} because of the storage class");
+            self.add(&mut st, item);
+        }
+    }
+
+    /// `pollCapacities` (capacity.go:515-523).
     pub fn poll_capacities(&self) {
-        todo!()
+        let mut st = self.state.lock().unwrap();
+        let all: Vec<ItemKey> = st.capacities.iter().cloned().collect();
+        for item in all {
+            self.add(&mut st, item);
+        }
     }
+
+    /// `queue.Get` (without blocking): moves due `AddRateLimited` items onto
+    /// the queue first.
     pub fn pop(&self) -> Option<ItemKey> {
-        todo!()
+        let mut st = self.state.lock().unwrap();
+        let now = Instant::now();
+        let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut st.delayed)
+            .into_iter()
+            .partition(|(t, _)| *t <= now);
+        st.delayed = later;
+        for (_, key) in due {
+            if !st.queue.contains(&key) {
+                st.queue.push_back(key);
+            }
+        }
+        st.queue.pop_front()
     }
+
+    /// The queued items, oldest first.
     pub fn queued(&self) -> Vec<ItemKey> {
-        todo!()
+        self.state.lock().unwrap().queue.iter().cloned().collect()
     }
+
     pub fn clear_queue(&self) {
-        todo!()
+        self.state.lock().unwrap().queue.clear();
     }
-    pub fn forget(&self, _key: &ItemKey) {
-        todo!()
+
+    /// `queue.Forget`.
+    pub fn forget(&self, key: &ItemKey) {
+        self.state.lock().unwrap().failures.remove(key);
     }
-    pub fn add_rate_limited(&self, _key: ItemKey, _start: Duration, _max: Duration) -> Duration {
-        todo!()
+
+    /// `queue.AddRateLimited` with `NewTypedItemExponentialFailureRateLimiter
+    /// (start, max)` (`When`: `base * 2^failures`, capped at `max`). Returns
+    /// the delay.
+    pub fn add_rate_limited(&self, key: ItemKey, start: Duration, max: Duration) -> Duration {
+        let mut st = self.state.lock().unwrap();
+        let exp = st.failures.entry(key.clone()).or_insert(0);
+        let n = *exp;
+        *exp += 1;
+        let delay = start
+            .checked_mul(2u32.saturating_pow(n))
+            .map_or(max, |d| d.min(max));
+        st.delayed.push((Instant::now() + delay, key));
+        delay
     }
+
+    /// When the earliest rate-limited item becomes due.
     pub fn next_delayed(&self) -> Option<Instant> {
-        todo!()
+        self.state
+            .lock()
+            .unwrap()
+            .delayed
+            .iter()
+            .map(|(t, _)| *t)
+            .min()
     }
+
+    /// Resolves when an item was queued since the last wait.
     pub async fn notified(&self) {
         self.notify.notified().await
     }
