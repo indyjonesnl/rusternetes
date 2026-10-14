@@ -2038,3 +2038,76 @@ fn get_device_mount_refs_delegates_to_the_host_mounters_get_mount_refs() {
         assert_eq!(got, want, "{path}");
     }
 }
+
+// ---- getCSIDriver waits for the CSIDriverLister cache (csi_plugin.go:873-890)
+//
+// Upstream's `getCSIDriver` calls `kletHost.WaitForCacheSync()`
+// (`volume_host.go:175-188`), which blocks in `cache.WaitForCacheSync(
+// wait.NeverStop, csiDriversSynced)` until the informer syncs; it does not
+// error while the cache is still filling.
+
+#[test]
+fn get_csi_driver_waits_for_cache_sync_instead_of_erroring() {
+    let lister = crate::volume_plugins::csi_driver_lister::CsiDriverLister::new();
+    lister.insert(
+        serde_json::from_value(csi_driver_obj(
+            "late.csi.example.com",
+            json!({"attachRequired": false}),
+        ))
+        .unwrap(),
+    );
+    let host = Arc::new(
+        crate::volume_plugins::KubeletVolumeHost::new(
+            "/var/lib/rusternetes".to_string(),
+            None,
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            HashMap::new(),
+        )
+        .with_csi_driver_lister(lister.clone()),
+    );
+    let p = CsiPlugin::new(host);
+    let l = lister.clone();
+    let t = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        l.mark_synced();
+    });
+    let d = p
+        .get_csi_driver("late.csi.example.com")
+        .expect("must wait for the sync, not error")
+        .expect("driver present once synced");
+    assert_eq!(d.metadata.name, "late.csi.example.com");
+    assert!(lister.has_synced());
+    t.join().unwrap();
+}
+
+#[test]
+fn can_attach_waits_for_cache_sync() {
+    // skipAttach -> getCSIDriver blocks until synced, then reads attachRequired.
+    let lister = crate::volume_plugins::csi_driver_lister::CsiDriverLister::new();
+    lister.insert(
+        serde_json::from_value(csi_driver_obj(
+            "noattach.csi.example.com",
+            json!({"attachRequired": false}),
+        ))
+        .unwrap(),
+    );
+    let host = Arc::new(
+        crate::volume_plugins::KubeletVolumeHost::new(
+            "/var/lib/rusternetes".to_string(),
+            None,
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            HashMap::new(),
+        )
+        .with_csi_driver_lister(lister.clone()),
+    );
+    let p = CsiPlugin::new(host);
+    let l = lister.clone();
+    let t = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        l.mark_synced();
+    });
+    let v = claim_volume();
+    let r = can_attach_of(&p, &v, Some(&pv("noattach.csi.example.com", json!({}))));
+    assert_eq!(r.unwrap(), false);
+    t.join().unwrap();
+}
