@@ -2784,7 +2784,7 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             .layer(Extension(state.storage.clone()))
             // The impersonation gate inside skip_auth_middleware authorizes the
             // `impersonate` verb against this authorizer.
-            .layer(Extension(state.authorizer.clone()));
+            .layer(Extension(state.unfiltered_authorizer.clone()));
     } else {
         // In normal mode, apply full authentication
         protected_routes = protected_routes
@@ -2840,7 +2840,7 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             .layer(Extension(state.token_manager.clone()))
             .layer(Extension(state.bootstrap_token_manager.clone()))
             .layer(Extension(state.storage.clone()))
-            .layer(Extension(state.authorizer.clone()));
+            .layer(Extension(state.unfiltered_authorizer.clone()));
     }
 
     // Combine routes and add shared state.

@@ -66,7 +66,7 @@ fn policy_scope(state: &ApiServerState) -> RequestScope<MutatingAdmissionPolicy>
         subresource: None,
         store: Box::new(mutatingadmissionpolicy::new_store(
             state.storage.clone(),
-            state.authorizer.clone(),
+            state.unfiltered_authorizer.clone(),
         )),
         apply: Some(crate::ssa::apply_legacy::<MutatingAdmissionPolicy>),
         convert_to_internal: Some(mutatingadmissionpolicy::convert_to_internal),
@@ -149,7 +149,7 @@ fn binding_scope(state: &ApiServerState) -> RequestScope<MutatingAdmissionPolicy
         subresource: None,
         store: Box::new(mutatingadmissionpolicybinding::new_store(
             state.storage.clone(),
-            state.authorizer.clone(),
+            state.unfiltered_authorizer.clone(),
         )),
         apply: Some(crate::ssa::apply_legacy::<MutatingAdmissionPolicyBinding>),
         convert_to_internal: Some(mutatingadmissionpolicybinding::convert_to_internal),
