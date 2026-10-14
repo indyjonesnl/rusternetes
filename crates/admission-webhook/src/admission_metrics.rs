@@ -1,42 +1,394 @@
-//! Stub; implemented in the next commit.
+//! `apiserver_admission_*` step / controller / webhook metrics.
+//!
+//! Port of `staging/src/k8s.io/apiserver/pkg/admission/metrics/metrics.go`
+//! (release-1.35): `newAdmissionMetrics` (:128-270) for names, help, labels
+//! and buckets, `pluginHandlerWithMetrics` (:82-113) as
+//! [`with_step_metrics`] / [`with_controller_metrics`], and
+//! `ObserveAdmissionStep` (:278-281), `ObserveAdmissionController`
+//! (:283-286), `ObserveWebhook` (:288-296), `ObserveWebhookRejection`
+//! (:298-306) and `ObserveWebhookFailOpen` (:313-316). The
+//! `match_condition_*` metrics of the same file live in the api-server crate
+//! (`admission::admission_metrics`).
+//!
+//! Like upstream's `legacyregistry` they live in the process-global registry
+//! (`prometheus::default_registry()`), which `/metrics` serves.
 
+use std::collections::HashMap;
 use std::future::Future;
-use std::time::Duration;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
+use prometheus::core::{Collector, Desc};
+use prometheus::proto::{LabelPair, Metric, MetricFamily, MetricType, Summary};
+use prometheus::{register, HistogramOpts, HistogramVec, IntCounterVec, Opts};
 use rusternetes_common::admission::Operation;
 use rusternetes_common::Result;
 
-pub const STEP_VALIDATE: &str = "validate";
-pub const STEP_ADMIT: &str = "admit";
+const NAMESPACE: &str = "apiserver";
+const SUBSYSTEM: &str = "admission";
 
+/// metrics.go:59 `stepValidate`.
+pub const STEP_VALIDATE: &str = "validate";
+/// metrics.go:60 `stepAdmit`.
+pub const STEP_ADMIT: &str = "admit";
+/// The step type the validating dispatcher passes (validating/dispatcher.go:151,
+/// :181-195): `"validating"`, not [`STEP_VALIDATE`]. Upstream's mutating
+/// dispatcher passes `"admit"`.
+pub const STEP_VALIDATING_WEBHOOK: &str = "validating";
+
+/// `WebhookRejectionErrorType` (metrics.go:30-44).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WebhookRejectionErrorType {
+    /// `WebhookRejectionCallingWebhookError`.
     CallingWebhookError,
+    /// `WebhookRejectionAPIServerInternalError`.
     ApiServerInternalError,
+    /// `WebhookRejectionNoError`.
     NoError,
 }
 
-pub fn observe_admission_step(_: Duration, _: bool, _: &Operation, _: &str) {}
-pub fn observe_admission_controller(_: Duration, _: bool, _: &Operation, _: &str, _: &str) {}
-pub fn observe_webhook(_: &str, _: Duration, _: bool, _: &Operation, _: &str, _: i32) {}
-pub fn observe_webhook_rejection(_: &str, _: &str, _: &str, _: WebhookRejectionErrorType, _: i32) {}
-pub fn observe_webhook_fail_open(_: &str, _: &str) {}
-
-pub async fn with_step_metrics<T>(
-    _op: &Operation,
-    _step_type: &str,
-    fut: impl Future<Output = Result<T>>,
-) -> Result<T> {
-    fut.await
+impl WebhookRejectionErrorType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CallingWebhookError => "calling_webhook_error",
+            Self::ApiServerInternalError => "apiserver_internal_error",
+            Self::NoError => "no_error",
+        }
+    }
 }
 
-pub async fn with_controller_metrics<T>(
-    _name: &str,
-    _op: &Operation,
-    _step_type: &str,
+/// `string(attr.GetOperation())`.
+pub fn operation_label(op: &Operation) -> &'static str {
+    match op {
+        Operation::Create => "CREATE",
+        Operation::Update => "UPDATE",
+        Operation::Delete => "DELETE",
+        Operation::Connect => "CONNECT",
+    }
+}
+
+/// `legacyregistry` prefixes the help of a non-stable metric with its level.
+fn alpha(help: &str) -> String {
+    format!("[ALPHA] {help}")
+}
+
+fn histogram(name: &str, help: &str, buckets: Vec<f64>, labels: &[&str]) -> HistogramVec {
+    let h = HistogramVec::new(
+        HistogramOpts::new(name, help)
+            .namespace(NAMESPACE)
+            .subsystem(SUBSYSTEM)
+            .buckets(buckets),
+        labels,
+    )
+    .expect("valid metric");
+    let _ = register(Box::new(h.clone()));
+    h
+}
+
+fn counter(name: &str, help: String, labels: &[&str]) -> IntCounterVec {
+    let c = IntCounterVec::new(
+        Opts::new(name, help)
+            .namespace(NAMESPACE)
+            .subsystem(SUBSYSTEM),
+        labels,
+    )
+    .expect("valid metric");
+    let _ = register(Box::new(c.clone()));
+    c
+}
+
+/// A `metrics.SummaryVec` without objectives (metrics.go:146-156 sets only
+/// `MaxAge`, so client_golang exports `_sum` and `_count` per label set);
+/// `prometheus` has no summary type of its own.
+struct SummaryVec {
+    desc: Desc,
+    series: Mutex<HashMap<Vec<String>, (u64, f64)>>,
+}
+
+impl SummaryVec {
+    fn new(name: &str, help: String, labels: &[&str]) -> Self {
+        let desc = Desc::new(
+            format!("{NAMESPACE}_{SUBSYSTEM}_{name}"),
+            help,
+            labels.iter().map(|l| l.to_string()).collect(),
+            HashMap::new(),
+        )
+        .expect("valid desc");
+        Self {
+            desc,
+            series: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn observe(&self, labels: &[&str], v: f64) {
+        let mut series = self.series.lock().unwrap_or_else(|e| e.into_inner());
+        let e = series
+            .entry(labels.iter().map(|l| l.to_string()).collect())
+            .or_insert((0, 0.0));
+        e.0 += 1;
+        e.1 += v;
+    }
+}
+
+/// The registry owns a boxed collector; the metric set keeps observing.
+struct SummaryHandle(Arc<SummaryVec>);
+
+impl Collector for SummaryHandle {
+    fn desc(&self) -> Vec<&Desc> {
+        self.0.desc()
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        self.0.collect()
+    }
+}
+
+impl Collector for SummaryVec {
+    fn desc(&self) -> Vec<&Desc> {
+        vec![&self.desc]
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        let series = self.series.lock().unwrap_or_else(|e| e.into_inner());
+        let mut mf = MetricFamily::default();
+        mf.set_name(self.desc.fq_name.clone());
+        mf.set_help(self.desc.help.clone());
+        mf.set_field_type(MetricType::SUMMARY);
+        let metrics = series
+            .iter()
+            .map(|(values, (count, sum))| {
+                let mut m = Metric::default();
+                let pairs = self
+                    .desc
+                    .variable_labels
+                    .iter()
+                    .zip(values)
+                    .map(|(n, v)| {
+                        let mut p = LabelPair::default();
+                        p.set_name(n.clone());
+                        p.set_value(v.clone());
+                        p
+                    })
+                    .collect::<Vec<_>>();
+                m.set_label(pairs);
+                let mut s = Summary::default();
+                s.set_sample_count(*count);
+                s.set_sample_sum(*sum);
+                m.set_summary(s);
+                m
+            })
+            .collect::<Vec<_>>();
+        mf.set_metric(metrics);
+        vec![mf]
+    }
+}
+
+/// `metricSet` (metrics.go:333-336).
+struct MetricSet {
+    latencies: HistogramVec,
+    latencies_summary: Option<Arc<SummaryVec>>,
+}
+
+impl MetricSet {
+    /// `metricSet.observe` (metrics.go:355-361).
+    fn observe(&self, elapsed: Duration, labels: &[&str]) {
+        let secs = elapsed.as_secs_f64();
+        self.latencies.with_label_values(labels).observe(secs);
+        if let Some(s) = &self.latencies_summary {
+            s.observe(labels, secs);
+        }
+    }
+}
+
+const STEP_LABELS: &[&str] = &["type", "operation", "rejected"];
+const NAMED_LABELS: &[&str] = &["name", "type", "operation", "rejected"];
+/// "Use buckets ranging from 5 ms to 2.5 seconds." (metrics.go:132, :160).
+const LATENCY_BUCKETS: [f64; 6] = [0.005, 0.025, 0.1, 0.5, 1.0, 2.5];
+
+/// metrics.go:133-157.
+static STEP: LazyLock<MetricSet> = LazyLock::new(|| {
+    let summary = Arc::new(SummaryVec::new(
+        "step_admission_duration_seconds_summary",
+        alpha("Admission sub-step latency summary in seconds, broken out for each operation and API resource and step type (validate or admit)."),
+        STEP_LABELS,
+    ));
+    let _ = register(Box::new(SummaryHandle(summary.clone())));
+    MetricSet {
+        latencies: histogram(
+            "step_admission_duration_seconds",
+            "Admission sub-step latency histogram in seconds, broken out for each operation and API resource and step type (validate or admit).",
+            LATENCY_BUCKETS.to_vec(),
+            STEP_LABELS,
+        ),
+        latencies_summary: Some(summary),
+    }
+});
+
+/// metrics.go:161-175.
+static CONTROLLER: LazyLock<MetricSet> = LazyLock::new(|| {
+    MetricSet {
+    latencies: histogram(
+        "controller_admission_duration_seconds",
+        "Admission controller latency histogram in seconds, identified by name and broken out for each operation and API resource and type (validate or admit).",
+        LATENCY_BUCKETS.to_vec(),
+        NAMED_LABELS,
+    ),
+    latencies_summary: None,
+}
+});
+
+/// metrics.go:179-193: buckets up to 25s, "admission webhooks timeout at 30
+/// seconds by default".
+static WEBHOOK: LazyLock<MetricSet> = LazyLock::new(|| {
+    MetricSet {
+    latencies: histogram(
+        "webhook_admission_duration_seconds",
+        "Admission webhook latency histogram in seconds, identified by name and broken out for each operation and API resource and type (validate or admit).",
+        vec![0.005, 0.025, 0.1, 0.5, 1.0, 2.5, 10.0, 25.0],
+        NAMED_LABELS,
+    ),
+    latencies_summary: None,
+}
+});
+
+/// metrics.go:195-203.
+static WEBHOOK_REJECTION: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    counter(
+        "webhook_rejection_count",
+        alpha("Admission webhook rejection count, identified by name and broken out for each admission type (validating or admit) and operation. Additional labels specify an error type (calling_webhook_error or apiserver_internal_error if an error occurred; no_error otherwise) and optionally a non-zero rejection code if the webhook rejects the request with an HTTP status code (honored by the apiserver when the code is greater or equal to 400). Codes greater than 600 are truncated to 600, to keep the metrics cardinality bounded."),
+        &["name", "type", "operation", "error_type", "rejection_code"],
+    )
+});
+
+/// metrics.go:205-213.
+static WEBHOOK_FAIL_OPEN: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    counter(
+        "webhook_fail_open_count",
+        alpha("Admission webhook fail open count, identified by name and broken out for each admission type (validating or admit)."),
+        &["name", "type"],
+    )
+});
+
+/// metrics.go:215-223.
+static WEBHOOK_REQUEST: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    counter(
+        "webhook_request_total",
+        alpha("Admission webhook request total, identified by name and broken out for each admission type (validating or admit) and operation. Additional labels specify whether the request was rejected or not and an HTTP status code. Codes greater than 600 are truncated to 600, to keep the metrics cardinality bounded."),
+        &["name", "type", "operation", "code", "rejected"],
+    )
+});
+
+/// Register every family up front, as `newAdmissionMetrics` does at package
+/// init (metrics.go:260-268), so `/metrics` lists them before the first
+/// observation.
+pub fn register_all() {
+    LazyLock::force(&STEP);
+    LazyLock::force(&CONTROLLER);
+    LazyLock::force(&WEBHOOK);
+    LazyLock::force(&WEBHOOK_REJECTION);
+    LazyLock::force(&WEBHOOK_FAIL_OPEN);
+    LazyLock::force(&WEBHOOK_REQUEST);
+}
+
+/// `ObserveAdmissionStep` (:278-281): `append(extraLabels, stepType, op, rejected)`.
+pub fn observe_admission_step(elapsed: Duration, rejected: bool, op: &Operation, step_type: &str) {
+    STEP.observe(
+        elapsed,
+        &[step_type, operation_label(op), &rejected.to_string()],
+    );
+}
+
+/// `ObserveAdmissionController` (:283-286): the plugin name is the extra label.
+pub fn observe_admission_controller(
+    elapsed: Duration,
+    rejected: bool,
+    op: &Operation,
+    step_type: &str,
+    name: &str,
+) {
+    CONTROLLER.observe(
+        elapsed,
+        &[name, step_type, operation_label(op), &rejected.to_string()],
+    );
+}
+
+/// `ObserveWebhook` (:288-296).
+pub fn observe_webhook(
+    name: &str,
+    elapsed: Duration,
+    rejected: bool,
+    op: &Operation,
+    step_type: &str,
+    code: i32,
+) {
+    // We truncate codes greater than 600 to keep the cardinality bounded.
+    let code = code.min(600);
+    let rejected = rejected.to_string();
+    WEBHOOK_REQUEST
+        .with_label_values(&[
+            name,
+            step_type,
+            operation_label(op),
+            &code.to_string(),
+            &rejected,
+        ])
+        .inc();
+    WEBHOOK.observe(elapsed, &[name, step_type, operation_label(op), &rejected]);
+}
+
+/// `ObserveWebhookRejection` (:298-306).
+pub fn observe_webhook_rejection(
+    name: &str,
+    step_type: &str,
+    operation: &str,
+    error_type: WebhookRejectionErrorType,
+    rejection_code: i32,
+) {
+    // We truncate codes greater than 600 to keep the cardinality bounded.
+    let rejection_code = rejection_code.min(600);
+    WEBHOOK_REJECTION
+        .with_label_values(&[
+            name,
+            step_type,
+            operation,
+            error_type.as_str(),
+            &rejection_code.to_string(),
+        ])
+        .inc();
+}
+
+/// `ObserveWebhookFailOpen` (:313-316).
+pub fn observe_webhook_fail_open(name: &str, step_type: &str) {
+    WEBHOOK_FAIL_OPEN
+        .with_label_values(&[name, step_type])
+        .inc();
+}
+
+/// `WithStepMetrics` (:68-71) around one admit or validate phase:
+/// `pluginHandlerWithMetrics.Admit/Validate` (:89-113) time the call and
+/// report `rejected = err != nil`.
+pub async fn with_step_metrics<T>(
+    op: &Operation,
+    step_type: &str,
     fut: impl Future<Output = Result<T>>,
 ) -> Result<T> {
-    fut.await
+    let start = Instant::now();
+    let r = fut.await;
+    observe_admission_step(start.elapsed(), r.is_err(), op, step_type);
+    r
+}
+
+/// `WithControllerMetrics` (:63-66) around one named plugin's call.
+pub async fn with_controller_metrics<T>(
+    name: &str,
+    op: &Operation,
+    step_type: &str,
+    fut: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    let start = Instant::now();
+    let r = fut.await;
+    observe_admission_controller(start.elapsed(), r.is_err(), op, step_type, name);
+    r
 }
 
 #[cfg(test)]
