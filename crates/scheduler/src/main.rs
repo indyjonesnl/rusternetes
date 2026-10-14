@@ -160,9 +160,15 @@ fn install_statusz(app: Router, flags: rusternetes_common::flagz::NamedFlagSetsR
 /// kube-scheduler with the command line applied
 /// (cmd/kube-scheduler/app/options/options.go:119-128).
 fn component_secure_serving(
-    _args: &Args,
+    args: &Args,
 ) -> rusternetes_middleware::secure_serving::ComponentSecureServing {
-    rusternetes_middleware::secure_serving::ComponentSecureServing::for_scheduler()
+    let mut c = rusternetes_middleware::secure_serving::ComponentSecureServing::for_scheduler();
+    c.apply_flags(
+        &args.secure_serving,
+        &args.authentication,
+        &args.authorization,
+    );
+    c
 }
 
 /// `utilerrors.NewAggregate(errs).Error()` of the options `Validate`.
