@@ -19,6 +19,7 @@ pub mod host;
 pub mod host_path;
 pub mod image;
 pub mod local;
+pub mod metrics_statfs;
 #[cfg(test)]
 mod mounter_args_tests;
 pub mod nfs;
