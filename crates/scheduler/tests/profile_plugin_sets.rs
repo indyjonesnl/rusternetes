@@ -123,7 +123,10 @@ profiles:
         .create("/registry/nodes/tainted", &tainted_node())
         .await
         .unwrap();
-    for (name, sn) in [("p-default", "default-scheduler"), ("p-free", "ignores-taints")] {
+    for (name, sn) in [
+        ("p-default", "default-scheduler"),
+        ("p-free", "ignores-taints"),
+    ] {
         storage
             .create(&format!("/registry/pods/default/{name}"), &pod(name, sn))
             .await
@@ -136,4 +139,79 @@ profiles:
         node_of(&storage, "p-free").await.as_deref(),
         Some("tainted")
     );
+}
+
+fn plain_node(name: &str, labels: serde_json::Value) -> Node {
+    serde_json::from_value(json!({
+        "apiVersion": "v1", "kind": "Node",
+        "metadata": {"name": name, "uid": format!("{name}-uid"), "labels": labels},
+        "status": {
+            "capacity": {"cpu": "4", "memory": "8Gi", "pods": "110"},
+            "allocatable": {"cpu": "4", "memory": "8Gi", "pods": "110"}
+        }
+    }))
+    .unwrap()
+}
+
+fn pod_preferring_ssd(name: &str, scheduler: &str) -> Pod {
+    serde_json::from_value(json!({
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": name, "namespace": "default", "uid": format!("{name}-uid")},
+        "spec": {
+            "schedulerName": scheduler,
+            "containers": [{"name": "c", "image": "busybox"}],
+            "affinity": {"nodeAffinity": {"preferredDuringSchedulingIgnoredDuringExecution": [{
+                "weight": 100,
+                "preference": {"matchExpressions": [
+                    {"key": "disk", "operator": "In", "values": ["ssd"]}
+                ]}
+            }]}}
+        },
+        "status": {"phase": "Pending"}
+    }))
+    .unwrap()
+}
+
+/// Score plugin sets differ per profile: the default profile scores
+/// `NodeAffinity` and follows the preferred term, the profile that disables
+/// `NodeAffinity` at Score does not.
+#[tokio::test]
+async fn per_profile_score_sets_route_pods_differently() {
+    let doc = r#"
+profiles:
+- schedulerName: default-scheduler
+- schedulerName: no-affinity-score
+  plugins:
+    score:
+      disabled:
+      - name: NodeAffinity
+"#;
+    // A fresh cluster per profile so the first placement cannot skew the
+    // second pod's resource scores.
+    let run = |sn: &'static str| {
+        let profiles = profiles(doc).unwrap();
+        async move {
+            let storage = Arc::new(MemoryStorage::new());
+            storage
+                .create("/registry/nodes/n1", &plain_node("n1", json!({})))
+                .await
+                .unwrap();
+            storage
+                .create(
+                    "/registry/nodes/n2",
+                    &plain_node("n2", json!({"disk": "ssd"})),
+                )
+                .await
+                .unwrap();
+            storage
+                .create("/registry/pods/default/p", &pod_preferring_ssd("p", sn))
+                .await
+                .unwrap();
+            let scheduler = Scheduler::new_with_profiles(storage.clone(), 1, profiles);
+            scheduler.schedule_pending_pods().await.unwrap();
+            node_of(&storage, "p").await
+        }
+    };
+    assert_eq!(run("default-scheduler").await.as_deref(), Some("n2"));
+    assert_eq!(run("no-affinity-score").await.as_deref(), Some("n1"));
 }

@@ -10,6 +10,8 @@ mod data_plane;
 mod diagnosis;
 #[allow(dead_code)]
 mod framework;
+#[allow(dead_code)] // library API surface (Framework accessors); partly unused by the binary
+mod framework_runtime;
 #[allow(dead_code)]
 mod plugins;
 #[allow(dead_code)] // library API surface (Map accessors); partly unused by the binary
