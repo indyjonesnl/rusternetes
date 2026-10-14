@@ -173,3 +173,61 @@ mod gather_metrics_tests {
         ));
     }
 }
+
+/// `apierrors.IsAlreadyExists(err)` for a storage create error
+/// (apimachinery/pkg/api/errors/errors.go `IsAlreadyExists`, release-1.35).
+pub(crate) fn is_already_exists(e: &rusternetes_common::Error) -> bool {
+    let text = e.to_string();
+    text.contains("already exists") || text.contains("AlreadyExists")
+}
+
+/// [`is_already_exists`] for an `anyhow::Error` carrying a storage error
+/// (`create_pod` helpers return `anyhow::Result`).
+pub(crate) fn is_already_exists_anyhow(e: &anyhow::Error) -> bool {
+    let text = e.to_string();
+    text.contains("already exists") || text.contains("AlreadyExists")
+}
+
+#[cfg(test)]
+mod error_predicate_tests {
+    use super::{is_already_exists, is_already_exists_anyhow};
+    use rusternetes_common::Error;
+
+    #[test]
+    fn typed_already_exists_is_matched() {
+        assert!(is_already_exists(&Error::AlreadyExists("k".into())));
+    }
+
+    /// A non-AlreadyExists variant whose message merely mentions the token
+    /// must not be classified benign (upstream branches on the Status reason,
+    /// never on message text).
+    #[test]
+    fn other_variants_with_the_token_are_not_matched() {
+        assert!(!is_already_exists(&Error::Storage(
+            "backend: lease already exists in cache".into()
+        )));
+        assert!(!is_already_exists(&Error::BadRequest(
+            "label AlreadyExists is reserved".into()
+        )));
+        assert!(!is_already_exists(&Error::Conflict(
+            "resourceVersion mismatch; object already exists elsewhere".into()
+        )));
+    }
+
+    #[test]
+    fn anyhow_wrapped_variants_are_classified_by_variant() {
+        let typed: anyhow::Error = Error::AlreadyExists("k".into()).into();
+        assert!(is_already_exists_anyhow(&typed));
+        let wrapped = anyhow::Error::from(Error::AlreadyExists("k".into())).context("creating pod");
+        assert!(is_already_exists_anyhow(&wrapped));
+        let other: anyhow::Error = Error::Storage("lease already exists in cache".into()).into();
+        assert!(!is_already_exists_anyhow(&other));
+        let plain = anyhow::anyhow!("pod already exists");
+        assert!(!is_already_exists_anyhow(&plain));
+    }
+
+    #[test]
+    fn untokened_non_matching_variants_are_not_matched() {
+        assert!(!is_already_exists(&Error::NotFound("k".into())));
+    }
+}

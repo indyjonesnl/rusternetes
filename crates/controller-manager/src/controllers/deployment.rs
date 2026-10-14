@@ -1355,8 +1355,7 @@ impl<S: Storage + 'static> DeploymentController<S> {
                 );
             }
             Err(e) => {
-                let err_str = format!("{}", e);
-                if err_str.contains("already exists") || err_str.contains("AlreadyExists") {
+                if super::is_already_exists(&e) {
                     debug!(
                         "ReplicaSet {}/{} already exists, skipping creation",
                         namespace, rs_name
