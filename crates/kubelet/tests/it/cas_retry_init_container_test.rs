@@ -456,7 +456,7 @@ async fn test_9ff9e3a_init_container_statuses_refreshed_on_cas_retry() {
     let err = storage.update(&key, &new_pod).await.unwrap_err();
     println!("conflict on running status update: {}", err);
     assert!(
-        err.to_string().contains("Conflict") || err.to_string().contains("mismatch"),
+        matches!(err, rusternetes_common::Error::Conflict(_)),
         "expected Conflict, got: {}",
         err
     );

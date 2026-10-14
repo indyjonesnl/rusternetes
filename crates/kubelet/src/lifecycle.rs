@@ -35,6 +35,17 @@ pub fn phase_is_terminal(phase: Option<&Phase>) -> bool {
     matches!(phase, Some(Phase::Succeeded) | Some(Phase::Failed))
 }
 
+/// `apierrors.IsConflict(err)` for a pod-status write — the predicate behind
+/// client-go `retry.RetryOnConflict` (staging/src/k8s.io/client-go/util/retry/
+/// util.go:103-105, `OnError(backoff, errors.IsConflict, fn)`;
+/// apimachinery errors.go:548-557). Decided by the typed variant, never the
+/// message. Every storage backend maps a resourceVersion CAS failure to
+/// `Error::Conflict` (memory.rs, etcd.rs, rhino.rs, api_storage.rs
+/// `map_write_err`).
+pub fn is_status_write_conflict(e: &rusternetes_common::Error) -> bool {
+    matches!(e, rusternetes_common::Error::Conflict(_))
+}
+
 /// Decide whether a kubelet status write that would set the pod phase to
 /// `incoming` must be SKIPPED because the pod already reached a terminal
 /// phase in storage (`current`).
@@ -464,6 +475,32 @@ pub fn terminated_state_from_exit(
             container_id: None,
         }),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod conflict_predicate_tests {
+    use super::is_status_write_conflict;
+    use rusternetes_common::Error;
+
+    #[test]
+    fn typed_conflict_is_matched() {
+        assert!(is_status_write_conflict(&Error::Conflict("x".into())));
+    }
+
+    /// Only the Conflict variant is a 409 (`IsConflict`); a different variant
+    /// whose text mentions the old tokens must not trigger the CAS retry.
+    #[test]
+    fn other_variants_with_the_tokens_are_not_matched() {
+        assert!(!is_status_write_conflict(&Error::BadRequest(
+            "metadata.uid mismatch".into()
+        )));
+        assert!(!is_status_write_conflict(&Error::Storage(
+            "Conflict resolution backend unavailable".into()
+        )));
+        assert!(!is_status_write_conflict(&Error::NotFound(
+            "pod Conflict-test".into()
+        )));
     }
 }
 

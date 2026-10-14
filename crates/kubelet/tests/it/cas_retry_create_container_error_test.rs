@@ -304,7 +304,7 @@ async fn test_7881f80_create_container_error_persisted_after_cas_conflict() {
     let err = storage.update(&key, &new_pod).await.unwrap_err();
     println!("CAS conflict on CreateContainerError write: {}", err);
     assert!(
-        err.to_string().contains("Conflict") || err.to_string().contains("mismatch"),
+        matches!(err, rusternetes_common::Error::Conflict(_)),
         "expected Conflict, got: {}",
         err
     );

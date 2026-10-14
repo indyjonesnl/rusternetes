@@ -626,7 +626,7 @@ async fn test_3bf2ed2_retry_pod_running_status_on_conflict() {
     let err = storage.update(&key, &new_pod).await.unwrap_err();
     println!("conflict on first update: {}", err);
     assert!(
-        err.to_string().contains("Conflict") || err.to_string().contains("mismatch"),
+        matches!(err, rusternetes_common::Error::Conflict(_)),
         "expected Conflict error, got: {}",
         err
     );
