@@ -4338,6 +4338,8 @@ dependencies = [
  "rusternetes-streamproxy",
  "rusternetes-test-support",
  "rustls 0.23.40",
+ "rustls-native-certs 0.8.3",
+ "rustls-pemfile",
  "serde",
  "serde_ignored",
  "serde_json",
