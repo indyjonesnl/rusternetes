@@ -405,7 +405,7 @@ impl Feature {
     /// `staging/src/k8s.io/component-base/zpages/features/kube_features.go`).
     /// Only the cross-check in `version_history_agrees_with_v1_35_summaries`
     /// reads it: the specials and PreAlpha rejection resolve the spec at the
-    /// emulated version via [`Feature::spec_at_versions`].
+    /// emulated version via [`feature_spec_at_emulation_and_min_compat_version`].
     #[cfg(test)]
     const fn prerelease(self) -> PreRelease {
         match self {
@@ -903,11 +903,51 @@ fn feature_enabled(
     emulation: Version,
     min_compat: Version,
 ) -> bool {
-    let name = format!("{f:?}");
-    if let Some((_, v)) = enabled.iter().find(|(n, _)| *n == name) {
+    named_gate_enabled(&format!("{f:?}"), enabled, emulation, min_compat)
+}
+
+fn feature_by_name(name: &str) -> Option<Feature> {
+    ALL_FEATURES
+        .iter()
+        .copied()
+        .find(|f| format!("{f:?}") == name)
+}
+
+/// [`feature_enabled`] for any known gate by name, modelled by a [`Feature`]
+/// variant or not. Upstream panics on an unknown key (:868); callers only pass
+/// names from [`UPSTREAM_GATES`].
+fn named_gate_enabled(
+    name: &str,
+    enabled: &[(String, bool)],
+    emulation: Version,
+    min_compat: Version,
+) -> bool {
+    if let Some((_, v)) = enabled.iter().find(|(n, _)| n == name) {
         return *v;
     }
-    f.spec_at_versions(emulation, min_compat).default
+    let gate = upstream_gate(name).unwrap_or_else(|| panic!("feature {name} is not known"));
+    feature_spec_at_emulation_and_min_compat_version(gate.specs, emulation, Some(min_compat))
+        .default
+}
+
+/// Current state of any gate kube-apiserver registers, by name (`Enabled`,
+/// feature_gate.go:871, for gates no [`Feature`] variant models). `None` for a
+/// name that is not a known gate.
+pub fn gate_enabled(name: &str) -> Option<bool> {
+    upstream_gate(name)?;
+    let cfg = config();
+    let enabled = unsafe_set_from_map(
+        &cfg.enabled_raw,
+        cfg.emulation_version,
+        cfg.min_compatibility_version,
+    )
+    .ok()?;
+    Some(named_gate_enabled(
+        name,
+        &enabled,
+        cfg.emulation_version,
+        cfg.min_compatibility_version,
+    ))
 }
 
 /// Store the result of `unsafeSetFromMap`: explicit values win, every other
@@ -930,7 +970,7 @@ fn unsafe_set_from_map(
     min_compat: Version,
 ) -> Result<Vec<(String, bool)>, String> {
     let resolved = resolve_gates(raw, &known_gates(), emulation, min_compat)?;
-    check_dependencies(|f| feature_enabled(f, &resolved, emulation, min_compat))?;
+    check_dependencies(|n| named_gate_enabled(n, &resolved, emulation, min_compat))?;
     Ok(resolved)
 }
 
@@ -941,13 +981,24 @@ pub fn enabled_alpha_features() -> Vec<String> {
         let cfg = config();
         (cfg.emulation_version, cfg.min_compatibility_version)
     };
-    ALL_FEATURES
+    let cfg = config();
+    // The post-set view over every known gate, modelled or not.
+    let Ok(resolved) = unsafe_set_from_map(&cfg.enabled_raw, emulation, min_compat) else {
+        return Vec::new();
+    };
+    UPSTREAM_GATES
         .iter()
-        .filter(|f| {
-            f.spec_at_versions(emulation, min_compat).pre_release == PreRelease::Alpha
-                && STATES[f.idx()].load(Ordering::Relaxed)
+        .filter(|g| {
+            feature_spec_at_emulation_and_min_compat_version(g.specs, emulation, Some(min_compat))
+                .pre_release
+                == PreRelease::Alpha
+                && match feature_by_name(g.name) {
+                    // Modelled gates carry the live (possibly `set`) value.
+                    Some(f) => STATES[f.idx()].load(Ordering::Relaxed),
+                    None => named_gate_enabled(g.name, &resolved, emulation, min_compat),
+                }
         })
-        .map(|f| format!("{f:?}"))
+        .map(|g| g.name.to_string())
         .collect()
 }
 
@@ -1151,268 +1202,19 @@ const fn spec(
 }
 
 impl Feature {
-    /// The gate's `VersionedSpecs`, ascending by version: the spec list of
-    /// the gate in `defaultVersionedKubernetesFeatureGates`
-    /// (release-1.35: `pkg/features/kube_features.go:1123`,
+    /// The gate's `VersionedSpecs`, ascending by version, read from the
+    /// generated [`upstream_table`] (the spec list of the gate in
+    /// `defaultVersionedKubernetesFeatureGates`, release-1.35:
+    /// `pkg/features/kube_features.go:1123`,
     /// `staging/src/k8s.io/apiserver/pkg/features/kube_features.go:309`,
     /// `staging/src/k8s.io/component-base/zpages/features/kube_features.go:38`
-    /// `featureGates()`), transcribed verbatim: each row is
-    /// `{Version: 1.<minor>, Default, PreRelease, LockToDefault}`. No
-    /// upstream 1.35 spec sets `MinCompatibilityVersion`.
+    /// `featureGates()`). No upstream 1.35 spec sets `MinCompatibilityVersion`.
     fn specs(self) -> Vec<FeatureSpec> {
-        match self {
-            Feature::RelaxedDNSSearchValidation => vec![
-                spec(32, false, PreRelease::Alpha, false),
-                spec(33, true, PreRelease::Beta, false),
-                spec(34, true, PreRelease::Ga, true),
-            ],
-            Feature::PodTopologyLabelsAdmission => vec![
-                spec(33, false, PreRelease::Alpha, false),
-                spec(35, true, PreRelease::Beta, false),
-            ],
-            Feature::NodeDeclaredFeatures => vec![spec(35, false, PreRelease::Alpha, false)],
-            Feature::InPlacePodVerticalScaling => vec![
-                spec(27, false, PreRelease::Alpha, false),
-                spec(33, true, PreRelease::Beta, false),
-                spec(35, true, PreRelease::Ga, true),
-            ],
-            Feature::SELinuxMountReadWriteOncePod => vec![
-                spec(25, false, PreRelease::Alpha, false),
-                spec(27, false, PreRelease::Beta, false),
-                spec(28, true, PreRelease::Beta, false),
-            ],
-            Feature::SELinuxMount => vec![
-                spec(30, false, PreRelease::Alpha, false),
-                spec(33, false, PreRelease::Beta, false),
-            ],
-            Feature::SELinuxChangePolicy => vec![
-                spec(32, false, PreRelease::Alpha, false),
-                spec(33, true, PreRelease::Beta, false),
-            ],
-            Feature::MaxUnavailableStatefulSet => vec![
-                spec(24, false, PreRelease::Alpha, false),
-                spec(35, false, PreRelease::Beta, false),
-            ],
-            Feature::DRADeviceTaints => vec![spec(33, false, PreRelease::Alpha, false)],
-            Feature::DRAPartitionableDevices => vec![spec(33, false, PreRelease::Alpha, false)],
-            Feature::DRADeviceBindingConditions => vec![spec(34, false, PreRelease::Alpha, false)],
-            Feature::DRAConsumableCapacity => vec![spec(34, false, PreRelease::Alpha, false)],
-            Feature::DRAResourceClaimDeviceStatus => vec![
-                spec(32, false, PreRelease::Alpha, false),
-                spec(33, true, PreRelease::Beta, false),
-            ],
-            Feature::InPlacePodLevelResourcesVerticalScaling => {
-                vec![spec(35, false, PreRelease::Alpha, false)]
-            }
-            Feature::DRAExtendedResource => vec![spec(34, false, PreRelease::Alpha, false)],
-            Feature::ClusterTrustBundleProjection => vec![
-                spec(29, false, PreRelease::Alpha, false),
-                spec(33, false, PreRelease::Beta, false),
-            ],
-            Feature::PodCertificateRequest => vec![
-                spec(34, false, PreRelease::Alpha, false),
-                spec(35, false, PreRelease::Beta, false),
-            ],
-            Feature::ContainerStopSignals => vec![spec(33, false, PreRelease::Alpha, false)],
-            Feature::ResourceHealthStatus => vec![spec(31, false, PreRelease::Alpha, false)],
-            Feature::GenericWorkload => vec![spec(35, false, PreRelease::Alpha, false)],
-            Feature::TaintTolerationComparisonOperators => {
-                vec![spec(35, false, PreRelease::Alpha, false)]
-            }
-            Feature::PodLevelResources => vec![
-                spec(32, false, PreRelease::Alpha, false),
-                spec(34, true, PreRelease::Beta, false),
-            ],
-            Feature::MatchLabelKeysInPodTopologySpread => vec![
-                spec(25, false, PreRelease::Alpha, false),
-                spec(27, true, PreRelease::Beta, false),
-            ],
-            Feature::MatchLabelKeysInPodTopologySpreadSelectorMerge => {
-                vec![spec(34, true, PreRelease::Beta, false)]
-            }
-            Feature::PodDeletionCost => vec![
-                spec(21, false, PreRelease::Alpha, false),
-                spec(22, true, PreRelease::Beta, false),
-            ],
-            Feature::ClusterTrustBundle => vec![
-                spec(27, false, PreRelease::Alpha, false),
-                spec(33, false, PreRelease::Beta, false),
-            ],
-            Feature::DRADeviceTaintRules => vec![spec(35, false, PreRelease::Alpha, false)],
-            Feature::ComponentFlagz => vec![spec(32, false, PreRelease::Alpha, false)],
-            Feature::ComponentStatusz => vec![spec(32, false, PreRelease::Alpha, false)],
-            Feature::StorageVersionAPI => vec![spec(20, false, PreRelease::Alpha, false)],
-            Feature::APIServerIdentity => vec![
-                spec(20, false, PreRelease::Alpha, false),
-                spec(26, true, PreRelease::Beta, false),
-            ],
-            Feature::StorageVersionMigrator => vec![
-                spec(30, false, PreRelease::Alpha, false),
-                spec(35, false, PreRelease::Beta, false),
-            ],
-            Feature::KubeletCrashLoopBackOffMax => vec![
-                spec(32, false, PreRelease::Alpha, false),
-                spec(35, true, PreRelease::Beta, false),
-            ],
-            Feature::ReduceDefaultCrashLoopBackOffDecay => {
-                vec![spec(33, false, PreRelease::Alpha, false)]
-            }
-            Feature::WatchCacheInitializationPostStartHook => {
-                vec![spec(31, false, PreRelease::Beta, false)]
-            }
-            Feature::MutableCSINodeAllocatableCount => vec![
-                spec(33, false, PreRelease::Alpha, false),
-                spec(34, false, PreRelease::Beta, false),
-                spec(35, true, PreRelease::Beta, false),
-            ],
-            Feature::MutatingAdmissionPolicy => vec![
-                spec(32, false, PreRelease::Alpha, false),
-                spec(34, false, PreRelease::Beta, false),
-            ],
-            Feature::DeploymentReplicaSetTerminatingReplicas => vec![
-                spec(33, false, PreRelease::Alpha, false),
-                spec(35, true, PreRelease::Beta, false),
-            ],
-            Feature::StorageCapacityScoring => vec![spec(33, false, PreRelease::Alpha, false)],
-            Feature::CrossNamespaceVolumeDataSource => {
-                vec![spec(26, false, PreRelease::Alpha, false)]
-            }
-            Feature::RuntimeClassInImageCriApi => vec![spec(29, false, PreRelease::Alpha, false)],
-            Feature::DynamicResourceAllocation => vec![
-                spec(26, false, PreRelease::Alpha, false),
-                spec(32, false, PreRelease::Beta, false),
-                spec(34, true, PreRelease::Ga, false),
-                spec(35, true, PreRelease::Ga, true),
-            ],
-            Feature::AuthorizeWithSelectors => vec![
-                spec(31, false, PreRelease::Alpha, false),
-                spec(32, true, PreRelease::Beta, false),
-                spec(34, true, PreRelease::Ga, true),
-            ],
-            Feature::AuthorizeNodeWithSelectors => vec![
-                spec(31, false, PreRelease::Alpha, false),
-                spec(32, true, PreRelease::Beta, false),
-                spec(34, true, PreRelease::Ga, true),
-            ],
-            Feature::MultiCIDRServiceAllocator => vec![
-                spec(27, false, PreRelease::Alpha, false),
-                spec(31, false, PreRelease::Beta, false),
-                spec(33, true, PreRelease::Ga, false),
-                spec(34, true, PreRelease::Ga, true),
-            ],
-            Feature::DisableAllocatorDualWrite => vec![
-                spec(31, false, PreRelease::Alpha, false),
-                spec(33, false, PreRelease::Beta, false),
-                spec(34, true, PreRelease::Ga, false),
-                spec(35, true, PreRelease::Ga, true),
-            ],
-            Feature::GangScheduling => vec![spec(35, false, PreRelease::Alpha, false)],
-            Feature::GracefulNodeShutdown => vec![
-                spec(20, false, PreRelease::Alpha, false),
-                spec(21, true, PreRelease::Beta, false),
-            ],
-            Feature::GracefulNodeShutdownBasedOnPodPriority => vec![
-                spec(23, false, PreRelease::Alpha, false),
-                spec(24, true, PreRelease::Beta, false),
-            ],
-            Feature::InPlacePodVerticalScalingAllocatedStatus => vec![
-                spec(32, false, PreRelease::Alpha, false),
-                spec(33, false, PreRelease::Deprecated, false),
-            ],
-            Feature::InPlacePodVerticalScalingExclusiveCPUs => {
-                vec![spec(32, false, PreRelease::Alpha, false)]
-            }
-            Feature::InPlacePodVerticalScalingExclusiveMemory => {
-                vec![spec(34, false, PreRelease::Alpha, false)]
-            }
-            Feature::MemoryManager => vec![
-                spec(21, false, PreRelease::Alpha, false),
-                spec(22, true, PreRelease::Beta, false),
-                spec(32, true, PreRelease::Ga, true),
-            ],
-            Feature::PodLifecycleSleepAction => vec![
-                spec(29, false, PreRelease::Alpha, false),
-                spec(30, true, PreRelease::Beta, false),
-                spec(34, true, PreRelease::Ga, true),
-            ],
-            Feature::PodLifecycleSleepActionAllowZero => vec![
-                spec(32, false, PreRelease::Alpha, false),
-                spec(33, true, PreRelease::Beta, false),
-                spec(34, true, PreRelease::Ga, true),
-            ],
-            Feature::ProcMountType => vec![
-                spec(12, false, PreRelease::Alpha, false),
-                spec(31, false, PreRelease::Beta, false),
-                spec(33, true, PreRelease::Beta, false),
-            ],
-            Feature::UserNamespacesSupport => vec![
-                spec(25, false, PreRelease::Alpha, false),
-                spec(30, false, PreRelease::Beta, false),
-                spec(33, true, PreRelease::Beta, false),
-            ],
-            Feature::DRAAdminAccess => vec![
-                spec(32, false, PreRelease::Alpha, false),
-                spec(34, true, PreRelease::Beta, false),
-            ],
-            Feature::DRAPrioritizedList => vec![
-                spec(33, false, PreRelease::Alpha, false),
-                spec(34, true, PreRelease::Beta, false),
-            ],
-            Feature::DRASchedulerFilterTimeout => vec![spec(34, true, PreRelease::Beta, false)],
-            Feature::ContainerRestartRules => vec![
-                spec(34, false, PreRelease::Alpha, false),
-                spec(35, true, PreRelease::Beta, false),
-            ],
-            Feature::RestartAllContainersOnContainerExits => {
-                vec![spec(35, false, PreRelease::Alpha, false)]
-            }
-            Feature::ServiceAccountTokenNodeBinding => vec![
-                spec(29, false, PreRelease::Alpha, false),
-                spec(31, true, PreRelease::Beta, false),
-                spec(33, true, PreRelease::Ga, true),
-            ],
-            Feature::ServiceAccountTokenNodeBindingValidation => vec![
-                spec(29, false, PreRelease::Alpha, false),
-                spec(30, true, PreRelease::Beta, false),
-                spec(32, true, PreRelease::Ga, true),
-            ],
-            Feature::UserNamespacesHostNetworkSupport => {
-                vec![spec(35, false, PreRelease::Alpha, false)]
-            }
-            Feature::WindowsCPUAndMemoryAffinity => vec![spec(32, false, PreRelease::Alpha, false)],
-            Feature::WindowsGracefulNodeShutdown => vec![
-                spec(32, false, PreRelease::Alpha, false),
-                spec(34, true, PreRelease::Beta, false),
-            ],
-            Feature::UnknownVersionInteroperabilityProxy => {
-                vec![spec(28, false, PreRelease::Alpha, false)]
-            }
-            Feature::DeclarativeValidation => vec![spec(33, true, PreRelease::Beta, false)],
-            Feature::DeclarativeValidationTakeover => {
-                vec![spec(33, false, PreRelease::Beta, false)]
-            }
-            Feature::StructuredAuthenticationConfiguration => vec![
-                spec(29, false, PreRelease::Alpha, false),
-                spec(30, true, PreRelease::Beta, false),
-                spec(34, true, PreRelease::Ga, true),
-            ],
-            Feature::StructuredAuthenticationConfigurationEgressSelector => {
-                vec![spec(34, true, PreRelease::Beta, false)]
-            }
-            Feature::StructuredAuthenticationConfigurationJWKSMetrics => {
-                vec![spec(35, true, PreRelease::Beta, false)]
-            }
-            Feature::ImageVolume => vec![
-                spec(31, false, PreRelease::Alpha, false),
-                spec(33, false, PreRelease::Beta, false),
-                spec(35, true, PreRelease::Beta, false),
-            ],
-        }
-    }
-
-    /// `featureSpecAtEmulationAndMinCompatVersion(known[f], emulation, minCompat)`.
-    fn spec_at_versions(self, emulation: Version, min_compat: Version) -> FeatureSpec {
-        feature_spec_at_emulation_and_min_compat_version(&self.specs(), emulation, Some(min_compat))
+        let name = format!("{self:?}");
+        upstream_gate(&name)
+            .unwrap_or_else(|| panic!("{name} missing from upstream_table.rs"))
+            .specs
+            .to_vec()
     }
 
     /// `featureSpecAtEmulationAndMinCompatVersion(known[f], emulation, nil)`.
@@ -1421,12 +1223,29 @@ impl Feature {
     }
 }
 
+/// One gate of [`upstream_table::UPSTREAM_GATES`]: `known[name]` plus the
+/// gate's entry in `defaultKubernetesFeatureGateDependencies`.
+pub(crate) struct UpstreamGate {
+    pub(crate) name: &'static str,
+    pub(crate) specs: &'static [FeatureSpec],
+    pub(crate) deps: &'static [&'static str],
+}
+
+mod upstream_table;
+use upstream_table::UPSTREAM_GATES;
+
+fn upstream_gate(name: &str) -> Option<&'static UpstreamGate> {
+    UPSTREAM_GATES.iter().find(|g| g.name == name)
+}
+
+/// `known` (feature_gate.go:229): every gate kube-apiserver registers, not
+/// only the ones a [`Feature`] variant models.
 fn known_gates() -> Vec<KnownGate> {
-    ALL_FEATURES
+    UPSTREAM_GATES
         .iter()
-        .map(|f| KnownGate {
-            name: format!("{f:?}"),
-            specs: f.specs(),
+        .map(|g| KnownGate {
+            name: g.name.to_string(),
+            specs: g.specs.to_vec(),
         })
         .collect()
 }
@@ -1483,8 +1302,14 @@ fn set_from_map(m: &[(String, bool)]) -> Result<(), String> {
     let resolved = unsafe_set_from_map(&cfg.enabled_raw, emulation, min_compat)?;
     // feature_gate.go:407-411
     for (name, v) in &cfg.enabled_raw {
-        if let Some(&f) = ALL_FEATURES.iter().find(|f| format!("{f:?}") == *name) {
-            match f.spec_at_versions(emulation, min_compat).pre_release {
+        if let Some(g) = upstream_gate(name) {
+            match feature_spec_at_emulation_and_min_compat_version(
+                g.specs,
+                emulation,
+                Some(min_compat),
+            )
+            .pre_release
+            {
                 PreRelease::Deprecated => tracing::warn!(
                     "Setting deprecated feature gate {name}={v}. It will be removed in a future release."
                 ),
@@ -1499,160 +1324,28 @@ fn set_from_map(m: &[(String, bool)]) -> Result<(), String> {
     Ok(())
 }
 
-/// `defaultKubernetesFeatureGateDependencies` (pkg/features/kube_features.go:2166-2420)
-/// restricted to non-empty entries whose gates are all modelled in
-/// [`Feature`] (#3222); the remainder of the map has no modelled sources (#3231). `AuthorizeNodeWithSelectors: {genericfeatures.AuthorizeWithSelectors}`
-/// comes from the same map.
-const DEPENDENCIES: &[(Feature, &[Feature])] = &[
-    (
-        Feature::AuthorizeNodeWithSelectors,
-        &[Feature::AuthorizeWithSelectors],
-    ),
-    (
-        Feature::ClusterTrustBundleProjection,
-        &[Feature::ClusterTrustBundle],
-    ),
-    (
-        Feature::DRAAdminAccess,
-        &[Feature::DynamicResourceAllocation],
-    ),
-    (
-        Feature::DRAConsumableCapacity,
-        &[Feature::DynamicResourceAllocation],
-    ),
-    (
-        Feature::DRADeviceBindingConditions,
-        &[
-            Feature::DynamicResourceAllocation,
-            Feature::DRAResourceClaimDeviceStatus,
-        ],
-    ),
-    (Feature::DRADeviceTaintRules, &[Feature::DRADeviceTaints]),
-    (
-        Feature::DRADeviceTaints,
-        &[Feature::DynamicResourceAllocation],
-    ),
-    (
-        Feature::DRAExtendedResource,
-        &[Feature::DynamicResourceAllocation],
-    ),
-    (
-        Feature::DRAPartitionableDevices,
-        &[Feature::DynamicResourceAllocation],
-    ),
-    (
-        Feature::DRAPrioritizedList,
-        &[Feature::DynamicResourceAllocation],
-    ),
-    (
-        Feature::DRASchedulerFilterTimeout,
-        &[Feature::DynamicResourceAllocation],
-    ),
-    (
-        Feature::DisableAllocatorDualWrite,
-        &[Feature::MultiCIDRServiceAllocator],
-    ),
-    (Feature::GangScheduling, &[Feature::GenericWorkload]),
-    (
-        Feature::GracefulNodeShutdownBasedOnPodPriority,
-        &[Feature::GracefulNodeShutdown],
-    ),
-    (
-        Feature::InPlacePodLevelResourcesVerticalScaling,
-        &[
-            Feature::InPlacePodVerticalScaling,
-            Feature::PodLevelResources,
-            Feature::NodeDeclaredFeatures,
-        ],
-    ),
-    (
-        Feature::InPlacePodVerticalScalingAllocatedStatus,
-        &[Feature::InPlacePodVerticalScaling],
-    ),
-    (
-        Feature::InPlacePodVerticalScalingExclusiveCPUs,
-        &[Feature::InPlacePodVerticalScaling],
-    ),
-    (
-        Feature::InPlacePodVerticalScalingExclusiveMemory,
-        &[Feature::InPlacePodVerticalScaling, Feature::MemoryManager],
-    ),
-    (
-        Feature::MatchLabelKeysInPodTopologySpreadSelectorMerge,
-        &[Feature::MatchLabelKeysInPodTopologySpread],
-    ),
-    (
-        Feature::PodCertificateRequest,
-        &[Feature::AuthorizeNodeWithSelectors],
-    ),
-    (
-        Feature::PodLifecycleSleepActionAllowZero,
-        &[Feature::PodLifecycleSleepAction],
-    ),
-    (Feature::ProcMountType, &[Feature::UserNamespacesSupport]),
-    (
-        Feature::ResourceHealthStatus,
-        &[Feature::DynamicResourceAllocation],
-    ),
-    (Feature::StorageVersionAPI, &[Feature::APIServerIdentity]),
-    (
-        Feature::RestartAllContainersOnContainerExits,
-        &[
-            Feature::ContainerRestartRules,
-            Feature::NodeDeclaredFeatures,
-        ],
-    ),
-    (
-        Feature::DeclarativeValidationTakeover,
-        &[Feature::DeclarativeValidation],
-    ),
-    (
-        Feature::ServiceAccountTokenNodeBinding,
-        &[Feature::ServiceAccountTokenNodeBindingValidation],
-    ),
-    (
-        Feature::StructuredAuthenticationConfigurationEgressSelector,
-        &[Feature::StructuredAuthenticationConfiguration],
-    ),
-    (
-        Feature::StructuredAuthenticationConfigurationJWKSMetrics,
-        &[Feature::StructuredAuthenticationConfiguration],
-    ),
-    (
-        Feature::UnknownVersionInteroperabilityProxy,
-        &[Feature::APIServerIdentity],
-    ),
-    (
-        Feature::UserNamespacesHostNetworkSupport,
-        &[Feature::UserNamespacesSupport],
-    ),
-    (
-        Feature::WindowsCPUAndMemoryAffinity,
-        &[Feature::MemoryManager],
-    ),
-    (
-        Feature::WindowsGracefulNodeShutdown,
-        &[Feature::GracefulNodeShutdown],
-    ),
-];
-
 /// Dependency validation of `unsafeSetFromMap` (feature_gate.go:418-436): every
-/// enabled gate must have all its dependencies enabled. Errors aggregate like
-/// `utilerrors.NewAggregate`. `is_enabled` yields the post-set state.
-fn check_dependencies(is_enabled: impl Fn(Feature) -> bool) -> Result<(), String> {
+/// enabled gate must have all its dependencies enabled. The edges are
+/// `defaultKubernetesFeatureGateDependencies` (pkg/features/kube_features.go:2166),
+/// carried per gate in [`upstream_table`] (`Dependencies()`, sorted and
+/// compacted by `AddDependencies` feature_gate.go:604-621). Errors aggregate
+/// like `utilerrors.NewAggregate`. `is_enabled` yields the post-set state.
+fn check_dependencies(is_enabled: impl Fn(&str) -> bool) -> Result<(), String> {
     let mut errs = Vec::new();
-    for (feature, deps) in DEPENDENCIES {
-        if !is_enabled(*feature) {
+    for gate in UPSTREAM_GATES {
+        if gate.deps.is_empty() || !is_enabled(gate.name) {
             continue;
         }
-        let disabled: Vec<String> = deps
+        let disabled: Vec<&str> = gate
+            .deps
             .iter()
-            .filter(|d| !is_enabled(**d))
-            .map(|d| format!("{d:?}"))
+            .copied()
+            .filter(|d| !is_enabled(d))
             .collect();
         if !disabled.is_empty() {
             errs.push(format!(
-                "{feature:?} is enabled, but depends on features that are disabled: [{}]",
+                "{} is enabled, but depends on features that are disabled: [{}]",
+                gate.name,
                 disabled.join(" ")
             ));
         }
@@ -2393,6 +2086,102 @@ mod tests {
         assert!(validate().is_empty());
         set_from_str("PodTopologyLabelsAdmission=false").unwrap();
         assert!(validate().is_empty());
+        reset_to_defaults();
+    }
+
+    // #3321: gates registered upstream but consumed by no rusternetes code
+    // are still known to `--feature-gates` (feature_gate.go:385-389 only
+    // rejects names absent from `known`).
+    #[test]
+    #[serial]
+    fn unconsumed_upstream_gates_are_recognised() {
+        reset_to_defaults();
+        // pkg/features/kube_features.go SidecarContainers: 1.33 GA + LockToDefault(true).
+        set_from_str("SidecarContainers=true").unwrap();
+        // staging/src/k8s.io/apiextensions-apiserver/pkg/features/kube_features.go
+        set_from_str("CRDValidationRatcheting=true").unwrap();
+        // staging/src/k8s.io/component-base/logs/api/v1/kube_features.go
+        set_from_str("ContextualLogging=false").unwrap();
+        reset_to_defaults();
+    }
+
+    // Structural guard for the generated table (scripts/gen-feature-gate-table.sh
+    // --check is the drift guard against ../kubernetes itself).
+    #[test]
+    fn upstream_table_is_well_formed() {
+        // 218 gates in GetAllVersioned() minus the AllAlpha/AllBeta specials.
+        assert_eq!(UPSTREAM_GATES.len(), 216);
+        assert!(
+            UPSTREAM_GATES.windows(2).all(|w| w[0].name < w[1].name),
+            "sorted and unique"
+        );
+        for g in UPSTREAM_GATES {
+            assert!(!g.specs.is_empty(), "{}", g.name);
+            assert!(
+                g.specs.windows(2).all(|w| w[0].version < w[1].version),
+                "{} specs ascend",
+                g.name
+            );
+            for d in g.deps {
+                assert!(upstream_gate(d).is_some(), "{} -> unknown {d}", g.name);
+            }
+        }
+        for &f in ALL_FEATURES {
+            assert!(upstream_gate(&format!("{f:?}")).is_some(), "{f:?}");
+        }
+    }
+
+    // `Enabled` for a gate no `Feature` variant models, across emulation versions
+    // (kube_features.go WatchList: 1.32 Beta on, 1.33 Beta off, 1.34 Beta on).
+    #[test]
+    #[serial]
+    fn unmodelled_gate_state_follows_emulation_version() {
+        reset_to_defaults();
+        assert_eq!(gate_enabled("WatchList"), Some(true));
+        assert_eq!(gate_enabled("fooBarBaz"), None);
+        set_emulation_version(Version::major_minor(1, 33)).unwrap();
+        assert_eq!(gate_enabled("WatchList"), Some(false));
+        set_from_str("WatchList=true").unwrap();
+        assert_eq!(gate_enabled("WatchList"), Some(true));
+        reset_to_defaults();
+    }
+
+    // AllAlpha / AllBeta reach unmodelled gates too (feature_gate.go:270-296).
+    #[test]
+    #[serial]
+    fn all_alpha_toggles_unmodelled_alpha_gates() {
+        reset_to_defaults();
+        let alpha = UPSTREAM_GATES
+            .iter()
+            .find(|g| {
+                feature_by_name(g.name).is_none()
+                    && g.deps.is_empty()
+                    && feature_spec_at_emulation_and_min_compat_version(
+                        g.specs,
+                        EMULATION_VERSION,
+                        Some(MIN_COMPATIBILITY_VERSION),
+                    )
+                    .pre_release
+                        == PreRelease::Alpha
+            })
+            .expect("an unmodelled alpha gate")
+            .name;
+        assert_eq!(gate_enabled(alpha), Some(false));
+        assert!(!enabled_alpha_features().iter().any(|n| n == alpha));
+        set_from_str("AllAlpha=true").unwrap();
+        assert_eq!(gate_enabled(alpha), Some(true));
+        assert!(enabled_alpha_features().iter().any(|n| n == alpha));
+        reset_to_defaults();
+    }
+
+    #[test]
+    #[serial]
+    fn unconsumed_upstream_gates_honour_lock_to_default() {
+        reset_to_defaults();
+        assert_eq!(
+            set_from_str("SidecarContainers=false").unwrap_err(),
+            "cannot set feature gate SidecarContainers to false, feature is locked to true"
+        );
         reset_to_defaults();
     }
 }
