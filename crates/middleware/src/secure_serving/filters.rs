@@ -31,7 +31,7 @@ use super::authn::{
 use crate::PeerCertificates;
 use axum::body::Body;
 use axum::extract::Request;
-use axum::http::{HeaderMap, Method, StatusCode};
+use axum::http::{Method, StatusCode};
 use axum::middleware::{from_fn, Next};
 use axum::response::Response;
 use axum::Router;
@@ -333,6 +333,7 @@ mod tests {
     };
     use crate::PeerCertificates;
     use async_trait::async_trait;
+    use axum::http::HeaderMap;
     use axum::routing::get;
     use http_body_util::BodyExt;
     use rusternetes_common::authz::Opinion;
