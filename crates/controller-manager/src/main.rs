@@ -542,7 +542,11 @@ fn component_secure_serving(
 ) -> rusternetes_middleware::secure_serving::ComponentSecureServing {
     let mut c =
         rusternetes_middleware::secure_serving::ComponentSecureServing::for_controller_manager();
-    c.apply_flags(&args.secure_serving, &args.authentication, &args.authorization);
+    c.apply_flags(
+        &args.secure_serving,
+        &args.authentication,
+        &args.authorization,
+    );
     c
 }
 
