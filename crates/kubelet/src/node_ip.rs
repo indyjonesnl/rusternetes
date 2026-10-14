@@ -156,7 +156,7 @@ pub fn node_addresses(
     validate: &dyn Fn(IpAddr) -> Result<(), String>,
     hostname: &str,
     lookup: &dyn Fn(&str) -> Vec<IpAddr>,
-    resolve: &dyn Fn(Option<IpAddr>) -> Option<IpAddr>,
+    resolve: &dyn Fn(Option<IpAddr>) -> Result<IpAddr, String>,
 ) -> Result<Vec<(String, String)>, String> {
     let node_ip = node_ips.first().copied();
     let prefer_ipv4 = node_ip.is_none_or(|ip| ip.is_ipv4());
@@ -183,13 +183,17 @@ pub fn node_addresses(
     // 3) DNS lookup of the node name (preferred family first)
     // 4) default-route address
     let mut ip_addr: Option<IpAddr> = None;
+    // Go's shared `err` variable: set by validateNodeIPFunc in the lookup
+    // loop, overwritten by resolveAddressFunc (setters.go:164-179).
+    let mut err: Option<String> = None;
     if node_ip_specified {
         ip_addr = node_ip;
     } else if let Some(a) = parse_ip_sloppy(hostname) {
         ip_addr = Some(a);
     } else {
         for a in lookup(hostname) {
-            if validate(a).is_ok() {
+            err = validate(a).err();
+            if err.is_none() {
                 if a.is_ipv4() == prefer_ipv4 {
                     ip_addr = Some(a);
                     break;
@@ -199,10 +203,21 @@ pub fn node_addresses(
             }
         }
         if ip_addr.is_none() {
-            ip_addr = resolve(node_ip);
+            match resolve(node_ip) {
+                Ok(a) => {
+                    ip_addr = Some(a);
+                    err = None;
+                }
+                Err(e) => err = Some(e),
+            }
         }
     }
-    let ip_addr = ip_addr.ok_or_else(|| format!("can't get ip address of node {hostname}"))?;
+    let ip_addr = ip_addr.ok_or_else(|| {
+        format!(
+            "can't get ip address of node {hostname}. error: {}",
+            err.as_deref().unwrap_or("<nil>")
+        )
+    })?;
     Ok(vec![internal(ip_addr), host])
 }
 
@@ -214,7 +229,7 @@ pub fn effective_internal_ips(
     validate: &dyn Fn(IpAddr) -> Result<(), String>,
     hostname: &str,
     lookup: &dyn Fn(&str) -> Vec<IpAddr>,
-    resolve: &dyn Fn(Option<IpAddr>) -> Option<IpAddr>,
+    resolve: &dyn Fn(Option<IpAddr>) -> Result<IpAddr, String>,
     detect: &dyn Fn() -> String,
 ) -> Vec<String> {
     // Upstream runs the setter whether or not --node-ip is set
@@ -350,7 +365,10 @@ mod tests {
     // setters_test.go TestNodeAddress: single --node-ip
     #[test]
     fn address_single_node_ip() {
-        let r = node_addresses(&[ip("fd00::5")], &validate_node_ip, "h", &none, &|_| None).unwrap();
+        let r = node_addresses(&[ip("fd00::5")], &validate_node_ip, "h", &none, &|_| {
+            Err("no default route".to_string())
+        })
+        .unwrap();
         assert_eq!(
             r,
             vec![
@@ -368,7 +386,7 @@ mod tests {
             &validate_node_ip,
             "h",
             &none,
-            &|_| None,
+            &|_| Err("no default route".to_string()),
         )
         .unwrap();
         assert_eq!(
@@ -385,14 +403,17 @@ mod tests {
     #[test]
     fn address_invalid_node_ip_errors() {
         assert!(
-            node_addresses(&[ip("127.0.0.1")], &validate_node_ip, "h", &none, &|_| None).is_err()
+            node_addresses(&[ip("127.0.0.1")], &validate_node_ip, "h", &none, &|_| Err(
+                "no default route".to_string()
+            ))
+            .is_err()
         );
         assert!(node_addresses(
             &[ip("10.0.0.2"), ip("ff02::1")],
             &validate_node_ip,
             "h",
             &none,
-            &|_| None
+            &|_| Err("no default route".to_string())
         )
         .is_err());
     }
@@ -401,7 +422,10 @@ mod tests {
     #[test]
     fn address_no_node_ip_prefers_ipv4_lookup() {
         let lk = |_: &str| vec![ip("fd00::9"), ip("10.0.0.9")];
-        let r = node_addresses(&[], &validate_node_ip, "h", &lk, &|_| None).unwrap();
+        let r = node_addresses(&[], &validate_node_ip, "h", &lk, &|_| {
+            Err("no default route".to_string())
+        })
+        .unwrap();
         assert_eq!(r[0], ("InternalIP".into(), "10.0.0.9".into()));
     }
 
@@ -409,10 +433,13 @@ mod tests {
     #[test]
     fn address_unspecified_ipv6_prefers_ipv6_and_resolves() {
         let lk = |_: &str| vec![ip("10.0.0.9"), ip("fd00::9")];
-        let r = node_addresses(&[ip("::")], &validate_node_ip, "h", &lk, &|_| None).unwrap();
+        let r = node_addresses(&[ip("::")], &validate_node_ip, "h", &lk, &|_| {
+            Err("no default route".to_string())
+        })
+        .unwrap();
         assert_eq!(r[0], ("InternalIP".into(), "fd00::9".into()));
         let r = node_addresses(&[ip("0.0.0.0")], &validate_node_ip, "h", &none, &|_| {
-            Some(ip("10.9.9.9"))
+            Ok(ip("10.9.9.9"))
         })
         .unwrap();
         assert_eq!(r[0], ("InternalIP".into(), "10.9.9.9".into()));
@@ -421,21 +448,30 @@ mod tests {
     // setters.go:160: a hostname that is itself an IP is used
     #[test]
     fn address_hostname_ip_literal_used() {
-        let r = node_addresses(&[], &validate_node_ip, "10.2.2.2", &none, &|_| None).unwrap();
+        let r = node_addresses(&[], &validate_node_ip, "10.2.2.2", &none, &|_| {
+            Err("no default route".to_string())
+        })
+        .unwrap();
         assert_eq!(r[0], ("InternalIP".into(), "10.2.2.2".into()));
     }
 
     // setters.go:181: nothing found => error
     #[test]
     fn address_nothing_found_errors() {
-        assert!(node_addresses(&[], &validate_node_ip, "h", &none, &|_| None).is_err());
+        assert!(node_addresses(&[], &validate_node_ip, "h", &none, &|_| Err(
+            "no default route".to_string()
+        ))
+        .is_err());
     }
 
     // setters.go:183 `can't get ip address of node %s. error: %v`
     #[test]
     fn address_nothing_found_error_text_carries_resolver_error() {
-        let e = node_addresses(&[], &validate_node_ip, "h", &none, &|_| None).unwrap_err();
-        assert!(e.starts_with("can't get ip address of node h. error: "), "{e}");
+        let e = node_addresses(&[], &validate_node_ip, "h", &none, &|_| {
+            Err("no default route".to_string())
+        })
+        .unwrap_err();
+        assert_eq!(e, "can't get ip address of node h. error: no default route");
     }
 
     // setters.go:163-179 runs with NO --node-ip too: an IPv6-only host (DNS
@@ -443,9 +479,14 @@ mod tests {
     #[test]
     fn effective_ips_without_node_ip_uses_ipv6_only_lookup() {
         let lk = |_: &str| vec![ip("fd00::9")];
-        let got = effective_internal_ips(&[], &validate_node_ip, "h", &lk, &|_| None, &|| {
-            "127.0.0.1".to_string()
-        });
+        let got = effective_internal_ips(
+            &[],
+            &validate_node_ip,
+            "h",
+            &lk,
+            &|_| Err("no default route".to_string()),
+            &|| "127.0.0.1".to_string(),
+        );
         assert_eq!(got, vec!["fd00::9".to_string()]);
     }
 
@@ -454,11 +495,25 @@ mod tests {
         let lk = |_: &str| vec![ip("fd00::9"), ip("10.0.0.9")];
         let d = || "127.0.0.1".to_string();
         assert_eq!(
-            effective_internal_ips(&[], &validate_node_ip, "h", &lk, &|_| None, &d),
+            effective_internal_ips(
+                &[],
+                &validate_node_ip,
+                "h",
+                &lk,
+                &|_| Err("no default route".to_string()),
+                &d
+            ),
             vec!["10.0.0.9".to_string()]
         );
         assert_eq!(
-            effective_internal_ips(&[], &validate_node_ip, "h", &none, &|_| None, &d),
+            effective_internal_ips(
+                &[],
+                &validate_node_ip,
+                "h",
+                &none,
+                &|_| Err("no default route".to_string()),
+                &d
+            ),
             vec!["127.0.0.1".to_string()]
         );
     }
