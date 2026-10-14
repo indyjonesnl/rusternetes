@@ -133,6 +133,11 @@ struct Args {
     #[command(flatten)]
     authorization: rusternetes_api_server::authorizer::AuthorizationArgs,
 
+    /// `--enable-admission-plugins` / `--disable-admission-plugins` /
+    /// `--admission-control` (#3415).
+    #[command(flatten)]
+    admission: admission::plugins::AdmissionArgs,
+
     /// Enable TLS/HTTPS
     #[arg(long)]
     tls: bool,
@@ -307,6 +312,10 @@ async fn main() -> Result<()> {
         .map_err(|e| e.exit())
         .unwrap();
     args.authorization.mark_legacy_flags_set(&matches);
+    // `s.Admission.Validate()` + `ApplyTo` (#3415): a bad plugin flag stops startup.
+    args.admission
+        .validate_and_install()
+        .map_err(|e| anyhow::anyhow!("invalid admission flags: {e}"))?;
     request_timeout::set_request_timeout(args.request_timeout);
     apply_feature_gates(&args)?;
     // `validateClusterIPFlags`: refuse to start on a bad range.
