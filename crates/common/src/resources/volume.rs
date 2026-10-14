@@ -996,6 +996,27 @@ mod tests {
         let json = serde_json::to_string(&pvc).unwrap();
         let _deserialized: PersistentVolumeClaim = serde_json::from_str(&json).unwrap();
     }
+
+    /// `core/v1 PersistentVolumeSource.fc` (`types.go`, `FCVolumeSource`): a
+    /// PV carrying a FibreChannel source must keep it (#3288); the kubelet's
+    /// `kubernetes.io/fc` plugin reads `spec.fc`.
+    #[test]
+    fn pv_spec_keeps_fc_source() {
+        let fc = serde_json::json!({
+            "targetWWNs": ["500a0981891b8dc5"],
+            "lun": 0,
+            "fsType": "ext4",
+            "readOnly": true,
+            "wwids": ["3600508b400105e210000900000490000"]
+        });
+        let pv: PersistentVolume = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "pv-fc"},
+            "spec": {"fc": fc}
+        }))
+        .unwrap();
+        let out = serde_json::to_value(&pv).unwrap();
+        assert_eq!(out["spec"]["fc"], fc);
+    }
 }
 
 /// `ReferenceGrant` (`gateway.networking.k8s.io/v1beta1`,
