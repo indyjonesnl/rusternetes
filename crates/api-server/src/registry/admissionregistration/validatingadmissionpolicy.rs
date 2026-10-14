@@ -311,3 +311,81 @@ mod invalid_status_tests {
         assert_eq!(st.reason.as_deref(), Some("Invalid"));
     }
 }
+
+#[cfg(test)]
+mod match_condition_compile_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn policy(match_conditions: serde_json::Value) -> ValidatingAdmissionPolicy {
+        serde_json::from_value(json!({"apiVersion": "admissionregistration.k8s.io/v1", "kind": "ValidatingAdmissionPolicy", "metadata": {"name": "foo"}, "spec": {
+            "matchConstraints": {"matchPolicy": "Exact", "objectSelector": {}, "namespaceSelector": {}, "resourceRules": [{"operations": ["CREATE"], "apiGroups": ["a"], "apiVersions": ["a"], "resources": ["a"]}]},
+            "validations": [{"expression": "true"}],
+            "matchConditions": match_conditions,
+            "failurePolicy": "Fail"}})).unwrap()
+    }
+
+    fn messages(errs: &ErrorList) -> String {
+        errs.iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// `validateMatchConditionsExpression` (validation.go:1100-1112) compiles
+    /// with `MatchCondition.ReturnTypes = [bool]` (matcher.go:49-51), and
+    /// `CompileCELExpression` rejects another output type (compile.go:189-203)
+    /// (#3265).
+    #[test]
+    fn create_rejects_a_non_bool_match_condition() {
+        let p = policy(json!([{"name": "c", "expression": "6"}]));
+        let errs = RestCreateStrategy::validate(&Strategy, &RequestContext::new(None), &p);
+        assert!(
+            messages(&errs).contains(
+                r#"spec.matchConditions[0].expression: Invalid value: "6": must evaluate to bool but got int"#
+            ),
+            "{}",
+            messages(&errs)
+        );
+    }
+
+    /// `validateMatchCondition` (validation.go:984-997).
+    #[test]
+    fn create_rejects_a_match_condition_that_does_not_compile() {
+        let p = policy(json!([{"name": "c", "expression": "///"}]));
+        let errs = RestCreateStrategy::validate(&Strategy, &RequestContext::new(None), &p);
+        assert!(
+            messages(&errs).contains(
+                r#"spec.matchConditions[0].expression: Invalid value: "///": compilation failed"#
+            ),
+            "{}",
+            messages(&errs)
+        );
+    }
+
+    #[test]
+    fn create_accepts_a_bool_match_condition() {
+        let p = policy(json!([{"name": "c", "expression": "object.metadata.name == 'x'"}]));
+        let errs = RestCreateStrategy::validate(&Strategy, &RequestContext::new(None), &p);
+        assert!(errs.is_empty(), "{}", messages(&errs));
+    }
+
+    /// `ignoreValidatingAdmissionPolicyMatchConditions` (validation.go:619-628):
+    /// unchanged `matchConditions` / `paramKind` are not compiled again; a
+    /// change is.
+    #[test]
+    fn update_skips_unchanged_match_conditions_only() {
+        let old = policy(json!([{"name": "c", "expression": "6"}]));
+        let unchanged = old.clone();
+        let ctx = RequestContext::new(None);
+        let errs = RestUpdateStrategy::validate_update(&Strategy, &ctx, &unchanged, &old);
+        assert!(errs.is_empty(), "{}", messages(&errs));
+        let changed = policy(json!([{"name": "c", "expression": "7"}]));
+        let errs = RestUpdateStrategy::validate_update(&Strategy, &ctx, &changed, &old);
+        assert!(
+            messages(&errs).contains("spec.matchConditions[0].expression"),
+            "{}",
+            messages(&errs)
+        );
+    }
+}
