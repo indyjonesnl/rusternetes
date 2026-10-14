@@ -1577,8 +1577,11 @@ impl Kubelet {
                     .map(|a| a.map(|s| s.ip()).collect())
                     .unwrap_or_default()
             };
-            let resolve = |_: Option<std::net::IpAddr>| -> Option<std::net::IpAddr> {
-                Self::detect_internal_ip().parse().ok()
+            // `resolveAddressFunc` = `netutils.ResolveBindAddress`
+            // (apimachinery util/net/interface.go:468-483).
+            let resolve = |node_ip: Option<std::net::IpAddr>| -> Result<std::net::IpAddr, String> {
+                crate::node_ip::net_interface::resolve_bind_address(node_ip)
+                    .map_err(|e| e.to_string())
             };
             crate::node_ip::effective_internal_ips(
                 crate::node_ip::configured_node_ips(),
@@ -3607,9 +3610,7 @@ impl Kubelet {
 
                             if let Err(e) = self.storage.update_status(&key, &new_pod).await {
                                 // Retry with fresh read on conflict (K8s pattern)
-                                if e.to_string().contains("Conflict")
-                                    || e.to_string().contains("mismatch")
-                                {
+                                if crate::lifecycle::is_status_write_conflict(&e) {
                                     if let Ok(fresh_pod) = self.storage.get::<Pod>(&key).await {
                                         // Terminal phases are sticky — don't
                                         // regress a Succeeded/Failed pod to

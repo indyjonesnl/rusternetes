@@ -21,12 +21,13 @@ redis = ["rusternetes-storage/redis"]
 
 [dependencies]
 mimalloc = { version = "0.1", optional = true }
-rusternetes-common = { path = "../common" }
+rusternetes-common = { path = "../common", features = ["axum-support"] }
 # api-client: StorageBackend::Api + the shared ApiStorage adapter (now lives in
 # the storage crate; resolves the old controller-manager dependency, #1146).
 rusternetes-storage = { path = "../storage", features = ["api-client"] }
 rusternetes-client = { path = "../client" }
 tokio.workspace = true
+axum.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -36,6 +37,7 @@ serde_json = { workspace = true }
 futures = { workspace = true }
 
 [dev-dependencies]
+tower = { workspace = true }
 serial_test = { workspace = true }
 # Integration tests drive the Endpoints/EndpointSlice controllers to populate
 # state kube-proxy then programs. (The lib no longer depends on it — ApiStorage

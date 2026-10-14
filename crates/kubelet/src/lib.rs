@@ -168,6 +168,13 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
                 get(|| async move { Json(kubelet_config_clone.as_ref().clone()) }),
             )
             .merge(server::read_only_router(server_state));
+        // server.go:328 `installStatusZ()`: last, over the routes registered so far.
+        let registered: Vec<String> = ["/metrics", "/configz"]
+            .into_iter()
+            .chain(server::READ_ONLY_PATHS)
+            .map(String::from)
+            .collect();
+        let app = server::install_statusz(app, registered);
         // Serve the kubelet API port over HTTPS (#1644) — a Kubernetes
         // api-server proxies logs/exec/attach/metrics via `https://…:10250`.
         let addr: std::net::SocketAddr = metrics_addr.parse().expect("valid metrics addr");

@@ -4414,6 +4414,7 @@ dependencies = [
  "cel",
  "chrono",
  "chrono-tz",
+ "clap",
  "criterion",
  "cron",
  "ed25519-dalek",
@@ -4573,6 +4574,7 @@ name = "rusternetes-kube-proxy"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "futures",
  "mimalloc",
@@ -4584,6 +4586,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "tokio",
+ "tower 0.4.13",
  "tracing",
  "tracing-subscriber",
 ]

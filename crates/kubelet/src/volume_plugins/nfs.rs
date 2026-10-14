@@ -1,3 +1,5 @@
+use crate::volume_plugins::metrics_statfs::MetricsStatFs;
+use crate::volume_plugins::plugin::{Metrics, MetricsProvider};
 use crate::volume_plugins::util::mount_ops::{cleanup_mount_with_force, Mounter as MountUtil};
 use crate::volume_plugins::util::mount_utils::is_not_mount_point;
 use crate::volume_plugins::util::{join_mount_options, mount_option_from_spec};
@@ -21,9 +23,9 @@ const UNMOUNT_TIMEOUT: Duration = Duration::from_secs(60);
 /// `ProbeVolumePlugins` (`cmd/kubelet/app/plugins.go`).
 ///
 /// Not ported: `Recycle` (`nfs.go:156-173`, the PV controller's recycler
-/// pod, not a kubelet concern) and the `MetricsProvider` embedded in `nfs`
-/// (`volume.NewMetricsStatFS`, `nfs.go:131`, `:150`): no plugin here exposes
-/// volume metrics yet.
+/// pod, not a kubelet concern). The `MetricsProvider` embedded in `nfs`
+/// (`volume.NewMetricsStatFS`, `nfs.go:131`, `:150`) is on the concrete
+/// mounter/unmounter; the `Mounter`/`Unmounter` traits do not yet require it.
 pub struct NfsPlugin {
     host: Arc<dyn VolumeHost>,
 }
@@ -32,6 +34,24 @@ impl NfsPlugin {
     /// `Init` (`nfs.go:70-73`).
     pub fn new(host: Arc<dyn VolumeHost>) -> Self {
         Self { host }
+    }
+
+    /// `newMounterInternal` (`nfs.go:116-138`), returning the concrete mounter
+    /// so its embedded `MetricsProvider` stays reachable.
+    fn new_nfs_mounter(&self, spec: &Spec<'_>, pod: &Pod) -> Result<NfsMounter> {
+        let (source, read_only) = get_volume_source(spec)?;
+        Ok(NfsMounter {
+            nfs: Nfs::new(spec.name(), &pod.metadata.uid, self.host.clone()),
+            server: get_server_from_source(source),
+            export_path: source.path.clone(),
+            read_only,
+            mount_options: mount_option_from_spec(spec, &[]),
+        })
+    }
+
+    /// `newUnmounterInternal` (`nfs.go:144-152`).
+    fn new_nfs_unmounter(&self, vol_name: &str, pod_uid: &str) -> NfsUnmounter {
+        NfsUnmounter(Nfs::new(vol_name, pod_uid, self.host.clone()))
     }
 
     /// `GetAccessModes` (`nfs.go:108-114`): `PersistentVolumePlugin`.
@@ -102,27 +122,12 @@ impl VolumePlugin for NfsPlugin {
 
     /// `NewMounter` / `newMounterInternal` (`nfs.go:116-138`).
     async fn new_mounter(&self, spec: &Spec<'_>, pod: &Pod) -> Result<Box<dyn Mounter>> {
-        let (source, read_only) = get_volume_source(spec)?;
-        Ok(Box::new(NfsMounter {
-            nfs: Nfs {
-                vol_name: spec.name().to_string(),
-                pod_uid: pod.metadata.uid.clone(),
-                host: self.host.clone(),
-            },
-            server: get_server_from_source(source),
-            export_path: source.path.clone(),
-            read_only,
-            mount_options: mount_option_from_spec(spec, &[]),
-        }))
+        Ok(Box::new(self.new_nfs_mounter(spec, pod)?))
     }
 
     /// `NewUnmounter` / `newUnmounterInternal` (`nfs.go:140-152`).
     fn new_unmounter(&self, vol_name: &str, pod_uid: &str) -> Result<Box<dyn Unmounter>> {
-        Ok(Box::new(NfsUnmounter(Nfs {
-            vol_name: vol_name.to_string(),
-            pod_uid: pod_uid.to_string(),
-            host: self.host.clone(),
-        })))
+        Ok(Box::new(self.new_nfs_unmounter(vol_name, pod_uid)))
     }
 
     /// `ConstructVolumeSpec` (`nfs.go:175-187`): an NFS volume named, and
@@ -145,9 +150,23 @@ struct Nfs {
     vol_name: String,
     pod_uid: String,
     host: Arc<dyn VolumeHost>,
+    /// Embedded `volume.MetricsProvider` (`nfs.go:195`), set to
+    /// `volume.NewMetricsStatFS(getPath(..))` (`nfs.go:131`, `:150`).
+    metrics: MetricsStatFs,
 }
 
 impl Nfs {
+    fn new(vol_name: &str, pod_uid: &str, host: Arc<dyn VolumeHost>) -> Self {
+        let mut nfs = Nfs {
+            vol_name: vol_name.to_string(),
+            pod_uid: pod_uid.to_string(),
+            host,
+            metrics: MetricsStatFs::new(""),
+        };
+        nfs.metrics = MetricsStatFs::new(&nfs.path());
+        nfs
+    }
+
     /// `GetPath` (`nfs.go:198-201`).
     fn path(&self) -> String {
         self.host
@@ -257,6 +276,18 @@ impl Mounter for NfsMounter {
 
 /// `nfsUnmounter` (`nfs.go:275-277`).
 struct NfsUnmounter(Nfs);
+
+impl MetricsProvider for NfsMounter {
+    fn get_metrics(&self) -> Result<Metrics> {
+        self.nfs.metrics.get_metrics()
+    }
+}
+
+impl MetricsProvider for NfsUnmounter {
+    fn get_metrics(&self) -> Result<Metrics> {
+        self.0.metrics.get_metrics()
+    }
+}
 
 #[async_trait]
 impl Unmounter for NfsUnmounter {
@@ -373,6 +404,30 @@ mod tests {
     /// `doTestPlugin` (`nfs_test.go:99-190`) as far as it does not touch the
     /// fake mounter: the volume path under `kubernetes.io~nfs`, the
     /// `<server>:<path>` source, and `GetAttributes`.
+    /// `nfs` embeds `volume.NewMetricsStatFS(getPath(..))` in both the mounter
+    /// and the unmounter (`nfs.go:131`, `:150`): metrics are the statfs of the
+    /// pod volume dir.
+    #[tokio::test]
+    async fn mounter_and_unmounter_provide_statfs_metrics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plug = plugin(tmp.path());
+        let v = vol(json!({"server": "127.0.0.1", "path": "/somepath"}));
+        let m = plug
+            .new_nfs_mounter(&spec(&v, None, false), &pod())
+            .unwrap();
+        let u = plug.new_nfs_unmounter("vol1", "poduid");
+
+        // Directory absent: FsInfoFailed, like upstream's statfs error.
+        let err = m.get_metrics().unwrap_err();
+        assert!(err.to_string().starts_with("failed to get FsInfo"), "{err}");
+
+        std::fs::create_dir_all(m.get_path()).unwrap();
+        for got in [m.get_metrics().unwrap(), u.get_metrics().unwrap()] {
+            assert!(got.capacity.unwrap().value() > 0);
+            assert!(got.available.unwrap().value() > 0);
+        }
+    }
+
     async fn do_test_plugin(spec: &Spec<'_>, want_source: &str) {
         let tmp = tempfile::tempdir().unwrap();
         let plug = plugin(tmp.path());

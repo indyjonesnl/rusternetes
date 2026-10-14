@@ -552,6 +552,9 @@ async fn async_main() -> Result<()> {
             // conflist to derive, so the node-network agent stays off and the
             // image's cluster-wide CNI config keeps applying (#1691).
             node_net: None,
+            // MetricsBindAddress default (defaults.go:52-56).
+            metrics_bind_address:
+                rusternetes_kube_proxy::serve_metrics::default_metrics_bind_address(""),
         };
         tokio::spawn(async move {
             if let Err(e) = rusternetes_kube_proxy::run(proxy_storage, proxy_config).await {

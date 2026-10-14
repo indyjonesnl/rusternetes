@@ -131,7 +131,12 @@ struct Args {
 /// `compatibility.DefaultBuildEffectiveVersion()` (not the flag-derived
 /// effective version) and `pathRecorderMux.ListedPaths()`; the only path this
 /// server lists is `/metrics`.
-fn install_statusz(app: Router) -> Router {
+fn install_statusz(app: Router, flags: rusternetes_common::flagz::NamedFlagSetsReader) -> Router {
+    // `flagz.Install` behind the `ComponentFlagz` gate, before statusz
+    // (cmd/kube-scheduler/app/server.go:388-392; reader from
+    // cmd/kube-scheduler/app/options/options.go:270-274).
+    let app =
+        rusternetes_common::flagz::install_if_enabled(app, "kube-scheduler", Some(Box::new(flags)));
     rusternetes_common::statusz::install_if_enabled(app, "kube-scheduler", || {
         rusternetes_common::statusz::Registry::new(Some(
             rusternetes_common::compatibility::default_build_effective_version(),
@@ -142,7 +147,12 @@ fn install_statusz(app: Router) -> Router {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let cmd = <Args as clap::CommandFactory>::command();
+    let matches = cmd.clone().get_matches();
+    let flags = rusternetes_common::flagz::flags_from_clap(&cmd, &matches);
+    let args = <Args as clap::FromArgMatches>::from_arg_matches(&matches)
+        .map_err(|e| e.exit())
+        .unwrap();
 
     rusternetes_common::tracing::init_basic_tracing("scheduler", &args.log_level)?;
 
@@ -181,7 +191,7 @@ async fn main() -> Result<()> {
     // the binding subresource + status + events. Resolve the api-server URL and
     // CA from --kubeconfig (preferred) or the explicit flags.
     if args.api_server_url.is_some() || args.kubeconfig.is_some() {
-        return run_api_mode(args, &profiles).await;
+        return run_api_mode(args, &profiles, flags).await;
     }
 
     let storage_config = match args.storage_backend.as_str() {
@@ -214,6 +224,7 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         let app = install_statusz(
             Router::new().route("/metrics", get(|| async move { metrics_clone.gather() })),
+            flags,
         );
         let listener = tokio::net::TcpListener::bind(&metrics_addr).await.unwrap();
         axum::serve(listener, app).await.unwrap();
@@ -285,7 +296,11 @@ async fn main() -> Result<()> {
 /// the api-server URL + CA from `--kubeconfig` (preferred) or the explicit
 /// `--api-server-url` flag, builds the [`ApiBackend`] (client + informers +
 /// event recorder) and runs the single-instance scheduling loop.
-async fn run_api_mode(args: Args, profiles: &profile::Map) -> Result<()> {
+async fn run_api_mode(
+    args: Args,
+    profiles: &profile::Map,
+    flags: rusternetes_common::flagz::NamedFlagSetsReader,
+) -> Result<()> {
     use rusternetes_client::http::ApiClient;
     use rusternetes_client::kubeconfig::KubeConfig;
 
@@ -297,6 +312,7 @@ async fn run_api_mode(args: Args, profiles: &profile::Map) -> Result<()> {
     tokio::spawn(async move {
         let app = install_statusz(
             Router::new().route("/metrics", get(|| async move { metrics_clone.gather() })),
+            flags,
         );
         let listener = tokio::net::TcpListener::bind(&metrics_addr).await.unwrap();
         axum::serve(listener, app).await.unwrap();

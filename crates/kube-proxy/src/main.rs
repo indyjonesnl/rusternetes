@@ -95,6 +95,12 @@ struct Args {
     /// a no-masquerade CIDR so cross-node pod traffic keeps its source IP.
     #[arg(long, default_value = "10.244.0.0/16")]
     pod_cidr: String,
+
+    /// IP address (and port) for the metrics/status server to serve on
+    /// (upstream `--metrics-bind-address`; empty = `127.0.0.1:10249`, a bare IP
+    /// gets port 10249).
+    #[arg(long, default_value = "")]
+    metrics_bind_address: String,
 }
 
 /// Apply `--feature-gates` process-wide. Port of `featureGate.Set`
@@ -132,6 +138,10 @@ async fn main() -> Result<()> {
                 no_masq_cidrs: vec![args.pod_cidr.clone(), args.cluster_cidr.clone()],
             }
         }),
+        // `--metrics-bind-address`; empty gets the defaults.go:52-56 default.
+        metrics_bind_address: rusternetes_kube_proxy::serve_metrics::default_metrics_bind_address(
+            &args.metrics_bind_address,
+        ),
     };
 
     // In-cluster path: read cluster state from the api-server (no storage handle).

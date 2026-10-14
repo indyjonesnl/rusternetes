@@ -2,7 +2,7 @@
 //
 // Every versioned feature gate (and dependency edge) that kube-apiserver
 // registers on `utilfeature.DefaultMutableFeatureGate`, dumped from
-// Kubernetes release-1.35 @ 90640ec14a7612baba12b658e962a9436b583ce4 via `GetAllVersioned()` /
+// Kubernetes release-1.35 @ bbd1e3faf9eab3f0f9b0dfbd7f8beea64e66ca72 via `GetAllVersioned()` /
 // `Dependencies()`: `defaultVersionedKubernetesFeatureGates` in
 // pkg/features/kube_features.go, staging/src/k8s.io/apiserver/pkg/features/kube_features.go,
 // staging/src/k8s.io/apiextensions-apiserver/pkg/features/kube_features.go,

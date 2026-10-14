@@ -1,6 +1,7 @@
 pub mod iptables;
 pub mod node_net;
 pub mod proxy;
+pub mod serve_metrics;
 
 use futures::StreamExt;
 use proxy::KubeProxy;
@@ -27,6 +28,10 @@ pub struct KubeProxyConfig {
     /// the other nodes' pod CIDRs, and keeps cluster traffic out of the
     /// masquerade path. Upstream analogue: kindnetd (see [`node_net`]).
     pub node_net: Option<node_net::NodeNetConfig>,
+    /// `MetricsBindAddress` (KubeProxyConfiguration): where the metrics/status
+    /// server listens; empty disables it. Defaults per
+    /// [`serve_metrics::default_metrics_bind_address`].
+    pub metrics_bind_address: String,
 }
 
 impl Default for KubeProxyConfig {
@@ -37,6 +42,7 @@ impl Default for KubeProxyConfig {
             cluster_cidr: iptables::DEFAULT_CLUSTER_CIDR.to_string(),
             nodeport_range: iptables::DEFAULT_NODEPORT_RANGE.to_string(),
             node_net: None,
+            metrics_bind_address: serve_metrics::default_metrics_bind_address(""),
         }
     }
 }
@@ -87,6 +93,9 @@ async fn run_proxy<S: Storage + Send + Sync + 'static>(
         config.nodeport_range.clone(),
         config.node_name.clone(),
     )?));
+
+    // `serveMetrics` (cmd/kube-proxy/app/server.go:561); proxy mode is iptables.
+    serve_metrics::serve_metrics(config.metrics_bind_address.clone(), "iptables");
 
     info!("Kube-proxy initialized successfully");
     info!("Syncing services every {} seconds", config.sync_interval);

@@ -2516,10 +2516,10 @@ impl<S: Storage + 'static> JobController<S> {
                                 // TTL.
                                 self.expectations.creation_observed(&exp_key);
                                 active -= 1;
-                                let err_str = format!("{}", e);
-                                if err_str.contains("already exists")
-                                    || err_str.contains("AlreadyExists")
-                                {
+                                // Typed `apierrors.IsAlreadyExists` (errors.go:542-544);
+                                // upstream pods use generateName so it never
+                                // branches here — a Rusternetes-only benign case.
+                                if super::is_already_exists_anyhow(&e) {
                                     debug!(
                                         "Pod already exists for Job {}/{}, skipping",
                                         namespace, name
