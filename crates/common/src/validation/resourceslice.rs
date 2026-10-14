@@ -840,4 +840,45 @@ mod tests {
             vec![("spec.sharedCounters[0].counters".to_string(), String::new())]
         );
     }
+
+    /// Port of `max-shared-counters` / `too-many-shared-counters`
+    /// (validation_resourceslice_test.go:783-800): `validateSet` over
+    /// `sharedCounters` (`validation.go:723`) caps at
+    /// `ResourceSliceMaxCounterSets` (8) with `WithOrigin("maxItems")`.
+    fn shared_counters(n: usize) -> serde_json::Value {
+        let sets: Vec<_> = (0..n)
+            .map(|i| serde_json::json!({"name": format!("counterset-{i}"), "counters": {"c": {"value": "1"}}}))
+            .collect();
+        let mut spec = spec_with_devices(vec![]);
+        spec["sharedCounters"] = serde_json::json!(sets);
+        spec
+    }
+
+    #[test]
+    fn shared_counters_over_cap_carry_max_items_origin() {
+        assert_eq!(
+            too_many_origins(shared_counters(9)),
+            vec![("spec.sharedCounters".to_string(), "maxItems".to_string())]
+        );
+    }
+
+    #[test]
+    fn shared_counters_at_cap_are_valid() {
+        let mut v = base();
+        v["spec"] = shared_counters(8);
+        let got = validate_resource_slice(&slice(v));
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    /// `validateSet` short-circuits: an over-cap list yields only TooMany.
+    #[test]
+    fn shared_counters_over_cap_short_circuit() {
+        let mut spec = shared_counters(9);
+        spec["sharedCounters"][0]["name"] = serde_json::json!("Bad Name");
+        let mut v = base();
+        v["spec"] = spec;
+        let got = validate_resource_slice(&slice(v));
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].field, "spec.sharedCounters");
+    }
 }

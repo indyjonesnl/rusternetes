@@ -1555,4 +1555,91 @@ mod tests {
             ]
         );
     }
+
+    // ---- constraints caps (#3558) ----------------------------------------
+
+    fn one_request() -> serde_json::Value {
+        serde_json::json!({"name": "q0", "exactly": {
+            "deviceClassName": "c.example.com", "allocationMode": "ExactCount", "count": 1
+        }})
+    }
+
+    /// Port of `invalid-request-with-max-size-short-circuit`
+    /// (validation_resourceclaim_test.go:299-340): `validateSlice` over
+    /// `constraints` (`validation.go:151`) returns only the TooMany error, so
+    /// the invalid entries are not validated.
+    #[test]
+    fn constraints_over_cap_short_circuit_with_max_items_origin() {
+        let mut constraints =
+            vec![serde_json::json!({"requests": ["q0", "bad name"], "matchAttribute": "foo/bar"})];
+        for _ in 1..33 {
+            constraints.push(serde_json::json!({"matchAttribute": "foo/bar"}));
+        }
+        let got = validate_resource_claim(&claim(serde_json::json!({
+            "requests": [one_request()], "constraints": constraints,
+        })));
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].field, "spec.devices.constraints");
+        assert_eq!(got[0].origin, "maxItems");
+        assert!(
+            got[0].to_string().contains("must have at most 32 items"),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn constraints_at_cap_are_valid() {
+        let constraints: Vec<_> = (0..32)
+            .map(|_| serde_json::json!({"matchAttribute": "foo/bar"}))
+            .collect();
+        let got = validate_resource_claim(&claim(serde_json::json!({
+            "requests": [one_request()], "constraints": constraints,
+        })));
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    /// `validateDeviceConstraint` runs `validateSet(constraint.Requests,
+    /// DeviceRequestsMaxSize, ...)` (`validation.go:355`): capped, and
+    /// duplicate names are rejected.
+    #[test]
+    fn constraint_requests_over_cap_carry_max_items_origin() {
+        let got = validate_resource_claim(&claim(serde_json::json!({
+            "requests": [one_request()],
+            "constraints": [{"requests": names(33), "matchAttribute": "foo/bar"}],
+        })));
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].field, "spec.devices.constraints[0].requests");
+        assert_eq!(got[0].origin, "maxItems");
+    }
+
+    #[test]
+    fn constraint_requests_duplicate_is_rejected() {
+        let got = validate_resource_claim(&claim(serde_json::json!({
+            "requests": [one_request()],
+            "constraints": [{"requests": ["q0", "q0"], "matchAttribute": "foo/bar"}],
+        })));
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].field, "spec.devices.constraints[0].requests[1]");
+        assert!(got[0].to_string().contains("Duplicate"), "{got:?}");
+    }
+
+    // ---- tolerations (#3559) ---------------------------------------------
+
+    /// Upstream has no list cap on `tolerations`: `validateDeviceRequest`
+    /// loops them (`validation.go:262-264`) and the generated v1 validation
+    /// only does `EachSliceVal` (zz_generated.validations.go:1209-1217).
+    #[test]
+    fn tolerations_have_no_list_cap() {
+        let tolerations: Vec<_> = (0..17)
+            .map(|i| serde_json::json!({"key": format!("k{i}"), "operator": "Exists"}))
+            .collect();
+        let mut exact = serde_json::json!({
+            "deviceClassName": "c.example.com", "allocationMode": "ExactCount", "count": 1
+        });
+        exact["tolerations"] = serde_json::json!(tolerations);
+        let got = validate_resource_claim(&claim(serde_json::json!({
+            "requests": [{"name": "q0", "exactly": exact}],
+        })));
+        assert!(got.is_empty(), "{got:?}");
+    }
 }
