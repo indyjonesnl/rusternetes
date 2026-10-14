@@ -631,9 +631,18 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("Pods metric without pods field"))?;
                 let target = parse_target_avg(&p.target)?;
+                // horizontal.go:478-482: LabelSelectorAsSelector(spec.Pods.Metric.Selector).
+                let metric_selector = p
+                    .metric
+                    .selector
+                    .as_ref()
+                    .map(|s| s.as_selector_string())
+                    .transpose()
+                    .map_err(|e| anyhow::anyhow!("failed to get pods metric value: {e}"))?
+                    .unwrap_or_default();
                 let info = self
                     .metrics_client
-                    .get_raw_metric(&p.metric.name, namespace, &selector)
+                    .get_raw_metric(&p.metric.name, namespace, &selector, &metric_selector)
                     .await?;
                 let (replicas, avg) = calc::get_metric_replicas(&info, current_replicas, target)?;
                 let status = MetricStatus {
@@ -659,9 +668,23 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("Object metric without object field"))?;
                 let target = parse_target_value(&o.target)?;
+                // horizontal.go:468-472: LabelSelectorAsSelector(spec.Object.Metric.Selector).
+                let metric_selector = o
+                    .metric
+                    .selector
+                    .as_ref()
+                    .map(|s| s.as_selector_string())
+                    .transpose()
+                    .map_err(|e| anyhow::anyhow!("failed to get object metric value: {e}"))?
+                    .unwrap_or_default();
                 let (value, _) = self
                     .metrics_client
-                    .get_object_metric(&o.metric.name, namespace, &o.described_object)
+                    .get_object_metric(
+                        &o.metric.name,
+                        namespace,
+                        &o.described_object,
+                        &metric_selector,
+                    )
                     .await?;
                 let (replicas, v) =
                     calc::get_object_metric_replicas(value, current_replicas, target)?;
@@ -702,11 +725,18 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("External metric without external field"))?;
                 let target = parse_target_avg(&e.target)?;
-                let default_sel = rusternetes_common::types::LabelSelector::default();
-                let sel = e.metric.selector.as_ref().unwrap_or(&default_sel);
+                // replica_calculator.go:355-358: LabelSelectorAsSelector(metricSelector).
+                let metric_selector = e
+                    .metric
+                    .selector
+                    .as_ref()
+                    .map(|s| s.as_selector_string())
+                    .transpose()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                    .unwrap_or_default();
                 let (values, _) = self
                     .metrics_client
-                    .get_external_metric(&e.metric.name, namespace, sel)
+                    .get_external_metric(&e.metric.name, namespace, &metric_selector)
                     .await?;
                 let (replicas, sum) = calc::get_external_metric_replicas(&values, target)?;
                 // k8s reports currentAverageValue = sum / currentReplicas for an
