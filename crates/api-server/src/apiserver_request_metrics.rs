@@ -16,15 +16,20 @@
 //! `requestLatencies` (:104-118), `responseSizes` (:152-162),
 //! `requestAbortsTotal` (:243-252) and `RecordRequestAbort` (:496-506).
 //!
+//! Also ported: `apiSelfRequestCounter` (:222-230, :604-607),
+//! `fieldValidationRequestLatencies` (:139-151; the child is created but, as
+//! upstream, never observed :617-618) and `longRunningRequestsGauge` with
+//! `RecordLongRunning` (:87-95, :551-575). The SLI/SLO histograms (:119-149)
+//! and [`record_request_abort`] (called by the timeout filter,
+//! `request_timeout`) are ported as well.
+//!
 //! DEVIATIONS: (1) the elapsed time of a watch is the time to response
 //! headers, since the body streams after the handler returns; (2) response
 //! size is the declared/exact body length (zero for unsized streams) rather
-//! than bytes written; (3) `request_sli_duration_seconds` /
-//! `request_slo_duration_seconds` (:119-149) are not ported (no latency
-//! trackers for webhook / APF-wait time), nor is the `apiserver_self`
-//! counter, deprecated-API gauge or field-validation histogram. [`record_request_abort`]
-//! is called by the timeout filter (`request_timeout`) when a response body
-//! outlives the request deadline.
+//! than bytes written; (3) `RecordLongRunning` is applied as a response-body
+//! guard for WATCH/CONNECT verbs, so upgraded (101) exec/attach/portforward
+//! connections are not held open by it; (4) no `requested_deprecated_apis`
+//! gauge.
 
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
@@ -373,6 +378,13 @@ pub fn monitor_request(
     let dry_run = clean_dry_run(&req.query);
     let verb = reported_verb(req, scope);
     let (group, version, resource) = resource_gvr(req);
+    // "MonitorRequest happens after authentication, so we can trust the
+    // username given by the request" (:604-607).
+    if req.user_name == API_SERVER_USER {
+        API_SELF_REQUEST_COUNTER
+            .with_label_values(&[&verb, group, resource, &req.subresource])
+            .inc();
+    }
     REQUEST_LATENCIES
         .with_label_values(&[
             &verb,
@@ -385,6 +397,9 @@ pub fn monitor_request(
             component,
         ])
         .observe(elapsed.as_secs_f64());
+    // Upstream creates the child here but never calls Observe (:617-618);
+    // replicated, so the series exists with a zero count.
+    FIELD_VALIDATION_REQUEST_LATENCIES.with_label_values(&[&clean_field_validation(&req.query)]);
     // `if wd, ok := LatencyTrackersFrom(ctx); ok && dryRun == ""` (:620-625):
     // the latency minus webhook and APF queue-wait time.
     if let (Some(excluded), "") = (excluded, dry_run.as_str()) {
@@ -421,17 +436,123 @@ pub fn monitor_request(
     }
 }
 
-/// `cleanFieldValidation` (metrics.go:822-834).
-pub(crate) fn clean_field_validation(_query: &str) -> String {
-    String::new()
+/// `cleanFieldValidation` (metrics.go:822-834) with `ValidateFieldValidation`
+/// (apimachinery meta/v1/validation:242-252): `allowedFieldValidationValues`
+/// is `{"", Ignore, Warn, Strict}`.
+pub(crate) fn clean_field_validation(query: &str) -> String {
+    // "avoid allocating when we don't see fieldValidation in the query"
+    if !query.contains("fieldValidation") {
+        return String::new();
+    }
+    let values: Vec<_> = url::form_urlencoded::parse(query.as_bytes())
+        .filter(|(k, _)| k == "fieldValidation")
+        .map(|(_, v)| v)
+        .collect();
+    if values.len() != 1 || !matches!(&*values[0], "" | "Ignore" | "Warn" | "Strict") {
+        return "invalid".into();
+    }
+    values[0].to_string()
 }
 
-/// Guard returned by [`record_long_running`].
-pub struct LongRunningGuard;
+/// `apiSelfRequestCounter` (metrics.go:222-230).
+static API_SELF_REQUEST_COUNTER: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    counter_vec(
+        "selfrequest_total",
+        "Counter of apiserver self-requests broken out for each verb, API resource and subresource.",
+        &["verb", "group", "resource", "subresource"],
+    )
+});
+
+/// `fieldValidationRequestLatencies` (metrics.go:139-151). Upstream sets no
+/// `Subsystem`, so the name carries no `apiserver_` prefix.
+static FIELD_VALIDATION_REQUEST_LATENCIES: LazyLock<HistogramVec> = LazyLock::new(|| {
+    let h = HistogramVec::new(
+        HistogramOpts::new(
+            "field_validation_request_duration_seconds",
+            "Response latency distribution in seconds for each field validation value",
+        )
+        .buckets(vec![
+            0.05, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0,
+            15.0, 20.0, 30.0, 45.0, 60.0,
+        ]),
+        &["field_validation"],
+    )
+    .expect("valid metric");
+    let _ = register(Box::new(h.clone()));
+    h
+});
+
+/// `longRunningRequestsGauge` (metrics.go:87-95).
+static LONG_RUNNING_REQUESTS_GAUGE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    gauge_vec(
+        "longrunning_requests",
+        "Gauge of all active long-running apiserver requests broken out by verb, group, version, resource, scope and component. Not all requests are tracked this way.",
+        &["verb", "group", "version", "resource", "subresource", "scope", "component"],
+    )
+});
+
+/// `user.APIServerUser` (authentication/user/user.go:78).
+const API_SERVER_USER: &str = "system:apiserver";
+
+/// Holds the `longrunning_requests` gauge up for the life of the guard: the
+/// `g.Inc(); defer g.Dec(); fn()` of `RecordLongRunning` (metrics.go:571-574)
+/// with the closure replaced by scope.
+pub struct LongRunningGuard(prometheus::IntGauge);
+
+impl Drop for LongRunningGuard {
+    fn drop(&mut self) {
+        self.0.dec();
+    }
+}
 
 /// `RecordLongRunning` (metrics.go:551-575).
-pub fn record_long_running(_req: &RequestMeta, _component: &str) -> LongRunningGuard {
-    LongRunningGuard
+pub fn record_long_running(req: &RequestMeta, component: &str) -> LongRunningGuard {
+    let scope = clean_scope(req);
+    // As in `MonitorRequest`, the verb comes from the method, not requestInfo.
+    let verb = reported_verb(req, scope);
+    let g = if req.is_resource_request {
+        LONG_RUNNING_REQUESTS_GAUGE.with_label_values(&[
+            &verb,
+            &req.api_group,
+            &req.api_version,
+            &req.resource,
+            &req.subresource,
+            scope,
+            component,
+        ])
+    } else {
+        LONG_RUNNING_REQUESTS_GAUGE
+            .with_label_values(&[&verb, "", "", "", &req.path, scope, component])
+    };
+    g.inc();
+    LongRunningGuard(g)
+}
+
+/// A response body that carries a [`LongRunningGuard`]: the gauge stays up
+/// until the body (the watch / connect / log stream) is finished or dropped.
+struct GuardedBody {
+    inner: axum::body::Body,
+    _guard: LongRunningGuard,
+}
+
+impl http_body::Body for GuardedBody {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 /// `RecordRequestAbort` (metrics.go:496-506).
@@ -470,7 +591,11 @@ pub(crate) fn request_meta(req: &axum::extract::Request) -> RequestMeta {
         api_version: attrs.api_version,
         resource: attrs.resource,
         subresource: attrs.subresource,
-        user_name: String::new(),
+        user_name: req
+            .extensions()
+            .get::<rusternetes_middleware::AuthContext>()
+            .map(|c| c.user.username.clone())
+            .unwrap_or_default(),
     }
 }
 
@@ -486,7 +611,7 @@ pub async fn instrument_request(
     // `WithLatencyTrackers` (filters/webhook_duration.go:36-61) installs the
     // trackers for every request except watches.
     let trackers = (meta.verb != "watch").then(|| Arc::new(LatencyTrackers::new()));
-    let resp = match &trackers {
+    let mut resp = match &trackers {
         Some(t) => with_latency_trackers(t.clone(), next.run(req)).await,
         None => next.run(req).await,
     };
@@ -504,6 +629,22 @@ pub async fn instrument_request(
         size,
         trackers.map(|t| t.excluded_latency()),
     );
+    // `RecordLongRunning` wraps watch serving (handlers/get.go:283), connect
+    // handlers (handlers/rest.go:218) and `StreamObject` for logs
+    // (responsewriters/writers.go:327); the verbs those paths report are
+    // WATCH and CONNECT (`validConnectRequests` includes log).
+    if matches!(
+        reported_verb(&meta, clean_scope(&meta)).as_str(),
+        "WATCH" | "CONNECT"
+    ) {
+        let guard = record_long_running(&meta, "apiserver");
+        resp = resp.map(|body| {
+            axum::body::Body::new(GuardedBody {
+                inner: body,
+                _guard: guard,
+            })
+        });
+    }
     resp
 }
 
