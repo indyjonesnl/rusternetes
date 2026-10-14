@@ -19,6 +19,7 @@ pub mod git_repo;
 pub mod host;
 pub mod host_path;
 pub mod image;
+pub mod iscsi;
 pub mod local;
 pub mod metrics_statfs;
 #[cfg(test)]

@@ -153,6 +153,16 @@ pub trait VolumePlugin: Send + Sync {
     }
 
     /// Rust spelling of the type assertion
+    /// `volumePlugin.(volume.AttachableVolumePlugin)` (`plugins.go:810`, which
+    /// `FindAttachablePluginBySpec` performs before `CanAttach`). `None` is a
+    /// failed assertion. CSI is attachable upstream too, but its attacher is
+    /// not ported (the kubelet never calls `WaitForAttach` for it), so it
+    /// stays `None` here.
+    fn as_attachable_plugin(&self) -> Option<&dyn AttachableVolumePlugin> {
+        None
+    }
+
+    /// Rust spelling of the type assertion
     /// `volumePlugin.(volume.NodeExpandableVolumePlugin)`
     /// (`plugins.go:931`, `:944`), which `FindNodeExpandablePlugin{BySpec,
     /// ByName}` perform. `None` is a failed assertion — every plugin
@@ -243,6 +253,51 @@ pub trait DeviceMounter: Send + Sync {
 pub trait DeviceMountableVolumePlugin: VolumePlugin {
     /// `NewDeviceMounter`.
     fn new_device_mounter(&self) -> Result<Box<dyn DeviceMounter>>;
+}
+
+/// Port of `volume.Attacher` (`pkg/volume/volume.go:270-290`): the
+/// device-mounter that can also wait for a volume to show up on the node. Only
+/// `WaitForAttach` is called by the kubelet's `MountVolume` operation
+/// (`operation_generator.go:505-518`): `Attach`/`VolumesAreAttached` belong to
+/// the attach/detach controller and are not ported.
+#[async_trait]
+pub trait Attacher: DeviceMounter {
+    /// `WaitForAttach` (`volume.go:289`): blocks until the device is attached
+    /// to this node and returns the path to it, or errors after `timeout`.
+    async fn wait_for_attach(
+        &self,
+        spec: &Spec<'_>,
+        device_path: &str,
+        pod: &Pod,
+        timeout: std::time::Duration,
+    ) -> Result<String>;
+}
+
+/// Port of `volume.DeviceUnmounter` (`pkg/volume/volume.go:323-329`).
+#[async_trait]
+pub trait DeviceUnmounter: Send + Sync {
+    /// `UnmountDevice` (`volume.go:328`): unmounts the global mount of the
+    /// disk. Only to be called once all bind mounts have been unmounted.
+    async fn unmount_device(&self, device_mount_path: &str) -> Result<()>;
+}
+
+/// Port of `volume.AttachableVolumePlugin` (`pkg/volume/plugins.go:228-236`),
+/// together with the two `DeviceMountableVolumePlugin` methods
+/// (`NewDeviceUnmounter`, `GetDeviceMountRefs`, `plugins.go:239-245`) that
+/// [`DeviceMountableVolumePlugin`] omits: no plugin but this one's implementers
+/// has a use for them, so they live here rather than forcing a stub on CSI.
+/// `NewDetacher`/`Detach` (attach/detach controller) and
+/// `VerifyExhaustedResource` are not ported. A plugin opts in by returning
+/// itself from [`VolumePlugin::as_attachable_plugin`].
+pub trait AttachableVolumePlugin: DeviceMountableVolumePlugin {
+    /// `NewAttacher` (`plugins.go:230`).
+    fn new_attacher(&self) -> Result<Box<dyn Attacher>>;
+
+    /// `NewDeviceUnmounter` (`plugins.go:241`).
+    fn new_device_unmounter(&self) -> Result<Box<dyn DeviceUnmounter>>;
+
+    /// `GetDeviceMountRefs` (`plugins.go:242`).
+    fn get_device_mount_refs(&self, device_mount_path: &str) -> Result<Vec<String>>;
 }
 
 /// Port of `volume.Unmounter` (`pkg/volume/volume.go:189-198`).

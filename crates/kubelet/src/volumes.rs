@@ -258,6 +258,7 @@ impl VolumeManager {
             Box::new(crate::volume_plugins::git_repo::GitRepoPlugin::new(
                 host.clone(),
             )),
+            Box::new(crate::volume_plugins::iscsi::IscsiPlugin::new(host.clone())),
             // `image.ProbeVolumePlugins` (`cmd/kubelet/app/plugins.go`).
             Box::new(crate::volume_plugins::image::ImagePlugin::new()),
             Box::new(crate::volume_plugins::config_map::ConfigMapPlugin::new(

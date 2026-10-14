@@ -433,6 +433,9 @@ impl<'a, S: Storage + ?Sized> OperationGenerator<'a, S> {
     }
 }
 
+/// `waitForAttachTimeout` (`pkg/kubelet/volumemanager/volume_manager.go:88`).
+const WAIT_FOR_ATTACH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
 /// Port of the mount half of `operationGenerator.GenerateMountVolumeFunc`
 /// (`operation_generator.go:431-640`): find the plugin, `NewMounter`, and for a
 /// device-mountable plugin `NewDeviceMounter` -> `GetDeviceMountPath` ->
@@ -443,10 +446,12 @@ impl<'a, S: Storage + ?Sized> OperationGenerator<'a, S> {
 /// Not ported (each waits on the reconciler/`ActualStateOfWorld` wiring,
 /// tracked under #1970): skipping `MountDevice` when
 /// `GetDeviceMountState == DeviceGloballyMounted` (`:530`),
-/// `MarkDeviceAsMounted` / `markDeviceErrorState` (`:545-566`), `WaitForAttach`
-/// (`:505-518`), the ReadWriteOncePod-elsewhere check (`:480-489`), the
+/// `MarkDeviceAsMounted` / `markDeviceErrorState` (`:545-566`), the ReadWriteOncePod-elsewhere check (`:480-489`), the
 /// post-`SetUp` expansion and `MarkVolumeAsMounted` (`:600-640`).
 /// `MountDevice` is idempotent per the CSI spec, so repeating it is safe.
+///
+/// `WaitForAttach` (`:511-526`) runs for plugins that return an attacher from
+/// [`VolumePlugin::as_attachable_plugin`] (iscsi); CSI's attacher is not ported.
 pub async fn mount_volume(
     mgr: &VolumePluginMgr,
     spec: &Spec<'_>,
@@ -469,11 +474,40 @@ pub async fn mount_volume_with_attributes(
     let plugin = mgr.find_plugin_by_spec(spec)?;
     let mounter = plugin.new_mounter(spec, pod).await?;
 
+    // Get attacher, if possible (`:486-492`)
+    let volume_attacher = mgr
+        .find_attachable_plugin_by_spec(spec)
+        .and_then(|p| p.as_attachable_plugin())
+        .and_then(|ap| ap.new_attacher().ok());
+
     // get deviceMounter, if possible (`:495-500`)
     let device_mounter = mgr
         .find_device_mountable_plugin_by_spec(spec)
         .and_then(|p| p.as_device_mountable_plugin())
         .and_then(|dm| dm.new_device_mounter().ok());
+
+    let mut device_path = device_path.to_string();
+    if let Some(volume_attacher) = &volume_attacher {
+        // Wait for attachable volumes to finish attaching (`:513-525`)
+        info!(
+            "MountVolume.WaitForAttach entering for volume {} (DevicePath {device_path:?})",
+            spec.name()
+        );
+        device_path = volume_attacher
+            .wait_for_attach(spec, &device_path, pod, WAIT_FOR_ATTACH_TIMEOUT)
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "MountVolume.WaitForAttach failed for volume {}: {e}",
+                    spec.name()
+                )
+            })?;
+        info!(
+            "MountVolume.WaitForAttach succeeded for volume {} (DevicePath {device_path:?})",
+            spec.name()
+        );
+    }
+    let device_path = device_path.as_str();
 
     if let Some(device_mounter) = device_mounter {
         let device_mount_path = device_mounter.get_device_mount_path(spec)?;
