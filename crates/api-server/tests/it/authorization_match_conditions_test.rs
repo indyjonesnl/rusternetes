@@ -182,3 +182,94 @@ fn non_bool_expression_is_a_compile_error() {
         "{e:?}"
     );
 }
+
+// compile_test.go `TestCompileCELExpression`: the typed environment
+// (`mustBuildEnv`, compile.go:173-259) rejects undeclared references and
+// undefined fields at compile time.
+#[test]
+fn compile_against_the_typed_subject_access_review_environment() {
+    let cases: &[(&str, &str)] = &[
+        ("request.user == 'bob'", ""),
+        ("request.time == 'now'", "undefined field 'time'"),
+        ("request++'", "Syntax error"),
+        ("request.user", "must evaluate to bool"),
+        ("x.user", "undeclared reference to 'x'"),
+        (
+            "request.resourceAttributes.fieldSelector.rawSelector == 'foo'",
+            "",
+        ),
+        (
+            "request.resourceAttributes.fieldSelector.requirements.exists(r, r.key == 'foo' && r.operator == 'In' && ('bar' in r.values))",
+            "",
+        ),
+        (
+            "request.resourceAttributes.labelSelector.rawSelector == 'foo'",
+            "",
+        ),
+        (
+            "request.resourceAttributes.labelSelector.requirements.exists(r, r.key == 'foo' && r.operator == 'In' && ('bar' in r.values))",
+            "",
+        ),
+        (
+            "request.resourceAttributes.bogus == 'x'",
+            "undefined field 'bogus'",
+        ),
+        (
+            "request.nonResourceAttributes.bogus == 'x'",
+            "undefined field 'bogus'",
+        ),
+        (
+            "request.resourceAttributes.fieldSelector.bogus == 'x'",
+            "undefined field 'bogus'",
+        ),
+        ("has(request.bogus)", "undefined field 'bogus'"),
+    ];
+    for (expr, want) in cases {
+        let got = CelMatcher::compile(&[mc(expr)]);
+        if want.is_empty() {
+            assert!(got.is_ok(), "{expr}: {got:?}");
+        } else {
+            let errs = got.expect_err(expr).join("\n");
+            assert!(errs.contains(want), "{expr}: {errs}");
+        }
+    }
+}
+
+// compile.go:128-159: selector usage is detected for `.x` (`.?x` needs the optional
+// syntax, which the shared CEL compile path does not enable).
+#[test]
+fn compile_records_selector_usage() {
+    let m = |e: &str| CelMatcher::compile(&[mc(e)]).unwrap().unwrap();
+    let none = m("request.user == 'a'");
+    assert!(!none.uses_field_selector() && !none.uses_label_selector());
+    let f = m("request.resourceAttributes.fieldSelector.rawSelector == 'foo'");
+    assert!(f.uses_field_selector() && !f.uses_label_selector());
+    let l = m("has(request.resourceAttributes.labelSelector)");
+    assert!(!l.uses_field_selector() && l.uses_label_selector());
+    // matcher.go:33-36: the matcher records the OR across expressions.
+    let both = CelMatcher::compile(&[
+        mc("has(request.resourceAttributes.fieldSelector)"),
+        mc("has(request.resourceAttributes.labelSelector)"),
+    ])
+    .unwrap()
+    .unwrap();
+    assert!(both.uses_field_selector() && both.uses_label_selector());
+}
+
+// matcher.go:60-62 + compile.go:293-325: the selectors reach the expression
+// only through `convertObjectToUnstructured`, when an expression uses them.
+#[tokio::test]
+async fn selector_requirements_are_visible_to_match_conditions() {
+    let (url, n) = serve().await;
+    let a = authorizer(
+        &url,
+        FailurePolicy::Deny,
+        &["request.resourceAttributes.fieldSelector.requirements.exists(r, r.key == 'metadata.name' && r.operator == 'In' && ('x' in r.values))"],
+    );
+    let mut attrs = alice();
+    attrs.verb = "list".into();
+    attrs.set_selectors("metadata.name=x", "");
+    let o = a.authorize_opinion(&attrs).await.unwrap();
+    assert!(matches!(o, Opinion::Allow), "{o:?}");
+    assert_eq!(n.load(Ordering::SeqCst), 1);
+}
