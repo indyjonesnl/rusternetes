@@ -15,19 +15,99 @@ pub const DEFAULT_METRICS_ADDRESS: &str = "127.0.0.1";
 /// `kubeProxy` (server.go): the component name statusz is installed with.
 pub const KUBE_PROXY: &str = "kube-proxy";
 
+/// Whether Go's `net.SplitHostPort` succeeds (the only thing
+/// `AppendPortIfNeeded` uses it for): `host:port` or `[host]:port` with no
+/// stray colons or brackets.
+fn split_host_port_ok(addr: &str) -> bool {
+    let Some(i) = addr.rfind(':') else {
+        return false; // missing port in address
+    };
+    if let Some(rest) = addr.strip_prefix('[') {
+        // "[host]:port": the ']' must directly precede the last colon.
+        let Some(end) = rest.find(']') else {
+            return false; // missing ']' in address
+        };
+        if end + 1 != i {
+            return false;
+        }
+        !rest[..end].contains(['[', ']']) && !addr[i + 1..].contains([':', '[', ']'])
+    } else {
+        // Unbracketed: any colon before the last one is a "too many colons".
+        !addr[..i].contains([':', '[', ']']) && !addr[i + 1..].contains(['[', ']'])
+    }
+}
+
 /// `proxyutil.AppendPortIfNeeded` (pkg/proxy/util/utils.go:157-176).
-pub fn append_port_if_needed(addr: &str, _port: u16) -> String {
-    addr.to_string()
+pub fn append_port_if_needed(addr: &str, port: u16) -> String {
+    // Return if address is already in "ipv4:port" or "[ipv6]:port" format.
+    if split_host_port_ok(addr) {
+        return addr.to_string();
+    }
+    // Simply return for invalid case. This should be caught by validation instead.
+    match addr.parse::<std::net::IpAddr>() {
+        Err(_) => addr.to_string(),
+        Ok(std::net::IpAddr::V4(_)) => format!("{addr}:{port}"),
+        Ok(std::net::IpAddr::V6(_)) => format!("[{addr}]:{port}"),
+    }
 }
 
 /// The `MetricsBindAddress` defaulting of defaults.go:52-56.
 pub fn default_metrics_bind_address(addr: &str) -> String {
-    addr.to_string()
+    if addr.is_empty() {
+        format!("{DEFAULT_METRICS_ADDRESS}:{PROXY_STATUS_PORT}")
+    } else {
+        append_port_if_needed(addr, PROXY_STATUS_PORT)
+    }
 }
 
-/// The mux of `serveMetrics` (without the listener).
-pub fn metrics_router(_proxy_mode: &str) -> Router {
-    Router::new()
+/// The mux of `serveMetrics` (server.go:463-493), without the listener.
+pub fn metrics_router(proxy_mode: &str) -> Router {
+    let proxy_mode = proxy_mode.to_string();
+    let router = Router::new().route(
+        "/proxyMode",
+        axum::routing::get(move || {
+            let proxy_mode = proxy_mode.clone();
+            async move {
+                (
+                    [
+                        ("Content-Type", "text/plain; charset=utf-8"),
+                        ("X-Content-Type-Options", "nosniff"),
+                    ],
+                    proxy_mode,
+                )
+            }
+        }),
+    );
+    // `ListedPaths()` is read before `statusz.Install`, so it lists what the
+    // mux has registered so far.
+    rusternetes_common::statusz::install_if_enabled(router, KUBE_PROXY, || {
+        rusternetes_common::statusz::Registry::new(Some(
+            rusternetes_common::compatibility::default_build_effective_version(),
+        ))
+        .with_listed_paths(vec!["/proxyMode".to_string()])
+    })
+}
+
+/// `serveMetrics` (server.go:459-518): an empty bind address disables the
+/// server; otherwise it is (re)started every 5s until it serves
+/// (`wait.UntilWithContext(ctx, fn, 5*time.Second)`), logging each failure.
+pub fn serve_metrics(bind_address: String, proxy_mode: &'static str) {
+    if bind_address.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            match tokio::net::TcpListener::bind(&bind_address).await {
+                Ok(listener) => {
+                    if let Err(e) = axum::serve(listener, metrics_router(proxy_mode)).await {
+                        tracing::error!("starting metrics server failed: {e}");
+                    }
+                }
+                Err(e) => tracing::error!("starting metrics server failed: {e}"),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    });
 }
 
 #[cfg(test)]
