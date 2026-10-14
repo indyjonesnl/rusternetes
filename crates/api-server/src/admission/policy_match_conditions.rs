@@ -276,6 +276,10 @@ impl ConditionEvaluator for CelConditions {
 }
 
 #[cfg(test)]
+#[path = "policy_match_conditions_budget_tests.rs"]
+mod budget_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
