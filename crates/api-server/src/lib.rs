@@ -23,6 +23,7 @@ pub use rusternetes_middleware::cbor;
 #[allow(dead_code)]
 pub mod apiserver_request_metrics;
 pub mod conversion;
+pub mod deprecation;
 pub mod dynamic_routes;
 pub mod endpoints;
 pub mod flow_control;
