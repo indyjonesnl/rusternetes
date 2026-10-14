@@ -6,24 +6,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-/// Version information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VersionInfo {
-    pub major: String,
-    pub minor: String,
-    #[serde(rename = "gitVersion")]
-    pub git_version: String,
-    #[serde(rename = "gitCommit")]
-    pub git_commit: String,
-    #[serde(rename = "gitTreeState")]
-    pub git_tree_state: String,
-    #[serde(rename = "buildDate")]
-    pub build_date: String,
-    #[serde(rename = "goVersion")]
-    pub go_version: String,
-    pub compiler: String,
-    pub platform: String,
-}
+/// Version information (`apimachinery/pkg/version.Info`).
+pub use rusternetes_common::compatibility::VersionInfo;
 
 /// APIVersions lists the versions that are available, to allow clients to discover
 /// the API at /api
@@ -2003,17 +1987,9 @@ pub async fn get_api_group(
 /// GET /version
 /// Returns the version information for the server
 pub async fn get_version() -> (StatusCode, Json<VersionInfo>) {
-    let version_info = VersionInfo {
-        major: "1".to_string(),
-        minor: "35".to_string(),
-        git_version: "v1.35.0".to_string(),
-        git_commit: "rusternetes-v0.1.0".to_string(),
-        git_tree_state: "clean".to_string(),
-        build_date: "2026-03-10T00:00:00Z".to_string(),
-        go_version: "rust1.83".to_string(),
-        compiler: "rustc".to_string(),
-        platform: "linux/amd64".to_string(),
-    };
+    // `routes.Version{Version: c.EffectiveVersion.Info()}`
+    // (apiserver/pkg/server/config.go:1129).
+    let version_info = rusternetes_common::compatibility::current_effective_version().info();
 
     (StatusCode::OK, Json(version_info))
 }
@@ -4534,6 +4510,21 @@ mod listed_paths_tests {
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+
+    /// config.go:1129 `routes.Version{Version: c.EffectiveVersion.Info()}`:
+    /// /version carries the emulation + min-compatibility fields.
+    #[tokio::test]
+    async fn version_endpoint_carries_emulation_fields() {
+        let (status, Json(info)) = get_version().await;
+        assert_eq!(status, StatusCode::OK);
+        let v = serde_json::to_value(info).unwrap();
+        assert_eq!(v["major"], "1");
+        assert_eq!(v["minor"], "35");
+        assert_eq!(v["emulationMajor"], "1");
+        assert_eq!(v["emulationMinor"], "35");
+        assert_eq!(v["minCompatibilityMajor"], "1");
+        assert_eq!(v["minCompatibilityMinor"], "34");
+    }
 
     /// customresource_discovery_controller.go:105 — a CRD that is not
     /// `Established` contributes nothing to discovery.
