@@ -545,3 +545,46 @@ async fn authorizes_once_per_request() {
         .unwrap();
     assert_eq!(h.authorizer_calls.load(Ordering::SeqCst), 1);
 }
+
+// ---- wiring: the filter is in the router's handler chain ----
+
+/// Through `build_router`, a denied request is answered by the filter (the
+/// `forbiddenMessage` body, one counted attempt, the handler's own check never
+/// reached), not by the handler's own authorize.
+#[tokio::test]
+async fn router_authorizes_through_the_filter() {
+    use rusternetes_test_support::harness::TestApiServer;
+    let _g = LOCK.lock().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let api = TestApiServer::builder()
+        .authorizer(Arc::new(Fake {
+            opinion: Opinion::Deny("RBAC: nope".into()),
+            error: None,
+            calls: calls.clone(),
+        }))
+        .build();
+    let before = attempts("denied");
+    let (status, body) = api.get("/api/v1/namespaces/default/pods").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        body["message"],
+        "pods is forbidden: User \"admin\" cannot list resource \"pods\" in API group \"\" in the namespace \"default\": RBAC: nope"
+    );
+    assert_eq!(body["details"]["kind"], "pods");
+    assert_eq!(attempts("denied"), before + 1);
+    // Once: the filter's; the handler never ran.
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// An allowed request authorizes in the filter once, and once more in each
+/// handler check that remains behind it, without counting again.
+#[tokio::test]
+async fn router_counts_one_attempt_for_an_allowed_request() {
+    use rusternetes_test_support::harness::TestApiServer;
+    let _g = LOCK.lock().await;
+    let api = TestApiServer::new();
+    let before = attempts("allowed");
+    let (status, _) = api.get("/api/v1/namespaces/default/pods").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(attempts("allowed"), before + 1);
+}
