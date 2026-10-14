@@ -240,4 +240,26 @@ mod tests {
         assert!(!is_already_exists(&other));
         assert!(!is_conflict(&other));
     }
+
+    /// Typed errors whose message does not carry the reason token: the
+    /// predicates must follow apimachinery `IsConflict` (errors.go:548-557,
+    /// code fallback for an unknown reason) and `IsAlreadyExists` (:542-544,
+    /// reason only), not substring-match the rendered text.
+    #[test]
+    fn predicates_use_typed_status_not_message() {
+        use crate::api_status::ApiStatusError;
+        let typed = |code: u16, reason: &str, message: &str| {
+            anyhow::Error::new(ApiStatusError {
+                code,
+                reason: reason.into(),
+                message: message.into(),
+            })
+        };
+        // 409 with an unknown reason and an opaque message is a Conflict.
+        assert!(is_conflict(&typed(409, "", "request failed with status 409")));
+        // A message that merely mentions "Conflict" is not one (reason Invalid).
+        assert!(!is_conflict(&typed(422, "Invalid", "field Conflict is invalid")));
+        // AlreadyExists is reason-only: no code fallback.
+        assert!(!is_already_exists(&typed(409, "", "AlreadyExists")));
+    }
 }

@@ -1396,6 +1396,33 @@ mod tests {
         );
     }
 
+    /// `isExpiredError` (reflector.go:1051-1058) = `IsResourceExpired ||
+    /// IsGone`; `IsGone` has the code fallback (errors.go:574-583), so a bare
+    /// 410 with no reason is expired, and the rendered text is irrelevant.
+    #[test]
+    fn is_expired_error_uses_typed_status() {
+        use rusternetes_client::api_status::ApiStatusError;
+        let typed = |code: u16, reason: &str, message: &str| {
+            anyhow::Error::new(ApiStatusError {
+                code,
+                reason: reason.into(),
+                message: message.into(),
+            })
+        };
+        assert!(is_expired_error(&typed(410, "", "request failed with status 410")));
+        assert!(is_expired_error(&typed(410, "Expired", "too old")));
+        assert!(is_expired_error(&typed(
+            0,
+            "Expired",
+            "wrapped text without the token"
+        )));
+        assert!(!is_expired_error(&typed(
+            500,
+            "InternalError",
+            "Error from server (Gone): spoofed"
+        )));
+    }
+
     #[test]
     fn map_write_err_maps_unsupported_media_type() {
         let e = anyhow::Error::new(rusternetes_client::api_status::ApiStatusError {

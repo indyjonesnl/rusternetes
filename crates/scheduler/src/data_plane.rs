@@ -624,4 +624,36 @@ mod tests {
         let e = anyhow::anyhow!("Error from server (Conflict): pod already assigned");
         assert!(matches!(api_err_to_common(e), Error::Conflict(_)));
     }
+
+    /// Typed `ApiStatusError`s must classify by reason/code (apimachinery
+    /// `IsNotFound`/`IsConflict`/`IsAlreadyExists`, errors.go:529-557), not by
+    /// the rendered message.
+    #[test]
+    fn api_err_classifies_by_typed_status() {
+        use rusternetes_client::api_status::ApiStatusError;
+        let typed = |code: u16, reason: &str, message: &str| {
+            anyhow::Error::new(ApiStatusError {
+                code,
+                reason: reason.into(),
+                message: message.into(),
+            })
+        };
+        assert!(matches!(
+            api_err_to_common(typed(409, "", "request failed with status 409")),
+            Error::Conflict(_)
+        ));
+        assert!(matches!(
+            api_err_to_common(typed(404, "", "request failed with status 404")),
+            Error::NotFound(_)
+        ));
+        assert!(matches!(
+            api_err_to_common(typed(409, "AlreadyExists", "exists")),
+            Error::Conflict(_)
+        ));
+        // A message that mentions "(Conflict)" on a non-conflict status.
+        assert!(matches!(
+            api_err_to_common(typed(500, "InternalError", "x (Conflict) y")),
+            Error::Internal(_)
+        ));
+    }
 }
