@@ -8,15 +8,15 @@
 
 use prometheus::core::{Collector, Desc};
 use prometheus::proto::MetricFamily;
-use prometheus::{register, IntCounterVec, IntGaugeVec, Opts};
+use prometheus::{IntCounterVec, IntGaugeVec, Opts, Registry};
 use sha2::{Digest, Sha256};
-use std::sync::{LazyLock, Once, RwLock};
+use std::sync::{Arc, LazyLock, Once, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const NAMESPACE: &str = "apiserver";
 const SUBSYSTEM: &str = "authorization_config_controller";
 
-static AUTOMATIC_RELOADS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+fn reloads_total_vec() -> IntCounterVec {
     IntCounterVec::new(
         Opts::new(
             "automatic_reloads_total",
@@ -27,22 +27,20 @@ static AUTOMATIC_RELOADS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
         &["status", "apiserver_id_hash"],
     )
     .expect("valid metric")
-});
+}
 
-static AUTOMATIC_RELOAD_LAST_TIMESTAMP_SECONDS: LazyLock<prometheus::GaugeVec> = LazyLock::new(
-    || {
-        prometheus::GaugeVec::new(
-            Opts::new(
-                "automatic_reload_last_timestamp_seconds",
-                "[BETA] Timestamp of the last automatic reload of authorization configuration split by status and apiserver identity.",
-            )
-            .namespace(NAMESPACE)
-            .subsystem(SUBSYSTEM),
-            &["status", "apiserver_id_hash"],
+fn last_timestamp_vec() -> prometheus::GaugeVec {
+    prometheus::GaugeVec::new(
+        Opts::new(
+            "automatic_reload_last_timestamp_seconds",
+            "[BETA] Timestamp of the last automatic reload of authorization configuration split by status and apiserver identity.",
         )
-        .expect("valid metric")
-    },
-);
+        .namespace(NAMESPACE)
+        .subsystem(SUBSYSTEM),
+        &["status", "apiserver_id_hash"],
+    )
+    .expect("valid metric")
+}
 
 fn last_config_info_vec() -> IntGaugeVec {
     IntGaugeVec::new(
@@ -57,13 +55,12 @@ fn last_config_info_vec() -> IntGaugeVec {
     .expect("valid metric")
 }
 
-/// `configmetrics.AtomicHashProvider` (`SetHashes` / `GetCurrentHashes`).
-static CONFIG_HASHES: RwLock<Vec<String>> = RwLock::new(Vec::new());
-
 /// `configmetrics.NewConfigInfoCustomCollector`: emits one gauge of value 1
-/// carrying the current hashes, or nothing while none are set.
+/// carrying the current hashes, or nothing while none are set. `hashes` is
+/// the `AtomicHashProvider` (`SetHashes` / `GetCurrentHashes`).
 struct ConfigInfoCollector {
     template: IntGaugeVec,
+    hashes: Arc<RwLock<Vec<String>>>,
 }
 
 impl Collector for ConfigInfoCollector {
@@ -72,7 +69,7 @@ impl Collector for ConfigInfoCollector {
     }
 
     fn collect(&self) -> Vec<MetricFamily> {
-        let hashes = CONFIG_HASHES.read().unwrap().clone();
+        let hashes = self.hashes.read().unwrap().clone();
         if hashes.is_empty() {
             return vec![];
         }
@@ -83,60 +80,112 @@ impl Collector for ConfigInfoCollector {
     }
 }
 
+/// The metric set of metrics.go as an instance. Upstream keeps these as
+/// package vars on `legacyregistry`, which is safe there because `go test`
+/// runs each package in its own process; `cargo test` shares one process
+/// across every module, so unit tests build a private instance + registry
+/// ([`Metrics::new`]) while production uses the process-global one.
+pub struct Metrics {
+    automatic_reloads_total: IntCounterVec,
+    automatic_reload_last_timestamp_seconds: prometheus::GaugeVec,
+    hashes: Arc<RwLock<Vec<String>>>,
+}
+
+impl Metrics {
+    pub fn new() -> Self {
+        Self {
+            automatic_reloads_total: reloads_total_vec(),
+            automatic_reload_last_timestamp_seconds: last_timestamp_vec(),
+            hashes: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
+
+    /// `RegisterMetrics` (metrics.go:80-91) against `registry`.
+    pub fn register_with(&self, registry: &Registry) {
+        let _ = registry.register(Box::new(self.automatic_reloads_total.clone()));
+        let _ = registry.register(Box::new(
+            self.automatic_reload_last_timestamp_seconds.clone(),
+        ));
+        let _ = registry.register(Box::new(ConfigInfoCollector {
+            template: last_config_info_vec(),
+            hashes: self.hashes.clone(),
+        }));
+    }
+
+    /// `ResetMetricsForTest` (metrics.go:93-96).
+    pub fn reset(&self) {
+        self.automatic_reloads_total.reset();
+        self.automatic_reload_last_timestamp_seconds.reset();
+    }
+
+    fn set_to_current_time(&self, status: &str, id_hash: &str) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        self.automatic_reload_last_timestamp_seconds
+            .with_label_values(&[status, id_hash])
+            .set(now);
+    }
+
+    /// `RecordAuthorizationConfigAutomaticReloadFailure` (metrics.go:98-102).
+    pub fn record_failure(&self, api_server_id: &str) {
+        let id_hash = get_hash(api_server_id);
+        self.automatic_reloads_total
+            .with_label_values(&["failure", &id_hash])
+            .inc();
+        self.set_to_current_time("failure", &id_hash);
+    }
+
+    /// `RecordAuthorizationConfigAutomaticReloadSuccess` (metrics.go:104-111).
+    pub fn record_success(&self, api_server_id: &str, authz_config_data: &str) {
+        let id_hash = get_hash(api_server_id);
+        self.automatic_reloads_total
+            .with_label_values(&["success", &id_hash])
+            .inc();
+        self.set_to_current_time("success", &id_hash);
+        self.record_last_config_info(api_server_id, authz_config_data);
+    }
+
+    /// `RecordAuthorizationConfigLastConfigInfo` (metrics.go:113-115).
+    pub fn record_last_config_info(&self, api_server_id: &str, authz_config_data: &str) {
+        *self.hashes.write().unwrap() = vec![get_hash(api_server_id), get_hash(authz_config_data)];
+    }
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+static GLOBAL: LazyLock<Metrics> = LazyLock::new(Metrics::new);
+
 static REGISTER: Once = Once::new();
 
-/// `RegisterMetrics` (metrics.go:80-91).
+/// `RegisterMetrics` (metrics.go:80-91) on the default registry.
 pub fn register_metrics() {
-    REGISTER.call_once(|| {
-        let _ = register(Box::new(AUTOMATIC_RELOADS_TOTAL.clone()));
-        let _ = register(Box::new(AUTOMATIC_RELOAD_LAST_TIMESTAMP_SECONDS.clone()));
-        let _ = register(Box::new(ConfigInfoCollector {
-            template: last_config_info_vec(),
-        }));
-    });
+    REGISTER.call_once(|| GLOBAL.register_with(prometheus::default_registry()));
 }
 
 /// `ResetMetricsForTest` (metrics.go:93-96).
 pub fn reset_metrics_for_test() {
-    AUTOMATIC_RELOADS_TOTAL.reset();
-    AUTOMATIC_RELOAD_LAST_TIMESTAMP_SECONDS.reset();
+    GLOBAL.reset();
 }
 
-fn set_to_current_time(status: &str, id_hash: &str) {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
-    AUTOMATIC_RELOAD_LAST_TIMESTAMP_SECONDS
-        .with_label_values(&[status, id_hash])
-        .set(now);
-}
-
-/// `RecordAuthorizationConfigAutomaticReloadFailure` (metrics.go:98-102).
 pub fn record_authorization_config_automatic_reload_failure(api_server_id: &str) {
-    let id_hash = get_hash(api_server_id);
-    AUTOMATIC_RELOADS_TOTAL
-        .with_label_values(&["failure", &id_hash])
-        .inc();
-    set_to_current_time("failure", &id_hash);
+    GLOBAL.record_failure(api_server_id);
 }
 
-/// `RecordAuthorizationConfigAutomaticReloadSuccess` (metrics.go:104-111).
 pub fn record_authorization_config_automatic_reload_success(
     api_server_id: &str,
     authz_config_data: &str,
 ) {
-    let id_hash = get_hash(api_server_id);
-    AUTOMATIC_RELOADS_TOTAL
-        .with_label_values(&["success", &id_hash])
-        .inc();
-    set_to_current_time("success", &id_hash);
-    record_authorization_config_last_config_info(api_server_id, authz_config_data);
+    GLOBAL.record_success(api_server_id, authz_config_data);
 }
 
-/// `RecordAuthorizationConfigLastConfigInfo` (metrics.go:113-115).
 pub fn record_authorization_config_last_config_info(api_server_id: &str, authz_config_data: &str) {
-    *CONFIG_HASHES.write().unwrap() = vec![get_hash(api_server_id), get_hash(authz_config_data)];
+    GLOBAL.record_last_config_info(api_server_id, authz_config_data);
 }
 
 /// `getHash` (metrics.go:117-127): empty data hashes to the empty string.
@@ -150,7 +199,6 @@ pub fn get_hash(data: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     // metrics_test.go:28-29.
     const TEST_API_SERVER_ID: &str = "testAPIServerID";
@@ -162,11 +210,17 @@ mod tests {
     const CONFIG_HASH: &str =
         "sha256:2a66c95e5593fc74e6c3dbbb708741361f0690ed45d17e4d4ac0b9c282b6538f";
 
-    /// The tests share process-global metrics; serialise them.
-    static LOCK: Mutex<()> = Mutex::new(());
+    /// Private metrics + registry per test (no shared process state, so no
+    /// serialisation needed; see [`Metrics`]).
+    fn fixture() -> (Metrics, Registry) {
+        let m = Metrics::new();
+        let r = Registry::new();
+        m.register_with(&r);
+        (m, r)
+    }
 
-    fn family(name: &str) -> Option<prometheus::proto::MetricFamily> {
-        prometheus::gather().into_iter().find(|f| f.name() == name)
+    fn family(r: &Registry, name: &str) -> Option<prometheus::proto::MetricFamily> {
+        r.gather().into_iter().find(|f| f.name() == name)
     }
 
     fn label<'a>(m: &'a prometheus::proto::Metric, name: &str) -> &'a str {
@@ -187,12 +241,13 @@ mod tests {
     // TestRecordAuthorizationConfigAutomaticReloadFailure (metrics_test.go:53-70).
     #[test]
     fn failure_is_counted_by_status_and_id_hash() {
-        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        register_metrics();
-        reset_metrics_for_test();
-        record_authorization_config_automatic_reload_failure(TEST_API_SERVER_ID);
-        let f =
-            family("apiserver_authorization_config_controller_automatic_reloads_total").unwrap();
+        let (m, r) = fixture();
+        m.record_failure(TEST_API_SERVER_ID);
+        let f = family(
+            &r,
+            "apiserver_authorization_config_controller_automatic_reloads_total",
+        )
+        .unwrap();
         assert_eq!(
             f.help(),
             "[BETA] Total number of automatic reloads of authorization configuration split by status and apiserver identity."
@@ -207,16 +262,21 @@ mod tests {
     // _StaleMetricCleanup (:121-): only the latest config hash is exposed.
     #[test]
     fn success_exposes_only_the_latest_config_info() {
-        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        register_metrics();
-        reset_metrics_for_test();
-        record_authorization_config_automatic_reload_success(TEST_API_SERVER_ID, "config1");
-        record_authorization_config_automatic_reload_success(TEST_API_SERVER_ID, "config2");
-        let f =
-            family("apiserver_authorization_config_controller_automatic_reloads_total").unwrap();
+        let (m, r) = fixture();
+        m.record_success(TEST_API_SERVER_ID, "config1");
+        m.record_success(TEST_API_SERVER_ID, "config2");
+        let f = family(
+            &r,
+            "apiserver_authorization_config_controller_automatic_reloads_total",
+        )
+        .unwrap();
         assert_eq!(label(&f.get_metric()[0], "status"), "success");
         assert_eq!(f.get_metric()[0].get_counter().value(), 2.0);
-        let info = family("apiserver_authorization_config_controller_last_config_info").unwrap();
+        let info = family(
+            &r,
+            "apiserver_authorization_config_controller_last_config_info",
+        )
+        .unwrap();
         assert_eq!(
             info.help(),
             "[ALPHA] Information about the last applied authorization configuration with hash as label, split by apiserver identity."
@@ -226,12 +286,34 @@ mod tests {
         assert_eq!(info.get_metric()[0].get_gauge().value(), 1.0);
     }
 
+    // Regression for the flake: `ReloadableAuthorizer::spawn_reload` (run by
+    // authorizer.rs tests in the same process, without LOCK) writes the global
+    // hashes at any moment. A foreign writer landing mid-test must not change
+    // what this test observes.
+    #[test]
+    fn foreign_global_writer_does_not_leak_into_isolated_metrics() {
+        let (m, r) = fixture();
+        m.record_success(TEST_API_SERVER_ID, "config1");
+        record_authorization_config_last_config_info("interloper", "other"); // global, foreign
+        m.record_success(TEST_API_SERVER_ID, "config2");
+        record_authorization_config_last_config_info("interloper", "other"); // global, foreign
+        let info = family(
+            &r,
+            "apiserver_authorization_config_controller_last_config_info",
+        )
+        .unwrap();
+        assert_eq!(label(&info.get_metric()[0], "hash"), get_hash("config2"));
+    }
+
     #[test]
     fn last_config_info_hash_label_is_sha256_of_the_data() {
-        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        register_metrics();
-        record_authorization_config_last_config_info(TEST_API_SERVER_ID, TEST_CONFIG_DATA);
-        let info = family("apiserver_authorization_config_controller_last_config_info").unwrap();
+        let (m, r) = fixture();
+        m.record_last_config_info(TEST_API_SERVER_ID, TEST_CONFIG_DATA);
+        let info = family(
+            &r,
+            "apiserver_authorization_config_controller_last_config_info",
+        )
+        .unwrap();
         assert_eq!(
             label(&info.get_metric()[0], "apiserver_id_hash"),
             TEST_API_SERVER_ID_HASH
@@ -242,11 +324,10 @@ mod tests {
     // TestAuthorizationConfigAutomaticReloadLastTimestampSeconds (:95-).
     #[test]
     fn last_timestamp_gauge_is_named_and_labelled_like_upstream() {
-        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        register_metrics();
-        reset_metrics_for_test();
-        record_authorization_config_automatic_reload_failure(TEST_API_SERVER_ID);
+        let (m, r) = fixture();
+        m.record_failure(TEST_API_SERVER_ID);
         let f = family(
+            &r,
             "apiserver_authorization_config_controller_automatic_reload_last_timestamp_seconds",
         )
         .unwrap();
