@@ -27,6 +27,8 @@ fn kubelet_config_is_cni_only_no_netstack_surface() {
         sync_interval: 3,
         metrics_port: 10250,
         kubernetes_service_host: "10.96.0.1".to_string(),
+        node_ip: String::new(),
+        cloud_provider: String::new(),
     };
 
     // Sanity: the default config is equivalent on the fields we set.

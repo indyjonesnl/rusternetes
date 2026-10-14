@@ -182,6 +182,16 @@ struct Args {
     #[arg(long, default_value = "3")]
     kubelet_sync_interval: u64,
 
+    /// IP address (or dual-stack pair "v4,v6") of the embedded kubelet's node
+    /// (upstream kubelet `--node-ip`, same semantics).
+    #[arg(long, default_value = "")]
+    node_ip: String,
+
+    /// Cloud provider of the embedded kubelet: empty, or `external` (upstream
+    /// kubelet `--cloud-provider`).
+    #[arg(long, default_value = "")]
+    cloud_provider: String,
+
     /// Kube-proxy sync interval in seconds
     #[arg(long, default_value = "1")]
     proxy_sync_interval: u64,
@@ -534,6 +544,8 @@ async fn async_main() -> Result<()> {
         network: args.network,
         sync_interval: args.kubelet_sync_interval,
         metrics_port: 10250,
+        node_ip: args.node_ip.clone(),
+        cloud_provider: args.cloud_provider.clone(),
         kubernetes_service_host: args
             .kubernetes_service_host
             .clone()

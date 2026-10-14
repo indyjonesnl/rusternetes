@@ -148,9 +148,30 @@ pub fn is_external_cloud_provider(name: &str) -> bool {
 
 /// `NewMainKubelet` cloud-provider gate (kubelet.go:461-464): only "" and
 /// "external" are accepted; any other name is an
-/// `ErrorForDisabledProvider` (cloud-provider/plugins.go:94-96). STUB.
-pub fn validate_cloud_provider(_name: &str) -> Result<(), String> {
+/// `ErrorForDisabledProvider` (cloud-provider/plugins.go:94-96).
+pub fn validate_cloud_provider(name: &str) -> Result<(), String> {
+    if !is_external_cloud_provider(name) && !name.is_empty() {
+        return Err(format!(
+            "cloud provider {name:?} was specified, but built-in cloud providers are disabled. Please set --cloud-provider=external and migrate to an external cloud provider"
+        ));
+    }
     Ok(())
+}
+
+/// `RunKubelet`'s `ParseNodeIPArgument(kubeServer.NodeIP,
+/// kubeServer.CloudProvider)` (cmd/kubelet/app/server.go:1216-1222) followed
+/// by `NewMainKubelet`'s cloud-provider gate and
+/// `externalCloudProvider = cloudprovider.IsExternal(cloudProvider)`
+/// (kubelet.go:461-464, 619). Returns `(nodeIPs, externalCloudProvider)`;
+/// unparsable tokens are logged and ignored.
+pub fn node_ip_config(node_ip: &str, cloud_provider: &str) -> Result<(Vec<IpAddr>, bool), String> {
+    let (ips, invalid) = parse_node_ip_argument(node_ip, cloud_provider)
+        .map_err(|e| format!("bad --node-ip {node_ip:?}: {e}"))?;
+    if !invalid.is_empty() {
+        tracing::warn!("Could not parse some node IP(s), ignoring them: {invalid:?}");
+    }
+    validate_cloud_provider(cloud_provider)?;
+    Ok((ips, is_external_cloud_provider(cloud_provider)))
 }
 
 /// `nodestatus.NodeAddress` Setter (setters.go:62-135): mutates `node`'s
@@ -621,6 +642,26 @@ mod tests {
         );
         assert!(is_external_cloud_provider("external"));
         assert!(!is_external_cloud_provider(""));
+    }
+
+    // server.go:1216-1222 + kubelet.go:461-464, 619
+    #[test]
+    fn node_ip_config_parses_and_gates_cloud_provider() {
+        assert_eq!(node_ip_config("", "").unwrap(), (vec![], false));
+        assert_eq!(
+            node_ip_config("10.1.1.1,fd00::1", "external").unwrap(),
+            (vec![ip("10.1.1.1"), ip("fd00::1")], true)
+        );
+        assert!(node_ip_config("10.1.1.1", "aws")
+            .unwrap_err()
+            .contains("built-in cloud providers are disabled"));
+        // ParseNodeIPArgument rejects dual-stack for a legacy provider first.
+        assert!(node_ip_config("10.1.1.1,fd00::1", "aws")
+            .unwrap_err()
+            .contains("dual-stack not supported in this configuration"));
+        assert!(node_ip_config("10.1.1.1,10.1.1.2", "")
+            .unwrap_err()
+            .starts_with("bad --node-ip"));
     }
 
     // ---- setters_test.go TestNodeAddress (cloud-provider cases) ----
