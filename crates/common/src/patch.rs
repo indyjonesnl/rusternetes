@@ -968,6 +968,17 @@ fn strategic_merge_arrays_with(
     patch: &[Value],
     strategy: Option<MergeKeyStrategy>,
 ) -> Result<Vec<Value>, PatchError> {
+    // `mergeSliceWithSpecialElements` (patch.go:1548-1587): a `$patch: replace`
+    // element makes the patch items (minus every `$patch` element) the whole
+    // list, whatever the original held.
+    if patch.iter().any(|v| {
+        v.as_object()
+            .and_then(|o| o.get("$patch"))
+            .and_then(|d| d.as_str())
+            == Some("replace")
+    }) {
+        return Ok(remove_directives(patch));
+    }
     let strategy = match strategy {
         Some(s) => s,
         None => {
