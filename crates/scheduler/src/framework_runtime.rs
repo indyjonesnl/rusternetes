@@ -454,6 +454,8 @@ pub struct ProfileSpec<'a> {
     pub plugins: Option<&'a Plugins>,
     /// `profile.PluginConfig[].Name`, for the duplicate-config check.
     pub plugin_config_names: &'a [String],
+    /// `profile.PercentageOfNodesToScore` (framework.go:354).
+    pub percentage_of_nodes_to_score: Option<i32>,
 }
 
 /// A resolved profile framework: per-extension-point plugin lists (after
@@ -461,6 +463,9 @@ pub struct ProfileSpec<'a> {
 #[derive(Debug, Clone, Default)]
 pub struct Framework {
     pub profile_name: String,
+    /// `f.percentageOfNodesToScore` (framework.go:354); set even when the
+    /// profile has no plugins.
+    pub percentage_of_nodes_to_score: Option<i32>,
     lists: HashMap<ExtensionPoint, Vec<String>>,
     score_plugin_weight: HashMap<String, i32>,
 }
@@ -522,6 +527,7 @@ impl Framework {
 pub fn new_framework(r: &Registry, profile: &ProfileSpec<'_>) -> Result<Framework, String> {
     let mut f = Framework {
         profile_name: profile.scheduler_name.to_string(),
+        percentage_of_nodes_to_score: profile.percentage_of_nodes_to_score,
         ..Default::default()
     };
     let Some(plugins) = profile.plugins else {
@@ -793,6 +799,7 @@ mod tests {
                 scheduler_name: "p",
                 plugins: Some(p),
                 plugin_config_names: &[],
+                ..Default::default()
             },
         )
     }
@@ -850,6 +857,7 @@ mod tests {
                 scheduler_name: "p",
                 plugins: Some(&p),
                 plugin_config_names: &[TEST_PLUGIN.to_string(), TEST_PLUGIN.to_string()],
+                ..Default::default()
             },
         )
         .unwrap_err();
@@ -1018,6 +1026,7 @@ mod tests {
                 scheduler_name: "p",
                 plugins: None,
                 plugin_config_names: &[],
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1036,6 +1045,7 @@ mod tests {
                 scheduler_name: "default-scheduler",
                 plugins: Some(&d),
                 plugin_config_names: &[],
+                ..Default::default()
             },
         )
         .unwrap();

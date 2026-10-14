@@ -18,6 +18,7 @@ use crate::framework_runtime::{
 };
 use crate::scheduler_config::VolumeBindingArgs;
 use crate::volume_binding::{self, FunctionShapePoint};
+use rusternetes_common::resources::pod::NodeAffinity;
 use rusternetes_common::resources::Pod;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -46,6 +47,17 @@ pub struct Profile {
     pub volume_bind_timeout: Duration,
     /// Resolved `VolumeBinding` scorer shape (`VolumeBindingArgs.Shape`).
     pub volume_shape: Vec<FunctionShapePoint>,
+    /// `KubeSchedulerProfile.PercentageOfNodesToScore`: overrides the global
+    /// value when set (`numFeasibleNodesToFind`, schedule_one.go:717-723).
+    pub percentage_of_nodes_to_score: Option<i32>,
+    /// `NodeAffinityArgs.AddedAffinity` (node_affinity.go:310-333
+    /// `addedNodeSelector` / `addedPrefSchedTerms`).
+    pub added_affinity: Option<NodeAffinity>,
+    /// `DefaultPreemptionArgs.MinCandidateNodesPercentage`
+    /// (default_preemption.go:174-183 `calculateNumCandidates`).
+    pub min_candidate_nodes_percentage: i32,
+    /// `DefaultPreemptionArgs.MinCandidateNodesAbsolute`.
+    pub min_candidate_nodes_absolute: i32,
     /// The built framework for this profile (plugins per extension point +
     /// score weights). [`Map::new_map`] rebuilds it from `plugins`.
     pub framework: Framework,
@@ -63,6 +75,11 @@ impl Profile {
             queue_sort_args: None,
             volume_bind_timeout: crate::volume_bind::DEFAULT_BIND_TIMEOUT,
             volume_shape: volume_binding::default_shape(),
+            percentage_of_nodes_to_score: None,
+            added_affinity: None,
+            // SetDefaults_DefaultPreemptionArgs (v1/defaults.go:177-184).
+            min_candidate_nodes_percentage: 10,
+            min_candidate_nodes_absolute: 100,
             framework: Framework::default(),
         };
         p.framework = p
@@ -79,6 +96,7 @@ impl Profile {
                 scheduler_name: &self.scheduler_name,
                 plugins: self.plugins.as_ref(),
                 plugin_config_names: &self.plugin_config_names,
+                percentage_of_nodes_to_score: self.percentage_of_nodes_to_score,
             },
         )
     }
@@ -100,6 +118,11 @@ impl Profile {
 #[derive(Debug, Clone, Default)]
 pub struct Map {
     profiles: HashMap<String, Profile>,
+    /// The global `KubeSchedulerConfiguration.PercentageOfNodesToScore`
+    /// (`Scheduler.percentageOfNodesToScore`, scheduler.go:142;
+    /// `DefaultPercentageOfNodesToScore` = 0, types.go:217). Carried beside
+    /// the profiles because both come from the one configuration.
+    pub percentage_of_nodes_to_score: i32,
 }
 
 impl Map {
