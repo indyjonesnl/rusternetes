@@ -1563,3 +1563,74 @@ mod pod_update_whole {
         assert!(errs.is_empty(), "{errs:?}");
     }
 }
+
+// validatePodMetadataAndSpec's pod-only rules (validation.go:4511-4527) run on
+// ValidatePodCreate (validation.go:5602) and on ValidatePodResize (:6221), not
+// just ValidatePodUpdate.
+mod pod_only_rules_on_create_and_resize {
+    use super::*;
+    use rusternetes_common::validation::pod_subresource::validate_pod_resize;
+
+    fn sa_token_pod(service_account_name: Option<&str>) -> Pod {
+        let mut spec = minimal_spec(vec![minimal_container("c", "nginx")]);
+        spec.service_account_name = service_account_name.map(str::to_string);
+        spec.volumes = Some(vec![serde_json::from_value(serde_json::json!({
+            "name": "tok",
+            "projected": {"sources": [{"serviceAccountToken": {"path": "token"}}]}
+        }))
+        .unwrap()]);
+        pod_with_spec(spec)
+    }
+
+    #[test]
+    fn create_forbids_sa_token_without_service_account_name() {
+        let errs = validate_pod_create(&sa_token_pod(None), true);
+        assert!(
+            errs.iter().any(|e| e.field
+                == "spec.volumes[0].projected.sources[0].serviceAccountToken"
+                && e.detail == "must not be specified when serviceAccountName is not set"),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn create_allows_sa_token_with_service_account_name() {
+        let errs = validate_pod_create(&sa_token_pod(Some("default")), true);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn create_rejects_whitespace_padded_images() {
+        let mut pod = pod_with_spec(minimal_spec(vec![minimal_container("c", "nginx ")]));
+        pod.spec.as_mut().unwrap().init_containers = Some(vec![minimal_container("i", " busybox")]);
+        let errs = validate_pod_create(&pod, true);
+        for f in ["spec.containers[0].image", "spec.initContainers[0].image"] {
+            assert!(
+                errs.iter()
+                    .any(|e| e.field == f
+                        && e.detail == "must not have leading or trailing whitespace"),
+                "{f}: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resize_runs_pod_only_rules() {
+        let mut pod = sa_token_pod(None);
+        pod.metadata.resource_version = Some("1".to_string());
+        let errs = validate_pod_resize(&pod, &pod);
+        assert!(
+            errs.iter()
+                .any(|e| e.field == "spec.volumes[0].projected.sources[0].serviceAccountToken"),
+            "{errs:?}"
+        );
+        let mut ws = pod_with_spec(minimal_spec(vec![minimal_container("c", "nginx ")]));
+        ws.metadata.resource_version = Some("1".to_string());
+        let errs = validate_pod_resize(&ws, &ws);
+        assert!(
+            errs.iter().any(|e| e.field == "spec.containers[0].image"
+                && e.detail == "must not have leading or trailing whitespace"),
+            "{errs:?}"
+        );
+    }
+}

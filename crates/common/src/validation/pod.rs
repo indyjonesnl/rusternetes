@@ -150,6 +150,11 @@ pub fn validate_pod_create(pod: &Pod, allow_relaxed_dns_search: bool) -> ErrorLi
         allow_relaxed_dns_search,
         allow_taint_toleration_comparison_operators(None),
     ));
+    // `validatePodMetadataAndSpec` runs the pod-only rules for both
+    // `ValidatePodCreate` (validation.go:5602) and `ValidatePodResize`
+    // (:6221). ServiceAccount admission has already defaulted
+    // `serviceAccountName` by the time the strategy validates.
+    errs.extend(validate_pod_only_rules(spec, &spec_path));
     errs
 }
 
