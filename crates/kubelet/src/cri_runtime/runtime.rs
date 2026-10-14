@@ -30,7 +30,7 @@ use rusternetes_cri::{v1, CriClient, CriError};
 use rusternetes_storage::{build_prefix, Storage};
 use tracing::{debug, warn};
 
-use super::{probe, status, translate};
+use super::{image_volume_metrics, probe, status, translate};
 
 /// If `err` is containerd's "sandbox name already reserved" `RunPodSandbox`
 /// failure, return the id of the orphaned sandbox currently holding the
@@ -49,6 +49,20 @@ fn reserved_sandbox_id(err: &CriError) -> Option<String> {
     let rest = &msg[start..];
     rest.find('"').map(|end| rest[..end].to_string())
 }
+
+/// Marks a failed `CreateContainer` (upstream `ErrCreateContainer` with the
+/// gRPC status message as `msg`, `kuberuntime_container.go:277-282`).
+/// `Display` is the message only.
+#[derive(Debug)]
+struct CreateContainerFailed(String);
+
+impl std::fmt::Display for CreateContainerFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CreateContainerFailed {}
 
 /// Per-probe threshold-tracking state for the liveness/startup probe state
 /// machine. Mirrors the bollard runtime's `ProbeState`.
@@ -392,6 +406,8 @@ impl CriContainerRuntime {
     /// Connect to the CRI runtime at `socket`. `log_root` is the base dir for per-pod container logs.
     pub async fn connect(socket: impl AsRef<Path>, log_root: impl Into<String>) -> Result<Self> {
         let cri = CriClient::connect(socket).await?;
+        // `metrics.Register` (`metrics.go:1300-1304`), gated on ImageVolume.
+        image_volume_metrics::register_image_volume_metrics();
         Ok(Self {
             cri,
             log_root: log_root.into(),
@@ -696,9 +712,16 @@ impl CriContainerRuntime {
         // `EnsureImageExists` (`images/image_manager.go:194`): the pod runtime
         // handler goes in the ImageSpec of both ImageStatus and PullImage.
         let handler = self.pod_runtime_handler(event_ctx.map(|(p, _)| p)).await?;
+        // `EnsureImageExists` (`images/image_manager.go:185-192`): the pod's
+        // annotations ride in the ImageSpec of ImageStatus and PullImage
+        // (`toRuntimeAPIImageSpec`, `kuberuntime/convert.go:63-81`).
+        let annotations = event_ctx
+            .and_then(|(p, _)| p.metadata.annotations.clone())
+            .unwrap_or_default();
+        let spec = rusternetes_cri::to_runtime_api_image_spec(image, &handler, &annotations);
 
         if policy != "Always" {
-            let present = cri.image_status_for_handler(image, &handler, false).await?;
+            let present = cri.image_status_spec(spec.clone(), false).await?;
             if let Some(present) = present {
                 return Ok(present.id);
             }
@@ -710,7 +733,7 @@ impl CriContainerRuntime {
                 }));
             }
         }
-        Ok(cri.pull_image(image, Some(&handler), None).await?)
+        Ok(cri.pull_image_spec(spec, None).await?)
     }
 
     /// Port of `getImageVolumes` (`kuberuntime_manager.go:1813-1850`): pull
@@ -927,7 +950,61 @@ impl CriContainerRuntime {
         // fail late here to populate the ErrImagePull and ImagePullBackOff
         // correctly to the end user." Before the container's own image pull,
         // as `startContainer` follows it.
+        for msg in
+            image_volume_metrics::image_volume_pull_failure_events(image_volume_pulls, container)
+        {
+            // `recordContainerEvent(... FailedToCreateContainer, "Error: %v", s.Message())`
+            // (`kuberuntime_manager.go:1792-1800`).
+            self.emit_event(
+                pod,
+                Some(&container.name),
+                crate::events::FAILED_CONTAINER,
+                rusternetes_common::resources::EventType::Warning,
+                &msg,
+            )
+            .await;
+        }
         let image_volumes = to_kube_container_image_volumes(image_volume_pulls, container)?;
+        let res = self
+            .start_container_with_image_volumes(
+                cri,
+                pod,
+                container,
+                sandbox_id,
+                sandbox_cfg,
+                host_paths,
+                &image_volumes,
+            )
+            .await;
+        // `incrementImageVolumeMetrics(err, msg, ...)` (`:1659`).
+        let (is_create_err, msg) = match &res {
+            Err(e) => match e.downcast_ref::<CreateContainerFailed>() {
+                Some(c) => (true, c.0.clone()),
+                None => (false, String::new()),
+            },
+            Ok(_) => (false, String::new()),
+        };
+        image_volume_metrics::increment_image_volume_metrics(
+            is_create_err,
+            &msg,
+            container,
+            &image_volumes,
+        );
+        res
+    }
+
+    /// `startContainer` after the image volumes are resolved.
+    #[allow(clippy::too_many_arguments)]
+    async fn start_container_with_image_volumes(
+        &self,
+        cri: &mut CriClient,
+        pod: &Pod,
+        container: &rusternetes_common::resources::pod::Container,
+        sandbox_id: &str,
+        sandbox_cfg: &v1::PodSandboxConfig,
+        host_paths: &std::collections::HashMap<String, String>,
+        image_volumes: &std::collections::HashMap<String, v1::ImageSpec>,
+    ) -> anyhow::Result<String> {
         // Honor the image pull policy (also surfaces ErrImageNeverPull).
         self.ensure_image(
             &container.image,
@@ -1049,7 +1126,7 @@ impl CriContainerRuntime {
             node_allocatable,
             &mount_attrs,
             supports_rro,
-            &image_volumes,
+            image_volumes,
         )
         .map_err(|msg| {
             anyhow::anyhow!(
@@ -1208,7 +1285,13 @@ impl CriContainerRuntime {
 
         let container_id = cri
             .create_container(sandbox_id, cfg, sandbox_cfg.clone())
-            .await?;
+            .await
+            .map_err(|e| {
+                // `ErrCreateContainer` with `s.Message()` (`:277-282`); the
+                // error text itself is unchanged.
+                let msg = image_volume_metrics::grpc_message(&anyhow::Error::new(e));
+                anyhow::Error::new(CreateContainerFailed(msg))
+            })?;
         // Emit Created event after the container is created — mirrors upstream
         // `startContainer` in `pkg/kubelet/kuberuntime/kuberuntime_container.go:290`:
         //   m.recordContainerEvent(…, events.CreatedContainer, "Container created")

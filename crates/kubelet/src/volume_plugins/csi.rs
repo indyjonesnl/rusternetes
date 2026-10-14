@@ -418,7 +418,7 @@ impl CsiPlugin {
                 "name": spec_vol_id, "csi": {"driver": driver}
             }))?;
             return Ok(ReconstructedVolume {
-                volume,
+                volume: Some(volume),
                 persistent_volume: None,
             });
         }
@@ -431,7 +431,7 @@ impl CsiPlugin {
         }))?;
         let volume = serde_json::from_value(serde_json::json!({"name": spec_vol_id}))?;
         Ok(ReconstructedVolume {
-            volume,
+            volume: Some(volume),
             persistent_volume: Some(pv),
         })
     }

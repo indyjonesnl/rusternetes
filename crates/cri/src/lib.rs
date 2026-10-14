@@ -224,12 +224,24 @@ impl CriClient {
         runtime_handler: Option<&str>,
         sandbox_config: Option<v1::PodSandboxConfig>,
     ) -> Result<String> {
+        let spec = to_runtime_api_image_spec(
+            image,
+            runtime_handler.unwrap_or_default(),
+            &Default::default(),
+        );
+        self.pull_image_spec(spec, sandbox_config).await
+    }
+
+    /// `PullImage` with a caller-built [`v1::ImageSpec`] (see
+    /// [`to_runtime_api_image_spec`]), so pod annotations reach the runtime
+    /// (`images/image_manager.go:185-192`).
+    pub async fn pull_image_spec(
+        &mut self,
+        spec: v1::ImageSpec,
+        sandbox_config: Option<v1::PodSandboxConfig>,
+    ) -> Result<String> {
         let request = v1::PullImageRequest {
-            image: Some(v1::ImageSpec {
-                image: image.to_string(),
-                runtime_handler: runtime_handler.unwrap_or_default().to_string(),
-                ..Default::default()
-            }),
+            image: Some(spec),
             auth: None,
             sandbox_config,
         };
@@ -256,12 +268,18 @@ impl CriClient {
         runtime_handler: &str,
         verbose: bool,
     ) -> Result<Option<v1::Image>> {
+        let spec = to_runtime_api_image_spec(image, runtime_handler, &Default::default());
+        self.image_status_spec(spec, verbose).await
+    }
+
+    /// `ImageStatus` with a caller-built [`v1::ImageSpec`].
+    pub async fn image_status_spec(
+        &mut self,
+        spec: v1::ImageSpec,
+        verbose: bool,
+    ) -> Result<Option<v1::Image>> {
         let request = v1::ImageStatusRequest {
-            image: Some(v1::ImageSpec {
-                image: image.to_string(),
-                runtime_handler: runtime_handler.to_string(),
-                ..Default::default()
-            }),
+            image: Some(spec),
             verbose,
         };
         let resp = self
@@ -695,12 +713,20 @@ fn normalize_socket_path(socket: &Path) -> PathBuf {
 }
 
 /// Port of `toRuntimeAPIImageSpec` (`pkg/kubelet/kuberuntime/convert.go:63-81`).
+///
+/// The `RuntimeClassInImageCriAPI` gate (`convert.go:75-78`) is applied by the
+/// caller, which passes an empty handler when it is off.
 pub fn to_runtime_api_image_spec(
-    _image: &str,
-    _runtime_handler: &str,
-    _annotations: &std::collections::HashMap<String, String>,
+    image: &str,
+    runtime_handler: &str,
+    annotations: &std::collections::HashMap<String, String>,
 ) -> v1::ImageSpec {
-    v1::ImageSpec::default()
+    v1::ImageSpec {
+        image: image.to_string(),
+        annotations: annotations.clone(),
+        runtime_handler: runtime_handler.to_string(),
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]
