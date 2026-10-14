@@ -8,11 +8,11 @@
 //!   :90-106, `InMemoryEncodingFor` :108-118, `emulatedStorageVersion`
 //!   :125-205)
 //! * `staging/src/k8s.io/apiserver/pkg/server/storage/storage_factory.go`
-//!   (`DefaultStorageFactory.NewConfig` :227-271, the caller that picks
+//!   (`DefaultStorageFactory.NewConfig` :229-271, the caller that picks
 //!   `BackwardCompatibileStorageEncodingFor` over `StorageEncodingFor`)
 //! * `staging/src/k8s.io/apiserver/pkg/server/resourceconfig/helpers.go:45-56`
 //!   (`MergeResourceEncodingConfigs`)
-//! * `pkg/kubeapiserver/default_storage_factory_builder.go:66-98`
+//! * `pkg/kubeapiserver/default_storage_factory_builder.go:71-100`
 //!   (`NewStorageFactoryConfigEffectiveVersion`, the `ResourceEncodingOverrides`)
 //! * `staging/src/k8s.io/apiserver/pkg/server/storage/storage_factory_test.go`
 //!   (`TestStorageFactoryCompatibilityVersion`)
@@ -29,6 +29,7 @@
 mod scheme_table;
 
 use crate::compatibility::{current_effective_version, EffectiveVersion};
+use crate::feature_gates::Version;
 
 use std::collections::BTreeMap;
 
@@ -206,7 +207,7 @@ impl Scheme {
         let registered = self
             .groups
             .get(&example.group)
-            .is_some_and(|g| g.internal_kinds.iter().any(|k| *k == example.kind));
+            .is_some_and(|g| g.internal_kinds.contains(&example.kind));
         if registered {
             Ok(vec![(example.group.clone(), example.kind.clone())])
         } else {
@@ -389,10 +390,71 @@ impl ResourceEncodingConfig for DefaultResourceEncodingConfig {
 /// `emulatedStorageVersion` (:125-205).
 fn emulated_storage_version(
     binary_version_of_resource: GroupVersion,
-    _example: Option<&Example>,
-    _effective_version: Option<&EffectiveVersion>,
-    _scheme: &Scheme,
+    example: Option<&Example>,
+    effective_version: Option<&EffectiveVersion>,
+    scheme: &Scheme,
 ) -> Result<GroupVersion, String> {
+    let (Some(example), Some(effective_version)) = (example, effective_version) else {
+        return Ok(binary_version_of_resource);
+    };
+
+    // Look up example in scheme to find all objects of the same Group-Kind
+    // Use the highest priority version for that group-kind whose lifecycle window
+    // includes the current emulation version.
+    // If no version is found, use the binary version
+    // (in this case the API should be disabled anyway)
+    let gvks = scheme.object_kinds(example)?;
+
+    let Some((group, kind)) = gvks
+        .into_iter()
+        .find(|(group, _)| *group == binary_version_of_resource.group)
+    else {
+        return Err(format!(
+            "object {}.{} has no GVKs registered in scheme",
+            example.group, example.kind
+        ));
+    };
+
+    // VersionsForGroupKind returns versions in priority order
+    let compatibility_version = effective_version.min_compatibility_version();
+
+    for version in scheme.versions_for_group_kind(&group, &kind) {
+        if version == API_VERSION_INTERNAL {
+            continue;
+        }
+
+        let introduced = scheme.new_introduced(&group, &version, &kind)?;
+
+        // If it was introduced after current compatibility version, don't use it
+        // skip the introduced check for test when current compatibility version is 0.0 to test all apis
+        if let Some((major, minor)) = introduced {
+            if compatibility_version.major > 0 || compatibility_version.minor > 0 {
+                // API resource lifecycles should be relative to k8s api version
+                let introduced_ver = Version::major_minor(major, minor);
+                if introduced_ver > compatibility_version {
+                    continue;
+                }
+            }
+        }
+
+        // versions is returned in priority order, so just use first result
+        return Ok(GroupVersion { group, version });
+    }
+
+    // Getting here means we're serving a version that is unknown to the
+    // min-compatibility-version server.
+    //
+    // This is only expected to happen when serving an alpha API type due
+    // to missing pre-release lifecycle information
+    // (which doesn't happen by default), or when emulation-version and
+    // min-compatibility-version are several versions apart so a beta or GA API
+    // was being served which didn't exist at all in min-compatibility-version.
+    //
+    // In the alpha case - we do not support compatibility versioning of
+    // alpha types and recommend users do not mix the two.
+    // In the skip-level case - The version of apiserver we are retaining
+    // compatibility with has no knowledge of the type,
+    // so storing it in another type is no issue.
     Ok(binary_version_of_resource)
 }
 
@@ -438,7 +500,7 @@ pub fn merge_resource_encoding_configs(
     default_resource_encoding
 }
 
-/// `StorageFactoryConfig` (default_storage_factory_builder.go:100-108),
+/// `StorageFactoryConfig` (default_storage_factory_builder.go:103-110),
 /// reduced to the encoding half.
 #[derive(Debug, Clone)]
 pub struct StorageFactoryConfig {
@@ -447,12 +509,12 @@ pub struct StorageFactoryConfig {
 }
 
 impl StorageFactoryConfig {
-    /// `NewStorageFactoryConfig` (:61-63).
+    /// `NewStorageFactoryConfig` (:66-69).
     pub fn new() -> Self {
         Self::new_effective_version(current_effective_version())
     }
 
-    /// `NewStorageFactoryConfigEffectiveVersion` (:66-98).
+    /// `NewStorageFactoryConfigEffectiveVersion` (:71-100).
     pub fn new_effective_version(effective_version: EffectiveVersion) -> Self {
         let resources = vec![
             // If a resource has to be stored in a version that is not the
@@ -488,7 +550,7 @@ impl StorageFactoryConfig {
     }
 
     /// The `MergeResourceEncodingConfigs` call in `completedStorageFactoryConfig.New`
-    /// (default_storage_factory_builder.go:134).
+    /// (default_storage_factory_builder.go:132).
     pub fn resource_encoding_config(&self) -> DefaultResourceEncodingConfig {
         merge_resource_encoding_configs(
             self.default_resource_encoding.clone(),

@@ -1,5 +1,5 @@
 //! Ports of `TestStorageFactoryCompatibilityVersion`
-//! (storage_factory_test.go:421-570) plus checks against the release-1.35
+//! (storage_factory_test.go:433-) plus checks against the release-1.35
 //! scheme table.
 
 use super::*;
@@ -250,7 +250,7 @@ fn legacy_scheme_skips_versions_introduced_after_min_compat() {
 
 #[test]
 fn storage_factory_config_overrides_pin_pre_ga_versions() {
-    // default_storage_factory_builder.go:66-98
+    // default_storage_factory_builder.go:71-100
     let cfg = StorageFactoryConfig::new_effective_version(ev("1.35.0"));
     let config = cfg.resource_encoding_config();
     for (group, resource, kind, version) in [
