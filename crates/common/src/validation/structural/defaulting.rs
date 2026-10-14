@@ -10,7 +10,66 @@ use super::Structural;
 
 /// `Default` (:30-72): defaults `x` depending on the default values in `s`.
 pub fn default(x: &mut Value, s: Option<&Structural>) {
-    let _ = (x, s);
+    let Some(s) = s else {
+        return;
+    };
+
+    match x {
+        Value::Object(map) => {
+            for (k, prop) in &s.properties {
+                let Some(def) = default_value(prop) else {
+                    continue;
+                };
+                if map
+                    .get(k)
+                    .is_none_or(|v| is_non_nullable_null(v, Some(prop)))
+                {
+                    map.insert(k.clone(), def.clone());
+                }
+            }
+            let keys: Vec<String> = map.keys().cloned().collect();
+            for k in keys {
+                let Some(v) = map.get_mut(&k) else { continue };
+                if let Some(prop) = s.properties.get(&k) {
+                    default(v, Some(prop));
+                } else if let Some(ap) = s.additional_properties.as_deref() {
+                    let ap_s = ap.structural.as_ref();
+                    if is_non_nullable_null(v, ap_s) {
+                        // `DeepCopyJSONValue(nil)` is nil: a missing default leaves the null.
+                        if let Some(def) = ap_s.and_then(default_value) {
+                            *v = def.clone();
+                        }
+                    }
+                    default(v, ap_s);
+                }
+            }
+        }
+        Value::Array(items) => {
+            let item_s = s.items.as_deref();
+            for item in items {
+                if is_non_nullable_null(item, item_s) {
+                    if let Some(def) = item_s.and_then(default_value) {
+                        *item = def.clone();
+                    }
+                }
+                default(item, item_s);
+            }
+        }
+        // scalars, do nothing
+        _ => {}
+    }
+}
+
+/// `prop.Default.Object` when it is non-nil. A JSON `null` default is the
+/// nil `JSON{Object: nil}` upstream.
+fn default_value(s: &Structural) -> Option<&Value> {
+    s.generic.default.as_ref().filter(|v| !v.is_null())
+}
+
+/// `isNonNullableNull` (:25-28): returns true if the item is nil AND it is
+/// not nullable.
+fn is_non_nullable_null(x: &Value, s: Option<&Structural>) -> bool {
+    x.is_null() && s.is_some_and(|s| !s.generic.nullable)
 }
 
 #[cfg(test)]
