@@ -312,7 +312,9 @@ impl Strategy {
     /// `schemaobjectmeta.CoerceWithOptions` reports for embedded `metadata`
     /// (:1442-1449). The unknown fields of the root `metadata`
     /// (`GetObjectMetaWithOptions`, :1415-1421) cannot be seen here: the typed
-    /// `ObjectMeta` has already dropped them.
+    /// `ObjectMeta` has already dropped them. `validate_strict_fields`
+    /// reports them (as `metadata.<field>`) for every typed resource, from
+    /// the request body, before this runs (#3399).
     fn unknown_fields(&self, cr: &CustomResource) -> Vec<String> {
         let Some(structural) = self.structural_schema() else {
             return Vec::new();
