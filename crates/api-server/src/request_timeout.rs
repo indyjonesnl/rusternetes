@@ -144,15 +144,13 @@ pub async fn request_timeout_middleware(req: Request, next: Next) -> Response {
         Err(msg) => {
             // `withFailedRequestAudit(failedErrorHandler(..), statusErr, ..)`
             // (request_deadline.go:75-77).
-            let failed = status_response(
-                StatusCode::BAD_REQUEST,
-                Status::failure(msg.clone(), "BadRequest", 400),
-            );
+            let status = Status::failure(msg, "BadRequest", 400);
+            let failed = status_response(StatusCode::BAD_REQUEST, status.clone());
             return crate::audit::audit_failed_request(
                 req.method(),
                 req.uri(),
                 req.headers(),
-                &msg,
+                &status,
                 failed,
             )
             .await;
@@ -408,14 +406,25 @@ mod tests {
             .unwrap(),
             sink: cap.clone(),
         });
-        let resp = serve("/api/v1/namespaces?timeout=foo", Duration::ZERO).await;
+        let resp = serve(
+            "/api/v1/namespaces/n/auditedthings?timeout=foo",
+            Duration::ZERO,
+        )
+        .await;
         assert_eq!(resp.status(), 400);
         assert!(resp.headers().contains_key("Audit-ID"));
-        let ev = cap.0.lock().await;
+        // The sink is process-global: other tests' 400s land here too.
+        let ev: Vec<_> = cap
+            .0
+            .lock()
+            .await
+            .iter()
+            .filter(|e| e.request_uri.contains("auditedthings"))
+            .cloned()
+            .collect();
         assert_eq!(ev.len(), 1, "{ev:?}");
         assert_eq!(ev[0].stage, AuditStage::ResponseStarted);
         assert_eq!(ev[0].verb, "list");
-        assert_eq!(ev[0].request_uri, "/api/v1/namespaces?timeout=foo");
         let rs = ev[0].response_status.as_ref().unwrap();
         assert_eq!(rs.code, 400);
         assert!(rs

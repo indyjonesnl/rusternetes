@@ -730,6 +730,67 @@ pub async fn audit_middleware(req: Request, next: Next) -> Response {
     }
 }
 
+/// The event half of `evaluatePolicyAndCreateAuditEvent`
+/// (filters/audit.go:117-148): `ac.Init(rac, sink)` +
+/// `audit.LogRequestMetadata` (request.go:43-82).
+fn new_audit_context(
+    cfg: &AuditConfig,
+    uri: &axum::http::Uri,
+    headers: &axum::http::HeaderMap,
+    attrs: &Attributes,
+    user_info: UserInfo,
+    rac: RequestAuditConfig,
+) -> Arc<AuditContext> {
+    let received = Utc::now();
+    let audit_id = headers
+        .get("Audit-ID")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let event = AuditEvent {
+        api_version: "audit.k8s.io/v1".to_string(),
+        kind: "Event".to_string(),
+        level: rac.level.clone(),
+        audit_id: audit_id.clone(),
+        stage: AuditStage::RequestReceived,
+        request_uri: uri
+            .path_and_query()
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_default(),
+        verb: attrs.verb.clone(),
+        user: user_info,
+        user_agent: headers
+            .get("User-Agent")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string),
+        source_ips: headers
+            .get("X-Forwarded-For")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+            .unwrap_or_default(),
+        object_ref: attrs.is_resource_request.then(|| ObjectReference {
+            resource: Some(attrs.resource.clone()),
+            subresource: Some(attrs.subresource.clone()).filter(|s| !s.is_empty()),
+            api_group: Some(attrs.api_group.clone()).filter(|s| !s.is_empty()),
+            namespace: Some(attrs.namespace.clone()).filter(|s| !s.is_empty()),
+            name: Some(attrs.name.clone()).filter(|s| !s.is_empty()),
+            uid: None,
+            api_version: Some(attrs.api_version.clone()),
+            resource_version: None,
+        }),
+        response_status: None,
+        response_object: None,
+        request_received_timestamp: received,
+        stage_timestamp: received,
+        annotations: None,
+    };
+    Arc::new(AuditContext {
+        inner: Mutex::new(AuditInner { event, config: rac }),
+        sink: cfg.sink.clone(),
+    })
+}
+
 /// `WithAudit` (filters/audit.go:41-117) +
 /// `evaluatePolicyAndCreateAuditEvent` (:119-) + `audit.LogRequestMetadata`
 /// (request.go:43-82).
@@ -758,58 +819,8 @@ pub async fn with_audit(cfg: Arc<AuditConfig>, req: Request, next: Next) -> Resp
         return next.run(req).await;
     }
 
-    let received = Utc::now();
-    let audit_id = req
-        .headers()
-        .get("Audit-ID")
-        .and_then(|v| v.to_str().ok())
-        .filter(|v| !v.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let event = AuditEvent {
-        api_version: "audit.k8s.io/v1".to_string(),
-        kind: "Event".to_string(),
-        level: rac.level.clone(),
-        audit_id: audit_id.clone(),
-        stage: AuditStage::RequestReceived,
-        request_uri: req
-            .uri()
-            .path_and_query()
-            .map(|p| p.as_str().to_string())
-            .unwrap_or_default(),
-        verb: attrs.verb.clone(),
-        user: user_info,
-        user_agent: req
-            .headers()
-            .get("User-Agent")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string),
-        source_ips: req
-            .headers()
-            .get("X-Forwarded-For")
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
-            .unwrap_or_default(),
-        object_ref: attrs.is_resource_request.then(|| ObjectReference {
-            resource: Some(attrs.resource.clone()),
-            subresource: Some(attrs.subresource.clone()).filter(|s| !s.is_empty()),
-            api_group: Some(attrs.api_group.clone()).filter(|s| !s.is_empty()),
-            namespace: Some(attrs.namespace.clone()).filter(|s| !s.is_empty()),
-            name: Some(attrs.name.clone()).filter(|s| !s.is_empty()),
-            uid: None,
-            api_version: Some(attrs.api_version.clone()),
-            resource_version: None,
-        }),
-        response_status: None,
-        response_object: None,
-        request_received_timestamp: received,
-        stage_timestamp: received,
-        annotations: None,
-    };
-    let ac = Arc::new(AuditContext {
-        inner: Mutex::new(AuditInner { event, config: rac }),
-        sink: cfg.sink.clone(),
-    });
+    let ac = new_audit_context(&cfg, req.uri(), req.headers(), &attrs, user_info, rac);
+    let audit_id = ac.audit_id();
 
     // Annotations authentication recorded before this filter existed
     // (e.g. `authentication.k8s.io/legacy-token*`, legacy.go:143-170).
@@ -849,14 +860,68 @@ pub async fn with_audit(cfg: Arc<AuditConfig>, req: Request, next: Next) -> Resp
 }
 
 /// `withFailedRequestAudit` (request_deadline.go:106-133) against the
-/// installed pipeline.
+/// installed pipeline; a no-op without one (`sink == nil || policy == nil`,
+/// :107-109).
 pub async fn audit_failed_request(
-    _method: &Method,
-    _uri: &axum::http::Uri,
-    _headers: &axum::http::HeaderMap,
-    _status_message: &str,
+    method: &Method,
+    uri: &axum::http::Uri,
+    headers: &axum::http::HeaderMap,
+    status: &rusternetes_common::types::Status,
     failed: Response,
 ) -> Response {
+    match AUDIT.get() {
+        Some(cfg) => with_failed_request_audit(cfg, method, uri, headers, status, failed).await,
+        None => failed,
+    }
+}
+
+/// `withFailedRequestAudit` (request_deadline.go:106-133). It runs before
+/// authentication, so the request has no user (`attribs.GetUser()` is nil,
+/// request.go:61) and the policy is evaluated for an unauthenticated request.
+/// The one event it writes is at stage ResponseStarted: no RequestReceived and
+/// no ResponseComplete, because the failed handler is not wrapped by WithAudit.
+pub async fn with_failed_request_audit(
+    cfg: &AuditConfig,
+    method: &Method,
+    uri: &axum::http::Uri,
+    headers: &axum::http::HeaderMap,
+    status: &rusternetes_common::types::Status,
+    mut failed: Response,
+) -> Response {
+    let mut attrs = request_info(method, uri.path(), uri.query());
+    let user_info = UserInfo {
+        username: String::new(),
+        uid: String::new(),
+        groups: vec![],
+        extra: None,
+    };
+    attrs.user = Some(user_info.clone());
+    let rac = cfg.policy.evaluate(&attrs);
+    if rac.level == AuditLevel::None {
+        // `!ac.Enabled()` (:118-121).
+        return failed;
+    }
+    let ac = new_audit_context(cfg, uri, headers, &attrs, user_info, rac);
+    // `respStatus.Message = statusErr.Error()` (:123-127).
+    if let Ok(mut g) = ac.inner.lock() {
+        g.event.response_status = Some(ResponseStatus {
+            message: status.message.clone(),
+            ..Default::default()
+        });
+    }
+    // `ErrorNegotiated` -> `WriteObjectNegotiated` -> `audit.LogResponseObject`
+    // (responsewriters/writers.go:346), then the audit writer's `processCode`
+    // on the header write (filters/audit.go:205-211) with
+    // `processResponseStartedStage` = true (:130).
+    if let Ok(obj) = serde_json::to_value(status) {
+        ac.log_response_object(&obj);
+    }
+    ac.set_response_status(failed.status().as_u16());
+    ac.process_event_stage(AuditStage::ResponseStarted).await;
+    // `WithAuditInit` sets the Audit-ID header ahead of this filter.
+    if let Ok(v) = HeaderValue::from_str(&ac.audit_id()) {
+        failed.headers_mut().insert("Audit-ID", v);
+    }
     failed
 }
 
@@ -1641,5 +1706,41 @@ rules:
             "would violate"
         );
         assert_eq!(a.len(), 2);
+    }
+
+    // TestWithFailedRequestAudit (request_deadline_test.go:350-): the event is
+    // written once, at ResponseStarted, with the code and statusErr message;
+    // a request the policy does not audit passes through (`!ac.Enabled()`).
+    #[tokio::test]
+    async fn failed_request_audit_writes_one_response_started_event() {
+        let cap = Arc::new(Capture(Default::default()));
+        let cfg = AuditConfig {
+            policy: Policy::from_yaml(POLICY).unwrap(),
+            sink: cap.clone(),
+        };
+        let status =
+            rusternetes_common::types::Status::failure("error serving request", "BadRequest", 400);
+        let failed = || {
+            let mut r = Response::new(Body::empty());
+            *r.status_mut() = axum::http::StatusCode::BAD_REQUEST;
+            r
+        };
+        let h = axum::http::HeaderMap::new();
+        // Audited (secrets: Metadata).
+        let uri: axum::http::Uri = "/api/v1/namespaces/ns/secrets/s".parse().unwrap();
+        let resp = with_failed_request_audit(&cfg, &Method::GET, &uri, &h, &status, failed()).await;
+        assert!(resp.headers().contains_key("Audit-ID"));
+        // Not audited (no rule matches pods/p): untouched, no event.
+        let uri: axum::http::Uri = "/api/v1/namespaces/ns/pods/p".parse().unwrap();
+        let resp = with_failed_request_audit(&cfg, &Method::GET, &uri, &h, &status, failed()).await;
+        assert!(!resp.headers().contains_key("Audit-ID"));
+        let ev = cap.0.lock().await;
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].stage, AuditStage::ResponseStarted);
+        let rs = ev[0].response_status.as_ref().unwrap();
+        assert_eq!(rs.code, 400);
+        assert_eq!(rs.message.as_deref(), Some("error serving request"));
+        assert_eq!(rs.reason.as_deref(), Some("BadRequest"));
+        assert_eq!(ev[0].user.username, "");
     }
 }
