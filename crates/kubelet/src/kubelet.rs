@@ -3607,9 +3607,7 @@ impl Kubelet {
 
                             if let Err(e) = self.storage.update_status(&key, &new_pod).await {
                                 // Retry with fresh read on conflict (K8s pattern)
-                                if e.to_string().contains("Conflict")
-                                    || e.to_string().contains("mismatch")
-                                {
+                                if crate::lifecycle::is_status_write_conflict(&e) {
                                     if let Ok(fresh_pod) = self.storage.get::<Pod>(&key).await {
                                         // Terminal phases are sticky — don't
                                         // regress a Succeeded/Failed pod to
