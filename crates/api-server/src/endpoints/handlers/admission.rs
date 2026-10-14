@@ -754,7 +754,15 @@ impl Admission<'_> {
             dry_run: self.dry_run,
             operation_options: None,
         };
-        plugin.admit(&mut attr, reinvocation.clone()).await?;
+        // `WithControllerMetrics(plugin, "MutatingAdmissionPolicy")`
+        // (metrics.go:63-66, :89-100).
+        rusternetes_admission_webhook::admission_metrics::with_controller_metrics(
+            "MutatingAdmissionPolicy",
+            op,
+            rusternetes_admission_webhook::admission_metrics::STEP_ADMIT,
+            plugin.admit(&mut attr, reinvocation.clone()),
+        )
+        .await?;
         match attr.object {
             Some(after) if after != before => serde_json::from_value(after).map_err(|e| {
                 Error::Internal(format!(
@@ -777,6 +785,24 @@ impl Admission<'_> {
     /// `IfNeeded` webhook is rerun on the second pass when a policy or
     /// in-tree plugin changed the object after it (#3041).
     pub async fn admit<T: Object>(&self, op: Operation, obj: T, old: Option<&T>) -> Result<T> {
+        // `c.AdmissionControl = admissionmetrics.WithStepMetrics(admissionChain)`
+        // (apiserver/pkg/server/options/admission.go:179): the whole admit
+        // phase, both reinvoker passes included, is one `step` observation.
+        let step_op = op.clone();
+        rusternetes_admission_webhook::admission_metrics::with_step_metrics(
+            &step_op,
+            rusternetes_admission_webhook::admission_metrics::STEP_ADMIT,
+            self.admit_reinvoking(op, obj, old),
+        )
+        .await
+    }
+
+    async fn admit_reinvoking<T: Object>(
+        &self,
+        op: Operation,
+        obj: T,
+        old: Option<&T>,
+    ) -> Result<T> {
         use crate::admission::policy_mutating::ReinvocationContext;
         let reinvocation = std::sync::Arc::new(ReinvocationContext::new(false));
         let obj = self.admit_chain(&op, obj, old, &reinvocation).await?;
@@ -869,6 +895,23 @@ impl Admission<'_> {
         obj: Option<&T>,
         old: Option<&T>,
     ) -> Result<()> {
+        // `WithStepMetrics` (admission.go:179), the validate phase.
+        let step_op = op.clone();
+        rusternetes_admission_webhook::admission_metrics::with_step_metrics(
+            &step_op,
+            rusternetes_admission_webhook::admission_metrics::STEP_VALIDATE,
+            self.validate_chain(ctx, op, obj, old),
+        )
+        .await
+    }
+
+    async fn validate_chain<T: Object>(
+        &self,
+        ctx: &RequestContext,
+        op: Operation,
+        obj: Option<&T>,
+        old: Option<&T>,
+    ) -> Result<()> {
         self.validate_in_tree(ctx, &op, obj, old).await?;
         let name = obj
             .or(old)
@@ -931,6 +974,30 @@ impl Admission<'_> {
     /// `QuotaAdmission.Validate` (apiserver/pkg/admission/plugin/
     /// resourcequota/admission.go:158-165), last in the chain.
     async fn validate_quota(
+        &self,
+        op: Operation,
+        name: &str,
+        obj: Option<&serde_json::Value>,
+        old: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        // The plugin is decorated by `WithControllerMetrics`
+        // (metrics.go:63-66); `NewHandler(Create, Update)`
+        // (resourcequota/admission.go:97) keeps other operations out of the
+        // chain, so they are not observed.
+        if !matches!(op, Operation::Create | Operation::Update) {
+            return self.evaluate_quota(op, name, obj, old).await;
+        }
+        let observed_op = op.clone();
+        rusternetes_admission_webhook::admission_metrics::with_controller_metrics(
+            "ResourceQuota",
+            &observed_op,
+            rusternetes_admission_webhook::admission_metrics::STEP_VALIDATE,
+            self.evaluate_quota(op, name, obj, old),
+        )
+        .await
+    }
+
+    async fn evaluate_quota(
         &self,
         op: Operation,
         name: &str,
