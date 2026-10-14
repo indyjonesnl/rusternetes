@@ -111,15 +111,6 @@ impl CapacityRefresher {
         }
     }
 
-    /// `pollCapacities` (capacity.go:515-523).
-    pub fn poll_capacities(&self) {
-        let mut st = self.state.lock().unwrap();
-        let all: Vec<ItemKey> = st.capacities.iter().cloned().collect();
-        for item in all {
-            self.add(&mut st, item);
-        }
-    }
-
     /// `queue.Get` (without blocking): moves due `AddRateLimited` items onto
     /// the queue first.
     pub fn pop(&self) -> Option<ItemKey> {
@@ -138,10 +129,12 @@ impl CapacityRefresher {
     }
 
     /// The queued items, oldest first.
+    #[allow(dead_code)] // used by tests; the bin target re-includes this module
     pub fn queued(&self) -> Vec<ItemKey> {
         self.state.lock().unwrap().queue.iter().cloned().collect()
     }
 
+    #[allow(dead_code)] // used by tests; the bin target re-includes this module
     pub fn clear_queue(&self) {
         self.state.lock().unwrap().queue.clear();
     }

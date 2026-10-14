@@ -865,13 +865,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queue_deduplicates_and_poll_enqueues_every_item() {
+    async fn queue_deduplicates() {
         let (_s, _c, r) = refresh_fixture(&[&[("layer0", "foo")]]).await;
         r.refresh_sc("direct-sc");
         r.refresh_sc("direct-sc");
         assert_eq!(queued_strings(&r).len(), 1);
-        r.poll_capacities();
-        assert_eq!(queued_strings(&r).len(), 2);
     }
 
     #[tokio::test]
