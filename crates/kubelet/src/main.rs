@@ -378,14 +378,13 @@ async fn main() -> Result<()> {
         .collect();
 
     // RunKubelet: ParseNodeIPArgument(kubeServer.NodeIP, kubeServer.CloudProvider)
-    // (cmd/kubelet/app/server.go:1216-1222). No cloud provider here.
-    if let Some(raw) = args.node_ip.as_deref() {
-        let (ips, invalid) = node_ip::parse_node_ip_argument(raw, "")
-            .map_err(|e| anyhow::anyhow!("bad --node-ip {raw:?}: {e}"))?;
-        if !invalid.is_empty() {
-            tracing::warn!("Could not parse some node IP(s), ignoring them: {invalid:?}");
-        }
-        node_ip::set_configured_node_ips(ips);
+    // (cmd/kubelet/app/server.go:1216-1222). The result is threaded into
+    // `Kubelet::new_with_eviction` (createAndInitKubelet -> NewMainKubelet).
+    let raw_node_ip = args.node_ip.as_deref().unwrap_or("");
+    let (node_ips, invalid) = node_ip::parse_node_ip_argument(raw_node_ip, "")
+        .map_err(|e| anyhow::anyhow!("bad --node-ip {raw_node_ip:?}: {e}"))?;
+    if !invalid.is_empty() {
+        tracing::warn!("Could not parse some node IP(s), ignoring them: {invalid:?}");
     }
 
     // Build eviction manager from CLI flags BEFORE consuming `args` into
@@ -566,7 +565,7 @@ async fn main() -> Result<()> {
             eviction_manager,
             runtime_config.metrics_bind_port,
             args.allowed_unsafe_sysctls.clone(),
-            node_ip::configured_node_ips().to_vec(),
+            node_ips,
             false,
         )
         .await?

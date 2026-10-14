@@ -12,20 +12,6 @@ use std::net::{IpAddr, Ipv4Addr};
 
 pub mod net_interface;
 
-static CONFIGURED_NODE_IPS: std::sync::OnceLock<Vec<IpAddr>> = std::sync::OnceLock::new();
-
-/// Record the parsed `--node-ip` (upstream threads `nodeIPs` through
-/// `createAndInitKubelet`; we keep it process-wide so the many
-/// `Kubelet::new*` constructors do not change). First call wins.
-pub fn set_configured_node_ips(ips: Vec<IpAddr>) {
-    let _ = CONFIGURED_NODE_IPS.set(ips);
-}
-
-/// The parsed `--node-ip` values (empty when the flag is unset).
-pub fn configured_node_ips() -> &'static [IpAddr] {
-    CONFIGURED_NODE_IPS.get().map(Vec::as_slice).unwrap_or(&[])
-}
-
 /// `netutils.ParseIPSloppy`: like `ParseIP` but tolerates leading zeros in
 /// IPv4 octets ("01.2.3.004").
 pub(crate) fn parse_ip_sloppy(s: &str) -> Option<IpAddr> {
@@ -280,6 +266,7 @@ pub fn set_node_address(
 
 /// The setter without an external cloud provider, on a scratch node named
 /// `hostname`; returns `(type, address)` pairs.
+#[cfg(test)]
 pub fn node_addresses(
     node_ips: &[IpAddr],
     validate: &dyn Fn(IpAddr) -> Result<(), String>,
@@ -303,10 +290,12 @@ pub fn node_addresses(
 /// The InternalIP list the kubelet advertises: the `NodeAddress` setter
 /// result, falling back to `detect` (the legacy single-IPv4 path) when the
 /// setter errors or yields no InternalIP. `Never empty`.
+#[allow(clippy::too_many_arguments)]
 pub fn effective_internal_ips(
     configured: &[IpAddr],
     validate: &dyn Fn(IpAddr) -> Result<(), String>,
     hostname: &str,
+    external_cloud_provider: bool,
     lookup: &dyn Fn(&str) -> Vec<IpAddr>,
     resolve: &dyn Fn(Option<IpAddr>) -> Result<IpAddr, String>,
     detect: &dyn Fn() -> String,
@@ -314,11 +303,25 @@ pub fn effective_internal_ips(
     // Upstream runs the setter whether or not --node-ip is set
     // (pkg/kubelet/nodestatus/setters.go:70-96, 141-189): with no node IP it
     // looks up the node name, preferring IPv4 but accepting a valid IPv6.
-    if let Ok(addrs) = node_addresses(configured, validate, hostname, lookup, resolve) {
-        let ips: Vec<String> = addrs
+    let mut node = rusternetes_common::resources::Node::new(hostname);
+    if set_node_address(
+        &mut node,
+        configured,
+        validate,
+        hostname,
+        external_cloud_provider,
+        lookup,
+        resolve,
+    )
+    .is_ok()
+    {
+        let ips: Vec<String> = node
+            .status
+            .and_then(|s| s.addresses)
+            .unwrap_or_default()
             .into_iter()
-            .filter(|(t, _)| t == "InternalIP")
-            .map(|(_, a)| a)
+            .filter(|a| a.address_type == "InternalIP")
+            .map(|a| a.address)
             .collect();
         if !ips.is_empty() {
             return ips;
@@ -562,6 +565,7 @@ mod tests {
             &[],
             &validate_node_ip,
             "h",
+            false,
             &lk,
             &|_| Err("no default route".to_string()),
             &|| "127.0.0.1".to_string(),
@@ -578,6 +582,7 @@ mod tests {
                 &[],
                 &validate_node_ip,
                 "h",
+                false,
                 &lk,
                 &|_| Err("no default route".to_string()),
                 &d
@@ -589,6 +594,7 @@ mod tests {
                 &[],
                 &validate_node_ip,
                 "h",
+                false,
                 &none,
                 &|_| Err("no default route".to_string()),
                 &d
