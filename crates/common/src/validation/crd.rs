@@ -177,7 +177,7 @@ pub fn validate_custom_resource_selectable_fields(
             errs.push(Error::required(&sp, ""));
             continue;
         }
-        let (path, found) = match valid_field_path(&selectable.json_path, schema) {
+        let (path, found) = match valid_field_path(&selectable.json_path, schema, false) {
             Ok(resolved) => resolved,
             Err(e) => {
                 errs.push(Error::invalid(
@@ -248,9 +248,9 @@ fn allowed_selectable_field_schema(schema: Option<&Structural>) -> bool {
 type ResolvedFieldPath<'a> = (Vec<(String, bool)>, Option<&'a Structural>);
 
 /// `cel.ValidFieldPath`
-/// (`staging/src/k8s.io/apiextensions-apiserver/pkg/apiserver/schema/cel/validation.go:557-676`)
-/// with `allowArrayNotation` false, which is how
-/// `ValidateCustomResourceSelectableFields` calls it.
+/// (`staging/src/k8s.io/apiextensions-apiserver/pkg/apiserver/schema/cel/validation.go:557-676`).
+/// `allow_array_notation` is `WithFieldPathAllowArrayNotation` (default true;
+/// `ValidateCustomResourceSelectableFields` passes false).
 ///
 /// Returns the resolved path (`(name, is_key)` per element: `Child` or `Key`)
 /// and the schema of the leaf, which is `None` after stepping into a
@@ -260,39 +260,67 @@ type ResolvedFieldPath<'a> = (Vec<(String, bool)>, Option<&'a Structural>);
 /// `*Structural` (nil from a failed `NewStructural`, or from
 /// `schema = schema.AdditionalProperties.Structural` at `:566`). Every error
 /// string is upstream's, because a client reads them.
-fn valid_field_path<'a>(
+pub fn valid_field_path<'a>(
     json_path: &str,
     schema: Option<&'a Structural>,
+    allow_array_notation: bool,
 ) -> Result<ResolvedFieldPath<'a>, String> {
     let mut path: Vec<(String, bool)> = Vec::new();
     let mut schema: Option<&Structural> = schema;
     let mut tokens = tokenize_field_path(json_path).into_iter();
 
+    // The `isNamed` selection both arms repeat (`:638-646`, `:660-666`)
+    // followed by `appendToPath` (`:563-576`). `NewStructural` only sets
+    // `Properties` when non-empty.
+    let step = |name: String,
+                schema: &mut Option<&'a Structural>,
+                path: &mut Vec<(String, bool)>|
+     -> Result<(), String> {
+        let invalid = || "does not refer to a valid field".to_string();
+        // Go nil-pointer dereference at `schema/cel/validation.go:638`/`:660`.
+        let current =
+            schema.expect("runtime error: invalid memory address or nil pointer dereference");
+        if !current.properties.is_empty() {
+            let next = current.properties.get(&name).ok_or_else(invalid)?;
+            path.push((name, false));
+            *schema = Some(next);
+        } else if let Some(additional) = current.additional_properties.as_deref() {
+            path.push((name, true));
+            *schema = additional.structural.as_ref();
+        } else {
+            return Err(invalid());
+        }
+        Ok(())
+    };
+
     while let Some(token) = tokens.next() {
         match token.as_str() {
-            // `WithFieldPathAllowArrayNotation(false)` (`:622-624`).
-            "[" => return Err("array notation is not allowed".to_string()),
+            "[" => {
+                // `WithFieldPathAllowArrayNotation(false)` (`:622-624`).
+                if !allow_array_notation {
+                    return Err("array notation is not allowed".to_string());
+                }
+                let Some(tok) = tokens.next() else {
+                    return Err("unexpected end of JSON path".to_string());
+                };
+                if tok.len() < 2 || !tok.starts_with('\'') || !tok.ends_with('\'') {
+                    return Err(format!("expected single quoted string but got {tok}"));
+                }
+                let unescaped = unescape_single_quote(&tok[1..tok.len() - 1])
+                    .map_err(|e| format!("invalid string literal: {e}"))?;
+                step(unescaped, &mut schema, &mut path)?;
+                let Some(close) = tokens.next() else {
+                    return Err("unexpected end of JSON path".to_string());
+                };
+                if close != "]" {
+                    return Err(format!("expected ] but got {close}"));
+                }
+            }
             "." => {
                 let Some(name) = tokens.next() else {
                     return Err("unexpected end of JSON path".to_string());
                 };
-                let invalid = || "does not refer to a valid field".to_string();
-                // Go nil-pointer dereference at `schema/cel/validation.go:660`.
-                let current = schema
-                    .expect("runtime error: invalid memory address or nil pointer dereference");
-                // `if schema.Properties != nil ... else if
-                // schema.AdditionalProperties != nil` (`:660-666`);
-                // `NewStructural` only sets `Properties` when non-empty.
-                if !current.properties.is_empty() {
-                    let next = current.properties.get(&name).ok_or_else(invalid)?;
-                    path.push((name, false));
-                    schema = Some(next);
-                } else if let Some(additional) = current.additional_properties.as_deref() {
-                    path.push((name, true));
-                    schema = additional.structural.as_ref();
-                } else {
-                    return Err(invalid());
-                }
+                step(name, &mut schema, &mut path)?;
             }
             other => return Err(format!("expected [ or . but got: {other}")),
         }
@@ -301,50 +329,72 @@ fn valid_field_path<'a>(
     Ok((path, schema))
 }
 
-/// The scanner in `ValidFieldPath` (`validation.go:580-615`): `.`, `[` and `]`
-/// come back as single-character tokens, everything between them as one token.
-/// A single-quoted string is returned whole, delimiters included — which only
-/// matters for the array notation this caller rejects anyway.
-fn tokenize_field_path(json_path: &str) -> Vec<String> {
-    let mut tokens: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut in_quote = false;
-    let mut escaped = false;
-
-    for ch in json_path.chars() {
-        if in_quote {
-            current.push(ch);
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '\'' {
-                in_quote = false;
-                tokens.push(std::mem::take(&mut current));
-            }
-            continue;
-        }
-        match ch {
-            '.' | '[' | ']' => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
+/// `unescapeSingleQuote` (`schema/cel/validation.go:506-537`): every match of
+/// `\\.` (a backslash and any one char but a newline) is replaced, and an
+/// unknown directive is an error.
+fn unescape_single_quote(s: &str) -> Result<String, String> {
+    let mut out = String::new();
+    let mut err = None;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && chars.peek().is_some_and(|n| *n != '\n') {
+            let d = chars.next().unwrap_or_default();
+            out.push(match d {
+                'a' => '\u{7}',
+                'b' => '\u{8}',
+                'f' => '\u{c}',
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                'v' => '\u{b}',
+                '\'' => '\'',
+                '\\' => '\\',
+                _ => {
+                    err = Some(format!("invalid escape char \\{d}"));
+                    continue;
                 }
-                tokens.push(ch.to_string());
-            }
-            '\'' => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-                in_quote = true;
-                current.push(ch);
-            }
-            _ => current.push(ch),
+            });
+        } else {
+            out.push(c);
         }
     }
-    if !current.is_empty() {
-        tokens.push(current);
+    err.map_or(Ok(out), Err)
+}
+
+/// The scanner in `ValidFieldPath` (`validation.go:580-615`): `.`, `[` and
+/// `]` come back as single-character tokens, everything between them as one
+/// token. Only a token that *starts* with `'` is a quoted string
+/// (`data[0] == '\''`, `:590`); it ends at the first later `'` not preceded by
+/// a backslash (`:591`), delimiters inside it ignored, and runs to the end of
+/// the input when never closed (`:609-612`).
+fn tokenize_field_path(json_path: &str) -> Vec<String> {
+    let chars: Vec<char> = json_path.chars().collect();
+    let mut tokens: Vec<String> = Vec::new();
+    let mut pos = 0;
+    while pos < chars.len() {
+        let data = &chars[pos..];
+        let mut advance = data.len();
+        if data[0] == '\'' {
+            if let Some(i) = (1..data.len()).find(|&i| data[i] == '\'' && data[i - 1] != '\\') {
+                advance = i + 1;
+            }
+        } else if let Some(i) = data.iter().position(|c| matches!(c, '.' | '[' | ']')) {
+            advance = i.max(1);
+        }
+        tokens.push(data[..advance].iter().collect());
+        pos += advance;
     }
     tokens
+}
+
+/// `pathValid` (`validation.go:1324-1331`): `NewStructural` on the schema
+/// holding the rule, then `ValidFieldPath` with array notation allowed. A
+/// schema `NewStructural` rejects counts as valid.
+pub fn path_valid(schema: &JSONSchemaProps, path: &str) -> bool {
+    match crate::validation::structural::new_structural(schema) {
+        Ok(ss) => valid_field_path(path, Some(&ss), true).is_ok(),
+        Err(_) => true,
+    }
 }
 
 /// `validateCustomResourceDefinitionSpec` (`validation.go:353`), minus the

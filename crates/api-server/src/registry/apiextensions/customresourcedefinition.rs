@@ -106,6 +106,11 @@ fn schema_rule_errors_in(
     let preexisting = old
         .map(|o| crate::handlers::cel_validation::find_preexisting_expressions(&o.spec))
         .unwrap_or_default();
+    // `findVersionsWithUnchangedSchemas(obj, oldObj)` (validation.go:242);
+    // empty on create.
+    let unchanged = old
+        .map(|o| versions_with_unchanged_schemas(crd, o))
+        .unwrap_or_default();
     let mut errs = Vec::new();
     for (i, version) in crd.spec.versions.iter().enumerate() {
         let Some(validation) = &version.schema else {
@@ -120,9 +125,37 @@ fn schema_rule_errors_in(
                 .child("openAPIV3Schema"),
             env_set,
             &preexisting,
+            // `suppressExpressionCostForUnchangedSchema` (validation.go:219-226).
+            unchanged.contains(&version.name),
         ));
     }
     errs
+}
+
+/// `findVersionsWithUnchangedSchemas` (apiextensions validation.go:197-217):
+/// each version of `obj` whose schema equals the one the old object has for
+/// the same version name. (`GetSchemaForVersion`'s fallback to the
+/// deprecated top-level `spec.validation` is v1-only and not modelled.)
+fn versions_with_unchanged_schemas(
+    obj: &CustomResourceDefinition,
+    old: &CustomResourceDefinition,
+) -> std::collections::HashSet<String> {
+    let schema_of = |crd: &CustomResourceDefinition, name: &str| {
+        crd.spec
+            .versions
+            .iter()
+            .find(|v| v.name == name)
+            .map(|v| serde_json::to_value(&v.schema).ok())
+    };
+    obj.spec
+        .versions
+        .iter()
+        .filter(|v| {
+            matches!((schema_of(obj, &v.name), schema_of(old, &v.name)),
+                (Some(a), Some(b)) if a == b)
+        })
+        .map(|v| v.name.clone())
+        .collect()
 }
 
 /// `supportedVersionedFormats` (apiserver/validation/formats.go:32-71) as
@@ -2435,7 +2468,8 @@ mod tests {
             fields(&errs),
             vec![(
                 "Forbidden".to_string(),
-                format!("spec.versions[0].schema.openAPIV3Schema.x-kubernetes-validations[0].rule")
+                "spec.versions[0].schema.openAPIV3Schema.x-kubernetes-validations[0].rule"
+                    .to_string()
             )]
         );
         // v2 changed to an expensive rule: enforced for v2 only.
