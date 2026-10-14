@@ -7,6 +7,7 @@
 //! `ContainerRuntime`-equivalent lifecycle methods build on it in later steps.
 
 pub mod host_policy;
+pub mod image_volume_metrics;
 pub mod probe;
 pub mod runtime;
 pub mod status;
