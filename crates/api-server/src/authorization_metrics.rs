@@ -75,7 +75,7 @@ impl InstrumentedAuthorizer {
             // non-terminal, not reported
             Opinion::NoOpinion { .. } => {}
             // matches SubjectAccessReview status.allowed field name
-            Opinion::Allow => record_authorization_decision(
+            Opinion::Allow(_) => record_authorization_decision(
                 &self.authorizer_type,
                 &self.authorizer_name,
                 "allowed",
@@ -94,7 +94,7 @@ impl InstrumentedAuthorizer {
 impl Authorizer for InstrumentedAuthorizer {
     async fn authorize(&self, attrs: &RequestAttributes) -> Result<Decision> {
         match self.authorize_opinion(attrs).await? {
-            Opinion::Allow => Ok(Decision::Allow),
+            Opinion::Allow(_) => Ok(Decision::Allow),
             Opinion::Deny(reason) => Ok(Decision::Deny(reason)),
             Opinion::NoOpinion { reason, error } => match error {
                 Some(e) => Err(rusternetes_common::error::Error::Authorization(e)),

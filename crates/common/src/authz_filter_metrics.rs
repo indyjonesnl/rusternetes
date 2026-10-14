@@ -65,7 +65,7 @@ static LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
 /// decision.
 pub fn record_authorization_metrics(result: &Result<Opinion>, elapsed: Duration) {
     let label = match result {
-        Ok(Opinion::Allow) => ALLOWED,
+        Ok(Opinion::Allow(_)) => ALLOWED,
         Err(_) | Ok(Opinion::NoOpinion { error: Some(_), .. }) => ERROR,
         Ok(Opinion::Deny(_)) => DENIED,
         Ok(Opinion::NoOpinion { error: None, .. }) => NO_OPINION,
@@ -92,7 +92,7 @@ struct FilterInstrumentedAuthorizer {
 impl Authorizer for FilterInstrumentedAuthorizer {
     async fn authorize(&self, attrs: &RequestAttributes) -> Result<Decision> {
         match self.authorize_opinion(attrs).await? {
-            Opinion::Allow => Ok(Decision::Allow),
+            Opinion::Allow(_) => Ok(Decision::Allow),
             Opinion::Deny(reason) => Ok(Decision::Deny(reason)),
             Opinion::NoOpinion { reason, error } => match error {
                 Some(e) => Err(crate::error::Error::Authorization(e)),

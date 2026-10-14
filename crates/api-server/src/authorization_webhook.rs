@@ -1041,7 +1041,7 @@ fn should_cache(attr: &RequestAttributes) -> bool {
 impl Authorizer for WebhookAuthorizer {
     async fn authorize(&self, attrs: &RequestAttributes) -> AuthzResult<Decision> {
         match self.authorize_opinion(attrs).await? {
-            Opinion::Allow => Ok(Decision::Allow),
+            Opinion::Allow(_) => Ok(Decision::Allow),
             Opinion::Deny(reason) => Ok(Decision::Deny(reason)),
             Opinion::NoOpinion { reason, error } => match error {
                 Some(e) => Err(Error::Authorization(e)),
@@ -1114,7 +1114,7 @@ impl Authorizer for WebhookAuthorizer {
                 status.reason
             )),
             (true, false) => Opinion::Deny(status.reason),
-            (false, true) => Opinion::Allow,
+            (false, true) => Opinion::Allow(status.reason),
             (false, false) => Opinion::NoOpinion {
                 reason: status.reason,
                 error: None,

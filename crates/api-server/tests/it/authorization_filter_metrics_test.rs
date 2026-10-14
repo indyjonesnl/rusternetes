@@ -24,7 +24,7 @@ struct Fake(Result<Opinion>);
 impl Authorizer for Fake {
     async fn authorize(&self, a: &RequestAttributes) -> Result<Decision> {
         match self.authorize_opinion(a).await? {
-            Opinion::Allow => Ok(Decision::Allow),
+            Opinion::Allow(_) => Ok(Decision::Allow),
             Opinion::Deny(r) => Ok(Decision::Deny(r)),
             Opinion::NoOpinion {
                 reason,
@@ -106,7 +106,7 @@ fn duration_count(r: &str) -> u64 {
 async fn filter_records_every_result_label() {
     let _g = LOCK.lock().await;
     let cases: Vec<(&str, Result<Opinion>)> = vec![
-        ("allowed", Ok(Opinion::Allow)),
+        ("allowed", Ok(Opinion::Allow(String::new()))),
         ("denied", Ok(Opinion::Deny("no".into()))),
         (
             "error",

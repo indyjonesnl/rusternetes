@@ -115,7 +115,7 @@ fn resource(name: &str) -> RequestAttributes {
 }
 
 fn is_allow(o: &Opinion) -> bool {
-    matches!(o, Opinion::Allow)
+    matches!(o, Opinion::Allow(_))
 }
 
 fn allowing_mock() -> Shared {
@@ -372,7 +372,7 @@ async fn cache_and_retry_table() {
         // Errors ride on a NoOpinion (failurePolicy=NoOpinion), as upstream's
         // (DecisionNoOpinion, "", err).
         let (authorized, errored) = match &got {
-            Ok(Opinion::Allow) => (true, false),
+            Ok(Opinion::Allow(_)) => (true, false),
             Ok(Opinion::NoOpinion { error, .. }) => (false, error.is_some()),
             Ok(Opinion::Deny(_)) => (false, false),
             Err(_) => (false, true),
