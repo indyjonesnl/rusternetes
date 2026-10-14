@@ -1441,4 +1441,108 @@ mod tests {
             ]
         );
     }
+
+    // ---- TooMany origin (#3412) ------------------------------------------
+    //
+    // Upstream `validateSlice` / `validateSet`
+    // (`pkg/apis/resource/validation/validation.go:1181`, `:1198`) tag every
+    // size breach `.WithOrigin("maxItems")`; `validateMap` (`:1246`) and the
+    // direct `field.TooMany` for device-status conditions (`:1286`) do not.
+
+    fn too_many_origins(errs: ErrorList) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = errs
+            .into_iter()
+            .filter(|e| e.error_type == crate::validation::field::ErrorType::TooMany)
+            .map(|e| (e.field, e.origin))
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn names(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("r{i}")).collect()
+    }
+
+    #[test]
+    fn spec_too_many_carries_max_items_origin() {
+        let exact = serde_json::json!({
+            "deviceClassName": "c.example.com", "allocationMode": "ExactCount", "count": 1
+        });
+        let selectors: Vec<_> = (0..33)
+            .map(|_| serde_json::json!({"cel": {"expression": "true"}}))
+            .collect();
+        let mut with_selectors = exact.clone();
+        with_selectors["selectors"] = serde_json::json!(selectors);
+        let first_available: Vec<_> = (0..9)
+            .map(|i| {
+                serde_json::json!({"name": format!("s{i}"), "deviceClassName": "c.example.com",
+                    "allocationMode": "ExactCount", "count": 1})
+            })
+            .collect();
+        let mut requests: Vec<serde_json::Value> = (0..33)
+            .map(|i| serde_json::json!({"name": format!("q{i}"), "exactly": exact}))
+            .collect();
+        requests[0] = serde_json::json!({"name": "q0", "exactly": with_selectors});
+        requests[1] = serde_json::json!({"name": "q1", "firstAvailable": first_available});
+        let config: Vec<_> = (0..33)
+            .map(|i| match i {
+                0 => serde_json::json!({"requests": names(33)}),
+                _ => serde_json::json!({}),
+            })
+            .collect();
+        let got = too_many_origins(validate_resource_claim(&claim(serde_json::json!({
+            "requests": requests, "config": config,
+        }))));
+        let want: Vec<(String, String)> = [
+            "spec.devices.config",
+            "spec.devices.config[0].requests",
+            "spec.devices.requests",
+            "spec.devices.requests[0].exactly.selectors",
+            "spec.devices.requests[1].firstAvailable",
+        ]
+        .iter()
+        .map(|f| (f.to_string(), "maxItems".to_string()))
+        .collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn status_too_many_carries_max_items_origin_except_conditions() {
+        let consumers: Vec<_> = (0..257)
+            .map(|i| serde_json::json!({"resource": "pods", "name": format!("p{i}"), "uid": format!("{i}")}))
+            .collect();
+        let results: Vec<_> = (0..33).map(|_| result(serde_json::json!({}))).collect();
+        let configs: Vec<_> = (0..65)
+            .map(|_| serde_json::json!({"source": "FromClaim", "opaque": {"driver": "d.example.com", "parameters": {}}}))
+            .collect();
+        let conditions: Vec<_> = (0..9)
+            .map(|i| serde_json::json!({"type": format!("T{i}"), "status": "True", "reason": "R", "lastTransitionTime": "2024-01-01T00:00:00Z"}))
+            .collect();
+        let status: ResourceClaimStatus = serde_json::from_value(serde_json::json!({
+            "reservedFor": consumers,
+            "allocation": {"devices": {"results": results, "config": configs}},
+            "devices": [device(serde_json::json!({"conditions": conditions}))],
+        }))
+        .unwrap();
+        let spec = claim(serde_json::json!({
+            "requests": [{"name": "r", "exactly": {"deviceClassName": "c.example.com", "allocationMode": "ExactCount", "count": 1}}]
+        }));
+        let got = too_many_origins(validate_resource_claim_status_update(
+            &status,
+            &ResourceClaimStatus::default(),
+            &spec.spec.devices,
+            false,
+            &Path::new("status"),
+        ));
+        let m = |f: &str, o: &str| (f.to_string(), o.to_string());
+        assert_eq!(
+            got,
+            vec![
+                m("status.allocation.devices.config", "maxItems"),
+                m("status.allocation.devices.results", "maxItems"),
+                m("status.devices[0].conditions", ""),
+                m("status.reservedFor", "maxItems"),
+            ]
+        );
+    }
 }
