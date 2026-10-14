@@ -4414,6 +4414,7 @@ dependencies = [
  "cel",
  "chrono",
  "chrono-tz",
+ "clap",
  "criterion",
  "cron",
  "ed25519-dalek",
