@@ -365,6 +365,20 @@ pub fn wrapped_empty_dir_meta_dir(
         .into_owned()
 }
 
+/// `volumeutil.IsReady` (`pkg/volume/util/util.go:75-90`): true when `dir`
+/// holds a regular file called `ready`.
+pub fn is_ready(dir: &str) -> bool {
+    let ready_file = std::path::Path::new(dir).join("ready");
+    match std::fs::metadata(&ready_file) {
+        Err(_) => false,
+        Ok(m) if !m.is_file() => {
+            tracing::error!("ready-file is not a file: {}", ready_file.display());
+            false
+        }
+        Ok(_) => true,
+    }
+}
+
 /// `volumeutil.SetReady` (`pkg/volume/util/util.go:93-106`): MkdirAll the dir
 /// at 0750 and touch the `ready` file. Errors are logged, not returned.
 pub fn set_ready(dir: &str) {

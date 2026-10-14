@@ -254,6 +254,10 @@ impl VolumeManager {
             Box::new(crate::volume_plugins::local::LocalPlugin::new(host.clone())),
             // `nfs.ProbeVolumePlugins` (`cmd/kubelet/app/plugins.go`).
             Box::new(crate::volume_plugins::nfs::NfsPlugin::new(host.clone())),
+            // `git_repo.ProbeVolumePlugins` (`cmd/kubelet/app/plugins.go:61`).
+            Box::new(crate::volume_plugins::git_repo::GitRepoPlugin::new(
+                host.clone(),
+            )),
             // `image.ProbeVolumePlugins` (`cmd/kubelet/app/plugins.go`).
             Box::new(crate::volume_plugins::image::ImagePlugin::new()),
             Box::new(crate::volume_plugins::config_map::ConfigMapPlugin::new(
@@ -3611,6 +3615,26 @@ mod dispatch_tests {
         assert!(vm
             .plugin_mgr
             .find_plugin_by_name("kubernetes.io/nfs")
+            .is_ok());
+    }
+
+    /// `git_repo.ProbeVolumePlugins` is registered by the kubelet
+    /// (`cmd/kubelet/app/plugins.go:61`), so a `gitRepo` volume resolves to
+    /// the `kubernetes.io/git-repo` plugin (`git_repo.go:53`) instead of
+    /// failing with `no volume plugin matched` (#3289).
+    #[test]
+    fn a_git_repo_volume_is_claimed_by_the_git_repo_plugin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(
+            tmp.path().to_string_lossy().to_string(),
+            None,
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+        let v = volume("g", json!({"gitRepo": {"repository": "https://x/y.git"}}));
+        assert_eq!(vm.plugin_name_for_volume(&v), "kubernetes.io/git-repo");
+        assert!(vm
+            .plugin_mgr
+            .find_plugin_by_name("kubernetes.io/git-repo")
             .is_ok());
     }
 
