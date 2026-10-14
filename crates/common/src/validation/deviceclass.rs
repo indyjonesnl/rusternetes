@@ -8,8 +8,8 @@
 //! DRA CEL environment is tracked in #1442. ObjectMeta is validated separately.
 
 use crate::resources::{DeviceClass, DeviceClassSpec};
-use crate::validation::field::{Error, ErrorList, Path};
-use crate::validation::resourceclaim::validate_selector_slice;
+use crate::validation::field::{ErrorList, Path};
+use crate::validation::resourceclaim::{too_many_max_items, validate_selector_slice};
 
 const DEVICE_CONFIG_MAX_SIZE: usize = 32;
 
@@ -35,7 +35,7 @@ fn validate_device_class_spec(spec: &DeviceClassSpec, fld_path: &Path) -> ErrorL
     ));
 
     if spec.config.len() > DEVICE_CONFIG_MAX_SIZE {
-        errs.push(Error::too_many(
+        errs.push(too_many_max_items(
             &fld_path.child("config"),
             spec.config.len(),
             DEVICE_CONFIG_MAX_SIZE,

@@ -19,6 +19,7 @@ use crate::resources::{ResourceSlice, ResourceSliceSpec};
 use crate::validation::csinode::validate_csi_driver_name;
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::{is_dns1123_label, is_dns1123_subdomain, validate_label_name};
+use crate::validation::resourceclaim::too_many_max_items;
 use std::collections::HashSet;
 
 /// Port of upstream `validateNodeName` (resource/validation): node names use
@@ -173,7 +174,7 @@ fn validate_resource_slice_spec(spec: &ResourceSliceSpec, fld_path: &Path) -> Er
         RESOURCE_SLICE_MAX_DEVICES
     };
     if spec.devices.len() > max_devices {
-        errs.push(Error::too_many(
+        errs.push(too_many_max_items(
             &devices_path,
             spec.devices.len(),
             max_devices,
@@ -214,7 +215,7 @@ fn validate_device(device: &Device, fld_path: &Path) -> ErrorList {
 
     let taints_path = fld_path.child("taints");
     if device.taints.len() > DEVICE_TAINTS_MAX_LENGTH {
-        errs.push(Error::too_many(
+        errs.push(too_many_max_items(
             &taints_path,
             device.taints.len(),
             DEVICE_TAINTS_MAX_LENGTH,
@@ -226,7 +227,7 @@ fn validate_device(device: &Device, fld_path: &Path) -> ErrorList {
 
     let consumes_path = fld_path.child("consumesCounters");
     if device.consumes_counters.len() > MAX_COUNTER_CONSUMPTIONS_PER_DEVICE {
-        errs.push(Error::too_many(
+        errs.push(too_many_max_items(
             &consumes_path,
             device.consumes_counters.len(),
             MAX_COUNTER_CONSUMPTIONS_PER_DEVICE,
@@ -286,7 +287,7 @@ pub(crate) fn validate_device_binding_parameters(
         (binding_failure_conditions, &bfc_path),
     ] {
         if list.len() > BINDING_CONDITIONS_MAX_SIZE {
-            errs.push(Error::too_many(
+            errs.push(too_many_max_items(
                 path,
                 list.len(),
                 BINDING_CONDITIONS_MAX_SIZE,
