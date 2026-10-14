@@ -990,6 +990,29 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
 
+    /// `structuraldefaulting.Default` (algorithm.go:45,:53,:61): a non-nullable
+    /// null is replaced by the default, for properties, additionalProperties
+    /// and array items alike; a nullable null is kept.
+    #[test]
+    fn test_apply_defaults_replaces_non_nullable_nulls() {
+        let schema: JSONSchemaProps = serde_json::from_value(json!({
+            "type": "object",
+            "properties": {
+                "a": {"type": "string", "default": "A"},
+                "n": {"type": "string", "nullable": true, "default": "N"},
+                "m": {"type": "object", "additionalProperties": {"type": "string", "default": "X"}},
+                "l": {"type": "array", "items": {"type": "string", "default": "I"}}
+            }
+        }))
+        .unwrap();
+        let mut v = json!({"a": null, "n": null, "m": {"k": null}, "l": [null, "z"]});
+        SchemaValidator::apply_defaults(&schema, &mut v);
+        assert_eq!(
+            v,
+            json!({"a": "A", "n": null, "m": {"k": "X"}, "l": ["I", "z"]})
+        );
+    }
+
     #[test]
     fn test_nested_required_in_array_items_reports_rooted_path() {
         // CustomResourcePublishOpenAPI #239: a CR with spec.bars[0] missing the

@@ -980,6 +980,7 @@ fn validate_nested_value_validation_completeness(
     all_errs
 }
 
+pub mod defaulting;
 pub mod objectmeta;
 pub mod prune;
 pub mod prunenulls;
