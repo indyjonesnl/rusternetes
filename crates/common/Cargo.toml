@@ -55,6 +55,8 @@ p384 = "0.13"
 p521 = "0.13"
 rsa = { version = "0.9", features = ["sha2"] }
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
+# Validity window of generated self-signed serving certs (rcgen takes `time` types).
+time = "0.3"
 
 [features]
 default = []
@@ -64,7 +66,6 @@ clap-support = ["clap"]
 [dev-dependencies]
 tempfile = "3.27.0"
 proptest = "1"
-time = "0.3"
 serial_test = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 criterion = "0.5"
