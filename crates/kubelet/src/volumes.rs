@@ -3662,6 +3662,29 @@ mod dispatch_tests {
             .is_ok());
     }
 
+    /// `fc.ProbeVolumePlugins` is registered by the kubelet
+    /// (`cmd/kubelet/app/plugins.go`), so an `fc` volume resolves to the
+    /// `kubernetes.io/fc` plugin (`pkg/volume/fc/fc.go:56`) instead of
+    /// failing with `no volume plugin matched` (#3288).
+    #[test]
+    fn an_fc_volume_is_claimed_by_the_fc_plugin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(
+            tmp.path().to_string_lossy().to_string(),
+            None,
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+        let v = volume(
+            "f",
+            json!({"fc": {"targetWWNs": ["500a0981891b8dc5"], "lun": 0}}),
+        );
+        assert_eq!(vm.plugin_name_for_volume(&v), "kubernetes.io/fc");
+        assert!(vm
+            .plugin_mgr
+            .find_plugin_by_name("kubernetes.io/fc")
+            .is_ok());
+    }
+
     /// `image.ProbeVolumePlugins` is registered by the kubelet
     /// (`cmd/kubelet/app/plugins.go`), so an `image` volume resolves to the
     /// `kubernetes.io/image` stub plugin (`pkg/volume/image/image.go:41`)
