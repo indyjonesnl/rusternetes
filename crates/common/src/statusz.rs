@@ -303,10 +303,10 @@ const SUPPORTED: [(&str, &str, &str); 4] = [
 
 /// `schema.GroupVersionKind` pieces collected from the `g`/`v`/`as` params.
 #[derive(Debug, Default, Clone, PartialEq)]
-struct Gvk {
-    group: String,
-    version: String,
-    kind: String,
+pub(crate) struct Gvk {
+    pub(crate) group: String,
+    pub(crate) version: String,
+    pub(crate) kind: String,
 }
 
 /// `goautoneg.Accept`.
@@ -404,24 +404,29 @@ fn parse_accept(header: &str) -> Vec<Accept> {
 }
 
 /// `StatuszEndpointRestrictions.AllowsMediaTypeTransform` (negotiate/negotiation.go).
-fn allows_media_type_transform(mime_type: &str, mime_sub_type: &str, gvk: &Option<Gvk>) -> bool {
+pub(crate) fn allows_media_type_transform(
+    mime_type: &str,
+    mime_sub_type: &str,
+    gvk: &Option<Gvk>,
+    kind: &str,
+) -> bool {
     if mime_type == "text" && mime_sub_type == "plain" {
         return gvk.is_none();
     }
-    matches!(gvk, Some(g) if g.group == GROUP_NAME && g.version == VERSION && g.kind == KIND)
+    matches!(gvk, Some(g) if g.group == GROUP_NAME && g.version == VERSION && g.kind == kind)
 }
 
 /// The result of `MediaTypeOptions` for one accepted serializer.
-struct Negotiated {
-    media_type: &'static str,
-    pretty: bool,
-    convert: Option<Gvk>,
+pub(crate) struct Negotiated {
+    pub(crate) media_type: &'static str,
+    pub(crate) pretty: bool,
+    pub(crate) convert: Option<Gvk>,
 }
 
 /// `NegotiateMediaTypeOptions` + `acceptMediaTypeOptions` (negotiate.go) with
 /// `StatuszEndpointRestrictions` (`AllowsServerVersion`/`AllowsStreamSchema`
 /// always false).
-fn negotiate_media_type_options(header: &str) -> Option<Negotiated> {
+pub(crate) fn negotiate_media_type_options(header: &str, kind: &str) -> Option<Negotiated> {
     if header.is_empty() {
         let (mt, _, _) = SUPPORTED[0];
         return Some(Negotiated {
@@ -438,7 +443,7 @@ fn negotiate_media_type_options(header: &str) -> Option<Negotiated> {
             if !matches {
                 continue;
             }
-            if let Some(n) = accept_media_type_options(&clause.params, media_type, t, st) {
+            if let Some(n) = accept_media_type_options(&clause.params, media_type, t, st, kind) {
                 return Some(n);
             }
         }
@@ -451,6 +456,7 @@ fn accept_media_type_options(
     media_type: &'static str,
     t: &str,
     st: &str,
+    kind: &str,
 ) -> Option<Negotiated> {
     let mut convert: Option<Gvk> = None;
     let mut pretty = false;
@@ -468,7 +474,7 @@ fn accept_media_type_options(
             _ => {}
         }
     }
-    if !allows_media_type_transform(t, st, &convert) {
+    if !allows_media_type_transform(t, st, &convert, kind) {
         return None;
     }
     Some(Negotiated {
@@ -479,7 +485,7 @@ fn accept_media_type_options(
 }
 
 /// `isPrettyPrint` (negotiate.go).
-fn is_pretty_print(raw_query: &str, user_agent: &str) -> bool {
+pub(crate) fn is_pretty_print(raw_query: &str, user_agent: &str) -> bool {
     if raw_query.contains("pretty") {
         let pp = raw_query
             .split('&')
@@ -502,7 +508,7 @@ fn is_pretty_print(raw_query: &str, user_agent: &str) -> bool {
 /// way: `ErrorNegotiated` re-negotiates the original `Accept` under
 /// `DefaultEndpointRestrictions`, which rejects the `g/v/as` conversion, so
 /// `WriteObjectNegotiated` falls back to raw JSON for the failure status.
-fn error_response(code: u16, reason: &str, message: &str) -> Response {
+pub(crate) fn error_response(code: u16, reason: &str, message: &str) -> Response {
     let status = serde_json::json!({
         "kind": "Status",
         "apiVersion": "v1",
@@ -520,7 +526,7 @@ fn error_response(code: u16, reason: &str, message: &str) -> Response {
 }
 
 /// `errNotAcceptable` (negotiation/errors.go): reason `NotAcceptable`.
-fn not_acceptable() -> Response {
+pub(crate) fn not_acceptable() -> Response {
     let supported: Vec<&str> = SUPPORTED.iter().map(|(m, _, _)| *m).collect();
     error_response(
         406,
@@ -533,12 +539,12 @@ fn not_acceptable() -> Response {
 }
 
 /// A plain (non-`metav1.Status`) error: `ErrorToAPIStatus` default branch.
-fn plain_error(message: &str) -> Response {
+pub(crate) fn plain_error(message: &str) -> Response {
     error_response(500, "Unknown", message)
 }
 
 /// `html.EscapeString`.
-fn html_escape(s: &str) -> String {
+pub(crate) fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('\'', "&#39;")
         .replace('<', "&lt;")
@@ -621,7 +627,7 @@ pub fn handle_statusz_with_delimiters(
         };
     }
 
-    let Some(n) = negotiate_media_type_options(accept) else {
+    let Some(n) = negotiate_media_type_options(accept, KIND) else {
         return not_acceptable();
     };
     let pretty = n.pretty || is_pretty_print(raw_query, user_agent);
