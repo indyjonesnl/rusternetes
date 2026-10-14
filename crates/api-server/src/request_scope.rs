@@ -10,6 +10,11 @@
 //! consumed instead of at ~200 call sites.
 
 use crate::audit::{request_info, Attributes};
+
+/// `request.RequestInfo`. The api-server binary compiles its own copy of
+/// `crate::audit`, so code compiled into both must name the type through
+/// here (the lib's), which is what the task-local holds.
+pub type RequestInfo = Attributes;
 use rusternetes_common::authz::RequestAttributes;
 
 tokio::task_local! {

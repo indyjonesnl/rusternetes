@@ -18,7 +18,8 @@
 //! authorizer without recording metrics of their own and the filter's
 //! attempt is the one that is counted.
 
-use crate::audit::{add_audit_annotation, add_audit_annotations, Attributes};
+use crate::audit::{add_audit_annotation, add_audit_annotations};
+use crate::request_scope::RequestInfo;
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::Next;
@@ -40,7 +41,7 @@ const REASON_ERROR: &str = "internal error";
 /// `GetAuthorizerAttributes` (authorization.go:101-153) for the request's
 /// `RequestInfo`. The selectors are parsed as `AuthorizeWithSelectors` does
 /// (GA and locked on since 1.34, kube_features.go:353).
-pub fn get_authorizer_attributes(user: UserInfo, info: &Attributes) -> RequestAttributes {
+pub fn get_authorizer_attributes(user: UserInfo, info: &RequestInfo) -> RequestAttributes {
     let mut attrs = if info.is_resource_request {
         RequestAttributes::new(user, info.verb.clone(), info.resource.clone())
     } else {

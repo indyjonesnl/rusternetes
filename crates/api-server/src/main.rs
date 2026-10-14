@@ -7,6 +7,7 @@ static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod admission;
 mod audit;
+mod authorization_filter;
 pub use rusternetes_admission_webhook as admission_webhook;
 #[allow(dead_code)]
 mod bootstrap;
