@@ -711,18 +711,15 @@ fn out_of_budget() -> BudgetError {
     }
 }
 
-/// `evaluationActivation.Evaluate` from the evaluation on (`activation.go:
-/// 132-189`): charge the composition (variable) cost, then the actual cost of
-/// `evaluate`, against `remaining_budget`. Returns the evaluation result (an
-/// `Err` is `evaluation.Error`'s detail) and the remaining budget; the
-/// `BudgetError` is the error returned instead of an `EvaluationResult`.
-pub fn evaluate_with_budget(
-    expression: &str,
-    evaluate: impl FnOnce() -> (Result<Value, CostEvalError>, u64),
+/// The budget half of `evaluationActivation.Evaluate` (`activation.go:
+/// 143-174`): charge the composition (variable) cost, then the actual cost,
+/// against `remaining_budget`; the remaining budget, or the out-of-budget
+/// error that stops all further evaluation.
+pub fn charge_budget(
     composition_cost: Option<i64>,
+    rt_cost: u64,
     remaining_budget: i64,
-) -> Result<(Result<Value, String>, i64), BudgetError> {
-    let (result, rt_cost) = evaluate();
+) -> Result<i64, BudgetError> {
     let mut remaining = remaining_budget;
     // budget may be spent due to lazy evaluation of composited variables
     if let Some(composition) = composition_cost {
@@ -736,7 +733,21 @@ pub fn evaluate_with_budget(
     if rt_cost > i64::MAX as u64 || rt_cost as i64 > remaining {
         return Err(out_of_budget());
     }
-    remaining -= rt_cost as i64;
+    Ok(remaining - rt_cost as i64)
+}
+
+/// `evaluationActivation.Evaluate` from the evaluation on (`activation.go:
+/// 132-189`): [`charge_budget`] for `evaluate`'s cost. Returns the evaluation
+/// result (an `Err` is `evaluation.Error`'s detail) and the remaining budget;
+/// the `BudgetError` is the error returned instead of an `EvaluationResult`.
+pub fn evaluate_with_budget(
+    expression: &str,
+    evaluate: impl FnOnce() -> (Result<Value, CostEvalError>, u64),
+    composition_cost: Option<i64>,
+    remaining_budget: i64,
+) -> Result<(Result<Value, String>, i64), BudgetError> {
+    let (result, rt_cost) = evaluate();
+    let remaining = charge_budget(composition_cost, rt_cost, remaining_budget)?;
     match result {
         Err(e) => Ok((
             Err(format!("expression '{expression}' resulted in error: {e}")),

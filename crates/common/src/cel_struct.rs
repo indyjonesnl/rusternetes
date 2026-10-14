@@ -205,6 +205,12 @@ pub fn execute_checked(
     mode: TypeCheck,
 ) -> Result<Value, String> {
     let v = execute_raw(expr, ctx)?;
+    finish_checked(v, mode)
+}
+
+/// The `CheckTypeNamesMatchFieldPathNames` and marker-stripping half of
+/// [`execute_checked`], for a value evaluated elsewhere (the costed path).
+pub fn finish_checked(v: Value, mode: TypeCheck) -> Result<Value, String> {
     let mut errs = Vec::new();
     match mode {
         TypeCheck::Root => {
