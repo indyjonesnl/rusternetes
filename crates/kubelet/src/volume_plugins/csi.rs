@@ -788,8 +788,13 @@ impl DeviceMountableVolumePlugin for CsiPlugin {
     }
 
     /// `GetDeviceMountRefs` (`csi_plugin.go:721-727`).
-    fn get_device_mount_refs(&self, _device_mount_path: &str) -> Result<Vec<String>> {
-        Ok(vec![])
+    ///
+    /// ```go
+    /// m := p.host.GetMounter()
+    /// return m.GetMountRefs(deviceMountPath)
+    /// ```
+    fn get_device_mount_refs(&self, device_mount_path: &str) -> Result<Vec<String>> {
+        Ok(self.host.get_mounter().get_mount_refs(device_mount_path)?)
     }
 }
 

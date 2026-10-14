@@ -680,18 +680,43 @@ mod local_ephemeral_tests {
 const KUBERNETES_PLUGIN_PATH_PREFIX: &str = "/plugins/kubernetes.io/";
 
 /// Port of `HasMountRefs` (`pkg/volume/util/util.go:559-593`).
-pub fn has_mount_refs(_mount_path: &str, _mount_refs: &[String]) -> bool {
-    let _ = KUBERNETES_PLUGIN_PATH_PREFIX;
-    false
+///
+/// A ref is a real external reference when it does not contain the
+/// `/plugins/kubernetes.io/...` suffix of `mount_path` (the kubelet's own
+/// bind mounts of the same device, possibly under a different root). With no
+/// such segment the whole `mount_path` is searched for. (Upstream's
+/// "gci mounter" workaround, kept verbatim.)
+pub fn has_mount_refs(mount_path: &str, mount_refs: &[String]) -> bool {
+    let path_to_find = match mount_path.find(KUBERNETES_PLUGIN_PATH_PREFIX) {
+        Some(i) => &mount_path[i..],
+        None => mount_path,
+    };
+    mount_refs.iter().any(|r| !r.contains(path_to_find))
 }
 
 /// The refs gate of `GenerateUnmountDeviceFunc`
 /// (`operation_generator.go:846-856`): `Err` when the refs lookup failed or
 /// the device mount path is still referenced elsewhere.
+///
+/// ```go
+/// if err != nil || util.HasMountRefs(deviceMountPath, refs) {
+///     if err == nil {
+///         err = fmt.Errorf("the device mount path %q is still mounted by other references %v", deviceMountPath, refs)
+///     }
+///     ... GenerateError("GetDeviceMountRefs check failed", err)
+/// ```
 pub fn check_device_mount_refs(
-    _device_mount_path: &str,
-    _refs: anyhow::Result<Vec<String>>,
+    device_mount_path: &str,
+    refs: anyhow::Result<Vec<String>>,
 ) -> anyhow::Result<()> {
+    let refs = refs?;
+    if has_mount_refs(device_mount_path, &refs) {
+        // `%q` / `%v` of a `[]string`: Go-quoted path, `[a b]`.
+        anyhow::bail!(
+            "the device mount path {device_mount_path:?} is still mounted by other references [{}]",
+            refs.join(" ")
+        );
+    }
     Ok(())
 }
 

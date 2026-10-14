@@ -619,6 +619,12 @@ impl Mounter {
         )
     }
 
+    /// `GetMountRefs` (`mount_linux.go:513-529`): every mount reference to
+    /// `pathname`, over `/proc/self/mountinfo`.
+    pub fn get_mount_refs(&self, pathname: &str) -> io::Result<Vec<String>> {
+        super::mount_utils::get_mount_refs(pathname)
+    }
+
     /// `Unmount` (`mount_linux.go:400-408`).
     pub fn unmount(&self, target: &str) -> io::Result<()> {
         tracing::debug!("Unmounting {target}");
