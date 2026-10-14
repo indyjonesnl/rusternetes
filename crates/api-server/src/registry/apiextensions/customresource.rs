@@ -49,6 +49,8 @@ use rusternetes_common::types::{ObjectMeta, TypeMeta};
 use rusternetes_common::validation::field::{Error as FieldError, ErrorList, ErrorType, Path};
 use rusternetes_common::validation::metav1::is_qualified_name;
 use rusternetes_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
+use rusternetes_common::validation::structural::objectmeta::{coerce_with_options, CoerceOptions};
+use rusternetes_common::validation::structural::{new_structural, Structural};
 use rusternetes_common::{Error, Result};
 use rusternetes_storage::StorageBackend;
 
@@ -222,65 +224,6 @@ pub enum StrictMode {
     Patch,
 }
 
-/// Fields `ObjectMeta` declares; anything else under a `metadata` key, at the
-/// root or in an embedded object, is unknown
-/// (`pkg/apiserver/schema/objectmeta/validation.go`).
-const KNOWN_META: &[&str] = &[
-    "name",
-    "generateName",
-    "namespace",
-    "selfLink",
-    "uid",
-    "resourceVersion",
-    "generation",
-    "creationTimestamp",
-    "deletionTimestamp",
-    "deletionGracePeriodSeconds",
-    "labels",
-    "annotations",
-    "ownerReferences",
-    "finalizers",
-    "managedFields",
-    "clusterName",
-];
-
-fn check_embedded_meta(value: &serde_json::Value, path: &str) -> Option<String> {
-    if let Some(obj) = value.as_object() {
-        if let Some(meta) = obj.get("metadata").and_then(|m| m.as_object()) {
-            let meta_path = if path.is_empty() {
-                ".metadata".to_string()
-            } else {
-                format!("{path}.metadata")
-            };
-            for key in meta.keys() {
-                if !KNOWN_META.contains(&key.as_str()) {
-                    return Some(format!("{meta_path}.{key}: field not declared in schema"));
-                }
-            }
-        }
-        for (key, val) in obj {
-            if key == "metadata" {
-                continue;
-            }
-            let child = if path.is_empty() {
-                format!(".{key}")
-            } else {
-                format!("{path}.{key}")
-            };
-            if let Some(err) = check_embedded_meta(val, &child) {
-                return Some(err);
-            }
-        }
-    } else if let Some(arr) = value.as_array() {
-        for item in arr {
-            if let Some(err) = check_embedded_meta(item, path) {
-                return Some(err);
-            }
-        }
-    }
-    None
-}
-
 /// `customResourceStrategy` (strategy.go:50-60) for one served version.
 pub struct Strategy {
     crd: Arc<CustomResourceDefinition>,
@@ -365,29 +308,80 @@ impl Strategy {
     /// The paths `structuralpruning.PruneWithOptions(u.Object,
     /// structuralSchemas[gv.Version], true, {TrackUnknownFieldPaths})` reports
     /// (customresource_handler.go:1427-1435), skipped when the CRD has
-    /// `preserveUnknownFields` (:1426). Unknown `metadata` fields
-    /// (`schemaobjectmeta`, :1415-1421, :1439-1446) are not ported yet.
+    /// `preserveUnknownFields` (:1426), followed by the paths
+    /// `schemaobjectmeta.CoerceWithOptions` reports for embedded `metadata`
+    /// (:1442-1449). The unknown fields of the root `metadata`
+    /// (`GetObjectMetaWithOptions`, :1415-1421) cannot be seen here: the typed
+    /// `ObjectMeta` has already dropped them.
     fn unknown_fields(&self, cr: &CustomResource) -> Vec<String> {
-        if self.crd.spec.preserve_unknown_fields == Some(true) {
+        let Some(structural) = self.structural_schema() else {
             return Vec::new();
+        };
+        let mut paths = Vec::new();
+        if self.crd.spec.preserve_unknown_fields != Some(true) {
+            if let Ok(mut value) = serde_json::to_value(cr) {
+                paths.extend(
+                    rusternetes_common::validation::structural::prune::prune_with_options(
+                        &mut value,
+                        Some(&structural),
+                        true,
+                        true,
+                    ),
+                );
+            }
         }
-        let Some(schema) = self.crd_version().and_then(|v| v.schema.as_ref()) else {
-            return Vec::new();
+        paths.extend(self.coerce_embedded_metadata(&mut cr.clone(), true).1);
+        paths
+    }
+
+    /// The served version's structural schema (`structuralSchemas[gv.Version]`).
+    fn structural_schema(&self) -> Option<Structural> {
+        let schema = self.crd_version().and_then(|v| v.schema.as_ref())?;
+        new_structural(&schema.open_apiv3_schema).ok()
+    }
+
+    /// `schemaobjectmeta.CoerceWithOptions(nil, u.Object,
+    /// structuralSchemas[gv.Version], false, ...)` with
+    /// `DropInvalidFields: false` (customresource_handler.go:1442-1449 on the
+    /// request path, :1190-1194): every embedded `metadata` is round-tripped
+    /// through `ObjectMeta`. The root `metadata` is not part of the value it
+    /// walks: it is a typed field here, and the root is not an embedded
+    /// resource.
+    fn coerce_embedded_metadata(
+        &self,
+        cr: &mut CustomResource,
+        return_unknown_field_paths: bool,
+    ) -> (Option<FieldError>, Vec<String>) {
+        let Some(structural) = self.structural_schema() else {
+            return (None, Vec::new());
         };
-        let Ok(structural) =
-            rusternetes_common::validation::structural::new_structural(&schema.open_apiv3_schema)
-        else {
-            return Vec::new();
-        };
-        let Ok(mut value) = serde_json::to_value(cr) else {
-            return Vec::new();
-        };
-        rusternetes_common::validation::structural::prune::prune_with_options(
+        let mut map = serde_json::Map::new();
+        for (k, v) in std::mem::take(&mut cr.extra) {
+            map.insert(k, v);
+        }
+        if let Some(spec) = cr.spec.take() {
+            map.insert("spec".to_string(), spec);
+        }
+        if let Some(status) = cr.status.take() {
+            map.insert("status".to_string(), status);
+        }
+        let mut value = serde_json::Value::Object(map);
+        let out = coerce_with_options(
+            None,
             &mut value,
             Some(&structural),
-            true,
-            true,
-        )
+            false,
+            CoerceOptions {
+                drop_invalid_fields: false,
+                return_unknown_field_paths,
+            },
+        );
+        if let serde_json::Value::Object(mut map) = value {
+            cr.spec = map.remove("spec");
+            cr.status = map.remove("status");
+            cr.extra = map.into_iter().collect();
+        }
+        out
     }
 
     /// The object's schema and CEL errors, as field errors.
@@ -712,10 +706,19 @@ impl CustomResourceRest {
                 _ => format!("strict decoding error: unknown field \"{}\"", unknown[0]),
             }));
         }
-        if let Ok(value) = serde_json::to_value(cr) {
-            if let Some(err) = check_embedded_meta(&value, "") {
-                return Err(Error::InvalidResource(err));
-            }
+        // The unknown fields of every embedded `metadata`
+        // (`schemaobjectmeta.CoerceWithOptions`, :1442-1449), which feed the
+        // `StrictDecodingError` (:1338-1342).
+        if let Some(path) = self
+            .strategy
+            .coerce_embedded_metadata(&mut cr.clone(), true)
+            .1
+            .first()
+        {
+            return Err(Error::InvalidResource(match self.strict {
+                StrictMode::Patch => format!(".{path}: field not declared in schema"),
+                _ => format!("strict decoding error: unknown field \"{path}\""),
+            }));
         }
         if !preserves {
             if let Some(spec_schema) = schema
@@ -759,8 +762,18 @@ impl RestStorage<CustomResource> for CustomResourceRest {
     /// `schemaCoercingDecoder.Decode` + `unstructuredDefaulter.Default`
     /// (customresource_handler.go:1189-1200, 1321-1346): the body is
     /// defaulted and pruned as it is decoded, so admission sees the result.
-    fn decode_coerce(&self, obj: &mut CustomResource) {
+    fn decode_coerce(&self, obj: &mut CustomResource) -> Result<()> {
         self.strategy.coerce(obj);
+        // `unstructuredSchemaCoercer.apply` (:1442-1449): a malformed embedded
+        // `metadata` fails the decode, which the handler reports through
+        // `transformDecodeError` (handlers/rest.go:251-253).
+        if let (Some(err), _) = self.strategy.coerce_embedded_metadata(obj, false) {
+            return Err(Error::BadRequest(format!(
+                "{} in version {:?} cannot be handled as a {}: {err}",
+                obj.kind, self.strategy.version, obj.kind
+            )));
+        }
+        Ok(())
     }
 
     /// The strict-decoding verdict, on the body as sent.
