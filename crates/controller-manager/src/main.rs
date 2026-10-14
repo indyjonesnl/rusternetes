@@ -1162,6 +1162,7 @@ async fn main() -> Result<()> {
                         owner_namespace: namespace,
                         immediate_binding,
                         refresher,
+                        limiter: Arc::new(rusternetes_client::ratelimit::RateLimiter::unlimited()),
                     };
                     controllers::csi_capacity::run_capacity_loop(
                         &ctl,

@@ -397,6 +397,9 @@ pub struct CapacityController<'a, S: Storage, C: CapacityClient> {
     pub immediate_binding: bool,
     /// `capacities` + `queue`, shared with the provisioner's refresh hooks.
     pub refresher: std::sync::Arc<super::csi_capacity_refresh::CapacityRefresher>,
+    /// The token bucket of the dedicated capacity clientset
+    /// (`--kube-api-capacity-qps/-burst`, csi-provisioner.go:456-458). Stub.
+    pub limiter: std::sync::Arc<rusternetes_client::ratelimit::RateLimiter>,
 }
 
 /// `WorkItem` (capacity.go:105-108) with the StorageClass resolved.
@@ -825,6 +828,16 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
     }
 
     // ---- workers ----
+
+    /// `--capacity-threads` workers (capacity.go:238-253). Stub: one worker.
+    pub async fn run_workers(
+        &self,
+        _threads: u32,
+        start: std::time::Duration,
+        max: std::time::Duration,
+    ) {
+        self.run_worker(start, max).await
+    }
 
     /// `wait.UntilWithContext(pollCapacities, pollPeriod)` (capacity.go:255).
     async fn run_poll(&self, period: std::time::Duration) {
@@ -1586,6 +1599,8 @@ mod tests {
         max: Mutex<Option<i64>>,
         requests: Mutex<Vec<GetCapacityRequest>>,
         fail: Mutex<bool>,
+        /// How long a `GetCapacity` call takes.
+        delay: Mutex<Duration>,
     }
 
     impl CapacityClient for FakeClient {
@@ -1594,6 +1609,10 @@ mod tests {
             req: GetCapacityRequest,
         ) -> std::result::Result<GetCapacityResponse, String> {
             self.requests.lock().unwrap().push(req);
+            let delay = *self.delay.lock().unwrap();
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             if *self.fail.lock().unwrap() {
                 return Err("boom".into());
             }
@@ -1651,6 +1670,7 @@ mod tests {
             owner_namespace: NS.into(),
             immediate_binding: immediate,
             refresher: Default::default(),
+            limiter: std::sync::Arc::new(rusternetes_client::ratelimit::RateLimiter::unlimited()),
         }
     }
 
@@ -2408,6 +2428,73 @@ mod tests {
             _ = run => unreachable!("the loop never ends"),
             _ = scenario => {}
         }
+    }
+
+    // ---- #3547: capacity clientset rate limit and --capacity-threads ----
+
+    fn zones(n: usize) -> Vec<Segment> {
+        (0..n).map(|i| seg(&[("zone", &format!("z{i}"))])).collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capacity_creates_and_deletes_go_through_the_capacity_rate_limiter() {
+        // csi-provisioner.go:456-458 builds the clientset that creates, updates
+        // and deletes CSIStorageCapacity objects with its own QPS/Burst
+        // (token bucket, rest/config.go:370-381): burst 2 at 1 QPS lets two
+        // creates through at once, the 3rd and 4th wait 1s and 2s.
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        put_sc(&st, sc("late", DRIVER, None)).await;
+        let limited = |qps: f64, burst: f64| CapacityController {
+            limiter: std::sync::Arc::new(rusternetes_client::ratelimit::RateLimiter::new(
+                qps, burst,
+            )),
+            ..ctl(&st, &cl, false)
+        };
+        let c = limited(1.0, 2.0);
+        let start = tokio::time::Instant::now();
+        settle(&c, &st, &zones(4)).await;
+        assert_eq!(list_caps(&st).await.len(), 4);
+        assert_eq!(start.elapsed(), Duration::from_secs(2));
+
+        // Deletes of obsolete objects are throttled by the same bucket kind:
+        // burst 1 at 1 QPS, four deletes take 3s.
+        let c = limited(1.0, 1.0);
+        let start = tokio::time::Instant::now();
+        settle(&c, &st, &[]).await;
+        assert!(list_caps(&st).await.is_empty());
+        assert_eq!(start.elapsed(), Duration::from_secs(3));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capacity_threads_workers_process_the_queue_concurrently() {
+        // Controller.Run (capacity.go:238-253) starts `threadiness` workers on
+        // the one queue; four 100ms GetCapacity calls take 100ms with four.
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        *cl.delay.lock().unwrap() = Duration::from_millis(100);
+        put_sc(&st, sc("late", DRIVER, None)).await;
+        let c = boot(&st, &cl, false, &zones(4)).await;
+        let start = tokio::time::Instant::now();
+        let run = c.run_workers(4, Duration::from_millis(1), Duration::from_secs(1));
+        tokio::select! {
+            _ = run => unreachable!("workers never end"),
+            _ = eventually("four objects", async || list_caps(&st).await.len() == 4) => {}
+        }
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "took {:?}",
+            start.elapsed()
+        );
+        // The same item is never processed by two workers at once, so no
+        // duplicate objects appear (checked by the count above plus a tick).
+        c.apply_c_list(list_caps(&st).await);
+        c.poll_capacities();
+        tokio::select! {
+            _ = c.run_workers(4, Duration::from_millis(1), Duration::from_secs(1)) => unreachable!(),
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+        }
+        assert_eq!(list_caps(&st).await.len(), 4);
     }
 
     #[test]
