@@ -226,6 +226,23 @@ mod tests {
         assert_eq!(info.get_metric()[0].get_gauge().value(), 1.0);
     }
 
+    // Regression for the flake: `ReloadableAuthorizer::spawn_reload` (run by
+    // authorizer.rs tests in the same process, without LOCK) writes the global
+    // hashes at any moment. A foreign writer landing mid-test must not change
+    // what this test observes.
+    #[test]
+    fn foreign_global_writer_does_not_leak_into_isolated_metrics() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        register_metrics();
+        reset_metrics_for_test();
+        record_authorization_config_automatic_reload_success(TEST_API_SERVER_ID, "config1");
+        record_authorization_config_last_config_info("interloper", "other");
+        record_authorization_config_automatic_reload_success(TEST_API_SERVER_ID, "config2");
+        record_authorization_config_last_config_info("interloper", "other");
+        let info = family("apiserver_authorization_config_controller_last_config_info").unwrap();
+        assert_eq!(label(&info.get_metric()[0], "hash"), get_hash("config2"));
+    }
+
     #[test]
     fn last_config_info_hash_label_is_sha256_of_the_data() {
         let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
