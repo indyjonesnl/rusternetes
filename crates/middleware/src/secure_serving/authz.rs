@@ -11,44 +11,165 @@
 //! * `pkg/authorization/union/union.go` (reused: [`UnionAuthorizer`])
 //!
 //! Not ported (unreachable from the delegating authorizer): `matchConditions`
-//! (`NewFromInterface` passes none) and the authorizer metrics.
+//! (`NewFromInterface` passes none), the authorizer metrics, and the
+//! field/label selector attributes (every request is a non-resource request,
+//! see `filters::authorizer_attributes`).
 
 use super::webhook::{default_should_retry, with_exponential_backoff, Backoff, ReviewClient};
 use async_trait::async_trait;
 use rusternetes_common::auth::UserInfo;
 use rusternetes_common::authz::{Authorizer, Decision, Opinion, RequestAttributes};
-use rusternetes_common::error::Result;
-use std::sync::Arc;
+use rusternetes_common::error::{Error, Result};
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::time::Instant;
 
 /// `maxControlledAttrCacheSize` (webhook.go:56).
 pub const MAX_CONTROLLED_ATTR_CACHE_SIZE: usize = 10000;
 
+/// `cache.NewLRUExpireCache(8192)` (`NewFromInterface`).
+const RESPONSE_CACHE_SIZE: usize = 8192;
+
+struct PathAuthorizer {
+    paths: Vec<String>,
+    prefixes: Vec<String>,
+}
+
+#[async_trait]
+impl Authorizer for PathAuthorizer {
+    async fn authorize(&self, attrs: &RequestAttributes) -> Result<Decision> {
+        match self.authorize_opinion(attrs).await? {
+            Opinion::Allow => Ok(Decision::Allow),
+            Opinion::Deny(r) => Ok(Decision::Deny(r)),
+            Opinion::NoOpinion { reason, .. } => Ok(Decision::Deny(reason)),
+        }
+    }
+
+    async fn authorize_opinion(&self, a: &RequestAttributes) -> Result<Opinion> {
+        let no_opinion = Opinion::NoOpinion {
+            reason: String::new(),
+            error: None,
+        };
+        if !a.is_non_resource_request {
+            return Ok(no_opinion);
+        }
+        let pth = a.path.as_deref().unwrap_or("");
+        let pth = pth.strip_prefix('/').unwrap_or(pth);
+        if self.paths.iter().any(|p| p == pth) {
+            return Ok(Opinion::Allow);
+        }
+        if self.prefixes.iter().any(|p| pth.starts_with(p.as_str())) {
+            return Ok(Opinion::Allow);
+        }
+        Ok(no_opinion)
+    }
+
+    async fn get_user_rules(
+        &self,
+        _user: &UserInfo,
+        _namespace: &str,
+    ) -> Result<(
+        Vec<rusternetes_common::resources::ResourceRule>,
+        Vec<rusternetes_common::resources::NonResourceRule>,
+    )> {
+        Ok((vec![], vec![]))
+    }
+}
+
 /// `path.NewAuthorizer`: accepts the given paths; each is either a fully
 /// matching path or ends in `*` for a prefix match; a leading `/` is optional.
 /// Resource requests get no opinion.
-pub fn new_path_authorizer(_always_allow_paths: &[String]) -> std::result::Result<Arc<dyn Authorizer>, String> {
-    unimplemented!("new_path_authorizer")
+pub fn new_path_authorizer(
+    always_allow_paths: &[String],
+) -> std::result::Result<Arc<dyn Authorizer>, String> {
+    let mut prefixes = vec![];
+    let mut paths: Vec<String> = vec![];
+    for p in always_allow_paths {
+        let p = p.strip_prefix('/').unwrap_or(p);
+        if p.is_empty() {
+            // matches "/"
+            paths.push(String::new());
+            continue;
+        }
+        if p[..p.len() - 1].contains('*') {
+            return Err(format!("only trailing * allowed in {p:?}"));
+        }
+        if let Some(prefix) = p.strip_suffix('*') {
+            prefixes.push(prefix.to_string());
+        } else {
+            paths.push(p.to_string());
+        }
+    }
+    Ok(Arc::new(PathAuthorizer { paths, prefixes }))
 }
 
 /// `webhook.shouldCache` (webhook.go:537-547).
-pub fn should_cache(_attr: &RequestAttributes) -> bool {
-    unimplemented!("should_cache")
+pub fn should_cache(attr: &RequestAttributes) -> bool {
+    let size = attr.namespace.as_deref().unwrap_or("").len()
+        + attr.verb.len()
+        + attr.api_group.len()
+        + attr.api_version.len()
+        + attr.resource.len()
+        + attr.subresource.as_deref().unwrap_or("").len()
+        + attr.name.as_deref().unwrap_or("").len()
+        + attr.path.as_deref().unwrap_or("").len();
+    size < MAX_CONTROLLED_ATTR_CACHE_SIZE
 }
 
 /// The `SubjectAccessReviewSpec` `WebhookAuthorizer.Authorize` builds
-/// (webhook.go:171-190, `resourceAttributesFrom`).
-pub fn subject_access_review_spec(_attr: &RequestAttributes) -> serde_json::Value {
-    unimplemented!("subject_access_review_spec")
+/// (webhook.go:171-190, `resourceAttributesFrom`). Empty fields are omitted
+/// (`omitempty`).
+pub fn subject_access_review_spec(attr: &RequestAttributes) -> Value {
+    let mut spec = Map::new();
+    let u = &attr.user;
+    let mut put = |k: &str, v: &str| {
+        if !v.is_empty() {
+            spec.insert(k.to_string(), json!(v));
+        }
+    };
+    put("user", &u.username);
+    put("uid", &u.uid);
+    if !u.groups.is_empty() {
+        spec.insert("groups".into(), json!(u.groups));
+    }
+    if !u.extra.is_empty() {
+        spec.insert("extra".into(), json!(u.extra));
+    }
+    if !attr.is_non_resource_request {
+        let mut ra = Map::new();
+        let mut put = |k: &str, v: &str| {
+            if !v.is_empty() {
+                ra.insert(k.to_string(), json!(v));
+            }
+        };
+        put("namespace", attr.namespace.as_deref().unwrap_or(""));
+        put("verb", &attr.verb);
+        put("group", &attr.api_group);
+        put("version", &attr.api_version);
+        put("resource", &attr.resource);
+        put("subresource", attr.subresource.as_deref().unwrap_or(""));
+        put("name", attr.name.as_deref().unwrap_or(""));
+        spec.insert("resourceAttributes".into(), Value::Object(ra));
+    } else {
+        spec.insert(
+            "nonResourceAttributes".into(),
+            json!({"path": attr.path.as_deref().unwrap_or(""), "verb": attr.verb}),
+        );
+    }
+    Value::Object(spec)
 }
 
 /// `webhook.WebhookAuthorizer` as built by `DelegatingAuthorizerConfig.New`
 /// (`decisionOnError` = `DecisionNoOpinion`).
 pub struct SubjectAccessReviewAuthorizer {
-    _client: Arc<dyn ReviewClient>,
-    _authorized_ttl: Duration,
-    _unauthorized_ttl: Duration,
-    _retry_backoff: Backoff,
+    client: Arc<dyn ReviewClient>,
+    authorized_ttl: Duration,
+    unauthorized_ttl: Duration,
+    retry_backoff: Backoff,
+    /// `responseCache`: spec JSON -> (expiry, `SubjectAccessReviewStatus`).
+    cache: Mutex<HashMap<String, (Instant, Value)>>,
 }
 
 impl SubjectAccessReviewAuthorizer {
@@ -60,11 +181,43 @@ impl SubjectAccessReviewAuthorizer {
         retry_backoff: Backoff,
     ) -> Self {
         Self {
-            _client: client,
-            _authorized_ttl: authorized_ttl,
-            _unauthorized_ttl: unauthorized_ttl,
-            _retry_backoff: retry_backoff,
+            client,
+            authorized_ttl,
+            unauthorized_ttl,
+            retry_backoff,
+            cache: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn cache_get(&self, key: &str) -> Option<Value> {
+        let mut c = self.cache.lock().unwrap();
+        match c.get(key) {
+            Some((exp, v)) if *exp > Instant::now() => Some(v.clone()),
+            Some(_) => {
+                c.remove(key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn cache_add(&self, key: String, status: Value, ttl: Duration) {
+        let mut c = self.cache.lock().unwrap();
+        if c.len() >= RESPONSE_CACHE_SIZE {
+            let now = Instant::now();
+            c.retain(|_, (exp, _)| *exp > now);
+            if c.len() >= RESPONSE_CACHE_SIZE {
+                // evict the entry closest to expiry
+                if let Some(k) = c
+                    .iter()
+                    .min_by_key(|(_, (e, _))| *e)
+                    .map(|(k, _)| k.clone())
+                {
+                    c.remove(&k);
+                }
+            }
+        }
+        c.insert(key, (Instant::now() + ttl, status));
     }
 }
 
@@ -80,8 +233,78 @@ impl Authorizer for SubjectAccessReviewAuthorizer {
         }
     }
 
-    async fn authorize_opinion(&self, _attrs: &RequestAttributes) -> Result<Opinion> {
-        unimplemented!("SubjectAccessReviewAuthorizer::authorize_opinion")
+    /// `WebhookAuthorizer.Authorize` (webhook.go:~ 188-319).
+    async fn authorize_opinion(&self, attrs: &RequestAttributes) -> Result<Opinion> {
+        let spec = subject_access_review_spec(attrs);
+        let key = spec.to_string();
+        let status = match self.cache_get(&key) {
+            Some(s) => s,
+            None => {
+                let review = json!({
+                    "apiVersion": "authorization.k8s.io/v1",
+                    "kind": "SubjectAccessReview",
+                    "spec": spec,
+                });
+                let result: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+                let outcome = with_exponential_backoff(
+                    self.retry_backoff.clone(),
+                    || {
+                        let client = self.client.clone();
+                        let review = review.clone();
+                        let result = result.clone();
+                        async move {
+                            let r = client
+                                .create(
+                                    "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+                                    &review,
+                                )
+                                .await?;
+                            *result.lock().unwrap() = Some(r);
+                            Ok(())
+                        }
+                    },
+                    default_should_retry,
+                )
+                .await;
+                if let Err(e) = outcome {
+                    tracing::error!("Failed to make webhook authorizer request: {e}");
+                    // decisionOnError == DecisionNoOpinion
+                    return Ok(Opinion::NoOpinion {
+                        reason: String::new(),
+                        error: Some(e),
+                    });
+                }
+                let status = result
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .map(|r| r["status"].clone())
+                    .unwrap_or(Value::Null);
+                if should_cache(attrs) {
+                    let ttl = if status["allowed"].as_bool().unwrap_or(false) {
+                        self.authorized_ttl
+                    } else {
+                        self.unauthorized_ttl
+                    };
+                    self.cache_add(key, status.clone(), ttl);
+                }
+                status
+            }
+        };
+        let allowed = status["allowed"].as_bool().unwrap_or(false);
+        let denied = status["denied"].as_bool().unwrap_or(false);
+        let reason = status["reason"].as_str().unwrap_or("").to_string();
+        match (denied, allowed) {
+            (true, true) => Err(Error::Authorization(
+                "webhook subject access review returned both allow and deny response".into(),
+            )),
+            (true, false) => Ok(Opinion::Deny(reason)),
+            (false, true) => Ok(Opinion::Allow),
+            (false, false) => Ok(Opinion::NoOpinion {
+                reason,
+                error: None,
+            }),
+        }
     }
 
     async fn get_user_rules(
@@ -107,7 +330,18 @@ pub struct DelegatingAuthorizerConfig {
 impl DelegatingAuthorizerConfig {
     /// `DelegatingAuthorizerConfig.New` (delegating.go:46-60).
     pub fn new(&self) -> std::result::Result<Arc<dyn Authorizer>, String> {
-        unimplemented!("DelegatingAuthorizerConfig::new")
+        let Some(backoff) = &self.webhook_retry_backoff else {
+            return Err(
+                "retry backoff parameters for delegating authorization webhook has not been specified"
+                    .into(),
+            );
+        };
+        Ok(Arc::new(SubjectAccessReviewAuthorizer::new(
+            self.subject_access_review_client.clone(),
+            self.allow_cache_ttl,
+            self.deny_cache_ttl,
+            backoff.clone(),
+        )))
     }
 }
 
@@ -144,16 +378,76 @@ mod tests {
             want_err: bool,
         }
         let cases = vec![
-            Case { name: "inner star", excluded: vec!["/foo*bar"], allowed: vec![], no_opinion: vec![], want_err: true },
-            Case { name: "double star", excluded: vec!["/foo**"], allowed: vec![], no_opinion: vec![], want_err: true },
-            Case { name: "empty", excluded: vec![], allowed: vec![], no_opinion: vec!["/"], want_err: false },
-            Case { name: "slash", excluded: vec!["/"], allowed: vec!["/"], no_opinion: vec!["/foo", "//"], want_err: false },
-            Case { name: "foo", excluded: vec!["/foo"], allowed: vec!["/foo", "foo"], no_opinion: vec!["/", "", "/bar", "/foo/", "/fooooo", "//foo"], want_err: false },
-            Case { name: "foo slash", excluded: vec!["/foo/"], allowed: vec!["/foo/"], no_opinion: vec!["/", "", "/bar", "/foo", "/fooooo"], want_err: false },
-            Case { name: "foo slash star", excluded: vec!["/foo/*"], allowed: vec!["/foo/", "/foo/bar/bla"], no_opinion: vec!["/", "", "/foo", "/bar", "/fooooo"], want_err: false },
-            Case { name: "foo bar", excluded: vec!["/foo", "/bar"], allowed: vec!["/foo", "/bar"], no_opinion: vec!["/", "", "/foo/", "/bar/", "/fooooo"], want_err: false },
-            Case { name: "foo star", excluded: vec!["/foo*"], allowed: vec!["/foo", "/foooo"], no_opinion: vec!["/", "", "/fo", "/bar"], want_err: false },
-            Case { name: "star", excluded: vec!["/*"], allowed: vec!["/", "", "/foo", "/foooo"], no_opinion: vec![], want_err: false },
+            Case {
+                name: "inner star",
+                excluded: vec!["/foo*bar"],
+                allowed: vec![],
+                no_opinion: vec![],
+                want_err: true,
+            },
+            Case {
+                name: "double star",
+                excluded: vec!["/foo**"],
+                allowed: vec![],
+                no_opinion: vec![],
+                want_err: true,
+            },
+            Case {
+                name: "empty",
+                excluded: vec![],
+                allowed: vec![],
+                no_opinion: vec!["/"],
+                want_err: false,
+            },
+            Case {
+                name: "slash",
+                excluded: vec!["/"],
+                allowed: vec!["/"],
+                no_opinion: vec!["/foo", "//"],
+                want_err: false,
+            },
+            Case {
+                name: "foo",
+                excluded: vec!["/foo"],
+                allowed: vec!["/foo", "foo"],
+                no_opinion: vec!["/", "", "/bar", "/foo/", "/fooooo", "//foo"],
+                want_err: false,
+            },
+            Case {
+                name: "foo slash",
+                excluded: vec!["/foo/"],
+                allowed: vec!["/foo/"],
+                no_opinion: vec!["/", "", "/bar", "/foo", "/fooooo"],
+                want_err: false,
+            },
+            Case {
+                name: "foo slash star",
+                excluded: vec!["/foo/*"],
+                allowed: vec!["/foo/", "/foo/bar/bla"],
+                no_opinion: vec!["/", "", "/foo", "/bar", "/fooooo"],
+                want_err: false,
+            },
+            Case {
+                name: "foo bar",
+                excluded: vec!["/foo", "/bar"],
+                allowed: vec!["/foo", "/bar"],
+                no_opinion: vec!["/", "", "/foo/", "/bar/", "/fooooo"],
+                want_err: false,
+            },
+            Case {
+                name: "foo star",
+                excluded: vec!["/foo*"],
+                allowed: vec!["/foo", "/foooo"],
+                no_opinion: vec!["/", "", "/fo", "/bar"],
+                want_err: false,
+            },
+            Case {
+                name: "star",
+                excluded: vec!["/*"],
+                allowed: vec!["/", "", "/foo", "/foooo"],
+                no_opinion: vec![],
+                want_err: false,
+            },
         ];
         for c in cases {
             let paths: Vec<String> = c.excluded.iter().map(|s| s.to_string()).collect();
@@ -179,7 +473,11 @@ mod tests {
                     .authorize_opinion(&non_resource(user("u", &[]), "get", p))
                     .await
                     .unwrap();
-                assert!(matches!(got, Opinion::NoOpinion { .. }), "{} {p:?}: {got:?}", c.name);
+                assert!(
+                    matches!(got, Opinion::NoOpinion { .. }),
+                    "{} {p:?}: {got:?}",
+                    c.name
+                );
             }
         }
     }
@@ -198,7 +496,9 @@ mod tests {
     #[test]
     fn path_authorizer_error_text() {
         assert_eq!(
-            new_path_authorizer(&["/foo*bar".to_string()]).err().unwrap(),
+            new_path_authorizer(&["/foo*bar".to_string()])
+                .err()
+                .unwrap(),
             "only trailing * allowed in \"foo*bar\""
         );
     }
@@ -347,15 +647,71 @@ mod tests {
             ("404 doesnt retry", &alice, false, 404, true, false, 1),
             ("403 doesnt retry", &alice, false, 403, true, false, 1),
             ("401 doesnt retry", &alice, false, 401, true, false, 1),
-            ("alice successful request", &alice, true, 200, false, true, 1),
+            (
+                "alice successful request",
+                &alice,
+                true,
+                200,
+                false,
+                true,
+                1,
+            ),
             ("alice cached request", &alice, false, 500, false, true, 0),
             ("bob failed request", &bob, false, 500, true, false, 5),
-            ("bob unauthorized request", &bob, false, 200, false, false, 1),
-            ("bob unauthorized cached request", &bob, false, 500, false, false, 0),
-            ("ridiculous unauthorized request", &ridiculous_bob, false, 200, false, false, 1),
-            ("ridiculous unauthorized request again", &ridiculous_bob, false, 200, false, false, 1),
-            ("ridiculous authorized request", &ridiculous_alice, true, 200, false, true, 1),
-            ("ridiculous authorized request again", &ridiculous_alice, true, 200, false, true, 1),
+            (
+                "bob unauthorized request",
+                &bob,
+                false,
+                200,
+                false,
+                false,
+                1,
+            ),
+            (
+                "bob unauthorized cached request",
+                &bob,
+                false,
+                500,
+                false,
+                false,
+                0,
+            ),
+            (
+                "ridiculous unauthorized request",
+                &ridiculous_bob,
+                false,
+                200,
+                false,
+                false,
+                1,
+            ),
+            (
+                "ridiculous unauthorized request again",
+                &ridiculous_bob,
+                false,
+                200,
+                false,
+                false,
+                1,
+            ),
+            (
+                "ridiculous authorized request",
+                &ridiculous_alice,
+                true,
+                200,
+                false,
+                true,
+                1,
+            ),
+            (
+                "ridiculous authorized request again",
+                &ridiculous_alice,
+                true,
+                200,
+                false,
+                true,
+                1,
+            ),
         ];
         for (name, attr, allow, status, want_err, want_authorized, want_calls) in cases {
             backend.reset(allow, status);
@@ -377,7 +733,12 @@ mod tests {
     #[tokio::test]
     async fn sar_status_maps_to_opinions() {
         let backend = Backend::new();
-        let a = SubjectAccessReviewAuthorizer::new(backend.clone(), Duration::ZERO, Duration::ZERO, fast(1));
+        let a = SubjectAccessReviewAuthorizer::new(
+            backend.clone(),
+            Duration::ZERO,
+            Duration::ZERO,
+            fast(1),
+        );
         let attr = non_resource(user("u", &[]), "get", "/x");
 
         backend.reset(true, 200);
@@ -386,7 +747,10 @@ mod tests {
         backend.reset(false, 200);
         assert_eq!(
             a.authorize_opinion(&attr).await.unwrap(),
-            Opinion::NoOpinion { reason: "because".into(), error: None }
+            Opinion::NoOpinion {
+                reason: "because".into(),
+                error: None
+            }
         );
 
         *backend.denied.lock().unwrap() = true;
@@ -403,7 +767,12 @@ mod tests {
     #[tokio::test]
     async fn sar_zero_ttl_does_not_cache() {
         let backend = Backend::new();
-        let a = SubjectAccessReviewAuthorizer::new(backend.clone(), Duration::ZERO, Duration::ZERO, fast(1));
+        let a = SubjectAccessReviewAuthorizer::new(
+            backend.clone(),
+            Duration::ZERO,
+            Duration::ZERO,
+            fast(1),
+        );
         let attr = non_resource(user("u", &[]), "get", "/x");
         backend.reset(true, 200);
         a.authorize_opinion(&attr).await.unwrap();
@@ -449,20 +818,32 @@ mod tests {
         backend.reset(false, 200);
         // masters never reach the backend
         let r = u
-            .authorize(&non_resource(user("admin", &["system:masters"]), "get", "/metrics"))
+            .authorize(&non_resource(
+                user("admin", &["system:masters"]),
+                "get",
+                "/metrics",
+            ))
             .await
             .unwrap();
         assert_eq!(r, Decision::Allow);
         // an always-allow path never reaches the backend
         let r = u
-            .authorize(&non_resource(user("system:anonymous", &[]), "get", "/healthz"))
+            .authorize(&non_resource(
+                user("system:anonymous", &[]),
+                "get",
+                "/healthz",
+            ))
             .await
             .unwrap();
         assert_eq!(r, Decision::Allow);
         assert_eq!(backend.calls(), 0);
         // everything else asks the API server
         let r = u
-            .authorize(&non_resource(user("system:anonymous", &[]), "get", "/metrics"))
+            .authorize(&non_resource(
+                user("system:anonymous", &[]),
+                "get",
+                "/metrics",
+            ))
             .await
             .unwrap();
         assert!(matches!(r, Decision::Deny(_)));
