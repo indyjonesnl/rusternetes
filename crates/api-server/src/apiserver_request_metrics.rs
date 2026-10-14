@@ -52,6 +52,9 @@ pub struct RequestMeta {
     pub api_version: String,
     pub resource: String,
     pub subresource: String,
+    /// The authenticated user's name (`request.UserFrom(ctx)`), empty when
+    /// authentication did not run.
+    pub user_name: String,
 }
 
 const APISERVER: &str = "apiserver";
@@ -418,6 +421,19 @@ pub fn monitor_request(
     }
 }
 
+/// `cleanFieldValidation` (metrics.go:822-834).
+pub(crate) fn clean_field_validation(_query: &str) -> String {
+    String::new()
+}
+
+/// Guard returned by [`record_long_running`].
+pub struct LongRunningGuard;
+
+/// `RecordLongRunning` (metrics.go:551-575).
+pub fn record_long_running(_req: &RequestMeta, _component: &str) -> LongRunningGuard {
+    LongRunningGuard
+}
+
 /// `RecordRequestAbort` (metrics.go:496-506).
 pub fn record_request_abort(req: &RequestMeta) {
     let scope = clean_scope(req);
@@ -454,6 +470,7 @@ pub(crate) fn request_meta(req: &axum::extract::Request) -> RequestMeta {
         api_version: attrs.api_version,
         resource: attrs.resource,
         subresource: attrs.subresource,
+        user_name: String::new(),
     }
 }
 
@@ -717,6 +734,108 @@ mod tests {
         );
         // elapsed (~0) - 100s of queue wait.
         assert!(sum < -99.0, "sli sum {sum}");
+    }
+
+    // metrics_test.go TestCleanFieldValidation (:300-358).
+    #[test]
+    fn clean_field_validation_matches_upstream_table() {
+        for (q, want) in [
+            ("", ""),
+            ("foo=bar", ""),
+            ("fieldValidation=Ignore", "Ignore"),
+            ("fieldValidation=Warn", "Warn"),
+            ("fieldValidation=Strict", "Strict"),
+            ("fieldValidation=foo", "invalid"),
+            ("fieldValidation=Strict&fieldValidation=Ignore", "invalid"),
+        ] {
+            assert_eq!(clean_field_validation(q), want, "query {q:?}");
+        }
+    }
+
+    // MonitorRequest (:617-618) creates the (subsystem-less, :139-148) child without
+    // observing it (upstream never calls Observe).
+    #[test]
+    fn monitor_request_creates_unobserved_field_validation_series() {
+        use crate::flow_control::metric_test_util::{has_series, sample};
+        let mut m = meta("fvthings");
+        m.query = "fieldValidation=Warn".into();
+        monitor_request(&m, "apiserver", 200, Duration::from_millis(1), 0, None);
+        let l = [("field_validation", "Warn")];
+        assert!(has_series("field_validation_request_duration_seconds", &l));
+        assert_eq!(sample("field_validation_request_duration_seconds", &l), 0.0);
+    }
+
+    // MonitorRequest (:604-607): apiSelfRequestCounter for system:apiserver.
+    #[test]
+    fn self_request_counted_only_for_apiserver_user() {
+        use crate::flow_control::metric_test_util::sample;
+        let l = [("verb", "LIST"), ("resource", "selfthings")];
+        let mut m = meta("selfthings");
+        m.user_name = "system:apiserver".into();
+        monitor_request(&m, "apiserver", 200, Duration::ZERO, 0, None);
+        assert_eq!(sample("apiserver_selfrequest_total", &l), 1.0);
+        m.user_name = "alice".into();
+        monitor_request(&m, "apiserver", 200, Duration::ZERO, 0, None);
+        assert_eq!(sample("apiserver_selfrequest_total", &l), 1.0);
+    }
+
+    // RecordLongRunning (:551-575): gauge up while open, down on drop; the
+    // labels use the reported verb, and non-resource requests the path.
+    #[test]
+    fn long_running_gauge_tracks_open_requests() {
+        use crate::flow_control::metric_test_util::sample;
+        let mut m = meta("lrthings");
+        m.verb = "watch".into();
+        m.query = "watch=true".into();
+        let l = [
+            ("verb", "WATCH"),
+            ("resource", "lrthings"),
+            ("component", "apiserver"),
+        ];
+        let g = record_long_running(&m, "apiserver");
+        assert_eq!(sample("apiserver_longrunning_requests", &l), 1.0);
+        drop(g);
+        assert_eq!(sample("apiserver_longrunning_requests", &l), 0.0);
+        let np = RequestMeta {
+            method: "GET".into(),
+            path: "/lrpath".into(),
+            ..Default::default()
+        };
+        let _g = record_long_running(&np, "apiserver");
+        assert_eq!(
+            sample(
+                "apiserver_longrunning_requests",
+                &[("subresource", "/lrpath"), ("resource", "")]
+            ),
+            1.0
+        );
+    }
+
+    // InstrumentRouteFunc: a watch response holds the gauge until its body
+    // is dropped (RecordLongRunning wraps serving, get.go:283).
+    #[tokio::test]
+    async fn instrument_request_holds_long_running_for_watch_body() {
+        use crate::flow_control::metric_test_util::sample;
+        use axum::{body::Body, http::Request, middleware, routing::get, Router};
+        use tower::ServiceExt;
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/default/lrwatchthings",
+                get(|| async { "x" }),
+            )
+            .layer(middleware::from_fn(instrument_request));
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/namespaces/default/lrwatchthings?watch=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let l = [("verb", "WATCH"), ("resource", "lrwatchthings")];
+        assert_eq!(sample("apiserver_longrunning_requests", &l), 1.0);
+        drop(resp);
+        assert_eq!(sample("apiserver_longrunning_requests", &l), 0.0);
     }
 
     // RecordDroppedRequest (metrics.go:508-526): `apiserver_request_total`
