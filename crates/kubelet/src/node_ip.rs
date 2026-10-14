@@ -146,6 +146,13 @@ pub fn is_external_cloud_provider(name: &str) -> bool {
     name == "external"
 }
 
+/// `NewMainKubelet` cloud-provider gate (kubelet.go:461-464): only "" and
+/// "external" are accepted; any other name is an
+/// `ErrorForDisabledProvider` (cloud-provider/plugins.go:94-96). STUB.
+pub fn validate_cloud_provider(_name: &str) -> Result<(), String> {
+    Ok(())
+}
+
 /// `nodestatus.NodeAddress` Setter (setters.go:62-135): mutates `node`'s
 /// annotations and `status.addresses`, or returns an error after possibly
 /// partially mutating the node (the Go Setter contract).
@@ -601,6 +608,19 @@ mod tests {
             ),
             vec!["127.0.0.1".to_string()]
         );
+    }
+
+    // kubelet.go:461-464 + plugins.go:94-96
+    #[test]
+    fn cloud_provider_must_be_empty_or_external() {
+        assert!(validate_cloud_provider("").is_ok());
+        assert!(validate_cloud_provider("external").is_ok());
+        assert_eq!(
+            validate_cloud_provider("aws").unwrap_err(),
+            "cloud provider \"aws\" was specified, but built-in cloud providers are disabled. Please set --cloud-provider=external and migrate to an external cloud provider"
+        );
+        assert!(is_external_cloud_provider("external"));
+        assert!(!is_external_cloud_provider(""));
     }
 
     // ---- setters_test.go TestNodeAddress (cloud-provider cases) ----
