@@ -1043,6 +1043,13 @@ async fn main() -> Result<()> {
         if let Some(nd) = node_deployment {
             provisioner = provisioner.with_node_deployment(nd);
         }
+        // csi-provisioner.go:546-548: "Wrap Provision and Delete to detect when
+        // it is time to refresh capacity."
+        let capacity_refresher: Arc<controllers::csi_capacity_refresh::CapacityRefresher> =
+            Default::default();
+        if args.csi_enable_capacity {
+            provisioner = provisioner.with_capacity_refresher(capacity_refresher.clone());
+        }
         let provisioner = Arc::new(
             provisioner
                 .with_default_fs_type(args.csi_default_fstype.clone())
@@ -1098,6 +1105,11 @@ async fn main() -> Result<()> {
             let managed_by_id = controllers::csi_capacity::managed_by_id(node.as_deref());
             let immediate_binding = args.csi_capacity_for_immediate_binding;
             let poll = args.csi_capacity_poll_interval;
+            // `--retry-interval-start` (csi-provisioner.go, default 1s; no
+            // flag here) and `--retry-interval-max`: the capacity queue's
+            // `NewTypedItemExponentialFailureRateLimiter` (:528).
+            let retry_start = std::time::Duration::from_secs(1);
+            let retry_max = args.csi_retry_interval_max;
             let cap_storage = storage.clone();
             let cap_driver = driver.to_string();
             let cap_socket = socket.to_string();
@@ -1109,6 +1121,7 @@ async fn main() -> Result<()> {
                 let managed_by_id = managed_by_id.clone();
                 let namespace = namespace.clone();
                 let topology = topology.clone();
+                let refresher = capacity_refresher.clone();
                 async move {
                     let client =
                         rusternetes_csi::controller_client::CsiControllerClient::with_endpoint(
@@ -1122,9 +1135,16 @@ async fn main() -> Result<()> {
                         managed_by_id,
                         owner_namespace: namespace,
                         immediate_binding,
-                        refresher: Default::default(),
+                        refresher,
                     };
-                    controllers::csi_capacity::run_capacity_loop(&ctl, &topology, poll).await;
+                    controllers::csi_capacity::run_capacity_loop(
+                        &ctl,
+                        &topology,
+                        poll,
+                        retry_start,
+                        retry_max,
+                    )
+                    .await;
                 }
             });
         }

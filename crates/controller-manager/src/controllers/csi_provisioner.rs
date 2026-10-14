@@ -919,6 +919,14 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
         self
     }
 
+    /// `capacity.NewProvisionWrapper` (provision.go:30-37).
+    pub fn with_capacity_refresher(
+        self,
+        _refresher: Arc<super::csi_capacity_refresh::CapacityRefresher>,
+    ) -> Self {
+        self
+    }
+
     /// `--immediate-topology`: with immediate binding, pass the aggregated
     /// cluster topology (true, the default) or none.
     pub fn with_immediate_topology(mut self, on: bool) -> Self {
