@@ -630,6 +630,8 @@ impl Kubelet {
             EvictionManager::new(),
             10250,
             Vec::new(),
+            Vec::new(),
+            false,
         )
         .await
     }
@@ -651,7 +653,10 @@ impl Kubelet {
         eviction_manager: EvictionManager,
         metrics_port: u16,
         allowed_unsafe_sysctls: Vec<String>,
+        node_ips: Vec<std::net::IpAddr>,
+        external_cloud_provider: bool,
     ) -> Result<Self> {
+        let _ = (&node_ips, external_cloud_provider);
         // CRI runtime backend (containerd + crun). The endpoint and runtime
         // handler come from the standard kubelet env vars; pod networking is
         // owned entirely by containerd's CNI plugin (CNI is the only
@@ -853,6 +858,14 @@ impl Kubelet {
         self.node_status_report_frequency = d
             .filter(|d| !d.is_zero())
             .unwrap_or(Duration::from_secs(300));
+        self
+    }
+
+    /// `Kubelet.nodeIPValidator` override (STUB).
+    pub fn with_node_ip_validator(
+        self,
+        _validator: impl Fn(std::net::IpAddr) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
         self
     }
 
@@ -6502,6 +6515,219 @@ mod tests {
             .await
             .with_crash_loop_backoff_max(Some(Duration::from_secs(3)));
         assert_eq!(t.crash_loop_backoff_initial(), Duration::from_secs(3));
+    }
+
+    /// A kubelet built with explicit `nodeIPs` / `externalCloudProvider`
+    /// (`NewMainKubelet`, kubelet.go:428-430, 619, 637), with the
+    /// `nodeIPValidator` override kubelet_node_status_test.go uses so the test
+    /// IPs need not be on a host interface.
+    async fn node_ip_kubelet(
+        dir: &tempfile::TempDir,
+        storage: std::sync::Arc<rusternetes_storage::StorageBackend>,
+        name: &str,
+        ips: &[&str],
+        external: bool,
+    ) -> Kubelet {
+        let sock = dir.path().join("absent.sock");
+        std::env::set_var(
+            "CONTAINER_RUNTIME_ENDPOINT",
+            format!("unix://{}", sock.display()),
+        );
+        let k = Kubelet::new_with_eviction(
+            name.into(),
+            storage,
+            10,
+            dir.path().join("vols").display().to_string(),
+            "10.96.0.10".into(),
+            "cluster.local".into(),
+            "bridge".into(),
+            String::new(),
+            dir.path().to_path_buf(),
+            crate::eviction::EvictionManager::new(),
+            10250,
+            Vec::new(),
+            ips.iter().map(|s| s.parse().unwrap()).collect(),
+            external,
+        )
+        .await
+        .unwrap()
+        .with_node_ip_validator(|_| Ok(()));
+        k.update_runtime_up().await;
+        k.register_node().await.unwrap();
+        k
+    }
+
+    async fn get_node(
+        storage: &rusternetes_storage::StorageBackend,
+        name: &str,
+    ) -> rusternetes_common::resources::Node {
+        use rusternetes_storage::{build_key, Storage};
+        storage.get(&build_key("nodes", None, name)).await.unwrap()
+    }
+
+    fn node_addrs(n: &rusternetes_common::resources::Node) -> Vec<(String, String)> {
+        n.status
+            .as_ref()
+            .and_then(|s| s.addresses.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|a| (a.address_type, a.address))
+            .collect()
+    }
+
+    fn pair(t: &str, a: &str) -> (String, String) {
+        (t.to_string(), a.to_string())
+    }
+
+    /// initialNode (kubelet_node_status.go:325-333) taints an
+    /// externalCloudProvider node with `node.cloudprovider.kubernetes.io/
+    /// uninitialized=true:NoSchedule`, and setNodeStatus runs the NodeAddress
+    /// setter (setters.go:62-135): provided-node-ip annotation + addresses.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn external_cloud_provider_node_is_tainted_annotated_and_addressed() {
+        use rusternetes_storage::StorageBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(StorageBackend::new_memory());
+        let _k = node_ip_kubelet(&dir, storage.clone(), "node-ext", &["10.1.1.1"], true).await;
+        let n = get_node(&storage, "node-ext").await;
+        let taints = n.spec.as_ref().unwrap().taints.clone().unwrap_or_default();
+        assert!(
+            taints.iter().any(
+                |t| t.key == "node.cloudprovider.kubernetes.io/uninitialized"
+                    && t.value.as_deref() == Some("true")
+                    && t.effect == "NoSchedule"
+            ),
+            "taints: {taints:?}"
+        );
+        assert_eq!(
+            n.metadata.annotations.as_ref().unwrap()["alpha.kubernetes.io/provided-node-ip"],
+            "10.1.1.1"
+        );
+        assert_eq!(
+            node_addrs(&n),
+            vec![pair("InternalIP", "10.1.1.1"), pair("Hostname", "node-ext")]
+        );
+    }
+
+    /// Without an external provider there is no taint, no annotation.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn non_external_node_has_no_cloud_taint_or_annotation() {
+        use rusternetes_storage::StorageBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(StorageBackend::new_memory());
+        let _k = node_ip_kubelet(&dir, storage.clone(), "node-int", &["10.1.1.1"], false).await;
+        let n = get_node(&storage, "node-int").await;
+        assert!(n
+            .spec
+            .as_ref()
+            .and_then(|s| s.taints.clone())
+            .unwrap_or_default()
+            .is_empty());
+        assert!(!n
+            .metadata
+            .annotations
+            .clone()
+            .unwrap_or_default()
+            .contains_key("alpha.kubernetes.io/provided-node-ip"));
+    }
+
+    /// setters.go:104-110: with --cloud-provider=external and addresses
+    /// already set, the setter returns early; provider addresses win on every
+    /// sync.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn external_cloud_provider_addresses_survive_status_sync() {
+        use rusternetes_storage::{build_key, Storage, StorageBackend};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(StorageBackend::new_memory());
+        let k = node_ip_kubelet(&dir, storage.clone(), "node-prov", &["10.1.1.1"], true).await;
+        let key = build_key("nodes", None, "node-prov");
+        let mut n = get_node(&storage, "node-prov").await;
+        n.status.as_mut().unwrap().addresses = Some(vec![
+            rusternetes_common::resources::NodeAddress {
+                address_type: "ExternalIP".into(),
+                address: "203.0.113.7".into(),
+            },
+            rusternetes_common::resources::NodeAddress {
+                address_type: "InternalIP".into(),
+                address: "10.9.9.9".into(),
+            },
+        ]);
+        storage.update_status(&key, &n).await.unwrap();
+        k.update_node_status().await.unwrap();
+        assert_eq!(
+            node_addrs(&get_node(&storage, "node-prov").await),
+            vec![
+                pair("ExternalIP", "203.0.113.7"),
+                pair("InternalIP", "10.9.9.9")
+            ]
+        );
+    }
+
+    /// kubelet_node_status.go:678 + setNodeStatus: the NodeAddress setter
+    /// re-runs on EVERY status sync (not memoized for the process lifetime),
+    /// overwriting drifted addresses and deleting a stale provided-node-ip
+    /// annotation when no longer using an external provider (setters.go:97-101).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn node_address_setter_reruns_every_status_sync() {
+        use rusternetes_storage::{build_key, Storage, StorageBackend};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(StorageBackend::new_memory());
+        let k = node_ip_kubelet(&dir, storage.clone(), "node-sync", &["10.1.1.1"], false).await;
+        let key = build_key("nodes", None, "node-sync");
+        let mut n = get_node(&storage, "node-sync").await;
+        n.status.as_mut().unwrap().addresses =
+            Some(vec![rusternetes_common::resources::NodeAddress {
+                address_type: "InternalIP".into(),
+                address: "9.9.9.9".into(),
+            }]);
+        n.metadata
+            .annotations
+            .get_or_insert_with(Default::default)
+            .insert(
+                "alpha.kubernetes.io/provided-node-ip".into(),
+                "9.9.9.9".into(),
+            );
+        storage.update(&key, &n).await.unwrap();
+        k.update_node_status().await.unwrap();
+        let n = get_node(&storage, "node-sync").await;
+        assert_eq!(
+            node_addrs(&n),
+            vec![
+                pair("InternalIP", "10.1.1.1"),
+                pair("Hostname", "node-sync")
+            ]
+        );
+        assert!(!n
+            .metadata
+            .annotations
+            .clone()
+            .unwrap_or_default()
+            .contains_key("alpha.kubernetes.io/provided-node-ip"));
+    }
+
+    /// #3542: nodeIPs live on the Kubelet (createAndInitKubelet ->
+    /// NewMainKubelet `nodeIPs`), not in process-global state: two kubelets in
+    /// one process advertise their own `--node-ip`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn node_ips_are_per_kubelet_not_process_global() {
+        use rusternetes_storage::StorageBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(StorageBackend::new_memory());
+        let _a = node_ip_kubelet(&dir, storage.clone(), "node-a", &["10.1.1.1"], false).await;
+        let _b = node_ip_kubelet(&dir, storage.clone(), "node-b", &["10.1.1.2"], false).await;
+        assert_eq!(
+            node_addrs(&get_node(&storage, "node-a").await),
+            vec![pair("InternalIP", "10.1.1.1"), pair("Hostname", "node-a")]
+        );
+        assert_eq!(
+            node_addrs(&get_node(&storage, "node-b").await),
+            vec![pair("InternalIP", "10.1.1.2"), pair("Hostname", "node-b")]
+        );
     }
 
     use std::time::Duration;

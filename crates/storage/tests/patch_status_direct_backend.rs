@@ -41,3 +41,36 @@ async fn direct_backend_applies_delta_onto_current_status() {
     assert_eq!(ready["status"], "False");
     assert!(conds.iter().any(|c| c["type"] == "Extra"));
 }
+
+/// PatchNodeStatus (status.go:33-62) deliberately does NOT reset ObjectMeta
+/// ("Some component does use this to update node annotations"), and the
+/// `/status` strategy only restores `Spec` (pkg/registry/core/node/strategy.go
+/// `nodeStatusStrategy.PrepareForUpdate`: `newNode.Spec = oldNode.Spec`). So a
+/// status patch carrying metadata annotations must persist them, while a
+/// spec change in the patch is discarded.
+#[tokio::test]
+async fn direct_backend_status_patch_applies_metadata_but_not_spec() {
+    let s = MemoryStorage::new();
+    let key = "/registry/minions/n2";
+    let seed = json!({"apiVersion":"v1","kind":"Node",
+        "metadata":{"name":"n2","annotations":{"stale":"x","keep":"y"}},
+        "spec":{"unschedulable":false},
+        "status":{"conditions":[{"type":"Ready","status":"True"}]}});
+    s.create(key, &seed).await.unwrap();
+
+    let delta = json!({
+        "metadata":{"annotations":{"stale":null,"new":"z"}},
+        "spec":{"unschedulable":true},
+        "status":{"conditions":[{"type":"Ready","status":"False"}]}});
+    let out: serde_json::Value = s
+        .patch_status_strategic_merge(key, &delta, &seed)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        out["metadata"]["annotations"],
+        json!({"keep":"y","new":"z"})
+    );
+    assert_eq!(out["spec"]["unschedulable"], json!(false));
+    assert_eq!(out["status"]["conditions"][0]["status"], "False");
+}

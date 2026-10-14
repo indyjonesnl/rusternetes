@@ -566,6 +566,8 @@ async fn main() -> Result<()> {
             eviction_manager,
             runtime_config.metrics_bind_port,
             args.allowed_unsafe_sysctls.clone(),
+            node_ip::configured_node_ips().to_vec(),
+            false,
         )
         .await?
         .with_resolv_conf(&args.resolv_conf)

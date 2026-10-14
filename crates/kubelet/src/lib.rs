@@ -147,6 +147,8 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
             // The all-in-one binary doesn't expose --allowed-unsafe-sysctls;
             // default to none (unsafe sysctls rejected with SysctlForbidden).
             Vec::new(),
+            Vec::new(),
+            false,
         )
         .await?,
     );
