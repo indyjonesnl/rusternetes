@@ -216,6 +216,7 @@ mod namespace_finalize_removal_test;
 mod namespace_generic_store_test;
 mod namespace_handler_test;
 mod namespace_lifecycle_admission_test;
+mod negotiated_error_test;
 mod networking_rbac_decode_when_absent_test;
 mod networkpolicy_default_policytypes_test;
 mod networkpolicy_handler_test;
