@@ -399,3 +399,4 @@ mod pod_status_proto_state_test;
 mod portforward_connect_admission_test;
 mod run_seeds_default_rbac_test;
 mod synthesized_list_options_test;
+mod custom_resource_stored_meta_test;
