@@ -19,9 +19,10 @@
 //! attempt is the one that is counted.
 
 use crate::audit::{add_audit_annotation, add_audit_annotations};
+use crate::negotiated_error::respond_with_error;
 use crate::request_scope::RequestInfo;
 use axum::extract::{Request, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use rusternetes_common::auth::UserInfo;
@@ -89,10 +90,22 @@ pub fn forbidden_message(attrs: &RequestAttributes) -> String {
     }
 }
 
-/// `Forbidden` / `ForbiddenStatusError` (errors.go): `apierrors.NewForbidden`
-/// for the attributes' resource, with `forbiddenMessage` (and the reason,
-/// when there is one) as the cause.
-pub fn forbidden(attrs: &RequestAttributes, reason: &str) -> Response {
+/// `Forbidden` (errors.go:36-38) for a request with the given headers and raw
+/// query: the Status is serialized per its `Accept` (`RespondWithError` ->
+/// `ErrorNegotiated`, #3517).
+pub fn forbidden_negotiated(
+    attrs: &RequestAttributes,
+    reason: &str,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    respond_with_error(&forbidden_status(attrs, reason), headers, raw_query)
+}
+
+/// `ForbiddenStatusError` (errors.go:45-58): `apierrors.NewForbidden` for the
+/// attributes' resource, with `forbiddenMessage` (and the reason, when there
+/// is one) as the cause.
+pub fn forbidden_status(attrs: &RequestAttributes, reason: &str) -> Status {
     let msg = sanitize(&forbidden_message(attrs));
     let err = if reason.is_empty() {
         msg
@@ -134,18 +147,7 @@ pub fn forbidden(attrs: &RequestAttributes, reason: &str) -> Response {
         continue_token: None,
         remaining_item_count: None,
     });
-    let audit_obj = serde_json::to_value(&status).ok();
-    let mut response = (StatusCode::FORBIDDEN, axum::Json(status)).into_response();
-    response.headers_mut().insert(
-        "x-content-type-options",
-        HeaderValue::from_static("nosniff"),
-    );
-    if let Some(v) = audit_obj {
-        response
-            .extensions_mut()
-            .insert(rusternetes_common::audit::AuditResponseObject(v));
-    }
-    response
+    status
 }
 
 /// `InternalError` (errors.go:83-87).
@@ -176,6 +178,8 @@ pub async fn with_authorization(
         .path_and_query()
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| req.uri().path().to_string());
+    let headers = req.headers().clone();
+    let raw_query = req.uri().query().map(str::to_string);
     let authorization_start = Instant::now();
 
     // `request.UserFrom(ctx)`; `GetAuthorizerAttributes` fails when there is
@@ -226,5 +230,5 @@ pub async fn with_authorization(
         ),
         (REASON_ANNOTATION_KEY.to_string(), reason.clone()),
     ]);
-    forbidden(&attributes, &reason)
+    forbidden_negotiated(&attributes, &reason, &headers, raw_query.as_deref())
 }

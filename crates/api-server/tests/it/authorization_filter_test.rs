@@ -13,7 +13,7 @@ use axum::routing::any;
 use axum::Router;
 use rusternetes_api_server::audit::{request_info, with_audit, AuditConfig, Policy};
 use rusternetes_api_server::authorization_filter::{
-    forbidden, forbidden_message, get_authorizer_attributes, with_authorization,
+    forbidden_message, forbidden_negotiated, get_authorizer_attributes, with_authorization,
 };
 use rusternetes_api_server::request_scope::request_info_middleware;
 use rusternetes_common::audit::{AuditBackend, AuditEvent};
@@ -27,7 +27,7 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 /// The attempt counters are process-global: serialize the tests that read them.
-static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(crate) static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn user(name: &str) -> UserInfo {
     UserInfo {
@@ -377,7 +377,7 @@ async fn forbidden_body_matches_upstream_cases() {
         ),
     ];
     for (attrs, reason, expected) in cases {
-        let resp = forbidden(&attrs, reason);
+        let resp = forbidden_negotiated(&attrs, reason, &axum::http::HeaderMap::new(), None);
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         assert_eq!(resp.headers()["content-type"], "application/json");
         let got: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
