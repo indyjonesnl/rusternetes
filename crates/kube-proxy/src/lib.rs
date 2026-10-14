@@ -1,6 +1,7 @@
 pub mod iptables;
 pub mod node_net;
 pub mod proxy;
+pub mod serve_metrics;
 
 use futures::StreamExt;
 use proxy::KubeProxy;
