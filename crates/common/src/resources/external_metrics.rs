@@ -19,8 +19,10 @@ pub struct ExternalMetricValue {
     /// The name of the metric.
     #[serde(default)]
     pub metric_name: String,
-    /// The labels for the metric.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// The labels for the metric. `MetricLabels map[string]string
+    /// json:"metricLabels"` has no omitempty: a nil map is `null`
+    /// (`external_metrics/v1beta1/types.go`).
+    #[serde(default)]
     pub metric_labels: Option<BTreeMap<String, String>>,
     #[serde(
         default = "zero_time",
@@ -28,9 +30,10 @@ pub struct ExternalMetricValue {
         deserialize_with = "crate::types::k8s_time_required::deserialize"
     )]
     pub timestamp: DateTime<Utc>,
-    /// Window over which the value was produced, e.g. "60s".
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub window: Option<String>,
+    /// `WindowSeconds *int64 json:"window,omitempty"`: the window in seconds
+    /// (an integer on the wire, not a duration string).
+    #[serde(rename = "window", default, skip_serializing_if = "Option::is_none")]
+    pub window_seconds: Option<i64>,
     /// The value of the metric as a quantity string.
     #[serde(default)]
     pub value: String,
@@ -94,7 +97,7 @@ mod tests {
                     "worker".to_string(),
                 )])),
                 timestamp: fixed_time(),
-                window: Some("60s".to_string()),
+                window_seconds: Some(60),
                 value: "42".to_string(),
             }],
         };
@@ -102,6 +105,8 @@ mod tests {
         // camelCase field names per K8s API contract.
         assert!(json.contains("\"metricName\":\"queue_depth\""));
         assert!(json.contains("\"metricLabels\""));
+        // `window` is an integer on the wire.
+        assert!(json.contains("\"window\":60"));
         let back: ExternalMetricValueList = serde_json::from_str(&json).unwrap();
         assert_eq!(list, back);
     }
