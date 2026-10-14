@@ -35,11 +35,15 @@ pub fn phase_is_terminal(phase: Option<&Phase>) -> bool {
     matches!(phase, Some(Phase::Succeeded) | Some(Phase::Failed))
 }
 
-/// `apierrors.IsConflict(err)` for a pod-status write
-/// (legacy string match; replaced in the next commit).
+/// `apierrors.IsConflict(err)` for a pod-status write — the predicate behind
+/// client-go `retry.RetryOnConflict` (staging/src/k8s.io/client-go/util/retry/
+/// util.go:103-105, `OnError(backoff, errors.IsConflict, fn)`;
+/// apimachinery errors.go:548-557). Decided by the typed variant, never the
+/// message. Every storage backend maps a resourceVersion CAS failure to
+/// `Error::Conflict` (memory.rs, etcd.rs, rhino.rs, api_storage.rs
+/// `map_write_err`).
 pub fn is_status_write_conflict(e: &rusternetes_common::Error) -> bool {
-    let text = e.to_string();
-    text.contains("Conflict") || text.contains("mismatch")
+    matches!(e, rusternetes_common::Error::Conflict(_))
 }
 
 /// Decide whether a kubelet status write that would set the pod phase to
