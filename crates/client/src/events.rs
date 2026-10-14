@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
+use crate::api_status::{is_already_exists, is_conflict};
 use crate::http::ApiClient;
 
 /// An involved-object reference for [`build_event`]:
@@ -185,18 +186,6 @@ impl ClientEventRecorder {
     }
 }
 
-/// The api-server reports a name collision as a `Status` with reason
-/// `AlreadyExists` (HTTP 409); [`crate::http::ApiClient`] surfaces that verbatim
-/// in the error message.
-fn is_already_exists(e: &anyhow::Error) -> bool {
-    format!("{e:#}").contains("AlreadyExists")
-}
-
-/// A resourceVersion mismatch on PATCH surfaces as reason `Conflict` (HTTP 409).
-fn is_conflict(e: &anyhow::Error) -> bool {
-    format!("{e:#}").contains("Conflict")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,20 +212,23 @@ mod tests {
 
     #[test]
     fn classifies_already_exists_and_conflict() {
-        // Mirrors `format_status_error`'s rendering of a Status failure.
-        let ae = anyhow::anyhow!(
-            "Error from server (AlreadyExists): events \"p.scheduled.ab\" already exists"
-        );
+        use crate::api_status::ApiStatusError;
+        let typed = |code: u16, reason: &str| {
+            anyhow::Error::new(ApiStatusError {
+                code,
+                reason: reason.into(),
+                message: format!("Error from server ({reason}): m"),
+            })
+        };
+        let ae = typed(409, "AlreadyExists");
         assert!(is_already_exists(&ae));
         assert!(!is_conflict(&ae));
 
-        let conflict = anyhow::anyhow!(
-            "Error from server (Conflict): Operation cannot be fulfilled on events"
-        );
+        let conflict = typed(409, "Conflict");
         assert!(is_conflict(&conflict));
         assert!(!is_already_exists(&conflict));
 
-        let other = anyhow::anyhow!("Error from server (NotFound): events not found");
+        let other = typed(404, "NotFound");
         assert!(!is_already_exists(&other));
         assert!(!is_conflict(&other));
     }
@@ -256,9 +248,17 @@ mod tests {
             })
         };
         // 409 with an unknown reason and an opaque message is a Conflict.
-        assert!(is_conflict(&typed(409, "", "request failed with status 409")));
+        assert!(is_conflict(&typed(
+            409,
+            "",
+            "request failed with status 409"
+        )));
         // A message that merely mentions "Conflict" is not one (reason Invalid).
-        assert!(!is_conflict(&typed(422, "Invalid", "field Conflict is invalid")));
+        assert!(!is_conflict(&typed(
+            422,
+            "Invalid",
+            "field Conflict is invalid"
+        )));
         // AlreadyExists is reason-only: no code fallback.
         assert!(!is_already_exists(&typed(409, "", "AlreadyExists")));
     }

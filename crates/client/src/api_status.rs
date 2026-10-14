@@ -113,6 +113,17 @@ pub fn is_conflict(err: &anyhow::Error) -> bool {
     reason_or_code(err, "Conflict", 409)
 }
 
+/// `IsGone` (errors.go:574-583).
+pub fn is_gone(err: &anyhow::Error) -> bool {
+    reason_or_code(err, "Gone", 410)
+}
+
+/// `IsResourceExpired` (errors.go:588-590): `ReasonForError(err) == Expired`,
+/// reason only, no code fallback.
+pub fn is_resource_expired(err: &anyhow::Error) -> bool {
+    reason_and_code_for_error(err).0 == "Expired"
+}
+
 /// `IsInvalid` (errors.go:561-570).
 pub fn is_invalid(err: &anyhow::Error) -> bool {
     reason_or_code(err, "Invalid", 422)
@@ -161,6 +172,15 @@ mod tests {
         assert!(is_already_exists(&err(409, "AlreadyExists")));
         assert!(is_conflict(&err(409, "")));
         assert!(!is_conflict(&err(409, "AlreadyExists")));
+    }
+
+    #[test]
+    fn gone_has_code_fallback_expired_does_not() {
+        assert!(is_gone(&err(410, "")));
+        assert!(is_gone(&err(0, "Gone")));
+        assert!(!is_gone(&err(410, "Expired")));
+        assert!(is_resource_expired(&err(410, "Expired")));
+        assert!(!is_resource_expired(&err(410, "")));
     }
 
     #[test]

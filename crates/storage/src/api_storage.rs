@@ -43,8 +43,8 @@ use crate::{Storage, WatchEvent, WatchStream};
 use async_trait::async_trait;
 use futures::StreamExt;
 use rusternetes_client::api_status::{
-    is_already_exists, is_bad_request, is_conflict, is_forbidden, is_invalid, is_not_found,
-    is_unsupported_media_type,
+    is_already_exists, is_bad_request, is_conflict, is_forbidden, is_gone, is_invalid,
+    is_not_found, is_resource_expired, is_unsupported_media_type,
 };
 use rusternetes_client::http::{ApiClient, GetError, KubernetesList};
 use rusternetes_client::watch::{watch_stream, WatchEvent as ClientWatchEvent};
@@ -947,11 +947,10 @@ impl Storage for ApiStorage {
 }
 
 /// `isExpiredError` (client-go `reflector.go:1051-1058`): the server said the
-/// revision is gone. `format_status_error` renders a `Status` as
-/// `Error from server (<reason>): <message>`.
+/// revision is gone: `IsResourceExpired(err) || IsGone(err)` on the typed
+/// `ApiStatusError`.
 fn is_expired_error(e: &anyhow::Error) -> bool {
-    let m = e.to_string();
-    m.starts_with("Error from server (Expired)") || m.starts_with("Error from server (Gone)")
+    is_resource_expired(e) || is_gone(e)
 }
 
 /// Percent-encode a query value (RFC 3986 unreserved bytes pass through).
@@ -1409,7 +1408,11 @@ mod tests {
                 message: message.into(),
             })
         };
-        assert!(is_expired_error(&typed(410, "", "request failed with status 410")));
+        assert!(is_expired_error(&typed(
+            410,
+            "",
+            "request failed with status 410"
+        )));
         assert!(is_expired_error(&typed(410, "Expired", "too old")));
         assert!(is_expired_error(&typed(
             0,
