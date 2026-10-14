@@ -34,6 +34,13 @@ tracing-subscriber.workspace = true
 clap.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
+chrono.workspace = true
+prometheus.workspace = true
+# Existing locked dependencies, for upstream promhttp negotiation/exposition.
+protobuf = "3.7"
+url = "2.5"
+miniz_oxide = "0.8"
+crc = "3.4"
 futures = { workspace = true }
 
 [dev-dependencies]

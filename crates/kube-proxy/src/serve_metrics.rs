@@ -2,11 +2,34 @@
 //!
 //! Port of `serveMetrics` (cmd/kube-proxy/app/server.go:459-518) and the
 //! `MetricsBindAddress` default (pkg/proxy/apis/config/v1alpha1/defaults.go:52-56).
-//! Only the `/proxyMode` and `/statusz` handlers exist here so far; the
-//! `healthz`, `/metrics`, `configz`, `flagz` and profiling handlers `serveMetrics`
-//! also installs are not ported yet.
+//! Upstream `healthz.InstallHandler`, SLI reset, legacy metrics and configz
+//! are installed before statusz captures ListedPaths. Flagz and runtime
+//! profiling/debug flags are tracked in #3556 and #3557.
 
-use axum::Router;
+mod configz;
+mod exposition;
+mod health;
+
+pub use configz::ConfigRegistry;
+pub use health::ProxyHealthServer;
+
+use axum::{
+    extract::{RawQuery, State},
+    http::{HeaderMap, Method, StatusCode},
+    response::IntoResponse,
+    routing::any,
+    Router,
+};
+use std::sync::{Arc, OnceLock};
+
+/// config.GroupName (pkg/proxy/apis/config/register.go:25).
+pub const CONFIG_GROUP: &str = "kubeproxy.config.k8s.io";
+
+/// Process-wide registrations, like configz.configs (configz.go:52-54).
+pub fn config_registry() -> Arc<ConfigRegistry> {
+    static REGISTRY: OnceLock<Arc<ConfigRegistry>> = OnceLock::new();
+    Arc::clone(REGISTRY.get_or_init(|| Arc::new(ConfigRegistry::default())))
+}
 
 /// `ports.ProxyStatusPort` (pkg/cluster/ports/ports.go).
 pub const PROXY_STATUS_PORT: u16 = 10249;
@@ -60,50 +83,198 @@ pub fn default_metrics_bind_address(addr: &str) -> String {
     }
 }
 
-/// The mux of `serveMetrics` (server.go:463-493), without the listener.
+/// No explicit checks are passed to InstallHandler, so only ping is installed
+/// (healthz.go:202-205). Verbose is controlled by parameter presence, not value;
+/// excludes are repeated parameters, and unmatched names are sorted/quoted
+/// (healthz.go:259-265,279-305,322-330).
+async fn ping_health(RawQuery(query): RawQuery) -> impl IntoResponse {
+    let params: Vec<_> =
+        url::form_urlencoded::parse(query.as_deref().unwrap_or_default().as_bytes()).collect();
+    let verbose = params.iter().any(|(key, _)| key == "verbose");
+    let excluded: std::collections::BTreeSet<_> = params
+        .iter()
+        .filter(|(key, _)| key == "exclude")
+        .map(|(_, value)| value.as_ref())
+        .collect();
+    let mut body = if excluded.contains("ping") {
+        "[+]ping excluded: ok\n".to_owned()
+    } else {
+        exposition::observe_ping();
+        "[+]ping ok\n".to_owned()
+    };
+    let unknown: Vec<_> = excluded
+        .iter()
+        .filter(|name| **name != "ping")
+        .map(|name| format!("{name:?}"))
+        .collect();
+    if !unknown.is_empty() {
+        body.push_str(&format!(
+            "warn: some health checks cannot be excluded: no matches for {}\n",
+            unknown.join(",")
+        ));
+    }
+    if verbose {
+        body.push_str("healthz check passed\n");
+    } else {
+        body = "ok".to_owned();
+    }
+    (
+        [
+            ("Content-Type", "text/plain; charset=utf-8"),
+            ("X-Content-Type-Options", "nosniff"),
+        ],
+        body,
+    )
+}
+
+/// The mux of serveMetrics (server.go:464-493), without its listener.
 pub fn metrics_router(proxy_mode: &str) -> Router {
-    let proxy_mode = proxy_mode.to_string();
-    let router = Router::new().route(
-        "/proxyMode",
-        axum::routing::get(move || {
-            let proxy_mode = proxy_mode.clone();
-            async move {
-                (
-                    [
-                        ("Content-Type", "text/plain; charset=utf-8"),
-                        ("X-Content-Type-Options", "nosniff"),
-                    ],
-                    proxy_mode,
-                )
-            }
-        }),
-    );
-    // `ListedPaths()` is read before `statusz.Install`, so it lists what the
-    // mux has registered so far.
+    metrics_router_with_config(proxy_mode, config_registry())
+}
+
+/// Install the metrics mux with a config registry (configz.go:65-66).
+pub fn metrics_router_with_config(proxy_mode: &str, configs: Arc<ConfigRegistry>) -> Router {
+    exposition::initialize();
+    let proxy_mode = proxy_mode.to_owned();
+    let router = Router::new()
+        .route("/healthz", any(ping_health))
+        // Individual checks do not observe SLI metrics (healthz.go:335-343).
+        .route(
+            "/healthz/ping",
+            any(|| async { ([("Content-Type", "text/plain; charset=utf-8")], "ok") }),
+        )
+        .route(
+            "/metrics/slis",
+            any(|headers: HeaderMap, method: Method| async move {
+                exposition::render(headers, true, method)
+            }),
+        )
+        .route(
+            "/proxyMode",
+            any(move || {
+                let proxy_mode = proxy_mode.clone();
+                async move {
+                    (
+                        [
+                            ("Content-Type", "text/plain; charset=utf-8"),
+                            ("X-Content-Type-Options", "nosniff"),
+                        ],
+                        proxy_mode,
+                    )
+                }
+            }),
+        )
+        .route(
+            "/metrics",
+            any(|headers: HeaderMap, method: Method| async move {
+                exposition::render(headers, false, method)
+            }),
+        )
+        .route(
+            "/configz",
+            any(|State(configs): State<Arc<ConfigRegistry>>| async move {
+                match configs.json() {
+                    Ok(body) => (
+                        [
+                            ("Content-Type", "application/json"),
+                            ("X-Content-Type-Options", "nosniff"),
+                        ],
+                        body,
+                    )
+                        .into_response(),
+                    Err(error) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("error marshaling json: {error}\n"),
+                    )
+                        .into_response(),
+                }
+            }),
+        )
+        .with_state(configs);
+    // ListedPaths excludes neither healthz/ping nor metrics/slis and is sorted
+    // (mux/pathrecorder.go:98-105). Read before statusz.Install (server.go:490).
     rusternetes_common::statusz::install_if_enabled(router, KUBE_PROXY, || {
         rusternetes_common::statusz::Registry::new(Some(
             rusternetes_common::compatibility::default_build_effective_version(),
         ))
-        .with_listed_paths(vec!["/proxyMode".to_string()])
+        .with_listed_paths(
+            vec![
+                "/configz",
+                "/healthz",
+                "/healthz/ping",
+                "/metrics",
+                "/metrics/slis",
+                "/proxyMode",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        )
     })
 }
 
-/// `serveMetrics` (server.go:459-518): an empty bind address disables the
-/// server; otherwise it is (re)started every 5s until it serves
-/// (`wait.UntilWithContext(ctx, fn, 5*time.Second)`), logging each failure.
+/// Listener settings kept separate from the existing KubeProxyConfig so callers
+/// of the library retain their config shape while the standalone CLI can set
+/// HealthzBindAddress and BindAddressHardFail (server.go:244-245,551-561).
+#[derive(Clone, Debug)]
+pub struct DiagnosticsOptions {
+    pub healthz_bind_address: String,
+    pub bind_address_hard_fail: bool,
+}
+
+impl Default for DiagnosticsOptions {
+    fn default() -> Self {
+        Self {
+            healthz_bind_address: "0.0.0.0:10256".to_owned(),
+            bind_address_hard_fail: false,
+        }
+    }
+}
+
+/// `serveMetrics` (server.go:459-521): empty disables, otherwise retry every 5s.
 pub fn serve_metrics(bind_address: String, proxy_mode: &'static str) {
+    serve_metrics_with_errors(bind_address, proxy_mode, None);
+}
+
+pub(crate) fn serve_metrics_with_errors(
+    bind_address: String,
+    proxy_mode: &'static str,
+    errors: Option<tokio::sync::mpsc::UnboundedSender<anyhow::Error>>,
+) {
     if bind_address.is_empty() {
         return;
     }
+    spawn_server(
+        bind_address,
+        metrics_router(proxy_mode),
+        "starting metrics server failed",
+        errors,
+    );
+}
+
+/// server.go:442-456,495-521: retry listener errors every five seconds; hardfail
+/// sends one error and never retries. The receiver is handled by run_proxy.
+pub(crate) fn spawn_server(
+    bind_address: String,
+    router: Router,
+    label: &'static str,
+    errors: Option<tokio::sync::mpsc::UnboundedSender<anyhow::Error>>,
+) {
     tokio::spawn(async move {
         loop {
-            match tokio::net::TcpListener::bind(&bind_address).await {
-                Ok(listener) => {
-                    if let Err(e) = axum::serve(listener, metrics_router(proxy_mode)).await {
-                        tracing::error!("starting metrics server failed: {e}");
-                    }
+            let error = match tokio::net::TcpListener::bind(&bind_address).await {
+                Ok(listener) => axum::serve(listener, router.clone())
+                    .await
+                    .err()
+                    .map(anyhow::Error::from),
+                Err(error) => Some(anyhow::Error::from(error)),
+            };
+            if let Some(error) = error {
+                tracing::error!("{label}: {error}");
+                if let Some(errors) = &errors {
+                    let _ = errors.send(error.context(label));
+                    return;
                 }
-                Err(e) => tracing::error!("starting metrics server failed: {e}"),
             }
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
@@ -153,7 +324,13 @@ mod tests {
             .find(|l| l.starts_with("Paths"))
             .unwrap_or_else(|| panic!("no Paths line: {body}"));
         let got: Vec<&str> = line.split_whitespace().skip(1).collect();
-        assert_eq!(got, vec!["/proxyMode"], "{body}");
+        // statusz/statusz.go:237-256 aggregates nested handlers to their
+        // first path segment before rendering the Paths line.
+        assert_eq!(
+            got,
+            vec!["/configz", "/healthz", "/metrics", "/proxyMode"],
+            "{body}"
+        );
     }
 
     // server.go:487: gate off => no /statusz.
@@ -193,5 +370,31 @@ mod tests {
         assert_eq!(default_metrics_bind_address(""), "127.0.0.1:10249");
         assert_eq!(default_metrics_bind_address("0.0.0.0"), "0.0.0.0:10249");
         assert_eq!(default_metrics_bind_address("0.0.0.0:99"), "0.0.0.0:99");
+    }
+}
+
+#[cfg(test)]
+mod listener_tests {
+    use super::*;
+
+    // serveMetrics/serveHealthz error channels send once and never retry in
+    // hardfail mode (server.go:446-450,500-504).
+    #[tokio::test]
+    async fn hardfail_listener_sends_error_once() {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = occupied.local_addr().unwrap().to_string();
+        let (errors, mut received) = tokio::sync::mpsc::unbounded_channel();
+        spawn_server(
+            address,
+            Router::new(),
+            "healthz server failed",
+            Some(errors),
+        );
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(error.to_string().contains("healthz server failed"));
+        assert!(received.recv().await.is_none());
     }
 }

@@ -231,7 +231,6 @@ impl<S: Storage> KubeProxy<S> {
             debug!("Kube-proxy: state unchanged, skipping sync");
             return Ok(());
         }
-        self.last_sync_hash = current_hash;
 
         // K8s uses iptables-restore to atomically replace all NAT rules.
         // Individual iptables -F + -A creates a gap where no rules exist,
@@ -268,7 +267,16 @@ impl<S: Storage> KubeProxy<S> {
                     error!("Failed to sync service {}/{}: {}", namespace, name, e);
                 }
             }
+            // A best-effort fallback is not a successful atomic restore.
+            // Upstream returns on RestoreAll failure before Healthz.Updated
+            // (iptables/proxier.go:1497-1506,1521-1522).
+            return Err(e);
         }
+
+        // Upstream returns before Healthz.Updated on restore failure
+        // (iptables/proxier.go:1497-1506,1521-1522). Cache only successful
+        // state, so a failed retry cannot masquerade as a successful no-op.
+        self.last_sync_hash = current_hash;
 
         debug!("Kube-proxy sync completed");
         Ok(())
