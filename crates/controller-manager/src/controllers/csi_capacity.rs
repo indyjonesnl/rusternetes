@@ -705,6 +705,26 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
     }
 }
 
+/// Event handlers of capacity.go (`onTopologyChanges`, `onSCAddOrUpdate`,
+/// `onSCDelete`, `onCAddOrUpdate`, `onCDelete`, `pollCapacities`) and the
+/// informer caches that feed them (#3548). Stubs until implemented.
+impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
+    pub fn on_topology_changes(&self, _added: &[Segment], _removed: &[Segment]) {}
+    pub fn on_sc_add_or_update(&self, _sc: &StorageClass) {}
+    pub fn on_sc_delete(&self, _sc: &StorageClass) {}
+    pub fn on_c_add_or_update(&self, _c: &CSIStorageCapacity) {}
+    pub fn on_c_delete(&self, _c: &CSIStorageCapacity) {}
+    pub fn poll_capacities(&self) {}
+    pub fn apply_topology(&self, _segments: Vec<Segment>) {}
+    pub fn apply_sc_list(&self, _list: Vec<StorageClass>) {}
+    pub fn apply_c_list(&self, _list: Vec<CSIStorageCapacity>) {}
+    pub fn informer_c_upsert(&self, _c: &CSIStorageCapacity) {}
+    pub fn informer_c_delete(&self, _c: &CSIStorageCapacity) {}
+    pub fn stats(&self) -> CapacityStats {
+        CapacityStats::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::csi_capacity_refresh::{CapacityRefresher, ItemKey};
@@ -1491,5 +1511,322 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(list_caps(&st).await.len(), 1);
+    }
+
+    // ---- event-driven triggers (#3548): capacity.go onSCAddOrUpdate etc. ----
+
+    async fn list_scs(st: &MemoryStorage) -> Vec<StorageClass> {
+        st.list::<StorageClass>(&build_prefix("storageclasses", None))
+            .await
+            .unwrap()
+    }
+
+    /// `prepare` (capacity.go:262-337): classes and topology are known, then
+    /// the existing objects are fed to `onCAddOrUpdate`.
+    async fn boot<'a>(
+        st: &'a MemoryStorage,
+        cl: &'a FakeClient,
+        immediate: bool,
+        segs: &[Segment],
+    ) -> CapacityController<'a, MemoryStorage, FakeClient> {
+        let c = ctl(st, cl, immediate);
+        c.apply_sc_list(list_scs(st).await);
+        c.apply_topology(segs.to_vec());
+        c.apply_c_list(list_caps(st).await);
+        c
+    }
+
+    /// The informer delivering the effects of the workers' writes back to the
+    /// handlers, until nothing is left to do.
+    async fn pump(c: &CapacityController<'_, MemoryStorage, FakeClient>, st: &MemoryStorage) {
+        for _ in 0..6 {
+            c.sync_queued(Duration::from_millis(1), Duration::from_secs(1))
+                .await;
+            c.apply_c_list(list_caps(st).await);
+        }
+    }
+
+    fn queued_classes(c: &CapacityRefresher) -> Vec<String> {
+        let mut v: Vec<String> = c
+            .queued()
+            .iter()
+            .map(|i| i.storage_class_name.clone())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[tokio::test]
+    async fn sc_added_enqueues_one_item_per_known_segment() {
+        // onSCAddOrUpdate (capacity.go:370-387)
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        let c = boot(
+            &st,
+            &cl,
+            false,
+            &[seg(&[("zone", "a")]), seg(&[("zone", "b")])],
+        )
+        .await;
+        assert!(queued_classes(&c.refresher).is_empty());
+        put_sc(&st, sc("late", DRIVER, None)).await;
+        c.apply_sc_list(list_scs(&st).await);
+        assert_eq!(queued_classes(&c.refresher), vec!["late", "late"]);
+        pump(&c, &st).await;
+        assert_eq!(list_caps(&st).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sc_of_other_driver_or_immediate_binding_is_ignored_on_add() {
+        // capacity.go:371-379
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        let c = boot(&st, &cl, false, &[seg(&[("zone", "a")])]).await;
+        put_sc(&st, sc("foreign", "other-driver", None)).await;
+        put_sc(&st, sc("imm", DRIVER, Some(VolumeBindingMode::Immediate))).await;
+        c.apply_sc_list(list_scs(&st).await);
+        assert!(queued_classes(&c.refresher).is_empty());
+        let c = boot(&st, &cl, true, &[seg(&[("zone", "a")])]).await;
+        assert_eq!(queued_classes(&c.refresher), vec!["imm"]);
+    }
+
+    #[tokio::test]
+    async fn sc_deleted_removes_items_and_enqueues_object_removal() {
+        // onSCDelete (capacity.go:390-403) + removeWorkItem (:488-512)
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        put_sc(&st, sc("late", DRIVER, None)).await;
+        let c = boot(&st, &cl, false, &[seg(&[("zone", "a")])]).await;
+        pump(&c, &st).await;
+        assert_eq!(list_caps(&st).await.len(), 1);
+        st.delete(&build_key("storageclasses", None, "late"))
+            .await
+            .unwrap();
+        c.apply_sc_list(list_scs(&st).await);
+        assert_eq!(c.stats().goal, 0);
+        // The object itself is queued for removal, not left for a poll tick.
+        assert_eq!(list_caps(&st).await.len(), 1);
+        pump(&c, &st).await;
+        assert!(list_caps(&st).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn topology_added_creates_objects_for_all_matching_classes() {
+        // "add storage topology segment" (capacity_test.go:927-1001)
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        *cl.capacity.lock().unwrap() = 1 << 30;
+        put_sc(&st, sc("imm", DRIVER, Some(VolumeBindingMode::Immediate))).await;
+        put_sc(&st, sc("late", DRIVER, None)).await;
+        let c = boot(&st, &cl, false, &[]).await;
+        c.apply_topology(vec![seg(&[("zone", "a")])]);
+        pump(&c, &st).await;
+        let caps = list_caps(&st).await;
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0].storage_class_name, "late");
+        assert_eq!(c.stats().goal, 1);
+        assert_eq!(c.stats().current, 1);
+    }
+
+    #[tokio::test]
+    async fn topology_removed_deletes_objects_and_added_creates_new_ones() {
+        // "add and remove storage topology segment" (capacity_test.go:1039-1085)
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        put_sc(&st, sc("late", DRIVER, None)).await;
+        let c = boot(&st, &cl, false, &[seg(&[("zone", "a")])]).await;
+        pump(&c, &st).await;
+        c.apply_topology(vec![seg(&[("zone", "b")])]);
+        pump(&c, &st).await;
+        let caps = list_caps(&st).await;
+        assert_eq!(caps.len(), 1);
+        assert_eq!(
+            caps[0].node_topology.as_ref().unwrap().match_labels,
+            Some([("zone".to_string(), "b".to_string())].into())
+        );
+        c.apply_topology(vec![]);
+        pump(&c, &st).await;
+        assert!(list_caps(&st).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn capacity_deleted_by_someone_is_recreated() {
+        // "re-create capacity" (capacity_test.go:744-783); onCDelete (:728-741)
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        put_sc(&st, sc("late", DRIVER, None)).await;
+        let c = boot(&st, &cl, false, &[seg(&[("zone", "a")])]).await;
+        pump(&c, &st).await;
+        let before = list_caps(&st).await.remove(0);
+        st.delete(&build_key(
+            "csistoragecapacities",
+            Some(NS),
+            &before.metadata.name,
+        ))
+        .await
+        .unwrap();
+        c.informer_c_delete(&before);
+        pump(&c, &st).await;
+        let after = list_caps(&st).await;
+        assert_eq!(after.len(), 1);
+        assert_ne!(after[0].metadata.uid, before.metadata.uid);
+    }
+
+    #[tokio::test]
+    async fn capacity_that_lost_its_labels_is_left_alone_and_recreated() {
+        // "ignore capacity after owner change" (capacity_test.go:793-844);
+        // onCAddOrUpdate !isManaged branch (:688-701)
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        put_sc(&st, sc("late", DRIVER, None)).await;
+        let c = boot(&st, &cl, false, &[seg(&[("zone", "a")])]).await;
+        pump(&c, &st).await;
+        let mut obj = list_caps(&st).await.remove(0);
+        obj.metadata.labels = None;
+        st.update(
+            &build_key("csistoragecapacities", Some(NS), &obj.metadata.name),
+            &obj,
+        )
+        .await
+        .unwrap();
+        c.apply_c_list(list_caps(&st).await);
+        pump(&c, &st).await;
+        let caps = list_caps(&st).await;
+        assert_eq!(caps.len(), 2, "foreign object kept, new one created");
+        assert_eq!(
+            caps.iter().filter(|c| c.metadata.labels.is_some()).count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_and_recreate_by_someone_with_wrong_capacity_is_corrected() {
+        // "delete and recreate by someone" (capacity_test.go:845-892)
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        *cl.capacity.lock().unwrap() = 1 << 30;
+        put_sc(&st, sc("late", DRIVER, None)).await;
+        let c = boot(&st, &cl, false, &[seg(&[("zone", "a")])]).await;
+        pump(&c, &st).await;
+        let old = list_caps(&st).await.remove(0);
+        st.delete(&build_key(
+            "csistoragecapacities",
+            Some(NS),
+            &old.metadata.name,
+        ))
+        .await
+        .unwrap();
+        let mut new = old.clone();
+        new.metadata.uid = "uid-2".into();
+        new.capacity = Some("1Mi".into());
+        st.create(
+            &build_key("csistoragecapacities", Some(NS), &new.metadata.name),
+            &new,
+        )
+        .await
+        .unwrap();
+        // Watch order: Deleted(old), then Added(new).
+        c.informer_c_delete(&old);
+        let stored = list_caps(&st).await.remove(0);
+        c.informer_c_upsert(&stored);
+        pump(&c, &st).await;
+        let caps = list_caps(&st).await;
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0].capacity.as_deref(), Some("1Gi"));
+    }
+
+    #[tokio::test]
+    async fn redundant_managed_capacity_is_deleted_on_add() {
+        // "delete redundant capacity" (capacity_test.go:784-792); :723-725
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        let c = boot(&st, &cl, false, &[]).await;
+        let mut dup = CSIStorageCapacity {
+            type_meta: TypeMeta::default(),
+            metadata: ObjectMeta::new("csisc-dup").with_namespace(NS),
+            storage_class_name: "late".into(),
+            capacity: Some("1Gi".into()),
+            maximum_volume_size: None,
+            node_topology: Some(seg(&[("zone", "a")]).label_selector()),
+        };
+        dup.metadata.uid = "dup-uid".into();
+        dup.metadata.labels = Some(
+            [
+                (DRIVER_NAME_LABEL.to_string(), DRIVER.to_string()),
+                (MANAGED_BY_LABEL.to_string(), MANAGED.to_string()),
+            ]
+            .into(),
+        );
+        st.create(
+            &build_key("csistoragecapacities", Some(NS), "csisc-dup"),
+            &dup,
+        )
+        .await
+        .unwrap();
+        c.informer_c_upsert(&dup);
+        pump(&c, &st).await;
+        assert!(list_caps(&st).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn gauges_are_computed_lazily_from_current_state() {
+        // CollectWithStability (capacity.go:751-767): no tick stores them; an
+        // object created by a worker is not counted until its event arrives
+        // (:642-645).
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        put_sc(&st, sc("late", DRIVER, None)).await;
+        let c = boot(&st, &cl, false, &[seg(&[("zone", "a")])]).await;
+        assert_eq!(
+            c.stats(),
+            CapacityStats {
+                goal: 1,
+                current: 0,
+                obsolete: 0
+            }
+        );
+        c.sync_queued(Duration::from_millis(1), Duration::from_secs(1))
+            .await;
+        assert_eq!(c.stats().current, 0, "created, event not seen yet");
+        c.apply_c_list(list_caps(&st).await);
+        assert_eq!(
+            c.stats(),
+            CapacityStats {
+                goal: 1,
+                current: 1,
+                obsolete: 0
+            }
+        );
+        // "obsolete object, missing SC" (capacity_test.go:440-459)
+        st.delete(&build_key("storageclasses", None, "late"))
+            .await
+            .unwrap();
+        c.apply_sc_list(list_scs(&st).await);
+        assert_eq!(
+            c.stats(),
+            CapacityStats {
+                goal: 0,
+                current: 0,
+                obsolete: 1
+            }
+        );
+    }
+
+    #[test]
+    fn workqueue_does_not_hand_out_an_item_that_is_being_processed() {
+        // client-go workqueue Add/Get/Done: re-adding an item in flight marks
+        // it dirty; it is queued again by Done, never processed twice at once.
+        let r = CapacityRefresher::new();
+        let k = ItemKey {
+            segment: seg(&[("zone", "a")]),
+            storage_class_name: "sc".into(),
+        };
+        r.set_capacities([k.clone()].into());
+        r.refresh_sc("sc");
+        assert_eq!(r.pop(), Some(k.clone()));
+        r.refresh_sc("sc");
+        assert_eq!(r.pop(), None, "in flight: must not be handed out again");
+        r.done(&k);
+        assert_eq!(r.pop(), Some(k));
     }
 }

@@ -139,6 +139,9 @@ impl CapacityRefresher {
         self.state.lock().unwrap().queue.clear();
     }
 
+    /// `queue.Done` (stub until #3548).
+    pub fn done(&self, _key: &ItemKey) {}
+
     /// `queue.Forget`.
     pub fn forget(&self, key: &ItemKey) {
         self.state.lock().unwrap().failures.remove(key);
