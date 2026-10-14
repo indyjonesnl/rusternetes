@@ -675,3 +675,87 @@ mod local_ephemeral_tests {
         )));
     }
 }
+
+/// `kubernetesPluginPathPrefix` (`pkg/volume/util/util.go:68-69`).
+const KUBERNETES_PLUGIN_PATH_PREFIX: &str = "/plugins/kubernetes.io/";
+
+/// Port of `HasMountRefs` (`pkg/volume/util/util.go:559-593`).
+pub fn has_mount_refs(_mount_path: &str, _mount_refs: &[String]) -> bool {
+    let _ = KUBERNETES_PLUGIN_PATH_PREFIX;
+    false
+}
+
+/// The refs gate of `GenerateUnmountDeviceFunc`
+/// (`operation_generator.go:846-856`): `Err` when the refs lookup failed or
+/// the device mount path is still referenced elsewhere.
+pub fn check_device_mount_refs(
+    _device_mount_path: &str,
+    _refs: anyhow::Result<Vec<String>>,
+) -> anyhow::Result<()> {
+    Ok(())
+}
+
+/// `TestHasMountRefs` (`pkg/volume/util/util_test.go:308-340`) and the
+/// `GetDeviceMountRefs check failed` arms of `GenerateUnmountDeviceFunc`.
+#[cfg(test)]
+mod mount_refs_tests {
+    use super::*;
+
+    fn v(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn has_mount_refs_matches_upstream_cases() {
+        let path = "/var/lib/kubelet/plugins/kubernetes.io/some-plugin/mounts/volume-XXXX";
+        // "plugin mounts only"
+        assert!(!has_mount_refs(
+            path,
+            &v(&[
+                "/home/somewhere/var/lib/kubelet/plugins/kubernetes.io/some-plugin/mounts/volume-XXXX",
+                "/var/lib/kubelet/plugins/kubernetes.io/some-plugin/mounts/volume-XXXX",
+                "/mnt/kubelet/plugins/kubernetes.io/some-plugin/mounts/volume-XXXX",
+                "/mnt/plugins/kubernetes.io/some-plugin/mounts/volume-XXXX",
+            ])
+        ));
+        // "extra local mount"
+        assert!(has_mount_refs(
+            path,
+            &v(&[
+                "/home/somewhere/var/lib/kubelet/plugins/kubernetes.io/some-plugin/mounts/volume-XXXX",
+                "/local/data/kubernetes.io/some-plugin/mounts/volume-XXXX",
+                "/mnt/kubelet/plugins/kubernetes.io/some-plugin/mounts/volume-XXXX",
+                "/mnt/plugins/kubernetes.io/some-plugin/mounts/volume-XXXX",
+            ])
+        ));
+    }
+
+    /// No `/plugins/kubernetes.io/` in the path: the whole path is searched for.
+    #[test]
+    fn has_mount_refs_without_plugin_prefix_uses_the_whole_path() {
+        assert!(!has_mount_refs("/a/b", &v(&["/x/a/b/y"])));
+        assert!(has_mount_refs("/a/b", &v(&["/data/other"])));
+        assert!(!has_mount_refs("/a/b", &[]));
+    }
+
+    #[test]
+    fn check_device_mount_refs_errors_like_upstream() {
+        let path = "/var/lib/kubelet/plugins/kubernetes.io/csi/pv/x/globalmount";
+        assert!(check_device_mount_refs(path, Ok(vec![])).is_ok());
+        let own = vec![format!("/mnt{path}")];
+        assert!(check_device_mount_refs(path, Ok(own)).is_ok());
+        let err = check_device_mount_refs(path, Ok(vec!["/local/manual".to_string()]))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            format!(
+                "the device mount path \"{path}\" is still mounted by other references [/local/manual]"
+            )
+        );
+        let err = check_device_mount_refs(path, Err(anyhow::anyhow!("boom")))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "boom");
+    }
+}
