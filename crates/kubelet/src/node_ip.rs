@@ -147,17 +147,33 @@ fn host_interface_ips() -> Result<Vec<IpAddr>, String> {
     Ok(out)
 }
 
-/// `NodeAddress` setter, no external cloud provider
-/// (setters.go:70-96, 141-189). Returns `(type, address)` pairs.
+/// `cloudproviderapi.AnnotationAlphaProvidedIPAddr`
+/// (staging/src/k8s.io/cloud-provider/api/well_known_annotations.go:25).
+pub const ANNOTATION_ALPHA_PROVIDED_IP_ADDR: &str = "alpha.kubernetes.io/provided-node-ip";
+
+/// `cloudproviderapi.TaintExternalCloudProvider`
+/// (staging/src/k8s.io/cloud-provider/api/well_known_taints.go:24).
+pub const TAINT_EXTERNAL_CLOUD_PROVIDER: &str = "node.cloudprovider.kubernetes.io/uninitialized";
+
+/// `cloudprovider.IsExternal` (staging/src/k8s.io/cloud-provider/plugins.go:79).
+pub fn is_external_cloud_provider(name: &str) -> bool {
+    name == "external"
+}
+
+/// `nodestatus.NodeAddress` Setter (setters.go:62-135): mutates `node`'s
+/// annotations and `status.addresses`, or returns an error after possibly
+/// partially mutating the node (the Go Setter contract).
 /// `lookup` is `net.LookupIP(node.Name)`; `resolve` is
 /// `resolveAddressFunc(nodeIP)` (default-route address of the family).
-pub fn node_addresses(
+pub fn set_node_address(
+    node: &mut rusternetes_common::resources::Node,
     node_ips: &[IpAddr],
     validate: &dyn Fn(IpAddr) -> Result<(), String>,
     hostname: &str,
+    external_cloud_provider: bool,
     lookup: &dyn Fn(&str) -> Vec<IpAddr>,
     resolve: &dyn Fn(Option<IpAddr>) -> Result<IpAddr, String>,
-) -> Result<Vec<(String, String)>, String> {
+) -> Result<(), String> {
     let node_ip = node_ips.first().copied();
     let prefer_ipv4 = node_ip.is_none_or(|ip| ip.is_ipv4());
     let node_ip_specified = node_ip.is_some_and(|ip| !ip.is_unspecified());
@@ -171,13 +187,53 @@ pub fn node_addresses(
         validate(ip).map_err(|e| format!("failed to validate secondaryNodeIP: {e}"))?;
     }
 
-    let internal = |a: IpAddr| ("InternalIP".to_string(), a.to_string());
-    let host = ("Hostname".to_string(), hostname.to_string());
+    if let (true, true, Some(nip)) = (external_cloud_provider, node_ip_specified, node_ip) {
+        // Annotate the Node object with nodeIP for external cloud provider.
+        let mut annotation = nip.to_string();
+        if let (true, Some(sec)) = (secondary_specified, secondary) {
+            annotation.push(',');
+            annotation.push_str(&sec.to_string());
+        }
+        node.metadata
+            .annotations
+            .get_or_insert_with(Default::default)
+            .insert(ANNOTATION_ALPHA_PROVIDED_IP_ADDR.to_string(), annotation);
+    } else if let Some(annotations) = node.metadata.annotations.as_mut() {
+        // Clean up stale annotations if no longer using a cloud provider or
+        // no longer overriding node IP.
+        annotations.remove(ANNOTATION_ALPHA_PROVIDED_IP_ADDR);
+    }
+
+    let status = node.status.get_or_insert_with(Default::default);
+    let internal = |a: IpAddr| rusternetes_common::resources::NodeAddress {
+        address_type: "InternalIP".to_string(),
+        address: a.to_string(),
+    };
+    let host = rusternetes_common::resources::NodeAddress {
+        address_type: "Hostname".to_string(),
+        address: hostname.to_string(),
+    };
+
+    if external_cloud_provider {
+        // If --cloud-provider=external and node address is already set, then
+        // we return early because provider set addresses should take precedence.
+        if status.addresses.as_ref().is_some_and(|a| !a.is_empty()) {
+            return Ok(());
+        }
+        // If nodeIPs are not set wait for the external cloud-provider to set
+        // the node addresses.
+        if node_ip.is_none() {
+            status.addresses = Some(vec![host]);
+            return Ok(());
+        }
+    }
     if let (true, true, Some(a), Some(b)) =
         (node_ip_specified, secondary_specified, node_ip, secondary)
     {
-        return Ok(vec![internal(a), internal(b), host]);
+        status.addresses = Some(vec![internal(a), internal(b), host]);
+        return Ok(());
     }
+    let node_name = node.metadata.name.clone();
 
     // 1) nodeIP if set (and not 0.0.0.0/::)  2) hostname that is an IP
     // 3) DNS lookup of the node name (preferred family first)
@@ -191,7 +247,7 @@ pub fn node_addresses(
     } else if let Some(a) = parse_ip_sloppy(hostname) {
         ip_addr = Some(a);
     } else {
-        for a in lookup(hostname) {
+        for a in lookup(&node_name) {
             err = validate(a).err();
             if err.is_none() {
                 if a.is_ipv4() == prefer_ipv4 {
@@ -214,42 +270,34 @@ pub fn node_addresses(
     }
     let ip_addr = ip_addr.ok_or_else(|| {
         format!(
-            "can't get ip address of node {hostname}. error: {}",
+            "can't get ip address of node {node_name}. error: {}",
             err.as_deref().unwrap_or("<nil>")
         )
     })?;
-    Ok(vec![internal(ip_addr), host])
+    status.addresses = Some(vec![internal(ip_addr), host]);
+    Ok(())
 }
 
-/// `cloudproviderapi.AnnotationAlphaProvidedIPAddr`
-/// (staging/src/k8s.io/cloud-provider/api/well_known_annotations.go:25).
-pub const ANNOTATION_ALPHA_PROVIDED_IP_ADDR: &str = "alpha.kubernetes.io/provided-node-ip";
-
-/// `nodestatus.NodeAddress` Setter (setters.go:62-135): mutates `node`'s
-/// annotations and `status.addresses`. STUB: no external-cloud-provider
-/// handling yet.
-#[allow(clippy::too_many_arguments)]
-pub fn set_node_address(
-    node: &mut rusternetes_common::resources::Node,
+/// The setter without an external cloud provider, on a scratch node named
+/// `hostname`; returns `(type, address)` pairs.
+pub fn node_addresses(
     node_ips: &[IpAddr],
     validate: &dyn Fn(IpAddr) -> Result<(), String>,
     hostname: &str,
-    _external_cloud_provider: bool,
     lookup: &dyn Fn(&str) -> Vec<IpAddr>,
     resolve: &dyn Fn(Option<IpAddr>) -> Result<IpAddr, String>,
-) -> Result<(), String> {
-    let addrs = node_addresses(node_ips, validate, hostname, lookup, resolve)?;
-    let status = node.status.get_or_insert_with(Default::default);
-    status.addresses = Some(
-        addrs
-            .into_iter()
-            .map(|(t, a)| rusternetes_common::resources::NodeAddress {
-                address_type: t,
-                address: a,
-            })
-            .collect(),
-    );
-    Ok(())
+) -> Result<Vec<(String, String)>, String> {
+    let mut node = rusternetes_common::resources::Node::new(hostname);
+    set_node_address(
+        &mut node, node_ips, validate, hostname, false, lookup, resolve,
+    )?;
+    Ok(node
+        .status
+        .and_then(|s| s.addresses)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| (a.address_type, a.address))
+        .collect())
 }
 
 /// The InternalIP list the kubelet advertises: the `NodeAddress` setter
