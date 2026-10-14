@@ -68,6 +68,13 @@ const JSON_PATCH_ESCAPE_KEY_FN: &str = "jsonpatch.escapeKey";
 /// A compiled CEL expression whose struct initializers have been rewritten.
 pub struct CompiledExpression(IdedExpr);
 
+impl CompiledExpression {
+    /// The rewritten expression, for the costed evaluation of [`crate::cel_cost`].
+    pub fn expression(&self) -> &IdedExpr {
+        &self.0
+    }
+}
+
 /// A default CEL [`Context`] with the struct-literal guard functions.
 pub fn new_context() -> Context<'static> {
     let mut ctx = Context::default();
