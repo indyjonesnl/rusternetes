@@ -355,6 +355,12 @@ pub struct AdmissionArgs {
 }
 
 impl AdmissionArgs {
+    /// pflag's use-time deprecation notice (vendor/github.com/spf13/pflag/
+    /// flag.go:511) for `--admission-control`.
+    pub fn deprecation_warning(&self) -> Option<String> {
+        None
+    }
+
     pub fn to_options(&self) -> AdmissionOptions {
         AdmissionOptions {
             enable_plugins: self.enable_admission_plugins.clone(),
@@ -380,6 +386,67 @@ impl AdmissionArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn help_of(flag: &str) -> String {
+        use clap::Args;
+        let cmd = AdmissionArgs::augment_args(clap::Command::new("x"));
+        let arg = cmd.get_arguments().find(|a| a.get_id() == flag).unwrap();
+        arg.get_help().map(|h| h.to_string()).unwrap_or_default()
+    }
+
+    fn default_on() -> String {
+        let o = AdmissionOptions::kube_apiserver();
+        o.recommended_plugin_order
+            .iter()
+            .filter(|p| !o.default_off_plugins.contains(*p))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// `AddFlags` (staging/src/k8s.io/apiserver/pkg/server/options/admission.go:107-124):
+    /// the help embeds `defaultEnabledPluginNames()` and `Plugins.Registered()`.
+    #[test]
+    fn enable_and_disable_help_list_defaults_and_registered() {
+        let registered = AdmissionOptions::kube_apiserver().registered.join(", ");
+        assert_eq!(
+            help_of("enable_admission_plugins"),
+            format!(
+                "admission plugins that should be enabled in addition to default enabled ones ({}). Comma-delimited list of admission plugins: {registered}. The order of plugins in this flag does not matter.",
+                default_on()
+            )
+        );
+        assert_eq!(
+            help_of("disable_admission_plugins"),
+            format!(
+                "admission plugins that should be disabled although they are in the default enabled plugins list ({}). Comma-delimited list of admission plugins: {registered}. The order of plugins in this flag does not matter.",
+                default_on()
+            )
+        );
+    }
+
+    /// `AddFlags` (pkg/kubeapiserver/options/admission.go:73-85): the help
+    /// lists the registered plugins, `MarkDeprecated` adds pflag's
+    /// ` (DEPRECATED: ...)` (flag.go:760) and a use-time notice (flag.go:511).
+    #[test]
+    fn admission_control_is_deprecated() {
+        let registered = AdmissionOptions::kube_apiserver().registered.join(", ");
+        assert_eq!(
+            help_of("admission_control"),
+            format!(
+                "Admission is divided into two phases. In the first phase, only mutating admission plugins run. In the second phase, only validating admission plugins run. The names in the below list may represent a validating plugin, a mutating plugin, or both. The order of plugins in which they are passed to this flag does not matter. Comma-delimited list of: {registered}. (DEPRECATED: Use --enable-admission-plugins or --disable-admission-plugins instead. Will be removed in a future version.)"
+            )
+        );
+        let used = AdmissionArgs {
+            admission_control: Some(vec!["AlwaysAdmit".into()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            used.deprecation_warning().as_deref(),
+            Some("Flag --admission-control has been deprecated, Use --enable-admission-plugins or --disable-admission-plugins instead. Will be removed in a future version.")
+        );
+        assert_eq!(AdmissionArgs::default().deprecation_warning(), None);
+    }
 
     fn set(names: &[&str]) -> HashSet<String> {
         names.iter().map(|s| s.to_string()).collect()
