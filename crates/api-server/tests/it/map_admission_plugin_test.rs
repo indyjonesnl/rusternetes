@@ -465,3 +465,40 @@ async fn if_needed_webhook_is_not_reinvoked_when_nothing_changed_after_it() {
     assert_eq!(p_calls.load(Ordering::SeqCst), 2);
     assert_eq!(w_calls.load(Ordering::SeqCst), 1);
 }
+
+/// `WithControllerMetrics` decorates the MutatingAdmissionPolicy plugin
+/// (admission/plugins.go:142-144), so its `Admit` is timed under the plugin
+/// name (metrics.go:89-100); `serial` keeps the count exact.
+#[tokio::test]
+#[serial]
+async fn policy_plugin_admit_is_observed_as_controller() {
+    fn count() -> u64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|f| f.name() == "apiserver_admission_controller_admission_duration_seconds")
+            .and_then(|mf| {
+                mf.get_metric()
+                    .iter()
+                    .find(|m| {
+                        [
+                            ("name", "MutatingAdmissionPolicy"),
+                            ("type", "admit"),
+                            ("operation", "CREATE"),
+                            ("rejected", "false"),
+                        ]
+                        .iter()
+                        .all(|(k, v)| {
+                            m.get_label()
+                                .iter()
+                                .any(|l| l.name() == *k && l.value() == *v)
+                        })
+                    })
+                    .map(|m| m.get_histogram().get_sample_count())
+            })
+            .unwrap_or(0)
+    }
+    let _g = with_feature(Feature::MutatingAdmissionPolicy, true);
+    let before = count();
+    admit(&state(true), Operation::Create).await;
+    assert!(count() > before, "MutatingAdmissionPolicy not observed");
+}
