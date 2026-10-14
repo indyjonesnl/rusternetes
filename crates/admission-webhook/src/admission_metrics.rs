@@ -427,6 +427,13 @@ pub(crate) mod tests {
             .get_sample_count()
     }
 
+    /// `hist_count`, 0 for a series not yet observed.
+    pub(crate) fn hist_count_or_zero(name: &str, labels: &[(&str, &str)]) -> u64 {
+        find(name, labels)
+            .map(|m| m.get_histogram().get_sample_count())
+            .unwrap_or(0)
+    }
+
     /// `expectFindMetric`.
     fn summary_count(name: &str, labels: &[(&str, &str)]) -> u64 {
         find(name, labels)
