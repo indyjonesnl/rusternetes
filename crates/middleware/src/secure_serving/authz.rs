@@ -26,6 +26,59 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
 
+/// `unionAuthzHandler` (`pkg/authorization/union/union.go:44-69`): the first
+/// `Allow` or `Deny` wins; no-opinion reasons that are not empty are joined
+/// with `\n`, and the errors that came with them are aggregated.
+///
+/// Used instead of `rusternetes_common::authz::UnionAuthorizer`, which joins
+/// every reason (empty ones too) with `"; "` and so renders the
+/// always-empty reasons of the path and privileged-group authorizers as
+/// `": ; "` in the 403 message.
+pub struct UnionAuthz {
+    authorizers: Vec<Arc<dyn Authorizer>>,
+}
+
+impl UnionAuthz {
+    pub fn new(authorizers: Vec<Arc<dyn Authorizer>>) -> Self {
+        Self { authorizers }
+    }
+}
+
+#[async_trait]
+impl Authorizer for UnionAuthz {
+    async fn authorize(&self, attrs: &RequestAttributes) -> Result<Decision> {
+        let mut errlist: Vec<String> = vec![];
+        let mut reasons: Vec<String> = vec![];
+        for a in &self.authorizers {
+            match a.authorize_opinion(attrs).await? {
+                Opinion::Allow => return Ok(Decision::Allow),
+                Opinion::Deny(r) => return Ok(Decision::Deny(r)),
+                Opinion::NoOpinion { reason, error } => {
+                    errlist.extend(error);
+                    if !reason.is_empty() {
+                        reasons.push(reason);
+                    }
+                }
+            }
+        }
+        match super::authn::aggregate(&errlist) {
+            Some(e) => Err(Error::Authorization(e)),
+            None => Ok(Decision::Deny(reasons.join("\n"))),
+        }
+    }
+
+    async fn get_user_rules(
+        &self,
+        _user: &UserInfo,
+        _namespace: &str,
+    ) -> Result<(
+        Vec<rusternetes_common::resources::ResourceRule>,
+        Vec<rusternetes_common::resources::NonResourceRule>,
+    )> {
+        Ok((vec![], vec![]))
+    }
+}
+
 /// `maxControlledAttrCacheSize` (webhook.go:56).
 pub const MAX_CONTROLLED_ATTR_CACHE_SIZE: usize = 10000;
 
@@ -329,6 +382,7 @@ pub struct DelegatingAuthorizerConfig {
 
 impl DelegatingAuthorizerConfig {
     /// `DelegatingAuthorizerConfig.New` (delegating.go:46-60).
+    #[allow(clippy::new_ret_no_self)] // `DelegatingAuthorizerConfig.New`
     pub fn new(&self) -> std::result::Result<Arc<dyn Authorizer>, String> {
         let Some(backoff) = &self.webhook_retry_backoff else {
             return Err(
@@ -854,5 +908,84 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r, Decision::Allow);
+    }
+
+    struct Fixed(Opinion);
+    #[async_trait]
+    impl Authorizer for Fixed {
+        async fn authorize(&self, _a: &RequestAttributes) -> Result<Decision> {
+            unreachable!()
+        }
+        async fn authorize_opinion(&self, _a: &RequestAttributes) -> Result<Opinion> {
+            Ok(self.0.clone())
+        }
+        async fn get_user_rules(
+            &self,
+            _u: &UserInfo,
+            _ns: &str,
+        ) -> Result<(
+            Vec<rusternetes_common::resources::ResourceRule>,
+            Vec<rusternetes_common::resources::NonResourceRule>,
+        )> {
+            Ok((vec![], vec![]))
+        }
+    }
+
+    fn no_opinion(reason: &str, error: Option<&str>) -> Arc<dyn Authorizer> {
+        Arc::new(Fixed(Opinion::NoOpinion {
+            reason: reason.into(),
+            error: error.map(String::from),
+        }))
+    }
+
+    // union.go:44-69: empty reasons are dropped, the rest joined with "\n".
+    #[tokio::test]
+    async fn union_joins_non_empty_reasons_with_newlines() {
+        let attr = non_resource(user("u", &[]), "get", "/x");
+        let u = UnionAuthz::new(vec![no_opinion("", None), no_opinion("", None)]);
+        assert_eq!(
+            u.authorize(&attr).await.unwrap(),
+            Decision::Deny(String::new())
+        );
+        let u = UnionAuthz::new(vec![
+            no_opinion("a", None),
+            no_opinion("", None),
+            no_opinion("b", None),
+        ]);
+        assert_eq!(
+            u.authorize(&attr).await.unwrap(),
+            Decision::Deny("a\nb".into())
+        );
+    }
+
+    // an Allow or Deny stops the chain; errors of earlier no-opinions are dropped then
+    #[tokio::test]
+    async fn union_stops_at_the_first_decision() {
+        let attr = non_resource(user("u", &[]), "get", "/x");
+        let u = UnionAuthz::new(vec![
+            no_opinion("", Some("boom")),
+            Arc::new(Fixed(Opinion::Allow)),
+            no_opinion("never", None),
+        ]);
+        assert_eq!(u.authorize(&attr).await.unwrap(), Decision::Allow);
+        let u = UnionAuthz::new(vec![
+            Arc::new(Fixed(Opinion::Deny("no".into()))),
+            Arc::new(Fixed(Opinion::Allow)),
+        ]);
+        assert_eq!(
+            u.authorize(&attr).await.unwrap(),
+            Decision::Deny("no".into())
+        );
+    }
+
+    // no decision plus errors is an error: the filter renders it as a 500
+    #[tokio::test]
+    async fn union_aggregates_errors_when_nobody_decides() {
+        let attr = non_resource(user("u", &[]), "get", "/x");
+        let u = UnionAuthz::new(vec![no_opinion("", Some("e1")), no_opinion("", Some("e2"))]);
+        assert_eq!(
+            u.authorize(&attr).await.unwrap_err().to_string(),
+            Error::Authorization("[e1, e2]".into()).to_string()
+        );
     }
 }

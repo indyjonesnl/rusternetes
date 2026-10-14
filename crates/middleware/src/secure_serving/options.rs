@@ -9,33 +9,45 @@
 //! * `authentication.go:46-497` (`DelegatingAuthenticationOptions`,
 //!   `RequestHeaderAuthenticationOptions`, `getClient`, `ApplyTo`)
 //! * `authorization.go:38-243` (`DelegatingAuthorizationOptions`)
-//! * `authentication_dynamic_request_header.go` (the in-cluster request-header lookup)
-//! * `staging/src/k8s.io/apiserver/pkg/server/dynamiccertificates/{dynamic_cafile_content.go,configmap_cafile_content.go}`
+//! * `authentication_dynamic_request_header.go` and
+//!   `authentication/request/headerrequest/requestheader_controller.go:197-317`
+//!   (the in-cluster request-header lookup)
+//! * `server/dynamiccertificates/{dynamic_cafile_content.go,configmap_cafile_content.go}`
 //!
 //! Not offered (see the module docs of [`super::serve`]): `--tls-sni-cert-key`,
 //! `--http2-max-streams-per-connection`, `--permit-port-sharing`,
 //! `--permit-address-sharing`.
 //!
 //! Deliberate reduction: the in-cluster CA / request-header configmap is
-//! re-polled every [`FILE_REFRESH_DURATION`] instead of being informer-driven.
+//! re-polled every [`CONFIGMAP_REFRESH_DURATION`] instead of being
+//! informer-driven.
 
 use super::authn::{
     AnonymousAuthConfig, CaContent, DelegatingAuthenticatorConfig, RequestAuthenticator,
     RequestHeaderConfig, RequestHeaderSettings,
 };
-use super::serve::SecureServingInfo;
-use super::webhook::{Backoff, ReviewClient};
-use rusternetes_common::authz::Authorizer;
+use super::authz::{new_path_authorizer, DelegatingAuthorizerConfig, UnionAuthz};
+use super::serve::{tls_cipher_suites, tls_version, SecureServingInfo, ServingCert};
+use super::webhook::{ApiClientReviewClient, Backoff, ReviewClient, ReviewError};
+use async_trait::async_trait;
+use rusternetes_common::authz::{Authorizer, PrivilegedGroupAuthorizer};
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-/// `FileRefreshDuration` (dynamic_cafile_content.go): how often a CA source is re-read.
+/// `FileRefreshDuration` (dynamic_cafile_content.go): how often a CA file is re-read.
 pub const FILE_REFRESH_DURATION: Duration = Duration::from_secs(60);
+
+/// How often the in-cluster configmap is re-read (upstream watches it).
+pub const CONFIGMAP_REFRESH_DURATION: Duration = Duration::from_secs(10);
 
 /// `authenticationConfigMapNamespace` / `authenticationConfigMapName` (authentication.go:427-434).
 pub const AUTHENTICATION_CONFIGMAP_NAMESPACE: &str = "kube-system";
 pub const AUTHENTICATION_CONFIGMAP_NAME: &str = "extension-apiserver-authentication";
+
+/// `RemoteRequestHeaderUID` is beta and on by default since 1.33
+/// (`apiserver/pkg/features/kube_features.go:417-420`).
+const REMOTE_REQUEST_HEADER_UID: bool = true;
 
 // ------------------------------------------------------------- secure serving
 
@@ -73,35 +85,236 @@ pub struct SecureServingOptions {
 impl SecureServingOptions {
     /// `NewSecureServingOptions` (serving.go:112-121).
     pub fn new() -> Self {
-        unimplemented!("SecureServingOptions::new")
+        Self {
+            bind_address: IpAddr::from([0, 0, 0, 0]),
+            bind_port: 443,
+            required: false,
+            listener: None,
+            server_cert: GeneratableKeyCert {
+                pair_name: "apiserver".to_string(),
+                cert_directory: "apiserver.local.config/certificates".to_string(),
+                ..Default::default()
+            },
+            cipher_suites: vec![],
+            min_tls_version: String::new(),
+            disable_http2_serving: false,
+        }
     }
 
     /// `Validate` (serving.go:130-148); the messages are upstream's.
     pub fn validate(&self) -> Vec<String> {
-        unimplemented!("SecureServingOptions::validate")
+        let mut errors = vec![];
+        // serving.go:137 parses as `(Required && BindPort < 1) || BindPort > 65535`.
+        if (self.required && self.bind_port < 1) || self.bind_port > 65535 {
+            errors.push(format!(
+                "--secure-port {} must be between 1 and 65535, inclusive. It cannot be turned off with 0",
+                self.bind_port
+            ));
+        } else if self.bind_port < 0 || self.bind_port > 65535 {
+            errors.push(format!(
+                "--secure-port {} must be between 0 and 65535, inclusive. 0 for turning off secure port",
+                self.bind_port
+            ));
+        }
+        if (!self.server_cert.cert_key.cert_file.is_empty()
+            || !self.server_cert.cert_key.key_file.is_empty())
+            && self.server_cert.generated_cert.is_some()
+        {
+            errors.push("cert/key file and in-memory certificate cannot both be set".to_string());
+        }
+        errors
     }
 
     /// `ApplyTo` (serving.go:224-338): bind the listener and resolve the
     /// certificate, cipher suites and TLS version. `None` when serving is off.
     pub fn apply_to(&mut self) -> Result<Option<SecureServingInfo>, String> {
-        unimplemented!("SecureServingOptions::apply_to")
+        if self.bind_port <= 0 && self.listener.is_none() {
+            return Ok(None);
+        }
+        let listener = match self.listener.as_ref() {
+            None => {
+                let addr = std::net::SocketAddr::new(self.bind_address, self.bind_port as u16);
+                let l = std::net::TcpListener::bind(addr)
+                    .map_err(|e| format!("failed to create listener: {e}"))?;
+                self.bind_port = l
+                    .local_addr()
+                    .map_err(|e| format!("failed to create listener: {e}"))?
+                    .port() as i32;
+                l
+            }
+            Some(l) => {
+                let addr = l
+                    .local_addr()
+                    .map_err(|_| "failed to parse ip and port from listener".to_string())?;
+                self.bind_port = addr.port() as i32;
+                self.bind_address = addr.ip();
+                l.try_clone()
+                    .map_err(|e| format!("failed to clone the listener: {e}"))?
+            }
+        };
+        // Keep one handle, as `s.Listener` stays set upstream.
+        let info_listener = listener
+            .try_clone()
+            .map_err(|e| format!("failed to clone the listener: {e}"))?;
+        self.listener = Some(listener);
+
+        let key_cert = &self.server_cert.cert_key;
+        let cert = if !key_cert.cert_file.is_empty() || !key_cert.key_file.is_empty() {
+            let c = ServingCert::Files {
+                cert_file: key_cert.cert_file.clone(),
+                key_file: key_cert.key_file.clone(),
+            };
+            // NewDynamicServingContentFromFiles loads the pair up front.
+            c.load()?;
+            Some(c)
+        } else {
+            self.server_cert
+                .generated_cert
+                .as_ref()
+                .map(|(cert_pem, key_pem)| ServingCert::Static {
+                    cert_pem: cert_pem.clone(),
+                    key_pem: key_pem.clone(),
+                })
+        };
+
+        let cipher_suites = if self.cipher_suites.is_empty() {
+            vec![]
+        } else {
+            tls_cipher_suites(&self.cipher_suites)?
+        };
+        let min_tls_version = tls_version(&self.min_tls_version)?;
+
+        Ok(Some(SecureServingInfo {
+            listener: info_listener,
+            cert,
+            cipher_suites,
+            min_tls_version,
+            disable_http2: self.disable_http2_serving,
+            client_cas: vec![],
+        }))
     }
 
     /// `MaybeDefaultWithSelfSignedCerts` (serving.go:340-391).
     pub fn maybe_default_with_self_signed_certs(
         &mut self,
-        _public_address: &str,
-        _alternate_dns: &[String],
-        _alternate_ips: &[IpAddr],
+        public_address: &str,
+        alternate_dns: &[String],
+        alternate_ips: &[IpAddr],
     ) -> Result<(), String> {
-        unimplemented!("SecureServingOptions::maybe_default_with_self_signed_certs")
+        if self.bind_port == 0 && self.listener.is_none() {
+            return Ok(());
+        }
+        if !self.server_cert.cert_key.cert_file.is_empty()
+            || !self.server_cert.cert_key.key_file.is_empty()
+        {
+            return Ok(());
+        }
+
+        let mut can_read_cert_and_key = false;
+        if !self.server_cert.cert_directory.is_empty() {
+            if self.server_cert.pair_name.is_empty() {
+                return Err("PairName is required if CertDirectory is set".to_string());
+            }
+            let dir = std::path::Path::new(&self.server_cert.cert_directory);
+            self.server_cert.cert_key.cert_file = dir
+                .join(format!("{}.crt", self.server_cert.pair_name))
+                .to_string_lossy()
+                .into_owned();
+            self.server_cert.cert_key.key_file = dir
+                .join(format!("{}.key", self.server_cert.pair_name))
+                .to_string_lossy()
+                .into_owned();
+            can_read_cert_and_key = rusternetes_common::self_signed::can_read_cert_and_key(
+                &self.server_cert.cert_key.cert_file,
+                &self.server_cert.cert_key.key_file,
+            )?;
+        }
+
+        if !can_read_cert_and_key {
+            // add either the bind address or localhost to the valid alternates
+            let mut alternate_dns = alternate_dns.to_vec();
+            let mut alternate_ips = alternate_ips.to_vec();
+            if self.bind_address.is_unspecified() {
+                alternate_dns.push("localhost".to_string());
+            } else {
+                alternate_ips.push(self.bind_address);
+            }
+
+            let (cert, key) =
+                rusternetes_common::self_signed::generate_self_signed_cert_key_with_fixtures(
+                    public_address,
+                    &alternate_ips,
+                    &alternate_dns,
+                    &self.server_cert.fixture_directory,
+                )
+                .map_err(|e| format!("unable to generate self signed cert: {e}"))?;
+            let kc = &self.server_cert.cert_key;
+            if !kc.cert_file.is_empty() && !kc.key_file.is_empty() {
+                write_cert(&kc.cert_file, &cert)?;
+                write_key(&kc.key_file, &key)?;
+                tracing::info!(
+                    "Generated self-signed cert ({}, {})",
+                    kc.cert_file,
+                    kc.key_file
+                );
+            } else {
+                self.server_cert.generated_cert = Some((cert, key));
+                tracing::info!("Generated self-signed cert in-memory");
+            }
+        }
+        Ok(())
     }
+}
+
+/// `certutil.WriteCert` (client-go `util/cert/io.go`): `MkdirAll(dir, 0755)`, mode 0644.
+fn write_cert(path: &str, data: &[u8]) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(dir) = std::path::Path::new(path).parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o644)
+        .open(path)
+        .and_then(|mut f| f.write_all(data))
+        .map_err(|e| e.to_string())
+}
+
+/// `keyutil.WriteKey` (client-go `util/keyutil/key.go`): `MkdirAll(dir, 0755)`, mode 0600.
+fn write_key(path: &str, data: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(dir) = std::path::Path::new(path).parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .and_then(|mut f| f.write_all(data))
+        .map_err(|e| e.to_string())
 }
 
 impl Default for SecureServingOptions {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// pflag `StringSlice` semantics: an empty value is the empty list.
+fn string_slice(v: &[String]) -> Option<Vec<String>> {
+    if v.is_empty() {
+        return None;
+    }
+    if v.len() == 1 && v[0].is_empty() {
+        return Some(vec![]);
+    }
+    Some(v.to_vec())
 }
 
 /// The `--bind-address` ... `--tls-min-version` flags (serving.go:150-221).
@@ -154,8 +367,31 @@ pub struct SecureServingFlags {
 
 impl SecureServingFlags {
     /// What `fs.Parse` does to the options the flags were registered on.
-    pub fn apply_to_options(&self, _o: &mut SecureServingOptions) {
-        unimplemented!("SecureServingFlags::apply_to_options")
+    pub fn apply_to_options(&self, o: &mut SecureServingOptions) {
+        if let Some(v) = self.bind_address {
+            o.bind_address = v;
+        }
+        if let Some(v) = self.secure_port {
+            o.bind_port = v;
+        }
+        if let Some(v) = self.disable_http2_serving {
+            o.disable_http2_serving = v;
+        }
+        if let Some(v) = &self.cert_dir {
+            o.server_cert.cert_directory = v.clone();
+        }
+        if let Some(v) = &self.tls_cert_file {
+            o.server_cert.cert_key.cert_file = v.clone();
+        }
+        if let Some(v) = &self.tls_private_key_file {
+            o.server_cert.cert_key.key_file = v.clone();
+        }
+        if let Some(v) = string_slice(&self.tls_cipher_suites) {
+            o.cipher_suites = v;
+        }
+        if let Some(v) = &self.tls_min_version {
+            o.min_tls_version = v.clone();
+        }
     }
 }
 
@@ -172,18 +408,86 @@ pub struct RequestHeaderAuthenticationOptions {
     pub allowed_names: Vec<String>,
 }
 
+fn check_for_white_space_only(flag: &str, names: &[String]) -> Option<String> {
+    names
+        .iter()
+        .any(|n| n.trim().is_empty())
+        .then(|| format!("empty value in {flag:?}"))
+}
+
+fn case_insensitive_has(headers: &[String], header: &str) -> bool {
+    headers.iter().any(|h| h.eq_ignore_ascii_case(header))
+}
+
 impl RequestHeaderAuthenticationOptions {
     /// `Validate` (authentication.go:67-108). `remote_request_header_uid` is
     /// the `RemoteRequestHeaderUID` feature gate.
-    pub fn validate(&self, _remote_request_header_uid: bool) -> Vec<String> {
-        unimplemented!("RequestHeaderAuthenticationOptions::validate")
+    pub fn validate(&self, remote_request_header_uid: bool) -> Vec<String> {
+        let mut all = vec![];
+        for (flag, v) in [
+            ("requestheader-username-headers", &self.username_headers),
+            ("requestheader-group-headers", &self.group_headers),
+            (
+                "requestheader-extra-headers-prefix",
+                &self.extra_header_prefixes,
+            ),
+            ("requestheader-allowed-names", &self.allowed_names),
+        ] {
+            all.extend(check_for_white_space_only(flag, v));
+        }
+        if !self.username_headers.is_empty()
+            && !case_insensitive_has(&self.username_headers, "X-Remote-User")
+        {
+            tracing::warn!("--requestheader-username-headers is set without specifying the standard X-Remote-User header - API aggregation will not work");
+        }
+        if !self.group_headers.is_empty()
+            && !case_insensitive_has(&self.group_headers, "X-Remote-Group")
+        {
+            tracing::warn!("--requestheader-group-headers is set without specifying the standard X-Remote-Group header - API aggregation will not work");
+        }
+        if !self.extra_header_prefixes.is_empty()
+            && !case_insensitive_has(&self.extra_header_prefixes, "X-Remote-Extra-")
+        {
+            tracing::warn!("--requestheader-extra-headers-prefix is set without specifying the standard X-Remote-Extra- header prefix - API aggregation will not work");
+        }
+        if !remote_request_header_uid {
+            if !self.uid_headers.is_empty() {
+                all.push("--requestheader-uid-headers requires the \"RemoteRequestHeaderUID\" feature to be enabled".to_string());
+            }
+        } else {
+            all.extend(check_for_white_space_only(
+                "requestheader-uid-headers",
+                &self.uid_headers,
+            ));
+            if !self.uid_headers.is_empty()
+                && !case_insensitive_has(&self.uid_headers, "X-Remote-Uid")
+            {
+                // this was added later and so we are able to error out
+                all.push("--requestheader-uid-headers is set without specifying the standard X-Remote-Uid header - API aggregation will not work".to_string());
+            }
+        }
+        all
     }
 
     /// `ToAuthenticationRequestHeaderConfig` (authentication.go:159-177).
     pub fn to_authentication_request_header_config(
         &self,
     ) -> Result<Option<RequestHeaderConfig>, String> {
-        unimplemented!("to_authentication_request_header_config")
+        if self.client_ca_file.is_empty() {
+            return Ok(None);
+        }
+        let ca = CaContent::from_file("request-header", &self.client_ca_file)?;
+        ca.run_file_refresh(self.client_ca_file.clone(), FILE_REFRESH_DURATION);
+        Ok(Some(RequestHeaderConfig {
+            ca,
+            settings: Arc::new(RwLock::new(RequestHeaderSettings {
+                username_headers: self.username_headers.clone(),
+                uid_headers: self.uid_headers.clone(),
+                group_headers: self.group_headers.clone(),
+                extra_header_prefixes: self.extra_header_prefixes.clone(),
+                allowed_client_names: self.allowed_names.clone(),
+            })),
+        }))
     }
 }
 
@@ -199,6 +503,8 @@ pub struct DelegatingAuthenticationOptions {
     pub tolerate_in_cluster_lookup_failure: bool,
     pub webhook_retry_backoff: Option<Backoff>,
     pub token_request_timeout: Duration,
+    /// Set by `NewDelegatingAuthenticationOptions`; `ApplyTo` does not read it
+    /// (it hardcodes `Enabled: true`, authentication.go:337).
     pub anonymous: Option<AnonymousAuthConfig>,
 }
 
@@ -211,26 +517,154 @@ pub struct AuthenticationInfo {
 impl DelegatingAuthenticationOptions {
     /// `NewDelegatingAuthenticationOptions` (authentication.go:251-271).
     pub fn new() -> Self {
-        unimplemented!("DelegatingAuthenticationOptions::new")
+        Self {
+            // very low for responsiveness, but high enough to handle storms
+            cache_ttl: Duration::from_secs(10),
+            client_ca: String::new(),
+            request_header: RequestHeaderAuthenticationOptions {
+                username_headers: vec!["x-remote-user".to_string()],
+                // UID headers are deliberately not defaulted (authentication.go:257-262)
+                uid_headers: vec![],
+                group_headers: vec!["x-remote-group".to_string()],
+                extra_header_prefixes: vec!["x-remote-extra-".to_string()],
+                ..Default::default()
+            },
+            webhook_retry_backoff: Some(Backoff::default_auth_webhook()),
+            token_request_timeout: Duration::from_secs(10),
+            anonymous: Some(AnonymousAuthConfig {
+                enabled: true,
+                condition_paths: vec![],
+            }),
+            remote_kubeconfig_file: String::new(),
+            remote_kubeconfig_file_optional: false,
+            skip_in_cluster_lookup: false,
+            tolerate_in_cluster_lookup_failure: false,
+        }
     }
 
     /// `Validate` (authentication.go:288-301).
     pub fn validate(&self) -> Vec<String> {
-        unimplemented!("DelegatingAuthenticationOptions::validate")
+        let mut all = self.request_header.validate(REMOTE_REQUEST_HEADER_UID);
+        if let Some(b) = &self.webhook_retry_backoff {
+            if b.steps <= 0 {
+                all.push(format!(
+                    "number of webhook retry attempts must be greater than 1, but is: {}",
+                    b.steps
+                ));
+            }
+        }
+        all
     }
 
     /// `ApplyTo` (authentication.go:330-425). `serving` receives the client CAs
     /// (`authenticationInfo.ApplyClientCert`).
     pub async fn apply_to(
         &self,
-        _serving: Option<&mut SecureServingInfo>,
+        mut serving: Option<&mut SecureServingInfo>,
     ) -> Result<AuthenticationInfo, String> {
-        let _ = (
-            DelegatingAuthenticatorConfig::new,
-            CaContent::new,
-            RequestHeaderSettings::default,
-        );
-        unimplemented!("DelegatingAuthenticationOptions::apply_to")
+        let mut info = AuthenticationInfo {
+            authenticator: None,
+            request_header_config: None,
+        };
+        let mut cfg = DelegatingAuthenticatorConfig {
+            anonymous: Some(AnonymousAuthConfig {
+                enabled: true,
+                condition_paths: vec![],
+            }),
+            token_access_review_client: None,
+            token_access_review_timeout: self.token_request_timeout,
+            webhook_retry_backoff: self.webhook_retry_backoff.clone(),
+            cache_ttl: self.cache_ttl,
+            client_certificate_ca: None,
+            request_header_config: None,
+        };
+
+        let client = get_client(
+            &self.remote_kubeconfig_file,
+            self.remote_kubeconfig_file_optional,
+            "authentication",
+        )
+        .map_err(|e| format!("failed to get delegated authentication kubeconfig: {e}"))?;
+
+        // configure token review
+        if let Some(c) = &client {
+            cfg.token_access_review_client = Some(Arc::new(ApiClientReviewClient(c.clone())));
+        }
+
+        // get the clientCA information
+        if !self.client_ca.is_empty() {
+            let ca = CaContent::from_file("client-ca-bundle", &self.client_ca)
+                .map_err(|e| format!("unable to load client CA provider: {e}"))?;
+            ca.run_file_refresh(self.client_ca.clone(), FILE_REFRESH_DURATION);
+            cfg.client_certificate_ca = Some(ca.clone());
+            apply_client_cert(serving.as_deref_mut(), ca);
+        } else if !self.skip_in_cluster_lookup {
+            match &client {
+                None => tracing::warn!(
+                    "No authentication-kubeconfig provided in order to lookup client-ca-file in configmap/{} in {}, so client certificate authentication won't work.",
+                    AUTHENTICATION_CONFIGMAP_NAME,
+                    AUTHENTICATION_CONFIGMAP_NAMESPACE
+                ),
+                Some(c) => {
+                    // NewDynamicCAFromConfigMapController: loaded by RunOnce when
+                    // the server starts; a failure is ignored ("fail closed").
+                    let ca = CaContent::new("client-ca");
+                    spawn_configmap_refresh(c.clone(), &ca, "client-ca-file", None, true);
+                    cfg.client_certificate_ca = Some(ca.clone());
+                    apply_client_cert(serving.as_deref_mut(), ca);
+                }
+            }
+        }
+
+        let mut request_header_config: Option<RequestHeaderConfig> = None;
+        if !self.request_header.client_ca_file.is_empty() {
+            request_header_config = self
+                .request_header
+                .to_authentication_request_header_config()
+                .map_err(|e| {
+                    format!("unable to create request header authentication config: {e}")
+                })?;
+        } else if !self.skip_in_cluster_lookup {
+            match &client {
+                None => tracing::warn!(
+                    "No authentication-kubeconfig provided in order to lookup requestheader-client-ca-file in configmap/{} in {}, so request-header client certificate authentication won't work.",
+                    AUTHENTICATION_CONFIGMAP_NAME,
+                    AUTHENTICATION_CONFIGMAP_NAMESPACE
+                ),
+                Some(c) => match create_request_header_config(c.clone()).await {
+                    Ok(rh) => request_header_config = Some(rh),
+                    Err(e) => {
+                        if self.tolerate_in_cluster_lookup_failure {
+                            tracing::warn!(
+                                "Error looking up in-cluster authentication configuration: {e}"
+                            );
+                            tracing::warn!("Continuing without authentication configuration. This may treat all requests as anonymous.");
+                            tracing::warn!("To require authentication configuration lookup to succeed, set --authentication-tolerate-lookup-failure=false");
+                        } else {
+                            return Err(format!(
+                                "unable to load configmap based request-header-client-ca-file: {e}"
+                            ));
+                        }
+                    }
+                },
+            }
+        }
+        if let Some(rh) = request_header_config {
+            cfg.request_header_config = Some(rh.clone());
+            apply_client_cert(serving, rh.ca.clone());
+            info.request_header_config = Some(rh);
+        }
+
+        // create authenticator
+        info.authenticator = Some(cfg.new()?);
+        Ok(info)
+    }
+}
+
+/// `AuthenticationInfo.ApplyClientCert` (config.go:535-549).
+fn apply_client_cert(serving: Option<&mut SecureServingInfo>, ca: Arc<CaContent>) {
+    if let Some(s) = serving {
+        s.apply_client_cert(ca);
     }
 }
 
@@ -238,6 +672,130 @@ impl Default for DelegatingAuthenticationOptions {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// `deserializeStrings` (requestheader_controller.go): a JSON array, or nil.
+fn deserialize_strings(v: Option<&serde_json::Value>) -> Result<Vec<String>, String> {
+    match v.and_then(|v| v.as_str()) {
+        None | Some("") => Ok(vec![]),
+        Some(s) => serde_json::from_str(s).map_err(|e| e.to_string()),
+    }
+}
+
+/// `getRequestHeaderBundleFromConfigMap` (requestheader_controller.go:283-317).
+fn request_header_settings_from_configmap(
+    cm: &serde_json::Value,
+    previous_allowed: &RequestHeaderSettings,
+) -> Result<RequestHeaderSettings, String> {
+    let _ = previous_allowed;
+    let data = &cm["data"];
+    Ok(RequestHeaderSettings {
+        username_headers: deserialize_strings(data.get("requestheader-username-headers"))?,
+        uid_headers: deserialize_strings(data.get("requestheader-uid-headers"))?,
+        group_headers: deserialize_strings(data.get("requestheader-group-headers"))?,
+        extra_header_prefixes: deserialize_strings(data.get("requestheader-extra-headers-prefix"))?,
+        allowed_client_names: deserialize_strings(data.get("requestheader-allowed-names"))?,
+    })
+}
+
+async fn get_authentication_configmap(
+    client: &rusternetes_client::http::ApiClient,
+) -> Result<Option<serde_json::Value>, String> {
+    let path = format!(
+        "/api/v1/namespaces/{AUTHENTICATION_CONFIGMAP_NAMESPACE}/configmaps/{AUTHENTICATION_CONFIGMAP_NAME}"
+    );
+    match client.get::<serde_json::Value>(&path).await {
+        Ok(v) => Ok(Some(v)),
+        Err(rusternetes_client::http::GetError::NotFound) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// `ConfigMapCAController.loadCABundle` (configmap_cafile_content.go:145-171).
+fn load_ca_bundle(ca: &CaContent, cm: Option<&serde_json::Value>, key: &str) -> Result<(), String> {
+    let cm = cm.ok_or_else(|| format!("configmap {AUTHENTICATION_CONFIGMAP_NAME:?} not found"))?;
+    let bundle = cm["data"][key].as_str().unwrap_or("");
+    if bundle.is_empty() {
+        return Err(format!("missing content for CA bundle {:?}", ca.name()));
+    }
+    ca.set_pem(bundle.as_bytes()).map(|_| ())
+}
+
+/// The refresh half of `ConfigMapCAController.Run` /
+/// `RequestHeaderAuthRequestController.Run`: re-read the configmap on an
+/// interval (upstream also reacts to watch events). The task ends with the CA.
+fn spawn_configmap_refresh(
+    client: Arc<rusternetes_client::http::ApiClient>,
+    ca: &Arc<CaContent>,
+    key: &'static str,
+    settings: Option<Arc<RwLock<RequestHeaderSettings>>>,
+    immediate: bool,
+) {
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    let weak = Arc::downgrade(ca);
+    tokio::spawn(async move {
+        let mut first = immediate;
+        loop {
+            if !first {
+                tokio::time::sleep(CONFIGMAP_REFRESH_DURATION).await;
+            }
+            first = false;
+            let Some(ca) = weak.upgrade() else { return };
+            match get_authentication_configmap(&client).await {
+                Ok(cm) => {
+                    if let Err(e) = load_ca_bundle(&ca, cm.as_ref(), key) {
+                        tracing::error!("Failed to load CA bundle {:?}: {e}", ca.name());
+                    }
+                    if let (Some(settings), Some(cm)) = (&settings, &cm) {
+                        let current = settings.read().unwrap().clone();
+                        match request_header_settings_from_configmap(cm, &current) {
+                            Ok(new) if new != current => {
+                                *settings.write().unwrap() = new;
+                                tracing::info!("Loaded a new request header values");
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::error!("Failed to load the request header values: {e}")
+                            }
+                        }
+                    }
+                }
+                Err(e) => tracing::error!("Failed to read the authentication configmap: {e}"),
+            }
+        }
+    });
+}
+
+/// `createRequestHeaderConfig` (authentication.go:430-452): the synchronous
+/// `RunOnce` of the request-header controller decides whether the lookup
+/// worked. `ConfigMapCAController.RunOnce` ignores its error; the header
+/// controller's `RunOnce` ignores NotFound and fails on anything else.
+async fn create_request_header_config(
+    client: Arc<rusternetes_client::http::ApiClient>,
+) -> Result<RequestHeaderConfig, String> {
+    let ca = CaContent::new("client-ca");
+    let settings = Arc::new(RwLock::new(RequestHeaderSettings::default()));
+    let cm = get_authentication_configmap(&client).await.inspect_err(|e| {
+        tracing::warn!(
+            "Unable to get configmap/{AUTHENTICATION_CONFIGMAP_NAME} in {AUTHENTICATION_CONFIGMAP_NAMESPACE}: {e}"
+        )
+    })?;
+    // ConfigMapCAController.RunOnce: `_ = c.loadCABundle()`
+    let _ = load_ca_bundle(&ca, cm.as_ref(), "requestheader-client-ca-file");
+    if let Some(cm) = &cm {
+        let new = request_header_settings_from_configmap(cm, &RequestHeaderSettings::default())?;
+        *settings.write().unwrap() = new;
+    }
+    spawn_configmap_refresh(
+        client,
+        &ca,
+        "requestheader-client-ca-file",
+        Some(settings.clone()),
+        false,
+    );
+    Ok(RequestHeaderConfig { ca, settings })
 }
 
 /// `--authentication-kubeconfig` ... `--requestheader-allowed-names`
@@ -305,14 +863,49 @@ pub struct AuthenticationFlags {
 }
 
 impl AuthenticationFlags {
-    pub fn apply_to_options(&self, _o: &mut DelegatingAuthenticationOptions) {
-        unimplemented!("AuthenticationFlags::apply_to_options")
+    pub fn apply_to_options(&self, o: &mut DelegatingAuthenticationOptions) {
+        if let Some(v) = &self.authentication_kubeconfig {
+            o.remote_kubeconfig_file = v.clone();
+        }
+        if let Some(v) = self.authentication_token_webhook_cache_ttl {
+            o.cache_ttl = v;
+        }
+        if let Some(v) = &self.client_ca_file {
+            o.client_ca = v.clone();
+        }
+        if let Some(v) = string_slice(&self.requestheader_username_headers) {
+            o.request_header.username_headers = v;
+        }
+        if let Some(v) = string_slice(&self.requestheader_uid_headers) {
+            o.request_header.uid_headers = v;
+        }
+        if let Some(v) = string_slice(&self.requestheader_group_headers) {
+            o.request_header.group_headers = v;
+        }
+        if let Some(v) = string_slice(&self.requestheader_extra_headers_prefix) {
+            o.request_header.extra_header_prefixes = v;
+        }
+        if let Some(v) = &self.requestheader_client_ca_file {
+            o.request_header.client_ca_file = v.clone();
+        }
+        if let Some(v) = string_slice(&self.requestheader_allowed_names) {
+            o.request_header.allowed_names = v;
+        }
+        if let Some(v) = self.authentication_skip_lookup {
+            o.skip_in_cluster_lookup = v;
+        }
+        if let Some(v) = self.authentication_tolerate_lookup_failure {
+            o.tolerate_in_cluster_lookup_failure = v;
+        }
     }
 }
 
 /// A Go `time.Duration` flag value (`24h`, `10s`, `1m30s`).
-pub fn parse_go_duration_arg(_s: &str) -> Result<Duration, String> {
-    unimplemented!("parse_go_duration_arg")
+pub fn parse_go_duration_arg(s: &str) -> Result<Duration, String> {
+    let nanos = rusternetes_common::go_duration::parse_go_duration(s)?;
+    u64::try_from(nanos)
+        .map(Duration::from_nanos)
+        .map_err(|_| format!("negative duration {s:?}"))
 }
 
 // ------------------------------------------------------------- authorization
@@ -334,28 +927,121 @@ pub struct AuthorizationInfo {
     pub authorizer: Arc<dyn Authorizer>,
 }
 
+/// `clientConfig.Timeout = s.ClientTimeout` (authorization.go:239): every
+/// request is cut off after the timeout, as an error that is not retried.
+struct TimeoutReviewClient {
+    inner: Arc<dyn ReviewClient>,
+    timeout: Duration,
+}
+
+#[async_trait]
+impl ReviewClient for TimeoutReviewClient {
+    async fn create(
+        &self,
+        path: &str,
+        review: &serde_json::Value,
+    ) -> Result<serde_json::Value, ReviewError> {
+        match tokio::time::timeout(self.timeout, self.inner.create(path, review)).await {
+            Ok(r) => r,
+            Err(_) => Err(ReviewError {
+                status_code: 0,
+                reason: String::new(),
+                message: format!(
+                    "Post {path:?}: context deadline exceeded (Client.Timeout exceeded while awaiting headers)"
+                ),
+                connection_reset: false,
+                suggests_client_delay: false,
+            }),
+        }
+    }
+}
+
 impl DelegatingAuthorizationOptions {
     /// `NewDelegatingAuthorizationOptions` (authorization.go:78-94).
     pub fn new() -> Self {
-        unimplemented!("DelegatingAuthorizationOptions::new")
+        Self {
+            // very low for responsiveness, but high enough to handle storms
+            allow_cache_ttl: Duration::from_secs(10),
+            deny_cache_ttl: Duration::from_secs(10),
+            client_timeout: Duration::from_secs(10),
+            webhook_retry_backoff: Some(Backoff::default_auth_webhook()),
+            // This allows the kubelet to always get health and readiness without causing an authorization check.
+            always_allow_paths: vec![
+                "/healthz".to_string(),
+                "/readyz".to_string(),
+                "/livez".to_string(),
+            ],
+            // system:masters has full authority in a hard-coded authorizer of the delegated server.
+            always_allow_groups: vec!["system:masters".to_string()],
+            remote_kubeconfig_file: String::new(),
+            remote_kubeconfig_file_optional: false,
+        }
     }
 
     /// `Validate` (authorization.go:123-134).
     pub fn validate(&self) -> Vec<String> {
-        unimplemented!("DelegatingAuthorizationOptions::validate")
+        let mut all = vec![];
+        if let Some(b) = &self.webhook_retry_backoff {
+            if b.steps <= 0 {
+                all.push(format!(
+                    "number of webhook retry attempts must be greater than 1, but is: {}",
+                    b.steps
+                ));
+            }
+        }
+        all
     }
 
     /// `ApplyTo` (authorization.go:162-175).
     pub async fn apply_to(&self) -> Result<AuthorizationInfo, String> {
-        unimplemented!("DelegatingAuthorizationOptions::apply_to")
+        let client = get_client(
+            &self.remote_kubeconfig_file,
+            self.remote_kubeconfig_file_optional,
+            "authorization",
+        )?
+        .map(|c| -> Arc<dyn ReviewClient> {
+            Arc::new(TimeoutReviewClient {
+                inner: Arc::new(ApiClientReviewClient(c)),
+                timeout: self.client_timeout,
+            })
+        });
+        Ok(AuthorizationInfo {
+            authorizer: self.to_authorizer(client)?,
+        })
     }
 
     /// `toAuthorizer` (authorization.go:177-209).
     pub fn to_authorizer(
         &self,
-        _client: Option<Arc<dyn ReviewClient>>,
+        client: Option<Arc<dyn ReviewClient>>,
     ) -> Result<Arc<dyn Authorizer>, String> {
-        unimplemented!("DelegatingAuthorizationOptions::to_authorizer")
+        let mut authorizers: Vec<Arc<dyn Authorizer>> = vec![];
+        if !self.always_allow_groups.is_empty() {
+            let groups: Vec<&str> = self
+                .always_allow_groups
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
+            authorizers.push(Arc::new(PrivilegedGroupAuthorizer::new(&groups)));
+        }
+        if !self.always_allow_paths.is_empty() {
+            authorizers.push(new_path_authorizer(&self.always_allow_paths)?);
+        }
+        match client {
+            None => tracing::warn!(
+                "No authorization-kubeconfig provided, so SubjectAccessReview of authorization tokens won't work."
+            ),
+            Some(c) => authorizers.push(
+                DelegatingAuthorizerConfig {
+                    subject_access_review_client: c,
+                    allow_cache_ttl: self.allow_cache_ttl,
+                    deny_cache_ttl: self.deny_cache_ttl,
+                    webhook_retry_backoff: self.webhook_retry_backoff.clone(),
+                }
+                .new()?,
+            ),
+        }
+        Ok(Arc::new(UnionAuthz::new(authorizers)))
     }
 }
 
@@ -391,8 +1077,19 @@ pub struct AuthorizationFlags {
 }
 
 impl AuthorizationFlags {
-    pub fn apply_to_options(&self, _o: &mut DelegatingAuthorizationOptions) {
-        unimplemented!("AuthorizationFlags::apply_to_options")
+    pub fn apply_to_options(&self, o: &mut DelegatingAuthorizationOptions) {
+        if let Some(v) = &self.authorization_kubeconfig {
+            o.remote_kubeconfig_file = v.clone();
+        }
+        if let Some(v) = self.authorization_webhook_cache_authorized_ttl {
+            o.allow_cache_ttl = v;
+        }
+        if let Some(v) = self.authorization_webhook_cache_unauthorized_ttl {
+            o.deny_cache_ttl = v;
+        }
+        if let Some(v) = string_slice(&self.authorization_always_allow_paths) {
+            o.always_allow_paths = v;
+        }
     }
 }
 
@@ -400,18 +1097,60 @@ impl AuthorizationFlags {
 
 /// `getClient` (authentication.go:462-497, authorization.go:211-243): the
 /// client for delegated reviews, from `--*-kubeconfig` or the in-cluster
-/// config. `Ok(None)` when it is optional and there is none.
+/// config, with `QPS = 200` and `Burst = 400`. `Ok(None)` when it is optional
+/// and there is none.
 pub fn get_client(
-    _kubeconfig_file: &str,
-    _optional: bool,
-    _what: &str,
-    _timeout: Option<Duration>,
+    kubeconfig_file: &str,
+    optional: bool,
+    what: &str,
 ) -> Result<Option<Arc<rusternetes_client::http::ApiClient>>, String> {
-    unimplemented!("get_client")
+    use rusternetes_client::http::ApiClient;
+    let wrap = |e: String| format!("failed to get delegated {what} kubeconfig: {e}");
+    let client = if !kubeconfig_file.is_empty() {
+        let cfg = rusternetes_client::kubeconfig::KubeConfig::load_from_file(
+            &std::path::PathBuf::from(kubeconfig_file),
+        )
+        .map_err(|e| wrap(format!("{e:#}")))?;
+        let server = cfg.get_server().map_err(|e| wrap(format!("{e:#}")))?;
+        ApiClient::with_tls(
+            &server,
+            cfg.should_skip_tls_verify().unwrap_or(false),
+            cfg.get_ca_cert_pem().ok().flatten(),
+            cfg.get_client_cert_pem()
+                .ok()
+                .flatten()
+                .map(String::into_bytes),
+            cfg.get_client_key_pem()
+                .ok()
+                .flatten()
+                .map(String::into_bytes),
+            cfg.get_token().ok().flatten(),
+        )
+        .map_err(|e| wrap(format!("{e:#}")))?
+    } else {
+        // without the remote kubeconfig file, try to use the in-cluster config.
+        // If it is optional, ignore errors.
+        let cc = match rusternetes_client::config::ClientConfig::in_cluster() {
+            Ok(cc) => cc,
+            Err(e) => {
+                if optional {
+                    if std::env::var("KUBERNETES_SERVICE_HOST").is_ok()
+                        || std::env::var("KUBERNETES_SERVICE_HOST_OVERRIDE").is_ok()
+                    {
+                        tracing::warn!(
+                            "failed to read in-cluster kubeconfig for delegated {what}: {e:#}"
+                        );
+                    }
+                    return Ok(None);
+                }
+                return Err(wrap(format!("{e:#}")));
+            }
+        };
+        ApiClient::from_config(&cc).map_err(|e| wrap(format!("{e:#}")))?
+    };
+    // set high qps/burst limits since this will effectively limit API server responsiveness
+    Ok(Some(Arc::new(client.with_rate_limit(200.0, 400.0))))
 }
-
-#[allow(dead_code)]
-type _Settings = RwLock<RequestHeaderSettings>;
 
 #[cfg(test)]
 mod tests {
@@ -451,13 +1190,19 @@ mod tests {
     #[test]
     fn serving_validate_port_range() {
         let mut o = SecureServingOptions::new();
+        // serving.go:137 parses as `(Required && BindPort < 1) || BindPort > 65535`,
+        // so an oversized port gets the "cannot be turned off" wording even when
+        // the port is optional. Replicated as is.
         o.bind_port = 70000;
         assert_eq!(
             o.validate(),
-            vec!["--secure-port 70000 must be between 0 and 65535, inclusive. 0 for turning off secure port"]
+            vec!["--secure-port 70000 must be between 1 and 65535, inclusive. It cannot be turned off with 0"]
         );
         o.bind_port = -1;
-        assert_eq!(o.validate().len(), 1);
+        assert_eq!(
+            o.validate(),
+            vec!["--secure-port -1 must be between 0 and 65535, inclusive. 0 for turning off secure port"]
+        );
         o.bind_port = 0;
         assert!(o.validate().is_empty());
         // serving.go:137: Required && BindPort < 1 || BindPort > 65535
@@ -514,7 +1259,10 @@ mod tests {
     // pflag bool: `--x=false` is accepted.
     #[test]
     fn bool_flags_accept_explicit_false() {
-        let cli = parse(&["--authentication-tolerate-lookup-failure=false", "--disable-http2-serving=false"]);
+        let cli = parse(&[
+            "--authentication-tolerate-lookup-failure=false",
+            "--disable-http2-serving=false",
+        ]);
         let mut a = DelegatingAuthenticationOptions::new();
         a.tolerate_in_cluster_lookup_failure = true;
         cli.authn.apply_to_options(&mut a);
@@ -576,14 +1324,12 @@ mod tests {
     #[test]
     fn self_signed_in_memory_when_no_cert_directory() {
         let mut o = serving_on_loopback();
-        o.maybe_default_with_self_signed_certs(
-            "localhost",
-            &[],
-            &["127.0.0.1".parse().unwrap()],
-        )
-        .unwrap();
+        o.maybe_default_with_self_signed_certs("localhost", &[], &["127.0.0.1".parse().unwrap()])
+            .unwrap();
         let (cert, key) = o.server_cert.generated_cert.clone().unwrap();
-        assert!(String::from_utf8(cert).unwrap().contains("BEGIN CERTIFICATE"));
+        assert!(String::from_utf8(cert)
+            .unwrap()
+            .contains("BEGIN CERTIFICATE"));
         assert!(String::from_utf8(key).unwrap().contains("RSA PRIVATE KEY"));
         // nothing named on disk
         assert!(o.server_cert.cert_key.cert_file.is_empty());
@@ -594,7 +1340,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut o = serving_on_loopback();
         o.server_cert.cert_directory = dir.path().to_str().unwrap().into();
-        o.maybe_default_with_self_signed_certs("localhost", &[], &[]).unwrap();
+        o.maybe_default_with_self_signed_certs("localhost", &[], &[])
+            .unwrap();
         let cert = dir.path().join("kube-controller-manager.crt");
         let key = dir.path().join("kube-controller-manager.key");
         assert!(cert.exists() && key.exists());
@@ -604,7 +1351,8 @@ mod tests {
         // second run: `canReadCertAndKey` -> reuse, no regeneration
         let mut o2 = serving_on_loopback();
         o2.server_cert.cert_directory = dir.path().to_str().unwrap().into();
-        o2.maybe_default_with_self_signed_certs("localhost", &[], &[]).unwrap();
+        o2.maybe_default_with_self_signed_certs("localhost", &[], &[])
+            .unwrap();
         assert_eq!(std::fs::read(&cert).unwrap(), first);
     }
 
@@ -612,11 +1360,13 @@ mod tests {
     fn self_signed_is_skipped_when_cert_files_are_given_or_serving_is_off() {
         let mut o = serving_on_loopback();
         o.server_cert.cert_key.cert_file = "a.crt".into();
-        o.maybe_default_with_self_signed_certs("localhost", &[], &[]).unwrap();
+        o.maybe_default_with_self_signed_certs("localhost", &[], &[])
+            .unwrap();
         assert!(o.server_cert.generated_cert.is_none());
         let mut o = serving_on_loopback();
         o.bind_port = 0;
-        o.maybe_default_with_self_signed_certs("localhost", &[], &[]).unwrap();
+        o.maybe_default_with_self_signed_certs("localhost", &[], &[])
+            .unwrap();
         assert!(o.server_cert.generated_cert.is_none());
     }
 
@@ -626,7 +1376,8 @@ mod tests {
         o.server_cert.cert_directory = "/tmp/somewhere".into();
         o.server_cert.pair_name = String::new();
         assert_eq!(
-            o.maybe_default_with_self_signed_certs("localhost", &[], &[]).unwrap_err(),
+            o.maybe_default_with_self_signed_certs("localhost", &[], &[])
+                .unwrap_err(),
             "PairName is required if CertDirectory is set"
         );
     }
@@ -638,9 +1389,14 @@ mod tests {
         let san = |bind: &str| {
             let mut o = serving_on_loopback();
             o.bind_address = bind.parse().unwrap();
-            o.maybe_default_with_self_signed_certs("host", &[], &[]).unwrap();
+            o.maybe_default_with_self_signed_certs("host", &[], &[])
+                .unwrap();
             let (cert, _) = o.server_cert.generated_cert.clone().unwrap();
-            let der = rustls_pemfile::certs(&mut &cert[..]).next().unwrap().unwrap().to_vec();
+            let der = rustls_pemfile::certs(&mut &cert[..])
+                .next()
+                .unwrap()
+                .unwrap()
+                .to_vec();
             let (_, c) = parse_x509_certificate(&der).unwrap();
             let mut dns = vec![];
             let mut ips = vec![];
@@ -674,8 +1430,14 @@ mod tests {
         assert_eq!(o.request_header.username_headers, vec!["x-remote-user"]);
         assert!(o.request_header.uid_headers.is_empty());
         assert_eq!(o.request_header.group_headers, vec!["x-remote-group"]);
-        assert_eq!(o.request_header.extra_header_prefixes, vec!["x-remote-extra-"]);
-        assert_eq!(o.webhook_retry_backoff, Some(Backoff::default_auth_webhook()));
+        assert_eq!(
+            o.request_header.extra_header_prefixes,
+            vec!["x-remote-extra-"]
+        );
+        assert_eq!(
+            o.webhook_retry_backoff,
+            Some(Backoff::default_auth_webhook())
+        );
         assert_eq!(o.token_request_timeout, Duration::from_secs(10));
         assert!(o.anonymous.as_ref().unwrap().enabled);
     }
@@ -721,7 +1483,10 @@ mod tests {
     #[test]
     fn to_authentication_request_header_config() {
         let o = RequestHeaderAuthenticationOptions::default();
-        assert!(o.to_authentication_request_header_config().unwrap().is_none());
+        assert!(o
+            .to_authentication_request_header_config()
+            .unwrap()
+            .is_none());
 
         let dir = tempfile::tempdir().unwrap();
         let ca = dir.path().join("ca.crt");
@@ -737,7 +1502,10 @@ mod tests {
             extra_header_prefixes: vec!["x-remote-extra-".into()],
             allowed_names: vec!["kube-aggregator".into()],
         };
-        let cfg = o.to_authentication_request_header_config().unwrap().unwrap();
+        let cfg = o
+            .to_authentication_request_header_config()
+            .unwrap()
+            .unwrap();
         let s = cfg.settings.read().unwrap().clone();
         assert_eq!(s.username_headers, vec!["x-remote-user"]);
         assert_eq!(s.uid_headers, vec!["x-remote-uid"]);
@@ -781,7 +1549,10 @@ mod tests {
     #[test]
     fn go_duration_flag_values() {
         assert_eq!(parse_go_duration_arg("1m30s"), Ok(Duration::from_secs(90)));
-        assert_eq!(parse_go_duration_arg("250ms"), Ok(Duration::from_millis(250)));
+        assert_eq!(
+            parse_go_duration_arg("250ms"),
+            Ok(Duration::from_millis(250))
+        );
         assert!(parse_go_duration_arg("ten").is_err());
     }
 
@@ -795,7 +1566,10 @@ mod tests {
         assert_eq!(o.client_timeout, Duration::from_secs(10));
         assert_eq!(o.always_allow_paths, vec!["/healthz", "/readyz", "/livez"]);
         assert_eq!(o.always_allow_groups, vec!["system:masters"]);
-        assert_eq!(o.webhook_retry_backoff, Some(Backoff::default_auth_webhook()));
+        assert_eq!(
+            o.webhook_retry_backoff,
+            Some(Backoff::default_auth_webhook())
+        );
     }
 
     #[test]
@@ -841,9 +1615,12 @@ mod tests {
             groups: groups.iter().map(|g| g.to_string()).collect(),
             extra: Default::default(),
         };
-        let get = |user: UserInfo, path: &str| RequestAttributes::new_non_resource(user, "get", path);
+        let get =
+            |user: UserInfo, path: &str| RequestAttributes::new_non_resource(user, "get", path);
         assert_eq!(
-            a.authorize(&get(u("a", &["system:masters"]), "/metrics")).await.unwrap(),
+            a.authorize(&get(u("a", &["system:masters"]), "/metrics"))
+                .await
+                .unwrap(),
             Decision::Allow
         );
         assert_eq!(
@@ -862,7 +1639,7 @@ mod tests {
         let p = dir.join("kubeconfig");
         std::fs::write(
             &p,
-            "apiVersion: v1\nkind: Config\nclusters:\n- cluster:\n    server: http://localhost:56789\n  name: cluster\ncontexts:\n- context:\n    cluster: cluster\n  name: cluster\ncurrent-context: cluster\n",
+            "apiVersion: v1\nkind: Config\nclusters:\n- cluster:\n    server: http://localhost:56789\n  name: cluster\ncontexts:\n- context:\n    cluster: cluster\n    user: u\n  name: cluster\ncurrent-context: cluster\nusers:\n- name: u\n  user: {}\n",
         )
         .unwrap();
         p.to_str().unwrap().to_string()
@@ -872,8 +1649,8 @@ mod tests {
     fn get_client_from_a_kubeconfig() {
         let dir = tempfile::tempdir().unwrap();
         let k = write_kubeconfig(dir.path());
-        assert!(get_client(&k, false, "authentication", None).unwrap().is_some());
-        assert!(get_client("/nonexistent", true, "authentication", None).is_err());
+        assert!(get_client(&k, false, "authentication").unwrap().is_some());
+        assert!(get_client("/nonexistent", true, "authentication").is_err());
     }
 
     // authentication.go:473-479: no kubeconfig and not in a cluster: nil when
@@ -885,8 +1662,8 @@ mod tests {
         {
             return; // running inside a cluster
         }
-        assert!(get_client("", true, "authentication", None).unwrap().is_none());
-        let err = get_client("", false, "authentication", None).err().unwrap();
+        assert!(get_client("", true, "authentication").unwrap().is_none());
+        let err = get_client("", false, "authentication").err().unwrap();
         assert!(
             err.starts_with("failed to get delegated authentication kubeconfig: "),
             "{err}"
@@ -895,7 +1672,9 @@ mod tests {
 
     // ---- authentication_test.go TestApplyToFallback
 
-    async fn apply_authn(o: &DelegatingAuthenticationOptions) -> Result<AuthenticationInfo, String> {
+    async fn apply_authn(
+        o: &DelegatingAuthenticationOptions,
+    ) -> Result<AuthenticationInfo, String> {
         o.apply_to(None).await
     }
 
@@ -975,7 +1754,10 @@ mod tests {
                 peer_certs: &[],
             })
             .await;
-        assert!(r.is_err(), "token errors against an unreachable server: {r:?}");
+        assert!(
+            r.is_err(),
+            "token errors against an unreachable server: {r:?}"
+        );
         // no credentials: anonymous
         let r = a
             .authenticate_request(&mut crate::secure_serving::authn::AuthRequest {
@@ -996,6 +1778,9 @@ mod tests {
         o.remote_kubeconfig_file_optional = true;
         o.client_ca = "/nonexistent/ca.crt".into();
         let err = apply_authn(&o).await.err().unwrap();
-        assert!(err.starts_with("unable to load client CA provider: "), "{err}");
+        assert!(
+            err.starts_with("unable to load client CA provider: "),
+            "{err}"
+        );
     }
 }
