@@ -13,6 +13,7 @@ path = "src/lib.rs"
 rusternetes-common = { path = "../common", features = ["axum-support"] }
 rusternetes-protobuf = { path = "../protobuf" }
 rusternetes-storage = { path = "../storage" }
+rusternetes-client = { path = "../client" } # delegated TokenReview/SubjectAccessReview client (#3437)
 axum = { workspace = true, features = ["ws"] }
 serde.workspace = true
 serde_json.workspace = true
@@ -26,9 +27,22 @@ base64 = "0.22"
 bytes = "1.5"
 http-body = "1"
 prometheus.workspace = true
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls = { workspace = true }
+rustls-pemfile = "2.1"
+futures = { workspace = true }
+async-trait = { workspace = true }
+clap = { workspace = true }
+sha2 = "0.10"
+hmac = "0.12"
+tokio = { workspace = true, features = ["time", "net", "sync", "rt", "macros"] }
+tower = { workspace = true }
+http-body-util = "0.1"
 x509-parser = { workspace = true } # parse verified client-cert subject (CN→user / O→groups, #1129)
 
 [dev-dependencies]
 rcgen = { workspace = true } # generate client certs with custom CN/O for x509-authn tests
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }
 tower = { workspace = true }
+tempfile = "3"
+reqwest = { workspace = true }

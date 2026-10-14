@@ -1,6 +1,7 @@
 pub mod cbor;
 pub mod request_header;
 pub mod response;
+pub mod secure_serving;
 pub mod table;
 
 use axum::{
