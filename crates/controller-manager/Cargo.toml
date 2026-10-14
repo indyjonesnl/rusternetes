@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 mimalloc = { version = "0.1", optional = true }
-rusternetes-common = { path = "../common", features = ["axum-support"] }
+rusternetes-common = { path = "../common", features = ["axum-support", "clap-support"] }
 # api-client: StorageBackend::Api + the ApiStorage adapter used by run_with_api.
 rusternetes-storage = { path = "../storage", features = ["api-client"] }
 rusternetes-client = { path = "../client" }

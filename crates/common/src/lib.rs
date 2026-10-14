@@ -28,6 +28,7 @@ pub mod event_correlator;
 pub mod feature_gates;
 pub mod field_selector;
 pub mod fieldmanager;
+pub mod flagz;
 pub mod go_duration;
 pub mod jsonpath;
 pub mod label_selector;

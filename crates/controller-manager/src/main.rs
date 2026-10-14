@@ -490,6 +490,7 @@ fn spawn_metrics_server(
     port: u16,
     gather: fn() -> String,
     effective_version: rusternetes_common::compatibility::EffectiveVersion,
+    flags: rusternetes_common::flagz::NamedFlagSetsReader,
 ) {
     if port == 0 {
         return;
@@ -498,6 +499,13 @@ fn spawn_metrics_server(
         let app = axum::Router::new().route(
             "/metrics",
             axum::routing::get(move || async move { gather() }),
+        );
+        // `flagz.Install` behind the `ComponentFlagz` gate
+        // (cmd/kube-controller-manager/app/controllermanager.go:219-223).
+        let app = rusternetes_common::flagz::install_if_enabled(
+            app,
+            "kube-controller-manager",
+            Some(Box::new(flags)),
         );
         // `statusz.Install` behind the `ComponentStatusz` gate
         // (cmd/kube-controller-manager/app/controllermanager.go:225-234), with
@@ -524,6 +532,7 @@ fn spawn_metrics_server(
 async fn run_api_mode(
     args: Args,
     effective_version: rusternetes_common::compatibility::EffectiveVersion,
+    flags: rusternetes_common::flagz::NamedFlagSetsReader,
 ) -> Result<()> {
     use rusternetes_client::http::ApiClient;
     use rusternetes_client::kubeconfig::KubeConfig;
@@ -534,6 +543,7 @@ async fn run_api_mode(
         args.metrics_port,
         rusternetes_controller_manager::controllers::gather_metrics,
         effective_version,
+        flags,
     );
 
     let (ca_pem, kube_insecure, token, client_cert, client_key) =
@@ -662,7 +672,14 @@ fn apply_feature_gates(args: &Args) -> Result<rusternetes_common::compatibility:
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    // `options.Flags` / `ParsedFlags` -> `flagz.NamedFlagSetsReader`
+    // (cmd/kube-controller-manager/app/options/options.go:535-539).
+    let cmd = <Args as clap::CommandFactory>::command();
+    let matches = cmd.clone().get_matches();
+    let flags = rusternetes_common::flagz::flags_from_clap(&cmd, &matches);
+    let args = <Args as clap::FromArgMatches>::from_arg_matches(&matches)
+        .map_err(|e| e.exit())
+        .unwrap();
     let effective_version = apply_feature_gates(&args)?;
 
     rusternetes_common::tracing::init_basic_tracing("controller-manager", &args.log_level)?;
@@ -673,13 +690,14 @@ async fn main() -> Result<()> {
             "Starting Rusternetes Controller Manager (API mode) {}",
             rusternetes_common::build_info::version_line()
         );
-        return run_api_mode(args, effective_version).await;
+        return run_api_mode(args, effective_version, flags).await;
     }
 
     spawn_metrics_server(
         args.metrics_port,
         controllers::gather_metrics,
         effective_version,
+        flags,
     );
 
     info!(
