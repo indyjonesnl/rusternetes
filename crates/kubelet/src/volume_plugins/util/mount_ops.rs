@@ -7,7 +7,7 @@
 //!
 //! Also ported for the nfs plugin (#3286): `UnmountWithForce`/`tryUnmount`/
 //! `forceUmount`, `CanSafelySkipMountPointCheck`, `IsLikelyNotMountPoint`
-//! (the `isLikelyNotMountPointStat` fallback, not the statx fast path) and
+//! (`isLikelyNotMountPointStatx` with the `isLikelyNotMountPointStat` fallback) and
 //! `CleanupMountPoint`/`CleanupMountWithForce` (`mount_helper_common.go`).
 //!
 //! Not ported (tracked in #3193): `detectSystemd`/`detectSafeNotMountedBehavior` probing (the caller states
@@ -487,13 +487,29 @@ impl Mounter {
         file: &str,
         statx_fn: impl Fn(&str) -> Result<StatxInfo, StatxError>,
     ) -> Result<bool, StatxError> {
-        let _ = (file, statx_fn);
-        unimplemented!()
+        let stat = statx_fn(file)?;
+        if stat.attributes_mask != 0 && stat.attributes_mask & ROOT_ATTR != 0 {
+            // No need to check rootStat if STATX_ATTR_MOUNT_ROOT is supported.
+            return Ok(stat.attributes & ROOT_ATTR == 0);
+        }
+        // filepath.Dir(strings.TrimSuffix(file, "/"))
+        let trimmed = file.strip_suffix('/').unwrap_or(file);
+        let root = match std::path::Path::new(trimmed).parent() {
+            Some(p) if p.as_os_str().is_empty() => ".",
+            Some(p) => p.to_str().unwrap_or("."),
+            None => trimmed,
+        };
+        let root_stat = statx_fn(root)?;
+        Ok(stat.dev_major == root_stat.dev_major && stat.dev_minor == root_stat.dev_minor)
     }
 
     /// `IsLikelyNotMountPoint` (`mount_linux.go:495-503`).
     pub fn is_likely_not_mount_point(&self, file: &str) -> io::Result<bool> {
-        self.is_likely_not_mount_point_stat(file)
+        match Self::is_likely_not_mount_point_statx_with(file, statx) {
+            Err(StatxError::NotSupported) => self.is_likely_not_mount_point_stat(file),
+            Err(StatxError::Io(e)) => Err(e),
+            Ok(b) => Ok(b),
+        }
     }
 
     /// `isLikelyNotMountPointStat` (`mount_linux.go:443-458`), the fallback
@@ -742,6 +758,40 @@ fn statfs_flags(path: &str) -> io::Result<u64> {
         return Err(io::Error::last_os_error());
     }
     Ok(s.f_flag as u64)
+}
+
+const ROOT_ATTR: u64 = libc::STATX_ATTR_MOUNT_ROOT as u64;
+
+/// `statx` (`mount_linux.go:430-441`): `AT_FDCWD`, `AT_STATX_DONT_SYNC`,
+/// mask 0; `ENOSYS` becomes `errStatxNotSupport`.
+fn statx(file: &str) -> Result<StatxInfo, StatxError> {
+    let c = std::ffi::CString::new(file)
+        .map_err(|_| StatxError::Io(io::Error::from_raw_os_error(libc::EINVAL)))?;
+    let mut st: libc::statx = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is NUL-terminated and `st` is a valid out-pointer.
+    let rc = unsafe {
+        libc::statx(
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            libc::AT_STATX_DONT_SYNC,
+            0,
+            &mut st,
+        )
+    };
+    if rc != 0 {
+        let e = io::Error::last_os_error();
+        return Err(if e.raw_os_error() == Some(libc::ENOSYS) {
+            StatxError::NotSupported
+        } else {
+            StatxError::Io(e)
+        });
+    }
+    Ok(StatxInfo {
+        attributes: st.stx_attributes,
+        attributes_mask: st.stx_attributes_mask,
+        dev_major: st.stx_dev_major,
+        dev_minor: st.stx_dev_minor,
+    })
 }
 
 /// Subset of `unix.Statx_t` that `isLikelyNotMountPointStatx` reads.
