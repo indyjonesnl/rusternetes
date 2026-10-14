@@ -23,9 +23,9 @@ const UNMOUNT_TIMEOUT: Duration = Duration::from_secs(60);
 /// `ProbeVolumePlugins` (`cmd/kubelet/app/plugins.go`).
 ///
 /// Not ported: `Recycle` (`nfs.go:156-173`, the PV controller's recycler
-/// pod, not a kubelet concern) and the `MetricsProvider` embedded in `nfs`
-/// (`volume.NewMetricsStatFS`, `nfs.go:131`, `:150`): no plugin here exposes
-/// volume metrics yet.
+/// pod, not a kubelet concern). The `MetricsProvider` embedded in `nfs`
+/// (`volume.NewMetricsStatFS`, `nfs.go:131`, `:150`) is on the concrete
+/// mounter/unmounter; the `Mounter`/`Unmounter` traits do not yet require it.
 pub struct NfsPlugin {
     host: Arc<dyn VolumeHost>,
 }
@@ -279,13 +279,13 @@ struct NfsUnmounter(Nfs);
 
 impl MetricsProvider for NfsMounter {
     fn get_metrics(&self) -> Result<Metrics> {
-        Err(anyhow!("unimplemented"))
+        self.nfs.metrics.get_metrics()
     }
 }
 
 impl MetricsProvider for NfsUnmounter {
     fn get_metrics(&self) -> Result<Metrics> {
-        Err(anyhow!("unimplemented"))
+        self.0.metrics.get_metrics()
     }
 }
 

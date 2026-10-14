@@ -4,6 +4,7 @@
 
 use crate::volume_plugins::plugin::{Metrics, MetricsProvider};
 use anyhow::Result;
+use rusternetes_common::quantity::{Format, Quantity};
 
 /// `MetricsError` codes (`metrics_errors.go:23-31`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,9 +44,82 @@ impl MetricsStatFs {
     }
 }
 
+/// `NewNoPathDefinedError` (`metrics_errors.go:56-61`).
+fn no_path_defined_error() -> MetricsError {
+    MetricsError {
+        code: MetricsErrorCode::NoPathDefined,
+        msg: "no path defined for disk usage metrics.".to_string(),
+    }
+}
+
+/// `NewFsInfoFailedError` (`metrics_errors.go:64-69`).
+fn fs_info_failed_error(err: &std::io::Error) -> MetricsError {
+    MetricsError {
+        code: MetricsErrorCode::FsInfoFailed,
+        msg: format!("failed to get FsInfo due to error {err}"),
+    }
+}
+
+/// `fs.Info` (linux, `fs.go:39-60`): (available bytes, byte capacity, byte
+/// usage, total inodes, inodes free, inode usage).
+fn fs_info(path: &str) -> std::io::Result<(i64, i64, i64, i64, i64, i64)> {
+    let c = std::ffi::CString::new(path)
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    // SAFETY: `c` is NUL-terminated; `st` is a valid out-pointer.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let bsize = st.f_bsize as i64;
+    let available = st.f_bavail as i64 * bsize;
+    let capacity = st.f_blocks as i64 * bsize;
+    let usage = (st.f_blocks as i64 - st.f_bfree as i64) * bsize;
+    let inodes = st.f_files as i64;
+    let inodes_free = st.f_ffree as i64;
+    Ok((
+        available,
+        capacity,
+        usage,
+        inodes,
+        inodes_free,
+        inodes - inodes_free,
+    ))
+}
+
+impl MetricsStatFs {
+    /// `getFsInfo` (`metrics_statfs.go:63-75`): every quantity is
+    /// `resource.BinarySI`.
+    fn get_fs_info(&self, metrics: &mut Metrics) -> Result<()> {
+        let (available, capacity, usage, inodes, inodes_free, inodes_used) =
+            fs_info(&self.path).map_err(|e| fs_info_failed_error(&e))?;
+        let q = |v| Some(Quantity::from_value(v, Format::BinarySI));
+        metrics.available = q(available);
+        metrics.capacity = q(capacity);
+        metrics.used = q(usage);
+        metrics.inodes = q(inodes);
+        metrics.inodes_free = q(inodes_free);
+        metrics.inodes_used = q(inodes_used);
+        Ok(())
+    }
+}
+
 impl MetricsProvider for MetricsStatFs {
+    /// `GetMetrics` (`metrics_statfs.go:46-60`).
+    ///
+    /// Not ported: `servermetrics.CollectVolumeStatCalDuration("statfs", ..)`
+    /// (no kubelet volume-stat histogram exists yet). Idiom difference:
+    /// upstream returns the partial `*Metrics` alongside the error; the
+    /// `Result` here carries only the error.
     fn get_metrics(&self) -> Result<Metrics> {
-        Err(anyhow::anyhow!("unimplemented"))
+        if self.path.is_empty() {
+            return Err(no_path_defined_error().into());
+        }
+        let mut metrics = Metrics {
+            time: Some(chrono::Utc::now()),
+            ..Default::default()
+        };
+        self.get_fs_info(&mut metrics)?;
+        Ok(metrics)
     }
 }
 
