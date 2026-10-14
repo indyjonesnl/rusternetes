@@ -32,6 +32,7 @@ use crate::resources::{
 };
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::{is_dns1035_label, is_dns1123_subdomain};
+use crate::validation::structural::Structural;
 use crate::validation::webhookconfiguration::{validate_webhook_service, validate_webhook_url};
 use std::collections::HashSet;
 
@@ -149,21 +150,21 @@ fn immutable<T: serde::Serialize>(path: &Path, value: &T) -> Error {
 /// `ValidateCustomResourceSelectableFields` (`validation.go:847-878`).
 ///
 /// Upstream resolves each `jsonPath` against the version's **structural**
-/// schema with `cel.ValidFieldPath(..., WithFieldPathAllowArrayNotation(false))`
-/// and then checks three things the required-and-unique half cannot: that the
-/// path exists, that it does not point into `metadata`, and that its leaf is a
-/// scalar. Uniqueness is on the *resolved* path, so two spellings of the same
-/// field collide.
+/// schema (`structuralschema.NewStructural`, `validation.go:314`) with
+/// `cel.ValidFieldPath(..., WithFieldPathAllowArrayNotation(false))` and then
+/// checks three things the required-and-unique half cannot: that the path
+/// exists, that it does not point into `metadata`, and that its leaf is a
+/// scalar. Uniqueness is on the *resolved* path (`path.String()`), so two
+/// spellings of the same field collide.
 ///
-/// Deviation, stated deliberately: Rusternetes has no structural-schema
-/// builder, so the path is resolved against the declared `properties` /
-/// `additionalProperties` of the OpenAPI schema as written. A field reachable
-/// only through `allOf`/`anyOf`/`oneOf` — which a structural schema would have
-/// flattened — is reported as invalid here. The rest of the contract, including
-/// every message, is upstream's.
+/// `schema` is `None` when `NewStructural` failed: upstream appends the error
+/// and still passes the nil `*Structural` on (`validation.go:314-317`), so
+/// `ValidFieldPath` nil-dereferences it on the first `.` token. That is
+/// replicated as a real panic (see [`valid_field_path`]); the api-server's
+/// outermost panic-recovery layer turns it into upstream's 500.
 pub fn validate_custom_resource_selectable_fields(
     selectable_fields: &[SelectableField],
-    schema: Option<&JSONSchemaProps>,
+    schema: Option<&Structural>,
     fld_path: &Path,
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
@@ -176,16 +177,6 @@ pub fn validate_custom_resource_selectable_fields(
             errs.push(Error::required(&sp, ""));
             continue;
         }
-        // Without a schema there is nothing to resolve against; upstream always
-        // has one here because `requireOpenAPISchema` has already rejected a
-        // version without it.
-        let Some(schema) = schema else {
-            if !unique.insert(selectable.json_path.clone()) {
-                errs.push(Error::duplicate(&sp, selectable.json_path.clone()));
-            }
-            continue;
-        };
-
         let (path, found) = match valid_field_path(&selectable.json_path, schema) {
             Ok(resolved) => resolved,
             Err(e) => {
@@ -198,7 +189,9 @@ pub fn validate_custom_resource_selectable_fields(
             }
         };
 
-        if path.first().map(String::as_str) == Some("metadata") {
+        // `path.Root().String() == "metadata"` (`:861`): only a named first
+        // element, never a `[key]`.
+        if matches!(path.first(), Some((name, false)) if name == "metadata") {
             errs.push(Error::invalid(
                 &sp,
                 selectable.json_path.clone(),
@@ -212,7 +205,7 @@ pub fn validate_custom_resource_selectable_fields(
                 "must point to a field of type string, boolean or integer. Enum string fields and strings with formats are allowed.",
             ));
         }
-        if !unique.insert(path.join(".")) {
+        if !unique.insert(field_path_string(&path)) {
             errs.push(Error::duplicate(&sp, selectable.json_path.clone()));
         }
     }
@@ -224,27 +217,51 @@ pub fn validate_custom_resource_selectable_fields(
     errs
 }
 
-/// `allowedSelectableFieldSchema` (`validation.go:880-890`).
-fn allowed_selectable_field_schema(schema: &JSONSchemaProps) -> bool {
-    matches!(
-        schema.type_.as_deref(),
-        Some("string") | Some("boolean") | Some("integer")
-    )
+/// `field.Path.String()`: the root element is bare, later named elements are
+/// `.name`, and keys are `[key]`.
+fn field_path_string(path: &[(String, bool)]) -> String {
+    let mut out = String::new();
+    for (i, (name, is_key)) in path.iter().enumerate() {
+        if *is_key {
+            out.push_str(&format!("[{name}]"));
+        } else if i == 0 {
+            out.push_str(name);
+        } else {
+            out.push('.');
+            out.push_str(name);
+        }
+    }
+    out
 }
+
+/// `allowedSelectableFieldSchema` (`validation.go:880-890`); a nil schema is
+/// not allowed.
+fn allowed_selectable_field_schema(schema: Option<&Structural>) -> bool {
+    schema.is_some_and(|s| matches!(s.generic.type_.as_str(), "string" | "boolean" | "integer"))
+}
+
+/// The resolved path and the leaf schema returned by [`valid_field_path`].
+type ResolvedFieldPath<'a> = (Vec<(String, bool)>, Option<&'a Structural>);
 
 /// `cel.ValidFieldPath`
 /// (`staging/src/k8s.io/apiextensions-apiserver/pkg/apiserver/schema/cel/validation.go:557-676`)
 /// with `allowArrayNotation` false, which is how
 /// `ValidateCustomResourceSelectableFields` calls it.
 ///
-/// Returns the resolved path segments and the schema of the leaf. Every error
+/// Returns the resolved path (`(name, is_key)` per element: `Child` or `Key`)
+/// and the schema of the leaf, which is `None` after stepping into a
+/// boolean-only `additionalProperties` (`AdditionalProperties.Structural` is
+/// nil there). Stepping *through* a nil schema panics, as the Go does: the
+/// `.` arm evaluates `if schema.Properties != nil {` (`:660`) on the nil
+/// `*Structural` (nil from a failed `NewStructural`, or from
+/// `schema = schema.AdditionalProperties.Structural` at `:566`). Every error
 /// string is upstream's, because a client reads them.
 fn valid_field_path<'a>(
     json_path: &str,
-    schema: &'a JSONSchemaProps,
-) -> Result<(Vec<String>, &'a JSONSchemaProps), String> {
-    let mut path: Vec<String> = Vec::new();
-    let mut schema = schema;
+    schema: Option<&'a Structural>,
+) -> Result<ResolvedFieldPath<'a>, String> {
+    let mut path: Vec<(String, bool)> = Vec::new();
+    let mut schema: Option<&Structural> = schema;
     let mut tokens = tokenize_field_path(json_path).into_iter();
 
     while let Some(token) = tokens.next() {
@@ -255,21 +272,22 @@ fn valid_field_path<'a>(
                 let Some(name) = tokens.next() else {
                     return Err("unexpected end of JSON path".to_string());
                 };
-                if schema.properties.is_some() {
-                    let Some(next) = schema.properties.as_ref().and_then(|p| p.get(&name)) else {
-                        return Err("does not refer to a valid field".to_string());
-                    };
-                    path.push(name);
-                    schema = next;
-                } else if let Some(additional) = schema.additional_properties.as_deref() {
-                    // An unnamed key: the leaf is the map's value schema.
-                    let JSONSchemaPropsOrBool::Schema(next) = additional else {
-                        return Err("does not refer to a valid field".to_string());
-                    };
-                    path.push(name);
-                    schema = next;
+                let invalid = || "does not refer to a valid field".to_string();
+                // Go nil-pointer dereference at `schema/cel/validation.go:660`.
+                let current = schema
+                    .expect("runtime error: invalid memory address or nil pointer dereference");
+                // `if schema.Properties != nil ... else if
+                // schema.AdditionalProperties != nil` (`:660-666`);
+                // `NewStructural` only sets `Properties` when non-empty.
+                if !current.properties.is_empty() {
+                    let next = current.properties.get(&name).ok_or_else(invalid)?;
+                    path.push((name, false));
+                    schema = Some(next);
+                } else if let Some(additional) = current.additional_properties.as_deref() {
+                    path.push((name, true));
+                    schema = additional.structural.as_ref();
                 } else {
-                    return Err("does not refer to a valid field".to_string());
+                    return Err(invalid());
                 }
             }
             other => return Err(format!("expected [ or . but got: {other}")),
@@ -440,10 +458,10 @@ fn validate_custom_resource_definition_spec_opts(
             }
         }
         if let Some(fields) = &version.selectable_fields {
-            errs.extend(validate_custom_resource_selectable_fields(
+            errs.extend(validate_version_selectable_fields(
                 fields,
                 version.schema.as_ref().map(|s| &s.open_apiv3_schema),
-                &vp.child("selectableFields"),
+                &vp,
             ));
         }
         errs.extend(validate_subresources(
@@ -514,6 +532,48 @@ fn validate_custom_resource_definition_validation(
         Err(msg) => vec![Error::invalid(&schema_path, String::new(), msg)],
         Ok(ss) => crate::validation::structural::validate_structural(&schema_path, &ss),
     }
+}
+
+/// The `len(version.SelectableFields) > 0` block of
+/// `validateCustomResourceDefinitionVersion` (`validation.go:311-318`).
+///
+/// An absent `openAPIV3Schema` decodes as the zero schema here (see
+/// `validate_custom_resource_definition_validation`), which upstream sees as a
+/// nil pointer.
+fn validate_version_selectable_fields(
+    fields: &[SelectableField],
+    schema: Option<&JSONSchemaProps>,
+    version_path: &Path,
+) -> ErrorList {
+    if fields.is_empty() {
+        return Vec::new();
+    }
+    let selectable_path = version_path.child("selectableFields");
+    let Some(schema) = schema.filter(|s| **s != JSONSchemaProps::default()) else {
+        return vec![Error::invalid(
+            &selectable_path,
+            String::new(),
+            "may only be set when `version.schema.openAPIV3Schema` is not included",
+        )];
+    };
+    let mut errs: ErrorList = Vec::new();
+    let structural = match crate::validation::structural::new_structural(schema) {
+        Ok(ss) => Some(ss),
+        Err(msg) => {
+            errs.push(Error::invalid(
+                &version_path.child("schema.openAPIV3Schema"),
+                String::new(),
+                msg,
+            ));
+            None
+        }
+    };
+    errs.extend(validate_custom_resource_selectable_fields(
+        fields,
+        structural.as_ref(),
+        &selectable_path,
+    ));
+    errs
 }
 
 /// `schemaIsNonStructural` (`validation.go:1769-1777`).
@@ -1652,3 +1712,7 @@ AiEAhWF2/JiVNXisqXic1Dfy761y8wW/Io2IJoBMvcYxo4E=
 #[cfg(test)]
 #[path = "crd_structural_tests.rs"]
 mod structural_schema_tests;
+
+#[cfg(test)]
+#[path = "crd_selectable_tests.rs"]
+mod selectable_fields_tests;

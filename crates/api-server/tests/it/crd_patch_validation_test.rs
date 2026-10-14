@@ -335,3 +335,34 @@ async fn a_resolvable_scalar_selectable_field_is_accepted() {
         .await;
     assert!(status.is_success(), "{status} {answer}");
 }
+
+/// `NewStructural` rejects `items` as an array, so `validation.go:314-317`
+/// carries a nil `*Structural` into `ValidFieldPath`, which dereferences it at
+/// `schema/cel/validation.go:660`. The Go panic is answered by
+/// `WithPanicRecovery` (apiserver/pkg/server/filters/wrap.go:56) with a plain
+/// text 500 (#3375).
+#[tokio::test]
+async fn selectable_field_on_unconvertible_schema_panics_into_a_500() {
+    let api = TestApiServer::new();
+    let mut body = crd_body("panics", "Panic", json!({}));
+    body["spec"]["versions"][0]["schema"] = json!({ "openAPIV3Schema": {
+        "type": "object",
+        "properties": { "foo": { "type": "string" } },
+        "items": [{ "type": "string" }]
+    }});
+    body["spec"]["versions"][0]["selectableFields"] = json!([{ "jsonPath": ".foo" }]);
+    let (status, _, raw, _) = api
+        .send_full(
+            "POST",
+            CRDS,
+            Some("application/json"),
+            None,
+            Some(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+    assert_eq!(status.as_u16(), 500);
+    assert_eq!(
+        String::from_utf8_lossy(&raw),
+        "This request caused apiserver to panic. Look in the logs for details.\n"
+    );
+}

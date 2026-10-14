@@ -44,7 +44,9 @@ fn two_version_crd() -> Value {
     // None conversion strategy (omit spec.conversion). Both versions declare the
     // same top-level selectable field `.color`, so the only cross-version
     // difference is apiVersion — which the watch must rewrite to the requested
-    // version. schema=None ⇒ no pruning, so the top-level `color` survives.
+    // version. Upstream rejects `selectableFields` without an
+    // `openAPIV3Schema` (validation.go:311-312), so each version declares
+    // `color` as a string property; that also keeps it from being pruned.
     json!({
         "apiVersion": "apiextensions.k8s.io/v1",
         "kind": "CustomResourceDefinition",
@@ -63,12 +65,20 @@ fn two_version_crd() -> Value {
                     "name": "v1",
                     "served": true,
                     "storage": true,
+                    "schema": { "openAPIV3Schema": {
+                        "type": "object",
+                        "properties": { "color": { "type": "string" } }
+                    } },
                     "selectableFields": [ { "jsonPath": ".color" } ]
                 },
                 {
                     "name": "v2",
                     "served": true,
                     "storage": false,
+                    "schema": { "openAPIV3Schema": {
+                        "type": "object",
+                        "properties": { "color": { "type": "string" } }
+                    } },
                     "selectableFields": [ { "jsonPath": ".color" } ]
                 }
             ]
