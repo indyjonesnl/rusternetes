@@ -78,7 +78,7 @@ pub trait TokenAuthenticator: Send + Sync {
 
 /// `utilerrors.NewAggregate(errs).Error()` (errors.go): nil for none, the
 /// message for one, `[a, b]` for several distinct messages.
-fn aggregate(errs: &[String]) -> Option<String> {
+pub(crate) fn aggregate(errs: &[String]) -> Option<String> {
     if errs.is_empty() {
         return None;
     }
@@ -267,6 +267,7 @@ pub struct UnionAuthenticator {
 
 impl UnionAuthenticator {
     /// `union.New`: a single handler is returned as is.
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(handlers: Vec<Arc<dyn RequestAuthenticator>>) -> Arc<dyn RequestAuthenticator> {
         Self::build(handlers, false)
     }
@@ -1131,6 +1132,7 @@ pub struct DelegatingAuthenticatorConfig {
 
 impl DelegatingAuthenticatorConfig {
     /// `DelegatingAuthenticatorConfig.New` (delegating.go:61-131).
+    #[allow(clippy::new_ret_no_self)] // `DelegatingAuthenticatorConfig.New`
     pub fn new(&self) -> Result<Arc<dyn RequestAuthenticator>, String> {
         let mut authenticators: Vec<Arc<dyn RequestAuthenticator>> = vec![];
 
@@ -1702,7 +1704,10 @@ mod tests {
         let p = pki("ca");
         let der = client_cert(&p, "system:kube-scheduler", &["g1"], true);
         let a = X509Authenticator::new_dynamic(ca_content(&p));
-        let r = run_certs(&a, &[der.clone()]).await.unwrap().unwrap();
+        let r = run_certs(&a, std::slice::from_ref(&der))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(r.user.username, "system:kube-scheduler");
         assert_eq!(r.user.groups, vec!["g1".to_string()]); // rcgen keeps one value per DN type
         use sha2::{Digest, Sha256};
@@ -1781,7 +1786,7 @@ mod tests {
         let content = ca_content(&a_pki);
         let a = X509Authenticator::new_dynamic(content.clone());
         let der = client_cert(&b_pki, "u", &[], true);
-        assert!(run_certs(&a, &[der.clone()]).await.is_err());
+        assert!(run_certs(&a, std::slice::from_ref(&der)).await.is_err());
         assert!(content.set_pem(b_pki.ca_pem.as_bytes()).unwrap());
         assert!(run_certs(&a, &[der]).await.unwrap().is_some());
         // same bytes again: hasCAChanged is false
