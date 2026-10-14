@@ -108,6 +108,9 @@ impl ComponentSecureServing {
             Some(authorization.authorizer),
             authentication.authenticator,
         );
+        if let Ok(addr) = info.local_addr() {
+            tracing::info!("Serving securely on {addr}");
+        }
         serve::serve(handler, info).map(Some)
     }
 }
