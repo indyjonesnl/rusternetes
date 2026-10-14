@@ -188,7 +188,7 @@ rusternetes-scheduler [OPTIONS]
 | `--data-dir` | `./data/rusternetes.db` | SQLite path |
 | `--log-level` | `info` | Log level |
 | `--interval` | `2` | Scheduling interval (seconds) |
-| `--metrics-port` | `8081` | Metrics server port |
+| `--secure-port` | `10259` | HTTPS port for `/metrics`, `/statusz`, `/flagz` (authn/authz via `--authentication-kubeconfig` / `--authorization-kubeconfig`) |
 | `--enable-leader-election` | `false` | Enable leader election (HA) |
 | `--leader-election-identity` | — | Unique identity per instance |
 | `--leader-election-lock-key` | `/rusternetes/scheduler/leader` | Lock key |
