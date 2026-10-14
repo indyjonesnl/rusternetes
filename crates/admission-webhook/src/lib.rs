@@ -878,6 +878,39 @@ impl<S: Storage> AdmissionWebhookManager<S> {
         .await
     }
 
+    /// The ValidatingAdmissionWebhook plugin's `Validate`, timed as
+    /// `WithControllerMetrics(plugin, "ValidatingAdmissionWebhook")`
+    /// (admission/metrics/metrics.go:63-66, :102-113): `rejected` is
+    /// `err != nil`, a denial being the error the plugin returns.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_validating_webhooks_with_dryrun(
+        &self,
+        operation: &Operation,
+        gvk: &GroupVersionKind,
+        gvr: &GroupVersionResource,
+        namespace: Option<&str>,
+        name: &str,
+        object: Option<Value>,
+        old_object: Option<Value>,
+        user_info: &UserInfo,
+        dry_run: bool,
+    ) -> Result<AdmissionResponse> {
+        let start = std::time::Instant::now();
+        let result = self
+            .validate_webhooks_dryrun(
+                operation, gvk, gvr, namespace, name, object, old_object, user_info, dry_run,
+            )
+            .await;
+        admission_metrics::observe_admission_controller(
+            start.elapsed(),
+            matches!(result, Err(_) | Ok(AdmissionResponse::Deny(_))),
+            operation,
+            admission_metrics::STEP_VALIDATE,
+            "ValidatingAdmissionWebhook",
+        );
+        result
+    }
+
     /// Run validating webhooks honoring the request's dry-run state.
     ///
     /// When `dry_run=true`:
@@ -888,7 +921,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
     /// - The `dryRun: true` field is set on the `AdmissionReviewRequest` so the
     ///   webhook can short-circuit side-effects on its end.
     #[allow(clippy::too_many_arguments)]
-    pub async fn run_validating_webhooks_with_dryrun(
+    async fn validate_webhooks_dryrun(
         &self,
         operation: &Operation,
         gvk: &GroupVersionKind,
@@ -1427,6 +1460,11 @@ impl<S: Storage> AdmissionWebhookManager<S> {
             // mutated the object, so every eligible webhook is reinvoked.
             reinvoke_ctx.require_reinvoking_previously_invoked_plugins();
         }
+        // The MutatingAdmissionWebhook plugin's `Admit`, timed as
+        // `WithControllerMetrics(plugin, "MutatingAdmissionWebhook")`
+        // (admission/metrics/metrics.go:63-66, :89-100). Each reinvoker pass
+        // is one `Admit` call.
+        let start = std::time::Instant::now();
         let result = self
             .dispatch_mutating_webhooks(
                 operation,
@@ -1442,6 +1480,13 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                 reinvoke_ctx,
             )
             .await;
+        admission_metrics::observe_admission_controller(
+            start.elapsed(),
+            matches!(&result, Err(_) | Ok((AdmissionResponse::Deny(_), _, _))),
+            operation,
+            admission_metrics::STEP_ADMIT,
+            "MutatingAdmissionWebhook",
+        );
         if let Ok((_, object, _)) = &result {
             // dispatcher.go:120-122 (`defer`).
             reinvoke_ctx.set_last_webhook_invocation_output(object.clone());
@@ -2117,6 +2162,10 @@ impl<S: Storage> AdmissionWebhookManager<S> {
     }
 
     /// Extended VAP evaluation with resource name and namespace for precise matching.
+    ///
+    /// The ValidatingAdmissionPolicy plugin's `Validate`, timed as
+    /// `WithControllerMetrics(plugin, "ValidatingAdmissionPolicy")`
+    /// (admission/metrics/metrics.go:63-66, :102-113).
     pub async fn run_validating_admission_policies_ext(
         &self,
         operation: &Operation,
@@ -2138,6 +2187,28 @@ impl<S: Storage> AdmissionWebhookManager<S> {
     /// `inputs.Authorizer == nil` (activation.go:52): neither is bound.
     #[allow(clippy::too_many_arguments)]
     pub async fn run_validating_admission_policies_authz(
+        &self,
+        operation: &Operation,
+        gvk: &GroupVersionKind,
+        object: Option<&Value>,
+        old_object: Option<&Value>,
+        resource: Option<&str>,
+        namespace: Option<&str>,
+        authz: Option<&crate::cel_evaluators::VapAuthorizer>,
+    ) -> Result<()> {
+        admission_metrics::with_controller_metrics(
+            "ValidatingAdmissionPolicy",
+            operation,
+            admission_metrics::STEP_VALIDATE,
+            self.evaluate_validating_admission_policies(
+                operation, gvk, object, old_object, resource, namespace, authz,
+            ),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn evaluate_validating_admission_policies(
         &self,
         operation: &Operation,
         gvk: &GroupVersionKind,
