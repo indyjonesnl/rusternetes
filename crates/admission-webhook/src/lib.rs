@@ -3,6 +3,7 @@
 // This module implements the client for calling external admission webhooks
 // and processing their responses.
 
+pub mod admission_metrics;
 pub mod cel_evaluators;
 
 #[cfg(test)]
@@ -5058,5 +5059,359 @@ mod tests {
             "extraField must be pruned: {:?}",
             pruned_spec
         );
+    }
+}
+
+/// Dispatcher call sites of `admission/metrics/metrics.go`
+/// (validating/dispatcher.go:141-209, mutating/dispatcher.go:169-215).
+#[cfg(test)]
+mod dispatcher_metrics_tests {
+    use super::*;
+    use crate::admission_metrics::tests::{counter, hist_count};
+    use rusternetes_common::admission::AdmissionStatus;
+    use rusternetes_common::resources::{
+        MutatingWebhook, OperationType, Rule, RuleWithOperations, SideEffectClass,
+        ValidatingWebhook, WebhookClientConfig,
+    };
+    use rusternetes_storage::memory::MemoryStorage;
+    use serde_json::json;
+
+    /// A webhook server answering every POST with `status` and the canned
+    /// review (`allowed`, optional denial `code`).
+    async fn serve(status: u16, allowed: bool, code: Option<i32>) -> String {
+        use axum::{http::StatusCode, routing::post, Json, Router};
+        let app = Router::new().route(
+            "/admit",
+            post(move |Json(review): Json<AdmissionReview>| async move {
+                let uid = review.request.map(|r| r.uid).unwrap_or_default();
+                let resp = AdmissionReviewResponse {
+                    uid,
+                    allowed,
+                    status: code.map(|c| AdmissionStatus {
+                        status: "Failure".into(),
+                        message: Some("nope".into()),
+                        reason: None,
+                        code: Some(c),
+                        metadata: None,
+                    }),
+                    patch: None,
+                    patch_type: None,
+                    audit_annotations: None,
+                    warnings: None,
+                };
+                (
+                    StatusCode::from_u16(status).unwrap(),
+                    Json(AdmissionReview::new_response(resp)),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app.into_make_service()).await;
+        });
+        format!("http://{addr}/admit")
+    }
+
+    fn rule() -> RuleWithOperations {
+        RuleWithOperations {
+            operations: vec![OperationType::Create],
+            rule: Rule {
+                api_groups: vec!["".into()],
+                api_versions: vec!["v1".into()],
+                resources: vec!["configmaps".into()],
+                scope: None,
+            },
+        }
+    }
+
+    fn gvk() -> GroupVersionKind {
+        GroupVersionKind {
+            group: "".into(),
+            version: "v1".into(),
+            kind: "ConfigMap".into(),
+        }
+    }
+
+    fn gvr() -> GroupVersionResource {
+        GroupVersionResource {
+            group: "".into(),
+            version: "v1".into(),
+            resource: "configmaps".into(),
+        }
+    }
+
+    fn user() -> UserInfo {
+        UserInfo {
+            username: "u".into(),
+            uid: "1".into(),
+            groups: vec![],
+        }
+    }
+
+    async fn run_validating(
+        name: &str,
+        url: &str,
+        policy: FailurePolicy,
+    ) -> Result<AdmissionResponse> {
+        let storage = Arc::new(MemoryStorage::new());
+        let cfg = ValidatingWebhookConfiguration {
+            api_version: "admissionregistration.k8s.io/v1".into(),
+            kind: "ValidatingWebhookConfiguration".into(),
+            metadata: rusternetes_common::types::ObjectMeta::new(name),
+            webhooks: Some(vec![ValidatingWebhook {
+                name: name.into(),
+                client_config: WebhookClientConfig {
+                    url: Some(url.into()),
+                    service: None,
+                    ca_bundle: None,
+                },
+                rules: vec![rule()],
+                failure_policy: Some(policy),
+                match_policy: None,
+                namespace_selector: None,
+                object_selector: None,
+                side_effects: SideEffectClass::None,
+                timeout_seconds: Some(2),
+                admission_review_versions: vec!["v1".into()],
+                match_conditions: None,
+            }]),
+        };
+        storage
+            .create(
+                &format!("/registry/validatingwebhookconfigurations/{name}"),
+                &cfg,
+            )
+            .await
+            .unwrap();
+        AdmissionWebhookManager::new(storage)
+            .run_validating_webhooks(
+                &Operation::Create,
+                &gvk(),
+                &gvr(),
+                Some("default"),
+                "c",
+                Some(json!({"metadata": {"name": "c"}})),
+                None,
+                &user(),
+            )
+            .await
+    }
+
+    async fn run_mutating(
+        name: &str,
+        url: &str,
+        policy: FailurePolicy,
+    ) -> Result<AdmissionResponse> {
+        let storage = Arc::new(MemoryStorage::new());
+        let cfg = MutatingWebhookConfiguration {
+            api_version: "admissionregistration.k8s.io/v1".into(),
+            kind: "MutatingWebhookConfiguration".into(),
+            metadata: rusternetes_common::types::ObjectMeta::new(name),
+            webhooks: Some(vec![MutatingWebhook {
+                name: name.into(),
+                client_config: WebhookClientConfig {
+                    url: Some(url.into()),
+                    service: None,
+                    ca_bundle: None,
+                },
+                rules: vec![rule()],
+                failure_policy: Some(policy),
+                match_policy: None,
+                namespace_selector: None,
+                object_selector: None,
+                side_effects: SideEffectClass::None,
+                timeout_seconds: Some(2),
+                admission_review_versions: vec!["v1".into()],
+                match_conditions: None,
+                reinvocation_policy: None,
+            }]),
+        };
+        storage
+            .create(
+                &format!("/registry/mutatingwebhookconfigurations/{name}"),
+                &cfg,
+            )
+            .await
+            .unwrap();
+        AdmissionWebhookManager::new(storage)
+            .run_mutating_webhooks(
+                &Operation::Create,
+                &gvk(),
+                &gvr(),
+                Some("default"),
+                "c",
+                Some(json!({"metadata": {"name": "c"}})),
+                None,
+                &user(),
+            )
+            .await
+            .map(|(r, _)| r)
+    }
+
+    fn request_total(name: &str, ty: &str, code: &str, rejected: &str) -> u64 {
+        counter(
+            "apiserver_admission_webhook_request_total",
+            &[
+                ("name", name),
+                ("type", ty),
+                ("operation", "CREATE"),
+                ("code", code),
+                ("rejected", rejected),
+            ],
+        )
+    }
+
+    fn rejection(name: &str, ty: &str, error_type: &str, code: &str) -> u64 {
+        counter(
+            "apiserver_admission_webhook_rejection_count",
+            &[
+                ("name", name),
+                ("type", ty),
+                ("operation", "CREATE"),
+                ("error_type", error_type),
+                ("rejection_code", code),
+            ],
+        )
+    }
+
+    fn latency(name: &str, ty: &str, rejected: &str) -> u64 {
+        hist_count(
+            "apiserver_admission_webhook_admission_duration_seconds",
+            &[
+                ("name", name),
+                ("type", ty),
+                ("operation", "CREATE"),
+                ("rejected", rejected),
+            ],
+        )
+    }
+
+    fn fail_open(name: &str, ty: &str) -> u64 {
+        counter(
+            "apiserver_admission_webhook_fail_open_count",
+            &[("name", name), ("type", ty)],
+        )
+    }
+
+    /// dispatcher.go:195: success is `ObserveWebhook(..., false, "validating", 200)`
+    /// (the validating dispatcher labels its type `validating`, not `validate`).
+    #[tokio::test]
+    async fn validating_allow_observes_200() {
+        let url = serve(200, true, None).await;
+        run_validating("m-v-allow", &url, FailurePolicy::Fail)
+            .await
+            .unwrap();
+        assert_eq!(request_total("m-v-allow", "validating", "200", "false"), 1);
+        assert_eq!(latency("m-v-allow", "validating", "false"), 1);
+    }
+
+    /// dispatcher.go:185-188: `ErrWebhookRejection` observes `no_error` with
+    /// the (>=400) status code.
+    #[tokio::test]
+    async fn validating_denial_observes_rejection_no_error() {
+        let url = serve(200, false, Some(403)).await;
+        let r = run_validating("m-v-deny", &url, FailurePolicy::Fail)
+            .await
+            .unwrap();
+        assert!(matches!(r, AdmissionResponse::Deny(_)));
+        assert_eq!(rejection("m-v-deny", "validating", "no_error", "403"), 1);
+        assert_eq!(request_total("m-v-deny", "validating", "403", "true"), 1);
+        assert_eq!(latency("m-v-deny", "validating", "true"), 1);
+    }
+
+    /// `ToStatusErr` (errors/statuserror.go:31-34): a denial without a code
+    /// is reported as 400.
+    #[tokio::test]
+    async fn validating_denial_without_code_is_400() {
+        let url = serve(200, false, None).await;
+        run_validating("m-v-deny400", &url, FailurePolicy::Fail)
+            .await
+            .unwrap();
+        assert_eq!(rejection("m-v-deny400", "validating", "no_error", "400"), 1);
+    }
+
+    /// dispatcher.go:179-184: `ErrCallingWebhook` on Fail is rejected with
+    /// `calling_webhook_error`; a transport failure is a 503
+    /// (`NewServiceUnavailable`, :287-289).
+    #[tokio::test]
+    async fn validating_unreachable_fail_observes_calling_webhook_error() {
+        let r = run_validating("m-v-down", "http://127.0.0.1:1/admit", FailurePolicy::Fail).await;
+        assert!(r.is_err());
+        assert_eq!(
+            rejection("m-v-down", "validating", "calling_webhook_error", "503"),
+            1
+        );
+        assert_eq!(request_total("m-v-down", "validating", "503", "true"), 1);
+    }
+
+    /// dispatcher.go:201-209: on Ignore the call is not rejected and the
+    /// fail-open counter ticks.
+    #[tokio::test]
+    async fn validating_unreachable_ignore_observes_fail_open() {
+        run_validating(
+            "m-v-open",
+            "http://127.0.0.1:1/admit",
+            FailurePolicy::Ignore,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fail_open("m-v-open", "validating"), 1);
+        assert_eq!(request_total("m-v-open", "validating", "503", "false"), 1);
+    }
+
+    /// client-go turns a non-2xx response into a `StatusError` carrying the
+    /// HTTP code, which `ErrCallingWebhook.Status` keeps (:281-285).
+    #[tokio::test]
+    async fn validating_http_500_observes_its_code() {
+        let url = serve(500, true, None).await;
+        let r = run_validating("m-v-500", &url, FailurePolicy::Fail).await;
+        assert!(r.is_err());
+        assert_eq!(
+            rejection("m-v-500", "validating", "calling_webhook_error", "500"),
+            1
+        );
+    }
+
+    /// mutating/dispatcher.go:190: success observes `"admit"`, 200.
+    #[tokio::test]
+    async fn mutating_allow_observes_200() {
+        let url = serve(200, true, None).await;
+        run_mutating("m-m-allow", &url, FailurePolicy::Fail)
+            .await
+            .unwrap();
+        assert_eq!(request_total("m-m-allow", "admit", "200", "false"), 1);
+        assert_eq!(latency("m-m-allow", "admit", "false"), 1);
+    }
+
+    /// mutating/dispatcher.go:181-184.
+    #[tokio::test]
+    async fn mutating_denial_observes_rejection_no_error() {
+        let url = serve(200, false, Some(422)).await;
+        run_mutating("m-m-deny", &url, FailurePolicy::Fail)
+            .await
+            .unwrap();
+        assert_eq!(rejection("m-m-deny", "admit", "no_error", "422"), 1);
+        assert_eq!(request_total("m-m-deny", "admit", "422", "true"), 1);
+    }
+
+    /// mutating/dispatcher.go:174-179 and :207-212.
+    #[tokio::test]
+    async fn mutating_unreachable_observes_rejection_or_fail_open() {
+        let r = run_mutating("m-m-down", "http://127.0.0.1:1/admit", FailurePolicy::Fail).await;
+        assert!(r.is_err());
+        assert_eq!(
+            rejection("m-m-down", "admit", "calling_webhook_error", "503"),
+            1
+        );
+        run_mutating(
+            "m-m-open",
+            "http://127.0.0.1:1/admit",
+            FailurePolicy::Ignore,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fail_open("m-m-open", "admit"), 1);
+        assert_eq!(request_total("m-m-open", "admit", "503", "false"), 1);
     }
 }
