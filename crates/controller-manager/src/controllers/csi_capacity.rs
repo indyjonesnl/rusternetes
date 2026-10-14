@@ -344,6 +344,7 @@ pub async fn run_capacity_loop<S: Storage, C: CapacityClient>(
     poll_interval: std::time::Duration,
     retry_interval_start: std::time::Duration,
     retry_interval_max: std::time::Duration,
+    threads: u32,
 ) {
     ctl.register_metrics();
     // Subscribe first, list second: nothing that happens in between is lost.
@@ -366,11 +367,12 @@ pub async fn run_capacity_loop<S: Storage, C: CapacityClient>(
         }
     }
     tokio::join!(
-        ctl.run_worker(retry_interval_start, retry_interval_max),
+        ctl.run_workers(threads, retry_interval_start, retry_interval_max),
         ctl.run_poll(poll_interval),
         ctl.run_informer(
             sc_prefix,
             sc_watch,
+            false,
             |l: Vec<StorageClass>| ctl.apply_sc_list(l),
             |o: &StorageClass| ctl.informer_sc_upsert(o),
             |o: &StorageClass| ctl.informer_sc_delete(o),
@@ -378,6 +380,7 @@ pub async fn run_capacity_loop<S: Storage, C: CapacityClient>(
         ctl.run_informer(
             c_prefix,
             c_watch,
+            true,
             |l: Vec<CSIStorageCapacity>| ctl.apply_c_list(l),
             |o: &CSIStorageCapacity| ctl.informer_c_upsert(o),
             |o: &CSIStorageCapacity| ctl.informer_c_delete(o),
@@ -398,8 +401,31 @@ pub struct CapacityController<'a, S: Storage, C: CapacityClient> {
     /// `capacities` + `queue`, shared with the provisioner's refresh hooks.
     pub refresher: std::sync::Arc<super::csi_capacity_refresh::CapacityRefresher>,
     /// The token bucket of the dedicated capacity clientset
-    /// (`--kube-api-capacity-qps/-burst`, csi-provisioner.go:456-458). Stub.
+    /// (`--kube-api-capacity-qps/-burst`, csi-provisioner.go:456-458): every
+    /// non-watch request of that clientset (CSIStorageCapacity create, update,
+    /// delete and the informer's list) takes a token, see [`capacity_limiter`].
     pub limiter: std::sync::Arc<rusternetes_client::ratelimit::RateLimiter>,
+}
+
+/// The rate limiter `kubernetes.NewForConfig` builds for `config.QPS` /
+/// `config.Burst` (client-go `rest/config.go:370-381`): zero means
+/// `DefaultQPS` / `DefaultBurst`, a QPS that is not positive means no limiter.
+pub fn capacity_limiter(
+    qps: f64,
+    burst: i32,
+) -> std::sync::Arc<rusternetes_client::ratelimit::RateLimiter> {
+    use rusternetes_client::ratelimit::{RateLimiter, DEFAULT_BURST, DEFAULT_QPS};
+    let qps = if qps == 0.0 { DEFAULT_QPS } else { qps };
+    let burst = if burst == 0 {
+        DEFAULT_BURST
+    } else {
+        f64::from(burst)
+    };
+    std::sync::Arc::new(if qps > 0.0 {
+        RateLimiter::new(qps, burst)
+    } else {
+        RateLimiter::unlimited()
+    })
 }
 
 /// `WorkItem` (capacity.go:105-108) with the StorageClass resolved.
@@ -816,6 +842,8 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
         // :273 "onTopologyChanges lists the classes."
         let segments = self.refresher.lock().segments.clone();
         self.on_topology_changes(&segments, &[]);
+        // The CSIStorageCapacity informer lists through the capacity clientset.
+        self.limiter.acquire().await;
         let capacities: Vec<CSIStorageCapacity> = self
             .storage
             .list(&build_prefix(
@@ -829,14 +857,18 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
 
     // ---- workers ----
 
-    /// `--capacity-threads` workers (capacity.go:238-253). Stub: one worker.
+    /// `for range threadiness { go wait.UntilWithContext(runWorker, time.Second) }`
+    /// (capacity.go:238-253): `--capacity-threads` workers on the one queue.
+    /// The queue hands an item out to one worker at a time (`Done` re-queues
+    /// what was added meanwhile), which `syncCapacity` relies on (:568-571).
+    /// As upstream, zero threads means no worker.
     pub async fn run_workers(
         &self,
-        _threads: u32,
+        threads: u32,
         start: std::time::Duration,
         max: std::time::Duration,
     ) {
-        self.run_worker(start, max).await
+        futures::future::join_all((0..threads).map(|_| self.run_worker(start, max))).await;
     }
 
     /// `wait.UntilWithContext(pollCapacities, pollPeriod)` (capacity.go:255).
@@ -959,6 +991,7 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
                 let name = obj.metadata.name.clone();
                 // :642-645: the created object is intentionally not stored in
                 // `capacities`; it arrives through the informer.
+                self.limiter.acquire().await;
                 self.storage
                     .create(
                         &build_key("csistoragecapacities", Some(&self.owner_namespace), &name),
@@ -986,6 +1019,7 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
                             .push(owner.clone());
                     }
                 }
+                self.limiter.acquire().await;
                 self.storage
                     .update(
                         &build_key(
@@ -1041,6 +1075,7 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
     /// `deleteCapacity` (:673-681): NotFound is success.
     async fn delete_capacity(&self, namespace: &str, name: &str) -> Result<()> {
         tracing::trace!("Capacity Controller: removing CSIStorageCapacity {name}");
+        self.limiter.acquire().await;
         match self
             .storage
             .delete(&build_key("csistoragecapacities", Some(namespace), name))
@@ -1060,6 +1095,7 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
         &self,
         prefix: String,
         mut first: Option<rusternetes_storage::WatchStream>,
+        throttled: bool,
         relist: impl Fn(Vec<T>),
         upsert: impl Fn(&T),
         delete: impl Fn(&T),
@@ -1080,6 +1116,12 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
                             continue;
                         }
                     };
+                    // Only the capacity informer lists through the throttled
+                    // capacity clientset; watches are never throttled
+                    // (client-go rest/request.go:763-764).
+                    if throttled {
+                        self.limiter.acquire().await;
+                    }
                     match self.storage.list::<T>(&prefix).await {
                         Ok(l) => relist(l),
                         Err(e) => {
@@ -2381,6 +2423,7 @@ mod tests {
             Duration::from_secs(3600),
             Duration::from_millis(10),
             Duration::from_secs(1),
+            2,
         );
         let scenario = async {
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -2464,6 +2507,16 @@ mod tests {
         settle(&c, &st, &[]).await;
         assert!(list_caps(&st).await.is_empty());
         assert_eq!(start.elapsed(), Duration::from_secs(3));
+    }
+
+    #[test]
+    fn capacity_limiter_follows_client_go_defaulting() {
+        // rest/config.go:370-381: 0 -> DefaultQPS/DefaultBurst, qps <= 0 -> none.
+        let l = capacity_limiter(1.0, 5);
+        assert_eq!((l.qps(), l.burst()), (1.0, 5.0));
+        let l = capacity_limiter(0.0, 0);
+        assert_eq!((l.qps(), l.burst()), (5.0, 10.0));
+        assert!(capacity_limiter(-1.0, 5).qps() <= 0.0);
     }
 
     #[tokio::test(start_paused = true)]
