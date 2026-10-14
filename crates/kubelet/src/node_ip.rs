@@ -10,6 +10,8 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 
+pub mod net_interface;
+
 static CONFIGURED_NODE_IPS: std::sync::OnceLock<Vec<IpAddr>> = std::sync::OnceLock::new();
 
 /// Record the parsed `--node-ip` (upstream threads `nodeIPs` through
@@ -26,7 +28,7 @@ pub fn configured_node_ips() -> &'static [IpAddr] {
 
 /// `netutils.ParseIPSloppy`: like `ParseIP` but tolerates leading zeros in
 /// IPv4 octets ("01.2.3.004").
-fn parse_ip_sloppy(s: &str) -> Option<IpAddr> {
+pub(crate) fn parse_ip_sloppy(s: &str) -> Option<IpAddr> {
     if let Ok(ip) = s.parse::<IpAddr>() {
         return Some(ip);
     }
@@ -427,6 +429,13 @@ mod tests {
     #[test]
     fn address_nothing_found_errors() {
         assert!(node_addresses(&[], &validate_node_ip, "h", &none, &|_| None).is_err());
+    }
+
+    // setters.go:183 `can't get ip address of node %s. error: %v`
+    #[test]
+    fn address_nothing_found_error_text_carries_resolver_error() {
+        let e = node_addresses(&[], &validate_node_ip, "h", &none, &|_| None).unwrap_err();
+        assert!(e.starts_with("can't get ip address of node h. error: "), "{e}");
     }
 
     // setters.go:163-179 runs with NO --node-ip too: an IPv6-only host (DNS
