@@ -103,6 +103,13 @@ async fn missing_deleted_and_autoscaler_tainted_nodes() {
     for (node, eligible) in [
         (None, false),
         (Some(node(serde_json::json!({}))), true),
+        // proxy_health.go:184 uses time.IsZero, not pointer presence.
+        (
+            Some(node(
+                serde_json::json!({"deletionTimestamp": "0001-01-01T00:00:00Z"}),
+            )),
+            true,
+        ),
         (
             Some(node(
                 serde_json::json!({"spec": {"taints": [{"key": "other", "effect": "NoSchedule"}]}}),
