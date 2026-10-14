@@ -24,6 +24,8 @@ mimalloc = { version = "0.1", optional = true }
 rusternetes-common = { path = "../common", features = ["axum-support", "clap-support"] }
 rusternetes-storage = { path = "../storage" }
 rusternetes-client = { path = "../client" }
+# secure serving + delegated authn/authz for /metrics, /statusz, /flagz (#3437)
+rusternetes-middleware = { path = "../middleware" }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
