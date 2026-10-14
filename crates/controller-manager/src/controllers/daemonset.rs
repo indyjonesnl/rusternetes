@@ -182,7 +182,10 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                         // benign (race / re-reconcile), as before.
                         self.expectations.creation_observed(exp_key);
                         let text = e.to_string();
-                        if text.contains("already exists") || text.contains("AlreadyExists") {
+                        // Typed `apierrors.IsAlreadyExists` (errors.go:542-544);
+                        // upstream pods use generateName so it never branches
+                        // here — a Rusternetes-only benign case (named pods).
+                        if super::is_already_exists_anyhow(&e) {
                             debug!("DaemonSet pod already exists, skipping: {}", text);
                             continue;
                         }
