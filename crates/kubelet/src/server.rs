@@ -151,12 +151,29 @@ pub fn read_only_router(state: ServerState) -> Router {
 /// `ComponentKubelet` (pkg/kubelet/server/server.go:116).
 pub const COMPONENT_KUBELET: &str = "kubelet";
 
-/// `(Server).installStatusZ` (pkg/kubelet/server/server.go:393-398).
-pub fn install_statusz(router: Router, _registered_paths: Vec<String>) -> Router {
-    router
+/// `(Server).installStatusZ` (pkg/kubelet/server/server.go:393-398): behind the
+/// `ComponentStatusz` gate, install `/statusz` with a registry built from
+/// `compatibility.DefaultBuildEffectiveVersion()` and the container's
+/// `RegisteredHandlePaths()` (`registered_paths`). The registry is only built
+/// when the gate is on, as upstream builds it inside the `if`.
+///
+/// Not ported: `s.addMetricsBucketMatcher("statusz")` (server.go:395) -- this
+/// kubelet has no per-path HTTP metrics buckets yet.
+pub fn install_statusz(router: Router, registered_paths: Vec<String>) -> Router {
+    rusternetes_common::statusz::install_if_enabled(router, COMPONENT_KUBELET, || {
+        rusternetes_common::statusz::Registry::new(Some(
+            rusternetes_common::compatibility::default_build_effective_version(),
+        ))
+        .with_listed_paths(registered_paths)
+    })
 }
 
+/// Paths [`read_only_router`] registers (the route templates, as go-restful's
+/// `RegisteredHandlePaths()` reports them).
+pub const READ_ONLY_PATHS: [&str; 4] = ["/pods", "/runningpods/", "/healthz", "/stats/summary"];
+
 /// `authorizer.AttributesRecord` (as populated by `GetRequestAttributes`).
+#[allow(dead_code)] // consumed by the kubelet authn/authz filter (not yet wired)
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RequestAttributes {
     pub user: String,
@@ -171,21 +188,109 @@ pub struct RequestAttributes {
     pub path: String,
 }
 
+#[allow(dead_code)]
+const STATS_PATH: &str = "/stats/";
+#[allow(dead_code)]
+const METRICS_PATH: &str = "/metrics";
+#[allow(dead_code)]
+const LOGS_PATH: &str = "/logs/";
+#[allow(dead_code)]
+const CHECKPOINT_PATH: &str = "/checkpoint/";
+#[allow(dead_code)]
+const PODS_PATH: &str = "/pods";
+#[allow(dead_code)]
+const RUNNING_PODS_PATH: &str = "/runningpods/";
+
 /// `isSubpath` (pkg/kubelet/server/auth.go:56-59).
-pub fn is_subpath(_subpath: &str, _path: &str) -> bool {
-    false
+#[allow(dead_code)] // consumed by the kubelet authn/authz filter (not yet wired)
+pub fn is_subpath(subpath: &str, path: &str) -> bool {
+    let path = path.strip_suffix('/').unwrap_or(path);
+    subpath == path || (subpath.starts_with(path) && subpath.as_bytes()[path.len()] == b'/')
 }
 
 /// `nodeAuthorizerAttributesGetter.GetRequestAttributes`
-/// (pkg/kubelet/server/auth.go:77-148).
+/// (pkg/kubelet/server/auth.go:77-148). `KubeletFineGrainedAuthz` is read by
+/// name (it has no typed `Feature` variant); the `/flagz` -> `configz` case is
+/// unconditional, as upstream.
+#[allow(dead_code)] // consumed by the kubelet authn/authz filter (not yet wired)
 pub fn get_request_attributes(
-    _node_name: &str,
-    _user: &str,
-    _method: &str,
-    _request_path: &str,
+    node_name: &str,
+    user: &str,
+    method: &str,
+    request_path: &str,
 ) -> Vec<RequestAttributes> {
-    Vec::new()
+    let api_verb = match method {
+        "POST" => "create",
+        "GET" => "get",
+        "PUT" => "update",
+        "PATCH" => "patch",
+        "DELETE" => "delete",
+        _ => "",
+    };
+
+    let mut subresources: Vec<&str> = Vec::new();
+    if rusternetes_common::feature_gates::gate_enabled("KubeletFineGrainedAuthz").unwrap_or(false) {
+        if is_subpath(request_path, PODS_PATH) {
+            subresources.push("pods");
+        } else if is_subpath(request_path, "/healthz") {
+            subresources.push("healthz");
+        } else if is_subpath(request_path, "/configz") {
+            subresources.push("configz");
+        // upstream puts runningpods last (it allocates a new string on every
+        // check); the case order is preserved.
+        } else if is_subpath(request_path, RUNNING_PODS_PATH) {
+            subresources.push("pods");
+        }
+    }
+
+    if is_subpath(request_path, STATS_PATH) {
+        subresources.push("stats");
+    } else if is_subpath(request_path, METRICS_PATH) {
+        subresources.push("metrics");
+    } else if is_subpath(request_path, LOGS_PATH) {
+        // "log" to match other log subresources (pods/log, etc)
+        subresources.push("log");
+    } else if is_subpath(request_path, CHECKPOINT_PATH) {
+        subresources.push("checkpoint");
+    } else if is_subpath(
+        request_path,
+        rusternetes_common::statusz::DEFAULT_STATUSZ_PATH,
+    ) {
+        subresources.push("statusz");
+    } else if is_subpath(request_path, "/flagz") {
+        subresources.push("configz");
+    } else {
+        subresources.push("proxy");
+    }
+
+    subresources
+        .into_iter()
+        .map(|subresource| RequestAttributes {
+            user: user.to_string(),
+            verb: api_verb.to_string(),
+            namespace: String::new(),
+            api_group: String::new(),
+            api_version: "v1".to_string(),
+            resource: "nodes".to_string(),
+            subresource: subresource.to_string(),
+            name: node_name.to_string(),
+            resource_request: true,
+            path: request_path.to_string(),
+        })
+        .collect()
 }
+
+/// Route templates [`crate::streaming_server`] handlers are mounted at in the
+/// kubelet binary (main.rs).
+pub const STREAMING_PATHS: [&str; 7] = [
+    "/exec/:namespace/:pod/:container",
+    "/exec/:namespace/:pod/:uid/:container",
+    "/attach/:namespace/:pod/:container",
+    "/attach/:namespace/:pod/:uid/:container",
+    "/portForward/:namespace/:pod",
+    "/portForward/:namespace/:pod/:uid",
+    "/containerLogs/:namespace/:pod/:container",
+];
 
 #[cfg(test)]
 mod statusz_tests {
@@ -223,18 +328,15 @@ mod statusz_tests {
         let _g = with_feature(Feature::ComponentStatusz, true);
         let app = install_statusz(
             Router::new(),
-            paths(&["/metrics", "/configz", "/healthz", "/pods", "/statusz"]),
+            paths(&["/metrics", "/configz", "/healthz", "/pods"]),
         );
         let (status, body) = get(app, "/statusz", "text/plain").await;
         assert_eq!(status, 200, "{body}");
         assert!(body.contains("kubelet statusz"), "{body}");
-        // Go regexp `Paths([:=\s]+)/configz /healthz /metrics /pods /statusz\n$`.
+        // Go regexp `Paths([:=\s]+)/configz /healthz /metrics /pods\n$`.
         let tail = body.rsplit_once("Paths").map(|(_, t)| t).unwrap_or("");
         let rest = tail.trim_start_matches([':', '=', ' ', '\t', '\n']);
-        assert_eq!(
-            rest, "/configz /healthz /metrics /pods /statusz\n",
-            "{body}"
-        );
+        assert_eq!(rest, "/configz /healthz /metrics /pods\n", "{body}");
     }
 
     // server.go:394: gate off => nothing is installed.
