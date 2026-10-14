@@ -214,10 +214,10 @@ fn authorize(a: &AuthorizerVal, attrs: RequestAttributes) -> Value {
     let authorizer = a.authorizer.0.clone();
     let result = block_on(async move { authorizer.authorize_opinion(&attrs).await });
     opaque(match result {
-        Ok(Opinion::Allow) => DecisionVal {
+        Ok(Opinion::Allow(reason)) => DecisionVal {
             err: None,
             allowed: true,
-            reason: String::new(),
+            reason,
         },
         Ok(Opinion::Deny(reason)) => DecisionVal {
             err: None,
