@@ -5307,7 +5307,7 @@ mod tests {
 #[cfg(test)]
 mod dispatcher_metrics_tests {
     use super::*;
-    use crate::admission_metrics::tests::{counter, hist_count};
+    use crate::admission_metrics::tests::{counter, hist_count, hist_count_or_zero};
     use rusternetes_common::admission::AdmissionStatus;
     use rusternetes_common::resources::{
         MutatingWebhook, OperationType, Rule, RuleWithOperations, SideEffectClass,
@@ -5653,5 +5653,78 @@ mod dispatcher_metrics_tests {
         .unwrap();
         assert_eq!(fail_open("m-m-open", "admit"), 1);
         assert_eq!(request_total("m-m-open", "admit", "503", "false"), 1);
+    }
+
+    fn plugin_count(plugin: &str, ty: &str, rejected: &str) -> u64 {
+        hist_count_or_zero(
+            "apiserver_admission_controller_admission_duration_seconds",
+            &[
+                ("name", plugin),
+                ("type", ty),
+                ("operation", "CREATE"),
+                ("rejected", rejected),
+            ],
+        )
+    }
+
+    /// `WithControllerMetrics` decorates every plugin
+    /// (server/options/admission.go:90, admission/plugins.go:142-144): the
+    /// ValidatingAdmissionWebhook plugin's `Validate` is timed under its
+    /// `PluginName`, `rejected` being `err != nil`. Other tests share the
+    /// series, hence the strict increase rather than an exact count.
+    #[tokio::test]
+    async fn validating_webhook_plugin_is_observed_as_controller() {
+        let (ok0, bad0) = (
+            plugin_count("ValidatingAdmissionWebhook", "validate", "false"),
+            plugin_count("ValidatingAdmissionWebhook", "validate", "true"),
+        );
+        let allow = serve(200, true, None).await;
+        run_validating("m-c-v-allow", &allow, FailurePolicy::Fail)
+            .await
+            .unwrap();
+        let deny = serve(200, false, Some(403)).await;
+        run_validating("m-c-v-deny", &deny, FailurePolicy::Fail)
+            .await
+            .unwrap();
+        assert!(plugin_count("ValidatingAdmissionWebhook", "validate", "false") > ok0);
+        assert!(plugin_count("ValidatingAdmissionWebhook", "validate", "true") > bad0);
+    }
+
+    /// The MutatingAdmissionWebhook plugin's `Admit`, `admit` step.
+    #[tokio::test]
+    async fn mutating_webhook_plugin_is_observed_as_controller() {
+        let (ok0, bad0) = (
+            plugin_count("MutatingAdmissionWebhook", "admit", "false"),
+            plugin_count("MutatingAdmissionWebhook", "admit", "true"),
+        );
+        let allow = serve(200, true, None).await;
+        run_mutating("m-c-m-allow", &allow, FailurePolicy::Fail)
+            .await
+            .unwrap();
+        let deny = serve(200, false, Some(403)).await;
+        run_mutating("m-c-m-deny", &deny, FailurePolicy::Fail)
+            .await
+            .unwrap();
+        assert!(plugin_count("MutatingAdmissionWebhook", "admit", "false") > ok0);
+        assert!(plugin_count("MutatingAdmissionWebhook", "admit", "true") > bad0);
+    }
+
+    /// The ValidatingAdmissionPolicy plugin's `Validate`, even with no policy
+    /// to evaluate.
+    #[tokio::test]
+    async fn validating_admission_policy_plugin_is_observed_as_controller() {
+        let before = plugin_count("ValidatingAdmissionPolicy", "validate", "false");
+        AdmissionWebhookManager::new(Arc::new(MemoryStorage::new()))
+            .run_validating_admission_policies_ext(
+                &Operation::Create,
+                &gvk(),
+                None,
+                None,
+                Some("configmaps"),
+                Some("default"),
+            )
+            .await
+            .unwrap();
+        assert!(plugin_count("ValidatingAdmissionPolicy", "validate", "false") > before);
     }
 }
