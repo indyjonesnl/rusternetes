@@ -690,6 +690,14 @@ async fn main() -> Result<()> {
                 get(streaming_server::handle_container_logs),
             )
             .merge(server::read_only_router(server_state));
+        // server.go:328 `installStatusZ()`: last, over the routes registered so far.
+        let registered: Vec<String> = ["/metrics", "/configz"]
+            .into_iter()
+            .chain(server::STREAMING_PATHS)
+            .chain(server::READ_ONLY_PATHS)
+            .map(String::from)
+            .collect();
+        let app = server::install_statusz(app, registered);
 
         // Serve the kubelet API port over HTTPS (#1644): a vanilla api-server
         // proxies logs/exec/attach/metrics to `https://<nodeIP>:10250` and will

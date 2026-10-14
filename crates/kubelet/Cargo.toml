@@ -21,7 +21,7 @@ redis = ["rusternetes-storage/redis"]
 
 [dependencies]
 mimalloc = { version = "0.1", optional = true }
-rusternetes-common = { path = "../common" }
+rusternetes-common = { path = "../common", features = ["axum-support"] }
 pem.workspace = true
 prometheus.workspace = true
 # api-client: StorageBackend::Api lets the in-cluster kubelet read/write via
