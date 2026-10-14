@@ -38,6 +38,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml = "0.9"
 sha2 = "0.10"
+regex = "1.10"
 sha1 = "0.10"
 anyhow.workspace = true
 tracing.workspace = true

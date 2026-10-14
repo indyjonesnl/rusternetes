@@ -54,6 +54,8 @@ pub trait MountInterface: Send + Sync {
     fn can_safely_skip_mount_point_check(&self) -> bool;
     /// `GetMountRefs` (`mount.go:88`).
     fn get_mount_refs(&self, pathname: &str) -> io::Result<Vec<String>>;
+    /// `List` (`mount.go:59`): all mounted filesystems.
+    fn list(&self) -> io::Result<Vec<super::mount_list::MountPoint>>;
 }
 
 impl MountInterface for Mounter {
@@ -101,6 +103,11 @@ impl MountInterface for Mounter {
 
     fn get_mount_refs(&self, pathname: &str) -> io::Result<Vec<String>> {
         super::mount_utils::get_mount_refs(pathname)
+    }
+
+    /// `Mounter.List` (`mount_linux.go:426-428`).
+    fn list(&self) -> io::Result<Vec<super::mount_list::MountPoint>> {
+        super::mount_list::list_proc_mounts(super::mount_list::PROC_MOUNTS_PATH)
     }
 }
 
@@ -521,6 +528,24 @@ pub(crate) mod testing {
                 .iter()
                 .filter(|m| m.device == dev && m.path != real)
                 .map(|m| m.path.clone())
+                .collect())
+        }
+
+        /// `FakeMounter.List` (`fake_mounter.go:181-187`): the in-memory mount points.
+        fn list(&self) -> io::Result<Vec<crate::volume_plugins::util::mount_list::MountPoint>> {
+            Ok(self
+                .mount_points
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|m| crate::volume_plugins::util::mount_list::MountPoint {
+                    device: m.device.clone(),
+                    path: m.path.clone(),
+                    fstype: m.fstype.clone(),
+                    opts: m.opts.clone(),
+                    freq: 0,
+                    pass: 0,
+                })
                 .collect())
         }
     }

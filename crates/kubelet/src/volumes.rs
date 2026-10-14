@@ -259,6 +259,8 @@ impl VolumeManager {
                 host.clone(),
             )),
             Box::new(crate::volume_plugins::iscsi::IscsiPlugin::new(host.clone())),
+            // `fc.ProbeVolumePlugins` (`cmd/kubelet/app/plugins.go`).
+            Box::new(crate::volume_plugins::fc::FcPlugin::new(host.clone())),
             // `image.ProbeVolumePlugins` (`cmd/kubelet/app/plugins.go`).
             Box::new(crate::volume_plugins::image::ImagePlugin::new()),
             Box::new(crate::volume_plugins::config_map::ConfigMapPlugin::new(
@@ -3709,7 +3711,7 @@ mod dispatch_tests {
         assert!(!tmp.path().join("pods").exists(), "no directory is made");
     }
 
-    /// #3262: an unimplemented kind (rbd, fc, gitRepo) matches no
+    /// #3262: an unimplemented kind (rbd, gitRepo) matches no
     /// plugin. Upstream's desired-state populator fails the volume with
     /// `failed to get Plugin from volumeSpec for volume %q err=%v`
     /// (`desired_state_of_world.go:272-277`) over `ErrNoPluginMatched`

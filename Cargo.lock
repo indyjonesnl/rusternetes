@@ -4654,6 +4654,7 @@ dependencies = [
  "rand 0.9.4",
  "rand_core 0.6.4",
  "rcgen",
+ "regex",
  "reqwest",
  "rsa",
  "rusternetes-client",
