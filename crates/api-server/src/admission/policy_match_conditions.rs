@@ -15,7 +15,9 @@
 //! Deviations: the CEL cost budget (`RuntimeCELCostBudgetMatchConditions`)
 //! is not ported. The request authorizer
 //! (`Match`'s `authz` argument, a `NewCachingAuthorizer` from the dispatcher,
-//! #3228) is accepted but unused until the CEL `authorizer` library is bound. A non-`bool` result is an
+//! #3228) is bound to the CEL `authorizer` / `authorizer.requestResource`
+//! variables (`OptionalVariableBindings.Authorizer`, matcher.go:80-86;
+//! `rusternetes_common::cel_authz_library`, #3300). A non-`bool` result is an
 //! evaluation error here; the compile-time rejection (`ReturnTypes`) happens at
 //! policy / configuration validation (`cel_env::output_type_failure`).
 
@@ -59,6 +61,7 @@ pub trait ConditionEvaluator: Send + Sync {
         attributes: &Attributes,
         versioned: &VersionedAttributes,
         param: Option<&Value>,
+        authz: Arc<dyn Authorizer>,
     ) -> Result<Vec<EvaluationResult>, String>;
 }
 
@@ -140,7 +143,7 @@ impl ConditionMatcher for Matcher {
         attributes: &Attributes,
         versioned: &VersionedAttributes,
         param: Option<&Value>,
-        _authz: &dyn Authorizer,
+        authz: Arc<dyn Authorizer>,
     ) -> MatchResult {
         let t = Instant::now();
         let operation = operation_str(&attributes.operation);
@@ -153,7 +156,11 @@ impl ConditionMatcher for Matcher {
                 operation,
             )
         };
-        let results = match self.filter.for_input(attributes, versioned, param).await {
+        let results = match self
+            .filter
+            .for_input(attributes, versioned, param, authz)
+            .await
+        {
             Ok(r) => r,
             Err(err) => {
                 observe_time(t);
@@ -228,6 +235,7 @@ impl ConditionEvaluator for CelConditions {
         attributes: &Attributes,
         versioned: &VersionedAttributes,
         param: Option<&Value>,
+        authz: Arc<dyn Authorizer>,
     ) -> Result<Vec<EvaluationResult>, String> {
         // `CreateAdmissionRequest(versionedAttr.Attributes,
         // versionedAttr.GetResource(), versionedAttr.VersionedKind)`: the
@@ -238,6 +246,7 @@ impl ConditionEvaluator for CelConditions {
             attributes,
             param,
             namespace: None,
+            authorizer: Some(authz),
         };
         Ok(self
             .conditions
@@ -284,6 +293,7 @@ mod tests {
             _: &Attributes,
             _: &VersionedAttributes,
             _: Option<&Value>,
+            _: Arc<dyn Authorizer>,
         ) -> Result<Vec<EvaluationResult>, String> {
             if self.throw_error {
                 return Err("test error".into());
@@ -490,7 +500,9 @@ mod tests {
                 STEP_VALIDATE,
                 "test",
             );
-            let r = m.matches(&a, &v, None, &AlwaysAllowAuthorizer).await;
+            let r = m
+                .matches(&a, &v, None, Arc::new(AlwaysAllowAuthorizer))
+                .await;
             // A failed fake-evaluator call matches nothing, so `matches` is
             // false there (the Go case's `shouldMatch` is not asserted for
             // errors).
@@ -527,7 +539,9 @@ mod tests {
             None,
             "test",
         );
-        let r = m.matches(&a, &v, None, &AlwaysAllowAuthorizer).await;
+        let r = m
+            .matches(&a, &v, None, Arc::new(AlwaysAllowAuthorizer))
+            .await;
         assert!(r.matches && r.error.is_none(), "{r:?}");
     }
 
@@ -544,7 +558,9 @@ mod tests {
             None,
             "test",
         );
-        let r = m.matches(&a, &v, None, &AlwaysAllowAuthorizer).await;
+        let r = m
+            .matches(&a, &v, None, Arc::new(AlwaysAllowAuthorizer))
+            .await;
         assert!(!r.matches);
         assert_eq!(r.failed_condition_name.as_deref(), Some("name"));
     }
@@ -554,16 +570,16 @@ mod tests {
         let (a, v) = attrs(Some(json!({"metadata": {"name": "y"}})));
         let conds = [cond("bad", "object.nope.deeper == 1"), cond("ok", "true")];
         let r = new_matcher(&conds, &[], None, "test")
-            .matches(&a, &v, None, &AlwaysAllowAuthorizer)
+            .matches(&a, &v, None, Arc::new(AlwaysAllowAuthorizer))
             .await;
         assert!(r.error.is_some() && !r.matches, "{r:?}");
         let r = new_matcher(&conds, &[], Some(&FailurePolicy::Ignore), "test")
-            .matches(&a, &v, None, &AlwaysAllowAuthorizer)
+            .matches(&a, &v, None, Arc::new(AlwaysAllowAuthorizer))
             .await;
         assert!(r.error.is_none() && !r.matches, "{r:?}");
         // A non-bool result is an evaluation error too.
         let r = new_matcher(&[cond("n", "1 + 1")], &[], None, "test")
-            .matches(&a, &v, None, &AlwaysAllowAuthorizer)
+            .matches(&a, &v, None, Arc::new(AlwaysAllowAuthorizer))
             .await;
         assert!(r.error.is_some(), "{r:?}");
     }
@@ -579,13 +595,13 @@ mod tests {
         );
         let p = json!({"spec": {"name": "x"}});
         assert!(
-            m.matches(&a, &v, Some(&p), &AlwaysAllowAuthorizer)
+            m.matches(&a, &v, Some(&p), Arc::new(AlwaysAllowAuthorizer))
                 .await
                 .matches
         );
         let p2 = json!({"spec": {"name": "z"}});
         assert!(
-            !m.matches(&a, &v, Some(&p2), &AlwaysAllowAuthorizer)
+            !m.matches(&a, &v, Some(&p2), Arc::new(AlwaysAllowAuthorizer))
                 .await
                 .matches
         );
@@ -622,7 +638,8 @@ mod tests {
             STEP_VALIDATE,
             name,
         );
-        m.matches(&a, &v, None, &AlwaysAllowAuthorizer).await;
+        m.matches(&a, &v, None, Arc::new(AlwaysAllowAuthorizer))
+            .await;
     }
 
     /// matcher.go:87-89: a filter error observes the evaluation time but is
@@ -796,7 +813,7 @@ mod tests {
             let mut out = Vec::new();
             for e in exprs {
                 let m = new_matcher(&[cond("c", e)], &[], None, "test");
-                let r = m.matches(&attrs.0, &attrs.1, None, authz.as_ref()).await;
+                let r = m.matches(&attrs.0, &attrs.1, None, authz.clone()).await;
                 out.push(match (r.error, r.matches) {
                     (Some(e), _) => Err(e),
                     (None, m) => Ok(m),

@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use rusternetes_common::admission::Operation as AdmissionOperation;
+use rusternetes_common::auth::UserInfo;
 use rusternetes_common::cel::{CELContext, CELEvaluator};
+use rusternetes_common::cel_authz_library;
 use rusternetes_common::cel_struct::{self, TypeCheck};
 use serde_json::{json, Value};
 
@@ -127,6 +129,32 @@ pub(super) fn evaluate_expression(
         for (name, v) in vars {
             ctx.add_json_variable(name, v)
                 .map_err(|e| PatchError::Other(e.to_string()))?;
+        }
+        // activation.go:52-55: `authorizer` and `authorizer.requestResource`
+        // exist only when `inputs.Authorizer != nil`.
+        if let Some(authz) = &r.authorizer {
+            let user = r.attributes.user_info.clone().unwrap_or(UserInfo {
+                username: String::new(),
+                uid: String::new(),
+                groups: Vec::new(),
+                extra: Default::default(),
+            });
+            ctx.add_variable(
+                cel_authz_library::AUTHORIZER_VAR.to_string(),
+                cel_authz_library::new_authorizer_val(&user, authz.clone()),
+            );
+            ctx.add_variable(
+                cel_authz_library::REQUEST_RESOURCE_AUTHORIZER_VAR.to_string(),
+                cel_authz_library::new_resource_authorizer_val(
+                    &user,
+                    authz.clone(),
+                    &r.attributes.resource.group,
+                    &r.attributes.resource.resource,
+                    &r.attributes.subresource,
+                    &r.attributes.namespace,
+                    &r.attributes.name,
+                ),
+            );
         }
 
         let mut evaluator = evaluator.lock().unwrap();
@@ -358,6 +386,7 @@ mod tests {
             attributes,
             param: None,
             namespace: None,
+            authorizer: None,
         };
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()

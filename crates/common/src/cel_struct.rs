@@ -117,6 +117,7 @@ pub fn new_context() -> Context<'static> {
             Ok(v)
         },
     );
+    crate::cel_authz_library::register(&mut ctx);
     ctx
 }
 
@@ -312,7 +313,21 @@ fn rewrite(e: &mut IdedExpr, expected: Option<&str>) -> Result<(), String> {
     match &mut e.expr {
         Expr::Unspecified => Err("unspecified CEL expression".to_string()),
         Expr::Ident(_) | Expr::Literal(_) => Ok(()),
-        Expr::Select(s) => rewrite(&mut s.operand, None),
+        Expr::Select(s) => {
+            // `authorizer.requestResource` is the qualified name of a
+            // variable (compile.go:40, activation.go:99-103), not a field
+            // select on `authorizer`.
+            if !s.test
+                && s.field == "requestResource"
+                && matches!(&s.operand.expr, Expr::Ident(n) if n == crate::cel_authz_library::AUTHORIZER_VAR)
+            {
+                e.expr = Expr::Ident(
+                    crate::cel_authz_library::REQUEST_RESOURCE_AUTHORIZER_VAR.to_string(),
+                );
+                return Ok(());
+            }
+            rewrite(&mut s.operand, None)
+        }
         Expr::Call(c) => {
             if c.func_name == "escapeKey"
                 && c.args.len() == 1
