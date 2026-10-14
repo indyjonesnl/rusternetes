@@ -491,9 +491,12 @@ fn node_ipam_params(args: &Args) -> Result<Option<(String, NodeCidrMaskSizes, Op
 /// kube-controller-manager with the command line applied
 /// (cmd/kube-controller-manager/app/options/options.go:224-238).
 fn component_secure_serving(
-    _args: &Args,
+    args: &Args,
 ) -> rusternetes_middleware::secure_serving::ComponentSecureServing {
-    rusternetes_middleware::secure_serving::ComponentSecureServing::for_controller_manager()
+    let mut c =
+        rusternetes_middleware::secure_serving::ComponentSecureServing::for_controller_manager();
+    c.apply_flags(&args.secure_serving, &args.authentication, &args.authorization);
+    c
 }
 
 /// `utilerrors.NewAggregate(errs).Error()` of the options `Validate`.
