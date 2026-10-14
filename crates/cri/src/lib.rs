@@ -694,9 +694,33 @@ fn normalize_socket_path(socket: &Path) -> PathBuf {
     PathBuf::from(trimmed)
 }
 
+/// Port of `toRuntimeAPIImageSpec` (`pkg/kubelet/kuberuntime/convert.go:63-81`).
+pub fn to_runtime_api_image_spec(
+    _image: &str,
+    _runtime_handler: &str,
+    _annotations: &std::collections::HashMap<String, String>,
+) -> v1::ImageSpec {
+    v1::ImageSpec::default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ImageSpec used by both ImageStatus and PullImage carries the pod
+    /// annotations (`EnsureImageExists`, `images/image_manager.go:185-192`)
+    /// and the runtime handler.
+    #[test]
+    fn image_spec_carries_annotations_and_handler() {
+        let mut ann = std::collections::HashMap::new();
+        ann.insert("k".to_string(), "v".to_string());
+        let spec = to_runtime_api_image_spec("img:1", "h", &ann);
+        assert_eq!(spec.image, "img:1");
+        assert_eq!(spec.runtime_handler, "h");
+        assert_eq!(spec.annotations, ann);
+        let empty = to_runtime_api_image_spec("img:1", "", &Default::default());
+        assert!(empty.annotations.is_empty());
+    }
 
     #[test]
     fn strips_unix_scheme() {
