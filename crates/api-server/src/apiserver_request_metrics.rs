@@ -28,8 +28,10 @@
 //! size is the declared/exact body length (zero for unsized streams) rather
 //! than bytes written; (3) `RecordLongRunning` is applied as a response-body
 //! guard for WATCH/CONNECT verbs, so upgraded (101) exec/attach/portforward
-//! connections are not held open by it; (4) no `requested_deprecated_apis`
-//! gauge.
+//! connections are not held open by it; (4) `deprecated`/`removedRelease` are
+//! resolved per request from `crate::deprecation` instead of being captured
+//! per route at install time (`installer.go:781-797`); the endpoint-level
+//! `Warning:` header is not emitted.
 
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
@@ -385,6 +387,19 @@ pub fn monitor_request(
             .with_label_values(&[&verb, group, resource, &req.subresource])
             .inc();
     }
+    // `deprecated` / `removedRelease` are fixed per route at install time
+    // (installer.go:781-797); resolved here from the request's resource.
+    let (deprecated, removed_release) =
+        crate::deprecation::deprecation_for(group, version, resource, &req.subresource);
+    if deprecated {
+        DEPRECATED_REQUEST_GAUGE
+            .with_label_values(&[group, version, resource, &req.subresource, &removed_release])
+            .set(1);
+        crate::audit::add_audit_annotation(DEPRECATED_ANNOTATION_KEY, "true");
+        if !removed_release.is_empty() {
+            crate::audit::add_audit_annotation(REMOVED_RELEASE_ANNOTATION_KEY, &removed_release);
+        }
+    }
     REQUEST_LATENCIES
         .with_label_values(&[
             &verb,
@@ -453,6 +468,20 @@ pub(crate) fn clean_field_validation(query: &str) -> String {
     }
     values[0].to_string()
 }
+
+/// `deprecatedRequestGauge` (metrics.go:66-74).
+static DEPRECATED_REQUEST_GAUGE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    gauge_vec(
+        "requested_deprecated_apis",
+        "Gauge of deprecated APIs that have been requested, broken out by API group, version, resource, subresource, and removed_release.",
+        &["group", "version", "resource", "subresource", "removed_release"],
+    )
+});
+
+/// `deprecatedAnnotationKey` (metrics.go:380-382).
+const DEPRECATED_ANNOTATION_KEY: &str = "k8s.io/deprecated";
+/// `removedReleaseAnnotationKey` (metrics.go:383-387).
+const REMOVED_RELEASE_ANNOTATION_KEY: &str = "k8s.io/removed-release";
 
 /// `apiSelfRequestCounter` (metrics.go:222-230).
 static API_SELF_REQUEST_COUNTER: LazyLock<IntCounterVec> = LazyLock::new(|| {

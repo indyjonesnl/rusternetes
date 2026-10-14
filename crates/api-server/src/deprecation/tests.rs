@@ -22,6 +22,7 @@ fn fake(
 #[test]
 fn test_major_minor() {
     // (name, major, minor, expect, want err)
+    #[allow(clippy::type_complexity)]
     let cases: &[(&str, &str, &str, (i64, i64), bool)] = &[
         ("empty", "", "", (0, 0), true),
         ("non-numeric major", "A", "0", (0, 0), true),
