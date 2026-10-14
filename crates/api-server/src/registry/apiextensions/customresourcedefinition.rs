@@ -82,14 +82,36 @@ fn record_storage_version(crd: &mut CustomResourceDefinition) {
 
 /// The CEL rule checks of `handlers::cel_validation`, as field errors under
 /// the schema they were found in.
-fn schema_rule_errors(crd: &CustomResourceDefinition) -> ErrorList {
+fn schema_rule_errors(
+    crd: &CustomResourceDefinition,
+    old: Option<&CustomResourceDefinition>,
+) -> ErrorList {
+    schema_rule_errors_in(
+        crd,
+        old,
+        &rusternetes_common::cel_versions::EnvSet::must_base_env_set(
+            rusternetes_common::cel_versions::default_compatibility_version(),
+        ),
+    )
+}
+
+/// [`schema_rule_errors`] against an explicit environment set.
+fn schema_rule_errors_in(
+    crd: &CustomResourceDefinition,
+    _old: Option<&CustomResourceDefinition>,
+    env_set: &rusternetes_common::cel_versions::EnvSet,
+) -> ErrorList {
     let mut errs = Vec::new();
     for (i, version) in crd.spec.versions.iter().enumerate() {
         let Some(validation) = &version.schema else {
             continue;
         };
         if let Err(e) =
-            crate::handlers::cel_validation::validate_crd_rules(&validation.open_apiv3_schema)
+            crate::handlers::cel_validation::validate_crd_rules_in(
+                &validation.open_apiv3_schema,
+                env_set,
+                &std::collections::HashSet::new(),
+            )
         {
             let detail = match e {
                 Error::InvalidResource(msg) => msg,
@@ -238,7 +260,7 @@ impl RestCreateStrategy<CustomResourceDefinition> for Strategy {
     /// `Validate` (strategy.go:120-122).
     fn validate(&self, _ctx: &RequestContext, obj: &CustomResourceDefinition) -> ErrorList {
         let mut errs = validate_custom_resource_definition(obj);
-        errs.extend(schema_rule_errors(obj));
+        errs.extend(schema_rule_errors(obj, None));
         errs
     }
 
@@ -285,7 +307,7 @@ impl RestUpdateStrategy<CustomResourceDefinition> for Strategy {
         old: &CustomResourceDefinition,
     ) -> ErrorList {
         let mut errs = validate_custom_resource_definition_update(obj, old);
-        errs.extend(schema_rule_errors(obj));
+        errs.extend(schema_rule_errors(obj, Some(old)));
         errs
     }
 
@@ -1668,6 +1690,38 @@ mod tests {
 
     fn ctx() -> RequestContext {
         RequestContext::new(None)
+    }
+
+    fn crd_with_rule(rule: &str) -> CustomResourceDefinition {
+        crd(serde_json::json!({"spec": {
+            "group": "example.com",
+            "scope": "Namespaced",
+            "names": {"plural": "widgets", "kind": "Widget"},
+            "versions": [{"name": "v1", "served": true, "storage": true,
+                "schema": {"openAPIV3Schema": {"type": "object",
+                    "x-kubernetes-validations": [{"rule": rule}]}}}]
+        }}))
+    }
+
+    /// `ValidateCustomResourceDefinitionUpdate` passes
+    /// `findPreexistingExpressions(&oldObj.Spec)` (validation.go:241), so a
+    /// rule the old CRD already stored compiles in `StoredExpressions`
+    /// (validation.go:158-163) even below the library's introduced version.
+    #[test]
+    fn update_compiles_preexisting_rules_in_the_stored_environment() {
+        use rusternetes_common::cel_versions::EnvSet;
+        use rusternetes_common::feature_gates::Version;
+        let rule = "semver('1.2.3').major() > 0";
+        let env_set = EnvSet::must_base_env_set(Version::major_minor(1, 32));
+        let new = crd_with_rule(rule);
+        // Create (no old object): a new expression, semver is undeclared.
+        assert!(!schema_rule_errors_in(&new, None, &env_set).is_empty());
+        // Update of a CRD already carrying the rule: stored environment.
+        let old = crd_with_rule(rule);
+        assert!(schema_rule_errors_in(&new, Some(&old), &env_set).is_empty());
+        // A rule not in the old CRD is still new.
+        let other = crd_with_rule("semver('1.2.3').minor() > 0");
+        assert!(!schema_rule_errors_in(&other, Some(&old), &env_set).is_empty());
     }
 
     fn crd_with_props(props: serde_json::Value) -> CustomResourceDefinition {
