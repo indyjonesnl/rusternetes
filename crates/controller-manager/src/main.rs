@@ -311,11 +311,19 @@ struct Args {
     #[arg(long, default_value = "15")]
     leader_election_lease_duration: u64,
 
-    /// Port serving Prometheus `/metrics` (plain HTTP). 0 disables it.
-    /// Default is upstream kube-controller-manager's secure port
-    /// (`ports.KubeControllerManagerPort`, `pkg/cluster/ports/ports.go`).
-    #[arg(long, default_value_t = 10257)]
-    metrics_port: u16,
+    /// `SecureServing` (`--bind-address`, `--secure-port` default 10257,
+    /// `--tls-cert-file`, ...): HTTPS for `/metrics`, `/statusz`, `/flagz`
+    /// (cmd/kube-controller-manager/app/options/options.go:224-238).
+    #[command(flatten)]
+    secure_serving: rusternetes_middleware::secure_serving::options::SecureServingFlags,
+
+    /// `Authentication` (`--authentication-kubeconfig`, `--client-ca-file`, ...).
+    #[command(flatten)]
+    authentication: rusternetes_middleware::secure_serving::options::AuthenticationFlags,
+
+    /// `Authorization` (`--authorization-kubeconfig`, ...).
+    #[command(flatten)]
+    authorization: rusternetes_middleware::secure_serving::options::AuthorizationFlags,
 
     /// API server base URL for the HPA metrics client
     #[arg(long, default_value = "https://api-server:6443")]
@@ -479,56 +487,72 @@ fn node_ipam_params(args: &Args) -> Result<Option<(String, NodeCidrMaskSizes, Op
     )))
 }
 
+/// The `SecureServing` / `Authentication` / `Authorization` options of
+/// kube-controller-manager with the command line applied
+/// (cmd/kube-controller-manager/app/options/options.go:224-238).
+fn component_secure_serving(
+    _args: &Args,
+) -> rusternetes_middleware::secure_serving::ComponentSecureServing {
+    rusternetes_middleware::secure_serving::ComponentSecureServing::for_controller_manager()
+}
+
+/// `utilerrors.NewAggregate(errs).Error()` of the options `Validate`.
+fn aggregate_errors(errs: &[String]) -> String {
+    if errs.len() == 1 {
+        errs[0].clone()
+    } else {
+        format!("[{}]", errs.join(", "))
+    }
+}
+
+/// Serve `GET /metrics`, `/statusz` and `/flagz` over the secure port behind
+/// the authentication and authorization filters, as
+/// `cmd/kube-controller-manager/app/controllermanager.go:195-240` does:
+/// `BuildHandlerChain(unsecuredMux, &c.Authorization, &c.Authentication)`.
+/// Like upstream there is no insecure port, and a failure to set up secure
+/// serving is fatal.
+async fn serve_secure(
+    args: &Args,
+    gather: fn() -> String,
+    effective_version: rusternetes_common::compatibility::EffectiveVersion,
+    flags: rusternetes_common::flagz::NamedFlagSetsReader,
+) -> Result<()> {
+    let component = component_secure_serving(args);
+    let errs = component.validate();
+    if !errs.is_empty() {
+        anyhow::bail!("{}", aggregate_errors(&errs));
+    }
+    let app = axum::Router::new().route(
+        "/metrics",
+        axum::routing::get(move || async move { gather() }),
+    );
+    // `flagz.Install` behind the `ComponentFlagz` gate
+    // (cmd/kube-controller-manager/app/controllermanager.go:219-223).
+    let app = rusternetes_common::flagz::install_if_enabled(
+        app,
+        "kube-controller-manager",
+        Some(Box::new(flags)),
+    );
+    // `statusz.Install` behind the `ComponentStatusz` gate
+    // (cmd/kube-controller-manager/app/controllermanager.go:225-234), with
+    // `ComponentGlobalsRegistry.EffectiveVersionFor(DefaultKubeComponent)`
+    // and the listed paths of the mux (here only `/metrics`).
+    let app =
+        rusternetes_common::statusz::install_if_enabled(app, "kube-controller-manager", || {
+            rusternetes_common::statusz::Registry::new(Some(effective_version))
+                .with_listed_paths(vec!["/metrics".to_string()])
+        });
+    component
+        .serve(app)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to start secure serving: {e}"))?;
+    Ok(())
+}
+
 /// Run the controller-manager as an api-server client (in-cluster static pod).
 /// Resolves the api-server CA from `--kubeconfig` and the URL from
 /// `--api-server-url`, builds an [`ApiClient`], and delegates to the library's
 /// `run_with_api`, which drives every controller through `ApiStorage`.
-/// Serve `gather()` on `GET /metrics` (upstream serves the `legacyregistry` on
-/// the same path of the controller-manager's secure port). A bind failure is
-/// logged, not fatal: metrics must not take the controllers down.
-fn spawn_metrics_server(
-    port: u16,
-    gather: fn() -> String,
-    effective_version: rusternetes_common::compatibility::EffectiveVersion,
-    flags: rusternetes_common::flagz::NamedFlagSetsReader,
-) {
-    if port == 0 {
-        return;
-    }
-    tokio::spawn(async move {
-        let app = axum::Router::new().route(
-            "/metrics",
-            axum::routing::get(move || async move { gather() }),
-        );
-        // `flagz.Install` behind the `ComponentFlagz` gate
-        // (cmd/kube-controller-manager/app/controllermanager.go:219-223).
-        let app = rusternetes_common::flagz::install_if_enabled(
-            app,
-            "kube-controller-manager",
-            Some(Box::new(flags)),
-        );
-        // `statusz.Install` behind the `ComponentStatusz` gate
-        // (cmd/kube-controller-manager/app/controllermanager.go:225-234), with
-        // `ComponentGlobalsRegistry.EffectiveVersionFor(DefaultKubeComponent)`
-        // and the listed paths of the mux (here only `/metrics`).
-        let app =
-            rusternetes_common::statusz::install_if_enabled(app, "kube-controller-manager", || {
-                rusternetes_common::statusz::Registry::new(Some(effective_version))
-                    .with_listed_paths(vec!["/metrics".to_string()])
-            });
-        let addr = format!("0.0.0.0:{port}");
-        match tokio::net::TcpListener::bind(&addr).await {
-            Ok(listener) => {
-                info!("Serving /metrics on {addr}");
-                if let Err(e) = axum::serve(listener, app).await {
-                    error!("metrics server error: {e}");
-                }
-            }
-            Err(e) => warn!("metrics server: cannot bind {addr}: {e}"),
-        }
-    });
-}
-
 async fn run_api_mode(
     args: Args,
     effective_version: rusternetes_common::compatibility::EffectiveVersion,
@@ -539,12 +563,13 @@ async fn run_api_mode(
 
     // API mode runs the lib's controllers, so serve the lib's registry (the
     // bin compiles its own copy of `controllers`, with a separate registry).
-    spawn_metrics_server(
-        args.metrics_port,
+    serve_secure(
+        &args,
         rusternetes_controller_manager::controllers::gather_metrics,
         effective_version,
         flags,
-    );
+    )
+    .await?;
 
     let (ca_pem, kube_insecure, token, client_cert, client_key) =
         if let Some(path) = args.kubeconfig.as_deref() {
@@ -693,12 +718,7 @@ async fn main() -> Result<()> {
         return run_api_mode(args, effective_version, flags).await;
     }
 
-    spawn_metrics_server(
-        args.metrics_port,
-        controllers::gather_metrics,
-        effective_version,
-        flags,
-    );
+    serve_secure(&args, controllers::gather_metrics, effective_version, flags).await?;
 
     info!(
         "Starting Rusternetes Controller Manager {}",
@@ -1813,5 +1833,38 @@ mod pv_recycler_flag_tests {
         assert!(err.to_string().starts_with(
             "failed to probe volume plugins when starting persistentvolume controller: failed to read file path /nonexistent/pod.yaml: "
         ));
+    }
+}
+
+#[cfg(test)]
+mod secure_serving_flag_tests {
+    use super::*;
+
+    // cmd/kube-controller-manager/app/options/options.go:233-238
+    #[test]
+    fn default_secure_port_is_10257() {
+        let args = Args::try_parse_from(["controller-manager"]).unwrap();
+        let c = component_secure_serving(&args);
+        assert_eq!(c.secure_serving.bind_port, 10257);
+    }
+
+    // `--secure-port` / `--bind-address` (apiserver SecureServingOptions.AddFlags)
+    #[test]
+    fn secure_port_and_bind_address_flags_apply() {
+        let args = Args::try_parse_from([
+            "controller-manager",
+            "--secure-port=1234",
+            "--bind-address=127.0.0.1",
+        ])
+        .unwrap();
+        let c = component_secure_serving(&args);
+        assert_eq!(c.secure_serving.bind_port, 1234);
+        assert_eq!(c.secure_serving.bind_address.to_string(), "127.0.0.1");
+    }
+
+    // upstream has no plain-HTTP metrics port, so the flag is gone
+    #[test]
+    fn insecure_metrics_port_flag_is_gone() {
+        assert!(Args::try_parse_from(["controller-manager", "--metrics-port=8080"]).is_err());
     }
 }

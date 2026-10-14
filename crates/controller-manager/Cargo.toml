@@ -19,6 +19,8 @@ rusternetes-common = { path = "../common", features = ["axum-support", "clap-sup
 # api-client: StorageBackend::Api + the ApiStorage adapter used by run_with_api.
 rusternetes-storage = { path = "../storage", features = ["api-client"] }
 rusternetes-client = { path = "../client" }
+# secure serving + delegated authn/authz for /metrics, /statusz, /flagz (#3437)
+rusternetes-middleware = { path = "../middleware" }
 rusternetes-csi = { path = "../csi" }
 # gRPC status codes for the CSI provisioner (`isInfeasibleError`).
 tonic.workspace = true
