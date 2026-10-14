@@ -1122,6 +1122,7 @@ async fn main() -> Result<()> {
                         managed_by_id,
                         owner_namespace: namespace,
                         immediate_binding,
+                        refresher: Default::default(),
                     };
                     controllers::csi_capacity::run_capacity_loop(&ctl, &topology, poll).await;
                 }
