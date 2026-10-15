@@ -1391,11 +1391,19 @@ impl<T: Object, S: Storage> TryUpdate<T> for UpdateAttempt<'_, T, S> {
         if unconditional {
             obj.metadata_mut().resource_version = existing.metadata().resource_version.clone();
         } else if new_rv == 0 {
-            return Err(Abort::Api(Error::Invalid(vec![FieldError::invalid(
-                &Path::new("metadata").child("resourceVersion"),
-                0i64,
-                "must be specified for an update",
-            )])));
+            // `apierrors.NewInvalid(schema.GroupKind{Group:
+            // qualifiedResource.Group, Kind: qualifiedResource.Resource},
+            // name, fieldErrList)` (store.go:731-733).
+            return Err(Abort::Api(Error::new_invalid(
+                &self.store.qualified_resource.group,
+                &self.store.qualified_resource.resource,
+                self.name,
+                vec![FieldError::invalid(
+                    &Path::new("metadata").child("resourceVersion"),
+                    0i64,
+                    "must be specified for an update",
+                )],
+            )));
         } else if new_rv != parse_resource_version(existing.metadata())? {
             return Err(Abort::Api(
                 self.store.conflict(self.name, OPTIMISTIC_LOCK_ERROR_MSG),

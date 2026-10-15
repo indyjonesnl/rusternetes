@@ -24,7 +24,7 @@ use crate::state::ApiServerState;
 
 /// create.go:100-113: `metainternalversionscheme.ParameterCodec.DecodeParameters`
 /// then `ValidateCreateOptions`.
-pub(super) fn checked_create_options(params: &HashMap<String, String>) -> Result<CreateOptions> {
+pub(crate) fn checked_create_options(params: &HashMap<String, String>) -> Result<CreateOptions> {
     let options = CreateOptions {
         field_manager: params.get("fieldManager").cloned(),
         dry_run: dry_run_param(params),

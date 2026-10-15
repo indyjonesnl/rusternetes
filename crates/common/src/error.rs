@@ -689,7 +689,10 @@ mod tests {
             let c = &st.details.unwrap().causes.unwrap()[0];
             assert_eq!(c.reason.as_deref(), Some(reason), "{msg}");
         }
-        assert_eq!(ErrorType::TypeInvalid.cause_reason(), "FieldValueTypeInvalid");
+        assert_eq!(
+            ErrorType::TypeInvalid.cause_reason(),
+            "FieldValueTypeInvalid"
+        );
         assert_eq!(ErrorType::Internal.cause_reason(), "InternalError");
 
         // `IsInvalid(NewInvalid(kind("Test"), "2", nil))` (errors_test.go:72).
