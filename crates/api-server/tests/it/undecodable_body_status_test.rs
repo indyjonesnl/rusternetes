@@ -269,6 +269,8 @@ fn collection_uri(group: &str, version: &str, resource: &str, namespaced: bool) 
 }
 
 #[tokio::test]
+// Discovery then POST must see one gate state: wait out `#[serial]` gate flips (#3654).
+#[serial_test::parallel]
 async fn every_creatable_resource_rejects_an_undecodable_body_with_a_badrequest_status() {
     let api = TestApiServer::new();
     let resources = creatable_resources(&api).await;

@@ -92,6 +92,8 @@ fn is_decode_failure(answer: &Value) -> bool {
 }
 
 #[tokio::test]
+// Discovery then POST must see one gate state: wait out `#[serial]` gate flips (#3654).
+#[serial_test::parallel]
 async fn a_create_body_of_only_a_name_reaches_validation() {
     let api = TestApiServer::new();
     let resources = creatable_resources(&api).await;
