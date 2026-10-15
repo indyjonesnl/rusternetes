@@ -283,6 +283,21 @@ async fn main() -> Result<()> {
             })
         };
 
+        // OnStoppedLeading (server.go:310-322): exit 0 if asked to terminate,
+        // else "Leaderelection lost" and exit 1.
+        {
+            let lost = elector.lost_leadership();
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                rusternetes_common::leader_election::exit_on_stopped_leading(
+                    &lost,
+                    Some(&ctx),
+                    |code| std::process::exit(code),
+                )
+                .await
+            });
+        }
+
         let scheduler = Arc::new(Scheduler::new_with_profiles(
             storage,
             args.interval,

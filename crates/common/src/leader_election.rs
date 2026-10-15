@@ -85,13 +85,15 @@ impl ShutdownFlag {
 }
 
 /// Signal raised when the elector LOSES the lock (as opposed to being asked to
-/// shut down). Stub: red commit.
+/// shut down). Rust analogue of client-go's `Run` returning on a failed renew
+/// (`leaderelection.go:211-230`), which fires `OnStoppedLeading`.
 #[derive(Clone, Default)]
 pub struct LostLeadership {
     flag: Arc<ShutdownFlag>,
 }
 
 impl LostLeadership {
+    /// Resolves once the lock has been lost.
     pub async fn wait(&self) {
         self.flag.wait().await
     }
@@ -100,14 +102,34 @@ impl LostLeadership {
     }
 }
 
-/// Port of `OnStoppedLeading` (stub).
+/// `OnStoppedLeading` of the control-plane binaries. Waits for the lock to be
+/// lost, then exits through `exit` (`std::process::exit` in the binaries; an
+/// injectable seam so tests can observe the code).
+///
+/// - kube-controller-manager (`cmd/kube-controller-manager/app/controllermanager.go:367-369`):
+///   `klog.FlushAndExit(klog.ExitFlushTimeout, 1)`, unconditionally; it runs with
+///   `context.Background()`, so pass `ctx = None`.
+/// - kube-scheduler (`cmd/kube-scheduler/app/server.go:310-322`): exit 0 if the
+///   termination context is done ("Requested to terminate, exiting"), otherwise
+///   "Leaderelection lost" and exit 1.
+///
+/// Every controller stops because the process exits; the supervisor / compose
+/// restart policy then restarts it as a fresh follower.
 pub async fn exit_on_stopped_leading<F>(
-    _lost: &LostLeadership,
-    _ctx: Option<&crate::signal::ShutdownContext>,
-    _exit: F,
+    lost: &LostLeadership,
+    ctx: Option<&crate::signal::ShutdownContext>,
+    exit: F,
 ) where
     F: FnOnce(i32),
 {
+    lost.wait().await;
+    if ctx.is_some_and(|c| c.is_cancelled()) {
+        info!("Requested to terminate, exiting");
+        exit(0);
+    } else {
+        error!("Leaderelection lost");
+        exit(1);
+    }
 }
 
 /// LeaderElector manages leader election using etcd
@@ -117,6 +139,7 @@ pub struct LeaderElector {
     state: Arc<RwLock<LeaderState>>,
     lease_id: Arc<Mutex<Option<i64>>>,
     shutdown: Arc<ShutdownFlag>,
+    lost: LostLeadership,
 }
 
 impl LeaderElector {
@@ -138,7 +161,13 @@ impl LeaderElector {
             state: Arc::new(RwLock::new(LeaderState::Unknown)),
             lease_id: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(ShutdownFlag::default()),
+            lost: LostLeadership::default(),
         })
+    }
+
+    /// Handle that resolves when this elector loses the lock.
+    pub fn lost_leadership(&self) -> LostLeadership {
+        self.lost.clone()
     }
 
     /// Get the current leader state
@@ -186,7 +215,13 @@ impl LeaderElector {
             match self.attempt_leadership().await {
                 Ok(true) => {
                     // We acquired or maintained leadership
-                    self.run_as_leader().await?;
+                    if self.run_as_leader().await? {
+                        // client-go `Run` returns when renewal fails and its
+                        // deferred OnStoppedLeading fires (leaderelection.go:213);
+                        // it never resumes as a follower.
+                        self.lost.trigger().await;
+                        return Ok(());
+                    }
                 }
                 Ok(false) => {
                     // We are a follower
@@ -332,7 +367,8 @@ impl LeaderElector {
     }
 
     /// Run the leader loop - renew lease periodically
-    async fn run_as_leader(&self) -> Result<()> {
+    /// Returns `true` when leadership was lost, `false` on shutdown.
+    async fn run_as_leader(&self) -> Result<bool> {
         let mut renew_timer = interval(Duration::from_secs(self.config.renew_interval));
         renew_timer.tick().await; // First tick completes immediately
 
@@ -344,7 +380,7 @@ impl LeaderElector {
 
             // Check if we should shutdown
             if self.shutdown.is_set().await {
-                return Ok(());
+                return Ok(false);
             }
 
             // Verify we're still the leader and renew lease
@@ -355,13 +391,13 @@ impl LeaderElector {
                 }
                 Ok(false) => {
                     // Lost leadership
-                    warn!("Lost leadership, returning to election loop");
-                    return Ok(());
+                    warn!("Lost leadership");
+                    return Ok(true);
                 }
                 Err(e) => {
                     error!(error = %e, "Error maintaining leadership");
                     *self.state.write().await = LeaderState::Unknown;
-                    return Ok(());
+                    return Ok(true);
                 }
             }
         }

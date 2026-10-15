@@ -831,6 +831,17 @@ async fn main() -> Result<()> {
             }
         });
 
+        // OnStoppedLeading (controllermanager.go:367-369): exit 1 on a lost
+        // lock so every controller stops; the restart policy brings up a fresh
+        // follower. Upstream runs with context.Background(), so no ctx.
+        let lost = elector.lost_leadership();
+        tokio::spawn(async move {
+            rusternetes_common::leader_election::exit_on_stopped_leading(&lost, None, |code| {
+                std::process::exit(code)
+            })
+            .await
+        });
+
         Some(elector)
     } else {
         warn!("Leader election disabled - running in single-instance mode");
