@@ -1386,7 +1386,7 @@ mod embedded_resource_tests {
 
     fn fields(errs: &ErrorList) -> Vec<(ErrorType, String)> {
         errs.iter()
-            .map(|e| (e.error_type.clone(), e.field.clone()))
+            .map(|e| (e.error_type, e.field.clone()))
             .collect()
     }
 
