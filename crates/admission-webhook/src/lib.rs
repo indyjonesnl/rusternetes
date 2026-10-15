@@ -5799,3 +5799,308 @@ mod dispatcher_metrics_tests {
         assert!(plugin_count("ValidatingAdmissionPolicy", "validate", "false") > before);
     }
 }
+
+/// Webhook-kind `apiserver_admission_match_condition_*` metrics
+/// (webhook/generic/webhook.go:236, webhook/matchconditions/matcher.go:84-143).
+#[cfg(test)]
+mod webhook_match_condition_metrics_tests {
+    use super::*;
+    use rusternetes_common::resources::admission_webhook::MatchCondition;
+    use rusternetes_common::resources::{
+        MutatingWebhook, OperationType, Rule, RuleWithOperations, SideEffectClass,
+        ValidatingWebhook, WebhookClientConfig,
+    };
+    use rusternetes_storage::memory::MemoryStorage;
+    use serde_json::json;
+
+    /// An address nothing listens on: any call to it fails, so an `Ok` result
+    /// proves the webhook was never called.
+    const DEAD: &str = "http://127.0.0.1:1/admit";
+
+    fn rule() -> RuleWithOperations {
+        RuleWithOperations {
+            operations: vec![OperationType::Create],
+            rule: Rule {
+                api_groups: vec!["".into()],
+                api_versions: vec!["v1".into()],
+                resources: vec!["configmaps".into()],
+                scope: None,
+            },
+        }
+    }
+
+    fn gvk() -> GroupVersionKind {
+        GroupVersionKind {
+            group: "".into(),
+            version: "v1".into(),
+            kind: "ConfigMap".into(),
+        }
+    }
+
+    fn gvr() -> GroupVersionResource {
+        GroupVersionResource {
+            group: "".into(),
+            version: "v1".into(),
+            resource: "configmaps".into(),
+        }
+    }
+
+    fn user() -> UserInfo {
+        UserInfo {
+            username: "u".into(),
+            uid: "1".into(),
+            groups: vec![],
+        }
+    }
+
+    fn conds(exprs: &[&str]) -> Option<Vec<MatchCondition>> {
+        Some(
+            exprs
+                .iter()
+                .enumerate()
+                .map(|(i, e)| MatchCondition {
+                    name: format!("c{i}"),
+                    expression: (*e).to_string(),
+                })
+                .collect(),
+        )
+    }
+
+    const FALSE: &str = "false";
+    const TRUE: &str = "true";
+    /// Runtime error: the key does not exist.
+    const ERR: &str = "object.metadata.nosuchfield == 'x'";
+
+    async fn run_validating(
+        name: &str,
+        policy: FailurePolicy,
+        exprs: &[&str],
+    ) -> Result<AdmissionResponse> {
+        let storage = Arc::new(MemoryStorage::new());
+        let cfg = ValidatingWebhookConfiguration {
+            api_version: "admissionregistration.k8s.io/v1".into(),
+            kind: "ValidatingWebhookConfiguration".into(),
+            metadata: rusternetes_common::types::ObjectMeta::new(name),
+            webhooks: Some(vec![ValidatingWebhook {
+                name: name.into(),
+                client_config: WebhookClientConfig {
+                    url: Some(DEAD.into()),
+                    service: None,
+                    ca_bundle: None,
+                },
+                rules: vec![rule()],
+                failure_policy: Some(policy),
+                match_policy: None,
+                namespace_selector: None,
+                object_selector: None,
+                side_effects: SideEffectClass::None,
+                timeout_seconds: Some(2),
+                admission_review_versions: vec!["v1".into()],
+                match_conditions: conds(exprs),
+            }]),
+        };
+        storage
+            .create(
+                &format!("/registry/validatingwebhookconfigurations/{name}"),
+                &cfg,
+            )
+            .await
+            .unwrap();
+        AdmissionWebhookManager::new(storage)
+            .run_validating_webhooks(
+                &Operation::Create,
+                &gvk(),
+                &gvr(),
+                Some("default"),
+                "c",
+                Some(json!({"metadata": {"name": "c"}})),
+                None,
+                &user(),
+            )
+            .await
+    }
+
+    async fn run_mutating(
+        name: &str,
+        policy: FailurePolicy,
+        exprs: &[&str],
+    ) -> Result<AdmissionResponse> {
+        let storage = Arc::new(MemoryStorage::new());
+        let cfg = MutatingWebhookConfiguration {
+            api_version: "admissionregistration.k8s.io/v1".into(),
+            kind: "MutatingWebhookConfiguration".into(),
+            metadata: rusternetes_common::types::ObjectMeta::new(name),
+            webhooks: Some(vec![MutatingWebhook {
+                name: name.into(),
+                client_config: WebhookClientConfig {
+                    url: Some(DEAD.into()),
+                    service: None,
+                    ca_bundle: None,
+                },
+                rules: vec![rule()],
+                failure_policy: Some(policy),
+                match_policy: None,
+                namespace_selector: None,
+                object_selector: None,
+                side_effects: SideEffectClass::None,
+                timeout_seconds: Some(2),
+                admission_review_versions: vec!["v1".into()],
+                match_conditions: conds(exprs),
+                reinvocation_policy: None,
+            }]),
+        };
+        storage
+            .create(
+                &format!("/registry/mutatingwebhookconfigurations/{name}"),
+                &cfg,
+            )
+            .await
+            .unwrap();
+        AdmissionWebhookManager::new(storage)
+            .run_mutating_webhooks(
+                &Operation::Create,
+                &gvk(),
+                &gvr(),
+                Some("default"),
+                "c",
+                Some(json!({"metadata": {"name": "c"}})),
+                None,
+                &user(),
+            )
+            .await
+            .map(|(r, _)| r)
+    }
+
+    /// Value of the series of `family` carrying `name`/`webhook`/`ty`/CREATE;
+    /// 0 when it was never observed.
+    fn count(family: &str, name: &str, ty: &str) -> u64 {
+        let l = [
+            ("name", name),
+            ("kind", "webhook"),
+            ("type", ty),
+            ("operation", "CREATE"),
+        ];
+        prometheus::gather()
+            .iter()
+            .filter(|f| f.name() == family)
+            .flat_map(|f| f.get_metric().iter())
+            .find(|m| {
+                l.iter().all(|(k, v)| {
+                    m.get_label()
+                        .iter()
+                        .any(|p| p.name() == *k && p.value() == *v)
+                })
+            })
+            .map(|m| {
+                if family.ends_with("_total") {
+                    m.get_counter().value() as u64
+                } else {
+                    m.get_histogram().get_sample_count()
+                }
+            })
+            .unwrap_or(0)
+    }
+
+    fn excl(name: &str, ty: &str) -> u64 {
+        count(
+            "apiserver_admission_match_condition_exclusions_total",
+            name,
+            ty,
+        )
+    }
+    fn errs(name: &str, ty: &str) -> u64 {
+        count(
+            "apiserver_admission_match_condition_evaluation_errors_total",
+            name,
+            ty,
+        )
+    }
+    fn secs(name: &str, ty: &str) -> u64 {
+        count(
+            "apiserver_admission_match_condition_evaluation_seconds",
+            name,
+            ty,
+        )
+    }
+
+    /// matcher.go:109-116: a `false` condition observes the evaluation time;
+    /// webhook.go:236 observes the exclusion; the webhook is never called.
+    #[tokio::test]
+    async fn validating_false_condition_observes_exclusion_and_time() {
+        let r = run_validating("mc-v-false", FailurePolicy::Fail, &[TRUE, FALSE]).await;
+        assert!(r.is_ok(), "excluded webhook must not be called: {r:?}");
+        assert_eq!(excl("mc-v-false", "validate"), 1);
+        assert_eq!(secs("mc-v-false", "validate"), 1);
+        assert_eq!(errs("mc-v-false", "validate"), 0);
+    }
+
+    /// Mutating webhooks are labelled `admit` (accessors.go:129, :148).
+    #[tokio::test]
+    async fn mutating_false_condition_observes_exclusion_and_time() {
+        let r = run_mutating("mc-m-false", FailurePolicy::Fail, &[FALSE]).await;
+        assert!(r.is_ok(), "excluded webhook must not be called: {r:?}");
+        assert_eq!(excl("mc-m-false", "admit"), 1);
+        assert_eq!(secs("mc-m-false", "admit"), 1);
+    }
+
+    /// matcher.go:105-107, :118-120: every erroring condition counts, then
+    /// failurePolicy Ignore skips the webhook (`Matches: false`), which is an
+    /// exclusion (webhook.go:235-238).
+    #[tokio::test]
+    async fn validating_eval_error_ignore_counts_each_error_and_excludes() {
+        let r = run_validating("mc-v-ign", FailurePolicy::Ignore, &[ERR, TRUE, ERR]).await;
+        assert!(r.is_ok());
+        assert_eq!(errs("mc-v-ign", "validate"), 2);
+        assert_eq!(secs("mc-v-ign", "validate"), 1);
+        assert_eq!(excl("mc-v-ign", "validate"), 1);
+    }
+
+    /// matcher.go:123-131 + webhook.go:231-234: failurePolicy Fail turns the
+    /// errors into a Forbidden for the request (no exclusion, no call).
+    #[tokio::test]
+    async fn validating_eval_error_fail_is_forbidden_not_excluded() {
+        let r = run_validating("mc-v-fail", FailurePolicy::Fail, &[ERR]).await;
+        let e = r.expect_err("fail policy must reject on match-condition error");
+        assert!(
+            e.to_string().to_lowercase().contains("forbidden"),
+            "got {e}"
+        );
+        assert_eq!(errs("mc-v-fail", "validate"), 1);
+        assert_eq!(secs("mc-v-fail", "validate"), 1);
+        assert_eq!(excl("mc-v-fail", "validate"), 0);
+    }
+
+    #[tokio::test]
+    async fn mutating_eval_error_fail_is_forbidden_ignore_excludes() {
+        let r = run_mutating("mc-m-fail", FailurePolicy::Fail, &[ERR]).await;
+        assert!(r.is_err());
+        assert_eq!(errs("mc-m-fail", "admit"), 1);
+        assert_eq!(excl("mc-m-fail", "admit"), 0);
+        let r = run_mutating("mc-m-ign", FailurePolicy::Ignore, &[ERR]).await;
+        assert!(r.is_ok());
+        assert_eq!(errs("mc-m-ign", "admit"), 1);
+        assert_eq!(excl("mc-m-ign", "admit"), 1);
+    }
+
+    /// A `false` after an error: the false short-circuits and the webhook is
+    /// skipped even under Fail (matcher.go:111-121 "skip calling webhook
+    /// always"); the earlier error was still counted.
+    #[tokio::test]
+    async fn false_after_error_excludes_even_under_fail() {
+        let r = run_validating("mc-v-mix", FailurePolicy::Fail, &[ERR, FALSE]).await;
+        assert!(r.is_ok());
+        assert_eq!(errs("mc-v-mix", "validate"), 1);
+        assert_eq!(excl("mc-v-mix", "validate"), 1);
+    }
+
+    /// All conditions true: no exclusion, no evaluation-time observation
+    /// (matcher.go:140-143 returns without observing); the webhook IS called.
+    #[tokio::test]
+    async fn all_true_conditions_observe_nothing() {
+        let r = run_validating("mc-v-true", FailurePolicy::Fail, &[TRUE]).await;
+        assert!(r.is_err(), "matching webhook is called (dead url)");
+        assert_eq!(excl("mc-v-true", "validate"), 0);
+        assert_eq!(secs("mc-v-true", "validate"), 0);
+        assert_eq!(errs("mc-v-true", "validate"), 0);
+    }
+}
