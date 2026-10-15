@@ -149,7 +149,7 @@ impl DeviceMounter for IscsiAttacher {
         // `mountArgs.SELinuxLabel` -> `AddSELinuxMountOption`: see the module docs.
         if not_mnt {
             let exec: Arc<dyn Exec> = Arc::new(RealExec);
-            let disk_mounter = SafeFormatAndMount { mounter, exec };
+            let disk_mounter = SafeFormatAndMount::new(mounter, exec);
             let mount_options = mount_option_from_spec(spec, &options);
             let (device_path, target) = (device_path.to_string(), device_mount_path.to_string());
             let res = tokio::task::spawn_blocking(move || {
