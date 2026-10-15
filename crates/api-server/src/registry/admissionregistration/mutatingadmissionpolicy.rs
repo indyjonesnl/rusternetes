@@ -97,6 +97,7 @@ fn compile_errors(obj: &MutatingAdmissionPolicy, ignore_match_conditions: bool) 
         // compiler, so no `variables` and no patch types.
         let env = MutationEnv {
             has_params,
+            has_authorizer: true,
             has_patch_types: false,
             variables: None,
         };
@@ -122,6 +123,7 @@ fn compile_errors(obj: &MutatingAdmissionPolicy, ignore_match_conditions: bool) 
         .collect();
     let variable_env = MutationEnv {
         has_params,
+        has_authorizer: true,
         has_patch_types: false,
         variables: Some(variables),
     };

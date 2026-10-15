@@ -131,6 +131,7 @@ fn validation_and_evaluation_compose() {
     use rusternetes_common::cel_env::{mutation_env_failure, ExpectedOutput, MutationEnv};
     let env = MutationEnv {
         has_params: false,
+        has_authorizer: true,
         has_patch_types: true,
         variables: None,
     };

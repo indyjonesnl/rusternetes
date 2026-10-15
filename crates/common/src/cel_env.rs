@@ -45,6 +45,10 @@ use cel::common::ast::{EntryExpr, Expr, IdedExpr, LiteralValue};
 pub struct MutationEnv {
     /// `HasParams`: `spec.paramKind != nil`.
     pub has_params: bool,
+    /// `HasAuthorizer`: whether `authorizer` is declared. Every environment
+    /// but the one a `messageExpression` is compiled in has it
+    /// (`compilePolicy`, validating/plugin.go:118-119; validation.go:1124).
+    pub has_authorizer: bool,
     /// `HasPatchTypes`: the `Object` / `JSONPatch` type resolver.
     pub has_patch_types: bool,
     /// The fields of the composited `variables` object; `None` when the
@@ -61,6 +65,9 @@ pub enum ExpectedOutput {
     /// `MatchCondition.ReturnTypes()` is `[cel.BoolType]`
     /// (`admission/plugin/webhook/matchconditions/matcher.go:49-51`).
     Bool,
+    /// `MessageExpressionCondition.ReturnTypes()` is `[cel.StringType]`
+    /// (validating/message.go:34-36).
+    String,
     /// `ApplyConfigurationCondition` (smd.go:52).
     Object,
     /// `JSONPatchCondition` (json_patch.go:57).
@@ -70,14 +77,14 @@ pub enum ExpectedOutput {
 /// `variables` declared in every environment that composes them.
 const VARIABLES: &str = "variables";
 
-/// Names declared by `createEnvForOpts` apart from `params` / `variables`,
+/// Names declared by `createEnvForOpts` apart from `params` / `variables` /
+/// `authorizer`,
 /// and the CEL type identifiers every environment declares.
 const DECLARED: &[&str] = &[
     "object",
     "oldObject",
     "namespaceObject",
     "request",
-    "authorizer",
     "int",
     "uint",
     "double",
@@ -137,6 +144,7 @@ impl Checker<'_> {
         self.scope.iter().any(|s| s == name)
             || DECLARED.contains(&name)
             || (name == "params" && self.env.has_params)
+            || (name == "authorizer" && self.env.has_authorizer)
             || (name == VARIABLES && self.env.variables.is_some())
     }
 
@@ -227,6 +235,7 @@ fn output_mismatch(root: &IdedExpr, expected: ExpectedOutput) -> Option<String> 
     let want = match expected {
         ExpectedOutput::Any => return None,
         ExpectedOutput::Bool => "bool",
+        ExpectedOutput::String => "string",
         ExpectedOutput::Object => "Object",
         ExpectedOutput::JsonPatchList => "list(JSONPatch)",
     };
@@ -285,6 +294,7 @@ mod tests {
     fn env() -> MutationEnv {
         MutationEnv {
             has_params: false,
+            has_authorizer: true,
             has_patch_types: true,
             variables: Some(["x".to_string()].into()),
         }
@@ -322,9 +332,33 @@ mod tests {
         assert_eq!(fail("params.foo == 'a'", &with, ExpectedOutput::Any), "");
     }
 
+    /// plugin.go:119: a `messageExpression` has no `authorizer`.
+    #[test]
+    fn authorizer_needs_has_authorizer() {
+        let src = "authorizer.group('').resource('pods').check('get').allowed()";
+        assert_eq!(fail(src, &env(), ExpectedOutput::Bool), "");
+        let without = MutationEnv {
+            has_authorizer: false,
+            ..env()
+        };
+        let m = fail(src, &without, ExpectedOutput::Bool);
+        assert!(m.contains("undeclared reference to 'authorizer'"), "{m}");
+    }
+
+    /// message.go:34-36 / validation_test.go:2644.
+    #[test]
+    fn a_message_expression_must_be_a_string() {
+        let m = fail("0 == 0", &env(), ExpectedOutput::String);
+        assert_eq!(m, "must evaluate to string but got bool");
+        assert_eq!(fail("'a'", &env(), ExpectedOutput::String), "");
+    }
+
     #[test]
     fn variables_is_undeclared_in_the_stateless_environment() {
-        let stateless = MutationEnv::default();
+        let stateless = MutationEnv {
+            has_authorizer: true,
+            ..MutationEnv::default()
+        };
         let m = fail("variables.x", &stateless, ExpectedOutput::Any);
         assert!(m.contains("undeclared reference to 'variables'"), "{m}");
     }
