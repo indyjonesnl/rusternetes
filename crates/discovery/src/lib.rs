@@ -4544,6 +4544,57 @@ mod tests {
         assert_eq!(v["minCompatibilityMinor"], "34");
     }
 
+    /// customresource_discovery_controller.go:105-135 `sync`: every
+    /// Established CRD of a group contributes its served versions to one
+    /// APIGroup (de-duplicated via versionsForDiscoveryMap), so two CRDs
+    /// sharing a group surface the union of their versions in /apis,
+    /// matching /apis/{group}.
+    #[tokio::test]
+    async fn apis_merges_served_versions_across_crds_in_a_group() {
+        use rusternetes_storage::Storage;
+        let storage = std::sync::Arc::new(rusternetes_storage::StorageBackend::new_memory());
+        for (name, plural, kind, vers) in [
+            ("foos.merge.example.com", "foos", "Foo", vec!["v1", "v1beta1"]),
+            ("bars.merge.example.com", "bars", "Bar", vec!["v1", "v2"]),
+        ] {
+            let versions: Vec<_> = vers
+                .iter()
+                .map(|v| serde_json::json!({"name": v, "served": true, "storage": *v == "v1"}))
+                .collect();
+            let crd = serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": {"name": name},
+                "spec": {"group": "merge.example.com", "scope": "Namespaced",
+                    "names": {"plural": plural, "singular": plural, "kind": kind},
+                    "versions": versions},
+                "status": {"conditions": [{"type": "Established", "status": "True"}]}
+            });
+            let key = rusternetes_storage::build_key("customresourcedefinitions", None, name);
+            storage.create(&key, &crd).await.unwrap();
+        }
+        let resp = get_api_groups(Some(storage.clone()), HeaderMap::new()).await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let matching: Vec<_> = doc["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|g| g["name"] == "merge.example.com")
+            .collect();
+        assert_eq!(matching.len(), 1, "one APIGroup per group");
+        let got: Vec<&str> = matching[0]["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["version"].as_str().unwrap())
+            .collect();
+        assert_eq!(got, ["v2", "v1", "v1beta1"]);
+        assert_eq!(matching[0]["preferredVersion"]["version"], "v2");
+    }
+
     /// customresource_discovery_controller.go:284-288
     /// `sortGroupDiscoveryByKubeAwareVersion`: a CRD group's versions are
     /// ordered by kube-aware version priority (not the CRD's listed order)
