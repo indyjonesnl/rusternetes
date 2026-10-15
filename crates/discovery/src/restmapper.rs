@@ -1154,6 +1154,7 @@ pub fn served_group_resources(crds: &[serde_json::Value]) -> Vec<ApiGroupResourc
     }
 
     // Established CRDs, one APIResource per served version.
+    let mut crd_groups: Vec<usize> = Vec::new();
     for crd in crds.iter().filter(|c| super::crd_established(c)) {
         let (Some(group), Some(names), Some(versions)) = (
             crd.pointer("/spec/group").and_then(|v| v.as_str()),
@@ -1177,6 +1178,7 @@ pub fn served_group_resources(crds: &[serde_json::Value]) -> Vec<ApiGroupResourc
                     name: group.to_string(),
                     ..Default::default()
                 });
+                crd_groups.push(out.len() - 1);
                 out.len() - 1
             }
         };
@@ -1203,6 +1205,15 @@ pub fn served_group_resources(crds: &[serde_json::Value]) -> Vec<ApiGroupResourc
                     namespaced,
                     kind: kind.to_string(),
                 });
+        }
+    }
+    // customresource_discovery_controller.go:225-231, 284-288: versions by
+    // kube-aware priority, the first is the preferred version.
+    for idx in crd_groups {
+        let g = &mut out[idx];
+        super::kube_version::sort_by_kube_aware_version_desc(&mut g.versions, |v| v.as_str());
+        if let Some(first) = g.versions.first() {
+            g.preferred_version = first.clone();
         }
     }
     out

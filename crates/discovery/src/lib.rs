@@ -393,7 +393,12 @@ pub async fn get_api_groups(
                             "freshness": "Current"
                         }));
                 }
-                for (group, versions) in crd_groups {
+                for (group, mut versions) in crd_groups {
+                    // sortGroupDiscoveryByKubeAwareVersion
+                    // (customresource_discovery_controller.go:284-288).
+                    kube_version::sort_by_kube_aware_version_desc(&mut versions, |v| {
+                        v["version"].as_str().unwrap_or("")
+                    });
                     if !seen_groups.contains(&group) {
                         seen_groups.insert(group.clone());
                         groups.push(
@@ -826,6 +831,15 @@ pub async fn get_api_groups(
                             }
                             gv_versions.push(gv);
                         }
+                    }
+                    // sortGroupDiscoveryByKubeAwareVersion, then the first item
+                    // is the preferred version
+                    // (customresource_discovery_controller.go:225-231, 284-288).
+                    kube_version::sort_by_kube_aware_version_desc(&mut gv_versions, |v| {
+                        v.version.as_str()
+                    });
+                    if let Some(first) = gv_versions.first() {
+                        preferred = Some(first.clone());
                     }
                     if !gv_versions.is_empty() {
                         groups.push(APIGroup {
@@ -1939,6 +1953,8 @@ pub async fn get_api_group(
                     }
                 }
             }
+            // customresource_discovery_controller.go:225-231, 284-288.
+            kube_version::sort_by_kube_aware_version_desc(&mut versions, |v| v.version.as_str());
             if !versions.is_empty() {
                 let preferred = versions[0].clone();
                 let response = serde_json::json!({
@@ -4614,7 +4630,7 @@ mod tests {
         assert_eq!(got, want);
 
         // RESTMapper input: versions in kube-aware order, preferred first.
-        let groups = restmapper::served_group_resources(&[crd.clone()]);
+        let groups = restmapper::served_group_resources(std::slice::from_ref(&crd));
         let g = groups
             .iter()
             .find(|g| g.name == "ordered.example.com")

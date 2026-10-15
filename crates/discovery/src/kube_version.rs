@@ -1,3 +1,84 @@
+//! Kube-aware version ordering.
+//!
+//! Ported from `staging/src/k8s.io/apimachinery/pkg/version/helpers.go`
+//! (`versionType` :27-34, `kubeVersionRegex` :36, `parseKubeVersion` :38-62,
+//! `CompareKubeAwareVersionStrings` :64-88) and
+//! `staging/src/k8s.io/apiextensions-apiserver/pkg/apiserver/
+//! customresource_discovery_controller.go` `sortGroupDiscoveryByKubeAwareVersion`
+//! (:284-288).
+
+use std::cmp::Ordering;
+
+/// `versionType`: the bigger, the higher the priority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum VersionType {
+    Alpha,
+    Beta,
+    Ga,
+}
+
+/// `parseKubeVersion`: `^v([\d]+)(?:(alpha|beta)([\d]+))?$`, as
+/// `(major, type, minor)`; the minor of a GA version is 0.
+fn parse_kube_version(v: &str) -> Option<(i64, VersionType, i64)> {
+    let rest = v.strip_prefix('v')?;
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let major_end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    let (major, tail) = rest.split_at(major_end);
+    if !digits(major) {
+        return None;
+    }
+    let major = major.parse().ok()?;
+    if tail.is_empty() {
+        return Some((major, VersionType::Ga, 0));
+    }
+    let (vtype, minor) = match (tail.strip_prefix("alpha"), tail.strip_prefix("beta")) {
+        (Some(m), _) => (VersionType::Alpha, m),
+        (_, Some(m)) => (VersionType::Beta, m),
+        _ => return None,
+    };
+    if !digits(minor) {
+        return None;
+    }
+    Some((major, vtype, minor.parse().ok()?))
+}
+
+/// `CompareKubeAwareVersionStrings`: negative, zero or positive as `v1` sorts
+/// below, equal to or above `v2` (GA > beta > alpha, then major, then minor;
+/// kube-like versions beat the rest, which compare in reverse alphabetical
+/// order, exactly as upstream's `strings.Compare(v2, v1)`).
+pub fn compare_kube_aware_version_strings(v1: &str, v2: &str) -> i64 {
+    if v1 == v2 {
+        return 0;
+    }
+    match (parse_kube_version(v1), parse_kube_version(v2)) {
+        (None, None) => match v2.cmp(v1) {
+            Ordering::Less => -1,
+            Ordering::Equal => 0,
+            Ordering::Greater => 1,
+        },
+        (None, Some(_)) => -1,
+        (Some(_), None) => 1,
+        (Some((major1, type1, minor1)), Some((major2, type2, minor2))) => {
+            if type1 != type2 {
+                return type1 as i64 - type2 as i64;
+            }
+            if major1 != major2 {
+                return major1 - major2;
+            }
+            minor1 - minor2
+        }
+    }
+}
+
+/// `sortGroupDiscoveryByKubeAwareVersion`: highest version first, so the first
+/// item is the group's preferred version. `sort.Slice` is not stable but the
+/// comparison is total over distinct names, so the result is the same.
+pub fn sort_by_kube_aware_version_desc<T>(items: &mut [T], version: impl Fn(&T) -> &str) {
+    items.sort_by(|a, b| compare_kube_aware_version_strings(version(b), version(a)).cmp(&0));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
