@@ -2130,6 +2130,12 @@ pub struct BookmarkObject {
 /// produce an HTTP 410 (and used to), upstream clients treat
 /// `?watch=true` as "always 200 + stream of events" — so we must surface
 /// the failure as a streamed ERROR envelope.
+///
+/// Framing is left to the HTTP server, as Go's net/http does for `serveWatch`:
+/// the body here is a fixed-size `Body::from(String)`, so hyper sends a
+/// `Content-Length`. Setting `Transfer-Encoding: chunked` by hand on it makes
+/// hyper write the raw bytes unchunked and the client sees
+/// `IncompleteMessage` instead of the ERROR event (#3761).
 fn build_watch_error_response(status_obj: Status) -> Result<Response> {
     let envelope = K8sWatchEvent {
         event_type: WatchEventType::Error,
@@ -2143,7 +2149,6 @@ fn build_watch_error_response(status_obj: Status) -> Result<Response> {
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::CACHE_CONTROL, "no-cache, private")
-        .header(header::TRANSFER_ENCODING, "chunked")
         .body(Body::from(body))
         .map_err(|e| Error::Internal(format!("Failed to build ERROR response: {}", e)))
 }
