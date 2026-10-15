@@ -316,6 +316,7 @@ mod serviceaccount_list_watch_fieldselector_test;
 mod serviceaccount_store_test;
 mod small_api_decode_when_absent_test;
 mod ssa_configmap_apply_test;
+mod ssa_reset_fields_batch_test;
 mod ssa_reset_fields_test;
 mod ssa_secret_apply_test;
 mod statefulset_generic_store_test;

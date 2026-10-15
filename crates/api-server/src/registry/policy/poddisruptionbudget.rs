@@ -22,6 +22,7 @@ use crate::registry::rest::{
     GroupResource, NamespaceScopedStrategy, RequestContext, RestCreateStrategy, RestDeleteStrategy,
     RestUpdateStrategy,
 };
+use crate::ssa::ResetFields;
 
 /// `policy.PDBV1beta1Label` (pkg/apis/policy/helper.go:24).
 const PDB_V1BETA1_LABEL: &str = "pdb.kubernetes.io/deprecated-v1beta1-empty-selector-match";
@@ -144,6 +145,13 @@ impl RestUpdateStrategy<PodDisruptionBudget> for Strategy {
     fn allow_unconditional_update(&self) -> bool {
         false
     }
+
+    /// `GetResetFields` (policy/poddisruptionbudget/strategy.go:51-62): `status`.
+    fn get_reset_fields(&self) -> ResetFields {
+        ResetFields::new()
+            .with("policy/v1beta1", &[&["status"]])
+            .with("policy/v1", &[&["status"]])
+    }
 }
 
 /// `podDisruptionBudgetStrategy` implements no
@@ -189,6 +197,13 @@ impl RestUpdateStrategy<PodDisruptionBudget> for StatusStrategy {
 
     fn allow_unconditional_update(&self) -> bool {
         false
+    }
+
+    /// `GetResetFields` (policy/poddisruptionbudget/strategy.go:139-150): `spec`.
+    fn get_reset_fields(&self) -> ResetFields {
+        ResetFields::new()
+            .with("policy/v1beta1", &[&["spec"]])
+            .with("policy/v1", &[&["spec"]])
     }
 }
 
