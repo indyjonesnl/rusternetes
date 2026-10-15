@@ -506,7 +506,7 @@ fn emptydir_wrapper_volumes_status_objects_are_independent() {
 /// [sig-storage] CSINodes CSI Conformance should run through the lifecycle of
 /// a csinode [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/storage/csinode.go
+/// Upstream: k8s.io/kubernetes/test/e2e/storage/csi_node.go
 /// Sonobuoy (v1.35, 2026-05-28): newly-passing
 ///
 /// A CSINode stores per-node CSI driver information. This test mirrors the
@@ -653,7 +653,7 @@ fn csidriver_lifecycle_serde_round_trip() {
 /// [sig-storage] CSIStorageCapacity should support CSIStorageCapacities API
 /// operations [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/storage/csi_storage_capacity.go
+/// Upstream: k8s.io/kubernetes/test/e2e/storage/csistoragecapacity.go
 /// Sonobuoy (v1.35, 2026-05-28): newly-passing
 ///
 /// CSIStorageCapacity stores the result of a CSI GetCapacity call. Lifecycle:
@@ -703,7 +703,7 @@ fn csi_storage_capacity_lifecycle_serde_round_trip() {
 /// [sig-storage] StorageClasses CSI Conformance should run through the
 /// lifecycle of a StorageClass [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/storage/storage_class.go
+/// Upstream: k8s.io/kubernetes/test/e2e/storage/storageclass.go
 /// Sonobuoy (v1.35, 2026-05-28): newly-passing
 ///
 /// StorageClass lifecycle: create → verify fields → assert immutable
@@ -874,7 +874,7 @@ fn volume_attachment_status_can_be_applied() {
 /// [sig-storage] VolumeAttributesClass should run through the lifecycle of a
 /// VolumeAttributesClass [FeatureGate:VolumeAttributesClass] [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/storage/volume_attributes_class.go
+/// Upstream: k8s.io/kubernetes/test/e2e/storage/volumeattributesclass.go
 /// Sonobuoy (v1.35, 2026-05-28): newly-passing
 ///
 /// VolumeAttributesClass is a cluster-scoped resource that describes a named
