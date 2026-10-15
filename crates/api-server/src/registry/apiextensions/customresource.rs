@@ -22,9 +22,11 @@
 //! Not ported here, and still served by the bespoke handlers:
 //! - list and watch, tracked in #2135;
 //! - `GetResetFields` (managed-fields reset sets) and table conversion;
-//! - `x-kubernetes-list-type` map/set uniqueness (`listtype.ValidateListSetsAndMaps`)
-//!   and the `schemaobjectmeta.Validate` embedded-resource check, which
+//! - the `schemaobjectmeta.Validate` embedded-resource check, which
 //!   Rusternetes' schema validator does not implement.
+//!
+//! `x-kubernetes-list-type` map/set uniqueness
+//! (`listtype.ValidateListSetsAndMaps`) is [`Strategy::list_type_errors`].
 //!
 //! Decode-time coercion. Upstream's request decoder (`schemaCoercingDecoder`,
 //! customresource_handler.go:1321-1346) prunes and defaults the object as it
@@ -49,6 +51,7 @@ use rusternetes_common::types::{ObjectMeta, TypeMeta};
 use rusternetes_common::validation::field::{Error as FieldError, ErrorList, ErrorType, Path};
 use rusternetes_common::validation::metav1::is_qualified_name;
 use rusternetes_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
+use rusternetes_common::validation::structural::listtype::validate_list_sets_and_maps;
 use rusternetes_common::validation::structural::objectmeta::{coerce_with_options, CoerceOptions};
 use rusternetes_common::validation::structural::{new_structural, Structural};
 use rusternetes_common::{Error, Result};
@@ -396,6 +399,46 @@ impl Strategy {
         errs
     }
 
+    /// The object as upstream's `u.Object`, less the root `metadata` (a typed
+    /// field here, and the root is not a list-typed schema position).
+    fn object_value(cr: &CustomResource) -> serde_json::Map<String, serde_json::Value> {
+        let mut map = serde_json::Map::new();
+        for (k, v) in &cr.extra {
+            map.insert(k.clone(), v.clone());
+        }
+        if let Some(spec) = &cr.spec {
+            map.insert("spec".to_string(), spec.clone());
+        }
+        if let Some(status) = &cr.status {
+            map.insert("status".to_string(), status.clone());
+        }
+        map
+    }
+
+    /// `structurallisttype.ValidateListSetsAndMaps(nil, a.structuralSchema,
+    /// u.Object)`.
+    fn list_type_errors_of(&self, cr: &CustomResource) -> ErrorList {
+        validate_list_sets_and_maps(
+            &Path::default(),
+            self.structural_schema().as_ref(),
+            Some(&Self::object_value(cr)),
+        )
+    }
+
+    /// The `x-kubernetes-list-type` `map`/`set` uniqueness errors of `cr`.
+    /// On create (`old` is `None`) they always apply (strategy.go:214); on
+    /// update they ratchet: reported only when the old object had none
+    /// (strategy.go:300-302). `status_strategy.go:117-122` is the same rule
+    /// with the new errors computed first.
+    pub fn list_type_errors(&self, cr: &CustomResource, old: Option<&CustomResource>) -> ErrorList {
+        if let Some(old) = old {
+            if !self.list_type_errors_of(old).is_empty() {
+                return Vec::new();
+            }
+        }
+        self.list_type_errors_of(cr)
+    }
+
     /// `ValidateTypeMeta` (validator.go:120-132).
     pub fn type_meta_errors(&self, cr: &CustomResource) -> ErrorList {
         if !cr.kind.is_empty() && cr.kind != self.crd.spec.names.kind {
@@ -439,6 +482,8 @@ impl RestCreateStrategy<CustomResource> for Strategy {
             &Path::new("metadata"),
         ));
         errs.extend(self.schema_errors(obj, None));
+        // strategy.go:214
+        errs.extend(self.list_type_errors(obj, None));
         errs
     }
 
@@ -495,7 +540,10 @@ impl RestUpdateStrategy<CustomResource> for Strategy {
         if !errs.is_empty() {
             return errs;
         }
-        self.schema_errors(obj, Some(old))
+        let mut errs = self.schema_errors(obj, Some(old));
+        // strategy.go:299-302
+        errs.extend(self.list_type_errors(obj, Some(old)));
+        errs
     }
 
     fn warnings_on_update(
@@ -556,7 +604,10 @@ impl RestUpdateStrategy<CustomResource> for StatusStrategy {
         obj: &CustomResource,
         old: &CustomResource,
     ) -> ErrorList {
-        self.0.schema_errors(obj, Some(old))
+        let mut errs = self.0.schema_errors(obj, Some(old));
+        // status_strategy.go:117-122
+        errs.extend(self.0.list_type_errors(obj, Some(old)));
+        errs
     }
 
     /// `WarningsOnUpdate` (status_strategy.go:140-143).
@@ -1326,5 +1377,66 @@ mod prune_nulls_tests {
         let mut obj = cr(json!({"plain": null}));
         strategy(true).coerce(&mut obj);
         assert_eq!(obj.spec.unwrap(), json!({"plain": null, "defaulted": "d"}));
+    }
+}
+
+#[cfg(test)]
+mod list_type_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn strategy() -> Strategy {
+        let crd: CustomResourceDefinition = serde_json::from_value(json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {"name": "widgets.stable.example.com"},
+            "spec": {
+                "group": "stable.example.com", "scope": "Namespaced",
+                "names": {"plural": "widgets", "kind": "Widget", "listKind": "WidgetList"},
+                "versions": [{"name": "v1", "served": true, "storage": true,
+                    "schema": {"openAPIV3Schema": {"type": "object", "properties": {
+                        "spec": {"type": "object", "properties": {
+                            "tags": {"type": "array", "x-kubernetes-list-type": "set",
+                                     "items": {"type": "string"}}
+                        }}
+                    }}}}]
+            }
+        }))
+        .unwrap();
+        Strategy::new(Arc::new(crd), "v1")
+    }
+
+    fn cr(tags: serde_json::Value) -> CustomResource {
+        serde_json::from_value(json!({
+            "apiVersion": "stable.example.com/v1", "kind": "Widget",
+            "metadata": {"name": "w"}, "spec": {"tags": tags}
+        }))
+        .unwrap()
+    }
+
+    /// strategy.go:300-302: an update is checked only when the old object
+    /// was clean, so an object stored with duplicates stays updatable.
+    #[test]
+    fn update_ratchets_when_the_old_object_already_had_duplicates() {
+        let s = strategy();
+        let old = cr(json!(["a", "a"]));
+        let new = cr(json!(["a", "a", "b"]));
+        assert!(s.list_type_errors(&new, Some(&old)).is_empty());
+    }
+
+    #[test]
+    fn update_checks_when_the_old_object_was_clean() {
+        let s = strategy();
+        let old = cr(json!(["a"]));
+        let new = cr(json!(["a", "a"]));
+        let errs = s.list_type_errors(&new, Some(&old));
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert_eq!(errs[0].field, "spec.tags[1]");
+    }
+
+    #[test]
+    fn create_always_checks() {
+        let errs = strategy().list_type_errors(&cr(json!(["a", "a"])), None);
+        assert_eq!(errs.len(), 1, "{errs:?}");
     }
 }
