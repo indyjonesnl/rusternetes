@@ -1575,9 +1575,27 @@ impl<S: Storage + 'static> PVBinderController<S> {
             return self.complete_binding(pv.clone(), pvc).await;
         }
 
+        // `FindMatchingVolume` (component-helpers `pv_helpers.go:279-283`,
+        // called from `findByClaim` `index.go:97` with node == nil):
+        // `if node == nil && delayBinding { continue }` — after the
+        // IsVolumeBoundToClaim return (phase 1 above), the PV controller does
+        // not bind unclaimed PVs for a delay-binding class; the scheduler's
+        // VolumeBinding plugin (BindPodVolumes) binds them with a node chosen.
+        // `delayBinding` is computed once up front exactly as
+        // `syncUnboundClaim` does (`pv_controller.go:337`), errors propagate.
+        let delay_binding = self
+            .is_delay_binding_mode(class_of(
+                pvc.spec.storage_class_name.as_deref(),
+                pvc.metadata.annotations.as_ref(),
+            ))
+            .await?;
+
         // Phase 2: first-match among genuinely unclaimed PVs (static volumes /
         // legacy PVs with no claimRef).
         for pv in pvs {
+            if delay_binding {
+                continue;
+            }
             debug!("Checking PV {} (storage_class={:?}, capacity={:?}, access_modes={:?}, claim_ref={:?})",
                 pv.metadata.name,
                 pv.spec.storage_class_name,
