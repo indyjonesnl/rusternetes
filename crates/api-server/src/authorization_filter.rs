@@ -26,7 +26,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use rusternetes_common::auth::UserInfo;
 use rusternetes_common::authz::{Authorizer, Opinion, RequestAttributes};
-use rusternetes_common::authz_filter_metrics::record_authorization_metrics;
+use rusternetes_common::authz_filter_metrics::record_authorization_outcome_metrics;
 use rusternetes_common::types::{ListMeta, Status, StatusDetails};
 use std::sync::Arc;
 use std::time::Instant;
@@ -190,14 +190,20 @@ pub async fn with_authorization(
     };
     let attributes = get_authorizer_attributes(user, &info);
 
-    let result = authorizer.authorize_opinion(&attributes).await;
+    let result = authorizer.authorize_outcome(&attributes).await;
     // authorization.go:64-70: the metrics, whichever way the request goes.
-    record_authorization_metrics(&result, authorization_start.elapsed());
+    let authorization_elapsed = authorization_start.elapsed();
+    // request.TrackAuthorizationLatency (authorization.go:70;
+    // request/webhook_duration.go:262-268), for both allow and failure paths.
+    rusternetes_common::latency_trackers::track_authorization_latency(authorization_elapsed);
+    record_authorization_outcome_metrics(&result, authorization_elapsed);
 
     let (decision, reason, err) = match result {
-        Ok(Opinion::Allow(reason)) => (Some(true), reason, None),
-        Ok(Opinion::Deny(reason)) => (Some(false), reason, None),
-        Ok(Opinion::NoOpinion { reason, error }) => (None, reason, error),
+        Ok(outcome) => match outcome.opinion {
+            Opinion::Allow(reason) => (Some(true), reason, outcome.error),
+            Opinion::Deny(reason) => (Some(false), reason, outcome.error),
+            Opinion::NoOpinion { reason, error } => (None, reason, outcome.error.or(error)),
+        },
         Err(e) => (None, String::new(), Some(e.to_string())),
     };
 

@@ -27,7 +27,7 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 /// The attempt counters are process-global: serialize the tests that read them.
-static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(super) static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn user(name: &str) -> UserInfo {
     UserInfo {

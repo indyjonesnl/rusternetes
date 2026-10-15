@@ -93,20 +93,21 @@ impl InstrumentedAuthorizer {
 #[async_trait]
 impl Authorizer for InstrumentedAuthorizer {
     async fn authorize(&self, attrs: &RequestAttributes) -> Result<Decision> {
-        match self.authorize_opinion(attrs).await? {
-            Opinion::Allow(_) => Ok(Decision::Allow),
-            Opinion::Deny(reason) => Ok(Decision::Deny(reason)),
-            Opinion::NoOpinion { reason, error } => match error {
-                Some(e) => Err(rusternetes_common::error::Error::Authorization(e)),
-                None => Ok(Decision::Deny(reason)),
-            },
-        }
+        self.authorize_outcome(attrs).await?.into_decision()
     }
 
     async fn authorize_opinion(&self, attrs: &RequestAttributes) -> Result<Opinion> {
-        let opinion = self.delegate.authorize_opinion(attrs).await?;
-        self.record(&opinion);
-        Ok(opinion)
+        Ok(self.authorize_outcome(attrs).await?.into_opinion())
+    }
+
+    // metrics/metrics.go:77-94 forwards decision, reason and error together.
+    async fn authorize_outcome(
+        &self,
+        attrs: &RequestAttributes,
+    ) -> Result<rusternetes_common::authz::AuthorizationOutcome> {
+        let outcome = self.delegate.authorize_outcome(attrs).await?;
+        self.record(&outcome.opinion);
+        Ok(outcome)
     }
 
     async fn get_user_rules(

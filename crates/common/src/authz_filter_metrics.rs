@@ -6,9 +6,9 @@
 //! (`filters/authorization.go:57-99`).
 //!
 //! The api-server's `WithAuthorization` filter (`authorization_filter.rs`)
-//! calls [`record_authorization_metrics`] once per request.
+//! calls [`record_authorization_outcome_metrics`] once per request.
 
-use crate::authz::Opinion;
+use crate::authz::{AuthorizationOutcome, Opinion};
 use crate::Result;
 use prometheus::{register, HistogramOpts, HistogramVec, IntCounterVec, Opts};
 use std::sync::LazyLock;
@@ -64,6 +64,31 @@ pub fn record_authorization_metrics(result: &Result<Opinion>, elapsed: Duration)
         Ok(Opinion::Deny(_)) => DENIED,
         Ok(Opinion::NoOpinion { error: None, .. }) => NO_OPINION,
     };
+    record_label(label, elapsed);
+}
+
+/// filters/metrics.go:106-122 with an independent evaluation-error slot.
+/// Allow takes precedence over error; an error overrides an explicit denial.
+pub fn record_authorization_outcome_metrics(
+    result: &Result<AuthorizationOutcome>,
+    elapsed: Duration,
+) {
+    let label = match result {
+        Ok(outcome) if matches!(outcome.opinion, Opinion::Allow(_)) => ALLOWED,
+        Err(_) => ERROR,
+        Ok(outcome)
+            if outcome.error.is_some()
+                || matches!(&outcome.opinion, Opinion::NoOpinion { error: Some(_), .. }) =>
+        {
+            ERROR
+        }
+        Ok(outcome) if matches!(outcome.opinion, Opinion::Deny(_)) => DENIED,
+        Ok(_) => NO_OPINION,
+    };
+    record_label(label, elapsed);
+}
+
+fn record_label(label: &str, elapsed: Duration) {
     ATTEMPTS.with_label_values(&[label]).inc();
     LATENCY
         .with_label_values(&[label])

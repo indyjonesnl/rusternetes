@@ -7,7 +7,7 @@
 //! reuses the `PolicyList` loaded at initial startup).
 
 use rusternetes_common::auth::UserInfo;
-use rusternetes_common::authz::{Authorizer, Decision, RequestAttributes};
+use rusternetes_common::authz::{Authorizer, Decision, Opinion, RequestAttributes};
 use rusternetes_common::resources::{NonResourceRule, ResourceRule};
 use serde::{Deserialize, Deserializer};
 use std::path::Path;
@@ -415,6 +415,21 @@ impl Authorizer for PolicyList {
             }
         }
         Ok(Decision::Deny("No policy matched.".to_string()))
+    }
+
+    // abac.go:229-235: allow reason is empty; abstention is exactly
+    // "No policy matched.". Do not manufacture an ABAC allow description.
+    async fn authorize_opinion(
+        &self,
+        attrs: &RequestAttributes,
+    ) -> rusternetes_common::Result<Opinion> {
+        Ok(match self.authorize(attrs).await? {
+            Decision::Allow => Opinion::Allow(String::new()),
+            Decision::Deny(reason) => Opinion::NoOpinion {
+                reason,
+                error: None,
+            },
+        })
     }
 
     /// `PolicyList.RulesFor` (abac.go:241-272).

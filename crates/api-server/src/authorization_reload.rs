@@ -186,11 +186,19 @@ impl ReloadableAuthorizer {
 #[async_trait]
 impl Authorizer for ReloadableAuthorizer {
     async fn authorize(&self, attrs: &RequestAttributes) -> Result<Decision> {
-        self.current().authorize(attrs).await
+        self.authorize_outcome(attrs).await?.into_decision()
     }
 
     async fn authorize_opinion(&self, attrs: &RequestAttributes) -> Result<Opinion> {
-        self.current().authorize_opinion(attrs).await
+        Ok(self.authorize_outcome(attrs).await?.into_opinion())
+    }
+
+    // pkg/kubeapiserver/authorizer/reload.go:78-79 forwards the full tuple.
+    async fn authorize_outcome(
+        &self,
+        attrs: &RequestAttributes,
+    ) -> Result<rusternetes_common::authz::AuthorizationOutcome> {
+        self.current().authorize_outcome(attrs).await
     }
 
     async fn get_user_rules(
