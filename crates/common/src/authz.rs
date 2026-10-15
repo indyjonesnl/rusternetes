@@ -1592,3 +1592,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "authz/allow_reason_tests.rs"]
+mod allow_reason_tests;
