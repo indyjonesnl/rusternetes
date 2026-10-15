@@ -248,9 +248,15 @@ pub fn validate_pod_ephemeral_containers_update(new: &Pod, old: &Pod) -> ErrorLi
             {
                 errs.push(Error::forbidden(
                     &spec_path,
+                    // validation.go:6206-6207: `diff.Diff(old, *new)`.
                     format!(
-                        "existing ephemeral containers {:?} may not be changed\n",
-                        old_container.name
+                        "existing ephemeral containers {:?} may not be changed\n{}",
+                        old_container.name,
+                        crate::diff_schema::struct_diff(
+                            crate::diff_schema::EPHEMERAL_CONTAINER,
+                            &serde_json::to_value(old_container).unwrap_or_default(),
+                            &serde_json::to_value(new_container).unwrap_or_default(),
+                        )
                     ),
                 ))
             }
@@ -974,6 +980,40 @@ mod tests {
         assert_eq!(
             resize_errs(&old, &old),
             vec![": windows pods cannot be resized"]
+        );
+    }
+
+    /// validation.go:6205-6207: the "may not be changed" error appends
+    /// `diff.Diff(old, *new)` — a unified diff (context 3) of
+    /// `json.MarshalIndent` of the INTERNAL `core.EphemeralContainer`, which has
+    /// no json tags (Go field names, declaration order, `EphemeralContainerCommon`
+    /// inlined, nil slices/pointers as `null`, `Resources` always an object).
+    #[test]
+    fn ephemeral_update_changed_error_carries_diff_text() {
+        use serde_json::json;
+        let with = |image: &str| {
+            pod(json!({
+                "metadata": {"name": "pod", "namespace": "ns", "resourceVersion": "1"},
+                "spec": {"containers": [{"name": "cnt", "image": "busybox"}],
+                         "restartPolicy": "OnFailure",
+                         "ephemeralContainers": [{"name": "a", "image": image}]}
+            }))
+        };
+        let errs = validate_pod_ephemeral_containers_update(&with("other"), &with("busybox"));
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert_eq!(
+            errs[0].detail,
+            concat!(
+                "existing ephemeral containers \"a\" may not be changed\n",
+                "@@ -1,6 +1,6 @@\n",
+                " {\n",
+                "  \"Name\": \"a\",\n",
+                "- \"Image\": \"busybox\",\n",
+                "+ \"Image\": \"other\",\n",
+                "  \"Command\": null,\n",
+                "  \"Args\": null,\n",
+                "  \"WorkingDir\": \"\",\n",
+            )
         );
     }
 
