@@ -705,7 +705,7 @@ mod tests {
             fn allow_match(expect: RequestAttributes) -> Self {
                 Self {
                     expect: Some(expect),
-                    match_result: Ok(Opinion::Allow),
+                    match_result: Ok(Opinion::Allow(String::new())),
                     default_result: Ok(Opinion::Deny(String::new())),
                 }
             }
@@ -713,7 +713,7 @@ mod tests {
             fn deny_all() -> Self {
                 Self {
                     expect: None,
-                    match_result: Ok(Opinion::Allow),
+                    match_result: Ok(Opinion::Allow(String::new())),
                     default_result: Ok(Opinion::Deny("fake reason".into())),
                 }
             }
@@ -721,7 +721,7 @@ mod tests {
             fn error_all() -> Self {
                 Self {
                     expect: None,
-                    match_result: Ok(Opinion::Allow),
+                    match_result: Ok(Opinion::Allow(String::new())),
                     default_result: Err("fake authz error".into()),
                 }
             }
@@ -734,7 +734,7 @@ mod tests {
                 attrs: &RequestAttributes,
             ) -> rusternetes_common::Result<Decision> {
                 match self.authorize_opinion(attrs).await? {
-                    Opinion::Allow => Ok(Decision::Allow),
+                    Opinion::Allow(_) => Ok(Decision::Allow),
                     Opinion::Deny(r) => Ok(Decision::Deny(r)),
                     Opinion::NoOpinion { reason, .. } => Ok(Decision::Deny(reason)),
                 }
