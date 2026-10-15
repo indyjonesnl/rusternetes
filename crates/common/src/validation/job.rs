@@ -843,7 +843,11 @@ fn validate_pod_failure_policy(
     let mut errs: ErrorList = Vec::new();
     let rules_path = fld_path.child("rules");
     if rules.len() > MAX_POD_FAILURE_POLICY_RULES {
-        errs.push(Error::too_many(&rules_path, MAX_POD_FAILURE_POLICY_RULES));
+        errs.push(Error::too_many(
+            &rules_path,
+            rules.len(),
+            MAX_POD_FAILURE_POLICY_RULES,
+        ));
     }
 
     let mut container_names: HashSet<&str> = HashSet::new();
@@ -909,7 +913,11 @@ fn validate_pod_failure_policy(
                     "at least one value is required",
                 ));
             } else if on_exit.values.len() > MAX_ON_EXIT_CODES_VALUES {
-                errs.push(Error::too_many(&values_path, MAX_ON_EXIT_CODES_VALUES));
+                errs.push(Error::too_many(
+                    &values_path,
+                    on_exit.values.len(),
+                    MAX_ON_EXIT_CODES_VALUES,
+                ));
             }
             let mut seen: HashSet<i32> = HashSet::new();
             let mut ordered = true;
@@ -937,7 +945,11 @@ fn validate_pod_failure_policy(
         if !rule.on_pod_conditions.is_empty() {
             let opc_path = rule_path.child("onPodConditions");
             if rule.on_pod_conditions.len() > MAX_ON_POD_CONDITIONS_PATTERNS {
-                errs.push(Error::too_many(&opc_path, MAX_ON_POD_CONDITIONS_PATTERNS));
+                errs.push(Error::too_many(
+                    &opc_path,
+                    rule.on_pod_conditions.len(),
+                    MAX_ON_POD_CONDITIONS_PATTERNS,
+                ));
             }
             for (j, pattern) in rule.on_pod_conditions.iter().enumerate() {
                 let p_path = opc_path.index(j);
@@ -1003,7 +1015,11 @@ fn validate_success_policy(
         ));
     }
     if rules.len() > MAX_SUCCESS_POLICY_RULES {
-        errs.push(Error::too_many(&rules_path, MAX_SUCCESS_POLICY_RULES));
+        errs.push(Error::too_many(
+            &rules_path,
+            rules.len(),
+            MAX_SUCCESS_POLICY_RULES,
+        ));
     }
     for (i, rule) in rules.iter().enumerate() {
         let rule_path = rules_path.index(i);

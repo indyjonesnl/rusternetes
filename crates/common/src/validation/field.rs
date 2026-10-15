@@ -345,23 +345,13 @@ impl Error {
         }
     }
 
-    /// `field.TooMany` — bad value omitted, detail says the max count.
-    pub fn too_many(path: &Path, max_items: usize) -> Self {
-        Self {
-            error_type: ErrorType::TooMany,
-            field: path.to_string(),
-            bad_value: BadValue::Omit,
-            detail: format!("must have at most {max_items} items"),
-            origin: String::new(),
-        }
-    }
-
     /// `field.TooMany(path, actualQuantity, maxQuantity)`
     /// (`staging/src/k8s.io/apimachinery/pkg/util/validation/field/errors.go:282-302`):
-    /// unlike [`Error::too_many`] the bad value is the actual count, so the
-    /// body reads `Too many: 17: must have at most 16 items`, and a max of 1
-    /// says `item`.
-    pub fn too_many_with_actual(path: &Path, actual: usize, max_items: usize) -> Self {
+    /// the bad value is the actual count, so the body reads
+    /// `Too many: 17: must have at most 16 items`, and a max of 1 says `item`.
+    /// Go's negative-quantity branches (`has too many items` / omitted bad
+    /// value) are unreachable with `usize` and no caller passes a negative.
+    pub fn too_many(path: &Path, actual: usize, max_items: usize) -> Self {
         let noun = if max_items == 1 { "item" } else { "items" };
         Self {
             error_type: ErrorType::TooMany,

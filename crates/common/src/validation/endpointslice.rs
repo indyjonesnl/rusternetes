@@ -77,7 +77,11 @@ pub fn validate_endpoint_slice(slice: &EndpointSlice) -> ErrorList {
     let eps_path = Path::new("endpoints");
     // Upstream caps the number of endpoints per slice (maxEndpoints).
     if slice.endpoints.len() > MAX_ENDPOINTS {
-        errs.push(Error::too_many(&eps_path, MAX_ENDPOINTS));
+        errs.push(Error::too_many(
+            &eps_path,
+            slice.endpoints.len(),
+            MAX_ENDPOINTS,
+        ));
     }
     for (i, ep) in slice.endpoints.iter().enumerate() {
         let addr_path = eps_path.index(i).child("addresses");
@@ -87,7 +91,11 @@ pub fn validate_endpoint_slice(slice: &EndpointSlice) -> ErrorList {
                 "must contain at least 1 address",
             ));
         } else if ep.addresses.len() > MAX_ADDRESSES {
-            errs.push(Error::too_many(&addr_path, MAX_ADDRESSES));
+            errs.push(Error::too_many(
+                &addr_path,
+                ep.addresses.len(),
+                MAX_ADDRESSES,
+            ));
         }
         for (j, addr) in ep.addresses.iter().enumerate() {
             let p = addr_path.index(j);
@@ -113,7 +121,7 @@ pub fn validate_endpoint_slice(slice: &EndpointSlice) -> ErrorList {
     let ports_path = Path::new("ports");
     // Upstream caps the number of ports per slice (maxPorts).
     if slice.ports.len() > MAX_PORTS {
-        errs.push(Error::too_many(&ports_path, MAX_PORTS));
+        errs.push(Error::too_many(&ports_path, slice.ports.len(), MAX_PORTS));
     }
     // Track port names for duplicate detection. Upstream
     // `validateEndpointSlicePorts` (discovery validation.go:187-191) dereferences

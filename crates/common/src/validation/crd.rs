@@ -211,7 +211,11 @@ pub fn validate_custom_resource_selectable_fields(
     }
 
     if unique.len() > MAX_SELECTABLE_FIELDS {
-        errs.push(Error::too_many(fld_path, MAX_SELECTABLE_FIELDS));
+        errs.push(Error::too_many(
+            fld_path,
+            unique.len(),
+            MAX_SELECTABLE_FIELDS,
+        ));
     }
 
     errs
