@@ -252,11 +252,12 @@ impl<T: Object> Patcher<'_, T> {
         // there and the result goes back to the stored one (patch.go:323-338,
         // :449-462).
         let patched = match self.scope.patch_conversion {
-            None => apply_patch(&current_json, &patch, patch_type.clone()).map_err(patch_error)?,
+            None => apply_patch(&current_json, &patch, patch_type.clone())
+                .map_err(|e| patch_error(e, patch_type))?,
             Some(conversion) => {
                 let versioned = (conversion.to_request_version)(&current_json);
-                let patched =
-                    apply_patch(&versioned, &patch, patch_type.clone()).map_err(patch_error)?;
+                let patched = apply_patch(&versioned, &patch, patch_type.clone())
+                    .map_err(|e| patch_error(e, patch_type))?;
                 (conversion.from_request_version)(&current_json, patched)
             }
         };
@@ -447,20 +448,22 @@ pub(super) fn patch_invalid(patched_js: String, msg: String) -> Error {
     )
 }
 
-/// A failed patch application. RFC 6902 §4.2 mandates that the target of a
-/// `remove` (and friends) exists; upstream reports a missing one as
-/// `field.NotFound(<path>, "")`, so the 422 carries
-/// `causes[].reason = FieldValueNotFound` with the real field path.
-fn patch_error(e: crate::patch::PatchError) -> Error {
-    use rusternetes_common::validation::field::{BadValue, ErrorType};
-    match e {
-        crate::patch::PatchError::PathNotFound(field) => Error::Invalid(vec![FieldError {
-            error_type: ErrorType::NotFound,
-            field,
-            bad_value: BadValue::Omit,
-            detail: String::new(),
-            origin: String::new(),
-        }]),
-        other => Error::InvalidResource(other.to_string()),
+/// A failed patch application.
+///
+/// JSON Patch (`jsonPatcher.applyJSPatch`, patch.go:395-415):
+/// `jsonpatch.DecodePatch` failing is `errors.NewBadRequest(err.Error())`;
+/// every `patchObj.Apply` failure (a missing `remove`/`replace` target, a
+/// failed `test`, ...) is `errors.NewGenericServerResponse(
+/// http.StatusUnprocessableEntity, "", schema.GroupResource{}, "",
+/// err.Error(), 0, false)` — 422 / `Invalid` with the canned message and no
+/// `causes`, NOT a `field.NotFound`.
+fn patch_error(e: crate::patch::PatchError, patch_type: &PatchType) -> Error {
+    use crate::patch::PatchError;
+    match (patch_type, e) {
+        (PatchType::JsonPatch, PatchError::DecodeFailed(msg)) => Error::BadRequest(msg),
+        (PatchType::JsonPatch, other) => {
+            Error::generic_server_response(422, "", "", "", "", &other.to_string(), 0, false)
+        }
+        (_, other) => Error::InvalidResource(other.to_string()),
     }
 }

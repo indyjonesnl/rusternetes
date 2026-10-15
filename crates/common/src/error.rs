@@ -187,6 +187,11 @@ impl Error {
     /// `aggregate.Error()` (`apimachinery/pkg/util/errors/errors.go:70-96`):
     /// one error as itself, several deduplicated as `[a, b]`.
     pub fn aggregate(errs: &ErrorList) -> Error {
+        Error::unknown_error(Error::aggregate_message(errs))
+    }
+
+    /// `errs.ToAggregate().Error()` — the text [`Error::aggregate`] carries.
+    pub fn aggregate_message(errs: &ErrorList) -> String {
         let mut msgs: Vec<String> = Vec::new();
         for e in errs {
             let m = e.to_string();
@@ -194,14 +199,149 @@ impl Error {
                 msgs.push(m);
             }
         }
-        let message = if msgs.len() == 1 {
+        if msgs.len() == 1 {
             msgs.remove(0)
         } else {
             format!("[{}]", msgs.join(", "))
-        };
+        }
+    }
+
+    /// Any plain Go `error` that is not an `APIStatus` reaching the endpoint:
+    /// `ErrorToAPIStatus`'s default arm
+    /// (`apiserver/pkg/endpoints/handlers/responsewriters/status.go:60-81`)
+    /// renders HTTP 500, reason `StatusReasonUnknown` (`""`, omitted on the
+    /// wire), `Message: err.Error()` and no details.
+    pub fn unknown_error(message: impl Into<String>) -> Error {
         let mut status = crate::types::Status::failure(message, "", 500);
         status.reason = None;
         Error::Status(Box::new(status))
+    }
+
+    /// `errors.NewGenericServerResponse(code, verb, qualifiedResource, name,
+    /// serverMessage, retryAfterSeconds, isUnexpectedResponse)`
+    /// (`apimachinery/pkg/api/errors/errors.go:437-524`, release-1.35).
+    ///
+    /// `group`/`resource` are the `schema.GroupResource`; an empty `resource`
+    /// is `qualifiedResource.Empty()` (the qualified resource's `String()` is
+    /// `resource.group`, or just `resource` for the core group). `details` is
+    /// always present, with `causes` only for `is_unexpected_response`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generic_server_response(
+        code: u16,
+        verb: &str,
+        group: &str,
+        resource: &str,
+        name: &str,
+        server_message: &str,
+        retry_after_seconds: i32,
+        is_unexpected_response: bool,
+    ) -> Error {
+        let mut reason = "Unknown";
+        let mut message = format!(
+            "the server responded with the status code {code} but did not return more information"
+        );
+        match code {
+            409 => {
+                reason = if verb == "POST" {
+                    "AlreadyExists"
+                } else {
+                    "Conflict"
+                };
+                message = "the server reported a conflict".to_string();
+            }
+            404 => {
+                reason = "NotFound";
+                message = "the server could not find the requested resource".to_string();
+            }
+            400 => {
+                reason = "BadRequest";
+                message = "the server rejected our request for an unknown reason".to_string();
+            }
+            401 => {
+                reason = "Unauthorized";
+                message = "the server has asked for the client to provide credentials".to_string();
+            }
+            403 => {
+                reason = "Forbidden";
+                // The server message has details about who is trying to
+                // perform what action. Keep its message.
+                message = server_message.to_string();
+            }
+            406 => {
+                reason = "NotAcceptable";
+                message = if server_message.is_empty() || server_message == "unknown" {
+                    "the server was unable to respond with a content type that the client supports"
+                        .to_string()
+                } else {
+                    server_message.to_string()
+                };
+            }
+            415 => {
+                reason = "UnsupportedMediaType";
+                message = server_message.to_string();
+            }
+            405 => {
+                reason = "MethodNotAllowed";
+                message =
+                    "the server does not allow this method on the requested resource".to_string();
+            }
+            422 => {
+                reason = "Invalid";
+                message =
+                    "the server rejected our request due to an error in our request".to_string();
+            }
+            503 => {
+                reason = "ServiceUnavailable";
+                message = "the server is currently unable to handle the request".to_string();
+            }
+            504 => {
+                reason = "Timeout";
+                message = "the server was unable to return a response in the time allotted, but may still be processing the request".to_string();
+            }
+            429 => {
+                reason = "TooManyRequests";
+                message =
+                    "the server has received too many requests and has asked us to try again later"
+                        .to_string();
+            }
+            c if c >= 500 => {
+                reason = "InternalError";
+                message = format!(
+                    "an error on the server ({server_message:?}) has prevented the request from succeeding"
+                );
+            }
+            _ => {}
+        }
+        if !resource.is_empty() {
+            let qualified = if group.is_empty() {
+                resource.to_string()
+            } else {
+                format!("{resource}.{group}")
+            };
+            message = if name.is_empty() {
+                format!("{message} ({} {qualified})", verb.to_lowercase())
+            } else {
+                format!("{message} ({} {qualified} {name})", verb.to_lowercase())
+            };
+        }
+        let causes = is_unexpected_response.then(|| {
+            vec![crate::types::StatusCause {
+                reason: Some("UnexpectedServerResponse".to_string()),
+                message: Some(server_message.to_string()),
+                field: None,
+            }]
+        });
+        let details = crate::types::StatusDetails {
+            name: Some(name.to_string()).filter(|n| !n.is_empty()),
+            group: Some(group.to_string()).filter(|g| !g.is_empty()),
+            kind: Some(resource.to_string()).filter(|r| !r.is_empty()),
+            uid: None,
+            causes,
+            retry_after_seconds: Some(retry_after_seconds).filter(|s| *s != 0),
+        };
+        Error::Status(Box::new(crate::types::Status::failure_with_details(
+            message, reason, code, details,
+        )))
     }
 
     /// Returns the machine-readable reason string matching Kubernetes StatusReason values
@@ -586,6 +726,92 @@ fn extract_resource_details_for_invalid(msg: &str) -> Option<crate::types::Statu
 
 #[cfg(all(test, feature = "axum-support"))]
 mod tests {
+    /// `NewGenericServerResponse(422, "", GroupResource{}, "", msg, 0, false)`
+    /// (errors.go:476-478, :511-523): reason Invalid, canned message (the
+    /// server message is dropped), empty details.
+    #[test]
+    fn generic_server_response_422_is_canned_with_empty_details() {
+        let Error::Status(s) =
+            Error::generic_server_response(422, "", "", "", "", "boom: not found", 0, false)
+        else {
+            panic!("expected Status");
+        };
+        assert_eq!(s.code, Some(422));
+        assert_eq!(s.reason.as_deref(), Some("Invalid"));
+        assert_eq!(
+            s.message.as_deref(),
+            Some("the server rejected our request due to an error in our request")
+        );
+        assert_eq!(
+            serde_json::to_value(s.details.as_ref().unwrap()).unwrap(),
+            serde_json::json!({})
+        );
+    }
+
+    /// errors.go:437-524: verb-dependent 409, the qualified-resource suffix
+    /// (with and without a name), the >=500 wording, unexpected-response
+    /// causes and retry-after.
+    #[test]
+    fn generic_server_response_follows_the_upstream_switch() {
+        let st = |e: Error| match e {
+            Error::Status(s) => *s,
+            other => panic!("expected Status, got {other:?}"),
+        };
+        let s = st(Error::generic_server_response(
+            409,
+            "POST",
+            "apps",
+            "deployments",
+            "d",
+            "x",
+            0,
+            false,
+        ));
+        assert_eq!(s.reason.as_deref(), Some("AlreadyExists"));
+        assert_eq!(
+            s.message.as_deref(),
+            Some("the server reported a conflict (post deployments.apps d)")
+        );
+        let s = st(Error::generic_server_response(
+            409, "GET", "", "pods", "", "x", 0, false,
+        ));
+        assert_eq!(s.reason.as_deref(), Some("Conflict"));
+        assert_eq!(
+            s.message.as_deref(),
+            Some("the server reported a conflict (get pods)")
+        );
+        let s = st(Error::generic_server_response(
+            500, "", "", "", "", "oops", 10, true,
+        ));
+        assert_eq!(s.reason.as_deref(), Some("InternalError"));
+        assert_eq!(
+            s.message.as_deref(),
+            Some("an error on the server (\"oops\") has prevented the request from succeeding")
+        );
+        let d = s.details.unwrap();
+        assert_eq!(d.retry_after_seconds, Some(10));
+        let c = &d.causes.unwrap()[0];
+        assert_eq!(c.reason.as_deref(), Some("UnexpectedServerResponse"));
+        assert_eq!(c.message.as_deref(), Some("oops"));
+        let s = st(Error::generic_server_response(
+            418, "", "", "", "", "", 0, false,
+        ));
+        assert_eq!(s.reason.as_deref(), Some("Unknown"));
+        assert_eq!(
+            s.message.as_deref(),
+            Some(
+                "the server responded with the status code 418 but did not return more information"
+            )
+        );
+        let s = st(Error::generic_server_response(
+            406, "", "", "", "", "unknown", 0, false,
+        ));
+        assert_eq!(
+            s.message.as_deref(),
+            Some("the server was unable to respond with a content type that the client supports")
+        );
+    }
+
     // endpoints/filters/authorization.go:87-91: an authorizer error that did not
     // come with an Allow is `responsewriters.InternalError` (500), not Forbidden.
     #[test]
