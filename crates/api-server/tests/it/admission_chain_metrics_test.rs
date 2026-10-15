@@ -159,6 +159,7 @@ fn cm_admission<'a>(
         namespace: Some("default"),
         user,
         dry_run: false,
+        forbid_create: false,
     }
 }
 
@@ -191,7 +192,6 @@ fn cm_kind() -> (GroupVersionKind, GroupVersionResource, UserInfo, ConfigMap) {
 /// plugins.go:69-100 + each plugin's `NewHandler(...)` and interface
 /// assertions: which plugin is observed under which step on a CREATE.
 const CREATE_ADMIT: &[&str] = &[
-    "NodeRestriction",
     "LimitRanger",
     "ServiceAccount",
     "Priority",
@@ -294,16 +294,14 @@ async fn update_observes_only_the_plugins_that_handle_update() {
     );
 }
 
-/// DELETE: Priority (C,U,D) validates; NodeRestriction (C,U,D) is an
-/// Admit-only plugin, so it is observed under `admit`; LimitRanger (C,U) is not
-/// called.
+/// DELETE: Priority (C,U,D) validates; LimitRanger (C,U) is not called.
+/// (NodeRestriction, an Admit-only plugin, is off by default.)
 #[tokio::test]
-async fn delete_observes_priority_and_node_restriction_only() {
+async fn delete_observes_priority_but_not_limit_ranger() {
     let state = state();
     let (kind, resource, user, cm) = cm_kind();
     let admission = cm_admission(&state, &kind, &resource, &user);
     let pr0 = plugin_series("Priority", "validate", "DELETE", "false");
-    let nr0 = plugin_series("NodeRestriction", "admit", "DELETE", "false");
     let lr0 = plugin_series("LimitRanger", "validate", "DELETE", "false");
 
     let ctx = RequestContext::new(Some("default")).with_user(&user);
@@ -313,7 +311,6 @@ async fn delete_observes_priority_and_node_restriction_only() {
         .unwrap();
 
     assert!(plugin_series("Priority", "validate", "DELETE", "false") > pr0);
-    assert!(plugin_series("NodeRestriction", "admit", "DELETE", "false") > nr0);
     assert_eq!(
         plugin_series("LimitRanger", "validate", "DELETE", "false"),
         lr0
