@@ -4380,43 +4380,6 @@ pub fn validate_container_updates(
     (errs, false)
 }
 
-/// Stand-in for upstream's `diff.Diff(old, munged)` (a `cmp.Diff` rendering
-/// that Rust cannot reproduce byte for byte): one `path: -old +new` line per
-/// differing leaf.
-fn json_spec_diff(old: &serde_json::Value, new: &serde_json::Value) -> String {
-    fn walk(path: &str, a: &serde_json::Value, b: &serde_json::Value, out: &mut Vec<String>) {
-        use serde_json::Value;
-        match (a, b) {
-            (Value::Object(x), Value::Object(y)) => {
-                let mut keys: Vec<&String> = x.keys().chain(y.keys()).collect();
-                keys.sort();
-                keys.dedup();
-                for k in keys {
-                    let p = format!("{path}.{k}");
-                    match (x.get(k), y.get(k)) {
-                        (Some(l), Some(r)) => walk(&p, l, r, out),
-                        (l, r) => out.push(format!(
-                            "{p}: -{} +{}",
-                            l.map_or("<absent>".to_string(), |v| v.to_string()),
-                            r.map_or("<absent>".to_string(), |v| v.to_string())
-                        )),
-                    }
-                }
-            }
-            (Value::Array(x), Value::Array(y)) if x.len() == y.len() => {
-                for (i, (l, r)) in x.iter().zip(y).enumerate() {
-                    walk(&format!("{path}[{i}]"), l, r, out);
-                }
-            }
-            _ if a != b => out.push(format!("{path}: -{a} +{b}")),
-            _ => {}
-        }
-    }
-    let mut out = Vec::new();
-    walk("spec", old, new, &mut out);
-    out.join("\n")
-}
-
 /// Top-level immutability fence. Composes the four pre-checks above plus a
 /// munge+DeepEqual fence that catches any other forbidden field changes.
 /// Mirrors `ValidatePodUpdate` (validation.go:5695-5838).
@@ -4623,7 +4586,7 @@ pub fn validate_pod_spec_update(
             format!(
                 "pod updates may not change fields other than {}\n{}",
                 UPDATABLE_POD_SPEC_FIELDS.join(","),
-                json_spec_diff(&old_json, &munged_json),
+                crate::diff_schema::pod_spec_diff(&old_json, &munged_json),
             ),
         ));
     }

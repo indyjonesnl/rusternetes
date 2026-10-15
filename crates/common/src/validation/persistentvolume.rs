@@ -1251,9 +1251,14 @@ pub fn validate_persistent_volume_update(
     }
 
     if persistent_volume_source(&new_spec) != persistent_volume_source(&old.spec) {
+        // validation.go:2283-2284: `diff.Diff(old source, new source)`.
+        let source_diff = crate::diff_schema::persistent_volume_source_diff(
+            &serde_json::to_value(&old.spec).unwrap_or_default(),
+            &serde_json::to_value(&new_spec).unwrap_or_default(),
+        );
         errs.push(Error::forbidden(
             &Path::new("spec").child("persistentvolumesource"),
-            "spec.persistentvolumesource is immutable after creation",
+            format!("spec.persistentvolumesource is immutable after creation\n{source_diff}"),
         ));
     }
 
