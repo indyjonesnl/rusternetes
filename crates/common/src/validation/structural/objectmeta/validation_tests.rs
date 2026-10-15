@@ -11,6 +11,8 @@ use super::*;
 use crate::validation::field::ErrorType;
 use crate::validation::structural::{Extensions, StructuralOrBool};
 
+type Expected = Vec<(ErrorType, String)>;
+
 fn embedded() -> Structural {
     Structural {
         extensions: Extensions {
@@ -34,7 +36,7 @@ fn invalid(p: &str) -> (ErrorType, String) {
 fn assert_matches(name: &str, errs: &[Error], expected: &[(ErrorType, String)]) {
     let mut got: Vec<(ErrorType, String)> = errs
         .iter()
-        .map(|e| (e.error_type.clone(), e.field.clone()))
+        .map(|e| (e.error_type, e.field.clone()))
         .collect();
     let mut want = expected.to_vec();
     let key = |e: &(ErrorType, String)| format!("{:?} {}", e.0, e.1);
@@ -46,7 +48,7 @@ fn assert_matches(name: &str, errs: &[Error], expected: &[(ErrorType, String)]) 
 /// `TestValidateEmbeddedResource`.
 #[test]
 fn validate_embedded_resource_cases() {
-    let cases: Vec<(&str, Value, Vec<(ErrorType, String)>)> = vec![
+    let cases: Vec<(&str, Value, Expected)> = vec![
         (
             "empty",
             json!({}),
@@ -128,7 +130,7 @@ fn validate_cases() {
         ..Default::default()
     };
 
-    let cases: Vec<(&str, Value, bool, Vec<(ErrorType, String)>)> = vec![
+    let cases: Vec<(&str, Value, bool, Expected)> = vec![
         ("empty", json!({}), false, vec![]),
         (
             "include root",
