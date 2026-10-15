@@ -376,6 +376,8 @@ mod wire_format_coverage_test;
 mod workload_template_decodes_when_absent_test;
 mod workload_template_drop_disabled_test;
 
+mod conformance_node_lease;
+mod conformance_node_podtemplates;
 mod connect_mutating_admission_test;
 mod custom_external_metrics_selectors_test;
 mod custom_metrics_list_shape_test;
