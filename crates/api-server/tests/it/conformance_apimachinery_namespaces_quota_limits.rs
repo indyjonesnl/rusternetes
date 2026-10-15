@@ -42,20 +42,19 @@
 //! | limit_range.go:256 list, patch, delete by collection | cross-namespace label-selected list + collection delete added |
 //!
 //! **Every mirror in this file has now been re-derived.** What remains is not
-//! re-derivation but absence: ten upstream conformance cases in these sources
-//! have no mirror at all — `resource_quota.go` :112, :172, :339, :406, :462,
-//! :754 and `namespace.go` :247, :256, :309, :376. All ten are enumerated in
-//! #1770. Two of them (namespace :247, :256 — pods and services removed on
-//! namespace deletion) are controller-owned and their mirrors likely belong in
+//! re-derivation but absence. The five object-count quota cases
+//! (`resource_quota.go` :112, :172, :339, :406, :462 — the life of a service,
+//! secret, configMap, replication controller and replica set) are now mirrored
+//! in `conformance_apimachinery_resource_quota_object_count.rs`. Five cases in
+//! these sources still have no mirror at all — `resource_quota.go` :754 and
+//! `namespace.go` :247, :256, :309, :376 — tracked in #1770. Two of them
+//! (namespace :247, :256 — pods and services removed on namespace deletion) are
+//! controller-owned and their mirrors likely belong in
 //! `crates/controller-manager/tests/it/`, as the kube-root-ca requirements did
 //! in #1755.
 //!
 //! The record stays marked in-progress for that reason: the file's mirrors are
 //! audited, the area's coverage is not.
-//! Nine upstream conformance cases in these sources have **no mirror at all** —
-//! the quota cases covering the life of a service, secret, configMap,
-//! replication controller and replica set among them. Enumerated and tracked in
-//! #1770.
 //!
 //! Do not treat this file as audited: the record above is explicitly partial.
 //!

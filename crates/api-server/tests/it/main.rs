@@ -42,6 +42,7 @@ mod conformance_apimachinery_aggregation_discovery;
 mod conformance_apimachinery_crd_lifecycle;
 mod conformance_apimachinery_crd_openapi;
 mod conformance_apimachinery_namespaces_quota_limits;
+mod conformance_apimachinery_resource_quota_object_count;
 mod conformance_apimachinery_vap_apf_server;
 mod conformance_apimachinery_watch_chunking_gc;
 mod conformance_auth_rbac_serviceaccount;
