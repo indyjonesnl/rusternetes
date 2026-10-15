@@ -106,6 +106,20 @@ const BURST_REPLICAS: usize = 250;
 /// `controller.SlowStartInitialBatchSize`
 /// (pkg/controller/controller_utils.go:87).
 const SLOW_START_INITIAL_BATCH_SIZE: usize = 1;
+/// `maxNameGenerationCreateAttempts`
+/// (staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go:440).
+const MAX_NAME_GENERATION_CREATE_ATTEMPTS: usize = 8;
+
+/// `<base>-<5 random chars>`, as upstream's `simpleNameGenerator`.
+fn generate_pod_name(base: &str) -> String {
+    use rand::Rng;
+    const CHARSET: &[u8] = b"bcdfghjklmnpqrstvwxz2456789";
+    let mut rng = rand::rng();
+    let suffix: String = (0..5)
+        .map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char)
+        .collect();
+    format!("{base}-{suffix}")
+}
 
 impl<S: Storage + 'static> DaemonSetController<S> {
     pub fn new(storage: Arc<S>) -> Self {
@@ -1308,6 +1322,21 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         node_name: &str,
         namespace: &str,
     ) -> Result<String> {
+        self.create_pod_with_namer(daemonset, node_name, namespace, &mut || {
+            generate_pod_name(&daemonset.metadata.name)
+        })
+        .await
+    }
+
+    /// `create_pod` with the generateName generator injected so a collision
+    /// is testable. `next_name` is called once per create attempt.
+    async fn create_pod_with_namer(
+        &self,
+        daemonset: &DaemonSet,
+        node_name: &str,
+        namespace: &str,
+        next_name: &mut (dyn FnMut() -> String + Send),
+    ) -> Result<String> {
         let daemonset_name = &daemonset.metadata.name;
         // Pod naming depends on the update strategy.
         //
@@ -1328,20 +1357,10 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             .as_ref()
             .and_then(|s| s.strategy_type.as_deref())
             == Some("OnDelete");
-        let pod_name = if on_delete {
+        let mut pod_name = if on_delete {
             format!("{}-{}", daemonset_name, node_name)
         } else {
-            let suffix: String = {
-                use rand::Rng;
-                let mut rng = rand::rng();
-                (0..5)
-                    .map(|_| {
-                        const CHARSET: &[u8] = b"bcdfghjklmnpqrstvwxz2456789";
-                        CHARSET[rng.random_range(0..CHARSET.len())] as char
-                    })
-                    .collect()
-            };
-            format!("{}-{}", daemonset_name, suffix)
+            next_name()
         };
 
         // Create pod from template
@@ -1449,7 +1468,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             }
         }
 
-        let pod = Pod {
+        let mut pod = Pod {
             type_meta: rusternetes_common::types::TypeMeta {
                 kind: "Pod".to_string(),
                 api_version: "v1".to_string(),
@@ -1478,10 +1497,28 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             }),
         };
 
-        let key = format!("/registry/pods/{}/{}", namespace, pod_name);
-        self.storage.create(&key, &pod).await?;
-
-        Ok(pod_name)
+        // generateName retry: `createWithGenerateNameRetry` redraws the name on
+        // AlreadyExists, up to `maxNameGenerationCreateAttempts`
+        // (staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go:440,
+        // :460-470). Only for generated names; OnDelete pods have a fixed name.
+        let attempts = if on_delete {
+            1
+        } else {
+            MAX_NAME_GENERATION_CREATE_ATTEMPTS
+        };
+        let mut attempt = 1;
+        loop {
+            let key = format!("/registry/pods/{}/{}", namespace, pod_name);
+            match self.storage.create(&key, &pod).await {
+                Ok(_) => return Ok(pod_name),
+                Err(rusternetes_common::Error::AlreadyExists(_)) if attempt < attempts => {
+                    attempt += 1;
+                    pod_name = next_name();
+                    pod.metadata.name = pod_name.clone();
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
 
     /// Inject the projected `kube-api-access` volume, as upstream's ServiceAccount
@@ -2938,6 +2975,27 @@ mod tests {
 
     /// `syncNodes` caps one call at `burstReplicas` (:987-989) and sets the
     /// capped count as the expectation.
+    /// A generateName collision is retried with a fresh name
+    /// (`createWithGenerateNameRetry`, store.go:460-470) rather than being
+    /// swallowed as "already exists" and leaving the node without a pod.
+    #[tokio::test]
+    async fn test_create_pod_retries_generate_name_collision() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = DaemonSetController::new(storage.clone());
+        let ds = make_test_daemonset("gn", "default");
+        let taken = make_test_daemonset("gn", "default");
+        let squatter = controller
+            .create_pod(&taken, "n0", "default")
+            .await
+            .unwrap();
+        let mut names = vec!["gn-fresh".to_string(), squatter.clone(), squatter.clone()];
+        let created = controller
+            .create_pod_with_namer(&ds, "n1", "default", &mut || names.pop().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(created, "gn-fresh");
+    }
+
     #[tokio::test]
     async fn test_burst_replicas_caps_creates() {
         let storage = Arc::new(MemoryStorage::new());
