@@ -654,6 +654,52 @@ mod tests {
         }
     }
 
+    /// `TestNewInvalid` cases beyond the three above (errors_test.go:124-220):
+    /// NotFound, NotSupported, Required and the nil error list, plus
+    /// `Cause.Type = CauseType(err.Type)` (errors.go:289), which makes an
+    /// `Internal` error `InternalError` and a `TypeInvalid` one
+    /// `FieldValueTypeInvalid` rather than collapsing them to
+    /// `FieldValueInvalid`.
+    #[test]
+    fn new_invalid_matches_upstream_remaining_cases() {
+        use crate::validation::field::{Error as FE, ErrorType};
+        let p = Path::new("field[0].name");
+        let cases: Vec<(FE, &str, &str)> = vec![
+            (
+                FE::not_found(&p, "bar"),
+                "FieldValueNotFound",
+                r#"Kind "name" is invalid: field[0].name: Not found: "bar""#,
+            ),
+            (
+                FE::not_supported(&p, "bar", &[] as &[&str]),
+                "FieldValueNotSupported",
+                r#"Kind "name" is invalid: field[0].name: Unsupported value: "bar""#,
+            ),
+            (
+                FE::internal(&p, "boom"),
+                "InternalError",
+                r#"Kind "name" is invalid: field[0].name: Internal error: boom"#,
+            ),
+        ];
+        for (err, reason, msg) in cases {
+            let Error::Status(st) = Error::new_invalid("", "Kind", "name", vec![err]) else {
+                panic!("not a Status")
+            };
+            assert_eq!(st.message.as_deref(), Some(msg));
+            let c = &st.details.unwrap().causes.unwrap()[0];
+            assert_eq!(c.reason.as_deref(), Some(reason), "{msg}");
+        }
+        assert_eq!(ErrorType::TypeInvalid.cause_reason(), "FieldValueTypeInvalid");
+        assert_eq!(ErrorType::Internal.cause_reason(), "InternalError");
+
+        // `IsInvalid(NewInvalid(kind("Test"), "2", nil))` (errors_test.go:72).
+        let Error::Status(st) = Error::new_invalid("", "Test", "2", vec![]) else {
+            panic!()
+        };
+        assert_eq!(st.reason.as_deref(), Some("Invalid"));
+        assert!(st.details.unwrap().causes.is_none());
+    }
+
     /// `StatusDetails.Name`/`Kind` are `omitempty` (meta/v1 types.go), so an
     /// empty name or kind must not serialize (delete.go:81 passes name "").
     #[test]

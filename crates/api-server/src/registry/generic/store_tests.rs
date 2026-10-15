@@ -442,11 +442,27 @@ async fn an_unconditional_update_needs_the_strategy_to_allow_it() {
     });
     create(&registry, cm("foo")).await;
     let err = update(&registry, cm("foo")).await.unwrap_err();
-    let Error::Invalid(errs) = err else {
+    // `apierrors.NewInvalid(schema.GroupKind{Group: qualifiedResource.Group,
+    // Kind: qualifiedResource.Resource}, name, ...)` (store.go:731-733).
+    let Error::Status(st) = err else {
         panic!("{err:?}")
     };
-    assert_eq!(errs[0].field, "metadata.resourceVersion");
-    assert_eq!(errs[0].detail, "must be specified for an update");
+    assert_eq!(
+        st.message.as_deref(),
+        Some(
+            "configmaps \"foo\" is invalid: metadata.resourceVersion: Invalid value: 0: \
+             must be specified for an update"
+        )
+    );
+    let d = st.details.unwrap();
+    assert_eq!(d.kind.as_deref(), Some("configmaps"));
+    assert_eq!(d.name.as_deref(), Some("foo"));
+    let c = &d.causes.unwrap()[0];
+    assert_eq!(c.field.as_deref(), Some("metadata.resourceVersion"));
+    assert_eq!(
+        c.message.as_deref(),
+        Some("Invalid value: 0: must be specified for an update")
+    );
 }
 
 /// `TestNoOpUpdates` (store_test.go:847-900): an update that changes nothing

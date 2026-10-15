@@ -471,3 +471,25 @@ async fn multi_violation_request_emits_one_cause_per_violation() {
         "expected both FieldValueRequired and FieldValueNotSupported in causes={causes:#?}"
     );
 }
+
+/// `CreateOptions` validation on the pod `binding` and `eviction` creates:
+/// `NewInvalid(schema.GroupKind{Group: metav1.GroupName, Kind:
+/// "CreateOptions"}, "", errs)` (endpoints/handlers/create.go:109-112), so the
+/// message carries the `CreateOptions.meta.k8s.io "" is invalid: ` prefix.
+#[tokio::test]
+async fn pod_binding_and_eviction_create_options_use_new_invalid() {
+    let router = spawn_router();
+    create_namespace(&router, "default").await;
+    for (sub, kind) in [("binding", "Binding"), ("eviction", "Eviction")] {
+        let uri = format!("/api/v1/namespaces/default/pods/p/{sub}?dryRun=Maybe");
+        let (status, body) = post_json(&router, &uri, &json!({"kind": kind})).await;
+        assert_eq!(status, 422, "{sub}: {body}");
+        let msg = body["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.starts_with(r#"CreateOptions.meta.k8s.io "" is invalid: dryRun: "#),
+            "{sub}: {body}"
+        );
+        assert_eq!(body["details"]["kind"], "CreateOptions", "{sub}: {body}");
+        assert_eq!(body["details"]["group"], "meta.k8s.io", "{sub}: {body}");
+    }
+}

@@ -1141,16 +1141,23 @@ mod tests {
         let spec = json!({"type": "NodePort", "ports": [{"port": 80, "protocol": "TCP", "nodePort": 30100}]});
         create(&pa, &mut svc(spec.clone())).await.unwrap();
         let err = create(&pa, &mut svc(spec)).await.unwrap_err();
-        let Error::Invalid(errs) = err else {
-            panic!("want Invalid, got {err:?}")
+        // `NewInvalid(api.Kind("Service"), service.Name, el)` (alloc.go:536).
+        let Error::Status(st) = err else {
+            panic!("want a NewInvalid Status, got {err:?}")
         };
-        assert_eq!(errs[0].field, "spec.ports[0].nodePort");
+        let d = st.details.as_ref().unwrap();
+        assert_eq!(d.kind.as_deref(), Some("Service"));
+        assert_eq!(d.name.as_deref(), Some("foo"));
+        let c = &d.causes.as_ref().unwrap()[0];
+        assert_eq!(c.field.as_deref(), Some("spec.ports[0].nodePort"));
+        let msg = st.message.as_deref().unwrap();
         assert!(
-            errs[0]
-                .detail
-                .contains("provided port is already allocated"),
-            "{errs:?}"
+            msg.starts_with(
+                "Service \"foo\" is invalid: spec.ports[0].nodePort: Invalid value: 30100: "
+            ),
+            "{msg}"
         );
+        assert!(msg.contains("provided port is already allocated"), "{msg}");
     }
 
     #[tokio::test]
@@ -1254,7 +1261,10 @@ mod tests {
             .await
             .err()
             .expect("the port is taken");
-        assert!(matches!(err, Error::Invalid(_)), "{err:?}");
+        assert!(
+            matches!(&err, Error::Status(st) if st.message.as_deref().is_some_and(|m| m.starts_with("Service \"foo\" is invalid: "))),
+            "{err:?}"
+        );
         assert_eq!(pa.allocated().await, vec![30300, 30301]);
     }
 
