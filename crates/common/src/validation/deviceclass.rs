@@ -8,8 +8,8 @@
 //! DRA CEL environment is tracked in #1442. ObjectMeta is validated separately.
 
 use crate::resources::{DeviceClass, DeviceClassSpec};
-use crate::validation::field::{Error, ErrorList, Path};
-use crate::validation::resourceclaim::validate_selector_slice;
+use crate::validation::field::{ErrorList, Path};
+use crate::validation::resourceclaim::{too_many_max_items, validate_selector_slice};
 
 const DEVICE_CONFIG_MAX_SIZE: usize = 32;
 
@@ -35,7 +35,7 @@ fn validate_device_class_spec(spec: &DeviceClassSpec, fld_path: &Path) -> ErrorL
     ));
 
     if spec.config.len() > DEVICE_CONFIG_MAX_SIZE {
-        errs.push(Error::too_many(
+        errs.push(too_many_max_items(
             &fld_path.child("config"),
             spec.config.len(),
             DEVICE_CONFIG_MAX_SIZE,
@@ -138,5 +138,28 @@ mod tests {
                 .any(|m| m.contains("selectors") && m.contains("at most")),
             "{e:?}"
         );
+    }
+
+    /// `validateSlice` tags the size breach `.WithOrigin("maxItems")`
+    /// (`pkg/apis/resource/validation/validation.go:1181`; asserted by
+    /// `validation_deviceclass_test.go:222,316`).
+    #[test]
+    fn too_many_selectors_and_config_carry_max_items_origin() {
+        let selectors: Vec<_> = (0..33)
+            .map(|_| serde_json::json!({"cel": {"expression": "true"}}))
+            .collect();
+        let config: Vec<_> = (0..33)
+            .map(|_| serde_json::json!({"opaque": {"driver": "d.example.com", "parameters": {}}}))
+            .collect();
+        let mut got: Vec<(String, String)> = validate_device_class(&dc(
+            serde_json::json!({"selectors": selectors, "config": config}),
+        ))
+        .into_iter()
+        .filter(|e| e.error_type == crate::validation::field::ErrorType::TooMany)
+        .map(|e| (e.field, e.origin))
+        .collect();
+        got.sort();
+        let m = |f: &str| (f.to_string(), "maxItems".to_string());
+        assert_eq!(got, vec![m("spec.config"), m("spec.selectors")]);
     }
 }

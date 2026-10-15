@@ -19,6 +19,7 @@ use crate::resources::{ResourceSlice, ResourceSliceSpec};
 use crate::validation::csinode::validate_csi_driver_name;
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::{is_dns1123_label, is_dns1123_subdomain, validate_label_name};
+use crate::validation::resourceclaim::too_many_max_items;
 use std::collections::HashSet;
 
 /// Port of upstream `validateNodeName` (resource/validation): node names use
@@ -173,7 +174,7 @@ fn validate_resource_slice_spec(spec: &ResourceSliceSpec, fld_path: &Path) -> Er
         RESOURCE_SLICE_MAX_DEVICES
     };
     if spec.devices.len() > max_devices {
-        errs.push(Error::too_many(
+        errs.push(too_many_max_items(
             &devices_path,
             spec.devices.len(),
             max_devices,
@@ -214,7 +215,7 @@ fn validate_device(device: &Device, fld_path: &Path) -> ErrorList {
 
     let taints_path = fld_path.child("taints");
     if device.taints.len() > DEVICE_TAINTS_MAX_LENGTH {
-        errs.push(Error::too_many(
+        errs.push(too_many_max_items(
             &taints_path,
             device.taints.len(),
             DEVICE_TAINTS_MAX_LENGTH,
@@ -226,7 +227,7 @@ fn validate_device(device: &Device, fld_path: &Path) -> ErrorList {
 
     let consumes_path = fld_path.child("consumesCounters");
     if device.consumes_counters.len() > MAX_COUNTER_CONSUMPTIONS_PER_DEVICE {
-        errs.push(Error::too_many(
+        errs.push(too_many_max_items(
             &consumes_path,
             device.consumes_counters.len(),
             MAX_COUNTER_CONSUMPTIONS_PER_DEVICE,
@@ -286,7 +287,7 @@ pub(crate) fn validate_device_binding_parameters(
         (binding_failure_conditions, &bfc_path),
     ] {
         if list.len() > BINDING_CONDITIONS_MAX_SIZE {
-            errs.push(Error::too_many(
+            errs.push(too_many_max_items(
                 path,
                 list.len(),
                 BINDING_CONDITIONS_MAX_SIZE,
@@ -762,6 +763,81 @@ mod tests {
             e[0].contains("spec.devices[0].bindingFailureConditions[0]")
                 && e[0].contains("must not overlap with bindingConditions"),
             "{e:?}"
+        );
+    }
+
+    // ---- TooMany origin (#3412) ------------------------------------------
+    //
+    // `validateSlice` / `validateSet` tag size breaches
+    // `.WithOrigin("maxItems")` (`validation.go:1181`, `:1198`); `validateMap`
+    // for a counter set's `counters` (`:1246`) does not.
+    fn too_many_origins(spec: serde_json::Value) -> Vec<(String, String)> {
+        let mut v = base();
+        v["spec"] = spec;
+        let mut out: Vec<(String, String)> = validate_resource_slice(&slice(v))
+            .into_iter()
+            .filter(|e| e.error_type == crate::validation::field::ErrorType::TooMany)
+            .map(|e| (e.field, e.origin))
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn spec_with_devices(devices: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({
+            "driver": "dra.example.com",
+            "pool": {"name": "pool-1", "generation": 1, "resourceSliceCount": 1},
+            "allNodes": true,
+            "devices": devices,
+        })
+    }
+
+    #[test]
+    fn devices_too_many_carries_max_items_origin() {
+        let devices: Vec<_> = (0..129)
+            .map(|i| serde_json::json!({"name": format!("d{i}")}))
+            .collect();
+        assert_eq!(
+            too_many_origins(spec_with_devices(devices)),
+            vec![("spec.devices".to_string(), "maxItems".to_string())]
+        );
+    }
+
+    #[test]
+    fn device_lists_too_many_carry_max_items_origin() {
+        let taints: Vec<_> = (0..17)
+            .map(|i| serde_json::json!({"key": format!("k{i}"), "effect": "NoSchedule"}))
+            .collect();
+        let consumes: Vec<_> = (0..3)
+            .map(|i| serde_json::json!({"counterSet": format!("cs{i}"), "counters": {"c": {"value": "1"}}}))
+            .collect();
+        let conds: Vec<String> = (0..5).map(|i| format!("cond{i}")).collect();
+        let device = serde_json::json!({
+            "name": "d0", "taints": taints, "consumesCounters": consumes,
+            "bindingConditions": conds, "bindingFailureConditions": conds,
+        });
+        let m = |f: &str| (f.to_string(), "maxItems".to_string());
+        assert_eq!(
+            too_many_origins(spec_with_devices(vec![device])),
+            vec![
+                m("spec.devices[0].bindingConditions"),
+                m("spec.devices[0].bindingFailureConditions"),
+                m("spec.devices[0].consumesCounters"),
+                m("spec.devices[0].taints"),
+            ]
+        );
+    }
+
+    #[test]
+    fn counter_set_counters_too_many_has_no_origin() {
+        let counters: serde_json::Map<String, serde_json::Value> = (0..33)
+            .map(|i| (format!("c{i}"), serde_json::json!({"value": "1"})))
+            .collect();
+        let mut spec = spec_with_devices(vec![serde_json::json!({"name": "d0"})]);
+        spec["sharedCounters"] = serde_json::json!([{"name": "cs", "counters": counters}]);
+        assert_eq!(
+            too_many_origins(spec),
+            vec![("spec.sharedCounters[0].counters".to_string(), String::new())]
         );
     }
 }
