@@ -138,6 +138,15 @@ impl KubeletVolumeHost {
         self
     }
 
+    /// Replace the host's `mount.Interface`. Upstream injects
+    /// `mount.NewFakeMounter` into its `FakeVolumeHost`; here the seam is a
+    /// real [`Mounter`] reading an injected mountinfo
+    /// ([`Mounter::with_mountinfo_path`]).
+    pub fn with_mounter(mut self, mounter: Mounter) -> Self {
+        self.mounter = mounter;
+        self
+    }
+
     /// Attach the kubelet's pod certificate manager
     /// (`kubeletVolumeHost.podCertificateManager`, `volume_host.go`).
     pub fn with_pod_certificate_manager(

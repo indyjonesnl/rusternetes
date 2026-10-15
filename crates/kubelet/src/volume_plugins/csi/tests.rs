@@ -1345,6 +1345,73 @@ async fn desired_volume_keeps_its_device_staged() {
     assert!(!target.exists());
 }
 
+/// `GenerateUnmountDeviceFunc`'s refs gate (`operation_generator.go:846-856`)
+/// as the sweep applies it: the plugin the sweep asks (`FindDeviceMountable
+/// PluginByName` over the manager's registry) answers `GetDeviceMountRefs`
+/// from its host's mounter, so a reference to the device mount path elsewhere
+/// blocks `NodeUnstageVolume` until it is gone, and the mounter's mountinfo is
+/// injectable (`FakeMounter.MountPoints` stand-in).
+#[tokio::test]
+async fn staged_device_with_an_outside_reference_is_not_unstaged() {
+    let f = fx(
+        "outsideref",
+        &[Cap::StageUnstageVolume],
+        Some(json!({"attachRequired": false})),
+    )
+    .await;
+    let device = staged_dir_only(&f);
+    let target = std::path::Path::new(&f.root)
+        .join("plugins/kubernetes.io/csi")
+        .join(&f.driver)
+        .join("abc");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::rename(device.parent().unwrap(), &target).unwrap();
+    let global = std::fs::canonicalize(target.join("globalmount")).unwrap();
+
+    let mountinfo = std::path::Path::new(&f.root).join("mountinfo");
+    let write_info = |outside: bool| {
+        let mut info = format!(
+            "10 1 8:1 / / rw - ext4 /dev/sda1 rw\n20 10 8:1 /r {} rw - ext4 /dev/sda1 rw\n",
+            global.display()
+        );
+        if outside {
+            info.push_str("21 10 8:1 /r /mnt/other rw - ext4 /dev/sda1 rw\n");
+        }
+        std::fs::write(&mountinfo, info).unwrap();
+    };
+
+    let host = Arc::new(
+        crate::volume_plugins::KubeletVolumeHost::new(
+            f.root.clone(),
+            None,
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            HashMap::new(),
+        )
+        .with_mounter(
+            crate::volume_plugins::util::mount_ops::Mounter::new("", false, false)
+                .with_mountinfo_path(mountinfo.to_str().unwrap()),
+        ),
+    );
+    let mut vm = volume_manager(&f.root);
+    vm.plugin_mgr = Arc::new(crate::volume_plugins::VolumePluginMgr::new(vec![Box::new(
+        CsiPlugin::new(host),
+    )]));
+    let none = std::collections::HashSet::new();
+
+    write_info(true);
+    vm.unmount_csi_devices_not_in(&none).await;
+    assert!(
+        f.fake.calls.lock().unwrap().unstage.is_empty(),
+        "an outside reference must block NodeUnstageVolume"
+    );
+    assert!(target.exists());
+
+    write_info(false);
+    vm.unmount_csi_devices_not_in(&none).await;
+    assert_eq!(f.fake.calls.lock().unwrap().unstage.len(), 1);
+    assert!(!target.exists());
+}
+
 /// #2424: a terminated pod that is still present in the API has its volumes
 /// unmounted too (`findAndRemoveDeletedPods` + `ShouldPodRuntimeBeRemoved`,
 /// `pod_workers.go:698`); a running live pod's are left alone.
