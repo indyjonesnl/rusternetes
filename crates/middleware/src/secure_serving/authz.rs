@@ -51,7 +51,7 @@ impl Authorizer for UnionAuthz {
         let mut reasons: Vec<String> = vec![];
         for a in &self.authorizers {
             match a.authorize_opinion(attrs).await? {
-                Opinion::Allow => return Ok(Decision::Allow),
+                Opinion::Allow(_) => return Ok(Decision::Allow),
                 Opinion::Deny(r) => return Ok(Decision::Deny(r)),
                 Opinion::NoOpinion { reason, error } => {
                     errlist.extend(error);
@@ -94,7 +94,7 @@ struct PathAuthorizer {
 impl Authorizer for PathAuthorizer {
     async fn authorize(&self, attrs: &RequestAttributes) -> Result<Decision> {
         match self.authorize_opinion(attrs).await? {
-            Opinion::Allow => Ok(Decision::Allow),
+            Opinion::Allow(_) => Ok(Decision::Allow),
             Opinion::Deny(r) => Ok(Decision::Deny(r)),
             Opinion::NoOpinion { reason, .. } => Ok(Decision::Deny(reason)),
         }
@@ -111,10 +111,10 @@ impl Authorizer for PathAuthorizer {
         let pth = a.path.as_deref().unwrap_or("");
         let pth = pth.strip_prefix('/').unwrap_or(pth);
         if self.paths.iter().any(|p| p == pth) {
-            return Ok(Opinion::Allow);
+            return Ok(Opinion::Allow(String::new()));
         }
         if self.prefixes.iter().any(|p| pth.starts_with(p.as_str())) {
-            return Ok(Opinion::Allow);
+            return Ok(Opinion::Allow(String::new()));
         }
         Ok(no_opinion)
     }
@@ -280,7 +280,7 @@ impl Authorizer for SubjectAccessReviewAuthorizer {
         // The deny/no-opinion distinction lives in `authorize_opinion`; this
         // is the two-valued projection `UnionAuthorizer` never calls.
         match self.authorize_opinion(attrs).await? {
-            Opinion::Allow => Ok(Decision::Allow),
+            Opinion::Allow(_) => Ok(Decision::Allow),
             Opinion::Deny(r) => Ok(Decision::Deny(r)),
             Opinion::NoOpinion { reason, .. } => Ok(Decision::Deny(reason)),
         }
@@ -352,7 +352,7 @@ impl Authorizer for SubjectAccessReviewAuthorizer {
                 "webhook subject access review returned both allow and deny response".into(),
             )),
             (true, false) => Ok(Opinion::Deny(reason)),
-            (false, true) => Ok(Opinion::Allow),
+            (false, true) => Ok(Opinion::Allow(reason)),
             (false, false) => Ok(Opinion::NoOpinion {
                 reason,
                 error: None,
@@ -520,7 +520,7 @@ mod tests {
                     .authorize_opinion(&non_resource(user("u", &[]), "get", p))
                     .await
                     .unwrap();
-                assert_eq!(got, Opinion::Allow, "{} {p:?}", c.name);
+                assert_eq!(got, Opinion::Allow(String::new()), "{} {p:?}", c.name);
             }
             for p in &c.no_opinion {
                 let got = a
@@ -771,7 +771,7 @@ mod tests {
             backend.reset(allow, status);
             let got = a.authorize_opinion(attr).await;
             let (authorized, err) = match got {
-                Ok(Opinion::Allow) => (true, false),
+                Ok(Opinion::Allow(_)) => (true, false),
                 Ok(Opinion::NoOpinion { error, .. }) => (false, error.is_some()),
                 Ok(Opinion::Deny(_)) => (false, false),
                 Err(_) => (false, true),
@@ -795,8 +795,12 @@ mod tests {
         );
         let attr = non_resource(user("u", &[]), "get", "/x");
 
+        // webhook.go:294: DecisionAllow carries r.Status.Reason.
         backend.reset(true, 200);
-        assert_eq!(a.authorize_opinion(&attr).await.unwrap(), Opinion::Allow);
+        assert_eq!(
+            a.authorize_opinion(&attr).await.unwrap(),
+            Opinion::Allow("because".into())
+        );
 
         backend.reset(false, 200);
         assert_eq!(
@@ -964,13 +968,13 @@ mod tests {
         let attr = non_resource(user("u", &[]), "get", "/x");
         let u = UnionAuthz::new(vec![
             no_opinion("", Some("boom")),
-            Arc::new(Fixed(Opinion::Allow)),
+            Arc::new(Fixed(Opinion::Allow(String::new()))),
             no_opinion("never", None),
         ]);
         assert_eq!(u.authorize(&attr).await.unwrap(), Decision::Allow);
         let u = UnionAuthz::new(vec![
             Arc::new(Fixed(Opinion::Deny("no".into()))),
-            Arc::new(Fixed(Opinion::Allow)),
+            Arc::new(Fixed(Opinion::Allow(String::new()))),
         ]);
         assert_eq!(
             u.authorize(&attr).await.unwrap(),
