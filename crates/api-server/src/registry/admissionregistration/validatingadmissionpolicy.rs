@@ -4,10 +4,8 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use rusternetes_common::authz::Authorizer;
 use rusternetes_common::cel_env::{mutation_env_failure, ExpectedOutput, MutationEnv};
-use rusternetes_common::{Error, Result};
 
 use rusternetes_common::resources::validating_admission_policy::ValidatingAdmissionPolicyStatus;
 use rusternetes_common::resources::ValidatingAdmissionPolicy;
@@ -19,15 +17,11 @@ use rusternetes_common::validation::validating_admission_policy::{
 };
 use rusternetes_storage::StorageBackend;
 
-use super::authz::authorize_param_kind;
-use crate::registry::generic::store::{
-    BeginCreate, BeginUpdate, CreateOptions, Finish, UpdateOptions,
-};
+use super::authz::{authorize_param_kind, ParamAuthz};
 use crate::registry::generic::Store;
-use crate::registry::rbac::policybased::Noop;
 use crate::registry::rest::{
-    reset_object_meta_for_status, with_group_kind, GroupResource, NamespaceScopedStrategy,
-    RequestContext, RestCreateStrategy, RestDeleteStrategy, RestUpdateStrategy,
+    reset_object_meta_for_status, GroupResource, NamespaceScopedStrategy, RequestContext,
+    RestCreateStrategy, RestDeleteStrategy, RestUpdateStrategy, ValidateFuture,
 };
 
 /// `SetObjectDefaults_ValidatingAdmissionPolicy`
@@ -156,7 +150,11 @@ fn compile_errors(obj: &ValidatingAdmissionPolicy, ignore_match_conditions: bool
 }
 
 /// `validatingAdmissionPolicyStrategy` (strategy.go:36-45).
-pub struct Strategy;
+#[derive(Default)]
+pub struct Strategy {
+    /// `authorizer` / `resourceResolver`; `None` skips the `paramKind` check.
+    pub authz: Option<ParamAuthz>,
+}
 
 impl NamespaceScopedStrategy for Strategy {
     fn namespace_scoped(&self) -> bool {
@@ -176,6 +174,24 @@ impl RestCreateStrategy<ValidatingAdmissionPolicy> for Strategy {
         let mut errs = validate(obj);
         errs.extend(compile_errors(obj, false));
         errs
+    }
+
+    /// The `paramKind` authorization of `Validate` (strategy.go:83-92), run
+    /// only when the rest of `Validate` found nothing (`len(errs) == 0`).
+    fn validate_async<'a>(
+        &'a self,
+        ctx: &'a RequestContext,
+        obj: &'a ValidatingAdmissionPolicy,
+    ) -> ValidateFuture<'a> {
+        Box::pin(async move {
+            let Some(authz) = &self.authz else {
+                return Vec::new();
+            };
+            if !RestCreateStrategy::validate(self, ctx, obj).is_empty() {
+                return Vec::new();
+            }
+            authorize_param_kind(ctx, authz.authorizer.as_ref(), &authz.storage, obj, None).await
+        })
     }
 }
 
@@ -212,6 +228,31 @@ impl RestUpdateStrategy<ValidatingAdmissionPolicy> for Strategy {
             ignore_validating_admission_policy_match_conditions(obj, old),
         ));
         errs
+    }
+
+    /// The `paramKind` authorization of `ValidateUpdate` (strategy.go:109-119).
+    fn validate_update_async<'a>(
+        &'a self,
+        ctx: &'a RequestContext,
+        obj: &'a ValidatingAdmissionPolicy,
+        old: &'a ValidatingAdmissionPolicy,
+    ) -> ValidateFuture<'a> {
+        Box::pin(async move {
+            let Some(authz) = &self.authz else {
+                return Vec::new();
+            };
+            if !RestUpdateStrategy::validate_update(self, ctx, obj, old).is_empty() {
+                return Vec::new();
+            }
+            authorize_param_kind(
+                ctx,
+                authz.authorizer.as_ref(),
+                &authz.storage,
+                obj,
+                Some(old),
+            )
+            .await
+        })
     }
 
     /// strategy.go:111-113.
@@ -263,68 +304,6 @@ impl RestUpdateStrategy<ValidatingAdmissionPolicy> for StatusStrategy {
     }
 }
 
-/// `Validate` / `ValidateUpdate` (strategy.go:79-87, :104-112): the `paramKind`
-/// read-access check, run once the object is well-formed. See [`super::authz`]
-/// for why it is a Store hook.
-pub struct ParamKindAuthz {
-    authorizer: Arc<dyn Authorizer>,
-    storage: Arc<StorageBackend>,
-}
-
-#[async_trait]
-impl BeginCreate<ValidatingAdmissionPolicy> for ParamKindAuthz {
-    async fn begin_create(
-        &self,
-        ctx: &RequestContext,
-        obj: &mut ValidatingAdmissionPolicy,
-        _options: &CreateOptions,
-    ) -> Result<Box<dyn Finish>> {
-        if validate(obj).is_empty() && compile_errors(obj, false).is_empty() {
-            let errs =
-                authorize_param_kind(ctx, self.authorizer.as_ref(), &self.storage, obj, None).await;
-            if !errs.is_empty() {
-                return Err(with_group_kind(
-                    Error::Invalid(errs),
-                    "admissionregistration.k8s.io",
-                    obj,
-                ));
-            }
-        }
-        Ok(Box::new(Noop))
-    }
-}
-
-#[async_trait]
-impl BeginUpdate<ValidatingAdmissionPolicy> for ParamKindAuthz {
-    async fn begin_update(
-        &self,
-        ctx: &RequestContext,
-        obj: &mut ValidatingAdmissionPolicy,
-        old: &mut ValidatingAdmissionPolicy,
-        _options: &UpdateOptions,
-    ) -> Result<Box<dyn Finish>> {
-        if validate(obj).is_empty()
-            && compile_errors(
-                obj,
-                ignore_validating_admission_policy_match_conditions(obj, old),
-            )
-            .is_empty()
-        {
-            let errs =
-                authorize_param_kind(ctx, self.authorizer.as_ref(), &self.storage, obj, Some(old))
-                    .await;
-            if !errs.is_empty() {
-                return Err(with_group_kind(
-                    Error::Invalid(errs),
-                    "admissionregistration.k8s.io",
-                    obj,
-                ));
-            }
-        }
-        Ok(Box::new(Noop))
-    }
-}
-
 /// `NewREST` (storage/storage.go:49-80): the main store and the status store.
 pub fn new_stores(
     storage: Arc<StorageBackend>,
@@ -333,37 +312,38 @@ pub fn new_stores(
     Store<ValidatingAdmissionPolicy, StorageBackend>,
     Store<ValidatingAdmissionPolicy, StorageBackend>,
 ) {
-    let mut store = Store::new(
+    let store = Store::new(
         storage.clone(),
         GroupResource::new(
             "admissionregistration.k8s.io",
             "validatingadmissionpolicies",
         ),
-        Arc::new(Strategy),
+        Arc::new(Strategy {
+            authz: Some(ParamAuthz {
+                authorizer,
+                storage,
+            }),
+        }),
     )
     .with_decode_defaulter(convert_to_internal);
-    // The status strategy has no authorization (strategy.go:147-180), so the
-    // status store is derived before the hooks are set.
+    // The status strategy has no authorization (strategy.go:147-180).
     let status = store.with_update_strategy(Arc::new(StatusStrategy));
-    let hook = Arc::new(ParamKindAuthz {
-        authorizer,
-        storage,
-    });
-    store.begin_create = Some(hook.clone());
-    store.begin_update = Some(hook);
     (store, status)
 }
 
 #[cfg(test)]
 mod invalid_status_tests {
     use super::*;
+    use crate::registry::generic::store::{CreateOptions, UpdateOptions};
+    use crate::registry::rest::DefaultUpdatedObjectInfo;
     use rusternetes_common::auth::UserInfo;
     use rusternetes_common::authz::AlwaysDenyAuthorizer;
+    use rusternetes_common::Error;
 
     /// `ValidatingAdmissionPolicy` strategy `Validate` appends the authz error as a
     /// `field.Forbidden`, and `BeforeCreate` / `BeforeUpdate` wrap the list in
     /// `errors.NewInvalid(kind.GroupKind(), name, errs)`
-    /// (rest/create.go:130-137, rest/update.go:131-141; errors.go:284-312), so
+    /// (rest/create.go:122-131, rest/update.go:149-158; errors.go:284-312), so
     /// the status is `<Kind>.<group> "<name>" is invalid: ...` with details.
     #[tokio::test]
     async fn authz_denial_is_a_new_invalid_status() {
@@ -373,12 +353,10 @@ mod invalid_status_tests {
             "validations": [{"expression": "true"}],
             "failurePolicy": "Fail"}})).unwrap();
         assert!(validate(&obj).is_empty(), "{:?}", validate(&obj));
-        let hook = ParamKindAuthz {
-            authorizer: Arc::new(AlwaysDenyAuthorizer),
-            storage: Arc::new(StorageBackend::Memory(Arc::new(
-                rusternetes_storage::MemoryStorage::new(),
-            ))),
-        };
+        let storage = Arc::new(StorageBackend::Memory(Arc::new(
+            rusternetes_storage::MemoryStorage::new(),
+        )));
+        let (store, _status) = new_stores(storage, Arc::new(AlwaysDenyAuthorizer));
         let user = UserInfo {
             username: "alice".into(),
             uid: String::new(),
@@ -386,11 +364,11 @@ mod invalid_status_tests {
             extra: Default::default(),
         };
         let ctx = RequestContext::new(None).with_user(&user);
-        let Err(Error::Status(st)) = hook
-            .begin_create(&ctx, &mut obj.clone(), &CreateOptions::default())
+        let Err(Error::Status(st)) = store
+            .create(&ctx, obj.clone(), None, &CreateOptions::default())
             .await
         else {
-            panic!("expected a Status error from begin_create")
+            panic!("expected a Status error from create")
         };
         assert_eq!(st.code, Some(422));
         assert_eq!(st.reason.as_deref(), Some("Invalid"));
@@ -404,18 +382,119 @@ mod invalid_status_tests {
         assert_eq!(d.kind.as_deref(), Some("ValidatingAdmissionPolicy"));
         assert_eq!(d.name.as_deref(), Some("foo"));
 
-        let Err(Error::Status(st)) = hook
-            .begin_update(
+        let mut plain = obj.clone();
+        plain.spec.as_mut().unwrap().param_kind = None;
+        let created = store
+            .create(&ctx, plain, None, &CreateOptions::default())
+            .await
+            .unwrap();
+        let mut update = obj.clone();
+        update.metadata.resource_version = created.metadata.resource_version.clone();
+        let info = DefaultUpdatedObjectInfo::new(Some(update), Vec::new());
+        let Err(Error::Status(st)) = store
+            .update(
                 &ctx,
-                &mut obj.clone(),
-                &mut ValidatingAdmissionPolicy::new("foo"),
+                "foo",
+                &info,
+                None,
+                None,
+                false,
                 &UpdateOptions::default(),
             )
             .await
         else {
-            panic!("expected a Status error from begin_update")
+            panic!("expected a Status error from update")
         };
         assert_eq!(st.reason.as_deref(), Some("Invalid"));
+    }
+}
+
+#[cfg(test)]
+mod param_kind_authz_ordering_tests {
+    use super::*;
+    use crate::registry::generic::store::{CreateOptions, UpdateOptions};
+    use crate::registry::rest::DefaultUpdatedObjectInfo;
+    use rusternetes_common::auth::UserInfo;
+    use rusternetes_common::authz::AlwaysDenyAuthorizer;
+    use rusternetes_common::Error;
+    use rusternetes_storage::Storage;
+
+    fn policy(param_kind: bool) -> ValidatingAdmissionPolicy {
+        let mut spec = serde_json::json!({
+            "matchConstraints": {"matchPolicy": "Exact", "objectSelector": {}, "namespaceSelector": {}, "resourceRules": [{"operations": ["CREATE"], "apiGroups": ["a"], "apiVersions": ["a"], "resources": ["a"]}]},
+            "validations": [{"expression": "true"}],
+            "failurePolicy": "Fail"});
+        if param_kind {
+            spec["paramKind"] =
+                serde_json::json!({"kind": "ReplicaLimit", "apiVersion": "rules.example.com/v1"});
+        }
+        serde_json::from_value(serde_json::json!({"apiVersion": "admissionregistration.k8s.io/v1", "kind": "ValidatingAdmissionPolicy", "metadata": {"name": "foo"}, "spec": spec})).unwrap()
+    }
+
+    /// Upstream authorizes `paramKind` INSIDE `Validate` / `ValidateUpdate`
+    /// (validatingadmissionpolicy/strategy.go:83-92, :109-119), which
+    /// `BeforeUpdate` (rest/update.go:131-141) calls after
+    /// `validateCommonFields`; both lists are returned in ONE `Invalid`. An
+    /// update that adds a finalizer to an object being deleted
+    /// (`ValidateObjectMetaUpdate`) and an unauthorized paramKind therefore
+    /// reports both causes.
+    #[tokio::test]
+    async fn an_unauthorized_param_kind_is_reported_with_the_metadata_errors() {
+        let storage = Arc::new(StorageBackend::Memory(Arc::new(
+            rusternetes_storage::MemoryStorage::new(),
+        )));
+        let (store, _status) = new_stores(storage.clone(), Arc::new(AlwaysDenyAuthorizer));
+        let user = UserInfo {
+            username: "alice".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        };
+        let ctx = RequestContext::new(None).with_user(&user);
+        let mut plain = policy(false);
+        plain.metadata.finalizers = Some(vec!["a".to_string()]);
+        store
+            .create(&ctx, plain, None, &CreateOptions::default())
+            .await
+            .unwrap();
+        // The object is now being deleted.
+        let key = rusternetes_storage::build_key("validatingadmissionpolicies", None, "foo");
+        let mut stored: ValidatingAdmissionPolicy = storage.get(&key).await.unwrap();
+        stored.metadata.deletion_timestamp = Some(chrono::Utc::now());
+        let stored = storage.update(&key, &stored).await.unwrap();
+
+        let mut next = policy(true);
+        next.metadata.finalizers = Some(vec!["a".to_string(), "b".to_string()]);
+        next.metadata.resource_version = stored.metadata.resource_version.clone();
+        let info = DefaultUpdatedObjectInfo::new(Some(next), Vec::new());
+        let err = store
+            .update(
+                &ctx,
+                "foo",
+                &info,
+                None,
+                None,
+                false,
+                &UpdateOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        let Error::Status(st) = err else {
+            panic!("expected Status, got {err:?}")
+        };
+        let fields: Vec<_> = st
+            .details
+            .unwrap()
+            .causes
+            .unwrap()
+            .into_iter()
+            .filter_map(|c| c.field)
+            .collect();
+        assert!(fields.contains(&"spec.paramKind".to_string()), "{fields:?}");
+        assert!(
+            fields.contains(&"metadata.finalizers".to_string()),
+            "{fields:?}"
+        );
     }
 }
 
@@ -446,7 +525,8 @@ mod match_condition_compile_tests {
     #[test]
     fn create_rejects_a_non_bool_match_condition() {
         let p = policy(json!([{"name": "c", "expression": "6"}]));
-        let errs = RestCreateStrategy::validate(&Strategy, &RequestContext::new(None), &p);
+        let errs =
+            RestCreateStrategy::validate(&Strategy::default(), &RequestContext::new(None), &p);
         assert!(
             messages(&errs).contains(
                 r#"spec.matchConditions[0].expression: Invalid value: "6": must evaluate to bool but got int"#
@@ -460,7 +540,8 @@ mod match_condition_compile_tests {
     #[test]
     fn create_rejects_a_match_condition_that_does_not_compile() {
         let p = policy(json!([{"name": "c", "expression": "///"}]));
-        let errs = RestCreateStrategy::validate(&Strategy, &RequestContext::new(None), &p);
+        let errs =
+            RestCreateStrategy::validate(&Strategy::default(), &RequestContext::new(None), &p);
         assert!(
             messages(&errs).contains(
                 r#"spec.matchConditions[0].expression: Invalid value: "///": compilation failed"#
@@ -473,7 +554,8 @@ mod match_condition_compile_tests {
     #[test]
     fn create_accepts_a_bool_match_condition() {
         let p = policy(json!([{"name": "c", "expression": "object.metadata.name == 'x'"}]));
-        let errs = RestCreateStrategy::validate(&Strategy, &RequestContext::new(None), &p);
+        let errs =
+            RestCreateStrategy::validate(&Strategy::default(), &RequestContext::new(None), &p);
         assert!(errs.is_empty(), "{}", messages(&errs));
     }
 
@@ -485,10 +567,11 @@ mod match_condition_compile_tests {
         let old = policy(json!([{"name": "c", "expression": "6"}]));
         let unchanged = old.clone();
         let ctx = RequestContext::new(None);
-        let errs = RestUpdateStrategy::validate_update(&Strategy, &ctx, &unchanged, &old);
+        let errs =
+            RestUpdateStrategy::validate_update(&Strategy::default(), &ctx, &unchanged, &old);
         assert!(errs.is_empty(), "{}", messages(&errs));
         let changed = policy(json!([{"name": "c", "expression": "7"}]));
-        let errs = RestUpdateStrategy::validate_update(&Strategy, &ctx, &changed, &old);
+        let errs = RestUpdateStrategy::validate_update(&Strategy::default(), &ctx, &changed, &old);
         assert!(
             messages(&errs).contains("spec.matchConditions[0].expression"),
             "{}",
