@@ -88,6 +88,11 @@ pub struct ServiceAccountController<S: Storage> {
     signing_key: Option<EncodingKey>,
     /// PEM-encoded CA certificate injected into SA token secrets
     ca_cert_pem: Option<String>,
+    /// ServiceAccount (name, uid) of each token Secret whose deletion the watch
+    /// has seen but the worker has not yet synced, keyed `namespace/name`.
+    /// Upstream carries these in the Secret queue key (`makeSecretQueueKey`,
+    /// tokens_controller.go:599-607) because the object is gone by sync time.
+    deleted_tokens: std::sync::Mutex<HashMap<String, (String, String)>>,
 }
 
 impl<S: Storage + 'static> ServiceAccountController<S> {
@@ -103,6 +108,7 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
             storage,
             signing_key,
             ca_cert_pem: None,
+            deleted_tokens: Default::default(),
         }
     }
 
@@ -225,7 +231,10 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
                     }
                     event = secret_watch.next() => {
                         match event {
-                            Some(Ok(ev)) => queue.add(extract_key(&ev)).await,
+                            Some(Ok(ev)) => {
+                                self.note_deleted_token(&ev);
+                                queue.add(extract_key(&ev)).await
+                            }
                             Some(Err(e)) => {
                                 tracing::warn!("Secret watch error: {}, reconnecting", e);
                                 watch_broken = true;
@@ -537,9 +546,12 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
         let secret_key = build_key("secrets", Some(namespace), name);
         let mut secret: Secret = match self.storage.get(&secret_key).await {
             Ok(s) => s,
-            // Upstream: a deleted token only has its reference removed from the
-            // ServiceAccount's secrets list (removeSecretReference) — not ported.
-            Err(rusternetes_common::Error::NotFound(_)) => return Ok(()),
+            // A deleted token only has its reference removed from the
+            // ServiceAccount's secrets list (`syncSecret`, secret == nil,
+            // tokens_controller.go:295-304).
+            Err(rusternetes_common::Error::NotFound(_)) => {
+                return self.sync_deleted_token(namespace, name).await;
+            }
             Err(e) => return Err(e.into()),
         };
         if secret.secret_type.as_deref() != Some(SECRET_TYPE_SERVICE_ACCOUNT_TOKEN) {
@@ -616,6 +628,116 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
         }
     }
 
+    /// `makeSecretQueueKey` (tokens_controller.go:599-607) for a deleted
+    /// token Secret: the watch's previous value is the only place the
+    /// ServiceAccount name and uid annotations survive the deletion.
+    fn note_deleted_token(&self, ev: &rusternetes_storage::WatchEvent) {
+        let rusternetes_storage::WatchEvent::Deleted(key, prev) = ev else {
+            return;
+        };
+        let Ok(secret) = serde_json::from_str::<Secret>(prev) else {
+            return;
+        };
+        if secret.secret_type.as_deref() != Some(SECRET_TYPE_SERVICE_ACCOUNT_TOKEN) {
+            return;
+        }
+        let annotation = |k: &str| {
+            secret
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get(k))
+                .cloned()
+                .unwrap_or_default()
+        };
+        let ns = secret.metadata.namespace.clone().unwrap_or_else(|| {
+            key.strip_prefix("/registry/secrets/")
+                .and_then(|r| r.split('/').next())
+                .unwrap_or_default()
+                .to_string()
+        });
+        self.deleted_tokens.lock().unwrap().insert(
+            format!("{}/{}", ns, secret.metadata.name),
+            (
+                annotation(SA_NAME_ANNOTATION),
+                annotation(SA_UID_ANNOTATION),
+            ),
+        );
+    }
+
+    /// `syncSecret`, `secret == nil` branch (tokens_controller.go:295-304): if
+    /// the ServiceAccount the deleted token named still exists, drop the
+    /// reference, retrying on conflict with `RemoveTokenBackoff`.
+    async fn sync_deleted_token(&self, namespace: &str, name: &str) -> Result<()> {
+        let Some((sa_name, sa_uid)) = self
+            .deleted_tokens
+            .lock()
+            .unwrap()
+            .remove(&format!("{}/{}", namespace, name))
+        else {
+            return Ok(());
+        };
+        // `getServiceAccount(.., fetchOnCacheMiss=false)` is nil when absent or
+        // the uid differs; removeSecretReference re-checks both on a fresh GET.
+        // RemoveTokenBackoff: Steps 10, Duration 100ms, Jitter 1.0
+        // (tokens_controller.go:49-53); RetryOnConflict retries only Conflict.
+        for attempt in 0..10u32 {
+            match self
+                .remove_secret_reference(namespace, &sa_name, &sa_uid, name)
+                .await
+            {
+                Err(e) if is_conflict(&e) && attempt < 9 => {
+                    let jitter = 1.0 + rand::random::<f64>();
+                    tokio::time::sleep(std::time::Duration::from_millis((100.0 * jitter) as u64))
+                        .await;
+                }
+                // The upstream caller logs the error and does not requeue.
+                Err(e) => {
+                    error!("Removing secret reference: {}", e);
+                    return Ok(());
+                }
+                Ok(()) => return Ok(()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Upstream `removeSecretReference` (tokens_controller.go:447-483).
+    async fn remove_secret_reference(
+        &self,
+        namespace: &str,
+        sa_name: &str,
+        sa_uid: &str,
+        secret_name: &str,
+    ) -> std::result::Result<(), rusternetes_common::Error> {
+        let key = build_key("serviceaccounts", Some(namespace), sa_name);
+        let mut sa: ServiceAccount = match self.storage.get(&key).await {
+            Ok(sa) => sa,
+            // Ignore NotFound errors when attempting to remove a reference.
+            Err(rusternetes_common::Error::NotFound(_)) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        // Short-circuit if the UID doesn't match.
+        if !sa_uid.is_empty() && sa_uid != sa.metadata.uid {
+            return Ok(());
+        }
+        // Short-circuit if the secret is no longer referenced.
+        let refs = sa.secrets.take().unwrap_or_default();
+        if !refs.iter().any(|r| r.name.as_deref() == Some(secret_name)) {
+            return Ok(());
+        }
+        // `secrets := []v1.ObjectReference{}`; an empty slice is omitempty.
+        let kept: Vec<_> = refs
+            .into_iter()
+            .filter(|r| r.name.as_deref() != Some(secret_name))
+            .collect();
+        sa.secrets = if kept.is_empty() { None } else { Some(kept) };
+        match self.storage.update(&key, &sa).await {
+            Ok(_) | Err(rusternetes_common::Error::NotFound(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Upstream `deleteToken`: delete with a UID precondition; NotFound and a
     /// failed precondition need no retry.
     async fn delete_token(&self, namespace: &str, name: &str, uid: &str) -> Result<()> {
@@ -685,6 +807,10 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
             Err(e) => Err(e.into()),
         }
     }
+}
+
+fn is_conflict(e: &rusternetes_common::Error) -> bool {
+    matches!(e, rusternetes_common::Error::Conflict(_))
 }
 
 #[cfg(test)]
