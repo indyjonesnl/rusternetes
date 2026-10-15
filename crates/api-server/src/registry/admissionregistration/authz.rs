@@ -3,14 +3,14 @@
 //! `.../validatingadmissionpolicybinding/authz.go`.
 //!
 //! Upstream runs it inside the strategy's `Validate` / `ValidateUpdate`, once
-//! the object is well-formed (`validatingadmissionpolicy/strategy.go:79-87`,
-//! `:104-112`; the binding's likewise). A strategy's `validate` is synchronous
-//! here and the authorizer is async, so the check runs in the Store's
-//! `BeginCreate` / `BeginUpdate` hook instead — the same seam the RBAC
-//! policybased storages use. The hook first runs the strategy's own validation
-//! and, like upstream's `if len(errs) == 0`, authorizes only a well-formed
-//! object (the malformed one is then rejected by the Store's validation with
-//! the ordinary errors).
+//! the object is well-formed (`validatingadmissionpolicy/strategy.go:83-92`,
+//! `:109-119`; the binding's likewise). A strategy's `validate` is synchronous
+//! here and the authorizer is async, so each strategy runs it from
+//! `validate_async` / `validate_update_async` — the async half of `Validate`
+//! that `before_create` / `before_update` call next to it (the same seam
+//! `resourceclaim`'s `AuthorizedForAdmin` uses). The strategy first runs its
+//! own synchronous validation and, like upstream's `if len(errs) == 0`,
+//! authorizes only a well-formed object.
 //!
 //! Where this differs from upstream: `resolver.ResourceResolver`
 //! (`resolver/resolver.go:30-61`) asks the discovery client for the resource
@@ -22,7 +22,7 @@
 //!
 //! The hooks return the denial as `errors.NewInvalid(<kind>.<group>, name, errs)`:
 //! the strategies append `field.Forbidden(spec.paramKind|paramRef, err.Error())`
-//! (validatingadmissionpolicy/strategy.go:87-89, :113-115; the binding's and the
+//! (validatingadmissionpolicy/strategy.go:86-89, :112-115; the binding's and the
 //! mutating twins' likewise) and `BeforeCreate`/`BeforeUpdate` wrap the list
 //! (rest/create.go, rest/update.go; errors.go `NewInvalid`).
 
@@ -39,6 +39,16 @@ use rusternetes_storage::{build_key, build_prefix, Storage, StorageBackend};
 
 use crate::registry::rbac::escalation_check::escalation_allowed;
 use crate::registry::rest::RequestContext;
+
+/// The `authorizer` (and, through [`resolve_resource`], the resolver) a
+/// strategy is built with (`NewStrategy(typer, authorizer, resourceResolver)`).
+/// A strategy without one skips the check (`v.authorizer == nil`,
+/// `authorize`).
+#[derive(Clone)]
+pub struct ParamAuthz {
+    pub authorizer: std::sync::Arc<dyn Authorizer>,
+    pub storage: std::sync::Arc<StorageBackend>,
+}
 
 /// `EscalationAllowed(ctx)` and `UserFrom(ctx)`: `Ok(None)` for a superuser
 /// (skip all checks), the requester otherwise.
@@ -113,12 +123,12 @@ async fn resolve_resource(
 }
 
 /// `validatingAdmissionPolicyStrategy.authorizeCreate` / `authorizeUpdate` /
-/// `authorize` (validatingadmissionpolicy/authz.go:30-96): the requester needs
+/// `authorize` (validatingadmissionpolicy/authz.go:31-105): the requester needs
 /// `get` on all objects of `spec.paramKind`. The error is wrapped in a
-/// `field.Forbidden` at `spec.paramKind` (strategy.go:83-85, :108-110).
+/// `field.Forbidden` at `spec.paramKind` (strategy.go:86-89, :112-115).
 ///
 /// `old` is `None` on create; on update the check is skipped when the
-/// paramKind is unchanged (authz.go:47-50).
+/// paramKind is unchanged (authz.go:49-52).
 pub async fn authorize_param_kind(
     ctx: &RequestContext,
     authorizer: &dyn Authorizer,
@@ -137,7 +147,7 @@ pub async fn authorize_param_kind(
 }
 
 /// `mutatingAdmissionPolicyStrategy.authorizeCreate` / `authorizeUpdate` /
-/// `authorize` (mutatingadmissionpolicy/authz.go:30-96): identical to the
+/// `authorize` (mutatingadmissionpolicy/authz.go:31-105): identical to the
 /// validating policy's, over `MutatingAdmissionPolicy.spec.paramKind`.
 pub async fn authorize_mutating_param_kind(
     ctx: &RequestContext,
@@ -223,12 +233,12 @@ async fn authorize_kind(
 
 /// `validatingAdmissionPolicyBindingStrategy.authorizeCreate` /
 /// `authorizeUpdate` / `authorize` (validatingadmissionpolicybinding/authz.go:
-/// 30-117): the requester needs `get` (named paramRef) or `list` (selector) on
+/// 31-137): the requester needs `get` (named paramRef) or `list` (selector) on
 /// the param resource, found through the policy named by `spec.policyName`.
 /// The error is wrapped in a `field.Forbidden` at `spec.paramRef`.
 ///
 /// `old` is `None` on create; on update the check is skipped when paramRef and
-/// policyName are both unchanged (authz.go:47-50).
+/// policyName are both unchanged (authz.go:49-52).
 pub async fn authorize_param_ref(
     ctx: &RequestContext,
     authorizer: &dyn Authorizer,
@@ -253,7 +263,7 @@ pub async fn authorize_param_ref(
 
 /// `mutatingAdmissionPolicyBindingStrategy.authorizeCreate` /
 /// `authorizeUpdate` / `authorize` (mutatingadmissionpolicybinding/authz.go:
-/// 30-135): the validating binding's check over a `MutatingAdmissionPolicy`
+/// 31-137): the validating binding's check over a `MutatingAdmissionPolicy`
 /// (read from `mutatingadmissionpolicies`), with upstream's two differences
 /// kept verbatim ([`Flavor::Mutating`]).
 pub async fn authorize_mutating_param_ref(

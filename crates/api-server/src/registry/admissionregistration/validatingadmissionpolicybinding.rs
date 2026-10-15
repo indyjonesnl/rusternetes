@@ -4,27 +4,21 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use rusternetes_common::authz::Authorizer;
-use rusternetes_common::{Error, Result};
 
 use rusternetes_common::resources::ValidatingAdmissionPolicyBinding;
-use rusternetes_common::validation::field::{ErrorList, Path};
+use rusternetes_common::validation::field::{Error as FieldError, ErrorList, Path};
 use rusternetes_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
 use rusternetes_common::validation::validating_admission_policy::{
     set_defaults_validating_admission_policy_binding, validate_validating_admission_policy_binding,
 };
 use rusternetes_storage::StorageBackend;
 
-use super::authz::authorize_param_ref;
-use crate::registry::generic::store::{
-    BeginCreate, BeginUpdate, CreateOptions, Finish, UpdateOptions,
-};
+use super::authz::{authorize_param_ref, ParamAuthz};
 use crate::registry::generic::Store;
-use crate::registry::rbac::policybased::Noop;
 use crate::registry::rest::{
-    with_group_kind, GroupResource, NamespaceScopedStrategy, RequestContext, RestCreateStrategy,
-    RestDeleteStrategy, RestUpdateStrategy,
+    GroupResource, NamespaceScopedStrategy, RequestContext, RestCreateStrategy, RestDeleteStrategy,
+    RestUpdateStrategy, ValidateFuture,
 };
 
 /// `SetObjectDefaults_ValidatingAdmissionPolicyBinding`
@@ -50,7 +44,11 @@ fn validate(obj: &ValidatingAdmissionPolicyBinding) -> ErrorList {
 }
 
 /// `validatingAdmissionPolicyBindingStrategy` (strategy.go:36-44).
-pub struct Strategy;
+#[derive(Default)]
+pub struct Strategy {
+    /// `authorizer` / `resourceResolver`; `None` skips the authorization.
+    pub authz: Option<ParamAuthz>,
+}
 
 impl NamespaceScopedStrategy for Strategy {
     fn namespace_scoped(&self) -> bool {
@@ -70,6 +68,32 @@ impl RestCreateStrategy<ValidatingAdmissionPolicyBinding> for Strategy {
 
     fn validate(&self, _ctx: &RequestContext, obj: &ValidatingAdmissionPolicyBinding) -> ErrorList {
         validate(obj)
+    }
+
+    /// The `paramRef` authorization of `Validate`, run only when the rest of
+    /// `Validate` found nothing (`len(errs) == 0`).
+    fn validate_async<'a>(
+        &'a self,
+        ctx: &'a RequestContext,
+        obj: &'a ValidatingAdmissionPolicyBinding,
+    ) -> ValidateFuture<'a> {
+        Box::pin(async move {
+            let Some(authz) = &self.authz else {
+                return Vec::new();
+            };
+            if !RestCreateStrategy::validate(self, ctx, obj).is_empty() {
+                return Vec::new();
+            }
+            match authorize_param_ref(ctx, authz.authorizer.as_ref(), &authz.storage, obj, None)
+                .await
+            {
+                Ok(errs) => errs,
+                Err(e) => vec![FieldError::forbidden(
+                    &Path::new("spec").child("paramRef"),
+                    e.to_string(),
+                )],
+            }
+        })
     }
 }
 
@@ -102,6 +126,38 @@ impl RestUpdateStrategy<ValidatingAdmissionPolicyBinding> for Strategy {
         validate(obj)
     }
 
+    /// The `paramRef` authorization of `ValidateUpdate`.
+    fn validate_update_async<'a>(
+        &'a self,
+        ctx: &'a RequestContext,
+        obj: &'a ValidatingAdmissionPolicyBinding,
+        old: &'a ValidatingAdmissionPolicyBinding,
+    ) -> ValidateFuture<'a> {
+        Box::pin(async move {
+            let Some(authz) = &self.authz else {
+                return Vec::new();
+            };
+            if !RestUpdateStrategy::validate_update(self, ctx, obj, old).is_empty() {
+                return Vec::new();
+            }
+            match authorize_param_ref(
+                ctx,
+                authz.authorizer.as_ref(),
+                &authz.storage,
+                obj,
+                Some(old),
+            )
+            .await
+            {
+                Ok(errs) => errs,
+                Err(e) => vec![FieldError::forbidden(
+                    &Path::new("spec").child("paramRef"),
+                    e.to_string(),
+                )],
+            }
+        })
+    }
+
     /// strategy.go:124-126.
     fn allow_unconditional_update(&self) -> bool {
         false
@@ -110,107 +166,50 @@ impl RestUpdateStrategy<ValidatingAdmissionPolicyBinding> for Strategy {
 
 impl RestDeleteStrategy<ValidatingAdmissionPolicyBinding> for Strategy {}
 
-/// `Validate` / `ValidateUpdate` (strategy.go:80-88, :109-117): the `paramRef`
-/// read-access check, run once the object is well-formed. See [`super::authz`]
-/// for why it is a Store hook.
-pub struct ParamRefAuthz {
-    authorizer: Arc<dyn Authorizer>,
-    storage: Arc<StorageBackend>,
-}
-
-#[async_trait]
-impl BeginCreate<ValidatingAdmissionPolicyBinding> for ParamRefAuthz {
-    async fn begin_create(
-        &self,
-        ctx: &RequestContext,
-        obj: &mut ValidatingAdmissionPolicyBinding,
-        _options: &CreateOptions,
-    ) -> Result<Box<dyn Finish>> {
-        if validate(obj).is_empty() {
-            let errs = authorize_param_ref(ctx, self.authorizer.as_ref(), &self.storage, obj, None)
-                .await?;
-            if !errs.is_empty() {
-                return Err(with_group_kind(
-                    Error::Invalid(errs),
-                    "admissionregistration.k8s.io",
-                    obj,
-                ));
-            }
-        }
-        Ok(Box::new(Noop))
-    }
-}
-
-#[async_trait]
-impl BeginUpdate<ValidatingAdmissionPolicyBinding> for ParamRefAuthz {
-    async fn begin_update(
-        &self,
-        ctx: &RequestContext,
-        obj: &mut ValidatingAdmissionPolicyBinding,
-        old: &mut ValidatingAdmissionPolicyBinding,
-        _options: &UpdateOptions,
-    ) -> Result<Box<dyn Finish>> {
-        if validate(obj).is_empty() {
-            let errs =
-                authorize_param_ref(ctx, self.authorizer.as_ref(), &self.storage, obj, Some(old))
-                    .await?;
-            if !errs.is_empty() {
-                return Err(with_group_kind(
-                    Error::Invalid(errs),
-                    "admissionregistration.k8s.io",
-                    obj,
-                ));
-            }
-        }
-        Ok(Box::new(Noop))
-    }
-}
-
 /// `NewREST` (storage/storage.go:46-69).
 pub fn new_store(
     storage: Arc<StorageBackend>,
     authorizer: Arc<dyn Authorizer>,
 ) -> Store<ValidatingAdmissionPolicyBinding, StorageBackend> {
-    let mut store = Store::new(
+    Store::new(
         storage.clone(),
         GroupResource::new(
             "admissionregistration.k8s.io",
             "validatingadmissionpolicybindings",
         ),
-        Arc::new(Strategy),
+        Arc::new(Strategy {
+            authz: Some(ParamAuthz {
+                authorizer,
+                storage,
+            }),
+        }),
     )
-    .with_decode_defaulter(convert_to_internal);
-    let hook = Arc::new(ParamRefAuthz {
-        authorizer,
-        storage,
-    });
-    store.begin_create = Some(hook.clone());
-    store.begin_update = Some(hook);
-    store
+    .with_decode_defaulter(convert_to_internal)
 }
 
 #[cfg(test)]
 mod invalid_status_tests {
     use super::*;
+    use crate::registry::generic::store::{CreateOptions, UpdateOptions};
+    use crate::registry::rest::DefaultUpdatedObjectInfo;
     use rusternetes_common::auth::UserInfo;
     use rusternetes_common::authz::AlwaysDenyAuthorizer;
+    use rusternetes_common::Error;
 
     /// `ValidatingAdmissionPolicyBinding` strategy `Validate` appends the authz error as a
     /// `field.Forbidden`, and `BeforeCreate` / `BeforeUpdate` wrap the list in
     /// `errors.NewInvalid(kind.GroupKind(), name, errs)`
-    /// (rest/create.go:130-137, rest/update.go:131-141; errors.go:284-312), so
+    /// (rest/create.go:122-131, rest/update.go:149-158; errors.go:284-312), so
     /// the status is `<Kind>.<group> "<name>" is invalid: ...` with details.
     #[tokio::test]
     async fn authz_denial_is_a_new_invalid_status() {
         let obj: ValidatingAdmissionPolicyBinding = serde_json::from_value(serde_json::json!({"apiVersion": "admissionregistration.k8s.io/v1", "kind": "ValidatingAdmissionPolicyBinding", "metadata": {"name": "foo"}, "spec": {
             "policyName": "p.example.com", "validationActions": ["Deny"],
             "paramRef": {"name": "x", "parameterNotFoundAction": "Deny"}}})).unwrap();
-        let hook = ParamRefAuthz {
-            authorizer: Arc::new(AlwaysDenyAuthorizer),
-            storage: Arc::new(StorageBackend::Memory(Arc::new(
-                rusternetes_storage::MemoryStorage::new(),
-            ))),
-        };
+        let storage = Arc::new(StorageBackend::Memory(Arc::new(
+            rusternetes_storage::MemoryStorage::new(),
+        )));
+        let store = new_store(storage, Arc::new(AlwaysDenyAuthorizer));
         let user = UserInfo {
             username: "alice".into(),
             uid: String::new(),
@@ -218,11 +217,11 @@ mod invalid_status_tests {
             extra: Default::default(),
         };
         let ctx = RequestContext::new(None).with_user(&user);
-        let Err(Error::Status(st)) = hook
-            .begin_create(&ctx, &mut obj.clone(), &CreateOptions::default())
+        let Err(Error::Status(st)) = store
+            .create(&ctx, obj.clone(), None, &CreateOptions::default())
             .await
         else {
-            panic!("expected a Status error from begin_create")
+            panic!("expected a Status error from create")
         };
         assert_eq!(st.code, Some(422));
         assert_eq!(st.reason.as_deref(), Some("Invalid"));
@@ -236,16 +235,28 @@ mod invalid_status_tests {
         assert_eq!(d.kind.as_deref(), Some("ValidatingAdmissionPolicyBinding"));
         assert_eq!(d.name.as_deref(), Some("foo"));
 
-        let Err(Error::Status(st)) = hook
-            .begin_update(
+        let mut plain = obj.clone();
+        plain.spec.as_mut().unwrap().param_ref = None;
+        let created = store
+            .create(&ctx, plain, None, &CreateOptions::default())
+            .await
+            .unwrap();
+        let mut update = obj.clone();
+        update.metadata.resource_version = created.metadata.resource_version.clone();
+        let info = DefaultUpdatedObjectInfo::new(Some(update), Vec::new());
+        let Err(Error::Status(st)) = store
+            .update(
                 &ctx,
-                &mut obj.clone(),
-                &mut ValidatingAdmissionPolicyBinding::new("foo"),
+                "foo",
+                &info,
+                None,
+                None,
+                false,
                 &UpdateOptions::default(),
             )
             .await
         else {
-            panic!("expected a Status error from begin_update")
+            panic!("expected a Status error from update")
         };
         assert_eq!(st.reason.as_deref(), Some("Invalid"));
     }
