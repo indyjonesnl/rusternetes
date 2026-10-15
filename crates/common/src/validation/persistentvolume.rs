@@ -1067,3 +1067,256 @@ mod update_tests {
             .any(|e| e.field.ends_with("volumeAttributesClassName")));
     }
 }
+
+/// Every `PersistentVolumeSource` member (#3609), ported from upstream
+/// `TestValidatePersistentVolumes` / `TestValidatePersistentVolumeSourceUpdate`
+/// (`pkg/apis/core/validation/validation_test.go:114`, `:740`).
+#[cfg(test)]
+mod all_sources_tests {
+    use super::*;
+
+    fn pv_with(source: serde_json::Value) -> PersistentVolume {
+        let mut v = serde_json::json!({
+            "metadata": {"name": "pv"},
+            "spec": {
+                "capacity": {"storage": "1Gi"},
+                "accessModes": ["ReadWriteOnce"],
+            }
+        });
+        for (k, val) in source.as_object().unwrap() {
+            v["spec"][k] = val.clone();
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// One valid example per member, in upstream order
+    /// (`ValidatePersistentVolumeSpec`, validation.go:2037-2210). `fc` is
+    /// carried by its own plugin PR (#3506).
+    fn valid_sources() -> Vec<(&'static str, serde_json::Value)> {
+        vec![
+            ("gcePersistentDisk", serde_json::json!({"pdName": "p"})),
+            ("awsElasticBlockStore", serde_json::json!({"volumeID": "v"})),
+            (
+                "glusterfs",
+                serde_json::json!({"endpoints": "ep", "path": "vol", "endpointsNamespace": "default"}),
+            ),
+            ("flocker", serde_json::json!({"datasetName": "d"})),
+            (
+                "rbd",
+                serde_json::json!({"monitors": ["m"], "image": "i", "secretRef": {"name": "s", "namespace": "default"}}),
+            ),
+            (
+                "quobyte",
+                serde_json::json!({"registry": "host:7861", "volume": "v"}),
+            ),
+            ("cephfs", serde_json::json!({"monitors": ["m"]})),
+            (
+                "cinder",
+                serde_json::json!({"volumeID": "v", "secretRef": {"name": "s", "namespace": "default"}}),
+            ),
+            (
+                "flexVolume",
+                serde_json::json!({"driver": "vendor/drv", "options": {"a": "b"}}),
+            ),
+            (
+                "azureFile",
+                serde_json::json!({"secretName": "s", "shareName": "sh", "secretNamespace": "default"}),
+            ),
+            (
+                "vsphereVolume",
+                serde_json::json!({"volumePath": "[ds] v.vmdk"}),
+            ),
+            ("photonPersistentDisk", serde_json::json!({"pdID": "p"})),
+            ("portworxVolume", serde_json::json!({"volumeID": "v"})),
+            (
+                "azureDisk",
+                serde_json::json!({"diskName": "d", "diskURI": "/subscriptions/x", "kind": "Managed", "cachingMode": "ReadOnly"}),
+            ),
+            (
+                "scaleIO",
+                serde_json::json!({"gateway": "g", "system": "s", "volumeName": "v", "secretRef": {"name": "s", "namespace": "default"}}),
+            ),
+            ("storageos", serde_json::json!({"volumeName": "vol"})),
+        ]
+    }
+
+    #[test]
+    fn every_source_roundtrips_and_validates() {
+        for (name, body) in valid_sources() {
+            let pv = pv_with(serde_json::json!({ name: body.clone() }));
+            let out = serde_json::to_value(&pv).unwrap();
+            assert_eq!(out["spec"][name], body, "{name} must survive a round trip");
+            let errs = validate_persistent_volume(&pv);
+            assert!(errs.is_empty(), "{name}: {errs:?}");
+        }
+    }
+
+    #[test]
+    fn too_many_sources_is_forbidden() {
+        // upstream "too-many-sources": hostPath + gcePersistentDisk.
+        let pv = pv_with(serde_json::json!({
+            "hostPath": {"path": "/foo"},
+            "gcePersistentDisk": {"pdName": "foo"},
+        }));
+        let errs = validate_persistent_volume(&pv);
+        assert!(
+            errs.iter().any(|e| e.field == "spec.gcePersistentDisk"
+                && e.detail.contains("may not specify more than 1 volume type")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn source_update_is_forbidden_for_every_member() {
+        for (name, body) in valid_sources() {
+            let old = pv_with(serde_json::json!({ name: body.clone() }));
+            // Change one scalar string member of the source.
+            let mut changed = body.clone();
+            let key = changed
+                .as_object()
+                .unwrap()
+                .iter()
+                .find(|(_, v)| v.is_string())
+                .map(|(k, _)| k.clone())
+                .unwrap();
+            changed[key] = serde_json::json!("changed-value");
+            let new = pv_with(serde_json::json!({ name: changed }));
+            let errs = validate_persistent_volume_update(&new, &old);
+            assert!(
+                errs.iter()
+                    .any(|e| e.field == "spec.persistentvolumesource"),
+                "{name}: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hostpath_to_flexvolume_is_forbidden() {
+        // upstream "condition-update-source-type".
+        let old = pv_with(serde_json::json!({"hostPath": {"path": "/foo"}}));
+        let new = pv_with(
+            serde_json::json!({"flexVolume": {"driver": "kubernetes.io/blue", "fsType": "ext4"}}),
+        );
+        let errs = validate_persistent_volume_update(&new, &old);
+        assert!(
+            errs.iter()
+                .any(|e| e.field == "spec.persistentvolumesource"),
+            "{errs:?}"
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|e| e.detail.contains("must specify a volume type")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn required_fields_per_source() {
+        let cases = [
+            (
+                "glusterfs",
+                serde_json::json!({}),
+                "spec.glusterfs.endpoints",
+            ),
+            (
+                "glusterfs",
+                serde_json::json!({"endpoints": "e"}),
+                "spec.glusterfs.path",
+            ),
+            (
+                "glusterfs",
+                serde_json::json!({"endpoints": "e", "path": "p", "endpointsNamespace": ""}),
+                "spec.glusterfs.endpointsNamespace",
+            ),
+            ("flocker", serde_json::json!({}), "spec.flocker"),
+            ("rbd", serde_json::json!({}), "spec.rbd.monitors"),
+            (
+                "rbd",
+                serde_json::json!({"monitors": ["m"]}),
+                "spec.rbd.image",
+            ),
+            (
+                "quobyte",
+                serde_json::json!({"volume": "v"}),
+                "spec.quobyte.registry",
+            ),
+            ("cephfs", serde_json::json!({}), "spec.cephfs.monitors"),
+            ("cinder", serde_json::json!({}), "spec.cinder.volumeID"),
+            (
+                "cinder",
+                serde_json::json!({"volumeID": "v", "secretRef": {"name": "s"}}),
+                "spec.cinder.secretRef.namespace",
+            ),
+            (
+                "flexVolume",
+                serde_json::json!({}),
+                "spec.flexVolume.driver",
+            ),
+            (
+                "azureFile",
+                serde_json::json!({"shareName": "s", "secretNamespace": "n"}),
+                "spec.azureFile.secretName",
+            ),
+            (
+                "azureFile",
+                serde_json::json!({"secretName": "s", "secretNamespace": "n"}),
+                "spec.azureFile.shareName",
+            ),
+            (
+                "vsphereVolume",
+                serde_json::json!({}),
+                "spec.vsphereVolume.volumePath",
+            ),
+            (
+                "photonPersistentDisk",
+                serde_json::json!({}),
+                "spec.photonPersistentDisk.pdID",
+            ),
+            (
+                "portworxVolume",
+                serde_json::json!({}),
+                "spec.portworxVolume.volumeID",
+            ),
+            (
+                "azureDisk",
+                serde_json::json!({}),
+                "spec.azureDisk.diskName",
+            ),
+            (
+                "azureDisk",
+                serde_json::json!({"diskName": "d"}),
+                "spec.azureDisk.diskURI",
+            ),
+            ("scaleIO", serde_json::json!({}), "spec.scaleIO.gateway"),
+            (
+                "storageos",
+                serde_json::json!({}),
+                "spec.storageos.volumeName",
+            ),
+            (
+                "gcePersistentDisk",
+                serde_json::json!({}),
+                "spec.persistentDisk.pdName",
+            ),
+            (
+                "gcePersistentDisk",
+                serde_json::json!({"pdName": "p", "partition": 256}),
+                "spec.persistentDisk.partition",
+            ),
+            (
+                "awsElasticBlockStore",
+                serde_json::json!({}),
+                "spec.awsElasticBlockStore.volumeID",
+            ),
+        ];
+        for (name, body, field) in cases {
+            let pv = pv_with(serde_json::json!({ name: body }));
+            let errs = validate_persistent_volume(&pv);
+            assert!(
+                errs.iter().any(|e| e.field == field),
+                "{name} -> {field}: {errs:?}"
+            );
+        }
+    }
+}
