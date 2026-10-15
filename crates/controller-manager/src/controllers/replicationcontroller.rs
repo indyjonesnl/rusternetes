@@ -432,9 +432,13 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
             rc_pods.len()
         );
 
-        let mut create_failure: Option<String> = None;
+        // Upstream's `manageReplicasErr`: recorded as the ReplicaFailure
+        // condition by `calculateStatus` and returned from the sync AFTER the
+        // status update, so the workqueue retries with backoff
+        // (replica_set.go:755-774).
+        let mut manage_error: Option<String> = None;
         // Upstream: `if rsNeedsSync && rs.DeletionTimestamp == nil { manageReplicas }`
-        // (replica_set.go:756). The deletionTimestamp half is handled by the
+        // (replica_set.go:757). The deletionTimestamp half is handled by the
         // early return above. Status is still recalculated below either way —
         // upstream "always updates status as pods come up or die".
         if !needs_sync {
@@ -443,10 +447,6 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
                 rc_key
             );
         }
-        // Set when creates are rejected because the namespace is terminating.
-        // Deliberately NOT folded into `create_failure`: that drives the
-        // ReplicaFailure condition, and upstream does not raise one for this.
-        let mut namespace_terminating = false;
         // Pods this reconcile successfully asked the backend to create. Only
         // these are worth waiting to observe — a create that failed will never
         // produce a pod.
@@ -480,21 +480,18 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
 
                     let mut batch_failure = None;
                     for result in results {
+                        // `HasStatusCause(err, v1.NamespaceTerminatingCause)`
+                        // -> `return nil` inside the `slowStartBatch`
+                        // callback (replica_set.go:630-639): the rejected
+                        // create is a success to `slowStartBatch`, so it is
+                        // neither a ReplicaFailure nor a reason to stop, and
+                        // it counts toward `successfulCreations`.
+                        let result = match result {
+                            Err(e) if is_namespace_terminating_rejection(&e) => Ok(()),
+                            other => other,
+                        };
                         match result {
                             Ok(()) => created += 1,
-                            // The namespace is going away, so every create in this
-                            // reconcile will fail and none of them matter. Upstream
-                            // returns nil here so the create is not counted as a
-                            // replica failure (replica_set.go:632-637); stopping
-                            // now additionally spares the api-server a batch of
-                            // requests it would only reject.
-                            Err(e) if is_namespace_terminating_rejection(&e) => {
-                                debug!(
-                                    "RC {}/{}: namespace is terminating, abandoning pod creation",
-                                    namespace, rc.metadata.name
-                                );
-                                namespace_terminating = true;
-                            }
                             Err(e) => {
                                 error!("Failed to create pod for RC {}: {}", rc.metadata.name, e);
                                 batch_failure.get_or_insert_with(|| e.to_string());
@@ -502,22 +499,18 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
                         }
                     }
 
-                    if namespace_terminating {
-                        break;
-                    }
-
                     // Upstream stops at the first failing batch and reports what
                     // succeeded (`replica_set.go:838-840`), rather than pushing
                     // the remaining rounds at an api-server that is already
                     // rejecting — the next reconcile retries from the new count.
                     if let Some(e) = batch_failure {
-                        create_failure = Some(e);
+                        manage_error = Some(e);
                         break;
                     }
                 }
                 // Creates we never attempted must not be waited on: upstream
                 // decrements the expectation for each skipped pod, because no watch
-                // event will ever arrive for them (replica_set.go:645-651).
+                // event will ever arrive for them (replica_set.go:644-650).
                 let skipped = to_create.saturating_sub(created);
                 for _ in 0..skipped {
                     self.expectations.creation_observed(&rc_key);
@@ -535,13 +528,22 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
                     .map(|p| format!("{}/{}", namespace, p.metadata.name))
                     .collect();
                 self.expectations.expect_deletions_of(&rc_key, &doomed_keys);
-                for (pod, pod_key) in doomed.iter().zip(&doomed_keys) {
-                    if let Err(e) = self.delete_pod(&pod.metadata.name, namespace).await {
+                // The deletes run concurrently and every one is attempted; only
+                // the first error is reported, after the status update
+                // (replica_set.go:672-698).
+                let results = futures::future::join_all(
+                    doomed
+                        .iter()
+                        .map(|pod| self.delete_pod(&pod.metadata.name, namespace)),
+                )
+                .await;
+                for (result, pod_key) in results.into_iter().zip(&doomed_keys) {
+                    if let Err(e) = result {
                         // The informer will not observe this deletion
-                        // (replica_set.go:683-689).
+                        // (replica_set.go:679-686).
                         self.expectations.deletion_observed_of(&rc_key, pod_key);
                         if !matches!(e, rusternetes_common::Error::NotFound(_)) {
-                            return Err(e);
+                            manage_error.get_or_insert_with(|| e.to_string());
                         }
                     }
                 }
@@ -623,7 +625,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
 
         // K8s only sets ReplicaFailure from actual pod creation errors
         // (manageReplicas return value), NOT from existing Failed pods.
-        // Don't override create_failure here — the condition should clear
+        // Don't override manage_error here — the condition should clear
         // once pod creation succeeds again.
         // See: pkg/controller/replication/replication_controller.go — syncReplicationController
 
@@ -632,10 +634,17 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
             rc,
             final_current_replicas,
             final_ready_replicas,
-            create_failure.as_deref(),
+            manage_error.as_deref(),
             super::replicaset::replica_failure_reason(current_replicas, desired_replicas),
         )
         .await?;
+
+        // `if manageReplicasErr != nil { return manageReplicasErr }` after the
+        // status update (replica_set.go:772-774): the error requeues the key
+        // with rate-limited backoff (see `worker`).
+        if let Some(e) = manage_error {
+            return Err(rusternetes_common::Error::Internal(e));
+        }
 
         Ok(())
     }
@@ -2558,6 +2567,9 @@ pub(crate) mod tests {
         let mut rc: ReplicationController = storage.get(rc_key).await.unwrap();
         rc.spec.replicas = Some(1);
         storage.update(rc_key, &rc).await.unwrap();
+        // Reconcile the object as the worker would read it: the update bumped
+        // its resourceVersion, which the status write is conditional on.
+        let rc: ReplicationController = storage.get(rc_key).await.unwrap();
         storage.arm();
         let result = controller.reconcile_rc(&rc).await;
         (controller, result)
