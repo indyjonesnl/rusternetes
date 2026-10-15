@@ -433,7 +433,7 @@ mod param_kind_authz_ordering_tests {
 
     /// Upstream authorizes `paramKind` INSIDE `Validate` / `ValidateUpdate`
     /// (validatingadmissionpolicy/strategy.go:83-92, :109-119), which
-    /// `BeforeUpdate` (rest/update.go:131-141) calls after
+    /// `BeforeUpdate` (rest/update.go:149-158) calls after
     /// `validateCommonFields`; both lists are returned in ONE `Invalid`. An
     /// update that adds a finalizer to an object being deleted
     /// (`ValidateObjectMetaUpdate`) and an unauthorized paramKind therefore
