@@ -3037,4 +3037,371 @@ mod tests {
             Some((0, 0))
         );
     }
+
+    // ---------------------------------------------------------------------
+    // #3633 / #3634: selector semantics and informer event handlers.
+    //
+    // Ported from upstream pkg/controller/replicaset/replica_set_test.go
+    // (TestPodControllerLookup :486, TestUpdatePods :731) and
+    // replica_set.go addPod/updatePod/deletePod :415-570 +
+    // `metav1.LabelSelectorAsSelector`.
+    // ---------------------------------------------------------------------
+
+    pub(crate) fn expr(
+        key: &str,
+        op: &str,
+        values: &[&str],
+    ) -> rusternetes_common::types::LabelSelector {
+        rusternetes_common::types::LabelSelector {
+            match_labels: None,
+            match_expressions: Some(vec![rusternetes_common::types::LabelSelectorRequirement {
+                key: key.to_string(),
+                operator: op.to_string(),
+                values: if values.is_empty() {
+                    None
+                } else {
+                    Some(values.iter().map(|v| v.to_string()).collect())
+                },
+            }]),
+        }
+    }
+
+    /// Everything currently queued, sorted.
+    pub(crate) async fn queued(queue: &WorkQueue) -> Vec<String> {
+        let mut keys = Vec::new();
+        while queue.len().await > 0 {
+            let key = queue.get().await.unwrap();
+            queue.done(&key).await;
+            keys.push(key);
+        }
+        keys.sort();
+        keys
+    }
+
+    pub(crate) fn controlled(
+        mut pod: Pod,
+        kind: &str,
+        name: &str,
+        uid: &str,
+        controller: bool,
+    ) -> Pod {
+        pod.metadata.owner_references = Some(vec![OwnerReference {
+            api_version: "apps/v1".to_string(),
+            kind: kind.to_string(),
+            name: name.to_string(),
+            uid: uid.to_string(),
+            controller: Some(controller),
+            block_owner_deletion: None,
+        }]);
+        pod
+    }
+
+    pub(crate) fn pod_event(
+        make: fn(String, String) -> WatchEvent,
+        pod: &Pod,
+        rv: &str,
+    ) -> WatchEvent {
+        let mut pod = pod.clone();
+        pod.metadata.resource_version = Some(rv.to_string());
+        make(
+            format!("/registry/pods/default/{}", pod.metadata.name),
+            serde_json::to_string(&pod).unwrap(),
+        )
+    }
+
+    async fn put_rs(storage: &Arc<MemoryStorage>, rs: &ReplicaSet) {
+        storage
+            .create(
+                &build_key("replicasets", Some("default"), &rs.metadata.name),
+                rs,
+            )
+            .await
+            .unwrap();
+    }
+
+    /// `claimPods` reads the selector through `LabelSelectorAsSelector`, so a
+    /// matchExpressions selector adopts a matching orphan.
+    #[tokio::test]
+    async fn rs_match_expressions_selector_adopts_orphan() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicaSetController::new(Arc::clone(&storage), 30);
+        let mut rs = make_replicaset("expr", make_labels(&[("app", "a")]), 1);
+        rs.spec.selector = expr("app", "In", &["a", "b"]);
+        let orphan = make_pod("orphan", make_labels(&[("app", "a")]));
+        seed_rs(&storage, &rs, &[orphan]).await;
+
+        controller.reconcile_replicaset(&rs).await.unwrap();
+
+        let pods: Vec<Pod> = storage
+            .list(&build_prefix("pods", Some("default")))
+            .await
+            .unwrap();
+        assert_eq!(pods.len(), 1, "the orphan fills the one replica");
+        let adopted = &pods[0].metadata.owner_references.as_ref().unwrap()[0];
+        assert_eq!(adopted.uid, rs.metadata.uid);
+    }
+
+    /// A pod this RS controls whose labels satisfy a matchExpressions selector
+    /// stays claimed, and one that does not is released
+    /// (`ControllerRefManager.ClaimObject`).
+    #[tokio::test]
+    async fn rs_match_expressions_selector_keeps_matching_and_releases_unmatched() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicaSetController::new(Arc::clone(&storage), 30);
+        let mut rs = make_replicaset("expr", make_labels(&[("app", "a")]), 1);
+        rs.spec.selector = expr("tier", "In", &["db"]);
+        let uid = rs.metadata.uid.clone();
+        let kept = owned_pod("kept", make_labels(&[("tier", "db")]), "expr", &uid);
+        let dropped = owned_pod("dropped", make_labels(&[("tier", "web")]), "expr", &uid);
+        seed_rs(&storage, &rs, &[kept, dropped]).await;
+
+        controller.reconcile_replicaset(&rs).await.unwrap();
+
+        let owned_by_rs = |p: &Pod| {
+            p.metadata
+                .owner_references
+                .as_ref()
+                .is_some_and(|refs| refs.iter().any(|r| r.uid == uid))
+        };
+        let kept: Pod = storage
+            .get(&build_key("pods", Some("default"), "kept"))
+            .await
+            .unwrap();
+        let dropped: Pod = storage
+            .get(&build_key("pods", Some("default"), "dropped"))
+            .await
+            .unwrap();
+        assert!(owned_by_rs(&kept), "tier In [db] still matches");
+        assert!(!owned_by_rs(&dropped), "tier=web no longer matches");
+    }
+
+    /// `syncReplicaSet`: "error converting pod selector to selector" is
+    /// logged and the sync returns nil (replica_set.go:729-733). No pod is
+    /// created or claimed.
+    #[tokio::test]
+    async fn rs_invalid_selector_skips_the_sync() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicaSetController::new(Arc::clone(&storage), 30);
+        let mut rs = make_replicaset("bad", make_labels(&[("app", "a")]), 2);
+        rs.spec.selector = expr("app", "Bogus", &["a"]);
+        seed_rs(&storage, &rs, &[]).await;
+
+        let next = controller.reconcile_replicaset(&rs).await.unwrap();
+
+        assert_eq!(next, None);
+        let pods: Vec<Pod> = storage
+            .list(&build_prefix("pods", Some("default")))
+            .await
+            .unwrap();
+        assert!(pods.is_empty(), "an invalid selector syncs nothing");
+    }
+
+    /// `addPod`: "If it has a ControllerRef, that's all that matters"
+    /// (replica_set.go:426-440). `GetControllerOf` returns only the
+    /// `controller: true` ref, so a plain owner reference is an orphan.
+    #[tokio::test]
+    async fn rs_pod_event_ignores_a_non_controller_owner_reference() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicaSetController::new(Arc::clone(&storage), 30);
+        let queue = WorkQueue::new();
+        let rs = make_replicaset("g", make_labels(&[("app", "g")]), 1);
+        put_rs(&storage, &rs).await;
+        controller.set_expectations("default/g", 1, 0);
+
+        // A pod with labels the RS does not select and a non-controller ref.
+        let pod = controlled(
+            make_pod("p", make_labels(&[("other", "x")])),
+            "ReplicaSet",
+            "g",
+            &rs.metadata.uid,
+            false,
+        );
+        controller
+            .enqueue_owner_replicaset(&queue, &pod_event(WatchEvent::Added, &pod, "1"))
+            .await;
+
+        assert!(queued(&queue).await.is_empty());
+        assert_eq!(
+            controller.expectations.get_expectations("default/g"),
+            Some((1, 0)),
+            "a creation is observed only for the controller reference"
+        );
+    }
+
+    /// `resolveControllerRef` (replica_set.go:302-321): wrong kind, a missing
+    /// RS and a UID mismatch all resolve to nil, and nothing is enqueued or
+    /// observed.
+    #[tokio::test]
+    async fn rs_pod_event_unresolvable_controller_ref_does_nothing() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicaSetController::new(Arc::clone(&storage), 30);
+        let queue = WorkQueue::new();
+        let rs = make_replicaset("g", make_labels(&[("app", "g")]), 1);
+        put_rs(&storage, &rs).await;
+        controller.set_expectations("default/g", 1, 0);
+        let labels = make_labels(&[("app", "g")]);
+
+        for (i, (kind, name, uid)) in [
+            ("Deployment", "g", rs.metadata.uid.as_str()),
+            ("ReplicaSet", "missing", rs.metadata.uid.as_str()),
+            ("ReplicaSet", "g", "recreated-uid"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let pod = controlled(
+                make_pod(&format!("p{i}"), labels.clone()),
+                kind,
+                name,
+                uid,
+                true,
+            );
+            controller
+                .enqueue_owner_replicaset(&queue, &pod_event(WatchEvent::Added, &pod, "1"))
+                .await;
+        }
+
+        assert!(queued(&queue).await.is_empty());
+        assert_eq!(
+            controller.expectations.get_expectations("default/g"),
+            Some((1, 0))
+        );
+    }
+
+    /// `addPod` of an orphan syncs every RS whose selector matches it
+    /// (`getPodReplicaSets`, replica_set.go:289-300; the lister skips a pod
+    /// without labels and an empty selector) — not every RS in the namespace —
+    /// and observes no creation (:441-453). `TestPodControllerLookup`.
+    #[tokio::test]
+    async fn rs_orphan_pod_added_enqueues_only_matching_replicasets() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicaSetController::new(Arc::clone(&storage), 30);
+        let queue = WorkQueue::new();
+        let by_labels = make_replicaset("by-labels", make_labels(&[("app", "a")]), 1);
+        let mut by_expr = make_replicaset("by-expr", make_labels(&[("app", "a")]), 1);
+        by_expr.spec.selector = expr("app", "In", &["a"]);
+        let other = make_replicaset("other", make_labels(&[("app", "z")]), 1);
+        let mut invalid = make_replicaset("invalid", make_labels(&[("app", "a")]), 1);
+        invalid.spec.selector = expr("app", "Bogus", &["a"]);
+        let mut empty = make_replicaset("empty", make_labels(&[("app", "a")]), 1);
+        empty.spec.selector = rusternetes_common::types::LabelSelector {
+            match_labels: None,
+            match_expressions: None,
+        };
+        for rs in [&by_labels, &by_expr, &other, &invalid, &empty] {
+            put_rs(&storage, rs).await;
+        }
+        controller.set_expectations("default/by-labels", 1, 0);
+
+        let orphan = make_pod("orphan", make_labels(&[("app", "a")]));
+        controller
+            .enqueue_owner_replicaset(&queue, &pod_event(WatchEvent::Added, &orphan, "1"))
+            .await;
+
+        assert_eq!(
+            queued(&queue).await,
+            vec![
+                "replicasets/default/by-expr",
+                "replicasets/default/by-labels"
+            ]
+        );
+        assert_eq!(
+            controller
+                .expectations
+                .get_expectations("default/by-labels"),
+            Some((1, 0)),
+            "no controller waits for an orphan"
+        );
+
+        // "pods without labels don't match any ReplicaSets".
+        let unlabeled = make_pod("unlabeled", HashMap::new());
+        controller
+            .enqueue_owner_replicaset(&queue, &pod_event(WatchEvent::Added, &unlabeled, "1"))
+            .await;
+        assert!(queued(&queue).await.is_empty());
+    }
+
+    /// `deletePod`: "No controller should care about orphans being deleted"
+    /// (replica_set.go:553-557).
+    #[tokio::test]
+    async fn rs_orphan_pod_deleted_enqueues_nothing() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicaSetController::new(Arc::clone(&storage), 30);
+        let queue = WorkQueue::new();
+        put_rs(
+            &storage,
+            &make_replicaset("a", make_labels(&[("app", "a")]), 1),
+        )
+        .await;
+        let orphan = make_pod("orphan", make_labels(&[("app", "a")]));
+        controller
+            .enqueue_owner_replicaset(&queue, &pod_event(WatchEvent::Added, &orphan, "1"))
+            .await;
+        queued(&queue).await;
+
+        controller
+            .enqueue_owner_replicaset(&queue, &pod_event(WatchEvent::Deleted, &orphan, "2"))
+            .await;
+
+        assert!(queued(&queue).await.is_empty());
+    }
+
+    /// `TestUpdatePods` (replica_set_test.go:731): case 1, a label change on a
+    /// controlled pod syncs the owner only; case 3, dropping the ControllerRef
+    /// syncs the former owner and any label-matching RS; an update that changes
+    /// nothing about an orphan syncs nobody (:511-528).
+    #[tokio::test]
+    async fn rs_update_pod_follows_the_controller_ref() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicaSetController::new(Arc::clone(&storage), 30);
+        let queue = WorkQueue::new();
+        let rs1 = make_replicaset("foo", make_labels(&[("foo", "bar")]), 1);
+        let rs2 = make_replicaset("barfoo", make_labels(&[("bar", "foo")]), 1);
+        put_rs(&storage, &rs1).await;
+        put_rs(&storage, &rs2).await;
+
+        // Case 1: owned by rs1, labels change to rs2's: only the owner wakes.
+        let owned = controlled(
+            make_pod("p", make_labels(&[("foo", "bar")])),
+            "ReplicaSet",
+            "foo",
+            &rs1.metadata.uid,
+            true,
+        );
+        controller
+            .enqueue_owner_replicaset(&queue, &pod_event(WatchEvent::Added, &owned, "1"))
+            .await;
+        queued(&queue).await;
+        let mut relabeled = owned.clone();
+        relabeled.metadata.labels = Some(make_labels(&[("bar", "foo")]));
+        controller
+            .enqueue_owner_replicaset(&queue, &pod_event(WatchEvent::Modified, &relabeled, "2"))
+            .await;
+        assert_eq!(queued(&queue).await, vec!["replicasets/default/foo"]);
+
+        // Case 3: the ControllerRef is removed: former owner + matching RS.
+        let mut orphaned = relabeled.clone();
+        orphaned.metadata.owner_references = None;
+        controller
+            .enqueue_owner_replicaset(&queue, &pod_event(WatchEvent::Modified, &orphaned, "3"))
+            .await;
+        assert_eq!(
+            queued(&queue).await,
+            vec!["replicasets/default/barfoo", "replicasets/default/foo"]
+        );
+
+        // An orphan whose labels and ref did not change wakes nobody.
+        controller
+            .enqueue_owner_replicaset(&queue, &pod_event(WatchEvent::Modified, &orphaned, "4"))
+            .await;
+        assert!(queued(&queue).await.is_empty());
+
+        // An orphan that changes labels wakes the RSs matching the new ones.
+        let mut moved = orphaned.clone();
+        moved.metadata.labels = Some(make_labels(&[("foo", "bar")]));
+        controller
+            .enqueue_owner_replicaset(&queue, &pod_event(WatchEvent::Modified, &moved, "5"))
+            .await;
+        assert_eq!(queued(&queue).await, vec!["replicasets/default/foo"]);
+    }
 }

@@ -3265,4 +3265,283 @@ pub(crate) mod tests {
             Some((1, 0))
         );
     }
+
+    // ---------------------------------------------------------------------
+    // #3633 / #3634: selector semantics and informer event handlers. The RC
+    // rides the RS controller (replication_controller.go:57-79); its lister
+    // is `GetPodControllers` (client-go listers/core/v1/
+    // replicationcontroller_expansion.go:39-66) and its selector is
+    // `Convert_v1_ReplicationControllerSpec_To_apps_ReplicaSetSpec`
+    // (pkg/apis/core/v1/conversion.go:117-130).
+    // ---------------------------------------------------------------------
+
+    async fn queued(queue: &WorkQueue) -> Vec<String> {
+        let mut keys = Vec::new();
+        while queue.len().await > 0 {
+            let key = queue.get().await.unwrap();
+            queue.done(&key).await;
+            keys.push(key);
+        }
+        keys.sort();
+        keys
+    }
+
+    /// A pod event for `p` in `default`. `owner` is (kind, name, uid, controller).
+    fn rc_pod_event(
+        make: fn(String, String) -> rusternetes_storage::WatchEvent,
+        name: &str,
+        labels: &[(&str, &str)],
+        owner: Option<(&str, &str, &str, bool)>,
+        rv: &str,
+    ) -> rusternetes_storage::WatchEvent {
+        let labels: HashMap<&str, &str> = labels.iter().copied().collect();
+        let mut v = serde_json::json!({
+            "metadata": {"name": name, "namespace": "default", "labels": labels,
+                "resourceVersion": rv},
+            "spec": {"containers": []},
+        });
+        if let Some((kind, owner_name, uid, controller)) = owner {
+            v["metadata"]["ownerReferences"] = serde_json::json!([{
+                "apiVersion": "v1", "kind": kind, "name": owner_name, "uid": uid,
+                "controller": controller
+            }]);
+        }
+        make(format!("/registry/pods/default/{name}"), v.to_string())
+    }
+
+    async fn put_rc(storage: &Arc<MemoryStorage>, rc: &ReplicationController) {
+        storage
+            .create(
+                &format!(
+                    "/registry/replicationcontrollers/default/{}",
+                    rc.metadata.name
+                ),
+                rc,
+            )
+            .await
+            .unwrap();
+    }
+
+    /// `selector: {}` converts to `LabelSelector{MatchLabels: {}}` and
+    /// `LabelSelectorAsSelector` turns that into `labels.Everything()`, which
+    /// claims even an unlabelled orphan.
+    #[tokio::test]
+    async fn rc_empty_selector_selects_everything_as_upstream() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicationControllerController::new(storage.clone(), 5);
+        // `selector: {}` converts to `LabelSelector{MatchLabels: {}}`, which
+        // `LabelSelectorAsSelector` turns into `labels.Everything()`.
+        let rc = make_rc("all", "default", 1, HashMap::new(), Some(HashMap::new()));
+        put_rc(&storage, &rc).await;
+        let orphan = pod_from_event_json("o");
+        storage
+            .create("/registry/pods/default/o", &orphan)
+            .await
+            .unwrap();
+
+        controller.reconcile_rc(&rc).await.unwrap();
+
+        let pods = rc_pods(&storage).await;
+        assert_eq!(
+            pods.len(),
+            1,
+            "the unlabelled orphan is claimed, none created"
+        );
+        assert!(pods[0].metadata.owner_references.is_some());
+    }
+
+    fn pod_from_event_json(name: &str) -> Pod {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": name, "namespace": "default"},
+            "spec": {"containers": []},
+            "status": {"phase": "Running"},
+        }))
+        .unwrap()
+    }
+
+    /// `addPod`: only a `controller: true` reference counts
+    /// (`GetControllerOf`, replica_set.go:426-440).
+    #[tokio::test]
+    async fn rc_pod_event_ignores_a_non_controller_owner_reference() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicationControllerController::new(storage.clone(), 5);
+        let queue = WorkQueue::new();
+        let rc = make_rc("g", "default", 1, rc_selector("g"), None);
+        put_rc(&storage, &rc).await;
+        controller.expectations.set_expectations("default/g", 1, 0);
+
+        controller
+            .enqueue_owner_rc(
+                &queue,
+                &rc_pod_event(
+                    rusternetes_storage::WatchEvent::Added,
+                    "p",
+                    &[("other", "x")],
+                    Some(("ReplicationController", "g", &rc.metadata.uid, false)),
+                    "1",
+                ),
+            )
+            .await;
+
+        assert!(queued(&queue).await.is_empty());
+        assert_eq!(
+            controller.expectations.get_expectations("default/g"),
+            Some((1, 0))
+        );
+    }
+
+    /// `resolveControllerRef` (replica_set.go:302-321): wrong kind, missing
+    /// controller and UID mismatch resolve to nil.
+    #[tokio::test]
+    async fn rc_pod_event_unresolvable_controller_ref_does_nothing() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicationControllerController::new(storage.clone(), 5);
+        let queue = WorkQueue::new();
+        let rc = make_rc("g", "default", 1, rc_selector("g"), None);
+        put_rc(&storage, &rc).await;
+        controller.expectations.set_expectations("default/g", 1, 0);
+
+        for (i, (kind, name, uid)) in [
+            ("ReplicaSet", "g", rc.metadata.uid.as_str()),
+            ("ReplicationController", "missing", rc.metadata.uid.as_str()),
+            ("ReplicationController", "g", "recreated-uid"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            controller
+                .enqueue_owner_rc(
+                    &queue,
+                    &rc_pod_event(
+                        rusternetes_storage::WatchEvent::Added,
+                        &format!("p{i}"),
+                        &[("app", "g")],
+                        Some((kind, name, uid, true)),
+                        "1",
+                    ),
+                )
+                .await;
+        }
+
+        assert!(queued(&queue).await.is_empty());
+        assert_eq!(
+            controller.expectations.get_expectations("default/g"),
+            Some((1, 0))
+        );
+    }
+
+    /// `addPod` of an orphan syncs the RCs `GetPodControllers` returns: those
+    /// whose non-empty selector the pod's labels satisfy. A pod without
+    /// labels matches none, and no creation is observed.
+    #[tokio::test]
+    async fn rc_orphan_pod_added_enqueues_only_matching_controllers() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicationControllerController::new(storage.clone(), 5);
+        let queue = WorkQueue::new();
+        put_rc(
+            &storage,
+            &make_rc("hit", "default", 1, rc_selector("a"), None),
+        )
+        .await;
+        put_rc(
+            &storage,
+            &make_rc("miss", "default", 1, rc_selector("z"), None),
+        )
+        .await;
+        put_rc(
+            &storage,
+            &make_rc("empty", "default", 1, HashMap::new(), None),
+        )
+        .await;
+        controller
+            .expectations
+            .set_expectations("default/hit", 1, 0);
+
+        controller
+            .enqueue_owner_rc(
+                &queue,
+                &rc_pod_event(
+                    rusternetes_storage::WatchEvent::Added,
+                    "orphan",
+                    &[("app", "a")],
+                    None,
+                    "1",
+                ),
+            )
+            .await;
+        assert_eq!(
+            queued(&queue).await,
+            vec!["replicationcontrollers/default/hit"]
+        );
+        assert_eq!(
+            controller.expectations.get_expectations("default/hit"),
+            Some((1, 0))
+        );
+
+        controller
+            .enqueue_owner_rc(
+                &queue,
+                &rc_pod_event(
+                    rusternetes_storage::WatchEvent::Added,
+                    "unlabeled",
+                    &[],
+                    None,
+                    "1",
+                ),
+            )
+            .await;
+        assert!(queued(&queue).await.is_empty());
+    }
+
+    /// `updatePod`: dropping the ControllerRef wakes the former owner and the
+    /// label-matching controllers; an unchanged orphan wakes nobody.
+    #[tokio::test]
+    async fn rc_update_pod_follows_the_controller_ref() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicationControllerController::new(storage.clone(), 5);
+        let queue = WorkQueue::new();
+        let rc1 = make_rc("foo", "default", 1, rc_selector("foo"), None);
+        let rc2 = make_rc("barfoo", "default", 1, rc_selector("bar"), None);
+        put_rc(&storage, &rc1).await;
+        put_rc(&storage, &rc2).await;
+        let added = rusternetes_storage::WatchEvent::Added;
+        let modified = rusternetes_storage::WatchEvent::Modified;
+
+        controller
+            .enqueue_owner_rc(
+                &queue,
+                &rc_pod_event(
+                    added,
+                    "p",
+                    &[("app", "foo")],
+                    Some(("ReplicationController", "foo", &rc1.metadata.uid, true)),
+                    "1",
+                ),
+            )
+            .await;
+        queued(&queue).await;
+
+        controller
+            .enqueue_owner_rc(
+                &queue,
+                &rc_pod_event(modified, "p", &[("app", "bar")], None, "2"),
+            )
+            .await;
+        assert_eq!(
+            queued(&queue).await,
+            vec![
+                "replicationcontrollers/default/barfoo",
+                "replicationcontrollers/default/foo"
+            ]
+        );
+
+        controller
+            .enqueue_owner_rc(
+                &queue,
+                &rc_pod_event(modified, "p", &[("app", "bar")], None, "3"),
+            )
+            .await;
+        assert!(queued(&queue).await.is_empty());
+    }
 }
