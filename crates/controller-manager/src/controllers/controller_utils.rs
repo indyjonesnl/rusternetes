@@ -319,11 +319,9 @@ impl RankGates {
             pod_deletion_cost: rusternetes_common::feature_gates::enabled(
                 rusternetes_common::feature_gates::Feature::PodDeletionCost,
             ),
-            // No `Feature` variant models it; read it by name.
-            logarithmic_scale_down: rusternetes_common::feature_gates::gate_enabled(
-                "LogarithmicScaleDown",
-            )
-            .unwrap_or(true),
+            logarithmic_scale_down: rusternetes_common::feature_gates::enabled(
+                rusternetes_common::feature_gates::Feature::LogarithmicScaleDown,
+            ),
         }
     }
 }
@@ -487,6 +485,23 @@ mod tests {
         pod_deletion_cost: true,
         logarithmic_scale_down: true,
     };
+
+    // controller_utils.go:875,895 read `features.LogarithmicScaleDown` (1.31 GA,
+    // default true); `RankGates::current` must resolve it through the `Feature`
+    // variant, so flipping the variant flips the gate the ranking sees.
+    #[test]
+    #[serial_test::serial]
+    fn rank_gates_follow_logarithmic_scale_down_feature() {
+        use rusternetes_common::feature_gates::{self, Feature};
+        feature_gates::reset_to_defaults();
+        assert!(feature_gates::enabled(Feature::LogarithmicScaleDown));
+        assert!(RankGates::current().logarithmic_scale_down);
+        {
+            let _off = feature_gates::with_feature(Feature::LogarithmicScaleDown, false);
+            assert!(!RankGates::current().logarithmic_scale_down);
+        }
+        assert!(RankGates::current().logarithmic_scale_down);
+    }
 
     fn t(now: DateTime<Utc>, secs_ago: i64) -> DateTime<Utc> {
         now - chrono::Duration::seconds(secs_ago)
