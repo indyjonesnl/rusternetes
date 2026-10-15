@@ -576,7 +576,10 @@ async fn endpoints_controller_creates_endpoints_for_matching_pods() {
 
 /// [sig-network] Endpoints should test the lifecycle of an Endpoint [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/network/endpoints.go:40
+/// Upstream: k8s.io/kubernetes/test/e2e/network/endpoints.go:58. That case
+/// is API-only (no Service, no controller); its verb sequence is mirrored in
+/// `crates/api-server/tests/it/conformance_network_endpoints_api.rs`. This
+/// fragment checks the EndpointsController side.
 /// Sonobuoy (Round 160): PASS (newly-passing.txt)
 ///
 /// Create then verify then scale to zero then verify empty then scale back
@@ -885,7 +888,8 @@ async fn services_serve_endpoints_same_port_different_protocols() {
 /// [sig-network] Services should find a service from listing all namespaces
 /// [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/network/service.go (list all ns)
+/// Upstream: k8s.io/kubernetes/test/e2e/network/service.go:3220 (API mirror:
+/// `crates/api-server/tests/it/conformance_network_services_api.rs`)
 /// Sonobuoy (Round 160): PASS (newly-passing.txt)
 ///
 /// When services exist in two different namespaces, listing all services
@@ -907,7 +911,8 @@ async fn services_find_from_listing_all_namespaces() {
 
 /// [sig-network] Services should delete a collection of services [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/network/service.go (collection delete)
+/// Upstream: k8s.io/kubernetes/test/e2e/network/service.go:3472 (API mirror:
+/// `crates/api-server/tests/it/conformance_network_services_api.rs`)
 /// Sonobuoy (Round 160): PASS (newly-passing.txt)
 ///
 /// Creating three services and deleting them individually must leave an

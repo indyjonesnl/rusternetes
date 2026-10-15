@@ -486,9 +486,14 @@ async fn endpointslice_should_carry_multiple_endpoint_ips() {
     }
 }
 
-/// [sig-network] EndpointSlice should support EndpointSlice API operations (kubernetes.io/service-name label)
+/// [sig-network] EndpointSlice should create Endpoints and EndpointSlices for
+/// Pods matching a Service [Conformance] (kubernetes.io/service-name label)
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/network/endpointslice.go:231
+/// Upstream: k8s.io/kubernetes/test/e2e/network/endpointslice.go:144, which
+/// finds the controller's slices by `kubernetes.io/service-name`
+/// (`hasMatchingEndpointSlices`, endpointslice.go:796). The API-operations
+/// case (endpointslice.go:274) is mirrored in
+/// `crates/api-server/tests/it/conformance_network_endpoints_api.rs`.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn endpointslice_should_label_with_service_name() {
@@ -519,9 +524,11 @@ async fn endpointslice_should_label_with_service_name() {
     assert_eq!(label, Some(&"labeled".to_string()));
 }
 
-/// [sig-network] EndpointSlice should be managed by endpointslice-controller.k8s.io
+/// [sig-network] EndpointSlice should create and delete EndpointSlices for a
+/// Service with a selector that matches no pods [Conformance] (managed-by label)
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/network/endpointslice.go:231 (managed-by label)
+/// Upstream: k8s.io/kubernetes/test/e2e/network/endpointslice.go:67, which
+/// asserts `endpointslice.kubernetes.io/managed-by` at endpointslice.go:105-111
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn endpointslice_should_carry_managed_by_label() {

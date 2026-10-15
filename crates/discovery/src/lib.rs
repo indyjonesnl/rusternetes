@@ -3890,8 +3890,21 @@ pub async fn get_discovery_v1_resources() -> (StatusCode, Json<APIResourceList>)
         singular_name: "endpointslice".to_string(),
         namespaced: true,
         kind: "EndpointSlice".to_string(),
+        // The endpointslice registry is a `genericregistry.Store`
+        // (pkg/registry/discovery/endpointslice/storage/storage.go:37), a
+        // `rest.CollectionDeleter`, so the installer advertises
+        // `deletecollection` (staging/src/k8s.io/apiserver/pkg/endpoints/
+        // installer.go:343, :573, :183). The aggregated document already did;
+        // this per-GV one did not (#3741, endpointslice.go:272).
         verbs: [
-            "create", "delete", "get", "list", "patch", "update", "watch",
+            "create",
+            "delete",
+            "deletecollection",
+            "get",
+            "list",
+            "patch",
+            "update",
+            "watch",
         ]
         .iter()
         .map(|s| s.to_string())
