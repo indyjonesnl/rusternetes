@@ -68,6 +68,7 @@ pub async fn create_token_review(
                 &state.storage,
                 &token_review.spec.token,
                 &claims,
+                state.token_manager.service_account_lookup(),
                 &mut observations,
             )
             .await

@@ -192,7 +192,7 @@ impl ServiceAccountClaims {
 /// Ported from `pkg/kubeapiserver/options/authentication.go`
 /// (`ServiceAccountAuthenticationOptions`, `Validate`, `ToAuthenticationConfig`)
 /// and `pkg/controlplane/apiserver/options/validation.go` (`validateTokenRequest`).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ServiceAccountOptions {
     /// `--service-account-key-file` (repeatable): PEM files whose RSA/ECDSA
     /// private or public keys verify tokens.
@@ -212,6 +212,26 @@ pub struct ServiceAccountOptions {
     /// `--service-account-jwks-uri` (authentication.go:454-458): overrides the
     /// `jwks_uri` of the discovery document. Validated whenever set.
     pub jwks_uri: Option<String>,
+    /// `--service-account-lookup` (authentication.go:439-440): validate
+    /// legacy ServiceAccount tokens exist in storage as part of
+    /// authentication. `WithServiceAccounts` defaults it to true
+    /// (authentication.go:226). Independent of the other flags, so it does not
+    /// count towards [`Self::is_empty`].
+    pub lookup: bool,
+}
+
+impl Default for ServiceAccountOptions {
+    fn default() -> Self {
+        Self {
+            key_files: Vec::new(),
+            signing_key_file: None,
+            issuers: Vec::new(),
+            api_audiences: Vec::new(),
+            max_expiration: None,
+            jwks_uri: None,
+            lookup: true,
+        }
+    }
 }
 
 impl ServiceAccountOptions {
@@ -350,6 +370,9 @@ pub struct TokenManager {
     max_token_expiration_seconds: i64,
     /// `--service-account-jwks-uri`.
     jwks_uri: Option<String>,
+    /// `--service-account-lookup` (`ServiceAccountLookup`, config.go:69);
+    /// defaults to true.
+    lookup: bool,
 }
 
 impl TokenManager {
@@ -366,6 +389,7 @@ impl TokenManager {
             api_audiences: Vec::new(),
             max_token_expiration_seconds: 0,
             jwks_uri: None,
+            lookup: true,
         }
     }
 
@@ -388,6 +412,7 @@ impl TokenManager {
             api_audiences: Vec::new(),
             max_token_expiration_seconds: 0,
             jwks_uri: None,
+            lookup: true,
         })
     }
 
@@ -403,6 +428,7 @@ impl TokenManager {
             opts.validate()?;
         }
         self.jwks_uri = opts.jwks_uri.clone().filter(|u| !u.is_empty());
+        self.lookup = opts.lookup;
         self.max_token_expiration_seconds = opts
             .max_expiration
             .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
@@ -480,6 +506,12 @@ impl TokenManager {
             "subject_types_supported": ["public"],
             "id_token_signing_alg_values_supported": algs.into_iter().collect::<Vec<_>>(),
         }))
+    }
+
+    /// `--service-account-lookup`: whether the legacy token validator looks the
+    /// Secret and ServiceAccount up (`NewLegacyValidator(lookup, ...)`).
+    pub fn service_account_lookup(&self) -> bool {
+        self.lookup
     }
 
     /// `--service-account-max-token-expiration` in seconds; 0 when unset.

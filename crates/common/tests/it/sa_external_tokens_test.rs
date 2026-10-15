@@ -537,3 +537,21 @@ fn openid_metadata_serves_configured_keys_3684() {
         .unwrap();
     assert_eq!(cfg["jwks_uri"], "https://default/openid/v1/jwks");
 }
+
+/// `--service-account-lookup` (authentication.go:226 default true,
+/// config.go:69 `ServiceAccountLookup`) reaches the TokenManager even when no
+/// other service-account flag is given.
+#[test]
+fn service_account_lookup_flag_2714() {
+    assert!(TokenManager::new(b"s").service_account_lookup());
+    assert!(ServiceAccountOptions::default().lookup);
+    let o = ServiceAccountOptions {
+        lookup: false,
+        ..Default::default()
+    };
+    assert!(o.is_empty());
+    let tm = TokenManager::new(b"s")
+        .with_service_account_options(&o)
+        .unwrap();
+    assert!(!tm.service_account_lookup());
+}

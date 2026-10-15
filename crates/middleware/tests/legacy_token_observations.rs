@@ -81,7 +81,7 @@ async fn auto_generated_token_warns_annotates_and_counts() {
         m.legacy_auto_token_uses_total.get(),
     );
     let mut obs = AuthObservations::default();
-    validate_service_account_token(&s, &token(), &claims(), &mut obs)
+    validate_service_account_token(&s, &token(), &claims(), true, &mut obs)
         .await
         .unwrap();
     // jwt.go:385: a token with no audience
@@ -107,7 +107,7 @@ async fn manual_token_annotates_and_counts_without_warning() {
     let m = serviceaccount_metrics();
     let manual = m.legacy_manual_token_uses_total.get();
     let mut obs = AuthObservations::default();
-    validate_service_account_token(&s, &token(), &claims(), &mut obs)
+    validate_service_account_token(&s, &token(), &claims(), true, &mut obs)
         .await
         .unwrap();
     // legacy.go:165-168
@@ -130,7 +130,7 @@ async fn invalidated_token_annotates_and_counts() {
     let m = serviceaccount_metrics();
     let invalid = m.invalid_legacy_auto_token_uses_total.get();
     let mut obs = AuthObservations::default();
-    let err = validate_service_account_token(&s, &token(), &claims(), &mut obs)
+    let err = validate_service_account_token(&s, &token(), &claims(), true, &mut obs)
         .await
         .unwrap_err();
     assert!(err.contains("has been marked invalid"));
@@ -151,7 +151,7 @@ async fn legacy_use_observed_before_audience_check_is_not_counted_twice() {
     let before = m.legacy_tokens_total.get();
     let mut obs = AuthObservations::default();
     obs.observe_legacy_token("system:serviceaccount:ns:sa");
-    validate_service_account_token(&s, &token(), &claims(), &mut obs)
+    validate_service_account_token(&s, &token(), &claims(), true, &mut obs)
         .await
         .unwrap();
     let annotated = obs
@@ -173,7 +173,45 @@ async fn bound_token_with_an_audience_is_not_a_legacy_use() {
     c.aud = vec!["api".to_string()];
     // fails on the missing SA, but must not record a legacy observation
     let mut obs = AuthObservations::default();
-    let _ = validate_service_account_token(&s, "x.y.z", &c, &mut obs).await;
+    let _ = validate_service_account_token(&s, "x.y.z", &c, true, &mut obs).await;
     assert!(obs.audit_annotations.is_empty());
     assert!(obs.warnings.is_empty());
+}
+
+/// `--service-account-lookup=false` (legacy.go:114 `if v.lookup`): the Secret
+/// and ServiceAccount are never read, so a token whose Secret is gone still
+/// authenticates, and nothing is stamped or recorded from the lookup block.
+#[tokio::test]
+async fn lookup_false_skips_secret_and_serviceaccount_checks() {
+    let s = StorageBackend::new_memory(); // no Secret, no ServiceAccount
+    let mut obs = AuthObservations::default();
+    validate_service_account_token(&s, &token(), &claims(), false, &mut obs)
+        .await
+        .unwrap();
+    assert!(!has(
+        &obs,
+        "authentication.k8s.io/legacy-token-manual-secret",
+        "tok"
+    ));
+    assert!(obs.warnings.is_empty());
+
+    // The same token with lookup=true is invalidated (legacy.go:104-108).
+    let mut obs = AuthObservations::default();
+    let err = validate_service_account_token(&s, &token(), &claims(), true, &mut obs)
+        .await
+        .unwrap_err();
+    assert_eq!(err, "Token has been invalidated");
+}
+
+/// The claim checks (legacy.go:76-102) run before `if v.lookup`.
+#[tokio::test]
+async fn lookup_false_still_checks_claims() {
+    let s = StorageBackend::new_memory();
+    let mut c = claims();
+    c.sub = "system:serviceaccount:ns:other".to_string();
+    let mut obs = AuthObservations::default();
+    let err = validate_service_account_token(&s, &token(), &c, false, &mut obs)
+        .await
+        .unwrap_err();
+    assert_eq!(err, "sub claim is invalid");
 }
