@@ -11,6 +11,7 @@ pub mod concurrency;
 pub mod etcd;
 mod event_bus;
 pub mod event_recorder;
+pub mod lease_lock;
 pub mod memory;
 pub mod metadata;
 #[cfg(any(feature = "sqlite", feature = "redis"))]

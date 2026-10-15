@@ -50,7 +50,6 @@ use controllers::{
     vpa::VerticalPodAutoscalerController,
 };
 use rusternetes_common::cloud_provider::CloudProvider;
-use rusternetes_common::leader_election::{LeaderElectionConfig, LeaderElector};
 use rusternetes_storage::{StorageBackend, StorageConfig};
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -315,13 +314,35 @@ struct Args {
     #[arg(long)]
     leader_election_identity: Option<String>,
 
-    /// Leader election lock key
-    #[arg(long, default_value = "/rusternetes/controller-manager/leader")]
-    leader_election_lock_key: String,
+    /// Leader election lock key (etcd key of the retired etcd-lease elector;
+    /// accepted and ignored, the lock is now a Lease -- see
+    /// `--leader-election-resource-namespace` / `--leader-election-resource-name`).
+    #[arg(long, hide = true)]
+    leader_election_lock_key: Option<String>,
+
+    /// Namespace of the leader-election Lease
+    /// (`--leader-elect-resource-namespace`, kube-system by default).
+    #[arg(long, default_value = "kube-system")]
+    leader_election_resource_namespace: String,
+
+    /// Name of the leader-election Lease (`--leader-elect-resource-name`).
+    #[arg(long, default_value = "kube-controller-manager")]
+    leader_election_resource_name: String,
 
     /// Leader election lease duration in seconds
+    /// (`LeaseDuration`, 15s: component-base v1alpha1 defaults.go:37-39)
     #[arg(long, default_value = "15")]
     leader_election_lease_duration: u64,
+
+    /// Seconds the acting leader retries refreshing leadership before giving up
+    /// (`RenewDeadline`, 10s: defaults.go:40-42)
+    #[arg(long, default_value = "10")]
+    leader_election_renew_deadline: u64,
+
+    /// Seconds between tries of leader-election actions
+    /// (`RetryPeriod`, 2s: defaults.go:43-45)
+    #[arg(long, default_value = "2")]
+    leader_election_retry_period: u64,
 
     /// Port serving Prometheus `/metrics` (plain HTTP). 0 disables it.
     /// Default is upstream kube-controller-manager's secure port
@@ -797,38 +818,54 @@ async fn main() -> Result<()> {
 
     // Initialize leader election if enabled
     let leader_elector = if args.enable_leader_election {
-        let etcd_endpoints: Vec<String> = args
-            .etcd_servers
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .collect();
-
         let identity = args
             .leader_election_identity
             .clone()
             .unwrap_or_else(|| format!("controller-manager-{}", uuid::Uuid::new_v4()));
-
-        let config = LeaderElectionConfig {
-            identity: identity.clone(),
-            lock_key: args.leader_election_lock_key.clone(),
-            lease_duration: args.leader_election_lease_duration,
-            renew_interval: args.leader_election_lease_duration / 3,
-            retry_interval: 2,
-        };
+        if args.leader_election_lock_key.is_some() {
+            warn!("--leader-election-lock-key is ignored: the lock is a coordination.k8s.io Lease");
+        }
 
         info!(
             identity = %identity,
             "Leader election enabled - starting in follower mode"
         );
 
-        let elector = Arc::new(LeaderElector::new(etcd_endpoints, config).await?);
+        // OnStoppedLeading (cmd/kube-controller-manager/app/controllermanager.go:367-369):
+        // "leaderelection lost", then `klog.FlushAndExit(.., 1)`, so every
+        // controller stops with the process; the restart policy brings it
+        // back as a fresh follower. Upstream runs with context.Background()
+        // and without ReleaseOnCancel (see the shutdown note below).
+        let elector = Arc::new(rusternetes_common::leaderelection::LeaderElector::new(
+            rusternetes_common::leaderelection::ElectionConfig {
+                lock: Arc::new(rusternetes_storage::lease_lock::LeaseLock::new(
+                    storage.clone(),
+                    args.leader_election_resource_namespace.clone(),
+                    args.leader_election_resource_name.clone(),
+                    identity.clone(),
+                )),
+                lease_duration: std::time::Duration::from_secs(args.leader_election_lease_duration),
+                renew_deadline: std::time::Duration::from_secs(args.leader_election_renew_deadline),
+                retry_period: std::time::Duration::from_secs(args.leader_election_retry_period),
+                release_on_cancel: false,
+                name: args.leader_election_resource_name.clone(),
+                callbacks: rusternetes_common::leaderelection::LeaderCallbacks {
+                    on_started_leading: Arc::new(|_| {}),
+                    on_stopped_leading: Arc::new(|| {
+                        tracing::error!("leaderelection lost");
+                        std::process::exit(1);
+                    }),
+                    on_new_leader: None,
+                },
+            },
+        )?);
 
-        // Start leader election in background
+        // Start leader election in background (`go leaderElectAndRun`).
         let elector_clone = elector.clone();
         tokio::spawn(async move {
-            if let Err(e) = elector_clone.run().await {
-                tracing::error!("Leader election error: {}", e);
-            }
+            elector_clone
+                .run(rusternetes_common::signal::ShutdownContext::new())
+                .await
         });
 
         Some(elector)
@@ -845,7 +882,7 @@ async fn main() -> Result<()> {
                 // Wait until we're the leader (if leader election is enabled)
                 if let Some(ref elector) = elector_clone {
                     loop {
-                        while !elector.is_leader().await {
+                        while !elector.is_leader() {
                             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                         }
                         info!("{} starting (leader acquired)", $name);
@@ -862,7 +899,7 @@ async fn main() -> Result<()> {
                         .await;
 
                         // Check if we're still the leader
-                        if !elector.is_leader().await {
+                        if !elector.is_leader() {
                             warn!("{} stopped (lost leadership)", $name);
                             continue;
                         }

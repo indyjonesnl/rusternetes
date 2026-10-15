@@ -105,7 +105,7 @@ etcdctl --endpoints=http://localhost:2379 endpoint health
 **HA Configuration**:
 - **Instances**: 2+ controller managers
 - **Mode**: Active-standby via leader election
-- **Leader election**: etcd-based lease mechanism
+- **Leader election**: `coordination.k8s.io/v1` Lease lock (client-go `leaderelection` semantics)
 
 **How it works**:
 1. All instances attempt to acquire leadership
@@ -119,14 +119,14 @@ etcdctl --endpoints=http://localhost:2379 endpoint health
 controller-manager \
   --enable-leader-election \
   --leader-election-identity=controller-manager-1 \
-  --leader-election-lock-key=/rusternetes/controller-manager/leader \
+  --leader-election-resource-name=kube-controller-manager \
   --leader-election-lease-duration=15
 ```
 
 **Monitoring**:
 ```bash
-# Check current leader via etcd
-etcdctl get /rusternetes/controller-manager/leader
+# Check current leader
+kubectl -n kube-system get lease kube-controller-manager -o jsonpath='{.spec.holderIdentity}'
 ```
 
 ### 4. Scheduler
@@ -136,7 +136,7 @@ etcdctl get /rusternetes/controller-manager/leader
 **HA Configuration**:
 - **Instances**: 2+ schedulers
 - **Mode**: Active-standby via leader election
-- **Leader election**: etcd-based lease mechanism
+- **Leader election**: `coordination.k8s.io/v1` Lease lock (client-go `leaderelection` semantics)
 
 **How it works**:
 - Same leader election mechanism as controller-manager
