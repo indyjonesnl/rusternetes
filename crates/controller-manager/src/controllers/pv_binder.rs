@@ -2512,6 +2512,7 @@ mod tests {
                 gce_persistent_disk: None,
                 aws_elastic_block_store: None,
                 fc: None,
+                more_sources: Default::default(),
                 access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
                 persistent_volume_reclaim_policy: None,
                 storage_class_name: Some("standard".into()),

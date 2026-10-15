@@ -67,6 +67,7 @@ fn make_pv(name: &str, storage_class: &str, capacity_gi: u32) -> PersistentVolum
             gce_persistent_disk: None,
             aws_elastic_block_store: None,
             fc: None,
+            more_sources: Default::default(),
             capacity,
             host_path: Some(HostPathVolumeSource {
                 path: format!("/tmp/pv-test/{name}"),

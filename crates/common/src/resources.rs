@@ -32,6 +32,7 @@ pub mod node;
 pub mod pod;
 pub mod podcertificaterequest;
 pub mod policy;
+pub mod pv_sources;
 pub mod rangeallocation;
 pub mod rbac;
 pub mod runtimeclass;

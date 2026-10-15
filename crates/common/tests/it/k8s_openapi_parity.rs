@@ -361,6 +361,17 @@ const KNOWN_GAPS: &[(&str, &str)] = &[
     // empty (additionalProperties have no fixed keys), so it round-trips to
     // absent. Presence is modelled; this is a serialization-skip artifact.
     ("PersistentVolume", "spec.capacity"),
+    // FlexPersistentVolumeSource.options is `map[string]string` with
+    // `json:"options,omitempty"` upstream
+    // (staging/src/k8s.io/api/core/v1/types.go:1338) and a
+    // `skip_serializing_if = "HashMap::is_empty"` HashMap here. The maximal
+    // instance leaves every map empty, so it round-trips to absent in both
+    // implementations; same serialization-skip artifact as `spec.capacity`.
+    ("PersistentVolume", "spec.flexVolume.options"),
+    (
+        "VolumeAttachment",
+        "spec.source.inlineVolumeSpec.flexVolume.options",
+    ),
 ];
 
 fn check(name: &str, upstream_schema: Value, parse_roundtrip: impl Fn(Value) -> Value) {
