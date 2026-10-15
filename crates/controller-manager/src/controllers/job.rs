@@ -6021,8 +6021,13 @@ mod tests {
         let d = controller
             .take_requeue_delay("default", "idx-job")
             .expect("a pending per-index backoff must request a delayed requeue");
+        // The pod finished 1s ago and the first-failure backoff is 10s, so
+        // the remaining time can only be <= 9s. The lower bound is loose on
+        // purpose: this runs on the wall clock and a loaded CI runner can
+        // stall for seconds between building the pod and the sync (observed:
+        // 7.999s against a `> 8s` bound).
         assert!(
-            d > Duration::from_secs(8) && d <= Duration::from_secs(10),
+            d > Duration::from_secs(1) && d <= Duration::from_secs(9),
             "{d:?}"
         );
         assert!(controller
