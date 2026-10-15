@@ -830,6 +830,22 @@ pub fn spawn_borrowing_updater<S: Storage + 'static>(
     })
 }
 
+/// `priorityAndFairnessConfigConsumerHookName` (server/config.go:921).
+pub const APF_CONFIG_CONSUMER_HOOK: &str = "priority-and-fairness-config-consumer";
+/// `priorityAndFairnessFilterHookName` (server/config.go:938).
+pub const APF_FILTER_HOOK: &str = "priority-and-fairness-filter";
+/// `storageObjectCountTrackerHookName` (server/config.go:963).
+pub const STORAGE_OBJECT_COUNT_TRACKER_HOOK: &str = "storage-object-count-tracker-hook";
+
+/// STUB (red commit): registers nothing yet.
+pub fn register_post_start_hooks<S: Storage + 'static>(
+    _registry: &crate::post_start_hooks::PostStartHooks,
+    _engine: Arc<FlowControlEngine<S>>,
+    _tracker: Arc<ObjectCountTracker>,
+    _stop: tokio::sync::watch::Receiver<bool>,
+) {
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1889,5 +1905,42 @@ mod tests {
             wait_for(move || e.concurrency_limit("evented").is_none()).await,
             "PL delete event must reach the engine"
         );
+    }
+
+    // GenericAPIServer.New (server/config.go:921-970) registers exactly these
+    // three hooks when FlowControl and StorageObjectCountTracker are set; each
+    // is a `poststarthook/<name>` check that finishes (the hooks return nil
+    // after starting their goroutines).
+    #[tokio::test]
+    async fn apf_post_start_hooks_registered_and_finish() {
+        let registry = crate::post_start_hooks::PostStartHooks::new();
+        let engine = Arc::new(FlowControlEngine::with_limits(
+            Arc::new(MemoryStorage::new()),
+            400,
+            200,
+        ));
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        register_post_start_hooks(
+            &registry,
+            engine,
+            Arc::new(ObjectCountTracker::new()),
+            stop_rx,
+        );
+        let names: Vec<String> = registry.checks().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(
+            names,
+            vec![
+                "poststarthook/priority-and-fairness-config-consumer",
+                "poststarthook/priority-and-fairness-filter",
+                "poststarthook/storage-object-count-tracker-hook",
+            ]
+        );
+        for _ in 0..100 {
+            if registry.checks().iter().all(|(_, r)| r.is_ok()) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("hooks never finished: {:?}", registry.checks());
     }
 }
