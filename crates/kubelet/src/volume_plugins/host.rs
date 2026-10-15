@@ -25,6 +25,21 @@ pub trait VolumeHost: Send + Sync {
     /// `escaped_plugin_name` is already escaped, as at upstream's callers.
     fn get_pod_plugin_dir(&self, pod_uid: &str, escaped_plugin_name: &str) -> String;
 
+    /// `GetPluginDir` (`plugins.go:346`, `kubelet_getters.go:83-85`):
+    /// `<root>/plugins/<pluginName>`, the per-plugin global directory (the
+    /// device mount paths of attachable plugins live under it). `plugin_name`
+    /// is the unescaped plugin name, as upstream's callers pass it.
+    fn get_plugin_dir(&self, plugin_name: &str) -> String;
+
+    /// `GetVolumeDevicePluginDir` (`plugins.go:351`,
+    /// `kubelet_getters.go:104-106`): `<root>/plugins/<pluginName>/volumeDevices`,
+    /// the global map path root of a block-volume plugin.
+    fn get_volume_device_plugin_dir(&self, plugin_name: &str) -> String;
+
+    /// `GetPodVolumeDeviceDir` (`plugins.go:374`, `kubelet_getters.go:194-196`):
+    /// `<root>/pods/<podUID>/volumeDevices/<escapedPluginName>`.
+    fn get_pod_volume_device_dir(&self, pod_uid: &str, escaped_plugin_name: &str) -> String;
+
     /// `GetKubeClient` (`plugins.go:377`). Our equivalent of the API client is
     /// the storage backend the kubelet already reads objects through.
     fn get_kube_client(&self) -> Option<&Arc<StorageBackend>>;
@@ -152,6 +167,29 @@ impl VolumeHost for KubeletVolumeHost {
 
     fn get_pod_plugin_dir(&self, pod_uid: &str, escaped_plugin_name: &str) -> String {
         crate::pod_dirs::get_pod_plugin_dir(&self.volumes_base_path, pod_uid, escaped_plugin_name)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn get_plugin_dir(&self, plugin_name: &str) -> String {
+        std::path::Path::new(&self.volumes_base_path)
+            .join("plugins")
+            .join(plugin_name)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn get_volume_device_plugin_dir(&self, plugin_name: &str) -> String {
+        std::path::Path::new(&self.get_plugin_dir(plugin_name))
+            .join("volumeDevices")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn get_pod_volume_device_dir(&self, pod_uid: &str, escaped_plugin_name: &str) -> String {
+        crate::pod_dirs::get_pod_dir(&self.volumes_base_path, pod_uid)
+            .join("volumeDevices")
+            .join(escaped_plugin_name)
             .to_string_lossy()
             .into_owned()
     }

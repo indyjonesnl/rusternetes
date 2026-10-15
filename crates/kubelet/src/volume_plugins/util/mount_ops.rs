@@ -613,9 +613,13 @@ impl Mounter {
 
 /// `CleanupMountPoint` (`mount_helper_common.go:30-41`): unmount `mount_path`
 /// and delete the remaining directory if successful.
+///
+/// Takes the `mount.Interface` (`mounter` is any
+/// [`MountInterface`](super::mount_interface::MountInterface), as upstream's
+/// is), so a plugin test can hand it `FakeMounter`.
 pub fn cleanup_mount_point(
     mount_path: &str,
-    mounter: &Mounter,
+    mounter: &dyn super::mount_interface::MountInterface,
     extensive_mount_point_check: bool,
 ) -> io::Result<()> {
     cleanup_impl(mount_path, mounter, extensive_mount_point_check, |m, p| {
@@ -638,11 +642,11 @@ pub fn cleanup_mount_with_force(
 
 /// The body `CleanupMountPoint`/`doCleanupMountPoint` and `CleanupMountWithForce`
 /// share (`mount_helper_common.go:30-120`); they differ only in the unmount call.
-fn cleanup_impl(
+fn cleanup_impl<M: super::mount_interface::MountInterface + ?Sized>(
     mount_path: &str,
-    mounter: &Mounter,
+    mounter: &M,
     extensive: bool,
-    unmount: impl Fn(&Mounter, &str) -> io::Result<()>,
+    unmount: impl Fn(&M, &str) -> io::Result<()>,
 ) -> io::Result<()> {
     let (exists, path_err) = super::mount_utils::path_exists(mount_path);
     if !exists && path_err.is_none() {
@@ -686,9 +690,9 @@ fn cleanup_impl(
 }
 
 /// `removePathIfNotMountPoint` (`mount_helper_common.go:131-155`).
-fn remove_path_if_not_mount_point(
+fn remove_path_if_not_mount_point<M: super::mount_interface::MountInterface + ?Sized>(
     mount_path: &str,
-    mounter: &Mounter,
+    mounter: &M,
     extensive: bool,
 ) -> io::Result<bool> {
     let checked = if extensive {

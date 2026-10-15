@@ -258,6 +258,7 @@ impl VolumeManager {
             Box::new(crate::volume_plugins::git_repo::GitRepoPlugin::new(
                 host.clone(),
             )),
+            Box::new(crate::volume_plugins::iscsi::IscsiPlugin::new(host.clone())),
             // `image.ProbeVolumePlugins` (`cmd/kubelet/app/plugins.go`).
             Box::new(crate::volume_plugins::image::ImagePlugin::new()),
             Box::new(crate::volume_plugins::config_map::ConfigMapPlugin::new(
@@ -1375,7 +1376,7 @@ impl VolumeManager {
             // (`desired_state_of_world.go:272-277`,
             // `desired_state_of_world_populator.go:310-315`); there is no
             // fallback directory (#3262). Covers a PV-resolved spec too (e.g.
-            // an iscsi-sourced PersistentVolume).
+            // a PersistentVolume whose source has no plugin).
             Err(crate::volume_plugins::PluginLookupError::NoPluginMatched) => {
                 Err(NoPluginForVolume(volume.name.clone()).into())
             }
@@ -3638,6 +3639,29 @@ mod dispatch_tests {
             .is_ok());
     }
 
+    /// `iscsi.ProbeVolumePlugins` is registered by the kubelet
+    /// (`cmd/kubelet/app/plugins.go`), so an `iscsi` volume resolves to the
+    /// `kubernetes.io/iscsi` plugin (`pkg/volume/iscsi/iscsi.go:59`) instead
+    /// of failing with `no volume plugin matched` (#3287).
+    #[test]
+    fn an_iscsi_volume_is_claimed_by_the_iscsi_plugin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(
+            tmp.path().to_string_lossy().to_string(),
+            None,
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+        let v = volume(
+            "i",
+            json!({"iscsi": {"targetPortal": "10.0.0.1", "iqn": "iqn.x", "lun": 0}}),
+        );
+        assert_eq!(vm.plugin_name_for_volume(&v), "kubernetes.io/iscsi");
+        assert!(vm
+            .plugin_mgr
+            .find_plugin_by_name("kubernetes.io/iscsi")
+            .is_ok());
+    }
+
     /// `image.ProbeVolumePlugins` is registered by the kubelet
     /// (`cmd/kubelet/app/plugins.go`), so an `image` volume resolves to the
     /// `kubernetes.io/image` stub plugin (`pkg/volume/image/image.go:41`)
@@ -3662,7 +3686,7 @@ mod dispatch_tests {
         assert!(!tmp.path().join("pods").exists(), "no directory is made");
     }
 
-    /// #3262: an unimplemented kind (iscsi, fc, gitRepo) matches no
+    /// #3262: an unimplemented kind (rbd, fc, gitRepo) matches no
     /// plugin. Upstream's desired-state populator fails the volume with
     /// `failed to get Plugin from volumeSpec for volume %q err=%v`
     /// (`desired_state_of_world.go:272-277`) over `ErrNoPluginMatched`
@@ -3677,17 +3701,17 @@ mod dispatch_tests {
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
         );
         let pod: Pod = serde_json::from_value(json!({
-            "metadata": {"name": "p", "namespace": "default", "uid": "uid-iscsi"},
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-rbd"},
             "spec": {"containers": [{"name": "c", "image": "i",
-                "volumeMounts": [{"name": "iscsi-vol", "mountPath": "/m"}]}],
-                "volumes": [{"name": "iscsi-vol", "iscsi": {"targetPortal": "10.0.0.1", "iqn": "iqn.x", "lun": 0}}]}
+                "volumeMounts": [{"name": "rbd-vol", "mountPath": "/m"}]}],
+                "volumes": [{"name": "rbd-vol", "rbd": {"monitors": ["10.0.0.1"], "image": "img"}}]}
         }))
         .unwrap();
 
         let err = vm.create_pod_volumes(&pod).await.unwrap_err();
         assert_eq!(
             err.to_string(),
-            "failed to get Plugin from volumeSpec for volume \"iscsi-vol\" err=no volume plugin matched"
+            "failed to get Plugin from volumeSpec for volume \"rbd-vol\" err=no volume plugin matched"
         );
         assert!(crate::lifecycle::is_volume_wait_error(&err.to_string()));
         assert!(!tmp.path().join("pods").exists(), "no fallback dir");
@@ -3705,9 +3729,9 @@ mod dispatch_tests {
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
         );
         let pod: Pod = serde_json::from_value(json!({
-            "metadata": {"name": "p", "namespace": "default", "uid": "uid-iscsi"},
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-rbd"},
             "spec": {"containers": [{"name": "c", "image": "i"}],
-                "volumes": [{"name": "iscsi-vol", "iscsi": {"targetPortal": "s", "iqn": "iqn.x", "lun": 0}}]}
+                "volumes": [{"name": "rbd-vol", "rbd": {"monitors": ["s"], "image": "img"}}]}
         }))
         .unwrap();
         assert!(vm.create_pod_volumes(&pod).await.unwrap().is_empty());

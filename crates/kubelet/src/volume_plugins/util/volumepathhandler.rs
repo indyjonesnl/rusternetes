@@ -9,8 +9,9 @@
 //!
 //! **Not ported (tracked in #2293):** the `bindMount == true` mapping and the
 //! unmount of a live bind mount (both need `mount(2)`/`umount(2)`; this crate
-//! has no mount helper yet), `FindGlobalMapPathUUIDFromPod` /
-//! `GetDeviceBindMountRefs` (consumers of bind mounts), and the `losetup`
+//! has no mount helper yet), `GetDeviceBindMountRefs` (consumer of bind
+//! mounts; `FindGlobalMapPathUUIDFromPod` was ported for the iscsi plugin,
+//! #3287), and the `losetup`
 //! file-device functions (`AttachFileDevice`, `DetachFileDevice`,
 //! `GetLoopDevice`) which back `volumeMode: Block` on a file-backed PV.
 
@@ -133,6 +134,76 @@ impl VolumePathHandler {
             Err(e) => bail!("failed to Lstat file {map_path}: {e}"),
         }
     }
+
+    /// Port of `FindGlobalMapPathUUIDFromPod`
+    /// (`volume_path_handler_linux.go:164-185`): find the `{pod uuid}` device
+    /// node (bind mount) under `plugin_dir` whose device is the one the pod's
+    /// `map_path` symlink points at. Returns the empty string when none
+    /// matches.
+    pub fn find_global_map_path_uuid_from_pod(
+        &self,
+        plugin_dir: &str,
+        map_path: &str,
+        pod_uid: &str,
+    ) -> Result<String> {
+        let mut global_map_path_uuid = String::new();
+        // `filepath.Walk`: lexical order, symlinks not followed, a failed
+        // `Lstat` of the root (or a failed directory read) aborts the walk.
+        fn walk(path: &Path, f: &mut dyn FnMut(&Path, &fs::Metadata)) -> std::io::Result<()> {
+            let md = fs::symlink_metadata(path)?;
+            f(path, &md);
+            if md.is_dir() {
+                let mut names: Vec<_> = fs::read_dir(path)?
+                    .map(|e| e.map(|e| e.file_name()))
+                    .collect::<std::io::Result<_>>()?;
+                names.sort();
+                for n in names {
+                    walk(&path.join(n), f)?;
+                }
+            }
+            Ok(())
+        }
+        walk(Path::new(plugin_dir), &mut |path, md| {
+            let ft = md.file_type();
+            let is_device = ft.is_block_device() || ft.is_char_device();
+            if is_device && path.file_name().is_some_and(|n| n == pod_uid) {
+                tracing::debug!(
+                    "FindGlobalMapPathFromPod: path {}, mapPath {map_path}",
+                    path.display()
+                );
+                if let Ok(true) = compare_bind_mount_and_symlinks(&path.to_string_lossy(), map_path)
+                {
+                    global_map_path_uuid = path.to_string_lossy().into_owned();
+                }
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("FindGlobalMapPathUUIDFromPod failed: {e}"))?;
+        // Return path contains global map path + {pod uuid}
+        Ok(global_map_path_uuid)
+    }
+}
+
+/// Port of `compareBindMountAndSymlinks` (`volume_path_handler_linux.go:190-217`):
+/// whether the global path (bind mount) and the pod path (symlink) point at the
+/// same device, i.e. the devices have the same major/minor number.
+fn compare_bind_mount_and_symlinks(global: &str, pod: &str) -> Result<bool> {
+    let dev_num_global = get_device_major_minor(global)
+        .map_err(|e| anyhow::anyhow!("getDeviceMajorMinor failed for path {global}: {e}"))?;
+    let dev_pod =
+        fs::read_link(pod).map_err(|e| anyhow::anyhow!("failed to readlink path {pod}: {e}"))?;
+    let dev_pod = dev_pod.to_string_lossy();
+    let dev_num_pod = get_device_major_minor(&dev_pod)
+        .map_err(|e| anyhow::anyhow!("getDeviceMajorMinor failed for path {dev_pod}: {e}"))?;
+    Ok(dev_num_global == dev_num_pod)
+}
+
+/// Port of `getDeviceMajorMinor` (`volume_path_handler_linux.go:224-236`):
+/// `major:minor` in hex, from the path's `st_rdev`.
+fn get_device_major_minor(path: &str) -> Result<String> {
+    use std::os::unix::fs::MetadataExt;
+    let md = fs::metadata(path).map_err(|e| anyhow::anyhow!("failed to stat path {path}: {e}"))?;
+    let rdev = md.rdev();
+    Ok(format!("{:x}:{:x}", libc::major(rdev), libc::minor(rdev)))
 }
 
 /// Port of `mapSymlinkDevice` (`volume_path_handler.go:160-169`): replace
