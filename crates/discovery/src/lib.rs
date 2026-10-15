@@ -806,49 +806,55 @@ pub async fn get_api_groups(
         use rusternetes_storage::Storage;
         let crd_prefix = rusternetes_storage::build_prefix("customresourcedefinitions", None);
         if let Ok(crds) = storage.list::<serde_json::Value>(&crd_prefix).await {
-            let mut seen_groups: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
+            // One APIGroup per group, built from the served versions of
+            // every Established CRD in it, de-duplicated by version
+            // (customresource_discovery_controller.go:105-135
+            // `versionsForDiscoveryMap`).
+            let mut group_order: Vec<String> = Vec::new();
+            let mut group_versions: std::collections::HashMap<
+                String,
+                Vec<GroupVersionForDiscovery>,
+            > = std::collections::HashMap::new();
             for crd in crds.iter().filter(|c| crd_established(c)) {
                 let group = crd.pointer("/spec/group").and_then(|v| v.as_str());
                 let versions_arr = crd.pointer("/spec/versions").and_then(|v| v.as_array());
                 if let (Some(group), Some(versions_arr)) = (group, versions_arr) {
-                    if seen_groups.contains(group) {
-                        continue;
-                    }
-                    seen_groups.insert(group.to_string());
-                    let mut gv_versions = Vec::new();
-                    let mut preferred = None;
                     for ver in versions_arr {
                         let ver_name = ver.get("name").and_then(|v| v.as_str()).unwrap_or("v1");
                         let served = ver.get("served").and_then(|v| v.as_bool()).unwrap_or(false);
-                        if served {
-                            let gv = GroupVersionForDiscovery {
-                                group_version: format!("{}/{}", group, ver_name),
-                                version: ver_name.to_string(),
-                            };
-                            if preferred.is_none() {
-                                preferred = Some(gv.clone());
-                            }
-                            gv_versions.push(gv);
+                        if !served {
+                            continue;
                         }
-                    }
-                    // sortGroupDiscoveryByKubeAwareVersion, then the first item
-                    // is the preferred version
-                    // (customresource_discovery_controller.go:225-231, 284-288).
-                    kube_version::sort_by_kube_aware_version_desc(&mut gv_versions, |v| {
-                        v.version.as_str()
-                    });
-                    if let Some(first) = gv_versions.first() {
-                        preferred = Some(first.clone());
-                    }
-                    if !gv_versions.is_empty() {
-                        groups.push(APIGroup {
-                            name: group.to_string(),
-                            versions: gv_versions,
-                            preferred_version: preferred.unwrap(),
+                        if !group_versions.contains_key(group) {
+                            group_order.push(group.to_string());
+                        }
+                        let entry = group_versions.entry(group.to_string()).or_default();
+                        if entry.iter().any(|v| v.version == ver_name) {
+                            continue;
+                        }
+                        entry.push(GroupVersionForDiscovery {
+                            group_version: format!("{}/{}", group, ver_name),
+                            version: ver_name.to_string(),
                         });
                     }
                 }
+            }
+            for group in group_order {
+                let Some(mut gv_versions) = group_versions.remove(&group) else {
+                    continue;
+                };
+                // sortGroupDiscoveryByKubeAwareVersion, then the first item
+                // is the preferred version
+                // (customresource_discovery_controller.go:225-231, 284-288).
+                kube_version::sort_by_kube_aware_version_desc(&mut gv_versions, |v| {
+                    v.version.as_str()
+                });
+                let preferred_version = gv_versions[0].clone();
+                groups.push(APIGroup {
+                    name: group,
+                    versions: gv_versions,
+                    preferred_version,
+                });
             }
         }
     }
@@ -4554,7 +4560,12 @@ mod tests {
         use rusternetes_storage::Storage;
         let storage = std::sync::Arc::new(rusternetes_storage::StorageBackend::new_memory());
         for (name, plural, kind, vers) in [
-            ("foos.merge.example.com", "foos", "Foo", vec!["v1", "v1beta1"]),
+            (
+                "foos.merge.example.com",
+                "foos",
+                "Foo",
+                vec!["v1", "v1beta1"],
+            ),
             ("bars.merge.example.com", "bars", "Bar", vec!["v1", "v2"]),
         ] {
             let versions: Vec<_> = vers
