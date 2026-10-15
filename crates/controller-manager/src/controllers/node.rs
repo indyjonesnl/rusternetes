@@ -106,7 +106,6 @@ struct NodeObservation {
 
 pub struct NodeController<S: Storage> {
     storage: Arc<S>,
-    first_seen: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
     observed_conditions: Arc<std::sync::Mutex<ObservedConditions>>,
     eviction: EvictionConfig,
     evictor: Arc<tokio::sync::Mutex<Evictor>>,
@@ -219,7 +218,6 @@ impl<S: Storage + 'static> NodeController<S> {
     pub fn with_eviction_config(storage: Arc<S>, eviction: EvictionConfig) -> Self {
         Self {
             storage,
-            first_seen: Arc::new(std::sync::Mutex::new(HashMap::new())),
             observed_conditions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             eviction,
             evictor: Arc::new(tokio::sync::Mutex::new(Evictor::default())),
@@ -243,9 +241,8 @@ impl<S: Storage + 'static> NodeController<S> {
         *self.clock_offset.lock().unwrap() += by;
     }
 
-    /// Test helper: mark `node_name` as first seen long enough ago that the
-    /// startup grace period is over. Reconcile_node skips condition updates
-    /// within the K8s-standard 60s startup grace; this lets tests observe the
+    /// Test helper: mark `node_name` as observed long enough ago that the
+    /// nodeHealthMap startup grace period is over, so tests observe the
     /// Ready-flip behavior deterministically without sleeping.
     ///
     /// `dead_code` allowed because the bin compilation unit never calls this
@@ -254,15 +251,6 @@ impl<S: Storage + 'static> NodeController<S> {
     #[allow(dead_code)]
     #[doc(hidden)]
     pub fn seed_first_seen_for_test(&self, node_name: &str) {
-        let past = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(
-                NODE_STARTUP_GRACE_PERIOD_SECS * 2,
-            ))
-            .unwrap_or_else(std::time::Instant::now);
-        self.first_seen
-            .lock()
-            .unwrap()
-            .insert(node_name.to_string(), past);
         // The controller has been watching this node all along: its first
         // `tryUpdateNodeHealth` entry dates from the heartbeat, not from now.
         self.backdated.lock().unwrap().insert(node_name.to_string());
@@ -578,18 +566,6 @@ impl<S: Storage + 'static> NodeController<S> {
 
         self.do_no_execute_tainting_pass().await;
         Ok(())
-    }
-
-    /// True while the node is inside the K8s startup grace period
-    /// (`nodeStartupGracePeriod = 60s`); records first sight.
-    fn in_startup_grace(&self, node_name: &str) -> bool {
-        let first_seen_time = {
-            let mut first_seen = self.first_seen.lock().unwrap();
-            *first_seen
-                .entry(node_name.to_string())
-                .or_insert_with(std::time::Instant::now)
-        };
-        first_seen_time.elapsed() < std::time::Duration::from_secs(NODE_STARTUP_GRACE_PERIOD_SECS)
     }
 
     /// `monitorNodeHealth` (node_lifecycle_controller.go:670-778): one pass over
@@ -1361,9 +1337,11 @@ impl<S: Storage + 'static> NodeController<S> {
         if let Err(e) = self.do_no_schedule_tainting_pass(node).await {
             error!("Failed to taint NoSchedule on node {}: {}", node_name, e);
         }
-        if self.in_startup_grace(node_name) {
-            return Ok(());
-        }
+        // No further startup-grace gate: after `doNoScheduleTaintingPass`
+        // upstream's `doNodeProcessingPassWorker` proceeds directly
+        // (node_lifecycle_controller.go:516-540). The only startup grace is
+        // the nodeHealthMap one in `tryUpdateNodeHealth` (:849,
+        // `gracePeriod = nc.nodeStartupGracePeriod`).
 
         // Apply the shutdown taint when the node reports a graceful shutdown.
         //
@@ -3041,5 +3019,29 @@ mod tests {
             [noschedule("node.kubernetes.io/unschedulable")]
         );
         assert!(taint_keys(&storage, "ok").await.is_empty());
+    }
+
+    /// #3009: upstream's `doNodeProcessingPassWorker`
+    /// (node_lifecycle_controller.go:516-540) has no startup-grace gate of its
+    /// own after `doNoScheduleTaintingPass`; the only grace is the nodeHealthMap
+    /// one inside `monitorNodeHealth`. A freshly observed node reporting
+    /// `Ready=False reason=NodeShutdown` must therefore get its shutdown taint
+    /// on the first pass, without `seed_first_seen_for_test`.
+    #[tokio::test]
+    async fn process_node_has_no_second_startup_grace_gate() {
+        let storage = Arc::new(MemoryStorage::new());
+        let c = NodeController::with_eviction_config(storage.clone(), fast_config());
+        let mut n = znode("fresh", "zone1", "False", 0);
+        n.status.as_mut().unwrap().conditions.as_mut().unwrap()[0].reason =
+            Some("NodeShutdown".to_string());
+        // Not `put`: that backdates the node's health-map entry.
+        put_raw(&storage, &n).await;
+        c.process_node(&n).await.unwrap();
+        assert!(
+            taint_keys(&storage, "fresh")
+                .await
+                .contains(&noschedule("node.kubernetes.io/shutdown")),
+            "shutdown taint withheld by a startup grace upstream does not have"
+        );
     }
 }
