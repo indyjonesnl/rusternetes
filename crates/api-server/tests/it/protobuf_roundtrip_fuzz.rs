@@ -66,6 +66,7 @@ fn synth(
         }
         FieldType::BytesMap => Some(json!({ "k1": "aGk=" })),
         FieldType::QuantityMap => Some(json!({ "cpu": "100m" })),
+        FieldType::StringListMap => Some(json!({ "k1": ["a", "b"] })),
         FieldType::Message(name) => synth_message(name, schemas, depth),
         FieldType::MessageMap(name) => {
             synth_message(name, schemas, depth).map(|m| json!({ "k1": m }))
