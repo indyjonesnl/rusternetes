@@ -15,7 +15,7 @@ use axum::{
     extract::{Path, Query, State},
     http::HeaderMap,
     response::Response,
-    Extension, Json,
+    Extension,
 };
 use rusternetes_common::{
     admission::{GroupVersionKind, GroupVersionResource},
@@ -280,7 +280,11 @@ pub async fn list_podtemplates(
                             remaining_item_count: None,
                         });
                     }
-                    return Ok((axum::http::StatusCode::GONE, Json(status)).into_response());
+                    return Ok((
+                        axum::http::StatusCode::GONE,
+                        crate::audit::json_response(status),
+                    )
+                        .into_response());
                 }
                 return Err(rusternetes_common::Error::InvalidResource(e.message));
             }
@@ -290,7 +294,7 @@ pub async fn list_podtemplates(
     list.metadata.continue_token = paginated.continue_token;
     list.metadata.remaining_item_count = paginated.remaining_item_count;
     list.metadata.resource_version = Some(paginated.resource_version);
-    Ok(Json(list).into_response())
+    Ok(crate::audit::json_response(list).into_response())
 }
 
 /// List all podtemplates across all namespaces
@@ -397,7 +401,11 @@ pub async fn list_all_podtemplates(
                             remaining_item_count: None,
                         });
                     }
-                    return Ok((axum::http::StatusCode::GONE, Json(status)).into_response());
+                    return Ok((
+                        axum::http::StatusCode::GONE,
+                        crate::audit::json_response(status),
+                    )
+                        .into_response());
                 }
                 return Err(rusternetes_common::Error::InvalidResource(e.message));
             }
@@ -407,5 +415,5 @@ pub async fn list_all_podtemplates(
     list.metadata.continue_token = paginated.continue_token;
     list.metadata.remaining_item_count = paginated.remaining_item_count;
     list.metadata.resource_version = Some(paginated.resource_version);
-    Ok(Json(list).into_response())
+    Ok(crate::audit::json_response(list).into_response())
 }

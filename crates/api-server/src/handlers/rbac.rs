@@ -14,7 +14,7 @@ use axum::{
     extract::{Path, Query, State},
     http::HeaderMap,
     response::{IntoResponse, Response},
-    Extension, Json,
+    Extension,
 };
 use rusternetes_common::{
     admission::{GroupVersionKind, GroupVersionResource},
@@ -231,7 +231,7 @@ pub async fn list_roles(
         crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
             .await,
     );
-    Ok(Json(list).into_response())
+    Ok(crate::audit::json_response(list).into_response())
 }
 
 /// List all roles across all namespaces
@@ -281,7 +281,7 @@ pub async fn list_all_roles(
         crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
             .await,
     );
-    Ok(Json(list).into_response())
+    Ok(crate::audit::json_response(list).into_response())
 }
 
 /// The RoleBinding `RequestScope`: `rbac.authorization.k8s.io/v1` `RoleBinding` served
@@ -469,7 +469,7 @@ pub async fn list_rolebindings(
         crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
             .await,
     );
-    Ok(Json(list).into_response())
+    Ok(crate::audit::json_response(list).into_response())
 }
 
 /// List all rolebindings across all namespaces
@@ -528,7 +528,7 @@ pub async fn list_all_rolebindings(
         crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
             .await,
     );
-    Ok(Json(list).into_response())
+    Ok(crate::audit::json_response(list).into_response())
 }
 
 /// The ClusterRole `RequestScope`: `rbac.authorization.k8s.io/v1` `ClusterRole` served
@@ -713,7 +713,7 @@ pub async fn list_clusterroles(
         crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
             .await,
     );
-    Ok(Json(list).into_response())
+    Ok(crate::audit::json_response(list).into_response())
 }
 
 /// The ClusterRoleBinding `RequestScope`: `rbac.authorization.k8s.io/v1` `ClusterRoleBinding` served
@@ -896,5 +896,5 @@ pub async fn list_clusterrolebindings(
         crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
             .await,
     );
-    Ok(Json(list).into_response())
+    Ok(crate::audit::json_response(list).into_response())
 }

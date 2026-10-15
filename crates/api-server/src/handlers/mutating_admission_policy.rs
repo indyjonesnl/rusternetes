@@ -22,7 +22,7 @@ use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
     extract::State,
     response::{IntoResponse, Response},
-    Extension, Json,
+    Extension,
 };
 use rusternetes_common::{
     admission::{GroupVersionKind, GroupVersionResource},
@@ -129,7 +129,7 @@ pub async fn list_mutating_admission_policies(
         crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
             .await,
     );
-    Ok(Json(list).into_response())
+    Ok(crate::audit::json_response(list).into_response())
 }
 
 // ===== MutatingAdmissionPolicyBinding =====
@@ -212,5 +212,5 @@ pub async fn list_mutating_admission_policy_bindings(
         crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
             .await,
     );
-    Ok(Json(list).into_response())
+    Ok(crate::audit::json_response(list).into_response())
 }

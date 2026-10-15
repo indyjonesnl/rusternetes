@@ -15,7 +15,7 @@ use axum::{
     extract::{Path, Query, State},
     http::HeaderMap,
     response::{IntoResponse, Response},
-    Extension, Json,
+    Extension,
 };
 use rusternetes_common::{
     admission::{GroupVersionKind, GroupVersionResource},
@@ -403,7 +403,7 @@ pub async fn list(
             Some(resource_version.to_string()),
             "Deployment",
         );
-        return Ok(axum::Json(table).into_response());
+        return Ok(crate::audit::json_response(table).into_response());
     }
 
     let mut list = List::new("DeploymentList", "apps/v1", deployments);
@@ -411,7 +411,7 @@ pub async fn list(
         crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
             .await,
     );
-    Ok(Json(list).into_response())
+    Ok(crate::audit::json_response(list).into_response())
 }
 
 /// List all deployments across all namespaces
@@ -495,7 +495,7 @@ pub async fn list_all_deployments(
             Some(resource_version.to_string()),
             "Deployment",
         );
-        return Ok(axum::Json(table).into_response());
+        return Ok(crate::audit::json_response(table).into_response());
     }
 
     let mut list = List::new("DeploymentList", "apps/v1", deployments);
@@ -503,5 +503,5 @@ pub async fn list_all_deployments(
         crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
             .await,
     );
-    Ok(Json(list).into_response())
+    Ok(crate::audit::json_response(list).into_response())
 }

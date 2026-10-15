@@ -13,7 +13,7 @@ use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
     extract::State,
     response::{IntoResponse, Response},
-    Extension, Json,
+    Extension,
 };
 use rusternetes_common::{
     admission::{GroupVersionKind, GroupVersionResource},
@@ -261,7 +261,11 @@ pub async fn list_validating_webhooks(
         crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
             .await,
     );
-    Ok(crate::endpoints::handlers::negotiate(&headers, Json(list).into_response()).await)
+    Ok(crate::endpoints::handlers::negotiate(
+        &headers,
+        crate::audit::json_response(list).into_response(),
+    )
+    .await)
 }
 
 // ===== MutatingWebhookConfiguration =====
@@ -349,5 +353,9 @@ pub async fn list_mutating_webhooks(
         crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
             .await,
     );
-    Ok(crate::endpoints::handlers::negotiate(&headers, Json(list).into_response()).await)
+    Ok(crate::endpoints::handlers::negotiate(
+        &headers,
+        crate::audit::json_response(list).into_response(),
+    )
+    .await)
 }

@@ -213,5 +213,5 @@ pub async fn list_runtimeclasses(
         crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
             .await,
     );
-    Ok(axum::Json(list).into_response())
+    Ok(crate::audit::json_response(list).into_response())
 }

@@ -15,7 +15,7 @@ use axum::{
     extract::{Path, Query, State},
     http::HeaderMap,
     response::Response,
-    Extension, Json,
+    Extension,
 };
 use rusternetes_common::{
     admission::{GroupVersionKind, GroupVersionResource},
@@ -164,7 +164,7 @@ pub async fn list_csistoragecapacities(
         crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
             .await,
     );
-    Ok(Json(list).into_response())
+    Ok(crate::audit::json_response(list).into_response())
 }
 
 pub async fn list_all_csistoragecapacities(
@@ -234,7 +234,7 @@ pub async fn list_all_csistoragecapacities(
         crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
             .await,
     );
-    Ok(Json(list).into_response())
+    Ok(crate::audit::json_response(list).into_response())
 }
 
 pub async fn update_csistoragecapacity(

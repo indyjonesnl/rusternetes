@@ -15,7 +15,7 @@ use axum::{
     extract::{Path, Query, State},
     http::HeaderMap,
     response::Response,
-    Extension, Json,
+    Extension,
 };
 use rusternetes_common::{
     admission::{GroupVersionKind, GroupVersionResource},
@@ -126,7 +126,9 @@ pub async fn list_csidrivers(
         crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
             .await,
     );
-    Ok(axum::response::IntoResponse::into_response(Json(list)))
+    Ok(axum::response::IntoResponse::into_response(
+        crate::audit::json_response(list),
+    ))
 }
 
 pub async fn update_csidriver(

@@ -21,7 +21,7 @@ use axum::{
     extract::{OriginalUri, Path, Query, State},
     http::{header, HeaderMap, Uri},
     response::{IntoResponse, Response},
-    Extension, Json,
+    Extension,
 };
 use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
 use rusternetes_common::dump::decode_request_body;
@@ -376,7 +376,7 @@ pub async fn list(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut events, &params)?;
 
-    Ok(Json(EventList {
+    Ok(crate::audit::json_response(EventList {
         api_version: "v1".to_string(),
         kind: "EventList".to_string(),
         metadata: rusternetes_common::types::ListMeta::default(),
@@ -446,7 +446,7 @@ pub async fn list_all(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut events, &params)?;
 
-    Ok(Json(EventList {
+    Ok(crate::audit::json_response(EventList {
         api_version: "v1".to_string(),
         kind: "EventList".to_string(),
         metadata: rusternetes_common::types::ListMeta::default(),
@@ -531,7 +531,7 @@ pub async fn list_events_v1(
 
     // Answer in the events.k8s.io/v1 schema, not the stored core one with a
     // rewritten `apiVersion` (#1926).
-    Ok(Json(EventV1List {
+    Ok(crate::audit::json_response(EventV1List {
         api_version: "events.k8s.io/v1".to_string(),
         kind: "EventList".to_string(),
         metadata: rusternetes_common::types::ListMeta::default(),
@@ -598,7 +598,7 @@ pub async fn list_all_events_v1(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut events, &params)?;
 
-    Ok(Json(EventV1List {
+    Ok(crate::audit::json_response(EventV1List {
         api_version: "events.k8s.io/v1".to_string(),
         kind: "EventList".to_string(),
         metadata: rusternetes_common::types::ListMeta::default(),

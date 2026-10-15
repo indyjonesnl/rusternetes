@@ -106,5 +106,5 @@ pub async fn list_external_metrics(
         items,
     };
 
-    Ok(Json(list))
+    Ok(crate::audit::json_response(list))
 }

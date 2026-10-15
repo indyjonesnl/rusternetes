@@ -368,7 +368,11 @@ async fn paginate_configmaps_response(
                             remaining_item_count: None,
                         });
                     }
-                    return Ok((axum::http::StatusCode::GONE, axum::Json(status)).into_response());
+                    return Ok((
+                        axum::http::StatusCode::GONE,
+                        crate::audit::json_response(status),
+                    )
+                        .into_response());
                 }
                 // Malformed continue token / encoding error -> 400 BadRequest
                 // Status object (kind=Status), matching upstream apiserver.
@@ -380,7 +384,7 @@ async fn paginate_configmaps_response(
     list.metadata.continue_token = paginated.continue_token;
     list.metadata.remaining_item_count = paginated.remaining_item_count;
     list.metadata.resource_version = Some(paginated.resource_version);
-    Ok(axum::Json(list).into_response())
+    Ok(crate::audit::json_response(list).into_response())
 }
 
 #[cfg(test)]
