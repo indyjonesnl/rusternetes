@@ -157,8 +157,8 @@ pub const COMPONENT_KUBELET: &str = "kubelet";
 /// `RegisteredHandlePaths()` (`registered_paths`). The registry is only built
 /// when the gate is on, as upstream builds it inside the `if`.
 ///
-/// Not ported: `s.addMetricsBucketMatcher("statusz")` (server.go:395) -- this
-/// kubelet has no per-path HTTP metrics buckets yet.
+/// `s.addMetricsBucketMatcher("statusz")` (server.go:395) is
+/// [`MetricsBuckets::for_read_only_router`].
 pub fn install_statusz(router: Router, registered_paths: Vec<String>) -> Router {
     rusternetes_common::statusz::install_if_enabled(router, COMPONENT_KUBELET, || {
         rusternetes_common::statusz::Registry::new(Some(
@@ -166,6 +166,97 @@ pub fn install_statusz(router: Router, registered_paths: Vec<String>) -> Router 
         ))
         .with_listed_paths(registered_paths)
     })
+}
+
+/// The `metricsBuckets` / `metricsMethodBuckets` sets of `Server`
+/// (pkg/kubelet/server/server.go:125-126, initialised at :308-309) with
+/// `addMetricsBucketMatcher` (:402), `getMetricBucket` (:407) and
+/// `getMetricMethodBucket` (:415). Not consumed yet: the per-request HTTP
+/// metrics instrumentation that reads the bucket is not wired (#3476).
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct MetricsBuckets {
+    buckets: std::collections::HashSet<String>,
+    method_buckets: std::collections::HashSet<&'static str>,
+}
+
+#[allow(dead_code)]
+impl MetricsBuckets {
+    /// `sets.New[string]()` plus the method set
+    /// `"OPTIONS", "GET", "HEAD", "POST", "PUT", "DELETE", "TRACE", "CONNECT"`.
+    pub fn new() -> Self {
+        Self {
+            buckets: Default::default(),
+            method_buckets: [
+                "OPTIONS", "GET", "HEAD", "POST", "PUT", "DELETE", "TRACE", "CONNECT",
+            ]
+            .into_iter()
+            .collect(),
+        }
+    }
+
+    /// The buckets for the handlers `read_only_router` serves: the
+    /// `InstallDefaultHandlers` calls at server.go:429 (`healthz`), :440
+    /// (`pods`), :452 (`stats`) and :610 (`runningpods`), plus
+    /// `installStatusZ` (:395) and `installFlagZ` (:604) behind their gates.
+    /// `/metrics` and `/configz` are registered by the caller, not here.
+    pub fn for_read_only_router(statusz_enabled: bool, flagz_enabled: bool) -> Self {
+        let mut b = Self::new();
+        for name in ["healthz", "pods", "stats", "runningpods"] {
+            b.add_metrics_bucket_matcher(name);
+        }
+        if statusz_enabled {
+            b.add_metrics_bucket_matcher("statusz");
+        }
+        if flagz_enabled {
+            b.add_metrics_bucket_matcher("flagz");
+        }
+        b
+    }
+
+    /// `addMetricsBucketMatcher`: "not thread safe and should not be used
+    /// dynamically" -- hence `&mut self`.
+    pub fn add_metrics_bucket_matcher(&mut self, bucket: &str) {
+        self.buckets.insert(bucket.to_string());
+    }
+
+    /// `getMetricBucket`.
+    pub fn get_metric_bucket(&self, path: &str) -> String {
+        let root = get_url_root_path(path);
+        if self.buckets.contains(&root) {
+            return root;
+        }
+        "other".to_string()
+    }
+
+    /// `getMetricMethodBucket`: unknown or invalid HTTP verbs are `other`.
+    pub fn get_metric_method_bucket(&self, method: &str) -> String {
+        if self.method_buckets.contains(method) {
+            return method.to_string();
+        }
+        "other".to_string()
+    }
+}
+
+impl Default for MetricsBuckets {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// `getURLRootPath` (server.go:1139-1150): the first path segment, or
+/// `metrics/<sub>` for a `/metrics/...` path.
+#[allow(dead_code)]
+fn get_url_root_path(path: &str) -> String {
+    let trimmed = path.strip_prefix('/').unwrap_or(path);
+    let mut parts = trimmed.splitn(3, '/');
+    let first = parts.next().unwrap_or("");
+    if first == "metrics" {
+        if let Some(second) = parts.next() {
+            return format!("{first}/{second}");
+        }
+    }
+    first.to_string()
 }
 
 /// Paths [`read_only_router`] registers (the route templates, as go-restful's
@@ -460,5 +551,100 @@ mod statusz_tests {
             }
         }
         reset_to_defaults();
+    }
+
+    // server_test.go:TestMetricBuckets (the buckets upstream's installed
+    // handlers add; `/debug`, `/exec`... are not served by this kubelet).
+    #[test]
+    fn metric_buckets_cases() {
+        let mut b = MetricsBuckets::new();
+        for name in [
+            "healthz",
+            "attach",
+            "configz",
+            "containerLogs",
+            "debug",
+            "exec",
+            "logs",
+            "metrics",
+            "metrics/cadvisor",
+            "metrics/probes",
+            "metrics/resource",
+            "pods",
+            "portForward",
+            "run",
+            "runningpods",
+            "stats",
+            "statusz",
+            "flagz",
+        ] {
+            b.add_metrics_bucket_matcher(name);
+        }
+        let cases = [
+            ("/healthz", "healthz"),
+            ("/attach/podNamespace/podID/containerName", "attach"),
+            ("/attach/podNamespace/podID/uid/containerName", "attach"),
+            ("/configz", "configz"),
+            (
+                "/containerLogs/podNamespace/podID/containerName",
+                "containerLogs",
+            ),
+            ("/debug/flags/v", "debug"),
+            ("/debug/pprof/subpath", "debug"),
+            ("/exec/podNamespace/podID/containerName", "exec"),
+            ("/healthz/", "healthz"),
+            ("/healthz/log", "healthz"),
+            ("/healthz/ping", "healthz"),
+            ("/healthz/syncloop", "healthz"),
+            ("/logs/", "logs"),
+            ("/logs/logpath", "logs"),
+            ("/metrics", "metrics"),
+            ("/metrics/cadvisor", "metrics/cadvisor"),
+            ("/metrics/probes", "metrics/probes"),
+            ("/metrics/resource", "metrics/resource"),
+            ("/pods/", "pods"),
+            ("/portForward/podNamespace/podID", "portForward"),
+            ("/portForward/podNamespace/podID/uid", "portForward"),
+            ("/run/podNamespace/podID/containerName", "run"),
+            ("/runningpods/", "runningpods"),
+            ("/stats/", "stats"),
+            ("/stats/summary", "stats"),
+            ("/statusz", "statusz"),
+            ("/flagz", "flagz"),
+            ("/junk", "other"),
+            ("/healthzjunk", "other"),
+        ];
+        for (path, want) in cases {
+            assert_eq!(b.get_metric_bucket(path), want, "{path}");
+        }
+    }
+
+    // server_test.go:TestMetricMethodBuckets
+    #[test]
+    fn metric_method_buckets_cases() {
+        let b = MetricsBuckets::new();
+        assert_eq!(b.get_metric_method_bucket("GET"), "GET");
+        assert_eq!(b.get_metric_method_bucket("POST"), "POST");
+        assert_eq!(b.get_metric_method_bucket("WEIRD"), "other");
+    }
+
+    // server.go:InstallDefaultHandlers/installStatusZ/installFlagZ: only the
+    // handlers this kubelet serves add their bucket.
+    #[test]
+    fn default_buckets_cover_only_served_paths() {
+        let b = MetricsBuckets::for_read_only_router(false, false);
+        for (path, want) in [
+            ("/healthz", "healthz"),
+            ("/pods", "pods"),
+            ("/runningpods/", "runningpods"),
+            ("/stats/summary", "stats"),
+            ("/statusz", "other"),
+            ("/flagz", "other"),
+        ] {
+            assert_eq!(b.get_metric_bucket(path), want, "{path}");
+        }
+        let b = MetricsBuckets::for_read_only_router(true, true);
+        assert_eq!(b.get_metric_bucket("/statusz"), "statusz");
+        assert_eq!(b.get_metric_bucket("/flagz"), "flagz");
     }
 }
