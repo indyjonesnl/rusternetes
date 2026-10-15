@@ -2977,6 +2977,7 @@ impl ProtoRegistry {
         Self::register_node_v1(&mut schemas);
         Self::register_authentication_v1(&mut schemas);
         Self::register_authorization_v1(&mut schemas);
+        Self::register_authorization_v1_selectors(&mut schemas);
         Self::register_certificates_v1(&mut schemas);
 
         ProtoRegistry { schemas }
@@ -13297,6 +13298,50 @@ impl ProtoRegistry {
                 ]),
             },
         );
+    }
+
+    /// authorization.k8s.io/v1 `ResourceAttributes.fieldSelector` (8) /
+    /// `labelSelector` (9) and their `*SelectorAttributes` messages, from
+    /// staging/src/k8s.io/api/authorization/v1/generated.proto:
+    /// `FieldSelectorAttributes { rawSelector = 1; requirements = 2 }` and
+    /// `LabelSelectorAttributes { rawSelector = 1; requirements = 2 }`.
+    fn register_authorization_v1_selectors(schemas: &mut HashMap<String, MessageSchema>) {
+        let attrs = |req: &str| MessageSchema {
+            fields: HashMap::from([
+                (1, ("rawSelector".into(), FieldType::String)),
+                (
+                    2,
+                    (
+                        "requirements".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message(req.into()))),
+                    ),
+                ),
+            ]),
+        };
+        schemas.insert(
+            "FieldSelectorAttributes".into(),
+            attrs("FieldSelectorRequirement"),
+        );
+        schemas.insert(
+            "LabelSelectorAttributes".into(),
+            attrs("LabelSelectorRequirement"),
+        );
+        if let Some(ra) = schemas.get_mut("ResourceAttributes") {
+            ra.fields.insert(
+                8,
+                (
+                    "fieldSelector".into(),
+                    FieldType::Message("FieldSelectorAttributes".into()),
+                ),
+            );
+            ra.fields.insert(
+                9,
+                (
+                    "labelSelector".into(),
+                    FieldType::Message("LabelSelectorAttributes".into()),
+                ),
+            );
+        }
     }
 
     /// certificates.k8s.io/v1. Field numbers from
