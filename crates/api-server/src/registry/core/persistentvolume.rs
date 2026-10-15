@@ -43,6 +43,10 @@ pub fn convert_to_internal(pv: &mut PersistentVolume) {
     if pv.spec.volume_mode.is_none() {
         pv.spec.volume_mode = Some(PersistentVolumeMode::Filesystem);
     }
+    // SetObjectDefaults_PersistentVolume (zz_generated.defaults.go:151-155).
+    if let Some(iscsi) = pv.spec.iscsi.as_mut() {
+        iscsi.set_defaults();
+    }
 }
 
 /// `GetWarningsForPersistentVolume` (pkg/api/persistentvolume/util.go:40-110).
@@ -273,6 +277,34 @@ mod tests {
             Some(PersistentVolumeReclaimPolicy::Retain)
         );
         assert_eq!(pv.spec.volume_mode, Some(PersistentVolumeMode::Filesystem));
+    }
+
+    /// `SetObjectDefaults_PersistentVolume` (zz_generated.defaults.go:151-155):
+    /// `iscsiInterface == ""` -> "default" (`+default="default"`,
+    /// staging/src/k8s.io/api/core/v1/types.go:1558).
+    #[test]
+    fn defaults_iscsi_interface() {
+        for (iface, want) in [
+            (None, "default"),
+            (Some(""), "default"),
+            (Some("tcp"), "tcp"),
+        ] {
+            let mut iscsi = serde_json::json!({"targetPortal": "p", "iqn": "q", "lun": 0});
+            if let Some(i) = iface {
+                iscsi["iscsiInterface"] = i.into();
+            }
+            let mut pv: PersistentVolume = serde_json::from_value(serde_json::json!({
+                "apiVersion": "v1", "kind": "PersistentVolume",
+                "metadata": {"name": "pv"},
+                "spec": {"capacity": {"storage": "1Gi"}, "iscsi": iscsi}
+            }))
+            .unwrap();
+            convert_to_internal(&mut pv);
+            assert_eq!(
+                pv.spec.iscsi.unwrap().iscsi_interface.as_deref(),
+                Some(want)
+            );
+        }
     }
 
     /// `TestStatusCreate` (strategy_test.go:247): create

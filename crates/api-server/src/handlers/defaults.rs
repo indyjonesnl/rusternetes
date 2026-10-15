@@ -119,6 +119,9 @@ fn apply_volume_default_mode(vol: &mut rusternetes_common::resources::pod::Volum
     if let Some(p) = vol.projected.as_mut() {
         p.default_mode.get_or_insert(DEFAULT_MODE);
     }
+    if let Some(i) = vol.iscsi.as_mut() {
+        i.set_defaults();
+    }
 }
 
 /// Apply K8s defaults to an EphemeralContainer. Mirrors the
@@ -946,6 +949,29 @@ mod tests {
             template.spec.containers[0].image_pull_policy.as_deref(),
             Some("Always")
         );
+    }
+
+    /// `+default="default"` on `ISCSIVolumeSource.iscsiInterface`
+    /// (staging/src/k8s.io/api/core/v1/types.go:1510), applied by
+    /// `SetObjectDefaults_Pod` (zz_generated.defaults.go:219-222) and
+    /// `SetObjectDefaults_PodTemplate` (:610-613) as `== ""` -> "default".
+    #[test]
+    fn test_iscsi_interface_defaulted() {
+        let mut spec = PodSpec {
+            containers: vec![],
+            volumes: Some(vec![
+                serde_json::from_value(serde_json::json!({"name": "a", "iscsi": {"targetPortal": "p", "iqn": "q", "lun": 0}})).unwrap(),
+                serde_json::from_value(serde_json::json!({"name": "b", "iscsi": {"targetPortal": "p", "iqn": "q", "lun": 0, "iscsiInterface": ""}})).unwrap(),
+                serde_json::from_value(serde_json::json!({"name": "c", "iscsi": {"targetPortal": "p", "iqn": "q", "lun": 0, "iscsiInterface": "tcp"}})).unwrap(),
+            ]),
+            ..Default::default()
+        };
+        apply_pod_spec_defaults(&mut spec);
+        let v = spec.volumes.as_deref().unwrap();
+        let get = |i: usize| v[i].iscsi.as_ref().unwrap().iscsi_interface.clone();
+        assert_eq!(get(0).as_deref(), Some("default"));
+        assert_eq!(get(1).as_deref(), Some("default"));
+        assert_eq!(get(2).as_deref(), Some("tcp"));
     }
 
     #[test]

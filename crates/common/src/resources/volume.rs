@@ -180,6 +180,19 @@ pub struct NFSVolumeSource {
     pub read_only: Option<bool>,
 }
 
+impl ISCSIVolumeSource {
+    /// `+default="default"` on `iscsiInterface`
+    /// (staging/src/k8s.io/api/core/v1/types.go:1510, :1558), applied as
+    /// `if ISCSIInterface == "" { = "default" }` by
+    /// `SetObjectDefaults_Pod` / `_PodTemplate` / `_PersistentVolume`
+    /// (pkg/apis/core/v1/zz_generated.defaults.go:151, :219, :610).
+    pub fn set_defaults(&mut self) {
+        if self.iscsi_interface.as_deref().is_none_or(str::is_empty) {
+            self.iscsi_interface = Some("default".to_string());
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ISCSIVolumeSource {
