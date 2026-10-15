@@ -4264,6 +4264,59 @@ mod tests {
             .is_empty());
     }
 
+    /// `FindMatchingVolume` (component-helpers `pv_helpers.go:279-283`):
+    /// `node == nil && delayBinding` skips every PV that is not already bound
+    /// to the claim, so the scheduler's VolumeBinding plugin binds it with a
+    /// node chosen. The PV controller must leave the unclaimed PV alone.
+    #[tokio::test]
+    async fn delay_binding_claim_does_not_bind_unclaimed_pv() {
+        let storage = Arc::new(MemoryStorage::new());
+        put_class(&storage, "wffc", false, "WaitForFirstConsumer").await;
+        let mut pv = pv_with("pv-free", None, Some(PersistentVolumePhase::Available));
+        pv.spec.storage_class_name = Some("wffc".into());
+        put_pv(&storage, &pv).await;
+        let mut pvc = classless_claim();
+        pvc.spec.storage_class_name = Some("wffc".into());
+        let (r, got) = sync_claim(&storage, pvc).await;
+        r.unwrap();
+        assert_eq!(got.spec.volume_name, None);
+        assert_eq!(phase_of(&got), PersistentVolumeClaimPhase::Pending);
+        let ev = events_with_reason(&storage, "WaitForFirstConsumer").await;
+        assert_eq!(ev.len(), 1);
+    }
+
+    /// Control for the skip above: an Immediate class still binds.
+    #[tokio::test]
+    async fn immediate_class_claim_binds_unclaimed_pv() {
+        let storage = Arc::new(MemoryStorage::new());
+        put_class(&storage, "imm", false, "Immediate").await;
+        let mut pv = pv_with("pv-free", None, Some(PersistentVolumePhase::Available));
+        pv.spec.storage_class_name = Some("imm".into());
+        put_pv(&storage, &pv).await;
+        let mut pvc = classless_claim();
+        pvc.spec.storage_class_name = Some("imm".into());
+        let (r, got) = sync_claim(&storage, pvc).await;
+        r.unwrap();
+        assert_eq!(got.spec.volume_name.as_deref(), Some("pv-free"));
+    }
+
+    /// `IsVolumeBoundToClaim` is checked BEFORE the delayBinding skip
+    /// (`pv_helpers.go:263-277`): a PV the scheduler pre-bound (claimRef set)
+    /// is completed by the PV controller even for a delay-binding class.
+    #[tokio::test]
+    async fn delay_binding_claim_binds_prebound_pv() {
+        let storage = Arc::new(MemoryStorage::new());
+        put_class(&storage, "wffc", false, "WaitForFirstConsumer").await;
+        let mut pv = make_prebound_pv("pv-pre", "c", "u");
+        pv.spec.storage_class_name = Some("wffc".into());
+        put_pv(&storage, &pv).await;
+        let mut pvc = classless_claim();
+        pvc.spec.storage_class_name = Some("wffc".into());
+        let (r, got) = sync_claim(&storage, pvc).await;
+        r.unwrap();
+        assert_eq!(got.spec.volume_name.as_deref(), Some("pv-pre"));
+    }
+
     /// An Immediate class with no volume is provisioned by the dynamic
     /// provisioner (provisionClaim, :366-374): no event from this branch.
     #[tokio::test]
