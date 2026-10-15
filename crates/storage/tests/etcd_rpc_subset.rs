@@ -361,6 +361,84 @@ async fn exercise_watch_create_vs_update(storage: &EtcdStorage, backend: &str) {
     );
 }
 
+/// `Storage::stats` on a backend that has never read the key itself: the size
+/// estimator must be fed by the watch loop alone, like upstream's
+/// `storage/etcd3/watcher.go` (`UpdateKey` on PUT, `DeleteKey` on DELETE).
+///
+/// A second client does the writes, so the observing `storage` learns about
+/// the object only through its watch stream. Estimates the object size > 0
+/// after the PUT and back to 0 after the DELETE (#3094, follow-up to #2991).
+///
+/// etcd only: `stats` is a keys-only range read (`getKeys` in stats.go) and
+/// kine answers `keysOnly is not implemented by kine`.
+async fn exercise_stats_fed_by_watch(observer: &EtcdStorage, writer: &EtcdStorage, backend: &str) {
+    use futures::StreamExt;
+
+    let prefix = "/registry/configmaps/statswatch/";
+    let key = "/registry/configmaps/statswatch/s1";
+
+    let mut stream = observer
+        .watch(prefix)
+        .await
+        .unwrap_or_else(|e| panic!("[{backend}] watch failed: {e}"));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Nothing observed yet.
+    let before = observer
+        .stats(prefix)
+        .await
+        .unwrap_or_else(|e| panic!("[{backend}] stats failed: {e}"));
+    assert_eq!(before.object_count, 0, "[{backend}] {before:?}");
+    assert_eq!(
+        before.estimated_average_object_size_bytes, 0,
+        "[{backend}] {before:?}"
+    );
+
+    writer
+        .create(key, &json!({"data": {"k": "some payload"}}))
+        .await
+        .unwrap_or_else(|e| panic!("[{backend}] writer create failed: {e}"));
+    let put_event = tokio::time::timeout(Duration::from_secs(15), stream.next())
+        .await
+        .unwrap_or_else(|_| panic!("[{backend}] timed out waiting for the PUT event"));
+    assert!(
+        matches!(put_event, Some(Ok(WatchEvent::Added(..)))),
+        "[{backend}] expected ADDED, got {put_event:?}"
+    );
+
+    let after_put = observer
+        .stats(prefix)
+        .await
+        .unwrap_or_else(|e| panic!("[{backend}] stats failed: {e}"));
+    assert_eq!(after_put.object_count, 1, "[{backend}] {after_put:?}");
+    assert!(
+        after_put.estimated_average_object_size_bytes > 0,
+        "[{backend}] the watch PUT must feed the estimator, got {after_put:?}"
+    );
+
+    writer
+        .delete(key)
+        .await
+        .unwrap_or_else(|e| panic!("[{backend}] writer delete failed: {e}"));
+    let del_event = tokio::time::timeout(Duration::from_secs(15), stream.next())
+        .await
+        .unwrap_or_else(|_| panic!("[{backend}] timed out waiting for the DELETE event"));
+    assert!(
+        matches!(del_event, Some(Ok(WatchEvent::Deleted(..)))),
+        "[{backend}] expected DELETED, got {del_event:?}"
+    );
+
+    let after_delete = observer
+        .stats(prefix)
+        .await
+        .unwrap_or_else(|e| panic!("[{backend}] stats failed: {e}"));
+    assert_eq!(after_delete.object_count, 0, "[{backend}] {after_delete:?}");
+    assert_eq!(
+        after_delete.estimated_average_object_size_bytes, 0,
+        "[{backend}] the watch DELETE must drop the key, got {after_delete:?}"
+    );
+}
+
 const PAGE_SIZE: usize = 3;
 
 #[tokio::test]
@@ -373,6 +451,8 @@ async fn etcd_backend_speaks_the_upstream_rpc_subset_on_etcd() {
     exercise_storage_surface(&storage, "etcd").await;
     exercise_list_paging(&storage, "etcd", PAGE_SIZE).await;
     exercise_watch_create_vs_update(&storage, "etcd").await;
+    let writer = connect(&container, PAGE_SIZE as i64).await;
+    exercise_stats_fed_by_watch(&storage, &writer, "etcd").await;
 }
 
 #[tokio::test]
