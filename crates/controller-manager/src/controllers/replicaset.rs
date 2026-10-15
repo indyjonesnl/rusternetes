@@ -927,11 +927,6 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
             rusternetes_common::tolerations::add_default_tolerations(spec);
         }
 
-        // Check ResourceQuota before creating pod
-        super::check_resource_quota(&*self.storage, namespace)
-            .await
-            .map_err(|e| rusternetes_common::Error::Forbidden(e.to_string()))?;
-
         let key = build_key("pods", Some(namespace), &pod_name);
         self.storage.create(&key, &pod).await?;
 
@@ -1076,6 +1071,65 @@ mod tests {
             .map(|cs| cs.iter().any(|c| c.condition_type == "ReplicaFailure"))
             .unwrap_or(false);
         assert!(!has_rf, "ReplicaFailure must clear once creates succeed");
+    }
+
+    /// `[sig-apps] ReplicaSet should surface a failure condition on a common
+    /// issue like exceeded quota`: the rejection is the api-server's quota
+    /// admission 403, not a client-side pre-check (#3618; upstream
+    /// `manageReplicas` -> `calculateStatus` records the create error as
+    /// `ReplicaFailure`). The controller must issue the create and surface
+    /// the Forbidden it gets back, then clear the condition once it clears.
+    #[tokio::test]
+    async fn test_rs_replica_failure_from_apiserver_quota_forbidden() {
+        let storage =
+            Arc::new(crate::controllers::quota_admission_double::QuotaAdmissionStorage::new());
+        let controller = ReplicaSetController::new(storage.clone(), 10);
+        let labels = make_labels(&[("app", "q")]);
+        let rs = make_replicaset("q-rs", labels, 2);
+        let rs_key = build_key("replicasets", Some("default"), "q-rs");
+        storage.create(&rs_key, &rs).await.unwrap();
+        let quota = serde_json::json!({
+            "apiVersion": "v1", "kind": "ResourceQuota",
+            "metadata": {"name": "pq", "namespace": "default", "uid": "q-uid"},
+            "spec": {"hard": {"pods": "0"}}
+        });
+        let quota_key = "/registry/resourcequotas/default/pq";
+        storage.create(quota_key, &quota).await.unwrap();
+
+        controller.reconcile_all().await.unwrap();
+
+        assert!(
+            storage
+                .denied_creates
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0,
+            "the controller must reach the api-server and be denied there"
+        );
+        let after: ReplicaSet = storage.get(&rs_key).await.unwrap();
+        let cond = after
+            .status
+            .as_ref()
+            .and_then(|s| s.conditions.as_ref())
+            .and_then(|cs| cs.iter().find(|c| c.condition_type == "ReplicaFailure"))
+            .expect("ReplicaFailure must be set from the api-server's Forbidden");
+        assert_eq!(cond.reason.as_deref(), Some("FailedCreate"));
+        assert!(cond
+            .message
+            .as_deref()
+            .unwrap_or("")
+            .contains("exceeded quota"));
+
+        storage.delete(quota_key).await.unwrap();
+        controller.reconcile_all().await.unwrap();
+        let after: ReplicaSet = storage.get(&rs_key).await.unwrap();
+        assert!(
+            !after
+                .status
+                .as_ref()
+                .and_then(|s| s.conditions.as_ref())
+                .is_some_and(|cs| cs.iter().any(|c| c.condition_type == "ReplicaFailure")),
+            "ReplicaFailure must clear once creates succeed"
+        );
     }
 
     #[tokio::test]

@@ -872,11 +872,6 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
             }
         }
 
-        // Check ResourceQuota before creating pod
-        super::check_resource_quota(&*self.storage, namespace)
-            .await
-            .map_err(|e| rusternetes_common::Error::Forbidden(e.to_string()))?;
-
         // Retry a name collision under a freshly generated name, as upstream's
         // api-server does for `generateName` objects
         // (registry/generic/registry/store.go:463-470). Our controllers write
@@ -1629,7 +1624,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_rc_sets_replica_failure_on_quota_exceeded() {
-        let storage = Arc::new(MemoryStorage::new());
+        // The api-server's quota admission denies the create; the controller has
+        // no client-side quota check (#3618).
+        let storage =
+            Arc::new(crate::controllers::quota_admission_double::QuotaAdmissionStorage::new());
         let controller = ReplicationControllerController::new(storage.clone(), 5);
 
         let mut selector = HashMap::new();
@@ -1672,6 +1670,14 @@ mod tests {
             0,
             "No pods should be created when quota is exceeded"
         );
+        assert!(
+            storage
+                .denied_creates
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0,
+            "the controller must reach the api-server and be denied there, \
+             not pre-check quota client-side"
+        );
 
         // Verify the RC has a ReplicaFailure condition
         let updated_rc: ReplicationController = storage
@@ -1699,7 +1705,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_rc_clears_replica_failure_when_pods_created_successfully() {
-        let storage = Arc::new(MemoryStorage::new());
+        // The api-server's quota admission denies the create; the controller has
+        // no client-side quota check (#3618).
+        let storage =
+            Arc::new(crate::controllers::quota_admission_double::QuotaAdmissionStorage::new());
         let controller = ReplicationControllerController::new(storage.clone(), 5);
 
         let mut selector = HashMap::new();
