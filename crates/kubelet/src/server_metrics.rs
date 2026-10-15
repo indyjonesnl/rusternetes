@@ -16,12 +16,14 @@ use std::time::Instant;
 const KUBELET_SUBSYSTEM: &str = "kubelet";
 
 /// `VolumeStatCalDuration` (`metrics.go:69-79`): `Buckets: metrics.DefBuckets`
-/// is `prometheus.DefBuckets`, the crate's default buckets.
+/// is `prometheus.DefBuckets`, the crate's default buckets. The metric is
+/// `StabilityLevel: metrics.ALPHA` (`metrics.go:75`), so component-base
+/// prefixes the served help with `[ALPHA] ` (`component-base/metrics/opts.go:193-198`).
 static VOLUME_STAT_CAL_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
     HistogramVec::new(
         HistogramOpts::new(
             format!("{KUBELET_SUBSYSTEM}_volume_metric_collection_duration_seconds"),
-            "Duration in seconds to calculate volume stats",
+            "[ALPHA] Duration in seconds to calculate volume stats",
         ),
         &["metric_source"],
     )
@@ -58,7 +60,7 @@ mod tests {
     fn collected_duration_is_served_by_kubelet_metrics() {
         collect_volume_stat_cal_duration("unit_test_src", Instant::now());
         let body = rusternetes_common::observability::MetricsRegistry::new().gather();
-        assert!(body.contains("# HELP kubelet_volume_metric_collection_duration_seconds Duration in seconds to calculate volume stats"));
+        assert!(body.contains("# HELP kubelet_volume_metric_collection_duration_seconds [ALPHA] Duration in seconds to calculate volume stats"));
         assert!(body.contains(
             "kubelet_volume_metric_collection_duration_seconds_count{metric_source=\"unit_test_src\"} 1"
         ));
