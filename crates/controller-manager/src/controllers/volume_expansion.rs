@@ -25,19 +25,32 @@ const VOLUME_RESIZER_KEY: &str = "volume.kubernetes.io/storage-resizer";
 /// (`staging/src/k8s.io/csi-translation-lib/translate.go:146-153`): the first
 /// `inTreePlugins` entry whose `CanSupport(pv)` holds, i.e. the plugin whose
 /// source the PV carries (`gce_pd.go` `CanSupport`: `GCEPersistentDisk != nil`;
-/// `aws_ebs.go`: `AWSElasticBlockStore != nil`). Rusternetes' PV spec only has
-/// those two translatable sources; azureDisk/azureFile/cinder/vsphere/portworx
-/// have no field to carry (tracked separately).
+/// `aws_ebs.go`: `AWSElasticBlockStore != nil`; `openstack_cinder.go:162`:
+/// `Cinder`; `azure_disk.go:235`: `AzureDisk`; `azure_file.go:235`: `AzureFile`;
+/// `vsphere_volume.go:204`: `VsphereVolume`; `portworx.go:189`:
+/// `PortworxVolume`). A PV carries one source, so the map-iteration order of
+/// `inTreePlugins` (`translate.go:30-42`) is immaterial.
 fn in_tree_plugin_name_from_pv(pv: &PersistentVolume) -> Option<&'static str> {
-    if pv.spec.gce_persistent_disk.is_some() {
+    let s = &pv.spec;
+    let m = &s.more_sources;
+    if s.gce_persistent_disk.is_some() {
         Some("kubernetes.io/gce-pd")
-    } else if pv.spec.aws_elastic_block_store.is_some() {
+    } else if s.aws_elastic_block_store.is_some() {
         Some("kubernetes.io/aws-ebs")
+    } else if m.cinder.is_some() {
+        Some("kubernetes.io/cinder")
+    } else if m.azure_disk.is_some() {
+        Some("kubernetes.io/azure-disk")
+    } else if m.azure_file.is_some() {
+        Some("kubernetes.io/azure-file")
+    } else if m.vsphere_volume.is_some() {
+        Some("kubernetes.io/vsphere-volume")
+    } else if m.portworx_volume.is_some() {
+        Some("kubernetes.io/portworx-volume")
     } else {
         None
     }
 }
-
 pub struct VolumeExpansionController<S: Storage> {
     storage: Arc<S>,
     /// `expc.recorder` (expand_controller.go).
@@ -579,6 +592,19 @@ mod tests {
             "kubernetes.io/gce-pd" => {
                 spec["gcePersistentDisk"] = serde_json::json!({"pdName": "d"})
             }
+            "kubernetes.io/azure-disk" => {
+                spec["azureDisk"] = serde_json::json!({"diskName": "d", "diskURI": "u"})
+            }
+            "kubernetes.io/azure-file" => {
+                spec["azureFile"] = serde_json::json!({"secretName": "s", "shareName": "n"})
+            }
+            "kubernetes.io/cinder" => spec["cinder"] = serde_json::json!({"volumeID": "v"}),
+            "kubernetes.io/vsphere-volume" => {
+                spec["vsphereVolume"] = serde_json::json!({"volumePath": "[ds] vol.vmdk"})
+            }
+            "kubernetes.io/portworx-volume" => {
+                spec["portworxVolume"] = serde_json::json!({"volumeID": "v"})
+            }
             _ => unreachable!(),
         }
         serde_json::from_value(serde_json::json!({
@@ -602,6 +628,11 @@ mod tests {
         for (plugin, driver) in [
             ("kubernetes.io/aws-ebs", "ebs.csi.aws.com"),
             ("kubernetes.io/gce-pd", "pd.csi.storage.gke.io"),
+            ("kubernetes.io/azure-disk", "disk.csi.azure.com"),
+            ("kubernetes.io/azure-file", "file.csi.azure.com"),
+            ("kubernetes.io/cinder", "cinder.csi.openstack.org"),
+            ("kubernetes.io/vsphere-volume", "csi.vsphere.vmware.com"),
+            ("kubernetes.io/portworx-volume", "pxd.portworx.com"),
         ] {
             let c1 = pvc("good-pvc", "vol-3", "1Gi", "2Gi", "u3");
             let (s, c) = setup(Some(migratable_pv("vol-3", plugin, "u3")), &c1).await;
