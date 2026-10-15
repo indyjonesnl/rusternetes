@@ -1277,21 +1277,89 @@ async fn unmount_device_retries_then_reports_the_last_detach_error() {
         manager: manager.clone(),
         host: plug.host.clone(),
     };
-    // 1ms interval, 5ms timeout: the immediate attempt plus those that fit.
+    // No tick can fire (1h interval) and the timer fires 1ms after the
+    // immediate attempt fails, so `wait.PollImmediate` makes exactly two
+    // attempts: the immediate one and the one its closed channel runs
+    // (`waitForWithContext`, wait.go: `if !open { return ErrWaitTimeout }`).
+    // Neither count depends on how fast this machine is.
     let err = detacher
         .unmount_device_with(
             &dir.to_string_lossy(),
+            std::time::Duration::from_secs(3600),
             std::time::Duration::from_millis(1),
-            std::time::Duration::from_millis(5),
         )
         .await
         .unwrap_err();
     let calls = *manager.calls.lock().unwrap();
-    assert!(calls > 1, "DetachDisk must be retried, got {calls} call(s)");
+    assert_eq!(calls, 2, "DetachDisk must be retried once on timeout");
     assert_eq!(
         err.to_string(),
-        format!("fc: failed to detach disk: /dev/sdb: device is busy ({calls})")
+        "fc: failed to detach disk: /dev/sdb: device is busy (2)"
     );
+}
+
+/// `UnmountDevice`'s `wait.PollImmediate` retries on every tick until
+/// `DetachDisk` succeeds; the timeout (1h here) is never reached, so the count
+/// is exact however slowly the ticks arrive.
+#[tokio::test]
+async fn unmount_device_retries_on_each_tick_until_detach_succeeds() {
+    use crate::volume_plugins::util::mount_interface::testing::MountPoint;
+    struct BusyTwice {
+        calls: Mutex<usize>,
+    }
+    impl DiskManager for BusyTwice {
+        fn make_global_pd_name(&self, _: &FcDisk) -> String {
+            String::new()
+        }
+        fn make_global_vdpd_name(&self, _: &FcDisk) -> String {
+            String::new()
+        }
+        fn attach_disk(&self, _: &FcDiskMounter) -> Result<String> {
+            unreachable!()
+        }
+        fn detach_disk(&self, _: &FcDiskUnmounter, _: &str) -> Result<()> {
+            let mut n = self.calls.lock().unwrap();
+            *n += 1;
+            if *n < 3 {
+                return Err(anyhow!("device is busy ({n})"));
+            }
+            Ok(())
+        }
+        fn detach_block_fc_disk(&self, _: &FcDiskUnmapper, _: &str, _: &str) -> Result<()> {
+            unreachable!()
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let plug = FcPlugin::new(host(tmp.path()));
+    let dir = tmp.path().join("global");
+    std::fs::create_dir_all(&dir).unwrap();
+    let fm = Arc::new(FakeMounter::new());
+    fm.mount_points.lock().unwrap().push(MountPoint {
+        device: "/dev/sdb".into(),
+        path: std::fs::canonicalize(&dir)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+        fstype: "ext4".into(),
+        opts: vec![],
+    });
+    let manager = Arc::new(BusyTwice {
+        calls: Mutex::new(0),
+    });
+    let detacher = FcDetacher {
+        mounter: fm,
+        manager: manager.clone(),
+        host: plug.host.clone(),
+    };
+    detacher
+        .unmount_device_with(
+            &dir.to_string_lossy(),
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_secs(3600),
+        )
+        .await
+        .unwrap();
+    assert_eq!(*manager.calls.lock().unwrap(), 3);
 }
 
 /// `MountDevice` (`attacher.go:102-138`): the global path is created

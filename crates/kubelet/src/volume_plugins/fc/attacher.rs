@@ -212,11 +212,20 @@ impl FcDetacher {
         // E.g. DetachDisk sometimes fails to flush a multipath device with "device is busy" when it was
         // just unmounted.
         // 2 minutes should be enough within 6 minute force detach timeout.
-        // `wait.PollImmediate(10*time.Second, 2*time.Minute, ...)`: one attempt
-        // now, then one per interval until the timeout elapses.
-        let start = tokio::time::Instant::now();
+        // `wait.PollImmediate(10*time.Second, 2*time.Minute, ...)`, as
+        // `poll` + `poller` + `waitForWithContext`
+        // (staging/src/k8s.io/apimachinery/pkg/util/wait/poll.go,
+        // wait.go): one attempt now; only if it fails does `poller` start
+        // its ticker and its timeout timer. Every tick runs one more attempt
+        // (a tick that lands mid-attempt is dropped), and when the timer
+        // fires the closed channel still runs ONE final attempt before
+        // `ErrWaitTimeout`. A failed immediate attempt is therefore always
+        // retried at least once.
         let mut detach_error: Option<anyhow::Error> = None;
         let mut detached = false;
+        let mut timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+        let mut tick: Option<tokio::time::Interval> = None;
+        let mut closed = false;
         loop {
             let (manager, un_mounter, dev) =
                 (self.manager.clone(), un_mounter.clone(), dev_name.clone());
@@ -233,10 +242,27 @@ impl FcDetacher {
                     detach_error = Some(e);
                 }
             }
-            if start.elapsed() + poll_interval > poll_timeout {
+            // `poller`: time.NewTicker(interval), time.NewTimer(timeout),
+            // both started after the immediate attempt.
+            let timer = timer.get_or_insert_with(|| Box::pin(tokio::time::sleep(poll_timeout)));
+            let tick = tick.get_or_insert_with(|| {
+                let mut t = tokio::time::interval_at(
+                    tokio::time::Instant::now() + poll_interval,
+                    poll_interval,
+                );
+                t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                t
+            });
+            if closed {
+                // That was the attempt the closed channel ran
+                // (`if !open { return ErrWaitTimeout }`).
                 break;
             }
-            tokio::time::sleep(poll_interval).await;
+            closed = tokio::select! {
+                _ = tick.tick() => false,
+                // `if timeout != 0`: a zero timeout arms no timer.
+                _ = timer.as_mut(), if !poll_timeout.is_zero() => true,
+            };
         }
         if !detached {
             return Err(anyhow!(
