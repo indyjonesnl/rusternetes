@@ -851,7 +851,7 @@ pub const STORAGE_OBJECT_COUNT_TRACKER_HOOK: &str = "storage-object-count-tracke
 ///   `go c.StorageObjectCountTracker.RunUntil(stop)`.
 ///
 /// Upstream also registers `max-in-flight-filter` (:949-958) when APF is off;
-/// this server has no max-in-flight filter (tracked separately).
+/// this server has no max-in-flight filter (#3664).
 pub fn register_post_start_hooks<S: Storage + 'static>(
     registry: &crate::post_start_hooks::PostStartHooks,
     engine: Arc<FlowControlEngine<S>>,
@@ -866,9 +866,26 @@ pub fn register_post_start_hooks<S: Storage + 'static>(
     spawn_starting_hook_with(registry, APF_FILTER_HOOK, || {
         apiserver_request_metrics::start_watermark_maintenance();
     });
-    spawn_starting_hook_with(registry, STORAGE_OBJECT_COUNT_TRACKER_HOOK, move || {
-        tokio::spawn(async move { tracker.run_until(stop).await });
-    });
+    register_storage_object_count_tracker_hook(registry, tracker, stop);
+}
+
+/// `storage-object-count-tracker-hook` (server/config.go:961-970). Upstream
+/// registers it whenever `c.StorageObjectCountTracker != nil`, which
+/// `NewConfig` always sets (config.go:472), independent of APF vs
+/// max-in-flight -- so callers register it with APF off too
+/// (server/config_test.go lists it beside `max-in-flight-filter`).
+pub fn register_storage_object_count_tracker_hook(
+    registry: &crate::post_start_hooks::PostStartHooks,
+    tracker: Arc<ObjectCountTracker>,
+    stop: tokio::sync::watch::Receiver<bool>,
+) {
+    crate::post_start_hooks::spawn_starting_hook_with(
+        registry,
+        STORAGE_OBJECT_COUNT_TRACKER_HOOK,
+        move || {
+            tokio::spawn(async move { tracker.run_until(stop).await });
+        },
+    );
 }
 
 #[cfg(test)]
@@ -1929,6 +1946,24 @@ mod tests {
         assert!(
             wait_for(move || e.concurrency_limit("evented").is_none()).await,
             "PL delete event must reach the engine"
+        );
+    }
+
+    // The tracker hook does not depend on APF (config.go:961-970, NewConfig
+    // always sets the tracker at config.go:472).
+    #[tokio::test]
+    async fn tracker_hook_registers_standalone_without_apf() {
+        let registry = crate::post_start_hooks::PostStartHooks::new();
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        register_storage_object_count_tracker_hook(
+            &registry,
+            Arc::new(ObjectCountTracker::new()),
+            stop_rx,
+        );
+        let names: Vec<String> = registry.checks().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(
+            names,
+            vec!["poststarthook/storage-object-count-tracker-hook"]
         );
     }
 

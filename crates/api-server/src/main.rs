@@ -507,6 +507,16 @@ async fn main() -> Result<()> {
         ));
         flow_control_filter::install_flow_control(apf);
         info!("API Priority and Fairness enabled");
+    } else {
+        // `storage-object-count-tracker-hook` is registered whenever the
+        // tracker exists (server/config.go:961-970), APF or not.
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        std::mem::forget(stop_tx);
+        flow_control_filter::register_storage_object_count_tracker_hook(
+            post_start_hooks::global(),
+            Arc::new(flow_control_object_count::ObjectCountTracker::new()),
+            stop_rx,
+        );
     }
 
     // Create shared state with CA certificate and Prometheus client
