@@ -1343,3 +1343,71 @@ mod exec_query_bool_tests {
         assert_eq!(q.command, vec!["sh".to_string()]);
     }
 }
+
+#[cfg(test)]
+mod connect_admission_step_metrics_tests {
+    use super::*;
+    use rusternetes_common::auth::TokenManager;
+    use rusternetes_common::authz::AlwaysAllowAuthorizer;
+    use rusternetes_common::observability::MetricsRegistry;
+    use rusternetes_storage::{MemoryStorage, StorageBackend};
+
+    fn step(ty: &str) -> u64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|f| f.name() == "apiserver_admission_step_admission_duration_seconds")
+            .and_then(|mf| {
+                mf.get_metric()
+                    .iter()
+                    .find(|m| {
+                        [
+                            ("type", ty),
+                            ("operation", "CONNECT"),
+                            ("rejected", "false"),
+                        ]
+                        .iter()
+                        .all(|(k, v)| {
+                            m.get_label()
+                                .iter()
+                                .any(|l| l.name() == *k && l.value() == *v)
+                        })
+                    })
+                    .map(|m| m.get_histogram().get_sample_count())
+            })
+            .unwrap_or(0)
+    }
+
+    /// `WithStepMetrics` wraps the whole chain
+    /// (server/options/admission.go:179) and ConnectResource admits through
+    /// it (endpoints/handlers/rest.go:199-216), so a connect request is one
+    /// `admit` and one `validate` observation (#3523).
+    #[tokio::test]
+    async fn connect_admission_observes_admit_and_validate_steps() {
+        let state = ApiServerState::new(
+            Arc::new(StorageBackend::Memory(Arc::new(MemoryStorage::new()))),
+            Arc::new(TokenManager::new(b"secret")),
+            Arc::new(AlwaysAllowAuthorizer),
+            Arc::new(MetricsRegistry::new()),
+            true,
+        );
+        let user = rusternetes_common::admission::UserInfo {
+            username: "u".into(),
+            uid: String::new(),
+            groups: vec![],
+        };
+        let (admit0, validate0) = (step("admit"), step("validate"));
+        run_connect_admission(
+            &state,
+            "PodExecOptions",
+            "pods/exec",
+            "default",
+            "p",
+            serde_json::json!({"kind": "PodExecOptions"}),
+            &user,
+        )
+        .await
+        .unwrap();
+        assert!(step("admit") > admit0, "admit step not observed");
+        assert!(step("validate") > validate0, "validate step not observed");
+    }
+}
