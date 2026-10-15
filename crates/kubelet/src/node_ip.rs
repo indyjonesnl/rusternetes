@@ -342,6 +342,70 @@ pub fn get_node_host_ips(
     Ok(node_ips)
 }
 
+/// The host-IP block of `generateAPIPodStatus`
+/// (pkg/kubelet/kubelet_pods.go:2005-2040), applied to `s` once
+/// `getHostIPsAnyWay` succeeded with `host_ips`. Returns the
+/// `HostIPsIPFamilyMismatch` event message when upstream would record one.
+pub fn apply_host_ips(
+    host_network: bool,
+    s: &mut rusternetes_common::resources::pod::PodStatus,
+    host_ips: &[IpAddr],
+) -> Option<String> {
+    use rusternetes_common::resources::pod::{HostIP, PodIP};
+    // utilnet.IPFamilyOfString: "4" / "6", or "" when unparseable.
+    let family_of_str = |ip: &str| match parse_ip_sloppy(ip) {
+        Some(ip) if ip.is_ipv4() => "4",
+        Some(_) => "6",
+        None => "",
+    };
+    let family = |ip: &IpAddr| if ip.is_ipv4() { "4" } else { "6" };
+    let primary = *host_ips.first()?;
+    let mut mismatch = None;
+    if let Some(old) = s.host_ip.as_deref().filter(|h| !h.is_empty()) {
+        if family_of_str(old) != family(&primary) {
+            mismatch = Some(format!(
+                "Kubelet detected an IPv{} node IP ({}), but the cloud provider selected an IPv{} node IP ({}); pass an explicit `--node-ip` to kubelet to fix this.",
+                family_of_str(old),
+                old,
+                family(&primary),
+                primary
+            ));
+        }
+    }
+    s.host_ip = Some(primary.to_string());
+    let mut hips = vec![HostIP {
+        ip: primary.to_string(),
+    }];
+    if host_ips.len() == 2 {
+        hips.push(HostIP {
+            ip: host_ips[1].to_string(),
+        });
+    }
+    s.host_i_ps = Some(hips);
+
+    // HostNetwork Pods inherit the node IPs as PodIPs. They are immutable once
+    // set, other than that if the node becomes dual-stack, we add the secondary IP.
+    if host_network {
+        if s.pod_ip.as_deref().unwrap_or("").is_empty() {
+            s.pod_ip = Some(primary.to_string());
+            s.pod_i_ps = Some(vec![PodIP {
+                ip: primary.to_string(),
+            }]);
+        }
+        // Secondary IP is not set #105320
+        if host_ips.len() == 2 {
+            if let Some(pod_ips) = s.pod_i_ps.as_mut().filter(|p| p.len() == 1) {
+                if family_of_str(&pod_ips[0].ip) != family(&host_ips[1]) {
+                    pod_ips.push(PodIP {
+                        ip: host_ips[1].to_string(),
+                    });
+                }
+            }
+        }
+    }
+    mismatch
+}
+
 /// The setter without an external cloud provider, on a scratch node named
 /// `hostname`; returns `(type, address)` pairs.
 #[cfg(test)]
@@ -976,5 +1040,97 @@ mod tests {
         .unwrap_err();
         assert!(e.starts_with("failed to validate secondaryNodeIP:"), "{e}");
         assert!(addrs_of(&n).is_empty());
+    }
+
+    fn status() -> rusternetes_common::resources::pod::PodStatus {
+        Default::default()
+    }
+
+    fn pod_ips(s: &rusternetes_common::resources::pod::PodStatus) -> Vec<String> {
+        s.pod_i_ps
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| p.ip)
+            .collect()
+    }
+
+    // kubelet_pods_test.go TestGenerateAPIPodStatusHostNetworkPodIPs
+    #[test]
+    fn host_network_pod_ips_inherit_node_ips() {
+        use rusternetes_common::resources::pod::PodIP;
+        // (node host IPs, CRI pod IPs, expected PodIPs)
+        let cases: Vec<(Vec<&str>, Vec<&str>, Vec<&str>)> = vec![
+            (vec!["10.0.0.1"], vec![], vec!["10.0.0.1"]),
+            (
+                vec!["10.0.0.1", "fd01::1234"],
+                vec![],
+                vec!["10.0.0.1", "fd01::1234"],
+            ),
+            // CRI PodIPs override NodeAddresses; the secondary is appended
+            (
+                vec!["10.0.0.1", "fd01::1234"],
+                vec!["192.168.0.1"],
+                vec!["192.168.0.1", "fd01::1234"],
+            ),
+            (
+                vec!["10.0.0.1", "fd01::1234"],
+                vec!["192.168.0.1", "2001:db8::2"],
+                vec!["192.168.0.1", "2001:db8::2"],
+            ),
+        ];
+        for (host, cri, want) in cases {
+            let host: Vec<IpAddr> = host.into_iter().map(ip).collect();
+            let mut s = status();
+            if !cri.is_empty() {
+                s.pod_ip = Some(cri[0].to_string());
+                s.pod_i_ps = Some(cri.iter().map(|i| PodIP { ip: i.to_string() }).collect());
+            }
+            apply_host_ips(true, &mut s, &host);
+            assert_eq!(pod_ips(&s), want, "{host:?} {cri:?}");
+            assert_eq!(s.pod_ip.as_deref(), Some(want[0]));
+            assert_eq!(s.host_ip, Some(host[0].to_string()));
+            assert_eq!(s.host_i_ps.unwrap().len(), host.len());
+        }
+    }
+
+    #[test]
+    fn non_host_network_pod_does_not_inherit_node_ips() {
+        let mut s = status();
+        apply_host_ips(false, &mut s, &[ip("10.0.0.1")]);
+        assert_eq!(s.host_ip.as_deref(), Some("10.0.0.1"));
+        assert!(s.pod_ip.is_none() && s.pod_i_ps.is_none());
+    }
+
+    // pod IPs are immutable once set; only the secondary is added (#105320)
+    #[test]
+    fn host_network_pod_ips_immutable_but_gain_secondary() {
+        use rusternetes_common::resources::pod::PodIP;
+        let mut s = status();
+        s.pod_ip = Some("10.0.0.1".into());
+        s.pod_i_ps = Some(vec![PodIP {
+            ip: "10.0.0.1".into(),
+        }]);
+        apply_host_ips(true, &mut s, &[ip("1.1.1.1")]);
+        assert_eq!(pod_ips(&s), vec!["10.0.0.1"]);
+        apply_host_ips(true, &mut s, &[ip("1.1.1.1"), ip("2001:db8::2")]);
+        assert_eq!(pod_ips(&s), vec!["10.0.0.1", "2001:db8::2"]);
+    }
+
+    // kubelet_pods.go:2011-2017 HostIPsIPFamilyMismatch
+    #[test]
+    fn host_ip_family_mismatch_message() {
+        let mut s = status();
+        s.host_ip = Some("10.0.0.1".into());
+        let msg = apply_host_ips(false, &mut s, &[ip("fd00::1")]).unwrap();
+        assert_eq!(
+            msg,
+            "Kubelet detected an IPv4 node IP (10.0.0.1), but the cloud provider selected an IPv6 node IP (fd00::1); pass an explicit `--node-ip` to kubelet to fix this."
+        );
+        assert_eq!(s.host_ip.as_deref(), Some("fd00::1"));
+        let mut s = status();
+        s.host_ip = Some("10.0.0.1".into());
+        assert!(apply_host_ips(false, &mut s, &[ip("10.0.0.2")]).is_none());
+        assert!(apply_host_ips(false, &mut status(), &[ip("10.0.0.2")]).is_none());
     }
 }
