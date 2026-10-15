@@ -136,6 +136,7 @@ fn compile_errors(obj: &ValidatingAdmissionPolicy, ignore_match_conditions: bool
     let env = MutationEnv {
         has_params: spec.param_kind.is_some(),
         has_patch_types: false,
+        has_authorizer: true,
         variables: None,
     };
     for (i, c) in spec.match_conditions.iter().flatten().enumerate() {
