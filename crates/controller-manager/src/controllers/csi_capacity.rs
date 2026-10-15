@@ -242,6 +242,7 @@ pub async fn lookup_owner<S: Storage>(
     api_version: &str,
     kind: &str,
     levels: i32,
+    _limiter: &rusternetes_client::ratelimit::RateLimiter,
 ) -> Result<OwnerReference> {
     let (mut api_version, mut kind, mut name, mut levels) = (
         api_version.to_string(),
@@ -426,6 +427,34 @@ pub fn capacity_limiter(
     } else {
         RateLimiter::unlimited()
     })
+}
+
+/// STUB (red commit): replaced by the coalescing queue in the next commit.
+#[allow(dead_code)]
+#[derive(Default)]
+pub struct TopologyQueue {
+    pending: std::sync::atomic::AtomicUsize,
+    notify: tokio::sync::Notify,
+}
+
+#[allow(dead_code)]
+impl TopologyQueue {
+    pub fn add(&self) {
+        self.pending
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.notify.notify_one();
+    }
+    pub async fn get(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        loop {
+            let n = self.pending.load(SeqCst);
+            if n > 0 {
+                self.pending.store(n - 1, SeqCst);
+                return;
+            }
+            self.notify.notified().await;
+        }
+    }
 }
 
 /// `WorkItem` (capacity.go:105-108) with the StorageClass resolved.
@@ -1280,6 +1309,7 @@ mod tests {
         NodeSelectorRequirement, StorageClass, VolumeBindingMode,
     };
     use rusternetes_common::types::{ObjectMeta, TypeMeta};
+    use rusternetes_client::ratelimit::RateLimiter;
     use rusternetes_storage::build_key;
     use rusternetes_storage::memory::MemoryStorage;
     use std::collections::HashSet;
@@ -1430,11 +1460,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queue_deduplicates() {
+    async fn queue_does_not_deduplicate_fresh_adds() {
+        // capacity.go:115-120: `QueueKey` holds pointers and every
+        // `queue.Add(QueueKey{item: &item})` uses a fresh one, so the workqueue
+        // keeps both entries.
         let (_s, _c, r) = refresh_fixture(&[&[("layer0", "foo")]]).await;
         r.refresh_sc("direct-sc");
         r.refresh_sc("direct-sc");
-        assert_eq!(queued_strings(&r).len(), 1);
+        assert_eq!(queued_strings(&r).len(), 2);
     }
 
     #[tokio::test]
@@ -2019,14 +2052,89 @@ mod tests {
         )
         .await
         .unwrap();
-        let o0 = lookup_owner(&st, NS, "p", "v1", "Pod", 0).await.unwrap();
+        let ul = RateLimiter::unlimited();
+        let o0 = lookup_owner(&st, NS, "p", "v1", "Pod", 0, &ul)
+            .await
+            .unwrap();
         assert_eq!((o0.kind.as_str(), o0.uid.as_str()), ("Pod", "pu"));
-        let o1 = lookup_owner(&st, NS, "p", "v1", "Pod", 1).await.unwrap();
+        let o1 = lookup_owner(&st, NS, "p", "v1", "Pod", 1, &ul)
+            .await
+            .unwrap();
         assert_eq!((o1.kind.as_str(), o1.uid.as_str()), ("ReplicaSet", "rsu"));
-        let o2 = lookup_owner(&st, NS, "p", "v1", "Pod", 2).await.unwrap();
+        let o2 = lookup_owner(&st, NS, "p", "v1", "Pod", 2, &ul)
+            .await
+            .unwrap();
         assert_eq!((o2.kind.as_str(), o2.uid.as_str()), ("Deployment", "du"));
         assert_eq!(o2.controller, Some(true));
-        assert!(lookup_owner(&st, NS, "p", "v1", "Pod", 3).await.is_err());
+        assert!(lookup_owner(&st, NS, "p", "v1", "Pod", 3, &ul)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lookup_owner_gets_go_through_the_capacity_rate_limiter() {
+        // csi-provisioner.go:456-474: `config.QPS/Burst` are set to the capacity
+        // values BEFORE `owner.Lookup(config, ...)`, which builds its own client
+        // (pkg/owner/owner.go:37-44) with a token bucket of QPS 1 / burst 1
+        // here: the 2nd GET of a two-level walk waits 1s.
+        use serde_json::json;
+        let st = MemoryStorage::new();
+        st.create(
+            &build_key("pods", Some(NS), "p"),
+            &json!({"metadata":{"name":"p","uid":"pu","ownerReferences":[
+                {"apiVersion":"apps/v1","kind":"ReplicaSet","name":"rs","uid":"rsu","controller":true}]}}),
+        )
+        .await
+        .unwrap();
+        st.create(
+            &build_key("replicasets", Some(NS), "rs"),
+            &json!({"metadata":{"name":"rs","uid":"rsu","ownerReferences":[
+                {"apiVersion":"apps/v1","kind":"Deployment","name":"d","uid":"du","controller":true}]}}),
+        )
+        .await
+        .unwrap();
+        let l = RateLimiter::new(1.0, 1.0);
+        let start = tokio::time::Instant::now();
+        lookup_owner(&st, NS, "p", "v1", "Pod", 2, &l)
+            .await
+            .unwrap();
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn topology_queue_coalesces_a_burst_into_one_sync() {
+        // nodes.go:63-150 handlers only `queue.Add("")`; RunWorker (:226-243)
+        // syncs once per Get, so n adds before the worker runs are one sync.
+        let q = TopologyQueue::default();
+        for _ in 0..1000 {
+            q.add();
+        }
+        tokio::time::timeout(Duration::from_millis(100), q.get())
+            .await
+            .expect("one pending sync");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), q.get())
+                .await
+                .is_err(),
+            "the burst must have been coalesced into a single sync"
+        );
+    }
+
+    #[tokio::test]
+    async fn topology_queue_add_while_syncing_queues_one_more_sync() {
+        // workqueue Add during processing marks the item dirty; Done queues it
+        // again exactly once.
+        let q = TopologyQueue::default();
+        q.add();
+        q.get().await;
+        q.add();
+        q.add();
+        tokio::time::timeout(Duration::from_millis(100), q.get())
+            .await
+            .expect("one re-queued sync");
+        assert!(tokio::time::timeout(Duration::from_millis(100), q.get())
+            .await
+            .is_err());
     }
 
     #[test]
