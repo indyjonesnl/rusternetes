@@ -299,6 +299,17 @@ async fn open_watch_stream(
     prefix: &str,
     requested_rv: Option<&str>,
 ) -> Result<std::result::Result<rusternetes_storage::WatchStream, Response>> {
+    // `cacher.Watch` (storage/cacher/cacher.go:513-516) and `etcd3.store.Watch`
+    // (storage/etcd3/store.go:967-970) return `ParseResourceVersion`'s
+    // `InvalidError` untouched, and `Store.WatchPredicate` passes it on
+    // (registry/generic/registry/store.go:1459-1462). Nothing in release-1.35
+    // calls `storage/errors.InterpretWatchError`, so the endpoint renders a
+    // plain error: a 500 with no reason (`Error::aggregate`), as `Get` does.
+    if let Some(rv) = requested_rv {
+        if let Err(errs) = crate::registry::generic::store::parse_resource_version_str(rv) {
+            return Err(Error::aggregate(&errs));
+        }
+    }
     let current_rev = state.storage.current_revision().await.unwrap_or(1);
     let replay_revision = requested_rv
         .filter(|rv| !rv.is_empty() && *rv != "0" && *rv != "1")

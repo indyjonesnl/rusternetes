@@ -246,8 +246,7 @@ impl<T: Object> Patcher<'_, T> {
     ) -> Result<T> {
         let current_json =
             serde_json::to_value(current).map_err(|e| Error::Internal(e.to_string()))?;
-        let patch: serde_json::Value = serde_json::from_slice(self.body)
-            .map_err(|e| Error::BadRequest(format!("error decoding patch: {e}")))?;
+        let patch = decode_patch_document(self.params, patch_type, self.body)?;
         // The patch was written against the served version, so it applies
         // there and the result goes back to the stored one (patch.go:323-338,
         // :449-462).
@@ -461,9 +460,53 @@ fn patch_error(e: crate::patch::PatchError, patch_type: &PatchType) -> Error {
     use crate::patch::PatchError;
     match (patch_type, e) {
         (PatchType::JsonPatch, PatchError::DecodeFailed(msg)) => Error::BadRequest(msg),
+        // patch.go:405-411, :408 `NewRequestEntityTooLargeError`.
+        (_, PatchError::RequestEntityTooLarge(msg)) => {
+            Error::Status(Box::new(rusternetes_common::types::Status::failure(
+                format!("Request entity too large: {msg}"),
+                "RequestEntityTooLarge",
+                413,
+            )))
+        }
         (PatchType::JsonPatch, other) => {
             Error::generic_server_response(422, "", "", "", "", &other.to_string(), 0, false)
         }
+        // `interpretStrategicMergePatchError` (patch.go:797-806) and the merge
+        // patch's `ErrBadJSONPatch` (:428-430): NewBadRequest.
+        (_, PatchError::BadRequest(msg)) => Error::BadRequest(msg),
+        // Its default arm: the error goes on raw, a 500 with no reason.
+        (_, PatchError::Uninterpreted(msg)) => Error::unknown_error(msg),
         (_, other) => Error::InvalidResource(other.to_string()),
     }
+}
+
+/// Decode the patch document into a value, as each patcher does before it
+/// applies it.
+///
+/// * JSON patch: `jsonpatch.DecodePatch` failing is `NewBadRequest(err.Error())`
+///   (patch.go:404-407); with a strict `fieldValidation` the document is
+///   first decoded by `kjson.UnmarshalStrict`, whose failure is
+///   `NewBadRequest("error decoding patch: %v")` (:393-396).
+/// * Merge patch: the strict decode has the same `error decoding patch: %v`
+///   (:421-427); otherwise a document that is not JSON is
+///   `jsonpatch.ErrBadJSONPatch`, `NewBadRequest` (:428-430), "Invalid JSON
+///   Patch".
+/// * Strategic merge patch: `strategicPatchObject` returns
+///   `NewBadRequest(err.Error())` for both decoders (:561-570).
+fn decode_patch_document(
+    params: &HashMap<String, String>,
+    patch_type: &PatchType,
+    body: &[u8],
+) -> Result<serde_json::Value> {
+    use crate::handlers::validation::FieldValidationMode;
+    let strict = !matches!(
+        FieldValidationMode::from_query(params),
+        FieldValidationMode::Ignore
+    );
+    serde_json::from_slice(body).map_err(|e| match patch_type {
+        PatchType::StrategicMergePatch => Error::BadRequest(e.to_string()),
+        PatchType::JsonMergePatch if !strict => Error::BadRequest("Invalid JSON Patch".to_string()),
+        _ if !strict => Error::BadRequest(e.to_string()),
+        _ => Error::BadRequest(format!("error decoding patch: {e}")),
+    })
 }

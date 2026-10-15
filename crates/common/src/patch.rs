@@ -71,6 +71,27 @@ pub enum PatchError {
     #[error("Patch operation failed: {0}")]
     OperationFailed(String),
 
+    /// More than `maxJSONPatchOperations` operations: `applyJSPatch`'s
+    /// `errors.NewRequestEntityTooLargeError(...)` (patch.go:407-411). Carries
+    /// the message it wraps.
+    #[error("{0}")]
+    RequestEntityTooLarge(String),
+
+    /// An error upstream's patch code returns as `errors.NewBadRequest(
+    /// err.Error())`: the strategic-merge sentinels
+    /// `ErrBadPatchFormatForRetainKeys` & co. (`interpretStrategicMergePatchError`,
+    /// patch.go:797-801) and a merge patch's `jsonpatch.ErrBadJSONPatch`
+    /// (patch.go:428-430).
+    #[error("{0}")]
+    BadRequest(String),
+
+    /// An error upstream returns as a plain `error` (`fmt.Errorf`,
+    /// `mergepatch.ErrNoMergeKey`, `ErrBadArgType`, ...): the default arm of
+    /// `interpretStrategicMergePatchError` (patch.go:805-806) passes it on, and
+    /// `ErrorToAPIStatus` renders it as a 500 with no reason.
+    #[error("{0}")]
+    Uninterpreted(String),
+
     /// JSON-Patch targeted a path that does not exist on the object.
     ///
     /// Carries the resolved dotted field path (e.g. `spec.doesNotExist`) so
@@ -143,7 +164,15 @@ pub fn apply_patch(
     patch_type: PatchType,
 ) -> Result<Value, PatchError> {
     match patch_type {
-        PatchType::JsonMergePatch => apply_merge_patch(original, patch),
+        PatchType::JsonMergePatch => {
+            // `jsonpatch.MergePatch` (json-patch v4 merge.go:127-133, :144-149):
+            // a patch that is `null` or neither an object nor an array is
+            // `ErrBadJSONPatch`, which patch.go:428-430 makes a BadRequest.
+            if !(patch.is_object() || patch.is_array()) {
+                return Err(PatchError::BadRequest("Invalid JSON Patch".to_string()));
+            }
+            apply_merge_patch(original, patch)
+        }
         PatchType::JsonPatch => apply_json_patch(original, patch),
         PatchType::StrategicMergePatch => apply_strategic_merge_patch(original, patch),
     }
@@ -194,10 +223,21 @@ fn apply_merge_patch(original: &Value, patch: &Value) -> Result<Value, PatchErro
     Ok(result)
 }
 
+/// `maxJSONPatchOperations` (apiserver/pkg/endpoints/handlers/patch.go:64).
+pub const MAX_JSON_PATCH_OPERATIONS: usize = 10000;
+
 /// Apply JSON Patch (RFC 6902)
 fn apply_json_patch(original: &Value, patch: &Value) -> Result<Value, PatchError> {
     let operations: Vec<JsonPatchOperation> = serde_json::from_value(patch.clone())
         .map_err(|e| PatchError::DecodeFailed(e.to_string()))?;
+    // patch.go:407-411, after `jsonpatch.DecodePatch` and before `Apply`.
+    if operations.len() > MAX_JSON_PATCH_OPERATIONS {
+        return Err(PatchError::RequestEntityTooLarge(format!(
+            "The allowed maximum operations in a JSON patch is {}, got {}",
+            MAX_JSON_PATCH_OPERATIONS,
+            operations.len()
+        )));
+    }
 
     let mut current = original.clone();
 
@@ -535,13 +575,13 @@ fn apply_strategic_merge_patch(original: &Value, patch: &Value) -> Result<Value,
                 {
                     // Strategic merge for arrays
                     let orig_arr = result_obj[key].as_array().ok_or_else(|| {
-                        PatchError::InvalidPatch(format!(
+                        PatchError::Uninterpreted(format!(
                             "strategic merge: '{}' is not an array",
                             key
                         ))
                     })?;
                     let patch_arr = patch_value.as_array().ok_or_else(|| {
-                        PatchError::InvalidPatch(format!(
+                        PatchError::Uninterpreted(format!(
                             "strategic merge: patch for '{}' is not an array",
                             key
                         ))
@@ -570,7 +610,7 @@ fn apply_strategic_merge_patch(original: &Value, patch: &Value) -> Result<Value,
                     continue;
                 };
                 let to_delete = patch_value.as_array().ok_or_else(|| {
-                    PatchError::InvalidPatch(format!(
+                    PatchError::Uninterpreted(format!(
                         "strategic merge: {key} must be a list of primitives"
                     ))
                 })?;
@@ -593,7 +633,7 @@ fn apply_retain_keys_directive(
     patch: &serde_json::Map<String, Value>,
     retain: &Value,
 ) -> Result<(), PatchError> {
-    let bad = || PatchError::InvalidPatch("invalid patch format of retainKeys".to_string());
+    let bad = || PatchError::BadRequest("invalid patch format of retainKeys".to_string());
     let list = retain.as_array().ok_or_else(bad)?;
     let keys: std::collections::HashSet<&str> = list.iter().filter_map(|v| v.as_str()).collect();
     for (k, v) in patch {
@@ -647,7 +687,7 @@ fn normalize_order(
     id: ItemId,
 ) -> Result<Vec<Value>, PatchError> {
     if merged.iter().any(|v| v.is_object() && id(v).is_none()) {
-        return Err(PatchError::InvalidPatch(
+        return Err(PatchError::Uninterpreted(
             "map in list does not contain the merge key".to_string(),
         ));
     }
@@ -723,7 +763,7 @@ fn validate_patch_with_set_order_list(
         }
         let (a, b) = (id(non_delete[p]), id(&order[o]));
         if is_map_list && (a.is_none() || b.is_none()) {
-            return Err(PatchError::InvalidPatch(
+            return Err(PatchError::Uninterpreted(
                 "map in list does not contain the merge key".to_string(),
             ));
         }
@@ -733,7 +773,7 @@ fn validate_patch_with_set_order_list(
         o += 1;
     }
     if p < non_delete.len() && o >= order.len() {
-        return Err(PatchError::InvalidPatch(format!(
+        return Err(PatchError::Uninterpreted(format!(
             "The order in patch list:\n{patch_list:?}\n doesn't match {SET_ELEMENT_ORDER} list:\n{order:?}\n"
         )));
     }
@@ -769,7 +809,7 @@ fn merge_set_element_order_lists(
             continue;
         };
         let order = order_v.as_array().ok_or_else(|| {
-            PatchError::InvalidPatch(format!("strategic merge: {key} must be a list"))
+            PatchError::Uninterpreted(format!("strategic merge: {key} must be a list"))
         })?;
         let original = match result_obj.get(field) {
             Some(Value::Array(a)) => Some(a.clone()),
