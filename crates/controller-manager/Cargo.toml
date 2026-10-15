@@ -51,6 +51,8 @@ reqwest = { workspace = true }
 rustls = { workspace = true }
 
 [dev-dependencies]
+# Paused-clock tests (CSI capacity rate limiter / worker concurrency).
+tokio = { version = "1", features = ["test-util"] }
 tempfile = "3"
 tokio-stream = { version = "0.1", features = ["net"] }
 serial_test = { workspace = true }

@@ -227,10 +227,22 @@ struct Args {
     #[arg(long, default_value_t = 1, allow_hyphen_values = true)]
     csi_capacity_ownerref_level: i32,
 
-    /// `--capacity-threads` (csi-provisioner.go:88, default 1). Accepted for
-    /// flag parity; the publisher is one level-triggered pass per poll.
+    /// `--capacity-threads` (csi-provisioner.go:88, default 1): workers on the
+    /// CSIStorageCapacity queue (`Controller.Run`, capacity.go:238-253).
     #[arg(long, default_value_t = 1)]
     csi_capacity_threads: u32,
+
+    /// `--kube-api-capacity-qps` (csi-provisioner.go:98, default 1): QPS of the
+    /// dedicated client that writes CSIStorageCapacity objects (:456). Zero
+    /// means client-go's default of 5, a negative value no limit
+    /// (`rest/config.go:370-381`).
+    #[arg(long, default_value_t = 1.0, allow_hyphen_values = true)]
+    csi_kube_api_capacity_qps: f64,
+
+    /// `--kube-api-capacity-burst` (csi-provisioner.go:99, default 5): burst of
+    /// that client (:457). Zero means client-go's default of 10.
+    #[arg(long, default_value_t = 5, allow_hyphen_values = true)]
+    csi_kube_api_capacity_burst: i32,
 
     /// Storage backend: "etcd" or "sqlite"
     #[arg(long, default_value = "etcd")]
@@ -1136,6 +1148,13 @@ async fn main() -> Result<()> {
             // `NewTypedItemExponentialFailureRateLimiter` (:528).
             let retry_start = std::time::Duration::from_secs(1);
             let retry_max = args.csi_retry_interval_max;
+            let threads = args.csi_capacity_threads;
+            // csi-provisioner.go:453-458: "Publishing storage capacity
+            // information uses its own client with separate rate limiting."
+            let capacity_limiter = controllers::csi_capacity::capacity_limiter(
+                args.csi_kube_api_capacity_qps,
+                args.csi_kube_api_capacity_burst,
+            );
             let cap_storage = storage.clone();
             let cap_driver = driver.to_string();
             let cap_socket = socket.to_string();
@@ -1148,6 +1167,7 @@ async fn main() -> Result<()> {
                 let namespace = namespace.clone();
                 let topology = topology.clone();
                 let refresher = capacity_refresher.clone();
+                let limiter = capacity_limiter.clone();
                 async move {
                     let client =
                         rusternetes_csi::controller_client::CsiControllerClient::with_endpoint(
@@ -1162,6 +1182,7 @@ async fn main() -> Result<()> {
                         owner_namespace: namespace,
                         immediate_binding,
                         refresher,
+                        limiter,
                     };
                     controllers::csi_capacity::run_capacity_loop(
                         &ctl,
@@ -1169,6 +1190,7 @@ async fn main() -> Result<()> {
                         poll,
                         retry_start,
                         retry_max,
+                        threads,
                     )
                     .await;
                 }
@@ -1754,6 +1776,9 @@ mod csi_capacity_flag_tests {
         assert_eq!(args.csi_capacity_poll_interval, Duration::from_secs(60));
         assert_eq!(args.csi_capacity_ownerref_level, 1);
         assert_eq!(args.csi_capacity_threads, 1);
+        // csi-provisioner.go:98-99
+        assert_eq!(args.csi_kube_api_capacity_qps, 1.0);
+        assert_eq!(args.csi_kube_api_capacity_burst, 5);
     }
 
     #[test]
@@ -1765,8 +1790,12 @@ mod csi_capacity_flag_tests {
             "--csi-capacity-poll-interval=5s",
             "--csi-capacity-ownerref-level=-1",
             "--csi-capacity-threads=3",
+            "--csi-kube-api-capacity-qps=-1",
+            "--csi-kube-api-capacity-burst=7",
         ])
         .unwrap();
+        assert_eq!(args.csi_kube_api_capacity_qps, -1.0);
+        assert_eq!(args.csi_kube_api_capacity_burst, 7);
         assert!(args.csi_enable_capacity);
         assert!(args.csi_capacity_for_immediate_binding);
         assert_eq!(args.csi_capacity_poll_interval, Duration::from_secs(5));

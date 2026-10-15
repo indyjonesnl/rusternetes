@@ -3,14 +3,17 @@
 //! (`Controller`) and `pkg/capacity/topology/{topology,nodes}.go`
 //! (`Segment`, `nodeTopology.sync`).
 //!
-//! The Go controller is event/queue driven. This port keeps its *decisions*
-//! (which `(topology segment, StorageClass)` pairs get an object, when an
-//! object is created / updated / deleted, ownership and labels) as one
-//! level-triggered `reconcile` pass over `Storage`; wiring it into a run loop
-//! is `run_capacity_loop`, started from `main.rs` (#3219).
+//! The Go controller is event/queue driven and so is this port (#3548): the
+//! StorageClass, CSIStorageCapacity and topology (CSINode/Node) watches over
+//! `Storage` call `onSCAddOrUpdate`/`onSCDelete`/`onCAddOrUpdate`/`onCDelete`/
+//! `onTopologyChanges`, which maintain `capacities` and the work queue that
+//! the workers drain (`run_capacity_loop`, started from `main.rs`, #3219).
+//! Deviation: the `Storage` seam has no label-selector watch, so the
+//! CSIStorageCapacity informer sees every object of the namespace and relies
+//! on the `isManaged` safeguard that upstream keeps for exactly this.
 
 use super::csi_capacity_metrics::CapacityStats;
-use super::csi_capacity_refresh::ItemKey;
+use super::csi_capacity_refresh::{ItemKey, QueueKey, State};
 use rusternetes_common::quantity::{Format, Quantity};
 use rusternetes_common::resources::csi::{CSINode, CSIStorageCapacity};
 use rusternetes_common::resources::volume::LabelSelector;
@@ -302,61 +305,88 @@ pub async fn lookup_owner<S: Storage>(
 }
 
 /// How the topology is obtained (`topology.Informer`): discovered from
-/// CSINode/Node, or the fixed segment of node-deployment mode.
+/// CSINode/Node, or the fixed segment of node-deployment mode
+/// (`NewFixedNodeTopology`).
 #[derive(Clone)]
 pub enum TopologySource {
     Discovered,
     Fixed(Segment),
 }
 
-/// One tick of the publisher: `onTopologyChanges` input, then `reconcile`.
-pub async fn capacity_tick<S: Storage, C: CapacityClient>(
-    ctl: &CapacityController<'_, S, C>,
-    topology: &TopologySource,
-) -> Result<()> {
-    let segments = match topology {
-        TopologySource::Fixed(s) => vec![s.clone()],
-        TopologySource::Discovered => {
-            let csi_nodes: Vec<CSINode> = ctl.storage.list(&build_prefix("csinodes", None)).await?;
-            let nodes: Vec<Node> = ctl.storage.list(&build_prefix("nodes", None)).await?;
-            discover_segments(&csi_nodes, &nodes, &ctl.driver_name)
-        }
-    };
-    ctl.reconcile(&segments).await
+/// `nodeTopology.driverTopologyKeys` (nodes.go:175-185): `None` if the driver
+/// is not running on the node, otherwise at least an empty slice of keys.
+pub fn driver_topology_keys(csi_node: &CSINode, driver_name: &str) -> Option<Vec<String>> {
+    csi_node
+        .spec
+        .drivers
+        .iter()
+        .find(|d| d.name == driver_name)
+        .map(|d| d.topology_keys.clone().unwrap_or_default())
 }
 
-/// `Controller.Run` (capacity.go:232-259): `pollCapacities` re-syncs every
-/// object each `poll_interval` (`wait.UntilWithContext`), and the queue fed by
-/// `refreshTopology`/`refreshSC` (provision.go) is worked off in between with
-/// per-item exponential backoff. Deviation: topology and StorageClass changes
-/// are picked up by the poll tick rather than from informer events, and there
-/// is one worker (`--csi-capacity-threads` is accepted for flag parity only).
+/// `isManaged` (capacity.go:833-836).
+fn is_managed_by(c: &CSIStorageCapacity, driver_name: &str, managed_by_id: &str) -> bool {
+    c.metadata.labels.as_ref().is_some_and(|l| {
+        l.get(DRIVER_NAME_LABEL).map(String::as_str) == Some(driver_name)
+            && l.get(MANAGED_BY_LABEL).map(String::as_str) == Some(managed_by_id)
+    })
+}
+
+/// `Controller.Run` (capacity.go:232-260): `prepare`, a worker (`--capacity-threads`
+/// is #3547), `pollCapacities` every `poll_interval`
+/// (`wait.UntilWithContext`) and the informer event handlers that feed the
+/// queue: StorageClass, CSIStorageCapacity and the topology (CSINode / Node)
+/// watches. The queue, including the `refreshTopology`/`refreshSC` triggers of
+/// provision.go, is worked off with per-item exponential backoff.
 pub async fn run_capacity_loop<S: Storage, C: CapacityClient>(
     ctl: &CapacityController<'_, S, C>,
     topology: &TopologySource,
     poll_interval: std::time::Duration,
     retry_interval_start: std::time::Duration,
     retry_interval_max: std::time::Duration,
+    threads: u32,
 ) {
-    let mut next_poll = tokio::time::Instant::now();
+    ctl.register_metrics();
+    // Subscribe first, list second: nothing that happens in between is lost.
+    // The informers deliver such events again, which the handlers tolerate.
+    let sc_prefix = build_prefix("storageclasses", None);
+    let c_prefix = build_prefix("csistoragecapacities", Some(&ctl.owner_namespace));
+    let node_prefix = build_prefix("nodes", None);
+    let csinode_prefix = build_prefix("csinodes", None);
+    let sc_watch = ctl.storage.watch(&sc_prefix).await.ok();
+    let c_watch = ctl.storage.watch(&c_prefix).await.ok();
+    let node_watch = ctl.storage.watch(&node_prefix).await.ok();
+    let csinode_watch = ctl.storage.watch(&csinode_prefix).await.ok();
     loop {
-        if tokio::time::Instant::now() >= next_poll {
-            if let Err(e) = capacity_tick(ctl, topology).await {
+        match ctl.prepare(topology).await {
+            Ok(()) => break,
+            Err(e) => {
                 tracing::error!("CSIStorageCapacity publisher ({}): {e}", ctl.driver_name);
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
-            next_poll = tokio::time::Instant::now() + poll_interval;
-        }
-        ctl.sync_queued(retry_interval_start, retry_interval_max)
-            .await;
-        let mut wake = next_poll;
-        if let Some(d) = ctl.refresher.next_delayed() {
-            wake = wake.min(tokio::time::Instant::from_std(d));
-        }
-        tokio::select! {
-            _ = tokio::time::sleep_until(wake) => {}
-            _ = ctl.refresher.notified() => {}
         }
     }
+    tokio::join!(
+        ctl.run_workers(threads, retry_interval_start, retry_interval_max),
+        ctl.run_poll(poll_interval),
+        ctl.run_informer(
+            sc_prefix,
+            sc_watch,
+            false,
+            |l: Vec<StorageClass>| ctl.apply_sc_list(l),
+            |o: &StorageClass| ctl.informer_sc_upsert(o),
+            |o: &StorageClass| ctl.informer_sc_delete(o),
+        ),
+        ctl.run_informer(
+            c_prefix,
+            c_watch,
+            true,
+            |l: Vec<CSIStorageCapacity>| ctl.apply_c_list(l),
+            |o: &CSIStorageCapacity| ctl.informer_c_upsert(o),
+            |o: &CSIStorageCapacity| ctl.informer_c_delete(o),
+        ),
+        ctl.run_topology(topology, node_watch, csinode_watch),
+    );
 }
 
 /// The `Controller` fields that decide what gets published.
@@ -370,23 +400,38 @@ pub struct CapacityController<'a, S: Storage, C: CapacityClient> {
     pub immediate_binding: bool,
     /// `capacities` + `queue`, shared with the provisioner's refresh hooks.
     pub refresher: std::sync::Arc<super::csi_capacity_refresh::CapacityRefresher>,
+    /// The token bucket of the dedicated capacity clientset
+    /// (`--kube-api-capacity-qps/-burst`, csi-provisioner.go:456-458): every
+    /// non-watch request of that clientset (CSIStorageCapacity create, update,
+    /// delete and the informer's list) takes a token, see [`capacity_limiter`].
+    pub limiter: std::sync::Arc<rusternetes_client::ratelimit::RateLimiter>,
 }
 
-/// `WorkItem` (capacity.go:96-99) with the StorageClass resolved.
+/// The rate limiter `kubernetes.NewForConfig` builds for `config.QPS` /
+/// `config.Burst` (client-go `rest/config.go:370-381`): zero means
+/// `DefaultQPS` / `DefaultBurst`, a QPS that is not positive means no limiter.
+pub fn capacity_limiter(
+    qps: f64,
+    burst: i32,
+) -> std::sync::Arc<rusternetes_client::ratelimit::RateLimiter> {
+    use rusternetes_client::ratelimit::{RateLimiter, DEFAULT_BURST, DEFAULT_QPS};
+    let qps = if qps == 0.0 { DEFAULT_QPS } else { qps };
+    let burst = if burst == 0 {
+        DEFAULT_BURST
+    } else {
+        f64::from(burst)
+    };
+    std::sync::Arc::new(if qps > 0.0 {
+        RateLimiter::new(qps, burst)
+    } else {
+        RateLimiter::unlimited()
+    })
+}
+
+/// `WorkItem` (capacity.go:105-108) with the StorageClass resolved.
 struct WorkItem<'s> {
     segment: &'s Segment,
     sc: &'s StorageClass,
-}
-
-impl WorkItem<'_> {
-    /// `WorkItem.equals` (capacity.go:101-104).
-    fn equals(&self, c: &CSIStorageCapacity) -> bool {
-        c.storage_class_name == self.sc.metadata.name
-            && c.node_topology.as_ref().is_some_and(|t| {
-                t.match_labels.as_ref() == Some(&self.segment.label_map())
-                    && t.match_expressions.as_ref().is_none_or(|e| e.is_empty())
-            })
-    }
 }
 
 /// `Quantity.Value()` of the stored string; `None` when unparseable.
@@ -394,7 +439,7 @@ fn quantity_value(q: &str) -> Option<i128> {
     Quantity::parse(q).ok().map(|q| q.value())
 }
 
-/// `sizesAreEqual` (capacity.go:841-849).
+/// `sizesAreEqual` (capacity.go:838-849).
 fn sizes_are_equal(expected: Option<&str>, actual: Option<&str>) -> bool {
     match (expected, actual) {
         (None, None) => true,
@@ -408,16 +453,19 @@ fn binary_si(v: i64) -> String {
     Quantity::from_value(v, Format::BinarySI).canonical_string()
 }
 
+/// Event handlers of capacity.go (`onTopologyChanges`, `onSCAddOrUpdate`,
+/// `onSCDelete`, `onCAddOrUpdate`, `onCDelete`, `pollCapacities`; #3548).
+/// Like upstream they run under `capacitiesLock` ([`CapacityRefresher::lock`])
+/// and read the StorageClass list / topology segments from the caches that the
+/// `informer_*` / `apply_*` functions below keep up to date, which is what the
+/// listers of the Go informers are.
 impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
-    /// `isManaged` (capacity.go:828-831).
+    /// `isManaged` (capacity.go:833-836).
     fn is_managed(&self, c: &CSIStorageCapacity) -> bool {
-        c.metadata.labels.as_ref().is_some_and(|l| {
-            l.get(DRIVER_NAME_LABEL) == Some(&self.driver_name)
-                && l.get(MANAGED_BY_LABEL) == Some(&self.managed_by_id)
-        })
+        is_managed_by(c, &self.driver_name, &self.managed_by_id)
     }
 
-    /// `isOwnedByUs` (capacity.go:817-824): a *controller* reference with our UID.
+    /// `isOwnedByUs` (capacity.go:821-828): a *controller* reference with our UID.
     fn is_owned_by_us(&self, c: &CSIStorageCapacity) -> bool {
         let Some(owner) = &self.owner else {
             return false;
@@ -429,165 +477,496 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
             .any(|o| o.controller == Some(true) && o.uid == owner.uid)
     }
 
-    /// One pass of `onTopologyChanges` (:365-391) + `onCAddOrUpdate`
-    /// (:539-587) + `syncCapacity` (:586-715): publish, update and delete
-    /// objects until they match `segments` x the driver's StorageClasses.
-    pub async fn reconcile(&self, segments: &[Segment]) -> Result<()> {
-        let (stats, r) = self.reconcile_with_stats(segments).await;
-        super::csi_capacity_metrics::publish(&self.driver_name, stats);
-        r
+    /// `sc.Provisioner != c.driverName` and the immediate-binding check shared
+    /// by `onTopologyChanges` (capacity.go:353-358) and `onSCAddOrUpdate`
+    /// (:371-379).
+    fn sc_is_wanted(&self, sc: &StorageClass) -> bool {
+        sc.provisioner == self.driver_name
+            && (self.immediate_binding
+                || sc.volume_binding_mode != Some(VolumeBindingMode::Immediate))
     }
 
-    /// `reconcile` plus the gauge values of the pass, as
-    /// `getObjectsGoal/Current/Obsolete` (capacity.go:769-807) would report
-    /// them right after it: `obsolete` is what is left after the deletions.
-    async fn reconcile_with_stats(&self, segments: &[Segment]) -> (CapacityStats, Result<()>) {
-        let mut stats = CapacityStats::default();
-        let r = self.reconcile_inner(segments, &mut stats).await;
-        (stats, r)
+    /// `addWorkItem` (capacity.go:469-484). Must hold the lock.
+    fn add_work_item(&self, st: &mut State, segment: &Segment, sc: &StorageClass) {
+        let item = ItemKey {
+            segment: segment.clone(),
+            storage_class_name: sc.metadata.name.clone(),
+        };
+        // Ensure that we have an entry for it...
+        st.capacities.entry(item.clone()).or_insert(None);
+        // ... and then tell our workers to update or create that capacity object.
+        tracing::trace!("Capacity Controller: enqueuing {item:?}");
+        st.add_item(item);
     }
 
-    async fn reconcile_inner(&self, segments: &[Segment], stats: &mut CapacityStats) -> Result<()> {
+    /// `removeWorkItem` (capacity.go:488-512). Must hold the lock.
+    fn remove_work_item(&self, st: &mut State, segment: &Segment, sc: &StorageClass) {
+        let item = ItemKey {
+            segment: segment.clone(),
+            storage_class_name: sc.metadata.name.clone(),
+        };
+        let Some(capacity) = st.capacities.remove(&item) else {
+            // Already gone or in the queue to be removed.
+            tracing::trace!("Capacity Controller: {item:?} already removed");
+            return;
+        };
+        // Deleting the item prevents further updates to it, in case that it is
+        // already in the queue.
+        let Some(capacity) = capacity else {
+            tracing::trace!("Capacity Controller: {item:?} removed, no object");
+            return;
+        };
+        // Any capacity object in the queue will be deleted.
+        tracing::trace!(
+            "Capacity Controller: enqueuing CSIStorageCapacity {} for removal",
+            capacity.metadata.name
+        );
+        st.add(QueueKey::Capacity {
+            namespace: capacity
+                .metadata
+                .namespace
+                .clone()
+                .unwrap_or_else(|| self.owner_namespace.clone()),
+            name: capacity.metadata.name.clone(),
+        });
+    }
+
+    /// `onTopologyChanges` (capacity.go:339-366), called by the topology informer.
+    pub fn on_topology_changes(&self, added: &[Segment], removed: &[Segment]) {
+        tracing::trace!(
+            "Capacity Controller: topology changed: added {added:?}, removed {removed:?}"
+        );
+        let mut st = self.refresher.lock();
+        let storageclasses: Vec<StorageClass> = st.classes.values().cloned().collect();
+        for sc in &storageclasses {
+            if !self.sc_is_wanted(sc) {
+                continue;
+            }
+            for segment in added {
+                self.add_work_item(&mut st, segment, sc);
+            }
+            for segment in removed {
+                self.remove_work_item(&mut st, segment, sc);
+            }
+        }
+    }
+
+    /// `onSCAddOrUpdate` (capacity.go:370-387): add or update events of the
+    /// StorageClass informer.
+    pub fn on_sc_add_or_update(&self, sc: &StorageClass) {
+        if sc.provisioner != self.driver_name {
+            return;
+        }
+        tracing::trace!(
+            "Capacity Controller: storage class {} was updated or added",
+            sc.metadata.name
+        );
+        if !self.sc_is_wanted(sc) {
+            tracing::trace!(
+                "Capacity Controller: ignoring storage class {} because it uses immediate binding",
+                sc.metadata.name
+            );
+            return;
+        }
+        let mut st = self.refresher.lock();
+        let segments = st.segments.clone();
+        for segment in &segments {
+            self.add_work_item(&mut st, segment, sc);
+        }
+    }
+
+    /// `onSCDelete` (capacity.go:390-403): delete events of the StorageClass
+    /// informer.
+    pub fn on_sc_delete(&self, sc: &StorageClass) {
+        if sc.provisioner != self.driver_name {
+            return;
+        }
+        tracing::trace!(
+            "Capacity Controller: storage class {} was removed",
+            sc.metadata.name
+        );
+        let mut st = self.refresher.lock();
+        let segments = st.segments.clone();
+        for segment in &segments {
+            self.remove_work_item(&mut st, segment, sc);
+        }
+    }
+
+    /// `pollCapacities` (capacity.go:515-523): must be called periodically to
+    /// detect when the underlying storage capacity has changed.
+    pub fn poll_capacities(&self) {
+        let mut st = self.refresher.lock();
+        let items: Vec<ItemKey> = st.capacities.keys().cloned().collect();
+        for item in items {
+            tracing::trace!("Capacity Controller: enqueuing {item:?} for periodic update");
+            st.add_item(item);
+        }
+    }
+
+    /// `onCAddOrUpdate` (capacity.go:687-726): takes a read-only
+    /// CSIStorageCapacity object and either remembers it for future updates or
+    /// ensures that it gets deleted if no longer needed. Foreign objects are
+    /// ignored.
+    pub fn on_c_add_or_update(&self, capacity: &CSIStorageCapacity) {
+        let mut st = self.refresher.lock();
+        if !self.is_managed(capacity) {
+            // Not ours (anymore?). For the unlikely case that someone removed
+            // our owner reference, we also must remove our reference to the
+            // object.
+            let items: Vec<ItemKey> = st
+                .capacities
+                .iter()
+                .filter(|(_, c2)| {
+                    c2.as_ref()
+                        .is_some_and(|c2| c2.metadata.uid == capacity.metadata.uid)
+                })
+                .map(|(item, _)| item.clone())
+                .collect();
+            for item in items {
+                st.capacities.insert(item.clone(), None);
+                tracing::trace!(
+                    "Capacity Controller: CSIStorageCapacity {} owner was modified by someone, enqueueing {item:?} for re-creation",
+                    capacity.metadata.name
+                );
+                st.add_item(item);
+            }
+            return;
+        }
+
+        let mut matched = None;
+        for (item, capacity2) in st.capacities.iter() {
+            match capacity2 {
+                // We already have matched the object. Either way, remember the
+                // new object revision to avoid the "conflict" error when we
+                // try to update the old object.
+                Some(c2) if c2.metadata.uid == capacity.metadata.uid => {
+                    matched = Some(item.clone());
+                    break;
+                }
+                // This is the capacity object for this particular combination
+                // of parameters. Reuse it.
+                None if item.equals(capacity) => {
+                    matched = Some(item.clone());
+                    break;
+                }
+                _ => {}
+            }
+        }
+        match matched {
+            Some(item) => {
+                st.capacities.insert(item, Some(capacity.clone()));
+            }
+            None => {
+                // The CSIStorageCapacity object is obsolete, delete it.
+                tracing::trace!(
+                    "Capacity Controller: CSIStorageCapacity {} with resource version {:?} is obsolete, enqueue for removal",
+                    capacity.metadata.name,
+                    capacity.metadata.resource_version
+                );
+                st.add(QueueKey::Capacity {
+                    namespace: capacity
+                        .metadata
+                        .namespace
+                        .clone()
+                        .unwrap_or_else(|| self.owner_namespace.clone()),
+                    name: capacity.metadata.name.clone(),
+                });
+            }
+        }
+    }
+
+    /// `onCDelete` (capacity.go:728-741).
+    pub fn on_c_delete(&self, capacity: &CSIStorageCapacity) {
+        let mut st = self.refresher.lock();
+        let item = st
+            .capacities
+            .iter()
+            .find(|(_, c2)| {
+                c2.as_ref()
+                    .is_some_and(|c2| c2.metadata.uid == capacity.metadata.uid)
+            })
+            .map(|(item, _)| item.clone());
+        if let Some(item) = item {
+            // The object is still needed. Someone else must have removed it.
+            // Re-create it...
+            tracing::trace!(
+                "Capacity Controller: CSIStorageCapacity {} was removed by someone, enqueue {item:?} for re-creation",
+                capacity.metadata.name
+            );
+            st.capacities.insert(item.clone(), None);
+            st.add_item(item);
+        }
+    }
+
+    /// `CollectWithStability` (capacity.go:751-767), evaluated now.
+    #[allow(dead_code)] // used by tests; the bin target re-includes this module
+    pub fn stats(&self) -> CapacityStats {
+        self.refresher.stats(&|c| self.is_managed(c))
+    }
+
+    /// `legacyregistry.CustomMustRegister(capacityController)`
+    /// (csi-provisioner.go:545): the gauges are computed at scrape time.
+    pub fn register_metrics(&self) {
+        let weak = std::sync::Arc::downgrade(&self.refresher);
+        let (driver, managed_by) = (self.driver_name.clone(), self.managed_by_id.clone());
+        super::csi_capacity_metrics::register(&self.driver_name, move || {
+            let refresher = weak.upgrade()?;
+            Some(refresher.stats(&|c| is_managed_by(c, &driver, &managed_by)))
+        });
+    }
+
+    // ---- informer caches ----
+
+    /// StorageClass informer add/update: update the cache, then call the
+    /// handler registered in `NewCentralCapacityController` (:188-204).
+    pub fn informer_sc_upsert(&self, sc: &StorageClass) {
+        self.refresher
+            .lock()
+            .classes
+            .insert(sc.metadata.name.clone(), sc.clone());
+        self.on_sc_add_or_update(sc);
+    }
+
+    /// StorageClass informer delete (:205-216).
+    pub fn informer_sc_delete(&self, sc: &StorageClass) {
+        self.refresher.lock().classes.remove(&sc.metadata.name);
+        self.on_sc_delete(sc);
+    }
+
+    /// CSIStorageCapacity informer add/update (`prepare`, :293-309).
+    pub fn informer_c_upsert(&self, c: &CSIStorageCapacity) {
+        self.refresher
+            .lock()
+            .cache
+            .insert(c.metadata.name.clone(), c.clone());
+        self.on_c_add_or_update(c);
+    }
+
+    /// CSIStorageCapacity informer delete (`prepare`, :310-321).
+    pub fn informer_c_delete(&self, c: &CSIStorageCapacity) {
+        self.refresher.lock().cache.remove(&c.metadata.name);
+        self.on_c_delete(c);
+    }
+
+    /// The reflector's `Replace` of a StorageClass list: every listed object is
+    /// an add/update, cached objects that are gone were deleted.
+    pub fn apply_sc_list(&self, list: Vec<StorageClass>) {
+        let names: std::collections::HashSet<&str> =
+            list.iter().map(|o| o.metadata.name.as_str()).collect();
+        let gone: Vec<StorageClass> = self
+            .refresher
+            .lock()
+            .classes
+            .values()
+            .filter(|o| !names.contains(o.metadata.name.as_str()))
+            .cloned()
+            .collect();
+        for sc in &list {
+            self.informer_sc_upsert(sc);
+        }
+        for sc in &gone {
+            self.informer_sc_delete(sc);
+        }
+    }
+
+    /// The reflector's `Replace` of a CSIStorageCapacity list.
+    pub fn apply_c_list(&self, list: Vec<CSIStorageCapacity>) {
+        let names: std::collections::HashSet<&str> =
+            list.iter().map(|o| o.metadata.name.as_str()).collect();
+        let gone: Vec<CSIStorageCapacity> = self
+            .refresher
+            .lock()
+            .cache
+            .values()
+            .filter(|o| !names.contains(o.metadata.name.as_str()))
+            .cloned()
+            .collect();
+        for c in &list {
+            self.informer_c_upsert(c);
+        }
+        for c in &gone {
+            self.informer_c_delete(c);
+        }
+    }
+
+    /// `nodeTopology.sync` (nodes.go:245-341) bookkeeping: remember the new
+    /// segment list and call the callback (`onTopologyChanges`) with what was
+    /// added and removed.
+    pub fn apply_topology(&self, segments: Vec<Segment>) {
+        let (added, removed) = {
+            let mut st = self.refresher.lock();
+            let added: Vec<Segment> = segments
+                .iter()
+                .filter(|s| !st.segments.contains(s))
+                .cloned()
+                .collect();
+            let removed: Vec<Segment> = st
+                .segments
+                .iter()
+                .filter(|s| !segments.contains(s))
+                .cloned()
+                .collect();
+            st.segments = segments;
+            (added, removed)
+        };
+        if !added.is_empty() || !removed.is_empty() {
+            tracing::trace!("topology changed: added {added:?}, removed {removed:?}");
+            self.on_topology_changes(&added, &removed);
+        }
+    }
+
+    /// The segments the topology informer would report right now.
+    pub async fn current_segments(&self, topology: &TopologySource) -> Result<Vec<Segment>> {
+        Ok(match topology {
+            TopologySource::Fixed(s) => vec![s.clone()],
+            TopologySource::Discovered => {
+                let csi_nodes: Vec<CSINode> =
+                    self.storage.list(&build_prefix("csinodes", None)).await?;
+                let nodes: Vec<Node> = self.storage.list(&build_prefix("nodes", None)).await?;
+                discover_segments(&csi_nodes, &nodes, &self.driver_name)
+            }
+        })
+    }
+
+    /// `prepare` (capacity.go:262-337): learn the StorageClasses and topology
+    /// segments, so that the work items are known, then feed the existing
+    /// CSIStorageCapacity objects to `onCAddOrUpdate`.
+    pub async fn prepare(&self, topology: &TopologySource) -> Result<()> {
         let classes: Vec<StorageClass> = self
             .storage
             .list(&build_prefix("storageclasses", None))
             .await?;
-        let mut items = Vec::new();
-        for sc in &classes {
-            if sc.provisioner != self.driver_name {
-                continue;
-            }
-            // :379-381
-            if !self.immediate_binding
-                && sc.volume_binding_mode == Some(VolumeBindingMode::Immediate)
-            {
-                continue;
-            }
-            for segment in segments {
-                items.push(WorkItem { segment, sc });
-            }
-        }
-
-        // `addWorkItem` / `removeWorkItem` (:469-513): the refresh triggers
-        // look items up in this set.
-        self.refresher.set_capacities(
-            items
-                .iter()
-                .map(|i| ItemKey {
-                    segment: i.segment.clone(),
-                    storage_class_name: i.sc.metadata.name.clone(),
-                })
-                .collect(),
-        );
-
-        let existing: Vec<CSIStorageCapacity> = self
+        self.apply_sc_list(classes);
+        let segments = self.current_segments(topology).await?;
+        self.apply_topology(segments);
+        // :273 "onTopologyChanges lists the classes."
+        let segments = self.refresher.lock().segments.clone();
+        self.on_topology_changes(&segments, &[]);
+        // The CSIStorageCapacity informer lists through the capacity clientset.
+        self.limiter.acquire().await;
+        let capacities: Vec<CSIStorageCapacity> = self
             .storage
             .list(&build_prefix(
                 "csistoragecapacities",
                 Some(&self.owner_namespace),
             ))
             .await?;
-        // Match each managed object to the first item it fits; foreign objects
-        // are ignored (:547-562) and everything else is obsolete or a
-        // duplicate and is deleted (:582-585).
-        let mut matched: Vec<Option<CSIStorageCapacity>> = vec![None; items.len()];
-        let mut first_err = None;
-        for c in existing {
-            if !self.is_managed(&c) {
-                continue;
-            }
-            match items
-                .iter()
-                .enumerate()
-                .find(|(i, it)| matched[*i].is_none() && it.equals(&c))
-            {
-                Some((i, _)) => matched[i] = Some(c),
-                // A failed delete leaves the object obsolete (:792-807).
-                None => {
-                    if let Err(e) = self.delete_capacity(&c).await {
-                        stats.obsolete += 1;
-                        first_err.get_or_insert(e);
-                    }
-                }
-            }
-        }
-
-        stats.goal = items.len() as i64;
-        for (item, current) in items.iter().zip(matched) {
-            let existed = current.is_some();
-            match self.sync_capacity(item, current).await {
-                Ok(created) => stats.current += i64::from(existed || created),
-                Err(e) => {
-                    stats.current += i64::from(existed);
-                    first_err.get_or_insert(e);
-                }
-            }
-        }
-        first_err.map_or(Ok(()), Err)
+        self.apply_c_list(capacities);
+        Ok(())
     }
 
-    /// `runWorker` / `processNextWorkItem` (capacity.go:525-560) for the items
-    /// currently queued: success is `Forget`, failure is `AddRateLimited`
+    // ---- workers ----
+
+    /// `for range threadiness { go wait.UntilWithContext(runWorker, time.Second) }`
+    /// (capacity.go:238-253): `--capacity-threads` workers on the one queue.
+    /// The queue hands an item out to one worker at a time (`Done` re-queues
+    /// what was added meanwhile), which `syncCapacity` relies on (:568-571).
+    /// As upstream, zero threads means no worker.
+    pub async fn run_workers(
+        &self,
+        threads: u32,
+        start: std::time::Duration,
+        max: std::time::Duration,
+    ) {
+        futures::future::join_all((0..threads).map(|_| self.run_worker(start, max))).await;
+    }
+
+    /// `wait.UntilWithContext(pollCapacities, pollPeriod)` (capacity.go:255).
+    async fn run_poll(&self, period: std::time::Duration) {
+        let mut ticker = tokio::time::interval(period);
+        loop {
+            ticker.tick().await;
+            self.poll_capacities();
+        }
+    }
+
+    /// `runWorker` (capacity.go:525-528): one of `--capacity-threads` workers.
+    async fn run_worker(&self, start: std::time::Duration, max: std::time::Duration) {
+        loop {
+            if self.process_next(start, max).await {
+                continue;
+            }
+            let wake = self.refresher.next_delayed();
+            tokio::select! {
+                _ = async {
+                    match wake {
+                        Some(t) => tokio::time::sleep_until(tokio::time::Instant::from_std(t)).await,
+                        None => std::future::pending().await,
+                    }
+                } => {}
+                _ = self.refresher.notified() => {}
+            }
+        }
+    }
+
+    /// `processNextWorkItem` (capacity.go:531-561) without blocking: `false`
+    /// when nothing is queued. Success is `Forget`, failure is `AddRateLimited`
     /// (`NewTypedItemExponentialFailureRateLimiter(retryIntervalStart,
     /// retryIntervalMax)`, csi-provisioner.go:528).
-    pub async fn sync_queued(&self, start: std::time::Duration, max: std::time::Duration) {
-        while let Some(key) = self.refresher.pop() {
-            match self.sync_item(&key).await {
-                Ok(()) => self.refresher.forget(&key),
-                Err(e) => {
-                    tracing::error!("CSIStorageCapacity publisher ({}): {e}", self.driver_name);
-                    let d = self.refresher.add_rate_limited(key, start, max);
-                    tracing::warn!("Retrying after {d:?}");
-                }
-            }
-        }
-    }
-
-    /// `syncCapacity(ctx, item)` (:564-672) for one queued item.
-    async fn sync_item(&self, key: &ItemKey) -> Result<()> {
-        // :572-583: "The item was removed in the meantime."
-        if !self.refresher.is_capacity(key) {
-            return Ok(());
-        }
-        // :585-593: a missing StorageClass is "another indication that the
-        // value is no longer needed".
-        let sc: StorageClass = match self
-            .storage
-            .get(&build_key("storageclasses", None, &key.storage_class_name))
-            .await
-        {
-            Ok(sc) => sc,
-            Err(Error::NotFound(_)) => return Ok(()),
+    pub async fn process_next(&self, start: std::time::Duration, max: std::time::Duration) -> bool {
+        let Some(key) = self.refresher.pop() else {
+            return false;
+        };
+        let r = match &key {
+            QueueKey::Item(item) => self.sync_item(item).await,
+            QueueKey::Capacity { namespace, name } => self.delete_capacity(namespace, name).await,
+        };
+        // `defer c.queue.Done(obj)` runs before the error handling.
+        self.refresher.done(&key);
+        match r {
+            Ok(()) => self.refresher.forget(&key),
             Err(e) => {
-                return Err(Error::Internal(format!(
-                    "retrieve storage class for {key:?}: {e}"
-                )))
+                tracing::error!("CSIStorageCapacity publisher ({}): {e}", self.driver_name);
+                let d = self.refresher.add_rate_limited(key, start, max);
+                tracing::warn!("Retrying after {d:?}");
             }
-        };
-        let item = WorkItem {
-            segment: &key.segment,
-            sc: &sc,
-        };
-        let existing: Vec<CSIStorageCapacity> = self
-            .storage
-            .list(&build_prefix(
-                "csistoragecapacities",
-                Some(&self.owner_namespace),
-            ))
-            .await?;
-        let current = existing
-            .into_iter()
-            .find(|c| self.is_managed(c) && item.equals(c));
-        self.sync_capacity(&item, current).await.map(|_| ())
+        }
+        true
     }
 
-    /// `syncCapacity` (:586-715).
+    /// Process what is queued right now (and what is rescheduled by it).
+    #[allow(dead_code)] // used by tests; the bin target re-includes this module
+    pub async fn sync_queued(&self, start: std::time::Duration, max: std::time::Duration) {
+        while self.process_next(start, max).await {}
+    }
+
+    /// `syncCapacity(ctx, item)` (capacity.go:564-671): reads the object from
+    /// `capacities`, which only the informer event handlers update.
+    async fn sync_item(&self, item: &ItemKey) -> Result<()> {
+        let (current, sc) = {
+            let st = self.refresher.lock();
+            (
+                st.capacities.get(item).cloned(),
+                st.classes.get(&item.storage_class_name).cloned(),
+            )
+        };
+        // :577-582: "The item was removed in the meantime. This can happen when
+        // the storage class or the topology segment are gone."
+        let Some(current) = current else {
+            tracing::trace!("Capacity Controller: {item:?} became obsolete");
+            return Ok(());
+        };
+        // :584-592: "Another indication that the value is no longer needed."
+        let Some(sc) = sc else {
+            return Ok(());
+        };
+        self.sync_capacity(
+            &WorkItem {
+                segment: &item.segment,
+                sc: &sc,
+            },
+            current,
+        )
+        .await
+    }
+
+    /// `syncCapacity` (:594-670).
     async fn sync_capacity(
         &self,
         item: &WorkItem<'_>,
         current: Option<CSIStorageCapacity>,
-    ) -> Result<bool> {
-        // :599-604 — the assumption is that the capacity is independent of the
+    ) -> Result<()> {
+        // :594-603 — the assumption is that the capacity is independent of the
         // capabilities, hence no VolumeCapabilities.
         let req = GetCapacityRequest {
             parameters: item.sc.parameters.clone().unwrap_or_default(),
@@ -610,13 +989,15 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
             None => {
                 let obj = self.new_capacity(item, quantity, maximum_volume_size);
                 let name = obj.metadata.name.clone();
+                // :642-645: the created object is intentionally not stored in
+                // `capacities`; it arrives through the informer.
+                self.limiter.acquire().await;
                 self.storage
                     .create(
                         &build_key("csistoragecapacities", Some(&self.owner_namespace), &name),
                         &obj,
                     )
                     .await?;
-                return Ok(true);
             }
             Some(c)
                 if sizes_are_equal(c.capacity.as_deref(), Some(&quantity))
@@ -626,6 +1007,8 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
                     )
                     && (self.owner.is_none() || self.is_owned_by_us(&c)) => {}
             Some(mut c) => {
+                // `capacity.DeepCopy()` (:653): `c` is already a copy of the
+                // cached object.
                 c.capacity = Some(quantity);
                 c.maximum_volume_size = maximum_volume_size;
                 if let Some(owner) = &self.owner {
@@ -636,6 +1019,7 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
                             .push(owner.clone());
                     }
                 }
+                self.limiter.acquire().await;
                 self.storage
                     .update(
                         &build_key(
@@ -648,12 +1032,12 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
                     .await?;
             }
         }
-        Ok(false)
+        Ok(())
     }
 
-    /// The create path of `syncCapacity` (:621-640): a brand-new object. Kept
+    /// The create path of `syncCapacity` (:617-640): a brand-new object. Kept
     /// apart from the update path, which must write a clone of the stored
-    /// object (upstream's `capacity.DeepCopy()`, :661) so the PUT carries the
+    /// object (upstream's `capacity.DeepCopy()`, :653) so the PUT carries the
     /// stored uid / resourceVersion.
     fn new_capacity(
         &self,
@@ -688,26 +1072,207 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
         }
     }
 
-    /// `deleteCapacity` (:717-725): NotFound is success.
-    async fn delete_capacity(&self, c: &CSIStorageCapacity) -> Result<()> {
+    /// `deleteCapacity` (:673-681): NotFound is success.
+    async fn delete_capacity(&self, namespace: &str, name: &str) -> Result<()> {
+        tracing::trace!("Capacity Controller: removing CSIStorageCapacity {name}");
+        self.limiter.acquire().await;
         match self
             .storage
-            .delete(&build_key(
-                "csistoragecapacities",
-                Some(&self.owner_namespace),
-                &c.metadata.name,
-            ))
+            .delete(&build_key("csistoragecapacities", Some(namespace), name))
             .await
         {
             Err(Error::NotFound(_)) => Ok(()),
             r => r,
         }
     }
+
+    // ---- informers over `Storage` ----
+
+    /// A list+watch informer for one resource: `first` is a stream subscribed
+    /// before the initial list (`prepare` did that list); after a broken watch
+    /// it is re-subscribed and the resource re-listed (`Replace`).
+    async fn run_informer<T>(
+        &self,
+        prefix: String,
+        mut first: Option<rusternetes_storage::WatchStream>,
+        throttled: bool,
+        relist: impl Fn(Vec<T>),
+        upsert: impl Fn(&T),
+        delete: impl Fn(&T),
+    ) where
+        T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+    {
+        use futures::StreamExt;
+        use rusternetes_storage::WatchEvent;
+        loop {
+            let mut stream = match first.take() {
+                Some(s) => s,
+                None => {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    let s = match self.storage.watch(&prefix).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::error!("watch {prefix}: {e}");
+                            continue;
+                        }
+                    };
+                    // Only the capacity informer lists through the throttled
+                    // capacity clientset; watches are never throttled
+                    // (client-go rest/request.go:763-764).
+                    if throttled {
+                        self.limiter.acquire().await;
+                    }
+                    match self.storage.list::<T>(&prefix).await {
+                        Ok(l) => relist(l),
+                        Err(e) => {
+                            tracing::error!("list {prefix}: {e}");
+                            continue;
+                        }
+                    }
+                    s
+                }
+            };
+            while let Some(ev) = stream.next().await {
+                match ev {
+                    Ok(WatchEvent::Added(_, v)) | Ok(WatchEvent::Modified(_, v)) => {
+                        match serde_json::from_str::<T>(&v) {
+                            Ok(o) => upsert(&o),
+                            Err(e) => tracing::error!("decode {prefix} event: {e}"),
+                        }
+                    }
+                    Ok(WatchEvent::Deleted(_, v)) => match serde_json::from_str::<T>(&v) {
+                        Ok(o) => delete(&o),
+                        Err(e) => tracing::error!("decode {prefix} event: {e}"),
+                    },
+                    Err(e) => {
+                        tracing::error!("watch {prefix}: {e}");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// `NewNodeTopology`'s Node and CSINode handlers (nodes.go:63-150) and its
+    /// `RunWorker`: whenever something relevant changed, recompute the segments
+    /// and call `onTopologyChanges`. A fixed topology never changes.
+    async fn run_topology(
+        &self,
+        topology: &TopologySource,
+        mut nodes: Option<rusternetes_storage::WatchStream>,
+        mut csinodes: Option<rusternetes_storage::WatchStream>,
+    ) {
+        use futures::StreamExt;
+        use rusternetes_storage::WatchEvent;
+        if matches!(topology, TopologySource::Fixed(_)) {
+            return std::future::pending().await;
+        }
+        let node_prefix = build_prefix("nodes", None);
+        let csinode_prefix = build_prefix("csinodes", None);
+        // What the handlers' `oldObj` provides in Go: node labels and the
+        // driver's topology keys of the previous revision.
+        let mut node_labels: HashMap<String, Option<HashMap<String, String>>> = HashMap::new();
+        let mut csinode_keys: HashMap<String, Option<Vec<String>>> = HashMap::new();
+        loop {
+            let (mut ns, mut cs) = match (nodes.take(), csinodes.take()) {
+                (Some(n), Some(c)) => (n, c),
+                _ => {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    let (Ok(n), Ok(c)) = (
+                        self.storage.watch(&node_prefix).await,
+                        self.storage.watch(&csinode_prefix).await,
+                    ) else {
+                        tracing::error!("topology watch failed");
+                        continue;
+                    };
+                    self.sync_topology(topology).await;
+                    (n, c)
+                }
+            };
+            if let Ok(l) = self.storage.list::<Node>(&node_prefix).await {
+                node_labels = l
+                    .into_iter()
+                    .map(|n| (n.metadata.name.clone(), n.metadata.labels.clone()))
+                    .collect();
+            }
+            if let Ok(l) = self.storage.list::<CSINode>(&csinode_prefix).await {
+                csinode_keys = l
+                    .into_iter()
+                    .map(|n| {
+                        let k = driver_topology_keys(&n, &self.driver_name);
+                        (n.metadata.name, k)
+                    })
+                    .collect();
+            }
+            loop {
+                let changed = tokio::select! {
+                    ev = ns.next() => match ev {
+                        None | Some(Err(_)) => break,
+                        Some(Ok(WatchEvent::Added(_, v))) => {
+                            serde_json::from_str::<Node>(&v).is_ok_and(|n| {
+                                node_labels.insert(n.metadata.name, n.metadata.labels);
+                                true
+                            })
+                        }
+                        Some(Ok(WatchEvent::Modified(_, v))) => {
+                            // Shortcut: labels haven't changed, no need to sync.
+                            serde_json::from_str::<Node>(&v).is_ok_and(|n| {
+                                let old = node_labels
+                                    .insert(n.metadata.name, n.metadata.labels.clone());
+                                old.as_ref() != Some(&n.metadata.labels)
+                            })
+                        }
+                        Some(Ok(WatchEvent::Deleted(_, v))) => {
+                            serde_json::from_str::<Node>(&v).is_ok_and(|n| {
+                                node_labels.remove(&n.metadata.name);
+                                true
+                            })
+                        }
+                    },
+                    ev = cs.next() => match ev {
+                        None | Some(Err(_)) => break,
+                        Some(Ok(WatchEvent::Added(_, v))) => {
+                            serde_json::from_str::<CSINode>(&v).is_ok_and(|n| {
+                                let k = driver_topology_keys(&n, &self.driver_name);
+                                csinode_keys.insert(n.metadata.name, k);
+                                true
+                            })
+                        }
+                        Some(Ok(WatchEvent::Modified(_, v))) => {
+                            // Shortcut: keys haven't changed, no need to sync.
+                            serde_json::from_str::<CSINode>(&v).is_ok_and(|n| {
+                                let k = driver_topology_keys(&n, &self.driver_name);
+                                let old = csinode_keys.insert(n.metadata.name, k.clone());
+                                old.as_ref() != Some(&k)
+                            })
+                        }
+                        Some(Ok(WatchEvent::Deleted(_, v))) => {
+                            serde_json::from_str::<CSINode>(&v).is_ok_and(|n| {
+                                csinode_keys.remove(&n.metadata.name);
+                                true
+                            })
+                        }
+                    },
+                };
+                if changed {
+                    self.sync_topology(topology).await;
+                }
+            }
+        }
+    }
+
+    /// `nodeTopology.sync`.
+    async fn sync_topology(&self, topology: &TopologySource) {
+        match self.current_segments(topology).await {
+            Ok(segments) => self.apply_topology(segments),
+            Err(e) => tracing::error!("CSIStorageCapacity publisher ({}): {e}", self.driver_name),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::csi_capacity_refresh::{CapacityRefresher, ItemKey};
+    use super::super::csi_capacity_refresh::{CapacityRefresher, ItemKey, QueueKey};
     use super::*;
     use rusternetes_common::resources::csi::{CSINodeDriver, CSINodeSpec};
     use rusternetes_common::resources::volume::VolumeNodeAffinity;
@@ -791,7 +1356,7 @@ mod tests {
         let cl = FakeClient::default();
         let c = ctl(&st, &cl, false);
         let segs: Vec<Segment> = segments.iter().map(|s| seg(s)).collect();
-        c.reconcile(&segs).await.unwrap();
+        settle(&c, &st, &segs).await;
         // "Clear queue so that below we only get to see items scheduled for refresh."
         c.refresher.clear_queue();
         let r = c.refresher.clone();
@@ -895,10 +1460,9 @@ mod tests {
     async fn sync_queued_skips_items_that_are_no_longer_wanted() {
         let (st, cl, r) = refresh_fixture(&[&[("layer0", "foo")]]).await;
         r.refresh_sc("direct-sc");
-        // The StorageClass is gone: "Another indication that the value is no longer needed."
-        st.delete(&build_key("storageclasses", None, "direct-sc"))
-            .await
-            .unwrap();
+        // The StorageClass is gone from the lister while the item is still
+        // queued: "Another indication that the value is no longer needed."
+        r.lock().classes.remove("direct-sc");
         cl.requests.lock().unwrap().clear();
         let c = ctl_with(&st, &cl, r.clone());
         c.sync_queued(Duration::from_secs(1), Duration::from_secs(300))
@@ -935,10 +1499,10 @@ mod tests {
     #[test]
     fn rate_limiter_doubles_per_failure_and_caps_at_max() {
         let r = CapacityRefresher::new();
-        let k = ItemKey {
+        let k = QueueKey::Item(ItemKey {
             segment: seg(&[]),
             storage_class_name: "sc".into(),
-        };
+        });
         let (s, m) = (Duration::from_secs(1), Duration::from_secs(5));
         let d: Vec<_> = (0..5)
             .map(|_| r.add_rate_limited(k.clone(), s, m))
@@ -1077,6 +1641,8 @@ mod tests {
         max: Mutex<Option<i64>>,
         requests: Mutex<Vec<GetCapacityRequest>>,
         fail: Mutex<bool>,
+        /// How long a `GetCapacity` call takes.
+        delay: Mutex<Duration>,
     }
 
     impl CapacityClient for FakeClient {
@@ -1085,6 +1651,10 @@ mod tests {
             req: GetCapacityRequest,
         ) -> std::result::Result<GetCapacityResponse, String> {
             self.requests.lock().unwrap().push(req);
+            let delay = *self.delay.lock().unwrap();
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             if *self.fail.lock().unwrap() {
                 return Err("boom".into());
             }
@@ -1142,6 +1712,7 @@ mod tests {
             owner_namespace: NS.into(),
             immediate_binding: immediate,
             refresher: Default::default(),
+            limiter: std::sync::Arc::new(rusternetes_client::ratelimit::RateLimiter::unlimited()),
         }
     }
 
@@ -1165,7 +1736,7 @@ mod tests {
         put_sc(&st, sc("late-sc", DRIVER, None)).await;
         put_sc(&st, sc("foreign-sc", "other-driver", None)).await;
         let segs = vec![seg(&[("zone", "a")]), seg(&[("zone", "b")])];
-        ctl(&st, &cl, false).reconcile(&segs).await.unwrap();
+        settle(&ctl(&st, &cl, false), &st, &segs).await;
 
         let caps = list_caps(&st).await;
         assert_eq!(caps.len(), 2);
@@ -1198,13 +1769,10 @@ mod tests {
         let cl = FakeClient::default();
         put_sc(&st, sc("late-sc", DRIVER, None)).await;
         let c = ctl(&st, &cl, false);
-        let (s, r) = c
-            .reconcile_with_stats(&[seg(&[("zone", "a")]), seg(&[("zone", "b")])])
-            .await;
-        r.unwrap();
-        // Every object is created in this pass, so each item has one now.
+        settle(&c, &st, &[seg(&[("zone", "a")]), seg(&[("zone", "b")])]).await;
+        // Every object is created and has been seen, so each item has one.
         assert_eq!(
-            s,
+            c.stats(),
             CapacityStats {
                 goal: 2,
                 current: 2,
@@ -1212,12 +1780,10 @@ mod tests {
             }
         );
 
-        // Zone b disappears: its object is deleted in this pass, so nothing
-        // obsolete remains afterwards.
-        let (s, r) = c.reconcile_with_stats(&[seg(&[("zone", "a")])]).await;
-        r.unwrap();
+        // Zone b disappears: its object is deleted, so nothing obsolete remains.
+        settle(&c, &st, &[seg(&[("zone", "a")])]).await;
         assert_eq!(
-            s,
+            c.stats(),
             CapacityStats {
                 goal: 1,
                 current: 1,
@@ -1228,14 +1794,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_publishes_the_gauges_per_driver() {
+    async fn the_gauges_are_exported_per_driver_at_scrape_time() {
         let st = MemoryStorage::new();
         let cl = FakeClient::default();
         put_sc(&st, sc("late-sc", DRIVER, None)).await;
-        ctl(&st, &cl, false)
-            .reconcile(&[seg(&[("zone", "a")])])
-            .await
-            .unwrap();
+        let c = ctl(&st, &cl, false);
+        c.register_metrics();
+        settle(&c, &st, &[seg(&[("zone", "a")])]).await;
         let out = super::super::csi_capacity_metrics::gather();
         for (n, v) in [
             ("csistoragecapacities_desired_goal", 1),
@@ -1255,10 +1820,10 @@ mod tests {
         put_sc(&st, sc("late-sc", DRIVER, None)).await;
         let segs = vec![seg(&[("zone", "a")])];
         let c = ctl(&st, &cl, false);
-        c.reconcile(&segs).await.unwrap();
+        settle(&c, &st, &segs).await;
         let first = list_caps(&st).await.remove(0);
 
-        c.reconcile(&segs).await.unwrap();
+        settle(&c, &st, &segs).await;
         let same = list_caps(&st).await.remove(0);
         assert_eq!(
             first.metadata.resource_version,
@@ -1266,7 +1831,7 @@ mod tests {
         );
 
         *cl.capacity.lock().unwrap() = 200;
-        c.reconcile(&segs).await.unwrap();
+        settle(&c, &st, &segs).await;
         let caps = list_caps(&st).await;
         assert_eq!(caps.len(), 1, "update, not a second object");
         assert_eq!(caps[0].metadata.name, first.metadata.name);
@@ -1283,10 +1848,10 @@ mod tests {
         put_sc(&st, sc("late-sc", DRIVER, None)).await;
         let segs = vec![seg(&[("zone", "a")])];
         let c = ctl(&st, &cl, false);
-        c.reconcile(&segs).await.unwrap();
+        settle(&c, &st, &segs).await;
         let before = list_caps(&st).await.remove(0);
         *cl.capacity.lock().unwrap() = 7;
-        c.reconcile(&segs).await.unwrap();
+        settle(&c, &st, &segs).await;
         let after = list_caps(&st).await.remove(0);
         assert_eq!(after.capacity.as_deref(), Some("7"));
         assert_eq!(after.metadata.uid, before.metadata.uid);
@@ -1304,11 +1869,11 @@ mod tests {
         put_sc(&st, sc("late-sc", DRIVER, None)).await;
         let segs = vec![seg(&[])];
         let c = ctl(&st, &cl, false);
-        c.reconcile(&segs).await.unwrap();
+        settle(&c, &st, &segs).await;
 
         // capacity.go:643-650: MaximumVolumeSize differs -> update.
         *cl.max.lock().unwrap() = Some(10);
-        c.reconcile(&segs).await.unwrap();
+        settle(&c, &st, &segs).await;
         assert_eq!(
             list_caps(&st).await[0].maximum_volume_size.as_deref(),
             Some("10")
@@ -1323,7 +1888,7 @@ mod tests {
         )
         .await
         .unwrap();
-        c.reconcile(&segs).await.unwrap();
+        settle(&c, &st, &segs).await;
         let o = list_caps(&st)
             .await
             .remove(0)
@@ -1342,7 +1907,7 @@ mod tests {
         put_sc(&st, sc("late-sc", DRIVER, None)).await;
         let c = ctl(&st, &cl, false);
         let both = vec![seg(&[("zone", "a")]), seg(&[("zone", "b")])];
-        c.reconcile(&both).await.unwrap();
+        settle(&c, &st, &both).await;
         assert_eq!(list_caps(&st).await.len(), 2);
 
         // A foreign object (other managed-by) must survive (capacity.go:782-786).
@@ -1374,7 +1939,7 @@ mod tests {
             .unwrap();
 
         // Segment b disappears -> its object goes; the duplicate goes too.
-        c.reconcile(&both[..1]).await.unwrap();
+        settle(&c, &st, &both[..1]).await;
         let names: Vec<_> = list_caps(&st)
             .await
             .into_iter()
@@ -1391,7 +1956,7 @@ mod tests {
         st.delete(&build_key("storageclasses", None, "late-sc"))
             .await
             .unwrap();
-        c.reconcile(&both[..1]).await.unwrap();
+        settle(&c, &st, &both[..1]).await;
         let names: Vec<_> = list_caps(&st)
             .await
             .into_iter()
@@ -1416,14 +1981,14 @@ mod tests {
         )
         .await;
         let segs = vec![seg(&[("zone", "a")])];
-        ctl(&st, &cl, false).reconcile(&segs).await.unwrap();
+        settle(&ctl(&st, &cl, false), &st, &segs).await;
         let classes: Vec<_> = list_caps(&st)
             .await
             .into_iter()
             .map(|c| c.storage_class_name)
             .collect();
         assert_eq!(classes, vec!["late".to_string()]);
-        ctl(&st, &cl, true).reconcile(&segs).await.unwrap();
+        settle(&ctl(&st, &cl, true), &st, &segs).await;
         assert_eq!(list_caps(&st).await.len(), 2);
     }
 
@@ -1482,14 +2047,525 @@ mod tests {
         put_sc(&st, sc("late-sc", DRIVER, None)).await;
         let c = ctl(&st, &cl, false);
         // No CSINodes: no segments, nothing published.
-        capacity_tick(&c, &TopologySource::Discovered)
-            .await
-            .unwrap();
+        c.prepare(&TopologySource::Discovered).await.unwrap();
+        pump(&c, &st).await;
         assert!(list_caps(&st).await.is_empty());
         // Fixed topology publishes exactly one object.
-        capacity_tick(&c, &TopologySource::Fixed(seg(&[("zone", "a")])))
+        c.prepare(&TopologySource::Fixed(seg(&[("zone", "a")])))
             .await
             .unwrap();
+        pump(&c, &st).await;
         assert_eq!(list_caps(&st).await.len(), 1);
+    }
+
+    #[test]
+    fn driver_topology_keys_is_none_without_the_driver_and_empty_without_keys() {
+        // nodes.go:175-185
+        let csi = |driver: &str, keys: Option<Vec<&str>>| CSINode {
+            type_meta: TypeMeta::default(),
+            metadata: ObjectMeta::new("n"),
+            spec: CSINodeSpec {
+                drivers: vec![CSINodeDriver {
+                    name: driver.into(),
+                    node_id: "n".into(),
+                    topology_keys: keys.map(|k| k.into_iter().map(String::from).collect()),
+                    allocatable: None,
+                }],
+            },
+        };
+        assert_eq!(driver_topology_keys(&csi("other", None), DRIVER), None);
+        assert_eq!(
+            driver_topology_keys(&csi(DRIVER, None), DRIVER),
+            Some(vec![])
+        );
+        assert_eq!(
+            driver_topology_keys(&csi(DRIVER, Some(vec!["a"])), DRIVER),
+            Some(vec!["a".to_string()])
+        );
+    }
+
+    // ---- event-driven triggers (#3548): capacity.go onSCAddOrUpdate etc. ----
+
+    async fn list_scs(st: &MemoryStorage) -> Vec<StorageClass> {
+        st.list::<StorageClass>(&build_prefix("storageclasses", None))
+            .await
+            .unwrap()
+    }
+
+    /// `prepare` (capacity.go:262-337): classes and topology are known, then
+    /// the existing objects are fed to `onCAddOrUpdate`.
+    async fn boot<'a>(
+        st: &'a MemoryStorage,
+        cl: &'a FakeClient,
+        immediate: bool,
+        segs: &[Segment],
+    ) -> CapacityController<'a, MemoryStorage, FakeClient> {
+        let c = ctl(st, cl, immediate);
+        c.apply_sc_list(list_scs(st).await);
+        c.apply_topology(segs.to_vec());
+        c.apply_c_list(list_caps(st).await);
+        c
+    }
+
+    /// A full pass of the controller's loops over `segs`: `prepare`, one
+    /// `pollCapacities` tick and the workers, with the informer feeding their
+    /// writes back.
+    async fn settle(
+        c: &CapacityController<'_, MemoryStorage, FakeClient>,
+        st: &MemoryStorage,
+        segs: &[Segment],
+    ) {
+        c.apply_sc_list(list_scs(st).await);
+        c.apply_topology(segs.to_vec());
+        c.apply_c_list(list_caps(st).await);
+        c.poll_capacities();
+        pump(c, st).await;
+    }
+
+    /// The informer delivering the effects of the workers' writes back to the
+    /// handlers, until nothing is left to do.
+    async fn pump(c: &CapacityController<'_, MemoryStorage, FakeClient>, st: &MemoryStorage) {
+        for _ in 0..6 {
+            c.sync_queued(Duration::from_millis(1), Duration::from_secs(1))
+                .await;
+            c.apply_c_list(list_caps(st).await);
+        }
+    }
+
+    fn queued_classes(c: &CapacityRefresher) -> Vec<String> {
+        let mut v: Vec<String> = c
+            .queued()
+            .iter()
+            .map(|i| i.storage_class_name.clone())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[tokio::test]
+    async fn sc_added_enqueues_one_item_per_known_segment() {
+        // onSCAddOrUpdate (capacity.go:370-387)
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        let c = boot(
+            &st,
+            &cl,
+            false,
+            &[seg(&[("zone", "a")]), seg(&[("zone", "b")])],
+        )
+        .await;
+        assert!(queued_classes(&c.refresher).is_empty());
+        put_sc(&st, sc("late", DRIVER, None)).await;
+        c.apply_sc_list(list_scs(&st).await);
+        assert_eq!(queued_classes(&c.refresher), vec!["late", "late"]);
+        pump(&c, &st).await;
+        assert_eq!(list_caps(&st).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sc_of_other_driver_or_immediate_binding_is_ignored_on_add() {
+        // capacity.go:371-379
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        let c = boot(&st, &cl, false, &[seg(&[("zone", "a")])]).await;
+        put_sc(&st, sc("foreign", "other-driver", None)).await;
+        put_sc(&st, sc("imm", DRIVER, Some(VolumeBindingMode::Immediate))).await;
+        c.apply_sc_list(list_scs(&st).await);
+        assert!(queued_classes(&c.refresher).is_empty());
+        let c = boot(&st, &cl, true, &[seg(&[("zone", "a")])]).await;
+        assert_eq!(queued_classes(&c.refresher), vec!["imm"]);
+    }
+
+    #[tokio::test]
+    async fn sc_deleted_removes_items_and_enqueues_object_removal() {
+        // onSCDelete (capacity.go:390-403) + removeWorkItem (:488-512)
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        put_sc(&st, sc("late", DRIVER, None)).await;
+        let c = boot(&st, &cl, false, &[seg(&[("zone", "a")])]).await;
+        pump(&c, &st).await;
+        assert_eq!(list_caps(&st).await.len(), 1);
+        st.delete(&build_key("storageclasses", None, "late"))
+            .await
+            .unwrap();
+        c.apply_sc_list(list_scs(&st).await);
+        assert_eq!(c.stats().goal, 0);
+        // The object itself is queued for removal, not left for a poll tick.
+        assert_eq!(list_caps(&st).await.len(), 1);
+        pump(&c, &st).await;
+        assert!(list_caps(&st).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn topology_added_creates_objects_for_all_matching_classes() {
+        // "add storage topology segment" (capacity_test.go:927-1001)
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        *cl.capacity.lock().unwrap() = 1 << 30;
+        put_sc(&st, sc("imm", DRIVER, Some(VolumeBindingMode::Immediate))).await;
+        put_sc(&st, sc("late", DRIVER, None)).await;
+        let c = boot(&st, &cl, false, &[]).await;
+        c.apply_topology(vec![seg(&[("zone", "a")])]);
+        pump(&c, &st).await;
+        let caps = list_caps(&st).await;
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0].storage_class_name, "late");
+        assert_eq!(c.stats().goal, 1);
+        assert_eq!(c.stats().current, 1);
+    }
+
+    #[tokio::test]
+    async fn topology_removed_deletes_objects_and_added_creates_new_ones() {
+        // "add and remove storage topology segment" (capacity_test.go:1039-1085)
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        put_sc(&st, sc("late", DRIVER, None)).await;
+        let c = boot(&st, &cl, false, &[seg(&[("zone", "a")])]).await;
+        pump(&c, &st).await;
+        c.apply_topology(vec![seg(&[("zone", "b")])]);
+        pump(&c, &st).await;
+        let caps = list_caps(&st).await;
+        assert_eq!(caps.len(), 1);
+        assert_eq!(
+            caps[0].node_topology.as_ref().unwrap().match_labels,
+            Some([("zone".to_string(), "b".to_string())].into())
+        );
+        c.apply_topology(vec![]);
+        pump(&c, &st).await;
+        assert!(list_caps(&st).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn capacity_deleted_by_someone_is_recreated() {
+        // "re-create capacity" (capacity_test.go:744-783); onCDelete (:728-741)
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        put_sc(&st, sc("late", DRIVER, None)).await;
+        let c = boot(&st, &cl, false, &[seg(&[("zone", "a")])]).await;
+        pump(&c, &st).await;
+        let before = list_caps(&st).await.remove(0);
+        st.delete(&build_key(
+            "csistoragecapacities",
+            Some(NS),
+            &before.metadata.name,
+        ))
+        .await
+        .unwrap();
+        c.informer_c_delete(&before);
+        pump(&c, &st).await;
+        let after = list_caps(&st).await;
+        assert_eq!(after.len(), 1);
+        assert_ne!(after[0].metadata.uid, before.metadata.uid);
+    }
+
+    #[tokio::test]
+    async fn capacity_that_lost_its_labels_is_left_alone_and_recreated() {
+        // "ignore capacity after owner change" (capacity_test.go:793-844);
+        // onCAddOrUpdate !isManaged branch (:688-701)
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        put_sc(&st, sc("late", DRIVER, None)).await;
+        let c = boot(&st, &cl, false, &[seg(&[("zone", "a")])]).await;
+        pump(&c, &st).await;
+        let mut obj = list_caps(&st).await.remove(0);
+        obj.metadata.labels = None;
+        st.update(
+            &build_key("csistoragecapacities", Some(NS), &obj.metadata.name),
+            &obj,
+        )
+        .await
+        .unwrap();
+        c.apply_c_list(list_caps(&st).await);
+        pump(&c, &st).await;
+        let caps = list_caps(&st).await;
+        assert_eq!(caps.len(), 2, "foreign object kept, new one created");
+        assert_eq!(
+            caps.iter().filter(|c| c.metadata.labels.is_some()).count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_and_recreate_by_someone_with_wrong_capacity_is_corrected() {
+        // "delete and recreate by someone" (capacity_test.go:845-892)
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        *cl.capacity.lock().unwrap() = 1 << 30;
+        put_sc(&st, sc("late", DRIVER, None)).await;
+        let c = boot(&st, &cl, false, &[seg(&[("zone", "a")])]).await;
+        pump(&c, &st).await;
+        let old = list_caps(&st).await.remove(0);
+        st.delete(&build_key(
+            "csistoragecapacities",
+            Some(NS),
+            &old.metadata.name,
+        ))
+        .await
+        .unwrap();
+        let mut new = old.clone();
+        new.metadata.uid = "uid-2".into();
+        new.capacity = Some("1Mi".into());
+        st.create(
+            &build_key("csistoragecapacities", Some(NS), &new.metadata.name),
+            &new,
+        )
+        .await
+        .unwrap();
+        // Watch order: Deleted(old), then Added(new).
+        c.informer_c_delete(&old);
+        let stored = list_caps(&st).await.remove(0);
+        c.informer_c_upsert(&stored);
+        pump(&c, &st).await;
+        let caps = list_caps(&st).await;
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0].capacity.as_deref(), Some("1Gi"));
+    }
+
+    #[tokio::test]
+    async fn redundant_managed_capacity_is_deleted_on_add() {
+        // "delete redundant capacity" (capacity_test.go:784-792); :723-725
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        let c = boot(&st, &cl, false, &[]).await;
+        let mut dup = CSIStorageCapacity {
+            type_meta: TypeMeta::default(),
+            metadata: ObjectMeta::new("csisc-dup").with_namespace(NS),
+            storage_class_name: "late".into(),
+            capacity: Some("1Gi".into()),
+            maximum_volume_size: None,
+            node_topology: Some(seg(&[("zone", "a")]).label_selector()),
+        };
+        dup.metadata.uid = "dup-uid".into();
+        dup.metadata.labels = Some(
+            [
+                (DRIVER_NAME_LABEL.to_string(), DRIVER.to_string()),
+                (MANAGED_BY_LABEL.to_string(), MANAGED.to_string()),
+            ]
+            .into(),
+        );
+        st.create(
+            &build_key("csistoragecapacities", Some(NS), "csisc-dup"),
+            &dup,
+        )
+        .await
+        .unwrap();
+        c.informer_c_upsert(&dup);
+        pump(&c, &st).await;
+        assert!(list_caps(&st).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn gauges_are_computed_lazily_from_current_state() {
+        // CollectWithStability (capacity.go:751-767): no tick stores them; an
+        // object created by a worker is not counted until its event arrives
+        // (:642-645).
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        put_sc(&st, sc("late", DRIVER, None)).await;
+        let c = boot(&st, &cl, false, &[seg(&[("zone", "a")])]).await;
+        assert_eq!(
+            c.stats(),
+            CapacityStats {
+                goal: 1,
+                current: 0,
+                obsolete: 0
+            }
+        );
+        c.sync_queued(Duration::from_millis(1), Duration::from_secs(1))
+            .await;
+        assert_eq!(c.stats().current, 0, "created, event not seen yet");
+        c.apply_c_list(list_caps(&st).await);
+        assert_eq!(
+            c.stats(),
+            CapacityStats {
+                goal: 1,
+                current: 1,
+                obsolete: 0
+            }
+        );
+        // "obsolete object, missing SC" (capacity_test.go:440-459)
+        st.delete(&build_key("storageclasses", None, "late"))
+            .await
+            .unwrap();
+        c.apply_sc_list(list_scs(&st).await);
+        assert_eq!(
+            c.stats(),
+            CapacityStats {
+                goal: 0,
+                current: 0,
+                obsolete: 1
+            }
+        );
+    }
+
+    /// Poll `f` until it holds, for at most 5s.
+    async fn eventually(what: &str, mut f: impl AsyncFnMut() -> bool) {
+        for _ in 0..250 {
+            if f().await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("timed out waiting for: {what}");
+    }
+
+    #[tokio::test]
+    async fn run_loop_reacts_to_watch_events_long_before_the_poll_tick() {
+        // The StorageClass, Node and CSINode informers drive the queue
+        // (capacity.go:188-219 + nodes.go:63-150); the poll period is an hour.
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        *cl.capacity.lock().unwrap() = 1 << 30;
+        let c = ctl(&st, &cl, false);
+        let run = run_capacity_loop(
+            &c,
+            &TopologySource::Discovered,
+            Duration::from_secs(3600),
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+            2,
+        );
+        let scenario = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            put_sc(&st, sc("late-sc", DRIVER, None)).await;
+            let n = node("n1", &[("zone", "a")]);
+            st.create(&build_key("nodes", None, "n1"), &n)
+                .await
+                .unwrap();
+            let csi = csi_node("n1", DRIVER, Some(vec!["zone"]));
+            st.create(&build_key("csinodes", None, "n1"), &csi)
+                .await
+                .unwrap();
+            eventually("object for the new segment", async || {
+                list_caps(&st).await.len() == 1
+            })
+            .await;
+            // A new label on the node changes the segment: new object, old gone.
+            let mut n = node("n1", &[("zone", "b")]);
+            n.metadata = st
+                .get::<Node>(&build_key("nodes", None, "n1"))
+                .await
+                .unwrap()
+                .metadata;
+            n.metadata.labels = Some([("zone".to_string(), "b".to_string())].into());
+            st.update(&build_key("nodes", None, "n1"), &n)
+                .await
+                .unwrap();
+            eventually("object moved to zone b", async || {
+                let caps = list_caps(&st).await;
+                caps.len() == 1
+                    && caps[0].node_topology.as_ref().unwrap().match_labels
+                        == Some([("zone".to_string(), "b".to_string())].into())
+            })
+            .await;
+            // The StorageClass goes: its object is removed by the delete event.
+            st.delete(&build_key("storageclasses", None, "late-sc"))
+                .await
+                .unwrap();
+            eventually("object removed with its class", async || {
+                list_caps(&st).await.is_empty()
+            })
+            .await;
+        };
+        tokio::select! {
+            _ = run => unreachable!("the loop never ends"),
+            _ = scenario => {}
+        }
+    }
+
+    // ---- #3547: capacity clientset rate limit and --capacity-threads ----
+
+    fn zones(n: usize) -> Vec<Segment> {
+        (0..n).map(|i| seg(&[("zone", &format!("z{i}"))])).collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capacity_creates_and_deletes_go_through_the_capacity_rate_limiter() {
+        // csi-provisioner.go:456-458 builds the clientset that creates, updates
+        // and deletes CSIStorageCapacity objects with its own QPS/Burst
+        // (token bucket, rest/config.go:370-381): burst 2 at 1 QPS lets two
+        // creates through at once, the 3rd and 4th wait 1s and 2s.
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        put_sc(&st, sc("late", DRIVER, None)).await;
+        let limited = |qps: f64, burst: f64| CapacityController {
+            limiter: std::sync::Arc::new(rusternetes_client::ratelimit::RateLimiter::new(
+                qps, burst,
+            )),
+            ..ctl(&st, &cl, false)
+        };
+        let c = limited(1.0, 2.0);
+        let start = tokio::time::Instant::now();
+        settle(&c, &st, &zones(4)).await;
+        assert_eq!(list_caps(&st).await.len(), 4);
+        assert_eq!(start.elapsed(), Duration::from_secs(2));
+
+        // Deletes of obsolete objects are throttled by the same bucket kind:
+        // burst 1 at 1 QPS, four deletes take 3s.
+        let c = limited(1.0, 1.0);
+        let start = tokio::time::Instant::now();
+        settle(&c, &st, &[]).await;
+        assert!(list_caps(&st).await.is_empty());
+        assert_eq!(start.elapsed(), Duration::from_secs(3));
+    }
+
+    #[test]
+    fn capacity_limiter_follows_client_go_defaulting() {
+        // rest/config.go:370-381: 0 -> DefaultQPS/DefaultBurst, qps <= 0 -> none.
+        let l = capacity_limiter(1.0, 5);
+        assert_eq!((l.qps(), l.burst()), (1.0, 5.0));
+        let l = capacity_limiter(0.0, 0);
+        assert_eq!((l.qps(), l.burst()), (5.0, 10.0));
+        assert!(capacity_limiter(-1.0, 5).qps() <= 0.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capacity_threads_workers_process_the_queue_concurrently() {
+        // Controller.Run (capacity.go:238-253) starts `threadiness` workers on
+        // the one queue; four 100ms GetCapacity calls take 100ms with four.
+        let st = MemoryStorage::new();
+        let cl = FakeClient::default();
+        *cl.delay.lock().unwrap() = Duration::from_millis(100);
+        put_sc(&st, sc("late", DRIVER, None)).await;
+        let c = boot(&st, &cl, false, &zones(4)).await;
+        let start = tokio::time::Instant::now();
+        let run = c.run_workers(4, Duration::from_millis(1), Duration::from_secs(1));
+        tokio::select! {
+            _ = run => unreachable!("workers never end"),
+            _ = eventually("four objects", async || list_caps(&st).await.len() == 4) => {}
+        }
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "took {:?}",
+            start.elapsed()
+        );
+        // The same item is never processed by two workers at once, so no
+        // duplicate objects appear (checked by the count above plus a tick).
+        c.apply_c_list(list_caps(&st).await);
+        c.poll_capacities();
+        tokio::select! {
+            _ = c.run_workers(4, Duration::from_millis(1), Duration::from_secs(1)) => unreachable!(),
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+        }
+        assert_eq!(list_caps(&st).await.len(), 4);
+    }
+
+    #[test]
+    fn workqueue_does_not_hand_out_an_item_that_is_being_processed() {
+        // client-go workqueue Add/Get/Done: re-adding an item in flight marks
+        // it dirty; it is queued again by Done, never processed twice at once.
+        let r = CapacityRefresher::new();
+        let k = ItemKey {
+            segment: seg(&[("zone", "a")]),
+            storage_class_name: "sc".into(),
+        };
+        r.set_capacities([k.clone()].into());
+        r.refresh_sc("sc");
+        let key = QueueKey::Item(k);
+        assert_eq!(r.pop(), Some(key.clone()));
+        r.refresh_sc("sc");
+        assert_eq!(r.pop(), None, "in flight: must not be handed out again");
+        r.done(&key);
+        assert_eq!(r.pop(), Some(key));
     }
 }
