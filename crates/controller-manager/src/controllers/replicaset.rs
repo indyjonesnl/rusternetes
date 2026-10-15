@@ -5,6 +5,7 @@ use super::controller_utils::{
 use super::expectations::ControllerExpectations;
 use super::pod_informer::{
     apply_pod_observation, ControllerRef, PodEventTarget, PodInformerCache, PodObservation,
+    ResolvedController,
 };
 use super::replicationcontroller::{
     generate_pod_name, is_namespace_terminating_rejection, slow_start_batches, BURST_REPLICAS,
@@ -1011,7 +1012,7 @@ impl<S: Storage + 'static> PodEventTarget for ReplicaSetController<S> {
         &self,
         namespace: &str,
         controller_ref: &ControllerRef,
-    ) -> Option<String> {
+    ) -> Option<ResolvedController> {
         if controller_ref.kind != "ReplicaSet" {
             return None;
         }
@@ -1026,7 +1027,10 @@ impl<S: Storage + 'static> PodEventTarget for ReplicaSetController<S> {
             .ok()?;
         // "The controller we found with this Name is not the same one that
         // the ControllerRef points to."
-        (rs.metadata.uid == controller_ref.uid).then_some(rs.metadata.name)
+        (rs.metadata.uid == controller_ref.uid).then(|| ResolvedController {
+            name: rs.metadata.name.clone(),
+            min_ready_seconds: rs.spec.min_ready_seconds.unwrap_or(0),
+        })
     }
 
     /// `ReplicaSetLister.GetPodReplicaSets` (client-go

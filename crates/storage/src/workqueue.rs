@@ -164,7 +164,12 @@ impl WorkQueue {
             // Don't mark dirty — requeue_rate_limited should use delayed map
         }
         let deadline = Instant::now() + delay;
-        inner.delayed.insert(key, deadline);
+        // delaying_queue.go `insert`: "if the entry already exists, update
+        // the time only if it would cause the item to be queued sooner".
+        let entry = inner.delayed.entry(key).or_insert(deadline);
+        if deadline < *entry {
+            *entry = deadline;
+        }
         drop(inner);
         // Wake up get() so it can recalculate its sleep deadline
         self.notify.notify_one();
@@ -220,8 +225,10 @@ impl WorkQueue {
                     .collect();
                 for key in ready {
                     inner.delayed.remove(&key);
-                    if !inner.dirty.contains(&key) && !inner.processing.contains(&key) {
-                        inner.dirty.insert(key.clone());
+                    // `waitingLoop` hands the matured entry to `Add`
+                    // (delaying_queue.go:305): a key being processed is only
+                    // marked dirty, and `done()` re-queues it.
+                    if inner.dirty.insert(key.clone()) && !inner.processing.contains(&key) {
                         inner.queue.push_back(key);
                     }
                 }
@@ -463,6 +470,40 @@ mod tests {
         assert_eq!(backoff_duration(4, base, max), Duration::from_millis(40));
         assert_eq!(backoff_duration(10, base, max), Duration::from_millis(2560));
         assert_eq!(backoff_duration(20, base, max), Duration::from_secs(1000)); // capped
+    }
+
+    /// delaying_queue.go `insert`: "if the entry already exists, update the
+    /// time only if it would cause the item to be queued sooner".
+    #[tokio::test]
+    async fn add_after_keeps_the_earlier_deadline() {
+        let q = WorkQueue::new();
+        q.add_after("key1".into(), Duration::from_millis(100)).await;
+        q.add_after("key1".into(), Duration::from_secs(60)).await;
+        let got = tokio::time::timeout(Duration::from_secs(3), q.get())
+            .await
+            .expect("the earlier deadline must stand");
+        assert_eq!(got.as_deref(), Some("key1"));
+    }
+
+    /// delaying_queue.go `waitingLoop` hands a ready entry to `Add`, which
+    /// marks a key being processed dirty so `Done` re-queues it; the wake-up
+    /// must not be dropped.
+    #[tokio::test]
+    async fn a_delayed_key_that_matures_while_processing_is_not_lost() {
+        let q = WorkQueue::new();
+        q.add("key1".into()).await;
+        let key = q.get().await.unwrap();
+        q.add_after(key.clone(), Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Promotion happens inside get(); nothing else is queued, so poll once.
+        assert!(tokio::time::timeout(Duration::from_millis(100), q.get())
+            .await
+            .is_err());
+        q.done(&key).await;
+        let got = tokio::time::timeout(Duration::from_secs(3), q.get())
+            .await
+            .expect("re-queued by done()");
+        assert_eq!(got.as_deref(), Some("key1"));
     }
 
     #[tokio::test]
