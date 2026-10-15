@@ -378,7 +378,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
         );
 
         // Read expectations BEFORE listing pods. Upstream does the same
-        // (replica_set.go:728 precedes the pod list) and its
+        // (replica_set.go:728 precedes the pod list at :736) and its
         // `TestRSSyncExpectations` explains why: if the list is taken first and
         // expectations checked second, a pod arriving in between makes the
         // record look fulfilled while the list still lacks that pod — and the
@@ -485,7 +485,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
                             // The namespace is going away, so every create in this
                             // reconcile will fail and none of them matter. Upstream
                             // returns nil here so the create is not counted as a
-                            // replica failure (replica_set.go:643-651); stopping
+                            // replica failure (replica_set.go:632-637); stopping
                             // now additionally spares the api-server a batch of
                             // requests it would only reject.
                             Err(e) if is_namespace_terminating_rejection(&e) => {
@@ -875,7 +875,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
 
         // Retry a name collision under a freshly generated name, as upstream's
         // api-server does for `generateName` objects
-        // (registry/generic/registry/store.go:463-470). Our controllers write
+        // (registry/generic/registry/store.go:464-475). Our controllers write
         // pods with a client-side name rather than through the generateName
         // path, so the retry has to live here.
         //
@@ -1115,7 +1115,7 @@ fn rc_owner_names(serialised_pod: &str) -> Vec<String> {
 /// }
 /// ```
 ///
-/// (pkg/controller/replicaset/replica_set.go:643-651). It is deliberately NOT
+/// (pkg/controller/replicaset/replica_set.go:632-637). It is deliberately NOT
 /// a `ReplicaFailure`: the namespace is going away, so there is nothing wrong
 /// with this ReplicaSet and nothing for an operator to act on.
 ///
@@ -2179,7 +2179,7 @@ pub(crate) mod tests {
     /// }
     /// ```
     ///
-    /// (pkg/controller/replicaset/replica_set.go:643-651)
+    /// (pkg/controller/replicaset/replica_set.go:632-637)
     ///
     /// We shipped the api-server half of that pair in #1849 — creates into a
     /// Terminating namespace now return 403 with the `NamespaceTerminating`
@@ -2321,7 +2321,7 @@ pub(crate) mod tests {
     /// Before this, #1849's admission rejection had no consumer, so every
     /// namespace teardown left the RC retrying creates that could never
     /// succeed and stamping a condition upstream deliberately never sets
-    /// (pkg/controller/replicaset/replica_set.go:643-651).
+    /// (pkg/controller/replicaset/replica_set.go:632-637).
     #[tokio::test]
     async fn rc_abandons_creates_when_namespace_is_terminating() {
         let inner = Arc::new(MemoryStorage::new());

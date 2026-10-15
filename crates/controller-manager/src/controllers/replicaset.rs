@@ -410,7 +410,7 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
             desired_replicas
         );
 
-        // `manageReplicas` (replica_set.go:601-698), gated as `syncReplicaSet`
+        // `manageReplicas` (replica_set.go:601-702), gated as `syncReplicaSet`
         // gates it: `if rsNeedsSync && rs.DeletionTimestamp == nil` (:757).
         // Acting while expectations are unmet is exactly what caused the #542
         // burst: a re-reconcile (rapid pod watch event or 5s resync) would
@@ -469,7 +469,7 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
                 }
                 // Any skipped (or failed) pods that never landed shouldn't be
                 // expected: "Decrement the expected number of creates because
-                // the informer won't observe this pod" (:642-650).
+                // the informer won't observe this pod" (:641-650).
                 for _ in 0..diff.saturating_sub(successful_creations) {
                     self.observe_creation(&exp_key);
                 }
@@ -995,7 +995,7 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
 
         // Retry a name collision under a freshly generated name, as upstream's
         // api-server does for `generateName` objects
-        // (registry/generic/registry/store.go:463-470). Any other error is
+        // (registry/generic/registry/store.go:464-475). Any other error is
         // returned on the first attempt.
         let mut attempt_name = pod_name;
         for attempt in 0..MAX_NAME_GENERATION_CREATE_ATTEMPTS {
@@ -1758,7 +1758,7 @@ mod tests {
     }
 
     /// `HasStatusCause(err, v1.NamespaceTerminatingCause)` -> `return nil`
-    /// (replica_set.go:631-637): no ReplicaFailure, no requeue.
+    /// (replica_set.go:632-637): no ReplicaFailure, no requeue.
     #[tokio::test]
     async fn rs_ignores_namespace_terminating_create_rejection() {
         let storage = Arc::new(TerminatingNamespaceStorage::new(Arc::new(
@@ -1863,7 +1863,7 @@ mod tests {
 
     /// `TestRSSyncExpectations`: a pod cannot sneak in between listing pods and
     /// checking expectations. Expectations must be read BEFORE the list
-    /// (replica_set.go:728 precedes :734): checked after, the late pod makes the
+    /// (replica_set.go:728 precedes :736): checked after, the late pod makes the
     /// record look fulfilled while the list still lacks it, and the controller
     /// creates a duplicate.
     #[tokio::test]
