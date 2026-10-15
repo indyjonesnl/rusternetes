@@ -1663,6 +1663,7 @@ mod tests {
             mounter: SafeFormatAndMount {
                 mounter: Arc::new(FakeMounter::new()),
                 exec: exec_dyn.clone(),
+                format_limit: Default::default(),
             },
             exec: exec_dyn,
             device_util,

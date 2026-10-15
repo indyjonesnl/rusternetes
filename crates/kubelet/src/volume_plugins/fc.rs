@@ -124,6 +124,7 @@ impl FcPlugin {
             mounter: SafeFormatAndMount {
                 mounter,
                 exec: exec.clone(),
+                format_limit: Default::default(),
             },
             device_util: new_os_device_handler(),
             mount_options: mount_option_from_spec(spec, &[]),
@@ -826,6 +827,7 @@ pub(crate) fn volume_spec_to_mounter(
         mounter: SafeFormatAndMount {
             mounter: Arc::new(host.get_mounter().clone()),
             exec,
+            format_limit: Default::default(),
         },
         device_util: new_os_device_handler(),
         mount_options: mount_option_from_spec(spec, &[]),

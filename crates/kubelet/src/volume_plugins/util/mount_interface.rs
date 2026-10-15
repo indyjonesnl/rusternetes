@@ -13,16 +13,17 @@
 //! trait lets a plugin test substitute `FakeMounter` exactly as upstream's
 //! `doTestPlugin` does.
 //!
-//! Not ported: `SafeFormatAndMount.formatSem` / `formatTimeout`
-//! (`mount.go:151-152`, `mount_linux.go:645-666`): the rate limit is only
-//! enabled by `WithMaxConcurrentFormat` (`mount.go:174-181`), which the kubelet
-//! never passes to the iscsi plugin (`&mount.SafeFormatAndMount{Interface:
-//! mounter, Exec: exec}`, `iscsi.go:134`, `attacher.go:132`), so it is nil.
+//! `SafeFormatAndMount.formatSem` / `formatTimeout` (`mount.go:151-152`) are
+//! [`FormatLimit`], enabled by `WithMaxConcurrentFormat` (`mount.go:174-181`);
+//! the kubelet never passes it to the iscsi plugin (`&mount.SafeFormatAndMount{
+//! Interface: mounter, Exec: exec}`, `iscsi.go:134`, `attacher.go:132`), so
+//! by default it is unset, as upstream.
 
 use super::exec::{Exec, ExecError};
 use super::mount_ops::{sanitized_options_for_logging, Mounter};
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 use tracing::{error, info, warn};
 
 /// `mount.Interface` (`mount.go:39-89`) restricted to what the volume plugins
@@ -145,14 +146,77 @@ const FSCK_ERRORS_CORRECTED: i32 = 1;
 /// `fsckErrorsUncorrected` (`mount_linux.go:52`).
 const FSCK_ERRORS_UNCORRECTED: i32 = 4;
 
-/// `mount.SafeFormatAndMount` (`mount.go:147-153`): `Interface` plus `Exec`.
+/// `formatSem` + `formatTimeout` (`mount.go:151-152`): a counting semaphore
+/// (`chan any` of capacity `n`) and the per-format token hold time. `None` is
+/// a nil `formatSem` (unlimited).
+#[derive(Clone, Default)]
+pub struct FormatLimit(Option<FormatLimitInner>);
+
+#[derive(Clone)]
+struct FormatLimitInner {
+    /// `cap(formatSem)`.
+    capacity: usize,
+    /// Tokens currently held (`len(formatSem)`).
+    held: Arc<(Mutex<usize>, Condvar)>,
+    /// `formatTimeout`.
+    timeout: Duration,
+}
+
+impl FormatLimit {
+    /// `WithMaxConcurrentFormat` (`mount.go:174-181`): `n < 1` is unlimited.
+    pub fn with_max_concurrent_format(n: i64, timeout: Duration) -> Self {
+        if n > 0 {
+            Self(Some(FormatLimitInner {
+                capacity: n as usize,
+                held: Arc::new((Mutex::new(0), Condvar::new())),
+                timeout,
+            }))
+        } else {
+            Self(None)
+        }
+    }
+
+    /// `formatSem != nil`.
+    pub fn has_sem(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// `cap(formatSem)`.
+    pub fn capacity(&self) -> Option<usize> {
+        self.0.as_ref().map(|i| i.capacity)
+    }
+
+    /// `formatTimeout`.
+    pub fn timeout(&self) -> Option<Duration> {
+        self.0.as_ref().map(|i| i.timeout)
+    }
+}
+
+/// `mount.SafeFormatAndMount` (`mount.go:147-153`): `Interface` plus `Exec`,
+/// and the optional `formatSem`/`formatTimeout`.
 #[derive(Clone)]
 pub struct SafeFormatAndMount {
     pub mounter: Arc<dyn MountInterface>,
     pub exec: Arc<dyn Exec>,
+    pub format_limit: FormatLimit,
 }
 
 impl SafeFormatAndMount {
+    /// `NewSafeFormatAndMount` (`mount.go:155-165`) without options.
+    pub fn new(mounter: Arc<dyn MountInterface>, exec: Arc<dyn Exec>) -> Self {
+        Self {
+            mounter,
+            exec,
+            format_limit: FormatLimit::default(),
+        }
+    }
+
+    /// `NewSafeFormatAndMount(.., WithMaxConcurrentFormat(n, timeout))`.
+    pub fn with_max_concurrent_format(mut self, n: i64, timeout: Duration) -> Self {
+        self.format_limit = FormatLimit::with_max_concurrent_format(n, timeout);
+        self
+    }
+
     /// `FormatAndMount` (`mount.go:189-191`).
     pub fn format_and_mount(
         &self,
@@ -302,8 +366,34 @@ impl SafeFormatAndMount {
             .map_err(|e| MountError::new(mount_error_value, e.to_string()))
     }
 
-    /// `format` (`mount_linux.go:645-666`) without the optional `formatSem`.
+    /// `format` (`mount_linux.go:645-666`). With a `formatSem` it acquires a
+    /// token (`mounter.formatSem <- struct{}{}`), and a goroutine releases it
+    /// when the command returns (`<-done`) or `formatTimeout` elapses,
+    /// whichever is first; the command itself is allowed to complete.
     fn format(&self, fstype: &str, args: &[String]) -> (String, Result<(), ExecError>) {
+        // `done` is closed on return (`defer close(done)`): dropping the
+        // sender wakes the releaser thread.
+        let _done = self.format_limit.0.as_ref().map(|limit| {
+            let (lock, cv) = &*limit.held;
+            let mut held = lock.lock().unwrap();
+            while *held >= limit.capacity {
+                held = cv.wait(held).unwrap();
+            }
+            *held += 1;
+            drop(held);
+
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+            let sem = limit.held.clone();
+            let timeout = limit.timeout;
+            std::thread::spawn(move || {
+                // select { case <-done: case <-timeout.C: }
+                let _ = done_rx.recv_timeout(timeout);
+                let (lock, cv) = &*sem;
+                *lock.lock().unwrap() -= 1;
+                cv.notify_one();
+            });
+            done_tx
+        });
         self.exec.combined_output(&format!("mkfs.{fstype}"), args)
     }
 
@@ -754,6 +844,7 @@ mod tests {
             let sfm = SafeFormatAndMount {
                 mounter: mounter.clone(),
                 exec: exec.clone(),
+                format_limit: Default::default(),
             };
             let dest = tempfile::tempdir().unwrap();
             let dest = dest.path().to_str().unwrap();
@@ -789,5 +880,111 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod format_limit_tests {
+    //! Ports of `TestWithMaxConcurrentFormat` (`mount_test.go:181-218`),
+    //! `TestSafeFormatAndMount_format` concurrency (`mount_linux_test.go:
+    //! 655-755`) and `TestFormatTimeout` (`:757-818`).
+    use super::testing::FakeMounter;
+    use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+
+    #[test]
+    fn with_max_concurrent_format() {
+        let timeout = Duration::from_secs(60);
+        for (max, want_sem) in [(0, false), (-1, false), (1, true), (3, true)] {
+            let l = FormatLimit::with_max_concurrent_format(max, timeout);
+            assert_eq!(l.has_sem(), want_sem, "max={max}");
+            if want_sem {
+                assert_eq!(l.capacity(), Some(max as usize));
+                assert_eq!(l.timeout(), Some(timeout));
+            }
+        }
+    }
+
+    /// An `Exec` whose command bumps `concurrent` then blocks on `witness`
+    /// (the upstream `makeFakeCommandAction` hook).
+    struct BlockingExec {
+        concurrent: Arc<Mutex<usize>>,
+        witness: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl Exec for BlockingExec {
+        fn combined_output(&self, _cmd: &str, _args: &[String]) -> (String, Result<(), ExecError>) {
+            *self.concurrent.lock().unwrap() += 1;
+            // `<-witness`: a value releases one command; a closed channel
+            // releases all of them.
+            let _ = self.witness.lock().unwrap().recv();
+            *self.concurrent.lock().unwrap() -= 1;
+            ("complete".to_string(), Ok(()))
+        }
+    }
+
+    fn setup(
+        max: i64,
+        timeout: Duration,
+    ) -> (Arc<SafeFormatAndMount>, Arc<Mutex<usize>>, mpsc::Sender<()>) {
+        let concurrent = Arc::new(Mutex::new(0));
+        let (tx, rx) = mpsc::channel();
+        let exec = Arc::new(BlockingExec {
+            concurrent: concurrent.clone(),
+            witness: Mutex::new(rx),
+        });
+        let sfm = SafeFormatAndMount::new(Arc::new(FakeMounter::new()), exec)
+            .with_max_concurrent_format(max, timeout);
+        (Arc::new(sfm), concurrent, tx)
+    }
+
+    fn spawn_formats(sfm: &Arc<SafeFormatAndMount>, n: usize) {
+        for _ in 0..n {
+            let sfm = sfm.clone();
+            thread::spawn(move || {
+                let (_, r) = sfm.format("ext4", &[]);
+                r.expect("format");
+            });
+        }
+    }
+
+    fn settle() {
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    #[test]
+    fn format_concurrency_is_bounded() {
+        for max in [2usize, 3, 4] {
+            let (sfm, concurrent, witness) = setup(max as i64, Duration::from_secs(60));
+            // max+1 formatters: only max may run, one waits for a token.
+            spawn_formats(&sfm, max + 1);
+            settle();
+            assert_eq!(*concurrent.lock().unwrap(), max, "max={max}");
+            // Let max commands finish; the pending one then runs.
+            for _ in 0..max {
+                witness.send(()).unwrap();
+            }
+            settle();
+            assert_eq!(*concurrent.lock().unwrap(), 1, "max={max}");
+            drop(witness);
+            thread::sleep(Duration::from_millis(50));
+            assert_eq!(*concurrent.lock().unwrap(), 0, "max={max}");
+        }
+    }
+
+    #[test]
+    fn format_timeout_releases_the_token() {
+        let max = 4usize;
+        let timeout = Duration::from_millis(200);
+        let (sfm, concurrent, witness) = setup(max as i64, timeout);
+        spawn_formats(&sfm, max + 1);
+        thread::sleep(timeout + Duration::from_millis(100));
+        // The token is released at the timeout although the command still
+        // runs, so the (max+1)th formatter was admitted.
+        assert_eq!(*concurrent.lock().unwrap(), max + 1);
+        drop(witness);
+        settle();
+        assert_eq!(*concurrent.lock().unwrap(), 0);
     }
 }

@@ -535,6 +535,7 @@ fn search_mounter(
         mounter: SafeFormatAndMount {
             mounter: Arc::new(FakeMounter::new()),
             exec: Arc::new(no_commands()),
+            format_limit: Default::default(),
         },
         device_util,
         mount_options: vec![],
