@@ -932,7 +932,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
         current_replicas: i32,
         ready_replicas: i32,
         failure_message: Option<&str>,
-        _failure_reason: Option<&str>,
+        failure_reason: Option<&str>,
     ) -> rusternetes_common::Result<()> {
         let namespace = rc.metadata.namespace.as_deref().unwrap_or("default");
         let key = build_key("replicationcontrollers", Some(namespace), &rc.metadata.name);
@@ -952,24 +952,29 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
             .cloned()
             .unwrap_or_default();
 
-        // Keep all conditions that are NOT managed by this controller
-        let mut conditions: Vec<_> = existing_conditions
-            .into_iter()
-            .filter(|c| c.condition_type != "ReplicaFailure")
-            .collect();
-
-        if let Some(msg) = failure_message {
-            // Add ReplicaFailure when there's an actual failure message
-            // (quota exceeded, pod creation failed, etc.)
-            conditions.push(ReplicationControllerCondition {
-                condition_type: "ReplicaFailure".to_string(),
-                status: "True".to_string(),
-                last_transition_time: Some(Utc::now()),
-                reason: Some("FailedCreate".to_string()),
-                message: Some(msg.to_string()),
-            });
+        // `calculateStatus` (replica_set_utils.go:124-136; the RC rides the RS
+        // controller upstream): ReplicaFailure is only SET when none exists and
+        // only REMOVED when there is no error, so a persisting failure keeps its
+        // lastTransitionTime and message (`SetCondition`, :169-176).
+        let mut conditions: Vec<_> = existing_conditions;
+        let has_failure_condition = conditions
+            .iter()
+            .any(|c| c.condition_type == "ReplicaFailure");
+        match failure_message {
+            Some(msg) if !has_failure_condition => {
+                conditions.push(ReplicationControllerCondition {
+                    condition_type: "ReplicaFailure".to_string(),
+                    status: "True".to_string(),
+                    last_transition_time: Some(Utc::now()),
+                    reason: failure_reason.map(str::to_string),
+                    message: Some(msg.to_string()),
+                });
+            }
+            None if has_failure_condition => {
+                conditions.retain(|c| c.condition_type != "ReplicaFailure");
+            }
+            _ => {}
         }
-        // else: ReplicaFailure already filtered out above, clearing it
 
         let final_conditions = if conditions.is_empty() {
             None

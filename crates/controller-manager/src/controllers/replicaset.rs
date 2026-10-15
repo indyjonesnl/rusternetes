@@ -410,8 +410,8 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
             desired_replicas
         );
 
-        // `manageReplicas` (replica_set.go:601-694), gated as `syncReplicaSet`
-        // gates it: `if rsNeedsSync && rs.DeletionTimestamp == nil` (:756).
+        // `manageReplicas` (replica_set.go:601-698), gated as `syncReplicaSet`
+        // gates it: `if rsNeedsSync && rs.DeletionTimestamp == nil` (:757).
         // Acting while expectations are unmet is exactly what caused the #542
         // burst: a re-reconcile (rapid pod watch event or 5s resync) would
         // `list` before the prior create was visible, see current<desired
@@ -431,7 +431,7 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
         } else if replicaset.metadata.deletion_timestamp.is_none() {
             if current_replicas < desired_replicas {
                 // `diff > rsc.burstReplicas` => `diff = rsc.burstReplicas`
-                // (replica_set.go:610-612).
+                // (replica_set.go:611-613).
                 let diff = ((desired_replicas - current_replicas) as usize).min(BURST_REPLICAS);
                 info!(
                     "Creating {} pods for replicaset {}/{}",
@@ -469,7 +469,7 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
                 }
                 // Any skipped (or failed) pods that never landed shouldn't be
                 // expected: "Decrement the expected number of creates because
-                // the informer won't observe this pod" (:640-650).
+                // the informer won't observe this pod" (:642-650).
                 for _ in 0..diff.saturating_sub(successful_creations) {
                     self.observe_creation(&exp_key);
                 }
@@ -492,7 +492,7 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
                 self.expectations
                     .expect_deletions_of(&exp_key, &doomed_keys);
                 // The deletes run concurrently and every one is attempted; only
-                // the first error is reported (:672-694).
+                // the first error is reported (:672-697).
                 let results = futures::future::join_all(
                     doomed
                         .iter()
@@ -502,7 +502,7 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
                 for (result, pod_key) in results.into_iter().zip(&doomed_keys) {
                     if let Err(e) = result {
                         // The informer will not observe this deletion
-                        // (replica_set.go:683-689).
+                        // (replica_set.go:679-686).
                         self.observe_deletion(&exp_key, pod_key);
                         if !matches!(e, rusternetes_common::Error::NotFound(_)) {
                             manage_error.get_or_insert_with(|| e.to_string());
@@ -564,7 +564,7 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
         .await?;
 
         // `if manageReplicasErr != nil { return manageReplicasErr }` after the
-        // status update (replica_set.go:765-767): the error requeues the key
+        // status update (replica_set.go:772-774): the error requeues the key
         // with rate-limited backoff.
         if let Some(e) = manage_error {
             return Err(rusternetes_common::Error::Internal(e));
@@ -1025,7 +1025,7 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
     }
 
     /// The per-pod create `manageReplicas` hands to `slowStartBatch`
-    /// (replica_set.go:624-632): a rejection because the namespace is
+    /// (replica_set.go:630-639): a rejection because the namespace is
     /// terminating returns nil, so it is neither a failure nor a
     /// `ReplicaFailure` — "any creation will fail". Upstream matches the
     /// structured `NamespaceTerminatingCause`; see
@@ -1051,6 +1051,18 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
         info!("Deleted pod {}/{}", namespace, name);
 
         Ok(())
+    }
+}
+
+/// Reason of the ReplicaFailure condition, from the pod count BEFORE
+/// `manageReplicas` ran against `.spec.replicas`: `FailedCreate` if short,
+/// `FailedDelete` if over, unset when equal (a zero-value string upstream).
+/// Upstream `calculateStatus`, replica_set_utils.go:127-132.
+pub(crate) fn replica_failure_reason(active: i32, desired: i32) -> Option<&'static str> {
+    match active.cmp(&desired) {
+        std::cmp::Ordering::Less => Some("FailedCreate"),
+        std::cmp::Ordering::Greater => Some("FailedDelete"),
+        std::cmp::Ordering::Equal => None,
     }
 }
 
@@ -1726,7 +1738,7 @@ mod tests {
             .unwrap();
 
         // syncReplicaSet returns manageReplicasErr after updating status, so
-        // the workqueue requeues with backoff (replica_set.go:765-767).
+        // the workqueue requeues with backoff (replica_set.go:772-774).
         let result = controller.reconcile_replicaset(&rs).await;
         assert!(result.is_err(), "a create failure must requeue the key");
 
@@ -1746,7 +1758,7 @@ mod tests {
     }
 
     /// `HasStatusCause(err, v1.NamespaceTerminatingCause)` -> `return nil`
-    /// (replica_set.go:632-637): no ReplicaFailure, no requeue.
+    /// (replica_set.go:631-637): no ReplicaFailure, no requeue.
     #[tokio::test]
     async fn rs_ignores_namespace_terminating_create_rejection() {
         let storage = Arc::new(TerminatingNamespaceStorage::new(Arc::new(
@@ -1936,17 +1948,5 @@ mod tests {
         assert_eq!(replica_failure_reason(3, 2), Some("FailedDelete"));
         // diff == 0 leaves `reason` unset (a zero-value string upstream).
         assert_eq!(replica_failure_reason(2, 2), None);
-    }
-}
-
-/// Reason of the ReplicaFailure condition, from the pod count BEFORE
-/// `manageReplicas` ran against `.spec.replicas`: `FailedCreate` if short,
-/// `FailedDelete` if over, unset when equal (a zero-value string upstream).
-/// Upstream `calculateStatus`, replica_set_utils.go:127-132.
-pub(crate) fn replica_failure_reason(active: i32, desired: i32) -> Option<&'static str> {
-    match active.cmp(&desired) {
-        std::cmp::Ordering::Less => Some("FailedCreate"),
-        std::cmp::Ordering::Greater => Some("FailedDelete"),
-        std::cmp::Ordering::Equal => None,
     }
 }
