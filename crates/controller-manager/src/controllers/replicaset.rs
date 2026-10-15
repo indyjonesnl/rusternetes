@@ -194,7 +194,7 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
             let storage_key = build_key("replicasets", Some(ns), name);
             match self.storage.get::<ReplicaSet>(&storage_key).await {
                 Ok(resource) => match self.reconcile_replicaset(&resource).await {
-                    Ok(()) => queue.forget(&key).await,
+                    Ok(_next_sync) => queue.forget(&key).await,
                     Err(e) => {
                         error!("Failed to reconcile {}: {}", key, e);
                         queue.requeue_rate_limited(key.clone()).await;
@@ -334,10 +334,12 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
         Ok(())
     }
 
+    /// Returns upstream's `nextSyncDuration` (replica_set.go:775-788): when the
+    /// key must be re-enqueued after a delay to recompute availability.
     async fn reconcile_replicaset(
         &self,
         replicaset: &ReplicaSet,
-    ) -> rusternetes_common::Result<()> {
+    ) -> rusternetes_common::Result<Option<Duration>> {
         let namespace = replicaset
             .metadata
             .namespace
@@ -570,7 +572,7 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
             return Err(rusternetes_common::Error::Internal(e));
         }
 
-        Ok(())
+        Ok(None)
     }
 
     /// Check if a pod's labels match the ReplicaSet's selector (ignoring ownerReference)
@@ -1948,5 +1950,333 @@ mod tests {
         assert_eq!(replica_failure_reason(3, 2), Some("FailedDelete"));
         // diff == 0 leaves `reason` unset (a zero-value string upstream).
         assert_eq!(replica_failure_reason(2, 2), None);
+    }
+
+    // ---------------------------------------------------------------------
+    // syncReplicaSet / calculateStatus / getPodsToDelete parity (#3624)
+    //
+    // Ported from upstream pkg/controller/replicaset/replica_set.go
+    // (`syncReplicaSet` :713-790, `getPodsToDelete` :874) and
+    // replica_set_utils.go (`calculateStatus` :96-141), with
+    // pkg/controller/controller_utils.go `ActivePodsWithRanks` (:778-870).
+    // ---------------------------------------------------------------------
+
+    use rusternetes_common::resources::pod::PodCondition;
+
+    fn ready_condition(since: chrono::DateTime<chrono::Utc>) -> PodCondition {
+        PodCondition {
+            condition_type: "Ready".to_string(),
+            status: "True".to_string(),
+            reason: None,
+            message: None,
+            last_probe_time: None,
+            last_transition_time: Some(since),
+            observed_generation: None,
+        }
+    }
+
+    /// A pod owned by `rs`, on `node` ("" = unscheduled), in `phase`, Ready
+    /// since `ready_since` (None = not ready).
+    fn ranked_pod(
+        name: &str,
+        rs: &ReplicaSet,
+        node: &str,
+        phase: Phase,
+        ready_since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Pod {
+        let labels = rs.spec.selector.match_labels.clone().unwrap_or_default();
+        let mut pod = owned_pod(name, labels, &rs.metadata.name, &rs.metadata.uid);
+        if !node.is_empty() {
+            pod.spec.as_mut().unwrap().node_name = Some(node.to_string());
+        }
+        let status = pod.status.as_mut().unwrap();
+        status.phase = Some(phase);
+        status.conditions = ready_since.map(|t| vec![ready_condition(t)]);
+        pod
+    }
+
+    async fn seed_rs(storage: &Arc<MemoryStorage>, rs: &ReplicaSet, pods: &[Pod]) {
+        storage
+            .create(
+                &build_key("replicasets", Some("default"), &rs.metadata.name),
+                rs,
+            )
+            .await
+            .unwrap();
+        for pod in pods {
+            storage
+                .create(&build_key("pods", Some("default"), &pod.metadata.name), pod)
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn terminating_pod_names(storage: &Arc<MemoryStorage>) -> Vec<String> {
+        let pods: Vec<Pod> = storage
+            .list(&build_prefix("pods", Some("default")))
+            .await
+            .unwrap();
+        let mut names: Vec<String> = pods
+            .into_iter()
+            .filter(|p| p.metadata.deletion_timestamp.is_some())
+            .map(|p| p.metadata.name)
+            .collect();
+        names.sort();
+        names
+    }
+
+    async fn status_of(storage: &Arc<MemoryStorage>, name: &str) -> ReplicaSetStatus {
+        let rs: ReplicaSet = storage
+            .get(&build_key("replicasets", Some("default"), name))
+            .await
+            .unwrap();
+        rs.status.expect("status written")
+    }
+
+    /// `syncReplicaSet` computes status from the `activePods` it listed BEFORE
+    /// `manageReplicas` (replica_set.go:743 `calculateStatus(rs, activePods,
+    /// ...)`; `manageReplicas` is documented "Does NOT modify <activePods>",
+    /// :597). Pods created this sync are counted by the sync their Added
+    /// events trigger, not by a second list.
+    #[tokio::test]
+    async fn rs_status_counts_the_pods_listed_before_manage_replicas() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicaSetController::new(Arc::clone(&storage), 30);
+        let rs = make_replicaset("pre", make_labels(&[("app", "pre")]), 3);
+        seed_rs(&storage, &rs, &[]).await;
+
+        controller.reconcile_replicaset(&rs).await.unwrap();
+
+        let pods: Vec<Pod> = storage
+            .list(&build_prefix("pods", Some("default")))
+            .await
+            .unwrap();
+        assert_eq!(pods.len(), 3);
+        assert_eq!(
+            status_of(&storage, "pre").await.replicas,
+            0,
+            "status is the pre-manage count, not a re-list"
+        );
+    }
+
+    /// Creations are observed by the informer's `addPod` handler
+    /// (replica_set.go:436 `CreationObserved`), never by the sync itself: a
+    /// sync that lowers its own expectations from a re-list defeats the brake.
+    #[tokio::test]
+    async fn rs_sync_does_not_lower_its_own_create_expectations() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicaSetController::new(Arc::clone(&storage), 30);
+        let rs = make_replicaset("exp", make_labels(&[("app", "exp")]), 3);
+        seed_rs(&storage, &rs, &[]).await;
+
+        controller.reconcile_replicaset(&rs).await.unwrap();
+
+        assert_eq!(
+            controller.expectations.get_expectations("default/exp"),
+            Some((3, 0)),
+            "only pod-watch Added events lower the creation expectation"
+        );
+    }
+
+    /// `getPodsToDelete` (replica_set.go:874) deletes the ranked victims,
+    /// not the first `diff` pods: not-ready before ready
+    /// (`ActivePodsWithRanks.Less` rule 3, controller_utils.go:849).
+    #[tokio::test]
+    async fn rs_scale_down_deletes_the_not_ready_pod_first() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicaSetController::new(Arc::clone(&storage), 30);
+        let rs = make_replicaset("rank", make_labels(&[("app", "rank")]), 1);
+        let ago = chrono::Utc::now() - chrono::Duration::seconds(300);
+        let pods = [
+            ranked_pod("a-ready", &rs, "n1", Phase::Running, Some(ago)),
+            ranked_pod("z-notready", &rs, "n1", Phase::Running, None),
+        ];
+        seed_rs(&storage, &rs, &pods).await;
+
+        controller.reconcile_replicaset(&rs).await.unwrap();
+
+        assert_eq!(terminating_pod_names(&storage).await, vec!["z-notready"]);
+    }
+
+    /// Rule 5 of `ActivePodsWithRanks.Less` (controller_utils.go:861): a pod
+    /// colocated with more related pods is deleted first
+    /// (`getPodsRankedByRelatedPodsOnSameNode`, replica_set.go:942-957).
+    #[tokio::test]
+    async fn rs_scale_down_prefers_the_pod_sharing_a_node() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicaSetController::new(Arc::clone(&storage), 30);
+        let rs = make_replicaset("colo", make_labels(&[("app", "colo")]), 2);
+        let ago = chrono::Utc::now() - chrono::Duration::seconds(300);
+        let pods = [
+            ranked_pod("a-alone", &rs, "n2", Phase::Running, Some(ago)),
+            ranked_pod("b-shared", &rs, "n1", Phase::Running, Some(ago)),
+            ranked_pod("c-shared", &rs, "n1", Phase::Running, Some(ago)),
+        ];
+        seed_rs(&storage, &rs, &pods).await;
+
+        controller.reconcile_replicaset(&rs).await.unwrap();
+
+        let victims = terminating_pod_names(&storage).await;
+        assert_eq!(victims.len(), 1);
+        assert_ne!(victims[0], "a-alone", "the pod alone on its node survives");
+    }
+
+    /// Unscheduled before scheduled, pending before running
+    /// (controller_utils.go:835-846; TestGetPodsToDelete "various pod phases").
+    #[tokio::test]
+    async fn rs_scale_down_prefers_unscheduled_then_pending_pods() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicaSetController::new(Arc::clone(&storage), 30);
+        let rs = make_replicaset("phase", make_labels(&[("app", "phase")]), 1);
+        let ago = chrono::Utc::now() - chrono::Duration::seconds(300);
+        let pods = [
+            ranked_pod("a-running", &rs, "n1", Phase::Running, Some(ago)),
+            ranked_pod("b-pending", &rs, "n1", Phase::Pending, None),
+            ranked_pod("c-unscheduled", &rs, "", Phase::Pending, None),
+        ];
+        seed_rs(&storage, &rs, &pods).await;
+
+        controller.reconcile_replicaset(&rs).await.unwrap();
+
+        assert_eq!(
+            terminating_pod_names(&storage).await,
+            vec!["b-pending", "c-unscheduled"]
+        );
+    }
+
+    /// `calculateStatus` counts a pod fully labeled when the TEMPLATE labels
+    /// match it (replica_set_utils.go:103-110), not every active pod.
+    #[tokio::test]
+    async fn rs_fully_labeled_replicas_matches_template_labels() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicaSetController::new(Arc::clone(&storage), 30);
+        let mut rs = make_replicaset("fl", make_labels(&[("app", "fl")]), 2);
+        rs.spec.template.metadata =
+            Some(ObjectMeta::new("").with_labels(make_labels(&[("app", "fl"), ("tier", "web")])));
+        let ago = chrono::Utc::now() - chrono::Duration::seconds(300);
+        let mut full = ranked_pod("full", &rs, "n1", Phase::Running, Some(ago));
+        full.metadata.labels = Some(make_labels(&[("app", "fl"), ("tier", "web")]));
+        let partial = ranked_pod("partial", &rs, "n1", Phase::Running, Some(ago));
+        seed_rs(&storage, &rs, &[full, partial]).await;
+
+        controller.reconcile_replicaset(&rs).await.unwrap();
+
+        let status = status_of(&storage, "fl").await;
+        assert_eq!(status.replicas, 2);
+        assert_eq!(status.fully_labeled_replicas, Some(1));
+    }
+
+    /// `IsPodAvailable` (pkg/api/v1/pod/util.go:283-294) measures
+    /// minReadySeconds from the Ready condition's lastTransitionTime, not the
+    /// pod's creation time.
+    #[tokio::test]
+    async fn rs_availability_uses_the_ready_transition_time() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicaSetController::new(Arc::clone(&storage), 30);
+        let mut rs = make_replicaset("avail", make_labels(&[("app", "avail")]), 2);
+        rs.spec.min_ready_seconds = Some(60);
+        let now = chrono::Utc::now();
+        // Created an hour ago but only just became Ready: not available.
+        let mut just_ready = ranked_pod(
+            "just-ready",
+            &rs,
+            "n1",
+            Phase::Running,
+            Some(now - chrono::Duration::seconds(10)),
+        );
+        just_ready.metadata.creation_timestamp = Some(now - chrono::Duration::hours(1));
+        // Also created an hour ago, Ready for two minutes: available.
+        let mut long_ready = ranked_pod(
+            "long-ready",
+            &rs,
+            "n1",
+            Phase::Running,
+            Some(now - chrono::Duration::seconds(120)),
+        );
+        long_ready.metadata.creation_timestamp = Some(now - chrono::Duration::hours(1));
+        seed_rs(&storage, &rs, &[just_ready, long_ready]).await;
+
+        controller.reconcile_replicaset(&rs).await.unwrap();
+
+        let status = status_of(&storage, "avail").await;
+        assert_eq!(status.ready_replicas, 2);
+        assert_eq!(status.available_replicas, 1);
+    }
+
+    /// `syncReplicaSet` plans the next availability check
+    /// (replica_set.go:775-788): `FindMinNextPodAvailabilityCheck` gives the
+    /// time until the earliest ready pod turns available.
+    #[tokio::test]
+    async fn rs_requeues_when_a_ready_pod_is_not_yet_available() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicaSetController::new(Arc::clone(&storage), 30);
+        let mut rs = make_replicaset("next", make_labels(&[("app", "next")]), 1);
+        rs.spec.min_ready_seconds = Some(60);
+        let pod = ranked_pod(
+            "p",
+            &rs,
+            "n1",
+            Phase::Running,
+            Some(chrono::Utc::now() - chrono::Duration::seconds(10)),
+        );
+        seed_rs(&storage, &rs, &[pod]).await;
+
+        let next = controller
+            .reconcile_replicaset(&rs)
+            .await
+            .unwrap()
+            .expect("an AddAfter must be planned");
+
+        assert!(
+            next > Duration::from_secs(48) && next <= Duration::from_secs(50),
+            "~50s left until the pod is available, got {next:?}"
+        );
+    }
+
+    /// With `DeploymentReplicaSetTerminatingReplicas` on, `calculateStatus`
+    /// reports the claimed terminating pods (replica_set_utils.go:119-122,
+    /// replica_set.go:748-753).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rs_reports_terminating_replicas_when_the_gate_is_on() {
+        use rusternetes_common::feature_gates::{with_feature, Feature};
+        let _gate = with_feature(Feature::DeploymentReplicaSetTerminatingReplicas, true);
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicaSetController::new(Arc::clone(&storage), 30);
+        let rs = make_replicaset("term", make_labels(&[("app", "term")]), 1);
+        let ago = chrono::Utc::now() - chrono::Duration::seconds(300);
+        let live = ranked_pod("live", &rs, "n1", Phase::Running, Some(ago));
+        let mut dying = ranked_pod("dying", &rs, "n1", Phase::Running, Some(ago));
+        dying.metadata.deletion_timestamp = Some(chrono::Utc::now());
+        seed_rs(&storage, &rs, &[live, dying]).await;
+
+        controller.reconcile_replicaset(&rs).await.unwrap();
+
+        let status = status_of(&storage, "term").await;
+        assert_eq!(status.replicas, 1);
+        assert_eq!(status.terminating_replicas, Some(1));
+    }
+
+    /// Gate off: the field stays unset (replica_set_utils.go:119).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rs_leaves_terminating_replicas_unset_when_the_gate_is_off() {
+        use rusternetes_common::feature_gates::{with_feature, Feature};
+        let _gate = with_feature(Feature::DeploymentReplicaSetTerminatingReplicas, false);
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicaSetController::new(Arc::clone(&storage), 30);
+        let rs = make_replicaset("termoff", make_labels(&[("app", "termoff")]), 1);
+        let ago = chrono::Utc::now() - chrono::Duration::seconds(300);
+        let live = ranked_pod("live", &rs, "n1", Phase::Running, Some(ago));
+        let mut dying = ranked_pod("dying", &rs, "n1", Phase::Running, Some(ago));
+        dying.metadata.deletion_timestamp = Some(chrono::Utc::now());
+        seed_rs(&storage, &rs, &[live, dying]).await;
+
+        controller.reconcile_replicaset(&rs).await.unwrap();
+
+        assert_eq!(
+            status_of(&storage, "termoff").await.terminating_replicas,
+            None
+        );
     }
 }

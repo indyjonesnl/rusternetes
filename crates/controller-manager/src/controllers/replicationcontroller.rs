@@ -235,7 +235,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
                 .await
             {
                 Ok(resource) => match self.reconcile_rc(&resource).await {
-                    Ok(()) => queue.forget(&key).await,
+                    Ok(_next_sync) => queue.forget(&key).await,
                     Err(e) => {
                         error!("Failed to reconcile {}: {}", key, e);
                         queue.requeue_rate_limited(key.clone()).await;
@@ -291,7 +291,10 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
         Ok(())
     }
 
-    async fn reconcile_rc(&self, rc: &ReplicationController) -> rusternetes_common::Result<()> {
+    async fn reconcile_rc(
+        &self,
+        rc: &ReplicationController,
+    ) -> rusternetes_common::Result<Option<Duration>> {
         let namespace = rc.metadata.namespace.as_deref().unwrap_or("default");
         let rc_key = format!("{}/{}", namespace, rc.metadata.name);
 
@@ -346,7 +349,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
                         "RC {}/{} orphan incomplete, will retry next cycle",
                         namespace, rc.metadata.name
                     );
-                    return Ok(());
+                    return Ok(None);
                 }
                 // Remove orphan finalizer and delete the RC
                 let mut updated_rc = rc.clone();
@@ -365,11 +368,11 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
                 } else {
                     let _ = self.storage.update(&rc_key, &updated_rc).await;
                 }
-                return Ok(());
+                return Ok(None);
             }
             // If being deleted without orphan, skip reconciliation (let it terminate)
             self.expectations.delete_expectations(&rc_key);
-            return Ok(());
+            return Ok(None);
         }
 
         debug!(
@@ -646,7 +649,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
             return Err(rusternetes_common::Error::Internal(e));
         }
 
-        Ok(())
+        Ok(None)
     }
 
     /// Check if a pod's labels match the RC's selector (pure label check, ignores ownerReference)
@@ -2572,7 +2575,7 @@ pub(crate) mod tests {
         let rc: ReplicationController = storage.get(rc_key).await.unwrap();
         storage.arm();
         let result = controller.reconcile_rc(&rc).await;
-        (controller, result)
+        (controller, result.map(|_| ()))
     }
 
     /// The deletes run concurrently, every one is attempted, and only the
@@ -3000,6 +3003,245 @@ pub(crate) mod tests {
         assert_eq!(
             controller.expectations.get_expectations("default/g"),
             Some((0, 1))
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // syncReplicaSet / calculateStatus / getPodsToDelete parity (#3627)
+    //
+    // The RC rides the ReplicaSet controller upstream
+    // (pkg/controller/replication/replication_controller.go:57-79,
+    // `NewBaseController` with `EnableStatusTerminatingReplicas: false`), so
+    // each behaviour below is the RS one (#3624): replica_set.go
+    // `syncReplicaSet` :713-790, `getPodsToDelete` :874,
+    // replica_set_utils.go `calculateStatus` :96-141.
+    // ---------------------------------------------------------------------
+
+    fn rc_selector(app: &str) -> HashMap<String, String> {
+        let mut selector = HashMap::new();
+        selector.insert("app".to_string(), app.to_string());
+        selector
+    }
+
+    async fn seed_rc(
+        storage: &Arc<MemoryStorage>,
+        controller: &ReplicationControllerController<MemoryStorage>,
+        rc: &ReplicationController,
+    ) {
+        storage
+            .create(
+                &format!(
+                    "/registry/replicationcontrollers/default/{}",
+                    rc.metadata.name
+                ),
+                rc,
+            )
+            .await
+            .unwrap();
+        let stored: ReplicationController = storage
+            .get(&format!(
+                "/registry/replicationcontrollers/default/{}",
+                rc.metadata.name
+            ))
+            .await
+            .unwrap();
+        controller.reconcile_rc(&stored).await.unwrap();
+    }
+
+    async fn rc_pods(storage: &Arc<MemoryStorage>) -> Vec<Pod> {
+        storage.list("/registry/pods/default/").await.unwrap()
+    }
+
+    async fn write_pod(storage: &Arc<MemoryStorage>, pod: &Pod) {
+        storage
+            .update(
+                &format!("/registry/pods/default/{}", pod.metadata.name),
+                pod,
+            )
+            .await
+            .unwrap();
+    }
+
+    fn make_ready(pod: &mut Pod, since: chrono::DateTime<chrono::Utc>) {
+        let status = pod.status.get_or_insert_with(Default::default);
+        status.phase = Some(Phase::Running);
+        status.conditions = Some(vec![rusternetes_common::resources::pod::PodCondition {
+            condition_type: "Ready".to_string(),
+            status: "True".to_string(),
+            reason: None,
+            message: None,
+            last_probe_time: None,
+            last_transition_time: Some(since),
+            observed_generation: None,
+        }]);
+    }
+
+    async fn rc_status(storage: &Arc<MemoryStorage>, name: &str) -> ReplicationControllerStatus {
+        let rc: ReplicationController = storage
+            .get(&format!("/registry/replicationcontrollers/default/{name}"))
+            .await
+            .unwrap();
+        rc.status.expect("status written")
+    }
+
+    use rusternetes_common::resources::ReplicationControllerStatus;
+
+    /// `calculateStatus(rs, activePods, ...)` over the pods listed before
+    /// `manageReplicas` (replica_set.go:743, :597 "Does NOT modify
+    /// <activePods>").
+    #[tokio::test]
+    async fn rc_status_counts_the_pods_listed_before_manage_replicas() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicationControllerController::new(storage.clone(), 5);
+        let rc = make_rc("pre", "default", 3, rc_selector("pre"), None);
+        seed_rc(&storage, &controller, &rc).await;
+
+        assert_eq!(rc_pods(&storage).await.len(), 3);
+        assert_eq!(
+            rc_status(&storage, "pre").await.replicas,
+            0,
+            "status is the pre-manage count, not a re-list"
+        );
+    }
+
+    /// `CreationObserved` is the informer's `addPod` (replica_set.go:436);
+    /// the sync never lowers its own expectations.
+    #[tokio::test]
+    async fn rc_sync_does_not_lower_its_own_create_expectations() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicationControllerController::new(storage.clone(), 5);
+        let rc = make_rc("exp", "default", 3, rc_selector("exp"), None);
+        seed_rc(&storage, &controller, &rc).await;
+
+        assert_eq!(
+            controller.expectations.get_expectations("default/exp"),
+            Some((3, 0))
+        );
+    }
+
+    /// `getPodsToDelete` (replica_set.go:874) ranks victims: not-ready before
+    /// ready (controller_utils.go:849).
+    #[tokio::test]
+    async fn rc_scale_down_deletes_the_not_ready_pod_first() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicationControllerController::new(storage.clone(), 5);
+        let rc = make_rc("rank", "default", 2, rc_selector("rank"), None);
+        seed_rc(&storage, &controller, &rc).await;
+        let mut pods = rc_pods(&storage).await;
+        pods.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
+        let ago = chrono::Utc::now() - chrono::Duration::seconds(300);
+        make_ready(&mut pods[0], ago);
+        for pod in &mut pods {
+            pod.spec.as_mut().unwrap().node_name = Some("n1".to_string());
+            write_pod(&storage, pod).await;
+        }
+        let keep = pods[0].metadata.name.clone();
+        controller.expectations.delete_expectations("default/rank");
+
+        let mut rc: ReplicationController = storage
+            .get("/registry/replicationcontrollers/default/rank")
+            .await
+            .unwrap();
+        rc.spec.replicas = Some(1);
+        controller.reconcile_rc(&rc).await.unwrap();
+
+        let dying: Vec<String> = rc_pods(&storage)
+            .await
+            .into_iter()
+            .filter(|p| p.metadata.deletion_timestamp.is_some())
+            .map(|p| p.metadata.name)
+            .collect();
+        assert_eq!(dying.len(), 1);
+        assert_ne!(dying[0], keep, "the Ready pod must survive");
+    }
+
+    /// `fullyLabeledReplicas` matches the TEMPLATE labels
+    /// (replica_set_utils.go:103-110).
+    #[tokio::test]
+    async fn rc_fully_labeled_replicas_matches_template_labels() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicationControllerController::new(storage.clone(), 5);
+        let mut template = rc_selector("fl");
+        template.insert("tier".to_string(), "web".to_string());
+        let rc = make_rc("fl", "default", 2, rc_selector("fl"), Some(template));
+        seed_rc(&storage, &controller, &rc).await;
+        let mut pods = rc_pods(&storage).await;
+        pods.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
+        pods[0].metadata.labels = Some(rc_selector("fl"));
+        write_pod(&storage, &pods[0]).await;
+        controller.expectations.delete_expectations("default/fl");
+
+        let rc: ReplicationController = storage
+            .get("/registry/replicationcontrollers/default/fl")
+            .await
+            .unwrap();
+        controller.reconcile_rc(&rc).await.unwrap();
+
+        let status = rc_status(&storage, "fl").await;
+        assert_eq!(status.replicas, 2);
+        assert_eq!(status.fully_labeled_replicas, Some(1));
+    }
+
+    /// `IsPodAvailable` measures minReadySeconds from the Ready condition's
+    /// lastTransitionTime (pkg/api/v1/pod/util.go:283-294); the RC's
+    /// `availableReplicas` is that count, not `readyReplicas`.
+    #[tokio::test]
+    async fn rc_availability_honours_min_ready_seconds() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicationControllerController::new(storage.clone(), 5);
+        let mut rc = make_rc("avail", "default", 2, rc_selector("avail"), None);
+        rc.spec.min_ready_seconds = Some(60);
+        seed_rc(&storage, &controller, &rc).await;
+        let mut pods = rc_pods(&storage).await;
+        let now = chrono::Utc::now();
+        make_ready(&mut pods[0], now - chrono::Duration::seconds(10));
+        make_ready(&mut pods[1], now - chrono::Duration::seconds(120));
+        for pod in &pods {
+            write_pod(&storage, pod).await;
+        }
+        controller.expectations.delete_expectations("default/avail");
+
+        let rc: ReplicationController = storage
+            .get("/registry/replicationcontrollers/default/avail")
+            .await
+            .unwrap();
+        controller.reconcile_rc(&rc).await.unwrap();
+
+        let status = rc_status(&storage, "avail").await;
+        assert_eq!(status.ready_replicas, Some(2));
+        assert_eq!(status.available_replicas, Some(1));
+    }
+
+    /// `syncReplicaSet` plans the next availability check
+    /// (replica_set.go:775-788).
+    #[tokio::test]
+    async fn rc_requeues_when_a_ready_pod_is_not_yet_available() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicationControllerController::new(storage.clone(), 5);
+        let mut rc = make_rc("next", "default", 1, rc_selector("next"), None);
+        rc.spec.min_ready_seconds = Some(60);
+        seed_rc(&storage, &controller, &rc).await;
+        let mut pods = rc_pods(&storage).await;
+        make_ready(
+            &mut pods[0],
+            chrono::Utc::now() - chrono::Duration::seconds(10),
+        );
+        write_pod(&storage, &pods[0]).await;
+        controller.expectations.delete_expectations("default/next");
+
+        let rc: ReplicationController = storage
+            .get("/registry/replicationcontrollers/default/next")
+            .await
+            .unwrap();
+        let next = controller
+            .reconcile_rc(&rc)
+            .await
+            .unwrap()
+            .expect("an AddAfter must be planned");
+
+        assert!(
+            next > Duration::from_secs(48) && next <= Duration::from_secs(50),
+            "~50s left until the pod is available, got {next:?}"
         );
     }
 }
