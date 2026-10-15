@@ -16,6 +16,8 @@ use crate::advanced::{
 };
 use crate::data_plane::{ApiBackend, DataPlane};
 use crate::diagnosis::{fit_error_message, Diagnosis};
+use crate::framework_runtime::{names, ExtensionPoint};
+use crate::profile::DEFAULT_SCHEDULER_NAME;
 use crate::volume_binding::{self, PreFilterOutcome};
 
 pub struct Scheduler<S: Storage + Send + Sync + 'static = StorageBackend> {
@@ -894,10 +896,19 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         vols: Option<volume_binding::PodVolumes>,
     ) -> rusternetes_common::Result<()> {
         use crate::volume_bind::{self as vb, PreBindPreFlight, VolumeBindingState};
-        let bind_timeout = self
+        let profile = self
             .profile_for(&pod)
-            .map_err(rusternetes_common::Error::Internal)?
-            .volume_bind_timeout;
+            .map_err(rusternetes_common::Error::Internal)?;
+        let bind_timeout = profile.volume_bind_timeout;
+        // VolumeBinding's Reserve / PreBind run only when the pod's profile
+        // enables the plugin at those extension points (RunReservePluginsReserve
+        // :211, RunPreBindPlugins :327 iterate the profile's plugin lists).
+        let reserve_on = profile
+            .framework
+            .has(ExtensionPoint::Reserve, names::VOLUME_BINDING);
+        let prebind_on = profile
+            .framework
+            .has(ExtensionPoint::PreBind, names::VOLUME_BINDING);
         let ns = pod
             .metadata
             .namespace
@@ -914,7 +925,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         };
 
         // Reserve (volume_binding.go:531-553)
-        {
+        if reserve_on {
             let mut b = self.volume_binder.lock().unwrap_or_else(|e| e.into_inner());
             if let Err(e) = vb::reserve(&mut b, &mut state, &pod, node_name) {
                 drop(b);
@@ -928,6 +939,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
 
         // PreBindPreFlight + PreBind (volume_binding.go:555-601)
         let prebind = match vb::pre_bind_preflight(&state, node_name) {
+            _ if !prebind_on => Ok(()),
             Ok(PreBindPreFlight::Skip) => Ok(()),
             Ok(PreBindPreFlight::Run) => {
                 vb::pre_bind(
@@ -975,10 +987,24 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         // 6. Calculate resource scores
         // 7. Select node with highest score
 
+        // The pod's own framework (`frameworkForPod`): which plugins run at
+        // each extension point for this profile (`NewFramework`, #3401).
+        let fallback_profile;
+        let profile = match self.profile_for(pod) {
+            Ok(p) => p,
+            Err(_) => {
+                fallback_profile = crate::profile::Profile::named(DEFAULT_SCHEDULER_NAME);
+                &fallback_profile
+            }
+        };
+        let fw = &profile.framework;
+        let filter_on = |name: &str| fw.has(ExtensionPoint::Filter, name);
         // Phase 0: VolumeBinding PreFilter (volume_binding.go PreFilter). A pod
         // with a missing/lost/deleting PVC or an unbound Immediate claim is
         // UnschedulableAndUnresolvable; the pod is retried on the next resync.
-        let volume_ctx = if volume_binding::pod_references_pvcs(pod) {
+        let volume_ctx = if volume_binding::pod_references_pvcs(pod)
+            && fw.has(ExtensionPoint::PreFilter, names::VOLUME_BINDING)
+        {
             let ns = pod.metadata.namespace.as_deref().unwrap_or("default");
             match self.data.list_volume_snapshot(ns).await {
                 Ok(snap) => match self.sync_and_pre_filter(ns, pod, &snap) {
@@ -1003,13 +1029,17 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         };
 
         // Phase 1: Filter schedulable nodes
+        // (NodeUnschedulable filter.)
+        let unschedulable_on = filter_on(names::NODE_UNSCHEDULABLE);
         let schedulable_nodes: Vec<&Node> = nodes
             .iter()
             .filter(|n| {
-                !n.spec
-                    .as_ref()
-                    .and_then(|s| s.unschedulable)
-                    .unwrap_or(false)
+                !unschedulable_on
+                    || !n
+                        .spec
+                        .as_ref()
+                        .and_then(|s| s.unschedulable)
+                        .unwrap_or(false)
             })
             .collect();
 
@@ -1017,10 +1047,11 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             return None;
         }
 
-        // Phase 2: Filter by taints and tolerations
+        // Phase 2: Filter by taints and tolerations (TaintToleration filter).
+        let taint_on = filter_on(names::TAINT_TOLERATION);
         let tolerated_nodes: Vec<&Node> = schedulable_nodes
             .iter()
-            .filter(|node| check_taints_tolerations(node, pod))
+            .filter(|node| !taint_on || check_taints_tolerations(node, pod))
             .copied()
             .collect();
 
@@ -1030,16 +1061,20 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         }
 
         // Phase 3: Check node selectors (basic label matching)
-        let selector_matched_nodes: Vec<&Node> =
-            if let Some(node_selector) = pod.spec.as_ref().and_then(|s| s.node_selector.as_ref()) {
-                tolerated_nodes
-                    .iter()
-                    .filter(|node| self.matches_node_selector(node, node_selector))
-                    .copied()
-                    .collect()
-            } else {
-                tolerated_nodes
-            };
+        // (`spec.nodeSelector` is part of the NodeAffinity filter.)
+        let node_affinity_filter_on = filter_on(names::NODE_AFFINITY);
+        let selector_matched_nodes: Vec<&Node> = if !node_affinity_filter_on {
+            tolerated_nodes
+        } else if let Some(node_selector) = pod.spec.as_ref().and_then(|s| s.node_selector.as_ref())
+        {
+            tolerated_nodes
+                .iter()
+                .filter(|node| self.matches_node_selector(node, node_selector))
+                .copied()
+                .collect()
+        } else {
+            tolerated_nodes
+        };
 
         if selector_matched_nodes.is_empty() {
             debug!("No nodes match node selector");
@@ -1048,9 +1083,10 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
 
         // Phase 4: Check DRA device availability
         // Filter nodes that have required devices for ResourceClaims
+        let dra_on = filter_on(names::DYNAMIC_RESOURCES);
         let mut dra_matched_nodes: Vec<&Node> = Vec::new();
         for node in selector_matched_nodes {
-            if self.check_dra_device_availability(node, pod).await {
+            if !dra_on || self.check_dra_device_availability(node, pod).await {
                 dra_matched_nodes.push(node);
             } else {
                 debug!(
@@ -1066,10 +1102,11 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         }
 
         // Phase 4b: Check hostPort conflicts
+        let ports_on = filter_on(names::NODE_PORTS);
         let port_ok_nodes: Vec<&Node> = dra_matched_nodes
             .into_iter()
             .filter(|node| {
-                if !check_host_port_conflicts(node, pod, all_pods) {
+                if ports_on && !check_host_port_conflicts(node, pod, all_pods) {
                     debug!(
                         "Node {} rejected for pod {}: hostPort conflict",
                         node.metadata.name, pod.metadata.name
@@ -1093,7 +1130,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         let mut pod_volumes_by_node: std::collections::HashMap<String, volume_binding::PodVolumes> =
             std::collections::HashMap::new();
         let port_ok_nodes: Vec<&Node> = match volume_ctx {
-            Some((snap, claims)) => port_ok_nodes
+            Some((snap, claims)) if filter_on(names::VOLUME_BINDING) => port_ok_nodes
                 .into_iter()
                 .filter(
                     |node| match volume_binding::find_pod_volumes(pod, &claims, node, &snap) {
@@ -1121,7 +1158,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     },
                 )
                 .collect(),
-            None => port_ok_nodes,
+            _ => port_ok_nodes,
         };
 
         if port_ok_nodes.is_empty() {
@@ -1133,10 +1170,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         // only built when StorageCapacityScoring is on (volume_binding.go:642-653);
         // otherwise, or when PreScore says Skip, Score is not run.
         // Per-profile VolumeBindingArgs.Shape (the pod's own framework).
-        let volume_shape = self
-            .profile_for(pod)
-            .map(|p| p.volume_shape.clone())
-            .unwrap_or_else(|_| volume_binding::default_shape());
+        let volume_shape = profile.volume_shape.clone();
         let scoring_enabled = rusternetes_common::feature_gates::enabled(
             rusternetes_common::feature_gates::Feature::StorageCapacityScoring,
         );
@@ -1150,32 +1184,35 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
 
         // Phase 5, 6 & 7: Score nodes based on affinity, pod affinity/anti-affinity, topology spread, and resources
         let mut node_scores: Vec<NodeScore> = Vec::new();
+        let inter_pod_filter_on = filter_on(names::INTER_POD_AFFINITY);
+        let spread_filter_on = filter_on(names::POD_TOPOLOGY_SPREAD);
+        let fit_filter_on = filter_on(names::NODE_RESOURCES_FIT);
 
         for node in port_ok_nodes {
             // Check node affinity (hard requirements and scoring)
             let (affinity_ok, node_affinity_score) = check_node_affinity(node, pod);
-            if !affinity_ok {
+            if node_affinity_filter_on && !affinity_ok {
                 continue; // Skip nodes that don't meet hard affinity requirements
             }
 
             // Check pod affinity (hard requirements and scoring)
             let (pod_affinity_ok, pod_affinity_score) =
                 check_pod_affinity(node, pod, all_pods, nodes);
-            if !pod_affinity_ok {
+            if inter_pod_filter_on && !pod_affinity_ok {
                 continue; // Skip nodes that don't meet hard pod affinity requirements
             }
 
             // Check pod anti-affinity (hard requirements and penalty scoring)
             let (pod_anti_affinity_ok, pod_anti_affinity_penalty) =
                 check_pod_anti_affinity(node, pod, all_pods, nodes);
-            if !pod_anti_affinity_ok {
+            if inter_pod_filter_on && !pod_anti_affinity_ok {
                 continue; // Skip nodes that violate hard pod anti-affinity requirements
             }
 
             // Check topology spread constraints (hard requirements and penalty scoring)
             let (topology_ok, topology_penalty) =
                 check_topology_spread_constraints(node, pod, all_pods, nodes);
-            if !topology_ok {
+            if spread_filter_on && !topology_ok {
                 continue; // Skip nodes that violate hard topology spread constraints
             }
 
@@ -1183,7 +1220,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             let resource_score = self.calculate_resource_score_with_overhead(node, pod, all_pods);
 
             // If pod doesn't fit resource-wise, skip
-            if resource_score == 0 {
+            if fit_filter_on && resource_score == 0 {
                 debug!(
                     "Node {} rejected for pod {}: resource_score=0 (insufficient resources)",
                     node.metadata.name, pod.metadata.name,
@@ -1210,13 +1247,25 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     scoring_enabled,
                 )
             });
-            let total_score = volume_score
-                + (resource_score as i64 * 25 / 100)
-                + (node_affinity_score as i64 * 20 / 100)
-                + (pod_affinity_score as i64 * 18 / 100)
+            // Each component belongs to the Score plugin that owns it upstream
+            // and is scaled by that plugin's configured weight relative to
+            // its default weight (identical to the unscaled blend under the
+            // default profile); a profile that does not run the plugin at
+            // Score contributes nothing for it.
+            let w = |plugin: &str, component: i64, pct: i64| {
+                weighted_component(fw, plugin, component, pct)
+            };
+            let total_score = volume_score * i64::from(fw.score_weight(names::VOLUME_BINDING))
+                + w(names::NODE_RESOURCES_FIT, resource_score as i64, 25)
+                + w(names::NODE_AFFINITY, node_affinity_score as i64, 20)
+                + w(names::INTER_POD_AFFINITY, pod_affinity_score as i64, 18)
                 + (priority_score as i64 * 15 / 100)
-                - (pod_anti_affinity_penalty as i64 * 12 / 100)
-                - (topology_penalty as i64 * 10 / 100);
+                - w(
+                    names::INTER_POD_AFFINITY,
+                    pod_anti_affinity_penalty as i64,
+                    12,
+                )
+                - w(names::POD_TOPOLOGY_SPREAD, topology_penalty as i64, 10);
 
             node_scores.push(NodeScore {
                 node_name: node.metadata.name.clone(),
@@ -1404,6 +1453,20 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         priority_classes: &HashMap<String, PriorityClass>,
         pdbs: &[rusternetes_common::resources::PodDisruptionBudget],
     ) -> Option<(String, Vec<Pod>)> {
+        // `RunPostFilterPlugins` runs only the pod's profile's PostFilter
+        // plugins; DefaultPreemption is the one that evicts victims
+        // (schedule_one.go:172 `HasPostFilterPlugins`).
+        let runs_default_preemption = self.profile_for(pod).map_or(true, |p| {
+            p.framework
+                .has(ExtensionPoint::PostFilter, names::DEFAULT_PREEMPTION)
+        });
+        if !runs_default_preemption {
+            debug!(
+                "Pod {} profile does not run DefaultPreemption, skipping preemption",
+                pod.metadata.name
+            );
+            return None;
+        }
         // If the pod's preemptionPolicy is "Never", skip preemption entirely.
         // Fall back to the PriorityClass's policy when the pod spec doesn't
         // carry one (mirrors the spec.priority backstop in the schedule
@@ -1968,6 +2031,30 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
 /// Split a `/registry/pods/{ns}/{name}` storage key into `(ns, name)`. Tolerates
 /// a missing namespace segment (defaults to `default`). The scheduler builds
 /// these keys via `build_key("pods", Some(ns), name)`, so the format is stable.
+/// Default `Score` plugin weights (default_plugins.go:35-48) the compiled-in
+/// score blend is calibrated against.
+fn default_score_weight(plugin: &str) -> i64 {
+    match plugin {
+        names::NODE_AFFINITY | names::INTER_POD_AFFINITY | names::POD_TOPOLOGY_SPREAD => 2,
+        _ => 1,
+    }
+}
+
+/// One component of the compiled-in score blend, scaled by the profile's
+/// weight for the plugin that owns it: `component * pct / 100` at the default
+/// weight, 0 when the profile does not run `plugin` at Score.
+fn weighted_component(
+    fw: &crate::framework_runtime::Framework,
+    plugin: &str,
+    component: i64,
+    pct: i64,
+) -> i64 {
+    if !fw.has(ExtensionPoint::Score, plugin) {
+        return 0;
+    }
+    component * pct * i64::from(fw.score_weight(plugin)) / (100 * default_score_weight(plugin))
+}
+
 fn parse_pod_storage_key(pod_key: &str) -> (&str, &str) {
     let rest = pod_key
         .strip_prefix("/registry/pods/")
@@ -2746,6 +2833,43 @@ mod tests {
         assert_eq!(
             scheduler.profile_for(&pod).unwrap_err(),
             "profile not found for scheduler name \"nope\""
+        );
+    }
+
+    /// The compiled-in score blend scales each component by the profile's
+    /// weight for its owning plugin (relative to the default weight), and a
+    /// plugin not run at Score contributes nothing (`getScoreWeights`).
+    #[test]
+    fn test_weighted_component_follows_profile_score_weights() {
+        use crate::framework_runtime::{Plugin, PluginSet};
+        let default_fw = crate::profile::Profile::named("d").framework;
+        // Default weights: identical to the unscaled `component * pct / 100`.
+        assert_eq!(
+            weighted_component(&default_fw, names::NODE_AFFINITY, 80, 20),
+            80 * 20 / 100
+        );
+        assert_eq!(
+            weighted_component(&default_fw, names::NODE_RESOURCES_FIT, 77, 25),
+            77 * 25 / 100
+        );
+        // NodeAffinity re-weighted 2 -> 4 doubles its component.
+        let mut p = crate::profile::Profile::named("w");
+        let mut plugins = p.plugins.take().unwrap();
+        plugins.score = PluginSet {
+            enabled: vec![Plugin::weighted(names::NODE_AFFINITY, 4)],
+            disabled: vec![Plugin::new(names::POD_TOPOLOGY_SPREAD)],
+        };
+        p.plugins = Some(plugins);
+        let m = crate::profile::Map::new_map(vec![p]).unwrap();
+        let fw = &m.get("w").unwrap().framework;
+        assert_eq!(
+            weighted_component(fw, names::NODE_AFFINITY, 80, 20),
+            2 * (80 * 20 / 100)
+        );
+        // Disabled at Score: no contribution.
+        assert_eq!(
+            weighted_component(fw, names::POD_TOPOLOGY_SPREAD, 50, 10),
+            0
         );
     }
 

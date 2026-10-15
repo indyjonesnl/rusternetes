@@ -8,6 +8,7 @@
 //! - `pkg/scheduler/framework/plugins/volumebinding/volume_binding.go:642-653`
 //!   (shape scaled by `MaxNodeScore / MaxCustomPriorityScore`).
 
+use crate::framework_runtime::{default_plugins, merge_plugins, PluginSet, Plugins};
 use crate::volume_binding::{FunctionShapePoint, MAX_CUSTOM_PRIORITY_SCORE, MAX_NODE_SCORE};
 use rusternetes_common::go_duration::format_go_duration;
 use rusternetes_common::label_selector::{LabelOperator, LabelRequirement};
@@ -776,82 +777,6 @@ struct ExtenderManagedResource {
     name: String,
 }
 
-/// `config.Plugin` (pkg/scheduler/apis/config/types.go). The internal type has
-/// no json tags, so a marshalled bad value uses the Go field names.
-#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
-struct Plugin {
-    name: String,
-    #[serde(default)]
-    weight: Option<i32>,
-}
-
-/// `config.PluginSet`. `apiequality.Semantic.DeepEqual` treats nil and empty
-/// slices as equal, which `Vec` equality already does.
-#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
-struct PluginSet {
-    #[serde(default)]
-    enabled: Vec<Plugin>,
-    #[serde(default)]
-    disabled: Vec<Plugin>,
-}
-
-impl PluginSet {
-    /// `json.Marshal` of the internal `config.PluginSet` (no json tags; a nil
-    /// slice marshals as `null`).
-    fn go_json(&self) -> String {
-        fn list(v: &[Plugin]) -> String {
-            if v.is_empty() {
-                return "null".to_string();
-            }
-            let items: Vec<String> = v
-                .iter()
-                .map(|p| {
-                    let name = serde_json::Value::String(p.name.clone());
-                    format!("{{\"Name\":{name},\"Weight\":{}}}", p.weight.unwrap_or(0))
-                })
-                .collect();
-            format!("[{}]", items.join(","))
-        }
-        // Struct field order, which serde_json's map would sort away.
-        format!(
-            "{{\"Enabled\":{},\"Disabled\":{}}}",
-            list(&self.enabled),
-            list(&self.disabled)
-        )
-    }
-}
-
-/// The extension points `validatePluginConfig` iterates
-/// (validation.go:166-182). `multiPoint` is deliberately absent, as upstream.
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Plugins {
-    #[serde(default)]
-    pre_enqueue: PluginSet,
-    #[serde(default)]
-    queue_sort: PluginSet,
-    #[serde(default)]
-    pre_filter: PluginSet,
-    #[serde(default)]
-    filter: PluginSet,
-    #[serde(default)]
-    post_filter: PluginSet,
-    #[serde(default)]
-    pre_score: PluginSet,
-    #[serde(default)]
-    score: PluginSet,
-    #[serde(default)]
-    reserve: PluginSet,
-    #[serde(default)]
-    permit: PluginSet,
-    #[serde(default)]
-    pre_bind: PluginSet,
-    #[serde(default)]
-    bind: PluginSet,
-    #[serde(default)]
-    post_bind: PluginSet,
-}
-
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Profile {
@@ -936,22 +861,41 @@ fn resolve_profiles(
             (None, true) => crate::profile::DEFAULT_SCHEDULER_NAME.to_string(),
             (None, false) => String::new(),
         };
-        let queue_sort = profile
-            .plugins
-            .as_ref()
-            .and_then(|p| p.queue_sort.enabled.first())
-            .map(|p| p.name.clone())
-            .unwrap_or_else(|| crate::profile::DEFAULT_QUEUE_SORT.to_string());
+        // v1 SetDefaults_KubeSchedulerProfile: merge the profile's plugins
+        // over the default plugin set (defaults.go:72).
+        let plugins = merge_plugins(default_plugins(), profile.plugins.as_ref());
+        let plugin_config_names: Vec<String> = profile
+            .plugin_config
+            .iter()
+            .map(|pc| pc.name.clone())
+            .collect();
+        let mut p = crate::profile::Profile::named(&name).with_volume_binding_args(&args);
+        p.plugins = Some(plugins);
+        p.plugin_config_names = plugin_config_names;
+        // The queue sort plugin of the resolved framework; `Map::new_map`
+        // reports a framework that fails to build.
+        let queue_sort = crate::framework_runtime::new_framework(
+            &crate::framework_runtime::Registry::in_tree(),
+            &crate::framework_runtime::ProfileSpec {
+                scheduler_name: &name,
+                plugins: p.plugins.as_ref(),
+                plugin_config_names: &p.plugin_config_names,
+            },
+        )
+        .ok()
+        .and_then(|f| {
+            f.plugins_at(crate::framework_runtime::ExtensionPoint::QueueSort)
+                .first()
+                .cloned()
+        })
+        .unwrap_or_else(|| crate::profile::DEFAULT_QUEUE_SORT.to_string());
         // The last matching pluginConfig wins, as validateCommonQueueSort.
-        let queue_sort_args = profile
+        p.queue_sort_args = profile
             .plugin_config
             .iter()
             .rfind(|pc| pc.name == queue_sort)
             .and_then(|pc| pc.args.as_ref())
             .and_then(|v| serde_json::to_value(v).ok());
-        let mut p = crate::profile::Profile::named(&name).with_volume_binding_args(&args);
-        p.queue_sort = queue_sort;
-        p.queue_sort_args = queue_sort_args;
         resolved.push((p, args));
     }
     if errs.is_empty() {

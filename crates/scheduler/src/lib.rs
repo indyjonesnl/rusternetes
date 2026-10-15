@@ -3,6 +3,7 @@ pub mod data_plane;
 pub mod diagnosis;
 #[allow(dead_code)]
 pub mod framework;
+pub mod framework_runtime;
 #[allow(dead_code)]
 pub mod plugins;
 pub mod profile;
