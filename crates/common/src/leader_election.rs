@@ -84,6 +84,32 @@ impl ShutdownFlag {
     }
 }
 
+/// Signal raised when the elector LOSES the lock (as opposed to being asked to
+/// shut down). Stub: red commit.
+#[derive(Clone, Default)]
+pub struct LostLeadership {
+    flag: Arc<ShutdownFlag>,
+}
+
+impl LostLeadership {
+    pub async fn wait(&self) {
+        self.flag.wait().await
+    }
+    pub(crate) async fn trigger(&self) {
+        self.flag.trigger().await
+    }
+}
+
+/// Port of `OnStoppedLeading` (stub).
+pub async fn exit_on_stopped_leading<F>(
+    _lost: &LostLeadership,
+    _ctx: Option<&crate::signal::ShutdownContext>,
+    _exit: F,
+) where
+    F: FnOnce(i32),
+{
+}
+
 /// LeaderElector manages leader election using etcd
 pub struct LeaderElector {
     client: Arc<Mutex<Client>>,
@@ -627,5 +653,59 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// kube-controller-manager `OnStoppedLeading` (controllermanager.go:367-369)
+    /// and kube-scheduler (server.go:310-322): a lost lock with no termination
+    /// request exits 1 (`klog.FlushAndExit(.., 1)`).
+    #[tokio::test]
+    async fn lost_lock_exits_1() {
+        let lost = LostLeadership::default();
+        let code = Arc::new(std::sync::Mutex::new(None));
+        let c = code.clone();
+        let l = lost.clone();
+        let t = tokio::spawn(async move {
+            exit_on_stopped_leading(&l, None, move |n| *c.lock().unwrap() = Some(n)).await
+        });
+        lost.trigger().await;
+        tokio::time::timeout(Duration::from_secs(2), t)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*code.lock().unwrap(), Some(1));
+    }
+
+    /// kube-scheduler server.go:310-316: ctx.Done() => "Requested to terminate,
+    /// exiting", exit 0.
+    #[tokio::test]
+    async fn stopped_after_cancel_exits_0() {
+        let lost = LostLeadership::default();
+        let ctx = crate::signal::ShutdownContext::new();
+        ctx.cancel();
+        lost.trigger().await;
+        let code = Arc::new(std::sync::Mutex::new(None));
+        let c = code.clone();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            exit_on_stopped_leading(&lost, Some(&ctx), move |n| *c.lock().unwrap() = Some(n)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*code.lock().unwrap(), Some(0));
+    }
+
+    /// No loss, no exit: a follower or a healthy leader never exits.
+    #[tokio::test]
+    async fn no_loss_no_exit() {
+        let lost = LostLeadership::default();
+        let code = Arc::new(std::sync::Mutex::new(None));
+        let c = code.clone();
+        let r = tokio::time::timeout(
+            Duration::from_millis(150),
+            exit_on_stopped_leading(&lost, None, move |n| *c.lock().unwrap() = Some(n)),
+        )
+        .await;
+        assert!(r.is_err(), "must keep waiting");
+        assert_eq!(*code.lock().unwrap(), None);
     }
 }
