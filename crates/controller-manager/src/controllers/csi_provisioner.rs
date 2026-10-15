@@ -807,6 +807,9 @@ pub struct CsiProvisioner<S: Storage> {
     node_deployment: Option<NodeDeployment>,
     /// `internalNodeDeployment.rateLimiter`; set with `node_deployment`.
     owner_limiter: Option<OwnerRateLimiter>,
+    /// `capacity.NewProvisionWrapper`'s `Controller`: refreshed after every
+    /// Provision/Delete (`--enable-capacity`).
+    capacity_refresher: Option<Arc<super::csi_capacity_refresh::CapacityRefresher>>,
     /// The `ctx` that `Run(ctx)` hands to `checkNode`/`becomeOwner`
     /// (controller.go:1606, :1676, :1749); `true` once cancelled.
     shutdown: tokio::sync::watch::Sender<bool>,
@@ -862,6 +865,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             capabilities: tokio::sync::OnceCell::new(),
             node_deployment: None,
             owner_limiter: None,
+            capacity_refresher: None,
             shutdown: tokio::sync::watch::channel(false).0,
         }
     }
@@ -917,6 +921,42 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
     pub fn with_strict_topology(mut self, on: bool) -> Self {
         self.strict_topology = on;
         self
+    }
+
+    /// `capacity.NewProvisionWrapper` (provision.go:30-37).
+    pub fn with_capacity_refresher(
+        mut self,
+        refresher: Arc<super::csi_capacity_refresh::CapacityRefresher>,
+    ) -> Self {
+        self.capacity_refresher = Some(refresher);
+        self
+    }
+
+    /// `provisionWrapper.Provision` (provision.go:39-77), run on the result of
+    /// the wrapped `Provision`.
+    fn refresh_capacity_after_provision(
+        &self,
+        outcome: &Outcome<PersistentVolume>,
+        sc: &StorageClass,
+    ) {
+        let Some(r) = &self.capacity_refresher else {
+            return;
+        };
+        match outcome {
+            Ok(pv) => match &pv.spec.node_affinity {
+                // "If we know where the volume was provisioned, then refresh
+                // all objects in that topology."
+                Some(affinity) => r.refresh_topology(affinity),
+                // "Fall back to refresh by storage class."
+                None => r.refresh_sc(&sc.metadata.name),
+            },
+            // "Unsuccessful provisioning might also be a reason why we have to
+            // refresh."
+            Err((state, _)) if *state != ProvisioningState::NoChange => {
+                r.refresh_sc(&sc.metadata.name)
+            }
+            Err(_) => {}
+        }
     }
 
     /// `--immediate-topology`: with immediate binding, pass the aggregated
@@ -1440,10 +1480,11 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
         )
         .await;
 
-        let mut volume = match self
+        let provisioned = self
             .provision(claim, &class, &selected_node, &pv_name)
-            .await
-        {
+            .await;
+        self.refresh_capacity_after_provision(&provisioned, &class);
+        let mut volume = match provisioned {
             Ok(v) => v,
             Err((_, Failure::Ignored(reason))) => {
                 // "Provision ignored, do nothing and hope another provisioner
@@ -1656,7 +1697,15 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
     async fn delete_volume_operation(&self, volume: &PersistentVolume) -> Result<()> {
         let object = Self::volume_ref(volume);
         match self.delete_csi_volume(volume).await {
-            Ok(()) => {}
+            Ok(()) => {
+                // `provisionWrapper.Delete` (provision.go:80-90): "We don't
+                // know the storage class, but the topology is even better."
+                if let (Some(r), Some(affinity)) =
+                    (&self.capacity_refresher, &volume.spec.node_affinity)
+                {
+                    r.refresh_topology(affinity);
+                }
+            }
             Err(DeleteFailure::Ignored(reason)) => {
                 // "Delete ignored, do nothing and hope another provisioner
                 // will delete it." (lib controller.go deleteVolumeOperation)

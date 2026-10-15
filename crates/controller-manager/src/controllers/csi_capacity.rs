@@ -10,6 +10,7 @@
 //! is `run_capacity_loop`, started from `main.rs` (#3219).
 
 use super::csi_capacity_metrics::CapacityStats;
+use super::csi_capacity_refresh::ItemKey;
 use rusternetes_common::quantity::{Format, Quantity};
 use rusternetes_common::resources::csi::{CSINode, CSIStorageCapacity};
 use rusternetes_common::resources::volume::LabelSelector;
@@ -88,8 +89,6 @@ impl Segment {
 }
 
 /// `termToSegment` (capacity.go:458-478).
-// Only exercised by tests until StorageClass.allowedTopologies filtering lands (#3234).
-#[allow(dead_code)]
 pub fn term_to_segment(term: &NodeSelectorTerm) -> std::result::Result<Segment, String> {
     if term.match_fields.as_ref().is_some_and(|f| !f.is_empty()) {
         return Err(format!("MatchFields not empty: {:?}", term.match_fields));
@@ -326,21 +325,37 @@ pub async fn capacity_tick<S: Storage, C: CapacityClient>(
     ctl.reconcile(&segments).await
 }
 
-/// `Controller.Run` (capacity.go:255): `pollCapacities` re-syncs every object
-/// each `poll_interval` (`wait.UntilWithContext`). Deviation: topology and
-/// StorageClass changes are picked up on the next tick rather than from
-/// informer events, and there is one worker (`--csi-capacity-threads` is
-/// accepted for flag parity only).
+/// `Controller.Run` (capacity.go:232-259): `pollCapacities` re-syncs every
+/// object each `poll_interval` (`wait.UntilWithContext`), and the queue fed by
+/// `refreshTopology`/`refreshSC` (provision.go) is worked off in between with
+/// per-item exponential backoff. Deviation: topology and StorageClass changes
+/// are picked up by the poll tick rather than from informer events, and there
+/// is one worker (`--csi-capacity-threads` is accepted for flag parity only).
 pub async fn run_capacity_loop<S: Storage, C: CapacityClient>(
     ctl: &CapacityController<'_, S, C>,
     topology: &TopologySource,
     poll_interval: std::time::Duration,
+    retry_interval_start: std::time::Duration,
+    retry_interval_max: std::time::Duration,
 ) {
+    let mut next_poll = tokio::time::Instant::now();
     loop {
-        if let Err(e) = capacity_tick(ctl, topology).await {
-            tracing::error!("CSIStorageCapacity publisher ({}): {e}", ctl.driver_name);
+        if tokio::time::Instant::now() >= next_poll {
+            if let Err(e) = capacity_tick(ctl, topology).await {
+                tracing::error!("CSIStorageCapacity publisher ({}): {e}", ctl.driver_name);
+            }
+            next_poll = tokio::time::Instant::now() + poll_interval;
         }
-        tokio::time::sleep(poll_interval).await;
+        ctl.sync_queued(retry_interval_start, retry_interval_max)
+            .await;
+        let mut wake = next_poll;
+        if let Some(d) = ctl.refresher.next_delayed() {
+            wake = wake.min(tokio::time::Instant::from_std(d));
+        }
+        tokio::select! {
+            _ = tokio::time::sleep_until(wake) => {}
+            _ = ctl.refresher.notified() => {}
+        }
     }
 }
 
@@ -353,6 +368,8 @@ pub struct CapacityController<'a, S: Storage, C: CapacityClient> {
     pub managed_by_id: String,
     pub owner_namespace: String,
     pub immediate_binding: bool,
+    /// `capacities` + `queue`, shared with the provisioner's refresh hooks.
+    pub refresher: std::sync::Arc<super::csi_capacity_refresh::CapacityRefresher>,
 }
 
 /// `WorkItem` (capacity.go:96-99) with the StorageClass resolved.
@@ -451,6 +468,18 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
             }
         }
 
+        // `addWorkItem` / `removeWorkItem` (:469-513): the refresh triggers
+        // look items up in this set.
+        self.refresher.set_capacities(
+            items
+                .iter()
+                .map(|i| ItemKey {
+                    segment: i.segment.clone(),
+                    storage_class_name: i.sc.metadata.name.clone(),
+                })
+                .collect(),
+        );
+
         let existing: Vec<CSIStorageCapacity> = self
             .storage
             .list(&build_prefix(
@@ -495,6 +524,61 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
             }
         }
         first_err.map_or(Ok(()), Err)
+    }
+
+    /// `runWorker` / `processNextWorkItem` (capacity.go:525-560) for the items
+    /// currently queued: success is `Forget`, failure is `AddRateLimited`
+    /// (`NewTypedItemExponentialFailureRateLimiter(retryIntervalStart,
+    /// retryIntervalMax)`, csi-provisioner.go:528).
+    pub async fn sync_queued(&self, start: std::time::Duration, max: std::time::Duration) {
+        while let Some(key) = self.refresher.pop() {
+            match self.sync_item(&key).await {
+                Ok(()) => self.refresher.forget(&key),
+                Err(e) => {
+                    tracing::error!("CSIStorageCapacity publisher ({}): {e}", self.driver_name);
+                    let d = self.refresher.add_rate_limited(key, start, max);
+                    tracing::warn!("Retrying after {d:?}");
+                }
+            }
+        }
+    }
+
+    /// `syncCapacity(ctx, item)` (:564-672) for one queued item.
+    async fn sync_item(&self, key: &ItemKey) -> Result<()> {
+        // :572-583: "The item was removed in the meantime."
+        if !self.refresher.is_capacity(key) {
+            return Ok(());
+        }
+        // :585-593: a missing StorageClass is "another indication that the
+        // value is no longer needed".
+        let sc: StorageClass = match self
+            .storage
+            .get(&build_key("storageclasses", None, &key.storage_class_name))
+            .await
+        {
+            Ok(sc) => sc,
+            Err(Error::NotFound(_)) => return Ok(()),
+            Err(e) => {
+                return Err(Error::Internal(format!(
+                    "retrieve storage class for {key:?}: {e}"
+                )))
+            }
+        };
+        let item = WorkItem {
+            segment: &key.segment,
+            sc: &sc,
+        };
+        let existing: Vec<CSIStorageCapacity> = self
+            .storage
+            .list(&build_prefix(
+                "csistoragecapacities",
+                Some(&self.owner_namespace),
+            ))
+            .await?;
+        let current = existing
+            .into_iter()
+            .find(|c| self.is_managed(c) && item.equals(c));
+        self.sync_capacity(&item, current).await.map(|_| ())
     }
 
     /// `syncCapacity` (:586-715).
@@ -623,15 +707,19 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::csi_capacity_refresh::{CapacityRefresher, ItemKey};
     use super::*;
     use rusternetes_common::resources::csi::{CSINodeDriver, CSINodeSpec};
+    use rusternetes_common::resources::volume::VolumeNodeAffinity;
     use rusternetes_common::resources::volume::{
         NodeSelectorRequirement, StorageClass, VolumeBindingMode,
     };
     use rusternetes_common::types::{ObjectMeta, TypeMeta};
     use rusternetes_storage::build_key;
     use rusternetes_storage::memory::MemoryStorage;
+    use std::collections::HashSet;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     const DRIVER: &str = "my-csi-driver";
     const NS: &str = "kube-system";
@@ -655,6 +743,213 @@ mod tests {
             operator: op.into(),
             values: Some(vals.iter().map(|v| v.to_string()).collect()),
         }
+    }
+
+    // ---- TestRefresh (capacity_test.go:1799-1957) ----
+
+    fn vna(pairs: &[(&str, &str)]) -> VolumeNodeAffinity {
+        VolumeNodeAffinity {
+            required: Some(rusternetes_common::resources::volume::NodeSelector {
+                node_selector_terms: vec![NodeSelectorTerm {
+                    match_expressions: Some(
+                        pairs.iter().map(|(k, v)| req(k, "In", &[v])).collect(),
+                    ),
+                    match_fields: None,
+                }],
+            }),
+        }
+    }
+
+    /// `itemsAsSortedStringSlice`.
+    fn queued_strings(c: &CapacityRefresher) -> Vec<String> {
+        let mut v: Vec<String> = c
+            .queued()
+            .iter()
+            .map(|i| {
+                let e: Vec<String> = i
+                    .segment
+                    .entries()
+                    .iter()
+                    .map(|e| format!("{}: {}", e.key, e.value))
+                    .collect();
+                format!("{}, [{}]", i.storage_class_name, e.join(" "))
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    const DEEP: [(&str, &str); 3] = [("layer0", "foo"), ("layer1", "X"), ("layer2", "A")];
+    const DEEP_OTHER: [(&str, &str); 3] = [("layer0", "foo"), ("layer1", "X"), ("layer2", "B")];
+
+    async fn refresh_fixture(
+        segments: &[&[(&str, &str)]],
+    ) -> (MemoryStorage, FakeClient, std::sync::Arc<CapacityRefresher>) {
+        let st = MemoryStorage::new();
+        put_sc(&st, sc("direct-sc", DRIVER, None)).await;
+        put_sc(&st, sc("triple-sc", DRIVER, None)).await;
+        let cl = FakeClient::default();
+        let c = ctl(&st, &cl, false);
+        let segs: Vec<Segment> = segments.iter().map(|s| seg(s)).collect();
+        c.reconcile(&segs).await.unwrap();
+        // "Clear queue so that below we only get to see items scheduled for refresh."
+        c.refresher.clear_queue();
+        let r = c.refresher.clone();
+        (st, cl, r)
+    }
+
+    #[tokio::test]
+    async fn refresh_storageclass() {
+        let (_s, _c, r) = refresh_fixture(&[&[("layer0", "foo")], &[("layer0", "bar")]]).await;
+        r.refresh_sc("direct-sc");
+        assert_eq!(
+            queued_strings(&r),
+            vec!["direct-sc, [layer0: bar]", "direct-sc, [layer0: foo]"]
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_topology() {
+        let (_s, _c, r) = refresh_fixture(&[&[("layer0", "foo")], &[("layer0", "bar")]]).await;
+        r.refresh_topology(&vna(&[("layer0", "bar")]));
+        assert_eq!(
+            queued_strings(&r),
+            vec!["direct-sc, [layer0: bar]", "triple-sc, [layer0: bar]"]
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_deep_topology() {
+        let (_s, _c, r) = refresh_fixture(&[&DEEP, &DEEP_OTHER]).await;
+        r.refresh_topology(&vna(&DEEP));
+        assert_eq!(
+            queued_strings(&r),
+            vec![
+                "direct-sc, [layer0: foo layer1: X layer2: A]",
+                "triple-sc, [layer0: foo layer1: X layer2: A]"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_unknown_or_truncated_topology_and_class_queue_nothing() {
+        let (_s, _c, r) = refresh_fixture(&[&DEEP, &DEEP_OTHER]).await;
+        r.refresh_topology(&vna(&[
+            ("layer0", "foo"),
+            ("layer1", "X"),
+            ("layer2", "BBBBBBBBBBB"),
+        ]));
+        r.refresh_sc("no-such-sc");
+        r.refresh_topology(&vna(&[("layer0", "foo")]));
+        assert!(queued_strings(&r).is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_topology_skips_unusable_terms_only() {
+        let (_s, _c, r) = refresh_fixture(&[&DEEP]).await;
+        r.refresh_topology(&VolumeNodeAffinity { required: None });
+        assert!(queued_strings(&r).is_empty());
+        // An unusable term (`MatchFields`) is skipped, a later usable one is not.
+        let mut a = vna(&DEEP);
+        let bad = NodeSelectorTerm {
+            match_expressions: None,
+            match_fields: Some(vec![req("metadata.name", "In", &["n"])]),
+        };
+        a.required
+            .as_mut()
+            .unwrap()
+            .node_selector_terms
+            .insert(0, bad);
+        r.refresh_topology(&a);
+        assert_eq!(queued_strings(&r).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn queue_deduplicates() {
+        let (_s, _c, r) = refresh_fixture(&[&[("layer0", "foo")]]).await;
+        r.refresh_sc("direct-sc");
+        r.refresh_sc("direct-sc");
+        assert_eq!(queued_strings(&r).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sync_queued_refreshes_only_the_queued_items() {
+        let (st, cl, r) = refresh_fixture(&[&[("layer0", "foo")], &[("layer0", "bar")]]).await;
+        *cl.capacity.lock().unwrap() = 99;
+        cl.requests.lock().unwrap().clear();
+        r.refresh_topology(&vna(&[("layer0", "bar")]));
+        let c = ctl_with(&st, &cl, r.clone());
+        c.sync_queued(Duration::from_secs(1), Duration::from_secs(300))
+            .await;
+        assert_eq!(cl.requests.lock().unwrap().len(), 2);
+        let caps = list_caps(&st).await;
+        let updated = caps
+            .iter()
+            .filter(|c| c.capacity.as_deref() == Some("99"))
+            .count();
+        assert_eq!(updated, 2);
+        assert!(r.queued().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_queued_skips_items_that_are_no_longer_wanted() {
+        let (st, cl, r) = refresh_fixture(&[&[("layer0", "foo")]]).await;
+        r.refresh_sc("direct-sc");
+        // The StorageClass is gone: "Another indication that the value is no longer needed."
+        st.delete(&build_key("storageclasses", None, "direct-sc"))
+            .await
+            .unwrap();
+        cl.requests.lock().unwrap().clear();
+        let c = ctl_with(&st, &cl, r.clone());
+        c.sync_queued(Duration::from_secs(1), Duration::from_secs(300))
+            .await;
+        assert!(cl.requests.lock().unwrap().is_empty());
+        // The item left `capacities`: it "became obsolete".
+        r.refresh_sc("triple-sc");
+        r.set_capacities(HashSet::new());
+        c.sync_queued(Duration::from_secs(1), Duration::from_secs(300))
+            .await;
+        assert!(cl.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_item_is_requeued_with_exponential_backoff_until_it_succeeds() {
+        let (st, cl, r) = refresh_fixture(&[&[("layer0", "foo")]]).await;
+        *cl.fail.lock().unwrap() = true;
+        r.refresh_sc("direct-sc");
+        let c = ctl_with(&st, &cl, r.clone());
+        c.sync_queued(Duration::from_millis(10), Duration::from_secs(1))
+            .await;
+        // `AddRateLimited`: not queued yet, but scheduled.
+        assert!(r.queued().is_empty());
+        assert!(r.next_delayed().is_some());
+        *cl.fail.lock().unwrap() = false;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        c.sync_queued(Duration::from_millis(10), Duration::from_secs(1))
+            .await;
+        // `Forget` after success: nothing pending.
+        assert!(r.next_delayed().is_none());
+        assert!(r.queued().is_empty());
+    }
+
+    #[test]
+    fn rate_limiter_doubles_per_failure_and_caps_at_max() {
+        let r = CapacityRefresher::new();
+        let k = ItemKey {
+            segment: seg(&[]),
+            storage_class_name: "sc".into(),
+        };
+        let (s, m) = (Duration::from_secs(1), Duration::from_secs(5));
+        let d: Vec<_> = (0..5)
+            .map(|_| r.add_rate_limited(k.clone(), s, m))
+            .collect();
+        assert_eq!(
+            d,
+            [1, 2, 4, 5, 5].map(Duration::from_secs).to_vec(),
+            "ItemExponentialFailureRateLimiter.When"
+        );
+        r.forget(&k);
+        assert_eq!(r.add_rate_limited(k, s, m), s);
     }
 
     // ---- TestTermToSegment (capacity_test.go:1686-1797) ----
@@ -781,6 +1076,7 @@ mod tests {
         capacity: Mutex<i64>,
         max: Mutex<Option<i64>>,
         requests: Mutex<Vec<GetCapacityRequest>>,
+        fail: Mutex<bool>,
     }
 
     impl CapacityClient for FakeClient {
@@ -789,6 +1085,9 @@ mod tests {
             req: GetCapacityRequest,
         ) -> std::result::Result<GetCapacityResponse, String> {
             self.requests.lock().unwrap().push(req);
+            if *self.fail.lock().unwrap() {
+                return Err("boom".into());
+            }
             Ok(GetCapacityResponse {
                 available_capacity: *self.capacity.lock().unwrap(),
                 maximum_volume_size: *self.max.lock().unwrap(),
@@ -842,6 +1141,18 @@ mod tests {
             managed_by_id: MANAGED.into(),
             owner_namespace: NS.into(),
             immediate_binding: immediate,
+            refresher: Default::default(),
+        }
+    }
+
+    fn ctl_with<'a>(
+        st: &'a MemoryStorage,
+        cl: &'a FakeClient,
+        refresher: std::sync::Arc<CapacityRefresher>,
+    ) -> CapacityController<'a, MemoryStorage, FakeClient> {
+        CapacityController {
+            refresher,
+            ..ctl(st, cl, false)
         }
     }
 

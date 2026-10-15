@@ -2414,3 +2414,143 @@ async fn deleting_a_migrated_pv_translates_its_class_and_propagates_errors() {
     assert!(p.sync_volume(&pv).await.is_err());
     assert!(deleted(&rec).is_empty());
 }
+
+// ---- provisionWrapper (capacity/provision.go) ----
+
+mod capacity_refresh {
+    use super::*;
+    use rusternetes_controller_manager::controllers::csi_capacity::{Segment, SegmentEntry};
+    use rusternetes_controller_manager::controllers::csi_capacity_refresh::{
+        CapacityRefresher, ItemKey,
+    };
+
+    fn item(zone: Option<&str>, sc: &str) -> ItemKey {
+        ItemKey {
+            segment: Segment::from_entries(
+                zone.map(|z| SegmentEntry {
+                    key: "topology.example.com/zone".into(),
+                    value: z.into(),
+                })
+                .into_iter()
+                .collect(),
+            ),
+            storage_class_name: sc.into(),
+        }
+    }
+
+    fn refresher(items: Vec<ItemKey>) -> Arc<CapacityRefresher> {
+        let r = Arc::new(CapacityRefresher::new());
+        r.set_capacities(items.into_iter().collect());
+        r
+    }
+
+    fn sorted(r: &CapacityRefresher) -> Vec<String> {
+        strings(&r.queued())
+    }
+
+    fn strings(items: &[ItemKey]) -> Vec<String> {
+        let mut v: Vec<String> = items.iter().map(|i| format!("{i:?}")).collect();
+        v.sort();
+        v
+    }
+
+    fn zone_affinity(z: &str) -> VolumeNodeAffinity {
+        VolumeNodeAffinity {
+            required: Some(NodeSelector {
+                node_selector_terms: vec![NodeSelectorTerm {
+                    match_expressions: Some(vec![NodeSelectorRequirement {
+                        key: "topology.example.com/zone".into(),
+                        operator: "In".into(),
+                        values: Some(vec![z.into()]),
+                    }]),
+                    match_fields: None,
+                }],
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_provisioned_volume_with_node_affinity_refreshes_its_topology() {
+        let mut fake = Fake::with_topology();
+        fake.accessible_topology = vec![zone("a"), zone("b")];
+        let (storage, p, _rec, _d) = env(fake, storage_class(None)).await;
+        put_node(&storage, "n1", Some("a"), true).await;
+        let r = refresher(vec![
+            item(Some("a"), "fast"),
+            item(Some("a"), "slow"),
+            item(Some("b"), "fast"),
+            item(Some("c"), "fast"),
+        ]);
+        let p = p.with_capacity_refresher(r.clone());
+        p.sync_claim(&claim(&[(ANN, DRIVER)])).await.unwrap();
+        // provision.go:57: refreshTopology over every term, any StorageClass.
+        assert_eq!(
+            sorted(&r),
+            strings(&[
+                item(Some("a"), "fast"),
+                item(Some("a"), "slow"),
+                item(Some("b"), "fast")
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provisioned_volume_without_node_affinity_refreshes_its_storage_class() {
+        let (_storage, p, _rec, _d) = env(Fake::new(), storage_class(None)).await;
+        let r = refresher(vec![item(None, "fast"), item(None, "slow")]);
+        let p = p.with_capacity_refresher(r.clone());
+        p.sync_claim(&claim(&[(ANN, DRIVER)])).await.unwrap();
+        // provision.go:65: refreshSC.
+        assert_eq!(sorted(&r), strings(&[item(None, "fast")]));
+    }
+
+    #[tokio::test]
+    async fn a_failed_provision_refreshes_the_storage_class() {
+        let mut fake = Fake::new();
+        fake.create_code = Some(tonic::Code::InvalidArgument);
+        let (_storage, p, _rec, _d) = env(fake, storage_class(None)).await;
+        let r = refresher(vec![item(None, "fast"), item(None, "slow")]);
+        let p = p.with_capacity_refresher(r.clone());
+        p.sync_claim(&claim(&[(ANN, DRIVER)])).await.unwrap_err();
+        // provision.go:75: state != ProvisioningNoChange.
+        assert_eq!(sorted(&r), strings(&[item(None, "fast")]));
+    }
+
+    #[tokio::test]
+    async fn a_deleted_volume_refreshes_its_topology() {
+        let (storage, p, _rec, _d) = env(Fake::new(), storage_class(None)).await;
+        let r = refresher(vec![item(Some("a"), "fast"), item(Some("b"), "fast")]);
+        let p = p.with_capacity_refresher(r.clone());
+        let mut pv = csi_pv(
+            "pv1",
+            PersistentVolumePhase::Released,
+            PersistentVolumeReclaimPolicy::Delete,
+        );
+        pv.spec.node_affinity = Some(zone_affinity("a"));
+        put_pv(&storage, &pv).await;
+        p.sync_volume(&pv).await.unwrap();
+        // provision.go:86.
+        assert_eq!(sorted(&r), strings(&[item(Some("a"), "fast")]));
+    }
+
+    #[tokio::test]
+    async fn an_ignored_delete_refreshes_nothing() {
+        let (storage, p, _rec, _d) = env(Fake::new(), storage_class(None)).await;
+        let r = refresher(vec![item(Some("a"), "fast")]);
+        let p = p.with_capacity_refresher(r.clone());
+        let mut pv = csi_pv(
+            "other",
+            PersistentVolumePhase::Released,
+            PersistentVolumeReclaimPolicy::Delete,
+        );
+        pv.metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert("pv.kubernetes.io/provisioned-by".into(), "other.csi".into());
+        pv.spec.node_affinity = Some(zone_affinity("a"));
+        put_pv(&storage, &pv).await;
+        p.sync_volume(&pv).await.unwrap();
+        assert!(r.queued().is_empty());
+    }
+}

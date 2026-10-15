@@ -10,6 +10,7 @@ pub mod cronjob;
 pub mod csi_attacher;
 pub mod csi_capacity;
 pub mod csi_capacity_metrics;
+pub mod csi_capacity_refresh;
 pub mod csi_provisioner;
 pub mod csi_topology;
 pub mod daemonset;
