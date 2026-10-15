@@ -16,7 +16,7 @@ use rusternetes_common::deletion::{DeleteOptions, Preconditions};
 use rusternetes_common::types::ObjectMeta;
 use rusternetes_common::validation::field::{ErrorList, Path};
 use rusternetes_common::validation::objectmeta::{
-    name_is_path_segment, validate_object_meta, validate_object_meta_update,
+    validate_object_meta, validate_object_meta_update, validate_path_segment_name,
 };
 use rusternetes_common::{Error, Result};
 use serde::{de::DeserializeOwned, Serialize};
@@ -418,7 +418,7 @@ pub async fn before_create<T: Object>(
     let errs = validate_object_meta(
         obj.metadata(),
         strategy.namespace_scoped(),
-        name_is_path_segment,
+        validate_path_segment_name,
         &Path::new("metadata"),
     );
     if !errs.is_empty() {
@@ -436,7 +436,7 @@ pub async fn before_create<T: Object>(
 /// `validateCommonFields` (rest/update.go:88-101).
 fn validate_common_fields(meta: &ObjectMeta, old_meta: &ObjectMeta, namespaced: bool) -> ErrorList {
     let fld = Path::new("metadata");
-    let mut errs = validate_object_meta(meta, namespaced, name_is_path_segment, &fld);
+    let mut errs = validate_object_meta(meta, namespaced, validate_path_segment_name, &fld);
     errs.extend(validate_object_meta_update(meta, old_meta, &fld));
     errs
 }

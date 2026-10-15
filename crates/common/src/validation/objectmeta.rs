@@ -106,16 +106,24 @@ const NAME_MAY_NOT_BE: [&str; 2] = [".", ".."];
 /// `path.NameMayNotContain` (`/` and `%`).
 const NAME_MAY_NOT_CONTAIN: [&str; 2] = ["/", "%"];
 
-/// Upstream `path.IsValidPathSegmentName` exposed as a [`ValidateNameFunc`].
-/// Used by the RBAC kinds (`ValidateRBACName`) — names only need to encode
-/// safely as a REST/etcd path segment, so the DNS rules don't apply. The
-/// `prefix` flag is ignored (upstream `ValidateRBACName` ignores it too).
-pub fn name_is_path_segment(name: &str, _prefix: bool) -> Vec<String> {
+/// Upstream `path.IsValidPathSegmentName`
+/// (`apimachinery/pkg/api/validation/path/name.go:30-47`): the name can be
+/// safely encoded as a path segment — it may not be `.`/`..`, nor contain
+/// `/` or `%`.
+pub fn is_valid_path_segment_name(name: &str) -> Vec<String> {
     for illegal in NAME_MAY_NOT_BE {
         if name == illegal {
             return vec![format!("may not be '{illegal}'")];
         }
     }
+    is_valid_path_segment_prefix(name)
+}
+
+/// Upstream `path.IsValidPathSegmentPrefix` (`name.go:49-59`): the name can be
+/// used as a prefix of a path-segment name. It does not check for exact
+/// matches with `NameMayNotBe`, since an arbitrary suffix might make the name
+/// valid.
+pub fn is_valid_path_segment_prefix(name: &str) -> Vec<String> {
     let mut errs = Vec::new();
     for illegal in NAME_MAY_NOT_CONTAIN {
         if name.contains(illegal) {
@@ -123,6 +131,28 @@ pub fn name_is_path_segment(name: &str, _prefix: bool) -> Vec<String> {
         }
     }
     errs
+}
+
+/// Upstream `path.ValidatePathSegmentName` (`name.go:61-67`), a
+/// [`ValidateNameFunc`]: [`is_valid_path_segment_prefix`] when `prefix`
+/// (i.e. for `generateName`), else [`is_valid_path_segment_name`]. This is the
+/// name func `rest.BeforeCreate`/`BeforeUpdate` pass to `ValidateObjectMeta`
+/// (`apiserver/pkg/registry/rest/create.go:129`, `update.go:97`).
+pub fn validate_path_segment_name(name: &str, prefix: bool) -> Vec<String> {
+    if prefix {
+        return is_valid_path_segment_prefix(name);
+    }
+    is_valid_path_segment_name(name)
+}
+
+/// Upstream `path.IsValidPathSegmentName` as a [`ValidateNameFunc`] that
+/// ignores `prefix` — the shape of upstream `ValidateRBACName`
+/// (`pkg/apis/rbac/validation/validation.go:32-34`) and the APIService name
+/// func, both of which reject a `generateName` of `.`/`..`. For the
+/// prefix-aware `path.ValidatePathSegmentName` use
+/// [`validate_path_segment_name`].
+pub fn name_is_path_segment(name: &str, _prefix: bool) -> Vec<String> {
+    is_valid_path_segment_name(name)
 }
 
 /// Upstream `ValidateIPAddressName` (networking) → `validation.IsValidIP`
@@ -739,5 +769,88 @@ mod tests {
     fn render_timestamp_matches_upstream() {
         let ts = DateTime::from_timestamp(1000, 0).unwrap();
         assert_eq!(render_timestamp(ts), "1970-01-01T00:16:40Z");
+    }
+
+    /// Port of upstream `TestValidatePathSegmentName`
+    /// (`apimachinery/pkg/api/validation/path/name_test.go:24-131`).
+    #[test]
+    fn validate_path_segment_name_upstream_cases() {
+        let cases: &[(&str, &str, bool, &str)] = &[
+            ("empty", "", false, ""),
+            ("empty,prefix", "", true, ""),
+            ("valid", "foo.bar.baz", false, ""),
+            ("valid,prefix", "foo.bar.baz", true, ""),
+            (
+                "valid complex",
+                "sha256:ABCDEF012345@ABCDEF012345",
+                false,
+                "",
+            ),
+            ("valid extended charset", "Iñtërnâtiônàlizætiøn", false, ""),
+            ("dot", ".", false, "."),
+            ("dot leading", ".test", false, ""),
+            ("dot,prefix", ".", true, ""),
+            ("dot dot", "..", false, ".."),
+            ("dot dot leading", "..test", false, ""),
+            ("dot dot,prefix", "..", true, ""),
+            ("slash", "foo/bar", false, "/"),
+            ("slash,prefix", "foo/bar", true, "/"),
+            ("percent", "foo%bar", false, "%"),
+            ("percent,prefix", "foo%bar", true, "%"),
+        ];
+        for (k, name, prefix, expected) in cases {
+            let msgs = validate_path_segment_name(name, *prefix);
+            if expected.is_empty() {
+                assert!(msgs.is_empty(), "{k}: expected no message, got {msgs:?}");
+            } else {
+                assert!(!msgs.is_empty(), "{k}: expected error message, got none");
+                assert!(
+                    msgs[0].contains(expected),
+                    "{k}: expected message containing {expected:?}, got {:?}",
+                    msgs[0]
+                );
+            }
+        }
+    }
+
+    /// Port of upstream `TestValidateWithMultiErrors` (`name_test.go:133-168`).
+    #[test]
+    fn validate_path_segment_name_multi_errors() {
+        for prefix in [false, true] {
+            assert_eq!(
+                validate_path_segment_name("foo//bar%", prefix),
+                vec!["may not contain '/'", "may not contain '%'"],
+                "prefix={prefix}"
+            );
+        }
+    }
+
+    /// `ValidateObjectMeta` calls the name func with `prefix = true` for
+    /// `generateName` (`apimachinery/pkg/api/validation/objectmeta.go`), so a
+    /// generateName of `.`/`..` passes `path.ValidatePathSegmentName` (#3734).
+    #[test]
+    fn generate_name_dot_passes_path_segment_validation() {
+        for gn in [".", ".."] {
+            let meta = ObjectMeta {
+                name: "ok".to_string(),
+                generate_name: Some(gn.to_string()),
+                ..Default::default()
+            };
+            let errs = validate_object_meta(
+                &meta,
+                false,
+                validate_path_segment_name,
+                &Path::new("metadata"),
+            );
+            assert!(errs.is_empty(), "generateName {gn:?}: {errs:?}");
+        }
+    }
+
+    /// `ValidateRBACName` ignores `prefix` and always applies
+    /// `IsValidPathSegmentName` (`pkg/apis/rbac/validation/validation.go:32-34`).
+    #[test]
+    fn name_is_path_segment_ignores_prefix_like_validate_rbac_name() {
+        assert_eq!(name_is_path_segment(".", true), vec!["may not be '.'"]);
+        assert_eq!(name_is_path_segment("..", true), vec!["may not be '..'"]);
     }
 }
