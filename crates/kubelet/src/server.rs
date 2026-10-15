@@ -158,7 +158,7 @@ pub const COMPONENT_KUBELET: &str = "kubelet";
 /// when the gate is on, as upstream builds it inside the `if`.
 ///
 /// `s.addMetricsBucketMatcher("statusz")` (server.go:395) is
-/// [`MetricsBuckets::for_read_only_router`].
+/// [`MetricsBuckets::install_status_z`].
 pub fn install_statusz(router: Router, registered_paths: Vec<String>) -> Router {
     rusternetes_common::statusz::install_if_enabled(router, COMPONENT_KUBELET, || {
         rusternetes_common::statusz::Registry::new(Some(
@@ -171,13 +171,28 @@ pub fn install_statusz(router: Router, registered_paths: Vec<String>) -> Router 
 /// The `metricsBuckets` / `metricsMethodBuckets` sets of `Server`
 /// (pkg/kubelet/server/server.go:125-126, initialised at :308-309) with
 /// `addMetricsBucketMatcher` (:402), `getMetricBucket` (:407) and
-/// `getMetricMethodBucket` (:415). Not consumed yet: the per-request HTTP
+/// `getMetricMethodBucket` (:415), plus the bucket registrations of
+/// `NewServer`'s installers ([`MetricsBuckets::new_server`]). Not consumed yet: the per-request HTTP
 /// metrics instrumentation that reads the bucket is not wired (#3476).
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct MetricsBuckets {
     buckets: std::collections::HashSet<String>,
     method_buckets: std::collections::HashSet<&'static str>,
+}
+
+/// The inputs of `NewServer` that decide which bucket matchers are added.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ServerBucketOptions {
+    /// `kubeCfg.EnableDebuggingHandlers`.
+    pub enable_debugging_handlers: bool,
+    /// `ComponentFlagz` gate and a non-nil flagz registry.
+    pub flagz_enabled: bool,
+    /// `ContainerCheckpoint` gate.
+    pub checkpoint_enabled: bool,
+    /// `ComponentStatusz` gate.
+    pub statusz_enabled: bool,
 }
 
 #[allow(dead_code)]
@@ -195,23 +210,105 @@ impl MetricsBuckets {
         }
     }
 
-    /// The buckets for the handlers `read_only_router` serves: the
-    /// `InstallDefaultHandlers` calls at server.go:429 (`healthz`), :440
-    /// (`pods`), :452 (`stats`) and :610 (`runningpods`), plus
-    /// `installStatusZ` (:395) and `installFlagZ` (:604) behind their gates.
-    /// `/metrics` and `/configz` are registered by the caller, not here.
-    pub fn for_read_only_router(statusz_enabled: bool, flagz_enabled: bool) -> Self {
+    /// The bucket-registering sequence of `NewServer`
+    /// (server.go:311-330): `InstallAuthNotRequiredHandlers`, then
+    /// `InstallAuthRequiredHandlers` + `InstallSystemLogHandler` +
+    /// `InstallProfilingHandler` when `EnableDebuggingHandlers`, else
+    /// `InstallDebuggingDisabledHandlers`, then `installStatusZ`.
+    /// `InstallDebugFlagsHandler` registers no bucket.
+    pub fn new_server(opts: ServerBucketOptions) -> Self {
         let mut b = Self::new();
-        for name in ["healthz", "pods", "stats", "runningpods"] {
-            b.add_metrics_bucket_matcher(name);
+        b.install_auth_not_required_handlers();
+        if opts.enable_debugging_handlers {
+            b.install_auth_required_handlers(opts.flagz_enabled, opts.checkpoint_enabled);
+            b.install_system_log_handler();
+            b.install_profiling_handler();
+        } else {
+            b.install_debugging_disabled_handlers();
         }
-        if statusz_enabled {
-            b.add_metrics_bucket_matcher("statusz");
+        b.install_status_z(opts.statusz_enabled);
+        b
+    }
+
+    /// The `addMetricsBucketMatcher` calls of `InstallAuthNotRequiredHandlers`
+    /// (server.go:427-510), in upstream order. `metrics/resource` and
+    /// `metrics/probes` are registered twice upstream (:457-458, :494, :503);
+    /// the set makes that idempotent.
+    pub fn install_auth_not_required_handlers(&mut self) {
+        for bucket in [
+            "healthz",
+            "pods",
+            "stats",
+            "metrics",
+            "metrics/cadvisor",
+            "metrics/probes",
+            "metrics/resource",
+            "metrics/resource",
+            "metrics/probes",
+        ] {
+            self.add_metrics_bucket_matcher(bucket);
+        }
+    }
+
+    /// The `addMetricsBucketMatcher` calls of `InstallAuthRequiredHandlers`
+    /// (server.go:519-629): `flagz` only when `ComponentFlagz` is on and a
+    /// flagz registry is set (:602-607), `checkpoint` only when
+    /// `ContainerCheckpoint` is on (:620-622).
+    pub fn install_auth_required_handlers(
+        &mut self,
+        flagz_enabled: bool,
+        checkpoint_enabled: bool,
+    ) {
+        for bucket in [
+            "run",
+            "exec",
+            "attach",
+            "portForward",
+            "containerLogs",
+            "configz",
+        ] {
+            self.add_metrics_bucket_matcher(bucket);
         }
         if flagz_enabled {
-            b.add_metrics_bucket_matcher("flagz");
+            self.add_metrics_bucket_matcher("flagz");
         }
-        b
+        self.add_metrics_bucket_matcher("runningpods");
+        if checkpoint_enabled {
+            self.add_metrics_bucket_matcher("checkpoint");
+        }
+    }
+
+    /// `InstallDebuggingDisabledHandlers` (server.go:633-651).
+    pub fn install_debugging_disabled_handlers(&mut self) {
+        for bucket in [
+            "run",
+            "exec",
+            "attach",
+            "portForward",
+            "containerLogs",
+            "runningpods",
+            "pprof",
+            "logs",
+        ] {
+            self.add_metrics_bucket_matcher(bucket);
+        }
+    }
+
+    /// `InstallSystemLogHandler` (server.go:655-656).
+    pub fn install_system_log_handler(&mut self) {
+        self.add_metrics_bucket_matcher("logs");
+    }
+
+    /// `InstallProfilingHandler` (server.go:705-706).
+    pub fn install_profiling_handler(&mut self) {
+        self.add_metrics_bucket_matcher("debug");
+    }
+
+    /// `installStatusZ` (server.go:393-396): behind `ComponentStatusz`.
+    pub fn install_status_z(&mut self, statusz_enabled: bool) {
+        if statusz_enabled {
+            self.add_metrics_bucket_matcher("statusz");
+        }
     }
 
     /// `addMetricsBucketMatcher`: "not thread safe and should not be used
@@ -242,6 +339,19 @@ impl Default for MetricsBuckets {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// `longRunningRequestPathMap` (server.go:1152-1157). Upstream keys it
+/// `portforward` (lower case) while the bucket is `portForward`, so a
+/// port-forward request is never reported long-running; replicated as-is
+/// (#3250).
+const LONG_RUNNING_REQUEST_PATHS: [&str; 4] = ["exec", "attach", "portforward", "debug"];
+
+/// `isLongRunningRequest` (server.go:1160-1163): fed the bucketed path by
+/// `ServeHTTP` (:1187-1189).
+#[allow(dead_code)]
+pub fn is_long_running_request(path: &str) -> bool {
+    LONG_RUNNING_REQUEST_PATHS.contains(&path)
 }
 
 /// `getURLRootPath` (server.go:1139-1150): the first path segment, or
@@ -553,33 +663,17 @@ mod statusz_tests {
         reset_to_defaults();
     }
 
-    // server_test.go:TestMetricBuckets (the buckets upstream's installed
-    // handlers add; `/debug`, `/exec`... are not served by this kubelet).
+    // server_test.go:TestMetricBuckets: upstream builds the real server
+    // (`NewServer` with debugging handlers and ComponentStatusz on) and reads
+    // its buckets; so do we, from the installer sequence, never by hand.
     #[test]
     fn metric_buckets_cases() {
-        let mut b = MetricsBuckets::new();
-        for name in [
-            "healthz",
-            "attach",
-            "configz",
-            "containerLogs",
-            "debug",
-            "exec",
-            "logs",
-            "metrics",
-            "metrics/cadvisor",
-            "metrics/probes",
-            "metrics/resource",
-            "pods",
-            "portForward",
-            "run",
-            "runningpods",
-            "stats",
-            "statusz",
-            "flagz",
-        ] {
-            b.add_metrics_bucket_matcher(name);
-        }
+        let b = MetricsBuckets::new_server(ServerBucketOptions {
+            enable_debugging_handlers: true,
+            flagz_enabled: true,
+            checkpoint_enabled: false,
+            statusz_enabled: true,
+        });
         let cases = [
             ("/healthz", "healthz"),
             ("/attach/podNamespace/podID/containerName", "attach"),
@@ -628,23 +722,60 @@ mod statusz_tests {
         assert_eq!(b.get_metric_method_bucket("WEIRD"), "other");
     }
 
-    // server.go:InstallDefaultHandlers/installStatusZ/installFlagZ: only the
-    // handlers this kubelet serves add their bucket.
+    // NewServer's gates decide which buckets exist (server.go:311-330).
     #[test]
-    fn default_buckets_cover_only_served_paths() {
-        let b = MetricsBuckets::for_read_only_router(false, false);
+    fn server_gates_decide_buckets() {
+        // Debugging handlers off: `InstallDebuggingDisabledHandlers` still
+        // registers run/exec/... and `pprof`/`logs`, but never `debug`,
+        // `configz`, `flagz`, `statusz` or `checkpoint`.
+        let b = MetricsBuckets::new_server(ServerBucketOptions::default());
         for (path, want) in [
             ("/healthz", "healthz"),
             ("/pods", "pods"),
-            ("/runningpods/", "runningpods"),
             ("/stats/summary", "stats"),
+            ("/metrics", "metrics"),
+            ("/metrics/cadvisor", "metrics/cadvisor"),
+            ("/metrics/probes", "metrics/probes"),
+            ("/metrics/resource", "metrics/resource"),
+            ("/runningpods/", "runningpods"),
+            ("/pprof/x", "pprof"),
+            ("/logs/", "logs"),
+            ("/configz", "other"),
+            ("/debug/flags/v", "other"),
             ("/statusz", "other"),
             ("/flagz", "other"),
+            ("/checkpoint/ns/pod/c", "other"),
         ] {
             assert_eq!(b.get_metric_bucket(path), want, "{path}");
         }
-        let b = MetricsBuckets::for_read_only_router(true, true);
-        assert_eq!(b.get_metric_bucket("/statusz"), "statusz");
-        assert_eq!(b.get_metric_bucket("/flagz"), "flagz");
+        let b = MetricsBuckets::new_server(ServerBucketOptions {
+            enable_debugging_handlers: true,
+            flagz_enabled: true,
+            checkpoint_enabled: true,
+            statusz_enabled: true,
+        });
+        for (path, want) in [
+            ("/configz", "configz"),
+            ("/statusz", "statusz"),
+            ("/flagz", "flagz"),
+            ("/checkpoint/ns/pod/c", "checkpoint"),
+            ("/debug/flags/v", "debug"),
+        ] {
+            assert_eq!(b.get_metric_bucket(path), want, "{path}");
+        }
+    }
+
+    // server.go:1152-1163 `longRunningRequestPathMap` / `isLongRunningRequest`.
+    #[test]
+    fn long_running_requests() {
+        for p in ["exec", "attach", "portforward", "debug"] {
+            assert!(is_long_running_request(p), "{p}");
+        }
+        // Upstream's map key is lower-case `portforward` while the bucket is
+        // `portForward`, so the bucketed path is not long-running (#3250).
+        assert!(!is_long_running_request("portForward"));
+        for p in ["healthz", "pods", "other", "logs"] {
+            assert!(!is_long_running_request(p), "{p}");
+        }
     }
 }
