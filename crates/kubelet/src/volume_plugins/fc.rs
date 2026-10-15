@@ -11,9 +11,6 @@
 //!   ([`super::util::metrics`]).
 //! - `ConstructVolumeSpec`'s `SELinuxMountContext` (`fc.go:283-294`):
 //!   [`ReconstructedVolume`] cannot carry one (#2312, #3493).
-//! - `GetReliableMountRefs`'s retry on `IsInconsistentReadError`
-//!   (`fc.go:251-256`): our mountinfo reader has no inconsistent-read error
-//!   (#3495).
 //! - `VerifyExhaustedResource`, `NewDetacher`/`Detach` and the attach side of
 //!   `Attacher` (`Attach`, `VolumesAreAttached`): attach/detach-controller
 //!   interfaces with no kubelet caller (#3498).
@@ -332,7 +329,18 @@ impl VolumePlugin for FcPlugin {
         // leave the global mount still mounted, while marking the volume as unused.
         // The volume can then be mounted on several nodes, resulting in volume
         // corruption.
-        let paths = MountInterface::get_mount_refs(mounter, mount_path)?;
+        let paths = match super::util::mount_utils::get_reliable_mount_refs(mounter, mount_path) {
+            Err(e) if super::util::mount_utils::is_inconsistent_read_error(&e) => {
+                tracing::error!(
+                    "Failed to read mount refs from /proc/mounts for {mount_path}: {e}"
+                );
+                tracing::error!(
+                    "Kubelet cannot unmount volume at {mount_path}, please unmount it manually"
+                );
+                return Err(e.into());
+            }
+            r => r?,
+        };
         let plugin_dir = self.host.get_plugin_dir(FC_PLUGIN_NAME);
         for path in &paths {
             if path.contains(&plugin_dir) {
