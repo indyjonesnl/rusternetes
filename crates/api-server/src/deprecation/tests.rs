@@ -216,3 +216,33 @@ fn table_is_sorted_and_complete() {
         }
     }
 }
+
+/// `installer.go:781-797`: a route whose kind is deprecated at the current
+/// version carries its `WarningMessage`; a stable or not-yet-deprecated one
+/// carries none. admissionregistration.k8s.io/v1alpha1 MutatingAdmissionPolicy
+/// is deprecated in 1.35 and removed in 1.38
+/// (admissionregistration/v1alpha1/zz_generated.prerelease-lifecycle.go:32-40).
+#[test]
+fn endpoint_warnings_carry_the_deprecation_message() {
+    assert_eq!(
+        endpoint_warnings(
+            "admissionregistration.k8s.io",
+            "v1alpha1",
+            "mutatingadmissionpolicies",
+            ""
+        ),
+        vec![
+            "admissionregistration.k8s.io/v1alpha1 MutatingAdmissionPolicy is deprecated in v1.35+, unavailable in v1.38+"
+                .to_string()
+        ]
+    );
+    assert_eq!(
+        endpoint_warnings("apps", "v1beta1", "deployments", "scale"),
+        vec![
+            "apps/v1beta1 Scale is deprecated in v1.8+, unavailable in v1.16+; use autoscaling/v1 Scale"
+                .to_string()
+        ]
+    );
+    assert!(endpoint_warnings("apps", "v1", "deployments", "").is_empty());
+    assert!(endpoint_warnings("", "v1", "pods", "").is_empty());
+}

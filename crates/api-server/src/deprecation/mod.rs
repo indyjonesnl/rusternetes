@@ -199,5 +199,17 @@ pub fn deprecation_for(
     }
 }
 
+/// The endpoint-level warnings of a route (`installer.go:781-797`): the
+/// route's `deprecation.WarningMessage` when the kind it serves is deprecated
+/// at [`CURRENT_MAJOR_MINOR`], else none.
+pub fn endpoint_warnings(
+    _group: &str,
+    _version: &str,
+    _resource: &str,
+    _subresource: &str,
+) -> Vec<String> {
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests;

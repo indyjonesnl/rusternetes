@@ -10,3 +10,4 @@
 //! (#1990).
 
 pub mod handlers;
+pub mod warning;
