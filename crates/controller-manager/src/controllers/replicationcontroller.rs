@@ -1029,7 +1029,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
 /// than 100. The doubling is a damage bound as much as a speed-up: when
 /// creates are being rejected (quota, admission) the first failing round costs
 /// one create, not N.
-fn slow_start_batches(count: usize, initial_batch_size: usize) -> Vec<usize> {
+pub(crate) fn slow_start_batches(count: usize, initial_batch_size: usize) -> Vec<usize> {
     slow_start_batches_capped(count, initial_batch_size, usize::MAX)
 }
 
@@ -1138,7 +1138,7 @@ pub(crate) fn is_namespace_terminating_rejection(err: &rusternetes_common::Error
 /// generated names and a 50% probability occurs at ~4500
 /// generated names.
 /// ```
-const MAX_NAME_GENERATION_CREATE_ATTEMPTS: usize = 8;
+pub(crate) const MAX_NAME_GENERATION_CREATE_ATTEMPTS: usize = 8;
 
 /// Alphabet for generated name suffixes.
 ///
@@ -1155,7 +1155,7 @@ const NAME_SUFFIX_ALPHABET: &[u8] = b"bcdfghjklmnpqrstvwxz2456789";
 const NAME_SUFFIX_LENGTH: usize = 5;
 
 /// A `<base>-<suffix>` name, as upstream's `simpleNameGenerator` builds it.
-fn generate_pod_name(base: &str) -> String {
+pub(crate) fn generate_pod_name(base: &str) -> String {
     use rand::Rng;
     let mut rng = rand::rng();
     let suffix: String = (0..NAME_SUFFIX_LENGTH)
@@ -1175,13 +1175,13 @@ fn generate_pod_name(base: &str) -> String {
 /// burst at an api-server it shares with every other client. The cap is a
 /// throttle rather than a ceiling: whatever is left is created by the next
 /// sync.
-const BURST_REPLICAS: usize = 500;
+pub(crate) const BURST_REPLICAS: usize = 500;
 
 /// Upstream's `SlowStartInitialBatchSize` (pkg/controller/controller_utils.go).
-const SLOW_START_INITIAL_BATCH_SIZE: usize = 1;
+pub(crate) const SLOW_START_INITIAL_BATCH_SIZE: usize = 1;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use rusternetes_common::resources::workloads::{PodTemplateSpec, ReplicationControllerSpec};
     use rusternetes_common::types::ObjectMeta;
@@ -1957,14 +1957,14 @@ mod tests {
     /// Wraps `MemoryStorage` and records how many pod creates are in flight at
     /// once, so a test can tell a batched implementation from a serial one.
     /// Every other method delegates straight through.
-    struct ConcurrencyProbeStorage {
+    pub(crate) struct ConcurrencyProbeStorage {
         inner: Arc<MemoryStorage>,
         in_flight: std::sync::atomic::AtomicUsize,
         peak_in_flight: std::sync::atomic::AtomicUsize,
     }
 
     impl ConcurrencyProbeStorage {
-        fn new(inner: Arc<MemoryStorage>) -> Self {
+        pub(crate) fn new(inner: Arc<MemoryStorage>) -> Self {
             Self {
                 inner,
                 in_flight: std::sync::atomic::AtomicUsize::new(0),
@@ -1972,7 +1972,7 @@ mod tests {
             }
         }
 
-        fn peak(&self) -> usize {
+        pub(crate) fn peak(&self) -> usize {
             self.peak_in_flight
                 .load(std::sync::atomic::Ordering::SeqCst)
         }
@@ -2174,20 +2174,20 @@ mod tests {
 
     /// Rejects every pod create the way our api-server does for a Terminating
     /// namespace (#1849), and counts the attempts. Everything else delegates.
-    struct TerminatingNamespaceStorage {
+    pub(crate) struct TerminatingNamespaceStorage {
         inner: Arc<MemoryStorage>,
         pod_create_attempts: std::sync::atomic::AtomicUsize,
     }
 
     impl TerminatingNamespaceStorage {
-        fn new(inner: Arc<MemoryStorage>) -> Self {
+        pub(crate) fn new(inner: Arc<MemoryStorage>) -> Self {
             Self {
                 inner,
                 pod_create_attempts: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
-        fn attempts(&self) -> usize {
+        pub(crate) fn attempts(&self) -> usize {
             self.pod_create_attempts
                 .load(std::sync::atomic::Ordering::SeqCst)
         }
@@ -2445,13 +2445,13 @@ mod tests {
 
     /// Fails the first `n` pod creates with AlreadyExists, then behaves. Stands
     /// in for a generated pod name colliding with one already in the namespace.
-    struct NameCollisionStorage {
+    pub(crate) struct NameCollisionStorage {
         inner: Arc<MemoryStorage>,
         remaining_collisions: std::sync::atomic::AtomicUsize,
     }
 
     impl NameCollisionStorage {
-        fn new(inner: Arc<MemoryStorage>, collisions: usize) -> Self {
+        pub(crate) fn new(inner: Arc<MemoryStorage>, collisions: usize) -> Self {
             Self {
                 inner,
                 remaining_collisions: std::sync::atomic::AtomicUsize::new(collisions),

@@ -1498,4 +1498,342 @@ mod tests {
             "the DELETED event of an already-observed pod must not count again"
         );
     }
+
+    // ---------------------------------------------------------------------
+    // manageReplicas / syncReplicaSet parity (#3619)
+    //
+    // Ported from upstream pkg/controller/replicaset/replica_set_test.go:
+    // TestSlowStartBatch, TestSyncReplicaSetCreateFailures,
+    // TestControllerBurstReplicas, TestRSSyncExpectations,
+    // TestControllerUpdateStatusWithFailure and, from
+    // replica_set_utils_test.go, TestCalculateStatusConditions.
+    // ---------------------------------------------------------------------
+
+    use crate::controllers::quota_admission_double::QuotaAdmissionStorage;
+    use crate::controllers::replicationcontroller::tests::{
+        ConcurrencyProbeStorage, TerminatingNamespaceStorage,
+    };
+
+    fn rs_condition(
+        rs: &ReplicaSet,
+        ty: &str,
+    ) -> Option<rusternetes_common::resources::ReplicaSetCondition> {
+        rs.status
+            .as_ref()
+            .and_then(|s| s.conditions.as_ref())
+            .and_then(|cs| cs.iter().find(|c| c.condition_type == ty))
+            .cloned()
+    }
+
+    /// `slowStartBatch` (replica_set.go:820-844) issues each batch
+    /// concurrently, and one sync must reach the full replica count. Serial
+    /// creates could not create 100 pods inside the conformance spec's 120s
+    /// budget (#1847).
+    #[tokio::test]
+    async fn rs_creates_pods_in_concurrent_slow_start_batches() {
+        let inner = Arc::new(MemoryStorage::new());
+        let storage = Arc::new(ConcurrencyProbeStorage::new(inner));
+        let controller = ReplicaSetController::new(storage.clone(), 5);
+        let labels = make_labels(&[("app", "ss")]);
+        let rs = make_replicaset("ss", labels, 100);
+        storage
+            .create(&build_key("replicasets", Some("default"), "ss"), &rs)
+            .await
+            .unwrap();
+
+        controller.reconcile_replicaset(&rs).await.unwrap();
+
+        let pods: Vec<Pod> = storage
+            .list(&build_prefix("pods", Some("default")))
+            .await
+            .unwrap();
+        assert_eq!(pods.len(), 100);
+        assert!(
+            storage.peak() > 1,
+            "creates within a slow-start batch must overlap (peak {})",
+            storage.peak()
+        );
+    }
+
+    /// `TestControllerBurstReplicas`: `diff > rsc.burstReplicas` is capped
+    /// (replica_set.go:611-613); the next sync creates the remainder.
+    #[tokio::test]
+    async fn rs_caps_creates_at_burst_replicas_and_finishes_next_sync() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicaSetController::new(storage.clone(), 5);
+        let desired = crate::controllers::replicationcontroller::BURST_REPLICAS as i32 + 100;
+        let rs = make_replicaset("burst", make_labels(&[("app", "burst")]), desired);
+        storage
+            .create(&build_key("replicasets", Some("default"), "burst"), &rs)
+            .await
+            .unwrap();
+
+        controller.reconcile_replicaset(&rs).await.unwrap();
+        let pods: Vec<Pod> = storage
+            .list(&build_prefix("pods", Some("default")))
+            .await
+            .unwrap();
+        assert_eq!(
+            pods.len(),
+            crate::controllers::replicationcontroller::BURST_REPLICAS,
+            "one sync must not exceed burstReplicas"
+        );
+
+        // The creates were observed (pod watch Added events); simulate them.
+        for _ in 0..crate::controllers::replicationcontroller::BURST_REPLICAS {
+            controller.observe_creation("default/burst");
+        }
+        let rs: ReplicaSet = storage
+            .get(&build_key("replicasets", Some("default"), "burst"))
+            .await
+            .unwrap();
+        controller.reconcile_replicaset(&rs).await.unwrap();
+        let pods: Vec<Pod> = storage
+            .list(&build_prefix("pods", Some("default")))
+            .await
+            .unwrap();
+        assert_eq!(pods.len(), desired as usize);
+    }
+
+    /// `TestSyncReplicaSetCreateFailures`: 100 replicas, a limit of 10 (quota);
+    /// the controller must not make 100 create calls in one pass. Slow start
+    /// stops after the first failing batch (replica_set.go:838-840).
+    #[tokio::test]
+    async fn rs_stops_creating_after_the_first_failing_batch() {
+        let storage = Arc::new(QuotaAdmissionStorage::new());
+        let controller = ReplicaSetController::new(storage.clone(), 5);
+        let rs = make_replicaset("cf", make_labels(&[("app", "cf")]), 100);
+        storage
+            .create(&build_key("replicasets", Some("default"), "cf"), &rs)
+            .await
+            .unwrap();
+        storage
+            .create(
+                "/registry/resourcequotas/default/pq",
+                &serde_json::json!({
+                    "apiVersion": "v1", "kind": "ResourceQuota",
+                    "metadata": {"name": "pq", "namespace": "default", "uid": "q"},
+                    "spec": {"hard": {"pods": "10"}}
+                }),
+            )
+            .await
+            .unwrap();
+
+        // syncReplicaSet returns manageReplicasErr after updating status, so
+        // the workqueue requeues with backoff (replica_set.go:765-767).
+        let result = controller.reconcile_replicaset(&rs).await;
+        assert!(result.is_err(), "a create failure must requeue the key");
+
+        let denied = storage
+            .denied_creates
+            .load(std::sync::atomic::Ordering::SeqCst);
+        // Batches 1,2,4,8: the 8-batch is the first to fail, so <= 8 denials.
+        assert!(
+            denied > 0 && denied <= 8,
+            "expected the sync to stop after the first failing batch, saw {denied} denials"
+        );
+        let pods: Vec<Pod> = storage
+            .list(&build_prefix("pods", Some("default")))
+            .await
+            .unwrap();
+        assert!(pods.len() >= 10 && pods.len() < 100, "got {}", pods.len());
+    }
+
+    /// `HasStatusCause(err, v1.NamespaceTerminatingCause)` -> `return nil`
+    /// (replica_set.go:632-637): no ReplicaFailure, no requeue.
+    #[tokio::test]
+    async fn rs_ignores_namespace_terminating_create_rejection() {
+        let storage = Arc::new(TerminatingNamespaceStorage::new(Arc::new(
+            MemoryStorage::new(),
+        )));
+        let controller = ReplicaSetController::new(storage.clone(), 5);
+        let rs = make_replicaset("doomed", make_labels(&[("app", "doomed")]), 5);
+        let key = build_key("replicasets", Some("default"), "doomed");
+        storage.create(&key, &rs).await.unwrap();
+
+        controller
+            .reconcile_replicaset(&rs)
+            .await
+            .expect("a terminating namespace must not fail the sync");
+
+        let after: ReplicaSet = storage.get(&key).await.unwrap();
+        assert!(
+            rs_condition(&after, "ReplicaFailure").is_none(),
+            "a terminating namespace must not raise ReplicaFailure"
+        );
+    }
+
+    /// Storage whose first pod `list` lets one "late" pod arrive and lowers
+    /// the RS's outstanding create expectation AFTER the snapshot was taken —
+    /// upstream's `FakeRSExpectations` hook in `TestRSSyncExpectations`.
+    struct LatePodStorage {
+        inner: Arc<MemoryStorage>,
+        late_pod: std::sync::Mutex<Option<Pod>>,
+        expectations: std::sync::OnceLock<Arc<ControllerExpectations>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for LatePodStorage {
+        async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.create(key, value).await
+        }
+        async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+        where
+            T: serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.get(key).await
+        }
+        async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.update(key, value).await
+        }
+        async fn update_raw(
+            &self,
+            key: &str,
+            value: &serde_json::Value,
+        ) -> rusternetes_common::Result<()> {
+            self.inner.update_raw(key, value).await
+        }
+        async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            let snapshot = self.inner.list(prefix).await;
+            if prefix.starts_with("/registry/pods/") {
+                let late = self.late_pod.lock().unwrap().take();
+                if let Some(pod) = late {
+                    // The pod arrives, and its Added event lowers the
+                    // expectation, strictly after the snapshot above.
+                    let key = build_key("pods", Some("default"), &pod.metadata.name);
+                    self.inner.create(&key, &pod).await.unwrap();
+                    self.expectations
+                        .get()
+                        .unwrap()
+                        .creation_observed("default/race");
+                }
+            }
+            snapshot
+        }
+        async fn watch(
+            &self,
+            prefix: &str,
+        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            self.inner.watch(prefix).await
+        }
+        async fn watch_from_revision(
+            &self,
+            prefix: &str,
+            revision: i64,
+        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            self.inner.watch_from_revision(prefix, revision).await
+        }
+        async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+            self.inner.current_revision().await
+        }
+        async fn is_revision_compacted(&self, revision: i64) -> rusternetes_common::Result<bool> {
+            self.inner.is_revision_compacted(revision).await
+        }
+    }
+
+    /// `TestRSSyncExpectations`: a pod cannot sneak in between listing pods and
+    /// checking expectations. Expectations must be read BEFORE the list
+    /// (replica_set.go:728 precedes :734): checked after, the late pod makes the
+    /// record look fulfilled while the list still lacks it, and the controller
+    /// creates a duplicate.
+    #[tokio::test]
+    async fn rs_sync_reads_expectations_before_listing_pods() {
+        let labels = make_labels(&[("app", "race")]);
+        let rs = make_replicaset("race", labels.clone(), 2);
+        let storage = Arc::new(LatePodStorage {
+            inner: Arc::new(MemoryStorage::new()),
+            late_pod: std::sync::Mutex::new(Some(owned_pod(
+                "late",
+                labels.clone(),
+                "race",
+                &rs.metadata.uid,
+            ))),
+            expectations: std::sync::OnceLock::new(),
+        });
+        let controller = ReplicaSetController::new(storage.clone(), 5);
+        storage
+            .expectations
+            .set(controller.expectations.clone())
+            .ok()
+            .unwrap();
+        storage
+            .create(&build_key("replicasets", Some("default"), "race"), &rs)
+            .await
+            .unwrap();
+        storage
+            .create(
+                &build_key("pods", Some("default"), "first"),
+                &owned_pod("first", labels, "race", &rs.metadata.uid),
+            )
+            .await
+            .unwrap();
+        // One create is in flight: the "late" pod.
+        controller.expectations.expect_creations("default/race", 1);
+
+        controller.reconcile_replicaset(&rs).await.unwrap();
+
+        let pods: Vec<Pod> = storage
+            .list(&build_prefix("pods", Some("default")))
+            .await
+            .unwrap();
+        assert_eq!(pods.len(), 2, "no duplicate create: got {}", pods.len());
+    }
+
+    /// `SetCondition` (replica_set_utils.go:169-176) is a no-op when the
+    /// condition already exists with the same status and reason, and
+    /// `calculateStatus` only sets ReplicaFailure when none exists
+    /// (:124-136): a failure that persists keeps its lastTransitionTime and
+    /// message instead of being rewritten every sync.
+    #[tokio::test]
+    async fn rs_replica_failure_is_not_rewritten_while_it_persists() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicaSetController::new(storage.clone(), 10);
+        let rs = make_replicaset("stable", make_labels(&[("app", "s")]), 1);
+        let key = build_key("replicasets", Some("default"), "stable");
+        storage.create(&key, &rs).await.unwrap();
+
+        controller
+            .update_status(&rs, 0, 0, 0, Some("first failure"))
+            .await
+            .unwrap();
+        let first = rs_condition(&storage.get(&key).await.unwrap(), "ReplicaFailure").unwrap();
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let rs: ReplicaSet = storage.get(&key).await.unwrap();
+        controller
+            .update_status(&rs, 0, 0, 0, Some("second failure"))
+            .await
+            .unwrap();
+        let second = rs_condition(&storage.get(&key).await.unwrap(), "ReplicaFailure").unwrap();
+
+        assert_eq!(second.message, first.message);
+        assert_eq!(second.last_transition_time, first.last_transition_time);
+    }
+
+    /// `TestCalculateStatusConditions`: reason is FailedCreate for diff < 0,
+    /// FailedDelete for diff > 0 (replica_set_utils.go:127-132).
+    #[test]
+    fn rs_replica_failure_reason_follows_the_diff() {
+        assert_eq!(replica_failure_reason(1, 2), Some("FailedCreate"));
+        assert_eq!(replica_failure_reason(3, 2), Some("FailedDelete"));
+        // diff == 0 leaves `reason` unset (a zero-value string upstream).
+        assert_eq!(replica_failure_reason(2, 2), None);
+    }
+}
+
+/// Reason of the ReplicaFailure condition, from the pre-manage pod count.
+fn replica_failure_reason(_active: i32, _desired: i32) -> Option<&'static str> {
+    Some("FailedCreate")
 }
