@@ -235,10 +235,21 @@ fn observe_webhook_internal_error(
     admission_metrics::observe_webhook(name, elapsed, true, operation, step_type, 0);
 }
 
-/// A validating webhook task that panicked.
-fn validating_task_panic(_name: &str, _policy: &FailurePolicy, r: &str) -> Result<()> {
+/// A validating webhook call that panicked: `HandleCrash`'s handler
+/// (validating/dispatcher.go:142-163) fails open under `failurePolicy: Ignore`
+/// and counts `ObserveWebhookFailOpen`; otherwise the request fails with
+/// `NewInternalError("ValidatingAdmissionWebhook/<name> has panicked: <r>")`.
+fn validating_task_panic(name: &str, policy: &FailurePolicy, r: &str) -> Result<()> {
+    if matches!(policy, FailurePolicy::Ignore) {
+        warn!("Panic calling webhook, failing open {}: {}", name, r);
+        admission_metrics::observe_webhook_fail_open(
+            name,
+            admission_metrics::STEP_VALIDATING_WEBHOOK,
+        );
+        return Ok(());
+    }
     Err(rusternetes_common::Error::Internal(format!(
-        "webhook task panicked: {r}"
+        "ValidatingAdmissionWebhook/{name} has panicked: {r}"
     )))
 }
 
@@ -1185,7 +1196,39 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                     }
 
                     // Resolve webhook URL and build invocation
-                    let raw_url = self.client.build_webhook_url(&webhook.client_config)?;
+                    // `GetRESTClient` failing is an `ErrCallingWebhook` carrying
+                    // `NewInternalError` (500), so failurePolicy applies
+                    // (validating/dispatcher.go:263-266,
+                    // mutating/dispatcher.go:262-265).
+                    let raw_url = match self.client.build_webhook_url(&webhook.client_config) {
+                        Ok(u) => u,
+                        Err(e) => {
+                            let ignore =
+                                matches!(webhook.failure_policy, Some(FailurePolicy::Ignore));
+                            observe_webhook_call(
+                                &webhook.name,
+                                operation,
+                                admission_metrics::STEP_VALIDATING_WEBHOOK,
+                                Duration::ZERO,
+                                &Err(CallFailure {
+                                    error: e,
+                                    code: 500,
+                                }),
+                                ignore,
+                            );
+                            if ignore {
+                                warn!(
+                                    "Failed calling webhook, failing open {}: could not get REST client",
+                                    webhook.name
+                                );
+                                continue;
+                            }
+                            return Err(rusternetes_common::Error::Internal(format!(
+                                "failed calling webhook \"{}\": could not get REST client",
+                                webhook.name
+                            )));
+                        }
+                    };
                     let resolved_url =
                         AdmissionWebhookClient::resolve_service_url(&raw_url, &self.storage).await;
                     let timeout = resolve_webhook_timeout(webhook.timeout_seconds);
@@ -1254,7 +1297,10 @@ impl<S: Storage> AdmissionWebhookManager<S> {
         // K8s dispatches all validating webhooks concurrently via goroutines.
         // See: dispatcher.go lines 126-131
         let mut handles = Vec::new();
+        // (name, failurePolicy) per task, for the panic handler below.
+        let mut handle_meta: Vec<(String, FailurePolicy)> = Vec::new();
         for inv in invocations {
+            handle_meta.push((inv.webhook_name.clone(), inv.failure_policy.clone()));
             let review = AdmissionReview::new_request(inv.request.clone());
             // K8s caBundle is []byte in Go, which JSON-serializes as base64.
             // Try base64 decode first; if that fails, use raw bytes (might already be PEM).
@@ -1308,15 +1354,13 @@ impl<S: Storage> AdmissionWebhookManager<S> {
         let results = futures::future::join_all(handles).await;
         let mut all_warnings = Vec::new();
 
-        for result in results {
+        for (result, (meta_name, meta_policy)) in results.into_iter().zip(handle_meta) {
             let (webhook_name, failure_policy, _uid, call_result) = match result {
                 Ok(r) => r,
                 Err(e) => {
                     error!("Webhook task panicked: {}", e);
-                    return Err(rusternetes_common::Error::Internal(format!(
-                        "webhook task panicked: {}",
-                        e
-                    )));
+                    validating_task_panic(&meta_name, &meta_policy, &e.to_string())?;
+                    continue;
                 }
             };
 
@@ -1797,7 +1841,39 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                     };
 
                     // Resolve webhook URL — K8s service names need endpoint IP lookup
-                    let raw_url = self.client.build_webhook_url(&webhook.client_config)?;
+                    // `GetRESTClient` failing is an `ErrCallingWebhook` carrying
+                    // `NewInternalError` (500), so failurePolicy applies
+                    // (validating/dispatcher.go:263-266,
+                    // mutating/dispatcher.go:262-265).
+                    let raw_url = match self.client.build_webhook_url(&webhook.client_config) {
+                        Ok(u) => u,
+                        Err(e) => {
+                            let ignore =
+                                matches!(webhook.failure_policy, Some(FailurePolicy::Ignore));
+                            observe_webhook_call(
+                                &webhook.name,
+                                operation,
+                                admission_metrics::STEP_ADMIT,
+                                Duration::ZERO,
+                                &Err(CallFailure {
+                                    error: e,
+                                    code: 500,
+                                }),
+                                ignore,
+                            );
+                            if ignore {
+                                warn!(
+                                    "Failed calling webhook, failing open {}: could not get REST client",
+                                    webhook.name
+                                );
+                                continue;
+                            }
+                            return Err(rusternetes_common::Error::Internal(format!(
+                                "failed calling webhook \"{}\": could not get REST client",
+                                webhook.name
+                            )));
+                        }
+                    };
                     let resolved_url =
                         AdmissionWebhookClient::resolve_service_url(&raw_url, &self.storage).await;
                     let timeout = resolve_webhook_timeout(webhook.timeout_seconds);
@@ -1958,6 +2034,28 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                                 calling_webhook_error,
                                 ignore_client_call_failures,
                             );
+                            // An undecodable patch is an `ErrCallingWebhook`
+                            // (mutating/dispatcher.go:327-335), so Ignore fails
+                            // open (:207-212); the reinvocation bookkeeping
+                            // (:200-203) still runs.
+                            if calling_webhook_error && ignore_client_call_failures {
+                                warn!(
+                                    "Failed calling webhook, failing open {}: {}",
+                                    webhook.name, e
+                                );
+                                admission_metrics::observe_webhook_fail_open(
+                                    &webhook.name,
+                                    admission_metrics::STEP_ADMIT,
+                                );
+                                if matches!(
+                                    webhook.reinvocation_policy,
+                                    Some(ReinvocationPolicy::IfNeeded)
+                                ) {
+                                    reinvoke_ctx
+                                        .add_reinvocable_webhook_to_previously_invoked(webhook_uid);
+                                }
+                                continue;
+                            }
                             return Err(e);
                         }
                     };
