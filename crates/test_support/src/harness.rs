@@ -308,7 +308,11 @@ pub struct TestApiServerBuilder {
     service_cluster_ip_range: String,
     strict_namespaces: bool,
     token_manager: Option<TokenManager>,
+    authorizer_wrapper: Option<AuthorizerWrapper>,
 }
+
+/// See [`TestApiServerBuilder::wrap_authorizer`].
+type AuthorizerWrapper = Box<dyn FnOnce(Arc<dyn Authorizer>) -> Arc<dyn Authorizer>>;
 
 impl Default for TestApiServerBuilder {
     fn default() -> Self {
@@ -321,6 +325,7 @@ impl Default for TestApiServerBuilder {
             service_cluster_ip_range: String::new(),
             strict_namespaces: false,
             token_manager: None,
+            authorizer_wrapper: None,
         }
     }
 }
@@ -350,6 +355,17 @@ impl TestApiServerBuilder {
     /// Use this authorizer instead of the allow-all or RBAC one.
     pub fn authorizer(mut self, authorizer: Arc<dyn Authorizer>) -> Self {
         self.authorizer = Some(authorizer);
+        self
+    }
+
+    /// Wrap the authorizer the server is built with (the allow-all or
+    /// [`RBACAuthorizer`] one), e.g. with a decorator that counts the
+    /// `authorize` calls it forwards.
+    pub fn wrap_authorizer(
+        mut self,
+        wrap: impl FnOnce(Arc<dyn Authorizer>) -> Arc<dyn Authorizer> + 'static,
+    ) -> Self {
+        self.authorizer_wrapper = Some(Box::new(wrap));
         self
     }
 
@@ -394,6 +410,10 @@ impl TestApiServerBuilder {
             Arc::new(RBACAuthorizer::new(backend.clone()))
         } else {
             Arc::new(AlwaysAllowAuthorizer)
+        };
+        let authorizer = match self.authorizer_wrapper {
+            Some(wrap) => wrap(authorizer),
+            None => authorizer,
         };
         let metrics = Arc::new(MetricsRegistry::new());
         let ranges =
