@@ -187,6 +187,11 @@ struct Args {
     #[arg(long, default_value = "")]
     node_ip: String,
 
+    /// Hostname override of the embedded kubelet (upstream kubelet
+    /// `--hostname-override`); empty uses `--node-name`.
+    #[arg(long, default_value = "")]
+    hostname_override: String,
+
     /// Cloud provider of the embedded kubelet: empty, or `external` (upstream
     /// kubelet `--cloud-provider`).
     #[arg(long, default_value = "")]
@@ -546,6 +551,7 @@ async fn async_main() -> Result<()> {
         metrics_port: 10250,
         node_ip: args.node_ip.clone(),
         cloud_provider: args.cloud_provider.clone(),
+        hostname_override: args.hostname_override.clone(),
         kubernetes_service_host: args
             .kubernetes_service_host
             .clone()

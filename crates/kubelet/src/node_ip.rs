@@ -292,6 +292,56 @@ pub fn set_node_address(
     Ok(())
 }
 
+/// `nodeutil.GetHostname` (staging/src/k8s.io/component-helpers/node/util/
+/// hostname.go:28-46). `os_hostname` is `os.Hostname`.
+pub fn get_hostname(
+    hostname_override: &str,
+    os_hostname: &dyn Fn() -> std::io::Result<String>,
+) -> Result<String, String> {
+    let host_name = if hostname_override.is_empty() {
+        os_hostname().map_err(|e| format!("couldn't determine hostname: {e}"))?
+    } else {
+        hostname_override.to_string()
+    };
+    // Trim whitespaces first to avoid getting an empty hostname.
+    let host_name = host_name.trim();
+    if host_name.is_empty() {
+        return Err("empty hostname is invalid".into());
+    }
+    Ok(host_name.to_lowercase())
+}
+
+/// `utilnode.GetNodeHostIPs` (pkg/util/node/node.go:65-98).
+pub fn get_node_host_ips(
+    addresses: &[rusternetes_common::resources::NodeAddress],
+) -> Result<Vec<IpAddr>, String> {
+    // Re-sort the addresses with InternalIPs first and then ExternalIPs.
+    let mut all_ips: Vec<IpAddr> = Vec::with_capacity(addresses.len());
+    for kind in ["InternalIP", "ExternalIP"] {
+        all_ips.extend(
+            addresses
+                .iter()
+                .filter(|a| a.address_type == kind)
+                .filter_map(|a| parse_ip_sloppy(&a.address)),
+        );
+    }
+    let Some(&first) = all_ips.first() else {
+        let known: Vec<String> = addresses
+            .iter()
+            .map(|a| format!("{{{} {}}}", a.address_type, a.address))
+            .collect();
+        return Err(format!(
+            "host IP unknown; known addresses: [{}]",
+            known.join(" ")
+        ));
+    };
+    let mut node_ips = vec![first];
+    if let Some(&other) = all_ips.iter().find(|ip| ip.is_ipv6() != first.is_ipv6()) {
+        node_ips.push(other);
+    }
+    Ok(node_ips)
+}
+
 /// The setter without an external cloud provider, on a scratch node named
 /// `hostname`; returns `(type, address)` pairs.
 #[cfg(test)]
@@ -315,55 +365,103 @@ pub fn node_addresses(
         .collect())
 }
 
-/// The InternalIP list the kubelet advertises: the `NodeAddress` setter
-/// result, falling back to `detect` (the legacy single-IPv4 path) when the
-/// setter errors or yields no InternalIP. `Never empty`.
-#[allow(clippy::too_many_arguments)]
-pub fn effective_internal_ips(
-    configured: &[IpAddr],
-    validate: &dyn Fn(IpAddr) -> Result<(), String>,
-    hostname: &str,
-    external_cloud_provider: bool,
-    lookup: &dyn Fn(&str) -> Vec<IpAddr>,
-    resolve: &dyn Fn(Option<IpAddr>) -> Result<IpAddr, String>,
-    detect: &dyn Fn() -> String,
-) -> Vec<String> {
-    // Upstream runs the setter whether or not --node-ip is set
-    // (pkg/kubelet/nodestatus/setters.go:70-96, 141-189): with no node IP it
-    // looks up the node name, preferring IPv4 but accepting a valid IPv6.
-    let mut node = rusternetes_common::resources::Node::new(hostname);
-    if set_node_address(
-        &mut node,
-        configured,
-        validate,
-        hostname,
-        external_cloud_provider,
-        lookup,
-        resolve,
-    )
-    .is_ok()
-    {
-        let ips: Vec<String> = node
-            .status
-            .and_then(|s| s.addresses)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|a| a.address_type == "InternalIP")
-            .map(|a| a.address)
-            .collect();
-        if !ips.is_empty() {
-            return ips;
-        }
-    }
-    vec![detect()]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    // hostname_test.go TestGetHostname
+    #[test]
+    fn get_hostname_cases() {
+        let os = || Ok("OsHost".to_string());
+        assert_eq!(get_hostname("overridden", &os).unwrap(), "overridden");
+        assert_eq!(get_hostname("OVERRIDDEN", &os).unwrap(), "overridden");
+        assert_eq!(get_hostname(" OVERRIDDEN ", &os).unwrap(), "overridden");
+        assert_eq!(
+            get_hostname(" ", &os).unwrap_err(),
+            "empty hostname is invalid"
+        );
+        // empty parameter: os.Hostname(), lowercased.
+        assert_eq!(get_hostname("", &os).unwrap(), "oshost");
+        // os.Hostname failure.
+        let bad = || Err(std::io::Error::other("boom"));
+        assert!(get_hostname("", &bad)
+            .unwrap_err()
+            .starts_with("couldn't determine hostname: "));
+        // os hostname that is only whitespace.
+        let blank = || Ok("  ".to_string());
+        assert_eq!(
+            get_hostname("", &blank).unwrap_err(),
+            "empty hostname is invalid"
+        );
+    }
+
+    // pkg/util/node/node_test.go TestGetNodeHostIPs
+    #[test]
+    fn get_node_host_ips_cases() {
+        let a = |t: &str, v: &str| rusternetes_common::resources::NodeAddress {
+            address_type: t.to_string(),
+            address: v.to_string(),
+        };
+        let ips = |l: &[&str]| l.iter().map(|s| ip(s)).collect::<Vec<_>>();
+        assert!(get_node_host_ips(&[]).is_err());
+        assert!(get_node_host_ips(&[a("Hostname", "example.com")]).is_err());
+        let err = get_node_host_ips(&[a("Hostname", "example.com")]).unwrap_err();
+        assert!(
+            err.starts_with("host IP unknown; known addresses: "),
+            "{err}"
+        );
+        // IPv4-only, simple
+        assert_eq!(
+            get_node_host_ips(&[
+                a("InternalIP", "1.2.3.4"),
+                a("ExternalIP", "4.3.2.1"),
+                a("ExternalIP", "4.3.2.2")
+            ])
+            .unwrap(),
+            ips(&["1.2.3.4"])
+        );
+        // external-first
+        assert_eq!(
+            get_node_host_ips(&[
+                a("ExternalIP", "4.3.2.1"),
+                a("ExternalIP", "4.3.2.2"),
+                a("InternalIP", "1.2.3.4")
+            ])
+            .unwrap(),
+            ips(&["1.2.3.4"])
+        );
+        // no internal
+        assert_eq!(
+            get_node_host_ips(&[a("ExternalIP", "4.3.2.1"), a("ExternalIP", "4.3.2.2")]).unwrap(),
+            ips(&["4.3.2.1"])
+        );
+        // dual-stack node
+        assert_eq!(
+            get_node_host_ips(&[
+                a("InternalIP", "1.2.3.4"),
+                a("ExternalIP", "4.3.2.1"),
+                a("ExternalIP", "4.3.2.2"),
+                a("InternalIP", "a:b::c:d"),
+                a("ExternalIP", "d:c::b:a")
+            ])
+            .unwrap(),
+            ips(&["1.2.3.4", "a:b::c:d"])
+        );
+        // dual-stack node, IPv6-first, no internal IPv4
+        assert_eq!(
+            get_node_host_ips(&[
+                a("InternalIP", "a:b::c:d"),
+                a("ExternalIP", "d:c::b:a"),
+                a("ExternalIP", "4.3.2.1"),
+                a("ExternalIP", "4.3.2.2")
+            ])
+            .unwrap(),
+            ips(&["a:b::c:d", "4.3.2.1"])
+        );
     }
 
     // ips_test.go TestParseNodeIPArgument
@@ -587,48 +685,23 @@ mod tests {
     // setters.go:163-179 runs with NO --node-ip too: an IPv6-only host (DNS
     // yields only a valid v6 address) advertises it instead of 127.0.0.1 (#3186).
     #[test]
-    fn effective_ips_without_node_ip_uses_ipv6_only_lookup() {
+    fn addresses_without_node_ip_use_ipv6_only_lookup() {
         let lk = |_: &str| vec![ip("fd00::9")];
-        let got = effective_internal_ips(
-            &[],
-            &validate_node_ip,
-            "h",
-            false,
-            &lk,
-            &|_| Err("no default route".to_string()),
-            &|| "127.0.0.1".to_string(),
-        );
-        assert_eq!(got, vec!["fd00::9".to_string()]);
+        let got = node_addresses(&[], &validate_node_ip, "h", &lk, &|_| {
+            Err("no default route".to_string())
+        })
+        .unwrap();
+        assert_eq!(got[0], ("InternalIP".to_string(), "fd00::9".to_string()));
     }
 
     #[test]
-    fn effective_ips_without_node_ip_prefers_ipv4_and_falls_back_to_detect() {
+    fn addresses_without_node_ip_prefer_ipv4() {
         let lk = |_: &str| vec![ip("fd00::9"), ip("10.0.0.9")];
-        let d = || "127.0.0.1".to_string();
-        assert_eq!(
-            effective_internal_ips(
-                &[],
-                &validate_node_ip,
-                "h",
-                false,
-                &lk,
-                &|_| Err("no default route".to_string()),
-                &d
-            ),
-            vec!["10.0.0.9".to_string()]
-        );
-        assert_eq!(
-            effective_internal_ips(
-                &[],
-                &validate_node_ip,
-                "h",
-                false,
-                &none,
-                &|_| Err("no default route".to_string()),
-                &d
-            ),
-            vec!["127.0.0.1".to_string()]
-        );
+        let got = node_addresses(&[], &validate_node_ip, "h", &lk, &|_| {
+            Err("no default route".to_string())
+        })
+        .unwrap();
+        assert_eq!(got[0], ("InternalIP".to_string(), "10.0.0.9".to_string()));
     }
 
     // kubelet.go:461-464 + plugins.go:94-96
