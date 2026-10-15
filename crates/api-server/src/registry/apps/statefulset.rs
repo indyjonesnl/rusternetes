@@ -24,6 +24,7 @@ use crate::registry::rest::{
     RestCreateStrategy, RestDeleteStrategy, RestUpdateStrategy,
 };
 use crate::registry::scale::{Scalable, ScaleRest};
+use crate::ssa::ResetFields;
 
 /// The v1 defaulting a decoded StatefulSet goes through:
 /// `SetDefaults_StatefulSet` (pkg/apis/apps/v1/defaults.go) and the pod
@@ -174,6 +175,11 @@ impl RestUpdateStrategy<StatefulSet> for Strategy {
     fn allow_unconditional_update(&self) -> bool {
         true
     }
+
+    /// `GetResetFields` (strategy.go:59-69): `status`.
+    fn get_reset_fields(&self) -> ResetFields {
+        ResetFields::new().with("apps/v1", &[&["status"]])
+    }
 }
 
 /// `DefaultGarbageCollectionPolicy` (strategy.go:50-52): `DeleteDependents`.
@@ -217,6 +223,11 @@ impl RestUpdateStrategy<StatefulSet> for StatusStrategy {
 
     fn allow_unconditional_update(&self) -> bool {
         true
+    }
+
+    /// `GetResetFields` (strategy.go:197-205): `spec`.
+    fn get_reset_fields(&self) -> ResetFields {
+        ResetFields::new().with("apps/v1", &[&["spec"]])
     }
 }
 

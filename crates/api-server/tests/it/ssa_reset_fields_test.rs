@@ -176,3 +176,93 @@ async fn deployment_apply_does_not_own_status() {
         "{out}"
     );
 }
+
+/// The apps/v1 workload kinds whose strategies reset `status` on the main
+/// resource and `spec` on `/status`:
+/// `pkg/registry/apps/replicaset/strategy.go:69-77` and `:199-207`,
+/// `pkg/registry/apps/statefulset/strategy.go:59-69` and `:197-205`,
+/// `pkg/registry/apps/daemonset/strategy.go:57-67` and `:173-181`.
+fn workload(kind: &str, name: &str, with_status: bool) -> Value {
+    let mut spec = json!({
+        "selector": {"matchLabels": {"app": "rf"}},
+        "template": {
+            "metadata": {"labels": {"app": "rf"}},
+            "spec": {"containers": [{"name": "c", "image": "busybox"}]}
+        }
+    });
+    if kind == "StatefulSet" {
+        spec["serviceName"] = json!("svc");
+    }
+    let status = match kind {
+        "ReplicaSet" => json!({"replicas": 1}),
+        "StatefulSet" => json!({"replicas": 1}),
+        _ => json!({
+            "currentNumberScheduled": 1, "numberMisscheduled": 0,
+            "desiredNumberScheduled": 1, "numberReady": 1
+        }),
+    };
+    let mut b = json!({
+        "apiVersion": "apps/v1", "kind": kind,
+        "metadata": {"name": name, "namespace": "default"},
+        "spec": spec
+    });
+    if with_status {
+        b["status"] = status;
+    }
+    b
+}
+
+async fn main_resource_does_not_own_status(kind: &str, plural: &str) {
+    let api = TestApiServer::new();
+    let name = format!("rf-{plural}-main");
+    let uri = format!("/apis/apps/v1/namespaces/default/{plural}/{name}");
+    let (code, out) = apply(&api, &uri, "user", &workload(kind, &name, true)).await;
+    assert_eq!(code, StatusCode::CREATED, "{out}");
+    let owned = owned_keys(&out, "user");
+    assert!(owned.contains(&"f:spec".to_string()), "{out}");
+    assert!(!owned.contains(&"f:status".to_string()), "{out}");
+}
+
+async fn status_does_not_own_spec(kind: &str, plural: &str) {
+    let api = TestApiServer::new();
+    let name = format!("rf-{plural}-status");
+    let base = format!("/apis/apps/v1/namespaces/default/{plural}");
+    let (code, out) = api.post(&base, &workload(kind, &name, false)).await;
+    assert_eq!(code, StatusCode::CREATED, "{out}");
+    let uri = format!("{base}/{name}/status");
+    let (code, out) = apply(&api, &uri, "ctrl", &workload(kind, &name, true)).await;
+    assert_eq!(code, StatusCode::OK, "{out}");
+    let owned = owned_keys(&out, "ctrl");
+    assert!(owned.contains(&"f:status".to_string()), "{out}");
+    assert!(!owned.contains(&"f:spec".to_string()), "{out}");
+}
+
+#[tokio::test]
+async fn replicaset_main_resource_does_not_own_status() {
+    main_resource_does_not_own_status("ReplicaSet", "replicasets").await;
+}
+
+#[tokio::test]
+async fn replicaset_status_does_not_own_spec() {
+    status_does_not_own_spec("ReplicaSet", "replicasets").await;
+}
+
+#[tokio::test]
+async fn statefulset_main_resource_does_not_own_status() {
+    main_resource_does_not_own_status("StatefulSet", "statefulsets").await;
+}
+
+#[tokio::test]
+async fn statefulset_status_does_not_own_spec() {
+    status_does_not_own_spec("StatefulSet", "statefulsets").await;
+}
+
+#[tokio::test]
+async fn daemonset_main_resource_does_not_own_status() {
+    main_resource_does_not_own_status("DaemonSet", "daemonsets").await;
+}
+
+#[tokio::test]
+async fn daemonset_status_does_not_own_spec() {
+    status_does_not_own_spec("DaemonSet", "daemonsets").await;
+}

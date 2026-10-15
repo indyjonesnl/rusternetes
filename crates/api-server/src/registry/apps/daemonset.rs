@@ -21,6 +21,7 @@ use crate::registry::rest::{
     GarbageCollectionPolicy, GroupResource, NamespaceScopedStrategy, RequestContext,
     RestCreateStrategy, RestDeleteStrategy, RestUpdateStrategy,
 };
+use crate::ssa::ResetFields;
 
 /// The v1 defaulting a decoded DaemonSet goes through:
 /// `SetDefaults_DaemonSet` (pkg/apis/apps/v1/defaults.go) and the pod
@@ -105,6 +106,11 @@ impl RestUpdateStrategy<DaemonSet> for Strategy {
     fn allow_unconditional_update(&self) -> bool {
         true
     }
+
+    /// `GetResetFields` (strategy.go:57-67): `status`.
+    fn get_reset_fields(&self) -> ResetFields {
+        ResetFields::new().with("apps/v1", &[&["status"]])
+    }
 }
 
 /// `DefaultGarbageCollectionPolicy` (strategy.go:48-50): `DeleteDependents`.
@@ -152,6 +158,11 @@ impl RestUpdateStrategy<DaemonSet> for StatusStrategy {
 
     fn allow_unconditional_update(&self) -> bool {
         true
+    }
+
+    /// `GetResetFields` (strategy.go:173-181): `spec`.
+    fn get_reset_fields(&self) -> ResetFields {
+        ResetFields::new().with("apps/v1", &[&["spec"]])
     }
 }
 
