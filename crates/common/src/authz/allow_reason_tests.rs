@@ -367,3 +367,17 @@ async fn node_default_and_success_reasons_are_empty() {
         }
     );
 }
+
+// authorizer/interfaces.go:80-85: reason and error are independent fields.
+// Legacy adapters must also accept the older embedded NoOpinion error slot.
+#[test]
+fn outcome_adapters_preserve_embedded_errors() {
+    let outcome = AuthorizationOutcome {
+        opinion: Opinion::NoOpinion { reason: "abstained".into(), error: Some("evaluation failed".into()) },
+        error: None,
+    };
+    assert_eq!(outcome.clone().into_opinion(), outcome.opinion);
+    assert!(outcome.into_decision().is_err());
+    let denied = AuthorizationOutcome { opinion: Opinion::Deny("denied".into()), error: Some("evaluation failed".into()) };
+    assert!(denied.into_decision().is_err());
+}

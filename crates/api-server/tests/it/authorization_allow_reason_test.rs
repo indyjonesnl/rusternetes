@@ -120,3 +120,55 @@ async fn abac_reasons_remain_empty_on_allow_and_exact_on_no_match() {
         }
     );
 }
+
+// caching_authorizer.go:31-39,79-81 caches the entire tuple once, shared by
+// adapters for the legacy APIs, rather than separately reauthorizing.
+#[tokio::test]
+async fn cached_outcome_is_shared_with_legacy_adapters() {
+    let cache = rusternetes_api_server::admission::caching_authorizer::new_caching_authorizer(
+        Arc::new(AllowWithError),
+    );
+    let attrs = RequestAttributes::new(UserInfo::anonymous(), "get", "pods");
+    let outcome = cache.authorize_outcome(&attrs).await.unwrap();
+    assert_eq!(cache.authorize(&attrs).await.unwrap(), Decision::Allow);
+    assert_eq!(
+        cache.authorize_opinion(&attrs).await.unwrap(),
+        outcome.opinion
+    );
+    assert_eq!(cache.authorize_outcome(&attrs).await.unwrap(), outcome);
+}
+
+// metrics/metrics.go:77-94 returns the delegate's complete tuple, including
+// when called via legacy adapters in this Rust implementation.
+#[tokio::test]
+async fn instrumented_legacy_adapters_share_the_outcome_path() {
+    let authorizer = rusternetes_api_server::authorization_metrics::instrumented_authorizer(
+        "RBAC", "legacy-outcome", Arc::new(AllowWithError),
+    );
+    let attrs = RequestAttributes::new(UserInfo::anonymous(), "get", "pods");
+    assert_eq!(authorizer.authorize(&attrs).await.unwrap(), Decision::Allow);
+    assert_eq!(authorizer.authorize_opinion(&attrs).await.unwrap(),
+        Opinion::Allow("RBAC: partial evaluation allowed".into()));
+}
+
+// pkg/kubeapiserver/authorizer/reload.go:78-79 forwards the full tuple.
+#[tokio::test]
+async fn reloadable_legacy_adapters_share_the_outcome_path() {
+    use rusternetes_api_server::{
+        authorization_config::AuthorizationConfiguration,
+        authorization_reload::{ChainBuilder, ReloadableAuthorizer},
+    };
+    struct Builder;
+    impl ChainBuilder for Builder {
+        fn new_for_config(&self, _: &AuthorizationConfiguration) -> anyhow::Result<Arc<dyn Authorizer>> {
+            unreachable!("this test never reloads")
+        }
+    }
+    let authorizer = ReloadableAuthorizer::new("", "test".into(),
+        AuthorizationConfiguration::default(), vec![], Arc::new(AllowWithError), Arc::new(Builder));
+    let attrs = RequestAttributes::new(UserInfo::anonymous(), "get", "pods");
+    assert_eq!(authorizer.authorize(&attrs).await.unwrap(), Decision::Allow);
+    assert_eq!(authorizer.authorize_opinion(&attrs).await.unwrap(),
+        Opinion::Allow("RBAC: partial evaluation allowed".into()));
+    assert!(authorizer.authorize_outcome(&attrs).await.unwrap().error.is_some());
+}
