@@ -3055,3 +3055,7 @@ mod system_namespaces_tests {
         assert_eq!(got.metadata.uid, before);
     }
 }
+
+#[cfg(test)]
+#[path = "bootstrap_policy_tests.rs"]
+mod bootstrap_policy_tests;
