@@ -41,22 +41,22 @@
 //! | namespace.go:404 apply a finalizer | both halves (add + remove) now asserted |
 //! | limit_range.go:256 list, patch, delete by collection | cross-namespace label-selected list + collection delete added |
 //!
-//! **Every mirror in this file has now been re-derived.** What remains is not
-//! re-derivation but absence. The five object-count quota cases
-//! (`resource_quota.go` :112, :172, :339, :406, :462 — the life of a service,
-//! secret, configMap, replication controller and replica set) are now mirrored
-//! in `conformance_apimachinery_resource_quota_object_count.rs`. Five cases in
-//! these sources still have no mirror at all — `resource_quota.go` :754 and
-//! `namespace.go` :247, :256, :309, :376 — tracked in #1770. Two of them
-//! (namespace :247, :256 — pods and services removed on namespace deletion) are
-//! controller-owned and their mirrors likely belong in
-//! `crates/controller-manager/tests/it/`, as the kube-root-ca requirements did
-//! in #1755.
+//! **Every mirror in this file has now been re-derived**, and every
+//! conformance case in these sources now has a mirror (#1770). Ten of them
+//! live in sibling files:
 //!
-//! The record stays marked in-progress for that reason: the file's mirrors are
-//! audited, the area's coverage is not.
+//! | upstream cases | mirror file |
+//! |---|---|
+//! | `resource_quota.go` :112, :172, :339, :406, :462 (life of a service, secret, configMap, replication controller, replica set) | `conformance_apimachinery_resource_quota_object_count.rs` |
+//! | `resource_quota.go` :754 (terminating scopes) | `conformance_apimachinery_resource_quota_terminating_scope.rs` |
+//! | `namespace.go` :247, :256 (pods / services removed on namespace deletion), :309 (namespace status), :376 (namespace update) | `conformance_apimachinery_namespace_lifecycle.rs` |
 //!
-//! Do not treat this file as audited: the record above is explicitly partial.
+//! The two deletion cases are controller-owned; their mirror drives the real
+//! `NamespaceController` over `ApiStorage` against a served api-server, so it
+//! stays in this crate rather than `crates/controller-manager/tests/it/`.
+//!
+//! The remaining gaps are the per-mirror ones in the table above (watch
+//! confirmation, extended-resources denial, resourceVersion compare).
 //!
 //! See `docs/conformance/apimachinery-namespaces-quota-limits.md` for the
 //! test-by-test status table and the cross-reference into `docs/CONFORMANCE.md`
@@ -1357,8 +1357,10 @@ async fn resource_quota_scopes_best_effort_filter() {
 /// `resource_quota.go:754` ("should verify ResourceQuota with terminating
 /// scopes."), which is a **different mechanism**: the Terminating /
 /// NotTerminating *scope* keys off `spec.activeDeadlineSeconds`
-/// (pods.go:418), not off the pod's phase. The two are unrelated, and
-/// `resource_quota.go:754` has no mirror at all — recorded in #1770.
+/// (pods.go:418), not off the pod's phase. The two are unrelated;
+/// `resource_quota.go:754` is mirrored by
+/// `resource_quota_verifies_terminating_scopes`
+/// (`conformance_apimachinery_resource_quota_terminating_scope.rs`, #1770).
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn resource_quota_terminal_pods_not_counted() {
