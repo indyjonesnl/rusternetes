@@ -10854,6 +10854,45 @@ impl ProtoRegistry {
 
         // kube-aggregator/v1
         schemas.insert("APIServiceList".into(), list_schema("APIService"));
+
+        // certificates/v1 (certificates/v1/generated.proto:102) — the
+        // v1beta1 list has the same shape.
+        schemas.insert(
+            "CertificateSigningRequestList".into(),
+            list_schema("CertificateSigningRequest"),
+        );
+
+        // flowcontrol/v1 (flowcontrol/v1/generated.proto:114, :340); the
+        // v1beta1/v1beta2/v1beta3 lists have the same shape.
+        schemas.insert("FlowSchemaList".into(), list_schema("FlowSchema"));
+        schemas.insert(
+            "PriorityLevelConfigurationList".into(),
+            list_schema("PriorityLevelConfiguration"),
+        );
+
+        // node/v1 (node/v1/generated.proto:79); v1alpha1/v1beta1 same shape.
+        schemas.insert("RuntimeClassList".into(), list_schema("RuntimeClass"));
+
+        // resource/v1 (resource/v1/generated.proto:668, :1409, :1505, :1601);
+        // v1beta1/v1beta2 same shape. The DRA kinds live behind
+        // group-qualified keys (see `register_resource_v1`), so the items
+        // point at those.
+        schemas.insert(
+            "DeviceClassList".into(),
+            list_schema("resource.k8s.io/v1.DeviceClass"),
+        );
+        schemas.insert(
+            "ResourceClaimList".into(),
+            list_schema("resource.k8s.io/v1.ResourceClaim"),
+        );
+        schemas.insert(
+            "ResourceClaimTemplateList".into(),
+            list_schema("resource.k8s.io/v1.ResourceClaimTemplate"),
+        );
+        schemas.insert(
+            "ResourceSliceList".into(),
+            list_schema("resource.k8s.io/v1.ResourceSlice"),
+        );
     }
 
     /// Register apimachinery types that ride alongside the resource schemas:
