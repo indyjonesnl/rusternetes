@@ -548,6 +548,7 @@ pub async fn priority_and_fairness<S: Storage + 'static>(
         api_version: attrs.api_version.clone(),
         resource: attrs.resource.clone(),
         subresource: attrs.subresource.clone(),
+        ..Default::default()
     };
     let is_mutating = !NON_MUTATING_REQUEST_VERBS.contains(&attrs.verb.as_str());
 
