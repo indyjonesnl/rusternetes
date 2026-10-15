@@ -1,8 +1,8 @@
 use super::controller_utils::{find_min_next_pod_availability_check, is_pod_active, pod_key};
 use super::expectations::ControllerExpectations;
 use super::pod_informer::{
-    apply_pod_observation, ControllerRef, PodEventTarget, PodInformerCache, PodObservation,
-    ResolvedController,
+    apply_pod_observation, ControllerRef, PodEventTarget, PodObservation, ResolvedController,
+    SharedPodInformer,
 };
 use super::replicaset::{
     count_pods, get_pods_to_delete, indirectly_related_pods, PodCounts, RelatedSet,
@@ -39,16 +39,29 @@ pub struct ReplicationControllerController<S: Storage> {
     /// The shared pod informer's indexer, as far as the event handlers need
     /// it ([`super::pod_informer`]): the handlers, not the sync, lower
     /// `expectations` (replica_set.go:436, :568).
-    pod_cache: PodInformerCache,
+    pod_informer: Arc<SharedPodInformer<S>>,
 }
 
 impl<S: Storage + 'static> ReplicationControllerController<S> {
+    #[allow(dead_code)] // the binary shares one informer via `with_pod_informer`
     pub fn new(storage: Arc<S>, interval_secs: u64) -> Self {
+        let interval = Duration::from_secs(interval_secs);
+        let pod_informer = Arc::new(SharedPodInformer::new(storage.clone(), interval));
+        Self::with_pod_informer(storage, interval_secs, pod_informer)
+    }
+
+    /// A controller whose pod event handlers hang off an informer shared with
+    /// other controllers.
+    pub(crate) fn with_pod_informer(
+        storage: Arc<S>,
+        interval_secs: u64,
+        pod_informer: Arc<SharedPodInformer<S>>,
+    ) -> Self {
         Self {
             storage,
             interval: Duration::from_secs(interval_secs),
             expectations: Arc::new(ControllerExpectations::new()),
-            pod_cache: PodInformerCache::new(),
+            pod_informer,
         }
     }
 
@@ -66,6 +79,15 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
                 worker_self.worker(worker_queue).await;
             }
         });
+
+        // Upstream's controller registers its handlers on the shared pod
+        // informer (`podInformer.Informer().AddEventHandler`, replica_set.go:207)
+        // and the informer factory runs the one watch; the first controller to
+        // get here starts it.
+        self.pod_informer
+            .add_event_handler(Arc::clone(&self), queue.clone())
+            .await;
+        self.pod_informer.start();
 
         loop {
             // Initial full reconciliation
@@ -91,24 +113,6 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
                 }
             };
 
-            let pod_prefix = build_prefix("pods", None);
-            let mut pod_watch = match self.storage.watch(&pod_prefix).await {
-                Ok(w) => w,
-                Err(e) => {
-                    error!(
-                        "Failed to establish pod watch: {}, retrying in {:?}",
-                        e, self.interval
-                    );
-                    tokio::time::sleep(self.interval).await;
-                    continue;
-                }
-            };
-
-            // The reflector's list: with the watch established first, nothing
-            // that happens from here on is missed, and the pods created or
-            // deleted while the previous watch was down are observed now.
-            self.relist_pods(&queue).await;
-
             // Periodic full resync as safety net
             let mut resync = tokio::time::interval(std::time::Duration::from_secs(5));
             resync.tick().await; // consume first immediate tick
@@ -132,21 +136,6 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
                             }
                         }
                     }
-                    event = pod_watch.next() => {
-                        match event {
-                            Some(Ok(ev)) => {
-                                self.enqueue_owner_rc(&queue, &ev).await;
-                            }
-                            Some(Err(e)) => {
-                                warn!("Pod watch error: {}, reconnecting", e);
-                                watch_broken = true;
-                            }
-                            None => {
-                                warn!("Pod watch stream ended, reconnecting");
-                                watch_broken = true;
-                            }
-                        }
-                    }
                     _ = resync.tick() => {
                         self.enqueue_all(&queue).await;
                     }
@@ -161,7 +150,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
     async fn relist_pods(&self, queue: &WorkQueue) {
         match self.storage.list::<Pod>(&build_prefix("pods", None)).await {
             Ok(pods) => {
-                for observation in self.pod_cache.replace(&pods) {
+                for observation in self.pod_informer.cache().replace(&pods) {
                     self.apply_observation(queue, &observation).await;
                 }
             }
@@ -180,8 +169,9 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
 
     /// One pod watch event through the informer handlers: `addPod`,
     /// `updatePod` or `deletePod`, whichever the pod cache says it is.
+    #[cfg(test)]
     async fn enqueue_owner_rc(&self, queue: &WorkQueue, event: &rusternetes_storage::WatchEvent) {
-        if let Some(observation) = self.pod_cache.on_event(event) {
+        if let Some(observation) = self.pod_informer.cache().on_event(event) {
             self.apply_observation(queue, &observation).await;
         }
     }

@@ -27,14 +27,18 @@
 //! ReplicationController (`resolveControllerRef`, `getPodReplicaSets`).
 
 use super::controller_utils::is_pod_ready;
+use futures::StreamExt;
 use rusternetes_common::resources::Pod;
-use rusternetes_storage::{WatchEvent, WorkQueue};
+use rusternetes_storage::{build_prefix, Storage, WatchEvent, WorkQueue};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::sync::Mutex;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tracing::{error, warn};
 
 /// `metav1.OwnerReference`, restricted to what `resolveControllerRef` reads
 /// (replica_set.go:305-321): the kind, the name to look the controller up by,
@@ -90,6 +94,9 @@ struct KnownPod {
     resource_version: Option<u64>,
     /// `podutil.IsPodReady(pod)`, for the Ready-transition check (:509).
     ready: bool,
+    /// `pod.DeletionTimestamp != nil`, for replaying `addPod`'s
+    /// "already pending deletion" branch to a handler added later.
+    terminating: bool,
 }
 
 /// Pod key ("namespace/name") to what the handlers read of it.
@@ -131,6 +138,7 @@ fn known_of(pod: &Pod) -> KnownPod {
         labels: labels_digest(pod.metadata.labels.as_ref()),
         resource_version: pod.metadata.resource_version.as_deref().map(digest),
         ready: is_pod_ready(pod),
+        terminating: pod.metadata.deletion_timestamp.is_some(),
     }
 }
 
@@ -257,6 +265,30 @@ impl PodInformerCache {
 
         let effects = Self::handle_present(&mut known, &pod_key, &pod?);
         Some(PodObservation { pod_key, effects })
+    }
+
+    /// What `AddEventHandler` replays to a handler added after the informer
+    /// holds pods: an `addPod` for each held pod. An orphan's
+    /// `getPodReplicaSets` enqueue is not replayed (the labels are not kept,
+    /// to keep the cache small); the controller's own initial full enqueue
+    /// covers it.
+    fn held_as_adds(&self) -> Vec<PodObservation> {
+        let known = self.known.lock().unwrap();
+        known
+            .iter()
+            .filter_map(|(pod_key, k)| {
+                let controller = k.controller.clone()?;
+                let effect = if k.terminating {
+                    PodEffect::ObserveDeletion(controller)
+                } else {
+                    PodEffect::ObserveCreation(controller)
+                };
+                Some(PodObservation {
+                    pod_key: pod_key.clone(),
+                    effects: vec![effect],
+                })
+            })
+            .collect()
     }
 
     /// The reflector's re-list on (re)connect: `DeltaFIFO.Replace`. Pods not
@@ -394,6 +426,162 @@ pub(crate) async fn apply_pod_observation<T: PodEventTarget>(
             PodEffect::EnqueueMatching(labels) => {
                 for name in target.pod_controllers(namespace, labels).await {
                     queue.add(enqueue(&name)).await;
+                }
+            }
+        }
+    }
+}
+
+/// One registered `ResourceEventHandler`: a [`PodEventTarget`] and the queue
+/// its handlers enqueue onto. Object-safe so one informer can hold targets of
+/// different controllers (`PodEventTarget` returns `impl Future`).
+trait PodObservationHandler: Send + Sync {
+    fn handle<'a>(
+        &'a self,
+        observation: &'a PodObservation,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+}
+
+struct RegisteredTarget<T> {
+    target: Arc<T>,
+    queue: WorkQueue,
+}
+
+impl<T: PodEventTarget + Send + Sync + 'static> PodObservationHandler for RegisteredTarget<T> {
+    fn handle<'a>(
+        &'a self,
+        observation: &'a PodObservation,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(apply_pod_observation(
+            &*self.target,
+            &self.queue,
+            observation,
+        ))
+    }
+}
+
+/// The shared pod informer: ONE watch + re-list task owning ONE
+/// [`PodInformerCache`], fanning each classified [`PodObservation`] out to
+/// every registered [`PodEventTarget`].
+///
+/// Upstream classifies each delta once against the informer's single indexer
+/// (`client-go/tools/cache/controller.go:581-607`, `processDeltas`: the
+/// `clientState.Get` hit chooses `OnUpdate`, a miss `OnAdd`) and
+/// `sharedIndexInformer.OnAdd`/`OnUpdate` hand the notification to
+/// `sharedProcessor.distribute` (`shared_informer.go:863-880`), which delivers
+/// it to every listener. Classifying once per controller against a shared
+/// cache would instead show the second controller an update where the first
+/// saw the add, and the add is what lowers `ControllerExpectations`
+/// (replica_set.go:436). Here the cache is consulted exactly once per event,
+/// before any target is told.
+pub(crate) struct SharedPodInformer<S: Storage> {
+    storage: Arc<S>,
+    interval: Duration,
+    cache: PodInformerCache,
+    handlers: Mutex<Vec<Arc<dyn PodObservationHandler>>>,
+    started: AtomicBool,
+}
+
+impl<S: Storage + 'static> SharedPodInformer<S> {
+    pub(crate) fn new(storage: Arc<S>, interval: Duration) -> Self {
+        Self {
+            storage,
+            interval,
+            cache: PodInformerCache::new(),
+            handlers: Mutex::new(Vec::new()),
+            started: AtomicBool::new(false),
+        }
+    }
+
+    /// The informer's indexer, for a target driving its own pass.
+    pub(crate) fn cache(&self) -> &PodInformerCache {
+        &self.cache
+    }
+
+    /// `AddEventHandler` (`shared_informer.go:656`,
+    /// `sharedProcessor.addListener` :821): from now on every observation reaches `target`, enqueuing onto
+    /// `queue`. Like upstream, a handler added after the informer holds pods
+    /// is told about them: the held pods are replayed to it as adds
+    /// (`shared_informer.go:702`: "for _, item := range s.indexer.List()
+    /// { listener.add(addNotification{...}) }").
+    pub(crate) async fn add_event_handler<T: PodEventTarget + Send + Sync + 'static>(
+        &self,
+        target: Arc<T>,
+        queue: WorkQueue,
+    ) {
+        let handler: Arc<dyn PodObservationHandler> = Arc::new(RegisteredTarget { target, queue });
+        for observation in self.cache.held_as_adds() {
+            handler.handle(&observation).await;
+        }
+        self.handlers.lock().unwrap().push(handler);
+    }
+
+    /// `sharedProcessor.distribute` (shared_informer.go:863): every listener
+    /// gets the notification.
+    async fn distribute(&self, observation: &PodObservation) {
+        let handlers: Vec<_> = self.handlers.lock().unwrap().clone();
+        for handler in handlers {
+            handler.handle(observation).await;
+        }
+    }
+
+    /// One pod watch event: classified once, delivered to every handler.
+    pub(crate) async fn on_event(&self, event: &WatchEvent) {
+        if let Some(observation) = self.cache.on_event(event) {
+            self.distribute(&observation).await;
+        }
+    }
+
+    /// The reflector's list (`DeltaFIFO.Replace`) delivered to every handler.
+    pub(crate) async fn relist(&self) {
+        match self.storage.list::<Pod>(&build_prefix("pods", None)).await {
+            Ok(pods) => {
+                for observation in self.cache.replace(&pods) {
+                    self.distribute(&observation).await;
+                }
+            }
+            Err(e) => error!("Failed to list pods for the informer re-list: {}", e),
+        }
+    }
+
+    /// Start the one informer task; later calls are no-ops, so every
+    /// controller sharing the informer can call this from its `run()`.
+    pub(crate) fn start(self: &Arc<Self>) {
+        if self.started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let informer = Arc::clone(self);
+        tokio::spawn(async move { informer.run().await });
+    }
+
+    async fn run(&self) {
+        loop {
+            let mut watch = match self.storage.watch(&build_prefix("pods", None)).await {
+                Ok(w) => w,
+                Err(e) => {
+                    error!(
+                        "Failed to establish pod watch: {}, retrying in {:?}",
+                        e, self.interval
+                    );
+                    tokio::time::sleep(self.interval).await;
+                    continue;
+                }
+            };
+            // The reflector's list: with the watch established first, nothing
+            // that happens from here on is missed, and the pods created or
+            // deleted while the previous watch was down are observed now.
+            self.relist().await;
+            loop {
+                match watch.next().await {
+                    Some(Ok(event)) => self.on_event(&event).await,
+                    Some(Err(e)) => {
+                        warn!("Pod watch error: {}, reconnecting", e);
+                        break;
+                    }
+                    None => {
+                        warn!("Pod watch stream ended, reconnecting");
+                        break;
+                    }
                 }
             }
         }
@@ -822,5 +1010,128 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// A target that records what the informer's handlers lowered.
+    struct Recording {
+        prefix: &'static str,
+        log: Mutex<Vec<String>>,
+    }
+
+    impl Recording {
+        fn new(prefix: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                prefix,
+                log: Mutex::new(Vec::new()),
+            })
+        }
+        fn log(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    impl PodEventTarget for Recording {
+        fn queue_prefix(&self) -> &'static str {
+            self.prefix
+        }
+        async fn resolve_controller_ref(
+            &self,
+            _: &str,
+            controller_ref: &ControllerRef,
+        ) -> Option<ResolvedController> {
+            Some(ResolvedController {
+                name: controller_ref.name.clone(),
+                min_ready_seconds: 0,
+            })
+        }
+        async fn pod_controllers(&self, _: &str, _: &HashMap<String, String>) -> Vec<String> {
+            Vec::new()
+        }
+        fn creation_observed(&self, key: &str) {
+            self.log.lock().unwrap().push(format!("created {key}"));
+        }
+        fn deletion_observed(&self, key: &str, pod_key: &str) {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("deleted {key} {pod_key}"));
+        }
+    }
+
+    /// `processDeltas` classifies once and `sharedProcessor.distribute` tells
+    /// every listener (controller.go:581-607, shared_informer.go:863): two
+    /// targets on one informer both see ONE add (so both lower their
+    /// expectations), the next event as an update for both, and a pod that
+    /// vanished across a re-list as a delete for both.
+    #[tokio::test]
+    async fn every_target_sees_the_same_add_update_and_relist_delete() {
+        use rusternetes_storage::memory::MemoryStorage;
+        let storage = Arc::new(MemoryStorage::new());
+        let informer = Arc::new(SharedPodInformer::new(
+            storage.clone(),
+            Duration::from_millis(10),
+        ));
+        let rs = Recording::new("replicasets");
+        let rc = Recording::new("replicationcontrollers");
+        let (rs_queue, rc_queue) = (WorkQueue::new(), WorkQueue::new());
+        informer
+            .add_event_handler(rs.clone(), rs_queue.clone())
+            .await;
+        informer
+            .add_event_handler(rc.clone(), rc_queue.clone())
+            .await;
+
+        informer
+            .on_event(&WatchEvent::Added(
+                key("p"),
+                pod_json_with("p", Some(("c", true)), &[], false, Some("1")),
+            ))
+            .await;
+        informer
+            .on_event(&WatchEvent::Modified(
+                key("p"),
+                pod_json_with("p", Some(("c", true)), &[], false, Some("2")),
+            ))
+            .await;
+        for t in [&rs, &rc] {
+            assert_eq!(
+                t.log(),
+                vec!["created default/c"],
+                "one add, then an update"
+            );
+        }
+        assert_eq!(rs_queue.len().await, 1);
+        assert_eq!(rc_queue.len().await, 1);
+
+        // The pod is gone from storage; the re-list finds it vanished.
+        informer.relist().await;
+        for t in [&rs, &rc] {
+            assert_eq!(
+                t.log(),
+                vec!["created default/c", "deleted default/c default/p"]
+            );
+        }
+    }
+
+    /// A handler added after the informer holds pods is replayed them as adds
+    /// (`AddEventHandlerWithOptions`), so it does not miss a creation.
+    #[tokio::test]
+    async fn a_late_handler_is_replayed_the_held_pods() {
+        use rusternetes_storage::memory::MemoryStorage;
+        let informer = Arc::new(SharedPodInformer::new(
+            Arc::new(MemoryStorage::new()),
+            Duration::from_millis(10),
+        ));
+        informer
+            .on_event(&WatchEvent::Added(
+                key("p"),
+                pod_json_with("p", Some(("c", true)), &[], false, Some("1")),
+            ))
+            .await;
+        let late = Recording::new("replicasets");
+        informer
+            .add_event_handler(late.clone(), WorkQueue::new())
+            .await;
+        assert_eq!(late.log(), vec!["created default/c"]);
     }
 }
