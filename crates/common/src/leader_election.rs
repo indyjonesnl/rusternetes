@@ -44,6 +44,26 @@ impl Default for LeaderElectionConfig {
     }
 }
 
+/// Shutdown flag whose `trigger()` also wakes sleepers.
+#[derive(Default)]
+pub(crate) struct ShutdownFlag {
+    set: RwLock<bool>,
+    notify: tokio::sync::Notify,
+}
+
+impl ShutdownFlag {
+    pub(crate) async fn trigger(&self) {
+        todo!()
+    }
+    pub(crate) async fn is_set(&self) -> bool {
+        *self.set.read().await
+    }
+    pub(crate) async fn sleep_or_shutdown(&self, d: Duration) {
+        let _ = d;
+        todo!()
+    }
+}
+
 /// LeaderElector manages leader election using etcd
 pub struct LeaderElector {
     client: Arc<Mutex<Client>>,
@@ -350,6 +370,23 @@ impl LeaderElector {
     }
 }
 
+/// `ReleaseOnCancel` (client-go `leaderelection.go:304`): once `ctx` is
+/// cancelled, run `shutdown` (which makes the elector release the lock) and wait
+/// up to `release_timeout` for the election task `run` to finish, as
+/// `Run(ctx)` does not return before `release()` has run.
+pub async fn release_on_cancel<F, Fut, T>(
+    ctx: &crate::signal::ShutdownContext,
+    shutdown: F,
+    run: tokio::task::JoinHandle<T>,
+    release_timeout: Duration,
+) where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let _ = (ctx, shutdown, run, release_timeout);
+    todo!()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,5 +513,89 @@ mod tests {
         elector2.shutdown().await;
 
         let _ = tokio::join!(handle1, handle2);
+    }
+
+    /// client-go `TestReleaseOnCancellation_Leases`: cancelling the context
+    /// must make the lock be released before the election task returns.
+    #[tokio::test]
+    async fn release_on_cancel_runs_release_after_cancel_and_waits_for_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let ctx = crate::signal::ShutdownContext::new();
+        let released = Arc::new(AtomicBool::new(false));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        // Fake election task: like `run()`, it only releases once told to.
+        let run = {
+            let released = released.clone();
+            let notify = notify.clone();
+            tokio::spawn(async move {
+                notify.notified().await;
+                sleep(Duration::from_millis(50)).await;
+                released.store(true, Ordering::SeqCst);
+            })
+        };
+        let waiter = {
+            let ctx = ctx.clone();
+            let notify = notify.clone();
+            tokio::spawn(async move {
+                release_on_cancel(
+                    &ctx,
+                    || async move { notify.notify_one() },
+                    run,
+                    Duration::from_secs(2),
+                )
+                .await
+            })
+        };
+        sleep(Duration::from_millis(50)).await;
+        assert!(!released.load(Ordering::SeqCst), "no release before cancel");
+        ctx.cancel();
+        tokio::time::timeout(Duration::from_secs(3), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            released.load(Ordering::SeqCst),
+            "release must complete before release_on_cancel returns"
+        );
+    }
+
+    /// A stuck release is bounded (upstream bounds release() by RenewDeadline).
+    #[tokio::test]
+    async fn release_on_cancel_is_bounded_by_timeout() {
+        let ctx = crate::signal::ShutdownContext::new();
+        ctx.cancel();
+        let run = tokio::spawn(std::future::pending::<()>());
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            release_on_cancel(&ctx, || async {}, run, Duration::from_millis(100)),
+        )
+        .await
+        .expect("must give up after the release timeout");
+    }
+
+    /// `shutdown()` must wake a sleeping `run()` loop promptly instead of
+    /// waiting out the retry/renew interval (so release happens inside the
+    /// SIGTERM grace period).
+    #[tokio::test]
+    async fn shutdown_flag_wakes_sleepers() {
+        let flag = Arc::new(ShutdownFlag::default());
+        let f = flag.clone();
+        let sleeper = tokio::spawn(async move {
+            f.sleep_or_shutdown(Duration::from_secs(60)).await;
+        });
+        sleep(Duration::from_millis(50)).await;
+        flag.trigger().await;
+        tokio::time::timeout(Duration::from_secs(2), sleeper)
+            .await
+            .expect("sleeper must wake on shutdown")
+            .unwrap();
+        assert!(flag.is_set().await);
+        // A late sleeper returns immediately too.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            flag.sleep_or_shutdown(Duration::from_secs(60)),
+        )
+        .await
+        .unwrap();
     }
 }
