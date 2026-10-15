@@ -5,6 +5,7 @@ pub mod cert_authority;
 pub mod certificate_signing_request;
 pub mod cidrset_metrics;
 pub mod clusterrole_aggregation;
+pub(crate) mod controller_utils;
 pub mod cronjob;
 pub mod csi_attacher;
 pub mod csi_capacity;
@@ -42,11 +43,14 @@ pub mod node_lifecycle_metrics;
 pub mod node_lifecycle_queue;
 pub mod node_lifecycle_zone;
 pub mod pod_disruption_budget;
+pub(crate) mod pod_informer;
 pub mod priorityclass;
 pub mod pv_binder;
 pub mod pv_protection;
 pub mod pv_recycler;
 pub mod pvc_protection;
+#[cfg(test)]
+pub mod quota_admission_double;
 pub mod replicaset;
 pub mod replicationcontroller;
 pub mod resource_quota;
@@ -97,49 +101,6 @@ pub async fn propagate_sa_image_pull_secrets<S: rusternetes_storage::Storage>(
             sa.image_pull_secrets.as_deref(),
         );
     }
-}
-
-/// Check ResourceQuota before creating a pod in a namespace.
-/// Returns Ok(()) if quota allows, Err with quota exceeded message otherwise.
-pub async fn check_resource_quota<S: rusternetes_storage::Storage>(
-    storage: &S,
-    namespace: &str,
-) -> anyhow::Result<()> {
-    let quota_prefix = format!("/registry/resourcequotas/{}/", namespace);
-    let quotas: Vec<serde_json::Value> = storage.list(&quota_prefix).await.unwrap_or_default();
-    for quota in &quotas {
-        if let Some(hard) = quota.pointer("/spec/hard") {
-            for limit_key in ["pods", "count/pods"] {
-                if let Some(limit_str) = hard.get(limit_key).and_then(|v| v.as_str()) {
-                    let limit: i64 = limit_str.parse().unwrap_or(i64::MAX);
-                    let pod_prefix = format!("/registry/pods/{}/", namespace);
-                    let current: Vec<serde_json::Value> =
-                        storage.list(&pod_prefix).await.unwrap_or_default();
-                    // Only count active pods (not Failed/Succeeded/terminating)
-                    let active_count = current
-                        .iter()
-                        .filter(|p| {
-                            let phase = p
-                                .pointer("/status/phase")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            let terminating = p.pointer("/metadata/deletionTimestamp").is_some();
-                            !terminating && phase != "Failed" && phase != "Succeeded"
-                        })
-                        .count();
-                    if active_count as i64 >= limit {
-                        return Err(anyhow::anyhow!(
-                            "exceeded quota: {}, requested: 1, used: {}, limited: {}",
-                            limit_key,
-                            active_count,
-                            limit_str
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Every controller's Prometheus series in text exposition format: the

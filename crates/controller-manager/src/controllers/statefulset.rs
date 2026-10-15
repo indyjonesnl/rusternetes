@@ -1607,9 +1607,6 @@ impl<S: Storage + 'static> StatefulSetController<S> {
             }),
         };
 
-        // Check ResourceQuota before creating pod
-        super::check_resource_quota(&*self.storage, namespace).await?;
-
         let key = format!("/registry/pods/{}/{}", namespace, pod_name);
         match self.storage.create(&key, &pod).await {
             Ok(_) => Ok(()),
@@ -1720,8 +1717,6 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                 ..Default::default()
             }),
         };
-
-        super::check_resource_quota(&*self.storage, namespace).await?;
 
         let key = format!("/registry/pods/{}/{}", namespace, pod_name);
         match self.storage.create(&key, &pod).await {

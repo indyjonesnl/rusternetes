@@ -224,6 +224,10 @@ async fn test_replicaset_self_healing() {
     let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
     assert_eq!(pods.len(), 3, "Should create 3 pods");
 
+    // The pod informer observes the creates (replica_set.go:436); only then
+    // are the expectations satisfied and a later sync may act (:743).
+    controller.reconcile_all().await.unwrap();
+
     // Delete one pod to simulate failure
     let pod_to_delete = &pods[0];
     let pod_key = build_key("pods", Some("default"), &pod_to_delete.metadata.name);
@@ -635,6 +639,8 @@ async fn test_replicaset_skips_deleting_pods() {
     storage.create(&key, &rs).await.unwrap();
 
     // Create pods
+    controller.reconcile_all().await.unwrap();
+    // Informer observes the creates (replica_set.go:436) before the next sync.
     controller.reconcile_all().await.unwrap();
 
     // Mark one pod as being deleted

@@ -8,6 +8,7 @@ use rusternetes_common::resources::{Pod, PodStatus};
 use rusternetes_common::types::{OwnerReference, Phase};
 use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 
+use super::controller_utils::{is_pod_ready, sort_active_pods};
 use super::expectations::ControllerExpectations;
 use super::job_tracking::{
     clean_uncounted_pods_without_finalizers, has_job_tracking_finalizer, push_uncounted_failed,
@@ -2778,29 +2779,11 @@ impl<S: Storage + 'static> JobController<S> {
             }),
         };
 
-        // Check ResourceQuota before creating pod
-        super::check_resource_quota(&*self.storage, namespace).await?;
-
         let key = format!("/registry/pods/{}/{}", namespace, pod_name);
         self.storage.create(&key, &pod).await?;
 
         Ok(pod_name)
     }
-}
-
-/// `podutil.IsPodReady`: the Ready condition is True.
-fn is_pod_ready(pod: &Pod) -> bool {
-    pod_ready_condition(pod).is_some()
-}
-
-fn pod_ready_condition(pod: &Pod) -> Option<&rusternetes_common::resources::pod::PodCondition> {
-    pod.status
-        .as_ref()
-        .and_then(|s| s.conditions.as_ref())
-        .and_then(|cs| {
-            cs.iter()
-                .find(|c| c.condition_type == "Ready" && c.status == "True")
-        })
 }
 
 /// `controller.CountTerminatingPods` (`controller_utils.go:1021`): not yet
@@ -2815,112 +2798,6 @@ fn count_terminating_pods<'a>(pods: impl IntoIterator<Item = &'a Pod>) -> i32 {
                 )
         })
         .count() as i32
-}
-
-/// `(regularRestarts, sidecarRestarts)` — `maxContainerRestarts`
-/// (`controller_utils.go:948`).
-fn max_container_restarts(pod: &Pod) -> (u32, u32) {
-    let regular = pod
-        .status
-        .as_ref()
-        .and_then(|s| s.container_statuses.as_ref())
-        .map_or(0, |cs| {
-            cs.iter().map(|c| c.restart_count).max().unwrap_or(0)
-        });
-    let sidecars: HashSet<&str> = pod
-        .spec
-        .as_ref()
-        .and_then(|s| s.init_containers.as_ref())
-        .map(|ics| {
-            ics.iter()
-                .filter(|c| c.restart_policy.as_deref() == Some("Always"))
-                .map(|c| c.name.as_str())
-                .collect()
-        })
-        .unwrap_or_default();
-    let sidecar = pod
-        .status
-        .as_ref()
-        .and_then(|s| s.init_container_statuses.as_ref())
-        .map_or(0, |cs| {
-            cs.iter()
-                .filter(|c| sidecars.contains(c.name.as_str()))
-                .map(|c| c.restart_count)
-                .max()
-                .unwrap_or(0)
-        });
-    (regular, sidecar)
-}
-
-/// `afterOrZero` (`controller_utils.go:913`).
-fn after_or_zero(
-    t1: Option<chrono::DateTime<chrono::Utc>>,
-    t2: Option<chrono::DateTime<chrono::Utc>>,
-) -> bool {
-    match (t1, t2) {
-        (Some(a), Some(b)) => a > b,
-        (a, _) => a.is_none(),
-    }
-}
-
-/// `controller.ActivePods.Less` (`controller_utils.go:741-776`): true when
-/// `a` should be deleted before `b`.
-fn active_pods_less(a: &Pod, b: &Pod) -> bool {
-    // 1. Unassigned < assigned.
-    let node = |p: &Pod| {
-        p.spec
-            .as_ref()
-            .and_then(|s| s.node_name.clone())
-            .unwrap_or_default()
-    };
-    let (na, nb) = (node(a), node(b));
-    if na != nb && (na.is_empty() || nb.is_empty()) {
-        return na.is_empty();
-    }
-    // 2. PodPending < PodUnknown < PodRunning (`podPhaseToOrdinal`).
-    let ordinal = |p: &Pod| match p.status.as_ref().and_then(|s| s.phase.as_ref()) {
-        Some(Phase::Unknown) => 1,
-        Some(Phase::Running) => 2,
-        _ => 0,
-    };
-    if ordinal(a) != ordinal(b) {
-        return ordinal(a) < ordinal(b);
-    }
-    // 3. Not ready < ready.
-    if is_pod_ready(a) != is_pod_ready(b) {
-        return !is_pod_ready(a);
-    }
-    // 4. Ready for less time < ready for more time.
-    if let (Some(ca), Some(cb)) = (pod_ready_condition(a), pod_ready_condition(b)) {
-        if ca.last_transition_time != cb.last_transition_time {
-            return after_or_zero(ca.last_transition_time, cb.last_transition_time);
-        }
-    }
-    // 5. More restarts < fewer restarts (`compareMaxContainerRestarts`).
-    let (ra, rb) = (max_container_restarts(a), max_container_restarts(b));
-    if ra.0 != rb.0 {
-        return ra.0 > rb.0;
-    }
-    if ra.1 != rb.1 {
-        return ra.1 > rb.1;
-    }
-    // 6. Newer < older.
-    if a.metadata.creation_timestamp != b.metadata.creation_timestamp {
-        return after_or_zero(a.metadata.creation_timestamp, b.metadata.creation_timestamp);
-    }
-    false
-}
-
-fn sort_active_pods(pods: &mut [&Pod]) {
-    pods.sort_by(|a, b| {
-        if active_pods_less(a, b) {
-            std::cmp::Ordering::Less
-        } else if active_pods_less(b, a) {
-            std::cmp::Ordering::Greater
-        } else {
-            std::cmp::Ordering::Equal
-        }
-    });
 }
 
 /// `getCompletionIndex` (`indexed_job_utils.go:394`): the annotation only,
