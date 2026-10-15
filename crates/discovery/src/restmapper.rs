@@ -961,7 +961,7 @@ mod tests {
             gvs.iter()
                 .map(|(g, v)| {
                     let mut d = DefaultRestMapper::new(&[(g, v)]);
-                    d.add(Gvk::new(g, v, "dup"));
+                    d.add(Gvk::new(g, v, "dup"), Scope::Namespace);
                     d
                 })
                 .collect(),
@@ -1013,8 +1013,14 @@ mod tests {
             ("first-group", "first-version"),
         ];
         let mut m = DefaultRestMapper::new(&order);
-        m.add(Gvk::new("first-group", "first-version", "my-kind"));
-        m.add(Gvk::new("second-group", "first-version", "my-kind"));
+        m.add(
+            Gvk::new("first-group", "first-version", "my-kind"),
+            Scope::Namespace,
+        );
+        m.add(
+            Gvk::new("second-group", "first-version", "my-kind"),
+            Scope::Namespace,
+        );
         for name in ["my-kinds", "my-kind"] {
             // group prefix works
             let got = m.resources_for(&Gvr::new("first", "", name)).unwrap();
@@ -1076,7 +1082,7 @@ mod tests {
             ("lowercases", "lowercaseses", "lowercases"),
         ] {
             let mut m = DefaultRestMapper::new(&[("tgroup", "test")]);
-            m.add(Gvk::new("tgroup", "test", kind));
+            m.add(Gvk::new("tgroup", "test", kind), Scope::Namespace);
             assert_eq!(m.resource_singularizer(plural).as_deref(), Ok(singular));
         }
     }
@@ -1135,5 +1141,352 @@ mod tests {
             m.kind_for(&Gvr::new("example.com", "", "widget")),
             Ok(Gvk::new("example.com", "v1", "Widget"))
         );
+    }
+
+    fn gk(group: &str, kind: &str) -> Gk {
+        Gk::new(group, kind)
+    }
+
+    fn mapper_with(gvs: &[(&str, &str)], kinds: &[(&str, &str, &str)]) -> DefaultRestMapper {
+        let mut m = DefaultRestMapper::new(gvs);
+        for (g, v, k) in kinds {
+            m.add(Gvk::new(g, v, k), Scope::Namespace);
+        }
+        m
+    }
+
+    /// restmapper_test.go:499-560 `TestRESTMapperRESTMapping`.
+    #[test]
+    fn default_mapper_rest_mapping_table() {
+        let tg = "tgroup";
+        // no default versions: Unknown / InternalObject both fail
+        let mut m = DefaultRestMapper::new(&[]);
+        m.add(Gvk::new(tg, "test", "InternalObject"), Scope::Namespace);
+        assert!(m.rest_mapping(&gk(tg, "Unknown"), &[]).is_err());
+        assert!(m.rest_mapping(&gk(tg, "InternalObject"), &[]).is_err());
+
+        let m = mapper_with(&[(tg, "test")], &[(tg, "test", "InternalObject")]);
+        assert!(m.rest_mapping(&gk(tg, "Unknown"), &[]).is_err());
+        let got = m
+            .rest_mapping(&gk(tg, "InternalObject"), &["test"])
+            .unwrap();
+        assert_eq!(got.resource, Gvr::new(tg, "test", "internalobjects"));
+        assert_eq!(got.kind, Gvk::new(tg, "test", "InternalObject"));
+        assert_eq!(got.scope, Scope::Namespace);
+        // no versions asked for: the default group-versions are searched
+        let got = m.rest_mapping(&gk(tg, "InternalObject"), &[]).unwrap();
+        assert_eq!(got.resource, Gvr::new(tg, "test", "internalobjects"));
+    }
+
+    /// restmapper_test.go:562-619 `TestRESTMapperRESTMappingSelectsVersion`.
+    #[test]
+    fn default_mapper_rest_mapping_selects_version() {
+        let g = "tgroup";
+        let mut m = DefaultRestMapper::new(&[(g, "test1"), (g, "test2")]);
+        m.add(Gvk::new(g, "test1", "InternalObject"), Scope::Namespace);
+        m.add(Gvk::new(g, "test2", "OtherObject"), Scope::Namespace);
+        let internal = gk(g, "InternalObject");
+        let other = gk(g, "OtherObject");
+
+        // pick default matching object kind based on search order
+        let got = m.rest_mapping(&other, &[]).unwrap();
+        assert_eq!(got.resource, Gvr::new(g, "test2", "otherobjects"));
+        assert_eq!(got.kind, Gvk::new(g, "test2", "OtherObject"));
+        let got = m.rest_mapping(&internal, &[]).unwrap();
+        assert_eq!(got.resource, Gvr::new(g, "test1", "internalobjects"));
+
+        // mismatch of version
+        assert!(m.rest_mapping(&internal, &["test2"]).is_err());
+        assert!(m.rest_mapping(&other, &["test1"]).is_err());
+        // not in the search versions
+        assert!(m.rest_mapping(&other, &["test3"]).is_err());
+        // explicit search order
+        assert!(m.rest_mapping(&other, &["test3", "test1"]).is_err());
+        let got = m.rest_mapping(&other, &["test3", "test2"]).unwrap();
+        assert_eq!(got.resource, Gvr::new(g, "test2", "otherobjects"));
+        assert_eq!(got.kind, Gvk::new(g, "test2", "OtherObject"));
+    }
+
+    /// restmapper_test.go:719-734 `TestRESTMapperReportsErrorOnBadVersion`
+    /// plus the error strings of errors.go:106-120.
+    #[test]
+    fn rest_mapping_no_match_error_names_the_searched_versions() {
+        let g = "tgroup";
+        let m = mapper_with(
+            &[(g, "test1"), (g, "test2")],
+            &[(g, "test1", "InternalObject")],
+        );
+        let err = m
+            .rest_mapping(&gk(g, "InternalObject"), &["test3"])
+            .unwrap_err();
+        assert!(err.is_no_match());
+        assert_eq!(
+            err.to_string(),
+            r#"no matches for kind "InternalObject" in version "tgroup/test3""#
+        );
+        let none = MapperError::NoKindMatch {
+            gk: gk(g, "Foo"),
+            searched_versions: vec![],
+        };
+        assert_eq!(
+            none.to_string(),
+            r#"no matches for kind "Foo" in group "tgroup""#
+        );
+        let many = MapperError::NoKindMatch {
+            gk: gk("", "Foo"),
+            searched_versions: vec!["v2".into(), "v1beta".into(), "v2".into()],
+        };
+        // `sets.String.List()` sorts and de-duplicates; `%q` of a []string.
+        assert_eq!(
+            many.to_string(),
+            r#"no matches for kind "Foo" in versions ["v1beta" "v2"]"#
+        );
+    }
+
+    /// restmapper_test.go:621-717 `TestRESTMapperRESTMappings`.
+    #[test]
+    fn default_mapper_rest_mappings_table() {
+        let tg = "tgroup";
+        assert!(DefaultRestMapper::new(&[])
+            .rest_mappings(&gk(tg, "Unknown"), &[])
+            .is_err());
+        let m = mapper_with(&[(tg, "v1")], &[]);
+        assert!(m.rest_mappings(&gk(tg, "Unknown"), &[]).is_err());
+        // ask for specific version - not available - thus error
+        assert!(m.rest_mappings(&gk(tg, "InternalObject"), &["v2"]).is_err());
+
+        // ask for specific version - available
+        let m = mapper_with(&[(tg, "v1")], &[(tg, "v2", "InternalObject")]);
+        let got = m.rest_mappings(&gk(tg, "InternalObject"), &["v2"]).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].resource, Gvr::new(tg, "v2", "internalobjects"));
+        assert_eq!(got[0].kind, Gvk::new(tg, "v2", "InternalObject"));
+
+        // ask for specific versions - only one available
+        let got = m
+            .rest_mappings(&gk(tg, "InternalObject"), &["v3", "v2"])
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].kind, Gvk::new(tg, "v2", "InternalObject"));
+
+        // do not ask for specific version - search through default versions
+        let m = mapper_with(
+            &[(tg, "v1"), (tg, "v2")],
+            &[(tg, "v1", "InternalObject"), (tg, "v2", "InternalObject")],
+        );
+        let got = m.rest_mappings(&gk(tg, "InternalObject"), &[]).unwrap();
+        assert_eq!(
+            got.iter().map(|r| r.kind.clone()).collect::<Vec<_>>(),
+            vec![
+                Gvk::new(tg, "v1", "InternalObject"),
+                Gvk::new(tg, "v2", "InternalObject")
+            ]
+        );
+        // `runtime.APIVersionInternal` is skipped, so only the default
+        // versions are searched (restmapper.go:473).
+        let got = m
+            .rest_mappings(&gk(tg, "InternalObject"), &["__internal"])
+            .unwrap();
+        assert_eq!(got.len(), 2);
+    }
+
+    /// multirestmapper_test.go:259-345 `TestMultiRESTMapperRESTMappings`
+    /// (the cases a `DefaultRestMapper` can produce: upstream's
+    /// `fixedRESTMapper{err: ...}` cases have no counterpart here).
+    #[test]
+    fn multi_mapper_rest_mappings() {
+        let foo = gk("", "Foo");
+        // "empty with no versions" / "one version" / "multi(two) versions"
+        for versions in [vec![], vec!["v1beta"], vec!["v1beta", "v2"]] {
+            let err = MultiRestMapper::default()
+                .rest_mappings(&foo, &versions)
+                .unwrap_err();
+            assert_eq!(
+                err,
+                MapperError::NoKindMatch {
+                    gk: foo.clone(),
+                    searched_versions: versions.iter().map(|v| v.to_string()).collect(),
+                }
+            );
+        }
+        // "ignore not found": the delegate's no-match is dropped and replaced
+        // by the multi mapper's own error carrying the asked-for versions.
+        let multi = MultiRestMapper(vec![mapper_with(&[("", "v1")], &[("", "v1", "Bar")])]);
+        let err = multi.rest_mappings(&foo, &["v1beta"]).unwrap_err();
+        assert_eq!(
+            err,
+            MapperError::NoKindMatch {
+                gk: foo.clone(),
+                searched_versions: vec!["v1beta".into()],
+            }
+        );
+        // "return both"
+        let multi = MultiRestMapper(vec![
+            mapper_with(&[("", "v1")], &[("", "v1", "Foo")]),
+            mapper_with(&[("", "v2")], &[("", "v2", "Foo")]),
+        ]);
+        let got = multi.rest_mappings(&foo, &[]).unwrap();
+        assert_eq!(
+            got.iter().map(|m| m.kind.clone()).collect::<Vec<_>>(),
+            vec![Gvk::new("", "v1", "Foo"), Gvk::new("", "v2", "Foo")]
+        );
+    }
+
+    /// multirestmapper.go:154-187: one mapping wins, several are ambiguous.
+    #[test]
+    fn multi_mapper_rest_mapping_single_or_ambiguous() {
+        let foo = gk("", "Foo");
+        let one = MultiRestMapper(vec![
+            mapper_with(&[("", "v1")], &[("", "v1", "Foo")]),
+            mapper_with(&[("", "v2")], &[("", "v2", "Bar")]),
+        ]);
+        assert_eq!(
+            one.rest_mapping(&foo, &[]).unwrap().kind,
+            Gvk::new("", "v1", "Foo")
+        );
+        let two = MultiRestMapper(vec![
+            mapper_with(&[("", "v1")], &[("", "v1", "Foo")]),
+            mapper_with(&[("", "v2")], &[("", "v2", "Foo")]),
+        ]);
+        let err = two.rest_mapping(&foo, &[]).unwrap_err();
+        assert_eq!(
+            err,
+            MapperError::AmbiguousKind {
+                partial: Gvk::new("", "", "Foo"),
+                resources: vec![],
+                kinds: vec![Gvk::new("", "v1", "Foo"), Gvk::new("", "v2", "Foo")],
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "/, Kind=Foo matches multiple kinds [/v1, Kind=Foo /v2, Kind=Foo]"
+        );
+        let none = MultiRestMapper::default()
+            .rest_mapping(&foo, &[])
+            .unwrap_err();
+        assert!(none.is_no_match());
+    }
+
+    fn priority_fixture(kind_priority: Vec<Gvk>) -> PriorityRestMapper {
+        // priority_test.go:266-286 `mapping1..3` behind three mappers.
+        PriorityRestMapper {
+            delegate: MultiRestMapper(vec![
+                mapper_with(&[("", "v1alpha1")], &[("", "v1alpha1", "Foo")]),
+                mapper_with(&[("", "v1")], &[("", "v1", "Foo")]),
+                mapper_with(&[("other", "v1")], &[("other", "v1", "Foo")]),
+            ]),
+            resource_priority: vec![],
+            kind_priority,
+        }
+    }
+
+    /// priority_test.go:266-372 `TestPriorityRESTMapperRESTMapping`
+    /// (without the `fixedRESTMapper` error / "result + error" cases).
+    #[test]
+    fn priority_mapper_rest_mapping() {
+        let foo = gk("", "Foo");
+        // "empty"
+        let err = PriorityRestMapper::default()
+            .rest_mapping(&foo, &[])
+            .unwrap_err();
+        assert_eq!(
+            err,
+            MapperError::NoKindMatch {
+                gk: foo.clone(),
+                searched_versions: vec![]
+            }
+        );
+        // "return error for ambiguous"
+        let err = priority_fixture(vec![])
+            .rest_mapping(&foo, &[])
+            .unwrap_err();
+        assert_eq!(
+            err,
+            MapperError::AmbiguousKind {
+                partial: Gvk::new("", "", "Foo"),
+                resources: vec![],
+                kinds: vec![
+                    Gvk::new("", "v1alpha1", "Foo"),
+                    Gvk::new("", "v1", "Foo"),
+                    Gvk::new("other", "v1", "Foo"),
+                ],
+            }
+        );
+        // "accept only item"
+        let only = PriorityRestMapper {
+            delegate: MultiRestMapper(vec![mapper_with(&[("", "v1")], &[("", "v1", "Foo")])]),
+            ..Default::default()
+        };
+        assert_eq!(
+            only.rest_mapping(&foo, &[]).unwrap().kind,
+            Gvk::new("", "v1", "Foo")
+        );
+        // "return single priority"
+        let got = priority_fixture(vec![Gvk::new("", "v1", ANY), Gvk::new("", "v1alpha1", ANY)])
+            .rest_mapping(&foo, &[])
+            .unwrap();
+        assert_eq!(got.kind, Gvk::new("", "v1", "Foo"));
+        // "return out of group match"
+        let got = priority_fixture(vec![Gvk::new(ANY, "v1", ANY), Gvk::new("other", ANY, ANY)])
+            .rest_mapping(&foo, &[])
+            .unwrap();
+        assert_eq!(got.kind, Gvk::new("other", "v1", "Foo"));
+        // RESTMappings is the delegate's.
+        assert_eq!(
+            priority_fixture(vec![])
+                .rest_mappings(&foo, &[])
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    /// priority_test.go:374-407 `TestPriorityRESTMapperRESTMappingHonorsUserVersion`.
+    #[test]
+    fn priority_mapper_rest_mapping_honors_user_version() {
+        let mapper = PriorityRestMapper {
+            delegate: MultiRestMapper(vec![
+                mapper_with(&[("Bar", "v2alpha1")], &[("Bar", "v2alpha1", "Foo")]),
+                mapper_with(&[("Bar", "v1")], &[("Bar", "v1", "Foo")]),
+            ]),
+            resource_priority: vec![],
+            kind_priority: vec![Gvk::new("Bar", "v2alpha1", ANY), Gvk::new("Bar", ANY, ANY)],
+        };
+        let foo = gk("Bar", "Foo");
+        assert_eq!(
+            mapper.rest_mapping(&foo, &["v1"]).unwrap().kind,
+            Gvk::new("Bar", "v1", "Foo")
+        );
+        assert_eq!(
+            mapper.rest_mapping(&foo, &["v2alpha1"]).unwrap().kind,
+            Gvk::new("Bar", "v2alpha1", "Foo")
+        );
+        // Without a user version the priority list picks v2alpha1.
+        assert_eq!(
+            mapper.rest_mapping(&foo, &[]).unwrap().kind,
+            Gvk::new("Bar", "v2alpha1", "Foo")
+        );
+    }
+
+    /// discovery.go:96-121: namespaced vs cluster scope, and `List` is Root.
+    #[test]
+    fn discovery_mapper_rest_mapping_carries_scope() {
+        let m = new_discovery_rest_mapper(&served_group_resources(&[]));
+        let pod = m.rest_mapping(&gk("", "Pod"), &[]).unwrap();
+        assert_eq!(pod.resource, Gvr::new("", "v1", "pods"));
+        assert_eq!(pod.scope, Scope::Namespace);
+        let node = m.rest_mapping(&gk("", "Node"), &[]).unwrap();
+        assert_eq!(node.scope, Scope::Root);
+        let list = m.rest_mapping(&gk("", "List"), &[]).unwrap();
+        assert_eq!(list.scope, Scope::Root);
+        // autoscaling prefers v2 over v1; asking for v1 honours the user.
+        let hpa = m
+            .rest_mapping(&gk("autoscaling", "HorizontalPodAutoscaler"), &[])
+            .unwrap();
+        assert_eq!(hpa.kind.version, "v2");
+        let hpa = m
+            .rest_mapping(&gk("autoscaling", "HorizontalPodAutoscaler"), &["v1"])
+            .unwrap();
+        assert_eq!(hpa.kind.version, "v1");
     }
 }
