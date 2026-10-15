@@ -68,7 +68,9 @@ async fn exhausting_the_budget_fails_the_request_with_fail_policy() {
         None,
         "test",
     );
-    let r = m.matches(&a, &v, None, &AlwaysAllowAuthorizer).await;
+    let r = m
+        .matches(&a, &v, None, Arc::new(AlwaysAllowAuthorizer))
+        .await;
     assert!(!r.matches, "{r:?}");
     assert_eq!(
         r.error.as_deref(),
@@ -88,7 +90,9 @@ async fn exhausting_the_budget_skips_the_policy_with_ignore() {
         Some(&FailurePolicy::Ignore),
         "test",
     );
-    let r = m.matches(&a, &v, None, &AlwaysAllowAuthorizer).await;
+    let r = m
+        .matches(&a, &v, None, Arc::new(AlwaysAllowAuthorizer))
+        .await;
     assert!(!r.matches && r.error.is_none(), "{r:?}");
 }
 
@@ -98,7 +102,9 @@ async fn exhausting_the_budget_skips_the_policy_with_ignore() {
 async fn per_call_limit_is_an_evaluation_error_within_the_budget() {
     let (a, v) = attrs(heavy_object());
     let m = new_matcher(&[cond("a", HEAVY), cond("b", HEAVY)], &[], None, "test");
-    let r = m.matches(&a, &v, None, &AlwaysAllowAuthorizer).await;
+    let r = m
+        .matches(&a, &v, None, Arc::new(AlwaysAllowAuthorizer))
+        .await;
     let err = r
         .error
         .expect("evaluation errors resort to the fail policy");
@@ -124,7 +130,9 @@ async fn variable_cost_is_charged_once() {
         None,
         "test",
     );
-    let r = m.matches(&a, &v, None, &AlwaysAllowAuthorizer).await;
+    let r = m
+        .matches(&a, &v, None, Arc::new(AlwaysAllowAuthorizer))
+        .await;
     let err = r.error.expect("the variable fails to evaluate");
     assert!(!err.contains("running out of cost budget"), "{err}");
 }
@@ -139,6 +147,8 @@ async fn cheap_conditions_stay_within_the_budget() {
         None,
         "test",
     );
-    let r = m.matches(&a, &v, None, &AlwaysAllowAuthorizer).await;
+    let r = m
+        .matches(&a, &v, None, Arc::new(AlwaysAllowAuthorizer))
+        .await;
     assert!(r.matches && r.error.is_none(), "{r:?}");
 }
