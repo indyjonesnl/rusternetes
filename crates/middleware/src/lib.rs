@@ -558,13 +558,14 @@ pub async fn validate_service_account_token(
     storage: &StorageBackend,
     token: &str,
     claims: &rusternetes_common::auth::ServiceAccountClaims,
+    legacy_lookup: bool,
     obs: &mut AuthObservations,
 ) -> std::result::Result<(), String> {
     if claims.aud.is_empty() {
         obs.observe_legacy_token(&claims.sub);
     }
     if claims.iss == rusternetes_common::auth::LEGACY_ISSUER {
-        validate_legacy_service_account_token(storage, token, claims, obs).await
+        validate_legacy_service_account_token(storage, token, claims, legacy_lookup, obs).await
     } else {
         validate_service_account_claims(storage, claims).await
     }
@@ -578,7 +579,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Port of `legacyValidator.Validate` with `lookup=true`
+/// Port of `legacyValidator.Validate` (`lookup` = `--service-account-lookup`)
 /// (`pkg/serviceaccount/legacy.go:73-170`): the claims must be present and
 /// consistent, the Secret the token was minted for must still exist, not be
 /// deleted and still hold this exact token, the ServiceAccount must still exist
@@ -595,6 +596,7 @@ async fn validate_legacy_service_account_token(
     storage: &StorageBackend,
     token: &str,
     claims: &rusternetes_common::auth::ServiceAccountClaims,
+    lookup: bool,
     obs: &mut AuthObservations,
 ) -> std::result::Result<(), String> {
     use rusternetes_common::auth::{
@@ -634,6 +636,12 @@ async fn validate_legacy_service_account_token(
     let (sub_ns, sub_name) = (sub.next().unwrap_or(""), sub.next().unwrap_or(""));
     if sub_ns.is_empty() || sub_name.is_empty() || sub_ns != namespace || sub_name != sa_name {
         return Err("sub claim is invalid".to_string());
+    }
+
+    // `if v.lookup { ... }` (legacy.go:114): with `--service-account-lookup=false`
+    // the Secret, ServiceAccount and tracking checks are all skipped.
+    if !lookup {
+        return Ok(());
     }
 
     // Make sure token hasn't been invalidated by deletion of the secret
@@ -939,8 +947,14 @@ pub async fn auth_middleware(
             // Upstream parity: a JWT that decodes is not sufficient; the
             // ServiceAccount and every bound object must still exist
             // (`validator.Validate`, claims.go:144-263).
-            if let Err(reason) =
-                validate_service_account_token(&storage, token, &claims, &mut observations).await
+            if let Err(reason) = validate_service_account_token(
+                &storage,
+                token,
+                &claims,
+                token_manager.service_account_lookup(),
+                &mut observations,
+            )
+            .await
             {
                 warn!("Rejecting service account token: {}", reason);
                 return Err((StatusCode::UNAUTHORIZED, "Invalid token").into_response());

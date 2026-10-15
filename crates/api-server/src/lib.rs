@@ -228,7 +228,7 @@ pub struct ApiServerConfig {
 /// `api-server` and all-in-one binaries (#1575, #2713). Help text and flag
 /// names follow `ServiceAccountAuthenticationOptions.AddFlags`
 /// (pkg/kubeapiserver/options/authentication.go:431-470).
-#[derive(clap::Args, Debug, Clone, Default)]
+#[derive(clap::Args, Debug, Clone)]
 pub struct ServiceAccountArgs {
     /// File containing PEM-encoded x509 RSA or ECDSA private or public keys,
     /// used to verify ServiceAccount tokens. The specified file can contain
@@ -280,6 +280,17 @@ pub struct ServiceAccountArgs {
     /// (pkg/kubeapiserver/options/authentication.go:454-458).
     #[arg(long = "service-account-jwks-uri")]
     pub service_account_jwks_uri: Option<String>,
+    /// If true, validate ServiceAccount tokens exist in etcd as part of
+    /// authentication (authentication.go:439-440; default true).
+    #[arg(
+        long = "service-account-lookup",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true
+    )]
+    pub service_account_lookup: bool,
 }
 
 fn parse_go_duration_arg(s: &str) -> std::result::Result<std::time::Duration, String> {
@@ -291,6 +302,21 @@ fn parse_go_duration_arg(s: &str) -> std::result::Result<std::time::Duration, St
         .map_err(|_| format!("negative duration {s:?} is not allowed"))
 }
 
+impl Default for ServiceAccountArgs {
+    fn default() -> Self {
+        Self {
+            service_account_key_file: Vec::new(),
+            service_account_signing_key_file: None,
+            service_account_issuer: Vec::new(),
+            api_audiences: Vec::new(),
+            service_account_max_token_expiration: None,
+            service_account_jwks_uri: None,
+            // WithServiceAccounts: Lookup = true (authentication.go:226)
+            service_account_lookup: true,
+        }
+    }
+}
+
 impl ServiceAccountArgs {
     pub fn to_options(&self) -> rusternetes_common::auth::ServiceAccountOptions {
         rusternetes_common::auth::ServiceAccountOptions {
@@ -300,6 +326,7 @@ impl ServiceAccountArgs {
             api_audiences: self.api_audiences.clone(),
             max_expiration: self.service_account_max_token_expiration,
             jwks_uri: self.service_account_jwks_uri.clone(),
+            lookup: self.service_account_lookup,
         }
     }
 }
@@ -573,6 +600,18 @@ mod service_account_args_tests {
             o.max_expiration,
             Some(std::time::Duration::from_secs(86400))
         );
+    }
+
+    /// `--service-account-lookup` defaults to true (authentication.go:226) and
+    /// takes `=false` (a pflag bool).
+    #[test]
+    fn lookup_flag_defaults_true() {
+        assert!(Wrap::try_parse_from(["x"]).unwrap().sa.to_options().lookup);
+        assert!(ServiceAccountArgs::default().to_options().lookup);
+        let w = Wrap::try_parse_from(["x", "--service-account-lookup=false"]).unwrap();
+        assert!(!w.sa.to_options().lookup);
+        let w = Wrap::try_parse_from(["x", "--service-account-lookup"]).unwrap();
+        assert!(w.sa.to_options().lookup);
     }
 
     #[test]
