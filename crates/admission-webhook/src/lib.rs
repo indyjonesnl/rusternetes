@@ -5,6 +5,7 @@
 
 pub mod admission_metrics;
 pub mod cel_evaluators;
+pub mod webhook_match;
 
 #[cfg(test)]
 mod match_conditions_budget_tests;
@@ -1103,12 +1104,17 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                                 old_object.as_ref(),
                                 Some(user_info),
                             );
-                            let mut evaluator =
-                                crate::cel_evaluators::MatchConditionEvaluator::new();
-                            let outcome = evaluator.evaluate(conditions, &request, None);
-                            match outcome {
-                                crate::cel_evaluators::MatchOutcome::Matched => {}
-                                crate::cel_evaluators::MatchOutcome::NotMatched => {
+                            // webhook/generic/webhook.go:224-240 `ShouldCallHook` over
+                            // matchconditions/matcher.go `Match`.
+                            match crate::webhook_match::match_webhook_conditions(
+                                &webhook.name,
+                                crate::admission_metrics::STEP_VALIDATE,
+                                conditions,
+                                webhook.failure_policy.as_ref(),
+                                &request,
+                            ) {
+                                crate::webhook_match::WebhookMatch::Matches => {}
+                                crate::webhook_match::WebhookMatch::Excluded => {
                                     debug!(
                                         "Skipping validating webhook {} — matchConditions not met for {}/{}",
                                         webhook.name,
@@ -1117,26 +1123,15 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                                     );
                                     continue;
                                 }
-                                crate::cel_evaluators::MatchOutcome::Error(msg) => {
-                                    // matcher.go:86-95, :128-141: an error is
-                                    // `MatchResult{Error}` on `Fail` and a skip
-                                    // on `Ignore`; generic/webhook.go:232-234
-                                    // fails the request closed with Forbidden.
-                                    if !matches!(
-                                        webhook.failure_policy,
-                                        Some(FailurePolicy::Ignore)
-                                    ) {
-                                        warn!(
-                                            "Failed evaluating match conditions, failing closed {}: {}",
-                                            webhook.name, msg
-                                        );
-                                        return Err(match_conditions_forbidden(gvr, name, &msg));
-                                    }
-                                    debug!(
-                                        "Skipping validating webhook {} — matchCondition error: {}",
+                                crate::webhook_match::WebhookMatch::Forbidden(msg) => {
+                                    warn!(
+                                        "Failed evaluating match conditions, failing closed {}: {}",
                                         webhook.name, msg
                                     );
-                                    continue;
+                                    return Err(rusternetes_common::Error::Forbidden(format!(
+                                        "{} \"{}\" is forbidden: {}",
+                                        gvr.resource, name, msg
+                                    )));
                                 }
                             }
                         }
@@ -1669,12 +1664,17 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                                 old_object.as_ref(),
                                 Some(user_info),
                             );
-                            let mut evaluator =
-                                crate::cel_evaluators::MatchConditionEvaluator::new();
-                            let outcome = evaluator.evaluate(conditions, &request, None);
-                            match outcome {
-                                crate::cel_evaluators::MatchOutcome::Matched => {}
-                                crate::cel_evaluators::MatchOutcome::NotMatched => {
+                            // webhook/generic/webhook.go:224-240 `ShouldCallHook` over
+                            // matchconditions/matcher.go `Match`.
+                            match crate::webhook_match::match_webhook_conditions(
+                                &webhook.name,
+                                crate::admission_metrics::STEP_ADMIT,
+                                conditions,
+                                webhook.failure_policy.as_ref(),
+                                &request,
+                            ) {
+                                crate::webhook_match::WebhookMatch::Matches => {}
+                                crate::webhook_match::WebhookMatch::Excluded => {
                                     debug!(
                                         "Skipping mutating webhook {} — matchConditions not met for {}/{}",
                                         webhook.name,
@@ -1683,25 +1683,15 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                                     );
                                     continue;
                                 }
-                                crate::cel_evaluators::MatchOutcome::Error(msg) => {
-                                    // matcher.go:86-95, :128-141 and
-                                    // generic/webhook.go:232-234, as for the
-                                    // validating dispatcher.
-                                    if !matches!(
-                                        webhook.failure_policy,
-                                        Some(FailurePolicy::Ignore)
-                                    ) {
-                                        warn!(
-                                            "Failed evaluating match conditions, failing closed {}: {}",
-                                            webhook.name, msg
-                                        );
-                                        return Err(match_conditions_forbidden(gvr, name, &msg));
-                                    }
-                                    debug!(
-                                        "Skipping mutating webhook {} — matchCondition error: {}",
+                                crate::webhook_match::WebhookMatch::Forbidden(msg) => {
+                                    warn!(
+                                        "Failed evaluating match conditions, failing closed {}: {}",
                                         webhook.name, msg
                                     );
-                                    continue;
+                                    return Err(rusternetes_common::Error::Forbidden(format!(
+                                        "{} \"{}\" is forbidden: {}",
+                                        gvr.resource, name, msg
+                                    )));
                                 }
                             }
                         }
