@@ -248,9 +248,15 @@ pub fn validate_pod_ephemeral_containers_update(new: &Pod, old: &Pod) -> ErrorLi
             {
                 errs.push(Error::forbidden(
                     &spec_path,
+                    // validation.go:6206-6207: `diff.Diff(old, *new)`.
                     format!(
-                        "existing ephemeral containers {:?} may not be changed\n",
-                        old_container.name
+                        "existing ephemeral containers {:?} may not be changed\n{}",
+                        old_container.name,
+                        crate::diff_schema::struct_diff(
+                            crate::diff_schema::EPHEMERAL_CONTAINER,
+                            &serde_json::to_value(old_container).unwrap_or_default(),
+                            &serde_json::to_value(new_container).unwrap_or_default(),
+                        )
                     ),
                 ))
             }
