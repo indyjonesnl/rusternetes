@@ -54,6 +54,7 @@ mod conformance_cbor_codec_test;
 mod conformance_cli_kubectl_label_rc;
 mod conformance_configmap_envfrom_prefixes_test;
 mod conformance_container_status_allocated_proto_test;
+mod conformance_dra_crud;
 mod conformance_dra_proto_test;
 mod conformance_duration_proto_test;
 mod conformance_envvar_valuefrom_proto_test;
@@ -387,8 +388,10 @@ mod workload_template_drop_disabled_test;
 
 mod conformance_apimachinery_aggregated_discovery;
 mod conformance_apimachinery_field_validation;
+mod conformance_node_configmap_secret;
 mod conformance_node_lease;
 mod conformance_node_podtemplates;
+mod conformance_node_runtimeclass_lifecycle;
 mod conformance_scheduling_priorityclass_endpoints;
 mod conformance_storage_csi_inline;
 mod conformance_storage_pv_status;
