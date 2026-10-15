@@ -54,9 +54,12 @@
 //! still exists, and re-entering surfaces as ADDED. The implementation gets all
 //! four transitions right; nothing asserted them before.
 //!
-//! Five upstream cases have **no mirror at all**: watch.go:334 (concurrent
-//! watches receive events in the same order) and garbage_collector.go :488,
-//! :547, :722, :826. Enumerated in #1770.
+//! Five upstream cases that had no mirror at all (#1770) are mirrored in their
+//! own files, against a served api-server with the real controllers:
+//! watch.go:334 (concurrent watches receive events in the same order) in
+//! `conformance_apimachinery_watch_concurrent_order.rs`, and
+//! garbage_collector.go :488, :547, :722, :826 in
+//! `conformance_apimachinery_gc_deployment_owners.rs`.
 //!
 //! Correction (#1749, 2026-08-27): an earlier version of this block also listed
 //! watch.go:191 (restart watching from the last observed resourceVersion) as
