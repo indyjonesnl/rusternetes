@@ -406,6 +406,10 @@ impl Patcher for JsonPatcher {
 }
 
 #[cfg(test)]
+#[path = "policy_patch_budget_tests.rs"]
+mod budget_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::admission::policy_matching::Attributes;
