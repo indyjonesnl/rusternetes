@@ -657,6 +657,18 @@ impl LabelSelector {
     /// empty. The error is `NewRequirement`'s aggregate for a requirement it
     /// refuses.
     pub fn as_selector_string(&self) -> std::result::Result<String, String> {
+        self.requirements(true)
+    }
+
+    /// The `NewRequirement` pass of `LabelSelectorAsSelector`
+    /// (helpers.go:62-79) with no `String()` rendering: the same errors as
+    /// [`Self::as_selector_string`], without building the text that
+    /// `label_selector_as_selector` throws away (#2923).
+    pub fn validate_requirements(&self) -> std::result::Result<(), String> {
+        self.requirements(false).map(drop)
+    }
+
+    fn requirements(&self, render: bool) -> std::result::Result<String, String> {
         use crate::validation::field::{Error, Path};
         use crate::validation::metav1::{is_qualified_name, is_valid_label_value};
 
@@ -693,6 +705,9 @@ impl LabelSelector {
                         value_errs.join("; "),
                     ));
                 }
+            }
+            if !render {
+                return;
             }
             // `Requirement.String` (labels/selector.go:344-395).
             let mut sorted = values.to_vec();
@@ -811,9 +826,9 @@ pub fn label_selector_as_selector(selector: Option<&LabelSelector>) -> Result<Se
     // Every requirement goes through `labels.NewRequirement`
     // (`helpers.go:62-79`, `labels/selector.go:185-225`): an unknown operator,
     // an invalid key or value, and a wrong value count are all errors.
-    // `as_selector_string` is that same port, and checks the operator with
-    // upstream's message.
-    selector.as_selector_string()?;
+    // `validate_requirements` is that same port (shared with
+    // `as_selector_string`), and checks the operator with upstream's message.
+    selector.validate_requirements()?;
     Ok(Selector::Requirements(selector.clone()))
 }
 
@@ -1451,6 +1466,27 @@ mod tests {
             "matchExpressions": [{"key": "baz", "operator": "In", "values": ["qux", "norf"]}]
         }));
         assert!(label_selector_as_selector(Some(&good)).is_ok());
+    }
+
+    /// #2923: `label_selector_as_selector` validates without rendering the
+    /// selector string; the refusals must stay exactly `as_selector_string`'s.
+    #[test]
+    fn validate_requirements_reports_what_as_selector_string_reports() {
+        for v in [
+            serde_json::json!({"matchExpressions": [{"key": "baz", "operator": "Exists", "values": ["q"]}]}),
+            serde_json::json!({"matchExpressions": [{"key": "baz", "operator": "In"}]}),
+            serde_json::json!({"matchExpressions": [{"key": "a", "operator": "Bogus"}]}),
+            serde_json::json!({"matchLabels": {"bad key": "not valid!"}}),
+            serde_json::json!({"matchLabels": {"app": "web"}, "matchExpressions": [{"key": "b", "operator": "NotIn", "values": ["x"]}]}),
+            serde_json::json!({}),
+        ] {
+            let s = sel(v.clone());
+            assert_eq!(
+                s.validate_requirements(),
+                s.as_selector_string().map(drop),
+                "{v}"
+            );
+        }
     }
 
     #[test]
