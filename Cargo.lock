@@ -4539,6 +4539,7 @@ dependencies = [
 name = "rusternetes-discovery"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "rusternetes-common",
  "rusternetes-storage",

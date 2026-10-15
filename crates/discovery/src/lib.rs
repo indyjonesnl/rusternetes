@@ -6,6 +6,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+pub mod deferred_restmapper;
 pub mod kube_version;
 pub mod restmapper;
 
