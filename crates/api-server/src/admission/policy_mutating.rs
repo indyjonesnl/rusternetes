@@ -38,6 +38,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
 use rusternetes_common::authz::Authorizer;
+use rusternetes_common::cel_cost::RUNTIME_CEL_COST_BUDGET;
 use rusternetes_common::resources::mutating_admission_policy::ReinvocationPolicyType;
 use rusternetes_common::resources::{MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding};
 use rusternetes_common::Error;
@@ -157,7 +158,15 @@ pub struct PatchRequest<'a> {
 /// copy and must not change the request's object in place.
 #[async_trait]
 pub trait Patcher: Send + Sync {
-    async fn patch(&self, request: &PatchRequest<'_>) -> Result<Value, PatchError>;
+    ///
+    /// `runtime_cel_cost_budget` is `Patch`'s `runtimeCELCostBudget`: callers
+    /// pass `RUNTIME_CEL_COST_BUDGET` (dispatcher.go:259); it is a parameter
+    /// for testing only upstream too.
+    async fn patch(
+        &self,
+        request: &PatchRequest<'_>,
+        runtime_cel_cost_budget: i64,
+    ) -> Result<Value, PatchError>;
 }
 
 /// `matchconditions.MatchResult`.
@@ -374,15 +383,20 @@ impl MutatingDispatcher {
             ))));
         }
 
+        // dispatcher.go:259: `patcher.Patch(ctx, patchRequest,
+        // celconfig.RuntimeCELCostBudget)`.
         let mut new_object = patcher
-            .patch(&PatchRequest {
-                matched_resource: resource,
-                versioned_attributes: versioned,
-                attributes,
-                param,
-                namespace,
-                authorizer: Some(authz),
-            })
+            .patch(
+                &PatchRequest {
+                    matched_resource: resource,
+                    versioned_attributes: versioned,
+                    attributes,
+                    param,
+                    namespace,
+                    authorizer: Some(authz),
+                },
+                RUNTIME_CEL_COST_BUDGET,
+            )
             .await?;
         self.defaulter.default_object(&mut new_object);
 
@@ -717,7 +731,7 @@ mod tests {
     struct FnPatcher(Box<PatchFn>);
     #[async_trait]
     impl Patcher for FnPatcher {
-        async fn patch(&self, r: &PatchRequest<'_>) -> Result<Value, PatchError> {
+        async fn patch(&self, r: &PatchRequest<'_>, _: i64) -> Result<Value, PatchError> {
             (self.0)(r.versioned_attributes.versioned_object.as_ref().unwrap())
         }
     }
@@ -1247,14 +1261,17 @@ mod tests {
             versioned_old_object: None,
             dirty: false,
         };
-        p.patch(&PatchRequest {
-            matched_resource: &gvr,
-            versioned_attributes: &v,
-            attributes: &a,
-            param: None,
-            namespace: None,
-            authorizer: None,
-        })
+        p.patch(
+            &PatchRequest {
+                matched_resource: &gvr,
+                versioned_attributes: &v,
+                attributes: &a,
+                param: None,
+                namespace: None,
+                authorizer: None,
+            },
+            RUNTIME_CEL_COST_BUDGET,
+        )
         .await
     }
 
