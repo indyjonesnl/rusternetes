@@ -892,4 +892,124 @@ mod tests {
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].field, "spec.sharedCounters");
     }
+
+    /// Capacity request-policy cases. Upstream
+    /// `validateRequestPolicyValidValues` (`validation.go:1006-1033`) runs
+    /// `validateSet(validValues, CapacityRequestPolicyDiscreteMaxOptions, ...)`
+    /// (`types.go:466` = 10).
+    fn cap_errs(allow_multiple: bool, capacity: serde_json::Value) -> Vec<(String, String)> {
+        let mut spec = spec_with_devices(vec![serde_json::json!({
+            "name": "gpu-0",
+            "allowMultipleAllocations": allow_multiple,
+            "capacity": {"cap": capacity},
+        })]);
+        spec["allNodes"] = serde_json::json!(true);
+        let mut v = base();
+        v["spec"] = spec;
+        validate_resource_slice(&slice(v))
+            .into_iter()
+            .map(|e| (e.field.clone(), e.to_string()))
+            .collect()
+    }
+
+    fn valid_values(n: usize) -> serde_json::Value {
+        let vals: Vec<String> = (1..=n).map(|i| format!("{i}Mi")).collect();
+        serde_json::json!({
+            "value": "1Gi",
+            "requestPolicy": {"default": "1Mi", "validValues": vals},
+        })
+    }
+
+    #[test]
+    fn valid_values_over_cap_is_too_many_with_origin() {
+        let mut v = base();
+        v["spec"] = spec_with_devices(vec![serde_json::json!({
+            "name": "gpu-0", "allowMultipleAllocations": true,
+            "capacity": {"cap": valid_values(11)},
+        })]);
+        let got = validate_resource_slice(&slice(v));
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(
+            got[0].field,
+            "spec.devices[0].capacity[cap].requestPolicy.validValues"
+        );
+        assert_eq!(got[0].origin, "maxItems");
+    }
+
+    #[test]
+    fn valid_values_at_cap_is_valid() {
+        assert!(cap_errs(true, valid_values(10)).is_empty());
+    }
+
+    #[test]
+    fn request_policy_forbidden_without_allow_multiple_allocations() {
+        let got = cap_errs(true, valid_values(1));
+        assert!(got.is_empty(), "{got:?}");
+        let got = cap_errs(false, valid_values(1));
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].0, "spec.devices[0].capacity[cap].requestPolicy");
+        assert!(got[0].1.contains("allowMultipleAllocations must be true"));
+    }
+
+    #[test]
+    fn request_policy_valid_values_and_valid_range_exclusive() {
+        let got = cap_errs(
+            true,
+            serde_json::json!({"value": "1Gi", "requestPolicy": {
+                "default": "1Mi", "validValues": ["1Mi"], "validRange": {"min": "1Mi"}}}),
+        );
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].1.contains(
+            r#"exactly one policy can be specified, cannot specify "validValues" and "validRange" at the same time"#
+        ));
+    }
+
+    #[test]
+    fn request_policy_valid_values_rules() {
+        // Unsorted, option larger than capacity, default not among the options.
+        let got = cap_errs(
+            true,
+            serde_json::json!({"value": "1Gi", "requestPolicy": {
+                "default": "3Mi", "validValues": ["2Mi", "1Mi", "2Gi"]}}),
+        );
+        let msgs: Vec<_> = got.iter().map(|g| g.1.as_str()).collect();
+        assert!(msgs.iter().any(|m| m.contains("values must be sorted in ascending order")), "{msgs:?}");
+        assert!(msgs.iter().any(|m| m.contains("option is larger than capacity value: 1Gi")), "{msgs:?}");
+        assert!(msgs.iter().any(|m| m.contains("default value is not valid according to the requestPolicy")), "{msgs:?}");
+    }
+
+    #[test]
+    fn request_policy_default_required() {
+        let got = cap_errs(
+            true,
+            serde_json::json!({"value": "1Gi", "requestPolicy": {"validValues": ["1Mi"]}}),
+        );
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].0, "spec.devices[0].capacity[cap].requestPolicy.default");
+        assert!(got[0].1.contains("required when validValues is defined"));
+    }
+
+    #[test]
+    fn request_policy_range_rules() {
+        let got = cap_errs(
+            true,
+            serde_json::json!({"value": "10", "requestPolicy": {
+                "default": "1", "validRange": {"min": "2", "max": "20", "step": "3"}}}),
+        );
+        let msgs: Vec<_> = got.iter().map(|g| g.1.as_str()).collect();
+        assert!(msgs.iter().any(|m| m.contains("default is less than min: 2")), "{msgs:?}");
+        assert!(msgs.iter().any(|m| m.contains("max is larger than capacity value: 10")), "{msgs:?}");
+        assert!(msgs.iter().any(|m| m.contains("value is not a multiple of a given step (3) from (2)")), "{msgs:?}");
+    }
+
+    #[test]
+    fn request_policy_range_min_required() {
+        let got = cap_errs(
+            true,
+            serde_json::json!({"value": "1Gi", "requestPolicy": {
+                "default": "1Mi", "validRange": {"max": "1Mi"}}}),
+        );
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].0.ends_with("validRange.min"));
+    }
 }
