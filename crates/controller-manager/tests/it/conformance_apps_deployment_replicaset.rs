@@ -1126,6 +1126,8 @@ async fn replicaset_recreates_deleted_pod() {
 
     let ctrl = ReplicaSetController::new(storage.clone(), 5);
     ctrl.reconcile_all().await.unwrap();
+    // Informer observes the creates (replica_set.go:436) before the next sync.
+    ctrl.reconcile_all().await.unwrap();
     let pods: Vec<Pod> = storage.list(&build_prefix("pods", Some(ns))).await.unwrap();
     assert_eq!(pods.len(), 3);
 
@@ -1388,6 +1390,9 @@ async fn rc_publishes_status_after_reconcile() {
 
     let ctrl = ReplicationControllerController::new(storage.clone(), 5);
     ctrl.reconcile_all().await.unwrap();
+    // Status counts the pods listed BEFORE manageReplicas (replica_set.go:743),
+    // so it lands on the sync after the informer observed the creates.
+    ctrl.reconcile_all().await.unwrap();
 
     let rc: ReplicationController = storage.get(&key).await.unwrap();
     let status = rc.status.expect("RC must publish status after reconcile");
@@ -1415,6 +1420,8 @@ async fn rc_recreates_deleted_pod() {
         .unwrap();
 
     let ctrl = ReplicationControllerController::new(storage.clone(), 5);
+    ctrl.reconcile_all().await.unwrap();
+    // Informer observes the creates (replica_set.go:436) before the next sync.
     ctrl.reconcile_all().await.unwrap();
 
     let pods: Vec<Pod> = storage.list(&build_prefix("pods", Some(ns))).await.unwrap();

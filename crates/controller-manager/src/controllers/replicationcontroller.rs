@@ -270,8 +270,14 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
     }
 
     #[allow(dead_code)]
+    /// One synchronous pass, for callers that do not run the watch loop: let the
+    /// pod informer catch up (the reflector's list, [`Self::relist_pods`]) and
+    /// then sync every object once. The informer step is what lowers the
+    /// expectations for pods created by an earlier pass, as the pod watch's
+    /// Added events do in [`Self::run`] (replica_set.go:436).
     pub async fn reconcile_all(&self) -> rusternetes_common::Result<()> {
         debug!("Reconciling all replicationcontrollers");
+        self.relist_pods(&WorkQueue::new()).await;
 
         // Get all replicationcontrollers
         let prefix = build_prefix("replicationcontrollers", None);
@@ -3225,6 +3231,38 @@ pub(crate) mod tests {
         assert!(
             next > Duration::from_secs(48) && next <= Duration::from_secs(50),
             "~50s left until the pod is available, got {next:?}"
+        );
+    }
+
+    /// The informer's re-list on (re)connect (`DeltaFIFO.Replace`): pods
+    /// created while the watch was down are observed as adds, once, so a lost
+    /// Added event does not wedge the sync until the expectations TTL.
+    #[tokio::test]
+    async fn rc_relist_observes_creations_the_watch_missed() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicationControllerController::new(storage.clone(), 5);
+        let queue = WorkQueue::new();
+        let rc = make_rc("gap", "default", 2, rc_selector("gap"), None);
+        seed_rc(&storage, &controller, &rc).await;
+        assert_eq!(rc_pods(&storage).await.len(), 2);
+        assert_eq!(
+            controller.expectations.get_expectations("default/gap"),
+            Some((2, 0)),
+            "the sync itself does not observe its creates"
+        );
+
+        controller.relist_pods(&queue).await;
+        assert_eq!(
+            controller.expectations.get_expectations("default/gap"),
+            Some((0, 0))
+        );
+
+        // Nothing new on a second re-list.
+        controller.expectations.expect_creations("default/gap", 1);
+        controller.relist_pods(&queue).await;
+        assert_eq!(
+            controller.expectations.get_expectations("default/gap"),
+            Some((1, 0))
         );
     }
 }

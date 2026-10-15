@@ -339,8 +339,14 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
     }
 
     #[allow(dead_code)]
+    /// One synchronous pass, for callers that do not run the watch loop: let the
+    /// pod informer catch up (the reflector's list, [`Self::relist_pods`]) and
+    /// then sync every object once. The informer step is what lowers the
+    /// expectations for pods created by an earlier pass, as the pod watch's
+    /// Added events do in [`Self::run`] (replica_set.go:436).
     pub async fn reconcile_all(&self) -> rusternetes_common::Result<()> {
         debug!("Reconciling all replicasets");
+        self.relist_pods(&WorkQueue::new()).await;
 
         // Get all replicasets
         let prefix = build_prefix("replicasets", None);
@@ -2499,6 +2505,536 @@ mod tests {
         assert_eq!(
             status_of(&storage, "termoff").await.terminating_replicas,
             None
+        );
+    }
+
+    // ---- ports of the pure helpers' upstream tests (#3624) ----
+
+    fn names(pods: &[&Pod]) -> Vec<String> {
+        pods.iter().map(|p| p.metadata.name.clone()).collect()
+    }
+
+    /// `TestGetPodsToDelete` (replica_set_test.go:1942-2140).
+    #[test]
+    fn get_pods_to_delete_follows_upstream_table() {
+        let rs = make_replicaset("foo", make_labels(&[("name", "foo")]), 1);
+        let ago = chrono::Utc::now() - chrono::Duration::seconds(300);
+        let unscheduled_pending =
+            ranked_pod("unscheduled-pending-pod", &rs, "", Phase::Pending, None);
+        let scheduled_pending = ranked_pod(
+            "scheduled-pending-pod",
+            &rs,
+            "fake-node",
+            Phase::Pending,
+            None,
+        );
+        let running_not_ready = ranked_pod(
+            "scheduled-running-not-ready-pod",
+            &rs,
+            "fake-node",
+            Phase::Running,
+            None,
+        );
+        let ready_node1 = ranked_pod(
+            "scheduled-running-ready-pod-on-node-1",
+            &rs,
+            "fake-node-1",
+            Phase::Running,
+            Some(ago),
+        );
+        let ready_node2 = ranked_pod(
+            "scheduled-running-ready-pod-on-node-2",
+            &rs,
+            "fake-node-2",
+            Phase::Running,
+            Some(ago),
+        );
+
+        struct Case<'a> {
+            name: &'a str,
+            pods: Vec<&'a Pod>,
+            // defaults to `pods` when None
+            related: Option<Vec<&'a Pod>>,
+            diff: usize,
+            expected: Vec<&'a Pod>,
+        }
+        let cases = vec![
+            Case {
+                name: "len(pods) = 0 (i.e., diff = 0 too)",
+                pods: vec![],
+                related: None,
+                diff: 0,
+                expected: vec![],
+            },
+            Case {
+                name: "diff = len(pods)",
+                pods: vec![&running_not_ready, &ready_node1],
+                related: None,
+                diff: 2,
+                expected: vec![&running_not_ready, &ready_node1],
+            },
+            Case {
+                name: "diff < len(pods)",
+                pods: vec![&ready_node1, &running_not_ready],
+                related: None,
+                diff: 1,
+                expected: vec![&running_not_ready],
+            },
+            Case {
+                name: "various pod phases and conditions, diff = len(pods)",
+                pods: vec![
+                    &ready_node1,
+                    &ready_node1,
+                    &ready_node2,
+                    &running_not_ready,
+                    &scheduled_pending,
+                    &unscheduled_pending,
+                ],
+                related: None,
+                diff: 6,
+                expected: vec![
+                    &ready_node1,
+                    &ready_node1,
+                    &ready_node2,
+                    &running_not_ready,
+                    &scheduled_pending,
+                    &unscheduled_pending,
+                ],
+            },
+            Case {
+                name: "various pod phases and conditions, diff = len(pods), relatedPods empty",
+                pods: vec![
+                    &ready_node1,
+                    &ready_node1,
+                    &ready_node2,
+                    &running_not_ready,
+                    &scheduled_pending,
+                    &unscheduled_pending,
+                ],
+                related: Some(vec![]),
+                diff: 6,
+                expected: vec![
+                    &ready_node1,
+                    &ready_node1,
+                    &ready_node2,
+                    &running_not_ready,
+                    &scheduled_pending,
+                    &unscheduled_pending,
+                ],
+            },
+            Case {
+                name: "scheduled vs unscheduled, diff < len(pods)",
+                pods: vec![&scheduled_pending, &unscheduled_pending],
+                related: None,
+                diff: 1,
+                expected: vec![&unscheduled_pending],
+            },
+            Case {
+                name: "ready vs not-ready, diff < len(pods)",
+                pods: vec![&ready_node1, &running_not_ready, &running_not_ready],
+                related: None,
+                diff: 2,
+                expected: vec![&running_not_ready, &running_not_ready],
+            },
+            Case {
+                name:
+                    "ready and colocated with another ready pod vs not colocated, diff < len(pods)",
+                pods: vec![&ready_node1, &ready_node2],
+                related: Some(vec![&ready_node1, &ready_node2, &ready_node2]),
+                diff: 1,
+                expected: vec![&ready_node2],
+            },
+            Case {
+                name: "pending vs running, diff < len(pods)",
+                pods: vec![&scheduled_pending, &running_not_ready],
+                related: None,
+                diff: 1,
+                expected: vec![&scheduled_pending],
+            },
+            Case {
+                name: "various pod phases and conditions, diff < len(pods)",
+                pods: vec![
+                    &ready_node1,
+                    &ready_node2,
+                    &running_not_ready,
+                    &scheduled_pending,
+                    &unscheduled_pending,
+                ],
+                related: None,
+                diff: 3,
+                expected: vec![&unscheduled_pending, &scheduled_pending, &running_not_ready],
+            },
+        ];
+        for case in cases {
+            let related = case.related.clone().unwrap_or_else(|| case.pods.clone());
+            let got = get_pods_to_delete(&case.pods, &related, case.diff);
+            assert_eq!(
+                names(&got),
+                names(&case.expected),
+                "{}: unexpected pods to delete",
+                case.name
+            );
+        }
+    }
+
+    /// `TestRelatedPodsLookup` (replica_set_test.go:552-625).
+    #[test]
+    fn related_pods_lookup_follows_upstream_table() {
+        let owned_by = |mut rs: ReplicaSet, uid: &str| {
+            rs.metadata.owner_references = Some(vec![OwnerReference::new(
+                "apps/v1",
+                "Deployment",
+                "owner",
+                uid,
+            )
+            .with_controller(true)]);
+            rs
+        };
+        let some_rs = owned_by(
+            make_replicaset("foo1", make_labels(&[("foo", "bar")]), 1),
+            "123",
+        );
+        let related_rs = owned_by(
+            make_replicaset("foo2", make_labels(&[("foo", "baz")]), 1),
+            "123",
+        );
+        let unrelated_rs = owned_by(
+            make_replicaset("bar1", make_labels(&[("foo", "quux")]), 1),
+            "456",
+        );
+        let mut pending_deletion_rs = owned_by(
+            make_replicaset("foo3", make_labels(&[("foo", "xyzzy")]), 1),
+            "789",
+        );
+        pending_deletion_rs.metadata.deletion_timestamp = Some(chrono::Utc::now());
+
+        let pod1 = ranked_pod("pod1", &some_rs, "", Phase::Running, None);
+        let pod2 = ranked_pod("pod2", &some_rs, "", Phase::Running, None);
+        let pod3 = ranked_pod("pod3", &related_rs, "", Phase::Running, None);
+        let pod4 = ranked_pod("pod4", &unrelated_rs, "", Phase::Running, None);
+        let pending_pod = ranked_pod("pod", &pending_deletion_rs, "", Phase::Running, None);
+
+        let related_names = |rs: &ReplicaSet, all: &[&ReplicaSet], pods: &[Pod]| {
+            let sets: Vec<RelatedSet<'_>> = all
+                .iter()
+                .map(|r| RelatedSet {
+                    metadata: &r.metadata,
+                    selector: r.spec.selector.clone(),
+                })
+                .collect();
+            let mut got: Vec<String> = indirectly_related_pods(&rs.metadata, &sets, pods)
+                .iter()
+                .map(|p| p.metadata.name.clone())
+                .collect();
+            got.sort();
+            got
+        };
+
+        assert_eq!(
+            related_names(
+                &pending_deletion_rs,
+                &[&pending_deletion_rs, &unrelated_rs],
+                std::slice::from_ref(&pending_pod)
+            ),
+            vec!["pod"],
+            "a pod is related even if its owning ReplicaSet is pending deletion"
+        );
+        assert_eq!(
+            related_names(
+                &some_rs,
+                &[&some_rs, &unrelated_rs],
+                &[pod1.clone(), pod2.clone(), pod4.clone()]
+            ),
+            vec!["pod1", "pod2"],
+            "only the ReplicaSet's own pods when there is no related ReplicaSet"
+        );
+        assert_eq!(
+            related_names(
+                &some_rs,
+                &[&some_rs, &related_rs, &unrelated_rs],
+                &[pod1, pod2, pod3, pod4]
+            ),
+            vec!["pod1", "pod2", "pod3"],
+            "own pods plus any related ReplicaSet's, never an unrelated one's"
+        );
+
+        // `getReplicaSetsWithSameController`: no controller, no related sets.
+        let orphan = make_replicaset("lonely", make_labels(&[("foo", "bar")]), 1);
+        assert!(related_names(
+            &orphan,
+            &[&orphan],
+            &[ranked_pod("p", &orphan, "", Phase::Running, None)]
+        )
+        .is_empty());
+    }
+
+    /// `TestCalculateStatus` (replica_set_utils_test.go:38-330).
+    #[test]
+    #[serial_test::serial]
+    fn calculate_status_follows_upstream_table() {
+        use rusternetes_common::feature_gates::{with_feature, Feature};
+        // Template labels are always the full map (`newReplicaSet`); the
+        // pods carry the selector's labels (`newPod`).
+        let rs_with = |replicas: i32, selector: &[(&str, &str)], min_ready: i32| {
+            let mut rs = make_replicaset("foobar", make_labels(selector), replicas);
+            rs.spec.template.metadata = Some(
+                ObjectMeta::new("")
+                    .with_labels(make_labels(&[("name", "foo"), ("type", "production")])),
+            );
+            rs.spec.min_ready_seconds = Some(min_ready);
+            rs
+        };
+        let not_fully = rs_with(1, &[("name", "foo")], 0);
+        let fully = rs_with(2, &[("name", "foo"), ("type", "production")], 0);
+        let long_min_ready = rs_with(1, &[("name", "foo"), ("type", "production")], 3600);
+        let now = chrono::Utc::now();
+        let ready = |name: &str, rs: &ReplicaSet, since: Option<chrono::DateTime<chrono::Utc>>| {
+            ranked_pod(name, rs, "", Phase::Running, Some(since.unwrap_or(now)))
+        };
+        let terminating = |mut p: Pod| {
+            p.metadata.deletion_timestamp = Some(now);
+            p
+        };
+
+        struct Case {
+            name: &'static str,
+            gate: bool,
+            rs: ReplicaSet,
+            active: Vec<Pod>,
+            terminating: Vec<Pod>,
+            // replicas, fully labeled, ready, available, terminating
+            expected: (i32, i32, i32, i32, Option<i32>),
+        }
+        let cases = vec![
+            Case {
+                name: "1 fully labelled pod",
+                gate: false,
+                rs: fully.clone(),
+                active: vec![ready("pod1", &fully, None)],
+                terminating: vec![],
+                expected: (1, 1, 1, 1, None),
+            },
+            Case {
+                name: "1 not fully labelled pod",
+                gate: false,
+                rs: not_fully.clone(),
+                active: vec![ready("pod1", &not_fully, None)],
+                terminating: vec![],
+                expected: (1, 0, 1, 1, None),
+            },
+            Case {
+                name: "2 fully labelled pods with DeploymentReplicaSetTerminatingReplicas",
+                gate: true,
+                rs: fully.clone(),
+                active: vec![ready("pod1", &fully, None), ready("pod2", &fully, None)],
+                terminating: vec![],
+                expected: (2, 2, 2, 2, Some(0)),
+            },
+            Case {
+                name: "1 fully labelled pod, 1 not fully labelled pod",
+                gate: false,
+                rs: not_fully.clone(),
+                active: vec![ready("pod1", &not_fully, None), ready("pod2", &fully, None)],
+                terminating: vec![],
+                expected: (2, 1, 2, 2, None),
+            },
+            Case {
+                name: "1 non-ready pod",
+                gate: false,
+                rs: fully.clone(),
+                active: vec![ranked_pod("pod1", &fully, "", Phase::Pending, None)],
+                terminating: vec![],
+                expected: (1, 1, 0, 0, None),
+            },
+            Case {
+                name: "1 ready but non-available pod",
+                gate: false,
+                rs: long_min_ready.clone(),
+                active: vec![ready("pod1", &long_min_ready, Some(now))],
+                terminating: vec![],
+                expected: (1, 1, 1, 0, None),
+            },
+            Case {
+                name: "1 available pod with minReadySeconds",
+                gate: false,
+                rs: long_min_ready.clone(),
+                active: vec![ready(
+                    "pod1",
+                    &long_min_ready,
+                    Some(now - chrono::Duration::seconds(3600)),
+                )],
+                terminating: vec![],
+                expected: (1, 1, 1, 1, None),
+            },
+            Case {
+                name: "1 fully labelled pod and 1 terminating without the gate",
+                gate: false,
+                rs: fully.clone(),
+                active: vec![ready("pod1", &fully, None)],
+                terminating: vec![terminating(ready("pod2", &fully, None))],
+                expected: (1, 1, 1, 1, None),
+            },
+            Case {
+                name: "1 fully labelled pod and 2 terminating with the gate",
+                gate: true,
+                rs: fully.clone(),
+                active: vec![ready("pod1", &fully, None)],
+                terminating: vec![
+                    terminating(ready("pod2", &fully, None)),
+                    terminating(ready("pod3", &fully, None)),
+                ],
+                expected: (1, 1, 1, 1, Some(2)),
+            },
+        ];
+        for case in cases {
+            let _gate = with_feature(Feature::DeploymentReplicaSetTerminatingReplicas, case.gate);
+            let active: Vec<&Pod> = case.active.iter().collect();
+            let terminating: Vec<&Pod> = case.terminating.iter().collect();
+            let status = calculate_status(&case.rs, &active, &terminating, None, now);
+            assert_eq!(
+                (
+                    status.replicas,
+                    status.fully_labeled_replicas,
+                    status.ready_replicas,
+                    status.available_replicas,
+                    status.terminating_replicas
+                ),
+                (
+                    case.expected.0,
+                    Some(case.expected.1),
+                    case.expected.2,
+                    case.expected.3,
+                    case.expected.4
+                ),
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    /// `TestCalculateStatusConditions` (replica_set_utils_test.go:332-440):
+    /// set once with the diff's reason, kept while it persists, removed when
+    /// the error clears.
+    #[test]
+    fn calculate_status_conditions_follow_upstream_table() {
+        let now = chrono::Utc::now();
+        let rs = make_replicaset("foobar", make_labels(&[("name", "foo")]), 2);
+        let mut failing_rs = make_replicaset("foobar", make_labels(&[("name", "foo")]), 10);
+        failing_rs.status = Some(ReplicaSetStatus {
+            conditions: Some(vec![rusternetes_common::resources::ReplicaSetCondition {
+                condition_type: "ReplicaFailure".to_string(),
+                status: "True".to_string(),
+                last_transition_time: None,
+                reason: None,
+                message: None,
+            }]),
+            ..Default::default()
+        });
+        let pods = |rs: &ReplicaSet, n: usize| -> Vec<Pod> {
+            (0..n)
+                .map(|i| ranked_pod(&format!("pod{i}"), rs, "", Phase::Running, Some(now)))
+                .collect()
+        };
+        let conds = |rs: &ReplicaSet, n: usize, err: Option<&str>| {
+            let owned = pods(rs, n);
+            let refs: Vec<&Pod> = owned.iter().collect();
+            calculate_status(rs, &refs, &[], err, now)
+                .conditions
+                .unwrap_or_default()
+        };
+
+        let c = conds(&rs, 1, Some("fake manageReplicasErr"));
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].reason.as_deref(), Some("FailedCreate"), "diff < 0");
+        assert_eq!(c[0].message.as_deref(), Some("fake manageReplicasErr"));
+
+        let c = conds(&rs, 3, Some("fake manageReplicasErr"));
+        assert_eq!(c[0].reason.as_deref(), Some("FailedDelete"), "diff > 0");
+
+        assert!(
+            conds(&failing_rs, 1, None).is_empty(),
+            "manageReplicasErr == nil && failureCond != nil removes it"
+        );
+
+        let c = conds(&failing_rs, 1, Some("fake manageReplicasErr"));
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].reason, None, "the existing condition is left alone");
+        assert_eq!(c[0].message, None);
+
+        assert!(conds(&rs, 1, None).is_empty());
+    }
+
+    /// The informer's re-list on (re)connect (`DeltaFIFO.Replace`): a pod
+    /// created while the watch was down is observed as an add, exactly once,
+    /// so a creation whose Added event was lost does not wedge the sync until
+    /// the expectations TTL.
+    #[tokio::test]
+    async fn rs_relist_observes_creations_the_watch_missed() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicaSetController::new(Arc::clone(&storage), 30);
+        let queue = WorkQueue::new();
+        let rs = make_replicaset("gap", make_labels(&[("app", "gap")]), 2);
+        let pods = [
+            ranked_pod("p1", &rs, "n1", Phase::Pending, None),
+            ranked_pod("p2", &rs, "n1", Phase::Pending, None),
+        ];
+        seed_rs(&storage, &rs, &pods).await;
+        // The sync issued two creates; their Added events never arrived.
+        controller.set_expectations("default/gap", 2, 0);
+
+        controller.relist_pods(&queue).await;
+        assert_eq!(
+            controller.expectations.get_expectations("default/gap"),
+            Some((0, 0))
+        );
+
+        // A second re-list, and a late Added event for a pod already seen,
+        // are updates: they must not lower the count again.
+        controller.set_expectations("default/gap", 1, 0);
+        controller.relist_pods(&queue).await;
+        controller
+            .enqueue_owner_replicaset(
+                &queue,
+                &WatchEvent::Added(
+                    "/registry/pods/default/p1".to_string(),
+                    serde_json::to_string(&pods[0]).unwrap(),
+                ),
+            )
+            .await;
+        assert_eq!(
+            controller.expectations.get_expectations("default/gap"),
+            Some((1, 0)),
+            "a pod the informer already holds is not a creation observation"
+        );
+    }
+
+    /// Pods that vanished while the watch was down are observed as deletes
+    /// (`DeletedFinalStateUnknown`), so the delete expectation clears.
+    #[tokio::test]
+    async fn rs_relist_observes_deletions_the_watch_missed() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicaSetController::new(Arc::clone(&storage), 30);
+        let queue = WorkQueue::new();
+        let rs = make_replicaset("gone", make_labels(&[("app", "gone")]), 1);
+        let pods = [
+            ranked_pod("keep", &rs, "n1", Phase::Pending, None),
+            ranked_pod("doomed", &rs, "n1", Phase::Pending, None),
+        ];
+        seed_rs(&storage, &rs, &pods).await;
+        controller.relist_pods(&queue).await;
+
+        controller
+            .expectations
+            .expect_deletions_of("default/gone", &["default/doomed".to_string()]);
+        storage
+            .delete(&build_key("pods", Some("default"), "doomed"))
+            .await
+            .unwrap();
+        controller.relist_pods(&queue).await;
+
+        assert_eq!(
+            controller.expectations.get_expectations("default/gone"),
+            Some((0, 0))
         );
     }
 }
