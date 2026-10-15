@@ -316,6 +316,12 @@ pub enum Feature {
     /// `Mount.image` (`kuberuntime_manager.go:1813-1850` `getImageVolumes`,
     /// `kubelet_pods.go:327-330` `makeMounts`).
     ImageVolume,
+
+    /// Upstream gate `LogarithmicScaleDown` (1.21 Alpha, 1.22 Beta on, 1.31 GA
+    /// locked to default; `pkg/features/kube_features.go:1494-1498`, name at
+    /// `:565`). Read by `ActivePodsWithRanks.Less`
+    /// (`pkg/controller/controller_utils.go:875,895`).
+    LogarithmicScaleDown,
 }
 
 impl Feature {
@@ -396,6 +402,7 @@ impl Feature {
             Feature::StructuredAuthenticationConfigurationEgressSelector => 71,
             Feature::StructuredAuthenticationConfigurationJWKSMetrics => 72,
             Feature::ImageVolume => 73,
+            Feature::LogarithmicScaleDown => 74,
         }
     }
 
@@ -421,7 +428,8 @@ impl Feature {
             | Feature::PodLifecycleSleepActionAllowZero
             | Feature::ServiceAccountTokenNodeBinding
             | Feature::ServiceAccountTokenNodeBindingValidation
-            | Feature::StructuredAuthenticationConfiguration => PreRelease::Ga,
+            | Feature::StructuredAuthenticationConfiguration
+            | Feature::LogarithmicScaleDown => PreRelease::Ga,
             Feature::InPlacePodVerticalScalingAllocatedStatus => PreRelease::Deprecated,
             Feature::PodTopologyLabelsAdmission
             | Feature::SELinuxMountReadWriteOncePod
@@ -509,6 +517,7 @@ impl Feature {
                 | Feature::ServiceAccountTokenNodeBinding
                 | Feature::ServiceAccountTokenNodeBindingValidation
                 | Feature::StructuredAuthenticationConfiguration
+                | Feature::LogarithmicScaleDown
         )
     }
 
@@ -661,6 +670,8 @@ impl Feature {
             Feature::StructuredAuthenticationConfigurationJWKSMetrics => true,
             // 1.35 Beta, on (pkg/features/kube_features.go:1366-1370)
             Feature::ImageVolume => true,
+            // pkg/features/kube_features.go:1494-1498 (1.31 GA + LockToDefault)
+            Feature::LogarithmicScaleDown => true,
         }
     }
 }
@@ -751,6 +762,7 @@ pub const ALL_FEATURES: &[Feature] = &[
     Feature::StructuredAuthenticationConfigurationEgressSelector,
     Feature::StructuredAuthenticationConfigurationJWKSMetrics,
     Feature::ImageVolume,
+    Feature::LogarithmicScaleDown,
 ];
 
 /// Total number of feature gates. Derived from [`ALL_FEATURES`].
@@ -839,6 +851,7 @@ static STATES: [AtomicBool; NUM_FEATURES] = [
     AtomicBool::new(Feature::StructuredAuthenticationConfigurationEgressSelector.default_enabled()),
     AtomicBool::new(Feature::StructuredAuthenticationConfigurationJWKSMetrics.default_enabled()),
     AtomicBool::new(Feature::ImageVolume.default_enabled()),
+    AtomicBool::new(Feature::LogarithmicScaleDown.default_enabled()),
 ];
 
 /// Returns whether `feature` is currently enabled in this process.
