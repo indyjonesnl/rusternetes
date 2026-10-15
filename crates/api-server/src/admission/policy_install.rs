@@ -16,12 +16,12 @@
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use rusternetes_discovery::restmapper::{
-    new_discovery_rest_mapper, served_group_resources, Gk, PriorityRestMapper, Scope,
-};
 use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
 use rusternetes_common::resources::Namespace;
 use rusternetes_common::Error;
+use rusternetes_discovery::restmapper::{
+    new_discovery_rest_mapper, served_group_resources, Gk, PriorityRestMapper, Scope,
+};
 use rusternetes_storage::Storage;
 use serde_json::Value;
 
@@ -90,8 +90,7 @@ impl RestMapper for DiscoveryRestMapper {
     /// custom.metrics handler share one kind -> resource path.
     fn rest_mapping(&self, group: &str, kind: &str, version: &str) -> Result<RestMapping, String> {
         static MAPPER: OnceLock<PriorityRestMapper> = OnceLock::new();
-        let mapper =
-            MAPPER.get_or_init(|| new_discovery_rest_mapper(&served_group_resources(&[])));
+        let mapper = MAPPER.get_or_init(|| new_discovery_rest_mapper(&served_group_resources(&[])));
         let mapping = mapper
             .rest_mapping(&Gk::new(group, kind), &[version])
             .map_err(|e| e.to_string())?;
