@@ -86,6 +86,10 @@ pub struct PersistentVolumeSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub iscsi: Option<ISCSIVolumeSource>,
 
+    /// FibreChannel source (`core/v1 PersistentVolumeSource.fc`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fc: Option<FCVolumeSource>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local: Option<LocalVolumeSource>,
 
@@ -206,6 +210,27 @@ pub struct ISCSIVolumeSource {
     /// custom iSCSI Initiator Name
     #[serde(skip_serializing_if = "Option::is_none")]
     pub initiator_name: Option<String>,
+}
+
+/// `core/v1 FCVolumeSource` (`staging/src/k8s.io/api/core/v1/types.go`): a
+/// Fibre Channel volume. Exactly one of `targetWWNs` (with `lun`) or `wwids`
+/// is set.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FCVolumeSource {
+    #[serde(
+        default,
+        rename = "targetWWNs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub target_wwns: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lun: Option<i32>,
+    #[serde(default, rename = "fsType", skip_serializing_if = "Option::is_none")]
+    pub fs_type: Option<String>,
+    #[serde(default, rename = "readOnly", skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wwids: Option<Vec<String>>,
 }
 
 /// SecretReference represents a Secret reference by name and namespace.
@@ -934,6 +959,7 @@ mod tests {
                 csi: None,
                 gce_persistent_disk: None,
                 aws_elastic_block_store: None,
+                fc: None,
                 access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
                 persistent_volume_reclaim_policy: Some(PersistentVolumeReclaimPolicy::Retain),
                 storage_class_name: Some("manual".to_string()),
@@ -995,6 +1021,27 @@ mod tests {
 
         let json = serde_json::to_string(&pvc).unwrap();
         let _deserialized: PersistentVolumeClaim = serde_json::from_str(&json).unwrap();
+    }
+
+    /// `core/v1 PersistentVolumeSource.fc` (`types.go`, `FCVolumeSource`): a
+    /// PV carrying a FibreChannel source must keep it (#3288); the kubelet's
+    /// `kubernetes.io/fc` plugin reads `spec.fc`.
+    #[test]
+    fn pv_spec_keeps_fc_source() {
+        let fc = serde_json::json!({
+            "targetWWNs": ["500a0981891b8dc5"],
+            "lun": 0,
+            "fsType": "ext4",
+            "readOnly": true,
+            "wwids": ["3600508b400105e210000900000490000"]
+        });
+        let pv: PersistentVolume = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "pv-fc"},
+            "spec": {"fc": fc}
+        }))
+        .unwrap();
+        let out = serde_json::to_value(&pv).unwrap();
+        assert_eq!(out["spec"]["fc"], fc);
     }
 }
 

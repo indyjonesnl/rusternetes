@@ -37,6 +37,7 @@ async fn csi_pv(storage: &MemoryStorage, name: &str, driver: &str, claim: Option
         spec: PersistentVolumeSpec {
             gce_persistent_disk: None,
             aws_elastic_block_store: None,
+            fc: None,
             capacity: HashMap::from([("storage".to_string(), "10Gi".to_string())]),
             host_path: None,
             nfs: None,
@@ -356,6 +357,7 @@ async fn a_non_csi_volume_is_not_snapshotted() {
         spec: PersistentVolumeSpec {
             gce_persistent_disk: None,
             aws_elastic_block_store: None,
+            fc: None,
             capacity: HashMap::from([("storage".to_string(), "10Gi".to_string())]),
             host_path: Some(HostPathVolumeSource {
                 path: "/tmp/pv-6".to_string(),

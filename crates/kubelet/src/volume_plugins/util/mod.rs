@@ -10,6 +10,7 @@ pub mod hostutil;
 pub mod key_mutex;
 pub mod metrics;
 pub mod mount_interface;
+pub mod mount_list;
 pub mod mount_ops;
 pub mod mount_utils;
 pub mod nested_volumes;

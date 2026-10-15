@@ -15,6 +15,7 @@ pub mod csi_drivers_store;
 pub mod csi_node_updater;
 pub mod downward_api;
 pub mod empty_dir;
+pub mod fc;
 pub mod git_repo;
 pub mod host;
 pub mod host_path;
