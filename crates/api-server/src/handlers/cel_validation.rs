@@ -22,10 +22,10 @@
 //!      estimated cost budget — sufficient to reject obviously expensive
 //!      rules at compile time and runaway evaluations at runtime.
 
-use rusternetes_common::cel_versions::{
-    compile_failure, default_compatibility_version, EnvSet, EnvType,
+use rusternetes_common::cel_versions::{compile_failure, EnvSet, EnvType};
+use rusternetes_common::resources::{
+    CustomResource, CustomResourceDefinition, CustomResourceDefinitionSpec, JSONSchemaProps,
 };
-use rusternetes_common::resources::{CustomResource, CustomResourceDefinition, JSONSchemaProps};
 use rusternetes_common::schema_validation::PathSeg;
 use rusternetes_common::{CELContext, CELEvaluator, Error, Result};
 use std::collections::HashSet;
@@ -219,20 +219,38 @@ pub fn estimate_cost(rule: &str) -> u64 {
     cost
 }
 
-/// Validate every `x-kubernetes-validations[].rule` on `schema` at CRD admission.
+/// `findPreexistingExpressions` (apiextensions validation.go:172-183) for the
+/// `rules` set: every `x-kubernetes-validations[].rule` anywhere in any
+/// version's schema (`SchemaHas`, validation.go:1659, walks the whole schema
+/// and `findPreexistingExpressionsInSchema` never stops it, :185-195).
+/// The deprecated top-level `spec.validation` is v1-only and not modelled.
+///
+/// `messageExpressions` (validation.go:155, 165-169) is not collected: this
+/// module does not compile `messageExpression` at all yet.
+pub fn find_preexisting_rules(spec: &CustomResourceDefinitionSpec) -> HashSet<String> {
+    use std::cell::RefCell;
+    let rules = RefCell::new(HashSet::new());
+    for v in &spec.versions {
+        if let Some(validation) = &v.schema {
+            rusternetes_common::validation::crd::schema_has(&validation.open_apiv3_schema, &|s| {
+                for raw in s.x_kubernetes_validations.iter().flatten() {
+                    if let Some(rule) = raw.get("rule").and_then(|r| r.as_str()) {
+                        rules.borrow_mut().insert(rule.to_string());
+                    }
+                }
+                false
+            });
+        }
+    }
+    rules.into_inner()
+}
+
+/// Validate every `x-kubernetes-validations[].rule` on `schema` at CRD admission
+/// against an explicit environment set; rules in `preexisting` are compiled in
+/// the stored environment.
 ///
 /// Returns an error if any rule is malformed (compile error), references an
 /// unknown property at the same level, or exceeds the estimated-cost budget.
-pub fn validate_crd_rules(schema: &JSONSchemaProps) -> Result<()> {
-    validate_crd_rules_in(
-        schema,
-        &EnvSet::must_base_env_set(default_compatibility_version()),
-        &HashSet::new(),
-    )
-}
-
-/// `validate_crd_rules` against an explicit environment set; rules in
-/// `preexisting` are compiled in the stored environment.
 pub fn validate_crd_rules_in(
     schema: &JSONSchemaProps,
     env_set: &EnvSet,
