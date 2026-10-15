@@ -535,13 +535,14 @@ fn validate_request_policy_range_step(
 ) -> ErrorList {
     let mut errs = ErrorList::new();
     let step_val = step.value();
-    // Go's `added%stepVal` would panic on a zero step; a zero step is rejected
-    // by declarative validation upstream, so skip rather than crash.
-    if step_val == 0 {
-        return errs;
-    }
-    let added = value.value() - min.value();
-    if added % step_val != 0 {
+    // No zero-step guard, deliberately: upstream has none (`Step` carries no
+    // validation tag and the imperative validation runs first,
+    // `resourceslice/strategy.go:63`), so `added%stepVal` (`validation.go:1085`)
+    // is an integer divide-by-zero panic that `WithPanicRecovery` answers 500
+    // (`apiserver/pkg/server/filters/wrap.go:30-58`). `%` panics identically
+    // here and the router's `CatchPanicLayer` gives the same 500 (#3250).
+    let added = value.value().wrapping_sub(min.value());
+    if added.wrapping_rem(step_val) != 0 {
         errs.push(Error::invalid(
             fld_path,
             value.canonical_string(),
@@ -1327,5 +1328,316 @@ mod tests {
         );
         assert_eq!(got.len(), 1, "{got:?}");
         assert!(got[0].0.ends_with("validRange.min"));
+    }
+}
+
+/// Port of upstream `TestValidateDeviceCapacity`
+/// (`pkg/apis/resource/validation/validation_device_capacity_test.go:53-198`,
+/// 21 scenarios), run through `validateMultiAllocatableDeviceCapacity`, plus
+/// the zero-step behaviour (#3250).
+#[cfg(test)]
+mod device_capacity_scenarios {
+    use super::*;
+    use serde_json::{json, Value};
+
+    const ONE: &str = "1Gi";
+    const TWO: &str = "2Gi";
+    const MAX: &str = "10Gi";
+    const OVER: &str = "20Gi";
+
+    /// `testDeviceCapacity` + `testCapacityRequestPolicy`: `default`,
+    /// `validValues` and `validRange` are only present when given.
+    fn capacity(value: &str, policy: Option<Value>) -> DeviceCapacity {
+        let mut v = json!({ "value": value });
+        if let Some(p) = policy {
+            v["requestPolicy"] = p;
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn policy(
+        default: Option<&str>,
+        valid_values: Option<Vec<&str>>,
+        range: Option<Value>,
+    ) -> Value {
+        let mut p = json!({});
+        if let Some(d) = default {
+            p["default"] = json!(d);
+        }
+        if let Some(vv) = valid_values {
+            p["validValues"] = json!(vv);
+        }
+        if let Some(r) = range {
+            p["validRange"] = r;
+        }
+        p
+    }
+
+    /// `testValidRange`.
+    fn range(min: Option<&str>, max: Option<&str>, step: Option<&str>) -> Value {
+        let mut r = json!({});
+        if let Some(m) = min {
+            r["min"] = json!(m);
+        }
+        if let Some(m) = max {
+            r["max"] = json!(m);
+        }
+        if let Some(s) = step {
+            r["step"] = json!(s);
+        }
+        r
+    }
+
+    fn run(cap: &DeviceCapacity) -> ErrorList {
+        validate_multi_allocatable_device_capacity(
+            cap,
+            &Path::new("spec").child("devices").child("capacity"),
+        )
+    }
+
+    #[test]
+    fn validate_device_capacity_scenarios() {
+        let capacity_field = Path::new("spec").child("devices").child("capacity");
+        let policy_field = capacity_field.child("requestPolicy");
+        let valid_values_field = policy_field.child("validValues");
+        let valid_range_field = policy_field.child("validRange");
+
+        let scenarios: Vec<(&str, DeviceCapacity, ErrorList)> = vec![
+            ("no-policy", capacity(ONE, None), vec![]),
+            (
+                "policy-without-default",
+                capacity(ONE, Some(policy(None, None, None))),
+                vec![],
+            ),
+            (
+                "policy-with-valid-values-without-default",
+                capacity(ONE, Some(policy(None, Some(vec![ONE]), None))),
+                vec![Error::required(
+                    &policy_field.child("default"),
+                    "required when validValues is defined",
+                )],
+            ),
+            (
+                "policy-with-valid-range-without-default",
+                capacity(ONE, Some(policy(None, None, Some(range(Some(ONE), None, None))))),
+                vec![Error::required(
+                    &policy_field.child("default"),
+                    "required when validRange is defined",
+                )],
+            ),
+            (
+                "policy-with-valid-range-without-min",
+                capacity(ONE, Some(policy(Some(ONE), None, Some(range(None, None, None))))),
+                vec![Error::required(
+                    &valid_range_field.child("min"),
+                    "required when validRange is defined",
+                )],
+            ),
+            (
+                "valid-simple-range",
+                capacity(MAX, Some(policy(Some(ONE), None, Some(range(Some(ONE), None, None))))),
+                vec![],
+            ),
+            (
+                "valid-range-with-max",
+                capacity(MAX, Some(policy(Some(ONE), None, Some(range(Some(ONE), Some(MAX), None))))),
+                vec![],
+            ),
+            (
+                "valid-range-with-step",
+                capacity(MAX, Some(policy(Some(ONE), None, Some(range(Some(ONE), None, Some(ONE)))))),
+                vec![],
+            ),
+            (
+                "valid-range-with-max-and-step",
+                capacity(
+                    MAX,
+                    Some(policy(Some(ONE), None, Some(range(Some(ONE), Some(MAX), Some(ONE))))),
+                ),
+                vec![],
+            ),
+            (
+                "valid-single-option",
+                capacity(MAX, Some(policy(Some(ONE), Some(vec![ONE]), None))),
+                vec![],
+            ),
+            (
+                "valid-two-options",
+                capacity(MAX, Some(policy(Some(ONE), Some(vec![ONE, MAX]), None))),
+                vec![],
+            ),
+            (
+                "default-without-policy",
+                capacity(MAX, Some(policy(Some(ONE), None, None))),
+                vec![],
+            ),
+            (
+                "more-than-one-policy",
+                capacity(
+                    MAX,
+                    Some(policy(Some(ONE), Some(vec![ONE]), Some(range(Some(ONE), None, None)))),
+                ),
+                vec![Error::forbidden(
+                    &policy_field,
+                    "exactly one policy can be specified, cannot specify \"validValues\" and \"validRange\" at the same time",
+                )],
+            ),
+            (
+                "invalid-options",
+                capacity(MAX, Some(policy(Some(ONE), Some(vec![OVER]), None))),
+                vec![
+                    Error::invalid(
+                        &valid_values_field.index(0),
+                        "20Gi",
+                        "option is larger than capacity value: 10Gi",
+                    ),
+                    Error::invalid(
+                        &valid_values_field,
+                        "1Gi",
+                        "default value is not valid according to the requestPolicy",
+                    ),
+                ],
+            ),
+            (
+                "invalid-options-duplicate",
+                capacity(MAX, Some(policy(Some(ONE), Some(vec![ONE, ONE]), None))),
+                vec![Error::duplicate(&valid_values_field.index(1), "1073741824")],
+            ),
+            (
+                "invalid-options-duplicate-normalized",
+                capacity(MAX, Some(policy(Some("1Ki"), Some(vec!["1Ki", "1024"]), None))),
+                vec![Error::duplicate(&valid_values_field.index(1), "1024")],
+            ),
+            (
+                "invalid-options-unsort",
+                capacity(MAX, Some(policy(Some(ONE), Some(vec![TWO, ONE]), None))),
+                vec![Error::invalid(
+                    &valid_values_field.index(1),
+                    ONE,
+                    "values must be sorted in ascending order",
+                )],
+            ),
+            (
+                "invalid-range-large-min-small-max",
+                capacity(
+                    MAX,
+                    Some(policy(Some(TWO), None, Some(range(Some(OVER), Some(ONE), None)))),
+                ),
+                vec![
+                    Error::invalid(
+                        &valid_range_field.child("min"),
+                        "20Gi",
+                        "min is larger than capacity value: 10Gi",
+                    ),
+                    Error::invalid(
+                        &valid_range_field.child("min"),
+                        "2Gi",
+                        "default is less than min: 20Gi",
+                    ),
+                    Error::invalid(
+                        &valid_range_field.child("max"),
+                        "20Gi",
+                        "min is larger than max: 1Gi",
+                    ),
+                    Error::invalid(
+                        &valid_range_field.child("max"),
+                        "2Gi",
+                        "default is more than max: 1Gi",
+                    ),
+                ],
+            ),
+            (
+                "invalid-range-large-max",
+                capacity(
+                    MAX,
+                    Some(policy(Some(ONE), None, Some(range(Some(ONE), Some(OVER), None)))),
+                ),
+                vec![Error::invalid(
+                    &valid_range_field.child("max"),
+                    "20Gi",
+                    "max is larger than capacity value: 10Gi",
+                )],
+            ),
+            (
+                "invalid-range-multiple-of-step",
+                capacity(
+                    MAX,
+                    Some(policy(Some(TWO), None, Some(range(Some(ONE), Some(MAX), Some(TWO))))),
+                ),
+                vec![
+                    Error::invalid(
+                        &valid_range_field.child("step"),
+                        "2Gi",
+                        "value is not a multiple of a given step (2Gi) from (1Gi)",
+                    ),
+                    Error::invalid(
+                        &valid_range_field.child("step"),
+                        "10Gi",
+                        "value is not a multiple of a given step (2Gi) from (1Gi)",
+                    ),
+                ],
+            ),
+            (
+                "invalid-range-large-step",
+                capacity(
+                    MAX,
+                    Some(policy(Some(ONE), None, Some(range(Some(ONE), None, Some(MAX))))),
+                ),
+                vec![Error::invalid(
+                    &valid_range_field.child("step"),
+                    "10Gi",
+                    "one step 11Gi is larger than capacity value: 10Gi",
+                )],
+            ),
+        ];
+        assert_eq!(scenarios.len(), 21);
+        for (name, cap, want) in scenarios {
+            let got = run(&cap);
+            assert_eq!(
+                got.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+                want.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+                "scenario {name}"
+            );
+        }
+    }
+
+    /// An unparsable quantity never reaches validation: upstream's typed
+    /// `Quantity` fails decode, so `q()` returning `None` is unreachable. Ours
+    /// must fail decode too, for every quantity-typed policy field.
+    #[test]
+    fn unparsable_policy_quantities_fail_decode() {
+        for p in [
+            json!({ "default": "abc" }),
+            json!({ "validValues": ["1Gi", "abc"] }),
+            json!({ "validRange": { "min": "abc" } }),
+            json!({ "validRange": { "min": "1", "max": "abc" } }),
+            json!({ "validRange": { "min": "1", "step": "abc" } }),
+        ] {
+            let r: Result<DeviceCapacity, _> =
+                serde_json::from_value(json!({ "value": "1Gi", "requestPolicy": p.clone() }));
+            assert!(r.is_err(), "{p} must fail decode");
+        }
+    }
+
+    /// A zero `validRange.step` is NOT rejected before the imperative
+    /// validation: `CapacityRequestPolicyRange.Step` has no validation tag
+    /// (`pkg/apis/resource/types.go:521-546`; `zz_generated.validations.go:242`
+    /// "Device.Capacity has no validation") and `ResourceSliceStrategy.Validate`
+    /// runs `ValidateResourceSlice` first (`resourceslice/strategy.go:63`). Go
+    /// then evaluates `added%stepVal` with `stepVal == 0`
+    /// (`validation.go:1085`): an integer divide-by-zero panic, answered 500 by
+    /// `WithPanicRecovery`. Rust's `%` panics identically (#3250: replicate).
+    #[test]
+    #[should_panic(expected = "divisor of zero")]
+    fn zero_step_panics_like_go() {
+        let cap = capacity(
+            MAX,
+            Some(policy(
+                Some(ONE),
+                None,
+                Some(range(Some(ONE), None, Some("0"))),
+            )),
+        );
+        let _ = run(&cap);
     }
 }
