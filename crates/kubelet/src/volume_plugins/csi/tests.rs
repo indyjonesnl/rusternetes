@@ -1228,6 +1228,26 @@ async fn unmount_device_without_stage_capability_only_cleans_up() {
     assert!(!device.parent().unwrap().exists());
 }
 
+/// `NewDeviceUnmounter` (`csi_plugin.go:717-719`) hands back the attacher, whose
+/// `UnmountDevice` is the same `NodeUnstageVolume` path.
+#[tokio::test]
+async fn new_device_unmounter_unstages_through_the_attacher() {
+    let f = fx(
+        "devunmounter",
+        &[Cap::StageUnstageVolume],
+        Some(json!({"attachRequired": false})),
+    )
+    .await;
+    let device = staged_dir_only(&f);
+    let unmounter = DeviceMountableVolumePlugin::new_device_unmounter(&f.plugin).unwrap();
+    unmounter
+        .unmount_device(&device.to_string_lossy())
+        .await
+        .unwrap();
+    assert_eq!(f.fake.calls.lock().unwrap().unstage.len(), 1);
+    assert!(!device.parent().unwrap().exists());
+}
+
 /// "success: json file doesn't exist, unmount device is skipped" (`:1503`).
 #[tokio::test]
 async fn unmount_device_skips_when_the_data_file_is_missing() {
@@ -1326,10 +1346,13 @@ async fn desired_volume_keeps_its_device_staged() {
     let device = staged_dir_only(&f);
     let vm = volume_manager(&f.root);
     // The plugin dir is under the kubelet root; move the hand-made layout there.
-    let target = std::path::Path::new(&f.root)
-        .join("plugins/kubernetes.io/csi")
-        .join(&f.driver)
-        .join("abc");
+    // `GetDeviceMountPath` (`csi_attacher.go:598-622`) derives the directory
+    // from the driver and the sha256 of the handle, so the layout must match.
+    let target = make_device_mount_path(&plugin_dir(&f.root), &f.driver, "vol-1")
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
     std::fs::create_dir_all(target.parent().unwrap()).unwrap();
     std::fs::rename(device.parent().unwrap(), &target).unwrap();
 
@@ -1360,10 +1383,13 @@ async fn staged_device_with_an_outside_reference_is_not_unstaged() {
     )
     .await;
     let device = staged_dir_only(&f);
-    let target = std::path::Path::new(&f.root)
-        .join("plugins/kubernetes.io/csi")
-        .join(&f.driver)
-        .join("abc");
+    // `GetDeviceMountPath` (`csi_attacher.go:598-622`) derives the directory
+    // from the driver and the sha256 of the handle, so the layout must match.
+    let target = make_device_mount_path(&plugin_dir(&f.root), &f.driver, "vol-1")
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
     std::fs::create_dir_all(target.parent().unwrap()).unwrap();
     std::fs::rename(device.parent().unwrap(), &target).unwrap();
     let global = std::fs::canonicalize(target.join("globalmount")).unwrap();
