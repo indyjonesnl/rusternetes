@@ -502,7 +502,9 @@ fn openid_metadata_serves_configured_keys_3684() {
     o.jwks_uri = Some("https://keys.example.com/jwks".to_string());
     let tm = manager(&o);
 
-    let cfg = tm.openid_config_json("https://default/openid/v1/jwks").unwrap();
+    let cfg = tm
+        .openid_config_json("https://default/openid/v1/jwks")
+        .unwrap();
     assert_eq!(cfg["issuer"], ISSUER);
     assert_eq!(cfg["jwks_uri"], "https://keys.example.com/jwks");
     assert_eq!(cfg["response_types_supported"], json!(["id_token"]));
@@ -530,6 +532,8 @@ fn openid_metadata_serves_configured_keys_3684() {
 
     // Without --service-account-jwks-uri the caller's default is used.
     let tm = manager(&opts(&["rsa.pub"]));
-    let cfg = tm.openid_config_json("https://default/openid/v1/jwks").unwrap();
+    let cfg = tm
+        .openid_config_json("https://default/openid/v1/jwks")
+        .unwrap();
     assert_eq!(cfg["jwks_uri"], "https://default/openid/v1/jwks");
 }

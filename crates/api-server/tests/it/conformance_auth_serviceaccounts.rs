@@ -1604,7 +1604,10 @@ async fn oidc_discovery_reflects_configured_issuer_jwks_uri_and_keys_3684() {
     assert_eq!(status, 200, "{cfg}");
     assert_eq!(cfg["issuer"], "https://issuer.example.com");
     assert_eq!(cfg["jwks_uri"], "https://keys.example.com/jwks");
-    assert_eq!(cfg["id_token_signing_alg_values_supported"], json!(["RS256"]));
+    assert_eq!(
+        cfg["id_token_signing_alg_values_supported"],
+        json!(["RS256"])
+    );
     let (status, set) = get_json(state, "/openid/v1/jwks").await;
     assert_eq!(status, 200, "{set}");
     let keys = set["keys"].as_array().unwrap();
