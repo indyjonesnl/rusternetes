@@ -237,12 +237,13 @@ async fn always_deny_authorizer_denies_everything() {
 }
 
 // ---------------------------------------------------------------------------
-// RBACAuthorizer — system:admin bypass
+// RBACAuthorizer — no username-only system:admin bypass
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn rbac_system_admin_always_allowed() {
-    // system:admin bypasses RBAC entirely, no bindings needed.
+async fn rbac_system_admin_requires_a_binding() {
+    // rbac.go:75-80,122-126: RBAC only allows a matching rule. Privileged
+    // groups are handled separately (authorizerfactory/builtin.go:82-96).
     let store = MockAuthzStorage::new();
     let az = rbac_authorizer(store);
 
@@ -250,7 +251,10 @@ async fn rbac_system_admin_always_allowed() {
         .with_namespace("kube-system")
         .with_api_group("");
 
-    assert_eq!(az.authorize(&attrs).await.unwrap(), Decision::Allow);
+    assert_eq!(
+        az.authorize(&attrs).await.unwrap(),
+        Decision::Deny(String::new())
+    );
 }
 
 // ---------------------------------------------------------------------------
