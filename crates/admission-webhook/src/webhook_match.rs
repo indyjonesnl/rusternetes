@@ -81,6 +81,14 @@ pub fn match_webhook_conditions(
     }
 }
 
+/// `apierrors.NewForbidden(qualifiedResource, name, err)` message
+/// (staging/src/k8s.io/apimachinery/pkg/api/errors/errors.go:209-217), as
+/// `ShouldCallHook` builds it from `attr.GetResource().GroupResource()` and
+/// `attr.GetName()` (webhook.go:231-234).
+pub fn forbidden_message(group: &str, resource: &str, name: &str, err: &str) -> String {
+    format!("{resource} \"{name}\" is forbidden: {err}")
+}
+
 enum Inner {
     Matches,
     Excluded,
@@ -144,4 +152,88 @@ fn match_inner(
         };
     }
     Inner::Matches
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusternetes_common::admission::{GroupVersionKind, UserInfo};
+
+    #[test]
+    fn forbidden_message_matches_new_forbidden() {
+        // errors.go:216: `<group-resource> "<name>" is forbidden: <err>`,
+        // GroupResource.String() being `resource.group` outside core.
+        assert_eq!(
+            forbidden_message("apps", "deployments", "d", "boom"),
+            "deployments.apps \"d\" is forbidden: boom"
+        );
+        assert_eq!(
+            forbidden_message("", "configmaps", "c", "boom"),
+            "configmaps \"c\" is forbidden: boom"
+        );
+        // errors.go:213-214: no name, no quoted name.
+        assert_eq!(
+            forbidden_message("apps", "deployments", "", "boom"),
+            "deployments.apps is forbidden: boom"
+        );
+    }
+
+    fn request() -> AdmissionRequest {
+        crate::build_admission_request_for_match(
+            &rusternetes_common::admission::Operation::Create,
+            &GroupVersionKind {
+                group: String::new(),
+                version: "v1".into(),
+                kind: "ConfigMap".into(),
+            },
+            Some("default"),
+            "c",
+            Some(&serde_json::json!({"metadata": {"name": "c"}})),
+            None,
+            Some(&UserInfo {
+                username: "u".into(),
+                uid: "1".into(),
+                groups: vec![],
+            }),
+        )
+    }
+
+    fn cond(name: &str, expr: &str) -> MatchCondition {
+        MatchCondition {
+            name: name.into(),
+            expression: expr.into(),
+        }
+    }
+
+    /// `utilerrors.NewAggregate(...).Error()` (util/errors/errors.go:70-96):
+    /// several distinct errors are `[a, b]`; a single one is bare.
+    #[test]
+    fn several_errors_are_an_aggregate_in_brackets() {
+        let conds = [
+            cond("a", "object.metadata.nosuch1 == 'x'"),
+            cond("b", "object.metadata.nosuch2 == 'x'"),
+        ];
+        let r = match_webhook_conditions(
+            "agg-test",
+            "validate",
+            &conds,
+            Some(&FailurePolicy::Fail),
+            &request(),
+        );
+        let WebhookMatch::Forbidden(msg) = r else {
+            panic!("expected Forbidden, got {r:?}")
+        };
+        assert!(msg.starts_with('[') && msg.ends_with(']'), "got {msg}");
+        let one = match_webhook_conditions(
+            "agg-test-one",
+            "validate",
+            &conds[..1],
+            Some(&FailurePolicy::Fail),
+            &request(),
+        );
+        let WebhookMatch::Forbidden(msg) = one else {
+            panic!("expected Forbidden")
+        };
+        assert!(!msg.starts_with('['), "got {msg}");
+    }
 }
