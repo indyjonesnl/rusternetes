@@ -107,6 +107,7 @@ fn validate_ephemeral_containers(spec: &PodSpec, fld_path: &Path) -> ErrorList {
             spec.termination_grace_period_seconds,
             spec.os.as_ref(),
             spec.restart_policy.as_deref(),
+            spec.host_users.unwrap_or(true),
             &idx_path,
         ));
 

@@ -893,7 +893,7 @@ fn validate_host_ips(pod: &Pod, old: &Pod) -> ErrorList {
 
 /// `IsValidUserID` / `IsValidGroupID` (apimachinery util/validation/
 /// validation.go:296-309): `[0, MaxInt32]`.
-fn is_valid_id(id: i64) -> Vec<String> {
+pub(crate) fn is_valid_id(id: i64) -> Vec<String> {
     if (0..=i32::MAX as i64).contains(&id) {
         return Vec::new();
     }
