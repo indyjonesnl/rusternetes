@@ -292,6 +292,24 @@ pub fn set_node_address(
     Ok(())
 }
 
+/// `nodeutil.GetHostname` (staging/src/k8s.io/component-helpers/node/util/
+/// hostname.go:28-46). `os_hostname` is `os.Hostname`.
+pub fn get_hostname(
+    hostname_override: &str,
+    os_hostname: &dyn Fn() -> std::io::Result<String>,
+) -> Result<String, String> {
+    let _ = (hostname_override, os_hostname);
+    Err("unimplemented".into())
+}
+
+/// `utilnode.GetNodeHostIPs` (pkg/util/node/node.go:65-98).
+pub fn get_node_host_ips(
+    addresses: &[rusternetes_common::resources::NodeAddress],
+) -> Result<Vec<IpAddr>, String> {
+    let _ = addresses;
+    Err("unimplemented".into())
+}
+
 /// The setter without an external cloud provider, on a scratch node named
 /// `hostname`; returns `(type, address)` pairs.
 #[cfg(test)]
@@ -364,6 +382,97 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    // hostname_test.go TestGetHostname
+    #[test]
+    fn get_hostname_cases() {
+        let os = || Ok("OsHost".to_string());
+        assert_eq!(get_hostname("overridden", &os).unwrap(), "overridden");
+        assert_eq!(get_hostname("OVERRIDDEN", &os).unwrap(), "overridden");
+        assert_eq!(get_hostname(" OVERRIDDEN ", &os).unwrap(), "overridden");
+        assert_eq!(
+            get_hostname(" ", &os).unwrap_err(),
+            "empty hostname is invalid"
+        );
+        // empty parameter: os.Hostname(), lowercased.
+        assert_eq!(get_hostname("", &os).unwrap(), "oshost");
+        // os.Hostname failure.
+        let bad = || Err(std::io::Error::other("boom"));
+        assert!(get_hostname("", &bad)
+            .unwrap_err()
+            .starts_with("couldn't determine hostname: "));
+        // os hostname that is only whitespace.
+        let blank = || Ok("  ".to_string());
+        assert_eq!(
+            get_hostname("", &blank).unwrap_err(),
+            "empty hostname is invalid"
+        );
+    }
+
+    // pkg/util/node/node_test.go TestGetNodeHostIPs
+    #[test]
+    fn get_node_host_ips_cases() {
+        let a = |t: &str, v: &str| rusternetes_common::resources::NodeAddress {
+            address_type: t.to_string(),
+            address: v.to_string(),
+        };
+        let ips = |l: &[&str]| l.iter().map(|s| ip(s)).collect::<Vec<_>>();
+        assert!(get_node_host_ips(&[]).is_err());
+        assert!(get_node_host_ips(&[a("Hostname", "example.com")]).is_err());
+        let err = get_node_host_ips(&[a("Hostname", "example.com")]).unwrap_err();
+        assert!(
+            err.starts_with("host IP unknown; known addresses: "),
+            "{err}"
+        );
+        // IPv4-only, simple
+        assert_eq!(
+            get_node_host_ips(&[
+                a("InternalIP", "1.2.3.4"),
+                a("ExternalIP", "4.3.2.1"),
+                a("ExternalIP", "4.3.2.2")
+            ])
+            .unwrap(),
+            ips(&["1.2.3.4"])
+        );
+        // external-first
+        assert_eq!(
+            get_node_host_ips(&[
+                a("ExternalIP", "4.3.2.1"),
+                a("ExternalIP", "4.3.2.2"),
+                a("InternalIP", "1.2.3.4")
+            ])
+            .unwrap(),
+            ips(&["1.2.3.4"])
+        );
+        // no internal
+        assert_eq!(
+            get_node_host_ips(&[a("ExternalIP", "4.3.2.1"), a("ExternalIP", "4.3.2.2")]).unwrap(),
+            ips(&["4.3.2.1"])
+        );
+        // dual-stack node
+        assert_eq!(
+            get_node_host_ips(&[
+                a("InternalIP", "1.2.3.4"),
+                a("ExternalIP", "4.3.2.1"),
+                a("ExternalIP", "4.3.2.2"),
+                a("InternalIP", "a:b::c:d"),
+                a("ExternalIP", "d:c::b:a")
+            ])
+            .unwrap(),
+            ips(&["1.2.3.4", "a:b::c:d"])
+        );
+        // dual-stack node, IPv6-first, no internal IPv4
+        assert_eq!(
+            get_node_host_ips(&[
+                a("InternalIP", "a:b::c:d"),
+                a("ExternalIP", "d:c::b:a"),
+                a("ExternalIP", "4.3.2.1"),
+                a("ExternalIP", "4.3.2.2")
+            ])
+            .unwrap(),
+            ips(&["a:b::c:d", "4.3.2.1"])
+        );
     }
 
     // ips_test.go TestParseNodeIPArgument

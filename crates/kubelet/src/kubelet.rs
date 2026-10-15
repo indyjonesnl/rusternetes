@@ -364,6 +364,9 @@ struct RestartBackoff {
 
 pub struct Kubelet {
     node_name: String,
+    /// `Kubelet.hostname` (kubelet.go:1137): `nodeutil.GetHostname(
+    /// --hostname-override)`, distinct from `nodeName`.
+    hostname: String,
     storage: Arc<StorageBackend>,
     /// `kubelet.podCertificateManager` (`kubelet.go:1242-1245`): fed by
     /// `pod_cache.reconcile` as pods are added to / dropped from the node, and
@@ -751,6 +754,7 @@ impl Kubelet {
         crate::eviction::log_statvfs_path(&eviction_root_dir);
 
         Ok(Self {
+            hostname: node_name.clone(),
             node_name,
             storage,
             pod_certificate_manager,
@@ -888,6 +892,12 @@ impl Kubelet {
 
     /// `Kubelet.nodeIPValidator` override (defaults to `validateNodeIP`,
     /// kubelet_node_status.go:706-740).
+    #[allow(dead_code)]
+    pub fn with_hostname(self, hostname: &str) -> Self {
+        let _ = hostname;
+        self
+    }
+
     pub fn with_node_ip_validator(
         mut self,
         validator: impl Fn(std::net::IpAddr) -> Result<(), String> + Send + Sync + 'static,
@@ -1650,6 +1660,30 @@ impl Kubelet {
     /// from the node on every status sync (see `update_node_status`).
     fn node_internal_ip(&self) -> String {
         self.internal_ips.lock().unwrap()[0].clone()
+    }
+
+    /// `kl.getHostIPsAnyWay()` (kubelet_getters.go:318-326).
+    #[allow(dead_code)]
+    fn get_host_ips_any_way(&self) -> Result<Vec<std::net::IpAddr>, String> {
+        self.node_internal_ip()
+            .parse()
+            .map(|ip| vec![ip])
+            .map_err(|e| format!("{e}"))
+    }
+
+    /// Pod `status.hostIP` / `status.hostIPs` (kubelet_pods.go:2005-2024).
+    #[allow(dead_code)]
+    fn host_ip_fields(
+        &self,
+    ) -> (
+        Option<String>,
+        Option<Vec<rusternetes_common::resources::pod::HostIP>>,
+    ) {
+        let ip = self.node_internal_ip();
+        (
+            Some(ip.clone()),
+            Some(vec![rusternetes_common::resources::pod::HostIP { ip }]),
+        )
     }
 
     /// `nodestatus.NodeAddress(kl.nodeIPs, kl.nodeIPValidator, kl.hostname,
@@ -6634,6 +6668,17 @@ mod tests {
         ips: &[&str],
         external: bool,
     ) -> Kubelet {
+        node_ip_kubelet_h(dir, storage, name, None, ips, external).await
+    }
+
+    async fn node_ip_kubelet_h(
+        dir: &tempfile::TempDir,
+        storage: std::sync::Arc<rusternetes_storage::StorageBackend>,
+        name: &str,
+        hostname: Option<&str>,
+        ips: &[&str],
+        external: bool,
+    ) -> Kubelet {
         let sock = dir.path().join("absent.sock");
         std::env::set_var(
             "CONTAINER_RUNTIME_ENDPOINT",
@@ -6658,6 +6703,10 @@ mod tests {
         .await
         .unwrap()
         .with_node_ip_validator(|_| Ok(()));
+        let k = match hostname {
+            Some(h) => k.with_hostname(h),
+            None => k,
+        };
         k.update_runtime_up().await;
         k.register_node().await.unwrap();
         k
@@ -6813,6 +6862,90 @@ mod tests {
             .clone()
             .unwrap_or_default()
             .contains_key("alpha.kubernetes.io/provided-node-ip"));
+    }
+
+    /// #3585: `kl.hostname` (nodeutil.GetHostname(--hostname-override)) is
+    /// distinct from `nodeName`: the Hostname address (setters.go:128-130) and
+    /// the `kubernetes.io/hostname` label (kubelet_node_status.go:306) carry
+    /// the hostname, the Node object keeps `nodeName`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn hostname_is_distinct_from_node_name() {
+        use rusternetes_storage::StorageBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(StorageBackend::new_memory());
+        let _k = node_ip_kubelet_h(
+            &dir,
+            storage.clone(),
+            "node-a",
+            Some("host-a"),
+            &["10.1.1.1"],
+            false,
+        )
+        .await;
+        let n = get_node(&storage, "node-a").await;
+        assert_eq!(n.metadata.name, "node-a");
+        assert_eq!(
+            node_addrs(&n),
+            vec![pair("InternalIP", "10.1.1.1"), pair("Hostname", "host-a")]
+        );
+        assert_eq!(
+            n.metadata.labels.as_ref().unwrap()["kubernetes.io/hostname"],
+            "host-a"
+        );
+    }
+
+    /// #3585: setters.go:166-171 looks up `node.Name` only; the pre-existing
+    /// `$HOSTNAME` retry is gone.
+    #[test]
+    #[serial_test::serial]
+    fn lookup_node_ips_has_no_hostname_env_fallback() {
+        std::env::set_var("HOSTNAME", "localhost");
+        let found = Kubelet::lookup_node_ips("no-such-host.invalid");
+        std::env::remove_var("HOSTNAME");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// #3584: pod hostIPs come from the node's status addresses
+    /// (getHostIPsAnyWay -> GetNodeHostIPs), no invented fallback IP.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn host_ips_follow_node_addresses_without_invented_fallback() {
+        use rusternetes_storage::StorageBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(StorageBackend::new_memory());
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        let k = node_ip_kubelet(&dir, storage.clone(), "node-s", &["10.1.1.1"], false).await;
+        assert_eq!(k.get_host_ips_any_way().unwrap(), vec![ip("10.1.1.1")]);
+        let k = node_ip_kubelet(
+            &dir,
+            storage.clone(),
+            "node-d",
+            &["10.1.1.2", "fd00::2"],
+            false,
+        )
+        .await;
+        assert_eq!(
+            k.get_host_ips_any_way().unwrap(),
+            vec![ip("10.1.1.2"), ip("fd00::2")]
+        );
+        let (host_ip, host_ips) = k.host_ip_fields();
+        assert_eq!(host_ip.as_deref(), Some("10.1.1.2"));
+        let host_ips: Vec<String> = host_ips.unwrap().into_iter().map(|h| h.ip).collect();
+        assert_eq!(
+            host_ips,
+            vec!["10.1.1.2".to_string(), "fd00::2".to_string()]
+        );
+        // --cloud-provider=external without --node-ip: Hostname only
+        // (setters.go:130-135) => host IP unknown, hostIP left unset.
+        let k = node_ip_kubelet(&dir, storage.clone(), "node-x", &[], true).await;
+        let err = k.get_host_ips_any_way().unwrap_err();
+        assert!(
+            err.starts_with("host IP unknown; known addresses: "),
+            "{err}"
+        );
+        let (host_ip, host_ips) = k.host_ip_fields();
+        assert!(host_ip.is_none() && host_ips.is_none());
     }
 
     /// #3542: nodeIPs live on the Kubelet (createAndInitKubelet ->
