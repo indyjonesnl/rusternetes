@@ -4,8 +4,8 @@ use super::controller_utils::{
 };
 use super::expectations::ControllerExpectations;
 use super::pod_informer::{
-    apply_pod_observation, ControllerRef, PodEventTarget, PodInformerCache, PodObservation,
-    ResolvedController,
+    apply_pod_observation, ControllerRef, PodEventTarget, PodObservation, ResolvedController,
+    SharedPodInformer,
 };
 use super::replicationcontroller::{
     generate_pod_name, is_namespace_terminating_rejection, slow_start_batches, BURST_REPLICAS,
@@ -17,7 +17,9 @@ use rusternetes_common::{
     resources::{Pod, PodStatus, ReplicaSet, ReplicaSetStatus},
     types::{label_selector_as_selector, ObjectMeta, Phase, Selector},
 };
-use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WatchEvent, WorkQueue};
+#[cfg(test)]
+use rusternetes_storage::WatchEvent;
+use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::collections::HashMap;
 use std::{sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};
@@ -48,16 +50,30 @@ pub struct ReplicaSetController<S: Storage> {
     /// add-versus-update, and the adds/deletes a watch gap hid
     /// ([`super::pod_informer`]). The handlers, not the sync, lower
     /// `expectations` (replica_set.go:436, :568).
-    pod_cache: PodInformerCache,
+    pod_informer: Arc<SharedPodInformer<S>>,
 }
 
 impl<S: Storage + 'static> ReplicaSetController<S> {
+    #[allow(dead_code)] // the binary shares one informer via `with_pod_informer`
     pub fn new(storage: Arc<S>, interval_secs: u64) -> Self {
+        let interval = Duration::from_secs(interval_secs);
+        let pod_informer = Arc::new(SharedPodInformer::new(storage.clone(), interval));
+        Self::with_pod_informer(storage, interval_secs, pod_informer)
+    }
+
+    /// A controller whose pod event handlers hang off an informer shared with
+    /// other controllers (upstream builds one `PodInformer` from the shared
+    /// informer factory and hands it to every controller).
+    pub(crate) fn with_pod_informer(
+        storage: Arc<S>,
+        interval_secs: u64,
+        pod_informer: Arc<SharedPodInformer<S>>,
+    ) -> Self {
         Self {
             storage,
             interval: Duration::from_secs(interval_secs),
             expectations: Arc::new(ControllerExpectations::new()),
-            pod_cache: PodInformerCache::new(),
+            pod_informer,
         }
     }
 
@@ -118,6 +134,15 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
             }
         });
 
+        // Upstream's controller registers its handlers on the shared pod
+        // informer (`podInformer.Informer().AddEventHandler`, replica_set.go:207,
+        // NewBaseController) and the informer factory runs the one watch; the
+        // first controller to get here starts it.
+        self.pod_informer
+            .add_event_handler(Arc::clone(&self), queue.clone())
+            .await;
+        self.pod_informer.start();
+
         loop {
             // Initial full reconciliation
             self.enqueue_all(&queue).await;
@@ -136,24 +161,6 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
                     continue;
                 }
             };
-
-            let pod_prefix = build_prefix("pods", None);
-            let mut pod_watch = match self.storage.watch(&pod_prefix).await {
-                Ok(w) => w,
-                Err(e) => {
-                    error!(
-                        "Failed to establish pod watch: {}, retrying in {:?}",
-                        e, self.interval
-                    );
-                    tokio::time::sleep(self.interval).await;
-                    continue;
-                }
-            };
-
-            // The reflector's list: with the watch established first, nothing
-            // that happens from here on is missed, and the pods created or
-            // deleted while the previous watch was down are observed now.
-            self.relist_pods(&queue).await;
 
             // Periodic full resync as safety net
             let mut resync = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -174,21 +181,6 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
                             }
                             None => {
                                 warn!("Watch stream ended, reconnecting");
-                                watch_broken = true;
-                            }
-                        }
-                    }
-                    event = pod_watch.next() => {
-                        match event {
-                            Some(Ok(ev)) => {
-                                self.enqueue_owner_replicaset(&queue, &ev).await;
-                            }
-                            Some(Err(e)) => {
-                                warn!("Pod watch error: {}, reconnecting", e);
-                                watch_broken = true;
-                            }
-                            None => {
-                                warn!("Pod watch stream ended, reconnecting");
                                 watch_broken = true;
                             }
                         }
@@ -264,7 +256,7 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
     async fn relist_pods(&self, queue: &WorkQueue) {
         match self.storage.list::<Pod>(&build_prefix("pods", None)).await {
             Ok(pods) => {
-                for observation in self.pod_cache.replace(&pods) {
+                for observation in self.pod_informer.cache().replace(&pods) {
                     self.apply_observation(queue, &observation).await;
                 }
             }
@@ -282,8 +274,9 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
 
     /// One pod watch event through the informer handlers: `addPod`,
     /// `updatePod` or `deletePod`, whichever the pod cache says it is.
+    #[cfg(test)]
     async fn enqueue_owner_replicaset(&self, queue: &WorkQueue, event: &WatchEvent) {
-        if let Some(observation) = self.pod_cache.on_event(event) {
+        if let Some(observation) = self.pod_informer.cache().on_event(event) {
             self.apply_observation(queue, &observation).await;
         }
     }

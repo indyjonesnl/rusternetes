@@ -905,9 +905,16 @@ async fn main() -> Result<()> {
     });
 
     // Start replicationcontroller controller
-    let rc_controller = Arc::new(ReplicationControllerController::new(
+    // One pod informer (one watch, one cache) feeds both controllers' pod
+    // event handlers (client-go `sharedIndexInformer` + `sharedProcessor`).
+    let pod_informer = Arc::new(controllers::pod_informer::SharedPodInformer::new(
+        storage.clone(),
+        std::time::Duration::from_secs(args.sync_interval),
+    ));
+    let rc_controller = Arc::new(ReplicationControllerController::with_pod_informer(
         storage.clone(),
         args.sync_interval,
+        pod_informer.clone(),
     ));
     spawn_controller!("ReplicationController controller", leader_elector, {
         let controller = rc_controller.clone();
@@ -919,9 +926,10 @@ async fn main() -> Result<()> {
     });
 
     // Start ReplicaSet controller
-    let replicaset_controller = Arc::new(ReplicaSetController::new(
+    let replicaset_controller = Arc::new(ReplicaSetController::with_pod_informer(
         storage.clone(),
         args.sync_interval,
+        pod_informer,
     ));
     spawn_controller!("ReplicaSet controller", leader_elector, {
         let controller = replicaset_controller.clone();
