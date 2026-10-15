@@ -15,9 +15,8 @@
 //! `pkg/api/meta/restmapper.go`), the rule the generated REST mapping uses.
 //!
 //! The endpoint-level `Warning:` header (`installer.go:814`
-//! `utilwarning.AddWarningsHandler`) is not wired: [`warning_message`] is
-//! ported and tested but the per-request warning recorder it feeds does not
-//! exist yet.
+//! `utilwarning.AddWarningsHandler`) is [`endpoint_warnings`], added by
+//! `crate::endpoints::warning::add_warnings_handler`.
 
 mod table;
 
@@ -88,7 +87,6 @@ pub fn removed_release(obj: Option<&Lifecycle>) -> String {
 }
 
 /// `WarningMessage` (deprecation.go:93-123).
-#[allow(dead_code)] // bin target: awaits the per-request warning recorder
 pub fn warning_message(obj: Option<&Lifecycle>) -> String {
     let Some(obj) = obj else { return String::new() };
     let (dep_major, dep_minor) = obj.deprecated;
@@ -118,7 +116,6 @@ pub fn warning_message(obj: Option<&Lifecycle>) -> String {
 }
 
 /// `GroupVersion.String()`.
-#[allow(dead_code)]
 fn group_version_string(group: &str, version: &str) -> String {
     match (group.is_empty(), version.is_empty()) {
         (true, _) => version.to_string(),
@@ -203,12 +200,18 @@ pub fn deprecation_for(
 /// route's `deprecation.WarningMessage` when the kind it serves is deprecated
 /// at [`CURRENT_MAJOR_MINOR`], else none.
 pub fn endpoint_warnings(
-    _group: &str,
-    _version: &str,
-    _resource: &str,
-    _subresource: &str,
+    group: &str,
+    version: &str,
+    resource: &str,
+    subresource: &str,
 ) -> Vec<String> {
-    Vec::new()
+    let obj = lookup(group, version, resource, subresource);
+    let (major, minor) = CURRENT_MAJOR_MINOR;
+    let mut warnings = Vec::new();
+    if is_deprecated(obj, major as i64, minor as i64) {
+        warnings.push(warning_message(obj));
+    }
+    warnings
 }
 
 #[cfg(test)]

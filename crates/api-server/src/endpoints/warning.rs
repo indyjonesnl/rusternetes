@@ -30,11 +30,57 @@ pub async fn add_warnings_handler(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    next.run(req).await
+    // Routes are installed for resources only (`registerResourceHandlers`), so
+    // a non-resource request has no endpoint-level warnings.
+    let attrs = crate::audit::request_info(req.method(), req.uri().path(), req.uri().query());
+    let warnings = if attrs.is_resource_request {
+        crate::deprecation::endpoint_warnings(
+            &attrs.api_group,
+            &attrs.api_version,
+            &attrs.resource,
+            &attrs.subresource,
+        )
+    } else {
+        Vec::new()
+    };
+    let mut resp = next.run(req).await;
+    // warning.go:28-30: `if len(warnings) == 0 { return handler }`.
+    if !warnings.is_empty() {
+        add_route_warnings(resp.headers_mut(), &warnings);
+    }
+    resp
 }
 
-/// Record `route_warnings` ahead of the warnings the handler already wrote.
-pub fn add_route_warnings(_headers: &mut HeaderMap, _route_warnings: &[String]) {}
+/// Record `route_warnings` ahead of the warnings the handler already wrote,
+/// as `recorder.AddWarning` (filters/warning.go:69-92) would have had they
+/// been added first: an empty text is dropped, a repeated text is recorded
+/// once, and a text `net.NewWarningHeader` rejects (control characters,
+/// apimachinery util/net/http.go:664-666) is not written.
+pub fn add_route_warnings(headers: &mut HeaderMap, route_warnings: &[String]) {
+    let written: Vec<HeaderValue> = headers.get_all(header::WARNING).iter().cloned().collect();
+    headers.remove(header::WARNING);
+    let mut recorded: Vec<HeaderValue> = Vec::new();
+    for text in route_warnings {
+        if text.is_empty() || text.chars().any(char::is_control) {
+            continue;
+        }
+        let value = crate::handlers::validation::format_warning_header(text);
+        let Ok(value) = HeaderValue::from_str(&value) else {
+            continue;
+        };
+        if !recorded.contains(&value) {
+            recorded.push(value);
+        }
+    }
+    for value in written {
+        if !recorded.contains(&value) {
+            recorded.push(value);
+        }
+    }
+    for value in recorded {
+        headers.append(header::WARNING, value);
+    }
+}
 
 #[cfg(test)]
 mod tests {

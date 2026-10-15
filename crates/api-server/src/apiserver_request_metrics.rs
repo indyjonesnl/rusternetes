@@ -31,7 +31,7 @@
 //! connections are not held open by it; (4) `deprecated`/`removedRelease` are
 //! resolved per request from `crate::deprecation` instead of being captured
 //! per route at install time (`installer.go:781-797`); the endpoint-level
-//! `Warning:` header is not emitted.
+//! `Warning:` header is `crate::endpoints::warning::add_warnings_handler`.
 
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;

@@ -2758,6 +2758,11 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         protected_routes = protected_routes.layer(axum_middleware::from_fn(
             crate::apiserver_request_metrics::instrument_request,
         ));
+        // `AddWarningsHandler` wraps `InstrumentRouteFunc` (installer.go:810-814):
+        // a deprecated route's warning is recorded before the handler runs.
+        protected_routes = protected_routes.layer(axum_middleware::from_fn(
+            crate::endpoints::warning::add_warnings_handler,
+        ));
         // WithAuthorization is the innermost filter: after authentication,
         // audit, impersonation and priority-and-fairness, around the handler
         // (server/config.go:1015-1043).
@@ -2822,6 +2827,11 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         // counts every request the handler chain serves.
         protected_routes = protected_routes.layer(axum_middleware::from_fn(
             crate::apiserver_request_metrics::instrument_request,
+        ));
+        // `AddWarningsHandler` wraps `InstrumentRouteFunc` (installer.go:810-814):
+        // a deprecated route's warning is recorded before the handler runs.
+        protected_routes = protected_routes.layer(axum_middleware::from_fn(
+            crate::endpoints::warning::add_warnings_handler,
         ));
         // WithAuthorization is the innermost filter: after authentication,
         // audit, impersonation and priority-and-fairness, around the handler
