@@ -16,6 +16,9 @@ use std::sync::Arc;
 
 pub struct EtcdStorage {
     client: Client,
+    /// Keeps the loopback bridges of any `unix:` endpoints alive (see
+    /// `etcd_endpoint`); aborted when the last clone of the storage drops.
+    _unix_bridges: Arc<Vec<crate::etcd_endpoint::UnixBridge>>,
     /// Highest revision the backend is known to have compacted away, or 0 when
     /// nothing is known yet.
     ///
@@ -147,6 +150,7 @@ fn prefix_range_end(prefix: &[u8]) -> Vec<u8> {
 impl EtcdStorage {
     /// Create a new EtcdStorage instance
     pub async fn new(endpoints: Vec<String>) -> Result<Self> {
+        let (endpoints, bridges) = crate::etcd_endpoint::resolve_endpoints(endpoints).await?;
         let options = Some(
             etcd_client::ConnectOptions::new()
                 .with_keep_alive(
@@ -163,6 +167,7 @@ impl EtcdStorage {
 
         Ok(Self {
             client,
+            _unix_bridges: Arc::new(bridges),
             page_size: DEFAULT_LIST_PAGE_SIZE,
             compact_revision: Arc::new(AtomicI64::new(0)),
             leases: Arc::new(LeaseManager::new()),
