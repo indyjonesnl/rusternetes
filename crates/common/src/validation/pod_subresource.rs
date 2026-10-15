@@ -20,7 +20,8 @@ use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::objectmeta::{
     name_is_dns_subdomain, validate_object_meta, validate_object_meta_update,
 };
-use crate::validation::pod::{validate_container, validate_pod_create};
+use crate::validation::pod::{validate_container, validate_pod_create_with_options};
+use crate::validation::pod_options::get_validation_options_from_pod_spec_and_meta;
 use crate::validation::pod_status::validate_pod_metadata_annotations_with_opts;
 
 /// `core.MirrorPodAnnotationKey`.
@@ -49,8 +50,15 @@ fn validate_pod_metadata_and_spec(
     // `ValidatePodSpec` (validation.go:4643) validates the ephemeral
     // containers; "cannot be set on create" belongs to `ValidatePodCreate`
     // (validation.go:5605-5608), not to `validatePodMetadataAndSpec`.
+    // `GetValidationOptionsFromPodSpecAndMeta(&pod.Spec, &oldPod.Spec, ...)`
+    // (strategy.go) - derived from the old pod when there is one.
+    let mut opts = get_validation_options_from_pod_spec_and_meta(
+        pod.spec.as_ref(),
+        old.and_then(|o| o.spec.as_ref()),
+    );
+    opts.allow_relaxed_dns_search_validation |= enabled(Feature::RelaxedDNSSearchValidation);
     errs.extend(
-        validate_pod_create(pod, enabled(Feature::RelaxedDNSSearchValidation))
+        validate_pod_create_with_options(pod, &opts)
             .into_iter()
             .filter(|e| {
                 !(e.field == "spec.ephemeralContainers" && e.detail == "cannot be set on create")

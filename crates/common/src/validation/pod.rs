@@ -40,6 +40,9 @@ use crate::validation::metav1::{
     is_qualified_name, is_valid_label_value, validate_label_name, validate_label_selector,
     LabelSelectorValidationOptions,
 };
+use crate::validation::pod_options::{
+    get_validation_options_from_pod_spec_and_meta, PodValidationOptions,
+};
 use once_cell::sync::Lazy;
 use regex::Regex;
 
@@ -131,6 +134,19 @@ fn validate_port_num_or_name(port: &IntOrString, fld_path: &Path) -> ErrorList {
 /// `allow_relaxed_dns_search` should be wired from the
 /// `RelaxedDNSSearchValidation` feature gate.
 pub fn validate_pod_create(pod: &Pod, allow_relaxed_dns_search: bool) -> ErrorList {
+    // `GetValidationOptionsFromPodSpecAndMeta(spec, nil, ...)`: a create has
+    // no old spec, so the gates alone decide.
+    let opts = pod.spec.as_ref().map(|spec| {
+        let mut opts = get_validation_options_from_pod_spec_and_meta(Some(spec), None);
+        opts.allow_relaxed_dns_search_validation |= allow_relaxed_dns_search;
+        opts
+    });
+    validate_pod_create_with_options(pod, &opts.unwrap_or_default())
+}
+
+/// [`validate_pod_create`] with the options already derived. Callers that
+/// have an old object (`ValidatePodResize`) derive them from it.
+pub fn validate_pod_create_with_options(pod: &Pod, opts: &PodValidationOptions) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     let spec_path = Path::new("spec");
 
@@ -142,14 +158,7 @@ pub fn validate_pod_create(pod: &Pod, allow_relaxed_dns_search: bool) -> ErrorLi
         return errs;
     };
 
-    // `GetValidationOptionsFromPodSpecAndMeta(spec, nil, ...)` (util.go:444):
-    // a create has no old spec, so the gate alone decides.
-    errs.extend(validate_pod_spec(
-        spec,
-        &spec_path,
-        allow_relaxed_dns_search,
-        allow_taint_toleration_comparison_operators(None),
-    ));
+    errs.extend(validate_pod_spec_with_options(spec, &spec_path, opts));
     // `validatePodMetadataAndSpec` runs the pod-only rules for both
     // `ValidatePodCreate` (validation.go:5602) and `ValidatePodResize`
     // (:6221). ServiceAccount admission has already defaulted
@@ -236,13 +245,9 @@ pub fn validate_pod_update(
     ));
     errs.extend(crate::validation::pod_status::validate_pod_metadata_annotations(new, Some(old)));
     if let Some(spec) = new.spec.as_ref() {
-        errs.extend(validate_pod_spec_for(
-            spec,
-            &spec_path,
-            allow_relaxed_dns_search,
-            allow_taint_toleration_comparison_operators(old.spec.as_ref()),
-            false,
-        ));
+        let mut opts = get_validation_options_from_pod_spec_and_meta(Some(spec), old.spec.as_ref());
+        opts.allow_relaxed_dns_search_validation |= allow_relaxed_dns_search;
+        errs.extend(validate_pod_spec_for(spec, &spec_path, &opts, false));
         errs.extend(validate_pod_only_rules(spec, &spec_path));
     }
     if let (Some(o), Some(n)) = (old.spec.as_ref(), new.spec.as_ref()) {
@@ -263,13 +268,19 @@ pub fn validate_pod_spec(
     allow_relaxed_dns_search: bool,
     allow_taint_toleration_comparison_operators: bool,
 ) -> ErrorList {
-    validate_pod_spec_for(
-        spec,
-        fld_path,
-        allow_relaxed_dns_search,
-        allow_taint_toleration_comparison_operators,
-        true,
-    )
+    let mut opts = get_validation_options_from_pod_spec_and_meta(Some(spec), None);
+    opts.allow_relaxed_dns_search_validation |= allow_relaxed_dns_search;
+    opts.allow_taint_toleration_comparison_operators = allow_taint_toleration_comparison_operators;
+    validate_pod_spec_with_options(spec, fld_path, &opts)
+}
+
+/// `ValidatePodSpec(spec, ..., opts)` with caller-derived options.
+pub fn validate_pod_spec_with_options(
+    spec: &PodSpec,
+    fld_path: &Path,
+    opts: &PodValidationOptions,
+) -> ErrorList {
+    validate_pod_spec_for(spec, fld_path, opts, true)
 }
 
 /// `validate_pod_spec` with the create-only rule made optional:
@@ -280,10 +291,12 @@ pub fn validate_pod_spec(
 fn validate_pod_spec_for(
     spec: &PodSpec,
     fld_path: &Path,
-    allow_relaxed_dns_search: bool,
-    allow_taint_toleration_comparison_operators: bool,
+    opts: &PodValidationOptions,
     forbid_ephemeral_containers: bool,
 ) -> ErrorList {
+    let allow_relaxed_dns_search = opts.allow_relaxed_dns_search_validation;
+    let allow_taint_toleration_comparison_operators =
+        opts.allow_taint_toleration_comparison_operators;
     let mut errs: ErrorList = Vec::new();
     let containers_path = fld_path.child("containers");
 
@@ -458,7 +471,7 @@ fn validate_pod_spec_for(
 
     // Volumes: unique names.
     if let Some(ref vols) = spec.volumes {
-        errs.extend(validate_volumes(vols, &fld_path.child("volumes")));
+        errs.extend(validate_volumes(vols, &fld_path.child("volumes"), opts));
     }
 
     // Tolerations.
@@ -475,6 +488,7 @@ fn validate_pod_spec_for(
         errs.extend(validate_topology_spread_constraints(
             tscs,
             &fld_path.child("topologySpreadConstraints"),
+            opts,
         ));
     }
 
@@ -495,7 +509,13 @@ fn validate_pod_spec_for(
     // `pkg/apis/core/validation/validation.go:5563` and `:5565`).
     if let Some(ref sc) = spec.security_context {
         let sc_path = fld_path.child("securityContext");
-        errs.extend(validate_sysctls(sc, &sc_path.child("sysctls")));
+        errs.extend(validate_sysctls(
+            sc,
+            spec.host_network.unwrap_or(false),
+            spec.host_ipc.unwrap_or(false),
+            opts,
+            &sc_path.child("sysctls"),
+        ));
         if let Some(ref sp) = sc.seccomp_profile {
             errs.extend(validate_seccomp_profile(
                 sp,
@@ -545,6 +565,7 @@ fn validate_pod_spec_for(
         if let Some(na) = affinity.node_affinity.as_ref() {
             errs.extend(validate_node_affinity(
                 na,
+                opts,
                 &affinity_path.child("nodeAffinity"),
             ));
         }
@@ -554,12 +575,14 @@ fn validate_pod_spec_for(
                 pa.required_during_scheduling_ignored_during_execution
                     .as_deref()
                     .unwrap_or(&[]),
+                opts.allow_invalid_label_value_in_selector,
                 &path.child("requiredDuringSchedulingIgnoredDuringExecution"),
             ));
             errs.extend(validate_weighted_pod_affinity_terms(
                 pa.preferred_during_scheduling_ignored_during_execution
                     .as_deref()
                     .unwrap_or(&[]),
+                opts.allow_invalid_label_value_in_selector,
                 &path.child("preferredDuringSchedulingIgnoredDuringExecution"),
             ));
         }
@@ -569,12 +592,14 @@ fn validate_pod_spec_for(
                 paa.required_during_scheduling_ignored_during_execution
                     .as_deref()
                     .unwrap_or(&[]),
+                opts.allow_invalid_label_value_in_selector,
                 &path.child("requiredDuringSchedulingIgnoredDuringExecution"),
             ));
             errs.extend(validate_weighted_pod_affinity_terms(
                 paa.preferred_during_scheduling_ignored_during_execution
                     .as_deref()
                     .unwrap_or(&[]),
+                opts.allow_invalid_label_value_in_selector,
                 &path.child("preferredDuringSchedulingIgnoredDuringExecution"),
             ));
         }
@@ -593,14 +618,19 @@ fn validate_pod_spec_for(
 
 /// Port of upstream `validateNodeAffinity`
 /// (`pkg/apis/core/validation/validation.go:5209-5223`).
-fn validate_node_affinity(na: &NodeAffinity, fld_path: &Path) -> ErrorList {
+fn validate_node_affinity(
+    na: &NodeAffinity,
+    opts: &PodValidationOptions,
+    fld_path: &Path,
+) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     if let Some(required) = na
         .required_during_scheduling_ignored_during_execution
         .as_ref()
     {
-        errs.extend(validate_node_selector(
+        errs.extend(validate_node_selector_with_options(
             required,
+            opts.allow_invalid_label_value_in_required_node_affinity,
             &fld_path.child("requiredDuringSchedulingIgnoredDuringExecution"),
         ));
     }
@@ -624,6 +654,15 @@ pub(crate) fn validate_node_selector(
     node_selector: &crate::resources::pod::NodeSelector,
     fld_path: &Path,
 ) -> ErrorList {
+    validate_node_selector_with_options(node_selector, false, fld_path)
+}
+
+/// `ValidateNodeSelector(nodeSelector, allowInvalidLabelValueInRequiredNodeAffinity, ...)`.
+pub(crate) fn validate_node_selector_with_options(
+    node_selector: &crate::resources::pod::NodeSelector,
+    allow_invalid_label_value: bool,
+    fld_path: &Path,
+) -> ErrorList {
     let terms_path = fld_path.child("nodeSelectorTerms");
     if node_selector.node_selector_terms.is_empty() {
         return vec![Error::required(
@@ -633,14 +672,22 @@ pub(crate) fn validate_node_selector(
     }
     let mut errs: ErrorList = Vec::new();
     for (i, term) in node_selector.node_selector_terms.iter().enumerate() {
-        errs.extend(validate_node_selector_term(term, &terms_path.index(i)));
+        errs.extend(validate_node_selector_term(
+            term,
+            allow_invalid_label_value,
+            &terms_path.index(i),
+        ));
     }
     errs
 }
 
 /// Port of upstream `ValidateNodeSelectorTerm`
 /// (`pkg/apis/core/validation/validation.go:5019-5032`).
-fn validate_node_selector_term(term: &NodeSelectorTerm, fld_path: &Path) -> ErrorList {
+fn validate_node_selector_term(
+    term: &NodeSelectorTerm,
+    allow_invalid_label_value: bool,
+    fld_path: &Path,
+) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     for (i, req) in term
         .match_expressions
@@ -651,6 +698,7 @@ fn validate_node_selector_term(term: &NodeSelectorTerm, fld_path: &Path) -> Erro
     {
         errs.extend(validate_node_selector_requirement(
             req,
+            allow_invalid_label_value,
             &fld_path.child("matchExpressions").index(i),
         ));
     }
@@ -674,6 +722,7 @@ fn validate_node_selector_term(term: &NodeSelectorTerm, fld_path: &Path) -> Erro
 /// how many values are allowed, and the key is a label name.
 fn validate_node_selector_requirement(
     req: &crate::resources::pod::NodeSelectorRequirement,
+    allow_invalid_label_value: bool,
     fld_path: &Path,
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
@@ -713,9 +762,12 @@ fn validate_node_selector_requirement(
     }
 
     errs.extend(validate_label_name(&req.key, &fld_path.child("key")));
-    for (i, value) in values.iter().enumerate() {
-        for msg in crate::validation::metav1::is_valid_label_value(value) {
-            errs.push(Error::invalid(&values_path.index(i), value.clone(), msg));
+    // `if !allowInvalidLabelValueInRequiredNodeAffinity` (:4976).
+    if !allow_invalid_label_value {
+        for (i, value) in values.iter().enumerate() {
+            for msg in crate::validation::metav1::is_valid_label_value(value) {
+                errs.push(Error::invalid(&values_path.index(i), value.clone(), msg));
+            }
         }
     }
     errs
@@ -776,60 +828,28 @@ fn validate_preferred_scheduling_terms(
                 "must be in the range 1-100",
             ));
         }
+        // `ValidateNodeSelectorTerm(term.Preference, false, ...)`: preferred
+        // terms are always strict about label values.
         errs.extend(validate_node_selector_term(
             &term.preference,
+            false,
             &idx.child("preference"),
         ));
     }
     errs
 }
 
-/// Port of upstream `validatePodAffinityTerms`
-/// (`pkg/apis/core/validation/validation.go:5169-5176`).
-fn validate_pod_affinity_terms(terms: &[PodAffinityTerm], fld_path: &Path) -> ErrorList {
-    let mut errs: ErrorList = Vec::new();
-    for (i, term) in terms.iter().enumerate() {
-        errs.extend(validate_pod_affinity_term(term, &fld_path.index(i)));
-    }
-    errs
-}
-
-/// Port of upstream `validateWeightedPodAffinityTerms`
-/// (`pkg/apis/core/validation/validation.go:5178-5188`).
-fn validate_weighted_pod_affinity_terms(
-    terms: &[WeightedPodAffinityTerm],
+/// `ValidatePodAffinityTermSelector` (validation.go:9262-9268).
+pub(crate) fn validate_pod_affinity_term_selector(
+    term: &PodAffinityTerm,
+    allow_invalid_label_value_in_selector: bool,
     fld_path: &Path,
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
-    for (i, weighted) in terms.iter().enumerate() {
-        let idx = fld_path.index(i);
-        if weighted.weight <= 0 || weighted.weight > 100 {
-            errs.push(Error::invalid(
-                &idx.child("weight"),
-                weighted.weight,
-                "must be in the range 1-100",
-            ));
-        }
-        errs.extend(validate_pod_affinity_term(
-            &weighted.pod_affinity_term,
-            &idx.child("podAffinityTerm"),
-        ));
-    }
-    errs
-}
-
-/// Port of upstream `validatePodAffinityTerm`
-/// (`pkg/apis/core/validation/validation.go:5152-5166`) together with
-/// `ValidatePodAffinityTermSelector` (`:5130-5137`): both selectors are
-/// validated, every listed namespace is a DNS label, and `topologyKey` is a
-/// required label name.
-fn validate_pod_affinity_term(term: &PodAffinityTerm, fld_path: &Path) -> ErrorList {
-    let mut errs: ErrorList = Vec::new();
     let opts = LabelSelectorValidationOptions {
-        allow_invalid_label_value_in_selector: false,
+        allow_invalid_label_value_in_selector,
         ..Default::default()
     };
-
     if let Some(selector) = term.label_selector.as_ref() {
         errs.extend(validate_label_selector(
             selector,
@@ -844,6 +864,65 @@ fn validate_pod_affinity_term(term: &PodAffinityTerm, fld_path: &Path) -> ErrorL
             &fld_path.child("namespaceSelector"),
         ));
     }
+    errs
+}
+
+/// Port of upstream `validatePodAffinityTerms`
+/// (`pkg/apis/core/validation/validation.go:5169-5176`).
+fn validate_pod_affinity_terms(
+    terms: &[PodAffinityTerm],
+    allow_invalid_label_value_in_selector: bool,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    for (i, term) in terms.iter().enumerate() {
+        errs.extend(validate_pod_affinity_term(
+            term,
+            allow_invalid_label_value_in_selector,
+            &fld_path.index(i),
+        ));
+    }
+    errs
+}
+
+/// Port of upstream `validateWeightedPodAffinityTerms`
+/// (`pkg/apis/core/validation/validation.go:5178-5188`).
+fn validate_weighted_pod_affinity_terms(
+    terms: &[WeightedPodAffinityTerm],
+    allow_invalid_label_value_in_selector: bool,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    for (i, weighted) in terms.iter().enumerate() {
+        let idx = fld_path.index(i);
+        if weighted.weight <= 0 || weighted.weight > 100 {
+            errs.push(Error::invalid(
+                &idx.child("weight"),
+                weighted.weight,
+                "must be in the range 1-100",
+            ));
+        }
+        errs.extend(validate_pod_affinity_term(
+            &weighted.pod_affinity_term,
+            allow_invalid_label_value_in_selector,
+            &idx.child("podAffinityTerm"),
+        ));
+    }
+    errs
+}
+
+/// Port of upstream `validatePodAffinityTerm`
+/// (`pkg/apis/core/validation/validation.go:5152-5166`) together with
+/// `ValidatePodAffinityTermSelector` (`:5130-5137`): both selectors are
+/// validated, every listed namespace is a DNS label, and `topologyKey` is a
+/// required label name.
+fn validate_pod_affinity_term(
+    term: &PodAffinityTerm,
+    allow_invalid_label_value_in_selector: bool,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList =
+        validate_pod_affinity_term_selector(term, allow_invalid_label_value_in_selector, fld_path);
 
     for name in term.namespaces.as_deref().unwrap_or(&[]) {
         for msg in is_dns1123_label(name) {
@@ -1029,7 +1108,13 @@ pub fn is_valid_sysctl_name(name: &str) -> bool {
 
 /// Upstream `validateSysctls`: each `securityContext.sysctls[]` name must be
 /// present, a valid sysctl name, and unique.
-fn validate_sysctls(sc: &PodSecurityContext, fld_path: &Path) -> ErrorList {
+fn validate_sysctls(
+    sc: &PodSecurityContext,
+    host_network: bool,
+    host_ipc: bool,
+    opts: &PodValidationOptions,
+    fld_path: &Path,
+) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     let Some(sysctls) = sc.sysctls.as_ref() else {
         return errs;
@@ -1050,9 +1135,93 @@ fn validate_sysctls(sc: &PodSecurityContext, fld_path: &Path) -> ErrorList {
         } else if seen.contains(s.name.as_str()) {
             errs.push(Error::duplicate(&name_path, s.name.clone()));
         }
+        // `if !opts.AllowNamespacedSysctlsForHostNetAndHostIPC` (:5479).
+        if !opts.allow_namespaced_sysctls_for_host_net_and_host_ipc {
+            if let Some(err) = validate_host_sysctl(&s.name, host_network, host_ipc, &name_path) {
+                errs.push(err);
+            }
+        }
         seen.insert(s.name.as_str());
     }
     errs
+}
+
+/// Kernel namespace of a sysctl, `utilsysctl.Namespace`
+/// (component-helpers/node/util/sysctl/namespace.go:26-37).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SysctlNamespace {
+    Ipc,
+    Net,
+    Unknown,
+}
+
+/// `utilsysctl.NormalizeName` (component-helpers/node/util/sysctl/sysctl.go:109-128):
+/// when the first separator is `/`, the use of `.` and `/` is swapped.
+fn normalize_sysctl_name(val: &str) -> String {
+    match val.find(['.', '/']) {
+        Some(i) if val.as_bytes()[i] == b'/' => val
+            .chars()
+            .map(|c| match c {
+                '.' => '/',
+                '/' => '.',
+                other => other,
+            })
+            .collect(),
+        _ => val.to_string(),
+    }
+}
+
+/// `utilsysctl.GetNamespace` (namespace.go:95-104), reduced to the namespace.
+pub(crate) fn get_sysctl_namespace(sysctl: &str) -> SysctlNamespace {
+    let mut name = normalize_sysctl_name(sysctl);
+    if let Some(i) = name.find('*') {
+        name.truncate(i);
+    }
+    // `nameToNamespace` (:39-55).
+    match name.as_str() {
+        "kernel.sem"
+        | "kernel.shmall"
+        | "kernel.shmmax"
+        | "kernel.shmmni"
+        | "kernel.shm_rmid_forced"
+        | "kernel.shm"
+        | "kernel.msgmax"
+        | "kernel.msgmnb"
+        | "kernel.msgmni"
+        | "kernel.msg" => return SysctlNamespace::Ipc,
+        _ => {}
+    }
+    // `prefixToNamespace` (:57-62).
+    if name.starts_with("net.") {
+        SysctlNamespace::Net
+    } else if name.starts_with("fs.mqueue.") {
+        SysctlNamespace::Ipc
+    } else {
+        SysctlNamespace::Unknown
+    }
+}
+
+/// `ValidateHostSysctl` (validation.go:5491-5500): a namespaced sysctl may not
+/// be set when the pod shares that namespace with the host.
+pub(crate) fn validate_host_sysctl(
+    sysctl: &str,
+    host_network: bool,
+    host_ipc: bool,
+    fld_path: &Path,
+) -> Option<Error> {
+    match get_sysctl_namespace(sysctl) {
+        SysctlNamespace::Net if host_network => Some(Error::invalid(
+            fld_path,
+            sysctl.to_string(),
+            "may not be specified when 'hostNetwork' is true",
+        )),
+        SysctlNamespace::Ipc if host_ipc => Some(Error::invalid(
+            fld_path,
+            sysctl.to_string(),
+            "may not be specified when 'hostIPC' is true",
+        )),
+        _ => None,
+    }
 }
 
 /// Validates a single container (regular or init). When `is_init` is true,
@@ -2249,6 +2418,7 @@ const NODE_INCLUSION_POLICIES: &[&str] = &["Honor", "Ignore"];
 fn validate_topology_spread_constraints(
     constraints: &[TopologySpreadConstraint],
     fld_path: &Path,
+    opts: &PodValidationOptions,
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     for (i, c) in constraints.iter().enumerate() {
@@ -2322,19 +2492,54 @@ fn validate_topology_spread_constraints(
                 }
             }
         }
-        // matchLabelKeys: valid label names, disjoint from the selector keys.
-        errs.extend(validate_match_label_keys(
-            c.match_label_keys.as_deref(),
-            c.label_selector.as_ref(),
-            &sub.child("matchLabelKeys"),
-        ));
-        // labelSelector.
-        if let Some(sel) = &c.label_selector {
-            errs.extend(validate_label_selector(
-                sel,
-                LabelSelectorValidationOptions::default(),
-                &sub.child("labelSelector"),
-            ));
+        // matchLabelKeys (validation.go:8767-8793). The legacy function is
+        // `ValidateMatchLabelKeysInTopologySpread`, the preferred one
+        // `ValidateMatchLabelKeysAndMismatchLabelKeys`; the options decide
+        // which, so an already-stored pod keeps validating the way it did.
+        let match_keys = c.match_label_keys.as_deref();
+        let selector = c.label_selector.as_ref();
+        let legacy = |errs: &mut ErrorList| {
+            errs.extend(validate_match_label_keys(
+                match_keys,
+                selector,
+                &sub.child("matchLabelKeys"),
+            ))
+        };
+        let preferred = |errs: &mut ErrorList| {
+            errs.extend(validate_match_label_keys_and_mismatch_label_keys(
+                &sub,
+                match_keys.unwrap_or(&[]),
+                &[],
+                selector,
+            ))
+        };
+        if opts.allow_match_label_keys_in_pod_topology_spread {
+            match (
+                opts.allow_match_label_keys_in_pod_topology_spread_selector_merge,
+                opts.old_pod_violates_match_label_keys_validation,
+                opts.old_pod_violates_legacy_match_label_keys_validation,
+            ) {
+                // :8773 merge && oldViolates -> legacy.
+                (true, true, _) => legacy(&mut errs),
+                // :8777 merge && !oldViolates -> preferred.
+                (true, false, _) => preferred(&mut errs),
+                // :8780 !merge && oldViolatesLegacy -> preferred.
+                (false, _, true) => preferred(&mut errs),
+                // :8784 !merge && !oldViolatesLegacy -> legacy.
+                (false, _, false) => legacy(&mut errs),
+            }
+        } else {
+            legacy(&mut errs);
+        }
+        // `if !opts.AllowInvalidTopologySpreadConstraintLabelSelector` (:8794).
+        if !opts.allow_invalid_topology_spread_constraint_label_selector {
+            if let Some(sel) = &c.label_selector {
+                errs.extend(validate_label_selector(
+                    sel,
+                    LabelSelectorValidationOptions::default(),
+                    &sub.child("labelSelector"),
+                ));
+            }
         }
     }
     errs
@@ -2414,7 +2619,7 @@ fn validate_object_field_selector(
 }
 
 /// Port of upstream `ValidateMatchLabelKeysInTopologySpread`.
-fn validate_match_label_keys(
+pub(crate) fn validate_match_label_keys(
     match_label_keys: Option<&[String]>,
     label_selector: Option<&crate::types::LabelSelector>,
     fld_path: &Path,
@@ -2445,11 +2650,106 @@ fn validate_match_label_keys(
     for (i, key) in keys.iter().enumerate() {
         errs.extend(validate_label_name(key, &fld_path.index(i)));
         if selector_keys.contains(key.as_str()) {
-            errs.push(Error::invalid(
-                &fld_path.index(i),
-                key.clone(),
-                "exists in both matchLabelKeys and labelSelector",
-            ));
+            errs.push(
+                Error::invalid(
+                    &fld_path.index(i),
+                    key.clone(),
+                    "exists in both matchLabelKeys and labelSelector",
+                )
+                .with_origin("duplicatedLabelKeys"),
+            );
+        }
+    }
+    errs
+}
+
+/// `validateLabelKeys` (validation.go:8944-8959): label keys must be valid
+/// label names, and need a labelSelector.
+fn validate_label_keys(
+    fld_path: &Path,
+    label_keys: &[String],
+    label_selector: Option<&crate::types::LabelSelector>,
+) -> ErrorList {
+    if label_keys.is_empty() {
+        return Vec::new();
+    }
+    if label_selector.is_none() {
+        return vec![Error::forbidden(
+            fld_path,
+            "must not be specified when labelSelector is not set",
+        )];
+    }
+    let mut errs: ErrorList = Vec::new();
+    for (i, key) in label_keys.iter().enumerate() {
+        errs.extend(validate_label_name(key, &fld_path.index(i)));
+    }
+    errs
+}
+
+/// Port of `ValidateMatchLabelKeysAndMismatchLabelKeys`
+/// (validation.go:8864-8910). Unlike the legacy rule it only flags a key that
+/// repeats inside the selector (`labelSelectorKeys` is seeded from
+/// `matchLabels` and grows with each expression), because the merged selector
+/// already contains the key from `matchLabelKeys`.
+pub(crate) fn validate_match_label_keys_and_mismatch_label_keys(
+    fld_path: &Path,
+    match_label_keys: &[String],
+    mismatch_label_keys: &[String],
+    label_selector: Option<&crate::types::LabelSelector>,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    errs.extend(validate_label_keys(
+        &fld_path.child("matchLabelKeys"),
+        match_label_keys,
+        label_selector,
+    ));
+    errs.extend(validate_label_keys(
+        &fld_path.child("mismatchLabelKeys"),
+        mismatch_label_keys,
+        label_selector,
+    ));
+
+    if let Some(selector) = label_selector {
+        // labelKeysMap is keyed by label key, valued by its index (the last
+        // index wins, as in the Go map assignment).
+        let mut label_keys_map: HashMap<&str, usize> = HashMap::new();
+        for (i, key) in match_label_keys.iter().enumerate() {
+            label_keys_map.insert(key.as_str(), i);
+        }
+        let mut selector_keys: HashSet<&str> = selector
+            .match_labels
+            .iter()
+            .flat_map(|m| m.keys().map(|k| k.as_str()))
+            .collect();
+        for expression in selector.match_expressions.iter().flatten() {
+            let key = expression.key.as_str();
+            if let Some(&i) = label_keys_map.get(key) {
+                if selector_keys.contains(key) {
+                    errs.push(
+                        Error::invalid(
+                            &fld_path.child("matchLabelKeys").index(i),
+                            key.to_string(),
+                            "exists in both matchLabelKeys and labelSelector",
+                        )
+                        .with_origin("duplicatedLabelKeys"),
+                    );
+                }
+            }
+            selector_keys.insert(key);
+        }
+    }
+
+    let mismatch: HashSet<&str> = mismatch_label_keys.iter().map(|k| k.as_str()).collect();
+    for (i, k) in match_label_keys.iter().enumerate() {
+        if mismatch.contains(k.as_str()) {
+            errs.push(
+                Error::invalid(
+                    &fld_path.child("matchLabelKeys").index(i),
+                    k.clone(),
+                    "exists in both matchLabelKeys and mismatchLabelKeys",
+                )
+                .with_origin("duplicatedMismatchLabelKeys"),
+            );
         }
     }
     errs
@@ -2515,13 +2815,13 @@ fn validate_config_or_secret_key_selector(name: &str, key: &str, fld_path: &Path
 /// itself skips it in exactly that case ("Without it, this sanity check has to
 /// be skipped", `:459-461`), so skipping it here is the same behaviour, not a
 /// shortcut.
-fn validate_volumes(volumes: &[Volume], fld_path: &Path) -> ErrorList {
+fn validate_volumes(volumes: &[Volume], fld_path: &Path, opts: &PodValidationOptions) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     let mut seen: HashSet<&str> = HashSet::new();
     for (i, vol) in volumes.iter().enumerate() {
         let idx = fld_path.index(i);
         let vpath = idx.child("name");
-        errs.extend(validate_volume_source(vol, &idx));
+        errs.extend(validate_volume_source(vol, &idx, opts));
         if vol.name.is_empty() {
             errs.push(Error::required(&vpath, ""));
         } else {
@@ -2593,7 +2893,7 @@ const FILE_MODE_ERR_MSG: &str = "must be a number between 0 and 0777 (octal), bo
 
 /// Port of upstream `ValidateLocalNonReservedPath`: a relative path with no
 /// `..` component that additionally must not *start* with `..`.
-fn validate_local_non_reserved_path(target: &str, fld_path: &Path) -> ErrorList {
+pub(crate) fn validate_local_non_reserved_path(target: &str, fld_path: &Path) -> ErrorList {
     let mut errs = validate_local_descending_path(target, fld_path);
     // Upstream suppresses this when the `..` element check already fired.
     if target.starts_with("..") && !target.starts_with("../") {
@@ -2623,7 +2923,7 @@ fn validate_file_mode(mode: Option<i32>, fld_path: &Path) -> ErrorList {
 /// upstream's shape — a second type is `Forbidden` with "may not specify more
 /// than 1 volume type", and no type at all is `Required` with "must specify a
 /// volume type" (`:808-810`).
-fn validate_volume_source(vol: &Volume, fld_path: &Path) -> ErrorList {
+fn validate_volume_source(vol: &Volume, fld_path: &Path, opts: &PodValidationOptions) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     let mut num_volumes = 0usize;
 
@@ -2701,7 +3001,7 @@ fn validate_volume_source(vol: &Volume, fld_path: &Path) -> ErrorList {
     source!(
         vol.projected.as_ref(),
         "projected",
-        validate_projected_volume_source
+        |p: &ProjectedVolumeSource, path: &Path| validate_projected_volume_source(p, path, opts)
     );
     source!(vol.csi.as_ref(), "csi", validate_csi_volume_source);
     source!(
@@ -2956,6 +3256,7 @@ fn validate_container_resource_field_selector(
 fn validate_projected_volume_source(
     projected: &ProjectedVolumeSource,
     fld_path: &Path,
+    opts: &PodValidationOptions,
 ) -> ErrorList {
     let mut errs = validate_file_mode(projected.default_mode, &fld_path.child("defaultMode"));
     let mut all_paths: HashSet<String> = HashSet::new();
@@ -3043,7 +3344,8 @@ fn validate_projected_volume_source(
             // the source (`:1226-1230`).
             if sat.path.is_empty() {
                 errs.push(Error::required(&fld_path.child("path"), ""));
-            } else {
+            } else if !opts.allow_non_local_projected_token_path {
+                // `else if !opts.AllowNonLocalProjectedTokenPath` (:1228).
                 errs.extend(validate_local_non_reserved_path(
                     &sat.path,
                     &fld_path.child("path"),
@@ -4462,6 +4764,9 @@ mod tests {
         let sc = sc_with_sysctls(&["foo-", "kernel.shmmax", "safe-and-unsafe", "bar.."]);
         let errs = validate_sysctls(
             &sc,
+            false,
+            false,
+            &PodValidationOptions::default(),
             &Path::new("spec").child("securityContext").child("sysctls"),
         );
         let bad: Vec<&str> = errs
@@ -4483,6 +4788,9 @@ mod tests {
         let sc = sc_with_sysctls(&["kernel.shmmax", "kernel.shmmax", ""]);
         let errs = validate_sysctls(
             &sc,
+            false,
+            false,
+            &PodValidationOptions::default(),
             &Path::new("spec").child("securityContext").child("sysctls"),
         );
         assert_eq!(errs.len(), 2, "one duplicate + one required: {errs:?}");
@@ -5295,6 +5603,7 @@ mod tests {
         validate_topology_spread_constraints(
             &tscs,
             &Path::new("spec").child("topologySpreadConstraints"),
+            &PodValidationOptions::default(),
         )
         .into_iter()
         .map(|e| e.to_string())
