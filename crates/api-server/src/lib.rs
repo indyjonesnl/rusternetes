@@ -271,6 +271,14 @@ pub struct ServiceAccountArgs {
         value_parser = parse_go_duration_arg
     )]
     pub service_account_max_token_expiration: Option<std::time::Duration>,
+
+    /// Overrides the URI for the JSON Web Key Set in the discovery doc served
+    /// at /.well-known/openid-configuration. This flag is useful if the
+    /// discovery doc and key set are served to relying parties from a URL
+    /// other than the API server's external address
+    /// (pkg/kubeapiserver/options/authentication.go:454-458).
+    #[arg(long = "service-account-jwks-uri")]
+    pub service_account_jwks_uri: Option<String>,
 }
 
 fn parse_go_duration_arg(s: &str) -> std::result::Result<std::time::Duration, String> {
@@ -290,6 +298,7 @@ impl ServiceAccountArgs {
             issuers: self.service_account_issuer.clone(),
             api_audiences: self.api_audiences.clone(),
             max_expiration: self.service_account_max_token_expiration,
+            jwks_uri: self.service_account_jwks_uri.clone(),
         }
     }
 }

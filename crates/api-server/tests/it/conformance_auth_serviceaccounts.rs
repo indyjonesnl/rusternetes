@@ -1581,3 +1581,36 @@ async fn token_request_audience_is_reflected_in_token_review() {
         "Token must authenticate: {review_body}"
     );
 }
+
+/// #3684: with `--service-account-key-file` / `--service-account-issuer` /
+/// `--service-account-jwks-uri` the discovery document and JWKS reflect the
+/// configuration (`openIDConfigJSON` / `openIDKeysetJSON`,
+/// pkg/serviceaccount/openidmetadata.go) instead of a hardcoded issuer.
+#[tokio::test]
+async fn oidc_discovery_reflects_configured_issuer_jwks_uri_and_keys_3684() {
+    use rusternetes_common::auth::{ServiceAccountOptions, TokenManager};
+    let fixtures = format!("{}/../common/tests/fixtures/sa", env!("CARGO_MANIFEST_DIR"));
+    let tm = TokenManager::new(b"oidc-secret")
+        .with_service_account_options(&ServiceAccountOptions {
+            key_files: vec![format!("{fixtures}/rsa.pub")],
+            signing_key_file: Some(format!("{fixtures}/rsa-pkcs1.key")),
+            issuers: vec!["https://issuer.example.com".to_string()],
+            jwks_uri: Some("https://keys.example.com/jwks".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+    let state = TestApiServer::builder().token_manager(tm).build();
+    let (status, cfg) = get_json(state.clone(), "/.well-known/openid-configuration").await;
+    assert_eq!(status, 200, "{cfg}");
+    assert_eq!(cfg["issuer"], "https://issuer.example.com");
+    assert_eq!(cfg["jwks_uri"], "https://keys.example.com/jwks");
+    assert_eq!(cfg["id_token_signing_alg_values_supported"], json!(["RS256"]));
+    let (status, set) = get_json(state, "/openid/v1/jwks").await;
+    assert_eq!(status, 200, "{set}");
+    let keys = set["keys"].as_array().unwrap();
+    assert_eq!(keys.len(), 1, "{set}");
+    assert_eq!(keys[0]["kty"], "RSA");
+    assert_eq!(keys[0]["alg"], "RS256");
+    assert_eq!(keys[0]["use"], "sig");
+    assert!(keys[0]["kid"].as_str().is_some_and(|k| !k.is_empty()));
+}

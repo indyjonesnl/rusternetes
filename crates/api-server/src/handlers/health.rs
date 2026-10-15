@@ -306,7 +306,17 @@ pub async fn pprof_trace() -> Result<String, (StatusCode, String)> {
 
 /// OpenID Connect discovery endpoint
 /// Returns the OIDC provider metadata for service account issuer discovery
-pub async fn openid_configuration() -> Json<serde_json::Value> {
+pub async fn openid_configuration(
+    State(state): State<Arc<ApiServerState>>,
+) -> Json<serde_json::Value> {
+    // Configured keys: `openIDConfigJSON` (pkg/serviceaccount/openidmetadata.go),
+    // honouring --service-account-issuer and --service-account-jwks-uri.
+    if let Some(cfg) = state
+        .token_manager
+        .openid_config_json("https://kubernetes.default.svc.cluster.local/openid/v1/jwks")
+    {
+        return Json(cfg);
+    }
     Json(serde_json::json!({
         "issuer": "https://kubernetes.default.svc.cluster.local",
         "jwks_uri": "https://kubernetes.default.svc.cluster.local/openid/v1/jwks",
@@ -319,7 +329,11 @@ pub async fn openid_configuration() -> Json<serde_json::Value> {
 /// JSON Web Key Set endpoint
 /// Returns the public keys used to verify service account tokens.
 /// K8s ref: pkg/serviceaccount/openidmetadata.go — publicJWKSFromKeys
-pub async fn openid_jwks() -> Json<serde_json::Value> {
+pub async fn openid_jwks(State(state): State<Arc<ApiServerState>>) -> Json<serde_json::Value> {
+    // Configured keys: `openIDKeysetJSON` (--service-account-key-file).
+    if let Some(set) = state.token_manager.openid_keyset_json() {
+        return Json(set);
+    }
     // Try to load the RSA public key from standard paths
     let key_paths = [
         "/etc/kubernetes/pki/sa.pub",

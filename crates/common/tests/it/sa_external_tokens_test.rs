@@ -460,3 +460,76 @@ fn max_token_expiration_clamps_requests_2714() {
     assert_eq!(tm.clamp_expiration_seconds(86_400), 7200);
     assert_eq!(tm.clamp_expiration_seconds(3600), 3600);
 }
+
+/// `--service-account-jwks-uri` validation (`pkg/kubeapiserver/options/
+/// authentication.go:289-296`, applied whenever the flag is set).
+#[test]
+fn jwks_uri_must_be_an_https_url_3684() {
+    let mut o = opts(&["rsa.pub"]);
+    o.jwks_uri = Some("http://example.com/jwks".to_string());
+    let err = o.validate().unwrap_err().to_string();
+    assert!(
+        err.contains(
+            "service-account-jwks-uri requires https scheme, parsed as: http://example.com/jwks"
+        ),
+        "{err}"
+    );
+    o.jwks_uri = Some("::not a url".to_string());
+    let err = o.validate().unwrap_err().to_string();
+    assert!(
+        err.contains("service-account-jwks-uri must be a valid URL"),
+        "{err}"
+    );
+    o.jwks_uri = Some("https://example.com/jwks".to_string());
+    assert!(o.validate().is_ok());
+    // Validated even when no other SA flag is set.
+    let lone = ServiceAccountOptions {
+        jwks_uri: Some("http://example.com/jwks".to_string()),
+        ..Default::default()
+    };
+    assert!(TokenManager::new(b"s")
+        .with_service_account_options(&lone)
+        .is_err());
+}
+
+/// `openIDConfigJSON` / `openIDKeysetJSON` (`pkg/serviceaccount/
+/// openidmetadata.go:199-262`): the discovery document carries the configured
+/// issuer and `--service-account-jwks-uri`; the key set holds one JWK per
+/// verification key (`jwkFromPublicKey`: alg, use=sig, kid).
+#[test]
+fn openid_metadata_serves_configured_keys_3684() {
+    let mut o = opts(&["rsa.pub", "ec.pub"]);
+    o.jwks_uri = Some("https://keys.example.com/jwks".to_string());
+    let tm = manager(&o);
+
+    let cfg = tm.openid_config_json("https://default/openid/v1/jwks").unwrap();
+    assert_eq!(cfg["issuer"], ISSUER);
+    assert_eq!(cfg["jwks_uri"], "https://keys.example.com/jwks");
+    assert_eq!(cfg["response_types_supported"], json!(["id_token"]));
+    assert_eq!(cfg["subject_types_supported"], json!(["public"]));
+    // getAlgs: sorted, de-duplicated.
+    assert_eq!(
+        cfg["id_token_signing_alg_values_supported"],
+        json!(["ES256", "RS256"])
+    );
+
+    let set = tm.openid_keyset_json().unwrap();
+    let keys = set["keys"].as_array().unwrap();
+    assert_eq!(keys.len(), 2);
+    assert_eq!(keys[0]["kty"], "RSA");
+    assert_eq!(keys[0]["alg"], "RS256");
+    assert_eq!(keys[0]["use"], "sig");
+    assert_eq!(keys[0]["kid"], kid_of("rsa.pub"));
+    assert!(keys[0]["n"].is_string() && keys[0]["e"].is_string());
+    assert_eq!(keys[1]["kty"], "EC");
+    assert_eq!(keys[1]["alg"], "ES256");
+    assert_eq!(keys[1]["crv"], "P-256");
+    assert_eq!(keys[1]["kid"], kid_of("ec.pub"));
+    assert!(keys[1]["x"].is_string() && keys[1]["y"].is_string());
+    assert!(keys[1].get("d").is_none());
+
+    // Without --service-account-jwks-uri the caller's default is used.
+    let tm = manager(&opts(&["rsa.pub"]));
+    let cfg = tm.openid_config_json("https://default/openid/v1/jwks").unwrap();
+    assert_eq!(cfg["jwks_uri"], "https://default/openid/v1/jwks");
+}
