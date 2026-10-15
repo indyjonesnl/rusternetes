@@ -53,14 +53,34 @@ pub(crate) struct ShutdownFlag {
 
 impl ShutdownFlag {
     pub(crate) async fn trigger(&self) {
-        todo!()
+        *self.set.write().await = true;
+        // notify_waiters wakes current sleepers; late sleepers see `set`.
+        self.notify.notify_waiters();
     }
     pub(crate) async fn is_set(&self) -> bool {
         *self.set.read().await
     }
+    pub(crate) async fn wait(&self) {
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !self.is_set().await {
+            notified.await;
+        }
+    }
     pub(crate) async fn sleep_or_shutdown(&self, d: Duration) {
-        let _ = d;
-        todo!()
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        // Register interest before checking the flag so a concurrent
+        // trigger() cannot slip between the check and the wait.
+        notified.as_mut().enable();
+        if self.is_set().await {
+            return;
+        }
+        tokio::select! {
+            _ = sleep(d) => {}
+            _ = &mut notified => {}
+        }
     }
 }
 
@@ -70,7 +90,7 @@ pub struct LeaderElector {
     config: LeaderElectionConfig,
     state: Arc<RwLock<LeaderState>>,
     lease_id: Arc<Mutex<Option<i64>>>,
-    shutdown: Arc<RwLock<bool>>,
+    shutdown: Arc<ShutdownFlag>,
 }
 
 impl LeaderElector {
@@ -91,7 +111,7 @@ impl LeaderElector {
             config,
             state: Arc::new(RwLock::new(LeaderState::Unknown)),
             lease_id: Arc::new(Mutex::new(None)),
-            shutdown: Arc::new(RwLock::new(false)),
+            shutdown: Arc::new(ShutdownFlag::default()),
         })
     }
 
@@ -131,7 +151,7 @@ impl LeaderElector {
 
         loop {
             // Check if we should shutdown
-            if *self.shutdown.read().await {
+            if self.shutdown.is_set().await {
                 info!("Leader election shutting down");
                 self.release_leadership().await?;
                 break;
@@ -149,7 +169,9 @@ impl LeaderElector {
                 Err(e) => {
                     error!(error = %e, "Error in leader election");
                     *self.state.write().await = LeaderState::Unknown;
-                    sleep(Duration::from_secs(self.config.retry_interval)).await;
+                    self.shutdown
+                        .sleep_or_shutdown(Duration::from_secs(self.config.retry_interval))
+                        .await;
                 }
             }
         }
@@ -289,10 +311,13 @@ impl LeaderElector {
         renew_timer.tick().await; // First tick completes immediately
 
         loop {
-            renew_timer.tick().await;
+            tokio::select! {
+                _ = renew_timer.tick() => {}
+                _ = self.shutdown.wait() => {}
+            }
 
             // Check if we should shutdown
-            if *self.shutdown.read().await {
+            if self.shutdown.is_set().await {
                 return Ok(());
             }
 
@@ -318,7 +343,9 @@ impl LeaderElector {
 
     /// Run the follower loop - check for leader changes
     async fn run_as_follower(&self) -> Result<()> {
-        sleep(Duration::from_secs(self.config.retry_interval)).await;
+        self.shutdown
+            .sleep_or_shutdown(Duration::from_secs(self.config.retry_interval))
+            .await;
         Ok(())
     }
 
@@ -366,7 +393,7 @@ impl LeaderElector {
 
     /// Initiate shutdown
     pub async fn shutdown(&self) {
-        *self.shutdown.write().await = true;
+        self.shutdown.trigger().await;
     }
 }
 
@@ -383,8 +410,11 @@ pub async fn release_on_cancel<F, Fut, T>(
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    let _ = (ctx, shutdown, run, release_timeout);
-    todo!()
+    ctx.cancelled().await;
+    shutdown().await;
+    if tokio::time::timeout(release_timeout, run).await.is_err() {
+        warn!("Timed out waiting for leader election to release the lock");
+    }
 }
 
 #[cfg(test)]
