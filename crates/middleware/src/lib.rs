@@ -2925,10 +2925,7 @@ const MAX_GENERATE_NAME_BODY: usize = 4 * 1024 * 1024;
 /// untouched — preserving raw-byte strict decoding (e.g. duplicate-field
 /// detection) for the overwhelmingly common path.
 pub fn synthesize_generate_name(body: &[u8]) -> Option<Vec<u8>> {
-    synthesize_generate_name_with(body, &|prefix| {
-        let suffix = uuid::Uuid::new_v4().simple().to_string()[..5].to_string();
-        format!("{prefix}{suffix}")
-    })
+    synthesize_generate_name_with(body, &rusternetes_common::names::simple_name_generator)
 }
 
 /// [`synthesize_generate_name`] with the name generator injected
@@ -2970,12 +2967,15 @@ pub fn synthesize_generate_name_with(
 /// here. Non-POST, non-JSON, and already-named requests pass straight through
 /// with their original bytes intact.
 pub async fn generate_name_middleware(req: Request, next: Next) -> Response {
-    generate_name_middleware_with(req, next, &|prefix| {
-        let suffix = uuid::Uuid::new_v4().simple().to_string()[..5].to_string();
-        format!("{prefix}{suffix}")
-    })
-    .await
+    generate_name_middleware_with(req, next, &rusternetes_common::names::simple_name_generator)
+        .await
 }
+
+/// `maxNameGenerationCreateAttempts` (apiserver
+/// `pkg/registry/generic/registry/store.go:440`): how many times a create that
+/// carries `generateName` is attempted when it fails on a name conflict. Each
+/// attempt draws a new name.
+pub const MAX_NAME_GENERATION_CREATE_ATTEMPTS: usize = 8;
 
 /// [`generate_name_middleware`] with the name generator injected.
 pub async fn generate_name_middleware_with(
@@ -3001,11 +3001,56 @@ pub async fn generate_name_middleware_with(
         }
     };
 
-    let new_body = match synthesize_generate_name_with(&bytes, generate) {
-        Some(rewritten) => Body::from(rewritten),
-        None => Body::from(bytes),
+    // Not a create that needs a generated name: forward the original bytes.
+    let Some(mut rewritten) = synthesize_generate_name_with(&bytes, generate) else {
+        return next
+            .run(Request::from_parts(parts, Body::from(bytes)))
+            .await;
     };
-    next.run(Request::from_parts(parts, new_body)).await
+
+    // `createWithGenerateNameRetry` (store.go:464-473): attempt the create up
+    // to MAX_NAME_GENERATION_CREATE_ATTEMPTS times, redrawing the name from
+    // the nameless original (upstream's `obj.DeepCopyObject()`) whenever the
+    // create fails with AlreadyExists; any other outcome ends the loop.
+    let mut attempt = 1;
+    loop {
+        let mut req = Request::new(Body::from(rewritten));
+        *req.method_mut() = parts.method.clone();
+        *req.uri_mut() = parts.uri.clone();
+        *req.version_mut() = parts.version;
+        *req.headers_mut() = parts.headers.clone();
+        *req.extensions_mut() = parts.extensions.clone();
+        let resp = next.clone().run(req).await;
+        if resp.status() != StatusCode::CONFLICT || attempt >= MAX_NAME_GENERATION_CREATE_ATTEMPTS {
+            return resp;
+        }
+        let (resp_parts, resp_body) = resp.into_parts();
+        let Ok(resp_bytes) = axum::body::to_bytes(resp_body, MAX_GENERATE_NAME_BODY).await else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to read response body",
+            )
+                .into_response();
+        };
+        if !is_already_exists_status(&resp_bytes) {
+            return Response::from_parts(resp_parts, Body::from(resp_bytes));
+        }
+        // The same nameless original yielded a name on the first pass.
+        match synthesize_generate_name_with(&bytes, generate) {
+            Some(next_body) => rewritten = next_body,
+            None => return Response::from_parts(resp_parts, Body::from(resp_bytes)),
+        }
+        attempt += 1;
+    }
+}
+
+/// `apierrors.IsAlreadyExists` on a serialised `Status` (`reason ==
+/// "AlreadyExists"`).
+fn is_already_exists_status(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("reason")?.as_str().map(|r| r == "AlreadyExists"))
+        .unwrap_or(false)
 }
 
 // ============================================================================
