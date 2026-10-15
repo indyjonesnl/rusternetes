@@ -360,6 +360,16 @@ impl super::plugin::DeviceMountableVolumePlugin for FcPlugin {
     fn new_device_mounter(&self) -> Result<Box<dyn DeviceMounter>> {
         Ok(Box::new(self.new_attacher_internal()))
     }
+
+    /// `GetDeviceMountRefs` (`attacher.go:60-63`).
+    ///
+    /// ```go
+    /// mounter := plugin.host.GetMounter()
+    /// return mounter.GetMountRefs(deviceMountPath)
+    /// ```
+    fn get_device_mount_refs(&self, device_mount_path: &str) -> Result<Vec<String>> {
+        Ok(self.host.get_mounter().get_mount_refs(device_mount_path)?)
+    }
 }
 
 impl BlockVolumePlugin for FcPlugin {
