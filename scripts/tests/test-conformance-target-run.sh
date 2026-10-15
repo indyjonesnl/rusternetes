@@ -370,6 +370,67 @@ else
     && ok "hang after junit written => results salvaged (exit 0, passed=1)" \
     || bad "hang-after-junit exit=$rc_hj passed=$(gho passed): $out_hj"
 
+  # --- the suite finished, hydrophone did not notice (#3024) ----------------
+  # The conformance image's go-runner writes /tmp/results/done once it has
+  # tarred the results (test/conformance/image/go-runner/main.go saveResults,
+  # const.go doneFileName), and hydrophone's pod shares /tmp/results with a
+  # `sleep infinity` output-container. When hydrophone's log follow wedges, the
+  # runner must see that marker and stop hydrophone instead of burning the whole
+  # HYDROPHONE_TIMEOUT, then salvage the junit from the sidecar.
+  #
+  # Stub kubectl: `exec ... test -f /tmp/results/done` succeeds iff FAKE_DONE=1;
+  # `cp ... <dest>` drops a junit into <dest>. Used only for these cases, so the
+  # preflight-gate tests above still see the real (or no) kubectl.
+  KSHIM="$TMP/kubectl-shim"; mkdir -p "$KSHIM"
+  cat > "$KSHIM/kubectl" <<'EOF'
+#!/usr/bin/env bash
+case " $* " in
+  *" exec "*"test -f /tmp/results/done"*) [ "${FAKE_DONE:-0}" = "1" ] ;;
+  *" cp "*) dest="${*: -1}"; mkdir -p "$dest"
+            echo '<testsuite><testcase name="x" status="passed"></testcase></testsuite>' > "$dest/junit_01.xml" ;;
+  *) exit 1 ;;
+esac
+EOF
+  chmod +x "$KSHIM/kubectl"
+
+  t0=$(date +%s)
+  set +e
+  out_done=$(PATH="$KSHIM:$PATH" FAKE_DONE=1 HYDROPHONE_TIMEOUT=300 HYDROPHONE_KILL_AFTER=1 \
+      HYDROPHONE_DONE_POLL=1 HYDROPHONE_DONE_GRACE=1 FAKE_MODE=hang run_cli --target sig-node \
+      --kubeconfig "$KC" --hydrophone "$FAKE" --output-dir "$TMP/odone" 2>&1)
+  rc_done=$?
+  set -e
+  elapsed=$(( $(date +%s) - t0 ))
+  [ "$elapsed" -lt 20 ] && ok "done marker stops a wedged hydrophone early (took ${elapsed}s)" \
+    || bad "done marker did not stop hydrophone (took ${elapsed}s, HYDROPHONE_TIMEOUT=300)"
+  echo "$out_done" | grep -q "done marker" \
+    && ok "the done-marker stop is named in the log" || bad "done-marker stop not reported: $out_done"
+  [ "$rc_done" -eq 0 ] && [ "$(gho passed)" = "1" ] \
+    && ok "stopped at done marker => junit salvaged from the sidecar (exit 0, passed=1)" \
+    || bad "stopped-at-done exit=$rc_done passed=$(gho passed): $out_done"
+
+  # No marker yet: the watcher must not stop a hydrophone that is still running
+  # the suite — only HYDROPHONE_TIMEOUT does.
+  set +e
+  out_nd=$(PATH="$KSHIM:$PATH" FAKE_DONE=0 HYDROPHONE_TIMEOUT=3 HYDROPHONE_KILL_AFTER=1 \
+      HYDROPHONE_DONE_POLL=1 HYDROPHONE_DONE_GRACE=1 FAKE_MODE=hang run_cli --target sig-node \
+      --kubeconfig "$KC" --hydrophone "$FAKE" --output-dir "$TMP/onodone" 2>&1)
+  set -e
+  echo "$out_nd" | grep -q "hydrophone timed out" && ! echo "$out_nd" | grep -q "done marker" \
+    && ok "no done marker => only HYDROPHONE_TIMEOUT stops hydrophone" \
+    || bad "no-marker run was stopped by the watcher: $out_nd"
+
+  # A hydrophone that exits by itself is never reported as stopped.
+  set +e
+  out_ok=$(PATH="$KSHIM:$PATH" FAKE_DONE=1 HYDROPHONE_DONE_POLL=1 HYDROPHONE_DONE_GRACE=1 \
+      FAKE_MODE=pass run_cli --target sig-node \
+      --kubeconfig "$KC" --hydrophone "$FAKE" --output-dir "$TMP/odoneok" 2>&1)
+  rc_ok=$?
+  set -e
+  [ "$rc_ok" -eq 0 ] && ! echo "$out_ok" | grep -q "stopping hydrophone" \
+    && ok "hydrophone that exits on its own is left alone" \
+    || bad "clean run rc=$rc_ok was treated as wedged: $out_ok"
+
   # Default must fit inside the workflow's timeout-minutes with bring-up room.
   def="$(grep -oE 'HYDROPHONE_TIMEOUT:-[0-9]+' "$RUNNER" | head -1 | grep -oE '[0-9]+$')"
   job="$(grep -oE 'timeout-minutes: [0-9]+' "$REPO_ROOT/.github/workflows/conformance-target.yml" | head -1 | grep -oE '[0-9]+')"
