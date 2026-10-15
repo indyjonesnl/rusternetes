@@ -484,6 +484,99 @@ mod tests {
         );
     }
 
+    fn migratable_pv(name: &str, source: &str, claim_uid: &str) -> PersistentVolume {
+        let mut spec = serde_json::json!({
+            "capacity": {"storage": "1Gi"},
+            "claimRef": {"namespace": "default", "uid": claim_uid},
+        });
+        match source {
+            "kubernetes.io/aws-ebs" => {
+                spec["awsElasticBlockStore"] = serde_json::json!({"volumeID": "v"})
+            }
+            "kubernetes.io/gce-pd" => {
+                spec["gcePersistentDisk"] = serde_json::json!({"pdName": "d"})
+            }
+            _ => unreachable!(),
+        }
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "PersistentVolume",
+            "metadata": {"name": name}, "spec": spec,
+        }))
+        .unwrap()
+    }
+
+    async fn stored_pvc(s: &Arc<MemoryStorage>, name: &str) -> PersistentVolumeClaim {
+        s.get(&build_key("persistentvolumeclaims", Some("default"), name))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn csi_migrated_in_tree_pv_sets_resizer_annotation() {
+        // TestSyncHandler "when pvc and pv has everything for in-tree plugin"
+        // (expand_controller_test.go:65-71): expectedAnnotation
+        // {VolumeResizerKey: AWSEBSDriverName}; GCE PD likewise.
+        for (plugin, driver) in [
+            ("kubernetes.io/aws-ebs", "ebs.csi.aws.com"),
+            ("kubernetes.io/gce-pd", "pd.csi.storage.gke.io"),
+        ] {
+            let c1 = pvc("good-pvc", "vol-3", "1Gi", "2Gi", "u3");
+            let (s, c) = setup(Some(migratable_pv("vol-3", plugin, "u3")), &c1).await;
+            c.reconcile_pvc(&c1).await.unwrap();
+
+            let ann = stored_pvc(&s, "good-pvc").await.metadata.annotations;
+            assert_eq!(
+                ann,
+                Some(HashMap::from([(
+                    "volume.kubernetes.io/storage-resizer".to_string(),
+                    driver.to_string()
+                )])),
+                "{plugin}"
+            );
+            let evs = events(&s).await;
+            assert_eq!(evs.len(), 1, "{evs:?}");
+            assert_eq!(evs[0].reason, "ExternalExpanding");
+            assert_eq!(
+                evs[0].message,
+                format!("CSI migration enabled for {plugin}; waiting for external resizer to expand the pvc")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn migrated_pv_with_pre_resize_annotation_still_sets_resizer() {
+        // "if pv has pre-resize capacity annotation" (:73-83) with an AWS EBS PV:
+        // the :228-236 early return is skipped, so the migratable branch runs.
+        let c1 = pvc("p", "vol-4", "2Gi", "2Gi", "u4");
+        let mut p = migratable_pv("vol-4", "kubernetes.io/aws-ebs", "u4");
+        p.metadata.annotations = Some(HashMap::from([(
+            "volume.alpha.kubernetes.io/pre-resize-capacity".to_string(),
+            "1Gi".to_string(),
+        )]));
+        let (s, c) = setup(Some(p), &c1).await;
+        c.reconcile_pvc(&c1).await.unwrap();
+        assert!(stored_pvc(&s, "p")
+            .await
+            .metadata
+            .annotations
+            .is_some_and(|a| a.get("volume.kubernetes.io/storage-resizer")
+                == Some(&"ebs.csi.aws.com".to_string())));
+    }
+
+    #[tokio::test]
+    async fn migrated_pv_with_satisfied_request_is_left_alone() {
+        // :228-236 returns before the migration branch.
+        let c1 = pvc("p", "vol", "1Gi", "1Gi", "u");
+        let (s, c) = setup(
+            Some(migratable_pv("vol", "kubernetes.io/aws-ebs", "u")),
+            &c1,
+        )
+        .await;
+        c.reconcile_pvc(&c1).await.unwrap();
+        assert!(stored_pvc(&s, "p").await.metadata.annotations.is_none());
+        assert!(events(&s).await.is_empty());
+    }
+
     #[tokio::test]
     async fn storage_class_is_not_consulted() {
         // upstream never reads the StorageClass in syncHandler; allowVolumeExpansion
