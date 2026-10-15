@@ -110,7 +110,7 @@ impl ObjectDefaulter for Fakes {
 struct SetLabel;
 #[async_trait]
 impl Patcher for SetLabel {
-    async fn patch(&self, r: &PatchRequest<'_>) -> Result<Value, PatchError> {
+    async fn patch(&self, r: &PatchRequest<'_>, _: i64) -> Result<Value, PatchError> {
         let mut o = r.versioned_attributes.versioned_object.clone().unwrap();
         o["metadata"]["labels"] = json!({"mutated": "yes"});
         Ok(o)
@@ -282,7 +282,7 @@ struct Counting {
 }
 #[async_trait]
 impl Patcher for Counting {
-    async fn patch(&self, r: &PatchRequest<'_>) -> Result<Value, PatchError> {
+    async fn patch(&self, r: &PatchRequest<'_>, _: i64) -> Result<Value, PatchError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let mut o = r.versioned_attributes.versioned_object.clone().unwrap();
         o["metadata"]["labels"][self.key] = json!("yes");
@@ -417,7 +417,7 @@ async fn install_webhook(backend: &Arc<StorageBackend>, url: String) {
 struct Stamp(Arc<AtomicUsize>);
 #[async_trait]
 impl Patcher for Stamp {
-    async fn patch(&self, r: &PatchRequest<'_>) -> Result<Value, PatchError> {
+    async fn patch(&self, r: &PatchRequest<'_>, _: i64) -> Result<Value, PatchError> {
         let n = self.0.fetch_add(1, Ordering::SeqCst) + 1;
         let mut o = r.versioned_attributes.versioned_object.clone().unwrap();
         o["metadata"]["labels"]["n"] = json!(n.to_string());

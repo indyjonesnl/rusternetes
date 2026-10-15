@@ -10,14 +10,15 @@ use crate::admission::policy_apply_config::ApplyConfigPatcher;
 use crate::admission::policy_matching::Attributes;
 use crate::admission::policy_mutating::VersionedAttributes;
 use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource, Operation};
+use rusternetes_common::cel_cost::RUNTIME_CEL_COST_BUDGET;
 use serde_json::json;
 
 const OUT_OF_BUDGET: &str =
     "validation failed due to running out of cost budget, no further validation rules will be run";
 
-/// Each `object.xs.all(i, i >= 0)` over this object costs well under the 1M
-/// per-call limit, so every variable evaluates, but a dozen of them are more
-/// than the 10M `RuntimeCELCostBudget`.
+/// Each `object.xs.all(i, i >= 0)` over this object costs 500,003: under the
+/// 1M per-call limit, so every variable evaluates, but more than twenty of
+/// them are over the 10M `RuntimeCELCostBudget`.
 fn heavy_object() -> Value {
     let xs: Vec<u32> = (0..100_000).collect();
     json!({"xs": xs})
@@ -78,10 +79,11 @@ fn run(patcher: Arc<dyn Patcher>) -> Result<Value, String> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
-    rt.block_on(patcher.patch(&req)).map_err(|e| match e {
-        PatchError::Status(e) => e.to_string(),
-        PatchError::Other(m) => m,
-    })
+    rt.block_on(patcher.patch(&req, RUNTIME_CEL_COST_BUDGET))
+        .map_err(|e| match e {
+            PatchError::Status(e) => e.to_string(),
+            PatchError::Other(m) => m,
+        })
 }
 
 fn apply_config(n: usize) -> Result<Value, String> {
