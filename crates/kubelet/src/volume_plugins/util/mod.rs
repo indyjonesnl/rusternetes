@@ -139,17 +139,16 @@ pub fn is_device_mountable_volume(
 ///     volume.ConfigMap != nil
 /// ```
 ///
-/// **Deviation:** the `GitRepo` arm is dropped because
-/// `rusternetes_common::resources::Volume` has no `gitRepo` field — the source
-/// was removed from the API and this project never modelled it. Every other
-/// arm is verbatim; `StorageMediumDefault` is the empty string
-/// (`staging/src/k8s.io/api/core/v1/types.go`), which is what an absent
-/// `medium` decodes to.
+/// `volume.GitRepo` is `Volume.legacy_sources.git_repo` here (the deprecated
+/// source is carried losslessly in `LegacyVolumeSources`). `StorageMediumDefault`
+/// is the empty string (`staging/src/k8s.io/api/core/v1/types.go`), which is
+/// what an absent `medium` decodes to.
 pub fn is_local_ephemeral_volume(volume: &Volume) -> bool {
-    volume
-        .empty_dir
-        .as_ref()
-        .is_some_and(|ed| ed.medium.as_deref().unwrap_or("").is_empty())
+    volume.legacy_sources.git_repo.is_some()
+        || volume
+            .empty_dir
+            .as_ref()
+            .is_some_and(|ed| ed.medium.as_deref().unwrap_or("").is_empty())
         || volume.config_map.is_some()
 }
 
@@ -629,5 +628,50 @@ mod unmounter_tests {
             .construct_volume_spec("v", "/p")
             .unwrap();
         assert_eq!(hp.volume.host_path.unwrap().path, "v");
+    }
+}
+
+/// `IsLocalEphemeralVolume` (`pkg/volume/util/util.go:498-502`) — one case per
+/// arm of the upstream disjunction.
+#[cfg(test)]
+mod local_ephemeral_tests {
+    use super::*;
+
+    fn vol(v: serde_json::Value) -> Volume {
+        let mut m = serde_json::json!({"name": "v"});
+        m.as_object_mut()
+            .unwrap()
+            .extend(v.as_object().unwrap().clone());
+        serde_json::from_value(m).unwrap()
+    }
+
+    #[test]
+    fn git_repo_is_local_ephemeral() {
+        let v = vol(serde_json::json!({"gitRepo": {"repository": "https://x/y.git"}}));
+        assert!(is_local_ephemeral_volume(&v));
+    }
+
+    #[test]
+    fn default_medium_empty_dir_is_local_ephemeral() {
+        assert!(is_local_ephemeral_volume(&vol(
+            serde_json::json!({"emptyDir": {}})
+        )));
+        assert!(!is_local_ephemeral_volume(&vol(
+            serde_json::json!({"emptyDir": {"medium": "Memory"}})
+        )));
+    }
+
+    #[test]
+    fn config_map_is_local_ephemeral() {
+        assert!(is_local_ephemeral_volume(&vol(
+            serde_json::json!({"configMap": {"name": "c"}})
+        )));
+    }
+
+    #[test]
+    fn other_sources_are_not_local_ephemeral() {
+        assert!(!is_local_ephemeral_volume(&vol(
+            serde_json::json!({"secret": {"secretName": "s"}})
+        )));
     }
 }
