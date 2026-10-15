@@ -4716,6 +4716,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tower 0.4.13",
  "tracing",
  "uuid",
  "x509-parser",
