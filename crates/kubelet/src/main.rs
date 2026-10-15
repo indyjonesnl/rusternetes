@@ -55,6 +55,7 @@ mod serving_tls;
 mod runtime;
 mod runtime_state;
 mod server;
+mod server_metrics;
 mod static_pod_watch;
 mod static_pods;
 mod streaming_server;

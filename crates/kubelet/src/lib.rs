@@ -23,6 +23,7 @@ pub mod removeall;
 pub mod runtime;
 pub mod runtime_state;
 pub mod server;
+pub mod server_metrics;
 pub mod serving_tls;
 pub mod static_pod_watch;
 pub mod static_pods;
