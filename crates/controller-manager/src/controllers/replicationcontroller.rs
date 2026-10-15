@@ -1,6 +1,8 @@
 use super::controller_utils::{find_min_next_pod_availability_check, is_pod_active, pod_key};
 use super::expectations::ControllerExpectations;
-use super::pod_informer::{PodInformerCache, PodObservation};
+use super::pod_informer::{
+    apply_pod_observation, ControllerRef, PodEventTarget, PodInformerCache, PodObservation,
+};
 use super::replicaset::{
     count_pods, get_pods_to_delete, indirectly_related_pods, PodCounts, RelatedSet,
 };
@@ -9,9 +11,10 @@ use chrono::Utc;
 use futures::StreamExt;
 use rusternetes_common::{
     resources::{Pod, PodStatus, ReplicationController, ReplicationControllerCondition},
-    types::{ObjectMeta, OwnerReference, Phase},
+    types::{label_selector_as_selector, ObjectMeta, OwnerReference, Phase, Selector},
 };
 use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
+use std::collections::HashMap;
 use std::{sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};
 
@@ -44,7 +47,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
             storage,
             interval: Duration::from_secs(interval_secs),
             expectations: Arc::new(ControllerExpectations::new()),
-            pod_cache: PodInformerCache::new("ReplicationController"),
+            pod_cache: PodInformerCache::new(),
         }
     }
 
@@ -167,42 +170,15 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
 
     /// The informer's `addPod` / `updatePod` / `deletePod` handlers
     /// (replica_set.go:415-570; the RC runs on the same code), for one
-    /// classified pod event: lower the owners' expectations and enqueue them.
+    /// classified pod event ([`PodInformerCache::on_event`]): resolve the
+    /// controller reference, lower the expectations and enqueue the RCs it
+    /// names.
     async fn apply_observation(&self, queue: &WorkQueue, observation: &PodObservation) {
-        let pod_key = observation.pod_key();
-        let Some((ns, _)) = pod_key.split_once('/') else {
-            return;
-        };
-        for owner in observation.owners() {
-            let rc_key = format!("{ns}/{owner}");
-            match observation {
-                // `CreationObserved` (:436): without it the counts never come
-                // down and every sync waits out the 5-minute TTL instead of
-                // proceeding as soon as its creates land.
-                PodObservation::Created { .. } => self.expectations.creation_observed(&rc_key),
-                // `DeletionObserved` (:568), counted once per expected pod
-                // (controller_utils.go:380-390). A graceful delete first
-                // MODIFIES the pod (deletionTimestamp); `updatePod` observes
-                // it right there (:468-480) so replacements are not delayed
-                // until the kubelet removes the pod.
-                PodObservation::Deleted { .. } => {
-                    self.expectations.deletion_observed_of(&rc_key, pod_key)
-                }
-                PodObservation::Updated { .. } => {}
-            }
-            queue
-                .add(format!("replicationcontrollers/{}/{}", ns, owner))
-                .await;
-        }
+        apply_pod_observation(self, queue, observation).await;
     }
 
-    /// When a pod changes, check its ownerReferences for a ReplicationController
-    /// owner, update that RC's expectations as the informer's handlers would
-    /// ([`PodInformerCache::on_event`]) and enqueue it for reconciliation.
-    ///
-    /// The owner comes from the event's value (the previous pod for a delete),
-    /// so a deleted pod no longer needs the fallback of enqueuing every RC in
-    /// the namespace.
+    /// One pod watch event through the informer handlers: `addPod`,
+    /// `updatePod` or `deletePod`, whichever the pod cache says it is.
     async fn enqueue_owner_rc(&self, queue: &WorkQueue, event: &rusternetes_storage::WatchEvent) {
         if let Some(observation) = self.pod_cache.on_event(event) {
             self.apply_observation(queue, &observation).await;
@@ -392,6 +368,20 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
         // controller creates a duplicate.
         let needs_sync = self.expectations.satisfied(&rc_key);
 
+        // `metav1.LabelSelectorAsSelector(rs.Spec.Selector)` over the RC's
+        // converted selector: an invalid one is logged and the sync returns
+        // nil (replica_set.go:729-733).
+        let selector = match rc_selector_of(rc) {
+            Ok(selector) => selector,
+            Err(e) => {
+                error!(
+                    "error converting pod selector to selector for rc {}: {}",
+                    rc_key, e
+                );
+                return Ok(None);
+            }
+        };
+
         // Get all pods in namespace
         let pods_prefix = build_prefix("pods", Some(namespace));
         let all_pods: Vec<Pod> = self.storage.list(&pods_prefix).await?;
@@ -403,7 +393,9 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
 
         // Adopt orphan pods and release non-matching owned pods
         // (`claimPods`, replica_set.go:792-806).
-        let all_pods = self.adopt_and_release(rc, all_pods, namespace).await?;
+        let all_pods = self
+            .adopt_and_release(rc, &selector, all_pods, namespace)
+            .await?;
 
         // `activePods`: owned by this RC (after adopt/release) and
         // `FilterActivePods` (controller_utils.go:1001): not Failed/Succeeded,
@@ -646,21 +638,6 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
         indirectly_related_pods(&rc.metadata, &sets, pods)
     }
 
-    /// Check if a pod's labels match the RC's selector (pure label check, ignores ownerReference)
-    fn labels_match_selector(&self, pod: &Pod, rc: &ReplicationController) -> bool {
-        if let Some(selector) = &rc.spec.selector {
-            if let Some(pod_labels) = &pod.metadata.labels {
-                for (key, value) in selector {
-                    if pod_labels.get(key) != Some(value) {
-                        return false;
-                    }
-                }
-                return true;
-            }
-        }
-        false
-    }
-
     /// Check if a pod is owned by this RC (has a controller ownerReference pointing to it)
     fn is_owned_by(&self, pod: &Pod, rc: &ReplicationController) -> bool {
         // K8s uses UID matching for ownership, not name matching.
@@ -693,6 +670,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
     async fn adopt_and_release(
         &self,
         rc: &ReplicationController,
+        selector: &Selector,
         mut all_pods: Vec<Pod>,
         namespace: &str,
     ) -> rusternetes_common::Result<Vec<Pod>> {
@@ -712,7 +690,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
                 continue;
             }
 
-            let labels_match = self.labels_match_selector(pod, rc);
+            let labels_match = selector.matches(pod.metadata.labels.as_ref());
             let owned = self.is_owned_by(pod, rc);
 
             if labels_match && !owned && !self.has_controller_owner(pod) {
@@ -1027,6 +1005,92 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
         );
 
         Ok(())
+    }
+}
+
+/// `Convert_v1_ReplicationControllerSpec_To_apps_ReplicaSetSpec`
+/// (pkg/apis/core/v1/conversion.go:117-130) then `LabelSelectorAsSelector`:
+/// an absent selector converts to a nil `LabelSelector` (`labels.Nothing()`),
+/// a present one — even `{}` — to `MatchLabels` (`labels.Everything()` when
+/// empty).
+fn rc_selector_of(rc: &ReplicationController) -> Result<Selector, String> {
+    let converted =
+        rc.spec
+            .selector
+            .as_ref()
+            .map(|match_labels| rusternetes_common::types::LabelSelector {
+                match_labels: Some(match_labels.clone()),
+                match_expressions: None,
+            });
+    label_selector_as_selector(converted.as_ref())
+}
+
+/// The ReplicationController half of the pod event handlers: the RC rides the
+/// ReplicaSet controller (replication_controller.go:57-79) with its lister
+/// adapters, so `resolveControllerRef` is the RS one over the RC lister.
+impl<S: Storage + 'static> PodEventTarget for ReplicationControllerController<S> {
+    fn queue_prefix(&self) -> &'static str {
+        "replicationcontrollers"
+    }
+
+    /// `resolveControllerRef` (replica_set.go:302-321).
+    async fn resolve_controller_ref(
+        &self,
+        namespace: &str,
+        controller_ref: &ControllerRef,
+    ) -> Option<String> {
+        if controller_ref.kind != "ReplicationController" {
+            return None;
+        }
+        let rc: ReplicationController = self
+            .storage
+            .get(&build_key(
+                "replicationcontrollers",
+                Some(namespace),
+                &controller_ref.name,
+            ))
+            .await
+            .ok()?;
+        (rc.metadata.uid == controller_ref.uid).then_some(rc.metadata.name)
+    }
+
+    /// `ReplicationControllerLister.GetPodControllers` (client-go
+    /// `listers/core/v1/replicationcontroller_expansion.go:36-66`): a pod
+    /// without labels matches none, and "an rc with a nil or empty selector
+    /// creeps in, it should match nothing, not everything".
+    async fn pod_controllers(
+        &self,
+        namespace: &str,
+        pod_labels: &HashMap<String, String>,
+    ) -> Vec<String> {
+        if pod_labels.is_empty() {
+            return Vec::new();
+        }
+        let Ok(controllers) = self
+            .storage
+            .list::<ReplicationController>(&build_prefix("replicationcontrollers", Some(namespace)))
+            .await
+        else {
+            return Vec::new();
+        };
+        controllers
+            .into_iter()
+            .filter(|rc| {
+                rc.spec.selector.as_ref().is_some_and(|selector| {
+                    !selector.is_empty()
+                        && selector.iter().all(|(k, v)| pod_labels.get(k) == Some(v))
+                })
+            })
+            .map(|rc| rc.metadata.name)
+            .collect()
+    }
+
+    fn creation_observed(&self, key: &str) {
+        self.expectations.creation_observed(key);
+    }
+
+    fn deletion_observed(&self, key: &str, pod_key: &str) {
+        self.expectations.deletion_observed_of(key, pod_key);
     }
 }
 
@@ -2959,6 +3023,10 @@ pub(crate) mod tests {
         let storage = Arc::new(MemoryStorage::new());
         let controller = ReplicationControllerController::new(storage.clone(), 5);
         let queue = WorkQueue::new();
+        // `resolveControllerRef` needs the RC the pod's reference names.
+        let mut rc = make_rc("g", "default", 1, rc_selector("g"), None);
+        rc.metadata.uid = "u".to_string();
+        put_rc(&storage, &rc).await;
         controller.expectations.expect_deletions_of(
             "default/g",
             &["default/p1".to_string(), "default/p2".to_string()],
@@ -2969,7 +3037,7 @@ pub(crate) mod tests {
                 "namespace": "default",
                 "deletionTimestamp": "2026-10-07T00:00:00Z",
                 "ownerReferences": [{"apiVersion": "v1", "kind": "ReplicationController",
-                    "name": "g", "uid": "u"}]
+                    "name": "g", "uid": "u", "controller": true}]
             }
         })
         .to_string();
@@ -3270,7 +3338,7 @@ pub(crate) mod tests {
     // #3633 / #3634: selector semantics and informer event handlers. The RC
     // rides the RS controller (replication_controller.go:57-79); its lister
     // is `GetPodControllers` (client-go listers/core/v1/
-    // replicationcontroller_expansion.go:39-66) and its selector is
+    // replicationcontroller_expansion.go:36-66) and its selector is
     // `Convert_v1_ReplicationControllerSpec_To_apps_ReplicaSetSpec`
     // (pkg/apis/core/v1/conversion.go:117-130).
     // ---------------------------------------------------------------------
@@ -3543,5 +3611,52 @@ pub(crate) mod tests {
             )
             .await;
         assert!(queued(&queue).await.is_empty());
+    }
+
+    /// The worker wires `nextSyncDuration` to `queue.AddAfter` after `Forget`
+    /// (replica_set.go:786-788; the RC rides this code): a ready but not yet
+    /// available pod is re-checked by a second sync after `minReadySeconds`
+    /// with no watch event to wake the key. (`WorkQueue` times on
+    /// `std::time::Instant`, so a paused tokio clock cannot drive it; the delay
+    /// here is real and 1s.)
+    #[tokio::test]
+    async fn rc_worker_requeues_the_key_after_the_next_sync_duration() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = Arc::new(ReplicationControllerController::new(storage.clone(), 5));
+        let mut rc = make_rc("later", "default", 1, rc_selector("later"), None);
+        rc.spec.min_ready_seconds = Some(1);
+        seed_rc(&storage, &controller, &rc).await;
+        let mut pods = rc_pods(&storage).await;
+        make_ready(&mut pods[0], chrono::Utc::now());
+        write_pod(&storage, &pods[0]).await;
+        controller.expectations.delete_expectations("default/later");
+
+        let queue = WorkQueue::new();
+        let worker = tokio::spawn({
+            let controller = Arc::clone(&controller);
+            let queue = queue.clone();
+            async move { controller.worker(queue).await }
+        });
+        queue
+            .add("replicationcontrollers/default/later".to_string())
+            .await;
+
+        let available = async {
+            loop {
+                let rc: ReplicationController = storage
+                    .get("/registry/replicationcontrollers/default/later")
+                    .await
+                    .unwrap();
+                if rc.status.is_some_and(|s| s.available_replicas == Some(1)) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), available)
+            .await
+            .expect("the AddAfter must drive a second sync that sees the pod available");
+        queue.shutdown().await;
+        worker.await.unwrap();
     }
 }
