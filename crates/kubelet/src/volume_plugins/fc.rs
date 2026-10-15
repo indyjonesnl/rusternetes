@@ -369,6 +369,11 @@ impl super::plugin::DeviceMountableVolumePlugin for FcPlugin {
         Ok(Box::new(self.new_attacher_internal()))
     }
 
+    /// `NewDeviceUnmounter` (`attacher.go:158-160`): `plugin.NewDetacher()`.
+    fn new_device_unmounter(&self) -> Result<Box<dyn super::plugin::DeviceUnmounter>> {
+        Ok(Box::new(self.new_detacher_internal()))
+    }
+
     /// `GetDeviceMountRefs` (`attacher.go:60-63`).
     ///
     /// ```go

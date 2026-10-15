@@ -292,31 +292,16 @@ pub trait Attacher: DeviceMounter {
     ) -> Result<String>;
 }
 
-/// Port of `volume.DeviceUnmounter` (`pkg/volume/volume.go:323-329`).
-#[async_trait]
-pub trait DeviceUnmounter: Send + Sync {
-    /// `UnmountDevice` (`volume.go:328`): unmounts the global mount of the
-    /// disk. Only to be called once all bind mounts have been unmounted.
-    async fn unmount_device(&self, device_mount_path: &str) -> Result<()>;
-}
-
-/// Port of `volume.AttachableVolumePlugin` (`pkg/volume/plugins.go:228-236`),
-/// together with the two `DeviceMountableVolumePlugin` methods
-/// (`NewDeviceUnmounter`, `GetDeviceMountRefs`, `plugins.go:239-245`) that
-/// [`DeviceMountableVolumePlugin`] omits: no plugin but this one's implementers
-/// has a use for them, so they live here rather than forcing a stub on CSI.
-/// `NewDetacher`/`Detach` (attach/detach controller) and
-/// `VerifyExhaustedResource` are not ported. A plugin opts in by returning
-/// itself from [`VolumePlugin::as_attachable_plugin`].
+/// Port of `volume.AttachableVolumePlugin` (`pkg/volume/plugins.go:228-236`):
+/// a [`DeviceMountableVolumePlugin`] that also attaches. `NewDeviceUnmounter`
+/// and `GetDeviceMountRefs` live on [`DeviceMountableVolumePlugin`], as in
+/// upstream (`plugins.go:239-245`). `NewDetacher`/`Detach` (attach/detach
+/// controller), `CanAttach` and `VerifyExhaustedResource` are not ported. A
+/// plugin opts in by returning itself from
+/// [`VolumePlugin::as_attachable_plugin`].
 pub trait AttachableVolumePlugin: DeviceMountableVolumePlugin {
     /// `NewAttacher` (`plugins.go:230`).
     fn new_attacher(&self) -> Result<Box<dyn Attacher>>;
-
-    /// `NewDeviceUnmounter` (`plugins.go:241`).
-    fn new_device_unmounter(&self) -> Result<Box<dyn DeviceUnmounter>>;
-
-    /// `GetDeviceMountRefs` (`plugins.go:242`).
-    fn get_device_mount_refs(&self, device_mount_path: &str) -> Result<Vec<String>>;
 }
 
 /// Port of `volume.Unmounter` (`pkg/volume/volume.go:189-198`).

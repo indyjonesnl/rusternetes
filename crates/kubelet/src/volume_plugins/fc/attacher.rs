@@ -61,17 +61,6 @@ impl AttachableVolumePlugin for FcPlugin {
     fn new_attacher(&self) -> Result<Box<dyn Attacher>> {
         Ok(Box::new(self.new_attacher_internal()))
     }
-
-    /// `NewDeviceUnmounter` (`attacher.go:158-160`): `plugin.NewDetacher()`.
-    fn new_device_unmounter(&self) -> Result<Box<dyn DeviceUnmounter>> {
-        Ok(Box::new(self.new_detacher_internal()))
-    }
-
-    /// `GetDeviceMountRefs` (`attacher.go:60-63`).
-    fn get_device_mount_refs(&self, device_mount_path: &str) -> Result<Vec<String>> {
-        let mounter = self.host.get_mounter();
-        Ok(MountInterface::get_mount_refs(mounter, device_mount_path)?)
-    }
 }
 
 #[async_trait]
