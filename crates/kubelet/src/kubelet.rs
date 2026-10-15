@@ -1662,6 +1662,32 @@ impl Kubelet {
         }
     }
 
+    /// The host-IP block at the end of `generateAPIPodStatus`
+    /// (kubelet_pods.go:2005-2040): sets HostIP/HostIPs, lets hostNetwork pods
+    /// inherit the node IPs as PodIPs, and records `HostIPsIPFamilyMismatch`.
+    async fn apply_host_ips_to_pod(&self, pod: &mut Pod) {
+        let host_network = pod.spec.as_ref().and_then(|s| s.host_network) == Some(true);
+        let Some(status) = pod.status.as_mut() else {
+            return;
+        };
+        match self.get_host_ips_any_way() {
+            Ok(host_ips) => {
+                if let Some(msg) = crate::node_ip::apply_host_ips(host_network, status, &host_ips) {
+                    self.runtime
+                        .emit_event(
+                            pod,
+                            None,
+                            "HostIPsIPFamilyMismatch",
+                            rusternetes_common::resources::EventType::Warning,
+                            &msg,
+                        )
+                        .await;
+                }
+            }
+            Err(e) => debug!("Cannot get host IPs: {e}"),
+        }
+    }
+
     /// `nodestatus.NodeAddress(kl.nodeIPs, kl.nodeIPValidator, kl.hostname,
     /// kl.externalCloudProvider, utilnet.ResolveBindAddress)` applied to
     /// `node` (kubelet_node_status.go:678).
@@ -3696,6 +3722,7 @@ impl Kubelet {
                                 )),
                                 ..Default::default()
                             });
+                            self.apply_host_ips_to_pod(&mut new_pod).await;
 
                             if let Err(e) = self.storage.update_status(&key, &new_pod).await {
                                 // Retry with fresh read on conflict (K8s pattern)
@@ -3903,6 +3930,7 @@ impl Kubelet {
                                     start_time: Some(chrono::Utc::now()),
                                     ..Default::default()
                                 });
+                                self.apply_host_ips_to_pod(&mut new_pod).await;
 
                                 if let Err(e) = self.storage.update_status(&key, &new_pod).await {
                                     warn!(
@@ -4190,6 +4218,7 @@ impl Kubelet {
                         )),
                         ..Default::default()
                     });
+                    self.apply_host_ips_to_pod(&mut new_pod).await;
 
                     // Use non-fatal update: if the write fails (e.g., concurrency conflict),
                     // the next sync will retry via the Pending+is_running path.
