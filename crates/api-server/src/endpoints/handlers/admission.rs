@@ -37,12 +37,15 @@ use rusternetes_common::{Error, Result};
 use rusternetes_storage::Storage;
 
 use super::rest::{authorize, RequestScope};
+use crate::admission::caching_authorizer::new_caching_authorizer;
 use crate::admission::plugins::enabled as plugin_enabled;
 use crate::admission::{resourcequota, storage_object_in_use_protection};
 use crate::registry::rest::{
     GroupResource, Object, RequestContext, TransformFunc, ValidateObject, ValidateObjectUpdate,
 };
 use crate::state::ApiServerState;
+use rusternetes_admission_webhook::cel_evaluators::VapAuthorizer;
+use std::sync::Arc;
 
 /// One request's view of the admission chain: upstream's `admission.Interface`
 /// plus the static parts of `admission.NewAttributesRecord`.
@@ -877,13 +880,22 @@ impl Admission<'_> {
         if plugin_enabled("ValidatingAdmissionPolicy") {
             self.state
                 .webhook_manager
-                .run_validating_admission_policies_ext(
+                .run_validating_admission_policies_authz(
                     &op,
                     self.kind,
                     obj.as_ref(),
                     old.as_ref(),
                     Some(&self.request_resource().resource),
                     self.namespace,
+                    // The policy plugin's `SetAuthorizer` (WantsAuthorizer) value,
+                    // wrapped per dispatch (validating/dispatcher.go:117).
+                    Some(&VapAuthorizer {
+                        user: self.user.clone(),
+                        authorizer: Arc::new(new_caching_authorizer(
+                            self.state.unfiltered_authorizer.clone(),
+                        )),
+                        subresource: self.subresource.unwrap_or_default().to_string(),
+                    }),
                 )
                 .await?;
         }
