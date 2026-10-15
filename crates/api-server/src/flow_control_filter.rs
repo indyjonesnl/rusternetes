@@ -42,8 +42,9 @@
 //!   counters, and `watch_count_samples` (#2987). Not ported:
 //!   `RecordDroppedRequest`/`RecordRequestTermination` (see the module doc of
 //!   `flow_control_metrics`).
-//! - `getRequestWaitContext` has no request deadline to take 1/4 of (we have no
-//!   `WithRequestDeadline`/timeout filter), so the default limit applies:
+//! - `getRequestWaitContext` takes 1/4 of the deadline `WithRequestDeadline`
+//!   put on the request (`request_timeout::RequestDeadline`, incl. a user
+//!   `?timeout=`); long-running requests carry none and get the default limit,
 //!   `RequestTimeout/4` = 15s (config.go:445, :1027).
 //! - Public routes (health probes, discovery, metrics) are not behind the
 //!   filter; upstream sends the probes to the `exempt` level and discovery to a
@@ -462,6 +463,13 @@ pub async fn priority_and_fairness<S: Storage + 'static>(
     next: Next,
 ) -> Response {
     let attrs = request_info(req.method(), req.uri().path(), req.uri().query());
+    // `ctx.Deadline()` / `ReceivedTimestampFrom(ctx)`, set by
+    // `WithRequestDeadline` (request_timeout.rs); absent for long-running
+    // requests.
+    let request_deadline = req
+        .extensions()
+        .get::<crate::request_timeout::RequestDeadline>()
+        .copied();
     let method = req.method().clone();
     let query = req.uri().query().unwrap_or("").to_string();
     let apply_patch = req
@@ -552,7 +560,12 @@ pub async fn priority_and_fairness<S: Storage + 'static>(
     };
     let is_mutating = !NON_MUTATING_REQUEST_VERBS.contains(&attrs.verb.as_str());
 
-    let wait = request_wait_limit(Instant::now(), None, None, f.default_wait_limit);
+    let wait = request_wait_limit(
+        Instant::now(),
+        request_deadline.map(|d| d.received_at),
+        request_deadline.map(|d| d.deadline),
+        f.default_wait_limit,
+    );
     match f
         .engine
         .execute_with_estimate(&classification, &estimate, wait)
@@ -1331,6 +1344,93 @@ mod tests {
         assert!(
             started.elapsed() >= Duration::from_millis(70),
             "it queued first"
+        );
+        gate.notify_one();
+        let _ = held.await;
+    }
+
+    // `getRequestWaitContext` takes 1/4 of the deadline `WithRequestDeadline`
+    // put on the request context (priority-and-fairness.go:418-420), not the
+    // default wait limit. Through the real timeout middleware via `?timeout=`.
+    #[tokio::test]
+    async fn queue_wait_is_a_quarter_of_the_request_deadline() {
+        use rusternetes_common::resources::flowcontrol::{
+            LimitResponse, LimitResponseType, LimitedPriorityLevelConfiguration,
+            PriorityLevelConfiguration, QueuingConfiguration,
+        };
+        use rusternetes_common::types::ObjectMeta;
+        use rusternetes_common::validation::flowcontrol_bootstrap::mandatory_priority_level_configuration;
+        use rusternetes_storage::build_key;
+
+        let mut pl: PriorityLevelConfiguration =
+            mandatory_priority_level_configuration("catch-all").unwrap();
+        pl.metadata = ObjectMeta::new("catch-all");
+        pl.spec.limited = Some(LimitedPriorityLevelConfiguration {
+            nominal_concurrency_shares: Some(5),
+            lending_concurrency_limit: None,
+            lendable_percent: None,
+            borrowing_limit_percent: None,
+            limit_response: Some(LimitResponse {
+                type_: LimitResponseType::Queue,
+                queuing: Some(QueuingConfiguration {
+                    queues: 1,
+                    hand_size: 1,
+                    queue_length_limit: 10,
+                }),
+            }),
+        });
+        let st = Arc::new(MemoryStorage::new());
+        st.create(
+            &build_key("prioritylevelconfigurations", None, "catch-all"),
+            &pl,
+        )
+        .await
+        .unwrap();
+        let engine = Arc::new(FlowControlEngine::with_limits(st, 1, 0));
+        engine.initialize().await.unwrap();
+        // Default wait limit 5s; `?timeout=400ms` must override it (100ms).
+        let filter = Arc::new(ApfFilter::new(engine, Duration::from_secs(5)));
+
+        let gate = Arc::new(Notify::new());
+        let g = gate.clone();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let s = seen.clone();
+        let router = Router::new()
+            .route(
+                "/api/v1/namespaces/default",
+                get(move || {
+                    let (g, s) = (g.clone(), s.clone());
+                    async move {
+                        if s.fetch_add(1, Ordering::SeqCst) == 0 {
+                            g.notified().await;
+                        }
+                        "ok"
+                    }
+                }),
+            )
+            .layer(from_fn_with_state(
+                filter,
+                priority_and_fairness::<MemoryStorage>,
+            ))
+            .layer(axum::middleware::from_fn(
+                crate::request_timeout::request_timeout_middleware,
+            ));
+        let a = router.clone();
+        let held = tokio::spawn(async move {
+            a.oneshot(get_req("/api/v1/namespaces/default?timeout=400ms"))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let started = Instant::now();
+        let resp = router
+            .oneshot(get_req("/api/v1/namespaces/default?timeout=400ms"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "waited the default limit, not 1/4 of the deadline: {:?}",
+            started.elapsed()
         );
         gate.notify_one();
         let _ = held.await;

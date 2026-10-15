@@ -57,6 +57,17 @@ fn request_timeout() -> Duration {
         .unwrap_or(DEFAULT_REQUEST_TIMEOUT)
 }
 
+/// The request context's deadline and received timestamp, as
+/// `withRequestDeadline` leaves them in `req.Context()`
+/// (request_deadline.go:91-96): `ctx.Deadline()` and
+/// `apirequest.ReceivedTimestampFrom(ctx)`. Absent on long-running requests,
+/// which get no deadline (request_deadline.go:67-70).
+#[derive(Clone, Copy, Debug)]
+pub struct RequestDeadline {
+    pub received_at: std::time::Instant,
+    pub deadline: std::time::Instant,
+}
+
 /// `parseTimeout` (request_deadline.go:155-167): the user's `?timeout=`.
 pub fn parse_timeout(query: Option<&str>) -> Result<Option<Duration>, String> {
     let value = query
@@ -138,6 +149,13 @@ pub async fn request_timeout_middleware(req: Request, next: Next) -> Response {
         }
     };
     let deadline = started + timeout;
+    // `context.WithDeadline(ctx, started.Add(timeout))` (request_deadline.go:91-96):
+    // what `getRequestWaitContext` reads in APF.
+    let mut req = req;
+    req.extensions_mut().insert(RequestDeadline {
+        received_at: started.into_std(),
+        deadline: deadline.into_std(),
+    });
     match tokio::time::timeout_at(deadline, next.run(req)).await {
         Err(_) => {
             // `postTimeoutFn` (timeout.go:56-58).
