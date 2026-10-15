@@ -11,8 +11,6 @@
 //!   `NewMetricsBlock` is ported ([`super::util::metrics`]).
 //! - `ConstructVolumeSpec`'s `SELinuxMountContext` (`iscsi.go:286`, `:294`):
 //!   [`ReconstructedVolume`] cannot carry one (#2312, #3493).
-//! - `GetReliableMountRefs`'s retry on `IsInconsistentReadError`
-//!   (`util.go:664-683`): our mountinfo reader has no inconsistent-read error (#3495).
 //! - `VerifyExhaustedResource`, `NewDetacher`/`Detach` and the attach side of
 //!   `Attacher` (`Attach`, `VolumesAreAttached`): attach/detach-controller
 //!   interfaces with no kubelet caller (#3498).
@@ -677,13 +675,22 @@ impl CustomBlockVolumeUnmapper for IscsiDiskUnmapper {
     }
 }
 
-/// `getReliableMountRefs` (`util.go:664-683`) without the inconsistent-read
-/// retry (see the module docs).
+/// `GetReliableMountRefs` (`util.go:661-683`) plus the caller's
+/// `IsInconsistentReadError` logging (`iscsi.go:229-233`).
 fn get_reliable_mount_refs(
     mounter: &super::util::mount_ops::Mounter,
     mount_path: &str,
 ) -> Result<Vec<String>> {
-    Ok(MountInterface::get_mount_refs(mounter, mount_path)?)
+    match super::util::mount_utils::get_reliable_mount_refs(mounter, mount_path) {
+        Err(e) if super::util::mount_utils::is_inconsistent_read_error(&e) => {
+            tracing::error!("Failed to read mount refs from /proc/mounts for {mount_path}: {e}");
+            tracing::error!(
+                "Kubelet cannot unmount volume at {mount_path}, please unmount it and all mounts of the same device manually."
+            );
+            Err(e.into())
+        }
+        r => Ok(r?),
+    }
 }
 
 /// `portalMounter` (`iscsi.go:472-477`).

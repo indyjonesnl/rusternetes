@@ -1,6 +1,7 @@
 //! Port of `staging/src/k8s.io/mount-utils` (Linux): `ParseMountInfo`,
 //! `SearchMountPoints`, `Mounter.GetMountRefs`, `Mounter.IsMountPoint`,
-//! `IsNotMountPoint`, `PathWithinBase`, `IsCorruptedMnt`.
+//! `IsNotMountPoint`, `PathWithinBase`, `IsCorruptedMnt`, `ConsistentRead`
+//! and `GetReliableMountRefs`.
 //!
 //! Not ported (tracked separately): `Mount`/`MountSensitiveWithoutSystemd`
 //! (`mount_linux.go:163`), `Unmount`, `CleanupMountPoint`.
@@ -121,10 +122,156 @@ pub fn parse_mount_info_str(content: &str) -> Result<Vec<MountInfo>, String> {
     Ok(infos)
 }
 
+/// `maxListTries` (`mount_helper_unix.go:42`).
+const MAX_LIST_TRIES: usize = 10;
+
+/// `InconsistentReadError` (`k8s.io/utils/io/read.go`, vendored at
+/// `vendor/k8s.io/utils/io/read.go:62-72`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InconsistentReadError {
+    filename: String,
+    attempts: usize,
+}
+
+impl std::fmt::Display for InconsistentReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "could not get consistent content of {} after {} attempts",
+            self.filename, self.attempts
+        )
+    }
+}
+
+impl std::error::Error for InconsistentReadError {}
+
+/// `IsInconsistentReadError` (`vendor/k8s.io/utils/io/read.go:74-79`): Go's
+/// type assertion on the error value, which does not unwrap, so only an error
+/// carrying exactly an [`InconsistentReadError`] matches.
+pub fn is_inconsistent_read_error(err: &io::Error) -> bool {
+    err.get_ref()
+        .is_some_and(|e| e.downcast_ref::<InconsistentReadError>().is_some())
+}
+
+/// `consistentReadSync` (`vendor/k8s.io/utils/io/read.go:41-60`); `sync` is the
+/// hook the upstream tests use to mutate the file between reads.
+fn consistent_read_sync(
+    filename: &str,
+    attempts: usize,
+    mut sync: Option<&mut dyn FnMut(usize)>,
+) -> io::Result<Vec<u8>> {
+    let mut old_content = std::fs::read(filename)?;
+    for i in 0..attempts {
+        if let Some(f) = sync.as_mut() {
+            f(i);
+        }
+        let new_content = std::fs::read(filename)?;
+        if old_content == new_content {
+            return Ok(new_content);
+        }
+        // Files are different, continue reading
+        old_content = new_content;
+    }
+    Err(io::Error::other(InconsistentReadError {
+        filename: filename.to_string(),
+        attempts,
+    }))
+}
+
+/// `ConsistentRead` (`vendor/k8s.io/utils/io/read.go:30-32`): reads a file
+/// until it gets the same content twice.
+pub fn consistent_read(filename: &str, attempts: usize) -> io::Result<Vec<u8>> {
+    consistent_read_sync(filename, attempts, None)
+}
+
+/// `kernelHasMountinfoBug` (`mount_helper_unix.go:211-247`): the bug was fixed
+/// by kernel commit 9f6c61f96f2d97 (since Linux 5.8).
+fn kernel_has_mountinfo_bug() -> bool {
+    static HAS_BUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HAS_BUG.get_or_init(|| {
+        // Assume old kernel when uname fails.
+        // SAFETY: a zeroed utsname is a valid out-parameter for uname(2).
+        let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
+        if unsafe { libc::uname(&mut uts) } != 0 {
+            return true;
+        }
+        let release: Vec<u8> = uts
+            .release
+            .iter()
+            .take_while(|c| **c != 0)
+            .map(|c| *c as u8)
+            .collect();
+        kernel_release_has_mountinfo_bug(&release)
+    })
+}
+
+/// The version test inside `kernelHasMountinfoBug`: `SplitN(release, ".", 3)`
+/// must give three parts, then `major > 5 || (major == 5 && minor >= 8)` is
+/// fixed.
+fn kernel_release_has_mountinfo_bug(release: &[u8]) -> bool {
+    let v: Vec<&[u8]> = release.splitn(3, |b| *b == b'.').collect();
+    if v.len() != 3 {
+        return true;
+    }
+    // strconv.Atoi errors are ignored upstream (value 0).
+    let atoi = |b: &[u8]| {
+        std::str::from_utf8(b)
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0)
+    };
+    let (major, minor) = (atoi(v[0]), atoi(v[1]));
+    !(major > 5 || (major == 5 && minor >= 8))
+}
+
+/// `readMountInfo` (`mount_helper_unix.go:250-256`).
+fn read_mount_info(path: &str) -> io::Result<Vec<u8>> {
+    if kernel_has_mountinfo_bug() {
+        return consistent_read(path, MAX_LIST_TRIES);
+    }
+    std::fs::read(path)
+}
+
 /// `ParseMountInfo` (`mount_helper_unix.go:102`).
 pub fn parse_mount_info(filename: &str) -> io::Result<Vec<MountInfo>> {
-    let content = std::fs::read_to_string(filename)?;
+    let content = read_mount_info(filename)?;
+    let content = String::from_utf8_lossy(&content);
     parse_mount_info_str(&content).map_err(io::Error::other)
+}
+
+/// `GetReliableMountRefs` (`pkg/volume/util/util.go:661-683`): calls
+/// `GetMountRefs` and retries on [`is_inconsistent_read_error`], polling
+/// immediately then every 10ms for up to a minute.
+pub fn get_reliable_mount_refs<M: super::mount_interface::MountInterface + ?Sized>(
+    mounter: &M,
+    mount_path: &str,
+) -> io::Result<Vec<String>> {
+    get_reliable_mount_refs_with(
+        std::time::Duration::from_millis(10),
+        std::time::Duration::from_secs(60),
+        || mounter.get_mount_refs(mount_path),
+    )
+}
+
+/// `wait.PollImmediate(interval, timeout, ..)` around `GetMountRefs`; on
+/// timeout (`wait.Interrupted`) the last inconsistent-read error is returned.
+fn get_reliable_mount_refs_with(
+    interval: std::time::Duration,
+    timeout: std::time::Duration,
+    mut get: impl FnMut() -> io::Result<Vec<String>>,
+) -> io::Result<Vec<String>> {
+    let start = std::time::Instant::now();
+    loop {
+        match get() {
+            Err(e) if is_inconsistent_read_error(&e) => {
+                if start.elapsed() >= timeout {
+                    return Err(e);
+                }
+                std::thread::sleep(interval);
+            }
+            r => return r,
+        }
+    }
 }
 
 /// Go `path.Clean` for the subset we need (lexical).
@@ -378,5 +525,111 @@ mod tests {
         assert!(is_corrupted_mnt(&io::Error::from_raw_os_error(107))); // ENOTCONN
         assert!(is_corrupted_mnt(&io::Error::from_raw_os_error(116))); // ESTALE
         assert!(!is_corrupted_mnt(&io::Error::from_raw_os_error(2))); // ENOENT
+    }
+    #[test]
+    fn consistent_read_returns_stable_content() {
+        let f = write_tmp("abc");
+        let got = consistent_read(f.path().to_str().unwrap(), 3).unwrap();
+        assert_eq!(got, b"abc");
+    }
+
+    #[test]
+    fn consistent_read_reports_inconsistent_after_attempts() {
+        // The file changes between every pair of reads (upstream's
+        // consistentReadSync `sync` hook), so it never stabilises.
+        let f = write_tmp("0");
+        let path = f.path().to_str().unwrap().to_string();
+        let mut sync = |i: usize| std::fs::write(&path, format!("{}", i + 1)).unwrap();
+        let err = consistent_read_sync(&path, 5, Some(&mut sync)).unwrap_err();
+        assert!(is_inconsistent_read_error(&err));
+        assert_eq!(
+            err.to_string(),
+            format!("could not get consistent content of {path} after 5 attempts")
+        );
+    }
+
+    #[test]
+    fn consistent_read_succeeds_once_content_settles() {
+        let f = write_tmp("0");
+        let path = f.path().to_str().unwrap().to_string();
+        let mut sync = |i: usize| {
+            if i < 2 {
+                std::fs::write(&path, format!("{}", i + 1)).unwrap();
+            }
+        };
+        let got = consistent_read_sync(&path, 5, Some(&mut sync)).unwrap();
+        assert_eq!(got, b"2");
+    }
+
+    #[test]
+    fn plain_io_errors_are_not_inconsistent_reads() {
+        assert!(!is_inconsistent_read_error(&io::Error::other("x")));
+        assert!(!is_inconsistent_read_error(&io::Error::from(
+            io::ErrorKind::NotFound
+        )));
+    }
+
+    #[test]
+    fn kernel_release_bug_gate() {
+        let bug = kernel_release_has_mountinfo_bug;
+        assert!(!bug(b"5.8.0"));
+        assert!(!bug(b"6.1.0-generic"));
+        assert!(bug(b"5.7.19"));
+        assert!(bug(b"4.19.0"));
+        assert!(bug(b"5.15")); // fewer than 3 parts: assume old kernel
+    }
+
+    fn inconsistent() -> io::Error {
+        io::Error::other(InconsistentReadError {
+            filename: "/proc/self/mountinfo".into(),
+            attempts: 10,
+        })
+    }
+
+    #[test]
+    fn reliable_mount_refs_retries_inconsistent_reads() {
+        let mut calls = 0;
+        let got = get_reliable_mount_refs_with(
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_secs(5),
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Err(inconsistent())
+                } else {
+                    Ok(vec!["/a".to_string()])
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(got, vec!["/a".to_string()]);
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn reliable_mount_refs_returns_other_errors_immediately() {
+        let mut calls = 0;
+        let err = get_reliable_mount_refs_with(
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_secs(5),
+            || {
+                calls += 1;
+                Err(io::Error::other("boom"))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "boom");
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn reliable_mount_refs_times_out_with_last_inconsistent_error() {
+        let err = get_reliable_mount_refs_with(
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(20),
+            || Err(inconsistent()),
+        )
+        .unwrap_err();
+        assert!(is_inconsistent_read_error(&err));
     }
 }
