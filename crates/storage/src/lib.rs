@@ -822,20 +822,25 @@ where
     use rusternetes_common::patch::{apply_patch, PatchType};
     const MAX_ATTEMPTS: usize = 8;
     for attempt in 0..MAX_ATTEMPTS {
-        let mut current: serde_json::Value = storage.get(key).await?;
+        let current: serde_json::Value = storage.get(key).await?;
         let merged = apply_patch(&current, patch, PatchType::StrategicMergePatch)
             .map_err(|e| Error::InvalidResource(format!("invalid status patch for {key}: {e}")))?;
-        if let Some(obj) = current.as_object_mut() {
-            match merged.get("status") {
-                Some(status) => {
-                    obj.insert("status".to_string(), status.clone());
+        // `nodeStatusStrategy.PrepareForUpdate` (pkg/registry/core/node/
+        // strategy.go:179-187) restores only `Spec` from the stored object;
+        // metadata changes carried by the patch apply (PatchNodeStatus does
+        // not reset ObjectMeta, component-helpers/node/util/status.go:55-61).
+        let mut next = merged;
+        if let Some(obj) = next.as_object_mut() {
+            match current.get("spec") {
+                Some(spec) => {
+                    obj.insert("spec".to_string(), spec.clone());
                 }
                 None => {
-                    obj.remove("status");
+                    obj.remove("spec");
                 }
             }
         }
-        match storage.update::<serde_json::Value>(key, &current).await {
+        match storage.update::<serde_json::Value>(key, &next).await {
             Ok(updated) => return serde_json::from_value(updated).map_err(Error::Serialization),
             Err(Error::Conflict(_)) if attempt + 1 < MAX_ATTEMPTS => continue,
             Err(e) => return Err(e),

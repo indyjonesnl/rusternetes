@@ -50,6 +50,10 @@ pub struct KubeletConfig {
     pub sync_interval: u64,
     pub metrics_port: u16,
     pub kubernetes_service_host: String,
+    /// Kubelet `--node-ip` (empty = unset).
+    pub node_ip: String,
+    /// Kubelet `--cloud-provider` (empty or `external`).
+    pub cloud_provider: String,
 }
 
 impl Default for KubeletConfig {
@@ -63,6 +67,8 @@ impl Default for KubeletConfig {
             sync_interval: 3,
             metrics_port: 10250,
             kubernetes_service_host: "10.96.0.1".to_string(),
+            node_ip: String::new(),
+            cloud_provider: String::new(),
         }
     }
 }
@@ -76,6 +82,12 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
         "Starting Rusternetes Kubelet for node: {}",
         config.node_name
     );
+
+    // RunKubelet: ParseNodeIPArgument + NewMainKubelet's cloud-provider gate
+    // (server.go:1216-1222, kubelet.go:461-464, 619).
+    let (node_ips, external_cloud_provider) =
+        node_ip::node_ip_config(&config.node_ip, &config.cloud_provider)
+            .map_err(|e| anyhow::anyhow!(e))?;
 
     // Discover cluster DNS if not hardcoded
     let cluster_dns = {
@@ -147,6 +159,8 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
             // The all-in-one binary doesn't expose --allowed-unsafe-sysctls;
             // default to none (unsafe sysctls rejected with SysctlForbidden).
             Vec::new(),
+            node_ips,
+            external_cloud_provider,
         )
         .await?,
     );
