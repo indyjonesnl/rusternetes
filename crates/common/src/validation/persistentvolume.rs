@@ -1533,6 +1533,37 @@ mod update_tests {
         );
     }
 
+    /// validation.go:2282-2284: the immutability error appends
+    /// `diff.Diff(oldPv.Spec.PersistentVolumeSource, newPv.Spec.PersistentVolumeSource)`,
+    /// a unified diff (context 3) of `json.MarshalIndent` of the INTERNAL
+    /// `core.PersistentVolumeSource` (Go field names, declaration order, nil
+    /// pointers as `null`).
+    #[test]
+    fn changed_source_error_carries_diff_text() {
+        let old = hostpath_pv("/data");
+        let new = hostpath_pv("/other");
+        let errs = validate_persistent_volume_update(&new, &old);
+        let e = errs
+            .iter()
+            .find(|e| e.field == "spec.persistentvolumesource")
+            .unwrap_or_else(|| panic!("{errs:?}"));
+        assert_eq!(
+            e.detail,
+            concat!(
+                "spec.persistentvolumesource is immutable after creation\n",
+                "@@ -2,7 +2,7 @@\n",
+                "  \"GCEPersistentDisk\": null,\n",
+                "  \"AWSElasticBlockStore\": null,\n",
+                "  \"HostPath\": {\n",
+                "-  \"Path\": \"/data\",\n",
+                "+  \"Path\": \"/other\",\n",
+                "   \"Type\": null\n",
+                "  },\n",
+                "  \"Glusterfs\": null,\n",
+            )
+        );
+    }
+
     #[test]
     fn changed_volume_mode_rejected() {
         let mut old = hostpath_pv("/data");

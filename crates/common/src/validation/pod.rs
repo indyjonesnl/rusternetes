@@ -4968,6 +4968,47 @@ mod tests {
         assert!(errs[0].to_string().contains("field is immutable"));
     }
 
+    /// validation.go:5830-5834: the forbidden error appends
+    /// `diff.Diff(oldPod.Spec, mungedPodSpec)` — a unified diff (context 3) of
+    /// `json.MarshalIndent` of the INTERNAL `core.PodSpec` (Go field names,
+    /// declaration order, nil pointers/slices as `null`, `SecurityContext`
+    /// always an object because the v1 conversion allocates it).
+    #[test]
+    fn pod_spec_update_forbidden_carries_diff_text() {
+        let spec = |node: &str| -> PodSpec {
+            serde_json::from_value(serde_json::json!({
+                "containers": [{"name": "c", "image": "i"}],
+                "restartPolicy": "Always",
+                "nodeName": node
+            }))
+            .unwrap()
+        };
+        let errs = validate_pod_spec_update(&spec("a"), &spec("b"), false);
+        let e = errs
+            .iter()
+            .find(|e| {
+                e.detail
+                    .starts_with("pod updates may not change fields other than")
+            })
+            .unwrap_or_else(|| panic!("{errs:?}"));
+        let want = format!(
+            "pod updates may not change fields other than {}\n{}",
+            UPDATABLE_POD_SPEC_FIELDS.join(","),
+            concat!(
+                "@@ -42,7 +42,7 @@\n",
+                "  \"NodeSelector\": null,\n",
+                "  \"ServiceAccountName\": \"\",\n",
+                "  \"AutomountServiceAccountToken\": null,\n",
+                "- \"NodeName\": \"a\",\n",
+                "+ \"NodeName\": \"b\",\n",
+                "  \"SecurityContext\": {\n",
+                "   \"HostNetwork\": false,\n",
+                "   \"HostPID\": false,\n",
+            )
+        );
+        assert_eq!(e.detail, want);
+    }
+
     #[test]
     fn active_deadline_update_allows_nil_to_positive() {
         let old = pod_spec_with_active_deadline(None);
