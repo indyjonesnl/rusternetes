@@ -11,6 +11,18 @@ where
     Ok(opt.unwrap_or_default())
 }
 
+/// Go's zero `time.Time` (`0001-01-01T00:00:00Z`), the value a required
+/// `metav1.Time` / `metav1.MicroTime` holds when unset.
+fn go_zero_time() -> DateTime<Utc> {
+    use chrono::TimeZone;
+    Utc.with_ymd_and_hms(1, 1, 1, 0, 0, 0).unwrap()
+}
+
+/// `Time.IsZero()`.
+fn is_go_zero_time(t: &DateTime<Utc>) -> bool {
+    *t == go_zero_time()
+}
+
 pub mod sorted_opt_map {
     //! Serialize an `Option<HashMap<String, String>>` with keys sorted, as
     //! Go's `encoding/json` does for maps. A `HashMap` otherwise emits in
@@ -124,6 +136,11 @@ pub mod k8s_time_required {
     where
         S: Serializer,
     {
+        // `Time.MarshalJSON` / `MicroTime.MarshalJSON` (time.go:162-166,
+        // micro_time.go:175-178): the zero time encodes as `null`.
+        if super::is_go_zero_time(date) {
+            return serializer.serialize_none();
+        }
         serializer.serialize_str(&date.format("%Y-%m-%dT%H:%M:%SZ").to_string())
     }
 
@@ -131,7 +148,11 @@ pub mod k8s_time_required {
     where
         D: Deserializer<'de>,
     {
-        let s = String::deserialize(deserializer)?;
+        // `Time.UnmarshalJSON` / `MicroTime.UnmarshalJSON` (time.go:100-104,
+        // micro_time.go:113-117): `null` is the zero time, not an error.
+        let Some(s) = Option::<String>::deserialize(deserializer)? else {
+            return Ok(super::go_zero_time());
+        };
         if let Ok(dt) = DateTime::parse_from_rfc3339(&s) {
             return Ok(dt.with_timezone(&Utc));
         }
@@ -191,6 +212,11 @@ pub mod k8s_micro_time_required {
     where
         S: Serializer,
     {
+        // `Time.MarshalJSON` / `MicroTime.MarshalJSON` (time.go:162-166,
+        // micro_time.go:175-178): the zero time encodes as `null`.
+        if super::is_go_zero_time(date) {
+            return serializer.serialize_none();
+        }
         serializer.serialize_str(&date.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string())
     }
 
@@ -198,7 +224,11 @@ pub mod k8s_micro_time_required {
     where
         D: Deserializer<'de>,
     {
-        let s = String::deserialize(deserializer)?;
+        // `Time.UnmarshalJSON` / `MicroTime.UnmarshalJSON` (time.go:100-104,
+        // micro_time.go:113-117): `null` is the zero time, not an error.
+        let Some(s) = Option::<String>::deserialize(deserializer)? else {
+            return Ok(super::go_zero_time());
+        };
         if let Ok(dt) = DateTime::parse_from_rfc3339(&s) {
             return Ok(dt.with_timezone(&Utc));
         }
@@ -1350,6 +1380,30 @@ pub struct ManagedFieldsEntry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn required_times_accept_null_and_emit_null_for_zero() {
+        // Time.UnmarshalJSON time.go:100-104; MarshalJSON time.go:162-166.
+        #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+        struct W {
+            #[serde(with = "super::k8s_time_required")]
+            t: chrono::DateTime<chrono::Utc>,
+            #[serde(with = "super::k8s_micro_time_required")]
+            m: chrono::DateTime<chrono::Utc>,
+        }
+        let w: W = serde_json::from_str(r#"{"t":null,"m":null}"#).unwrap();
+        assert_eq!(w.t, super::go_zero_time());
+        assert_eq!(w.m, super::go_zero_time());
+        assert_eq!(serde_json::to_string(&w).unwrap(), r#"{"t":null,"m":null}"#);
+        let w: W = serde_json::from_str(
+            r#"{"t":"2024-01-02T03:04:05Z","m":"2024-01-02T03:04:05.123456Z"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string(&w).unwrap(),
+            r#"{"t":"2024-01-02T03:04:05Z","m":"2024-01-02T03:04:05.123456Z"}"#
+        );
+    }
+
     use super::*;
 
     /// metav1.ObjectMeta: `Name string `json:"name,omitempty"``
