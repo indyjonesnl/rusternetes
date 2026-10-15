@@ -135,9 +135,10 @@ pub struct UpdateOptions {
 /// `strconv.ParseUint(rv, 10, 64)` rejects is
 /// `storage.NewInvalidError(field.ErrorList{field.Invalid(
 /// field.NewPath("resourceVersion"), rv, err.Error())})`. That is a plain
-/// error, NOT a `Status`: each caller decides what it becomes (only
-/// `InterpretWatchError`, storage/errors/storage.go:116-120, makes it a
-/// `NewInvalid`).
+/// error, NOT a `Status`: each caller decides what it becomes. Watch and Get
+/// return it untouched (a 500); `InterpretWatchError`
+/// (storage/errors/storage.go:116-120) would make it a `NewInvalid`, but
+/// nothing in release-1.35 calls it.
 pub fn parse_resource_version_str(rv: &str) -> std::result::Result<u64, Vec<FieldError>> {
     if rv.is_empty() || rv == "0" {
         return Ok(0);
