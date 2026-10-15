@@ -623,13 +623,14 @@ async fn async_main() -> Result<()> {
     info!("All components started");
 
     // The API server task blocks on its listener — wait for it or ctrl-c
+    let shutdown_ctx = rusternetes_common::signal::setup_signal_context();
     tokio::select! {
         result = api_handle => {
             if let Err(e) = result {
                 error!("API server task panicked: {}", e);
             }
         }
-        _ = tokio::signal::ctrl_c() => {
+        _ = shutdown_ctx.cancelled() => {
             info!("Received shutdown signal, stopping rusternetes");
         }
     }

@@ -1558,8 +1558,16 @@ async fn main() -> Result<()> {
 
     info!("All controllers started successfully");
 
-    // Keep the main thread alive
-    tokio::signal::ctrl_c().await?;
+    // Keep the main thread alive until SIGTERM/SIGINT. As PID 1 in a container
+    // a process with no SIGTERM handler ignores the signal, so register one.
+    // Upstream kube-controller-manager runs with `context.Background()`
+    // (cmd/kube-controller-manager/app/controllermanager.go:136) and does NOT set
+    // ReleaseOnCancel on its election (only kube-scheduler does, options.go:375);
+    // a SIGTERM terminates the process and the lease expires, so the elector is
+    // deliberately not released here.
+    rusternetes_common::signal::setup_signal_context()
+        .cancelled()
+        .await;
     info!("Shutting down controller manager");
     // Cancel the context Run(ctx) hands to each provisioner (controller.go:1749).
     for p in &csi_provisioner_handles {

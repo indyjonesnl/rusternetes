@@ -230,6 +230,10 @@ async fn main() -> Result<()> {
         axum::serve(listener, app).await.unwrap();
     });
 
+    // cmd/kube-scheduler/app/server.go:150-156: SetupSignalHandler (SIGTERM+SIGINT)
+    // cancels the run context.
+    let ctx = rusternetes_common::signal::setup_signal_context();
+
     // Leader election
     if args.enable_leader_election {
         let etcd_endpoints: Vec<String> = args
@@ -254,11 +258,28 @@ async fn main() -> Result<()> {
 
         let elector = Arc::new(LeaderElector::new(etcd_endpoints, config).await?);
         let elector_clone = elector.clone();
-        tokio::spawn(async move {
+        let election = tokio::spawn(async move {
             if let Err(e) = elector_clone.run().await {
                 tracing::error!("Leader election error: {}", e);
             }
         });
+        // ReleaseOnCancel: true (cmd/kube-scheduler/app/options/options.go:375):
+        // on cancel, give up the lock; bounded by RenewDeadline (leaderelection.go:304-307).
+        let release_timeout =
+            std::time::Duration::from_secs((args.leader_election_lease_duration * 2 / 3).max(1));
+        let releaser = {
+            let ctx = ctx.clone();
+            let elector = elector.clone();
+            tokio::spawn(async move {
+                rusternetes_common::leader_election::release_on_cancel(
+                    &ctx,
+                    || async move { elector.shutdown().await },
+                    election,
+                    release_timeout,
+                )
+                .await
+            })
+        };
 
         let scheduler = Arc::new(Scheduler::new_with_profiles(
             storage,
@@ -267,11 +288,33 @@ async fn main() -> Result<()> {
         ));
         loop {
             while !elector.is_leader().await {
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {}
+                    _ = ctx.cancelled() => {
+                        info!("Requested to terminate, exiting");
+                        let _ = releaser.await;
+                        return Ok(());
+                    }
+                }
             }
             info!("Scheduler starting (leader acquired)");
-            if let Err(e) = Arc::clone(&scheduler).run().await {
-                tracing::error!("Scheduler error: {}", e);
+            tokio::select! {
+                r = Arc::clone(&scheduler).run() => {
+                    if let Err(e) = r {
+                        tracing::error!("Scheduler error: {}", e);
+                    }
+                }
+                _ = ctx.cancelled() => {
+                    // OnStoppedLeading with ctx.Done(): "Requested to terminate, exiting"
+                    // (server.go:310-316). Wait for release() to finish first.
+                    info!("Requested to terminate, exiting");
+                    let _ = releaser.await;
+                    return Ok(());
+                }
+            }
+            if ctx.is_cancelled() {
+                let _ = releaser.await;
+                return Ok(());
             }
             if !elector.is_leader().await {
                 warn!("Scheduler stopped (lost leadership)");
@@ -286,7 +329,10 @@ async fn main() -> Result<()> {
             args.interval,
             profiles.clone(),
         ));
-        scheduler.run().await?;
+        tokio::select! {
+            r = scheduler.run() => r?,
+            _ = ctx.cancelled() => info!("Requested to terminate, exiting"),
+        }
     }
 
     Ok(())
@@ -367,6 +413,12 @@ async fn run_api_mode(
         profiles.clone(),
     ));
     info!("Scheduler starting (API mode, single instance, no leader election)");
-    scheduler.run().await?;
+    // cmd/kube-scheduler/app/server.go:150-156: SetupSignalHandler cancels the
+    // run context on SIGTERM/SIGINT.
+    let ctx = rusternetes_common::signal::setup_signal_context();
+    tokio::select! {
+        r = scheduler.run() => r?,
+        _ = ctx.cancelled() => info!("Requested to terminate, exiting"),
+    }
     Ok(())
 }
