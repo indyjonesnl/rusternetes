@@ -429,31 +429,34 @@ pub fn capacity_limiter(
     })
 }
 
-/// STUB (red commit): replaced by the coalescing queue in the next commit.
-#[allow(dead_code)]
+/// The `csitopology` workqueue of `NewNodeTopology` (nodes.go:49, built in
+/// csi-provisioner.go:488-494), whose only key is `""`. The Node and CSINode
+/// handlers just `queue.Add("")` (nodes.go:71, :89, :102, :114, :134, :147);
+/// `RunWorker` (:212-228) runs one `sync` per `queue.Get`. A workqueue holds a
+/// key once however often it is added, and an `Add` while the key is being
+/// processed queues it once more when `Done` runs, which is exactly the one
+/// stored permit of a `Notify`: a burst of events is one `sync`, so n node
+/// registrations do not cost n recomputations.
+///
+/// The queue is never used rate-limited: `sync` has no failure path that
+/// re-adds the key (nodes.go:259-262 and :277-281 log and return), so the
+/// `NewTypedItemExponentialFailureRateLimiter(retryIntervalStart,
+/// retryIntervalMax)` upstream passes in is dead weight and there is no retry
+/// to port; the next event (or the initial `Add`) is what triggers a sync.
 #[derive(Default)]
 pub struct TopologyQueue {
-    pending: std::sync::atomic::AtomicUsize,
     notify: tokio::sync::Notify,
 }
 
-#[allow(dead_code)]
 impl TopologyQueue {
+    /// `queue.Add("")`.
     pub fn add(&self) {
-        self.pending
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.notify.notify_one();
     }
+
+    /// `queue.Get()`: resolves once something was added since the last `get`.
     pub async fn get(&self) {
-        use std::sync::atomic::Ordering::SeqCst;
-        loop {
-            let n = self.pending.load(SeqCst);
-            if n > 0 {
-                self.pending.store(n - 1, SeqCst);
-                return;
-            }
-            self.notify.notified().await;
-        }
+        self.notify.notified().await;
     }
 }
 
@@ -1183,19 +1186,43 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
     }
 
     /// `NewNodeTopology`'s Node and CSINode handlers (nodes.go:63-150) and its
-    /// `RunWorker`: whenever something relevant changed, recompute the segments
-    /// and call `onTopologyChanges`. A fixed topology never changes.
+    /// `RunWorker`: whenever something relevant changed, queue a recompute of
+    /// the segments (coalesced by [`TopologyQueue`]) that calls
+    /// `onTopologyChanges`. A fixed topology never changes.
     async fn run_topology(
         &self,
         topology: &TopologySource,
-        mut nodes: Option<rusternetes_storage::WatchStream>,
-        mut csinodes: Option<rusternetes_storage::WatchStream>,
+        nodes: Option<rusternetes_storage::WatchStream>,
+        csinodes: Option<rusternetes_storage::WatchStream>,
     ) {
-        use futures::StreamExt;
-        use rusternetes_storage::WatchEvent;
         if matches!(topology, TopologySource::Fixed(_)) {
             return std::future::pending().await;
         }
+        let queue = TopologyQueue::default();
+        // `nt.queue.Add("") // Initial sync` (nodes.go:225).
+        queue.add();
+        tokio::join!(
+            // `RunWorker` (nodes.go:226-243): the one worker.
+            async {
+                loop {
+                    queue.get().await;
+                    self.sync_topology(topology).await;
+                }
+            },
+            self.watch_topology(nodes, csinodes, &queue),
+        );
+    }
+
+    /// The Node and CSINode event handlers of `NewNodeTopology`
+    /// (nodes.go:63-150): they only `queue.Add("")`.
+    async fn watch_topology(
+        &self,
+        mut nodes: Option<rusternetes_storage::WatchStream>,
+        mut csinodes: Option<rusternetes_storage::WatchStream>,
+        queue: &TopologyQueue,
+    ) {
+        use futures::StreamExt;
+        use rusternetes_storage::WatchEvent;
         let node_prefix = build_prefix("nodes", None);
         let csinode_prefix = build_prefix("csinodes", None);
         // What the handlers' `oldObj` provides in Go: node labels and the
@@ -1214,7 +1241,7 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
                         tracing::error!("topology watch failed");
                         continue;
                     };
-                    self.sync_topology(topology).await;
+                    queue.add();
                     (n, c)
                 }
             };
@@ -1284,7 +1311,7 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
                     },
                 };
                 if changed {
-                    self.sync_topology(topology).await;
+                    queue.add();
                 }
             }
         }
