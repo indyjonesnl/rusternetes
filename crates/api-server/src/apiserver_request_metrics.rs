@@ -28,8 +28,10 @@
 //! size is the declared/exact body length (zero for unsized streams) rather
 //! than bytes written; (3) `RecordLongRunning` is applied as a response-body
 //! guard for WATCH/CONNECT verbs, so upgraded (101) exec/attach/portforward
-//! connections are not held open by it; (4) no `requested_deprecated_apis`
-//! gauge.
+//! connections are not held open by it; (4) `deprecated`/`removedRelease` are
+//! resolved per request from `crate::deprecation` instead of being captured
+//! per route at install time (`installer.go:781-797`); the endpoint-level
+//! `Warning:` header is not emitted.
 
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
@@ -385,6 +387,19 @@ pub fn monitor_request(
             .with_label_values(&[&verb, group, resource, &req.subresource])
             .inc();
     }
+    // `deprecated` / `removedRelease` are fixed per route at install time
+    // (installer.go:781-797); resolved here from the request's resource.
+    let (deprecated, removed_release) =
+        crate::deprecation::deprecation_for(group, version, resource, &req.subresource);
+    if deprecated {
+        DEPRECATED_REQUEST_GAUGE
+            .with_label_values(&[group, version, resource, &req.subresource, &removed_release])
+            .set(1);
+        crate::audit::add_audit_annotation(DEPRECATED_ANNOTATION_KEY, "true");
+        if !removed_release.is_empty() {
+            crate::audit::add_audit_annotation(REMOVED_RELEASE_ANNOTATION_KEY, &removed_release);
+        }
+    }
     REQUEST_LATENCIES
         .with_label_values(&[
             &verb,
@@ -453,6 +468,20 @@ pub(crate) fn clean_field_validation(query: &str) -> String {
     }
     values[0].to_string()
 }
+
+/// `deprecatedRequestGauge` (metrics.go:66-74).
+static DEPRECATED_REQUEST_GAUGE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    gauge_vec(
+        "requested_deprecated_apis",
+        "Gauge of deprecated APIs that have been requested, broken out by API group, version, resource, subresource, and removed_release.",
+        &["group", "version", "resource", "subresource", "removed_release"],
+    )
+});
+
+/// `deprecatedAnnotationKey` (metrics.go:380-382).
+const DEPRECATED_ANNOTATION_KEY: &str = "k8s.io/deprecated";
+/// `removedReleaseAnnotationKey` (metrics.go:383-387).
+const REMOVED_RELEASE_ANNOTATION_KEY: &str = "k8s.io/removed-release";
 
 /// `apiSelfRequestCounter` (metrics.go:222-230).
 static API_SELF_REQUEST_COUNTER: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -1172,5 +1201,110 @@ mod tests {
         let before = sample("apiserver_request_aborts_total", &l);
         record_request_abort(&meta("abortedthings"));
         assert_eq!(sample("apiserver_request_aborts_total", &l), before + 1.0);
+    }
+
+    fn deprecated_meta(group: &str, version: &str, resource: &str) -> RequestMeta {
+        RequestMeta {
+            api_group: group.into(),
+            api_version: version.into(),
+            ..meta(resource)
+        }
+    }
+
+    // MonitorRequest (metrics.go:609-615): a request to a deprecated API
+    // version sets apiserver_requested_deprecated_apis{...removed_release}=1.
+    #[test]
+    fn deprecated_api_request_sets_gauge() {
+        use crate::flow_control::metric_test_util::{has_series, sample};
+        let l = [
+            ("group", "apps"),
+            ("version", "v1beta1"),
+            ("resource", "deployments"),
+            ("subresource", ""),
+            ("removed_release", "1.16"),
+        ];
+        assert!(!has_series("apiserver_requested_deprecated_apis", &l));
+        monitor_request(
+            &deprecated_meta("apps", "v1beta1", "deployments"),
+            "apiserver",
+            200,
+            Duration::ZERO,
+            0,
+            None,
+        );
+        assert_eq!(sample("apiserver_requested_deprecated_apis", &l), 1.0);
+        // A stable version is not recorded.
+        monitor_request(
+            &deprecated_meta("apps", "v1", "deployments"),
+            "apiserver",
+            200,
+            Duration::ZERO,
+            0,
+            None,
+        );
+        assert!(!has_series(
+            "apiserver_requested_deprecated_apis",
+            &[("group", "apps"), ("version", "v1")]
+        ));
+    }
+
+    struct CaptureSink(tokio::sync::Mutex<Vec<rusternetes_common::audit::AuditEvent>>);
+    #[async_trait::async_trait]
+    impl rusternetes_common::audit::AuditBackend for CaptureSink {
+        async fn log(&self, e: rusternetes_common::audit::AuditEvent) -> Result<(), String> {
+            self.0.lock().await.push(e);
+            Ok(())
+        }
+        async fn flush(&self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    // MonitorRequest (metrics.go:609-615): audit annotations
+    // k8s.io/deprecated="true" and k8s.io/removed-release on a deprecated route.
+    #[tokio::test]
+    async fn deprecated_api_request_adds_audit_annotations() {
+        use axum::{body::Body, http::Request, middleware, routing::get, Router};
+        use tower::ServiceExt;
+        let sink = Arc::new(CaptureSink(Default::default()));
+        let cfg = Arc::new(crate::audit::AuditConfig {
+            policy: crate::audit::Policy::from_yaml(
+                "apiVersion: audit.k8s.io/v1\nkind: Policy\nomitStages: [\"RequestReceived\"]\nrules:\n- level: Metadata\n",
+            )
+            .unwrap(),
+            sink: sink.clone(),
+        });
+        let app = Router::new()
+            .route(
+                "/apis/extensions/v1beta1/namespaces/:ns/ingresses",
+                get(|| async { "ok" }),
+            )
+            .layer(middleware::from_fn(instrument_request))
+            .layer(middleware::from_fn(move |req, next| {
+                let cfg = cfg.clone();
+                async move { crate::audit::with_audit(cfg, req, next).await }
+            }));
+        let resp = app
+            .oneshot(
+                Request::get("/apis/extensions/v1beta1/namespaces/default/ingresses")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let events = sink.0.lock().await;
+        let ann = events
+            .iter()
+            .find_map(|e| e.annotations.clone())
+            .expect("annotated event");
+        assert_eq!(
+            ann.get("k8s.io/deprecated").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            ann.get("k8s.io/removed-release").map(String::as_str),
+            Some("1.22")
+        );
     }
 }

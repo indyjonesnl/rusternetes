@@ -16,6 +16,7 @@ mod legacy_token_tracking;
 pub use rusternetes_admission_webhook::cel_evaluators as cel;
 mod apiserver_request_metrics;
 mod conversion;
+mod deprecation;
 mod dynamic_routes;
 mod endpoints;
 #[allow(dead_code)]
