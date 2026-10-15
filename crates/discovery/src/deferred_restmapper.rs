@@ -15,9 +15,11 @@
 //! Rust-only: the discovery "client" is an async [`DiscoveryClient`] (the
 //! served groups are computed from storage), so the lookups are `async`.
 //! The recursion upstream (`d.KindFor(resource)` after `d.Reset()`) is a loop
-//! with the same exit conditions.
+//! with the same exit conditions. `memCacheClient`'s aggregated-discovery and
+//! per-group-version transient-error handling have no counterpart: the
+//! served groups are computed in one call.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -49,84 +51,187 @@ pub trait DiscoveryClient: Send + Sync {
     async fn group_resources(&self) -> Result<Vec<ApiGroupResources>, MapperError>;
 }
 
+#[derive(Default)]
+struct CacheState {
+    /// `cacheValid`.
+    valid: bool,
+    /// Bumped by every `Invalidate`: a refresh that raced one must not
+    /// repopulate the cache (upstream holds `d.lock` across `Invalidate` and
+    /// `refreshLocked`, memcache.go:220-232, 235).
+    generation: u64,
+    /// `groupList` + `groupToServerResources`.
+    groups: Option<Arc<Vec<ApiGroupResources>>>,
+}
+
 /// `memCacheClient`.
 pub struct MemCacheClient<C: DiscoveryClient> {
     delegate: Arc<C>,
+    state: Mutex<CacheState>,
 }
 
 impl<C: DiscoveryClient> MemCacheClient<C> {
     /// `NewMemCacheClient`.
     pub fn new(delegate: Arc<C>) -> Self {
-        Self { delegate }
+        Self {
+            delegate,
+            state: Mutex::new(CacheState::default()),
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, CacheState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
 #[async_trait]
 impl<C: DiscoveryClient> CachedDiscovery for MemCacheClient<C> {
+    /// "Whether the cache is populated at all" (memcache.go:213-215).
     fn fresh(&self) -> bool {
-        false
+        self.state().valid
     }
-    fn invalidate(&self) {}
+
+    fn invalidate(&self) {
+        let mut s = self.state();
+        s.valid = false;
+        s.groups = None;
+        s.generation += 1;
+    }
+
+    /// `if !d.cacheValid { d.refreshLocked() }` (memcache.go:100-108): the
+    /// cache is populated on first use after an invalidation.
     async fn group_resources(&self) -> Result<Vec<ApiGroupResources>, MapperError> {
-        self.delegate.group_resources().await
+        let generation = {
+            let s = self.state();
+            if s.valid {
+                if let Some(g) = &s.groups {
+                    return Ok(g.as_ref().clone());
+                }
+            }
+            s.generation
+        };
+        // refreshLocked: an error leaves the cache invalid (memcache.go:
+        // 270-274, `return err`).
+        let groups = Arc::new(self.delegate.group_resources().await?);
+        let mut s = self.state();
+        if s.generation == generation {
+            s.groups = Some(groups.clone());
+            s.valid = true;
+        }
+        Ok(groups.as_ref().clone())
     }
 }
 
 /// `DeferredDiscoveryRESTMapper`.
 pub struct DeferredRestMapper<D: CachedDiscovery> {
+    /// `initMu` + `delegate`.
+    delegate: tokio::sync::Mutex<Option<Arc<PriorityRestMapper>>>,
     cl: Arc<D>,
 }
 
 impl<D: CachedDiscovery> DeferredRestMapper<D> {
     /// `NewDeferredDiscoveryRESTMapper`.
     pub fn new(cl: Arc<D>) -> Self {
-        Self { cl }
+        Self {
+            delegate: tokio::sync::Mutex::new(None),
+            cl,
+        }
     }
 
+    /// `getDelegate` (discovery.go:194-211).
     async fn get_delegate(&self) -> Result<Arc<PriorityRestMapper>, MapperError> {
-        let groups = self.cl.group_resources().await?;
-        Ok(Arc::new(new_discovery_rest_mapper(&groups)))
+        let mut delegate = self.delegate.lock().await;
+        if let Some(d) = delegate.as_ref() {
+            return Ok(d.clone());
+        }
+        let group_resources = self.cl.group_resources().await?;
+        let d = Arc::new(new_discovery_rest_mapper(&group_resources));
+        *delegate = Some(d.clone());
+        Ok(d)
     }
 
-    /// `Reset`.
+    /// `Reset` (discovery.go:213-222): "resets the internally cached
+    /// Discovery information and will cause the next mapping request to
+    /// re-discover".
     pub async fn reset(&self) {
+        let mut delegate = self.delegate.lock().await;
         self.cl.invalidate();
+        *delegate = None;
     }
 
+    /// The guard every lookup shares: run `lookup` on the delegate and, when
+    /// `missed` and the client is not fresh, `Reset` and run it again
+    /// (`if err != nil && !d.cl.Fresh() { d.Reset(); ... }`).
+    async fn lookup<T>(
+        &self,
+        lookup: impl Fn(&PriorityRestMapper) -> Result<T, MapperError>,
+        missed: impl Fn(&Result<T, MapperError>) -> bool,
+    ) -> Result<T, MapperError> {
+        loop {
+            let del = self.get_delegate().await?;
+            let r = lookup(&del);
+            if missed(&r) && !self.cl.fresh() {
+                self.reset().await;
+                continue;
+            }
+            return r;
+        }
+    }
+
+    /// `KindFor` (discovery.go:225-237).
     pub async fn kind_for(&self, resource: &Gvr) -> Result<Gvk, MapperError> {
-        self.get_delegate().await?.kind_for(resource)
+        self.lookup(|m| m.kind_for(resource), |r| r.is_err()).await
     }
 
+    /// `KindsFor` (discovery.go:240-252): retries on `len(gvks) == 0`.
     pub async fn kinds_for(&self, resource: &Gvr) -> Result<Vec<Gvk>, MapperError> {
-        self.get_delegate().await?.kinds_for(resource)
+        self.lookup(
+            |m| m.kinds_for(resource),
+            |r| r.as_ref().map_or(true, |v| v.is_empty()),
+        )
+        .await
     }
 
+    /// `ResourceFor` (discovery.go:255-267).
     pub async fn resource_for(&self, input: &Gvr) -> Result<Gvr, MapperError> {
-        self.get_delegate().await?.resource_for(input)
+        self.lookup(|m| m.resource_for(input), |r| r.is_err()).await
     }
 
+    /// `ResourcesFor` (discovery.go:270-282): retries on `len(gvrs) == 0`.
     pub async fn resources_for(&self, input: &Gvr) -> Result<Vec<Gvr>, MapperError> {
-        self.get_delegate().await?.resources_for(input)
+        self.lookup(
+            |m| m.resources_for(input),
+            |r| r.as_ref().map_or(true, |v| v.is_empty()),
+        )
+        .await
     }
 
+    /// `RESTMapping` (discovery.go:285-298).
     pub async fn rest_mapping(
         &self,
         gk: &Gk,
         versions: &[&str],
     ) -> Result<RestMapping, MapperError> {
-        self.get_delegate().await?.rest_mapping(gk, versions)
+        self.lookup(|m| m.rest_mapping(gk, versions), |r| r.is_err())
+            .await
     }
 
+    /// `RESTMappings` (discovery.go:301-313): retries on `len(ms) == 0`.
     pub async fn rest_mappings(
         &self,
         gk: &Gk,
         versions: &[&str],
     ) -> Result<Vec<RestMapping>, MapperError> {
-        self.get_delegate().await?.rest_mappings(gk, versions)
+        self.lookup(
+            |m| m.rest_mappings(gk, versions),
+            |r| r.as_ref().map_or(true, |v| v.is_empty()),
+        )
+        .await
     }
 
+    /// `ResourceSingularizer` (discovery.go:316-327).
     pub async fn resource_singularizer(&self, resource: &str) -> Result<String, MapperError> {
-        self.get_delegate().await?.resource_singularizer(resource)
+        self.lookup(|m| m.resource_singularizer(resource), |r| r.is_err())
+            .await
     }
 }
 
@@ -250,8 +355,10 @@ mod tests {
         assert_eq!(m.rest_mappings(&gk, &[]).await.unwrap().len(), 1);
         assert_eq!(1, calls(&c), "rest_mappings");
         let (c, m) = new();
-        assert_eq!(m.resource_singularizer("foo").await.unwrap(), "foo");
-        assert_eq!(1, calls(&c), "resource_singularizer");
+        // DefaultRESTMapper.ResourceSingularizer never errors on an unknown
+        // resource (restmapper.go:152-180), so it never invalidates.
+        m.resource_singularizer("foo").await.unwrap();
+        assert_eq!(0, calls(&c), "resource_singularizer");
     }
 
     /// `Reset` (discovery.go:213-222): invalidates the client and drops the
