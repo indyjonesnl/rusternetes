@@ -1336,10 +1336,22 @@ pub async fn repair_service_node_ports_once(
 // Used by the test harness (test_support), not by the binary.
 #[allow(dead_code)]
 pub async fn repair_service_cluster_ips_once(
-    state: &crate::state::ApiServerState,
+    state: &Arc<crate::state::ApiServerState>,
 ) -> rusternetes_common::Result<()> {
     use crate::registry::core::service::ipallocator::repair::RepairIpAddress;
-    RepairIpAddress::new(state.storage.clone()).run_once().await
+    RepairIpAddress::new(state.storage.clone(), ip_address_loopback(state))
+        .run_once()
+        .await
+}
+
+/// The loopback client `RepairIPAddress` writes IPAddresses through
+/// (`NewRepairIPAddress(..., client, ...)`,
+/// pkg/registry/core/rest/storage_core.go:142-148), the same one the
+/// ClusterIP allocators use.
+fn ip_address_loopback(
+    state: &Arc<crate::state::ApiServerState>,
+) -> Arc<dyn crate::registry::core::service::ipallocator::IpAddressClient> {
+    Arc::new(crate::registry::networking::ipaddress::Loopback::new(state))
 }
 
 /// Run `pass` now and every `REPAIR_INTERVAL` after, signalling the first
@@ -1381,12 +1393,15 @@ where
 /// `REPAIR_INTERVAL`, and fail startup unless both first passes succeed
 /// within one minute.
 pub async fn start_service_ip_repair_controllers(
-    state: &crate::state::ApiServerState,
+    state: &Arc<crate::state::ApiServerState>,
 ) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
     use crate::registry::core::service::ipallocator::repair::RepairIpAddress;
     use crate::registry::core::service::portallocator::repair::Repair;
 
-    let ip_repair = Arc::new(RepairIpAddress::new(state.storage.clone()));
+    let ip_repair = Arc::new(RepairIpAddress::new(
+        state.storage.clone(),
+        ip_address_loopback(state),
+    ));
     let ip_repair_workers = ip_repair.clone();
     let (ip_handle, ip_first) = spawn_repair_loop("service ClusterIP repair", move || {
         let ip_repair = ip_repair.clone();

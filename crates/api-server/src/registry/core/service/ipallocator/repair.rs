@@ -11,6 +11,11 @@
 //! resync), and `spawn_workers` adds the event-driven workers over the
 //! storage watch, with the same queues, 5 workers each, `maxRetries` and
 //! `AddAfter` requeue of a leaked IPAddress.
+//!
+//! Reads go to storage (upstream's listers); every IPAddress write goes
+//! through `r.client` (repairip.go:373, :430, :434, :495, :512, :552), the
+//! api-server's loopback client (storage_core.go:142-148), so the IPAddress
+//! Store and admission see the repair's creates and deletes.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -28,8 +33,8 @@ use rusternetes_storage::{build_key, EventRecorder, Storage};
 use tracing::{error, warn};
 
 use super::{
-    family_of, ip_address_key, new_ip_address, prefix_contains_ip, CONTROLLER_NAME,
-    IP_ADDRESS_PREFIX, LABEL_IP_ADDRESS_FAMILY, LABEL_MANAGED_BY,
+    family_of, ip_address_key, new_ip_address, prefix_contains_ip, IpAddressClient,
+    CONTROLLER_NAME, IP_ADDRESS_PREFIX, LABEL_IP_ADDRESS_FAMILY, LABEL_MANAGED_BY,
 };
 
 /// `maxRetries` (repairip.go:57): a key is retried this many times before
@@ -56,6 +61,9 @@ const DEFAULT_SERVICE_CIDR_NAME: &str = "kubernetes";
 
 /// `RepairIPAddress` (repairip.go:83-103).
 pub struct RepairIpAddress<S: Storage + 'static> {
+    /// `client kubernetes.Interface` (repairip.go:90): the IPAddress
+    /// writes.
+    client: Arc<dyn IpAddressClient>,
     storage: Arc<S>,
     recorder: EventRecorder<S>,
     /// `clock.Clock` (repairip.go:102), injectable for the tests.
@@ -125,8 +133,9 @@ fn svc_key(ns: &str, name: &str) -> String {
 
 impl<S: Storage + 'static> RepairIpAddress<S> {
     /// `NewRepairIPAddress` (repairip.go:105-113).
-    pub fn new(storage: Arc<S>) -> Self {
+    pub fn new(storage: Arc<S>, client: Arc<dyn IpAddressClient>) -> Self {
         Self {
+            client,
             recorder: EventRecorder::new(storage.clone()),
             storage,
             clock: Arc::new(Utc::now),
@@ -286,14 +295,7 @@ impl<S: Storage + 'static> RepairIpAddress<S> {
                     .await;
                     error!("the ClusterIP [{family}]: {ip} for Service {ns}/{name} is not allocated; repairing");
                     let name = ip.to_string();
-                    match self
-                        .storage
-                        .create(&ip_address_key(&name), &new_ip_address(&name, Some(svc)))
-                        .await
-                    {
-                        Ok(_) | Err(Error::AlreadyExists(_)) => {}
-                        Err(e) => return Err(e),
-                    }
+                    self.client.create(new_ip_address(&name, Some(svc))).await?;
                     continue;
                 }
                 Err(e) => {
@@ -354,18 +356,18 @@ impl<S: Storage + 'static> RepairIpAddress<S> {
 
     /// `recreateIPAddress` (repairip.go:417-427).
     async fn recreate_ip_address(&self, name: &str, svc: &Service) -> Result<()> {
-        match self.storage.delete(&ip_address_key(name)).await {
+        match self.client.delete(name).await {
             Ok(()) | Err(Error::NotFound(_)) => {}
             Err(e) => return Err(e),
         }
-        self.storage
-            .create(&ip_address_key(name), &new_ip_address(name, Some(svc)))
-            .await?;
-        Ok(())
+        self.client.create(new_ip_address(name, Some(svc))).await
     }
 
+    /// `r.client.NetworkingV1().IPAddresses().Delete(...)` with
+    /// `!apierrors.IsNotFound(err)` (repairip.go:495-498, :512-515,
+    /// :552-555).
     async fn delete_ip_address(&self, name: &str) -> Result<()> {
-        match self.storage.delete(&ip_address_key(name)).await {
+        match self.client.delete(name).await {
             Ok(()) | Err(Error::NotFound(_)) => Ok(()),
             Err(e) => Err(e),
         }
@@ -569,6 +571,44 @@ mod tests {
     use rusternetes_storage::MemoryStorage;
     use serde_json::json;
 
+    /// `fake.NewSimpleClientset()` with the create/delete reactors of
+    /// `newFakeRepair` (repairip_test.go:54-90): writes land in storage
+    /// (the informer indexers) and each is recorded as a `(verb,
+    /// resource)` action for `expectAction`.
+    struct FakeClient {
+        storage: Arc<MemoryStorage>,
+        actions: std::sync::Mutex<Vec<[&'static str; 2]>>,
+    }
+
+    impl FakeClient {
+        fn new(storage: Arc<MemoryStorage>) -> Arc<Self> {
+            Arc::new(Self {
+                storage,
+                actions: Default::default(),
+            })
+        }
+
+        fn actions(&self) -> Vec<[&'static str; 2]> {
+            self.actions.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl IpAddressClient for FakeClient {
+        async fn create(&self, ip: IPAddress) -> Result<()> {
+            self.actions.lock().unwrap().push(["create", "ipaddresses"]);
+            self.storage
+                .create(&ip_address_key(&ip.metadata.name), &ip)
+                .await
+                .map(|_| ())
+        }
+
+        async fn delete(&self, name: &str) -> Result<()> {
+            self.actions.lock().unwrap().push(["delete", "ipaddresses"]);
+            self.storage.delete(&ip_address_key(name)).await
+        }
+    }
+
     const V4: &str = "10.0.0.0/16";
     const V6: &str = "2001:db8::/64";
 
@@ -619,6 +659,8 @@ mod tests {
         expected_ips: &'static [&'static str],
         /// IPAddresses that must be gone afterwards.
         deleted_ips: &'static [&'static str],
+        /// `actions [][]string // verb and resource`.
+        actions: &'static [[&'static str; 2]],
         events: &'static [&'static str],
     }
 
@@ -642,7 +684,8 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let r = RepairIpAddress::new(storage.clone()).with_clock(tc.test_time);
+        let client = FakeClient::new(storage.clone());
+        let r = RepairIpAddress::new(storage.clone(), client.clone()).with_clock(tc.test_time);
         r.run_once()
             .await
             .unwrap_or_else(|e| panic!("{}: {e}", tc.name));
@@ -667,6 +710,8 @@ mod tests {
                 tc.name
             );
         }
+        // `expectAction(t, c.Actions(), test.actions)`.
+        assert_eq!(client.actions(), tc.actions, "{}: actions", tc.name);
         // One Event per (object, reason): repeated reasons aggregate.
         let events: Vec<Event> = storage.list("/registry/events/").await.unwrap();
         let got: HashSet<String> = events
@@ -703,6 +748,7 @@ mod tests {
                 test_time: t0(),
                 expected_ips: &["10.0.1.1"],
                 deleted_ips: &[],
+                actions: &[],
                 events: &[],
             },
             Case {
@@ -716,6 +762,7 @@ mod tests {
                 test_time: t0(),
                 expected_ips: &["10.0.1.1", "2001:db8::10"],
                 deleted_ips: &[],
+                actions: &[],
                 events: &[],
             },
             Case {
@@ -732,6 +779,7 @@ mod tests {
                 test_time: t0(),
                 expected_ips: &["192.168.0.1", "2001:db8:a:b::10"],
                 deleted_ips: &[],
+                actions: &[],
                 events: &[],
             },
             Case {
@@ -742,6 +790,7 @@ mod tests {
                 test_time: t0(),
                 expected_ips: &["10.0.1.1"],
                 deleted_ips: &[],
+                actions: &[["create", "ipaddresses"]],
                 events: &["Warning ClusterIPNotAllocated Cluster IP [IPv4]: 10.0.1.1 is not allocated; repairing"],
             },
             Case {
@@ -752,6 +801,7 @@ mod tests {
                 test_time: t0(),
                 expected_ips: &["10.0.1.1", "2001:db8::10"],
                 deleted_ips: &[],
+                actions: &[["create", "ipaddresses"], ["create", "ipaddresses"]],
                 events: &[
                     "Warning ClusterIPNotAllocated Cluster IP [IPv4]: 10.0.1.1 is not allocated; repairing",
                     "Warning ClusterIPNotAllocated Cluster IP [IPv6]: 2001:db8::10 is not allocated; repairing",
@@ -765,6 +815,7 @@ mod tests {
                 test_time: t0(),
                 expected_ips: &["192.168.1.1"],
                 deleted_ips: &[],
+                actions: &[["create", "ipaddresses"]],
                 events: &["Warning ClusterIPNotAllocated Cluster IP [IPv4]: 192.168.1.1 is not allocated; repairing"],
             },
             Case {
@@ -775,7 +826,25 @@ mod tests {
                 test_time: t0(),
                 expected_ips: &["10.0.1.1"],
                 deleted_ips: &[],
+                actions: &[["delete", "ipaddresses"], ["create", "ipaddresses"]],
                 events: &["Warning ClusterIPNotAllocated the ClusterIP [IPv4]: 10.0.1.1 for Service bar/test-svc has a wrong reference; repairing"],
+            },
+            Case {
+                name: "reconcile IPAddresses dual stack",
+                svcs: vec![svc("test-svc", &["10.0.1.1", "2001:db8::10"], t0() - chrono::Duration::seconds(1))],
+                ip_addresses: vec![
+                    ip_address("10.0.1.1", "test-svc2", t0()),
+                    ip_address("2001:db8::10", "test-svc2", t0()),
+                ],
+                cidrs: k8s(),
+                test_time: t0(),
+                expected_ips: &["10.0.1.1", "2001:db8::10"],
+                deleted_ips: &[],
+                actions: &[["delete", "ipaddresses"], ["create", "ipaddresses"], ["delete", "ipaddresses"], ["create", "ipaddresses"]],
+                events: &[
+                    "Warning ClusterIPNotAllocated the ClusterIP [IPv4]: 10.0.1.1 for Service bar/test-svc has a wrong reference; repairing",
+                    "Warning ClusterIPNotAllocated the ClusterIP [IPv6]: 2001:db8::10 for Service bar/test-svc has a wrong reference; repairing",
+                ],
             },
             Case {
                 name: "one IP out of range",
@@ -788,6 +857,7 @@ mod tests {
                 test_time: t0(),
                 expected_ips: &["2001:db8::10"],
                 deleted_ips: &[],
+                actions: &[],
                 events: &["Warning ClusterIPOutOfRange Cluster IP [IPv4]: 192.168.1.1 is not within any configured Service CIDR; please recreate service"],
             },
             Case {
@@ -798,6 +868,7 @@ mod tests {
                 test_time: t0(),
                 expected_ips: &["10.0.1.1"],
                 deleted_ips: &[],
+                actions: &[],
                 events: &[],
             },
             Case {
@@ -808,6 +879,7 @@ mod tests {
                 test_time: secs(70),
                 expected_ips: &[],
                 deleted_ips: &["10.0.1.1"],
+                actions: &[["delete", "ipaddresses"]],
                 events: &["Warning IPAddressNotAllocated IPAddress: 10.0.1.1 for Service bar/test-svc appears to have leaked: cleaning up"],
             },
             Case {
@@ -818,6 +890,7 @@ mod tests {
                 test_time: t0(),
                 expected_ips: &["10.0.0.0"],
                 deleted_ips: &[],
+                actions: &[],
                 events: &["Warning ClusterIPOutOfRange Cluster IP [IPv4]: 10.0.0.0 is not within any configured Service CIDR; please recreate service"],
             },
             Case {
@@ -828,6 +901,7 @@ mod tests {
                 test_time: t0(),
                 expected_ips: &["10.0.255.255"],
                 deleted_ips: &[],
+                actions: &[],
                 events: &["Warning ClusterIPOutOfRange Cluster IP [IPv4]: 10.0.255.255 is not within any configured Service CIDR; please recreate service"],
             },
             Case {
@@ -838,6 +912,7 @@ mod tests {
                 test_time: t0(),
                 expected_ips: &["2001:db8::"],
                 deleted_ips: &[],
+                actions: &[],
                 events: &["Warning ClusterIPOutOfRange Cluster IP [IPv6]: 2001:db8:: is not within any configured Service CIDR; please recreate service"],
             },
             Case {
@@ -848,7 +923,30 @@ mod tests {
                 test_time: t0(),
                 expected_ips: &["2001:db8::ffff:ffff:ffff:ffff"],
                 deleted_ips: &[],
+                actions: &[],
                 events: &[],
+            },
+            Case {
+                name: "one IP orphan matching the broadcast address within grace period",
+                svcs: vec![],
+                ip_addresses: vec![ip_address("10.0.255.255", "test-svc", t0())],
+                cidrs: k8s(),
+                test_time: t0(),
+                expected_ips: &["10.0.255.255"],
+                deleted_ips: &[],
+                actions: &[],
+                events: &[],
+            },
+            Case {
+                name: "one IP orphan matching the broadcast address after grace period",
+                svcs: vec![],
+                ip_addresses: vec![ip_address("10.0.255.255", "test-svc", t0())],
+                cidrs: k8s(),
+                test_time: secs(90),
+                expected_ips: &[],
+                deleted_ips: &["10.0.255.255"],
+                actions: &[["delete", "ipaddresses"]],
+                events: &["Warning IPAddressNotAllocated IPAddress: 10.0.255.255 for Service bar/test-svc appears to have leaked: cleaning up"],
             },
             Case {
                 name: "Two IPAddresses referencing the same service",
@@ -861,6 +959,7 @@ mod tests {
                 test_time: t0(),
                 expected_ips: &["10.0.1.1"],
                 deleted_ips: &["10.0.1.2"],
+                actions: &[["delete", "ipaddresses"]],
                 events: &["Warning IPAddressWrongReference IPAddress: 10.0.1.2 for Service bar/test-svc has a wrong reference; cleaning up"],
             },
             Case {
@@ -874,6 +973,7 @@ mod tests {
                 test_time: secs(3),
                 expected_ips: &["10.0.1.1", "10.0.1.2"],
                 deleted_ips: &[],
+                actions: &[],
                 events: &[],
             },
             Case {
@@ -887,6 +987,7 @@ mod tests {
                 test_time: secs(10),
                 expected_ips: &["10.0.1.1"],
                 deleted_ips: &["10.0.1.2"],
+                actions: &[["delete", "ipaddresses"]],
                 events: &["Warning IPAddressWrongReference IPAddress: 10.0.1.2 for Service bar/test-svc has a wrong reference; cleaning up"],
             },
             Case {
@@ -900,6 +1001,7 @@ mod tests {
                 test_time: t0(),
                 expected_ips: &["10.0.1.1"],
                 deleted_ips: &[],
+                actions: &[],
                 events: &["Warning ClusterIPAlreadyAllocated Cluster IP [IPv4]:10.0.1.1 was assigned to multiple services; please recreate service"],
             },
         ];
@@ -924,7 +1026,8 @@ mod tests {
             .create(&ip_address_key("2001:db8::11"), &ip)
             .await
             .unwrap();
-        let r = RepairIpAddress::new(storage.clone()).with_clock(secs(3600));
+        let r = RepairIpAddress::new(storage.clone(), FakeClient::new(storage.clone()))
+            .with_clock(secs(3600));
         r.sync_ip_address(&ip).await.unwrap();
         assert!(storage
             .get::<IPAddress>(&ip_address_key("2001:db8::11"))
@@ -943,7 +1046,8 @@ mod tests {
             .create(&ip_address_key("2001:db8::12"), &ip)
             .await
             .unwrap();
-        let r = RepairIpAddress::new(storage.clone()).with_clock(secs(20));
+        let r = RepairIpAddress::new(storage.clone(), FakeClient::new(storage.clone()))
+            .with_clock(secs(20));
         assert_eq!(
             r.sync_ip_address(&ip).await.unwrap(),
             Some(Duration::from_secs(40))
@@ -973,7 +1077,10 @@ mod tests {
     #[tokio::test]
     async fn workers_delete_a_leaked_ip_address_on_its_event() {
         let storage = Arc::new(MemoryStorage::new());
-        let r = Arc::new(RepairIpAddress::new(storage.clone()).with_clock(secs(3600)));
+        let r = Arc::new(
+            RepairIpAddress::new(storage.clone(), FakeClient::new(storage.clone()))
+                .with_clock(secs(3600)),
+        );
         let handles = r.spawn_workers();
         tokio::time::sleep(Duration::from_millis(100)).await;
         storage
@@ -1004,7 +1111,10 @@ mod tests {
             )
             .await
             .unwrap();
-        let r = Arc::new(RepairIpAddress::new(storage.clone()));
+        let r = Arc::new(RepairIpAddress::new(
+            storage.clone(),
+            FakeClient::new(storage.clone()),
+        ));
         let handles = r.spawn_workers();
         tokio::time::sleep(Duration::from_millis(100)).await;
         storage

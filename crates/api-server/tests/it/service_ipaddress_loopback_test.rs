@@ -132,3 +132,96 @@ async fn a_webhook_that_denies_the_ipaddress_fails_the_service_create() {
     let (s, _) = api.get(&format!("{SVCS}/a")).await;
     assert_eq!(s, StatusCode::NOT_FOUND, "no Service without its IP");
 }
+
+/// The ClusterIP repair writes the IPAddress it recreates through the same
+/// loopback client (#2433). Upstream `RepairIPAddress` holds the
+/// api-server's loopback `kubernetes.Interface`
+/// (pkg/registry/core/rest/storage_core.go:142-148) and calls
+/// `r.client.NetworkingV1().IPAddresses().Create(...)` for a Service whose
+/// ClusterIP has no IPAddress (pkg/registry/core/service/ipallocator/
+/// controller/repairip.go:373), so a webhook on `ipaddresses` sees it.
+#[tokio::test]
+async fn a_webhook_on_ipaddresses_sees_the_repair_create() {
+    use rusternetes_api_server::state::ApiServerState;
+    use rusternetes_common::auth::TokenManager;
+    use rusternetes_common::authz::AlwaysAllowAuthorizer;
+    use rusternetes_common::observability::MetricsRegistry;
+    use rusternetes_common::resources::{Service, ServiceCIDR};
+    use rusternetes_storage::{MemoryStorage, StorageBackend};
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (url, _stop) = start_webhook(false, seen.clone()).await;
+
+    let mem = Arc::new(MemoryStorage::new());
+    let state = Arc::new(ApiServerState::new(
+        Arc::new(StorageBackend::Memory(mem.clone())),
+        Arc::new(TokenManager::new(b"secret")),
+        Arc::new(AlwaysAllowAuthorizer),
+        Arc::new(MetricsRegistry::new()),
+        true,
+    ));
+    let cfg: rusternetes_common::resources::ValidatingWebhookConfiguration =
+        serde_json::from_value(json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "ip.example.com"},
+            "webhooks": [{
+                "name": "ip.example.com",
+                "clientConfig": {"url": url},
+                "rules": [{
+                    "operations": ["CREATE", "DELETE"],
+                    "apiGroups": ["networking.k8s.io"],
+                    "apiVersions": ["v1"],
+                    "resources": ["ipaddresses"]
+                }],
+                "failurePolicy": "Fail",
+                "sideEffects": "None",
+                "admissionReviewVersions": ["v1"]
+            }]
+        }))
+        .unwrap();
+    mem.create(
+        &build_key("validatingwebhookconfigurations", None, "ip.example.com"),
+        &cfg,
+    )
+    .await
+    .unwrap();
+    mem.create(
+        &build_key("servicecidrs", None, "kubernetes"),
+        &ServiceCIDR::new("kubernetes", vec!["10.0.0.0/16".to_string()]),
+    )
+    .await
+    .unwrap();
+    // A Service stored without its IPAddress (e.g. from before the
+    // IPAddress allocator): the repair creates the IPAddress.
+    let svc: Service = serde_json::from_value(json!({
+        "apiVersion": "v1", "kind": "Service",
+        "metadata": {"name": "a", "namespace": "default", "uid": "u-a"},
+        "spec": {"clusterIP": "10.0.1.1", "clusterIPs": ["10.0.1.1"],
+                 "ports": [{"port": 80}]}
+    }))
+    .unwrap();
+    mem.create(&build_key("services", Some("default"), "a"), &svc)
+        .await
+        .unwrap();
+
+    rusternetes_api_server::bootstrap::repair_service_cluster_ips_once(&state)
+        .await
+        .unwrap();
+
+    assert!(
+        mem.get::<rusternetes_common::resources::IPAddress>(&build_key(
+            "ipaddresses",
+            None,
+            "10.0.1.1"
+        ))
+        .await
+        .is_ok(),
+        "the repair recreates the IPAddress"
+    );
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec!["CREATE ipaddresses"],
+        "the repair's create went around admission"
+    );
+}
