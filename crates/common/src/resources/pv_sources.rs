@@ -55,6 +55,82 @@ pub struct PersistentVolumeMoreSources {
     pub storageos: Option<StorageOSPersistentVolumeSource>,
 }
 
+fn default_str(s: &mut String, v: &str) {
+    if s.is_empty() {
+        *s = v.to_string();
+    }
+}
+
+impl PersistentVolumeMoreSources {
+    /// The rbd/azureDisk/scaleIO arms of `SetObjectDefaults_PersistentVolume`
+    /// (pkg/apis/core/v1/zz_generated.defaults.go:137-181; `+default` tags at
+    /// staging/src/k8s.io/api/core/v1/types.go:1699,1713 and on the rbd/
+    /// scaleIO fields). The hostPath/iscsi/capacity arms live with the flat
+    /// spec fields.
+    pub fn apply_defaults(&mut self) {
+        if let Some(rbd) = self.rbd.as_mut() {
+            default_str(&mut rbd.rbd_pool, "rbd");
+            default_str(&mut rbd.rados_user, "admin");
+            default_str(&mut rbd.keyring, "/etc/ceph/keyring");
+        }
+        if let Some(az) = self.azure_disk.as_mut() {
+            az.caching_mode.get_or_insert_with(|| "ReadWrite".into());
+            az.fs_type.get_or_insert_with(|| "ext4".into());
+            az.read_only.get_or_insert(false);
+            az.kind.get_or_insert_with(|| "Shared".into());
+        }
+        if let Some(sio) = self.scale_io.as_mut() {
+            default_str(&mut sio.storage_mode, "ThinProvisioned");
+            default_str(&mut sio.fs_type, "xfs");
+        }
+    }
+}
+
+/// Defaults a Go string field held in opaque JSON: unset or `""` takes `v`.
+fn json_default_str(obj: &mut serde_json::Map<String, serde_json::Value>, key: &str, v: &str) {
+    if obj
+        .get(key)
+        .and_then(|x| x.as_str())
+        .is_none_or(str::is_empty)
+    {
+        obj.insert(key.into(), v.into());
+    }
+}
+
+/// Defaults a Go pointer field held in opaque JSON: unset or `null` takes `v`.
+fn json_default_ptr(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    v: serde_json::Value,
+) {
+    if obj.get(key).is_none_or(serde_json::Value::is_null) {
+        obj.insert(key.into(), v);
+    }
+}
+
+/// The rbd/azureDisk/scaleIO arms of the pod-volume defaulting
+/// (`a.VolumeSource.RBD/AzureDisk/ScaleIO` in `SetObjectDefaults_Pod`,
+/// pkg/apis/core/v1/zz_generated.defaults.go:224-290). Pod volumes keep these
+/// sources as opaque JSON, so the same defaults are applied to the object.
+pub fn apply_legacy_volume_source_defaults(src: &mut crate::resources::pod::LegacyVolumeSources) {
+    use serde_json::{json, Value};
+    if let Some(Value::Object(o)) = src.rbd.as_mut() {
+        json_default_str(o, "pool", "rbd");
+        json_default_str(o, "user", "admin");
+        json_default_str(o, "keyring", "/etc/ceph/keyring");
+    }
+    if let Some(Value::Object(o)) = src.azure_disk.as_mut() {
+        json_default_ptr(o, "cachingMode", json!("ReadWrite"));
+        json_default_ptr(o, "fsType", json!("ext4"));
+        json_default_ptr(o, "readOnly", json!(false));
+        json_default_ptr(o, "kind", json!("Shared"));
+    }
+    if let Some(Value::Object(o)) = src.scale_io.as_mut() {
+        json_default_str(o, "storageMode", "ThinProvisioned");
+        json_default_str(o, "fsType", "xfs");
+    }
+}
+
 /// `core/v1 GlusterfsPersistentVolumeSource`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

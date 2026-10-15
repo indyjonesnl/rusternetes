@@ -107,6 +107,10 @@ fn apply_volume_default_source(vol: &mut rusternetes_common::resources::pod::Vol
 /// the per-source `SetDefaults_*VolumeSource` functions (pkg/apis/core/v1).
 fn apply_volume_default_mode(vol: &mut rusternetes_common::resources::pod::Volume) {
     const DEFAULT_MODE: i32 = 0o644;
+    // rbd/azureDisk/scaleIO arms (zz_generated.defaults.go:224-290)
+    rusternetes_common::resources::pv_sources::apply_legacy_volume_source_defaults(
+        &mut vol.legacy_sources,
+    );
     if let Some(s) = vol.secret.as_mut() {
         s.default_mode.get_or_insert(DEFAULT_MODE);
     }
@@ -1003,6 +1007,42 @@ mod tests {
             Some(0o600),
             "explicit mode preserved"
         );
+    }
+
+    /// zz_generated.defaults.go:211-290 (`SetObjectDefaults_Pod` volumes): rbd,
+    /// azureDisk and scaleIO default when empty/nil; explicit values are kept.
+    #[test]
+    fn test_pod_volume_rbd_azure_disk_scale_io_defaults() {
+        let mut spec = PodSpec {
+            containers: vec![],
+            volumes: Some(vec![
+                serde_json::from_value(serde_json::json!({"name": "r", "rbd": {"monitors": ["m"], "image": "i"}})).unwrap(),
+                serde_json::from_value(serde_json::json!({"name": "a", "azureDisk": {"diskName": "d", "diskURI": "u"}})).unwrap(),
+                serde_json::from_value(serde_json::json!({"name": "s", "scaleIO": {"gateway": "g", "system": "s", "secretRef": {"name": "n"}}})).unwrap(),
+                serde_json::from_value(serde_json::json!({"name": "k", "azureDisk": {"diskName": "d", "diskURI": "u",
+                    "cachingMode": "None", "fsType": "xfs", "readOnly": true, "kind": "Dedicated"}})).unwrap(),
+            ]),
+            ..Default::default()
+        };
+        apply_pod_spec_defaults(&mut spec);
+        let v = spec.volumes.as_deref().unwrap();
+        let r = v[0].legacy_sources.rbd.as_ref().unwrap();
+        assert_eq!(r["pool"], "rbd");
+        assert_eq!(r["user"], "admin");
+        assert_eq!(r["keyring"], "/etc/ceph/keyring");
+        let a = v[1].legacy_sources.azure_disk.as_ref().unwrap();
+        assert_eq!(a["cachingMode"], "ReadWrite");
+        assert_eq!(a["fsType"], "ext4");
+        assert_eq!(a["readOnly"], false);
+        assert_eq!(a["kind"], "Shared");
+        let s = v[2].legacy_sources.scale_io.as_ref().unwrap();
+        assert_eq!(s["storageMode"], "ThinProvisioned");
+        assert_eq!(s["fsType"], "xfs");
+        let k = v[3].legacy_sources.azure_disk.as_ref().unwrap();
+        assert_eq!(k["cachingMode"], "None");
+        assert_eq!(k["fsType"], "xfs");
+        assert_eq!(k["readOnly"], true);
+        assert_eq!(k["kind"], "Dedicated");
     }
 
     /// SetDefaults_Volume (pkg/apis/core/v1/defaults.go:66-71): a volume with

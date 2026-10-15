@@ -47,6 +47,9 @@ pub fn convert_to_internal(pv: &mut PersistentVolume) {
     if let Some(iscsi) = pv.spec.iscsi.as_mut() {
         iscsi.set_defaults();
     }
+
+    // SetObjectDefaults_PersistentVolume (zz_generated.defaults.go:137-181)
+    pv.spec.more_sources.apply_defaults();
 }
 
 /// `GetWarningsForPersistentVolume` (pkg/api/persistentvolume/util.go:40-110).
@@ -305,6 +308,46 @@ mod tests {
                 Some(want)
             );
         }
+    }
+
+    /// `SetObjectDefaults_PersistentVolume` (pkg/apis/core/v1/zz_generated.defaults.go:
+    /// 137-181): rbd, azureDisk and scaleIO members default when empty/nil
+    /// and keep explicit values.
+    #[test]
+    fn defaults_rbd_azure_disk_scale_io_sources() {
+        let mut pv = pv();
+        pv.spec.more_sources = serde_json::from_value(serde_json::json!({
+            "rbd": {"monitors": ["m"], "image": "i"},
+            "azureDisk": {"diskName": "d", "diskURI": "u"},
+            "scaleIO": {"gateway": "g", "system": "s"}
+        }))
+        .unwrap();
+        convert_to_internal(&mut pv);
+        let v = serde_json::to_value(&pv.spec.more_sources).unwrap();
+        assert_eq!(v["rbd"]["pool"], "rbd");
+        assert_eq!(v["rbd"]["user"], "admin");
+        assert_eq!(v["rbd"]["keyring"], "/etc/ceph/keyring");
+        assert_eq!(v["azureDisk"]["cachingMode"], "ReadWrite");
+        assert_eq!(v["azureDisk"]["fsType"], "ext4");
+        assert_eq!(v["azureDisk"]["readOnly"], false);
+        assert_eq!(v["azureDisk"]["kind"], "Shared");
+        assert_eq!(v["scaleIO"]["storageMode"], "ThinProvisioned");
+        assert_eq!(v["scaleIO"]["fsType"], "xfs");
+    }
+
+    #[test]
+    fn explicit_rbd_azure_disk_scale_io_values_are_kept() {
+        let mut pv = pv();
+        pv.spec.more_sources = serde_json::from_value(serde_json::json!({
+            "rbd": {"monitors": ["m"], "image": "i", "pool": "p", "user": "u", "keyring": "/k"},
+            "azureDisk": {"diskName": "d", "diskURI": "u", "cachingMode": "None",
+                "fsType": "xfs", "readOnly": true, "kind": "Dedicated"},
+            "scaleIO": {"gateway": "g", "system": "s", "storageMode": "ThickProvisioned", "fsType": "ext4"}
+        }))
+        .unwrap();
+        let before = serde_json::to_value(&pv.spec.more_sources).unwrap();
+        convert_to_internal(&mut pv);
+        assert_eq!(serde_json::to_value(&pv.spec.more_sources).unwrap(), before);
     }
 
     /// `TestStatusCreate` (strategy_test.go:247): create
