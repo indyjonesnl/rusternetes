@@ -1,12 +1,12 @@
 //! In-tree -> CSI PersistentVolume translation: a port of
 //! `staging/src/k8s.io/csi-translation-lib` (`translate.go`,
 //! `plugins/in_tree_volume.go`, `plugins/gce_pd.go`, `plugins/aws_ebs.go`,
-//! `plugins/portworx.go`).
+//! `plugins/portworx.go`, `plugins/vsphere_volume.go`, `plugins/azure_file.go`).
 //!
 //! Shared by the external-attacher (`CsiAttacher`) and the scheduler's
 //! VolumeBinding plugin (`tryTranslatePVToCSI`). Plugins ported so far: GCE PD,
-//! AWS EBS and Portworx; the other in-tree plugins of `translate.go:34-42`
-//! (Cinder, AzureDisk, AzureFile, vSphere) are tracked follow-ups.
+//! AWS EBS, Portworx, vSphere and Azure File; the other in-tree plugins of
+//! `translate.go:34-42` (Cinder, AzureDisk) are tracked follow-ups.
 //!
 //! `TranslateCSIPVToInTree` (`translate.go:116-128`) is ported for the same
 //! two plugins, with `translateTopologyFromCSIToInTree` /
@@ -81,8 +81,10 @@ trait InTreePlugin {
 static GCE_PD: GcePersistentDiskTranslator = GcePersistentDiskTranslator;
 static AWS_EBS: AwsElasticBlockStoreTranslator = AwsElasticBlockStoreTranslator;
 static PORTWORX: PortworxCsiTranslator = PortworxCsiTranslator;
-fn in_tree_plugins() -> [&'static dyn InTreePlugin; 3] {
-    [&GCE_PD, &AWS_EBS, &PORTWORX]
+static VSPHERE: VsphereCsiTranslator = VsphereCsiTranslator;
+static AZURE_FILE: AzureFileCsiTranslator = AzureFileCsiTranslator;
+fn in_tree_plugins() -> [&'static dyn InTreePlugin; 5] {
+    [&GCE_PD, &AWS_EBS, &PORTWORX, &VSPHERE, &AZURE_FILE]
 }
 
 /// `CSITranslator` (`translate.go:48`).
@@ -1288,6 +1290,439 @@ impl InTreePlugin for PortworxCsiTranslator {
     }
 
     /// `RepairVolumeHandle` (`portworx.go:204-206`): identity.
+    fn repair_volume_handle(&self, volume_handle: &str, _node_id: &str) -> Result<String, String> {
+        Ok(volume_handle.to_string())
+    }
+}
+
+// ---- vSphere (`plugins/vsphere_volume.go`) ----------------------------------
+
+/// `VSphereDriverName` (`vsphere_volume.go:33`).
+pub const VSPHERE_DRIVER_NAME: &str = "csi.vsphere.vmware.com";
+/// `VSphereInTreePluginName` (`vsphere_volume.go:35`).
+pub const VSPHERE_IN_TREE_PLUGIN_NAME: &str = "kubernetes.io/vsphere-volume";
+/// `vSphereCSITopologyZoneKey` / `...RegionKey` (`vsphere_volume.go:38,41`).
+const VSPHERE_CSI_TOPOLOGY_ZONE_KEY: &str = "topology.csi.vmware.com/zone";
+const VSPHERE_CSI_TOPOLOGY_REGION_KEY: &str = "topology.csi.vmware.com/region";
+/// `paramStoragePolicyName` / `paramcsiMigration` (`vsphere_volume.go:44,47`).
+const VSPHERE_PARAM_STORAGE_POLICY_NAME: &str = "storagepolicyname";
+const VSPHERE_PARAM_CSI_MIGRATION: &str = "csimigration";
+
+/// `translateTopologyFromInTreevSphereToCSI` (`vsphere_volume.go:243-269`).
+fn translate_topology_from_in_tree_vsphere_to_csi(pv: &mut PersistentVolume) {
+    let (zone_label, region_label) = get_topology_label(pv);
+    for (label_key, csi_key) in [
+        (zone_label, VSPHERE_CSI_TOPOLOGY_ZONE_KEY),
+        (region_label, VSPHERE_CSI_TOPOLOGY_REGION_KEY),
+    ] {
+        if !get_topology_values(pv, label_key).is_empty() {
+            replace_topology(pv, label_key, csi_key);
+        } else if let Some(label) = pv
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get(label_key))
+            .filter(|l| !l.is_empty())
+            .cloned()
+        {
+            // upstream ignores the error here
+            let _ = add_topology(pv, csi_key, &[label]);
+        }
+    }
+}
+
+/// `AttributeInitialVolumeFilepath` (`vsphere_volume.go:63`).
+const VSPHERE_ATTRIBUTE_INITIAL_VOLUME_FILEPATH: &str = "initialvolumefilepath";
+
+/// `translateTopologyFromCSIToInTreevSphere` (`vsphere_volume.go:271-317`).
+fn translate_topology_from_csi_to_in_tree_vsphere(pv: &mut PersistentVolume) {
+    let (zone_label, region_label) = get_topology_label(pv);
+    // Replace all CSI topology to Kubernetes Zone / Region label
+    replace_topology(pv, VSPHERE_CSI_TOPOLOGY_ZONE_KEY, zone_label);
+    replace_topology(pv, VSPHERE_CSI_TOPOLOGY_REGION_KEY, region_label);
+    for label_key in [zone_label, region_label] {
+        let vals = get_topology_values(pv, label_key);
+        if let Some(first) = vals.first() {
+            pv.metadata
+                .labels
+                .get_or_insert_with(Default::default)
+                .entry(label_key.to_string())
+                .or_insert_with(|| first.clone());
+        }
+    }
+}
+
+struct VsphereCsiTranslator;
+
+impl InTreePlugin for VsphereCsiTranslator {
+    /// `TranslateInTreeStorageClassToCSI` (`vsphere_volume.go:68-110`).
+    fn translate_in_tree_storage_class_to_csi(&self, sc: &mut StorageClass) -> Result<(), String> {
+        let mut params: HashMap<String, String> = HashMap::new();
+        for (k, v) in sc.parameters.iter().flatten() {
+            let (key, value) = match k.to_lowercase().as_str() {
+                FS_TYPE_KEY => (CSI_FS_TYPE_KEY, v),
+                VSPHERE_PARAM_STORAGE_POLICY_NAME => (VSPHERE_PARAM_STORAGE_POLICY_NAME, v),
+                "datastore" => ("datastore-migrationparam", v),
+                "diskformat" => ("diskformat-migrationparam", v),
+                "hostfailurestotolerate" => ("hostfailurestotolerate-migrationparam", v),
+                "forceprovisioning" => ("forceprovisioning-migrationparam", v),
+                "cachereservation" => ("cachereservation-migrationparam", v),
+                "diskstripes" => ("diskstripes-migrationparam", v),
+                "objectspacereservation" => ("objectspacereservation-migrationparam", v),
+                "iopslimit" => ("iopslimit-migrationparam", v),
+                // "StorageClass parameter is not supported" (dropped)
+                _ => continue,
+            };
+            params.insert(key.to_string(), value.clone());
+        }
+        params.insert(VSPHERE_PARAM_CSI_MIGRATION.to_string(), "true".to_string());
+        if let Some(existing) = sc.allowed_topologies.as_ref().filter(|t| !t.is_empty()) {
+            sc.allowed_topologies = Some(translate_allowed_topologies(
+                existing,
+                VSPHERE_CSI_TOPOLOGY_ZONE_KEY,
+            ));
+        }
+        sc.parameters = Some(params);
+        Ok(())
+    }
+
+    /// `TranslateInTreePVToCSI` (`vsphere_volume.go:141-163`).
+    fn translate_in_tree_pv_to_csi(&self, pv: &mut PersistentVolume) -> Result<(), String> {
+        let Some(vs) = pv.spec.more_sources.vsphere_volume.clone() else {
+            return Err("pv is nil or VsphereVolume not defined on pv".into());
+        };
+        let mut attributes = HashMap::new();
+        if !vs.storage_policy_name.is_empty() {
+            attributes.insert(
+                VSPHERE_PARAM_STORAGE_POLICY_NAME.to_string(),
+                vs.storage_policy_name,
+            );
+        }
+        let csi = CSIVolumeSource {
+            driver: VSPHERE_DRIVER_NAME.to_string(),
+            volume_handle: Some(vs.volume_path),
+            fs_type: Some(vs.fs_type).filter(|f| !f.is_empty()),
+            volume_attributes: Some(attributes),
+            ..Default::default()
+        };
+        translate_topology_from_in_tree_vsphere_to_csi(pv);
+        pv.spec.more_sources.vsphere_volume = None;
+        pv.spec.csi = Some(csi);
+        Ok(())
+    }
+
+    /// `TranslateInTreeInlineVolumeToCSI` (`vsphere_volume.go:112-139`).
+    fn translate_in_tree_inline_volume_to_csi(
+        &self,
+        volume: &Volume,
+        _pod_namespace: &str,
+    ) -> Result<PersistentVolume, String> {
+        let Some(vs) = volume.legacy_sources.vsphere_volume.as_ref().and_then(|v| {
+            serde_json::from_value::<crate::resources::pv_sources::VsphereVirtualDiskVolumeSource>(
+                v.clone(),
+            )
+            .ok()
+        }) else {
+            return Err("volume is nil or VsphereVolume not defined on volume".into());
+        };
+        // Must be unique per disk as it is used as the unique part of the
+        // staging path
+        let mut pv = inline_pv(format!("{VSPHERE_DRIVER_NAME}-{}", vs.volume_path));
+        let mut attributes = HashMap::new();
+        if !vs.storage_policy_name.is_empty() {
+            attributes.insert(
+                VSPHERE_PARAM_STORAGE_POLICY_NAME.to_string(),
+                vs.storage_policy_name,
+            );
+        }
+        pv.spec.csi = Some(CSIVolumeSource {
+            driver: VSPHERE_DRIVER_NAME.to_string(),
+            volume_handle: Some(vs.volume_path),
+            fs_type: Some(vs.fs_type).filter(|f| !f.is_empty()),
+            volume_attributes: Some(attributes),
+            ..Default::default()
+        });
+        pv.spec.access_modes = vec![PersistentVolumeAccessMode::ReadWriteOnce];
+        Ok(pv)
+    }
+
+    /// `TranslateCSIPVToInTree` (`vsphere_volume.go:165-190`).
+    fn translate_csi_pv_to_in_tree(&self, pv: &mut PersistentVolume) -> Result<(), String> {
+        let Some(csi) = pv.spec.csi.clone() else {
+            return Err("pv is nil or CSI source not defined on pv".into());
+        };
+        let vs = crate::resources::pv_sources::VsphereVirtualDiskVolumeSource {
+            fs_type: csi.fs_type.clone().unwrap_or_default(),
+            volume_path: csi
+                .volume_attributes
+                .as_ref()
+                .and_then(|a| a.get(VSPHERE_ATTRIBUTE_INITIAL_VOLUME_FILEPATH))
+                .cloned()
+                .unwrap_or_default(),
+            ..Default::default()
+        };
+        // translate CSI topology to In-tree topology for rollback compatibility.
+        translate_topology_from_csi_to_in_tree_vsphere(pv);
+        pv.spec.csi = None;
+        pv.spec.more_sources.vsphere_volume = Some(vs);
+        Ok(())
+    }
+
+    /// `CanSupport` (`vsphere_volume.go:218-220`).
+    fn can_support(&self, pv: &PersistentVolume) -> bool {
+        pv.spec.more_sources.vsphere_volume.is_some()
+    }
+
+    /// `CanSupportInline` (`vsphere_volume.go:224-226`).
+    fn can_support_inline(&self, volume: &Volume) -> bool {
+        volume.legacy_sources.vsphere_volume.is_some()
+    }
+
+    fn in_tree_plugin_name(&self) -> &'static str {
+        VSPHERE_IN_TREE_PLUGIN_NAME
+    }
+
+    fn csi_plugin_name(&self) -> &'static str {
+        VSPHERE_DRIVER_NAME
+    }
+
+    /// `RepairVolumeHandle` (`vsphere_volume.go:232-234`): identity.
+    fn repair_volume_handle(&self, volume_handle: &str, _node_id: &str) -> Result<String, String> {
+        Ok(volume_handle.to_string())
+    }
+}
+
+// ---- Azure File (`plugins/azure_file.go`) -----------------------------------
+
+/// `AzureFileDriverName` (`azure_file.go:34`).
+pub const AZURE_FILE_DRIVER_NAME: &str = "file.csi.azure.com";
+/// `AzureFileInTreePluginName` (`azure_file.go:36`).
+pub const AZURE_FILE_IN_TREE_PLUGIN_NAME: &str = "kubernetes.io/azure-file";
+/// `volumeIDTemplate` is `%s#%s#%s#%s#%s`; `shareNameField`;
+/// `secretNameTemplate`; `resourceGroupAnnotation` (`azure_file.go:38-48`).
+const AZURE_FILE_SEPARATOR: &str = "#";
+const AZURE_FILE_SHARE_NAME_FIELD: &str = "sharename";
+const AZURE_FILE_RESOURCE_GROUP_ANNOTATION: &str = "kubernetes.io/azure-file-resource-group";
+/// `secretNameField` / `secretNamespaceField` / `defaultSecretNamespace`
+/// (`azure_file.go:43-47`).
+const AZURE_FILE_SECRET_NAME_FIELD: &str = "secretname";
+const AZURE_FILE_SECRET_NAMESPACE_FIELD: &str = "secretnamespace";
+const AZURE_FILE_DEFAULT_SECRET_NAMESPACE: &str = "default";
+
+/// `secretNameFormatRE` (`azure_file.go:52`).
+static AZURE_FILE_SECRET_NAME_FORMAT_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"azure-storage-account-(.+)-secret").expect("static regex")
+    });
+
+/// `getStorageAccountName` (`azure_file.go:327-334`).
+fn get_storage_account_name(secret_name: &str) -> Result<String, String> {
+    AZURE_FILE_SECRET_NAME_FORMAT_RE
+        .captures(secret_name)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
+        .ok_or_else(|| {
+            format!(
+                "could not get account name from {secret_name}, correct format: {}",
+                AZURE_FILE_SECRET_NAME_FORMAT_RE.as_str()
+            )
+        })
+}
+
+struct AzureFileCsiTranslator;
+
+impl InTreePlugin for AzureFileCsiTranslator {
+    /// `TranslateInTreeStorageClassToCSI` (`azure_file.go:56-58`): `return sc, nil`.
+    fn translate_in_tree_storage_class_to_csi(&self, _sc: &mut StorageClass) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// `TranslateInTreePVToCSI` (`azure_file.go:97-148`).
+    fn translate_in_tree_pv_to_csi(&self, pv: &mut PersistentVolume) -> Result<(), String> {
+        let Some(azure) = pv.spec.more_sources.azure_file.clone() else {
+            return Err("pv is nil or Azure File source not defined on pv".into());
+        };
+        // `getStorageAccountName` failing falls back to the secret name.
+        let account_name =
+            get_storage_account_name(&azure.secret_name).unwrap_or(azure.secret_name.clone());
+        let resource_group = pv
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get(AZURE_FILE_RESOURCE_GROUP_ANNOTATION))
+            .cloned()
+            .unwrap_or_default();
+        let namespace = match &azure.secret_namespace {
+            Some(ns) => ns.clone(),
+            None => pv
+                .spec
+                .claim_ref
+                .as_ref()
+                .and_then(|r| r.namespace.clone())
+                .unwrap_or_default(),
+        };
+        if namespace.is_empty() {
+            return Err(
+                "could not find a secret namespace in PersistentVolumeSource or ClaimRef".into(),
+            );
+        }
+        let sep = AZURE_FILE_SEPARATOR;
+        let volume_id = format!(
+            "{resource_group}{sep}{account_name}{sep}{}{sep}{}{sep}{namespace}",
+            azure.share_name, pv.metadata.name
+        );
+        let csi = CSIVolumeSource {
+            driver: AZURE_FILE_DRIVER_NAME.to_string(),
+            node_stage_secret_ref: Some(SecretReference {
+                name: Some(azure.secret_name),
+                namespace: Some(namespace),
+            }),
+            // Go `bool` without omitempty-pointer: false is the unset value.
+            read_only: Some(azure.read_only).filter(|r| *r),
+            volume_attributes: Some(HashMap::from([(
+                AZURE_FILE_SHARE_NAME_FIELD.to_string(),
+                azure.share_name,
+            )])),
+            volume_handle: Some(volume_id),
+            ..Default::default()
+        };
+        pv.spec.more_sources.azure_file = None;
+        pv.spec.csi = Some(csi);
+        Ok(())
+    }
+
+    /// `TranslateInTreeInlineVolumeToCSI` (`azure_file.go:62-110`).
+    fn translate_in_tree_inline_volume_to_csi(
+        &self,
+        volume: &Volume,
+        pod_namespace: &str,
+    ) -> Result<PersistentVolume, String> {
+        let Some(azure) = volume.legacy_sources.azure_file.as_ref() else {
+            return Err("volume is nil or Azure File not defined on volume".into());
+        };
+        let field = |k: &str| {
+            azure
+                .get(k)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let secret_name = field("secretName");
+        let share_name = field("shareName");
+        let read_only = azure
+            .get("readOnly")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let account_name = get_storage_account_name(&secret_name).unwrap_or(secret_name.clone());
+        let secret_namespace = if pod_namespace.is_empty() {
+            AZURE_FILE_DEFAULT_SECRET_NAMESPACE
+        } else {
+            pod_namespace
+        };
+        let sep = AZURE_FILE_SEPARATOR;
+        let volume_id = format!(
+            "{sep}{account_name}{sep}{share_name}{sep}{}{sep}{secret_namespace}",
+            volume.name
+        );
+        // Must be unique as it is used as the unique part of the staging path
+        let mut pv = inline_pv(volume_id.clone());
+        pv.spec.csi = Some(CSIVolumeSource {
+            driver: AZURE_FILE_DRIVER_NAME.to_string(),
+            volume_handle: Some(volume_id),
+            read_only: Some(read_only).filter(|r| *r),
+            volume_attributes: Some(HashMap::from([(
+                AZURE_FILE_SHARE_NAME_FIELD.to_string(),
+                share_name,
+            )])),
+            node_stage_secret_ref: Some(SecretReference {
+                name: Some(secret_name),
+                namespace: Some(secret_namespace.to_string()),
+            }),
+            ..Default::default()
+        });
+        pv.spec.access_modes = vec![PersistentVolumeAccessMode::ReadWriteMany];
+        Ok(pv)
+    }
+
+    /// `TranslateCSIPVToInTree` (`azure_file.go:150-221`).
+    fn translate_csi_pv_to_in_tree(&self, pv: &mut PersistentVolume) -> Result<(), String> {
+        let Some(csi) = pv.spec.csi.clone() else {
+            return Err("pv is nil or CSI source not defined on pv".into());
+        };
+        let mut azure = crate::resources::pv_sources::AzureFilePersistentVolumeSource {
+            read_only: csi.read_only.unwrap_or(false),
+            ..Default::default()
+        };
+        for (k, v) in csi.volume_attributes.iter().flatten() {
+            match k.to_lowercase().as_str() {
+                AZURE_FILE_SHARE_NAME_FIELD => azure.share_name = v.clone(),
+                AZURE_FILE_SECRET_NAME_FIELD => azure.secret_name = v.clone(),
+                AZURE_FILE_SECRET_NAMESPACE_FIELD => azure.secret_namespace = Some(v.clone()),
+                _ => {}
+            }
+        }
+        let mut resource_group = String::new();
+        if let Some(r) = csi
+            .node_stage_secret_ref
+            .as_ref()
+            .filter(|r| r.name.as_deref().is_some_and(|n| !n.is_empty()))
+        {
+            azure.secret_name = r.name.clone().unwrap_or_default();
+            azure.secret_namespace = Some(r.namespace.clone().unwrap_or_default());
+        }
+        if azure.share_name.is_empty() || azure.secret_name.is_empty() {
+            // `getFileShareInfo` (`azure_file.go:306-318`)
+            let handle = csi.volume_handle.clone().unwrap_or_default();
+            let segments: Vec<&str> = handle.split(AZURE_FILE_SEPARATOR).collect();
+            if segments.len() < 3 {
+                return Err(format!(
+                    "error parsing volume id: {handle:?}, should at least contain two #"
+                ));
+            }
+            if azure.share_name.is_empty() {
+                azure.share_name = segments[2].to_string();
+            }
+            if azure.secret_name.is_empty() {
+                azure.secret_name = format!("azure-storage-account-{}-secret", segments[1]);
+            }
+            resource_group = segments[0].to_string();
+        }
+        if azure.secret_namespace.is_none() {
+            azure.secret_namespace = Some(AZURE_FILE_DEFAULT_SECRET_NAMESPACE.to_string());
+        }
+        pv.spec.csi = None;
+        pv.spec.more_sources.azure_file = Some(azure);
+        if !resource_group.is_empty() {
+            pv.metadata
+                .annotations
+                .get_or_insert_with(Default::default)
+                .insert(
+                    AZURE_FILE_RESOURCE_GROUP_ANNOTATION.to_string(),
+                    resource_group,
+                );
+        }
+        Ok(())
+    }
+
+    /// `CanSupport` (`azure_file.go:223-225`).
+    fn can_support(&self, pv: &PersistentVolume) -> bool {
+        pv.spec.more_sources.azure_file.is_some()
+    }
+
+    /// `CanSupportInline` (`azure_file.go:230-232`).
+    fn can_support_inline(&self, volume: &Volume) -> bool {
+        volume.legacy_sources.azure_file.is_some()
+    }
+
+    fn in_tree_plugin_name(&self) -> &'static str {
+        AZURE_FILE_IN_TREE_PLUGIN_NAME
+    }
+
+    fn csi_plugin_name(&self) -> &'static str {
+        AZURE_FILE_DRIVER_NAME
+    }
+
+    /// `RepairVolumeHandle` (`azure_file.go:239-241`): identity.
     fn repair_volume_handle(&self, volume_handle: &str, _node_id: &str) -> Result<String, String> {
         Ok(volume_handle.to_string())
     }
@@ -2551,5 +2986,385 @@ mod tests {
             );
         }
         assert!(!p.contains_key("openstorage.io/auth-secret-name"));
+    }
+
+    // ---- vSphere (`plugins/vsphere_volume_test.go`) -----------------------
+
+    fn vsphere_pv(labels: &[(&str, &str)], policy: &str) -> PersistentVolume {
+        let mut pv = blank_pv("pvc-d8b4475f");
+        pv.metadata.labels = (!labels.is_empty()).then(|| {
+            labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        });
+        pv.spec.access_modes = vec![PersistentVolumeAccessMode::ReadWriteOnce];
+        pv.spec.more_sources.vsphere_volume = Some(
+            crate::resources::pv_sources::VsphereVirtualDiskVolumeSource {
+                volume_path: "[vsanDatastore] 6785a85e/disk.vmdk".into(),
+                fs_type: "ext4".into(),
+                storage_policy_name: policy.into(),
+                storage_policy_id: String::new(),
+            },
+        );
+        pv
+    }
+
+    /// `TestTranslateVSphereInTreePVToCSI` ("translate valid vSphere in-tree
+    /// PV", "...with beta topology labels").
+    #[test]
+    fn vsphere_pv_translates() {
+        let t = CsiTranslator::new();
+        let out = t
+            .translate_in_tree_pv_to_csi(&vsphere_pv(&[], "vSAN Default Storage Policy"))
+            .unwrap();
+        assert!(out.spec.more_sources.vsphere_volume.is_none());
+        let csi = out.spec.csi.as_ref().unwrap();
+        assert_eq!(csi.driver, "csi.vsphere.vmware.com");
+        assert_eq!(
+            csi.volume_handle.as_deref(),
+            Some("[vsanDatastore] 6785a85e/disk.vmdk")
+        );
+        assert_eq!(csi.fs_type.as_deref(), Some("ext4"));
+        assert_eq!(
+            csi.volume_attributes.as_ref().unwrap(),
+            &HashMap::from([(
+                "storagepolicyname".to_string(),
+                "vSAN Default Storage Policy".to_string()
+            )])
+        );
+        assert!(out.spec.node_affinity.is_none());
+
+        // No policy name: attributes stay an empty (non-nil) map.
+        let out = t.translate_in_tree_pv_to_csi(&vsphere_pv(&[], "")).unwrap();
+        assert_eq!(
+            out.spec.csi.unwrap().volume_attributes,
+            Some(HashMap::new())
+        );
+
+        // Beta topology labels become CSI zone + region node affinity.
+        let out = t
+            .translate_in_tree_pv_to_csi(&vsphere_pv(
+                &[
+                    ("failure-domain.beta.kubernetes.io/zone", "z1"),
+                    ("failure-domain.beta.kubernetes.io/region", "r1"),
+                ],
+                "p",
+            ))
+            .unwrap();
+        assert_eq!(
+            keys_and_values(&out),
+            vec![
+                ("topology.csi.vmware.com/zone".into(), vec!["z1".into()]),
+                ("topology.csi.vmware.com/region".into(), vec!["r1".into()]),
+            ]
+        );
+        // Labels are kept.
+        assert_eq!(out.metadata.labels.as_ref().unwrap().len(), 2);
+
+        // Existing in-tree affinity keys are replaced in place.
+        let mut pv = vsphere_pv(&[], "p");
+        pv.spec.node_affinity = affinity("topology.kubernetes.io/zone", &["z9"]);
+        let out = t.translate_in_tree_pv_to_csi(&pv).unwrap();
+        assert_eq!(
+            keys_and_values(&out),
+            vec![("topology.csi.vmware.com/zone".into(), vec!["z9".into()])]
+        );
+    }
+
+    /// `TestTranslatevSphereInTreeStorageClassToCSI` (full parameter table).
+    #[test]
+    fn vsphere_storage_class_translates() {
+        let t = CsiTranslator::new();
+        let name = "kubernetes.io/vsphere-volume";
+        let mig = ("csimigration", "true");
+        let ok = |input: StorageClass, exp: StorageClass| {
+            let got = t
+                .translate_in_tree_storage_class_to_csi(name, &input)
+                .unwrap();
+            assert!(sc_eq(&got, &exp), "got {got:?}, want {exp:?}");
+        };
+        ok(sc(&[], None), sc(&[mig], None));
+        ok(sc(&[("unknownparam", "value")], None), sc(&[mig], None));
+        ok(
+            sc(
+                &[
+                    ("storagepolicyname", "test-policy-name"),
+                    ("datastore", "vsanDatastore"),
+                ],
+                None,
+            ),
+            sc(
+                &[
+                    ("storagepolicyname", "test-policy-name"),
+                    ("datastore-migrationparam", "vsanDatastore"),
+                    mig,
+                ],
+                None,
+            ),
+        );
+        ok(
+            sc(&[("fstype", "ext4")], None),
+            sc(&[("csi.storage.k8s.io/fstype", "ext4"), mig], None),
+        );
+        ok(
+            sc(&[], topo(LABEL_TOPOLOGY_ZONE, &["zone-a"])),
+            sc(&[mig], topo("topology.csi.vmware.com/zone", &["zone-a"])),
+        );
+        ok(
+            sc(
+                &[("storagepolicyname", "p")],
+                topo(LABEL_FAILURE_DOMAIN_BETA_ZONE, &["zone-a"]),
+            ),
+            sc(
+                &[("storagepolicyname", "p"), mig],
+                topo("topology.csi.vmware.com/zone", &["zone-a"]),
+            ),
+        );
+        ok(
+            sc(
+                &[
+                    ("storagepolicyname", "test-policy-name"),
+                    ("datastore", "test-datastore-name"),
+                    ("fstype", "ext4"),
+                    ("diskformat", "thin"),
+                    ("hostfailurestotolerate", "1"),
+                    ("forceprovisioning", "yes"),
+                    ("cachereservation", "25"),
+                    ("diskstripes", "4"),
+                    ("objectspacereservation", "10"),
+                    ("iopslimit", "32"),
+                ],
+                topo(LABEL_TOPOLOGY_ZONE, &["zone-a"]),
+            ),
+            sc(
+                &[
+                    ("storagepolicyname", "test-policy-name"),
+                    ("datastore-migrationparam", "test-datastore-name"),
+                    ("csi.storage.k8s.io/fstype", "ext4"),
+                    ("diskformat-migrationparam", "thin"),
+                    ("hostfailurestotolerate-migrationparam", "1"),
+                    ("forceprovisioning-migrationparam", "yes"),
+                    ("cachereservation-migrationparam", "25"),
+                    ("diskstripes-migrationparam", "4"),
+                    ("objectspacereservation-migrationparam", "10"),
+                    ("iopslimit-migrationparam", "32"),
+                    mig,
+                ],
+                topo("topology.csi.vmware.com/zone", &["zone-a"]),
+            ),
+        );
+    }
+
+    #[test]
+    fn vsphere_names_and_support() {
+        let t = CsiTranslator::new();
+        let pv = vsphere_pv(&[], "");
+        assert!(t.is_pv_migratable(&pv));
+        assert_eq!(
+            t.get_in_tree_plugin_name_from_pv(&pv).unwrap(),
+            "kubernetes.io/vsphere-volume"
+        );
+        assert_eq!(
+            t.get_csi_name_from_in_tree_name("kubernetes.io/vsphere-volume")
+                .unwrap(),
+            "csi.vsphere.vmware.com"
+        );
+        assert_eq!(
+            t.get_in_tree_name_from_csi_name("csi.vsphere.vmware.com")
+                .unwrap(),
+            "kubernetes.io/vsphere-volume"
+        );
+        assert_eq!(
+            t.repair_volume_handle("csi.vsphere.vmware.com", "h", "n")
+                .unwrap(),
+            "h"
+        );
+    }
+
+    // ---- Azure File (`plugins/azure_file_test.go`) ------------------------
+
+    fn azf_pv(
+        annotations: &[(&str, &str)],
+        secret_ns: Option<&str>,
+        claim_ns: Option<&str>,
+    ) -> PersistentVolume {
+        let mut pv = blank_pv("uuid");
+        pv.metadata.annotations = (!annotations.is_empty()).then(|| {
+            annotations
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        });
+        pv.spec.more_sources.azure_file = Some(
+            crate::resources::pv_sources::AzureFilePersistentVolumeSource {
+                secret_name: "secretname".into(),
+                share_name: "sharename".into(),
+                read_only: true,
+                secret_namespace: secret_ns.map(String::from),
+            },
+        );
+        pv.spec.claim_ref = claim_ns.map(|ns| crate::resources::service_account::ObjectReference {
+            namespace: Some(ns.into()),
+            ..Default::default()
+        });
+        pv
+    }
+
+    /// `azure_file.go:62-110` / `:150-221` and `vsphere_volume.go:112-190`:
+    /// inline translation and the CSI->in-tree round trip.
+    #[test]
+    fn azure_file_and_vsphere_inline_and_reverse_translation() {
+        let t = CsiTranslator::new();
+        let vol = inline(serde_json::json!({
+            "name": "v",
+            "azureFile": {"secretName": "azure-storage-account-acct-secret", "shareName": "sh"}
+        }));
+        let pv = t
+            .translate_in_tree_inline_volume_to_csi(&vol, "ns")
+            .unwrap();
+        assert_eq!(pv.metadata.name, "#acct#sh#v#ns");
+        assert_eq!(
+            pv.spec.access_modes,
+            vec![PersistentVolumeAccessMode::ReadWriteMany]
+        );
+        let back = t.translate_csi_pv_to_in_tree(&pv).unwrap();
+        let az = back.spec.more_sources.azure_file.unwrap();
+        assert_eq!(az.share_name, "sh");
+        assert_eq!(az.secret_name, "azure-storage-account-acct-secret");
+        assert_eq!(az.secret_namespace.as_deref(), Some("ns"));
+
+        let vol = inline(serde_json::json!({
+            "name": "v", "vsphereVolume": {"volumePath": "[ds] vol.vmdk", "fsType": "ext4"}
+        }));
+        assert!(t.is_inline_migratable(&vol));
+        let pv = t
+            .translate_in_tree_inline_volume_to_csi(&vol, "ns")
+            .unwrap();
+        assert_eq!(pv.metadata.name, "csi.vsphere.vmware.com-[ds] vol.vmdk");
+        let mut csi_pv = pv.clone();
+        csi_pv
+            .spec
+            .csi
+            .as_mut()
+            .unwrap()
+            .volume_attributes
+            .as_mut()
+            .unwrap()
+            .insert("initialvolumefilepath".into(), "[ds] vol.vmdk".into());
+        let back = t.translate_csi_pv_to_in_tree(&csi_pv).unwrap();
+        let vs = back.spec.more_sources.vsphere_volume.unwrap();
+        assert_eq!(vs.volume_path, "[ds] vol.vmdk");
+        assert_eq!(vs.fs_type, "ext4");
+    }
+
+    /// `TestTranslateAzureFileInTreePVToCSI`.
+    #[test]
+    fn azure_file_pv_translates() {
+        let t = CsiTranslator::new();
+        let rg = [("kubernetes.io/azure-file-resource-group", "rg")];
+
+        // "return error if secret namespace could not be found"
+        assert!(t
+            .translate_in_tree_pv_to_csi(&azf_pv(&rg, None, None))
+            .unwrap_err()
+            .contains("could not find a secret namespace"));
+
+        // "azure file volume" / "with rg annotation"
+        for (ann, handle) in [
+            (&[][..], "#secretname#sharename#uuid#secretnamespace"),
+            (&rg[..], "rg#secretname#sharename#uuid#secretnamespace"),
+        ] {
+            let out = t
+                .translate_in_tree_pv_to_csi(&azf_pv(ann, Some("secretnamespace"), None))
+                .unwrap();
+            assert!(out.spec.more_sources.azure_file.is_none());
+            let csi = out.spec.csi.unwrap();
+            assert_eq!(csi.driver, "file.csi.azure.com");
+            assert_eq!(csi.read_only, Some(true));
+            assert_eq!(csi.volume_handle.as_deref(), Some(handle));
+            let r = csi.node_stage_secret_ref.unwrap();
+            assert_eq!(r.name.as_deref(), Some("secretname"));
+            assert_eq!(r.namespace.as_deref(), Some("secretnamespace"));
+            assert_eq!(
+                csi.volume_attributes.unwrap(),
+                HashMap::from([("sharename".to_string(), "sharename".to_string())])
+            );
+        }
+
+        // "get secret namespace from ClaimRef when it's missing in pv spec source"
+        let out = t
+            .translate_in_tree_pv_to_csi(&azf_pv(&rg, None, Some("secretnamespace")))
+            .unwrap();
+        let csi = out.spec.csi.as_ref().unwrap();
+        assert_eq!(
+            csi.volume_handle.as_deref(),
+            Some("rg#secretname#sharename#uuid#secretnamespace")
+        );
+        assert!(out.spec.claim_ref.is_some());
+
+        // `getStorageAccountName`: a conforming secret name yields the account.
+        let mut pv = azf_pv(&[], Some("ns"), None);
+        pv.spec
+            .more_sources
+            .azure_file
+            .as_mut()
+            .unwrap()
+            .secret_name = "azure-storage-account-accountname-dup-secret".into();
+        let out = t.translate_in_tree_pv_to_csi(&pv).unwrap();
+        assert_eq!(
+            out.spec.csi.unwrap().volume_handle.as_deref(),
+            Some("#accountname-dup#sharename#uuid#ns")
+        );
+    }
+
+    /// `TestGetStorageAccount`.
+    #[test]
+    fn azure_file_storage_account_name() {
+        assert_eq!(
+            get_storage_account_name("azure-storage-account-accountname-secret").unwrap(),
+            "accountname"
+        );
+        assert_eq!(
+            get_storage_account_name("azure-storage-account-accountname-dup-secret").unwrap(),
+            "accountname-dup"
+        );
+        assert!(get_storage_account_name("invalid").is_err());
+    }
+
+    /// `TestTranslateAzureFileInTreeStorageClassToCSI`: the class is returned
+    /// unchanged (`azure_file.go` `TranslateInTreeStorageClassToCSI`), and the
+    /// provisioner is not rewritten.
+    #[test]
+    fn azure_file_storage_class_unchanged_and_names() {
+        let t = CsiTranslator::new();
+        let input = sc(&[("skuName", "Standard_LRS")], None);
+        let out = t
+            .translate_in_tree_storage_class_to_csi("kubernetes.io/azure-file", &input)
+            .unwrap();
+        assert!(sc_eq(&out, &input));
+        assert_eq!(out.provisioner, input.provisioner);
+
+        let pv = azf_pv(&[], Some("ns"), None);
+        assert!(t.is_pv_migratable(&pv));
+        assert_eq!(
+            t.get_in_tree_plugin_name_from_pv(&pv).unwrap(),
+            "kubernetes.io/azure-file"
+        );
+        assert_eq!(
+            t.get_csi_name_from_in_tree_name("kubernetes.io/azure-file")
+                .unwrap(),
+            "file.csi.azure.com"
+        );
+        assert_eq!(
+            t.get_in_tree_name_from_csi_name("file.csi.azure.com")
+                .unwrap(),
+            "kubernetes.io/azure-file"
+        );
+        assert_eq!(
+            t.repair_volume_handle("file.csi.azure.com", "h", "n")
+                .unwrap(),
+            "h"
+        );
     }
 }
