@@ -4,8 +4,8 @@
 //! `NewFromPlugins` decorates every plugin
 //! (`staging/src/k8s.io/apiserver/pkg/admission/plugins.go:142-144`,
 //! `server/options/admission.go:90`) and the chain skips a plugin whose
-//! `Handles(op)` is false (`admission/chain.go:33-35`, `:53-55`) or that does
-//! not implement the phase's interface (`chain.go:37`, `:57`, and
+//! `Handles(op)` is false (`admission/chain.go:33-35`, `:49-51`) or that does
+//! not implement the phase's interface (`chain.go:36`, `:52`, and
 //! `metrics/metrics.go:89-113`, which return before observing). So a plugin is
 //! observed exactly for the operations its `admission.NewHandler(...)` names
 //! and under the steps for which it implements `MutationInterface` (`admit`)
@@ -28,7 +28,7 @@ struct Spec {
 }
 
 /// The in-tree plugins of `AllOrderedPlugins` (pkg/kubeapiserver/options/
-/// plugins.go:69-100) that this server implements, with the citation of each
+/// plugins.go:70-101) that this server implements, with the citation of each
 /// handler and interface assertion (release-1.35, `plugin/pkg/admission/`).
 const PLUGINS: &[Spec] = &[
     // limitranger/admission.go:76-77, :206
