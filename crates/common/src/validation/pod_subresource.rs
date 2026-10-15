@@ -977,6 +977,40 @@ mod tests {
         );
     }
 
+    /// validation.go:6205-6207: the "may not be changed" error appends
+    /// `diff.Diff(old, *new)` — a unified diff (context 3) of
+    /// `json.MarshalIndent` of the INTERNAL `core.EphemeralContainer`, which has
+    /// no json tags (Go field names, declaration order, `EphemeralContainerCommon`
+    /// inlined, nil slices/pointers as `null`, `Resources` always an object).
+    #[test]
+    fn ephemeral_update_changed_error_carries_diff_text() {
+        use serde_json::json;
+        let with = |image: &str| {
+            pod(json!({
+                "metadata": {"name": "pod", "namespace": "ns", "resourceVersion": "1"},
+                "spec": {"containers": [{"name": "cnt", "image": "busybox"}],
+                         "restartPolicy": "OnFailure",
+                         "ephemeralContainers": [{"name": "a", "image": image}]}
+            }))
+        };
+        let errs = validate_pod_ephemeral_containers_update(&with("other"), &with("busybox"));
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert_eq!(
+            errs[0].detail,
+            concat!(
+                "existing ephemeral containers \"a\" may not be changed\n",
+                "@@ -1,6 +1,6 @@\n",
+                " {\n",
+                "  \"Name\": \"a\",\n",
+                "- \"Image\": \"busybox\",\n",
+                "+ \"Image\": \"other\",\n",
+                "  \"Command\": null,\n",
+                "  \"Args\": null,\n",
+                "  \"WorkingDir\": \"\",\n",
+            )
+        );
+    }
+
     /// TestValidatePodEphemeralContainersUpdate: removal and change refused,
     /// addition and reordering allowed (validation_test.go:16059).
     #[test]
