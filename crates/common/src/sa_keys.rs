@@ -29,6 +29,9 @@ pub struct VerificationKey {
     /// Signature algorithms a token verified with this key may carry.
     pub algorithms: Vec<Algorithm>,
     pub decoding_key: DecodingKey,
+    /// The public JWK served at `/openid/v1/jwks` (`jwkFromPublicKey`,
+    /// `pkg/serviceaccount/openidmetadata.go:291-309`).
+    pub jwk: serde_json::Value,
 }
 
 impl std::fmt::Debug for VerificationKey {
@@ -68,11 +71,28 @@ fn verification_key_from_spki(spki_der: &[u8]) -> Option<VerificationKey> {
     let (_, spki) = x509_parser::x509::SubjectPublicKeyInfo::from_der(spki_der).ok()?;
     let oid = spki.algorithm.algorithm.to_id_string();
     let pem = pem_encode("PUBLIC KEY", spki_der);
+    let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+    let key_id = key_id_from_spki_der(spki_der);
+    let mut jwk = serde_json::json!({ "use": "sig", "kid": key_id });
     let (algorithms, decoding_key) = match oid.as_str() {
-        OID_RSA => (
-            vec![Algorithm::RS256, Algorithm::RS384, Algorithm::RS512],
-            DecodingKey::from_rsa_pem(pem.as_bytes()).ok()?,
-        ),
+        OID_RSA => {
+            use x509_parser::public_key::PublicKey;
+            let PublicKey::RSA(rsa) = spki.parsed().ok()? else {
+                return None;
+            };
+            let strip = |b: &[u8]| -> Vec<u8> {
+                let i = b.iter().position(|x| *x != 0).unwrap_or(b.len());
+                b[i..].to_vec()
+            };
+            jwk["kty"] = "RSA".into();
+            jwk["alg"] = "RS256".into(); // algorithmFromPublicKey: only RS256
+            jwk["n"] = b64(&strip(rsa.modulus)).into();
+            jwk["e"] = b64(&strip(rsa.exponent)).into();
+            (
+                vec![Algorithm::RS256, Algorithm::RS384, Algorithm::RS512],
+                DecodingKey::from_rsa_pem(pem.as_bytes()).ok()?,
+            )
+        }
         OID_EC => {
             let curve = spki
                 .algorithm
@@ -80,19 +100,29 @@ fn verification_key_from_spki(spki_der: &[u8]) -> Option<VerificationKey> {
                 .as_ref()
                 .and_then(|p| p.as_oid().ok())
                 .map(|o| o.to_id_string())?;
-            let alg = match curve.as_str() {
-                OID_P256 => Algorithm::ES256,
-                OID_P384 => Algorithm::ES384,
+            let (alg, alg_name, crv, coord) = match curve.as_str() {
+                OID_P256 => (Algorithm::ES256, "ES256", "P-256", 32),
+                OID_P384 => (Algorithm::ES384, "ES384", "P-384", 48),
                 _ => return None,
             };
+            let point = spki.subject_public_key.data.as_ref();
+            if point.len() != 1 + 2 * coord || point[0] != 4 {
+                return None;
+            }
+            jwk["kty"] = "EC".into();
+            jwk["alg"] = alg_name.into();
+            jwk["crv"] = crv.into();
+            jwk["x"] = b64(&point[1..1 + coord]).into();
+            jwk["y"] = b64(&point[1 + coord..]).into();
             (vec![alg], DecodingKey::from_ec_pem(pem.as_bytes()).ok()?)
         }
         _ => return None,
     };
     Some(VerificationKey {
-        key_id: key_id_from_spki_der(spki_der),
+        key_id,
         algorithms,
         decoding_key,
+        jwk,
     })
 }
 

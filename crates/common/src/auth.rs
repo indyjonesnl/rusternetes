@@ -209,6 +209,9 @@ pub struct ServiceAccountOptions {
     /// `None`/zero = unset. Independent of the other flags, so it does not
     /// count towards [`Self::is_empty`].
     pub max_expiration: Option<std::time::Duration>,
+    /// `--service-account-jwks-uri` (authentication.go:454-458): overrides the
+    /// `jwks_uri` of the discovery document. Validated whenever set.
+    pub jwks_uri: Option<String>,
 }
 
 impl ServiceAccountOptions {
@@ -244,6 +247,22 @@ impl ServiceAccountOptions {
     /// Port of `validateTokenRequest` (validation.go:34-52) and
     /// `BuiltInAuthenticationOptions.Validate` (authentication.go:258-288).
     pub fn validate(&self) -> Result<()> {
+        // authentication.go:289-296: validated whenever explicitly set.
+        if let Some(uri) = self.jwks_uri.as_deref().filter(|u| !u.is_empty()) {
+            match url::Url::parse(uri) {
+                Err(e) => {
+                    return Err(Error::InvalidResource(format!(
+                        "service-account-jwks-uri must be a valid URL: {e}"
+                    )))
+                }
+                Ok(u) if u.scheme() != "https" => {
+                    return Err(Error::InvalidResource(format!(
+                        "service-account-jwks-uri requires https scheme, parsed as: {u}"
+                    )))
+                }
+                Ok(_) => {}
+            }
+        }
         if self.is_empty() {
             return Ok(());
         }
@@ -329,6 +348,8 @@ pub struct TokenManager {
     /// `--service-account-max-token-expiration` in seconds; 0 = unset
     /// (`TokenREST.maxExpirationSeconds`).
     max_token_expiration_seconds: i64,
+    /// `--service-account-jwks-uri`.
+    jwks_uri: Option<String>,
 }
 
 impl TokenManager {
@@ -344,6 +365,7 @@ impl TokenManager {
             issuers: Vec::new(),
             api_audiences: Vec::new(),
             max_token_expiration_seconds: 0,
+            jwks_uri: None,
         }
     }
 
@@ -365,6 +387,7 @@ impl TokenManager {
             issuers: Vec::new(),
             api_audiences: Vec::new(),
             max_token_expiration_seconds: 0,
+            jwks_uri: None,
         })
     }
 
@@ -375,6 +398,11 @@ impl TokenManager {
     /// the authenticator, and the signing key replaces the signer.
     pub fn with_service_account_options(mut self, opts: &ServiceAccountOptions) -> Result<Self> {
         opts.validate_max_expiration()?;
+        // The jwks-uri check must run even when no other flag is set.
+        if opts.is_empty() && opts.jwks_uri.is_some() {
+            opts.validate()?;
+        }
+        self.jwks_uri = opts.jwks_uri.clone().filter(|u| !u.is_empty());
         self.max_token_expiration_seconds = opts
             .max_expiration
             .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
@@ -414,6 +442,44 @@ impl TokenManager {
             opts.api_audiences.clone()
         };
         Ok(self)
+    }
+
+    /// The verification keys configured with `--service-account-key-file`.
+    pub fn verification_keys(&self) -> &[VerificationKey] {
+        self.verification_keys.as_deref().map_or(&[], Vec::as_slice)
+    }
+
+    /// `openIDKeysetJSON` (`pkg/serviceaccount/openidmetadata.go:248-262`):
+    /// the JWKS of the configured verification keys, or `None` when no keys
+    /// are configured (upstream then skips installing the endpoints).
+    pub fn openid_keyset_json(&self) -> Option<serde_json::Value> {
+        let keys = self.verification_keys();
+        if keys.is_empty() {
+            return None;
+        }
+        let jwks: Vec<&serde_json::Value> = keys.iter().map(|k| &k.jwk).collect();
+        Some(serde_json::json!({ "keys": jwks }))
+    }
+
+    /// `openIDConfigJSON` (`openidmetadata.go:223-246`): the discovery
+    /// document. `jwks_uri` is `--service-account-jwks-uri`, else
+    /// `default_jwks_uri` (upstream: `https://<external address>/openid/v1/jwks`).
+    pub fn openid_config_json(&self, default_jwks_uri: &str) -> Option<serde_json::Value> {
+        let keys = self.verification_keys();
+        let issuer = self.issuer()?;
+        if keys.is_empty() {
+            return None;
+        }
+        // getAlgs: sorted, de-duplicated.
+        let algs: std::collections::BTreeSet<&str> =
+            keys.iter().filter_map(|k| k.jwk["alg"].as_str()).collect();
+        Some(serde_json::json!({
+            "issuer": issuer,
+            "jwks_uri": self.jwks_uri.as_deref().unwrap_or(default_jwks_uri),
+            "response_types_supported": ["id_token"],
+            "subject_types_supported": ["public"],
+            "id_token_signing_alg_values_supported": algs.into_iter().collect::<Vec<_>>(),
+        }))
     }
 
     /// `--service-account-max-token-expiration` in seconds; 0 when unset.
