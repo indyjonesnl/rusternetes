@@ -142,10 +142,18 @@ pub async fn request_timeout_middleware(req: Request, next: Next) -> Response {
     let timeout = match request_deadline(req.uri().query(), request_timeout()) {
         Ok(t) => t,
         Err(msg) => {
-            return status_response(
-                StatusCode::BAD_REQUEST,
-                Status::failure(msg, "BadRequest", 400),
+            // `withFailedRequestAudit(failedErrorHandler(..), statusErr, ..)`
+            // (request_deadline.go:75-77).
+            let status = Status::failure(msg, "BadRequest", 400);
+            let failed = status_response(StatusCode::BAD_REQUEST, status.clone());
+            return crate::audit::audit_failed_request(
+                req.method(),
+                req.uri(),
+                req.headers(),
+                &status,
+                failed,
             )
+            .await;
         }
     };
     let deadline = started + timeout;
@@ -207,6 +215,7 @@ mod tests {
     use super::*;
     use crate::flow_control::metric_test_util::sample;
     use axum::body::Body;
+    use std::sync::Arc;
     use tower::ServiceExt;
 
     const MAX: Duration = Duration::from_secs(60);
@@ -368,5 +377,60 @@ mod tests {
         let res = axum::body::to_bytes(resp.into_body(), usize::MAX).await;
         assert!(res.is_err(), "body read must be aborted");
         assert_eq!(sample("apiserver_request_aborts_total", &l), before + 1.0);
+    }
+
+    struct Capture(tokio::sync::Mutex<Vec<rusternetes_common::audit::AuditEvent>>);
+    #[async_trait::async_trait]
+    impl rusternetes_common::audit::AuditBackend for Capture {
+        async fn log(&self, e: rusternetes_common::audit::AuditEvent) -> Result<(), String> {
+            self.0.lock().await.push(e);
+            Ok(())
+        }
+        async fn flush(&self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    // TestWithRequestDeadlineWithInvalidTimeoutIsAudited
+    // (request_deadline_test.go:256-284) + TestWithFailedRequestAudit
+    // (:350-): the 400 is audited as ONE event at stage ResponseStarted whose
+    // ResponseStatus carries the code and the statusErr message.
+    #[tokio::test]
+    async fn malformed_timeout_is_audited() {
+        use rusternetes_common::audit::AuditStage;
+        let cap = Arc::new(Capture(Default::default()));
+        crate::audit::install_audit(crate::audit::AuditConfig {
+            policy: crate::audit::Policy::from_yaml(
+                "apiVersion: audit.k8s.io/v1\nkind: Policy\nrules:\n- level: RequestResponse\n",
+            )
+            .unwrap(),
+            sink: cap.clone(),
+        });
+        let resp = serve(
+            "/api/v1/namespaces/n/auditedthings?timeout=foo",
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(resp.status(), 400);
+        assert!(resp.headers().contains_key("Audit-ID"));
+        // The sink is process-global: other tests' 400s land here too.
+        let ev: Vec<_> = cap
+            .0
+            .lock()
+            .await
+            .iter()
+            .filter(|e| e.request_uri.contains("auditedthings"))
+            .cloned()
+            .collect();
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert_eq!(ev[0].stage, AuditStage::ResponseStarted);
+        assert_eq!(ev[0].verb, "list");
+        let rs = ev[0].response_status.as_ref().unwrap();
+        assert_eq!(rs.code, 400);
+        assert!(rs
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("invalid timeout specified in the request URL"));
     }
 }
