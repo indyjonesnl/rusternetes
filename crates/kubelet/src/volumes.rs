@@ -698,6 +698,24 @@ impl VolumeManager {
             if held.contains(&key) || desired.contains(&key) {
                 continue;
             }
+            // `GenerateUnmountDeviceFunc` (`operation_generator.go:846-856`):
+            // refuse to unstage while another mount still references the
+            // device mount path; the failure is retried on the next sync.
+            let device_mount_path = device_path.to_string_lossy();
+            let refs =
+                crate::volume_plugins::plugin::DeviceMountableVolumePlugin::get_device_mount_refs(
+                    self.csi_plugin.as_ref(),
+                    &device_mount_path,
+                );
+            if let Err(e) =
+                crate::volume_plugins::util::check_device_mount_refs(&device_mount_path, refs)
+            {
+                warn!(
+                    "UnmountDevice of {} ({}) skipped: GetDeviceMountRefs check failed: {e:#}",
+                    key.1, device_mount_path
+                );
+                continue;
+            }
             if let Err(e) = self.csi_plugin.unmount_device(&device_path).await {
                 warn!(
                     "CSI UnmountDevice of {} ({}) failed: {e:#}",

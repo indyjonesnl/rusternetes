@@ -253,6 +253,9 @@ pub trait DeviceMounter: Send + Sync {
 pub trait DeviceMountableVolumePlugin: VolumePlugin {
     /// `NewDeviceMounter`.
     fn new_device_mounter(&self) -> Result<Box<dyn DeviceMounter>>;
+
+    /// `GetDeviceMountRefs` (`plugins.go:243`).
+    fn get_device_mount_refs(&self, device_mount_path: &str) -> Result<Vec<String>>;
 }
 
 /// Port of `volume.Attacher` (`pkg/volume/volume.go:270-290`): the

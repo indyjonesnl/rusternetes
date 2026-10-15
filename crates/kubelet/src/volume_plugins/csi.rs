@@ -786,6 +786,16 @@ impl DeviceMountableVolumePlugin for CsiPlugin {
             plugin_dir: plugin_dir(self.host.get_volumes_base_path()),
         }))
     }
+
+    /// `GetDeviceMountRefs` (`csi_plugin.go:721-727`).
+    ///
+    /// ```go
+    /// m := p.host.GetMounter()
+    /// return m.GetMountRefs(deviceMountPath)
+    /// ```
+    fn get_device_mount_refs(&self, device_mount_path: &str) -> Result<Vec<String>> {
+        Ok(self.host.get_mounter().get_mount_refs(device_mount_path)?)
+    }
 }
 
 /// `getPVSourceFromSpec` (`csi_util.go:165-174`).

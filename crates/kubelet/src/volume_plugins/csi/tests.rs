@@ -2008,3 +2008,33 @@ fn registry_finds_csi_as_attachable_only_when_can_attach() {
     assert!(mgr.find_attachable_plugin_by_spec(&spec(&yes)).is_some());
     assert!(mgr.find_attachable_plugin_by_spec(&spec(&no)).is_none());
 }
+
+// ---- GetDeviceMountRefs (csi_plugin.go:721-727) ----------------------------
+//
+// `m := p.host.GetMounter(); return m.GetMountRefs(deviceMountPath)`. Upstream
+// has no csi_plugin_test.go case for it; the delegation is the whole method.
+
+#[test]
+fn get_device_mount_refs_delegates_to_the_host_mounters_get_mount_refs() {
+    use crate::volume_plugins::plugin::DeviceMountableVolumePlugin;
+    let p = plugin();
+    // A path that does not exist has no refs (`GetMountRefs`: `!pathExists`).
+    assert!(p
+        .get_device_mount_refs("/definitely/not/here/globalmount")
+        .unwrap()
+        .is_empty());
+    for path in [
+        "/",
+        "/proc",
+        "/dev",
+        "/sys",
+        "/tmp",
+        "/etc/hosts",
+        "/etc/resolv.conf",
+    ] {
+        let want = crate::volume_plugins::util::mount_utils::get_mount_refs(path)
+            .map_err(|e| e.to_string());
+        let got = p.get_device_mount_refs(path).map_err(|e| e.to_string());
+        assert_eq!(got, want, "{path}");
+    }
+}
