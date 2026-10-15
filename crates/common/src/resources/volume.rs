@@ -9,6 +9,8 @@ use std::collections::HashMap;
 pub const PV_PROTECTION_FINALIZER: &str = "kubernetes.io/pv-protection";
 /// `volumeutil.PVCProtectionFinalizer` (pkg/volume/util/util.go).
 pub const PVC_PROTECTION_FINALIZER: &str = "kubernetes.io/pvc-protection";
+/// `volumeutil.VACProtectionFinalizer` (pkg/volume/util/finalizer.go:27).
+pub const VAC_PROTECTION_FINALIZER: &str = "kubernetes.io/vac-protection";
 
 /// PersistentVolume represents a storage resource in the cluster
 #[derive(Debug, Clone, Serialize, Deserialize)]
