@@ -171,12 +171,14 @@ fn accept_media_type_options(
     let mut convert = false;
     for (k, v) in params {
         match k.as_str() {
+            // A media-type parameter, not a query parameter: upstream decodes
+            // it as `v == "1"` (negotiate.go:230-231), not with ParseBool.
+            "pretty" => pretty = v == "1",
             "as" | "g" | "v" => convert = true,
             // AllowsStreamSchema(s) == (s == "watch").
             "stream" if !v.is_empty() && (!accepts.streams || v != "watch") => return None,
             // AllowsServerVersion is always false.
             "sv" if !v.is_empty() => return None,
-            "pretty" => pretty = v == "1",
             _ => {}
         }
     }
