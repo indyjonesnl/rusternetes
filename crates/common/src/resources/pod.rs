@@ -1039,18 +1039,21 @@ pub struct VolumeMount {
 /// (`staging/src/k8s.io/api/core/v1/types.go`, `VolumeSource`). Rusternetes
 /// does not implement these plugins, but the API must still round-trip them
 /// losslessly and PodSecurity `restrictedVolumes` names the type of the
-/// offending source (`check_restrictedVolumes.go:108-153`). Each source is
-/// kept as opaque JSON; only its presence is interpreted.
+/// offending source (`check_restrictedVolumes.go:108-153`). Most sources are
+/// kept as opaque JSON; only their presence is interpreted. `gcePersistentDisk`
+/// and `awsElasticBlockStore` are typed (the same core/v1 structs a PV uses)
+/// because csi-translation reads them (`TranslateInTreeInlineVolumeToCSI`,
+/// `staging/src/k8s.io/csi-translation-lib/translate.go:67-90`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LegacyVolumeSources {
     #[serde(rename = "gcePersistentDisk", skip_serializing_if = "Option::is_none")]
-    pub gce_persistent_disk: Option<serde_json::Value>,
+    pub gce_persistent_disk: Option<crate::resources::volume::GCEPersistentDiskVolumeSource>,
 
     #[serde(
         rename = "awsElasticBlockStore",
         skip_serializing_if = "Option::is_none"
     )]
-    pub aws_elastic_block_store: Option<serde_json::Value>,
+    pub aws_elastic_block_store: Option<crate::resources::volume::AWSElasticBlockStoreVolumeSource>,
 
     #[serde(rename = "gitRepo", skip_serializing_if = "Option::is_none")]
     pub git_repo: Option<serde_json::Value>,
@@ -3399,6 +3402,48 @@ mod tests {
         assert!(v.legacy_sources.gce_persistent_disk.is_some());
         assert!(v.legacy_sources.storageos.is_some());
         assert!(v.legacy_sources.rbd.is_none());
+        assert_eq!(serde_json::to_value(&v).unwrap(), src);
+    }
+
+    /// `gcePersistentDisk` / `awsElasticBlockStore` decode into the typed
+    /// core/v1 sources (`GCEPersistentDiskVolumeSource`,
+    /// `AWSElasticBlockStoreVolumeSource`) that csi-translation reads (#3739),
+    /// and re-encode unchanged.
+    #[test]
+    fn volume_gce_and_ebs_sources_are_typed() {
+        use crate::resources::volume::{
+            AWSElasticBlockStoreVolumeSource, GCEPersistentDiskVolumeSource,
+        };
+        let src = serde_json::json!({
+            "name": "v",
+            "gcePersistentDisk": {"pdName": "d", "fsType": "ext4", "partition": 2, "readOnly": true},
+        });
+        let v: Volume = serde_json::from_value(src.clone()).unwrap();
+        assert_eq!(
+            v.legacy_sources.gce_persistent_disk,
+            Some(GCEPersistentDiskVolumeSource {
+                pd_name: "d".into(),
+                fs_type: Some("ext4".into()),
+                partition: Some(2),
+                read_only: Some(true),
+            })
+        );
+        assert_eq!(serde_json::to_value(&v).unwrap(), src);
+
+        let src = serde_json::json!({
+            "name": "e",
+            "awsElasticBlockStore": {"volumeID": "vol-1", "partition": 1},
+        });
+        let v: Volume = serde_json::from_value(src.clone()).unwrap();
+        assert_eq!(
+            v.legacy_sources.aws_elastic_block_store,
+            Some(AWSElasticBlockStoreVolumeSource {
+                volume_id: "vol-1".into(),
+                fs_type: None,
+                partition: Some(1),
+                read_only: None,
+            })
+        );
         assert_eq!(serde_json::to_value(&v).unwrap(), src);
     }
 }
