@@ -119,6 +119,9 @@ fn apply_volume_default_mode(vol: &mut rusternetes_common::resources::pod::Volum
     if let Some(p) = vol.projected.as_mut() {
         p.default_mode.get_or_insert(DEFAULT_MODE);
     }
+    if let Some(i) = vol.iscsi.as_mut() {
+        i.set_defaults();
+    }
 }
 
 /// Apply K8s defaults to an EphemeralContainer. Mirrors the

@@ -53,7 +53,9 @@ fn source() -> serde_json::Value {
         "targetPortal": "127.0.0.1:3260",
         "iqn": "iqn.2014-12.server:storage.target01",
         "fsType": "ext4",
-        "lun": 0
+        "lun": 0,
+        // As stored: the api-server applies `+default="default"` (#3491).
+        "iscsiInterface": "default"
     })
 }
 
@@ -264,14 +266,6 @@ fn get_iscsi_initiator_info_test() {
     assert_eq!(
         get_iscsi_initiator_info(&spec(&v, None, false)).unwrap().0,
         "tcp"
-    );
-    // `+default="default"` (`core/v1/types.go:1507`): an unset interface reads as `default`.
-    let unset = vol("v", source());
-    assert_eq!(
-        get_iscsi_initiator_info(&spec(&unset, None, false))
-            .unwrap()
-            .0,
-        "default"
     );
 }
 

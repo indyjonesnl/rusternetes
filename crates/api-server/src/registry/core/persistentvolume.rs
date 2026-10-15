@@ -43,6 +43,10 @@ pub fn convert_to_internal(pv: &mut PersistentVolume) {
     if pv.spec.volume_mode.is_none() {
         pv.spec.volume_mode = Some(PersistentVolumeMode::Filesystem);
     }
+    // SetObjectDefaults_PersistentVolume (zz_generated.defaults.go:151-155).
+    if let Some(iscsi) = pv.spec.iscsi.as_mut() {
+        iscsi.set_defaults();
+    }
 }
 
 /// `GetWarningsForPersistentVolume` (pkg/api/persistentvolume/util.go:40-110).
@@ -280,7 +284,11 @@ mod tests {
     /// staging/src/k8s.io/api/core/v1/types.go:1558).
     #[test]
     fn defaults_iscsi_interface() {
-        for (iface, want) in [(None, "default"), (Some(""), "default"), (Some("tcp"), "tcp")] {
+        for (iface, want) in [
+            (None, "default"),
+            (Some(""), "default"),
+            (Some("tcp"), "tcp"),
+        ] {
             let mut iscsi = serde_json::json!({"targetPortal": "p", "iqn": "q", "lun": 0});
             if let Some(i) = iface {
                 iscsi["iscsiInterface"] = i.into();

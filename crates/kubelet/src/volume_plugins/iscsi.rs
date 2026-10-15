@@ -738,18 +738,15 @@ pub(crate) fn get_iscsi_target_info(spec: &Spec<'_>) -> Result<(String, Vec<Stri
 /// `getISCSIInitiatorInfo` (`iscsi.go:506-515`): iface and initiator name.
 ///
 /// `iscsiInterface` is `+default="default"` in `core/v1`
-/// (`staging/src/k8s.io/api/core/v1/types.go:1510`, `:1558`), applied by the
-/// API server's schema defaulting before any kubelet reads the object. Our
-/// api-server does not default it, so the empty value is read as `default`
-/// here, the value upstream's kubelet always sees (#3491).
+/// (`staging/src/k8s.io/api/core/v1/types.go:1510`, `:1558`); the API server
+/// applies it (`SetObjectDefaults_Pod`/`_PersistentVolume`), so like upstream
+/// the kubelet reads the field as stored (#3491).
 pub(crate) fn get_iscsi_initiator_info(spec: &Spec<'_>) -> Result<(String, Option<String>)> {
     let (s, _) = iscsi_source(spec).ok_or_else(|| anyhow!(NOT_ISCSI))?;
-    let iface = s
-        .iscsi_interface
-        .clone()
-        .filter(|i| !i.is_empty())
-        .unwrap_or_else(|| "default".to_string());
-    Ok((iface, s.initiator_name.clone()))
+    Ok((
+        s.iscsi_interface.clone().unwrap_or_default(),
+        s.initiator_name.clone(),
+    ))
 }
 
 /// `getISCSIDiscoveryCHAPInfo` (`iscsi.go:518-527`).
