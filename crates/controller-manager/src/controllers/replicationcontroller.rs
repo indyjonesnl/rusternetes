@@ -633,6 +633,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
             final_current_replicas,
             final_ready_replicas,
             create_failure.as_deref(),
+            super::replicaset::replica_failure_reason(current_replicas, desired_replicas),
         )
         .await?;
 
@@ -931,6 +932,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
         current_replicas: i32,
         ready_replicas: i32,
         failure_message: Option<&str>,
+        _failure_reason: Option<&str>,
     ) -> rusternetes_common::Result<()> {
         let namespace = rc.metadata.namespace.as_deref().unwrap_or("default");
         let key = build_key("replicationcontrollers", Some(namespace), &rc.metadata.name);
@@ -1620,6 +1622,47 @@ pub(crate) mod tests {
                 .is_some_and(|vols| vols.iter().any(|v| v.name.starts_with("kube-api-access"))),
             "pod must get the SA token volume injected"
         );
+    }
+
+    /// `calculateStatus` (replica_set_utils.go:124-136; the RC rides the RS
+    /// controller upstream) sets ReplicaFailure only when absent, so a failure
+    /// that persists keeps its lastTransitionTime and message; the reason is
+    /// FailedDelete when over-replicated.
+    #[tokio::test]
+    async fn rc_replica_failure_is_not_rewritten_while_it_persists() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicationControllerController::new(storage.clone(), 5);
+        let mut selector = HashMap::new();
+        selector.insert("app".to_string(), "stable".to_string());
+        let rc = make_rc("stable", "default", 1, selector, None);
+        let key = "/registry/replicationcontrollers/default/stable";
+        storage.create(key, &rc).await.unwrap();
+
+        controller
+            .update_status(&rc, 0, 0, Some("first failure"), Some("FailedDelete"))
+            .await
+            .unwrap();
+        let cond = |rc: ReplicationController| {
+            rc.status
+                .unwrap()
+                .conditions
+                .unwrap()
+                .into_iter()
+                .find(|c| c.condition_type == "ReplicaFailure")
+                .unwrap()
+        };
+        let first = cond(storage.get(key).await.unwrap());
+        assert_eq!(first.reason.as_deref(), Some("FailedDelete"));
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let rc: ReplicationController = storage.get(key).await.unwrap();
+        controller
+            .update_status(&rc, 0, 0, Some("second failure"), Some("FailedCreate"))
+            .await
+            .unwrap();
+        let second = cond(storage.get(key).await.unwrap());
+        assert_eq!(second.message, first.message);
+        assert_eq!(second.last_transition_time, first.last_transition_time);
     }
 
     #[tokio::test]

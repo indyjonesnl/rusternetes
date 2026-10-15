@@ -1943,7 +1943,7 @@ mod tests {
 /// `manageReplicas` ran against `.spec.replicas`: `FailedCreate` if short,
 /// `FailedDelete` if over, unset when equal (a zero-value string upstream).
 /// Upstream `calculateStatus`, replica_set_utils.go:127-132.
-fn replica_failure_reason(active: i32, desired: i32) -> Option<&'static str> {
+pub(crate) fn replica_failure_reason(active: i32, desired: i32) -> Option<&'static str> {
     match active.cmp(&desired) {
         std::cmp::Ordering::Less => Some("FailedCreate"),
         std::cmp::Ordering::Greater => Some("FailedDelete"),
