@@ -381,6 +381,10 @@ mod workload_template_drop_disabled_test;
 
 mod conformance_node_lease;
 mod conformance_node_podtemplates;
+mod conformance_storage_csi_inline;
+mod conformance_storage_pv_status;
+mod conformance_storage_storageclass;
+mod conformance_storage_volumeattachment;
 mod connect_mutating_admission_test;
 mod custom_external_metrics_selectors_test;
 mod custom_metrics_list_shape_test;
