@@ -20,6 +20,7 @@ use crate::registry::rest::{
     RestCreateStrategy, RestDeleteStrategy, RestUpdateStrategy,
 };
 use crate::registry::scale::{Scalable, ScaleRest};
+use crate::ssa::ResetFields;
 
 /// The v1 defaulting a decoded ReplicaSet goes through:
 /// `SetDefaults_ReplicaSet` (pkg/apis/apps/v1/defaults.go) and the pod
@@ -96,6 +97,11 @@ impl RestUpdateStrategy<ReplicaSet> for Strategy {
     fn allow_unconditional_update(&self) -> bool {
         true
     }
+
+    /// `GetResetFields` (strategy.go:69-77): `status`.
+    fn get_reset_fields(&self) -> ResetFields {
+        ResetFields::new().with("apps/v1", &[&["status"]])
+    }
 }
 
 /// strategy.go:58-60.
@@ -142,6 +148,11 @@ impl RestUpdateStrategy<ReplicaSet> for StatusStrategy {
 
     fn allow_unconditional_update(&self) -> bool {
         true
+    }
+
+    /// `GetResetFields` (strategy.go:199-207): `spec`.
+    fn get_reset_fields(&self) -> ResetFields {
+        ResetFields::new().with("apps/v1", &[&["spec"]])
     }
 }
 
