@@ -1146,10 +1146,14 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                                         "Failed evaluating match conditions, failing closed {}: {}",
                                         webhook.name, msg
                                     );
-                                    return Err(rusternetes_common::Error::Forbidden(format!(
-                                        "{} \"{}\" is forbidden: {}",
-                                        gvr.resource, name, msg
-                                    )));
+                                    return Err(rusternetes_common::Error::Forbidden(
+                                        crate::webhook_match::forbidden_message(
+                                            &gvr.group,
+                                            &gvr.resource,
+                                            name,
+                                            &msg,
+                                        ),
+                                    ));
                                 }
                             }
                         }
@@ -1739,10 +1743,14 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                                         "Failed evaluating match conditions, failing closed {}: {}",
                                         webhook.name, msg
                                     );
-                                    return Err(rusternetes_common::Error::Forbidden(format!(
-                                        "{} \"{}\" is forbidden: {}",
-                                        gvr.resource, name, msg
-                                    )));
+                                    return Err(rusternetes_common::Error::Forbidden(
+                                        crate::webhook_match::forbidden_message(
+                                            &gvr.group,
+                                            &gvr.resource,
+                                            name,
+                                            &msg,
+                                        ),
+                                    ));
                                 }
                             }
                         }
@@ -2037,7 +2045,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                                 ignore_client_call_failures,
                             );
                             // An undecodable patch is an `ErrCallingWebhook`
-                            // (mutating/dispatcher.go:327-335), so Ignore fails
+                            // (mutating/dispatcher.go:336-339), so Ignore fails
                             // open (:207-212); the reinvocation bookkeeping
                             // (:200-203) still runs.
                             if calling_webhook_error && ignore_client_call_failures {
@@ -6352,7 +6360,7 @@ mod webhook_match_condition_metrics_tests {
 }
 
 /// failurePolicy handling gaps found while wiring the webhook metrics (#3522):
-/// mutating/dispatcher.go:262-265 and :327-335, validating/dispatcher.go:142-152
+/// mutating/dispatcher.go:262-265 and :336-339, validating/dispatcher.go:142-152
 /// and :263-266.
 #[cfg(test)]
 mod dispatcher_failure_policy_tests {
@@ -6557,7 +6565,7 @@ mod dispatcher_failure_policy_tests {
         )
     }
 
-    /// mutating/dispatcher.go:327-335: an undecodable patch is an
+    /// mutating/dispatcher.go:336-339: an undecodable patch is an
     /// `ErrCallingWebhook`, so Ignore fails open.
     #[tokio::test]
     async fn mutating_undecodable_patch_fails_open_under_ignore() {

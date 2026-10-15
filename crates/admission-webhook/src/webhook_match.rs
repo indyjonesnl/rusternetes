@@ -86,7 +86,39 @@ pub fn match_webhook_conditions(
 /// `ShouldCallHook` builds it from `attr.GetResource().GroupResource()` and
 /// `attr.GetName()` (webhook.go:231-234).
 pub fn forbidden_message(group: &str, resource: &str, name: &str, err: &str) -> String {
-    format!("{resource} \"{name}\" is forbidden: {err}")
+    // GroupResource.String() (runtime/schema/group_version.go:62).
+    let qualified = if group.is_empty() {
+        resource.to_string()
+    } else {
+        format!("{resource}.{group}")
+    };
+    if qualified.is_empty() {
+        format!("forbidden: {err}")
+    } else if name.is_empty() {
+        format!("{qualified} is forbidden: {err}")
+    } else {
+        format!("{qualified} \"{name}\" is forbidden: {err}")
+    }
+}
+
+/// `utilerrors.NewAggregate(errs).Error()`
+/// (apimachinery/pkg/util/errors/errors.go:70-96): one error is its message;
+/// several are their distinct messages joined by ", " inside brackets.
+fn aggregate(errors: &[String]) -> String {
+    if let [one] = errors {
+        return one.clone();
+    }
+    let mut seen: Vec<&str> = Vec::new();
+    for e in errors {
+        if !seen.contains(&e.as_str()) {
+            seen.push(e);
+        }
+    }
+    if seen.len() == 1 {
+        seen[0].to_string()
+    } else {
+        format!("[{}]", seen.join(", "))
+    }
 }
 
 enum Inner {
@@ -146,7 +178,7 @@ fn match_inner(
         // matcher.go:118-135: a mix of true and errors resorts to failurePolicy.
         observe_time(t);
         return match policy {
-            FailurePolicy::Fail => Inner::Error(errors.join(", ")),
+            FailurePolicy::Fail => Inner::Error(aggregate(&errors)),
             FailurePolicy::Ignore => Inner::Excluded,
             FailurePolicy::Unknown(_) => Inner::Matches,
         };

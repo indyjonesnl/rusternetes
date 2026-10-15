@@ -130,7 +130,7 @@ async fn admit_and_validate_observe_the_step_metrics() {
 // `WithControllerMetrics` decorates EVERY plugin
 // (apiserver/pkg/server/options/admission.go:90, admission/plugins.go:142-144)
 // and the chain calls a plugin whenever `Handles(op)` is true
-// (admission/chain.go:33-35, :53-55), whatever the resource: a plugin that
+// (admission/chain.go:33-35, :49-51), whatever the resource: a plugin that
 // has nothing to do for the object is still observed.
 
 fn plugin_series(name: &str, ty: &str, op: &str, rejected: &str) -> u64 {
@@ -189,7 +189,7 @@ fn cm_kind() -> (GroupVersionKind, GroupVersionResource, UserInfo, ConfigMap) {
     )
 }
 
-/// plugins.go:69-100 + each plugin's `NewHandler(...)` and interface
+/// plugins.go:70-101 + each plugin's `NewHandler(...)` and interface
 /// assertions: which plugin is observed under which step on a CREATE.
 const CREATE_ADMIT: &[&str] = &[
     "LimitRanger",

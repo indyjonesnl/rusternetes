@@ -17,7 +17,7 @@
 //! in the state yet (the `patch/` package is #2996), so it does nothing.
 //!
 //! The in-tree plugins ahead of them run first, in `AllOrderedPlugins` order
-//! (plugins.go:69-100), for the resources on this path that they handle:
+//! (plugins.go:70-101), for the resources on this path that they handle:
 //! LimitRanger and DefaultStorageClass, for PersistentVolumeClaims, and
 //! Priority, for PriorityClasses. For Pods, [`Admission::admit_pod`] runs
 //! NodeRestriction, LimitRanger, ServiceAccount, Priority,
@@ -146,7 +146,7 @@ impl Admission<'_> {
     /// One in-tree plugin as `NewFromPlugins` runs it
     /// (apiserver/pkg/admission/plugins.go:142-144): skipped when it is not in
     /// the enabled set, or when the chain would not call it for this
-    /// operation and step (`chain.go:33-35`, `:53-55`); otherwise `work` is
+    /// operation and step (`chain.go:33-35`, `:49-51`); otherwise `work` is
     /// decorated by `WithControllerMetrics` (metrics.go:63-66, :89-113), so the
     /// plugin is observed whatever the resource, `rejected` being `err != nil`.
     /// See [`crate::admission::plugin_metrics`].
@@ -389,7 +389,7 @@ impl Admission<'_> {
         .await?;
 
         // `StorageObjectInUseProtection` follows `DefaultStorageClass` in
-        // `AllOrderedPlugins` (plugins.go:69-100); it acts on the resource
+        // `AllOrderedPlugins` (plugins.go:70-101); it acts on the resource
         // itself, never a subresource (admission.go `admitPV`/`admitPVC`).
         self.plugin("StorageObjectInUseProtection", op, ADMIT, async {
             if self.subresource.is_none() && self.resource.group.is_empty() {
@@ -407,7 +407,7 @@ impl Admission<'_> {
         .await?;
 
         // PodTopologyLabels.admitPod (plugin/pkg/admission/podtopologylabels/
-        // admission.go:123-148; after RuntimeClass in plugins.go:98): a pod
+        // admission.go:123-148; after RuntimeClass in plugins.go:93, listed at :100): a pod
         // created with `spec.nodeName` gets the node's topology labels,
         // overwriting its own.
         self.plugin("PodTopologyLabels", op, ADMIT, async {
@@ -606,7 +606,7 @@ impl Admission<'_> {
         })
         .await?;
         // `Priority` sits ahead of `LimitRanger` in `AllOrderedPlugins`
-        // (plugins.go:69-100).
+        // (plugins.go:70-101).
         self.plugin("Priority", op, VALIDATE, async {
             self.validate_priority(op, obj).await
         })
