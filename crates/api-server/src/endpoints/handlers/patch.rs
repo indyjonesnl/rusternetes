@@ -83,18 +83,7 @@ pub async fn patch_resource<T: Object>(
         )));
     }
 
-    let options = PatchOptions {
-        field_manager: params.get("fieldManager").cloned(),
-        force: params
-            .get("force")
-            .map(|v| rusternetes_common::query::k8s_query_bool(v)),
-        dry_run: dry_run_param(params),
-        field_validation: params.get("fieldValidation").cloned(),
-    };
-    let errs = validate_patch_options(&options, content_type);
-    if !errs.is_empty() {
-        return Err(Error::Invalid(errs));
-    }
+    let options = checked_patch_options(params, content_type)?;
     let dry_run = is_dry_run(options.dry_run.as_deref());
 
     // patchResource (patch.go:653-691): pick the mechanism. Apply may create.
@@ -275,13 +264,7 @@ impl<T: Object> Patcher<'_, T> {
 
         // Decode the result strictly or not, per fieldValidation. A strict
         // failure is `Invalid` on the `patch` field (patch.go:338-363).
-        let invalid_patch = |msg: String| {
-            Error::Invalid(vec![FieldError::invalid(
-                &Path::new("patch"),
-                patched_js.clone(),
-                msg,
-            )])
-        };
+        let invalid_patch = |msg: String| patch_invalid(patched_js.clone(), msg);
         let obj: T = serde_json::from_value(patched).map_err(|e| invalid_patch(e.to_string()))?;
         // `appliedStrictErrs`: the patch document's own errors, which precede
         // the patched object's (patch.go:338-363 `append(appliedStrictErrs,
@@ -429,6 +412,38 @@ impl<T: Object> TransformFunc<T> for Patcher<'_, T> {
         check_name(&obj, self.name, self.namespace)?;
         Ok(obj)
     }
+}
+
+/// patch.go:116-128: decode the query into `PatchOptions`, then
+/// `ValidatePatchOptions`.
+pub(super) fn checked_patch_options(
+    params: &HashMap<String, String>,
+    content_type: &str,
+) -> Result<PatchOptions> {
+    let options = PatchOptions {
+        field_manager: params.get("fieldManager").cloned(),
+        force: params
+            .get("force")
+            .map(|v| rusternetes_common::query::k8s_query_bool(v)),
+        dry_run: dry_run_param(params),
+        field_validation: params.get("fieldValidation").cloned(),
+    };
+    let errs = validate_patch_options(&options, content_type);
+    if !errs.is_empty() {
+        return Err(Error::Invalid(errs));
+    }
+    Ok(options)
+}
+
+/// `errors.NewInvalid(schema.GroupKind{}, "", field.ErrorList{
+/// field.Invalid(field.NewPath("patch"), patchedObjJS, msg)})`
+/// (patch.go:345-347, 352-354, 361-363).
+pub(super) fn patch_invalid(patched_js: String, msg: String) -> Error {
+    Error::Invalid(vec![FieldError::invalid(
+        &Path::new("patch"),
+        patched_js,
+        msg,
+    )])
 }
 
 /// A failed patch application. RFC 6902 §4.2 mandates that the target of a

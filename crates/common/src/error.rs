@@ -653,6 +653,19 @@ mod tests {
         }
     }
 
+    /// `StatusDetails.Name`/`Kind` are `omitempty` (meta/v1 types.go), so an
+    /// empty name or kind must not serialize (delete.go:81 passes name "").
+    #[test]
+    fn new_invalid_omits_empty_name_and_kind() {
+        let e = crate::validation::field::Error::invalid(&Path::new("f"), "x", "d");
+        let Error::Status(st) = Error::new_invalid("", "", "", vec![e]) else {
+            panic!("expected Status");
+        };
+        let v = serde_json::to_value(st.details.unwrap()).unwrap();
+        assert!(v.get("name").is_none(), "{v}");
+        assert!(v.get("kind").is_none(), "{v}");
+    }
+
     #[test]
     fn new_invalid_with_no_errors_and_with_several() {
         let Error::Status(st) = Error::new_invalid("", "Kind", "name", vec![]) else {

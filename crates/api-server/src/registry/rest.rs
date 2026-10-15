@@ -1202,6 +1202,38 @@ mod tests {
         );
     }
 
+    /// delete.go:81: `NewInvalid(meta.k8s.io DeleteOptions, "", errs)`.
+    #[test]
+    fn before_delete_invalid_options_is_new_invalid() {
+        let mut obj = cm("a");
+        let mut opts = DeleteOptions {
+            dry_run: Some(vec!["Maybe".to_string()]),
+            ..zero_delete_options()
+        };
+        let err = before_delete(
+            &PlainDelete,
+            &gr(),
+            &RequestContext::new(Some("ns")),
+            &mut obj,
+            &mut opts,
+        )
+        .unwrap_err();
+        let Error::Status(st) = err else {
+            panic!("expected NewInvalid Status, got {err:?}");
+        };
+        assert!(
+            st.message
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("DeleteOptions.meta.k8s.io \"\" is invalid: dryRun: "),
+            "{:?}",
+            st.message
+        );
+        let d = st.details.unwrap();
+        assert_eq!(d.kind.as_deref(), Some("DeleteOptions"));
+        assert_eq!(d.group.as_deref(), Some("meta.k8s.io"));
+    }
+
     #[test]
     fn group_resource_displays_like_upstream() {
         assert_eq!(

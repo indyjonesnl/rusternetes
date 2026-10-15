@@ -447,3 +447,86 @@ mod admission_plugin_selection {
         assert_eq!(pod.spec.unwrap().priority, Some(0), "Priority is on");
     }
 }
+
+/// `errors.NewInvalid` for the request-options validators and the patch
+/// decode failure (#2392). Upstream: update.go:93, create.go:110,
+/// patch.go:125, 345-347, delete.go:132 — all go through
+/// `NewInvalid(schema.GroupKind{...}, "", errs)`
+/// (apimachinery errors.go:284-312), so the Status message carries the
+/// `<Kind>.<group> "" is invalid: ` prefix and `details.kind/group`.
+mod options_new_invalid {
+    use super::*;
+    use rusternetes_common::Error;
+
+    fn status(err: Error) -> Box<rusternetes_common::types::Status> {
+        match err {
+            Error::Status(s) => s,
+            other => panic!("expected a NewInvalid Status, got {other:?}"),
+        }
+    }
+
+    fn assert_meta_invalid(err: Error, kind: &str, field: &str) {
+        let st = status(err);
+        let msg = st.message.clone().unwrap_or_default();
+        let prefix = format!("{kind}.meta.k8s.io \"\" is invalid: {field}: ");
+        assert!(msg.starts_with(&prefix), "message {msg:?}");
+        assert_eq!(st.reason.as_deref(), Some("Invalid"));
+        assert_eq!(st.code, Some(422));
+        let d = st.details.expect("details");
+        assert_eq!(d.kind.as_deref(), Some(kind));
+        assert_eq!(d.group.as_deref(), Some("meta.k8s.io"));
+        let c = &d.causes.expect("causes")[0];
+        assert_eq!(c.field.as_deref(), Some(field));
+        assert!(
+            !c.message.as_deref().unwrap_or("").starts_with(field),
+            "cause message is ErrorBody(), without the field prefix"
+        );
+    }
+
+    #[test]
+    fn delete_options() {
+        let err = decode_delete_options(&q(&[("dryRun", "Maybe")]), b"").unwrap_err();
+        assert_meta_invalid(err, "DeleteOptions", "dryRun");
+    }
+
+    #[test]
+    fn create_options() {
+        let err =
+            super::super::create::checked_create_options(&q(&[("dryRun", "Maybe")])).unwrap_err();
+        assert_meta_invalid(err, "CreateOptions", "dryRun");
+    }
+
+    #[test]
+    fn update_options() {
+        let err =
+            super::super::update::checked_update_options(&q(&[("dryRun", "Maybe")])).unwrap_err();
+        assert_meta_invalid(err, "UpdateOptions", "dryRun");
+    }
+
+    #[test]
+    fn patch_options() {
+        let err = super::super::patch::checked_patch_options(
+            &q(&[("dryRun", "Maybe")]),
+            "application/merge-patch+json",
+        )
+        .unwrap_err();
+        assert_meta_invalid(err, "PatchOptions", "dryRun");
+    }
+
+    /// patch.go:345-347 uses the zero GroupKind and an empty name, so the
+    /// message has an empty qualified kind: ` "" is invalid: patch: ...`.
+    #[test]
+    fn patch_decode_failure() {
+        let st = status(super::super::patch::patch_invalid(
+            "{}".into(),
+            "boom".into(),
+        ));
+        assert_eq!(
+            st.message.as_deref(),
+            Some(r#" "" is invalid: patch: Invalid value: "{}": boom"#)
+        );
+        let d = st.details.expect("details");
+        assert_eq!((d.kind, d.group), (None, None));
+        assert_eq!(d.causes.expect("causes")[0].field.as_deref(), Some("patch"));
+    }
+}
