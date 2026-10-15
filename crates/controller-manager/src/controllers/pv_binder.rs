@@ -1985,7 +1985,7 @@ const IN_TREE_TO_CSI_DRIVER: &[(&str, &str)] = &[
 ];
 
 /// `CSITranslator.GetCSINameFromInTreeName` (`translate.go:168-175`).
-fn csi_name_from_in_tree_name(plugin: &str) -> Option<&'static str> {
+pub(crate) fn csi_name_from_in_tree_name(plugin: &str) -> Option<&'static str> {
     IN_TREE_TO_CSI_DRIVER
         .iter()
         .find(|(p, _)| *p == plugin)
@@ -1996,7 +1996,7 @@ fn csi_name_from_in_tree_name(plugin: &str) -> Option<&'static str> {
 /// (`pkg/volume/csimigration/plugin_manager.go:85-107`). In 1.35 every
 /// per-plugin gate is GA and locked on (`CSIMigrationPortworx`:
 /// `kube_features.go:1178`), so each translator plugin is migrated.
-fn is_migration_enabled_for_plugin(plugin: &str) -> bool {
+pub(crate) fn is_migration_enabled_for_plugin(plugin: &str) -> bool {
     csi_name_from_in_tree_name(plugin).is_some()
 }
 

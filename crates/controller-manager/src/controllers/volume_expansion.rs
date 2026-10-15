@@ -18,6 +18,26 @@ const CONCURRENT_VOLUME_EXPAND_SYNCS: usize = 10;
 /// `util.AnnPreResizeCapacity` (`pkg/volume/util/resize_util.go:52`).
 const ANN_PRE_RESIZE_CAPACITY: &str = "volume.alpha.kubernetes.io/pre-resize-capacity";
 
+/// `volumetypes.VolumeResizerKey` (`pkg/volume/util/types/types.go:209`).
+const VOLUME_RESIZER_KEY: &str = "volume.kubernetes.io/storage-resizer";
+
+/// `CSITranslator.GetInTreePluginNameFromSpec` for a PV
+/// (`staging/src/k8s.io/csi-translation-lib/translate.go:146-153`): the first
+/// `inTreePlugins` entry whose `CanSupport(pv)` holds, i.e. the plugin whose
+/// source the PV carries (`gce_pd.go` `CanSupport`: `GCEPersistentDisk != nil`;
+/// `aws_ebs.go`: `AWSElasticBlockStore != nil`). Rusternetes' PV spec only has
+/// those two translatable sources; azureDisk/azureFile/cinder/vsphere/portworx
+/// have no field to carry (tracked separately).
+fn in_tree_plugin_name_from_pv(pv: &PersistentVolume) -> Option<&'static str> {
+    if pv.spec.gce_persistent_disk.is_some() {
+        Some("kubernetes.io/gce-pd")
+    } else if pv.spec.aws_elastic_block_store.is_some() {
+        Some("kubernetes.io/aws-ebs")
+    } else {
+        None
+    }
+}
+
 pub struct VolumeExpansionController<S: Storage> {
     storage: Arc<S>,
     /// `expc.recorder` (expand_controller.go).
@@ -196,23 +216,92 @@ impl<S: Storage + 'static> VolumeExpansionController<S> {
             return Ok(());
         }
 
+        // `csiMigratedPluginManager.IsMigratable(volumeSpec)` (:238-243;
+        // `plugin_manager.go:111-123`): a PV whose in-tree plugin has CSI
+        // migration enabled is handed to the external resizer (:245-269).
+        if let Some(plugin) = in_tree_plugin_name_from_pv(&pv)
+            .filter(|p| crate::controllers::pv_binder::is_migration_enabled_for_plugin(p))
+        {
+            self.record_event(
+                pvc,
+                EventType::Normal,
+                &format!(
+                    "CSI migration enabled for {plugin}; waiting for external resizer to expand the pvc"
+                ),
+            )
+            .await;
+            // `GetCSINameFromInTreeName` (:252-257).
+            let Some(resizer) = crate::controllers::pv_binder::csi_name_from_in_tree_name(plugin)
+            else {
+                let msg = format!("error getting CSI driver name for pvc {key}, with error could not find CSI Driver name for plugin {plugin}");
+                self.record_event(pvc, EventType::Warning, &msg).await;
+                anyhow::bail!(msg);
+            };
+            // `util.SetClaimResizer` (:259-264).
+            if let Err(e) = self.set_claim_resizer(pvc, resizer).await {
+                let msg = format!("error setting resizer annotation to pvc {key}, with error {e}");
+                self.record_event(pvc, EventType::Warning, &msg).await;
+                anyhow::bail!(msg);
+            }
+            return Ok(());
+        }
+
         // `FindExpandablePluginBySpec` (:271-283) finds an expandable plugin only for
         // in-tree volume types that implement `ExpandableVolumePlugin`; rusternetes
         // has none (hostPath/nfs/iscsi/local never did upstream either), and a CSI
         // volume is expanded by the external-resizer sidecar calling
-        // ControllerExpandVolume (and the kubelet NodeExpandVolume). So every PV
+        // ControllerExpandVolume (and the kubelet NodeExpandVolume). So every other PV
         // lands on the `volumePlugin == nil` branch: record ExternalExpanding and
         // return nil without requeueing (the "for csi plugin without migration
         // path" case of TestSyncHandler, expand_controller_test.go:84-91). Writing
         // PV/PVC capacity here would bypass the CSI contract. The StorageClass is
         // never read: allowVolumeExpansion is enforced by PVC admission.
-        self.record_external_expanding(pvc).await;
+        self.record_event(
+            pvc,
+            EventType::Normal,
+            "waiting for an external controller to expand this PVC",
+        )
+        .await;
         Ok(())
     }
 
-    /// `expc.recorder.Event(pvc, EventTypeNormal, events.ExternalExpanding, msg)`
-    /// (expand_controller.go:262-271).
-    async fn record_external_expanding(&self, pvc: &PersistentVolumeClaim) {
+    /// `util.SetClaimResizer` (`pkg/volume/util/resize_util.go:167-185`):
+    /// `PatchPVCStatus` (:325-340) of `volume.kubernetes.io/storage-resizer`
+    /// guarded by the resourceVersion (`createPVCPatch` addResourceVersionCheck,
+    /// :360-365); a no-op when the annotation already holds `resizer` (:178-180).
+    async fn set_claim_resizer(&self, pvc: &PersistentVolumeClaim, resizer: &str) -> Result<()> {
+        if pvc
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get(VOLUME_RESIZER_KEY))
+            .is_some_and(|v| v == resizer)
+        {
+            return Ok(());
+        }
+        let patch = serde_json::json!({"metadata": {
+            "annotations": {VOLUME_RESIZER_KEY: resizer},
+            "resourceVersion": pvc.metadata.resource_version,
+        }});
+        let mut full = pvc.clone();
+        full.metadata
+            .annotations
+            .get_or_insert_with(Default::default)
+            .insert(VOLUME_RESIZER_KEY.to_string(), resizer.to_string());
+        let key = build_key(
+            "persistentvolumeclaims",
+            pvc.metadata.namespace.as_deref(),
+            &pvc.metadata.name,
+        );
+        self.storage
+            .patch_status_strategic_merge::<PersistentVolumeClaim>(&key, &patch, &full)
+            .await?;
+        Ok(())
+    }
+
+    /// `expc.recorder.Event(pvc, eventType, events.ExternalExpanding, msg)`
+    /// (expand_controller.go:247, :255, :262, :271).
+    async fn record_event(&self, pvc: &PersistentVolumeClaim, type_: EventType, msg: &str) {
         let involved = ObjectReference {
             kind: Some("PersistentVolumeClaim".to_string()),
             namespace: pvc.metadata.namespace.clone(),
@@ -227,13 +316,7 @@ impl<S: Storage + 'static> VolumeExpansionController<S> {
         };
         if let Err(e) = self
             .recorder
-            .event(
-                &involved,
-                &source,
-                EventType::Normal,
-                "ExternalExpanding",
-                "waiting for an external controller to expand this PVC",
-            )
+            .event(&involved, &source, type_, "ExternalExpanding", msg)
             .await
         {
             warn!("failed to record ExternalExpanding event: {e}");
