@@ -430,7 +430,7 @@ pub(super) fn checked_patch_options(
     };
     let errs = validate_patch_options(&options, content_type);
     if !errs.is_empty() {
-        return Err(Error::Invalid(errs));
+        return Err(Error::new_invalid("meta.k8s.io", "PatchOptions", "", errs));
     }
     Ok(options)
 }
@@ -439,11 +439,12 @@ pub(super) fn checked_patch_options(
 /// field.Invalid(field.NewPath("patch"), patchedObjJS, msg)})`
 /// (patch.go:345-347, 352-354, 361-363).
 pub(super) fn patch_invalid(patched_js: String, msg: String) -> Error {
-    Error::Invalid(vec![FieldError::invalid(
-        &Path::new("patch"),
-        patched_js,
-        msg,
-    )])
+    Error::new_invalid(
+        "",
+        "",
+        "",
+        vec![FieldError::invalid(&Path::new("patch"), patched_js, msg)],
+    )
 }
 
 /// A failed patch application. RFC 6902 §4.2 mandates that the target of a

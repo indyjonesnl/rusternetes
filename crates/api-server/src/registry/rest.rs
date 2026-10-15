@@ -629,7 +629,9 @@ pub fn before_delete<T: Object>(
 
     let errs = rusternetes_common::validation::metav1::validate_delete_options(options);
     if !errs.is_empty() {
-        return Err(Error::Invalid(errs));
+        // delete.go:81: `NewInvalid(GroupKind{metav1.GroupName,
+        // "DeleteOptions"}, "", errs)`.
+        return Err(Error::new_invalid("meta.k8s.io", "DeleteOptions", "", errs));
     }
 
     // Checking the preconditions here to fail early. They are enforced again

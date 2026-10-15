@@ -164,9 +164,10 @@ impl Error {
             })
             .collect();
         let details = crate::types::StatusDetails {
-            name: Some(name.to_string()),
+            // `Name`/`Group`/`Kind` are `omitempty` in metav1.StatusDetails.
+            name: Some(name.to_string()).filter(|n| !n.is_empty()),
             group: Some(group.to_string()).filter(|g| !g.is_empty()),
-            kind: Some(kind.to_string()),
+            kind: Some(kind.to_string()).filter(|k| !k.is_empty()),
             uid: None,
             causes: Some(causes).filter(|c| !c.is_empty()),
             retry_after_seconds: None,

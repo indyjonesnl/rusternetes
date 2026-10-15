@@ -127,7 +127,7 @@ fn delete_options_errors() {
     ));
     assert!(matches!(
         decode_delete_options(&q(&[("dryRun", "Maybe")]), b""),
-        Err(Error::Invalid(_))
+        Err(Error::Status(_))
     ));
 }
 

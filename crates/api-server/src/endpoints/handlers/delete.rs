@@ -53,7 +53,8 @@ pub fn decode_delete_options(
 
     let errs = validate_delete_options(&options);
     if !errs.is_empty() {
-        return Err(Error::Invalid(errs));
+        // delete.go:132 / :307.
+        return Err(Error::new_invalid("meta.k8s.io", "DeleteOptions", "", errs));
     }
     Ok(options)
 }

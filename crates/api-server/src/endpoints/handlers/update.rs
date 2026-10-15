@@ -32,7 +32,7 @@ pub(super) fn checked_update_options(params: &HashMap<String, String>) -> Result
     };
     let errs = validate_update_options(&options);
     if !errs.is_empty() {
-        return Err(Error::Invalid(errs));
+        return Err(Error::new_invalid("meta.k8s.io", "UpdateOptions", "", errs));
     }
     Ok(options)
 }
