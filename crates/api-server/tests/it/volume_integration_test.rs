@@ -35,6 +35,7 @@ fn test_persistentvolume_creation() {
             gce_persistent_disk: None,
             aws_elastic_block_store: None,
             fc: None,
+            more_sources: Default::default(),
             capacity,
             host_path: Some(HostPathVolumeSource {
                 path: "/mnt/data".to_string(),
@@ -340,6 +341,7 @@ fn test_pv_with_multiple_access_modes() {
             gce_persistent_disk: None,
             aws_elastic_block_store: None,
             fc: None,
+            more_sources: Default::default(),
             capacity,
             host_path: Some(HostPathVolumeSource {
                 path: "/shared".to_string(),

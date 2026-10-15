@@ -14,17 +14,26 @@
 //! `NotSupported` check is reproduced here.
 
 use crate::quantity::Quantity;
+use crate::resources::pv_sources::{
+    AzureDiskVolumeSource, AzureFilePersistentVolumeSource, CephFSPersistentVolumeSource,
+    CinderPersistentVolumeSource, FlexPersistentVolumeSource, FlockerVolumeSource,
+    GlusterfsPersistentVolumeSource, PhotonPersistentDiskVolumeSource, PortworxVolumeSource,
+    QuobyteVolumeSource, RBDPersistentVolumeSource, ScaleIOPersistentVolumeSource,
+    StorageOSPersistentVolumeSource, VsphereVirtualDiskVolumeSource,
+};
 use crate::resources::volume::{
-    CSIVolumeSource, HostPathType, HostPathVolumeSource, ISCSIVolumeSource, LocalVolumeSource,
-    NodeSelector, NodeSelectorRequirement, NodeSelectorTerm, PersistentVolume,
+    AWSElasticBlockStoreVolumeSource, CSIVolumeSource, FCVolumeSource,
+    GCEPersistentDiskVolumeSource, HostPathType, HostPathVolumeSource, ISCSIVolumeSource,
+    LocalVolumeSource, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm, PersistentVolume,
     PersistentVolumeAccessMode, PersistentVolumeMode, PersistentVolumeReclaimPolicy,
     PersistentVolumeSpec, SecretReference, VolumeNodeAffinity,
 };
 use crate::validation::csinode::validate_csi_driver_name;
-use crate::validation::field::{Error, ErrorList, Path};
+use crate::validation::field::{BadValue, Error, ErrorList, Path};
 use crate::validation::metav1::{is_dns1123_label, is_dns1123_subdomain};
 use crate::validation::objectmeta::{
-    name_is_dns_subdomain, validate_object_meta, validate_object_meta_update,
+    name_is_dns_subdomain, validate_namespace_name, validate_object_meta,
+    validate_object_meta_update,
 };
 use crate::validation::pod::{validate_nfs_volume_source, validate_node_selector};
 use once_cell::sync::Lazy;
@@ -136,6 +145,455 @@ fn validate_local_volume_source(ls: &LocalVolumeSource, fld_path: &Path) -> Erro
         return vec![Error::required(&fld_path.child("path"), "")];
     }
     validate_path_no_backsteps(&ls.path, &fld_path.child("path"))
+}
+
+/// `pdPartitionErrorMsg` (validation.go:79) = `validation.InclusiveRangeError(1, 255)`.
+const PD_PARTITION_ERROR_MSG: &str = "must be between 1 and 255, inclusive";
+
+/// `validateGCEPersistentDiskVolumeSource` (validation.go:950-959). The
+/// caller passes `fldPath.Child("persistentDisk")`, as upstream does.
+fn validate_gce_persistent_disk_volume_source(
+    pd: &GCEPersistentDiskVolumeSource,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if pd.pd_name.is_empty() {
+        errs.push(Error::required(&fld_path.child("pdName"), ""));
+    }
+    let partition = pd.partition.unwrap_or(0);
+    if !(0..=255).contains(&partition) {
+        errs.push(Error::invalid(
+            &fld_path.child("partition"),
+            partition,
+            PD_PARTITION_ERROR_MSG,
+        ));
+    }
+    errs
+}
+
+/// `validateFCVolumeSource` (validation.go:928-948).
+fn validate_fc_volume_source(fc: &FCVolumeSource, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let wwns = fc.target_wwns.as_deref().unwrap_or(&[]);
+    let wwids = fc.wwids.as_deref().unwrap_or(&[]);
+    if wwns.is_empty() && wwids.is_empty() {
+        errs.push(Error::required(
+            &fld_path.child("targetWWNs"),
+            "must specify either targetWWNs or wwids, but not both",
+        ));
+    }
+    if !wwns.is_empty() && !wwids.is_empty() {
+        errs.push(Error::invalid(
+            &fld_path.child("targetWWNs"),
+            BadValue::marshal(&wwns),
+            "targetWWNs and wwids can not be specified simultaneously",
+        ));
+    }
+    if !wwns.is_empty() {
+        match fc.lun {
+            None => errs.push(Error::required(
+                &fld_path.child("lun"),
+                "lun is required if targetWWNs is specified",
+            )),
+            Some(lun) if !(0..=255).contains(&lun) => errs.push(Error::invalid(
+                &fld_path.child("lun"),
+                lun,
+                "must be between 0 and 255, inclusive",
+            )),
+            _ => {}
+        }
+    }
+    errs
+}
+
+/// `validateAWSElasticBlockStoreVolumeSource` (validation.go:961-970).
+fn validate_aws_elastic_block_store_volume_source(
+    pd: &AWSElasticBlockStoreVolumeSource,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if pd.volume_id.is_empty() {
+        errs.push(Error::required(&fld_path.child("volumeID"), ""));
+    }
+    let partition = pd.partition.unwrap_or(0);
+    if !(0..=255).contains(&partition) {
+        errs.push(Error::invalid(
+            &fld_path.child("partition"),
+            partition,
+            PD_PARTITION_ERROR_MSG,
+        ));
+    }
+    errs
+}
+
+/// `validateGlusterfsPersistentVolumeSource` (validation.go:1078-1097).
+fn validate_glusterfs_persistent_volume_source(
+    glusterfs: &GlusterfsPersistentVolumeSource,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if glusterfs.endpoints_name.is_empty() {
+        errs.push(Error::required(&fld_path.child("endpoints"), ""));
+    }
+    if glusterfs.path.is_empty() {
+        errs.push(Error::required(&fld_path.child("path"), ""));
+    }
+    if let Some(ns) = &glusterfs.endpoints_namespace {
+        let child = fld_path.child("endpointsNamespace");
+        if ns.is_empty() {
+            errs.push(Error::invalid(
+                &child,
+                ns.clone(),
+                "if the endpointnamespace is set, it must be a valid namespace name",
+            ));
+        } else {
+            for msg in validate_namespace_name(ns, false) {
+                errs.push(Error::invalid(&child, ns.clone(), msg));
+            }
+        }
+    }
+    errs
+}
+
+/// `validateFlockerVolumeSource` (validation.go:1099-1112).
+fn validate_flocker_volume_source(flocker: &FlockerVolumeSource, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if flocker.dataset_name.is_empty() && flocker.dataset_uuid.is_empty() {
+        errs.push(Error::required(
+            fld_path,
+            "one of datasetName and datasetUUID is required",
+        ));
+    }
+    if !flocker.dataset_name.is_empty() && !flocker.dataset_uuid.is_empty() {
+        errs.push(Error::invalid(
+            fld_path,
+            "resource",
+            "datasetName and datasetUUID can not be specified simultaneously",
+        ));
+    }
+    if flocker.dataset_name.contains('/') {
+        errs.push(Error::invalid(
+            &fld_path.child("datasetName"),
+            flocker.dataset_name.clone(),
+            "must not contain '/'",
+        ));
+    }
+    errs
+}
+
+/// `validateRBDPersistentVolumeSource` (validation.go:1515-1524).
+fn validate_rbd_persistent_volume_source(
+    rbd: &RBDPersistentVolumeSource,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if rbd.ceph_monitors.is_empty() {
+        errs.push(Error::required(&fld_path.child("monitors"), ""));
+    }
+    if rbd.rbd_image.is_empty() {
+        errs.push(Error::required(&fld_path.child("image"), ""));
+    }
+    errs
+}
+
+/// Go's `net.SplitHostPort` success criteria (`net/ipsock.go`), which is all
+/// `validateQuobyteVolumeSource` consumes (it discards host and port).
+fn split_host_port_ok(hostport: &str) -> bool {
+    let Some(i) = hostport.rfind(':') else {
+        return false; // missing port in address
+    };
+    let (j, k);
+    if hostport.starts_with('[') {
+        let Some(end) = hostport.find(']') else {
+            return false; // missing ']' in address
+        };
+        if end + 1 == hostport.len() {
+            return false; // missing port in address
+        }
+        if end + 1 != i {
+            return false; // too many colons / missing port
+        }
+        j = 1;
+        k = end + 1;
+    } else {
+        if hostport[..i].contains(':') {
+            return false; // too many colons in address
+        }
+        j = 0;
+        k = 0;
+    }
+    if hostport[j..].contains('[') {
+        return false; // unexpected '[' in address
+    }
+    if hostport[k..].contains(']') {
+        return false; // unexpected ']' in address
+    }
+    true
+}
+
+/// `validateQuobyteVolumeSource` (validation.go:1048-1066).
+fn validate_quobyte_volume_source(quobyte: &QuobyteVolumeSource, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if quobyte.registry.is_empty() {
+        errs.push(Error::required(
+            &fld_path.child("registry"),
+            "must be a host:port pair or multiple pairs separated by commas",
+        ));
+    } else if quobyte.tenant.len() >= 65 {
+        errs.push(Error::required(
+            &fld_path.child("tenant"),
+            "must be a UUID and may not exceed a length of 64 characters",
+        ));
+    } else {
+        for pair in quobyte.registry.split(',') {
+            if !split_host_port_ok(pair) {
+                errs.push(Error::invalid(
+                    &fld_path.child("registry"),
+                    quobyte.registry.clone(),
+                    "must be a host:port pair or multiple pairs separated by commas",
+                ));
+            }
+        }
+    }
+    if quobyte.volume.is_empty() {
+        errs.push(Error::required(&fld_path.child("volume"), ""));
+    }
+    errs
+}
+
+/// `validateCephFSPersistentVolumeSource` (validation.go:1563-1569).
+fn validate_cephfs_persistent_volume_source(
+    cephfs: &CephFSPersistentVolumeSource,
+    fld_path: &Path,
+) -> ErrorList {
+    if cephfs.monitors.is_empty() {
+        return vec![Error::required(&fld_path.child("monitors"), "")];
+    }
+    Vec::new()
+}
+
+/// The `secretRef.name` / `secretRef.namespace` `Required` pair shared by the
+/// Cinder and StorageOS persistent validators.
+fn require_secret_ref_name_and_namespace(
+    name: Option<&str>,
+    namespace: Option<&str>,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if name.unwrap_or("").is_empty() {
+        errs.push(Error::required(
+            &fld_path.child("secretRef").child("name"),
+            "",
+        ));
+    }
+    if namespace.unwrap_or("").is_empty() {
+        errs.push(Error::required(
+            &fld_path.child("secretRef").child("namespace"),
+            "",
+        ));
+    }
+    errs
+}
+
+/// `validateCinderPersistentVolumeSource` (validation.go:1539-1553).
+fn validate_cinder_persistent_volume_source(
+    cd: &CinderPersistentVolumeSource,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if cd.volume_id.is_empty() {
+        errs.push(Error::required(&fld_path.child("volumeID"), ""));
+    }
+    if let Some(r) = &cd.secret_ref {
+        errs.extend(require_secret_ref_name_and_namespace(
+            r.name.as_deref(),
+            r.namespace.as_deref(),
+            fld_path,
+        ));
+    }
+    errs
+}
+
+/// `validateFlexPersistentVolumeSource` (validation.go:1592-1611).
+fn validate_flex_persistent_volume_source(
+    fv: &FlexPersistentVolumeSource,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if fv.driver.is_empty() {
+        errs.push(Error::required(&fld_path.child("driver"), ""));
+    }
+    // Make sure user-specified options don't use kubernetes namespaces. Go
+    // ranges a map in random order; sort for a deterministic error list.
+    let mut keys: Vec<&String> = fv.options.keys().collect();
+    keys.sort();
+    for k in keys {
+        let namespace = k.split('/').next().unwrap_or(k);
+        let normalized = format!(".{}", namespace.to_lowercase());
+        if normalized.ends_with(".kubernetes.io") || normalized.ends_with(".k8s.io") {
+            errs.push(Error::invalid(
+                &fld_path.child("options").key(k.clone()),
+                k.clone(),
+                "kubernetes.io and k8s.io namespaces are reserved",
+            ));
+        }
+    }
+    errs
+}
+
+/// `validateAzureFilePV` (validation.go:1624-1638).
+fn validate_azure_file_pv(azure: &AzureFilePersistentVolumeSource, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if azure.secret_name.is_empty() {
+        errs.push(Error::required(&fld_path.child("secretName"), ""));
+    }
+    if azure.share_name.is_empty() {
+        errs.push(Error::required(&fld_path.child("shareName"), ""));
+    }
+    if let Some(ns) = &azure.secret_namespace {
+        if ns.is_empty() {
+            errs.push(Error::required(&fld_path.child("secretNamespace"), ""));
+        }
+    }
+    errs
+}
+
+/// `validateVsphereVolumeSource` (validation.go:1683-1689).
+fn validate_vsphere_volume_source(
+    cd: &VsphereVirtualDiskVolumeSource,
+    fld_path: &Path,
+) -> ErrorList {
+    if cd.volume_path.is_empty() {
+        return vec![Error::required(&fld_path.child("volumePath"), "")];
+    }
+    Vec::new()
+}
+
+/// `validatePhotonPersistentDiskVolumeSource` (validation.go:1691-1697).
+fn validate_photon_persistent_disk_volume_source(
+    cd: &PhotonPersistentDiskVolumeSource,
+    fld_path: &Path,
+) -> ErrorList {
+    if cd.pd_id.is_empty() {
+        return vec![Error::required(&fld_path.child("pdID"), "")];
+    }
+    Vec::new()
+}
+
+/// `validatePortworxVolumeSource` (validation.go:1699-1705).
+fn validate_portworx_volume_source(pwx: &PortworxVolumeSource, fld_path: &Path) -> ErrorList {
+    if pwx.volume_id.is_empty() {
+        return vec![Error::required(&fld_path.child("volumeID"), "")];
+    }
+    Vec::new()
+}
+
+/// `validateAzureDisk` (validation.go:1640-1681).
+fn validate_azure_disk(azure: &AzureDiskVolumeSource, fld_path: &Path) -> ErrorList {
+    // `sets.List` order of the supported sets.
+    const CACHING_MODES: &[&str] = &["None", "ReadOnly", "ReadWrite"];
+    const DISK_KINDS: &[&str] = &["Dedicated", "Managed", "Shared"];
+    const DISK_URI_MANAGED: &[&str] = &[
+        "/subscriptions/{sub-id}/resourcegroups/{group-name}/providers/microsoft.compute/disks/{disk-id}",
+    ];
+    const DISK_URI_BLOB: &[&str] =
+        &["https://{account-name}.blob.core.windows.net/{container-name}/{disk-name}.vhd"];
+
+    let mut errs: ErrorList = Vec::new();
+    if azure.disk_name.is_empty() {
+        errs.push(Error::required(&fld_path.child("diskName"), ""));
+    }
+    if azure.data_disk_uri.is_empty() {
+        errs.push(Error::required(&fld_path.child("diskURI"), ""));
+    }
+    if let Some(mode) = &azure.caching_mode {
+        if !CACHING_MODES.contains(&mode.as_str()) {
+            errs.push(Error::not_supported(
+                &fld_path.child("cachingMode"),
+                mode.clone(),
+                CACHING_MODES,
+            ));
+        }
+    }
+    if let Some(kind) = &azure.kind {
+        if !DISK_KINDS.contains(&kind.as_str()) {
+            errs.push(Error::not_supported(
+                &fld_path.child("kind"),
+                kind.clone(),
+                DISK_KINDS,
+            ));
+        }
+        // validate that DiskUri is the correct format
+        if kind == "Managed" && !azure.data_disk_uri.starts_with("/subscriptions/") {
+            errs.push(Error::not_supported(
+                &fld_path.child("diskURI"),
+                azure.data_disk_uri.clone(),
+                DISK_URI_MANAGED,
+            ));
+        }
+        if kind != "Managed" && !azure.data_disk_uri.starts_with("https://") {
+            errs.push(Error::not_supported(
+                &fld_path.child("diskURI"),
+                azure.data_disk_uri.clone(),
+                DISK_URI_BLOB,
+            ));
+        }
+    }
+    errs
+}
+
+/// `validateScaleIOPersistentVolumeSource` (validation.go:1721-1733).
+fn validate_scaleio_persistent_volume_source(
+    sio: &ScaleIOPersistentVolumeSource,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if sio.gateway.is_empty() {
+        errs.push(Error::required(&fld_path.child("gateway"), ""));
+    }
+    if sio.system.is_empty() {
+        errs.push(Error::required(&fld_path.child("system"), ""));
+    }
+    if sio.volume_name.is_empty() {
+        errs.push(Error::required(&fld_path.child("volumeName"), ""));
+    }
+    errs
+}
+
+/// `validateStorageOSPersistentVolumeSource` (validation.go:1764-1783).
+fn validate_storageos_persistent_volume_source(
+    storageos: &StorageOSPersistentVolumeSource,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if storageos.volume_name.is_empty() {
+        errs.push(Error::required(&fld_path.child("volumeName"), ""));
+    } else {
+        for msg in is_dns1123_label(&storageos.volume_name) {
+            errs.push(Error::invalid(
+                &fld_path.child("volumeName"),
+                storageos.volume_name.clone(),
+                msg,
+            ));
+        }
+    }
+    if !storageos.volume_namespace.is_empty() {
+        for msg in is_dns1123_label(&storageos.volume_namespace) {
+            errs.push(Error::invalid(
+                &fld_path.child("volumeNamespace"),
+                storageos.volume_namespace.clone(),
+                msg,
+            ));
+        }
+    }
+    if let Some(r) = &storageos.secret_ref {
+        errs.extend(require_secret_ref_name_and_namespace(
+            r.name.as_deref(),
+            r.namespace.as_deref(),
+            fld_path,
+        ));
+    }
+    errs
 }
 
 /// Port of upstream `validatePVSecretReference`
@@ -471,16 +929,104 @@ pub fn validate_persistent_volume_spec(
             }
         };
     }
+    // Upstream order, validation.go:2038-2210. Each member's "may not specify
+    // more than 1 volume type" error is keyed by its own field name (note the
+    // upstream quirks `gcePersistentDisk`/`persistentDisk` and `cephFS`/
+    // `cephfs`: Forbidden path and validator path differ).
+    let more = &spec.more_sources;
     source!(
         &spec.host_path,
         "hostPath",
         validate_host_path_volume_source
     );
+    if let Some(gce) = &spec.gce_persistent_disk {
+        if num_volumes > 0 {
+            errs.push(Error::forbidden(
+                &fld_path.child("gcePersistentDisk"),
+                "may not specify more than 1 volume type",
+            ));
+        } else {
+            num_volumes += 1;
+            errs.extend(validate_gce_persistent_disk_volume_source(
+                gce,
+                &fld_path.child("persistentDisk"),
+            ));
+        }
+    }
+    source!(
+        &spec.aws_elastic_block_store,
+        "awsElasticBlockStore",
+        validate_aws_elastic_block_store_volume_source
+    );
+    source!(
+        &more.glusterfs,
+        "glusterfs",
+        validate_glusterfs_persistent_volume_source
+    );
+    source!(&more.flocker, "flocker", validate_flocker_volume_source);
     source!(&spec.nfs, "nfs", validate_nfs_volume_source);
+    source!(&more.rbd, "rbd", validate_rbd_persistent_volume_source);
+    source!(&more.quobyte, "quobyte", validate_quobyte_volume_source);
+    if let Some(cephfs) = &more.cephfs {
+        if num_volumes > 0 {
+            errs.push(Error::forbidden(
+                &fld_path.child("cephFS"),
+                "may not specify more than 1 volume type",
+            ));
+        } else {
+            num_volumes += 1;
+            errs.extend(validate_cephfs_persistent_volume_source(
+                cephfs,
+                &fld_path.child("cephfs"),
+            ));
+        }
+    }
     source!(&spec.iscsi, "iscsi", |iscsi, p| {
         validate_iscsi_persistent_volume_source(iscsi, pv_name, p)
     });
+    source!(
+        &more.cinder,
+        "cinder",
+        validate_cinder_persistent_volume_source
+    );
+    source!(&spec.fc, "fc", validate_fc_volume_source);
+    // validation.go:2124-2127: flexVolume alone has no "more than 1 volume
+    // type" branch; it always counts and validates.
+    if let Some(flex) = &more.flex_volume {
+        num_volumes += 1;
+        errs.extend(validate_flex_persistent_volume_source(
+            flex,
+            &fld_path.child("flexVolume"),
+        ));
+    }
+    source!(&more.azure_file, "azureFile", validate_azure_file_pv);
+    source!(
+        &more.vsphere_volume,
+        "vsphereVolume",
+        validate_vsphere_volume_source
+    );
+    source!(
+        &more.photon_persistent_disk,
+        "photonPersistentDisk",
+        validate_photon_persistent_disk_volume_source
+    );
+    source!(
+        &more.portworx_volume,
+        "portworxVolume",
+        validate_portworx_volume_source
+    );
+    source!(&more.azure_disk, "azureDisk", validate_azure_disk);
+    source!(
+        &more.scale_io,
+        "scaleIO",
+        validate_scaleio_persistent_volume_source
+    );
     source!(&spec.local, "local", validate_local_volume_source);
+    source!(
+        &more.storageos,
+        "storageos",
+        validate_storageos_persistent_volume_source
+    );
     source!(&spec.csi, "csi", validate_csi_persistent_volume_source);
     if num_volumes == 0 {
         errs.push(Error::required(fld_path, "must specify a volume type"));
@@ -655,13 +1201,26 @@ pub fn validate_persistent_volume_status_update(
 /// creation. Capacity / accessModes / reclaimPolicy etc. are intentionally
 /// excluded.
 fn persistent_volume_source(spec: &PersistentVolumeSpec) -> serde_json::Value {
-    serde_json::json!({
+    let mut members = serde_json::json!({
         "hostPath": spec.host_path,
         "nfs": spec.nfs,
         "iscsi": spec.iscsi,
         "local": spec.local,
         "csi": spec.csi,
-    })
+        "gcePersistentDisk": spec.gce_persistent_disk,
+        "awsElasticBlockStore": spec.aws_elastic_block_store,
+        "fc": spec.fc,
+    });
+    // The remaining members (`PersistentVolumeMoreSources`): upstream compares
+    // the whole `core.PersistentVolumeSource` with `Semantic.DeepEqual`
+    // (validation.go:2283).
+    if let (Some(dst), Ok(serde_json::Value::Object(src))) = (
+        members.as_object_mut(),
+        serde_json::to_value(&spec.more_sources),
+    ) {
+        dst.extend(src);
+    }
+    members
 }
 
 /// Validate a `PersistentVolume` on update. Mirrors upstream
@@ -1090,8 +1649,7 @@ mod all_sources_tests {
     }
 
     /// One valid example per member, in upstream order
-    /// (`ValidatePersistentVolumeSpec`, validation.go:2037-2210). `fc` is
-    /// carried by its own plugin PR (#3506).
+    /// (`ValidatePersistentVolumeSpec`, validation.go:2037-2210).
     fn valid_sources() -> Vec<(&'static str, serde_json::Value)> {
         vec![
             ("gcePersistentDisk", serde_json::json!({"pdName": "p"})),
@@ -1113,6 +1671,10 @@ mod all_sources_tests {
             (
                 "cinder",
                 serde_json::json!({"volumeID": "v", "secretRef": {"name": "s", "namespace": "default"}}),
+            ),
+            (
+                "fc",
+                serde_json::json!({"targetWWNs": ["500a0982"], "lun": 0}),
             ),
             (
                 "flexVolume",
@@ -1152,6 +1714,30 @@ mod all_sources_tests {
     }
 
     #[test]
+    fn fc_source_is_validated_and_counted() {
+        // validateFCVolumeSource (validation.go:928-948): neither set.
+        let errs = validate_persistent_volume(&pv_with(serde_json::json!({"fc": {}})));
+        assert!(
+            errs.iter().any(|e| e.field == "spec.fc.targetWWNs"),
+            "{errs:?}"
+        );
+        // targetWWNs without lun.
+        let errs =
+            validate_persistent_volume(&pv_with(serde_json::json!({"fc": {"targetWWNs": ["a"]}})));
+        assert!(errs.iter().any(|e| e.field == "spec.fc.lun"), "{errs:?}");
+        // fc counts toward the union.
+        let errs = validate_persistent_volume(&pv_with(serde_json::json!({
+            "hostPath": {"path": "/foo"},
+            "fc": {"wwids": ["w"]},
+        })));
+        assert!(
+            errs.iter().any(|e| e.field == "spec.fc"
+                && e.detail.contains("may not specify more than 1 volume type")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
     fn too_many_sources_is_forbidden() {
         // upstream "too-many-sources": hostPath + gcePersistentDisk.
         let pv = pv_with(serde_json::json!({
@@ -1176,10 +1762,14 @@ mod all_sources_tests {
                 .as_object()
                 .unwrap()
                 .iter()
-                .find(|(_, v)| v.is_string())
+                .find(|(_, v)| v.is_string() || v.is_array())
                 .map(|(k, _)| k.clone())
                 .unwrap();
-            changed[key] = serde_json::json!("changed-value");
+            changed[key] = if changed[&key].is_array() {
+                serde_json::json!(["changed-value"])
+            } else {
+                serde_json::json!("changed-value")
+            };
             let new = pv_with(serde_json::json!({ name: changed }));
             let errs = validate_persistent_volume_update(&new, &old);
             assert!(

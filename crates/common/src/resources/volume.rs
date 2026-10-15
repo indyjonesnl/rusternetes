@@ -105,6 +105,14 @@ pub struct PersistentVolumeSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aws_elastic_block_store: Option<AWSElasticBlockStoreVolumeSource>,
 
+    /// The remaining `PersistentVolumeSource` members (glusterfs, rbd,
+    /// cinder, cephfs, flocker, flexVolume, azureFile, vsphereVolume,
+    /// quobyte, azureDisk, photonPersistentDisk, portworxVolume, scaleIO,
+    /// storageos), inlined on the wire exactly as upstream embeds
+    /// `PersistentVolumeSource` (see `pv_sources.rs`).
+    #[serde(flatten)]
+    pub more_sources: crate::resources::pv_sources::PersistentVolumeMoreSources,
+
     /// volumeAttributesClassName may be used to set the VolumeAttributesClass used by this claim
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume_attributes_class_name: Option<String>,
@@ -973,6 +981,7 @@ mod tests {
                 gce_persistent_disk: None,
                 aws_elastic_block_store: None,
                 fc: None,
+                more_sources: Default::default(),
                 access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
                 persistent_volume_reclaim_policy: Some(PersistentVolumeReclaimPolicy::Retain),
                 storage_class_name: Some("manual".to_string()),
