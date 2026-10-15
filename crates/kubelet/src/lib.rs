@@ -54,6 +54,9 @@ pub struct KubeletConfig {
     pub node_ip: String,
     /// Kubelet `--cloud-provider` (empty or `external`).
     pub cloud_provider: String,
+    /// Kubelet `--hostname-override` (empty = use `node_name` as the
+    /// hostname).
+    pub hostname_override: String,
 }
 
 impl Default for KubeletConfig {
@@ -69,6 +72,7 @@ impl Default for KubeletConfig {
             kubernetes_service_host: "10.96.0.1".to_string(),
             node_ip: String::new(),
             cloud_provider: String::new(),
+            hostname_override: String::new(),
         }
     }
 }
@@ -88,6 +92,18 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
     let (node_ips, external_cloud_provider) =
         node_ip::node_ip_config(&config.node_ip, &config.cloud_provider)
             .map_err(|e| anyhow::anyhow!(e))?;
+
+    // RunKubelet: `nodeutil.GetHostname(kubeServer.HostnameOverride)`
+    // (server.go:1208); `node_name` stands in for the hostname when unset.
+    let hostname = node_ip::get_hostname(
+        if config.hostname_override.is_empty() {
+            &config.node_name
+        } else {
+            &config.hostname_override
+        },
+        &|| Ok(String::new()),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
 
     // Discover cluster DNS if not hardcoded
     let cluster_dns = {
@@ -162,7 +178,8 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
             node_ips,
             external_cloud_provider,
         )
-        .await?,
+        .await?
+        .with_hostname(&hostname),
     );
 
     k.register_pod_certificate_metrics(&metrics.registry);

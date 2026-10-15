@@ -165,6 +165,14 @@ struct Args {
     #[arg(long)]
     node_ip: Option<String>,
 
+    /// If non-empty, use this string as the node's identification (Hostname
+    /// address, `kubernetes.io/hostname` label) instead of the actual
+    /// hostname (upstream `--hostname-override`, options.go:288). Without it
+    /// the `--node-name` stands in for the hostname, as upstream derives
+    /// `nodeName` from it.
+    #[arg(long)]
+    hostname_override: Option<String>,
+
     /// The provider for cloud services. Empty runs with no cloud provider;
     /// `external` runs with an external cloud provider (upstream
     /// `--cloud-provider`, options.go:295). Any other value is rejected, as
@@ -391,6 +399,15 @@ async fn main() -> Result<()> {
         node_ip::node_ip_config(args.node_ip.as_deref().unwrap_or(""), &args.cloud_provider)
             .map_err(|e| anyhow::anyhow!(e))?;
 
+    // RunKubelet: `nodeutil.GetHostname(kubeServer.HostnameOverride)`
+    // (server.go:1208). `--node-name` stands in for the hostname when no
+    // override is given (upstream: `nodeName := types.NodeName(hostname)`).
+    let hostname = node_ip::get_hostname(
+        args.hostname_override.as_deref().unwrap_or(&args.node_name),
+        &|| Ok(String::new()),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+
     // Build eviction manager from CLI flags BEFORE consuming `args` into
     // RuntimeConfig::build — that call moves out several String fields.
     let eviction_manager = build_eviction_manager(&args, config_file.as_ref())?;
@@ -573,6 +590,7 @@ async fn main() -> Result<()> {
             external_cloud_provider,
         )
         .await?
+        .with_hostname(&hostname)
         .with_resolv_conf(&args.resolv_conf)
         .with_pod_manifest_path(args.pod_manifest_path.clone())
         .with_node_status_update_frequency(node_status_update_frequency)

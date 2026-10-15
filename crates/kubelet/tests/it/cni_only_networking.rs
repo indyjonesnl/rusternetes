@@ -29,6 +29,7 @@ fn kubelet_config_is_cni_only_no_netstack_surface() {
         kubernetes_service_host: "10.96.0.1".to_string(),
         node_ip: String::new(),
         cloud_provider: String::new(),
+        hostname_override: String::new(),
     };
 
     // Sanity: the default config is equivalent on the fields we set.

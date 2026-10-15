@@ -377,6 +377,10 @@ pub struct CriContainerRuntime {
     /// Node IPs (upstream `Configurer.nodeIPs`) used for the localhost
     /// nameserver fallback when `--resolv-conf` is empty (`dns.go:431-447`).
     node_ips: Vec<String>,
+    /// The node's host IPs (`kl.getHostIPsAnyWay()`, kubelet_getters.go:
+    /// 318-326), shared with the kubelet which refreshes it with every
+    /// `NodeAddress` setter run. Empty = host IP unknown.
+    host_ips: Arc<std::sync::Mutex<Vec<String>>>,
     /// Node allocatable (`cpu`/`memory`/`ephemeral-storage`/`hugepages-*`),
     /// used to default unset resourceFieldRef LIMITS into downward-API env
     /// (upstream `MergeContainerResourceLimits`). Empty leaves such vars unset.
@@ -400,6 +404,7 @@ impl CriContainerRuntime {
             resolv_conf: "/etc/resolv.conf".to_string(),
             node_name: String::new(),
             node_ips: Vec::new(),
+            host_ips: Arc::new(std::sync::Mutex::new(Vec::new())),
             node_allocatable: std::collections::HashMap::new(),
         })
     }
@@ -492,6 +497,14 @@ impl CriContainerRuntime {
     #[must_use]
     pub fn with_node_ips(mut self, ips: Vec<String>) -> Self {
         self.node_ips = ips;
+        self
+    }
+
+    /// Share the kubelet's host-IP handle (`getHostIPsAnyWay`) used to
+    /// resolve downward-API `status.hostIP(s)` at container-create time.
+    #[must_use]
+    pub fn with_host_ips(mut self, host_ips: Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+        self.host_ips = host_ips;
         self
     }
 
@@ -945,12 +958,20 @@ impl CriContainerRuntime {
                     st.pod_ip = Some(ip);
                 }
             }
+            // podFieldSelectorRuntimeValue (kubelet_pods.go:1005-1019): the
+            // host IPs come from `getHostIPsAnyWay`; when unknown nothing is
+            // invented and the fieldRef stays unresolved.
             if st.host_ip.is_none() {
-                let nip = node_internal_ip().to_string();
-                st.host_i_ps = Some(vec![rusternetes_common::resources::pod::HostIP {
-                    ip: nip.clone(),
-                }]);
-                st.host_ip = Some(nip);
+                let host_ips = self.host_ips.lock().unwrap().clone();
+                if let Some(first) = host_ips.first() {
+                    st.host_ip = Some(first.clone());
+                    st.host_i_ps = Some(
+                        host_ips
+                            .iter()
+                            .map(|ip| rusternetes_common::resources::pod::HostIP { ip: ip.clone() })
+                            .collect(),
+                    );
+                }
             }
             &eff_pod
         } else {
@@ -2944,28 +2965,6 @@ fn service_env_vars(host: &str, port: &str) -> Vec<(String, String)> {
         (format!("{pp}_PORT"), port.to_string()),
         (format!("{pp}_ADDR"), host.to_string()),
     ]
-}
-
-/// Memoized node InternalIP, used to fill `status.hostIP`(`s`) for downward-API
-/// env resolution at container-create time. Mirrors the kubelet's
-/// `detect_internal_ip` (resolve our own hostname to its non-loopback IPv4);
-/// stable for the process lifetime.
-fn node_internal_ip() -> &'static str {
-    static NODE_IP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    NODE_IP.get_or_init(|| {
-        std::env::var("HOSTNAME")
-            .ok()
-            .and_then(|h| std::net::ToSocketAddrs::to_socket_addrs(&(h.as_str(), 0u16)).ok())
-            .and_then(|addrs| {
-                addrs
-                    .filter_map(|a| match a.ip() {
-                        std::net::IpAddr::V4(ip) if !ip.is_loopback() => Some(ip.to_string()),
-                        _ => None,
-                    })
-                    .next()
-            })
-            .unwrap_or_else(|| "127.0.0.1".to_string())
-    })
 }
 
 /// Format a CRI `VersionResponse` as the k8s `containerRuntimeVersion`
