@@ -52,6 +52,7 @@ pub mod resources;
 pub mod sa_keys;
 pub mod schema_validation;
 pub mod serviceaccount;
+pub mod signal;
 pub mod statusz;
 pub mod tls;
 pub mod tolerations;

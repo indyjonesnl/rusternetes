@@ -44,13 +44,53 @@ impl Default for LeaderElectionConfig {
     }
 }
 
+/// Shutdown flag whose `trigger()` also wakes sleepers.
+#[derive(Default)]
+pub(crate) struct ShutdownFlag {
+    set: RwLock<bool>,
+    notify: tokio::sync::Notify,
+}
+
+impl ShutdownFlag {
+    pub(crate) async fn trigger(&self) {
+        *self.set.write().await = true;
+        // notify_waiters wakes current sleepers; late sleepers see `set`.
+        self.notify.notify_waiters();
+    }
+    pub(crate) async fn is_set(&self) -> bool {
+        *self.set.read().await
+    }
+    pub(crate) async fn wait(&self) {
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !self.is_set().await {
+            notified.await;
+        }
+    }
+    pub(crate) async fn sleep_or_shutdown(&self, d: Duration) {
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        // Register interest before checking the flag so a concurrent
+        // trigger() cannot slip between the check and the wait.
+        notified.as_mut().enable();
+        if self.is_set().await {
+            return;
+        }
+        tokio::select! {
+            _ = sleep(d) => {}
+            _ = &mut notified => {}
+        }
+    }
+}
+
 /// LeaderElector manages leader election using etcd
 pub struct LeaderElector {
     client: Arc<Mutex<Client>>,
     config: LeaderElectionConfig,
     state: Arc<RwLock<LeaderState>>,
     lease_id: Arc<Mutex<Option<i64>>>,
-    shutdown: Arc<RwLock<bool>>,
+    shutdown: Arc<ShutdownFlag>,
 }
 
 impl LeaderElector {
@@ -71,7 +111,7 @@ impl LeaderElector {
             config,
             state: Arc::new(RwLock::new(LeaderState::Unknown)),
             lease_id: Arc::new(Mutex::new(None)),
-            shutdown: Arc::new(RwLock::new(false)),
+            shutdown: Arc::new(ShutdownFlag::default()),
         })
     }
 
@@ -111,7 +151,7 @@ impl LeaderElector {
 
         loop {
             // Check if we should shutdown
-            if *self.shutdown.read().await {
+            if self.shutdown.is_set().await {
                 info!("Leader election shutting down");
                 self.release_leadership().await?;
                 break;
@@ -129,7 +169,9 @@ impl LeaderElector {
                 Err(e) => {
                     error!(error = %e, "Error in leader election");
                     *self.state.write().await = LeaderState::Unknown;
-                    sleep(Duration::from_secs(self.config.retry_interval)).await;
+                    self.shutdown
+                        .sleep_or_shutdown(Duration::from_secs(self.config.retry_interval))
+                        .await;
                 }
             }
         }
@@ -269,10 +311,13 @@ impl LeaderElector {
         renew_timer.tick().await; // First tick completes immediately
 
         loop {
-            renew_timer.tick().await;
+            tokio::select! {
+                _ = renew_timer.tick() => {}
+                _ = self.shutdown.wait() => {}
+            }
 
             // Check if we should shutdown
-            if *self.shutdown.read().await {
+            if self.shutdown.is_set().await {
                 return Ok(());
             }
 
@@ -298,7 +343,9 @@ impl LeaderElector {
 
     /// Run the follower loop - check for leader changes
     async fn run_as_follower(&self) -> Result<()> {
-        sleep(Duration::from_secs(self.config.retry_interval)).await;
+        self.shutdown
+            .sleep_or_shutdown(Duration::from_secs(self.config.retry_interval))
+            .await;
         Ok(())
     }
 
@@ -346,7 +393,27 @@ impl LeaderElector {
 
     /// Initiate shutdown
     pub async fn shutdown(&self) {
-        *self.shutdown.write().await = true;
+        self.shutdown.trigger().await;
+    }
+}
+
+/// `ReleaseOnCancel` (client-go `leaderelection.go:304`): once `ctx` is
+/// cancelled, run `shutdown` (which makes the elector release the lock) and wait
+/// up to `release_timeout` for the election task `run` to finish, as
+/// `Run(ctx)` does not return before `release()` has run.
+pub async fn release_on_cancel<F, Fut, T>(
+    ctx: &crate::signal::ShutdownContext,
+    shutdown: F,
+    run: tokio::task::JoinHandle<T>,
+    release_timeout: Duration,
+) where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    ctx.cancelled().await;
+    shutdown().await;
+    if tokio::time::timeout(release_timeout, run).await.is_err() {
+        warn!("Timed out waiting for leader election to release the lock");
     }
 }
 
@@ -476,5 +543,89 @@ mod tests {
         elector2.shutdown().await;
 
         let _ = tokio::join!(handle1, handle2);
+    }
+
+    /// client-go `TestReleaseOnCancellation_Leases`: cancelling the context
+    /// must make the lock be released before the election task returns.
+    #[tokio::test]
+    async fn release_on_cancel_runs_release_after_cancel_and_waits_for_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let ctx = crate::signal::ShutdownContext::new();
+        let released = Arc::new(AtomicBool::new(false));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        // Fake election task: like `run()`, it only releases once told to.
+        let run = {
+            let released = released.clone();
+            let notify = notify.clone();
+            tokio::spawn(async move {
+                notify.notified().await;
+                sleep(Duration::from_millis(50)).await;
+                released.store(true, Ordering::SeqCst);
+            })
+        };
+        let waiter = {
+            let ctx = ctx.clone();
+            let notify = notify.clone();
+            tokio::spawn(async move {
+                release_on_cancel(
+                    &ctx,
+                    || async move { notify.notify_one() },
+                    run,
+                    Duration::from_secs(2),
+                )
+                .await
+            })
+        };
+        sleep(Duration::from_millis(50)).await;
+        assert!(!released.load(Ordering::SeqCst), "no release before cancel");
+        ctx.cancel();
+        tokio::time::timeout(Duration::from_secs(3), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            released.load(Ordering::SeqCst),
+            "release must complete before release_on_cancel returns"
+        );
+    }
+
+    /// A stuck release is bounded (upstream bounds release() by RenewDeadline).
+    #[tokio::test]
+    async fn release_on_cancel_is_bounded_by_timeout() {
+        let ctx = crate::signal::ShutdownContext::new();
+        ctx.cancel();
+        let run = tokio::spawn(std::future::pending::<()>());
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            release_on_cancel(&ctx, || async {}, run, Duration::from_millis(100)),
+        )
+        .await
+        .expect("must give up after the release timeout");
+    }
+
+    /// `shutdown()` must wake a sleeping `run()` loop promptly instead of
+    /// waiting out the retry/renew interval (so release happens inside the
+    /// SIGTERM grace period).
+    #[tokio::test]
+    async fn shutdown_flag_wakes_sleepers() {
+        let flag = Arc::new(ShutdownFlag::default());
+        let f = flag.clone();
+        let sleeper = tokio::spawn(async move {
+            f.sleep_or_shutdown(Duration::from_secs(60)).await;
+        });
+        sleep(Duration::from_millis(50)).await;
+        flag.trigger().await;
+        tokio::time::timeout(Duration::from_secs(2), sleeper)
+            .await
+            .expect("sleeper must wake on shutdown")
+            .unwrap();
+        assert!(flag.is_set().await);
+        // A late sleeper returns immediately too.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            flag.sleep_or_shutdown(Duration::from_secs(60)),
+        )
+        .await
+        .unwrap();
     }
 }
