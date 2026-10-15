@@ -179,9 +179,9 @@ fn expect_error_substring(id: &str) -> &str {
 /// pods a warning naming the failing check (run.go:316-336).
 ///
 /// `failRequiresError` (run.go:302-307; only procMount at 1.35 baseline,
-/// fixtures_procMount.go:93) means API validation rejects the pod outright,
-/// which is outside PodSecurity itself, so those scenarios are not replayed
-/// here.
+/// fixtures_procMount.go:93) means API validation rejects the pod outright
+/// (`ValidateSecurityContext`, validation.go:8387-8389), so those scenarios
+/// are replayed against `validate_deployment` instead of PodSecurity.
 #[tokio::test]
 async fn pod_security_fixtures_controller_scenarios() {
     use rusternetes_common::resources::Namespace;
@@ -265,7 +265,21 @@ async fn pod_security_fixtures_controller_scenarios() {
             for (name, pod) in load(&dir.join("fail")) {
                 let stem = check_stem(&name).to_string();
                 if stem == "procmount" && minor >= 35 {
-                    continue; // failRequiresError, see above
+                    // failRequiresError: the Deployment itself is rejected.
+                    let mut d = deployment(&pod);
+                    d["metadata"]["namespace"] = ns.clone().into();
+                    d["spec"]["template"]["metadata"]["labels"] =
+                        serde_json::json!({"test": "true"});
+                    let d: rusternetes_common::resources::Deployment =
+                        serde_json::from_value(d).unwrap();
+                    let errs = rusternetes_common::validation::apps::validate_deployment(&d);
+                    assert!(
+                        errs.iter()
+                            .any(|e| e.field.ends_with("securityContext.procMount")),
+                        "{ns} fail/{name}: expected a procMount validation error, got {errs:?}"
+                    );
+                    controllers += 1;
+                    continue;
                 }
                 let check = applicable
                     .iter()
