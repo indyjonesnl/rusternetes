@@ -87,6 +87,31 @@ fn policy_cases() -> Vec<(&'static str, Value, &'static str)> {
             }] })),
             "spec.validations[0].messageExpression: Invalid value: \"   \": must be non-empty if specified",
         ),
+        // validation_test.go:2619 / :2644.
+        (
+            "a messageExpression that does not parse",
+            spec_with(json!({ "validations": [{
+                "expression": "true", "messageExpression": "object.x in [1, 2, "
+            }] })),
+            "spec.validations[0].messageExpression: Invalid value: \"object.x in [1, 2, \": compilation failed",
+        ),
+        (
+            "a messageExpression of the wrong type",
+            spec_with(json!({ "validations": [{
+                "expression": "true", "messageExpression": "0 == 0"
+            }] })),
+            "spec.validations[0].messageExpression: Invalid value: \"0 == 0\": must evaluate to string but got bool",
+        ),
+        // plugin.go:119 / validation.go:1124: messageExpressions are compiled
+        // with `HasAuthorizer: false`, so `authorizer` is undeclared.
+        (
+            "a messageExpression that references authorizer",
+            spec_with(json!({ "validations": [{
+                "expression": "true",
+                "messageExpression": "authorizer.group('').resource('pods').check('get').allowed() ? 'a' : 'b'"
+            }] })),
+            "spec.validations[0].messageExpression: Invalid value: \"authorizer.group('').resource('pods').check('get').allowed() ? 'a' : 'b'\": compilation failed: ERROR: <input>: undeclared reference to 'authorizer' (in container '')",
+        ),
         (
             "a variable with no name",
             spec_with(json!({ "variables": [{ "expression": "object.spec" }] })),
@@ -474,4 +499,33 @@ async fn a_valid_policy_status_is_written() {
         );
         resource_version = body["metadata"]["resourceVersion"].clone();
     }
+}
+
+/// The accept side of the `messageExpression` compile: `authorizer` is allowed
+/// in `validations[].expression` (validation.go:1096, `HasAuthorizer: true`)
+/// and the declared `variables` / `params` resolve in a `messageExpression`.
+#[tokio::test]
+async fn message_expression_compile_accepts_declared_names() {
+    let api = TestApiServer::new();
+    let (status, body) = api
+        .send(
+            "POST",
+            POLICIES,
+            Some("application/json"),
+            Some(&json!({
+                "apiVersion": "admissionregistration.k8s.io/v1",
+                "kind": "ValidatingAdmissionPolicy",
+                "metadata": { "name": "policy-msg-ok" },
+                "spec": spec_with(json!({
+                    "paramKind": { "apiVersion": "v1", "kind": "ConfigMap" },
+                    "variables": [{ "name": "replicas", "expression": "object.spec.replicas" }],
+                    "validations": [{
+                        "expression": "authorizer.group('').resource('pods').check('get').allowed()",
+                        "messageExpression": "'have ' + string(variables.replicas) + string(params.data)"
+                    }]
+                })),
+            })),
+        )
+        .await;
+    assert!(status.is_success(), "{status} {body}");
 }

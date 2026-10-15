@@ -4,7 +4,8 @@
 //! Not modelled, each tracked on the issue named:
 //!
 //! - CEL compilation of a policy's `validations`, `variables`,
-//!   `auditAnnotations` and `messageExpression`, and the type-checking
+//!   `auditAnnotations` (`messageExpression` is compiled, in
+//!   `validatingadmissionpolicy`), and the type-checking
 //!   controller that fills `status.typeChecking` (#1442). The
 //!   `matchConditions` of the two webhook configurations and of a
 //!   ValidatingAdmissionPolicy are compiled, as

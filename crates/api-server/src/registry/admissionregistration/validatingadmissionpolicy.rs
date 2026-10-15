@@ -49,6 +49,59 @@ fn spec_json(obj: &ValidatingAdmissionPolicy) -> Option<serde_json::Value> {
     serde_json::to_value(&obj.spec).ok()
 }
 
+/// `validateMessageExpression` (validation.go:1114-1126) for every
+/// `validations[i].messageExpression` that is not blank (:1041-1045): compiled
+/// with `HasAuthorizer: false` (also `compilePolicy`, validating/plugin.go:119),
+/// so a reference to `authorizer` is `undeclared reference`, and expected to
+/// evaluate to a string (`MessageExpressionCondition.ReturnTypes`,
+/// message.go:34-36). `HasParams` is `opts.allowParamsInMatchConditions`, which
+/// `validateValidatingAdmissionPolicySpec` sets when `paramKind` is present
+/// (:790-792). The `variables` are declared only when the policy has some:
+/// `getCompiler` (:773-779) builds the composited compiler only then and the
+/// stateless one otherwise (`createCompiler`, :1316-1327).
+///
+/// The rest of the spec's CEL compile (`validations[].expression`,
+/// `variables`, `auditAnnotations`) is not modelled here, see [`super`].
+fn message_expression_errors(obj: &ValidatingAdmissionPolicy) -> ErrorList {
+    let mut errs = ErrorList::new();
+    let Some(spec) = &obj.spec else {
+        return errs;
+    };
+    let has_variables = spec.variables.as_ref().is_some_and(|v| !v.is_empty());
+    let names: std::collections::BTreeSet<String> = spec
+        .variables
+        .iter()
+        .flatten()
+        .map(|v| v.name.clone())
+        .filter(|n| !n.trim().is_empty())
+        .collect();
+    let env = MutationEnv {
+        has_params: spec.param_kind.is_some(),
+        has_authorizer: false,
+        has_patch_types: false,
+        variables: has_variables.then_some(names),
+    };
+    for (i, v) in spec.validations.iter().flatten().enumerate() {
+        let Some(expression) = v.message_expression.as_deref() else {
+            continue;
+        };
+        if expression.trim().is_empty() {
+            continue;
+        }
+        if let Some(detail) = mutation_env_failure(expression, &env, ExpectedOutput::String) {
+            errs.push(FieldError::invalid(
+                &Path::new("spec")
+                    .child("validations")
+                    .index(i)
+                    .child("messageExpression"),
+                expression.to_string(),
+                detail,
+            ));
+        }
+    }
+    errs
+}
+
 /// `validateValidatingAdmissionPolicy` (validation.go:762-770): ObjectMeta
 /// with `NameIsDNSSubdomain`, then the spec.
 fn validate(obj: &ValidatingAdmissionPolicy) -> ErrorList {
@@ -59,6 +112,7 @@ fn validate(obj: &ValidatingAdmissionPolicy) -> ErrorList {
         &Path::new("metadata"),
     );
     errs.extend(validate_validating_admission_policy(obj));
+    errs.extend(message_expression_errors(obj));
     errs
 }
 
@@ -82,6 +136,7 @@ fn compile_errors(obj: &ValidatingAdmissionPolicy, ignore_match_conditions: bool
     let env = MutationEnv {
         has_params: spec.param_kind.is_some(),
         has_patch_types: false,
+        has_authorizer: true,
         variables: None,
     };
     for (i, c) in spec.match_conditions.iter().flatten().enumerate() {

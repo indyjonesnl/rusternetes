@@ -68,7 +68,10 @@ async fn grant(api: &TestApiServer, user: &str, extra: Value) {
 }
 
 async fn api() -> TestApiServer {
-    let api = TestApiServer::builder().rbac().build();
+    seed(TestApiServer::builder().rbac().build()).await
+}
+
+async fn seed(api: TestApiServer) -> TestApiServer {
     let cr: ClusterRole = serde_json::from_value(json!({
         "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole",
         "metadata": {"name": "cluster-admin"},
@@ -322,5 +325,164 @@ async fn binding_to_an_unknown_policy_needs_permission_on_everything() {
         &body,
         "spec.paramRef",
         "unable to get policy missing to determine minimum required permissions",
+    );
+}
+
+// ---- the policy plugin's `authorizer` binding (#3528, of #3446) ----------
+
+use async_trait::async_trait;
+use rusternetes_common::auth::UserInfo;
+use rusternetes_common::authz::{Authorizer, Decision, Opinion, RequestAttributes};
+use rusternetes_common::resources::{NonResourceRule, ResourceRule};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+/// Forwards to the real authorizer and counts the calls that reach it for
+/// `get secrets`, the one check the policies below make.
+struct CountingAuthorizer {
+    inner: Arc<dyn Authorizer>,
+    secret_gets: Arc<AtomicUsize>,
+}
+
+impl CountingAuthorizer {
+    fn count(&self, attrs: &RequestAttributes) {
+        if attrs.resource == "secrets" && attrs.verb == "get" {
+            self.secret_gets.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+#[async_trait]
+impl Authorizer for CountingAuthorizer {
+    async fn authorize(&self, attrs: &RequestAttributes) -> rusternetes_common::Result<Decision> {
+        self.count(attrs);
+        self.inner.authorize(attrs).await
+    }
+
+    async fn authorize_opinion(
+        &self,
+        attrs: &RequestAttributes,
+    ) -> rusternetes_common::Result<Opinion> {
+        self.count(attrs);
+        self.inner.authorize_opinion(attrs).await
+    }
+
+    async fn get_user_rules(
+        &self,
+        user: &UserInfo,
+        namespace: &str,
+    ) -> rusternetes_common::Result<(Vec<ResourceRule>, Vec<NonResourceRule>)> {
+        self.inner.get_user_rules(user, namespace).await
+    }
+}
+
+async fn counting_api() -> (TestApiServer, Arc<AtomicUsize>) {
+    let secret_gets = Arc::new(AtomicUsize::new(0));
+    let counter = secret_gets.clone();
+    let api = TestApiServer::builder()
+        .rbac()
+        .wrap_authorizer(move |inner| {
+            Arc::new(CountingAuthorizer {
+                inner,
+                secret_gets: counter,
+            })
+        })
+        .build();
+    let api = seed(api).await;
+    let create_cm = json!([{"apiGroups": [""], "resources": ["configmaps"], "verbs": ["create"]}]);
+    // erin may create configmaps; frank may also `get` secrets.
+    grant(&api, "erin", create_cm.clone()).await;
+    let mut frank = create_cm.as_array().unwrap().clone();
+    frank.push(json!({"apiGroups": [""], "resources": ["secrets"], "verbs": ["get"]}));
+    grant(&api, "frank", json!(frank)).await;
+    (api, secret_gets)
+}
+
+/// A policy on configmap CREATE that holds only when the requesting user may
+/// `get` secrets, and a Deny binding for it. Created by the default
+/// (`system:masters`) identity.
+async fn install_authorizer_policy(api: &TestApiServer, name: &str) {
+    let (s, body) = api
+        .post(
+            VAP,
+            &json!({"apiVersion": "admissionregistration.k8s.io/v1",
+                "kind": "ValidatingAdmissionPolicy", "metadata": {"name": name},
+                "spec": {
+                    "failurePolicy": "Fail",
+                    "matchConstraints": {"resourceRules": [{
+                        "apiGroups": [""], "apiVersions": ["v1"],
+                        "operations": ["CREATE"], "resources": ["configmaps"]}]},
+                    "validations": [{
+                        "expression": "authorizer.group('').resource('secrets').check('get').allowed()",
+                        "message": "must be able to get secrets"}]}}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+    let (s, body) = api
+        .post(VAPB, &binding(&format!("{name}-b"), name, None))
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+}
+
+fn configmap(name: &str) -> Value {
+    json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": name}})
+}
+
+const CONFIGMAPS: &str = "/api/v1/namespaces/default/configmaps";
+
+/// handlers/admission.rs passes the request user and the (unfiltered)
+/// authorizer to the policy plugin: `authorizer.<group>.<resource>.check(verb)`
+/// is the requester's own permission, not the server's.
+#[tokio::test]
+async fn policy_authorizer_decides_by_the_requesting_users_permissions() {
+    let (api, _) = counting_api().await;
+    install_authorizer_policy(&api, "needs-secrets").await;
+
+    let (s, body) = as_user(&api, "erin", "POST", CONFIGMAPS, Some(&configmap("denied"))).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("must be able to get secrets"),
+        "{body}"
+    );
+
+    let (s, body) = as_user(
+        &api,
+        "frank",
+        "POST",
+        CONFIGMAPS,
+        Some(&configmap("allowed")),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+}
+
+/// dispatcher.go:117, :221: one `NewCachingAuthorizer` per dispatch, shared by
+/// every policy of the request, so N policies asking the same question reach
+/// the real authorizer once, while a second request asks again.
+#[tokio::test]
+async fn one_request_shares_one_caching_authorizer_across_policies() {
+    let (api, secret_gets) = counting_api().await;
+    for name in ["needs-secrets-a", "needs-secrets-b", "needs-secrets-c"] {
+        install_authorizer_policy(&api, name).await;
+    }
+    secret_gets.store(0, Ordering::SeqCst);
+
+    let (s, body) = as_user(&api, "frank", "POST", CONFIGMAPS, Some(&configmap("one"))).await;
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        secret_gets.load(Ordering::SeqCst),
+        1,
+        "three policies, one check"
+    );
+
+    let (s, body) = as_user(&api, "frank", "POST", CONFIGMAPS, Some(&configmap("two"))).await;
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        secret_gets.load(Ordering::SeqCst),
+        2,
+        "the cache lives for one request"
     );
 }
