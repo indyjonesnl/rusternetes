@@ -1,11 +1,12 @@
 //! In-tree -> CSI PersistentVolume translation: a port of
 //! `staging/src/k8s.io/csi-translation-lib` (`translate.go`,
-//! `plugins/in_tree_volume.go`, `plugins/gce_pd.go`, `plugins/aws_ebs.go`).
+//! `plugins/in_tree_volume.go`, `plugins/gce_pd.go`, `plugins/aws_ebs.go`,
+//! `plugins/portworx.go`).
 //!
 //! Shared by the external-attacher (`CsiAttacher`) and the scheduler's
-//! VolumeBinding plugin (`tryTranslatePVToCSI`). Plugins ported so far: GCE PD
-//! and AWS EBS; the other in-tree plugins of `translate.go:34-42` (Cinder,
-//! AzureDisk, AzureFile, vSphere, Portworx) are tracked follow-ups.
+//! VolumeBinding plugin (`tryTranslatePVToCSI`). Plugins ported so far: GCE PD,
+//! AWS EBS and Portworx; the other in-tree plugins of `translate.go:34-42`
+//! (Cinder, AzureDisk, AzureFile, vSphere) are tracked follow-ups.
 //!
 //! `TranslateCSIPVToInTree` (`translate.go:116-128`) is ported for the same
 //! two plugins, with `translateTopologyFromCSIToInTree` /
@@ -20,8 +21,8 @@ use crate::resources::pod::Volume;
 use crate::resources::volume::PersistentVolumeMode;
 use crate::resources::volume::{
     AWSElasticBlockStoreVolumeSource, CSIVolumeSource, GCEPersistentDiskVolumeSource, NodeSelector,
-    NodeSelectorRequirement, NodeSelectorTerm, PersistentVolumeAccessMode, StorageClass,
-    TopologySelectorLabelRequirement, TopologySelectorTerm, VolumeNodeAffinity,
+    NodeSelectorRequirement, NodeSelectorTerm, PersistentVolumeAccessMode, SecretReference,
+    StorageClass, TopologySelectorLabelRequirement, TopologySelectorTerm, VolumeNodeAffinity,
 };
 use crate::resources::PersistentVolume;
 use crate::types::ObjectMeta;
@@ -79,8 +80,9 @@ trait InTreePlugin {
 /// `inTreePlugins` (`translate.go:32-42`), the ported subset.
 static GCE_PD: GcePersistentDiskTranslator = GcePersistentDiskTranslator;
 static AWS_EBS: AwsElasticBlockStoreTranslator = AwsElasticBlockStoreTranslator;
-fn in_tree_plugins() -> [&'static dyn InTreePlugin; 2] {
-    [&GCE_PD, &AWS_EBS]
+static PORTWORX: PortworxCsiTranslator = PortworxCsiTranslator;
+fn in_tree_plugins() -> [&'static dyn InTreePlugin; 3] {
+    [&GCE_PD, &AWS_EBS, &PORTWORX]
 }
 
 /// `CSITranslator` (`translate.go:48`).
@@ -1118,6 +1120,174 @@ impl InTreePlugin for AwsElasticBlockStoreTranslator {
     }
 
     /// `RepairVolumeHandle` (`aws_ebs.go:227-229`).
+    fn repair_volume_handle(&self, volume_handle: &str, _node_id: &str) -> Result<String, String> {
+        Ok(volume_handle.to_string())
+    }
+}
+
+// ---- Portworx (`plugins/portworx.go`) ---------------------------------------
+
+/// `PortworxDriverName` (`portworx.go:32`).
+pub const PORTWORX_DRIVER_NAME: &str = "pxd.portworx.com";
+/// `PortworxVolumePluginName` (`portworx.go:31`).
+pub const PORTWORX_IN_TREE_PLUGIN_NAME: &str = "kubernetes.io/portworx-volume";
+/// `OpenStorageAuthSecretNameKey` / `...NamespaceKey` (`portworx.go:34-35`).
+const OPEN_STORAGE_AUTH_SECRET_NAME_KEY: &str = "openstorage.io/auth-secret-name";
+const OPEN_STORAGE_AUTH_SECRET_NAMESPACE_KEY: &str = "openstorage.io/auth-secret-namespace";
+/// `csiParameterPrefix` (`portworx.go:37`).
+const CSI_PARAMETER_PREFIX: &str = "csi.storage.k8s.io/";
+/// The six `prefixed*Secret{Name,Namespace}Key` pairs (`portworx.go:39-55`).
+const PORTWORX_CSI_SECRET_KINDS: [&str; 6] = [
+    "provisioner",
+    "controller-publish",
+    "node-publish",
+    "node-stage",
+    "controller-expand",
+    "node-expand",
+];
+
+struct PortworxCsiTranslator;
+
+impl InTreePlugin for PortworxCsiTranslator {
+    /// `TranslateInTreeStorageClassToCSI` (`portworx.go:68-98`).
+    fn translate_in_tree_storage_class_to_csi(&self, sc: &mut StorageClass) -> Result<(), String> {
+        let mut params: HashMap<String, String> = HashMap::new();
+        for (k, v) in sc.parameters.iter().flatten() {
+            match k.to_lowercase().as_str() {
+                OPEN_STORAGE_AUTH_SECRET_NAME_KEY => {
+                    for kind in PORTWORX_CSI_SECRET_KINDS {
+                        params.insert(
+                            format!("{CSI_PARAMETER_PREFIX}{kind}-secret-name"),
+                            v.clone(),
+                        );
+                    }
+                }
+                OPEN_STORAGE_AUTH_SECRET_NAMESPACE_KEY => {
+                    for kind in PORTWORX_CSI_SECRET_KINDS {
+                        params.insert(
+                            format!("{CSI_PARAMETER_PREFIX}{kind}-secret-namespace"),
+                            v.clone(),
+                        );
+                    }
+                }
+                // "All other parameters can be copied as is"
+                _ => {
+                    params.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        if !params.is_empty() {
+            sc.parameters = Some(params);
+        }
+        sc.provisioner = PORTWORX_DRIVER_NAME.to_string();
+        Ok(())
+    }
+
+    /// `TranslateInTreePVToCSI` (`portworx.go:128-158`).
+    fn translate_in_tree_pv_to_csi(&self, pv: &mut PersistentVolume) -> Result<(), String> {
+        let Some(px) = pv.spec.more_sources.portworx_volume.clone() else {
+            return Err("pv is nil or PortworxVolume not defined on pv".into());
+        };
+        // `metav1.HasAnnotation` is a key-presence check.
+        let annotations = pv.metadata.annotations.as_ref();
+        let secret_ref = match (
+            annotations.and_then(|a| a.get(OPEN_STORAGE_AUTH_SECRET_NAME_KEY)),
+            annotations.and_then(|a| a.get(OPEN_STORAGE_AUTH_SECRET_NAMESPACE_KEY)),
+        ) {
+            (Some(name), Some(namespace)) => Some(SecretReference {
+                name: Some(name.clone()),
+                namespace: Some(namespace.clone()),
+            }),
+            _ => None,
+        };
+        // `fsType` is a plain string upstream; empty means unset on the wire.
+        let csi = CSIVolumeSource {
+            driver: PORTWORX_DRIVER_NAME.to_string(),
+            volume_handle: Some(px.volume_id),
+            fs_type: Some(px.fs_type).filter(|f| !f.is_empty()),
+            volume_attributes: Some(HashMap::new()),
+            controller_publish_secret_ref: secret_ref.clone(),
+            node_stage_secret_ref: secret_ref.clone(),
+            node_publish_secret_ref: secret_ref.clone(),
+            controller_expand_secret_ref: secret_ref.clone(),
+            node_expand_secret_ref: secret_ref,
+            ..Default::default()
+        };
+        pv.spec.more_sources.portworx_volume = None;
+        pv.spec.csi = Some(csi);
+        Ok(())
+    }
+
+    /// `TranslateCSIPVToInTree` (`portworx.go:160-176`).
+    fn translate_csi_pv_to_in_tree(&self, pv: &mut PersistentVolume) -> Result<(), String> {
+        let Some(csi) = pv.spec.csi.clone() else {
+            return Err("pv is nil or CSI source not defined on pv".into());
+        };
+        let px = crate::resources::pv_sources::PortworxVolumeSource {
+            volume_id: csi.volume_handle.unwrap_or_default(),
+            fs_type: csi.fs_type.unwrap_or_default(),
+            read_only: csi.read_only.unwrap_or(false),
+        };
+        pv.spec.csi = None;
+        pv.spec.more_sources.portworx_volume = Some(px);
+        Ok(())
+    }
+
+    /// `TranslateInTreeInlineVolumeToCSI` (`portworx.go:100-126`).
+    fn translate_in_tree_inline_volume_to_csi(
+        &self,
+        volume: &Volume,
+        _pod_namespace: &str,
+    ) -> Result<PersistentVolume, String> {
+        let Some(px) = volume
+            .legacy_sources
+            .portworx_volume
+            .as_ref()
+            .and_then(|v| {
+                serde_json::from_value::<crate::resources::pv_sources::PortworxVolumeSource>(
+                    v.clone(),
+                )
+                .ok()
+            })
+        else {
+            return Err("volume is nil or PortworxVolume not defined on volume".into());
+        };
+        let am = if px.read_only {
+            PersistentVolumeAccessMode::ReadOnlyMany
+        } else {
+            PersistentVolumeAccessMode::ReadWriteOnce
+        };
+        let mut pv = inline_pv(format!("{PORTWORX_DRIVER_NAME}-{}", px.volume_id));
+        pv.spec.csi = Some(CSIVolumeSource {
+            driver: PORTWORX_DRIVER_NAME.to_string(),
+            volume_handle: Some(px.volume_id),
+            fs_type: Some(px.fs_type).filter(|f| !f.is_empty()),
+            volume_attributes: Some(HashMap::new()),
+            ..Default::default()
+        });
+        pv.spec.access_modes = vec![am];
+        Ok(pv)
+    }
+
+    /// `CanSupport` (`portworx.go:182-184`).
+    fn can_support(&self, pv: &PersistentVolume) -> bool {
+        pv.spec.more_sources.portworx_volume.is_some()
+    }
+
+    /// `CanSupportInline` (`portworx.go:187-189`).
+    fn can_support_inline(&self, volume: &Volume) -> bool {
+        volume.legacy_sources.portworx_volume.is_some()
+    }
+
+    fn in_tree_plugin_name(&self) -> &'static str {
+        PORTWORX_IN_TREE_PLUGIN_NAME
+    }
+
+    fn csi_plugin_name(&self) -> &'static str {
+        PORTWORX_DRIVER_NAME
+    }
+
+    /// `RepairVolumeHandle` (`portworx.go:204-206`): identity.
     fn repair_volume_handle(&self, volume_handle: &str, _node_id: &str) -> Result<String, String> {
         Ok(volume_handle.to_string())
     }
@@ -2198,5 +2368,188 @@ mod tests {
             t.get_in_tree_plugin_name_from_spec(None, None).unwrap_err(),
             "both persistent volume and volume are nil"
         );
+    }
+
+    // ---- Portworx (`plugins/portworx_test.go`) ----------------------------
+
+    fn px_pv(annotations: Option<&[(&str, &str)]>) -> PersistentVolume {
+        let mut pv = blank_pv("pxd.portworx.com");
+        pv.metadata.annotations = annotations.map(|a| {
+            a.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        });
+        pv.spec.access_modes = vec![PersistentVolumeAccessMode::ReadWriteOnce];
+        pv.spec.more_sources.portworx_volume =
+            Some(crate::resources::pv_sources::PortworxVolumeSource {
+                volume_id: "ID1111".into(),
+                fs_type: "type".into(),
+                read_only: false,
+            });
+        pv
+    }
+
+    /// `portworx.go:100-126`, `:160-176`, `:187-189`: inline translation,
+    /// CSI->in-tree round trip, and `CanSupportInline`.
+    #[test]
+    fn portworx_inline_and_reverse_translation() {
+        let t = CsiTranslator::new();
+        let vol = inline(serde_json::json!({
+            "name": "v", "portworxVolume": {"volumeID": "ID1", "fsType": "ext4", "readOnly": true}
+        }));
+        assert!(t.is_inline_migratable(&vol));
+        let pv = t
+            .translate_in_tree_inline_volume_to_csi(&vol, "ns")
+            .unwrap();
+        assert_eq!(pv.metadata.name, "pxd.portworx.com-ID1");
+        assert_eq!(
+            pv.spec.access_modes,
+            vec![PersistentVolumeAccessMode::ReadOnlyMany]
+        );
+        let back = t.translate_csi_pv_to_in_tree(&pv).unwrap();
+        let px = back.spec.more_sources.portworx_volume.unwrap();
+        assert_eq!(
+            (px.volume_id.as_str(), px.fs_type.as_str()),
+            ("ID1", "ext4")
+        );
+        assert!(back.spec.csi.is_none());
+    }
+
+    /// `TestTranslatePortworxInTreePVToCSI` "normal" / "with secret annotations".
+    #[test]
+    fn portworx_pv_translates() {
+        let t = CsiTranslator::new();
+        let out = t.translate_in_tree_pv_to_csi(&px_pv(None)).unwrap();
+        assert!(out.spec.more_sources.portworx_volume.is_none());
+        let csi = out.spec.csi.unwrap();
+        assert_eq!(csi.driver, "pxd.portworx.com");
+        assert_eq!(csi.volume_handle.as_deref(), Some("ID1111"));
+        assert_eq!(csi.fs_type.as_deref(), Some("type"));
+        assert_eq!(csi.volume_attributes, Some(HashMap::new()));
+        assert!(csi.controller_publish_secret_ref.is_none());
+
+        let ann = [
+            ("openstorage.io/auth-secret-name", "test-secret"),
+            ("openstorage.io/auth-secret-namespace", "test-namespace"),
+        ];
+        let csi = t
+            .translate_in_tree_pv_to_csi(&px_pv(Some(&ann)))
+            .unwrap()
+            .spec
+            .csi
+            .unwrap();
+        for r in [
+            &csi.controller_publish_secret_ref,
+            &csi.node_stage_secret_ref,
+            &csi.node_publish_secret_ref,
+            &csi.controller_expand_secret_ref,
+            &csi.node_expand_secret_ref,
+        ] {
+            let r = r.as_ref().unwrap();
+            assert_eq!(r.name.as_deref(), Some("test-secret"));
+            assert_eq!(r.namespace.as_deref(), Some("test-namespace"));
+        }
+        // Both annotations are required (`HasAnnotation` x2).
+        let one = [("openstorage.io/auth-secret-name", "test-secret")];
+        let csi = t
+            .translate_in_tree_pv_to_csi(&px_pv(Some(&one)))
+            .unwrap()
+            .spec
+            .csi
+            .unwrap();
+        assert!(csi.node_stage_secret_ref.is_none());
+    }
+
+    #[test]
+    fn portworx_names_and_support() {
+        let t = CsiTranslator::new();
+        let pv = px_pv(None);
+        assert!(t.is_pv_migratable(&pv));
+        assert_eq!(
+            t.get_in_tree_plugin_name_from_pv(&pv).unwrap(),
+            "kubernetes.io/portworx-volume"
+        );
+        assert_eq!(
+            t.get_csi_name_from_in_tree_name("kubernetes.io/portworx-volume")
+                .unwrap(),
+            "pxd.portworx.com"
+        );
+        assert_eq!(
+            t.get_in_tree_name_from_csi_name("pxd.portworx.com")
+                .unwrap(),
+            "kubernetes.io/portworx-volume"
+        );
+        // `RepairVolumeHandle` is the identity (`portworx.go`).
+        assert_eq!(
+            t.repair_volume_handle("pxd.portworx.com", "h", "n")
+                .unwrap(),
+            "h"
+        );
+        assert!(!t.is_pv_migratable(&blank_pv("x")));
+    }
+
+    /// `TestTranslatePortworxInTreeStorageClassToCSI`.
+    #[test]
+    fn portworx_storage_class_translates() {
+        let t = CsiTranslator::new();
+        let name = "kubernetes.io/portworx-volume";
+        let out = t
+            .translate_in_tree_storage_class_to_csi(
+                name,
+                &sc(
+                    &[("repl", "1"), ("fs", "ext4"), ("priority_io", "high")],
+                    None,
+                ),
+            )
+            .unwrap();
+        assert_eq!(out.provisioner, "pxd.portworx.com");
+        let p = out.parameters.unwrap();
+        assert_eq!(p.len(), 3);
+        assert_eq!(p["repl"], "1");
+
+        // "empty": parameters stay as they were (`len(params) > 0` guard).
+        let mut empty = sc(&[], None);
+        empty.parameters = None;
+        let out = t
+            .translate_in_tree_storage_class_to_csi(name, &empty)
+            .unwrap();
+        assert_eq!(out.provisioner, "pxd.portworx.com");
+        assert!(out.parameters.is_none());
+
+        // "with secret params"
+        let out = t
+            .translate_in_tree_storage_class_to_csi(
+                name,
+                &sc(
+                    &[
+                        ("repl", "1"),
+                        ("openstorage.io/auth-secret-name", "test-secret"),
+                        ("openstorage.io/auth-secret-namespace", "test-namespace"),
+                    ],
+                    None,
+                ),
+            )
+            .unwrap();
+        let p = out.parameters.unwrap();
+        assert_eq!(p.len(), 13);
+        assert_eq!(p["repl"], "1");
+        for k in [
+            "provisioner",
+            "controller-publish",
+            "node-stage",
+            "node-publish",
+            "controller-expand",
+            "node-expand",
+        ] {
+            assert_eq!(
+                p[&format!("csi.storage.k8s.io/{k}-secret-name")],
+                "test-secret"
+            );
+            assert_eq!(
+                p[&format!("csi.storage.k8s.io/{k}-secret-namespace")],
+                "test-namespace"
+            );
+        }
+        assert!(!p.contains_key("openstorage.io/auth-secret-name"));
     }
 }
