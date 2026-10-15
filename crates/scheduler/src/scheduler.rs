@@ -19,6 +19,7 @@ use crate::diagnosis::{fit_error_message, Diagnosis};
 use crate::framework_runtime::{names, ExtensionPoint};
 use crate::profile::DEFAULT_SCHEDULER_NAME;
 use crate::volume_binding::{self, PreFilterOutcome};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub struct Scheduler<S: Storage + Send + Sync + 'static = StorageBackend> {
     /// All reads/writes flow through the data plane — either storage directly
@@ -50,6 +51,12 @@ pub struct Scheduler<S: Storage + Send + Sync + 'static = StorageBackend> {
     volume_binder: Arc<std::sync::Mutex<crate::volume_assume::VolumeBinder>>,
     /// Poll interval of `BindPodVolumes` (1s upstream).
     pub(crate) volume_bind_poll: Duration,
+    /// `Scheduler.nextStartNodeIndex` (scheduler.go): where the next cycle
+    /// starts looking for feasible nodes, so every node gets examined.
+    next_start_node_index: AtomicUsize,
+    /// Test override of `getOffsetRand` (default_preemption.go:185-189, a
+    /// package variable upstream tests replace); `usize::MAX` = random.
+    preemption_offset_override: AtomicUsize,
 }
 
 impl Scheduler<StorageBackend> {
@@ -70,6 +77,8 @@ impl Scheduler<StorageBackend> {
             nominations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             volume_binder: Arc::default(),
             volume_bind_poll: crate::volume_bind::BIND_POLL_INTERVAL,
+            next_start_node_index: AtomicUsize::new(0),
+            preemption_offset_override: AtomicUsize::new(usize::MAX),
         }
     }
 }
@@ -101,6 +110,8 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             nominations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             volume_binder: Arc::default(),
             volume_bind_poll: crate::volume_bind::BIND_POLL_INTERVAL,
+            next_start_node_index: AtomicUsize::new(0),
+            preemption_offset_override: AtomicUsize::new(usize::MAX),
         }
     }
 
@@ -1028,115 +1039,117 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             None
         };
 
-        // Phase 1: Filter schedulable nodes
-        // (NodeUnschedulable filter.)
+        // `findNodesThatPassFilters` (schedule_one.go:624-708): visit the nodes
+        // starting where the previous cycle left off (`nextStartNodeIndex`,
+        // :544-548) and stop as soon as `numFeasibleNodesToFind` nodes pass
+        // every filter.
+        let num_all_nodes = nodes.len();
+        if num_all_nodes == 0 {
+            return None;
+        }
+        // schedule_one.go:634-636: without scoring (and without extender
+        // filters, which Rusternetes has none of) one feasible node is enough.
+        let num_nodes_to_find = if fw.has_score_plugins() {
+            num_feasible_nodes_to_find(
+                fw.percentage_of_nodes_to_score,
+                self.profiles.percentage_of_nodes_to_score,
+                num_all_nodes as i32,
+            ) as usize
+        } else {
+            1
+        };
+        let start_index = self.next_start_node_index.load(Ordering::Relaxed);
+
+        let node_affinity_filter_on = filter_on(names::NODE_AFFINITY);
         let unschedulable_on = filter_on(names::NODE_UNSCHEDULABLE);
-        let schedulable_nodes: Vec<&Node> = nodes
-            .iter()
-            .filter(|n| {
-                !unschedulable_on
-                    || !n
+        let taint_on = filter_on(names::TAINT_TOLERATION);
+        let dra_on = filter_on(names::DYNAMIC_RESOURCES);
+        let ports_on = filter_on(names::NODE_PORTS);
+        let inter_pod_filter_on = filter_on(names::INTER_POD_AFFINITY);
+        let spread_filter_on = filter_on(names::POD_TOPOLOGY_SPREAD);
+        let fit_filter_on = filter_on(names::NODE_RESOURCES_FIT);
+        // VolumeBinding Filter (FindPodVolumes) — bound PV node affinity,
+        // matching/provisionable unbound WaitForFirstConsumer claims.
+        let volume_filter = match &volume_ctx {
+            Some((snap, claims)) if filter_on(names::VOLUME_BINDING) => Some((snap, claims)),
+            _ => None,
+        };
+        // `NodeAffinityArgs.AddedAffinity`: `addedNodeSelector` (Filter) and
+        // `addedPrefSchedTerms` (Score), node_affinity.go:310-333.
+        let added_required = profile.added_affinity.as_ref().and_then(|a| {
+            a.required_during_scheduling_ignored_during_execution
+                .as_ref()
+        });
+        let added_preferred = profile.added_affinity.as_ref().and_then(|a| {
+            a.preferred_during_scheduling_ignored_during_execution
+                .as_ref()
+        });
+        // `podVolumesByNode` (volume_binding.go stateData): Filter's per-node
+        // result, read back by PreScore/Score.
+        let mut pod_volumes_by_node: std::collections::HashMap<String, volume_binding::PodVolumes> =
+            std::collections::HashMap::new();
+        let mut feasible: Vec<NodeEval> = Vec::new();
+        let mut processed_nodes = 0usize;
+        for i in 0..num_all_nodes {
+            let node = &nodes[(start_index + i) % num_all_nodes];
+            processed_nodes += 1;
+            let eval = async {
+                // NodeUnschedulable
+                if unschedulable_on
+                    && node
                         .spec
                         .as_ref()
                         .and_then(|s| s.unschedulable)
                         .unwrap_or(false)
-            })
-            .collect();
-
-        if schedulable_nodes.is_empty() {
-            return None;
-        }
-
-        // Phase 2: Filter by taints and tolerations (TaintToleration filter).
-        let taint_on = filter_on(names::TAINT_TOLERATION);
-        let tolerated_nodes: Vec<&Node> = schedulable_nodes
-            .iter()
-            .filter(|node| !taint_on || check_taints_tolerations(node, pod))
-            .copied()
-            .collect();
-
-        if tolerated_nodes.is_empty() {
-            debug!("No nodes tolerate pod taints");
-            return None;
-        }
-
-        // Phase 3: Check node selectors (basic label matching)
-        // (`spec.nodeSelector` is part of the NodeAffinity filter.)
-        let node_affinity_filter_on = filter_on(names::NODE_AFFINITY);
-        let selector_matched_nodes: Vec<&Node> = if !node_affinity_filter_on {
-            tolerated_nodes
-        } else if let Some(node_selector) = pod.spec.as_ref().and_then(|s| s.node_selector.as_ref())
-        {
-            tolerated_nodes
-                .iter()
-                .filter(|node| self.matches_node_selector(node, node_selector))
-                .copied()
-                .collect()
-        } else {
-            tolerated_nodes
-        };
-
-        if selector_matched_nodes.is_empty() {
-            debug!("No nodes match node selector");
-            return None;
-        }
-
-        // Phase 4: Check DRA device availability
-        // Filter nodes that have required devices for ResourceClaims
-        let dra_on = filter_on(names::DYNAMIC_RESOURCES);
-        let mut dra_matched_nodes: Vec<&Node> = Vec::new();
-        for node in selector_matched_nodes {
-            if !dra_on || self.check_dra_device_availability(node, pod).await {
-                dra_matched_nodes.push(node);
-            } else {
-                debug!(
-                    "Node {} does not have required DRA devices for pod {}",
-                    node.metadata.name, pod.metadata.name
-                );
-            }
-        }
-
-        if dra_matched_nodes.is_empty() {
-            debug!("No nodes have required DRA devices");
-            return None;
-        }
-
-        // Phase 4b: Check hostPort conflicts
-        let ports_on = filter_on(names::NODE_PORTS);
-        let port_ok_nodes: Vec<&Node> = dra_matched_nodes
-            .into_iter()
-            .filter(|node| {
+                {
+                    return None;
+                }
+                // TaintToleration
+                if taint_on && !check_taints_tolerations(node, pod) {
+                    debug!(
+                        "Node {} has taints the pod does not tolerate",
+                        node.metadata.name
+                    );
+                    return None;
+                }
+                // NodeAffinity (`spec.nodeSelector` is part of its filter, as is
+                // the scheduler-enforced `addedAffinity`, node_affinity.go:217-236).
+                if node_affinity_filter_on {
+                    if let Some(required) = added_required {
+                        if !rusternetes_common::affinity::matches_node_selector(node, required) {
+                            diag.add_node_reasons([ERR_REASON_ENFORCED_NODE_AFFINITY.to_string()]);
+                            return None;
+                        }
+                    }
+                    if let Some(node_selector) =
+                        pod.spec.as_ref().and_then(|s| s.node_selector.as_ref())
+                    {
+                        if !self.matches_node_selector(node, node_selector) {
+                            return None;
+                        }
+                    }
+                }
+                // DynamicResources: devices for the pod's ResourceClaims
+                if dra_on && !self.check_dra_device_availability(node, pod).await {
+                    debug!(
+                        "Node {} does not have required DRA devices for pod {}",
+                        node.metadata.name, pod.metadata.name
+                    );
+                    return None;
+                }
+                // NodePorts
                 if ports_on && !check_host_port_conflicts(node, pod, all_pods) {
                     debug!(
                         "Node {} rejected for pod {}: hostPort conflict",
                         node.metadata.name, pod.metadata.name
                     );
-                    false
-                } else {
-                    true
+                    return None;
                 }
-            })
-            .collect();
-
-        if port_ok_nodes.is_empty() {
-            debug!("No nodes without hostPort conflicts");
-            return None;
-        }
-
-        // Phase 4c: VolumeBinding Filter (FindPodVolumes) — bound PV node
-        // affinity, matching/provisionable unbound WaitForFirstConsumer claims.
-        // `podVolumesByNode` (volume_binding.go stateData): Filter's per-node
-        // result, read back by PreScore/Score.
-        let mut pod_volumes_by_node: std::collections::HashMap<String, volume_binding::PodVolumes> =
-            std::collections::HashMap::new();
-        let port_ok_nodes: Vec<&Node> = match volume_ctx {
-            Some((snap, claims)) if filter_on(names::VOLUME_BINDING) => port_ok_nodes
-                .into_iter()
-                .filter(
-                    |node| match volume_binding::find_pod_volumes(pod, &claims, node, &snap) {
+                // VolumeBinding
+                if let Some((snap, claims)) = volume_filter {
+                    match volume_binding::find_pod_volumes(pod, claims, node, snap) {
                         Ok((vols, reasons)) if reasons.is_empty() => {
                             pod_volumes_by_node.insert(node.metadata.name.clone(), vols);
-                            true
                         }
                         Ok((_, reasons)) => {
                             diag.add_node_reasons(reasons.iter().map(|r| r.to_string()));
@@ -1146,23 +1159,87 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                                 pod.metadata.name,
                                 reasons.join(", ")
                             );
-                            false
+                            return None;
                         }
                         Err(e) => {
                             debug!(
                                 "VolumeBinding filter error on node {} for pod {}: {}",
                                 node.metadata.name, pod.metadata.name, e
                             );
-                            false
+                            return None;
                         }
-                    },
-                )
-                .collect(),
-            _ => port_ok_nodes,
-        };
+                    }
+                }
+                // Node affinity (hard requirements and scoring)
+                let (affinity_ok, mut node_affinity_score) = check_node_affinity(node, pod);
+                if node_affinity_filter_on && !affinity_ok {
+                    return None;
+                }
+                // `addedPrefSchedTerms.Score(node)` (node_affinity.go:276-278)
+                if let Some(terms) = added_preferred {
+                    for t in terms {
+                        if rusternetes_common::affinity::matches_node_selector_term(
+                            node,
+                            &t.preference,
+                        ) {
+                            node_affinity_score += t.weight;
+                        }
+                    }
+                }
+                // Pod affinity (hard requirements and scoring)
+                let (pod_affinity_ok, pod_affinity_score) =
+                    check_pod_affinity(node, pod, all_pods, nodes);
+                if inter_pod_filter_on && !pod_affinity_ok {
+                    return None;
+                }
+                // Pod anti-affinity (hard requirements and penalty scoring)
+                let (pod_anti_affinity_ok, pod_anti_affinity_penalty) =
+                    check_pod_anti_affinity(node, pod, all_pods, nodes);
+                if inter_pod_filter_on && !pod_anti_affinity_ok {
+                    return None;
+                }
+                // Topology spread constraints (hard requirements and penalty scoring)
+                let (topology_ok, topology_penalty) =
+                    check_topology_spread_constraints(node, pod, all_pods, nodes);
+                if spread_filter_on && !topology_ok {
+                    return None;
+                }
+                // Resource fit (accounting for pod overhead and existing pod usage)
+                let resource_score =
+                    self.calculate_resource_score_with_overhead(node, pod, all_pods);
+                if fit_filter_on && resource_score == 0 {
+                    debug!(
+                        "Node {} rejected for pod {}: resource_score=0 (insufficient resources)",
+                        node.metadata.name, pod.metadata.name,
+                    );
+                    return None;
+                }
+                Some(NodeEval {
+                    node,
+                    node_affinity_score,
+                    pod_affinity_score,
+                    pod_anti_affinity_penalty,
+                    topology_penalty,
+                    resource_score,
+                })
+            }
+            .await;
+            if let Some(eval) = eval {
+                feasible.push(eval);
+                if feasible.len() >= num_nodes_to_find {
+                    break;
+                }
+            }
+        }
+        // schedule_one.go:547-548: always advance, so every node gets a chance
+        // to be searched across cycles.
+        self.next_start_node_index.store(
+            (start_index + processed_nodes) % num_all_nodes,
+            Ordering::Relaxed,
+        );
 
-        if port_ok_nodes.is_empty() {
-            debug!("No nodes satisfy the pod's volume requirements");
+        if feasible.is_empty() {
+            debug!("No nodes satisfy the pod's constraints");
             return None;
         }
 
@@ -1182,51 +1259,15 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             None
         };
 
-        // Phase 5, 6 & 7: Score nodes based on affinity, pod affinity/anti-affinity, topology spread, and resources
+        // Score the feasible nodes.
         let mut node_scores: Vec<NodeScore> = Vec::new();
-        let inter_pod_filter_on = filter_on(names::INTER_POD_AFFINITY);
-        let spread_filter_on = filter_on(names::POD_TOPOLOGY_SPREAD);
-        let fit_filter_on = filter_on(names::NODE_RESOURCES_FIT);
-
-        for node in port_ok_nodes {
-            // Check node affinity (hard requirements and scoring)
-            let (affinity_ok, node_affinity_score) = check_node_affinity(node, pod);
-            if node_affinity_filter_on && !affinity_ok {
-                continue; // Skip nodes that don't meet hard affinity requirements
-            }
-
-            // Check pod affinity (hard requirements and scoring)
-            let (pod_affinity_ok, pod_affinity_score) =
-                check_pod_affinity(node, pod, all_pods, nodes);
-            if inter_pod_filter_on && !pod_affinity_ok {
-                continue; // Skip nodes that don't meet hard pod affinity requirements
-            }
-
-            // Check pod anti-affinity (hard requirements and penalty scoring)
-            let (pod_anti_affinity_ok, pod_anti_affinity_penalty) =
-                check_pod_anti_affinity(node, pod, all_pods, nodes);
-            if inter_pod_filter_on && !pod_anti_affinity_ok {
-                continue; // Skip nodes that violate hard pod anti-affinity requirements
-            }
-
-            // Check topology spread constraints (hard requirements and penalty scoring)
-            let (topology_ok, topology_penalty) =
-                check_topology_spread_constraints(node, pod, all_pods, nodes);
-            if spread_filter_on && !topology_ok {
-                continue; // Skip nodes that violate hard topology spread constraints
-            }
-
-            // Calculate resource-based score (accounting for pod overhead and existing pod usage)
-            let resource_score = self.calculate_resource_score_with_overhead(node, pod, all_pods);
-
-            // If pod doesn't fit resource-wise, skip
-            if fit_filter_on && resource_score == 0 {
-                debug!(
-                    "Node {} rejected for pod {}: resource_score=0 (insufficient resources)",
-                    node.metadata.name, pod.metadata.name,
-                );
-                continue;
-            }
+        for eval in feasible {
+            let node = eval.node;
+            let node_affinity_score = eval.node_affinity_score;
+            let pod_affinity_score = eval.pod_affinity_score;
+            let pod_anti_affinity_penalty = eval.pod_anti_affinity_penalty;
+            let topology_penalty = eval.topology_penalty;
+            let resource_score = eval.resource_score;
 
             // Priority score (resolve from PriorityClass if needed)
             let priority_score = self.get_pod_priority_sync(pod, priority_classes);
@@ -1518,9 +1559,17 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         // [sig-scheduling] SchedulerPreemption passed or failed by luck (#1130).
         // Upstream: pickOneNodeForPreemption
         // (pkg/scheduler/framework/preemption/preemption.go:651-730).
-        let mut candidates: Vec<crate::advanced::PreemptionCandidate> = Vec::new();
-
-        // Only consider nodes that pass basic scheduling constraints (except resources)
+        // `potentialNodes` (preemption.go:343-365 findCandidates): nodes whose
+        // failed predicates preemption may fix. Rusternetes filters them here
+        // (everything except resource fit).
+        let profile = self.profile_for(pod).ok();
+        let added_required = profile
+            .and_then(|p| p.added_affinity.as_ref())
+            .and_then(|a| {
+                a.required_during_scheduling_ignored_during_execution
+                    .as_ref()
+            });
+        let mut potential_nodes: Vec<&Node> = Vec::new();
         for node in nodes {
             // Skip unschedulable nodes
             if node
@@ -1544,12 +1593,46 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 }
             }
 
+            // NodeAffinity's scheduler-enforced addedAffinity
+            // (node_affinity.go:221-223 Filter).
+            if let Some(required) = added_required {
+                if !rusternetes_common::affinity::matches_node_selector(node, required) {
+                    continue;
+                }
+            }
+
             // Check node affinity (hard requirements only)
             let (affinity_ok, _) = check_node_affinity(node, pod);
             if !affinity_ok {
                 continue;
             }
+            potential_nodes.push(node);
+        }
 
+        // `GetOffsetAndNumCandidates` (default_preemption.go:191-193) then
+        // `DryRunPreemption` (preemption.go:768-821): dry-run the potential
+        // nodes from a random offset and stop once `candidatesNum` candidates
+        // are found (at least one without PDB violations).
+        let num_potential = potential_nodes.len();
+        let candidates_num = profile.map_or(100, |p| {
+            calculate_num_candidates(
+                num_potential as i32,
+                p.min_candidate_nodes_percentage,
+                p.min_candidate_nodes_absolute,
+            )
+        }) as usize;
+        let offset = if num_potential == 0 {
+            0
+        } else {
+            match self.preemption_offset_override.load(Ordering::Relaxed) {
+                usize::MAX => random_offset(num_potential),
+                fixed => fixed % num_potential,
+            }
+        };
+        let mut non_violating: Vec<crate::advanced::PreemptionCandidate> = Vec::new();
+        let mut violating: Vec<crate::advanced::PreemptionCandidate> = Vec::new();
+        for i in 0..num_potential {
+            let node = potential_nodes[(offset + i) % num_potential];
             // PDB-aware selection: check_preemption_with_pdbs sorts
             // budget-protected pods last and reprieves them where the
             // preemptor still fits without them, which is upstream's
@@ -1565,17 +1648,31 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 priority_classes,
             );
             if can_preempt && !pods_to_evict.is_empty() {
-                candidates.push(crate::advanced::PreemptionCandidate {
-                    num_pdb_violations: crate::advanced::count_pdb_violating_victims(
-                        &pods_to_evict,
-                        all_pods,
-                        pdbs,
-                    ),
+                let num_pdb_violations =
+                    crate::advanced::count_pdb_violating_victims(&pods_to_evict, all_pods, pdbs);
+                let c = crate::advanced::PreemptionCandidate {
+                    num_pdb_violations,
                     node_name: node.metadata.name.clone(),
                     victims: pods_to_evict,
-                });
+                };
+                // candidateList.add: each list holds at most `candidatesNum`.
+                let list = if num_pdb_violations == 0 {
+                    &mut non_violating
+                } else {
+                    &mut violating
+                };
+                if list.len() < candidates_num {
+                    list.push(c);
+                }
+                if !non_violating.is_empty()
+                    && non_violating.len() + violating.len() >= candidates_num
+                {
+                    break;
+                }
             }
         }
+        let mut candidates = non_violating;
+        candidates.extend(violating);
 
         let chosen = crate::advanced::pick_one_node_for_preemption(&candidates)?;
         candidates
@@ -2031,6 +2128,77 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
 /// Split a `/registry/pods/{ns}/{name}` storage key into `(ns, name)`. Tolerates
 /// a missing namespace segment (defaults to `default`). The scheduler builds
 /// these keys via `build_key("pods", Some(ns), name)`, so the format is stable.
+/// `errReasonEnforced` (node_affinity.go:66-67).
+const ERR_REASON_ENFORCED_NODE_AFFINITY: &str =
+    "node(s) didn't match scheduler-enforced node affinity";
+
+/// `minFeasibleNodesToFind` (schedule_one.go:52-56): below this many nodes all
+/// of them are examined.
+const MIN_FEASIBLE_NODES_TO_FIND: i32 = 100;
+/// `minFeasibleNodesPercentageToFind` (schedule_one.go:57-61).
+const MIN_FEASIBLE_NODES_PERCENTAGE_TO_FIND: i32 = 5;
+
+/// `Scheduler.numFeasibleNodesToFind` (schedule_one.go:710-738): the number of
+/// feasible nodes after which the filter search stops. `profile_percentage` is
+/// the profile's `percentageOfNodesToScore`, which overrides the global
+/// `global_percentage` when set.
+fn num_feasible_nodes_to_find(
+    profile_percentage: Option<i32>,
+    global_percentage: i32,
+    num_all_nodes: i32,
+) -> i32 {
+    if num_all_nodes < MIN_FEASIBLE_NODES_TO_FIND {
+        return num_all_nodes;
+    }
+    // Use the profile percentageOfNodesToScore if it's set; otherwise the
+    // global one.
+    let mut percentage = profile_percentage.unwrap_or(global_percentage);
+    if percentage == 0 {
+        percentage = 50 - num_all_nodes / 125;
+        if percentage < MIN_FEASIBLE_NODES_PERCENTAGE_TO_FIND {
+            percentage = MIN_FEASIBLE_NODES_PERCENTAGE_TO_FIND;
+        }
+    }
+    let num_nodes = num_all_nodes * percentage / 100;
+    if num_nodes < MIN_FEASIBLE_NODES_TO_FIND {
+        return MIN_FEASIBLE_NODES_TO_FIND;
+    }
+    num_nodes
+}
+
+/// `calculateNumCandidates` (default_preemption.go:170-183): how many
+/// preemption candidates the dry run must find, from
+/// `minCandidateNodesPercentage` / `minCandidateNodesAbsolute`; never more than
+/// `num_nodes`.
+fn calculate_num_candidates(num_nodes: i32, min_percentage: i32, min_absolute: i32) -> i32 {
+    let mut n = num_nodes * min_percentage / 100;
+    if n < min_absolute {
+        n = min_absolute;
+    }
+    if n > num_nodes {
+        n = num_nodes;
+    }
+    n
+}
+
+/// `getOffsetRand` (default_preemption.go:185-189): a random offset in
+/// `0..num_nodes` (`rand.Int31n`).
+fn random_offset(num_nodes: usize) -> usize {
+    use std::hash::BuildHasher;
+    (std::collections::hash_map::RandomState::new().hash_one(0u8) as usize) % num_nodes
+}
+
+/// A node that passed every filter, with the per-plugin score inputs computed
+/// while filtering.
+struct NodeEval<'a> {
+    node: &'a Node,
+    node_affinity_score: i32,
+    pod_affinity_score: i32,
+    pod_anti_affinity_penalty: i32,
+    topology_penalty: i32,
+    resource_score: i32,
+}
+
 /// Default `Score` plugin weights (default_plugins.go:35-48) the compiled-in
 /// score blend is calibrated against.
 fn default_score_weight(plugin: &str) -> i64 {
@@ -2834,6 +3002,128 @@ mod tests {
             scheduler.profile_for(&pod).unwrap_err(),
             "profile not found for scheduler name \"nope\""
         );
+    }
+
+    // schedule_one_test.go TestNumFeasibleNodesToFind.
+    #[test]
+    fn test_num_feasible_nodes_to_find() {
+        // (global, profile, numAllNodes) -> want
+        for (global, profile, all, want) in [
+            (0, None, 10, 10),
+            (0, Some(40), 10, 10),
+            (0, None, 1000, 420),
+            (0, Some(40), 1000, 400),
+            (100, Some(40), 1000, 400),
+            (40, None, 1000, 400),
+            (0, None, 6000, 300),
+            (0, Some(40), 6000, 2400),
+        ] {
+            assert_eq!(
+                num_feasible_nodes_to_find(profile, global, all),
+                want,
+                "global={global} profile={profile:?} nodes={all}"
+            );
+        }
+    }
+
+    /// schedule_one_test.go TestFairEvaluationForNodes: with 500 nodes and
+    /// `percentageOfNodesToScore: 30` every cycle finds 150 feasible nodes and
+    /// `nextStartNodeIndex` advances by exactly that, wrapping around.
+    #[tokio::test]
+    async fn test_fair_evaluation_for_nodes() {
+        let num_all_nodes = 500usize;
+        let mut profiles = crate::profile::Map::new_map(vec![crate::profile::Profile::named(
+            DEFAULT_SCHEDULER_NAME,
+        )])
+        .unwrap();
+        profiles.percentage_of_nodes_to_score = 30;
+        let scheduler = Scheduler::new_with_profiles(Arc::new(MemoryStorage::new()), 1, profiles);
+        let nodes: Vec<Node> = (0..num_all_nodes)
+            .map(|i| make_node(&format!("n-{i:03}")))
+            .collect();
+        let pod = make_pending_pod("p", "default");
+        let nodes_to_find = num_feasible_nodes_to_find(None, 30, num_all_nodes as i32) as usize;
+        assert_eq!(nodes_to_find, 150);
+        for i in 0..2 * (num_all_nodes / nodes_to_find + 1) {
+            let mut diag = Diagnosis::default();
+            let picked = scheduler
+                .select_node_inner(&pod, &nodes, &[], &HashMap::new(), &mut diag)
+                .await;
+            assert!(picked.is_some());
+            assert_eq!(
+                scheduler.next_start_node_index.load(Ordering::Relaxed),
+                (i + 1) * nodes_to_find % num_all_nodes,
+                "cycle {i}"
+            );
+        }
+    }
+
+    fn running_pod(name: &str, node: &str, cpu: &str, priority: i32) -> Pod {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": name, "namespace": "default", "uid": format!("{name}-uid")},
+            "spec": {
+                "nodeName": node,
+                "priority": priority,
+                "containers": [{
+                    "name": "c", "image": "busybox",
+                    "resources": {"requests": {"cpu": cpu}}
+                }]
+            },
+            "status": {"phase": "Running"}
+        }))
+        .unwrap()
+    }
+
+    /// default_preemption_test.go TestCalculateNumCandidates /
+    /// TestDryRunPreemption shape: with `minCandidateNodesPercentage: 0` and
+    /// `minCandidateNodesAbsolute: 1` the dry run stops at the first candidate
+    /// found from the offset (here n1, two victims); the default args
+    /// (10% / 100) examine every node and pick the node with the fewest victims.
+    #[tokio::test]
+    async fn test_preemption_stops_after_min_candidate_nodes() {
+        assert_eq!(calculate_num_candidates(5, 10, 100), 5);
+        assert_eq!(calculate_num_candidates(1000, 10, 100), 100);
+        assert_eq!(calculate_num_candidates(1000, 50, 100), 500);
+        assert_eq!(calculate_num_candidates(1000, 0, 1), 1);
+
+        let nodes = vec![make_node("n1"), make_node("n2"), make_node("n3")];
+        let all_pods = vec![
+            running_pod("a", "n1", "2", 0),
+            running_pod("b", "n1", "2", 0),
+            running_pod("c", "n2", "4", 0),
+            running_pod("d", "n3", "4", 0),
+        ];
+        let mut preemptor = make_pending_pod("hi", "default");
+        {
+            let spec = preemptor.spec.as_mut().unwrap();
+            spec.priority = Some(1000);
+            spec.containers[0].resources = Some(rusternetes_common::types::ResourceRequirements {
+                requests: Some(HashMap::from([("cpu".to_string(), "4".to_string())])),
+                limits: None,
+                claims: None,
+            });
+        }
+        let run = |doc: &'static str| {
+            let nodes = nodes.clone();
+            let all_pods = all_pods.clone();
+            let preemptor = preemptor.clone();
+            async move {
+                let profiles = crate::scheduler_config::profiles_from_config(doc, false).unwrap();
+                let scheduler =
+                    Scheduler::new_with_profiles(Arc::new(MemoryStorage::new()), 1, profiles);
+                scheduler
+                    .preemption_offset_override
+                    .store(0, Ordering::Relaxed);
+                scheduler
+                    .try_preempt(&preemptor, &nodes, &all_pods, &HashMap::new(), &[])
+                    .await
+                    .map(|(node, victims)| (node, victims.len()))
+            }
+        };
+        assert_eq!(run("").await, Some(("n2".to_string(), 1)));
+        let one_candidate = "profiles:\n- schedulerName: default-scheduler\n  pluginConfig:\n  - name: DefaultPreemption\n    args:\n      minCandidateNodesPercentage: 0\n      minCandidateNodesAbsolute: 1\n";
+        assert_eq!(run(one_candidate).await, Some(("n1".to_string(), 2)));
     }
 
     /// The compiled-in score blend scales each component by the profile's

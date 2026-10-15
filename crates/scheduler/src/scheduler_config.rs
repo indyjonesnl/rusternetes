@@ -807,7 +807,8 @@ pub fn volume_binding_args_from_config(
     doc: &str,
     storage_capacity_scoring: bool,
 ) -> Result<VolumeBindingArgs, String> {
-    let (_, args) = resolve_profiles(doc, storage_capacity_scoring)?
+    let (resolved, _) = resolve_profiles(doc, storage_capacity_scoring)?;
+    let (_, args) = resolved
         .into_iter()
         .next()
         .expect("resolve_profiles always yields at least one profile");
@@ -821,17 +822,21 @@ pub fn profiles_from_config(
     doc: &str,
     storage_capacity_scoring: bool,
 ) -> Result<crate::profile::Map, String> {
-    let resolved = resolve_profiles(doc, storage_capacity_scoring)?;
-    crate::profile::Map::new_map(resolved.into_iter().map(|(p, _)| p).collect())
+    let (resolved, global_percentage) = resolve_profiles(doc, storage_capacity_scoring)?;
+    let mut m = crate::profile::Map::new_map(resolved.into_iter().map(|(p, _)| p).collect())?;
+    m.percentage_of_nodes_to_score = global_percentage;
+    Ok(m)
 }
 
 /// Default + validate every profile (an empty list yields the one default
 /// profile, v1/defaults.go:111-113), returning each with its resolved
-/// `VolumeBindingArgs`.
+/// `VolumeBindingArgs`, plus the global `percentageOfNodesToScore`
+/// (v1/defaults.go:127-129 defaults a nil value to
+/// `DefaultPercentageOfNodesToScore` = 0).
 fn resolve_profiles(
     doc: &str,
     storage_capacity_scoring: bool,
-) -> Result<Vec<(crate::profile::Profile, VolumeBindingArgs)>, String> {
+) -> Result<(Vec<(crate::profile::Profile, VolumeBindingArgs)>, i32), String> {
     let mut cfg: KubeSchedulerConfiguration =
         serde_yaml::from_str(doc).map_err(|e| format!("invalid scheduler config: {e}"))?;
     let (mut errs, init_errs) = validate_profiles(&cfg)?;
@@ -872,6 +877,30 @@ fn resolve_profiles(
         let mut p = crate::profile::Profile::named(&name).with_volume_binding_args(&args);
         p.plugins = Some(plugins);
         p.plugin_config_names = plugin_config_names;
+        p.percentage_of_nodes_to_score = profile.percentage_of_nodes_to_score;
+        // Plugin args consumed at runtime (`New*` constructors): the
+        // validated, defaulted args of the profile's pluginConfig entries.
+        for (i, pc) in profile.plugin_config.iter().enumerate() {
+            let args_path = Path::new("profiles")
+                .index(idx)
+                .child("pluginConfig")
+                .index(i)
+                .child("args");
+            match pc.name.as_str() {
+                "NodeAffinity" => {
+                    let a: NodeAffinityArgs = decode_args(pc, &args_path)?;
+                    p.added_affinity = a.added_affinity;
+                }
+                "DefaultPreemption" => {
+                    let mut a: DefaultPreemptionArgs = decode_args(pc, &args_path)?;
+                    a.set_defaults();
+                    p.min_candidate_nodes_percentage =
+                        a.min_candidate_nodes_percentage.unwrap_or(10);
+                    p.min_candidate_nodes_absolute = a.min_candidate_nodes_absolute.unwrap_or(100);
+                }
+                _ => {}
+            }
+        }
         // The queue sort plugin of the resolved framework; `Map::new_map`
         // reports a framework that fails to build.
         let queue_sort = crate::framework_runtime::new_framework(
@@ -880,6 +909,7 @@ fn resolve_profiles(
                 scheduler_name: &name,
                 plugins: p.plugins.as_ref(),
                 plugin_config_names: &p.plugin_config_names,
+                percentage_of_nodes_to_score: p.percentage_of_nodes_to_score,
             },
         )
         .ok()
@@ -902,7 +932,7 @@ fn resolve_profiles(
         errs = init_errs;
     }
     if errs.is_empty() {
-        Ok(resolved)
+        Ok((resolved, cfg.percentage_of_nodes_to_score.unwrap_or(0)))
     } else {
         Err(errs
             .iter()
