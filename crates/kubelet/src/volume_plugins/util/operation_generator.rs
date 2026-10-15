@@ -20,13 +20,14 @@ use crate::volume_plugins::plugin::{
 };
 use crate::volume_plugins::registry::VolumePluginMgr;
 use crate::volume_plugins::util::fs_group_from;
+use crate::volume_plugins::util::hostutil::HostUtils;
 use crate::volume_plugins::util::node_expander::{
     pvc_object_reference, record_event, NodeExpander, NodeResizeOperationOpts,
 };
-use crate::volume_plugins::util::operation_executor::VolumeToMount;
+use crate::volume_plugins::util::operation_executor::{AttachedVolume, VolumeToMount};
 use crate::volume_plugins::util::resize_util::{self, RESOURCE_STORAGE};
 use crate::volume_plugins::util::types::{
-    is_failed_precondition_error, is_operation_not_supported_error,
+    is_failed_precondition_error, is_operation_not_supported_error, OperationContext,
 };
 use anyhow::{anyhow, Error};
 use rusternetes_common::quantity::{Format, Quantity};
@@ -537,6 +538,32 @@ pub async fn mount_volume_with_attributes(
         )?)
         .await?;
     Ok((mounter.get_path(), mounter.get_attributes()))
+}
+
+/// Port of the `GeneratedOperations` `GenerateUnmountDeviceFunc` returns
+/// (`operation_generator.go:807-905`).
+pub struct GeneratedUnmountDevice<'a> {
+    /// `OperationName`.
+    pub operation_name: &'static str,
+    _lifetime: std::marker::PhantomData<&'a ()>,
+}
+
+impl GeneratedUnmountDevice<'_> {
+    /// `OperationFunc`.
+    pub async fn run(&self) -> OperationContext {
+        OperationContext::default()
+    }
+}
+
+/// Port of `operationGenerator.GenerateUnmountDeviceFunc`
+/// (`operation_generator.go:807-905`).
+pub fn generate_unmount_device_func<'a>(
+    _mgr: &'a VolumePluginMgr,
+    _device_to_detach: &'a AttachedVolume,
+    _actual_state_of_world: &'a ActualStateOfWorld,
+    _hostutil: &'a dyn HostUtils,
+) -> anyhow::Result<GeneratedUnmountDevice<'a>> {
+    Err(anyhow!("not ported"))
 }
 
 /// The `volume.MounterArgs` the operation generator hands to `SetUp`

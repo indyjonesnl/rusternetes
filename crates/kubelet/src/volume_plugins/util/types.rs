@@ -127,6 +127,32 @@ pub fn is_operation_not_supported_error(err: &anyhow::Error) -> bool {
     )
 }
 
+/// Port of `types.OperationContext` (`pkg/volume/util/types/types.go:48-60`):
+/// what a generated operation's `OperationFunc` returns. `event_err` is the
+/// simple error for events, `detailed_err` the one for logs; both `None` is
+/// success.
+#[derive(Debug, Default)]
+pub struct OperationContext {
+    pub event_err: Option<anyhow::Error>,
+    pub detailed_err: Option<anyhow::Error>,
+    pub migrated: bool,
+}
+
+impl OperationContext {
+    /// `NewOperationContext` (`types.go:54-60`).
+    pub fn new(
+        event_err: Option<anyhow::Error>,
+        detailed_err: Option<anyhow::Error>,
+        migrated: bool,
+    ) -> Self {
+        Self {
+            event_err,
+            detailed_err,
+            migrated,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -247,12 +247,28 @@ pub trait DeviceMounter: Send + Sync {
     ) -> Result<()>;
 }
 
+/// Port of `volume.DeviceUnmounter` (`pkg/volume/volume.go:332-338`): unmounts
+/// a device from its global path. For CSI this is `NodeUnstageVolume`.
+///
+/// `async` where upstream is synchronous, for the same reason as
+/// [`Unmounter`]: the CSI implementation awaits a gRPC call.
+#[async_trait]
+pub trait DeviceUnmounter: Send + Sync {
+    /// `UnmountDevice` (`volume.go:337`): unmounts the global mount of the
+    /// disk. This should only be called once all bind mounts have been
+    /// unmounted.
+    async fn unmount_device(&self, device_mount_path: &str) -> Result<()>;
+}
+
 /// Port of `volume.DeviceMountableVolumePlugin` (`pkg/volume/plugins.go`):
-/// `NewDeviceMounter` (`CanDeviceMount` stays on [`VolumePlugin`], see
-/// [`VolumePlugin::can_device_mount`]).
+/// `NewDeviceMounter`, `NewDeviceUnmounter` (`CanDeviceMount` stays on
+/// [`VolumePlugin`], see [`VolumePlugin::can_device_mount`]).
 pub trait DeviceMountableVolumePlugin: VolumePlugin {
     /// `NewDeviceMounter`.
     fn new_device_mounter(&self) -> Result<Box<dyn DeviceMounter>>;
+
+    /// `NewDeviceUnmounter`.
+    fn new_device_unmounter(&self) -> Result<Box<dyn DeviceUnmounter>>;
 
     /// `GetDeviceMountRefs` (`plugins.go:243`).
     fn get_device_mount_refs(&self, device_mount_path: &str) -> Result<Vec<String>>;

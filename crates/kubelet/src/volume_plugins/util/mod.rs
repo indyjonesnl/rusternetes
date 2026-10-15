@@ -20,6 +20,8 @@ pub mod operation_generator;
 pub mod resize_util;
 pub mod selinux;
 pub mod types;
+#[cfg(test)]
+mod unmount_device_tests;
 pub mod volumepathhandler;
 
 use crate::volume_plugins::plugin::{Spec, VolumePlugin};

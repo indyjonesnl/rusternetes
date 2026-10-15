@@ -1,6 +1,6 @@
 use super::csi_client::{CsiDriverClient, CsiError};
 use crate::volume_plugins::plugin::{
-    DeviceMountableVolumePlugin, DeviceMounter, DeviceMounterArgs,
+    DeviceMountableVolumePlugin, DeviceMounter, DeviceMounterArgs, DeviceUnmounter,
 };
 use crate::volume_plugins::{
     Attributes, Mounter, ReconstructedVolume, Spec, Unmounter, VolumeHost, VolumePlugin,
@@ -785,6 +785,11 @@ impl DeviceMountableVolumePlugin for CsiPlugin {
             storage: self.host.get_kube_client().cloned(),
             plugin_dir: plugin_dir(self.host.get_volumes_base_path()),
         }))
+    }
+
+    /// `NewDeviceUnmounter` (`csi_plugin.go:717-719`).
+    fn new_device_unmounter(&self) -> Result<Box<dyn DeviceUnmounter>> {
+        Err(anyhow!("not ported"))
     }
 
     /// `GetDeviceMountRefs` (`csi_plugin.go:721-727`).
