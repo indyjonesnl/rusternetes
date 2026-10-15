@@ -57,8 +57,12 @@ async fn serve() -> Served {
             let _ = axum::serve(listener, router).await;
         }
     });
+    // `f.ClientSet`: one clientset, one limiter, `ClientQPS: 20,
+    // ClientBurst: 50` (test/e2e/framework/framework.go:182-183, :224-225).
     let client = Arc::new(
-        ApiClient::new(&format!("http://{address}"), true, None).expect("build api-server client"),
+        ApiClient::new(&format!("http://{address}"), true, None)
+            .expect("build api-server client")
+            .with_rate_limit(20.0, 50.0),
     );
     Served {
         api,
@@ -151,8 +155,19 @@ async fn wait_for_next_config_map_event(
 /// `produceConfigMapEvents` (:465-522): every `min_wait` pick create / update /
 /// delete at random (create when none exist) until `stop` fires. Upstream's
 /// `rand.Intn` becomes a fixed-seed xorshift so a failure reproduces.
+///
+/// Two pieces of upstream pacing are kept, because without them the producer
+/// can outrun the watch cache's replay ring on a loaded runner, and the next
+/// watch the spec opens then gets a 410:
+/// - Writes go through `f.ClientSet`, whose rate limiter is
+///   `ClientQPS: 20, ClientBurst: 50` (`test/e2e/framework/framework.go:182-183`,
+///   applied at :224-225). The 5ms ticker is the floor and the limiter is
+///   the real pace.
+/// - `time.NewTicker` drops ticks for a slow receiver instead of firing the
+///   missed ones back to back, which is `MissedTickBehavior::Skip`. tokio's
+///   default (`Burst`) would replay every missed tick at once after a stall.
 async fn produce_config_map_events(
-    api: TestApiServer,
+    client: Arc<ApiClient>,
     ns: String,
     mut stop: stop_signal::Receiver<bool>,
     min_wait: Duration,
@@ -167,7 +182,9 @@ async fn produce_config_map_events(
     let name = |i: usize| format!("cm-{i}");
     let collection = format!("/api/v1/namespaces/{ns}/configmaps");
     let mut existing: Vec<usize> = Vec::new();
-    let mut ticker = tokio::time::interval(min_wait);
+    // time.NewTicker: first tick after one interval, slow receivers drop ticks.
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + min_wait, min_wait);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut i = 0usize;
     let mut updates = 0usize;
     loop {
@@ -178,7 +195,7 @@ async fn produce_config_map_events(
         }
         match op {
             0 => {
-                let (s, b) = api
+                let _: Value = client
                     .post(
                         &collection,
                         &json!({
@@ -186,13 +203,8 @@ async fn produce_config_map_events(
                             "metadata": { "name": name(i) }
                         }),
                     )
-                    .await;
-                assert_eq!(
-                    s.as_u16(),
-                    201,
-                    "Failed to create configmap {}: {b}",
-                    name(i)
-                );
+                    .await
+                    .unwrap_or_else(|e| panic!("Failed to create configmap {}: {e}", name(i)));
                 existing.push(i);
                 i += 1;
             }
@@ -201,7 +213,7 @@ async fn produce_config_map_events(
                 let n = name(existing[idx]);
                 // An Update with no resourceVersion: ConfigMap allows an
                 // unconditional update (`AllowUnconditionalUpdate`).
-                let (s, b) = api
+                let _: Value = client
                     .put(
                         &format!("{collection}/{n}"),
                         &json!({
@@ -212,15 +224,18 @@ async fn produce_config_map_events(
                             }
                         }),
                     )
-                    .await;
-                assert_eq!(s.as_u16(), 200, "Failed to update configmap {n}: {b}");
+                    .await
+                    .unwrap_or_else(|e| panic!("Failed to update configmap {n}: {e}"));
                 updates += 1;
             }
             _ => {
                 let idx = rand(existing.len());
                 let n = name(existing[idx]);
-                let (s, b) = api.delete(&format!("{collection}/{n}")).await;
-                assert_eq!(s.as_u16(), 200, "Failed to delete configmap {n}: {b}");
+                let s = client
+                    .delete_with_options(&format!("{collection}/{n}"), &[], None)
+                    .await
+                    .unwrap_or_else(|e| panic!("Failed to delete configmap {n}: {e}"));
+                assert_eq!(s.as_u16(), 200, "Failed to delete configmap {n}: {s}");
                 existing.remove(idx);
             }
         }
@@ -259,7 +274,7 @@ async fn concurrent_watches_receive_events_in_same_order() {
     // "starting a background goroutine to produce watch events" (:345-352).
     let (stop_tx, stop_rx) = stop_signal::channel(false);
     let producer = tokio::spawn(produce_config_map_events(
-        served.api.clone(),
+        served.client.clone(),
         ns.to_string(),
         stop_rx,
         Duration::from_millis(5),
