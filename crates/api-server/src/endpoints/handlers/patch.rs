@@ -83,18 +83,7 @@ pub async fn patch_resource<T: Object>(
         )));
     }
 
-    let options = PatchOptions {
-        field_manager: params.get("fieldManager").cloned(),
-        force: params
-            .get("force")
-            .map(|v| rusternetes_common::query::k8s_query_bool(v)),
-        dry_run: dry_run_param(params),
-        field_validation: params.get("fieldValidation").cloned(),
-    };
-    let errs = validate_patch_options(&options, content_type);
-    if !errs.is_empty() {
-        return Err(Error::Invalid(errs));
-    }
+    let options = checked_patch_options(params, content_type)?;
     let dry_run = is_dry_run(options.dry_run.as_deref());
 
     // patchResource (patch.go:653-691): pick the mechanism. Apply may create.
@@ -263,11 +252,12 @@ impl<T: Object> Patcher<'_, T> {
         // there and the result goes back to the stored one (patch.go:323-338,
         // :449-462).
         let patched = match self.scope.patch_conversion {
-            None => apply_patch(&current_json, &patch, patch_type.clone()).map_err(patch_error)?,
+            None => apply_patch(&current_json, &patch, patch_type.clone())
+                .map_err(|e| patch_error(e, patch_type))?,
             Some(conversion) => {
                 let versioned = (conversion.to_request_version)(&current_json);
-                let patched =
-                    apply_patch(&versioned, &patch, patch_type.clone()).map_err(patch_error)?;
+                let patched = apply_patch(&versioned, &patch, patch_type.clone())
+                    .map_err(|e| patch_error(e, patch_type))?;
                 (conversion.from_request_version)(&current_json, patched)
             }
         };
@@ -275,13 +265,7 @@ impl<T: Object> Patcher<'_, T> {
 
         // Decode the result strictly or not, per fieldValidation. A strict
         // failure is `Invalid` on the `patch` field (patch.go:338-363).
-        let invalid_patch = |msg: String| {
-            Error::Invalid(vec![FieldError::invalid(
-                &Path::new("patch"),
-                patched_js.clone(),
-                msg,
-            )])
-        };
+        let invalid_patch = |msg: String| patch_invalid(patched_js.clone(), msg);
         let obj: T = serde_json::from_value(patched).map_err(|e| invalid_patch(e.to_string()))?;
         // `appliedStrictErrs`: the patch document's own errors, which precede
         // the patched object's (patch.go:338-363 `append(appliedStrictErrs,
@@ -431,20 +415,55 @@ impl<T: Object> TransformFunc<T> for Patcher<'_, T> {
     }
 }
 
-/// A failed patch application. RFC 6902 §4.2 mandates that the target of a
-/// `remove` (and friends) exists; upstream reports a missing one as
-/// `field.NotFound(<path>, "")`, so the 422 carries
-/// `causes[].reason = FieldValueNotFound` with the real field path.
-fn patch_error(e: crate::patch::PatchError) -> Error {
-    use rusternetes_common::validation::field::{BadValue, ErrorType};
-    match e {
-        crate::patch::PatchError::PathNotFound(field) => Error::Invalid(vec![FieldError {
-            error_type: ErrorType::NotFound,
-            field,
-            bad_value: BadValue::Omit,
-            detail: String::new(),
-            origin: String::new(),
-        }]),
-        other => Error::InvalidResource(other.to_string()),
+/// patch.go:116-128: decode the query into `PatchOptions`, then
+/// `ValidatePatchOptions`.
+pub(super) fn checked_patch_options(
+    params: &HashMap<String, String>,
+    content_type: &str,
+) -> Result<PatchOptions> {
+    let options = PatchOptions {
+        field_manager: params.get("fieldManager").cloned(),
+        force: params
+            .get("force")
+            .map(|v| rusternetes_common::query::k8s_query_bool(v)),
+        dry_run: dry_run_param(params),
+        field_validation: params.get("fieldValidation").cloned(),
+    };
+    let errs = validate_patch_options(&options, content_type);
+    if !errs.is_empty() {
+        return Err(Error::new_invalid("meta.k8s.io", "PatchOptions", "", errs));
+    }
+    Ok(options)
+}
+
+/// `errors.NewInvalid(schema.GroupKind{}, "", field.ErrorList{
+/// field.Invalid(field.NewPath("patch"), patchedObjJS, msg)})`
+/// (patch.go:345-347, 352-354, 361-363).
+pub(super) fn patch_invalid(patched_js: String, msg: String) -> Error {
+    Error::new_invalid(
+        "",
+        "",
+        "",
+        vec![FieldError::invalid(&Path::new("patch"), patched_js, msg)],
+    )
+}
+
+/// A failed patch application.
+///
+/// JSON Patch (`jsonPatcher.applyJSPatch`, patch.go:395-415):
+/// `jsonpatch.DecodePatch` failing is `errors.NewBadRequest(err.Error())`;
+/// every `patchObj.Apply` failure (a missing `remove`/`replace` target, a
+/// failed `test`, ...) is `errors.NewGenericServerResponse(
+/// http.StatusUnprocessableEntity, "", schema.GroupResource{}, "",
+/// err.Error(), 0, false)` — 422 / `Invalid` with the canned message and no
+/// `causes`, NOT a `field.NotFound`.
+fn patch_error(e: crate::patch::PatchError, patch_type: &PatchType) -> Error {
+    use crate::patch::PatchError;
+    match (patch_type, e) {
+        (PatchType::JsonPatch, PatchError::DecodeFailed(msg)) => Error::BadRequest(msg),
+        (PatchType::JsonPatch, other) => {
+            Error::generic_server_response(422, "", "", "", "", &other.to_string(), 0, false)
+        }
+        (_, other) => Error::InvalidResource(other.to_string()),
     }
 }

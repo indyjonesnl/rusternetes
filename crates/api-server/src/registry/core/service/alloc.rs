@@ -87,16 +87,15 @@ fn collect_service_node_ports(service: &Service) -> Vec<usize> {
 
 /// The `field.Invalid(spec.ports[i].nodePort)` wrapped by
 /// `apierrors.NewInvalid(api.Kind("Service"), ...)`.
-fn invalid_node_port(i: usize, value: usize, err: &PortError) -> Error {
+fn invalid_node_port(service: &Service, i: usize, value: usize, err: &PortError) -> Error {
     let path = field::Path::new("spec")
         .child("ports")
         .index(i)
         .child("nodePort");
-    Error::Invalid(vec![field::Error::invalid(
-        &path,
-        value as i64,
-        err.to_string(),
-    )])
+    invalid_service(
+        service,
+        vec![field::Error::invalid(&path, value as i64, err.to_string())],
+    )
 }
 
 fn set_node_port(service: &mut Service, i: usize, port: usize) {
@@ -146,7 +145,7 @@ async fn init_node_ports(service: &mut Service, op: &mut PortAllocationOperation
             if np != 0 {
                 op.allocate(np)
                     .await
-                    .map_err(|e| invalid_node_port(i, np, &e))?;
+                    .map_err(|e| invalid_node_port(service, i, np, &e))?;
                 set_node_port(service, i, np);
                 svc_port_to_node_port.insert(port, np);
             } else {
@@ -163,7 +162,7 @@ async fn init_node_ports(service: &mut Service, op: &mut PortAllocationOperation
             } else {
                 op.allocate(requested)
                     .await
-                    .map_err(|e| invalid_node_port(i, requested, &e))?;
+                    .map_err(|e| invalid_node_port(service, i, requested, &e))?;
             }
         }
     }
@@ -248,7 +247,7 @@ async fn update_node_ports(
             if !old_numbers.contains(&np) && !port_allocated.contains(&np) {
                 op.allocate(np)
                     .await
-                    .map_err(|e| invalid_node_port(i, np, &e))?;
+                    .map_err(|e| invalid_node_port(service, i, np, &e))?;
                 port_allocated.insert(np);
             }
         } else {
@@ -428,8 +427,10 @@ fn policy_value(svc: &Service) -> serde_json::Value {
     serde_json::to_value(&svc.spec.ip_family_policy).unwrap_or_default()
 }
 
-fn invalid_service(errs: field::ErrorList) -> Error {
-    Error::Invalid(errs)
+/// `apierrors.NewInvalid(api.Kind("Service"), service.Name, el)`
+/// (alloc.go:156, 229, 281, 420, 444, 536, 561, 824).
+fn invalid_service(service: &Service, errs: field::ErrorList) -> Error {
+    Error::new_invalid("", "Service", &service.metadata.name, errs)
 }
 
 /// `initIPFamilyFields` (alloc.go:104-303): default `ipFamilyPolicy` and
@@ -462,7 +463,7 @@ pub fn init_ip_family_fields(
 
     let el = validate_service_cluster_ips_related_fields(service, old);
     if !el.is_empty() {
-        return Err(invalid_service(el));
+        return Err(invalid_service(service, el));
     }
 
     let policy_path = field::Path::new("spec").child("ipFamilyPolicy");
@@ -547,7 +548,7 @@ pub fn init_ip_family_fields(
     }
 
     if !el.is_empty() {
-        return Err(invalid_service(el));
+        return Err(invalid_service(service, el));
     }
 
     // Headless + selectorless may carry families the cluster does not have.
@@ -582,7 +583,7 @@ pub fn init_ip_family_fields(
         }
     }
     if !el.is_empty() {
-        return Err(invalid_service(el));
+        return Err(invalid_service(service, el));
     }
 
     let fams = service.spec.ip_families.get_or_insert_with(Vec::new);
@@ -733,11 +734,10 @@ fn cluster_ips(service: &Service) -> Vec<String> {
 
 fn invalid_cluster_ips(service: &Service, detail: String) -> Error {
     let path = field::Path::new("spec").child("clusterIPs");
-    Error::Invalid(vec![field::Error::invalid(
-        &path,
-        cluster_ips(service),
-        detail,
-    )])
+    invalid_service(
+        service,
+        vec![field::Error::invalid(&path, cluster_ips(service), detail)],
+    )
 }
 
 /// `allocIPs` (alloc.go:395-451): claim a named address, or allocate the
@@ -1141,16 +1141,23 @@ mod tests {
         let spec = json!({"type": "NodePort", "ports": [{"port": 80, "protocol": "TCP", "nodePort": 30100}]});
         create(&pa, &mut svc(spec.clone())).await.unwrap();
         let err = create(&pa, &mut svc(spec)).await.unwrap_err();
-        let Error::Invalid(errs) = err else {
-            panic!("want Invalid, got {err:?}")
+        // `NewInvalid(api.Kind("Service"), service.Name, el)` (alloc.go:536).
+        let Error::Status(st) = err else {
+            panic!("want a NewInvalid Status, got {err:?}")
         };
-        assert_eq!(errs[0].field, "spec.ports[0].nodePort");
+        let d = st.details.as_ref().unwrap();
+        assert_eq!(d.kind.as_deref(), Some("Service"));
+        assert_eq!(d.name.as_deref(), Some("foo"));
+        let c = &d.causes.as_ref().unwrap()[0];
+        assert_eq!(c.field.as_deref(), Some("spec.ports[0].nodePort"));
+        let msg = st.message.as_deref().unwrap();
         assert!(
-            errs[0]
-                .detail
-                .contains("provided port is already allocated"),
-            "{errs:?}"
+            msg.starts_with(
+                "Service \"foo\" is invalid: spec.ports[0].nodePort: Invalid value: 30100: "
+            ),
+            "{msg}"
         );
+        assert!(msg.contains("provided port is already allocated"), "{msg}");
     }
 
     #[tokio::test]
@@ -1254,7 +1261,10 @@ mod tests {
             .await
             .err()
             .expect("the port is taken");
-        assert!(matches!(err, Error::Invalid(_)), "{err:?}");
+        assert!(
+            matches!(&err, Error::Status(st) if st.message.as_deref().is_some_and(|m| m.starts_with("Service \"foo\" is invalid: "))),
+            "{err:?}"
+        );
         assert_eq!(pa.allocated().await, vec![30300, 30301]);
     }
 
@@ -1315,5 +1325,32 @@ mod tests {
         assert!(txn_alloc_cluster_ips(&pa, &mut s, false).await.is_err());
         let v4 = pa.get(&IPFamily::IPv4).unwrap();
         assert_eq!(v4.used().await, 1, "the partial allocation is not released");
+    }
+
+    /// `apierrors.NewInvalid(api.Kind("Service"), service.Name, el)`
+    /// (alloc.go:156, 229, 281, 420, 444, 536, 561, 824): every Invalid the
+    /// allocator returns names the Service.
+    #[test]
+    fn invalid_helpers_name_the_service() {
+        let el = vec![field::Error::required(&field::Path::new("spec"), "")];
+        let Error::Status(st) = invalid_service(&svc(json!({})), el) else {
+            panic!("want a NewInvalid Status")
+        };
+        assert_eq!(
+            st.message.as_deref(),
+            Some("Service \"foo\" is invalid: spec: Required value")
+        );
+        assert_eq!(st.details.unwrap().kind.as_deref(), Some("Service"));
+
+        let s = svc(json!({"clusterIP": "10.0.0.1"}));
+        let Error::Status(st) = invalid_cluster_ips(&s, "boom".into()) else {
+            panic!("want a NewInvalid Status")
+        };
+        assert_eq!(
+            st.message.as_deref(),
+            Some(
+                "Service \"foo\" is invalid: spec.clusterIPs: Invalid value: [\"10.0.0.1\"]: boom"
+            )
+        );
     }
 }

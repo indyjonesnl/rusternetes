@@ -61,6 +61,13 @@ pub enum PatchError {
     #[error("Invalid patch document: {0}")]
     InvalidPatch(String),
 
+    /// The JSON Patch document does not decode into operations —
+    /// `jsonpatch.DecodePatch` failing, which `applyJSPatch` returns as
+    /// `errors.NewBadRequest(err.Error())`
+    /// (apiserver/pkg/endpoints/handlers/patch.go:404-407).
+    #[error("Invalid patch document: {0}")]
+    DecodeFailed(String),
+
     #[error("Patch operation failed: {0}")]
     OperationFailed(String),
 
@@ -190,7 +197,7 @@ fn apply_merge_patch(original: &Value, patch: &Value) -> Result<Value, PatchErro
 /// Apply JSON Patch (RFC 6902)
 fn apply_json_patch(original: &Value, patch: &Value) -> Result<Value, PatchError> {
     let operations: Vec<JsonPatchOperation> = serde_json::from_value(patch.clone())
-        .map_err(|e| PatchError::InvalidPatch(e.to_string()))?;
+        .map_err(|e| PatchError::DecodeFailed(e.to_string()))?;
 
     let mut current = original.clone();
 

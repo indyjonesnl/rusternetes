@@ -74,20 +74,13 @@ pub async fn wait_until_resource_version<S: Storage + ?Sized>(
     storage: &S,
     resource_version: &str,
 ) -> Result<()> {
-    // `APIObjectVersioner.ParseResourceVersion`
-    // (storage/api_object_versioner.go:90-103).
-    let want: u64 = match resource_version {
-        "" | "0" => return Ok(()),
-        rv => rv.parse().map_err(|e: std::num::ParseIntError| {
-            Error::Invalid(vec![FieldError::invalid(
-                &Path::new("resourceVersion"),
-                rv,
-                format!(
-                    "strconv.ParseUint: parsing {rv:?}: {}",
-                    parse_uint_reason(&e)
-                ),
-            )])
-        })?,
+    // `Get` returns `ParseResourceVersion`'s `InvalidError` untouched
+    // (cacher/delegator.go:163-166): a plain error, so the endpoint renders it
+    // as a 500 with no reason (`Error::aggregate`).
+    let want = match parse_resource_version_str(resource_version) {
+        Ok(0) => return Ok(()),
+        Ok(want) => want,
+        Err(errs) => return Err(Error::aggregate(&errs)),
     };
     // `waitUntilFreshAndBlock` (storage/cacher/watch_cache.go:448-488): wait
     // on a condition that every processed event broadcasts, until
@@ -135,6 +128,32 @@ pub async fn wait_until_resource_version<S: Storage + ?Sized>(
 pub struct UpdateOptions {
     /// `dryRun=All`.
     pub dry_run: bool,
+}
+
+/// `APIObjectVersioner.ParseResourceVersion`
+/// (storage/api_object_versioner.go:90-103): `""` and `"0"` are 0; anything
+/// `strconv.ParseUint(rv, 10, 64)` rejects is
+/// `storage.NewInvalidError(field.ErrorList{field.Invalid(
+/// field.NewPath("resourceVersion"), rv, err.Error())})`. That is a plain
+/// error, NOT a `Status`: each caller decides what it becomes (only
+/// `InterpretWatchError`, storage/errors/storage.go:116-120, makes it a
+/// `NewInvalid`).
+pub fn parse_resource_version_str(rv: &str) -> std::result::Result<u64, Vec<FieldError>> {
+    if rv.is_empty() || rv == "0" {
+        return Ok(0);
+    }
+    // Go's ParseUint takes digits only; Rust's `u64::from_str` also accepts a
+    // leading `+`.
+    let reason = match rv.parse::<u64>() {
+        Ok(v) if !rv.starts_with('+') => return Ok(v),
+        Err(e) => parse_uint_reason(&e),
+        Ok(_) => "invalid syntax",
+    };
+    Err(vec![FieldError::invalid(
+        &Path::new("resourceVersion"),
+        rv,
+        format!("strconv.ParseUint: parsing {rv:?}: {reason}"),
+    )])
 }
 
 /// The reason `strconv.ParseUint` gives for a failed parse.
@@ -1391,11 +1410,19 @@ impl<T: Object, S: Storage> TryUpdate<T> for UpdateAttempt<'_, T, S> {
         if unconditional {
             obj.metadata_mut().resource_version = existing.metadata().resource_version.clone();
         } else if new_rv == 0 {
-            return Err(Abort::Api(Error::Invalid(vec![FieldError::invalid(
-                &Path::new("metadata").child("resourceVersion"),
-                0i64,
-                "must be specified for an update",
-            )])));
+            // `apierrors.NewInvalid(schema.GroupKind{Group:
+            // qualifiedResource.Group, Kind: qualifiedResource.Resource},
+            // name, fieldErrList)` (store.go:731-733).
+            return Err(Abort::Api(Error::new_invalid(
+                &self.store.qualified_resource.group,
+                &self.store.qualified_resource.resource,
+                self.name,
+                vec![FieldError::invalid(
+                    &Path::new("metadata").child("resourceVersion"),
+                    0i64,
+                    "must be specified for an update",
+                )],
+            )));
         } else if new_rv != parse_resource_version(existing.metadata())? {
             return Err(Abort::Api(
                 self.store.conflict(self.name, OPTIMISTIC_LOCK_ERROR_MSG),
@@ -1546,17 +1573,12 @@ fn is_dry_run(options: &DeleteOptions) -> bool {
 /// `APIObjectVersioner.ObjectResourceVersion` / `ParseResourceVersion`
 /// (storage/api_object_versioner.go:74-101): `""` and `"0"` are unset.
 fn parse_resource_version(meta: &ObjectMeta) -> Result<u64> {
+    // `Versioner().ObjectResourceVersion` (storage/api_object_versioner.go:74-84)
+    // returns `strconv.ParseUint`'s error as is — a plain error, so
+    // `Store.Update` (registry/generic/registry/store.go:642, :662) surfaces a
+    // 500 with no reason and that text as its message.
     let rv = meta.resource_version.as_deref().unwrap_or("");
-    if rv.is_empty() || rv == "0" {
-        return Ok(0);
-    }
-    rv.parse::<u64>().map_err(|e| {
-        Error::Invalid(vec![FieldError::invalid(
-            &Path::new("resourceVersion"),
-            rv.to_string(),
-            e.to_string(),
-        )])
-    })
+    parse_resource_version_str(rv).map_err(|errs| Error::unknown_error(errs[0].detail.clone()))
 }
 
 /// Whether two objects serialize identically — etcd3's `GuaranteedUpdate`

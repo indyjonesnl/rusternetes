@@ -130,9 +130,12 @@ impl ErrorType {
             ErrorType::Forbidden => "FieldValueForbidden",
             ErrorType::TooLong => "FieldValueTooLong",
             ErrorType::TooMany => "FieldValueTooMany",
-            // Upstream NewInvalid collapses Internal into FieldValueInvalid.
-            ErrorType::Internal => "FieldValueInvalid",
-            ErrorType::TypeInvalid => "FieldValueInvalid",
+            // `Cause.Type = CauseType(err.Type)` (errors.go:289), and
+            // `ErrorTypeInternal = "InternalError"` /
+            // `ErrorTypeTypeInvalid = "FieldValueTypeInvalid"`
+            // (util/validation/field/errors.go:169-171).
+            ErrorType::Internal => "InternalError",
+            ErrorType::TypeInvalid => "FieldValueTypeInvalid",
         }
     }
 }
@@ -302,7 +305,12 @@ impl Error {
             .iter()
             .map(|s| format!("\"{}\"", s.as_ref()))
             .collect();
-        let detail = format!("supported values: {}", quoted.join(", "));
+        // `NotSupported` (errors.go:235-245): no detail when no valid values.
+        let detail = if quoted.is_empty() {
+            String::new()
+        } else {
+            format!("supported values: {}", quoted.join(", "))
+        };
         Self {
             error_type: ErrorType::NotSupported,
             field: path.to_string(),

@@ -25,7 +25,6 @@ use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     dump::decode_request_body,
     resources::{Binding, Node, Pod},
-    validation::metav1::{validate_create_options, CreateOptions},
     List, Result,
 };
 use rusternetes_storage::{build_key, build_prefix, Storage};
@@ -407,15 +406,7 @@ pub async fn create_binding(
     )
     .await?;
 
-    let options = CreateOptions {
-        field_manager: params.get("fieldManager").cloned(),
-        dry_run: endpoints::dry_run_param(&params),
-        field_validation: params.get("fieldValidation").cloned(),
-    };
-    let errs = validate_create_options(&options);
-    if !errs.is_empty() {
-        return Err(rusternetes_common::Error::Invalid(errs));
-    }
+    let options = crate::endpoints::handlers::create::checked_create_options(&params)?;
     let dry_run = endpoints::is_dry_run(options.dry_run.as_deref());
 
     let mut binding: Binding = decode_request_body(&body)?;
@@ -491,15 +482,7 @@ pub async fn create_eviction(
     )
     .await?;
 
-    let options = CreateOptions {
-        field_manager: params.get("fieldManager").cloned(),
-        dry_run: endpoints::dry_run_param(&params),
-        field_validation: params.get("fieldValidation").cloned(),
-    };
-    let errs = validate_create_options(&options);
-    if !errs.is_empty() {
-        return Err(Error::Invalid(errs));
-    }
+    let options = crate::endpoints::handlers::create::checked_create_options(&params)?;
     let dry_run = endpoints::is_dry_run(options.dry_run.as_deref());
 
     // `EvictionREST.AcceptsGroupVersion` (eviction.go:87-95): both policy/v1

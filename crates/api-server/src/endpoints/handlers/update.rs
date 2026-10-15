@@ -22,6 +22,21 @@ use crate::registry::rest::{
 };
 use crate::state::ApiServerState;
 
+/// update.go:84-96: decode the query into `UpdateOptions`, then
+/// `ValidateUpdateOptions`.
+pub(super) fn checked_update_options(params: &HashMap<String, String>) -> Result<UpdateOptions> {
+    let options = UpdateOptions {
+        field_manager: params.get("fieldManager").cloned(),
+        dry_run: dry_run_param(params),
+        field_validation: params.get("fieldValidation").cloned(),
+    };
+    let errs = validate_update_options(&options);
+    if !errs.is_empty() {
+        return Err(Error::new_invalid("meta.k8s.io", "UpdateOptions", "", errs));
+    }
+    Ok(options)
+}
+
 /// PUT to a named object: replace it with the object in `body`.
 #[allow(clippy::too_many_arguments)]
 pub async fn update_resource<T: Object>(
@@ -44,15 +59,7 @@ pub async fn update_resource<T: Object>(
     )
     .await?;
 
-    let options = UpdateOptions {
-        field_manager: params.get("fieldManager").cloned(),
-        dry_run: dry_run_param(params),
-        field_validation: params.get("fieldValidation").cloned(),
-    };
-    let errs = validate_update_options(&options);
-    if !errs.is_empty() {
-        return Err(Error::Invalid(errs));
-    }
+    let options = checked_update_options(params)?;
     let dry_run = is_dry_run(options.dry_run.as_deref());
 
     let (mut obj, decode_warnings) = decode(scope, params, body)?;

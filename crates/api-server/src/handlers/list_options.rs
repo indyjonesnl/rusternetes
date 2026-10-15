@@ -143,6 +143,17 @@ pub async fn prepare_list<S: Storage + ?Sized>(
         .get("resourceVersion")
         .map(String::as_str)
         .unwrap_or("");
+    // `storage.ValidateListOptions` (storage/interfaces.go:366-369), run first
+    // by `CacheDelegator.GetList` (cacher/delegator.go:179-182): an
+    // unparseable version is `apierrors.NewBadRequest(fmt.Sprintf("invalid
+    // resource version: %v", err))`, `err` being the `InvalidError` whose text
+    // is the aggregate of its errors.
+    if let Err(errs) = crate::registry::generic::store::parse_resource_version_str(rv) {
+        return Err(Error::BadRequest(format!(
+            "invalid resource version: {}",
+            Error::aggregate_message(&errs)
+        )));
+    }
     crate::registry::generic::store::wait_until_resource_version(storage, rv).await
 }
 
@@ -429,12 +440,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_resource_version_is_invalid() {
+    async fn malformed_resource_version_is_a_bad_request() {
+        // `storage.ValidateListOptions` (storage/interfaces.go:366-369):
+        // `apierrors.NewBadRequest(fmt.Sprintf("invalid resource version: %v", err))`
+        // where `err` is the `InvalidError` whose text is the aggregate.
         let storage = MemoryStorage::new();
         let err = prepare_list(&storage, &q(&[("resourceVersion", "abc")]))
             .await
             .unwrap_err();
-        assert!(matches!(err, Error::Invalid(_)), "{err:?}");
+        match err {
+            Error::BadRequest(msg) => assert_eq!(
+                msg,
+                "invalid resource version: resourceVersion: Invalid value: \"abc\": strconv.ParseUint: parsing \"abc\": invalid syntax"
+            ),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
     }
 
     /// The wait is woken by the storage's writes, not by a timer (upstream's

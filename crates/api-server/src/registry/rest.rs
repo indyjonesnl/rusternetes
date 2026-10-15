@@ -629,7 +629,9 @@ pub fn before_delete<T: Object>(
 
     let errs = rusternetes_common::validation::metav1::validate_delete_options(options);
     if !errs.is_empty() {
-        return Err(Error::Invalid(errs));
+        // delete.go:81: `NewInvalid(GroupKind{metav1.GroupName,
+        // "DeleteOptions"}, "", errs)`.
+        return Err(Error::new_invalid("meta.k8s.io", "DeleteOptions", "", errs));
     }
 
     // Checking the preconditions here to fail early. They are enforced again
@@ -1200,6 +1202,38 @@ mod tests {
             err.to_string(),
             "Conflict: Operation cannot be fulfilled on configmaps \"a\": the UID in the precondition (stale) does not match the UID in record (real). The object might have been deleted and then recreated"
         );
+    }
+
+    /// delete.go:81: `NewInvalid(meta.k8s.io DeleteOptions, "", errs)`.
+    #[test]
+    fn before_delete_invalid_options_is_new_invalid() {
+        let mut obj = cm("a");
+        let mut opts = DeleteOptions {
+            dry_run: Some(vec!["Maybe".to_string()]),
+            ..zero_delete_options()
+        };
+        let err = before_delete(
+            &PlainDelete,
+            &gr(),
+            &RequestContext::new(Some("ns")),
+            &mut obj,
+            &mut opts,
+        )
+        .unwrap_err();
+        let Error::Status(st) = err else {
+            panic!("expected NewInvalid Status, got {err:?}");
+        };
+        assert!(
+            st.message
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("DeleteOptions.meta.k8s.io \"\" is invalid: dryRun: "),
+            "{:?}",
+            st.message
+        );
+        let d = st.details.unwrap();
+        assert_eq!(d.kind.as_deref(), Some("DeleteOptions"));
+        assert_eq!(d.group.as_deref(), Some("meta.k8s.io"));
     }
 
     #[test]

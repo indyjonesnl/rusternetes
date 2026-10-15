@@ -22,6 +22,21 @@ use crate::registry::rest::{
 };
 use crate::state::ApiServerState;
 
+/// create.go:100-113: `metainternalversionscheme.ParameterCodec.DecodeParameters`
+/// then `ValidateCreateOptions`.
+pub(crate) fn checked_create_options(params: &HashMap<String, String>) -> Result<CreateOptions> {
+    let options = CreateOptions {
+        field_manager: params.get("fieldManager").cloned(),
+        dry_run: dry_run_param(params),
+        field_validation: params.get("fieldValidation").cloned(),
+    };
+    let errs = validate_create_options(&options);
+    if !errs.is_empty() {
+        return Err(Error::new_invalid("meta.k8s.io", "CreateOptions", "", errs));
+    }
+    Ok(options)
+}
+
 /// POST to a collection: create the object in `body`.
 pub async fn create_resource<T: Object>(
     state: &ApiServerState,
@@ -42,15 +57,7 @@ pub async fn create_resource<T: Object>(
     )
     .await?;
 
-    let options = CreateOptions {
-        field_manager: params.get("fieldManager").cloned(),
-        dry_run: dry_run_param(params),
-        field_validation: params.get("fieldValidation").cloned(),
-    };
-    let errs = validate_create_options(&options);
-    if !errs.is_empty() {
-        return Err(Error::Invalid(errs));
-    }
+    let options = checked_create_options(params)?;
     let dry_run = is_dry_run(options.dry_run.as_deref());
 
     let (mut obj, decode_warnings) = decode(scope, params, body)?;
