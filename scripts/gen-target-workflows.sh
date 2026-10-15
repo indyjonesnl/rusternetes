@@ -73,10 +73,11 @@ on:
         required: false
         default: main
 
-# Per-target group so a newer run supersedes an older one for THIS target
+# Per-target, per-ref group so a newer run supersedes an older one for THIS
+# target on THIS ref,
 # without cancelling other targets' runs (independence: FR-003).
 concurrency:
-  group: conformance-$target
+  group: conformance-$target-\${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
