@@ -260,7 +260,7 @@ async fn main() -> Result<()> {
         "sqlite" => {
             info!("Using SQLite storage backend at: {}", args.data_dir);
             StorageConfig::Sqlite {
-                path: args.data_dir,
+                path: args.data_dir.clone(),
             }
         }
         _ => {

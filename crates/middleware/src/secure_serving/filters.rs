@@ -378,7 +378,7 @@ mod tests {
             attrs: &RequestAttributes,
         ) -> rusternetes_common::error::Result<Opinion> {
             Ok(match (self.0)(attrs)? {
-                Decision::Allow => Opinion::Allow,
+                Decision::Allow => Opinion::Allow(String::new()),
                 Decision::Deny(r) => Opinion::NoOpinion {
                     reason: r,
                     error: None,
