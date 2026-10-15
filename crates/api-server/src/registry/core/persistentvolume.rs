@@ -47,6 +47,9 @@ pub fn convert_to_internal(pv: &mut PersistentVolume) {
     if let Some(iscsi) = pv.spec.iscsi.as_mut() {
         iscsi.set_defaults();
     }
+
+    // SetObjectDefaults_PersistentVolume (zz_generated.defaults.go:137-181)
+    pv.spec.more_sources.apply_defaults();
 }
 
 /// `GetWarningsForPersistentVolume` (pkg/api/persistentvolume/util.go:40-110).

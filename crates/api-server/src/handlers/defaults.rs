@@ -107,6 +107,10 @@ fn apply_volume_default_source(vol: &mut rusternetes_common::resources::pod::Vol
 /// the per-source `SetDefaults_*VolumeSource` functions (pkg/apis/core/v1).
 fn apply_volume_default_mode(vol: &mut rusternetes_common::resources::pod::Volume) {
     const DEFAULT_MODE: i32 = 0o644;
+    // rbd/azureDisk/scaleIO arms (zz_generated.defaults.go:224-290)
+    rusternetes_common::resources::pv_sources::apply_legacy_volume_source_defaults(
+        &mut vol.legacy_sources,
+    );
     if let Some(s) = vol.secret.as_mut() {
         s.default_mode.get_or_insert(DEFAULT_MODE);
     }
