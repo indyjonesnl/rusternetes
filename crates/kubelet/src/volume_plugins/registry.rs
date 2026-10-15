@@ -101,11 +101,15 @@ impl VolumePluginMgr {
     }
 
     /// Port of `FindDeviceMountablePluginByName` (`pkg/volume/plugins.go:852-861`).
+    ///
+    /// `Ok(None)` is upstream's `(nil, nil)` — a plugin matched but is not a
+    /// `DeviceMountableVolumePlugin`; the type assertion is
+    /// [`VolumePlugin::as_device_mountable_plugin`].
     pub fn find_device_mountable_plugin_by_name(
         &self,
-        _name: &str,
+        name: &str,
     ) -> Result<Option<&dyn DeviceMountableVolumePlugin>, PluginLookupError> {
-        Err(PluginLookupError::NoPluginMatched)
+        Ok(self.find_plugin_by_name(name)?.as_device_mountable_plugin())
     }
 
     /// Port of `FindMapperPluginBySpec` (`pkg/volume/plugins.go:900-911`).

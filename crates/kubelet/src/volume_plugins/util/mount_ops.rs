@@ -287,7 +287,8 @@ impl Mounter {
     /// (`k8s.io/mount-utils/fake_mounter.go`): point `GetMountRefs` at a
     /// mountinfo file instead of `/proc/self/mountinfo`, so a test can state
     /// which mounts reference a path.
-    pub fn with_mountinfo_path(self, _path: &str) -> Self {
+    pub fn with_mountinfo_path(mut self, path: &str) -> Self {
+        self.mountinfo_path = Some(path.to_string());
         self
     }
 
@@ -634,7 +635,10 @@ impl Mounter {
     /// `GetMountRefs` (`mount_linux.go:513-529`): every mount reference to
     /// `pathname`, over `/proc/self/mountinfo`.
     pub fn get_mount_refs(&self, pathname: &str) -> io::Result<Vec<String>> {
-        super::mount_utils::get_mount_refs(pathname)
+        match &self.mountinfo_path {
+            Some(path) => super::mount_utils::get_mount_refs_at(pathname, path),
+            None => super::mount_utils::get_mount_refs(pathname),
+        }
     }
 
     /// `Unmount` (`mount_linux.go:400-408`).
