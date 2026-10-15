@@ -837,13 +837,38 @@ pub const APF_FILTER_HOOK: &str = "priority-and-fairness-filter";
 /// `storageObjectCountTrackerHookName` (server/config.go:963).
 pub const STORAGE_OBJECT_COUNT_TRACKER_HOOK: &str = "storage-object-count-tracker-hook";
 
-/// STUB (red commit): registers nothing yet.
+/// The three hooks `GenericAPIServer.New` adds when API Priority and Fairness
+/// is on (server/config.go:921-970), as `AddPostStartHook` + the shared
+/// `runPostStartHook` runner: each only starts background work and returns
+/// nil, so each finishes at once and can never be fatal.
+///
+/// - `priority-and-fairness-config-consumer` (:921-934): `go c.FlowControl.Run(stop)`,
+///   i.e. the config worker (`apf_controller.go:371-391` `Run`: config worker
+///   + `updateBorrowing` every `borrowingAdjustmentPeriod`);
+/// - `priority-and-fairness-filter` (:937-947):
+///   `StartPriorityAndFairnessWatermarkMaintenance` (priority-and-fairness.go:360);
+/// - `storage-object-count-tracker-hook` (:961-970):
+///   `go c.StorageObjectCountTracker.RunUntil(stop)`.
+///
+/// Upstream also registers `max-in-flight-filter` (:949-958) when APF is off;
+/// this server has no max-in-flight filter (tracked separately).
 pub fn register_post_start_hooks<S: Storage + 'static>(
-    _registry: &crate::post_start_hooks::PostStartHooks,
-    _engine: Arc<FlowControlEngine<S>>,
-    _tracker: Arc<ObjectCountTracker>,
-    _stop: tokio::sync::watch::Receiver<bool>,
+    registry: &crate::post_start_hooks::PostStartHooks,
+    engine: Arc<FlowControlEngine<S>>,
+    tracker: Arc<ObjectCountTracker>,
+    stop: tokio::sync::watch::Receiver<bool>,
 ) {
+    use crate::post_start_hooks::spawn_starting_hook_with;
+    spawn_starting_hook_with(registry, APF_CONFIG_CONSUMER_HOOK, move || {
+        spawn_config_reloader(engine.clone());
+        spawn_borrowing_updater(engine);
+    });
+    spawn_starting_hook_with(registry, APF_FILTER_HOOK, || {
+        apiserver_request_metrics::start_watermark_maintenance();
+    });
+    spawn_starting_hook_with(registry, STORAGE_OBJECT_COUNT_TRACKER_HOOK, move || {
+        tokio::spawn(async move { tracker.run_until(stop).await });
+    });
 }
 
 #[cfg(test)]
