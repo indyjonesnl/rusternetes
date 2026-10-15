@@ -133,17 +133,16 @@ pub fn is_device_mountable_volume(
 ///     volume.ConfigMap != nil
 /// ```
 ///
-/// **Deviation:** the `GitRepo` arm is dropped because
-/// `rusternetes_common::resources::Volume` has no `gitRepo` field — the source
-/// was removed from the API and this project never modelled it. Every other
-/// arm is verbatim; `StorageMediumDefault` is the empty string
-/// (`staging/src/k8s.io/api/core/v1/types.go`), which is what an absent
-/// `medium` decodes to.
+/// `volume.GitRepo` is `Volume.legacy_sources.git_repo` here (the deprecated
+/// source is carried losslessly in `LegacyVolumeSources`). `StorageMediumDefault`
+/// is the empty string (`staging/src/k8s.io/api/core/v1/types.go`), which is
+/// what an absent `medium` decodes to.
 pub fn is_local_ephemeral_volume(volume: &Volume) -> bool {
-    volume
-        .empty_dir
-        .as_ref()
-        .is_some_and(|ed| ed.medium.as_deref().unwrap_or("").is_empty())
+    volume.legacy_sources.git_repo.is_some()
+        || volume
+            .empty_dir
+            .as_ref()
+            .is_some_and(|ed| ed.medium.as_deref().unwrap_or("").is_empty())
         || volume.config_map.is_some()
 }
 
