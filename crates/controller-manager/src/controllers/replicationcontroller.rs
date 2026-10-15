@@ -2315,15 +2315,23 @@ pub(crate) mod tests {
         }
     }
 
-    /// When the namespace is terminating, the RC must give up quietly: no
-    /// ReplicaFailure, and no batch of creates the api-server can only reject.
+    /// `HasStatusCause(err, v1.NamespaceTerminatingCause)` -> `return nil`
+    /// inside the `slowStartBatch` callback (replica_set.go:632-637), so the
+    /// rejected create counts as a SUCCESS: no ReplicaFailure, no requeue, and
+    /// the batches carry on (:820-844 only stops on an error). A 20-replica RC
+    /// therefore attempts all 20 creates (batches 1, 2, 4, 8, 5) rather than
+    /// abandoning after the first rejection.
     ///
-    /// Before this, #1849's admission rejection had no consumer, so every
-    /// namespace teardown left the RC retrying creates that could never
-    /// succeed and stamping a condition upstream deliberately never sets
-    /// (pkg/controller/replicaset/replica_set.go:632-637).
+    /// Upstream also does NOT decrement the expectation for these creates
+    /// (`successfulCreations` includes them, so the skipped-pod loop at
+    /// :644-650 has nothing to undo); replicated, not fixed.
+    ///
+    /// There is no replication_controller_test.go upstream: the RC runs through
+    /// the ReplicaSet controller (pkg/controller/replication/conversion.go), so
+    /// the equivalents are `TestSlowStartBatch` (replica_set_test.go:1872) and
+    /// `TestSyncReplicaSetCreateFailures` (replica_set_test.go:281).
     #[tokio::test]
-    async fn rc_abandons_creates_when_namespace_is_terminating() {
+    async fn rc_continues_slow_start_past_namespace_terminating_rejection() {
         let inner = Arc::new(MemoryStorage::new());
         let storage = Arc::new(TerminatingNamespaceStorage::new(inner));
         let controller = ReplicationControllerController::new(storage.clone(), 5);
@@ -2339,15 +2347,12 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        // Must not surface as a reconcile error: the namespace going away is
-        // not this controller's problem to report.
+        // Must not surface as a reconcile error: upstream's callback returns nil.
         controller
-            .reconcile_all()
+            .reconcile_rc(&rc)
             .await
             .expect("a terminating namespace must not fail the reconcile");
 
-        // Upstream sets ReplicaFailure only for real create failures — a quota
-        // denial, say. Not for this.
         let observed: ReplicationController = storage
             .get("/registry/replicationcontrollers/default/simpletest-rc")
             .await
@@ -2362,13 +2367,260 @@ pub(crate) mod tests {
             "a terminating namespace must not raise ReplicaFailure"
         );
 
-        // And it must stop rather than push the remaining batches at an
-        // api-server that is rejecting all of them: the first slow-start batch
-        // is 1, so exactly one attempt for a 20-replica RC.
         assert_eq!(
             storage.attempts(),
-            1,
-            "must abandon after the first rejected batch, not attempt all 20"
+            20,
+            "slowStartBatch keeps going: the rejection is a nil return, not a failure"
+        );
+        assert_eq!(
+            controller
+                .expectations
+                .get_expectations("default/simpletest-rc"),
+            Some((20, 0)),
+            "upstream counts the rejected creates as successes, so none is decremented"
+        );
+    }
+
+    /// `syncReplicaSet` returns `manageReplicasErr` AFTER updating status
+    /// (replica_set.go:772-774) so the workqueue requeues the key with backoff:
+    /// the error must reach the worker, and ReplicaFailure must already be on
+    /// the object. Mirrors `TestSyncReplicaSetCreateFailures`
+    /// (replica_set_test.go:281).
+    #[tokio::test]
+    async fn rc_returns_create_failure_after_updating_status_for_requeue() {
+        let storage =
+            Arc::new(crate::controllers::quota_admission_double::QuotaAdmissionStorage::new());
+        let controller = ReplicationControllerController::new(storage.clone(), 5);
+        let mut selector = HashMap::new();
+        selector.insert("app".to_string(), "cf".to_string());
+        let rc = make_rc("cf", "default", 3, selector, None);
+        let rc_key = "/registry/replicationcontrollers/default/cf";
+        storage.create(rc_key, &rc).await.unwrap();
+        storage
+            .create(
+                "/registry/resourcequotas/default/pq",
+                &serde_json::json!({
+                    "apiVersion": "v1", "kind": "ResourceQuota",
+                    "metadata": {"name": "pq", "namespace": "default", "uid": "q"},
+                    "spec": {"hard": {"pods": "0"}}
+                }),
+            )
+            .await
+            .unwrap();
+
+        let result = controller.reconcile_rc(&rc).await;
+        assert!(result.is_err(), "a create failure must requeue the key");
+
+        let after: ReplicationController = storage.get(rc_key).await.unwrap();
+        let failure = after
+            .status
+            .and_then(|s| s.conditions)
+            .and_then(|cs| {
+                cs.into_iter()
+                    .find(|c| c.condition_type == "ReplicaFailure")
+            })
+            .expect("status is written before the error is returned");
+        assert_eq!(failure.reason.as_deref(), Some("FailedCreate"));
+    }
+
+    /// Fails `delete_gracefully` for every pod once armed, and counts the
+    /// attempts. Everything else delegates.
+    pub(crate) struct DeleteFailingStorage {
+        inner: Arc<MemoryStorage>,
+        fail_with_not_found: bool,
+        armed: std::sync::atomic::AtomicBool,
+        delete_attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl DeleteFailingStorage {
+        pub(crate) fn new(inner: Arc<MemoryStorage>, fail_with_not_found: bool) -> Self {
+            Self {
+                inner,
+                fail_with_not_found,
+                armed: std::sync::atomic::AtomicBool::new(false),
+                delete_attempts: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn arm(&self) {
+            self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn attempts(&self) -> usize {
+            self.delete_attempts
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl rusternetes_storage::Storage for DeleteFailingStorage {
+        async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.create(key, value).await
+        }
+
+        async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+        where
+            T: serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.get(key).await
+        }
+
+        async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.update(key, value).await
+        }
+
+        async fn update_raw(
+            &self,
+            key: &str,
+            value: &serde_json::Value,
+        ) -> rusternetes_common::Result<()> {
+            self.inner.update_raw(key, value).await
+        }
+
+        async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+            self.inner.delete(key).await
+        }
+
+        async fn delete_gracefully(&self, key: &str) -> rusternetes_common::Result<()> {
+            if key.starts_with("/registry/pods/")
+                && self.armed.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                self.delete_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Err(if self.fail_with_not_found {
+                    rusternetes_common::Error::NotFound(format!("pod {key} not found"))
+                } else {
+                    rusternetes_common::Error::Internal(format!("delete {key} failed"))
+                });
+            }
+            self.inner.delete_gracefully(key).await
+        }
+
+        async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.list(prefix).await
+        }
+
+        async fn watch(
+            &self,
+            prefix: &str,
+        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            self.inner.watch(prefix).await
+        }
+
+        async fn watch_from_revision(
+            &self,
+            prefix: &str,
+            revision: i64,
+        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            self.inner.watch_from_revision(prefix, revision).await
+        }
+
+        async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+            self.inner.current_revision().await
+        }
+
+        async fn is_revision_compacted(&self, revision: i64) -> rusternetes_common::Result<bool> {
+            self.inner.is_revision_compacted(revision).await
+        }
+    }
+
+    /// Scale an RC from 3 to 1 against `storage`, with every pod delete failing
+    /// once the storage is armed.
+    async fn scale_down_with_failing_deletes(
+        storage: &Arc<DeleteFailingStorage>,
+    ) -> (
+        ReplicationControllerController<DeleteFailingStorage>,
+        rusternetes_common::Result<()>,
+    ) {
+        let controller = ReplicationControllerController::new(storage.clone(), 5);
+        let mut selector = HashMap::new();
+        selector.insert("app".to_string(), "df".to_string());
+        let rc = make_rc("df", "default", 3, selector, None);
+        let rc_key = "/registry/replicationcontrollers/default/df";
+        storage.create(rc_key, &rc).await.unwrap();
+        controller.reconcile_rc(&rc).await.unwrap();
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        assert_eq!(pods.len(), 3);
+        // The creates are observed (pod watch Added events); simulate them.
+        for _ in 0..3 {
+            controller.expectations.creation_observed("default/df");
+        }
+
+        let mut rc: ReplicationController = storage.get(rc_key).await.unwrap();
+        rc.spec.replicas = Some(1);
+        storage.update(rc_key, &rc).await.unwrap();
+        storage.arm();
+        let result = controller.reconcile_rc(&rc).await;
+        (controller, result)
+    }
+
+    /// The deletes run concurrently, every one is attempted, and only the
+    /// first error is reported AFTER the status update
+    /// (replica_set.go:672-698, :772-774): no early return on the first failed
+    /// delete, ReplicaFailure=FailedDelete recorded, error returned to requeue.
+    #[tokio::test]
+    async fn rc_attempts_every_delete_and_updates_status_when_a_delete_fails() {
+        let storage = Arc::new(DeleteFailingStorage::new(
+            Arc::new(MemoryStorage::new()),
+            false,
+        ));
+        let (controller, result) = scale_down_with_failing_deletes(&storage).await;
+
+        assert!(result.is_err(), "a delete failure must requeue the key");
+        assert_eq!(storage.attempts(), 2, "every delete is attempted");
+
+        let after: ReplicationController = storage
+            .get("/registry/replicationcontrollers/default/df")
+            .await
+            .unwrap();
+        let status = after.status.expect("status is updated despite the error");
+        let failure = status
+            .conditions
+            .and_then(|cs| {
+                cs.into_iter()
+                    .find(|c| c.condition_type == "ReplicaFailure")
+            })
+            .expect("ReplicaFailure recorded for the failed delete");
+        assert_eq!(failure.reason.as_deref(), Some("FailedDelete"));
+
+        // The informer will not observe the failed deletions, so each lowers
+        // the expectation back (replica_set.go:679-686).
+        assert_eq!(
+            controller.expectations.get_expectations("default/df"),
+            Some((0, 0))
+        );
+    }
+
+    /// `!apierrors.IsNotFound(err)` guards the error report
+    /// (replica_set.go:682-685): a pod already gone is no failure.
+    #[tokio::test]
+    async fn rc_delete_not_found_is_not_a_failure() {
+        let storage = Arc::new(DeleteFailingStorage::new(
+            Arc::new(MemoryStorage::new()),
+            true,
+        ));
+        let (_controller, result) = scale_down_with_failing_deletes(&storage).await;
+
+        result.expect("NotFound on delete must not fail the sync");
+        let after: ReplicationController = storage
+            .get("/registry/replicationcontrollers/default/df")
+            .await
+            .unwrap();
+        assert!(
+            !after
+                .status
+                .and_then(|s| s.conditions)
+                .is_some_and(|cs| cs.iter().any(|c| c.condition_type == "ReplicaFailure")),
+            "NotFound is not a ReplicaFailure"
         );
     }
 
