@@ -412,23 +412,10 @@ pub(crate) fn operation_str(
 }
 
 /// `path.ValidatePathSegmentName(name, false)`
-/// (`apimachinery/pkg/api/validation/path/name.go:29-48`): a name may not be
+/// (`apimachinery/pkg/api/validation/path/name.go:61-67`): a name may not be
 /// `.`, `..`, or contain `/` or `%`.
 pub(crate) fn validate_path_segment_name(name: &str) -> Vec<String> {
-    let mut msgs = Vec::new();
-    if name == "." {
-        msgs.push("may not be '.'".to_string());
-    } else if name == ".." {
-        msgs.push("may not be '..'".to_string());
-    } else {
-        if name.contains('/') {
-            msgs.push("may not contain '/'".to_string());
-        }
-        if name.contains('%') {
-            msgs.push("may not contain '%'".to_string());
-        }
-    }
-    msgs
+    crate::validation::objectmeta::validate_path_segment_name(name, false)
 }
 
 /// `validateMatchConditions` + `validateMatchCondition`

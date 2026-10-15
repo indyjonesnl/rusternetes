@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use rusternetes_common::deletion::{DeleteOptions, Preconditions};
 use rusternetes_common::types::{ObjectMeta, StatusDetails};
 use rusternetes_common::validation::field::{Error as FieldError, Path};
-use rusternetes_common::validation::objectmeta::name_is_path_segment;
+use rusternetes_common::validation::objectmeta::is_valid_path_segment_name;
 use rusternetes_common::{Error, Result};
 use rusternetes_storage::{build_key, Storage};
 use tracing::debug;
@@ -496,7 +496,7 @@ impl<T: Object, S: Storage> Store<T, S> {
         if name.is_empty() {
             return Err(Error::BadRequest("Name parameter required.".to_string()));
         }
-        let msgs = name_is_path_segment(name, false);
+        let msgs = is_valid_path_segment_name(name);
         if !msgs.is_empty() {
             return Err(Error::BadRequest(format!(
                 "Name parameter invalid: {name:?}: {}",
