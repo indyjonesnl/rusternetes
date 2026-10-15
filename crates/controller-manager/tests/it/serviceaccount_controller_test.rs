@@ -700,3 +700,112 @@ async fn test_tokens_controller_deletes_tokens_of_deleted_sa() {
     assert!(get_secret(&storage, "ns1", "t-gone").await.is_none());
     assert!(get_secret(&storage, "ns1", "t-other").await.is_some());
 }
+
+// ---------------------------------------------------------------------------
+// removeSecretReference
+//
+// Ported from `TestTokenCreation` cases "deleted secret with serviceaccount
+// with reference" / "... without reference" / "deleted secret without
+// serviceaccount" (pkg/controller/serviceaccount/tokens_controller_test.go:409-
+// 432): when a token Secret is deleted its entry leaves the ServiceAccount's
+// `secrets` list (tokens_controller.go:295-304, 447-480). Driven through the
+// controller's watch loop, the only place the deleted Secret's SA name/uid is
+// known (`makeSecretQueueKey`).
+// ---------------------------------------------------------------------------
+
+fn sa_with_secret_refs(ns: &str, name: &str, refs: &[&str]) -> ServiceAccount {
+    let mut sa = service_account(ns, name);
+    sa.secrets = Some(
+        refs.iter()
+            .map(
+                |r| rusternetes_common::resources::service_account::ObjectReference {
+                    name: Some(r.to_string()),
+                    ..Default::default()
+                },
+            )
+            .collect(),
+    );
+    sa
+}
+
+async fn ref_names(storage: &Arc<MemoryStorage>, ns: &str, sa: &str) -> Vec<String> {
+    storage
+        .get::<ServiceAccount>(&build_key("serviceaccounts", Some(ns), sa))
+        .await
+        .unwrap()
+        .secrets
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|r| r.name)
+        .collect()
+}
+
+#[tokio::test]
+async fn test_tokens_controller_removes_reference_of_deleted_token() {
+    let storage = Arc::new(MemoryStorage::new());
+    let sa = sa_with_secret_refs("ns1", "sa1", &["tok", "keep"]);
+    storage
+        .create(&build_key("serviceaccounts", Some("ns1"), "sa1"), &sa)
+        .await
+        .unwrap();
+    let tok = token_secret(
+        "ns1",
+        "tok",
+        "sa1",
+        Some(&sa.metadata.uid),
+        SA_TOKEN_TYPE,
+        &[("token", "x")],
+    );
+    seed_secret(&storage, &tok).await;
+
+    let controller = Arc::new(ServiceAccountController::new(storage.clone()));
+    let handle = tokio::spawn(controller.run());
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    storage
+        .delete(&build_key("secrets", Some("ns1"), "tok"))
+        .await
+        .unwrap();
+
+    let mut refs = ref_names(&storage, "ns1", "sa1").await;
+    for _ in 0..50 {
+        if refs == ["keep"] {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        refs = ref_names(&storage, "ns1", "sa1").await;
+    }
+    handle.abort();
+    assert_eq!(refs, ["keep"], "deleted token's reference must be removed");
+}
+
+/// The Secret's `service-account.uid` annotation guards the removal
+/// (`getServiceAccount(.., saUID, ..)` is nil on a mismatch -> no update).
+#[tokio::test]
+async fn test_tokens_controller_keeps_reference_when_sa_uid_differs() {
+    let storage = Arc::new(MemoryStorage::new());
+    let sa = sa_with_secret_refs("ns1", "sa1", &["tok"]);
+    storage
+        .create(&build_key("serviceaccounts", Some("ns1"), "sa1"), &sa)
+        .await
+        .unwrap();
+    // The SA UID does not match, so the sync reaps the token; the SA must
+    // keep its (stale) reference because the deleted token is not its own.
+    let tok = token_secret(
+        "ns1",
+        "tok",
+        "sa1",
+        Some("an-older-sa-uid"),
+        SA_TOKEN_TYPE,
+        &[("token", "x")],
+    );
+    seed_secret(&storage, &tok).await;
+
+    let controller = Arc::new(ServiceAccountController::new(storage.clone()));
+    let handle = tokio::spawn(controller.run());
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    handle.abort();
+
+    assert!(get_secret(&storage, "ns1", "tok").await.is_none());
+    assert_eq!(ref_names(&storage, "ns1", "sa1").await, ["tok"]);
+}
