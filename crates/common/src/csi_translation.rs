@@ -7,12 +7,17 @@
 //! and AWS EBS; the other in-tree plugins of `translate.go:34-42` (Cinder,
 //! AzureDisk, AzureFile, vSphere, Portworx) are tracked follow-ups.
 //!
-//! NOT ported: `TranslateCSIPVToInTree` and `TranslateInTreeInlineVolumeToCSI` (tracked follow-ups).
+//! `TranslateCSIPVToInTree` (`translate.go:116-128`) is ported for the same
+//! two plugins, with `translateTopologyFromCSIToInTree` /
+//! `regionTopologyHandler` (`in_tree_volume.go:275-397`).
+//!
+//! NOT ported: `TranslateInTreeInlineVolumeToCSI` (tracked follow-up; the pod
+//! `volumes[]` legacy sources are still opaque JSON).
 
 use crate::resources::volume::{
-    CSIVolumeSource, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm,
-    PersistentVolumeAccessMode, StorageClass, TopologySelectorLabelRequirement,
-    TopologySelectorTerm, VolumeNodeAffinity,
+    AWSElasticBlockStoreVolumeSource, CSIVolumeSource, GCEPersistentDiskVolumeSource, NodeSelector,
+    NodeSelectorRequirement, NodeSelectorTerm, PersistentVolumeAccessMode, StorageClass,
+    TopologySelectorLabelRequirement, TopologySelectorTerm, VolumeNodeAffinity,
 };
 use crate::resources::PersistentVolume;
 use std::collections::{BTreeSet, HashMap};
@@ -48,6 +53,9 @@ trait InTreePlugin {
     /// `TranslateInTreeStorageClassToCSI` (`in_tree_volume.go:34-36`): input is
     /// already a private copy and may be modified.
     fn translate_in_tree_storage_class_to_csi(&self, sc: &mut StorageClass) -> Result<(), String>;
+    /// `TranslateCSIPVToInTree` (`in_tree_volume.go:48-51`): input is
+    /// already a private copy and may be modified.
+    fn translate_csi_pv_to_in_tree(&self, pv: &mut PersistentVolume) -> Result<(), String>;
     fn can_support(&self, pv: &PersistentVolume) -> bool;
     fn in_tree_plugin_name(&self) -> &'static str;
     fn csi_plugin_name(&self) -> &'static str;
@@ -85,6 +93,28 @@ impl CsiTranslator {
         Err(format!(
             "could not find in-tree plugin translation logic for {:?}",
             copied.metadata.name
+        ))
+    }
+
+    /// `TranslateCSIPVToInTree` (`translate.go:116-128`): the plugin is
+    /// chosen by the CSI source's driver name; the input is not modified.
+    pub fn translate_csi_pv_to_in_tree(
+        &self,
+        pv: &PersistentVolume,
+    ) -> Result<PersistentVolume, String> {
+        let Some(csi) = pv.spec.csi.as_ref() else {
+            return Err("CSI persistent volume was nil".to_string());
+        };
+        let mut copied = pv.clone();
+        for plugin in in_tree_plugins() {
+            if csi.driver == plugin.csi_plugin_name() {
+                plugin.translate_csi_pv_to_in_tree(&mut copied)?;
+                return Ok(copied);
+            }
+        }
+        Err(format!(
+            "could not find in-tree plugin translation logic for {}",
+            csi.driver
         ))
     }
 
@@ -427,6 +457,122 @@ fn translate_topology_from_in_tree_to_csi(pv: &mut PersistentVolume, csi_topolog
     }
 }
 
+/// `regionParserFn` (`in_tree_volume.go:260`).
+type RegionParser = fn(&[&str]) -> Result<String, String>;
+
+/// `translateTopologyFromCSIToInTree` (`in_tree_volume.go:275-307`): replace
+/// the CSI topology key with the Kubernetes zone label, add the region when a
+/// `region_parser` is given, then label the PV with its zones if it is not
+/// labelled already.
+fn translate_topology_from_csi_to_in_tree(
+    pv: &mut PersistentVolume,
+    csi_topology_key: &str,
+    region_parser: Option<RegionParser>,
+) -> Result<(), String> {
+    let (zone_label, _) = get_topology_label(pv);
+
+    // 1. Replace all CSI topology to Kubernetes Zone label
+    replace_topology(pv, csi_topology_key, zone_label);
+
+    // 2. Take care of region topology if a regionParser is passed
+    if let Some(region_parser) = region_parser {
+        region_topology_handler(pv, region_parser)
+            .map_err(|e| format!("Failed to handle region topology. error: {e}"))?;
+    }
+
+    // 3. Add labels about Kubernetes Topology
+    let zone_vals = get_topology_values(pv, zone_label);
+    if !zone_vals.is_empty() {
+        pv.metadata
+            .labels
+            .get_or_insert_with(HashMap::new)
+            .entry(zone_label.to_string())
+            .or_insert_with(|| zone_vals.join(LABEL_MULTI_ZONE_DELIMITER));
+    }
+    Ok(())
+}
+
+/// `regionTopologyHandler` (`in_tree_volume.go:342-397`): every term without
+/// a region requirement gets one parsed from that term's zones, and the PV is
+/// labelled with the region when exactly one exists.
+fn region_topology_handler(
+    pv: &mut PersistentVolume,
+    region_parser: RegionParser,
+) -> Result<(), String> {
+    let (zone_label, region_label) = get_topology_label(pv);
+    // Make sure the necessary fields exist
+    let Some(required) = pv
+        .spec
+        .node_affinity
+        .as_mut()
+        .and_then(|a| a.required.as_mut())
+        .filter(|r| !r.node_selector_terms.is_empty())
+    else {
+        return Ok(());
+    };
+
+    // process each term
+    for term in &mut required.node_selector_terms {
+        // In the first loop, see if regionLabel already exist
+        let mut region_exist = false;
+        let mut zone_vals: Vec<String> = Vec::new();
+        for r in term.match_expressions.iter().flatten() {
+            if r.key == region_label {
+                region_exist = true;
+                break;
+            } else if r.key == zone_label {
+                zone_vals.extend(r.values.iter().flatten().cloned());
+            }
+        }
+        if region_exist {
+            // Regionlabel already exist in this term, skip it
+            continue;
+        }
+        // If no regionLabel found, generate region label from the zoneLabel
+        // we collect from this term
+        let zones: Vec<&str> = zone_vals.iter().map(String::as_str).collect();
+        let region_val = region_parser(&zones)?;
+        term.match_expressions
+            .get_or_insert_with(Vec::new)
+            .push(NodeSelectorRequirement {
+                key: region_label.to_string(),
+                operator: "In".to_string(),
+                values: Some(vec![region_val]),
+            });
+    }
+
+    // Add region label
+    let region_vals = get_topology_values(pv, region_label);
+    if let [region] = region_vals.as_slice() {
+        // We should only have exactly 1 region value
+        pv.metadata
+            .labels
+            .get_or_insert_with(HashMap::new)
+            .entry(region_label.to_string())
+            .or_insert_with(|| region.clone());
+    }
+    Ok(())
+}
+
+/// `%v` of a `sets.String` (a `map[string]sets.Empty`): `map[a:{} b:{}]`.
+fn go_string_set(set: &BTreeSet<String>) -> String {
+    let items: Vec<String> = set.iter().map(|k| format!("{k}:{{}}")).collect();
+    format!("map[{}]", items.join(" "))
+}
+
+/// `strconv.Atoi`, with its error text.
+fn atoi(s: &str) -> Result<i64, String> {
+    s.parse::<i64>().map_err(|e| {
+        let why = match e.kind() {
+            std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow => {
+                "value out of range"
+            }
+            _ => "invalid syntax",
+        };
+        format!("strconv.Atoi: parsing {s:?}: {why}")
+    })
+}
+
 // ---- GCE PD (`plugins/gce_pd.go`) -------------------------------------------
 
 struct GcePersistentDiskTranslator;
@@ -485,10 +631,24 @@ fn gce_get_region_from_zones(zones: &[&str]) -> Result<String, String> {
     }
     if regions.len() != 1 {
         return Err(format!(
-            "multiple or no regions gotten from zones, got: {regions:?}"
+            "multiple or no regions gotten from zones, got: {}",
+            go_string_set(&regions)
         ));
     }
     Ok(regions.into_iter().next().unwrap())
+}
+
+/// `pdNameFromVolumeID` (`gce_pd.go:373-379`).
+fn pd_name_from_volume_id(id: &str) -> Result<String, String> {
+    let split: Vec<&str> = id.split('/').collect();
+    if split.len() < VOL_ID_TOTAL_ELEMENTS {
+        return Err(format!(
+            "failed to get id components.Got: {}, wanted {} components or more. ",
+            split.len(),
+            VOL_ID_TOTAL_ELEMENTS
+        ));
+    }
+    Ok(split[VOL_ID_DISK_NAME_VALUE].to_string())
 }
 
 impl InTreePlugin for GcePersistentDiskTranslator {
@@ -551,6 +711,43 @@ impl InTreePlugin for GcePersistentDiskTranslator {
         pv.spec.gce_persistent_disk = None;
         pv.spec.csi = Some(csi);
         pv.spec.access_modes = backward_compatible_access_modes(&pv.spec.access_modes);
+        Ok(())
+    }
+
+    /// `TranslateCSIPVToInTree` (`gce_pd.go:269-306`). Go's zero values are
+    /// omitted on the wire, so an empty fsType and a false readOnly stay unset.
+    fn translate_csi_pv_to_in_tree(&self, pv: &mut PersistentVolume) -> Result<(), String> {
+        let Some(csi) = pv.spec.csi.clone() else {
+            return Err("pv is nil or CSI source not defined on pv".into());
+        };
+        let pd_name = pd_name_from_volume_id(csi.volume_handle.as_deref().unwrap_or_default())?;
+        let mut gce = GCEPersistentDiskVolumeSource {
+            pd_name,
+            fs_type: csi.fs_type.clone().filter(|f| !f.is_empty()),
+            partition: None,
+            read_only: csi.read_only.filter(|r| *r),
+        };
+        if let Some(partition) = csi
+            .volume_attributes
+            .as_ref()
+            .and_then(|a| a.get("partition"))
+            .filter(|p| !p.is_empty())
+        {
+            let part = atoi(partition)
+                .map_err(|e| format!("Failed to convert partition {partition} to integer: {e}"))?;
+            gce.partition = Some(part as i32).filter(|p| *p != 0);
+        }
+
+        // translate CSI topology to In-tree topology for rollback compatibility
+        translate_topology_from_csi_to_in_tree(
+            pv,
+            GCE_PD_TOPOLOGY_KEY,
+            Some(gce_get_region_from_zones),
+        )
+        .map_err(|e| format!("failed to translate topology. PV:{pv:?}. Error:{e}"))?;
+
+        pv.spec.csi = None;
+        pv.spec.gce_persistent_disk = Some(gce);
         Ok(())
     }
 
@@ -645,6 +842,40 @@ fn kubernetes_volume_id_to_ebs_volume_id(kubernetes_id: &str) -> Result<String, 
     Ok(aws_id.to_string())
 }
 
+/// `getAwsRegionFromZones` (`aws_ebs.go:280-305`). AWS zones can be in four
+/// forms: us-west-2a, us-gov-east-1a, us-west-2-lax-1a (local zone) and
+/// us-east-1-wl1-bos-wlz-1 (wavelength).
+fn get_aws_region_from_zones(zones: &[&str]) -> Result<String, String> {
+    if zones.is_empty() {
+        return Err("no zones specified".into());
+    }
+    let mut regions = BTreeSet::new();
+    for zone in zones {
+        let mut split: Vec<&str> = zone.split('-').collect();
+        let n = split.len();
+        if (n == 3 || n == 4) && split[n - 1].len() == 2 {
+            // this would break if we ever have a location with more than 9
+            // regions, ie us-west-10.
+            split[n - 1] = &split[n - 1][..1];
+            regions.insert(split.join("-"));
+        } else if n == 5 || n == 7 {
+            // local zone or wavelength
+            regions.insert(split[..3].join("-"));
+        } else {
+            return Err(format!(
+                "Unexpected zone format: {zone} is not a valid AWS zone"
+            ));
+        }
+    }
+    if regions.len() != 1 {
+        return Err(format!(
+            "multiple or no regions gotten from zones, got: {}",
+            go_string_set(&regions)
+        ));
+    }
+    Ok(regions.into_iter().next().unwrap())
+}
+
 impl InTreePlugin for AwsElasticBlockStoreTranslator {
     /// `TranslateInTreePVToCSI` (`aws_ebs.go:139-168`).
     fn translate_in_tree_storage_class_to_csi(&self, sc: &mut StorageClass) -> Result<(), String> {
@@ -670,6 +901,41 @@ impl InTreePlugin for AwsElasticBlockStoreTranslator {
         translate_topology_from_in_tree_to_csi(pv, AWS_EBS_TOPOLOGY_KEY);
         pv.spec.aws_elastic_block_store = None;
         pv.spec.csi = Some(csi);
+        Ok(())
+    }
+
+    /// `TranslateCSIPVToInTree` (`aws_ebs.go:170-201`). A `partition`
+    /// attribute that is present must parse, even when empty.
+    fn translate_csi_pv_to_in_tree(&self, pv: &mut PersistentVolume) -> Result<(), String> {
+        let Some(csi) = pv.spec.csi.clone() else {
+            return Err("pv is nil or CSI source not defined on pv".into());
+        };
+        let mut ebs = AWSElasticBlockStoreVolumeSource {
+            volume_id: csi.volume_handle.clone().unwrap_or_default(),
+            fs_type: csi.fs_type.clone().filter(|f| !f.is_empty()),
+            partition: None,
+            read_only: csi.read_only.filter(|r| *r),
+        };
+        if let Some(partition) = csi
+            .volume_attributes
+            .as_ref()
+            .and_then(|a| a.get("partition"))
+        {
+            let part = atoi(partition)
+                .map_err(|e| format!("failed to convert partition {partition} to integer: {e}"))?;
+            ebs.partition = Some(part as i32).filter(|p| *p != 0);
+        }
+
+        // translate CSI topology to In-tree topology for rollback compatibility
+        translate_topology_from_csi_to_in_tree(
+            pv,
+            AWS_EBS_TOPOLOGY_KEY,
+            Some(get_aws_region_from_zones),
+        )
+        .map_err(|e| format!("failed to translate topology. PV:{pv:?}. Error:{e}"))?;
+
+        pv.spec.csi = None;
+        pv.spec.aws_elastic_block_store = Some(ebs);
         Ok(())
     }
 
@@ -1057,5 +1323,475 @@ mod tests {
             "vol-1"
         );
         assert!(t.repair_volume_handle("other", "x", "y").is_err());
+    }
+
+    // ---- TranslateCSIPVToInTree -------------------------------------------
+
+    const REGION_GA: &str = "topology.kubernetes.io/region";
+    const REGION_BETA: &str = "failure-domain.beta.kubernetes.io/region";
+
+    fn req(key: &str, values: &[&str]) -> NodeSelectorRequirement {
+        NodeSelectorRequirement {
+            key: key.into(),
+            operator: "In".into(),
+            values: Some(values.iter().map(|s| s.to_string()).collect()),
+        }
+    }
+
+    fn term(reqs: Vec<NodeSelectorRequirement>) -> NodeSelectorTerm {
+        NodeSelectorTerm {
+            match_expressions: Some(reqs),
+            match_fields: None,
+        }
+    }
+
+    fn labels(pairs: &[(&str, &str)]) -> Option<HashMap<String, String>> {
+        Some(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+    }
+
+    fn pv_with(
+        labels: Option<HashMap<String, String>>,
+        terms: Vec<NodeSelectorTerm>,
+    ) -> PersistentVolume {
+        let mut pv = blank_pv("gcepd");
+        pv.metadata.labels = labels;
+        pv.spec.node_affinity = Some(VolumeNodeAffinity {
+            required: Some(NodeSelector {
+                node_selector_terms: terms,
+            }),
+        });
+        pv
+    }
+
+    fn terms_json(pv: &PersistentVolume) -> serde_json::Value {
+        serde_json::to_value(
+            &pv.spec
+                .node_affinity
+                .as_ref()
+                .unwrap()
+                .required
+                .as_ref()
+                .unwrap()
+                .node_selector_terms,
+        )
+        .unwrap()
+    }
+
+    /// `TestTranslateTopologyFromCSIToInTree` (`in_tree_volume_test.go:106-485`),
+    /// the GCE PD rows (the Cinder row waits for the Cinder plugin).
+    #[test]
+    fn translate_topology_from_csi_to_in_tree_matches_upstream_table() {
+        let gce: Option<RegionParser> = Some(gce_get_region_from_zones);
+        let ga_labels = labels(&[(ZONE_GA, "us-east1-a"), (REGION_GA, "us-east1")]);
+        let beta_labels = labels(&[(ZONE_BETA, "us-west2-b"), (REGION_BETA, "us-west2")]);
+        let ga_zone_first = vec![term(vec![
+            req(ZONE_GA, &["us-east1-a"]),
+            req(REGION_GA, &["us-east1"]),
+        ])];
+        let ga_region_first = vec![term(vec![
+            req(REGION_GA, &["us-east1"]),
+            req(ZONE_GA, &["us-east1-a"]),
+        ])];
+        let beta_zone_first = vec![term(vec![
+            req(ZONE_BETA, &["us-west2-b"]),
+            req(REGION_BETA, &["us-west2"]),
+        ])];
+        let beta_region_first = vec![term(vec![
+            req(REGION_BETA, &["us-west2"]),
+            req(ZONE_BETA, &["us-west2-b"]),
+        ])];
+        let existing = labels(&[(ZONE_GA, "existingZone"), (REGION_GA, "existingRegion")]);
+
+        #[allow(clippy::type_complexity)]
+        let cases: Vec<(
+            &str,
+            Option<RegionParser>,
+            PersistentVolume,
+            Vec<NodeSelectorTerm>,
+            Option<HashMap<String, String>>,
+        )> = vec![
+            (
+                "Remove CSI Topology Key and do not change existing GA Kubernetes topology",
+                gce,
+                pv_with(
+                    ga_labels.clone(),
+                    vec![term(vec![
+                        req(REGION_GA, &["us-east1"]),
+                        req(GCE_PD_TOPOLOGY_KEY, &["us-east1-a"]),
+                    ])],
+                ),
+                ga_region_first.clone(),
+                ga_labels.clone(),
+            ),
+            (
+                "Remove CSI Topology Key and do not change existing Beta Kubernetes topology",
+                gce,
+                pv_with(
+                    beta_labels.clone(),
+                    vec![term(vec![
+                        req(REGION_BETA, &["us-west2"]),
+                        req(GCE_PD_TOPOLOGY_KEY, &["us-west2-b"]),
+                    ])],
+                ),
+                beta_region_first,
+                beta_labels.clone(),
+            ),
+            (
+                "Remove CSI Topology Key and add Kubernetes topology from NodeAffinity, ignore labels",
+                gce,
+                pv_with(
+                    existing.clone(),
+                    vec![term(vec![req(GCE_PD_TOPOLOGY_KEY, &["us-east1-a"])])],
+                ),
+                ga_zone_first.clone(),
+                existing.clone(),
+            ),
+            (
+                "No CSI topology label exists and no change to the NodeAffinity",
+                gce,
+                pv_with(existing.clone(), vec![]),
+                vec![],
+                existing.clone(),
+            ),
+            (
+                "Generate GA labels and kubernetes topology only from CSI topology",
+                gce,
+                pv_with(
+                    None,
+                    vec![term(vec![req(GCE_PD_TOPOLOGY_KEY, &["us-east1-a"])])],
+                ),
+                ga_zone_first,
+                ga_labels,
+            ),
+            (
+                "Generate Beta labels and kubernetes topology from Beta NodeAffinity",
+                gce,
+                pv_with(None, vec![term(vec![req(ZONE_BETA, &["us-west2-b"])])]),
+                beta_zone_first,
+                beta_labels.clone(),
+            ),
+            (
+                "regionParser is missing and only zone labels get generated",
+                None,
+                pv_with(
+                    None,
+                    vec![term(vec![req(GCE_PD_TOPOLOGY_KEY, &["us-east1-a"])])],
+                ),
+                vec![term(vec![req(ZONE_GA, &["us-east1-a"])])],
+                labels(&[(ZONE_GA, "us-east1-a")]),
+            ),
+            (
+                "Replace multi-term CSI Topology Key and add Region Kubernetes topology for both",
+                gce,
+                pv_with(
+                    None,
+                    vec![
+                        term(vec![req(GCE_PD_TOPOLOGY_KEY, &["us-east1-a"])]),
+                        term(vec![req(GCE_PD_TOPOLOGY_KEY, &["us-east1-c"])]),
+                    ],
+                ),
+                vec![
+                    term(vec![
+                        req(ZONE_GA, &["us-east1-a"]),
+                        req(REGION_GA, &["us-east1"]),
+                    ]),
+                    term(vec![
+                        req(ZONE_GA, &["us-east1-c"]),
+                        req(REGION_GA, &["us-east1"]),
+                    ]),
+                ],
+                labels(&[(ZONE_GA, "us-east1-a__us-east1-c"), (REGION_GA, "us-east1")]),
+            ),
+        ];
+
+        for (name, parser, mut pv, want_terms, want_labels) in cases {
+            translate_topology_from_csi_to_in_tree(&mut pv, GCE_PD_TOPOLOGY_KEY, parser)
+                .unwrap_or_else(|e| panic!("{name}: unexpected error {e}"));
+            assert_eq!(
+                terms_json(&pv),
+                serde_json::to_value(&want_terms).unwrap(),
+                "{name}"
+            );
+            assert_eq!(pv.metadata.labels, want_labels, "{name}");
+        }
+    }
+
+    /// `regionTopologyHandler` (`in_tree_volume.go:356-361`): a term with no
+    /// zone value reaches the region parser with no zones, and that error
+    /// fails the translation.
+    #[test]
+    fn a_term_without_zones_fails_the_region_parser() {
+        let mut pv = pv_with(None, vec![term(vec![req("other", &["x"])])]);
+        let err = translate_topology_from_csi_to_in_tree(
+            &mut pv,
+            GCE_PD_TOPOLOGY_KEY,
+            Some(gce_get_region_from_zones),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "Failed to handle region topology. error: no zones specified"
+        );
+    }
+
+    /// `TestGetAwsRegionFromZones` (`aws_ebs_test.go:213-283`).
+    #[test]
+    fn get_aws_region_from_zones_matches_upstream_table() {
+        let ok: &[(&[&str], &str)] = &[
+            (&["us-west-2a", "us-west-2b"], "us-west-2"),
+            (&["us-gov-east-1a"], "us-gov-east-1"),
+            (&["us-east-1-wl1-bos-wlz-1"], "us-east-1"),
+            (&["us-west-2-lax-1a"], "us-west-2"),
+        ];
+        for (zones, want) in ok {
+            assert_eq!(
+                get_aws_region_from_zones(zones).unwrap(),
+                *want,
+                "{zones:?}"
+            );
+        }
+        let bad: &[&[&str]] = &[
+            &[],
+            &["us-west-2a", "us-east-1a"],
+            &["us-west-2"],
+            &["us-west-2ab"],
+            &["us-west"],
+        ];
+        for zones in bad {
+            assert!(get_aws_region_from_zones(zones).is_err(), "{zones:?}");
+        }
+        assert_eq!(
+            get_aws_region_from_zones(&["us-west"]).unwrap_err(),
+            "Unexpected zone format: us-west is not a valid AWS zone"
+        );
+    }
+
+    /// `TestTranslationStability` (`translate_test.go:47-102`): in-tree ->
+    /// CSI -> in-tree is the identity.
+    #[test]
+    fn translation_round_trip_is_stable() {
+        let t = CsiTranslator::new();
+        let mut gce = blank_pv("");
+        gce.metadata = ObjectMeta::default();
+        gce.spec.gce_persistent_disk = Some(GCEPersistentDiskVolumeSource {
+            pd_name: "test-disk".into(),
+            fs_type: Some("ext4".into()),
+            partition: None,
+            read_only: None,
+        });
+        let mut ebs = blank_pv("");
+        ebs.metadata = ObjectMeta::default();
+        ebs.spec.aws_elastic_block_store = Some(AWSElasticBlockStoreVolumeSource {
+            volume_id: "vol01".into(),
+            fs_type: Some("ext3".into()),
+            partition: Some(1),
+            read_only: Some(true),
+        });
+        for pv in [gce, ebs] {
+            let csi = t.translate_in_tree_pv_to_csi(&pv).unwrap();
+            let back = t.translate_csi_pv_to_in_tree(&csi).unwrap();
+            assert_eq!(
+                serde_json::to_value(&back).unwrap(),
+                serde_json::to_value(&pv).unwrap()
+            );
+        }
+    }
+
+    /// `TestTopologyTranslation` (`translate_test.go:104-258`), GCE PD and
+    /// AWS EBS rows: the round trip removes the CSI key and leaves a
+    /// Kubernetes zone key.
+    #[test]
+    fn topology_round_trip_restores_kubernetes_keys() {
+        let t = CsiTranslator::new();
+        let beta = labels(&[(ZONE_BETA, "us-east-1a"), (REGION_BETA, "us-east-1")]);
+        let ga = labels(&[(ZONE_GA, "us-east-1a"), (REGION_GA, "us-east-1")]);
+        let regional_beta = labels(&[(ZONE_BETA, "europe-west1-b__europe-west1-c")]);
+        let regional_ga = labels(&[(ZONE_GA, "europe-west1-b__europe-west1-c")]);
+        let topo = |key: &str, values: &[&str]| vec![term(vec![req(key, values)])];
+        let gce = |labels: Option<HashMap<String, String>>, terms: Vec<NodeSelectorTerm>| {
+            let mut pv = blank_pv("");
+            pv.metadata.labels = labels;
+            if !terms.is_empty() {
+                pv.spec.node_affinity = Some(VolumeNodeAffinity {
+                    required: Some(NodeSelector {
+                        node_selector_terms: terms,
+                    }),
+                });
+            }
+            pv.spec.gce_persistent_disk = Some(GCEPersistentDiskVolumeSource {
+                pd_name: "test-disk".into(),
+                fs_type: Some("ext4".into()),
+                ..Default::default()
+            });
+            pv
+        };
+        let ebs = |labels: Option<HashMap<String, String>>, terms: Vec<NodeSelectorTerm>| {
+            let mut pv = gce(labels, terms);
+            pv.spec.gce_persistent_disk = None;
+            pv.spec.aws_elastic_block_store = Some(AWSElasticBlockStoreVolumeSource {
+                volume_id: "vol01".into(),
+                fs_type: Some("ext3".into()),
+                partition: Some(1),
+                read_only: Some(true),
+            });
+            pv
+        };
+        let cases: Vec<(&str, PersistentVolume)> = vec![
+            (GCE_PD_TOPOLOGY_KEY, gce(beta.clone(), vec![])),
+            (GCE_PD_TOPOLOGY_KEY, gce(ga.clone(), vec![])),
+            (
+                GCE_PD_TOPOLOGY_KEY,
+                gce(None, topo(GCE_PD_TOPOLOGY_KEY, &["us-east-2a"])),
+            ),
+            (GCE_PD_TOPOLOGY_KEY, gce(regional_beta.clone(), vec![])),
+            (
+                GCE_PD_TOPOLOGY_KEY,
+                gce(None, topo(ZONE_GA, &["europe-west1-b", "europe-west1-c"])),
+            ),
+            (
+                GCE_PD_TOPOLOGY_KEY,
+                gce(
+                    regional_beta,
+                    topo(ZONE_BETA, &["europe-west1-f", "europe-west1-g"]),
+                ),
+            ),
+            (
+                GCE_PD_TOPOLOGY_KEY,
+                gce(
+                    regional_ga,
+                    topo(ZONE_GA, &["europe-west1-f", "europe-west1-g"]),
+                ),
+            ),
+            (
+                GCE_PD_TOPOLOGY_KEY,
+                gce(
+                    None,
+                    vec![
+                        term(vec![req(ZONE_GA, &["europe-west1-f"])]),
+                        term(vec![req(ZONE_GA, &["europe-west1-g"])]),
+                    ],
+                ),
+            ),
+            (AWS_EBS_TOPOLOGY_KEY, ebs(beta.clone(), vec![])),
+            (
+                AWS_EBS_TOPOLOGY_KEY,
+                ebs(beta, topo(ZONE_BETA, &["us-east-2a"])),
+            ),
+            (AWS_EBS_TOPOLOGY_KEY, ebs(ga.clone(), vec![])),
+            (
+                AWS_EBS_TOPOLOGY_KEY,
+                ebs(ga, topo(ZONE_GA, &["us-east-2a"])),
+            ),
+        ];
+        for (key, pv) in cases {
+            let csi = t.translate_in_tree_pv_to_csi(&pv).unwrap();
+            let back = t
+                .translate_csi_pv_to_in_tree(&csi)
+                .unwrap_or_else(|e| panic!("{pv:?}: {e}"));
+            let affinity = back.spec.node_affinity.as_ref();
+            assert!(!topology_key_exist(key, affinity), "{back:?}");
+            assert!(
+                topology_key_exist(ZONE_BETA, affinity) || topology_key_exist(ZONE_GA, affinity),
+                "{back:?}"
+            );
+        }
+    }
+
+    /// `gcePersistentDiskCSITranslator.TranslateCSIPVToInTree`
+    /// (`gce_pd.go:269-306`): the PD name is the handle's sixth element and a
+    /// non-empty `partition` attribute is parsed.
+    #[test]
+    fn gce_csi_pv_translates_to_in_tree() {
+        let t = CsiTranslator::new();
+        let mut pv = blank_pv("pv1");
+        pv.spec.csi = Some(CSIVolumeSource {
+            driver: GCE_PD_DRIVER_NAME.into(),
+            volume_handle: Some("projects/p/zones/us-central1-a/disks/d1".into()),
+            fs_type: Some("xfs".into()),
+            read_only: Some(true),
+            volume_attributes: Some(HashMap::from([("partition".into(), "3".into())])),
+            ..Default::default()
+        });
+        let out = t.translate_csi_pv_to_in_tree(&pv).unwrap();
+        assert!(out.spec.csi.is_none());
+        assert_eq!(
+            out.spec.gce_persistent_disk,
+            Some(GCEPersistentDiskVolumeSource {
+                pd_name: "d1".into(),
+                fs_type: Some("xfs".into()),
+                partition: Some(3),
+                read_only: Some(true),
+            })
+        );
+        // the input is not modified
+        assert!(pv.spec.csi.is_some());
+
+        pv.spec.csi.as_mut().unwrap().volume_handle = Some("projects/p/disks/d1".into());
+        assert_eq!(
+            t.translate_csi_pv_to_in_tree(&pv).unwrap_err(),
+            "failed to get id components.Got: 4, wanted 6 components or more. "
+        );
+        let csi = pv.spec.csi.as_mut().unwrap();
+        csi.volume_handle = Some("projects/p/zones/z/disks/d1".into());
+        csi.volume_attributes = Some(HashMap::from([("partition".into(), "x".into())]));
+        assert_eq!(
+            t.translate_csi_pv_to_in_tree(&pv).unwrap_err(),
+            "Failed to convert partition x to integer: strconv.Atoi: parsing \"x\": invalid syntax"
+        );
+    }
+
+    /// `awsElasticBlockStoreCSITranslator.TranslateCSIPVToInTree`
+    /// (`aws_ebs.go:170-201`): the handle is the volume ID, and a present
+    /// `partition` attribute must parse (an empty one too).
+    #[test]
+    fn ebs_csi_pv_translates_to_in_tree() {
+        let t = CsiTranslator::new();
+        let mut pv = blank_pv("pv2");
+        pv.spec.csi = Some(CSIVolumeSource {
+            driver: AWS_EBS_DRIVER_NAME.into(),
+            volume_handle: Some("vol-0abc".into()),
+            volume_attributes: Some(HashMap::from([("partition".into(), "2".into())])),
+            ..Default::default()
+        });
+        let out = t.translate_csi_pv_to_in_tree(&pv).unwrap();
+        assert_eq!(
+            out.spec.aws_elastic_block_store,
+            Some(AWSElasticBlockStoreVolumeSource {
+                volume_id: "vol-0abc".into(),
+                fs_type: None,
+                partition: Some(2),
+                read_only: None,
+            })
+        );
+        pv.spec.csi.as_mut().unwrap().volume_attributes =
+            Some(HashMap::from([("partition".into(), "".into())]));
+        assert_eq!(
+            t.translate_csi_pv_to_in_tree(&pv).unwrap_err(),
+            "failed to convert partition  to integer: strconv.Atoi: parsing \"\": invalid syntax"
+        );
+    }
+
+    /// `CSITranslator.TranslateCSIPVToInTree` (`translate.go:116-128`).
+    #[test]
+    fn translate_csi_pv_to_in_tree_rejects_non_csi_and_unknown_drivers() {
+        let t = CsiTranslator::new();
+        assert_eq!(
+            t.translate_csi_pv_to_in_tree(&blank_pv("x")).unwrap_err(),
+            "CSI persistent volume was nil"
+        );
+        let mut pv = blank_pv("x");
+        pv.spec.csi = Some(CSIVolumeSource {
+            driver: "other.csi".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            t.translate_csi_pv_to_in_tree(&pv).unwrap_err(),
+            "could not find in-tree plugin translation logic for other.csi"
+        );
     }
 }
