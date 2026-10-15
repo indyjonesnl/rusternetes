@@ -34,12 +34,25 @@ impl ItemKey {
 }
 
 /// `QueueKey` (capacity.go:115-120): either a work item to sync, or an
-/// obsolete CSIStorageCapacity object to delete. The Go key holds a pointer to
-/// the object; `deleteCapacity` only uses its namespace and name.
+/// obsolete CSIStorageCapacity object to delete. The Go key holds a *pointer*
+/// (`item *WorkItem`, `capacity *CSIStorageCapacity`) and every
+/// `queue.Add(QueueKey{item: &item})` uses a fresh one, so the workqueue (which
+/// keys by `==`, i.e. by pointer) does not collapse repeated adds of the same
+/// logical item: each add is its own entry and costs its own sync. `id` is
+/// that pointer identity: [`State::add_item`] / [`State::add_capacity`] mint a
+/// new one per add, and a retry (`AddRateLimited(obj)`) re-adds the same key.
+/// `deleteCapacity` only uses the namespace and name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum QueueKey {
-    Item(ItemKey),
-    Capacity { namespace: String, name: String },
+    Item {
+        id: u64,
+        item: ItemKey,
+    },
+    Capacity {
+        id: u64,
+        namespace: String,
+        name: String,
+    },
 }
 
 /// `Controller.capacities`, the informer caches and `Controller.queue`,
@@ -68,6 +81,8 @@ pub struct State {
     failures: HashMap<QueueKey, u32>,
     delayed: Vec<(Instant, QueueKey)>,
     notify: Arc<Notify>,
+    /// Source of the pointer identities of [`QueueKey`].
+    next_id: u64,
 }
 
 impl State {
@@ -86,9 +101,25 @@ impl State {
         self.notify.notify_one();
     }
 
-    /// `queue.Add(QueueKey{item: &item})`.
+    fn fresh_id(&mut self) -> u64 {
+        self.next_id += 1;
+        self.next_id
+    }
+
+    /// `queue.Add(QueueKey{item: &item})`: a fresh pointer, so a new entry.
     pub fn add_item(&mut self, item: ItemKey) {
-        self.add(QueueKey::Item(item));
+        let id = self.fresh_id();
+        self.add(QueueKey::Item { id, item });
+    }
+
+    /// `queue.Add(QueueKey{capacity: capacity})`.
+    pub fn add_capacity(&mut self, namespace: String, name: String) {
+        let id = self.fresh_id();
+        self.add(QueueKey::Capacity {
+            id,
+            namespace,
+            name,
+        });
     }
 }
 
@@ -220,7 +251,7 @@ impl CapacityRefresher {
             .queue
             .iter()
             .filter_map(|k| match k {
-                QueueKey::Item(i) => Some(i.clone()),
+                QueueKey::Item { item, .. } => Some(item.clone()),
                 QueueKey::Capacity { .. } => None,
             })
             .collect()

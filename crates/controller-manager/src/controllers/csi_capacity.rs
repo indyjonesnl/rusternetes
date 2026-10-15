@@ -235,6 +235,7 @@ pub fn fixed_segment(accessible_topology: Option<&HashMap<String, String>>) -> S
 /// `owner.Lookup` (pkg/owner/owner.go:37-100): walk `levels` controlling
 /// owners up from the starting object; `levels == 0` returns the object
 /// itself. Only apiVersion, kind, name and uid are set; controller is true.
+/// `limiter` is the token bucket of the client `owner.Lookup` builds.
 pub async fn lookup_owner<S: Storage>(
     storage: &S,
     namespace: &str,
@@ -242,7 +243,7 @@ pub async fn lookup_owner<S: Storage>(
     api_version: &str,
     kind: &str,
     levels: i32,
-    _limiter: &rusternetes_client::ratelimit::RateLimiter,
+    limiter: &rusternetes_client::ratelimit::RateLimiter,
 ) -> Result<OwnerReference> {
     let (mut api_version, mut kind, mut name, mut levels) = (
         api_version.to_string(),
@@ -266,6 +267,11 @@ pub async fn lookup_owner<S: Storage>(
                 )))
             }
         };
+        // `owner.Lookup(config, ...)` builds its own client from the config whose
+        // QPS/Burst were just set to the capacity values (csi-provisioner.go:
+        // 456-457, :474; owner.go:37-44): every GET takes a token of that
+        // client's own bucket.
+        limiter.acquire().await;
         let obj: serde_json::Value = storage
             .get(&build_key(resource, Some(namespace), &name))
             .await
@@ -553,14 +559,14 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
             "Capacity Controller: enqueuing CSIStorageCapacity {} for removal",
             capacity.metadata.name
         );
-        st.add(QueueKey::Capacity {
-            namespace: capacity
+        st.add_capacity(
+            capacity
                 .metadata
                 .namespace
                 .clone()
                 .unwrap_or_else(|| self.owner_namespace.clone()),
-            name: capacity.metadata.name.clone(),
-        });
+            capacity.metadata.name.clone(),
+        );
     }
 
     /// `onTopologyChanges` (capacity.go:339-366), called by the topology informer.
@@ -695,14 +701,14 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
                     capacity.metadata.name,
                     capacity.metadata.resource_version
                 );
-                st.add(QueueKey::Capacity {
-                    namespace: capacity
+                st.add_capacity(
+                    capacity
                         .metadata
                         .namespace
                         .clone()
                         .unwrap_or_else(|| self.owner_namespace.clone()),
-                    name: capacity.metadata.name.clone(),
-                });
+                    capacity.metadata.name.clone(),
+                );
             }
         }
     }
@@ -940,8 +946,10 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
             return false;
         };
         let r = match &key {
-            QueueKey::Item(item) => self.sync_item(item).await,
-            QueueKey::Capacity { namespace, name } => self.delete_capacity(namespace, name).await,
+            QueueKey::Item { item, .. } => self.sync_item(item).await,
+            QueueKey::Capacity {
+                namespace, name, ..
+            } => self.delete_capacity(namespace, name).await,
         };
         // `defer c.queue.Done(obj)` runs before the error handling.
         self.refresher.done(&key);
@@ -1330,13 +1338,13 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
 mod tests {
     use super::super::csi_capacity_refresh::{CapacityRefresher, ItemKey, QueueKey};
     use super::*;
+    use rusternetes_client::ratelimit::RateLimiter;
     use rusternetes_common::resources::csi::{CSINodeDriver, CSINodeSpec};
     use rusternetes_common::resources::volume::VolumeNodeAffinity;
     use rusternetes_common::resources::volume::{
         NodeSelectorRequirement, StorageClass, VolumeBindingMode,
     };
     use rusternetes_common::types::{ObjectMeta, TypeMeta};
-    use rusternetes_client::ratelimit::RateLimiter;
     use rusternetes_storage::build_key;
     use rusternetes_storage::memory::MemoryStorage;
     use std::collections::HashSet;
@@ -1559,10 +1567,13 @@ mod tests {
     #[test]
     fn rate_limiter_doubles_per_failure_and_caps_at_max() {
         let r = CapacityRefresher::new();
-        let k = QueueKey::Item(ItemKey {
-            segment: seg(&[]),
-            storage_class_name: "sc".into(),
-        });
+        let k = QueueKey::Item {
+            id: 1,
+            item: ItemKey {
+                segment: seg(&[]),
+                storage_class_name: "sc".into(),
+            },
+        };
         let (s, m) = (Duration::from_secs(1), Duration::from_secs(5));
         let d: Vec<_> = (0..5)
             .map(|_| r.add_rate_limited(k.clone(), s, m))
@@ -2253,6 +2264,11 @@ mod tests {
         c.apply_sc_list(list_scs(st).await);
         c.apply_topology(segs.to_vec());
         c.apply_c_list(list_caps(st).await);
+        // The queue keeps every add (fresh `QueueKey` pointers, capacity.go:
+        // 115-120), so the entries of `apply_topology` would be synced as well
+        // as those of the poll. upstream's test queue (capacity_test.go:
+        // 1383-1403) collapses them; do the same here to count one sync per item.
+        c.refresher.clear_queue();
         c.poll_capacities();
         pump(c, st).await;
     }
@@ -2686,9 +2702,12 @@ mod tests {
     }
 
     #[test]
-    fn workqueue_does_not_hand_out_an_item_that_is_being_processed() {
-        // client-go workqueue Add/Get/Done: re-adding an item in flight marks
-        // it dirty; it is queued again by Done, never processed twice at once.
+    fn workqueue_does_not_hand_out_a_key_that_is_being_processed() {
+        // client-go workqueue Add/Get/Done: re-adding the same key in flight
+        // marks it dirty; it is queued again by Done, never processed twice at
+        // once. (Fresh adds of an item are fresh keys, see
+        // `queue_does_not_deduplicate_fresh_adds`; the same key is added again
+        // by `AddRateLimited` and by `Done`.)
         let r = CapacityRefresher::new();
         let k = ItemKey {
             segment: seg(&[("zone", "a")]),
@@ -2696,11 +2715,12 @@ mod tests {
         };
         r.set_capacities([k.clone()].into());
         r.refresh_sc("sc");
-        let key = QueueKey::Item(k);
-        assert_eq!(r.pop(), Some(key.clone()));
-        r.refresh_sc("sc");
+        let key = r.pop().expect("queued");
+        r.lock().add(key.clone());
+        r.lock().add(key.clone());
         assert_eq!(r.pop(), None, "in flight: must not be handed out again");
         r.done(&key);
-        assert_eq!(r.pop(), Some(key));
+        assert_eq!(r.pop(), Some(key.clone()));
+        assert_eq!(r.pop(), None, "dirty twice, queued once");
     }
 }
