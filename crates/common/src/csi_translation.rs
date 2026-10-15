@@ -1,12 +1,13 @@
 //! In-tree -> CSI PersistentVolume translation: a port of
 //! `staging/src/k8s.io/csi-translation-lib` (`translate.go`,
 //! `plugins/in_tree_volume.go`, `plugins/gce_pd.go`, `plugins/aws_ebs.go`,
-//! `plugins/portworx.go`, `plugins/vsphere_volume.go`, `plugins/azure_file.go`).
+//! `plugins/portworx.go`, `plugins/vsphere_volume.go`, `plugins/azure_file.go`,
+//! `plugins/openstack_cinder.go`).
 //!
 //! Shared by the external-attacher (`CsiAttacher`) and the scheduler's
 //! VolumeBinding plugin (`tryTranslatePVToCSI`). Plugins ported so far: GCE PD,
-//! AWS EBS, Portworx, vSphere and Azure File; the other in-tree plugins of
-//! `translate.go:34-42` (Cinder, AzureDisk) are tracked follow-ups.
+//! AWS EBS, Portworx, vSphere, Azure File and Cinder; the other in-tree plugin of
+//! `translate.go:34-42` (AzureDisk) is tracked follow-ups.
 //!
 //! `TranslateCSIPVToInTree` (`translate.go:116-128`) is ported for the same
 //! two plugins, with `translateTopologyFromCSIToInTree` /
@@ -83,8 +84,9 @@ static AWS_EBS: AwsElasticBlockStoreTranslator = AwsElasticBlockStoreTranslator;
 static PORTWORX: PortworxCsiTranslator = PortworxCsiTranslator;
 static VSPHERE: VsphereCsiTranslator = VsphereCsiTranslator;
 static AZURE_FILE: AzureFileCsiTranslator = AzureFileCsiTranslator;
-fn in_tree_plugins() -> [&'static dyn InTreePlugin; 5] {
-    [&GCE_PD, &AWS_EBS, &PORTWORX, &VSPHERE, &AZURE_FILE]
+static CINDER: OsCinderCsiTranslator = OsCinderCsiTranslator;
+fn in_tree_plugins() -> [&'static dyn InTreePlugin; 6] {
+    [&GCE_PD, &AWS_EBS, &PORTWORX, &VSPHERE, &AZURE_FILE, &CINDER]
 }
 
 /// `CSITranslator` (`translate.go:48`).
@@ -1728,6 +1730,144 @@ impl InTreePlugin for AzureFileCsiTranslator {
     }
 }
 
+// ---- Cinder (`plugins/openstack_cinder.go`) ---------------------------------
+
+/// `CinderDriverName` (`openstack_cinder.go:32`).
+pub const CINDER_DRIVER_NAME: &str = "cinder.csi.openstack.org";
+/// `CinderTopologyKey` (`openstack_cinder.go:34`).
+const CINDER_TOPOLOGY_KEY: &str = "topology.cinder.csi.openstack.org/zone";
+/// `CinderInTreePluginName` (`openstack_cinder.go:36`).
+pub const CINDER_IN_TREE_PLUGIN_NAME: &str = "kubernetes.io/cinder";
+
+struct OsCinderCsiTranslator;
+
+impl InTreePlugin for OsCinderCsiTranslator {
+    /// `TranslateInTreeStorageClassToCSI` (`openstack_cinder.go:49-76`).
+    fn translate_in_tree_storage_class_to_csi(&self, sc: &mut StorageClass) -> Result<(), String> {
+        let mut params: HashMap<String, String> = HashMap::new();
+        for (k, v) in sc.parameters.iter().flatten() {
+            match k.to_lowercase().as_str() {
+                FS_TYPE_KEY => {
+                    params.insert(CSI_FS_TYPE_KEY.to_string(), v.clone());
+                }
+                // "All other parameters are supported by the CSI driver. This
+                // includes also "availability", therefore do not translate it
+                // to sc.AllowedTopologies"
+                _ => {
+                    params.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        if let Some(existing) = sc.allowed_topologies.as_ref().filter(|t| !t.is_empty()) {
+            sc.allowed_topologies =
+                Some(translate_allowed_topologies(existing, CINDER_TOPOLOGY_KEY));
+        }
+        sc.parameters = Some(params);
+        Ok(())
+    }
+
+    /// `TranslateInTreePVToCSI` (`openstack_cinder.go:106-129`).
+    fn translate_in_tree_pv_to_csi(&self, pv: &mut PersistentVolume) -> Result<(), String> {
+        let Some(cinder) = pv.spec.more_sources.cinder.clone() else {
+            return Err("pv is nil or Cinder not defined on pv".into());
+        };
+        let csi = CSIVolumeSource {
+            driver: CINDER_DRIVER_NAME.to_string(),
+            volume_handle: Some(cinder.volume_id),
+            read_only: Some(cinder.read_only).filter(|r| *r),
+            fs_type: Some(cinder.fs_type).filter(|f| !f.is_empty()),
+            volume_attributes: Some(HashMap::new()),
+            ..Default::default()
+        };
+        translate_topology_from_in_tree_to_csi(pv, CINDER_TOPOLOGY_KEY);
+        pv.spec.more_sources.cinder = None;
+        pv.spec.csi = Some(csi);
+        Ok(())
+    }
+
+    /// `TranslateInTreeInlineVolumeToCSI` (`openstack_cinder.go:78-104`).
+    fn translate_in_tree_inline_volume_to_csi(
+        &self,
+        volume: &Volume,
+        _pod_namespace: &str,
+    ) -> Result<PersistentVolume, String> {
+        let Some(cinder) = volume.legacy_sources.cinder.as_ref() else {
+            return Err("volume is nil or Cinder not defined on volume".into());
+        };
+        let volume_id = cinder
+            .get("volumeID")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let fs_type = cinder
+            .get("fsType")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let read_only = cinder
+            .get("readOnly")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        // Must be unique per disk as it is used as the unique part of the
+        // staging path
+        let mut pv = inline_pv(format!("{CINDER_DRIVER_NAME}-{volume_id}"));
+        pv.spec.csi = Some(CSIVolumeSource {
+            driver: CINDER_DRIVER_NAME.to_string(),
+            volume_handle: Some(volume_id),
+            read_only: Some(read_only).filter(|r| *r),
+            fs_type: Some(fs_type).filter(|f| !f.is_empty()),
+            volume_attributes: Some(HashMap::new()),
+            ..Default::default()
+        });
+        pv.spec.access_modes = vec![PersistentVolumeAccessMode::ReadWriteOnce];
+        Ok(pv)
+    }
+
+    /// `TranslateCSIPVToInTree` (`openstack_cinder.go:131-160`).
+    fn translate_csi_pv_to_in_tree(&self, pv: &mut PersistentVolume) -> Result<(), String> {
+        let Some(csi) = pv.spec.csi.clone() else {
+            return Err("pv is nil or CSI source not defined on pv".into());
+        };
+        let cinder = crate::resources::pv_sources::CinderPersistentVolumeSource {
+            volume_id: csi.volume_handle.clone().unwrap_or_default(),
+            fs_type: csi.fs_type.clone().unwrap_or_default(),
+            read_only: csi.read_only.unwrap_or(false),
+            secret_ref: None,
+        };
+        // translate CSI topology to In-tree topology for rollback
+        // compatibility. It is not possible to guess Cinder Region from the
+        // Zone, therefore leave it empty.
+        translate_topology_from_csi_to_in_tree(pv, CINDER_TOPOLOGY_KEY, None)
+            .map_err(|e| format!("failed to translate topology. PV:{pv:?}. Error:{e}"))?;
+        pv.spec.csi = None;
+        pv.spec.more_sources.cinder = Some(cinder);
+        Ok(())
+    }
+
+    /// `CanSupport` (`openstack_cinder.go:162-164`).
+    fn can_support(&self, pv: &PersistentVolume) -> bool {
+        pv.spec.more_sources.cinder.is_some()
+    }
+
+    /// `CanSupportInline` (`openstack_cinder.go:169-171`).
+    fn can_support_inline(&self, volume: &Volume) -> bool {
+        volume.legacy_sources.cinder.is_some()
+    }
+
+    fn in_tree_plugin_name(&self) -> &'static str {
+        CINDER_IN_TREE_PLUGIN_NAME
+    }
+
+    fn csi_plugin_name(&self) -> &'static str {
+        CINDER_DRIVER_NAME
+    }
+
+    /// `RepairVolumeHandle` (`openstack_cinder.go:181-183`): identity.
+    fn repair_volume_handle(&self, volume_handle: &str, _node_id: &str) -> Result<String, String> {
+        Ok(volume_handle.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3363,6 +3503,118 @@ mod tests {
         );
         assert_eq!(
             t.repair_volume_handle("file.csi.azure.com", "h", "n")
+                .unwrap(),
+            "h"
+        );
+    }
+
+    // ---- Cinder (`plugins/openstack_cinder_test.go`) ----------------------
+
+    const CINDER_NAME: &str = "kubernetes.io/cinder";
+    const CINDER_KEY: &str = "topology.cinder.csi.openstack.org/zone";
+
+    fn cinder_pv() -> PersistentVolume {
+        let mut pv = blank_pv("pv1");
+        pv.spec.more_sources.cinder =
+            Some(crate::resources::pv_sources::CinderPersistentVolumeSource {
+                volume_id: "vol-1".into(),
+                fs_type: "ext4".into(),
+                read_only: true,
+                secret_ref: None,
+            });
+        pv
+    }
+
+    /// `TestTranslateCinderInTreeStorageClassToCSI`.
+    #[test]
+    fn cinder_storage_class_translation_matches_upstream_table() {
+        let t = CsiTranslator::new();
+        let ok = |input: StorageClass, exp: StorageClass| {
+            let got = t
+                .translate_in_tree_storage_class_to_csi(CINDER_NAME, &input)
+                .expect("translates");
+            assert!(sc_eq(&got, &exp), "got {got:?}, want {exp:?}");
+        };
+        ok(sc(&[("foo", "bar")], None), sc(&[("foo", "bar")], None));
+        ok(sc(&[], None), sc(&[], None));
+        ok(
+            sc(&[("fstype", "ext3")], None),
+            sc(&[("csi.storage.k8s.io/fstype", "ext3")], None),
+        );
+        // "availability" is not translated to AllowedTopologies.
+        ok(
+            sc(&[("availability", "nova")], None),
+            sc(&[("availability", "nova")], None),
+        );
+        ok(
+            sc(&[], topo(ZONE_BETA, &["nova"])),
+            sc(&[], topo(CINDER_KEY, &["nova"])),
+        );
+    }
+
+    /// `openstack_cinder.go:78-104` / `:131-160`: inline translation and the
+    /// CSI->in-tree round trip.
+    #[test]
+    fn cinder_inline_and_reverse_translation() {
+        let t = CsiTranslator::new();
+        let vol = inline(serde_json::json!({
+            "name": "v", "cinder": {"volumeID": "vid", "fsType": "ext4", "readOnly": true}
+        }));
+        assert!(t.is_inline_migratable(&vol));
+        let pv = t
+            .translate_in_tree_inline_volume_to_csi(&vol, "ns")
+            .unwrap();
+        assert_eq!(pv.metadata.name, "cinder.csi.openstack.org-vid");
+        let back = t.translate_csi_pv_to_in_tree(&pv).unwrap();
+        let c = back.spec.more_sources.cinder.unwrap();
+        assert_eq!(
+            (c.volume_id.as_str(), c.fs_type.as_str(), c.read_only),
+            ("vid", "ext4", true)
+        );
+        assert!(back.spec.csi.is_none());
+    }
+
+    /// `TranslateInTreePVToCSI` (`openstack_cinder.go`): the source moves to
+    /// CSI, with empty VolumeAttributes, and topology is rewritten.
+    #[test]
+    fn cinder_pv_translates_to_csi() {
+        let t = CsiTranslator::new();
+        let mut pv = cinder_pv();
+        pv.spec.node_affinity = affinity(ZONE_BETA, &["nova"]);
+        let out = t.translate_in_tree_pv_to_csi(&pv).unwrap();
+        assert!(out.spec.more_sources.cinder.is_none());
+        let csi = out.spec.csi.as_ref().unwrap();
+        assert_eq!(csi.driver, "cinder.csi.openstack.org");
+        assert_eq!(csi.volume_handle.as_deref(), Some("vol-1"));
+        assert_eq!(csi.fs_type.as_deref(), Some("ext4"));
+        assert_eq!(csi.read_only, Some(true));
+        assert_eq!(csi.volume_attributes, Some(HashMap::new()));
+        assert_eq!(
+            keys_and_values(&out),
+            vec![(CINDER_KEY.to_string(), vec!["nova".to_string()])]
+        );
+        // The input is not modified.
+        assert!(pv.spec.more_sources.cinder.is_some());
+    }
+
+    #[test]
+    fn cinder_names_and_support() {
+        let t = CsiTranslator::new();
+        let pv = cinder_pv();
+        assert!(t.is_pv_migratable(&pv));
+        assert_eq!(t.get_in_tree_plugin_name_from_pv(&pv).unwrap(), CINDER_NAME);
+        assert_eq!(
+            t.get_csi_name_from_in_tree_name(CINDER_NAME).unwrap(),
+            "cinder.csi.openstack.org"
+        );
+        assert_eq!(
+            t.get_in_tree_name_from_csi_name("cinder.csi.openstack.org")
+                .unwrap(),
+            CINDER_NAME
+        );
+        // `RepairVolumeHandle` is the identity.
+        assert_eq!(
+            t.repair_volume_handle("cinder.csi.openstack.org", "h", "n")
                 .unwrap(),
             "h"
         );
