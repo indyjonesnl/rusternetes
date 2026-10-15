@@ -26,6 +26,7 @@
 //! controller, the part that differs between the ReplicaSet and the
 //! ReplicationController (`resolveControllerRef`, `getPodReplicaSets`).
 
+use super::controller_utils::is_pod_ready;
 use rusternetes_common::resources::Pod;
 use rusternetes_storage::{WatchEvent, WorkQueue};
 use std::collections::hash_map::DefaultHasher;
@@ -33,6 +34,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
+use std::time::Duration;
 
 /// `metav1.OwnerReference`, restricted to what `resolveControllerRef` reads
 /// (replica_set.go:305-321): the kind, the name to look the controller up by,
@@ -57,6 +59,11 @@ pub(crate) enum PodEffect {
     /// `enqueueRS` of the controller the reference resolves to
     /// (`updatePod`, :484-514).
     Enqueue(ControllerRef),
+    /// `enqueueRSAfter(rs, MinReadySeconds)` of the controller the reference
+    /// resolves to, when it has `minReadySeconds > 0`: the pod just became
+    /// Ready, so availability is re-checked once `minReadySeconds` have
+    /// passed (`updatePod`, :493-515).
+    EnqueueAfterMinReady(ControllerRef),
     /// `getPodReplicaSets(pod)` then `enqueueRS` for each: an orphan was
     /// added, or changed, and the controllers that could adopt it are synced
     /// (:441-453, :517-528). Carries the pod's labels.
@@ -81,6 +88,8 @@ struct KnownPod {
     /// Digest of `pod.ResourceVersion`, for the "periodic resync" guard
     /// (:459-463). `None` when the pod carries none.
     resource_version: Option<u64>,
+    /// `podutil.IsPodReady(pod)`, for the Ready-transition check (:509).
+    ready: bool,
 }
 
 /// Pod key ("namespace/name") to what the handlers read of it.
@@ -121,6 +130,7 @@ fn known_of(pod: &Pod) -> KnownPod {
         controller: controller_of(pod),
         labels: labels_digest(pod.metadata.labels.as_ref()),
         resource_version: pod.metadata.resource_version.as_deref().map(digest),
+        ready: is_pod_ready(pod),
     }
 }
 
@@ -205,7 +215,14 @@ impl PodInformerCache {
             }
         }
         if let Some(controller) = cur.controller {
-            effects.push(PodEffect::Enqueue(controller));
+            effects.push(PodEffect::Enqueue(controller.clone()));
+            // "MinReadySeconds in the Pod will generate an Available
+            // condition ... we can fake the update by resyncing the
+            // controller MinReadySeconds after the it is requeued because a
+            // Pod transitioned to Ready."
+            if !old.ready && cur.ready {
+                effects.push(PodEffect::EnqueueAfterMinReady(controller));
+            }
         } else if label_changed || controller_ref_changed {
             // "Otherwise, it's an orphan. If anything changed, sync matching
             // controllers to see if anyone wants to adopt it now."
@@ -279,19 +296,28 @@ impl PodInformerCache {
     }
 }
 
+/// What `resolveControllerRef` returns: upstream hands back the controller
+/// object, and the handlers read its name and `Spec.MinReadySeconds`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedController {
+    pub(crate) name: String,
+    /// `rs.Spec.MinReadySeconds` (0 when unset).
+    pub(crate) min_ready_seconds: i32,
+}
+
 /// The controller-specific half of the pod event handlers.
 pub(crate) trait PodEventTarget: Sync {
     /// The work-queue key prefix: `replicasets` or `replicationcontrollers`.
     fn queue_prefix(&self) -> &'static str;
 
-    /// `resolveControllerRef` (replica_set.go:302-321): the name of the
-    /// controller `controller_ref` points at, or `None` when it is of another
+    /// `resolveControllerRef` (replica_set.go:302-321): the controller
+    /// `controller_ref` points at, or `None` when it is of another
     /// kind, no longer exists, or has a different UID.
     fn resolve_controller_ref(
         &self,
         namespace: &str,
         controller_ref: &ControllerRef,
-    ) -> impl Future<Output = Option<String>> + Send;
+    ) -> impl Future<Output = Option<ResolvedController>> + Send;
 
     /// `getPodReplicaSets` (replica_set.go:289-300): the names of the
     /// controllers in `namespace` that could adopt a pod with these labels.
@@ -322,7 +348,7 @@ pub(crate) async fn apply_pod_observation<T: PodEventTarget>(
     for effect in &observation.effects {
         match effect {
             PodEffect::ObserveCreation(controller_ref) => {
-                if let Some(name) = target
+                if let Some(ResolvedController { name, .. }) = target
                     .resolve_controller_ref(namespace, controller_ref)
                     .await
                 {
@@ -331,7 +357,7 @@ pub(crate) async fn apply_pod_observation<T: PodEventTarget>(
                 }
             }
             PodEffect::ObserveDeletion(controller_ref) => {
-                if let Some(name) = target
+                if let Some(ResolvedController { name, .. }) = target
                     .resolve_controller_ref(namespace, controller_ref)
                     .await
                 {
@@ -340,11 +366,29 @@ pub(crate) async fn apply_pod_observation<T: PodEventTarget>(
                 }
             }
             PodEffect::Enqueue(controller_ref) => {
-                if let Some(name) = target
+                if let Some(ResolvedController { name, .. }) = target
                     .resolve_controller_ref(namespace, controller_ref)
                     .await
                 {
                     queue.add(enqueue(&name)).await;
+                }
+            }
+            PodEffect::EnqueueAfterMinReady(controller_ref) => {
+                if let Some(ResolvedController {
+                    name,
+                    min_ready_seconds,
+                }) = target
+                    .resolve_controller_ref(namespace, controller_ref)
+                    .await
+                {
+                    if min_ready_seconds > 0 {
+                        queue
+                            .add_after(
+                                enqueue(&name),
+                                Duration::from_secs(min_ready_seconds as u64),
+                            )
+                            .await;
+                    }
                 }
             }
             PodEffect::EnqueueMatching(labels) => {
@@ -640,5 +684,143 @@ mod tests {
         assert!(cache
             .replace(&[pod("kept", "rs", Some("1")), pod("new", "rs", Some("1"))])
             .is_empty());
+    }
+
+    fn with_ready(json: String, ready: bool) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v["status"] = json!({"conditions": [{
+            "type": "Ready", "status": if ready { "True" } else { "False" }
+        }]});
+        v.to_string()
+    }
+
+    fn owned(rv: &str, ready: bool) -> String {
+        with_ready(
+            pod_json_with("p", Some(("rs", true)), &[], false, Some(rv)),
+            ready,
+        )
+    }
+
+    /// `updatePod` (replica_set.go:509): `!IsPodReady(old) && IsPodReady(cur)`
+    /// follows `enqueueRS` with `enqueueRSAfter`.
+    #[test]
+    fn a_ready_transition_schedules_the_availability_recheck() {
+        let cache = PodInformerCache::new();
+        cache.on_event(&WatchEvent::Added(key("p"), owned("1", false)));
+        assert_eq!(
+            effects(cache.on_event(&WatchEvent::Modified(key("p"), owned("2", true)))),
+            vec![
+                PodEffect::Enqueue(rs_ref("rs")),
+                PodEffect::EnqueueAfterMinReady(rs_ref("rs"))
+            ]
+        );
+        // Already Ready on both sides: no recheck.
+        assert_eq!(
+            effects(cache.on_event(&WatchEvent::Modified(key("p"), owned("3", true)))),
+            vec![PodEffect::Enqueue(rs_ref("rs"))]
+        );
+        // Ready to not Ready is not a transition to Ready.
+        assert_eq!(
+            effects(cache.on_event(&WatchEvent::Modified(key("p"), owned("4", false)))),
+            vec![PodEffect::Enqueue(rs_ref("rs"))]
+        );
+    }
+
+    /// `addPod` never schedules the recheck, and an orphan has no controller
+    /// whose `MinReadySeconds` could apply (:493-515 sits inside
+    /// `if curControllerRef != nil`).
+    #[test]
+    fn only_a_controlled_update_schedules_the_recheck() {
+        let cache = PodInformerCache::new();
+        assert_eq!(
+            effects(cache.on_event(&WatchEvent::Added(key("p"), owned("1", true)))),
+            vec![PodEffect::ObserveCreation(rs_ref("rs"))]
+        );
+        let orphan = |rv: &str, ready: bool| {
+            with_ready(
+                pod_json_with("o", None, &[("a", "1")], false, Some(rv)),
+                ready,
+            )
+        };
+        cache.on_event(&WatchEvent::Added(key("o"), orphan("1", false)));
+        assert!(
+            effects(cache.on_event(&WatchEvent::Modified(key("o"), orphan("2", true)))).is_empty()
+        );
+    }
+
+    struct Target {
+        min_ready_seconds: i32,
+    }
+
+    impl PodEventTarget for Target {
+        fn queue_prefix(&self) -> &'static str {
+            "replicasets"
+        }
+        async fn resolve_controller_ref(
+            &self,
+            _namespace: &str,
+            controller_ref: &ControllerRef,
+        ) -> Option<ResolvedController> {
+            Some(ResolvedController {
+                name: controller_ref.name.clone(),
+                min_ready_seconds: self.min_ready_seconds,
+            })
+        }
+        async fn pod_controllers(&self, _: &str, _: &HashMap<String, String>) -> Vec<String> {
+            Vec::new()
+        }
+        fn creation_observed(&self, _: &str) {}
+        fn deletion_observed(&self, _: &str, _: &str) {}
+    }
+
+    fn recheck() -> PodObservation {
+        PodObservation {
+            pod_key: "default/p".into(),
+            effects: vec![PodEffect::EnqueueAfterMinReady(rs_ref("rs"))],
+        }
+    }
+
+    /// `rs.Spec.MinReadySeconds > 0` gates `enqueueRSAfter`: the key is not
+    /// queued now, and is queued once the duration has passed.
+    #[tokio::test]
+    async fn the_recheck_enqueues_after_min_ready_seconds() {
+        let queue = WorkQueue::new();
+        apply_pod_observation(
+            &Target {
+                min_ready_seconds: 1,
+            },
+            &queue,
+            &recheck(),
+        )
+        .await;
+        assert_eq!(queue.len().await, 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), queue.get())
+                .await
+                .is_err(),
+            "must not be available before minReadySeconds"
+        );
+        let got = tokio::time::timeout(Duration::from_secs(3), queue.get())
+            .await
+            .expect("available after minReadySeconds");
+        assert_eq!(got.as_deref(), Some("replicasets/default/rs"));
+    }
+
+    #[tokio::test]
+    async fn no_min_ready_seconds_means_no_recheck() {
+        let queue = WorkQueue::new();
+        apply_pod_observation(
+            &Target {
+                min_ready_seconds: 0,
+            },
+            &queue,
+            &recheck(),
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1500), queue.get())
+                .await
+                .is_err()
+        );
     }
 }

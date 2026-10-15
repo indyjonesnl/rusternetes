@@ -2,6 +2,7 @@ use super::controller_utils::{find_min_next_pod_availability_check, is_pod_activ
 use super::expectations::ControllerExpectations;
 use super::pod_informer::{
     apply_pod_observation, ControllerRef, PodEventTarget, PodInformerCache, PodObservation,
+    ResolvedController,
 };
 use super::replicaset::{
     count_pods, get_pods_to_delete, indirectly_related_pods, PodCounts, RelatedSet,
@@ -1038,7 +1039,7 @@ impl<S: Storage + 'static> PodEventTarget for ReplicationControllerController<S>
         &self,
         namespace: &str,
         controller_ref: &ControllerRef,
-    ) -> Option<String> {
+    ) -> Option<ResolvedController> {
         if controller_ref.kind != "ReplicationController" {
             return None;
         }
@@ -1051,7 +1052,10 @@ impl<S: Storage + 'static> PodEventTarget for ReplicationControllerController<S>
             ))
             .await
             .ok()?;
-        (rc.metadata.uid == controller_ref.uid).then_some(rc.metadata.name)
+        (rc.metadata.uid == controller_ref.uid).then(|| ResolvedController {
+            name: rc.metadata.name.clone(),
+            min_ready_seconds: rc.spec.min_ready_seconds.unwrap_or(0),
+        })
     }
 
     /// `ReplicationControllerLister.GetPodControllers` (client-go
