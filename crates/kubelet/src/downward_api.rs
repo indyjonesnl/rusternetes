@@ -31,6 +31,7 @@
 
 use rusternetes_common::quantity::Quantity;
 use rusternetes_common::resources::{Pod, ResourceFieldSelector};
+use rusternetes_common::validation::metav1::is_qualified_name;
 
 /// Error returned when a DownwardAPI field path or resource selector is
 /// unsupported or cannot be resolved against the supplied pod.
@@ -39,6 +40,9 @@ pub enum DownwardError {
     /// The supplied `fieldRef.fieldPath` is not one the kubelet supports
     /// (e.g. `spec.unknownField`).
     UnsupportedField(String),
+    /// A subscripted `fieldRef.fieldPath` that `ExtractFieldPathAsString`
+    /// rejects; carries the verbatim upstream message.
+    FieldPath(String),
     /// The supplied `resourceFieldRef.resource` is not one the kubelet
     /// supports (e.g. `limits.unknown`).
     UnsupportedResource(String),
@@ -56,7 +60,8 @@ pub enum DownwardError {
 impl std::fmt::Display for DownwardError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnsupportedField(p) => write!(f, "Unsupported field path: {p}"),
+            Self::UnsupportedField(p) => write!(f, "unsupported fieldPath: {p}"),
+            Self::FieldPath(m) => f.write_str(m),
             Self::UnsupportedResource(r) => write!(f, "Unsupported resource field: {r}"),
             Self::MissingSpec => f.write_str("Pod has no spec"),
             Self::ContainerNotFound(n) => write!(f, "Container {n} not found"),
@@ -67,69 +72,69 @@ impl std::fmt::Display for DownwardError {
 
 impl std::error::Error for DownwardError {}
 
-/// Resolve a DownwardAPI `fieldRef.fieldPath` against the pod.
-///
-/// Supported paths (mirrors upstream
-/// `pkg/kubelet/kubelet_pods.go::podFieldSelectorRuntimeValue`):
+/// Resolve a downwardAPI/projected **volume** `fieldRef.fieldPath` against the
+/// pod. Port of `fieldpath.ExtractFieldPathAsString`
+/// (`pkg/fieldpath/fieldpath.go:55-90`), the only resolver the volume side
+/// reaches (`pkg/volume/downwardapi/downwardapi.go:85`):
 ///
 /// - `metadata.name`, `metadata.namespace`, `metadata.uid`
-/// - `metadata.labels`, `metadata.annotations` (rendered as
-///   `key="value"` lines joined by `\n`, sorted by key, no trailing newline)
+/// - `metadata.labels`, `metadata.annotations` (`FormatMap`: `key="value"`
+///   lines joined by `\n`, sorted by key, no trailing newline)
 /// - `metadata.labels['key']`, `metadata.annotations['key']` (single value)
-/// - `spec.nodeName`, `spec.serviceAccountName`
-/// - `status.podIP`, `status.hostIP`
+///
+/// Everything else, including `status.*` / `spec.*`, is an error
+/// (`unsupported fieldPath: %v`). Those env-only paths are resolved by
+/// `podFieldSelectorRuntimeValue` (`kubelet_pods.go:1000-1019`), ported in
+/// `cri_runtime`; volume validation (`validVolumeDownwardAPIFieldPathExpressions`,
+/// `pkg/apis/core/validation/validation.go:1114`) rejects them up front.
 pub fn resolve_pod_field(pod: &Pod, field_path: &str) -> Result<String, DownwardError> {
-    let value = match field_path {
-        "metadata.name" => pod.metadata.name.clone(),
-        "metadata.namespace" => pod
-            .metadata
-            .namespace
-            .clone()
-            .unwrap_or_else(|| "default".to_string()),
-        "metadata.uid" => pod.metadata.uid.clone(),
-        "spec.nodeName" => pod
-            .spec
-            .as_ref()
-            .and_then(|s| s.node_name.clone())
-            .unwrap_or_default(),
-        "spec.serviceAccountName" => pod
-            .spec
-            .as_ref()
-            .and_then(|s| s.service_account_name.clone())
-            .unwrap_or_else(|| "default".to_string()),
-        "status.podIP" => pod
-            .status
-            .as_ref()
-            .and_then(|s| s.pod_ip.clone())
-            .unwrap_or_default(),
-        "status.hostIP" => pod
-            .status
-            .as_ref()
-            .and_then(|s| s.host_ip.clone())
-            .unwrap_or_else(|| "127.0.0.1".to_string()),
-        "metadata.labels" => render_kv_map(pod.metadata.labels.as_ref()),
-        "metadata.annotations" => render_kv_map(pod.metadata.annotations.as_ref()),
-        other => {
-            if let Some(key) = strip_bracket_key(other, "metadata.labels[") {
-                pod.metadata
-                    .labels
-                    .as_ref()
-                    .and_then(|m| m.get(key))
-                    .cloned()
-                    .unwrap_or_default()
-            } else if let Some(key) = strip_bracket_key(other, "metadata.annotations[") {
-                pod.metadata
+    if let Some((path, subscript)) = split_maybe_subscripted_path(field_path) {
+        let invalid = |errs: Vec<String>| {
+            DownwardError::FieldPath(format!(
+                "invalid key subscript in {field_path}: {}",
+                errs.join(";")
+            ))
+        };
+        return match path {
+            "metadata.annotations" => {
+                let errs = is_qualified_name(&subscript.to_lowercase());
+                if !errs.is_empty() {
+                    return Err(invalid(errs));
+                }
+                Ok(pod
+                    .metadata
                     .annotations
                     .as_ref()
-                    .and_then(|m| m.get(key))
+                    .and_then(|m| m.get(subscript))
                     .cloned()
-                    .unwrap_or_default()
-            } else {
-                return Err(DownwardError::UnsupportedField(other.to_string()));
+                    .unwrap_or_default())
             }
-        }
-    };
-    Ok(value)
+            "metadata.labels" => {
+                let errs = is_qualified_name(subscript);
+                if !errs.is_empty() {
+                    return Err(invalid(errs));
+                }
+                Ok(pod
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|m| m.get(subscript))
+                    .cloned()
+                    .unwrap_or_default())
+            }
+            _ => Err(DownwardError::FieldPath(format!(
+                "fieldPath \"{field_path}\" does not support subscript"
+            ))),
+        };
+    }
+    match field_path {
+        "metadata.annotations" => Ok(render_kv_map(pod.metadata.annotations.as_ref())),
+        "metadata.labels" => Ok(render_kv_map(pod.metadata.labels.as_ref())),
+        "metadata.name" => Ok(pod.metadata.name.clone()),
+        "metadata.namespace" => Ok(pod.metadata.namespace.clone().unwrap_or_default()),
+        "metadata.uid" => Ok(pod.metadata.uid.clone()),
+        other => Err(DownwardError::UnsupportedField(other.to_string())),
+    }
 }
 
 /// Resolve a DownwardAPI `resourceFieldRef` against the pod, defaulting unset
@@ -408,25 +413,22 @@ fn go_quote(s: &str) -> String {
     out
 }
 
-/// Strip a `prefix[` and trailing `']` to recover the bracketed key in
-/// `metadata.labels['key']` / `metadata.annotations['key']`. Returns
-/// `None` when the path does not match.
-fn strip_bracket_key<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
-    let rest = path.strip_prefix(prefix)?;
-    let inner = rest.strip_suffix(']')?;
-    // K8s allows both single and double quotes, plus unquoted keys.
-    let unquoted = inner
-        .strip_prefix('\'')
-        .and_then(|s| s.strip_suffix('\''))
-        .or_else(|| inner.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
-        .unwrap_or(inner);
-    Some(unquoted)
+/// Port of `fieldpath.SplitMaybeSubscriptedPath`
+/// (`pkg/fieldpath/fieldpath.go:108-120`): only the `path['key']` form is a
+/// subscript; the path part must be non-empty.
+fn split_maybe_subscripted_path(field_path: &str) -> Option<(&str, &str)> {
+    let s = field_path.strip_suffix("']")?;
+    let (path, subscript) = s.split_once("['")?;
+    if path.is_empty() {
+        return None;
+    }
+    Some((path, subscript))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusternetes_common::resources::{Container, Pod, PodSpec, PodStatus};
+    use rusternetes_common::resources::{Container, Pod, PodSpec};
     use rusternetes_common::types::{ObjectMeta, ResourceRequirements, TypeMeta};
     use std::collections::HashMap;
 
@@ -456,26 +458,62 @@ mod tests {
     }
 
     #[test]
-    fn metadata_namespace_defaults_to_default_when_missing() {
-        let mut p = make_pod();
-        p.metadata.namespace = None;
-        assert_eq!(
-            resolve_pod_field(&p, "metadata.namespace").unwrap(),
-            "default"
-        );
-    }
-
-    #[test]
     fn unknown_field_returns_unsupported_error() {
         let p = make_pod();
         let err = resolve_pod_field(&p, "spec.unknownField").unwrap_err();
         assert!(matches!(err, DownwardError::UnsupportedField(_)));
     }
 
+    /// `TestExtractFieldPathAsString` (`pkg/fieldpath/fieldpath_test.go:51`):
+    /// the volume side (`downwardapi.go:85`) reaches only
+    /// `ExtractFieldPathAsString`, which has no `status.*` / `spec.*` cases —
+    /// no loopback invention for `status.hostIP`.
     #[test]
-    fn status_host_ip_defaults_to_loopback() {
+    fn status_and_spec_paths_are_unsupported_for_volumes() {
         let p = make_pod();
-        assert_eq!(resolve_pod_field(&p, "status.hostIP").unwrap(), "127.0.0.1");
+        for path in [
+            "status.hostIP",
+            "status.hostIPs",
+            "status.podIP",
+            "spec.nodeName",
+            "spec.serviceAccountName",
+            "metadata.whoops",
+        ] {
+            let err = resolve_pod_field(&p, path).unwrap_err();
+            assert_eq!(err.to_string(), format!("unsupported fieldPath: {path}"));
+        }
+    }
+
+    #[test]
+    fn namespace_is_returned_as_is() {
+        let mut p = make_pod();
+        p.metadata.namespace = None;
+        assert_eq!(resolve_pod_field(&p, "metadata.namespace").unwrap(), "");
+    }
+
+    #[test]
+    fn invalid_label_and_annotation_subscripts() {
+        let mut p = make_pod();
+        p.metadata.annotations = Some(HashMap::from([("Www.k8s.io/test".into(), "1".into())]));
+        assert_eq!(
+            resolve_pod_field(&p, "metadata.annotations['Www.k8s.io/test']").unwrap(),
+            "1"
+        );
+        let e = resolve_pod_field(&p, "metadata.annotations['invalid~key']").unwrap_err();
+        assert!(e
+            .to_string()
+            .contains("invalid key subscript in metadata.annotations['invalid~key']"));
+        let e = resolve_pod_field(&p, "metadata.labels['Www.k8s.io/test']").unwrap_err();
+        assert!(e
+            .to_string()
+            .contains("invalid key subscript in metadata.labels"));
+        let e = resolve_pod_field(&p, "metadata.notexisting['something']").unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "fieldPath \"metadata.notexisting['something']\" does not support subscript"
+        );
+        // Only the `['key']` form is a subscript; `["key"]` and unquoted are not.
+        assert!(resolve_pod_field(&p, "metadata.labels[app]").is_err());
     }
 
     #[test]
@@ -701,15 +739,5 @@ mod tests {
                 .unwrap(),
             (64 * 1024 * 1024).to_string()
         );
-    }
-
-    #[test]
-    fn pod_status_pod_ip_round_trips() {
-        let mut p = make_pod();
-        p.status = Some(PodStatus {
-            pod_ip: Some("10.244.0.5".into()),
-            ..Default::default()
-        });
-        assert_eq!(resolve_pod_field(&p, "status.podIP").unwrap(), "10.244.0.5");
     }
 }

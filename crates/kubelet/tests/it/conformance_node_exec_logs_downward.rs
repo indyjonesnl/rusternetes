@@ -269,27 +269,8 @@ fn downward_api_provides_pod_name_namespace_and_ip() {
         resolve_pod_field(&pod, "metadata.namespace").unwrap(),
         "downward-ns"
     );
-    assert_eq!(
-        resolve_pod_field(&pod, "status.podIP").unwrap(),
-        "10.244.0.5"
-    );
-}
-
-/// [sig-node] Downward API should provide host IP as an env var
-///
-/// Upstream: k8s.io/kubernetes/test/e2e/common/node/downwardapi.go:67
-/// Sonobuoy (Round 160): PASS
-#[test]
-fn downward_api_provides_host_ip_env_var() {
-    let mut pod = make_pod("downward-pod", "ns");
-    pod.status = Some(PodStatus {
-        host_ip: Some("192.168.1.10".to_string()),
-        ..Default::default()
-    });
-    assert_eq!(
-        resolve_pod_field(&pod, "status.hostIP").unwrap(),
-        "192.168.1.10"
-    );
+    // status.podIP is an env-only path (podFieldSelectorRuntimeValue, covered
+    // in cri_runtime::translate tests); the volume resolver rejects it.
 }
 
 /// [sig-node] Downward API should provide pod UID as env vars
@@ -397,29 +378,6 @@ fn downward_api_defaults_limits_to_node_allocatable() {
     assert_eq!(
         resolve_container_resource(&pod, &sel, Some(&node_allocatable())).unwrap(),
         (8i64 * 1024 * 1024 * 1024).to_string()
-    );
-}
-
-/// [sig-node] Downward API should provide host IP and pod IP via host network [LinuxOnly]
-///
-/// Upstream: k8s.io/kubernetes/test/e2e/common/node/downwardapi.go:108 (f.It)
-/// Sonobuoy (Round 160): PASS
-#[test]
-fn downward_api_provides_both_host_and_pod_ip_when_hostnetwork() {
-    let mut pod = make_pod("hn-pod", "ns");
-    pod.spec.as_mut().unwrap().host_network = Some(true);
-    pod.status = Some(PodStatus {
-        host_ip: Some("192.0.2.10".to_string()),
-        pod_ip: Some("192.0.2.10".to_string()),
-        ..Default::default()
-    });
-    assert_eq!(
-        resolve_pod_field(&pod, "status.hostIP").unwrap(),
-        "192.0.2.10"
-    );
-    assert_eq!(
-        resolve_pod_field(&pod, "status.podIP").unwrap(),
-        "192.0.2.10"
     );
 }
 
