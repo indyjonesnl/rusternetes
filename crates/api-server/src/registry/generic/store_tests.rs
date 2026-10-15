@@ -1331,7 +1331,13 @@ async fn get_rejects_a_too_large_resource_version() {
     );
 }
 
-/// storage/api_object_versioner.go:90-103: an unparseable version is Invalid.
+/// storage/api_object_versioner.go:90-103: an unparseable version is a
+/// `storage.InvalidError`, a plain error. `etcd3 Get` / `CacheDelegator.Get`
+/// return it as is (cacher/delegator.go:163-166), so the endpoint's
+/// `ErrorToAPIStatus` default arm renders 500, reason `Unknown` (empty, omitted
+/// on the wire), message `InvalidError.Error()` =
+/// `errs.ToAggregate().Error()` (storage/errors.go:183-185), no details
+/// (responsewriters/status.go:60-81).
 #[tokio::test]
 async fn get_rejects_an_unparseable_resource_version() {
     let registry = store(TestStrategy::default());
@@ -1340,13 +1346,40 @@ async fn get_rejects_an_unparseable_resource_version() {
         .get(&ctx(), "foo", &get_rv("abc"))
         .await
         .unwrap_err();
-    match err {
-        Error::Invalid(errs) => {
-            let s = format!("{}", Error::Invalid(errs));
-            assert!(s.contains("resourceVersion: Invalid value: \"abc\""), "{s}");
-        }
-        other => panic!("expected Invalid, got {other:?}"),
-    }
+    let Error::Status(status) = err else {
+        panic!("expected a bare 500 Status, got {err:?}");
+    };
+    assert_eq!(status.code, Some(500));
+    assert_eq!(status.reason, None);
+    assert_eq!(
+        status.message.as_deref(),
+        Some("resourceVersion: Invalid value: \"abc\": strconv.ParseUint: parsing \"abc\": invalid syntax")
+    );
+    assert!(status.details.is_none());
+}
+
+/// `Store.Update` reads the new object's version with
+/// `Versioner().ObjectResourceVersion` (registry/generic/registry/store.go:662),
+/// whose `strconv.ParseUint` error (storage/api_object_versioner.go:74-84) is
+/// returned through `GuaranteedUpdate` and `InterpretUpdateError` untouched:
+/// a plain error, so 500 / reason Unknown / message = `strconv` text.
+#[tokio::test]
+async fn update_with_an_unparseable_resource_version_is_a_plain_500() {
+    let registry = store(TestStrategy::default());
+    create(&registry, cm("foo")).await;
+    let mut bad = cm("foo");
+    bad.metadata.resource_version = Some("abc".to_string());
+    let err = update(&registry, bad).await.unwrap_err();
+    let Error::Status(status) = err else {
+        panic!("expected a bare 500 Status, got {err:?}");
+    };
+    assert_eq!(status.code, Some(500));
+    assert_eq!(status.reason, None);
+    assert_eq!(
+        status.message.as_deref(),
+        Some("strconv.ParseUint: parsing \"abc\": invalid syntax")
+    );
+    assert!(status.details.is_none());
 }
 
 /// A missing object is still NotFound, whatever the version asked for.

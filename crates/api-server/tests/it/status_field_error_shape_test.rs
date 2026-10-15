@@ -359,16 +359,17 @@ async fn pod_update_changing_node_name_emits_field_value_forbidden() {
 }
 
 /// Upstream: a JSON Patch `{"op":"remove","path":"/spec/doesNotExist"}`
-/// against an existing object → the patch library raises a "path not found"
-/// failure that the api-server reflects as `field.NotFound(path, "")` →
-/// `causes[].reason = "FieldValueNotFound"`, `field = "spec.doesNotExist"`.
-///
-/// Rust handler at `crates/api-server/src/handlers/pod.rs:1450-1500` does
-/// surface patch failures as 422 Invalid (via
-/// `Error::InvalidResource(e.to_string())`), but the builder still emits a
-/// hardcoded `FieldValueInvalid` / `metadata.name` cause.
+/// against an existing object fails inside `patchObj.Apply`, which
+/// `jsonPatcher.applyJSPatch` returns as
+/// `errors.NewGenericServerResponse(http.StatusUnprocessableEntity, "",
+/// schema.GroupResource{}, "", err.Error(), 0, false)`
+/// (apiserver/pkg/endpoints/handlers/patch.go:412-415). That is code 422,
+/// reason `Invalid`, the canned message "the server rejected our request due
+/// to an error in our request" (the library's text is dropped because
+/// `isUnexpectedResponse` is false), and an empty `details` with NO causes —
+/// not `field.NotFound`.
 #[tokio::test]
-async fn json_patch_remove_missing_field_emits_field_value_not_found() {
+async fn json_patch_remove_missing_field_is_a_generic_422() {
     let router = spawn_router();
     create_namespace(&router, "default").await;
 
@@ -392,7 +393,17 @@ async fn json_patch_remove_missing_field_emits_field_value_not_found() {
     )
     .await;
     assert_eq!(status, 422, "expected 422 Invalid: body={body}");
-    assert_status_with_cause(&body, "FieldValueNotFound", "spec.doesNotExist");
+    assert_invalid_envelope(&body);
+    assert_eq!(
+        body.get("message").and_then(|v| v.as_str()),
+        Some("the server rejected our request due to an error in our request"),
+        "body={body}"
+    );
+    assert_eq!(
+        body.get("details"),
+        Some(&json!({})),
+        "details is an empty struct, no causes: body={body}"
+    );
 }
 
 /// Upstream: `spec.restartPolicy = "InvalidPolicy"` →
