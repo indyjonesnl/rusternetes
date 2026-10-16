@@ -104,7 +104,7 @@ pub async fn create_subject_access_review(
         },
     });
 
-    Ok((StatusCode::CREATED, Json(sar)))
+    Ok((StatusCode::CREATED, crate::audit::json_response(sar)))
 }
 
 /// Create a SelfSubjectAccessReview (authorization.k8s.io/v1)
@@ -201,7 +201,7 @@ pub async fn create_self_subject_access_review(
         },
     });
 
-    Ok((StatusCode::CREATED, Json(ssar)))
+    Ok((StatusCode::CREATED, crate::audit::json_response(ssar)))
 }
 
 /// Create a LocalSubjectAccessReview (authorization.k8s.io/v1)
@@ -305,7 +305,7 @@ pub async fn create_local_subject_access_review(
         },
     });
 
-    Ok((StatusCode::CREATED, Json(lsar)))
+    Ok((StatusCode::CREATED, crate::audit::json_response(lsar)))
 }
 
 /// Create a SelfSubjectRulesReview (authorization.k8s.io/v1)
@@ -353,7 +353,7 @@ pub async fn create_self_subject_rules_review(
         evaluation_error: None,
     });
 
-    Ok((StatusCode::CREATED, Json(ssrr)))
+    Ok((StatusCode::CREATED, crate::audit::json_response(ssrr)))
 }
 
 #[cfg(test)]

@@ -18,7 +18,7 @@ use axum::{
     extract::{Path, Query, State},
     http::HeaderMap,
     response::{IntoResponse, Response},
-    Extension, Json,
+    Extension,
 };
 use rusternetes_common::{
     admission::{GroupVersionKind, GroupVersionResource},
@@ -382,7 +382,7 @@ pub async fn list(
             Some(resource_version.to_string()),
             "Service",
         );
-        return Ok(Json(table).into_response());
+        return Ok(crate::audit::json_response(table).into_response());
     }
 
     // Wrap in proper List object
@@ -395,7 +395,7 @@ pub async fn list(
         )
         .await,
     );
-    Ok(Json(list).into_response())
+    Ok(crate::audit::json_response(list).into_response())
 }
 
 /// List all services across all namespaces
@@ -477,7 +477,7 @@ pub async fn list_all_services(
             Some(resource_version.to_string()),
             "Service",
         );
-        return Ok(Json(table).into_response());
+        return Ok(crate::audit::json_response(table).into_response());
     }
 
     let mut list = List::new("ServiceList", "v1", services);
@@ -489,5 +489,5 @@ pub async fn list_all_services(
         )
         .await,
     );
-    Ok(Json(list).into_response())
+    Ok(crate::audit::json_response(list).into_response())
 }

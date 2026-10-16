@@ -31,7 +31,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{header, HeaderMap},
     response::{IntoResponse, Response},
-    Extension, Json,
+    Extension,
 };
 use rusternetes_common::{
     admission::{GroupVersionKind, GroupVersionResource},
@@ -198,7 +198,7 @@ pub async fn list_validating_admission_policies(
     );
     let mut value = serde_json::to_value(&list).map_err(|e| Error::Internal(e.to_string()))?;
     to_v1beta1(&mut value);
-    Ok(Json(value).into_response())
+    Ok(crate::audit::json_response(value).into_response())
 }
 
 /// GET `/status`.
@@ -358,7 +358,7 @@ pub async fn list_validating_admission_policy_bindings(
     );
     let mut value = serde_json::to_value(&list).map_err(|e| Error::Internal(e.to_string()))?;
     to_v1beta1(&mut value);
-    Ok(Json(value).into_response())
+    Ok(crate::audit::json_response(value).into_response())
 }
 
 /// Watch `validatingadmissionpolicies` at v1beta1 (404 unless the gate is on).

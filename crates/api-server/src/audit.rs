@@ -695,6 +695,15 @@ pub fn log_response_object<B: serde::Serialize>(obj: &B) {
     });
 }
 
+/// A JSON 2xx body that records the object it serializes: `log_response_object`
+/// then `Json(obj)`, the pair `WriteObjectNegotiated` performs
+/// (responsewriters/writers.go:346). Handlers that return a typed list/review
+/// directly use this instead of a bare `Json(..)`, which would bypass audit.
+pub fn json_response<B: serde::Serialize>(obj: B) -> axum::Json<B> {
+    log_response_object(&obj);
+    axum::Json(obj)
+}
+
 /// `audit.AddAuditAnnotation(ctx, key, value)` (context.go:297).
 #[allow(dead_code)]
 pub fn add_audit_annotation(key: &str, value: &str) {
@@ -1742,5 +1751,74 @@ rules:
         assert_eq!(rs.message.as_deref(), Some("error serving request"));
         assert_eq!(rs.reason.as_deref(), Some("BadRequest"));
         assert_eq!(ev[0].user.username, "");
+    }
+    // #2933: every response object is recorded where it is serialized
+    // (`WriteObjectNegotiated` -> `audit.LogResponseObject`,
+    // responsewriters/writers.go:346), lists included. The typed list handlers
+    // returned `Json(list)` directly and bypassed it.
+    async fn list_handler_response_object(
+        route: axum::routing::MethodRouter,
+    ) -> Option<serde_json::Value> {
+        let (_resp, ev) = run_policy_app(level_policy("RequestResponse", false), route).await;
+        ev.last().and_then(|e| e.response_object.clone())
+    }
+
+    fn list_state() -> Arc<crate::state::ApiServerState> {
+        use rusternetes_common::auth::TokenManager;
+        use rusternetes_common::observability::MetricsRegistry;
+        use rusternetes_storage::StorageBackend;
+        Arc::new(crate::state::ApiServerState::new(
+            Arc::new(StorageBackend::new_memory()),
+            Arc::new(TokenManager::new(b"test-secret")),
+            Arc::new(rusternetes_common::authz::AlwaysAllowAuthorizer)
+                as Arc<dyn rusternetes_common::authz::Authorizer>,
+            Arc::new(MetricsRegistry::new()),
+            true,
+        ))
+    }
+
+    fn anon() -> axum::Extension<crate::middleware::AuthContext> {
+        axum::Extension(crate::middleware::AuthContext {
+            user: rusternetes_common::auth::UserInfo::anonymous(),
+        })
+    }
+
+    #[tokio::test]
+    async fn deployment_list_is_audited_at_request_response() {
+        use axum::extract::{Path, Query, State};
+        let state = list_state();
+        let obj = list_handler_response_object(get(move || async move {
+            crate::handlers::deployment::list(
+                State(state),
+                anon(),
+                Path("ns".to_string()),
+                axum::http::HeaderMap::new(),
+                Query(Default::default()),
+            )
+            .await
+            .unwrap()
+        }))
+        .await
+        .expect("a DeploymentList must be recorded as responseObject");
+        assert_eq!(obj["kind"], "DeploymentList");
+    }
+
+    #[tokio::test]
+    async fn secret_list_is_audited_at_request_response() {
+        use axum::extract::{Path, Query, State};
+        let state = list_state();
+        let obj = list_handler_response_object(get(move || async move {
+            crate::handlers::secret::list(
+                State(state),
+                anon(),
+                Path("ns".to_string()),
+                Query(Default::default()),
+            )
+            .await
+            .unwrap()
+        }))
+        .await
+        .expect("a SecretList must be recorded as responseObject");
+        assert_eq!(obj["kind"], "SecretList");
     }
 }

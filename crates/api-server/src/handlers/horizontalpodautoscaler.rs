@@ -15,7 +15,7 @@ use axum::{
     extract::{OriginalUri, Path, Query, State},
     http::{header, HeaderMap, Uri},
     response::{IntoResponse, Response},
-    Extension, Json,
+    Extension,
 };
 use rusternetes_common::{
     admission::{GroupVersionKind, GroupVersionResource},
@@ -412,7 +412,7 @@ pub async fn list(
     let mut value = serde_json::to_value(&list)
         .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
     to_served_json(&uri, &mut value);
-    Ok(Json(value).into_response())
+    Ok(crate::audit::json_response(value).into_response())
 }
 
 pub async fn list_all(
@@ -471,7 +471,7 @@ pub async fn list_all(
     let mut value = serde_json::to_value(&list)
         .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
     to_served_json(&uri, &mut value);
-    Ok(Json(value).into_response())
+    Ok(crate::audit::json_response(value).into_response())
 }
 
 /// GET `/status`: `StatusREST.Get` is the store's `Get`.

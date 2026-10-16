@@ -15,7 +15,7 @@ use axum::{
     extract::{Path, Query, State},
     http::HeaderMap,
     response::{IntoResponse, Response},
-    Extension, Json,
+    Extension,
 };
 use rusternetes_common::{
     admission::{GroupVersionKind, GroupVersionResource},
@@ -401,12 +401,12 @@ pub async fn list(
             Some(resource_version),
             "ReplicaSet",
         );
-        return Ok(Json(table).into_response());
+        return Ok(crate::audit::json_response(table).into_response());
     }
 
     let mut list = List::new("ReplicaSetList", "apps/v1", replicasets);
     list.metadata.resource_version = Some(resource_version);
-    Ok(Json(list).into_response())
+    Ok(crate::audit::json_response(list).into_response())
 }
 
 /// List all replicasets across all namespaces
@@ -488,10 +488,10 @@ pub async fn list_all_replicasets(
             Some(resource_version),
             "ReplicaSet",
         );
-        return Ok(Json(table).into_response());
+        return Ok(crate::audit::json_response(table).into_response());
     }
 
     let mut list = List::new("ReplicaSetList", "apps/v1", replicasets);
     list.metadata.resource_version = Some(resource_version);
-    Ok(Json(list).into_response())
+    Ok(crate::audit::json_response(list).into_response())
 }

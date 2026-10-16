@@ -15,7 +15,7 @@ use axum::{
     extract::{Path, Query, State},
     http::HeaderMap,
     response::{IntoResponse, Response},
-    Extension, Json,
+    Extension,
 };
 use rusternetes_common::{
     admission::{GroupVersionKind, GroupVersionResource},
@@ -389,7 +389,7 @@ pub async fn list_replicationcontrollers(
             Some(resource_version.clone()),
             "ReplicationController",
         );
-        return Ok(axum::Json(table).into_response());
+        return Ok(crate::audit::json_response(table).into_response());
     }
 
     let mut list = List::new("ReplicationControllerList", "v1", rcs);
@@ -397,7 +397,7 @@ pub async fn list_replicationcontrollers(
         crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
             .await,
     );
-    Ok(Json(list).into_response())
+    Ok(crate::audit::json_response(list).into_response())
 }
 
 /// List all replicationcontrollers across all namespaces
@@ -460,7 +460,7 @@ pub async fn list_all_replicationcontrollers(
             Some(resource_version.clone()),
             "ReplicationController",
         );
-        return Ok(axum::Json(table).into_response());
+        return Ok(crate::audit::json_response(table).into_response());
     }
 
     let mut list = List::new("ReplicationControllerList", "v1", rcs);
@@ -468,5 +468,5 @@ pub async fn list_all_replicationcontrollers(
         crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
             .await,
     );
-    Ok(Json(list).into_response())
+    Ok(crate::audit::json_response(list).into_response())
 }

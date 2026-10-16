@@ -42,7 +42,7 @@ pub async fn get(
         }
     };
 
-    Ok(Json(component_status))
+    Ok(crate::audit::json_response(component_status))
 }
 
 /// List all component statuses
@@ -73,5 +73,5 @@ pub async fn list(
     let mut list = List::new("ComponentStatusList", "v1", components);
     list.metadata.resource_version =
         Some(crate::handlers::list_collection_resource_version(&_state.storage, &list.items).await);
-    Ok(Json(list))
+    Ok(crate::audit::json_response(list))
 }

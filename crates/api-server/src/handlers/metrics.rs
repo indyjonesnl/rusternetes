@@ -76,7 +76,7 @@ pub async fn get_node_metrics(
     // it returns `errors.NewNotFound(m.groupResource, name)` -- no zero-usage
     // fallback object.
     match node_metrics(state.storage.as_ref(), &node).await {
-        Some(m) => Ok(Json(m)),
+        Some(m) => Ok(crate::audit::json_response(m)),
         None => Err(node_metrics_not_found(&name)),
     }
 }
@@ -160,7 +160,7 @@ pub async fn list_node_metrics(
     let mut list = List::new("NodeMetricsList", "metrics.k8s.io/v1beta1", metrics);
     list.metadata.resource_version =
         Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
-    Ok(Json(list))
+    Ok(crate::audit::json_response(list))
 }
 
 /// Get metrics for a specific pod
@@ -189,7 +189,7 @@ pub async fn get_pod_metrics(
     // metrics-server pkg/api/pod.go Get: `len(ms) == 0` returns NotFound
     // (lines 134-136) -- no fabricated object.
     match pod_metrics(state.storage.as_ref(), &namespace, &pod).await {
-        Some(m) => Ok(Json(m)),
+        Some(m) => Ok(crate::audit::json_response(m)),
         None => Err(pod_metrics_not_found(&namespace, &name)),
     }
 }
@@ -233,7 +233,7 @@ pub async fn list_pod_metrics(
     let mut list = List::new("PodMetricsList", "metrics.k8s.io/v1beta1", metrics_list);
     list.metadata.resource_version =
         Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
-    Ok(Json(list))
+    Ok(crate::audit::json_response(list))
 }
 
 /// List metrics for all pods across all namespaces
@@ -280,7 +280,7 @@ pub async fn list_all_pod_metrics(
     let mut list = List::new("PodMetricsList", "metrics.k8s.io/v1beta1", metrics_list);
     list.metadata.resource_version =
         Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
-    Ok(Json(list))
+    Ok(crate::audit::json_response(list))
 }
 
 #[cfg(test)]
