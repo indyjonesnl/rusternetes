@@ -73,6 +73,13 @@
 #                       (default: 256; one full suite on a fresh cluster grows
 #                       the store to ~85 MB, so 256 means "more than a couple
 #                       of suites of never-reclaimed pages")
+#   --max-compaction-lag N
+#                       Refuse to run when the storage backend's compaction
+#                       backlog (max(id) - compact_rev_key) exceeds N revisions
+#                       (default: 10000, i.e. 10x rhino's compact_min_retain of
+#                       1000; healthy sits at ~1000-1600). Read from a copy of
+#                       state.db, so it needs python3 and is SKIPPED, not
+#                       failed, when that is unavailable (#1806)
 #   --skip-node-image-check
 #                       Skip only the per-node binary-equality assertion
 #   --timeout SECONDS   Budget for the whole preflight (default: 60)
@@ -98,6 +105,7 @@ SANDBOX_IMAGE="registry.k8s.io/pause:3.10.1"
 SKIP_IMAGE_PULL=0
 STORAGE_CONTAINER="rusternetes-rhino"
 MAX_STORAGE_MB=256
+MAX_COMPACTION_LAG=10000
 SKIP_NODE_IMAGE_CHECK=0
 # Per-node compose service pairs that MUST run the same build. Each entry is
 # "node-1 container:node-2 container:binary path". containerd/containerd2 are
@@ -129,6 +137,7 @@ while [ $# -gt 0 ]; do
         --skip-image-pull) SKIP_IMAGE_PULL=1; shift ;;
         --storage-container) [ $# -ge 2 ] || die "--storage-container requires a value"; STORAGE_CONTAINER="$2"; shift 2 ;;
         --max-storage-mb)  [ $# -ge 2 ] || die "--max-storage-mb requires a value"; MAX_STORAGE_MB="$2"; shift 2 ;;
+        --max-compaction-lag) [ $# -ge 2 ] || die "--max-compaction-lag requires a value"; MAX_COMPACTION_LAG="$2"; shift 2 ;;
         --skip-node-image-check) SKIP_NODE_IMAGE_CHECK=1; shift ;;
         --timeout)         [ $# -ge 2 ] || die "--timeout requires a value"; BUDGET_SECONDS="$2"; shift 2 ;;
         -h|--help)         usage; exit 0 ;;
@@ -138,6 +147,7 @@ done
 
 [[ "$BUDGET_SECONDS" =~ ^[1-9][0-9]*$ ]] || die "--timeout must be a positive integer"
 [[ "$MAX_STORAGE_MB" =~ ^[1-9][0-9]*$ ]] || die "--max-storage-mb must be a positive integer"
+[[ "$MAX_COMPACTION_LAG" =~ ^[1-9][0-9]*$ ]] || die "--max-compaction-lag must be a positive integer"
 
 KUBECTL="${KUBECTL:-kubectl}"
 CONTAINER_RT="${CONTAINER_RUNTIME:-docker}"
@@ -146,9 +156,9 @@ command -v "$KUBECTL" >/dev/null 2>&1 || die "kubectl not found (set \$KUBECTL t
 [ -f "$KUBECONFIG_PATH" ] || die "kubeconfig not found: $KUBECONFIG_PATH"
 export KUBECONFIG="$KUBECONFIG_PATH"
 
-# Per-assertion timeout so one hung call cannot eat the whole budget. Eight
-# assertions share the budget; give each an eighth, floor 5s.
-PER_CHECK_TIMEOUT=$(( BUDGET_SECONDS / 8 ))
+# Per-assertion timeout so one hung call cannot eat the whole budget. Nine
+# assertions share the budget; give each a ninth, floor 5s.
+PER_CHECK_TIMEOUT=$(( BUDGET_SECONDS / 9 ))
 [ "$PER_CHECK_TIMEOUT" -lt 5 ] && PER_CHECK_TIMEOUT=5
 
 FAILURES=()
@@ -363,6 +373,52 @@ else
         else
             pass "storage backend holds ${storage_mb} MB (ceiling ${MAX_STORAGE_MB} MB)"
         fi
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# 9. The storage backend's compaction is keeping up (#1806). File size is the
+#    wrong proxy for #8's pathology: on 2026-08-28 a cluster with a 15,983-
+#    revision backlog passed the size gate at 69 MB and then failed on
+#    `client rate limiter Wait returned an error`. The direct signal is
+#    max(id) - compact_rev_key, which sits near compact_min_retain (1000) when
+#    healthy. rhino exposes no metric for it (it speaks only the etcd gRPC API
+#    and its image has no sqlite3), so read a copy of the DB. Anything that
+#    stops the number being read SKIPS: refusing over an unreadable value
+#    would block more than it protects.
+# ---------------------------------------------------------------------------
+if [ "$STORAGE_CONTAINER" = "none" ] || [ -z "$STORAGE_CONTAINER" ]; then
+    pass "compaction-backlog assertion skipped (--storage-container none)"
+elif ! command -v "$CONTAINER_RT" >/dev/null 2>&1; then
+    pass "$CONTAINER_RT not available — skipping compaction-backlog assertion"
+elif ! timeout "$PER_CHECK_TIMEOUT" "$CONTAINER_RT" inspect "$STORAGE_CONTAINER" >/dev/null 2>&1; then
+    pass "storage container '$STORAGE_CONTAINER' not present — skipping compaction-backlog assertion"
+else
+    lag=""
+    if command -v python3 >/dev/null 2>&1; then
+        lag_dir="$(mktemp -d)"
+        if timeout "$PER_CHECK_TIMEOUT" "$CONTAINER_RT" cp "$STORAGE_CONTAINER:/data/db/state.db" "$lag_dir/" >/dev/null 2>&1; then
+            # The WAL holds recent commits; a missing one is normal.
+            timeout "$PER_CHECK_TIMEOUT" "$CONTAINER_RT" cp "$STORAGE_CONTAINER:/data/db/state.db-wal" "$lag_dir/" >/dev/null 2>&1 || true
+            lag="$(timeout "$PER_CHECK_TIMEOUT" python3 -I - "$lag_dir/state.db" 2>/dev/null <<'PY'
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+head = db.execute("SELECT MAX(id) FROM kine").fetchone()[0]
+compact = db.execute("SELECT MAX(prev_revision) FROM kine WHERE name = 'compact_rev_key'").fetchone()[0]
+if head is None or compact is None:
+    sys.exit(1)
+print(max(head - compact, 0))
+PY
+)"
+        fi
+        rm -rf "$lag_dir"
+    fi
+    if ! [[ "$lag" =~ ^[0-9]+$ ]]; then
+        pass "could not read the compaction backlog from '$STORAGE_CONTAINER' (needs python3 and /data/db/state.db) — skipping compaction-backlog assertion"
+    elif [ "$lag" -gt "$MAX_COMPACTION_LAG" ]; then
+        fail "storage compaction is behind: backlog is ${lag} revisions (ceiling ${MAX_COMPACTION_LAG}) — recreate the stack with 'down -v' before measuring; specs will otherwise fail on 'client rate limiter Wait returned an error' and look like product defects (#1806)"
+    else
+        pass "compaction backlog is ${lag} (ceiling ${MAX_COMPACTION_LAG})"
     fi
 fi
 
