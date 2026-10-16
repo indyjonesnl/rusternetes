@@ -131,6 +131,13 @@ case "${1:-}" in
                 printf '%s\n' "${STORAGE_WAL_BYTES:-1048576}"
                 exit 0 ;;
         esac ;;
+    cp)
+        # docker cp <container>:<path> <dest>: serve the fixture DB (#1806).
+        src="${2:-}"; dest="${3:-}"
+        [ "${LAG_DB_READABLE:-1}" = "1" ] && [ -n "${LAG_FIXTURE_DIR:-}" ] || exit 1
+        f="${src##*/}"
+        [ -f "$LAG_FIXTURE_DIR/$f" ] || exit 1
+        cp "$LAG_FIXTURE_DIR/$f" "$dest/$f"; exit 0 ;;
     pull)
         [ "${PULL_OK:-1}" = "1" ] || { echo "Error response from daemon: timeout" >&2; exit 1; }
         exit 0 ;;
@@ -393,6 +400,43 @@ else
     echo "$out_bad_mb" | sed 's/^/    /'
     fail=1
 fi
+
+# Compaction backlog (#1806): max(id) - compact_rev_key.prev_revision. File size
+# lags the pathology (a 15,983-revision backlog passed at 69 MB), so the gate
+# reads the backlog itself from a copy of the DB. Needs python3 to build the
+# fixture; without it only the skip path can be exercised.
+if command -v python3 >/dev/null 2>&1; then
+    make_lag_db() { # dir max_id compact_rev
+        mkdir -p "$1"
+        python3 -I - "$1/state.db" "$2" "$3" <<'PY'
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+db.execute("CREATE TABLE kine (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, prev_revision INTEGER)")
+db.execute("INSERT INTO kine (id, name, prev_revision) VALUES (?, 'compact_rev_key', ?)", (1, int(sys.argv[3])))
+db.execute("INSERT INTO kine (id, name, prev_revision) VALUES (?, '/registry/x', 0)", (int(sys.argv[2]),))
+db.commit()
+PY
+    }
+    make_lag_db "$TMPROOT/lag-bad" 17000 1000      # backlog 16000 (the 2026-08-28 cluster)
+    make_lag_db "$TMPROOT/lag-ok" 2500 1500        # backlog 1000 (healthy)
+    make_lag_db "$TMPROOT/lag-edge" 11000 1000     # backlog exactly 10000
+    expect_case "compaction backlog over the ceiling is refused" 2 "backlog is 16000 revisions" \
+        "LAG_FIXTURE_DIR=$TMPROOT/lag-bad"
+    expect_case "refusal names the threshold" 2 "ceiling 10000" "LAG_FIXTURE_DIR=$TMPROOT/lag-bad"
+    expect_case "healthy compaction backlog passes" 0 "compaction backlog is 1000 (ceiling 10000)" \
+        "LAG_FIXTURE_DIR=$TMPROOT/lag-ok"
+    expect_case "backlog exactly at the ceiling passes" 0 "compaction backlog is 10000" \
+        "LAG_FIXTURE_DIR=$TMPROOT/lag-edge"
+    PREFLIGHT_FLAGS=(--max-compaction-lag 500)
+    expect_case "--max-compaction-lag moves the ceiling" 2 "ceiling 500" "LAG_FIXTURE_DIR=$TMPROOT/lag-ok"
+    PREFLIGHT_FLAGS=()
+else
+    echo "skip [compaction backlog cases: python3 unavailable]"
+fi
+expect_case "unreadable DB skips the compaction assertion" 0 "could not read the compaction backlog" \
+    "LAG_DB_READABLE=0"
+expect_case "absent storage container skips the compaction assertion" 0 "skipping compaction-backlog assertion" \
+    "RHINO_PRESENT=0"
 
 # --help must print the header and stop there. It used to spill the first ten
 # lines of code, because the range was hardcoded as lines 2-58 and every header
