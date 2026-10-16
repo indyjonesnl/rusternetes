@@ -26,8 +26,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tower::ServiceExt;
 
-/// The attempt counters are process-global: serialize the tests that read them.
-pub(crate) static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// The attempt counters are process-global: one lock, shared with every other
+/// test module that records or reads them (#3649).
+pub(crate) use super::metrics_test::LOCK;
 
 fn user(name: &str) -> UserInfo {
     UserInfo {
