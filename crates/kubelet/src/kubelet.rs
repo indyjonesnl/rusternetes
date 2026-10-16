@@ -4006,89 +4006,14 @@ impl Kubelet {
                                         .await,
                                     );
                                 } else {
-                                    // App-container start error. Waiting{ContainerCreating}
-                                    // carries the error message; phase is Failed only for a
-                                    // permanent port conflict, otherwise Pending to retry.
-                                    let phase = if is_port_conflict {
-                                        Phase::Failed
-                                    } else {
-                                        Phase::Pending
-                                    };
-                                    let conditions = if is_port_conflict {
-                                        Self::failed_pod_conditions()
-                                    } else {
-                                        Self::not_ready_pod_conditions()
-                                    };
-                                    // App containers blocked behind an incomplete
-                                    // init container must report PodInitializing (not
-                                    // ContainerCreating), and carry no init-error
-                                    // message — the failure belongs on the init
-                                    // container's status. Genuine app-container start
-                                    // errors (init already done) keep ContainerCreating
-                                    // + the error message. Mirrors upstream
-                                    // convertToAPIContainerStatuses (kubelet_pods.go).
-                                    let app_reason = app_container_waiting_reason(
-                                        &new_pod,
-                                        init_container_statuses.as_deref(),
-                                    );
-                                    let app_message = if app_reason == "PodInitializing" {
-                                        None
-                                    } else {
-                                        Some(err_msg.clone())
-                                    };
-                                    let container_statuses: Option<Vec<ContainerStatus>> =
-                                        new_pod.spec.as_ref().map(|spec| {
-                                            spec.containers
-                                                .iter()
-                                                .map(|c| ContainerStatus {
-                                                    name: c.name.clone(),
-                                                    ready: false,
-                                                    restart_count: 0,
-                                                    state: Some(ContainerState {
-                                                        waiting: Some(ContainerStateWaiting {
-                                                            reason: Some(app_reason.to_string()),
-                                                            message: app_message.clone(),
-                                                        }),
-                                                        ..Default::default()
-                                                    }),
-                                                    last_state: None,
-                                                    image: Some(c.image.clone()),
-                                                    image_id: None,
-                                                    container_id: None,
-                                                    started: Some(false),
-                                                    allocated_resources: c
-                                                        .resources
-                                                        .as_ref()
-                                                        .and_then(|r| r.requests.clone()),
-                                                    allocated_resources_status: None,
-                                                    resources: c.resources.clone(),
-                                                    user: None,
-                                                    volume_mounts: None,
-                                                    stop_signal: None,
-                                                })
-                                                .collect()
-                                        });
-                                    let prior = new_pod.status.as_ref();
-                                    new_pod.status = Some(PodStatus {
-                                        phase: Some(phase),
-                                        message: Some(err_msg.clone()),
-                                        reason: Some("FailedToStart".to_string()),
-                                        host_ip: prior
-                                            .and_then(|s| s.host_ip.clone())
-                                            .or_else(|| self.host_ip_fields().0),
-                                        pod_ip: prior.and_then(|s| s.pod_ip.clone()),
-                                        conditions: Some(conditions),
-                                        container_statuses,
+                                    self.apply_app_start_error_status(
+                                        &mut new_pod,
                                         init_container_statuses,
-                                        observed_generation: new_pod.metadata.generation,
-                                        qos_class: Some(qos),
-                                        start_time: prior.and_then(|s| s.start_time),
-                                        host_i_ps: prior
-                                            .and_then(|s| s.host_i_ps.clone())
-                                            .or_else(|| self.host_ip_fields().1),
-                                        ..Default::default()
-                                    });
-                                    self.apply_host_ips_to_pod(&mut new_pod).await;
+                                        &err_msg,
+                                        is_port_conflict,
+                                        qos,
+                                    )
+                                    .await;
                                 }
 
                                 if let Err(e) = self.storage.update_status(&key, &new_pod).await {
@@ -4712,33 +4637,7 @@ impl Kubelet {
                                     ) {
                                         return Ok(());
                                     }
-                                    if let Some(ref mut status) = new_pod.status {
-                                        status.phase = Some(Phase::Running);
-                                        status.message = Some("Liveness probe failed".to_string());
-                                        status.reason = Some("Restarting".to_string());
-                                    } else {
-                                        new_pod.status = Some(PodStatus {
-                                            phase: Some(Phase::Running),
-                                            message: Some("Liveness probe failed".to_string()),
-                                            reason: Some("Restarting".to_string()),
-                                            host_ip: self.host_ip_fields().0,
-                                            pod_ip: None,
-                                            conditions: None,
-                                            container_statuses: None,
-                                            init_container_statuses: None,
-                                            ephemeral_container_statuses: None,
-                                            resize: None,
-                                            resource_claim_statuses: None,
-                                            observed_generation: new_pod.metadata.generation,
-                                            host_i_ps: self.host_ip_fields().1,
-                                            pod_i_ps: None,
-                                            nominated_node_name: None,
-                                            qos_class: None,
-                                            start_time: None,
-                                            ..Default::default()
-                                        });
-                                    }
-                                    self.apply_host_ips_to_pod(&mut new_pod).await;
+                                    self.apply_liveness_restart_status(&mut new_pod).await;
 
                                     let _ = self.storage.update_status(&key, &new_pod).await;
 
@@ -5590,6 +5489,127 @@ impl Kubelet {
                 })
                 .collect()
         })
+    }
+
+    /// Status for an app-container start error (init not terminally failed),
+    /// followed by the host-IP block of `generateAPIPodStatus`
+    /// (kubelet_pods.go:2005-2040).
+    async fn apply_app_start_error_status(
+        &self,
+        new_pod: &mut Pod,
+        init_container_statuses: Option<Vec<ContainerStatus>>,
+        err_msg: &str,
+        is_port_conflict: bool,
+        qos: String,
+    ) {
+        // App-container start error. Waiting{ContainerCreating}
+        // carries the error message; phase is Failed only for a
+        // permanent port conflict, otherwise Pending to retry.
+        let phase = if is_port_conflict {
+            Phase::Failed
+        } else {
+            Phase::Pending
+        };
+        let conditions = if is_port_conflict {
+            Self::failed_pod_conditions()
+        } else {
+            Self::not_ready_pod_conditions()
+        };
+        // App containers blocked behind an incomplete
+        // init container must report PodInitializing (not
+        // ContainerCreating), and carry no init-error
+        // message — the failure belongs on the init
+        // container's status. Genuine app-container start
+        // errors (init already done) keep ContainerCreating
+        // + the error message. Mirrors upstream
+        // convertToAPIContainerStatuses (kubelet_pods.go).
+        let app_reason = app_container_waiting_reason(new_pod, init_container_statuses.as_deref());
+        let app_message = if app_reason == "PodInitializing" {
+            None
+        } else {
+            Some(err_msg.to_string())
+        };
+        let container_statuses: Option<Vec<ContainerStatus>> = new_pod.spec.as_ref().map(|spec| {
+            spec.containers
+                .iter()
+                .map(|c| ContainerStatus {
+                    name: c.name.clone(),
+                    ready: false,
+                    restart_count: 0,
+                    state: Some(ContainerState {
+                        waiting: Some(ContainerStateWaiting {
+                            reason: Some(app_reason.to_string()),
+                            message: app_message.clone(),
+                        }),
+                        ..Default::default()
+                    }),
+                    last_state: None,
+                    image: Some(c.image.clone()),
+                    image_id: None,
+                    container_id: None,
+                    started: Some(false),
+                    allocated_resources: c.resources.as_ref().and_then(|r| r.requests.clone()),
+                    allocated_resources_status: None,
+                    resources: c.resources.clone(),
+                    user: None,
+                    volume_mounts: None,
+                    stop_signal: None,
+                })
+                .collect()
+        });
+        let prior = new_pod.status.as_ref();
+        new_pod.status = Some(PodStatus {
+            phase: Some(phase),
+            message: Some(err_msg.to_string()),
+            reason: Some("FailedToStart".to_string()),
+            host_ip: prior
+                .and_then(|s| s.host_ip.clone())
+                .or_else(|| self.host_ip_fields().0),
+            pod_ip: prior.and_then(|s| s.pod_ip.clone()),
+            conditions: Some(conditions),
+            container_statuses,
+            init_container_statuses,
+            observed_generation: new_pod.metadata.generation,
+            qos_class: Some(qos),
+            start_time: prior.and_then(|s| s.start_time),
+            host_i_ps: prior
+                .and_then(|s| s.host_i_ps.clone())
+                .or_else(|| self.host_ip_fields().1),
+            ..Default::default()
+        });
+        self.apply_host_ips_to_pod(new_pod).await;
+    }
+
+    /// Liveness-restart status write, followed by the host-IP block of
+    /// `generateAPIPodStatus` (kubelet_pods.go:2005-2040).
+    async fn apply_liveness_restart_status(&self, new_pod: &mut Pod) {
+        if let Some(ref mut status) = new_pod.status {
+            status.phase = Some(Phase::Running);
+            status.message = Some("Liveness probe failed".to_string());
+            status.reason = Some("Restarting".to_string());
+        } else {
+            new_pod.status = Some(PodStatus {
+                phase: Some(Phase::Running),
+                message: Some("Liveness probe failed".to_string()),
+                reason: Some("Restarting".to_string()),
+                host_ip: self.host_ip_fields().0,
+                pod_ip: None,
+                conditions: None,
+                container_statuses: None,
+                init_container_statuses: None,
+                ephemeral_container_statuses: None,
+                resize: None,
+                resource_claim_statuses: None,
+                observed_generation: new_pod.metadata.generation,
+                host_i_ps: self.host_ip_fields().1,
+                pod_i_ps: None,
+                nominated_node_name: None,
+                qos_class: None,
+                start_time: None,
+                ..Default::default()
+            });
+        }
+        self.apply_host_ips_to_pod(new_pod).await;
     }
 
     /// `build_init_failure_status` followed by the host-IP block of
@@ -7735,6 +7755,63 @@ mod tests {
         let st = k
             .init_failure_status(&pod, None, Phase::Failed, "FailedToStart", None)
             .await;
+        assert_eq!(st.host_ip.as_deref(), Some("10.1.1.1"));
+        assert_eq!(st.pod_ip.as_deref(), Some("10.1.1.1"));
+        assert_eq!(st.pod_i_ps.unwrap()[0].ip, "10.1.1.1");
+    }
+
+    fn host_network_pod_for_3687(name: &str) -> Pod {
+        Pod {
+            type_meta: TypeMeta {
+                kind: "Pod".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: ObjectMeta::new(name).with_namespace("default"),
+            spec: Some(PodSpec {
+                host_network: Some(true),
+                containers: vec![Container {
+                    name: "app".to_string(),
+                    image: "busybox:latest".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            status: None,
+        }
+    }
+
+    /// #3687: the app-container start-error FailedToStart status goes through
+    /// the host-IP block of `generateAPIPodStatus` (kubelet_pods.go:2005-2040).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn app_start_error_status_applies_host_ips_to_host_network_pod() {
+        use rusternetes_storage::StorageBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(StorageBackend::new_memory());
+        let k = node_ip_kubelet(&dir, storage, "node-hn", &["10.1.1.1"], false).await;
+        let mut pod = host_network_pod_for_3687("hn-start-err");
+        k.apply_app_start_error_status(&mut pod, None, "boom", false, "BestEffort".to_string())
+            .await;
+        let st = pod.status.unwrap();
+        assert_eq!(st.reason.as_deref(), Some("FailedToStart"));
+        assert_eq!(st.host_ip.as_deref(), Some("10.1.1.1"));
+        assert_eq!(st.pod_ip.as_deref(), Some("10.1.1.1"));
+        assert_eq!(st.pod_i_ps.unwrap()[0].ip, "10.1.1.1");
+    }
+
+    /// #3687: the liveness-restart fallback (no prior status) also gets the
+    /// host-IP block.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn liveness_restart_status_applies_host_ips_to_host_network_pod() {
+        use rusternetes_storage::StorageBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(StorageBackend::new_memory());
+        let k = node_ip_kubelet(&dir, storage, "node-hn", &["10.1.1.1"], false).await;
+        let mut pod = host_network_pod_for_3687("hn-liveness");
+        k.apply_liveness_restart_status(&mut pod).await;
+        let st = pod.status.unwrap();
+        assert_eq!(st.reason.as_deref(), Some("Restarting"));
         assert_eq!(st.host_ip.as_deref(), Some("10.1.1.1"));
         assert_eq!(st.pod_ip.as_deref(), Some("10.1.1.1"));
         assert_eq!(st.pod_i_ps.unwrap()[0].ip, "10.1.1.1");
