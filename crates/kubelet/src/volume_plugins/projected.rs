@@ -677,14 +677,16 @@ impl Mounter for ProjectedMounter {
     /// dir, with `GetAttributes().ReadOnly == true` (`:175-181`), after each
     /// real write.
     ///
-    /// Not ported: the wrapped memory-backed emptyDir mount (`:143-157`) and
-    /// `MakeNestedMountpoints` (`:166`) — see the follow-up issue linked from
-    /// the PR (the kubelet has no tmpfs unmount, so a wrapper would leak
-    /// mounts).
+    /// The wrapped emptyDir (`:189-203`, `NewWrapperMounter`) is ported as in
+    /// secret.rs: `setupDir` (0777 root) + `SetReady` metadata dir. It runs AFTER
+    /// `collectData` (`:194-203`) so a failed collect leaves no volume behind
+    /// (`TestInvalidPathProjected`). `MakeNestedMountpoints` (`:205`) follows,
+    /// and a failed write runs the `defer` teardown (`:209-222`).
+    ///
+    /// Not ported (tracked on #2537): the memory-medium tmpfs mount itself and
+    /// `deleteServiceAccountToken(podUID)` on `TearDownAt` (`:454`).
     async fn set_up_at(&self, dir: &str, args: &crate::volume_plugins::MounterArgs) -> Result<()> {
         let volume_dir = dir;
-        std::fs::create_dir_all(volume_dir)
-            .context("Failed to create projected volume directory")?;
 
         let payload = self.collect_data(args).await.inspect_err(|e| {
             tracing::error!(
@@ -696,10 +698,29 @@ impl Mounter for ProjectedMounter {
             );
         })?;
 
-        write_payload(std::path::Path::new(volume_dir), &payload, args.fs_group).map_err(|e| {
+        crate::volume_plugins::empty_dir::setup_dir(volume_dir)
+            .context("Failed to create projected volume directory")?;
+        let meta_dir = crate::volume_plugins::util::wrapped_empty_dir_meta_dir(
+            &self.host,
+            &self.volume.name,
+            &self.pod.metadata.uid,
+        );
+        crate::volume_plugins::util::set_ready(&meta_dir);
+        crate::volume_plugins::util::nested_volumes::make_nested_mountpoints(
+            &self.volume.name,
+            std::path::Path::new(volume_dir),
+            &self.pod,
+        )?;
+
+        if let Err(e) = write_payload(std::path::Path::new(volume_dir), &payload, args.fs_group) {
             tracing::error!("Error writing payload to dir: {}", e);
-            anyhow!(e)
-        })?;
+            // emptyDir `TearDownAt` removes the ready dir, then the volume dir.
+            let _ = std::fs::remove_dir_all(&meta_dir);
+            if let Err(td) = std::fs::remove_dir_all(volume_dir) {
+                tracing::error!("error tearing down volume {}: {}", self.volume.name, td);
+            }
+            return Err(anyhow!(e));
+        }
 
         info!(
             "Created projected volume {} at {}",
@@ -1126,6 +1147,119 @@ mod tests {
         let before = std::fs::read_link(root.join("..data")).unwrap();
         m.set_up().await.unwrap();
         assert_eq!(std::fs::read_link(root.join("..data")).unwrap(), before);
+    }
+
+    async fn mounter_for_pod(
+        root: &std::path::Path,
+        storage: &Arc<StorageBackend>,
+        v: &Volume,
+        pod: &Pod,
+    ) -> Box<dyn Mounter> {
+        let p = ProjectedPlugin::new(Arc::new(crate::volume_plugins::KubeletVolumeHost::new(
+            root.to_string_lossy().to_string(),
+            Some(storage.clone()),
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            HashMap::new(),
+        )));
+        let spec = Spec {
+            volume: v,
+            persistent_volume: None,
+            read_only: false,
+        };
+        p.new_mounter(&spec, pod).await.unwrap()
+    }
+
+    /// `TestPlugin` (projected_test.go:1174): "projected volume should create
+    /// its own empty wrapper path" -- the wrapped emptyDir's `SetReady`
+    /// creates `<pod>/plugins/kubernetes.io~empty-dir/wrapped_<vol>`.
+    #[tokio::test]
+    async fn set_up_creates_the_wrapped_empty_dir_metadata_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = Arc::new(StorageBackend::new_memory());
+        put_cm(&st, "cm", "a", "1").await;
+        let v = vol(serde_json::json!([{"configMap": {"name": "cm"}}]));
+        let m = mounter(dir.path(), &st, &v).await;
+        m.set_up().await.unwrap();
+        let wrapper = dir
+            .path()
+            .join("pods/uid-1/plugins/kubernetes.io~empty-dir/wrapped_proj");
+        assert!(wrapper.is_dir(), "missing {}", wrapper.display());
+        assert!(wrapper.join("ready").exists());
+    }
+
+    /// The wrapped emptyDir's `setupDir` leaves the volume root at 0777.
+    #[tokio::test]
+    async fn volume_root_is_the_wrapped_empty_dir_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let st = Arc::new(StorageBackend::new_memory());
+        put_cm(&st, "cm", "a", "1").await;
+        let v = vol(serde_json::json!([{"configMap": {"name": "cm"}}]));
+        let m = mounter(dir.path(), &st, &v).await;
+        m.set_up().await.unwrap();
+        let mode = std::fs::metadata(m.get_path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o777);
+    }
+
+    /// `MakeNestedMountpoints` (`projected.go:205`): a volume mounted beneath
+    /// the projected volume gets its mountpoint directory created inside it.
+    #[tokio::test]
+    async fn nested_mountpoints_are_created_inside_the_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = Arc::new(StorageBackend::new_memory());
+        put_cm(&st, "cm", "a", "1").await;
+        let v = vol(serde_json::json!([{"configMap": {"name": "cm"}}]));
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "p", "namespace": "ns", "uid": "uid-1"},
+            "spec": {"containers": [{"name": "c", "image": "i", "volumeMounts": [
+                {"name": "proj", "mountPath": "/etc/proj"},
+                {"name": "other", "mountPath": "/etc/proj/sub/dir"}
+            ]}]}
+        }))
+        .unwrap();
+        let m = mounter_for_pod(dir.path(), &st, &v, &pod).await;
+        m.set_up().await.unwrap();
+        let root = std::path::PathBuf::from(m.get_path());
+        assert!(root.join("sub/dir").is_dir());
+        assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "1");
+    }
+
+    /// `TestInvalidPathProjected` (projected_test.go:1235): a bad item path
+    /// fails `collectData` BEFORE `wrapped.SetUpAt`, so no volume is created.
+    #[tokio::test]
+    async fn collect_failure_does_not_create_the_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = Arc::new(StorageBackend::new_memory());
+        let v = vol(serde_json::json!([{"configMap": {"name": "missing"}}]));
+        let m = mounter(dir.path(), &st, &v).await;
+        assert!(m.set_up().await.is_err());
+        assert!(!std::path::Path::new(&m.get_path()).exists());
+    }
+
+    /// SetUpAt's `defer` (`projected.go:209-222`): a failed AtomicWriter runs
+    /// `unmounter.TearDown()`, and emptyDir `TearDownAt` removes the volume
+    /// and its ready dir.
+    #[tokio::test]
+    async fn failed_write_tears_the_volume_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = Arc::new(StorageBackend::new_memory());
+        put_cm(&st, "cm", "a", "1").await;
+        let v = vol(serde_json::json!([{"configMap": {"name": "cm"}}]));
+        let m = mounter(dir.path(), &st, &v).await;
+        let root = std::path::PathBuf::from(m.get_path());
+        std::fs::create_dir_all(root.join("..data_tmp/x")).unwrap();
+        assert!(m.set_up().await.is_err());
+        assert!(
+            !root.exists(),
+            "volume dir must be removed after failed write"
+        );
+        assert!(!dir
+            .path()
+            .join("pods/uid-1/plugins/kubernetes.io~empty-dir/wrapped_proj")
+            .exists());
     }
 
     /// `collectData` merges every source into ONE payload (`projected.go:
