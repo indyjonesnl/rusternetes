@@ -1490,6 +1490,20 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Start the CSR cleaner (`newCertificateSigningRequestCleanerController`,
+    // cmd/kube-controller-manager/app/certificates.go:217-230).
+    let csr_cleaner = Arc::new(controllers::csr_cleaner::CsrCleanerController::new(
+        storage.clone(),
+    ));
+    spawn_controller!("CSR cleaner controller", leader_elector, {
+        let controller = csr_cleaner.clone();
+        async move {
+            if let Err(e) = controller.run().await {
+                tracing::error!("CSR cleaner controller error: {}", e);
+            }
+        }
+    });
+
     // Start Namespace controller (watch-based). Hand it the CA cert so it can
     // (re)create kube-root-ca.crt in every namespace (read from pki_dir, the
     // same dir the metrics/cert paths use above).

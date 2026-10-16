@@ -505,6 +505,16 @@ where
         }
     }));
 
+    // `newCertificateSigningRequestCleanerController`
+    // (cmd/kube-controller-manager/app/certificates.go:217-230).
+    let s = storage_for("CertificateSigningRequestCleaner");
+    handles.push(tokio::spawn(async move {
+        let c = Arc::new(controllers::csr_cleaner::CsrCleanerController::new(s));
+        if let Err(e) = c.run().await {
+            error!("CSR cleaner controller error: {}", e);
+        }
+    }));
+
     let s = storage_for("Namespace");
     let ns_ca = config.ca_cert_pem.clone();
     handles.push(tokio::spawn(async move {
