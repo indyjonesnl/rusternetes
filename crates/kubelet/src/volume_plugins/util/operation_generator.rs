@@ -55,12 +55,15 @@ use tracing::{debug, error, info, warn};
 /// ```
 ///
 /// The lookup error is discarded, as upstream does with `_`. The leading
-/// `InlineVolumeSpecForCSIMigration` guard (`:1997-2001`) is not ported: there
-/// is no in-tree-to-CSI migration here, so it is always false.
+/// `InlineVolumeSpecForCSIMigration` guard (`:1997-2001`, "a migrated inline
+/// volume and is not resizable") returns `false, nil` first.
 pub fn check_if_supports_node_expansion<'a>(
     mgr: &'a VolumePluginMgr,
     spec: &Spec<'_>,
 ) -> Option<&'a dyn NodeExpandableVolumePlugin> {
+    if spec.inline_volume_spec_for_csi_migration {
+        return None;
+    }
     let plugin = mgr
         .find_node_expandable_plugin_by_spec(spec)
         .ok()
@@ -871,8 +874,33 @@ mod tests {
             volume: &v,
             persistent_volume: Some(&pv),
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         assert!(check_if_supports_node_expansion(&m, &spec).is_some());
+    }
+
+    /// `checkIfSupportsNodeExpansion`'s leading guard
+    /// (`operation_generator.go:1997-2001`): a migrated inline volume is not
+    /// resizable even though its translated spec carries a CSI PV.
+    #[test]
+    fn migrated_inline_volume_does_not_support_node_expansion() {
+        let m = mgr();
+        let v: Volume = serde_json::from_value(
+            json!({"name": "v", "persistentVolumeClaim": {"claimName": "c"}}),
+        )
+        .unwrap();
+        let pv = pv();
+        let mut spec = Spec {
+            volume: &v,
+            persistent_volume: Some(&pv),
+            read_only: false,
+            migrated: true,
+            inline_volume_spec_for_csi_migration: false,
+        };
+        assert!(check_if_supports_node_expansion(&m, &spec).is_some());
+        spec.inline_volume_spec_for_csi_migration = true;
+        assert!(check_if_supports_node_expansion(&m, &spec).is_none());
     }
 
     /// An inline CSI volume has no PersistentVolume, so it is not resized
@@ -886,6 +914,8 @@ mod tests {
             volume: &v,
             persistent_volume: None,
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         assert!(check_if_supports_node_expansion(&m, &spec).is_none());
     }
@@ -899,6 +929,8 @@ mod tests {
             volume: &v,
             persistent_volume: None,
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         assert!(check_if_supports_node_expansion(&m, &spec).is_none());
     }
@@ -1192,6 +1224,8 @@ mod tests {
             volume: &v,
             persistent_volume: None,
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         mounter_args_for(&empty_dir_mgr(), &spec, pod, &FakeSELinuxLabelTranslator).unwrap()
     }
@@ -1305,6 +1339,8 @@ mod tests {
             volume: &v,
             persistent_volume: Some(&pv),
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         mounter_args_for(&mgr, &spec, &pod, &FakeSELinuxLabelTranslator).unwrap()
     }

@@ -19,6 +19,12 @@ pub struct Spec<'a> {
     /// (`desired_state_of_world_populator.go:461`, `:588`); false for
     /// `NewSpecFromVolume` (`plugins.go:549-553`).
     pub read_only: bool,
+    /// `Spec.Migrated` (`pkg/volume/plugins.go:436`): the spec was translated
+    /// to CSI by `csimigration.TranslateInTreeSpecToCSI`.
+    pub migrated: bool,
+    /// `Spec.InlineVolumeSpecForCSIMigration` (`plugins.go:438`): the
+    /// translated spec came from an inline (not PV) in-tree volume.
+    pub inline_volume_spec_for_csi_migration: bool,
 }
 
 impl Spec<'_> {
@@ -49,6 +55,8 @@ impl Spec<'_> {
             volume: self.volume.clone(),
             persistent_volume: self.persistent_volume.cloned(),
             read_only: self.read_only,
+            migrated: self.migrated,
+            inline_volume_spec_for_csi_migration: self.inline_volume_spec_for_csi_migration,
         }
     }
 }
@@ -69,6 +77,10 @@ pub struct OwnedSpec {
     pub persistent_volume: Option<PersistentVolume>,
     /// See [`Spec::read_only`].
     pub read_only: bool,
+    /// See [`Spec::migrated`].
+    pub migrated: bool,
+    /// See [`Spec::inline_volume_spec_for_csi_migration`].
+    pub inline_volume_spec_for_csi_migration: bool,
 }
 
 impl OwnedSpec {
@@ -78,6 +90,8 @@ impl OwnedSpec {
             volume: &self.volume,
             persistent_volume: self.persistent_volume.as_ref(),
             read_only: self.read_only,
+            migrated: self.migrated,
+            inline_volume_spec_for_csi_migration: self.inline_volume_spec_for_csi_migration,
         }
     }
 

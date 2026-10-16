@@ -588,6 +588,8 @@ pub(crate) mod tests {
                 volume,
                 persistent_volume: Some(pv.clone()),
                 read_only: false,
+                migrated: false,
+                inline_volume_spec_for_csi_migration: false,
             }),
             outer_volume_spec_names: vec![],
             pod: Arc::new(pod),

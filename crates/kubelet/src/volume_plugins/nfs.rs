@@ -367,6 +367,8 @@ mod tests {
             volume,
             persistent_volume: pv,
             read_only: ro,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         }
     }
 

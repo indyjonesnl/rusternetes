@@ -270,6 +270,8 @@ mod tests {
             volume: &vol,
             persistent_volume: Some(pv),
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         f.plugin
             .node_expand_with_client(
@@ -418,6 +420,8 @@ mod tests {
             volume: &vol,
             persistent_volume: Some(&pv),
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         let err = f
             .plugin

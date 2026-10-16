@@ -230,12 +230,16 @@ mod tests {
             volume: &v,
             persistent_volume: Some(&pv),
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         assert!(plugin().can_support(&s));
         let s = Spec {
             volume: &v,
             persistent_volume: None,
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         assert!(!plugin().can_support(&s));
     }
@@ -255,6 +259,8 @@ mod tests {
             volume: &v,
             persistent_volume: Some(&pv),
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         let m = plugin().new_mounter(&s, &pod(gid, None)).await.unwrap();
         m.set_up_with(&args_for(&pod(gid, None))).await.unwrap();
@@ -276,6 +282,8 @@ mod tests {
             volume: &v,
             persistent_volume: Some(&pv),
             read_only: true,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         let m = plugin().new_mounter(&s, &pod(gid, None)).await.unwrap();
         m.set_up_with(&args_for(&pod(gid, None))).await.unwrap();
@@ -299,6 +307,8 @@ mod tests {
             volume: &v,
             persistent_volume: Some(&pv),
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         let m = plugin()
             .new_mounter(&s, &pod(gid, Some("OnRootMismatch")))
@@ -342,6 +352,8 @@ mod tests {
             volume: &v,
             persistent_volume: Some(&pv),
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         // Pod has no fsGroup; the args do.
         let m = plugin().new_mounter(&s, &bare_pod()).await.unwrap();
@@ -380,6 +392,8 @@ mod tests {
             volume: &v,
             persistent_volume: Some(&pv),
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         let m = plugin().new_mounter(&s, &bare_pod()).await.unwrap();
         m.set_up_with(&crate::volume_plugins::MounterArgs {
