@@ -27,6 +27,7 @@
 //! ReplicationController (`resolveControllerRef`, `getPodReplicaSets`).
 
 use super::controller_utils::is_pod_ready;
+use super::job_tracking::has_job_tracking_finalizer;
 use futures::StreamExt;
 use rusternetes_common::resources::Pod;
 use rusternetes_storage::{build_prefix, Storage, WatchEvent, WorkQueue};
@@ -72,6 +73,28 @@ pub(crate) enum PodEffect {
     /// added, or changed, and the controllers that could adopt it are synced
     /// (:441-453, :517-528). Carries the pod's labels.
     EnqueueMatching(HashMap<String, String>),
+    /// The Job controller's `deletePod` for a pod it controls
+    /// (`job_controller.go:434-488`): unlike `ObserveDeletion` it depends on
+    /// whether the Job is finished and on the pod's tracking finalizer. Only
+    /// produced for a pod whose controller is a `Job`.
+    ObserveTrackedDeletion {
+        controller: ControllerRef,
+        uid: String,
+        has_finalizer: bool,
+        /// `deletePod(..., final)`: the pod is gone, not just terminating.
+        final_delete: bool,
+    },
+    /// `finalizerExpectations.finalizerRemovalObserved(key, curPod.UID)` for
+    /// the Job the reference resolves to (`updatePod`, :381-387, :408-413).
+    /// Only produced for a pod whose controller is a `Job` and whose
+    /// tracking finalizer is gone.
+    ObserveFinalizerRemoval {
+        controller: ControllerRef,
+        uid: String,
+    },
+    /// `enqueueOrphanPod(pod, false)`: a pod without a controller still holds
+    /// the Job tracking finalizer (:344-347, :417-420, :458-462).
+    ReleaseOrphan,
 }
 
 /// What a pod event means for the controllers' expectations and queue: the
@@ -97,6 +120,10 @@ struct KnownPod {
     /// `pod.DeletionTimestamp != nil`, for replaying `addPod`'s
     /// "already pending deletion" branch to a handler added later.
     terminating: bool,
+    /// `pod.UID` (`finalizerRemovalObserved` is keyed by it).
+    uid: String,
+    /// `hasJobTrackingFinalizer(pod)`.
+    tracking_finalizer: bool,
 }
 
 /// Pod key ("namespace/name") to what the handlers read of it.
@@ -139,6 +166,8 @@ fn known_of(pod: &Pod) -> KnownPod {
         resource_version: pod.metadata.resource_version.as_deref().map(digest),
         ready: is_pod_ready(pod),
         terminating: pod.metadata.deletion_timestamp.is_some(),
+        uid: pod.metadata.uid.clone(),
+        tracking_finalizer: has_job_tracking_finalizer(pod),
     }
 }
 
@@ -155,8 +184,28 @@ pub(crate) fn pod_key_from_storage_key(storage_key: &str) -> Option<String> {
 
 /// `deletePod` for a pod (replica_set.go:533-570): no controller reference,
 /// nothing ("No controller should care about orphans being deleted").
-fn delete_pod(controller: Option<ControllerRef>) -> Option<PodEffect> {
-    controller.map(PodEffect::ObserveDeletion)
+///
+/// The Job controller's `deletePod` (job_controller.go:434-488) differs: an
+/// orphan still holding the tracking finalizer is released ("But this pod
+/// might have belonged to a Job and the GC removed the reference"), and the
+/// observation depends on the pod's finalizer and on whether the delete is
+/// final, so a pod controlled by a `Job` gets its own effect.
+fn delete_pod(
+    controller: Option<ControllerRef>,
+    uid: &str,
+    has_finalizer: bool,
+    final_delete: bool,
+) -> Option<PodEffect> {
+    match controller {
+        None => has_finalizer.then_some(PodEffect::ReleaseOrphan),
+        Some(controller) if controller.kind == "Job" => Some(PodEffect::ObserveTrackedDeletion {
+            controller,
+            uid: uid.to_string(),
+            has_finalizer,
+            final_delete,
+        }),
+        Some(controller) => Some(PodEffect::ObserveDeletion(controller)),
+    }
 }
 
 impl PodInformerCache {
@@ -180,7 +229,12 @@ impl PodInformerCache {
             if pod.metadata.deletion_timestamp.is_some() {
                 // "is already pending deletion. Prevent the pod from being a
                 // creation observation" (:418-422).
-                effects.extend(delete_pod(cur.controller));
+                effects.extend(delete_pod(
+                    cur.controller,
+                    &cur.uid,
+                    cur.tracking_finalizer,
+                    false,
+                ));
             } else if let Some(controller) = cur.controller {
                 // "If it has a ControllerRef, that's all that matters."
                 effects.push(PodEffect::ObserveCreation(controller));
@@ -189,6 +243,11 @@ impl PodInformerCache {
                 // ReplicaSets and sync them to see if anyone wants to adopt
                 // it. DO NOT observe creation because no controller should be
                 // waiting for an orphan."
+                // The Job controller first "Clean[s] the finalizer"
+                // (job_controller.go:344-347).
+                if cur.tracking_finalizer {
+                    effects.push(PodEffect::ReleaseOrphan);
+                }
                 effects.push(PodEffect::EnqueueMatching(
                     pod.metadata.labels.clone().unwrap_or_default(),
                 ));
@@ -207,22 +266,49 @@ impl PodInformerCache {
         if pod.metadata.deletion_timestamp.is_some() {
             // A graceful delete first MODIFIES the pod; the controller must
             // not wait for the kubelet's final delete (:468-480).
-            effects.extend(delete_pod(cur.controller));
-            if label_changed {
-                effects.extend(delete_pod(old.controller));
+            effects.extend(delete_pod(
+                cur.controller,
+                &cur.uid,
+                cur.tracking_finalizer,
+                false,
+            ));
+            // The ReplicaSet's `updatePod` also observes the old controller
+            // when the labels changed (:468-480); the Job's does not
+            // (job_controller.go:370-377).
+            if label_changed && old.controller.as_ref().is_none_or(|c| c.kind != "Job") {
+                effects.extend(delete_pod(
+                    old.controller,
+                    &old.uid,
+                    old.tracking_finalizer,
+                    false,
+                ));
             }
             return effects;
         }
 
         let controller_ref_changed = cur.controller != old.controller;
+        // The Job's `updatePod` (job_controller.go:379-413): "Don't check if
+        // oldPod has the finalizer, as during ownership transfer finalizers
+        // might be re-added and removed again in behalf of the new owner."
+        let finalizer_removed = !cur.tracking_finalizer;
+        let removal = |controller: &ControllerRef| {
+            (finalizer_removed && controller.kind == "Job").then(|| {
+                PodEffect::ObserveFinalizerRemoval {
+                    controller: controller.clone(),
+                    uid: cur.uid.clone(),
+                }
+            })
+        };
         if controller_ref_changed {
             if let Some(old_controller) = old.controller {
                 // "The ControllerRef was changed. Sync the old controller, if
                 // any."
+                effects.extend(removal(&old_controller));
                 effects.push(PodEffect::Enqueue(old_controller));
             }
         }
         if let Some(controller) = cur.controller {
+            effects.extend(removal(&controller));
             effects.push(PodEffect::Enqueue(controller.clone()));
             // "MinReadySeconds in the Pod will generate an Available
             // condition ... we can fake the update by resyncing the
@@ -231,12 +317,20 @@ impl PodInformerCache {
             if !old.ready && cur.ready {
                 effects.push(PodEffect::EnqueueAfterMinReady(controller));
             }
-        } else if label_changed || controller_ref_changed {
-            // "Otherwise, it's an orphan. If anything changed, sync matching
-            // controllers to see if anyone wants to adopt it now."
-            effects.push(PodEffect::EnqueueMatching(
-                pod.metadata.labels.clone().unwrap_or_default(),
-            ));
+        } else {
+            // The Job's "Otherwise, it's an orphan. Clean the finalizer."
+            // (job_controller.go:417-420).
+            if cur.tracking_finalizer {
+                effects.push(PodEffect::ReleaseOrphan);
+            }
+            if label_changed || controller_ref_changed {
+                // "Otherwise, it's an orphan. If anything changed, sync
+                // matching controllers to see if anyone wants to adopt it
+                // now."
+                effects.push(PodEffect::EnqueueMatching(
+                    pod.metadata.labels.clone().unwrap_or_default(),
+                ));
+            }
         }
         effects
     }
@@ -255,11 +349,21 @@ impl PodInformerCache {
         if deleted {
             // The event carries the last known value; fall back to what the
             // cache held (the tombstone) when it cannot be decoded.
-            let cached = known.remove(&pod_key).and_then(|k| k.controller);
-            let controller = pod.as_ref().map(controller_of).unwrap_or(cached);
+            let cached = known.remove(&pod_key);
+            let (controller, uid, has_finalizer) = match (&pod, cached) {
+                (Some(pod), _) => (
+                    controller_of(pod),
+                    pod.metadata.uid.clone(),
+                    has_job_tracking_finalizer(pod),
+                ),
+                (None, Some(k)) => (k.controller, k.uid, k.tracking_finalizer),
+                (None, None) => (None, String::new(), false),
+            };
             return Some(PodObservation {
                 pod_key,
-                effects: delete_pod(controller).into_iter().collect(),
+                effects: delete_pod(controller, &uid, has_finalizer, true)
+                    .into_iter()
+                    .collect(),
             });
         }
 
@@ -277,11 +381,16 @@ impl PodInformerCache {
         known
             .iter()
             .filter_map(|(pod_key, k)| {
-                let controller = k.controller.clone()?;
                 let effect = if k.terminating {
-                    PodEffect::ObserveDeletion(controller)
-                } else {
+                    delete_pod(k.controller.clone(), &k.uid, k.tracking_finalizer, false)?
+                } else if let Some(controller) = k.controller.clone() {
                     PodEffect::ObserveCreation(controller)
+                } else if k.tracking_finalizer {
+                    // `addPod` of an orphan holding the Job tracking
+                    // finalizer (job_controller.go:344-347).
+                    PodEffect::ReleaseOrphan
+                } else {
+                    return None;
                 };
                 Some(PodObservation {
                     pod_key: pod_key.clone(),
@@ -318,10 +427,15 @@ impl PodInformerCache {
             .cloned()
             .collect();
         for pod_key in vanished {
-            let controller = known.remove(&pod_key).and_then(|k| k.controller);
+            let (controller, uid, has_finalizer) = known
+                .remove(&pod_key)
+                .map(|k| (k.controller, k.uid, k.tracking_finalizer))
+                .unwrap_or_default();
             observations.push(PodObservation {
                 pod_key,
-                effects: delete_pod(controller).into_iter().collect(),
+                effects: delete_pod(controller, &uid, has_finalizer, true)
+                    .into_iter()
+                    .collect(),
             });
         }
         observations
@@ -367,7 +481,8 @@ pub(crate) trait PodEventTarget: Sync {
 
     /// `expectations.CreationObserved(key)` for the pod `pod_key`. Defaults to
     /// the plain count; a controller that tracks WHICH pods it is waiting for
-    /// (the DaemonSet controller's per-pod creation set) overrides it.
+    /// (the DaemonSet controller's per-pod creation set, the Job controller's
+    /// created-pod keys) overrides it.
     fn creation_observed_of(&self, key: &str, _pod_key: &str) {
         self.creation_observed(key);
     }
@@ -379,6 +494,33 @@ pub(crate) trait PodEventTarget: Sync {
     fn min_ready_requeue_delay(&self, min_ready_seconds: i32) -> Duration {
         Duration::from_secs(min_ready_seconds as u64)
     }
+
+    /// How long a handler's enqueue is delayed: the Job controller's
+    /// `enqueueSyncJobBatched` adds `SyncJobBatchPeriod` (job_controller.go:593-600);
+    /// the ReplicaSet's `enqueueRS` is immediate.
+    fn enqueue_delay(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    /// `util.IsJobFinished(job)`, for `deletePod` (job_controller.go:468-474).
+    fn controller_finished(
+        &self,
+        _namespace: &str,
+        _name: &str,
+    ) -> impl Future<Output = bool> + Send {
+        async { false }
+    }
+
+    /// `jm.finalizerExpectations.finalizerRemovalObserved(logger, key, uid)`
+    /// (job_controller.go:389-394, :404-411, :484).
+    fn finalizer_removal_observed(&self, _key: &str, _uid: &str) {}
+
+    /// `jm.enqueueOrphanPod(pod, false)` (job_controller.go:347, :420, :463,
+    /// :471): handle the pod `pod_name` in `namespace`, which holds the
+    /// tracking finalizer with no Job able to account for it.
+    fn orphan_pod(&self, _namespace: &str, _pod_name: &str) -> impl Future<Output = ()> + Send {
+        async {}
+    }
 }
 
 /// Run the effects of one observation against `target`.
@@ -388,10 +530,20 @@ pub(crate) async fn apply_pod_observation<T: PodEventTarget>(
     observation: &PodObservation,
 ) {
     let pod_key = observation.pod_key.as_str();
-    let Some((namespace, _)) = pod_key.split_once('/') else {
+    let Some((namespace, pod_name)) = pod_key.split_once('/') else {
         return;
     };
     let enqueue = |name: &str| format!("{}/{namespace}/{name}", target.queue_prefix());
+    let delay = target.enqueue_delay();
+    // `enqueueRS` / `enqueueSyncJobBatched`: now, or after the target's batch
+    // period.
+    let add = |name: String| async move {
+        if delay.is_zero() {
+            queue.add(name).await;
+        } else {
+            queue.add_after(name, delay).await;
+        }
+    };
     for effect in &observation.effects {
         match effect {
             PodEffect::ObserveCreation(controller_ref) => {
@@ -400,7 +552,7 @@ pub(crate) async fn apply_pod_observation<T: PodEventTarget>(
                     .await
                 {
                     target.creation_observed_of(&format!("{namespace}/{name}"), pod_key);
-                    queue.add(enqueue(&name)).await;
+                    add(enqueue(&name)).await;
                 }
             }
             PodEffect::ObserveDeletion(controller_ref) => {
@@ -409,7 +561,7 @@ pub(crate) async fn apply_pod_observation<T: PodEventTarget>(
                     .await
                 {
                     target.deletion_observed(&format!("{namespace}/{name}"), pod_key);
-                    queue.add(enqueue(&name)).await;
+                    add(enqueue(&name)).await;
                 }
             }
             PodEffect::Enqueue(controller_ref) => {
@@ -417,7 +569,7 @@ pub(crate) async fn apply_pod_observation<T: PodEventTarget>(
                     .resolve_controller_ref(namespace, controller_ref)
                     .await
                 {
-                    queue.add(enqueue(&name)).await;
+                    add(enqueue(&name)).await;
                 }
             }
             PodEffect::EnqueueAfterMinReady(controller_ref) => {
@@ -438,9 +590,48 @@ pub(crate) async fn apply_pod_observation<T: PodEventTarget>(
                     }
                 }
             }
+            PodEffect::ObserveTrackedDeletion {
+                controller,
+                uid,
+                has_finalizer,
+                final_delete,
+            } => {
+                // `deletePod` (job_controller.go:434-488).
+                let resolved = target.resolve_controller_ref(namespace, controller).await;
+                let finished = match &resolved {
+                    Some(ResolvedController { name, .. }) => {
+                        target.controller_finished(namespace, name).await
+                    }
+                    None => false,
+                };
+                let Some(ResolvedController { name, .. }) = resolved.filter(|_| !finished) else {
+                    // "syncJob will not remove this finalizer."
+                    if *has_finalizer {
+                        target.orphan_pod(namespace, pod_name).await;
+                    }
+                    continue;
+                };
+                let job_key = format!("{namespace}/{name}");
+                target.deletion_observed(&job_key, pod_key);
+                // "Consider the finalizer removed if this is the final delete.
+                // Otherwise, it's an update for the deletion timestamp, then
+                // check finalizer."
+                if *final_delete || !*has_finalizer {
+                    target.finalizer_removal_observed(&job_key, uid);
+                }
+                add(enqueue(&name)).await;
+            }
+            PodEffect::ObserveFinalizerRemoval { controller, uid } => {
+                if let Some(ResolvedController { name, .. }) =
+                    target.resolve_controller_ref(namespace, controller).await
+                {
+                    target.finalizer_removal_observed(&format!("{namespace}/{name}"), uid);
+                }
+            }
+            PodEffect::ReleaseOrphan => target.orphan_pod(namespace, pod_name).await,
             PodEffect::EnqueueMatching(labels) => {
                 for name in target.pod_controllers(namespace, labels).await {
-                    queue.add(enqueue(&name)).await;
+                    add(enqueue(&name)).await;
                 }
             }
         }

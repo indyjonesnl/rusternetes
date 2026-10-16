@@ -15,6 +15,7 @@ use super::job_tracking::{
     push_uncounted_succeeded, remove_tracking_finalizer, uncounted_has_failed,
     uncounted_has_succeeded, FinalizerExpectations, JOB_TRACKING_FINALIZER,
 };
+use super::pod_informer::{ControllerRef, PodEventTarget, ResolvedController, SharedPodInformer};
 use super::replicationcontroller::{
     generate_pod_name, slow_start_batches_capped, MAX_NAME_GENERATION_CREATE_ATTEMPTS,
 };
@@ -61,6 +62,10 @@ pub struct JobController<S: Storage> {
     /// Upstream's `podBackoffStore` (`job_controller.go:128`): per-Job failure
     /// history that delays replacement pod creation (`manageJob`, `:1731`).
     backoff_store: BackoffStore,
+    /// The shared pod informer whose `addPod` / `updatePod` / `deletePod`
+    /// handlers (`job_controller.go:213-224`, `:319-492`) this controller
+    /// registers on: [`PodEventTarget`] below.
+    pod_informer: Arc<SharedPodInformer<S>>,
 }
 
 /// `SyncJobBatchPeriod` (`job_controller.go:64`).
@@ -321,51 +326,141 @@ fn clamp_counters_monotonic(next: &mut JobStatus, persisted: Option<&JobStatus>)
     }
 }
 
+/// The Job half of the pod event handlers (`job_controller.go:280-317`).
+impl<S: Storage + 'static> PodEventTarget for JobController<S> {
+    fn queue_prefix(&self) -> &'static str {
+        "jobs"
+    }
+
+    /// `resolveControllerRef` (`job_controller.go:300-317`): "Don't even try to
+    /// look up by Name if it's the wrong Kind", and the Job found by name must
+    /// have the ControllerRef's UID.
+    async fn resolve_controller_ref(
+        &self,
+        namespace: &str,
+        controller_ref: &ControllerRef,
+    ) -> Option<ResolvedController> {
+        if controller_ref.kind != "Job" {
+            return None;
+        }
+        let job: Job = self
+            .storage
+            .get(&build_key("jobs", Some(namespace), &controller_ref.name))
+            .await
+            .ok()?;
+        (job.metadata.uid == controller_ref.uid).then(|| ResolvedController {
+            name: job.metadata.name.clone(),
+            min_ready_seconds: 0,
+        })
+    }
+
+    /// `getPodJobs` (`job_controller.go:280-297`) over `GetPodJobs` (client-go
+    /// `listers/batch/v1/job_expansion.go`): a pod without labels matches no
+    /// Job; "This object has an invalid selector, it does not match the pod";
+    /// a nil selector is `labels.Nothing()`, an empty one `labels.Everything()`.
+    async fn pod_controllers(
+        &self,
+        namespace: &str,
+        pod_labels: &HashMap<String, String>,
+    ) -> Vec<String> {
+        if pod_labels.is_empty() {
+            return Vec::new();
+        }
+        let Ok(jobs) = self
+            .storage
+            .list::<Job>(&build_prefix("jobs", Some(namespace)))
+            .await
+        else {
+            return Vec::new();
+        };
+        let matching: Vec<String> = jobs
+            .into_iter()
+            .filter(|job| {
+                rusternetes_common::types::label_selector_as_selector(job.spec.selector.as_ref())
+                    .is_ok_and(|selector| selector.matches(Some(pod_labels)))
+            })
+            .map(|job| job.metadata.name)
+            .collect();
+        if matching.len() > 1 {
+            // "ControllerRef will ensure we don't do anything crazy, but more
+            // than one item in this list nevertheless constitutes user error."
+            warn!(
+                "user error! more than one job is selecting pods with labels: {:?}",
+                pod_labels
+            );
+        }
+        matching
+    }
+
+    fn creation_observed(&self, key: &str) {
+        self.expectations.creation_observed(key);
+    }
+
+    /// Deviation (pre-existing, see [`ControllerExpectations::creation_observed_of`]):
+    /// creations are tracked by pod key so the settle-from-listing step in
+    /// `reconcile` and the `addPod` handler never both count one pod.
+    fn creation_observed_of(&self, key: &str, pod_key: &str) {
+        self.expectations.creation_observed_of(key, pod_key);
+    }
+
+    fn deletion_observed(&self, key: &str, pod_key: &str) {
+        self.expectations.deletion_observed_of(key, pod_key);
+    }
+
+    /// `enqueueSyncJobBatched` (`job_controller.go:593-600`).
+    fn enqueue_delay(&self) -> Duration {
+        SYNC_JOB_BATCH_PERIOD
+    }
+
+    async fn controller_finished(&self, namespace: &str, name: &str) -> bool {
+        self.storage
+            .get::<Job>(&build_key("jobs", Some(namespace), name))
+            .await
+            .is_ok_and(|job| job_is_finished(&job))
+    }
+
+    fn finalizer_removal_observed(&self, key: &str, uid: &str) {
+        self.finalizer_expectations.removal_observed(key, uid);
+    }
+
+    /// `enqueueOrphanPod` -> `syncOrphanPod` -> `handleSingleOrphanPod`
+    /// (`job_controller.go:688-766`).
+    async fn orphan_pod(&self, namespace: &str, pod_name: &str) {
+        if let Ok(pod) = self
+            .storage
+            .get::<Pod>(&build_key("pods", Some(namespace), pod_name))
+            .await
+        {
+            self.release_if_orphan(&pod).await;
+        }
+    }
+}
+
 impl<S: Storage + 'static> JobController<S> {
+    #[allow(dead_code)] // the binary shares one informer via `with_pod_informer`
     pub fn new(storage: Arc<S>) -> Self {
+        let pod_informer = Arc::new(SharedPodInformer::new(
+            storage.clone(),
+            Duration::from_secs(5),
+        ));
+        Self::with_pod_informer(storage, pod_informer)
+    }
+
+    /// A controller whose pod event handlers hang off an informer shared with
+    /// other controllers (upstream hands every controller the one `PodInformer`
+    /// of the shared informer factory, `NewController(ctx, podInformer, ...)`,
+    /// job_controller.go:172).
+    pub(crate) fn with_pod_informer(
+        storage: Arc<S>,
+        pod_informer: Arc<SharedPodInformer<S>>,
+    ) -> Self {
         Self {
             storage,
+            pod_informer,
             expectations: Arc::new(ControllerExpectations::new()),
             finalizer_expectations: FinalizerExpectations::new(),
             requeue_delays: std::sync::Mutex::new(HashMap::new()),
             backoff_store: BackoffStore::default(),
-        }
-    }
-
-    /// `addPod` / `updatePod` / `deletePod` expectation bookkeeping
-    /// (`job_controller.go:339`, `:370-378`, `:480`): a pod ADDED for a Job
-    /// observes one creation (`CreationObserved`); a pod that is deleted, or
-    /// just stamped with a deletionTimestamp (`updatePod` routes those to
-    /// `deletePod(final=false)`), observes one deletion (`DeletionObserved`).
-    ///
-    /// Deviation: upstream's expectations are the plain counter and lower on
-    /// every event; here each pod is tracked by key (see
-    /// [`ControllerExpectations::creation_observed_of`] /
-    /// [`ControllerExpectations::deletion_observed_of`]) so the several
-    /// MODIFIED events and the final DELETED of one pod count once.
-    fn observe_pod_event(&self, event: &rusternetes_storage::WatchEvent) {
-        let (json, is_added, is_deleted) = match event {
-            rusternetes_storage::WatchEvent::Added(_, v) => (v, true, false),
-            rusternetes_storage::WatchEvent::Modified(_, v) => (v, false, false),
-            rusternetes_storage::WatchEvent::Deleted(_, v) => (v, false, true),
-        };
-        let Ok(pod) = serde_json::from_str::<Pod>(json) else {
-            return;
-        };
-        let Some(owner) = pod.metadata.owner_references.as_ref().and_then(|refs| {
-            refs.iter()
-                .find(|r| r.kind == "Job" && r.controller.unwrap_or(true))
-        }) else {
-            return;
-        };
-        let ns = pod.metadata.namespace.as_deref().unwrap_or("default");
-        let exp_key = format!("{}/{}", ns, owner.name);
-        let pod_key = format!("{}/{}", ns, pod.metadata.name);
-        let deleting = is_deleted || pod.metadata.deletion_timestamp.is_some();
-        if deleting {
-            self.expectations.deletion_observed_of(&exp_key, &pod_key);
-        } else if is_added {
-            self.expectations.creation_observed_of(&exp_key, &pod_key);
         }
     }
 
@@ -898,10 +993,21 @@ impl<S: Storage + 'static> JobController<S> {
             }
         });
 
+        // Upstream registers its pod handlers on the shared pod informer
+        // (`podInformer.Informer().AddEventHandler`, job_controller.go:213-224)
+        // and the informer factory runs the one watch; the first controller to
+        // get here starts it. The informer's initial list is what routes every
+        // orphan still holding the finalizer to `enqueueOrphanPod` (`addPod`).
+        self.pod_informer
+            .add_event_handler(Arc::clone(&self), queue.clone())
+            .await;
+        self.pod_informer.start();
+
         loop {
-            // Initial full reconciliation. The orphan sweep is the counterpart
-            // of the pod informer's initial list, whose `addPod` calls route
-            // every orphan still holding the finalizer to `enqueueOrphanPod`.
+            // Initial full reconciliation. The orphan sweep stays (#2050): the
+            // informer's `addPod` does not clean a pod whose controller Job is
+            // already gone (`resolveControllerRef` nil returns, :331-333);
+            // upstream leaves that pod to the garbage collector's delete.
             self.enqueue_all(&queue).await;
             self.reconcile_orphan_pods().await;
 
@@ -913,19 +1019,6 @@ impl<S: Storage + 'static> JobController<S> {
                 Err(e) => {
                     error!(
                         "Failed to establish watch: {}, retrying in {:?}",
-                        e, retry_interval
-                    );
-                    time::sleep(retry_interval).await;
-                    continue;
-                }
-            };
-
-            let pod_prefix = build_prefix("pods", None);
-            let mut pod_watch = match self.storage.watch(&pod_prefix).await {
-                Ok(w) => w,
-                Err(e) => {
-                    error!(
-                        "Failed to establish pod watch: {}, retrying in {:?}",
                         e, retry_interval
                     );
                     time::sleep(retry_interval).await;
@@ -957,21 +1050,6 @@ impl<S: Storage + 'static> JobController<S> {
                             }
                             None => {
                                 warn!("Watch stream ended, reconnecting");
-                                watch_broken = true;
-                            }
-                        }
-                    }
-                    event = pod_watch.next() => {
-                        match event {
-                            Some(Ok(ev)) => {
-                                self.enqueue_owner_job(&queue, &ev).await;
-                            }
-                            Some(Err(e)) => {
-                                warn!("Pod watch error: {}, reconnecting", e);
-                                watch_broken = true;
-                            }
-                            None => {
-                                warn!("Pod watch stream ended, reconnecting");
                                 watch_broken = true;
                             }
                         }
@@ -1040,51 +1118,6 @@ impl<S: Storage + 'static> JobController<S> {
             }
             Err(e) => {
                 error!("Failed to list jobs for enqueue: {}", e);
-            }
-        }
-    }
-
-    /// When a pod changes, check its ownerReferences for a Job owner
-    /// and enqueue that Job for reconciliation.
-    async fn enqueue_owner_job(&self, queue: &WorkQueue, event: &rusternetes_storage::WatchEvent) {
-        // `addPod` / `updatePod` / `deletePod`: observe the expectation from
-        // the event itself — a DELETED pod can no longer be read back.
-        self.observe_pod_event(event);
-        let pod_key = extract_key(event);
-        let parts: Vec<&str> = pod_key.splitn(3, '/').collect();
-        let ns = match parts.get(1) {
-            Some(ns) => *ns,
-            None => return,
-        };
-
-        let storage_key = format!("/registry/{}", pod_key);
-        match self.storage.get::<Pod>(&storage_key).await {
-            Ok(pod) => {
-                if let Some(refs) = &pod.metadata.owner_references {
-                    for owner_ref in refs {
-                        if owner_ref.kind == "Job" {
-                            queue.add(format!("jobs/{}/{}", ns, owner_ref.name)).await;
-                        }
-                    }
-                }
-                // `addPod` / `updatePod`: a pod still holding the finalizer
-                // with no live, counting Job to remove it is an orphan
-                // (`job_controller.go:344-347`, `:417-420`).
-                self.release_if_orphan(&pod).await;
-            }
-            Err(_) => {
-                // Pod deleted — enqueue all Jobs in this namespace
-                if let Ok(items) = self
-                    .storage
-                    .list::<Job>(&build_prefix("jobs", Some(ns)))
-                    .await
-                {
-                    for job in &items {
-                        queue
-                            .add(format!("jobs/{}/{}", ns, job.metadata.name))
-                            .await;
-                    }
-                }
             }
         }
     }
@@ -5640,7 +5673,7 @@ mod tests {
     // gone, only the Job controller's orphan path removes it. Upstream reaches
     // that path from `deleteJob` -> `enqueueLabelSelector`
     // (`pkg/controller/job/job_controller.go:561-581`) and from the pod event
-    // handlers (`addPod` :344-347, `updatePod` :417-420, `deletePod` :458-466),
+    // handlers (`addPod` :344-347, `updatePod` :417-420, `deletePod` :458-471),
     // all into `handleSingleOrphanPod` (:736-767). Ours existed but only
     // `reconcile_all` — a test entry point — called it, so in a cluster the
     // pods kept the finalizer forever: "there are 2 pods left".
@@ -6945,8 +6978,8 @@ mod tests {
                 format!("pods/default/{}", pod.metadata.name),
                 serde_json::to_string(pod).unwrap(),
             );
-            controller.observe_pod_event(&ev);
-            controller.observe_pod_event(&ev); // duplicate: not double counted
+            deliver(&controller, &WorkQueue::new(), ev.clone()).await;
+            deliver(&controller, &WorkQueue::new(), ev).await; // duplicate: an update, not a second creation
         }
         assert_eq!(
             controller.expectations.get_expectations("default/obs"),
@@ -6981,8 +7014,402 @@ mod tests {
             "pods/default/p1".to_string(),
             serde_json::to_string(&gone).unwrap(),
         );
-        controller.observe_pod_event(&ev);
+        deliver(&controller, &WorkQueue::new(), ev).await;
         assert!(controller.expectations.satisfied("default/sus2"));
+    }
+
+    // ---- #3869: the pod handlers on the shared pod informer ----------------
+    use crate::controllers::pod_informer::apply_pod_observation;
+    //
+    // Ports of `TestAddPod*`/`TestUpdatePod*`/`TestDeletePod*`-style cases
+    // (job_controller_test.go) and the handler bodies they pin
+    // (job_controller.go:319-492), driven through the informer cache + the
+    // `PodEventTarget` effects, as the running controller does.
+
+    /// One pod watch event through the informer, delivered to `controller`.
+    async fn deliver(
+        controller: &JobController<MemoryStorage>,
+        queue: &WorkQueue,
+        event: rusternetes_storage::WatchEvent,
+    ) {
+        if let Some(observation) = controller.pod_informer.cache().on_event(&event) {
+            apply_pod_observation(controller, queue, &observation).await;
+        }
+    }
+
+    fn pod_event(
+        kind: fn(String, String) -> rusternetes_storage::WatchEvent,
+        pod: &Pod,
+    ) -> rusternetes_storage::WatchEvent {
+        kind(
+            format!("/registry/pods/default/{}", pod.metadata.name),
+            serde_json::to_string(pod).unwrap(),
+        )
+    }
+
+    /// Everything the queue yields within `wait` (pod events enqueue after
+    /// `SyncJobBatchPeriod`, `enqueueSyncJobBatched`, :599).
+    async fn drain(queue: &WorkQueue, wait: Duration) -> Vec<String> {
+        let mut keys = Vec::new();
+        while let Ok(Some(key)) = tokio::time::timeout(wait, queue.get()).await {
+            queue.done(&key).await;
+            keys.push(key);
+        }
+        keys
+    }
+
+    async fn controller_with_job(job: Job) -> (Arc<MemoryStorage>, JobController<MemoryStorage>) {
+        let storage = Arc::new(MemoryStorage::new());
+        storage
+            .create(
+                &build_key("jobs", Some("default"), &job.metadata.name),
+                &job,
+            )
+            .await
+            .unwrap();
+        let controller = JobController::new(storage.clone());
+        (storage, controller)
+    }
+
+    async fn store_pod(storage: &MemoryStorage, pod: &Pod) {
+        storage
+            .create(&build_key("pods", Some("default"), &pod.metadata.name), pod)
+            .await
+            .unwrap();
+    }
+
+    /// `updatePod` (:361-431): "Don't check if oldPod has the finalizer" —
+    /// a pod update that leaves the pod without the tracking finalizer is
+    /// `finalizerRemovalObserved` for its UID, and the Job is enqueued.
+    #[tokio::test]
+    async fn update_without_finalizer_observes_the_removal_and_enqueues() {
+        let (_storage, controller) = controller_with_job(make_job("fr", "default", 1, 1)).await;
+        let queue = WorkQueue::new();
+        let mut pod = make_pod("fr-a", "default", Phase::Running, "fr", "job-uid-1");
+        pod.metadata.resource_version = Some("1".into());
+        deliver(
+            &controller,
+            &queue,
+            pod_event(rusternetes_storage::WatchEvent::Added, &pod),
+        )
+        .await;
+        drain(&queue, Duration::from_millis(1500)).await;
+
+        controller
+            .finalizer_expectations
+            .expect_removed("default/fr", [pod.metadata.uid.clone()]);
+        pod.metadata.finalizers = None;
+        pod.metadata.resource_version = Some("2".into());
+        deliver(
+            &controller,
+            &queue,
+            pod_event(rusternetes_storage::WatchEvent::Modified, &pod),
+        )
+        .await;
+
+        assert!(
+            controller
+                .finalizer_expectations
+                .expected("default/fr")
+                .is_empty(),
+            "finalizerRemovalObserved (:389-394, :404-411)"
+        );
+        assert_eq!(
+            drain(&queue, Duration::from_millis(1500)).await,
+            vec!["jobs/default/fr".to_string()]
+        );
+    }
+
+    /// `updatePod`: a pod that STILL holds the finalizer is not a removal.
+    #[tokio::test]
+    async fn update_with_finalizer_leaves_the_removal_expected() {
+        let (_storage, controller) = controller_with_job(make_job("fk", "default", 1, 1)).await;
+        let queue = WorkQueue::new();
+        let mut pod = make_pod("fk-a", "default", Phase::Running, "fk", "job-uid-1");
+        pod.metadata.resource_version = Some("1".into());
+        deliver(
+            &controller,
+            &queue,
+            pod_event(rusternetes_storage::WatchEvent::Added, &pod),
+        )
+        .await;
+        controller
+            .finalizer_expectations
+            .expect_removed("default/fk", [pod.metadata.uid.clone()]);
+        pod.metadata.resource_version = Some("2".into());
+        deliver(
+            &controller,
+            &queue,
+            pod_event(rusternetes_storage::WatchEvent::Modified, &pod),
+        )
+        .await;
+        assert_eq!(
+            controller
+                .finalizer_expectations
+                .expected("default/fk")
+                .len(),
+            1
+        );
+    }
+
+    /// `deletePod` (:434-492): "Consider the finalizer removed if this is the
+    /// final delete", even when the (stale) pod still lists the finalizer.
+    #[tokio::test]
+    async fn final_delete_observes_deletion_and_finalizer_removal() {
+        let (_storage, controller) = controller_with_job(make_job("fd", "default", 1, 1)).await;
+        let queue = WorkQueue::new();
+        let pod = make_pod("fd-a", "default", Phase::Running, "fd", "job-uid-1");
+        controller
+            .expectations
+            .expect_deletions_of("default/fd", &["default/fd-a".to_string()]);
+        controller
+            .finalizer_expectations
+            .expect_removed("default/fd", [pod.metadata.uid.clone()]);
+        deliver(
+            &controller,
+            &queue,
+            pod_event(rusternetes_storage::WatchEvent::Deleted, &pod),
+        )
+        .await;
+        assert!(controller.expectations.satisfied("default/fd"));
+        assert!(controller
+            .finalizer_expectations
+            .expected("default/fd")
+            .is_empty());
+        assert_eq!(
+            drain(&queue, Duration::from_millis(1500)).await,
+            vec!["jobs/default/fd".to_string()]
+        );
+    }
+
+    /// `deletePod(final=false)` — the deletionTimestamp update: "Otherwise,
+    /// it's an update for the deletion timestamp, then check finalizer"
+    /// (:484-488). A pod that still holds the finalizer is not yet removed.
+    #[tokio::test]
+    async fn terminating_pod_with_finalizer_is_not_a_finalizer_removal() {
+        let (_storage, controller) = controller_with_job(make_job("ft", "default", 1, 1)).await;
+        let queue = WorkQueue::new();
+        let mut pod = make_pod("ft-a", "default", Phase::Running, "ft", "job-uid-1");
+        pod.metadata.resource_version = Some("1".into());
+        deliver(
+            &controller,
+            &queue,
+            pod_event(rusternetes_storage::WatchEvent::Added, &pod),
+        )
+        .await;
+        controller
+            .expectations
+            .expect_deletions_of("default/ft", &["default/ft-a".to_string()]);
+        controller
+            .finalizer_expectations
+            .expect_removed("default/ft", [pod.metadata.uid.clone()]);
+        pod.metadata.deletion_timestamp = Some(chrono::Utc::now());
+        pod.metadata.resource_version = Some("2".into());
+        deliver(
+            &controller,
+            &queue,
+            pod_event(rusternetes_storage::WatchEvent::Modified, &pod),
+        )
+        .await;
+        assert!(controller.expectations.satisfied("default/ft"));
+        assert_eq!(
+            controller
+                .finalizer_expectations
+                .expected("default/ft")
+                .len(),
+            1,
+            "still holds the finalizer, so its removal is not observed"
+        );
+    }
+
+    /// `deletePod`: "if job == nil || util.IsJobFinished(job) { // syncJob will
+    /// not remove this finalizer. if hasFinalizer { enqueueOrphanPod } return }"
+    /// (:468-474): nothing is observed or enqueued, the finalizer is released.
+    #[tokio::test]
+    async fn terminating_pod_of_a_finished_job_is_released_not_observed() {
+        let mut job = make_job("fin", "default", 1, 1);
+        job.status = Some(JobStatus {
+            conditions: Some(vec![JobCondition {
+                condition_type: "Complete".to_string(),
+                status: "True".to_string(),
+                last_probe_time: None,
+                last_transition_time: None,
+                reason: None,
+                message: None,
+            }]),
+            ..Default::default()
+        });
+        let (storage, controller) = controller_with_job(job).await;
+        let queue = WorkQueue::new();
+        let mut pod = make_pod("fin-a", "default", Phase::Running, "fin", "job-uid-1");
+        pod.metadata.resource_version = Some("1".into());
+        store_pod(&storage, &pod).await;
+        controller
+            .expectations
+            .expect_deletions_of("default/fin", &["default/fin-a".to_string()]);
+        pod.metadata.deletion_timestamp = Some(chrono::Utc::now());
+        pod.metadata.resource_version = Some("2".into());
+        deliver(
+            &controller,
+            &queue,
+            pod_event(rusternetes_storage::WatchEvent::Modified, &pod),
+        )
+        .await;
+        assert!(
+            !controller.expectations.satisfied("default/fin"),
+            "a finished Job does not observe the deletion"
+        );
+        assert!(drain(&queue, Duration::from_millis(1500)).await.is_empty());
+        let stored: Pod = storage
+            .get(&build_key("pods", Some("default"), "fin-a"))
+            .await
+            .unwrap();
+        assert!(!has_job_tracking_finalizer(&stored), "enqueueOrphanPod");
+    }
+
+    /// `addPod`: "Otherwise, it's an orphan. Clean the finalizer." (:344-347)
+    #[tokio::test]
+    async fn added_orphan_pod_holding_the_finalizer_is_released() {
+        let (storage, controller) = controller_with_job(make_job("orph", "default", 1, 1)).await;
+        let queue = WorkQueue::new();
+        let mut pod = make_pod("orph-a", "default", Phase::Running, "orph", "job-uid-1");
+        pod.metadata.owner_references = None;
+        store_pod(&storage, &pod).await;
+        deliver(
+            &controller,
+            &queue,
+            pod_event(rusternetes_storage::WatchEvent::Added, &pod),
+        )
+        .await;
+        let stored: Pod = storage
+            .get(&build_key("pods", Some("default"), "orph-a"))
+            .await
+            .unwrap();
+        assert!(!has_job_tracking_finalizer(&stored));
+    }
+
+    /// `addPod` orphan: "Get a list of all matching controllers and sync them
+    /// to see if anyone wants to adopt it" via `getPodJobs` (:349-353,
+    /// `GetPodJobs`, client-go listers/batch/v1/job_expansion.go).
+    #[tokio::test]
+    async fn added_orphan_pod_wakes_the_jobs_whose_selector_matches() {
+        let storage = Arc::new(MemoryStorage::new());
+        for name in ["match", "other"] {
+            storage
+                .create(
+                    &build_key("jobs", Some("default"), name),
+                    &job_with_selector(name),
+                )
+                .await
+                .unwrap();
+        }
+        let controller = JobController::new(storage.clone());
+        let queue = WorkQueue::new();
+        let mut pod = make_pod("o-a", "default", Phase::Running, "match", "job-uid-1");
+        pod.metadata.owner_references = None;
+        pod.metadata.finalizers = None;
+        deliver(
+            &controller,
+            &queue,
+            pod_event(rusternetes_storage::WatchEvent::Added, &pod),
+        )
+        .await;
+        assert_eq!(
+            drain(&queue, Duration::from_millis(1500)).await,
+            vec!["jobs/default/match".to_string()]
+        );
+    }
+
+    /// `GetPodJobs`: "no jobs found for pod because it has no labels", a nil
+    /// selector is `labels.Nothing()`, an empty one `labels.Everything()`.
+    #[tokio::test]
+    async fn get_pod_jobs_selector_semantics() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut nil = make_job("nil", "default", 1, 1);
+        nil.spec.selector = None;
+        let mut empty = make_job("empty", "default", 1, 1);
+        empty.spec.selector = Some(Default::default());
+        for job in [&nil, &empty] {
+            storage
+                .create(&build_key("jobs", Some("default"), &job.metadata.name), job)
+                .await
+                .unwrap();
+        }
+        let controller = JobController::new(storage);
+        let labelled = HashMap::from([("a".to_string(), "b".to_string())]);
+        assert_eq!(
+            controller.pod_controllers("default", &labelled).await,
+            vec!["empty".to_string()]
+        );
+        assert!(controller
+            .pod_controllers("default", &HashMap::new())
+            .await
+            .is_empty());
+    }
+
+    /// `resolveControllerRef`: a Job with the same name but a different UID is
+    /// not the controller (:309-314) — nothing is observed or enqueued.
+    #[tokio::test]
+    async fn pod_of_a_recreated_job_uid_mismatch_is_ignored() {
+        let (_storage, controller) = controller_with_job(make_job("uid", "default", 1, 1)).await;
+        let queue = WorkQueue::new();
+        let pod = make_pod("uid-a", "default", Phase::Running, "uid", "some-other-uid");
+        controller.expectations.expect_creations("default/uid", 1);
+        deliver(
+            &controller,
+            &queue,
+            pod_event(rusternetes_storage::WatchEvent::Added, &pod),
+        )
+        .await;
+        assert!(!controller.expectations.satisfied("default/uid"));
+        assert!(drain(&queue, Duration::from_millis(1500)).await.is_empty());
+    }
+
+    /// `enqueueSyncJobBatched` (:593-600): pod events enqueue after
+    /// `SyncJobBatchPeriod`, not immediately.
+    #[tokio::test]
+    async fn pod_events_enqueue_after_the_batch_period() {
+        let (_storage, controller) = controller_with_job(make_job("bp", "default", 1, 1)).await;
+        let queue = WorkQueue::new();
+        let pod = make_pod("bp-a", "default", Phase::Running, "bp", "job-uid-1");
+        deliver(
+            &controller,
+            &queue,
+            pod_event(rusternetes_storage::WatchEvent::Added, &pod),
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), queue.get())
+                .await
+                .is_err(),
+            "must not be enqueued before SyncJobBatchPeriod"
+        );
+        assert_eq!(
+            drain(&queue, Duration::from_millis(1500)).await,
+            vec!["jobs/default/bp".to_string()]
+        );
+    }
+
+    /// The running controller registers on the informer: an orphan that held
+    /// the finalizer before the informer started is released from the
+    /// informer's initial list (the `addPod` of `processDeltas`), with the
+    /// informer started by ANOTHER controller first.
+    #[tokio::test]
+    async fn run_releases_orphans_when_the_informer_was_already_running() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut pod = make_pod("late-a", "default", Phase::Running, "late", "job-uid-1");
+        pod.metadata.owner_references = None;
+        store_pod(&storage, &pod).await;
+        let informer = Arc::new(SharedPodInformer::new(
+            storage.clone(),
+            Duration::from_secs(5),
+        ));
+        informer.relist().await;
+        let controller = Arc::new(JobController::with_pod_informer(storage.clone(), informer));
+        let handle = tokio::spawn(controller.run());
+        let held = wait_until_released(&storage, &["late-a"]).await;
+        handle.abort();
+        assert!(held.is_empty(), "still held: {held:?}");
     }
 
     fn pod_for_ordering(name: &str, phase: Phase, node: Option<&str>, ready: bool) -> Pod {
