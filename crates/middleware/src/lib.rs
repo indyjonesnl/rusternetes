@@ -912,6 +912,16 @@ pub async fn validate_service_account_claims(
     Ok(())
 }
 
+/// Records elapsed time into the request's authentication latency tracker
+/// when dropped.
+struct AuthenticationLatencyGuard(std::time::Instant);
+
+impl Drop for AuthenticationLatencyGuard {
+    fn drop(&mut self) {
+        rusternetes_common::latency_trackers::track_authentication_latency(self.0.elapsed());
+    }
+}
+
 /// Authentication middleware that extracts and validates JWT tokens.
 ///
 /// Mirrors upstream `pkg/serviceaccount/legacy.go` / `bound.go`: after a JWT
@@ -939,6 +949,10 @@ pub async fn auth_middleware(
         .unwrap_or("");
 
     let mut observations = AuthObservations::default();
+    // `TrackAuthenticationLatency` (filters/authentication.go:69): the time
+    // spent in `AuthenticateRequest`, recorded on success and failure alike
+    // (the guard also fires on the early 401 returns).
+    let authentication_latency = AuthenticationLatencyGuard(std::time::Instant::now());
     let user = if let Some(token) = auth_header.strip_prefix("Bearer ") {
         // Skip "Bearer "
 
@@ -996,6 +1010,7 @@ pub async fn auth_middleware(
         debug!("Anonymous request");
         UserInfo::anonymous()
     };
+    drop(authentication_latency);
 
     // Apply inbound impersonation headers. The authenticated caller must hold
     // the `impersonate` verb on each requested subject; on success the
@@ -3241,6 +3256,22 @@ pub async fn capture_payload(
 
 #[cfg(test)]
 mod tests {
+    /// `TrackAuthenticationLatency` (filters/authentication.go:69): the guard
+    /// records into the request's tracker on drop, and is a no-op without one.
+    #[tokio::test]
+    async fn authentication_latency_guard_records_on_drop() {
+        use rusternetes_common::latency_trackers::{with_latency_trackers, LatencyTrackers};
+        drop(AuthenticationLatencyGuard(std::time::Instant::now()));
+        let t = std::sync::Arc::new(LatencyTrackers::new());
+        with_latency_trackers(t.clone(), async {
+            let g = AuthenticationLatencyGuard(std::time::Instant::now());
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            drop(g);
+        })
+        .await;
+        assert!(t.authentication.get_latency() >= std::time::Duration::from_millis(5));
+    }
+
     use super::*;
 
     /// Build a DER-encoded self-signed cert with the given CN and Organizations,
