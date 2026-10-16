@@ -2,12 +2,12 @@
 //! `staging/src/k8s.io/csi-translation-lib` (`translate.go`,
 //! `plugins/in_tree_volume.go`, `plugins/gce_pd.go`, `plugins/aws_ebs.go`,
 //! `plugins/portworx.go`, `plugins/vsphere_volume.go`, `plugins/azure_file.go`,
-//! `plugins/openstack_cinder.go`).
+//! `plugins/azure_disk.go`, `plugins/openstack_cinder.go`).
 //!
 //! Shared by the external-attacher (`CsiAttacher`) and the scheduler's
 //! VolumeBinding plugin (`tryTranslatePVToCSI`). Plugins ported so far: GCE PD,
-//! AWS EBS, Portworx, vSphere, Azure File and Cinder; the other in-tree plugin of
-//! `translate.go:34-42` (AzureDisk) is tracked follow-ups.
+//! AWS EBS, Portworx, vSphere, Azure File, Azure Disk and Cinder: every in-tree
+//! plugin of `translate.go:34-42`.
 //!
 //! `TranslateCSIPVToInTree` (`translate.go:116-128`) is ported for the same
 //! two plugins, with `translateTopologyFromCSIToInTree` /
@@ -84,9 +84,18 @@ static AWS_EBS: AwsElasticBlockStoreTranslator = AwsElasticBlockStoreTranslator;
 static PORTWORX: PortworxCsiTranslator = PortworxCsiTranslator;
 static VSPHERE: VsphereCsiTranslator = VsphereCsiTranslator;
 static AZURE_FILE: AzureFileCsiTranslator = AzureFileCsiTranslator;
+static AZURE_DISK: AzureDiskCsiTranslator = AzureDiskCsiTranslator;
 static CINDER: OsCinderCsiTranslator = OsCinderCsiTranslator;
-fn in_tree_plugins() -> [&'static dyn InTreePlugin; 6] {
-    [&GCE_PD, &AWS_EBS, &PORTWORX, &VSPHERE, &AZURE_FILE, &CINDER]
+fn in_tree_plugins() -> [&'static dyn InTreePlugin; 7] {
+    [
+        &GCE_PD,
+        &AWS_EBS,
+        &PORTWORX,
+        &VSPHERE,
+        &AZURE_FILE,
+        &AZURE_DISK,
+        &CINDER,
+    ]
 }
 
 /// `CSITranslator` (`translate.go:48`).
@@ -1725,6 +1734,262 @@ impl InTreePlugin for AzureFileCsiTranslator {
     }
 
     /// `RepairVolumeHandle` (`azure_file.go:239-241`): identity.
+    fn repair_volume_handle(&self, volume_handle: &str, _node_id: &str) -> Result<String, String> {
+        Ok(volume_handle.to_string())
+    }
+}
+
+// ---- Azure Disk (`plugins/azure_disk.go`) -----------------------------------
+
+/// `AzureDiskDriverName` (`azure_disk.go:32`).
+pub const AZURE_DISK_DRIVER_NAME: &str = "disk.csi.azure.com";
+/// `AzureDiskTopologyKey` (`azure_disk.go:34`).
+const AZURE_DISK_TOPOLOGY_KEY: &str = "topology.disk.csi.azure.com/zone";
+/// `AzureDiskInTreePluginName` (`azure_disk.go:36`).
+pub const AZURE_DISK_IN_TREE_PLUGIN_NAME: &str = "kubernetes.io/azure-disk";
+/// `azureDiskKind` / `azureDiskCachingMode` / `azureDiskFSType`
+/// (`azure_disk.go:40-42`).
+const AZURE_DISK_KIND: &str = "kind";
+const AZURE_DISK_CACHING_MODE: &str = "cachingmode";
+const AZURE_DISK_FS_TYPE: &str = "fstype";
+/// `managed = string(v1.AzureManagedDisk)` (`azure_disk.go:48`).
+const AZURE_DISK_MANAGED: &str = "Managed";
+
+/// `managedDiskPathRE` / `unmanagedDiskPathRE` (`azure_disk.go:46-47`).
+const MANAGED_DISK_PATH_RE: &str =
+    ".*/subscriptions/(?:.*)/resourceGroups/(?:.*)/providers/Microsoft.Compute/disks/(.+)";
+const UNMANAGED_DISK_PATH_RE: &str = "http(?:.*)://(?:.*)/vhds/(.+)";
+static MANAGED_DISK_PATH_REGEX: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(MANAGED_DISK_PATH_RE).expect("static regex"));
+static UNMANAGED_DISK_PATH_REGEX: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(UNMANAGED_DISK_PATH_RE).expect("static regex"));
+/// `unzonedCSIRegionRE` (`azure_disk.go:49`).
+static UNZONED_CSI_REGION_REGEX: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new("^[0-9]+$").expect("static regex"));
+
+/// `isManagedDisk` (`azure_disk.go:260-265`).
+fn is_managed_disk(disk_uri: &str) -> bool {
+    // `len(diskURI) > 4 && strings.ToLower(diskURI[:4]) == "http"`: Go slices
+    // bytes, so compare bytes (a non-ASCII prefix can never equal "http").
+    let b = disk_uri.as_bytes();
+    !(b.len() > 4 && b[..4].eq_ignore_ascii_case(b"http"))
+}
+
+/// `getDiskName` (`azure_disk.go:267-279`).
+fn get_disk_name(disk_uri: &str) -> Result<String, String> {
+    let (re, pattern) = if is_managed_disk(disk_uri) {
+        (&*MANAGED_DISK_PATH_REGEX, MANAGED_DISK_PATH_RE)
+    } else {
+        (&*UNMANAGED_DISK_PATH_REGEX, UNMANAGED_DISK_PATH_RE)
+    };
+    re.captures(disk_uri)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
+        .ok_or_else(|| {
+            format!("could not get disk name from {disk_uri}, correct format: {pattern}")
+        })
+}
+
+/// `replaceFailureDomainsToCSI` (`azure_disk.go:282-309`): topology values for
+/// failure domains ("<number>") become "", the value the CSI driver expects.
+fn azure_disk_replace_failure_domains_to_csi(
+    terms: Vec<TopologySelectorTerm>,
+) -> Vec<TopologySelectorTerm> {
+    terms
+        .into_iter()
+        .map(|mut term| {
+            for exp in term.match_label_expressions.iter_mut().flatten() {
+                if exp.key == AZURE_DISK_TOPOLOGY_KEY {
+                    for v in exp.values.iter_mut() {
+                        if UNZONED_CSI_REGION_REGEX.is_match(v) {
+                            *v = String::new();
+                        }
+                    }
+                }
+            }
+            term
+        })
+        .collect()
+}
+
+struct AzureDiskCsiTranslator;
+
+/// `kind` check shared by the inline and PV paths (`azure_disk.go:106`,
+/// `:160`): `!strings.EqualFold(kind, managed)`.
+fn azure_disk_check_kind(kind: Option<&str>) -> Result<(), String> {
+    match kind {
+        Some(k) if !k.to_lowercase().eq(&AZURE_DISK_MANAGED.to_lowercase()) => {
+            Err(format!("kind({k}) is not supported in csi migration"))
+        }
+        _ => Ok(()),
+    }
+}
+
+impl InTreePlugin for AzureDiskCsiTranslator {
+    /// `TranslateInTreeStorageClassToCSI` (`azure_disk.go:64-97`).
+    fn translate_in_tree_storage_class_to_csi(&self, sc: &mut StorageClass) -> Result<(), String> {
+        let mut generated: Vec<TopologySelectorTerm> = Vec::new();
+        let mut params: HashMap<String, String> = HashMap::new();
+        for (k, v) in sc.parameters.iter().flatten() {
+            match k.to_lowercase().as_str() {
+                ZONE_KEY => {
+                    generated =
+                        generate_topology_selectors(AZURE_DISK_TOPOLOGY_KEY, vec![v.clone()])
+                }
+                ZONES_KEY => {
+                    generated = generate_topology_selectors(
+                        AZURE_DISK_TOPOLOGY_KEY,
+                        v.split(',').map(str::to_string).collect(),
+                    )
+                }
+                _ => {
+                    params.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        let existing = sc.allowed_topologies.clone().unwrap_or_default();
+        if !generated.is_empty() && !existing.is_empty() {
+            return Err(
+                "cannot simultaneously set allowed topologies and zone/zones parameters"
+                    .to_string(),
+            );
+        } else if !generated.is_empty() {
+            sc.allowed_topologies = Some(generated);
+        } else if !existing.is_empty() {
+            sc.allowed_topologies = Some(translate_allowed_topologies(
+                &existing,
+                AZURE_DISK_TOPOLOGY_KEY,
+            ));
+        }
+        // `sc.AllowedTopologies = t.replaceFailureDomainsToCSI(...)`: nil stays nil.
+        sc.allowed_topologies = sc
+            .allowed_topologies
+            .take()
+            .map(azure_disk_replace_failure_domains_to_csi);
+        sc.parameters = Some(params);
+        Ok(())
+    }
+
+    /// `TranslateInTreeInlineVolumeToCSI` (`azure_disk.go:100-141`).
+    fn translate_in_tree_inline_volume_to_csi(
+        &self,
+        volume: &Volume,
+        _pod_namespace: &str,
+    ) -> Result<PersistentVolume, String> {
+        let Some(azure) = volume.legacy_sources.azure_disk.as_ref() else {
+            return Err("volume is nil or Azure Disk not defined on volume".into());
+        };
+        let str_field = |k: &str| azure.get(k).and_then(|v| v.as_str());
+        azure_disk_check_kind(str_field("kind"))?;
+        let data_disk_uri = str_field("diskURI").unwrap_or_default().to_string();
+        // Must be unique per disk as it is used as the unique part of the
+        // staging path
+        let mut pv = inline_pv(data_disk_uri.clone());
+        let mut attrs =
+            HashMap::from([(AZURE_DISK_KIND.to_string(), AZURE_DISK_MANAGED.to_string())]);
+        let mut csi = CSIVolumeSource {
+            driver: AZURE_DISK_DRIVER_NAME.to_string(),
+            volume_handle: Some(data_disk_uri),
+            ..Default::default()
+        };
+        if let Some(ro) = azure.get("readOnly").and_then(|v| v.as_bool()) {
+            csi.read_only = Some(ro).filter(|r| *r);
+        }
+        if let Some(mode) = str_field("cachingMode").filter(|m| !m.is_empty()) {
+            attrs.insert(AZURE_DISK_CACHING_MODE.to_string(), mode.to_string());
+        }
+        if let Some(fs) = str_field("fsType") {
+            csi.fs_type = Some(fs.to_string());
+            attrs.insert(AZURE_DISK_FS_TYPE.to_string(), fs.to_string());
+        }
+        attrs.insert(AZURE_DISK_KIND.to_string(), AZURE_DISK_MANAGED.to_string());
+        csi.volume_attributes = Some(attrs);
+        pv.spec.csi = Some(csi);
+        pv.spec.access_modes = vec![PersistentVolumeAccessMode::ReadWriteOnce];
+        Ok(pv)
+    }
+
+    /// `TranslateInTreePVToCSI` (`azure_disk.go:144-183`).
+    fn translate_in_tree_pv_to_csi(&self, pv: &mut PersistentVolume) -> Result<(), String> {
+        let Some(azure) = pv.spec.more_sources.azure_disk.clone() else {
+            return Err("pv is nil or Azure Disk source not defined on pv".into());
+        };
+        azure_disk_check_kind(azure.kind.as_deref())?;
+        let mut attrs =
+            HashMap::from([(AZURE_DISK_KIND.to_string(), AZURE_DISK_MANAGED.to_string())]);
+        let mut csi = CSIVolumeSource {
+            driver: AZURE_DISK_DRIVER_NAME.to_string(),
+            volume_handle: Some(azure.data_disk_uri),
+            ..Default::default()
+        };
+        if let Some(mode) = azure.caching_mode {
+            attrs.insert(AZURE_DISK_CACHING_MODE.to_string(), mode);
+        }
+        if let Some(fs) = azure.fs_type {
+            csi.fs_type = Some(fs.clone());
+            attrs.insert(AZURE_DISK_FS_TYPE.to_string(), fs);
+        }
+        attrs.insert(AZURE_DISK_KIND.to_string(), AZURE_DISK_MANAGED.to_string());
+        if let Some(ro) = azure.read_only {
+            csi.read_only = Some(ro).filter(|r| *r);
+        }
+        csi.volume_attributes = Some(attrs);
+        pv.spec.more_sources.azure_disk = None;
+        pv.spec.csi = Some(csi);
+        Ok(())
+    }
+
+    /// `TranslateCSIPVToInTree` (`azure_disk.go:186-232`).
+    fn translate_csi_pv_to_in_tree(&self, pv: &mut PersistentVolume) -> Result<(), String> {
+        let Some(csi) = pv.spec.csi.clone() else {
+            return Err("pv is nil or CSI source not defined on pv".into());
+        };
+        let disk_uri = csi.volume_handle.clone().unwrap_or_default();
+        let disk_name = get_disk_name(&disk_uri)?;
+        let mut azure = crate::resources::pv_sources::AzureDiskVolumeSource {
+            disk_name,
+            data_disk_uri: disk_uri,
+            // `FSType: &csiSource.FSType`, `ReadOnly: &csiSource.ReadOnly`
+            fs_type: Some(csi.fs_type.clone().unwrap_or_default()),
+            read_only: Some(csi.read_only.unwrap_or(false)),
+            kind: Some(AZURE_DISK_MANAGED.to_string()),
+            ..Default::default()
+        };
+        if let Some(attrs) = csi.volume_attributes.as_ref() {
+            for (k, v) in attrs {
+                match k.to_lowercase().as_str() {
+                    AZURE_DISK_CACHING_MODE if !v.is_empty() => {
+                        azure.caching_mode = Some(v.clone());
+                    }
+                    AZURE_DISK_FS_TYPE if !v.is_empty() => azure.fs_type = Some(v.clone()),
+                    _ => {}
+                }
+            }
+        }
+        pv.spec.csi = None;
+        pv.spec.more_sources.azure_disk = Some(azure);
+        Ok(())
+    }
+
+    /// `CanSupport` (`azure_disk.go:235-237`).
+    fn can_support(&self, pv: &PersistentVolume) -> bool {
+        pv.spec.more_sources.azure_disk.is_some()
+    }
+
+    /// `CanSupportInline` (`azure_disk.go:242-244`).
+    fn can_support_inline(&self, volume: &Volume) -> bool {
+        volume.legacy_sources.azure_disk.is_some()
+    }
+
+    fn in_tree_plugin_name(&self) -> &'static str {
+        AZURE_DISK_IN_TREE_PLUGIN_NAME
+    }
+
+    fn csi_plugin_name(&self) -> &'static str {
+        AZURE_DISK_DRIVER_NAME
+    }
+
+    /// `RepairVolumeHandle` (`azure_disk.go:256-258`): identity.
     fn repair_volume_handle(&self, volume_handle: &str, _node_id: &str) -> Result<String, String> {
         Ok(volume_handle.to_string())
     }
@@ -3615,6 +3880,309 @@ mod tests {
         // `RepairVolumeHandle` is the identity.
         assert_eq!(
             t.repair_volume_handle("cinder.csi.openstack.org", "h", "n")
+                .unwrap(),
+            "h"
+        );
+    }
+
+    // ---- Azure Disk (`plugins/azure_disk_test.go`) ------------------------
+
+    const AZD_NAME: &str = "kubernetes.io/azure-disk";
+    const AZD_KEY: &str = "topology.disk.csi.azure.com/zone";
+    const AZD_URI: &str =
+        "/subscriptions/12/resourceGroups/23/providers/Microsoft.Compute/disks/name";
+
+    fn azd_pv(src: crate::resources::pv_sources::AzureDiskVolumeSource) -> PersistentVolume {
+        let mut pv = blank_pv("pv1");
+        pv.spec.more_sources.azure_disk = Some(src);
+        pv
+    }
+
+    /// `TestIsManagedDisk`.
+    #[test]
+    fn azure_disk_is_managed_disk() {
+        for (input, want) in [
+            (
+                "testurl/subscriptions/12/resourceGroups/23/providers/Microsoft.Compute/disks/name",
+                true,
+            ),
+            ("test.com", true),
+            ("HTTP://test.com", false),
+            ("http://test.com/vhds/name", false),
+        ] {
+            assert_eq!(is_managed_disk(input), want, "input {input:?}");
+        }
+    }
+
+    /// `TestGetDiskName`.
+    #[test]
+    fn azure_disk_get_disk_name() {
+        assert_eq!(
+            get_disk_name(
+                "testurl/subscriptions/12/resourceGroups/23/providers/Microsoft.Compute/disks/name"
+            ),
+            Ok("name".to_string())
+        );
+        assert_eq!(
+            get_disk_name("testurl/subscriptions/23/providers/Microsoft.Compute/disks/name"),
+            Err("could not get disk name from testurl/subscriptions/23/providers/Microsoft.Compute/disks/name, correct format: .*/subscriptions/(?:.*)/resourceGroups/(?:.*)/providers/Microsoft.Compute/disks/(.+)".to_string())
+        );
+        assert_eq!(
+            get_disk_name("http://test.com/vhds/name"),
+            Ok("name".to_string())
+        );
+        assert_eq!(
+            get_disk_name("http://test.io/name"),
+            Err("could not get disk name from http://test.io/name, correct format: http(?:.*)://(?:.*)/vhds/(.+)".to_string())
+        );
+    }
+
+    /// `TestTranslateAzureDiskInTreeInlineVolumeToCSI`.
+    #[test]
+    fn azure_disk_inline_translation_matches_upstream_table() {
+        let t = CsiTranslator::new();
+        // "no azure disk volume"
+        let vol = inline(serde_json::json!({"name": "v"}));
+        assert!(!t.is_inline_migratable(&vol));
+        assert!(t.translate_in_tree_inline_volume_to_csi(&vol, "").is_err());
+        // "azure disk volume"
+        let vol = inline(serde_json::json!({
+            "name": "v", "azureDisk": {"diskName": "diskname", "diskURI": "datadiskuri"}
+        }));
+        assert!(t.is_inline_migratable(&vol));
+        let pv = t.translate_in_tree_inline_volume_to_csi(&vol, "").unwrap();
+        assert_eq!(pv.metadata.name, "datadiskuri");
+        let csi = pv.spec.csi.as_ref().unwrap();
+        assert_eq!(csi.driver, "disk.csi.azure.com");
+        assert_eq!(csi.volume_handle.as_deref(), Some("datadiskuri"));
+        assert_eq!(
+            csi.volume_attributes,
+            Some(HashMap::from([("kind".to_string(), "Managed".to_string())]))
+        );
+        assert_eq!(
+            pv.spec.access_modes,
+            vec![PersistentVolumeAccessMode::ReadWriteOnce]
+        );
+        // The remaining optional fields (`azure_disk.go:111-125`).
+        let vol = inline(serde_json::json!({
+            "name": "v",
+            "azureDisk": {"diskName": "d", "diskURI": "u", "kind": "managed", "readOnly": true,
+                          "cachingMode": "ReadOnly", "fsType": "ext4"}
+        }));
+        let pv = t.translate_in_tree_inline_volume_to_csi(&vol, "").unwrap();
+        let csi = pv.spec.csi.as_ref().unwrap();
+        assert_eq!(csi.read_only, Some(true));
+        assert_eq!(csi.fs_type.as_deref(), Some("ext4"));
+        assert_eq!(
+            csi.volume_attributes,
+            Some(HashMap::from([
+                ("kind".to_string(), "Managed".to_string()),
+                ("cachingmode".to_string(), "ReadOnly".to_string()),
+                ("fstype".to_string(), "ext4".to_string()),
+            ]))
+        );
+        // "azure disk volume with non-managed kind"
+        let vol = inline(serde_json::json!({
+            "name": "v",
+            "azureDisk": {"diskName": "diskname", "diskURI": "datadiskuri", "kind": "Dedicated"}
+        }));
+        assert_eq!(
+            t.translate_in_tree_inline_volume_to_csi(&vol, "")
+                .unwrap_err(),
+            "kind(Dedicated) is not supported in csi migration"
+        );
+    }
+
+    /// `TestTranslateAzureDiskInTreePVToCSI`.
+    #[test]
+    fn azure_disk_pv_translates_matches_upstream_table() {
+        use crate::resources::pv_sources::AzureDiskVolumeSource;
+        let t = CsiTranslator::new();
+        // "no azure disk volume"
+        assert!(t.translate_in_tree_pv_to_csi(&blank_pv("x")).is_err());
+        // "azure disk volume"
+        let pv = azd_pv(AzureDiskVolumeSource {
+            caching_mode: Some("cachingmode".into()),
+            data_disk_uri: AZD_URI.into(),
+            fs_type: Some("fstype".into()),
+            read_only: Some(true),
+            ..Default::default()
+        });
+        let out = t.translate_in_tree_pv_to_csi(&pv).unwrap();
+        assert!(out.spec.more_sources.azure_disk.is_none());
+        let csi = out.spec.csi.as_ref().unwrap();
+        assert_eq!(csi.driver, "disk.csi.azure.com");
+        assert_eq!(csi.fs_type.as_deref(), Some("fstype"));
+        assert_eq!(csi.read_only, Some(true));
+        assert_eq!(csi.volume_handle.as_deref(), Some(AZD_URI));
+        assert_eq!(
+            csi.volume_attributes,
+            Some(HashMap::from([
+                ("cachingmode".to_string(), "cachingmode".to_string()),
+                ("fstype".to_string(), "fstype".to_string()),
+                ("kind".to_string(), "Managed".to_string()),
+            ]))
+        );
+        // The input is not modified.
+        assert!(pv.spec.more_sources.azure_disk.is_some());
+        // "azure disk volume with non-managed kind"
+        let pv = azd_pv(AzureDiskVolumeSource {
+            data_disk_uri: AZD_URI.into(),
+            kind: Some("Dedicated".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            t.translate_in_tree_pv_to_csi(&pv).unwrap_err(),
+            "kind(Dedicated) is not supported in csi migration"
+        );
+    }
+
+    /// `TestTranslateTranslateCSIPVToInTree`.
+    #[test]
+    fn azure_disk_csi_pv_translates_to_in_tree() {
+        let t = CsiTranslator::new();
+        let case = |attrs: &[(&str, &str)], mode: &str| {
+            let mut pv = blank_pv("pv1");
+            pv.spec.csi = Some(CSIVolumeSource {
+                driver: "disk.csi.azure.com".into(),
+                fs_type: Some("fstype".into()),
+                read_only: Some(true),
+                volume_handle: Some(AZD_URI.into()),
+                volume_attributes: Some(
+                    attrs
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                ),
+                ..Default::default()
+            });
+            let out = t.translate_csi_pv_to_in_tree(&pv).unwrap();
+            assert!(out.spec.csi.is_none());
+            let az = out.spec.more_sources.azure_disk.unwrap();
+            assert_eq!(az.caching_mode.as_deref(), Some(mode));
+            assert_eq!(az.data_disk_uri, AZD_URI);
+            assert_eq!(az.fs_type.as_deref(), Some("fstype"));
+            assert_eq!(az.read_only, Some(true));
+            assert_eq!(az.kind.as_deref(), Some("Managed"));
+            assert_eq!(az.disk_name, "name");
+        };
+        case(
+            &[
+                ("cachingmode", "ReadOnly"),
+                ("fstype", "fstype"),
+                ("kind", "managed"),
+            ],
+            "ReadOnly",
+        );
+        case(
+            &[
+                ("cachingmode", "ReadOnly"),
+                ("fsType", "fstype"),
+                ("kind", "managed"),
+            ],
+            "ReadOnly",
+        );
+        // Keys are matched case-insensitively.
+        case(
+            &[
+                ("cachingMode", "None"),
+                ("fsType", "fstype"),
+                ("kind", "managed"),
+            ],
+            "None",
+        );
+        case(
+            &[
+                ("cachingMode", "ReadWrite"),
+                ("fsType", "fstype"),
+                ("kind", "managed"),
+            ],
+            "ReadWrite",
+        );
+        // No attributes at all: FSType/ReadOnly come from the CSI source, and
+        // an unparseable handle is an error.
+        let mut pv = blank_pv("pv1");
+        pv.spec.csi = Some(CSIVolumeSource {
+            driver: "disk.csi.azure.com".into(),
+            volume_handle: Some("nonsense".into()),
+            ..Default::default()
+        });
+        assert!(t.translate_csi_pv_to_in_tree(&pv).is_err());
+    }
+
+    /// `TestTranslateInTreeStorageClassToCSI` (`azure_disk_test.go`).
+    #[test]
+    fn azure_disk_storage_class_translation_matches_upstream_table() {
+        let t = CsiTranslator::new();
+        let ok = |input: StorageClass, exp: StorageClass| {
+            let got = t
+                .translate_in_tree_storage_class_to_csi(AZD_NAME, &input)
+                .expect("translates");
+            assert!(sc_eq(&got, &exp), "got {got:?}, want {exp:?}");
+        };
+        ok(sc(&[("foo", "bar")], None), sc(&[("foo", "bar")], None));
+        ok(sc(&[], None), sc(&[], None));
+        ok(
+            sc(&[("zone", "foo")], None),
+            sc(&[], topo(AZD_KEY, &["foo"])),
+        );
+        ok(
+            sc(&[("zones", "foo,bar,baz")], None),
+            sc(&[], topo(AZD_KEY, &["foo", "bar", "baz"])),
+        );
+        ok(
+            sc(&[], topo(AZD_KEY, &["foo"])),
+            sc(&[], topo(AZD_KEY, &["foo"])),
+        );
+        ok(
+            sc(&[], topo(LABEL_TOPOLOGY_ZONE, &["foo"])),
+            sc(&[], topo(AZD_KEY, &["foo"])),
+        );
+        ok(
+            sc(&[], topo(LABEL_FAILURE_DOMAIN_BETA_ZONE, &["foo"])),
+            sc(&[], topo(AZD_KEY, &["foo"])),
+        );
+        // "zone and topology"
+        assert!(t
+            .translate_in_tree_storage_class_to_csi(
+                AZD_NAME,
+                &sc(&[("zone", "foo")], topo(AZD_KEY, &["foo"]))
+            )
+            .is_err());
+        // "topology in regions without zones": numeric failure domains become "".
+        ok(
+            sc(&[], topo(LABEL_TOPOLOGY_ZONE, &["0"])),
+            sc(&[], topo(AZD_KEY, &[""])),
+        );
+        ok(
+            sc(&[], topo(LABEL_TOPOLOGY_ZONE, &["1234"])),
+            sc(&[], topo(AZD_KEY, &[""])),
+        );
+        // "topology in regions with zones"
+        ok(
+            sc(&[], topo(LABEL_TOPOLOGY_ZONE, &["centralus-1"])),
+            sc(&[], topo(AZD_KEY, &["centralus-1"])),
+        );
+    }
+
+    #[test]
+    fn azure_disk_names_and_support() {
+        let t = CsiTranslator::new();
+        let pv = azd_pv(Default::default());
+        assert!(t.is_pv_migratable(&pv));
+        assert_eq!(t.get_in_tree_plugin_name_from_pv(&pv).unwrap(), AZD_NAME);
+        assert_eq!(
+            t.get_csi_name_from_in_tree_name(AZD_NAME).unwrap(),
+            "disk.csi.azure.com"
+        );
+        assert_eq!(
+            t.get_in_tree_name_from_csi_name("disk.csi.azure.com")
+                .unwrap(),
+            AZD_NAME
+        );
+        // `RepairVolumeHandle` is the identity.
+        assert_eq!(
+            t.repair_volume_handle("disk.csi.azure.com", "h", "n")
                 .unwrap(),
             "h"
         );
