@@ -1732,6 +1732,7 @@ fn remove_mount_dir(mount_path: &Path) -> Result<()> {
 
 mod block;
 mod expander;
+mod metrics;
 
 #[cfg(test)]
 mod tests;

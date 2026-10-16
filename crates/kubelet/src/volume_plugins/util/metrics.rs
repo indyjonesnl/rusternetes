@@ -17,6 +17,28 @@ pub const NO_PATH_DEFINED: &str = "no path defined for disk usage metrics.";
 /// `NewNotSupportedError` (`metrics_errors.go:34-40`).
 pub const NOT_SUPPORTED: &str = "metrics are not supported for MetricsNil Volumes";
 
+/// `MetricsError` with code `ErrCodeNotSupported` (`metrics_errors.go:25`).
+/// Kept as a typed error so `IsNotSupported` (`metrics_errors.go:86-88`) can
+/// be answered by [`is_not_supported`].
+#[derive(Debug, thiserror::Error)]
+#[error("{msg}")]
+pub struct NotSupportedError {
+    msg: String,
+}
+
+/// `NewNotSupportedErrorWithDriverName` (`metrics_errors.go:50-57`): the
+/// driver name is added to the message.
+pub fn new_not_supported_error_with_driver_name(name: &str) -> anyhow::Error {
+    anyhow::Error::new(NotSupportedError {
+        msg: format!("metrics are not supported for {name} volumes"),
+    })
+}
+
+/// `IsNotSupported` (`metrics_errors.go:86-88`).
+pub fn is_not_supported(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<NotSupportedError>().is_some()
+}
+
 /// `metricsBlock` (`metrics_block.go:33-36`): detects the size of a
 /// BlockMode volume from the device node it is attached to.
 pub struct MetricsBlock {

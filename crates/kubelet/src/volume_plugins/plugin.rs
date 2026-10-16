@@ -521,6 +521,13 @@ pub struct Metrics {
     pub inodes: Option<Quantity>,
     /// Free inodes in the volume.
     pub inodes_free: Option<Quantity>,
+    /// `Abnormal` (`volume.go:111`): false means the volume is operating
+    /// optimally. OPTIONAL; only CSI drivers with the `VOLUME_CONDITION`
+    /// node capability fill it.
+    pub abnormal: Option<bool>,
+    /// `Message` (`volume.go:116`): the condition of the volume. OPTIONAL,
+    /// filled together with `abnormal`.
+    pub message: Option<String>,
     /// Non-empty when the stats could not be collected.
     pub error: String,
 }
