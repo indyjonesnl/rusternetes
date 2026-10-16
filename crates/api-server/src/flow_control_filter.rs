@@ -830,6 +830,64 @@ pub fn spawn_borrowing_updater<S: Storage + 'static>(
     })
 }
 
+/// `priorityAndFairnessConfigConsumerHookName` (server/config.go:921).
+pub const APF_CONFIG_CONSUMER_HOOK: &str = "priority-and-fairness-config-consumer";
+/// `priorityAndFairnessFilterHookName` (server/config.go:938).
+pub const APF_FILTER_HOOK: &str = "priority-and-fairness-filter";
+/// `storageObjectCountTrackerHookName` (server/config.go:963).
+pub const STORAGE_OBJECT_COUNT_TRACKER_HOOK: &str = "storage-object-count-tracker-hook";
+
+/// The three hooks `GenericAPIServer.New` adds when API Priority and Fairness
+/// is on (server/config.go:921-970), as `AddPostStartHook` + the shared
+/// `runPostStartHook` runner: each only starts background work and returns
+/// nil, so each finishes at once and can never be fatal.
+///
+/// - `priority-and-fairness-config-consumer` (:921-934): `go c.FlowControl.Run(stop)`,
+///   i.e. the config worker (`apf_controller.go:371-391` `Run`: config worker
+///   + `updateBorrowing` every `borrowingAdjustmentPeriod`);
+/// - `priority-and-fairness-filter` (:937-947):
+///   `StartPriorityAndFairnessWatermarkMaintenance` (priority-and-fairness.go:360);
+/// - `storage-object-count-tracker-hook` (:961-970):
+///   `go c.StorageObjectCountTracker.RunUntil(stop)`.
+///
+/// Upstream also registers `max-in-flight-filter` (:949-958) when APF is off;
+/// this server has no max-in-flight filter (#3664).
+pub fn register_post_start_hooks<S: Storage + 'static>(
+    registry: &crate::post_start_hooks::PostStartHooks,
+    engine: Arc<FlowControlEngine<S>>,
+    tracker: Arc<ObjectCountTracker>,
+    stop: tokio::sync::watch::Receiver<bool>,
+) {
+    use crate::post_start_hooks::spawn_starting_hook_with;
+    spawn_starting_hook_with(registry, APF_CONFIG_CONSUMER_HOOK, move || {
+        spawn_config_reloader(engine.clone());
+        spawn_borrowing_updater(engine);
+    });
+    spawn_starting_hook_with(registry, APF_FILTER_HOOK, || {
+        apiserver_request_metrics::start_watermark_maintenance();
+    });
+    register_storage_object_count_tracker_hook(registry, tracker, stop);
+}
+
+/// `storage-object-count-tracker-hook` (server/config.go:961-970). Upstream
+/// registers it whenever `c.StorageObjectCountTracker != nil`, which
+/// `NewConfig` always sets (config.go:472), independent of APF vs
+/// max-in-flight -- so callers register it with APF off too
+/// (server/config_test.go lists it beside `max-in-flight-filter`).
+pub fn register_storage_object_count_tracker_hook(
+    registry: &crate::post_start_hooks::PostStartHooks,
+    tracker: Arc<ObjectCountTracker>,
+    stop: tokio::sync::watch::Receiver<bool>,
+) {
+    crate::post_start_hooks::spawn_starting_hook_with(
+        registry,
+        STORAGE_OBJECT_COUNT_TRACKER_HOOK,
+        move || {
+            tokio::spawn(async move { tracker.run_until(stop).await });
+        },
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1889,5 +1947,60 @@ mod tests {
             wait_for(move || e.concurrency_limit("evented").is_none()).await,
             "PL delete event must reach the engine"
         );
+    }
+
+    // The tracker hook does not depend on APF (config.go:961-970, NewConfig
+    // always sets the tracker at config.go:472).
+    #[tokio::test]
+    async fn tracker_hook_registers_standalone_without_apf() {
+        let registry = crate::post_start_hooks::PostStartHooks::new();
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        register_storage_object_count_tracker_hook(
+            &registry,
+            Arc::new(ObjectCountTracker::new()),
+            stop_rx,
+        );
+        let names: Vec<String> = registry.checks().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(
+            names,
+            vec!["poststarthook/storage-object-count-tracker-hook"]
+        );
+    }
+
+    // GenericAPIServer.New (server/config.go:921-970) registers exactly these
+    // three hooks when FlowControl and StorageObjectCountTracker are set; each
+    // is a `poststarthook/<name>` check that finishes (the hooks return nil
+    // after starting their goroutines).
+    #[tokio::test]
+    async fn apf_post_start_hooks_registered_and_finish() {
+        let registry = crate::post_start_hooks::PostStartHooks::new();
+        let engine = Arc::new(FlowControlEngine::with_limits(
+            Arc::new(MemoryStorage::new()),
+            400,
+            200,
+        ));
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        register_post_start_hooks(
+            &registry,
+            engine,
+            Arc::new(ObjectCountTracker::new()),
+            stop_rx,
+        );
+        let names: Vec<String> = registry.checks().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(
+            names,
+            vec![
+                "poststarthook/priority-and-fairness-config-consumer",
+                "poststarthook/priority-and-fairness-filter",
+                "poststarthook/storage-object-count-tracker-hook",
+            ]
+        );
+        for _ in 0..100 {
+            if registry.checks().iter().all(|(_, r)| r.is_ok()) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("hooks never finished: {:?}", registry.checks());
     }
 }
