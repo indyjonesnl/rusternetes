@@ -58,6 +58,12 @@ pub struct Profile {
     pub min_candidate_nodes_percentage: i32,
     /// `DefaultPreemptionArgs.MinCandidateNodesAbsolute`.
     pub min_candidate_nodes_absolute: i32,
+    /// `NodeResourcesFit` scorer built from `NodeResourcesFitArgs.ScoringStrategy`
+    /// (fit.go `nodeResourceStrategyTypeMap`).
+    pub fit_scorer: crate::score::ResourceAllocationScorer,
+    /// `NodeResourcesBalancedAllocation` scorer
+    /// (`NodeResourcesBalancedAllocationArgs.Resources`).
+    pub balanced_scorer: crate::score::ResourceAllocationScorer,
     /// The built framework for this profile (plugins per extension point +
     /// score weights). [`Map::new_map`] rebuilds it from `plugins`.
     pub framework: Framework,
@@ -80,6 +86,8 @@ impl Profile {
             // SetDefaults_DefaultPreemptionArgs (v1/defaults.go:177-184).
             min_candidate_nodes_percentage: 10,
             min_candidate_nodes_absolute: 100,
+            fit_scorer: crate::score::ResourceAllocationScorer::default_fit(),
+            balanced_scorer: crate::score::ResourceAllocationScorer::default_balanced(),
             framework: Framework::default(),
         };
         p.framework = p

@@ -19,6 +19,8 @@ mod profile;
 mod scheduler;
 #[allow(dead_code)] // library API surface (single-profile loaders); partly unused by the binary
 mod scheduler_config;
+#[allow(dead_code)] // library API surface; test-only helpers unused by the binary
+mod score;
 #[allow(dead_code)] // library API surface (informer delete/new); partly unused by the binary
 mod volume_assume;
 mod volume_bind;

@@ -12,7 +12,6 @@ use tracing::{debug, error, info, warn};
 use crate::advanced::{
     check_host_port_conflicts, check_node_affinity, check_pod_affinity, check_pod_anti_affinity,
     check_taints_tolerations, check_topology_spread_constraints, parse_resource_quantity,
-    NodeScore,
 };
 use crate::data_plane::{ApiBackend, DataPlane};
 use crate::diagnosis::{fit_error_message, Diagnosis};
@@ -986,7 +985,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         pod: &Pod,
         nodes: &[Node],
         all_pods: &[Pod],
-        priority_classes: &HashMap<String, PriorityClass>,
+        _priority_classes: &HashMap<String, PriorityClass>,
         diag: &mut Diagnosis,
     ) -> Option<(Node, Option<volume_binding::PodVolumes>)> {
         // Advanced scheduling algorithm:
@@ -1251,7 +1250,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                         pod_affinity_score,
                         pod_anti_affinity_penalty,
                         topology_penalty,
-                        resource_score,
                     })
                 }
                 .await;
@@ -1305,94 +1303,179 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             None
         };
 
-        // Score the feasible nodes.
-        let mut node_scores: Vec<NodeScore> = Vec::new();
-        for eval in feasible {
-            let node = eval.node;
-            let node_affinity_score = eval.node_affinity_score;
-            let pod_affinity_score = eval.pod_affinity_score;
-            let pod_anti_affinity_penalty = eval.pod_anti_affinity_penalty;
-            let topology_penalty = eval.topology_penalty;
-            let resource_score = eval.resource_score;
-
-            // Priority score (resolve from PriorityClass if needed)
-            let priority_score = self.get_pod_priority_sync(pod, priority_classes);
-
-            // Combined score:
-            // - resource (weight 25%)
-            // - node affinity (weight 20%)
-            // - pod affinity (weight 18%)
-            // - priority (weight 15%)
-            // - pod anti-affinity penalty (weight 12%)
-            // - topology spread penalty (weight 10%)
-            // VolumeBinding Score, plugin weight 1 (default_plugins.go:44: no
-            // `Weight` => 1) on the 0..=MaxNodeScore range.
-            let volume_score = volume_scorer.as_ref().map_or(0, |scorer| {
-                volume_binding::score(
-                    pod_volumes_by_node.get(&node.metadata.name),
-                    scorer,
-                    scoring_enabled,
-                )
-            });
-            // Each component belongs to the Score plugin that owns it upstream
-            // and is scaled by that plugin's configured weight relative to
-            // its default weight (identical to the unscaled blend under the
-            // default profile); a profile that does not run the plugin at
-            // Score contributes nothing for it.
-            let w = |plugin: &str, component: i64, pct: i64| {
-                weighted_component(fw, plugin, component, pct)
-            };
-            let total_score = volume_score * i64::from(fw.score_weight(names::VOLUME_BINDING))
-                + w(names::NODE_RESOURCES_FIT, resource_score as i64, 25)
-                + w(names::NODE_AFFINITY, node_affinity_score as i64, 20)
-                + w(names::INTER_POD_AFFINITY, pod_affinity_score as i64, 18)
-                + (priority_score as i64 * 15 / 100)
-                - w(
-                    names::INTER_POD_AFFINITY,
-                    pod_anti_affinity_penalty as i64,
-                    12,
-                )
-                - w(names::POD_TOPOLOGY_SPREAD, topology_penalty as i64, 10);
-
-            node_scores.push(NodeScore {
-                node_name: node.metadata.name.clone(),
-                score: total_score.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
-            });
-        }
-
-        if node_scores.is_empty() {
-            return None;
-        }
-
-        // Sort by score (descending). On tie, prefer the node with fewer
-        // pods already scheduled (LeastAllocated). This spreads pods across
-        // nodes when scores are equal (e.g. identical node configurations).
-        let pod_counts: std::collections::HashMap<String, usize> = {
-            let mut counts = std::collections::HashMap::new();
-            for p in all_pods {
-                if let Some(node) = p.spec.as_ref().and_then(|s| s.node_name.as_ref()) {
-                    *counts.entry(node.clone()).or_insert(0) += 1;
-                }
-            }
-            counts
-        };
-        node_scores.sort_by(|a, b| {
-            let score_cmp = b.score.cmp(&a.score);
-            if score_cmp == std::cmp::Ordering::Equal {
-                // Fewer pods = better (ascending)
-                let a_pods = pod_counts.get(&a.node_name).unwrap_or(&0);
-                let b_pods = pod_counts.get(&b.node_name).unwrap_or(&0);
-                a_pods.cmp(b_pods)
+        // `schedulePod` (schedule_one.go:443-451): "When only one node after
+        // predicate, just use it" - no Score plugin runs.
+        let chosen = if feasible.len() == 1 {
+            0
+        } else {
+            // `prioritizeNodes` (schedule_one.go:791-824) -> `RunScorePlugins`
+            // (framework.go:1273-1382), then `newSortedNodeScores(..).Pop()`
+            // (schedule_one.go:465-466).
+            let n = feasible.len();
+            let totals = if !fw.has_score_plugins() {
+                // prioritizeNodes :802-811: every node scores 1.
+                vec![1i64; n]
             } else {
-                score_cmp
-            }
-        });
-
-        let best_node_name = &node_scores[0].node_name;
-        debug!(
-            "Selected node {} with score {} for pod {}",
-            best_node_name, node_scores[0].score, pod.metadata.name
-        );
+                let usages = crate::score::node_usages(all_pods);
+                let usage_of = |name: &str| usages.get(name).cloned().unwrap_or_default();
+                let cluster_nodes: Vec<&Node> = nodes.iter().collect();
+                let mut ran: Vec<crate::score::PluginScores> = Vec::new();
+                for plugin in fw.plugins_at(ExtensionPoint::Score) {
+                    let weight = i64::from(fw.score_weight(plugin));
+                    // `None` is a PreScore `Skip` (the plugin is left out of
+                    // `RunScorePlugins`) or a plugin without a compiled-in
+                    // scorer.
+                    let (name, scores): (&'static str, Option<Vec<i64>>) = match plugin.as_str() {
+                        names::TAINT_TOLERATION => {
+                            let tols = crate::score::tolerations_prefer_no_schedule(pod);
+                            let mut v: Vec<i64> = feasible
+                                .iter()
+                                .map(|e| {
+                                    crate::score::count_intolerable_taints_prefer_no_schedule(
+                                        e.node, &tols,
+                                    )
+                                })
+                                .collect();
+                            // taint_toleration.go NormalizeScore: reverse.
+                            crate::score::default_normalize_score(
+                                crate::score::MAX_NODE_SCORE,
+                                true,
+                                &mut v,
+                            );
+                            (names::TAINT_TOLERATION, Some(v))
+                        }
+                        names::NODE_AFFINITY => {
+                            let mut v: Vec<i64> = feasible
+                                .iter()
+                                .map(|e| i64::from(e.node_affinity_score))
+                                .collect();
+                            crate::score::default_normalize_score(
+                                crate::score::MAX_NODE_SCORE,
+                                false,
+                                &mut v,
+                            );
+                            (names::NODE_AFFINITY, Some(v))
+                        }
+                        names::NODE_RESOURCES_FIT | names::NODE_RESOURCES_BALANCED_ALLOCATION => {
+                            let is_fit = plugin == names::NODE_RESOURCES_FIT;
+                            let scorer = if is_fit {
+                                &profile.fit_scorer
+                            } else {
+                                &profile.balanced_scorer
+                            };
+                            let reqs = scorer.pod_requests(pod);
+                            // balanced_allocation.go PreScore: best-effort pods
+                            // are skipped.
+                            let skip = !is_fit
+                                && crate::score::ResourceAllocationScorer::is_best_effort(&reqs);
+                            let mut v = Vec::with_capacity(n);
+                            if !skip {
+                                for e in &feasible {
+                                    match scorer.score(
+                                        e.node,
+                                        &usage_of(&e.node.metadata.name),
+                                        &reqs,
+                                    ) {
+                                        Ok(s) => v.push(s),
+                                        Err(m) => {
+                                            warn!(
+                                                "running Score plugins: plugin {:?} failed with: {}",
+                                                plugin, m
+                                            );
+                                            return None;
+                                        }
+                                    }
+                                }
+                            }
+                            let name = if is_fit {
+                                names::NODE_RESOURCES_FIT
+                            } else {
+                                names::NODE_RESOURCES_BALANCED_ALLOCATION
+                            };
+                            (name, (!skip).then_some(v))
+                        }
+                        names::IMAGE_LOCALITY => {
+                            let states = crate::score::image_states(&cluster_nodes);
+                            let v = feasible
+                                .iter()
+                                .map(|e| {
+                                    crate::score::image_locality_score(
+                                        e.node,
+                                        pod,
+                                        &states,
+                                        cluster_nodes.len(),
+                                    )
+                                })
+                                .collect();
+                            (names::IMAGE_LOCALITY, Some(v))
+                        }
+                        // Deviation (tracked in #3454): the raw per-node
+                        // affinity / spread numbers are still the compiled-in
+                        // `check_pod_affinity` /
+                        // `check_topology_spread_constraints` heuristics, but
+                        // they now go through the upstream NormalizeScore and
+                        // plugin weight like every other plugin.
+                        names::INTER_POD_AFFINITY => {
+                            let mut v: Vec<i64> = feasible
+                                .iter()
+                                .map(|e| {
+                                    i64::from(e.pod_affinity_score)
+                                        - i64::from(e.pod_anti_affinity_penalty)
+                                })
+                                .collect();
+                            crate::score::normalize_inter_pod_affinity(&mut v);
+                            (names::INTER_POD_AFFINITY, Some(v))
+                        }
+                        names::POD_TOPOLOGY_SPREAD => {
+                            let mut v: Vec<i64> = feasible
+                                .iter()
+                                .map(|e| i64::from(e.topology_penalty))
+                                .collect();
+                            crate::score::normalize_pod_topology_spread(&mut v);
+                            (names::POD_TOPOLOGY_SPREAD, Some(v))
+                        }
+                        names::VOLUME_BINDING => (
+                            names::VOLUME_BINDING,
+                            volume_scorer.as_ref().map(|scorer| {
+                                feasible
+                                    .iter()
+                                    .map(|e| {
+                                        volume_binding::score(
+                                            pod_volumes_by_node.get(&e.node.metadata.name),
+                                            scorer,
+                                            scoring_enabled,
+                                        )
+                                    })
+                                    .collect()
+                            }),
+                        ),
+                        _ => ("", None),
+                    };
+                    if let Some(scores) = scores {
+                        ran.push(crate::score::PluginScores {
+                            name,
+                            weight,
+                            scores,
+                        });
+                    }
+                }
+                match crate::score::total_scores(&ran, n) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!("applying score defaultWeights on Score plugins: {}", e);
+                        return None;
+                    }
+                }
+            };
+            let idx = crate::score::select_host(&totals)?;
+            debug!(
+                "Selected node {} with score {} for pod {}",
+                feasible[idx].node.metadata.name, totals[idx], pod.metadata.name
+            );
+            idx
+        };
+        let best_owned = feasible[chosen].node.metadata.name.clone();
+        let best_node_name = &best_owned;
 
         // `state.podVolumesByNode[nodeName]` (volume_binding.go:537) is carried
         // to Reserve/PreBind for the chosen node only.
@@ -2242,31 +2325,6 @@ struct NodeEval<'a> {
     pod_affinity_score: i32,
     pod_anti_affinity_penalty: i32,
     topology_penalty: i32,
-    resource_score: i32,
-}
-
-/// Default `Score` plugin weights (default_plugins.go:35-48) the compiled-in
-/// score blend is calibrated against.
-fn default_score_weight(plugin: &str) -> i64 {
-    match plugin {
-        names::NODE_AFFINITY | names::INTER_POD_AFFINITY | names::POD_TOPOLOGY_SPREAD => 2,
-        _ => 1,
-    }
-}
-
-/// One component of the compiled-in score blend, scaled by the profile's
-/// weight for the plugin that owns it: `component * pct / 100` at the default
-/// weight, 0 when the profile does not run `plugin` at Score.
-fn weighted_component(
-    fw: &crate::framework_runtime::Framework,
-    plugin: &str,
-    component: i64,
-    pct: i64,
-) -> i64 {
-    if !fw.has(ExtensionPoint::Score, plugin) {
-        return 0;
-    }
-    component * pct * i64::from(fw.score_weight(plugin)) / (100 * default_score_weight(plugin))
 }
 
 fn parse_pod_storage_key(pod_key: &str) -> (&str, &str) {
@@ -3227,43 +3285,6 @@ mod tests {
         assert_eq!(run("").await, Some(("n2".to_string(), 1)));
         let one_candidate = "profiles:\n- schedulerName: default-scheduler\n  pluginConfig:\n  - name: DefaultPreemption\n    args:\n      minCandidateNodesPercentage: 0\n      minCandidateNodesAbsolute: 1\n";
         assert_eq!(run(one_candidate).await, Some(("n1".to_string(), 2)));
-    }
-
-    /// The compiled-in score blend scales each component by the profile's
-    /// weight for its owning plugin (relative to the default weight), and a
-    /// plugin not run at Score contributes nothing (`getScoreWeights`).
-    #[test]
-    fn test_weighted_component_follows_profile_score_weights() {
-        use crate::framework_runtime::{Plugin, PluginSet};
-        let default_fw = crate::profile::Profile::named("d").framework;
-        // Default weights: identical to the unscaled `component * pct / 100`.
-        assert_eq!(
-            weighted_component(&default_fw, names::NODE_AFFINITY, 80, 20),
-            80 * 20 / 100
-        );
-        assert_eq!(
-            weighted_component(&default_fw, names::NODE_RESOURCES_FIT, 77, 25),
-            77 * 25 / 100
-        );
-        // NodeAffinity re-weighted 2 -> 4 doubles its component.
-        let mut p = crate::profile::Profile::named("w");
-        let mut plugins = p.plugins.take().unwrap();
-        plugins.score = PluginSet {
-            enabled: vec![Plugin::weighted(names::NODE_AFFINITY, 4)],
-            disabled: vec![Plugin::new(names::POD_TOPOLOGY_SPREAD)],
-        };
-        p.plugins = Some(plugins);
-        let m = crate::profile::Map::new_map(vec![p]).unwrap();
-        let fw = &m.get("w").unwrap().framework;
-        assert_eq!(
-            weighted_component(fw, names::NODE_AFFINITY, 80, 20),
-            2 * (80 * 20 / 100)
-        );
-        // Disabled at Score: no contribution.
-        assert_eq!(
-            weighted_component(fw, names::POD_TOPOLOGY_SPREAD, 50, 10),
-            0
-        );
     }
 
     #[tokio::test]

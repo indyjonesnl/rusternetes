@@ -15,13 +15,6 @@ pub use rusternetes_common::affinity::{
     check_node_affinity, check_pod_anti_affinity, match_selector, matches_pod_affinity_term,
 };
 
-/// Scoring result for a node
-#[derive(Debug, Clone)]
-pub struct NodeScore {
-    pub node_name: String,
-    pub score: i32,
-}
-
 /// Check if pod tolerates all node taints
 pub fn check_taints_tolerations(node: &Node, pod: &Pod) -> bool {
     let node_taints = match &node.spec {
@@ -73,7 +66,7 @@ fn taint_is_tolerated(taint: &Taint, tolerations: &[Toleration]) -> bool {
 }
 
 /// Check if a toleration matches a taint
-fn toleration_matches_taint(toleration: &Toleration, taint: &Taint) -> bool {
+pub(crate) fn toleration_matches_taint(toleration: &Toleration, taint: &Taint) -> bool {
     let operator = toleration.operator.as_deref().unwrap_or("Equal");
 
     // Check effect

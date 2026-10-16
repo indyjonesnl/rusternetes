@@ -891,6 +891,19 @@ fn resolve_profiles(
                     let a: NodeAffinityArgs = decode_args(pc, &args_path)?;
                     p.added_affinity = a.added_affinity;
                 }
+                "NodeResourcesFit" => {
+                    let mut a: NodeResourcesFitArgs = decode_args(pc, &args_path)?;
+                    a.set_defaults();
+                    if let Some(s) = crate::score::ResourceAllocationScorer::from_fit_args(&a) {
+                        p.fit_scorer = s;
+                    }
+                }
+                "NodeResourcesBalancedAllocation" => {
+                    let mut a: NodeResourcesBalancedAllocationArgs = decode_args(pc, &args_path)?;
+                    a.set_defaults();
+                    p.balanced_scorer =
+                        crate::score::ResourceAllocationScorer::balanced(a.resources);
+                }
                 "DefaultPreemption" => {
                     let mut a: DefaultPreemptionArgs = decode_args(pc, &args_path)?;
                     a.set_defaults();
