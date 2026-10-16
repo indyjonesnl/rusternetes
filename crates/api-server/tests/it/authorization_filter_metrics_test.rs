@@ -16,7 +16,7 @@ use rusternetes_storage::{MemoryStorage, StorageBackend};
 use std::sync::Arc;
 
 /// The metrics are process-global: serialize the tests that read them.
-static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(crate) static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct Fake(Result<Opinion>);
 
