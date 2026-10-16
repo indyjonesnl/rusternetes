@@ -24,11 +24,9 @@
 //! `TooLong` / `TooMany` for the max keywords, and `field.Invalid` carrying the
 //! go-openapi message for `minItems`, `minLength` and `pattern`.
 //!
-//! Deviation: the typed struct decodes an absent `from` / `to` / `group` /
-//! `kind` / `namespace` to its empty default, so an absent array is reported
-//! as the `minItems` failure rather than `Required`, and an absent `kind` or
-//! `namespace` as the `minLength` failure. An empty `group` is valid
-//! (the core group).
+//! Absent `from` / `to` / `group` / `kind` / `namespace` are `Required`
+//! (`required:` in the CRD), distinct from an empty array or string; an empty
+//! `group` is valid (the core group).
 
 use crate::resources::volume::{ReferenceGrant, ReferenceGrantFrom, ReferenceGrantSpec};
 use crate::validation::field::{Error, ErrorList, Path};
@@ -48,30 +46,50 @@ const MAX_ITEMS: usize = 16;
 
 /// Validate a `ReferenceGrant`'s spec against the CRD schema.
 pub fn validate_reference_grant(grant: &ReferenceGrant) -> ErrorList {
-    validate_spec(&grant.spec, &Path::new("spec"))
+    match &grant.spec {
+        Some(spec) => validate_spec(spec, &Path::new("spec")),
+        // `spec` is not in the top-level `required`.
+        None => Vec::new(),
+    }
+}
+
+/// go-openapi `required` -> `field.Required(errPath, "")`
+/// (apiextensions validation.go `kubeOpenAPIResultToFieldErrors`).
+fn required(p: &Path) -> Error {
+    Error::required(p, "")
 }
 
 fn validate_spec(spec: &ReferenceGrantSpec, fld: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
 
     let from = fld.child("from");
-    errs.extend(validate_item_count(spec.from.len(), &from));
-    for (i, f) in spec.from.iter().enumerate() {
-        errs.extend(validate_from(f, &from.index(i)));
+    match &spec.from {
+        None => errs.push(required(&from)),
+        Some(items) => {
+            errs.extend(validate_item_count(items.len(), &from));
+            for (i, f) in items.iter().enumerate() {
+                errs.extend(validate_from(f, &from.index(i)));
+            }
+        }
     }
 
     let to = fld.child("to");
-    errs.extend(validate_item_count(spec.to.len(), &to));
-    for (i, t) in spec.to.iter().enumerate() {
-        let p = to.index(i);
-        errs.extend(validate_group(&t.group, &p.child("group")));
-        errs.extend(validate_kind(&t.kind, &p.child("kind")));
-        if let Some(name) = t.name.as_deref() {
-            let np = p.child("name");
-            if name.is_empty() {
-                errs.push(too_short(&np, name, 1));
-            } else if name.len() > 253 {
-                errs.push(Error::too_long(&np, 253));
+    match &spec.to {
+        None => errs.push(required(&to)),
+        Some(items) => {
+            errs.extend(validate_item_count(items.len(), &to));
+            for (i, t) in items.iter().enumerate() {
+                let p = to.index(i);
+                errs.extend(validate_group(t.group.as_deref(), &p.child("group")));
+                errs.extend(validate_kind(t.kind.as_deref(), &p.child("kind")));
+                if let Some(name) = t.name.as_deref() {
+                    let np = p.child("name");
+                    if name.is_empty() {
+                        errs.push(too_short(&np, name, 1));
+                    } else if name.len() > 253 {
+                        errs.push(Error::too_long(&np, 253));
+                    }
+                }
             }
         }
     }
@@ -93,38 +111,35 @@ fn validate_item_count(len: usize, path: &Path) -> ErrorList {
 }
 
 fn validate_from(from: &ReferenceGrantFrom, p: &Path) -> ErrorList {
-    let mut errs = validate_group(&from.group, &p.child("group"));
-    errs.extend(validate_kind(&from.kind, &p.child("kind")));
+    let mut errs = validate_group(from.group.as_deref(), &p.child("group"));
+    errs.extend(validate_kind(from.kind.as_deref(), &p.child("kind")));
     let np = p.child("namespace");
-    if from.namespace.is_empty() {
-        errs.push(too_short(&np, &from.namespace, 1));
-    } else if from.namespace.len() > 63 {
-        errs.push(Error::too_long(&np, 63));
-    } else if !NAMESPACE_RE.is_match(&from.namespace) {
-        errs.push(pattern(&np, &from.namespace, NAMESPACE_PATTERN));
+    match from.namespace.as_deref() {
+        None => errs.push(required(&np)),
+        Some("") => errs.push(too_short(&np, "", 1)),
+        Some(ns) if ns.len() > 63 => errs.push(Error::too_long(&np, 63)),
+        Some(ns) if !NAMESPACE_RE.is_match(ns) => errs.push(pattern(&np, ns, NAMESPACE_PATTERN)),
+        Some(_) => {}
     }
     errs
 }
 
-fn validate_group(group: &str, p: &Path) -> ErrorList {
-    if group.len() > 253 {
-        vec![Error::too_long(p, 253)]
-    } else if !GROUP_RE.is_match(group) {
-        vec![pattern(p, group, GROUP_PATTERN)]
-    } else {
-        Vec::new()
+fn validate_group(group: Option<&str>, p: &Path) -> ErrorList {
+    match group {
+        None => vec![required(p)],
+        Some(g) if g.len() > 253 => vec![Error::too_long(p, 253)],
+        Some(g) if !GROUP_RE.is_match(g) => vec![pattern(p, g, GROUP_PATTERN)],
+        Some(_) => Vec::new(),
     }
 }
 
-fn validate_kind(kind: &str, p: &Path) -> ErrorList {
-    if kind.is_empty() {
-        vec![too_short(p, kind, 1)]
-    } else if kind.len() > 63 {
-        vec![Error::too_long(p, 63)]
-    } else if !KIND_RE.is_match(kind) {
-        vec![pattern(p, kind, KIND_PATTERN)]
-    } else {
-        Vec::new()
+fn validate_kind(kind: Option<&str>, p: &Path) -> ErrorList {
+    match kind {
+        None => vec![required(p)],
+        Some("") => vec![too_short(p, "", 1)],
+        Some(k) if k.len() > 63 => vec![Error::too_long(p, 63)],
+        Some(k) if !KIND_RE.is_match(k) => vec![pattern(p, k, KIND_PATTERN)],
+        Some(_) => Vec::new(),
     }
 }
 
@@ -149,18 +164,18 @@ mod tests {
 
     fn valid() -> ReferenceGrant {
         ReferenceGrant {
-            spec: ReferenceGrantSpec {
-                from: vec![ReferenceGrantFrom {
-                    group: String::new(),
-                    kind: "PersistentVolumeClaim".into(),
-                    namespace: "other".into(),
-                }],
-                to: vec![ReferenceGrantTo {
-                    group: "snapshot.storage.k8s.io".into(),
-                    kind: "VolumeSnapshot".into(),
+            spec: Some(ReferenceGrantSpec {
+                from: Some(vec![ReferenceGrantFrom {
+                    group: Some(String::new()),
+                    kind: Some("PersistentVolumeClaim".into()),
+                    namespace: Some("other".into()),
+                }]),
+                to: Some(vec![ReferenceGrantTo {
+                    group: Some("snapshot.storage.k8s.io".into()),
+                    kind: Some("VolumeSnapshot".into()),
                     name: None,
-                }],
-            },
+                }]),
+            }),
             ..Default::default()
         }
     }
@@ -173,14 +188,14 @@ mod tests {
     #[test]
     fn an_empty_core_group_is_valid_but_uppercase_is_not() {
         let mut g = valid();
-        g.spec.to[0].group = "Upper.example".into();
+        g.spec.as_mut().unwrap().to.as_mut().unwrap()[0].group = Some("Upper.example".into());
         assert_eq!(validate_reference_grant(&g).len(), 1);
     }
 
     #[test]
     fn name_must_not_be_empty_when_set() {
         let mut g = valid();
-        g.spec.to[0].name = Some(String::new());
+        g.spec.as_mut().unwrap().to.as_mut().unwrap()[0].name = Some(String::new());
         assert_eq!(validate_reference_grant(&g).len(), 1);
     }
 
@@ -189,12 +204,73 @@ mod tests {
     #[test]
     fn too_many_from_items_reports_actual_count() {
         let mut g = valid();
-        let item = g.spec.from[0].clone();
-        g.spec.from = vec![item; 17];
+        let spec = g.spec.as_mut().unwrap();
+        let item = spec.from.as_ref().unwrap()[0].clone();
+        spec.from = Some(vec![item; 17]);
         let errs = validate_reference_grant(&g);
         assert_eq!(
             errs.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
             vec!["spec.from: Too many: 17: must have at most 16 items"]
         );
+    }
+
+    fn errs_of(spec: serde_json::Value) -> Vec<String> {
+        let g: ReferenceGrant = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "g"},
+            "spec": spec,
+        }))
+        .unwrap();
+        validate_reference_grant(&g)
+            .iter()
+            .map(|e| e.to_string())
+            .collect()
+    }
+
+    /// go-openapi `required` -> `field.Required(path, "")`
+    /// (validation.go:177-178): an absent `from` / `to` is `Required`, not the
+    /// `minItems` failure an empty array gets.
+    #[test]
+    fn absent_from_and_to_are_required() {
+        assert_eq!(
+            errs_of(serde_json::json!({})),
+            vec!["spec.from: Required value", "spec.to: Required value"]
+        );
+        let empty = errs_of(serde_json::json!({"from": [], "to": []}));
+        assert_eq!(empty.len(), 2);
+        assert!(
+            empty[0].contains("should have at least 1 items"),
+            "{empty:?}"
+        );
+    }
+
+    /// `required: [group, kind, namespace]` on `from[]`, `[group, kind]` on
+    /// `to[]`: an absent key is `Required`; an empty `group` is present.
+    #[test]
+    fn absent_item_fields_are_required() {
+        assert_eq!(
+            errs_of(serde_json::json!({"from": [{}], "to": [{}]})),
+            vec![
+                "spec.from[0].group: Required value",
+                "spec.from[0].kind: Required value",
+                "spec.from[0].namespace: Required value",
+                "spec.to[0].group: Required value",
+                "spec.to[0].kind: Required value",
+            ]
+        );
+        assert!(errs_of(serde_json::json!({
+            "from": [{"group": "", "kind": "PersistentVolumeClaim", "namespace": "n"}],
+            "to": [{"group": "", "kind": "Secret"}],
+        }))
+        .is_empty());
+    }
+
+    /// `spec` itself is not in the CRD's top-level `required`, so an object
+    /// without one is valid.
+    #[test]
+    fn absent_spec_is_valid() {
+        let g: ReferenceGrant =
+            serde_json::from_value(serde_json::json!({"metadata": {"name": "g"}})).unwrap();
+        assert!(validate_reference_grant(&g).is_empty());
+        assert!(serde_json::to_value(&g).unwrap().get("spec").is_none());
     }
 }

@@ -2217,18 +2217,18 @@ fn xns_claim() -> PersistentVolumeClaim {
 async fn put_grant(storage: &MemoryStorage, from_ns: &str, to_name: Option<&str>) {
     let g = ReferenceGrant {
         metadata: ObjectMeta::new("grant").with_namespace("ns1"),
-        spec: ReferenceGrantSpec {
-            from: vec![ReferenceGrantFrom {
-                group: String::new(),
-                kind: "PersistentVolumeClaim".into(),
-                namespace: from_ns.into(),
-            }],
-            to: vec![ReferenceGrantTo {
-                group: String::new(),
-                kind: "PersistentVolumeClaim".into(),
+        spec: Some(ReferenceGrantSpec {
+            from: Some(vec![ReferenceGrantFrom {
+                group: Some(String::new()),
+                kind: Some("PersistentVolumeClaim".into()),
+                namespace: Some(from_ns.into()),
+            }]),
+            to: Some(vec![ReferenceGrantTo {
+                group: Some(String::new()),
+                kind: Some("PersistentVolumeClaim".into()),
                 name: to_name.map(String::from),
-            }],
-        },
+            }]),
+        }),
         ..Default::default()
     };
     storage
