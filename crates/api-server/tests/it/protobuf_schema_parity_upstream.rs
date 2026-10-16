@@ -467,6 +467,13 @@ pub(crate) fn compare_types(ours: &FieldType, theirs: &LogicalType) -> Option<St
                 other
             )),
         },
+        (FieldType::StringListMap, LogicalType::Map(value)) => match value.as_ref() {
+            LogicalType::Message(name) if name == "ExtraValue" => None,
+            other => Some(format!(
+                "expected map<string,ExtraValue>, upstream value={:?}",
+                other
+            )),
+        },
         (FieldType::MessageMap(expected), LogicalType::Map(value)) => match value.as_ref() {
             LogicalType::Message(name) if name == expected => None,
             other => Some(format!(
@@ -491,6 +498,7 @@ pub(crate) fn compare_types(ours: &FieldType, theirs: &LogicalType) -> Option<St
             FieldType::StringMap
             | FieldType::BytesMap
             | FieldType::MessageMap(_)
+            | FieldType::StringListMap
             | FieldType::QuantityMap,
             _,
         ) => Some(format!(
