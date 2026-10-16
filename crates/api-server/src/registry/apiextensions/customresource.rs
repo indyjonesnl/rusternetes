@@ -33,8 +33,15 @@
 //! the endpoint handlers run wherever they decode a body (the request body,
 //! a patched object, a webhook's patched object), and the strict-field
 //! verdict as `RestStorage::decode_strict`, judged on the body before the
-//! pruning. The strategies no longer prune. Not ported: the
-//! `StrictDecodingError` for Warn mode (`unknownFieldPaths` from the pruner).
+//! pruning. The strategies no longer prune.
+//!
+//! Warn mode's `StrictDecodingError` (`unknownFieldPaths`,
+//! customresource_handler.go:1338-1342) is produced by
+//! `Strategy::unknown_fields`, surfaced as `RestStorage::decode_unknown_fields`:
+//! the pruner's paths (`unstructuredSchemaCoercer.apply`, :1427-1435) plus the
+//! embedded-`metadata` paths (:1442-1449). Still deferred: the unknown fields
+//! of the root `metadata` (:1415-1421), the webhook converter (#3305), the
+//! objectmeta coercion (#3304) and PATCH warnings (#3306).
 
 use std::sync::Arc;
 
