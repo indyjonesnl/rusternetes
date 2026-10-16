@@ -685,7 +685,7 @@ async fn smp_no_replace_directive_merges_normally() {
 // ---------------------------------------------------------------------------
 
 /// SMP-4a: `$patch: delete` on `metadata.annotations` (a map) clears the
-/// annotations map (rusternetes implements this as `null`).
+/// annotations map to `{}` (`handleDirectiveInMergeMap`).
 #[tokio::test]
 async fn smp_delete_directive_on_annotations_map() {
     let (mem, router) = spawn_router();
@@ -708,8 +708,8 @@ async fn smp_delete_directive_on_annotations_map() {
     let stored = read_stored(&mem, "smp-4a").await;
     let anns = &stored["metadata"]["annotations"];
     assert!(
-        anns.is_null() || anns.as_object().is_some_and(|m| m.is_empty()),
-        "annotations must be cleared (null or empty); got {:?}",
+        anns == &json!({}),
+        "annotations must be an empty map (patch.go:916-920); got {:?}",
         anns
     );
 }
@@ -790,8 +790,8 @@ async fn smp_delete_directive_on_absent_map_is_noop() {
 }
 
 /// SMP-4e: deleting a map and re-adding it in a separate field of the
-/// same patch — order-of-ops semantics. Today rusternetes' `delete`
-/// strategy short-circuits the merge, so a co-mingled add is dropped.
+/// same patch. Upstream's `handleDirectiveInMergeMap` returns `{}` and
+/// drops sibling keys, so the co-mingled add is ignored.
 #[tokio::test]
 async fn smp_delete_then_re_add_in_same_patch() {
     let (mem, router) = spawn_router();
@@ -816,8 +816,9 @@ async fn smp_delete_then_re_add_in_same_patch() {
 
     let stored = read_stored(&mem, "smp-4e").await;
     let anns = stored["metadata"]["annotations"].as_object().unwrap();
-    assert!(anns.get("old").is_none(), "old must be deleted");
-    assert_eq!(anns.get("new").and_then(|v| v.as_str()), Some("2"));
+    // Upstream `handleDirectiveInMergeMap` (strategicpatch/patch.go:916-920)
+    // returns an empty map and ignores sibling keys.
+    assert!(anns.is_empty(), "delete ignores siblings; got {anns:?}");
 }
 
 // ---------------------------------------------------------------------------
