@@ -838,12 +838,19 @@ async fn main() -> Result<()> {
         // and without ReleaseOnCancel (see the shutdown note below).
         let elector = Arc::new(rusternetes_common::leaderelection::LeaderElector::new(
             rusternetes_common::leaderelection::ElectionConfig {
-                lock: Arc::new(rusternetes_storage::lease_lock::LeaseLock::new(
-                    storage.clone(),
-                    args.leader_election_resource_namespace.clone(),
-                    args.leader_election_resource_name.clone(),
-                    identity.clone(),
-                )),
+                lock: Arc::new(
+                    rusternetes_storage::lease_lock::LeaseLock::new(
+                        storage.clone(),
+                        args.leader_election_resource_namespace.clone(),
+                        args.leader_election_resource_name.clone(),
+                        identity.clone(),
+                    )
+                    // LockConfig.EventRecorder (options.go makeLeaderElectionConfig).
+                    .with_event_recorder(
+                        rusternetes_storage::EventRecorder::new(storage.clone()),
+                        "kube-controller-manager",
+                    ),
+                ),
                 lease_duration: std::time::Duration::from_secs(args.leader_election_lease_duration),
                 renew_deadline: std::time::Duration::from_secs(args.leader_election_renew_deadline),
                 retry_period: std::time::Duration::from_secs(args.leader_election_retry_period),
