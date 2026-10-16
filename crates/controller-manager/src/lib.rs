@@ -169,6 +169,11 @@ pub struct ControllerManagerConfig {
     /// `isDisabledByDefault: true` (`cmd/kube-controller-manager/app/bootstrap.go:59`),
     /// so it is opt-in (`--token-cleaner-controller`).
     pub token_cleaner_controller: bool,
+    /// `--service-cluster-ip-range` of the api-server this controller-manager
+    /// serves: the range the Service controller allocates ClusterIPs from and
+    /// whose first address it reserves for `default/kubernetes`
+    /// (#2446 item 3). Empty is the default range.
+    pub service_cluster_ip_range: String,
 }
 
 /// Run the controller-manager against a storage backend directly (all-in-one
@@ -660,8 +665,15 @@ where
     }));
 
     let s = storage_for("Service");
+    let service_range = config.service_cluster_ip_range.clone();
     handles.push(tokio::spawn(async move {
-        let c = Arc::new(ServiceController::new(s));
+        let c = match ServiceController::new(s).with_service_cluster_ip_range(&service_range) {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                error!("Service controller: invalid --service-cluster-ip-range: {e}");
+                return;
+            }
+        };
         if let Err(e) = c.run().await {
             error!("Service controller error: {}", e);
         }
@@ -834,6 +846,7 @@ mod per_controller_client_tests {
                 terminated_pod_gc_threshold:
                     controllers::podgc::DEFAULT_TERMINATED_POD_GC_THRESHOLD,
                 token_cleaner_controller: false,
+                service_cluster_ip_range: String::new(),
             },
         );
         for h in &handles {
@@ -891,6 +904,7 @@ mod csi_attach_wiring_tests {
                 terminated_pod_gc_threshold:
                     controllers::podgc::DEFAULT_TERMINATED_POD_GC_THRESHOLD,
                 token_cleaner_controller: false,
+                service_cluster_ip_range: String::new(),
             },
         );
         for h in &handles {
