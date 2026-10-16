@@ -128,11 +128,19 @@ struct Args {
 
     /// Namespace of the leader-election Lease
     /// (`--leader-elect-resource-namespace`, kube-system by default).
-    #[arg(long, default_value = "kube-system")]
+    #[arg(
+        long,
+        alias = "leader-elect-resource-namespace",
+        default_value = "kube-system"
+    )]
     leader_election_resource_namespace: String,
 
     /// Name of the leader-election Lease (`--leader-elect-resource-name`).
-    #[arg(long, default_value = "kube-scheduler")]
+    #[arg(
+        long,
+        alias = "leader-elect-resource-name",
+        default_value = "kube-scheduler"
+    )]
     leader_election_resource_name: String,
 
     /// Leader election lease duration in seconds
@@ -149,6 +157,89 @@ struct Args {
     /// (`RetryPeriod`, 2s: defaults.go:43-45)
     #[arg(long, default_value = "2")]
     leader_election_retry_period: u64,
+
+    /// Upstream `--leader-elect` (leaderelectionconfig.go:26-30), a pflag
+    /// bool: bare or `=true` enables; overrides `--enable-leader-election`.
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    leader_elect: Option<bool>,
+
+    /// Upstream `--leader-elect-lease-duration` (Go duration, e.g. `15s`).
+    #[arg(long)]
+    leader_elect_lease_duration: Option<String>,
+
+    /// Upstream `--leader-elect-renew-deadline` (Go duration, e.g. `10s`).
+    #[arg(long)]
+    leader_elect_renew_deadline: Option<String>,
+
+    /// Upstream `--leader-elect-retry-period` (Go duration, e.g. `2s`).
+    #[arg(long)]
+    leader_elect_retry_period: Option<String>,
+
+    /// Upstream `--leader-elect-resource-lock`; only `leases` is supported
+    /// (leaderelectionconfig.go:48-50).
+    #[arg(long)]
+    leader_elect_resource_lock: Option<String>,
+
+    /// Upstream `--profiling` (DebuggingOptions). Accepted for argv
+    /// compatibility; the scheduler exposes no pprof handlers, so it is ignored.
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    profiling: Option<bool>,
+
+    /// Upstream `--contention-profiling`. Accepted and ignored, as above.
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    contention_profiling: Option<bool>,
+}
+
+/// Effective leader-election settings after resolving the upstream flag
+/// names (`--leader-elect*`) over the native `--leader-election-*` ones.
+#[derive(Debug, PartialEq)]
+struct LeaderElectionSettings {
+    enabled: bool,
+    lease_duration: std::time::Duration,
+    renew_deadline: std::time::Duration,
+    retry_period: std::time::Duration,
+}
+
+impl Args {
+    /// Upstream flag names win over the native ones when given.
+    fn leader_election_settings(&self) -> Result<LeaderElectionSettings, String> {
+        let dur =
+            |flag: &str, v: &Option<String>, native: u64| -> Result<std::time::Duration, String> {
+                match v {
+                    None => Ok(std::time::Duration::from_secs(native)),
+                    Some(s) => {
+                        let ns = rusternetes_common::go_duration::parse_go_duration(s)
+                            .map_err(|e| format!("invalid value {s:?} for --{flag}: {e}"))?;
+                        Ok(std::time::Duration::from_nanos(ns.max(0) as u64))
+                    }
+                }
+            };
+        if let Some(lock) = &self.leader_elect_resource_lock {
+            if lock != "leases" {
+                return Err(format!(
+                    "invalid --leader-elect-resource-lock {lock:?}: only \"leases\" is supported"
+                ));
+            }
+        }
+        Ok(LeaderElectionSettings {
+            enabled: self.leader_elect.unwrap_or(self.enable_leader_election),
+            lease_duration: dur(
+                "leader-elect-lease-duration",
+                &self.leader_elect_lease_duration,
+                self.leader_election_lease_duration,
+            )?,
+            renew_deadline: dur(
+                "leader-elect-renew-deadline",
+                &self.leader_elect_renew_deadline,
+                self.leader_election_renew_deadline,
+            )?,
+            retry_period: dur(
+                "leader-elect-retry-period",
+                &self.leader_elect_retry_period,
+                self.leader_election_retry_period,
+            )?,
+        })
+    }
 }
 
 /// `statusz.Install` behind the `ComponentStatusz` gate
@@ -195,6 +286,13 @@ async fn main() -> Result<()> {
         rusternetes_common::compatibility::DEFAULT_KUBE_COMPONENT,
         &effective_version,
     );
+
+    if args.profiling == Some(true) || args.contention_profiling == Some(true) {
+        warn!("--profiling/--contention-profiling are accepted and ignored: no pprof handlers are served");
+    }
+    let le = args
+        .leader_election_settings()
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     let profiles = match &args.config {
         Some(path) => {
@@ -260,7 +358,7 @@ async fn main() -> Result<()> {
     let ctx = rusternetes_common::signal::setup_signal_context();
 
     // Leader election
-    if args.enable_leader_election {
+    if le.enabled {
         let identity = args
             .leader_election_identity
             .unwrap_or_else(|| format!("scheduler-{}", Uuid::new_v4()));
@@ -288,9 +386,9 @@ async fn main() -> Result<()> {
                         "default-scheduler",
                     ),
                 ),
-                lease_duration: std::time::Duration::from_secs(args.leader_election_lease_duration),
-                renew_deadline: std::time::Duration::from_secs(args.leader_election_renew_deadline),
-                retry_period: std::time::Duration::from_secs(args.leader_election_retry_period),
+                lease_duration: le.lease_duration,
+                renew_deadline: le.renew_deadline,
+                retry_period: le.retry_period,
                 // ReleaseOnCancel: true (cmd/kube-scheduler/app/options/options.go:375).
                 release_on_cancel: true,
                 name: args.leader_election_resource_name.clone(),
@@ -455,4 +553,79 @@ async fn run_api_mode(
         _ = ctx.cancelled() => info!("Requested to terminate, exiting"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn parse(argv: &[&str]) -> Result<Args, clap::Error> {
+        let mut v = vec!["kube-scheduler"];
+        v.extend_from_slice(argv);
+        Args::try_parse_from(v)
+    }
+
+    // component-base/config/options/leaderelectionconfig.go:26-57 flag names.
+    #[test]
+    fn upstream_leader_elect_flags_are_accepted() {
+        let a = parse(&[
+            "--leader-elect=true",
+            "--leader-elect-lease-duration=30s",
+            "--leader-elect-renew-deadline=20s",
+            "--leader-elect-retry-period=5s",
+            "--leader-elect-resource-lock=leases",
+            "--leader-elect-resource-name=my-sched",
+            "--leader-elect-resource-namespace=my-ns",
+        ])
+        .expect("upstream flags must parse");
+        let s = a.leader_election_settings().unwrap();
+        assert_eq!(
+            s,
+            LeaderElectionSettings {
+                enabled: true,
+                lease_duration: Duration::from_secs(30),
+                renew_deadline: Duration::from_secs(20),
+                retry_period: Duration::from_secs(5),
+            }
+        );
+        assert_eq!(a.leader_election_resource_name, "my-sched");
+        assert_eq!(a.leader_election_resource_namespace, "my-ns");
+    }
+
+    // pflag BoolVar: bare `--leader-elect` means true; `=false` means false.
+    #[test]
+    fn leader_elect_bare_and_false() {
+        let a = parse(&["--leader-elect"]).unwrap();
+        assert!(a.leader_election_settings().unwrap().enabled);
+        let a = parse(&["--leader-elect=false"]).unwrap();
+        assert!(!a.leader_election_settings().unwrap().enabled);
+    }
+
+    #[test]
+    fn native_flags_still_work_and_defaults_unchanged() {
+        let a = parse(&["--enable-leader-election"]).unwrap();
+        let s = a.leader_election_settings().unwrap();
+        assert!(s.enabled);
+        assert_eq!(s.lease_duration, Duration::from_secs(15));
+        assert_eq!(s.renew_deadline, Duration::from_secs(10));
+        assert_eq!(s.retry_period, Duration::from_secs(2));
+    }
+
+    // Go time.ParseDuration errors surface; only "leases" is a supported lock.
+    #[test]
+    fn invalid_duration_and_lock_rejected() {
+        let a = parse(&["--leader-elect-lease-duration=abc"]).unwrap();
+        assert!(a.leader_election_settings().is_err());
+        let a = parse(&["--leader-elect-resource-lock=configmaps"]).unwrap();
+        assert!(a.leader_election_settings().is_err());
+    }
+
+    // cmd/kube-scheduler/app/options: DebuggingOptions flags.
+    #[test]
+    fn profiling_flags_are_accepted() {
+        parse(&["--profiling=false", "--contention-profiling=true"])
+            .expect("--profiling/--contention-profiling must parse");
+        parse(&["--profiling"]).expect("bare --profiling is a pflag bool");
+    }
 }
