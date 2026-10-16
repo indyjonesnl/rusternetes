@@ -218,6 +218,11 @@ impl Map {
         self.profiles.is_empty()
     }
 
+    /// The profiles themselves (`for _, fwk := range sched.Profiles`).
+    pub fn profiles(&self) -> impl Iterator<Item = &Profile> {
+        self.profiles.values()
+    }
+
     /// Scheduler names, sorted (Go map iteration is unordered; sorted for logs).
     pub fn names(&self) -> Vec<&str> {
         let mut v: Vec<&str> = self.profiles.keys().map(String::as_str).collect();
