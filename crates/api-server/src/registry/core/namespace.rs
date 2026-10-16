@@ -22,6 +22,7 @@ use crate::registry::rest::{
     GroupResource, NamespaceScopedStrategy, RequestContext, RestCreateStrategy, RestDeleteStrategy,
     RestStorage, RestUpdateStrategy, UpdatedObjectInfo, ValidateObject, ValidateObjectUpdate,
 };
+use crate::ssa::ResetFields;
 
 /// `core.FinalizerKubernetes`.
 pub const FINALIZER_KUBERNETES: &str = "kubernetes";
@@ -139,6 +140,11 @@ impl RestUpdateStrategy<Namespace> for Strategy {
     fn allow_unconditional_update(&self) -> bool {
         true
     }
+
+    /// `GetResetFields` (core/namespace/strategy.go:54-60): `status`.
+    fn get_reset_fields(&self) -> ResetFields {
+        ResetFields::new().with("v1", &[&["status"]])
+    }
 }
 
 /// Namespaces use the default delete strategy.
@@ -181,6 +187,11 @@ impl RestUpdateStrategy<Namespace> for StatusStrategy {
     fn allow_unconditional_update(&self) -> bool {
         true
     }
+
+    /// `GetResetFields` (core/namespace/strategy.go:160-166): `spec`.
+    fn get_reset_fields(&self) -> ResetFields {
+        ResetFields::new().with("v1", &[&["spec"]])
+    }
 }
 
 /// `namespaceFinalizeStrategy` (strategy.go:183-214): the update strategy of
@@ -219,6 +230,11 @@ impl RestUpdateStrategy<Namespace> for FinalizeStrategy {
 
     fn allow_unconditional_update(&self) -> bool {
         true
+    }
+
+    /// `GetResetFields` (core/namespace/strategy.go:200-206): `status`.
+    fn get_reset_fields(&self) -> ResetFields {
+        ResetFields::new().with("v1", &[&["status"]])
     }
 }
 
@@ -308,6 +324,12 @@ impl RestStorage<Namespace> for NamespaceRest {
 
     fn namespace_scoped(&self) -> bool {
         RestStorage::namespace_scoped(&self.store)
+    }
+
+    /// The REST embeds `*genericregistry.Store`, so `GetResetFields` is promoted
+    /// from it (store.go:1698-1703).
+    fn get_reset_fields(&self) -> crate::ssa::ResetFields {
+        RestStorage::get_reset_fields(&self.store)
     }
 
     async fn get(

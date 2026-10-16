@@ -29,6 +29,7 @@ use crate::registry::rest::{
     RequestContext, RestCreateStrategy, RestDeleteStrategy, RestStorage, RestUpdateStrategy,
     UpdatedObjectInfo, ValidateObject, ValidateObjectUpdate,
 };
+use crate::ssa::ResetFields;
 
 // `pkg/apis/batch/types.go` label keys.
 const LEGACY_JOB_NAME_LABEL: &str = "job-name";
@@ -205,6 +206,11 @@ impl RestUpdateStrategy<Job> for Strategy {
     fn allow_unconditional_update(&self) -> bool {
         true
     }
+
+    /// `GetResetFields` (batch/job/strategy.go:83-91): `status`.
+    fn get_reset_fields(&self) -> ResetFields {
+        ResetFields::new().with("batch/v1", &[&["status"]])
+    }
 }
 
 /// `DefaultGarbageCollectionPolicy` (strategy.go:62-74): `OrphanDependents`
@@ -248,6 +254,11 @@ impl RestUpdateStrategy<Job> for StatusStrategy {
     fn allow_unconditional_update(&self) -> bool {
         true
     }
+
+    /// `GetResetFields` (batch/job/strategy.go:326-332): `spec`.
+    fn get_reset_fields(&self) -> ResetFields {
+        ResetFields::new().with("batch/v1", &[&["spec"]])
+    }
 }
 
 /// `deleteOptionWarnings` (storage/storage.go:56-57).
@@ -280,6 +291,12 @@ impl RestStorage<Job> for JobRest {
 
     fn namespace_scoped(&self) -> bool {
         RestStorage::namespace_scoped(&self.store)
+    }
+
+    /// The REST embeds `*genericregistry.Store`, so `GetResetFields` is promoted
+    /// from it (store.go:1698-1703).
+    fn get_reset_fields(&self) -> crate::ssa::ResetFields {
+        RestStorage::get_reset_fields(&self.store)
     }
 
     async fn get(

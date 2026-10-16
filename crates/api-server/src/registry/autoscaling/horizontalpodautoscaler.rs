@@ -31,6 +31,7 @@ use crate::registry::rest::{
     reset_object_meta_for_status, GroupResource, NamespaceScopedStrategy, RequestContext,
     RestCreateStrategy, RestDeleteStrategy, RestUpdateStrategy,
 };
+use crate::ssa::ResetFields;
 
 /// `autoscaling.DefaultCPUUtilization` (pkg/apis/autoscaling/annotations.go:34).
 const DEFAULT_CPU_UTILIZATION: i32 = 80;
@@ -216,6 +217,15 @@ impl RestUpdateStrategy<HorizontalPodAutoscaler> for Strategy {
     fn allow_unconditional_update(&self) -> bool {
         true
     }
+
+    /// `GetResetFields` (autoscaling/horizontalpodautoscaler/strategy.go:50-67): `status`.
+    fn get_reset_fields(&self) -> ResetFields {
+        ResetFields::new()
+            .with("autoscaling/v1", &[&["status"]])
+            .with("autoscaling/v2", &[&["status"]])
+            .with("autoscaling/v2beta1", &[&["status"]])
+            .with("autoscaling/v2beta2", &[&["status"]])
+    }
 }
 
 impl RestDeleteStrategy<HorizontalPodAutoscaler> for Strategy {}
@@ -261,6 +271,15 @@ impl RestUpdateStrategy<HorizontalPodAutoscaler> for StatusStrategy {
 
     fn allow_unconditional_update(&self) -> bool {
         true
+    }
+
+    /// `GetResetFields` (autoscaling/horizontalpodautoscaler/strategy.go:136-153): `spec`.
+    fn get_reset_fields(&self) -> ResetFields {
+        ResetFields::new()
+            .with("autoscaling/v1", &[&["spec"]])
+            .with("autoscaling/v2", &[&["spec"]])
+            .with("autoscaling/v2beta1", &[&["spec"]])
+            .with("autoscaling/v2beta2", &[&["spec"]])
     }
 }
 

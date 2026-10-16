@@ -15,6 +15,7 @@ use crate::registry::rest::{
     GroupResource, NamespaceScopedStrategy, RequestContext, RestCreateStrategy, RestDeleteStrategy,
     RestUpdateStrategy,
 };
+use crate::ssa::ResetFields;
 
 /// `SetDefaults_NodeStatus` (pkg/apis/core/v1/defaults.go:346-354): with no
 /// allocatable, allocatable is capacity. `NodeStatus` is a struct upstream,
@@ -111,6 +112,11 @@ impl RestUpdateStrategy<Node> for Strategy {
     fn allow_unconditional_update(&self) -> bool {
         true
     }
+
+    /// `GetResetFields` (core/node/strategy.go:64-72): `status`.
+    fn get_reset_fields(&self) -> ResetFields {
+        ResetFields::new().with("v1", &[&["status"]])
+    }
 }
 
 /// Nodes use the default delete strategy.
@@ -150,6 +156,11 @@ impl RestUpdateStrategy<Node> for StatusStrategy {
 
     fn allow_unconditional_update(&self) -> bool {
         true
+    }
+
+    /// `GetResetFields` (core/node/strategy.go:169-177): `spec`.
+    fn get_reset_fields(&self) -> ResetFields {
+        ResetFields::new().with("v1", &[&["spec"]])
     }
 }
 

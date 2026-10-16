@@ -17,6 +17,7 @@ use crate::registry::rest::{
     GarbageCollectionPolicy, GroupResource, NamespaceScopedStrategy, RequestContext,
     RestCreateStrategy, RestDeleteStrategy, RestUpdateStrategy,
 };
+use crate::ssa::ResetFields;
 
 /// Where `WarningsForJobSpec` reports for a CronJob (strategy.go:126, :158).
 const JOB_TEMPLATE_SPEC_PATH: &str = "spec.jobTemplate.spec";
@@ -116,6 +117,13 @@ impl RestUpdateStrategy<CronJob> for Strategy {
     fn allow_unconditional_update(&self) -> bool {
         true
     }
+
+    /// `GetResetFields` (batch/cronjob/strategy.go:73-84): `status`.
+    fn get_reset_fields(&self) -> ResetFields {
+        ResetFields::new()
+            .with("batch/v1", &[&["status"]])
+            .with("batch/v1beta1", &[&["status"]])
+    }
 }
 
 /// `DefaultGarbageCollectionPolicy` (strategy.go:52-65): `DeleteDependents`
@@ -156,6 +164,13 @@ impl RestUpdateStrategy<CronJob> for StatusStrategy {
 
     fn allow_unconditional_update(&self) -> bool {
         true
+    }
+
+    /// `GetResetFields` (batch/cronjob/strategy.go:174-183): `spec`.
+    fn get_reset_fields(&self) -> ResetFields {
+        ResetFields::new()
+            .with("batch/v1", &[&["spec"]])
+            .with("batch/v1beta1", &[&["spec"]])
     }
 }
 

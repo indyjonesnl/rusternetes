@@ -32,6 +32,7 @@ use crate::registry::rest::{
     RequestContext, RestCreateStrategy, RestDeleteStrategy, RestGracefulDeleteStrategy,
     RestUpdateStrategy, TransformFunc, UpdatedObjectInfo,
 };
+use crate::ssa::ResetFields;
 
 /// What decoding a Pod does beyond the field mapping: `SetDefaults_PodSpec`,
 /// `SetDefaults_Container` and `SetDefaults_Probe` (pkg/apis/core/v1/
@@ -418,6 +419,11 @@ impl RestUpdateStrategy<Pod> for Strategy {
     fn allow_unconditional_update(&self) -> bool {
         true
     }
+
+    /// `GetResetFields` (core/pod/strategy.go:76-84): `status`.
+    fn get_reset_fields(&self) -> ResetFields {
+        ResetFields::new().with("v1", &[&["status"]])
+    }
 }
 
 impl RestDeleteStrategy<Pod> for Strategy {
@@ -567,6 +573,18 @@ impl RestUpdateStrategy<Pod> for StatusStrategy {
 
     fn allow_unconditional_update(&self) -> bool {
         true
+    }
+
+    /// `GetResetFields` (core/pod/strategy.go:206-214): `spec, metadata.deletionTimestamp, metadata.ownerReferences`.
+    fn get_reset_fields(&self) -> ResetFields {
+        ResetFields::new().with(
+            "v1",
+            &[
+                &["spec"],
+                &["metadata", "deletionTimestamp"],
+                &["metadata", "ownerReferences"],
+            ],
+        )
     }
 }
 
