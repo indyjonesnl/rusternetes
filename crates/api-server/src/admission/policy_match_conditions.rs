@@ -12,8 +12,7 @@
 //! The `admissionmetrics` observations (matcher.go:88, :113, :116, :125) are
 //! ported (#3229, `admission_metrics.rs`).
 //!
-//! Deviations: the CEL cost budget (`RuntimeCELCostBudgetMatchConditions`)
-//! is not ported. The request authorizer
+//! Deviations: the request authorizer
 //! (`Match`'s `authz` argument, a `NewCachingAuthorizer` from the dispatcher,
 //! #3228) is bound to the CEL `authorizer` / `authorizer.requestResource`
 //! variables (`OptionalVariableBindings.Authorizer`, matcher.go:80-86;
@@ -21,6 +20,7 @@
 //! evaluation error here; the compile-time rejection (`ReturnTypes`) happens at
 //! policy / configuration validation (`cel_env::output_type_failure`).
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -28,6 +28,7 @@ use async_trait::async_trait;
 use rusternetes_common::admission::Operation;
 use rusternetes_common::authz::Authorizer;
 use rusternetes_common::cel::CELEvaluator;
+use rusternetes_common::cel_cost::{charge_budget, RUNTIME_CEL_COST_BUDGET_MATCH_CONDITIONS};
 use rusternetes_common::cel_struct::TypeCheck;
 use rusternetes_common::resources::admission_webhook::MatchCondition;
 use rusternetes_common::resources::validating_admission_policy::FailurePolicy;
@@ -37,7 +38,7 @@ use super::admission_metrics::{
     observe_match_condition_eval_error, observe_match_condition_evaluation_time, KIND_POLICY,
     STEP_VALIDATE,
 };
-use super::policy_json_patch::evaluate_expression;
+use super::policy_json_patch::{evaluate_expression_costed, CostReport};
 use super::policy_matching::Attributes;
 use super::policy_mutating::{
     ConditionMatcher, MatchResult, PatchError, PatchRequest, VersionedAttributes,
@@ -248,32 +249,59 @@ impl ConditionEvaluator for CelConditions {
             namespace: None,
             authorizer: Some(authz),
         };
-        Ok(self
-            .conditions
-            .iter()
-            .map(|(name, expr)| EvaluationResult {
+        // condition.go:103-109: `remainingBudget` starts at the caller's
+        // budget (matcher.go:85 `RuntimeCELCostBudgetMatchConditions`) and is
+        // threaded through every `activation.Evaluate`; running out of it
+        // returns the error instead of any evaluation (`return nil, -1, err`).
+        let mut remaining = RUNTIME_CEL_COST_BUDGET_MATCH_CONDITIONS;
+        // A composited variable is evaluated, and its cost reported, once
+        // (composition.go:191-225).
+        let mut charged: HashSet<String> = HashSet::new();
+        let mut evaluations = Vec::with_capacity(self.conditions.len());
+        for (name, expr) in &self.conditions {
+            let mut report = CostReport::default();
+            let result = evaluate_expression_costed(
+                &self.evaluator,
+                expr,
+                &self.variables,
+                &request,
+                TypeCheck::Root,
+                Some(&mut report),
+            );
+            let composition: u64 = report
+                .variable_costs
+                .iter()
+                .filter(|(n, _)| charged.insert(n.clone()))
+                .map(|(_, c)| *c)
+                .sum();
+            remaining = charge_budget(
+                Some(i64::try_from(composition).unwrap_or(i64::MAX)),
+                report.cost,
+                remaining,
+            )
+            .map_err(|e| e.detail)?;
+            evaluations.push(EvaluationResult {
                 name: name.clone(),
-                result: evaluate_expression(
-                    &self.evaluator,
-                    expr,
-                    &self.variables,
-                    &request,
-                    TypeCheck::Root,
-                )
-                .map_err(|e| match e {
-                    PatchError::Status(e) => e.to_string(),
-                    PatchError::Other(m) => m,
-                })
-                .and_then(|v| match v {
-                    Value::Bool(b) => Ok(b),
-                    other => Err(format!(
-                        "expression '{expr}' resulted in non-bool value: {other}"
-                    )),
-                }),
-            })
-            .collect())
+                result: result
+                    .map_err(|e| match e {
+                        PatchError::Status(e) => e.to_string(),
+                        PatchError::Other(m) => m,
+                    })
+                    .and_then(|v| match v {
+                        Value::Bool(b) => Ok(b),
+                        other => Err(format!(
+                            "expression '{expr}' resulted in non-bool value: {other}"
+                        )),
+                    }),
+            });
+        }
+        Ok(evaluations)
     }
 }
+
+#[cfg(test)]
+#[path = "policy_match_conditions_budget_tests.rs"]
+mod budget_tests;
 
 #[cfg(test)]
 mod tests {

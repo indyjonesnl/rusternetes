@@ -223,7 +223,7 @@ mod tests {
     struct SetLabel;
     #[async_trait]
     impl Patcher for SetLabel {
-        async fn patch(&self, r: &PatchRequest<'_>) -> Result<Value, PatchError> {
+        async fn patch(&self, r: &PatchRequest<'_>, _: i64) -> Result<Value, PatchError> {
             let mut o = r.versioned_attributes.versioned_object.clone().unwrap();
             o["metadata"]["labels"] = json!({"mutated": "yes"});
             Ok(o)

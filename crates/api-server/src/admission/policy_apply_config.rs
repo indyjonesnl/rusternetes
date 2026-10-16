@@ -14,7 +14,7 @@ use rusternetes_common::cel::CELEvaluator;
 use rusternetes_common::cel_struct::{self, TypeCheck};
 use serde_json::{Map, Value};
 
-use super::policy_json_patch::evaluate_expression;
+use super::policy_json_patch::evaluate_expression_budgeted;
 use super::policy_mutating::{PatchError, PatchRequest, Patcher};
 use crate::fieldmanager::apply::merge_values;
 use crate::fieldmanager::fieldset::{field_kind, FieldKind};
@@ -51,7 +51,11 @@ impl ApplyConfigPatcher {
 #[async_trait]
 impl Patcher for ApplyConfigPatcher {
     /// `applyConfigPatcher.Patch` (smd.go:67-116).
-    async fn patch(&self, r: &PatchRequest<'_>) -> Result<Value, PatchError> {
+    async fn patch(
+        &self,
+        r: &PatchRequest<'_>,
+        runtime_cel_cost_budget: i64,
+    ) -> Result<Value, PatchError> {
         if let Some(e) = &self.compile_error {
             // `objVal.CheckTypeNamesMatchFieldPathNames` (smd.go:99-102);
             // cel_struct checks the names statically.
@@ -63,12 +67,15 @@ impl Patcher for ApplyConfigPatcher {
                 },
             ));
         }
-        let value = evaluate_expression(
+        // smd.go:77 `ForInput(..., runtimeCELCostBudget)`; the remaining budget
+        // is not read again (`eval, _, err :=`).
+        let (value, _) = evaluate_expression_budgeted(
             &self.evaluator,
             &self.expression,
             &self.variables,
             r,
             TypeCheck::Root,
+            runtime_cel_cost_budget,
         )?;
         // smd.go:87-90, :104-107: the compiler ensures an `Object`.
         let Value::Object(mut patch) = value else {
@@ -201,6 +208,7 @@ mod tests {
     use crate::admission::policy_matching::Attributes;
     use crate::admission::policy_mutating::VersionedAttributes;
     use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource, Operation};
+    use rusternetes_common::cel_cost::RUNTIME_CEL_COST_BUDGET;
     use serde_json::json;
 
     /// `TestApplyConfiguration` harness: a Deployment `Create` with the
@@ -253,10 +261,11 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
-        rt.block_on(patcher.patch(&req)).map_err(|e| match e {
-            PatchError::Status(e) => e.to_string(),
-            PatchError::Other(m) => m,
-        })
+        rt.block_on(patcher.patch(&req, RUNTIME_CEL_COST_BUDGET))
+            .map_err(|e| match e {
+                PatchError::Status(e) => e.to_string(),
+                PatchError::Other(m) => m,
+            })
     }
 
     /// The expected result carries the patch's TypeMeta (smd.go:110).

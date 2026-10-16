@@ -14,6 +14,7 @@ use rusternetes_common::admission::Operation as AdmissionOperation;
 use rusternetes_common::auth::UserInfo;
 use rusternetes_common::cel::{CELContext, CELEvaluator};
 use rusternetes_common::cel_authz_library;
+use rusternetes_common::cel_cost::{charge_budget, CostOptions};
 use rusternetes_common::cel_struct::{self, TypeCheck};
 use serde_json::{json, Value};
 
@@ -58,13 +59,17 @@ impl JsonPatcher {
     fn evaluate_patch_expression(
         &self,
         r: &PatchRequest<'_>,
+        remaining_budget: i64,
     ) -> Result<Vec<Operation>, PatchError> {
-        let json = evaluate_expression(
+        // json_patch.go:121: `ForInput(..., remainingBudget)`; the remaining
+        // budget returned is discarded by `Patch` (`patchObj, _, err :=`).
+        let (json, _) = evaluate_expression_budgeted(
             &self.evaluator,
             &self.expression,
             &self.variables,
             r,
             TypeCheck::JsonPatchValues,
+            remaining_budget,
         )?;
         Self::operations_from(json)
     }
@@ -102,14 +107,66 @@ impl JsonPatcher {
 /// The shared half of `jsonPatcher.evaluatePatchExpression` and
 /// `applyConfigPatcher.Patch`: bind `object`/`oldObject`/`params`/
 /// `namespaceObject`/`request`, evaluate, and marshal the result to JSON.
-pub(super) fn evaluate_expression(
+///
+/// `MutatingEvaluator.ForInput(..., remainingBudget)` (cel/mutation.go:51-70):
+/// the composited variables the expression read and the expression itself are
+/// charged against `remaining_budget` (`activation.Evaluate`, activation.go:
+/// 132-189), so an out-of-budget expression fails with the `ErrOutOfBudget`
+/// error before any evaluation error is reported. Returns the value and the
+/// remaining budget.
+pub(super) fn evaluate_expression_budgeted(
     evaluator: &Mutex<CELEvaluator>,
     expression: &str,
     variables: &[(String, String)],
     r: &PatchRequest<'_>,
     check: TypeCheck,
+    remaining_budget: i64,
+) -> Result<(Value, i64), PatchError> {
+    let mut report = CostReport::default();
+    let result = evaluate_expression_costed(
+        evaluator,
+        expression,
+        variables,
+        r,
+        check,
+        Some(&mut report),
+    );
+    let composition: u64 = report.variable_costs.iter().map(|(_, c)| *c).sum();
+    let remaining = charge_budget(
+        Some(i64::try_from(composition).unwrap_or(i64::MAX)),
+        report.cost,
+        remaining_budget,
+    )
+    .map_err(|e| PatchError::Other(e.detail))?;
+    result.map(|v| (v, remaining))
+}
+
+/// What a costed evaluation spent (`EvalDetails.ActualCost()` and the
+/// `compositionContext` cost, activation.go:132-189).
+#[derive(Debug, Default)]
+pub(super) struct CostReport {
+    /// The expression's own actual cost.
+    pub cost: u64,
+    /// The composited variables this expression read (transitively), with the
+    /// cost of evaluating each. Upstream evaluates a variable lazily, once,
+    /// when it is first read (composition.go:191-225).
+    pub variable_costs: Vec<(String, u64)>,
+}
+
+/// [`evaluate_expression`], reporting the runtime cost when `report` is set
+/// (cel-go `cel.CostTracking`, #3323): the variables and the expression are
+/// each evaluated under the per-call limit (`environment/base.go:83`).
+pub(super) fn evaluate_expression_costed(
+    evaluator: &Mutex<CELEvaluator>,
+    expression: &str,
+    variables: &[(String, String)],
+    r: &PatchRequest<'_>,
+    check: TypeCheck,
+    report: Option<&mut CostReport>,
 ) -> Result<Value, PatchError> {
     {
+        let mut variable_cost: std::collections::HashMap<&str, u64> =
+            std::collections::HashMap::new();
         let mut ctx = CELContext::new();
         let attrs = r.versioned_attributes;
         let request = create_admission_request(r);
@@ -182,16 +239,20 @@ pub(super) fn evaluate_expression(
         let mut failed: Vec<(&str, String)> = Vec::new();
         bind(&mut ctx, &bound);
         for (name, expr) in variables {
-            let result = evaluator
-                .evaluate_to_value_raw(expr, &ctx)
-                .map_err(|e| e.to_string())
-                .and_then(|v| {
-                    // Fails a value that cannot marshal to JSON.
-                    cel_struct::strip_type_markers(&v)
-                        .json()
-                        .map_err(|e| e.to_string())?;
-                    Ok(v)
-                });
+            let evaluated = if report.is_some() {
+                let (r, c) = evaluator.evaluate_with_cost_raw(expr, &ctx, CostOptions::default());
+                variable_cost.insert(name.as_str(), c);
+                r.map_err(|e| anyhow::anyhow!("Failed to execute CEL expression '{expr}': {e}"))
+            } else {
+                evaluator.evaluate_to_value_raw(expr, &ctx)
+            };
+            let result = evaluated.map_err(|e| e.to_string()).and_then(|v| {
+                // Fails a value that cannot marshal to JSON.
+                cel_struct::strip_type_markers(&v)
+                    .json()
+                    .map_err(|e| e.to_string())?;
+                Ok(v)
+            });
             match result {
                 Ok(v) => {
                     bound.insert(cel::objects::Key::from(name.as_str()), v);
@@ -201,22 +262,67 @@ pub(super) fn evaluate_expression(
             }
         }
 
-        let value = evaluator
-            .evaluate_to_value_checked(expression, &ctx, check)
-            .map_err(|e| {
-                PatchError::Other(
-                    match failed.iter().find(|(n, _)| reads_variable(expression, n)) {
-                        Some((_, msg)) => msg.clone(),
-                        None => e.to_string(),
-                    },
-                )
-            })?;
+        let evaluated = match report {
+            None => evaluator.evaluate_to_value_checked(expression, &ctx, check),
+            Some(rep) => {
+                let (r, c) =
+                    evaluator.evaluate_with_cost_raw(expression, &ctx, CostOptions::default());
+                rep.cost = c;
+                rep.variable_costs = read_variable_costs(expression, variables, &variable_cost);
+                // the error wording of `evaluate_to_value_checked`
+                r.map_err(|e| {
+                    anyhow::anyhow!("Failed to execute CEL expression '{expression}': {e}")
+                })
+                .and_then(|v| {
+                    cel_struct::finish_checked(v, check).map_err(|e| {
+                        if e.starts_with("unexpected type name") {
+                            anyhow::anyhow!("type mismatch: {e}")
+                        } else {
+                            anyhow::anyhow!("Failed to execute CEL expression '{expression}': {e}")
+                        }
+                    })
+                })
+            }
+        };
+        let value = evaluated.map_err(|e| {
+            PatchError::Other(
+                match failed.iter().find(|(n, _)| reads_variable(expression, n)) {
+                    Some((_, msg)) => msg.clone(),
+                    None => e.to_string(),
+                },
+            )
+        })?;
         value.json().map_err(|e| {
             PatchError::Other(format!(
                 "JSONPath valueExpression evaluated to a type that could not marshal to JSON: {e}"
             ))
         })
     }
+}
+
+/// The variables `expression` reads, transitively (a variable may read the
+/// ones declared before it), with their evaluation costs: the lazily
+/// evaluated composited variables of composition.go:191-225.
+fn read_variable_costs(
+    expression: &str,
+    variables: &[(String, String)],
+    costs: &std::collections::HashMap<&str, u64>,
+) -> Vec<(String, u64)> {
+    let mut read: Vec<&str> = Vec::new();
+    let mut work: Vec<&str> = vec![expression];
+    while let Some(text) = work.pop() {
+        for (name, expr) in variables {
+            if reads_variable(text, name) && !read.contains(&name.as_str()) {
+                read.push(name);
+                work.push(expr);
+            }
+        }
+    }
+    variables
+        .iter()
+        .filter(|(n, _)| read.contains(&n.as_str()))
+        .map(|(n, _)| (n.clone(), costs.get(n.as_str()).copied().unwrap_or(0)))
+        .collect()
 }
 
 /// Whether `expression` reads `variables.<name>` / `variables["name"]`.
@@ -298,7 +404,11 @@ fn create_admission_request(r: &PatchRequest<'_>) -> Value {
 impl Patcher for JsonPatcher {
     /// `jsonPatcher.Patch` (json_patch.go:72-116), over the unstructured
     /// representation (the `*unstructured.Unstructured` branch at :102-103).
-    async fn patch(&self, request: &PatchRequest<'_>) -> Result<Value, PatchError> {
+    async fn patch(
+        &self,
+        request: &PatchRequest<'_>,
+        runtime_cel_cost_budget: i64,
+    ) -> Result<Value, PatchError> {
         if let Some(e) = &self.compile_error {
             // cel_struct checks `Object.<path>{}` type names statically
             // (CheckTypeNamesMatchFieldPathNames), which upstream does at
@@ -311,7 +421,7 @@ impl Patcher for JsonPatcher {
                 },
             ));
         }
-        let ops = self.evaluate_patch_expression(request)?;
+        let ops = self.evaluate_patch_expression(request, runtime_cel_cost_budget)?;
         let object = request
             .versioned_attributes
             .versioned_object
@@ -328,12 +438,17 @@ impl Patcher for JsonPatcher {
 }
 
 #[cfg(test)]
+#[path = "policy_patch_budget_tests.rs"]
+mod budget_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::admission::policy_matching::Attributes;
     use crate::admission::policy_mutating::VersionedAttributes;
     use rusternetes_common::admission::Operation as AdmissionOperation;
     use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
+    use rusternetes_common::cel_cost::RUNTIME_CEL_COST_BUDGET;
     use serde_json::json;
 
     fn attributes(object: &Value) -> Attributes {
@@ -391,10 +506,11 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
-        rt.block_on(patcher.patch(&req)).map_err(|e| match e {
-            PatchError::Status(e) => e.to_string(),
-            PatchError::Other(m) => m,
-        })
+        rt.block_on(patcher.patch(&req, RUNTIME_CEL_COST_BUDGET))
+            .map_err(|e| match e {
+                PatchError::Status(e) => e.to_string(),
+                PatchError::Other(m) => m,
+            })
     }
 
     fn run(expression: &str, object: Value) -> Result<Value, String> {
