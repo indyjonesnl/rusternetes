@@ -421,6 +421,10 @@ async fn cronjob_status_write_conflicts_without_duplicating_the_job() {
     use rusternetes_common::resources::workloads::Job;
     let storage = RacingStatusStorage::new();
     let key = "/registry/cronjobs/default/cj";
+    // A pinned clock (`jm.now`, cronjob_controllerv2.go:79): with the wall
+    // clock a minute boundary between the two syncs changes the scheduled
+    // time and so, correctly, the deterministic Job name.
+    let now = chrono::Utc::now();
     seed(
         &storage,
         key,
@@ -428,7 +432,7 @@ async fn cronjob_status_write_conflicts_without_duplicating_the_job() {
             "apiVersion": "batch/v1", "kind": "CronJob",
             "metadata": {"name": "cj", "namespace": "default", "uid": "u-cj",
                          // utils.go:101: the first run walks from creationTimestamp.
-                         "creationTimestamp": (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339()},
+                         "creationTimestamp": (now - chrono::Duration::minutes(10)).to_rfc3339()},
             "spec": {"schedule": "* * * * *",
                      "jobTemplate": {"spec": {"template": {"spec": {
                          "restartPolicy": "Never",
@@ -436,7 +440,7 @@ async fn cronjob_status_write_conflicts_without_duplicating_the_job() {
         }),
     )
     .await;
-    let c = CronJobController::new(storage.clone());
+    let c = CronJobController::new(storage.clone()).with_now(move || now);
     c.reconcile_all().await.unwrap();
     assert_lost_race_is_refused(&storage, key, status_is_set).await;
     let jobs: Vec<Job> = storage.list("/registry/jobs/default/").await.unwrap();

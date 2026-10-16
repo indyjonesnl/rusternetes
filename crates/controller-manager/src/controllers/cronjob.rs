@@ -379,12 +379,30 @@ pub struct CronJobController<S: Storage> {
     storage: Arc<S>,
     /// `jm.recorder` (cronjob_controllerv2.go).
     recorder: EventRecorder<S>,
+    /// `jm.now` (cronjob_controllerv2.go:79): "a function that returns current
+    /// time, done to facilitate unit tests".
+    now: Arc<dyn Fn() -> chrono::DateTime<chrono::Utc> + Send + Sync>,
 }
 
 impl<S: Storage + 'static> CronJobController<S> {
     pub fn new(storage: Arc<S>) -> Self {
         let recorder = EventRecorder::new(Arc::clone(&storage));
-        Self { storage, recorder }
+        Self {
+            storage,
+            recorder,
+            now: Arc::new(chrono::Utc::now),
+        }
+    }
+
+    /// Replace the clock, as upstream tests set `jm.now`. Used by the `it`
+    /// integration tests; the bin target compiles this module without them.
+    #[allow(dead_code)]
+    pub fn with_now(
+        mut self,
+        now: impl Fn() -> chrono::DateTime<chrono::Utc> + Send + Sync + 'static,
+    ) -> Self {
+        self.now = Arc::new(now);
+        self
     }
 
     /// `jm.recorder.Eventf(cronJob, corev1.EventTypeWarning, ...)`. A failure to
@@ -832,7 +850,7 @@ impl<S: Storage + 'static> CronJobController<S> {
         update_status: &mut bool,
     ) -> Result<Option<Duration>> {
         let name = cronjob.metadata.name.clone();
-        let now = chrono::Utc::now();
+        let now = (self.now)();
 
         let mut children: std::collections::HashSet<String> = std::collections::HashSet::new();
         for j in jobs {
