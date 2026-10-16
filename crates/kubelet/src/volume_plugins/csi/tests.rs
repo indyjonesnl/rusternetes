@@ -2131,3 +2131,126 @@ fn get_device_mount_refs_delegates_to_the_host_mounters_get_mount_refs() {
         assert_eq!(got, want, "{path}");
     }
 }
+
+// ---- SetUp: SELinux mount context (#2443) -----------------------------------
+
+/// Publish mount flags + persisted `seLinuxMountContext` of one `SetUp` with
+/// `MounterArgs.SELinuxLabel = label`.
+async fn selinux_set_up(
+    name: &str,
+    csi_driver: Option<serde_json::Value>,
+    gate: bool,
+    label: &str,
+) -> (Vec<String>, Option<String>) {
+    let _g = rusternetes_common::feature_gates::with_feature(
+        rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
+        gate,
+    );
+    let f = fx(name, &[], csi_driver).await;
+    let p = pv(&f.driver, json!({}));
+    let v = claim_volume();
+    let spec = Spec {
+        volume: &v,
+        persistent_volume: Some(&p),
+        read_only: false,
+    };
+    let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
+    let args = crate::volume_plugins::MounterArgs {
+        selinux_label: label.to_string(),
+        ..Default::default()
+    };
+    m.set_up_with(&args).await.unwrap();
+    let calls = f.fake.calls.lock().unwrap();
+    let flags = match calls.publish[0]
+        .volume_capability
+        .as_ref()
+        .unwrap()
+        .access_type
+        .as_ref()
+        .unwrap()
+    {
+        AccessType::Mount(mnt) => mnt.mount_flags.clone(),
+        other => panic!("expected mount, got {other:?}"),
+    };
+    let vol_dir = std::path::Path::new(&m.get_path())
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let data: HashMap<String, String> =
+        serde_json::from_slice(&std::fs::read(vol_dir.join("vol_data.json")).unwrap()).unwrap();
+    (flags, data.get("seLinuxMountContext").cloned())
+}
+
+/// `TestMounterSetUpSimple` "should include SELinux mount options, if
+/// feature-gate is enabled and driver supports it" (`csi_mounter_test.go:182`),
+/// and `csi_mounter.go:287` persists `seLinuxMountContext`.
+#[tokio::test]
+#[serial_test::serial]
+async fn set_up_adds_selinux_mount_option_when_driver_supports_it() {
+    let (flags, saved) = selinux_set_up(
+        "se-yes",
+        Some(json!({"attachRequired": false, "seLinuxMount": true})),
+        true,
+        "s0,c0",
+    )
+    .await;
+    assert!(
+        flags.contains(&"context=\"s0,c0\"".to_string()),
+        "{flags:?}"
+    );
+    assert_eq!(saved.as_deref(), Some("s0,c0"));
+}
+
+/// "...feature gate is enabled but driver does not support it".
+#[tokio::test]
+#[serial_test::serial]
+async fn set_up_omits_selinux_mount_option_when_driver_does_not_support_it() {
+    let (flags, saved) = selinux_set_up(
+        "se-no",
+        Some(json!({"attachRequired": false, "seLinuxMount": false})),
+        true,
+        "s0,c0",
+    )
+    .await;
+    assert!(
+        !flags.iter().any(|f| f.starts_with("context=")),
+        "{flags:?}"
+    );
+    assert_eq!(saved, None);
+}
+
+/// "...driver supports it, but Pod does not have it": never `-o context=""`.
+#[tokio::test]
+#[serial_test::serial]
+async fn set_up_omits_selinux_mount_option_without_a_pod_label() {
+    let (flags, saved) = selinux_set_up(
+        "se-nolabel",
+        Some(json!({"attachRequired": false, "seLinuxMount": true})),
+        true,
+        "",
+    )
+    .await;
+    assert!(
+        !flags.iter().any(|f| f.starts_with("context=")),
+        "{flags:?}"
+    );
+    assert_eq!(saved, None);
+}
+
+/// Gate off: `AddSELinuxMountOption` and the persisted context are skipped.
+#[tokio::test]
+#[serial_test::serial]
+async fn set_up_omits_selinux_mount_option_when_gate_is_off() {
+    let (flags, saved) = selinux_set_up(
+        "se-gateoff",
+        Some(json!({"attachRequired": false, "seLinuxMount": true})),
+        false,
+        "s0,c0",
+    )
+    .await;
+    assert!(
+        !flags.iter().any(|f| f.starts_with("context=")),
+        "{flags:?}"
+    );
+    assert_eq!(saved, None);
+}
