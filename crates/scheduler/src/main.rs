@@ -17,6 +17,8 @@ mod node_volume_limits;
 mod plugins;
 #[allow(dead_code)] // library API surface (Map accessors); partly unused by the binary
 mod profile;
+#[allow(dead_code)] // library API surface (queue introspection); partly unused by the binary
+mod queue;
 mod scheduler;
 #[allow(dead_code)] // library API surface (single-profile loaders); partly unused by the binary
 mod scheduler_config;
