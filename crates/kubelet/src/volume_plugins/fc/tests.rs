@@ -1083,8 +1083,8 @@ fn detach_block_missing_paths_is_a_no_op() {
 
 /// `TearDownDevice` (`fc.go:452-463`): detach, then delete `mapPath`; a manager
 /// failure is wrapped as `fc: failed to detach disk: <path>\nError: <err>`.
-#[test]
-fn tear_down_device_detaches_then_removes_the_map_path() {
+#[tokio::test]
+async fn tear_down_device_detaches_then_removes_the_map_path() {
     let tmp = tempfile::tempdir().unwrap();
     let plug = FcPlugin::new(host(tmp.path()));
     let map_path = tmp.path().join("volumeDevices/w1-lun-0");
@@ -1095,12 +1095,15 @@ fn tear_down_device_detaches_then_removes_the_map_path() {
         Arc::new(FakeDiskManager::new()),
         Arc::new(no_commands()),
     );
-    c.tear_down_device(&map_path.to_string_lossy(), "").unwrap();
+    c.tear_down_device(&map_path.to_string_lossy(), "")
+        .await
+        .unwrap();
     assert!(!map_path.exists());
 
     // The fake manager's `DetachBlockFCDisk` removes `mapPath`, which no longer exists.
     let err = c
         .tear_down_device(&map_path.to_string_lossy(), "")
+        .await
         .unwrap_err();
     assert!(
         err.to_string().starts_with(&format!(
