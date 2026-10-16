@@ -18,6 +18,16 @@ impl EmptyDirPlugin {
         Self { host }
     }
 
+    /// `getMetaDir` (`empty_dir.go:557-559`):
+    /// `filepath.Join(host.GetPodPluginDir(pod.UID, EscapeQualifiedName(emptyDirPluginName)), volName)`.
+    fn get_meta_dir(&self, pod_uid: &str, vol_name: &str) -> String {
+        let escaped = crate::pod_dirs::escape_qualified_name(self.name());
+        Path::new(&self.host.get_pod_plugin_dir(pod_uid, &escaped))
+            .join(vol_name)
+            .to_string_lossy()
+            .into_owned()
+    }
+
     /// `newUnmounterInternal` (`empty_dir.go:172-183`): the unmounter with its
     /// mount detector and mounter injected, so a test can drive every branch
     /// of `TearDownAt` without a real tmpfs.
@@ -30,6 +40,7 @@ impl EmptyDirPlugin {
     ) -> EmptyDirUnmounter {
         EmptyDirUnmounter {
             path: self.host.get_pod_volume_dir(pod_uid, self.name(), vol_name),
+            meta_dir: self.get_meta_dir(pod_uid, vol_name),
             mounter,
             mount_detector,
         }
@@ -69,6 +80,7 @@ impl VolumePlugin for EmptyDirPlugin {
 
     async fn new_mounter(&self, spec: &Spec<'_>, pod: &Pod) -> Result<Box<dyn Mounter>> {
         Ok(Box::new(EmptyDirMounter {
+            meta_dir: self.get_meta_dir(&pod.metadata.uid, &spec.volume.name),
             path: self
                 .host
                 .get_pod_volume_dir(&pod.metadata.uid, self.name(), &spec.volume.name),
@@ -212,6 +224,7 @@ impl Unmount for RealMounter {
 /// [`EmptyDirMounter`]; upstream's one `emptyDir` struct serves both.
 pub(crate) struct EmptyDirUnmounter {
     path: String,
+    meta_dir: String,
     mounter: Arc<dyn Unmount>,
     mount_detector: Arc<dyn MountDetector>,
 }
@@ -223,12 +236,18 @@ impl Unmounter for EmptyDirUnmounter {
     }
 
     /// `TearDownAt` (`empty_dir.go:495-525`).
-    ///
-    /// Not ported: the first step, removing the ready dir
-    /// (`getMetaDir`, `empty_dir.go:497-500`). Our `SetUp` never calls
-    /// `volumeutil.SetReady` (`empty_dir.go:284`), so there is none to remove;
-    /// tracked with the rest of `SetUpAt`'s readiness handling (#1972).
     async fn tear_down_at(&self, dir: &str) -> Result<()> {
+        // First remove ready dir which created in SetUp func
+        // (`empty_dir.go:497-500`).
+        if let Err(e) = std::fs::remove_dir_all(&self.meta_dir) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(anyhow!(
+                    "failed to remove ready dir [{}]: {e}",
+                    self.meta_dir
+                ));
+            }
+        }
+
         // `mount.PathExists` (`staging/src/k8s.io/mount-utils/mount_helper_unix.go:190`).
         match std::fs::metadata(dir) {
             Ok(_) => {}
@@ -278,6 +297,8 @@ fn remove_all(dir: &str) -> Result<()> {
 
 struct EmptyDirMounter {
     path: String,
+    /// `getMetaDir` (`empty_dir.go:557-559`).
+    meta_dir: String,
     volume_name: String,
     empty_dir: EmptyDirVolumeSource,
 }
@@ -300,6 +321,37 @@ impl Mounter for EmptyDirMounter {
     async fn set_up_at(&self, dir: &str, args: &crate::volume_plugins::MounterArgs) -> Result<()> {
         let volume_dir = dir;
         let empty_dir = &self.empty_dir;
+        // SetUpAt (empty_dir.go:234-261): IsLikelyNotMountPoint, tolerating a
+        // missing dir, then the ready-file short circuit.
+        let not_mnt = match crate::pod_dirs::is_likely_not_mount_point(Path::new(volume_dir)) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e) => return Err(anyhow!("IsLikelyNotMountPoint({volume_dir:?}): {e}")),
+        };
+        let kind = classify_medium(empty_dir.medium.as_deref());
+        if crate::volume_plugins::util::is_ready(&self.meta_dir) {
+            match kind {
+                Ok(Medium::Memory) if !not_mnt => return Ok(()),
+                Ok(Medium::Default) => {
+                    // Further check dir exists. (`assignQuota` is not ported.)
+                    if std::fs::metadata(volume_dir).is_ok() {
+                        return Ok(());
+                    }
+                    // This situation should not happen unless user manually
+                    // delete volume dir. In this case, delete ready file.
+                    warn!(
+                        "volume ready file dir {} exist, but volume dir {} does not. Remove ready dir",
+                        self.meta_dir, volume_dir
+                    );
+                    if let Err(e) = std::fs::remove_dir_all(&self.meta_dir) {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            warn!("failed to remove ready dir [{}]: {e}", self.meta_dir);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         // SetUpAt (empty_dir.go:268-277): the medium switch. Anything that is
         // not Default, Memory or a huge-page medium is an error.
         let medium = classify_medium(empty_dir.medium.as_deref())?;
@@ -325,6 +377,8 @@ impl Mounter for EmptyDirMounter {
         // other plugins here do, so a pod never starts against an unreadable
         // volume.
         crate::volume_ownership::set_volume_ownership(Path::new(volume_dir), args.fs_group, false)?;
+        // `volumeutil.SetReady(ed.getMetaDir())` (`empty_dir.go:284`).
+        crate::volume_plugins::util::set_ready(&self.meta_dir);
         info!(
             "Created emptyDir volume {} at {}",
             self.volume_name, volume_dir
@@ -360,6 +414,7 @@ mod tests {
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o400)).unwrap();
         let gid = std::fs::metadata(&d).unwrap().gid() as i64;
         let m = EmptyDirMounter {
+            meta_dir: d.join("meta").to_string_lossy().into_owned(),
             path: d.to_string_lossy().into_owned(),
             volume_name: "v".into(),
             empty_dir: EmptyDirVolumeSource {
@@ -737,6 +792,7 @@ mod tests {
     #[test]
     fn attributes_are_writable_managed_relabel() {
         let m = EmptyDirMounter {
+            meta_dir: "/tmp/x-meta".into(),
             path: "/tmp/x".into(),
             volume_name: "v".into(),
             empty_dir: EmptyDirVolumeSource {
@@ -752,5 +808,106 @@ mod tests {
                 selinux_relabel: true
             }
         );
+    }
+
+    // ---- ready file (`SetUpAt` / `TearDownAt`, empty_dir.go:234-286, 495-500) ----
+
+    fn mounter_in(root: &str) -> EmptyDirMounter {
+        let p = plugin_in(root);
+        EmptyDirMounter {
+            path: p.host.get_pod_volume_dir("poduid", p.name(), "scratch"),
+            meta_dir: p.get_meta_dir("poduid", "scratch"),
+            volume_name: "scratch".into(),
+            empty_dir: EmptyDirVolumeSource {
+                medium: None,
+                size_limit: None,
+            },
+        }
+    }
+
+    fn plugin_in(root: &str) -> EmptyDirPlugin {
+        EmptyDirPlugin::new(Arc::new(crate::volume_plugins::KubeletVolumeHost::new(
+            root.to_string(),
+            None,
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            std::collections::HashMap::new(),
+        )))
+    }
+
+    /// `volumeutil.SetReady(ed.getMetaDir())` after a successful setup.
+    #[tokio::test]
+    async fn set_up_writes_the_ready_file_under_the_plugin_dir() {
+        let root = tmp("ready-set");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.to_string_lossy().into_owned();
+        let m = mounter_in(&root);
+        m.set_up_with(&Default::default()).await.unwrap();
+        assert!(
+            m.meta_dir
+                .ends_with("pods/poduid/plugins/kubernetes.io~empty-dir/scratch"),
+            "{}",
+            m.meta_dir
+        );
+        assert!(std::path::Path::new(&m.meta_dir).join("ready").is_file());
+    }
+
+    /// Ready file present + default medium + dir present: setup is a no-op
+    /// (`empty_dir.go:244-250`), so existing content and mode are untouched.
+    #[tokio::test]
+    async fn set_up_with_ready_file_and_existing_dir_returns_early() {
+        let root = tmp("ready-early");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.to_string_lossy().into_owned();
+        let m = mounter_in(&root);
+        std::fs::create_dir_all(&m.path).unwrap();
+        crate::volume_plugins::util::set_ready(&m.meta_dir);
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&m.path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        m.set_up_with(&Default::default()).await.unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&m.path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "setupDir must not have run");
+    }
+
+    /// Ready file present but the volume dir deleted by hand: the ready dir is
+    /// removed and setup runs again (`empty_dir.go:251-259`).
+    #[tokio::test]
+    async fn set_up_with_stale_ready_file_recreates_the_dir() {
+        let root = tmp("ready-stale");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.to_string_lossy().into_owned();
+        let m = mounter_in(&root);
+        crate::volume_plugins::util::set_ready(&m.meta_dir);
+        assert!(!std::path::Path::new(&m.path).exists());
+        m.set_up_with(&Default::default()).await.unwrap();
+        assert!(std::path::Path::new(&m.path).is_dir());
+        assert!(std::path::Path::new(&m.meta_dir).join("ready").is_file());
+    }
+
+    /// `TearDownAt` first removes the ready dir (`empty_dir.go:497-500`),
+    /// even when the volume dir is already gone (`readyDirExists` cases).
+    #[tokio::test]
+    async fn tear_down_removes_the_ready_dir() {
+        let (root, dir) = filled("td-ready");
+        let m = mounter_in(&root);
+        crate::volume_plugins::util::set_ready(&m.meta_dir);
+        let u = unmounter_for(
+            &root,
+            Arc::new(FakeMountDetector {
+                medium: Medium::Default,
+                is_mount: false,
+            }),
+            Arc::new(FakeMounter::default()),
+        );
+        u.tear_down().await.unwrap();
+        assert!(!dir.exists());
+        assert!(!std::path::Path::new(&m.meta_dir).exists());
+
+        // Volume dir already gone, ready dir still there.
+        crate::volume_plugins::util::set_ready(&m.meta_dir);
+        u.tear_down().await.unwrap();
+        assert!(!std::path::Path::new(&m.meta_dir).exists());
     }
 }
