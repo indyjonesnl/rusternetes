@@ -36,10 +36,17 @@
 //! `CheckTypeNamesMatchFieldPathNames` runs on the *evaluated* result
 //! ([`execute_checked`]); [`execute`] strips the markers.
 //!
+//! `ObjectVal` reports its own type from `Type()` and is not a `Sizer`
+//! (`dynamic/objects.go:158-160`), so the marker must be invisible to CEL:
+//! `size` is overridden on the [`Context`] to not count it, `type` returns the
+//! `Object.<path>` name, and every comprehension range is routed through
+//! `OBJECT_ITERABLE_FN` so iteration yields only the real fields (#3157).
+//!
 //! Known divergences from cel-go, all benign: an unset `JSONPatch`
 //! `op`/`path`/`from` is an absent key rather than `""` (the patcher reads an
-//! absent key as `""`, as `jsonpatch.go` does); `type(Object{})` and
-//! `size()`/iteration see the marker key, as `Object{}` is a CEL map.
+//! absent key as `""`, as `jsonpatch.go` does); `type()` returns a string
+//! (the cel 0.13 crate has no type values), the type name for an `Object{}`
+//! and the CEL kind name (`map`, `int`, ...) otherwise.
 
 use cel::common::ast::{
     CallExpr, EntryExpr, Expr, IdedEntryExpr, IdedExpr, LiteralValue, MapEntryExpr, MapExpr,
@@ -59,6 +66,9 @@ const JSON_PATCH_STRING_FN: &str = "__jsonPatchString";
 /// Guard on an Object field value: map keys must be strings
 /// (`convertField`, dynamic/objects.go:240-258).
 const OBJECT_FIELD_FN: &str = "__objectField";
+/// Guard on a comprehension range: drops the type marker of an Object so
+/// iteration sees only its fields.
+const OBJECT_ITERABLE_FN: &str = "__objectIterable";
 /// `jsonpatch.escapeKey` (apiserver `pkg/cel/library/jsonpatch.go:57-62`).
 /// The interpreter parses `jsonpatch.escapeKey(x)` as a member call on the
 /// identifier `jsonpatch`; [`rewrite`] turns it into a global call of this
@@ -117,6 +127,23 @@ pub fn new_context() -> Context<'static> {
             }
         },
     );
+    // `ObjectVal` is not a Sizer (dynamic/objects.go:158-160): the marker key
+    // is not a field. Everything else is the stock `size`.
+    ctx.add_function(
+        "size",
+        |ftx: &cel::FunctionContext, cel::extractors::This(this): cel::extractors::This<Value>| {
+            cel::functions::size(ftx, cel::extractors::This(without_marker(&this)))
+        },
+    );
+    // `ObjectVal.Type` (dynamic/objects.go:158-160).
+    ctx.add_function("type", |v: Value| -> Result<Value, ExecutionError> {
+        let name = type_name(&v).unwrap_or_else(|| kind(&v));
+        Ok(Value::String(Arc::new(name.to_string())))
+    });
+    ctx.add_function(
+        OBJECT_ITERABLE_FN,
+        |v: Value| -> Result<Value, ExecutionError> { Ok(without_marker(&v)) },
+    );
     ctx.add_function(
         OBJECT_FIELD_FN,
         |v: Value| -> Result<Value, ExecutionError> {
@@ -140,6 +167,23 @@ fn kind(v: &Value) -> &'static str {
         Value::String(_) => "string",
         Value::Bytes(_) => "bytes",
         _ => "value",
+    }
+}
+
+/// `v` without its own (top-level) `Object{}` marker key; nested Objects keep
+/// theirs.
+fn without_marker(v: &Value) -> Value {
+    match v {
+        Value::Map(m) if type_name(v).is_some() => {
+            let map = m
+                .map
+                .iter()
+                .filter(|(k, _)| !is_type_key(k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            Value::Map(cel::objects::Map { map: Arc::new(map) })
+        }
+        other => other.clone(),
     }
 }
 
@@ -378,6 +422,8 @@ fn rewrite(e: &mut IdedExpr, expected: Option<&str>) -> Result<(), String> {
             }),
         Expr::Comprehension(c) => {
             rewrite(&mut c.iter_range, None)?;
+            let range = std::mem::replace(&mut c.iter_range, str_lit(""));
+            c.iter_range = guard(OBJECT_ITERABLE_FN, range);
             rewrite(&mut c.accu_init, None)?;
             rewrite(&mut c.loop_cond, None)?;
             rewrite(&mut c.loop_step, None)?;

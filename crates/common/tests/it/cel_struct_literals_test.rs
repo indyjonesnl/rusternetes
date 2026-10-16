@@ -213,3 +213,27 @@ fn type_names_are_checked_on_the_evaluated_result() {
     let err = run("Object{a: [1].map(x, Object.zzz{})[0]}", TypeCheck::Root).unwrap_err();
     assert!(err.contains("\"Object.zzz\""), "{err}");
 }
+
+/// #3157: `ObjectVal.Type` (`dynamic/objects.go:158-160`) is `Object.<path>`,
+/// `ObjectVal` is not a Sizer and has no marker field, so `size()` and
+/// iteration see only the real fields.
+#[test]
+fn object_has_its_own_type_and_no_marker_field() {
+    assert_eq!(
+        eval("type(Object.spec{a: 1}) == type(Object.spec{})").unwrap(),
+        json!(true)
+    );
+    assert_eq!(
+        eval("type(Object{}) == type(Object.spec{})").unwrap(),
+        json!(false)
+    );
+    assert_eq!(eval("type(Object{}) == type({})").unwrap(), json!(false));
+    assert_eq!(eval("size(Object{a: 1, b: 2})").unwrap(), json!(2));
+    assert_eq!(eval("Object{a: 1, b: 2}.size()").unwrap(), json!(2));
+    assert_eq!(eval("size(Object{})").unwrap(), json!(0));
+    assert_eq!(
+        eval("Object{a: 1, b: 2}.all(k, k == 'a' || k == 'b')").unwrap(),
+        json!(true)
+    );
+    assert_eq!(eval("Object{a: 1}.map(k, k)").unwrap(), json!(["a"]));
+}
