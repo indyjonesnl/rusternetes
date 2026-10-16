@@ -978,7 +978,7 @@ async fn main() -> Result<()> {
     let replicaset_controller = Arc::new(ReplicaSetController::with_pod_informer(
         storage.clone(),
         args.sync_interval,
-        pod_informer,
+        pod_informer.clone(),
     ));
     spawn_controller!("ReplicaSet controller", leader_elector, {
         let controller = replicaset_controller.clone();
@@ -990,7 +990,10 @@ async fn main() -> Result<()> {
     });
 
     // Start StatefulSet controller
-    let statefulset_controller = Arc::new(StatefulSetController::new(storage.clone()));
+    let statefulset_controller = Arc::new(StatefulSetController::with_pod_informer(
+        storage.clone(),
+        pod_informer,
+    ));
     spawn_controller!("StatefulSet controller", leader_elector, {
         let controller = statefulset_controller.clone();
         async move {
