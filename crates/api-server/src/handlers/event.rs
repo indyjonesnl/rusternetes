@@ -90,9 +90,18 @@ fn scope(state: &ApiServerState, uri: &Uri) -> (Served, RequestScope<Event>) {
 /// `involvedObject.namespace`, the message length and requires `source`,
 /// `firstTimestamp`, `lastTimestamp` and `count` -- which arrive as
 /// `deprecated*` on this version -- to be unset (#1914).
-fn request_body(served: Served, params: &HashMap<String, String>, body: &Bytes) -> Result<Bytes> {
+///
+/// Also returns the strict-decoding warnings of a `fieldValidation=Warn` body
+/// (#3694): the versioned decode is where upstream records them
+/// (`rest.go` `addStrictDecodingWarnings`, :439-446), and the generic create
+/// path only ever sees the converted core object.
+fn request_body(
+    served: Served,
+    params: &HashMap<String, String>,
+    body: &Bytes,
+) -> Result<(Bytes, Vec<String>)> {
     if served == Served::Core {
-        return Ok(body.clone());
+        return Ok((body.clone(), Vec::new()));
     }
     let value: serde_json::Value = match serde_json::from_slice(body) {
         Ok(value) => value,
@@ -116,17 +125,30 @@ fn request_body(served: Served, params: &HashMap<String, String>, body: &Bytes) 
     let v1: EventV1 = decode_request_body(body)?;
     // Strictness judges the body in the versioned type, before conversion drops
     // any of its fields: staging/src/k8s.io/apiserver/pkg/endpoints/handlers/
-    // create.go:116-148 decodes into the versioned object first. Warn-mode
-    // warnings are not carried through (#2111).
-    crate::handlers::validation::validate_strict_fields(params, body, &v1)?;
+    // create.go:116-148 decodes into the versioned object first.
+    let warnings = crate::handlers::validation::validate_strict_fields(params, body, &v1)?;
     let mut core = serde_json::to_value(v1.into_core())
         .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
     // The scope's decode checks the body's apiVersion against the served one;
     // `convert_to_internal` stamps the stored (core) version back on.
     core["apiVersion"] = serde_json::json!("events.k8s.io/v1");
-    Ok(Bytes::from(serde_json::to_vec(&core).map_err(|e| {
-        rusternetes_common::Error::Internal(e.to_string())
-    })?))
+    let bytes = Bytes::from(
+        serde_json::to_vec(&core)
+            .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?,
+    );
+    Ok((bytes, warnings))
+}
+
+/// The request's warnings as `Warning: 299` headers
+/// (endpoints/filters/warning.go).
+fn with_warnings(mut response: Response, warnings: &[String]) -> Response {
+    for warning in warnings {
+        let value = crate::handlers::validation::format_warning_header(warning);
+        if let Ok(v) = header::HeaderValue::from_str(&value) {
+            response.headers_mut().append(header::WARNING, v);
+        }
+    }
+    response
 }
 
 /// A response in the served version's schema: the stored core Event, or a list
@@ -182,7 +204,7 @@ pub async fn create(
     body: Bytes,
 ) -> Result<Response> {
     let (served, scope) = scope(&state, &uri);
-    let body = request_body(served, &params, &body)?;
+    let (body, warnings) = request_body(served, &params, &body)?;
     let out = endpoints::create_resource(
         &state,
         &scope,
@@ -192,7 +214,7 @@ pub async fn create(
         &body,
     )
     .await?;
-    response(served, out).await
+    Ok(with_warnings(response(served, out).await?, &warnings))
 }
 
 pub async fn get(
@@ -224,7 +246,7 @@ pub async fn update(
     body: Bytes,
 ) -> Result<Response> {
     let (served, scope) = scope(&state, &uri);
-    let body = request_body(served, &params, &body)?;
+    let (body, warnings) = request_body(served, &params, &body)?;
     let out = endpoints::update_resource(
         &state,
         &scope,
@@ -235,7 +257,7 @@ pub async fn update(
         &body,
     )
     .await?;
-    response(served, out).await
+    Ok(with_warnings(response(served, out).await?, &warnings))
 }
 
 /// PATCH. The patch is applied to the object in the version it was written
