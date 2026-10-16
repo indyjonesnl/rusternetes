@@ -13,10 +13,15 @@ mod event_bus;
 pub mod event_recorder;
 pub mod memory;
 pub mod metadata;
+pub mod preconditions;
+#[cfg(test)]
+mod preconditions_suite;
 #[cfg(any(feature = "sqlite", feature = "redis"))]
 pub mod rhino;
 pub mod size_estimator;
 pub mod workqueue;
+
+pub use preconditions::Preconditions;
 
 // Re-export MemoryStorage for convenient testing
 pub use memory::MemoryStorage;
@@ -272,6 +277,30 @@ pub trait Storage: Send + Sync {
 
     /// Delete a resource
     async fn delete(&self, key: &str) -> Result<()>;
+
+    /// Delete a resource only if it still satisfies `preconditions`
+    /// (`metav1.DeleteOptions{Preconditions: {UID, ResourceVersion}}`), failing
+    /// with `Error::Conflict` otherwise.
+    ///
+    /// Upstream: `storage.Interface.Delete(ctx, key, out, preconditions, ...)`
+    /// implemented by `etcd3 store.conditionalDelete`
+    /// (`staging/src/k8s.io/apiserver/pkg/storage/etcd3/store.go:361-453`): read
+    /// the object, `preconditions.Check`, then delete under a
+    /// `ModRevision == read-revision` guard (`OptimisticDelete`); when the guard
+    /// loses to a writer, re-read and re-check -- so a UID/RV that changed in
+    /// between is caught instead of deleted. Memory/etcd/rhino override this
+    /// with that atomic loop; `ApiStorage` sends the preconditions in the
+    /// DELETE body. The default here (get + check + delete) is NOT atomic and
+    /// exists only so wrapper/test-double stores keep compiling.
+    async fn delete_with_preconditions(
+        &self,
+        key: &str,
+        preconditions: &Preconditions,
+    ) -> Result<()> {
+        let obj: serde_json::Value = self.get(key).await?;
+        preconditions.check(key, &obj)?;
+        self.delete(key).await
+    }
 
     /// Delete a resource the way a CLIENT would: hand the deletion to the
     /// server and let it apply its own semantics — for pods, graceful
@@ -1008,6 +1037,14 @@ impl<S: Storage> Storage for std::sync::Arc<S> {
         (**self).delete(key).await
     }
 
+    async fn delete_with_preconditions(
+        &self,
+        key: &str,
+        preconditions: &Preconditions,
+    ) -> Result<()> {
+        (**self).delete_with_preconditions(key, preconditions).await
+    }
+
     async fn delete_gracefully(&self, key: &str) -> Result<()> {
         (**self).delete_gracefully(key).await
     }
@@ -1571,6 +1608,33 @@ impl Storage for StorageBackend {
             StorageBackend::Memory(s) => Storage::delete(s.as_ref(), key).await,
             #[cfg(feature = "api-client")]
             StorageBackend::Api(s) => Storage::delete(s, key).await,
+        }
+    }
+
+    async fn delete_with_preconditions(
+        &self,
+        key: &str,
+        preconditions: &Preconditions,
+    ) -> Result<()> {
+        match self {
+            StorageBackend::Etcd(s) => {
+                Storage::delete_with_preconditions(s, key, preconditions).await
+            }
+            #[cfg(feature = "sqlite")]
+            StorageBackend::Sqlite(s) => {
+                Storage::delete_with_preconditions(s, key, preconditions).await
+            }
+            #[cfg(feature = "redis")]
+            StorageBackend::Redis(s) => {
+                Storage::delete_with_preconditions(s, key, preconditions).await
+            }
+            StorageBackend::Memory(s) => {
+                Storage::delete_with_preconditions(s.as_ref(), key, preconditions).await
+            }
+            #[cfg(feature = "api-client")]
+            StorageBackend::Api(s) => {
+                Storage::delete_with_preconditions(s, key, preconditions).await
+            }
         }
     }
 

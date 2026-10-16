@@ -593,6 +593,57 @@ impl Storage for EtcdStorage {
         )))
     }
 
+    /// `etcd3 store.conditionalDelete` (`etcd3/store.go:361-453`): read the
+    /// object, `preconditions.Check` it, then `OptimisticDelete` under a
+    /// `ModRevision == <revision read>` guard; if a writer moved the revision
+    /// the guard fails, so re-read and re-check (a UID/RV that changed in
+    /// between is then a precondition failure, never a delete).
+    async fn delete_with_preconditions(
+        &self,
+        key: &str,
+        preconditions: &crate::Preconditions,
+    ) -> Result<()> {
+        let mut client = self.client.clone();
+        for _ in 0..GUARANTEED_UPDATE_ATTEMPTS {
+            let resp = client
+                .get(key, None)
+                .await
+                .map_err(|e| Error::Storage(format!("Failed to read resource: {}", e)))?;
+            let kv = resp
+                .kvs()
+                .first()
+                .ok_or_else(|| Error::NotFound(key.to_string()))?;
+            let expected = kv.mod_revision();
+            let json = kv
+                .value_str()
+                .map_err(|e| Error::Storage(format!("Invalid UTF-8 in value: {}", e)))?;
+            let obj: serde_json::Value =
+                serde_json::from_str(&Self::inject_resource_version(json, expected))
+                    .map_err(Error::Serialization)?;
+            preconditions.check(key, &obj)?;
+
+            let txn = etcd_client::Txn::new()
+                .when(vec![Compare::mod_revision(key, CompareOp::Equal, expected)])
+                .and_then(vec![TxnOp::delete(key, None)])
+                .or_else(vec![TxnOp::get(key, None)]);
+            let resp = client
+                .txn(txn)
+                .await
+                .map_err(|e| Error::Storage(format!("Failed to delete resource: {}", e)))?;
+            if resp.succeeded() {
+                debug!("Deleted resource at key: {} (preconditions held)", key);
+                let rev = resp.header().map(|h| h.revision()).unwrap_or(0);
+                self.sizes.delete_key(key, rev);
+                return Ok(());
+            }
+        }
+
+        Err(Error::Conflict(format!(
+            "failed to delete {} after {} attempts: concurrent writers keep moving the revision",
+            key, GUARANTEED_UPDATE_ATTEMPTS
+        )))
+    }
+
     async fn list<T>(&self, prefix: &str) -> Result<Vec<T>>
     where
         T: Serialize + DeserializeOwned + Send + Sync,
@@ -1123,7 +1174,8 @@ mod tests {
     ///
     /// Returns `None` when Docker isn't reachable so callers can soft-skip
     /// rather than fail the whole nextest job on Docker-less runners.
-    async fn start_etcd() -> Option<(testcontainers::ContainerAsync<GenericImage>, EtcdStorage)> {
+    pub(super) async fn start_etcd(
+    ) -> Option<(testcontainers::ContainerAsync<GenericImage>, EtcdStorage)> {
         // `quay.io/coreos/etcd` listens on 2379 for client gRPC and prints
         // "ready to serve client requests" once the listener is up. We bind
         // 0.0.0.0 so the port mapping works from the host network.
@@ -1254,5 +1306,19 @@ mod tests {
 
         floor.fetch_max(900, Ordering::Relaxed);
         assert_eq!(floor.load(Ordering::Relaxed), 900);
+    }
+}
+
+#[cfg(test)]
+mod preconditions_tests {
+    use super::tests::start_etcd;
+    use std::sync::Arc;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delete_with_preconditions_suite() {
+        let Some((_etcd, storage)) = start_etcd().await else {
+            return;
+        };
+        crate::preconditions_suite::run_all(Arc::new(storage)).await;
     }
 }

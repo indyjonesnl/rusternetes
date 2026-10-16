@@ -37,6 +37,10 @@ pub struct RhinoStorage<B: Backend> {
     sizes: Arc<crate::size_estimator::SizeEstimator>,
 }
 
+/// Bound on guard-miss retries in `delete_with_preconditions`
+/// (mirrors `etcd::GUARANTEED_UPDATE_ATTEMPTS`).
+const DELETE_PRECONDITION_ATTEMPTS: usize = 5;
+
 #[cfg(feature = "sqlite")]
 impl RhinoStorage<SqliteBackend> {
     /// Create a new RhinoStorage with the given SQLite database path.
@@ -161,6 +165,58 @@ impl<B: Backend> RhinoStorage<B> {
             });
         }
         self.bus = Some(bus);
+    }
+
+    /// Delete `key` iff its `mod_revision == expected_rev` (0 = any). `None`
+    /// on success; `Some(current kv)` when the guard lost to a writer.
+    async fn delete_at(
+        &self,
+        key: &str,
+        expected_rev: i64,
+    ) -> Result<Option<rhino::backend::KeyValue>> {
+        let (del_rev, prev_kv, succeeded) = retry_busy(RetryPolicy::default(), || {
+            self.backend.delete(key, expected_rev)
+        })
+        .await
+        .map_err(|e| map_backend_error(key, "delete", "delete resource", &e))?;
+
+        if !succeeded && expected_rev != 0 {
+            if let Some(kv) = prev_kv.clone() {
+                return Ok(Some(kv));
+            }
+        }
+
+        // kine's `Delete` reports a key that never existed as
+        // `(rev, nil, true)` and one already deleted as `(rev, nil, false)`
+        // (`pkg/logstructured/logstructured.go`). Both are NotFound upstream:
+        // `conditionalDelete` reads the key via `getState(..., ignoreNotFound:
+        // false)`, which returns `storage.NewKeyNotFoundError(key, 0)` when the
+        // kv is nil (`staging/src/k8s.io/apiserver/pkg/storage/etcd3/store.go`).
+        // A successful delete always carries the prior kv, so a missing one
+        // means there was nothing to delete (#2041).
+        if !succeeded || prev_kv.is_none() {
+            return Err(Error::NotFound(key.to_string()));
+        }
+
+        debug!("Deleted resource at key: {}", key);
+        self.sizes.delete_key(key, del_rev);
+        // Guarded so the prev-value reconstruction (utf8 + RV inject) is skipped
+        // entirely when no bus is attached — keep the guard, don't simplify to a
+        // bare `self.publish(...)` which would do that work unconditionally.
+        if self.bus.is_some() {
+            let prev_value = prev_kv
+                .as_ref()
+                .map(|kv| {
+                    let raw = String::from_utf8_lossy(&kv.value).to_string();
+                    // Stamp the DELETE's revision, not the object's last
+                    // write (etcd3/watcher.go parseEvent stamps `e.rev`), so
+                    // a watch snapshot can dedupe DELETED by rv (#2223).
+                    Self::inject_resource_version(&raw, del_rev)
+                })
+                .unwrap_or_default();
+            self.publish(WatchEvent::Deleted(key.to_string(), prev_value));
+        }
+        Ok(None)
     }
 
     /// Publish a watch event to the bus when one is attached; no-op otherwise.
@@ -418,42 +474,49 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        let (del_rev, prev_kv, succeeded) =
-            retry_busy(RetryPolicy::default(), || self.backend.delete(key, 0))
-                .await
-                .map_err(|e| map_backend_error(key, "delete", "delete resource", &e))?;
-
-        // kine's `Delete` reports a key that never existed as
-        // `(rev, nil, true)` and one already deleted as `(rev, nil, false)`
-        // (`pkg/logstructured/logstructured.go`). Both are NotFound upstream:
-        // `conditionalDelete` reads the key via `getState(..., ignoreNotFound:
-        // false)`, which returns `storage.NewKeyNotFoundError(key, 0)` when the
-        // kv is nil (`staging/src/k8s.io/apiserver/pkg/storage/etcd3/store.go`).
-        // A successful delete always carries the prior kv, so a missing one
-        // means there was nothing to delete (#2041).
-        if !succeeded || prev_kv.is_none() {
-            return Err(Error::NotFound(key.to_string()));
+        match self.delete_at(key, 0).await? {
+            None => Ok(()),
+            // Revision 0 is unconditional, so the backend never reports a
+            // moved key; keep the arm total rather than unreachable.
+            Some(_) => Err(Error::Conflict(
+                "resource was modified concurrently".to_string(),
+            )),
         }
+    }
 
-        debug!("Deleted resource at key: {}", key);
-        self.sizes.delete_key(key, del_rev);
-        // Guarded so the prev-value reconstruction (utf8 + RV inject) is skipped
-        // entirely when no bus is attached — keep the guard, don't simplify to a
-        // bare `self.publish(...)` which would do that work unconditionally.
-        if self.bus.is_some() {
-            let prev_value = prev_kv
-                .as_ref()
-                .map(|kv| {
-                    let raw = String::from_utf8_lossy(&kv.value).to_string();
-                    // Stamp the DELETE's revision, not the object's last
-                    // write (etcd3/watcher.go parseEvent stamps `e.rev`), so
-                    // a watch snapshot can dedupe DELETED by rv (#2223).
-                    Self::inject_resource_version(&raw, del_rev)
-                })
-                .unwrap_or_default();
-            self.publish(WatchEvent::Deleted(key.to_string(), prev_value));
+    /// `etcd3 store.conditionalDelete` (`etcd3/store.go:361-453`): read the
+    /// object, `preconditions.Check` it, then delete under a
+    /// `mod_revision == <revision read>` guard (`OptimisticDelete`). The kine
+    /// `Delete(key, revision)` reports a guard miss as `(rev, Some(current),
+    /// false)`; re-check the preconditions against that current object and
+    /// retry, as upstream does with `txnResp.KV`.
+    async fn delete_with_preconditions(
+        &self,
+        key: &str,
+        preconditions: &crate::Preconditions,
+    ) -> Result<()> {
+        let (_rev, kv) = retry_busy(RetryPolicy::default(), || {
+            self.backend.get(key, "", 1, 0, false)
+        })
+        .await
+        .map_err(|e| map_backend_error(key, "get", "get resource", &e))?;
+        let mut current = kv.ok_or_else(|| Error::NotFound(key.to_string()))?;
+        for _ in 0..DELETE_PRECONDITION_ATTEMPTS {
+            let json = String::from_utf8(current.value.clone())
+                .map_err(|e| Error::Storage(format!("Invalid UTF-8 in value: {}", e)))?;
+            let obj: serde_json::Value =
+                serde_json::from_str(&Self::inject_resource_version(&json, current.mod_revision))
+                    .map_err(Error::Serialization)?;
+            preconditions.check(key, &obj)?;
+            match self.delete_at(key, current.mod_revision).await? {
+                None => return Ok(()),
+                Some(moved) => current = moved,
+            }
         }
-        Ok(())
+        Err(Error::Conflict(format!(
+            "failed to delete {} after {} attempts: concurrent writers keep moving the revision",
+            key, DELETE_PRECONDITION_ATTEMPTS
+        )))
     }
 
     async fn list<T>(&self, prefix: &str) -> Result<Vec<T>>
@@ -1022,5 +1085,18 @@ mod stats_tests {
         // delete must have evicted its cached size.
         let st = Storage::stats(&s, "/registry/pods/").await.unwrap();
         assert_eq!(st.estimated_average_object_size_bytes, 0);
+    }
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod preconditions_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delete_with_preconditions_suite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.db");
+        let store = RhinoStorage::new(path.to_str().unwrap()).await.unwrap();
+        crate::preconditions_suite::run_all(Arc::new(store)).await;
     }
 }
