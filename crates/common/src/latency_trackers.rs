@@ -3,8 +3,14 @@
 //! `request_sli_duration_seconds` / `request_slo_duration_seconds` metrics
 //! subtract (`MonitorRequest`, `endpoints/metrics/metrics.go:619-624`).
 //!
-//! Includes authorization latency (max), which is retained per request and
-//! is not subtracted by MonitorRequest from the SLI latency.
+//! All ten `LatencyTrackers` fields exist. The mutating/validating webhook and
+//! APF queue-wait trackers feed `MonitorRequest`; authentication feeds the
+//! `WithAuthentication` filter; every non-zero tracker feeds
+//! `AuditAnnotationsFromLatencyTrackers`. Storage, transform, serialization,
+//! response-write and decode are declared with their `Track*` helpers but their
+//! call sites are not wired yet (tracked as follow-ups). Authorization is
+//! retained per request (max) and is not subtracted by `MonitorRequest` from
+//! the SLI latency.
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -72,8 +78,20 @@ pub struct LatencyTrackers {
     pub validating_webhook: DurationTracker,
     /// Priority & fairness queue wait: max.
     pub apf_queue_wait: DurationTracker,
-    /// Authorization uses max, not sum (webhook_duration.go:122-123,189).
+    /// Authentication: summed (:99).
+    pub authentication: DurationTracker,
+    /// Authorization: max (:100).
     pub authorization: DurationTracker,
+    /// Storage round trips: summed (:102).
+    pub storage: DurationTracker,
+    /// Response transformation: summed (:103).
+    pub transform: DurationTracker,
+    /// Response serialization: summed (:104).
+    pub serialization: DurationTracker,
+    /// Writes to the response writer: summed (:105).
+    pub response_write: DurationTracker,
+    /// Decode of storage objects: summed (:106).
+    pub decode: DurationTracker,
 }
 
 impl LatencyTrackers {
@@ -83,7 +101,13 @@ impl LatencyTrackers {
             mutating_webhook: DurationTracker::sum(),
             validating_webhook: DurationTracker::max(),
             apf_queue_wait: DurationTracker::max(),
+            authentication: DurationTracker::sum(),
             authorization: DurationTracker::max(),
+            storage: DurationTracker::sum(),
+            transform: DurationTracker::sum(),
+            serialization: DurationTracker::sum(),
+            response_write: DurationTracker::sum(),
+            decode: DurationTracker::sum(),
         }
     }
 
@@ -124,12 +148,100 @@ pub fn track_apf_queue_wait_latency(d: Duration) {
     }
 }
 
-/// TrackAuthorizationLatency (webhook_duration.go:262-268): no-op without
-/// trackers in context, otherwise keep the maximum authorization duration.
-pub fn track_authorization_latency(duration: Duration) {
-    if let Some(trackers) = latency_trackers_from_context() {
-        trackers.authorization.track_duration(duration);
+fn track(f: impl FnOnce(&LatencyTrackers)) {
+    if let Some(t) = latency_trackers_from_context() {
+        f(&t);
     }
+}
+
+/// `TrackStorageLatency` (webhook_duration.go:239-243).
+pub fn track_storage_latency(d: Duration) {
+    track(|t| t.storage.track_duration(d));
+}
+
+/// `TrackResponseWriteLatency`.
+pub fn track_response_write_latency(d: Duration) {
+    track(|t| t.response_write.track_duration(d));
+}
+
+/// `TrackAuthenticationLatency`.
+pub fn track_authentication_latency(d: Duration) {
+    track(|t| t.authentication.track_duration(d));
+}
+
+/// `TrackAuthorizationLatency`.
+pub fn track_authorization_latency(d: Duration) {
+    track(|t| t.authorization.track_duration(d));
+}
+
+/// `TrackDecodeLatency`.
+pub fn track_decode_latency(d: Duration) {
+    track(|t| t.decode.track_duration(d));
+}
+
+/// `TrackTransformResponseObjectLatency`: time `f` when trackers are
+/// installed, else just run it.
+pub async fn track_transform_response_object_latency<F: Future>(f: F) -> F::Output {
+    match latency_trackers_from_context() {
+        Some(t) => t.transform.track(f).await,
+        None => f.await,
+    }
+}
+
+/// `TrackSerializeResponseObjectLatency`.
+pub async fn track_serialize_response_object_latency<F: Future>(f: F) -> F::Output {
+    match latency_trackers_from_context() {
+        Some(t) => t.serialization.track(f).await,
+        None => f.await,
+    }
+}
+
+/// `AuditAnnotationsFromLatencyTrackers`: one annotation per non-zero
+/// tracker, valued with Go's `Duration.String`. `None` when the request
+/// carries no trackers (`!ok` -> nil).
+pub fn audit_annotations_from_latency_trackers() -> Option<Vec<(String, String)>> {
+    let t = latency_trackers_from_context()?;
+    Some(annotations_from(&t))
+}
+
+/// The map-building half of `AuditAnnotationsFromLatencyTrackers`.
+pub fn annotations_from(t: &LatencyTrackers) -> Vec<(String, String)> {
+    let table: [(&str, &DurationTracker); 10] = [
+        (
+            "apiserver.latency.k8s.io/transform-response-object",
+            &t.transform,
+        ),
+        ("apiserver.latency.k8s.io/etcd", &t.storage),
+        (
+            "apiserver.latency.k8s.io/serialize-response-object",
+            &t.serialization,
+        ),
+        ("apiserver.latency.k8s.io/response-write", &t.response_write),
+        (
+            "apiserver.latency.k8s.io/mutating-webhook",
+            &t.mutating_webhook,
+        ),
+        (
+            "apiserver.latency.k8s.io/validating-webhook",
+            &t.validating_webhook,
+        ),
+        ("apiserver.latency.k8s.io/decode-response-object", &t.decode),
+        ("apiserver.latency.k8s.io/apf-queue-wait", &t.apf_queue_wait),
+        ("apiserver.latency.k8s.io/authentication", &t.authentication),
+        ("apiserver.latency.k8s.io/authorization", &t.authorization),
+    ];
+    table
+        .into_iter()
+        .filter_map(|(k, tr)| {
+            let l = tr.get_latency();
+            (!l.is_zero()).then(|| {
+                (
+                    k.to_string(),
+                    crate::go_duration::format_go_duration(l.as_nanos() as i64),
+                )
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -184,5 +296,61 @@ mod tests {
             .track(tokio::time::sleep(Duration::from_millis(30)))
             .await;
         assert!(t.mutating_webhook.get_latency() >= Duration::from_millis(50));
+    }
+
+    /// `TestLatencyTrackersFrom` extended to the remaining trackers plus the
+    /// annotation map (webhook_duration.go:289-345): zero trackers are
+    /// omitted, sum/max aggregation per tracker, Go duration formatting.
+    #[test]
+    fn audit_annotations_cover_every_tracker() {
+        let t = LatencyTrackers::new();
+        assert!(annotations_from(&t).is_empty());
+        for d in [Duration::from_millis(100), Duration::from_millis(250)] {
+            t.authentication.track_duration(d);
+            t.authorization.track_duration(d);
+            t.storage.track_duration(d);
+            t.transform.track_duration(d);
+            t.serialization.track_duration(d);
+            t.response_write.track_duration(d);
+            t.decode.track_duration(d);
+        }
+        let m: std::collections::BTreeMap<_, _> = annotations_from(&t).into_iter().collect();
+        assert_eq!(m.len(), 7);
+        assert_eq!(m["apiserver.latency.k8s.io/authentication"], "350ms");
+        assert_eq!(m["apiserver.latency.k8s.io/authorization"], "250ms");
+        assert_eq!(m["apiserver.latency.k8s.io/etcd"], "350ms");
+        assert_eq!(
+            m["apiserver.latency.k8s.io/transform-response-object"],
+            "350ms"
+        );
+        assert_eq!(
+            m["apiserver.latency.k8s.io/serialize-response-object"],
+            "350ms"
+        );
+        assert_eq!(m["apiserver.latency.k8s.io/response-write"], "350ms");
+        assert_eq!(
+            m["apiserver.latency.k8s.io/decode-response-object"],
+            "350ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn annotations_none_without_trackers_and_helpers_route() {
+        assert!(audit_annotations_from_latency_trackers().is_none());
+        let t = Arc::new(LatencyTrackers::new());
+        with_latency_trackers(t.clone(), async {
+            track_authentication_latency(Duration::from_millis(1));
+            track_storage_latency(Duration::from_millis(2));
+            track_decode_latency(Duration::from_millis(3));
+            track_response_write_latency(Duration::from_millis(4));
+            track_authorization_latency(Duration::from_millis(5));
+            track_serialize_response_object_latency(tokio::time::sleep(Duration::from_millis(5)))
+                .await;
+            track_transform_response_object_latency(async {}).await;
+            assert!(audit_annotations_from_latency_trackers().unwrap().len() >= 6);
+        })
+        .await;
+        assert_eq!(t.storage.get_latency(), Duration::from_millis(2));
+        assert!(t.serialization.get_latency() >= Duration::from_millis(5));
     }
 }
