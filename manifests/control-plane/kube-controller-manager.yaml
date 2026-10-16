@@ -55,10 +55,15 @@ spec:
     # with the allocator flags when ALLOCATE_NODE_CIDRS is set in its environment
     # (the Calico stack does this — see compose.calico.yml), and otherwise
     # strips it. Off by default, so conformance/sqlite/etcd stacks are unchanged.
-    # @CSI_ATTACH_ARGS@ works the same way for CSI_ATTACHERS (comma-separated
-    # DRIVER=SOCKET -> one --csi-attacher each) and ATTACH_DETACH_CONTROLLER=1
-    # (--attach-detach-controller); both off by default (#3128). The driver
-    # sockets must be reachable from the pod (add a hostPath volume).
+    # The CSI_ATTACH_ARGS token works the same way for CSI_ATTACHERS
+    # (comma-separated DRIVER=SOCKET -> one --csi-attacher each) and
+    # ATTACH_DETACH_CONTROLLER=1 (--attach-detach-controller); both off by
+    # default (#3128). Each driver socket's directory becomes a hostPath volume
+    # + mount through the CSI_SOCKET_VOLUMES / CSI_SOCKET_MOUNTS tokens (#3133;
+    # kubeadm's flexvolume-dir mount,
+    # cmd/kubeadm/app/phases/controlplane/volumes.go:73-79). As with
+    # CERTS_PATH, the directory must exist at the same path on the host and in
+    # the node-1 kubelet container.
     args:
     - "--api-server-url"
     - "https://api-server:6443"
@@ -72,8 +77,10 @@ spec:
     - name: certs
       mountPath: "@CERTS_PATH@"
       readOnly: true
+@CSI_SOCKET_MOUNTS@
   volumes:
   - name: certs
     hostPath:
       path: "@CERTS_PATH@"
       type: Directory
+@CSI_SOCKET_VOLUMES@

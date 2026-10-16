@@ -78,6 +78,8 @@ on:
       # a conformance run that produces no junit at all.
       - 'scripts/tests/test-per-node-netns-compose.sh'
       - 'scripts/tests/test-node-ipam-autodetect.sh'
+      - 'scripts/tests/test-csi-attacher-socket-mounts.sh'
+      - 'manifests/control-plane/kube-controller-manager.yaml'
       - 'scripts/bootstrap-cluster.sh'
       - 'ci/actions/bring-up-cluster/action.yml'
       - 'compose.ghcr.yml'
@@ -144,6 +146,10 @@ jobs:
         run: bash scripts/tests/test-per-node-netns-compose.sh
       - name: Node-IPAM auto-detection test
         run: bash scripts/tests/test-node-ipam-autodetect.sh
+      # #3133: CSI_ATTACHERS sockets are hostPath-mounted into the
+      # controller-manager static pod.
+      - name: CSI attacher socket-mount test
+        run: bash scripts/tests/test-csi-attacher-socket-mounts.sh
       # The vanilla-swap harness's own TDD suites — pure logic, no kind, but they
       # were wired into no workflow, so the badge-counting bug they now cover
       # reached a published badge (100% (9/9) for a 2-spec run).

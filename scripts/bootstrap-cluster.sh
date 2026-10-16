@@ -175,6 +175,77 @@ node_ipam_cluster_cidr() {
     printf '%s' "$cidr"
 }
 
+# CSI external-attacher(s) + AttachDetachController for the controller-manager
+# (#3128): CSI_ATTACHERS="drv1=/sock1,drv2=unix:///sock2" -> one --csi-attacher
+# each; ATTACH_DETACH_CONTROLLER=1 -> --attach-detach-controller. Both off by
+# default.
+#
+# The controller-manager dials each driver socket from inside its static pod,
+# so the socket's directory has to be a hostPath volume of that pod (#3133).
+# Ported from how kubeadm makes a host plugin-socket dir reachable to the
+# kube-controller-manager: the flexvolume dir is mounted read-write as a
+# DirectoryOrCreate hostPath, "as it is used for third-party plugins to
+# integrate with their storage backends via unix domain socket"
+# (cmd/kubeadm/app/phases/controlplane/volumes.go:73-79). The in-process CSI
+# attacher itself is Rusternetes-only (upstream's controller-manager has no
+# CSI socket; the external-attacher sidecar does); the mount follows kubeadm.
+#
+# csi_socket_dirs prints the unique parent directories of the CSI_ATTACHERS
+# sockets, one per line. The unix:// / unix: scheme is stripped the way the
+# client does (crates/csi/src/lib.rs normalize_endpoint).
+csi_socket_dirs() {
+    [ -n "${CSI_ATTACHERS:-}" ] || return 0
+    local -a specs
+    local spec sock
+    IFS=',' read -r -a specs <<< "$CSI_ATTACHERS"
+    for spec in "${specs[@]}"; do
+        sock="${spec#*=}"
+        case "$sock" in
+            unix://*) sock="${sock#unix://}" ;;
+            unix:*) sock="${sock#unix:}" ;;
+        esac
+        dirname -- "$sock"
+    done | awk '!seen[$0]++'
+}
+
+# template_csi_attach <manifest> expands the controller-manager manifest's
+# @CSI_ATTACH_ARGS@, @CSI_SOCKET_MOUNTS@ and @CSI_SOCKET_VOLUMES@ placeholder
+# lines (one hostPath volume + mount per csi_socket_dirs entry), or deletes them
+# when CSI attach is off. Manifests without the placeholders are untouched.
+template_csi_attach() {
+    local dst="$1" args='' mounts='' volumes='' spec dir i=0
+    local -a specs
+    if [ -n "${CSI_ATTACHERS:-}" ]; then
+        IFS=',' read -r -a specs <<< "$CSI_ATTACHERS"
+        for spec in "${specs[@]}"; do
+            args+='    - "--csi-attacher"\n    - "'"${spec}"'"\n'
+        done
+    fi
+    if [ "${ATTACH_DETACH_CONTROLLER:-}" = "1" ]; then
+        args+='    - "--attach-detach-controller"\n'
+    fi
+    while IFS= read -r dir; do
+        [ -n "$dir" ] || continue
+        mounts+='    - name: csi-socket-'"${i}"'\n      mountPath: "'"${dir}"'"\n'
+        volumes+='  - name: csi-socket-'"${i}"'\n    hostPath:\n      path: "'"${dir}"'"\n      type: DirectoryOrCreate\n'
+        i=$((i + 1))
+    done < <(csi_socket_dirs)
+    local placeholder value
+    for placeholder in CSI_ATTACH_ARGS CSI_SOCKET_MOUNTS CSI_SOCKET_VOLUMES; do
+        case "$placeholder" in
+            CSI_ATTACH_ARGS) value="$args" ;;
+            CSI_SOCKET_MOUNTS) value="$mounts" ;;
+            CSI_SOCKET_VOLUMES) value="$volumes" ;;
+        esac
+        value="${value%\\n}"
+        if [ -n "$value" ]; then
+            sed -i "s|^@${placeholder}@\$|${value}|" "$dst"
+        else
+            sed -i "/^@${placeholder}@\$/d" "$dst"
+        fi
+    done
+}
+
 import_image_into_containerd() {
     local image="$1"
     local runtimes
@@ -308,20 +379,6 @@ if [ -d "$PROJECT_ROOT/manifests/control-plane" ]; then
     else
         node_ipam_args=''
     fi
-    # CSI external-attacher(s) + AttachDetachController for the controller-manager
-    # (#3128): CSI_ATTACHERS="drv1=/sock1,drv2=/sock2" -> one --csi-attacher each;
-    # ATTACH_DETACH_CONTROLLER=1 -> --attach-detach-controller. Both off by default.
-    csi_attach_args=''
-    if [ -n "${CSI_ATTACHERS:-}" ]; then
-        IFS=',' read -r -a _csi_specs <<< "$CSI_ATTACHERS"
-        for _spec in "${_csi_specs[@]}"; do
-            csi_attach_args+='    - "--csi-attacher"\n    - "'"${_spec}"'"\n'
-        done
-    fi
-    if [ "${ATTACH_DETACH_CONTROLLER:-}" = "1" ]; then
-        csi_attach_args+='    - "--attach-detach-controller"\n'
-    fi
-    csi_attach_args="${csi_attach_args%\\n}"
     for src in "$PROJECT_ROOT/manifests/control-plane/"*.yaml; do
         [ -e "$src" ] || continue
         dst="$PROJECT_ROOT/.rusternetes/manifests/$(basename "$src")"
@@ -338,11 +395,8 @@ if [ -d "$PROJECT_ROOT/manifests/control-plane" ]; then
         else
             sed -i '/@NODE_IPAM_ARGS@/d' "$dst"
         fi
-        if [ -n "$csi_attach_args" ]; then
-            sed -i "s|@CSI_ATTACH_ARGS@|${csi_attach_args}|" "$dst"
-        else
-            sed -i '/@CSI_ATTACH_ARGS@/d' "$dst"
-        fi
+        # CSI attach flags + driver-socket hostPath mounts (#3128, #3133).
+        template_csi_attach "$dst"
         echo "  $(basename "$src") -> $dst (image: $cp_image)"
         # Local build path: the image only exists in the docker/podman daemon —
         # import it into the containerd CRI store so IfNotPresent resolves it.
