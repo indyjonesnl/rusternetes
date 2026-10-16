@@ -49,6 +49,7 @@ pub mod pod_options;
 pub mod pod_status;
 pub mod pod_subresource;
 pub mod podcertificaterequest;
+pub mod storageversionmigration;
 pub mod podtemplate;
 pub mod priorityclass;
 pub mod prioritylevelconfiguration;
