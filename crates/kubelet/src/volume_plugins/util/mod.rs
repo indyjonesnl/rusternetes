@@ -18,6 +18,7 @@ pub mod node_expander;
 pub mod operation_executor;
 pub mod operation_generator;
 pub mod resize_util;
+pub mod resizefs;
 pub mod selinux;
 pub mod types;
 #[cfg(test)]
