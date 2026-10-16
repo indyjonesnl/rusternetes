@@ -1821,4 +1821,24 @@ rules:
         .expect("a SecretList must be recorded as responseObject");
         assert_eq!(obj["kind"], "SecretList");
     }
+
+    #[tokio::test]
+    async fn pod_list_is_audited_at_request_response() {
+        use axum::extract::{Path, State};
+        let state = list_state();
+        let obj = list_handler_response_object(get(move || async move {
+            crate::handlers::pod::list(
+                State(state),
+                anon(),
+                Path("ns".to_string()),
+                axum::http::HeaderMap::new(),
+                axum::extract::Query(Default::default()),
+            )
+            .await
+            .unwrap()
+        }))
+        .await
+        .expect("a PodList must be recorded as responseObject");
+        assert_eq!(obj["kind"], "PodList");
+    }
 }

@@ -157,7 +157,11 @@ pub async fn create_token_review(
     crate::audit::add_audit_annotations(&observations.audit_annotations);
     let mut headers = axum::http::HeaderMap::new();
     observations.append_warning_headers(&mut headers);
-    Ok((axum::http::StatusCode::CREATED, headers, Json(token_review)))
+    Ok((
+        axum::http::StatusCode::CREATED,
+        headers,
+        crate::audit::json_response(token_review),
+    ))
 }
 
 /// Create a TokenRequest (authentication.k8s.io/v1)
@@ -404,7 +408,10 @@ pub async fn create_token_request(
     // Upstream's generic create handler answers 201:
     // staging/src/k8s.io/apiserver/pkg/endpoints/handlers/create.go:227
     //   code := http.StatusCreated
-    Ok((axum::http::StatusCode::CREATED, Json(token_request)))
+    Ok((
+        axum::http::StatusCode::CREATED,
+        crate::audit::json_response(token_request),
+    ))
 }
 
 /// Create a SelfSubjectReview (authentication.k8s.io/v1)
@@ -434,7 +441,10 @@ pub async fn create_self_subject_review(
         }),
     });
 
-    Ok((axum::http::StatusCode::CREATED, Json(self_subject_review)))
+    Ok((
+        axum::http::StatusCode::CREATED,
+        crate::audit::json_response(self_subject_review),
+    ))
 }
 
 #[cfg(test)]
