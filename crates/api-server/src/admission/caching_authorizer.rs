@@ -16,7 +16,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use rusternetes_common::auth::UserInfo;
-use rusternetes_common::authz::{Authorizer, Decision, Opinion, RequestAttributes};
+use rusternetes_common::authz::{
+    AuthorizationOutcome, Authorizer, Decision, Opinion, RequestAttributes,
+};
 use rusternetes_common::resources::{NonResourceRule, ResourceRule};
 use rusternetes_common::{Error, Result};
 
@@ -26,16 +28,14 @@ type Cached<T> = std::result::Result<T, String>;
 /// use, intended for one request in the admission chain.
 pub struct CachingAuthorizer {
     authorizer: Arc<dyn Authorizer>,
-    decisions: Mutex<HashMap<String, Cached<Decision>>>,
-    opinions: Mutex<HashMap<String, Cached<Opinion>>>,
+    outcomes: Mutex<HashMap<String, Cached<AuthorizationOutcome>>>,
 }
 
 /// `NewCachingAuthorizer`.
 pub fn new_caching_authorizer(inner: Arc<dyn Authorizer>) -> CachingAuthorizer {
     CachingAuthorizer {
         authorizer: inner,
-        decisions: Mutex::new(HashMap::new()),
-        opinions: Mutex::new(HashMap::new()),
+        outcomes: Mutex::new(HashMap::new()),
     }
 }
 
@@ -98,25 +98,21 @@ impl Authorizer for CachingAuthorizer {
     /// `cachingAuthorizer.Authorize`: not safe for concurrent use upstream;
     /// the lock is never held across the delegate call.
     async fn authorize(&self, attrs: &RequestAttributes) -> Result<Decision> {
-        let key = cache_key(attrs);
-        if let Some(cached) = self.decisions.lock().unwrap().get(&key) {
-            return replay(cached);
-        }
-        let result = self.authorizer.authorize(attrs).await;
-        self.decisions
-            .lock()
-            .unwrap()
-            .insert(key, remember(&result));
-        result
+        self.authorize_outcome(attrs).await?.into_decision()
     }
 
     async fn authorize_opinion(&self, attrs: &RequestAttributes) -> Result<Opinion> {
+        Ok(self.authorize_outcome(attrs).await?.into_opinion())
+    }
+
+    // caching_authorizer.go:31-39,142-147 caches the entire tuple once.
+    async fn authorize_outcome(&self, attrs: &RequestAttributes) -> Result<AuthorizationOutcome> {
         let key = cache_key(attrs);
-        if let Some(cached) = self.opinions.lock().unwrap().get(&key) {
+        if let Some(cached) = self.outcomes.lock().unwrap().get(&key) {
             return replay(cached);
         }
-        let result = self.authorizer.authorize_opinion(attrs).await;
-        self.opinions.lock().unwrap().insert(key, remember(&result));
+        let result = self.authorizer.authorize_outcome(attrs).await;
+        self.outcomes.lock().unwrap().insert(key, remember(&result));
         result
     }
 

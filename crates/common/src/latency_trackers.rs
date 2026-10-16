@@ -3,8 +3,8 @@
 //! `request_sli_duration_seconds` / `request_slo_duration_seconds` metrics
 //! subtract (`MonitorRequest`, `endpoints/metrics/metrics.go:619-624`).
 //!
-//! Only the trackers `MonitorRequest` reads are ported: the mutating and
-//! validating webhook trackers and the APF queue-wait tracker.
+//! Includes authorization latency (max), which is retained per request and
+//! is not subtracted by MonitorRequest from the SLI latency.
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -63,7 +63,7 @@ impl DurationTracker {
     }
 }
 
-/// The trackers `MonitorRequest` subtracts (webhook_duration.go:111-195).
+/// Per-request latency trackers (webhook_duration.go:111-195).
 #[derive(Debug)]
 pub struct LatencyTrackers {
     /// Mutating webhooks run sequentially: summed.
@@ -72,6 +72,8 @@ pub struct LatencyTrackers {
     pub validating_webhook: DurationTracker,
     /// Priority & fairness queue wait: max.
     pub apf_queue_wait: DurationTracker,
+    /// Authorization uses max, not sum (webhook_duration.go:122-123,189).
+    pub authorization: DurationTracker,
 }
 
 impl LatencyTrackers {
@@ -81,6 +83,7 @@ impl LatencyTrackers {
             mutating_webhook: DurationTracker::sum(),
             validating_webhook: DurationTracker::max(),
             apf_queue_wait: DurationTracker::max(),
+            authorization: DurationTracker::max(),
         }
     }
 
@@ -118,6 +121,14 @@ pub fn latency_trackers_from_context() -> Option<Arc<LatencyTrackers>> {
 pub fn track_apf_queue_wait_latency(d: Duration) {
     if let Some(t) = latency_trackers_from_context() {
         t.apf_queue_wait.track_duration(d);
+    }
+}
+
+/// TrackAuthorizationLatency (webhook_duration.go:262-268): no-op without
+/// trackers in context, otherwise keep the maximum authorization duration.
+pub fn track_authorization_latency(duration: Duration) {
+    if let Some(trackers) = latency_trackers_from_context() {
+        trackers.authorization.track_duration(duration);
     }
 }
 

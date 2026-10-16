@@ -27,7 +27,7 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 /// The attempt counters are process-global: serialize the tests that read them.
-static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(super) static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn user(name: &str) -> UserInfo {
     UserInfo {
@@ -62,6 +62,15 @@ impl Authorizer for Fake {
                 error: Some(e.clone()),
             },
             (o, _) => o.clone(),
+        })
+    }
+    async fn authorize_outcome(
+        &self,
+        attrs: &RequestAttributes,
+    ) -> Result<rusternetes_common::authz::AuthorizationOutcome> {
+        Ok(rusternetes_common::authz::AuthorizationOutcome {
+            opinion: self.authorize_opinion(attrs).await?,
+            error: self.error.clone(),
         })
     }
     async fn get_user_rules(
@@ -421,6 +430,34 @@ async fn allow_passes_through_and_annotates() {
     assert_eq!(
         a["authorization.k8s.io/reason"],
         "RBAC: allowed to patch pod"
+    );
+    assert_eq!(attempts("allowed"), before + 1);
+}
+
+// authorization.go:79-86 and metrics_test.go:218-228: allow wins even
+// with an evaluation error, retaining the authorizer's reason in audit.
+#[tokio::test]
+async fn allow_with_error_annotates_reason_and_records_allowed() {
+    let _g = LOCK.lock().await;
+    let h = harness(
+        Opinion::Allow("RBAC: allowed by partial rules".into()),
+        Some("can't parse other rules"),
+        true,
+    );
+    let before = attempts("allowed");
+    let resp = h
+        .app
+        .clone()
+        .oneshot(request(Method::GET, "/api/v1/namespaces/default/pods"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(h.handler_calls.load(Ordering::SeqCst), 1);
+    let a = annotations(&h).await;
+    assert_eq!(a["authorization.k8s.io/decision"], "allow");
+    assert_eq!(
+        a["authorization.k8s.io/reason"],
+        "RBAC: allowed by partial rules"
     );
     assert_eq!(attempts("allowed"), before + 1);
 }

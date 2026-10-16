@@ -18,6 +18,7 @@ mod apiservice_delete_finalizers_test;
 mod apiservices_routing_test;
 mod apps_update_spec_validation_test;
 mod auth_integration_test;
+mod authorization_allow_reason_test;
 mod authorization_config_test;
 mod authorization_filter_metrics_test;
 mod authorization_filter_test;

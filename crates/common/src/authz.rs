@@ -9,6 +9,9 @@ use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
 
+mod reasons;
+use reasons::{aggregate_errors, applicable_subject, describe_subject, quoted};
+
 /// Subject ↔ user matcher mirroring upstream
 /// `pkg/registry/rbac/validation/rule.go` `appliesTo`:
 ///   * `User`           — `subject.name == user.username`
@@ -234,7 +237,51 @@ pub enum Opinion {
     },
 }
 
-/// Authorizer trait for authorization implementations
+/// Upstream authorizer.Authorize returns decision, reason and error
+/// independently (authorizer/interfaces.go:80-85). Keep the existing Opinion API
+/// compatible while allowing a terminal decision to carry an evaluation error.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuthorizationOutcome {
+    pub opinion: Opinion,
+    pub error: Option<String>,
+}
+
+impl AuthorizationOutcome {
+    pub fn from_opinion(mut opinion: Opinion) -> Self {
+        let error = match &mut opinion {
+            Opinion::NoOpinion { error, .. } => error.take(),
+            _ => None,
+        };
+        Self { opinion, error }
+    }
+
+    /// Adapt to the legacy opinion API, which has no error slot for a terminal
+    /// decision. Consumers needing that error use authorize_outcome instead.
+    pub fn into_opinion(mut self) -> Opinion {
+        if let Opinion::NoOpinion { error, .. } = &mut self.opinion {
+            *error = self.error.or(error.take());
+        }
+        self.opinion
+    }
+
+    /// Legacy binary consumers still allow an affirmative decision before
+    /// considering its error (filters/authorization.go:79-87).
+    pub fn into_decision(self) -> Result<Decision> {
+        match self.opinion {
+            Opinion::Allow(_) => Ok(Decision::Allow),
+            Opinion::Deny(reason) => match self.error {
+                Some(error) => Err(crate::Error::Authorization(error)),
+                None => Ok(Decision::Deny(reason)),
+            },
+            Opinion::NoOpinion { reason, error } => match self.error.or(error) {
+                Some(error) => Err(crate::Error::Authorization(error)),
+                None => Ok(Decision::Deny(reason)),
+            },
+        }
+    }
+}
+
+/// Authorizer trait for authorization implementations.
 #[async_trait]
 pub trait Authorizer: Send + Sync {
     async fn authorize(&self, attrs: &RequestAttributes) -> Result<Decision>;
@@ -249,6 +296,14 @@ pub trait Authorizer: Send + Sync {
                 error: None,
             },
         })
+    }
+
+    /// Full upstream decision/reason/error tuple. The default normalizes the
+    /// existing NoOpinion error into the independent outcome error slot.
+    async fn authorize_outcome(&self, attrs: &RequestAttributes) -> Result<AuthorizationOutcome> {
+        self.authorize_opinion(attrs)
+            .await
+            .map(AuthorizationOutcome::from_opinion)
     }
 
     /// Get all rules that apply to a user in a given namespace
@@ -272,105 +327,108 @@ impl<S: AuthzStorage> RBACAuthorizer<S> {
         Self { storage }
     }
 
-    /// Check if a user has permission based on RBAC rules
-    async fn check_rbac(&self, attrs: &RequestAttributes) -> Result<Decision> {
-        // Get all role bindings for the user
-        let role_bindings = self.get_user_role_bindings(attrs).await?;
-        let cluster_role_bindings = self.get_user_cluster_role_bindings(attrs).await?;
-
-        // Check namespace-scoped roles first
-        if let Some(namespace) = &attrs.namespace {
-            for binding in &role_bindings {
-                if let Some(ref binding_ns) = binding.metadata.namespace {
-                    if binding_ns == namespace {
-                        // Get the referenced role
-                        if let Ok(role) = self
-                            .storage
-                            .get::<Role>(&binding.role_ref.name, Some(binding_ns))
-                            .await
-                        {
-                            if self.check_policy_rules(&role.rules, attrs) {
-                                return Ok(Decision::Allow);
+    /// VisitRulesFor (validation/rule.go:179-235) visits cluster bindings
+    /// first, then namespaced bindings; errors do not hide a later valid rule.
+    async fn check_rbac(&self, attrs: &RequestAttributes) -> Result<Opinion> {
+        let mut errors = Vec::new();
+        match self.storage.list::<ClusterRoleBinding>(None).await {
+            Err(error) => errors.push(error.to_string()),
+            Ok(bindings) => {
+                for binding in bindings {
+                    let Some(subject) = applicable_subject(&binding.subjects, &attrs.user, "")
+                    else {
+                        continue;
+                    };
+                    match self.reference_rules(&binding.role_ref, "").await {
+                        Err(error) => errors.push(error.to_string()),
+                        Ok(rules) if self.check_policy_rules(&rules, attrs) => {
+                            // authorizingVisitor.visit (rbac.go:63-80), with the
+                            // clusterRoleBindingDescriber (rule.go:156-162).
+                            return Ok(Opinion::Allow(format!(
+                                "RBAC: allowed by ClusterRoleBinding {} of {} {} to {}",
+                                quoted(&binding.metadata.name),
+                                binding.role_ref.kind,
+                                quoted(&binding.role_ref.name),
+                                describe_subject(subject, "")
+                            )));
+                        }
+                        Ok(_) => {}
+                    }
+                }
+            }
+        }
+        if let Some(namespace) = attrs
+            .namespace
+            .as_deref()
+            .filter(|namespace| !namespace.is_empty())
+        {
+            match self.storage.list::<RoleBinding>(Some(namespace)).await {
+                Err(error) => errors.push(error.to_string()),
+                Ok(bindings) => {
+                    for binding in bindings {
+                        let Some(subject) =
+                            applicable_subject(&binding.subjects, &attrs.user, namespace)
+                        else {
+                            continue;
+                        };
+                        match self.reference_rules(&binding.role_ref, namespace).await {
+                            Err(error) => errors.push(error.to_string()),
+                            Ok(rules) if self.check_policy_rules(&rules, attrs) => {
+                                // roleBindingDescriber (validation/rule.go:170-176).
+                                let binding_namespace =
+                                    binding.metadata.namespace.as_deref().unwrap_or("");
+                                return Ok(Opinion::Allow(format!(
+                                    "RBAC: allowed by RoleBinding {} of {} {} to {}",
+                                    quoted(&format!(
+                                        "{}/{binding_namespace}",
+                                        binding.metadata.name
+                                    )),
+                                    binding.role_ref.kind,
+                                    quoted(&binding.role_ref.name),
+                                    describe_subject(subject, binding_namespace)
+                                )));
                             }
+                            Ok(_) => {}
                         }
                     }
                 }
             }
         }
-
-        // Check cluster-scoped roles via role bindings
-        for binding in &role_bindings {
-            if binding.role_ref.kind == "ClusterRole" {
-                if let Ok(cluster_role) = self
-                    .storage
-                    .get::<ClusterRole>(&binding.role_ref.name, None)
-                    .await
-                {
-                    if self.check_policy_rules(&cluster_role.rules, attrs) {
-                        return Ok(Decision::Allow);
-                    }
-                }
-            }
-        }
-
-        // Check cluster-scoped roles
-        for binding in cluster_role_bindings {
-            if let Ok(cluster_role) = self
-                .storage
-                .get::<ClusterRole>(&binding.role_ref.name, None)
-                .await
-            {
-                if self.check_policy_rules(&cluster_role.rules, attrs) {
-                    return Ok(Decision::Allow);
-                }
-            }
-        }
-
-        Ok(Decision::Deny(
-            "User does not have permission to perform this action".to_string(),
-        ))
+        // rbac.go:122-126: evaluation failures are a NoOpinion reason, never
+        // a returned error, and a no-match without errors has an empty reason.
+        let reason = aggregate_errors(&errors)
+            .map(|error| format!("RBAC: {error}"))
+            .unwrap_or_default();
+        Ok(Opinion::NoOpinion {
+            reason,
+            error: None,
+        })
     }
 
-    /// Get all RoleBindings that apply to the user.
-    ///
-    /// Subject matching mirrors upstream `pkg/registry/rbac/validation/rule.go`:
-    ///   * `User`            — `subject.name == user.username`
-    ///   * `Group`           — `user.groups.contains(subject.name)`
-    ///   * `ServiceAccount`  — `user.username == "system:serviceaccount:<ns>:<name>"`
-    ///     where `<ns>` is `subject.namespace` and `<name>` is `subject.name`.
-    async fn get_user_role_bindings(&self, attrs: &RequestAttributes) -> Result<Vec<RoleBinding>> {
-        let all_bindings = match &attrs.namespace {
-            Some(ns) => self.storage.list::<RoleBinding>(Some(ns)).await?,
-            None => vec![],
-        };
-
-        Ok(all_bindings
-            .into_iter()
-            .filter(|binding| {
-                binding
-                    .subjects
-                    .iter()
-                    .any(|subject| subject_matches(subject, &attrs.user))
-            })
-            .collect())
-    }
-
-    /// Get all ClusterRoleBindings that apply to the user
-    async fn get_user_cluster_role_bindings(
+    /// GetRoleReferenceRules (validation/rule.go:240-258).
+    async fn reference_rules(
         &self,
-        attrs: &RequestAttributes,
-    ) -> Result<Vec<ClusterRoleBinding>> {
-        let all_bindings = self.storage.list::<ClusterRoleBinding>(None).await?;
-
-        Ok(all_bindings
-            .into_iter()
-            .filter(|binding| {
-                binding
-                    .subjects
-                    .iter()
-                    .any(|subject| subject_matches(subject, &attrs.user))
-            })
-            .collect())
+        reference: &crate::resources::rbac::RoleRef,
+        namespace: &str,
+    ) -> std::result::Result<Vec<PolicyRule>, String> {
+        match reference.kind.as_str() {
+            "Role" => self
+                .storage
+                .get::<Role>(&reference.name, Some(namespace))
+                .await
+                .map(|role| role.rules)
+                .map_err(|error| error.to_string()),
+            "ClusterRole" => self
+                .storage
+                .get::<ClusterRole>(&reference.name, None)
+                .await
+                .map(|role| role.rules)
+                .map_err(|error| error.to_string()),
+            _ => Err(format!(
+                "unsupported role reference kind: {}",
+                quoted(&reference.kind)
+            )),
+        }
     }
 
     /// Check if policy rules allow the requested action
@@ -445,12 +503,12 @@ impl<S: AuthzStorage> RBACAuthorizer<S> {
 #[async_trait]
 impl<S: AuthzStorage> Authorizer for RBACAuthorizer<S> {
     async fn authorize(&self, attrs: &RequestAttributes) -> Result<Decision> {
-        // System admin has full access
-        if attrs.user.username == "system:admin" {
-            return Ok(Decision::Allow);
-        }
+        AuthorizationOutcome::from_opinion(self.check_rbac(attrs).await?).into_decision()
+    }
 
-        // Check RBAC
+    async fn authorize_opinion(&self, attrs: &RequestAttributes) -> Result<Opinion> {
+        // RBAC has no username-only system:admin bypass; privileged groups are
+        // a separate authorizer (builtin.go:82-96), before RBAC in the union.
         self.check_rbac(attrs).await
     }
 
@@ -571,6 +629,11 @@ impl Authorizer for AlwaysAllowAuthorizer {
         Ok(Decision::Allow)
     }
 
+    // authorizerfactory/builtin.go:32-33.
+    async fn authorize_opinion(&self, _attrs: &RequestAttributes) -> Result<Opinion> {
+        Ok(Opinion::Allow(String::new()))
+    }
+
     async fn get_user_rules(
         &self,
         _user: &UserInfo,
@@ -601,7 +664,15 @@ pub struct AlwaysDenyAuthorizer;
 #[async_trait]
 impl Authorizer for AlwaysDenyAuthorizer {
     async fn authorize(&self, _attrs: &RequestAttributes) -> Result<Decision> {
-        Ok(Decision::Deny("Access denied".to_string()))
+        Ok(Decision::Deny("Everything is forbidden.".to_string()))
+    }
+
+    // authorizerfactory/builtin.go:60-61.
+    async fn authorize_opinion(&self, _attrs: &RequestAttributes) -> Result<Opinion> {
+        Ok(Opinion::NoOpinion {
+            reason: "Everything is forbidden.".into(),
+            error: None,
+        })
     }
 
     async fn get_user_rules(
@@ -886,6 +957,37 @@ impl Authorizer for NodeAuthorizer {
         )))
     }
 
+    async fn authorize_opinion(&self, attrs: &RequestAttributes) -> Result<Opinion> {
+        // NodeIdentity requires prefix AND system:nodes (nodeidentifier/default.go:42-68).
+        // node_authorizer.go:109-118,164-168: non-node/default miss and all
+        // existing successful branches have empty reasons; unknown node name
+        // has the exact quoted identity reason. Graph/selector cases: #3672.
+        let is_node = attrs
+            .user
+            .groups
+            .iter()
+            .any(|group| group == "system:nodes");
+        let Some(name) = Self::extract_node_name(&attrs.user.username).filter(|_| is_node) else {
+            return Ok(Opinion::NoOpinion {
+                reason: String::new(),
+                error: None,
+            });
+        };
+        if name.is_empty() {
+            return Ok(Opinion::NoOpinion {
+                reason: format!("unknown node for user {}", quoted(&attrs.user.username)),
+                error: None,
+            });
+        }
+        Ok(match self.authorize(attrs).await? {
+            Decision::Allow => Opinion::Allow(String::new()),
+            Decision::Deny(_) => Opinion::NoOpinion {
+                reason: String::new(),
+                error: None,
+            },
+        })
+    }
+
     async fn get_user_rules(
         &self,
         user: &UserInfo,
@@ -935,20 +1037,9 @@ impl Authorizer for NodeAuthorizer {
     }
 }
 
-/// Chains authorizers so a request is allowed if ANY of them allows it,
-/// mirroring upstream `--authorization-mode=Node,RBAC`
-/// (`k8s.io/apiserver/pkg/authorization/union`). Upstream's chain
-/// short-circuits on the first `Allow`/`Deny` and falls through only on
-/// `NoOpinion`; its Node authorizer returns `NoOpinion` (not `Deny`) for
-/// anything it does not cover, which is what lets RBAC take over.
-///
-/// Our [`Decision`] is binary (no `NoOpinion`), and [`NodeAuthorizer`] returns
-/// `Deny` for uncovered requests. So we implement the equivalent as an
-/// *allow-override* chain: a `Deny` is treated as "no opinion — try the next
-/// authorizer", and only when every authorizer denies do we deny (with the
-/// reasons aggregated). This is behaviorally identical to the upstream Node,RBAC
-/// union because both Node and RBAC are allow-lists — neither issues an
-/// overriding explicit deny that must beat another authorizer's allow.
+/// Upstream `authorization/union/union.go:45-68`: return the first terminal
+/// Allow/Deny tuple; otherwise aggregate abstention reasons and errors.
+/// Legacy binary authorizers map Deny to NoOpinion through the trait adapter.
 pub struct UnionAuthorizer {
     authorizers: Vec<Arc<dyn Authorizer>>,
 }
@@ -962,45 +1053,45 @@ impl UnionAuthorizer {
 #[async_trait]
 impl Authorizer for UnionAuthorizer {
     async fn authorize(&self, attrs: &RequestAttributes) -> Result<Decision> {
-        // union.go `unionAuthzHandler.Authorize`: Allow and an explicit Deny
-        // return at once, NoOpinion moves on; errors that came with a NoOpinion
-        // are returned only if nobody decides.
-        let mut reasons = Vec::new();
-        let mut errors = Vec::new();
-        for authorizer in &self.authorizers {
-            match authorizer.authorize_opinion(attrs).await? {
-                Opinion::Allow(_) => return Ok(Decision::Allow),
-                Opinion::Deny(reason) => return Ok(Decision::Deny(reason)),
-                Opinion::NoOpinion { reason, error } => {
-                    reasons.push(reason);
-                    errors.extend(error);
-                }
-            }
-        }
-        if !errors.is_empty() {
-            return Err(crate::error::Error::Authorization(errors.join("; ")));
-        }
-        Ok(Decision::Deny(reasons.join("; ")))
+        self.authorize_outcome(attrs).await?.into_decision()
     }
 
-    /// union.go `unionAuthzHandler.Authorize`: the first Allow or Deny
-    /// decides, with its reason; otherwise NoOpinion with the reasons joined
-    /// and any errors that came with them.
     async fn authorize_opinion(&self, attrs: &RequestAttributes) -> Result<Opinion> {
+        Ok(self.authorize_outcome(attrs).await?.into_opinion())
+    }
+
+    async fn authorize_outcome(&self, attrs: &RequestAttributes) -> Result<AuthorizationOutcome> {
+        // union.go:45-68: aggregate only abstentions. A terminal result owns
+        // its reason AND error, even when previous delegates failed.
         let mut reasons = Vec::new();
         let mut errors = Vec::new();
         for authorizer in &self.authorizers {
-            match authorizer.authorize_opinion(attrs).await? {
+            let outcome = match authorizer.authorize_outcome(attrs).await {
+                Ok(outcome) => outcome,
+                Err(error) => AuthorizationOutcome {
+                    opinion: Opinion::NoOpinion {
+                        reason: String::new(),
+                        error: None,
+                    },
+                    error: Some(error.to_string()),
+                },
+            };
+            match outcome.opinion {
                 Opinion::NoOpinion { reason, error } => {
-                    reasons.push(reason);
-                    errors.extend(error);
+                    if !reason.is_empty() {
+                        reasons.push(reason);
+                    }
+                    errors.extend(outcome.error.or(error));
                 }
-                decided => return Ok(decided),
+                _ => return Ok(outcome),
             }
         }
-        Ok(Opinion::NoOpinion {
-            reason: reasons.join("; "),
-            error: (!errors.is_empty()).then(|| errors.join("; ")),
+        Ok(AuthorizationOutcome {
+            opinion: Opinion::NoOpinion {
+                reason: reasons.join("\n"),
+                error: None,
+            },
+            error: aggregate_errors(&errors),
         })
     }
 
@@ -1060,6 +1151,17 @@ impl Authorizer for PrivilegedGroupAuthorizer {
             return Ok(Decision::Allow);
         }
         Ok(Decision::Deny(String::new()))
+    }
+
+    // authorizerfactory/builtin.go:82-96.
+    async fn authorize_opinion(&self, attrs: &RequestAttributes) -> Result<Opinion> {
+        Ok(match self.authorize(attrs).await? {
+            Decision::Allow => Opinion::Allow(String::new()),
+            Decision::Deny(_) => Opinion::NoOpinion {
+                reason: String::new(),
+                error: None,
+            },
+        })
     }
 
     async fn get_user_rules(
@@ -1535,8 +1637,10 @@ mod tests {
             Arc::new(NodeAuthorizer),
             Arc::new(AlwaysDenyAuthorizer),
         ]);
-        let node_attrs =
-            RequestAttributes::new(mk_user("system:node:n1"), "get", "nodes").with_name("n1");
+        // NodeIdentity requires the system:nodes group (default.go:42-68).
+        let mut node_user = mk_user("system:node:n1");
+        node_user.groups.push("system:nodes".into());
+        let node_attrs = RequestAttributes::new(node_user, "get", "nodes").with_name("n1");
         assert!(matches!(
             node_union.authorize(&node_attrs).await.unwrap(),
             Decision::Allow
@@ -1592,3 +1696,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "authz/allow_reason_tests.rs"]
+mod allow_reason_tests;
