@@ -194,6 +194,16 @@ async fn crd_is_served_and_discoverable_immediately_after_create() {
         .find(|r| r.get("name").and_then(|n| n.as_str()) == Some("examples"))
         .expect("examples resource present in APIResourceList");
     assert_eq!(res.get("kind").and_then(|k| k.as_str()), Some("Example"));
+    // customresource_discovery_controller.go:133-135.
+    assert_eq!(
+        res.get("storageVersionHash").and_then(|k| k.as_str()),
+        Some(
+            rusternetes_common::resource_encoding::storage_version_hash::storage_version_hash(
+                group, "v1", "Example"
+            )
+            .as_str()
+        )
+    );
     assert!(res
         .get("verbs")
         .and_then(|v| v.as_array())
