@@ -567,6 +567,7 @@ async fn async_main() -> Result<()> {
         bootstrap_signer_controller: false,
         terminated_pod_gc_threshold:
             rusternetes_controller_manager::controllers::podgc::DEFAULT_TERMINATED_POD_GC_THRESHOLD,
+        token_cleaner_controller: false,
         legacy_sa_token_clean_up_period:
             rusternetes_controller_manager::controllers::legacy_serviceaccount_token_cleaner::DEFAULT_CLEAN_UP_PERIOD,
     };
