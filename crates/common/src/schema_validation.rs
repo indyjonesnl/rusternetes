@@ -942,44 +942,13 @@ impl SchemaValidator {
         }
     }
 
-    /// Apply default values from a JSONSchemaProps to a JSON value.
+    /// Apply default values from a JSONSchemaProps to a JSON value:
+    /// `structuraldefaulting.Default(x, structural)`
+    /// (schema/defaulting/algorithm.go:30-72), which operates on the
+    /// structural form of the schema (`schema.NewStructural`).
     pub fn apply_defaults(schema: &JSONSchemaProps, value: &mut Value) {
-        Self::apply_defaults_recursive(schema, value);
-    }
-
-    fn apply_defaults_recursive(schema: &JSONSchemaProps, value: &mut Value) {
-        if let Value::Object(ref mut map) = value {
-            if let Some(ref properties) = schema.properties {
-                for (key, prop_schema) in properties {
-                    if map.contains_key(key) {
-                        if let Some(val) = map.get_mut(key) {
-                            Self::apply_defaults_recursive(prop_schema, val);
-                        }
-                    } else if let Some(ref default_val) = prop_schema.default {
-                        map.insert(key.clone(), default_val.clone());
-                    }
-                }
-            }
-        }
-
-        if let Value::Array(ref mut arr) = value {
-            if let Some(ref items) = schema.items {
-                use crate::resources::crd::JSONSchemaPropsOrArray;
-                match items.as_ref() {
-                    JSONSchemaPropsOrArray::Schema(item_schema) => {
-                        for item in arr.iter_mut() {
-                            Self::apply_defaults_recursive(item_schema, item);
-                        }
-                    }
-                    JSONSchemaPropsOrArray::Schemas(schemas) => {
-                        for (i, item) in arr.iter_mut().enumerate() {
-                            if i < schemas.len() {
-                                Self::apply_defaults_recursive(&schemas[i], item);
-                            }
-                        }
-                    }
-                }
-            }
+        if let Ok(structural) = crate::validation::structural::new_structural(schema) {
+            crate::validation::structural::defaulting::default(value, Some(&structural));
         }
     }
 }
@@ -989,6 +958,29 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::HashMap;
+
+    /// `structuraldefaulting.Default` (algorithm.go:45,:53,:61): a non-nullable
+    /// null is replaced by the default, for properties, additionalProperties
+    /// and array items alike; a nullable null is kept.
+    #[test]
+    fn test_apply_defaults_replaces_non_nullable_nulls() {
+        let schema: JSONSchemaProps = serde_json::from_value(json!({
+            "type": "object",
+            "properties": {
+                "a": {"type": "string", "default": "A"},
+                "n": {"type": "string", "nullable": true, "default": "N"},
+                "m": {"type": "object", "additionalProperties": {"type": "string", "default": "X"}},
+                "l": {"type": "array", "items": {"type": "string", "default": "I"}}
+            }
+        }))
+        .unwrap();
+        let mut v = json!({"a": null, "n": null, "m": {"k": null}, "l": [null, "z"]});
+        SchemaValidator::apply_defaults(&schema, &mut v);
+        assert_eq!(
+            v,
+            json!({"a": "A", "n": null, "m": {"k": "X"}, "l": ["I", "z"]})
+        );
+    }
 
     #[test]
     fn test_nested_required_in_array_items_reports_rooted_path() {
