@@ -45,6 +45,7 @@ use controllers::{
     statefulset::StatefulSetController,
     storage_class::StorageClassController,
     ttl_controller::TTLController,
+    vac_protection::VacProtectionController,
     volume_expansion::VolumeExpansionController,
     volume_snapshot::VolumeSnapshotController,
     vpa::VerticalPodAutoscalerController,
@@ -1039,6 +1040,17 @@ async fn main() -> Result<()> {
         async move {
             if let Err(e) = controller.run().await {
                 tracing::error!("PV protection controller error: {}", e);
+            }
+        }
+    });
+
+    // Start VAC protection controller (vacprotection.NewVACProtectionController)
+    let vac_protection_controller = Arc::new(VacProtectionController::new(storage.clone()));
+    spawn_controller!("VAC protection controller", leader_elector, {
+        let controller = vac_protection_controller.clone();
+        async move {
+            if let Err(e) = controller.run().await {
+                tracing::error!("VAC protection controller error: {}", e);
             }
         }
     });
