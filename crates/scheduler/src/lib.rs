@@ -4,6 +4,7 @@ pub mod diagnosis;
 #[allow(dead_code)]
 pub mod framework;
 pub mod framework_runtime;
+pub mod node_volume_limits;
 #[allow(dead_code)]
 pub mod plugins;
 pub mod profile;
