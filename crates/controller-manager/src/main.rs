@@ -454,8 +454,9 @@ struct Args {
     /// Service CIDR(s) (e.g. `10.96.0.0/12`, at most two, one per family).
     /// When it overlaps `--cluster-cidr`,
     /// the overlapping subnets are never allocated to nodes (upstream
-    /// `--service-cluster-ip-range`, `filterOutServiceRange`). Only used when
-    /// `--allocate-node-cidrs` is set.
+    /// `--service-cluster-ip-range`, `filterOutServiceRange`). Also the range
+    /// the Service controller allocates ClusterIPs from; the node-IPAM filter
+    /// only applies when `--allocate-node-cidrs` is set.
     #[arg(long)]
     service_cluster_ip_range: Option<String>,
 
@@ -646,6 +647,7 @@ async fn run_api_mode(
         attach_detach_controller: false,
         bootstrap_signer_controller: false,
         terminated_pod_gc_threshold: args.terminated_pod_gc_threshold,
+        service_cluster_ip_range: args.service_cluster_ip_range.clone().unwrap_or_default(),
         // Route HPA metric fetches through the same kubeconfig-derived
         // credentials as the data plane (CA + bearer token, honouring the
         // insecure flag) instead of the default mTLS client cert under
@@ -1678,7 +1680,11 @@ async fn main() -> Result<()> {
     );
 
     // Start Service controller (watch-based)
-    let service_controller = Arc::new(ServiceController::new(storage.clone()));
+    let service_controller = Arc::new(
+        ServiceController::new(storage.clone())
+            .with_service_cluster_ip_range(args.service_cluster_ip_range.as_deref().unwrap_or(""))
+            .map_err(|e| anyhow::anyhow!("invalid --service-cluster-ip-range: {e}"))?,
+    );
     spawn_controller!("Service controller", leader_elector, {
         let controller = service_controller.clone();
         async move {

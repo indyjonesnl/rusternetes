@@ -12,12 +12,14 @@
 /// - EndpointSliceController: Maintains endpoint slices for scalability
 use anyhow::Result;
 use futures::StreamExt;
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use rusternetes_common::resources::Service;
 use rusternetes_common::resources::ServiceType;
 use rusternetes_common::resources::{IPFamily, IPFamilyPolicy, ServiceExternalTrafficPolicy};
+use rusternetes_common::service_ip_ranges::ServiceIpRanges;
 use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::collections::HashSet;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -29,8 +31,6 @@ const DEFAULT_SERVICE_CIDR_V6: &str = "fd00:10:96::/112";
 /// Default NodePort range (Kubernetes standard)
 const NODE_PORT_MIN: u16 = 30000;
 const NODE_PORT_MAX: u16 = 32767;
-/// Reserved ClusterIP for kubernetes.default service
-const KUBERNETES_SERVICE_IP: &str = "10.96.0.1";
 
 /// ServiceController manages service IP and port allocation
 pub struct ServiceController<S: Storage> {
@@ -39,10 +39,14 @@ pub struct ServiceController<S: Storage> {
     allocated_ips: Arc<Mutex<HashSet<String>>>,
     /// Tracks allocated NodePorts to avoid collisions
     allocated_node_ports: Arc<Mutex<HashSet<u16>>>,
-    /// Service CIDR for ClusterIP allocation
-    service_cidr: String,
-    /// Secondary IPv6 service CIDR for dual-stack ClusterIP allocation
-    service_cidr_v6: String,
+    /// IPv4 service range ClusterIPs are allocated from (`None`: single-stack
+    /// IPv6 cluster).
+    cidr_v4: Option<Ipv4Net>,
+    /// IPv6 service range (`None`: single-stack IPv4 cluster).
+    cidr_v6: Option<Ipv6Net>,
+    /// The address reserved for `default/kubernetes`: first address of the
+    /// primary range.
+    api_server_service_ip: IpAddr,
 }
 
 impl<S: Storage + 'static> ServiceController<S> {
@@ -51,8 +55,9 @@ impl<S: Storage + 'static> ServiceController<S> {
             storage,
             allocated_ips: Arc::new(Mutex::new(HashSet::new())),
             allocated_node_ports: Arc::new(Mutex::new(HashSet::new())),
-            service_cidr: DEFAULT_SERVICE_CIDR.to_string(),
-            service_cidr_v6: DEFAULT_SERVICE_CIDR_V6.to_string(),
+            cidr_v4: Some(DEFAULT_SERVICE_CIDR.parse().expect("default v4 range")),
+            cidr_v6: Some(DEFAULT_SERVICE_CIDR_V6.parse().expect("default v6 range")),
+            api_server_service_ip: ServiceIpRanges::default().api_server_service_ip(),
         }
     }
 
@@ -395,37 +400,64 @@ impl<S: Storage + 'static> ServiceController<S> {
         Ok(())
     }
 
-    /// Allocate a ClusterIP from the service CIDR range
+    /// The `kubernetes` Service address: the first address of the primary
+    /// range (`GetIndexedIP(&serviceClusterIPRange, 1)`,
+    /// pkg/controlplane/apiserver/options/options.go:378-382). Never handed
+    /// out to another Service.
+    #[cfg(test)]
+    pub fn api_server_service_ip(&self) -> IpAddr {
+        self.api_server_service_ip
+    }
+
+    /// Re-home the allocator on `--service-cluster-ip-range`: one range, or
+    /// two of different families, primary first. Parsed and validated by the
+    /// same code as the api-server's flag
+    /// ([`ServiceIpRanges`], completion.go:94-134 + validation.go:36-84). A
+    /// family without a range cannot be allocated from.
+    pub fn with_service_cluster_ip_range(mut self, flag: &str) -> Result<Self, String> {
+        // Unset keeps this controller's historical defaults (the default v4
+        // range plus a v6 range for dual-stack services).
+        if flag.is_empty() {
+            return Ok(self);
+        }
+        let ranges = ServiceIpRanges::parse(flag)?;
+        self.cidr_v4 = None;
+        self.cidr_v6 = None;
+        for cidr in ranges.cidrs() {
+            match cidr.parse::<IpNet>().map_err(|e| e.to_string())? {
+                IpNet::V4(n) => self.cidr_v4 = Some(n),
+                IpNet::V6(n) => self.cidr_v6 = Some(n),
+            }
+        }
+        self.api_server_service_ip = ranges.api_server_service_ip();
+        Ok(self)
+    }
+
+    /// Allocate a ClusterIP from the IPv4 service range
     async fn allocate_cluster_ip(&self) -> Result<String> {
         let mut ips = self.allocated_ips.lock().await;
 
-        // Parse service CIDR
-        let cidr_parts: Vec<&str> = self.service_cidr.split('/').collect();
-        if cidr_parts.len() != 2 {
-            return Err(anyhow::anyhow!(
-                "Invalid service CIDR: {}",
-                self.service_cidr
-            ));
-        }
+        let cidr = self
+            .cidr_v4
+            .ok_or_else(|| anyhow::anyhow!("no IPv4 service cluster IP range is configured"))?;
+        let base: u32 = cidr.network().into();
+        let num_ips: u64 = 1u64 << (32 - cidr.prefix_len() as u32);
 
-        let base_ip: Ipv4Addr = cidr_parts[0]
-            .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid service CIDR IP: {}", e))?;
-        let prefix_len: u8 = cidr_parts[1]
-            .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid service CIDR prefix length: {}", e))?;
-
-        // Calculate the number of available IPs in the CIDR range
-        let num_ips = 2u32.pow((32 - prefix_len) as u32);
-        let base_ip_u32: u32 = base_ip.into();
-
-        // Reserve the first IP (.0) and the last IP (.255 for /24 or equivalent)
-        // Start from .1, but .1 is reserved for kubernetes.default service
-        for offset in 2..num_ips {
-            let candidate_ip = Ipv4Addr::from(base_ip_u32 + offset);
-            let candidate_str = candidate_ip.to_string();
-
-            if !ips.contains(&candidate_str) && candidate_str != KUBERNETES_SERVICE_IP {
+        // Skip the network address and, below /31, the broadcast address
+        // (`ipallocator.NewInMemory` allocates only host addresses), plus the
+        // address reserved for the `kubernetes` Service.
+        let last = if cidr.prefix_len() < 31 {
+            num_ips - 1
+        } else {
+            num_ips
+        };
+        for offset in 1..last {
+            let candidate = Ipv4Addr::from(base.wrapping_add(offset as u32));
+            if IpAddr::V4(candidate) == self.api_server_service_ip {
+                continue;
+            }
+            let candidate_str = candidate.to_string();
+            if !ips.contains(&candidate_str) {
                 ips.insert(candidate_str.clone());
                 return Ok(candidate_str);
             }
@@ -433,7 +465,7 @@ impl<S: Storage + 'static> ServiceController<S> {
 
         Err(anyhow::anyhow!(
             "No available ClusterIPs in service CIDR {}",
-            self.service_cidr
+            cidr
         ))
     }
 
@@ -459,26 +491,14 @@ impl<S: Storage + 'static> ServiceController<S> {
         }
     }
 
-    /// Allocate a ClusterIP from the IPv6 service CIDR range.
+    /// Allocate a ClusterIP from the IPv6 service range.
     async fn allocate_cluster_ip_v6(&self) -> Result<String> {
         let mut ips = self.allocated_ips.lock().await;
 
-        let cidr_parts: Vec<&str> = self.service_cidr_v6.split('/').collect();
-        if cidr_parts.len() != 2 {
-            return Err(anyhow::anyhow!(
-                "Invalid IPv6 service CIDR: {}",
-                self.service_cidr_v6
-            ));
-        }
-
-        let base_ip: Ipv6Addr = cidr_parts[0]
-            .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid IPv6 service CIDR IP: {}", e))?;
-        let prefix_len: u32 = cidr_parts[1]
-            .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid IPv6 service CIDR prefix length: {}", e))?;
-
-        let host_bits = 128 - prefix_len;
+        let cidr = self
+            .cidr_v6
+            .ok_or_else(|| anyhow::anyhow!("no IPv6 service cluster IP range is configured"))?;
+        let host_bits = 128 - cidr.prefix_len() as u32;
         // Cap the scan window so a very large host space doesn't spin forever;
         // the service range only needs a modest number of addresses.
         let max_offset: u128 = if host_bits >= 32 {
@@ -486,17 +506,16 @@ impl<S: Storage + 'static> ServiceController<S> {
         } else {
             (1u128 << host_bits) - 1
         };
-        let base_ip_u128: u128 = base_ip.into();
+        let base: u128 = cidr.network().into();
 
-        // Start from offset 2, reserving ::0 (network address) and ::1 as a
-        // conventional cluster-DNS / gateway reservation, mirroring the IPv4
-        // allocator's treatment of .0 and .1.  Unlike IPv4 there is no broadcast
-        // address to reserve in IPv6, so the only skipped addresses are ::0/::1.
-        // TODO: make the IPv6 CIDR (currently DEFAULT_SERVICE_CIDR_V6) a
-        //       constructor parameter alongside the IPv4 CIDR for full parity.
-        for offset in 2..=max_offset {
-            let candidate_ip = Ipv6Addr::from(base_ip_u128 + offset);
-            let candidate_str = candidate_ip.to_string();
+        // Skip ::0 (network) and the address reserved for the `kubernetes`
+        // Service. IPv6 has no broadcast address.
+        for offset in 1..=max_offset {
+            let candidate = Ipv6Addr::from(base + offset);
+            if IpAddr::V6(candidate) == self.api_server_service_ip {
+                continue;
+            }
+            let candidate_str = candidate.to_string();
             if !ips.contains(&candidate_str) {
                 ips.insert(candidate_str.clone());
                 return Ok(candidate_str);
@@ -505,7 +524,7 @@ impl<S: Storage + 'static> ServiceController<S> {
 
         Err(anyhow::anyhow!(
             "No available ClusterIPs in IPv6 service CIDR {}",
-            self.service_cidr_v6
+            cidr
         ))
     }
 
@@ -620,6 +639,81 @@ mod tests {
 
         // IPs should be different
         assert_ne!(ip1, ip2);
+    }
+
+    /// `--service-cluster-ip-range` re-homes the allocator: ClusterIPs come
+    /// from the configured primary range and its first address is the
+    /// `kubernetes` Service's (`GetIndexedIP(&serviceClusterIPRange, 1)`,
+    /// pkg/controlplane/apiserver/options/options.go:378-382), not the
+    /// hard-coded 10.96.0.1.
+    #[tokio::test]
+    async fn custom_range_allocates_from_that_range() {
+        use rusternetes_storage::memory::MemoryStorage;
+        let controller = ServiceController::new(Arc::new(MemoryStorage::new()))
+            .with_service_cluster_ip_range("192.0.2.0/24")
+            .unwrap();
+        assert_eq!(controller.allocate_cluster_ip().await.unwrap(), "192.0.2.2");
+        assert_eq!(controller.allocate_cluster_ip().await.unwrap(), "192.0.2.3");
+    }
+
+    /// The reserved address follows the range: with 10.0.0.0/24 the
+    /// `kubernetes` IP is 10.0.0.1, and 10.96.0.1 is an ordinary address of no
+    /// range at all.
+    #[tokio::test]
+    async fn reserved_api_server_ip_is_the_first_of_the_primary_range() {
+        use rusternetes_storage::memory::MemoryStorage;
+        let controller = ServiceController::new(Arc::new(MemoryStorage::new()))
+            .with_service_cluster_ip_range("10.0.0.0/24")
+            .unwrap();
+        assert_eq!(controller.api_server_service_ip().to_string(), "10.0.0.1");
+        let mut got = Vec::new();
+        for _ in 0..253 {
+            got.push(controller.allocate_cluster_ip().await.unwrap());
+        }
+        assert!(!got.contains(&"10.0.0.1".to_string()));
+        assert!(!got.contains(&"10.0.0.0".to_string()));
+        assert!(!got.contains(&"10.0.0.255".to_string()), "broadcast");
+        assert!(controller.allocate_cluster_ip().await.is_err(), "exhausted");
+    }
+
+    /// An IPv6-primary dual-stack pair: the reserved address is the v6
+    /// range's first, and both families allocate from their own range.
+    #[tokio::test]
+    async fn ipv6_primary_dual_stack_ranges() {
+        use rusternetes_storage::memory::MemoryStorage;
+        let controller = ServiceController::new(Arc::new(MemoryStorage::new()))
+            .with_service_cluster_ip_range("2001:db8:1::/112,192.0.2.0/24")
+            .unwrap();
+        assert_eq!(
+            controller.api_server_service_ip().to_string(),
+            "2001:db8:1::1"
+        );
+        assert_eq!(
+            controller.allocate_cluster_ip_v6().await.unwrap(),
+            "2001:db8:1::2"
+        );
+        assert_eq!(controller.allocate_cluster_ip().await.unwrap(), "192.0.2.1");
+    }
+
+    /// A single-stack cluster has no range for the other family; allocating
+    /// from it is an error rather than an address from a default range.
+    #[tokio::test]
+    async fn family_without_a_range_cannot_allocate() {
+        use rusternetes_storage::memory::MemoryStorage;
+        let controller = ServiceController::new(Arc::new(MemoryStorage::new()))
+            .with_service_cluster_ip_range("192.0.2.0/24")
+            .unwrap();
+        assert!(controller.allocate_cluster_ip_v6().await.is_err());
+    }
+
+    #[test]
+    fn invalid_range_flag_is_rejected_like_upstream() {
+        use rusternetes_storage::memory::MemoryStorage;
+        let c = || ServiceController::new(Arc::new(MemoryStorage::new()));
+        assert!(c().with_service_cluster_ip_range("nope").is_err());
+        assert!(c()
+            .with_service_cluster_ip_range("10.0.0.0/24,10.1.0.0/24")
+            .is_err());
     }
 
     #[tokio::test]
