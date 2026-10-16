@@ -1473,6 +1473,8 @@ fn collection_uri(group: &str, version: &str, resource: &str, ns: Option<&str>) 
 /// with no fixture is unswept, and a stale fixture is a test that silently
 /// stopped covering anything.
 #[tokio::test]
+// Discovery then POST must see one gate state: wait out `#[serial]` gate flips (#3654).
+#[serial_test::parallel]
 async fn every_creatable_resource_has_a_sweep_fixture() {
     let s = TestApiServer::new();
     let discovered = creatable_resources(&s).await;
@@ -1524,6 +1526,8 @@ async fn every_creatable_resource_has_a_sweep_fixture() {
 /// create path and the storage decode path are different code, and either can
 /// lose the type on its own.
 #[tokio::test]
+// Discovery then POST must see one gate state: wait out `#[serial]` gate flips (#3654).
+#[serial_test::parallel]
 async fn creating_every_resource_preserves_json_types_and_timestamp_precision() {
     let s = TestApiServer::new();
     let discovered = creatable_resources(&s).await;

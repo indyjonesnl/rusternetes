@@ -1023,6 +1023,8 @@ async fn resource_findings(totals: &mut Totals) -> Vec<Finding> {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+// Discovery then POST must see one gate state: wait out `#[serial]` gate flips (#3654).
+#[serial_test::parallel]
 async fn wire_format_coverage_report() {
     let registry = ProtoRegistry::new();
     let view = registry_view(&registry);

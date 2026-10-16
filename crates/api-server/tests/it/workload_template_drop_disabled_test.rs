@@ -48,6 +48,7 @@ async fn assert_dropped(path: &str, body: Value, tmpl_path: &[&str]) {
 }
 
 #[tokio::test]
+#[serial_test::parallel] // reads the default-off GenericWorkload gate; wait out #[serial] flips (#3654)
 async fn deployment_template_drops_workload_ref() {
     let body = json!({"apiVersion": "apps/v1", "kind": "Deployment",
         "metadata": {"name": "d"},
@@ -61,6 +62,7 @@ async fn deployment_template_drops_workload_ref() {
 }
 
 #[tokio::test]
+#[serial_test::parallel] // reads the default-off GenericWorkload gate; wait out #[serial] flips (#3654)
 async fn replicaset_template_drops_workload_ref() {
     let body = json!({"apiVersion": "apps/v1", "kind": "ReplicaSet",
         "metadata": {"name": "r"},
@@ -74,6 +76,7 @@ async fn replicaset_template_drops_workload_ref() {
 }
 
 #[tokio::test]
+#[serial_test::parallel] // reads the default-off GenericWorkload gate; wait out #[serial] flips (#3654)
 async fn statefulset_template_drops_workload_ref() {
     let body = json!({"apiVersion": "apps/v1", "kind": "StatefulSet",
         "metadata": {"name": "s"},
@@ -87,6 +90,7 @@ async fn statefulset_template_drops_workload_ref() {
 }
 
 #[tokio::test]
+#[serial_test::parallel] // reads the default-off GenericWorkload gate; wait out #[serial] flips (#3654)
 async fn daemonset_template_drops_workload_ref() {
     let body = json!({"apiVersion": "apps/v1", "kind": "DaemonSet",
         "metadata": {"name": "ds"},
@@ -100,6 +104,7 @@ async fn daemonset_template_drops_workload_ref() {
 }
 
 #[tokio::test]
+#[serial_test::parallel] // reads the default-off GenericWorkload gate; wait out #[serial] flips (#3654)
 async fn job_template_drops_workload_ref() {
     let body = json!({"apiVersion": "batch/v1", "kind": "Job",
         "metadata": {"name": "j"},
@@ -113,6 +118,7 @@ async fn job_template_drops_workload_ref() {
 }
 
 #[tokio::test]
+#[serial_test::parallel] // reads the default-off GenericWorkload gate; wait out #[serial] flips (#3654)
 async fn cronjob_template_drops_workload_ref() {
     let body = json!({"apiVersion": "batch/v1", "kind": "CronJob",
         "metadata": {"name": "cj"},
@@ -127,6 +133,7 @@ async fn cronjob_template_drops_workload_ref() {
 }
 
 #[tokio::test]
+#[serial_test::parallel] // reads the default-off GenericWorkload gate; wait out #[serial] flips (#3654)
 async fn replicationcontroller_template_drops_workload_ref() {
     let body = json!({"apiVersion": "v1", "kind": "ReplicationController",
         "metadata": {"name": "rc"},
@@ -140,6 +147,7 @@ async fn replicationcontroller_template_drops_workload_ref() {
 }
 
 #[tokio::test]
+#[serial_test::parallel] // reads the default-off GenericWorkload gate; wait out #[serial] flips (#3654)
 async fn podtemplate_drops_workload_ref() {
     let body = json!({"apiVersion": "v1", "kind": "PodTemplate",
         "metadata": {"name": "pt"}, "template": template()});
@@ -153,6 +161,7 @@ async fn podtemplate_drops_workload_ref() {
 
 /// PrepareForUpdate: a PUT that adds the gated field is dropped too.
 #[tokio::test]
+#[serial_test::parallel] // reads the default-off GenericWorkload gate; wait out #[serial] flips (#3654)
 async fn deployment_update_drops_workload_ref() {
     let api = TestApiServer::new();
     let path = "/apis/apps/v1/namespaces/default/deployments";

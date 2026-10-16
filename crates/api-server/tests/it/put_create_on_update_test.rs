@@ -103,6 +103,8 @@ async fn updatable_resources(s: &TestApiServer) -> BTreeMap<Gvr, (bool, String)>
 }
 
 #[tokio::test]
+// Discovery then POST must see one gate state: wait out `#[serial]` gate flips (#3654).
+#[serial_test::parallel]
 async fn a_put_to_a_missing_object_is_not_a_create() {
     let api = TestApiServer::new();
     let resources = updatable_resources(&api).await;
@@ -464,6 +466,8 @@ async fn updatable_subresources(s: &TestApiServer) -> BTreeMap<Gvr, (bool, Strin
 /// writable subresource: `serviceStatusStrategy` embeds `svcStrategy`, so
 /// its `/status` opts in too. Every other entry must answer NotFound.
 #[tokio::test]
+// Discovery then POST must see one gate state: wait out `#[serial]` gate flips (#3654).
+#[serial_test::parallel]
 async fn a_put_to_a_missing_objects_subresource_is_not_a_create() {
     let api = TestApiServer::new();
     let subresources = updatable_subresources(&api).await;
