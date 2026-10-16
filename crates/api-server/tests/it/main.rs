@@ -343,6 +343,7 @@ mod ssa_configmap_apply_test;
 mod ssa_reset_fields_batch_test;
 mod ssa_reset_fields_crd_test;
 mod ssa_reset_fields_more_3728_test;
+mod ssa_reset_fields_svc_csr_3790_test;
 mod ssa_reset_fields_test;
 mod ssa_secret_apply_test;
 mod statefulset_generic_store_test;
