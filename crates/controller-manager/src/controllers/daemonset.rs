@@ -1,4 +1,5 @@
 use super::expectations::ControllerExpectations;
+use super::pod_informer::{ControllerRef, PodEventTarget, ResolvedController, SharedPodInformer};
 use super::replicationcontroller::slow_start_batches_capped;
 use crate::controllers::worker_pool::spawn_workers;
 use anyhow::Result;
@@ -10,8 +11,9 @@ use rusternetes_common::resources::workloads::DEPRECATED_TEMPLATE_GENERATION;
 use rusternetes_common::resources::{
     ControllerRevision, DaemonSet, DaemonSetStatus, Node, Pod, PodStatus,
 };
-use rusternetes_common::types::{OwnerReference, Phase};
-use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
+use rusternetes_common::types::{label_selector_as_selector, OwnerReference, Phase, Selector};
+use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
@@ -98,6 +100,10 @@ pub struct DaemonSetController<S: Storage> {
     /// [`super::expectations`]. Both halves are wired (creations and
     /// deletions, set together by `sync_nodes`).
     expectations: Arc<ControllerExpectations>,
+    /// The shared pod informer whose `addPod`/`updatePod`/`deletePod`
+    /// handlers this controller registers (daemon_controller.go:207-218,
+    /// `podInformer.Informer().AddEventHandler`).
+    pod_informer: Arc<SharedPodInformer<S>>,
 }
 
 /// `BurstReplicas` (pkg/controller/daemon/daemon_controller.go:61): caps the
@@ -122,10 +128,25 @@ fn generate_pod_name(base: &str) -> String {
 }
 
 impl<S: Storage + 'static> DaemonSetController<S> {
+    #[allow(dead_code)] // the binary shares one informer via `with_pod_informer`
     pub fn new(storage: Arc<S>) -> Self {
+        let pod_informer = Arc::new(SharedPodInformer::new(
+            storage.clone(),
+            Duration::from_secs(5),
+        ));
+        Self::with_pod_informer(storage, pod_informer)
+    }
+
+    /// A controller whose pod handlers hang off `pod_informer`, the one
+    /// informer the binary shares between controllers.
+    pub(crate) fn with_pod_informer(
+        storage: Arc<S>,
+        pod_informer: Arc<SharedPodInformer<S>>,
+    ) -> Self {
         Self {
             storage,
             expectations: Arc::new(ControllerExpectations::new()),
+            pod_informer,
         }
     }
 
@@ -253,17 +274,20 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             }
         });
 
+        // Pod events come from the shared pod informer, as upstream's
+        // `podInformer.Informer().AddEventHandler` (daemon_controller.go:207-218).
+        self.pod_informer
+            .add_event_handler(Arc::clone(&self), queue.clone())
+            .await;
+        self.pod_informer.start();
+
         loop {
             // Initial full reconciliation
             self.enqueue_all(&queue).await;
 
-            // Watch daemonsets, nodes, AND pods.
-            // K8s DS controller watches pods to react when a pod's status changes
-            // (e.g., phase set to Failed by kubelet or test), which triggers
-            // immediate reconciliation of the owning DaemonSet.
+            // Watch daemonsets and nodes; pods arrive via the shared informer.
             let ds_prefix = "/registry/daemonsets/";
             let node_prefix = "/registry/nodes/";
-            let pod_prefix = "/registry/pods/";
 
             let ds_watch = match self.storage.watch(ds_prefix).await {
                 Ok(w) => w,
@@ -287,21 +311,8 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                     continue;
                 }
             };
-            let pod_watch = match self.storage.watch(pod_prefix).await {
-                Ok(w) => w,
-                Err(e) => {
-                    error!(
-                        "Failed to establish pod watch for DS controller: {}, retrying in {:?}",
-                        e, retry_interval
-                    );
-                    time::sleep(retry_interval).await;
-                    continue;
-                }
-            };
-
             let mut ds_watch = ds_watch;
             let mut node_watch = node_watch;
-            let mut pod_watch = pod_watch;
 
             // Periodic full resync as safety net
             let mut resync = tokio::time::interval(Duration::from_secs(5));
@@ -342,22 +353,6 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                             }
                         }
                     }
-                    event = pod_watch.next() => {
-                        match event {
-                            Some(Ok(ev)) => {
-                                // When a pod changes, enqueue the owning DaemonSet.
-                                self.enqueue_ds_for_pod_event(&ev, &queue).await;
-                            }
-                            Some(Err(e)) => {
-                                warn!("Pod watch error in DS controller: {}, reconnecting", e);
-                                watch_broken = true;
-                            }
-                            None => {
-                                warn!("Pod watch stream ended in DS controller, reconnecting");
-                                watch_broken = true;
-                            }
-                        }
-                    }
                     _ = resync.tick() => {
                         self.enqueue_all(&queue).await;
                     }
@@ -372,53 +367,6 @@ impl<S: Storage + 'static> DaemonSetController<S> {
     /// both count it).
     fn observe_creation(&self, exp_key: &str, pod_key: &str) {
         self.expectations.creation_observed_of(exp_key, pod_key);
-    }
-
-    /// When a pod changes, find its owning DaemonSet and enqueue it for reconciliation.
-    async fn enqueue_ds_for_pod_event(
-        &self,
-        event: &rusternetes_storage::WatchEvent,
-        queue: &WorkQueue,
-    ) {
-        let json_str = match event {
-            rusternetes_storage::WatchEvent::Added(_, v)
-            | rusternetes_storage::WatchEvent::Modified(_, v)
-            | rusternetes_storage::WatchEvent::Deleted(_, v) => v,
-        };
-        if let Ok(pod) = serde_json::from_str::<Pod>(json_str) {
-            // `addPod`/`updatePod` route a pod with a deletionTimestamp to
-            // `deletePod` (daemon_controller.go:533-538, :582-589): a graceful
-            // delete MODIFIES the pod first and the kubelet removes it only
-            // after the grace period. `deletePod` then calls
-            // `expectations.DeletionObserved` (:668). The per-pod key set in
-            // the expectations makes the later DELETED event a no-op.
-            let deleting = matches!(event, rusternetes_storage::WatchEvent::Deleted(..))
-                || pod.metadata.deletion_timestamp.is_some();
-            if let Some(owner_refs) = &pod.metadata.owner_references {
-                for owner in owner_refs {
-                    if owner.kind == "DaemonSet" {
-                        let ns = pod.metadata.namespace.as_deref().unwrap_or("default");
-                        if matches!(event, rusternetes_storage::WatchEvent::Added(..)) && !deleting
-                        {
-                            // `addPod` -> `expectations.CreationObserved`
-                            // (daemon_controller.go:551), once per created pod.
-                            self.observe_creation(
-                                &format!("{}/{}", ns, owner.name),
-                                &format!("{}/{}", ns, pod.metadata.name),
-                            );
-                        }
-                        if deleting {
-                            self.expectations.deletion_observed_of(
-                                &format!("{}/{}", ns, owner.name),
-                                &format!("{}/{}", ns, pod.metadata.name),
-                            );
-                        }
-                        let key = format!("daemonsets/{}/{}", ns, owner.name);
-                        queue.add(key).await;
-                    }
-                }
-            }
-        }
     }
 
     /// When a node changes, enqueue ALL daemonsets since any DS might need
@@ -1768,6 +1716,93 @@ impl<S: Storage + 'static> DaemonSetController<S> {
     }
 }
 
+/// The DaemonSet half of the pod event handlers (daemon_controller.go
+/// `addPod` :530, `updatePod` :573, `deletePod` :634, `resolveControllerRef`
+/// :769, `getDaemonSetsForPod` :385 over client-go
+/// `listers/apps/v1/daemonset_expansion.go` `GetPodDaemonSets` :42).
+impl<S: Storage + 'static> PodEventTarget for DaemonSetController<S> {
+    fn queue_prefix(&self) -> &'static str {
+        "daemonsets"
+    }
+
+    /// "We can't look up by UID, so look up by Name and then verify UID.
+    /// Don't even try to look up by Name if it's the wrong Kind."
+    async fn resolve_controller_ref(
+        &self,
+        namespace: &str,
+        controller_ref: &ControllerRef,
+    ) -> Option<ResolvedController> {
+        if controller_ref.kind != "DaemonSet" {
+            return None;
+        }
+        let ds: DaemonSet = self
+            .storage
+            .get(&build_key(
+                "daemonsets",
+                Some(namespace),
+                &controller_ref.name,
+            ))
+            .await
+            .ok()?;
+        (ds.metadata.uid == controller_ref.uid).then(|| ResolvedController {
+            name: ds.metadata.name.clone(),
+            min_ready_seconds: ds.spec.min_ready_seconds.unwrap_or(0),
+        })
+    }
+
+    /// `GetPodDaemonSets`: a pod without labels matches none; an invalid
+    /// selector does not match; an empty selector matches nothing.
+    async fn pod_controllers(
+        &self,
+        namespace: &str,
+        pod_labels: &HashMap<String, String>,
+    ) -> Vec<String> {
+        if pod_labels.is_empty() {
+            return Vec::new();
+        }
+        let Ok(sets) = self
+            .storage
+            .list::<DaemonSet>(&build_prefix("daemonsets", Some(namespace)))
+            .await
+        else {
+            return Vec::new();
+        };
+        sets.into_iter()
+            .filter(|ds| {
+                matches!(
+                    label_selector_as_selector(Some(&ds.spec.selector)),
+                    Ok(selector @ Selector::Requirements(_)) if selector.matches(Some(pod_labels))
+                )
+            })
+            .map(|ds| ds.metadata.name)
+            .collect()
+    }
+
+    /// `dsc.expectations.CreationObserved(dsKey)` (:551) for the plain count.
+    fn creation_observed(&self, key: &str) {
+        self.expectations.creation_observed(key);
+    }
+
+    /// The DaemonSet controller's creation expectations are tracked per pod
+    /// (`record_created` in `sync_nodes`), so an event and a listing never
+    /// both count the same pod.
+    fn creation_observed_of(&self, key: &str, pod_key: &str) {
+        self.observe_creation(key, pod_key);
+    }
+
+    /// `dsc.expectations.DeletionObserved(dsKey)` (:668), UID-tracked per pod
+    /// so the later DELETED event of an already-observed pod is a no-op.
+    fn deletion_observed(&self, key: &str, pod_key: &str) {
+        self.expectations.deletion_observed_of(key, pod_key);
+    }
+
+    /// "Add a second to avoid milliseconds skew in AddAfter"
+    /// (`updatePod`, :573-632).
+    fn min_ready_requeue_delay(&self, min_ready_seconds: i32) -> Duration {
+        Duration::from_secs(min_ready_seconds as u64 + 1)
+    }
+}
+
 /// Resolve a DaemonSet `maxUnavailable` IntOrString against the desired pod
 /// count (number of eligible nodes). Percentages are rounded UP per K8s
 /// semantics (`intstr.GetScaledValueFromIntOrPercent` with `roundUp=true`).
@@ -2828,7 +2863,7 @@ mod tests {
         let json = serde_json::to_string(&pod).unwrap();
         let queue = WorkQueue::new();
         controller
-            .enqueue_ds_for_pod_event(
+            .deliver_pod_event(
                 &rusternetes_storage::WatchEvent::Modified(pod_key.clone(), json.clone()),
                 &queue,
             )
@@ -2840,7 +2875,7 @@ mod tests {
         );
         // ...and the DELETED event of the same pod is not counted again.
         controller
-            .enqueue_ds_for_pod_event(
+            .deliver_pod_event(
                 &rusternetes_storage::WatchEvent::Deleted(pod_key, json),
                 &queue,
             )
@@ -2949,9 +2984,9 @@ mod tests {
             let key = format!("/registry/pods/default/{}", pod.metadata.name);
             let json = serde_json::to_string(pod).unwrap();
             let ev = rusternetes_storage::WatchEvent::Added(key, json);
-            controller.enqueue_ds_for_pod_event(&ev, &queue).await;
+            controller.deliver_pod_event(&ev, &queue).await;
             // a replayed event must not count twice
-            controller.enqueue_ds_for_pod_event(&ev, &queue).await;
+            controller.deliver_pod_event(&ev, &queue).await;
         }
         assert_eq!(
             controller.expectations.get_expectations("default/cx"),
@@ -3060,5 +3095,282 @@ mod tests {
             Some((0, 0)),
             "the failed create must not be waited on"
         );
+    }
+
+    // --- pod event handlers on the shared pod informer (#3868) -------------
+    // daemon_controller_test.go TestAddPod :2951, TestAddPodOrphan :3000,
+    // TestUpdatePod, TestUpdatePodOrphanSameLabels, TestUpdatePodOrphanWithNewLabels,
+    // TestUpdatePodChangeControllerRef, TestUpdatePodControllerRefRemoved,
+    // TestDeletePod, TestDeletePodOrphan.
+
+    use rusternetes_storage::WatchEvent;
+
+    /// Drive one pod event through the informer's classification and this
+    /// controller's handlers (what `SharedPodInformer::on_event` does, for a
+    /// controller that is not behind an `Arc`).
+    trait DeliverPodEvent {
+        async fn deliver_pod_event(&self, event: &WatchEvent, queue: &WorkQueue);
+    }
+
+    impl DeliverPodEvent for DaemonSetController<MemoryStorage> {
+        async fn deliver_pod_event(&self, event: &WatchEvent, queue: &WorkQueue) {
+            if let Some(observation) = self.pod_informer.cache().on_event(event) {
+                super::super::pod_informer::apply_pod_observation(self, queue, &observation).await;
+            }
+        }
+    }
+
+    fn pod_json(
+        name: &str,
+        owner: Option<(&str, &str)>,
+        labels: &[(&str, &str)],
+        rv: &str,
+    ) -> String {
+        let labels: HashMap<&str, &str> = labels.iter().copied().collect();
+        let mut v = serde_json::json!({
+            "metadata": {
+                "name": name, "namespace": "default", "labels": labels,
+                "resourceVersion": rv
+            },
+            "spec": {"containers": []},
+        });
+        if let Some((owner, uid)) = owner {
+            v["metadata"]["ownerReferences"] = serde_json::json!([{
+                "apiVersion": "apps/v1", "kind": "DaemonSet", "name": owner,
+                "uid": uid, "controller": true
+            }]);
+        }
+        v.to_string()
+    }
+
+    fn pod_key(name: &str) -> String {
+        format!("/registry/pods/default/{name}")
+    }
+
+    /// Two DaemonSets "ds1" (selects app=ds1) and "ds2" (selects app=ds2), as
+    /// upstream's `newDaemonSet("foo1")`/`("foo2")`; returns their UIDs.
+    async fn two_daemonsets() -> (
+        DaemonSetController<MemoryStorage>,
+        (String, String),
+        WorkQueue,
+    ) {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = DaemonSetController::new(storage.clone());
+        let mut uids = Vec::new();
+        for n in ["ds1", "ds2"] {
+            let ds = make_test_daemonset(n, "default");
+            uids.push(ds.metadata.uid.clone());
+            storage
+                .create(&format!("/registry/daemonsets/default/{n}"), &ds)
+                .await
+                .unwrap();
+        }
+        (
+            controller,
+            (uids[0].clone(), uids[1].clone()),
+            WorkQueue::new(),
+        )
+    }
+
+    async fn drain(queue: &WorkQueue) -> Vec<String> {
+        let mut keys = Vec::new();
+        while queue.len().await > 0 {
+            let k = queue.get().await.unwrap();
+            queue.done(&k).await;
+            keys.push(k);
+        }
+        keys.sort();
+        keys
+    }
+
+    /// TestAddPod: a pod owned by a DaemonSet enqueues exactly that one.
+    #[tokio::test]
+    async fn an_owned_pod_enqueues_only_its_daemonset() {
+        let (c, (u1, u2), q) = two_daemonsets().await;
+        c.deliver_pod_event(
+            &WatchEvent::Added(
+                pod_key("p1"),
+                pod_json("p1", Some(("ds1", &u1)), &[("app", "ds1")], "1"),
+            ),
+            &q,
+        )
+        .await;
+        assert_eq!(drain(&q).await, vec!["daemonsets/default/ds1"]);
+        c.deliver_pod_event(
+            &WatchEvent::Added(
+                pod_key("p2"),
+                pod_json("p2", Some(("ds2", &u2)), &[("app", "ds2")], "1"),
+            ),
+            &q,
+        )
+        .await;
+        assert_eq!(drain(&q).await, vec!["daemonsets/default/ds2"]);
+    }
+
+    /// `resolveControllerRef`: a UID that does not match the DaemonSet found by
+    /// name, or a different kind, resolves to nothing (daemon_controller.go:769).
+    #[tokio::test]
+    async fn a_pod_owned_by_another_uid_or_kind_enqueues_nothing() {
+        let (c, _, q) = two_daemonsets().await;
+        c.deliver_pod_event(
+            &WatchEvent::Added(
+                pod_key("p1"),
+                pod_json("p1", Some(("ds1", "stale-uid")), &[("app", "ds1")], "1"),
+            ),
+            &q,
+        )
+        .await;
+        let wrong_kind = pod_json("p2", Some(("ds1", "x")), &[("app", "ds1")], "1")
+            .replace("\"DaemonSet\"", "\"ReplicaSet\"");
+        c.deliver_pod_event(&WatchEvent::Added(pod_key("p2"), wrong_kind), &q)
+            .await;
+        assert!(drain(&q).await.is_empty());
+    }
+
+    /// TestAddPodOrphan: an orphan wakes every DaemonSet whose selector
+    /// matches its labels (`GetPodDaemonSets`) and none that do not.
+    #[tokio::test]
+    async fn an_orphan_wakes_the_daemonsets_whose_selector_matches() {
+        let (c, _, q) = two_daemonsets().await;
+        c.deliver_pod_event(
+            &WatchEvent::Added(
+                pod_key("stray"),
+                pod_json("stray", None, &[("app", "nope")], "1"),
+            ),
+            &q,
+        )
+        .await;
+        // `len(pod.Labels) == 0` matches nothing either.
+        c.deliver_pod_event(
+            &WatchEvent::Added(pod_key("bare"), pod_json("bare", None, &[], "1")),
+            &q,
+        )
+        .await;
+        assert!(drain(&q).await.is_empty());
+        c.deliver_pod_event(
+            &WatchEvent::Added(
+                pod_key("adoptable"),
+                pod_json("adoptable", None, &[("app", "ds2")], "1"),
+            ),
+            &q,
+        )
+        .await;
+        assert_eq!(drain(&q).await, vec!["daemonsets/default/ds2"]);
+    }
+
+    /// TestUpdatePod + the "periodic resync" guard: an update with the same
+    /// resourceVersion is ignored, a new one wakes the owner.
+    #[tokio::test]
+    async fn an_updated_owned_pod_enqueues_its_daemonset_unless_resync() {
+        let (c, (u1, _), q) = two_daemonsets().await;
+        let p = |rv: &str| pod_json("p1", Some(("ds1", &u1)), &[("app", "ds1")], rv);
+        c.deliver_pod_event(&WatchEvent::Added(pod_key("p1"), p("1")), &q)
+            .await;
+        drain(&q).await;
+        c.deliver_pod_event(&WatchEvent::Modified(pod_key("p1"), p("1")), &q)
+            .await;
+        assert!(drain(&q).await.is_empty(), "same resourceVersion");
+        c.deliver_pod_event(&WatchEvent::Modified(pod_key("p1"), p("2")), &q)
+            .await;
+        assert_eq!(drain(&q).await, vec!["daemonsets/default/ds1"]);
+    }
+
+    /// TestUpdatePodOrphanSameLabels / TestUpdatePodOrphanWithNewLabels.
+    #[tokio::test]
+    async fn an_orphan_update_wakes_matching_sets_only_when_labels_change() {
+        let (c, _, q) = two_daemonsets().await;
+        let p = |rv: &str, app: &str| pod_json("o", None, &[("app", app)], rv);
+        c.deliver_pod_event(&WatchEvent::Added(pod_key("o"), p("1", "nope")), &q)
+            .await;
+        drain(&q).await;
+        c.deliver_pod_event(&WatchEvent::Modified(pod_key("o"), p("2", "nope")), &q)
+            .await;
+        assert!(drain(&q).await.is_empty(), "same labels");
+        c.deliver_pod_event(&WatchEvent::Modified(pod_key("o"), p("3", "ds1")), &q)
+            .await;
+        assert_eq!(drain(&q).await, vec!["daemonsets/default/ds1"]);
+    }
+
+    /// TestUpdatePodChangeControllerRef: both the old and the new owner wake.
+    #[tokio::test]
+    async fn changing_the_controller_ref_wakes_old_and_new_owner() {
+        let (c, (u1, u2), q) = two_daemonsets().await;
+        c.deliver_pod_event(
+            &WatchEvent::Added(
+                pod_key("p"),
+                pod_json("p", Some(("ds1", &u1)), &[("app", "ds1")], "1"),
+            ),
+            &q,
+        )
+        .await;
+        drain(&q).await;
+        c.deliver_pod_event(
+            &WatchEvent::Modified(
+                pod_key("p"),
+                pod_json("p", Some(("ds2", &u2)), &[("app", "ds1")], "2"),
+            ),
+            &q,
+        )
+        .await;
+        assert_eq!(
+            drain(&q).await,
+            vec!["daemonsets/default/ds1", "daemonsets/default/ds2"]
+        );
+    }
+
+    /// TestUpdatePodControllerRefRemoved: the old owner wakes, and so do the
+    /// sets that could now adopt the orphan.
+    #[tokio::test]
+    async fn removing_the_controller_ref_wakes_the_old_owner_and_adopters() {
+        let (c, (u1, _), q) = two_daemonsets().await;
+        c.deliver_pod_event(
+            &WatchEvent::Added(
+                pod_key("p"),
+                pod_json("p", Some(("ds1", &u1)), &[("app", "ds2")], "1"),
+            ),
+            &q,
+        )
+        .await;
+        drain(&q).await;
+        c.deliver_pod_event(
+            &WatchEvent::Modified(pod_key("p"), pod_json("p", None, &[("app", "ds2")], "2")),
+            &q,
+        )
+        .await;
+        assert_eq!(
+            drain(&q).await,
+            vec!["daemonsets/default/ds1", "daemonsets/default/ds2"]
+        );
+    }
+
+    /// TestDeletePod / TestDeletePodOrphan: deleting an owned pod wakes its
+    /// owner only; deleting an orphan wakes nobody ("No controller should care
+    /// about orphans being deleted").
+    #[tokio::test]
+    async fn deleting_an_owned_pod_wakes_its_owner_and_an_orphan_nobody() {
+        let (c, (u1, _), q) = two_daemonsets().await;
+        let owned = pod_json("p", Some(("ds1", &u1)), &[("app", "ds1")], "1");
+        c.deliver_pod_event(&WatchEvent::Added(pod_key("p"), owned.clone()), &q)
+            .await;
+        drain(&q).await;
+        c.deliver_pod_event(&WatchEvent::Deleted(pod_key("p"), owned), &q)
+            .await;
+        assert_eq!(drain(&q).await, vec!["daemonsets/default/ds1"]);
+        let orphan = pod_json("o", None, &[("app", "ds1")], "1");
+        c.deliver_pod_event(&WatchEvent::Added(pod_key("o"), orphan.clone()), &q)
+            .await;
+        drain(&q).await;
+        c.deliver_pod_event(&WatchEvent::Deleted(pod_key("o"), orphan), &q)
+            .await;
+        assert!(drain(&q).await.is_empty());
+    }
+
+    /// `updatePod` (daemon_controller.go:573-632): a pod turning Ready requeues
+    /// the DaemonSet after `minReadySeconds` PLUS ONE second ("Add a second to
+    /// avoid milliseconds skew in AddAfter").
+    #[tokio::test]
+    async fn a_pod_turning_ready_requeues_after_min_ready_seconds_plus_one() {
+        let (c, _, _) = two_daemonsets().await;
+        assert_eq!(c.min_ready_requeue_delay(10), Duration::from_secs(11));
     }
 }
