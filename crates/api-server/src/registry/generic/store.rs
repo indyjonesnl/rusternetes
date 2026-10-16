@@ -440,12 +440,17 @@ impl<T: Object, S: Storage> Store<T, S> {
 
     /// `calculateTTL` (store.go:1469-1486): the TTL to persist `obj` with.
     ///
-    /// `default_ttl` is the object's current TTL. Upstream reads it back from
-    /// the etcd lease (`res.TTL`) on an update; the [`Storage`] trait cannot
-    /// report a key's TTL, so an update passes 0. A `TTLFunc` that decides from
-    /// `existing` therefore sees no TTL on update -- the Event one, the only
-    /// in-tree one, ignores it (pkg/registry/core/event/storage/storage.go:
-    /// 42-44).
+    /// `default_ttl` is `res.TTL`. In release-1.35 nothing populates
+    /// `storage.ResponseMeta.TTL`: `etcd3/store.go` `getState` builds
+    /// `&storage.ResponseMeta{}` and sets only `ResourceVersion`, and no
+    /// file under `pkg/storage` assigns `.TTL`. So upstream's `GuaranteedUpdate`
+    /// always hands `calculateTTL` 0, and so does an update here -- this is
+    /// faithful, not a gap (#3153). A `TTLFunc` that decides from `existing`
+    /// sees 0 on update; the Event one, the only in-tree one, ignores it
+    /// (pkg/registry/core/event/storage/storage.go:42-44).
+    ///
+    /// Likewise an update with no `TTLFunc` writes TTL 0 (`updateState`:
+    /// a nil ttl pointer is `ttl = 0`, no lease), as `update_with_ttl` does.
     fn calculate_ttl(&self, obj: &T, default_ttl: u64, update: bool) -> Result<u64> {
         match &self.ttl_func {
             Some(ttl_func) => ttl_func(obj, default_ttl, update),
