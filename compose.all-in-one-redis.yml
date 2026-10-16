@@ -42,6 +42,7 @@ services:
     ports:
       - "6443:6443"
       - "10250:10250"
+      - "10257:10257"
     depends_on:
       redis:
         condition: service_healthy

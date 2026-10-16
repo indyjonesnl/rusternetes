@@ -54,6 +54,7 @@ rusternetes-client = { path = "../client" }
 rusternetes-storage = { path = "../storage" }
 rusternetes-common = { path = "../common" }
 tokio.workspace = true
+axum.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
