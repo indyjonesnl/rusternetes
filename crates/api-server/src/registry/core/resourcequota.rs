@@ -74,6 +74,11 @@ impl RestCreateStrategy<ResourceQuota> for Strategy {
 }
 
 impl RestUpdateStrategy<ResourceQuota> for Strategy {
+    /// `GetResetFields` (pkg/registry/core/resourcequota/strategy.go:49): status.
+    fn get_reset_fields(&self) -> crate::ssa::ResetFields {
+        crate::ssa::ResetFields::new().with("v1", &[&["status"]])
+    }
+
     /// strategy.go:115-117.
     fn allow_create_on_update(&self) -> bool {
         false
@@ -118,6 +123,11 @@ impl NamespaceScopedStrategy for StatusStrategy {
 }
 
 impl RestUpdateStrategy<ResourceQuota> for StatusStrategy {
+    /// `GetResetFields` (pkg/registry/core/resourcequota/strategy.go:143): spec.
+    fn get_reset_fields(&self) -> crate::ssa::ResetFields {
+        crate::ssa::ResetFields::new().with("v1", &[&["spec"]])
+    }
+
     fn allow_create_on_update(&self) -> bool {
         false
     }

@@ -76,6 +76,15 @@ impl RestCreateStrategy<FlowSchema> for Strategy {
 }
 
 impl RestUpdateStrategy<FlowSchema> for Strategy {
+    /// `GetResetFields` (pkg/registry/flowcontrol/flowschema/strategy.go:48): status.
+    fn get_reset_fields(&self) -> crate::ssa::ResetFields {
+        crate::ssa::ResetFields::new()
+            .with("flowcontrol.apiserver.k8s.io/v1beta1", &[&["status"]])
+            .with("flowcontrol.apiserver.k8s.io/v1beta2", &[&["status"]])
+            .with("flowcontrol.apiserver.k8s.io/v1beta3", &[&["status"]])
+            .with("flowcontrol.apiserver.k8s.io/v1", &[&["status"]])
+    }
+
     fn allow_create_on_update(&self) -> bool {
         false
     }
@@ -114,6 +123,27 @@ impl NamespaceScopedStrategy for StatusStrategy {
 }
 
 impl RestUpdateStrategy<FlowSchema> for StatusStrategy {
+    /// `GetResetFields` (pkg/registry/flowcontrol/flowschema/strategy.go:128): metadata, spec.
+    fn get_reset_fields(&self) -> crate::ssa::ResetFields {
+        crate::ssa::ResetFields::new()
+            .with(
+                "flowcontrol.apiserver.k8s.io/v1beta1",
+                &[&["metadata"], &["spec"]],
+            )
+            .with(
+                "flowcontrol.apiserver.k8s.io/v1beta2",
+                &[&["metadata"], &["spec"]],
+            )
+            .with(
+                "flowcontrol.apiserver.k8s.io/v1beta3",
+                &[&["metadata"], &["spec"]],
+            )
+            .with(
+                "flowcontrol.apiserver.k8s.io/v1",
+                &[&["metadata"], &["spec"]],
+            )
+    }
+
     fn allow_create_on_update(&self) -> bool {
         false
     }

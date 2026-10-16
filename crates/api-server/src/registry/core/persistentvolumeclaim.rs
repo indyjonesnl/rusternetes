@@ -198,6 +198,11 @@ impl RestCreateStrategy<PersistentVolumeClaim> for Strategy {
 }
 
 impl RestUpdateStrategy<PersistentVolumeClaim> for Strategy {
+    /// `GetResetFields` (pkg/registry/core/persistentvolumeclaim/strategy.go:54): status.
+    fn get_reset_fields(&self) -> crate::ssa::ResetFields {
+        crate::ssa::ResetFields::new().with("v1", &[&["status"]])
+    }
+
     fn allow_create_on_update(&self) -> bool {
         false
     }
@@ -257,6 +262,11 @@ impl NamespaceScopedStrategy for StatusStrategy {
 }
 
 impl RestUpdateStrategy<PersistentVolumeClaim> for StatusStrategy {
+    /// `GetResetFields` (pkg/registry/core/persistentvolumeclaim/strategy.go:145): spec.
+    fn get_reset_fields(&self) -> crate::ssa::ResetFields {
+        crate::ssa::ResetFields::new().with("v1", &[&["spec"]])
+    }
+
     fn allow_create_on_update(&self) -> bool {
         false
     }
