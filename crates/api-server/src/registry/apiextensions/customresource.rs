@@ -21,7 +21,7 @@
 //!
 //! Not ported here, and still served by the bespoke handlers:
 //! - list and watch, tracked in #2135;
-//! - `GetResetFields` (managed-fields reset sets) and table conversion;
+//! - table conversion;
 //! - `x-kubernetes-list-type` map/set uniqueness (`listtype.ValidateListSetsAndMaps`)
 //!   and the `schemaobjectmeta.Validate` embedded-resource check, which
 //!   Rusternetes' schema validator does not implement.
@@ -70,6 +70,7 @@ use crate::registry::rest::{
     GroupResource, NamespaceScopedStrategy, RequestContext, RestCreateStrategy, RestDeleteStrategy,
     RestStorage, RestUpdateStrategy, UpdatedObjectInfo, ValidateObject, ValidateObjectUpdate,
 };
+use crate::ssa::ResetFields;
 
 /// The first segment of a custom resource's storage key
 /// (`/registry/{this}/{ns}/{name}`): the group with `.` as `_`, then the
@@ -515,6 +516,16 @@ impl RestUpdateStrategy<CustomResource> for Strategy {
     }
 
     /// strategy.go:282-285.
+    /// `GetResetFields` (strategy.go:130-142): `status`, only when the
+    /// version has a `/status` subresource (`a.status != nil`).
+    fn get_reset_fields(&self) -> ResetFields {
+        let mut fields = ResetFields::new();
+        if self.status_enabled() {
+            fields = fields.with(&self.api_version(), &[&["status"]]);
+        }
+        fields
+    }
+
     fn allow_unconditional_update(&self) -> bool {
         false
     }
@@ -574,6 +585,11 @@ impl RestUpdateStrategy<CustomResource> for StatusStrategy {
         _old: &CustomResource,
     ) -> Vec<String> {
         Vec::new()
+    }
+
+    /// `GetResetFields` (status_strategy.go:46-64): `spec`.
+    fn get_reset_fields(&self) -> ResetFields {
+        ResetFields::new().with(&self.0.api_version(), &[&["spec"]])
     }
 
     fn allow_unconditional_update(&self) -> bool {
@@ -766,6 +782,12 @@ impl CustomResourceRest {
 
 #[async_trait]
 impl RestStorage<CustomResource> for CustomResourceRest {
+    /// The REST embeds `*genericregistry.Store`, so `GetResetFields` is promoted
+    /// from it (store.go:1698-1703).
+    fn get_reset_fields(&self) -> ResetFields {
+        RestStorage::get_reset_fields(&self.store)
+    }
+
     /// `schemaCoercingDecoder.Decode` + `unstructuredDefaulter.Default`
     /// (customresource_handler.go:1189-1200, 1321-1346): the body is
     /// defaulted and pruned as it is decoded, so admission sees the result.
