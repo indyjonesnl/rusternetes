@@ -63,6 +63,7 @@ mod runtime;
 mod runtime_state;
 mod server;
 mod server_auth;
+mod server_logs;
 mod server_metrics;
 mod server_metrics_endpoints;
 mod static_pod_url;
@@ -480,6 +481,9 @@ async fn main() -> Result<()> {
     let enable_debugging_handlers = config_file
         .as_ref()
         .is_none_or(|c| c.debugging_handlers_enabled());
+    let enable_system_log_handler = config_file
+        .as_ref()
+        .is_none_or(|c| c.system_log_handler_enabled());
 
     let runtime_config = RuntimeConfig::build(
         args.root_dir,
@@ -839,10 +843,18 @@ async fn main() -> Result<()> {
         } else {
             server::install_debugging_disabled_handlers(app)
         };
+        // server.go:315-325 InstallSystemLogHandler / InstallDebuggingDisabledHandlers.
+        let app = server_logs::install_logs_handlers(
+            app,
+            enable_debugging_handlers,
+            enable_system_log_handler,
+            std::path::PathBuf::from(server_logs::NODE_LOG_DIR),
+        );
         // server.go:328 `installStatusZ()`: last, over the routes registered so far.
         let registered: Vec<String> = ["/metrics"]
             .into_iter()
             .chain(server_metrics_endpoints::PATHS)
+            .chain([server_logs::LOGS_PATH])
             .map(String::from)
             .chain(
                 enable_debugging_handlers
