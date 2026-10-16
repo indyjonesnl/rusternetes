@@ -191,8 +191,11 @@ rusternetes-scheduler [OPTIONS]
 | `--metrics-port` | `8081` | Metrics server port |
 | `--enable-leader-election` | `false` | Enable leader election (HA) |
 | `--leader-election-identity` | — | Unique identity per instance |
-| `--leader-election-lock-key` | `/rusternetes/scheduler/leader` | Lock key |
+| `--leader-election-resource-namespace` | `kube-system` | Namespace of the leader-election Lease |
+| `--leader-election-resource-name` | `kube-scheduler` | Name of the leader-election Lease |
 | `--leader-election-lease-duration` | `15` | Lease duration (seconds) |
+| `--leader-election-renew-deadline` | `10` | Renew deadline (seconds) |
+| `--leader-election-retry-period` | `2` | Retry period (seconds) |
 
 ### controller-manager
 
@@ -212,8 +215,11 @@ rusternetes-controller-manager [OPTIONS]
 | `--cloud-region` | — | Cloud provider region |
 | `--enable-leader-election` | `false` | Enable leader election (HA) |
 | `--leader-election-identity` | — | Unique identity per instance |
-| `--leader-election-lock-key` | `/rusternetes/controller-manager/leader` | Lock key |
+| `--leader-election-resource-namespace` | `kube-system` | Namespace of the leader-election Lease |
+| `--leader-election-resource-name` | `kube-controller-manager` | Name of the leader-election Lease |
 | `--leader-election-lease-duration` | `15` | Lease duration (seconds) |
+| `--leader-election-renew-deadline` | `10` | Renew deadline (seconds) |
+| `--leader-election-retry-period` | `2` | Retry period (seconds) |
 
 ### kubelet
 

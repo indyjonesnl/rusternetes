@@ -35,7 +35,7 @@ pub mod go_duration;
 pub mod jsonpath;
 pub mod label_selector;
 pub mod latency_trackers;
-pub mod leader_election;
+pub mod leaderelection;
 pub mod observability;
 pub mod pagination;
 pub mod patch;

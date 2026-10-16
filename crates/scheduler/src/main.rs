@@ -27,7 +27,6 @@ mod volume_binding;
 use anyhow::Result;
 use axum::{routing::get, Router};
 use clap::Parser;
-use rusternetes_common::leader_election::{LeaderElectionConfig, LeaderElector};
 use rusternetes_common::observability::MetricsRegistry;
 use rusternetes_storage::{StorageBackend, StorageConfig};
 use scheduler::Scheduler;
@@ -119,13 +118,35 @@ struct Args {
     #[arg(long)]
     leader_election_identity: Option<String>,
 
-    /// Leader election lock key
-    #[arg(long, default_value = "/rusternetes/scheduler/leader")]
-    leader_election_lock_key: String,
+    /// Leader election lock key (etcd key of the retired etcd-lease elector;
+    /// accepted and ignored, the lock is now a Lease -- see
+    /// `--leader-election-resource-namespace` / `--leader-election-resource-name`).
+    #[arg(long, hide = true)]
+    leader_election_lock_key: Option<String>,
+
+    /// Namespace of the leader-election Lease
+    /// (`--leader-elect-resource-namespace`, kube-system by default).
+    #[arg(long, default_value = "kube-system")]
+    leader_election_resource_namespace: String,
+
+    /// Name of the leader-election Lease (`--leader-elect-resource-name`).
+    #[arg(long, default_value = "kube-scheduler")]
+    leader_election_resource_name: String,
 
     /// Leader election lease duration in seconds
+    /// (`LeaseDuration`, 15s: component-base v1alpha1 defaults.go:37-39)
     #[arg(long, default_value = "15")]
     leader_election_lease_duration: u64,
+
+    /// Seconds the acting leader retries refreshing leadership before giving up
+    /// (`RenewDeadline`, 10s: defaults.go:40-42)
+    #[arg(long, default_value = "10")]
+    leader_election_renew_deadline: u64,
+
+    /// Seconds between tries of leader-election actions
+    /// (`RetryPeriod`, 2s: defaults.go:43-45)
+    #[arg(long, default_value = "2")]
+    leader_election_retry_period: u64,
 }
 
 /// `statusz.Install` behind the `ComponentStatusz` gate
@@ -238,49 +259,51 @@ async fn main() -> Result<()> {
 
     // Leader election
     if args.enable_leader_election {
-        let etcd_endpoints: Vec<String> = args
-            .etcd_servers
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .collect();
-
         let identity = args
             .leader_election_identity
             .unwrap_or_else(|| format!("scheduler-{}", Uuid::new_v4()));
-
-        let config = LeaderElectionConfig {
-            identity: identity.clone(),
-            lock_key: args.leader_election_lock_key,
-            lease_duration: args.leader_election_lease_duration,
-            renew_interval: args.leader_election_lease_duration / 3,
-            retry_interval: 2,
-        };
+        if args.leader_election_lock_key.is_some() {
+            warn!("--leader-election-lock-key is ignored: the lock is a coordination.k8s.io Lease");
+        }
 
         info!(identity = %identity, "Leader election enabled - starting in follower mode");
 
-        let elector = Arc::new(LeaderElector::new(etcd_endpoints, config).await?);
-        let elector_clone = elector.clone();
-        let election = tokio::spawn(async move {
-            if let Err(e) = elector_clone.run().await {
-                tracing::error!("Leader election error: {}", e);
-            }
-        });
-        // ReleaseOnCancel: true (cmd/kube-scheduler/app/options/options.go:375):
-        // on cancel, give up the lock; bounded by RenewDeadline (leaderelection.go:304-307).
-        let release_timeout =
-            std::time::Duration::from_secs((args.leader_election_lease_duration * 2 / 3).max(1));
-        let releaser = {
-            let ctx = ctx.clone();
-            let elector = elector.clone();
-            tokio::spawn(async move {
-                rusternetes_common::leader_election::release_on_cancel(
-                    &ctx,
-                    || async move { elector.shutdown().await },
-                    election,
-                    release_timeout,
-                )
-                .await
-            })
+        // cmd/kube-scheduler/app/server.go:310-322 OnStoppedLeading: exit 0 if
+        // asked to terminate, otherwise "Leaderelection lost" and exit 1.
+        let stopped_ctx = ctx.clone();
+        let elector = Arc::new(rusternetes_common::leaderelection::LeaderElector::new(
+            rusternetes_common::leaderelection::ElectionConfig {
+                lock: Arc::new(rusternetes_storage::lease_lock::LeaseLock::new(
+                    storage.clone(),
+                    args.leader_election_resource_namespace.clone(),
+                    args.leader_election_resource_name.clone(),
+                    identity.clone(),
+                )),
+                lease_duration: std::time::Duration::from_secs(args.leader_election_lease_duration),
+                renew_deadline: std::time::Duration::from_secs(args.leader_election_renew_deadline),
+                retry_period: std::time::Duration::from_secs(args.leader_election_retry_period),
+                // ReleaseOnCancel: true (cmd/kube-scheduler/app/options/options.go:375).
+                release_on_cancel: true,
+                name: args.leader_election_resource_name.clone(),
+                callbacks: rusternetes_common::leaderelection::LeaderCallbacks {
+                    on_started_leading: Arc::new(|_| {}),
+                    on_stopped_leading: Arc::new(move || {
+                        if stopped_ctx.is_cancelled() {
+                            info!("Requested to terminate, exiting");
+                            std::process::exit(0);
+                        }
+                        tracing::error!("Leaderelection lost");
+                        std::process::exit(1);
+                    }),
+                    on_new_leader: None,
+                },
+            },
+        )?);
+        // `leaderElector.Run(ctx)`; on cancel it releases the lock before
+        // returning, then OnStoppedLeading exits 0.
+        let election = {
+            let (elector, ctx) = (elector.clone(), ctx.clone());
+            tokio::spawn(async move { elector.run(ctx).await })
         };
 
         let scheduler = Arc::new(Scheduler::new_with_profiles(
@@ -289,12 +312,12 @@ async fn main() -> Result<()> {
             profiles.clone(),
         ));
         loop {
-            while !elector.is_leader().await {
+            while !elector.is_leader() {
                 tokio::select! {
                     _ = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {}
                     _ = ctx.cancelled() => {
                         info!("Requested to terminate, exiting");
-                        let _ = releaser.await;
+                        let _ = election.await;
                         return Ok(());
                     }
                 }
@@ -310,15 +333,15 @@ async fn main() -> Result<()> {
                     // OnStoppedLeading with ctx.Done(): "Requested to terminate, exiting"
                     // (server.go:310-316). Wait for release() to finish first.
                     info!("Requested to terminate, exiting");
-                    let _ = releaser.await;
+                    let _ = election.await;
                     return Ok(());
                 }
             }
             if ctx.is_cancelled() {
-                let _ = releaser.await;
+                let _ = election.await;
                 return Ok(());
             }
-            if !elector.is_leader().await {
+            if !elector.is_leader() {
                 warn!("Scheduler stopped (lost leadership)");
                 continue;
             }
