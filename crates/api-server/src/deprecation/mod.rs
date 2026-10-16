@@ -182,8 +182,21 @@ pub fn lookup(
     }
 }
 
+/// `resourceExpirationEvaluator.ShouldServeForVersion`
+/// (`staging/src/k8s.io/apiserver/pkg/server/deleted_kinds.go:150-172`) for a
+/// GA build: `isAlpha` is false (no `-alpha` prerelease) and
+/// `KUBE_APISERVER_SERVE_REMOVED_APIS_FOR_ONE_RELEASE` is unset, so a kind
+/// whose `APILifecycleRemoved` is at or before the current release is not
+/// served (`removeDeletedKinds`, `:184`, drops its storage and so its route).
+pub fn should_serve_for_version(removed: (u32, u32), current: (u32, u32)) -> bool {
+    // MajorMinor ordering is (major, minor) lexicographic; equal means "remove
+    // when the current release GAs", which a GA build does.
+    removed > current
+}
+
 /// `(deprecated, removedRelease)` for a request, as computed once per route in
-/// `installer.go:781-797` against [`CURRENT_MAJOR_MINOR`].
+/// `installer.go:781-797` against [`CURRENT_MAJOR_MINOR`]. A kind that is no
+/// longer served has no installed route, hence no deprecation (#3755).
 pub fn deprecation_for(
     group: &str,
     version: &str,
@@ -192,6 +205,13 @@ pub fn deprecation_for(
 ) -> (bool, String) {
     let obj = lookup(group, version, resource, subresource);
     let (major, minor) = CURRENT_MAJOR_MINOR;
+    // `isNotRemoved` (deleted_kinds.go:128-146): a type without
+    // `APILifecycleRemoved` is always served.
+    if let Some(removed) = obj.and_then(|o| o.removed) {
+        if !should_serve_for_version(removed, CURRENT_MAJOR_MINOR) {
+            return (false, String::new());
+        }
+    }
     if is_deprecated(obj, major as i64, minor as i64) {
         (true, removed_release(obj))
     } else {

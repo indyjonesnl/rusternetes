@@ -1217,15 +1217,19 @@ mod tests {
     fn deprecated_api_request_sets_gauge() {
         use crate::flow_control::metric_test_util::{has_series, sample};
         let l = [
-            ("group", "apps"),
-            ("version", "v1beta1"),
-            ("resource", "deployments"),
+            ("group", "admissionregistration.k8s.io"),
+            ("version", "v1alpha1"),
+            ("resource", "mutatingadmissionpolicies"),
             ("subresource", ""),
-            ("removed_release", "1.16"),
+            ("removed_release", "1.38"),
         ];
         assert!(!has_series("apiserver_requested_deprecated_apis", &l));
         monitor_request(
-            &deprecated_meta("apps", "v1beta1", "deployments"),
+            &deprecated_meta(
+                "admissionregistration.k8s.io",
+                "v1alpha1",
+                "mutatingadmissionpolicies",
+            ),
             "apiserver",
             200,
             Duration::ZERO,
@@ -1276,7 +1280,7 @@ mod tests {
         });
         let app = Router::new()
             .route(
-                "/apis/extensions/v1beta1/namespaces/:ns/ingresses",
+                "/apis/admissionregistration.k8s.io/v1alpha1/mutatingadmissionpolicies",
                 get(|| async { "ok" }),
             )
             .layer(middleware::from_fn(instrument_request))
@@ -1286,9 +1290,11 @@ mod tests {
             }));
         let resp = app
             .oneshot(
-                Request::get("/apis/extensions/v1beta1/namespaces/default/ingresses")
-                    .body(Body::empty())
-                    .unwrap(),
+                Request::get(
+                    "/apis/admissionregistration.k8s.io/v1alpha1/mutatingadmissionpolicies",
+                )
+                .body(Body::empty())
+                .unwrap(),
             )
             .await
             .unwrap();
@@ -1304,7 +1310,7 @@ mod tests {
         );
         assert_eq!(
             ann.get("k8s.io/removed-release").map(String::as_str),
-            Some("1.22")
+            Some("1.38")
         );
     }
 }

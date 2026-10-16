@@ -161,16 +161,17 @@ fn lookup_deployment_v1beta1() {
     assert_eq!(l.kind, "Deployment");
     assert_eq!(l.deprecated, (1, 8));
     assert_eq!(l.removed, Some((1, 16)));
+    // Removed in 1.16 < 1.35: upstream never installs the route (#3755).
     assert_eq!(
         deprecation_for("apps", "v1beta1", "deployments", ""),
-        (true, "1.16".to_string())
+        (false, String::new())
     );
     assert_eq!(
         warning_message(Some(l)),
         "apps/v1beta1 Deployment is deprecated in v1.8+, unavailable in v1.16+; use apps/v1 Deployment"
     );
     // status serves the parent kind; scale serves Scale.
-    assert!(deprecation_for("apps", "v1beta1", "deployments", "status").0);
+    assert!(!deprecation_for("apps", "v1beta1", "deployments", "status").0);
     assert_eq!(
         lookup("apps", "v1beta1", "deployments", "scale")
             .unwrap()
@@ -215,4 +216,31 @@ fn table_is_sorted_and_complete() {
             assert!(r >= l.deprecated, "{} {}", l.version, l.kind);
         }
     }
+}
+
+/// `ShouldServeForVersion` (deleted_kinds.go:150-172), GA build: removed after
+/// current is served; equal or before is not.
+#[test]
+fn should_serve_for_version_ga_build() {
+    assert!(should_serve_for_version((1, 36), (1, 35)));
+    assert!(should_serve_for_version((2, 0), (1, 35)));
+    assert!(!should_serve_for_version((1, 35), (1, 35)));
+    assert!(!should_serve_for_version((1, 16), (1, 35)));
+    assert!(!should_serve_for_version((0, 99), (1, 35)));
+}
+
+/// A still-served deprecated kind keeps its deprecation:
+/// admissionregistration.k8s.io/v1alpha1 MutatingAdmissionPolicy, deprecated
+/// 1.35, removed 1.38.
+#[test]
+fn served_deprecated_kind_is_deprecated() {
+    assert_eq!(
+        deprecation_for(
+            "admissionregistration.k8s.io",
+            "v1alpha1",
+            "mutatingadmissionpolicies",
+            ""
+        ),
+        (true, "1.38".to_string())
+    );
 }
