@@ -2,15 +2,16 @@
 //! go with them, plus `buildQueueingHintMap`.
 //!
 //! Ported from upstream:
-//! - `pkg/scheduler/scheduler.go`: `buildQueueingHintMap` (`:318-385`),
-//!   `defaultQueueingHintFn` (`:541-543`).
+//! - `pkg/scheduler/scheduler.go`: `buildQueueingHintMap` (`:468-533`),
+//!   `defaultQueueingHintFn` (`:462-466`).
 //! - `pkg/scheduler/framework/plugins/noderesources/fit.go`:
-//!   `EventsToRegister` (`:341-363`), `isSchedulableAfterPodEvent`
-//!   (`:365-410`), `isSchedulableAfterNodeChange` (`:413-440`), `isFit`
-//!   (`:443-496`), `haveAnyRequestedResourcesIncreased` (`:530-569`).
+//!   `EventsToRegister` (`:341-371`), `isSchedulableAfterPodEvent`
+//!   (`:373-408`), `isSchedulableAfterPodScaleDown` (`:410-460`),
+//!   `isSchedulableAfterNodeChange` (`:462-489`), `isFit` (`:573`),
+//!   `haveAnyRequestedResourcesIncreased` (`:530-571`).
 //! - `pkg/scheduler/framework/plugins/nodeaffinity/node_affinity.go`:
-//!   `EventsToRegister` (`:84-98`), `isSchedulableAfterNodeChange`
-//!   (`:101-156`).
+//!   `EventsToRegister` (`:101-117`), `isSchedulableAfterNodeChange`
+//!   (`:119-174`).
 //!
 //! Only NodeResourcesFit and NodeAffinity ship hint functions in this slice;
 //! every other in-tree plugin registers its events hint-less, which
@@ -34,13 +35,13 @@ fn pod_name(pod: &Pod) -> String {
     )
 }
 
-/// `defaultQueueingHintFn` (`scheduler.go:541-543`): a plugin without a hint
+/// `defaultQueueingHintFn` (`scheduler.go:462-466`): a plugin without a hint
 /// function has its Pods retried (after backoff) on every registered event.
 pub fn default_queueing_hint_fn() -> QueueingHintFn {
     Arc::new(|_, _, _| Ok(QueueingHint::Queue))
 }
 
-/// `buildQueueingHintMap` (`scheduler.go:318-385`) for one profile.
+/// `buildQueueingHintMap` (`scheduler.go:468-533`) for one profile.
 ///
 /// A plugin registering `Node/Add` but not `Node/UpdateNodeTaint` also gets
 /// `Node/UpdateNodeTaint` with the default hint: an Unschedulable node is
@@ -96,11 +97,13 @@ pub fn build_queueing_hint_map(plugins: &[(String, Vec<ClusterEventWithHint>)]) 
     queueing_hint_map
 }
 
-/// `buildQueueingHintMap` run for every profile (`scheduler.go:299-316`):
+/// `buildQueueingHintMap` run for every profile (`scheduler.go:394-401`):
 /// each profile contributes the events of the plugins it enables.
-pub fn build_queueing_hint_map_per_profile(profiles: &[Profile]) -> QueueingHintMapPerProfile {
+pub fn build_queueing_hint_map_per_profile<'a>(
+    profiles: impl IntoIterator<Item = &'a Profile>,
+) -> QueueingHintMapPerProfile {
     profiles
-        .iter()
+        .into_iter()
         .map(|p| {
             let plugins: Vec<(String, Vec<ClusterEventWithHint>)> = p
                 .framework
@@ -115,13 +118,13 @@ pub fn build_queueing_hint_map_per_profile(profiles: &[Profile]) -> QueueingHint
 
 /// `EventsToRegister` of every in-tree plugin (feature gates at their 1.35
 /// defaults). Plugins without `EnqueueExtensions` get
-/// `UnrollWildCardResource` (`fillEnqueueExtensions`, `scheduler.go:487-508`).
+/// `UnrollWildCardResource` (`fillEnqueueExtensions`, `framework.go:673-689`).
 pub fn events_to_register(plugin_name: &str, profile: &Profile) -> Vec<ClusterEventWithHint> {
     use ActionType as A;
     use EventResource as R;
     let ev = |r: R, a: A| ClusterEventWithHint::new(ClusterEvent::new(r, a));
     match plugin_name {
-        // fit.go:341-363
+        // fit.go:341-371
         names::NODE_RESOURCES_FIT => vec![
             ClusterEventWithHint::with_hint(
                 ClusterEvent::new(R::Pod, A::DELETE | A::UPDATE_POD_SCALE_DOWN),
@@ -132,10 +135,10 @@ pub fn events_to_register(plugin_name: &str, profile: &Profile) -> Vec<ClusterEv
                 Arc::new(node_resources_fit::is_schedulable_after_node_change),
             ),
         ],
-        // node_affinity.go:84-98
+        // node_affinity.go:101-117
         names::NODE_AFFINITY => {
             // `addedNodeSelector` = NewNodeSelector(addedAffinity.Required…)
-            // (node_affinity.go:277-284).
+            // (node_affinity.go:321).
             let added = profile.added_affinity.as_ref().and_then(|a| {
                 a.required_during_scheduling_ignored_during_execution
                     .clone()
@@ -234,7 +237,7 @@ pub mod node_resources_fit {
     use crate::advanced::pod_request_amounts;
     use rusternetes_common::quantity::parse_resource_value;
 
-    /// `isSchedulableAfterPodEvent` (`fit.go:365-410`): a Pod delete or
+    /// `isSchedulableAfterPodEvent` (`fit.go:373-408`): a Pod delete or
     /// scale-down on the same node family frees resources; only an
     /// assigned Pod matters, and only when it would have shared a node.
     pub fn is_schedulable_after_pod_event(
@@ -288,7 +291,7 @@ pub mod node_resources_fit {
         Ok(QueueingHint::Queue)
     }
 
-    /// `isSchedulableAfterPodScaleDown` (`fit.go:388-405`, inline in upstream):
+    /// `isSchedulableAfterPodScaleDown` (`fit.go:410-460`):
     /// the resources released by the scale down must be ones the target
     /// Pod requests.
     fn is_schedulable_after_pod_scale_down(
@@ -315,7 +318,7 @@ pub mod node_resources_fit {
         false
     }
 
-    /// `isSchedulableAfterNodeChange` (`fit.go:413-440`): Node add, or an
+    /// `isSchedulableAfterNodeChange` (`fit.go:462-489`): Node add, or an
     /// allocatable update that increased a requested resource, when the
     /// (new) node fits the Pod on its own.
     pub fn is_schedulable_after_node_change(
@@ -342,7 +345,7 @@ pub mod node_resources_fit {
         Ok(QueueingHint::Queue)
     }
 
-    /// `haveAnyRequestedResourcesIncreased` (`fit.go:530-569`): true when
+    /// `haveAnyRequestedResourcesIncreased` (`fit.go:530-571`): true when
     /// any resource the Pod requests has a larger allocatable on the new
     /// node than on the old one (allowed pods count included).
     pub fn have_any_requested_resources_increased(
@@ -367,7 +370,7 @@ pub mod node_resources_fit {
         false
     }
 
-    /// `isFit` (`fit.go:443-496`): does the node, assumed empty, have enough
+    /// `isFit` (`fit.go:573`): does the node, assumed empty, have enough
     /// allocatable for the Pod's requests? Mirrors `Fits(pod, NewNodeInfo(node))`:
     /// at least one allowed Pod, and every requested resource covered.
     pub fn is_fit(pod: &Pod, node: &Node) -> bool {
@@ -405,7 +408,7 @@ pub mod node_affinity {
     use super::*;
     use rusternetes_common::affinity::{check_node_affinity, matches_node_selector};
 
-    /// `isSchedulableAfterNodeChange` (`node_affinity.go:101-156`): a node
+    /// `isSchedulableAfterNodeChange` (`node_affinity.go:119-174`): a node
     /// add that matches the Pod's required affinity (incl. the profile's
     /// `addedAffinity`) → Queue; a label update → Queue only when the node
     /// went from not matching to matching.

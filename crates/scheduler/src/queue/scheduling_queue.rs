@@ -210,8 +210,9 @@ pub type QueueingHintMapPerProfile = HashMap<String, QueueingHintMap>;
 /// `preEnqueuePluginMap` (`:189`): keyed by profile then plugin name.
 pub type PreEnqueuePluginMap = HashMap<String, Vec<Arc<dyn PreEnqueuePlugin>>>;
 
-/// `queueingStrategy` (`:415-425`).
+/// `queueingStrategy` (`:415-425`). Upstream's variant names are kept.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(clippy::enum_variant_names)]
 pub enum QueueingStrategy {
     /// Skip requeuing the Pod to activeQ/backoffQ.
     QueueSkip,

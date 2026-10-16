@@ -13,11 +13,26 @@ pub struct Diagnosis {
     pub pre_filter_msg: String,
     /// Filter rejection reasons, one entry per (node, reason).
     pub node_reasons: Vec<String>,
+    /// `Diagnosis.UnschedulablePlugins` (`types.go:765-766`): plugins that
+    /// returned Unschedulable or UnschedulableAndUnresolvable. Copied onto
+    /// the `QueuedPodInfo` in `handleSchedulingFailure` so the scheduling
+    /// queue only re-evaluates the pod on events those plugins registered.
+    pub unschedulable_plugins: std::collections::HashSet<String>,
 }
 
 impl Diagnosis {
     pub fn add_node_reasons<I: IntoIterator<Item = String>>(&mut self, reasons: I) {
         self.node_reasons.extend(reasons);
+    }
+
+    /// `Diagnosis.AddPluginStatus` (`types.go:787-801`) for a rejected
+    /// (Unschedulable / UnschedulableAndUnresolvable) status from `plugin`.
+    /// Rusternetes has no Pending status, so `PendingPlugins` is not modelled.
+    pub fn add_plugin_status(&mut self, plugin: &str) {
+        if plugin.is_empty() {
+            return;
+        }
+        self.unschedulable_plugins.insert(plugin.to_string());
     }
 
     pub fn is_empty(&self) -> bool {
@@ -56,7 +71,7 @@ mod tests {
     fn prefilter_msg_only() {
         let d = Diagnosis {
             pre_filter_msg: "persistentvolumeclaim \"x\" not found".into(),
-            node_reasons: vec![],
+            ..Default::default()
         };
         assert_eq!(
             fit_error_message(3, &d),
@@ -81,6 +96,7 @@ mod tests {
         let d = Diagnosis {
             pre_filter_msg: "boom".into(),
             node_reasons: vec!["dup".into()],
+            ..Default::default()
         };
         assert_eq!(fit_error_message(2, &d), "0/2 nodes are available: boom.");
     }

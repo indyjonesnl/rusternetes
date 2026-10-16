@@ -4,7 +4,7 @@ use rusternetes_common::{
     types::Phase,
 };
 use rusternetes_storage::{
-    build_key, build_prefix, extract_key, EventRecorder, Storage, StorageBackend, WorkQueue,
+    build_key, build_prefix, EventRecorder, Storage, StorageBackend, WatchEvent,
 };
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};
@@ -17,8 +17,75 @@ use crate::data_plane::{ApiBackend, DataPlane};
 use crate::diagnosis::{fit_error_message, Diagnosis};
 use crate::framework_runtime::{names, ExtensionPoint};
 use crate::profile::DEFAULT_SCHEDULER_NAME;
+use crate::queue::{
+    hints, node_scheduling_properties_change, pod_scheduling_properties_change, priority_sort_less,
+    ActionType, ClusterEvent, EventObject, EventResource, PriorityQueue, PriorityQueueOptions,
+    QueuedPodInfo, EVENT_ASSIGNED_POD_ADD, EVENT_ASSIGNED_POD_DELETE,
+};
 use crate::volume_binding::{self, PreFilterOutcome};
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Outcome of one scheduling cycle for `handleSchedulingFailure`.
+#[derive(Debug)]
+pub enum ScheduleOutcome {
+    /// Bound, or nothing to do (deleted / already assigned / not ours).
+    Done,
+    /// `FitError`: no node fit; the plugins that rejected the pod
+    /// (`Diagnosis.UnschedulablePlugins`). Empty when the failure was not a
+    /// fit error (e.g. no nodes registered), which the queue treats as an
+    /// error and backs off.
+    Unschedulable(std::collections::HashSet<String>),
+}
+
+/// Last-seen pods (by `ns/name`) and nodes (by name): the `oldObj` the
+/// informer would pass to the update/delete handlers.
+#[derive(Default)]
+struct SeenObjects {
+    pods: HashMap<String, Pod>,
+    nodes: HashMap<String, Node>,
+}
+
+/// `assignedPod` (eventhandlers.go:470-472).
+fn assigned_pod(pod: &Pod) -> bool {
+    !pod_node_name(pod).is_empty()
+}
+
+fn pod_node_name(pod: &Pod) -> &str {
+    pod.spec
+        .as_ref()
+        .and_then(|s| s.node_name.as_deref())
+        .unwrap_or("")
+}
+
+/// `newPodInformer`'s field selector (scheduler.go:651-656):
+/// `status.phase!=Succeeded,status.phase!=Failed`.
+fn is_terminal_pod(pod: &Pod) -> bool {
+    matches!(
+        pod.status.as_ref().and_then(|s| s.phase.as_ref()),
+        Some(Phase::Succeeded) | Some(Phase::Failed)
+    )
+}
+
+fn pod_key(pod: &Pod) -> String {
+    crate::queue::pod_key(pod)
+}
+
+/// `corev1helpers.PodPriority`.
+fn pod_priority(pod: &Pod) -> i32 {
+    pod.spec.as_ref().and_then(|s| s.priority).unwrap_or(0)
+}
+
+/// `hasNominatedNodeNameChanged` (eventhandlers.go:342-344).
+fn has_nominated_node_name_changed(old_pod: &Pod, new_pod: &Pod) -> bool {
+    let nn = |p: &Pod| {
+        p.status
+            .as_ref()
+            .and_then(|s| s.nominated_node_name.clone())
+            .unwrap_or_default()
+    };
+    let old = nn(old_pod);
+    !old.is_empty() && old != nn(new_pod)
+}
 
 pub struct Scheduler<S: Storage + Send + Sync + 'static = StorageBackend> {
     /// All reads/writes flow through the data plane — either storage directly
@@ -265,17 +332,39 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             self.interval
         );
 
-        let queue = WorkQueue::new();
+        // `New` (scheduler.go:282-341): the per-profile QueueingHintMap feeds
+        // the scheduling queue; PrioritySort is the only queue-sort plugin.
+        let queue = PriorityQueue::new(
+            priority_sort_less(),
+            PriorityQueueOptions {
+                queueing_hint_map: hints::build_queueing_hint_map_per_profile(
+                    self.profiles.profiles(),
+                ),
+                // Deviation: upstream flushes pods that sat in
+                // unschedulablePods for 5m. Rusternetes does not yet watch
+                // PV/PVC/StorageClass/CSINode/CSIStorageCapacity/ResourceClaim
+                // (whose events would requeue VolumeBinding/VolumeZone/DRA
+                // rejections), so the resync tick below flushes pods older
+                // than one `interval` instead — the pre-queue retry cadence.
+                pod_max_in_unschedulable_pods_duration: self.interval,
+                ..Default::default()
+            },
+        );
+        queue.run();
 
-        let worker_queue = queue.clone();
+        let worker_queue = Arc::clone(&queue);
         let worker_self = Arc::clone(&self);
         tokio::spawn(async move {
             worker_self.worker(worker_queue).await;
         });
 
-        // API mode: drive the work queue from the pods/nodes reflectors instead
-        // of a storage watch. Spawn both reflector run loops, then subscribe to
-        // the pods store and enqueue the work-queue key for every mutation.
+        // The informer hands `addPod`/`updatePod`/`deletePod` both the old and
+        // the new object; our watches deliver only the new one, so keep the
+        // last-seen copy per key to supply `oldObj`.
+        let mut seen = SeenObjects::default();
+
+        // API mode: drive the queue from the pods/nodes reflectors instead of
+        // a storage watch.
         if let DataPlane::Api(api) = &self.data {
             let pods = Arc::clone(&api.pods);
             let nodes = Arc::clone(&api.nodes);
@@ -284,44 +373,57 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             tokio::spawn(async move { nodes.run().await });
             tokio::spawn(async move { priority_classes.run().await });
 
-            let mut sub = api.pods.subscribe();
+            let mut pod_sub = api.pods.subscribe();
+            let mut node_sub = api.nodes.subscribe();
             let mut resync = tokio::time::interval(self.interval);
             resync.tick().await; // consume the immediate first tick
             loop {
+                use rusternetes_client::reflector::StoreEvent;
                 tokio::select! {
-                    ev = sub.recv() => {
-                        use rusternetes_client::reflector::StoreEvent;
+                    ev = pod_sub.recv() => {
                         match ev {
                             Ok(StoreEvent::Added(p) | StoreEvent::Modified(p)) => {
-                                let ns = p.metadata.namespace.as_deref().unwrap_or("default");
-                                queue.add(format!("pods/{}/{}", ns, p.metadata.name)).await;
+                                self.on_pod_event(&queue, &mut seen, p);
                             }
-                            Ok(StoreEvent::Deleted(_)) => {}
+                            Ok(StoreEvent::Deleted(p)) => {
+                                self.on_pod_deleted(&queue, &mut seen, &p);
+                            }
                             // Lagged/closed: fall back to a full resync below.
-                            Err(_) => { self.enqueue_all(&queue).await; }
+                            Err(_) => { self.resync(&queue, &mut seen).await; }
+                        }
+                    }
+                    ev = node_sub.recv() => {
+                        match ev {
+                            Ok(StoreEvent::Added(n) | StoreEvent::Modified(n)) => {
+                                self.on_node_event(&queue, &mut seen, n);
+                            }
+                            Ok(StoreEvent::Deleted(n)) => {
+                                self.on_node_deleted(&queue, &mut seen, &n);
+                            }
+                            Err(_) => { self.resync(&queue, &mut seen).await; }
                         }
                     }
                     _ = resync.tick() => {
-                        self.enqueue_all(&queue).await;
+                        self.resync(&queue, &mut seen).await;
                     }
                 }
             }
         }
 
-        // Storage mode (all-in-one): watch /registry/pods directly.
+        // Storage mode (all-in-one): watch /registry/pods and /registry/nodes
+        // directly.
         let storage = match &self.data {
             DataPlane::Storage(s) => Arc::clone(s),
             DataPlane::Api(_) => unreachable!("API mode handled above"),
         };
         loop {
-            self.enqueue_all(&queue).await;
+            self.resync(&queue, &mut seen).await;
 
-            // Watch for pod changes (new pods, status changes)
-            let prefix = build_prefix("pods", None);
-            let watch_result = storage.watch(&prefix).await;
-            let mut watch = match watch_result {
-                Ok(w) => w,
-                Err(e) => {
+            let pod_watch = storage.watch(&build_prefix("pods", None)).await;
+            let node_watch = storage.watch(&build_prefix("nodes", None)).await;
+            let (mut pod_watch, mut node_watch) = match (pod_watch, node_watch) {
+                (Ok(p), Ok(n)) => (p, n),
+                (Err(e), _) | (_, Err(e)) => {
                     error!("Failed to establish watch: {}, retrying", e);
                     tokio::time::sleep(self.interval).await;
                     continue;
@@ -336,11 +438,19 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             let mut watch_broken = false;
             while !watch_broken {
                 tokio::select! {
-                    event = watch.next() => {
+                    event = pod_watch.next() => {
                         match event {
-                            Some(Ok(ev)) => {
-                                let key = extract_key(&ev);
-                                queue.add(key).await;
+                            Some(Ok(WatchEvent::Added(_, v) | WatchEvent::Modified(_, v))) => {
+                                match serde_json::from_str::<Pod>(&v) {
+                                    Ok(p) => self.on_pod_event(&queue, &mut seen, p),
+                                    Err(e) => warn!("Cannot decode watched pod: {}", e),
+                                }
+                            }
+                            Some(Ok(WatchEvent::Deleted(_, v))) => {
+                                match serde_json::from_str::<Pod>(&v) {
+                                    Ok(p) => self.on_pod_deleted(&queue, &mut seen, &p),
+                                    Err(e) => warn!("Cannot decode deleted pod: {}", e),
+                                }
                             }
                             Some(Err(e)) => {
                                 warn!("Watch error: {}, reconnecting", e);
@@ -352,72 +462,370 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                             }
                         }
                     }
+                    event = node_watch.next() => {
+                        match event {
+                            Some(Ok(WatchEvent::Added(_, v) | WatchEvent::Modified(_, v))) => {
+                                match serde_json::from_str::<Node>(&v) {
+                                    Ok(n) => self.on_node_event(&queue, &mut seen, n),
+                                    Err(e) => warn!("Cannot decode watched node: {}", e),
+                                }
+                            }
+                            Some(Ok(WatchEvent::Deleted(_, v))) => {
+                                match serde_json::from_str::<Node>(&v) {
+                                    Ok(n) => self.on_node_deleted(&queue, &mut seen, &n),
+                                    Err(e) => warn!("Cannot decode deleted node: {}", e),
+                                }
+                            }
+                            Some(Err(e)) => {
+                                warn!("Node watch error: {}, reconnecting", e);
+                                watch_broken = true;
+                            }
+                            None => {
+                                warn!("Node watch stream ended, reconnecting");
+                                watch_broken = true;
+                            }
+                        }
+                    }
                     _ = resync.tick() => {
-                        self.enqueue_all(&queue).await;
+                        self.resync(&queue, &mut seen).await;
                     }
                 }
             }
-        }
-    }
-    async fn worker(&self, queue: WorkQueue) {
-        while let Some(key) = queue.get().await {
-            // K8s schedules ONE pod per cycle (scheduleOne), not all pending
-            // pods. This prevents the worker from blocking for minutes when
-            // many pods are pending. Each pod key gets its own fast cycle.
-            match self.try_schedule_pod(&key).await {
-                Ok(()) => queue.forget(&key).await,
-                Err(e) => {
-                    debug!("Failed to schedule pod {}: {}", key, e);
-                    queue.requeue_rate_limited(key.clone()).await;
-                }
-            }
-            queue.done(&key).await;
         }
     }
 
-    /// Enqueue all pending pods for scheduling.
-    async fn enqueue_all(&self, queue: &WorkQueue) {
-        match self.data.list_pods().await {
-            Ok(pods) => {
-                for pod in &pods {
-                    // Only enqueue pods that need scheduling
-                    // Treat nodeName="" same as None (Go JSON produces empty string)
-                    let has_node = pod
-                        .spec
-                        .as_ref()
-                        .and_then(|s| s.node_name.as_deref())
-                        .is_some_and(|n| !n.is_empty());
-                    let needs_scheduling = !has_node
-                        && matches!(
-                            pod.status.as_ref().and_then(|s| s.phase.as_ref()),
-                            None | Some(Phase::Pending)
-                        );
-                    if needs_scheduling {
-                        let ns = pod.metadata.namespace.as_deref().unwrap_or("");
-                        let key = format!("pods/{}/{}", ns, pod.metadata.name);
-                        queue.add(key).await;
-                    }
+    // -----------------------------------------------------------------------
+    // Event handlers (pkg/scheduler/eventhandlers.go)
+    // -----------------------------------------------------------------------
+
+    /// `addPod` / `updatePod` (eventhandlers.go:130-183): the first sighting
+    /// of a key is an add, later ones are updates with the last-seen copy as
+    /// `oldPod`. The pod informer lists only non-terminal pods
+    /// (`newPodInformer`, scheduler.go:651-656), so a pod turning
+    /// Succeeded/Failed is seen as a delete.
+    fn on_pod_event(&self, queue: &PriorityQueue, seen: &mut SeenObjects, pod: Pod) {
+        if is_terminal_pod(&pod) {
+            self.on_pod_deleted(queue, seen, &pod);
+            return;
+        }
+        let key = pod_key(&pod);
+        match seen.pods.insert(key, pod.clone()) {
+            None => self.add_pod(queue, &pod),
+            Some(old) => self.update_pod(queue, &old, &pod),
+        }
+    }
+
+    /// `deletePod` (eventhandlers.go:184-227).
+    fn on_pod_deleted(&self, queue: &PriorityQueue, seen: &mut SeenObjects, pod: &Pod) {
+        if seen.pods.remove(&pod_key(pod)).is_none() {
+            // Never seen (e.g. already terminal at first sight): nothing to undo.
+            return;
+        }
+        if assigned_pod(pod) {
+            self.delete_assigned_pod_from_cache(queue, pod);
+        } else if self.responsible_for_pod(pod) {
+            self.delete_pod_from_scheduling_queue(queue, pod, false);
+        }
+    }
+
+    /// `addPod` (eventhandlers.go:130-148).
+    fn add_pod(&self, queue: &PriorityQueue, pod: &Pod) {
+        if assigned_pod(pod) {
+            self.add_assigned_pod_to_cache(queue, pod);
+        } else if self.responsible_for_pod(pod) {
+            // `addPodToSchedulingQueue` (eventhandlers.go:228-238)
+            debug!(pod = %pod_key(pod), "Add event for unscheduled pod");
+            queue.add(pod.clone());
+        }
+    }
+
+    /// `updatePod` (eventhandlers.go:149-183).
+    fn update_pod(&self, queue: &PriorityQueue, old_pod: &Pod, new_pod: &Pod) {
+        if assigned_pod(old_pod) {
+            self.update_assigned_pod_in_cache(queue, old_pod, new_pod);
+        } else if assigned_pod(new_pod) {
+            // This update means binding operation. We can treat it as adding
+            // the pod to a cache.
+            self.add_assigned_pod_to_cache(queue, new_pod);
+            if self.responsible_for_pod(old_pod) {
+                // Pod shouldn't be in the scheduling queue, but in unlikely
+                // event that the pod has been bound by another component, it
+                // should be removed from scheduling queue for correctness.
+                self.delete_pod_from_scheduling_queue(queue, old_pod, true);
+            }
+        } else if self.responsible_for_pod(old_pod) {
+            self.update_pod_in_scheduling_queue(queue, old_pod, new_pod);
+        }
+    }
+
+    /// `updatePodInSchedulingQueue` (eventhandlers.go:297-340), minus the
+    /// assumed-pod branch (Rusternetes binds synchronously, so a pod is never
+    /// assumed while unassigned in the informer).
+    fn update_pod_in_scheduling_queue(&self, queue: &PriorityQueue, old_pod: &Pod, new_pod: &Pod) {
+        // Bypass update event that carries identical objects; otherwise, a
+        // duplicated Pod may go through scheduling and cause unexpected
+        // behavior (see #96071).
+        if old_pod.metadata.resource_version == new_pod.metadata.resource_version {
+            return;
+        }
+        debug!(pod = %pod_key(new_pod), "Update event for unscheduled pod");
+        queue.update(Some(old_pod), new_pod);
+        if has_nominated_node_name_changed(old_pod, new_pod) {
+            // Nominated node changed in pod, so we need to treat it as if the
+            // pod was deleted from the old nominated node, because the
+            // scheduler treats such a pod as if it was already assigned when
+            // scheduling lower or equal priority pods.
+            let prio = pod_priority(old_pod);
+            let pre_check = move |p: &Pod| pod_priority(p) <= prio;
+            queue.move_all_to_active_or_backoff_queue(
+                &EVENT_ASSIGNED_POD_DELETE,
+                Some(Arc::new(old_pod.clone())),
+                None,
+                Some(&pre_check),
+            );
+        }
+    }
+
+    /// `deletePodFromSchedulingQueue` (eventhandlers.go:346-377).
+    fn delete_pod_from_scheduling_queue(&self, queue: &PriorityQueue, pod: &Pod, in_binding: bool) {
+        debug!(pod = %pod_key(pod), "Delete event for unscheduled pod");
+        queue.delete(pod);
+        if in_binding {
+            // Not really a pod removal operation, but a binding; the binding
+            // process sends any necessary notifications.
+            return;
+        }
+        if pod
+            .status
+            .as_ref()
+            .and_then(|s| s.nominated_node_name.as_deref())
+            .is_some_and(|n| !n.is_empty())
+        {
+            // When a pod that had nominated node is deleted, it can unblock
+            // scheduling of other pods, because the lower or equal priority
+            // pods treat such a pod as if it was assigned.
+            let prio = pod_priority(pod);
+            let pre_check = move |p: &Pod| pod_priority(p) <= prio;
+            queue.move_all_to_active_or_backoff_queue(
+                &EVENT_ASSIGNED_POD_DELETE,
+                Some(Arc::new(pod.clone())),
+                None,
+                Some(&pre_check),
+            );
+        }
+    }
+
+    /// `addAssignedPodToCache` (eventhandlers.go:385-409), the queue half
+    /// (the node snapshot is rebuilt from the lister every cycle).
+    fn add_assigned_pod_to_cache(&self, queue: &PriorityQueue, pod: &Pod) {
+        debug!(pod = %pod_key(pod), "Add event for scheduled pod");
+        queue.move_all_to_active_or_backoff_queue(
+            &EVENT_ASSIGNED_POD_ADD,
+            None,
+            Some(Arc::new(pod.clone())),
+            None,
+        );
+    }
+
+    /// `updateAssignedPodInCache` (eventhandlers.go:412-453).
+    fn update_assigned_pod_in_cache(&self, queue: &PriorityQueue, old_pod: &Pod, new_pod: &Pod) {
+        debug!(pod = %pod_key(old_pod), "Update event for scheduled pod");
+        let old: Arc<EventObject> = Arc::new(old_pod.clone());
+        let new: Arc<EventObject> = Arc::new(new_pod.clone());
+        for evt in pod_scheduling_properties_change(new_pod, old_pod) {
+            queue.move_all_to_active_or_backoff_queue(
+                &evt,
+                Some(Arc::clone(&old)),
+                Some(Arc::clone(&new)),
+                None,
+            );
+        }
+    }
+
+    /// `deleteAssignedPodFromCache` (eventhandlers.go:455-467).
+    fn delete_assigned_pod_from_cache(&self, queue: &PriorityQueue, pod: &Pod) {
+        debug!(pod = %pod_key(pod), "Delete event for scheduled pod");
+        queue.move_all_to_active_or_backoff_queue(
+            &EVENT_ASSIGNED_POD_DELETE,
+            Some(Arc::new(pod.clone())),
+            None,
+            None,
+        );
+    }
+
+    /// `addNodeToCache` / `updateNodeInCache` (eventhandlers.go:53-98).
+    /// `preCheckForNode` is nil with QueueingHints enabled
+    /// (eventhandlers.go:727-736).
+    fn on_node_event(&self, queue: &PriorityQueue, seen: &mut SeenObjects, node: Node) {
+        let name = node.metadata.name.clone();
+        match seen.nodes.insert(name, node.clone()) {
+            None => {
+                debug!(node = %node.metadata.name, "Add event for node");
+                queue.move_all_to_active_or_backoff_queue(
+                    &ClusterEvent::new(EventResource::Node, ActionType::ADD),
+                    None,
+                    Some(Arc::new(node)),
+                    None,
+                );
+            }
+            Some(old_node) => {
+                if old_node.metadata.resource_version == node.metadata.resource_version {
+                    return;
+                }
+                debug!(node = %node.metadata.name, "Update event for node");
+                let old: Arc<EventObject> = Arc::new(old_node.clone());
+                let new: Arc<EventObject> = Arc::new(node.clone());
+                // Only requeue unschedulable pods if the node became more schedulable.
+                for evt in node_scheduling_properties_change(&node, &old_node) {
+                    queue.move_all_to_active_or_backoff_queue(
+                        &evt,
+                        Some(Arc::clone(&old)),
+                        Some(Arc::clone(&new)),
+                        None,
+                    );
                 }
             }
+        }
+    }
+
+    /// `deleteNodeFromCache` (eventhandlers.go:100-128).
+    fn on_node_deleted(&self, queue: &PriorityQueue, seen: &mut SeenObjects, node: &Node) {
+        if seen.nodes.remove(&node.metadata.name).is_none() {
+            return;
+        }
+        debug!(node = %node.metadata.name, "Delete event for node");
+        queue.move_all_to_active_or_backoff_queue(
+            &ClusterEvent::new(EventResource::Node, ActionType::DELETE),
+            Some(Arc::new(node.clone())),
+            None,
+            None,
+        );
+    }
+
+    /// Periodic relist (the reflector's resync, which upstream's informers
+    /// also perform): replays adds/updates/deletes the watch may have missed,
+    /// then flushes unschedulable pods older than
+    /// `podMaxInUnschedulablePodsDuration` (set to `interval`, see `run`).
+    async fn resync(&self, queue: &PriorityQueue, seen: &mut SeenObjects) {
+        match self.data.list_pods().await {
+            Ok(pods) => {
+                let mut live: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for pod in pods {
+                    if !is_terminal_pod(&pod) {
+                        live.insert(pod_key(&pod));
+                    }
+                    self.on_pod_event(queue, seen, pod);
+                }
+                let gone: Vec<Pod> = seen
+                    .pods
+                    .iter()
+                    .filter(|(k, _)| !live.contains(*k))
+                    .map(|(_, p)| p.clone())
+                    .collect();
+                for pod in gone {
+                    self.on_pod_deleted(queue, seen, &pod);
+                }
+            }
+            Err(e) => error!("Failed to list pods for resync: {}", e),
+        }
+        match self.data.list_nodes().await {
+            Ok(nodes) => {
+                let live: std::collections::HashSet<String> =
+                    nodes.iter().map(|n| n.metadata.name.clone()).collect();
+                for node in nodes {
+                    self.on_node_event(queue, seen, node);
+                }
+                let gone: Vec<Node> = seen
+                    .nodes
+                    .iter()
+                    .filter(|(k, _)| !live.contains(*k))
+                    .map(|(_, n)| n.clone())
+                    .collect();
+                for node in gone {
+                    self.on_node_deleted(queue, seen, &node);
+                }
+            }
+            Err(e) => error!("Failed to list nodes for resync: {}", e),
+        }
+        queue.flush_unschedulable_pods_leftover();
+    }
+
+    // -----------------------------------------------------------------------
+    // Scheduling loop (pkg/scheduler/schedule_one.go)
+    // -----------------------------------------------------------------------
+
+    /// `Scheduler.Run` → `ScheduleOne` (schedule_one.go:65-139): pop one pod
+    /// per cycle; on failure hand it to `handleSchedulingFailure`, which
+    /// requeues it with the plugins that rejected it so the queue only
+    /// re-evaluates it on events those plugins registered.
+    async fn worker(&self, queue: Arc<PriorityQueue>) {
+        while let Some(mut p_info) = queue.pop().await {
+            let ns = p_info.pod.metadata.namespace.clone().unwrap_or_default();
+            let key = format!("pods/{}/{}", ns, p_info.pod.metadata.name);
+            match self.try_schedule_pod(&key).await {
+                Ok(ScheduleOutcome::Done) => queue.done(&p_info.pod.metadata.uid),
+                Ok(ScheduleOutcome::Unschedulable(plugins)) => {
+                    // FitError: inject UnschedulablePlugins into the PodInfo.
+                    p_info.unschedulable_plugins = plugins;
+                    self.handle_scheduling_failure(&queue, p_info).await;
+                }
+                Err(e) => {
+                    debug!("Failed to schedule pod {}: {}", key, e);
+                    // Not a FitError: no plugins → an error backoff.
+                    p_info.unschedulable_plugins.clear();
+                    self.handle_scheduling_failure(&queue, p_info).await;
+                }
+            }
+        }
+    }
+
+    /// `handleSchedulingFailure` (schedule_one.go:1033-1113), the queue
+    /// half: re-read the pod; a pod that is gone or got assigned meanwhile
+    /// is only `Done`, otherwise it goes back through
+    /// `AddUnschedulableIfNotPresent`. The FailedScheduling event and the
+    /// nomination are already handled by `try_schedule_pod`.
+    async fn handle_scheduling_failure(&self, queue: &PriorityQueue, mut p_info: QueuedPodInfo) {
+        let uid = p_info.pod.metadata.uid.clone();
+        let ns = p_info.pod.metadata.namespace.clone().unwrap_or_default();
+        let name = p_info.pod.metadata.name.clone();
+        match self.data.get_pod(&ns, &name).await {
             Err(e) => {
-                error!("Failed to list pods for enqueue: {}", e);
+                info!(pod = %format!("{ns}/{name}"), error = %e, "Pod doesn't exist in informer cache");
+                // AddUnschedulableIfNotPresent isn't called: Done explicitly.
+                queue.done(&uid);
+            }
+            Ok(cached) if assigned_pod(&cached) => {
+                info!(pod = %format!("{ns}/{name}"), node = %pod_node_name(&cached), "Pod has been assigned to node. Abort adding it back to queue.");
+                queue.done(&uid);
+            }
+            Ok(cached) if cached.metadata.uid != uid => {
+                debug!(pod = %format!("{ns}/{name}"), old_uid = %uid, new_uid = %cached.metadata.uid, "Pod was recreated while handling scheduling failure. Skip requeueing and status updates.");
+                queue.done(&uid);
+            }
+            Ok(cached) => {
+                p_info.pod = cached;
+                if let Err(e) =
+                    queue.add_unschedulable_if_not_present(p_info, queue.scheduling_cycle())
+                {
+                    error!(error = %e, "Error occurred");
+                }
             }
         }
     }
 
     /// Try to schedule a single pod by its queue key (pods/{ns}/{name}).
     /// K8s schedules one pod per cycle in scheduleOne().
-    async fn try_schedule_pod(&self, key: &str) -> rusternetes_common::Result<()> {
+    async fn try_schedule_pod(&self, key: &str) -> rusternetes_common::Result<ScheduleOutcome> {
         let parts: Vec<&str> = key.splitn(3, '/').collect();
         let (ns, name) = match parts.len() {
             3 => (parts[1], parts[2]),
-            _ => return Ok(()), // invalid key
+            _ => return Ok(ScheduleOutcome::Done), // invalid key
         };
 
         let pod_key = build_key("pods", Some(ns), name);
         let pod: Pod = match self.data.get_pod(ns, name).await {
             Ok(p) => p,
-            Err(_) => return Ok(()), // pod deleted
+            Err(_) => return Ok(ScheduleOutcome::Done), // pod deleted
         };
 
         // Check if pod needs scheduling
@@ -427,7 +835,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             .and_then(|s| s.node_name.as_deref())
             .is_some_and(|n| !n.is_empty());
         if has_node {
-            return Ok(()); // already scheduled
+            return Ok(ScheduleOutcome::Done); // already scheduled
         }
         let is_pending = pod
             .status
@@ -435,24 +843,30 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             .map(|s| s.phase.is_none() || s.phase == Some(Phase::Pending))
             .unwrap_or(true);
         if !is_pending {
-            return Ok(()); // not pending
+            return Ok(ScheduleOutcome::Done); // not pending
         }
         // `responsibleForPod` (eventhandlers.go:474-476): only pods naming one
         // of our profiles enter the queue.
         if !self.responsible_for_pod(&pod) {
-            return Ok(()); // wrong scheduler
+            return Ok(ScheduleOutcome::Done); // wrong scheduler
         }
         // `frameworkForPod` (schedule_one.go:85-92): cannot fail after the
         // check above; upstream logs and drops the pod if it does.
         if let Err(e) = self.profile_for(&pod) {
             error!(error = %e, pod = key, "Error occurred");
-            return Ok(());
+            return Ok(ScheduleOutcome::Done);
         }
 
         // Get nodes and all pods for scheduling context
         let nodes: Vec<Node> = self.data.list_nodes().await?;
         if nodes.is_empty() {
-            return Ok(());
+            // `ErrNoNodesAvailable` (scheduler.go:70): not a
+            // FitError, so no plugins are recorded and the pod backs off.
+            debug!(
+                pod = key,
+                "Unable to schedule pod; no nodes are registered to the cluster; waiting"
+            );
+            return Ok(ScheduleOutcome::Unschedulable(Default::default()));
         }
         let priority_classes = self.load_priority_classes().await?;
         // Preemption needs these; a failure to list them must not stop
@@ -527,6 +941,11 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 }
             }
             self.nominate(&pod_key, &node_name).await;
+            // The preemptor stays unschedulable this cycle (PostFilter only
+            // nominates); the victims' Pod/Delete events requeue it.
+            return Ok(ScheduleOutcome::Unschedulable(
+                diagnosis.unschedulable_plugins,
+            ));
         } else {
             // No node fits and preemption can't help — surface FailedScheduling.
             // The production path previously stayed silent here; the
@@ -548,9 +967,12 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             };
             self.emit_pod_event(&pod, EventType::Warning, "FailedScheduling", &msg)
                 .await;
+            return Ok(ScheduleOutcome::Unschedulable(
+                diagnosis.unschedulable_plugins,
+            ));
         }
 
-        Ok(())
+        Ok(ScheduleOutcome::Done)
     }
 
     /// Run one scheduling cycle — schedules all pending pods.
@@ -1020,7 +1442,16 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 Ok(snap) => match self.sync_and_pre_filter(ns, pod, &snap) {
                     PreFilterOutcome::Skip => None,
                     PreFilterOutcome::Ready(claims) => Some((snap, claims)),
-                    PreFilterOutcome::Unresolvable(m) | PreFilterOutcome::Error(m) => {
+                    PreFilterOutcome::Unresolvable(m) => {
+                        diag.pre_filter_msg = m.clone();
+                        diag.add_plugin_status(names::VOLUME_BINDING);
+                        debug!(
+                            "VolumeBinding PreFilter rejected pod {}/{}: {}",
+                            ns, pod.metadata.name, m
+                        );
+                        return None;
+                    }
+                    PreFilterOutcome::Error(m) => {
                         diag.pre_filter_msg = m.clone();
                         debug!(
                             "VolumeBinding PreFilter rejected pod {}/{}: {}",
@@ -1129,6 +1560,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                             .and_then(|s| s.unschedulable)
                             .unwrap_or(false)
                     {
+                        diag.add_plugin_status(names::NODE_UNSCHEDULABLE);
                         return None;
                     }
                     // TaintToleration
@@ -1137,6 +1569,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                             "Node {} has taints the pod does not tolerate",
                             node.metadata.name
                         );
+                        diag.add_plugin_status(names::TAINT_TOLERATION);
                         return None;
                     }
                     // NodeAffinity (`spec.nodeSelector` is part of its filter, as is
@@ -1148,6 +1581,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                                 diag.add_node_reasons([
                                     ERR_REASON_ENFORCED_NODE_AFFINITY.to_string()
                                 ]);
+                                diag.add_plugin_status(names::NODE_AFFINITY);
                                 return None;
                             }
                         }
@@ -1155,6 +1589,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                             pod.spec.as_ref().and_then(|s| s.node_selector.as_ref())
                         {
                             if !self.matches_node_selector(node, node_selector) {
+                                diag.add_plugin_status(names::NODE_AFFINITY);
                                 return None;
                             }
                         }
@@ -1165,6 +1600,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                             "Node {} does not have required DRA devices for pod {}",
                             node.metadata.name, pod.metadata.name
                         );
+                        diag.add_plugin_status(names::DYNAMIC_RESOURCES);
                         return None;
                     }
                     // NodePorts
@@ -1173,6 +1609,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                             "Node {} rejected for pod {}: hostPort conflict",
                             node.metadata.name, pod.metadata.name
                         );
+                        diag.add_plugin_status(names::NODE_PORTS);
                         return None;
                     }
                     // VolumeBinding
@@ -1183,6 +1620,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                             }
                             Ok((_, reasons)) => {
                                 diag.add_node_reasons(reasons.iter().map(|r| r.to_string()));
+                                diag.add_plugin_status(names::VOLUME_BINDING);
                                 debug!(
                                     "Node {} rejected for pod {}: {}",
                                     node.metadata.name,
@@ -1203,6 +1641,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     // Node affinity (hard requirements and scoring)
                     let (affinity_ok, mut node_affinity_score) = check_node_affinity(node, pod);
                     if node_affinity_filter_on && !affinity_ok {
+                        diag.add_plugin_status(names::NODE_AFFINITY);
                         return None;
                     }
                     // `addedPrefSchedTerms.Score(node)` (node_affinity.go:276-278)
@@ -1220,18 +1659,21 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     let (pod_affinity_ok, pod_affinity_score) =
                         check_pod_affinity(node, pod, all_pods, nodes);
                     if inter_pod_filter_on && !pod_affinity_ok {
+                        diag.add_plugin_status(names::INTER_POD_AFFINITY);
                         return None;
                     }
                     // Pod anti-affinity (hard requirements and penalty scoring)
                     let (pod_anti_affinity_ok, pod_anti_affinity_penalty) =
                         check_pod_anti_affinity(node, pod, all_pods, nodes);
                     if inter_pod_filter_on && !pod_anti_affinity_ok {
+                        diag.add_plugin_status(names::INTER_POD_AFFINITY);
                         return None;
                     }
                     // Topology spread constraints (hard requirements and penalty scoring)
                     let (topology_ok, topology_penalty) =
                         check_topology_spread_constraints(node, pod, all_pods, nodes);
                     if spread_filter_on && !topology_ok {
+                        diag.add_plugin_status(names::POD_TOPOLOGY_SPREAD);
                         return None;
                     }
                     // Resource fit (accounting for pod overhead and existing pod usage)
@@ -1242,6 +1684,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                         "Node {} rejected for pod {}: resource_score=0 (insufficient resources)",
                         node.metadata.name, pod.metadata.name,
                     );
+                        diag.add_plugin_status(names::NODE_RESOURCES_FIT);
                         return None;
                     }
                     Some(NodeEval {
@@ -3512,5 +3955,116 @@ mod tests {
                 .is_some_and(|n| !n.is_empty()),
             "Pod with nodeName='' must be treated as unscheduled and get assigned a node"
         );
+    }
+    fn cpu_pod(name: &str, uid: &str, cpu: &str) -> Pod {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": name, "namespace": "default", "uid": uid},
+            "spec": {"containers": [{"name": "main", "image": "busybox",
+                "resources": {"requests": {"cpu": cpu}}}]},
+            "status": {"phase": "Pending"}
+        }))
+        .unwrap()
+    }
+
+    fn cpu_node(name: &str, cpu: &str) -> Node {
+        let mut node = make_node(name);
+        let st = node.status.as_mut().unwrap();
+        st.capacity
+            .as_mut()
+            .unwrap()
+            .insert("cpu".into(), cpu.into());
+        st.allocatable
+            .as_mut()
+            .unwrap()
+            .insert("cpu".into(), cpu.into());
+        node
+    }
+
+    /// `handleSchedulingFailure` copies `fitError.Diagnosis.UnschedulablePlugins`
+    /// onto the queued pod (schedule_one.go:1064-1065); the cycle must therefore
+    /// report which plugin rejected the pod.
+    #[tokio::test]
+    async fn try_schedule_pod_reports_rejecting_plugin() {
+        let storage = Arc::new(MemoryStorage::new());
+        storage
+            .create("/registry/nodes/small", &cpu_node("small", "1"))
+            .await
+            .unwrap();
+        storage
+            .create(
+                "/registry/pods/default/big",
+                &cpu_pod("big", "big-uid", "2"),
+            )
+            .await
+            .unwrap();
+        let scheduler =
+            Scheduler::new_with_name(Arc::clone(&storage), 60, DEFAULT_SCHEDULER_NAME.to_string());
+        match scheduler
+            .try_schedule_pod("pods/default/big")
+            .await
+            .unwrap()
+        {
+            ScheduleOutcome::Unschedulable(plugins) => assert_eq!(
+                plugins,
+                std::collections::HashSet::from([names::NODE_RESOURCES_FIT.to_string()])
+            ),
+            other => panic!("expected an unschedulable outcome, got {other:?}"),
+        }
+    }
+
+    /// End-to-end through `run()`: a pod rejected by NodeResourcesFit waits in
+    /// unschedulablePods; a Node/Add whose node fits it is the only thing that
+    /// moves it (the resync is far away), via `isSchedulableAfterNodeChange`
+    /// → backoffQ → activeQ → bound.
+    #[tokio::test]
+    async fn run_requeues_unschedulable_pod_on_node_add_hint() {
+        let storage = Arc::new(MemoryStorage::new());
+        storage
+            .create("/registry/nodes/small", &cpu_node("small", "1"))
+            .await
+            .unwrap();
+        storage
+            .create(
+                "/registry/pods/default/big",
+                &cpu_pod("big", "big-uid", "2"),
+            )
+            .await
+            .unwrap();
+        let scheduler = Arc::new(Scheduler::new_with_name(
+            Arc::clone(&storage),
+            3600, // resync must not be what requeues the pod
+            DEFAULT_SCHEDULER_NAME.to_string(),
+        ));
+        let runner = tokio::spawn(Arc::clone(&scheduler).run());
+
+        // The first cycle rejects the pod; nothing binds it.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let p: Pod = storage.get("/registry/pods/default/big").await.unwrap();
+        assert!(
+            p.spec
+                .as_ref()
+                .and_then(|s| s.node_name.as_deref())
+                .is_none(),
+            "pod must stay unscheduled while no node fits"
+        );
+
+        storage
+            .create("/registry/nodes/large", &cpu_node("large", "4"))
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            let p: Pod = storage.get("/registry/pods/default/big").await.unwrap();
+            if p.spec.as_ref().and_then(|s| s.node_name.as_deref()) == Some("large") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Node/Add should have requeued and bound the pod"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        runner.abort();
     }
 }
