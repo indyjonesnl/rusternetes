@@ -26,6 +26,7 @@ use crate::validation::metav1::{
     is_dns1035_label, is_dns1123_subdomain, validate_label_selector, LabelSelectorValidationOptions,
 };
 use crate::validation::validating_admission_policy::validate_match_conditions;
+pub use crate::validation::validating_admission_policy::PreexistingExpressions;
 use std::collections::HashSet;
 
 /// Versions of the AdmissionReview object this apiserver accepts. Mirrors
@@ -469,6 +470,45 @@ fn match_conditions_unchanged(
     old_c: &[Option<&Vec<MatchCondition>>],
 ) -> bool {
     new_c.len() == old_c.len() && new_c.iter().zip(old_c).all(|(n, o)| n == o)
+}
+
+/// `findValidatingPreexistingExpressions` (`validation.go:297-306`): only the
+/// `matchConditions` expressions of every webhook.
+pub fn find_validating_preexisting_expressions(
+    cfg: &ValidatingWebhookConfiguration,
+) -> PreexistingExpressions {
+    preexisting_match_conditions(
+        cfg.webhooks
+            .iter()
+            .flatten()
+            .map(|h| h.match_conditions.as_ref()),
+    )
+}
+
+/// `findMutatingPreexistingExpressions` (`validation.go:288-295`).
+pub fn find_mutating_preexisting_expressions(
+    cfg: &MutatingWebhookConfiguration,
+) -> PreexistingExpressions {
+    preexisting_match_conditions(
+        cfg.webhooks
+            .iter()
+            .flatten()
+            .map(|h| h.match_conditions.as_ref()),
+    )
+}
+
+fn preexisting_match_conditions<'a>(
+    hooks: impl Iterator<Item = Option<&'a Vec<MatchCondition>>>,
+) -> PreexistingExpressions {
+    let mut preexisting = PreexistingExpressions::default();
+    for conditions in hooks {
+        for mc in conditions.into_iter().flatten() {
+            preexisting
+                .match_condition_expressions
+                .insert(mc.expression.clone());
+        }
+    }
+    preexisting
 }
 
 pub fn ignore_validating_webhook_match_conditions(
