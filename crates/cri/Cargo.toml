@@ -32,6 +32,11 @@ hyper-util = { version = "0.1", features = ["client", "tokio"] }
 tokio-tungstenite = "0.24"
 url = "2.5.8"
 rusternetes-common = { path = "../common" }
+# In-process fake CRI RuntimeService for tests (feature `fake-server`, #1115).
+tokio-stream = { version = "0.1", features = ["net"], optional = true }
+
+[features]
+fake-server = ["dep:tokio-stream"]
 
 [build-dependencies]
 tonic-build = "0.12"

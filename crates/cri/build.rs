@@ -6,12 +6,14 @@
 //! annotations — so vanilla tonic-build compiles it without extra include paths.
 //!
 //! We build only the client side: the kubelet is a CRI client, never a server.
+//! The one exception is the test-only `fake-server` feature, which also emits
+//! the server traits so `fake.rs` can host an in-process fake runtime (#1115).
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto = "proto/runtime/v1/api.proto";
 
     tonic_build::configure()
-        .build_server(false)
+        .build_server(cfg!(feature = "fake-server"))
         .build_client(true)
         .compile_protos(&[proto], &["proto"])?;
 

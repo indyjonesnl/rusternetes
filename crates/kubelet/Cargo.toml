@@ -84,6 +84,8 @@ rand = "0.9"
 tonic-build = "0.12"
 
 [dev-dependencies]
+# Fake CRI RuntimeService server for CRI-less concurrency/stale-incarnation tests (#1115).
+rusternetes-cri = { path = "../cri", features = ["fake-server"] }
 tempfile = "3"
 serial_test = { workspace = true }
 url = "2.5"

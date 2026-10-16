@@ -109,4 +109,42 @@ mod tests {
             "same name/key must serialize regardless of pod uid"
         );
     }
+
+    /// Concurrent same-name syncs (#1115): N threads race `try_acquire` on the
+    /// same `namespace/name` key behind a barrier; exactly one wins, the rest
+    /// skip, and the key is reusable afterwards.
+    #[test]
+    fn concurrent_same_key_exactly_one_winner() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        const N: usize = 16;
+        let locks = Arc::new(SyncLocks::new());
+        let start = Arc::new(Barrier::new(N));
+        let done = Arc::new(Barrier::new(N));
+        let wins = Arc::new(AtomicUsize::new(0));
+
+        let handles: Vec<_> = (0..N)
+            .map(|_| {
+                let (locks, start, done, wins) =
+                    (locks.clone(), start.clone(), done.clone(), wins.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    let guard = locks.try_acquire("default/web-0");
+                    if guard.is_some() {
+                        wins.fetch_add(1, Ordering::SeqCst);
+                    }
+                    // Hold any winning guard until every thread has tried, so
+                    // the attempts genuinely overlap.
+                    done.wait();
+                    drop(guard);
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(wins.load(Ordering::SeqCst), 1, "exactly one sync may run");
+        assert!(locks.try_acquire("default/web-0").is_some());
+    }
 }
