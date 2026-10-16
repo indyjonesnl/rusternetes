@@ -287,6 +287,13 @@ async fn main() -> Result<()> {
         &effective_version,
     );
 
+    if args.profiling == Some(true) || args.contention_profiling == Some(true) {
+        warn!("--profiling/--contention-profiling are accepted and ignored: no pprof handlers are served");
+    }
+    let le = args
+        .leader_election_settings()
+        .map_err(|e| anyhow::anyhow!(e))?;
+
     let profiles = match &args.config {
         Some(path) => {
             scheduler_config::load_profiles(path).map_err(|e| anyhow::anyhow!("--config: {e}"))?
@@ -349,13 +356,6 @@ async fn main() -> Result<()> {
     // cmd/kube-scheduler/app/server.go:150-156: SetupSignalHandler (SIGTERM+SIGINT)
     // cancels the run context.
     let ctx = rusternetes_common::signal::setup_signal_context();
-
-    if args.profiling == Some(true) || args.contention_profiling == Some(true) {
-        warn!("--profiling/--contention-profiling are accepted and ignored: no pprof handlers are served");
-    }
-    let le = args
-        .leader_election_settings()
-        .map_err(|e| anyhow::anyhow!(e))?;
 
     // Leader election
     if le.enabled {
