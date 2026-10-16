@@ -46,6 +46,50 @@ pub fn ignore_validating_admission_policy_match_conditions(
         && new.match_conditions.unwrap_or_default() == old.match_conditions.unwrap_or_default()
 }
 
+/// `preexistingExpressions` (`validation.go:266-273`) minus the two
+/// MutatingAdmissionPolicy sets (see
+/// [`crate::validation::mutating_admission_policy::PreexistingExpressions`]):
+/// the expressions an old object already stores, which an update compiles in
+/// the `StoredExpressions` CEL environment rather than `NewExpressions`.
+#[derive(Debug, Default, PartialEq)]
+pub struct PreexistingExpressions {
+    pub match_condition_expressions: HashSet<String>,
+    pub validation_expressions: HashSet<String>,
+    pub validation_message_expressions: HashSet<String>,
+    pub audit_annotation_values_expressions: HashSet<String>,
+}
+
+/// `findValidatingPolicyPreexistingExpressions` (`validation.go:308-322`).
+pub fn find_validating_policy_preexisting_expressions(
+    policy: &ValidatingAdmissionPolicy,
+) -> PreexistingExpressions {
+    let mut preexisting = PreexistingExpressions::default();
+    let Some(spec) = &policy.spec else {
+        return preexisting;
+    };
+    for mc in spec.match_conditions.as_deref().unwrap_or_default() {
+        preexisting
+            .match_condition_expressions
+            .insert(mc.expression.clone());
+    }
+    for v in spec.validations.as_deref().unwrap_or_default() {
+        preexisting
+            .validation_expressions
+            .insert(v.expression.clone());
+        if let Some(m) = v.message_expression.as_deref().filter(|m| !m.is_empty()) {
+            preexisting
+                .validation_message_expressions
+                .insert(m.to_string());
+        }
+    }
+    for a in spec.audit_annotations.as_deref().unwrap_or_default() {
+        preexisting
+            .audit_annotation_values_expressions
+            .insert(a.value_expression.clone());
+    }
+    preexisting
+}
+
 /// `maxAuditAnnotations` (`validation.go:47`).
 const MAX_AUDIT_ANNOTATIONS: usize = 20;
 /// `maxAuditAnnotationValueExpressionLength` (`validation.go:49`).
