@@ -114,10 +114,72 @@ pub fn get_owner(pathname: &str) -> io::Result<(i64, i64)> {
     Ok((md.uid() as i64, md.gid() as i64))
 }
 
+/// `findMountInfo` (`hostutil_linux.go:183-202`): walk `mountinfo_path`
+/// backwards and take the first mount point that is a prefix of `path`.
+fn find_mount_info(path: &str, mountinfo_path: &str) -> io::Result<super::mount_utils::MountInfo> {
+    let infos = super::mount_utils::parse_mount_info(mountinfo_path)?;
+    infos
+        .into_iter()
+        .rev()
+        .find(|i| super::mount_utils::path_within_base(path, &i.mount_point))
+        .ok_or_else(|| io::Error::other(format!("cannot find mount point for {path:?}")))
+}
+
+/// `GetSELinux` (`hostutil_linux.go:236-259`): does the mount `path` lives on
+/// carry `seclabel` (in the mount or the super options)? `selinux_enabled`
+/// is `selinux.GetEnabled`; the mountinfo parse is skipped when it is false.
+pub fn get_selinux(
+    path: &str,
+    mountinfo_path: &str,
+    selinux_enabled: impl Fn() -> bool,
+) -> io::Result<bool> {
+    if !selinux_enabled() {
+        return Ok(false);
+    }
+    let info = find_mount_info(path, mountinfo_path)?;
+    Ok(info
+        .super_options
+        .iter()
+        .chain(info.mount_options.iter())
+        .any(|o| o == "seclabel"))
+}
+
+/// `HostUtil.GetSELinuxSupport` (`hostutil_linux.go:263-265`).
+pub fn get_selinux_support(pathname: &str) -> io::Result<bool> {
+    get_selinux(
+        pathname,
+        super::mount_utils::PROC_MOUNT_INFO_PATH,
+        crate::go_selinux::get_enabled,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
+
+    /// `TestGetSELinuxSupport` (`hostutil_linux_test.go:137`).
+    #[test]
+    fn get_selinux_support_cases() {
+        let info = "62 0 253:0 / / rw,relatime shared:1 - ext4 /dev/mapper/ssd-root rw,seclabel,data=ordered
+78 62 0:41 / /tmp rw,nosuid,nodev shared:30 - tmpfs tmpfs rw,seclabel
+83 63 0:44 / /var/lib/bar rw,relatime - tmpfs tmpfs rw
+227 62 253:0 /var/lib/docker/devicemapper /var/lib/docker/devicemapper rw,relatime - ext4 /dev/mapper/ssd-root rw,seclabel,data=ordered
+150 23 1:58 / /media/nfs_vol rw,relatime shared:89 - nfs4 172.18.4.223:/srv/nfs rw,vers=4.0,rsize=524288,wsize=524288,namlen=255,hard,proto=tcp,port=0,timeo=600,retrans=2,sec=sys,clientaddr=172.18.4.223,local_lock=none,addr=172.18.4.223
+";
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("mountinfo");
+        std::fs::write(&f, info).unwrap();
+        let f = f.to_str().unwrap();
+        for (name, mp, enabled, want) in [
+            ("ext4 on / with disabled SELinux", "/", false, false),
+            ("ext4 on /", "/", true, true),
+            ("tmpfs on /var/lib/bar", "/var/lib/bar", true, false),
+            ("nfsv4", "/media/nfs_vol", true, false),
+        ] {
+            assert_eq!(get_selinux(mp, f, || enabled).unwrap(), want, "{name}");
+        }
+    }
 
     #[test]
     fn get_owner_follows_symlinks() {
