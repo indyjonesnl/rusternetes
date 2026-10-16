@@ -83,6 +83,7 @@ impl VolumePlugin for ConfigMapPlugin {
                 .clone()
                 .expect("checked by can_support"),
             storage: self.host.get_kube_client().cloned(),
+            pod: pod.clone(),
         }))
     }
 
@@ -131,6 +132,9 @@ struct ConfigMapMounter {
     namespace: String,
     config_map: ConfigMapVolumeSource,
     storage: Option<Arc<StorageBackend>>,
+    /// `configMapVolumeMounter.pod` (`configmap.go:134`), read by
+    /// `MakeNestedMountpoints`.
+    pod: Pod,
 }
 
 #[async_trait]
@@ -171,6 +175,14 @@ impl Mounter for ConfigMapMounter {
         let volume_dir = dir;
         std::fs::create_dir_all(volume_dir)
             .context("Failed to create ConfigMap volume directory")?;
+        // `volumeutil.MakeNestedMountpoints(b.volName, dir, b.pod)`
+        // (`configmap.go:220-222`), after the wrapped emptyDir SetUpAt and
+        // before the failure-teardown `defer` is armed.
+        crate::volume_plugins::util::nested_volumes::make_nested_mountpoints(
+            &self.volume_name,
+            std::path::Path::new(volume_dir),
+            &self.pod,
+        )?;
 
         // Determine the default file mode: spec defaultMode, or 0644 (Kubernetes default)
         let cm_default_mode = self.config_map.default_mode.unwrap_or(0o644);
@@ -349,7 +361,25 @@ mod tests {
             storage: Some(Arc::new(StorageBackend::Memory(Arc::new(
                 rusternetes_storage::MemoryStorage::new(),
             )))),
+            pod: serde_json::from_value(json!({
+                "metadata": {"name": "p", "namespace": "ns", "uid": "uid-1"},
+                "spec": {"containers": [{"name": "c", "image": "i", "volumeMounts": [
+                    {"name": "cfg", "mountPath": "/etc/cfg"},
+                    {"name": "other", "mountPath": "/etc/cfg/sub/dir"}
+                ]}]}
+            }))
+            .unwrap(),
         }
+    }
+
+    /// `MakeNestedMountpoints` (`configmap.go:220`): a volume mounted beneath
+    /// the configMap volume gets its mountpoint directory created inside it.
+    #[tokio::test]
+    async fn nested_mountpoints_are_created_inside_the_volume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("vol");
+        mounter(&dir, true).set_up().await.unwrap();
+        assert!(dir.join("sub/dir").is_dir());
     }
 
     /// `TestPluginOptional` (`configmap_test.go:447-537`): an optional
@@ -437,6 +467,10 @@ mod tests {
             config_map: serde_json::from_value(json!({"name": "cm", "defaultMode": 0o600}))
                 .unwrap(),
             storage: Some(storage),
+            pod: serde_json::from_value(
+                json!({"metadata": {"name": "p", "uid": "u"}, "spec": {"containers": []}}),
+            )
+            .unwrap(),
         };
         m.set_up_with(&crate::volume_plugins::MounterArgs {
             fs_group: Some(gid),
