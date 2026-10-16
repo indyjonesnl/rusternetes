@@ -89,7 +89,7 @@ pub(crate) fn pvc_key(pvc: &PersistentVolumeClaim) -> String {
 
 /// `GetPersistentVolumeClaimClass` (component-helpers `helpers.go:43-53`):
 /// beta annotation first, then `spec.storageClassName`.
-fn claim_class(pvc: &PersistentVolumeClaim) -> String {
+pub(crate) fn claim_class(pvc: &PersistentVolumeClaim) -> String {
     if let Some(c) = pvc
         .metadata
         .annotations
