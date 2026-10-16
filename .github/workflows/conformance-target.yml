@@ -116,6 +116,19 @@ jobs:
             echo "image-tag=$REQUESTED -> pulling the published tag" >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      - name: Record image provenance
+        # #1696: `:main` can lag main HEAD (publish-images.yml queues), so a
+        # nightly may test old binaries. Record the digest under test and warn
+        # when `main` != the immutable sha-<main HEAD> tag. Warn-only.
+        env:
+          REQUESTED: ${{ inputs.image-tag }}
+        run: |
+          main_sha="$(git ls-remote origin refs/heads/main | cut -f1)"
+          {
+            echo ""
+            bash scripts/image-provenance.sh "$REQUESTED" "$main_sha"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: Bring up cluster
         uses: ./ci/actions/bring-up-cluster
         with:

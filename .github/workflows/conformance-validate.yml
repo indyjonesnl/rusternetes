@@ -28,6 +28,8 @@ on:
       - 'scripts/tests/test-conformance-suite-run.sh'
       - 'scripts/conformance-preflight.sh'
       - 'scripts/tests/test-conformance-preflight.sh'
+      - 'scripts/image-provenance.sh'
+      - 'scripts/tests/test-image-provenance.sh'
       - 'scripts/tests/test-target-workflows-sync.sh'
       - 'scripts/tests/test-target-coverage.sh'
       - 'scripts/tests/testdata/sig-coverage-sample.txt'
@@ -106,6 +108,8 @@ jobs:
         run: bash scripts/tests/test-conformance-suite-run.sh
       - name: Cluster preflight unit tests
         run: bash scripts/tests/test-conformance-preflight.sh
+      - name: Image provenance unit tests
+        run: bash scripts/tests/test-image-provenance.sh
       - name: Per-target workflow drift
         run: bash scripts/tests/test-target-workflows-sync.sh
       - name: Per-module vanilla-swap workflow drift
