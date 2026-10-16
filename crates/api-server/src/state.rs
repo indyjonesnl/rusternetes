@@ -51,6 +51,9 @@ pub struct ApiServerState {
     /// The CRD naming/establishing/condition controllers' workqueue: a CRD
     /// write queues its name, a worker (started on first use) drains it.
     pub crd_controllers: Arc<crate::registry::apiextensions::controller_queue::CrdControllers>,
+    /// The custom.metrics provider's RESTMapper: one per process, with the
+    /// periodic `Reset` of the kube-controller-manager's mapper (#3595).
+    pub custom_metrics_mapper: Arc<crate::handlers::custom_metrics::ServedRestMapper>,
 }
 
 /// `newServiceIPAllocators`' NodePort half (storage_core.go:484-495): one
@@ -104,6 +107,11 @@ impl ApiServerState {
         ));
 
         rusternetes_common::authz_filter_metrics::register_metrics();
+
+        let custom_metrics_mapper =
+            crate::handlers::custom_metrics::new_served_rest_mapper(storage.clone());
+        crate::handlers::custom_metrics::spawn_periodic_reset(&custom_metrics_mapper);
+
         Self {
             storage,
             token_manager,
@@ -125,6 +133,7 @@ impl ApiServerState {
             event_ttl: crate::registry::core::event::DEFAULT_EVENT_TTL_SECONDS,
             mutating_admission_policy: None,
             crd_controllers: Default::default(),
+            custom_metrics_mapper,
         }
     }
 
