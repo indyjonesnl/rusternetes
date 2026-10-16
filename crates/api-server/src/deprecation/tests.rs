@@ -244,3 +244,20 @@ fn served_deprecated_kind_is_deprecated() {
         (true, "1.38".to_string())
     );
 }
+
+/// Removed APIs (`APILifecycleRemoved` <= current) have no installed route
+/// upstream, so no deprecation signal is derived for them (#3755).
+#[test]
+fn removed_kinds_carry_no_deprecation() {
+    for (g, v, r) in [
+        ("extensions", "v1beta1", "ingresses"),
+        ("apps", "v1beta2", "deployments"),
+        ("batch", "v1beta1", "cronjobs"),
+    ] {
+        assert_eq!(
+            deprecation_for(g, v, r, ""),
+            (false, String::new()),
+            "{g}/{v} {r}"
+        );
+    }
+}
