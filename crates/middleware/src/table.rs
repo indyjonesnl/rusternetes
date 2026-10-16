@@ -340,6 +340,10 @@ const PCR_SIGNER_NAME_DOC: &str = "signerName indicates the requested signer.\n\
 /// (certificates/v1beta1 types_swagger_doc_generated.go:141).
 const PCR_ANNOTATIONS_DOC: &str = "unverifiedUserAnnotations allow pod authors to pass additional information to the signer implementation.  Kubernetes does not restrict or validate this metadata in any way.\n\nEntries are subject to the same validation as object metadata annotations, with the addition that all keys must be domain-prefixed. No restrictions are placed on values, except an overall size limitation on the entire field.\n\nSigners should document the keys and values they support.  Signers should deny requests that contain keys they do not recognize.";
 
+/// `ClusterTrustBundleSpec` swagger doc for `signerName`
+/// (certificates/v1beta1 types_swagger_doc_generated.go:100).
+const CTB_SIGNER_NAME_DOC: &str = "signerName indicates the associated signer, if any.\n\nIn order to create or update a ClusterTrustBundle that sets signerName, you must have the following cluster-scoped permission: group=certificates.k8s.io resource=signers resourceName=<the signer name> verb=attest.\n\nIf signerName is not empty, then the ClusterTrustBundle object must be named with the signer name as a prefix (translating slashes to colons). For example, for the signer name `example.com/foo`, valid ClusterTrustBundle object names include `example.com:foo:abc` and `example.com:foo:v1`.\n\nIf signerName is empty, then the ClusterTrustBundle object's name must not have such a prefix.\n\nList/watch requests for ClusterTrustBundles can filter on this field using a `spec.signerName=NAME` field selector.";
+
 fn col(
     name: &str,
     column_type: &str,
@@ -493,6 +497,12 @@ pub fn printer_columns(kind: &str) -> Option<Vec<ColumnDefinition>> {
                 0,
             ),
             col("Age", "string", "", OBJECT_META_CREATION_TIMESTAMP_DOC, 0),
+        ],
+        // pkg/printers/internalversion/printers.go:419-424
+        // (`clusterTrustBundleColumnDefinitions`).
+        "ClusterTrustBundle" => vec![
+            col("Name", "string", "name", OBJECT_META_NAME_DOC, 0),
+            col("SignerName", "string", "", CTB_SIGNER_NAME_DOC, 0),
         ],
         // pkg/printers/internalversion/printers.go:426-436
         // (`podCertificateRequestColumnDefinitions`); descriptions are the
@@ -741,6 +751,19 @@ pub fn printer_row_cells(kind: &str, obj: &serde_json::Value) -> Option<Vec<serd
                 Value::String(service),
                 Value::String(status),
                 Value::String(age),
+            ]
+        }
+        // printers.go:2332-2342 (`printClusterTrustBundle`): an empty
+        // signerName renders as `<none>`.
+        "ClusterTrustBundle" => {
+            let signer = str_at(obj, &["spec", "signerName"]).unwrap_or_default();
+            vec![
+                Value::String(name),
+                Value::String(if signer.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    signer
+                }),
             ]
         }
         // printers.go:2356-2381 (`printPodCertificateRequest`): "Issued",
@@ -1147,6 +1170,28 @@ mod tests {
             assert_eq!(c[5], json!(t));
             assert_eq!(c[6], json!("a.io/k=1,b.io/k=2"));
         }
+    }
+
+    // printers.go:419-424 (`clusterTrustBundleColumnDefinitions`) + 2332-2342
+    // (`printClusterTrustBundle`): signerName shows `<none>` when empty.
+    #[test]
+    fn cluster_trust_bundle_columns_and_cells_match_upstream() {
+        let cols = printer_columns("ClusterTrustBundleList").expect("has a printer");
+        let names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["Name", "SignerName"]);
+        assert_eq!(cols[0].format, "name");
+        assert!(cols[1]
+            .description
+            .starts_with("signerName indicates the associated signer, if any."));
+        let cells = |obj: serde_json::Value| printer_row_cells("ClusterTrustBundle", &obj).unwrap();
+        assert_eq!(
+            cells(json!({"metadata": {"name": "b"}, "spec": {}})),
+            vec![json!("b"), json!("<none>")]
+        );
+        assert_eq!(
+            cells(json!({"metadata": {"name": "x.io:s:a"}, "spec": {"signerName": "x.io/s"}})),
+            vec![json!("x.io:s:a"), json!("x.io/s")]
+        );
     }
 
     // duration_test.go TestHumanDuration + TestHumanDurationBoundaries.
