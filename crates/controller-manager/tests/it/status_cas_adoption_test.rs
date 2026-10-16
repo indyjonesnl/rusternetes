@@ -458,3 +458,61 @@ async fn cronjob_status_write_conflicts_without_duplicating_the_job() {
     })
     .await;
 }
+
+/// `bind` (pkg/controller/volume/persistentvolume/pv_controller.go:1090-1130, update :1019, status :925):
+/// `bindVolumeToClaim` -> `updateBindVolumeToClaim` does
+/// `PersistentVolumes().Update` (:1019) and `updateVolumePhase` then runs
+/// `UpdateStatus` (:925) on the object that `Update` RETURNED, so the status
+/// write carries that resourceVersion and a concurrent writer surfaces as a
+/// Conflict the claim worker requeues. The same chain applies to the claim
+/// (`bindClaimToVolume` -> `updateClaimStatus`) (#2160).
+#[tokio::test]
+async fn pv_binder_bind_status_writes_conflict_on_stale_read() {
+    use rusternetes_controller_manager::controllers::pv_binder::PVBinderController;
+    let storage = RacingStatusStorage::new();
+    let pv_key = "/registry/persistentvolumes/pv-a";
+    let pvc_key = "/registry/persistentvolumeclaims/default/pvc-a";
+    seed(
+        &storage,
+        pv_key,
+        json!({
+            "apiVersion": "v1", "kind": "PersistentVolume",
+            "metadata": {"name": "pv-a", "uid": "u-pv"},
+            "spec": {"capacity": {"storage": "1Gi"}, "accessModes": ["ReadWriteOnce"],
+                     "storageClassName": "fast",
+                     "hostPath": {"path": "/tmp/pv-a"}},
+            "status": {"phase": "Available"}
+        }),
+    )
+    .await;
+    seed(
+        &storage,
+        pvc_key,
+        json!({
+            "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+            "metadata": {"name": "pvc-a", "namespace": "default", "uid": "u-pvc"},
+            "spec": {"accessModes": ["ReadWriteOnce"], "storageClassName": "fast",
+                     "resources": {"requests": {"storage": "1Gi"}}},
+            "status": {"phase": "Pending"}
+        }),
+    )
+    .await;
+    let phase_is = |want: &'static str| {
+        move |v: &Value| v.pointer("/status/phase").and_then(|p| p.as_str()) == Some(want)
+    };
+    let c = PVBinderController::new(storage.clone());
+    c.reconcile_all().await.unwrap();
+    // The PV's phase write went through the conditional path (and lost the
+    // race, aborting that bind). `reconcile_all` also sweeps PVs afresh
+    // (`syncVolume`), so convergence is checked after the requeues below.
+    assert!(
+        storage.raced(),
+        "{pv_key}: the phase write never went through update_status_cas"
+    );
+    // Requeue: the retry re-reads and converges, including the claim.
+    for _ in 0..3 {
+        c.reconcile_all().await.unwrap();
+    }
+    assert_converges(&storage, pv_key, phase_is("Bound")).await;
+    assert_converges(&storage, pvc_key, phase_is("Bound")).await;
+}
