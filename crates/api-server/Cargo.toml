@@ -24,6 +24,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("pprof", "
 
 [dependencies]
 x509-parser.workspace = true
+rustls.workspace = true # client-cert verification for front-proxy authn (#3414)
 pem.workspace = true
 rand = "0.9"
 ipnet = "2"
@@ -100,4 +101,3 @@ protox-parse = "0.7"
 prost-types = "0.13"
 serial_test = { workspace = true }
 rcgen.workspace = true
-rustls.workspace = true
