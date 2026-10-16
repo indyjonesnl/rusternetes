@@ -1,4 +1,5 @@
 pub mod admission_metrics;
+pub mod builtin_plugins;
 pub mod caching_authorizer;
 pub mod certificates;
 pub mod config;
