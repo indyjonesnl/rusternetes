@@ -235,6 +235,7 @@ async fn admit(state: &ApiServerState, op: Operation) -> ConfigMap {
         namespace: Some("default"),
         user: &user,
         dry_run: false,
+        forbid_create: false,
     };
     let cm: ConfigMap = serde_json::from_value(json!({
         "apiVersion": "v1", "kind": "ConfigMap",

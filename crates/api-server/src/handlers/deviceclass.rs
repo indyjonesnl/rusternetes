@@ -47,6 +47,7 @@ fn scope(state: &ApiServerState) -> RequestScope<DeviceClass> {
         apply: Some(crate::ssa::apply_legacy::<DeviceClass>),
         convert_to_internal: None,
         patch_conversion: None,
+        forbid_create: false,
     }
 }
 

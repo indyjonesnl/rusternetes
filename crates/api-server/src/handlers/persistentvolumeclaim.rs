@@ -59,6 +59,7 @@ fn scope(
         apply: Some(crate::ssa::apply_legacy::<PersistentVolumeClaim>),
         convert_to_internal: Some(persistentvolumeclaim::convert_to_internal),
         patch_conversion: None,
+        forbid_create: false,
     }
 }
 

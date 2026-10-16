@@ -70,6 +70,7 @@ fn scope(
         apply: Some(crate::ssa::apply_legacy::<HorizontalPodAutoscaler>),
         convert_to_internal: Some(horizontalpodautoscaler::convert_to_internal),
         patch_conversion: (version == "v1").then_some(V1_PATCH_CONVERSION),
+        forbid_create: false,
     }
 }
 

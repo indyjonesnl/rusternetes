@@ -128,6 +128,7 @@ pub async fn patch_resource<T: Object>(
         namespace,
         user,
         dry_run,
+        forbid_create: scope.forbid_create,
     };
 
     let create_validation = CreateValidation {

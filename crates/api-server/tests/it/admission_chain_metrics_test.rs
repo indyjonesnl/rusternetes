@@ -97,6 +97,7 @@ async fn admit_and_validate_observe_the_step_metrics() {
         namespace: Some("default"),
         user: &user,
         dry_run: false,
+        forbid_create: false,
     };
     let cm: ConfigMap = serde_json::from_value(json!({
         "apiVersion": "v1", "kind": "ConfigMap",

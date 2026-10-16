@@ -406,6 +406,7 @@ mod admission_plugin_selection {
             namespace: Some("default"),
             user: &user,
             dry_run: false,
+            forbid_create: false,
         };
         let pod: Pod = serde_json::from_value(serde_json::json!({
             "apiVersion": "v1", "kind": "Pod",

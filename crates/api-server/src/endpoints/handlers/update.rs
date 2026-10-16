@@ -90,6 +90,7 @@ pub async fn update_resource<T: Object>(
         namespace,
         user,
         dry_run,
+        forbid_create: false,
     };
 
     // update.go:156-230: mutating admission is a transformer, so it sees the

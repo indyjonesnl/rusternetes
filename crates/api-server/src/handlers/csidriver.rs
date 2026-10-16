@@ -47,6 +47,7 @@ fn scope(state: &ApiServerState) -> RequestScope<CSIDriver> {
         apply: Some(crate::ssa::apply_legacy::<CSIDriver>),
         convert_to_internal: Some(csidriver::convert_to_internal),
         patch_conversion: None,
+        forbid_create: false,
     }
 }
 

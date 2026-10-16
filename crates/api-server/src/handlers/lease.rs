@@ -47,6 +47,7 @@ fn scope(state: &ApiServerState) -> RequestScope<Lease> {
         apply: Some(crate::ssa::apply_legacy::<Lease>),
         convert_to_internal: None,
         patch_conversion: None,
+        forbid_create: false,
     }
 }
 

@@ -47,6 +47,7 @@ fn scope(state: &ApiServerState) -> RequestScope<StorageClass> {
         apply: Some(crate::ssa::apply_legacy::<StorageClass>),
         convert_to_internal: Some(storageclass::convert_to_internal),
         patch_conversion: None,
+        forbid_create: false,
     }
 }
 

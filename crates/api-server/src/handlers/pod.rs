@@ -61,6 +61,7 @@ fn scope(state: &ApiServerState, subresource: Option<&'static str>) -> RequestSc
         apply: Some(crate::ssa::apply_legacy::<Pod>),
         convert_to_internal: Some(pod::convert_to_internal),
         patch_conversion: None,
+        forbid_create: false,
     }
 }
 
@@ -439,6 +440,7 @@ pub async fn create_binding(
         namespace: Some(&namespace),
         user: &auth_ctx.user,
         dry_run,
+        forbid_create: false,
     };
     let binding = admission.admit(Operation::Create, binding, None).await?;
     let validation = CreateValidation {
@@ -533,6 +535,7 @@ pub async fn create_eviction(
         namespace: Some(&namespace),
         user: &auth_ctx.user,
         dry_run,
+        forbid_create: false,
     };
     // Mutating admission, then the storage's create with validating
     // admission as its callback (create.go:202-209).

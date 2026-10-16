@@ -51,6 +51,7 @@ fn scope(state: &ApiServerState, subresource: Option<&'static str>) -> RequestSc
         apply: Some(crate::ssa::apply_legacy::<StatefulSet>),
         convert_to_internal: Some(statefulset::convert_to_internal),
         patch_conversion: None,
+        forbid_create: false,
     }
 }
 
@@ -73,6 +74,7 @@ fn scale_scope(state: &ApiServerState) -> RequestScope<Scale> {
         apply: Some(crate::ssa::apply_legacy::<Scale>),
         convert_to_internal: None,
         patch_conversion: None,
+        forbid_create: false,
     }
 }
 

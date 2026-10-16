@@ -83,6 +83,7 @@ pub async fn create_resource<T: Object>(
         namespace,
         user,
         dry_run,
+        forbid_create: scope.forbid_create,
     };
 
     // Mutating admission, then the Store's create with validating admission

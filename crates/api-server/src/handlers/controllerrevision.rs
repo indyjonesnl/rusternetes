@@ -48,6 +48,7 @@ fn scope(state: &ApiServerState) -> RequestScope<ControllerRevision> {
         apply: Some(crate::ssa::apply_legacy::<ControllerRevision>),
         convert_to_internal: None,
         patch_conversion: None,
+        forbid_create: false,
     }
 }
 
