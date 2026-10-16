@@ -57,6 +57,7 @@ impl VolumePlugin for DownwardApiPlugin {
 
     async fn new_mounter(&self, spec: &Spec<'_>, pod: &Pod) -> Result<Box<dyn Mounter>> {
         Ok(Box::new(DownwardApiMounter {
+            host: self.host.clone(),
             path: self
                 .host
                 .get_pod_volume_dir(&pod.metadata.uid, self.name(), &spec.volume.name),
@@ -105,6 +106,8 @@ impl VolumePlugin for DownwardApiPlugin {
 }
 
 struct DownwardApiMounter {
+    /// `plugin.host`, for the wrapped emptyDir's metadata dir.
+    host: Arc<dyn VolumeHost>,
     path: String,
     volume: Volume,
     pod: Pod,
@@ -157,6 +160,22 @@ impl Mounter for DownwardApiMounter {
         // runs in the AtomicWriter's `setPerms` (`:217-222`) below.
         crate::volume_plugins::empty_dir::setup_dir(volume_dir)
             .context("Failed to create DownwardAPI volume directory")?;
+        // The wrapped emptyDir's `SetUpAt` ends with
+        // `volumeutil.SetReady(ed.getMetaDir())` (empty_dir.go:284), which
+        // creates `<pod>/plugins/kubernetes.io~empty-dir/wrapped_<vol>`.
+        let meta_dir = crate::volume_plugins::util::wrapped_empty_dir_meta_dir(
+            &self.host,
+            &self.volume.name,
+            &self.pod.metadata.uid,
+        );
+        crate::volume_plugins::util::set_ready(&meta_dir);
+        // `volumeutil.MakeNestedMountpoints(b.volName, dir, *b.pod)`
+        // (downwardapi.go:191), before the failure-teardown `defer` is armed.
+        crate::volume_plugins::util::nested_volumes::make_nested_mountpoints(
+            &self.volume.name,
+            std::path::Path::new(volume_dir),
+            &self.pod,
+        )?;
 
         // `defer` at downwardapi.go:195-208: when the AtomicWriter fails after
         // the wrapped SetUpAt, `unmounter.TearDown()` runs and emptyDir
@@ -167,6 +186,8 @@ impl Mounter for DownwardApiMounter {
             args.fs_group,
             true,
         ) {
+            // emptyDir `TearDownAt` removes the ready dir first (empty_dir.go:497-500).
+            let _ = std::fs::remove_dir_all(&meta_dir);
             if let Err(td) = std::fs::remove_dir_all(volume_dir) {
                 tracing::error!("Error tearing down volume {}: {}", self.volume.name, td);
             }
@@ -331,6 +352,12 @@ mod tests {
 
     fn mounter_for(dir: &std::path::Path, items: serde_json::Value) -> DownwardApiMounter {
         DownwardApiMounter {
+            host: std::sync::Arc::new(crate::volume_plugins::KubeletVolumeHost::new(
+                "/var/lib/rusternetes".to_string(),
+                None,
+                rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+                HashMap::new(),
+            )),
             path: dir.to_string_lossy().into_owned(),
             volume: serde_json::from_value(
                 json!({"name": "podinfo", "downwardAPI": {"items": items}}),
@@ -579,6 +606,65 @@ mod tests {
         );
         assert!(m.set_up().await.is_err());
         assert!(!dir.exists());
+    }
+
+    async fn plugin_mounter(base: &std::path::Path, pod: Pod) -> Box<dyn Mounter> {
+        let plugin = DownwardApiPlugin::new(std::sync::Arc::new(
+            crate::volume_plugins::KubeletVolumeHost::new(
+                base.to_string_lossy().into_owned(),
+                None,
+                rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+                HashMap::new(),
+            ),
+        ));
+        let v: Volume = serde_json::from_value(json!({
+            "name": "podinfo",
+            "downwardAPI": {"items": [{"path": "f", "fieldRef": {"fieldPath": "metadata.name"}}]}
+        }))
+        .unwrap();
+        let spec = Spec {
+            volume: &v,
+            persistent_volume: None,
+            read_only: false,
+        };
+        plugin.new_mounter(&spec, &pod).await.unwrap()
+    }
+
+    /// `newDownwardAPITest` (downwardapi_test.go): "downwardapi volume should
+    /// create its own empty wrapper path" -- the wrapped emptyDir's `SetReady`
+    /// (empty_dir.go:284) creates
+    /// `<pod>/plugins/kubernetes.io~empty-dir/wrapped_<vol>`.
+    #[tokio::test]
+    async fn set_up_creates_the_wrapped_empty_dir_metadata_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = plugin_mounter(tmp.path(), test_pod()).await;
+        m.set_up().await.unwrap();
+        let wrapper = tmp
+            .path()
+            .join("pods/u1/plugins/kubernetes.io~empty-dir/wrapped_podinfo");
+        assert!(wrapper.is_dir(), "missing {}", wrapper.display());
+        assert!(wrapper.join("ready").exists());
+    }
+
+    /// `volumeutil.MakeNestedMountpoints(b.volName, dir, *b.pod)`
+    /// (downwardapi.go:191): a volume mounted beneath the downwardAPI volume
+    /// gets its mountpoint directory created inside it.
+    #[tokio::test]
+    async fn nested_mountpoints_are_created_inside_the_volume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "ns", "uid": "u1"},
+            "spec": {"containers": [{"name": "c", "image": "i", "volumeMounts": [
+                {"name": "podinfo", "mountPath": "/etc/podinfo"},
+                {"name": "other", "mountPath": "/etc/podinfo/sub/dir"}
+            ]}]}
+        }))
+        .unwrap();
+        let m = plugin_mounter(tmp.path(), pod).await;
+        m.set_up().await.unwrap();
+        let dir = std::path::PathBuf::from(m.get_path());
+        assert!(dir.join("sub/dir").is_dir());
+        assert_eq!(std::fs::read(dir.join("f")).unwrap(), b"p");
     }
 
     /// `downwardAPIVolume.GetAttributes` (`pkg/volume/downwardapi/downwardapi.go:154-160`).
