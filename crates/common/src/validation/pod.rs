@@ -522,6 +522,12 @@ fn validate_pod_spec_for(
                 &sc_path.child("seccompProfile"),
             ));
         }
+        errs.extend(
+            crate::validation::windows_options::validate_windows_security_context_options(
+                sc.windows_options.as_ref(),
+                &sc_path.child("windowsOptions"),
+            ),
+        );
         if let Some(ref ap) = sc.app_armor_profile {
             errs.extend(validate_app_armor_profile(
                 ap,
@@ -1376,6 +1382,12 @@ pub(crate) fn validate_container(
                 &sc_path.child("seccompProfile"),
             ));
         }
+        errs.extend(
+            crate::validation::windows_options::validate_windows_security_context_options(
+                sc.windows_options.as_ref(),
+                &sc_path.child("windowsOptions"),
+            ),
+        );
         if let Some(ref ap) = sc.app_armor_profile {
             errs.extend(validate_app_armor_profile(
                 ap,
