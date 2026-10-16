@@ -1475,13 +1475,7 @@ impl Kubelet {
 
         // Set default node labels matching K8s kubelet initialNode()
         // See: pkg/kubelet/kubelet_node_status.go:initialNode()
-        node.metadata.labels = Some(HashMap::from([
-            ("kubernetes.io/hostname".to_string(), self.hostname.clone()),
-            ("kubernetes.io/os".to_string(), "linux".to_string()),
-            ("kubernetes.io/arch".to_string(), "amd64".to_string()),
-            ("beta.kubernetes.io/os".to_string(), "linux".to_string()),
-            ("beta.kubernetes.io/arch".to_string(), "amd64".to_string()),
-        ]));
+        node.metadata.labels = Some(default_node_labels(&self.hostname));
 
         // Set node spec to mark it as schedulable
         node.spec = Some(NodeSpec {
@@ -1753,22 +1747,10 @@ impl Kubelet {
         };
 
         // Ensure default node labels are always set (K8s kubelet updateDefaultLabels)
-        let labels = node.metadata.labels.get_or_insert_with(HashMap::new);
-        labels
-            .entry("kubernetes.io/hostname".to_string())
-            .or_insert_with(|| self.hostname.clone());
-        labels
-            .entry("kubernetes.io/os".to_string())
-            .or_insert_with(|| "linux".to_string());
-        labels
-            .entry("kubernetes.io/arch".to_string())
-            .or_insert_with(|| "amd64".to_string());
-        labels
-            .entry("beta.kubernetes.io/os".to_string())
-            .or_insert_with(|| "linux".to_string());
-        labels
-            .entry("beta.kubernetes.io/arch".to_string())
-            .or_insert_with(|| "amd64".to_string());
+        update_default_labels(
+            &default_node_labels(&self.hostname),
+            &mut node.metadata.labels,
+        );
 
         // Ensure capacity, allocatable, and nodeInfo are always set
         if let Some(ref mut status) = node.status {
@@ -6266,6 +6248,89 @@ async fn upsert_metrics<S, T>(
                 debug!("Failed to create metrics {key}: {e}");
             }
         }
+    }
+}
+
+/// The default labels `initialNode` sets (kubelet_node_status.go:304-313;
+/// `v1.LabelHostname` plus os/arch and the deprecated beta os/arch).
+fn default_node_labels(hostname: &str) -> HashMap<String, String> {
+    HashMap::from([
+        ("kubernetes.io/hostname".to_string(), hostname.to_string()),
+        ("kubernetes.io/os".to_string(), "linux".to_string()),
+        ("kubernetes.io/arch".to_string(), "amd64".to_string()),
+        ("beta.kubernetes.io/os".to_string(), "linux".to_string()),
+        ("beta.kubernetes.io/arch".to_string(), "amd64".to_string()),
+    ])
+}
+
+/// `Kubelet.updateDefaultLabels` (pkg/kubelet/kubelet_node_status.go:230-267).
+fn update_default_labels(
+    initial: &HashMap<String, String>,
+    existing: &mut Option<HashMap<String, String>>,
+) -> bool {
+    const DEFAULT_LABELS: [&str; 5] = [
+        "kubernetes.io/hostname",
+        "kubernetes.io/os",
+        "kubernetes.io/arch",
+        "beta.kubernetes.io/os",
+        "beta.kubernetes.io/arch",
+    ];
+    let labels = existing.get_or_insert_with(HashMap::new);
+    let mut needs_update = false;
+    for label in DEFAULT_LABELS {
+        let Some(want) = initial.get(label) else {
+            continue;
+        };
+        if labels.get(label).map(String::as_str).unwrap_or("") != want.as_str() {
+            labels.insert(label.to_string(), want.clone());
+            needs_update = true;
+        }
+        if labels.get(label).is_some_and(|v| v.is_empty()) {
+            labels.remove(label);
+        }
+    }
+    needs_update
+}
+
+#[cfg(test)]
+mod default_labels_tests {
+    use super::*;
+
+    // kubelet_node_status.go:230-267: existing value != initial value is
+    // overwritten (needsUpdate), equal is a no-op, empty initial is deleted.
+    #[test]
+    fn force_overwrites_drifted_default_labels() {
+        let initial = default_node_labels("host-a");
+        let mut existing = Some(HashMap::from([
+            ("kubernetes.io/hostname".to_string(), "stale".to_string()),
+            ("kubernetes.io/os".to_string(), "linux".to_string()),
+            ("custom".to_string(), "keep".to_string()),
+        ]));
+        assert!(update_default_labels(&initial, &mut existing));
+        let l = existing.unwrap();
+        assert_eq!(l["kubernetes.io/hostname"], "host-a");
+        assert_eq!(l["kubernetes.io/arch"], "amd64");
+        assert_eq!(l["custom"], "keep");
+    }
+
+    #[test]
+    fn noop_when_already_matching() {
+        let initial = default_node_labels("h");
+        let mut existing = Some(initial.clone());
+        assert!(!update_default_labels(&initial, &mut existing));
+        assert_eq!(existing.unwrap(), initial);
+    }
+
+    #[test]
+    fn empty_initial_value_is_deleted() {
+        let mut initial = default_node_labels("h");
+        initial.insert("kubernetes.io/os".to_string(), String::new());
+        let mut existing = Some(HashMap::from([(
+            "kubernetes.io/os".to_string(),
+            "windows".to_string(),
+        )]));
+        assert!(update_default_labels(&initial, &mut existing));
+        assert!(!existing.unwrap().contains_key("kubernetes.io/os"));
     }
 }
 

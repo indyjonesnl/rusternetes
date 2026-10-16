@@ -124,9 +124,13 @@ struct Args {
     #[arg(long, default_value = "")]
     feature_gates: String,
 
-    /// Node name
+    /// Node name. Optional: upstream has no such flag and derives
+    /// `nodeName` from the hostname (`RunKubelet`, server.go:1208-1211), which
+    /// is what an unset `--node-name` does here. When set it stands in for the
+    /// node name (and, absent `--hostname-override`, the hostname) for
+    /// callers whose OS hostname is not the node name.
     #[arg(long)]
-    node_name: String,
+    node_name: Option<String>,
 
     /// Etcd endpoints (comma-separated)
     #[arg(long, default_value = "http://localhost:2379")]
@@ -401,11 +405,11 @@ async fn main() -> Result<()> {
             .map_err(|e| anyhow::anyhow!(e))?;
 
     // RunKubelet: `nodeutil.GetHostname(kubeServer.HostnameOverride)`
-    // (server.go:1208). `--node-name` stands in for the hostname when no
-    // override is given (upstream: `nodeName := types.NodeName(hostname)`).
-    let hostname = node_ip::get_hostname(
-        args.hostname_override.as_deref().unwrap_or(&args.node_name),
-        &|| Ok(String::new()),
+    // (server.go:1208) then `nodeName := types.NodeName(hostname)` (:1211).
+    let (node_name, hostname) = node_ip::resolve_node_identity(
+        args.node_name.as_deref(),
+        args.hostname_override.as_deref(),
+        &|| std::fs::read_to_string("/proc/sys/kernel/hostname"),
     )
     .map_err(|e| anyhow::anyhow!(e))?;
 
@@ -422,7 +426,7 @@ async fn main() -> Result<()> {
         args.metrics_port,
         args.log_level,
         config_file,
-        args.node_name,
+        node_name,
         etcd_endpoints,
     )?;
 
@@ -750,6 +754,13 @@ mod feature_gates_flag_tests {
         let mut v: Vec<&str> = vec!["kubelet", "--node-name", "n"];
         v.push(gates);
         Args::try_parse_from(v).unwrap()
+    }
+
+    /// Upstream has no `--node-name`; the kubelet must start without it.
+    #[test]
+    fn node_name_flag_is_optional() {
+        let a = Args::try_parse_from(["kubelet"]).unwrap();
+        assert!(a.node_name.is_none());
     }
 
     /// Upstream `--feature-gates` (component-base featuregate `Set`,
