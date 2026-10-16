@@ -535,6 +535,54 @@ fn spec_has_readiness_probe(spec: &rusternetes_common::resources::pod::PodSpec) 
         .unwrap_or(false)
 }
 
+/// Re-read the pod from storage for the per-cycle readiness block so that
+/// restart_count/last_state and gate conditions patched via /status mid-cycle
+/// are seen (the cycle-start `pod` is stale). Falls back to `fallback` on a
+/// storage error. Extracted from the sync loop for #2387.
+async fn load_readiness_pod<S: Storage>(
+    storage: &S,
+    namespace: &str,
+    pod_name: &str,
+    fallback: &Pod,
+) -> Pod {
+    let key = build_key("pods", Some(namespace), pod_name);
+    storage
+        .get::<Pod>(&key)
+        .await
+        .unwrap_or_else(|_| fallback.clone())
+}
+
+/// Returns `(containers_ready, ready)` for the per-cycle readiness block.
+/// Restartable init containers (sidecars) count toward ContainersReady
+/// (upstream pkg/kubelet/status/generate.go); plain init containers do not.
+/// Readiness gates are ANDed into Ready only, evaluated on `readiness_pod`
+/// (`GeneratePodReadyCondition`). Extracted from the sync loop for #2387.
+fn evaluate_pod_readiness(
+    readiness_pod: &Pod,
+    container_statuses: &[ContainerStatus],
+    init_container_statuses: Option<&[ContainerStatus]>,
+) -> (bool, bool) {
+    let init_sidecars_ready = match init_container_statuses {
+        Some(init) => {
+            let ics = readiness_pod
+                .spec
+                .as_ref()
+                .and_then(|sp| sp.init_containers.as_ref());
+            init.iter().all(|s| {
+                let is_sidecar = ics
+                    .and_then(|list| list.iter().find(|ic| ic.name == s.name))
+                    .and_then(|ic| ic.restart_policy.as_deref())
+                    == Some("Always");
+                !is_sidecar || s.ready
+            })
+        }
+        None => true,
+    };
+    let containers_ready = container_statuses.iter().all(|s| s.ready) && init_sidecars_ready;
+    let ready = containers_ready && readiness_gates_satisfied(readiness_pod);
+    (containers_ready, ready)
+}
+
 /// True when every condition named in `spec.readinessGates` is present in
 /// `status.conditions` with status `"True"`. A pod with no readinessGates is
 /// trivially satisfied. Mirrors upstream `GeneratePodReadyCondition`: the Ready
@@ -4774,12 +4822,8 @@ impl Kubelet {
                         // IMPORTANT: Read the fresh pod from storage so that
                         // restart_count/last_state set during the restart path
                         // above are preserved (the original `pod` variable is stale).
-                        let readiness_pod_key = build_key("pods", Some(namespace), pod_name);
-                        let readiness_pod = self
-                            .storage
-                            .get::<Pod>(&readiness_pod_key)
-                            .await
-                            .unwrap_or_else(|_| pod.clone());
+                        let readiness_pod =
+                            load_readiness_pod(&*self.storage, namespace, pod_name, pod).await;
                         if let Ok(mut container_statuses) =
                             self.get_container_statuses(&readiness_pod).await
                         {
@@ -4800,51 +4844,14 @@ impl Kubelet {
                                     .apply_readiness(&readiness_pod, init_statuses)
                                     .await;
                             }
-                            // Restartable init containers (sidecars) count toward
-                            // ContainersReady too (upstream status/generate.go):
-                            // every sidecar must be ready. Plain init containers
-                            // are excluded — they complete before the main
-                            // containers and aren't part of steady-state readiness.
-                            let init_sidecars_ready = match init_container_statuses.as_ref() {
-                                Some(init) => {
-                                    let ics = readiness_pod
-                                        .spec
-                                        .as_ref()
-                                        .and_then(|sp| sp.init_containers.as_ref());
-                                    init.iter().all(|s| {
-                                        let is_sidecar = ics
-                                            .and_then(|list| {
-                                                list.iter().find(|ic| ic.name == s.name)
-                                            })
-                                            .and_then(|ic| ic.restart_policy.as_deref())
-                                            == Some("Always");
-                                        !is_sidecar || s.ready
-                                    })
-                                }
-                                None => true,
-                            };
-                            let containers_ready =
-                                container_statuses.iter().all(|s| s.ready) && init_sidecars_ready;
-                            // Readiness gates: every condition named in
-                            // spec.readinessGates must be present in
-                            // status.conditions with status "True" for the pod to
-                            // be Ready (upstream GeneratePodReadyCondition). These
-                            // conditions are supplied via the status subresource.
-                            // ContainersReady ignores the gates; only Ready ANDs
-                            // them in.
-                            //
-                            // Evaluate against `readiness_pod` (re-read above), NOT
-                            // the cycle-start `pod` snapshot: a gate condition
-                            // patched via /status mid-cycle is only on the fresh
-                            // object. Upstream evaluates the gates against the
-                            // latest status conditions it is building on
-                            // (pkg/kubelet/status/generate.go
-                            // `GeneratePodReadyCondition`, `GetPodConditionFromList(
-                            // conditions, rg.ConditionType)`, fed from the status
-                            // manager's cached status, status_manager.go ~L577-585
-                            // `oldStatus = &cachedStatus.status`). #2384
-                            let all_ready =
-                                containers_ready && readiness_gates_satisfied(&readiness_pod);
+                            // Gates/sidecars evaluated on `readiness_pod` (re-read
+                            // above), NOT the cycle-start `pod`; see
+                            // evaluate_pod_readiness (#2384, #2387).
+                            let (containers_ready, all_ready) = evaluate_pod_readiness(
+                                &readiness_pod,
+                                &container_statuses,
+                                init_container_statuses.as_deref(),
+                            );
 
                             // Check if all containers have terminated (for Never/OnFailure restart policies)
                             let restart_policy = pod
@@ -8256,6 +8263,69 @@ mod tests {
         );
         assert!(!super::readiness_gates_satisfied(&stale));
         assert!(super::readiness_gates_satisfied(&fresh));
+    }
+
+    /// #2387 (red-first for #2384): drive the per-cycle readiness block without
+    /// a CRI runtime. The cycle-start pod is stale (no gate condition); storage
+    /// holds the fresh pod (gate patched via /status mid-cycle). The block must
+    /// evaluate gates on the re-read pod.
+    #[tokio::test]
+    async fn readiness_cycle_evaluates_gates_on_reread_pod() {
+        use rusternetes_common::resources::pod::{PodReadinessGate, PodSpec};
+        use rusternetes_storage::{build_key, Storage};
+        let now = chrono::Utc::now();
+        let spec = || PodSpec {
+            containers: vec![make_container("app")],
+            readiness_gates: Some(vec![PodReadinessGate {
+                condition_type: "www.example.com/feature-1".to_string(),
+            }]),
+            ..Default::default()
+        };
+        let mk = |conds: Vec<PodCondition>| {
+            let mut p = Pod::new("pod-ready", spec());
+            p.metadata.namespace = Some("ns".to_string());
+            p.status = Some(PodStatus {
+                conditions: Some(conds),
+                ..Default::default()
+            });
+            p
+        };
+        let stale = mk(vec![cond("ContainersReady", "True", now)]);
+        let fresh = mk(vec![
+            cond("ContainersReady", "True", now),
+            cond("www.example.com/feature-1", "True", now),
+        ]);
+        let storage = rusternetes_storage::memory::MemoryStorage::new();
+        let key = build_key("pods", Some("ns"), "pod-ready");
+        storage.create(&key, &fresh).await.unwrap();
+
+        let statuses: Vec<ContainerStatus> = serde_json::from_value(
+            serde_json::json!([{"name":"app","ready":true,"restartCount":0,"image":"i","imageID":"i"}]),
+        )
+        .unwrap();
+
+        // Stale snapshot alone: gate unsatisfied.
+        let (cr, ready) = super::evaluate_pod_readiness(&stale, &statuses, None);
+        assert!(cr);
+        assert!(!ready);
+
+        // The cycle re-reads the pod from storage and evaluates on that.
+        let rp = super::load_readiness_pod(&storage, "ns", "pod-ready", &stale).await;
+        let (cr, ready) = super::evaluate_pod_readiness(&rp, &statuses, None);
+        assert!(cr);
+        assert!(ready, "gates must be evaluated on the re-read pod");
+
+        // Storage miss falls back to the cycle-start pod.
+        let missing = super::load_readiness_pod(&storage, "ns", "absent", &stale).await;
+        assert!(!super::evaluate_pod_readiness(&missing, &statuses, None).1);
+
+        // A not-ready container holds both conditions false.
+        let mut unready = statuses.clone();
+        unready[0].ready = false;
+        assert_eq!(
+            super::evaluate_pod_readiness(&rp, &unready, None),
+            (false, false)
+        );
     }
 
     #[test]
