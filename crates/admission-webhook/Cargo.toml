@@ -21,6 +21,7 @@ cel.workspace = true
 uuid.workspace = true
 futures.workspace = true
 anyhow.workspace = true
+prometheus.workspace = true
 
 [dev-dependencies]
 rusternetes-storage = { path = "../storage" }
