@@ -3796,7 +3796,7 @@ impl Kubelet {
                             // retries on the next sync cycle.
                             // K8s ref: pkg/kubelet/kubelet.go:2204 — WaitForAttachAndMount
                             //          pkg/kubelet/kubelet_pods.go:2496 — defaultWaitingState
-                            if crate::lifecycle::is_volume_wait_error(&err_msg) {
+                            if crate::lifecycle::is_volume_wait_error(&e) {
                                 warn!(
                                     "Pod {}/{} waiting for volume (will retry): {}",
                                     namespace, pod_name, err_msg
