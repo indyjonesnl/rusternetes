@@ -7,6 +7,7 @@ pub mod framework_runtime;
 #[allow(dead_code)]
 pub mod plugins;
 pub mod profile;
+pub mod queue;
 pub mod scheduler;
 pub mod scheduler_config;
 pub mod score;
