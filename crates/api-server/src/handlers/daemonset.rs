@@ -51,6 +51,7 @@ fn scope(state: &ApiServerState, subresource: Option<&'static str>) -> RequestSc
         apply: Some(crate::ssa::apply_legacy::<DaemonSet>),
         convert_to_internal: Some(daemonset::convert_to_internal),
         patch_conversion: None,
+        forbid_create: false,
     }
 }
 

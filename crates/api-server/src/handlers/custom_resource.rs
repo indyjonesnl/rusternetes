@@ -13,7 +13,7 @@
 
 use crate::endpoints::handlers::{self as endpoints, RequestScope};
 use crate::registry::apiextensions::controllers::{
-    find_crd_condition, ESTABLISHED, NAMES_ACCEPTED,
+    find_crd_condition, ESTABLISHED, NAMES_ACCEPTED, TERMINATING,
 };
 use crate::registry::apiextensions::customresource::{
     new_scale_rest, CustomResourceRest, StrictMode,
@@ -153,6 +153,12 @@ fn scope(
         apply: Some(crate::ssa::apply_legacy::<CustomResource>),
         convert_to_internal: None,
         patch_conversion: None,
+        // customresource_handler.go:388-401: `terminating :=
+        // IsCRDConditionTrue(crd, Terminating)` wraps the `create` and
+        // `patch` verbs' admission in `forbidCreateAdmission`; `update` and
+        // the rest use `r.admission` as is. The Update handler builds its own
+        // admission and ignores this flag, as upstream's does.
+        forbid_create: is_crd_condition_true(crd, TERMINATING),
     }
 }
 
@@ -1063,6 +1069,7 @@ fn scale_scope(
         apply: Some(crate::ssa::apply_legacy::<Scale>),
         convert_to_internal: None,
         patch_conversion: None,
+        forbid_create: is_crd_condition_true(crd, TERMINATING),
     })
 }
 

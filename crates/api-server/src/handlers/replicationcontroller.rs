@@ -55,6 +55,7 @@ fn scope(
         apply: Some(crate::ssa::apply_legacy::<ReplicationController>),
         convert_to_internal: Some(replicationcontroller::convert_to_internal),
         patch_conversion: None,
+        forbid_create: false,
     }
 }
 
@@ -77,6 +78,7 @@ fn scale_scope(state: &ApiServerState) -> RequestScope<Scale> {
         apply: Some(crate::ssa::apply_legacy::<Scale>),
         convert_to_internal: None,
         patch_conversion: None,
+        forbid_create: false,
     }
 }
 

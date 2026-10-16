@@ -48,6 +48,7 @@ fn scope(state: &ApiServerState) -> RequestScope<PodTemplate> {
         apply: Some(crate::ssa::apply_legacy::<PodTemplate>),
         convert_to_internal: Some(podtemplate::convert_to_internal),
         patch_conversion: None,
+        forbid_create: false,
     }
 }
 

@@ -80,6 +80,7 @@ fn scope(state: &ApiServerState, uri: &Uri) -> (Served, RequestScope<Event>) {
             Served::Core => None,
             Served::EventsV1 => Some(event::EVENTS_V1_PATCH_CONVERSION),
         },
+        forbid_create: false,
     };
     (served, scope)
 }

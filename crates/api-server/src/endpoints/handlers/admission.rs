@@ -57,6 +57,10 @@ pub struct Admission<'a> {
     pub namespace: Option<&'a str>,
     pub user: &'a UserInfo,
     pub dry_run: bool,
+    /// `forbidCreateAdmission` (customresource_handler.go:1523-1554) wraps the
+    /// chain: `Handles(Create)` is true and both `Admit` and `Validate` refuse
+    /// an `admission.Create`.
+    pub forbid_create: bool,
 }
 
 fn denied(reason: &str) -> Error {
@@ -126,6 +130,17 @@ impl Admission<'_> {
             "{} \"{name}\" is forbidden: {err}",
             GroupResource::new(&self.resource.group, &self.resource.resource)
         ))
+    }
+
+    /// `forbidCreateAdmission.Admit`/`Validate`:
+    /// `apierrors.NewForbidden(a.GetResource().GroupResource(), a.GetName(),
+    /// errors.New("create not allowed while custom resource definition is terminating"))`
+    /// (customresource_handler.go:1541-1543).
+    fn forbid_create_error(&self, name: &str) -> Error {
+        self.forbidden(
+            name,
+            "create not allowed while custom resource definition is terminating",
+        )
     }
 
     /// The in-tree mutating plugins. `DefaultStorageClass`
@@ -803,6 +818,9 @@ impl Admission<'_> {
         obj: T,
         old: Option<&T>,
     ) -> Result<T> {
+        if self.forbid_create && op == Operation::Create {
+            return Err(self.forbid_create_error(&obj.metadata().name));
+        }
         use crate::admission::policy_mutating::ReinvocationContext;
         let reinvocation = std::sync::Arc::new(ReinvocationContext::new(false));
         let obj = self.admit_chain(&op, obj, old, &reinvocation).await?;
@@ -912,6 +930,10 @@ impl Admission<'_> {
         obj: Option<&T>,
         old: Option<&T>,
     ) -> Result<()> {
+        if self.forbid_create && op == Operation::Create {
+            let name = obj.map(|o| o.metadata().name.as_str()).unwrap_or_default();
+            return Err(self.forbid_create_error(name));
+        }
         self.validate_in_tree(ctx, &op, obj, old).await?;
         let name = obj
             .or(old)

@@ -92,6 +92,7 @@ pub async fn delete_resource<T: Object>(
         namespace,
         user,
         dry_run: is_dry_run(options.dry_run.as_deref()),
+        forbid_create: false,
     };
     let validation = DeleteValidation {
         admission: &admission,
@@ -163,6 +164,7 @@ pub async fn delete_collection<T: Object>(
         namespace,
         user,
         dry_run: is_dry_run(options.dry_run.as_deref()),
+        forbid_create: false,
     };
     let validation = DeleteValidation {
         admission: &admission,

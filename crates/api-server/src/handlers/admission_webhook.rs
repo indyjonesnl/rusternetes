@@ -196,6 +196,7 @@ fn validating_scope(state: &ApiServerState) -> RequestScope<ValidatingWebhookCon
         apply: Some(crate::ssa::apply_legacy::<ValidatingWebhookConfiguration>),
         convert_to_internal: Some(validating::convert_to_internal),
         patch_conversion: None,
+        forbid_create: false,
     }
 }
 
@@ -288,6 +289,7 @@ fn mutating_scope(state: &ApiServerState) -> RequestScope<MutatingWebhookConfigu
         apply: Some(crate::ssa::apply_legacy::<MutatingWebhookConfiguration>),
         convert_to_internal: Some(mutating::convert_to_internal),
         patch_conversion: None,
+        forbid_create: false,
     }
 }
 
