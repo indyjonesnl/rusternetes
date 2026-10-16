@@ -2862,6 +2862,16 @@ const MAX_GENERATE_NAME_BODY: usize = 4 * 1024 * 1024;
 /// untouched — preserving raw-byte strict decoding (e.g. duplicate-field
 /// detection) for the overwhelmingly common path.
 pub fn synthesize_generate_name(body: &[u8]) -> Option<Vec<u8>> {
+    synthesize_generate_name_with(body, &rusternetes_common::names::simple_name_generator)
+}
+
+/// [`synthesize_generate_name`] with the name generator injected
+/// (`names.NameGenerator`, `CreateStrategy.GenerateName`), so a test can
+/// force a collision.
+pub fn synthesize_generate_name_with(
+    body: &[u8],
+    generate: &(dyn Fn(&str) -> String + Sync),
+) -> Option<Vec<u8>> {
     let mut value: serde_json::Value = serde_json::from_slice(body).ok()?;
     let metadata = value
         .as_object_mut()?
@@ -2882,10 +2892,9 @@ pub fn synthesize_generate_name(body: &[u8]) -> Option<Vec<u8>> {
         .filter(|p| !p.is_empty())?
         .to_string();
 
-    let suffix = uuid::Uuid::new_v4().simple().to_string()[..5].to_string();
     metadata.insert(
         "name".to_string(),
-        serde_json::Value::String(format!("{prefix}{suffix}")),
+        serde_json::Value::String(generate(&prefix)),
     );
     serde_json::to_vec(&value).ok()
 }
@@ -2895,6 +2904,22 @@ pub fn synthesize_generate_name(body: &[u8]) -> Option<Vec<u8>> {
 /// here. Non-POST, non-JSON, and already-named requests pass straight through
 /// with their original bytes intact.
 pub async fn generate_name_middleware(req: Request, next: Next) -> Response {
+    generate_name_middleware_with(req, next, &rusternetes_common::names::simple_name_generator)
+        .await
+}
+
+/// `maxNameGenerationCreateAttempts` (apiserver
+/// `pkg/registry/generic/registry/store.go:440`): how many times a create that
+/// carries `generateName` is attempted when it fails on a name conflict. Each
+/// attempt draws a new name.
+pub const MAX_NAME_GENERATION_CREATE_ATTEMPTS: usize = 8;
+
+/// [`generate_name_middleware`] with the name generator injected.
+pub async fn generate_name_middleware_with(
+    req: Request,
+    next: Next,
+    generate: &(dyn Fn(&str) -> String + Sync),
+) -> Response {
     let is_json_create = req.method() == axum::http::Method::POST
         && req
             .headers()
@@ -2913,11 +2938,56 @@ pub async fn generate_name_middleware(req: Request, next: Next) -> Response {
         }
     };
 
-    let new_body = match synthesize_generate_name(&bytes) {
-        Some(rewritten) => Body::from(rewritten),
-        None => Body::from(bytes),
+    // Not a create that needs a generated name: forward the original bytes.
+    let Some(mut rewritten) = synthesize_generate_name_with(&bytes, generate) else {
+        return next
+            .run(Request::from_parts(parts, Body::from(bytes)))
+            .await;
     };
-    next.run(Request::from_parts(parts, new_body)).await
+
+    // `createWithGenerateNameRetry` (store.go:464-473): attempt the create up
+    // to MAX_NAME_GENERATION_CREATE_ATTEMPTS times, redrawing the name from
+    // the nameless original (upstream's `obj.DeepCopyObject()`) whenever the
+    // create fails with AlreadyExists; any other outcome ends the loop.
+    let mut attempt = 1;
+    loop {
+        let mut req = Request::new(Body::from(rewritten));
+        *req.method_mut() = parts.method.clone();
+        *req.uri_mut() = parts.uri.clone();
+        *req.version_mut() = parts.version;
+        *req.headers_mut() = parts.headers.clone();
+        *req.extensions_mut() = parts.extensions.clone();
+        let resp = next.clone().run(req).await;
+        if resp.status() != StatusCode::CONFLICT || attempt >= MAX_NAME_GENERATION_CREATE_ATTEMPTS {
+            return resp;
+        }
+        let (resp_parts, resp_body) = resp.into_parts();
+        let Ok(resp_bytes) = axum::body::to_bytes(resp_body, MAX_GENERATE_NAME_BODY).await else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to read response body",
+            )
+                .into_response();
+        };
+        if !is_already_exists_status(&resp_bytes) {
+            return Response::from_parts(resp_parts, Body::from(resp_bytes));
+        }
+        // The same nameless original yielded a name on the first pass.
+        match synthesize_generate_name_with(&bytes, generate) {
+            Some(next_body) => rewritten = next_body,
+            None => return Response::from_parts(resp_parts, Body::from(resp_bytes)),
+        }
+        attempt += 1;
+    }
+}
+
+/// `apierrors.IsAlreadyExists` on a serialised `Status` (`reason ==
+/// "AlreadyExists"`).
+fn is_already_exists_status(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("reason")?.as_str().map(|r| r == "AlreadyExists"))
+        .unwrap_or(false)
 }
 
 // ============================================================================
@@ -3784,6 +3854,108 @@ mod tests {
             synthesize_generate_name(body).is_none(),
             "an explicit name must win over generateName"
         );
+    }
+
+    /// Pin for upstream `createWithGenerateNameRetry` (store.go:464-473): a
+    /// create whose generated name collides is redrawn, up to
+    /// `maxNameGenerationCreateAttempts` (8, store.go:440) times.
+    mod generate_name_retry {
+        use super::*;
+        use axum::routing::post;
+        use std::collections::HashSet;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use tower::ServiceExt;
+
+        /// A "store": 409 AlreadyExists for a taken name, else take it.
+        fn app(
+            taken: Arc<Mutex<HashSet<String>>>,
+            gen_calls: Arc<AtomicUsize>,
+            names: Vec<&'static str>,
+        ) -> axum::Router {
+            let handler = move |body: axum::body::Bytes| {
+                let taken = taken.clone();
+                async move {
+                    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let name = v["metadata"]["name"].as_str().unwrap().to_string();
+                    if !taken.lock().unwrap().insert(name.clone()) {
+                        return (
+                            StatusCode::CONFLICT,
+                            axum::Json(serde_json::json!({
+                                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                                "reason": "AlreadyExists", "code": 409,
+                                "message": format!("\"{name}\" already exists"),
+                            })),
+                        );
+                    }
+                    (StatusCode::CREATED, axum::Json(v))
+                }
+            };
+            axum::Router::new()
+                .route("/", post(handler))
+                .layer(axum::middleware::from_fn(move |req, next| {
+                    let gen_calls = gen_calls.clone();
+                    let names = names.clone();
+                    async move {
+                        generate_name_middleware_with(req, next, &move |p| {
+                            let i = gen_calls.fetch_add(1, Ordering::SeqCst);
+                            format!("{p}{}", names[i.min(names.len() - 1)])
+                        })
+                        .await
+                    }
+                }))
+        }
+
+        async fn post_json(app: axum::Router, body: &str) -> (StatusCode, serde_json::Value) {
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap())
+        }
+
+        fn taken(names: &[&str]) -> Arc<Mutex<HashSet<String>>> {
+            Arc::new(Mutex::new(names.iter().map(|s| s.to_string()).collect()))
+        }
+
+        #[tokio::test]
+        async fn a_colliding_generated_name_is_redrawn() {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let a = app(
+                taken(&["p-aaaaa", "p-bbbbb"]),
+                calls.clone(),
+                vec!["aaaaa", "bbbbb", "ccccc"],
+            );
+            let (status, v) = post_json(a, r#"{"metadata":{"generateName":"p-"}}"#).await;
+            assert_eq!(status, StatusCode::CREATED, "{v}");
+            assert_eq!(v["metadata"]["name"], "p-ccccc");
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+        }
+
+        #[tokio::test]
+        async fn gives_up_after_eight_attempts() {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let a = app(taken(&["p-aaaaa"]), calls.clone(), vec!["aaaaa"]);
+            let (status, v) = post_json(a, r#"{"metadata":{"generateName":"p-"}}"#).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{v}");
+            assert_eq!(calls.load(Ordering::SeqCst), 8);
+        }
+
+        #[tokio::test]
+        async fn an_explicit_name_is_not_retried() {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let a = app(taken(&["fixed"]), calls.clone(), vec!["aaaaa"]);
+            let (status, _) = post_json(a, r#"{"metadata":{"name":"fixed"}}"#).await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[test]

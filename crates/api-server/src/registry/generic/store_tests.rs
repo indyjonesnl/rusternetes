@@ -299,6 +299,59 @@ async fn a_generated_name_that_collides_says_the_server_could_not_pick_one() {
     );
 }
 
+/// `createWithGenerateNameRetry` (store.go:464-473): a collision on a
+/// generated name is redrawn, at most `maxNameGenerationCreateAttempts` (8)
+/// times.
+#[tokio::test]
+async fn a_colliding_generated_name_is_redrawn_up_to_eight_times() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Seq(Arc<AtomicUsize>, usize);
+    impl NamespaceScopedStrategy for Seq {
+        fn namespace_scoped(&self) -> bool {
+            true
+        }
+    }
+    impl RestCreateStrategy<ConfigMap> for Seq {
+        /// Draws 1..=`self.1` collide with "foo-taken"; later draws are unique.
+        fn generate_name(&self, base: &str) -> String {
+            let n = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+            if n <= self.1 {
+                format!("{base}taken")
+            } else {
+                format!("{base}ok{n}")
+            }
+        }
+        fn prepare_for_create(&self, _: &RequestContext, _: &mut ConfigMap) {}
+        fn validate(&self, _: &RequestContext, _: &ConfigMap) -> ErrorList {
+            Vec::new()
+        }
+    }
+    let mut gen = cm("");
+    gen.metadata.generate_name = Some("foo-".to_string());
+
+    // Seven collisions, the eighth draw is free.
+    let draws = Arc::new(AtomicUsize::new(0));
+    let mut registry = store(TestStrategy::default());
+    create(&registry, cm("foo-taken")).await;
+    registry.create_strategy = Arc::new(Seq(draws.clone(), 7));
+    let created = registry
+        .create(&ctx(), gen.clone(), None, &CreateOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(created.metadata.name, "foo-ok8");
+    assert_eq!(draws.load(Ordering::SeqCst), 8);
+
+    // Eight collisions exhaust the attempts: AlreadyExists, no ninth draw.
+    let draws = Arc::new(AtomicUsize::new(0));
+    registry.create_strategy = Arc::new(Seq(draws.clone(), 8));
+    let err = registry
+        .create(&ctx(), gen, None, &CreateOptions::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::AlreadyExists(_)), "{err}");
+    assert_eq!(draws.load(Ordering::SeqCst), 8);
+}
+
 /// A dry-run create returns the object and writes nothing
 /// (`DryRunnableStorage.Create`, dryrun.go:39-47).
 #[tokio::test]

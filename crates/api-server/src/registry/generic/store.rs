@@ -12,8 +12,7 @@
 //! The `BeginCreate`, `BeginUpdate`, `AfterDelete` and `Decorator` hooks are
 //! ported; `AfterCreate` and `AfterUpdate` are not, as no in-tree registry
 //! sets them. Not yet ported, and added with the first resource that needs
-//! them: `ResetFieldsStrategy`, managed-fields timestamp handling, and
-//! the `RetryGenerateName` retry loop.
+//! them: `ResetFieldsStrategy` and managed-fields timestamp handling.
 
 use std::sync::Arc;
 
@@ -62,6 +61,9 @@ pub struct GetOptions {
 /// `blockTimeout` (storage/cacher/watch_cache.go): how long a read waits for
 /// the storage to reach the requested resource version.
 const GET_BLOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// `maxNameGenerationCreateAttempts` (store.go:440).
+const MAX_NAME_GENERATION_CREATE_ATTEMPTS: usize = 8;
+
 /// `resourceVersionTooHighRetrySeconds` (storage/cacher/watch_cache.go).
 const RESOURCE_VERSION_TOO_HIGH_RETRY_SECONDS: i32 = 1;
 
@@ -836,6 +838,35 @@ impl<T: Object, S: Storage> Store<T, S> {
     /// object after the strategy has prepared and validated it, just before
     /// the write.
     pub async fn create(
+        &self,
+        ctx: &RequestContext,
+        obj: T,
+        create_validation: Option<&dyn ValidateObject<T>>,
+        options: &CreateOptions,
+    ) -> Result<T> {
+        // `RetryGenerateName` is GA and locked on since 1.32
+        // (kube_features.go:2069-2073): `needsNameGeneration` (store.go:452-460)
+        // routes to `createWithGenerateNameRetry` (store.go:464-473).
+        let meta = obj.metadata();
+        let needs_name_generation =
+            meta.generate_name.as_deref().is_some_and(|g| !g.is_empty()) && meta.name.is_empty();
+        if !needs_name_generation {
+            return self.create_once(ctx, obj, create_validation, options).await;
+        }
+        let mut result = Err(Error::Internal("no create attempt made".into()));
+        for _ in 0..MAX_NAME_GENERATION_CREATE_ATTEMPTS {
+            result = self
+                .create_once(ctx, obj.clone(), create_validation, options)
+                .await;
+            if !matches!(result, Err(Error::AlreadyExists(_))) {
+                break;
+            }
+        }
+        result
+    }
+
+    /// `Store.create` (store.go:475-558), one attempt.
+    async fn create_once(
         &self,
         ctx: &RequestContext,
         mut obj: T,
