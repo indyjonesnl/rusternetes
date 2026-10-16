@@ -34,6 +34,14 @@ services:
       - /run/podman/podman.sock:/run/podman/podman.sock:rw,z
       - /run/podman/podman.sock:/var/run/docker.sock:rw,z
       - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw
+      # CSI attach/detach socket dir (#3746), off by default; uncomment together
+      # with the "--csi-attacher" block in `command:` below. The in-process
+      # controller-manager dials the driver socket from inside this container, so
+      # its directory is bind-mounted at the same path, read-write -- kubeadm's
+      # flexvolume-dir mount for the kube-controller-manager
+      # (cmd/kubeadm/app/phases/controlplane/volumes.go:73-79); the multi-container
+      # stack does the same via CSI_ATTACHERS in bootstrap-cluster.sh (#3133).
+      #   - /var/lib/kubelet/plugins/csi-hostpath:/var/lib/kubelet/plugins/csi-hostpath:rw
       - sqlite-data:/data/db
     environment:
       - RUST_LOG=info
@@ -50,10 +58,11 @@ services:
       - "--tls-key-file"
       - "/etc/kubernetes/pki/api-server.key"
       - "--skip-auth"
-      # CSI attach/detach (#3128), off by default; needs a CSI driver socket
-      # mounted into this container:
+      # CSI attach/detach (#3128), off by default. Uncomment together with the
+      # driver socket-dir mount in `volumes:` above (#3746); SOCKET's directory
+      # must be the mounted one:
       #   - "--csi-attacher"
-      #   - "<driver-name>=/path/to/csi.sock"
+      #   - "hostpath.csi.k8s.io=/var/lib/kubelet/plugins/csi-hostpath/csi.sock"
       #   - "--attach-detach-controller"
       # kube-proxy now runs in-process (no `--disable-proxy`). The image
       # ships iptables / iproute2 for that — see all-in-one.Dockerfile.

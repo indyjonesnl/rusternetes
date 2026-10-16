@@ -63,6 +63,9 @@ on:
       - 'scripts/tests/test-dockerfile-crate-enumeration.sh'
       - 'scripts/tests/test-dockerfile-multiarch.sh'
       - 'scripts/tests/test-kubelet-image-mount-deps.sh'
+      - 'scripts/tests/test-all-in-one-csi-socket-mount.sh'
+      - 'compose.all-in-one.yml'
+      - 'compose.all-in-one-redis.yml'
       - 'services.Dockerfile'
       - 'local-binary.services.Dockerfile'
       - 'all-in-one.Dockerfile'
@@ -127,6 +130,10 @@ jobs:
       # #3333: kubelet images must ship /sbin/mount.nfs (nfs-common).
       - name: Kubelet image mount-deps test
         run: bash scripts/tests/test-kubelet-image-mount-deps.sh
+      # #3746: the all-in-one stacks' commented CSI attacher opt-in carries the
+      # driver socket-dir bind mount (self-skips without docker).
+      - name: All-in-one CSI socket-mount test
+        run: bash scripts/tests/test-all-in-one-csi-socket-mount.sh
       # ubuntu-latest ships docker, so the compose-topology test's
       # `docker compose config` render runs here (it self-skips without docker).
       - name: Per-node netns topology test
