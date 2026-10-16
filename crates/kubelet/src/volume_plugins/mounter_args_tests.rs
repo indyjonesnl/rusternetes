@@ -66,8 +66,10 @@ fn volumes() -> Vec<(&'static str, Volume, Box<dyn VolumePlugin>)> {
         ),
         (
             "downwardAPI",
-            v(json!({"name": "v", "downwardAPI": {"items": [
-                {"path": "name", "fieldRef": {"fieldPath": "metadata.name"}}]}})),
+            v(
+                json!({"name": "v", "downwardAPI": {"defaultMode": 420, "items": [
+                {"path": "name", "fieldRef": {"fieldPath": "metadata.name"}}]}}),
+            ),
             Box::new(DownwardApiPlugin::new(host())),
         ),
         (

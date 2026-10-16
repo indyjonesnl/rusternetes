@@ -1171,12 +1171,11 @@ impl VolumeManager {
         if let Some(downward_api) = &volume.downward_api {
             let volume_dir = self.pod_volume_dir(pod, volume);
             let items = downward_api.items.as_deref().unwrap_or(&[]);
-            let mode = downward_api.default_mode.unwrap_or(0o644) as u32;
             match crate::volume_plugins::downward_api::collect_data(
                 items,
                 pod,
                 &self.node_allocatable,
-                mode,
+                downward_api.default_mode,
             ) {
                 Ok(payload) => {
                     let _ = crate::volume_ownership::write_payload_with_ownership(
@@ -2241,7 +2240,7 @@ mod projected_mode_tests {
         let pod: Pod = serde_json::from_value(json!({
             "metadata": {"name": "dapi-pod", "namespace": "default", "uid": "uid-da"},
             "spec": {"containers": [], "volumes": [{
-                "name": "podinfo", "downwardAPI": {"items": [
+                "name": "podinfo", "downwardAPI": {"defaultMode": 420, "items": [
                     {"path": "name", "fieldRef": {"fieldPath": "metadata.name"}}
                 ]}
             }]}
@@ -2839,7 +2838,7 @@ mod projected_mode_tests {
                 "volumes": [
                     {"name": "cm", "configMap": {"name": "cm"}},
                     {"name": "sec", "secret": {"secretName": "sec", "defaultMode": 384}},
-                    {"name": "da", "downwardAPI": {"items": [
+                    {"name": "da", "downwardAPI": {"defaultMode": 420, "items": [
                         {"path": "labels", "fieldRef": {"fieldPath": "metadata.labels"}}
                     ]}}
                 ]
@@ -3600,7 +3599,7 @@ mod dispatch_tests {
                 crate::pod_dirs::plugin::SECRET,
             ),
             (
-                volume("d", json!({"downwardAPI": {}})),
+                volume("d", json!({"downwardAPI": {"defaultMode": 420}})),
                 crate::pod_dirs::plugin::DOWNWARD_API,
             ),
             (
@@ -3645,7 +3644,7 @@ mod dispatch_tests {
                 crate::pod_dirs::plugin::EMPTY_DIR,
             ),
             (
-                volume("d", json!({"downwardAPI": {}})),
+                volume("d", json!({"downwardAPI": {"defaultMode": 420}})),
                 crate::pod_dirs::plugin::DOWNWARD_API,
             ),
             // `projected` is not storage-free: upstream's SetUpAt fails with
