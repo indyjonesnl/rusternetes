@@ -47,6 +47,7 @@ mod conformance_apimachinery_resource_quota_object_count;
 mod conformance_apimachinery_resource_quota_terminating_scope;
 mod conformance_apimachinery_vap_apf_server;
 mod conformance_apimachinery_watch_chunking_gc;
+mod conformance_apps_daemonset_deployment_job_cronjob;
 mod conformance_auth_rbac_serviceaccount;
 mod conformance_auth_serviceaccounts;
 mod conformance_cbor_codec_test;
