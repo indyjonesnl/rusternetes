@@ -438,11 +438,11 @@ async fn smp_ports_named_patch_with_unnamed_original() {
     );
 }
 
-/// SMP-2e: when the patch ports array is empty, the rusternetes behavior
-/// pins as "replace with empty" (mirrors RFC 7396) — upstream SMP would
-/// also leave the list empty without any merge-key context.
+/// SMP-2e: an empty patch list adds nothing to a `merge` list: `mergeSlice`
+/// (strategicpatch/patch.go:1500-1565) returns the live items, so the ports
+/// are unchanged. Clearing a merge list takes `$patch: replace` or `null`.
 #[tokio::test]
-async fn smp_ports_empty_patch_array_clears() {
+async fn smp_ports_empty_patch_array_keeps_ports() {
     let (mem, router) = spawn_router();
     let pod = json!({
         "apiVersion": "v1",
@@ -464,10 +464,10 @@ async fn smp_ports_empty_patch_array_clears() {
 
     let stored = read_stored(&mem, "smp-2e").await;
     let ports = find_container(&stored, "c1")["ports"].as_array().unwrap();
-    assert!(
-        ports.is_empty(),
-        "empty patch array should clear ports; got {:?}",
-        ports
+    assert_eq!(
+        ports,
+        &vec![json!({"containerPort": 80, "protocol": "TCP"})],
+        "an empty patch list keeps the live ports"
     );
 }
 

@@ -24,7 +24,7 @@ use super::rest::{
     retry_without_managed_fields_if_too_large, ApplyFn, RequestScope,
 };
 use crate::fieldmanager::manager_or_user_agent;
-use crate::patch::{apply_patch, PatchType};
+use crate::patch::{apply_patch_with_schema, PatchSchema, PatchType};
 use crate::registry::generic;
 use crate::registry::rest::{
     conflict, ensure_object_namespace_matches_request_namespace, expected_namespace_for_scope,
@@ -250,13 +250,25 @@ impl<T: Object> Patcher<'_, T> {
         // The patch was written against the served version, so it applies
         // there and the result goes back to the stored one (patch.go:323-338,
         // :449-462).
+        // `NewPatchMetaFromStruct(versionedObj)` (patch.go `strategicPatchObject`):
+        // the served kind's struct tags drive every list's merge key and
+        // strategy.
+        let kind = &self.scope.kind;
+        let schema = PatchSchema::for_kind(&kind.group, &kind.version, &kind.kind);
         let patched = match self.scope.patch_conversion {
-            None => apply_patch(&current_json, &patch, patch_type.clone())
-                .map_err(|e| patch_error(e, patch_type))?,
+            None => {
+                apply_patch_with_schema(&current_json, &patch, patch_type.clone(), schema.as_ref())
+                    .map_err(|e| patch_error(e, patch_type))?
+            }
             Some(conversion) => {
                 let versioned = (conversion.to_request_version)(&current_json);
-                let patched = apply_patch(&versioned, &patch, patch_type.clone())
-                    .map_err(|e| patch_error(e, patch_type))?;
+                let patched = apply_patch_with_schema(
+                    &versioned,
+                    &patch,
+                    patch_type.clone(),
+                    schema.as_ref(),
+                )
+                .map_err(|e| patch_error(e, patch_type))?;
                 (conversion.from_request_version)(&current_json, patched)
             }
         };

@@ -550,10 +550,12 @@ async fn patch_status(api: &TestApiServer, patch: &Value) -> (StatusCode, Value)
 async fn kubelet_status_patch_waiting_to_running_with_null() {
     let api = TestApiServer::new();
     seed_waiting_pod(&api).await;
-    let patch = json!({"status": {
-        "$setElementOrder/containerStatuses": [{"name": "c"}],
-        "containerStatuses": [{"name": "c", "ready": true,
-            "state": {"running": {"startedAt": "2026-10-07T00:00:00Z"}, "waiting": null}}]}});
+    // `PodStatus.ContainerStatuses` carries no `patchStrategy` tag
+    // (core/v1/types.go:5361), so `CreateTwoWayMergePatch` emits the whole
+    // list and the merge replaces it (`mergeSliceHandler`, patch.go:1481).
+    let patch = json!({"status": {"containerStatuses": [{
+        "name": "c", "image": "busybox", "imageID": "", "ready": true, "restartCount": 0,
+        "state": {"running": {"startedAt": "2026-10-07T00:00:00Z"}}}]}});
     let (s, body) = patch_status(&api, &patch).await;
     assert_eq!(s, StatusCode::OK, "{body}");
     let st = &body["status"]["containerStatuses"][0]["state"];
@@ -563,12 +565,11 @@ async fn kubelet_status_patch_waiting_to_running_with_null() {
     );
 }
 
-/// Go's `ContainerState` is a struct of three optional pointers and upstream
-/// validation never requires exactly one (`ValidateContainerStateTransition`,
-/// validation.go:5841 only checks Terminated transitions), so a patch lacking
-/// `waiting: null` is accepted (Go stores both keys; see below).
+/// An atomic list is replaced as a whole, not merged by `name`: a patch item
+/// naming only `state` leaves nothing of the live entry's other fields (Go
+/// zero-values them), and `waiting` goes with the old item.
 #[tokio::test]
-async fn kubelet_status_patch_tolerates_running_and_waiting_both_set() {
+async fn kubelet_status_patch_replaces_the_atomic_container_statuses_list() {
     let api = TestApiServer::new();
     seed_waiting_pod(&api).await;
     let patch = json!({"status": {"containerStatuses": [{"name": "c",
@@ -576,9 +577,8 @@ async fn kubelet_status_patch_tolerates_running_and_waiting_both_set() {
     let (s, body) = patch_status(&api, &patch).await;
     assert_eq!(s, StatusCode::OK, "{body}");
     let st = &body["status"]["containerStatuses"][0]["state"];
-    // Go stores both keys: the merge only replaces what the patch names.
     assert!(
-        st.get("running").is_some() && st.get("waiting").is_some(),
+        st.get("running").is_some() && st.get("waiting").is_none(),
         "{body}"
     );
 }
