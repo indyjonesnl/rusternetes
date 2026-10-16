@@ -19,6 +19,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
+mod mergepatch;
+#[cfg(test)]
+mod smp_error_tests;
+
+use mergepatch::{err_bad_arg_type, err_bad_patch_type, err_no_merge_key, go_fmt_v, GO_SLICE};
+
 /// Patch types supported by the API
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, PartialEq)]
@@ -461,11 +467,14 @@ fn apply_strategic_merge_patch(original: &Value, patch: &Value) -> Result<Value,
         PatchError::InvalidPatch("strategic merge patch is not an object".to_string())
     })?;
 
-    // Check for $patch directive
-    let patch_strategy = patch_obj
-        .get("$patch")
-        .and_then(|v| v.as_str())
-        .unwrap_or("merge");
+    // `$patch` directive: `handleDirectiveInMergeMap` (patch.go:906-923)
+    // knows only `replace` and `delete`; any other value (even `merge`) is
+    // `ErrBadPatchType` over the whole patch map.
+    let patch_strategy = match patch_obj.get("$patch") {
+        None => "merge",
+        Some(Value::String(s)) if s == "replace" || s == "delete" => s.as_str(),
+        Some(other) => return Err(PatchError::Uninterpreted(err_bad_patch_type(other, patch))),
+    };
 
     // Check for $retainKeys directive
     let retain_keys: Option<Vec<String>> = patch_obj
@@ -570,22 +579,10 @@ fn apply_strategic_merge_patch(original: &Value, patch: &Value) -> Result<Value,
                         patch_value.as_array().unwrap(),
                     );
                     result_obj.insert(key.clone(), Value::Array(merged));
-                } else if patch_value.is_array()
-                    && result_obj.get(key).is_some_and(|v| v.is_array())
+                } else if let (Some(Value::Array(orig_arr)), Value::Array(patch_arr)) =
+                    (result_obj.get(key), patch_value)
                 {
                     // Strategic merge for arrays
-                    let orig_arr = result_obj[key].as_array().ok_or_else(|| {
-                        PatchError::Uninterpreted(format!(
-                            "strategic merge: '{}' is not an array",
-                            key
-                        ))
-                    })?;
-                    let patch_arr = patch_value.as_array().ok_or_else(|| {
-                        PatchError::Uninterpreted(format!(
-                            "strategic merge: patch for '{}' is not an array",
-                            key
-                        ))
-                    })?;
                     let merged_array = strategic_merge_arrays_for_field(key, orig_arr, patch_arr)?;
                     result_obj.insert(key.clone(), Value::Array(merged_array));
                 } else if patch_value.is_object()
@@ -602,20 +599,35 @@ fn apply_strategic_merge_patch(original: &Value, patch: &Value) -> Result<Value,
 
             // `$deleteFromPrimitiveList/<field>` (patch.go:1349-1420,
             // `preprocessDeletionListForMerging` + `deleteFromSlice`): remove
-            // the listed values from the original `<field>` list. Absent or
-            // non-list originals are left alone (patch_test.go:681-730).
+            // the listed values from the original `<field>` list. Absent
+            // originals are left alone (patch_test.go:681-730). The value
+            // then runs through the rest of `mergeMap` (patch.go:1366-1426)
+            // with `isDeleteList` set: `null` deletes the field, a value of
+            // a different Go type than the live field is skipped, two maps
+            // merge, and two equal-typed scalars replace.
             for (key, patch_value) in patch_obj {
                 let Some(field) = key.strip_prefix(&format!("{DELETE_FROM_PRIMITIVE_LIST}/"))
                 else {
                     continue;
                 };
-                let to_delete = patch_value.as_array().ok_or_else(|| {
-                    PatchError::Uninterpreted(format!(
-                        "strategic merge: {key} must be a list of primitives"
-                    ))
-                })?;
-                if let Some(Value::Array(current)) = result_obj.get_mut(field) {
-                    current.retain(|v| !to_delete.contains(v));
+                if patch_value.is_null() {
+                    result_obj.remove(field);
+                    continue;
+                }
+                let Some(current) = result_obj.get_mut(field) else {
+                    continue;
+                };
+                if mergepatch::go_type_name(current) != mergepatch::go_type_name(patch_value) {
+                    continue;
+                }
+                match (current, patch_value) {
+                    (Value::Array(current), Value::Array(to_delete)) => {
+                        current.retain(|v| !to_delete.contains(v));
+                    }
+                    (current @ Value::Object(_), Value::Object(_)) => {
+                        *current = apply_strategic_merge_patch(current, patch_value)?;
+                    }
+                    (current, _) => *current = patch_value.clone(),
                 }
             }
         }
@@ -680,16 +692,21 @@ fn index_of(list: &[Value], v: &Value, id: ItemId) -> Option<usize> {
 /// (patch.go:404) + `mergeSortedSlice` (patch.go:427), after
 /// `partitionPrimitivesByPresentInList` / `partitionMapsByPresentInList`
 /// (patch.go:1236, 1254).
+///
+/// `merge_key` is `Some` for a list of maps: `partitionMapsByPresentInList`
+/// (patch.go:1262-1265) fails on the first merged map lacking it with
+/// `ErrNoMergeKey`.
 fn normalize_order(
     merged: &[Value],
     patch_order: &[Value],
     server_order: &[Value],
     id: ItemId,
+    merge_key: Option<&str>,
 ) -> Result<Vec<Value>, PatchError> {
-    if merged.iter().any(|v| v.is_object() && id(v).is_none()) {
-        return Err(PatchError::Uninterpreted(
-            "map in list does not contain the merge key".to_string(),
-        ));
+    if let Some(key) = merge_key {
+        if let Some(bad) = merged.iter().find(|v| v.is_object() && id(v).is_none()) {
+            return Err(PatchError::Uninterpreted(err_no_merge_key(bad, key)));
+        }
     }
     let (mut patch_items, mut server_only): (Vec<Value>, Vec<Value>) = merged
         .iter()
@@ -732,18 +749,21 @@ fn merge_scalar_lists(original: &[Value], patch: &[Value]) -> Vec<Value> {
             merged.push(v.clone());
         }
     }
-    normalize_order(&merged, patch, original, &scalar_id).expect("scalars always have an id")
+    normalize_order(&merged, patch, original, &scalar_id, None).expect("scalars always have an id")
 }
 
 /// `validatePatchWithSetOrderList` (patch.go:977-1021). For lists of maps
 /// `$patch: delete` items are dropped first (patch.go:992) and items that
-/// carry a directive are skipped (patch.go:1003).
+/// carry a directive are skipped (patch.go:1003). `merge_key` is `Some` for
+/// a list of maps; `mergeKeyValueEqual` (patch.go:947-954) reports the
+/// patch item, then the order item, lacking it as `ErrNoMergeKey`.
 fn validate_patch_with_set_order_list(
     patch_list: &[Value],
     order: &[Value],
     id: ItemId,
-    is_map_list: bool,
+    merge_key: Option<&str>,
 ) -> Result<(), PatchError> {
+    let is_map_list = merge_key.is_some();
     if patch_list.is_empty() || order.is_empty() {
         return Ok(());
     }
@@ -762,10 +782,16 @@ fn validate_patch_with_set_order_list(
             continue;
         }
         let (a, b) = (id(non_delete[p]), id(&order[o]));
-        if is_map_list && (a.is_none() || b.is_none()) {
-            return Err(PatchError::Uninterpreted(
-                "map in list does not contain the merge key".to_string(),
-            ));
+        if let Some(key) = merge_key {
+            if a.is_none() {
+                return Err(PatchError::Uninterpreted(err_no_merge_key(
+                    non_delete[p],
+                    key,
+                )));
+            }
+            if b.is_none() {
+                return Err(PatchError::Uninterpreted(err_no_merge_key(&order[o], key)));
+            }
         }
         if a == b {
             p += 1;
@@ -773,8 +799,11 @@ fn validate_patch_with_set_order_list(
         o += 1;
     }
     if p < non_delete.len() && o >= order.len() {
+        // patch.go:1019 renders both lists with `%v`.
         return Err(PatchError::Uninterpreted(format!(
-            "The order in patch list:\n{patch_list:?}\n doesn't match {SET_ELEMENT_ORDER} list:\n{order:?}\n"
+            "The order in patch list:\n{}\n doesn't match {SET_ELEMENT_ORDER} list:\n{}\n",
+            go_fmt_v(&Value::Array(patch_list.to_vec())),
+            go_fmt_v(&Value::Array(order.to_vec())),
         )));
     }
     Ok(())
@@ -808,18 +837,20 @@ fn merge_set_element_order_lists(
         let Some(field) = key.strip_prefix(&prefix) else {
             continue;
         };
-        let order = order_v.as_array().ok_or_else(|| {
-            PatchError::Uninterpreted(format!("strategic merge: {key} must be a list"))
-        })?;
+        // patch.go:1141-1164: the order list, then the live field, then the
+        // patch field must be a `[]interface{}` (a present `null` included),
+        // else `ErrBadArgType`.
+        let bad_arg = |v: &Value| PatchError::Uninterpreted(err_bad_arg_type(GO_SLICE, v));
+        let order = order_v.as_array().ok_or_else(|| bad_arg(order_v))?;
         let original = match result_obj.get(field) {
             Some(Value::Array(a)) => Some(a.clone()),
-            Some(Value::Null) | None => None,
-            Some(_) => continue,
+            None => None,
+            Some(other) => return Err(bad_arg(other)),
         };
         let patch_list = match patch_obj.get(field) {
             Some(Value::Array(a)) => Some(a.clone()),
-            Some(Value::Null) | None => None,
-            Some(_) => continue,
+            None => None,
+            Some(other) => return Err(bad_arg(other)),
         };
         let all_scalar = original.as_deref().is_none_or(is_scalar_list)
             && patch_list.as_deref().is_none_or(is_scalar_list)
@@ -843,12 +874,13 @@ fn merge_set_element_order_lists(
             None => scalar_id(v),
             Some(s) => merge_key_with(v, s),
         };
-        let is_map_list = strategy.is_some();
+        let merge_key = strategy.map(MergeKeyStrategy::field);
+        let is_map_list = merge_key.is_some();
         validate_patch_with_set_order_list(
             patch_list.as_deref().unwrap_or(&[]),
             order,
             &id,
-            is_map_list,
+            merge_key,
         )?;
         let merged = match (&original, &patch_list) {
             (None, None) => continue,
@@ -872,7 +904,7 @@ fn merge_set_element_order_lists(
             }
         };
         let server_order = original.unwrap_or_default();
-        let ordered = normalize_order(&merged, order, &server_order, &id)?;
+        let ordered = normalize_order(&merged, order, &server_order, &id, merge_key)?;
         result_obj.insert(field.to_string(), Value::Array(ordered));
         consumed.insert(field.to_string());
     }
@@ -938,6 +970,19 @@ fn detect_merge_key_strategy(patch: &[Value]) -> Option<MergeKeyStrategy> {
         return Some(MergeKeyStrategy::Uid);
     }
     None
+}
+
+impl MergeKeyStrategy {
+    /// The `patchMergeKey` struct tag this strategy stands for — the key
+    /// `ErrNoMergeKey` names.
+    fn field(self) -> &'static str {
+        match self {
+            MergeKeyStrategy::Name => "name",
+            MergeKeyStrategy::ContainerPort => "containerPort",
+            MergeKeyStrategy::Uid => "uid",
+            MergeKeyStrategy::Type => "type",
+        }
+    }
 }
 
 fn merge_key_with(item: &Value, strategy: MergeKeyStrategy) -> Option<String> {
@@ -1015,9 +1060,38 @@ fn strategic_merge_arrays_with(
     patch: &[Value],
     strategy: Option<MergeKeyStrategy>,
 ) -> Result<Vec<Value>, PatchError> {
-    // `mergeSliceWithSpecialElements` (patch.go:1548-1587): a `$patch: replace`
-    // element makes the patch items (minus every `$patch` element) the whole
-    // list, whatever the original held.
+    // `mergeSliceWithSpecialElements` (patch.go:1548-1587) walks the
+    // directive elements of a merge-keyed list of maps in order: `delete`
+    // needs the merge key (`ErrNoMergeKey`), `merge` is refused, and anything
+    // but `replace` is `ErrBadPatchType` over the element.
+    if let Some(s) = strategy {
+        for item in patch {
+            let Some(obj) = item.as_object() else {
+                continue;
+            };
+            let Some(directive) = obj.get("$patch") else {
+                continue;
+            };
+            match directive.as_str() {
+                Some("delete") if !obj.contains_key(s.field()) => {
+                    return Err(PatchError::Uninterpreted(err_no_merge_key(item, s.field())));
+                }
+                Some("delete") | Some("replace") => {}
+                Some("merge") => {
+                    return Err(PatchError::Uninterpreted(
+                        "merging lists cannot yet be specified in the patch".to_string(),
+                    ));
+                }
+                _ => {
+                    return Err(PatchError::Uninterpreted(err_bad_patch_type(
+                        directive, item,
+                    )));
+                }
+            }
+        }
+    }
+    // A `$patch: replace` element makes the patch items (minus every
+    // `$patch` element) the whole list, whatever the original held.
     if patch.iter().any(|v| {
         v.as_object()
             .and_then(|o| o.get("$patch"))
