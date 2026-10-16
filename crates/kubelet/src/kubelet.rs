@@ -3486,14 +3486,16 @@ impl Kubelet {
                                         }
                                     }
                                     let qos = Self::compute_qos_class(&p);
-                                    p.status = Some(Self::build_init_failure_status(
-                                        &p,
-                                        self.host_ip_fields(),
-                                        init_statuses,
-                                        Phase::Pending,
-                                        "PodInitializing",
-                                        Some(qos),
-                                    ));
+                                    p.status = Some(
+                                        self.init_failure_status(
+                                            &p,
+                                            init_statuses,
+                                            Phase::Pending,
+                                            "PodInitializing",
+                                            Some(qos),
+                                        )
+                                        .await,
+                                    );
                                     let _ = self.storage.update_status(&key, &p).await;
                                 }
                                 return Ok(());
@@ -3569,14 +3571,16 @@ impl Kubelet {
                                 let init_statuses = self.get_init_container_statuses(&p).await;
                                 if init_container_failed_terminally(&p, init_statuses.as_deref()) {
                                     let qos = Self::compute_qos_class(&p);
-                                    p.status = Some(Self::build_init_failure_status(
-                                        &p,
-                                        self.host_ip_fields(),
-                                        init_statuses,
-                                        Phase::Failed,
-                                        "FailedToStart",
-                                        Some(qos),
-                                    ));
+                                    p.status = Some(
+                                        self.init_failure_status(
+                                            &p,
+                                            init_statuses,
+                                            Phase::Failed,
+                                            "FailedToStart",
+                                            Some(qos),
+                                        )
+                                        .await,
+                                    );
                                     let _ = self.storage.update_status(&key, &p).await;
                                 }
                             }
@@ -3767,6 +3771,7 @@ impl Kubelet {
                                                 status.container_statuses = Some(cs);
                                             }
                                         }
+                                        self.apply_host_ips_to_pod(&mut retry_pod).await;
                                         if let Err(e2) =
                                             self.storage.update_status(&key, &retry_pod).await
                                         {
@@ -3990,14 +3995,16 @@ impl Kubelet {
                                     || err_msg.contains("bind: address already in use");
 
                                 if init_failed {
-                                    new_pod.status = Some(Self::build_init_failure_status(
-                                        &new_pod,
-                                        self.host_ip_fields(),
-                                        init_container_statuses,
-                                        Phase::Failed,
-                                        "FailedToStart",
-                                        Some(qos),
-                                    ));
+                                    new_pod.status = Some(
+                                        self.init_failure_status(
+                                            &new_pod,
+                                            init_container_statuses,
+                                            Phase::Failed,
+                                            "FailedToStart",
+                                            Some(qos),
+                                        )
+                                        .await,
+                                    );
                                 } else {
                                     // App-container start error. Waiting{ContainerCreating}
                                     // carries the error message; phase is Failed only for a
@@ -4081,6 +4088,7 @@ impl Kubelet {
                                             .or_else(|| self.host_ip_fields().1),
                                         ..Default::default()
                                     });
+                                    self.apply_host_ips_to_pod(&mut new_pod).await;
                                 }
 
                                 if let Err(e) = self.storage.update_status(&key, &new_pod).await {
@@ -4730,6 +4738,7 @@ impl Kubelet {
                                             ..Default::default()
                                         });
                                     }
+                                    self.apply_host_ips_to_pod(&mut new_pod).await;
 
                                     let _ = self.storage.update_status(&key, &new_pod).await;
 
@@ -5581,6 +5590,32 @@ impl Kubelet {
                 })
                 .collect()
         })
+    }
+
+    /// `build_init_failure_status` followed by the host-IP block of
+    /// `generateAPIPodStatus` (kubelet_pods.go:2005-2040), so the init-failure
+    /// write also carries hostNetwork PodIPs and records
+    /// `HostIPsIPFamilyMismatch`.
+    async fn init_failure_status(
+        &self,
+        pod: &Pod,
+        init_statuses: Option<Vec<ContainerStatus>>,
+        phase: Phase,
+        reason: &str,
+        qos: Option<String>,
+    ) -> PodStatus {
+        let status = Self::build_init_failure_status(
+            pod,
+            self.host_ip_fields(),
+            init_statuses,
+            phase,
+            reason,
+            qos,
+        );
+        let mut scratch = pod.clone();
+        scratch.status = Some(status);
+        self.apply_host_ips_to_pod(&mut scratch).await;
+        scratch.status.unwrap_or_default()
     }
 
     fn build_init_failure_status(
@@ -7668,6 +7703,41 @@ mod tests {
             super::app_container_waiting_reason(&pod, None),
             "ContainerCreating"
         );
+    }
+
+    /// #3687: every status write goes through the host-IP block of
+    /// `generateAPIPodStatus` (kubelet_pods.go:2005-2040): a hostNetwork pod's
+    /// init-failure status inherits the node IPs as PodIPs too.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn init_failure_status_applies_host_ips_to_host_network_pod() {
+        use rusternetes_storage::StorageBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(StorageBackend::new_memory());
+        let k = node_ip_kubelet(&dir, storage, "node-hn", &["10.1.1.1"], false).await;
+        let pod = Pod {
+            type_meta: TypeMeta {
+                kind: "Pod".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: ObjectMeta::new("hn").with_namespace("default"),
+            spec: Some(PodSpec {
+                host_network: Some(true),
+                containers: vec![Container {
+                    name: "app".to_string(),
+                    image: "busybox:latest".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            status: None,
+        };
+        let st = k
+            .init_failure_status(&pod, None, Phase::Failed, "FailedToStart", None)
+            .await;
+        assert_eq!(st.host_ip.as_deref(), Some("10.1.1.1"));
+        assert_eq!(st.pod_ip.as_deref(), Some("10.1.1.1"));
+        assert_eq!(st.pod_i_ps.unwrap()[0].ip, "10.1.1.1");
     }
 
     #[test]
