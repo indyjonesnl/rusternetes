@@ -3,10 +3,13 @@
 //!
 //! Ported from:
 //! - kine `pkg/drivers/generic/generic.go` `(*Generic).execute`: a bounded loop
-//!   that re-runs a statement while the driver's `Retry(err)` classifier says
-//!   so (the SQLite driver classifies `SQLITE_BUSY` / `SQLITE_LOCKED`), with a
-//!   linear backoff between attempts. (kine is not checked out on this
-//!   machine; cited from the k3s-io/kine source as recalled, not verbatim.)
+//!   (`wait := strategy.Backoff(backoff.Linear(100 * time.Millisecond))`,
+//!   `for ; retries < 20; retries++`) that re-runs the statement while
+//!   `d.Retry(err)` says so, with linear backoff. Verified against
+//!   k3s-io/kine main: no SQLite driver sets `Retry` (only `InsertRetry` in
+//!   `pgsql.go`), so kine's SQLite relies solely on
+//!   `DefaultParams = "_journal_mode=WAL&_busy_timeout=30000&...&_txlock=immediate..."`
+//!   (`pkg/drivers/sqlite/sqlite.go`) and never retries SQLITE_BUSY itself.
 //! - apiserver `storage/errors/storage.go` `InterpretListError` / `Get` /
 //!   `Create` / `Update` / `Delete`: `storage.IsUnreachable` becomes
 //!   `errors.NewServerTimeout(resource, op, 2)`.
@@ -15,8 +18,10 @@
 //!   `The %s operation against %s could not be completed at this time, please
 //!   try again.`
 //!
-//! Deliberate deviations: kine retries 20 times; we retry fewer because the
-//! driver already waited out a 30s `busy_timeout` per attempt. Upstream's
+//! Deliberate deviations: kine's generic loop allows 20 tries but its SQLite
+//! driver never opts in; this layer is an extra safety net on top of the 30s
+//! `busy_timeout` (rhino `SqliteBackend::new`), so it uses 5 attempts since
+//! each attempt may already have waited out that timeout. Upstream's
 //! `NewServerTimeout` is HTTP 500 with a `Retry-After` header; we keep that
 //! exact status (client-go retries a 5xx that carries `Retry-After`) rather
 //! than the 409/503 the issue sketched, since 409 means "re-read and retry"
