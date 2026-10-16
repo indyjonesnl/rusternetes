@@ -116,6 +116,7 @@ mod csr_signer_authz_test;
 mod csr_store_test;
 mod custom_resource_decode_coercion_test;
 mod custom_resource_embedded_meta_test;
+mod custom_resource_scope_mismatch_test;
 mod custom_resource_store_test;
 mod daemonset_generic_store_test;
 mod daemonset_handler_test;
