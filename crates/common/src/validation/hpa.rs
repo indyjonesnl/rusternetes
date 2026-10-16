@@ -147,7 +147,7 @@ impl HorizontalPodAutoscalerSpecValidationOptions {
 /// Upstream `schema.ParseGroupVersion`: returns `(group, version)` or an error
 /// string for a malformed value (more than one `/`). Empty / `"/"` parse to an
 /// empty `GroupVersion` with no error.
-fn parse_group_version(gv: &str) -> Result<(String, String), String> {
+pub(crate) fn parse_group_version(gv: &str) -> Result<(String, String), String> {
     if gv.is_empty() || gv == "/" {
         return Ok((String::new(), String::new()));
     }

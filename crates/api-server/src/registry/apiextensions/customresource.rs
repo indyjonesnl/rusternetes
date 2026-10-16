@@ -22,9 +22,11 @@
 //! Not ported here, and still served by the bespoke handlers:
 //! - list and watch, tracked in #2135;
 //! - `GetResetFields` (managed-fields reset sets) and table conversion;
-//! - `x-kubernetes-list-type` map/set uniqueness (`listtype.ValidateListSetsAndMaps`)
-//!   and the `schemaobjectmeta.Validate` embedded-resource check, which
-//!   Rusternetes' schema validator does not implement.
+//! - `x-kubernetes-list-type` map/set uniqueness (`listtype.ValidateListSetsAndMaps`),
+//!   which Rusternetes' schema validator does not implement.
+//!
+//! The `schemaobjectmeta.Validate` embedded-resource check is
+//! [`Strategy::embedded_resource_errors`].
 //!
 //! Decode-time coercion. Upstream's request decoder (`schemaCoercingDecoder`,
 //! customresource_handler.go:1321-1346) prunes and defaults the object as it
@@ -49,7 +51,9 @@ use rusternetes_common::types::{ObjectMeta, TypeMeta};
 use rusternetes_common::validation::field::{Error as FieldError, ErrorList, ErrorType, Path};
 use rusternetes_common::validation::metav1::is_qualified_name;
 use rusternetes_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
-use rusternetes_common::validation::structural::objectmeta::{coerce_with_options, CoerceOptions};
+use rusternetes_common::validation::structural::objectmeta::{
+    coerce_with_options, validate as validate_embedded_object_meta, CoerceOptions,
+};
 use rusternetes_common::validation::structural::{new_structural, Structural};
 use rusternetes_common::{Error, Result};
 use rusternetes_storage::StorageBackend;
@@ -396,6 +400,16 @@ impl Strategy {
         errs
     }
 
+    /// `schemaobjectmeta.Validate(nil, u.Object, a.structuralSchema, false)`
+    /// (strategy.go:211, :297): every `x-kubernetes-embedded-resource` object
+    /// carries a valid `apiVersion`, `kind` and `metadata`. Create and update
+    /// alike — "We don't make a difference between update and create for
+    /// those" (strategy.go:296) — so there is no ratcheting.
+    pub fn embedded_resource_errors(&self, cr: &CustomResource) -> ErrorList {
+        let obj = serde_json::to_value(cr).unwrap_or_default();
+        validate_embedded_object_meta(None, &obj, self.structural_schema().as_ref(), false)
+    }
+
     /// `ValidateTypeMeta` (validator.go:120-132).
     pub fn type_meta_errors(&self, cr: &CustomResource) -> ErrorList {
         if !cr.kind.is_empty() && cr.kind != self.crd.spec.names.kind {
@@ -439,6 +453,8 @@ impl RestCreateStrategy<CustomResource> for Strategy {
             &Path::new("metadata"),
         ));
         errs.extend(self.schema_errors(obj, None));
+        // strategy.go:211
+        errs.extend(self.embedded_resource_errors(obj));
         errs
     }
 
@@ -491,11 +507,14 @@ impl RestUpdateStrategy<CustomResource> for Strategy {
         obj: &CustomResource,
         old: &CustomResource,
     ) -> ErrorList {
-        let errs = self.type_meta_errors(obj);
+        let mut errs = self.type_meta_errors(obj);
         if !errs.is_empty() {
             return errs;
         }
-        self.schema_errors(obj, Some(old))
+        errs.extend(self.schema_errors(obj, Some(old)));
+        // strategy.go:297
+        errs.extend(self.embedded_resource_errors(obj));
+        errs
     }
 
     fn warnings_on_update(
@@ -1326,5 +1345,90 @@ mod prune_nulls_tests {
         let mut obj = cr(json!({"plain": null}));
         strategy(true).coerce(&mut obj);
         assert_eq!(obj.spec.unwrap(), json!({"plain": null, "defaulted": "d"}));
+    }
+}
+
+#[cfg(test)]
+mod embedded_resource_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn strategy() -> Strategy {
+        let crd: CustomResourceDefinition = serde_json::from_value(json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {"name": "widgets.stable.example.com"},
+            "spec": {
+                "group": "stable.example.com", "scope": "Namespaced",
+                "names": {"plural": "widgets", "kind": "Widget", "listKind": "WidgetList"},
+                "versions": [{"name": "v1", "served": true, "storage": true,
+                    "schema": {"openAPIV3Schema": {"type": "object", "properties": {
+                        "spec": {"type": "object", "properties": {
+                            "emb": {"type": "object",
+                                "x-kubernetes-embedded-resource": true,
+                                "x-kubernetes-preserve-unknown-fields": true}
+                        }}
+                    }}}}]
+            }
+        }))
+        .unwrap();
+        Strategy::new(Arc::new(crd), "v1")
+    }
+
+    fn cr(emb: serde_json::Value) -> CustomResource {
+        serde_json::from_value(json!({
+            "apiVersion": "stable.example.com/v1", "kind": "Widget",
+            "metadata": {"name": "w", "namespace": "default"},
+            "spec": {"emb": emb}
+        }))
+        .unwrap()
+    }
+
+    fn fields(errs: &ErrorList) -> Vec<(ErrorType, String)> {
+        errs.iter()
+            .map(|e| (e.error_type, e.field.clone()))
+            .collect()
+    }
+
+    /// strategy.go:211: `Validate` appends
+    /// `schemaobjectmeta.Validate(nil, u.Object, a.structuralSchema, false)`.
+    #[test]
+    fn create_requires_embedded_api_version_and_kind() {
+        let ctx = RequestContext::new(Some("default"));
+        let errs = RestCreateStrategy::validate(&strategy(), &ctx, &cr(json!({})));
+        assert_eq!(
+            fields(&errs),
+            vec![
+                (ErrorType::Required, "spec.emb.apiVersion".to_string()),
+                (ErrorType::Required, "spec.emb.kind".to_string()),
+            ]
+        );
+    }
+
+    /// strategy.go:296-297: "We don't make a difference between update and
+    /// create for those" — no ratcheting against the old object.
+    #[test]
+    fn update_validates_embedded_metadata_without_ratcheting() {
+        let ctx = RequestContext::new(Some("default"));
+        let bad = cr(json!({"apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "..", "labels": {"#": "x"}}}));
+        let errs = RestUpdateStrategy::validate_update(&strategy(), &ctx, &bad, &bad.clone());
+        assert_eq!(
+            fields(&errs),
+            vec![
+                (ErrorType::Invalid, "spec.emb.metadata.name".to_string()),
+                (ErrorType::Invalid, "spec.emb.metadata.labels".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn valid_embedded_resource_passes() {
+        let ctx = RequestContext::new(Some("default"));
+        let ok = cr(json!({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "p"}}));
+        assert!(RestCreateStrategy::validate(&strategy(), &ctx, &ok).is_empty());
+        assert!(
+            RestUpdateStrategy::validate_update(&strategy(), &ctx, &ok, &ok.clone()).is_empty()
+        );
     }
 }
