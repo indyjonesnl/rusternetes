@@ -848,7 +848,7 @@ pub fn default_shape() -> Vec<FunctionShapePoint> {
 }
 
 /// `helper.BuildBrokenLinearFunction` (framework/plugins/helper/shape_score.go:40-52).
-fn build_broken_linear_function(shape: Vec<FunctionShapePoint>) -> impl Fn(i64) -> i64 {
+pub(crate) fn build_broken_linear_function(shape: Vec<FunctionShapePoint>) -> impl Fn(i64) -> i64 {
     move |p| {
         for i in 0..shape.len() {
             if p <= shape[i].utilization {

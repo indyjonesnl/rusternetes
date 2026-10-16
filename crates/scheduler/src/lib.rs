@@ -9,6 +9,7 @@ pub mod plugins;
 pub mod profile;
 pub mod scheduler;
 pub mod scheduler_config;
+pub mod score;
 pub mod volume_assume;
 pub mod volume_bind;
 pub mod volume_binding;
