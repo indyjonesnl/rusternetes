@@ -8,6 +8,7 @@ pub mod build_info;
 pub mod cel;
 pub mod cel_authz;
 pub mod cel_authz_library;
+pub mod cel_cost;
 pub mod cel_dra;
 pub mod cel_env;
 pub mod cel_struct;

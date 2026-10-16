@@ -128,6 +128,51 @@ impl CELEvaluator {
             .map_err(|e| anyhow!("Failed to execute CEL expression '{}': {}", expression, e))
     }
 
+    /// Evaluate with the cel-go runtime cost tracker (`cel.CostTracking`),
+    /// returning the result and `EvalDetails.ActualCost()` (#3323). See
+    /// [`crate::cel_cost`].
+    pub fn evaluate_with_cost(
+        &mut self,
+        expression: &str,
+        context: &CELContext,
+        opts: crate::cel_cost::CostOptions,
+    ) -> (
+        std::result::Result<Value, crate::cel_cost::CostEvalError>,
+        u64,
+    ) {
+        let (r, cost) = self.evaluate_with_cost_raw(expression, context, opts);
+        (r.map(|v| cel_struct::strip_type_markers(&v)), cost)
+    }
+
+    /// [`Self::evaluate_with_cost`] keeping the `Object{}` type markers (for
+    /// values bound into another evaluation, or checked by the caller).
+    pub fn evaluate_with_cost_raw(
+        &mut self,
+        expression: &str,
+        context: &CELContext,
+        opts: crate::cel_cost::CostOptions,
+    ) -> (
+        std::result::Result<Value, crate::cel_cost::CostEvalError>,
+        u64,
+    ) {
+        let program = match self.compiled(expression) {
+            Ok(p) => p,
+            Err(e) => {
+                return (
+                    Err(crate::cel_cost::CostEvalError::Exec(
+                        cel::ExecutionError::function_error("compile", e.to_string()),
+                    )),
+                    0,
+                )
+            }
+        };
+        let mut cel_context = cel_struct::new_context();
+        for (key, value) in &context.variables {
+            let _ = cel_context.add_variable(key.clone(), value.clone());
+        }
+        crate::cel_cost::eval_with_cost(program.expression(), &cel_context, opts)
+    }
+
     /// Evaluate a MAP patch expression and run upstream's
     /// `CheckTypeNamesMatchFieldPathNames` on the result; a mismatch is
     /// `unexpected type name ...` (the caller adds `type mismatch: `).
