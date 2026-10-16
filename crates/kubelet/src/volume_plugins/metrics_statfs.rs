@@ -47,7 +47,7 @@ impl MetricsStatFs {
 }
 
 /// `NewNoPathDefinedError` (`metrics_errors.go:56-61`).
-fn no_path_defined_error() -> MetricsError {
+pub(crate) fn no_path_defined_error() -> MetricsError {
     MetricsError {
         code: MetricsErrorCode::NoPathDefined,
         msg: "no path defined for disk usage metrics.".to_string(),
@@ -55,7 +55,7 @@ fn no_path_defined_error() -> MetricsError {
 }
 
 /// `NewFsInfoFailedError` (`metrics_errors.go:64-69`).
-fn fs_info_failed_error(err: &std::io::Error) -> MetricsError {
+pub(crate) fn fs_info_failed_error(err: &std::io::Error) -> MetricsError {
     MetricsError {
         code: MetricsErrorCode::FsInfoFailed,
         msg: format!("failed to get FsInfo due to error {err}"),
@@ -64,7 +64,7 @@ fn fs_info_failed_error(err: &std::io::Error) -> MetricsError {
 
 /// `fs.Info` (linux, `fs.go:39-60`): (available bytes, byte capacity, byte
 /// usage, total inodes, inodes free, inode usage).
-fn fs_info(path: &str) -> std::io::Result<(i64, i64, i64, i64, i64, i64)> {
+pub(crate) fn fs_info(path: &str) -> std::io::Result<(i64, i64, i64, i64, i64, i64)> {
     let c = std::ffi::CString::new(path)
         .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
     // SAFETY: `c` is NUL-terminated; `st` is a valid out-pointer.
