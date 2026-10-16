@@ -14,6 +14,7 @@ use rusternetes_common::validation::objectmeta::{name_is_dns_subdomain, validate
 use rusternetes_common::validation::validating_admission_policy::{
     ignore_validating_admission_policy_match_conditions, set_defaults_validating_admission_policy,
     validate_validating_admission_policy, validate_validating_admission_policy_status_update,
+    MAX_AUDIT_ANNOTATION_VALUE_EXPRESSION_LENGTH,
 };
 use rusternetes_storage::StorageBackend;
 
@@ -43,55 +44,128 @@ fn spec_json(obj: &ValidatingAdmissionPolicy) -> Option<serde_json::Value> {
     serde_json::to_value(&obj.spec).ok()
 }
 
-/// `validateMessageExpression` (validation.go:1114-1126) for every
-/// `validations[i].messageExpression` that is not blank (:1041-1045): compiled
-/// with `HasAuthorizer: false` (also `compilePolicy`, validating/plugin.go:119),
-/// so a reference to `authorizer` is `undeclared reference`, and expected to
-/// evaluate to a string (`MessageExpressionCondition.ReturnTypes`,
-/// message.go:34-36). `HasParams` is `opts.allowParamsInMatchConditions`, which
-/// `validateValidatingAdmissionPolicySpec` sets when `paramKind` is present
-/// (:790-792). The `variables` are declared only when the policy has some:
-/// `getCompiler` (:773-779) builds the composited compiler only then and the
-/// stateless one otherwise (`createCompiler`, :1316-1327).
+/// The CEL compile of `validateValidatingAdmissionPolicySpec`
+/// (validation.go:803-828) that needs the composited compiler, in upstream's
+/// order: `validateVariable` (:999-1032), then per validation
+/// `validateValidation` (:1034-1061: `validateValidationExpression` and
+/// `validateMessageExpression`) and `validateAuditAnnotation` (:1128-1166).
 ///
-/// The rest of the spec's CEL compile (`validations[].expression`,
-/// `variables`, `auditAnnotations`) is not modelled here, see [`super`].
+/// `getCompiler` (:773-779) builds the composited compiler only when the
+/// policy has `variables` and the stateless one otherwise (`createCompiler`,
+/// :1316-1327). `CompileAndStoreVariable` (composition.go:95-100) adds each
+/// variable as a field of `variables` only after compiling it, so a variable
+/// sees just the ones before it; validations and audit annotations (compiled
+/// after the whole variables loop) see all of them. `HasParams` is
+/// `paramKind != nil` (`opts.allowParamsInMatchConditions` for
+/// `messageExpression`, set at :790-792); `HasAuthorizer` is true except for
+/// `messageExpression` (:1124) (`compilePolicy`, validating/plugin.go:118-119).
+/// Output types: `Variable` any (interface.go:74-76), `ValidationCondition`
+/// bool (:46-48), `MessageExpressionCondition` string (message.go:34-36),
+/// `AuditAnnotationCondition` string or null (:60-62); inference-dependent
+/// checks are #3277. The Stored/New environment distinction (preexisting
+/// expressions on update) is not modelled here.
 fn message_expression_errors(obj: &ValidatingAdmissionPolicy) -> ErrorList {
+    fn push(
+        errs: &mut ErrorList,
+        path: Path,
+        value: &str,
+        compiled: &str,
+        env: &MutationEnv,
+        expected: ExpectedOutput,
+    ) {
+        if let Some(detail) = mutation_env_failure(compiled, env, expected) {
+            errs.push(FieldError::invalid(&path, value.to_string(), detail));
+        }
+    }
     let mut errs = ErrorList::new();
     let Some(spec) = &obj.spec else {
         return errs;
     };
+    let has_params = spec.param_kind.is_some();
     let has_variables = spec.variables.as_ref().is_some_and(|v| !v.is_empty());
-    let names: std::collections::BTreeSet<String> = spec
+    let all_names: std::collections::BTreeSet<String> = spec
         .variables
         .iter()
         .flatten()
         .map(|v| v.name.clone())
         .filter(|n| !n.trim().is_empty())
         .collect();
-    let env = MutationEnv {
-        has_params: spec.param_kind.is_some(),
-        has_authorizer: false,
-        has_patch_types: false,
-        variables: has_variables.then_some(names),
-    };
-    for (i, v) in spec.validations.iter().flatten().enumerate() {
-        let Some(expression) = v.message_expression.as_deref() else {
-            continue;
-        };
-        if expression.trim().is_empty() {
-            continue;
-        }
-        if let Some(detail) = mutation_env_failure(expression, &env, ExpectedOutput::String) {
-            errs.push(FieldError::invalid(
-                &Path::new("spec")
-                    .child("validations")
+    // validateVariable (:999-1032).
+    let mut seen = std::collections::BTreeSet::new();
+    for (i, v) in spec.variables.iter().flatten().enumerate() {
+        if !v.expression.trim().is_empty() {
+            let env = MutationEnv {
+                has_params,
+                has_authorizer: true,
+                has_patch_types: false,
+                variables: Some(seen.clone()),
+            };
+            push(
+                &mut errs,
+                Path::new("spec")
+                    .child("variables")
                     .index(i)
-                    .child("messageExpression"),
-                expression.to_string(),
-                detail,
-            ));
+                    .child("expression"),
+                &v.expression,
+                &v.expression,
+                &env,
+                ExpectedOutput::Any,
+            );
         }
+        if !v.name.trim().is_empty() {
+            seen.insert(v.name.clone());
+        }
+    }
+    let env_for = |has_authorizer: bool| MutationEnv {
+        has_params,
+        has_authorizer,
+        has_patch_types: false,
+        variables: has_variables.then(|| all_names.clone()),
+    };
+    // validateValidation (:1034-1061).
+    for (i, v) in spec.validations.iter().flatten().enumerate() {
+        let base = Path::new("spec").child("validations").index(i);
+        if !v.expression.trim().is_empty() {
+            push(
+                &mut errs,
+                base.child("expression"),
+                &v.expression,
+                &v.expression,
+                &env_for(true),
+                ExpectedOutput::Bool,
+            );
+        }
+        if let Some(expression) = v.message_expression.as_deref() {
+            if !expression.trim().is_empty() {
+                push(
+                    &mut errs,
+                    base.child("messageExpression"),
+                    expression,
+                    expression,
+                    &env_for(false),
+                    ExpectedOutput::String,
+                );
+            }
+        }
+    }
+    // validateAuditAnnotation (:1128-1166): a blank or over-long expression is
+    // reported by the structural validation instead.
+    for (i, a) in spec.audit_annotations.iter().flatten().enumerate() {
+        let trimmed = a.value_expression.trim();
+        if trimmed.is_empty() || trimmed.len() > MAX_AUDIT_ANNOTATION_VALUE_EXPRESSION_LENGTH {
+            continue;
+        }
+        push(
+            &mut errs,
+            Path::new("spec")
+                .child("auditAnnotations")
+                .index(i)
+                .child("valueExpression"),
+            &a.value_expression,
+            trimmed,
+            &env_for(true),
+            ExpectedOutput::StringOrNull,
+        );
     }
     errs
 }
@@ -577,5 +651,119 @@ mod match_condition_compile_tests {
             "{}",
             messages(&errs)
         );
+    }
+}
+
+#[cfg(test)]
+mod expression_compile_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn policy(spec_extra: serde_json::Value) -> ValidatingAdmissionPolicy {
+        let mut spec = json!({
+            "matchConstraints": {"matchPolicy": "Exact", "objectSelector": {}, "namespaceSelector": {}, "resourceRules": [{"operations": ["CREATE"], "apiGroups": ["a"], "apiVersions": ["a"], "resources": ["a"]}]},
+            "failurePolicy": "Fail"});
+        for (k, v) in spec_extra.as_object().unwrap() {
+            spec[k] = v.clone();
+        }
+        serde_json::from_value(json!({"apiVersion": "admissionregistration.k8s.io/v1", "kind": "ValidatingAdmissionPolicy", "metadata": {"name": "foo"}, "spec": spec})).unwrap()
+    }
+
+    fn msgs(p: &ValidatingAdmissionPolicy) -> String {
+        RestCreateStrategy::validate(&Strategy::default(), &RequestContext::new(None), p)
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// validation_test.go:2618 "validation expression that does not compile".
+    #[test]
+    fn rejects_a_validation_expression_that_does_not_compile() {
+        let m = msgs(&policy(
+            json!({"validations": [{"expression": "object.x in [1, 2, "}]}),
+        ));
+        assert!(
+            m.contains(r#"spec.validations[0].expression: Invalid value: "object.x in [1, 2, ": compilation failed"#),
+            "{m}"
+        );
+    }
+
+    /// `ValidationCondition.ReturnTypes` is `[bool]` (interface.go:46-48).
+    #[test]
+    fn rejects_a_non_bool_validation_expression() {
+        let m = msgs(&policy(json!({"validations": [{"expression": "6"}]})));
+        assert!(
+            m.contains(r#"spec.validations[0].expression: Invalid value: "6": must evaluate to bool but got int"#),
+            "{m}"
+        );
+    }
+
+    /// validation_test.go:2954: `variables` has no field `replicas`.
+    #[test]
+    fn rejects_an_undefined_variable_in_a_validation() {
+        let m = msgs(&policy(json!({
+            "variables": [{"name": "foo", "expression": "1 + 1"}],
+            "validations": [{"expression": "true"}, {"expression": "variables.replicas == 2"}]})));
+        assert!(
+            m.contains(r#"spec.validations[1].expression: Invalid value: "variables.replicas == 2": compilation failed"#) && m.contains("undefined field 'replicas'"),
+            "{m}"
+        );
+    }
+
+    /// validation_test.go:2983: a variable only sees the ones before it.
+    #[test]
+    fn variables_only_see_earlier_variables() {
+        let m = msgs(&policy(json!({
+            "variables": [
+                {"name": "correct", "expression": "object"},
+                {"name": "bar", "expression": "variables.foo + 1"},
+                {"name": "foo", "expression": "1 + 1"}],
+            "validations": [{"expression": "variables.foo > 1"}]})));
+        assert!(
+            m.contains(r#"spec.variables[1].expression: Invalid value: "variables.foo + 1": compilation failed"#) && m.contains("undefined field 'foo'"),
+            "{m}"
+        );
+        assert!(!m.contains("spec.validations"), "{m}");
+    }
+
+    /// validation_test.go:4415.
+    #[test]
+    fn rejects_a_variable_expression_that_does_not_compile() {
+        let m = msgs(&policy(json!({
+            "variables": [{"name": "a", "expression": "///"}],
+            "validations": [{"expression": "true"}]})));
+        assert!(
+            m.contains(r#"spec.variables[0].expression: Invalid value: "///": compilation failed"#),
+            "{m}"
+        );
+    }
+
+    /// validation_test.go:2731-2757.
+    #[test]
+    fn audit_annotation_value_expression_is_compiled() {
+        let m = msgs(&policy(json!({
+            "validations": [{"expression": "true"}],
+            "auditAnnotations": [{"key": "a", "valueExpression": "object.x in [1, 2, "}]})));
+        assert!(
+            m.contains(r#"spec.auditAnnotations[0].valueExpression: Invalid value: "object.x in [1, 2, ": compilation failed"#),
+            "{m}"
+        );
+        let m = msgs(&policy(json!({
+            "validations": [{"expression": "true"}],
+            "auditAnnotations": [{"key": "a", "valueExpression": "true"}]})));
+        assert!(
+            m.contains(r#"spec.auditAnnotations[0].valueExpression: Invalid value: "true": must evaluate to one of [string null_type]"#),
+            "{m}"
+        );
+    }
+
+    #[test]
+    fn accepts_valid_expressions() {
+        let m = msgs(&policy(json!({
+            "variables": [{"name": "foo", "expression": "object.metadata.name"}],
+            "validations": [{"expression": "variables.foo == 'x' && authorizer.group('a').check('get').allowed()"}],
+            "auditAnnotations": [{"key": "a", "valueExpression": "variables.foo"}]})));
+        assert!(m.is_empty(), "{m}");
     }
 }
