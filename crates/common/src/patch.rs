@@ -20,10 +20,14 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 
 mod mergepatch;
+mod meta;
 #[cfg(test)]
 mod smp_error_tests;
+#[cfg(test)]
+mod smp_schema_tests;
 
 use mergepatch::{err_bad_arg_type, err_bad_patch_type, err_no_merge_key, go_fmt_v, GO_SLICE};
+pub use meta::PatchSchema;
 
 /// Patch types supported by the API
 #[allow(clippy::enum_variant_names)]
@@ -98,6 +102,12 @@ pub enum PatchError {
     #[error("{0}")]
     Uninterpreted(String),
 
+    /// `mergepatch.ErrNoListOfLists`: `interpretStrategicMergePatchError`
+    /// answers it `NewGenericServerResponse(422, ...)` (apiserver
+    /// patch.go:802-803).
+    #[error("{0}")]
+    UnprocessableEntity(String),
+
     /// JSON-Patch targeted a path that does not exist on the object.
     ///
     /// Carries the resolved dotted field path (e.g. `spec.doesNotExist`) so
@@ -169,6 +179,21 @@ pub fn apply_patch(
     patch: &Value,
     patch_type: PatchType,
 ) -> Result<Value, PatchError> {
+    // Without the served kind, the object's own `apiVersion`/`kind` names it.
+    let schema = PatchSchema::for_object(original);
+    apply_patch_with_schema(original, patch, patch_type, schema.as_ref())
+}
+
+/// [`apply_patch`] against `schema`, the served kind's patch metadata
+/// (`NewPatchMetaFromStruct(versionedObj)`, apiserver `patch.go`
+/// `strategicPatchObject`). `None` has no struct to look up: a strategic
+/// merge then infers each list's merge key from the patch items.
+pub fn apply_patch_with_schema(
+    original: &Value,
+    patch: &Value,
+    patch_type: PatchType,
+    schema: Option<&PatchSchema>,
+) -> Result<Value, PatchError> {
     match patch_type {
         PatchType::JsonMergePatch => {
             // `jsonpatch.MergePatch` (json-patch v4 merge.go:127-133, :144-149):
@@ -180,7 +205,7 @@ pub fn apply_patch(
             apply_merge_patch(original, patch)
         }
         PatchType::JsonPatch => apply_json_patch(original, patch),
-        PatchType::StrategicMergePatch => apply_strategic_merge_patch(original, patch),
+        PatchType::StrategicMergePatch => smp_merge_map(original, patch, schema),
     }
 }
 
@@ -450,6 +475,17 @@ fn test_operation(value: &Value, path: &str, test_value: &Value) -> Result<(), P
 /// - Objects are recursively merged
 /// - Null values delete keys
 fn apply_strategic_merge_patch(original: &Value, patch: &Value) -> Result<Value, PatchError> {
+    smp_merge_map(original, patch, None)
+}
+
+/// `mergeMap` (strategicpatch/patch.go:1316) with `MergeParallelList` and
+/// `IgnoreUnmatchedNulls`, as `StrategicMergeMapPatchUsingLookupPatchMeta`
+/// runs it (:875-881). `schema` is `None` only where no kind is known.
+fn smp_merge_map(
+    original: &Value,
+    patch: &Value,
+    schema: Option<&PatchSchema>,
+) -> Result<Value, PatchError> {
     if !patch.is_object() {
         return Ok(patch.clone());
     }
@@ -551,7 +587,7 @@ fn apply_strategic_merge_patch(original: &Value, patch: &Value) -> Result<Value,
             // Upstream `mergePatchIntoOriginal` (patch.go:1110-1230): a
             // `$setElementOrder/<field>` directive merges the `<field>` list
             // together with its order list, then drops both from the patch.
-            let consumed = merge_set_element_order_lists(result_obj, patch_obj)?;
+            let consumed = merge_set_element_order_lists(result_obj, patch_obj, schema)?;
 
             for (key, patch_value) in patch_obj {
                 // Skip directive keys
@@ -560,6 +596,44 @@ fn apply_strategic_merge_patch(original: &Value, patch: &Value) -> Result<Value,
                 }
                 if consumed.contains(key) {
                     continue;
+                }
+
+                // With the kind's schema, a key present in both the live
+                // object and the patch, as two maps or two lists, is
+                // merged as `mergeMap` (patch.go:1394-1424) does: look up
+                // the field's patch metadata, then `mergeMapHandler` /
+                // `mergeSliceHandler` (:1451-1488) pick merge or replace.
+                if let (Some(schema), false) = (schema, patch_value.is_null()) {
+                    let handled = match (result_obj.get(key), patch_value) {
+                        (Some(Value::Object(_)), Value::Object(_)) => {
+                            let (sub, meta) = schema.lookup_struct(key).map_err(lookup_error)?;
+                            let (_, strategy) = extract_retain_keys_strategy(&meta.strategies)?;
+                            Some(if strategy == "replace" {
+                                patch_value.clone()
+                            } else {
+                                smp_merge_map(&result_obj[key], patch_value, Some(&sub))?
+                            })
+                        }
+                        (Some(Value::Array(orig)), Value::Array(patch_arr)) => {
+                            let (sub, meta) = schema.lookup_slice(key).map_err(lookup_error)?;
+                            let (_, strategy) = extract_retain_keys_strategy(&meta.strategies)?;
+                            Some(if strategy == "merge" {
+                                Value::Array(merge_slice(
+                                    orig,
+                                    patch_arr,
+                                    Some(&sub),
+                                    &meta.merge_key,
+                                )?)
+                            } else {
+                                patch_value.clone()
+                            })
+                        }
+                        _ => None,
+                    };
+                    if let Some(merged) = handled {
+                        result_obj.insert(key.clone(), merged);
+                        continue;
+                    }
                 }
 
                 if patch_value.is_null() {
@@ -589,11 +663,21 @@ fn apply_strategic_merge_patch(original: &Value, patch: &Value) -> Result<Value,
                     && result_obj.get(key).is_some_and(|v| v.is_object())
                 {
                     // Recursively merge objects
-                    let merged = apply_strategic_merge_patch(&result_obj[key], patch_value)?;
+                    let merged = smp_merge_map(&result_obj[key], patch_value, None)?;
                     result_obj.insert(key.clone(), merged);
                 } else {
-                    // Replace value
-                    result_obj.insert(key.clone(), patch_value.clone());
+                    // Not in the live object, or of another type: the patch
+                    // value goes in with its directives removed
+                    // (`removeDirectives`, patch.go:1423-1428, :1445-1450);
+                    // a value that is itself a directive map is dropped.
+                    match remove_directives_deep(patch_value) {
+                        Some(v) => {
+                            result_obj.insert(key.clone(), v);
+                        }
+                        None => {
+                            result_obj.remove(key);
+                        }
+                    }
                 }
             }
 
@@ -625,7 +709,11 @@ fn apply_strategic_merge_patch(original: &Value, patch: &Value) -> Result<Value,
                         current.retain(|v| !to_delete.contains(v));
                     }
                     (current @ Value::Object(_), Value::Object(_)) => {
-                        *current = apply_strategic_merge_patch(current, patch_value)?;
+                        let sub = match schema {
+                            Some(s) => Some(s.lookup_struct(field).map_err(lookup_error)?.0),
+                            None => None,
+                        };
+                        *current = smp_merge_map(current, patch_value, sub.as_ref())?;
                     }
                     (current, _) => *current = patch_value.clone(),
                 }
@@ -823,13 +911,15 @@ fn remove_directives(list: &[Value]) -> Vec<Value> {
 /// fields it consumed so the caller skips them.
 ///
 /// Upstream finds the merge key through `schema.LookupPatchMetadataForSlice`
-/// (patch.go:1165); there is no schema here, so for lists of maps the key
-/// is derived from the order list itself via `detect_merge_key_strategy`
-/// (the same heuristic `strategic_merge_arrays` uses). An order list that
-/// yields no key leaves the field to the ordinary merge.
+/// (patch.go:1165); with a `schema` that is what runs. Without one (no
+/// kind known) the key of a list of maps is derived from the order list
+/// itself via `detect_merge_key_strategy` (the same heuristic
+/// `strategic_merge_arrays` uses); an order list that yields no key leaves
+/// the field to the ordinary merge.
 fn merge_set_element_order_lists(
     result_obj: &mut serde_json::Map<String, Value>,
     patch_obj: &serde_json::Map<String, Value>,
+    schema: Option<&PatchSchema>,
 ) -> Result<std::collections::HashSet<String>, PatchError> {
     let mut consumed = std::collections::HashSet::new();
     let prefix = format!("{SET_ELEMENT_ORDER}/");
@@ -852,6 +942,43 @@ fn merge_set_element_order_lists(
             None => None,
             Some(other) => return Err(bad_arg(other)),
         };
+        if let Some(schema) = schema {
+            // patch.go:1165-1226: the field's own metadata drives the merge
+            // key and strategy.
+            let (sub, meta) = schema.lookup_slice(field).map_err(lookup_error)?;
+            let (_, strategy) = extract_retain_keys_strategy(&meta.strategies)?;
+            let key = meta.merge_key.as_str();
+            let id = |v: &Value| -> Option<String> {
+                if key.is_empty() {
+                    scalar_id(v)
+                } else {
+                    v.as_object().and_then(|m| m.get(key)).map(Value::to_string)
+                }
+            };
+            let merge_key = (!key.is_empty()).then_some(key);
+            validate_patch_with_set_order_list(
+                patch_list.as_deref().unwrap_or(&[]),
+                order,
+                &id,
+                merge_key,
+            )?;
+            let merged = match (&original, &patch_list) {
+                (None, None) => continue,
+                (Some(o), None) => o.clone(),
+                (None, Some(p)) => match remove_directives_deep(&Value::Array(p.clone())) {
+                    Some(Value::Array(a)) => a,
+                    _ => continue,
+                },
+                (Some(o), Some(p)) if strategy == "merge" => merge_slice(o, p, Some(&sub), key)?,
+                (Some(_), Some(p)) => p.clone(),
+            };
+            let server_order = original.unwrap_or_default();
+            slice_elements_are_maps(&[&server_order, patch_list.as_deref().unwrap_or(&[])])?;
+            let ordered = normalize_order(&merged, order, &server_order, &id, merge_key)?;
+            result_obj.insert(field.to_string(), Value::Array(ordered));
+            consumed.insert(field.to_string());
+            continue;
+        }
         let all_scalar = original.as_deref().is_none_or(is_scalar_list)
             && patch_list.as_deref().is_none_or(is_scalar_list)
             && is_scalar_list(order);
@@ -909,6 +1036,206 @@ fn merge_set_element_order_lists(
         consumed.insert(field.to_string());
     }
     Ok(consumed)
+}
+
+/// `removeDirectives` (patch.go:1282-1311): a map carrying `$patch` is
+/// dropped (`None`); maps and lists are cleaned recursively.
+fn remove_directives_deep(v: &Value) -> Option<Value> {
+    match v {
+        Value::Object(m) => {
+            if m.contains_key("$patch") {
+                return None;
+            }
+            Some(Value::Object(
+                m.iter()
+                    .filter_map(|(k, v)| remove_directives_deep(v).map(|v| (k.clone(), v)))
+                    .collect(),
+            ))
+        }
+        Value::Array(a) => Some(Value::Array(
+            a.iter().filter_map(remove_directives_deep).collect(),
+        )),
+        other => Some(other.clone()),
+    }
+}
+
+/// A failed `LookupPatchMetadataFor*` (meta.go): a plain `error`, so the
+/// apiserver answers it as a reason-less 500 (patch.go:805-806).
+fn lookup_error(msg: String) -> PatchError {
+    PatchError::Uninterpreted(msg)
+}
+
+/// `extractRetainKeysPatchStrategy` (patch.go:1778-1805): split a field's
+/// strategies into "has `retainKeys`" and the other strategy.
+fn extract_retain_keys_strategy(strategies: &[String]) -> Result<(bool, String), PatchError> {
+    match strategies {
+        [] => Ok((false, String::new())),
+        [one] if one == "retainKeys" => Ok((true, String::new())),
+        [one] => Ok((false, one.clone())),
+        [a, b] if a == "retainKeys" => Ok((true, b.clone())),
+        [a, b] if b == "retainKeys" => Ok((true, a.clone())),
+        _ => Err(PatchError::Uninterpreted(format!(
+            "unexpected patch strategy: [{}]",
+            strategies.join(" ")
+        ))),
+    }
+}
+
+/// `sliceElementType` (patch.go:1868-1895) reduced to what `mergeSlice`
+/// needs: whether the elements are maps. All elements must share one Go
+/// type, and a list of lists is `ErrNoListOfLists`.
+fn slice_elements_are_maps(slices: &[&[Value]]) -> Result<bool, PatchError> {
+    let mut prev: Option<Option<&'static str>> = None;
+    for s in slices {
+        for v in *s {
+            let cur = mergepatch::go_type_name(v);
+            match prev {
+                None => {
+                    prev = Some(cur);
+                    if v.is_array() {
+                        return Err(PatchError::UnprocessableEntity(
+                            "lists of lists are not supported".to_string(),
+                        ));
+                    }
+                }
+                Some(p) if p != cur => {
+                    let all =
+                        Value::Array(slices.iter().map(|s| Value::Array(s.to_vec())).collect());
+                    return Err(PatchError::Uninterpreted(format!(
+                        "list element types are not identical: {}",
+                        go_fmt_v(&all)
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    match prev {
+        None => Err(PatchError::Uninterpreted(
+            "no elements in any of the given slices".to_string(),
+        )),
+        Some(t) => Ok(t == Some("map[string]interface {}")),
+    }
+}
+
+/// `findMapInSliceBasedOnKeyValue` (patch.go:1692-1708): the first element
+/// whose `key` equals `value`; a non-map element is an error.
+fn find_map_in_slice(
+    list: &[Value],
+    key: &str,
+    value: &Value,
+) -> Result<Option<usize>, PatchError> {
+    for (i, v) in list.iter().enumerate() {
+        let Some(m) = v.as_object() else {
+            return Err(PatchError::Uninterpreted(format!(
+                "value for key {i} is not a map"
+            )));
+        };
+        if m.get(key) == Some(value) {
+            return Ok(Some(i));
+        }
+    }
+    Ok(None)
+}
+
+/// `mergeSlice` (patch.go:1500-1565): merge `patch` into `original` for a
+/// field whose strategy is `merge`. `schema` is the element's schema and
+/// `merge_key` the field's `patchMergeKey` (empty for a list of scalars).
+fn merge_slice(
+    original: &[Value],
+    patch: &[Value],
+    schema: Option<&PatchSchema>,
+    merge_key: &str,
+) -> Result<Vec<Value>, PatchError> {
+    if original.is_empty() && patch.is_empty() {
+        return Ok(original.to_vec());
+    }
+    let is_map = slice_elements_are_maps(&[original, patch])?;
+    if !is_map {
+        // Union, then `normalizeElementOrder` over the patch order and the
+        // live order (`deduplicateScalars` + :1556-1563).
+        return Ok(merge_scalar_lists(original, patch));
+    }
+    if merge_key.is_empty() {
+        return Err(PatchError::Uninterpreted(format!(
+            "cannot merge lists without merge key for {}",
+            schema.map(PatchSchema::name).unwrap_or_default()
+        )));
+    }
+    let (original, patch) = merge_slice_with_special_elements(original, patch, merge_key)?;
+    let merged = merge_slice_without_special_elements(original.clone(), &patch, merge_key, schema)?;
+    let id = |v: &Value| {
+        v.as_object()
+            .and_then(|m| m.get(merge_key))
+            .map(Value::to_string)
+    };
+    normalize_order(&merged, &patch, &original, &id, Some(merge_key))
+}
+
+/// `mergeSliceWithSpecialElements` (patch.go:1567-1607): apply the `$patch`
+/// elements of `patch` and return the live list after any deletes plus the
+/// patch without them (`replace` makes the patch items the live list and the
+/// patch empty, patch.go:1583-1585).
+fn merge_slice_with_special_elements(
+    original: &[Value],
+    patch: &[Value],
+    merge_key: &str,
+) -> Result<(Vec<Value>, Vec<Value>), PatchError> {
+    let mut original = original.to_vec();
+    let mut plain = Vec::new();
+    let mut replace = false;
+    for v in patch {
+        let m = v.as_object().expect("elements are maps");
+        let Some(directive) = m.get("$patch") else {
+            plain.push(v.clone());
+            continue;
+        };
+        match directive.as_str() {
+            Some("delete") => {
+                let Some(value) = m.get(merge_key) else {
+                    return Err(PatchError::Uninterpreted(err_no_merge_key(v, merge_key)));
+                };
+                // `deleteMatchingEntries` (:1609-1625).
+                while let Some(i) = find_map_in_slice(&original, merge_key, value)? {
+                    original.remove(i);
+                }
+            }
+            Some("replace") => replace = true,
+            Some("merge") => {
+                return Err(PatchError::Uninterpreted(
+                    "merging lists cannot yet be specified in the patch".to_string(),
+                ));
+            }
+            _ => {
+                return Err(PatchError::Uninterpreted(err_bad_patch_type(directive, v)));
+            }
+        }
+    }
+    if replace {
+        return Ok((plain, Vec::new()));
+    }
+    Ok((original, plain))
+}
+
+/// `mergeSliceWithoutSpecialElements` (patch.go:1627-1660): merge each patch
+/// map into the live map with the same merge key, or append it as given.
+fn merge_slice_without_special_elements(
+    mut original: Vec<Value>,
+    patch: &[Value],
+    merge_key: &str,
+    schema: Option<&PatchSchema>,
+) -> Result<Vec<Value>, PatchError> {
+    for v in patch {
+        let m = v.as_object().expect("elements are maps");
+        let Some(value) = m.get(merge_key) else {
+            return Err(PatchError::Uninterpreted(err_no_merge_key(v, merge_key)));
+        };
+        match find_map_in_slice(&original, merge_key, value)? {
+            Some(i) => original[i] = smp_merge_map(&original[i], v, schema)?,
+            None => original.push(v.clone()),
+        }
+    }
+    Ok(original)
 }
 
 /// Strategy used to compute the merge key for every item in an array

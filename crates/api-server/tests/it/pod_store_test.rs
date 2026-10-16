@@ -550,10 +550,12 @@ async fn patch_status(api: &TestApiServer, patch: &Value) -> (StatusCode, Value)
 async fn kubelet_status_patch_waiting_to_running_with_null() {
     let api = TestApiServer::new();
     seed_waiting_pod(&api).await;
-    let patch = json!({"status": {
-        "$setElementOrder/containerStatuses": [{"name": "c"}],
-        "containerStatuses": [{"name": "c", "ready": true,
-            "state": {"running": {"startedAt": "2026-10-07T00:00:00Z"}, "waiting": null}}]}});
+    // `PodStatus.ContainerStatuses` carries no `patchStrategy` tag
+    // (core/v1/types.go:5361), so `CreateTwoWayMergePatch` emits the whole
+    // list and the merge replaces it (`mergeSliceHandler`, patch.go:1481).
+    let patch = json!({"status": {"containerStatuses": [{
+        "name": "c", "image": "busybox", "imageID": "", "ready": true, "restartCount": 0,
+        "state": {"running": {"startedAt": "2026-10-07T00:00:00Z"}}}]}});
     let (s, body) = patch_status(&api, &patch).await;
     assert_eq!(s, StatusCode::OK, "{body}");
     let st = &body["status"]["containerStatuses"][0]["state"];
@@ -563,12 +565,11 @@ async fn kubelet_status_patch_waiting_to_running_with_null() {
     );
 }
 
-/// Go's `ContainerState` is a struct of three optional pointers and upstream
-/// validation never requires exactly one (`ValidateContainerStateTransition`,
-/// validation.go:5841 only checks Terminated transitions), so a patch lacking
-/// `waiting: null` is accepted (Go stores both keys; see below).
+/// An atomic list is replaced as a whole, not merged by `name`: a patch item
+/// naming only `state` leaves nothing of the live entry's other fields (Go
+/// zero-values them), and `waiting` goes with the old item.
 #[tokio::test]
-async fn kubelet_status_patch_tolerates_running_and_waiting_both_set() {
+async fn kubelet_status_patch_replaces_the_atomic_container_statuses_list() {
     let api = TestApiServer::new();
     seed_waiting_pod(&api).await;
     let patch = json!({"status": {"containerStatuses": [{"name": "c",
@@ -576,9 +577,8 @@ async fn kubelet_status_patch_tolerates_running_and_waiting_both_set() {
     let (s, body) = patch_status(&api, &patch).await;
     assert_eq!(s, StatusCode::OK, "{body}");
     let st = &body["status"]["containerStatuses"][0]["state"];
-    // Go stores both keys: the merge only replaces what the patch names.
     assert!(
-        st.get("running").is_some() && st.get("waiting").is_some(),
+        st.get("running").is_some() && st.get("waiting").is_none(),
         "{body}"
     );
 }
@@ -692,6 +692,70 @@ async fn an_invalid_ephemeral_container_is_rejected() {
             .as_str()
             .unwrap()
             .contains("spec.ephemeralContainers[0].name"),
+        "{body}"
+    );
+}
+
+/// `ErrNoListOfLists` is answered 422 (`interpretStrategicMergePatchError`,
+/// apiserver patch.go:802-803), not a reason-less 500.
+#[tokio::test]
+async fn smp_list_of_lists_is_422() {
+    let api = TestApiServer::new();
+    create(&api, &scheduled_pod("p1")).await;
+    let key = build_key("pods", Some("default"), "p1");
+    let mut stored: Value = api.storage.get(&key).await.unwrap();
+    stored["metadata"]["finalizers"] = json!([]);
+    api.storage.update(&key, &stored).await.unwrap();
+    let (s, body) = api
+        .send(
+            "PATCH",
+            &format!("{PODS}/p1"),
+            Some("application/strategic-merge-patch+json"),
+            Some(&json!({"metadata": {"finalizers": [[1]]}})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("lists of lists are not supported"),
+        "{body}"
+    );
+}
+
+/// The kubelet's Node status patch (`fixupPatchForNodeStatusAddresses`,
+/// component-helpers/node/util/status.go:85-120) replaces `addresses`; every
+/// item survives, including two `InternalIP`s that share the merge key.
+#[tokio::test]
+async fn node_status_patch_replace_addresses_keeps_duplicate_types() {
+    let api = TestApiServer::new();
+    let (s, body) = api
+        .send(
+            "POST",
+            "/api/v1/nodes",
+            None,
+            Some(&json!({"apiVersion": "v1", "kind": "Node", "metadata": {"name": "n1"}})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+    let patch = json!({"status": {"addresses": [
+        {"type": "InternalIP", "address": "10.0.0.1"},
+        {"type": "InternalIP", "address": "fd00::1"},
+        {"type": "Hostname", "address": "n"},
+        {"$patch": "replace"}]}});
+    let (s, body) = api
+        .send(
+            "PATCH",
+            "/api/v1/nodes/n1/status",
+            Some("application/strategic-merge-patch+json"),
+            Some(&patch),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["status"]["addresses"].as_array().unwrap().len(),
+        3,
         "{body}"
     );
 }

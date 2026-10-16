@@ -144,8 +144,11 @@ fn assert_2xx(status: u16, body: &Value, what: &str) {
 // ---------------------------------------------------------------------------
 // 1. application/strategic-merge-patch+json
 //
-// Upstream: a patch carrying only `matchLabels` MERGES key-by-key with the
-// original selector, leaving `matchExpressions` untouched.
+// Upstream: `PodDisruptionBudgetSpec.Selector` is tagged
+// `patchStrategy:"replace"` (staging/src/k8s.io/api/policy/v1/types.go:42), so
+// `mergeMapHandler` (strategicpatch/patch.go:1465-1472) swaps the whole
+// selector for the patch's: `matchLabels` is not merged key-by-key and the
+// original `matchExpressions` is dropped.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -153,10 +156,6 @@ async fn test_patch_compatibility_v1_strategic_merge() {
     let (mem, router) = spawn_router();
     let key = seed_base_pdb(&mem).await;
 
-    // Strategic-merge patch: supply only `matchLabels.patchmatch=true`. The
-    // existing `basematch=true` should stay (key-by-key merge), AND the
-    // existing matchExpressions entry MUST be preserved (SMP descends into
-    // selector key-by-key rather than replacing it wholesale).
     let patch = json!({
         "spec": {
             "selector": {
@@ -171,38 +170,15 @@ async fn test_patch_compatibility_v1_strategic_merge() {
     let stored = read_stored(&mem, &key).await;
     let selector = &stored["spec"]["selector"];
 
-    // matchLabels was merged in: BOTH base and patch labels are present.
-    let labels = selector["matchLabels"]
-        .as_object()
-        .unwrap_or_else(|| panic!("matchLabels missing/non-object in stored PDB: {}", stored));
     assert_eq!(
-        labels.get("basematch").and_then(|v| v.as_str()),
-        Some("true"),
-        "SMP: original matchLabel `basematch` must survive the merge; got {:?}",
-        labels
+        selector["matchLabels"],
+        json!({"patchmatch": "true"}),
+        "SMP: the selector is replaced, so only the patched label remains; got {selector}"
     );
-    assert_eq!(
-        labels.get("patchmatch").and_then(|v| v.as_str()),
-        Some("true"),
-        "SMP: patched matchLabel `patchmatch` must be added; got {:?}",
-        labels
+    assert!(
+        selector.get("matchExpressions").is_none_or(|e| e.is_null()),
+        "SMP: the original matchExpressions is replaced away; got {selector}"
     );
-
-    // matchExpressions was NOT in the patch — must be preserved untouched.
-    let exprs = selector["matchExpressions"].as_array().unwrap_or_else(|| {
-        panic!(
-            "SMP: matchExpressions must be preserved when patch omits it; got {}",
-            stored
-        )
-    });
-    assert_eq!(
-        exprs.len(),
-        1,
-        "SMP: exactly the original matchExpressions entry must remain; got {:?}",
-        exprs
-    );
-    assert_eq!(exprs[0]["key"], "baseexpression");
-    assert_eq!(exprs[0]["operator"], "In");
 }
 
 // ---------------------------------------------------------------------------
