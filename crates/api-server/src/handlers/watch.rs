@@ -2103,6 +2103,7 @@ fn resource_type_to_kind_and_version(resource_type: &str, api_group: &str) -> (S
         "csinodes" => "CSINode",
         "apiservices" => "APIService",
         "podcertificaterequests" => "PodCertificateRequest",
+        "storageversionmigrations" => "StorageVersionMigration",
         // Multi-word / irregular-plural kinds the CamelCase fallback below
         // mangles (e.g. "podtemplates" -> "Podtemplate", "deviceclasses" ->
         // "Deviceclasse"). A wrong Kind on a watch event/bookmark makes the
@@ -2133,7 +2134,10 @@ fn resource_type_to_kind_and_version(resource_type: &str, api_group: &str) -> (S
         }
     };
     // Served only as certificates.k8s.io/v1beta1 (storage_certificates.go).
-    let api_version = if resource_type == "podcertificaterequests" {
+    let api_version = if resource_type == "podcertificaterequests"
+        || resource_type == "storageversionmigrations"
+    {
+        // storagemigration.k8s.io is served only as v1beta1.
         format!("{}/v1beta1", api_group)
     } else if resource_type == "devicetaintrules" {
         // Served only as resource.k8s.io/v1alpha3 (storage_resource.go:117-130).
