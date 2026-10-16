@@ -15,11 +15,10 @@
 //! `pkg/api/meta/restmapper.go`), the rule the generated REST mapping uses.
 //!
 //! The endpoint-level `Warning:` header (`installer.go:814`
-//! `utilwarning.AddWarningsHandler`) is not wired: [`warning_message`] is
-//! ported and tested but the per-request warning recorder it feeds does not
-//! exist yet.
+//! `utilwarning.AddWarningsHandler`) is in [`warnings`].
 
 mod table;
+pub mod warnings;
 
 /// The kubernetes version this server reports (`versioninfo.Get()` is
 /// `v1.35.0`, see `openapi.rs`), as `(major, minor)`.
