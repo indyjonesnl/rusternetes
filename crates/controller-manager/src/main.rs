@@ -129,6 +129,11 @@ struct Args {
     #[arg(long = "attach-detach-controller", default_value_t = false)]
     attach_detach_controller: bool,
 
+    /// Run the bootstrap signer (`bootstrapsigner`). Upstream registers it
+    /// `isDisabledByDefault: true` (bootstrap.go:35); opt-in here too.
+    #[arg(long = "bootstrap-signer-controller", default_value_t = false)]
+    bootstrap_signer_controller: bool,
+
     /// `AttachDetachControllerConfiguration.ReconcilerMaxWaitForUnmountDuration`
     /// (default 6m): how long a volume still mounted on an unhealthy node is
     /// kept attached before it is force detached.
@@ -609,6 +614,7 @@ async fn run_api_mode(
         // The standalone binary spawns these itself (with leader election).
         csi_attachers: Vec::new(),
         attach_detach_controller: false,
+        bootstrap_signer_controller: false,
         // Route HPA metric fetches through the same kubeconfig-derived
         // credentials as the data plane (CA + bearer token, honouring the
         // insecure flag) instead of the default mTLS client cert under
@@ -1250,6 +1256,20 @@ async fn main() -> Result<()> {
             async move {
                 if let Err(e) = controller.run().await {
                     tracing::error!("AttachDetach controller error: {e}");
+                }
+            }
+        });
+    }
+
+    // BootstrapSigner (`newBootstrapSignerController`, bootstrap.go:30-53), opt-in.
+    if args.bootstrap_signer_controller {
+        let bootstrap_signer =
+            Arc::new(controllers::bootstrap_signer::Signer::new(storage.clone()));
+        spawn_controller!("BootstrapSigner controller", leader_elector, {
+            let controller = bootstrap_signer.clone();
+            async move {
+                if let Err(e) = controller.run().await {
+                    tracing::error!("BootstrapSigner controller error: {e}");
                 }
             }
         });

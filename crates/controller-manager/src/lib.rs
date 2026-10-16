@@ -156,6 +156,10 @@ pub struct ControllerManagerConfig {
     /// (`--attach-detach-controller`), matching the standalone binary, because
     /// it is only useful together with a CSI attacher.
     pub attach_detach_controller: bool,
+    /// Run the bootstrap signer. Upstream registers it
+    /// `isDisabledByDefault: true` (`cmd/kube-controller-manager/app/bootstrap.go:35`),
+    /// so it is opt-in (`--bootstrap-signer-controller`).
+    pub bootstrap_signer_controller: bool,
 }
 
 /// Run the controller-manager against a storage backend directly (all-in-one
@@ -373,6 +377,17 @@ where
         handles.push(tokio::spawn(async move {
             if let Err(e) = c.run().await {
                 error!("AttachDetach controller error: {e}");
+            }
+        }));
+    }
+
+    // `newBootstrapSignerController` (bootstrap.go:30-53), disabled by default.
+    if config.bootstrap_signer_controller {
+        let s = storage_for("BootstrapSigner");
+        let c = Arc::new(controllers::bootstrap_signer::Signer::new(s));
+        handles.push(tokio::spawn(async move {
+            if let Err(e) = c.run().await {
+                error!("BootstrapSigner controller error: {e}");
             }
         }));
     }
@@ -721,6 +736,7 @@ mod per_controller_client_tests {
                     controllers::legacy_serviceaccount_token_cleaner::DEFAULT_CLEAN_UP_PERIOD,
                 csi_attachers: Vec::new(),
                 attach_detach_controller: false,
+                bootstrap_signer_controller: false,
             },
         );
         for h in &handles {
@@ -774,6 +790,7 @@ mod csi_attach_wiring_tests {
                     controllers::legacy_serviceaccount_token_cleaner::DEFAULT_CLEAN_UP_PERIOD,
                 csi_attachers,
                 attach_detach_controller,
+                bootstrap_signer_controller: false,
             },
         );
         for h in &handles {
