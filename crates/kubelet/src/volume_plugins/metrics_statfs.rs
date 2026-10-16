@@ -2,9 +2,11 @@
 //! `pkg/volume/metrics_errors.go` (`MetricsError`) and `fs.Info`
 //! (`pkg/volume/util/fs/fs.go`, linux).
 
+use crate::server_metrics::collect_volume_stat_cal_duration;
 use crate::volume_plugins::plugin::{Metrics, MetricsProvider};
 use anyhow::Result;
 use rusternetes_common::quantity::{Format, Quantity};
+use std::time::Instant;
 
 /// `MetricsError` codes (`metrics_errors.go:23-31`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,20 +108,25 @@ impl MetricsStatFs {
 impl MetricsProvider for MetricsStatFs {
     /// `GetMetrics` (`metrics_statfs.go:46-60`).
     ///
-    /// Not ported: `servermetrics.CollectVolumeStatCalDuration("statfs", ..)`
-    /// (no kubelet volume-stat histogram exists yet). Idiom difference:
-    /// upstream returns the partial `*Metrics` alongside the error; the
-    /// `Result` here carries only the error.
+    /// `defer servermetrics.CollectVolumeStatCalDuration("statfs", startTime)`
+    /// (`:47`) observes on every return path, including the early errors.
+    /// Idiom difference: upstream returns the partial `*Metrics` alongside
+    /// the error; the `Result` here carries only the error.
     fn get_metrics(&self) -> Result<Metrics> {
-        if self.path.is_empty() {
-            return Err(no_path_defined_error().into());
-        }
-        let mut metrics = Metrics {
-            time: Some(chrono::Utc::now()),
-            ..Default::default()
-        };
-        self.get_fs_info(&mut metrics)?;
-        Ok(metrics)
+        let start_time = Instant::now();
+        let result = (|| {
+            if self.path.is_empty() {
+                return Err(no_path_defined_error().into());
+            }
+            let mut metrics = Metrics {
+                time: Some(chrono::Utc::now()),
+                ..Default::default()
+            };
+            self.get_fs_info(&mut metrics)?;
+            Ok(metrics)
+        })();
+        collect_volume_stat_cal_duration("statfs", start_time);
+        result
     }
 }
 
@@ -158,5 +165,16 @@ mod tests {
             m.inodes_used.as_ref().unwrap().value(),
             m.inodes.as_ref().unwrap().value() - m.inodes_free.as_ref().unwrap().value()
         );
+    }
+
+    // metrics_statfs.go:47: GetMetrics defers CollectVolumeStatCalDuration
+    // ("statfs", ..), so every call (even the no-path error) is observed.
+    #[test]
+    fn get_metrics_statfs_observes_volume_stat_duration() {
+        let _ = MetricsStatFs::new("").get_metrics();
+        let body = rusternetes_common::observability::MetricsRegistry::new().gather();
+        assert!(body.contains(
+            "kubelet_volume_metric_collection_duration_seconds_count{metric_source=\"statfs\"}"
+        ));
     }
 }

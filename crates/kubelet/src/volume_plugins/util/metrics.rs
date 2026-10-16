@@ -2,13 +2,15 @@
 //! `metrics_nil.go` (`MetricsNil`) and the two `metrics_errors.go`
 //! constructors they use (`NewNoPathDefinedError`, `NewNotSupportedError`).
 //!
-//! `servermetrics.CollectVolumeStatCalDuration` (`metrics_block.go:55`) is not
-//! ported: no volume stats histogram exists in this kubelet yet.
+//! `servermetrics.CollectVolumeStatCalDuration("block", ..)`
+//! (`metrics_block.go:55`) is ported in [`crate::server_metrics`].
 
+use crate::server_metrics::collect_volume_stat_cal_duration;
 use crate::volume_plugins::plugin::{Metrics, MetricsProvider};
 use anyhow::{anyhow, Result};
 use rusternetes_common::quantity::{Format, Quantity};
 use std::io::{Seek, SeekFrom};
+use std::time::Instant;
 
 /// `NewNoPathDefinedError` (`metrics_errors.go:60-65`).
 pub const NO_PATH_DEFINED: &str = "no path defined for disk usage metrics.";
@@ -32,15 +34,20 @@ impl MetricsProvider for MetricsBlock {
     /// `GetMetrics` (`metrics_block.go:48-75`). Only the capacity of the
     /// device can be detected with standard tools.
     fn get_metrics(&self) -> Result<Metrics> {
-        let mut metrics = Metrics {
-            time: Some(chrono::Utc::now()),
-            ..Default::default()
-        };
-        if self.device.is_empty() {
-            return Err(anyhow!(NO_PATH_DEFINED));
-        }
-        self.get_block_info(&mut metrics)?;
-        Ok(metrics)
+        let start_time = Instant::now();
+        let result = (|| {
+            let mut metrics = Metrics {
+                time: Some(chrono::Utc::now()),
+                ..Default::default()
+            };
+            if self.device.is_empty() {
+                return Err(anyhow!(NO_PATH_DEFINED));
+            }
+            self.get_block_info(&mut metrics)?;
+            Ok(metrics)
+        })();
+        collect_volume_stat_cal_duration("block", start_time);
+        result
     }
 }
 
@@ -78,6 +85,17 @@ mod tests {
     fn block_metrics_without_a_device_is_no_path_defined() {
         let e = new_metrics_block("").get_metrics().unwrap_err();
         assert_eq!(e.to_string(), NO_PATH_DEFINED);
+    }
+
+    /// `metrics_block.go:55`: GetMetrics defers
+    /// `CollectVolumeStatCalDuration("block", ..)`.
+    #[test]
+    fn block_metrics_observes_volume_stat_duration() {
+        let _ = new_metrics_block("").get_metrics();
+        let body = rusternetes_common::observability::MetricsRegistry::new().gather();
+        assert!(body.contains(
+            "kubelet_volume_metric_collection_duration_seconds_count{metric_source=\"block\"}"
+        ));
     }
 
     /// `getBlockInfo` seeks to the end: the capacity is the file size.
