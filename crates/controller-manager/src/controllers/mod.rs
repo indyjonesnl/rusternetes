@@ -13,6 +13,7 @@ pub mod csi_capacity_metrics;
 pub mod csi_capacity_refresh;
 pub mod csi_provisioner;
 pub mod csi_topology;
+pub mod csr_cleaner;
 pub mod daemonset;
 pub mod deployment;
 pub mod dynamic_provisioner;
