@@ -48,20 +48,26 @@
 //!   `operation_executor.go` `GenerateMsg` (`:361`) / `generateVolumeMsg`
 //!   (`:320`); tests `reconciler_test.go` `Test_ReportMultiAttachError` (`:1279`).
 //!
-//! NOT ported (tracked on #3053): CSI migration of in-tree volumes, ephemeral
+//! - CSI migration (#3801): `util.go` `CreateVolumeSpecWithNodeMigration` (`:108`),
+//!   `translateInTreeSpecToCSIOnNodeIfNeeded` (`:251`), `isCSIMigrationSupportedOnNode`
+//!   (`:292`); `attach_detach_controller.go:722-735`; `csi_attacher.go:84-103`.
+//!
+//! NOT ported (tracked on #3053): ephemeral
 //! inline CSI volumes (never attachable, `CanAttach`).
 //! Off by default; enabled with `--attach-detach-controller`.
 
 use super::pv_binder::is_pod_terminated;
 use anyhow::Result;
 use futures::StreamExt;
+use rusternetes_common::csi_migration::{translate_in_tree_spec_to_csi, PluginManager, VolumeSpec};
+use rusternetes_common::csi_translation::CsiTranslator;
 use rusternetes_common::resources::csi::{
-    CSIDriver, VolumeAttachment, VolumeAttachmentSource, VolumeAttachmentSpec,
+    CSIDriver, CSINode, VolumeAttachment, VolumeAttachmentSource, VolumeAttachmentSpec,
 };
 use rusternetes_common::resources::node::AttachedVolume;
 use rusternetes_common::resources::service_account::ObjectReference;
 use rusternetes_common::resources::volume::{
-    PersistentVolumeAccessMode, PersistentVolumeClaimPhase,
+    PersistentVolumeAccessMode, PersistentVolumeClaimPhase, PersistentVolumeSpec,
 };
 use rusternetes_common::resources::{EventSource, EventType};
 use rusternetes_common::resources::{Node, PersistentVolume, PersistentVolumeClaim, Pod};
@@ -105,6 +111,67 @@ struct Wanted {
     scheduled_pods: Vec<ObjectReference>,
     /// `VolumeSpec.Name()` (the PV name), used in event messages.
     spec_name: String,
+    /// `spec.InlineVolumeSpecForCSIMigration`: the translated inline volume's
+    /// PV spec, which becomes the VolumeAttachment's `inlineVolumeSpec`
+    /// (`csi_attacher.go:84-92`).
+    inline_spec: Option<PersistentVolumeSpec>,
+}
+
+/// `v1.MigratedPluginsAnnotationKey` (`staging/src/k8s.io/api/core/v1/annotation_key_constants.go`).
+const MIGRATED_PLUGINS_ANNOTATION_KEY: &str = "storage.alpha.kubernetes.io/migrated-plugins";
+
+/// `isCSIMigrationSupportedOnNode` (`attachdetach/util/util.go:292-346`) after
+/// the plugin name is known. `csi_node` is the node's CSINode (`None` = the
+/// lister returned NotFound, which upstream returns as an error).
+fn migration_supported_on_node(
+    pm: &PluginManager,
+    plugin_name: &str,
+    csi_node: Option<&CSINode>,
+) -> Result<bool, String> {
+    if plugin_name.is_empty() {
+        // Could not find a plugin name from translation directory, assume not translated
+        return Ok(false);
+    }
+    if pm.is_migration_complete_for_plugin(plugin_name) {
+        // All nodes are expected to have migrated CSI plugin installed and
+        // configured when CSI Migration Complete flag is enabled for a plugin.
+        return Ok(true);
+    }
+    let node = csi_node.ok_or_else(|| "csinode not found".to_string())?;
+    let Some(ann) = node.metadata.annotations.as_ref() else {
+        return Ok(false);
+    };
+    let mpa = ann
+        .get(MIGRATED_PLUGINS_ANNOTATION_KEY)
+        .map(String::as_str)
+        .unwrap_or_default();
+    Ok(mpa.split(',').any(|t| t == plugin_name))
+}
+
+/// `translateInTreeSpecToCSIOnNodeIfNeeded` (`attachdetach/util/util.go:251-272`).
+fn translate_in_tree_spec_to_csi_on_node_if_needed(
+    spec: VolumeSpec,
+    csi_node: Option<&CSINode>,
+    pm: &PluginManager,
+    translator: &CsiTranslator,
+    pod_namespace: &str,
+) -> Result<VolumeSpec, String> {
+    if !pm.is_migratable(Some(&spec))? {
+        // Jump out of translation fast so we don't check the node if the spec itself is not migratable
+        return Ok(spec);
+    }
+    let plugin_name = translator
+        .get_in_tree_plugin_name_from_spec(spec.persistent_volume.as_ref(), spec.volume.as_ref())?;
+    if migration_supported_on_node(pm, &plugin_name, csi_node)? {
+        return translate_in_tree_spec_to_csi(&spec, pod_namespace, translator);
+    }
+    Ok(spec)
+}
+
+/// The CSI driver and volume handle of an attached volume.
+struct CsiRef {
+    driver: String,
+    handle: String,
 }
 
 fn pod_ref(pod: &Pod) -> ObjectReference {
@@ -192,6 +259,10 @@ pub struct AttachDetachController<S: Storage> {
     /// `MultiAttachErrorReported`: attachment names already reported. Pruned to
     /// the desired state each reconcile (upstream's flag lives on the DSW entry).
     multi_attach_reported: Mutex<HashSet<String>>,
+    /// `csiMigratedPluginManager` (`attach_detach_controller.go`).
+    plugin_manager: PluginManager,
+    /// `intreeToCSITranslator`.
+    translator: CsiTranslator,
 }
 
 impl<S: Storage + 'static> AttachDetachController<S> {
@@ -203,6 +274,8 @@ impl<S: Storage + 'static> AttachDetachController<S> {
             max_wait_for_unmount: DEFAULT_MAX_WAIT_FOR_UNMOUNT,
             disable_force_detach_on_timeout: false,
             detach_requested: Default::default(),
+            plugin_manager: PluginManager::new(),
+            translator: CsiTranslator::new(),
         }
     }
 
@@ -255,12 +328,16 @@ impl<S: Storage + 'static> AttachDetachController<S> {
     }
 
     /// `ProcessPodVolumes` over every active pod: the desired state of world.
+    #[allow(clippy::too_many_arguments)]
     fn desired(
         pods: &[Pod],
         pvcs: &[PersistentVolumeClaim],
         pvs: &HashMap<String, PersistentVolume>,
         drivers: &HashMap<String, CSIDriver>,
         nodes: &HashSet<String>,
+        csi_nodes: &HashMap<String, CSINode>,
+        pm: &PluginManager,
+        translator: &CsiTranslator,
     ) -> HashMap<String, Wanted> {
         let mut out = HashMap::new();
         for pod in pods {
@@ -283,40 +360,78 @@ impl<S: Storage + 'static> AttachDetachController<S> {
                 .into_iter()
                 .flatten()
             {
-                let claim = if let Some(p) = &vol.persistent_volume_claim {
-                    p.claim_name.clone()
+                // createInTreeVolumeSpec (util.go:36-85).
+                let (claim, read_only) = if let Some(p) = &vol.persistent_volume_claim {
+                    (Some(p.claim_name.clone()), p.read_only.unwrap_or(false))
                 } else if vol.ephemeral.is_some() {
                     // ephemeral.VolumeClaimName
-                    format!("{}-{}", pod.metadata.name, vol.name)
+                    (Some(format!("{}-{}", pod.metadata.name, vol.name)), false)
                 } else {
-                    continue; // inline CSI is never attachable (CanAttach)
+                    (None, false)
                 };
-                let Some(pvc) = pvcs.iter().find(|c| {
-                    c.metadata.name == claim && c.metadata.namespace.as_deref() == Some(ns)
-                }) else {
+                let spec = match claim {
+                    // "In-line volume": volume.NewSpecFromVolume.
+                    None => VolumeSpec {
+                        volume: Some(vol.clone()),
+                        ..Default::default()
+                    },
+                    Some(claim) => {
+                        let Some(pvc) = pvcs.iter().find(|c| {
+                            c.metadata.name == claim && c.metadata.namespace.as_deref() == Some(ns)
+                        }) else {
+                            continue;
+                        };
+                        // getPVCFromCache: Bound phase and non-empty volumeName.
+                        let bound = pvc.status.as_ref().map(|s| &s.phase)
+                            == Some(&PersistentVolumeClaimPhase::Bound);
+                        let Some(pv_name) = pvc.spec.volume_name.clone().filter(|n| !n.is_empty())
+                        else {
+                            continue;
+                        };
+                        if !bound {
+                            continue;
+                        }
+                        let Some(pv) = pvs.get(&pv_name) else {
+                            continue;
+                        };
+                        // getPVSpecFromCache: claimRef set and pointing at this claim.
+                        let uid_ok = pv.spec.claim_ref.as_ref().is_some_and(|r| {
+                            r.uid.as_deref().unwrap_or_default() == pvc.metadata.uid
+                        });
+                        if !uid_ok {
+                            continue;
+                        }
+                        VolumeSpec {
+                            persistent_volume: Some(pv.clone()),
+                            read_only,
+                            ..Default::default()
+                        }
+                    }
+                };
+                // CreateVolumeSpecWithNodeMigration (util.go:108-122): an
+                // error skips the volume ("Error processing volume for pod").
+                let spec = match translate_in_tree_spec_to_csi_on_node_if_needed(
+                    spec,
+                    csi_nodes.get(&node),
+                    pm,
+                    translator,
+                    ns,
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        debug!(
+                            "Error processing volume {} for pod {}/{ns}: {e}",
+                            vol.name, pod.metadata.name
+                        );
+                        continue;
+                    }
+                };
+                // FindAttachablePluginBySpec: only a CSI PV is attachable (an
+                // inline CSI volume is ephemeral, `CanAttach` is false).
+                let Some(pv) = spec.persistent_volume.as_ref() else {
                     continue;
                 };
-                // getPVCFromCache: Bound phase and non-empty volumeName.
-                let bound = pvc.status.as_ref().map(|s| &s.phase)
-                    == Some(&PersistentVolumeClaimPhase::Bound);
-                let Some(pv_name) = pvc.spec.volume_name.clone().filter(|n| !n.is_empty()) else {
-                    continue;
-                };
-                if !bound {
-                    continue;
-                }
-                let Some(pv) = pvs.get(&pv_name) else {
-                    continue;
-                };
-                // getPVSpecFromCache: claimRef set and pointing at this claim.
-                let uid_ok = pv
-                    .spec
-                    .claim_ref
-                    .as_ref()
-                    .is_some_and(|r| r.uid.as_deref().unwrap_or_default() == pvc.metadata.uid);
-                if !uid_ok {
-                    continue;
-                }
+                let pv_name = pv.metadata.name.clone();
                 let Some(csi) = pv.spec.csi.as_ref() else {
                     continue; // not a CSI volume
                 };
@@ -333,6 +448,9 @@ impl<S: Storage + 'static> AttachDetachController<S> {
                     .entry(attachment_name(&handle, &csi.driver, &node))
                     .or_insert_with(|| Wanted {
                         spec_name: pv_name.clone(),
+                        inline_spec: spec
+                            .inline_volume_spec_for_csi_migration
+                            .then(|| pv.spec.clone()),
                         pv_name,
                         driver: csi.driver.clone(),
                         handle,
@@ -451,6 +569,56 @@ impl<S: Storage + 'static> AttachDetachController<S> {
         );
     }
 
+    /// The CSI source an existing VolumeAttachment points at.
+    /// `populateActualStateOfWorld` (`attach_detach_controller.go:700-736`):
+    /// the PV is looked up by `source.persistentVolumeName`, and a PV whose
+    /// in-tree plugin is migrated is translated to CSI first
+    /// (`:722-735`, `podNamespace` is empty); a failed translation skips the
+    /// VolumeAttachment. Deviation: upstream skips inline-source
+    /// VolumeAttachments (its actual state of world is in memory and already
+    /// holds them); this controller is stateless, so it reads the CSI source
+    /// off `source.inlineVolumeSpec` to be able to detach them.
+    fn va_csi_ref(
+        &self,
+        va: &VolumeAttachment,
+        pvs: &HashMap<String, PersistentVolume>,
+    ) -> Option<CsiRef> {
+        if let Some(inline) = va.spec.source.inline_volume_spec.as_ref() {
+            let csi = inline.csi.as_ref()?;
+            return Some(CsiRef {
+                driver: csi.driver.clone(),
+                handle: csi.volume_handle.clone().unwrap_or_default(),
+            });
+        }
+        let pv = pvs.get(va.spec.source.persistent_volume_name.as_ref()?)?;
+        let mut spec = VolumeSpec {
+            persistent_volume: Some(pv.clone()),
+            ..Default::default()
+        };
+        if let Ok(name) = self
+            .translator
+            .get_in_tree_plugin_name_from_spec(Some(pv), None)
+        {
+            if self.plugin_manager.is_migration_enabled_for_plugin(&name) {
+                spec = match translate_in_tree_spec_to_csi(&spec, "", &self.translator) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(
+                            "Failed to translate intree volumeSpec to CSI volumeSpec for volume {name}: VolumeAttachment {}: {e}",
+                            va.metadata.name
+                        );
+                        return None;
+                    }
+                };
+            }
+        }
+        let csi = spec.persistent_volume?.spec.csi?;
+        Some(CsiRef {
+            driver: csi.driver,
+            handle: csi.volume_handle.unwrap_or_default(),
+        })
+    }
+
     pub async fn reconcile_all(&self) -> Result<()> {
         let pods: Vec<Pod> = self.storage.list(&build_prefix("pods", None)).await?;
         let pvcs: Vec<PersistentVolumeClaim> = self
@@ -471,6 +639,13 @@ impl<S: Storage + 'static> AttachDetachController<S> {
             .into_iter()
             .map(|d| (d.metadata.name.clone(), d))
             .collect();
+        let csi_nodes: HashMap<String, CSINode> = self
+            .storage
+            .list::<CSINode>(&build_prefix("csinodes", None))
+            .await?
+            .into_iter()
+            .map(|n| (n.metadata.name.clone(), n))
+            .collect();
         let node_list: Vec<Node> = self.storage.list(&build_prefix("nodes", None)).await?;
         let nodes: HashSet<String> = node_list.iter().map(|n| n.metadata.name.clone()).collect();
         let vas: Vec<VolumeAttachment> = self
@@ -478,47 +653,45 @@ impl<S: Storage + 'static> AttachDetachController<S> {
             .list(&build_prefix("volumeattachments", None))
             .await?;
 
-        let desired = Self::desired(&pods, &pvcs, &pvs, &drivers, &nodes);
+        let desired = Self::desired(
+            &pods,
+            &pvcs,
+            &pvs,
+            &drivers,
+            &nodes,
+            &csi_nodes,
+            &self.plugin_manager,
+            &self.translator,
+        );
 
         // Actual state: the VolumeAttachments this controller owns, i.e. whose
         // name is what Attach() would have generated for their own source.
-        let mut attached: Vec<(&VolumeAttachment, &PersistentVolume, String)> = vec![];
+        let mut attached: Vec<(&VolumeAttachment, CsiRef)> = vec![];
         for va in &vas {
-            let Some(pv) = va
-                .spec
-                .source
-                .persistent_volume_name
-                .as_ref()
-                .and_then(|n| pvs.get(n))
-            else {
+            let Some(r) = self.va_csi_ref(va, &pvs) else {
                 continue;
             };
-            let Some(csi) = pv.spec.csi.as_ref() else {
-                continue;
-            };
-            let handle = csi.volume_handle.clone().unwrap_or_default();
-            if va.metadata.name != attachment_name(&handle, &csi.driver, &va.spec.node_name) {
+            if va.metadata.name != attachment_name(&r.handle, &r.driver, &va.spec.node_name) {
                 continue;
             }
-            attached.push((va, pv, handle));
+            attached.push((va, r));
         }
 
         // The volumes each node reports as attached
         // (`GetVolumesToReportAttached`): every owned attachment not already
         // being deleted.
         let mut report: HashMap<String, BTreeSet<String>> = HashMap::new();
-        for (va, pv, handle) in &attached {
+        for (va, r) in &attached {
             if va.metadata.deletion_timestamp.is_none() {
-                let driver = pv.spec.csi.as_ref().map_or("", |c| c.driver.as_str());
                 report
                     .entry(va.spec.node_name.clone())
                     .or_default()
-                    .insert(unique_volume_name(driver, handle));
+                    .insert(unique_volume_name(&r.driver, &r.handle));
             }
         }
 
         // Detach first (reconciler.go:167-170).
-        for (va, pv, handle) in &attached {
+        for (va, r) in &attached {
             if desired.contains_key(&va.metadata.name) || va.metadata.deletion_timestamp.is_some() {
                 continue;
             }
@@ -555,8 +728,7 @@ impl<S: Storage + 'static> AttachDetachController<S> {
                         .any(|t| t.key == "node.kubernetes.io/out-of-service")
                 });
             // MountedByNode: node.status.volumesInUse (reconciler.go:231-239).
-            let driver = pv.spec.csi.as_ref().map_or("", |c| c.driver.as_str());
-            let unique = unique_volume_name(driver, handle);
+            let unique = unique_volume_name(&r.driver, &r.handle);
             let mounted = node
                 .and_then(|n| n.status.as_ref())
                 .and_then(|s| s.volumes_in_use.as_ref())
@@ -612,10 +784,10 @@ impl<S: Storage + 'static> AttachDetachController<S> {
 
         // attachDesiredVolumes (reconciler.go:319).
         let existing: HashSet<&str> = vas.iter().map(|v| v.metadata.name.as_str()).collect();
-        let mut attached_on: HashMap<&str, Vec<&str>> = HashMap::new();
-        for (va, pv, _) in &attached {
+        let mut attached_on: HashMap<String, Vec<&str>> = HashMap::new();
+        for (va, r) in &attached {
             attached_on
-                .entry(pv.metadata.name.as_str())
+                .entry(unique_volume_name(&r.driver, &r.handle))
                 .or_default()
                 .push(va.spec.node_name.as_str());
         }
@@ -636,7 +808,7 @@ impl<S: Storage + 'static> AttachDetachController<S> {
             }
             if !w.multi_attach
                 && attached_on
-                    .get(w.pv_name.as_str())
+                    .get(&unique_volume_name(&w.driver, &w.handle))
                     .is_some_and(|n| n.iter().any(|n| *n != w.node))
             {
                 let first = self
@@ -646,7 +818,7 @@ impl<S: Storage + 'static> AttachDetachController<S> {
                     .insert(name.clone());
                 if first {
                     let mut other_nodes: Vec<&str> = attached_on
-                        .get(w.pv_name.as_str())
+                        .get(&unique_volume_name(&w.driver, &w.handle))
                         .map(|n| n.iter().copied().filter(|n| *n != w.node).collect())
                         .unwrap_or_default();
                     other_nodes.sort();
@@ -665,8 +837,10 @@ impl<S: Storage + 'static> AttachDetachController<S> {
                     attacher: w.driver.clone(),
                     node_name: w.node.clone(),
                     source: VolumeAttachmentSource {
-                        persistent_volume_name: Some(w.pv_name.clone()),
-                        inline_volume_spec: None,
+                        // csi_attacher.go:84-103: an inline volume migrated to
+                        // CSI carries its translated PV spec, a PV its name.
+                        persistent_volume_name: w.inline_spec.is_none().then(|| w.pv_name.clone()),
+                        inline_volume_spec: w.inline_spec.clone(),
                     },
                 },
                 status: None,
@@ -720,7 +894,55 @@ impl<S: Storage + 'static> AttachDetachController<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::multi_attach_messages;
+    use super::{
+        migration_supported_on_node, multi_attach_messages, MIGRATED_PLUGINS_ANNOTATION_KEY,
+    };
+    use rusternetes_common::csi_migration::PluginManager;
+    use rusternetes_common::resources::csi::CSINode;
+
+    fn csi_node(ann: Option<&str>) -> CSINode {
+        let mut n: CSINode = serde_json::from_value(
+            serde_json::json!({"metadata": {"name": "n"}, "spec": {"drivers": []}}),
+        )
+        .unwrap();
+        if let Some(a) = ann {
+            n.metadata.annotations =
+                Some([(MIGRATED_PLUGINS_ANNOTATION_KEY.to_string(), a.to_string())].into());
+        }
+        n
+    }
+
+    /// `isCSIMigrationSupportedOnNode` (`attachdetach/util/util.go:292-346`):
+    /// complete plugins need no CSINode, others consult the annotation, a
+    /// missing CSINode is an error.
+    #[test]
+    fn migration_supported_on_node_matches_upstream() {
+        let pm = PluginManager::new();
+        let gce = "kubernetes.io/gce-pd";
+        assert_eq!(migration_supported_on_node(&pm, gce, None), Ok(true));
+        assert_eq!(migration_supported_on_node(&pm, "", None), Ok(false));
+        // Portworx migration enabled but not complete: the CSINode decides.
+        let px = "kubernetes.io/portworx-volume";
+        let mut pm = PluginManager::new();
+        pm.csi_migration_portworx = true;
+        assert!(migration_supported_on_node(&pm, px, None).is_err());
+        assert_eq!(
+            migration_supported_on_node(&pm, px, Some(&csi_node(None))),
+            Ok(false)
+        );
+        assert_eq!(
+            migration_supported_on_node(
+                &pm,
+                px,
+                Some(&csi_node(Some("a,kubernetes.io/portworx-volume")))
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            migration_supported_on_node(&pm, px, Some(&csi_node(Some("kubernetes.io/aws-ebs")))),
+            Ok(false)
+        );
+    }
 
     /// `Test_ReportMultiAttachError` (`reconciler_test.go:1279`): ns1/pod1 is
     /// the pod being attached, `others` use the volume on other nodes.
