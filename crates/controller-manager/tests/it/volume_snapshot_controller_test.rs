@@ -34,7 +34,7 @@ async fn create_test_pvc(
             meta
         },
         spec: PersistentVolumeClaimSpec {
-            access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
+            access_modes: Some(vec![PersistentVolumeAccessMode::ReadWriteOnce]),
             resources: ResourceRequirements {
                 limits: None,
                 requests: Some(requests),
@@ -379,7 +379,7 @@ async fn test_snapshot_without_bound_pvc_fails() {
             meta
         },
         spec: PersistentVolumeClaimSpec {
-            access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
+            access_modes: Some(vec![PersistentVolumeAccessMode::ReadWriteOnce]),
             resources: ResourceRequirements {
                 limits: None,
                 requests: Some(requests),

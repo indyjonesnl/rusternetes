@@ -27,7 +27,7 @@ fn pvc(storage: &str, mode: Option<PersistentVolumeMode>) -> PersistentVolumeCla
             // A real update target satisfies the create-time spec rules, which
             // `validate_persistent_volume_claim_update` re-runs (upstream
             // `ValidatePersistentVolumeClaimUpdate` calls `ValidatePersistentVolumeClaim`).
-            access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
+            access_modes: Some(vec![PersistentVolumeAccessMode::ReadWriteOnce]),
             resources: ResourceRequirements {
                 limits: None,
                 requests: Some(requests),
@@ -166,7 +166,7 @@ fn spec_change_access_modes_rejected() {
     // invalid-update-change-access-modes-on-bound-claim
     let old = pvc("1Gi", None);
     let mut new = pvc("1Gi", None);
-    new.spec.access_modes = vec![PersistentVolumeAccessMode::ReadOnlyMany];
+    new.spec.access_modes = Some(vec![PersistentVolumeAccessMode::ReadOnlyMany]);
     let errs = validate_persistent_volume_claim_update(&new, &old);
     let e = errs.iter().find(|e| e.field == "spec").expect("spec error");
     assert_eq!(e.error_type, ErrorType::Forbidden);
@@ -323,7 +323,7 @@ fn invalid_api_group_kept_when_old_object_has_it() {
 fn spec_immutable_error_carries_unified_diff() {
     let old = pvc("1Gi", None);
     let mut new = pvc("1Gi", None);
-    new.spec.access_modes = vec![PersistentVolumeAccessMode::ReadOnlyMany];
+    new.spec.access_modes = Some(vec![PersistentVolumeAccessMode::ReadOnlyMany]);
     let errs = validate_persistent_volume_claim_update(&new, &old);
     let e = errs.iter().find(|e| e.field == "spec").expect("spec error");
     assert_eq!(
@@ -336,7 +336,7 @@ fn spec_immutable_error_carries_unified_diff() {
 fn spec_immutable_diff_far_apart_changes_make_two_hunks() {
     let old = pvc("1Gi", None);
     let mut new = pvc("1Gi", None);
-    new.spec.access_modes = vec![PersistentVolumeAccessMode::ReadOnlyMany];
+    new.spec.access_modes = Some(vec![PersistentVolumeAccessMode::ReadOnlyMany]);
     new.spec.data_source = Some(TypedLocalObjectReference {
         api_group: Some("snapshot.storage.k8s.io".into()),
         kind: "VolumeSnapshot".into(),
@@ -373,4 +373,48 @@ fn spec_immutable_diff_renders_quantities_canonically() {
     );
     assert!(e.detail.contains("\"cpu\": \"1\""), "{}", e.detail);
     assert!(e.detail.contains("\"storage\": \"1Gi\""), "{}", e.detail);
+}
+
+/// A claim whose `spec.accessModes` is decoded from `mode` (`None` = key
+/// absent = Go nil slice; `Some([])` = Go empty non-nil slice).
+fn pvc_with_decoded_access_modes(mode: Option<serde_json::Value>) -> PersistentVolumeClaim {
+    let mut v = serde_json::to_value(pvc("1Gi", None)).unwrap();
+    let spec = v["spec"].as_object_mut().unwrap();
+    spec.remove("accessModes");
+    if let Some(m) = mode {
+        spec.insert("accessModes".into(), m);
+    }
+    serde_json::from_value(v).unwrap()
+}
+
+/// `json.MarshalIndent` of the internal spec renders a nil `AccessModes`
+/// as `null` and an empty one as `[]`, so `diff.Diff` shows the change
+/// (validation.go:2583-2584; types.go `PersistentVolumeClaimSpec.AccessModes`).
+#[test]
+fn spec_immutable_diff_distinguishes_nil_and_empty_access_modes() {
+    let old = pvc_with_decoded_access_modes(None);
+    let mut new = pvc_with_decoded_access_modes(Some(serde_json::json!([])));
+    new.spec.data_source = Some(TypedLocalObjectReference {
+        api_group: Some("snapshot.storage.k8s.io".into()),
+        kind: "VolumeSnapshot".into(),
+        name: "s".into(),
+    });
+    let errs = validate_persistent_volume_claim_update(&new, &old);
+    let e = errs.iter().find(|e| e.field == "spec").expect("spec error");
+    assert!(
+        e.detail
+            .contains("\n- \"AccessModes\": null,\n+ \"AccessModes\": [],\n"),
+        "{}",
+        e.detail
+    );
+}
+
+/// `apiequality.Semantic.DeepEqual` treats nil and empty slices as equal, so
+/// nil -> [] alone is not a spec change.
+#[test]
+fn nil_and_empty_access_modes_are_semantically_equal() {
+    let old = pvc_with_decoded_access_modes(None);
+    let new = pvc_with_decoded_access_modes(Some(serde_json::json!([])));
+    let errs = validate_persistent_volume_claim_update(&new, &old);
+    assert!(!errs.iter().any(|e| e.field == "spec"), "{errs:?}");
 }

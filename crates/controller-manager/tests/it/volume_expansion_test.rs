@@ -123,7 +123,7 @@ async fn create_bound_pvc(
             meta
         },
         spec: rusternetes_common::resources::PersistentVolumeClaimSpec {
-            access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
+            access_modes: Some(vec![PersistentVolumeAccessMode::ReadWriteOnce]),
             resources: ResourceRequirements {
                 requests: Some(requests),
                 limits: None,
@@ -302,7 +302,7 @@ async fn test_expansion_only_for_bound_pvcs() {
             meta
         },
         spec: rusternetes_common::resources::PersistentVolumeClaimSpec {
-            access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
+            access_modes: Some(vec![PersistentVolumeAccessMode::ReadWriteOnce]),
             resources: ResourceRequirements {
                 requests: Some(requests),
                 limits: None,

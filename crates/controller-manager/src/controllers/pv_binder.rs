@@ -1407,7 +1407,7 @@ impl<S: Storage + 'static> PVBinderController<S> {
         }
         if !pvc
             .spec
-            .access_modes
+            .access_modes_slice()
             .iter()
             .all(|m| pv.spec.access_modes.contains(m))
         {
@@ -1892,7 +1892,7 @@ impl<S: Storage + 'static> PVBinderController<S> {
         }
 
         // Check access modes - PV must support all modes requested by PVC
-        for pvc_mode in &pvc_spec.access_modes {
+        for pvc_mode in pvc_spec.access_modes_slice() {
             if !pv_spec.access_modes.contains(pvc_mode) {
                 return false;
             }
@@ -2466,7 +2466,7 @@ mod tests {
                 m
             },
             spec: PersistentVolumeClaimSpec {
-                access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
+                access_modes: Some(vec![PersistentVolumeAccessMode::ReadWriteOnce]),
                 resources: ResourceRequirements {
                     limits: None,
                     requests: Some(requests),

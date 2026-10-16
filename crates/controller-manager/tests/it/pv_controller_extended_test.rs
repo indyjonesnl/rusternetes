@@ -138,7 +138,7 @@ fn build_pvc(
             meta
         },
         spec: PersistentVolumeClaimSpec {
-            access_modes,
+            access_modes: Some(access_modes),
             resources: ResourceRequirements {
                 limits: None,
                 requests: Some(requests),
