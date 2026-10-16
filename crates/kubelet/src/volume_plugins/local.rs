@@ -1,3 +1,5 @@
+use crate::volume_plugins::metrics_statfs::MetricsStatFs;
+use crate::volume_plugins::plugin::{Metrics, MetricsProvider};
 use crate::volume_plugins::{
     Attributes, Mounter, ReconstructedVolume, Spec, Unmounter, VolumeHost, VolumePlugin,
 };
@@ -14,11 +16,33 @@ use std::sync::Arc;
 /// volume dir; like [`super::host_path::HostPathPlugin`] we hand the container
 /// runtime the host directory itself, so there is no mount to count refs of
 /// (`local.go:552-577`, `:619`).
+///
+/// The `MetricsProvider` embedded in `localVolume` (`local.go:500`) is
+/// `volume.NewMetricsStatFS` on the mounter (`local.go:140`) and nil on the
+/// unmounter (`local.go:148-157`), so only [`LocalMounter`] provides metrics.
 pub struct LocalPlugin {}
 
 impl LocalPlugin {
     pub fn new(_host: Arc<dyn VolumeHost>) -> Self {
         Self {}
+    }
+
+    /// `NewMounter` (`local.go:115-146`), returning the concrete mounter so
+    /// its embedded `MetricsProvider` stays reachable.
+    fn new_local_mounter(&self, spec: &Spec<'_>) -> Result<LocalMounter> {
+        let path = local_path(spec)
+            .ok_or_else(|| anyhow!("local plugin got a spec with no local source"))?;
+        Ok(LocalMounter {
+            path: path.to_string(),
+            read_only: spec.read_only,
+            // Upstream: `NewMetricsStatFS(GetPodVolumeDir(..))` (`local.go:140`),
+            // the pod volume dir that `SetUpAt` bind-mounts `globalPath` onto,
+            // i.e. `GetPath()` (`local.go:503-505`). Under the no-bind-mount
+            // deviation above `GetPath()` is the local path itself, so statfs
+            // it: the pod volume dir is never mounted here and would report
+            // the kubelet root filesystem instead of the volume's.
+            metrics: MetricsStatFs::new(path),
+        })
     }
 }
 
@@ -60,12 +84,7 @@ impl VolumePlugin for LocalPlugin {
 
     /// `NewMounter` (`local.go:138-169`).
     async fn new_mounter(&self, spec: &Spec<'_>, _pod: &Pod) -> Result<Box<dyn Mounter>> {
-        let path = local_path(spec)
-            .ok_or_else(|| anyhow!("local plugin got a spec with no local source"))?;
-        Ok(Box::new(LocalMounter {
-            path: path.to_string(),
-            read_only: spec.read_only,
-        }))
+        Ok(Box::new(self.new_local_mounter(spec)?))
     }
 
     fn new_unmounter(&self, _vol_name: &str, _pod_uid: &str) -> Result<Box<dyn Unmounter>> {
@@ -93,6 +112,14 @@ impl VolumePlugin for LocalPlugin {
 struct LocalMounter {
     path: String,
     read_only: bool,
+    /// Embedded `volume.MetricsProvider` (`local.go:500`, set at `:140`).
+    metrics: MetricsStatFs,
+}
+
+impl MetricsProvider for LocalMounter {
+    fn get_metrics(&self) -> Result<Metrics> {
+        self.metrics.get_metrics()
+    }
 }
 
 #[async_trait]
@@ -238,6 +265,31 @@ mod tests {
             read_only: false,
         };
         assert!(!plugin().can_support(&s));
+    }
+
+    /// `NewMounter` (`local.go:140`) embeds `volume.NewMetricsStatFS(..)`:
+    /// the mounter's metrics are the statfs of the volume's directory. An
+    /// absent directory is `FsInfoFailed`, like upstream's statfs error.
+    #[tokio::test]
+    async fn mounter_provides_statfs_metrics() {
+        use crate::volume_plugins::plugin::MetricsProvider;
+        let d = tmp("metrics").join("disk");
+        let v = claimed();
+        let pv = pv_local(d.to_str().unwrap());
+        let s = Spec {
+            volume: &v,
+            persistent_volume: Some(&pv),
+            read_only: false,
+        };
+        let m = plugin().new_local_mounter(&s).unwrap();
+
+        let err = m.get_metrics().unwrap_err();
+        assert!(err.to_string().starts_with("failed to get FsInfo"), "{err}");
+
+        std::fs::create_dir_all(&d).unwrap();
+        let got = m.get_metrics().unwrap();
+        assert!(got.capacity.unwrap().value() > 0);
+        assert!(got.available.unwrap().value() > 0);
     }
 
     /// `SetUpAt` (`local.go:620-624`): a read-write local volume gets
