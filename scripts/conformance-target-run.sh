@@ -32,6 +32,9 @@
 # Env: HYDROPHONE_TIMEOUT (seconds, default 14400; 0 = unbounded) bounds the
 #      hydrophone call; HYDROPHONE_KILL_AFTER (default 60) is the SIGKILL grace.
 #      A killed run still salvages junit and collects diagnostics (#1635).
+#      HYDROPHONE_DONE_POLL (seconds, default 60; 0 = off) polls the conformance
+#      pod's done marker; HYDROPHONE_DONE_GRACE (default 300) is how long
+#      hydrophone gets after it before being stopped and the junit salvaged (#3024).
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -290,6 +293,65 @@ salvage_junit_from_pod() {
     return 0
 }
 
+# done_marker_present <kubeconfig>
+# True once the conformance image has finished the suite and saved its results.
+# Its go-runner writes $RESULTS_DIR/done (default /tmp/results) after tarring the
+# results — "the file that signals to the Sonobuoy worker we are done"
+# (test/conformance/image/go-runner/const.go:23-25 doneFileName,
+# main.go:113-137 saveResults, deferred in configureAndRunWithEnv so it runs
+# whatever the suite's outcome). Hydrophone's pod mounts that volume into its
+# `sleep infinity` output-container too (hydrophone pkg/conformance/deploy.go),
+# which stays up after the suite exits, so that is where to look.
+done_marker_present() {
+    local kc="${1:-}" ns="${CONFORMANCE_NAMESPACE:-conformance}"
+    command -v kubectl >/dev/null 2>&1 || return 1
+    timeout 60 kubectl --kubeconfig "$kc" --request-timeout=30s -n "$ns" exec \
+        -c output-container e2e-conformance-test -- test -f /tmp/results/done \
+        >/dev/null 2>&1
+}
+
+# sleep_while_alive <pid> <seconds>: sleep up to <seconds>, one second at a
+# time; false as soon as <pid> is gone.
+sleep_while_alive() {
+    local pid="$1" n="$2" i
+    for ((i = 0; i < n; i++)); do
+        kill -0 "$pid" 2>/dev/null || return 1
+        sleep 1
+    done
+    kill -0 "$pid" 2>/dev/null
+}
+
+# stop_hydrophone_at_done <pid> <kubeconfig> <output-dir>   (#3024)
+# Hydrophone decides the suite is over only when its follow of the conformance
+# container's log hits EOF and the last 30 lines carry "Ginkgo ran N suite"
+# (hydrophone pkg/conformance/client/logs.go PrintE2ELogs + testsAreStillRunning);
+# it then copies the results out. When that follow wedges it never gets there
+# and the run burns all of HYDROPHONE_TIMEOUT (#1635). This watcher polls the
+# done marker every HYDROPHONE_DONE_POLL seconds (0 = off); once it is there it
+# gives hydrophone HYDROPHONE_DONE_GRACE seconds to finish on its own, then
+# stops it (TERM, KILL after HYDROPHONE_KILL_AFTER) and leaves
+# <output-dir>/.hydrophone-stopped-at-done so the caller salvages the junit.
+# A hydrophone that exits by itself is never touched.
+stop_hydrophone_at_done() {
+    local pid="$1" kc="$2" out="$3"
+    local poll="${HYDROPHONE_DONE_POLL:-60}" grace="${HYDROPHONE_DONE_GRACE:-300}"
+    local kill_after="${HYDROPHONE_KILL_AFTER:-60}"
+    [ "$poll" != "0" ] || return 0
+    while :; do
+        sleep_while_alive "$pid" "$poll" || return 0
+        done_marker_present "$kc" && break
+    done
+    echo "[conformance-target-run] done marker seen: the suite finished; giving hydrophone ${grace}s to collect results" >&2
+    sleep_while_alive "$pid" "$grace" || return 0
+    echo "[conformance-target-run] hydrophone still running ${grace}s after the done marker — stopping hydrophone" >&2
+    : > "$out/.hydrophone-stopped-at-done"
+    kill -TERM "$pid" 2>/dev/null || return 0
+    sleep_while_alive "$pid" "$kill_after" || return 0
+    pkill -KILL -P "$pid" 2>/dev/null || true
+    kill -KILL "$pid" 2>/dev/null || true
+    return 0
+}
+
 # ---------- arg parsing ----------
 TARGET=""; FOCUS=""; SKIP=""; FOCUS_OVERRIDDEN=0
 KUBECONFIG_PATH="${KUBECONFIG:-$HOME/.kube/rusternetes-config}"
@@ -398,13 +460,30 @@ else
         || die "coreutils 'timeout' not on PATH; install it or set HYDROPHONE_TIMEOUT=0 to run unbounded"
     hydro_bound=(timeout --signal=TERM --kill-after="$HYDROPHONE_KILL_AFTER" "$HYDROPHONE_TIMEOUT")
 fi
+# hydrophone runs in the background so the done-marker watcher (#3024) has its
+# pid; `tail --pid` mirrors run.log to stdout live, as the old `| tee` did, and
+# exits once hydrophone has and the file is drained.
+rm -f "$OUTPUT_DIR/.hydrophone-stopped-at-done"
+: > "$OUTPUT_DIR/run.log"
 set +e
-${hydro_bound[@]+"${hydro_bound[@]}"} "${hydro_cmd[@]}" 2>&1 | tee "$OUTPUT_DIR/run.log"
-hydro_exit=${PIPESTATUS[0]}
+${hydro_bound[@]+"${hydro_bound[@]}"} "${hydro_cmd[@]}" > "$OUTPUT_DIR/run.log" 2>&1 &
+hydro_pid=$!
+tail -n +1 -f --pid="$hydro_pid" "$OUTPUT_DIR/run.log" &
+tail_pid=$!
+stop_hydrophone_at_done "$hydro_pid" "$KUBECONFIG_PATH" "$OUTPUT_DIR" &
+watcher_pid=$!
+wait "$hydro_pid"
+hydro_exit=$?
+kill "$watcher_pid" 2>/dev/null
+wait "$watcher_pid" 2>/dev/null
+wait "$tail_pid" 2>/dev/null
 set -e
 
+if [ -e "$OUTPUT_DIR/.hydrophone-stopped-at-done" ]; then
+    echo "[conformance-target-run] target=$TARGET hydrophone stopped after the done marker (exit $hydro_exit) — salvaging results" >&2
+    salvage_junit_from_pod "$OUTPUT_DIR" "$KUBECONFIG_PATH"
 # 124 = TERM delivered by timeout; 137 = it had to SIGKILL (--kill-after).
-if [ "${#hydro_bound[@]}" -gt 0 ] && { [ "$hydro_exit" -eq 124 ] || [ "$hydro_exit" -eq 137 ]; }; then
+elif [ "${#hydro_bound[@]}" -gt 0 ] && { [ "$hydro_exit" -eq 124 ] || [ "$hydro_exit" -eq 137 ]; }; then
     echo "[conformance-target-run] target=$TARGET hydrophone timed out after ${HYDROPHONE_TIMEOUT}s (exit $hydro_exit) — salvaging results" >&2
     salvage_junit_from_pod "$OUTPUT_DIR" "$KUBECONFIG_PATH"
 fi
