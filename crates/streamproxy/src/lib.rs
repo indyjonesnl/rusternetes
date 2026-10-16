@@ -50,6 +50,18 @@ fn should_strip(name: &str, nominated: &[String]) -> bool {
     is_hop_by_hop(name) || nominated.iter().any(|n| n.eq_ignore_ascii_case(name))
 }
 
+/// A value kept alive for the whole life of an upgraded connection.
+///
+/// A caller that scopes something to the request (e.g. api-server's
+/// `RecordLongRunning` gauge, which upstream holds for the duration of the
+/// blocking `ServeHTTP` of the connect handler,
+/// `staging/src/k8s.io/apiserver/pkg/endpoints/handlers/rest.go:218`) inserts
+/// one as a request extension. `proxy_upgrade` returns the 101 immediately and
+/// splices in a detached task, so it moves a clone into that task: the value
+/// drops only when the spliced connection ends (or the handshake fails).
+#[derive(Clone)]
+pub struct ConnectionHold(pub std::sync::Arc<dyn std::any::Any + Send + Sync>);
+
 /// Upgrade-aware reverse proxy: forwards `req` to `target`, and on a backend
 /// 101 splices both upgraded byte streams. Mirrors apimachinery
 /// proxy.NewUpgradeAwareHandler(upgradeRequired=true).
@@ -59,6 +71,7 @@ pub async fn proxy_upgrade(target: Uri, req: Request) -> Response {
     //    Connection: Upgrade on an HTTP/1.1 connection.
     let (mut parts, body) = req.into_parts();
     let client_on_upgrade = parts.extensions.remove::<hyper::upgrade::OnUpgrade>();
+    let hold = parts.extensions.get::<ConnectionHold>().cloned();
 
     // If hyper never set up an upgrade future for this request, we cannot
     // splice the client side after a backend 101. Returning 101 anyway would
@@ -148,6 +161,7 @@ pub async fn proxy_upgrade(target: Uri, req: Request) -> Response {
 
         // Spawn the bidirectional splice task.
         tokio::spawn(async move {
+            let _hold = hold;
             match tokio::try_join!(client_on_upgrade, backend_on_upgrade) {
                 Ok((client_upgraded, backend_upgraded)) => {
                     let mut client_io = hyper_util::rt::TokioIo::new(client_upgraded);
