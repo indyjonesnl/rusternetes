@@ -211,6 +211,60 @@ fn device_field(name: &str) -> Option<Ty> {
 /// Offsets (in characters) of the `[` of every index operator and of every
 /// `.` of a selection or member call, in source order. A literal's `[`, a
 /// float's `.` and anything inside a string or comment is not one.
+/// The identifiers the cel-go standard library declares besides variables
+/// (`common/stdlib/standard.go:44-57`, `decls.TypeVariable`), plus the root
+/// `google` of `google.protobuf.Duration` / `Timestamp`, which the checker
+/// resolves as a qualified name (`checker.go:123-145`).
+fn is_declared_ident(name: &str) -> bool {
+    matches!(
+        name,
+        "bool"
+            | "bytes"
+            | "double"
+            | "int"
+            | "list"
+            | "map"
+            | "null_type"
+            | "string"
+            | "type"
+            | "uint"
+            | "google"
+    )
+}
+
+/// The character offset of the first occurrence of `name` as an identifier
+/// token: outside string literals, not a selected field (preceded by `.`) and
+/// not a called function (followed by `(`).
+fn ident_offset(source: &str, name: &str) -> Option<usize> {
+    let chars: Vec<char> = source.chars().collect();
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' || c == '"' {
+            i += 1;
+            while i < chars.len() && chars[i] != c {
+                i += if chars[i] == '\\' { 2 } else { 1 };
+            }
+            i += 1;
+        } else if word(c) {
+            let start = i;
+            while i < chars.len() && word(chars[i]) {
+                i += 1;
+            }
+            let tok: String = chars[start..i].iter().collect();
+            let prev = chars[..start].iter().rev().find(|c| !c.is_whitespace());
+            let next = chars[i..].iter().find(|c| !c.is_whitespace());
+            if tok == name && prev != Some(&'.') && next != Some(&'(') {
+                return Some(start);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
 fn operator_offsets(source: &str) -> (Vec<usize>, Vec<usize>) {
     let chars: Vec<char> = source.chars().collect();
     let mut brackets = Vec::new();
@@ -717,6 +771,16 @@ impl<'a> Checker<'a> {
                 } else if name == "device" {
                     Ty::Device
                 } else {
+                    // checker.go:116 `checkIdent`: an identifier that is no
+                    // variable of the environment, no comprehension / bind
+                    // variable and no standard type identifier.
+                    if !is_declared_ident(name) {
+                        let at = ident_offset(self.source, name);
+                        self.report(
+                            at,
+                            format!("undeclared reference to '{name}' (in container '')"),
+                        );
+                    }
                     Ty::Dyn
                 }
             }
@@ -854,7 +918,15 @@ impl<'a> Checker<'a> {
             return result;
         }
 
-        let target = c.target.as_ref().map(|t| self.infer(t, scope));
+        // A bare identifier receiver may name a function namespace
+        // (`math.greatest`, `base64.encode`): checker.go:230-282 resolves the
+        // qualified function name before the receiver, which needs the
+        // function declarations this pass does not have, so it is not
+        // reported as undeclared.
+        let target = c.target.as_ref().map(|t| match &t.expr {
+            Expr::Ident(n) if !scope.iter().any(|(s, _)| s == n) && n != "device" => Ty::Dyn,
+            _ => self.infer(t, scope),
+        });
         if c.target.is_some() {
             self.take_dot();
         }
@@ -1958,6 +2030,30 @@ mod tests {
             "{d}"
         );
         assert!(d.ends_with("^"), "{d}");
+    }
+
+    /// `checker.go:116` `checkIdent` -> `errors.go:83`.
+    #[test]
+    fn undeclared_identifier_is_a_compile_error() {
+        assert_eq!(
+            invalid("foo == 1").unwrap(),
+            "compilation failed: ERROR: <input>:1:1: undeclared reference to 'foo' (in container '')\n | foo == 1\n | ^"
+        );
+        let d = invalid("device.driver == 'a' && other.x").unwrap();
+        assert!(
+            d.contains("<input>:1:25: undeclared reference to 'other' (in container '')"),
+            "{d}"
+        );
+    }
+
+    #[test]
+    fn declared_identifiers_are_accepted() {
+        // device, comprehension variables, cel.bind variables, std type idents.
+        assert!(invalid("device.attributes['d'].exists(k, k == 'x')").is_none());
+        assert!(invalid("[1].all(x, x > 0) && device.driver == 'a'").is_none());
+        assert!(invalid("cel.bind(a, device.driver, a == 'x')").is_none());
+        assert!(invalid("type(1) == int && type('a') == string").is_none());
+        assert!(invalid("device.driver == 'foo' && 'x'.size() == 1").is_none());
     }
 
     #[test]
