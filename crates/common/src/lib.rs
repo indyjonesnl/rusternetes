@@ -16,6 +16,7 @@ pub mod cloud_provider;
 pub mod clusterauthenticationtrust;
 pub mod compat_version_metrics;
 pub mod compatibility;
+pub mod csi_migration;
 pub mod csi_translation;
 pub mod defaults;
 pub mod deletion;
