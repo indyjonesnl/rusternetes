@@ -129,6 +129,53 @@ async fn collect(router: axum::Router, uri: String, max: usize, deadline: Durati
     events
 }
 
+/// True for the `ADDED` envelope of the `default` object.
+fn is_default_added(e: &Value) -> bool {
+    e["type"] == "ADDED" && e["object"]["metadata"]["name"] == "default"
+}
+
+/// Read a watch stream until an envelope satisfies `until` (returned with
+/// everything before it) or `deadline` passes. Unlike [`collect`], success is
+/// decided by the event arriving, not by a short wall-clock window: under CPU
+/// contention (parallel test processes in CI) the concurrent creator's POST can
+/// itself take over a second to commit (observed 1.27s locally), and an
+/// assertion window that closes first reports a "lost" event that is only late.
+/// `deadline` is therefore a generous failure backstop, never the success path.
+async fn collect_until(
+    router: axum::Router,
+    uri: String,
+    until: fn(&Value) -> bool,
+    deadline: Duration,
+) -> Vec<Value> {
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(&uri)
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    let mut stream = resp.into_body().into_data_stream();
+    let mut buf = String::new();
+    let mut events = Vec::new();
+    let run = async {
+        while let Some(Ok(bytes)) = stream.next().await {
+            buf.push_str(&String::from_utf8_lossy(&bytes));
+            while let Some(i) = buf.find('\n') {
+                let line = buf[..i].to_string();
+                buf.drain(..=i);
+                if let Ok(v) = serde_json::from_str::<Value>(line.trim()) {
+                    let done = until(&v);
+                    events.push(v);
+                    if done {
+                        return;
+                    }
+                }
+            }
+        }
+    };
+    let _ = timeout(deadline, run).await;
+    events
+}
+
 struct Case {
     /// Collection path with `{ns}` already substituted (no query string).
     collection: String,
@@ -405,18 +452,22 @@ async fn rhino_sqlite_list_then_watch_never_loses_concurrent_default_sa() {
             .as_str()
             .unwrap()
             .to_string();
-        let events = collect(
-            router.clone(),
-            format!("{base}?watch=true&resourceVersion={rv}&{sel}&allowWatchBookmarks=true"),
-            3,
-            Duration::from_millis(700),
-        )
-        .await;
+        // Listed => nothing to deliver. Otherwise the watch must deliver the
+        // creator's ADDED; wait for it (see `collect_until`), not for a window.
+        let events = if listed {
+            Vec::new()
+        } else {
+            collect_until(
+                router.clone(),
+                format!("{base}?watch=true&resourceVersion={rv}&{sel}&allowWatchBookmarks=true"),
+                is_default_added,
+                Duration::from_secs(20),
+            )
+            .await
+        };
         let _ = creator.await;
         let _ = noise.await;
-        let seen = events
-            .iter()
-            .any(|e| e["type"] == "ADDED" && e["object"]["metadata"]["name"] == "default");
+        let seen = events.iter().any(is_default_added);
         if !listed && !seen {
             lost.push(format!("round {round}: list rv {rv}, events {events:?}"));
         }
@@ -460,17 +511,15 @@ async fn rhino_sqlite_watchlist_never_loses_concurrent_default_sa() {
             )
             .await
         });
-        let events = collect(
+        let events = collect_until(
             router.clone(),
             format!("{base}?watch=true&sendInitialEvents=true&resourceVersionMatch=NotOlderThan&allowWatchBookmarks=true&fieldSelector=metadata.name%3Ddefault"),
-            4,
-            Duration::from_millis(700),
+            is_default_added,
+            Duration::from_secs(20),
         )
         .await;
         let _ = creator.await;
-        let seen = events
-            .iter()
-            .any(|e| e["type"] == "ADDED" && e["object"]["metadata"]["name"] == "default");
+        let seen = events.iter().any(is_default_added);
         if !seen {
             lost.push(format!("round {round}: events {events:?}"));
         }
