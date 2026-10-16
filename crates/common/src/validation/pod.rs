@@ -4380,43 +4380,6 @@ pub fn validate_container_updates(
     (errs, false)
 }
 
-/// Stand-in for upstream's `diff.Diff(old, munged)` (a `cmp.Diff` rendering
-/// that Rust cannot reproduce byte for byte): one `path: -old +new` line per
-/// differing leaf.
-fn json_spec_diff(old: &serde_json::Value, new: &serde_json::Value) -> String {
-    fn walk(path: &str, a: &serde_json::Value, b: &serde_json::Value, out: &mut Vec<String>) {
-        use serde_json::Value;
-        match (a, b) {
-            (Value::Object(x), Value::Object(y)) => {
-                let mut keys: Vec<&String> = x.keys().chain(y.keys()).collect();
-                keys.sort();
-                keys.dedup();
-                for k in keys {
-                    let p = format!("{path}.{k}");
-                    match (x.get(k), y.get(k)) {
-                        (Some(l), Some(r)) => walk(&p, l, r, out),
-                        (l, r) => out.push(format!(
-                            "{p}: -{} +{}",
-                            l.map_or("<absent>".to_string(), |v| v.to_string()),
-                            r.map_or("<absent>".to_string(), |v| v.to_string())
-                        )),
-                    }
-                }
-            }
-            (Value::Array(x), Value::Array(y)) if x.len() == y.len() => {
-                for (i, (l, r)) in x.iter().zip(y).enumerate() {
-                    walk(&format!("{path}[{i}]"), l, r, out);
-                }
-            }
-            _ if a != b => out.push(format!("{path}: -{a} +{b}")),
-            _ => {}
-        }
-    }
-    let mut out = Vec::new();
-    walk("spec", old, new, &mut out);
-    out.join("\n")
-}
-
 /// Top-level immutability fence. Composes the four pre-checks above plus a
 /// munge+DeepEqual fence that catches any other forbidden field changes.
 /// Mirrors `ValidatePodUpdate` (validation.go:5695-5838).
@@ -4623,7 +4586,7 @@ pub fn validate_pod_spec_update(
             format!(
                 "pod updates may not change fields other than {}\n{}",
                 UPDATABLE_POD_SPEC_FIELDS.join(","),
-                json_spec_diff(&old_json, &munged_json),
+                crate::diff_schema::pod_spec_diff(&old_json, &munged_json),
             ),
         ));
     }
@@ -4966,6 +4929,47 @@ mod tests {
         let errs = validate_termination_grace_period_immutable(Some(30), Some(60), &p);
         assert_eq!(errs.len(), 1);
         assert!(errs[0].to_string().contains("field is immutable"));
+    }
+
+    /// validation.go:5830-5834: the forbidden error appends
+    /// `diff.Diff(oldPod.Spec, mungedPodSpec)` — a unified diff (context 3) of
+    /// `json.MarshalIndent` of the INTERNAL `core.PodSpec` (Go field names,
+    /// declaration order, nil pointers/slices as `null`, `SecurityContext`
+    /// always an object because the v1 conversion allocates it).
+    #[test]
+    fn pod_spec_update_forbidden_carries_diff_text() {
+        let spec = |node: &str| -> PodSpec {
+            serde_json::from_value(serde_json::json!({
+                "containers": [{"name": "c", "image": "i"}],
+                "restartPolicy": "Always",
+                "nodeName": node
+            }))
+            .unwrap()
+        };
+        let errs = validate_pod_spec_update(&spec("a"), &spec("b"), false);
+        let e = errs
+            .iter()
+            .find(|e| {
+                e.detail
+                    .starts_with("pod updates may not change fields other than")
+            })
+            .unwrap_or_else(|| panic!("{errs:?}"));
+        let want = format!(
+            "pod updates may not change fields other than {}\n{}",
+            UPDATABLE_POD_SPEC_FIELDS.join(","),
+            concat!(
+                "@@ -42,7 +42,7 @@\n",
+                "  \"NodeSelector\": null,\n",
+                "  \"ServiceAccountName\": \"\",\n",
+                "  \"AutomountServiceAccountToken\": null,\n",
+                "- \"NodeName\": \"a\",\n",
+                "+ \"NodeName\": \"b\",\n",
+                "  \"SecurityContext\": {\n",
+                "   \"HostNetwork\": false,\n",
+                "   \"HostPID\": false,\n",
+            )
+        );
+        assert_eq!(e.detail, want);
     }
 
     #[test]
