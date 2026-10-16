@@ -50,6 +50,7 @@ mod conformance_apimachinery_vap_apf_server;
 mod conformance_apimachinery_watch_chunking_gc;
 mod conformance_apimachinery_watch_concurrent_order;
 mod conformance_apps_daemonset_deployment_job_cronjob;
+mod conformance_apps_statefulset_controllerrevision;
 mod conformance_auth_rbac_serviceaccount;
 mod conformance_auth_serviceaccounts;
 mod conformance_cbor_codec_test;
