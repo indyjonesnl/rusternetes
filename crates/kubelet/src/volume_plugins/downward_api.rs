@@ -1,5 +1,5 @@
 use crate::volume_plugins::{Attributes, Mounter, Spec, VolumeHost, VolumePlugin};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use rusternetes_common::resources::{Pod, Volume};
 use std::collections::HashMap;
@@ -135,9 +135,6 @@ impl Mounter for DownwardApiMounter {
 
         let volume_dir = dir;
 
-        // Spec defaultMode, or 0644 (the API default; see `collect_data`).
-        let da_default_mode = downward_api.default_mode.unwrap_or(0o644);
-
         // `CollectData` runs BEFORE any write (`SetUpAt`, downwardapi.go),
         // so a bad item leaves the volume untouched.
         let items = downward_api.items.as_deref().unwrap_or(&[]);
@@ -145,7 +142,7 @@ impl Mounter for DownwardApiMounter {
             items,
             &self.pod,
             &self.node_allocatable,
-            da_default_mode as u32,
+            downward_api.default_mode,
         )?;
 
         // `volumeutil.NewAtomicWriter(dir, ctx).Write(data, setPerms)`
@@ -196,15 +193,20 @@ impl Mounter for DownwardApiMounter {
 /// `resourceFieldRef` still yields an (empty) entry: upstream never errors
 /// there (the API validation layer rejects it before it reaches the kubelet).
 ///
-/// Deliberate deviation: upstream errors with "no defaultMode used, not even
-/// the default value for it" when `defaultMode` is nil, because the API server
-/// has defaulted it. The caller here passes 0644 for that case.
+/// Like upstream, a nil `defaultMode` is an error ("no defaultMode used, not
+/// even the default value for it"): the API server
+/// (`SetDefaults_DownwardAPIVolumeSource`) and the static-pod decoder
+/// (`rusternetes_common::defaults::default_volume_source_modes`) default it.
 pub(crate) fn collect_data(
     items: &[rusternetes_common::resources::DownwardAPIVolumeFile],
     pod: &Pod,
     node_allocatable: &HashMap<String, String>,
-    default_mode: u32,
+    default_mode: Option<i32>,
 ) -> Result<std::collections::BTreeMap<String, crate::atomic_writer::FileProjection>> {
+    let Some(default_mode) = default_mode else {
+        bail!("no defaultMode used, not even the default value for it");
+    };
+    let default_mode = default_mode as u32;
     let mut errlist: Vec<String> = Vec::new();
     let mut data = std::collections::BTreeMap::new();
     for item in items {
@@ -333,7 +335,7 @@ mod tests {
         DownwardApiMounter {
             path: dir.to_string_lossy().into_owned(),
             volume: serde_json::from_value(
-                json!({"name": "podinfo", "downwardAPI": {"items": items}}),
+                json!({"name": "podinfo", "downwardAPI": {"items": items, "defaultMode": 420}}),
             )
             .unwrap(),
             pod: test_pod(),
@@ -350,7 +352,7 @@ mod tests {
                 {"path": "this//labels", "fieldRef": {"fieldPath": "metadata.labels"}}
             ]))
             .unwrap();
-        let data = collect_data(&items, &test_pod(), &HashMap::new(), 0o644).unwrap();
+        let data = collect_data(&items, &test_pod(), &HashMap::new(), Some(0o644)).unwrap();
         assert!(data.contains_key("this/labels"), "{:?}", data.keys());
     }
 
@@ -364,7 +366,7 @@ mod tests {
                 {"path": "b", "fieldRef": {"fieldPath": "metadata.bogusB"}}
             ]))
             .unwrap();
-        let err = collect_data(&items, &test_pod(), &HashMap::new(), 0o644)
+        let err = collect_data(&items, &test_pod(), &HashMap::new(), Some(0o644))
             .unwrap_err()
             .to_string();
         assert!(err.contains("bogusA") && err.contains("bogusB"), "{err}");
@@ -376,7 +378,7 @@ mod tests {
     fn collect_data_item_without_ref_is_an_empty_file() {
         let items: Vec<rusternetes_common::resources::DownwardAPIVolumeFile> =
             serde_json::from_value(json!([{"path": "empty", "mode": 256}])).unwrap();
-        let data = collect_data(&items, &test_pod(), &HashMap::new(), 0o644).unwrap();
+        let data = collect_data(&items, &test_pod(), &HashMap::new(), Some(0o644)).unwrap();
         assert_eq!(data["empty"].data, Vec::<u8>::new());
         assert_eq!(data["empty"].mode, 0o400);
     }
@@ -513,6 +515,28 @@ mod tests {
             read(tmp.path(), "labels"),
             "key1=\"value1\"\nkey3=\"value3\""
         );
+    }
+
+    // `CollectData`: `if defaultMode == nil { return nil, fmt.Errorf("no
+    // defaultMode used, not even the default value for it") }`. The API server
+    // (and the static-pod decoder) default it, so nil never reaches here.
+    #[tokio::test]
+    async fn set_up_nil_default_mode_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = DownwardApiMounter {
+            path: tmp.path().to_string_lossy().into_owned(),
+            volume: serde_json::from_value(json!({"name": "podinfo", "downwardAPI": {"items": [
+                {"path": "f", "fieldRef": {"fieldPath": "metadata.name"}}]}}))
+            .unwrap(),
+            pod: test_pod(),
+            node_allocatable: HashMap::new(),
+        };
+        let err = m.set_up().await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no defaultMode used, not even the default value for it"),
+            "{err:#}"
+        );
+        assert!(!tmp.path().join("f").exists());
     }
 
     // test_default_mode: verifyMode 0644 on the file.

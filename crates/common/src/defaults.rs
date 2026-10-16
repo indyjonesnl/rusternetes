@@ -28,6 +28,29 @@
 
 use crate::resources::pod::{Container, PodSpec};
 
+/// `SetDefaults_{Secret,ConfigMap,DownwardAPI,Projected}VolumeSource`
+/// (`pkg/apis/core/v1/defaults.go`): `defaultMode` is 0644 when unset.
+///
+/// Pod volumes that never pass through the api-server (static pods) need this
+/// applied by the kubelet's decoder, as upstream's `SetObjectDefaults_Pod` does.
+pub fn default_volume_source_modes(spec: &mut PodSpec) {
+    const DEFAULT_MODE: i32 = 0o644;
+    for vol in spec.volumes.iter_mut().flatten() {
+        if let Some(s) = vol.secret.as_mut() {
+            s.default_mode.get_or_insert(DEFAULT_MODE);
+        }
+        if let Some(c) = vol.config_map.as_mut() {
+            c.default_mode.get_or_insert(DEFAULT_MODE);
+        }
+        if let Some(d) = vol.downward_api.as_mut() {
+            d.default_mode.get_or_insert(DEFAULT_MODE);
+        }
+        if let Some(p) = vol.projected.as_mut() {
+            p.default_mode.get_or_insert(DEFAULT_MODE);
+        }
+    }
+}
+
 /// Default every missing container request from the matching limit, across
 /// `spec.containers` and `spec.initContainers`.
 ///
