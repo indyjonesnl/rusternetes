@@ -385,8 +385,11 @@ mod wire_format_coverage_test;
 mod workload_template_decodes_when_absent_test;
 mod workload_template_drop_disabled_test;
 
+mod conformance_apimachinery_aggregated_discovery;
+mod conformance_apimachinery_field_validation;
 mod conformance_node_lease;
 mod conformance_node_podtemplates;
+mod conformance_scheduling_priorityclass_endpoints;
 mod conformance_storage_csi_inline;
 mod conformance_storage_pv_status;
 mod conformance_storage_storageclass;
