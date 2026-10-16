@@ -13,8 +13,10 @@
 //! pkg/kubelet/volume_host.go:122).
 //!
 //! Deliberately not ported: health checks (`addHealthCheck`, used only by the PLEG), the
-//! container-manager soft requirements and shutdown-manager errors.
+//! container-manager soft requirements and shutdown-manager errors (no such
+//! managers exist in this kubelet yet).
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -178,16 +180,84 @@ fn aggregate(mut errs: Vec<String>) -> Option<String> {
     })
 }
 
+/// What [`set_ready_condition`] did, so the caller can persist and record.
+#[derive(Debug, PartialEq)]
+pub struct ReadyUpdate {
+    /// The condition changed in a way that must be persisted (anything but a
+    /// fresh heartbeat time).
+    pub changed: bool,
+    /// `needToRecordEvent` (setters.go:529-548): the `events.NodeReady` /
+    /// `events.NodeNotReady` reason to record through `recordNodeStatusEvent`.
+    /// Only set when an existing Ready condition flipped status; the initial
+    /// condition records no event upstream.
+    pub event: Option<&'static str>,
+}
+
+/// `events.NodeReady` / `events.NodeNotReady` (pkg/kubelet/events/event.go:57-58).
+pub const EVENT_NODE_READY: &str = "NodeReady";
+pub const EVENT_NODE_NOT_READY: &str = "NodeNotReady";
+
+/// `Kubelet.recordNodeStatusEvent` (kubelet_node_status.go:632-635): a Normal
+/// event on `nodeRef` (`kubelet.go:552`, no UID or namespace) with the message
+/// `Node %s status is now: %s`.
+pub async fn record_node_status_event(
+    recorder: &rusternetes_storage::EventRecorder<rusternetes_storage::StorageBackend>,
+    node_name: &str,
+    event: &str,
+) {
+    let node_ref = rusternetes_common::resources::ObjectReference {
+        api_version: Some("v1".to_string()),
+        kind: Some("Node".to_string()),
+        name: Some(node_name.to_string()),
+        namespace: Some(String::new()),
+        ..Default::default()
+    };
+    let source = rusternetes_common::resources::EventSource {
+        component: crate::events::KUBELET_COMPONENT.to_string(),
+        host: Some(node_name.to_string()),
+    };
+    if let Err(e) = recorder
+        .event(
+            &node_ref,
+            &source,
+            rusternetes_common::resources::EventType::Normal,
+            event,
+            &format!("Node {node_name} status is now: {event}"),
+        )
+        .await
+    {
+        tracing::warn!("failed to record node event {event}: {e}");
+    }
+}
+
 /// Port of `nodestatus.ReadyCondition` (setters.go:469-551) minus the
-/// container-manager/shutdown inputs. `errs` is the runtime/network/storage
-/// error list. Keeps `lastTransitionTime` while the status is unchanged.
-/// Returns true when the condition changed in a way that must be persisted
-/// (anything but a fresh heartbeat time).
+/// container-manager SoftRequirements and shutdown-manager inputs (this
+/// kubelet has neither). `errs` is the runtime/network/storage error list;
+/// the missing-capacity error (setters.go:491-504) is appended here from
+/// `capacity`, with `ephemeral-storage` required only under
+/// `local_storage_capacity_isolation`. Keeps `lastTransitionTime` while the
+/// status is unchanged.
 pub fn set_ready_condition(
     conditions: &mut Vec<NodeCondition>,
-    errs: Vec<String>,
+    capacity: Option<&HashMap<String, String>>,
+    mut errs: Vec<String>,
     now: DateTime<Utc>,
-) -> bool {
+    local_storage_capacity_isolation: bool,
+) -> ReadyUpdate {
+    let mut required = vec!["cpu", "memory", "pods"];
+    if local_storage_capacity_isolation {
+        required.push("ephemeral-storage");
+    }
+    let missing: Vec<&str> = required
+        .into_iter()
+        .filter(|r| !capacity.is_some_and(|c| c.contains_key(*r)))
+        .collect();
+    if !missing.is_empty() {
+        errs.push(format!(
+            "missing node capacity for resources: {}",
+            missing.join(", ")
+        ));
+    }
     let (status, reason, message) = match aggregate(errs) {
         Some(m) => ("False", "KubeletNotReady", m),
         None => (
@@ -207,14 +277,25 @@ pub fn set_ready_condition(
     if let Some(old) = conditions.iter_mut().find(|c| c.condition_type == "Ready") {
         let changed =
             old.status != new.status || old.reason != new.reason || old.message != new.message;
-        if old.status == new.status {
+        let flipped = old.status != new.status;
+        if !flipped {
             new.last_transition_time = old.last_transition_time;
         }
         *old = new;
-        changed
+        ReadyUpdate {
+            changed,
+            event: flipped.then_some(if status == "True" {
+                EVENT_NODE_READY
+            } else {
+                EVENT_NODE_NOT_READY
+            }),
+        }
     } else {
         conditions.push(new);
-        true
+        ReadyUpdate {
+            changed: true,
+            event: None,
+        }
     }
 }
 
@@ -330,26 +411,201 @@ mod tests {
         assert_eq!(s.runtime_errors(), None);
     }
 
+    fn cap(keys: &[&str]) -> HashMap<String, String> {
+        keys.iter()
+            .map(|k| (k.to_string(), "1".to_string()))
+            .collect()
+    }
+    fn full() -> HashMap<String, String> {
+        cap(&["cpu", "memory", "pods", "ephemeral-storage"])
+    }
+    fn cond(ready: bool, msg: &str, transition: DateTime<Utc>, hb: DateTime<Utc>) -> NodeCondition {
+        NodeCondition {
+            condition_type: "Ready".into(),
+            status: if ready { "True" } else { "False" }.into(),
+            last_heartbeat_time: Some(hb),
+            last_transition_time: Some(transition),
+            reason: Some(
+                if ready {
+                    "KubeletReady"
+                } else {
+                    "KubeletNotReady"
+                }
+                .into(),
+            ),
+            message: Some(msg.into()),
+        }
+    }
+
+    type ReadyCase = (
+        &'static str,
+        Option<HashMap<String, String>>,
+        Vec<NodeCondition>,
+        Vec<String>,
+        bool,
+        NodeCondition,
+        Option<&'static str>,
+    );
+
+    /// `TestReadyCondition` (nodestatus/setters_test.go:1188), the cases that
+    /// do not need a container manager or shutdown manager.
+    #[test]
+    fn ready_condition_cases() {
+        let now = Utc::now();
+        let before = now - chrono::Duration::seconds(1);
+        let ok = "kubelet is posting ready status";
+        let cases: Vec<ReadyCase> = vec![
+            (
+                "new, ready",
+                Some(full()),
+                vec![],
+                vec![],
+                true,
+                cond(true, ok, now, now),
+                None,
+            ),
+            (
+                "new, not ready: storage errors",
+                Some(full()),
+                vec![],
+                vec!["some storage error".into()],
+                true,
+                cond(false, "some storage error", now, now),
+                None,
+            ),
+            (
+                "new, not ready: runtime and network errors",
+                Some(full()),
+                vec![],
+                vec!["runtime".into(), "network".into()],
+                true,
+                cond(false, "[runtime, network]", now, now),
+                None,
+            ),
+            (
+                "new, not ready: missing capacities",
+                None,
+                vec![],
+                vec![],
+                true,
+                cond(
+                    false,
+                    "missing node capacity for resources: cpu, memory, pods, ephemeral-storage",
+                    now,
+                    now,
+                ),
+                None,
+            ),
+            (
+                "new, not ready: errors and missing capacities aggregate",
+                Some(cap(&["cpu", "memory", "pods"])),
+                vec![],
+                vec!["runtime".into()],
+                true,
+                cond(
+                    false,
+                    "[runtime, missing node capacity for resources: ephemeral-storage]",
+                    now,
+                    now,
+                ),
+                None,
+            ),
+            (
+                "new, ready: localStorageCapacityIsolation is not supported",
+                Some(cap(&["cpu", "memory", "pods"])),
+                vec![],
+                vec![],
+                false,
+                cond(true, ok, now, now),
+                None,
+            ),
+            (
+                "transition to ready",
+                Some(full()),
+                vec![cond(false, "", before, before)],
+                vec![],
+                true,
+                cond(true, ok, now, now),
+                Some("NodeReady"),
+            ),
+            (
+                "transition to not ready",
+                Some(full()),
+                vec![cond(true, "", before, before)],
+                vec!["foo".into()],
+                true,
+                cond(false, "foo", now, now),
+                Some("NodeNotReady"),
+            ),
+            (
+                "ready, no transition",
+                Some(full()),
+                vec![cond(true, "", before, before)],
+                vec![],
+                true,
+                cond(true, ok, before, now),
+                None,
+            ),
+            (
+                "not ready, no transition",
+                Some(full()),
+                vec![cond(false, "", before, before)],
+                vec!["foo".into()],
+                true,
+                cond(false, "foo", before, now),
+                None,
+            ),
+        ];
+        for (desc, capacity, mut conds, errs, isolation, want, want_event) in cases {
+            let upd = set_ready_condition(&mut conds, capacity.as_ref(), errs, now, isolation);
+            assert_eq!(
+                serde_json::to_value(&conds).unwrap(),
+                serde_json::to_value(vec![want]).unwrap(),
+                "{desc}"
+            );
+            assert_eq!(upd.event, want_event, "{desc}");
+        }
+    }
+
     #[test]
     fn ready_condition_flips_and_preserves_transition_time() {
         let t0 = Utc::now() - chrono::Duration::seconds(100);
         let t1 = Utc::now();
+        let c = full();
         let mut conds = Vec::new();
-        assert!(set_ready_condition(&mut conds, vec![], t0));
+        assert!(set_ready_condition(&mut conds, Some(&c), vec![], t0, true).changed);
         assert_eq!(conds[0].status, "True");
         // Same status: transition time preserved, heartbeat advances.
-        assert!(!set_ready_condition(&mut conds, vec![], t1));
+        assert!(!set_ready_condition(&mut conds, Some(&c), vec![], t1, true).changed);
         assert_eq!(conds[0].last_transition_time, Some(t0));
         assert_eq!(conds[0].last_heartbeat_time, Some(t1));
         // Failure flips to False with the aggregate message.
-        assert!(set_ready_condition(
-            &mut conds,
-            vec!["a".into(), "b".into()],
-            t1
-        ));
+        assert!(
+            set_ready_condition(&mut conds, Some(&c), vec!["a".into(), "b".into()], t1, true)
+                .changed
+        );
         assert_eq!(conds[0].status, "False");
         assert_eq!(conds[0].reason.as_deref(), Some("KubeletNotReady"));
         assert_eq!(conds[0].message.as_deref(), Some("[a, b]"));
         assert_eq!(conds[0].last_transition_time, Some(t1));
+    }
+
+    /// `recordNodeStatusEvent` (kubelet_node_status.go:632): a Normal
+    /// `NodeNotReady` event on the Node with "Node %s status is now: %s".
+    #[tokio::test]
+    async fn node_status_event_is_recorded_on_the_node() {
+        use rusternetes_storage::Storage;
+        let storage = std::sync::Arc::new(rusternetes_storage::StorageBackend::new_memory());
+        let recorder = rusternetes_storage::EventRecorder::new(std::sync::Arc::clone(&storage));
+        record_node_status_event(&recorder, "node-1", EVENT_NODE_NOT_READY).await;
+        let evs: Vec<rusternetes_common::resources::Event> =
+            storage.list("/registry/events/").await.unwrap();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].reason, "NodeNotReady");
+        assert_eq!(evs[0].message, "Node node-1 status is now: NodeNotReady");
+        assert_eq!(evs[0].involved_object.kind.as_deref(), Some("Node"));
+        assert_eq!(evs[0].involved_object.name.as_deref(), Some("node-1"));
+        assert_eq!(evs[0].source.component, "kubelet");
+        assert_eq!(evs[0].source.host.as_deref(), Some("node-1"));
     }
 }
