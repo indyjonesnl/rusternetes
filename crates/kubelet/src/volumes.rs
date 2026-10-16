@@ -698,31 +698,96 @@ impl VolumeManager {
             if held.contains(&key) || desired.contains(&key) {
                 continue;
             }
-            // `GenerateUnmountDeviceFunc` (`operation_generator.go:846-856`):
-            // refuse to unstage while another mount still references the
-            // device mount path; the failure is retried on the next sync.
-            let device_mount_path = device_path.to_string_lossy();
-            let refs =
-                crate::volume_plugins::plugin::DeviceMountableVolumePlugin::get_device_mount_refs(
-                    self.csi_plugin.as_ref(),
-                    &device_mount_path,
-                );
-            if let Err(e) =
-                crate::volume_plugins::util::check_device_mount_refs(&device_mount_path, refs)
-            {
+            self.unmount_device(&key.1, &device_path).await;
+        }
+    }
+
+    /// `operationExecutor.UnmountDevice(attachedVolume.AttachedVolume,
+    /// actualStateOfWorld, hostutil)` (`operation_executor.go`, called from
+    /// `unmountDetachDevices`, `reconciler_common.go:296-306`):
+    /// `GenerateUnmountDeviceFunc` then run its operation.
+    ///
+    /// The kubelet keeps no `ActualStateOfWorld` yet (#1970); upstream's
+    /// reconstruction (`reconciler/reconstruct.go`) would have put this
+    /// device into it as attached and globally mounted. A transient one holding
+    /// just this volume, populated the same way, stands in, so
+    /// `MarkDeviceAsUncertain` / `MarkDeviceAsUnmounted` have the entry they
+    /// act on. The node name is not known to the manager, so the operation's
+    /// messages carry an empty one. A failure is logged and retried on the
+    /// next sync, as the reconciler does.
+    async fn unmount_device(&self, volume_handle: &str, device_mount_path: &std::path::Path) {
+        use crate::volume_manager::cache::actual_state_of_world::ActualStateOfWorld;
+        use crate::volume_plugins::plugin::OwnedSpec;
+        use crate::volume_plugins::util::operation_executor::AttachedVolume;
+        use crate::volume_plugins::util::operation_generator::generate_unmount_device_func;
+
+        let plugin_name = crate::pod_dirs::plugin::CSI;
+        let device_mount_path_str = device_mount_path.to_string_lossy().to_string();
+        let Ok(plugin) = self.plugin_mgr.find_plugin_by_name(plugin_name) else {
+            return;
+        };
+        // `ConstructVolumeSpec` over the volume directory holding `vol_data.json`.
+        let Some(data_dir) = device_mount_path.parent() else {
+            return;
+        };
+        let reconstructed = match plugin.construct_volume_spec("", &data_dir.to_string_lossy()) {
+            Ok(r) => r,
+            Err(e) => {
                 warn!(
-                    "UnmountDevice of {} ({}) skipped: GetDeviceMountRefs check failed: {e:#}",
-                    key.1, device_mount_path
+                    "Cannot reconstruct the spec of staged device {device_mount_path_str}: {e:#}"
                 );
-                continue;
+                return;
             }
-            if let Err(e) = self.csi_plugin.unmount_device(&device_path).await {
-                warn!(
-                    "CSI UnmountDevice of {} ({}) failed: {e:#}",
-                    key.1,
-                    device_path.display()
-                );
+        };
+        let spec = Arc::new(OwnedSpec {
+            volume: reconstructed.volume,
+            persistent_volume: reconstructed.persistent_volume,
+            read_only: false,
+        });
+        let volume_name = match crate::volume_plugins::util::get_unique_volume_name_from_spec(
+            plugin,
+            &spec.as_spec(),
+        ) {
+            Ok(n) => n,
+            Err(e) => {
+                warn!("Cannot name staged device {device_mount_path_str}: {e}");
+                return;
             }
+        };
+        let asw = ActualStateOfWorld::new("", Arc::clone(&self.plugin_mgr));
+        if let Err(e) = asw
+            .mark_volume_as_attached(Some(&volume_name), Arc::clone(&spec), "", "")
+            .and_then(|()| asw.mark_device_as_mounted(&volume_name, "", &device_mount_path_str, ""))
+        {
+            warn!("Cannot record staged device {device_mount_path_str}: {e}");
+            return;
+        }
+        let device_to_detach = AttachedVolume {
+            volume_name,
+            volume_spec: spec,
+            node_name: String::new(),
+            plugin_is_attachable: false,
+            device_path: String::new(),
+            device_mount_path: device_mount_path_str.clone(),
+            plugin_name: plugin_name.to_string(),
+            selinux_mount_context: String::new(),
+        };
+        let hostutil = crate::volume_plugins::util::hostutil::HostUtil;
+        let op = match generate_unmount_device_func(
+            &self.plugin_mgr,
+            &device_to_detach,
+            &asw,
+            &hostutil,
+        ) {
+            Ok(op) => op,
+            Err(e) => {
+                warn!("UnmountDevice of {volume_handle} ({device_mount_path_str}): {e:#}");
+                return;
+            }
+        };
+        let ctx = op.run().await;
+        if let Some(e) = ctx.detailed_err {
+            warn!("UnmountDevice of {volume_handle} ({device_mount_path_str}) failed: {e:#}");
         }
     }
 

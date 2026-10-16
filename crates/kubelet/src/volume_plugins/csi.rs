@@ -1,6 +1,6 @@
 use super::csi_client::{CsiDriverClient, CsiError};
 use crate::volume_plugins::plugin::{
-    DeviceMountableVolumePlugin, DeviceMounter, DeviceMounterArgs,
+    DeviceMountableVolumePlugin, DeviceMounter, DeviceMounterArgs, DeviceUnmounter,
 };
 use crate::volume_plugins::{
     Attributes, Mounter, ReconstructedVolume, Spec, Unmounter, VolumeHost, VolumePlugin,
@@ -437,6 +437,14 @@ impl CsiPlugin {
     /// A missing data file means the device was never staged here: skipped. A
     /// driver that is not registered is a transient failure (kubernetes#120268).
     pub async fn unmount_device(&self, device_mount_path: &Path) -> Result<()> {
+        Self::unmount_device_at(device_mount_path).await
+    }
+
+    /// [`Self::unmount_device`] without a plugin: the body of
+    /// `csiAttacher.UnmountDevice` reads nothing from the attacher but the
+    /// path, so the [`DeviceUnmounter`] that `NewDeviceUnmounter` returns
+    /// shares it.
+    pub(crate) async fn unmount_device_at(device_mount_path: &Path) -> Result<()> {
         let data_dir = device_mount_path
             .parent()
             .ok_or_else(|| anyhow!("device mount path {device_mount_path:?} has no parent"))?;
@@ -787,6 +795,23 @@ impl DeviceMountableVolumePlugin for CsiPlugin {
         }))
     }
 
+    /// `NewDeviceUnmounter` (`csi_plugin.go:717-719`).
+    ///
+    /// ```go
+    /// func (p *csiPlugin) NewDeviceUnmounter() (volume.DeviceUnmounter, error) {
+    ///     return p.NewDetacher()
+    /// }
+    /// ```
+    ///
+    /// `NewDetacher` is `newAttacherDetacher` (`csi_plugin.go:671-673`), the
+    /// same `csiAttacher` `NewDeviceMounter` builds.
+    fn new_device_unmounter(&self) -> Result<Box<dyn DeviceUnmounter>> {
+        Ok(Box::new(CsiAttacher {
+            storage: self.host.get_kube_client().cloned(),
+            plugin_dir: plugin_dir(self.host.get_volumes_base_path()),
+        }))
+    }
+
     /// `GetDeviceMountRefs` (`csi_plugin.go:721-727`).
     ///
     /// ```go
@@ -810,6 +835,15 @@ fn pv_source_from_spec<'a>(
     spec.persistent_volume
         .and_then(|pv| pv.spec.csi.as_ref())
         .ok_or_else(|| anyhow!("volume source not found in volume.Spec"))
+}
+
+#[async_trait]
+impl DeviceUnmounter for CsiAttacher {
+    /// `csiAttacher.UnmountDevice` (`csi_attacher.go:526-590`); see
+    /// [`CsiPlugin::unmount_device`].
+    async fn unmount_device(&self, device_mount_path: &str) -> Result<()> {
+        CsiPlugin::unmount_device_at(Path::new(device_mount_path)).await
+    }
 }
 
 #[async_trait]

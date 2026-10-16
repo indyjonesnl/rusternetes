@@ -292,6 +292,59 @@ pub struct AttachedVolume {
     pub selinux_mount_context: String,
 }
 
+impl AttachedVolume {
+    fn detail_str(&self) -> String {
+        format!(
+            "(UniqueName: {:?}) on node {:?}",
+            self.volume_name.0, self.node_name
+        )
+    }
+
+    /// Port of `AttachedVolume.GenerateMsgDetailed`
+    /// (`operation_executor.go:576-583`). Upstream's `VolumeSpec` may be nil
+    /// (`"nil"`); ours never is.
+    pub fn generate_msg_detailed(&self, prefix_msg: &str, suffix_msg: &str) -> String {
+        generate_volume_msg_detailed(
+            prefix_msg,
+            suffix_msg,
+            &self.volume_spec.volume.name,
+            &self.detail_str(),
+        )
+    }
+
+    /// Port of `AttachedVolume.GenerateMsg` (`operation_executor.go:586-593`),
+    /// over `generateVolumeMsg` (`:320-323`): the simple message is for
+    /// events, the detailed one for logs.
+    pub fn generate_msg(&self, prefix_msg: &str, suffix_msg: &str) -> (String, String) {
+        let simple = format!(
+            "{prefix_msg} for volume {:?} {suffix_msg}",
+            self.volume_spec.volume.name
+        );
+        (simple, self.generate_msg_detailed(prefix_msg, suffix_msg))
+    }
+
+    /// Port of `AttachedVolume.GenerateErrorDetailed`
+    /// (`operation_executor.go:596-598`). `err` is `None` for Go's nil error.
+    pub fn generate_error_detailed(
+        &self,
+        prefix_msg: &str,
+        err: Option<&anyhow::Error>,
+    ) -> anyhow::Error {
+        anyhow::anyhow!(self.generate_msg_detailed(prefix_msg, &err_suffix(err)))
+    }
+
+    /// Port of `AttachedVolume.GenerateError` (`operation_executor.go:601-604`):
+    /// `(simpleErr, detailedErr)`.
+    pub fn generate_error(
+        &self,
+        prefix_msg: &str,
+        err: &anyhow::Error,
+    ) -> (anyhow::Error, anyhow::Error) {
+        let (simple, detailed) = self.generate_msg(prefix_msg, &err_suffix(Some(err)));
+        (anyhow::anyhow!(simple), anyhow::anyhow!(detailed))
+    }
+}
+
 /// Port of `operationexecutor.MountedVolume`
 /// (`operation_executor.go:634-715`) — a volume that has been mounted to a
 /// pod.

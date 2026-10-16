@@ -332,6 +332,11 @@ impl super::plugin::DeviceMountableVolumePlugin for IscsiPlugin {
         Ok(Box::new(self.new_attacher_internal()))
     }
 
+    /// `NewDeviceUnmounter` (`attacher.go:163-165`): `plugin.NewDetacher()`.
+    fn new_device_unmounter(&self) -> Result<Box<dyn super::plugin::DeviceUnmounter>> {
+        Ok(Box::new(self.new_attacher_internal()))
+    }
+
     /// `GetDeviceMountRefs` (`attacher.go:65-68`).
     ///
     /// ```go

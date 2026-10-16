@@ -16,18 +16,20 @@ use crate::volume_manager::cache::desired_state_of_world::{
     desired_size_limit, effective_selinux_mount_label, get_selinux_label,
 };
 use crate::volume_plugins::plugin::{
-    DeviceMounterArgs, NodeExpandableVolumePlugin, NodeResizeOptions, Spec,
+    DeviceMountableVolumePlugin, DeviceMounter, DeviceMounterArgs, DeviceUnmounter,
+    NodeExpandableVolumePlugin, NodeResizeOptions, Spec,
 };
 use crate::volume_plugins::registry::VolumePluginMgr;
-use crate::volume_plugins::util::fs_group_from;
+use crate::volume_plugins::util::hostutil::HostUtils;
 use crate::volume_plugins::util::node_expander::{
     pvc_object_reference, record_event, NodeExpander, NodeResizeOperationOpts,
 };
-use crate::volume_plugins::util::operation_executor::VolumeToMount;
+use crate::volume_plugins::util::operation_executor::{AttachedVolume, VolumeToMount};
 use crate::volume_plugins::util::resize_util::{self, RESOURCE_STORAGE};
 use crate::volume_plugins::util::types::{
-    is_failed_precondition_error, is_operation_not_supported_error,
+    is_failed_precondition_error, is_operation_not_supported_error, OperationContext,
 };
+use crate::volume_plugins::util::{check_device_mount_refs, fs_group_from};
 use anyhow::{anyhow, Error};
 use rusternetes_common::quantity::{Format, Quantity};
 use rusternetes_common::resources::volume::{PersistentVolume, PersistentVolumeClaim};
@@ -537,6 +539,242 @@ pub async fn mount_volume_with_attributes(
         )?)
         .await?;
     Ok((mounter.get_path(), mounter.get_attributes()))
+}
+
+/// The operation `GenerateUnmountDeviceFunc` returns
+/// (`operation_generator.go:807-905`), i.e. the `GeneratedOperations` with
+/// `OperationName: "unmount_device"` and the `OperationFunc` closure
+/// ([`Self::run`]).
+///
+/// Not ported: `CompleteFunc` (`util.OperationCompleteHook`, the per-operation
+/// metrics hook) and `EventRecorderFunc` (nil upstream too): the kubelet has no
+/// operation executor yet to consume either (#1970).
+pub struct GeneratedUnmountDevice<'a> {
+    /// `OperationName`.
+    pub operation_name: &'static str,
+    device_mountable_volume_plugin: &'a dyn DeviceMountableVolumePlugin,
+    volume_device_unmounter: Box<dyn DeviceUnmounter>,
+    volume_device_mounter: Box<dyn DeviceMounter>,
+    device_to_detach: &'a AttachedVolume,
+    actual_state_of_world: &'a ActualStateOfWorld,
+    hostutil: &'a dyn HostUtils,
+}
+
+/// Port of `operationGenerator.GenerateUnmountDeviceFunc`
+/// (`operation_generator.go:807-905`): find the `DeviceMountableVolumePlugin`
+/// by name, take its `DeviceUnmounter` and `DeviceMounter`, and return the
+/// operation that unstages the device.
+///
+/// A free function over the plugin manager rather than a method of
+/// [`OperationGenerator`]: the generator's client and recorder are unused by
+/// this operation. `getMigratedStatusBySpec` (`:2222`) is always false here —
+/// there is no in-tree-to-CSI migration.
+pub fn generate_unmount_device_func<'a>(
+    mgr: &'a VolumePluginMgr,
+    device_to_detach: &'a AttachedVolume,
+    actual_state_of_world: &'a ActualStateOfWorld,
+    hostutil: &'a dyn HostUtils,
+) -> anyhow::Result<GeneratedUnmountDevice<'a>> {
+    // Get DeviceMounter plugin
+    let device_mountable_volume_plugin =
+        match mgr.find_device_mountable_plugin_by_name(&device_to_detach.plugin_name) {
+            Ok(Some(plugin)) => plugin,
+            // `err != nil || deviceMountableVolumePlugin == nil`: a nil error
+            // for a plugin that is not device-mountable.
+            Ok(None) => {
+                return Err(device_to_detach.generate_error_detailed(
+                    "UnmountDevice.FindDeviceMountablePluginByName failed",
+                    None,
+                ))
+            }
+            Err(e) => {
+                return Err(device_to_detach.generate_error_detailed(
+                    "UnmountDevice.FindDeviceMountablePluginByName failed",
+                    Some(&anyhow!(e)),
+                ))
+            }
+        };
+
+    let volume_device_unmounter = device_mountable_volume_plugin
+        .new_device_unmounter()
+        .map_err(|e| {
+            device_to_detach
+                .generate_error_detailed("UnmountDevice.NewDeviceUnmounter failed", Some(&e))
+        })?;
+
+    let volume_device_mounter = device_mountable_volume_plugin
+        .new_device_mounter()
+        .map_err(|e| {
+            device_to_detach
+                .generate_error_detailed("UnmountDevice.NewDeviceMounter failed", Some(&e))
+        })?;
+
+    Ok(GeneratedUnmountDevice {
+        operation_name: "unmount_device",
+        device_mountable_volume_plugin,
+        volume_device_unmounter,
+        volume_device_mounter,
+        device_to_detach,
+        actual_state_of_world,
+        hostutil,
+    })
+}
+
+impl GeneratedUnmountDevice<'_> {
+    /// The `unmountDeviceFunc` closure (`operation_generator.go:830-896`).
+    pub async fn run(&self) -> OperationContext {
+        let device_to_detach = self.device_to_detach;
+        let asw = self.actual_state_of_world;
+        // `getMigratedStatusBySpec`: see `generate_unmount_device_func`.
+        let migrated = false;
+        let spec = device_to_detach.volume_spec.as_spec();
+
+        //deviceMountPath := deviceToDetach.DeviceMountPath
+        let device_mount_path = match self.volume_device_mounter.get_device_mount_path(&spec) {
+            Ok(path) => path,
+            Err(err) => {
+                // On failure other than "does not exist", return error. Caller will log and retry.
+                if !format!("{err:#}").contains("does not exist") {
+                    let (event_err, detailed_err) =
+                        device_to_detach.generate_error("GetDeviceMountPath failed", &err);
+                    return OperationContext::new(Some(event_err), Some(detailed_err), migrated);
+                }
+                // If the mount path could not be found, don't fail the unmount, but instead log a warning and proceed,
+                // using the value from deviceToDetach.DeviceMountPath, so that the device can be marked as unmounted
+                let device_mount_path = device_to_detach.device_mount_path.clone();
+                warn!(
+                    "{}",
+                    device_to_detach.generate_msg_detailed(
+                        &format!(
+                            "GetDeviceMountPath failed, but unmount operation will proceed using deviceMountPath={device_mount_path}: {err}"
+                        ),
+                        ""
+                    )
+                );
+                device_mount_path
+            }
+        };
+
+        // `refs, err := GetDeviceMountRefs(..); if err != nil || HasMountRefs(..)`
+        let refs = self
+            .device_mountable_volume_plugin
+            .get_device_mount_refs(&device_mount_path);
+        if let Err(err) = check_device_mount_refs(&device_mount_path, refs) {
+            let (event_err, detailed_err) =
+                device_to_detach.generate_error("GetDeviceMountRefs check failed", &err);
+            return OperationContext::new(Some(event_err), Some(detailed_err), migrated);
+        }
+
+        // Execute unmount
+        if let Err(unmount_device_err) = self
+            .volume_device_unmounter
+            .unmount_device(&device_mount_path)
+            .await
+        {
+            // Mark the device as uncertain, so MountDevice is called for new pods. UnmountDevice may be already in progress.
+            self.mark_device_as_uncertain(&device_mount_path);
+
+            // On failure, return error. Caller will log and retry.
+            let (event_err, detailed_err) =
+                device_to_detach.generate_error("UnmountDevice failed", &unmount_device_err);
+            return OperationContext::new(Some(event_err), Some(detailed_err), migrated);
+        }
+
+        // Before logging that UnmountDevice succeeded and moving on,
+        // use hostutil.PathIsDevice to check if the path is a device,
+        // if so use hostutil.DeviceOpened to check if the device is in use anywhere
+        // else on the system. Retry if it returns true.
+        let device_opened = match is_device_opened(device_to_detach, self.hostutil) {
+            Ok(opened) => opened,
+            Err(device_opened_err) => {
+                return OperationContext::new(None, Some(device_opened_err), migrated);
+            }
+        };
+        // The device is still in use elsewhere. Caller will log and retry.
+        if device_opened {
+            // Mark the device as uncertain, so MountDevice is called for new pods.
+            self.mark_device_as_uncertain(&device_mount_path);
+            let (event_err, detailed_err) = device_to_detach.generate_error(
+                "UnmountDevice failed",
+                &anyhow!("the device is in use when it was no longer expected to be in use"),
+            );
+            return OperationContext::new(Some(event_err), Some(detailed_err), migrated);
+        }
+
+        info!(
+            "{}",
+            device_to_detach.generate_msg_detailed("UnmountDevice succeeded", "")
+        );
+
+        // Update actual state of world
+        if let Err(mark_device_unmounted_err) =
+            asw.mark_device_as_unmounted(&device_to_detach.volume_name)
+        {
+            // On failure, return error. Caller will log and retry.
+            let (event_err, detailed_err) = device_to_detach.generate_error(
+                "MarkDeviceAsUnmounted failed",
+                &anyhow!(mark_device_unmounted_err),
+            );
+            return OperationContext::new(Some(event_err), Some(detailed_err), migrated);
+        }
+
+        OperationContext::new(None, None, migrated)
+    }
+
+    /// `actualStateOfWorld.MarkDeviceAsUncertain(..)` with the upstream
+    /// handling of its error: "There is nothing else we can do. Hope that
+    /// UnmountDevice will be re-tried shortly." (`:862-865`, `:884-887`).
+    fn mark_device_as_uncertain(&self, device_mount_path: &str) {
+        let d = self.device_to_detach;
+        if let Err(e) = self.actual_state_of_world.mark_device_as_uncertain(
+            &d.volume_name,
+            &d.device_path,
+            device_mount_path,
+            &d.selinux_mount_context,
+        ) {
+            error!(
+                "{}",
+                d.generate_error_detailed(
+                    "UnmountDevice.MarkDeviceAsUncertain failed",
+                    Some(&anyhow!(e))
+                )
+            );
+        }
+    }
+}
+
+/// Port of `isDeviceOpened` (`operation_generator.go:2179-2198`): after
+/// `UnmountDevice`, is the device still opened elsewhere on the system?
+fn is_device_opened(
+    device_to_detach: &AttachedVolume,
+    host_util: &dyn HostUtils,
+) -> anyhow::Result<bool> {
+    match host_util.path_is_device(&device_to_detach.device_path) {
+        Ok(false) => {
+            // not a device path or path doesn't exist
+            // TODO: refer to #36092
+            debug!(
+                "The path isn't device path or doesn't exist. Skip checking device path: {}",
+                device_to_detach.device_path
+            );
+            Ok(false)
+        }
+        Err(e) if e.to_string().contains("does not exist") => {
+            debug!(
+                "The path isn't device path or doesn't exist. Skip checking device path: {}",
+                device_to_detach.device_path
+            );
+            Ok(false)
+        }
+        Err(e) => Err(device_to_detach
+            .generate_error_detailed("PathIsDevice failed", Some(&anyhow!(e.to_string())))),
+        Ok(true) => host_util
+            .device_opened(&device_to_detach.device_path)
+            .map_err(|e| {
+                device_to_detach
+                    .generate_error_detailed("DeviceOpened failed", Some(&anyhow!(e.to_string())))
+            }),
+    }
 }
 
 /// The `volume.MounterArgs` the operation generator hands to `SetUp`

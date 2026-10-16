@@ -267,6 +267,9 @@ pub struct Mounter {
     pub try_systemd: bool,
     pub with_safe_not_mounted_behavior: bool,
     with_systemd: std::sync::OnceLock<bool>,
+    /// The mountinfo file [`Self::get_mount_refs`] reads. `None` is
+    /// `/proc/self/mountinfo`; see [`Self::with_mountinfo_path`].
+    mountinfo_path: Option<String>,
 }
 
 impl Mounter {
@@ -276,7 +279,17 @@ impl Mounter {
             try_systemd,
             with_safe_not_mounted_behavior: safe_not_mounted,
             with_systemd: std::sync::OnceLock::new(),
+            mountinfo_path: None,
         }
+    }
+
+    /// Test seam standing in for upstream's `mount.FakeMounter.MountPoints`
+    /// (`k8s.io/mount-utils/fake_mounter.go`): point `GetMountRefs` at a
+    /// mountinfo file instead of `/proc/self/mountinfo`, so a test can state
+    /// which mounts reference a path.
+    pub fn with_mountinfo_path(mut self, path: &str) -> Self {
+        self.mountinfo_path = Some(path.to_string());
+        self
     }
 
     /// `hasSystemd` (`mount_linux.go:100-111`).
@@ -622,7 +635,10 @@ impl Mounter {
     /// `GetMountRefs` (`mount_linux.go:513-529`): every mount reference to
     /// `pathname`, over `/proc/self/mountinfo`.
     pub fn get_mount_refs(&self, pathname: &str) -> io::Result<Vec<String>> {
-        super::mount_utils::get_mount_refs(pathname)
+        match &self.mountinfo_path {
+            Some(path) => super::mount_utils::get_mount_refs_at(pathname, path),
+            None => super::mount_utils::get_mount_refs(pathname),
+        }
     }
 
     /// `Unmount` (`mount_linux.go:400-408`).
@@ -894,6 +910,30 @@ mod tests {
         assert!(!m.is_likely_not_mount_point("/proc").unwrap());
         assert!(m.is_likely_not_mount_point("/proc/self").unwrap());
         assert!(m.is_likely_not_mount_point("/nonexistent-xyz").is_err());
+    }
+
+    /// The `FakeMounter.MountPoints` stand-in: a `Mounter` pointed at a
+    /// mountinfo file reports the references that file describes, so
+    /// `GetMountRefs`-level behaviour (the `GetDeviceMountRefs` gate) is
+    /// testable beyond "delegates to the host mounter".
+    #[test]
+    fn get_mount_refs_reads_the_injected_mountinfo() {
+        use std::io::Write;
+        let d = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(d.path()).unwrap();
+        let info = format!(
+            "10 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+             20 10 8:1 /r {} rw - ext4 /dev/sda1 rw\n\
+             21 10 8:1 /r /mnt/other rw - ext4 /dev/sda1 rw\n",
+            real.display()
+        );
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(info.as_bytes()).unwrap();
+        let m = Mounter::new("", false, false).with_mountinfo_path(f.path().to_str().unwrap());
+        assert_eq!(
+            m.get_mount_refs(real.to_str().unwrap()).unwrap(),
+            vec!["/mnt/other".to_string()]
+        );
     }
 
     // TestMakeBindOpts (mount_test.go:27)

@@ -12,9 +12,7 @@
 //! `UnmountDevice`, the global paths).
 use super::util::search_disk;
 use super::*;
-use crate::volume_plugins::plugin::{
-    AttachableVolumePlugin, DeviceMountableVolumePlugin, DeviceMounterArgs,
-};
+use crate::volume_plugins::plugin::{DeviceMountableVolumePlugin, DeviceMounterArgs};
 use crate::volume_plugins::util::device_util::{new_device_handler, IoUtil};
 use crate::volume_plugins::util::exec::testing::{no_commands, script, FakeExec};
 use crate::volume_plugins::util::mount_interface::testing::FakeMounter;
@@ -807,7 +805,7 @@ fn global_paths() {
     assert!(found.new_device_unmounter().is_ok());
     assert!(DeviceMountableVolumePlugin::new_device_mounter(&plug).is_ok());
     assert_eq!(
-        AttachableVolumePlugin::get_device_mount_refs(&plug, "/nonexistent").unwrap(),
+        DeviceMountableVolumePlugin::get_device_mount_refs(&plug, "/nonexistent").unwrap(),
         Vec::<String>::new()
     );
 }

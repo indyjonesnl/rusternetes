@@ -1,5 +1,5 @@
 use crate::volume_plugins::plugin::{
-    BlockVolumePlugin, NodeExpandableVolumePlugin, Spec, VolumePlugin,
+    BlockVolumePlugin, DeviceMountableVolumePlugin, NodeExpandableVolumePlugin, Spec, VolumePlugin,
 };
 
 /// Port of `ErrNoPluginMatched` (`pkg/volume/plugins.go:71-72`) plus the
@@ -98,6 +98,18 @@ impl VolumePluginMgr {
             1 => Ok(matched[0]),
             _ => Err(PluginLookupError::MultipleMatched(name.to_string())),
         }
+    }
+
+    /// Port of `FindDeviceMountablePluginByName` (`pkg/volume/plugins.go:852-861`).
+    ///
+    /// `Ok(None)` is upstream's `(nil, nil)` — a plugin matched but is not a
+    /// `DeviceMountableVolumePlugin`; the type assertion is
+    /// [`VolumePlugin::as_device_mountable_plugin`].
+    pub fn find_device_mountable_plugin_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<&dyn DeviceMountableVolumePlugin>, PluginLookupError> {
+        Ok(self.find_plugin_by_name(name)?.as_device_mountable_plugin())
     }
 
     /// Port of `FindMapperPluginBySpec` (`pkg/volume/plugins.go:900-911`).
