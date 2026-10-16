@@ -6,6 +6,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+pub mod kube_version;
 pub mod restmapper;
 
 /// Version information (`apimachinery/pkg/version.Info`).
@@ -392,7 +393,12 @@ pub async fn get_api_groups(
                             "freshness": "Current"
                         }));
                 }
-                for (group, versions) in crd_groups {
+                for (group, mut versions) in crd_groups {
+                    // sortGroupDiscoveryByKubeAwareVersion
+                    // (customresource_discovery_controller.go:284-288).
+                    kube_version::sort_by_kube_aware_version_desc(&mut versions, |v| {
+                        v["version"].as_str().unwrap_or("")
+                    });
                     if !seen_groups.contains(&group) {
                         seen_groups.insert(group.clone());
                         groups.push(
@@ -826,6 +832,15 @@ pub async fn get_api_groups(
                             gv_versions.push(gv);
                         }
                     }
+                    // sortGroupDiscoveryByKubeAwareVersion, then the first item
+                    // is the preferred version
+                    // (customresource_discovery_controller.go:225-231, 284-288).
+                    kube_version::sort_by_kube_aware_version_desc(&mut gv_versions, |v| {
+                        v.version.as_str()
+                    });
+                    if let Some(first) = gv_versions.first() {
+                        preferred = Some(first.clone());
+                    }
                     if !gv_versions.is_empty() {
                         groups.push(APIGroup {
                             name: group.to_string(),
@@ -1099,20 +1114,6 @@ fn resource_categories(group: &str, resource: &str) -> &'static [&'static str] {
         ) => &["api-extensions"],
         _ => &[],
     }
-}
-
-/// `resolve_kind_to_resource` plus the resource's scope (`true` when
-/// namespaced): the two halves of a `meta.RESTMapping`.
-pub fn resolve_kind_to_resource_and_scope(
-    group: &str,
-    version: &str,
-    kind: &str,
-) -> Option<(String, bool)> {
-    let resource = resolve_kind_to_resource(group, version, kind)?;
-    get_aggregated_resources_for_group_uncategorized(group, version)
-        .iter()
-        .find(|r| r["resource"].as_str() == Some(resource.as_str()))
-        .map(|r| (resource.clone(), r["scope"].as_str() == Some("Namespaced")))
 }
 
 fn get_aggregated_resources_for_group_uncategorized(
@@ -1952,6 +1953,8 @@ pub async fn get_api_group(
                     }
                 }
             }
+            // customresource_discovery_controller.go:225-231, 284-288.
+            kube_version::sort_by_kube_aware_version_desc(&mut versions, |v| v.version.as_str());
             if !versions.is_empty() {
                 let preferred = versions[0].clone();
                 let response = serde_json::json!({
@@ -4539,6 +4542,114 @@ mod tests {
         assert_eq!(v["emulationMinor"], "35");
         assert_eq!(v["minCompatibilityMajor"], "1");
         assert_eq!(v["minCompatibilityMinor"], "34");
+    }
+
+    /// customresource_discovery_controller.go:284-288
+    /// `sortGroupDiscoveryByKubeAwareVersion`: a CRD group's versions are
+    /// ordered by kube-aware version priority (not the CRD's listed order)
+    /// and the first one is the preferred version (:225-231), in every
+    /// discovery document and in the RESTMapper input.
+    #[tokio::test]
+    async fn crd_group_versions_are_ordered_by_kube_aware_priority() {
+        use rusternetes_storage::Storage;
+        let storage = std::sync::Arc::new(rusternetes_storage::StorageBackend::new_memory());
+        let crd = serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {"name": "foos.ordered.example.com"},
+            "spec": {"group": "ordered.example.com", "scope": "Namespaced",
+                "names": {"plural": "foos", "singular": "foo", "kind": "Foo"},
+                "versions": [
+                    {"name": "v2alpha1", "served": true, "storage": false},
+                    {"name": "v1beta1", "served": true, "storage": false},
+                    {"name": "v1", "served": true, "storage": true},
+                    {"name": "v10", "served": false, "storage": false}
+                ]},
+            "status": {"conditions": [{"type": "Established", "status": "True"}]}
+        });
+        let key = rusternetes_storage::build_key(
+            "customresourcedefinitions",
+            None,
+            "foos.ordered.example.com",
+        );
+        storage.create(&key, &crd).await.unwrap();
+        let want = ["v1", "v1beta1", "v2alpha1"];
+
+        // GET /apis/{group}
+        let resp = get_api_group(
+            Some(storage.clone()),
+            axum::extract::Path("ordered.example.com".to_string()),
+        )
+        .await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let got: Vec<&str> = doc["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["version"].as_str().unwrap())
+            .collect();
+        assert_eq!(got, want);
+        assert_eq!(doc["preferredVersion"]["version"], "v1");
+
+        // GET /apis
+        let resp = get_api_groups(Some(storage.clone()), HeaderMap::new()).await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let g = doc["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["name"] == "ordered.example.com")
+            .unwrap();
+        let got: Vec<&str> = g["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["version"].as_str().unwrap())
+            .collect();
+        assert_eq!(got, want);
+        assert_eq!(g["preferredVersion"]["version"], "v1");
+
+        // GET /apis (aggregated discovery)
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "accept",
+            "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList"
+                .parse()
+                .unwrap(),
+        );
+        let resp = get_api_groups(Some(storage.clone()), headers).await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let g = doc["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["metadata"]["name"] == "ordered.example.com")
+            .unwrap();
+        let got: Vec<&str> = g["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["version"].as_str().unwrap())
+            .collect();
+        assert_eq!(got, want);
+
+        // RESTMapper input: versions in kube-aware order, preferred first.
+        let groups = restmapper::served_group_resources(std::slice::from_ref(&crd));
+        let g = groups
+            .iter()
+            .find(|g| g.name == "ordered.example.com")
+            .unwrap();
+        assert_eq!(g.versions, want);
+        assert_eq!(g.preferred_version, "v1");
     }
 
     /// customresource_discovery_controller.go:105 — a CRD that is not

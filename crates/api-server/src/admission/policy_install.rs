@@ -13,12 +13,15 @@
 
 #![allow(dead_code)]
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
 use rusternetes_common::resources::Namespace;
 use rusternetes_common::Error;
+use rusternetes_discovery::restmapper::{
+    new_discovery_rest_mapper, served_group_resources, Gk, PriorityRestMapper, Scope,
+};
 use rusternetes_storage::Storage;
 use serde_json::Value;
 
@@ -81,29 +84,25 @@ pub struct DiscoveryRestMapper;
 impl RestMapper for DiscoveryRestMapper {
     /// `RESTMapping(GroupKind, version)`: a kind that is not served is
     /// upstream's `NoKindMatchError`.
+    ///
+    /// Delegates to the ported `PriorityRESTMapper` over the served discovery
+    /// (`restmapper.NewDiscoveryRESTMapper`, #3519), so this and the
+    /// custom.metrics handler share one kind -> resource path.
     fn rest_mapping(&self, group: &str, kind: &str, version: &str) -> Result<RestMapping, String> {
-        let (resource, namespaced) =
-            rusternetes_discovery::resolve_kind_to_resource_and_scope(group, version, kind)
-                .ok_or_else(|| {
-                    format!(
-                        "no matches for kind \"{kind}\" in version \"{}\"",
-                        if group.is_empty() {
-                            version.to_string()
-                        } else {
-                            format!("{group}/{version}")
-                        }
-                    )
-                })?;
+        static MAPPER: OnceLock<PriorityRestMapper> = OnceLock::new();
+        let mapper = MAPPER.get_or_init(|| new_discovery_rest_mapper(&served_group_resources(&[])));
+        let mapping = mapper
+            .rest_mapping(&Gk::new(group, kind), &[version])
+            .map_err(|e| e.to_string())?;
         Ok(RestMapping {
             resource: GroupVersionResource {
-                group: group.to_string(),
-                version: version.to_string(),
-                resource,
+                group: mapping.resource.group,
+                version: mapping.resource.version,
+                resource: mapping.resource.resource,
             },
-            scope: if namespaced {
-                ParamScope::Namespace
-            } else {
-                ParamScope::Root
+            scope: match mapping.scope {
+                Scope::Namespace => ParamScope::Namespace,
+                Scope::Root => ParamScope::Root,
             },
         })
     }
@@ -346,6 +345,17 @@ mod tests {
             .rest_mapping("example.com", "Widget", "v1")
             .is_err());
         assert!(DiscoveryRestMapper.rest_mapping("", "Nope", "v1").is_err());
+        // errors.go:106-120 NoKindMatchError, one searched version.
+        assert_eq!(
+            DiscoveryRestMapper
+                .rest_mapping("apps", "Nope", "v1")
+                .unwrap_err(),
+            r#"no matches for kind "Nope" in version "apps/v1""#
+        );
+        // A version the group does not serve does not match.
+        assert!(DiscoveryRestMapper
+            .rest_mapping("apps", "Deployment", "v9")
+            .is_err());
     }
 
     #[tokio::test]
