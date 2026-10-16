@@ -4512,6 +4512,7 @@ dependencies = [
  "rusternetes-common",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-stream",
  "tokio-tungstenite 0.24.0",
  "tonic",
  "tonic-build",
