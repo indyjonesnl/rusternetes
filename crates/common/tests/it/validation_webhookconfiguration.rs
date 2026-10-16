@@ -234,3 +234,58 @@ fn unknown_enum_values_round_trip() {
     assert_eq!(back["sideEffects"], "weird");
     assert_eq!(back["rules"][0]["operations"][0], "PATCH");
 }
+
+/// `failurePolicy`, `matchPolicy` and `reinvocationPolicy` are `*T` upstream
+/// (`staging/src/k8s.io/api/admissionregistration/v1/types.go:808,825,958,975,
+/// 1079`, release-1.35). `SetDefaults_*Webhook` only fills nil
+/// (`pkg/apis/admissionregistration/v1/defaults.go:32-66`), so a non-nil `""`
+/// reaches validation and answers `field.NotSupported`
+/// (`validation.go:371-376,427-432,453-455`) rather than being treated as
+/// unset (#2562).
+#[test]
+fn empty_pointer_enum_values_are_not_supported() {
+    let cases = [
+        (
+            "failurePolicy",
+            "webhooks[0].failurePolicy: Unsupported value: \"\": supported values: \"Fail\", \"Ignore\"",
+        ),
+        (
+            "matchPolicy",
+            "webhooks[0].matchPolicy: Unsupported value: \"\": supported values: \"Equivalent\", \"Exact\"",
+        ),
+        (
+            "reinvocationPolicy",
+            "webhooks[0].reinvocationPolicy: Unsupported value: \"\": supported values: \"IfNeeded\", \"Never\"",
+        ),
+    ];
+    for (field, want) in cases {
+        let mut w = valid_webhook();
+        w[field] = json!("");
+        let m: MutatingWebhookConfiguration = serde_json::from_value(json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "cfg"},
+            "webhooks": [w.clone()]
+        }))
+        .unwrap();
+        let errs: Vec<String> = validate_mutating_webhook_configuration(&m)
+            .iter()
+            .map(|e| e.to_string())
+            .collect();
+        assert!(
+            errs.iter().any(|e| e.contains(want)),
+            "{field}: want {want:?} in {errs:?}"
+        );
+        if field != "reinvocationPolicy" {
+            let v = vwc(w);
+            let errs: Vec<String> = validate_validating_webhook_configuration(&v)
+                .iter()
+                .map(|e| e.to_string())
+                .collect();
+            assert!(
+                errs.iter().any(|e| e.contains(want)),
+                "{field} (validating): want {want:?} in {errs:?}"
+            );
+        }
+    }
+}

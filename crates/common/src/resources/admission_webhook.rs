@@ -3,7 +3,6 @@
 // This module defines ValidatingWebhookConfiguration and MutatingWebhookConfiguration
 // resources that configure external admission webhooks.
 
-use crate::resources::serde_helpers::empty_string_as_none;
 use crate::resources::WebhookClientConfig;
 use crate::types::ObjectMeta;
 use serde::{Deserialize, Serialize};
@@ -50,19 +49,11 @@ pub struct ValidatingWebhook {
     pub rules: Vec<RuleWithOperations>,
 
     /// FailurePolicy defines how unrecognized errors are handled
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "empty_string_as_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_policy: Option<FailurePolicy>,
 
     /// MatchPolicy defines how the rules are applied
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "empty_string_as_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub match_policy: Option<MatchPolicy>,
 
     /// NamespaceSelector decides whether to run the webhook on an object based on namespace
@@ -132,19 +123,11 @@ pub struct MutatingWebhook {
     pub rules: Vec<RuleWithOperations>,
 
     /// FailurePolicy defines how unrecognized errors are handled
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "empty_string_as_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_policy: Option<FailurePolicy>,
 
     /// MatchPolicy defines how the rules are applied
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "empty_string_as_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub match_policy: Option<MatchPolicy>,
 
     /// NamespaceSelector decides whether to run the webhook on an object based on namespace
@@ -172,11 +155,7 @@ pub struct MutatingWebhook {
     pub match_conditions: Option<Vec<MatchCondition>>,
 
     /// ReinvocationPolicy indicates whether this webhook should be called multiple times
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "empty_string_as_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reinvocation_policy: Option<ReinvocationPolicy>,
 }
 
