@@ -706,9 +706,10 @@ impl BlockVolumeUnmapper for FcDiskUnmapper {
     }
 }
 
+#[async_trait]
 impl CustomBlockVolumeUnmapper for FcDiskUnmapper {
     /// `TearDownDevice` (`fc.go:452-463`).
-    fn tear_down_device(&self, map_path: &str, device_path: &str) -> Result<()> {
+    async fn tear_down_device(&self, map_path: &str, device_path: &str) -> Result<()> {
         self.disk
             .manager
             .detach_block_fc_disk(self, map_path, device_path)
@@ -729,7 +730,7 @@ impl CustomBlockVolumeUnmapper for FcDiskUnmapper {
     }
 
     /// `UnmapPodDevice` (`fc.go:465-467`).
-    fn unmap_pod_device(&self) -> Result<()> {
+    async fn unmap_pod_device(&self) -> Result<()> {
         Ok(())
     }
 }

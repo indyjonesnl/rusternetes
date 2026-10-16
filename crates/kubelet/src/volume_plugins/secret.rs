@@ -260,20 +260,25 @@ impl Mounter for SecretMounter {
         // `wrapped.SetUpAt(dir, ...)` (secret.go:179-181) runs AFTER `getSecret`
         // and `MakePayload` (:166-177), so a missing Secret or bad item leaves
         // no volume behind (`TestInvalidPathSecret`, secret_test.go:365). The
-        // wrapped emptyDir's `setupDir` creates the root at 0777. Its fsGroup
-        // ownership runs in the AtomicWriter's `setPerms` (:242-247) below.
-        crate::volume_plugins::empty_dir::setup_dir(volume_dir)
-            .context("Failed to create Secret volume directory")?;
-        // The wrapped emptyDir's `SetUpAt` ends with
-        // `volumeutil.SetReady(ed.getMetaDir())` (empty_dir.go:284), which
-        // creates `<pod>/plugins/kubernetes.io~empty-dir/wrapped_<vol>`
+        // wrapped emptyDir creates the root at 0777 and ends with
+        // `volumeutil.SetReady(ed.getMetaDir())` (empty_dir.go:284), creating
+        // `<pod>/plugins/kubernetes.io~empty-dir/wrapped_<vol>`
         // (`TestPlugin`, secret_test.go:340-348).
+        let wrapped = crate::volume_plugins::util::new_wrapper_mounter(
+            &self.host,
+            &self.volume_name,
+            &self.pod,
+        )
+        .await?;
+        wrapped
+            .set_up_at(volume_dir, args)
+            .await
+            .context("Failed to create Secret volume directory")?;
         let meta_dir = crate::volume_plugins::util::wrapped_empty_dir_meta_dir(
             &self.host,
             &self.volume_name,
             &self.pod.metadata.uid,
         );
-        crate::volume_plugins::util::set_ready(&meta_dir);
         // `volumeutil.MakeNestedMountpoints(b.volName, dir, b.pod)`
         // (secret.go:181-183), before the failure-teardown `defer` is armed.
         crate::volume_plugins::util::nested_volumes::make_nested_mountpoints(

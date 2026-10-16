@@ -18,6 +18,7 @@ pub mod node_expander;
 pub mod operation_executor;
 pub mod operation_generator;
 pub mod resize_util;
+pub mod resizefs;
 pub mod selinux;
 pub mod types;
 #[cfg(test)]
@@ -370,6 +371,31 @@ pub fn wrapped_empty_dir_meta_dir(
         .join(format!("wrapped_{vol_name}"))
         .to_string_lossy()
         .into_owned()
+}
+
+/// `VolumeHost.NewWrapperMounter` (`pkg/kubelet/volume_host.go:190-199`): the
+/// mounter of an emptyDir volume named `wrapped_<vol_name>`. Its `SetUpAt`
+/// ends with `volumeutil.SetReady(ed.getMetaDir())` (`empty_dir.go:284`).
+pub async fn new_wrapper_mounter(
+    host: &std::sync::Arc<dyn crate::volume_plugins::VolumeHost>,
+    vol_name: &str,
+    pod: &rusternetes_common::resources::Pod,
+) -> anyhow::Result<Box<dyn crate::volume_plugins::Mounter>> {
+    use crate::volume_plugins::VolumePlugin;
+    let volume: rusternetes_common::resources::Volume = serde_json::from_value(
+        serde_json::json!({"name": format!("wrapped_{vol_name}"), "emptyDir": {}}),
+    )
+    .expect("static emptyDir volume");
+    crate::volume_plugins::empty_dir::EmptyDirPlugin::new(host.clone())
+        .new_mounter(
+            &crate::volume_plugins::Spec {
+                volume: &volume,
+                persistent_volume: None,
+                read_only: false,
+            },
+            pod,
+        )
+        .await
 }
 
 /// `volumeutil.IsReady` (`pkg/volume/util/util.go:75-90`): true when `dir`

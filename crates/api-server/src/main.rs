@@ -480,34 +480,43 @@ async fn main() -> Result<()> {
             .initialize()
             .await
             .map_err(|e| anyhow::anyhow!("initializing API Priority and Fairness: {e}"))?;
-        flow_control_filter::spawn_config_reloader(engine.clone());
-        flow_control_filter::spawn_borrowing_updater(engine.clone());
         let apf = Arc::new(flow_control_filter::ApfFilter::new(
-            engine,
+            engine.clone(),
             flow_control_filter::DEFAULT_REQUEST_TIMEOUT / 4,
         ));
-        // `storage-object-count-tracker-hook` (server/config.go:962-970) and
-        // `Store.startObservingCount` (store.go:1638): prune the tracker, and
-        // poll the stores' object counts into it for the list estimator.
-        // The senders live for the process; the server never signals stop.
+        // The `priority-and-fairness-config-consumer`, `priority-and-fairness-filter`
+        // and `storage-object-count-tracker-hook` post-start hooks
+        // (server/config.go:921-970). The senders live for the process; the
+        // server never signals stop.
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         std::mem::forget(stop_tx);
         let tracker = apf.object_count_tracker();
-        tokio::spawn({
-            let tracker = tracker.clone();
-            let stop = stop_rx.clone();
-            async move { tracker.run_until(stop).await }
-        });
+        flow_control_filter::register_post_start_hooks(
+            post_start_hooks::global(),
+            engine,
+            tracker.clone(),
+            stop_rx.clone(),
+        );
+        // `Store.startObservingCount` (store.go:1638): poll the stores' object
+        // counts into the tracker for the list estimator.
         tokio::spawn(flow_control_stats_poller::run(
             storage.clone(),
             tracker,
             flow_control_stats_poller::COUNT_METRIC_POLL_PERIOD,
             stop_rx,
         ));
-        // `StartPriorityAndFairnessWatermarkMaintenance` (priority-and-fairness.go:358-363).
-        apiserver_request_metrics::start_watermark_maintenance();
         flow_control_filter::install_flow_control(apf);
         info!("API Priority and Fairness enabled");
+    } else {
+        // `storage-object-count-tracker-hook` is registered whenever the
+        // tracker exists (server/config.go:961-970), APF or not.
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        std::mem::forget(stop_tx);
+        flow_control_filter::register_storage_object_count_tracker_hook(
+            post_start_hooks::global(),
+            Arc::new(flow_control_object_count::ObjectCountTracker::new()),
+            stop_rx,
+        );
     }
 
     // Create shared state with CA certificate and Prometheus client

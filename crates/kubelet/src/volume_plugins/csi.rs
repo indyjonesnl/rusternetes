@@ -220,6 +220,15 @@ impl VolumePlugin for CsiPlugin {
         Some(self)
     }
 
+    /// Rust spelling of the `volume.BlockVolumePlugin` assertion
+    /// (`plugins.go:906`, `:919`) made of `csiPlugin`
+    /// (`var _ volume.BlockVolumePlugin = &csiPlugin{}`, `csi_plugin.go:727`).
+    fn as_block_volume_plugin(
+        &self,
+    ) -> Option<&dyn crate::volume_plugins::plugin::BlockVolumePlugin> {
+        Some(self)
+    }
+
     /// Rust spelling of the `volume.NodeExpandableVolumePlugin` assertion
     /// `expander.go:32` makes of `csiPlugin`.
     fn as_node_expandable_plugin(
@@ -1721,6 +1730,7 @@ fn remove_mount_dir(mount_path: &Path) -> Result<()> {
     Ok(())
 }
 
+mod block;
 mod expander;
 
 #[cfg(test)]

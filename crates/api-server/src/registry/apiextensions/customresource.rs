@@ -320,7 +320,9 @@ impl Strategy {
     /// `schemaobjectmeta.CoerceWithOptions` reports for embedded `metadata`
     /// (:1442-1449). The unknown fields of the root `metadata`
     /// (`GetObjectMetaWithOptions`, :1415-1421) cannot be seen here: the typed
-    /// `ObjectMeta` has already dropped them.
+    /// `ObjectMeta` has already dropped them. `validate_strict_fields`
+    /// reports them (as `metadata.<field>`) for every typed resource, from
+    /// the request body, before this runs (#3399).
     fn unknown_fields(&self, cr: &CustomResource) -> Vec<String> {
         let Some(structural) = self.structural_schema() else {
             return Vec::new();
@@ -338,7 +340,10 @@ impl Strategy {
                 );
             }
         }
-        paths.extend(self.coerce_embedded_metadata(&mut cr.clone(), true).1);
+        paths.extend(
+            self.coerce_embedded_metadata(&mut cr.clone(), false, true)
+                .1,
+        );
         paths
     }
 
@@ -358,6 +363,7 @@ impl Strategy {
     fn coerce_embedded_metadata(
         &self,
         cr: &mut CustomResource,
+        drop_invalid_fields: bool,
         return_unknown_field_paths: bool,
     ) -> (Option<FieldError>, Vec<String>) {
         let Some(structural) = self.structural_schema() else {
@@ -380,7 +386,7 @@ impl Strategy {
             Some(&structural),
             false,
             CoerceOptions {
-                drop_invalid_fields: false,
+                drop_invalid_fields,
                 return_unknown_field_paths,
             },
         );
@@ -390,6 +396,17 @@ impl Strategy {
             cr.extra = map.into_iter().collect();
         }
         out
+    }
+
+    /// The embedded-`metadata` half of what the storage codec does to an
+    /// object it reads: `crdConversionRESTOptionsGetter` decodes with
+    /// `dropInvalidMetadata: true` (customresource_handler.go:1280-1283), so
+    /// `CoerceWithOptions` drops each malformed field of an embedded
+    /// `metadata` instead of failing (:1442-1445), and reports no unknown
+    /// field paths (`returnUnknownFieldPaths` is unset). An error cannot
+    /// arise with `DropInvalidFields` set, as upstream's does not either.
+    pub fn decode_stored(&self, cr: &mut CustomResource) {
+        let _ = self.coerce_embedded_metadata(cr, true, false);
     }
 
     /// The object's schema and CEL errors, as field errors.
@@ -624,6 +641,7 @@ impl DecodeRepair {
         if cr.metadata.generation.unwrap_or(0) == 0 {
             cr.metadata.generation = Some(1);
         }
+        self.strategy.decode_stored(cr);
     }
 }
 
@@ -734,7 +752,7 @@ impl CustomResourceRest {
         // `StrictDecodingError` (:1338-1342).
         if let Some(path) = self
             .strategy
-            .coerce_embedded_metadata(&mut cr.clone(), true)
+            .coerce_embedded_metadata(&mut cr.clone(), false, true)
             .1
             .first()
         {
@@ -796,7 +814,7 @@ impl RestStorage<CustomResource> for CustomResourceRest {
         // `unstructuredSchemaCoercer.apply` (:1442-1449): a malformed embedded
         // `metadata` fails the decode, which the handler reports through
         // `transformDecodeError` (handlers/rest.go:251-253).
-        if let (Some(err), _) = self.strategy.coerce_embedded_metadata(obj, false) {
+        if let (Some(err), _) = self.strategy.coerce_embedded_metadata(obj, false, false) {
             return Err(Error::BadRequest(format!(
                 "{} in version {:?} cannot be handled as a {}: {err}",
                 obj.kind, self.strategy.version, obj.kind

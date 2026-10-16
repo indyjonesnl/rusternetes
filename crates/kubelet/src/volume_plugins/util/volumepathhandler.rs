@@ -7,19 +7,33 @@
 //! mount — so this module only prepares the host-side link; the CRI wiring is
 //! the consumer's job.
 //!
-//! **Not ported (tracked in #2293):** the `bindMount == true` mapping and the
-//! unmount of a live bind mount (both need `mount(2)`/`umount(2)`; this crate
-//! has no mount helper yet), `GetDeviceBindMountRefs` (consumer of bind
-//! mounts; `FindGlobalMapPathUUIDFromPod` was ported for the iscsi plugin,
-//! #3287), and the `losetup`
-//! file-device functions (`AttachFileDevice`, `DetachFileDevice`,
-//! `GetLoopDevice`) which back `volumeMode: Block` on a file-backed PV.
+//! The bind-mount mapping (`mapBindMountDevice` / `unmapBindMountDevice`) goes
+//! through [`MountInterface`] (upstream's inline `mount.New("")`), and the
+//! losetup file-device functions (`volume_path_handler_linux.go`) through
+//! [`Exec`] plus a sysfs root, so tests can substitute both.
 
 use anyhow::{bail, Context, Result};
 use std::fs;
 use std::io::ErrorKind;
 use std::os::unix::fs::{symlink, FileTypeExt};
 use std::path::Path;
+
+use super::exec::{Exec, RealExec};
+use super::mount_interface::MountInterface;
+use super::mount_ops::{detect_safe_not_mounted_behavior, Mounter};
+
+/// `losetupPath` (`volume_path_handler.go:33`).
+const LOSETUP_PATH: &str = "losetup";
+/// `ErrDeviceNotFound` (`volume_path_handler.go:34`); upstream compares
+/// `err.Error()` against it, so the error text is the sentinel.
+pub const ERR_DEVICE_NOT_FOUND: &str = "device not found";
+/// The glob root of `getLoopDeviceFromSysfs` (`/sys/block/loop*`).
+const SYS_BLOCK: &str = "/sys/block";
+
+/// `mount.New("")` (`mount_linux.go:79-85`), as `host.rs` builds it.
+fn default_mounter() -> Mounter {
+    Mounter::new("", true, detect_safe_not_mounted_behavior())
+}
 
 /// Port of `VolumePathHandler` (`volume_path_handler.go:55`), the only
 /// implementation of upstream's `BlockVolumePathHandler` interface.
@@ -30,6 +44,25 @@ impl VolumePathHandler {
     /// Port of `MapDevice` (`volume_path_handler.go:67-95`).
     pub fn map_device(
         &self,
+        device_path: &str,
+        map_path: &str,
+        link_name: &str,
+        bind_mount: bool,
+    ) -> Result<()> {
+        self.map_device_with(
+            &default_mounter(),
+            device_path,
+            map_path,
+            link_name,
+            bind_mount,
+        )
+    }
+
+    /// [`Self::map_device`] with the mounter `mapBindMountDevice` builds
+    /// inline (`mount.New("")`) made explicit.
+    pub fn map_device_with(
+        &self,
+        mounter: &dyn MountInterface,
         device_path: &str,
         map_path: &str,
         link_name: &str,
@@ -53,42 +86,60 @@ impl VolumePathHandler {
             bail!("failed to mkdir {map_path}: {e}");
         }
         if bind_mount {
-            bail!(
-                "bind-mount block device mapping is not supported: no mount helper in this \
-                 crate (devicePath {device_path}, linkName {link_name})"
-            );
+            return map_bind_mount_device(mounter, device_path, map_path, link_name);
         }
         map_symlink_device(device_path, map_path, link_name)
     }
 
     /// Port of `UnmapDevice` (`volume_path_handler.go:171-182`).
     pub fn unmap_device(&self, map_path: &str, link_name: &str, bind_mount: bool) -> Result<()> {
+        self.unmap_device_with(&default_mounter(), map_path, link_name, bind_mount)
+    }
+
+    /// [`Self::unmap_device`] with the mounter made explicit.
+    pub fn unmap_device_with(
+        &self,
+        mounter: &dyn MountInterface,
+        map_path: &str,
+        link_name: &str,
+        bind_mount: bool,
+    ) -> Result<()> {
         if map_path.is_empty() {
             bail!("failed to unmap device from map path. mapPath is empty");
         }
         if bind_mount {
-            return self.unmap_bind_mount_device(map_path, link_name);
+            return self.unmap_bind_mount_device(mounter, map_path, link_name);
         }
         self.unmap_symlink_device(map_path, link_name)
     }
 
-    /// Port of `unmapBindMountDevice` (`volume_path_handler.go:184-214`).
-    /// Only the "not mounted" arm is reachable; a live mount is an error
-    /// rather than a silent leak (see the module comment).
-    fn unmap_bind_mount_device(&self, map_path: &str, link_name: &str) -> Result<()> {
+    /// Port of `unmapBindMountDevice` (`volume_path_handler.go:174-214`).
+    fn unmap_bind_mount_device(
+        &self,
+        mounter: &dyn MountInterface,
+        map_path: &str,
+        link_name: &str,
+    ) -> Result<()> {
+        // Check bind mount exists
         let link_path = Path::new(map_path).join(link_name);
         let link_path_str = link_path.to_string_lossy();
-        if self.is_device_bind_mount_exist(&link_path_str)? {
-            bail!(
-                "failed to unmount linkPath {link_path_str}: unmounting is not supported: \
-                 no mount helper in this crate"
-            );
+        if !self.is_device_bind_mount_exist(&link_path_str)? {
+            match fs::metadata(&link_path) {
+                Ok(_) => {}
+                // linkPath has already been removed
+                Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+                Err(e) => bail!("failed to check if path {link_path_str} exists: {e}"),
+            }
+            // Remove file
+            return remove_ignoring_not_found(&link_path);
         }
-        match fs::metadata(&link_path) {
-            Ok(_) => {}
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
-            Err(e) => bail!("failed to check if path {link_path_str} exists: {e}"),
-        }
+
+        // Unmount file
+        mounter
+            .unmount(&link_path_str)
+            .map_err(|e| anyhow::anyhow!("failed to unmount linkPath {link_path_str}: {e}"))?;
+
+        // Remove file
         remove_ignoring_not_found(&link_path)
     }
 
@@ -133,6 +184,49 @@ impl VolumePathHandler {
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
             Err(e) => bail!("failed to Lstat file {map_path}: {e}"),
         }
+    }
+
+    /// Port of `GetDeviceBindMountRefs` (`volume_path_handler.go:284-300`):
+    /// the device nodes (bind mounts) directly under `map_path`.
+    pub fn get_device_bind_mount_refs(
+        &self,
+        _dev_path: &str,
+        map_path: &str,
+    ) -> Result<Vec<String>> {
+        let mut refs = Vec::new();
+        // `os.ReadDir` returns entries sorted by filename.
+        let mut entries: Vec<_> = fs::read_dir(map_path)?.collect::<std::io::Result<_>>()?;
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let ft = entry.file_type()?;
+            if !(ft.is_block_device() || ft.is_char_device()) {
+                continue;
+            }
+            // TODO upstream: might need to check the file is linked to devPath
+            refs.push(
+                Path::new(map_path)
+                    .join(entry.file_name())
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        tracing::trace!("GetDeviceBindMountRefs: refs {refs:?}");
+        Ok(refs)
+    }
+
+    /// Port of `AttachFileDevice` (`volume_path_handler_linux.go:38-54`).
+    pub fn attach_file_device(&self, path: &str) -> Result<String> {
+        attach_file_device_with(&RealExec, Path::new(SYS_BLOCK), path)
+    }
+
+    /// Port of `DetachFileDevice` (`volume_path_handler_linux.go:57-75`).
+    pub fn detach_file_device(&self, path: &str) -> Result<()> {
+        detach_file_device_with(&RealExec, Path::new(SYS_BLOCK), path)
+    }
+
+    /// Port of `GetLoopDevice` (`volume_path_handler_linux.go:77-87`).
+    pub fn get_loop_device(&self, path: &str) -> Result<String> {
+        get_loop_device_with(Path::new(SYS_BLOCK), path)
     }
 
     /// Port of `FindGlobalMapPathUUIDFromPod`
@@ -204,6 +298,178 @@ fn get_device_major_minor(path: &str) -> Result<String> {
     let md = fs::metadata(path).map_err(|e| anyhow::anyhow!("failed to stat path {path}: {e}"))?;
     let rdev = md.rdev();
     Ok(format!("{:x}:{:x}", libc::major(rdev), libc::minor(rdev)))
+}
+
+/// Port of `mapBindMountDevice` (`volume_path_handler.go:111-150`).
+fn map_bind_mount_device(
+    mounter: &dyn MountInterface,
+    device_path: &str,
+    map_path: &str,
+    link_name: &str,
+) -> Result<()> {
+    // Check bind mount exists
+    let link_path = Path::new(map_path).join(link_name);
+    let link_path_str = link_path.to_string_lossy();
+    match fs::metadata(&link_path) {
+        Err(e) => {
+            if e.kind() != ErrorKind::NotFound {
+                bail!("failed to stat file {link_path_str}: {e}");
+            }
+            // Create file (O_CREATE|O_RDWR, 0750)
+            use std::os::unix::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o750)
+                .open(&link_path)
+                .map_err(|e| anyhow::anyhow!("failed to open file {link_path_str}: {e}"))?;
+        }
+        Ok(md) => {
+            // Check if device file
+            // TODO upstream: check this is actually the expected bind mount
+            let ft = md.file_type();
+            if ft.is_block_device() || ft.is_char_device() {
+                tracing::warn!(
+                    "Warning: Map skipped because bind mount already exists on the path: {link_path_str}"
+                );
+                return Ok(());
+            }
+            tracing::warn!(
+                "Warning: file {link_path_str} already exists but is not mounted, skip creating file"
+            );
+        }
+    }
+
+    // Bind mount file
+    mounter
+        .mount_sensitive_without_systemd(
+            device_path,
+            &link_path_str,
+            "",
+            &["bind".to_string()],
+            &[],
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to bind mount devicePath: {device_path} to linkPath {link_path_str}: {e}"
+            )
+        })
+}
+
+/// Port of `AttachFileDevice` over an injectable `losetup` runner / sysfs.
+fn attach_file_device_with(exec: &dyn Exec, sys_block: &Path, path: &str) -> Result<String> {
+    let mut block_device_path = match get_loop_device_with(sys_block, path) {
+        Ok(p) => p,
+        Err(e) if e.to_string() == ERR_DEVICE_NOT_FOUND => String::new(),
+        Err(e) => bail!("GetLoopDevice failed for path {path}: {e}"),
+    };
+    // If no existing loop device for the path, create one
+    if block_device_path.is_empty() {
+        tracing::debug!("Creating device for path: {path}");
+        block_device_path = make_loop_device(exec, sys_block, path)
+            .map_err(|e| anyhow::anyhow!("makeLoopDevice failed for path {path}: {e}"))?;
+    }
+    Ok(block_device_path)
+}
+
+/// Port of `DetachFileDevice` over an injectable `losetup` runner / sysfs.
+fn detach_file_device_with(exec: &dyn Exec, sys_block: &Path, path: &str) -> Result<()> {
+    match get_loop_device_with(sys_block, path) {
+        Err(e) if e.to_string() == ERR_DEVICE_NOT_FOUND => {
+            tracing::warn!(
+                "couldn't find loopback device which takes file descriptor lock. Skip detaching device. device path: {path:?}"
+            );
+            Ok(())
+        }
+        Err(e) => bail!("GetLoopDevice failed for path {path}: {e}"),
+        Ok(loop_path) => {
+            if !loop_path.is_empty() {
+                remove_loop_device(exec, &loop_path)
+                    .map_err(|e| anyhow::anyhow!("removeLoopDevice failed for path {path}: {e}"))?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Port of `GetLoopDevice` (`volume_path_handler_linux.go:77-87`).
+fn get_loop_device_with(sys_block: &Path, path: &str) -> Result<String> {
+    match fs::metadata(path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => bail!("{ERR_DEVICE_NOT_FOUND}"),
+        Err(e) => bail!("not attachable: {e}"),
+    }
+    get_loop_device_from_sysfs(sys_block, path)
+}
+
+/// Port of `makeLoopDevice` (`volume_path_handler_linux.go:89-101`).
+fn make_loop_device(exec: &dyn Exec, sys_block: &Path, path: &str) -> Result<String> {
+    let args = vec!["-f".to_string(), path.to_string()];
+    let (out, res) = exec.combined_output(LOSETUP_PATH, &args);
+    if let Err(e) = res {
+        tracing::debug!("Failed device create command for path: {path} {e} {out}");
+        bail!("losetup {} failed: {e}", args.join(" "));
+    }
+    get_loop_device_from_sysfs(sys_block, path)
+}
+
+/// Port of `removeLoopDevice` (`volume_path_handler_linux.go:103-114`).
+fn remove_loop_device(exec: &dyn Exec, device: &str) -> Result<()> {
+    let args = vec!["-d".to_string(), device.to_string()];
+    let (out, res) = exec.combined_output(LOSETUP_PATH, &args);
+    if let Err(e) = res {
+        if matches!(fs::metadata(device), Err(me) if me.kind() == ErrorKind::NotFound) {
+            return Ok(());
+        }
+        tracing::debug!("Failed to remove loopback device: {device}: {e} {out}");
+        bail!("losetup -d {device} failed: {e}");
+    }
+    Ok(())
+}
+
+/// Port of `getLoopDeviceFromSysfs` (`volume_path_handler_linux.go:119-148`):
+/// the backing file of each `<sys_block>/loop*/loop/backing_file`.
+fn get_loop_device_from_sysfs(sys_block: &Path, path: &str) -> Result<String> {
+    // If the file is a symlink.
+    let real_path = fs::canonicalize(path)
+        .map_err(|e| anyhow::anyhow!("failed to evaluate path {path}: {e}"))?;
+    let real_path = real_path.to_string_lossy();
+
+    // `filepath.Glob("/sys/block/loop*")` is lexical; an unreadable sysfs
+    // directory yields no matches rather than an error.
+    let mut devices: Vec<_> = match fs::read_dir(sys_block) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("loop"))
+            .map(|e| e.path())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    devices.sort();
+
+    for device in devices {
+        // The contents of this file is the absolute path of "path".
+        let Ok(data) = fs::read_to_string(device.join("loop/backing_file")) else {
+            continue;
+        };
+        // Return the first match.
+        let backing = clean_backing_file_path(&data);
+        if backing == path || backing == real_path {
+            let base = device.file_name().unwrap_or_default().to_string_lossy();
+            return Ok(format!("/dev/{base}"));
+        }
+    }
+    bail!("{ERR_DEVICE_NOT_FOUND}")
+}
+
+/// Port of `cleanBackingFilePath` (`volume_path_handler_linux.go:151-156`).
+fn clean_backing_file_path(path: &str) -> String {
+    // If the block device was deleted, the path will contain a "(deleted)" suffix
+    let path = path.trim();
+    let path = path.strip_suffix("(deleted)").unwrap_or(path);
+    path.trim().to_string()
 }
 
 /// Port of `mapSymlinkDevice` (`volume_path_handler.go:160-169`): replace
@@ -361,12 +627,8 @@ mod tests {
             .is_symlink_exist(f.to_str().unwrap())
             .unwrap());
     }
-
-    #[test]
-    fn bind_mount_mapping_is_an_explicit_error() {
-        let tmp = tempdir().unwrap();
-        let e =
-            err_of(VolumePathHandler.map_device("/dev/x", tmp.path().to_str().unwrap(), "l", true));
-        assert!(e.contains("not supported"), "{e}");
-    }
 }
+
+#[cfg(test)]
+#[path = "volumepathhandler_bind_loop_tests.rs"]
+mod bind_mount_and_loop_tests;
