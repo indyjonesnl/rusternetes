@@ -345,6 +345,7 @@ mod status_subresource_test;
 mod storage_classes_store_test;
 mod storage_topology_decode_test;
 mod storageclass_handler_test;
+mod storageversionmigration_3798_test;
 mod strategy_batch_test;
 mod strategy_pod_test;
 mod strategy_rbac_namespace_test;
