@@ -33,7 +33,7 @@ use rusternetes_common::validation::crd::{
     validate_custom_resource_definition_update, validate_update_custom_resource_definition_status,
     CUSTOM_RESOURCE_CLEANUP_FINALIZER,
 };
-use rusternetes_common::validation::field::{Error as FieldError, ErrorList, Path};
+use rusternetes_common::validation::field::{ErrorList, Path};
 use rusternetes_common::{Error, Result};
 use rusternetes_storage::{build_prefix, Storage, StorageBackend};
 use tracing::warn;
@@ -101,35 +101,26 @@ fn schema_rule_errors_in(
     old: Option<&CustomResourceDefinition>,
     env_set: &rusternetes_common::cel_versions::EnvSet,
 ) -> ErrorList {
-    // `findPreexistingExpressions(&oldObj.Spec)` (validation.go:241); nil on
-    // create (validation.go:153).
+    // `findPreexistingExpressions(&oldObj.Spec)` (validation.go:241); empty
+    // on create (validation.go:153).
     let preexisting = old
-        .map(|o| crate::handlers::cel_validation::find_preexisting_rules(&o.spec))
+        .map(|o| crate::handlers::cel_validation::find_preexisting_expressions(&o.spec))
         .unwrap_or_default();
     let mut errs = Vec::new();
     for (i, version) in crd.spec.versions.iter().enumerate() {
         let Some(validation) = &version.schema else {
             continue;
         };
-        if let Err(e) = crate::handlers::cel_validation::validate_crd_rules_in(
+        errs.extend(crate::handlers::cel_validation::validate_crd_schema_rules(
             &validation.open_apiv3_schema,
+            &Path::new("spec")
+                .child("versions")
+                .index(i)
+                .child("schema")
+                .child("openAPIV3Schema"),
             env_set,
             &preexisting,
-        ) {
-            let detail = match e {
-                Error::InvalidResource(msg) => msg,
-                other => other.to_string(),
-            };
-            errs.push(FieldError::invalid(
-                &Path::new("spec")
-                    .child("versions")
-                    .index(i)
-                    .child("schema")
-                    .child("openAPIV3Schema"),
-                String::new(),
-                detail,
-            ));
-        }
+        ));
     }
     errs
 }
@@ -1767,6 +1758,178 @@ mod tests {
         // A rule not in the old CRD is still new.
         let other = crd_with_rule("semver('1.2.3').minor() > 0");
         assert!(!schema_rule_errors_in(&other, Some(&old), &env_set).is_empty());
+    }
+
+    fn crd_with_schema(schema: serde_json::Value) -> CustomResourceDefinition {
+        crd(serde_json::json!({"spec": {
+            "group": "example.com",
+            "scope": "Namespaced",
+            "names": {"plural": "widgets", "kind": "Widget"},
+            "versions": [{"name": "v1", "served": true, "storage": true,
+                "schema": {"openAPIV3Schema": schema}}]
+        }}))
+    }
+
+    const SEMVER_RULE: &str = "semver('1.2.3').major() > 0";
+    const P: &str = "spec.versions[0].schema.openAPIV3Schema";
+
+    fn env_1_32() -> rusternetes_common::cel_versions::EnvSet {
+        rusternetes_common::cel_versions::EnvSet::must_base_env_set(
+            rusternetes_common::feature_gates::Version::major_minor(1, 32),
+        )
+    }
+
+    fn fields(errs: &ErrorList) -> Vec<(String, String)> {
+        let mut v: Vec<_> = errs
+            .iter()
+            .map(|e| (format!("{:?}", e.error_type), e.field.clone()))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// `ValidateCustomResourceDefinitionOpenAPISchema` recurses into
+    /// `additionalProperties` (validation.go:1065), `properties` (:1084) and
+    /// `items` (:1128, :1132) with a non-nil `celContext`, so a rule below any
+    /// of them is compiled and reported at its own path (:1292).
+    #[test]
+    fn rules_under_items_and_additional_properties_are_compiled() {
+        let rules = serde_json::json!([{"rule": SEMVER_RULE}]);
+        let c = crd_with_schema(serde_json::json!({"type": "object", "properties": {
+            "array": {"type": "array", "items": {"type": "string",
+                "x-kubernetes-validations": rules}},
+            "map": {"type": "object", "additionalProperties": {"type": "string",
+                "x-kubernetes-validations": rules}},
+            "tuple": {"type": "array", "items": [{"type": "string"},
+                {"type": "string", "x-kubernetes-validations": rules}]}
+        }}));
+        assert_eq!(
+            fields(&schema_rule_errors_in(&c, None, &env_1_32())),
+            vec![
+                (
+                    "Invalid".to_string(),
+                    format!("{P}.properties[array].items.x-kubernetes-validations[0].rule")
+                ),
+                (
+                    "Invalid".to_string(),
+                    format!(
+                        "{P}.properties[map].additionalProperties.x-kubernetes-validations[0].rule"
+                    )
+                ),
+                (
+                    "Invalid".to_string(),
+                    format!("{P}.properties[tuple].items[1].x-kubernetes-validations[0].rule")
+                ),
+            ]
+        );
+    }
+
+    /// `allOf`/`anyOf`/`oneOf`/`not`/`definitions`/`dependencies` recurse with
+    /// a nil `celContext` (validation.go:1088-1141): their rules are NOT
+    /// compiled upstream either.
+    #[test]
+    fn rules_under_combinators_are_not_compiled_as_upstream() {
+        let rules = serde_json::json!([{"rule": SEMVER_RULE}]);
+        let c = crd_with_schema(serde_json::json!({"type": "object", "properties": {
+            "f": {"type": "string", "allOf": [{"x-kubernetes-validations": rules}],
+                "not": {"x-kubernetes-validations": rules}}}}));
+        assert!(schema_rule_errors_in(&c, None, &env_1_32()).is_empty());
+    }
+
+    fn crd_with_msg(rule: &str, msg_expr: &str) -> CustomResourceDefinition {
+        let v = serde_json::json!([{"rule": rule, "messageExpression": msg_expr}]);
+        crd_with_schema(serde_json::json!({"type": "object", "properties": {
+            "x": {"type": "string", "x-kubernetes-validations": v},
+            "obj": {"type": "object", "x-kubernetes-validations": v,
+                "properties": {"a": {"type": "string", "x-kubernetes-validations": v}}},
+            "array": {"type": "array", "x-kubernetes-validations": v,
+                "items": {"type": "string", "x-kubernetes-validations": v}},
+            "map": {"type": "object", "x-kubernetes-validations": v,
+                "additionalProperties": {"type": "string", "x-kubernetes-validations": v}}
+        }}))
+    }
+
+    /// `TestValidateCustomResourceDefinitionValidationRuleCompatibility`
+    /// (validation_test.go:8168-8290): `preexistingExpressions.
+    /// MessageExpressionEnv` (validation.go:165-169) compiles an unchanged
+    /// messageExpression in the stored environment and a changed one in the
+    /// new-expressions environment.
+    #[test]
+    fn message_expression_compiles_in_stored_env_only_if_unchanged() {
+        let me = "'v: %s'.format([semver('1.2.3').major()])";
+        let rule = "true";
+        let old = crd_with_msg(rule, me);
+        assert!(schema_rule_errors_in(&crd_with_msg(rule, me), Some(&old), &env_1_32()).is_empty());
+        assert!(!schema_rule_errors_in(&crd_with_msg(rule, me), None, &env_1_32()).is_empty());
+        let changed = "'w: %s'.format([semver('1.2.3').major()])";
+        let errs = schema_rule_errors_in(&crd_with_msg(rule, changed), Some(&old), &env_1_32());
+        let me_path = |p: &str| {
+            (
+                "Invalid".to_string(),
+                format!("{P}.{p}.x-kubernetes-validations[0].messageExpression"),
+            )
+        };
+        let mut want = vec![
+            me_path("properties[x]"),
+            me_path("properties[obj]"),
+            me_path("properties[obj].properties[a]"),
+            me_path("properties[array]"),
+            me_path("properties[array].items"),
+            me_path("properties[map]"),
+            me_path("properties[map].additionalProperties"),
+        ];
+        want.sort();
+        assert_eq!(fields(&errs), want);
+    }
+
+    fn one_rule(rule: &str, msg_expr: &str) -> CustomResourceDefinition {
+        crd_with_schema(serde_json::json!({"type": "object", "properties": {
+            "f": {"type": "string", "x-kubernetes-validations":
+                [{"rule": rule, "messageExpression": msg_expr}]}}}))
+    }
+
+    /// validation_test.go:10991-11010 (syntax error) and :11125-11144
+    /// (whitespace only: validation.go:1243-1245, a schema error).
+    #[test]
+    fn message_expression_syntax_and_whitespace_errors() {
+        let env = env_1_32();
+        let errs = schema_rule_errors_in(&one_rule("self == 'a'", "self + \" "), None, &env);
+        assert_eq!(
+            fields(&errs),
+            vec![(
+                "Invalid".to_string(),
+                format!("{P}.properties[f].x-kubernetes-validations[0].messageExpression")
+            )]
+        );
+        assert!(errs[0]
+            .detail
+            .starts_with("messageExpression compilation failed: "));
+        let errs = schema_rule_errors_in(&one_rule("self == 'a'", "     "), None, &env);
+        assert_eq!(
+            fields(&errs),
+            vec![(
+                "Required".to_string(),
+                format!("{P}.properties[f].x-kubernetes-validations[0].messageExpression")
+            )]
+        );
+        assert_eq!(
+            errs[0].detail,
+            "messageExpression must be non-empty if specified"
+        );
+    }
+
+    /// `compileRule` (compilation.go:236-250) returns before compiling the
+    /// messageExpression when the rule itself fails.
+    #[test]
+    fn rule_error_short_circuits_message_expression() {
+        let errs = schema_rule_errors_in(&one_rule(SEMVER_RULE, "bad("), None, &env_1_32());
+        assert_eq!(
+            fields(&errs),
+            vec![(
+                "Invalid".to_string(),
+                format!("{P}.properties[f].x-kubernetes-validations[0].rule")
+            )]
+        );
     }
 
     fn crd_with_props(props: serde_json::Value) -> CustomResourceDefinition {

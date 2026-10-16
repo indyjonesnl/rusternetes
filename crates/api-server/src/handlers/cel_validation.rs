@@ -25,8 +25,10 @@
 use rusternetes_common::cel_versions::{compile_failure, EnvSet, EnvType};
 use rusternetes_common::resources::{
     CustomResource, CustomResourceDefinition, CustomResourceDefinitionSpec, JSONSchemaProps,
+    JSONSchemaPropsOrArray, JSONSchemaPropsOrBool,
 };
 use rusternetes_common::schema_validation::PathSeg;
+use rusternetes_common::validation::field::{Error as FieldError, Path};
 use rusternetes_common::{CELContext, CELEvaluator, Error, Result};
 use std::collections::HashSet;
 
@@ -96,47 +98,19 @@ fn collect_rules_recursive(
     }
 }
 
-/// Walk a schema and report the first unknown property reference in any
-/// `x-kubernetes-validations[].rule`. A rule reference like `self.foo` is
-/// "known" if `foo` is declared in the same schema's `properties` map.
+/// The first unknown property reference in one `x-kubernetes-validations`
+/// rule of `schema`. A rule reference like `self.foo` is "known" if `foo` is
+/// declared in the same schema's `properties` map.
 ///
-/// This is a deliberately conservative heuristic — it only flags obvious
-/// references such as `self.<ident>` against a schema with `type: object`
-/// and a declared `properties` map. More subtle references (chained accesses,
-/// dynamic indexing) are deferred to runtime.
-pub fn detect_unknown_property(schema: &JSONSchemaProps) -> Option<String> {
-    detect_unknown_property_recursive(schema)
-}
-
-fn detect_unknown_property_recursive(schema: &JSONSchemaProps) -> Option<String> {
-    if let Some(rules) = &schema.x_kubernetes_validations {
-        let known: Option<Vec<String>> = schema
-            .properties
-            .as_ref()
-            .map(|p| p.keys().cloned().collect());
-        if let Some(known) = known {
-            for raw in rules {
-                let rule_str = raw
-                    .as_object()
-                    .and_then(|o| o.get("rule"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if let Some(prop) = first_self_reference(rule_str) {
-                    if !known.iter().any(|k| k == &prop) {
-                        return Some(prop);
-                    }
-                }
-            }
-        }
-    }
-    if let Some(properties) = &schema.properties {
-        for child in properties.values() {
-            if let Some(err) = detect_unknown_property_recursive(child) {
-                return Some(err);
-            }
-        }
-    }
-    None
+/// This is a deliberately conservative heuristic (no schema-typed CEL
+/// environment exists yet): it only flags obvious references such as
+/// `self.<ident>` against a schema with a declared `properties` map. More
+/// subtle references (chained accesses, dynamic indexing) are deferred to
+/// runtime.
+fn unknown_property_in_rule(schema: &JSONSchemaProps, rule: &str) -> Option<String> {
+    let known = schema.properties.as_ref()?;
+    let prop = first_self_reference(rule)?;
+    (!known.contains_key(&prop)).then_some(prop)
 }
 
 /// Return the first `self.<ident>` access in `rule`, or `None` if there is
@@ -219,80 +193,265 @@ pub fn estimate_cost(rule: &str) -> u64 {
     cost
 }
 
-/// `findPreexistingExpressions` (apiextensions validation.go:172-183) for the
-/// `rules` set: every `x-kubernetes-validations[].rule` anywhere in any
-/// version's schema (`SchemaHas`, validation.go:1659, walks the whole schema
-/// and `findPreexistingExpressionsInSchema` never stops it, :185-195).
-/// The deprecated top-level `spec.validation` is v1-only and not modelled.
-///
-/// `messageExpressions` (validation.go:155, 165-169) is not collected: this
-/// module does not compile `messageExpression` at all yet.
-pub fn find_preexisting_rules(spec: &CustomResourceDefinitionSpec) -> HashSet<String> {
+/// `preexistingExpressions` (apiextensions validation.go:153-156): the rules
+/// and messageExpressions the stored CRD already carries.
+#[derive(Debug, Default, Clone)]
+pub struct PreexistingExpressions {
+    pub rules: HashSet<String>,
+    pub message_expressions: HashSet<String>,
+}
+
+impl PreexistingExpressions {
+    /// `RuleEnv` (validation.go:158-163): a rule already stored on the CRD
+    /// compiles in `StoredExpressions`, any other in `NewExpressions` at the
+    /// compatibility version.
+    pub fn rule_env(&self, expression: &str) -> EnvType {
+        if self.rules.contains(expression) {
+            EnvType::StoredExpressions
+        } else {
+            EnvType::NewExpressions
+        }
+    }
+
+    /// `MessageExpressionEnv` (validation.go:165-170).
+    pub fn message_expression_env(&self, expression: &str) -> EnvType {
+        if self.message_expressions.contains(expression) {
+            EnvType::StoredExpressions
+        } else {
+            EnvType::NewExpressions
+        }
+    }
+}
+
+/// `findPreexistingExpressions` (apiextensions validation.go:172-183): every
+/// `x-kubernetes-validations[].rule` and non-empty `messageExpression`
+/// anywhere in any version's schema (`SchemaHas`, validation.go:1659, walks
+/// the whole schema and `findPreexistingExpressionsInSchema` never stops it,
+/// :185-195). The deprecated top-level `spec.validation` is v1-only and not
+/// modelled.
+pub fn find_preexisting_expressions(spec: &CustomResourceDefinitionSpec) -> PreexistingExpressions {
     use std::cell::RefCell;
-    let rules = RefCell::new(HashSet::new());
+    let found = RefCell::new(PreexistingExpressions::default());
     for v in &spec.versions {
         if let Some(validation) = &v.schema {
             rusternetes_common::validation::crd::schema_has(&validation.open_apiv3_schema, &|s| {
                 for raw in s.x_kubernetes_validations.iter().flatten() {
                     if let Some(rule) = raw.get("rule").and_then(|r| r.as_str()) {
-                        rules.borrow_mut().insert(rule.to_string());
+                        found.borrow_mut().rules.insert(rule.to_string());
+                    }
+                    if let Some(me) = raw
+                        .get("messageExpression")
+                        .and_then(|r| r.as_str())
+                        .filter(|m| !m.is_empty())
+                    {
+                        found
+                            .borrow_mut()
+                            .message_expressions
+                            .insert(me.to_string());
                     }
                 }
                 false
             });
         }
     }
-    rules.into_inner()
+    found.into_inner()
 }
 
-/// Validate every `x-kubernetes-validations[].rule` on `schema` at CRD admission
-/// against an explicit environment set; rules in `preexisting` are compiled in
-/// the stored environment.
+/// `getCostErrorMessage` (validation.go:1352-1366).
+fn get_cost_error_message(cost_name: &str, expression_cost: u64, cost_limit: u64) -> String {
+    let exceed_factor = expression_cost as f64 / cost_limit as f64;
+    let factor = if exceed_factor > 100.0 {
+        "more than 100x".to_string()
+    } else if exceed_factor < 1.5 {
+        format!("{exceed_factor:.6}x")
+    } else {
+        format!("{exceed_factor:.1}x")
+    };
+    format!("{cost_name} exceeds budget by factor of {factor} (try simplifying the rule, or adding maxItems, maxProperties, and maxLength where arrays, maps, and strings are declared)")
+}
+
+/// The CEL half of `ValidateCustomResourceDefinitionOpenAPISchema` for one
+/// version's `openAPIV3Schema` at `fld_path`.
 ///
-/// Returns an error if any rule is malformed (compile error), references an
-/// unknown property at the same level, or exceeds the estimated-cost budget.
-pub fn validate_crd_rules_in(
+/// Not ported: the per-CRD `TotalCost` (`StaticEstimatedCRDCostLimit`,
+/// validation.go:981-992, cel_validation.go:260-297) and the per-schema
+/// cardinality multiplication (`getExpressionCost`, validation.go:1345): both
+/// need a real cost estimator, and the coarse [`estimate_cost`] heuristic
+/// would reject valid CRDs with them.
+///
+/// Rules are compiled against `env_set`; those already stored on the CRD
+/// (`pre`) in the stored environment. Rust has no schema-typed CEL
+/// environment or cost estimator yet, so compile errors are the
+/// undeclared-reference / syntax checks of `cel_versions` and the CEL parser,
+/// and costs come from the coarse [`estimate_cost`] heuristic.
+pub fn validate_crd_schema_rules(
     schema: &JSONSchemaProps,
+    fld_path: &Path,
     env_set: &EnvSet,
-    preexisting: &HashSet<String>,
-) -> Result<()> {
-    let rules = collect_rules(schema);
-    for r in &rules {
-        if estimate_cost(&r.rule) > DEFAULT_RULE_COST_LIMIT {
-            return Err(Error::InvalidResource(format!(
-                "x-kubernetes-validations rule exceeded the estimated cost limit: {}",
-                r.rule
-            )));
-        }
-        // `preexistingExpressions.RuleEnv` (apiextensions validation.go:158-163):
-        // a rule already stored on the CRD compiles in `StoredExpressions`,
-        // any other in `NewExpressions` at the compatibility version.
-        let env = if preexisting.contains(&r.rule) {
-            EnvType::StoredExpressions
-        } else {
-            EnvType::NewExpressions
-        };
-        if let Some(detail) = compile_failure(&r.rule, env_set, env) {
-            return Err(Error::InvalidResource(format!(
-                "x-kubernetes-validations rule is invalid: {}: {}",
-                r.rule, detail
-            )));
-        }
-        // Compile-time syntax check.
-        let mut ev = CELEvaluator::new();
-        if let Err(err) = ev.type_check(&r.rule) {
-            return Err(Error::InvalidResource(format!(
-                "x-kubernetes-validations rule is invalid: {}: {}",
-                r.rule, err
-            )));
+    pre: &PreexistingExpressions,
+) -> Vec<FieldError> {
+    let mut errs = Vec::new();
+    compile_schema_rules(schema, fld_path, env_set, pre, &mut errs);
+    errs
+}
+
+/// The recursion of `ValidateCustomResourceDefinitionOpenAPISchema`
+/// (validation.go:1031-1322) restricted to the sub-schemas it passes a
+/// non-nil `celContext`: `additionalProperties` (:1065), `properties`
+/// (:1084), `items` (:1128) and tuple `items[i]` (:1132). `not`, `allOf`,
+/// `oneOf`, `anyOf`, `definitions` and `dependencies` recurse with a nil
+/// context (:1088-1141), so their rules are not compiled.
+///
+/// Returns whether a schema error occurred here or deeper: CEL compilation
+/// is skipped for the node then (:1264-1268).
+fn compile_schema_rules(
+    schema: &JSONSchemaProps,
+    fld_path: &Path,
+    env_set: &EnvSet,
+    pre: &PreexistingExpressions,
+    errs: &mut Vec<FieldError>,
+) -> bool {
+    let mut schema_errors = false;
+    if let Some(JSONSchemaPropsOrBool::Schema(child)) = schema.additional_properties.as_deref() {
+        schema_errors |= compile_schema_rules(
+            child,
+            &fld_path.child("additionalProperties"),
+            env_set,
+            pre,
+            errs,
+        );
+    }
+    if let Some(properties) = &schema.properties {
+        let mut names: Vec<&String> = properties.keys().collect();
+        names.sort();
+        for name in names {
+            schema_errors |= compile_schema_rules(
+                &properties[name],
+                &fld_path.child("properties").key(name.clone()),
+                env_set,
+                pre,
+                errs,
+            );
         }
     }
-    if let Some(unknown) = detect_unknown_property(schema) {
-        return Err(Error::InvalidResource(format!(
-            "x-kubernetes-validations rule refers to unknown property: {unknown}"
-        )));
+    match schema.items.as_deref() {
+        Some(JSONSchemaPropsOrArray::Schema(i)) => {
+            schema_errors |= compile_schema_rules(i, &fld_path.child("items"), env_set, pre, errs);
+        }
+        Some(JSONSchemaPropsOrArray::Schemas(list)) => {
+            for (i, item) in list.iter().enumerate() {
+                schema_errors |= compile_schema_rules(
+                    item,
+                    &fld_path.child("items").index(i),
+                    env_set,
+                    pre,
+                    errs,
+                );
+            }
+        }
+        None => {}
     }
-    Ok(())
+
+    let Some(validations) = schema
+        .x_kubernetes_validations
+        .as_ref()
+        .filter(|v| !v.is_empty())
+    else {
+        return schema_errors;
+    };
+    let rule_path = |i: usize| fld_path.child("x-kubernetes-validations").index(i);
+    // validation.go:1243-1245.
+    for (i, raw) in validations.iter().enumerate() {
+        let me = raw
+            .get("messageExpression")
+            .and_then(|m| m.as_str())
+            .unwrap_or("");
+        if !me.is_empty() && me.trim().is_empty() {
+            errs.push(FieldError::required(
+                &rule_path(i).child("messageExpression"),
+                "messageExpression must be non-empty if specified",
+            ));
+            schema_errors = true;
+        }
+    }
+    if schema_errors {
+        return true;
+    }
+
+    for (i, raw) in validations.iter().enumerate() {
+        let rule = raw.get("rule").and_then(|r| r.as_str()).unwrap_or("");
+        if rule.trim().is_empty() {
+            // compileRule: an empty result, no error (compilation.go:236-241).
+            continue;
+        }
+        let rule_field = rule_path(i).child("rule");
+        // compileRule (compilation.go:242-246), then the unknown-property
+        // heuristic standing in for the schema-typed checker.
+        let failure = compile_failure(rule, env_set, pre.rule_env(rule))
+            .or_else(|| {
+                CELEvaluator::new()
+                    .type_check(rule)
+                    .err()
+                    .map(|e| format!("compilation failed: {e}"))
+            })
+            .or_else(|| {
+                unknown_property_in_rule(schema, rule).map(|prop| {
+                    format!("x-kubernetes-validations rule refers to unknown property: {prop}")
+                })
+            });
+        if let Some(detail) = failure {
+            errs.push(FieldError::invalid(&rule_field, raw.clone(), detail));
+            // compileRule returns before the messageExpression (:242-246).
+            continue;
+        }
+        // validation.go:1280-1287.
+        let cost = estimate_cost(rule);
+        if cost > DEFAULT_RULE_COST_LIMIT {
+            errs.push(FieldError::forbidden(
+                &rule_field,
+                get_cost_error_message("estimated rule cost", cost, DEFAULT_RULE_COST_LIMIT),
+            ));
+        }
+        // compileRule's messageExpression (compilation.go:253-287), and
+        // validation.go:1295-1307.
+        let me = raw
+            .get("messageExpression")
+            .and_then(|m| m.as_str())
+            .unwrap_or("");
+        if me.is_empty() {
+            continue;
+        }
+        let me_field = rule_path(i).child("messageExpression");
+        let me_failure = compile_failure(me, env_set, pre.message_expression_env(me))
+            .map(|d| {
+                format!(
+                    "messageExpression compilation failed: {}",
+                    d.strip_prefix("compilation failed: ").unwrap_or(&d)
+                )
+            })
+            .or_else(|| {
+                CELEvaluator::new()
+                    .type_check(me)
+                    .err()
+                    .map(|e| format!("messageExpression compilation failed: {e}"))
+            });
+        if let Some(detail) = me_failure {
+            errs.push(FieldError::invalid(&me_field, raw.clone(), detail));
+            continue;
+        }
+        let me_cost = estimate_cost(me);
+        if me_cost > DEFAULT_RULE_COST_LIMIT {
+            errs.push(FieldError::forbidden(
+                &me_field,
+                get_cost_error_message(
+                    "estimated messageExpression cost",
+                    me_cost,
+                    DEFAULT_RULE_COST_LIMIT,
+                ),
+            ));
+        }
+    }
+    false
 }
 
 /// Locate the JSON sub-tree the rule targets, given its `path` of property
@@ -701,14 +860,22 @@ mod tests {
     fn new_rules_are_compiled_at_the_compatibility_version() {
         let schema = schema_with_rule("semver('1.2.3').major() > 0", "m");
         let at_1_32 = EnvSet::must_base_env_set(Version::major_minor(1, 32));
-        let err = validate_crd_rules_in(&schema, &at_1_32, &HashSet::new()).unwrap_err();
+        let root = Path::new("openAPIV3Schema");
+        let pre = PreexistingExpressions::default();
+        let errs = validate_crd_schema_rules(&schema, &root, &at_1_32, &pre);
+        assert_eq!(errs.len(), 1, "{errs:?}");
         assert!(
-            err.to_string()
+            errs[0]
+                .detail
                 .contains("undeclared reference to 'semver' (in container '')"),
-            "{err}"
+            "{errs:?}"
+        );
+        assert_eq!(
+            errs[0].field,
+            "openAPIV3Schema.properties[spec].x-kubernetes-validations[0].rule"
         );
         let at_1_33 = EnvSet::must_base_env_set(Version::major_minor(1, 33));
-        assert!(validate_crd_rules_in(&schema, &at_1_33, &HashSet::new()).is_ok());
+        assert!(validate_crd_schema_rules(&schema, &root, &at_1_33, &pre).is_empty());
     }
 
     /// A rule already stored on the CRD is compiled in `StoredExpressions`.
@@ -717,8 +884,12 @@ mod tests {
         let rule = "semver('1.2.3').major() > 0";
         let schema = schema_with_rule(rule, "m");
         let at_1_32 = EnvSet::must_base_env_set(Version::major_minor(1, 32));
-        let pre: HashSet<String> = [rule.to_string()].into();
-        assert!(validate_crd_rules_in(&schema, &at_1_32, &pre).is_ok());
+        let pre = PreexistingExpressions {
+            rules: [rule.to_string()].into(),
+            ..Default::default()
+        };
+        let root = Path::new("openAPIV3Schema");
+        assert!(validate_crd_schema_rules(&schema, &root, &at_1_32, &pre).is_empty());
     }
 
     #[test]
@@ -743,8 +914,10 @@ mod tests {
     #[test]
     fn detect_unknown_property_flags_misspelling() {
         let schema = schema_with_rule("self.replicaz <= 100", "msg");
-        let unknown = detect_unknown_property(&schema);
+        let spec = &schema.properties.as_ref().unwrap()["spec"];
+        let unknown = unknown_property_in_rule(spec, "self.replicaz <= 100");
         assert_eq!(unknown.as_deref(), Some("replicaz"));
+        assert_eq!(unknown_property_in_rule(spec, "self.replicas <= 100"), None);
     }
 
     #[test]
