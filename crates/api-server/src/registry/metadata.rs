@@ -718,6 +718,16 @@ impl HasMetadata for rusternetes_common::resources::EventV1 {
     }
 }
 
+impl HasMetadata for rusternetes_common::resources::devicetaintrule::DeviceTaintRule {
+    fn metadata(&self) -> &rusternetes_common::types::ObjectMeta {
+        &self.metadata
+    }
+
+    fn metadata_mut(&mut self) -> &mut rusternetes_common::types::ObjectMeta {
+        &mut self.metadata
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::HasMetadata;

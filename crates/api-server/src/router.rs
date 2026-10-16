@@ -1929,6 +1929,27 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             "/apis/certificates.k8s.io/v1beta1/podcertificaterequests",
             get(handlers::podcertificaterequest::list_all),
         )
+        // Resource v1alpha3 API - DeviceTaintRules (cluster-scoped; 404 unless
+        // the DRADeviceTaintRules gate is on)
+        .route(
+            "/apis/resource.k8s.io/v1alpha3/devicetaintrules",
+            get(handlers::devicetaintrule::list)
+                .post(handlers::devicetaintrule::create)
+                .delete(handlers::devicetaintrule::deletecollection),
+        )
+        .route(
+            "/apis/resource.k8s.io/v1alpha3/devicetaintrules/:name",
+            get(handlers::devicetaintrule::get)
+                .put(handlers::devicetaintrule::update)
+                .patch(handlers::devicetaintrule::patch)
+                .delete(handlers::devicetaintrule::delete),
+        )
+        .route(
+            "/apis/resource.k8s.io/v1alpha3/devicetaintrules/:name/status",
+            get(handlers::devicetaintrule::get_status)
+                .put(handlers::devicetaintrule::update_status)
+                .patch(handlers::devicetaintrule::patch_status),
+        )
         // Coordination v1 API - Leases (namespace-scoped)
         .route(
             "/apis/coordination.k8s.io/v1/namespaces/:namespace/leases",

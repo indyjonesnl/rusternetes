@@ -18,6 +18,7 @@ pub mod daemonset;
 pub mod defaults;
 pub mod deployment;
 pub mod deviceclass;
+pub mod devicetaintrule;
 pub mod external_metrics;
 pub mod list_options;
 pub mod metric_selectors;

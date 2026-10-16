@@ -918,7 +918,7 @@ pub struct CapacityRequestPolicyRange {
     pub step: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceTaint {
     /// Key is the taint key to be applied to a device

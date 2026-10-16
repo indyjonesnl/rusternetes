@@ -15,6 +15,7 @@ pub mod crd;
 pub mod csi;
 pub mod custom_metrics;
 pub mod deployment;
+pub mod devicetaintrule;
 pub mod dra;
 pub mod endpoints;
 pub mod endpointslice;

@@ -2077,6 +2077,7 @@ fn resource_type_to_kind_and_version(resource_type: &str, api_group: &str) -> (S
         "resourceclaims" => "ResourceClaim",
         "resourceclaimtemplates" => "ResourceClaimTemplate",
         "deviceclasses" => "DeviceClass",
+        "devicetaintrules" => "DeviceTaintRule",
         other => {
             // CamelCase heuristic: capitalize first letter, remove trailing 's'
             let s = other.strip_suffix('s').unwrap_or(other);
@@ -2093,6 +2094,9 @@ fn resource_type_to_kind_and_version(resource_type: &str, api_group: &str) -> (S
     // Served only as certificates.k8s.io/v1beta1 (storage_certificates.go).
     let api_version = if resource_type == "podcertificaterequests" {
         format!("{}/v1beta1", api_group)
+    } else if resource_type == "devicetaintrules" {
+        // Served only as resource.k8s.io/v1alpha3 (storage_resource.go:117-130).
+        format!("{}/v1alpha3", api_group)
     } else if api_group.is_empty() {
         "v1".to_string()
     } else {
