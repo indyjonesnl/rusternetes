@@ -5,10 +5,10 @@
 //!
 //! Not ported (each noted at its call site):
 //!
-//! - `volume.NewMetricsStatFS` on the filesystem mounter/unmounter
-//!   (`iscsi.go:128`, `:194`): neither our `Mounter` nor `Unmounter`
-//!   carries a `MetricsProvider` (see `nfs.rs`; #3494); the block mapper's
-//!   `NewMetricsBlock` is ported ([`super::util::metrics`]).
+//! - `Mounter`/`Unmounter` do not embed `MetricsProvider` as a supertrait
+//!   (#3483); the filesystem mounter/unmounter implement it directly with
+//!   `volume.NewMetricsStatFS` (`iscsi.go:128`, `:194`), and the block
+//!   mapper's `NewMetricsBlock` is ported ([`super::util::metrics`]).
 //! - `ConstructVolumeSpec`'s `SELinuxMountContext` (`iscsi.go:286`, `:294`):
 //!   [`ReconstructedVolume`] cannot carry one (#2312, #3493).
 //! - `VerifyExhaustedResource`, `NewDetacher`/`Detach` and the attach side of
@@ -27,6 +27,7 @@ pub use attacher::IscsiAttacher;
 pub(crate) use disk_manager::DiskManager;
 pub use util::IscsiUtil;
 
+use super::metrics_statfs::MetricsStatFs;
 use super::plugin::{
     Attributes, BlockVolumeMapper, BlockVolumePlugin, BlockVolumeUnmapper,
     CustomBlockVolumeUnmapper, Metrics, MetricsProvider, OwnedSpec,
@@ -100,7 +101,9 @@ impl IscsiPlugin {
         secret: HashMap<String, String>,
     ) -> Result<IscsiDiskMounter> {
         let (read_only, fs_type) = get_iscsi_volume_info(spec)?;
-        let iscsi_disk = create_iscsi_disk(spec, pod_uid, self, manager, secret)?;
+        let mut iscsi_disk = create_iscsi_disk(spec, pod_uid, self, manager, secret)?;
+        // Add volume metrics (`iscsi.go:126-129`).
+        iscsi_disk.metrics = MetricsStatFs::new(&iscsi_disk.get_path());
         Ok(IscsiDiskMounter {
             disk: iscsi_disk,
             fs_type,
@@ -127,8 +130,12 @@ impl IscsiPlugin {
         mounter: Arc<dyn MountInterface>,
         exec: Arc<dyn Exec>,
     ) -> IscsiDiskUnmounter {
+        let mut disk = IscsiDisk::blank(vol_name, pod_uid, manager, self.clone());
+        // `MetricsProvider: volume.NewMetricsStatFS(GetPodVolumeDir(..))`
+        // (`iscsi.go:194`).
+        disk.metrics = MetricsStatFs::new(&disk.get_path());
         IscsiDiskUnmounter {
-            disk: IscsiDisk::blank(vol_name, pod_uid, manager, self.clone()),
+            disk,
             mounter,
             exec,
             device_util: new_os_device_handler(),
@@ -424,6 +431,12 @@ pub(crate) struct IscsiDisk {
     pub plugin: IscsiPlugin,
     /// Utility interface that provides API calls to the provider to attach/detach disks.
     pub manager: Arc<dyn DiskManager>,
+    /// Embedded `volume.MetricsProvider` (`iscsi.go:315`). Set to
+    /// `volume.NewMetricsStatFS(GetPath())` by `newMounterInternal`
+    /// (`:128`) and `newUnmounterInternal` (`:194`); the other builders leave
+    /// Go's nil, here a path-less [`MetricsStatFs`] that reports
+    /// `NoPathDefined` instead of a nil dereference.
+    pub metrics: MetricsStatFs,
 }
 
 impl IscsiDisk {
@@ -449,6 +462,7 @@ impl IscsiDisk {
             initiator_name: String::new(),
             plugin,
             manager,
+            metrics: MetricsStatFs::new(""),
         }
     }
 
@@ -554,6 +568,18 @@ impl super::Mounter for IscsiDiskMounter {
                 .store(!args.selinux_label.is_empty(), Ordering::SeqCst);
         }
         res
+    }
+}
+
+impl MetricsProvider for IscsiDiskMounter {
+    fn get_metrics(&self) -> Result<Metrics> {
+        self.disk.metrics.get_metrics()
+    }
+}
+
+impl MetricsProvider for IscsiDiskUnmounter {
+    fn get_metrics(&self) -> Result<Metrics> {
+        self.disk.metrics.get_metrics()
     }
 }
 
@@ -857,6 +883,7 @@ pub(crate) fn create_iscsi_disk(
         initiator_name,
         plugin: plugin.clone(),
         manager,
+        metrics: MetricsStatFs::new(""),
     })
 }
 
