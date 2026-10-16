@@ -231,7 +231,7 @@ async fn statefulset_should_create_pvcs_in_order_before_pods() {
             meta
         },
         spec: PersistentVolumeClaimSpec {
-            access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
+            access_modes: Some(vec![PersistentVolumeAccessMode::ReadWriteOnce]),
             selector: None,
             resources: ResourceRequirements {
                 limits: None,
@@ -322,7 +322,7 @@ async fn statefulset_pvc_retention_retain_on_scale_down() {
             meta
         },
         spec: PersistentVolumeClaimSpec {
-            access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
+            access_modes: Some(vec![PersistentVolumeAccessMode::ReadWriteOnce]),
             selector: None,
             resources: ResourceRequirements {
                 limits: None,
@@ -415,7 +415,7 @@ async fn statefulset_pvc_retention_delete_on_scale_down() {
             meta
         },
         spec: PersistentVolumeClaimSpec {
-            access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
+            access_modes: Some(vec![PersistentVolumeAccessMode::ReadWriteOnce]),
             selector: None,
             resources: ResourceRequirements {
                 limits: None,
@@ -880,7 +880,7 @@ fn data_pvc_template() -> PersistentVolumeClaim {
             meta
         },
         spec: PersistentVolumeClaimSpec {
-            access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
+            access_modes: Some(vec![PersistentVolumeAccessMode::ReadWriteOnce]),
             selector: None,
             resources: ResourceRequirements {
                 limits: None,

@@ -760,7 +760,7 @@ async fn statefulset_pvc_retention_policy_should_delete_pvcs_on_scale_down() {
         },
         metadata: ObjectMeta::new("data"),
         spec: PersistentVolumeClaimSpec {
-            access_modes: vec![],
+            access_modes: Some(vec![]),
             resources: ResourceRequirements::default(),
             volume_name: None,
             storage_class_name: None,
@@ -826,7 +826,7 @@ async fn statefulset_pvc_retention_policy_retain_keeps_pvcs_on_scale_down() {
         },
         metadata: ObjectMeta::new("data"),
         spec: PersistentVolumeClaimSpec {
-            access_modes: vec![],
+            access_modes: Some(vec![]),
             resources: ResourceRequirements::default(),
             volume_name: None,
             storage_class_name: None,

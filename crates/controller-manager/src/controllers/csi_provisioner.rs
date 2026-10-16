@@ -2078,7 +2078,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
         single_node_multi_writer: bool,
     ) -> std::result::Result<Vec<VolumeCapability>, String> {
         let mut caps = Vec::new();
-        for mode in &claim.spec.access_modes {
+        for mode in claim.spec.access_modes_slice() {
             let kind = to_csi_access_mode(std::slice::from_ref(mode), single_node_multi_writer)?;
             let access_type = if is_block(claim) {
                 AccessType::Block(BlockVolume {})
@@ -2947,7 +2947,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             },
             metadata: meta,
             spec: PersistentVolumeSpec {
-                access_modes: claim.spec.access_modes.clone(),
+                access_modes: claim.spec.access_modes_slice().to_vec(),
                 mount_options: sc.mount_options.clone(),
                 capacity: HashMap::from([(
                     "storage".to_string(),

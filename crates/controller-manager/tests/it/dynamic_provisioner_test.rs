@@ -59,7 +59,7 @@ async fn test_provisions_pv_for_pvc_with_storageclass() {
             meta
         },
         spec: PersistentVolumeClaimSpec {
-            access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
+            access_modes: Some(vec![PersistentVolumeAccessMode::ReadWriteOnce]),
             resources: ResourceRequirements {
                 limits: None,
                 requests: Some(requests),
@@ -133,7 +133,7 @@ async fn test_skips_pvc_without_storageclass() {
             meta
         },
         spec: PersistentVolumeClaimSpec {
-            access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
+            access_modes: Some(vec![PersistentVolumeAccessMode::ReadWriteOnce]),
             resources: ResourceRequirements {
                 limits: None,
                 requests: Some(requests),
@@ -217,7 +217,7 @@ async fn test_skips_already_bound_pvcs() {
             meta
         },
         spec: PersistentVolumeClaimSpec {
-            access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
+            access_modes: Some(vec![PersistentVolumeAccessMode::ReadWriteOnce]),
             resources: ResourceRequirements {
                 limits: None,
                 requests: Some(requests),
@@ -314,7 +314,7 @@ async fn test_honors_storage_capacity() {
             meta
         },
         spec: PersistentVolumeClaimSpec {
-            access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
+            access_modes: Some(vec![PersistentVolumeAccessMode::ReadWriteOnce]),
             resources: ResourceRequirements {
                 limits: None,
                 requests: Some(requests),
@@ -399,10 +399,10 @@ async fn test_honors_access_modes() {
             meta
         },
         spec: PersistentVolumeClaimSpec {
-            access_modes: vec![
+            access_modes: Some(vec![
                 PersistentVolumeAccessMode::ReadWriteMany,
                 PersistentVolumeAccessMode::ReadOnlyMany,
-            ],
+            ]),
             resources: ResourceRequirements {
                 limits: None,
                 requests: Some(requests),
@@ -489,7 +489,7 @@ async fn test_honors_reclaim_policy_delete() {
             meta
         },
         spec: PersistentVolumeClaimSpec {
-            access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
+            access_modes: Some(vec![PersistentVolumeAccessMode::ReadWriteOnce]),
             resources: ResourceRequirements {
                 limits: None,
                 requests: Some(requests),
@@ -573,7 +573,7 @@ async fn test_honors_reclaim_policy_retain() {
             meta
         },
         spec: PersistentVolumeClaimSpec {
-            access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
+            access_modes: Some(vec![PersistentVolumeAccessMode::ReadWriteOnce]),
             resources: ResourceRequirements {
                 limits: None,
                 requests: Some(requests),
@@ -748,7 +748,7 @@ async fn test_non_csi_plugin_rejects_pvc_with_datasource() {
             meta
         },
         spec: PersistentVolumeClaimSpec {
-            access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
+            access_modes: Some(vec![PersistentVolumeAccessMode::ReadWriteOnce]),
             resources: ResourceRequirements {
                 limits: None,
                 requests: Some(requests),
@@ -882,7 +882,7 @@ async fn test_rejects_pvc_restore_from_non_ready_snapshot() {
             meta
         },
         spec: PersistentVolumeClaimSpec {
-            access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
+            access_modes: Some(vec![PersistentVolumeAccessMode::ReadWriteOnce]),
             resources: ResourceRequirements {
                 limits: None,
                 requests: Some(requests),

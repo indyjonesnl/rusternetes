@@ -470,7 +470,7 @@ fn find_matching_volume<'a>(
         // CheckAccessModes (pv_helpers.go:346-358)
         if !pvc
             .spec
-            .access_modes
+            .access_modes_slice()
             .iter()
             .all(|m| volume.spec.access_modes.contains(m))
         {

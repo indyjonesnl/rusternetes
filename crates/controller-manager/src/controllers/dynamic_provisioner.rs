@@ -481,7 +481,7 @@ impl<S: Storage + 'static> DynamicProvisionerController<S> {
                 aws_elastic_block_store: None,
                 fc: None,
                 more_sources: Default::default(),
-                access_modes: pvc.spec.access_modes.clone(),
+                access_modes: pvc.spec.access_modes_slice().to_vec(),
                 persistent_volume_reclaim_policy: Some(reclaim_policy),
                 storage_class_name: Some(storage_class.metadata.name.clone()),
                 // Upstream copies the StorageClass mount options onto every
@@ -560,7 +560,7 @@ mod tests {
                 meta
             },
             spec: rusternetes_common::resources::PersistentVolumeClaimSpec {
-                access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
+                access_modes: Some(vec![PersistentVolumeAccessMode::ReadWriteOnce]),
                 resources: ResourceRequirements {
                     limits: None,
                     requests: Some(requests),

@@ -238,7 +238,7 @@ pub fn validate_persistent_volume_claim_spec_with_opts(
 
     // accessModes: at least one is required. (Individual values are an enum, so
     // their validity is enforced at deserialization.)
-    if spec.access_modes.is_empty() {
+    if spec.access_modes_slice().is_empty() {
         errs.push(Error::required(
             &fld_path.child("accessModes"),
             "at least 1 access mode is required",
@@ -261,7 +261,7 @@ pub fn validate_persistent_volume_claim_spec_with_opts(
     // ReadWriteOncePod may not be combined with any other access mode.
     // validation.go:2475-2486: an unsupported mode is NotSupported and is not
     // counted as "another" mode next to ReadWriteOncePod.
-    for mode in &spec.access_modes {
+    for mode in spec.access_modes_slice() {
         if let PersistentVolumeAccessMode::Unknown(v) = mode {
             errs.push(Error::not_supported(
                 &fld_path.child("accessModes"),
@@ -271,10 +271,10 @@ pub fn validate_persistent_volume_claim_spec_with_opts(
         }
     }
     let has_rwop = spec
-        .access_modes
+        .access_modes_slice()
         .iter()
         .any(|m| matches!(m, PersistentVolumeAccessMode::ReadWriteOncePod));
-    let has_other = spec.access_modes.iter().any(|m| {
+    let has_other = spec.access_modes_slice().iter().any(|m| {
         !matches!(
             m,
             PersistentVolumeAccessMode::ReadWriteOncePod | PersistentVolumeAccessMode::Unknown(_)
@@ -491,7 +491,7 @@ pub fn validate_persistent_volume_claim_status_update(
     {
         errs.push(Error::required(&Path::new("resourceVersion"), ""));
     }
-    if new_pvc.spec.access_modes.is_empty() {
+    if new_pvc.spec.access_modes_slice().is_empty() {
         // Upstream spells this path `Spec.accessModes`, capitalised.
         errs.push(Error::required(&Path::new("Spec").child("accessModes"), ""));
     }
@@ -592,6 +592,10 @@ fn specs_semantically_equal(a: &PersistentVolumeClaimSpec, b: &PersistentVolumeC
         let mut s = s.clone();
         s.resources.requests = None;
         s.resources.limits = None;
+        // Semantic.DeepEqual: nil and empty slices are equal.
+        if s.access_modes.as_ref().is_some_and(Vec::is_empty) {
+            s.access_modes = None;
+        }
         serde_json::to_value(&s).unwrap_or(serde_json::Value::Null)
     };
     quantity_maps_semantically_equal(&a.resources.requests, &b.resources.requests)
@@ -603,8 +607,7 @@ fn specs_semantically_equal(a: &PersistentVolumeClaimSpec, b: &PersistentVolumeC
 /// diff of `json.MarshalIndent` of the INTERNAL `core.PersistentVolumeClaimSpec`
 /// (types.go:503-575), which has no json tags — so Go field names in
 /// declaration order, no omitempty, nil pointers/maps/slices as `null`.
-/// Known gap: `access_modes` is a plain `Vec`, so a nil and an empty
-/// `AccessModes` slice both render `null` (Go: `null` vs `[]`).
+/// A nil `AccessModes` renders `null`, an empty one `[]`.
 fn spec_diff(old: &PersistentVolumeClaimSpec, new: &PersistentVolumeClaimSpec) -> String {
     crate::diff::diff(&go_spec_json(old), &go_spec_json(new))
 }
@@ -690,11 +693,11 @@ fn go_spec_json(s: &PersistentVolumeClaimSpec) -> GoJson {
             GoJson::Object(o)
         }
     };
-    let access_modes = if s.access_modes.is_empty() {
-        GoJson::Null
-    } else {
-        GoJson::Array(
-            s.access_modes
+    // nil slice -> `null`, empty non-nil slice -> `[]` (json.MarshalIndent).
+    let access_modes = match &s.access_modes {
+        None => GoJson::Null,
+        Some(modes) => GoJson::Array(
+            modes
                 .iter()
                 .map(|m| {
                     GoJson::str(
@@ -705,7 +708,7 @@ fn go_spec_json(s: &PersistentVolumeClaimSpec) -> GoJson {
                     )
                 })
                 .collect(),
-        )
+        ),
     };
     let mode = s.volume_mode.as_ref().map_or(GoJson::Null, |m| {
         GoJson::str(

@@ -94,7 +94,7 @@ fn test_persistentvolumeclaim_creation() {
         },
         metadata: ObjectMeta::new("test-pvc").with_namespace("default"),
         spec: PersistentVolumeClaimSpec {
-            access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
+            access_modes: Some(vec![PersistentVolumeAccessMode::ReadWriteOnce]),
             resources: ResourceRequirements {
                 limits: None,
                 requests: Some(requests),
@@ -123,7 +123,7 @@ fn test_persistentvolumeclaim_creation() {
     // Verify basic fields
     assert_eq!(pvc.metadata.name, "test-pvc");
     assert_eq!(pvc.metadata.namespace, Some("default".to_string()));
-    assert_eq!(pvc.spec.access_modes.len(), 1);
+    assert_eq!(pvc.spec.access_modes_slice().len(), 1);
 
     // Verify serialization
     let json = serde_json::to_string(&pvc).expect("Failed to serialize PVC");
@@ -387,7 +387,7 @@ fn test_pvc_with_resource_limits_and_requests() {
         },
         metadata: ObjectMeta::new("limited-pvc").with_namespace("production"),
         spec: PersistentVolumeClaimSpec {
-            access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
+            access_modes: Some(vec![PersistentVolumeAccessMode::ReadWriteOnce]),
             resources: ResourceRequirements {
                 limits: Some(limits),
                 requests: Some(requests),

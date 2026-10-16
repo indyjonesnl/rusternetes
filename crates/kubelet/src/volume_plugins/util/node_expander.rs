@@ -198,7 +198,7 @@ impl<'a, S: Storage + ?Sized> NodeExpander<'a, S> {
                 .opts
                 .pvc
                 .spec
-                .access_modes
+                .access_modes_slice()
                 .contains(&PersistentVolumeAccessMode::ReadWriteMany)
             && !self
                 .opts
