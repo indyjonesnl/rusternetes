@@ -561,7 +561,7 @@ pub fn record_long_running(req: &RequestMeta, component: &str) -> LongRunningGua
 /// until the body (the watch / connect / log stream) is finished or dropped.
 struct GuardedBody {
     inner: axum::body::Body,
-    _guard: LongRunningGuard,
+    _guard: Arc<LongRunningGuard>,
 }
 
 impl http_body::Body for GuardedBody {
@@ -631,7 +631,7 @@ pub(crate) fn request_meta(req: &axum::extract::Request) -> RequestMeta {
 /// `InstrumentRouteFunc` (metrics.go:633-650) as a middleware: time the inner
 /// handler and call [`monitor_request`].
 pub async fn instrument_request(
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use axum::body::HttpBody;
@@ -640,6 +640,21 @@ pub async fn instrument_request(
     // `WithLatencyTrackers` (filters/webhook_duration.go:36-61) installs the
     // trackers for every request except watches.
     let trackers = (meta.verb != "watch").then(|| Arc::new(LatencyTrackers::new()));
+    // Upgraded CONNECTs (exec/attach/portforward) return their 101 at once and
+    // splice in a detached task, so the gauge must travel with the connection:
+    // `RecordLongRunning` wraps the blocking `ServeHTTP` (rest.go:218). The
+    // hold is shared with the response body guard below; the gauge falls when
+    // the last owner drops.
+    let verb = reported_verb(&meta, clean_scope(&meta));
+    let upgrade = req.headers().contains_key(axum::http::header::UPGRADE) && verb == "CONNECT";
+    let long_running = matches!(verb.as_str(), "WATCH" | "CONNECT")
+        .then(|| Arc::new(record_long_running(&meta, "apiserver")));
+    if upgrade {
+        if let Some(g) = &long_running {
+            req.extensions_mut()
+                .insert(rusternetes_streamproxy::ConnectionHold(g.clone()));
+        }
+    }
     let mut resp = match &trackers {
         Some(t) => with_latency_trackers(t.clone(), next.run(req)).await,
         None => next.run(req).await,
@@ -662,11 +677,7 @@ pub async fn instrument_request(
     // handlers (handlers/rest.go:218) and `StreamObject` for logs
     // (responsewriters/writers.go:327); the verbs those paths report are
     // WATCH and CONNECT (`validConnectRequests` includes log).
-    if matches!(
-        reported_verb(&meta, clean_scope(&meta)).as_str(),
-        "WATCH" | "CONNECT"
-    ) {
-        let guard = record_long_running(&meta, "apiserver");
+    if let Some(guard) = long_running {
         resp = resp.map(|body| {
             axum::body::Body::new(GuardedBody {
                 inner: body,
@@ -1006,6 +1017,73 @@ mod tests {
         assert_eq!(sample("apiserver_longrunning_requests", &l), 1.0);
         drop(resp);
         assert_eq!(sample("apiserver_longrunning_requests", &l), 0.0);
+    }
+
+    // ConnectResource (handlers/rest.go:218) wraps the whole `ServeHTTP` in
+    // `RecordLongRunning`; for an upgraded exec/attach/portforward the handler
+    // blocks until the connection ends, so the gauge must stay up across the
+    // 101 and fall only when the spliced connection closes (#3545).
+    #[tokio::test]
+    async fn long_running_gauge_held_across_upgraded_connection() {
+        use crate::flow_control::metric_test_util::sample;
+        use axum::middleware;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = backend.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = s.read(&mut buf).await.unwrap();
+            s.write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: x\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            let mut line = [0u8; 5];
+            s.read_exact(&mut line).await.unwrap();
+            s.write_all(&line.to_ascii_uppercase()).await.unwrap();
+            // Hold the backend side open until the client hangs up.
+            let _ = s.read(&mut line).await;
+        });
+        let target: axum::http::Uri = format!("http://{backend_addr}/x").parse().unwrap();
+        let app = axum::Router::new()
+            .fallback(move |req: axum::extract::Request| {
+                let t = target.clone();
+                async move { rusternetes_streamproxy::proxy_upgrade(t, req).await }
+            })
+            .layer(middleware::from_fn(instrument_request));
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(proxy, app).await.unwrap() });
+
+        let l = [
+            ("verb", "CONNECT"),
+            ("resource", "pods"),
+            ("subresource", "attach"),
+        ];
+        let mut c = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        c.write_all(
+            b"GET /api/v1/namespaces/default/pods/lrup/attach HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: x\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut hdr = [0u8; 1024];
+        let n = c.read(&mut hdr).await.unwrap();
+        assert!(std::str::from_utf8(&hdr[..n]).unwrap().contains("101"));
+        c.write_all(b"hello").await.unwrap();
+        let mut out = [0u8; 5];
+        c.read_exact(&mut out).await.unwrap();
+        assert_eq!(&out, b"HELLO");
+        // The 101 response is long gone; the connection is still open.
+        assert_eq!(sample("apiserver_longrunning_requests", &l), 1.0);
+        drop(c);
+        for _ in 0..100 {
+            if sample("apiserver_longrunning_requests", &l) == 0.0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("gauge not released after the upgraded connection closed");
     }
 
     // RecordDroppedRequest (metrics.go:508-526): `apiserver_request_total`
