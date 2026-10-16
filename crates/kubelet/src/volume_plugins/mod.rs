@@ -22,6 +22,7 @@ pub mod host_path;
 pub mod image;
 pub mod iscsi;
 pub mod local;
+pub mod metrics_du;
 pub mod metrics_statfs;
 #[cfg(test)]
 mod mounter_args_tests;
