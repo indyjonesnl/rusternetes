@@ -17,7 +17,7 @@
 //! in the state yet (the `patch/` package is #2996), so it does nothing.
 //!
 //! The in-tree plugins ahead of them run first, in `AllOrderedPlugins` order
-//! (plugins.go:69-100), for the resources on this path that they handle:
+//! (plugins.go:70-101), for the resources on this path that they handle:
 //! LimitRanger and DefaultStorageClass, for PersistentVolumeClaims, and
 //! Priority, for PriorityClasses. For Pods, [`Admission::admit_pod`] runs
 //! NodeRestriction, LimitRanger, ServiceAccount, Priority,
@@ -128,73 +128,268 @@ impl Admission<'_> {
         ))
     }
 
-    /// The in-tree mutating plugins. `DefaultStorageClass`
-    /// (plugin/pkg/admission/storage/storageclass/setdefault/admission.go)
-    /// handles only CREATE of a PersistentVolumeClaim. LimitRanger's `Admit`
-    /// mutates only pods.
+    /// One in-tree plugin as `NewFromPlugins` runs it
+    /// (apiserver/pkg/admission/plugins.go:142-144): skipped when it is not in
+    /// the enabled set, or when the chain would not call it for this
+    /// operation and step (`chain.go:33-35`, `:49-51`); otherwise `work` is
+    /// decorated by `WithControllerMetrics` (metrics.go:63-66, :89-113), so the
+    /// plugin is observed whatever the resource, `rejected` being `err != nil`.
+    /// See [`crate::admission::plugin_metrics`].
+    async fn plugin(
+        &self,
+        name: &'static str,
+        op: &Operation,
+        step_type: &str,
+        work: impl std::future::Future<Output = Result<()>>,
+    ) -> Result<()> {
+        if !plugin_enabled(name) || !crate::admission::plugin_metrics::observed(name, op, step_type)
+        {
+            return Ok(());
+        }
+        rusternetes_admission_webhook::admission_metrics::with_controller_metrics(
+            name, op, step_type, work,
+        )
+        .await
+    }
+
+    /// The in-tree mutating plugins, each run through [`Self::plugin`]. For a
+    /// Pod they are NodeRestriction, LimitRanger, ServiceAccount, Priority,
+    /// DefaultTolerationSeconds, RuntimeClass and PodTopologyLabels;
+    /// `DefaultStorageClass` (plugin/pkg/admission/storage/storageclass/
+    /// setdefault/admission.go) handles only CREATE of a PersistentVolumeClaim
+    /// and NodeRestriction's `Admit` a node's request on a
+    /// PodCertificateRequest. NodeRestriction runs first, as it did before the
+    /// pod handlers moved onto this chain: it only narrows a node's requests
+    /// and reads the pod as sent.
     async fn admit_in_tree<T: Object>(&self, op: &Operation, obj: T) -> Result<T> {
-        if self.is_core("pods") {
-            let pod: Pod = recast(&obj)?;
-            return recast(&self.admit_pod(op, pod).await?);
-        }
-        // NodeRestriction.Admit (admission.go:228-229): a node's request on
-        // any operation or subresource of a PodCertificateRequest.
-        if plugin_enabled("NodeRestriction")
-            && self.resource.group == "certificates.k8s.io"
-            && self.resource.resource == "podcertificaterequests"
-        {
-            let pcr: rusternetes_common::resources::podcertificaterequest::PodCertificateRequest =
-                recast(&obj)?;
-            crate::handlers::node_restriction::admit_pod_certificate_request(
-                &*self.state.storage,
-                &rusternetes_middleware::AuthContext {
-                    user: self.user.clone(),
-                },
-                *op == Operation::Create,
-                self.subresource,
-                self.namespace.unwrap_or(""),
-                &pcr,
-            )
-            .await
-            .map_err(|e| match e {
-                Error::Forbidden(m) => self.forbidden(&pcr.metadata.name, m),
-                other => other,
-            })?;
-        }
-        if *op != Operation::Create {
-            return Ok(obj);
-        }
+        use rusternetes_admission_webhook::admission_metrics::STEP_ADMIT as ADMIT;
         let mut obj = obj;
-        if plugin_enabled("DefaultStorageClass") && self.is_core("persistentvolumeclaims") {
-            let mut pvc: PersistentVolumeClaim = recast(&obj)?;
-            crate::admission::set_default_storage_class(&self.state.storage, &mut pvc)
-                .await
-                .map_err(|e| self.forbidden(&pvc.metadata.name, e))?;
-            obj = recast(&pvc)?;
-        }
-        // `StorageObjectInUseProtection` follows `DefaultStorageClass` in
-        // `AllOrderedPlugins` (plugins.go:69-100); it acts on the resource
-        // itself, never a subresource (admission.go `admitPV`/`admitPVC`).
-        if plugin_enabled("StorageObjectInUseProtection")
-            && self.subresource.is_none()
-            && self.resource.group.is_empty()
-        {
-            if let Some(finalizer) =
-                storage_object_in_use_protection::finalizer_for(&self.resource.resource)
+        let mut pod: Option<Pod> = if self.is_core("pods") {
+            Some(recast(&obj)?)
+        } else {
+            None
+        };
+        let storage = &self.state.storage;
+        let namespace = self.namespace;
+        let create = *op == Operation::Create;
+
+        // NodeRestriction.Admit (admission.go:228-229): a node's request on
+        // any operation or subresource of a PodCertificateRequest, and its
+        // pod create.
+        self.plugin("NodeRestriction", op, ADMIT, async {
+            if let Some(pod) = pod.as_ref() {
+                if create && namespace.is_some() {
+                    crate::handlers::node_restriction::admit_pod_create(
+                        &**storage,
+                        &rusternetes_middleware::AuthContext {
+                            user: self.user.clone(),
+                        },
+                        pod,
+                    )
+                    .await?;
+                }
+            } else if self.resource.group == "certificates.k8s.io"
+                && self.resource.resource == "podcertificaterequests"
             {
-                storage_object_in_use_protection::add_protection_finalizer(
-                    obj.metadata_mut(),
-                    finalizer,
-                );
+                let pcr: rusternetes_common::resources::podcertificaterequest::PodCertificateRequest =
+                    recast(&obj)?;
+                crate::handlers::node_restriction::admit_pod_certificate_request(
+                    &**storage,
+                    &rusternetes_middleware::AuthContext {
+                        user: self.user.clone(),
+                    },
+                    create,
+                    self.subresource,
+                    namespace.unwrap_or(""),
+                    &pcr,
+                )
+                .await
+                .map_err(|e| match e {
+                    Error::Forbidden(m) => self.forbidden(&pcr.metadata.name, m),
+                    other => other,
+                })?;
             }
+            Ok(())
+        })
+        .await?;
+
+        // LimitRanger.Admit (plugin/pkg/admission/limitranger/admission.go).
+        self.plugin("LimitRanger", op, ADMIT, async {
+            if let (Some(pod), Some(namespace), true) = (pod.as_mut(), namespace, create) {
+                let name = pod.metadata.name.clone();
+                let limit_ranges: Vec<rusternetes_common::resources::LimitRange> = storage
+                    .list(&rusternetes_storage::build_prefix(
+                        "limitranges",
+                        Some(namespace),
+                    ))
+                    .await
+                    .unwrap_or_default();
+                match crate::admission::apply_limit_range_with(pod, &limit_ranges) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Err(self.forbidden(&name, "Pod violates LimitRange constraints"));
+                    }
+                    Err(e) => {
+                        tracing::warn!("Error checking LimitRange for pod {namespace}/{name}: {e}");
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await?;
+
+        // ServiceAccount.Admit: a failure to inject does not fail the pod.
+        self.plugin("ServiceAccount", op, ADMIT, async {
+            if let (Some(pod), Some(namespace), true) = (pod.as_mut(), namespace, create) {
+                let name = pod.metadata.name.clone();
+                if let Err(e) =
+                    crate::admission::inject_service_account_token(storage, namespace, pod).await
+                {
+                    tracing::warn!(
+                        "Error injecting service account token for pod {namespace}/{name}: {e}"
+                    );
+                }
+            }
+            Ok(())
+        })
+        .await?;
+
+        self.plugin("Priority", op, ADMIT, async {
+            if let (Some(pod), Some(_), true) = (pod.as_mut(), namespace, create) {
+                self.admit_pod_priority(pod).await?;
+            }
+            Ok(())
+        })
+        .await?;
+
+        // DefaultTolerationSeconds registers for Create AND Update
+        // (plugin/pkg/admission/defaulttolerationseconds/admission.go:86): the
+        // NotReady/Unreachable NoExecute tolerations (tolerationSeconds: 300),
+        // unless the pod has them.
+        self.plugin("DefaultTolerationSeconds", op, ADMIT, async {
+            if let Some(pod) = pod.as_mut() {
+                if *op == Operation::Update || (create && namespace.is_some()) {
+                    if let Some(spec) = pod.spec.as_mut() {
+                        rusternetes_common::tolerations::add_default_tolerations(spec);
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await?;
+
+        // RuntimeClass.Admit (plugin/pkg/admission/runtimeclass/admission.go):
+        // the class must exist, and its overhead is set on the pod.
+        self.plugin("RuntimeClass", op, ADMIT, async {
+            let (Some(pod), Some(_), true) = (pod.as_mut(), namespace, create) else {
+                return Ok(());
+            };
+            let name = pod.metadata.name.clone();
+            let runtime_class = pod
+                .spec
+                .as_ref()
+                .and_then(|s| s.runtime_class_name.clone())
+                .filter(|n| !n.is_empty());
+            if let Some(rc_name) = runtime_class {
+                let rc_key = rusternetes_storage::build_key("runtimeclasses", None, &rc_name);
+                let Ok(rc) = storage.get::<serde_json::Value>(&rc_key).await else {
+                    return Err(self.forbidden(
+                        &name,
+                        format!("pod {name} references non-existent RuntimeClass \"{rc_name}\""),
+                    ));
+                };
+                let overhead: std::collections::HashMap<String, String> = rc
+                    .pointer("/overhead/podFixed")
+                    .and_then(|o| o.as_object())
+                    .map(|o| {
+                        o.iter()
+                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !overhead.is_empty() {
+                    if let Some(spec) = pod.spec.as_mut() {
+                        spec.overhead = Some(overhead);
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await?;
+
+        self.plugin("DefaultStorageClass", op, ADMIT, async {
+            if self.is_core("persistentvolumeclaims") {
+                let mut pvc: PersistentVolumeClaim = recast(&obj)?;
+                crate::admission::set_default_storage_class(storage, &mut pvc)
+                    .await
+                    .map_err(|e| self.forbidden(&pvc.metadata.name, e))?;
+                obj = recast(&pvc)?;
+            }
+            Ok(())
+        })
+        .await?;
+
+        // `StorageObjectInUseProtection` follows `DefaultStorageClass` in
+        // `AllOrderedPlugins` (plugins.go:70-101); it acts on the resource
+        // itself, never a subresource (admission.go `admitPV`/`admitPVC`).
+        self.plugin("StorageObjectInUseProtection", op, ADMIT, async {
+            if self.subresource.is_none() && self.resource.group.is_empty() {
+                if let Some(finalizer) =
+                    storage_object_in_use_protection::finalizer_for(&self.resource.resource)
+                {
+                    storage_object_in_use_protection::add_protection_finalizer(
+                        obj.metadata_mut(),
+                        finalizer,
+                    );
+                }
+            }
+            Ok(())
+        })
+        .await?;
+
+        // PodTopologyLabels.admitPod (plugin/pkg/admission/podtopologylabels/
+        // admission.go:123-148; after RuntimeClass in plugins.go:93, listed at :100): a pod
+        // created with `spec.nodeName` gets the node's topology labels,
+        // overwriting its own.
+        self.plugin("PodTopologyLabels", op, ADMIT, async {
+            let (Some(pod), Some(_), true) = (pod.as_mut(), namespace, create) else {
+                return Ok(());
+            };
+            if !rusternetes_common::feature_gates::enabled(
+                rusternetes_common::feature_gates::Feature::PodTopologyLabelsAdmission,
+            ) {
+                return Ok(());
+            }
+            let node_name = pod
+                .spec
+                .as_ref()
+                .and_then(|s| s.node_name.clone())
+                .filter(|n| !n.is_empty());
+            if let Some(node_name) = node_name {
+                let labels =
+                    crate::handlers::pod::topology_labels_for_node_name(&**storage, &node_name)
+                        .await?;
+                if !labels.is_empty() {
+                    pod.metadata
+                        .labels
+                        .get_or_insert_with(Default::default)
+                        .extend(labels);
+                }
+            }
+            Ok(())
+        })
+        .await?;
+
+        if let Some(pod) = pod {
+            obj = recast(&pod)?;
         }
         Ok(obj)
     }
 
-    /// The in-tree validating plugins. `LimitRanger.Validate`
-    /// (plugin/pkg/admission/limitranger/admission.go:116-156) checks a
-    /// PersistentVolumeClaim's requests on CREATE and UPDATE, except when the
-    /// old object is being deleted.
+    /// The in-tree validating plugins, each run through [`Self::plugin`].
+    /// `LimitRanger.Validate` (plugin/pkg/admission/limitranger/admission.go:
+    /// 116-156) checks a PersistentVolumeClaim's requests on CREATE and
+    /// UPDATE, except when the old object is being deleted.
     async fn validate_in_tree<T: Object>(
         &self,
         ctx: &RequestContext,
@@ -202,108 +397,110 @@ impl Admission<'_> {
         obj: Option<&T>,
         old: Option<&T>,
     ) -> Result<()> {
-        if let (Operation::Update, Some(obj), Some(old)) = (op, obj, old) {
-            // `approval` is CertificateApproval's, `status` CertificateSigning's.
-            let plugin = match self.subresource {
-                Some("approval") => "CertificateApproval",
-                _ => "CertificateSigning",
-            };
-            if plugin_enabled(plugin) {
+        use rusternetes_admission_webhook::admission_metrics::{
+            STEP_ADMIT as ADMIT, STEP_VALIDATE as VALIDATE,
+        };
+        // `approval` is CertificateApproval's, `status` CertificateSigning's.
+        let approval = self.subresource == Some("approval");
+        self.plugin("CertificateApproval", op, VALIDATE, async {
+            if let (true, Some(obj), Some(old)) = (approval, obj, old) {
                 self.validate_csr_signer(obj, old).await?;
             }
+            Ok(())
+        })
+        .await?;
+        self.plugin("CertificateSigning", op, VALIDATE, async {
+            if let (false, Some(obj), Some(old)) = (approval, obj, old) {
+                self.validate_csr_signer(obj, old).await?;
+            }
+            Ok(())
+        })
+        .await?;
+        if let (Operation::Update, Some(obj), Some(old)) = (op, obj, old) {
             self.validate_pcr_signer(obj, old).await?;
         }
-        if let (Operation::Create, Some(obj)) = (op, obj) {
-            if plugin_enabled("CertificateSubjectRestriction") {
+        self.plugin("CertificateSubjectRestriction", op, VALIDATE, async {
+            if let Some(obj) = obj {
                 self.validate_csr_subject(obj)?;
             }
-        }
-        if let (Operation::Create | Operation::Update, Some(obj)) = (op, obj) {
-            if plugin_enabled("ClusterTrustBundleAttest") {
+            Ok(())
+        })
+        .await?;
+        self.plugin("ClusterTrustBundleAttest", op, VALIDATE, async {
+            if let Some(obj) = obj {
                 self.validate_ctb_attest(obj, old).await?;
             }
-        }
-        // PodSecurity `ValidateNamespace` (pod-security-admission/admission/
-        // admission.go:229-327): label validation, and the existing pods
-        // checked against a tightened enforce level.
-        if let (Operation::Create | Operation::Update, Some(obj), true, true) = (
-            op,
-            obj,
-            self.is_core("namespaces"),
-            plugin_enabled("PodSecurity"),
-        ) {
-            let ns: rusternetes_common::resources::Namespace = recast(obj)?;
-            let old_ns: Option<rusternetes_common::resources::Namespace> =
-                if *op == Operation::Update {
-                    old.map(recast).transpose()?
-                } else {
-                    None
-                };
-            for w in crate::admission::PodSecurityAdmission::new()
-                .validate_namespace(&self.state.storage, &ns, old_ns.as_ref())
-                .await?
-            {
-                ctx.add_warning(w);
-            }
-        }
-        // PodSecurity `ValidatePodController` (admission.go:393-453): the
-        // warn/audit evaluation of a controller's pod template. The plugin
-        // runs it for resources with `HasPodSpec` (podsecurity/admission.go:195).
-        if let (Operation::Create | Operation::Update, Some(obj), Some(namespace)) =
-            (op, obj, self.namespace)
-        {
-            let r = &self.resource;
-            if plugin_enabled("PodSecurity")
-                && !(r.group.is_empty() && r.resource == "pods")
-                && crate::admission::pod_security_controller::has_pod_spec(&r.group, &r.resource)
-            {
-                let value = serde_json::to_value(obj)
-                    .map_err(|e| Error::Internal(format!("failed to encode object: {e}")))?;
-                for w in crate::admission::PodSecurityAdmission::new()
-                    .validate_pod_controller(
-                        &self.state.storage,
-                        namespace,
-                        self.subresource,
-                        &r.group,
-                        &r.resource,
-                        &value,
-                        &self.user.username,
-                    )
-                    .await
-                    .warnings
+            Ok(())
+        })
+        .await?;
+        self.plugin("PodSecurity", op, VALIDATE, async {
+            self.validate_pod_security(ctx, op, obj, old).await
+        })
+        .await?;
+        // KEP-5328 + KEP-1287: a Guaranteed-QoS CPU resize against a node
+        // that has not declared `GuaranteedQoSPodCPUResize` is refused (the
+        // NodeDeclaredFeatureValidator plugin, off with its gate).
+        self.plugin("NodeDeclaredFeatureValidator", op, VALIDATE, async {
+            if self.subresource == Some("resize") && self.is_pod_resize() {
+                let pod: Option<Pod> = obj.map(recast).transpose()?;
+                let old: Option<Pod> = old.map(recast).transpose()?;
+                if let (Some(pod), Some(old), Some(_)) =
+                    (pod.as_ref(), old.as_ref(), self.namespace)
                 {
-                    ctx.add_warning(w);
+                    crate::handlers::pod_subresources::check_node_declared_features_for_resize(
+                        self.state.storage.as_ref(),
+                        old,
+                        pod,
+                    )
+                    .await?;
                 }
             }
-        }
-        if self.is_core("pods") || self.is_pod_resize() || self.is_pod_ephemeralcontainers() {
-            let obj: Option<Pod> = obj.map(recast).transpose()?;
-            let old: Option<Pod> = old.map(recast).transpose()?;
-            return self.validate_pod(ctx, op, obj.as_ref(), old.as_ref()).await;
-        }
+            Ok(())
+        })
+        .await?;
+        // NodeRestriction on a pod DELETE (admission.go:257-270). It is an
+        // Admit-only plugin upstream, so it is observed under `admit`; the
+        // delete path runs only the validating half here.
+        self.plugin("NodeRestriction", op, ADMIT, async {
+            if *op == Operation::Delete && self.is_core("pods") {
+                let old: Option<Pod> = old.map(recast).transpose()?;
+                if let Some(old) = old.as_ref() {
+                    crate::handlers::node_restriction::admit_pod_delete(
+                        &rusternetes_middleware::AuthContext {
+                            user: self.user.clone(),
+                        },
+                        old,
+                    )?;
+                }
+            }
+            Ok(())
+        })
+        .await?;
         // `Priority` sits ahead of `LimitRanger` in `AllOrderedPlugins`
-        // (plugins.go:69-100).
-        if plugin_enabled("Priority") {
-            self.validate_priority(op, obj).await?;
-        }
-        let (Some(obj), Some(namespace)) = (obj, self.namespace) else {
-            return Ok(());
-        };
-        if !plugin_enabled("LimitRanger")
-            || !matches!(op, Operation::Create | Operation::Update)
-            || !self.is_core("persistentvolumeclaims")
-            || old.is_some_and(|o| o.metadata().deletion_timestamp.is_some())
-        {
-            return Ok(());
-        }
-        let pvc: PersistentVolumeClaim = recast(obj)?;
-        match crate::admission::limit_ranger_validate_pvc(&self.state.storage, namespace, &pvc)
-            .await
-        {
-            Ok(None) => Ok(()),
-            Ok(Some(err)) => Err(self.forbidden(&pvc.metadata.name, err)),
-            Err(e) => Err(self.forbidden(&pvc.metadata.name, e)),
-        }
+        // (plugins.go:70-101).
+        self.plugin("Priority", op, VALIDATE, async {
+            self.validate_priority(op, obj).await
+        })
+        .await?;
+        self.plugin("LimitRanger", op, VALIDATE, async {
+            let (Some(obj), Some(namespace)) = (obj, self.namespace) else {
+                return Ok(());
+            };
+            if !self.is_core("persistentvolumeclaims")
+                || old.is_some_and(|o| o.metadata().deletion_timestamp.is_some())
+            {
+                return Ok(());
+            }
+            let pvc: PersistentVolumeClaim = recast(obj)?;
+            match crate::admission::limit_ranger_validate_pvc(&self.state.storage, namespace, &pvc)
+                .await
+            {
+                Ok(None) => Ok(()),
+                Ok(Some(err)) => Err(self.forbidden(&pvc.metadata.name, err)),
+                Err(e) => Err(self.forbidden(&pvc.metadata.name, e)),
+            }
+        })
+        .await
     }
 
     /// The `certificates/approval` and `certificates/signing` plugins, for an
@@ -427,147 +624,6 @@ impl Admission<'_> {
         Ok(())
     }
 
-    /// The in-tree mutating plugins for a Pod, in `AllOrderedPlugins` order
-    /// (plugins.go:69-100): LimitRanger, ServiceAccount, NodeRestriction,
-    /// Priority, DefaultTolerationSeconds, RuntimeClass. NodeRestriction runs
-    /// first here, as it did before the pod handlers moved onto this chain:
-    /// it only narrows a node's requests and reads the pod as sent.
-    async fn admit_pod(&self, op: &Operation, mut pod: Pod) -> Result<Pod> {
-        let name = pod.metadata.name.clone();
-        if *op == Operation::Update {
-            // DefaultTolerationSeconds registers for Create AND Update
-            // (plugin/pkg/admission/defaulttolerationseconds/admission.go:86).
-            if let (Some(spec), true) = (
-                pod.spec.as_mut(),
-                plugin_enabled("DefaultTolerationSeconds"),
-            ) {
-                rusternetes_common::tolerations::add_default_tolerations(spec);
-            }
-            return Ok(pod);
-        }
-        if *op != Operation::Create {
-            return Ok(pod);
-        }
-        let Some(namespace) = self.namespace else {
-            return Ok(pod);
-        };
-        let storage = &self.state.storage;
-
-        if plugin_enabled("NodeRestriction") {
-            crate::handlers::node_restriction::admit_pod_create(
-                &**storage,
-                &rusternetes_middleware::AuthContext {
-                    user: self.user.clone(),
-                },
-                &pod,
-            )
-            .await?;
-        }
-
-        // LimitRanger.Admit (plugin/pkg/admission/limitranger/admission.go).
-        if plugin_enabled("LimitRanger") {
-            let limit_ranges: Vec<rusternetes_common::resources::LimitRange> = storage
-                .list(&rusternetes_storage::build_prefix(
-                    "limitranges",
-                    Some(namespace),
-                ))
-                .await
-                .unwrap_or_default();
-            match crate::admission::apply_limit_range_with(&mut pod, &limit_ranges) {
-                Ok(true) => {}
-                Ok(false) => {
-                    return Err(self.forbidden(&name, "Pod violates LimitRange constraints"));
-                }
-                Err(e) => {
-                    tracing::warn!("Error checking LimitRange for pod {namespace}/{name}: {e}");
-                }
-            }
-        }
-
-        // ServiceAccount.Admit: a failure to inject does not fail the pod.
-        if plugin_enabled("ServiceAccount") {
-            if let Err(e) =
-                crate::admission::inject_service_account_token(storage, namespace, &mut pod).await
-            {
-                tracing::warn!(
-                    "Error injecting service account token for pod {namespace}/{name}: {e}"
-                );
-            }
-        }
-
-        if plugin_enabled("Priority") {
-            self.admit_pod_priority(&mut pod).await?;
-        }
-
-        // DefaultTolerationSeconds: the NotReady/Unreachable NoExecute
-        // tolerations (tolerationSeconds: 300), unless the pod has them.
-        if let (Some(spec), true) = (
-            pod.spec.as_mut(),
-            plugin_enabled("DefaultTolerationSeconds"),
-        ) {
-            rusternetes_common::tolerations::add_default_tolerations(spec);
-        }
-
-        // RuntimeClass.Admit (plugin/pkg/admission/runtimeclass/admission.go):
-        // the class must exist, and its overhead is set on the pod.
-        let runtime_class = pod
-            .spec
-            .as_ref()
-            .and_then(|s| s.runtime_class_name.clone())
-            .filter(|n| !n.is_empty() && plugin_enabled("RuntimeClass"));
-        if let Some(rc_name) = runtime_class {
-            let rc_key = rusternetes_storage::build_key("runtimeclasses", None, &rc_name);
-            let Ok(rc) = storage.get::<serde_json::Value>(&rc_key).await else {
-                return Err(self.forbidden(
-                    &name,
-                    format!("pod {name} references non-existent RuntimeClass \"{rc_name}\""),
-                ));
-            };
-            let overhead: std::collections::HashMap<String, String> = rc
-                .pointer("/overhead/podFixed")
-                .and_then(|o| o.as_object())
-                .map(|o| {
-                    o.iter()
-                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                        .collect()
-                })
-                .unwrap_or_default();
-            if !overhead.is_empty() {
-                if let Some(spec) = pod.spec.as_mut() {
-                    spec.overhead = Some(overhead);
-                }
-            }
-        }
-
-        // PodTopologyLabels.admitPod (plugin/pkg/admission/podtopologylabels/
-        // admission.go:123-148; after RuntimeClass in plugins.go:98): a pod
-        // created with `spec.nodeName` gets the node's topology labels,
-        // overwriting its own.
-        if plugin_enabled("PodTopologyLabels")
-            && rusternetes_common::feature_gates::enabled(
-                rusternetes_common::feature_gates::Feature::PodTopologyLabelsAdmission,
-            )
-        {
-            let node_name = pod
-                .spec
-                .as_ref()
-                .and_then(|s| s.node_name.clone())
-                .filter(|n| !n.is_empty());
-            if let Some(node_name) = node_name {
-                let labels =
-                    crate::handlers::pod::topology_labels_for_node_name(&**storage, &node_name)
-                        .await?;
-                if !labels.is_empty() {
-                    pod.metadata
-                        .labels
-                        .get_or_insert_with(Default::default)
-                        .extend(labels);
-                }
-            }
-        }
-        Ok(pod)
-    }
-
     /// `Priority.Admit` for a Pod (plugin/pkg/admission/priority/admission.go:
     /// 162-201): `spec.priority` is the one the PriorityClass names, and a
     /// request that sets a different one is refused.
@@ -628,90 +684,96 @@ impl Admission<'_> {
         Ok(())
     }
 
-    /// The in-tree validating plugins for a Pod: NodeRestriction on DELETE
-    /// (admission.go:257-270) and PodSecurity. The pod ResourceQuota
-    /// evaluator runs last, on the generic quota path (`validate_quota`).
-    async fn validate_pod(
+    /// The PodSecurity plugin's `Validate` (podsecurity/admission.go), one call
+    /// per request: `ValidateNamespace` (pod-security-admission/admission/
+    /// admission.go:229-327), `ValidatePodController` (:393-453) and
+    /// `ValidatePod` (:370-388). The pod ResourceQuota evaluator runs last, on
+    /// the generic path (`validate_quota`).
+    async fn validate_pod_security<T: Object>(
         &self,
         ctx: &RequestContext,
         op: &Operation,
-        obj: Option<&Pod>,
-        old: Option<&Pod>,
+        obj: Option<&T>,
+        old: Option<&T>,
     ) -> Result<()> {
-        let storage = &self.state.storage;
-        match op {
-            Operation::Delete => {
-                if let (Some(old), true) = (old, plugin_enabled("NodeRestriction")) {
-                    crate::handlers::node_restriction::admit_pod_delete(
-                        &rusternetes_middleware::AuthContext {
-                            user: self.user.clone(),
-                        },
-                        old,
-                    )?;
-                }
+        // `ValidateNamespace`: label validation, and the existing pods
+        // checked against a tightened enforce level.
+        if let (Operation::Create | Operation::Update, Some(obj), true) =
+            (op, obj, self.is_core("namespaces"))
+        {
+            let ns: rusternetes_common::resources::Namespace = recast(obj)?;
+            let old_ns: Option<rusternetes_common::resources::Namespace> =
+                if *op == Operation::Update {
+                    old.map(recast).transpose()?
+                } else {
+                    None
+                };
+            for w in crate::admission::PodSecurityAdmission::new()
+                .validate_namespace(&self.state.storage, &ns, old_ns.as_ref())
+                .await?
+            {
+                ctx.add_warning(w);
             }
-            Operation::Create => {
-                if let (Some(pod), Some(namespace)) = (obj, self.namespace) {
-                    if plugin_enabled("PodSecurity")
-                        && crate::admission::PodSecurityAdmission::should_evaluate(
-                            self.subresource,
-                            None,
-                            pod,
-                        )
-                    {
-                        // Warn mode: the request is admitted with warnings
-                        // (AdmissionResponse.Warnings -> warning.AddWarning).
-                        let outcome = crate::admission::PodSecurityAdmission::new()
-                            .admit_outcome(storage, namespace, pod, &self.user.username)
-                            .await?;
-                        crate::admission::record_pod_security_audit(&outcome);
-                        for w in outcome.warnings {
-                            ctx.add_warning(w);
-                        }
-                    }
-                }
-            }
-            // KEP-5328 + KEP-1287: a Guaranteed-QoS CPU resize against a node
-            // that has not declared `GuaranteedQoSPodCPUResize` is refused
-            // (the NodeDeclaredFeatureValidator plugin, off with its gate).
-            Operation::Update => {
-                // PodSecurity `ValidatePod` on UPDATE
-                // (pod-security-admission/admission/admission.go:370-388).
-                if let (Some(pod), Some(old), Some(namespace)) = (obj, old, self.namespace) {
-                    if plugin_enabled("PodSecurity")
-                        && crate::admission::PodSecurityAdmission::should_evaluate(
-                            self.subresource,
-                            Some(old),
-                            pod,
-                        )
-                    {
-                        // Warn mode: the request is admitted with warnings
-                        // (AdmissionResponse.Warnings -> warning.AddWarning).
-                        let outcome = crate::admission::PodSecurityAdmission::new()
-                            .admit_outcome(storage, namespace, pod, &self.user.username)
-                            .await?;
-                        crate::admission::record_pod_security_audit(&outcome);
-                        for w in outcome.warnings {
-                            ctx.add_warning(w);
-                        }
-                    }
-                    if self.subresource == Some("resize")
-                        && plugin_enabled("NodeDeclaredFeatureValidator")
-                    {
-                        crate::handlers::pod_subresources::check_node_declared_features_for_resize(
-                            storage.as_ref(),
-                            old,
-                            pod,
-                        )
-                        .await?;
-                    }
-                }
-            }
-            _ => {}
         }
-
-        // Pod quota is the last plugin (`validate_quota`): the pod evaluator
-        // (pkg/quota/v1/evaluator/core/pods.go) runs on the generic path.
+        // `ValidatePodController`: the warn/audit evaluation of a controller's
+        // pod template. The plugin runs it for resources with `HasPodSpec`
+        // (podsecurity/admission.go:195).
+        if let (Operation::Create | Operation::Update, Some(obj), Some(namespace)) =
+            (op, obj, self.namespace)
+        {
+            let r = &self.resource;
+            if !(r.group.is_empty() && r.resource == "pods")
+                && crate::admission::pod_security_controller::has_pod_spec(&r.group, &r.resource)
+            {
+                let value = serde_json::to_value(obj)
+                    .map_err(|e| Error::Internal(format!("failed to encode object: {e}")))?;
+                for w in crate::admission::PodSecurityAdmission::new()
+                    .validate_pod_controller(
+                        &self.state.storage,
+                        namespace,
+                        self.subresource,
+                        &r.group,
+                        &r.resource,
+                        &value,
+                        &self.user.username,
+                    )
+                    .await
+                    .warnings
+                {
+                    ctx.add_warning(w);
+                }
+            }
+        }
+        // `ValidatePod`, on CREATE and on UPDATE.
+        if self.is_core("pods") || self.is_pod_resize() || self.is_pod_ephemeralcontainers() {
+            let pod: Option<Pod> = obj.map(recast).transpose()?;
+            let old: Option<Pod> = old.map(recast).transpose()?;
+            let storage = &self.state.storage;
+            let target = match (op, pod.as_ref(), old.as_ref(), self.namespace) {
+                (Operation::Create, Some(pod), _, Some(namespace)) => Some((pod, None, namespace)),
+                (Operation::Update, Some(pod), Some(old), Some(namespace)) => {
+                    Some((pod, Some(old), namespace))
+                }
+                _ => None,
+            };
+            if let Some((pod, old, namespace)) = target {
+                if crate::admission::PodSecurityAdmission::should_evaluate(
+                    self.subresource,
+                    old,
+                    pod,
+                ) {
+                    // Warn mode: the request is admitted with warnings
+                    // (AdmissionResponse.Warnings -> warning.AddWarning).
+                    let outcome = crate::admission::PodSecurityAdmission::new()
+                        .admit_outcome(storage, namespace, pod, &self.user.username)
+                        .await?;
+                    crate::admission::record_pod_security_audit(&outcome);
+                    for w in outcome.warnings {
+                        ctx.add_warning(w);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -754,7 +816,15 @@ impl Admission<'_> {
             dry_run: self.dry_run,
             operation_options: None,
         };
-        plugin.admit(&mut attr, reinvocation.clone()).await?;
+        // `WithControllerMetrics(plugin, "MutatingAdmissionPolicy")`
+        // (metrics.go:63-66, :89-100).
+        rusternetes_admission_webhook::admission_metrics::with_controller_metrics(
+            "MutatingAdmissionPolicy",
+            op,
+            rusternetes_admission_webhook::admission_metrics::STEP_ADMIT,
+            plugin.admit(&mut attr, reinvocation.clone()),
+        )
+        .await?;
         match attr.object {
             Some(after) if after != before => serde_json::from_value(after).map_err(|e| {
                 Error::Internal(format!(
@@ -777,6 +847,24 @@ impl Admission<'_> {
     /// `IfNeeded` webhook is rerun on the second pass when a policy or
     /// in-tree plugin changed the object after it (#3041).
     pub async fn admit<T: Object>(&self, op: Operation, obj: T, old: Option<&T>) -> Result<T> {
+        // `c.AdmissionControl = admissionmetrics.WithStepMetrics(admissionChain)`
+        // (apiserver/pkg/server/options/admission.go:179): the whole admit
+        // phase, both reinvoker passes included, is one `step` observation.
+        let step_op = op.clone();
+        rusternetes_admission_webhook::admission_metrics::with_step_metrics(
+            &step_op,
+            rusternetes_admission_webhook::admission_metrics::STEP_ADMIT,
+            self.admit_reinvoking(op, obj, old),
+        )
+        .await
+    }
+
+    async fn admit_reinvoking<T: Object>(
+        &self,
+        op: Operation,
+        obj: T,
+        old: Option<&T>,
+    ) -> Result<T> {
         use crate::admission::policy_mutating::ReinvocationContext;
         let reinvocation = std::sync::Arc::new(ReinvocationContext::new(false));
         let obj = self.admit_chain(&op, obj, old, &reinvocation).await?;
@@ -869,6 +957,23 @@ impl Admission<'_> {
         obj: Option<&T>,
         old: Option<&T>,
     ) -> Result<()> {
+        // `WithStepMetrics` (admission.go:179), the validate phase.
+        let step_op = op.clone();
+        rusternetes_admission_webhook::admission_metrics::with_step_metrics(
+            &step_op,
+            rusternetes_admission_webhook::admission_metrics::STEP_VALIDATE,
+            self.validate_chain(ctx, op, obj, old),
+        )
+        .await
+    }
+
+    async fn validate_chain<T: Object>(
+        &self,
+        ctx: &RequestContext,
+        op: Operation,
+        obj: Option<&T>,
+        old: Option<&T>,
+    ) -> Result<()> {
         self.validate_in_tree(ctx, &op, obj, old).await?;
         let name = obj
             .or(old)
@@ -931,6 +1036,30 @@ impl Admission<'_> {
     /// `QuotaAdmission.Validate` (apiserver/pkg/admission/plugin/
     /// resourcequota/admission.go:158-165), last in the chain.
     async fn validate_quota(
+        &self,
+        op: Operation,
+        name: &str,
+        obj: Option<&serde_json::Value>,
+        old: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        // The plugin is decorated by `WithControllerMetrics`
+        // (metrics.go:63-66); `NewHandler(Create, Update)`
+        // (resourcequota/admission.go:97) keeps other operations out of the
+        // chain, so they are not observed.
+        if !matches!(op, Operation::Create | Operation::Update) {
+            return self.evaluate_quota(op, name, obj, old).await;
+        }
+        let observed_op = op.clone();
+        rusternetes_admission_webhook::admission_metrics::with_controller_metrics(
+            "ResourceQuota",
+            &observed_op,
+            rusternetes_admission_webhook::admission_metrics::STEP_VALIDATE,
+            self.evaluate_quota(op, name, obj, old),
+        )
+        .await
+    }
+
+    async fn evaluate_quota(
         &self,
         op: Operation,
         name: &str,

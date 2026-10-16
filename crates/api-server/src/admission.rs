@@ -2,6 +2,7 @@ pub mod admission_metrics;
 pub mod caching_authorizer;
 pub mod certificates;
 pub mod config;
+pub mod plugin_metrics;
 pub mod plugins;
 pub mod pod_security_api;
 pub mod pod_security_controller;
