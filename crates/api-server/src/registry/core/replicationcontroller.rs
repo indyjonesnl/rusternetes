@@ -79,6 +79,11 @@ impl RestCreateStrategy<ReplicationController> for Strategy {
 }
 
 impl RestUpdateStrategy<ReplicationController> for Strategy {
+    /// `GetResetFields` (pkg/registry/core/replicationcontroller/strategy.go:82): status.
+    fn get_reset_fields(&self) -> crate::ssa::ResetFields {
+        crate::ssa::ResetFields::new().with("v1", &[&["status"]])
+    }
+
     fn allow_create_on_update(&self) -> bool {
         false
     }
@@ -170,6 +175,11 @@ impl NamespaceScopedStrategy for StatusStrategy {
 }
 
 impl RestUpdateStrategy<ReplicationController> for StatusStrategy {
+    /// `GetResetFields` (pkg/registry/core/replicationcontroller/strategy.go:236): spec.
+    fn get_reset_fields(&self) -> crate::ssa::ResetFields {
+        crate::ssa::ResetFields::new().with("v1", &[&["spec"]])
+    }
+
     fn allow_create_on_update(&self) -> bool {
         false
     }
