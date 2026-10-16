@@ -269,6 +269,11 @@ impl RestCreateStrategy<Service> for Strategy {
 }
 
 impl RestUpdateStrategy<Service> for Strategy {
+    /// `GetResetFields` (pkg/registry/core/service/strategy.go:60-68): `status`.
+    fn get_reset_fields(&self) -> crate::ssa::ResetFields {
+        crate::ssa::ResetFields::new().with("v1", &[&["status"]])
+    }
+
     fn allow_create_on_update(&self) -> bool {
         true
     }
@@ -311,6 +316,11 @@ impl NamespaceScopedStrategy for StatusStrategy {
 }
 
 impl RestUpdateStrategy<Service> for StatusStrategy {
+    /// `GetResetFields` (pkg/registry/core/service/strategy.go:145-153): `spec`.
+    fn get_reset_fields(&self) -> crate::ssa::ResetFields {
+        crate::ssa::ResetFields::new().with("v1", &[&["spec"]])
+    }
+
     fn allow_create_on_update(&self) -> bool {
         true
     }
