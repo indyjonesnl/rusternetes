@@ -543,6 +543,31 @@ impl AuditContext {
         }
     }
 
+    /// `writeLatencyToAnnotation` (filters/audit.go:150-174): past 500ms,
+    /// record each non-zero layer latency plus the request total.
+    fn write_latency_to_annotation(&self) {
+        const THRESHOLD: std::time::Duration = std::time::Duration::from_millis(500);
+        let received = match self.inner.lock() {
+            Ok(g) => g.event.request_received_timestamp,
+            Err(_) => return,
+        };
+        let latency = (Utc::now() - received).to_std().unwrap_or_default();
+        if latency <= THRESHOLD {
+            return;
+        }
+        let mut layer =
+            match rusternetes_common::latency_trackers::audit_annotations_from_latency_trackers() {
+                Some(l) if !l.is_empty() => l,
+                // "latency tracking is not enabled for this request"
+                _ => return,
+            };
+        layer.push((
+            "apiserver.latency.k8s.io/total".to_string(),
+            rusternetes_common::go_duration::format_go_duration(latency.as_nanos() as i64),
+        ));
+        self.add_annotations(&layer);
+    }
+
     /// `AddAuditAnnotations` (context.go:312-327).
     fn add_annotations(&self, kvs: &[(String, String)]) {
         if let Ok(mut g) = self.inner.lock() {
@@ -864,6 +889,9 @@ pub async fn with_audit(cfg: Arc<AuditConfig>, req: Request, next: Next) -> Resp
     if long_running {
         ac.process_event_stage(AuditStage::ResponseStarted).await;
     }
+    // `writeLatencyToAnnotation` runs in `WithAudit`'s deferred func, which is
+    // the audit filter's own context: the trackers are the outer filter's.
+    ac.write_latency_to_annotation();
     ac.process_event_stage(AuditStage::ResponseComplete).await;
     resp
 }
@@ -1339,6 +1367,54 @@ rules:
             ev[0].annotations.as_ref().unwrap()["authentication.k8s.io/legacy-token"],
             "system:serviceaccount:ns:sa"
         );
+    }
+
+    /// `writeLatencyToAnnotation` (filters/audit.go:150-174): above 500ms the
+    /// per-layer latencies and `apiserver.latency.k8s.io/total` land on the
+    /// ResponseComplete event; below it nothing is added.
+    #[tokio::test]
+    async fn slow_request_gets_latency_annotations_fast_does_not() {
+        let cap = Arc::new(Capture(Default::default()));
+        let cfg = Arc::new(AuditConfig {
+            policy: Policy::from_yaml(POLICY).unwrap(),
+            sink: cap.clone(),
+        });
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/:ns/secrets/:name",
+                get(|axum::extract::Path((_, name)): axum::extract::Path<(String, String)>| async move {
+                    rusternetes_common::latency_trackers::track_storage_latency(
+                        std::time::Duration::from_millis(7),
+                    );
+                    if name == "slow" {
+                        tokio::time::sleep(std::time::Duration::from_millis(560)).await;
+                    }
+                    "ok"
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| {
+                let cfg = cfg.clone();
+                async move { with_audit(cfg, req, next).await }
+            }))
+            .layer(axum::middleware::from_fn(
+                crate::apiserver_request_metrics::with_latency_trackers_filter,
+            ));
+        for n in ["fast", "slow"] {
+            app.clone()
+                .oneshot(
+                    axum::http::Request::get(format!("/api/v1/namespaces/ns/secrets/{n}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let ev = cap.0.lock().await;
+        assert_eq!(ev.len(), 2);
+        assert!(ev[0].annotations.is_none(), "{:?}", ev[0].annotations);
+        let a = ev[1].annotations.as_ref().unwrap();
+        assert_eq!(a["apiserver.latency.k8s.io/etcd"], "7ms");
+        assert!(a["apiserver.latency.k8s.io/total"].ends_with("ms"));
     }
 
     /// A policy that audits every request at `level`.

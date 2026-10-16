@@ -2791,6 +2791,9 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
                 middleware::normalize_content_type_middleware,
             ))
             .layer(axum_middleware::from_fn(middleware::skip_auth_middleware))
+            .layer(axum_middleware::from_fn(
+                crate::apiserver_request_metrics::with_latency_trackers_filter,
+            ))
             // namespace_lifecycle_middleware reads the namespace; the
             // normal-auth branch below already layers this for auth.
             .layer(Extension(state.storage.clone()))
@@ -2861,6 +2864,10 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
                 middleware::normalize_content_type_middleware,
             ))
             .layer(axum_middleware::from_fn(middleware::auth_middleware))
+            // `WithLatencyTrackers` wraps authentication (server/config.go:1084).
+            .layer(axum_middleware::from_fn(
+                crate::apiserver_request_metrics::with_latency_trackers_filter,
+            ))
             .layer(Extension(state.token_manager.clone()))
             .layer(Extension(state.bootstrap_token_manager.clone()))
             .layer(Extension(state.storage.clone()))
