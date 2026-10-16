@@ -15,9 +15,11 @@
 //!
 //! Deviations (storage seam instead of client-go informers/listers):
 //! - Lists are read from storage per pass instead of informer caches.
-//! - The patch's `metadata.uid` and the delete's `resourceVersion`
-//!   preconditions are checked by re-reading the Secret just before the write
-//!   (the `Storage` trait has no preconditions), leaving a small race window.
+//! - The delete's `resourceVersion` precondition is atomic
+//!   (`Storage::delete_with_preconditions`, upstream `storage.Preconditions`).
+//!   The patch's `metadata.uid` precondition is still checked by re-reading
+//!   the Secret just before the patch (the `Storage` patch verbs carry no
+//!   preconditions), leaving a small race window.
 //! - The `kubernetes.io/legacy-token-last-used` stamping on use is the
 //!   api-server authenticator's half (`pkg/serviceaccount/legacy.go:185-198`);
 //!   it is not part of this controller (tracked separately).
@@ -25,7 +27,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use rusternetes_common::resources::{ConfigMap, Pod, Secret, ServiceAccount};
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_key, build_prefix, Preconditions, Storage};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -282,17 +284,17 @@ impl<S: Storage + 'static> LegacySATokenCleaner<S> {
     /// swallowed (:208-216).
     async fn delete_secret(&self, secret: &Secret) {
         let key = build_key("secrets", Some(namespace_of(secret)), &secret.metadata.name);
-        match self.storage.get::<Secret>(&key).await {
-            Ok(live) if live.metadata.resource_version == secret.metadata.resource_version => {}
-            Ok(_) => return, // conflict
-            Err(rusternetes_common::Error::NotFound(_)) => return,
-            Err(e) => {
-                error!("Deleting legacy service account token: {e}");
-                return;
-            }
-        }
-        match self.storage.delete(&key).await {
-            Ok(()) | Err(rusternetes_common::Error::NotFound(_)) => {}
+        let preconditions = Preconditions::new_resource_version(
+            secret.metadata.resource_version.clone().unwrap_or_default(),
+        );
+        match self
+            .storage
+            .delete_with_preconditions(&key, &preconditions)
+            .await
+        {
+            Ok(())
+            | Err(rusternetes_common::Error::NotFound(_))
+            | Err(rusternetes_common::Error::Conflict(_)) => {}
             Err(e) => error!(
                 "Deleting legacy service account token {}/{}: {e}",
                 namespace_of(secret),

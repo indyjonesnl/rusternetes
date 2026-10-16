@@ -239,6 +239,58 @@ impl Default for MemoryStorage {
     }
 }
 
+impl MemoryStorage {
+    fn delete_inner(&self, key: &str, preconditions: Option<&crate::Preconditions>) -> Result<()> {
+        let mut data = self.data.write().unwrap();
+        if let Some(pre) = preconditions {
+            let current = data
+                .get(key)
+                .ok_or_else(|| Error::NotFound(key.to_string()))?;
+            let obj: serde_json::Value = serde_json::from_str(current)?;
+            pre.check(key, &obj)?;
+        }
+        let previous_value = data
+            .remove(key)
+            .ok_or_else(|| Error::NotFound(key.to_string()))?;
+        // A delete advances the cluster revision in etcd; a watcher replaying
+        // from the revision the delete produced must not see it again.
+        let rev = self
+            .revision
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        drop(data); // Release lock before sending event
+        self.expiries.lock().unwrap().remove(key);
+
+        // Emit watch event with previous value
+        // The deleted object carries the DELETE's revision, as etcd's watch
+        // does (`etcd3/watcher.go` `parseEvent`: prevObj stamped with
+        // `e.rev`): a watch snapshot cut dedupes DELETED by it (#2223).
+        let undo_value = previous_value.clone();
+        let stamped = match serde_json::from_str::<serde_json::Value>(&previous_value) {
+            Ok(mut v) => match v.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+                Some(m) => {
+                    m.insert(
+                        "resourceVersion".to_string(),
+                        serde_json::Value::String(
+                            crate::concurrency::mod_revision_to_resource_version(rev),
+                        ),
+                    );
+                    serde_json::to_string(&v).unwrap_or(previous_value)
+                }
+                None => previous_value,
+            },
+            Err(_) => previous_value,
+        };
+        self.emit(
+            rev,
+            WatchEvent::Deleted(key.to_string(), stamped),
+            Some(undo_value),
+        );
+
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl Storage for MemoryStorage {
     async fn apply<T>(
@@ -470,46 +522,19 @@ impl Storage for MemoryStorage {
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        self.expiries.lock().unwrap().remove(key);
-        let mut data = self.data.write().unwrap();
-        let previous_value = data
-            .remove(key)
-            .ok_or_else(|| Error::NotFound(key.to_string()))?;
-        // A delete advances the cluster revision in etcd; a watcher replaying
-        // from the revision the delete produced must not see it again.
-        let rev = self
-            .revision
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1;
-        drop(data); // Release lock before sending event
+        self.delete_inner(key, None)
+    }
 
-        // Emit watch event with previous value
-        // The deleted object carries the DELETE's revision, as etcd's watch
-        // does (`etcd3/watcher.go` `parseEvent`: prevObj stamped with
-        // `e.rev`): a watch snapshot cut dedupes DELETED by it (#2223).
-        let undo_value = previous_value.clone();
-        let stamped = match serde_json::from_str::<serde_json::Value>(&previous_value) {
-            Ok(mut v) => match v.get_mut("metadata").and_then(|m| m.as_object_mut()) {
-                Some(m) => {
-                    m.insert(
-                        "resourceVersion".to_string(),
-                        serde_json::Value::String(
-                            crate::concurrency::mod_revision_to_resource_version(rev),
-                        ),
-                    );
-                    serde_json::to_string(&v).unwrap_or(previous_value)
-                }
-                None => previous_value,
-            },
-            Err(_) => previous_value,
-        };
-        self.emit(
-            rev,
-            WatchEvent::Deleted(key.to_string(), stamped),
-            Some(undo_value),
-        );
-
-        Ok(())
+    /// `conditionalDelete` (`etcd3/store.go:361-453`): the precondition check
+    /// and the removal happen under ONE write lock, which is this backend's
+    /// equivalent of etcd's `OptimisticDelete` ModRevision guard -- no writer
+    /// can slip between the check and the delete.
+    async fn delete_with_preconditions(
+        &self,
+        key: &str,
+        preconditions: &crate::Preconditions,
+    ) -> Result<()> {
+        self.delete_inner(key, Some(preconditions))
     }
 
     async fn list<T>(&self, prefix: &str) -> Result<Vec<T>>
@@ -1122,5 +1147,15 @@ mod tests {
             s.stats("/registry/none/").await.unwrap(),
             crate::ResourceStats::default()
         );
+    }
+}
+
+#[cfg(test)]
+mod preconditions_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delete_with_preconditions_suite() {
+        crate::preconditions_suite::run_all(Arc::new(MemoryStorage::new())).await;
     }
 }

@@ -787,6 +787,36 @@ impl Storage for ApiStorage {
         }
     }
 
+    /// `metav1.DeleteOptions{Preconditions}` on the DELETE body, as upstream's
+    /// clients send it (e.g. `pkg/controller/certificates/cleaner/pcrcleaner.go:93-99`);
+    /// the api-server's registry `Store.Delete` enforces it atomically
+    /// (`registry/generic/registry/store.go:1146-1149` -> `storage.Preconditions`)
+    /// and answers 409 on a miss, which is `Error::Conflict` here. Same
+    /// hard-delete query as `delete`.
+    async fn delete_with_preconditions(
+        &self,
+        key: &str,
+        preconditions: &crate::Preconditions,
+    ) -> Result<()> {
+        let path = self.object_path(key).await?;
+        let body = preconditions.to_delete_options();
+        let status = self
+            .client
+            .delete_with_options(&path, &force_delete_query(), Some(&body))
+            .await
+            .map_err(|e| Error::Storage(format!("{e:#}")))?;
+        match status.as_u16() {
+            s if (200..300).contains(&s) => Ok(()),
+            404 => Err(Error::NotFound(format!("{key} not found"))),
+            409 => Err(Error::Conflict(format!(
+                "delete {key} failed its preconditions: HTTP 409"
+            ))),
+            _ => Err(Error::Storage(format!(
+                "delete {key} failed: HTTP {status}"
+            ))),
+        }
+    }
+
     /// Graceful delete: a plain DELETE with no `gracePeriodSeconds` override,
     /// so the api-server terminates the object on its own terms. Controllers
     /// that used to stamp `deletionTimestamp` themselves must come through
