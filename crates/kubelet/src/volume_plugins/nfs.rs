@@ -540,8 +540,8 @@ mod tests {
         let rv = plugin(tmp.path())
             .construct_volume_spec("vol1", "/m")
             .unwrap();
-        assert_eq!(rv.volume.name, "vol1");
-        assert_eq!(rv.volume.nfs.unwrap().path, "vol1");
+        assert_eq!(rv.volume.as_ref().unwrap().name, "vol1");
+        assert_eq!(rv.volume.unwrap().nfs.unwrap().path, "vol1");
     }
 
     /// `TearDownAt` on a directory that is not a mount point removes it

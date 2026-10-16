@@ -320,7 +320,7 @@ pub(crate) fn reconstructed_volume(
     let mut volume = source;
     volume["name"] = serde_json::Value::String(name.to_string());
     Ok(crate::volume_plugins::ReconstructedVolume {
-        volume: serde_json::from_value(volume)?,
+        volume: Some(serde_json::from_value(volume)?),
         persistent_volume: None,
     })
 }
@@ -610,24 +610,27 @@ mod unmounter_tests {
         let cm = ConfigMapPlugin::new(h.clone())
             .construct_volume_spec("v", "/p")
             .unwrap();
-        assert_eq!(cm.volume.name, "v");
-        assert!(cm.volume.config_map.is_some());
+        assert_eq!(cm.volume.as_ref().unwrap().name, "v");
+        assert!(cm.volume.as_ref().unwrap().config_map.is_some());
         let sec = SecretPlugin::new(h.clone())
             .construct_volume_spec("v", "/p")
             .unwrap();
-        assert_eq!(sec.volume.secret.unwrap().secret_name.as_deref(), Some("v"));
+        assert_eq!(
+            sec.volume.unwrap().secret.unwrap().secret_name.as_deref(),
+            Some("v")
+        );
         let d = DownwardApiPlugin::new(h.clone())
             .construct_volume_spec("v", "/p")
             .unwrap();
-        assert!(d.volume.downward_api.is_some());
+        assert!(d.volume.unwrap().downward_api.is_some());
         let p = ProjectedPlugin::new(h.clone())
             .construct_volume_spec("v", "/p")
             .unwrap();
-        assert!(p.volume.projected.is_some());
+        assert!(p.volume.unwrap().projected.is_some());
         let hp = HostPathPlugin::new(h)
             .construct_volume_spec("v", "/p")
             .unwrap();
-        assert_eq!(hp.volume.host_path.unwrap().path, "v");
+        assert_eq!(hp.volume.unwrap().host_path.unwrap().path, "v");
     }
 }
 
