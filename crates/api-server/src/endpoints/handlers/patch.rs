@@ -488,6 +488,10 @@ fn patch_error(e: crate::patch::PatchError, patch_type: &PatchType) -> Error {
         (_, PatchError::BadRequest(msg)) => Error::BadRequest(msg),
         // Its default arm: the error goes on raw, a 500 with no reason.
         (_, PatchError::Uninterpreted(msg)) => Error::unknown_error(msg),
+        // `ErrNoListOfLists` (patch.go:802-803): `NewGenericServerResponse(422, ...)`.
+        (_, PatchError::UnprocessableEntity(msg)) => {
+            Error::generic_server_response(422, "", "", "", "", &msg, 0, false)
+        }
         (_, other) => Error::InvalidResource(other.to_string()),
     }
 }

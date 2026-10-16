@@ -695,3 +695,67 @@ async fn an_invalid_ephemeral_container_is_rejected() {
         "{body}"
     );
 }
+
+/// `ErrNoListOfLists` is answered 422 (`interpretStrategicMergePatchError`,
+/// apiserver patch.go:802-803), not a reason-less 500.
+#[tokio::test]
+async fn smp_list_of_lists_is_422() {
+    let api = TestApiServer::new();
+    create(&api, &scheduled_pod("p1")).await;
+    let key = build_key("pods", Some("default"), "p1");
+    let mut stored: Value = api.storage.get(&key).await.unwrap();
+    stored["metadata"]["finalizers"] = json!([]);
+    api.storage.update(&key, &stored).await.unwrap();
+    let (s, body) = api
+        .send(
+            "PATCH",
+            &format!("{PODS}/p1"),
+            Some("application/strategic-merge-patch+json"),
+            Some(&json!({"metadata": {"finalizers": [[1]]}})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("lists of lists are not supported"),
+        "{body}"
+    );
+}
+
+/// The kubelet's Node status patch (`fixupPatchForNodeStatusAddresses`,
+/// component-helpers/node/util/status.go:85-120) replaces `addresses`; every
+/// item survives, including two `InternalIP`s that share the merge key.
+#[tokio::test]
+async fn node_status_patch_replace_addresses_keeps_duplicate_types() {
+    let api = TestApiServer::new();
+    let (s, body) = api
+        .send(
+            "POST",
+            "/api/v1/nodes",
+            None,
+            Some(&json!({"apiVersion": "v1", "kind": "Node", "metadata": {"name": "n1"}})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+    let patch = json!({"status": {"addresses": [
+        {"type": "InternalIP", "address": "10.0.0.1"},
+        {"type": "InternalIP", "address": "fd00::1"},
+        {"type": "Hostname", "address": "n"},
+        {"$patch": "replace"}]}});
+    let (s, body) = api
+        .send(
+            "PATCH",
+            "/api/v1/nodes/n1/status",
+            Some("application/strategic-merge-patch+json"),
+            Some(&patch),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["status"]["addresses"].as_array().unwrap().len(),
+        3,
+        "{body}"
+    );
+}

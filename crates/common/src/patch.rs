@@ -102,6 +102,12 @@ pub enum PatchError {
     #[error("{0}")]
     Uninterpreted(String),
 
+    /// `mergepatch.ErrNoListOfLists`: `interpretStrategicMergePatchError`
+    /// answers it `NewGenericServerResponse(422, ...)` (apiserver
+    /// patch.go:802-803).
+    #[error("{0}")]
+    UnprocessableEntity(String),
+
     /// JSON-Patch targeted a path that does not exist on the object.
     ///
     /// Carries the resolved dotted field path (e.g. `spec.doesNotExist`) so
@@ -660,8 +666,18 @@ fn smp_merge_map(
                     let merged = smp_merge_map(&result_obj[key], patch_value, None)?;
                     result_obj.insert(key.clone(), merged);
                 } else {
-                    // Replace value
-                    result_obj.insert(key.clone(), patch_value.clone());
+                    // Not in the live object, or of another type: the patch
+                    // value goes in with its directives removed
+                    // (`removeDirectives`, patch.go:1423-1428, :1445-1450);
+                    // a value that is itself a directive map is dropped.
+                    match remove_directives_deep(patch_value) {
+                        Some(v) => {
+                            result_obj.insert(key.clone(), v);
+                        }
+                        None => {
+                            result_obj.remove(key);
+                        }
+                    }
                 }
             }
 
@@ -949,7 +965,10 @@ fn merge_set_element_order_lists(
             let merged = match (&original, &patch_list) {
                 (None, None) => continue,
                 (Some(o), None) => o.clone(),
-                (None, Some(p)) => remove_directives(p),
+                (None, Some(p)) => match remove_directives_deep(&Value::Array(p.clone())) {
+                    Some(Value::Array(a)) => a,
+                    _ => continue,
+                },
                 (Some(o), Some(p)) if strategy == "merge" => merge_slice(o, p, Some(&sub), key)?,
                 (Some(_), Some(p)) => p.clone(),
             };
@@ -1019,6 +1038,27 @@ fn merge_set_element_order_lists(
     Ok(consumed)
 }
 
+/// `removeDirectives` (patch.go:1282-1311): a map carrying `$patch` is
+/// dropped (`None`); maps and lists are cleaned recursively.
+fn remove_directives_deep(v: &Value) -> Option<Value> {
+    match v {
+        Value::Object(m) => {
+            if m.contains_key("$patch") {
+                return None;
+            }
+            Some(Value::Object(
+                m.iter()
+                    .filter_map(|(k, v)| remove_directives_deep(v).map(|v| (k.clone(), v)))
+                    .collect(),
+            ))
+        }
+        Value::Array(a) => Some(Value::Array(
+            a.iter().filter_map(remove_directives_deep).collect(),
+        )),
+        other => Some(other.clone()),
+    }
+}
+
 /// A failed `LookupPatchMetadataFor*` (meta.go): a plain `error`, so the
 /// apiserver answers it as a reason-less 500 (patch.go:805-806).
 fn lookup_error(msg: String) -> PatchError {
@@ -1053,7 +1093,7 @@ fn slice_elements_are_maps(slices: &[&[Value]]) -> Result<bool, PatchError> {
                 None => {
                     prev = Some(cur);
                     if v.is_array() {
-                        return Err(PatchError::Uninterpreted(
+                        return Err(PatchError::UnprocessableEntity(
                             "lists of lists are not supported".to_string(),
                         ));
                     }
@@ -1134,7 +1174,8 @@ fn merge_slice(
 
 /// `mergeSliceWithSpecialElements` (patch.go:1567-1607): apply the `$patch`
 /// elements of `patch` and return the live list after any deletes plus the
-/// patch without them (`replace` drops the live list).
+/// patch without them (`replace` makes the patch items the live list and the
+/// patch empty, patch.go:1583-1585).
 fn merge_slice_with_special_elements(
     original: &[Value],
     patch: &[Value],
@@ -1171,7 +1212,7 @@ fn merge_slice_with_special_elements(
         }
     }
     if replace {
-        return Ok((Vec::new(), plain));
+        return Ok((plain, Vec::new()));
     }
     Ok((original, plain))
 }

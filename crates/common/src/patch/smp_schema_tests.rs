@@ -215,3 +215,44 @@ fn set_element_order_uses_field_merge_key() {
         json!([{"name": "b"}, {"name": "c"}, {"name": "a", "image": "x"}])
     );
 }
+
+/// `mergeSliceWithSpecialElements` (patch.go:1583-1585): on `$patch: replace`
+/// the patch items become the live list and the patch is empty, so items that
+/// share a merge key all survive (nothing is merged into the first one).
+#[test]
+fn replace_directive_keeps_duplicate_merge_keys() {
+    let r = smp(
+        json!({"apiVersion": "v1", "kind": "Node",
+               "status": {"addresses": [{"type": "Hostname", "address": "old"}]}}),
+        json!({"status": {"addresses": [
+            {"type": "InternalIP", "address": "10.0.0.1"},
+            {"type": "InternalIP", "address": "fd00::1"},
+            {"type": "Hostname", "address": "n"},
+            {"$patch": "replace"}]}}),
+    )
+    .unwrap();
+    assert_eq!(
+        r["status"]["addresses"],
+        json!([
+            {"type": "InternalIP", "address": "10.0.0.1"},
+            {"type": "InternalIP", "address": "fd00::1"},
+            {"type": "Hostname", "address": "n"}
+        ])
+    );
+}
+
+/// `ErrNoListOfLists` is its own error so the handler can answer 422
+/// (`interpretStrategicMergePatchError`, apiserver patch.go:802-803).
+#[test]
+fn list_of_lists_is_unprocessable() {
+    let r = smp(
+        json!({"apiVersion": "v1", "kind": "Pod", "metadata": {"finalizers": []}}),
+        json!({"metadata": {"finalizers": [[1]]}}),
+    );
+    match r {
+        Err(PatchError::UnprocessableEntity(m)) => {
+            assert_eq!(m, "lists of lists are not supported")
+        }
+        other => panic!("expected UnprocessableEntity, got {other:?}"),
+    }
+}
