@@ -3717,7 +3717,6 @@ impl Kubelet {
                             // Write Running status using the fresh resourceVersion
                             let mut new_pod = fresh_pod;
                             let qos = Self::compute_qos_class(&new_pod);
-                            let observed_gen = new_pod.metadata.generation;
                             let init_container_statuses =
                                 self.get_init_container_statuses(&new_pod).await;
 
@@ -3747,29 +3746,30 @@ impl Kubelet {
                                 .get_ephemeral_container_statuses(&new_pod)
                                 .await;
 
-                            new_pod.status = Some(PodStatus {
-                                phase: Some(Phase::Running),
-                                message: Some("All containers started".to_string()),
-                                reason: None,
-                                host_ip: self.host_ip_fields().0,
-                                pod_ip,
-                                conditions: Some(conditions),
-                                container_statuses,
-                                init_container_statuses,
-                                ephemeral_container_statuses,
-                                resize: None,
-                                resource_claim_statuses: None,
-                                observed_generation: observed_gen,
-                                host_i_ps: self.host_ip_fields().1,
-                                pod_i_ps,
-                                nominated_node_name: None,
-                                qos_class: Some(qos),
-                                start_time: Some(preserved_start_time(
-                                    new_pod.status.as_ref().and_then(|s| s.start_time),
-                                    chrono::Utc::now(),
-                                )),
-                                ..Default::default()
-                            });
+                            // generateAPIPodStatus (kubelet_pods.go:1889), see pod_status.rs.
+                            let start_time = preserved_start_time(
+                                new_pod.status.as_ref().and_then(|s| s.start_time),
+                                chrono::Utc::now(),
+                            );
+                            let (host_ip, host_ips) = self.host_ip_fields();
+                            new_pod.status = Some(crate::pod_status::generate_api_pod_status(
+                                &new_pod,
+                                crate::pod_status::ApiPodStatusInput {
+                                    phase: Phase::Running,
+                                    message: Some("All containers started".to_string()),
+                                    reason: None,
+                                    host_ip,
+                                    host_ips,
+                                    pod_ip,
+                                    pod_ips: pod_i_ps,
+                                    conditions,
+                                    container_statuses,
+                                    init_container_statuses,
+                                    ephemeral_container_statuses,
+                                    qos_class: Some(qos),
+                                    start_time,
+                                },
+                            ));
                             self.apply_host_ips_to_pod(&mut new_pod).await;
 
                             if let Err(e) = self.storage.update_status(&key, &new_pod).await {
@@ -4217,7 +4217,6 @@ impl Kubelet {
                     // Update status to Running
                     let mut new_pod = fresh_pod;
                     let qos = Self::compute_qos_class(&new_pod);
-                    let observed_gen = new_pod.metadata.generation;
                     let init_container_statuses = self.get_init_container_statuses(&new_pod).await;
 
                     let has_readiness_probe = new_pod
@@ -4243,29 +4242,30 @@ impl Kubelet {
                         .get_ephemeral_container_statuses(&new_pod)
                         .await;
 
-                    new_pod.status = Some(PodStatus {
-                        phase: Some(Phase::Running),
-                        message: Some("All containers started".to_string()),
-                        reason: None,
-                        host_ip: self.host_ip_fields().0,
-                        pod_ip,
-                        conditions: Some(conditions),
-                        container_statuses,
-                        init_container_statuses,
-                        ephemeral_container_statuses,
-                        resize: None,
-                        resource_claim_statuses: None,
-                        observed_generation: observed_gen,
-                        host_i_ps: self.host_ip_fields().1,
-                        pod_i_ps,
-                        nominated_node_name: None,
-                        qos_class: Some(qos),
-                        start_time: Some(preserved_start_time(
-                            new_pod.status.as_ref().and_then(|s| s.start_time),
-                            chrono::Utc::now(),
-                        )),
-                        ..Default::default()
-                    });
+                    // generateAPIPodStatus (kubelet_pods.go:1889), see pod_status.rs.
+                    let start_time = preserved_start_time(
+                        new_pod.status.as_ref().and_then(|s| s.start_time),
+                        chrono::Utc::now(),
+                    );
+                    let (host_ip, host_ips) = self.host_ip_fields();
+                    new_pod.status = Some(crate::pod_status::generate_api_pod_status(
+                        &new_pod,
+                        crate::pod_status::ApiPodStatusInput {
+                            phase: Phase::Running,
+                            message: Some("All containers started".to_string()),
+                            reason: None,
+                            host_ip,
+                            host_ips,
+                            pod_ip,
+                            pod_ips: pod_i_ps,
+                            conditions,
+                            container_statuses,
+                            init_container_statuses,
+                            ephemeral_container_statuses,
+                            qos_class: Some(qos),
+                            start_time,
+                        },
+                    ));
                     self.apply_host_ips_to_pod(&mut new_pod).await;
 
                     // Use non-fatal update: if the write fails (e.g., concurrency conflict),
