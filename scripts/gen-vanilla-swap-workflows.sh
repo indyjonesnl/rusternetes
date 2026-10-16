@@ -76,10 +76,10 @@ on:
         required: false
         default: v1.35
 
-# Per-module group so a newer run supersedes an older one for THIS module
-# without cancelling the other modules' runs.
+# Per-module, per-ref group so a newer run on the SAME ref supersedes an older one for THIS module
+# without cancelling other modules or other refs (#3119).
 concurrency:
-  group: vanilla-swap-$module
+  group: vanilla-swap-$module-\${{ github.ref }}
   cancel-in-progress: true
 
 jobs:

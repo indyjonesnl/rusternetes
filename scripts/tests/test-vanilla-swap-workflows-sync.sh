@@ -62,4 +62,14 @@ if [ -e "$WF_DIR/vanilla-swap.yml" ]; then
     fail "the aggregate vanilla-swap.yml is back — it ran all modules in one run; use the per-module workflows"
 fi
 
+# #3119(b): the concurrency group must be per-ref (like the sig-* callers,
+# scripts/gen-target-workflows.sh). A bare per-module group lets a PR-branch
+# dispatch cancel the nightly / another PR's in-flight proof of the same module.
+for f in "$WF_DIR"/vanilla-swap-*.yml "$WF_DIR"/conformance-kine.yml; do
+    [ -e "$f" ] || continue
+    grep -qF "$MARKER" "$f" || [ "$(basename "$f")" = conformance-kine.yml ] || continue
+    grep -qE '^[[:space:]]+group:.*[$][{][{] github[.]ref [}][}]' "$f" \
+        || fail "$f concurrency group is not per-ref: a PR-branch dispatch would cancel other refs' runs (#3119)"
+done
+
 echo "PASS: per-module vanilla-swap workflows in sync with targets.json ($(jq length "$MANIFEST") modules)"

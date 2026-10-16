@@ -39,7 +39,7 @@ on:
         default: ''
 
 concurrency:
-  group: conformance-kine
+  group: conformance-kine-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
