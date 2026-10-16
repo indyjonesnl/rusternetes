@@ -15,7 +15,7 @@
 //! - The structural-schema half of `validateCustomResourceDefinitionSpec`
 //!   and CEL cost estimation: `handlers::cel_validation` keeps its own,
 //!   weaker, rule checks, reported here as field errors.
-//! - `GetResetFields` (managed-fields reset sets), `ShortNames` and
+//! - `ShortNames` and
 //!   `Categories` of `REST` (discovery), table conversion.
 //! - `StatusREST.Update`'s `forceAllowCreate=false` is the status strategy's
 //!   `AllowCreateOnUpdate`.
@@ -48,6 +48,7 @@ use crate::registry::rest::{
     GroupResource, NamespaceScopedStrategy, RequestContext, RestCreateStrategy, RestDeleteStrategy,
     RestStorage, RestUpdateStrategy, UpdatedObjectInfo, ValidateObject, ValidateObjectUpdate,
 };
+use crate::ssa::ResetFields;
 
 /// `SetDefaults_CustomResourceDefinition` (apiextensions/v1/defaults.go:30-40),
 /// run by the codec on every decode.
@@ -335,6 +336,14 @@ impl RestUpdateStrategy<CustomResourceDefinition> for Strategy {
     fn allow_unconditional_update(&self) -> bool {
         false
     }
+
+    /// `GetResetFields` (customresourcedefinition/strategy.go:60-71): `status`
+    /// for v1 and v1beta1.
+    fn get_reset_fields(&self) -> ResetFields {
+        ResetFields::new()
+            .with("apiextensions.k8s.io/v1", &[&["status"]])
+            .with("apiextensions.k8s.io/v1beta1", &[&["status"]])
+    }
 }
 
 /// CustomResourceDefinitions use the default delete strategy.
@@ -384,6 +393,14 @@ impl RestUpdateStrategy<CustomResourceDefinition> for StatusStrategy {
     /// strategy.go:280-282.
     fn allow_unconditional_update(&self) -> bool {
         false
+    }
+
+    /// `GetResetFields` (customresourcedefinition/strategy.go:252-265):
+    /// `metadata` and `spec` for v1 and v1beta1.
+    fn get_reset_fields(&self) -> ResetFields {
+        ResetFields::new()
+            .with("apiextensions.k8s.io/v1", &[&["metadata"], &["spec"]])
+            .with("apiextensions.k8s.io/v1beta1", &[&["metadata"], &["spec"]])
     }
 }
 
@@ -1117,6 +1134,12 @@ impl RestStorage<CustomResourceDefinition> for CrdRest {
         RestStorage::namespace_scoped(&self.store)
     }
 
+    /// The REST embeds `*genericregistry.Store`, so `GetResetFields` is promoted
+    /// from it (store.go:1698-1703).
+    fn get_reset_fields(&self) -> crate::ssa::ResetFields {
+        RestStorage::get_reset_fields(&self.store)
+    }
+
     async fn get(
         &self,
         ctx: &RequestContext,
@@ -1292,6 +1315,12 @@ impl RestStorage<CustomResourceDefinition> for CrdStatusRest {
 
     fn namespace_scoped(&self) -> bool {
         RestStorage::namespace_scoped(&self.store)
+    }
+
+    /// The REST embeds `*genericregistry.Store`, so `GetResetFields` is promoted
+    /// from it (store.go:1698-1703).
+    fn get_reset_fields(&self) -> crate::ssa::ResetFields {
+        RestStorage::get_reset_fields(&self.store)
     }
 
     async fn get(
