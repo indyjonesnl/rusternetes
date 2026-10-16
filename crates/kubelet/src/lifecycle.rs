@@ -356,18 +356,46 @@ pub fn reason_from_anyhow(err: &anyhow::Error) -> Option<&'static str> {
 /// gates container start on volume readiness; without this branch an unbound PVC
 /// would fall through to the start-failure path and surface as a misleading
 /// `error!` log + `InitContainerFailed` status instead of `ContainerCreating`.
-pub fn is_volume_wait_error(err_msg: &str) -> bool {
-    (err_msg.contains("not found in namespace")
-        && (err_msg.contains("Secret")
-            || err_msg.contains("ConfigMap")
-            || err_msg.contains("PersistentVolumeClaim")))
-        || err_msg.contains("is not bound to a volume")
-        // `desired_state_of_world.go:272-277` over `ErrNoPluginMatched`
-        // (`plugins.go:72`): the pod waits, it is not failed (#3262).
-        || err_msg.contains("err=no volume plugin matched")
-        // `csi_mounter.go:106-109`: a missing CSI driver is transient.
-        || err_msg.contains("mounter.SetUpAt failed to get CSI client")
+pub fn is_volume_wait_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<crate::cri_runtime::CriRuntimeError>()
+        .is_some_and(is_volume_wait_cri)
 }
+
+pub fn is_volume_wait_cri(err: &crate::cri_runtime::CriRuntimeError) -> bool {
+    match err {
+        crate::cri_runtime::CriRuntimeError::Volumes { source, .. } => {
+            is_volume_wait_anyhow(source)
+        }
+        _ => false,
+    }
+}
+
+/// Typed classification of a volume-provisioning error (#3513): the pod is
+/// waiting on a volume source that is not ready, not failing. Upstream branches
+/// on typed errors, never message text: `ErrNoPluginMatched`
+/// (`pkg/volume/plugins.go:72`, `desired_state_of_world.go:272-277`) and the
+/// transient CSI client failure (`csi_mounter.go:106-109`); a missing
+/// Secret/ConfigMap/PVC is the populator/mounter retrying
+/// (`desired_state_of_world_populator.go:432-441`).
+pub fn is_volume_wait_anyhow(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<VolumeWaitError>().is_some()
+        || err
+            .downcast_ref::<crate::volumes::NoPluginForVolume>()
+            .is_some()
+}
+
+/// Marker attached by the volume code (as the error or as `.context`) when a
+/// volume source is not ready yet; its text is the user-visible message.
+#[derive(Debug)]
+pub struct VolumeWaitError(pub String);
+
+impl std::fmt::Display for VolumeWaitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for VolumeWaitError {}
 
 pub fn container_reason_from_error_message(err_msg: &str) -> Option<&'static str> {
     if err_msg.starts_with("CreateContainerConfigError:") {
@@ -508,27 +536,47 @@ mod conflict_predicate_tests {
 mod tests {
     use super::*;
 
+    fn vol(source: anyhow::Error) -> crate::cri_runtime::CriRuntimeError {
+        crate::cri_runtime::CriRuntimeError::Volumes {
+            pod: "p".into(),
+            source,
+        }
+    }
+
+    /// #3513: classification is by error type, never by message text.
     #[test]
     fn volume_wait_error_classification() {
-        // PVC not bound / not found → wait (the #1096 cases). Messages mirror
-        // the wrapped CriRuntimeError::Volumes Display: "provisioning volumes
-        // for pod X: <source>".
-        assert!(is_volume_wait_error(
-            "provisioning volumes for pod p: PersistentVolumeClaim is not bound to a volume"
-        ));
-        assert!(is_volume_wait_error(
-            "provisioning volumes for pod p: PersistentVolumeClaim data not found in namespace ns"
-        ));
-        // Secret/ConfigMap not yet created → wait (pre-existing behavior).
-        assert!(is_volume_wait_error("Secret foo not found in namespace ns"));
-        assert!(is_volume_wait_error(
-            "ConfigMap foo not found in namespace ns"
-        ));
-        // Real start failures must NOT be treated as volume waits.
-        assert!(!is_volume_wait_error("CreateContainerConfigError: bad env"));
-        assert!(!is_volume_wait_error("port is already allocated"));
-        assert!(is_volume_wait_error(
-            "failed to get Plugin from volumeSpec for volume \"v\" err=no volume plugin matched"
+        use anyhow::Context;
+        // Typed markers (also behind a later `.context()`) are waits.
+        assert!(is_volume_wait_cri(&vol(anyhow::Error::new(
+            VolumeWaitError("PersistentVolumeClaim is not bound to a volume".into())
+        )
+        .context("outer"))));
+        let e: anyhow::Result<()> = Err(anyhow::anyhow!("storage down"))
+            .with_context(|| VolumeWaitError("Secret foo not found in namespace ns".into()));
+        assert!(is_volume_wait_cri(&vol(e.unwrap_err())));
+        // The upstream ErrNoPluginMatched error stays a wait.
+        assert!(is_volume_wait_cri(&vol(crate::volumes::NoPluginForVolume(
+            "v".into()
+        )
+        .into())));
+        // Real start failures whose TEXT merely mentions the tokens are not.
+        for msg in [
+            "CreateContainerConfigError: bad env",
+            "port is already allocated",
+            "Secret foo not found in namespace ns",
+            "PersistentVolumeClaim is not bound to a volume",
+            "err=no volume plugin matched",
+            "mounter.SetUpAt failed to get CSI client",
+        ] {
+            assert!(!is_volume_wait_cri(&vol(anyhow::anyhow!(msg))), "{msg}");
+        }
+        // Non-volume runtime errors never wait.
+        assert!(!is_volume_wait_cri(
+            &crate::cri_runtime::CriRuntimeError::InitContainerFailed {
+                name: "i".into(),
+                exit_code: 1
+            }
         ));
     }
 
