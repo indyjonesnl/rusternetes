@@ -17,6 +17,7 @@ pub mod node_ip;
 pub mod node_status;
 pub mod pluginmanager;
 pub mod pod_dirs;
+pub mod pod_status;
 pub mod podcertificate;
 mod poll;
 pub mod removeall;
