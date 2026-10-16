@@ -4421,6 +4421,7 @@ dependencies = [
  "ed25519-dalek",
  "etcd-client",
  "futures",
+ "ipnet",
  "jsonwebtoken",
  "k8s-openapi",
  "once_cell",

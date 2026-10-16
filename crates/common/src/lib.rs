@@ -52,6 +52,7 @@ pub mod resource_encoding;
 pub mod resources;
 pub mod sa_keys;
 pub mod schema_validation;
+pub mod service_ip_ranges;
 pub mod serviceaccount;
 pub mod signal;
 pub mod statusz;
