@@ -23,6 +23,7 @@ pub mod removeall;
 pub mod runtime;
 pub mod runtime_state;
 pub mod server;
+pub mod server_logs;
 pub mod server_metrics;
 pub mod serving_tls;
 pub mod static_pod_watch;
@@ -200,10 +201,19 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
                 get(|| async move { Json(kubelet_config_clone.as_ref().clone()) }),
             )
             .merge(server::read_only_router(server_state));
+        // The all-in-one binary has no kubelet config file: upstream defaults
+        // (enableDebuggingHandlers / enableSystemLogHandler = true).
+        let app = server_logs::install_logs_handlers(
+            app,
+            true,
+            true,
+            std::path::PathBuf::from(server_logs::NODE_LOG_DIR),
+        );
         // server.go:328 `installStatusZ()`: last, over the routes registered so far.
         let registered: Vec<String> = ["/metrics", "/configz"]
             .into_iter()
             .chain(server::READ_ONLY_PATHS)
+            .chain([server_logs::LOGS_PATH])
             .map(String::from)
             .collect();
         let app = server::install_statusz(app, registered);
