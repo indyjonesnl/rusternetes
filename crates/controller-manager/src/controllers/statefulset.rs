@@ -1,3 +1,4 @@
+use super::pod_informer::{ControllerRef, PodEventTarget, ResolvedController, SharedPodInformer};
 use super::replicationcontroller::slow_start_batches_capped;
 use crate::controllers::worker_pool::spawn_workers;
 use anyhow::Result;
@@ -5,8 +6,11 @@ use futures::StreamExt;
 use rusternetes_common::resources::{
     PersistentVolumeClaim, Pod, PodStatus, StatefulSet, StatefulSetStatus,
 };
-use rusternetes_common::types::{ObjectMeta, OwnerReference, Phase, TypeMeta};
+use rusternetes_common::types::{
+    label_selector_as_selector, ObjectMeta, OwnerReference, Phase, Selector, TypeMeta,
+};
 use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
@@ -26,11 +30,32 @@ const CONCURRENT_STATEFULSET_SYNCS: usize = 5;
 
 pub struct StatefulSetController<S: Storage> {
     storage: Arc<S>,
+    /// The shared pod informer whose `addPod`/`updatePod`/`deletePod`
+    /// handlers this controller registers (stateful_set.go:127-141,
+    /// `podInformer.Informer().AddEventHandler`).
+    pod_informer: Arc<SharedPodInformer<S>>,
 }
 
 impl<S: Storage + 'static> StatefulSetController<S> {
+    #[allow(dead_code)] // the binary shares one informer via `with_pod_informer`
     pub fn new(storage: Arc<S>) -> Self {
-        Self { storage }
+        let pod_informer = Arc::new(SharedPodInformer::new(
+            storage.clone(),
+            Duration::from_secs(5),
+        ));
+        Self::with_pod_informer(storage, pod_informer)
+    }
+
+    /// A controller whose pod handlers hang off `pod_informer`, the one
+    /// informer the binary shares between controllers.
+    pub(crate) fn with_pod_informer(
+        storage: Arc<S>,
+        pod_informer: Arc<SharedPodInformer<S>>,
+    ) -> Self {
+        Self {
+            storage,
+            pod_informer,
+        }
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
@@ -47,11 +72,18 @@ impl<S: Storage + 'static> StatefulSetController<S> {
             }
         });
 
+        // Pod events come from the shared pod informer, as upstream's
+        // `podInformer.Informer().AddEventHandler` (stateful_set.go:127-141).
+        self.pod_informer
+            .add_event_handler(Arc::clone(&self), queue.clone())
+            .await;
+        self.pod_informer.start();
+
         loop {
             // Initial full reconciliation
             self.enqueue_all(&queue).await;
 
-            // Watch for changes to StatefulSets AND Pods
+            // Watch for changes to StatefulSets
             let prefix = "/registry/statefulsets/";
             let watch_result = self.storage.watch(prefix).await;
             let mut watch = match watch_result {
@@ -59,19 +91,6 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                 Err(e) => {
                     error!(
                         "Failed to establish watch: {}, retrying in {:?}",
-                        e, retry_interval
-                    );
-                    time::sleep(retry_interval).await;
-                    continue;
-                }
-            };
-
-            let pod_prefix = build_prefix("pods", None);
-            let mut pod_watch = match self.storage.watch(&pod_prefix).await {
-                Ok(w) => w,
-                Err(e) => {
-                    error!(
-                        "Failed to establish pod watch: {}, retrying in {:?}",
                         e, retry_interval
                     );
                     time::sleep(retry_interval).await;
@@ -98,21 +117,6 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                             }
                             None => {
                                 warn!("Watch stream ended, reconnecting");
-                                watch_broken = true;
-                            }
-                        }
-                    }
-                    event = pod_watch.next() => {
-                        match event {
-                            Some(Ok(ev)) => {
-                                self.enqueue_owner_statefulset(&queue, &ev).await;
-                            }
-                            Some(Err(e)) => {
-                                warn!("Pod watch error: {}, reconnecting", e);
-                                watch_broken = true;
-                            }
-                            None => {
-                                warn!("Pod watch stream ended, reconnecting");
                                 watch_broken = true;
                             }
                         }
@@ -173,50 +177,6 @@ impl<S: Storage + 'static> StatefulSetController<S> {
             }
             Err(e) => {
                 error!("Failed to list statefulsets for enqueue: {}", e);
-            }
-        }
-    }
-
-    /// When a pod changes, check its ownerReferences for a StatefulSet owner
-    /// and enqueue that StatefulSet for reconciliation.
-    async fn enqueue_owner_statefulset(
-        &self,
-        queue: &WorkQueue,
-        event: &rusternetes_storage::WatchEvent,
-    ) {
-        let pod_key = extract_key(event);
-        let parts: Vec<&str> = pod_key.splitn(3, '/').collect();
-        let ns = match parts.get(1) {
-            Some(ns) => *ns,
-            None => return,
-        };
-
-        let storage_key = format!("/registry/{}", pod_key);
-        match self.storage.get::<Pod>(&storage_key).await {
-            Ok(pod) => {
-                if let Some(refs) = &pod.metadata.owner_references {
-                    for owner_ref in refs {
-                        if owner_ref.kind == "StatefulSet" {
-                            queue
-                                .add(format!("statefulsets/{}/{}", ns, owner_ref.name))
-                                .await;
-                        }
-                    }
-                }
-            }
-            Err(_) => {
-                // Pod deleted — enqueue all StatefulSets in this namespace
-                if let Ok(items) = self
-                    .storage
-                    .list::<StatefulSet>(&build_prefix("statefulsets", Some(ns)))
-                    .await
-                {
-                    for ss in &items {
-                        queue
-                            .add(format!("statefulsets/{}/{}", ns, ss.metadata.name))
-                            .await;
-                    }
-                }
             }
         }
     }
@@ -1757,6 +1717,74 @@ impl<S: Storage + 'static> StatefulSetController<S> {
     }
 }
 
+/// The StatefulSet half of the pod event handlers (stateful_set.go:202-310,
+/// `resolveControllerRef` :408, `getStatefulSetsForPod` :387). StatefulSets
+/// keep no expectations, so the creation/deletion hooks have nothing to lower.
+impl<S: Storage + 'static> PodEventTarget for StatefulSetController<S> {
+    fn queue_prefix(&self) -> &'static str {
+        "statefulsets"
+    }
+
+    /// "We can't look up by UID, so look up by Name and then verify UID.
+    /// Don't even try to look up by Name if it's the wrong Kind."
+    async fn resolve_controller_ref(
+        &self,
+        namespace: &str,
+        controller_ref: &ControllerRef,
+    ) -> Option<ResolvedController> {
+        if controller_ref.kind != "StatefulSet" {
+            return None;
+        }
+        let set: StatefulSet = self
+            .storage
+            .get(&build_key(
+                "statefulsets",
+                Some(namespace),
+                &controller_ref.name,
+            ))
+            .await
+            .ok()?;
+        (set.metadata.uid == controller_ref.uid).then(|| ResolvedController {
+            name: set.metadata.name.clone(),
+            min_ready_seconds: set.spec.min_ready_seconds.unwrap_or(0),
+        })
+    }
+
+    /// `StatefulSetLister.GetPodStatefulSets` (client-go
+    /// `listers/apps/v1/statefulset_expansion.go:39-80`): a pod without
+    /// labels matches none; an invalid selector does not match; an empty
+    /// selector matches nothing.
+    async fn pod_controllers(
+        &self,
+        namespace: &str,
+        pod_labels: &HashMap<String, String>,
+    ) -> Vec<String> {
+        if pod_labels.is_empty() {
+            return Vec::new();
+        }
+        let Ok(sets) = self
+            .storage
+            .list::<StatefulSet>(&build_prefix("statefulsets", Some(namespace)))
+            .await
+        else {
+            return Vec::new();
+        };
+        sets.into_iter()
+            .filter(|set| {
+                matches!(
+                    label_selector_as_selector(Some(&set.spec.selector)),
+                    Ok(selector @ Selector::Requirements(_)) if selector.matches(Some(pod_labels))
+                )
+            })
+            .map(|set| set.metadata.name)
+            .collect()
+    }
+
+    fn creation_observed(&self, _key: &str) {}
+
+    fn deletion_observed(&self, _key: &str, _pod_key: &str) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2794,5 +2822,148 @@ mod tests {
                 i
             );
         }
+    }
+
+    // --- pod event handlers on the shared pod informer (#3724) -------------
+    // stateful_set.go addPod :202, updatePod :236, deletePod :296.
+
+    use rusternetes_storage::WatchEvent;
+
+    fn sts_pod_json(name: &str, owner: Option<(&str, &str)>, labels: &[(&str, &str)]) -> String {
+        let labels: HashMap<&str, &str> = labels.iter().copied().collect();
+        let mut v = serde_json::json!({
+            "metadata": {"name": name, "namespace": "default", "labels": labels},
+            "spec": {"containers": []},
+        });
+        if let Some((owner, uid)) = owner {
+            v["metadata"]["ownerReferences"] = serde_json::json!([{
+                "apiVersion": "apps/v1", "kind": "StatefulSet", "name": owner,
+                "uid": uid, "controller": true
+            }]);
+        }
+        v.to_string()
+    }
+
+    /// The next queued key, or `None` if nothing arrives (never hangs).
+    async fn next(queue: &WorkQueue) -> Option<String> {
+        tokio::time::timeout(Duration::from_secs(2), queue.get())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// A controller registered on a fresh informer, plus its queue, with the
+    /// StatefulSet "web" (uid "web-uid") stored.
+    async fn registered() -> (
+        Arc<StatefulSetController<MemoryStorage>>,
+        Arc<SharedPodInformer<MemoryStorage>>,
+        WorkQueue,
+    ) {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut web = make_statefulset("web", "default", 1, "img");
+        web.metadata.uid = "web-uid".to_string();
+        storage
+            .create("/registry/statefulsets/default/web", &web)
+            .await
+            .unwrap();
+        let informer = Arc::new(SharedPodInformer::new(
+            storage.clone(),
+            Duration::from_secs(5),
+        ));
+        let controller = Arc::new(StatefulSetController::with_pod_informer(
+            storage,
+            informer.clone(),
+        ));
+        let queue = WorkQueue::new();
+        informer
+            .add_event_handler(controller.clone(), queue.clone())
+            .await;
+        (controller, informer, queue)
+    }
+
+    #[tokio::test]
+    async fn an_owned_pod_enqueues_only_its_statefulset() {
+        let (_c, informer, queue) = registered().await;
+        let owned = sts_pod_json("web-0", Some(("web", "web-uid")), &[("app", "web")]);
+        informer
+            .on_event(&WatchEvent::Added(
+                "/registry/pods/default/web-0".into(),
+                owned,
+            ))
+            .await;
+        assert_eq!(
+            next(&queue).await.as_deref(),
+            Some("statefulsets/default/web")
+        );
+        assert_eq!(queue.len().await, 0);
+    }
+
+    /// `resolveControllerRef`: a UID that does not match the StatefulSet found
+    /// by name resolves to nothing (stateful_set.go:408-424).
+    #[tokio::test]
+    async fn a_pod_owned_by_another_uid_enqueues_nothing() {
+        let (_c, informer, queue) = registered().await;
+        let stale = sts_pod_json("web-0", Some(("web", "other-uid")), &[("app", "web")]);
+        informer
+            .on_event(&WatchEvent::Added(
+                "/registry/pods/default/web-0".into(),
+                stale,
+            ))
+            .await;
+        assert_eq!(queue.len().await, 0);
+    }
+
+    /// An unrelated StatefulSet in the namespace is not enqueued by an
+    /// owned pod's deletion (the old handler enqueued every set in the
+    /// namespace; deletePod :296-325 enqueues only the controller).
+    #[tokio::test]
+    async fn deleting_an_owned_pod_enqueues_its_set_not_the_namespace() {
+        let (c, informer, queue) = registered().await;
+        let other = make_statefulset("other", "default", 1, "img");
+        c.storage
+            .create("/registry/statefulsets/default/other", &other)
+            .await
+            .unwrap();
+        let owned = sts_pod_json("web-0", Some(("web", "web-uid")), &[("app", "web")]);
+        let key = "/registry/pods/default/web-0".to_string();
+        informer
+            .on_event(&WatchEvent::Added(key.clone(), owned.clone()))
+            .await;
+        assert_eq!(
+            next(&queue).await.as_deref(),
+            Some("statefulsets/default/web")
+        );
+        queue.done("statefulsets/default/web").await;
+        informer.on_event(&WatchEvent::Deleted(key, owned)).await;
+        assert_eq!(
+            next(&queue).await.as_deref(),
+            Some("statefulsets/default/web")
+        );
+        assert_eq!(queue.len().await, 0);
+    }
+
+    /// An orphan whose labels match a set's selector wakes that set so it can
+    /// adopt it (addPod :215-227, `getStatefulSetsForPod` :387); a
+    /// non-matching orphan wakes nobody.
+    #[tokio::test]
+    async fn an_orphan_wakes_the_sets_whose_selector_matches() {
+        let (_c, informer, queue) = registered().await;
+        informer
+            .on_event(&WatchEvent::Added(
+                "/registry/pods/default/stray".into(),
+                sts_pod_json("stray", None, &[("app", "nope")]),
+            ))
+            .await;
+        assert_eq!(queue.len().await, 0);
+        informer
+            .on_event(&WatchEvent::Added(
+                "/registry/pods/default/adoptable".into(),
+                sts_pod_json("adoptable", None, &[("app", "web")]),
+            ))
+            .await;
+        assert_eq!(
+            next(&queue).await.as_deref(),
+            Some("statefulsets/default/web")
+        );
     }
 }
