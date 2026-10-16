@@ -43,6 +43,7 @@ pub mod node_ipam;
 pub mod node_lifecycle_metrics;
 pub mod node_lifecycle_queue;
 pub mod node_lifecycle_zone;
+pub mod pcr_cleaner;
 pub mod pod_disruption_budget;
 pub(crate) mod pod_informer;
 pub mod priorityclass;
