@@ -177,11 +177,13 @@ impl Admission<'_> {
         // itself, never a subresource (admission.go `admitPV`/`admitPVC`).
         if plugin_enabled("StorageObjectInUseProtection")
             && self.subresource.is_none()
-            && self.resource.group.is_empty()
         {
-            if let Some(finalizer) =
-                storage_object_in_use_protection::finalizer_for(&self.resource.resource)
-            {
+            if let Some(finalizer) = storage_object_in_use_protection::finalizer_for(
+                &self.resource.group,
+                &self.resource.resource,
+                rusternetes_common::feature_gates::gate_enabled("VolumeAttributesClass")
+                    .unwrap_or(false),
+            ) {
                 storage_object_in_use_protection::add_protection_finalizer(
                     obj.metadata_mut(),
                     finalizer,
