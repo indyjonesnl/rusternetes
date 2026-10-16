@@ -518,6 +518,7 @@ async fn async_main() -> Result<()> {
         node_ipam: None,
         csi_attachers,
         attach_detach_controller: args.attach_detach_controller,
+        service_cluster_ip_range: args.service_cluster_ip_range.clone(),
         legacy_sa_token_clean_up_period:
             rusternetes_controller_manager::controllers::legacy_serviceaccount_token_cleaner::DEFAULT_CLEAN_UP_PERIOD,
     };
