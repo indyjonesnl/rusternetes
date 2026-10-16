@@ -1124,6 +1124,10 @@ async fn main() -> Result<()> {
                         "v1",
                         "Pod",
                         args.csi_capacity_ownerref_level,
+                        &controllers::csi_capacity::capacity_limiter(
+                            args.csi_kube_api_capacity_qps,
+                            args.csi_kube_api_capacity_burst,
+                        ),
                     )
                     .await
                     .map_err(|e| anyhow::anyhow!("look up owner(s) of pod: {e}"))?,

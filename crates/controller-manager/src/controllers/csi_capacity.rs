@@ -235,6 +235,7 @@ pub fn fixed_segment(accessible_topology: Option<&HashMap<String, String>>) -> S
 /// `owner.Lookup` (pkg/owner/owner.go:37-100): walk `levels` controlling
 /// owners up from the starting object; `levels == 0` returns the object
 /// itself. Only apiVersion, kind, name and uid are set; controller is true.
+/// `limiter` is the token bucket of the client `owner.Lookup` builds.
 pub async fn lookup_owner<S: Storage>(
     storage: &S,
     namespace: &str,
@@ -242,6 +243,7 @@ pub async fn lookup_owner<S: Storage>(
     api_version: &str,
     kind: &str,
     levels: i32,
+    limiter: &rusternetes_client::ratelimit::RateLimiter,
 ) -> Result<OwnerReference> {
     let (mut api_version, mut kind, mut name, mut levels) = (
         api_version.to_string(),
@@ -265,6 +267,11 @@ pub async fn lookup_owner<S: Storage>(
                 )))
             }
         };
+        // `owner.Lookup(config, ...)` builds its own client from the config whose
+        // QPS/Burst were just set to the capacity values (csi-provisioner.go:
+        // 456-457, :474; owner.go:37-44): every GET takes a token of that
+        // client's own bucket.
+        limiter.acquire().await;
         let obj: serde_json::Value = storage
             .get(&build_key(resource, Some(namespace), &name))
             .await
@@ -428,6 +435,37 @@ pub fn capacity_limiter(
     })
 }
 
+/// The `csitopology` workqueue of `NewNodeTopology` (nodes.go:49, built in
+/// csi-provisioner.go:488-494), whose only key is `""`. The Node and CSINode
+/// handlers just `queue.Add("")` (nodes.go:71, :89, :102, :114, :134, :147);
+/// `RunWorker` (:212-228) runs one `sync` per `queue.Get`. A workqueue holds a
+/// key once however often it is added, and an `Add` while the key is being
+/// processed queues it once more when `Done` runs, which is exactly the one
+/// stored permit of a `Notify`: a burst of events is one `sync`, so n node
+/// registrations do not cost n recomputations.
+///
+/// The queue is never used rate-limited: `sync` has no failure path that
+/// re-adds the key (nodes.go:259-262 and :277-281 log and return), so the
+/// `NewTypedItemExponentialFailureRateLimiter(retryIntervalStart,
+/// retryIntervalMax)` upstream passes in is dead weight and there is no retry
+/// to port; the next event (or the initial `Add`) is what triggers a sync.
+#[derive(Default)]
+pub struct TopologyQueue {
+    notify: tokio::sync::Notify,
+}
+
+impl TopologyQueue {
+    /// `queue.Add("")`.
+    pub fn add(&self) {
+        self.notify.notify_one();
+    }
+
+    /// `queue.Get()`: resolves once something was added since the last `get`.
+    pub async fn get(&self) {
+        self.notify.notified().await;
+    }
+}
+
 /// `WorkItem` (capacity.go:105-108) with the StorageClass resolved.
 struct WorkItem<'s> {
     segment: &'s Segment,
@@ -521,14 +559,14 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
             "Capacity Controller: enqueuing CSIStorageCapacity {} for removal",
             capacity.metadata.name
         );
-        st.add(QueueKey::Capacity {
-            namespace: capacity
+        st.add_capacity(
+            capacity
                 .metadata
                 .namespace
                 .clone()
                 .unwrap_or_else(|| self.owner_namespace.clone()),
-            name: capacity.metadata.name.clone(),
-        });
+            capacity.metadata.name.clone(),
+        );
     }
 
     /// `onTopologyChanges` (capacity.go:339-366), called by the topology informer.
@@ -663,14 +701,14 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
                     capacity.metadata.name,
                     capacity.metadata.resource_version
                 );
-                st.add(QueueKey::Capacity {
-                    namespace: capacity
+                st.add_capacity(
+                    capacity
                         .metadata
                         .namespace
                         .clone()
                         .unwrap_or_else(|| self.owner_namespace.clone()),
-                    name: capacity.metadata.name.clone(),
-                });
+                    capacity.metadata.name.clone(),
+                );
             }
         }
     }
@@ -908,8 +946,10 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
             return false;
         };
         let r = match &key {
-            QueueKey::Item(item) => self.sync_item(item).await,
-            QueueKey::Capacity { namespace, name } => self.delete_capacity(namespace, name).await,
+            QueueKey::Item { item, .. } => self.sync_item(item).await,
+            QueueKey::Capacity {
+                namespace, name, ..
+            } => self.delete_capacity(namespace, name).await,
         };
         // `defer c.queue.Done(obj)` runs before the error handling.
         self.refresher.done(&key);
@@ -1154,19 +1194,43 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
     }
 
     /// `NewNodeTopology`'s Node and CSINode handlers (nodes.go:63-150) and its
-    /// `RunWorker`: whenever something relevant changed, recompute the segments
-    /// and call `onTopologyChanges`. A fixed topology never changes.
+    /// `RunWorker`: whenever something relevant changed, queue a recompute of
+    /// the segments (coalesced by [`TopologyQueue`]) that calls
+    /// `onTopologyChanges`. A fixed topology never changes.
     async fn run_topology(
         &self,
         topology: &TopologySource,
-        mut nodes: Option<rusternetes_storage::WatchStream>,
-        mut csinodes: Option<rusternetes_storage::WatchStream>,
+        nodes: Option<rusternetes_storage::WatchStream>,
+        csinodes: Option<rusternetes_storage::WatchStream>,
     ) {
-        use futures::StreamExt;
-        use rusternetes_storage::WatchEvent;
         if matches!(topology, TopologySource::Fixed(_)) {
             return std::future::pending().await;
         }
+        let queue = TopologyQueue::default();
+        // `nt.queue.Add("") // Initial sync` (nodes.go:225).
+        queue.add();
+        tokio::join!(
+            // `RunWorker` (nodes.go:226-243): the one worker.
+            async {
+                loop {
+                    queue.get().await;
+                    self.sync_topology(topology).await;
+                }
+            },
+            self.watch_topology(nodes, csinodes, &queue),
+        );
+    }
+
+    /// The Node and CSINode event handlers of `NewNodeTopology`
+    /// (nodes.go:63-150): they only `queue.Add("")`.
+    async fn watch_topology(
+        &self,
+        mut nodes: Option<rusternetes_storage::WatchStream>,
+        mut csinodes: Option<rusternetes_storage::WatchStream>,
+        queue: &TopologyQueue,
+    ) {
+        use futures::StreamExt;
+        use rusternetes_storage::WatchEvent;
         let node_prefix = build_prefix("nodes", None);
         let csinode_prefix = build_prefix("csinodes", None);
         // What the handlers' `oldObj` provides in Go: node labels and the
@@ -1185,7 +1249,7 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
                         tracing::error!("topology watch failed");
                         continue;
                     };
-                    self.sync_topology(topology).await;
+                    queue.add();
                     (n, c)
                 }
             };
@@ -1255,7 +1319,7 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
                     },
                 };
                 if changed {
-                    self.sync_topology(topology).await;
+                    queue.add();
                 }
             }
         }
@@ -1274,6 +1338,7 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
 mod tests {
     use super::super::csi_capacity_refresh::{CapacityRefresher, ItemKey, QueueKey};
     use super::*;
+    use rusternetes_client::ratelimit::RateLimiter;
     use rusternetes_common::resources::csi::{CSINodeDriver, CSINodeSpec};
     use rusternetes_common::resources::volume::VolumeNodeAffinity;
     use rusternetes_common::resources::volume::{
@@ -1430,11 +1495,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queue_deduplicates() {
+    async fn queue_does_not_deduplicate_fresh_adds() {
+        // capacity.go:115-120: `QueueKey` holds pointers and every
+        // `queue.Add(QueueKey{item: &item})` uses a fresh one, so the workqueue
+        // keeps both entries.
         let (_s, _c, r) = refresh_fixture(&[&[("layer0", "foo")]]).await;
         r.refresh_sc("direct-sc");
         r.refresh_sc("direct-sc");
-        assert_eq!(queued_strings(&r).len(), 1);
+        assert_eq!(queued_strings(&r).len(), 2);
     }
 
     #[tokio::test]
@@ -1499,10 +1567,13 @@ mod tests {
     #[test]
     fn rate_limiter_doubles_per_failure_and_caps_at_max() {
         let r = CapacityRefresher::new();
-        let k = QueueKey::Item(ItemKey {
-            segment: seg(&[]),
-            storage_class_name: "sc".into(),
-        });
+        let k = QueueKey::Item {
+            id: 1,
+            item: ItemKey {
+                segment: seg(&[]),
+                storage_class_name: "sc".into(),
+            },
+        };
         let (s, m) = (Duration::from_secs(1), Duration::from_secs(5));
         let d: Vec<_> = (0..5)
             .map(|_| r.add_rate_limited(k.clone(), s, m))
@@ -2019,14 +2090,89 @@ mod tests {
         )
         .await
         .unwrap();
-        let o0 = lookup_owner(&st, NS, "p", "v1", "Pod", 0).await.unwrap();
+        let ul = RateLimiter::unlimited();
+        let o0 = lookup_owner(&st, NS, "p", "v1", "Pod", 0, &ul)
+            .await
+            .unwrap();
         assert_eq!((o0.kind.as_str(), o0.uid.as_str()), ("Pod", "pu"));
-        let o1 = lookup_owner(&st, NS, "p", "v1", "Pod", 1).await.unwrap();
+        let o1 = lookup_owner(&st, NS, "p", "v1", "Pod", 1, &ul)
+            .await
+            .unwrap();
         assert_eq!((o1.kind.as_str(), o1.uid.as_str()), ("ReplicaSet", "rsu"));
-        let o2 = lookup_owner(&st, NS, "p", "v1", "Pod", 2).await.unwrap();
+        let o2 = lookup_owner(&st, NS, "p", "v1", "Pod", 2, &ul)
+            .await
+            .unwrap();
         assert_eq!((o2.kind.as_str(), o2.uid.as_str()), ("Deployment", "du"));
         assert_eq!(o2.controller, Some(true));
-        assert!(lookup_owner(&st, NS, "p", "v1", "Pod", 3).await.is_err());
+        assert!(lookup_owner(&st, NS, "p", "v1", "Pod", 3, &ul)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lookup_owner_gets_go_through_the_capacity_rate_limiter() {
+        // csi-provisioner.go:456-474: `config.QPS/Burst` are set to the capacity
+        // values BEFORE `owner.Lookup(config, ...)`, which builds its own client
+        // (pkg/owner/owner.go:37-44) with a token bucket of QPS 1 / burst 1
+        // here: the 2nd GET of a two-level walk waits 1s.
+        use serde_json::json;
+        let st = MemoryStorage::new();
+        st.create(
+            &build_key("pods", Some(NS), "p"),
+            &json!({"metadata":{"name":"p","uid":"pu","ownerReferences":[
+                {"apiVersion":"apps/v1","kind":"ReplicaSet","name":"rs","uid":"rsu","controller":true}]}}),
+        )
+        .await
+        .unwrap();
+        st.create(
+            &build_key("replicasets", Some(NS), "rs"),
+            &json!({"metadata":{"name":"rs","uid":"rsu","ownerReferences":[
+                {"apiVersion":"apps/v1","kind":"Deployment","name":"d","uid":"du","controller":true}]}}),
+        )
+        .await
+        .unwrap();
+        let l = RateLimiter::new(1.0, 1.0);
+        let start = tokio::time::Instant::now();
+        lookup_owner(&st, NS, "p", "v1", "Pod", 2, &l)
+            .await
+            .unwrap();
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn topology_queue_coalesces_a_burst_into_one_sync() {
+        // nodes.go:63-150 handlers only `queue.Add("")`; RunWorker (:226-243)
+        // syncs once per Get, so n adds before the worker runs are one sync.
+        let q = TopologyQueue::default();
+        for _ in 0..1000 {
+            q.add();
+        }
+        tokio::time::timeout(Duration::from_millis(100), q.get())
+            .await
+            .expect("one pending sync");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), q.get())
+                .await
+                .is_err(),
+            "the burst must have been coalesced into a single sync"
+        );
+    }
+
+    #[tokio::test]
+    async fn topology_queue_add_while_syncing_queues_one_more_sync() {
+        // workqueue Add during processing marks the item dirty; Done queues it
+        // again exactly once.
+        let q = TopologyQueue::default();
+        q.add();
+        q.get().await;
+        q.add();
+        q.add();
+        tokio::time::timeout(Duration::from_millis(100), q.get())
+            .await
+            .expect("one re-queued sync");
+        assert!(tokio::time::timeout(Duration::from_millis(100), q.get())
+            .await
+            .is_err());
     }
 
     #[test]
@@ -2118,6 +2264,11 @@ mod tests {
         c.apply_sc_list(list_scs(st).await);
         c.apply_topology(segs.to_vec());
         c.apply_c_list(list_caps(st).await);
+        // The queue keeps every add (fresh `QueueKey` pointers, capacity.go:
+        // 115-120), so the entries of `apply_topology` would be synced as well
+        // as those of the poll. upstream's test queue (capacity_test.go:
+        // 1383-1403) collapses them; do the same here to count one sync per item.
+        c.refresher.clear_queue();
         c.poll_capacities();
         pump(c, st).await;
     }
@@ -2551,9 +2702,12 @@ mod tests {
     }
 
     #[test]
-    fn workqueue_does_not_hand_out_an_item_that_is_being_processed() {
-        // client-go workqueue Add/Get/Done: re-adding an item in flight marks
-        // it dirty; it is queued again by Done, never processed twice at once.
+    fn workqueue_does_not_hand_out_a_key_that_is_being_processed() {
+        // client-go workqueue Add/Get/Done: re-adding the same key in flight
+        // marks it dirty; it is queued again by Done, never processed twice at
+        // once. (Fresh adds of an item are fresh keys, see
+        // `queue_does_not_deduplicate_fresh_adds`; the same key is added again
+        // by `AddRateLimited` and by `Done`.)
         let r = CapacityRefresher::new();
         let k = ItemKey {
             segment: seg(&[("zone", "a")]),
@@ -2561,11 +2715,12 @@ mod tests {
         };
         r.set_capacities([k.clone()].into());
         r.refresh_sc("sc");
-        let key = QueueKey::Item(k);
-        assert_eq!(r.pop(), Some(key.clone()));
-        r.refresh_sc("sc");
+        let key = r.pop().expect("queued");
+        r.lock().add(key.clone());
+        r.lock().add(key.clone());
         assert_eq!(r.pop(), None, "in flight: must not be handed out again");
         r.done(&key);
-        assert_eq!(r.pop(), Some(key));
+        assert_eq!(r.pop(), Some(key.clone()));
+        assert_eq!(r.pop(), None, "dirty twice, queued once");
     }
 }
