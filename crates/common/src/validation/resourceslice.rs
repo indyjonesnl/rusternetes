@@ -18,7 +18,9 @@ use crate::resources::dra::{
 use crate::resources::{ResourceSlice, ResourceSliceSpec};
 use crate::validation::csinode::validate_csi_driver_name;
 use crate::validation::field::{Error, ErrorList, Path};
-use crate::validation::metav1::{is_dns1123_label, is_dns1123_subdomain, validate_label_name};
+use crate::validation::metav1::{
+    is_dns1123_label, is_dns1123_subdomain, is_valid_label_value, validate_label_name,
+};
 use crate::validation::resourceclaim::too_many_max_items;
 use std::collections::HashSet;
 
@@ -222,7 +224,7 @@ fn validate_device(device: &Device, fld_path: &Path) -> ErrorList {
         ));
     }
     for (i, taint) in device.taints.iter().enumerate() {
-        errs.extend(validate_device_taint(taint, &taints_path.index(i)));
+        errs.extend(validate_device_taint(taint, None, &taints_path.index(i)));
     }
 
     let consumes_path = fld_path.child("consumesCounters");
@@ -372,20 +374,38 @@ pub(crate) fn validate_pool_name(name: &str, fld_path: &Path) -> ErrorList {
 
 /// Port of upstream `validateDeviceTaint`
 /// (`pkg/apis/resource/validation/validation.go:1391-1408`). `key` goes through
-/// `ValidateLabelName`, which includes the non-empty check, and `effect` is
-/// required with a closed set of values.
-fn validate_device_taint(taint: &DeviceTaint, fld_path: &Path) -> ErrorList {
+/// `ValidateLabelName`, which includes the non-empty check, a non-empty `value`
+/// through `validateLabelValue`, and `effect` is required with a closed set of
+/// values, checked only for a new taint or one whose effect changed
+/// (`oldTaint == nil || oldTaint.Effect != taint.Effect`).
+pub(crate) fn validate_device_taint(
+    taint: &DeviceTaint,
+    old_taint: Option<&DeviceTaint>,
+    fld_path: &Path,
+) -> ErrorList {
     let mut errs = validate_label_name(&taint.key, &fld_path.child("key"));
-    match &taint.effect {
-        None => errs.push(Error::required(&fld_path.child("effect"), "")),
-        Some(effect) => {
-            // validation.go:1402-1403: `!validDeviceTaintEffects.Has(...)`.
-            if let DeviceTaintEffect::Unknown(effect) = effect {
-                errs.push(Error::not_supported(
-                    &fld_path.child("effect"),
-                    effect.clone(),
-                    DEVICE_TAINT_EFFECTS,
-                ));
+    if let Some(value) = taint.value.as_deref().filter(|v| !v.is_empty()) {
+        // validation.go:1438-1447 `validateLabelValue`.
+        for msg in is_valid_label_value(value) {
+            errs.push(Error::invalid(
+                &fld_path.child("value"),
+                value.to_string(),
+                msg,
+            ));
+        }
+    }
+    if old_taint.is_none_or(|old| old.effect != taint.effect) {
+        match &taint.effect {
+            None => errs.push(Error::required(&fld_path.child("effect"), "")),
+            Some(effect) => {
+                // validation.go:1402-1403: `!validDeviceTaintEffects.Has(...)`.
+                if let DeviceTaintEffect::Unknown(effect) = effect {
+                    errs.push(Error::not_supported(
+                        &fld_path.child("effect"),
+                        effect.clone(),
+                        DEVICE_TAINT_EFFECTS,
+                    ));
+                }
             }
         }
     }

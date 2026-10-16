@@ -18,6 +18,7 @@ pub mod csidriver;
 pub mod csinode;
 pub mod csistoragecapacity;
 pub mod deviceclass;
+pub mod devicetaintrule;
 pub mod endpoints;
 pub mod endpointslice;
 pub mod events;
