@@ -462,17 +462,22 @@ pub trait BlockVolumeUnmapper: Send + Sync + MetricsProvider {
 /// Port of `volume.CustomBlockVolumeMapper` (`pkg/volume/volume.go:205-225`):
 /// the plugin-specific set-up/map steps. Idempotent, like every upstream
 /// volume method.
+///
+/// Async where upstream is synchronous: the CSI implementation awaits gRPC
+/// `NodeStageVolume`/`NodePublishVolume` (an idiom difference, as for
+/// [`NodeExpandableVolumePlugin::node_expand`]).
+#[async_trait]
 pub trait CustomBlockVolumeMapper: BlockVolumeMapper {
     /// `SetUpDevice` (`volume.go:211`). Prepares the volume on the node the
     /// plugin-specific way; may be called more than once. Returns the staging
     /// path if device setup succeeded.
-    fn set_up_device(&self) -> Result<String>;
+    async fn set_up_device(&self) -> Result<String>;
 
     /// `MapPodDevice` (`volume.go:218`). Maps the block device to a path and
     /// returns it. A unique device path across a kubelet node reboot is
     /// required to avoid unexpected block-volume destruction. An empty string
     /// means "use the path the attacher returned".
-    fn map_pod_device(&self) -> Result<String>;
+    async fn map_pod_device(&self) -> Result<String>;
 
     /// `GetStagingPath` (`volume.go:224`): the path used for staging the
     /// volume, mainly used by CSI plugins.
@@ -480,13 +485,15 @@ pub trait CustomBlockVolumeMapper: BlockVolumeMapper {
 }
 
 /// Port of `volume.CustomBlockVolumeUnmapper` (`pkg/volume/volume.go:233-243`).
+/// Async for the same reason as [`CustomBlockVolumeMapper`].
+#[async_trait]
 pub trait CustomBlockVolumeUnmapper: BlockVolumeUnmapper {
     /// `TearDownDevice` (`volume.go:238`). Removes traces of `SetUpDevice`;
     /// for a non-attachable plugin this detaches the volume from the node.
-    fn tear_down_device(&self, map_path: &str, device_path: &str) -> Result<()>;
+    async fn tear_down_device(&self, map_path: &str, device_path: &str) -> Result<()>;
 
     /// `UnmapPodDevice` (`volume.go:242`). Removes traces of `MapPodDevice`.
-    fn unmap_pod_device(&self) -> Result<()>;
+    async fn unmap_pod_device(&self) -> Result<()>;
 }
 
 /// Port of `volume.MetricsProvider` (`pkg/volume/volume.go:64-68`).
@@ -632,11 +639,12 @@ mod block_tests {
             Some(self)
         }
     }
+    #[async_trait]
     impl CustomBlockVolumeMapper for Custom {
-        fn set_up_device(&self) -> Result<String> {
+        async fn set_up_device(&self) -> Result<String> {
             Ok("/staging".into())
         }
-        fn map_pod_device(&self) -> Result<String> {
+        async fn map_pod_device(&self) -> Result<String> {
             Ok(String::new())
         }
         fn get_staging_path(&self) -> String {
@@ -646,13 +654,13 @@ mod block_tests {
 
     /// The operation generator type-asserts a mapper to
     /// `CustomBlockVolumeMapper`; a plain mapper must fail that assertion.
-    #[test]
-    fn custom_mapper_assertion() {
+    #[tokio::test]
+    async fn custom_mapper_assertion() {
         assert!(Plain.as_custom_block_volume_mapper().is_none());
         let c = Custom;
         let custom = c.as_custom_block_volume_mapper().unwrap();
-        assert_eq!(custom.set_up_device().unwrap(), "/staging");
-        assert_eq!(custom.map_pod_device().unwrap(), "");
+        assert_eq!(custom.set_up_device().await.unwrap(), "/staging");
+        assert_eq!(custom.map_pod_device().await.unwrap(), "");
         assert_eq!(custom.get_staging_path(), "/staging");
         assert!(c.supports_metrics());
     }

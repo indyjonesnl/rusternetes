@@ -651,12 +651,13 @@ impl BlockVolumeUnmapper for IscsiDiskUnmapper {
     }
 }
 
+#[async_trait]
 impl CustomBlockVolumeUnmapper for IscsiDiskUnmapper {
     /// `TearDownDevice` (`iscsi.go:441-453`). Even though iSCSI plugin has
     /// attacher/detacher implementation, iSCSI plugin needs volume detach
     /// operation during TearDownDevice(). This method is only chance that
     /// operations are done on kubelet node during volume teardown sequences.
-    fn tear_down_device(&self, map_path: &str, _device_path: &str) -> Result<()> {
+    async fn tear_down_device(&self, map_path: &str, _device_path: &str) -> Result<()> {
         // `DetachBlockISCSIDisk(*c, mapPath)` copies the unmapper but shares
         // the `*iscsiDisk` it loads `iscsi.json` into.
         let mut c = IscsiDiskUnmapper {
@@ -686,7 +687,7 @@ impl CustomBlockVolumeUnmapper for IscsiDiskUnmapper {
     }
 
     /// `UnmapPodDevice` (`iscsi.go:455-457`).
-    fn unmap_pod_device(&self) -> Result<()> {
+    async fn unmap_pod_device(&self) -> Result<()> {
         Ok(())
     }
 }
