@@ -3,10 +3,11 @@
 //! [`Storage`] backend, so the controller-manager and scheduler elect through a
 //! `coordination.k8s.io/v1` Lease on every backend (etcd, SQLite, Redis).
 
-use crate::Storage;
+use crate::{EventRecorder, Storage};
 use async_trait::async_trait;
 use rusternetes_common::leaderelection::{LeaderElectionRecord, ResourceLock};
 use rusternetes_common::resources::coordination::{Lease, LeaseSpec};
+use rusternetes_common::resources::{EventSource, EventType, ObjectReference};
 use rusternetes_common::{Error, Result};
 use std::sync::{Arc, Mutex};
 
@@ -18,6 +19,9 @@ pub struct LeaseLock<S: Storage> {
     /// `ll.lease`: the object last returned by get/create/update, whose
     /// resourceVersion guards the next update.
     lease: Mutex<Option<Lease>>,
+    /// `LockConfig.EventRecorder` (resourcelock/interface.go:72-73), optional:
+    /// the recorder plus the `EventSource` it stamps on every event.
+    recorder: Option<(EventRecorder<S>, EventSource)>,
 }
 
 impl<S: Storage> LeaseLock<S> {
@@ -33,7 +37,22 @@ impl<S: Storage> LeaseLock<S> {
             name: name.into(),
             identity: identity.into(),
             lease: Mutex::new(None),
+            recorder: None,
         }
+    }
+
+    /// Sets `ResourceLockConfig.EventRecorder`; `component` is the
+    /// `EventSource.Component` of the recorder (kube-controller-manager's
+    /// user agent, the scheduler profile name).
+    pub fn with_event_recorder(mut self, recorder: EventRecorder<S>, component: &str) -> Self {
+        self.recorder = Some((
+            recorder,
+            EventSource {
+                component: component.to_string(),
+                host: None,
+            },
+        ));
+        self
     }
 
     fn key(&self) -> String {
@@ -100,6 +119,45 @@ impl<S: Storage> ResourceLock for LeaseLock<S> {
         Ok(())
     }
 
+    /// `RecordEvent` (leaselock.go:98-109): a Normal `LeaderElection` event
+    /// "<identity> <s>" on the cached Lease (`ll.lease.ObjectMeta`, so an
+    /// empty reference before any get/create), typed as coordination.k8s.io/v1
+    /// Lease. A no-op without a recorder.
+    async fn record_event(&self, s: &str) {
+        let Some((recorder, source)) = &self.recorder else {
+            return;
+        };
+        let meta = self
+            .lease
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|l| l.metadata.clone())
+            .unwrap_or_default();
+        let involved = ObjectReference {
+            api_version: Some("coordination.k8s.io/v1".into()),
+            kind: Some("Lease".into()),
+            name: Some(meta.name.clone()),
+            namespace: meta.namespace.clone(),
+            uid: Some(meta.uid.clone()),
+            resource_version: meta.resource_version.clone(),
+            field_path: None,
+        };
+        let message = format!("{} {}", self.identity, s);
+        if let Err(e) = recorder
+            .event(
+                &involved,
+                source,
+                EventType::Normal,
+                "LeaderElection",
+                &message,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "failed to record leader election event");
+        }
+    }
+
     fn describe(&self) -> String {
         format!("{}/{}", self.namespace, self.name)
     }
@@ -157,6 +215,44 @@ mod tests {
         assert_eq!(got.holder_identity, "a");
         assert_eq!(got.leader_transitions, 2);
         assert_eq!(got.lease_duration_seconds, 15);
+    }
+
+    /// TestReleaseOnCancellation_Leases' event expectations
+    /// (leaderelection_test.go): RecordEvent writes a Normal `LeaderElection`
+    /// event "<identity> <s>" about the Lease; without a recorder it is a no-op.
+    #[tokio::test]
+    async fn record_event_emits_leader_election_event_on_the_lease() {
+        let storage = Arc::new(MemoryStorage::new());
+        let lock = LeaseLock::new(storage.clone(), "kube-system", "kcm", "a").with_event_recorder(
+            EventRecorder::new(storage.clone()),
+            "kube-controller-manager",
+        );
+        lock.create(&record("a")).await.unwrap();
+        lock.record_event("became leader").await;
+        lock.record_event("stopped leading").await;
+        let events: Vec<rusternetes_common::resources::Event> =
+            storage.list("/registry/events/kube-system/").await.unwrap();
+        assert_eq!(events.len(), 1, "same (object, reason) bumps one Event");
+        let e = &events[0];
+        assert_eq!(e.reason, "LeaderElection");
+        assert_eq!(e.event_type, EventType::Normal);
+        assert_eq!(e.message, "a stopped leading");
+        assert_eq!(e.count, 2);
+        assert_eq!(e.source.component, "kube-controller-manager");
+        assert_eq!(e.involved_object.kind.as_deref(), Some("Lease"));
+        assert_eq!(
+            e.involved_object.api_version.as_deref(),
+            Some("coordination.k8s.io/v1")
+        );
+        assert_eq!(e.involved_object.name.as_deref(), Some("kcm"));
+        assert!(!e.involved_object.uid.as_deref().unwrap_or("").is_empty());
+
+        let bare = LeaseLock::new(storage.clone(), "other", "kcm", "a");
+        bare.create(&record("a")).await.unwrap();
+        bare.record_event("became leader").await;
+        let none: Vec<rusternetes_common::resources::Event> =
+            storage.list("/registry/events/other/").await.unwrap();
+        assert!(none.is_empty());
     }
 
     /// `Update` before get/create is an error (leaselock.go).
