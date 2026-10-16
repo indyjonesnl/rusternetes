@@ -29,10 +29,12 @@ pub fn add_protection_finalizer(meta: &mut ObjectMeta, finalizer: &str) {
 /// `a.GetResource().GroupResource()`, admission.go:71-84), if any.
 /// `vac_enabled` is the `VolumeAttributesClass` gate.
 pub fn finalizer_for(group: &str, resource: &str, vac_enabled: bool) -> Option<&'static str> {
-    let _ = (group, vac_enabled, VAC_PROTECTION_FINALIZER);
-    match resource {
-        "persistentvolumes" => Some(PV_PROTECTION_FINALIZER),
-        "persistentvolumeclaims" => Some(PVC_PROTECTION_FINALIZER),
+    match (group, resource) {
+        ("", "persistentvolumes") => Some(PV_PROTECTION_FINALIZER),
+        ("", "persistentvolumeclaims") => Some(PVC_PROTECTION_FINALIZER),
+        ("storage.k8s.io", "volumeattributesclasses") if vac_enabled => {
+            Some(VAC_PROTECTION_FINALIZER)
+        }
         _ => None,
     }
 }
