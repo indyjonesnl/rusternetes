@@ -115,9 +115,34 @@ Reference hardware: _TBD (record CPU/RAM/OS when filling this in)_.
 | Scratch image size (musl, x86_64) | **82 MiB** | — | uncompressed; binary + CA bundle, nothing else (`all-in-one-musl.Dockerfile`) |
 | Scratch image size (musl, aarch64) | **65 MiB** | — | same image, native arm64 build — comfortably under #1041's sub-100MB target |
 | Time-to-cluster | TBD | TBD | `up` → first node Ready |
-| Idle RSS (avg) | TBD | ~535–750 MB | all-in-one container |
+| Idle RSS (avg) | **~247 MiB** (no CRI, 24 CPUs; see above) | ~535–750 MB | all-in-one container |
 | Idle RSS (max) | TBD | — | |
 | Idle CPU (avg) | TBD | TBD | |
+
+### Idle RSS of the all-in-one process (measured 2026-10-16)
+
+`scripts/bench-idle-memory.sh --bin <release-fast binary>`, 45 s after boot, empty
+SQLite store, in-process bus on, `--disable-proxy`, **no CRI runtime reachable**
+(the kubelet loops on a failed sanity check, so a real node adds a little).
+Host: 24 logical CPUs, glibc, `release-fast` profile (not the shipped LTO build).
+
+| Config | VmRSS | Threads |
+|---|---|---|
+| glibc malloc (default) | **247 MiB** (RssAnon 173, RssFile 80) | 54 |
+| glibc + `TOKIO_WORKER_THREADS=4` | 235 MiB | 34 |
+| glibc + `MALLOC_ARENA_MAX=2` | 223 MiB | 54 |
+| glibc + both | **218 MiB** | 34 |
+| `--features mimalloc` (glibc) | 428 MiB | 54 |
+| mimalloc + `TOKIO_WORKER_THREADS=4` | 341 MiB | 34 |
+| mimalloc + `TOKIO_WORKER_THREADS=2` | 308 MiB | 32 |
+| mimalloc + `MIMALLOC_PURGE_DELAY=0` | 385 MiB | 54 |
+
+Take-aways: idle RSS is already ~250 MiB on glibc, inside the sub-400 MiB target;
+mimalloc is *worse* on a many-core glibc host (per-thread heaps scale with the
+tokio worker count, which defaults to the core count), so the musl-only
+rationale for it stands but the "lowers idle RSS" claim does not; and
+`TOKIO_WORKER_THREADS` / `MALLOC_ARENA_MAX` are free knobs worth 10-30 MiB.
+These are single runs on one box; treat differences under ~10 MiB as noise.
 
 The all-in-one binary — 75 MiB glibc-dynamic, 82 MiB musl-static (fully
 self-contained, no glibc) — is in the same ballpark as k3s's ~70 MB static
