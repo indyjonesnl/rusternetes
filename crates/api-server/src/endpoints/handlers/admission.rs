@@ -175,9 +175,7 @@ impl Admission<'_> {
         // `StorageObjectInUseProtection` follows `DefaultStorageClass` in
         // `AllOrderedPlugins` (plugins.go:69-100); it acts on the resource
         // itself, never a subresource (admission.go `admitPV`/`admitPVC`).
-        if plugin_enabled("StorageObjectInUseProtection")
-            && self.subresource.is_none()
-        {
+        if plugin_enabled("StorageObjectInUseProtection") && self.subresource.is_none() {
             if let Some(finalizer) = storage_object_in_use_protection::finalizer_for(
                 &self.resource.group,
                 &self.resource.resource,
