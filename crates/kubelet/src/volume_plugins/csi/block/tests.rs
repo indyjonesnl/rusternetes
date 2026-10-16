@@ -462,3 +462,49 @@ async fn tear_down_device_skips_unstage_when_staging_path_is_gone() {
         .unwrap();
     assert!(f.fake.calls.lock().unwrap().unstage.is_empty());
 }
+
+/// `NewBlockVolumeMapper` sets `MetricsProvider = NewMetricsCsi(volumeHandle,
+/// blockPath+"/"+podUID, driverName)` (`csi_plugin.go:772`): the mapper's
+/// metrics are the driver's `NodeGetVolumeStats` for that path.
+#[tokio::test(flavor = "multi_thread")]
+async fn mapper_metrics_come_from_node_get_volume_stats() {
+    use crate::volume_plugins::csi_client::proto::{
+        volume_usage::Unit, NodeGetVolumeStatsResponse, VolumeUsage,
+    };
+    let f = fx(
+        "blockmetrics",
+        &[Cap::GetVolumeStats],
+        json!({"attachRequired": false}),
+    )
+    .await;
+    *f.fake.volume_stats_resp.lock().unwrap() = Some(NodeGetVolumeStatsResponse {
+        usage: vec![VolumeUsage {
+            available: 7,
+            total: 10,
+            used: 3,
+            unit: Unit::Bytes as i32,
+        }],
+        volume_condition: None,
+    });
+    let (v, pv, pod) = (claim_volume(), block_pv(&f.driver, json!({})), pod());
+    let spec = Spec {
+        volume: &v,
+        persistent_volume: Some(&pv),
+        read_only: false,
+    };
+    let bp = f.plugin.as_block_volume_plugin().unwrap();
+    let mapper = bp.new_block_volume_mapper(&spec, &pod).unwrap();
+    assert!(mapper.supports_metrics());
+
+    let m = mapper.get_metrics().unwrap();
+    assert_eq!(m.capacity.unwrap().value(), 10);
+    assert_eq!(m.used.unwrap().value(), 3);
+    assert_eq!(m.available.unwrap().value(), 7);
+
+    let req = f.fake.calls.lock().unwrap().volume_stats[0].clone();
+    assert_eq!(req.volume_id, "vol-1");
+    assert_eq!(
+        req.volume_path,
+        format!("{}/pv1/dev/pod-uid", device_root(&f))
+    );
+}

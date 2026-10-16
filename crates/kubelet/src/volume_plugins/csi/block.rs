@@ -15,6 +15,7 @@
 //! - `UnmapPodDevice` calls `NodeUnpublishVolume`,
 //! - `TearDownDevice` calls `NodeUnstageVolume`.
 
+use super::metrics::new_metrics_csi;
 use super::{
     get_attachment_name, get_credentials_from_secret, load_volume_data, make_dir_0750,
     pv_source_from_spec, remove_mount_dir, save_volume_data, transient, vol_data_key, CsiPlugin,
@@ -25,7 +26,6 @@ use crate::volume_plugins::plugin::{
     BlockVolumeMapper, BlockVolumePlugin, BlockVolumeUnmapper, CustomBlockVolumeMapper,
     CustomBlockVolumeUnmapper, Metrics, MetricsProvider, OwnedSpec, Spec,
 };
-use crate::volume_plugins::util::metrics::MetricsNil;
 use crate::volume_plugins::util::types::is_operation_finished_error;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -681,11 +681,11 @@ impl CsiBlockMapper {
 
 impl MetricsProvider for CsiBlockMapper {
     /// Upstream sets `MetricsProvider = NewMetricsCsi(volumeHandle,
-    /// blockPath+"/"+podUID, driverName)` (`csi_plugin.go:788`), which asks
-    /// the driver for `NodeGetVolumeStats`. That provider is not ported yet
-    /// (tracked in #3865), so metrics are reported as unsupported.
+    /// blockPath+"/"+podUID, driverName)` (`csi_plugin.go:772`), which asks
+    /// the driver for `NodeGetVolumeStats`.
     fn get_metrics(&self) -> Result<Metrics> {
-        MetricsNil.get_metrics()
+        let path = format!("{}/{}", self.global_map_path(), self.pod_uid);
+        new_metrics_csi(&self.volume_id, &path, &self.driver_name).get_metrics()
     }
 }
 

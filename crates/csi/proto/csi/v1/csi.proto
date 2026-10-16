@@ -47,6 +47,7 @@ service Node {
   rpc NodeGetCapabilities (NodeGetCapabilitiesRequest) returns (NodeGetCapabilitiesResponse) {}
   rpc NodeExpandVolume (NodeExpandVolumeRequest) returns (NodeExpandVolumeResponse) {}
   rpc NodeGetInfo (NodeGetInfoRequest) returns (NodeGetInfoResponse) {}
+  rpc NodeGetVolumeStats (NodeGetVolumeStatsRequest) returns (NodeGetVolumeStatsResponse) {}
 }
 
 message VolumeCapability {
@@ -179,6 +180,36 @@ message NodeExpandVolumeRequest {
 
 message NodeExpandVolumeResponse {
   int64 capacity_bytes = 1;
+}
+
+// NodeGetVolumeStats messages. Field numbers verified against the vendored
+// csi.pb.go (NodeGetVolumeStatsRequest/Response, VolumeUsage, VolumeCondition).
+message NodeGetVolumeStatsRequest {
+  string volume_id = 1;
+  string volume_path = 2;
+  string staging_target_path = 3;
+}
+
+message NodeGetVolumeStatsResponse {
+  repeated VolumeUsage usage = 1;
+  VolumeCondition volume_condition = 2;
+}
+
+message VolumeUsage {
+  enum Unit {
+    UNKNOWN = 0;
+    BYTES = 1;
+    INODES = 2;
+  }
+  int64 available = 1;
+  int64 total = 2;
+  int64 used = 3;
+  Unit unit = 4;
+}
+
+message VolumeCondition {
+  bool abnormal = 1;
+  string message = 2;
 }
 
 // ---- Identity + Controller service subset (external-provisioner / snapshotter

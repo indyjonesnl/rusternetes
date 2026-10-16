@@ -8,6 +8,7 @@
 //! first RPC dials.
 
 use super::csi_drivers_store::csi_drivers;
+use super::plugin::Metrics;
 use hyper_util::rt::TokioIo;
 use rusternetes_common::quantity::{Format, Quantity};
 use rusternetes_common::resources::PersistentVolumeAccessMode;
@@ -28,8 +29,8 @@ use proto::volume_capability::access_mode::Mode as AccessModeKind;
 use proto::volume_capability::{AccessMode, AccessType, BlockVolume, MountVolume};
 use proto::{
     CapacityRange, NodeExpandVolumeRequest, NodeGetCapabilitiesRequest, NodeGetInfoRequest,
-    NodePublishVolumeRequest, NodeStageVolumeRequest, NodeUnpublishVolumeRequest,
-    NodeUnstageVolumeRequest, VolumeCapability,
+    NodeGetVolumeStatsRequest, NodePublishVolumeRequest, NodeStageVolumeRequest,
+    NodeUnpublishVolumeRequest, NodeUnstageVolumeRequest, VolumeCapability,
 };
 
 /// `csiTimeout` (`pkg/volume/csi/csi_plugin.go:55`): the deadline every CSI
@@ -269,6 +270,19 @@ impl CsiDriverClient {
             .await
     }
 
+    /// `NodeSupportsVolumeStats` (`csi_client.go:580-582`): the `GET_VOLUME_STATS`
+    /// node capability.
+    pub async fn node_supports_volume_stats(&self) -> Result<bool, CsiError> {
+        self.node_supports_capability(NodeRpcType::GetVolumeStats)
+            .await
+    }
+
+    /// `nodeSupportsVolumeCondition` (`csi_client.go:666-668`).
+    async fn node_supports_volume_condition(&self) -> Result<bool, CsiError> {
+        self.node_supports_capability(NodeRpcType::VolumeCondition)
+            .await
+    }
+
     /// `NodeSupportsVolumeMountGroup` (`csi_client.go:670`).
     pub async fn node_supports_volume_mount_group(&self) -> Result<bool, CsiError> {
         self.node_supports_capability(NodeRpcType::VolumeMountGroup)
@@ -444,6 +458,83 @@ impl CsiDriverClient {
         }
     }
 
+    /// Port of `NodeGetVolumeStats` (`csi_client.go:588-664`): ask the driver
+    /// for the usage of the volume published at `target_path` and map it to
+    /// [`Metrics`]. `time` is left unset, as upstream leaves `metrics.Time`
+    /// for `metricsCsi.GetMetrics` to set.
+    pub async fn node_get_volume_stats(
+        &self,
+        vol_id: &str,
+        target_path: &str,
+    ) -> Result<Metrics, CsiError> {
+        if vol_id.is_empty() {
+            return Err(CsiError::Failed("missing volume id".into()));
+        }
+        if target_path.is_empty() {
+            return Err(CsiError::Failed("missing target path".into()));
+        }
+        let mut c = self.node_client()?;
+        let resp = self
+            .call(c.node_get_volume_stats(NodeGetVolumeStatsRequest {
+                volume_id: vol_id.to_string(),
+                volume_path: target_path.to_string(),
+                staging_target_path: String::new(),
+            }))
+            .await
+            .map_err(|s| CsiError::Failed(s.to_string()))?;
+
+        let zero = || Some(Quantity::from_value(0, Format::BinarySI));
+        let mut metrics = Metrics {
+            used: zero(),
+            capacity: zero(),
+            available: zero(),
+            inodes_used: zero(),
+            inodes: zero(),
+            inodes_free: zero(),
+            ..Default::default()
+        };
+
+        let mut is_support_node_volume_condition = false;
+        // `utilfeature.DefaultFeatureGate.Enabled(features.CSIVolumeHealth)`
+        if rusternetes_common::feature_gates::gate_enabled("CSIVolumeHealth").unwrap_or(false) {
+            is_support_node_volume_condition = self.node_supports_volume_condition().await?;
+            if is_support_node_volume_condition {
+                // `resp.VolumeCondition.GetAbnormal()` / `GetMessage()`: a nil
+                // condition reads as false / "".
+                let cond = resp.volume_condition.clone().unwrap_or_default();
+                metrics.abnormal = Some(cond.abnormal);
+                metrics.message = Some(cond.message);
+            }
+        }
+
+        // If the driver does not support volume condition and usages is nil,
+        // return an error. (proto3 `repeated` has no nil; empty is nil.)
+        if !is_support_node_volume_condition && resp.usage.is_empty() {
+            return Err(CsiError::Failed(
+                "failed to get usage from response. usage is nil".into(),
+            ));
+        }
+
+        for usage in &resp.usage {
+            match proto::volume_usage::Unit::try_from(usage.unit) {
+                Ok(proto::volume_usage::Unit::Bytes) => {
+                    metrics.available =
+                        Some(Quantity::from_value(usage.available, Format::BinarySI));
+                    metrics.capacity = Some(Quantity::from_value(usage.total, Format::BinarySI));
+                    metrics.used = Some(Quantity::from_value(usage.used, Format::BinarySI));
+                }
+                Ok(proto::volume_usage::Unit::Inodes) => {
+                    metrics.inodes_free =
+                        Some(Quantity::from_value(usage.available, Format::BinarySI));
+                    metrics.inodes = Some(Quantity::from_value(usage.total, Format::BinarySI));
+                    metrics.inodes_used = Some(Quantity::from_value(usage.used, Format::BinarySI));
+                }
+                _ => tracing::error!(unit = usage.unit, "unknown unit in VolumeUsage"),
+            }
+        }
+        Ok(metrics)
+    }
+
     /// Port of `NodeStageVolume` (`csi_client.go:386-454`).
     #[allow(clippy::too_many_arguments)]
     pub async fn node_stage_volume(
@@ -532,6 +623,7 @@ pub(crate) mod fake {
         /// Stage/publish call order, for NodeStage-before-NodePublish checks.
         pub order: Vec<&'static str>,
         pub node_get_info_calls: usize,
+        pub volume_stats: Vec<NodeGetVolumeStatsRequest>,
     }
 
     #[derive(Clone, Default)]
@@ -546,6 +638,9 @@ pub(crate) mod fake {
         pub expand_error: Arc<Mutex<Option<tonic::Code>>>,
         /// `NodeGetInfo`'s answer: `Err` makes the RPC fail.
         pub node_info: Arc<Mutex<Option<Result<NodeGetInfoResponse, tonic::Code>>>>,
+        /// `NodeGetVolumeStats`'s answer (`fake.NodeClient.SetNodeVolumeStatsResp`,
+        /// `fake_client.go`): `None` answers an empty response.
+        pub volume_stats_resp: Arc<Mutex<Option<NodeGetVolumeStatsResponse>>>,
     }
 
     impl FakeDriver {
@@ -618,6 +713,19 @@ pub(crate) mod fake {
             Ok(Response::new(NodeExpandVolumeResponse {
                 capacity_bytes: required,
             }))
+        }
+        async fn node_get_volume_stats(
+            &self,
+            r: Request<NodeGetVolumeStatsRequest>,
+        ) -> Result<Response<NodeGetVolumeStatsResponse>, Status> {
+            self.calls.lock().unwrap().volume_stats.push(r.into_inner());
+            Ok(Response::new(
+                self.volume_stats_resp
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_default(),
+            ))
         }
         async fn node_get_info(
             &self,
