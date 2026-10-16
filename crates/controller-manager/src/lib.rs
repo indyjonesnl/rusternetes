@@ -530,6 +530,21 @@ where
         }
     }));
 
+    // `newPodCertificateRequestCleanerController`
+    // (cmd/kube-controller-manager/app/certificates.go:232-253), gated on the
+    // `PodCertificateRequest` feature gate.
+    if rusternetes_common::feature_gates::enabled(
+        rusternetes_common::feature_gates::Feature::PodCertificateRequest,
+    ) {
+        let s = storage_for("PodCertificateRequestCleaner");
+        handles.push(tokio::spawn(async move {
+            let c = Arc::new(controllers::pcr_cleaner::PcrCleanerController::new(s));
+            if let Err(e) = c.run().await {
+                error!("PodCertificateRequest cleaner controller error: {}", e);
+            }
+        }));
+    }
+
     let s = storage_for("Namespace");
     let ns_ca = config.ca_cert_pem.clone();
     handles.push(tokio::spawn(async move {
