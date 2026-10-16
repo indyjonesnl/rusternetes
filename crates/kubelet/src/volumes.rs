@@ -131,6 +131,13 @@ pub struct VolumeManager {
     /// (`unmount_device`, `list_staged_devices`) that are not part of
     /// `VolumePlugin`. `plugin_mgr` holds the plugin as a `dyn VolumePlugin`.
     pub(crate) csi_plugin: Arc<crate::volume_plugins::csi::CsiPlugin>,
+    /// The kubelet's one `ActualStateOfWorld` (`volumeManager.actualStateOfWorld`,
+    /// `pkg/kubelet/volumemanager/volume_manager.go`), as far as the CSI
+    /// device-unmount sweep uses it. Staged devices are reconstructed into it
+    /// (`reconciler/reconstruct.go`) and it outlives a sweep, so a device left
+    /// `DeviceMountUncertain` by a failed `UnmountDevice` is still there to be
+    /// retried. `Arc`-shared because the manager is `Clone`d per runtime attach.
+    asw: Arc<crate::volume_manager::cache::actual_state_of_world::ActualStateOfWorld>,
     /// Each mounted pod volume's `Mounter.GetAttributes()` result plus the
     /// `SELinuxLabeled` bit, keyed by (pod UID, volume name). Stands in for the
     /// `VolumeInfo{Mounter, SELinuxLabeled}` map upstream's `makeMounts` reads
@@ -143,6 +150,23 @@ pub struct VolumeManager {
     /// `pkg/kubelet/volume_host.go:86`). Resync re-asks it for the bundle of
     /// each `podCertificate` source so a rotated credential reaches the mount.
     pod_certificate_manager: Option<Arc<dyn crate::podcertificate::Manager>>,
+}
+
+/// `(driver, volumeHandle)` of an attached volume's CSI persistent volume.
+fn csi_key_of(
+    v: &crate::volume_manager::cache::actual_state_of_world::AttachedVolume,
+) -> Option<(String, String)> {
+    let csi = v
+        .volume_spec
+        .persistent_volume
+        .as_ref()?
+        .spec
+        .csi
+        .as_ref()?;
+    Some((
+        csi.driver.clone(),
+        csi.volume_handle.clone().unwrap_or_default(),
+    ))
 }
 
 /// `kubecontainer.VolumeInfo` as far as `makeMounts` reads it.
@@ -282,8 +306,16 @@ impl VolumeManager {
             storage,
             token_manager,
             node_allocatable,
-            plugin_mgr,
             csi_plugin: Arc::new(crate::volume_plugins::csi::CsiPlugin::new(host)),
+            // `NewActualStateOfWorld(nodeName, volumePluginMgr)`. The manager
+            // does not know the node name (upstream reads it from the kubelet).
+            asw: Arc::new(
+                crate::volume_manager::cache::actual_state_of_world::ActualStateOfWorld::new(
+                    "",
+                    Arc::clone(&plugin_mgr),
+                ),
+            ),
+            plugin_mgr,
             mounted: Arc::default(),
             pod_certificate_manager,
         }
@@ -688,106 +720,140 @@ impl VolumeManager {
     }
 
     /// [`Self::unmount_unused_csi_devices`] with the desired set already known.
+    ///
+    /// `unmountDetachDevices` (`reconciler_common.go:273-315`) over the
+    /// persistent [`ActualStateOfWorld`]: every staged device is first
+    /// reconstructed into it ([`Self::reconstruct_staged_devices`]), then each
+    /// of `GetUnmountedVolumes()` that nothing holds or desires is unmounted
+    /// when `DeviceMayBeMounted()` and otherwise marked detached (the
+    /// non-attachable-plugin branch, `:301-303`). Not ported:
+    /// `IsOperationPending` (the sweep is the only operation issuer and runs
+    /// sequentially) and `DetachVolume` (a CSI plugin that is attachable is
+    /// detached by the attach/detach controller, `controllerAttachDetachEnabled`).
     pub(crate) async fn unmount_csi_devices_not_in(
         &self,
         desired: &std::collections::HashSet<(String, String)>,
     ) {
         let held = self.csi_volumes_held_by_pods();
-        for (driver, handle, device_path) in self.csi_plugin.list_staged_devices() {
-            let key = (driver, handle);
-            if held.contains(&key) || desired.contains(&key) {
+        self.reconstruct_staged_devices();
+        for unmounted in self.asw.get_unmounted_volumes() {
+            let key = csi_key_of(&unmounted);
+            if key
+                .as_ref()
+                .is_some_and(|k| held.contains(k) || desired.contains(k))
+            {
                 continue;
             }
-            self.unmount_device(&key.1, &device_path).await;
+            // "Re-read the actual state of the world, maybe the volume got
+            // mounted in the meantime" (`:278-281`).
+            let Some(attached) = self.asw.get_attached_volume(&unmounted.volume_name) else {
+                continue;
+            };
+            if attached.device_may_be_mounted() {
+                self.unmount_device(&attached).await;
+            } else {
+                // `controllerAttachDetachEnabled || !PluginIsAttachable`
+                // (`:299`): the kubelet is never the one that detaches.
+                self.asw
+                    .mark_volume_as_detached(&attached.volume_name, &attached.node_name);
+            }
+        }
+    }
+
+    /// Put every staged CSI device that is not yet in the actual state of world
+    /// into it as attached and globally mounted: the stand-in for
+    /// `reconciler/reconstruct.go`, which does the same for each volume found on
+    /// disk at startup. A device already known keeps its recorded state (an
+    /// uncertain mount stays uncertain until `UnmountDevice` resolves it).
+    fn reconstruct_staged_devices(&self) {
+        use crate::volume_plugins::plugin::OwnedSpec;
+
+        let plugin_name = crate::pod_dirs::plugin::CSI;
+        let Ok(plugin) = self.plugin_mgr.find_plugin_by_name(plugin_name) else {
+            return;
+        };
+        for (_, _, device_mount_path) in self.csi_plugin.list_staged_devices() {
+            let device_mount_path_str = device_mount_path.to_string_lossy().to_string();
+            // `ConstructVolumeSpec` over the volume directory holding `vol_data.json`.
+            let Some(data_dir) = device_mount_path.parent() else {
+                continue;
+            };
+            let reconstructed = match plugin.construct_volume_spec("", &data_dir.to_string_lossy())
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(
+                        "Cannot reconstruct the spec of staged device {device_mount_path_str}: {e:#}"
+                    );
+                    continue;
+                }
+            };
+            let spec = Arc::new(OwnedSpec {
+                volume: reconstructed.volume,
+                persistent_volume: reconstructed.persistent_volume,
+                read_only: false,
+            });
+            let volume_name = match crate::volume_plugins::util::get_unique_volume_name_from_spec(
+                plugin,
+                &spec.as_spec(),
+            ) {
+                Ok(n) => n,
+                Err(e) => {
+                    warn!("Cannot name staged device {device_mount_path_str}: {e}");
+                    continue;
+                }
+            };
+            if self.asw.volume_exists(&volume_name) {
+                continue;
+            }
+            if let Err(e) = self
+                .asw
+                .mark_volume_as_attached(Some(&volume_name), spec, "", "")
+                .and_then(|()| {
+                    self.asw
+                        .mark_device_as_mounted(&volume_name, "", &device_mount_path_str, "")
+                })
+            {
+                warn!("Cannot record staged device {device_mount_path_str}: {e}");
+            }
         }
     }
 
     /// `operationExecutor.UnmountDevice(attachedVolume.AttachedVolume,
     /// actualStateOfWorld, hostutil)` (`operation_executor.go`, called from
     /// `unmountDetachDevices`, `reconciler_common.go:296-306`):
-    /// `GenerateUnmountDeviceFunc` then run its operation.
-    ///
-    /// The kubelet keeps no `ActualStateOfWorld` yet (#1970); upstream's
-    /// reconstruction (`reconciler/reconstruct.go`) would have put this
-    /// device into it as attached and globally mounted. A transient one holding
-    /// just this volume, populated the same way, stands in, so
-    /// `MarkDeviceAsUncertain` / `MarkDeviceAsUnmounted` have the entry they
-    /// act on. The node name is not known to the manager, so the operation's
-    /// messages carry an empty one. A failure is logged and retried on the
-    /// next sync, as the reconciler does.
-    async fn unmount_device(&self, volume_handle: &str, device_mount_path: &std::path::Path) {
-        use crate::volume_manager::cache::actual_state_of_world::ActualStateOfWorld;
-        use crate::volume_plugins::plugin::OwnedSpec;
-        use crate::volume_plugins::util::operation_executor::AttachedVolume;
+    /// `GenerateUnmountDeviceFunc` then run its operation against the
+    /// persistent actual state of world, so `MarkDeviceAsUncertain` /
+    /// `MarkDeviceAsUnmounted` land on the entry the next sweep reads.
+    /// A failure is logged and retried on the next sync, as the reconciler does.
+    async fn unmount_device(
+        &self,
+        attached: &crate::volume_manager::cache::actual_state_of_world::AttachedVolume,
+    ) {
         use crate::volume_plugins::util::operation_generator::generate_unmount_device_func;
 
-        let plugin_name = crate::pod_dirs::plugin::CSI;
-        let device_mount_path_str = device_mount_path.to_string_lossy().to_string();
-        let Ok(plugin) = self.plugin_mgr.find_plugin_by_name(plugin_name) else {
-            return;
-        };
-        // `ConstructVolumeSpec` over the volume directory holding `vol_data.json`.
-        let Some(data_dir) = device_mount_path.parent() else {
-            return;
-        };
-        let reconstructed = match plugin.construct_volume_spec("", &data_dir.to_string_lossy()) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(
-                    "Cannot reconstruct the spec of staged device {device_mount_path_str}: {e:#}"
-                );
-                return;
-            }
-        };
-        let spec = Arc::new(OwnedSpec {
-            volume: reconstructed.volume,
-            persistent_volume: reconstructed.persistent_volume,
-            read_only: false,
-        });
-        let volume_name = match crate::volume_plugins::util::get_unique_volume_name_from_spec(
-            plugin,
-            &spec.as_spec(),
-        ) {
-            Ok(n) => n,
-            Err(e) => {
-                warn!("Cannot name staged device {device_mount_path_str}: {e}");
-                return;
-            }
-        };
-        let asw = ActualStateOfWorld::new("", Arc::clone(&self.plugin_mgr));
-        if let Err(e) = asw
-            .mark_volume_as_attached(Some(&volume_name), Arc::clone(&spec), "", "")
-            .and_then(|()| asw.mark_device_as_mounted(&volume_name, "", &device_mount_path_str, ""))
-        {
-            warn!("Cannot record staged device {device_mount_path_str}: {e}");
-            return;
-        }
-        let device_to_detach = AttachedVolume {
-            volume_name,
-            volume_spec: spec,
-            node_name: String::new(),
-            plugin_is_attachable: false,
-            device_path: String::new(),
-            device_mount_path: device_mount_path_str.clone(),
-            plugin_name: plugin_name.to_string(),
-            selinux_mount_context: String::new(),
-        };
+        let device_to_detach: &crate::volume_plugins::util::operation_executor::AttachedVolume =
+            attached;
+        let what = format!(
+            "{} ({})",
+            device_to_detach.volume_name, device_to_detach.device_mount_path
+        );
         let hostutil = crate::volume_plugins::util::hostutil::HostUtil;
         let op = match generate_unmount_device_func(
             &self.plugin_mgr,
-            &device_to_detach,
-            &asw,
+            device_to_detach,
+            &self.asw,
             &hostutil,
         ) {
             Ok(op) => op,
             Err(e) => {
-                warn!("UnmountDevice of {volume_handle} ({device_mount_path_str}): {e:#}");
+                warn!("UnmountDevice of {what}: {e:#}");
                 return;
             }
         };
         let ctx = op.run().await;
         if let Some(e) = ctx.detailed_err {
-            warn!("UnmountDevice of {volume_handle} ({device_mount_path_str}) failed: {e:#}");
+            warn!("UnmountDevice of {what} failed: {e:#}");
         }
     }
 
@@ -1849,6 +1915,115 @@ mod projected_mode_tests {
             0o400,
             "projected configMap item mode must be applied on resync"
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Stage a CSI device by hand under `<root>/plugins/kubernetes.io/csi`
+    /// (`<dir>/globalmount` + `<dir>/vol_data.json`) for a driver nobody has
+    /// registered, so `NodeUnstageVolume` fails transiently
+    /// (`csi_attacher.go` `UnmountDevice`, kubernetes#120268).
+    fn stage_unregistered_csi_device(root: &std::path::Path, handle: &str) {
+        use sha2::Digest;
+        let dir = root
+            .join("plugins")
+            .join(crate::pod_dirs::plugin::CSI)
+            // `makeDeviceMountPath`: `<csi plugin dir>/<driver>/<sha256(handle)>/globalmount`.
+            .join("gone.example.com")
+            .join(format!("{:x}", sha2::Sha256::digest(handle.as_bytes())));
+        std::fs::create_dir_all(dir.join("globalmount")).unwrap();
+        std::fs::write(
+            dir.join("vol_data.json"),
+            format!(
+                r#"{{"specVolID":"pv-{handle}","driverName":"gone.example.com","volumeHandle":"{handle}"}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// #3601: the device-unmount sweep runs against ONE persistent
+    /// `ActualStateOfWorld`. A failed `UnmountDevice` leaves the device
+    /// `DeviceMountUncertain` (`operation_generator.go:859-868`) and the next
+    /// sweep finds it there, instead of rebuilding a transient world that
+    /// forgets it.
+    #[tokio::test]
+    async fn device_unmount_sweep_keeps_uncertain_state_across_sweeps() {
+        use crate::volume_plugins::util::operation_executor::DeviceMountState;
+
+        let tmp = std::env::temp_dir().join(format!("rn-asw-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        stage_unregistered_csi_device(&tmp, "h1");
+        let vm = VolumeManager::new(
+            tmp.to_string_lossy().to_string(),
+            None,
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+        assert!(vm.asw.get_attached_volumes().is_empty());
+
+        vm.unmount_csi_devices_not_in(&Default::default()).await;
+        let after_first = vm.asw.get_attached_volumes();
+        assert_eq!(after_first.len(), 1, "the staged device is reconstructed");
+        assert_eq!(
+            after_first[0].device_mount_state,
+            DeviceMountState::DeviceMountUncertain
+        );
+
+        // A second sweep must neither duplicate nor reset the entry.
+        vm.unmount_csi_devices_not_in(&Default::default()).await;
+        let after_second = vm.asw.get_attached_volumes();
+        assert_eq!(after_second.len(), 1);
+        assert_eq!(
+            after_second[0].device_mount_state,
+            DeviceMountState::DeviceMountUncertain
+        );
+        // Clones of the manager (one per runtime attach) share the world.
+        assert_eq!(vm.clone().asw.get_attached_volumes().len(), 1);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `unmountDetachDevices` else-branch (`reconciler_common.go:299-303`): a
+    /// volume the world knows whose device is no longer mounted and that
+    /// nothing wants is marked detached, i.e. leaves the world.
+    #[tokio::test]
+    async fn device_unmount_sweep_detaches_unmounted_unwanted_volumes() {
+        use crate::volume_plugins::plugin::OwnedSpec;
+
+        let tmp = std::env::temp_dir().join(format!("rn-asw-detach-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let vm = VolumeManager::new(
+            tmp.to_string_lossy().to_string(),
+            None,
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+        let pv = serde_json::from_value(json!({
+            "metadata": {"name": "pv-x"},
+            "spec": {"csi": {"driver": "gone.example.com", "volumeHandle": "x"}}
+        }))
+        .unwrap();
+        let volume = serde_json::from_value(json!({"name": "pv-x"})).unwrap();
+        let spec = Arc::new(OwnedSpec {
+            volume,
+            persistent_volume: Some(pv),
+            read_only: false,
+        });
+        let name = crate::volume_plugins::util::get_unique_volume_name_from_spec(
+            vm.plugin_mgr
+                .find_plugin_by_name(crate::pod_dirs::plugin::CSI)
+                .unwrap(),
+            &spec.as_spec(),
+        )
+        .unwrap();
+        vm.asw
+            .mark_volume_as_attached(Some(&name), spec, "", "")
+            .unwrap();
+        assert!(vm.asw.volume_exists(&name));
+
+        let desired =
+            std::collections::HashSet::from([("gone.example.com".to_string(), "x".to_string())]);
+        vm.unmount_csi_devices_not_in(&desired).await;
+        assert!(vm.asw.volume_exists(&name), "desired volumes are kept");
+
+        vm.unmount_csi_devices_not_in(&Default::default()).await;
+        assert!(!vm.asw.volume_exists(&name), "unwanted volume is detached");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
