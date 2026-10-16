@@ -54,6 +54,7 @@ pub mod persistentvolumeclaim;
 pub mod pod;
 pub mod pod_subresources;
 pub mod podcertificaterequest;
+pub mod storageversionmigration;
 pub mod poddisruptionbudget;
 pub mod podtemplate;
 pub mod priorityclass;

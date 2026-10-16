@@ -32,6 +32,7 @@ pub mod networking;
 pub mod node;
 pub mod pod;
 pub mod podcertificaterequest;
+pub mod storageversionmigration;
 pub mod policy;
 pub mod pv_sources;
 pub mod rangeallocation;

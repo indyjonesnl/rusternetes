@@ -344,6 +344,7 @@ mod ssa_reset_fields_batch_test;
 mod ssa_reset_fields_crd_test;
 mod ssa_reset_fields_more_3728_test;
 mod ssa_reset_fields_test;
+mod storageversionmigration_3798_test;
 mod ssa_secret_apply_test;
 mod statefulset_generic_store_test;
 mod statefulset_handler_test;
