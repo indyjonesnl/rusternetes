@@ -60,6 +60,7 @@ impl MetricsClient for SeqCpuMetrics {
         _: &str,
         _: &str,
         _: &LabelSelector,
+        _: &str,
     ) -> anyhow::Result<PodMetricsInfo> {
         anyhow::bail!("not used")
     }
@@ -68,6 +69,7 @@ impl MetricsClient for SeqCpuMetrics {
         _: &str,
         _: &str,
         _: &CrossVersionObjectReference,
+        _: &str,
     ) -> anyhow::Result<(i64, chrono::DateTime<chrono::Utc>)> {
         anyhow::bail!("not used")
     }
@@ -75,7 +77,7 @@ impl MetricsClient for SeqCpuMetrics {
         &self,
         _: &str,
         _: &str,
-        _: &LabelSelector,
+        _: &str,
     ) -> anyhow::Result<(Vec<i64>, chrono::DateTime<chrono::Utc>)> {
         anyhow::bail!("not used")
     }
