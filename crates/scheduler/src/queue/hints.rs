@@ -237,85 +237,87 @@ pub mod node_resources_fit {
     use crate::advanced::pod_request_amounts;
     use rusternetes_common::quantity::parse_resource_value;
 
-    /// `isSchedulableAfterPodEvent` (`fit.go:373-408`): a Pod delete or
-    /// scale-down on the same node family frees resources; only an
-    /// assigned Pod matters, and only when it would have shared a node.
+    /// `isSchedulableAfterPodEvent` (`fit.go:373-408`): a Pod delete of a
+    /// scheduled (or nominated) pod, or a scale-down that frees a resource
+    /// the target requests, may make the target schedulable.
+    /// InPlacePodVerticalScaling is GA locked-on in 1.35
+    /// (`kube_features.go:1376-1380`), so the disabled branch is not ported.
     pub fn is_schedulable_after_pod_event(
         pod: &Pod,
         old_obj: Option<&EventObject>,
         new_obj: Option<&EventObject>,
     ) -> Result<QueueingHint, String> {
         let (original_pod, modified_pod) = as_typed::<Pod>(old_obj, new_obj)?;
-        let modified_pod = match modified_pod {
-            None => {
-                // Pod deleted.
-                let original = original_pod
-                    .ok_or_else(|| "pod delete event without an old object".to_string())?;
-                if original.metadata.uid == pod.metadata.uid {
-                    // The deleted pod is the target pod: this event isn't
-                    // what makes the Pod schedulable.
-                    debug!(pod = %pod_name(pod), "the deleted pod is the target pod; ignore");
-                    return Ok(QueueingHint::QueueSkip);
-                }
-                if original
-                    .spec
-                    .as_ref()
-                    .and_then(|s| s.node_name.as_deref())
-                    .unwrap_or("")
-                    .is_empty()
-                {
-                    // Unscheduled pod deletion frees nothing.
-                    debug!(pod = %pod_name(pod), "the deleted pod was unscheduled; ignore");
-                    return Ok(QueueingHint::QueueSkip);
-                }
-                debug!(pod = %pod_name(pod), "another scheduled pod was deleted, and it may make the unscheduled pod schedulable");
-                return Ok(QueueingHint::Queue);
+        let Some(modified_pod) = modified_pod else {
+            let original =
+                original_pod.ok_or_else(|| "pod delete event without an old object".to_string())?;
+            if node_name(original).is_empty() && nominated_node_name(original).is_empty() {
+                debug!(pod = %pod_name(pod), deleted_pod = %pod_name(original), "the deleted pod was unscheduled and it wouldn't make the unscheduled pod schedulable");
+                return Ok(QueueingHint::QueueSkip);
             }
-            Some(m) => m,
+            // any deletion event to a scheduled pod could make the unscheduled pod schedulable.
+            debug!(pod = %pod_name(pod), deleted_pod = %pod_name(original), "another scheduled pod was deleted, and it may make the unscheduled pod schedulable");
+            return Ok(QueueingHint::Queue);
         };
-        if modified_pod
-            .spec
-            .as_ref()
-            .and_then(|s| s.node_name.as_deref())
-            .unwrap_or("")
-            .is_empty()
-        {
-            debug!(pod = %pod_name(pod), "the updated pod is unscheduled; ignore");
-            return Ok(QueueingHint::QueueSkip);
-        }
+
         if !is_schedulable_after_pod_scale_down(pod, original_pod, modified_pod) {
-            debug!(pod = %pod_name(pod), "the pod was updated but doesn't free enough resources for the unscheduled pod");
+            debug!(pod = %pod_name(pod), modified_pod = %pod_name(modified_pod), "pod got scaled down, but the modification isn't related to the resource requests of the target pod");
             return Ok(QueueingHint::QueueSkip);
         }
-        debug!(pod = %pod_name(pod), "another scheduled pod was scaled down, and it may make the unscheduled pod schedulable");
+        debug!(pod = %pod_name(pod), modified_pod = %pod_name(modified_pod), "another scheduled pod or the target pod itself got scaled down, and it may make the unscheduled pod schedulable");
         Ok(QueueingHint::Queue)
     }
 
-    /// `isSchedulableAfterPodScaleDown` (`fit.go:410-460`):
-    /// the resources released by the scale down must be ones the target
-    /// Pod requests.
+    /// `isSchedulableAfterPodScaleDown` (`fit.go:410-460`): true when the
+    /// update is for the target pod itself, or when a scheduled pod's
+    /// request for a resource the target also requests got reduced.
     fn is_schedulable_after_pod_scale_down(
-        pod: &Pod,
-        original: Option<&Pod>,
-        modified: &Pod,
+        target_pod: &Pod,
+        original_pod: Option<&Pod>,
+        modified_pod: &Pod,
     ) -> bool {
-        let Some(original) = original else {
+        if modified_pod.metadata.uid == target_pod.metadata.uid {
+            // If the scaling down event is for targetPod, it would make targetPod schedulable.
+            return true;
+        }
+        if node_name(modified_pod).is_empty() {
+            // If the update event is for a unscheduled Pod, it wouldn't make targetPod schedulable.
+            return false;
+        }
+        let Some(original_pod) = original_pod else {
             return false;
         };
-        let pod_requests = pod_request_amounts(pod);
-        let original_requests = pod_request_amounts(original);
-        let modified_requests = pod_request_amounts(modified);
+        // the other pod was scheduled, so modification or deletion may free up some resources.
+        let original_requests = pod_request_amounts(original_pod);
+        let modified_requests = pod_request_amounts(modified_pod);
+        // check whether the resource request of the modified pod is less than the original pod.
+        let pod_requests = pod_request_amounts(target_pod);
         for (name, requested) in &pod_requests {
-            if *requested <= 0 {
+            if *requested == 0 {
+                // We only care about the resources requested by the pod we are trying to schedule.
                 continue;
             }
             let before = original_requests.get(name).copied().unwrap_or(0);
             let after = modified_requests.get(name).copied().unwrap_or(0);
-            if after < before {
+            if before > after {
                 return true;
             }
         }
         false
+    }
+
+    fn node_name(pod: &Pod) -> &str {
+        pod.spec
+            .as_ref()
+            .and_then(|s| s.node_name.as_deref())
+            .unwrap_or("")
+    }
+
+    fn nominated_node_name(pod: &Pod) -> &str {
+        pod.status
+            .as_ref()
+            .and_then(|s| s.nominated_node_name.as_deref())
+            .unwrap_or("")
     }
 
     /// `isSchedulableAfterNodeChange` (`fit.go:462-489`): Node add, or an
@@ -489,88 +491,127 @@ mod tests {
         Box::new(t)
     }
 
-    /// `Test_isSchedulableAfterPodChange` (`fit_test.go:1484-1600`).
+    fn nominated_pod(name: &str, cpu: &str, node: &str) -> Pod {
+        serde_json::from_value(json!({
+            "metadata": {"name": name, "namespace": "ns", "uid": name},
+            "spec": {"containers": [{"name": "c", "resources": {"requests": {"cpu": cpu}}}]},
+            "status": {"nominatedNodeName": node}
+        }))
+        .unwrap()
+    }
+
+    /// `Test_isSchedulableAfterPodChange` (`fit_test.go:1484-1600`), the rows
+    /// that do not need pod-level resources (`PodLevelResourceRequests` is
+    /// not modelled by `pod_request_amounts`). InPlacePodVerticalScaling is
+    /// GA locked-on in 1.35, so the disabled row is not ported.
     #[test]
     fn fit_is_schedulable_after_pod_change() {
-        let target = pod_req("1", "1Gi");
-        // backoff-wrong object → error
-        assert!(node_resources_fit::is_schedulable_after_pod_event(
-            &target,
-            None,
-            Some(&*obj(node("n", "1", "1Gi")))
-        )
-        .is_err());
-        // deleted pod is the target → skip
-        let mut t2 = target.clone();
-        t2.spec.as_mut().unwrap().node_name = Some("n".into());
-        assert_eq!(
-            node_resources_fit::is_schedulable_after_pod_event(&target, Some(&*obj(t2)), None)
-                .unwrap(),
-            QueueingHint::QueueSkip
-        );
-        // deleted pod unscheduled → skip
-        assert_eq!(
-            node_resources_fit::is_schedulable_after_pod_event(
-                &target,
-                Some(&*obj(
-                    pod_req("1", "1Gi").tap(|p| p.metadata.uid = "other".into())
-                )),
-                None
-            )
-            .unwrap(),
-            QueueingHint::QueueSkip
-        );
-        // deleted assigned pod → queue
-        assert_eq!(
-            node_resources_fit::is_schedulable_after_pod_event(
-                &target,
-                Some(&*obj(assigned_pod("o", "1", "1Gi", "n"))),
-                None
-            )
-            .unwrap(),
-            QueueingHint::Queue
-        );
-        // updated pod unscheduled → skip
-        assert_eq!(
-            node_resources_fit::is_schedulable_after_pod_event(
-                &target,
-                Some(&*obj(pod_req("2", "1Gi"))),
-                Some(&*obj(pod_req("1", "1Gi")))
-            )
-            .unwrap(),
-            QueueingHint::QueueSkip
-        );
-        // scaled down a resource the target requests → queue
-        assert_eq!(
-            node_resources_fit::is_schedulable_after_pod_event(
-                &target,
-                Some(&*obj(assigned_pod("o", "2", "1Gi", "n"))),
-                Some(&*obj(assigned_pod("o", "1", "1Gi", "n")))
-            )
-            .unwrap(),
-            QueueingHint::Queue
-        );
-        // scaled down an unrequested resource only → skip
-        let target_cpu_only = pod_req("1", "0");
-        assert_eq!(
-            node_resources_fit::is_schedulable_after_pod_event(
-                &target_cpu_only,
-                Some(&*obj(assigned_pod("o", "1", "2Gi", "n"))),
-                Some(&*obj(assigned_pod("o", "1", "1Gi", "n")))
-            )
-            .unwrap(),
-            QueueingHint::QueueSkip
-        );
-        // no change → skip
-        assert_eq!(
-            node_resources_fit::is_schedulable_after_pod_event(
-                &target,
-                Some(&*obj(assigned_pod("o", "1", "1Gi", "n"))),
-                Some(&*obj(assigned_pod("o", "1", "1Gi", "n")))
-            )
-            .unwrap(),
-            QueueingHint::QueueSkip
-        );
+        let target_1cpu = || {
+            let mut p = pod_req("1", "0");
+            p.metadata.uid = "uid0".into();
+            p
+        };
+        let other = |cpu: &str, node: Option<&str>| {
+            let mut p = assigned_pod("pod2", cpu, "0", node.unwrap_or(""));
+            if node.is_none() {
+                p.spec.as_mut().unwrap().node_name = None;
+            }
+            p.metadata.uid = "uid1".into();
+            p
+        };
+        struct Case {
+            name: &'static str,
+            pod: Pod,
+            old: Option<Box<EventObject>>,
+            new: Option<Box<EventObject>>,
+            expected: Result<QueueingHint, ()>,
+        }
+        let cases = vec![
+            Case {
+                name: "backoff-wrong-old-object",
+                pod: pod_req("0", "0"),
+                old: Some(obj("not-a-pod".to_string())),
+                new: None,
+                expected: Err(()),
+            },
+            Case {
+                name: "backoff-wrong-new-object",
+                pod: pod_req("0", "0"),
+                old: None,
+                new: Some(obj("not-a-pod".to_string())),
+                expected: Err(()),
+            },
+            Case {
+                name: "queue-on-other-pod-deleted",
+                pod: target_1cpu(),
+                old: Some(obj(other("1", Some("fake")))),
+                new: None,
+                expected: Ok(QueueingHint::Queue),
+            },
+            Case {
+                name: "skip-queue-on-unscheduled-pod-deleted",
+                pod: pod_req("0", "0"),
+                old: Some(obj(other("0", None))),
+                new: None,
+                expected: Ok(QueueingHint::QueueSkip),
+            },
+            // fit.go:380: a deleted pod that was only *nominated* still
+            // reserved room on its nominated node (preemptor deleted before
+            // it was bound) → Queue.
+            Case {
+                name: "queue-on-nominated-pod-deleted",
+                pod: target_1cpu(),
+                old: Some(obj(nominated_pod("pod2", "1", "node-1"))),
+                new: None,
+                expected: Ok(QueueingHint::Queue),
+            },
+            Case {
+                name: "skip-queue-on-other-unscheduled-pod",
+                pod: target_1cpu(),
+                old: Some(obj(other("2", None))),
+                new: Some(obj(other("1", None))),
+                expected: Ok(QueueingHint::QueueSkip),
+            },
+            Case {
+                name: "skip-queue-on-other-pod-unrelated-resource-scaled-down",
+                pod: target_1cpu(),
+                old: Some(obj(assigned_pod("pod2", "0", "2", "fake"))),
+                new: Some(obj(assigned_pod("pod2", "0", "1", "fake"))),
+                expected: Ok(QueueingHint::QueueSkip),
+            },
+            Case {
+                name: "queue-on-other-pod-some-resource-scale-down",
+                pod: target_1cpu(),
+                old: Some(obj(other("2", Some("fake")))),
+                new: Some(obj(other("1", Some("fake")))),
+                expected: Ok(QueueingHint::Queue),
+            },
+            // fit.go:413-416: a scale-down of the target pod itself queues it
+            // even though it is (still) unscheduled.
+            Case {
+                name: "queue-on-target-pod-some-resource-scale-down",
+                pod: target_1cpu(),
+                old: Some(obj({
+                    let mut p = pod_req("2", "0");
+                    p.metadata.uid = "uid0".into();
+                    p
+                })),
+                new: Some(obj(target_1cpu())),
+                expected: Ok(QueueingHint::Queue),
+            },
+        ];
+        for c in cases {
+            let got = node_resources_fit::is_schedulable_after_pod_event(
+                &c.pod,
+                c.old.as_deref(),
+                c.new.as_deref(),
+            );
+            match (c.expected, got) {
+                (Err(()), Err(_)) => {}
+                (Ok(want), Ok(got)) => assert_eq!(got, want, "{}", c.name),
+                (want, got) => panic!("{}: want {want:?}, got {got:?}", c.name),
+            }
+        }
     }
 
     /// `Test_isSchedulableAfterNodeChange` (`fit_test.go:1602-1723`).
@@ -814,12 +855,4 @@ mod tests {
             QueueingHint::Queue
         );
     }
-
-    trait Tap: Sized {
-        fn tap(mut self, f: impl FnOnce(&mut Self)) -> Self {
-            f(&mut self);
-            self
-        }
-    }
-    impl Tap for Pod {}
 }

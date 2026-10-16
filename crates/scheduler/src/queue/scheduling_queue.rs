@@ -176,12 +176,10 @@ pub fn pod_key(pod: &Pod) -> String {
     )
 }
 
-fn pod_scheduler_name(pod: &Pod) -> &str {
-    pod.spec
-        .as_ref()
-        .and_then(|s| s.scheduler_name.as_deref())
-        .unwrap_or("")
-}
+/// `pInfo.Pod.Spec.SchedulerName`, with the API server's default applied
+/// the same way `responsibleForPod` applies it (objects read straight from
+/// storage may carry no name).
+use crate::profile::pod_scheduler_name;
 
 /// `fwk.LessFunc`.
 pub type LessFn = Arc<dyn Fn(&QueuedPodInfo, &QueuedPodInfo) -> bool + Send + Sync>;
@@ -1676,7 +1674,7 @@ mod tests {
                     queueing_hint_fn: f,
                 }));
         }
-        HashMap::from([(String::new(), m)])
+        HashMap::from([(crate::profile::DEFAULT_SCHEDULER_NAME.to_string(), m)])
     }
 
     /// Upstream tests hand the popped `podInfo` back to
@@ -1886,6 +1884,30 @@ mod tests {
                 c.name
             );
         }
+    }
+
+    /// The API server defaults an unset `spec.schedulerName` to
+    /// `default-scheduler` (`SetDefaults_PodSpec`); objects read straight from
+    /// storage may still carry none. The hint map is keyed by profile name,
+    /// so the lookup must use the same defaulting `responsibleForPod` does —
+    /// otherwise every event degrades to "no map registered" → backoff.
+    #[test]
+    fn is_pod_worth_requeuing_defaults_unset_scheduler_name() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let q = new_test_queue(
+            hints(vec![(NODE_ADD, vec![("fooPlugin1", hint_skip(&count))])]),
+            Arc::new(RealClock),
+        );
+        let pod = mk_pod("pod1", "ns1", "1");
+        assert!(pod.spec.as_ref().unwrap().scheduler_name.is_none());
+        let p_info = QueuedPodInfo::for_lookup(pod, &["fooPlugin1"]);
+        let node = mk_node();
+        assert_eq!(
+            q.is_pod_worth_requeuing(&p_info, &NODE_ADD, None, Some(&node)),
+            QueueingStrategy::QueueSkip,
+            "the default profile's hint must decide, not the missing-map fallback"
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
     /// `TestPriorityQueue_AddUnschedulableIfNotPresent` (`:945-973`), minus
@@ -2142,7 +2164,7 @@ mod tests {
                 ),
             ]);
             let pre_enqueue: PreEnqueuePluginMap = HashMap::from([(
-                String::new(),
+                crate::profile::DEFAULT_SCHEDULER_NAME.to_string(),
                 vec![Arc::new(AllowlistGate {
                     name: gate,
                     allow: &["allow"],
@@ -2182,7 +2204,7 @@ mod tests {
             vec![("gate", super::super::hints::default_queueing_hint_fn())],
         )]);
         let pre_enqueue: PreEnqueuePluginMap = HashMap::from([(
-            String::new(),
+            crate::profile::DEFAULT_SCHEDULER_NAME.to_string(),
             vec![Arc::new(AllowlistGate {
                 name: "gate",
                 allow: &["allow"],

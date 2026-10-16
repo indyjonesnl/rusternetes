@@ -342,6 +342,22 @@ impl<S: Storage + Send + Sync + 'static> DataPlane<S> {
         }
     }
 
+    /// `podLister.Pods(ns).Get(name)` (schedule_one.go:1071-1072): the
+    /// informer-cache read `handleSchedulingFailure` does before requeuing.
+    /// `Ok(None)` is the lister's NotFound; API mode answers from the pods
+    /// reflector store (never fails), storage mode from the backend, whose
+    /// transient errors surface as `Err` — distinct from "gone".
+    pub async fn cached_pod(&self, ns: &str, name: &str) -> Result<Option<Pod>> {
+        match self {
+            DataPlane::Storage(s) => match s.get(&build_key("pods", Some(ns), name)).await {
+                Ok(p) => Ok(Some(p)),
+                Err(Error::NotFound(_)) => Ok(None),
+                Err(e) => Err(e),
+            },
+            DataPlane::Api(a) => Ok(a.pods.store().get(&format!("{ns}/{name}"))),
+        }
+    }
+
     /// Get one pod by namespace/name. Returns [`Error::NotFound`] when absent.
     pub async fn get_pod(&self, ns: &str, name: &str) -> Result<Pod> {
         match self {
