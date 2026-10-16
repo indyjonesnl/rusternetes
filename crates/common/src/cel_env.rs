@@ -68,6 +68,9 @@ pub enum ExpectedOutput {
     /// `MessageExpressionCondition.ReturnTypes()` is `[cel.StringType]`
     /// (validating/message.go:34-36).
     String,
+    /// `AuditAnnotationCondition.ReturnTypes()` is
+    /// `[cel.StringType, cel.NullType]` (validating/interface.go:60-62).
+    StringOrNull,
     /// `ApplyConfigurationCondition` (smd.go:52).
     Object,
     /// `JSONPatchCondition` (json_patch.go:57).
@@ -236,6 +239,7 @@ fn output_mismatch(root: &IdedExpr, expected: ExpectedOutput) -> Option<String> 
         ExpectedOutput::Any => return None,
         ExpectedOutput::Bool => "bool",
         ExpectedOutput::String => "string",
+        ExpectedOutput::StringOrNull => "one of [string null_type]",
         ExpectedOutput::Object => "Object",
         ExpectedOutput::JsonPatchList => "list(JSONPatch)",
     };
@@ -258,7 +262,10 @@ fn output_mismatch(root: &IdedExpr, expected: ExpectedOutput) -> Option<String> 
     };
     // `ast.OutputType().IsExactType(returnType)`: nothing to report when the
     // inferred type is the wanted one.
-    if got == want {
+    if got == want
+        || (expected == ExpectedOutput::StringOrNull && got == "string")
+        || (expected == ExpectedOutput::StringOrNull && got == "null_type")
+    {
         return None;
     }
     Some(format!("must evaluate to {want} but got {got}"))

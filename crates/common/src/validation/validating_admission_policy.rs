@@ -49,7 +49,7 @@ pub fn ignore_validating_admission_policy_match_conditions(
 /// `maxAuditAnnotations` (`validation.go:47`).
 const MAX_AUDIT_ANNOTATIONS: usize = 20;
 /// `maxAuditAnnotationValueExpressionLength` (`validation.go:49`).
-const MAX_AUDIT_ANNOTATION_VALUE_EXPRESSION_LENGTH: usize = 5 * 1024;
+pub const MAX_AUDIT_ANNOTATION_VALUE_EXPRESSION_LENGTH: usize = 5 * 1024;
 /// `validateMatchConditions` caps the list at 64 (`validation.go:966`).
 const MAX_MATCH_CONDITIONS: usize = 64;
 
