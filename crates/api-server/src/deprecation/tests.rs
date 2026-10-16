@@ -218,15 +218,87 @@ fn table_is_sorted_and_complete() {
     }
 }
 
-/// `ShouldServeForVersion` (deleted_kinds.go:150-172), GA build: removed after
-/// current is served; equal or before is not.
+fn ev(cur: (u32, u32)) -> ResourceExpirationEvaluator {
+    ResourceExpirationEvaluator {
+        current_version: cur,
+        is_alpha: false,
+        is_alpha_zero: false,
+        strict_removed_handling_in_alpha: false,
+        serve_removed_apis_one_more_release: false,
+    }
+}
+
+/// `Test_resourceExpirationEvaluator_isNotRemoved` (deleted_kinds_test.go:179-290);
+/// a never-removed kind has no `APILifecycleRemoved` and is always served.
 #[test]
-fn should_serve_for_version_ga_build() {
-    assert!(should_serve_for_version((1, 36), (1, 35)));
-    assert!(should_serve_for_version((2, 0), (1, 35)));
-    assert!(!should_serve_for_version((1, 35), (1, 35)));
-    assert!(!should_serve_for_version((1, 16), (1, 35)));
-    assert!(!should_serve_for_version((0, 99), (1, 35)));
+fn should_serve_for_version_table() {
+    let mut deferred = ev((1, 20));
+    deferred.serve_removed_apis_one_more_release = true;
+    let mut alpha = ev((1, 20));
+    alpha.is_alpha = true;
+    let mut alpha_strict = alpha.clone();
+    alpha_strict.strict_removed_handling_in_alpha = true;
+    let mut alpha_strict_zero = alpha_strict.clone();
+    alpha_strict_zero.is_alpha_zero = true;
+    let mut prev = ev((1, 21));
+    prev.serve_removed_apis_one_more_release = true;
+    let mut prev_major = ev((2, 20));
+    prev_major.serve_removed_apis_one_more_release = true;
+    let cases = [
+        ("removed-in-curr", ev((1, 20)), (1, 20), false),
+        ("removed-in-curr-but-deferred", deferred, (1, 20), true),
+        ("removed-in-curr-but-alpha", alpha, (1, 20), true),
+        (
+            "removed-in-curr-but-alpha-but-strict",
+            alpha_strict,
+            (1, 20),
+            false,
+        ),
+        ("strict-and-alpha-zero", alpha_strict_zero, (1, 20), true),
+        (
+            "removed-in-prev-deferral-does-not-help",
+            prev,
+            (1, 20),
+            false,
+        ),
+        ("removed-in-prev-major", prev_major, (1, 20), false),
+        ("removed-in-future", ev((1, 20)), (1, 21), true),
+    ];
+    for (name, e, removed, want) in cases {
+        assert_eq!(e.should_serve_for_version(removed), want, "{name}");
+    }
+}
+
+/// `Test_newResourceExpirationEvaluator` (deleted_kinds_test.go:36-90).
+#[test]
+fn new_evaluator_parses_version() {
+    let none = |_: &str| None;
+    let mk = |v: &str| ResourceExpirationEvaluator::new(v, none).unwrap();
+    assert_eq!(mk("v1.20.0-beta.0.62+a5d22854a2ac21"), ev((1, 20)));
+    let mut a0 = ev((1, 20));
+    a0.is_alpha = true;
+    a0.is_alpha_zero = true;
+    assert_eq!(mk("v1.20.0-alpha.0.62+a5d22854a2ac21"), a0);
+    let mut a1 = ev((1, 20));
+    a1.is_alpha = true;
+    assert_eq!(mk("v1.20.0-alpha.1.62+a5d22854a2ac21"), a1);
+    assert_eq!(mk("v1.20.1"), ev((1, 20)));
+    assert_eq!(mk("1.20.1"), ev((1, 20)));
+}
+
+/// `NewResourceExpirationEvaluator` env handling (deleted_kinds.go:98-115).
+#[test]
+fn new_evaluator_reads_env_switches() {
+    let env = |k: &str| match k {
+        "KUBE_APISERVER_SERVE_REMOVED_APIS_FOR_ONE_RELEASE" => Some("true".to_string()),
+        "KUBE_APISERVER_STRICT_REMOVED_API_HANDLING_IN_ALPHA" => Some("1".to_string()),
+        _ => None,
+    };
+    let e = ResourceExpirationEvaluator::new("v1.35.0", env).unwrap();
+    assert!(e.serve_removed_apis_one_more_release && e.strict_removed_handling_in_alpha);
+    assert!(e.should_serve_for_version((1, 35)));
+    let bad = |_: &str| Some("maybe".to_string());
+    assert!(ResourceExpirationEvaluator::new("v1.35.0", bad).is_err());
 }
 
 /// A still-served deprecated kind keeps its deprecation:

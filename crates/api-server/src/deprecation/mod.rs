@@ -181,16 +181,98 @@ pub fn lookup(
     }
 }
 
-/// `resourceExpirationEvaluator.ShouldServeForVersion`
-/// (`staging/src/k8s.io/apiserver/pkg/server/deleted_kinds.go:150-171`) for a
-/// GA build: `isAlpha` is false (no `-alpha` prerelease) and
-/// `KUBE_APISERVER_SERVE_REMOVED_APIS_FOR_ONE_RELEASE` is unset, so a kind
-/// whose `APILifecycleRemoved` is at or before the current release is not
-/// served (`removeDeletedKinds`, `:182-184`, drops its storage and so its route).
-pub fn should_serve_for_version(removed: (u32, u32), current: (u32, u32)) -> bool {
-    // MajorMinor ordering is (major, minor) lexicographic; equal means "remove
-    // when the current release GAs", which a GA build does.
-    removed > current
+/// `resourceExpirationEvaluator` (`staging/src/k8s.io/apiserver/pkg/server/deleted_kinds.go:42-58`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceExpirationEvaluator {
+    pub current_version: (u32, u32),
+    pub is_alpha: bool,
+    pub is_alpha_zero: bool,
+    /// `KUBE_APISERVER_STRICT_REMOVED_API_HANDLING_IN_ALPHA`.
+    pub strict_removed_handling_in_alpha: bool,
+    /// `KUBE_APISERVER_SERVE_REMOVED_APIS_FOR_ONE_RELEASE`.
+    pub serve_removed_apis_one_more_release: bool,
+}
+
+/// Go `strconv.ParseBool`.
+fn parse_bool(s: &str) -> Result<bool, String> {
+    match s {
+        "1" | "t" | "T" | "TRUE" | "true" | "True" => Ok(true),
+        "0" | "f" | "F" | "FALSE" | "false" | "False" => Ok(false),
+        _ => Err(format!("strconv.ParseBool: parsing {s:?}: invalid syntax")),
+    }
+}
+
+impl ResourceExpirationEvaluator {
+    /// `NewResourceExpirationEvaluator` (`deleted_kinds.go:73-125`): only major
+    /// and minor are kept, the prerelease decides `isAlpha`/`isAlphaZero`, and
+    /// the two env switches are read through `env`.
+    pub fn new(version: &str, env: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let v = version.strip_prefix('v').unwrap_or(version);
+        let v = v.split('+').next().unwrap_or(v);
+        let (core, prerelease) = match v.split_once('-') {
+            Some((c, p)) => (c, p),
+            None => (v, ""),
+        };
+        let mut it = core.split('.');
+        let major = it.next().unwrap_or("");
+        let minor = it.next().unwrap_or("");
+        let (major, minor) = major_minor(major, minor)?;
+        let mut ret = Self {
+            current_version: (major as u32, minor as u32),
+            is_alpha: prerelease.contains("alpha"),
+            is_alpha_zero: prerelease.contains("alpha.0"),
+            strict_removed_handling_in_alpha: false,
+            serve_removed_apis_one_more_release: false,
+        };
+        if let Some(v) = env("KUBE_APISERVER_STRICT_REMOVED_API_HANDLING_IN_ALPHA") {
+            ret.strict_removed_handling_in_alpha = parse_bool(&v)?;
+        }
+        if let Some(v) = env("KUBE_APISERVER_SERVE_REMOVED_APIS_FOR_ONE_RELEASE") {
+            ret.serve_removed_apis_one_more_release = parse_bool(&v)?;
+        }
+        Ok(ret)
+    }
+
+    /// `ShouldServeForVersion` (`deleted_kinds.go:150-172`).
+    pub fn should_serve_for_version(&self, removed: (u32, u32)) -> bool {
+        if removed > self.current_version {
+            return true;
+        }
+        if removed < self.current_version {
+            return false;
+        }
+        // Major and minor are equal, so the API is removed when the current
+        // release GAs. Alphas keep serving unless strict handling is asked
+        // for (and only from alpha.1 on); admins may defer one release.
+        if self.is_alpha && !self.is_alpha_zero && self.strict_removed_handling_in_alpha {
+            return false;
+        }
+        if self.is_alpha {
+            return true;
+        }
+        self.serve_removed_apis_one_more_release
+    }
+}
+
+/// The process-wide evaluator: this server reports `v1.35.0` (a GA build, see
+/// [`CURRENT_MAJOR_MINOR`]) with the upstream env switches applied.
+pub fn evaluator() -> &'static ResourceExpirationEvaluator {
+    static E: std::sync::OnceLock<ResourceExpirationEvaluator> = std::sync::OnceLock::new();
+    E.get_or_init(|| {
+        ResourceExpirationEvaluator::new("v1.35.0", |k| std::env::var(k).ok()).unwrap_or(
+            ResourceExpirationEvaluator {
+                current_version: CURRENT_MAJOR_MINOR,
+                is_alpha: false,
+                is_alpha_zero: false,
+                strict_removed_handling_in_alpha: false,
+                serve_removed_apis_one_more_release: false,
+            },
+        )
+    })
+}
+
+pub fn should_serve_for_version(removed: (u32, u32)) -> bool {
+    evaluator().should_serve_for_version(removed)
 }
 
 /// `(deprecated, removedRelease)` for a request, as computed once per route in
@@ -207,7 +289,7 @@ pub fn deprecation_for(
     // `isNotRemoved` (deleted_kinds.go:127-148): a type without
     // `APILifecycleRemoved` is always served.
     if let Some(removed) = obj.and_then(|o| o.removed) {
-        if !should_serve_for_version(removed, CURRENT_MAJOR_MINOR) {
+        if !should_serve_for_version(removed) {
             return (false, String::new());
         }
     }
