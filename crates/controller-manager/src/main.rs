@@ -978,7 +978,7 @@ async fn main() -> Result<()> {
     let replicaset_controller = Arc::new(ReplicaSetController::with_pod_informer(
         storage.clone(),
         args.sync_interval,
-        pod_informer,
+        pod_informer.clone(),
     ));
     spawn_controller!("ReplicaSet controller", leader_elector, {
         let controller = replicaset_controller.clone();
@@ -1012,7 +1012,10 @@ async fn main() -> Result<()> {
     });
 
     // Start Job controller
-    let job_controller = Arc::new(JobController::new(storage.clone()));
+    let job_controller = Arc::new(JobController::with_pod_informer(
+        storage.clone(),
+        pod_informer,
+    ));
     spawn_controller!("Job controller", leader_elector, {
         let controller = job_controller.clone();
         async move {
