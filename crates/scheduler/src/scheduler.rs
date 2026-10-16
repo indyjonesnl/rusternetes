@@ -70,6 +70,13 @@ fn pod_key(pod: &Pod) -> String {
     crate::queue::pod_key(pod)
 }
 
+/// Both objects carry a resourceVersion and it is the same one: the relist
+/// returned the object the watch already delivered.
+fn same_resource_version(old: &Pod, new: &Pod) -> bool {
+    old.metadata.resource_version.is_some()
+        && old.metadata.resource_version == new.metadata.resource_version
+}
+
 /// `corev1helpers.PodPriority`.
 fn pod_priority(pod: &Pod) -> i32 {
     pod.spec.as_ref().and_then(|s| s.priority).unwrap_or(0)
@@ -511,6 +518,11 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         let key = pod_key(&pod);
         match seen.pods.insert(key, pod.clone()) {
             None => self.add_pod(queue, &pod),
+            // The informer never fires UpdateFunc for an unchanged object
+            // (resync period 0, options.go:336); the periodic relist here
+            // must not either, or every assigned pod would emit a spurious
+            // AssignedPodUpdate per tick.
+            Some(old) if same_resource_version(&old, &pod) => {}
             Some(old) => self.update_pod(queue, &old, &pod),
         }
     }
@@ -780,30 +792,45 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
     }
 
     /// `handleSchedulingFailure` (schedule_one.go:1033-1113), the queue
-    /// half: re-read the pod; a pod that is gone or got assigned meanwhile
-    /// is only `Done`, otherwise it goes back through
+    /// half: re-read the pod from the cache; a pod that is gone or got
+    /// assigned meanwhile is only `Done`, otherwise it goes back through
     /// `AddUnschedulableIfNotPresent`. The FailedScheduling event and the
     /// nomination are already handled by `try_schedule_pod`.
+    ///
+    /// Deviation: upstream reads the informer cache, which can only miss.
+    /// Our storage-mode read can fail transiently; that is not "gone", so
+    /// the in-flight copy is requeued as an error (backoff) instead of being
+    /// `Done`d out of every queue.
     async fn handle_scheduling_failure(&self, queue: &PriorityQueue, mut p_info: QueuedPodInfo) {
         let uid = p_info.pod.metadata.uid.clone();
         let ns = p_info.pod.metadata.namespace.clone().unwrap_or_default();
         let name = p_info.pod.metadata.name.clone();
-        match self.data.get_pod(&ns, &name).await {
-            Err(e) => {
-                info!(pod = %format!("{ns}/{name}"), error = %e, "Pod doesn't exist in informer cache");
+        match self.data.cached_pod(&ns, &name).await {
+            Ok(None) => {
+                info!(pod = %format!("{ns}/{name}"), "Pod doesn't exist in informer cache");
                 // AddUnschedulableIfNotPresent isn't called: Done explicitly.
                 queue.done(&uid);
             }
-            Ok(cached) if assigned_pod(&cached) => {
+            Ok(Some(cached)) if assigned_pod(&cached) => {
                 info!(pod = %format!("{ns}/{name}"), node = %pod_node_name(&cached), "Pod has been assigned to node. Abort adding it back to queue.");
                 queue.done(&uid);
             }
-            Ok(cached) if cached.metadata.uid != uid => {
+            Ok(Some(cached)) if cached.metadata.uid != uid => {
                 debug!(pod = %format!("{ns}/{name}"), old_uid = %uid, new_uid = %cached.metadata.uid, "Pod was recreated while handling scheduling failure. Skip requeueing and status updates.");
                 queue.done(&uid);
             }
-            Ok(cached) => {
+            Ok(Some(cached)) => {
                 p_info.pod = cached;
+                if let Err(e) =
+                    queue.add_unschedulable_if_not_present(p_info, queue.scheduling_cycle())
+                {
+                    error!(error = %e, "Error occurred");
+                }
+            }
+            Err(e) => {
+                warn!(pod = %format!("{ns}/{name}"), error = %e, "Transient error re-reading pod after scheduling failure; requeuing with backoff");
+                // Not a fit error any more: no plugins → error backoff queue.
+                p_info.unschedulable_plugins.clear();
                 if let Err(e) =
                     queue.add_unschedulable_if_not_present(p_info, queue.scheduling_cycle())
                 {
@@ -825,7 +852,10 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         let pod_key = build_key("pods", Some(ns), name);
         let pod: Pod = match self.data.get_pod(ns, name).await {
             Ok(p) => p,
-            Err(_) => return Ok(ScheduleOutcome::Done), // pod deleted
+            // Gone → nothing to do; a transient read error is an error
+            // outcome (backoff + retry), not a deletion.
+            Err(rusternetes_common::Error::NotFound(_)) => return Ok(ScheduleOutcome::Done),
+            Err(e) => return Err(e),
         };
 
         // Check if pod needs scheduling
@@ -2787,7 +2817,7 @@ mod tests {
     use super::*;
     use rusternetes_common::resources::{Container, PodSpec, PodStatus};
     use rusternetes_common::types::ObjectMeta;
-    use rusternetes_storage::MemoryStorage;
+    use rusternetes_storage::{MemoryStorage, WatchStream};
 
     fn make_node(name: &str) -> Node {
         Node {
@@ -4066,5 +4096,224 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         runner.abort();
+    }
+    /// A `Storage` that delegates to `MemoryStorage` but fails the n-th `get`
+    /// of one key with a transient error (api-server restart, 429, backend
+    /// timeout) — the failure mode upstream's informer-cache read cannot have.
+    struct FlakyStorage {
+        inner: Arc<MemoryStorage>,
+        fail_key: String,
+        fail_on_nth_get: usize,
+        gets: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for FlakyStorage {
+        async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.create(key, value).await
+        }
+
+        async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+        where
+            T: serde::de::DeserializeOwned + Send + Sync,
+        {
+            if key == self.fail_key {
+                let n = self.gets.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == self.fail_on_nth_get {
+                    return Err(rusternetes_common::Error::Internal(
+                        "transient: connection reset".to_string(),
+                    ));
+                }
+            }
+            self.inner.get(key).await
+        }
+
+        async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.update(key, value).await
+        }
+
+        async fn update_raw(
+            &self,
+            key: &str,
+            value: &serde_json::Value,
+        ) -> rusternetes_common::Result<()> {
+            self.inner.update_raw(key, value).await
+        }
+
+        async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+            self.inner.delete(key).await
+        }
+
+        async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.list(prefix).await
+        }
+
+        async fn list_at_revision<T>(
+            &self,
+            prefix: &str,
+            revision: i64,
+        ) -> rusternetes_common::Result<Vec<T>>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+        {
+            self.inner.list_at_revision(prefix, revision).await
+        }
+
+        async fn watch(&self, prefix: &str) -> rusternetes_common::Result<WatchStream> {
+            self.inner.watch(prefix).await
+        }
+
+        async fn watch_from_revision(
+            &self,
+            prefix: &str,
+            revision: i64,
+        ) -> rusternetes_common::Result<WatchStream> {
+            self.inner.watch_from_revision(prefix, revision).await
+        }
+
+        async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+            self.inner.current_revision().await
+        }
+
+        async fn is_revision_compacted(&self, revision: i64) -> rusternetes_common::Result<bool> {
+            self.inner.is_revision_compacted(revision).await
+        }
+    }
+
+    /// `handleSchedulingFailure` re-reads the pod from the informer cache
+    /// (schedule_one.go:1071-1072), which can only fail NotFound. Our re-read
+    /// can fail transiently; that must NOT be taken as "pod gone" (which
+    /// `Done`s the pod out of every queue for good): the pod is requeued with
+    /// the in-flight copy and retried.
+    #[tokio::test]
+    async fn run_requeues_pod_when_failure_reread_fails_transiently() {
+        let inner = Arc::new(MemoryStorage::new());
+        inner
+            .create("/registry/nodes/small", &cpu_node("small", "1"))
+            .await
+            .unwrap();
+        inner
+            .create(
+                "/registry/pods/default/big",
+                &cpu_pod("big", "big-uid", "2"),
+            )
+            .await
+            .unwrap();
+        // get #1: the scheduling cycle; get #2: handleSchedulingFailure's
+        // re-read → transient error.
+        let storage = Arc::new(FlakyStorage {
+            inner,
+            fail_key: "/registry/pods/default/big".to_string(),
+            fail_on_nth_get: 2,
+            gets: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let scheduler = Arc::new(Scheduler::new_with_name(
+            Arc::clone(&storage),
+            3600, // resync must not be what rescues the pod
+            DEFAULT_SCHEDULER_NAME.to_string(),
+        ));
+        let runner = tokio::spawn(Arc::clone(&scheduler).run());
+
+        // error backoff is 1s; the retry must come on its own.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while storage.gets.load(Ordering::SeqCst) < 3 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "pod must be retried after the transient re-read error (gets = {})",
+                storage.gets.load(Ordering::SeqCst)
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // …and it is back in the queue's bookkeeping: a fitting node binds it.
+        storage
+            .create("/registry/nodes/large", &cpu_node("large", "4"))
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            let p: Pod = storage.get("/registry/pods/default/big").await.unwrap();
+            if p.spec.as_ref().and_then(|s| s.node_name.as_deref()) == Some("large") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "pod must be bound once a node fits"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        runner.abort();
+    }
+
+    /// Upstream never calls `updatePod` for an unchanged object (informer
+    /// resync is 0, `options.go:336`). Our periodic relist must not replay
+    /// identical assigned pods through `updateAssignedPodInCache`: the
+    /// generic `AssignedPodUpdate` that produces would requeue every pod
+    /// rejected by a plugin registered for Pod/Update* on every tick.
+    #[tokio::test]
+    async fn resync_relist_does_not_fire_update_events_for_unchanged_pods() {
+        let storage = Arc::new(MemoryStorage::new());
+        storage
+            .create("/registry/nodes/n", &cpu_node("n", "4"))
+            .await
+            .unwrap();
+        let mut assigned = cpu_pod("a", "a-uid", "1");
+        assigned.spec.as_mut().unwrap().node_name = Some("n".to_string());
+        storage
+            .create("/registry/pods/default/a", &assigned)
+            .await
+            .unwrap();
+        let scheduler = Scheduler::new_with_name(
+            Arc::clone(&storage),
+            3600,
+            DEFAULT_SCHEDULER_NAME.to_string(),
+        );
+        // A plugin registered for the general Pod/Update event (the only
+        // kind the generic `AssignedPodUpdate` reaches), hint-less.
+        let queue = PriorityQueue::new(
+            priority_sort_less(),
+            PriorityQueueOptions {
+                queueing_hint_map: HashMap::from([(
+                    DEFAULT_SCHEDULER_NAME.to_string(),
+                    HashMap::from([(
+                        ClusterEvent::new(EventResource::Pod, ActionType::UPDATE),
+                        vec![crate::queue::QueueingHintFunction {
+                            plugin_name: "fooPlugin".to_string(),
+                            queueing_hint_fn: hints::default_queueing_hint_fn(),
+                        }],
+                    )]),
+                )]),
+                ..Default::default()
+            },
+        );
+        let mut seen = SeenObjects::default();
+        scheduler.resync(&queue, &mut seen).await;
+
+        // A pod rejected by that plugin: any Pod/Update event requeues it.
+        queue.add(cpu_pod("p", "p-uid", "1"));
+        let mut popped = queue.pop().await.unwrap();
+        popped.unschedulable_plugins = std::collections::HashSet::from(["fooPlugin".to_string()]);
+        queue
+            .add_unschedulable_if_not_present(popped, queue.scheduling_cycle())
+            .unwrap();
+        assert_eq!(queue.unschedulable_pods().len(), 1);
+
+        // Relist with nothing changed.
+        scheduler.resync(&queue, &mut seen).await;
+        assert_eq!(
+            queue.unschedulable_pods().len(),
+            1,
+            "an unchanged assigned pod must not fire AssignedPodUpdate"
+        );
+        assert!(queue.pods_in_backoff_q().is_empty());
+        assert!(queue.pods_in_active_q().is_empty());
     }
 }
