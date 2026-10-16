@@ -299,6 +299,8 @@ mod tests {
             volume: &v,
             persistent_volume: None,
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         assert!(plugin().can_support(&spec));
     }
@@ -310,6 +312,8 @@ mod tests {
             volume: &v,
             persistent_volume: None,
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         assert!(!plugin().can_support(&spec));
     }

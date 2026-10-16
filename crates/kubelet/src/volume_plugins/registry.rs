@@ -238,6 +238,8 @@ mod tests {
             volume: &v,
             persistent_volume: None,
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         assert_eq!(
             mgr().find_plugin_by_spec(&spec).unwrap().name(),
@@ -252,6 +254,8 @@ mod tests {
             volume: &v,
             persistent_volume: None,
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         assert!(matches!(
             mgr().find_plugin_by_spec(&spec),
@@ -269,6 +273,8 @@ mod tests {
             volume: &v,
             persistent_volume: None,
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         let err = mgr().find_plugin_by_spec(&spec).err().unwrap();
         let msg = err.to_string();
@@ -348,6 +354,8 @@ mod tests {
                 volume: volume(volume_name),
                 persistent_volume: None,
                 read_only: false,
+                migrated: false,
+                inline_volume_spec_for_csi_migration: false,
             })
         }
     }
@@ -373,6 +381,8 @@ mod tests {
             volume: &blk,
             persistent_volume: None,
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         let found = m.find_mapper_plugin_by_spec(&spec).unwrap().unwrap();
         assert_eq!(found.name(), "kubernetes.io/block");
@@ -382,6 +392,8 @@ mod tests {
             volume: &a,
             persistent_volume: None,
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         assert!(m.find_mapper_plugin_by_spec(&spec).unwrap().is_none());
 
@@ -390,6 +402,8 @@ mod tests {
             volume: &z,
             persistent_volume: None,
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         assert!(matches!(
             m.find_mapper_plugin_by_spec(&spec),
@@ -494,6 +508,8 @@ mod tests {
             volume: &e,
             persistent_volume: None,
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         let found = m
             .find_node_expandable_plugin_by_spec(&spec)
@@ -507,6 +523,8 @@ mod tests {
             volume: &a,
             persistent_volume: None,
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         assert!(m
             .find_node_expandable_plugin_by_spec(&spec)
@@ -518,6 +536,8 @@ mod tests {
             volume: &z,
             persistent_volume: None,
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         assert!(matches!(
             m.find_node_expandable_plugin_by_spec(&spec),

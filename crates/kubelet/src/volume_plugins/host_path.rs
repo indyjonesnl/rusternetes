@@ -296,6 +296,8 @@ mod tests {
             volume: &v,
             persistent_volume: None,
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         assert!(plugin().can_support(&spec));
     }
@@ -308,6 +310,8 @@ mod tests {
             volume: &v,
             persistent_volume: Some(&pv),
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         assert!(plugin().can_support(&spec));
     }
@@ -319,6 +323,8 @@ mod tests {
             volume: &v,
             persistent_volume: None,
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         assert!(!plugin().can_support(&spec));
     }
@@ -332,6 +338,8 @@ mod tests {
             volume: &v,
             persistent_volume: Some(&pv),
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         let pod = test_pod();
         let m = plugin().new_mounter(&spec, &pod).await.unwrap();
@@ -350,6 +358,8 @@ mod tests {
             volume: &v,
             persistent_volume: None,
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         let pod = test_pod();
         let m = plugin().new_mounter(&spec, &pod).await.unwrap();
@@ -368,6 +378,8 @@ mod tests {
             volume: &v,
             persistent_volume: None,
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         let m = plugin().new_mounter(&spec, &test_pod()).await.unwrap();
         let err = m.set_up().await.unwrap_err().to_string();
@@ -392,6 +404,8 @@ mod tests {
             volume: &v,
             persistent_volume: Some(&pv),
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         let pod = test_pod();
         let m = plugin().new_mounter(&spec, &pod).await.unwrap();
@@ -406,6 +420,8 @@ mod tests {
             volume: &v,
             persistent_volume: None,
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         let m = plugin().new_mounter(&spec, &test_pod()).await.unwrap();
         m.set_up().await.unwrap_err().to_string()
@@ -552,6 +568,8 @@ mod tests {
             volume: &v,
             persistent_volume: Some(&pv),
             read_only: true,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         let m = plugin().new_mounter(&spec, &test_pod()).await.unwrap();
         assert_eq!(
@@ -572,6 +590,8 @@ mod tests {
             volume: &v,
             persistent_volume: None,
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         let m = plugin().new_mounter(&spec, &test_pod()).await.unwrap();
         assert!(!m.get_attributes().read_only);

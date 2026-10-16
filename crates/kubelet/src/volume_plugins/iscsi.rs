@@ -923,6 +923,8 @@ fn create_persistent_volume_from_iscsi_pv_source(
         volume,
         persistent_volume: Some(pv),
         read_only: false,
+        migrated: false,
+        inline_volume_spec_for_csi_migration: false,
     })
 }
 
