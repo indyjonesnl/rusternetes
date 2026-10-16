@@ -162,3 +162,18 @@ async fn gap_events_between_subscribe_and_list_are_not_duplicated() {
         .await;
     assert_eq!(got, vec!["ADDED /registry/pods/ns/d".to_string()]);
 }
+
+/// #3082 item 2: a stale `current_revision()` must not cut the snapshot below
+/// an item it returned, or that object replays as ADDED.
+#[test]
+fn snapshot_cutoff_is_never_below_a_listed_item() {
+    use rusternetes_api_server::handlers::watch::snapshot_cutoff;
+    let item = |rv: &str| json!({"metadata": {"resourceVersion": rv}});
+    assert_eq!(
+        snapshot_cutoff(10, &[item("12"), item("7")]),
+        12,
+        "stale rev loses"
+    );
+    assert_eq!(snapshot_cutoff(20, &[item("12")]), 20, "fresh rev wins");
+    assert_eq!(snapshot_cutoff(5, &[]), 5, "empty list keeps rev");
+}
