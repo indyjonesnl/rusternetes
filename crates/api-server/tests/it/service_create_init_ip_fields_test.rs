@@ -7,13 +7,12 @@
 //! `fixtures_create_init_ip_fields.json` holds one object per cluster, each
 //! case being the `svctest.MakeService` tweaks plus the expectation.
 //!
-//! Two deliberate deviations. Upstream's allocator ranges (storage_test.go:
-//! 70-81) are `10.0.0.0/16` and `2000::/108`; `--service-cluster-ip-range[0]`
-//! must still be the default `10.96.0.0/12` (`ipranges.rs`, the `kubernetes`
-//! Service address is not yet derived from the range), so the table's
-//! `10.0.0.1` / `2000::1` are remapped into `10.96.0.0/12` / `2001:db8:1::/112`.
-//! For the same reason the two clusters with an IPv6 primary (`singlestack:v6`,
-//! `dualstack:v6v4`, 260 cases) cannot be started and are skipped.
+//! One deliberate deviation. Upstream's allocator ranges (storage_test.go:
+//! 70-81) are `10.0.0.0/16` and `2000::/108`; the harness pins
+//! `10.96.0.0/12` and `2001:db8:1::/112`, so the table's `10.0.0.1` /
+//! `2000::1` are remapped into those ranges. All four clusters run, including
+//! the two with an IPv6 primary (`singlestack:v6`, `dualstack:v6v4`), now that
+//! the primary service range is honoured (#2445).
 
 use axum::http::StatusCode;
 use rusternetes_test_support::harness::TestApiServer;
@@ -76,9 +75,6 @@ async fn create_init_ip_fields_matches_upstream_table() {
     let mut failures = Vec::new();
     let mut ran = 0;
     for cluster in &clusters {
-        if cluster["clusterFamilies"][0] == "IPv6" {
-            continue;
-        }
         let range = range_for(cluster["clusterFamilies"].as_array().unwrap());
         let api = TestApiServer::builder()
             .service_cluster_ip_range(&range)
@@ -125,7 +121,7 @@ async fn create_init_ip_fields_matches_upstream_table() {
             assert_eq!(s, StatusCode::OK, "{label}: delete");
         }
     }
-    assert_eq!(ran, 260);
+    assert_eq!(ran, 520);
     assert!(
         failures.is_empty(),
         "{} of {ran} diverge from upstream:\n{}",
