@@ -147,7 +147,7 @@ const MATCH_CONDITION_KEYS: [&str; 1] = ["expression"];
 
 /// `unknown field "<path>"` for every key not in `known`, in document order;
 /// `descend` is called for each known key's value.
-fn unknown_fields(
+pub(crate) fn unknown_fields(
     v: &serde_yaml::Value,
     path: &str,
     known: &[&str],
@@ -170,7 +170,7 @@ fn unknown_fields(
     }
 }
 
-fn each_item(
+pub(crate) fn each_item(
     v: &serde_yaml::Value,
     path: &str,
     out: &mut Vec<String>,

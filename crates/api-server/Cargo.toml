@@ -78,6 +78,11 @@ prometheus-http-query = { version = "0.8", default-features = false, features = 
 ] }
 url = "2.5.8"
 cel.workspace = true
+# egress selector HTTP-CONNECT-over-TLS dialer (#3416)
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pemfile = "2.1"
+rustls-native-certs = "0.8"
 sha2 = "0.10"
 prost.workspace = true
 prost-types = "0.13"
