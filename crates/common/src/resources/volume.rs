@@ -1079,39 +1079,48 @@ pub struct ReferenceGrant {
     pub type_meta: TypeMeta,
     #[serde(default)]
     pub metadata: ObjectMeta,
-    #[serde(default)]
-    pub spec: ReferenceGrantSpec,
+    /// Absent stays absent: `spec` is not in the CRD's top-level `required`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<ReferenceGrantSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ReferenceGrantSpec {
-    #[serde(default)]
-    pub from: Vec<ReferenceGrantFrom>,
-    #[serde(default)]
-    pub to: Vec<ReferenceGrantTo>,
+    /// `+required` (referencegrant_types.go `From []ReferenceGrantFrom`): an
+    /// absent key is `Required`, distinct from an empty array.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<Vec<ReferenceGrantFrom>>,
+    /// `+required`, as `from`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<Vec<ReferenceGrantTo>>,
 }
 
 /// `ReferenceGrantFrom`: group/kind/namespace of the referring objects.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ReferenceGrantFrom {
-    #[serde(default)]
-    pub group: String,
-    #[serde(default)]
-    pub kind: String,
-    #[serde(default)]
-    pub namespace: String,
+    /// `+required`; the empty string (core group) is present, absent is not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// `+required`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// `+required`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 /// `ReferenceGrantTo`: group/kind (and optionally name) of the referents.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ReferenceGrantTo {
-    #[serde(default)]
-    pub group: String,
-    #[serde(default)]
-    pub kind: String,
+    /// `+required`; the empty string (core group) is present, absent is not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// `+required`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 }

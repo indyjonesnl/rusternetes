@@ -84,6 +84,18 @@ async fn from_and_to_are_required_and_bounded() {
         "{out}"
     );
 
+    let mut absent_from = grant("g1");
+    absent_from["spec"].as_object_mut().unwrap().remove("from");
+    let (s, out) = api.post(GRANTS, &absent_from).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{out}");
+    assert!(
+        out["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("spec.from: Required value"),
+        "{out}"
+    );
+
     let mut no_to = grant("g1");
     no_to["spec"]["to"] = json!([]);
     let (s, out) = api.post(GRANTS, &no_to).await;

@@ -653,18 +653,26 @@ fn is_granted(
         if grant.metadata.namespace.as_deref().unwrap_or("") != ref_ns {
             continue;
         }
+        // An object stored without a spec (valid: `spec` is not required)
+        // grants nothing.
+        let Some(spec) = grant.spec.as_ref() else {
+            continue;
+        };
         // Skip unrelated grants by their From.
-        if !grant.spec.from.iter().any(|f| {
-            f.group.is_empty() && f.kind == "PersistentVolumeClaim" && f.namespace == claim_ns
+        if !spec.from.iter().flatten().any(|f| {
+            f.group.as_deref().unwrap_or("").is_empty()
+                && f.kind.as_deref() == Some("PersistentVolumeClaim")
+                && f.namespace.as_deref().unwrap_or("") == claim_ns
         }) {
             continue;
         }
-        for to in &grant.spec.to {
+        for to in spec.to.iter().flatten() {
+            let to_group = to.group.as_deref().unwrap_or("");
             let group_ok = match &r.api_group {
-                Some(g) => to.group == *g,
-                None => to.group.is_empty(),
+                Some(g) => to_group == g,
+                None => to_group.is_empty(),
             };
-            if !group_ok || to.kind != r.kind {
+            if !group_ok || to.kind.as_deref().unwrap_or("") != r.kind {
                 continue;
             }
             if to
