@@ -567,3 +567,198 @@ async fn multi_attach_error_is_reported_once_per_volume_and_node() {
     c.reconcile_all().await.unwrap();
     assert_eq!(pod_events(&s, "b").await.len(), 1);
 }
+
+// ---- CSI migration (#3801): TranslateInTreeSpecToCSI callers ----
+//
+// Upstream: `attachdetach/util/util.go` `CreateVolumeSpecWithNodeMigration`
+// (`:108`) / `translateInTreeSpecToCSIOnNodeIfNeeded` (`:251`),
+// `attach_detach_controller.go` `populateActualStateOfWorld` (`:722-735`),
+// `csi_attacher.go` `Attach` (`:84-103`, inline source).
+
+const GCE_DRIVER: &str = "pd.csi.storage.gke.io";
+
+fn gce_pv_json() -> Value {
+    json!({
+        "apiVersion": "v1", "kind": "PersistentVolume",
+        "metadata": {"name": "gce-pv", "uid": "gce-pv-uid"},
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "capacity": {"storage": "1Gi"},
+            "claimRef": {"name": "claim", "namespace": "ns", "uid": "claim-uid"},
+            "gcePersistentDisk": {"pdName": "pd-1", "fsType": "ext4"}
+        },
+        "status": {"phase": "Bound"}
+    })
+}
+
+/// The volume handle the shared translator produces for the GCE PV.
+fn translated_gce_pv_handle() -> String {
+    use rusternetes_common::csi_translation::CsiTranslator;
+    let pv = serde_json::from_value(gce_pv_json()).unwrap();
+    let csi = CsiTranslator::new()
+        .translate_in_tree_pv_to_csi(&pv)
+        .unwrap()
+        .spec
+        .csi
+        .unwrap();
+    assert_eq!(csi.driver, GCE_DRIVER);
+    csi.volume_handle.unwrap()
+}
+
+async fn seed_claim(s: &MemoryStorage, volume: &str) {
+    put(
+        s,
+        "persistentvolumeclaims",
+        Some("ns"),
+        "claim",
+        json!({
+            "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+            "metadata": {"name": "claim", "namespace": "ns", "uid": "claim-uid"},
+            "spec": {"accessModes": ["ReadWriteOnce"], "resources": {}, "volumeName": volume},
+            "status": {"phase": "Bound"}
+        }),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn migrated_in_tree_pv_gets_a_va_for_the_translated_csi_source() {
+    let s = Arc::new(MemoryStorage::new());
+    seed_node(&s, "node-1", None).await;
+    seed_claim(&s, "gce-pv").await;
+    put(&s, "persistentvolumes", None, "gce-pv", gce_pv_json()).await;
+    put(
+        &s,
+        "pods",
+        Some("ns"),
+        "p",
+        pod("p", "node-1", "claim", "Running"),
+    )
+    .await;
+
+    controller(&s).reconcile_all().await.unwrap();
+
+    let handle = translated_gce_pv_handle();
+    let v = vas(&s).await;
+    assert_eq!(v.len(), 1, "a migrated GCE PD must be attached via CSI");
+    assert_eq!(
+        v[0].metadata.name,
+        attachment_name(&handle, GCE_DRIVER, "node-1")
+    );
+    assert_eq!(v[0].spec.attacher, GCE_DRIVER);
+    // regular PV scenario: the PV name, not an inline spec (csi_attacher.go:96-102).
+    assert_eq!(
+        v[0].spec.source.persistent_volume_name.as_deref(),
+        Some("gce-pv")
+    );
+    assert!(v[0].spec.source.inline_volume_spec.is_none());
+
+    // The attachment is recognised as owned on the next pass (no churn).
+    controller(&s).reconcile_all().await.unwrap();
+    assert_eq!(vas(&s).await.len(), 1);
+}
+
+#[tokio::test]
+async fn migrated_in_tree_pv_va_is_detached_once_unused() {
+    let s = Arc::new(MemoryStorage::new());
+    seed_node(&s, "node-1", None).await;
+    seed_claim(&s, "gce-pv").await;
+    put(&s, "persistentvolumes", None, "gce-pv", gce_pv_json()).await;
+    put(
+        &s,
+        "pods",
+        Some("ns"),
+        "p",
+        pod("p", "node-1", "claim", "Running"),
+    )
+    .await;
+    controller(&s).reconcile_all().await.unwrap();
+    assert_eq!(vas(&s).await.len(), 1);
+
+    s.delete(&build_key("pods", Some("ns"), "p")).await.unwrap();
+    controller(&s).reconcile_all().await.unwrap();
+    assert!(
+        vas(&s).await.is_empty(),
+        "populateActualStateOfWorld translates the PV so the VA is owned and detached"
+    );
+}
+
+#[tokio::test]
+async fn migrated_inline_volume_gets_a_va_with_inline_volume_spec() {
+    let s = Arc::new(MemoryStorage::new());
+    seed_node(&s, "node-1", None).await;
+    put(
+        &s,
+        "pods",
+        Some("ns"),
+        "p",
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "ns", "uid": "p-uid"},
+            "spec": {
+                "nodeName": "node-1",
+                "containers": [{"name": "c", "image": "i"}],
+                "volumes": [{"name": "data",
+                    "gcePersistentDisk": {"pdName": "pd-1", "fsType": "ext4"}}]
+            },
+            "status": {"phase": "Running"}
+        }),
+    )
+    .await;
+
+    controller(&s).reconcile_all().await.unwrap();
+
+    let v = vas(&s).await;
+    assert_eq!(
+        v.len(),
+        1,
+        "inline in-tree volume migrates to an attachment"
+    );
+    let inline = v[0]
+        .spec
+        .source
+        .inline_volume_spec
+        .as_ref()
+        .expect("csi_attacher.go:84-92: InlineVolumeSpecForCSIMigration");
+    assert!(v[0].spec.source.persistent_volume_name.is_none());
+    let csi = inline.csi.as_ref().unwrap();
+    assert_eq!(csi.driver, GCE_DRIVER);
+    assert_eq!(v[0].spec.attacher, GCE_DRIVER);
+    assert_eq!(
+        v[0].metadata.name,
+        attachment_name(csi.volume_handle.as_deref().unwrap(), GCE_DRIVER, "node-1")
+    );
+
+    // Pod gone: the inline-source attachment is detached too.
+    s.delete(&build_key("pods", Some("ns"), "p")).await.unwrap();
+    controller(&s).reconcile_all().await.unwrap();
+    assert!(vas(&s).await.is_empty());
+}
+
+#[tokio::test]
+async fn inline_non_migratable_and_inline_csi_volumes_are_never_attached() {
+    let s = Arc::new(MemoryStorage::new());
+    seed_node(&s, "node-1", None).await;
+    put(
+        &s,
+        "pods",
+        Some("ns"),
+        "p",
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "ns", "uid": "p-uid"},
+            "spec": {
+                "nodeName": "node-1",
+                "containers": [{"name": "c", "image": "i"}],
+                "volumes": [
+                    {"name": "e", "emptyDir": {}},
+                    {"name": "c", "csi": {"driver": DRIVER}}
+                ]
+            },
+            "status": {"phase": "Running"}
+        }),
+    )
+    .await;
+    controller(&s).reconcile_all().await.unwrap();
+    assert!(vas(&s).await.is_empty());
+}
