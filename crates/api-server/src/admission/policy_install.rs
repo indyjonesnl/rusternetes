@@ -13,7 +13,11 @@
 
 #![allow(dead_code)]
 
-use std::sync::{Arc, OnceLock};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+
+use futures::StreamExt;
 
 use async_trait::async_trait;
 use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
@@ -22,7 +26,7 @@ use rusternetes_common::Error;
 use rusternetes_discovery::restmapper::{
     new_discovery_rest_mapper, served_group_resources, Gk, PriorityRestMapper, Scope,
 };
-use rusternetes_storage::Storage;
+use rusternetes_storage::{build_prefix, Storage, WatchEvent};
 use serde_json::Value;
 
 use super::policy_dispatch::ParamScope;
@@ -78,8 +82,133 @@ pub fn new_mutating_policy_source(
     )
 }
 
-/// `meta.RESTMapper` over the resources this server serves.
-pub struct DiscoveryRestMapper;
+/// A synchronous snapshot of the CustomResourceDefinitions, kept current by a
+/// storage watch ([`CrdSnapshot::spawn`]); the `RestMapper` trait is sync.
+///
+/// Deviation (stated): upstream's mapper is
+/// `restmapper.NewDeferredDiscoveryRESTMapper(cacheddiscovery.NewMemCacheClient(
+/// kubeClient.Discovery()))` (staging/src/k8s.io/apiserver/pkg/server/options/
+/// admission.go:156-157), which invalidates its cache and retries once on a
+/// `NoMatch` (client-go restmapper/discovery.go `DeferredDiscoveryRESTMapper`).
+/// Here the CRD set is local, so the cache is invalidated by CRD change
+/// (`generation`) instead of by a miss.
+#[derive(Default)]
+pub struct CrdSnapshot {
+    crds: RwLock<BTreeMap<String, Value>>,
+    generation: AtomicU64,
+}
+
+impl CrdSnapshot {
+    /// Insert or replace one CRD and invalidate dependent mappers.
+    pub fn apply(&self, name: &str, crd: Value) {
+        self.crds.write().unwrap().insert(name.to_string(), crd);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Remove one CRD and invalidate dependent mappers.
+    pub fn remove(&self, name: &str) {
+        self.crds.write().unwrap().remove(name);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    fn values(&self) -> Vec<Value> {
+        self.crds.read().unwrap().values().cloned().collect()
+    }
+
+    fn name_of(crd: &Value) -> Option<String> {
+        crd.pointer("/metadata/name")
+            .and_then(|n| n.as_str())
+            .map(str::to_string)
+    }
+
+    /// Watch first, then list, so no event falls between the two (the same
+    /// order as `crdregistration::spawn_crd_event_handlers`); later watch
+    /// events are applied by a background task.
+    pub async fn spawn<S: Storage + 'static>(storage: Arc<S>) -> Arc<Self> {
+        let snapshot = Arc::new(Self::default());
+        let prefix = build_prefix("customresourcedefinitions", None);
+        let mut stream = match storage.watch(&prefix).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("CRD snapshot: cannot watch CRDs: {e}");
+                return snapshot;
+            }
+        };
+        match storage.list::<Value>(&prefix).await {
+            Ok(list) => {
+                for crd in list {
+                    if let Some(name) = Self::name_of(&crd) {
+                        snapshot.apply(&name, crd);
+                    }
+                }
+            }
+            Err(e) => tracing::error!("CRD snapshot: cannot list CRDs: {e}"),
+        }
+        let task = snapshot.clone();
+        tokio::spawn(async move {
+            while let Some(ev) = stream.next().await {
+                let Ok(ev) = ev else { continue };
+                match ev {
+                    WatchEvent::Added(_, v) | WatchEvent::Modified(_, v) => {
+                        let Ok(crd) = serde_json::from_str::<Value>(&v) else {
+                            continue;
+                        };
+                        if let Some(name) = Self::name_of(&crd) {
+                            task.apply(&name, crd);
+                        }
+                    }
+                    WatchEvent::Deleted(_, v) => {
+                        let Ok(crd) = serde_json::from_str::<Value>(&v) else {
+                            continue;
+                        };
+                        if let Some(name) = Self::name_of(&crd) {
+                            task.remove(&name);
+                        }
+                    }
+                }
+            }
+        });
+        snapshot
+    }
+}
+
+/// `meta.RESTMapper` over the resources this server serves: the built-in
+/// groups plus the groups of the established CustomResourceDefinitions
+/// (#3597), so a MAP matching/param kind defined by a CRD resolves.
+///
+/// The mapper is rebuilt only when the CRD set changed.
+#[derive(Default)]
+pub struct DiscoveryRestMapper {
+    crds: Option<Arc<CrdSnapshot>>,
+    cached: Mutex<Option<(u64, Arc<PriorityRestMapper>)>>,
+}
+
+impl DiscoveryRestMapper {
+    pub fn new(crds: Arc<CrdSnapshot>) -> Self {
+        Self {
+            crds: Some(crds),
+            cached: Mutex::new(None),
+        }
+    }
+
+    fn mapper(&self) -> Arc<PriorityRestMapper> {
+        let generation = self.crds.as_ref().map_or(0, |c| c.generation());
+        let mut cached = self.cached.lock().unwrap();
+        if let Some((g, m)) = cached.as_ref() {
+            if *g == generation {
+                return m.clone();
+            }
+        }
+        let crds = self.crds.as_ref().map(|c| c.values()).unwrap_or_default();
+        let m = Arc::new(new_discovery_rest_mapper(&served_group_resources(&crds)));
+        *cached = Some((generation, m.clone()));
+        m
+    }
+}
 
 impl RestMapper for DiscoveryRestMapper {
     /// `RESTMapping(GroupKind, version)`: a kind that is not served is
@@ -89,8 +218,7 @@ impl RestMapper for DiscoveryRestMapper {
     /// (`restmapper.NewDiscoveryRESTMapper`, #3519), so this and the
     /// custom.metrics handler share one kind -> resource path.
     fn rest_mapping(&self, group: &str, kind: &str, version: &str) -> Result<RestMapping, String> {
-        static MAPPER: OnceLock<PriorityRestMapper> = OnceLock::new();
-        let mapper = MAPPER.get_or_init(|| new_discovery_rest_mapper(&served_group_resources(&[])));
+        let mapper = self.mapper();
         let mapping = mapper
             .rest_mapping(&Gk::new(group, kind), &[version])
             .map_err(|e| e.to_string())?;
@@ -292,7 +420,7 @@ mod tests {
             Arc::new(StorageParamInformerFactory::new(storage.clone(), |_| {
                 String::new()
             })),
-            Arc::new(DiscoveryRestMapper),
+            Arc::new(DiscoveryRestMapper::default()),
         );
         let tasks = [
             tokio::spawn(policies.run(storage.clone())),
@@ -325,7 +453,7 @@ mod tests {
 
     #[test]
     fn rest_mapper_resolves_namespaced_and_cluster_kinds() {
-        let m = DiscoveryRestMapper;
+        let m = DiscoveryRestMapper::default();
         let cm = m.rest_mapping("", "ConfigMap", "v1").unwrap();
         assert_eq!(cm.resource.resource, "configmaps");
         assert_eq!(cm.resource.version, "v1");
@@ -341,21 +469,86 @@ mod tests {
     #[test]
     fn rest_mapper_unknown_kind_is_an_error() {
         // NoKindMatchError.
-        assert!(DiscoveryRestMapper
-            .rest_mapping("example.com", "Widget", "v1")
-            .is_err());
-        assert!(DiscoveryRestMapper.rest_mapping("", "Nope", "v1").is_err());
+        let m = DiscoveryRestMapper::default();
+        assert!(m.rest_mapping("example.com", "Widget", "v1").is_err());
+        assert!(m.rest_mapping("", "Nope", "v1").is_err());
         // errors.go:106-120 NoKindMatchError, one searched version.
         assert_eq!(
-            DiscoveryRestMapper
-                .rest_mapping("apps", "Nope", "v1")
-                .unwrap_err(),
+            m.rest_mapping("apps", "Nope", "v1").unwrap_err(),
             r#"no matches for kind "Nope" in version "apps/v1""#
         );
         // A version the group does not serve does not match.
-        assert!(DiscoveryRestMapper
-            .rest_mapping("apps", "Deployment", "v9")
-            .is_err());
+        assert!(m.rest_mapping("apps", "Deployment", "v9").is_err());
+    }
+
+    fn widget_crd(established: bool, scope: &str) -> Value {
+        serde_json::json!({
+            "metadata": {"name": "widgets.example.com"},
+            "spec": {
+                "group": "example.com",
+                "scope": scope,
+                "names": {"plural": "widgets", "singular": "widget", "kind": "Widget"},
+                "versions": [{"name": "v1", "served": true, "storage": true}],
+            },
+            "status": {"conditions": [{
+                "type": "Established",
+                "status": if established { "True" } else { "False" },
+            }]},
+        })
+    }
+
+    // #3597: a MAP matching/param kind defined by a CRD resolves instead of
+    // NoKindMatchError, and the mapper follows CRD changes.
+    #[test]
+    fn rest_mapper_resolves_established_crd_kinds_and_follows_changes() {
+        let crds = Arc::new(CrdSnapshot::default());
+        let m = DiscoveryRestMapper::new(crds.clone());
+        assert!(m.rest_mapping("example.com", "Widget", "v1").is_err());
+
+        crds.apply("widgets.example.com", widget_crd(true, "Namespaced"));
+        let w = m.rest_mapping("example.com", "Widget", "v1").unwrap();
+        assert_eq!(w.resource.resource, "widgets");
+        assert_eq!(w.scope, ParamScope::Namespace);
+
+        // Scope change is picked up (cache invalidated on CRD change).
+        crds.apply("widgets.example.com", widget_crd(true, "Cluster"));
+        assert_eq!(
+            m.rest_mapping("example.com", "Widget", "v1").unwrap().scope,
+            ParamScope::Root
+        );
+
+        // Not-yet-established CRDs are not served (discovery parity).
+        crds.apply("widgets.example.com", widget_crd(false, "Cluster"));
+        assert!(m.rest_mapping("example.com", "Widget", "v1").is_err());
+
+        crds.apply("widgets.example.com", widget_crd(true, "Cluster"));
+        crds.remove("widgets.example.com");
+        assert!(m.rest_mapping("example.com", "Widget", "v1").is_err());
+        // Built-ins are unaffected.
+        assert!(m.rest_mapping("apps", "Deployment", "v1").is_ok());
+    }
+
+    #[tokio::test]
+    async fn crd_snapshot_tracks_storage() {
+        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let crds = CrdSnapshot::spawn(storage.clone()).await;
+        let m = DiscoveryRestMapper::new(crds.clone());
+        storage
+            .create(
+                &rusternetes_storage::build_key(
+                    "customresourcedefinitions",
+                    None,
+                    "widgets.example.com",
+                ),
+                &widget_crd(true, "Namespaced"),
+            )
+            .await
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while m.rest_mapping("example.com", "Widget", "v1").is_err() {
+            assert!(std::time::Instant::now() < deadline, "CRD never observed");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]
