@@ -11,15 +11,20 @@
 //! two plugins, with `translateTopologyFromCSIToInTree` /
 //! `regionTopologyHandler` (`in_tree_volume.go:275-397`).
 //!
-//! NOT ported: `TranslateInTreeInlineVolumeToCSI` (tracked follow-up; the pod
-//! `volumes[]` legacy sources are still opaque JSON).
+//! `TranslateInTreeInlineVolumeToCSI` (`translate.go:67-90`), with
+//! `IsInlineMigratable` (`:196-204`) and the volume branch of
+//! `GetInTreePluginNameFromSpec` (`:145-164`), is ported for the same two
+//! plugins (`gce_pd.go:166-202`, `aws_ebs.go:104-135`).
 
+use crate::resources::pod::Volume;
+use crate::resources::volume::PersistentVolumeMode;
 use crate::resources::volume::{
     AWSElasticBlockStoreVolumeSource, CSIVolumeSource, GCEPersistentDiskVolumeSource, NodeSelector,
     NodeSelectorRequirement, NodeSelectorTerm, PersistentVolumeAccessMode, StorageClass,
     TopologySelectorLabelRequirement, TopologySelectorTerm, VolumeNodeAffinity,
 };
 use crate::resources::PersistentVolume;
+use crate::types::ObjectMeta;
 use std::collections::{BTreeSet, HashMap};
 
 /// `GCEPDDriverName` (`gce_pd.go:33`).
@@ -56,7 +61,16 @@ trait InTreePlugin {
     /// `TranslateCSIPVToInTree` (`in_tree_volume.go:48-51`): input is
     /// already a private copy and may be modified.
     fn translate_csi_pv_to_in_tree(&self, pv: &mut PersistentVolume) -> Result<(), String>;
+    /// `TranslateInTreeInlineVolumeToCSI` (`in_tree_volume.go:38-42`): wraps
+    /// the inline source's CSI translation in a new PV.
+    fn translate_in_tree_inline_volume_to_csi(
+        &self,
+        volume: &Volume,
+        pod_namespace: &str,
+    ) -> Result<PersistentVolume, String>;
     fn can_support(&self, pv: &PersistentVolume) -> bool;
+    /// `CanSupportInline` (`in_tree_volume.go:57-59`).
+    fn can_support_inline(&self, volume: &Volume) -> bool;
     fn in_tree_plugin_name(&self) -> &'static str;
     fn csi_plugin_name(&self) -> &'static str;
     fn repair_volume_handle(&self, volume_handle: &str, node_id: &str) -> Result<String, String>;
@@ -94,6 +108,63 @@ impl CsiTranslator {
             "could not find in-tree plugin translation logic for {:?}",
             copied.metadata.name
         ))
+    }
+
+    /// `TranslateInTreeInlineVolumeToCSI` (`translate.go:67-90`). Inline
+    /// volumes only support `Filesystem` (not block), so a VolumeMode the
+    /// plugin left unset is set to Filesystem here: the default PV
+    /// initialization that populates it does not apply to inline volumes.
+    pub fn translate_in_tree_inline_volume_to_csi(
+        &self,
+        volume: &Volume,
+        pod_namespace: &str,
+    ) -> Result<PersistentVolume, String> {
+        for plugin in in_tree_plugins() {
+            if plugin.can_support_inline(volume) {
+                let mut pv =
+                    plugin.translate_in_tree_inline_volume_to_csi(volume, pod_namespace)?;
+                if pv.spec.volume_mode.is_none() {
+                    pv.spec.volume_mode = Some(PersistentVolumeMode::Filesystem);
+                }
+                return Ok(pv);
+            }
+        }
+        Err(format!(
+            "could not find in-tree plugin translation logic for {:?}",
+            volume.name
+        ))
+    }
+
+    /// `IsInlineMigratable` (`translate.go:196-204`).
+    pub fn is_inline_migratable(&self, volume: &Volume) -> bool {
+        in_tree_plugins()
+            .iter()
+            .any(|p| p.can_support_inline(volume))
+    }
+
+    /// `GetInTreePluginNameFromSpec` (`translate.go:145-164`): the PV is
+    /// consulted when given, else the inline volume.
+    pub fn get_in_tree_plugin_name_from_spec(
+        &self,
+        pv: Option<&PersistentVolume>,
+        volume: Option<&Volume>,
+    ) -> Result<String, String> {
+        if let Some(pv) = pv {
+            return self.get_in_tree_plugin_name_from_pv(pv);
+        }
+        let Some(volume) = volume else {
+            return Err("both persistent volume and volume are nil".to_string());
+        };
+        in_tree_plugins()
+            .iter()
+            .find(|p| p.can_support_inline(volume))
+            .map(|p| p.in_tree_plugin_name().to_string())
+            .ok_or_else(|| {
+                format!(
+                    "could not find in-tree plugin name from volume {}",
+                    volume.name
+                )
+            })
     }
 
     /// `TranslateCSIPVToInTree` (`translate.go:116-128`): the plugin is
@@ -613,6 +684,20 @@ fn backward_compatible_access_modes(
     }
 }
 
+/// The PV an inline translation returns: upstream sets only `ObjectMeta.Name`
+/// (`gce_pd.go:186-190`, `aws_ebs.go:113-118`), no TypeMeta, uid or timestamp.
+fn inline_pv(name: String) -> PersistentVolume {
+    PersistentVolume {
+        type_meta: Default::default(),
+        metadata: ObjectMeta {
+            name,
+            ..Default::default()
+        },
+        spec: Default::default(),
+        status: None,
+    }
+}
+
 /// `gceGetRegionFromZones` (`gce_pd.go:380-400`).
 fn gce_get_region_from_zones(zones: &[&str]) -> Result<String, String> {
     if zones.is_empty() {
@@ -754,6 +839,51 @@ impl InTreePlugin for GcePersistentDiskTranslator {
     /// `CanSupport` (`gce_pd.go:317-319`).
     fn can_support(&self, pv: &PersistentVolume) -> bool {
         pv.spec.gce_persistent_disk.is_some()
+    }
+
+    /// `CanSupportInline` (`gce_pd.go:316-318`).
+    fn can_support_inline(&self, volume: &Volume) -> bool {
+        volume.legacy_sources.gce_persistent_disk.is_some()
+    }
+
+    /// `TranslateInTreeInlineVolumeToCSI` (`gce_pd.go:166-202`). The handle
+    /// is always zone-unspecified: an inline volume carries no zone labels.
+    fn translate_in_tree_inline_volume_to_csi(
+        &self,
+        volume: &Volume,
+        _pod_namespace: &str,
+    ) -> Result<PersistentVolume, String> {
+        let Some(pd_source) = volume.legacy_sources.gce_persistent_disk.as_ref() else {
+            return Err("volume is nil or GCE PD not defined on volume".into());
+        };
+        let partition = match pd_source.partition {
+            Some(p) if p != 0 => p.to_string(),
+            _ => String::new(),
+        };
+        let read_only = pd_source.read_only.unwrap_or(false);
+        let am = if read_only {
+            PersistentVolumeAccessMode::ReadOnlyMany
+        } else {
+            PersistentVolumeAccessMode::ReadWriteOnce
+        };
+        let csi = CSIVolumeSource {
+            driver: GCE_PD_DRIVER_NAME.to_string(),
+            volume_handle: Some(format!(
+                "projects/{UNSPECIFIED_VALUE}/zones/{UNSPECIFIED_VALUE}/disks/{}",
+                pd_source.pd_name
+            )),
+            read_only: Some(read_only).filter(|r| *r),
+            fs_type: pd_source.fs_type.clone(),
+            volume_attributes: Some(HashMap::from([("partition".to_string(), partition)])),
+            ..Default::default()
+        };
+        // Must be unique per disk as it is used as the unique part of the
+        // staging path
+        let mut pv = inline_pv(format!("{GCE_PD_DRIVER_NAME}-{}", pd_source.pd_name));
+        pv.spec.csi = Some(csi);
+        pv.spec.access_modes = vec![am];
+        pv.spec.volume_mode = Some(PersistentVolumeMode::Filesystem);
+        Ok(pv)
     }
 
     fn in_tree_plugin_name(&self) -> &'static str {
@@ -942,6 +1072,41 @@ impl InTreePlugin for AwsElasticBlockStoreTranslator {
     /// `CanSupport` (`aws_ebs.go:206-208`).
     fn can_support(&self, pv: &PersistentVolume) -> bool {
         pv.spec.aws_elastic_block_store.is_some()
+    }
+
+    /// `CanSupportInline` (`aws_ebs.go:213-215`).
+    fn can_support_inline(&self, volume: &Volume) -> bool {
+        volume.legacy_sources.aws_elastic_block_store.is_some()
+    }
+
+    /// `TranslateInTreeInlineVolumeToCSI` (`aws_ebs.go:104-135`). Unlike GCE
+    /// PD it leaves `VolumeMode` unset; the dispatcher fills it in.
+    fn translate_in_tree_inline_volume_to_csi(
+        &self,
+        volume: &Volume,
+        _pod_namespace: &str,
+    ) -> Result<PersistentVolume, String> {
+        let Some(ebs_source) = volume.legacy_sources.aws_elastic_block_store.as_ref() else {
+            return Err("volume is nil or AWS EBS not defined on volume".into());
+        };
+        let volume_handle = kubernetes_volume_id_to_ebs_volume_id(&ebs_source.volume_id)
+            .map_err(|e| format!("failed to translate Kubernetes ID to EBS Volume ID {e}"))?;
+        // Must be unique per disk as it is used as the unique part of the
+        // staging path
+        let mut pv = inline_pv(format!("{AWS_EBS_DRIVER_NAME}-{volume_handle}"));
+        pv.spec.csi = Some(CSIVolumeSource {
+            driver: AWS_EBS_DRIVER_NAME.to_string(),
+            volume_handle: Some(volume_handle),
+            read_only: ebs_source.read_only.filter(|r| *r),
+            fs_type: ebs_source.fs_type.clone(),
+            volume_attributes: Some(HashMap::from([(
+                "partition".to_string(),
+                ebs_source.partition.unwrap_or(0).to_string(),
+            )])),
+            ..Default::default()
+        });
+        pv.spec.access_modes = vec![PersistentVolumeAccessMode::ReadWriteOnce];
+        Ok(pv)
     }
 
     fn in_tree_plugin_name(&self) -> &'static str {
@@ -1792,6 +1957,246 @@ mod tests {
         assert_eq!(
             t.translate_csi_pv_to_in_tree(&pv).unwrap_err(),
             "could not find in-tree plugin translation logic for other.csi"
+        );
+    }
+
+    // ---- TranslateInTreeInlineVolumeToCSI (`translate.go:67-90`) ---------
+
+    fn inline(src: serde_json::Value) -> Volume {
+        serde_json::from_value(src).unwrap()
+    }
+
+    /// `TestInlineReadOnly` (`plugins/gce_pd_test.go:270-301`).
+    #[test]
+    fn gce_inline_read_only_is_read_only_many() {
+        let vol = inline(serde_json::json!({
+            "name": "", "gcePersistentDisk": {"pdName": "foo", "readOnly": true}
+        }));
+        let pv = GcePersistentDiskTranslator
+            .translate_in_tree_inline_volume_to_csi(&vol, "")
+            .unwrap();
+        let csi = pv.spec.csi.as_ref().expect("CSI source");
+        assert_eq!(csi.read_only, Some(true), "PV readonly value not true");
+        assert_eq!(
+            pv.spec.access_modes,
+            vec![PersistentVolumeAccessMode::ReadOnlyMany]
+        );
+    }
+
+    /// `gcePersistentDiskCSITranslator.TranslateInTreeInlineVolumeToCSI`
+    /// (`plugins/gce_pd.go:166-202`): name, unspecified-zone handle, the
+    /// partition attribute (empty for 0), RWO and Filesystem.
+    #[test]
+    fn gce_inline_translates_to_csi_pv() {
+        let t = CsiTranslator::new();
+        let vol = inline(serde_json::json!({
+            "name": "v", "gcePersistentDisk": {"pdName": "disk1", "fsType": "ext4"}
+        }));
+        let pv = t
+            .translate_in_tree_inline_volume_to_csi(&vol, "ns")
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&pv.spec).unwrap(),
+            serde_json::json!({
+                "accessModes": ["ReadWriteOnce"],
+                "volumeMode": "Filesystem",
+                "csi": {
+                    "driver": "pd.csi.storage.gke.io",
+                    "volumeHandle": "projects/UNSPECIFIED/zones/UNSPECIFIED/disks/disk1",
+                    "fsType": "ext4",
+                    "volumeAttributes": {"partition": ""},
+                },
+            })
+        );
+        assert_eq!(pv.metadata.name, "pd.csi.storage.gke.io-disk1");
+
+        let vol = inline(serde_json::json!({
+            "name": "v", "gcePersistentDisk": {"pdName": "disk1", "partition": 3}
+        }));
+        let pv = t.translate_in_tree_inline_volume_to_csi(&vol, "").unwrap();
+        let attrs = pv.spec.csi.unwrap().volume_attributes.unwrap();
+        assert_eq!(attrs.get("partition").map(String::as_str), Some("3"));
+    }
+
+    /// `TestTranslateInTreeInlineVolumeToCSI` (`plugins/aws_ebs_test.go:134-212`).
+    #[test]
+    fn ebs_inline_translation_matches_upstream_table() {
+        const NORMAL: &str = "vol-02399794d890f9375";
+        let cases: [(&str, serde_json::Value, Option<&str>); 5] = [
+            (
+                "Normal ID format",
+                serde_json::json!({"awsElasticBlockStore": {"volumeID": NORMAL}}),
+                Some("ebs.csi.aws.com-vol-02399794d890f9375"),
+            ),
+            (
+                "aws:///{volumeId} format",
+                serde_json::json!({"awsElasticBlockStore":
+                    {"volumeID": "aws:///vol-02399794d890f9375"}}),
+                Some("ebs.csi.aws.com-vol-02399794d890f9375"),
+            ),
+            (
+                "aws://{zone}/{volumeId} format",
+                serde_json::json!({"awsElasticBlockStore":
+                    {"volumeID": "aws://us-west-2a/vol-02399794d890f9375"}}),
+                Some("ebs.csi.aws.com-vol-02399794d890f9375"),
+            ),
+            (
+                "fails on invalid volume ID",
+                serde_json::json!({"awsElasticBlockStore":
+                    {"volumeID": "aws://us-west-2a/02399794d890f9375"}}),
+                None,
+            ),
+            ("fails on empty volume source", serde_json::json!({}), None),
+        ];
+        for (name, mut src, exp_pv_name) in cases {
+            src["name"] = "volume".into();
+            let got = AwsElasticBlockStoreTranslator
+                .translate_in_tree_inline_volume_to_csi(&inline(src), "");
+            match (got, exp_pv_name) {
+                (Ok(pv), Some(exp)) => {
+                    assert_eq!(pv.metadata.name, exp, "{name}");
+                    assert_eq!(
+                        pv.spec.csi.unwrap().volume_handle.as_deref(),
+                        Some(NORMAL),
+                        "{name}"
+                    );
+                }
+                (Err(_), None) => {}
+                (got, _) => panic!("{name}: unexpected {got:?}"),
+            }
+        }
+    }
+
+    /// `awsElasticBlockStoreCSITranslator.TranslateInTreeInlineVolumeToCSI`
+    /// (`plugins/aws_ebs.go:104-135`) leaves `VolumeMode` unset; the
+    /// dispatcher (`translate.go:77-85`) fills in Filesystem. The partition
+    /// attribute is always the decimal number, "0" included.
+    #[test]
+    fn ebs_inline_volume_mode_defaults_to_filesystem_in_dispatcher() {
+        let vol = inline(serde_json::json!({
+            "name": "v",
+            "awsElasticBlockStore": {"volumeID": "vol-1", "fsType": "ext3", "readOnly": true}
+        }));
+        let direct = AwsElasticBlockStoreTranslator
+            .translate_in_tree_inline_volume_to_csi(&vol, "")
+            .unwrap();
+        assert!(direct.spec.volume_mode.is_none());
+        let pv = CsiTranslator::new()
+            .translate_in_tree_inline_volume_to_csi(&vol, "")
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&pv.spec).unwrap(),
+            serde_json::json!({
+                "accessModes": ["ReadWriteOnce"],
+                "volumeMode": "Filesystem",
+                "csi": {
+                    "driver": "ebs.csi.aws.com",
+                    "volumeHandle": "vol-1",
+                    "readOnly": true,
+                    "fsType": "ext3",
+                    "volumeAttributes": {"partition": "0"},
+                },
+            })
+        );
+        assert_eq!(
+            AwsElasticBlockStoreTranslator
+                .translate_in_tree_inline_volume_to_csi(
+                    &inline(serde_json::json!({"name": "v", "awsElasticBlockStore":
+                        {"volumeID": "aws://us-west-2a/bad"}})),
+                    ""
+                )
+                .unwrap_err(),
+            "failed to translate Kubernetes ID to EBS Volume ID \
+             Invalid format for AWS volume (aws://us-west-2a/bad)"
+        );
+        assert_eq!(
+            GcePersistentDiskTranslator
+                .translate_in_tree_inline_volume_to_csi(
+                    &inline(serde_json::json!({"name": "v"})),
+                    ""
+                )
+                .unwrap_err(),
+            "volume is nil or GCE PD not defined on volume"
+        );
+        assert_eq!(
+            AwsElasticBlockStoreTranslator
+                .translate_in_tree_inline_volume_to_csi(
+                    &inline(serde_json::json!({"name": "v"})),
+                    ""
+                )
+                .unwrap_err(),
+            "volume is nil or AWS EBS not defined on volume"
+        );
+    }
+
+    /// `TestTranslateInTreeInlineVolumeToCSINameUniqueness`
+    /// (`translate_test.go:369-403`), GCE PD and AWS EBS rows.
+    #[test]
+    fn inline_translation_names_are_unique_per_volume() {
+        let t = CsiTranslator::new();
+        for (field, key) in [
+            ("gcePersistentDisk", "pdName"),
+            ("awsElasticBlockStore", "volumeID"),
+        ] {
+            let mk = |id: &str| {
+                let mut src = serde_json::json!({"name": ""});
+                src[field] = serde_json::json!({ key: id });
+                t.translate_in_tree_inline_volume_to_csi(&inline(src), "")
+                    .unwrap()
+            };
+            let pv1 = mk("2a1f0c5e-0b7e-4d6a-9c1e-6f3a4b5c6d7e");
+            let pv2 = mk("9b8c7d6e-5f4a-4b3c-8d2e-1f0a9b8c7d6e");
+            assert_ne!(
+                pv1.metadata.name, pv2.metadata.name,
+                "PV name {} not sufficiently unique for different volumes",
+                pv1.metadata.name
+            );
+        }
+    }
+
+    /// `TranslateInTreeInlineVolumeToCSI` with no supporting plugin, plus
+    /// `IsInlineMigratable` (`translate.go:196-204`) and the volume branch of
+    /// `GetInTreePluginNameFromSpec` (`translate.go:145-164`).
+    #[test]
+    fn inline_dispatch_migratable_and_plugin_name() {
+        let t = CsiTranslator::new();
+        let empty = inline(serde_json::json!({"name": "scratch", "emptyDir": {}}));
+        assert_eq!(
+            t.translate_in_tree_inline_volume_to_csi(&empty, "")
+                .unwrap_err(),
+            "could not find in-tree plugin translation logic for \"scratch\""
+        );
+        assert!(!t.is_inline_migratable(&empty));
+        assert_eq!(
+            t.get_in_tree_plugin_name_from_spec(None, Some(&empty))
+                .unwrap_err(),
+            "could not find in-tree plugin name from volume scratch"
+        );
+
+        let gce = inline(serde_json::json!({"name": "g", "gcePersistentDisk": {"pdName": "d"}}));
+        let ebs =
+            inline(serde_json::json!({"name": "e", "awsElasticBlockStore": {"volumeID": "vol-1"}}));
+        assert!(t.is_inline_migratable(&gce));
+        assert!(t.is_inline_migratable(&ebs));
+        assert_eq!(
+            t.get_in_tree_plugin_name_from_spec(None, Some(&gce))
+                .unwrap(),
+            GCE_PD_IN_TREE_PLUGIN_NAME
+        );
+        assert_eq!(
+            t.get_in_tree_plugin_name_from_spec(None, Some(&ebs))
+                .unwrap(),
+            AWS_EBS_IN_TREE_PLUGIN_NAME
+        );
+        // The PV branch wins when both are given.
+        assert_eq!(
+            t.get_in_tree_plugin_name_from_spec(Some(&ebs_pv("vol-1")), Some(&gce))
+                .unwrap(),
+            AWS_EBS_IN_TREE_PLUGIN_NAME
+        );
+        assert_eq!(
+            t.get_in_tree_plugin_name_from_spec(None, None).unwrap_err(),
+            "both persistent volume and volume are nil"
         );
     }
 }
