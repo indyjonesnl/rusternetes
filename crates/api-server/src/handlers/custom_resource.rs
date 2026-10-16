@@ -286,7 +286,12 @@ pub async fn list_custom_resources(
         crate::handlers::list_options::list_items(&*state.storage, &prefix, &params).await?;
 
     // Apply schema defaults on read (K8s "defaulting on read")
+    let strategy = crate::registry::apiextensions::customresource::Strategy::new(
+        std::sync::Arc::new((*crd).clone()),
+        &version,
+    );
     for cr in &mut crs {
+        strategy.decode_stored(cr);
         apply_schema_defaults(&crd, &version, cr);
     }
 
