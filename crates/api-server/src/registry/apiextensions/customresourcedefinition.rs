@@ -107,6 +107,11 @@ fn schema_rule_errors_in(
     let preexisting = old
         .map(|o| crate::handlers::cel_validation::find_preexisting_expressions(&o.spec))
         .unwrap_or_default();
+    // `findVersionsWithUnchangedSchemas(obj, oldObj)` (validation.go:242);
+    // empty on create.
+    let unchanged = old
+        .map(|o| versions_with_unchanged_schemas(crd, o))
+        .unwrap_or_default();
     let mut errs = Vec::new();
     for (i, version) in crd.spec.versions.iter().enumerate() {
         let Some(validation) = &version.schema else {
@@ -121,9 +126,37 @@ fn schema_rule_errors_in(
                 .child("openAPIV3Schema"),
             env_set,
             &preexisting,
+            // `suppressExpressionCostForUnchangedSchema` (validation.go:219-226).
+            unchanged.contains(&version.name),
         ));
     }
     errs
+}
+
+/// `findVersionsWithUnchangedSchemas` (apiextensions validation.go:197-217):
+/// each version of `obj` whose schema equals the one the old object has for
+/// the same version name. (`GetSchemaForVersion`'s fallback to the
+/// deprecated top-level `spec.validation` is v1-only and not modelled.)
+fn versions_with_unchanged_schemas(
+    obj: &CustomResourceDefinition,
+    old: &CustomResourceDefinition,
+) -> std::collections::HashSet<String> {
+    let schema_of = |crd: &CustomResourceDefinition, name: &str| {
+        crd.spec
+            .versions
+            .iter()
+            .find(|v| v.name == name)
+            .map(|v| serde_json::to_value(&v.schema).ok())
+    };
+    obj.spec
+        .versions
+        .iter()
+        .filter(|v| {
+            matches!((schema_of(obj, &v.name), schema_of(old, &v.name)),
+                (Some(a), Some(b)) if a == b)
+        })
+        .map(|v| v.name.clone())
+        .collect()
 }
 
 /// `supportedVersionedFormats` (apiserver/validation/formats.go:32-71) as
@@ -2268,5 +2301,210 @@ mod tests {
         })
         .await;
         assert_eq!(same, Err(Error::Internal("boom".into()).to_string()));
+    }
+
+    fn root_rules(rules: serde_json::Value, props: serde_json::Value) -> CustomResourceDefinition {
+        crd_with_schema(serde_json::json!({"type": "object",
+            "x-kubernetes-validations": rules, "properties": props}))
+    }
+
+    fn errs_at(c: &CustomResourceDefinition) -> Vec<(String, String)> {
+        fields(&schema_rule_errors_in(c, None, &env_1_32()))
+    }
+
+    fn at(kind: &str, path: &str) -> (String, String) {
+        (kind.to_string(), format!("{P}.{path}"))
+    }
+
+    /// validation_test.go:9951-9988 ("invalid and required messages") via
+    /// validation.go:1236-1241.
+    #[test]
+    fn schema_message_checks() {
+        let c = crd_with_schema(serde_json::json!({"type": "object", "properties": {
+            "value": {"type": "integer", "x-kubernetes-validations": [
+                {"rule": "self >= 0 &&\nself <= 100"},
+                {"rule": "self == 50", "message": "value requirements:\nmust be >= 0\nmust be <= 100 "},
+                {"rule": "self == 50", "message": " "},
+                {"rule": "self >= 0 &&\nself <= 100", "message": "ok"}]}}}));
+        assert_eq!(
+            errs_at(&c),
+            vec![
+                at(
+                    "Invalid",
+                    "properties[value].x-kubernetes-validations[1].message"
+                ),
+                at(
+                    "Invalid",
+                    "properties[value].x-kubernetes-validations[2].message"
+                ),
+                at(
+                    "Required",
+                    "properties[value].x-kubernetes-validations[0].message"
+                ),
+            ]
+        );
+    }
+
+    /// validation.go:1234-1235: an empty rule is a Required schema error.
+    #[test]
+    fn schema_empty_rule_is_required() {
+        let c = root_rules(
+            serde_json::json!([{"rule": "  "}, {"message": "m"}]),
+            serde_json::json!({}),
+        );
+        let errs = schema_rule_errors_in(&c, None, &env_1_32());
+        assert_eq!(
+            fields(&errs),
+            vec![
+                at("Required", "x-kubernetes-validations[0].rule"),
+                at("Required", "x-kubernetes-validations[1].rule"),
+            ]
+        );
+        assert_eq!(errs[0].detail, "rule is not specified");
+    }
+
+    /// validation_test.go:4208-4270: validation.go:1246-1248.
+    #[test]
+    fn schema_reason_must_be_supported() {
+        let c = crd_with_schema(serde_json::json!({"type": "object",
+            "x-kubernetes-validations": [{"rule": "self.a > 0", "reason": "InternalError", "fieldPath": ".a"}],
+            "properties": {"a": {"type": "number", "x-kubernetes-validations": [
+                {"rule": "true", "reason": "FieldValueRequired"},
+                {"rule": "true", "reason": "FieldValueInvalid"},
+                {"rule": "true", "reason": "FieldValueDuplicate"},
+                {"rule": "true", "reason": "FieldValueForbidden"}]}}}));
+        let errs = schema_rule_errors_in(&c, None, &env_1_32());
+        assert_eq!(
+            fields(&errs),
+            vec![at("NotSupported", "x-kubernetes-validations[0].reason")]
+        );
+    }
+
+    fn field_path_crd(paths: &[&str], props: serde_json::Value) -> CustomResourceDefinition {
+        let rules: Vec<_> = paths
+            .iter()
+            .map(|p| serde_json::json!({"rule": "true", "fieldPath": p}))
+            .collect();
+        root_rules(serde_json::Value::Array(rules), props)
+    }
+
+    /// validation_test.go:4271-4358 (`pathValid`, validation.go:1249-1259,
+    /// 1324-1331): `ValidFieldPath` with array notation allowed.
+    #[test]
+    fn schema_field_path_valid_and_invalid() {
+        let c = field_path_crd(
+            &[
+                ".foo['b.c']['c\\a']",
+                "['a.c']",
+                ".a.c",
+                ".list[0]",
+                "   ",
+                ".",
+                "..",
+            ],
+            serde_json::json!({
+                "a.c": {"type": "number"},
+                "foo": {"type": "object", "properties": {"b.c": {"type": "object",
+                    "properties": {"c\u{7}": {"type": "number"}}}}},
+                "list": {"type": "array", "items": {"type": "object",
+                    "properties": {"a": {"type": "number"}}}}}),
+        );
+        assert_eq!(
+            errs_at(&c),
+            vec![
+                at("Invalid", "x-kubernetes-validations[2].fieldPath"),
+                at("Invalid", "x-kubernetes-validations[3].fieldPath"),
+                at("Invalid", "x-kubernetes-validations[4].fieldPath"),
+                at("Invalid", "x-kubernetes-validations[4].fieldPath"),
+                at("Invalid", "x-kubernetes-validations[5].fieldPath"),
+                at("Invalid", "x-kubernetes-validations[6].fieldPath"),
+            ]
+        );
+    }
+
+    /// validation_test.go:4359-4444.
+    #[test]
+    fn schema_field_path_against_nested_properties() {
+        let c = field_path_crd(
+            &[".list[0].b", ".list[0.b", ".list0].b", ".a.c", ".a.b.d"],
+            serde_json::json!({
+                "a": {"type": "object", "properties": {"b": {"type": "object",
+                    "properties": {"c": {"type": "number"}}}}},
+                "list": {"type": "array", "items": {"type": "object",
+                    "properties": {"a": {"type": "number"}}}}}),
+        );
+        assert_eq!(errs_at(&c).len(), 5, "{:?}", errs_at(&c));
+    }
+
+    /// validation.go:1253-1255 (line breaks in fieldPath).
+    #[test]
+    fn schema_field_path_line_breaks() {
+        let c = field_path_crd(&[".a\n"], serde_json::json!({"a": {"type": "number"}}));
+        let errs = schema_rule_errors_in(&c, None, &env_1_32());
+        assert!(
+            errs.iter()
+                .any(|e| e.detail == "must not contain line breaks"),
+            "{errs:?}"
+        );
+    }
+
+    /// Schema errors skip CEL compilation (validation.go:1264-1268): the
+    /// semver rule beside a bad reason is not reported.
+    #[test]
+    fn schema_errors_skip_cel_compile() {
+        let c = root_rules(
+            serde_json::json!([{"rule": SEMVER_RULE, "reason": "Bogus"}]),
+            serde_json::json!({}),
+        );
+        assert_eq!(
+            errs_at(&c),
+            vec![at("NotSupported", "x-kubernetes-validations[0].reason")]
+        );
+    }
+
+    const EXPENSIVE: &str = "self.all(a, self.all(b, self.all(c, true)))";
+
+    fn crd_two_versions(v1_extra: &str, v2_rule: &str) -> CustomResourceDefinition {
+        let schema = |rule: &str, extra: &str| {
+            serde_json::json!({"openAPIV3Schema": {"type": "array",
+                "items": {"type": "string"}, "description": extra,
+                "x-kubernetes-validations": [{"rule": rule}]}})
+        };
+        crd(serde_json::json!({"spec": {
+            "group": "example.com",
+            "scope": "Namespaced",
+            "names": {"plural": "widgets", "kind": "Widget"},
+            "versions": [
+                {"name": "v1", "served": true, "storage": true, "schema": schema(EXPENSIVE, v1_extra)},
+                {"name": "v2", "served": true, "storage": false, "schema": schema(v2_rule, "")}]
+        }}))
+    }
+
+    /// validation.go:197-226, 1281: a version whose schema is unchanged skips
+    /// the per-expression cost check on update (and only that version).
+    #[test]
+    fn update_suppresses_cost_for_unchanged_schema_only() {
+        let env = env_1_32();
+        let old = crd_two_versions("", "true");
+        // Create: budget enforced.
+        assert!(!schema_rule_errors_in(&old, None, &env).is_empty());
+        // Update, nothing changed: suppressed.
+        assert!(schema_rule_errors_in(&old, Some(&old), &env).is_empty());
+        // v1 schema changed: enforced again, only for v1.
+        let changed = crd_two_versions("changed", "true");
+        let errs = schema_rule_errors_in(&changed, Some(&old), &env);
+        assert_eq!(
+            fields(&errs),
+            vec![(
+                "Forbidden".to_string(),
+                "spec.versions[0].schema.openAPIV3Schema.x-kubernetes-validations[0].rule"
+                    .to_string()
+            )]
+        );
+        // v2 changed to an expensive rule: enforced for v2 only.
+        let changed2 = crd_two_versions("", EXPENSIVE);
+        let errs = schema_rule_errors_in(&changed2, Some(&old), &env);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].field.starts_with("spec.versions[1]"), "{errs:?}");
     }
 }

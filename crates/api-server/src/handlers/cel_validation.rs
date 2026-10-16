@@ -35,6 +35,15 @@ use std::collections::HashSet;
 /// Default per-rule estimated cost budget (K8s default = 10M tokens).
 const DEFAULT_RULE_COST_LIMIT: u64 = 10_000_000;
 
+/// `supportedValidationReason` (apiextensions validation.go:66-71), in
+/// `sets.String.List()` (sorted) order.
+const SUPPORTED_VALIDATION_REASON: [&str; 4] = [
+    "FieldValueDuplicate",
+    "FieldValueForbidden",
+    "FieldValueInvalid",
+    "FieldValueRequired",
+];
+
 /// Default per-request runtime cost budget (K8s default = 100M tokens).
 const DEFAULT_REQUEST_RUNTIME_COST_LIMIT: u64 = 100_000_000;
 
@@ -289,9 +298,17 @@ pub fn validate_crd_schema_rules(
     fld_path: &Path,
     env_set: &EnvSet,
     pre: &PreexistingExpressions,
+    suppress_per_expression_cost: bool,
 ) -> Vec<FieldError> {
     let mut errs = Vec::new();
-    compile_schema_rules(schema, fld_path, env_set, pre, &mut errs);
+    compile_schema_rules(
+        schema,
+        fld_path,
+        env_set,
+        pre,
+        suppress_per_expression_cost,
+        &mut errs,
+    );
     errs
 }
 
@@ -309,6 +326,7 @@ fn compile_schema_rules(
     fld_path: &Path,
     env_set: &EnvSet,
     pre: &PreexistingExpressions,
+    suppress: bool,
     errs: &mut Vec<FieldError>,
 ) -> bool {
     let mut schema_errors = false;
@@ -318,6 +336,7 @@ fn compile_schema_rules(
             &fld_path.child("additionalProperties"),
             env_set,
             pre,
+            suppress,
             errs,
         );
     }
@@ -330,13 +349,15 @@ fn compile_schema_rules(
                 &fld_path.child("properties").key(name.clone()),
                 env_set,
                 pre,
+                suppress,
                 errs,
             );
         }
     }
     match schema.items.as_deref() {
         Some(JSONSchemaPropsOrArray::Schema(i)) => {
-            schema_errors |= compile_schema_rules(i, &fld_path.child("items"), env_set, pre, errs);
+            schema_errors |=
+                compile_schema_rules(i, &fld_path.child("items"), env_set, pre, suppress, errs);
         }
         Some(JSONSchemaPropsOrArray::Schemas(list)) => {
             for (i, item) in list.iter().enumerate() {
@@ -345,6 +366,7 @@ fn compile_schema_rules(
                     &fld_path.child("items").index(i),
                     env_set,
                     pre,
+                    suppress,
                     errs,
                 );
             }
@@ -360,16 +382,89 @@ fn compile_schema_rules(
         return schema_errors;
     };
     let rule_path = |i: usize| fld_path.child("x-kubernetes-validations").index(i);
-    // validation.go:1243-1245.
-    for (i, raw) in validations.iter().enumerate() {
-        let me = raw
-            .get("messageExpression")
+    // validation.go:1229-1262.
+    let str_of = |raw: &serde_json::Value, key: &str| -> String {
+        raw.get(key)
             .and_then(|m| m.as_str())
-            .unwrap_or("");
-        if !me.is_empty() && me.trim().is_empty() {
+            .unwrap_or("")
+            .to_string()
+    };
+    let has_newlines = |s: &str| s.contains(['\n', '\r']);
+    for (i, raw) in validations.iter().enumerate() {
+        let rule = str_of(raw, "rule");
+        let message = str_of(raw, "message");
+        let message_expression = str_of(raw, "messageExpression");
+        let field_path = str_of(raw, "fieldPath");
+        let (trimmed_rule, trimmed_msg) = (rule.trim(), message.trim());
+        let message_path = rule_path(i).child("message");
+        if trimmed_rule.is_empty() {
+            errs.push(FieldError::required(
+                &rule_path(i).child("rule"),
+                "rule is not specified",
+            ));
+            schema_errors = true;
+        } else if !message.is_empty() && trimmed_msg.is_empty() {
+            errs.push(FieldError::invalid(
+                &message_path,
+                message.clone(),
+                "must be non-empty if specified",
+            ));
+            schema_errors = true;
+        } else if has_newlines(trimmed_msg) {
+            errs.push(FieldError::invalid(
+                &message_path,
+                message.clone(),
+                "must not contain line breaks",
+            ));
+            schema_errors = true;
+        } else if has_newlines(trimmed_rule) && trimmed_msg.is_empty() {
+            errs.push(FieldError::required(
+                &message_path,
+                "message must be specified if rule contains line breaks",
+            ));
+            schema_errors = true;
+        }
+        if !message_expression.is_empty() && message_expression.trim().is_empty() {
             errs.push(FieldError::required(
                 &rule_path(i).child("messageExpression"),
                 "messageExpression must be non-empty if specified",
+            ));
+            schema_errors = true;
+        }
+        if let Some(reason) = raw.get("reason").and_then(|r| r.as_str()) {
+            if !SUPPORTED_VALIDATION_REASON.contains(&reason) {
+                errs.push(FieldError::not_supported(
+                    &rule_path(i).child("reason"),
+                    reason,
+                    &SUPPORTED_VALIDATION_REASON,
+                ));
+                schema_errors = true;
+            }
+        }
+        let fp_path = rule_path(i).child("fieldPath");
+        if !field_path.is_empty() && field_path.trim().is_empty() {
+            errs.push(FieldError::invalid(
+                &fp_path,
+                field_path.clone(),
+                "must be non-empty if specified",
+            ));
+            schema_errors = true;
+        }
+        if has_newlines(&field_path) {
+            errs.push(FieldError::invalid(
+                &fp_path,
+                field_path.clone(),
+                "must not contain line breaks",
+            ));
+            schema_errors = true;
+        }
+        if !field_path.is_empty()
+            && !rusternetes_common::validation::crd::path_valid(schema, &field_path)
+        {
+            errs.push(FieldError::invalid(
+                &fp_path,
+                field_path.clone(),
+                "must be a valid path",
             ));
             schema_errors = true;
         }
@@ -406,7 +501,7 @@ fn compile_schema_rules(
         }
         // validation.go:1280-1287.
         let cost = estimate_cost(rule);
-        if cost > DEFAULT_RULE_COST_LIMIT {
+        if !suppress && cost > DEFAULT_RULE_COST_LIMIT {
             errs.push(FieldError::forbidden(
                 &rule_field,
                 get_cost_error_message("estimated rule cost", cost, DEFAULT_RULE_COST_LIMIT),
@@ -440,7 +535,7 @@ fn compile_schema_rules(
             continue;
         }
         let me_cost = estimate_cost(me);
-        if me_cost > DEFAULT_RULE_COST_LIMIT {
+        if !suppress && me_cost > DEFAULT_RULE_COST_LIMIT {
             errs.push(FieldError::forbidden(
                 &me_field,
                 get_cost_error_message(
@@ -862,7 +957,7 @@ mod tests {
         let at_1_32 = EnvSet::must_base_env_set(Version::major_minor(1, 32));
         let root = Path::new("openAPIV3Schema");
         let pre = PreexistingExpressions::default();
-        let errs = validate_crd_schema_rules(&schema, &root, &at_1_32, &pre);
+        let errs = validate_crd_schema_rules(&schema, &root, &at_1_32, &pre, false);
         assert_eq!(errs.len(), 1, "{errs:?}");
         assert!(
             errs[0]
@@ -875,7 +970,7 @@ mod tests {
             "openAPIV3Schema.properties[spec].x-kubernetes-validations[0].rule"
         );
         let at_1_33 = EnvSet::must_base_env_set(Version::major_minor(1, 33));
-        assert!(validate_crd_schema_rules(&schema, &root, &at_1_33, &pre).is_empty());
+        assert!(validate_crd_schema_rules(&schema, &root, &at_1_33, &pre, false).is_empty());
     }
 
     /// A rule already stored on the CRD is compiled in `StoredExpressions`.
@@ -889,7 +984,7 @@ mod tests {
             ..Default::default()
         };
         let root = Path::new("openAPIV3Schema");
-        assert!(validate_crd_schema_rules(&schema, &root, &at_1_32, &pre).is_empty());
+        assert!(validate_crd_schema_rules(&schema, &root, &at_1_32, &pre, false).is_empty());
     }
 
     #[test]
