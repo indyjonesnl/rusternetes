@@ -290,6 +290,7 @@ mod replicaset_handler_test;
 mod replicationcontroller_generic_store_test;
 mod replicationcontroller_handler_test;
 mod replicationcontroller_post_e2e_test;
+mod request_header_authn_test;
 mod require_create_name_router_test;
 mod resource_store_test;
 mod resourceclaim_crud_patch_events_test;

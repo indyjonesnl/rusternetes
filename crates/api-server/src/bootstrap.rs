@@ -1471,17 +1471,43 @@ fn resolve_cluster_ca(ca_cert_pem: Option<&str>) -> Option<String> {
 
 /// This api-server's `ClusterAuthenticationInfo`
 /// (pkg/controlplane/apiserver/config.go:71). Upstream fills it from
-/// `--client-ca-file` and the `--requestheader-*` flags, which this
-/// api-server does not take yet (#1577). Until it does, the effective
-/// configuration is published: the cluster CA for both client and front
-/// proxy, and the identity headers the aggregator proxy sends
-/// (`handlers::aggregator::build_proxy_headers`).
+/// `--client-ca-file` (config.go:344) and, when `--requestheader-client-ca-file`
+/// is set, from the `--requestheader-*` flags (config.go:346-357); that is
+/// what is published here when the flags are given (#3414).
+///
+/// Without `--requestheader-client-ca-file` upstream publishes no
+/// request-header keys. This api-server's compose/all-in-one bring-up passes
+/// no front-proxy flags yet, and the aggregator proxy still signs with the
+/// cluster CA and sends the standard headers
+/// (`handlers::aggregator::build_proxy_headers`), so extension API servers
+/// need those keys; until the bring-up passes the flags, the effective
+/// configuration keeps being published as the fallback (tracked in #3423).
 pub fn cluster_authentication_info(
     ca_cert_pem: Option<&str>,
+    client_ca_file: Option<&str>,
+    request_header: Option<&crate::request_header_authentication::RequestHeaderTrust>,
 ) -> rusternetes_common::clusterauthenticationtrust::ClusterAuthenticationInfo {
     let ca = resolve_cluster_ca(ca_cert_pem);
+    let client_ca = client_ca_file
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .filter(|c| !c.is_empty())
+        .or_else(|| ca.clone());
+    if let Some(trust) = request_header {
+        let cfg = &trust.config;
+        return rusternetes_common::clusterauthenticationtrust::ClusterAuthenticationInfo {
+            client_ca,
+            request_header_username_headers: Some(cfg.username_headers.clone()),
+            request_header_uid_headers: Some(cfg.uid_headers.clone()),
+            request_header_group_headers: Some(cfg.group_headers.clone()),
+            request_header_extra_header_prefixes: Some(cfg.extra_header_prefixes.clone()),
+            request_header_allowed_names: Some(cfg.allowed_names.clone()),
+            request_header_ca: std::fs::read_to_string(&trust.client_ca_file)
+                .ok()
+                .filter(|c| !c.is_empty()),
+        };
+    }
     rusternetes_common::clusterauthenticationtrust::ClusterAuthenticationInfo {
-        client_ca: ca.clone(),
+        client_ca,
         request_header_username_headers: Some(vec!["X-Remote-User".to_string()]),
         request_header_uid_headers: None,
         request_header_group_headers: Some(vec!["X-Remote-Group".to_string()]),
@@ -2952,7 +2978,7 @@ mod post_start_hook_registration_tests {
         );
         spawn_cluster_authentication_trust_controller(
             storage.clone(),
-            cluster_authentication_info(None),
+            cluster_authentication_info(None, None, None),
         );
         start_default_servicecidr_controller(
             storage.clone(),

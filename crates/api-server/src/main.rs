@@ -42,7 +42,6 @@ mod handlers;
 use rusternetes_middleware as middleware;
 mod openapi;
 mod patch;
-mod peer_cert_acceptor;
 #[allow(dead_code)]
 mod post_start_hooks;
 mod prometheus_client;
@@ -51,6 +50,8 @@ mod registry;
 // The task-local is read by the lib's webhook authorizer, so the bin must
 // install it through the lib's module, not a second copy (#3159).
 use rusternetes_api_server::request_scope;
+// The bin's own `bootstrap` copy names the lib's trust type (#3414).
+use rusternetes_api_server::request_header_authentication;
 #[allow(dead_code)]
 mod storage_readiness_hook;
 pub use rusternetes_protobuf as protobuf;
@@ -138,6 +139,10 @@ struct Args {
     /// `--admission-control` (#3415).
     #[command(flatten)]
     admission: admission::plugins::AdmissionArgs,
+    /// `--requestheader-*` front-proxy authentication (#3414).
+    #[command(flatten)]
+    request_header:
+        rusternetes_api_server::request_header_authentication::RequestHeaderAuthenticationArgs,
 
     /// Enable TLS/HTTPS
     #[arg(long)]
@@ -317,6 +322,9 @@ async fn main() -> Result<()> {
     args.admission
         .validate_and_install()
         .map_err(|e| anyhow::anyhow!("invalid admission flags: {e}"))?;
+    let request_header = args
+        .request_header
+        .resolve(args.client_ca_file.as_deref())?;
     request_timeout::set_request_timeout(args.request_timeout);
     apply_feature_gates(&args)?;
     // `validateClusterIPFlags`: refuse to start on a bad range.
@@ -440,7 +448,11 @@ async fn main() -> Result<()> {
         api_port,
         service_ranges.api_server_service_ip(),
         service_ranges.cidrs(),
-        ca_cert_pem.as_deref(),
+        rusternetes_api_server::startup::ClusterAuthnInputs {
+            ca_cert_pem: ca_cert_pem.as_deref(),
+            client_ca_file: args.client_ca_file.as_deref(),
+            request_header: request_header.as_ref(),
+        },
         {
             let c = Arc::clone(&crd_controllers);
             move |s| {
@@ -555,13 +567,17 @@ async fn main() -> Result<()> {
         // connect) and serve via PeerCertAcceptor so the verified cert reaches
         // handlers for CN→user / O→groups mapping (#1129). Without it, plain
         // serving-only TLS as before.
-        let client_cert_authn = args.client_ca_file.is_some();
-        let server_config = if let Some(ref client_ca) = args.client_ca_file {
+        let client_cas = rusternetes_api_server::request_header_authentication::client_ca_files(
+            args.client_ca_file.as_deref(),
+            request_header.as_ref(),
+        );
+        let client_cert_authn = !client_cas.is_empty();
+        let server_config = if client_cert_authn {
             info!(
-                "Client certificate authentication enabled (CA: {})",
-                client_ca
+                "Client certificate authentication enabled (CAs: {})",
+                client_cas.join(", ")
             );
-            tls_config.into_mtls_server_config(client_ca)?
+            tls_config.into_mtls_server_config_for_cas(&client_cas)?
         } else {
             tls_config.into_server_config()?
         };
@@ -605,8 +621,13 @@ async fn main() -> Result<()> {
         }
 
         if client_cert_authn {
-            let mut server = axum_server::bind(addr)
-                .acceptor(peer_cert_acceptor::PeerCertAcceptor::new(rustls_config));
+            let mut server = axum_server::bind(addr).acceptor(
+                rusternetes_api_server::request_header_authentication::peer_cert_acceptor(
+                    rustls_config,
+                    args.client_ca_file.as_deref(),
+                    request_header.as_ref(),
+                )?,
+            );
             apply_http2_tuning!(server);
             server.serve(app.into_make_service()).await?;
         } else {

@@ -274,6 +274,10 @@ struct Args {
     /// `--admission-control` (#3415).
     #[command(flatten)]
     admission: rusternetes_api_server::admission::plugins::AdmissionArgs,
+    /// `--requestheader-*` front-proxy authentication (#3414).
+    #[command(flatten)]
+    request_header:
+        rusternetes_api_server::request_header_authentication::RequestHeaderAuthenticationArgs,
 }
 
 fn main() -> Result<()> {
@@ -432,6 +436,7 @@ async fn async_main() -> Result<()> {
         authorization_webhook: args.authorization.webhook.clone(),
         authorization_config: args.authorization.authorization_config.clone(),
         authorization_legacy_flags_set: args.authorization.legacy_flags_set,
+        request_header: args.request_header.clone(),
         ..Default::default()
     };
     let prepared_tls = rusternetes_api_server::prepare_tls_for_config(&api_config)?;
