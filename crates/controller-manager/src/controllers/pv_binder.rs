@@ -661,8 +661,11 @@ impl<S: Storage + 'static> PVBinderController<S> {
         status.message = message;
         pv.status = Some(status);
         let pv_key = build_key("persistentvolumes", None, &pv.metadata.name);
-        // Phase-only write -> status subresource (pv_controller.go:925).
-        let new_pv = self.storage.update_status(&pv_key, &pv).await?;
+        // Phase-only write -> status subresource (pv_controller.go:925),
+        // conditional on the resourceVersion of the object we were handed
+        // (`UpdateStatus(volumeClone)`; a lost race is a Conflict the caller
+        // requeues) (#2160).
+        let new_pv = self.storage.update_status_cas(&pv_key, &pv).await?;
         info!("Volume {} entered phase {:?}", new_pv.metadata.name, phase);
         Ok(new_pv)
     }
@@ -1504,7 +1507,10 @@ impl<S: Storage + 'static> PVBinderController<S> {
             pvc.metadata.namespace.as_deref(),
             &pvc.metadata.name,
         );
-        self.storage.update_status(&key, &*pvc).await?;
+        // `UpdateStatus(claimClone)` (pv_controller.go:866): conditional on the
+        // claim's resourceVersion, Conflict -> requeue (#2160).
+        let new_pvc = self.storage.update_status_cas(&key, &*pvc).await?;
+        *pvc = new_pvc;
         Ok(())
     }
 
@@ -1840,8 +1846,17 @@ impl<S: Storage + 'static> PVBinderController<S> {
         // through the status subresource (`UpdateStatus`, pv_controller.go:925).
         // A single full-object PUT would have its `.status` stripped by a
         // conformant api-server, leaving the PV bound but never Bound (#1723).
-        self.storage.update(&pv_key, &pv).await?;
-        self.storage.update_status(&pv_key, &pv).await?;
+        // The status write is built on the object `Update` returned
+        // (`bind`: `volume = updatedVolume` then `updateVolumePhase`, :1110), so it carries
+        // that resourceVersion and a concurrent writer is a Conflict (#2160).
+        let mut pv = self.storage.update(&pv_key, &pv).await?;
+        pv.status = Some(PersistentVolumeStatus {
+            phase: PersistentVolumePhase::Bound,
+            message: None,
+            reason: None,
+            last_phase_transition_time: None,
+        });
+        self.storage.update_status_cas(&pv_key, &pv).await?;
 
         bind_claim_to_volume(pvc, &pv_name);
         let pvc_key = build_key("persistentvolumeclaims", Some(&namespace), &pvc_name);
@@ -1849,7 +1864,9 @@ impl<S: Storage + 'static> PVBinderController<S> {
         // resource (`bindClaimToVolume`), then phase/capacity/VAC via the
         // status subresource (`updateClaimStatus(claim, ClaimBound, volume)`,
         // `bind` at pv_controller.go:1122).
-        self.storage.update(&pvc_key, pvc).await?;
+        // `updateClaimStatus(ctx, claim=updatedClaim, ...)` (`bind`, :1122): the claim
+        // `Update` returned carries the fresh resourceVersion.
+        *pvc = self.storage.update(&pvc_key, pvc).await?;
         self.update_claim_status(pvc, PersistentVolumeClaimPhase::Bound, Some(&pv))
             .await?;
 
@@ -3983,7 +4000,10 @@ mod tests {
             .unwrap();
         let st = pvc.status.unwrap();
         assert_eq!(st.phase, PersistentVolumeClaimPhase::Bound);
-        assert_eq!(st.capacity, Some(storage_cap("1024Mi")));
+        // The write goes through the server, which hands back the canonical
+        // quantity ("1Gi"); equivalence by value is what `Cmp` asserts.
+        let cap = st.capacity.unwrap();
+        assert!(quantity_eq(&cap["storage"], "1024Mi"), "{cap:?}");
     }
 
     /// :821-824: a volume without storage capacity is an error on the phase
