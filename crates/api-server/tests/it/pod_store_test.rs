@@ -715,11 +715,13 @@ async fn smp_list_of_lists_is_422() {
         )
         .await;
     assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    assert!(
-        body["message"]
-            .as_str()
-            .unwrap()
-            .contains("lists of lists are not supported"),
+    // `NewGenericServerResponse` (apimachinery errors.go:437-524) answers a 422
+    // with the fixed "rejected our request" message and drops `serverMessage`
+    // (it only becomes a cause when `isUnexpectedResponse`), so the
+    // "lists of lists" text never reaches the client.
+    assert_eq!(body["reason"], "Invalid", "{body}");
+    assert_eq!(
+        body["message"], "the server rejected our request due to an error in our request",
         "{body}"
     );
 }
