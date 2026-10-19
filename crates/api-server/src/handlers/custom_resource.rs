@@ -819,6 +819,9 @@ fn validate_custom_resource_with_ratcheting(
         cr.extra.iter().map(|(k, v)| (k.as_str(), v)).collect();
     let old_extra_specs: HashMap<&str, &serde_json::Value> =
         old_cr.extra.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    // One `celconfig.RuntimeCELCostBudget` for the whole custom resource
+    // (strategy.go:309), spent across every top-level property below.
+    let mut remaining_budget = rusternetes_common::cel_cost::RUNTIME_CEL_COST_BUDGET;
 
     for (key, prop_schema) in properties {
         let (new_val, old_val) = match key.as_str() {
@@ -849,7 +852,8 @@ fn validate_custom_resource_with_ratcheting(
         }
 
         // 2) CEL rule failures.
-        let failures = evaluate_cr_rules_with_paths(prop_schema, new_val, old_val_ref)?;
+        let failures =
+            evaluate_cr_rules_with_paths(prop_schema, new_val, old_val_ref, &mut remaining_budget)?;
         for f in failures {
             let ratcheted = if f.is_transition {
                 false

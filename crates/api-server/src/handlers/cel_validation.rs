@@ -22,6 +22,7 @@
 //!      estimated cost budget — sufficient to reject obviously expensive
 //!      rules at compile time and runaway evaluations at runtime.
 
+use rusternetes_common::cel_cost::{CostEvalError, CostOptions, RUNTIME_CEL_COST_BUDGET};
 use rusternetes_common::cel_versions::{compile_failure, EnvSet, EnvType};
 use rusternetes_common::resources::{
     CustomResource, CustomResourceDefinition, CustomResourceDefinitionSpec, JSONSchemaProps,
@@ -44,8 +45,63 @@ const SUPPORTED_VALIDATION_REASON: [&str; 4] = [
     "FieldValueRequired",
 ];
 
-/// Default per-request runtime cost budget (K8s default = 100M tokens).
-const DEFAULT_REQUEST_RUNTIME_COST_LIMIT: u64 = 100_000_000;
+/// The detail of every out-of-budget error (`validation.go:381,431`).
+const OUT_OF_COST_BUDGET: &str =
+    "validation failed due to running out of cost budget, no further validation rules will be run";
+
+/// `ruleErrorString` (`validation.go:764-769`).
+fn rule_error_string(message: &str, rule: &str) -> String {
+    if !message.is_empty() {
+        message.trim().to_string()
+    } else {
+        rule.trim().to_string()
+    }
+}
+
+/// The per-rule budget accounting of `validateExpressions`
+/// (`validation.go:380-434`, `:446-452`): evaluate `rule` under
+/// `celconfig.PerCallLimit`, charge its actual cost to `remaining_budget`, and
+/// map the outcomes.
+///
+/// `Err` is the message of an error that stops every further rule (budget
+/// exhausted, or the per-call limit exceeded); `Ok(Err)` is an ordinary
+/// evaluation error of this rule (`"%v evaluating rule: %v"`), after which
+/// evaluation continues.
+fn evaluate_rule_with_budget(
+    evaluator: &mut CELEvaluator,
+    rule: &str,
+    message: &str,
+    ctx: &CELContext,
+    remaining_budget: &mut i64,
+) -> std::result::Result<std::result::Result<bool, String>, String> {
+    let (result, rt_cost) = evaluator.evaluate_with_cost(rule, ctx, CostOptions::default());
+    // `*rtCost > math.MaxInt64 || int64(*rtCost) > remainingBudget`
+    if rt_cost > i64::MAX as u64 || rt_cost as i64 > *remaining_budget {
+        *remaining_budget = -1;
+        return Err(OUT_OF_COST_BUDGET.to_string());
+    }
+    *remaining_budget -= rt_cost as i64;
+    match result {
+        Err(CostEvalError::LimitExceeded) => {
+            *remaining_budget = -1;
+            Err(format!(
+                "'{}': no further validation rules will be run due to call cost exceeds limit for rule: {}",
+                CostEvalError::LimitExceeded,
+                rule_error_string(message, rule)
+            ))
+        }
+        Err(e) => Ok(Err(format!(
+            "{} evaluating rule: {}",
+            e,
+            rule_error_string(message, rule)
+        ))),
+        Ok(cel::Value::Bool(b)) => Ok(Ok(b)),
+        Ok(other) => Ok(Err(format!(
+            "CEL expression did not return a boolean: {other:?} evaluating rule: {}",
+            rule_error_string(message, rule)
+        ))),
+    }
+}
 
 /// A single CEL validation rule extracted from `x-kubernetes-validations[]`.
 #[derive(Debug, Clone)]
@@ -586,7 +642,9 @@ pub fn validate_cr_rules(
         .transpose()?;
 
     let mut evaluator = CELEvaluator::new();
-    let mut total_cost: u64 = 0;
+    // `celconfig.RuntimeCELCostBudget` per custom resource (strategy.go:221).
+    let mut remaining_budget = RUNTIME_CEL_COST_BUDGET;
+    let mut budget_checked_path: Option<&Vec<String>> = None;
 
     for r in rules {
         // Transition rules (referencing `oldSelf`) only fire on UPDATE.
@@ -600,14 +658,12 @@ pub fn validate_cr_rules(
             continue;
         }
 
-        // K8s default is 100M for the whole request. Reject runaway rules
-        // before they swamp the request.
-        total_cost = total_cost.saturating_add(estimate_cost(&r.rule));
-        if total_cost > DEFAULT_REQUEST_RUNTIME_COST_LIMIT {
-            return Err(Error::InvalidResource(format!(
-                "x-kubernetes-validations rule exceeded the runtime cost limit: {}",
-                r.rule
-            )));
+        // `validation.go:380`: a node with rules fails once the budget is spent.
+        if budget_checked_path != Some(&r.path) {
+            budget_checked_path = Some(&r.path);
+            if remaining_budget <= 0 {
+                return Err(Error::InvalidResource(OUT_OF_COST_BUDGET.to_string()));
+            }
         }
 
         let self_node = node_at_path(&cr_json, &r.path)
@@ -636,12 +692,19 @@ pub fn validate_cr_rules(
                 .map_err(|e| Error::Internal(e.to_string()))?;
         }
 
-        match evaluator.evaluate(&r.rule, &ctx) {
-            Ok(true) => {}
-            Ok(false) => {
+        match evaluate_rule_with_budget(
+            &mut evaluator,
+            &r.rule,
+            &r.message,
+            &ctx,
+            &mut remaining_budget,
+        ) {
+            Err(stop) => return Err(Error::InvalidResource(stop)),
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => {
                 return Err(Error::InvalidResource(r.message.clone()));
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 return Err(Error::InvalidResource(format!(
                     "failed to evaluate x-kubernetes-validations rule {:?}: {}",
                     r.rule, e
@@ -709,17 +772,17 @@ pub fn evaluate_cr_rules_with_paths(
     schema: &JSONSchemaProps,
     cr_value: &serde_json::Value,
     old_value: Option<&serde_json::Value>,
+    remaining_budget: &mut i64,
 ) -> Result<Vec<CrRuleFailure>> {
     let mut evaluator = CELEvaluator::new();
     let mut failures = Vec::new();
-    let mut total_cost: u64 = 0;
     walk_and_eval(
         schema,
         cr_value,
         old_value,
         &mut Vec::new(),
         &mut evaluator,
-        &mut total_cost,
+        remaining_budget,
         &mut failures,
     )?;
     Ok(failures)
@@ -732,11 +795,15 @@ fn walk_and_eval(
     old_node: Option<&serde_json::Value>,
     path: &mut Vec<PathSeg>,
     evaluator: &mut CELEvaluator,
-    total_cost: &mut u64,
+    remaining_budget: &mut i64,
     failures: &mut Vec<CrRuleFailure>,
 ) -> Result<()> {
     // Evaluate every rule attached to this schema node against `node`.
     if let Some(rules) = &schema.x_kubernetes_validations {
+        // `validation.go:380`: a node with rules fails once the budget is spent.
+        if !rules.is_empty() && *remaining_budget <= 0 {
+            return Err(Error::InvalidResource(OUT_OF_COST_BUDGET.to_string()));
+        }
         for raw in rules {
             let obj = match raw.as_object() {
                 Some(o) => o,
@@ -763,14 +830,6 @@ fn walk_and_eval(
                 continue;
             }
 
-            *total_cost = total_cost.saturating_add(estimate_cost(rule_str));
-            if *total_cost > DEFAULT_REQUEST_RUNTIME_COST_LIMIT {
-                return Err(Error::InvalidResource(format!(
-                    "x-kubernetes-validations rule exceeded the runtime cost limit: {}",
-                    rule_str
-                )));
-            }
-
             let mut ctx = CELContext::new();
             ctx.add_json_variable("self", node)
                 .map_err(|e| Error::Internal(e.to_string()))?;
@@ -782,14 +841,18 @@ fn walk_and_eval(
                     .map_err(|e| Error::Internal(e.to_string()))?;
             }
 
-            match evaluator.evaluate(rule_str, &ctx) {
-                Ok(true) => {}
-                Ok(false) => failures.push(CrRuleFailure {
+            match evaluate_rule_with_budget(evaluator, rule_str, &message, &ctx, remaining_budget) {
+                // Budget and per-call errors are not ratcheted: they stop the
+                // whole validation (validation_test.go "cost budget errors
+                // are not ratcheted").
+                Err(stop) => return Err(Error::InvalidResource(stop)),
+                Ok(Ok(true)) => {}
+                Ok(Ok(false)) => failures.push(CrRuleFailure {
                     path: path.clone(),
                     message,
                     is_transition,
                 }),
-                Err(_) => {
+                Ok(Err(_)) => {
                     // Runtime errors are reported as failures (no ratcheting
                     // for malformed evaluation either). Render the rule body
                     // so the caller's diagnostics stay actionable.
@@ -821,7 +884,7 @@ fn walk_and_eval(
                         old_child,
                         path,
                         evaluator,
-                        total_cost,
+                        remaining_budget,
                         failures,
                     )?;
                     path.pop();
@@ -850,7 +913,7 @@ fn walk_and_eval(
                         old_child,
                         path,
                         evaluator,
-                        total_cost,
+                        remaining_budget,
                         failures,
                     )?;
                     path.pop();
@@ -873,7 +936,7 @@ fn walk_and_eval(
                         old_child.as_ref(),
                         path,
                         evaluator,
-                        total_cost,
+                        remaining_budget,
                         failures,
                     )?;
                     path.pop();
@@ -988,7 +1051,8 @@ mod tests {
         new: serde_json::Value,
         old: Option<serde_json::Value>,
     ) -> bool {
-        !evaluate_cr_rules_with_paths(schema, &new, old.as_ref())
+        let mut budget = RUNTIME_CEL_COST_BUDGET;
+        !evaluate_cr_rules_with_paths(schema, &new, old.as_ref(), &mut budget)
             .unwrap()
             .is_empty()
     }
@@ -1058,6 +1122,90 @@ mod tests {
         assert!(collect_rules(&s)[0].optional_old_self);
         let s = optional_schema("oldSelf.foo == self.foo", None);
         assert!(!collect_rules(&s)[0].optional_old_self);
+    }
+
+    fn cr_with_nums(n: usize) -> CustomResource {
+        let nums: Vec<u32> = (0..n as u32).collect();
+        serde_json::from_value(json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Foo",
+            "metadata": {"name": "a"},
+            "spec": {"nums": nums}
+        }))
+        .expect("cr deserialises")
+    }
+
+    fn rules_at_spec(rule: &str, count: usize) -> Vec<ValidationRule> {
+        (0..count)
+            .map(|_| ValidationRule {
+                rule: rule.to_string(),
+                message: "failed rule".to_string(),
+                path: vec!["spec".to_string()],
+                optional_old_self: false,
+            })
+            .collect()
+    }
+
+    fn err_text(e: Error) -> String {
+        e.to_string()
+    }
+
+    /// `validation_test.go` `TestCELValidationLimit`: once the summed actual
+    /// cost of the rules passes `celconfig.RuntimeCELCostBudget` (10M) the
+    /// request fails with "validation failed due to running out of cost
+    /// budget, no further validation rules will be run".
+    #[test]
+    fn rules_whose_summed_cost_passes_the_runtime_budget_are_rejected() {
+        let cr = cr_with_nums(5000);
+        let few = rules_at_spec("self.nums.all(x, x >= 0)", 5);
+        validate_cr_rules(&few, &cr, None).expect("a few cheap rules fit the budget");
+        let many = rules_at_spec("self.nums.all(x, x >= 0)", 3000);
+        let e = validate_cr_rules(&many, &cr, None).expect_err("budget must run out");
+        assert!(
+            err_text(e).contains(
+                "validation failed due to running out of cost budget, no further validation rules will be run"
+            )
+        );
+    }
+
+    /// `validation.go:431`-ish `celconfig.PerCallLimit` (1M): one rule over the
+    /// per-call limit stops evaluation with "no further validation rules will
+    /// be run due to call cost exceeds limit for rule: <message>".
+    #[test]
+    fn a_rule_over_the_per_call_limit_is_rejected() {
+        let cr = cr_with_nums(2000);
+        let rules = rules_at_spec("self.nums.all(x, self.nums.all(y, x >= 0 && y >= 0))", 1);
+        let e = validate_cr_rules(&rules, &cr, None).expect_err("per-call limit");
+        assert!(err_text(e).contains(
+            "no further validation rules will be run due to call cost exceeds limit for rule: failed rule"
+        ));
+    }
+
+    /// `validation.go:380-383` through the ratcheting walk: the budget is one
+    /// per custom resource, passed in by the caller and spent across calls; an
+    /// exhausted budget is an error (never a ratcheted failure).
+    #[test]
+    fn the_walk_spends_one_budget_across_calls_and_stops_when_it_is_gone() {
+        let schema = schema_with_rule("self.nums.all(x, x >= 0)", "m");
+        let spec = json!({"nums": (0..5000).collect::<Vec<u32>>()});
+        let mut remaining = RUNTIME_CEL_COST_BUDGET;
+        let mut calls = 0;
+        let err = loop {
+            match evaluate_cr_rules_with_paths(
+                schema.properties.as_ref().unwrap().get("spec").unwrap(),
+                &spec,
+                None,
+                &mut remaining,
+            ) {
+                Ok(f) => assert!(f.is_empty()),
+                Err(e) => break e,
+            }
+            calls += 1;
+            assert!(calls < 10_000, "the budget never ran out");
+        };
+        assert!(err.to_string().contains(OUT_OF_COST_BUDGET));
+        assert!(calls > 1, "one evaluation must fit in the budget");
+        assert!(remaining < 0);
     }
 
     /// `preexistingExpressions.RuleEnv` (validation.go:158-163): a new rule is
