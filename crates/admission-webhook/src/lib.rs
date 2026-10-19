@@ -2333,7 +2333,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                 uid: a.user.uid.clone(),
                 groups: a.user.groups.clone(),
             });
-            let match_conditions_pass = self.evaluate_match_conditions(
+            let match_outcome = self.evaluate_match_conditions(
                 policy,
                 object,
                 old_object,
@@ -2344,8 +2344,31 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                 authz_user.as_ref(),
                 authz.map(|a| (a, derived_resource.as_str(), request_name)),
             );
-            if !match_conditions_pass {
-                continue;
+            match match_outcome {
+                crate::cel_evaluators::MatchOutcome::Matched => {}
+                crate::cel_evaluators::MatchOutcome::NotMatched => continue,
+                // validator.go:85-97: a matchConditions error is a decision
+                // with `policyDecisionActionForError(failurePolicy)` (:60-65),
+                // `Fail` (the default, :77-79) denying and `Ignore` admitting.
+                crate::cel_evaluators::MatchOutcome::Error(message) => {
+                    let ignore = policy
+                        .get("spec")
+                        .and_then(|s| s.get("failurePolicy"))
+                        .and_then(|f| f.as_str())
+                        == Some("Ignore");
+                    tracing::warn!(
+                        "CEL matchCondition error for policy {}: {}",
+                        policy_name,
+                        message
+                    );
+                    if !ignore {
+                        return Err(rusternetes_common::Error::InvalidResource(format!(
+                            "ValidatingAdmissionPolicy {} evaluation error: {}",
+                            policy_name, message
+                        )));
+                    }
+                    continue;
+                }
             }
 
             // Build CEL context with object variable
@@ -2693,8 +2716,9 @@ impl<S: Storage> AdmissionWebhookManager<S> {
         Ok(())
     }
 
-    /// Evaluate matchConditions for a VAP. Returns true if all conditions pass
-    /// (or none exist), false if any condition fails or errors.
+    /// Evaluate matchConditions for a VAP. `Matched` if all conditions pass
+    /// (or none exist), `NotMatched` if one is false, `Error` if evaluation
+    /// failed (the caller applies the policy's failurePolicy).
     ///
     /// Thin wrapper around [`crate::cel_evaluators::MatchConditionEvaluator`] — the source
     /// of truth for the CEL semantics. The VAP-specific concern handled here
@@ -2713,14 +2737,14 @@ impl<S: Storage> AdmissionWebhookManager<S> {
         name: &str,
         user_info: Option<&UserInfo>,
         authz: Option<(&crate::cel_evaluators::VapAuthorizer, &str, &str)>,
-    ) -> bool {
+    ) -> crate::cel_evaluators::MatchOutcome {
         let raw_conditions = match policy
             .get("spec")
             .and_then(|s| s.get("matchConditions"))
             .and_then(|c| c.as_array())
         {
             Some(c) if !c.is_empty() => c,
-            _ => return true, // No conditions = always match (upstream)
+            _ => return crate::cel_evaluators::MatchOutcome::Matched, // No conditions = always match (upstream)
         };
 
         let conditions: Vec<rusternetes_common::resources::MatchCondition> = raw_conditions
@@ -2728,7 +2752,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
             .filter_map(|v| serde_json::from_value(v.clone()).ok())
             .collect();
         if conditions.is_empty() {
-            return true;
+            return crate::cel_evaluators::MatchOutcome::Matched;
         }
 
         let request = build_admission_request_for_match(
@@ -2738,7 +2762,11 @@ impl<S: Storage> AdmissionWebhookManager<S> {
         let mut evaluator = crate::cel_evaluators::MatchConditionEvaluator::new();
         let mut context = match crate::cel_evaluators::build_context(&request, None) {
             Ok(ctx) => ctx,
-            Err(_) => return false,
+            Err(e) => {
+                return crate::cel_evaluators::MatchOutcome::Error(format!(
+                    "failed to build CEL context: {e}"
+                ))
+            }
         };
         // matcher.go:80-86: `Match`'s `authz` becomes
         // `OptionalVariableBindings.Authorizer`.
@@ -2752,10 +2780,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                 request_name,
             );
         }
-        matches!(
-            evaluator.evaluate_with_context(&conditions, &context),
-            crate::cel_evaluators::MatchOutcome::Matched
-        )
+        evaluator.evaluate_with_context(&conditions, &context)
     }
 }
 
@@ -4102,6 +4127,84 @@ mod tests {
             result.is_ok(),
             "Should pass with Ignore failure policy on CEL error"
         );
+    }
+
+    /// `validator.go:85-97`: a matchConditions error becomes a decision whose
+    /// action is `policyDecisionActionForError(failurePolicy)` (:60-65) —
+    /// `Fail` (the default) denies, `Ignore` admits.
+    async fn run_match_error_policy(failure_policy: Option<&str>) -> Result<()> {
+        let storage = Arc::new(MemoryStorage::new());
+        let manager = AdmissionWebhookManager::new(storage.clone());
+        let mut spec = json!({
+            "matchConstraints": {"resourceRules": [{
+                "apiGroups": [""], "resources": ["configmaps"], "operations": ["CREATE"],
+            }]},
+            "matchConditions": [{"name": "boom", "expression": "object.nonexistent.field > 0"}],
+            "validations": [{"expression": "false", "message": "denied"}]
+        });
+        if let Some(f) = failure_policy {
+            spec["failurePolicy"] = json!(f);
+        }
+        let policy = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": {"name": "mc-err", "creationTimestamp": chrono::Utc::now().to_rfc3339()},
+            "spec": spec
+        });
+        storage
+            .create::<serde_json::Value>("/registry/validatingadmissionpolicies/mc-err", &policy)
+            .await
+            .unwrap();
+        let old_time = (chrono::Utc::now() - chrono::Duration::seconds(10)).to_rfc3339();
+        let binding = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicyBinding",
+            "metadata": {"name": "mc-err-b", "creationTimestamp": old_time},
+            "spec": {"policyName": "mc-err"}
+        });
+        storage
+            .create::<serde_json::Value>(
+                "/registry/validatingadmissionpolicybindings/mc-err-b",
+                &binding,
+            )
+            .await
+            .unwrap();
+        let gvk = GroupVersionKind {
+            group: "".to_string(),
+            version: "v1".to_string(),
+            kind: "ConfigMap".to_string(),
+        };
+        let cm = json!({"metadata": {"name": "test"}});
+        manager
+            .run_validating_admission_policies_ext(
+                &Operation::Create,
+                &gvk,
+                Some(&cm),
+                None,
+                Some("configmaps"),
+                Some("default"),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_vap_match_condition_error_fail_policy_denies() {
+        for fp in [None, Some("Fail")] {
+            let err = run_match_error_policy(fp)
+                .await
+                .expect_err("a matchConditions error under Fail must deny");
+            assert!(
+                err.to_string().contains("mc-err"),
+                "denial should name the policy: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_vap_match_condition_error_ignore_policy_skips() {
+        // matchConditions error + Ignore: admitted, and the validations (which
+        // would deny) never run.
+        run_match_error_policy(Some("Ignore")).await.unwrap();
     }
 
     /// Reproduces the K8s conformance test "should allow expressions to refer variables".
