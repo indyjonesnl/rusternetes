@@ -1005,7 +1005,7 @@ async fn main() -> Result<()> {
     // Start StatefulSet controller
     let statefulset_controller = Arc::new(StatefulSetController::with_pod_informer(
         storage.clone(),
-        pod_informer,
+        pod_informer.clone(),
     ));
     spawn_controller!("StatefulSet controller", leader_elector, {
         let controller = statefulset_controller.clone();

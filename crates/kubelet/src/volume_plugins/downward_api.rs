@@ -551,6 +551,12 @@ mod tests {
     async fn set_up_nil_default_mode_errors() {
         let tmp = tempfile::tempdir().unwrap();
         let m = DownwardApiMounter {
+            host: std::sync::Arc::new(crate::volume_plugins::KubeletVolumeHost::new(
+                "/var/lib/rusternetes".to_string(),
+                None,
+                rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+                HashMap::new(),
+            )),
             path: tmp.path().to_string_lossy().into_owned(),
             volume: serde_json::from_value(json!({"name": "podinfo", "downwardAPI": {"items": [
                 {"path": "f", "fieldRef": {"fieldPath": "metadata.name"}}]}}))
@@ -643,7 +649,8 @@ mod tests {
         ));
         let v: Volume = serde_json::from_value(json!({
             "name": "podinfo",
-            "downwardAPI": {"items": [{"path": "f", "fieldRef": {"fieldPath": "metadata.name"}}]}
+            "downwardAPI": {"items": [{"path": "f", "fieldRef": {"fieldPath": "metadata.name"}}],
+                            "defaultMode": 420}
         }))
         .unwrap();
         let spec = Spec {
