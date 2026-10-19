@@ -364,6 +364,21 @@ pub(crate) trait PodEventTarget: Sync {
 
     /// `expectations.DeletionObserved(key, PodKey(pod))`.
     fn deletion_observed(&self, key: &str, pod_key: &str);
+
+    /// `expectations.CreationObserved(key)` for the pod `pod_key`. Defaults to
+    /// the plain count; a controller that tracks WHICH pods it is waiting for
+    /// (the DaemonSet controller's per-pod creation set) overrides it.
+    fn creation_observed_of(&self, key: &str, _pod_key: &str) {
+        self.creation_observed(key);
+    }
+
+    /// How long after a pod turns Ready the controller is requeued to
+    /// re-check availability. `enqueueRSAfter(rs, MinReadySeconds)`
+    /// (replica_set.go:511) waits exactly `minReadySeconds`; the DaemonSet
+    /// controller adds a second (daemon_controller.go, `updatePod`).
+    fn min_ready_requeue_delay(&self, min_ready_seconds: i32) -> Duration {
+        Duration::from_secs(min_ready_seconds as u64)
+    }
 }
 
 /// Run the effects of one observation against `target`.
@@ -384,7 +399,7 @@ pub(crate) async fn apply_pod_observation<T: PodEventTarget>(
                     .resolve_controller_ref(namespace, controller_ref)
                     .await
                 {
-                    target.creation_observed(&format!("{namespace}/{name}"));
+                    target.creation_observed_of(&format!("{namespace}/{name}"), pod_key);
                     queue.add(enqueue(&name)).await;
                 }
             }
@@ -417,7 +432,7 @@ pub(crate) async fn apply_pod_observation<T: PodEventTarget>(
                         queue
                             .add_after(
                                 enqueue(&name),
-                                Duration::from_secs(min_ready_seconds as u64),
+                                target.min_ready_requeue_delay(min_ready_seconds),
                             )
                             .await;
                     }

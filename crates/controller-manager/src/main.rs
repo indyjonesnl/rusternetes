@@ -1017,7 +1017,10 @@ async fn main() -> Result<()> {
     });
 
     // Start DaemonSet controller
-    let daemonset_controller = Arc::new(DaemonSetController::new(storage.clone()));
+    let daemonset_controller = Arc::new(DaemonSetController::with_pod_informer(
+        storage.clone(),
+        pod_informer,
+    ));
     spawn_controller!("DaemonSet controller", leader_elector, {
         let controller = daemonset_controller.clone();
         async move {
