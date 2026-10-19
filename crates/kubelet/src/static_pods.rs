@@ -46,6 +46,9 @@ pub fn parse_manifest(bytes: &[u8], file_name: &str) -> Result<Pod> {
     // the manifest's own bytes are not the identity, the effective spec is.
     if let Some(spec) = pod.spec.as_mut() {
         rusternetes_common::defaults::default_pod_requests_from_limits(spec);
+        // `SetDefaults_*VolumeSource` defaultMode (the kubelet's downwardAPI
+        // `CollectData` errors on nil).
+        rusternetes_common::defaults::default_volume_source_modes(spec);
     }
 
     Ok(pod)
