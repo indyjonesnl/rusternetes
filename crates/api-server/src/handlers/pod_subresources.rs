@@ -397,9 +397,19 @@ pub async fn get_logs(
             Err(resp) => return Ok(resp),
         };
 
+        // The 101 returns at once and the stream runs in a detached task:
+        // carry the instrumentation hold (`longrunning_requests` gauge and the
+        // deferred `MonitorRequest`) across it, as `proxy_upgrade` does.
+        let hold = req
+            .extensions()
+            .get::<rusternetes_streamproxy::ConnectionHold>()
+            .cloned();
         return Ok(ws
             .protocols(streaming::LOG_WS_PROTOCOLS)
-            .on_upgrade(move |socket| streaming::handle_logs_websocket(socket, stream, base64))
+            .on_upgrade(move |socket| async move {
+                let _hold = hold;
+                streaming::handle_logs_websocket(socket, stream, base64).await
+            })
             .into_response());
     }
 
