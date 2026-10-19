@@ -128,7 +128,7 @@ fn zero_quantity() -> Quantity {
 }
 
 /// `ephemeral.VolumeClaimName` (`ephemeral.go:41-43`).
-fn ephemeral_claim_name(pod: &Pod, vol_name: &str) -> String {
+pub(crate) fn ephemeral_claim_name(pod: &Pod, vol_name: &str) -> String {
     format!("{}-{}", pod.metadata.name, vol_name)
 }
 
