@@ -2,11 +2,53 @@ use anyhow::{Context, Result};
 use std::process::Command;
 use tracing::{debug, error, info, warn};
 
-/// Probe one iptables backend's nat table. Returns `(has_kube_chains,
-/// rule_count)`: whether the `KUBE-` chains kube-proxy/flannel install are
-/// present (the strongest signal a backend is the active one), and how many
-/// concrete `-A` rule lines it holds. A binary that is missing or errors
-/// reports `(false, 0)`.
+/// Directories searched after `$PATH`. Upstream kube-proxy execs bare command
+/// names (`cmdIPTables = "iptables"`, `cmdIPTablesRestore = "iptables-restore"`,
+/// pkg/util/iptables/iptables.go:142-144) and lets the OS resolve them via
+/// `$PATH`; the image's iptables-wrapper puts them on it. Our image may not
+/// carry a wrapper and container `$PATH`s often omit `sbin` (Alpine installs
+/// to `/sbin`, Debian to `/usr/sbin`), so fall back to the usual sbin dirs
+/// instead of hardcoding `/usr/sbin` as before (#1581).
+const FALLBACK_BIN_DIRS: &[&str] = &[
+    "/usr/sbin",
+    "/sbin",
+    "/usr/local/sbin",
+    "/usr/bin",
+    "/bin",
+    "/usr/local/bin",
+];
+
+/// Resolve `name` to an executable path: `$PATH` first (what Go's
+/// `exec.LookPath` does for the bare names upstream uses), then the sbin
+/// fallbacks. Returns `None` when the binary exists nowhere.
+pub(crate) fn resolve_binary(name: &str) -> Option<String> {
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    let dirs: Vec<std::path::PathBuf> = std::env::split_paths(&path_var)
+        .chain(FALLBACK_BIN_DIRS.iter().map(std::path::PathBuf::from))
+        .collect();
+    resolve_binary_in(name, &dirs)
+}
+
+fn resolve_binary_in(name: &str, dirs: &[std::path::PathBuf]) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+    dirs.iter()
+        .map(|d| d.join(name))
+        .find(|p| {
+            std::fs::metadata(p)
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Probe one iptables backend. Returns `(has_kube_chains, rule_count)`:
+/// whether the `KUBE-` chains kube-proxy/flannel install, or the kubelet's
+/// `KUBE-IPTABLES-HINT` / `KUBE-KUBELET-CANARY` hint chains in the mangle
+/// table (pkg/kubelet/kubelet_network_linux.go `KubeIPTablesHintChain`: "the
+/// chain whose existence in either iptables-legacy or iptables-nft indicates
+/// which version of iptables the system is using"), are present, and how many
+/// concrete `-A` rule lines the nat table holds. A binary that is missing or
+/// errors reports `(false, 0)`.
 fn backend_signal(backend: &str) -> (bool, usize) {
     let Ok(out) = Command::new(backend).args(["-t", "nat", "-S"]).output() else {
         return (false, 0);
@@ -15,13 +57,71 @@ fn backend_signal(backend: &str) -> (bool, usize) {
         return (false, 0);
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    let has_kube = text.lines().any(|l| l.contains("KUBE-"));
+    let mut has_kube = text.lines().any(|l| l.contains("KUBE-"));
     // Count rules (-A ...), not chain declarations (-N/-P).
     let rules = text.lines().filter(|l| l.starts_with("-A")).count();
+    if !has_kube {
+        if let Ok(m) = Command::new(backend).args(["-t", "mangle", "-S"]).output() {
+            if m.status.success() {
+                has_kube = String::from_utf8_lossy(&m.stdout)
+                    .lines()
+                    .any(|l| l.contains("KUBE-IPTABLES-HINT") || l.contains("KUBE-KUBELET-CANARY"));
+            }
+        }
+    }
     (has_kube, rules)
 }
 
-/// Detect the correct iptables command to use.
+/// One probed backend binary: its path and `(kube_chains, rule_count)`.
+type Probe = (String, (bool, usize));
+
+/// Pure selection over already-gathered probes, so it is testable without a
+/// host iptables. Returns `(iptables_path, restore_binary_name)`, or `None`
+/// when no iptables binary exists at all. `default` is plain `iptables`.
+fn select_backend(
+    nft: Option<Probe>,
+    legacy: Option<Probe>,
+    default: Option<String>,
+) -> Option<(String, &'static str)> {
+    const NFT_RESTORE: &str = "iptables-nft-restore";
+    const LEGACY_RESTORE: &str = "iptables-legacy-restore";
+    let (nft_kube, nft_rules) = nft.as_ref().map(|n| n.1).unwrap_or((false, 0));
+    let (legacy_kube, legacy_rules) = legacy.as_ref().map(|l| l.1).unwrap_or((false, 0));
+    let decisive = match (nft_kube, legacy_kube) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        // Both or neither show KUBE chains: the busier table wins.
+        _ => {
+            if nft_rules >= legacy_rules && (nft_rules > 0 || nft_kube) {
+                Some(true)
+            } else if legacy_rules > 0 || legacy_kube {
+                Some(false)
+            } else {
+                None
+            }
+        }
+    };
+    let by_signal = match decisive {
+        Some(true) => nft.clone().map(|n| (n.0, NFT_RESTORE)),
+        Some(false) => legacy.clone().map(|l| (l.0, LEGACY_RESTORE)),
+        None => None,
+    };
+    by_signal
+        // Nothing decisive: the alternatives-managed default.
+        .or_else(|| default.map(|d| (d, "iptables-restore")))
+        // No plain `iptables` either: any variant binary beats ENOENT.
+        .or_else(|| nft.map(|n| (n.0, NFT_RESTORE)))
+        .or_else(|| legacy.map(|l| (l.0, LEGACY_RESTORE)))
+}
+
+/// Resolve `name` next to the chosen `iptables` binary.
+fn resolve_sibling(iptables: &str, name: &str) -> Option<String> {
+    let dir = std::path::Path::new(iptables).parent()?;
+    resolve_binary_in(name, &[dir.to_path_buf()])
+}
+
+/// Detect the iptables binary and its matching `iptables-restore` to use.
+/// Returns `(iptables, iptables_restore)`.
 ///
 /// kube-proxy MUST program the same backend (nft vs legacy) that the rest of
 /// the netns uses, or its DNAT/MASQUERADE rules land in a ruleset the kernel
@@ -32,48 +132,33 @@ fn backend_signal(backend: &str) -> (bool, usize) {
 /// We mirror the upstream `iptables-wrapper` heuristic
 /// (kubernetes-sigs/iptables-wrappers) — the same logic flannel-rs's
 /// `flanneld/src/ipmasq.rs::detect()` uses, so the two always agree:
-/// prefer the backend whose nat table holds the `KUBE-` chains; failing a clear
-/// winner, the busier table; failing that, the alternatives-managed default
-/// `/usr/sbin/iptables` (nft on every modern distro and our kind-style node).
+/// prefer the backend whose tables hold the `KUBE-` / hint chains; failing a
+/// clear winner, the busier table; failing that, the alternatives-managed
+/// default `iptables`.
 ///
-/// The previous heuristic keyed off a `DOCKER` chain to decide "this is Docker's
-/// nftables backend". That marker only exists in the Docker host's own netns —
-/// in the per-node model kube-proxy shares the *node's* netns (a nested
-/// container with no DOCKER chain), so the check failed and we wrongly fell back
-/// to iptables-legacy while the node ran nf_tables. Result: the
-/// kubernetes-service DNAT was written to the legacy table and silently never
-/// took effect (flanneld could not reach 10.96.0.1:443).
-fn detect_iptables_cmd() -> &'static str {
-    const NFT: &str = "/usr/sbin/iptables-nft";
-    const LEGACY: &str = "/usr/sbin/iptables-legacy";
-    const DEFAULT: &str = "/usr/sbin/iptables";
+/// Binaries are resolved through `$PATH` plus sbin fallbacks
+/// (`resolve_binary`), not hardcoded `/usr/sbin/...`: on an Alpine node
+/// (k0s differential harness, #1581) iptables lives in `/sbin` and the old
+/// hardcoded paths all failed with ENOENT, crash-looping the pod.
+fn detect_iptables() -> (String, String) {
+    let probe = |name: &str| resolve_binary(name).map(|p| (p.clone(), backend_signal(&p)));
+    let nft = probe("iptables-nft");
+    let legacy = probe("iptables-legacy");
+    let default = resolve_binary("iptables");
+    debug!(?nft, ?legacy, ?default, "iptables backend signals");
 
-    let (nft_kube, nft_rules) = backend_signal(NFT);
-    let (legacy_kube, legacy_rules) = backend_signal(LEGACY);
-    debug!(
-        nft_kube,
-        nft_rules, legacy_kube, legacy_rules, "iptables backend signals"
-    );
-
-    let cmd = match (nft_kube, legacy_kube) {
-        (true, false) => NFT,
-        (false, true) => LEGACY,
-        // Both or neither show KUBE chains: fall back to the busier table, and
-        // to the alternatives default when neither responded usefully (e.g. a
-        // freshly-booted node where kube-proxy is the first rule-writer — the
-        // default resolves to nft on modern systems).
-        _ => {
-            if nft_rules >= legacy_rules && (nft_rules > 0 || nft_kube) {
-                NFT
-            } else if legacy_rules > 0 || legacy_kube {
-                LEGACY
-            } else {
-                DEFAULT
-            }
-        }
+    let Some((iptables, restore_name)) = select_backend(nft, legacy, default) else {
+        warn!("no iptables binary found on $PATH or in sbin dirs; using bare `iptables`");
+        return ("iptables".to_string(), "iptables-restore".to_string());
     };
-    info!("Using {cmd} (iptables-wrapper heuristic: nft={nft_rules}r/kube={nft_kube}, legacy={legacy_rules}r/kube={legacy_kube})");
-    cmd
+    // Prefer the restore binary next to the chosen iptables (same family),
+    // then any resolvable one, then the family-less `iptables-restore`.
+    let restore = resolve_sibling(&iptables, restore_name)
+        .or_else(|| resolve_binary(restore_name))
+        .or_else(|| resolve_binary("iptables-restore"))
+        .unwrap_or_else(|| restore_name.to_string());
+    info!("Using {iptables} / {restore} (iptables-wrapper heuristic)");
+    (iptables, restore)
 }
 
 /// Detect the container bridge interface and its CIDR.
@@ -161,6 +246,8 @@ pub struct IptablesManager {
     hostports_chain: String,
     /// The iptables command to use (detected at init)
     iptables_cmd: String,
+    /// Matching `iptables-restore` (same backend family as `iptables_cmd`).
+    restore_cmd: String,
     /// ClusterIP CIDR — narrows the POSTROUTING MASQUERADE so it doesn't fire
     /// on Docker's own DNS DNAT and other non-cluster traffic. Must match the
     /// apiserver's `--service-cluster-ip-range`.
@@ -221,6 +308,7 @@ impl IptablesManager {
             nodeports_chain: "RUSTERNETES-NODEPORTS".to_string(),
             hostports_chain: "KUBE-HOSTPORTS".to_string(),
             iptables_cmd: "/usr/sbin/iptables".to_string(),
+            restore_cmd: "iptables-restore".to_string(),
             cluster_cidr: DEFAULT_CLUSTER_CIDR.to_string(),
             nodeport_range: DEFAULT_NODEPORT_RANGE.to_string(),
             sep_chains: std::sync::Mutex::new(Vec::new()),
@@ -231,7 +319,7 @@ impl IptablesManager {
     }
 
     pub fn new(cluster_cidr: String, nodeport_range: String) -> Self {
-        let iptables_cmd = detect_iptables_cmd().to_string();
+        let (iptables_cmd, restore_cmd) = detect_iptables();
         let bridge_network = detect_bridge_network();
         // Probe whether the xt_recent module is available by trying a dummy check rule.
         // If the module is missing, stderr contains "Couldn't load" or "No such file".
@@ -273,6 +361,7 @@ impl IptablesManager {
             nodeports_chain: "RUSTERNETES-NODEPORTS".to_string(),
             hostports_chain: "KUBE-HOSTPORTS".to_string(),
             iptables_cmd,
+            restore_cmd,
             cluster_cidr,
             nodeport_range,
             sep_chains: std::sync::Mutex::new(Vec::new()),
@@ -2254,11 +2343,7 @@ impl IptablesManager {
 
         // Apply rules via iptables-restore --noflush
         // Use the matching restore command for the detected iptables backend
-        let restore_cmd = if self.iptables_cmd.contains("legacy") {
-            "iptables-legacy-restore"
-        } else {
-            "iptables-restore"
-        };
+        let restore_cmd = &self.restore_cmd;
         // `-w 5`: wait up to 5s for the xtables lock instead of failing
         // immediately. Under load (kubelet programming hostPorts, CNI, and this
         // proxy all touch iptables) the lock is frequently held; without --wait,
@@ -2317,6 +2402,88 @@ impl Drop for IptablesManager {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn probe(path: &str, kube: bool, rules: usize) -> Option<Probe> {
+        Some((path.to_string(), (kube, rules)))
+    }
+
+    #[test]
+    fn select_backend_kube_chains_win() {
+        let r = select_backend(
+            probe("/sbin/iptables-nft", true, 1),
+            probe("/sbin/iptables-legacy", false, 50),
+            None,
+        );
+        assert_eq!(
+            r,
+            Some(("/sbin/iptables-nft".into(), "iptables-nft-restore"))
+        );
+        let r = select_backend(
+            probe("/sbin/iptables-nft", false, 50),
+            probe("/sbin/iptables-legacy", true, 1),
+            None,
+        );
+        assert_eq!(
+            r,
+            Some(("/sbin/iptables-legacy".into(), "iptables-legacy-restore"))
+        );
+    }
+
+    #[test]
+    fn select_backend_uses_default_when_no_signal() {
+        let r = select_backend(
+            probe("/sbin/iptables-nft", false, 0),
+            probe("/sbin/iptables-legacy", false, 0),
+            Some("/sbin/iptables".into()),
+        );
+        assert_eq!(r, Some(("/sbin/iptables".into(), "iptables-restore")));
+    }
+
+    // Alpine (#1581): only plain `iptables` exists, no -nft/-legacy variants.
+    #[test]
+    fn select_backend_alpine_only_plain_iptables() {
+        let r = select_backend(None, None, Some("/sbin/iptables".into()));
+        assert_eq!(r, Some(("/sbin/iptables".into(), "iptables-restore")));
+    }
+
+    #[test]
+    fn select_backend_variant_only_without_signal_or_default() {
+        let r = select_backend(None, probe("/usr/sbin/iptables-legacy", false, 0), None);
+        assert_eq!(
+            r,
+            Some((
+                "/usr/sbin/iptables-legacy".into(),
+                "iptables-legacy-restore"
+            ))
+        );
+        assert_eq!(select_backend(None, None, None), None);
+    }
+
+    #[test]
+    fn resolve_binary_in_finds_executable_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kp-resolve-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("iptables");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let noexec = dir.join("iptables-nft");
+        std::fs::write(&noexec, "x").unwrap();
+        std::fs::set_permissions(&noexec, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let dirs = vec![std::path::PathBuf::from("/nonexistent"), dir.clone()];
+        assert_eq!(
+            resolve_binary_in("iptables", &dirs),
+            Some(exe.to_string_lossy().into_owned())
+        );
+        assert_eq!(resolve_binary_in("iptables-nft", &dirs), None);
+        assert_eq!(resolve_binary_in("iptables-legacy", &dirs), None);
+        assert_eq!(
+            resolve_sibling(exe.to_str().unwrap(), "iptables"),
+            Some(exe.to_string_lossy().into_owned())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_probability_calculation_uniform() {

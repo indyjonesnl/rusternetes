@@ -293,9 +293,14 @@ async fn run_proxy<S: Storage + Send + Sync + 'static>(
 }
 
 fn check_iptables() -> anyhow::Result<()> {
-    let output = std::process::Command::new("/usr/sbin/iptables-legacy")
-        .arg("--version")
-        .output()?;
+    // Resolve via $PATH + sbin fallbacks like upstream's bare-name exec
+    // (pkg/util/iptables/iptables.go cmdIPTables); a hardcoded
+    // /usr/sbin/iptables-legacy fails with ENOENT on Alpine (#1581).
+    let bin = ["iptables", "iptables-nft", "iptables-legacy"]
+        .iter()
+        .find_map(|n| crate::iptables::resolve_binary(n))
+        .ok_or_else(|| anyhow::anyhow!("no iptables binary found"))?;
+    let output = std::process::Command::new(bin).arg("--version").output()?;
 
     if output.status.success() {
         let version = String::from_utf8_lossy(&output.stdout);
