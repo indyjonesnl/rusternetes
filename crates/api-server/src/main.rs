@@ -116,6 +116,13 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0:6443")]
     bind_address: String,
 
+    /// The IP address on which to advertise the apiserver to members of the
+    /// cluster (the `kubernetes` Endpoints). If blank or unspecified, the
+    /// host of `--bind-address` is used, resolved to the host's default
+    /// address of its family (upstream `--advertise-address`).
+    #[arg(long)]
+    advertise_address: Option<std::net::IpAddr>,
+
     /// Etcd endpoints (comma-separated)
     #[arg(long, default_value = "http://localhost:2379")]
     etcd_servers: String,
@@ -413,6 +420,7 @@ async fn main() -> Result<()> {
 
     let api_config = rusternetes_api_server::ApiServerConfig {
         bind_address: args.bind_address.clone(),
+        advertise_address: args.advertise_address,
         tls: args.tls,
         tls_cert_file: args.tls_cert_file.clone(),
         tls_key_file: args.tls_key_file.clone(),
@@ -447,6 +455,10 @@ async fn main() -> Result<()> {
         storage.clone(),
         api_port,
         service_ranges.api_server_service_ip(),
+        rusternetes_api_server::bootstrap::AdvertiseAddress::new(
+            args.advertise_address,
+            &args.bind_address,
+        ),
         service_ranges.cidrs(),
         rusternetes_api_server::startup::ClusterAuthnInputs {
             ca_cert_pem: ca_cert_pem.as_deref(),
