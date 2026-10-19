@@ -49,6 +49,9 @@ pub struct ApiStatusError {
     pub reason: String,
     /// Text rendered by `Display` (legacy format, see module docs).
     pub message: String,
+    /// `Status.Details.RetryAfterSeconds`; `None` is `Details == nil`
+    /// (no details at all), `Some(0)` is details without a delay.
+    pub retry_after_seconds: Option<i32>,
 }
 
 impl fmt::Display for ApiStatusError {
@@ -88,6 +91,31 @@ pub fn reason_and_code_for_error(err: &anyhow::Error) -> (String, u16) {
         .find_map(|c| c.downcast_ref::<ApiStatusError>())
         .map(|s| (s.reason.clone(), s.code))
         .unwrap_or_default()
+}
+
+/// `apierrors.SuggestsClientDelay` (errors.go:791-805): the suggested seconds
+/// to wait and true when the error carries `Status.Details` and either its
+/// reason is `ServerTimeout` or `RetryAfterSeconds > 0`. Finds the status
+/// anywhere in the chain (`errors.As`).
+pub fn suggests_client_delay(err: &anyhow::Error) -> Option<i32> {
+    let s = err
+        .chain()
+        .find_map(|c| c.downcast_ref::<ApiStatusError>())?;
+    let secs = s.retry_after_seconds?;
+    if s.reason == "ServerTimeout" || secs > 0 {
+        Some(secs)
+    } else {
+        None
+    }
+}
+
+/// `utilnet.IsHTTP2ConnectionLost` (apimachinery/pkg/util/net/util.go:51-54):
+/// the rendered error contains "http2: client connection lost". Go's
+/// `err.Error()` includes every wrapped cause, so each link of the chain is
+/// searched.
+pub fn is_http2_connection_lost(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|c| c.to_string().contains("http2: client connection lost"))
 }
 
 /// The shared `reason == X || (!knownReasons[reason] && code == C)` shape of
@@ -170,6 +198,7 @@ mod tests {
             code,
             reason: reason.into(),
             message: "m".into(),
+            retry_after_seconds: None,
         })
         .context("outer")
     }
@@ -230,5 +259,42 @@ mod tests {
         assert_eq!(generic_reason_for_code(422, "PUT"), "Invalid");
         assert_eq!(generic_reason_for_code(500, "GET"), "InternalError");
         assert_eq!(generic_reason_for_code(418, "GET"), "");
+    }
+
+    fn with_delay(reason: &str, secs: Option<i32>) -> anyhow::Error {
+        anyhow::Error::new(ApiStatusError {
+            code: 500,
+            reason: reason.into(),
+            message: "m".into(),
+            retry_after_seconds: secs,
+        })
+        .context("outer")
+    }
+
+    #[test]
+    fn suggests_client_delay_matches_upstream() {
+        let d = |r: &str, s: Option<i32>| suggests_client_delay(&with_delay(r, s));
+        // ServerTimeout with details: suggested even at 0 seconds.
+        assert_eq!(d("ServerTimeout", Some(0)), Some(0));
+        assert_eq!(d("ServerTimeout", Some(3)), Some(3));
+        // Any reason with RetryAfterSeconds > 0.
+        assert_eq!(d("", Some(5)), Some(5));
+        // Details without a delay, or no details at all: no suggestion.
+        assert_eq!(d("", Some(0)), None);
+        assert_eq!(d("", None), None);
+        // ServerTimeout without Details (Details == nil) is not suggested.
+        assert_eq!(d("ServerTimeout", None), None);
+        assert_eq!(suggests_client_delay(&anyhow::anyhow!("boom")), None);
+    }
+
+    #[test]
+    fn http2_connection_lost_searches_the_chain() {
+        let e = anyhow::anyhow!("http2: client connection lost").context("Post failed");
+        assert!(is_http2_connection_lost(&e));
+        let wrapped = anyhow::anyhow!("send: http2: client connection lost");
+        assert!(is_http2_connection_lost(&wrapped));
+        assert!(!is_http2_connection_lost(&anyhow::anyhow!(
+            "connection reset"
+        )));
     }
 }

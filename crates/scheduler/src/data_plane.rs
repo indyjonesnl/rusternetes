@@ -694,6 +694,7 @@ mod tests {
             code: 409,
             reason: "Conflict".into(),
             message: "Error from server (Conflict): pod already assigned".into(),
+            retry_after_seconds: None,
         });
         assert!(matches!(api_err_to_common(e), Error::Conflict(_)));
     }
@@ -709,6 +710,7 @@ mod tests {
                 code,
                 reason: reason.into(),
                 message: message.into(),
+                retry_after_seconds: None,
             })
         };
         assert!(matches!(

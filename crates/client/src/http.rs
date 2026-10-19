@@ -79,10 +79,22 @@ impl std::error::Error for GetError {}
 /// when it is a `Failure` Status (rest/request.go:1489-1511), otherwise the
 /// reason is derived from the HTTP code (`NewGenericServerResponse`,
 /// apimachinery errors.go:437-493).
+/// `retryAfterSeconds` (rest/request.go:1378-1385): the integer value of the
+/// `Retry-After` header, 0 when absent or not an integer.
+fn retry_after_seconds(response: &reqwest::Response) -> i32 {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.parse::<i32>().ok())
+        .unwrap_or(0)
+}
+
 fn format_status_error(
     status: reqwest::StatusCode,
     verb: &reqwest::Method,
     body: &str,
+    retry_after: i32,
 ) -> anyhow::Error {
     use crate::api_status::{generic_reason_for_code, ApiStatusError};
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
@@ -105,6 +117,14 @@ fn format_status_error(
                 code,
                 reason: reason.to_string(),
                 message: text,
+                // `Status.Details.RetryAfterSeconds`; `None` when the body
+                // carried no `details`.
+                retry_after_seconds: v.get("details").map(|d| {
+                    d.get("retryAfterSeconds")
+                        .and_then(|r| r.as_i64())
+                        .and_then(|r| i32::try_from(r).ok())
+                        .unwrap_or(0)
+                }),
             });
         }
     }
@@ -112,6 +132,9 @@ fn format_status_error(
         code: status.as_u16(),
         reason: generic_reason_for_code(status.as_u16(), verb.as_str()).to_string(),
         message: format!("request failed with status {status}: {body}"),
+        // `NewGenericServerResponse` always sets Details, carrying the
+        // `Retry-After` header (errors.go:511-523, request.go:1245-1246).
+        retry_after_seconds: Some(retry_after),
     })
 }
 
@@ -298,11 +321,13 @@ impl ApiClient {
         }
 
         if !status.is_success() {
+            let retry_after = retry_after_seconds(&response);
             let body = response.text().await.unwrap_or_default();
             return Err(GetError::Other(format_status_error(
                 status,
                 &reqwest::Method::GET,
                 &body,
+                retry_after,
             )));
         }
 
@@ -365,8 +390,14 @@ impl ApiClient {
 
         if !response.status().is_success() {
             let status = response.status();
+            let retry_after = retry_after_seconds(&response);
             let body = response.text().await.unwrap_or_default();
-            return Err(format_status_error(status, &reqwest::Method::POST, &body));
+            return Err(format_status_error(
+                status,
+                &reqwest::Method::POST,
+                &body,
+                retry_after,
+            ));
         }
 
         response.json().await.context("Failed to parse response")
@@ -385,8 +416,14 @@ impl ApiClient {
 
         if !response.status().is_success() {
             let status = response.status();
+            let retry_after = retry_after_seconds(&response);
             let body = response.text().await.unwrap_or_default();
-            return Err(format_status_error(status, &reqwest::Method::PUT, &body));
+            return Err(format_status_error(
+                status,
+                &reqwest::Method::PUT,
+                &body,
+                retry_after,
+            ));
         }
 
         response.json().await.context("Failed to parse response")
@@ -430,8 +467,14 @@ impl ApiClient {
         let status = response.status();
 
         if !status.is_success() && status != StatusCode::NOT_FOUND {
+            let retry_after = retry_after_seconds(&response);
             let body = response.text().await.unwrap_or_default();
-            return Err(format_status_error(status, &reqwest::Method::DELETE, &body));
+            return Err(format_status_error(
+                status,
+                &reqwest::Method::DELETE,
+                &body,
+                retry_after,
+            ));
         }
 
         Ok(status)
@@ -477,8 +520,14 @@ impl ApiClient {
 
         if !response.status().is_success() {
             let status = response.status();
+            let retry_after = retry_after_seconds(&response);
             let body = response.text().await.unwrap_or_default();
-            return Err(format_status_error(status, &reqwest::Method::PATCH, &body));
+            return Err(format_status_error(
+                status,
+                &reqwest::Method::PATCH,
+                &body,
+                retry_after,
+            ));
         }
 
         response.json().await.context("Failed to parse response")
@@ -576,7 +625,7 @@ mod tests {
     #[test]
     fn test_format_status_error_already_exists() {
         let body = r#"{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"AlreadyExists","message":"configmaps \"f5-cm\" already exists","code":409}"#;
-        let err = format_status_error(StatusCode::CONFLICT, &reqwest::Method::POST, body);
+        let err = format_status_error(StatusCode::CONFLICT, &reqwest::Method::POST, body, 0);
         assert_eq!(
             err.to_string(),
             "Error from server (AlreadyExists): configmaps \"f5-cm\" already exists"
@@ -586,7 +635,7 @@ mod tests {
     #[test]
     fn test_format_status_error_not_found() {
         let body = r#"{"kind":"Status","status":"Failure","reason":"NotFound","message":"pods \"x\" not found","code":404}"#;
-        let err = format_status_error(StatusCode::NOT_FOUND, &reqwest::Method::POST, body);
+        let err = format_status_error(StatusCode::NOT_FOUND, &reqwest::Method::POST, body, 0);
         assert_eq!(
             err.to_string(),
             "Error from server (NotFound): pods \"x\" not found"
@@ -601,6 +650,7 @@ mod tests {
             StatusCode::INTERNAL_SERVER_ERROR,
             &reqwest::Method::POST,
             body,
+            0,
         );
         assert_eq!(err.to_string(), "Error from server: something bad");
     }
@@ -608,7 +658,7 @@ mod tests {
     #[test]
     fn test_format_status_error_non_status_body_falls_back() {
         let body = "plain text gateway error";
-        let err = format_status_error(StatusCode::BAD_GATEWAY, &reqwest::Method::POST, body);
+        let err = format_status_error(StatusCode::BAD_GATEWAY, &reqwest::Method::POST, body, 0);
         assert_eq!(
             err.to_string(),
             "request failed with status 502 Bad Gateway: plain text gateway error"
@@ -622,11 +672,51 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             &reqwest::Method::POST,
             body,
+            0,
         );
         assert_eq!(
             err.to_string(),
             "request failed with status 503 Service Unavailable: <html>503</html>"
         );
+    }
+
+    #[test]
+    fn retry_after_comes_from_status_details_or_header() {
+        use crate::api_status::suggests_client_delay;
+        // Body Status with details.retryAfterSeconds (Result.Error() keeps it).
+        let body = r#"{"kind":"Status","status":"Failure","reason":"ServerTimeout","code":500,"details":{"retryAfterSeconds":7},"message":"m"}"#;
+        let e = format_status_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &reqwest::Method::GET,
+            body,
+            0,
+        );
+        assert_eq!(suggests_client_delay(&e), Some(7));
+        // Body Status without details: no suggestion, header ignored (client-go
+        // only uses the header for the unstructured fallback error).
+        let body = r#"{"kind":"Status","status":"Failure","reason":"InternalError","code":500,"message":"m"}"#;
+        let e = format_status_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &reqwest::Method::GET,
+            body,
+            9,
+        );
+        assert_eq!(suggests_client_delay(&e), None);
+        // Non-Status body: Details always set, carrying the Retry-After header.
+        let e = format_status_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &reqwest::Method::GET,
+            "oops",
+            4,
+        );
+        assert_eq!(suggests_client_delay(&e), Some(4));
+        let e = format_status_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &reqwest::Method::GET,
+            "oops",
+            0,
+        );
+        assert_eq!(suggests_client_delay(&e), None);
     }
 
     // Throwaway self-signed client cert + key (RSA-2048, CN=test-client),
