@@ -247,7 +247,7 @@ fn collect_host_ports(pod: &Pod) -> Vec<(u16, String, String)> {
 
 /// Check if two hostIP values overlap.
 /// "0.0.0.0", "::", and "" all mean "all interfaces" and overlap with everything.
-fn host_ips_overlap(ip1: &str, ip2: &str) -> bool {
+pub(crate) fn host_ips_overlap(ip1: &str, ip2: &str) -> bool {
     let wildcard = |ip: &str| ip.is_empty() || ip == "0.0.0.0" || ip == "::";
     if wildcard(ip1) || wildcard(ip2) {
         return true;

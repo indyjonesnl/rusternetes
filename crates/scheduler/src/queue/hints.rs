@@ -13,8 +13,14 @@
 //!   `EventsToRegister` (`:101-117`), `isSchedulableAfterNodeChange`
 //!   (`:119-174`).
 //!
-//! Only NodeResourcesFit and NodeAffinity ship hint functions in this slice;
-//! every other in-tree plugin registers its events hint-less, which
+//! - `nodeports/node_ports.go` (`:117-158`), `nodeunschedulable/
+//!   node_unschedulable.go` (`:50-128`), `tainttoleration/taint_toleration.go`
+//!   (`:55-115`, `:228-245`).
+//! - `pkg/scheduler/framework/plugins/schedulinggates/scheduling_gates.go`
+//!   (`:59-94`).
+//!
+//! NodeResourcesFit, NodeAffinity, NodePorts, NodeUnschedulable,
+//! TaintToleration and SchedulingGates ship hint functions; every other in-tree plugin registers its events hint-less, which
 //! `build_queueing_hint_map` turns into `defaultQueueingHintFn` (always
 //! `Queue`) — exactly upstream's behaviour for a nil `QueueingHintFn`.
 
@@ -158,16 +164,34 @@ pub fn events_to_register(
         // nodename/node_name.go:48-58
         names::NODE_NAME => vec![ev(R::Node, A::ADD)],
         // nodeports/node_ports.go:117-132
-        names::NODE_PORTS => vec![ev(R::Pod, A::DELETE), ev(R::Node, A::ADD)],
+        names::NODE_PORTS => vec![
+            ClusterEventWithHint::with_hint(
+                ClusterEvent::new(R::Pod, A::DELETE),
+                Arc::new(node_ports::is_schedulable_after_pod_deleted),
+            ),
+            ev(R::Node, A::ADD),
+        ],
         // nodeunschedulable/node_unschedulable.go:50-61
         names::NODE_UNSCHEDULABLE => vec![
-            ev(R::Node, A::ADD | A::UPDATE_NODE_TAINT),
-            ev(R::Pod, A::UPDATE_POD_TOLERATION),
+            ClusterEventWithHint::with_hint(
+                ClusterEvent::new(R::Node, A::ADD | A::UPDATE_NODE_TAINT),
+                Arc::new(node_unschedulable::is_schedulable_after_node_change),
+            ),
+            ClusterEventWithHint::with_hint(
+                ClusterEvent::new(R::Pod, A::UPDATE_POD_TOLERATION),
+                Arc::new(node_unschedulable::is_schedulable_after_pod_toleration_change),
+            ),
         ],
         // tainttoleration/taint_toleration.go:55-66
         names::TAINT_TOLERATION => vec![
-            ev(R::Node, A::ADD | A::UPDATE_NODE_TAINT),
-            ev(R::Pod, A::UPDATE_POD_TOLERATION),
+            ClusterEventWithHint::with_hint(
+                ClusterEvent::new(R::Node, A::ADD | A::UPDATE_NODE_TAINT),
+                Arc::new(taint_toleration::is_schedulable_after_node_change),
+            ),
+            ClusterEventWithHint::with_hint(
+                ClusterEvent::new(R::Pod, A::UPDATE_POD_TOLERATION),
+                Arc::new(taint_toleration::is_schedulable_after_pod_toleration_change),
+            ),
         ],
         // interpodaffinity/plugin.go:65-80
         names::INTER_POD_AFFINITY => vec![
@@ -301,7 +325,10 @@ pub fn events_to_register(
             ev(R::ResourceSlice, A::ADD | A::UPDATE),
         ],
         // schedulinggates/scheduling_gates.go:60-67
-        names::SCHEDULING_GATES => vec![ev(R::Pod, A::UPDATE_POD_SCHEDULING_GATES_ELIMINATED)],
+        names::SCHEDULING_GATES => vec![ClusterEventWithHint::with_hint(
+            ClusterEvent::new(R::Pod, A::UPDATE_POD_SCHEDULING_GATES_ELIMINATED),
+            Arc::new(scheduling_gates::is_schedulable_after_update_pod_scheduling_gates_eliminated),
+        )],
         // defaultpreemption/default_preemption.go:107-116 (async preemption on)
         names::DEFAULT_PREEMPTION => vec![ClusterEventWithHint::with_hint(
             ClusterEvent::new(R::Pod, A::DELETE),
@@ -536,6 +563,288 @@ pub mod node_affinity {
     /// nodeSelector AND required node affinity terms.
     fn required_affinity_matches(pod: &Pod, node: &Node) -> bool {
         check_node_affinity(node, pod).0
+    }
+}
+
+/// `nodeports/node_ports.go` queueing hints.
+pub mod node_ports {
+    use super::*;
+    use crate::advanced::host_ips_overlap;
+    use rusternetes_common::resources::ContainerPort;
+
+    /// `isSchedulableAfterPodDeleted` (`node_ports.go:126-158`): deleting a
+    /// scheduled pod only helps when it held a host port the target wants.
+    pub fn is_schedulable_after_pod_deleted(
+        pod: &Pod,
+        old_obj: Option<&EventObject>,
+        _new_obj: Option<&EventObject>,
+    ) -> Result<QueueingHint, String> {
+        let (deleted_pod, _) = as_typed::<Pod>(old_obj, None)?;
+        let deleted_pod =
+            deleted_pod.ok_or_else(|| "pod delete event without an old object".to_string())?;
+
+        // If the deleted pod is unscheduled, it doesn't make the target pod schedulable.
+        let node_name = deleted_pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.node_name.as_deref())
+            .unwrap_or("");
+        let nominated = deleted_pod
+            .status
+            .as_ref()
+            .and_then(|s| s.nominated_node_name.as_deref())
+            .unwrap_or("");
+        if node_name.is_empty() && nominated.is_empty() {
+            debug!(pod = %pod_name(pod), deleted_pod = %pod_name(deleted_pod), "the deleted pod is unscheduled and it doesn't make the target pod schedulable");
+            return Ok(QueueingHint::QueueSkip);
+        }
+
+        // If the deleted pod doesn't use any host ports, it doesn't make the target pod schedulable.
+        let ports_in_use = get_host_ports(deleted_pod);
+        if ports_in_use.is_empty() {
+            return Ok(QueueingHint::QueueSkip);
+        }
+
+        // Verify that `pod` and the deleted pod don't have any common port(s).
+        if fits_ports(&get_host_ports(pod), &ports_in_use) {
+            debug!(pod = %pod_name(pod), deleted_pod = %pod_name(deleted_pod), "the deleted pod and the target pod don't have any common port(s), returning QueueSkip as deleting this Pod won't make the Pod schedulable");
+            return Ok(QueueingHint::QueueSkip);
+        }
+
+        debug!(pod = %pod_name(pod), deleted_pod = %pod_name(deleted_pod), "the deleted pod and the target pod have any common port(s), returning Queue as deleting this Pod may make the Pod schedulable");
+        Ok(QueueingHint::Queue)
+    }
+
+    /// `util.GetHostPorts` (`pkg/scheduler/util/utils.go:183-`): host ports of
+    /// the containers and of the restartable (sidecar) init containers.
+    fn get_host_ports(pod: &Pod) -> Vec<&ContainerPort> {
+        let mut ports = Vec::new();
+        let Some(spec) = pod.spec.as_ref() else {
+            return ports;
+        };
+        let host_port = |p: &&ContainerPort| p.host_port.unwrap_or(0) > 0;
+        for c in spec.init_containers.iter().flatten() {
+            // Only consider initContainers that will be running the entire
+            // duration of the Pod.
+            if c.restart_policy.as_deref() != Some("Always") {
+                continue;
+            }
+            ports.extend(c.ports.iter().flatten().filter(host_port));
+        }
+        for c in &spec.containers {
+            ports.extend(c.ports.iter().flatten().filter(host_port));
+        }
+        ports
+    }
+
+    /// `fitsPorts` (`node_ports.go:182-190`) against `HostPortInfo.CheckConflict`
+    /// (`k8s.io/kube-scheduler/framework/types.go`): same protocol and port,
+    /// and overlapping host IPs (an unset/`0.0.0.0` IP overlaps everything).
+    fn fits_ports(want: &[&ContainerPort], in_use: &[&ContainerPort]) -> bool {
+        let protocol = |p: &ContainerPort| {
+            if p.protocol.is_empty() {
+                "TCP".to_string()
+            } else {
+                p.protocol.clone()
+            }
+        };
+        let ip = |p: &ContainerPort| p.host_ip.clone().unwrap_or_default();
+        !want.iter().any(|w| {
+            in_use.iter().any(|u| {
+                w.host_port == u.host_port
+                    && protocol(w) == protocol(u)
+                    && host_ips_overlap(&ip(w), &ip(u))
+            })
+        })
+    }
+}
+
+/// Taint helpers shared by NodeUnschedulable and TaintToleration.
+mod taints {
+    use crate::advanced::toleration_matches_taint;
+    use rusternetes_common::resources::{Taint, Toleration};
+
+    /// `TolerationsTolerateTaint` (`component-helpers/scheduling/corev1/helpers.go`).
+    pub fn tolerations_tolerate_taint(tolerations: &[Toleration], taint: &Taint) -> bool {
+        tolerations
+            .iter()
+            .any(|t| toleration_matches_taint(t, taint))
+    }
+
+    /// `FindMatchingUntoleratedTaint` with `DoNotScheduleTaintsFilterFunc`
+    /// (`helpers.go:79-87`): is there a NoSchedule/NoExecute taint the
+    /// tolerations don't tolerate?
+    pub fn has_untolerated_do_not_schedule_taint(
+        taints: &[Taint],
+        tolerations: &[Toleration],
+    ) -> bool {
+        taints
+            .iter()
+            .filter(|t| t.effect == "NoSchedule" || t.effect == "NoExecute")
+            .any(|t| !tolerations_tolerate_taint(tolerations, t))
+    }
+}
+
+fn pod_tolerations(pod: &Pod) -> &[rusternetes_common::resources::Toleration] {
+    pod.spec
+        .as_ref()
+        .and_then(|s| s.tolerations.as_deref())
+        .unwrap_or(&[])
+}
+
+fn node_taints(node: &Node) -> &[rusternetes_common::resources::Taint] {
+    node.spec
+        .as_ref()
+        .and_then(|s| s.taints.as_deref())
+        .unwrap_or(&[])
+}
+
+fn node_unschedulable_flag(node: &Node) -> bool {
+    node.spec
+        .as_ref()
+        .and_then(|s| s.unschedulable)
+        .unwrap_or(false)
+}
+
+/// `nodeunschedulable/node_unschedulable.go` queueing hints.
+pub mod node_unschedulable {
+    use super::*;
+    use rusternetes_common::resources::Taint;
+
+    /// `isSchedulableAfterPodTolerationChange` (`node_unschedulable.go:78-105`).
+    pub fn is_schedulable_after_pod_toleration_change(
+        pod: &Pod,
+        old_obj: Option<&EventObject>,
+        new_obj: Option<&EventObject>,
+    ) -> Result<QueueingHint, String> {
+        let (_, modified_pod) = as_typed::<Pod>(old_obj, new_obj)?;
+        let modified_pod =
+            modified_pod.ok_or_else(|| "pod event without a new object".to_string())?;
+
+        if pod.metadata.uid == modified_pod.metadata.uid {
+            // Note: we don't need to check oldPod tolerations the taint because:
+            // - Taint can be added, but can't be modified nor removed.
+            // - If the Pod already has the toleration, it shouldn't have rejected by this plugin in the first place.
+            //   Meaning, here this Pod has been rejected by this plugin, and hence it shouldn't have the toleration yet.
+            let unschedulable = Taint {
+                key: "node.kubernetes.io/unschedulable".to_string(),
+                value: None,
+                effect: "NoSchedule".to_string(),
+                time_added: None,
+            };
+            if taints::tolerations_tolerate_taint(pod_tolerations(modified_pod), &unschedulable) {
+                // This update makes the pod tolerate the unschedulable taint.
+                debug!(pod = %pod_name(modified_pod), "a new toleration is added for the unschedulable Pod, and it may make it schedulable");
+                return Ok(QueueingHint::Queue);
+            }
+            debug!(pod = %pod_name(modified_pod), "a new toleration is added for the unschedulable Pod, but it's an unrelated toleration");
+            return Ok(QueueingHint::QueueSkip);
+        }
+
+        debug!(pod = %pod_name(modified_pod), "a new toleration is added for a Pod, but it's an unrelated Pod and wouldn't change the TaintToleration plugin's decision");
+        Ok(QueueingHint::QueueSkip)
+    }
+
+    /// `isSchedulableAfterNodeChange` (`node_unschedulable.go:107-128`).
+    pub fn is_schedulable_after_node_change(
+        pod: &Pod,
+        old_obj: Option<&EventObject>,
+        new_obj: Option<&EventObject>,
+    ) -> Result<QueueingHint, String> {
+        let (original_node, modified_node) = as_typed::<Node>(old_obj, new_obj)?;
+        let modified_node =
+            modified_node.ok_or_else(|| "node event without a new object".to_string())?;
+
+        // We queue this Pod when -
+        // 1. the node is updated from unschedulable to schedulable.
+        // 2. the node is added and is schedulable.
+        let modified_unschedulable = node_unschedulable_flag(modified_node);
+        if original_node.is_some_and(|o| node_unschedulable_flag(o) && !modified_unschedulable)
+            || (original_node.is_none() && !modified_unschedulable)
+        {
+            debug!(pod = %pod_name(pod), node = %modified_node.metadata.name, "node was created or updated, pod may be schedulable now");
+            return Ok(QueueingHint::Queue);
+        }
+
+        debug!(pod = %pod_name(pod), node = %modified_node.metadata.name, "node was created or updated, but it doesn't make this pod schedulable");
+        Ok(QueueingHint::QueueSkip)
+    }
+}
+
+/// `tainttoleration/taint_toleration.go` queueing hints.
+pub mod taint_toleration {
+    use super::*;
+
+    /// `isSchedulableAfterNodeChange` (`taint_toleration.go:96-115`).
+    pub fn is_schedulable_after_node_change(
+        pod: &Pod,
+        old_obj: Option<&EventObject>,
+        new_obj: Option<&EventObject>,
+    ) -> Result<QueueingHint, String> {
+        let (original_node, modified_node) = as_typed::<Node>(old_obj, new_obj)?;
+        let modified_node =
+            modified_node.ok_or_else(|| "node event without a new object".to_string())?;
+
+        let tolerations = pod_tolerations(pod);
+        let mut was_untolerated = true;
+        if let Some(original) = original_node {
+            was_untolerated =
+                taints::has_untolerated_do_not_schedule_taint(node_taints(original), tolerations);
+        }
+        let is_untolerated =
+            taints::has_untolerated_do_not_schedule_taint(node_taints(modified_node), tolerations);
+
+        if was_untolerated && !is_untolerated {
+            debug!(pod = %pod_name(pod), node = %modified_node.metadata.name, "node was created or updated, and this may make the Pod rejected by TaintToleration plugin in the previous scheduling cycle schedulable");
+            return Ok(QueueingHint::Queue);
+        }
+
+        debug!(pod = %pod_name(pod), node = %modified_node.metadata.name, "node was created or updated, but it doesn't change the TaintToleration plugin's decision");
+        Ok(QueueingHint::QueueSkip)
+    }
+
+    /// `isSchedulableAfterPodTolerationChange` (`taint_toleration.go:228-245`).
+    pub fn is_schedulable_after_pod_toleration_change(
+        pod: &Pod,
+        old_obj: Option<&EventObject>,
+        new_obj: Option<&EventObject>,
+    ) -> Result<QueueingHint, String> {
+        let (_, modified_pod) = as_typed::<Pod>(old_obj, new_obj)?;
+        let modified_pod =
+            modified_pod.ok_or_else(|| "pod event without a new object".to_string())?;
+
+        if pod.metadata.uid == modified_pod.metadata.uid {
+            // The updated Pod is the unschedulable Pod.
+            debug!(pod = %pod_name(modified_pod), "a new toleration is added for the unschedulable Pod, and it may make it schedulable");
+            return Ok(QueueingHint::Queue);
+        }
+
+        debug!(pod = %pod_name(modified_pod), "a new toleration is added for a Pod, but it's an unrelated Pod and wouldn't change the TaintToleration plugin's decision");
+        Ok(QueueingHint::QueueSkip)
+    }
+}
+
+/// `schedulinggates/scheduling_gates.go` queueing hints.
+pub mod scheduling_gates {
+    use super::*;
+
+    /// `isSchedulableAfterUpdatePodSchedulingGatesEliminated`
+    /// (`scheduling_gates.go:82-94`).
+    pub fn is_schedulable_after_update_pod_scheduling_gates_eliminated(
+        pod: &Pod,
+        old_obj: Option<&EventObject>,
+        new_obj: Option<&EventObject>,
+    ) -> Result<QueueingHint, String> {
+        let (_, modified_pod) = as_typed::<Pod>(old_obj, new_obj)?;
+        let modified_pod =
+            modified_pod.ok_or_else(|| "pod event without a new object".to_string())?;
+
+        if modified_pod.metadata.uid != pod.metadata.uid {
+            // If the update event is not for targetPod, it wouldn't make targetPod schedulable.
+            return Ok(QueueingHint::QueueSkip);
+        }
+
+        Ok(QueueingHint::Queue)
     }
 }
 
@@ -886,6 +1195,287 @@ mod tests {
                 labelled_node("n", json!({"foo": "bar", "zone": "a"}))
             )
             .unwrap(),
+            QueueingHint::Queue
+        );
+    }
+
+    fn gated_pod(uid: &str, gates: &[&str]) -> Pod {
+        let gates: Vec<_> = gates.iter().map(|g| json!({"name": g})).collect();
+        serde_json::from_value(json!({
+            "metadata": {"name": "p", "uid": uid},
+            "spec": {"containers": [], "schedulingGates": gates}
+        }))
+        .unwrap()
+    }
+
+    /// `Test_isSchedulableAfterPodChange` (`scheduling_gates_test.go:66-115`).
+    #[test]
+    fn scheduling_gates_is_schedulable_after_pod_change() {
+        use scheduling_gates::is_schedulable_after_update_pod_scheduling_gates_eliminated as f;
+        let pod = empty_pod();
+        // backoff-wrong-old-object / backoff-wrong-new-object
+        let any = obj(empty_pod());
+        assert!(f(&pod, Some(&"not-a-pod"), Some(&*any)).is_err());
+        assert!(f(&pod, None, Some(&"not-a-pod")).is_err());
+        // skip-queue-on-other-pod-updated
+        let target = gated_pod("uid0", &["foo", "bar"]);
+        let old = obj(gated_pod("uid1", &["foo", "bar"]));
+        let new = obj(gated_pod("uid1", &["foo"]));
+        assert_eq!(
+            f(&target, Some(&*old), Some(&*new)).unwrap(),
+            QueueingHint::QueueSkip
+        );
+        // queue-on-the-unsched-pod-updated
+        let target = gated_pod("", &["foo"]);
+        let old = obj(gated_pod("", &["foo"]));
+        let new = obj(gated_pod("", &[]));
+        assert_eq!(
+            f(&target, Some(&*old), Some(&*new)).unwrap(),
+            QueueingHint::Queue
+        );
+    }
+
+    // ---- NodePorts / NodeUnschedulable / TaintToleration -----------------
+
+    fn host_port_pod(node: Option<&str>, port: Option<u16>) -> Pod {
+        let mut spec = json!({"containers": [{"name": "c"}]});
+        if let Some(n) = node {
+            spec["nodeName"] = json!(n);
+        }
+        if let Some(p) = port {
+            spec["containers"][0]["ports"] = json!([{"containerPort": p, "hostPort": p}]);
+        }
+        serde_json::from_value(json!({"metadata": {"name": "p"}, "spec": spec})).unwrap()
+    }
+
+    /// `Test_isSchedulableAfterPodDeleted` (`node_ports_test.go:223-273`).
+    #[test]
+    fn node_ports_is_schedulable_after_pod_deleted() {
+        use node_ports::is_schedulable_after_pod_deleted as f;
+        let target = host_port_pod(None, Some(8080));
+        // backoff-wrong-old-object
+        assert!(f(&target, Some(&"not-a-pod"), None).is_err());
+        let cases = [
+            (
+                "skip-queue-on-unscheduled",
+                host_port_pod(None, None),
+                QueueingHint::QueueSkip,
+            ),
+            (
+                "skip-queue-on-non-hostport",
+                host_port_pod(Some("fake-node"), None),
+                QueueingHint::QueueSkip,
+            ),
+            (
+                "skip-queue-on-unrelated-hostport",
+                host_port_pod(Some("fake-node"), Some(8081)),
+                QueueingHint::QueueSkip,
+            ),
+            (
+                "queue-on-released-hostport",
+                host_port_pod(Some("fake-node"), Some(8080)),
+                QueueingHint::Queue,
+            ),
+        ];
+        for (name, old, want) in cases {
+            let old = obj(old);
+            assert_eq!(f(&target, Some(&*old), None).unwrap(), want, "{name}");
+        }
+    }
+
+    fn unsched_node(unschedulable: bool, taints: serde_json::Value) -> Node {
+        serde_json::from_value(json!({
+            "metadata": {"name": "n"},
+            "spec": {"unschedulable": unschedulable, "taints": taints}
+        }))
+        .unwrap()
+    }
+
+    /// `TestIsSchedulableAfterNodeChange` (`node_unschedulable_test.go:93-211`).
+    #[test]
+    fn node_unschedulable_is_schedulable_after_node_change() {
+        use node_unschedulable::is_schedulable_after_node_change as f;
+        let pod = empty_pod();
+        let none = json!([]);
+        let not_ready = json!([{"key": "node.kubernetes.io/not-ready", "effect": "NoExecute"}]);
+        // error-wrong-new-object / error-wrong-old-object
+        assert!(f(&pod, None, Some(&"not-a-node")).is_err());
+        let new = obj(unsched_node(true, none.clone()));
+        assert!(f(&pod, Some(&"not-a-node"), Some(&*new)).is_err());
+        let cases = [
+            (
+                "skip-queue-on-unschedulable-node-added",
+                None,
+                unsched_node(true, none.clone()),
+                QueueingHint::QueueSkip,
+            ),
+            (
+                "queue-on-schedulable-node-added",
+                None,
+                unsched_node(false, none.clone()),
+                QueueingHint::Queue,
+            ),
+            (
+                "skip-unrelated-change-unschedulable-true",
+                Some(unsched_node(true, none.clone())),
+                unsched_node(true, not_ready.clone()),
+                QueueingHint::QueueSkip,
+            ),
+            (
+                "skip-unrelated-change-unschedulable-false",
+                Some(unsched_node(false, none.clone())),
+                unsched_node(false, not_ready.clone()),
+                QueueingHint::QueueSkip,
+            ),
+            (
+                "queue-on-unschedulable-field-change",
+                Some(unsched_node(true, none.clone())),
+                unsched_node(false, none.clone()),
+                QueueingHint::Queue,
+            ),
+        ];
+        for (name, old, new, want) in cases {
+            let old = old.map(obj);
+            let new = obj(new);
+            assert_eq!(
+                f(&pod, old.as_deref(), Some(&*new)).unwrap(),
+                want,
+                "{name}"
+            );
+        }
+    }
+
+    fn empty_pod() -> Pod {
+        serde_json::from_value(json!({"metadata": {"name": "p"}, "spec": {"containers": []}}))
+            .unwrap()
+    }
+
+    fn tol_pod(uid: &str, tolerations: serde_json::Value) -> Pod {
+        serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "ns", "uid": uid},
+            "spec": {"containers": [], "tolerations": tolerations}
+        }))
+        .unwrap()
+    }
+
+    /// `TestIsSchedulableAfterPodTolerationChange`
+    /// (`node_unschedulable_test.go:214-272`).
+    #[test]
+    fn node_unschedulable_is_schedulable_after_pod_toleration_change() {
+        use node_unschedulable::is_schedulable_after_pod_toleration_change as f;
+        let pod = tol_pod("uid", json!([]));
+        assert!(f(&pod, None, Some(&"not-a-pod")).is_err());
+        let new = obj(empty_pod());
+        assert!(f(&pod, Some(&"not-a-pod"), Some(&*new)).is_err());
+        let unsched = json!([{"key": "node.kubernetes.io/unschedulable", "operator": "Exists"}]);
+        let cases = [
+            (
+                "skip-different-pod-update",
+                "different-uid",
+                unsched.clone(),
+                QueueingHint::QueueSkip,
+            ),
+            (
+                "queue-when-the-unsched-pod-gets-toleration",
+                "uid",
+                unsched.clone(),
+                QueueingHint::Queue,
+            ),
+            (
+                "skip-when-the-unsched-pod-gets-unrelated-toleration",
+                "uid",
+                json!([{"key": "unrelated-key", "operator": "Exists"}]),
+                QueueingHint::QueueSkip,
+            ),
+        ];
+        for (name, uid, tols, want) in cases {
+            let old = obj(tol_pod(uid, json!([])));
+            let new = obj(tol_pod(uid, tols));
+            assert_eq!(f(&pod, Some(&*old), Some(&*new)).unwrap(), want, "{name}");
+        }
+    }
+
+    fn taint_node(taints: serde_json::Value) -> Node {
+        serde_json::from_value(json!({"metadata": {"name": "nodeA"}, "spec": {"taints": taints}}))
+            .unwrap()
+    }
+
+    fn taint(value: &str) -> serde_json::Value {
+        json!({"key": "dedicated", "value": value, "effect": "NoSchedule"})
+    }
+
+    /// `TestIsSchedulableAfterNodeChange` (`taint_toleration_test.go:535-597`).
+    #[test]
+    fn taint_toleration_is_schedulable_after_node_change() {
+        use taint_toleration::is_schedulable_after_node_change as f;
+        let pod = tol_pod(
+            "u",
+            json!([{"key": "dedicated", "operator": "Equal", "value": "user2", "effect": "NoSchedule"}]),
+        );
+        assert!(f(&pod, None, Some(&"not-a-node")).is_err());
+        let new = obj(taint_node(json!([taint("user1")])));
+        assert!(f(&pod, Some(&"not-a-node"), Some(&*new)).is_err());
+        let cases = [
+            (
+                "skip-queue-on-untoleratedtaint-node-added",
+                None,
+                json!([taint("user1")]),
+                QueueingHint::QueueSkip,
+            ),
+            (
+                "queue-on-toleratedtaint-node-added",
+                None,
+                json!([taint("user2")]),
+                QueueingHint::Queue,
+            ),
+            (
+                "skip-unrelated-change",
+                Some(json!([taint("user1")])),
+                json!([taint("user1"), taint("user3")]),
+                QueueingHint::QueueSkip,
+            ),
+            (
+                "queue-on-taint-change",
+                Some(json!([taint("user1")])),
+                json!([taint("user2")]),
+                QueueingHint::Queue,
+            ),
+        ];
+        for (name, old, new, want) in cases {
+            let old = old.map(|t| obj(taint_node(t)));
+            let new = obj(taint_node(new));
+            assert_eq!(
+                f(&pod, old.as_deref(), Some(&*new)).unwrap(),
+                want,
+                "{name}"
+            );
+        }
+    }
+
+    /// `Test_isSchedulableAfterPodTolerationChange`
+    /// (`taint_toleration_test.go:600-702`).
+    #[test]
+    fn taint_toleration_is_schedulable_after_pod_toleration_change() {
+        use taint_toleration::is_schedulable_after_pod_toleration_change as f;
+        let pod = empty_pod();
+        assert!(f(&pod, None, Some(&"not-a-pod")).is_err());
+        let new = obj(empty_pod());
+        assert!(f(&pod, Some(&"not-a-pod"), Some(&*new)).is_err());
+        let foo = json!([{"key": "foo", "effect": "NoSchedule"}]);
+        // skip-updates-other-pod
+        let target = tol_pod("uid0", json!([]));
+        let old = obj(tol_pod("uid1", json!([])));
+        let new = obj(tol_pod("uid1", foo.clone()));
+        assert_eq!(
+            f(&target, Some(&*old), Some(&*new)).unwrap(),
+            QueueingHint::QueueSkip
+        );
+        // queue-on-toleration-added
+        let target = tol_pod("uid0", json!([]));
+        let old = obj(tol_pod("uid0", json!([])));
+        let new = obj(tol_pod("uid0", foo));
+        assert_eq!(
+            f(&target, Some(&*old), Some(&*new)).unwrap(),
             QueueingHint::Queue
         );
     }
