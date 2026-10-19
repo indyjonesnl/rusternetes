@@ -80,6 +80,9 @@ impl VolumePlugin for EmptyDirPlugin {
 
     async fn new_mounter(&self, spec: &Spec<'_>, pod: &Pod) -> Result<Box<dyn Mounter>> {
         Ok(Box::new(EmptyDirMounter {
+            pod: pod.clone(),
+            mounter: Arc::new(RealMounter),
+            mount_detector: Arc::new(RealMountDetector),
             meta_dir: self.get_meta_dir(&pod.metadata.uid, &spec.volume.name),
             path: self
                 .host
@@ -126,8 +129,7 @@ const PERM: u32 = 0o777;
 pub(crate) enum Medium {
     Default,
     Memory,
-    /// `v1helper.IsHugePageMedium`. Upstream mounts hugetlbfs (`setupHugepages`);
-    /// we do not yet, so it gets a plain directory as before (tracked separately).
+    /// `v1helper.IsHugePageMedium`: a hugetlbfs mount (`setupHugepages`).
     HugePages,
 }
 
@@ -172,14 +174,29 @@ pub(crate) fn setup_dir(dir: &str) -> Result<()> {
 /// Port of `mountDetector` (`empty_dir.go:198-205`): how to find what kind of
 /// mount a path is backed by.
 ///
-/// `GetMountMedium` also returns the huge-page size as a `*resource.Quantity`;
-/// only `setupHugepages`/`getPageSize` read it, and neither is ported (see
-/// [`Medium::HugePages`]), so it is not returned.
 pub(crate) trait MountDetector: Send + Sync {
-    /// `GetMountMedium`: the medium `path` is backed by and whether `path` is
-    /// itself the mount point. `(Memory, false)` means the path is on a tmpfs
-    /// but is not its root.
-    fn get_mount_medium(&self, path: &str) -> Result<(Medium, bool)>;
+    /// `GetMountMedium`: the medium `path` is backed by, whether `path` is
+    /// itself the mount point, and the huge-page size in bytes (the
+    /// `*resource.Quantity`; `None` unless `path` is a hugetlbfs and
+    /// `requested_medium` names a size). `(Memory, false, None)` means the
+    /// path is on a tmpfs but is not its root.
+    fn get_mount_medium(
+        &self,
+        path: &str,
+        requested_medium: &str,
+    ) -> Result<(Medium, bool, Option<u64>)>;
+}
+
+/// The `mount.Interface.MountSensitiveWithoutSystemd` call emptyDir's setup
+/// makes (`staging/src/k8s.io/mount-utils/mount.go`).
+pub(crate) trait Mount: Send + Sync {
+    fn mount_sensitive_without_systemd(
+        &self,
+        source: &str,
+        target: &str,
+        fstype: &str,
+        options: &[String],
+    ) -> Result<()>;
 }
 
 /// The one method of `mount.Interface` (`staging/src/k8s.io/mount-utils/`) emptyDir's
@@ -188,22 +205,73 @@ pub(crate) trait Unmount: Send + Sync {
     fn unmount(&self, target: &str) -> Result<()>;
 }
 
-/// `realMountDetector` (`empty_dir_linux.go:41-116`), minus the huge-page size.
+/// `realMountDetector` (`empty_dir_linux.go:41-116`).
 struct RealMountDetector;
+
+/// `getPageSize` (`empty_dir_linux.go:47-85`): the `pagesize=` option of the
+/// mount whose path is `path`, in bytes. `mounter.List()` is the parsed
+/// mountinfo (`mount-utils` `ParseMountInfo`), whose `Opts` are the per-mount
+/// options followed by the super-block options.
+fn get_page_size(mountinfo: &str, path: &str) -> Result<u64> {
+    for line in mountinfo.lines() {
+        let fields: Vec<&str> = line.split(' ').collect();
+        // `ParseMountInfo` requires a " - " separator after the optional fields.
+        let Some(sep) = fields.iter().position(|f| *f == "-") else {
+            continue;
+        };
+        if sep < 6 || fields.len() < sep + 4 {
+            continue;
+        }
+        if fields[4] != path {
+            continue;
+        }
+        let opts = fields[5].split(',').chain(fields[sep + 3].split(','));
+        for opt in opts {
+            let opt = opt.trim();
+            if let Some(v) = opt.strip_prefix("pagesize=") {
+                // NOTE: Adding suffix 'i' as result should be comparable with
+                // a medium size (`empty_dir_linux.go:70-76`).
+                let q = if v.ends_with('i') {
+                    v.to_string()
+                } else {
+                    format!("{v}i")
+                };
+                return crate::runtime::parse_quantity_bytes(&q).ok_or_else(|| {
+                    anyhow!("error getting page size from '{opt}' mount option: invalid quantity")
+                });
+            }
+        }
+        return Err(anyhow!("no pagesize option specified for {path} mount"));
+    }
+    Err(anyhow!("mount point for {path} not found"))
+}
 
 impl MountDetector for RealMountDetector {
     /// `empty_dir_linux.go:87-116`: `IsLikelyNotMountPoint`, then `statfs` and
     /// the filesystem magic.
-    fn get_mount_medium(&self, path: &str) -> Result<(Medium, bool)> {
+    fn get_mount_medium(
+        &self,
+        path: &str,
+        requested_medium: &str,
+    ) -> Result<(Medium, bool, Option<u64>)> {
         let not_mnt = crate::pod_dirs::is_likely_not_mount_point(std::path::Path::new(path))
             .map_err(|e| anyhow!("IsLikelyNotMountPoint({path:?}): {e}"))?;
         let buf = rustix::fs::statfs(path).map_err(|e| anyhow!("statfs({path:?}): {e}"))?;
-        let medium = match buf.f_type as u64 {
-            LINUX_TMPFS_MAGIC => Medium::Memory,
-            LINUX_HUGETLBFS_MAGIC => Medium::HugePages,
-            _ => Medium::Default,
-        };
-        Ok((medium, !not_mnt))
+        match buf.f_type as u64 {
+            LINUX_TMPFS_MAGIC => Ok((Medium::Memory, !not_mnt, None)),
+            LINUX_HUGETLBFS_MAGIC => {
+                // Skip page size detection if requested medium doesn't have
+                // size specified.
+                if requested_medium == "HugePages" {
+                    return Ok((Medium::HugePages, !not_mnt, None));
+                }
+                let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")
+                    .map_err(|e| anyhow!("error listing mount points: {e}"))?;
+                let size = get_page_size(&mountinfo, path)?;
+                Ok((Medium::HugePages, !not_mnt, Some(size)))
+            }
+            _ => Ok((Medium::Default, !not_mnt, None)),
+        }
     }
 }
 
@@ -217,6 +285,20 @@ struct RealMounter;
 impl Unmount for RealMounter {
     fn unmount(&self, target: &str) -> Result<()> {
         crate::runtime::unmount_path(target)
+    }
+}
+
+impl Mount for RealMounter {
+    /// `mount -t <fstype> -o <options> <source> <target>`
+    /// (`mount_linux.go` `doMount`, without the systemd-run wrapper).
+    fn mount_sensitive_without_systemd(
+        &self,
+        source: &str,
+        target: &str,
+        fstype: &str,
+        options: &[String],
+    ) -> Result<()> {
+        crate::runtime::mount_fs(source, target, fstype, options)
     }
 }
 
@@ -259,13 +341,175 @@ impl Unmounter for EmptyDirUnmounter {
         }
 
         // Figure out the medium.
-        let (medium, is_mnt) = self.mount_detector.get_mount_medium(dir)?;
+        let (medium, is_mnt, _) = self.mount_detector.get_mount_medium(dir, "")?;
         if is_mnt && matches!(medium, Medium::Memory | Medium::HugePages) {
             return self.teardown_tmpfs_or_hugetlbfs(dir);
         }
         // assume StorageMediumDefault
         teardown_default(dir)
     }
+}
+
+impl EmptyDirMounter {
+    /// `setupHugepages` (`empty_dir.go:343-385`).
+    fn setup_hugepages(&self, dir: &str) -> Result<()> {
+        setup_dir(dir)?;
+        let requested = self.empty_dir.medium.as_deref().unwrap_or("");
+        // Make SetUp idempotent.
+        let (medium, is_mnt, mount_page_size) =
+            self.mount_detector.get_mount_medium(dir, requested)?;
+        // If the directory is a mountpoint with medium hugepages of the same
+        // page size, there is no work to do since we are already in the
+        // desired state.
+        if is_mnt && medium == Medium::HugePages {
+            // Medium is: Hugepages
+            if requested == "HugePages" {
+                return Ok(());
+            }
+            let mount_page_size = mount_page_size.ok_or_else(|| {
+                anyhow!(
+                    "pod {}: mounted dir {} pagesize is not determined",
+                    self.pod.metadata.uid,
+                    dir
+                )
+            })?;
+            // Medium is: Hugepages-<size>. Mounted page size and medium size
+            // must be equal.
+            let medium_size = huge_page_size_from_medium(requested)?;
+            if medium_size != mount_page_size {
+                return Err(anyhow!(
+                    "pod {}: mounted dir {} pagesize '{}' and requested medium size '{}' differ",
+                    self.pod.metadata.uid,
+                    dir,
+                    quantity_string(mount_page_size),
+                    quantity_string(medium_size)
+                ));
+            }
+            return Ok(());
+        }
+
+        let page_size_mount_option = get_page_size_mount_option(requested, &self.pod)?;
+
+        info!(
+            "pod {}: mounting hugepages for volume {}",
+            self.pod.metadata.uid, self.volume_name
+        );
+        self.mounter.mount_sensitive_without_systemd(
+            "nodev",
+            dir,
+            "hugetlbfs",
+            &[page_size_mount_option],
+        )
+    }
+}
+
+/// `v1helper.HugePageSizeFromMedium` (`pkg/apis/core/v1/helper/helpers.go:115-126`),
+/// in bytes.
+fn huge_page_size_from_medium(medium: &str) -> Result<u64> {
+    if !(medium == "HugePages" || medium.starts_with("HugePages-")) {
+        return Err(anyhow!("medium: {medium} is not a hugepage medium"));
+    }
+    if medium == "HugePages" {
+        return Err(anyhow!("medium: {medium} doesn't have size information"));
+    }
+    let size = &medium["HugePages-".len()..];
+    crate::runtime::parse_quantity_bytes(size)
+        .ok_or_else(|| anyhow!("quantities must match the regular expression: {size:?}"))
+}
+
+/// `v1helper.HugePageSizeFromResourceName` (`helpers.go:81-87`), in bytes.
+fn huge_page_size_from_resource_name(name: &str) -> Result<u64> {
+    let Some(size) = name.strip_prefix("hugepages-") else {
+        return Err(anyhow!("resource name: {name} is an invalid hugepage name"));
+    };
+    crate::runtime::parse_quantity_bytes(size)
+        .ok_or_else(|| anyhow!("quantities must match the regular expression: {size:?}"))
+}
+
+/// `resource.Quantity.String()` for a binary-SI size: the largest `Ki`..`Ei`
+/// suffix that divides evenly (huge-page sizes are always powers of two).
+fn quantity_string(bytes: u64) -> String {
+    const SUFFIXES: [&str; 7] = ["", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei"];
+    let (mut v, mut i) = (bytes, 0);
+    while v != 0 && v % 1024 == 0 && i < SUFFIXES.len() - 1 {
+        v /= 1024;
+        i += 1;
+    }
+    format!("{v}{}", SUFFIXES[i])
+}
+
+/// `getPageSizeMountOption` (`empty_dir.go:389-445`): the `pagesize=<size>`
+/// mount option from the pod's huge-page requests and the medium.
+///
+/// `PodLevelResources` is on by default in 1.35 (beta since 1.34,
+/// `kube_features.go:1612`), so pod-level requests count whenever
+/// `IsPodLevelResourcesSet` (`component-helpers/resource/helpers.go:80`).
+fn get_page_size_mount_option(medium: &str, pod: &Pod) -> Result<String> {
+    let mut page_size_found = false;
+    let mut page_size = 0u64;
+
+    let mut medium_page_size = 0u64;
+    if medium != "HugePages" {
+        // medium is: Hugepages-<size>
+        medium_page_size = huge_page_size_from_medium(medium)?;
+    }
+
+    let mut requests: Vec<&std::collections::HashMap<String, String>> = Vec::new();
+    if let Some(spec) = pod.spec.as_ref() {
+        if let Some(r) = spec.resources.as_ref() {
+            let set = |m: &Option<std::collections::HashMap<String, String>>| {
+                m.as_ref().is_some_and(|m| {
+                    m.keys()
+                        .any(|k| k == "cpu" || k == "memory" || k.starts_with("hugepages-"))
+                })
+            };
+            if set(&r.requests) || set(&r.limits) {
+                if let Some(m) = r.requests.as_ref() {
+                    requests.push(m);
+                }
+            }
+        }
+        // In some rare cases init containers can also consume Huge pages.
+        let init = spec.init_containers.iter().flatten();
+        for c in spec.containers.iter().chain(init) {
+            if let Some(m) = c.resources.as_ref().and_then(|r| r.requests.as_ref()) {
+                requests.push(m);
+            }
+        }
+    }
+
+    // We can take request because limit and requests must match.
+    for list in requests {
+        for name in list.keys() {
+            if !name.starts_with("hugepages-") {
+                continue;
+            }
+            let current = huge_page_size_from_resource_name(name)?;
+            if medium == "HugePages" {
+                // medium is: Hugepages, size is not specified. PageSize for
+                // all volumes in a POD must be equal if medium is "Hugepages".
+                if page_size_found && page_size != current {
+                    return Err(anyhow!(
+                        "medium: {medium} can't be used if container requests multiple huge page sizes"
+                    ));
+                }
+                page_size_found = true;
+                page_size = current;
+            } else if current == medium_page_size {
+                // medium is: Hugepages-<size>
+                page_size_found = true;
+                page_size = current;
+            }
+        }
+    }
+
+    if !page_size_found {
+        return Err(anyhow!(
+            "medium {medium}: hugePages storage requested, but there is no resource request for huge pages"
+        ));
+    }
+
+    Ok(format!("pagesize={}", quantity_string(page_size)))
 }
 
 impl EmptyDirUnmounter {
@@ -296,6 +540,10 @@ fn remove_all(dir: &str) -> Result<()> {
 }
 
 struct EmptyDirMounter {
+    /// `ed.pod`: `getPageSizeMountOption` reads its resource requests.
+    pod: Pod,
+    mounter: Arc<dyn Mount>,
+    mount_detector: Arc<dyn MountDetector>,
     path: String,
     /// `getMetaDir` (`empty_dir.go:557-559`).
     meta_dir: String,
@@ -355,8 +603,13 @@ impl Mounter for EmptyDirMounter {
         // SetUpAt (empty_dir.go:268-277): the medium switch. Anything that is
         // not Default, Memory or a huge-page medium is an error.
         let medium = classify_medium(empty_dir.medium.as_deref())?;
-        // setupDir's errors are returned by upstream, not swallowed.
-        setup_dir(volume_dir)?;
+        match medium {
+            // setupDir's errors are returned by upstream, not swallowed.
+            Medium::Default => setup_dir(volume_dir)?,
+            Medium::HugePages => self.setup_hugepages(volume_dir)?,
+            // Memory: `setupTmpfs` calls `setupDir` first.
+            Medium::Memory => setup_dir(volume_dir)?,
+        }
 
         // Memory-medium emptyDir is a tmpfs. Mount it on the host volume dir
         // (propagated to the host daemon via the kubelet's rshared bind) so
@@ -414,6 +667,9 @@ mod tests {
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o400)).unwrap();
         let gid = std::fs::metadata(&d).unwrap().gid() as i64;
         let m = EmptyDirMounter {
+            pod: Pod::new("p", Default::default()),
+            mounter: Arc::new(RealMounter),
+            mount_detector: Arc::new(RealMountDetector),
             meta_dir: d.join("meta").to_string_lossy().into_owned(),
             path: d.to_string_lossy().into_owned(),
             volume_name: "v".into(),
@@ -531,15 +787,15 @@ mod tests {
     }
 
     impl MountDetector for FakeMountDetector {
-        fn get_mount_medium(&self, _path: &str) -> Result<(Medium, bool)> {
-            Ok((self.medium, self.is_mount))
+        fn get_mount_medium(&self, _path: &str, _m: &str) -> Result<(Medium, bool, Option<u64>)> {
+            Ok((self.medium, self.is_mount, None))
         }
     }
 
     struct FailingDetector;
 
     impl MountDetector for FailingDetector {
-        fn get_mount_medium(&self, path: &str) -> Result<(Medium, bool)> {
+        fn get_mount_medium(&self, path: &str, _m: &str) -> Result<(Medium, bool, Option<u64>)> {
             Err(anyhow!("statfs({path:?}): boom"))
         }
     }
@@ -741,8 +997,8 @@ mod tests {
     fn the_real_detector_reports_a_plain_directory_as_default() {
         let d = tmp("real-detector");
         std::fs::create_dir_all(&d).unwrap();
-        let (medium, is_mnt) = RealMountDetector
-            .get_mount_medium(d.to_str().unwrap())
+        let (medium, is_mnt, _) = RealMountDetector
+            .get_mount_medium(d.to_str().unwrap(), "")
             .unwrap();
         // /tmp may itself be a tmpfs; either way a subdirectory is no mount point.
         assert!(matches!(medium, Medium::Default | Medium::Memory));
@@ -761,7 +1017,7 @@ mod tests {
         }) {
             return;
         }
-        let (medium, is_mnt) = RealMountDetector.get_mount_medium("/dev/shm").unwrap();
+        let (medium, is_mnt, _) = RealMountDetector.get_mount_medium("/dev/shm", "").unwrap();
         assert_eq!(medium, Medium::Memory);
         assert!(is_mnt);
     }
@@ -792,6 +1048,9 @@ mod tests {
     #[test]
     fn attributes_are_writable_managed_relabel() {
         let m = EmptyDirMounter {
+            pod: Pod::new("p", Default::default()),
+            mounter: Arc::new(RealMounter),
+            mount_detector: Arc::new(RealMountDetector),
             meta_dir: "/tmp/x-meta".into(),
             path: "/tmp/x".into(),
             volume_name: "v".into(),
@@ -815,6 +1074,9 @@ mod tests {
     fn mounter_in(root: &str) -> EmptyDirMounter {
         let p = plugin_in(root);
         EmptyDirMounter {
+            pod: Pod::new("p", Default::default()),
+            mounter: Arc::new(RealMounter),
+            mount_detector: Arc::new(RealMountDetector),
             path: p.host.get_pod_volume_dir("poduid", p.name(), "scratch"),
             meta_dir: p.get_meta_dir("poduid", "scratch"),
             volume_name: "scratch".into(),
@@ -909,5 +1171,285 @@ mod tests {
         crate::volume_plugins::util::set_ready(&m.meta_dir);
         u.tear_down().await.unwrap();
         assert!(!std::path::Path::new(&m.meta_dir).exists());
+    }
+
+    // ---- hugepages (`TestGetHugePagesMountOptions`, `TestGetPageSize`,
+    // `TestSetupHugepages`, empty_dir_test.go:377-976) ----
+
+    use rusternetes_common::resources::{Container, PodSpec};
+    use rusternetes_common::types::ResourceRequirements;
+
+    fn reqs(r: &[(&str, &str)]) -> ResourceRequirements {
+        ResourceRequirements {
+            requests: Some(
+                r.iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            ),
+            limits: None,
+            claims: None,
+        }
+    }
+
+    fn container(r: &[(&str, &str)]) -> Container {
+        serde_json::from_value::<Container>(json!({"name": "c", "image": "i"}))
+            .map(|mut c| {
+                c.resources = Some(reqs(r));
+                c
+            })
+            .unwrap()
+    }
+
+    fn pod_of(
+        containers: &[&[(&str, &str)]],
+        init: &[&[(&str, &str)]],
+        pod_level: Option<&[(&str, &str)]>,
+    ) -> Pod {
+        let spec = PodSpec {
+            containers: containers.iter().map(|r| container(r)).collect(),
+            init_containers: if init.is_empty() {
+                None
+            } else {
+                Some(init.iter().map(|r| container(r)).collect())
+            },
+            resources: pod_level.map(reqs),
+            ..Default::default()
+        };
+        Pod::new("p", spec)
+    }
+
+    #[test]
+    fn page_size_mount_option_matches_upstream_cases() {
+        let h2 = ("hugepages-2Mi", "100Mi");
+        let h1 = ("hugepages-1Gi", "2Gi");
+        let ok =
+            |m, p: Pod, want: &str| assert_eq!(get_page_size_mount_option(m, &p).unwrap(), want);
+        let bad = |m, p: Pod| assert!(get_page_size_mount_option(m, &p).is_err(), "{m}");
+
+        ok("HugePages", pod_of(&[&[h2]], &[], None), "pagesize=2Mi");
+        // ProperValuesAndDifferentPageSize: same size in two containers.
+        ok(
+            "HugePages",
+            pod_of(&[&[h1], &[("hugepages-1Gi", "4Gi")]], &[], None),
+            "pagesize=1Gi",
+        );
+        ok(
+            "HugePages",
+            pod_of(&[], &[&[h1], &[("hugepages-1Gi", "4Gi")]], None),
+            "pagesize=1Gi",
+        );
+        bad(
+            "HugePages",
+            pod_of(&[], &[&[h2], &[("hugepages-1Gi", "4Gi")]], None),
+        );
+        bad("HugePages", pod_of(&[&[h1], &[h2]], &[], None));
+        bad("HugePages", pod_of(&[], &[], None));
+        ok(
+            "HugePages-1Gi",
+            pod_of(&[&[h2, h1]], &[], None),
+            "pagesize=1Gi",
+        );
+        ok(
+            "HugePages-2Mi",
+            pod_of(&[], &[&[h1, h2], &[h1, h2]], None),
+            "pagesize=2Mi",
+        );
+        bad("HugePages", pod_of(&[&[h2, h1]], &[], None));
+        bad("HugePages-", pod_of(&[&[h2, h1]], &[], None));
+        bad("foo", pod_of(&[&[h2, h1]], &[], None));
+        bad("HugePages-1Mi", pod_of(&[&[h2, h1]], &[], None));
+        // PodLevelResources.
+        ok("HugePages", pod_of(&[], &[], Some(&[h2])), "pagesize=2Mi");
+        ok(
+            "HugePages-2Mi",
+            pod_of(&[], &[], Some(&[h2])),
+            "pagesize=2Mi",
+        );
+        bad("HugePages", pod_of(&[], &[], Some(&[h1, h2])));
+        ok(
+            "HugePages-2Mi",
+            pod_of(&[], &[], Some(&[h1, h2])),
+            "pagesize=2Mi",
+        );
+        bad("HugePages", pod_of(&[&[h2]], &[], Some(&[h1])));
+        ok(
+            "HugePages-2Mi",
+            pod_of(&[&[h2]], &[], Some(&[h1])),
+            "pagesize=2Mi",
+        );
+    }
+
+    #[test]
+    fn get_page_size_reads_pagesize_option_of_the_mount() {
+        // `mount.FakeMounter` mount points, as mountinfo lines (options are
+        // the per-mount options then the super options).
+        let info = "\
+25 1 8:2 / / rw,relatime - ext4 /dev/sda2 rw,errors=remount-ro
+40 25 0:30 / /mnt/hugepages-2Mi rw,relatime - hugetlbfs /dev/hugepages rw,pagesize=2M
+42 25 0:31 / /sys rw,nosuid - sysfs sysfs rw
+41 25 0:32 / /mnt/hugepages-1Gi rw,relatime - hugetlbfs /dev/hugepages rw,pagesize=1024M
+43 25 0:33 / /mnt/noopt rw,relatime - hugetlbfs /dev/hugepages rw
+44 25 0:34 / /mnt/badopt rw,relatime - hugetlbfs /dev/hugepages rw,pagesize=NN
+45 25 0:35 / /mnt/mi rw shared:1 - hugetlbfs /dev/hugepages rw,pagesize=2Mi
+";
+        assert_eq!(get_page_size(info, "/mnt/hugepages-2Mi").unwrap(), 2 << 20);
+        assert_eq!(get_page_size(info, "/mnt/hugepages-1Gi").unwrap(), 1 << 30);
+        assert_eq!(get_page_size(info, "/mnt/mi").unwrap(), 2 << 20);
+        assert!(get_page_size(info, "/mnt/nomp").is_err());
+        assert!(get_page_size(info, "/mnt/noopt").is_err());
+        assert!(get_page_size(info, "/mnt/badopt").is_err());
+    }
+
+    struct HugeDetector {
+        page_size: Option<u64>,
+        is_mnt: bool,
+        err: bool,
+    }
+
+    impl MountDetector for HugeDetector {
+        fn get_mount_medium(&self, _path: &str, _m: &str) -> Result<(Medium, bool, Option<u64>)> {
+            if self.err {
+                return Err(anyhow!("GetMountMedium error"));
+            }
+            Ok((Medium::HugePages, self.is_mnt, self.page_size))
+        }
+    }
+
+    type MountCall = (String, String, String, Vec<String>);
+
+    #[derive(Default)]
+    struct RecordingMount {
+        calls: std::sync::Mutex<Vec<MountCall>>,
+    }
+
+    impl Mount for RecordingMount {
+        fn mount_sensitive_without_systemd(
+            &self,
+            source: &str,
+            target: &str,
+            fstype: &str,
+            options: &[String],
+        ) -> Result<()> {
+            self.calls.lock().unwrap().push((
+                source.into(),
+                target.into(),
+                fstype.into(),
+                options.to_vec(),
+            ));
+            Ok(())
+        }
+    }
+
+    fn huge_mounter(
+        medium: &str,
+        pod: Pod,
+        detector: HugeDetector,
+    ) -> (EmptyDirMounter, Arc<RecordingMount>) {
+        let rec = Arc::new(RecordingMount::default());
+        let m = EmptyDirMounter {
+            pod,
+            mounter: rec.clone(),
+            mount_detector: Arc::new(detector),
+            path: String::new(),
+            meta_dir: String::new(),
+            volume_name: "v".into(),
+            empty_dir: EmptyDirVolumeSource {
+                medium: Some(medium.into()),
+                size_limit: None,
+            },
+        };
+        (m, rec)
+    }
+
+    #[test]
+    fn setup_hugepages_matches_upstream_cases() {
+        let dir = tmp("setup-hugepages");
+        let d = dir.to_str().unwrap();
+        let h2 = ("hugepages-2Mi", "100Mi");
+        let det = |page_size, is_mnt, err| HugeDetector {
+            page_size,
+            is_mnt,
+            err,
+        };
+
+        // Valid: mount expected, with `nodev`/`hugetlbfs`/`pagesize=2Mi`.
+        let (m, rec) = huge_mounter(
+            "HugePages",
+            pod_of(&[&[h2]], &[], None),
+            det(Some(0), false, false),
+        );
+        m.setup_hugepages(d).unwrap();
+        assert_eq!(
+            *rec.calls.lock().unwrap(),
+            vec![(
+                "nodev".into(),
+                d.into(),
+                "hugetlbfs".into(),
+                vec!["pagesize=2Mi".into()]
+            )]
+        );
+
+        // Valid: already mounted with correct pagesize / already mounted.
+        let (m, rec) = huge_mounter(
+            "HugePages-2Mi",
+            pod_of(&[&[h2]], &[], None),
+            det(Some(2 << 20), true, false),
+        );
+        m.setup_hugepages(d).unwrap();
+        let (m2, _) = huge_mounter(
+            "HugePages",
+            pod_of(&[&[h2]], &[], None),
+            det(None, true, false),
+        );
+        m2.setup_hugepages(d).unwrap();
+        assert!(rec.calls.lock().unwrap().is_empty());
+
+        // Invalid: GetMountMedium error; medium and page size differ; bad
+        // medium; pagesize undetermined for a sized medium.
+        let (m, _) = huge_mounter(
+            "HugePages-2Mi",
+            pod_of(&[&[h2]], &[], None),
+            det(Some(2 << 20), true, true),
+        );
+        assert!(m.setup_hugepages(d).is_err());
+        let (m, _) = huge_mounter(
+            "HugePages-1Gi",
+            pod_of(&[&[("hugepages-1Gi", "2Gi")]], &[], None),
+            det(Some(2 << 20), true, false),
+        );
+        assert!(m
+            .setup_hugepages(d)
+            .unwrap_err()
+            .to_string()
+            .contains("differ"));
+        let (m, _) = huge_mounter(
+            "HugePages-NN",
+            pod_of(&[&[h2]], &[], None),
+            det(Some(0), false, false),
+        );
+        assert!(m.setup_hugepages(d).is_err());
+        let (m, _) = huge_mounter(
+            "HugePages-2Mi",
+            pod_of(&[&[h2]], &[], None),
+            det(None, true, false),
+        );
+        assert!(m.setup_hugepages(d).is_err());
+
+        // Invalid: setupDir fails.
+        let (m, _) = huge_mounter(
+            "HugePages",
+            pod_of(&[&[h2]], &[], None),
+            det(None, false, false),
+        );
+        assert!(m.setup_hugepages("").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quantity_string_is_canonical_binary_si() {
+        assert_eq!(quantity_string(2 << 20), "2Mi");
+        assert_eq!(quantity_string(1 << 30), "1Gi");
+        assert_eq!(quantity_string(2048 << 10), "2Mi");
+        assert_eq!(quantity_string(1000), "1000");
     }
 }

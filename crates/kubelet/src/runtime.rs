@@ -82,6 +82,36 @@ pub(crate) fn mount_tmpfs_for_emptydir(dir: &str, size_bytes: Option<u64>) -> an
     Ok(())
 }
 
+/// `mount.Interface.MountSensitiveWithoutSystemd`
+/// (`staging/src/k8s.io/mount-utils/mount_linux.go`): `mount -t <fstype>
+/// [-o <options>] <source> <target>`, reporting the command output on failure.
+pub(crate) fn mount_fs(
+    source: &str,
+    target: &str,
+    fstype: &str,
+    options: &[String],
+) -> anyhow::Result<()> {
+    let mut cmd = std::process::Command::new("mount");
+    cmd.args(["-t", fstype]);
+    if !options.is_empty() {
+        cmd.args(["-o", &options.join(",")]);
+    }
+    let out = cmd
+        .args([source, target])
+        .output()
+        .map_err(|e| anyhow::anyhow!("could not exec mount for {fstype} at {target}: {e}"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "mount failed: exit status {}\nMounting command: mount\nMounting arguments: -t {fstype} -o {} {source} {target}\nOutput: {}",
+            out.status,
+            options.join(","),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    info!("Mounted {} at {}", fstype, target);
+    Ok(())
+}
+
 /// Unmount `target`: `mount.Interface.Unmount`
 /// (`staging/src/k8s.io/mount-utils/mount_linux.go:401`), which runs
 /// `umount <target>` and reports its output on failure.
