@@ -468,9 +468,20 @@ pub struct Framework {
     pub percentage_of_nodes_to_score: Option<i32>,
     lists: HashMap<ExtensionPoint, Vec<String>>,
     score_plugin_weight: HashMap<String, i32>,
+    /// `f.enqueueExtensions` (framework.go:63): the enabled plugins whose
+    /// type is PreEnqueue/PreFilter/Filter/Reserve/Permit
+    /// (`shouldHaveEnqueueExtensions`, framework.go:663-671), in
+    /// `fillEnqueueExtensions` order.
+    enqueue_extensions: Vec<String>,
 }
 
 impl Framework {
+    /// `EnqueueExtensions` (framework.go:736-738): plugin names whose
+    /// `EventsToRegister` feed the scheduling queue.
+    pub fn enqueue_extension_plugins(&self) -> &[String] {
+        &self.enqueue_extensions
+    }
+
     /// Plugins configured at `ep`, in execution order.
     pub fn plugins_at(&self, ep: ExtensionPoint) -> &[String] {
         self.lists.get(&ep).map(Vec::as_slice).unwrap_or(&[])
@@ -557,6 +568,30 @@ pub fn new_framework(r: &Registry, profile: &ProfileSpec<'_>) -> Result<Framewor
         .iter()
         .filter_map(|n| r.get(n).map(|pts| (*n, pts)))
         .collect();
+
+    // fillEnqueueExtensions (framework.go:673-689), for every needed plugin
+    // the registry knows (the `for name, factory := range r` loop at :390-397).
+    // Go ranges a map; sort for a stable order.
+    {
+        let mut names: Vec<&str> = plugins_map.keys().copied().collect();
+        names.sort_unstable();
+        for name in names {
+            let pts = plugins_map[name];
+            // shouldHaveEnqueueExtensions (framework.go:663-671)
+            if [
+                ExtensionPoint::PreEnqueue,
+                ExtensionPoint::PreFilter,
+                ExtensionPoint::Filter,
+                ExtensionPoint::Reserve,
+                ExtensionPoint::Permit,
+            ]
+            .iter()
+            .any(|ep| pts.contains(ep))
+            {
+                f.enqueue_extensions.push(name.to_string());
+            }
+        }
+    }
 
     // initialize plugins per individual extension points (updatePluginList)
     for ep in ExtensionPoint::ALL {

@@ -8,6 +8,7 @@ pub mod node_volume_limits;
 #[allow(dead_code)]
 pub mod plugins;
 pub mod profile;
+pub mod queue;
 pub mod scheduler;
 pub mod scheduler_config;
 pub mod score;
