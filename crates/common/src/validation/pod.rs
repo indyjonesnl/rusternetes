@@ -288,6 +288,63 @@ pub fn validate_pod_spec_with_options(
 /// (strategy.go `PrepareForCreate`), not part of `ValidatePodSpec`, so
 /// `ValidatePodUpdate` (validation.go:5698 -> `validatePodMetadataAndSpec`
 /// :4509) must not apply it.
+/// `validateHostUsers` (validation.go:3919-3961).
+fn validate_host_users(spec: &PodSpec, fld_path: &Path, opts: &PodValidationOptions) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    // Only check when hostUsers is false (:3924).
+    if spec.host_users != Some(false) {
+        return errs;
+    }
+    // Restricted per kubernetes/kubernetes#111090 (validation.go:3929-3932).
+    if !opts.allow_user_namespaces_host_network_support && spec.host_network.unwrap_or(false) {
+        errs.push(Error::forbidden(
+            &fld_path.child("hostNetwork"),
+            "when `hostUsers` is false",
+        ));
+    }
+    if spec.host_pid.unwrap_or(false) {
+        errs.push(Error::forbidden(
+            &fld_path.child("HostPID"),
+            "when `hostUsers` is false",
+        ));
+    }
+    if spec.host_ipc.unwrap_or(false) {
+        errs.push(Error::forbidden(
+            &fld_path.child("HostIPC"),
+            "when `hostUsers` is false",
+        ));
+    }
+    if !opts.allow_user_namespaces_with_volume_devices {
+        // volumeDevices don't support idmap mounts (:3947), visited in
+        // `VisitContainersWithPath` order: init, regular, ephemeral.
+        let has = |d: &Option<Vec<crate::resources::pod::VolumeDevice>>| {
+            d.as_deref().is_some_and(|d| !d.is_empty())
+        };
+        let mut forbid = |path: Path| {
+            errs.push(Error::forbidden(
+                &path.child("volumeDevices"),
+                "when `hostUsers` is false",
+            ))
+        };
+        for (i, c) in spec.init_containers.iter().flatten().enumerate() {
+            if has(&c.volume_devices) {
+                forbid(fld_path.child("initContainers").index(i));
+            }
+        }
+        for (i, c) in spec.containers.iter().enumerate() {
+            if has(&c.volume_devices) {
+                forbid(fld_path.child("containers").index(i));
+            }
+        }
+        for (i, c) in spec.ephemeral_containers.iter().flatten().enumerate() {
+            if has(&c.volume_devices) {
+                forbid(fld_path.child("ephemeralContainers").index(i));
+            }
+        }
+    }
+    errs
+}
+
 fn validate_pod_spec_for(
     spec: &PodSpec,
     fld_path: &Path,
@@ -503,6 +560,9 @@ fn validate_pod_spec_for(
         allow_relaxed_dns_search,
         &fld_path.child("dnsConfig"),
     ));
+
+    // `validateHostUsers(spec, fldPath, opts)` (validation.go:4661).
+    errs.extend(validate_host_users(spec, fld_path, opts));
 
     // securityContext.sysctls name format / uniqueness, plus the pod-level
     // seccomp/AppArmor profiles (upstream `validatePodSecurityContext`,

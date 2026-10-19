@@ -10,7 +10,7 @@
 //!
 //! Options are ported where the validator in [`crate::validation::pod`] has the
 //! gated rule. The remaining upstream options (`AllowIndivisibleHugePagesValues`,
-//! `AllowUserNamespaces*`, `AllowOnlyRecursiveSELinuxChangePolicy`,
+//! `AllowOnlyRecursiveSELinuxChangePolicy`,
 //! `AllowSidecarResizePolicy`, `AllowContainerRestartPolicyRules`,
 //! `AllowRestartAllContainers`, `AllowPodLifecycleSleepActionZeroValue`,
 //! `AllowRelaxedEnvironmentVariableValidation`, `AllowEnvFilesValidation`,
@@ -57,6 +57,10 @@ pub struct PodValidationOptions {
     pub allow_relaxed_dns_search_validation: bool,
     /// `AllowTaintTolerationComparisonOperators`.
     pub allow_taint_toleration_comparison_operators: bool,
+    /// `AllowUserNamespacesWithVolumeDevices`.
+    pub allow_user_namespaces_with_volume_devices: bool,
+    /// `AllowUserNamespacesHostNetworkSupport`.
+    pub allow_user_namespaces_host_network_support: bool,
 }
 
 /// `GetValidationOptionsFromPodSpecAndMeta` (util.go:411-495) for the options
@@ -86,6 +90,10 @@ pub fn get_validation_options_from_pod_spec_and_meta(
     opts.allow_taint_toleration_comparison_operators =
         allow_taint_toleration_comparison_operators(old_spec);
 
+    // util.go:441 `useAllowUserNamespacesHostNetworkSupport(oldPodSpec)`.
+    opts.allow_user_namespaces_host_network_support =
+        use_allow_user_namespaces_host_network_support(old_spec);
+
     if let Some(old) = old_spec {
         // util.go:450 `hasInvalidLabelValueInAffinitySelector`.
         opts.allow_invalid_label_value_in_selector =
@@ -107,6 +115,10 @@ pub fn get_validation_options_from_pod_spec_and_meta(
                     has_legacy_invalid_topology_spread_constrain_match_label_keys(old);
             }
         }
+        // util.go:486: an old spec with userns and volume devices (which
+        // doesn't work) may still be modified.
+        opts.allow_user_namespaces_with_volume_devices =
+            has_user_namespaces_with_volume_devices(old);
         // util.go:464.
         opts.allow_non_local_projected_token_path = has_non_local_projected_token_path(old);
         // util.go:467-475: an old sysctl that `ValidateHostSysctl` rejects.
@@ -124,6 +136,33 @@ pub fn get_validation_options_from_pod_spec_and_meta(
         }
     }
     opts
+}
+
+/// `useAllowUserNamespacesHostNetworkSupport` (util.go:544-558).
+fn use_allow_user_namespaces_host_network_support(old_spec: Option<&PodSpec>) -> bool {
+    if enabled(Feature::UserNamespacesHostNetworkSupport) {
+        return true;
+    }
+    // A pod with user namespaces and hostNetwork already in the cluster keeps
+    // the relaxed validation after the gate is disabled.
+    old_spec.is_some_and(|s| s.host_users == Some(false) && s.host_network.unwrap_or(false))
+}
+
+/// `hasUserNamespacesWithVolumeDevices` (util.go:1664-1678).
+fn has_user_namespaces_with_volume_devices(spec: &PodSpec) -> bool {
+    if spec.host_users != Some(false) {
+        return false;
+    }
+    let devices = |c: &crate::resources::pod::Container| {
+        c.volume_devices.as_deref().is_some_and(|d| !d.is_empty())
+    };
+    spec.containers.iter().any(devices)
+        || spec.init_containers.iter().flatten().any(devices)
+        || spec
+            .ephemeral_containers
+            .iter()
+            .flatten()
+            .any(|c| c.volume_devices.as_deref().is_some_and(|d| !d.is_empty()))
 }
 
 /// `useRelaxedDNSSearchValidation` (util.go:520-532).
@@ -378,5 +417,154 @@ mod tests {
             opts(Some(&dns(&["a_b"]))).allow_relaxed_dns_search_validation
                 || enabled(Feature::RelaxedDNSSearchValidation)
         );
+    }
+
+    fn host_users_errors(spec: &PodSpec, opts: &PodValidationOptions) -> Vec<String> {
+        crate::validation::pod::validate_pod_spec_with_options(spec, &Path::new("spec"), opts)
+            .iter()
+            .map(|e| e.to_string())
+            .filter(|e| e.contains("`hostUsers` is false"))
+            .collect()
+    }
+
+    fn vol_dev(key: &str) -> serde_json::Value {
+        let dev = json!([{"name": "v", "devicePath": "/dev/x"}]);
+        match key {
+            "containers" => {
+                json!({"containers": [{"name": "c", "image": "i", "volumeDevices": dev}]})
+            }
+            "initContainers" => {
+                json!({"initContainers": [{"name": "c", "image": "i", "volumeDevices": dev}]})
+            }
+            _ => {
+                json!({"ephemeralContainers": [{"name": "c", "image": "i", "volumeDevices": dev}]})
+            }
+        }
+    }
+
+    /// `TestValidateHostUsers` (validation_test.go:26005): rejections.
+    #[test]
+    fn validate_host_users_forbidden() {
+        let o = PodValidationOptions::default();
+        let e = host_users_errors(&spec(json!({"hostUsers": false, "hostNetwork": true})), &o);
+        assert_eq!(
+            e,
+            vec!["spec.hostNetwork: Forbidden: when `hostUsers` is false"]
+        );
+        let e = host_users_errors(&spec(json!({"hostUsers": false, "hostPID": true})), &o);
+        assert_eq!(
+            e,
+            vec!["spec.HostPID: Forbidden: when `hostUsers` is false"]
+        );
+        let e = host_users_errors(&spec(json!({"hostUsers": false, "hostIPC": true})), &o);
+        assert_eq!(
+            e,
+            vec!["spec.HostIPC: Forbidden: when `hostUsers` is false"]
+        );
+        for (k, path) in [
+            ("containers", "spec.containers[0].volumeDevices"),
+            ("initContainers", "spec.initContainers[0].volumeDevices"),
+            (
+                "ephemeralContainers",
+                "spec.ephemeralContainers[0].volumeDevices",
+            ),
+        ] {
+            let mut v = vol_dev(k);
+            v["hostUsers"] = json!(false);
+            let e = host_users_errors(&spec(v), &o);
+            assert_eq!(
+                e,
+                vec![format!("{path}: Forbidden: when `hostUsers` is false")],
+                "{k}"
+            );
+        }
+    }
+
+    /// `TestValidateHostUsers`: accepted cases, and the two options.
+    #[test]
+    fn validate_host_users_allowed() {
+        let o = PodValidationOptions::default();
+        assert!(host_users_errors(&spec(json!({})), &o).is_empty());
+        assert!(host_users_errors(
+            &spec(
+                json!({"hostUsers": true, "hostNetwork": true, "hostPID": true, "hostIPC": true})
+            ),
+            &o
+        )
+        .is_empty());
+        assert!(host_users_errors(&spec(json!({"hostNetwork": true})), &o).is_empty());
+        let o = PodValidationOptions {
+            allow_user_namespaces_with_volume_devices: true,
+            ..Default::default()
+        };
+        for k in ["containers", "initContainers", "ephemeralContainers"] {
+            let mut v = vol_dev(k);
+            v["hostUsers"] = json!(false);
+            assert!(host_users_errors(&spec(v), &o).is_empty(), "{k}");
+        }
+        let o = PodValidationOptions {
+            allow_user_namespaces_host_network_support: true,
+            ..Default::default()
+        };
+        assert!(
+            host_users_errors(&spec(json!({"hostUsers": false, "hostNetwork": true})), &o)
+                .is_empty()
+        );
+    }
+
+    /// `TestHasUserNamespacesWithVolumeDevices` (util_test.go:6129), through
+    /// the derived option.
+    #[test]
+    fn user_namespaces_with_volume_devices_option() {
+        assert!(!opts(None).allow_user_namespaces_with_volume_devices);
+        for (k, want) in [
+            ("containers", true),
+            ("initContainers", true),
+            ("ephemeralContainers", true),
+        ] {
+            let mut v = vol_dev(k);
+            v["hostUsers"] = json!(false);
+            assert_eq!(
+                opts(Some(&spec(v))).allow_user_namespaces_with_volume_devices,
+                want,
+                "{k}"
+            );
+            let mut v = vol_dev(k);
+            v["hostUsers"] = json!(true);
+            assert!(
+                !opts(Some(&spec(v))).allow_user_namespaces_with_volume_devices,
+                "{k}"
+            );
+        }
+        assert!(
+            !opts(Some(&spec(json!({"hostUsers": false}))))
+                .allow_user_namespaces_with_volume_devices
+        );
+        assert!(!opts(Some(&spec(json!({})))).allow_user_namespaces_with_volume_devices);
+    }
+
+    /// `useAllowUserNamespacesHostNetworkSupport` (util.go:544): gate off (the
+    /// 1.35 default), so only an old userns+hostNetwork pod relaxes it.
+    #[test]
+    fn user_namespaces_host_network_support_option() {
+        assert!(!opts(None).allow_user_namespaces_host_network_support);
+        let old = spec(json!({"hostUsers": false, "hostNetwork": true}));
+        assert!(opts(Some(&old)).allow_user_namespaces_host_network_support);
+        for v in [
+            json!({"hostUsers": true, "hostNetwork": true}),
+            json!({"hostUsers": false}),
+            json!({"hostNetwork": true}),
+        ] {
+            assert!(!opts(Some(&spec(v))).allow_user_namespaces_host_network_support);
+        }
+    }
+
+    /// With the gate on, the option holds on create.
+    #[test]
+    #[serial_test::serial]
+    fn user_namespaces_host_network_support_gate() {
+        let _g =
+            crate::feature_gates::with_feature(Feature::UserNamespacesHostNetworkSupport, true);
+        assert!(opts(None).allow_user_namespaces_host_network_support);
     }
 }
