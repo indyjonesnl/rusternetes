@@ -41,6 +41,7 @@ ipnet = "2"
 prometheus.workspace = true
 axum.workspace = true
 sha2 = "0.10"
+hmac = "0.12"
 rand = "0.9"
 jsonwebtoken.workspace = true
 rcgen.workspace = true

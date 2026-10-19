@@ -4471,6 +4471,7 @@ dependencies = [
  "cron",
  "fnv",
  "futures",
+ "hmac 0.12.1",
  "ipnet",
  "jsonwebtoken",
  "mimalloc",
