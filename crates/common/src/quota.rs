@@ -268,6 +268,24 @@ pub fn is_hugepage_resource_name(name: &str) -> bool {
     name.starts_with(HUGEPAGES_PREFIX)
 }
 
+/// `helper.IsHugePageResourceValueDivisible`
+/// (`pkg/apis/core/helper/helpers.go:43-54`): the quantity is a whole multiple
+/// of the page size parsed from the `hugepages-<size>` name. An unparseable
+/// size, or a non-positive / fractional one, is not divisible.
+pub fn is_hugepage_resource_value_divisible(name: &str, quantity: &Quantity) -> bool {
+    // `HugePageSizeFromResourceName` (helpers.go:72-78).
+    let Some(size) = name.strip_prefix(HUGEPAGES_PREFIX) else {
+        return false;
+    };
+    let Ok(page_size) = Quantity::parse(size) else {
+        return false;
+    };
+    if page_size.is_negative() || page_size.is_zero() || page_size.milli_value() % 1000 != 0 {
+        return false;
+    }
+    quantity.value() % page_size.value() == 0
+}
+
 /// True when the name contains `kubernetes.io/` (`strings.Contains`, not a
 /// prefix check). Upstream `v1helper.IsPrefixedNativeResource`
 /// (`pkg/apis/core/v1/helper/helpers.go:51-55`).

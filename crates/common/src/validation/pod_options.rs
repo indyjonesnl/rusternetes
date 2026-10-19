@@ -9,14 +9,15 @@
 //! stored stays updatable. A create has no old spec and is strict.
 //!
 //! Options are ported where the validator in [`crate::validation::pod`] has the
-//! gated rule. The remaining upstream options (`AllowIndivisibleHugePagesValues`,
-//! `AllowUserNamespaces*`, `AllowOnlyRecursiveSELinuxChangePolicy`,
+//! gated rule. The remaining upstream options (`AllowUserNamespaces*`, `AllowOnlyRecursiveSELinuxChangePolicy`,
 //! `AllowSidecarResizePolicy`, `AllowContainerRestartPolicyRules`,
 //! `AllowRestartAllContainers`,
 //! `PodLevelResourcesEnabled`, `InPlacePodLevelResourcesVerticalScalingEnabled`)
 //! are tracked in #3572 because the rule they gate is not ported yet.
 
 use crate::feature_gates::{enabled, Feature};
+use crate::quantity::Quantity;
+use crate::quota::{is_hugepage_resource_name, is_hugepage_resource_value_divisible};
 use crate::resources::pod::{EnvFromSource, EnvVar, PodSpec};
 use crate::types::LabelSelector;
 use crate::validation::field::Path;
@@ -36,6 +37,9 @@ use std::collections::HashSet;
 /// options the Rust validator consumes.
 #[derive(Debug, Clone, Default)]
 pub struct PodValidationOptions {
+    /// `AllowIndivisibleHugePagesValues`: the old spec has a hugepages
+    /// quantity that is not a whole multiple of its page size.
+    pub allow_indivisible_huge_pages_values: bool,
     /// `AllowInvalidLabelValueInSelector`: pod (anti)affinity selectors.
     pub allow_invalid_label_value_in_selector: bool,
     /// `AllowInvalidTopologySpreadConstraintLabelSelector`.
@@ -105,6 +109,9 @@ pub fn get_validation_options_from_pod_spec_and_meta(
         allow_taint_toleration_comparison_operators(old_spec);
 
     if let Some(old) = old_spec {
+        // util.go:446-448: if old spec used non-integer multiple of huge page
+        // unit size, we must allow it.
+        opts.allow_indivisible_huge_pages_values = uses_indivisible_huge_pages_values(old);
         // util.go:450 `hasInvalidLabelValueInAffinitySelector`.
         opts.allow_invalid_label_value_in_selector =
             has_invalid_label_value_in_affinity_selector(old);
@@ -222,6 +229,41 @@ fn use_allow_env_files_validation(old_spec: Option<&PodSpec>) -> bool {
             .iter()
             .flatten()
             .any(|c| has(&c.env))
+}
+
+/// `checkContainerUseIndivisibleHugePagesValues` (util.go:313-331).
+fn check_container_use_indivisible_huge_pages_values(c: &crate::resources::pod::Container) -> bool {
+    let Some(res) = c.resources.as_ref() else {
+        return false;
+    };
+    [res.limits.as_ref(), res.requests.as_ref()]
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|(name, qty)| indivisible_huge_page_quantity(name, qty))
+}
+
+/// `IsHugePageResourceName` and not `IsHugePageResourceValueDivisible`. A value
+/// that does not parse cannot be stored, so it is not an indivisible one.
+fn indivisible_huge_page_quantity(name: &str, qty: &str) -> bool {
+    is_hugepage_resource_name(name)
+        && Quantity::parse(qty).is_ok_and(|q| !is_hugepage_resource_value_divisible(name, &q))
+}
+
+/// `usesIndivisibleHugePagesValues` (util.go:333-359): any init/regular
+/// container (`VisitContainers(..., AllContainers, ...)`; an ephemeral
+/// container carries no resources) or the pod overhead.
+fn uses_indivisible_huge_pages_values(spec: &PodSpec) -> bool {
+    spec.init_containers
+        .iter()
+        .flatten()
+        .chain(spec.containers.iter())
+        .any(check_container_use_indivisible_huge_pages_values)
+        || spec
+            .overhead
+            .iter()
+            .flatten()
+            .any(|(name, qty)| indivisible_huge_page_quantity(name, qty))
 }
 
 /// `useRelaxedDNSSearchValidation` (util.go:520-532).
@@ -574,5 +616,28 @@ mod tests {
         );
         // Create (no old spec) with the gate off stays strict.
         assert!(!opts(None).allow_pod_lifecycle_sleep_action_zero_value);
+    }
+
+    /// `usesIndivisibleHugePagesValues` (util.go:333-359): containers (limits
+    /// and requests), init containers and the pod overhead.
+    #[test]
+    fn indivisible_huge_pages_values_option() {
+        let c = |res: serde_json::Value| {
+            spec(json!({"containers": [{"name": "c", "image": "i", "resources": res}]}))
+        };
+        let on = |s: &PodSpec| opts(Some(s)).allow_indivisible_huge_pages_values;
+        assert!(on(&c(json!({"limits": {"hugepages-2Mi": "3Mi"}}))));
+        assert!(on(&c(json!({"requests": {"hugepages-2Mi": "1Mi"}}))));
+        assert!(!on(&c(json!({"limits": {"hugepages-2Mi": "4Mi"}}))));
+        // Not a hugepages resource, and an unparseable page size.
+        assert!(!on(&c(json!({"limits": {"memory": "3"}}))));
+        assert!(on(&c(json!({"limits": {"hugepages-bogus": "1"}}))));
+        assert!(on(&spec(
+            json!({"initContainers": [{"name": "i", "image": "i",
+            "resources": {"limits": {"hugepages-1Gi": "1Mi"}}}]})
+        )));
+        assert!(on(&spec(json!({"overhead": {"hugepages-2Mi": "3Mi"}}))));
+        assert!(!on(&spec(json!({"overhead": {"hugepages-2Mi": "2Mi"}}))));
+        assert!(!opts(None).allow_indivisible_huge_pages_values);
     }
 }
