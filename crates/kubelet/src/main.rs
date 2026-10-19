@@ -42,6 +42,7 @@ mod node_status;
 #[allow(dead_code)]
 mod pluginmanager;
 mod pod_dirs;
+mod pod_status;
 #[allow(dead_code)]
 mod podcertificate;
 mod poll;
