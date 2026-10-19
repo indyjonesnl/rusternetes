@@ -70,3 +70,4 @@ pub mod volumeattachment;
 pub mod volumeattributesclass;
 pub mod volumesnapshot;
 pub mod webhookconfiguration;
+pub mod windows_options;
