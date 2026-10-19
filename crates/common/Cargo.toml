@@ -18,6 +18,7 @@ jsonwebtoken.workspace = true
 prometheus.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
+rand = "0.9"
 rustls-pemfile = "2.1"
 axum = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }

@@ -24,6 +24,7 @@ pub mod removeall;
 pub mod runtime;
 pub mod runtime_state;
 pub mod server;
+pub mod server_auth;
 pub mod server_metrics;
 pub mod serving_tls;
 pub mod static_pod_watch;
@@ -192,6 +193,12 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
         kubelet: Some(k.clone()),
     };
     let tls_node_name = config.node_name.clone();
+    // `BuildAuth` with `kubeDeps.KubeClient == nil` and the legacy flag
+    // defaults (`applyLegacyDefaults`): anonymous requests, `AlwaysAllow`.
+    let (authn_config, authz_config) =
+        server_auth::resolve_auth_config(None, &server_auth::AuthFlags::default());
+    let (auth, _client_ca) =
+        server_auth::build_auth(&config.node_name, None, &authn_config, &authz_config)?;
     tokio::spawn(async move {
         use axum::{routing::get, Json, Router};
         let app = Router::new()
@@ -208,6 +215,7 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
             .map(String::from)
             .collect();
         let app = server::install_statusz(app, registered);
+        let app = server_auth::install_auth_filter(app, Some(auth));
         // Serve the kubelet API port over HTTPS (#1644) — a Kubernetes
         // api-server proxies logs/exec/attach/metrics via `https://…:10250`.
         let addr: std::net::SocketAddr = metrics_addr.parse().expect("valid metrics addr");

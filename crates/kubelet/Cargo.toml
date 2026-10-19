@@ -28,6 +28,7 @@ prometheus.workspace = true
 # the api-server while keeping its Arc<StorageBackend> handle unchanged.
 rusternetes-storage = { path = "../storage", features = ["api-client"] }
 rusternetes-client = { path = "../client" }
+rusternetes-middleware = { path = "../middleware" } # user_from_client_cert_der / PeerCertificates (x509 authn)
 rusternetes-cri = { path = "../cri" }
 rusternetes-csi = { path = "../csi" }
 rusternetes-streamproxy = { path = "../streamproxy" }
@@ -38,6 +39,8 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml = "0.9"
 sha2 = "0.10"
+hmac = "0.12"
+base64 = "0.22"
 regex = "1.10"
 sha1 = "0.10"
 anyhow.workspace = true

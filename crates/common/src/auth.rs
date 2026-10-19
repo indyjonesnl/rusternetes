@@ -925,7 +925,7 @@ impl BootstrapToken {
 }
 
 /// User information extracted from authentication
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserInfo {
     /// Username
     pub username: String,

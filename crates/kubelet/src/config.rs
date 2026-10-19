@@ -152,12 +152,11 @@ pub struct KubeletConfiguration {
     #[serde(rename = "cpuCFSQuotaPeriod")]
     pub cpu_cfs_quota_period: Option<std::time::Duration>,
 
-    /// `authentication` (`KubeletAuthentication`): only the webhook cache TTL is
-    /// modelled (`pkg/kubelet/apis/config/types.go` `KubeletWebhookAuthentication.CacheTTL`).
+    /// `authentication` (`KubeletAuthentication`, `pkg/kubelet/apis/config/types.go`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authentication: Option<KubeletAuthentication>,
 
-    /// `authorization` (`KubeletAuthorization`): only the webhook cache TTLs are modelled.
+    /// `authorization` (`KubeletAuthorization`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authorization: Option<KubeletAuthorization>,
 
@@ -190,18 +189,48 @@ fn nonzero_or(v: Option<std::time::Duration>, default_secs: u64) -> std::time::D
         .unwrap_or(std::time::Duration::from_secs(default_secs))
 }
 
-/// `KubeletAuthentication` (types.go:579); only `webhook.cacheTTL` is modelled.
+/// `KubeletAuthentication` (types.go:579-586).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KubeletAuthentication {
     #[serde(default)]
+    pub x509: KubeletX509Authentication,
+    #[serde(default)]
     pub webhook: KubeletWebhookAuthentication,
+    #[serde(default)]
+    pub anonymous: KubeletAnonymousAuthentication,
 }
 
-/// `KubeletWebhookAuthentication`: `cacheTTL` defaults to 2m (v1beta1/defaults.go:98-100).
+/// `KubeletX509Authentication` (types.go:589-594).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KubeletX509Authentication {
+    /// `clientCAFile`: PEM bundle of the authorities whose client certificates
+    /// authenticate (CN -> user, O -> groups).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "clientCAFile"
+    )]
+    pub client_ca_file: Option<String>,
+}
+
+/// `KubeletAnonymousAuthentication` (types.go:605-610); the v1beta1 default is
+/// `false` (defaults.go:92-94).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KubeletAnonymousAuthentication {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+/// `KubeletWebhookAuthentication`: `enabled` defaults to true
+/// (v1beta1/defaults.go:95-97), `cacheTTL` to 2m (:98-100).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KubeletWebhookAuthentication {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -211,10 +240,13 @@ pub struct KubeletWebhookAuthentication {
     pub cache_ttl: Option<std::time::Duration>,
 }
 
-/// `KubeletAuthorization`; only `webhook.cache{Authorized,Unauthorized}TTL` are modelled.
+/// `KubeletAuthorization` (types.go:559-566): `mode` defaults to `Webhook`
+/// (v1beta1/defaults.go:101-103).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KubeletAuthorization {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     #[serde(default)]
     pub webhook: KubeletWebhookAuthorization,
 }
