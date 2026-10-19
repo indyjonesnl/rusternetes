@@ -399,6 +399,25 @@ fn signal_watch_initialized() {
     crate::flow_control_watch_tracker::watch_initialized();
 }
 
+/// Cutoff for a snapshot read at `rev`: never below an item the snapshot
+/// returned. `current_revision()` can answer stale on a backend whose cached
+/// revision regresses under concurrent writers (#3082, rhino#6) while its
+/// `list_at_revision` is a live read, so `rev` alone could sit under the
+/// listed items and replay already-delivered objects as ADDED. Same floor the
+/// LIST path applies via [`crate::handlers::collection_resource_version`]
+/// (#1824); upstream stamps a list with the revision of the very read that
+/// produced its items (`etcd3/store.go` GetList, `getResp.Header.Revision`).
+pub fn snapshot_cutoff(rev: i64, items: &[serde_json::Value]) -> u64 {
+    crate::handlers::collection_resource_version(
+        Some(rev),
+        &snapshot_resource_version(items)
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+    )
+    .parse()
+    .unwrap_or(rev as u64)
+}
+
 /// (Named `watch_snapshot`, not `list_*`: this is the WATCH path, whose start
 /// revision legitimately IS the store revision -- see
 /// `list_resource_version_floor_guard_test`.)
@@ -426,7 +445,8 @@ pub async fn watch_snapshot(
                 .await
             {
                 signal_watch_initialized();
-                return Ok((list, Some(rev as u64)));
+                let cutoff = snapshot_cutoff(rev, &list);
+                return Ok((list, Some(cutoff)));
             }
         }
     }
