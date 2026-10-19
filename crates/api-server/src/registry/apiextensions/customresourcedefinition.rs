@@ -114,11 +114,15 @@ fn schema_rule_errors_in(
         .unwrap_or_default();
     let mut errs = Vec::new();
     for (i, version) in crd.spec.versions.iter().enumerate() {
-        let Some(validation) = &version.schema else {
+        let Some(schema) = version
+            .schema
+            .as_ref()
+            .and_then(|s| s.open_apiv3_schema.as_ref())
+        else {
             continue;
         };
         errs.extend(crate::handlers::cel_validation::validate_crd_schema_rules(
-            &validation.open_apiv3_schema,
+            schema,
             &Path::new("spec")
                 .child("versions")
                 .index(i)
@@ -255,8 +259,8 @@ fn collect_unrecognized_formats<'a>(s: &'a JSONSchemaProps, out: &mut Vec<&'a st
 fn unrecognized_formats_in_crd(crd: &CustomResourceDefinition) -> Vec<String> {
     let mut out = Vec::new();
     for v in &crd.spec.versions {
-        if let Some(schema) = &v.schema {
-            collect_unrecognized_formats(&schema.open_apiv3_schema, &mut out);
+        if let Some(schema) = v.schema.as_ref().and_then(|s| s.open_apiv3_schema.as_ref()) {
+            collect_unrecognized_formats(schema, &mut out);
         }
     }
     out.into_iter().map(str::to_string).collect()

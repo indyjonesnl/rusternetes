@@ -236,7 +236,11 @@ fn schema_less_crd(crd_name: &str, group: &str, plural: &str, kind: &str) -> Val
             "versions": [{
                 "name": "v1",
                 "served": true,
-                "storage": true
+                "storage": true,
+                // A v1 CRD must carry a schema (`requireOpenAPISchema`,
+                // validation.go:371-377); the e2e `setupCRD(nil)` sends this one
+                // (crd_publish_openapi.go:559-565).
+                "schema": {"openAPIV3Schema": {"type": "object", "x-kubernetes-preserve-unknown-fields": true}}
             }]
         }
     })

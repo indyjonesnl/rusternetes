@@ -405,7 +405,7 @@ pub fn validate_custom_resource_definition_spec(
     spec: &CustomResourceDefinitionSpec,
     fld_path: &Path,
 ) -> ErrorList {
-    validate_custom_resource_definition_spec_opts(spec, true, true, fld_path)
+    validate_custom_resource_definition_spec_opts(spec, true, true, true, fld_path)
 }
 
 /// [`validate_custom_resource_definition_spec`] with
@@ -414,6 +414,7 @@ fn validate_custom_resource_definition_spec_opts(
     spec: &CustomResourceDefinitionSpec,
     allow_invalid_ca_bundle: bool,
     require_structural_schema: bool,
+    require_open_api_schema: bool,
     fld_path: &Path,
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
@@ -456,6 +457,30 @@ fn validate_custom_resource_definition_spec_opts(
     if spec.preserve_unknown_fields != Some(true) {
         require_structural_schema = true;
     }
+    // `validation.go:371-387`. v1 has no top-level `spec.validation`, so only
+    // the per-version schemas are checked.
+    let versions_path = fld_path.child("versions");
+    for (i, v) in spec.versions.iter().enumerate() {
+        let missing = v
+            .schema
+            .as_ref()
+            .and_then(|s| s.open_apiv3_schema.as_ref())
+            .is_none();
+        let schema_path = versions_path
+            .index(i)
+            .child("schema")
+            .child("openAPIV3Schema");
+        if require_open_api_schema {
+            if missing {
+                errs.push(Error::required(&schema_path, ""));
+            }
+        } else if spec.preserve_unknown_fields != Some(true) && v.served && missing {
+            errs.push(Error::required(
+                &schema_path,
+                "because otherwise all fields are pruned",
+            ));
+        }
+    }
     // `validation.go:391-396` (`allowDefaults` is true for every caller).
     if spec_has_defaults(spec) {
         require_structural_schema = true;
@@ -473,7 +498,6 @@ fn validate_custom_resource_definition_spec_opts(
     }
 
     // versions (`:398-414`).
-    let versions_path = fld_path.child("versions");
     let mut storage_flag_count = 0usize;
     let mut seen: HashSet<&str> = HashSet::new();
     let mut unique_names = true;
@@ -494,9 +518,13 @@ fn validate_custom_resource_definition_spec_opts(
             ));
         }
 
-        if let Some(schema) = &version.schema {
+        if let Some(schema) = version
+            .schema
+            .as_ref()
+            .and_then(|s| s.open_apiv3_schema.as_ref())
+        {
             errs.extend(validate_custom_resource_definition_validation(
-                &schema.open_apiv3_schema,
+                schema,
                 require_structural_schema,
                 &vp.child("schema"),
             ));
@@ -514,7 +542,10 @@ fn validate_custom_resource_definition_spec_opts(
         if let Some(fields) = &version.selectable_fields {
             errs.extend(validate_version_selectable_fields(
                 fields,
-                version.schema.as_ref().map(|s| &s.open_apiv3_schema),
+                version
+                    .schema
+                    .as_ref()
+                    .and_then(|s| s.open_apiv3_schema.as_ref()),
                 &vp,
             ));
         }
@@ -570,15 +601,14 @@ fn validate_custom_resource_definition_spec_opts(
 /// Because that walk is absent, the init errors are shown whenever
 /// `ValidateStructural` found nothing.
 ///
-/// Deviation, stated deliberately: the typed model decodes an absent
-/// `openAPIV3Schema` (`schema: {}`) as the zero schema, which upstream sees as
-/// a nil pointer and skips (`:914-916`); the zero schema is skipped the same way.
+/// An absent `openAPIV3Schema` is `None` and the caller skips it, as upstream
+/// skips a nil pointer (`:914-916`); an explicit `{}` is validated.
 fn validate_custom_resource_definition_validation(
     schema: &JSONSchemaProps,
     require_structural_schema: bool,
     fld_path: &Path,
 ) -> ErrorList {
-    if !require_structural_schema || *schema == JSONSchemaProps::default() {
+    if !require_structural_schema {
         return Vec::new();
     }
     let schema_path = fld_path.child("openAPIV3Schema");
@@ -590,10 +620,6 @@ fn validate_custom_resource_definition_validation(
 
 /// The `len(version.SelectableFields) > 0` block of
 /// `validateCustomResourceDefinitionVersion` (`validation.go:311-318`).
-///
-/// An absent `openAPIV3Schema` decodes as the zero schema here (see
-/// `validate_custom_resource_definition_validation`), which upstream sees as a
-/// nil pointer.
 fn validate_version_selectable_fields(
     fields: &[SelectableField],
     schema: Option<&JSONSchemaProps>,
@@ -603,7 +629,7 @@ fn validate_version_selectable_fields(
         return Vec::new();
     }
     let selectable_path = version_path.child("selectableFields");
-    let Some(schema) = schema.filter(|s| **s != JSONSchemaProps::default()) else {
+    let Some(schema) = schema else {
         return vec![Error::invalid(
             &selectable_path,
             String::new(),
@@ -644,10 +670,27 @@ fn schema_is_non_structural(schema: &JSONSchemaProps) -> bool {
 /// (v1 has no top-level `spec.validation`).
 fn spec_has_non_structural_schema(spec: &CustomResourceDefinitionSpec) -> bool {
     spec.versions.iter().any(|v| {
-        v.schema.as_ref().is_some_and(|s| {
-            s.open_apiv3_schema != JSONSchemaProps::default()
-                && schema_is_non_structural(&s.open_apiv3_schema)
-        })
+        v.schema
+            .as_ref()
+            .and_then(|s| s.open_apiv3_schema.as_ref())
+            .is_some_and(schema_is_non_structural)
+    })
+}
+
+/// `requireOpenAPISchema` (`validation.go:1596-1604`): don't tighten
+/// validation on existing persisted data.
+fn require_open_api_schema(old_spec: &CustomResourceDefinitionSpec) -> bool {
+    all_versions_specify_open_api_schema(old_spec)
+}
+
+/// `allVersionsSpecifyOpenAPISchema` (`validation.go:1605-1615`), over the
+/// versions (v1 has no top-level `spec.validation`).
+fn all_versions_specify_open_api_schema(spec: &CustomResourceDefinitionSpec) -> bool {
+    spec.versions.iter().all(|v| {
+        v.schema
+            .as_ref()
+            .and_then(|s| s.open_apiv3_schema.as_ref())
+            .is_some()
     })
 }
 
@@ -659,7 +702,8 @@ fn has_schema_with(
     spec.versions.iter().any(|v| {
         v.schema
             .as_ref()
-            .is_some_and(|s| schema_has(&s.open_apiv3_schema, pred))
+            .and_then(|s| s.open_apiv3_schema.as_ref())
+            .is_some_and(|s| schema_has(s, pred))
     })
 }
 
@@ -1432,6 +1476,8 @@ pub fn validate_custom_resource_definition_update(
         // `requireStructuralSchema(&oldObj.Spec)` (`validation.go:228`, `:1749`):
         // don't tighten validation on existing persisted data.
         !spec_has_non_structural_schema(&old.spec),
+        // `requireOpenAPISchema(&oldObj.Spec)` (`validation.go:235`, `:1596`).
+        require_open_api_schema(&old.spec),
         &spec_path,
     ));
     errs.extend(validate_custom_resource_definition_spec_update(
@@ -1660,7 +1706,8 @@ AiEAhWF2/JiVNXisqXic1Dfy761y8wW/Io2IJoBMvcYxo4E=
     fn crd_with_bundle(bundle: Option<String>, established: bool) -> CustomResourceDefinition {
         let mut c = CustomResourceDefinition::new("widget", "example.com", "Widget", "widgets");
         c.spec.versions = vec![serde_json::from_value(serde_json::json!({
-            "name": "v1", "served": true, "storage": true
+            "name": "v1", "served": true, "storage": true,
+            "schema": {"openAPIV3Schema": {"type": "object"}}
         }))
         .unwrap()];
         c.spec.conversion = Some(crate::resources::CustomResourceConversion {

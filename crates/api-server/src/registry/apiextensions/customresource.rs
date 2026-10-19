@@ -293,11 +293,14 @@ impl Strategy {
         if self.crd.spec.preserve_unknown_fields == Some(true) {
             return;
         }
-        let Some(schema) = self.crd_version().and_then(|v| v.schema.as_ref()) else {
+        let Some(schema) = self
+            .crd_version()
+            .and_then(|v| v.schema.as_ref())
+            .and_then(|s| s.open_apiv3_schema.as_ref())
+        else {
             return;
         };
-        let Ok(structural) =
-            rusternetes_common::validation::structural::new_structural(&schema.open_apiv3_schema)
+        let Ok(structural) = rusternetes_common::validation::structural::new_structural(schema)
         else {
             return;
         };
@@ -349,8 +352,11 @@ impl Strategy {
 
     /// The served version's structural schema (`structuralSchemas[gv.Version]`).
     fn structural_schema(&self) -> Option<Structural> {
-        let schema = self.crd_version().and_then(|v| v.schema.as_ref())?;
-        new_structural(&schema.open_apiv3_schema).ok()
+        let schema = self
+            .crd_version()
+            .and_then(|v| v.schema.as_ref())
+            .and_then(|s| s.open_apiv3_schema.as_ref())?;
+        new_structural(schema).ok()
     }
 
     /// `schemaobjectmeta.CoerceWithOptions(nil, u.Object,
@@ -734,9 +740,13 @@ impl CustomResourceRest {
         }
         let crd = self.crd();
         let crd_preserves = crd.spec.preserve_unknown_fields == Some(true);
-        let schema = self.strategy.crd_version().and_then(|v| v.schema.as_ref());
+        let schema = self
+            .strategy
+            .crd_version()
+            .and_then(|v| v.schema.as_ref())
+            .and_then(|s| s.open_apiv3_schema.as_ref());
         let schema_preserves = schema
-            .map(|s| s.open_apiv3_schema.x_kubernetes_preserve_unknown_fields == Some(true))
+            .map(|s| s.x_kubernetes_preserve_unknown_fields == Some(true))
             .unwrap_or(false);
         let preserves = crd_preserves || schema_preserves;
 
@@ -763,7 +773,7 @@ impl CustomResourceRest {
         }
         if !preserves {
             if let Some(spec_schema) = schema
-                .and_then(|s| s.open_apiv3_schema.properties.as_ref())
+                .and_then(|s| s.properties.as_ref())
                 .and_then(|p| p.get("spec"))
             {
                 if let Some(spec) = &cr.spec {
