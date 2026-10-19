@@ -1485,6 +1485,40 @@ pub async fn normalize_content_type_middleware(
     // g=meta.k8s.io;v=v1` requests (see
     // `staging/src/k8s.io/apimachinery/pkg/runtime/serializer/protobuf`).
     if let Some(neg) = parse_accept_as_target(&accept_header) {
+        // A WATCH response is an open-ended stream and must NEVER be buffered
+        // below: `axum::body::to_bytes` on it blocks until the stream ends (or
+        // the 10 MiB cap), so a metadata-only informer (`Accept: ...;as=
+        // PartialObjectMetadata`, e.g. cert-manager's cainjector secret cache)
+        // got no event at all for the life of the watch. Upstream converts the
+        // embedded object of EACH event instead
+        // (`handlers/response.go: watchEmbeddedEncoder.doEncode` ->
+        // `doTransformObject`).
+        if is_watch_request
+            && response.status() == StatusCode::OK
+            && response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|ct| ct.starts_with("application/json"))
+        {
+            // `doTransformObject`: PartialObjectMetadata converts every
+            // non-Status event object. PartialObjectMetadataList can never
+            // describe a single event object (`asPartialObjectMetadataList`
+            // returns NotAcceptable, `doEncode` then keeps the object as is),
+            // and Table watch events are not converted yet (tracked in #1628).
+            if neg.target == AsTarget::PartialObjectMetadata {
+                let (mut parts, body) = response.into_parts();
+                parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+                return Ok(Response::from_parts(
+                    parts,
+                    Body::new(WatchEventTransformBody::new(
+                        body,
+                        convert_to_partial_object_metadata,
+                    )),
+                ));
+            }
+            return Ok(response);
+        }
         if response.status() == StatusCode::OK {
             let response_ct = response
                 .headers()
@@ -1741,6 +1775,109 @@ fn generic_table_cells(obj: &serde_json::Value) -> Vec<serde_json::Value> {
         .cloned()
         .unwrap_or(serde_json::Value::Null);
     vec![serde_json::Value::String(name.into()), creation]
+}
+
+/// Streams a chunked-JSON watch body, rewriting the embedded `object` of every
+/// event through `transform` and leaving the envelope (`type`) alone.
+///
+/// Port of `watchEmbeddedEncoder` (`staging/src/k8s.io/apiserver/pkg/endpoints/
+/// handlers/response.go:45-99`): `doEncode` runs `doTransformObject` on each
+/// event's object, passes a `*metav1.Status` (the ERROR event payload) through
+/// untouched, and falls back to the original object when the transform fails
+/// (`utilruntime.HandleError` then `result = obj`). The watch handlers here
+/// write one `\n`-terminated JSON event per chunk, but HTTP framing may split
+/// or join them, so the body is re-framed on newlines before transforming.
+struct WatchEventTransformBody {
+    inner: Body,
+    transform: fn(serde_json::Value) -> serde_json::Value,
+    /// Bytes of the current, not yet newline-terminated event.
+    partial: Vec<u8>,
+    /// Transformed events waiting to be handed to the client.
+    ready: std::collections::VecDeque<bytes::Bytes>,
+    inner_done: bool,
+}
+
+impl WatchEventTransformBody {
+    fn new(inner: Body, transform: fn(serde_json::Value) -> serde_json::Value) -> Self {
+        Self {
+            inner,
+            transform,
+            partial: Vec::new(),
+            ready: std::collections::VecDeque::new(),
+            inner_done: false,
+        }
+    }
+
+    /// One event line (no trailing newline) in, the transformed line (with
+    /// newline) out. Anything that is not a JSON watch event is forwarded
+    /// verbatim.
+    fn transform_line(&self, line: &[u8]) -> bytes::Bytes {
+        let rewritten = serde_json::from_slice::<serde_json::Value>(line)
+            .ok()
+            .and_then(|mut event| {
+                let object = event.get_mut("object")?;
+                // `doTransformObject`: a Status is never transformed.
+                if object.get("kind").and_then(|k| k.as_str()) == Some("Status") {
+                    return None;
+                }
+                let original = object.take();
+                *object = (self.transform)(original);
+                serde_json::to_vec(&event).ok()
+            });
+        let mut out = rewritten.unwrap_or_else(|| line.to_vec());
+        out.push(b'\n');
+        bytes::Bytes::from(out)
+    }
+
+    fn absorb(&mut self, data: &[u8]) {
+        self.partial.extend_from_slice(data);
+        while let Some(i) = self.partial.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = self.partial.drain(..=i).collect();
+            let line = &line[..line.len() - 1];
+            if line.iter().all(|b| b.is_ascii_whitespace()) {
+                continue;
+            }
+            let out = self.transform_line(line);
+            self.ready.push_back(out);
+        }
+    }
+}
+
+impl http_body::Body for WatchEventTransformBody {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        use std::task::Poll;
+        loop {
+            if let Some(chunk) = self.ready.pop_front() {
+                return Poll::Ready(Some(Ok(http_body::Frame::data(chunk))));
+            }
+            if self.inner_done {
+                return Poll::Ready(None);
+            }
+            match std::pin::Pin::new(&mut self.inner).poll_frame(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => {
+                    self.inner_done = true;
+                    // A final event with no trailing newline.
+                    if !self.partial.iter().all(|b| b.is_ascii_whitespace()) {
+                        let rest = std::mem::take(&mut self.partial);
+                        let out = self.transform_line(&rest);
+                        self.ready.push_back(out);
+                    }
+                }
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
+                Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                    Ok(data) => self.absorb(&data),
+                    Err(frame) => return Poll::Ready(Some(Ok(frame))),
+                },
+            }
+        }
+    }
 }
 
 /// Convert a single object into a `meta.k8s.io/v1.PartialObjectMetadata`
@@ -3711,6 +3848,35 @@ mod tests {
             json,
             "extracted JSON must match original"
         );
+    }
+
+    /// `watchEmbeddedEncoder.doEncode` (apiserver `handlers/response.go`):
+    /// events are re-framed on newlines whatever the chunking, the embedded
+    /// object is converted, and a `Status` (ERROR event) passes through.
+    #[test]
+    fn watch_event_transform_reframes_converts_and_spares_status() {
+        let mut body =
+            WatchEventTransformBody::new(Body::empty(), convert_to_partial_object_metadata);
+        let added = r#"{"type":"ADDED","object":{"kind":"Secret","apiVersion":"v1","metadata":{"name":"a"},"data":{"k":"v"}}}"#;
+        let err = r#"{"type":"ERROR","object":{"kind":"Status","apiVersion":"v1","code":410}}"#;
+        // One event split across two chunks, then a second event.
+        let all = format!("{added}\n{err}\n");
+        let (a, b) = all.as_bytes().split_at(30);
+        body.absorb(a);
+        assert!(body.ready.is_empty(), "no complete line yet");
+        body.absorb(b);
+        let out: Vec<serde_json::Value> = body
+            .ready
+            .iter()
+            .map(|c| serde_json::from_slice(c).unwrap())
+            .collect();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["object"]["kind"], "PartialObjectMetadata");
+        assert_eq!(out[0]["object"]["apiVersion"], "meta.k8s.io/v1");
+        assert_eq!(out[0]["object"]["metadata"]["name"], "a");
+        assert!(out[0]["object"].get("data").is_none());
+        assert_eq!(out[1]["object"]["kind"], "Status");
+        assert_eq!(out[1]["object"]["code"], 410);
     }
 
     #[test]
