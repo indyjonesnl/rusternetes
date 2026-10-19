@@ -49,6 +49,7 @@ fn scope(state: &ApiServerState) -> RequestScope<Endpoints> {
         apply: Some(crate::ssa::apply_legacy::<Endpoints>),
         convert_to_internal: Some(endpoint::convert_to_internal),
         patch_conversion: None,
+        forbid_create: false,
     }
 }
 

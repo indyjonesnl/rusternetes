@@ -49,6 +49,7 @@ fn scope(state: &ApiServerState) -> RequestScope<ConfigMap> {
         // ConfigMap has no defaulter and no conversion logic.
         convert_to_internal: None,
         patch_conversion: None,
+        forbid_create: false,
     }
 }
 

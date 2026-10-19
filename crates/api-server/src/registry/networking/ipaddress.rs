@@ -134,6 +134,7 @@ impl crate::registry::core::service::ipallocator::IpAddressClient for Loopback {
             namespace: None,
             user: &user,
             dry_run: false,
+            forbid_create: false,
         };
         let ctx = RequestContext::new(None)
             .with_user(&user)
@@ -168,6 +169,7 @@ impl crate::registry::core::service::ipallocator::IpAddressClient for Loopback {
             namespace: None,
             user: &user,
             dry_run: false,
+            forbid_create: false,
         };
         let ctx = RequestContext::new(None).with_group_version(&kind.group, &kind.version);
         let validation = DeleteValidation {

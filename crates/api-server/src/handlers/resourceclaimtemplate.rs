@@ -47,6 +47,7 @@ fn scope(state: &ApiServerState) -> RequestScope<ResourceClaimTemplate> {
         apply: Some(crate::ssa::apply_legacy::<ResourceClaimTemplate>),
         convert_to_internal: None,
         patch_conversion: None,
+        forbid_create: false,
     }
 }
 

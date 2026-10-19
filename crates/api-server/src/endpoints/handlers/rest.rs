@@ -52,6 +52,11 @@ pub struct RequestScope<T: Object> {
     /// one; see [`RequestVersionConversion`]. `None` for every resource that
     /// stores exactly what it serves.
     pub patch_conversion: Option<RequestVersionConversion>,
+    /// `forbidCreateAdmission` wraps the admission chain
+    /// (apiextensions-apiserver/pkg/apiserver/customresource_handler.go:388-401,
+    /// :1523-1554): every `Create` is refused. Set only for custom resources
+    /// whose CRD is Terminating.
+    pub forbid_create: bool,
 }
 
 /// How to move a stored object into the version a patch was written against,

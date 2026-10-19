@@ -71,6 +71,7 @@ fn policy_scope(state: &ApiServerState) -> RequestScope<MutatingAdmissionPolicy>
         apply: Some(crate::ssa::apply_legacy::<MutatingAdmissionPolicy>),
         convert_to_internal: Some(mutatingadmissionpolicy::convert_to_internal),
         patch_conversion: None,
+        forbid_create: false,
     }
 }
 
@@ -154,6 +155,7 @@ fn binding_scope(state: &ApiServerState) -> RequestScope<MutatingAdmissionPolicy
         apply: Some(crate::ssa::apply_legacy::<MutatingAdmissionPolicyBinding>),
         convert_to_internal: Some(mutatingadmissionpolicybinding::convert_to_internal),
         patch_conversion: None,
+        forbid_create: false,
     }
 }
 

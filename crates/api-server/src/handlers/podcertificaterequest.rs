@@ -67,6 +67,7 @@ fn scope(
         apply: Some(crate::ssa::apply_legacy::<PodCertificateRequest>),
         convert_to_internal: None,
         patch_conversion: None,
+        forbid_create: false,
     }
 }
 

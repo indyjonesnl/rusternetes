@@ -67,6 +67,7 @@ fn role_scope(state: &ApiServerState) -> RequestScope<Role> {
         apply: Some(crate::ssa::apply_legacy::<Role>),
         convert_to_internal: None,
         patch_conversion: None,
+        forbid_create: false,
     }
 }
 
@@ -298,6 +299,7 @@ fn rolebinding_scope(state: &ApiServerState) -> RequestScope<RoleBinding> {
         apply: Some(crate::ssa::apply_legacy::<RoleBinding>),
         convert_to_internal: Some(rolebinding::convert_to_internal),
         patch_conversion: None,
+        forbid_create: false,
     }
 }
 
@@ -545,6 +547,7 @@ fn clusterrole_scope(state: &ApiServerState) -> RequestScope<ClusterRole> {
         apply: Some(crate::ssa::apply_legacy::<ClusterRole>),
         convert_to_internal: None,
         patch_conversion: None,
+        forbid_create: false,
     }
 }
 
@@ -730,6 +733,7 @@ fn clusterrolebinding_scope(state: &ApiServerState) -> RequestScope<ClusterRoleB
         apply: Some(crate::ssa::apply_legacy::<ClusterRoleBinding>),
         convert_to_internal: Some(clusterrolebinding::convert_to_internal),
         patch_conversion: None,
+        forbid_create: false,
     }
 }
 
