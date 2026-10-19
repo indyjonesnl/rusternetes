@@ -193,16 +193,35 @@ pub fn events_to_register(plugin_name: &str, profile: &Profile) -> Vec<ClusterEv
         ],
         // volumerestrictions/volume_restrictions.go:336-352
         names::VOLUME_RESTRICTIONS => vec![
-            ev(R::Pod, A::DELETE),
+            ClusterEventWithHint::with_hint(
+                ClusterEvent::new(R::Pod, A::DELETE),
+                Arc::new(
+                    super::volume_hints::volume_restrictions::is_schedulable_after_pod_deleted,
+                ),
+            ),
             ev(R::Node, A::ADD),
-            ev(R::PersistentVolumeClaim, A::ADD),
+            ClusterEventWithHint::with_hint(
+                ClusterEvent::new(R::PersistentVolumeClaim, A::ADD),
+                Arc::new(super::volume_hints::volume_restrictions::is_schedulable_after_pvc_added),
+            ),
         ],
         // volumezone/volume_zone.go:267-285
         names::VOLUME_ZONE => vec![
-            ev(R::StorageClass, A::ADD),
+            ClusterEventWithHint::with_hint(
+                ClusterEvent::new(R::StorageClass, A::ADD),
+                Arc::new(
+                    super::volume_hints::volume_zone::is_schedulable_after_storage_class_added,
+                ),
+            ),
             ev(R::Node, A::ADD | A::UPDATE_NODE_LABEL),
-            ev(R::PersistentVolumeClaim, A::ADD | A::UPDATE),
-            ev(R::PersistentVolume, A::ADD | A::UPDATE),
+            ClusterEventWithHint::with_hint(
+                ClusterEvent::new(R::PersistentVolumeClaim, A::ADD | A::UPDATE),
+                Arc::new(super::volume_hints::volume_zone::is_schedulable_after_pvc_change),
+            ),
+            ClusterEventWithHint::with_hint(
+                ClusterEvent::new(R::PersistentVolume, A::ADD | A::UPDATE),
+                Arc::new(super::volume_hints::volume_zone::is_schedulable_after_pv_change),
+            ),
         ],
         // nodevolumelimits/csi.go:90-109
         names::NODE_VOLUME_LIMITS => vec![
