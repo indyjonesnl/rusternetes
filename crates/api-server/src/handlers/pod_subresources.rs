@@ -258,7 +258,7 @@ fn generic_server_response(code: StatusCode, pod_name: &str) -> Response {
     };
     (
         code,
-        axum::Json(rusternetes_common::types::Status::failure_with_details(
+        crate::audit::json_response(rusternetes_common::types::Status::failure_with_details(
             message,
             reason,
             code.as_u16(),

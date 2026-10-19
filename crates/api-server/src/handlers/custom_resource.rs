@@ -331,7 +331,7 @@ pub async fn list_custom_resources(
         crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
             .await,
     );
-    Ok(Json(list))
+    Ok(crate::audit::json_response(list))
 }
 
 /// DELETE on a custom-resource collection (`deletecollection`).

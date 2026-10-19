@@ -727,7 +727,11 @@ pub async fn list(
                         remaining_item_count: None,
                     });
                 }
-                return Ok((axum::http::StatusCode::GONE, axum::Json(status)).into_response());
+                return Ok((
+                    axum::http::StatusCode::GONE,
+                    crate::audit::json_response(status),
+                )
+                    .into_response());
             }
             return Err(rusternetes_common::Error::InvalidResource(e.message));
         }
@@ -738,7 +742,7 @@ pub async fn list(
     if crate::handlers::table::wants_table(accept) {
         let table =
             crate::handlers::table::pods_table(paginated.items, Some(resource_version.clone()));
-        return Ok(axum::Json(table).into_response());
+        return Ok(crate::audit::json_response(table).into_response());
     }
 
     // Wrap in proper List object with pagination metadata
@@ -751,7 +755,7 @@ pub async fn list(
     // protobuf envelope when the client negotiates
     // `application/vnd.kubernetes.protobuf`. See `build_pod_response` for
     // the encoder rationale.
-    let mut resp = axum::Json(list).into_response();
+    let mut resp = crate::audit::json_response(list).into_response();
     resp.extensions_mut()
         .insert(crate::response::NativeProtoOptIn::pod_list());
     Ok(resp)
@@ -861,7 +865,11 @@ pub async fn list_all_pods(
                         remaining_item_count: None,
                     });
                 }
-                return Ok((axum::http::StatusCode::GONE, axum::Json(status)).into_response());
+                return Ok((
+                    axum::http::StatusCode::GONE,
+                    crate::audit::json_response(status),
+                )
+                    .into_response());
             }
             return Err(rusternetes_common::Error::InvalidResource(e.message));
         }
@@ -872,7 +880,7 @@ pub async fn list_all_pods(
     if crate::handlers::table::wants_table(accept) {
         let table =
             crate::handlers::table::pods_table(paginated.items, Some(resource_version.clone()));
-        return Ok(axum::Json(table).into_response());
+        return Ok(crate::audit::json_response(table).into_response());
     }
 
     // Wrap in proper List object with pagination metadata
@@ -881,5 +889,5 @@ pub async fn list_all_pods(
     list.metadata.remaining_item_count = paginated.remaining_item_count;
     list.metadata.resource_version = Some(paginated.resource_version);
 
-    Ok(axum::Json(list).into_response())
+    Ok(crate::audit::json_response(list).into_response())
 }

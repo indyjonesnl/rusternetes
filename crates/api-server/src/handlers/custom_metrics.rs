@@ -476,7 +476,7 @@ pub async fn get_custom_metric(
         return Err(rusternetes_common::Error::Forbidden(reason));
     }
 
-    Ok(Json(
+    Ok(crate::audit::json_response(
         list_op(
             &state,
             Some(&namespace),
@@ -511,7 +511,7 @@ pub async fn list_custom_metrics(
         return Err(rusternetes_common::Error::Forbidden(reason));
     }
 
-    Ok(Json(
+    Ok(crate::audit::json_response(
         list_op(
             &state,
             Some(&namespace),
@@ -544,7 +544,7 @@ pub async fn get_namespace_metric(
         return Err(rusternetes_common::Error::Forbidden(reason));
     }
 
-    Ok(Json(
+    Ok(crate::audit::json_response(
         list_op(
             &state,
             None,
@@ -579,7 +579,7 @@ pub async fn get_cluster_metric(
         return Err(rusternetes_common::Error::Forbidden(reason));
     }
 
-    Ok(Json(
+    Ok(crate::audit::json_response(
         list_op(
             &state,
             None,
