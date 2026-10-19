@@ -324,6 +324,11 @@ pub(crate) fn sync_allocatable_with_capacity(
     *allocatable != before
 }
 
+/// `localStorageCapacityIsolation` input of `nodestatus.ReadyCondition`
+/// (kubelet_node_status.go `defaultNodeStatusFuncs`): the
+/// `LocalStorageCapacityIsolation` feature gate is GA and on by default.
+const LOCAL_STORAGE_CAPACITY_ISOLATION: bool = true;
+
 /// The node's advertised capacity/allocatable. Single source of truth so the
 /// NodeStatus the kubelet posts and the values used to default resourceFieldRef
 /// LIMITS never drift — both the env-var path (via
@@ -393,6 +398,8 @@ pub struct Kubelet {
     /// Runtime/network health fed by the CRI `Status` RPC; gates NodeReady.
     /// Upstream: `Kubelet.runtimeState` (pkg/kubelet/runtime.go).
     runtime_state: crate::runtime_state::RuntimeState,
+    /// `Kubelet.recorder` for `recordNodeStatusEvent` (kubelet_node_status.go:632).
+    node_event_recorder: rusternetes_storage::EventRecorder<StorageBackend>,
     sync_interval: Duration,
     /// Filesystem path used for `statvfs` when computing nodefs eviction stats.
     /// Defaults to `/var/lib/kubelet` when not provided.
@@ -810,6 +817,7 @@ impl Kubelet {
         // in `fs.go::GetFsInfoForPath`.
         crate::eviction::log_statvfs_path(&eviction_root_dir);
 
+        let node_event_recorder = rusternetes_storage::EventRecorder::new(storage.clone());
         let kubelet = Self {
             hostname: node_name.clone(),
             node_name,
@@ -822,6 +830,7 @@ impl Kubelet {
             runtime_state: crate::runtime_state::RuntimeState::new(
                 crate::runtime_state::MAX_WAIT_FOR_CONTAINER_RUNTIME,
             ),
+            node_event_recorder,
             sync_interval: Duration::from_secs(sync_interval_secs),
             eviction_root_dir,
             eviction_manager: Mutex::new(eviction_manager),
@@ -1544,15 +1553,18 @@ impl Kubelet {
         });
 
         // Set node status
+        let capacity = node_allocatable_map();
         node.status = Some(NodeStatus {
-            capacity: Some(node_allocatable_map()),
+            capacity: Some(capacity.clone()),
             allocatable: Some(node_allocatable_map()),
             conditions: Some({
                 let mut conditions = Vec::new();
                 crate::runtime_state::set_ready_condition(
                     &mut conditions,
+                    Some(&capacity),
                     self.ready_errors(),
                     chrono::Utc::now(),
+                    LOCAL_STORAGE_CAPACITY_ISOLATION,
                 );
                 conditions
             }),
@@ -1882,20 +1894,34 @@ impl Kubelet {
         // NodeReady is composed from runtime health, never asserted
         // (nodestatus.ReadyCondition, setters.go:469).
         let ready_errs = self.ready_errors();
+        let mut ready_event = None;
         if let Some(ref mut status) = node.status {
+            let capacity = status.capacity.clone();
             let conditions = status.conditions.get_or_insert_with(Vec::new);
             let was_ready = conditions
                 .iter()
                 .find(|c| c.condition_type == "Ready")
                 .map(|c| c.status.clone());
-            let changed = crate::runtime_state::set_ready_condition(
+            let update = crate::runtime_state::set_ready_condition(
                 conditions,
+                capacity.as_ref(),
                 ready_errs,
                 chrono::Utc::now(),
+                LOCAL_STORAGE_CAPACITY_ISOLATION,
             );
-            if changed && was_ready.as_deref() != Some("True") {
+            if update.changed && was_ready.as_deref() != Some("True") {
                 info!("Node Ready condition changed (was {was_ready:?})");
             }
+            ready_event = update.event;
+        }
+        if let Some(event) = ready_event {
+            // recordEventFunc (setters.go:540-548): NodeReady / NodeNotReady.
+            crate::runtime_state::record_node_status_event(
+                &self.node_event_recorder,
+                &self.node_name,
+                event,
+            )
+            .await;
         }
 
         // tryUpdateNodeStatus (kubelet_node_status.go:483-531): write only if
