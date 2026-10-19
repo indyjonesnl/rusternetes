@@ -87,6 +87,35 @@ pub struct KubeletConfiguration {
     #[serde(rename = "imageMinimumGCAge")]
     pub image_minimum_gc_age: Option<std::time::Duration>,
 
+    /// `imageMaximumGCAge` (`metav1.Duration`, Go duration string): an unused
+    /// image older than this is garbage collected regardless of disk usage;
+    /// zero (the default) disables it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "rusternetes_common::go_duration::option_serde"
+    )]
+    #[serde(rename = "imageMaximumGCAge")]
+    pub image_maximum_gc_age: Option<std::time::Duration>,
+
+    /// `imageGCHighThresholdPercent`: image-filesystem usage above which image
+    /// GC always runs (default 85, `v1beta1/defaults.go:156-158`).
+    #[serde(
+        default,
+        rename = "imageGCHighThresholdPercent",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub image_gc_high_threshold_percent: Option<i32>,
+
+    /// `imageGCLowThresholdPercent`: usage image GC frees down to (default 80,
+    /// `v1beta1/defaults.go:160-162`).
+    #[serde(
+        default,
+        rename = "imageGCLowThresholdPercent",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub image_gc_low_threshold_percent: Option<i32>,
+
     /// `volumeStatsAggPeriod` (`metav1.Duration`, Go duration string).
     #[serde(
         default,
@@ -280,6 +309,9 @@ impl Default for KubeletConfiguration {
             node_status_update_frequency: None,
             node_status_report_frequency: None,
             image_minimum_gc_age: None,
+            image_maximum_gc_age: None,
+            image_gc_high_threshold_percent: None,
+            image_gc_low_threshold_percent: None,
             volume_stats_agg_period: None,
             cpu_manager_reconcile_period: None,
             runtime_request_timeout: None,
@@ -335,6 +367,21 @@ impl KubeletConfiguration {
     /// `imageMinimumGCAge` with the upstream default applied (120s).
     pub fn effective_image_minimum_gc_age(&self) -> std::time::Duration {
         nonzero_or(self.image_minimum_gc_age, 120)
+    }
+
+    /// `imageMaximumGCAge` (default 0 = disabled; `v1beta1/defaults.go` leaves it unset).
+    pub fn effective_image_maximum_gc_age(&self) -> std::time::Duration {
+        self.image_maximum_gc_age.unwrap_or_default()
+    }
+
+    /// `imageGCHighThresholdPercent` with the upstream default applied (85).
+    pub fn effective_image_gc_high_threshold_percent(&self) -> i32 {
+        self.image_gc_high_threshold_percent.unwrap_or(85)
+    }
+
+    /// `imageGCLowThresholdPercent` with the upstream default applied (80).
+    pub fn effective_image_gc_low_threshold_percent(&self) -> i32 {
+        self.image_gc_low_threshold_percent.unwrap_or(80)
     }
 
     /// `volumeStatsAggPeriod` with the upstream default applied (60s).
@@ -556,6 +603,37 @@ impl KubeletConfiguration {
         } else if period.is_some() {
             anyhow::bail!(
                 "invalid configuration: FeatureGate KubeletCrashLoopBackOffMax not enabled, CrashLoopBackOff.MaxContainerRestartPeriod must not be set"
+            );
+        }
+
+        // validation.go:87-103 (`ValidateKubeletConfiguration`). The
+        // ImageMaximumGCAge gate is GA and locked on in 1.35, so the
+        // "feature gate is required" rule can not fire.
+        let high = self.effective_image_gc_high_threshold_percent();
+        let low = self.effective_image_gc_low_threshold_percent();
+        if !(0..=100).contains(&high) {
+            anyhow::bail!(
+                "invalid configuration: imageGCHighThresholdPercent (--image-gc-high-threshold) {high} must be between 0 and 100, inclusive"
+            );
+        }
+        if !(0..=100).contains(&low) {
+            anyhow::bail!(
+                "invalid configuration: imageGCLowThresholdPercent (--image-gc-low-threshold) {low} must be between 0 and 100, inclusive"
+            );
+        }
+        if low >= high {
+            anyhow::bail!(
+                "invalid configuration: imageGCLowThresholdPercent (--image-gc-low-threshold) {low} must be less than imageGCHighThresholdPercent (--image-gc-high-threshold) {high}"
+            );
+        }
+        let max_age = self.effective_image_maximum_gc_age();
+        if !max_age.is_zero() && max_age <= self.effective_image_minimum_gc_age() {
+            anyhow::bail!(
+                "invalid configuration: imageMaximumGCAge {} must be greater than imageMinimumGCAge {}",
+                rusternetes_common::go_duration::format_go_duration(max_age.as_nanos() as i64),
+                rusternetes_common::go_duration::format_go_duration(
+                    self.effective_image_minimum_gc_age().as_nanos() as i64
+                )
             );
         }
 
@@ -894,6 +972,59 @@ mod tests {
         mk("crashLoopBackOff:\n  maxContainerRestartPeriod: 300s\n")
             .validate()
             .unwrap();
+    }
+
+    /// `ValidateKubeletConfiguration` image GC rules (validation.go:87-103) and
+    /// the v1beta1 defaults (defaults.go:156-162).
+    #[test]
+    fn test_image_gc_config_defaults_and_validation() {
+        let d = KubeletConfiguration::default();
+        assert_eq!(d.effective_image_gc_high_threshold_percent(), 85);
+        assert_eq!(d.effective_image_gc_low_threshold_percent(), 80);
+        assert_eq!(
+            d.effective_image_maximum_gc_age(),
+            std::time::Duration::ZERO
+        );
+        d.validate().unwrap();
+
+        let mk = |y: &str| serde_yaml::from_str::<KubeletConfiguration>(y).unwrap();
+        let c = mk("imageGCHighThresholdPercent: 90\nimageGCLowThresholdPercent: 70\nimageMaximumGCAge: 10m\n");
+        assert_eq!(c.effective_image_gc_high_threshold_percent(), 90);
+        assert_eq!(c.effective_image_gc_low_threshold_percent(), 70);
+        assert_eq!(
+            c.effective_image_maximum_gc_age(),
+            std::time::Duration::from_secs(600)
+        );
+        c.validate().unwrap();
+
+        assert_eq!(
+            mk("imageGCHighThresholdPercent: 101\n")
+                .validate()
+                .unwrap_err()
+                .to_string(),
+            "invalid configuration: imageGCHighThresholdPercent (--image-gc-high-threshold) 101 must be between 0 and 100, inclusive"
+        );
+        assert_eq!(
+            mk("imageGCLowThresholdPercent: -1\n")
+                .validate()
+                .unwrap_err()
+                .to_string(),
+            "invalid configuration: imageGCLowThresholdPercent (--image-gc-low-threshold) -1 must be between 0 and 100, inclusive"
+        );
+        assert_eq!(
+            mk("imageGCHighThresholdPercent: 80\n")
+                .validate()
+                .unwrap_err()
+                .to_string(),
+            "invalid configuration: imageGCLowThresholdPercent (--image-gc-low-threshold) 80 must be less than imageGCHighThresholdPercent (--image-gc-high-threshold) 80"
+        );
+        assert_eq!(
+            mk("imageMaximumGCAge: 1m\n")
+                .validate()
+                .unwrap_err()
+                .to_string(),
+            "invalid configuration: imageMaximumGCAge 1m0s must be greater than imageMinimumGCAge 2m0s"
+        );
     }
 
     #[test]

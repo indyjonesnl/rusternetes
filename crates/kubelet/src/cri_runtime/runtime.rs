@@ -409,6 +409,12 @@ impl CriContainerRuntime {
         })
     }
 
+    /// A clone of the CRI client (its channels are shared) for components that
+    /// speak to the runtime directly, such as the image GC manager.
+    pub fn cri_client(&self) -> CriClient {
+        self.cri.clone()
+    }
+
     /// Query the CRI runtime's identity (Version RPC) and format it as the
     /// k8s `containerRuntimeVersion` string `<runtime_name>://<runtime_version>`
     /// (e.g. `containerd-rs://0.1.2`). Reflects whichever runtime the configured

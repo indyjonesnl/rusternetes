@@ -275,6 +275,53 @@ impl CriClient {
         Ok(resp.into_inner().image)
     }
 
+    /// List every image the runtime holds (`ListImages` with no filter, as
+    /// `kubeGenericRuntimeManager.ListImages` calls `imageService.ListImages(ctx, nil)`,
+    /// `pkg/kubelet/kuberuntime/kuberuntime_image.go:106`).
+    pub async fn list_images(&mut self) -> Result<Vec<v1::Image>> {
+        let request = v1::ListImagesRequest { filter: None };
+        let resp = self
+            .image
+            .list_images(with_deadline(request, Some(self.timeout)))
+            .await
+            .map_err(|source| CriError::Rpc {
+                rpc: "ListImages",
+                source: Box::new(source),
+            })?;
+        Ok(resp.into_inner().images)
+    }
+
+    /// Remove an image by reference (`RemoveImage`).
+    pub async fn remove_image(&mut self, image: &str) -> Result<()> {
+        let request = v1::RemoveImageRequest {
+            image: Some(v1::ImageSpec {
+                image: image.to_string(),
+                ..Default::default()
+            }),
+        };
+        self.image
+            .remove_image(with_deadline(request, Some(self.timeout)))
+            .await
+            .map_err(|source| CriError::Rpc {
+                rpc: "RemoveImage",
+                source: Box::new(source),
+            })?;
+        Ok(())
+    }
+
+    /// Filesystem usage of the image store (`ImageFsInfo`).
+    pub async fn image_fs_info(&mut self) -> Result<v1::ImageFsInfoResponse> {
+        let resp = self
+            .image
+            .image_fs_info(with_deadline(v1::ImageFsInfoRequest {}, Some(self.timeout)))
+            .await
+            .map_err(|source| CriError::Rpc {
+                rpc: "ImageFsInfo",
+                source: Box::new(source),
+            })?;
+        Ok(resp.into_inner())
+    }
+
     // ---- Pod sandbox lifecycle (RuntimeService) ----------------------------
 
     /// Create and start a pod sandbox, returning its sandbox id.
