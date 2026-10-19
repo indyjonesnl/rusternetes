@@ -96,3 +96,74 @@ async fn list_drops_malformed_embedded_metadata_fields() {
         "{out}"
     );
 }
+
+/// #3468: the ROOT `metadata` goes through `GetObjectMetaWithOptions` with
+/// `DropMalformedFields` too (`unstructuredSchemaCoercer.apply`,
+/// customresource_handler.go:1415-1419, `dropInvalidMetadata` :1282), so a
+/// stored CR whose root `metadata.labels` is `3` is served with the field
+/// dropped, not failed.
+async fn setup_with_malformed_root_metadata() -> TestApiServer {
+    let api = TestApiServer::new();
+    let (status, out) = api
+        .post(
+            "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+            &crd(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{out}");
+    api.wait_crd_established(&format!("widgets.{GROUP}")).await;
+    let stored = json!({
+        "apiVersion": format!("{GROUP}/v1"), "kind": "Widget",
+        "metadata": {
+            "name": "w1", "namespace": "default", "uid": "u1", "generation": 1,
+            "creationTimestamp": "2020-01-01T00:00:00Z",
+            "labels": 3, "annotations": {"a": "b"}
+        },
+        "spec": {}
+    });
+    let key = build_key("stable_example_com_widgets", Some("default"), "w1");
+    api.storage.create(&key, &stored).await.unwrap();
+    api
+}
+
+#[tokio::test]
+async fn get_drops_malformed_root_metadata_fields() {
+    let api = setup_with_malformed_root_metadata().await;
+    let (status, out) = api.get(&format!("{PATH}/w1")).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert!(out["metadata"].get("labels").is_none(), "{out}");
+    assert_eq!(out["metadata"]["annotations"], json!({"a": "b"}), "{out}");
+    assert_eq!(out["metadata"]["name"], "w1", "{out}");
+}
+
+#[tokio::test]
+async fn list_drops_malformed_root_metadata_fields() {
+    let api = setup_with_malformed_root_metadata().await;
+    let (status, out) = api.get(PATH).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["items"][0]["metadata"]["name"], "w1", "{out}");
+    assert!(out["items"][0]["metadata"].get("labels").is_none(), "{out}");
+}
+
+#[tokio::test]
+async fn update_and_delete_read_a_malformed_root_metadata_object() {
+    let api = setup_with_malformed_root_metadata().await;
+    let (_, current) = api.get(&format!("{PATH}/w1")).await;
+    let rv = current["metadata"]["resourceVersion"].clone();
+    let (status, out) = api
+        .put(
+            &format!("{PATH}/w1"),
+            &json!({
+                "apiVersion": format!("{GROUP}/v1"), "kind": "Widget",
+                "metadata": {"name": "w1", "namespace": "default", "resourceVersion": rv},
+                "spec": {"x": 1}
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert!(out["metadata"].get("labels").is_none(), "{out}");
+
+    let api = setup_with_malformed_root_metadata().await;
+    let (status, out) = api.delete(&format!("{PATH}/w1")).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+}

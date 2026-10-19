@@ -211,6 +211,10 @@ pub type ShouldDeleteDuringUpdateFn<T> = fn(&T, &T) -> bool;
 /// Store decodes from storage. See [`Store::decode_defaulter`].
 pub type DecodeDefaulterFn<T> = fn(&mut T);
 
+/// A storage codec's repair of the stored JSON before it is decoded into the
+/// typed object (see [`Store::decode_value`]).
+pub type DecodeValueFn = fn(&mut serde_json::Value);
+
 /// `FinishFunc` (store.go:59-60): what a Begin hook returns to complete its
 /// operation, told whether the operation succeeded.
 #[async_trait]
@@ -295,6 +299,13 @@ pub struct Store<T: Object, S: Storage> {
     /// existed, or written around the API, comes back defaulted — which the
     /// strategies' update validation relies on when it compares old and new.
     pub decode_defaulter: Option<DecodeDefaulterFn<T>>,
+    /// What the storage codec does to the stored object while it is still
+    /// unstructured, before the typed decode can refuse it. A custom
+    /// resource's codec drops each malformed field of the root `metadata`
+    /// (`crdConversionRESTOptionsGetter` with `dropInvalidMetadata: true`,
+    /// customresource_handler.go:1280-1283), which a typed `ObjectMeta`
+    /// cannot hold. `None` for every in-tree type.
+    pub decode_value: Option<DecodeValueFn>,
     /// `Decorator`.
     pub decorator: Option<DecoratorFn<T>>,
     /// `TTLFunc`.
@@ -350,6 +361,7 @@ impl<T: Object, S: Storage> Clone for Store<T, S> {
             return_deleted_object: self.return_deleted_object,
             should_delete_during_update: self.should_delete_during_update,
             decode_defaulter: self.decode_defaulter,
+            decode_value: self.decode_value,
             decorator: self.decorator.clone(),
             ttl_func: self.ttl_func.clone(),
             begin_create: self.begin_create.clone(),
@@ -416,6 +428,7 @@ impl<T: Object, S: Storage> Store<T, S> {
             return_deleted_object: false,
             should_delete_during_update: None,
             decode_defaulter: None,
+            decode_value: None,
             decorator: None,
             ttl_func: None,
             begin_create: None,
@@ -423,6 +436,32 @@ impl<T: Object, S: Storage> Store<T, S> {
             after_delete: None,
             update_transformers: Vec::new(),
         }
+    }
+
+    /// `storage.get`, decoded by the storage codec: the stored JSON is
+    /// repaired by [`Store::decode_value`] first when the store has one.
+    async fn read(&self, key: &str) -> Result<T> {
+        let Some(repair) = self.decode_value else {
+            return self.storage.get::<T>(key).await;
+        };
+        let mut value: serde_json::Value = self.storage.get(key).await?;
+        repair(&mut value);
+        serde_json::from_value(value).map_err(Error::Serialization)
+    }
+
+    /// `storage.list`, decoded the way [`Store::read`] decodes.
+    pub(crate) async fn read_list(&self, prefix: &str) -> Result<Vec<T>> {
+        let Some(repair) = self.decode_value else {
+            return self.storage.list::<T>(prefix).await;
+        };
+        let values: Vec<serde_json::Value> = self.storage.list(prefix).await?;
+        values
+            .into_iter()
+            .map(|mut value| {
+                repair(&mut value);
+                serde_json::from_value(value).map_err(Error::Serialization)
+            })
+            .collect()
     }
 
     /// This store with the storage codec's defaulting (see
@@ -644,7 +683,7 @@ impl<T: Object, S: Storage> Store<T, S> {
         try_update: &mut dyn TryUpdate<T>,
     ) -> std::result::Result<T, Abort<T>> {
         loop {
-            let current: Option<T> = match self.storage.get::<T>(key).await {
+            let current: Option<T> = match self.read(key).await {
                 Ok(obj) => Some(self.decoded(obj)),
                 Err(Error::NotFound(_)) if ignore_not_found => None,
                 Err(Error::NotFound(_)) => return Err(Abort::Api(self.not_found(name))),
@@ -807,7 +846,7 @@ impl<T: Object, S: Storage> Store<T, S> {
         delete_validation: Option<&dyn ValidateObject<T>>,
         dry_run: bool,
     ) -> Result<T> {
-        let current: T = self.decoded(self.storage.get(key).await?);
+        let current: T = self.decoded(self.read(key).await?);
         if let Err(failure) = Self::check_preconditions(preconditions, Some(&current)) {
             return Err(self.conflict(name, Self::storage_error_text(key, &failure)));
         }
@@ -826,8 +865,7 @@ impl<T: Object, S: Storage> Store<T, S> {
     pub async fn get(&self, ctx: &RequestContext, name: &str, options: &GetOptions) -> Result<T> {
         let key = self.key_func(ctx, name)?;
         self.wait_until_fresh(&options.resource_version).await?;
-        self.storage
-            .get(&key)
+        self.read(&key)
             .await
             .map(|obj| self.decorated(self.decoded(obj)))
             .map_err(|e| self.interpret_get_error(e, name))
@@ -899,7 +937,7 @@ impl<T: Object, S: Storage> Store<T, S> {
 
         let result = if options.dry_run {
             // `DryRunnableStorage.Create` (dryrun.go:39-47).
-            match self.storage.get::<T>(&key).await {
+            match self.read(&key).await {
                 Ok(_) => Err(Error::AlreadyExists(key.clone())),
                 Err(Error::NotFound(_)) => Ok(obj.clone()),
                 Err(e) => Err(e),
@@ -921,7 +959,7 @@ impl<T: Object, S: Storage> Store<T, S> {
                 };
                 // Tell the client when the name is taken by an object that is
                 // on its way out (store.go:532-542).
-                match self.storage.get::<T>(&key).await {
+                match self.read(&key).await {
                     Ok(existing) if existing.metadata().deletion_timestamp.is_some() => Err(
                         Error::AlreadyExists(format!("object is being deleted: {msg}")),
                     ),
@@ -1074,8 +1112,7 @@ impl<T: Object, S: Storage> Store<T, S> {
     ) -> Result<(Deleted<T>, bool)> {
         let key = self.key_func(ctx, name)?;
         let mut obj: T = self
-            .storage
-            .get(&key)
+            .read(&key)
             .await
             .map_err(|e| self.interpret_delete_error(e, name))?;
 
@@ -1775,8 +1812,7 @@ impl<T: Object, S: Storage + Send + Sync + 'static> crate::registry::rest::RestS
         let revision = self.storage.current_revision().await.unwrap_or(0);
         reject_compacted_continue(&*self.storage, list_options).await?;
         let mut items: Vec<T> = self
-            .storage
-            .list(&prefix)
+            .read_list(&prefix)
             .await?
             .into_iter()
             .map(|obj| self.decoded(obj))
