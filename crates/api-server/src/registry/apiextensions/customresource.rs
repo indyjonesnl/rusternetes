@@ -67,8 +67,9 @@ use crate::handlers::custom_resource::{
 use crate::registry::generic::store::{BeginUpdate, Finish};
 use crate::registry::generic::{CreateOptions, Deleted, Store, UpdateOptions};
 use crate::registry::rest::{
-    GroupResource, NamespaceScopedStrategy, RequestContext, RestCreateStrategy, RestDeleteStrategy,
-    RestStorage, RestUpdateStrategy, UpdatedObjectInfo, ValidateObject, ValidateObjectUpdate,
+    with_group_kind, GroupResource, NamespaceScopedStrategy, RequestContext, RestCreateStrategy,
+    RestDeleteStrategy, RestStorage, RestUpdateStrategy, UpdatedObjectInfo, ValidateObject,
+    ValidateObjectUpdate,
 };
 use crate::ssa::ResetFields;
 
@@ -777,7 +778,13 @@ impl CustomResourceRest {
     fn check_write(&self, cr: &CustomResource) -> Result<()> {
         let errs = self.strategy.type_meta_errors(cr);
         if !errs.is_empty() {
-            return Err(Error::Invalid(errs));
+            // `BeforeCreate`'s `NewInvalid(kind.GroupKind(), name, errs)`
+            // (rest/create.go:122-123), as the Store does for the same list.
+            return Err(with_group_kind(
+                Error::Invalid(errs),
+                &self.crd().spec.group,
+                cr,
+            ));
         }
         self.check_strict(cr)
     }
@@ -1373,5 +1380,29 @@ mod prune_nulls_tests {
         let mut obj = cr(json!({"plain": null}));
         strategy(true).coerce(&mut obj);
         assert_eq!(obj.spec.unwrap(), json!({"plain": null, "defaulted": "d"}));
+    }
+
+    /// `BeforeCreate` returns `errors.NewInvalid(kind.GroupKind(), name, errs)`
+    /// (rest/create.go:122-123), so a kind that does not match the CRD reads
+    /// `Other.stable.example.com "w" is invalid: kind: Invalid value: ...`
+    /// (errors.go:284-312), not the bare `Invalid resource: ...` list.
+    #[test]
+    fn decode_strict_kind_mismatch_is_new_invalid() {
+        use rusternetes_storage::MemoryStorage;
+        let strat = strategy(false);
+        let rest = CustomResourceRest::new(
+            Arc::new(StorageBackend::Memory(Arc::new(MemoryStorage::new()))),
+            strat.crd.clone(),
+            "v1",
+            false,
+            StrictMode::Off,
+        );
+        let mut obj = cr(json!({}));
+        obj.kind = "Other".into();
+        let err = rest.decode_strict(&obj).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Other.stable.example.com \"w\" is invalid: kind: Invalid value: \"Other\": must be Widget"
+        );
     }
 }
