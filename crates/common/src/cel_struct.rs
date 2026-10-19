@@ -45,8 +45,9 @@ use cel::common::ast::{
     CallExpr, EntryExpr, Expr, IdedEntryExpr, IdedExpr, LiteralValue, MapEntryExpr, MapExpr,
 };
 use cel::common::types::CelString;
-use cel::objects::Key;
-use cel::{Context, ExecutionError, Program, Value};
+use cel::objects::{Key, OptionalValue};
+use cel::parser::Parser;
+use cel::{Context, ExecutionError, Value};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
@@ -63,6 +64,8 @@ const OBJECT_FIELD_FN: &str = "__objectField";
 /// The interpreter parses `jsonpatch.escapeKey(x)` as a member call on the
 /// identifier `jsonpatch`; [`rewrite`] turns it into a global call of this
 /// dotted name.
+/// Guard replacing the `_?._` optional-select operator ([`opt_select`]).
+const OPT_SELECT_FN: &str = "__optSelect";
 const JSON_PATCH_ESCAPE_KEY_FN: &str = "jsonpatch.escapeKey";
 
 /// A compiled CEL expression whose struct initializers have been rewritten.
@@ -124,8 +127,46 @@ pub fn new_context() -> Context<'static> {
             Ok(v)
         },
     );
+    ctx.add_function(OPT_SELECT_FN, opt_select);
     crate::cel_authz_library::register(&mut ctx);
     ctx
+}
+
+/// Guard standing in for the `_?._` operator. The `cel` 0.13 interpreter
+/// (`objects.rs` `operators::OPT_SELECT`) errors with `No such key` for
+/// `map.?missing` when the receiver is a plain map, instead of yielding
+/// `optional.none()`. cel-go's `OptionalTypes()` library returns an optional
+/// for every receiver, and the apiextensions `optionalOldSelf` tests rely on
+/// it (`validation_test.go` `TestOptionalOldSelfCheckForNull`).
+fn opt_select(operand: Value, field: Value) -> Result<Value, ExecutionError> {
+    let Value::String(field) = field else {
+        return Err(ExecutionError::function_error(
+            "_?._",
+            "field must be string",
+        ));
+    };
+    fn lookup(v: &Value, field: &str) -> Option<Value> {
+        match v {
+            Value::Map(m) => m
+                .map
+                .get(&Key::String(std::sync::Arc::new(field.to_string())))
+                .cloned(),
+            _ => None,
+        }
+    }
+    let wrap = |v: Option<Value>| {
+        Value::Opaque(std::sync::Arc::new(match v {
+            Some(v) => OptionalValue::of(v),
+            None => OptionalValue::none(),
+        }))
+    };
+    if let Ok(opt) = <&OptionalValue>::try_from(&operand) {
+        return Ok(wrap(opt.value().and_then(|v| lookup(v, &field))));
+    }
+    match operand {
+        Value::Map(_) => Ok(wrap(lookup(&operand, &field))),
+        _ => Err(ExecutionError::NoSuchOverload),
+    }
 }
 
 fn kind(v: &Value) -> &'static str {
@@ -162,10 +203,14 @@ fn check_string_keys(v: &Value) -> Result<(), ExecutionError> {
 /// Parse `source` and rewrite its struct initializers. Never panics.
 pub fn compile(source: &str) -> Result<CompiledExpression, String> {
     // The antlr4rust parser panics on some invalid expressions.
-    let program = catch_unwind(AssertUnwindSafe(|| Program::compile(source)))
-        .map_err(|_| format!("invalid CEL expression '{source}'"))?
-        .map_err(|e| e.to_string())?;
-    let mut expr = program.expression().clone();
+    // `enable_optional_syntax`: cel-go `OptionalTypes()` is in the base env
+    // (apiserver `pkg/cel/environment/base.go:99-101`), so `.?field` and
+    // `[?index]` parse.
+    let mut expr = catch_unwind(AssertUnwindSafe(|| {
+        Parser::new().enable_optional_syntax(true).parse(source)
+    }))
+    .map_err(|_| format!("invalid CEL expression '{source}'"))?
+    .map_err(|e| e.to_string())?;
     rewrite(&mut expr, None)?;
     Ok(CompiledExpression(expr))
 }
@@ -351,6 +396,12 @@ fn rewrite(e: &mut IdedExpr, expected: Option<&str>) -> Result<(), String> {
             {
                 c.target = None;
                 c.func_name = JSON_PATCH_ESCAPE_KEY_FN.to_string();
+            }
+            if c.func_name == cel::common::ast::operators::OPT_SELECT
+                && c.target.is_none()
+                && c.args.len() == 2
+            {
+                c.func_name = OPT_SELECT_FN.to_string();
             }
             if let Some(t) = c.target.as_mut() {
                 rewrite(t, None)?;

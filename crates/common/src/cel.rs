@@ -5,7 +5,7 @@
 use crate::cel_struct::{self, CompiledExpression};
 use anyhow::{anyhow, Result};
 use cel::{
-    objects::{Key, Map},
+    objects::{Key, Map, OptionalValue},
     Value,
 };
 use serde_json;
@@ -338,6 +338,25 @@ impl CELContext {
         self.variables.insert(name, value);
     }
 
+    /// Bind `name` to a CEL optional: `optional.of(value)` when `value` is
+    /// `Some`, else `optional.none()`. Port of
+    /// `validationActivationWithOldSelf`'s `optionalOldSelfActivation`
+    /// (`apiextensions-apiserver/pkg/apiserver/schema/cel/validation.go:776-793`,
+    /// `types.OptionalNone` / `types.OptionalOf`).
+    pub fn add_optional_json_variable(
+        &mut self,
+        name: &str,
+        value: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        let opt = match value {
+            Some(v) => OptionalValue::of(json_to_cel_value(v)?),
+            None => OptionalValue::none(),
+        };
+        self.variables
+            .insert(name.to_string(), Value::Opaque(Arc::new(opt)));
+        Ok(())
+    }
+
     /// Add a JSON value as a variable (converts to CEL Value)
     pub fn add_json_variable(&mut self, name: &str, value: &serde_json::Value) -> Result<()> {
         let cel_value = json_to_cel_value(value)?;
@@ -612,5 +631,47 @@ mod tests {
             .evaluate("namespaceObject.metadata.name == 'test-ns'", &context)
             .unwrap();
         assert!(result);
+    }
+
+    /// cel-go `OptionalTypes()` (apiserver `pkg/cel/environment/base.go:99-101`)
+    /// is in the base env: `optional.of/none`, `hasValue`, `value`, `orValue`,
+    /// and the `.?field` / `[?i]` syntax.
+    fn eval_with(expr: &str, ctx: &CELContext) -> bool {
+        CELEvaluator::new().evaluate(expr, ctx).unwrap()
+    }
+
+    #[test]
+    fn optional_functions() {
+        let ctx = CELContext::new();
+        assert!(eval_with("optional.none().orValue(5) == 5", &ctx));
+        assert!(eval_with("optional.of(3).orValue(5) == 3", &ctx));
+        assert!(eval_with("optional.of(3).hasValue()", &ctx));
+        assert!(!eval_with("optional.none().hasValue()", &ctx));
+        assert!(eval_with("optional.of(3).value() == 3", &ctx));
+        assert!(!eval_with("optional.ofNonZeroValue(0).hasValue()", &ctx));
+        assert!(eval_with("optional.ofNonZeroValue(2).hasValue()", &ctx));
+    }
+
+    #[test]
+    fn optional_syntax_field_and_index_select() {
+        let mut ctx = CELContext::new();
+        ctx.add_json_variable("m", &serde_json::json!({"a": "x", "l": [1, 2]}))
+            .unwrap();
+        assert!(eval_with("m.?a.orValue('d') == 'x'", &ctx));
+        assert!(eval_with("m.?b.orValue('d') == 'd'", &ctx));
+        assert!(eval_with("m.l[?5].orValue(9) == 9", &ctx));
+        assert!(eval_with("m.l[?1].orValue(9) == 2", &ctx));
+    }
+
+    #[test]
+    fn add_optional_json_variable_binds_some_and_none() {
+        let mut ctx = CELContext::new();
+        ctx.add_optional_json_variable("o", Some(&serde_json::json!({"foo": "bar"})))
+            .unwrap();
+        ctx.add_optional_json_variable("n", None).unwrap();
+        assert!(eval_with("o.hasValue() && o.value().foo == 'bar'", &ctx));
+        assert!(eval_with("o.?foo.orValue('') == 'bar'", &ctx));
+        assert!(!eval_with("n.hasValue()", &ctx));
+        assert!(eval_with("n.?foo.orValue('z') == 'z'", &ctx));
     }
 }

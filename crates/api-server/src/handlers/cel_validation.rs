@@ -56,6 +56,8 @@ pub struct ValidationRule {
     /// property names (`["spec", "replicas"]`). Used to locate the JSON node
     /// the rule applies to on the incoming CR.
     pub path: Vec<String>,
+    /// `optionalOldSelf` (KEP-4008).
+    pub optional_old_self: bool,
 }
 
 /// Extract every `x-kubernetes-validations[]` entry from `schema`, recursing
@@ -93,6 +95,10 @@ fn collect_rules_recursive(
                     rule,
                     message,
                     path: path.clone(),
+                    optional_old_self: obj
+                        .get("optionalOldSelf")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
                 });
             }
         }
@@ -588,7 +594,9 @@ pub fn validate_cr_rules(
         // an undefined `oldSelf` — see upstream
         // `apiextensions-apiserver/.../validation/validation.go`.
         let is_transition = rule_references_old_self(&r.rule);
-        if is_transition && old_json.is_none() {
+        // Unless `optionalOldSelf` is set (validation.go:401-418: the rule
+        // then runs with `oldSelf` an empty optional).
+        if is_transition && old_json.is_none() && !r.optional_old_self {
             continue;
         }
 
@@ -610,11 +618,13 @@ pub fn validate_cr_rules(
         ctx.add_json_variable("self", &self_node)
             .map_err(|e| Error::Internal(e.to_string()))?;
 
-        if let Some(old) = &old_json {
-            if let Some(old_self) = node_at_path(old, &r.path) {
-                ctx.add_json_variable("oldSelf", old_self)
-                    .map_err(|e| Error::Internal(e.to_string()))?;
-            }
+        let old_self = old_json.as_ref().and_then(|old| node_at_path(old, &r.path));
+        if r.optional_old_self {
+            ctx.add_optional_json_variable("oldSelf", old_self)
+                .map_err(|e| Error::Internal(e.to_string()))?;
+        } else if let Some(old_self) = old_self {
+            ctx.add_json_variable("oldSelf", old_self)
+                .map_err(|e| Error::Internal(e.to_string()))?;
         }
 
         // Also expose `object`/`oldObject` for tests that author rules against
@@ -740,7 +750,12 @@ fn walk_and_eval(
 
             let is_transition = rule_references_old_self(rule_str);
             // Skip transition rules on CREATE.
-            if is_transition && old_node.is_none() {
+            // ...unless `optionalOldSelf` (validation.go:401-418).
+            let optional_old_self = obj
+                .get("optionalOldSelf")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if is_transition && old_node.is_none() && !optional_old_self {
                 continue;
             }
 
@@ -755,7 +770,10 @@ fn walk_and_eval(
             let mut ctx = CELContext::new();
             ctx.add_json_variable("self", node)
                 .map_err(|e| Error::Internal(e.to_string()))?;
-            if let Some(o) = old_node {
+            if optional_old_self {
+                ctx.add_optional_json_variable("oldSelf", old_node)
+                    .map_err(|e| Error::Internal(e.to_string()))?;
+            } else if let Some(o) = old_node {
                 ctx.add_json_variable("oldSelf", o)
                     .map_err(|e| Error::Internal(e.to_string()))?;
             }
@@ -946,6 +964,96 @@ mod tests {
             }
         });
         serde_json::from_value(raw).expect("schema deserialises")
+    }
+
+    fn optional_schema(rule: &str, optional: Option<bool>) -> JSONSchemaProps {
+        let mut v = json!({"rule": rule, "message": "failed rule"});
+        if let Some(b) = optional {
+            v["optionalOldSelf"] = json!(b);
+        }
+        serde_json::from_value(json!({
+            "type": "object",
+            "properties": {"foo": {"type": "string"}},
+            "x-kubernetes-validations": [v]
+        }))
+        .expect("schema deserialises")
+    }
+
+    fn fails(
+        schema: &JSONSchemaProps,
+        new: serde_json::Value,
+        old: Option<serde_json::Value>,
+    ) -> bool {
+        !evaluate_cr_rules_with_paths(schema, &new, old.as_ref())
+            .unwrap()
+            .is_empty()
+    }
+
+    /// apiextensions-apiserver `pkg/apiserver/schema/cel/validation_test.go`
+    /// `TestOptionalOldSelf`: with `optionalOldSelf: true` the rule runs on
+    /// create with `oldSelf` an empty optional.
+    #[test]
+    fn optional_old_self_evaluates_on_create_with_none() {
+        let s = optional_schema("self.foo == 'not bar' || !oldSelf.hasValue()", Some(true));
+        assert!(!fails(&s, json!({"foo": "bar"}), None));
+        // rule requires an old value: on create the empty optional fails it.
+        let s = optional_schema("oldSelf.hasValue() || self.foo == 'ok'", Some(true));
+        assert!(fails(&s, json!({"foo": "bad"}), None));
+        assert!(!fails(&s, json!({"foo": "ok"}), None));
+    }
+
+    #[test]
+    fn optional_old_self_binds_old_value_on_update() {
+        let s = optional_schema(
+            "self.foo == 'valid' || (oldSelf.hasValue() && oldSelf.value().foo != 'valid')",
+            Some(true),
+        );
+        // block: old was valid
+        assert!(fails(
+            &s,
+            json!({"foo": "invalid"}),
+            Some(json!({"foo": "valid"}))
+        ));
+        // ratchet: old also invalid
+        assert!(!fails(
+            &s,
+            json!({"foo": "invalid again"}),
+            Some(json!({"foo": "invalid"}))
+        ));
+        // `oldSelf.?foo.orValue(...)` optional field select
+        let s = optional_schema(
+            "self.foo != 'bar' || oldSelf.?foo.orValue('baz') == 'baz'",
+            Some(true),
+        );
+        assert!(!fails(
+            &s,
+            json!({"foo": "bar"}),
+            Some(json!({"foo": "baz"}))
+        ));
+        assert!(fails(
+            &s,
+            json!({"foo": "bar"}),
+            Some(json!({"foo": "other"}))
+        ));
+    }
+
+    /// Without the flag (or `false`) a transition rule is still skipped on
+    /// create (validation.go: `compiled.UsesOldSelf && oldObj == nil`).
+    #[test]
+    fn transition_rule_without_optional_old_self_skipped_on_create() {
+        for flag in [None, Some(false)] {
+            let s = optional_schema("oldSelf.foo == self.foo", flag);
+            assert!(!fails(&s, json!({"foo": "x"}), None));
+        }
+    }
+
+    /// The flat (`collect_rules` / `validate_cr_rules`) path honours it too.
+    #[test]
+    fn collect_rules_carries_optional_old_self() {
+        let s = optional_schema("!oldSelf.hasValue() || self.foo == 'x'", Some(true));
+        assert!(collect_rules(&s)[0].optional_old_self);
+        let s = optional_schema("oldSelf.foo == self.foo", None);
+        assert!(!collect_rules(&s)[0].optional_old_self);
     }
 
     /// `preexistingExpressions.RuleEnv` (validation.go:158-163): a new rule is
