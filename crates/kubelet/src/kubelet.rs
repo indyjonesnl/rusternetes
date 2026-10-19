@@ -3939,27 +3939,14 @@ impl Kubelet {
                                     self.get_init_container_statuses(&new_pod).await;
 
                                 let qos = Self::compute_qos_class(&new_pod);
-                                let observed_gen = new_pod.metadata.generation;
-                                new_pod.status = Some(PodStatus {
-                                    phase: Some(Phase::Pending),
-                                    message: Some(err_msg),
-                                    reason: Some(reason),
-                                    host_ip: self.host_ip_fields().0,
-                                    pod_ip: None,
-                                    conditions: None,
+                                new_pod.status = Some(self.create_error_pod_status(
+                                    &new_pod,
+                                    reason,
+                                    err_msg,
                                     container_statuses,
                                     init_container_statuses,
-                                    ephemeral_container_statuses: None,
-                                    resize: None,
-                                    resource_claim_statuses: None,
-                                    observed_generation: observed_gen,
-                                    host_i_ps: self.host_ip_fields().1,
-                                    pod_i_ps: None,
-                                    nominated_node_name: None,
-                                    qos_class: Some(qos),
-                                    start_time: Some(chrono::Utc::now()),
-                                    ..Default::default()
-                                });
+                                    qos,
+                                ));
                                 self.apply_host_ips_to_pod(&mut new_pod).await;
 
                                 if let Err(e) = self.storage.update_status(&key, &new_pod).await {
@@ -5570,6 +5557,44 @@ impl Kubelet {
                 })
                 .collect()
         })
+    }
+
+    /// Pending status for a container creation/config error (typed CRI
+    /// reason), generated through `generate_api_pod_status`
+    /// (pkg/kubelet/kubelet_pods.go:1889 generateAPIPodStatus). The caller
+    /// applies the host-IP block afterwards.
+    fn create_error_pod_status(
+        &self,
+        pod: &Pod,
+        reason: String,
+        err_msg: String,
+        container_statuses: Option<Vec<ContainerStatus>>,
+        init_container_statuses: Option<Vec<ContainerStatus>>,
+        qos: String,
+    ) -> PodStatus {
+        let start_time = preserved_start_time(
+            pod.status.as_ref().and_then(|s| s.start_time),
+            chrono::Utc::now(),
+        );
+        let (host_ip, host_ips) = self.host_ip_fields();
+        crate::pod_status::generate_api_pod_status(
+            pod,
+            crate::pod_status::ApiPodStatusInput {
+                phase: Phase::Pending,
+                message: Some(err_msg),
+                reason: Some(reason),
+                host_ip,
+                host_ips,
+                pod_ip: None,
+                pod_ips: None,
+                conditions: Vec::new(),
+                container_statuses,
+                init_container_statuses,
+                ephemeral_container_statuses: None,
+                qos_class: Some(qos),
+                start_time,
+            },
+        )
     }
 
     fn build_init_failure_status(
@@ -7740,6 +7765,62 @@ mod tests {
             super::app_container_waiting_reason(&pod, None),
             "ContainerCreating"
         );
+    }
+
+    /// #3901: the create-error Pending write is a generateAPIPodStatus
+    /// output: conditions the kubelet does not own survive
+    /// (kubelet_pods.go:1957-1962), startTime is not reset, and a terminal
+    /// API phase is not left (kubelet_pods.go:1937-1945).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn create_error_status_is_generated_from_prior_status() {
+        use rusternetes_storage::StorageBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(StorageBackend::new_memory());
+        let k = node_ip_kubelet(&dir, storage, "node-ce", &["10.1.1.1"], false).await;
+        let t0 = chrono::Utc::now() - chrono::Duration::hours(1);
+        let mut pod = Pod::new("ce", Default::default());
+        pod.status = Some(PodStatus {
+            phase: Some(Phase::Pending),
+            start_time: Some(t0),
+            conditions: Some(vec![rusternetes_common::resources::PodCondition {
+                condition_type: "DisruptionTarget".into(),
+                status: "True".into(),
+                reason: None,
+                message: None,
+                last_probe_time: None,
+                last_transition_time: None,
+                observed_generation: None,
+            }]),
+            ..Default::default()
+        });
+        let st = k.create_error_pod_status(
+            &pod,
+            "CreateContainerError".into(),
+            "boom".into(),
+            None,
+            None,
+            "BestEffort".into(),
+        );
+        assert_eq!(st.start_time, Some(t0), "startTime must not reset");
+        assert!(st
+            .conditions
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|c| c.condition_type == "DisruptionTarget"));
+        assert_eq!(st.reason.as_deref(), Some("CreateContainerError"));
+
+        pod.status.as_mut().unwrap().phase = Some(Phase::Failed);
+        let st = k.create_error_pod_status(
+            &pod,
+            "CreateContainerError".into(),
+            "boom".into(),
+            None,
+            None,
+            "BestEffort".into(),
+        );
+        assert_eq!(st.phase, Some(Phase::Failed), "terminal phase is sticky");
     }
 
     #[test]
