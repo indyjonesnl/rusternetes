@@ -227,7 +227,7 @@ fn create_test_pvc(name: &str, namespace: &str) -> PersistentVolumeClaim {
         },
         metadata: ObjectMeta::new(name).with_namespace(namespace),
         spec: PersistentVolumeClaimSpec {
-            access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
+            access_modes: Some(vec![PersistentVolumeAccessMode::ReadWriteOnce]),
             resources: ResourceRequirements {
                 requests: Some(requests),
                 limits: None,
@@ -455,7 +455,7 @@ async fn make_pvc(storage: &Arc<MemoryStorage>, name: &str, storage_req: &str) {
         },
         metadata: ObjectMeta::new(name).with_namespace(LR_NS),
         spec: PersistentVolumeClaimSpec {
-            access_modes: vec![],
+            access_modes: Some(vec![]),
             resources: PvcResourceRequirements {
                 requests: Some(requests),
                 limits: None,

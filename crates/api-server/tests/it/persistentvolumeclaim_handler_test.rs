@@ -41,7 +41,7 @@ fn create_test_pvc(name: &str, namespace: &str, storage: &str) -> PersistentVolu
             managed_fields: None,
         },
         spec: PersistentVolumeClaimSpec {
-            access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
+            access_modes: Some(vec![PersistentVolumeAccessMode::ReadWriteOnce]),
             resources: ResourceRequirements {
                 requests: Some(requests),
                 limits: None,
@@ -228,16 +228,16 @@ async fn test_pvc_access_modes() {
     let storage = Arc::new(MemoryStorage::new());
 
     let mut pvc = create_test_pvc("test-access", "default", "10Gi");
-    pvc.spec.access_modes = vec![
+    pvc.spec.access_modes = Some(vec![
         PersistentVolumeAccessMode::ReadWriteOnce,
         PersistentVolumeAccessMode::ReadOnlyMany,
-    ];
+    ]);
 
     let key = build_key("persistentvolumeclaims", Some("default"), "test-access");
 
     // Create with multiple access modes
     let created: PersistentVolumeClaim = storage.create(&key, &pvc).await.unwrap();
-    let modes = &created.spec.access_modes;
+    let modes = created.spec.access_modes_slice();
     assert_eq!(modes.len(), 2);
     assert!(modes.contains(&PersistentVolumeAccessMode::ReadWriteOnce));
     assert!(modes.contains(&PersistentVolumeAccessMode::ReadOnlyMany));

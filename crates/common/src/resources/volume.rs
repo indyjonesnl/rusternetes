@@ -422,9 +422,12 @@ pub struct PersistentVolumeClaim {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistentVolumeClaimSpec {
-    /// Access modes
-    #[serde(default)]
-    pub access_modes: Vec<PersistentVolumeAccessMode>,
+    /// Access modes. `None` is Go's nil slice (key absent), `Some(vec![])`
+    /// the empty non-nil slice (`accessModes: []`): `json.MarshalIndent` in
+    /// `diff.Diff` renders them `null` and `[]` (core types.go
+    /// `PersistentVolumeClaimSpec.AccessModes`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_modes: Option<Vec<PersistentVolumeAccessMode>>,
 
     /// Resource requirements
     #[serde(default)]
@@ -461,6 +464,13 @@ pub struct PersistentVolumeClaimSpec {
     /// VolumeAttributesClassName may be used to set the VolumeAttributesClass used by this claim
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume_attributes_class_name: Option<String>,
+}
+
+impl PersistentVolumeClaimSpec {
+    /// `AccessModes` with nil and empty collapsed, for read-only callers.
+    pub fn access_modes_slice(&self) -> &[PersistentVolumeAccessMode] {
+        self.access_modes.as_deref().unwrap_or(&[])
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1015,7 +1025,7 @@ mod tests {
             },
             metadata: ObjectMeta::new("test-pvc").with_namespace("default"),
             spec: PersistentVolumeClaimSpec {
-                access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
+                access_modes: Some(vec![PersistentVolumeAccessMode::ReadWriteOnce]),
                 resources: ResourceRequirements {
                     limits: None,
                     requests: Some(requests),

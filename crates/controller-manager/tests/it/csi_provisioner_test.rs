@@ -258,7 +258,7 @@ fn claim(annotations: &[(&str, &str)]) -> PersistentVolumeClaim {
         },
         metadata: meta,
         spec: PersistentVolumeClaimSpec {
-            access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
+            access_modes: Some(vec![PersistentVolumeAccessMode::ReadWriteOnce]),
             resources: ResourceRequirements {
                 requests: Some([("storage".to_string(), "1Gi".to_string())].into()),
                 ..Default::default()
