@@ -479,6 +479,9 @@ pub(crate) struct SharedPodInformer<S: Storage> {
     interval: Duration,
     cache: PodInformerCache,
     handlers: Mutex<Vec<Arc<dyn PodObservationHandler>>>,
+    /// `sharedIndexInformer.blockDeltas` (shared_informer.go:444-446): held
+    /// by event distribution and by a late handler's registration + replay.
+    block_deltas: tokio::sync::Mutex<()>,
     started: AtomicBool,
 }
 
@@ -489,6 +492,7 @@ impl<S: Storage + 'static> SharedPodInformer<S> {
             interval,
             cache: PodInformerCache::new(),
             handlers: Mutex::new(Vec::new()),
+            block_deltas: tokio::sync::Mutex::new(()),
             started: AtomicBool::new(false),
         }
     }
@@ -510,6 +514,9 @@ impl<S: Storage + 'static> SharedPodInformer<S> {
         queue: WorkQueue,
     ) {
         let handler: Arc<dyn PodObservationHandler> = Arc::new(RegisteredTarget { target, queue });
+        // shared_informer.go:698-699: `s.blockDeltas.Lock()` across
+        // addListener and the replay, so no delta is distributed in between.
+        let _block = self.block_deltas.lock().await;
         for observation in self.cache.held_as_adds() {
             handler.handle(&observation).await;
         }
@@ -527,6 +534,8 @@ impl<S: Storage + 'static> SharedPodInformer<S> {
 
     /// One pod watch event: classified once, delivered to every handler.
     pub(crate) async fn on_event(&self, event: &WatchEvent) {
+        // HandleDeltas (shared_informer.go:717-718): `s.blockDeltas.Lock()`.
+        let _block = self.block_deltas.lock().await;
         if let Some(observation) = self.cache.on_event(event) {
             self.distribute(&observation).await;
         }
@@ -536,6 +545,7 @@ impl<S: Storage + 'static> SharedPodInformer<S> {
     pub(crate) async fn relist(&self) {
         match self.storage.list::<Pod>(&build_prefix("pods", None)).await {
             Ok(pods) => {
+                let _block = self.block_deltas.lock().await;
                 for observation in self.cache.replace(&pods) {
                     self.distribute(&observation).await;
                 }
@@ -1133,5 +1143,82 @@ mod tests {
             .add_event_handler(late.clone(), WorkQueue::new())
             .await;
         assert_eq!(late.log(), vec!["created default/c"]);
+    }
+
+    /// A target whose controller-ref lookup parks until released, like the
+    /// storage read `resolve_controller_ref` does in API mode.
+    struct Gated {
+        inner: Arc<Recording>,
+        entered: tokio::sync::Notify,
+        gate: tokio::sync::Semaphore,
+    }
+
+    impl PodEventTarget for Gated {
+        fn queue_prefix(&self) -> &'static str {
+            self.inner.queue_prefix()
+        }
+        async fn resolve_controller_ref(
+            &self,
+            ns: &str,
+            controller_ref: &ControllerRef,
+        ) -> Option<ResolvedController> {
+            self.entered.notify_one();
+            self.gate.acquire().await.unwrap().forget();
+            self.inner.resolve_controller_ref(ns, controller_ref).await
+        }
+        async fn pod_controllers(&self, ns: &str, l: &HashMap<String, String>) -> Vec<String> {
+            self.inner.pod_controllers(ns, l).await
+        }
+        fn creation_observed(&self, key: &str) {
+            self.inner.creation_observed(key)
+        }
+        fn deletion_observed(&self, key: &str, pod_key: &str) {
+            self.inner.deletion_observed(key, pod_key)
+        }
+    }
+
+    /// `AddEventHandlerWithOptions` holds `s.blockDeltas` across
+    /// `addListener` and the replay (shared_informer.go:698-699), and
+    /// `HandleDeltas` takes the same lock around `processDeltas`
+    /// (shared_informer.go:717-718), so an event arriving while the replay is
+    /// in flight is delivered to the new handler afterwards, never lost.
+    #[tokio::test]
+    async fn an_event_during_a_late_handlers_replay_is_not_lost() {
+        use rusternetes_storage::memory::MemoryStorage;
+        let informer = Arc::new(SharedPodInformer::new(
+            Arc::new(MemoryStorage::new()),
+            Duration::from_millis(10),
+        ));
+        let added = |name: &str, rv: &str| {
+            WatchEvent::Added(
+                key(name),
+                pod_json_with(name, Some(("c", true)), &[], false, Some(rv)),
+            )
+        };
+        informer.on_event(&added("a", "1")).await;
+
+        let late = Arc::new(Gated {
+            inner: Recording::new("replicasets"),
+            entered: tokio::sync::Notify::new(),
+            gate: tokio::sync::Semaphore::new(0),
+        });
+        let register = {
+            let (informer, late) = (informer.clone(), late.clone());
+            tokio::spawn(async move { informer.add_event_handler(late, WorkQueue::new()).await })
+        };
+        late.entered.notified().await; // replay of "a" is in flight
+        let event = {
+            let informer = informer.clone();
+            tokio::spawn(async move { informer.on_event(&added("b", "2")).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        late.gate.add_permits(100);
+        register.await.unwrap();
+        event.await.unwrap();
+        assert_eq!(
+            late.inner.log(),
+            vec!["created default/c", "created default/c"],
+            "the replayed add of a and the live add of b"
+        );
     }
 }
