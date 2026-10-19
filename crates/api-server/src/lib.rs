@@ -14,6 +14,7 @@ pub mod request_scope;
 pub mod request_timeout;
 pub use rusternetes_admission_webhook as admission_webhook;
 pub mod apiserver_identity;
+pub mod apiservice_registration;
 pub mod autoregister;
 pub mod bootstrap;
 pub mod crdregistration;

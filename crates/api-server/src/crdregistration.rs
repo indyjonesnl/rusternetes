@@ -41,22 +41,40 @@ type GroupVersion = (String, String);
 /// `Done`): a key added while it is being processed is re-queued on `Done`, so
 /// one key is never worked by two workers at once
 /// (client-go `util/workqueue/queue.go`).
-#[derive(Default)]
-struct WorkQueue {
-    state: Mutex<QueueState>,
+pub(crate) struct WorkQueue<T> {
+    state: Mutex<QueueState<T>>,
     notify: Notify,
 }
 
-#[derive(Default)]
-struct QueueState {
-    queue: VecDeque<GroupVersion>,
-    dirty: HashSet<GroupVersion>,
-    processing: HashSet<GroupVersion>,
+struct QueueState<T> {
+    queue: VecDeque<T>,
+    dirty: HashSet<T>,
+    processing: HashSet<T>,
     shutting_down: bool,
 }
 
-impl WorkQueue {
-    fn add(&self, item: GroupVersion) {
+impl<T: Clone + Eq + std::hash::Hash> Default for QueueState<T> {
+    fn default() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            dirty: HashSet::new(),
+            processing: HashSet::new(),
+            shutting_down: false,
+        }
+    }
+}
+
+impl<T: Clone + Eq + std::hash::Hash> Default for WorkQueue<T> {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(QueueState::default()),
+            notify: Notify::new(),
+        }
+    }
+}
+
+impl<T: Clone + Eq + std::hash::Hash> WorkQueue<T> {
+    pub(crate) fn add(&self, item: T) {
         let mut st = self.state.lock().unwrap();
         if st.shutting_down || st.dirty.contains(&item) {
             return;
@@ -71,7 +89,7 @@ impl WorkQueue {
     }
 
     /// `Get`: blocks for work; `None` once shut down.
-    async fn get(&self) -> Option<GroupVersion> {
+    pub(crate) async fn get(&self) -> Option<T> {
         loop {
             let notified = self.notify.notified();
             {
@@ -89,7 +107,7 @@ impl WorkQueue {
         }
     }
 
-    fn done(&self, item: &GroupVersion) {
+    pub(crate) fn done(&self, item: &T) {
         let mut st = self.state.lock().unwrap();
         st.processing.remove(item);
         if st.dirty.contains(item) {
@@ -99,9 +117,16 @@ impl WorkQueue {
         }
     }
 
-    fn shut_down(&self) {
+    pub(crate) fn shut_down(&self) {
         self.state.lock().unwrap().shutting_down = true;
         self.notify.notify_waiters();
+    }
+
+    /// Nothing queued, dirty or in flight (test hook).
+    #[cfg(test)]
+    pub(crate) fn is_idle(&self) -> bool {
+        let st = self.state.lock().unwrap();
+        st.queue.is_empty() && st.dirty.is_empty() && st.processing.is_empty()
     }
 
     #[cfg(test)]
@@ -116,7 +141,7 @@ pub struct CrdRegistrationController<L: CrdLister> {
     api_service_registration: Arc<dyn AutoAPIServiceRegistration>,
     synced_initial_set: watch::Sender<bool>,
     /// Keyed by a groupVersion; de-dups and carries the rate-limited requeues.
-    queue: WorkQueue,
+    queue: WorkQueue<GroupVersion>,
     rate_limiter: Mutex<ControllerRateLimiter>,
 }
 

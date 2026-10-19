@@ -69,6 +69,10 @@ pub async fn register_post_start_hooks(
         rusternetes_discovery::delegate_listed_paths(),
     );
 
+    // apiservice-registration-controller + apiservice-discovery-controller
+    // PostStartHooks (kube-aggregator apiserver.go:368-420).
+    crate::apiservice_registration::spawn_apiservice_registration_hooks(storage.clone());
+
     // The caller owns the CRD controllers (the same `CrdControllers` its
     // `ApiServerState` feeds from requests): `lib.rs` and the binary each
     // compile their own `registry`, so the hook is passed in rather than named
@@ -137,6 +141,41 @@ pub async fn register_post_start_hooks(
 }
 
 #[cfg(test)]
+mod aggregator_hooks {
+    /// kube-aggregator `apiserver.go:368-420`: `apiservice-registration-controller`
+    /// and `apiservice-discovery-controller` are registered post-start hooks, and
+    /// both finish once the registration controller has installed every known
+    /// APIService (`apiServiceRegistrationControllerInitiated`).
+    #[tokio::test]
+    async fn startup_registers_and_finishes_the_apiservice_hooks() {
+        let storage = std::sync::Arc::new(rusternetes_storage::StorageBackend::new_memory());
+        super::register_post_start_hooks(
+            storage,
+            6443,
+            "10.96.0.1".parse().unwrap(),
+            vec!["10.96.0.0/12".to_string()],
+            None,
+            |_| {},
+        )
+        .await;
+        for name in [
+            "apiservice-registration-controller",
+            "apiservice-discovery-controller",
+        ] {
+            let mut finished = false;
+            for _ in 0..300 {
+                if crate::post_start_hooks::global().check(name) == Some(Ok(())) {
+                    finished = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(finished, "{name} not registered/finished");
+        }
+    }
+}
+
+#[cfg(test)]
 mod startup_hooks_single_path {
     const MAIN_RS: &str = include_str!("main.rs");
     const LIB_RS: &str = include_str!("lib.rs");
@@ -153,6 +192,7 @@ mod startup_hooks_single_path {
         // `start_controllers(` is the one exception: the entry points pass it
         // in as a closure (see `spawn_crd_resync`), each over its own state.
         "spawn_crd_informer_synced_hook(",
+        "spawn_apiservice_registration_hooks(",
         "spawn_legacy_token_tracking_controller(",
         "spawn_identity_hooks(",
         "storage_readiness_hook::spawn_for_backend(",
