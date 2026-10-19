@@ -382,3 +382,41 @@ fn device_mount_path_is_the_global_pd_name() {
         .unwrap();
     assert!(found.new_attacher().is_ok());
 }
+
+/// `iscsiDisk` embeds `volume.NewMetricsStatFS(GetPath())` on both the
+/// mounter (`iscsi.go:128`) and the unmounter (`iscsi.go:194`): metrics are
+/// the statfs of the pod volume dir (#3494).
+#[tokio::test]
+async fn mounter_and_unmounter_provide_statfs_metrics() {
+    use crate::volume_plugins::plugin::MetricsProvider;
+    let tmp = tempfile::tempdir().unwrap();
+    let plug = IscsiPlugin::new(host(tmp.path()));
+    let v = vol("vol1", source());
+    let m = plug
+        .new_mounter_internal(
+            &spec(&v, None, false),
+            "poduid",
+            Arc::new(FakeDiskManager::new()),
+            Arc::new(FakeMounter::new()),
+            Arc::new(no_commands()),
+            HashMap::new(),
+        )
+        .unwrap();
+    let u = plug.new_unmounter_internal(
+        "vol1",
+        "poduid",
+        Arc::new(FakeDiskManager::new()),
+        Arc::new(FakeMounter::new()),
+        Arc::new(no_commands()),
+    );
+
+    // Directory absent: FsInfoFailed, like upstream's statfs error.
+    let err = m.get_metrics().unwrap_err();
+    assert!(err.to_string().starts_with("failed to get FsInfo"), "{err}");
+
+    std::fs::create_dir_all(m.get_path()).unwrap();
+    for got in [m.get_metrics().unwrap(), u.get_metrics().unwrap()] {
+        assert!(got.capacity.unwrap().value() > 0);
+        assert!(got.available.unwrap().value() > 0);
+    }
+}
