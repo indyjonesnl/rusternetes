@@ -453,10 +453,9 @@ async fn configmap_volume_optional_updates_should_be_reflected_in_volume() {
     // `configmap_volume_optional_delete_should_be_reflected_in_volume`.
 }
 
-/// The delete leg of configmap_volume.go:240. Fails today: the plain configMap
-/// resync skips a deleted ConfigMap instead of projecting upstream's empty one
-/// (`pkg/volume/configmap/configmap.go` SetUpAt, `IsNotFound && optional`).
-#[ignore = "kubelet bug #3856: plain configMap resync keeps files after optional ConfigMap delete"]
+/// The delete leg of configmap_volume.go:240: resync projects upstream's empty
+/// ConfigMap (`pkg/volume/configmap/configmap.go` SetUpAt, `IsNotFound &&
+/// optional`) so the AtomicWriter prunes the removed key (#3856).
 #[tokio::test]
 async fn configmap_volume_optional_delete_should_be_reflected_in_volume() {
     let n = Node::new();
