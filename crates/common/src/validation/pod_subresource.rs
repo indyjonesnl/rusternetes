@@ -21,7 +21,9 @@ use crate::validation::objectmeta::{
     name_is_dns_subdomain, validate_object_meta, validate_object_meta_update,
 };
 use crate::validation::pod::{validate_container, validate_pod_create_with_options};
-use crate::validation::pod_options::get_validation_options_from_pod_spec_and_meta;
+use crate::validation::pod_options::{
+    get_validation_options_from_pod_spec_and_meta, PodValidationOptions,
+};
 use crate::validation::pod_status::validate_pod_metadata_annotations_with_opts;
 
 /// `core.MirrorPodAnnotationKey`.
@@ -67,6 +69,7 @@ fn validate_pod_metadata_and_spec(
     if let Some(spec) = pod.spec.as_ref() {
         errs.extend(validate_ephemeral_containers(
             spec,
+            &opts,
             &Path::new("spec").child("ephemeralContainers"),
         ));
     }
@@ -76,7 +79,11 @@ fn validate_pod_metadata_and_spec(
 /// `validateEphemeralContainers` (validation.go:3727-3783), less the
 /// duplicate-name check that `validate_pod_spec` already makes across all
 /// container kinds.
-fn validate_ephemeral_containers(spec: &PodSpec, fld_path: &Path) -> ErrorList {
+fn validate_ephemeral_containers(
+    spec: &PodSpec,
+    opts: &PodValidationOptions,
+    fld_path: &Path,
+) -> ErrorList {
     let mut errs = Vec::new();
     let ecs = spec.ephemeral_containers.as_deref().unwrap_or(&[]);
     if ecs.is_empty() {
@@ -108,6 +115,7 @@ fn validate_ephemeral_containers(spec: &PodSpec, fld_path: &Path) -> ErrorList {
             spec.os.as_ref(),
             spec.restart_policy.as_deref(),
             spec.host_users.unwrap_or(true),
+            opts,
             &idx_path,
         ));
 

@@ -252,6 +252,38 @@ pub fn is_relaxed_env_var_name(value: &str) -> Vec<String> {
     errs
 }
 
+/// Upstream `IsEnvVarName`
+/// (`staging/src/k8s.io/apimachinery/pkg/util/validation/validation.go:377`):
+/// `[-._a-zA-Z][-._a-zA-Z0-9]*`, then `hasChDirPrefix`.
+pub fn is_env_var_name(value: &str) -> Vec<String> {
+    const ENV_VAR_NAME_FMT: &str = "[-._a-zA-Z][-._a-zA-Z0-9]*";
+    const ENV_VAR_NAME_FMT_ERR_MSG: &str = "a valid environment variable name must consist of alphabetic characters, digits, '_', '-', or '.', and must not start with a digit";
+    let mut errs = Vec::new();
+    let mut chars = value.chars();
+    let ok = match chars.next() {
+        Some(c) if c == '-' || c == '.' || c == '_' || c.is_ascii_alphabetic() => {
+            chars.all(|c| c == '-' || c == '.' || c == '_' || c.is_ascii_alphanumeric())
+        }
+        _ => false,
+    };
+    if !ok {
+        errs.push(regex_error(
+            ENV_VAR_NAME_FMT_ERR_MSG,
+            ENV_VAR_NAME_FMT,
+            &["my.env-name", "MY_ENV.NAME", "MyEnvName1"],
+        ));
+    }
+    // `hasChDirPrefix` (validation.go:457).
+    if value == "." {
+        errs.push("must not be '.'".to_string());
+    } else if value == ".." {
+        errs.push("must not be '..'".to_string());
+    } else if value.starts_with("..") {
+        errs.push("must not start with '..'".to_string());
+    }
+    errs
+}
+
 /// Upstream `GetWarningsForIP`
 /// (`staging/src/k8s.io/apimachinery/pkg/util/validation/ip.go:105-131`) for
 /// an IP that has already passed validation: an IPv4-mapped IPv6 address, or

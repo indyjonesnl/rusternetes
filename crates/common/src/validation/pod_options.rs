@@ -13,16 +13,16 @@
 //! `AllowUserNamespaces*`, `AllowOnlyRecursiveSELinuxChangePolicy`,
 //! `AllowSidecarResizePolicy`, `AllowContainerRestartPolicyRules`,
 //! `AllowRestartAllContainers`, `AllowPodLifecycleSleepActionZeroValue`,
-//! `AllowRelaxedEnvironmentVariableValidation`, `AllowEnvFilesValidation`,
 //! `PodLevelResourcesEnabled`, `InPlacePodLevelResourcesVerticalScalingEnabled`)
 //! are tracked in #3572 because the rule they gate is not ported yet.
 
 use crate::feature_gates::{enabled, Feature};
-use crate::resources::pod::PodSpec;
+use crate::resources::pod::{EnvFromSource, EnvVar, PodSpec};
 use crate::types::LabelSelector;
 use crate::validation::field::Path;
 use crate::validation::metav1::{
-    is_valid_label_value, validate_label_selector, LabelSelectorValidationOptions,
+    is_env_var_name, is_relaxed_env_var_name, is_valid_label_value, validate_label_selector,
+    LabelSelectorValidationOptions,
 };
 use crate::validation::pod::{
     allow_taint_toleration_comparison_operators, get_sysctl_namespace,
@@ -30,6 +30,7 @@ use crate::validation::pod::{
     validate_match_label_keys_and_mismatch_label_keys, validate_pod_affinity_term_selector,
     SysctlNamespace,
 };
+use std::collections::HashSet;
 
 /// `apivalidation.PodValidationOptions` (validation.go), limited to the
 /// options the Rust validator consumes.
@@ -57,6 +58,10 @@ pub struct PodValidationOptions {
     pub allow_relaxed_dns_search_validation: bool,
     /// `AllowTaintTolerationComparisonOperators`.
     pub allow_taint_toleration_comparison_operators: bool,
+    /// `AllowRelaxedEnvironmentVariableValidation`.
+    pub allow_relaxed_environment_variable_validation: bool,
+    /// `AllowEnvFilesValidation`.
+    pub allow_env_files_validation: bool,
 }
 
 /// `GetValidationOptionsFromPodSpecAndMeta` (util.go:411-495) for the options
@@ -66,7 +71,7 @@ pub struct PodValidationOptions {
 /// which the pod metadata validators derive themselves
 /// (`validate_pod_metadata_annotations`).
 pub fn get_validation_options_from_pod_spec_and_meta(
-    _spec: Option<&PodSpec>,
+    spec: Option<&PodSpec>,
     old_spec: Option<&PodSpec>,
 ) -> PodValidationOptions {
     // Defaults from the feature gates (util.go:413-434).
@@ -82,6 +87,11 @@ pub fn get_validation_options_from_pod_spec_and_meta(
 
     // util.go:439 `useRelaxedDNSSearchValidation(oldPodSpec)`.
     opts.allow_relaxed_dns_search_validation = use_relaxed_dns_search_validation(old_spec);
+    // util.go:438 `useRelaxedEnvironmentVariableValidation(podSpec, oldPodSpec)`.
+    opts.allow_relaxed_environment_variable_validation =
+        use_relaxed_environment_variable_validation(spec, old_spec);
+    // util.go:440 `useAllowEnvFilesValidation(oldPodSpec)`.
+    opts.allow_env_files_validation = use_allow_env_files_validation(old_spec);
     // util.go:444 `allowTaintTolerationComparisonOperators(oldPodSpec)`.
     opts.allow_taint_toleration_comparison_operators =
         allow_taint_toleration_comparison_operators(old_spec);
@@ -124,6 +134,83 @@ pub fn get_validation_options_from_pod_spec_and_meta(
         }
     }
     opts
+}
+
+/// `useRelaxedEnvironmentVariableValidation` (util.go:497-519).
+fn use_relaxed_environment_variable_validation(
+    spec: Option<&PodSpec>,
+    old_spec: Option<&PodSpec>,
+) -> bool {
+    if enabled(Feature::RelaxedEnvironmentVariableValidation) {
+        return true;
+    }
+    let old_names = old_spec.map(gather_pod_env_var_names).unwrap_or_default();
+    let names = spec.map(gather_pod_env_var_names).unwrap_or_default();
+    names
+        .iter()
+        .any(|name| relaxed_env_var_used(name, &old_names))
+}
+
+/// `gatherPodEnvVarNames` (util.go:599-634): every env name and every envFrom
+/// prefix, over containers, init containers and ephemeral containers.
+fn gather_pod_env_var_names(spec: &PodSpec) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let mut add = |env: &Option<Vec<EnvVar>>, env_from: &Option<Vec<EnvFromSource>>| {
+        for e in env.iter().flatten() {
+            names.insert(e.name.clone());
+        }
+        for e in env_from.iter().flatten() {
+            names.insert(e.prefix.clone().unwrap_or_default());
+        }
+    };
+    for c in &spec.containers {
+        add(&c.env, &c.env_from);
+    }
+    for c in spec.init_containers.iter().flatten() {
+        add(&c.env, &c.env_from);
+    }
+    for c in spec.ephemeral_containers.iter().flatten() {
+        add(&c.env, &c.env_from);
+    }
+    names
+}
+
+/// `relaxedEnvVarUsed` (util.go:635-656).
+fn relaxed_env_var_used(name: &str, old_names: &HashSet<String>) -> bool {
+    // Not an update, or the old pod has no env: the gate decides.
+    if old_names.is_empty() {
+        return false;
+    }
+    if is_env_var_name(name).is_empty() || !is_relaxed_env_var_name(name).is_empty() {
+        // Valid under strict rules, or invalid under relaxed rules: strict.
+        return false;
+    }
+    // Failed strict, passed relaxed: grandfathered when already in use.
+    old_names.contains(name)
+}
+
+/// `useAllowEnvFilesValidation` (util.go:561-587) with `hasEnvFileKeyRef`.
+fn use_allow_env_files_validation(old_spec: Option<&PodSpec>) -> bool {
+    if enabled(Feature::EnvFiles) {
+        return true;
+    }
+    let Some(old) = old_spec else {
+        return false;
+    };
+    let has = |env: &Option<Vec<EnvVar>>| {
+        env.iter().flatten().any(|e| {
+            e.value_from
+                .as_ref()
+                .is_some_and(|v| v.file_key_ref.is_some())
+        })
+    };
+    old.containers.iter().any(|c| has(&c.env))
+        || old.init_containers.iter().flatten().any(|c| has(&c.env))
+        || old
+            .ephemeral_containers
+            .iter()
+            .flatten()
+            .any(|c| has(&c.env))
 }
 
 /// `useRelaxedDNSSearchValidation` (util.go:520-532).
@@ -312,6 +399,42 @@ mod tests {
             "maxSkew": 1, "topologyKey": "z", "whenUnsatisfiable": "DoNotSchedule",
             "matchLabelKeys": ["foo"], "labelSelector": {}}]}));
         assert!(!has_legacy_invalid_topology_spread_constrain_match_label_keys(&valid));
+    }
+
+    /// `relaxedEnvVarUsed` / `useAllowEnvFilesValidation` derivation with the
+    /// gates off (util.go:497, :561): only an old spec that already uses the
+    /// relaxed name / a fileKeyRef keeps the option.
+    #[test]
+    #[serial_test::serial]
+    fn env_options_from_old_spec_when_gates_off() {
+        let _a = crate::feature_gates::with_feature(
+            Feature::RelaxedEnvironmentVariableValidation,
+            false,
+        );
+        let _b = crate::feature_gates::with_feature(Feature::EnvFiles, false);
+        let with_env = |env: serde_json::Value| {
+            spec(json!({"containers": [{"name": "c", "image": "i", "env": env}]}))
+        };
+        let derive = |new: &PodSpec, old: Option<&PodSpec>| {
+            get_validation_options_from_pod_spec_and_meta(Some(new), old)
+        };
+        let relaxed = with_env(json!([{"name": "1bad"}]));
+        let strict = with_env(json!([{"name": "ok"}]));
+        // Create: the gate decides.
+        assert!(!derive(&relaxed, None).allow_relaxed_environment_variable_validation);
+        // Update, old pod used the name.
+        assert!(derive(&relaxed, Some(&relaxed)).allow_relaxed_environment_variable_validation);
+        // Update, old pod did not use it.
+        assert!(!derive(&relaxed, Some(&strict)).allow_relaxed_environment_variable_validation);
+        // Invalid under relaxed rules too: strict.
+        let bad = with_env(json!([{"name": "a=b"}]));
+        assert!(!derive(&bad, Some(&bad)).allow_relaxed_environment_variable_validation);
+
+        let file = with_env(json!([{"name": "f", "valueFrom": {"fileKeyRef":
+            {"volumeName": "v", "path": "p", "key": "K"}}}]));
+        assert!(!derive(&file, None).allow_env_files_validation);
+        assert!(!derive(&file, Some(&strict)).allow_env_files_validation);
+        assert!(derive(&strict, Some(&file)).allow_env_files_validation);
     }
 
     /// `TestValidateAllowNonLocalProjectedTokenPathOption` (:2822).
