@@ -1339,6 +1339,7 @@ pub(crate) fn validate_container(
         errs.extend(validate_resource_requirements(
             res,
             &fld_path.child("resources"),
+            opts,
         ));
     }
 
@@ -4262,29 +4263,42 @@ fn validate_readiness_probe(
 fn validate_resource_requirements(
     res: &crate::types::ResourceRequirements,
     fld_path: &Path,
+    opts: &PodValidationOptions,
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
 
     // Validate that Quantity strings are parseable.
     if let Some(ref limits) = res.limits {
         for (name, qty_str) in limits {
-            if crate::quantity::Quantity::parse(qty_str).is_err() {
-                errs.push(Error::invalid(
+            match crate::quantity::Quantity::parse(qty_str) {
+                Err(_) => errs.push(Error::invalid(
                     &fld_path.child("limits").key(name),
                     qty_str.clone(),
                     "quantities must match the regular expression '[+-]?([0-9]+\\.?[0-9]*|\\.?[0-9]+)[mMkKgGtTpPeE]*'",
-                ));
+                )),
+                Ok(q) => errs.extend(validate_resource_quantity_hugepage_value(
+                    name,
+                    &q,
+                    &fld_path.child("limits").key(name),
+                    opts,
+                )),
             }
         }
     }
     if let Some(ref requests) = res.requests {
         for (name, qty_str) in requests {
-            if crate::quantity::Quantity::parse(qty_str).is_err() {
-                errs.push(Error::invalid(
+            match crate::quantity::Quantity::parse(qty_str) {
+                Err(_) => errs.push(Error::invalid(
                     &fld_path.child("requests").key(name),
                     qty_str.clone(),
                     "quantities must match the regular expression '[+-]?([0-9]+\\.?[0-9]*|\\.?[0-9]+)[mMkKgGtTpPeE]*'",
-                ));
+                )),
+                Ok(q) => errs.extend(validate_resource_quantity_hugepage_value(
+                    name,
+                    &q,
+                    &fld_path.child("requests").key(name),
+                    opts,
+                )),
             }
         }
     }
@@ -4310,6 +4324,31 @@ fn validate_resource_requirements(
     }
 
     errs
+}
+
+/// `validateResourceQuantityHugePageValue` (`validation.go:7955-7964`), wrapped
+/// in the `field.Invalid(fldPath, quantity.String(), err.Error())` the two
+/// call sites in `validateResourceRequirements` (`:7846`, `:7877`) make.
+fn validate_resource_quantity_hugepage_value(
+    name: &str,
+    quantity: &crate::quantity::Quantity,
+    fld_path: &Path,
+    opts: &PodValidationOptions,
+) -> ErrorList {
+    if !crate::quota::is_hugepage_resource_name(name) {
+        return Vec::new();
+    }
+    if !opts.allow_indivisible_huge_pages_values
+        && !crate::quota::is_hugepage_resource_value_divisible(name, quantity)
+    {
+        let q = quantity.canonical_string();
+        return vec![Error::invalid(
+            fld_path,
+            q.clone(),
+            format!("{q} is not positive integer multiple of {name}"),
+        )];
+    }
+    Vec::new()
 }
 
 /// Validates `restartPolicy` — must be one of Always / OnFailure / Never.
@@ -7093,5 +7132,76 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `validateResourceQuantityHugePageValue` (`validation.go:7955`), reached
+    /// from `validateResourceRequirements` (`:7846`, `:7877`) with
+    /// `opts.AllowIndivisibleHugePagesValues` from
+    /// `GetValidationOptionsFromPodSpecAndMeta` (`util.go:448`). Upstream has no
+    /// unit test for the rule itself, so these are behavioural.
+    fn huge_pod(res: serde_json::Value) -> Pod {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "default"},
+            "spec": {"containers": [{"name": "c", "image": "i", "resources": res}]}
+        }))
+        .unwrap()
+    }
+
+    fn huge_errs(errs: ErrorList) -> Vec<String> {
+        errs.into_iter()
+            .map(|e| e.to_string())
+            .filter(|m| m.contains("not positive integer multiple"))
+            .collect()
+    }
+
+    #[test]
+    fn indivisible_hugepages_rejected_on_create() {
+        let pod = huge_pod(serde_json::json!({
+            "requests": {"memory": "1Gi", "hugepages-2Mi": "3Mi"},
+            "limits": {"memory": "1Gi", "hugepages-2Mi": "3Mi"}
+        }));
+        let m = huge_errs(validate_pod_create(&pod, false));
+        assert_eq!(m.len(), 2, "{m:?}");
+        assert!(
+            m.iter()
+                .all(|x| x.contains("3Mi is not positive integer multiple of hugepages-2Mi")),
+            "{m:?}"
+        );
+        assert!(
+            m[0].contains("spec.containers[0].resources.limits[hugepages-2Mi]"),
+            "{m:?}"
+        );
+        assert!(
+            m[1].contains("spec.containers[0].resources.requests[hugepages-2Mi]"),
+            "{m:?}"
+        );
+    }
+
+    #[test]
+    fn divisible_hugepages_accepted_on_create() {
+        let pod = huge_pod(serde_json::json!({
+            "requests": {"memory": "1Gi", "hugepages-2Mi": "4Mi"},
+            "limits": {"memory": "1Gi", "hugepages-2Mi": "4Mi"}
+        }));
+        assert!(huge_errs(validate_pod_create(&pod, false)).is_empty());
+    }
+
+    #[test]
+    fn indivisible_hugepages_allowed_on_update_when_old_spec_has_them() {
+        let pod = huge_pod(serde_json::json!({
+            "requests": {"memory": "1Gi", "hugepages-2Mi": "3Mi"},
+            "limits": {"memory": "1Gi", "hugepages-2Mi": "3Mi"}
+        }));
+        assert!(huge_errs(validate_pod_update(&pod, &pod, false, false)).is_empty());
+        // An old spec that is divisible does not relax the rule.
+        let old = huge_pod(serde_json::json!({
+            "requests": {"memory": "1Gi", "hugepages-2Mi": "4Mi"},
+            "limits": {"memory": "1Gi", "hugepages-2Mi": "4Mi"}
+        }));
+        assert_eq!(
+            huge_errs(validate_pod_update(&pod, &old, false, false)).len(),
+            2
+        );
     }
 }
