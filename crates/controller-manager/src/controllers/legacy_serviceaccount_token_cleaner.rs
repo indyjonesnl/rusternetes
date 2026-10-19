@@ -16,10 +16,10 @@
 //! Deviations (storage seam instead of client-go informers/listers):
 //! - Lists are read from storage per pass instead of informer caches.
 //! - The delete's `resourceVersion` precondition is atomic
-//!   (`Storage::delete_with_preconditions`, upstream `storage.Preconditions`).
-//!   The patch's `metadata.uid` precondition is still checked by re-reading
-//!   the Secret just before the patch (the `Storage` patch verbs carry no
-//!   preconditions), leaving a small race window.
+//!   (`Storage::delete_with_preconditions`, upstream `storage.Preconditions`),
+//!   and so is the patch's `metadata.uid` precondition
+//!   (`Storage::patch_strategic_merge_with_preconditions`, upstream
+//!   `GuaranteedUpdate(.., preconditions, ..)`, `etcd3/store.go:463`).
 //! - The `kubernetes.io/legacy-token-last-used` stamping on use is the
 //!   api-server authenticator's half (`pkg/serviceaccount/legacy.go:185-198`);
 //!   it is not part of this controller (tracked separately).
@@ -253,25 +253,18 @@ impl<S: Storage + 'static> LegacySATokenCleaner<S> {
     }
 
     /// The merge patch `applyv1.Secret(name, ns).WithUID(uid).WithLabels(..)`
-    /// (:190-198); `metadata.uid` acts as a precondition upstream, so verify
-    /// the live UID instead of writing it.
+    /// (:190-198): `metadata.uid` is a storage precondition upstream, so the
+    /// label lands only on the Secret generation that was inspected. Errors
+    /// (including a UID-mismatch Conflict) are logged, as upstream does.
     async fn label_invalid_since(&self, secret: &Secret, invalid_since: &str) {
         let key = build_key("secrets", Some(namespace_of(secret)), &secret.metadata.name);
-        match self.storage.get::<Secret>(&key).await {
-            Ok(live) if live.metadata.uid == secret.metadata.uid => {}
-            Ok(_) => return,
-            Err(rusternetes_common::Error::NotFound(_)) => return,
-            Err(e) => {
-                error!("Failed to label legacy service account token secret with invalid since date: {e}");
-                return;
-            }
-        }
         let patch = serde_json::json!({
             "metadata": { "labels": { INVALID_SINCE_LABEL_KEY: invalid_since } }
         });
+        let preconditions = Preconditions::new_uid(secret.metadata.uid.clone());
         if let Err(e) = self
             .storage
-            .patch_strategic_merge::<Secret>(&key, &patch)
+            .patch_strategic_merge_with_preconditions::<Secret>(&key, &patch, &preconditions)
             .await
         {
             error!(
@@ -656,6 +649,41 @@ mod tests {
         for c in cases {
             run_case(c).await;
         }
+    }
+
+    /// The label patch carries `WithUID(secret.UID)` (:190-198): a Secret that
+    /// was deleted and recreated (new UID) after the cleaner listed it must not
+    /// receive the label meant for the old generation; the live one must.
+    #[tokio::test]
+    async fn invalid_since_label_is_uid_guarded() {
+        let storage = Arc::new(MemoryStorage::new());
+        let live = token_secret("", "", "2022-12-27", "default", "12345", false);
+        put(&storage, "secrets", "default", &live).await;
+        let cleaner = LegacySATokenCleaner::new(
+            storage.clone(),
+            LegacySATokenCleanerOptions {
+                clean_up_period: Duration::from_secs(60),
+                sync_interval: Duration::from_secs(30),
+            },
+        )
+        .unwrap();
+        let key = build_key("secrets", Some("default"), "token-secret-1");
+        let label = |v: &serde_json::Value| {
+            v["metadata"]["labels"]
+                .get(INVALID_SINCE_LABEL_KEY)
+                .cloned()
+        };
+
+        let mut stale: Secret = serde_json::from_value(live.clone()).unwrap();
+        stale.metadata.uid = "old-generation".to_string();
+        cleaner.label_invalid_since(&stale, "2022-12-29").await;
+        let now: serde_json::Value = storage.get(&key).await.unwrap();
+        assert_eq!(label(&now), None, "stale UID must not be labeled");
+
+        let current: Secret = serde_json::from_value(live).unwrap();
+        cleaner.label_invalid_since(&current, "2022-12-29").await;
+        let now: serde_json::Value = storage.get(&key).await.unwrap();
+        assert_eq!(label(&now), Some(json!("2022-12-29")));
     }
 
     #[test]

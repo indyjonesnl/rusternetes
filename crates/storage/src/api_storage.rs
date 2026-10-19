@@ -707,6 +707,38 @@ impl Storage for ApiStorage {
         serde_json::from_value(patched).map_err(Error::Serialization)
     }
 
+    /// Preconditions travel as `metadata.uid` / `metadata.resourceVersion` in
+    /// the patch body, exactly how upstream clients carry them
+    /// (`applyv1.Secret(..).WithUID(uid)`,
+    /// `legacy_serviceaccount_token_cleaner.go:190-198`); the api-server's
+    /// registry `Update` turns them into `storage.Preconditions`
+    /// (`registry/generic/registry/store.go:626-632`) and a mismatch is 409.
+    async fn patch_strategic_merge_with_preconditions<T>(
+        &self,
+        key: &str,
+        patch: &Value,
+        preconditions: &crate::Preconditions,
+    ) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        let mut body = patch.clone();
+        if let Some(root) = body.as_object_mut() {
+            let meta = root
+                .entry("metadata")
+                .or_insert_with(|| Value::Object(Default::default()));
+            if let Some(meta) = meta.as_object_mut() {
+                if let Some(uid) = &preconditions.uid {
+                    meta.insert("uid".into(), uid.clone().into());
+                }
+                if let Some(rv) = &preconditions.resource_version {
+                    meta.insert("resourceVersion".into(), rv.clone().into());
+                }
+            }
+        }
+        self.patch_strategic_merge(key, &body).await
+    }
+
     async fn apply<T>(
         &self,
         key: &str,

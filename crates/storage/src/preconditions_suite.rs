@@ -52,6 +52,114 @@ pub(crate) async fn run_all<S: Storage + 'static>(s: Arc<S>) {
     empty_preconditions_delete_unconditionally(&*s).await;
     racing_uid_change_never_deletes_the_new_object(s.clone()).await;
     let _ = s.delete(KEY).await;
+    patch_with_preconditions(&*s).await;
+    racing_recreate_never_patches_the_new_object(s.clone()).await;
+    let _ = s.delete(KEY).await;
+}
+
+/// `GuaranteedUpdate` with `Preconditions` (`etcd3/store.go:463`, `:500-517`)
+/// driven through `patch_strategic_merge_with_preconditions`.
+async fn patch_with_preconditions<S: Storage>(s: &S) {
+    let _ = s.delete(KEY).await;
+    seed(s).await;
+    let cur = set_uid(s, "myUID").await;
+    let patch = json!({"metadata": {"labels": {"k": "v"}}});
+
+    // Mismatching UID: Conflict, object untouched.
+    let err = s
+        .patch_strategic_merge_with_preconditions::<Value>(
+            KEY,
+            &patch,
+            &Preconditions::new_uid("other"),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Conflict(_)), "{err:?}");
+    let now: Value = s.get(KEY).await.unwrap();
+    assert!(now["metadata"]["labels"].is_null());
+
+    // Stale resourceVersion: Conflict.
+    let err = s
+        .patch_strategic_merge_with_preconditions::<Value>(
+            KEY,
+            &patch,
+            &Preconditions::new_resource_version("1"),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Conflict(_)), "{err:?}");
+
+    // Matching UID + resourceVersion: patched.
+    let both = Preconditions {
+        uid: Some("myUID".into()),
+        resource_version: Some(rv_of(&cur)),
+    };
+    let out = s
+        .patch_strategic_merge_with_preconditions::<Value>(KEY, &patch, &both)
+        .await
+        .unwrap();
+    assert_eq!(out["metadata"]["labels"]["k"], "v");
+    assert_eq!(out["metadata"]["uid"], "myUID");
+
+    // Empty preconditions patch unconditionally; missing key is NotFound.
+    s.patch_strategic_merge_with_preconditions::<Value>(
+        KEY,
+        &json!({"metadata": {"labels": {"j": "w"}}}),
+        &Preconditions::default(),
+    )
+    .await
+    .unwrap();
+    s.delete(KEY).await.unwrap();
+    let err = s
+        .patch_strategic_merge_with_preconditions::<Value>(
+            KEY,
+            &patch,
+            &Preconditions::new_uid("myUID"),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+}
+
+/// The object is deleted and recreated (new UID) while a UID-guarded patch is
+/// in flight: the patch may land on the old generation or be rejected, but it
+/// must never land on the new one.
+async fn racing_recreate_never_patches_the_new_object<S: Storage + 'static>(s: Arc<S>) {
+    for i in 0..50 {
+        let _ = s.delete(KEY).await;
+        seed(&*s).await;
+        set_uid(&*s, "old").await;
+        let r = {
+            let s = s.clone();
+            tokio::spawn(async move {
+                s.delete(KEY).await?;
+                seed(&*s).await;
+                set_uid(&*s, "new").await;
+                Ok::<_, Error>(())
+            })
+        };
+        let p = {
+            let s = s.clone();
+            tokio::spawn(async move {
+                s.patch_strategic_merge_with_preconditions::<Value>(
+                    KEY,
+                    &json!({"metadata": {"labels": {"k": "v"}}}),
+                    &Preconditions::new_uid("old"),
+                )
+                .await
+            })
+        };
+        let _ = r.await.unwrap();
+        let _ = p.await.unwrap();
+        if let Ok(now) = s.get::<Value>(KEY).await {
+            if now["metadata"]["uid"] == "new" {
+                assert!(
+                    now["metadata"]["labels"].is_null(),
+                    "iter {i}: patch for UID old landed on the recreated object"
+                );
+            }
+        }
+    }
 }
 
 /// `RunTestPreconditionalDeleteWithSuggestion`.
