@@ -12,9 +12,14 @@
 //! - `pkg/scheduler/framework/plugins/nodeaffinity/node_affinity.go`:
 //!   `EventsToRegister` (`:101-117`), `isSchedulableAfterNodeChange`
 //!   (`:119-174`).
+//! - `pkg/scheduler/framework/plugins/interpodaffinity/plugin.go`:
+//!   `EventsToRegister` (`:83-104`), `isSchedulableAfterPodChange`
+//!   (`:171-232`), `isSchedulableAfterNodeChange` (`:234-320`), with
+//!   `podMatchesAllAffinityTerms` (`filtering.go:186-199`) and the
+//!   `GetAffinityTerms` helpers (`kube-scheduler/framework/types.go:380-490`).
 //!
-//! Only NodeResourcesFit and NodeAffinity ship hint functions in this slice;
-//! every other in-tree plugin registers its events hint-less, which
+//! NodeResourcesFit, NodeAffinity and InterPodAffinity ship hint functions
+//! in this slice; every other in-tree plugin registers its events hint-less, which
 //! `build_queueing_hint_map` turns into `defaultQueueingHintFn` (always
 //! `Queue`) — exactly upstream's behaviour for a nil `QueueingHintFn`.
 
@@ -164,10 +169,16 @@ pub fn events_to_register(plugin_name: &str, profile: &Profile) -> Vec<ClusterEv
             ev(R::Node, A::ADD | A::UPDATE_NODE_TAINT),
             ev(R::Pod, A::UPDATE_POD_TOLERATION),
         ],
-        // interpodaffinity/plugin.go:65-80
+        // interpodaffinity/plugin.go:83-104
         names::INTER_POD_AFFINITY => vec![
-            ev(R::Pod, A::ADD | A::UPDATE_POD_LABEL | A::DELETE),
-            ev(R::Node, A::ADD | A::UPDATE_NODE_LABEL),
+            ClusterEventWithHint::with_hint(
+                ClusterEvent::new(R::Pod, A::ADD | A::UPDATE_POD_LABEL | A::DELETE),
+                Arc::new(inter_pod_affinity::is_schedulable_after_pod_change),
+            ),
+            ClusterEventWithHint::with_hint(
+                ClusterEvent::new(R::Node, A::ADD | A::UPDATE_NODE_LABEL),
+                Arc::new(inter_pod_affinity::is_schedulable_after_node_change),
+            ),
         ],
         // podtopologyspread/plugin.go:138-156
         names::POD_TOPOLOGY_SPREAD => vec![
@@ -473,6 +484,255 @@ pub mod node_affinity {
     /// nodeSelector AND required node affinity terms.
     fn required_affinity_matches(pod: &Pod, node: &Node) -> bool {
         check_node_affinity(node, pod).0
+    }
+}
+
+/// `interpodaffinity/plugin.go` queueing hints.
+pub mod inter_pod_affinity {
+    use super::*;
+    use rusternetes_common::resources::PodAffinityTerm;
+    use rusternetes_common::types::{label_selector_as_selector, Selector};
+    use std::collections::HashSet;
+
+    /// `fwk.AffinityTerm` (`kube-scheduler/framework/types.go:380-385`).
+    struct AffinityTerm {
+        namespaces: HashSet<String>,
+        selector: Selector,
+        topology_key: String,
+        namespace_selector: Selector,
+    }
+
+    impl AffinityTerm {
+        /// `AffinityTerm.Matches` (`types.go:387-392`) with `nsLabels == nil`,
+        /// the only way `podMatchesAllAffinityTerms` calls it.
+        fn matches(&self, pod: &Pod) -> bool {
+            if self
+                .namespaces
+                .contains(pod.metadata.namespace.as_deref().unwrap_or(""))
+                || self.namespace_selector.matches(None)
+            {
+                return self.selector.matches(pod.metadata.labels.as_ref());
+            }
+            false
+        }
+    }
+
+    /// `newAffinityTerm` (`types.go:419-433`) with
+    /// `getNamespacesFromPodAffinityTerm` (`types.go:436-445`).
+    fn new_affinity_term(pod: &Pod, term: &PodAffinityTerm) -> Result<AffinityTerm, String> {
+        let selector = label_selector_as_selector(term.label_selector.as_ref())?;
+        let namespaces_given = term.namespaces.as_ref().is_some_and(|n| !n.is_empty());
+        let namespaces = if !namespaces_given && term.namespace_selector.is_none() {
+            HashSet::from([pod.metadata.namespace.clone().unwrap_or_default()])
+        } else {
+            term.namespaces.iter().flatten().cloned().collect()
+        };
+        let namespace_selector = label_selector_as_selector(term.namespace_selector.as_ref())?;
+        Ok(AffinityTerm {
+            namespaces,
+            selector,
+            topology_key: term.topology_key.clone(),
+            namespace_selector,
+        })
+    }
+
+    /// `GetAffinityTerms` (`types.go:402-417`).
+    fn get_affinity_terms(
+        pod: &Pod,
+        v1_terms: &[PodAffinityTerm],
+    ) -> Result<Vec<AffinityTerm>, String> {
+        v1_terms.iter().map(|t| new_affinity_term(pod, t)).collect()
+    }
+
+    /// `GetPodAffinityTerms` (`types.go:447-458`).
+    fn get_pod_affinity_terms(pod: &Pod) -> &[PodAffinityTerm] {
+        pod.spec
+            .as_ref()
+            .and_then(|s| s.affinity.as_ref())
+            .and_then(|a| a.pod_affinity.as_ref())
+            .and_then(|a| {
+                a.required_during_scheduling_ignored_during_execution
+                    .as_deref()
+            })
+            .unwrap_or(&[])
+    }
+
+    /// `GetPodAntiAffinityTerms` (`types.go:479-490`).
+    fn get_pod_anti_affinity_terms(pod: &Pod) -> &[PodAffinityTerm] {
+        pod.spec
+            .as_ref()
+            .and_then(|s| s.affinity.as_ref())
+            .and_then(|a| a.pod_anti_affinity.as_ref())
+            .and_then(|a| {
+                a.required_during_scheduling_ignored_during_execution
+                    .as_deref()
+            })
+            .unwrap_or(&[])
+    }
+
+    /// `podMatchesAllAffinityTerms` (`filtering.go:186-199`): no terms is
+    /// "no match".
+    fn pod_matches_all_affinity_terms(terms: &[AffinityTerm], pod: &Pod) -> bool {
+        if terms.is_empty() {
+            return false;
+        }
+        terms.iter().all(|t| t.matches(pod))
+    }
+
+    fn spec_node_name(pod: &Pod) -> &str {
+        pod.spec
+            .as_ref()
+            .and_then(|s| s.node_name.as_deref())
+            .unwrap_or("")
+    }
+
+    fn node_label<'a>(node: &'a Node, key: &str) -> Option<&'a String> {
+        node.metadata.labels.as_ref().and_then(|l| l.get(key))
+    }
+
+    /// `isSchedulableAfterPodChange` (`plugin.go:171-232`).
+    pub fn is_schedulable_after_pod_change(
+        pod: &Pod,
+        old_obj: Option<&EventObject>,
+        new_obj: Option<&EventObject>,
+    ) -> Result<QueueingHint, String> {
+        let (original_pod, modified_pod) = as_typed::<Pod>(old_obj, new_obj)?;
+        if modified_pod.is_some_and(|p| spec_node_name(p).is_empty())
+            || original_pod.is_some_and(|p| spec_node_name(p).is_empty())
+        {
+            debug!(pod = %pod_name(pod), "the added/updated/deleted pod is unscheduled, so it doesn't make the target pod schedulable");
+            return Ok(QueueingHint::QueueSkip);
+        }
+
+        let terms = get_affinity_terms(pod, get_pod_affinity_terms(pod))?;
+        let anti_terms = get_affinity_terms(pod, get_pod_anti_affinity_terms(pod))?;
+
+        // Pod is updated. Return Queue when the updated pod matching the target pod's affinity or not matching anti-affinity.
+        // Note that, we don't need to check each affinity individually when the Pod has more than one affinity
+        // because the current PodAffinity looks for a **single** existing pod that can satisfy **all** the terms of inter-pod affinity of an incoming pod.
+        if let (Some(modified), Some(original)) = (modified_pod, original_pod) {
+            if !pod_matches_all_affinity_terms(&terms, original)
+                && pod_matches_all_affinity_terms(&terms, modified)
+            {
+                debug!(pod = %pod_name(pod), modified_pod = %pod_name(modified), "a scheduled pod was updated to match the target pod's affinity, and the pod may be schedulable now");
+                return Ok(QueueingHint::Queue);
+            }
+            if pod_matches_all_affinity_terms(&anti_terms, original)
+                && !pod_matches_all_affinity_terms(&anti_terms, modified)
+            {
+                debug!(pod = %pod_name(pod), modified_pod = %pod_name(modified), "a scheduled pod was updated not to match the target pod's anti affinity, and the pod may be schedulable now");
+                return Ok(QueueingHint::Queue);
+            }
+            debug!(pod = %pod_name(pod), modified_pod = %pod_name(modified), "a scheduled pod was updated but it doesn't match the target pod's affinity or does match the target pod's anti-affinity");
+            return Ok(QueueingHint::QueueSkip);
+        }
+
+        // Pod is added. Return Queue when the added pod matching the target pod's affinity.
+        if let Some(modified) = modified_pod {
+            if pod_matches_all_affinity_terms(&terms, modified) {
+                debug!(pod = %pod_name(pod), modified_pod = %pod_name(modified), "a scheduled pod was added and it matches the target pod's affinity");
+                return Ok(QueueingHint::Queue);
+            }
+            debug!(pod = %pod_name(pod), modified_pod = %pod_name(modified), "a scheduled pod was added and it doesn't match the target pod's affinity");
+            return Ok(QueueingHint::QueueSkip);
+        }
+
+        // Pod is deleted. Return Queue when the deleted pod matching the target pod's anti-affinity.
+        // (upstream dereferences originalPod here; as_typed with neither
+        // object cannot reach this arm in a well-formed event)
+        let original =
+            original_pod.ok_or_else(|| "pod event without an old or new object".to_string())?;
+        if !pod_matches_all_affinity_terms(&anti_terms, original) {
+            debug!(pod = %pod_name(pod), "a scheduled pod was deleted but it doesn't match the target pod's anti-affinity");
+            return Ok(QueueingHint::QueueSkip);
+        }
+        debug!(pod = %pod_name(pod), "a scheduled pod was deleted and it matches the target pod's anti-affinity. The pod may be schedulable now");
+        Ok(QueueingHint::Queue)
+    }
+
+    /// `isSchedulableAfterNodeChange` (`plugin.go:234-320`).
+    pub fn is_schedulable_after_node_change(
+        pod: &Pod,
+        old_obj: Option<&EventObject>,
+        new_obj: Option<&EventObject>,
+    ) -> Result<QueueingHint, String> {
+        let (original_node, modified_node) = as_typed::<Node>(old_obj, new_obj)?;
+        let modified_node =
+            modified_node.ok_or_else(|| "node event without a new object".to_string())?;
+
+        let terms = get_affinity_terms(pod, get_pod_affinity_terms(pod))?;
+
+        // When queuing this Pod:
+        // - 1. A new node is added with the pod affinity topologyKey, the pod may become schedulable.
+        // - 2. The original node does not have the pod affinity topologyKey but the modified node does, the pod may become schedulable.
+        // - 3. Both the original and modified nodes have the pod affinity topologyKey and they differ, the pod may become schedulable.
+        for term in &terms {
+            let Some(original_node) = original_node else {
+                if node_label(modified_node, &term.topology_key).is_some() {
+                    // Case 1: A new node is added with the pod affinity topologyKey.
+                    debug!(pod = %pod_name(pod), node = %modified_node.metadata.name, "A node with a matched pod affinity topologyKey was added and it may make the pod schedulable");
+                    return Ok(QueueingHint::Queue);
+                }
+                continue;
+            };
+            let original_value = node_label(original_node, &term.topology_key);
+            let modified_value = node_label(modified_node, &term.topology_key);
+
+            if original_value.is_none() && modified_value.is_some() {
+                // Case 2: Original node does not have the pod affinity topologyKey, but the modified node does.
+                debug!(pod = %pod_name(pod), node = %modified_node.metadata.name, "A node got updated to have the topology key of pod affinity, which may make the pod schedulable");
+                return Ok(QueueingHint::Queue);
+            }
+
+            if original_value.is_some()
+                && modified_value.is_some()
+                && original_value != modified_value
+            {
+                // Case 3: Both nodes have the pod affinity topologyKey, but the values differ.
+                debug!(pod = %pod_name(pod), node = %modified_node.metadata.name, "A node is moved to a different domain of pod affinity, which may make the pod schedulable");
+                return Ok(QueueingHint::Queue);
+            }
+        }
+
+        let anti_terms = get_affinity_terms(pod, get_pod_anti_affinity_terms(pod))?;
+
+        // When queuing this Pod:
+        // - 1. A new node is added, the pod may become schedulable.
+        // - 2. The original node have the pod anti-affinity topologyKey but the modified node does not, the pod may become schedulable.
+        // - 3. Both the original and modified nodes have the pod anti-affinity topologyKey and they differ, the pod may become schedulable.
+        for term in &anti_terms {
+            let Some(original_node) = original_node else {
+                // Case 1: A new node is added.
+                // We always requeue the Pod with anti-affinity because:
+                // - the node without the topology key is always allowed to have a Pod with anti-affinity.
+                // - the addition of a node with the topology key makes Pods schedulable only when the topology it joins doesn't have any Pods that the Pod hates.
+                //   But, it's out-of-scope of this QHint to check which Pods are in the topology this Node is in.
+                debug!(pod = %pod_name(pod), node = %modified_node.metadata.name, "A node was added and it may make the pod schedulable");
+                return Ok(QueueingHint::Queue);
+            };
+
+            let original_value = node_label(original_node, &term.topology_key);
+            let modified_value = node_label(modified_node, &term.topology_key);
+
+            if original_value.is_some() && modified_value.is_none() {
+                // Case 2: The original node have the pod anti-affinity topologyKey but the modified node does not.
+                // Note that we don't need to check the opposite case (!originalHasKey && modifiedHasKey)
+                // because the node without the topology label can always accept pods with pod anti-affinity.
+                debug!(pod = %pod_name(pod), node = %modified_node.metadata.name, "A node got updated to not have the topology key of pod anti-affinity, which may make the pod schedulable");
+                return Ok(QueueingHint::Queue);
+            }
+
+            if original_value.is_some()
+                && modified_value.is_some()
+                && original_value != modified_value
+            {
+                // Case 3: Both nodes have the pod anti-affinity topologyKey, but the values differ.
+                debug!(pod = %pod_name(pod), node = %modified_node.metadata.name, "A node is moved to a different domain of pod anti-affinity, which may make the pod schedulable");
+                return Ok(QueueingHint::Queue);
+            }
+        }
+        debug!(pod = %pod_name(pod), node = %modified_node.metadata.name, "a node is added/updated but doesn't have any topologyKey which matches pod affinity/anti-affinity");
+        Ok(QueueingHint::QueueSkip)
     }
 }
 
@@ -872,5 +1132,392 @@ mod tests {
             (f.queueing_hint_fn)(&dummy, None, None).unwrap(),
             QueueingHint::Queue
         );
+    }
+
+    // ---- InterPodAffinity (`plugin_test.go`) ----
+
+    #[derive(Clone, Copy)]
+    enum Kind {
+        Affinity,
+        AntiAffinity,
+    }
+
+    fn selector_in(key: &str, values: &[&str]) -> serde_json::Value {
+        json!({"matchExpressions": [{"key": key, "operator": "In", "values": values}]})
+    }
+
+    /// `st.MakePod().Name("p")` with the given required terms appended.
+    fn ipa_pod(terms: Vec<(Kind, serde_json::Value, &str)>) -> Pod {
+        let mut aff: Vec<serde_json::Value> = vec![];
+        let mut anti: Vec<serde_json::Value> = vec![];
+        for (kind, sel, tk) in terms {
+            let t = json!({"labelSelector": sel, "topologyKey": tk});
+            match kind {
+                Kind::Affinity => aff.push(t),
+                Kind::AntiAffinity => anti.push(t),
+            }
+        }
+        let mut affinity = serde_json::Map::new();
+        if !aff.is_empty() {
+            affinity.insert(
+                "podAffinity".into(),
+                json!({"requiredDuringSchedulingIgnoredDuringExecution": aff}),
+            );
+        }
+        if !anti.is_empty() {
+            affinity.insert(
+                "podAntiAffinity".into(),
+                json!({"requiredDuringSchedulingIgnoredDuringExecution": anti}),
+            );
+        }
+        serde_json::from_value(json!({
+            "metadata": {"name": "p"},
+            "spec": {"affinity": affinity}
+        }))
+        .unwrap()
+    }
+
+    fn labelled_pod(node: Option<&str>, labels: &[(&str, &str)]) -> Pod {
+        let labels: serde_json::Map<String, serde_json::Value> = labels
+            .iter()
+            .map(|(k, v)| (k.to_string(), json!(v)))
+            .collect();
+        let mut spec = serde_json::Map::new();
+        if let Some(n) = node {
+            spec.insert("nodeName".into(), json!(n));
+        }
+        serde_json::from_value(json!({
+            "metadata": {"labels": labels},
+            "spec": spec
+        }))
+        .unwrap()
+    }
+
+    fn named_node(labels: &[(&str, &str)]) -> Node {
+        let labels: serde_json::Map<String, serde_json::Value> = labels
+            .iter()
+            .map(|(k, v)| (k.to_string(), json!(v)))
+            .collect();
+        serde_json::from_value(json!({"metadata": {"name": "node-a", "labels": labels}})).unwrap()
+    }
+
+    /// `Test_isSchedulableAfterPodChange` (`plugin_test.go:37-151`).
+    #[test]
+    fn inter_pod_affinity_is_schedulable_after_pod_change() {
+        use Kind::*;
+        let svc_aff = || {
+            ipa_pod(vec![(
+                Affinity,
+                selector_in("service", &["securityscan", "value2"]),
+                "region",
+            )])
+        };
+        let svc_anti = || {
+            ipa_pod(vec![(
+                AntiAffinity,
+                selector_in("service", &["securityscan", "value2"]),
+                "region",
+            )])
+        };
+        let exists = |k: &str| json!({"matchExpressions": [{"key": k, "operator": "Exists"}]});
+        let two_terms = || {
+            ipa_pod(vec![
+                (Affinity, exists("aaa"), "hostname"),
+                (Affinity, exists("bbb"), "hostname"),
+            ])
+        };
+        let n = Some("fake-node");
+        type PodCase<'a> = (&'a str, Pod, Option<Pod>, Option<Pod>, QueueingHint);
+        let cases: Vec<PodCase> = vec![
+            (
+                "add a pod which matches the pod affinity",
+                svc_aff(),
+                None,
+                Some(labelled_pod(n, &[("service", "securityscan")])),
+                QueueingHint::Queue,
+            ),
+            (
+                "add an un-scheduled pod",
+                svc_aff(),
+                None,
+                Some(labelled_pod(None, &[("service", "securityscan")])),
+                QueueingHint::QueueSkip,
+            ),
+            (
+                "add a pod which doesn't match the pod affinity",
+                svc_aff(),
+                None,
+                Some(labelled_pod(n, &[("aaa", "a")])),
+                QueueingHint::QueueSkip,
+            ),
+            (
+                "update a pod from non-match to match pod affinity",
+                svc_aff(),
+                Some(labelled_pod(n, &[("aaa", "a")])),
+                Some(labelled_pod(n, &[("service", "securityscan")])),
+                QueueingHint::Queue,
+            ),
+            (
+                "the updating pod matches target pod's affinity both before and after label changes",
+                svc_aff(),
+                Some(labelled_pod(n, &[("service", "value2")])),
+                Some(labelled_pod(n, &[("service", "securityscan")])),
+                QueueingHint::QueueSkip,
+            ),
+            (
+                "update an un-scheduled pod",
+                svc_aff(),
+                Some(labelled_pod(None, &[("service", "securityscan")])),
+                Some(labelled_pod(None, &[("service", "securityscan")])),
+                QueueingHint::QueueSkip,
+            ),
+            (
+                "update a pod from match to non-match the pod affinity",
+                svc_aff(),
+                Some(labelled_pod(n, &[("service", "securityscan")])),
+                Some(labelled_pod(n, &[("aaa", "a")])),
+                QueueingHint::QueueSkip,
+            ),
+            (
+                "update a pod from match to non-match pod's affinity - multiple terms case",
+                two_terms(),
+                Some(labelled_pod(n, &[("aaa", "a")])),
+                Some(labelled_pod(n, &[("service", "securityscan")])),
+                QueueingHint::QueueSkip,
+            ),
+            (
+                "update a pod from non-match to match pod's affinity - multiple terms case",
+                two_terms(),
+                Some(labelled_pod(n, &[("aaa", "a")])),
+                Some(labelled_pod(n, &[("aaa", ""), ("bbb", "")])),
+                QueueingHint::Queue,
+            ),
+            (
+                "modify pod label to change it from satisfying pod anti-affinity to not satisfying anti-affinity",
+                svc_anti(),
+                Some(labelled_pod(n, &[("service", "securityscan")])),
+                Some(labelled_pod(n, &[("service", "aaaa")])),
+                QueueingHint::Queue,
+            ),
+            (
+                "modify pod label to change it from not satisfying pod anti-affinity to satisfying anti-affinity",
+                svc_anti(),
+                Some(labelled_pod(n, &[("service", "bbb")])),
+                Some(labelled_pod(n, &[("service", "securityscan")])),
+                QueueingHint::QueueSkip,
+            ),
+            (
+                "delete a pod which doesn't match pod's anti-affinity",
+                svc_anti(),
+                Some(labelled_pod(n, &[("aaa", "a")])),
+                None,
+                QueueingHint::QueueSkip,
+            ),
+            (
+                "delete a pod which matches pod's anti-affinity",
+                svc_anti(),
+                Some(labelled_pod(n, &[("service", "securityscan")])),
+                None,
+                QueueingHint::Queue,
+            ),
+        ];
+        for (name, pod, old, new, want) in cases {
+            let old_b = old.map(obj);
+            let new_b = new.map(obj);
+            let got = inter_pod_affinity::is_schedulable_after_pod_change(
+                &pod,
+                old_b.as_deref(),
+                new_b.as_deref(),
+            )
+            .unwrap();
+            assert_eq!(got, want, "{name}");
+        }
+        // util.As error path: a wrong-typed object is an error (backoff).
+        assert!(inter_pod_affinity::is_schedulable_after_pod_change(
+            &svc_aff(),
+            None,
+            Some(&*obj("not-a-pod".to_string()))
+        )
+        .is_err());
+    }
+
+    /// `Test_isSchedulableAfterNodeChange` (`plugin_test.go:153-262`).
+    #[test]
+    fn inter_pod_affinity_is_schedulable_after_node_change() {
+        use Kind::*;
+        let aff = |tk: &str| {
+            ipa_pod(vec![(
+                Affinity,
+                selector_in("service", &["securityscan", "value2"]),
+                tk,
+            )])
+        };
+        let anti = || {
+            ipa_pod(vec![(
+                AntiAffinity,
+                json!({"matchLabels": {"another": "label"}}),
+                "zone",
+            )])
+        };
+        let cases: Vec<(&str, Pod, Option<Node>, Node, QueueingHint)> = vec![
+            (
+                "add a new node with matched pod affinity topologyKey",
+                aff("zone"),
+                None,
+                named_node(&[("zone", "zone1")]),
+                QueueingHint::Queue,
+            ),
+            (
+                "add a new node without matched topologyKey",
+                aff("region"),
+                None,
+                named_node(&[("zone", "zone1")]),
+                QueueingHint::QueueSkip,
+            ),
+            (
+                "update node label but not topologyKey",
+                aff("zone"),
+                Some(named_node(&[("aaa", "a")])),
+                named_node(&[("aaa", "b")]),
+                QueueingHint::QueueSkip,
+            ),
+            (
+                "update node label that isn't related to the pod affinity",
+                aff("zone"),
+                Some(named_node(&[("zone", "zone1")])),
+                named_node(&[("zone", "zone1"), ("unrelated-label", "unrelated")]),
+                QueueingHint::QueueSkip,
+            ),
+            (
+                "update node with different affinity topologyKey value",
+                aff("zone"),
+                Some(named_node(&[("zone", "zone1")])),
+                named_node(&[("zone", "zone2")]),
+                QueueingHint::Queue,
+            ),
+            (
+                "update node to have the affinity topology label",
+                aff("zone"),
+                Some(named_node(&[("aaa", "a")])),
+                named_node(&[("zone", "zone1")]),
+                QueueingHint::Queue,
+            ),
+            (
+                "add a new node with matched pod anti-affinity topologyKey",
+                anti(),
+                None,
+                named_node(&[("zone", "zone1")]),
+                QueueingHint::Queue,
+            ),
+            (
+                "add a new node without matched pod anti-affinity topologyKey",
+                anti(),
+                None,
+                named_node(&[]),
+                QueueingHint::Queue,
+            ),
+            (
+                "update node label that isn't related to the pod anti-affinity",
+                anti(),
+                Some(named_node(&[("zone", "zone1")])),
+                named_node(&[("zone", "zone1"), ("unrelated-label", "unrelated")]),
+                QueueingHint::QueueSkip,
+            ),
+            (
+                "update node with different anti-affinity topologyKey value",
+                anti(),
+                Some(named_node(&[("zone", "zone1")])),
+                named_node(&[("zone", "zone2")]),
+                QueueingHint::Queue,
+            ),
+            (
+                "update node to have the anti-affinity topology label",
+                anti(),
+                Some(named_node(&[("aaa", "a")])),
+                named_node(&[("zone", "zone1")]),
+                QueueingHint::QueueSkip,
+            ),
+            (
+                "update node label not to have anti-affinity topology label",
+                anti(),
+                Some(named_node(&[("zone", "zone1")])),
+                named_node(&[("aaa", "a")]),
+                QueueingHint::Queue,
+            ),
+        ];
+        for (name, pod, old, new, want) in cases {
+            let old_b = old.map(obj);
+            let got = inter_pod_affinity::is_schedulable_after_node_change(
+                &pod,
+                old_b.as_deref(),
+                Some(&*obj(new)),
+            )
+            .unwrap();
+            assert_eq!(got, want, "{name}");
+        }
+        assert!(inter_pod_affinity::is_schedulable_after_node_change(
+            &aff("zone"),
+            None,
+            Some(&*obj("not-a-node".to_string()))
+        )
+        .is_err());
+    }
+
+    /// `newAffinityTerm` / `AffinityTerm.Matches` (`kube-scheduler/framework/
+    /// types.go:387-445`): the namespace set, namespaceSelector and an absent
+    /// labelSelector (`labels.Nothing()`) all take part in the match.
+    #[test]
+    fn inter_pod_affinity_term_namespace_and_selector_semantics() {
+        let mk = |term: serde_json::Value, ns: &str| -> Pod {
+            serde_json::from_value(json!({
+                "metadata": {"name": "p", "namespace": ns},
+                "spec": {"affinity": {"podAntiAffinity": {
+                    "requiredDuringSchedulingIgnoredDuringExecution": [term]}}}
+            }))
+            .unwrap()
+        };
+        let scheduled = |ns: &str| -> Pod {
+            serde_json::from_value(json!({
+                "metadata": {"namespace": ns, "labels": {"a": "b"}},
+                "spec": {"nodeName": "n"}
+            }))
+            .unwrap()
+        };
+        let del = |target: &Pod, p: Pod| {
+            inter_pod_affinity::is_schedulable_after_pod_change(target, Some(&*obj(p)), None)
+                .unwrap()
+        };
+        let sel = json!({"matchLabels": {"a": "b"}});
+        // default namespace = the target pod's own
+        let t = mk(json!({"labelSelector": sel, "topologyKey": "z"}), "ns1");
+        assert_eq!(del(&t, scheduled("ns1")), QueueingHint::Queue);
+        assert_eq!(del(&t, scheduled("ns2")), QueueingHint::QueueSkip);
+        // explicit namespaces
+        let t = mk(
+            json!({"labelSelector": sel, "topologyKey": "z", "namespaces": ["ns2"]}),
+            "ns1",
+        );
+        assert_eq!(del(&t, scheduled("ns2")), QueueingHint::Queue);
+        assert_eq!(del(&t, scheduled("ns1")), QueueingHint::QueueSkip);
+        // namespaceSelector set, nsLabels nil: empty selector matches all
+        let t = mk(
+            json!({"labelSelector": sel, "topologyKey": "z", "namespaceSelector": {}}),
+            "ns1",
+        );
+        assert_eq!(del(&t, scheduled("ns9")), QueueingHint::Queue);
+        // absent labelSelector is labels.Nothing(): never matches
+        let t = mk(json!({"topologyKey": "z"}), "ns1");
+        assert_eq!(del(&t, scheduled("ns1")), QueueingHint::QueueSkip);
+        // an invalid selector is an error (backoff)
+        let t = mk(
+            json!({"labelSelector": {"matchExpressions": [{"key": "a", "operator": "Bogus"}]}, "topologyKey": "z"}),
+            "ns1",
+        );
+        assert!(inter_pod_affinity::is_schedulable_after_pod_change(
+            &t,
+            Some(&*obj(scheduled("ns1"))),
+            None
+        )
+        .is_err());
     }
 }
