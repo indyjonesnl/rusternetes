@@ -56,6 +56,7 @@ mod serving_tls;
 mod runtime;
 mod runtime_state;
 mod server;
+mod server_auth;
 mod server_metrics;
 mod static_pod_watch;
 mod static_pods;
@@ -238,6 +239,37 @@ struct Args {
     #[arg(long)]
     insecure_skip_tls_verify: bool,
 
+    /// `--anonymous-auth` (options.go:381): enables anonymous requests to the
+    /// kubelet server. Default true without `--config`, false with it.
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    anonymous_auth: Option<bool>,
+
+    /// `--authentication-token-webhook` (options.go:385): TokenReview-backed
+    /// bearer token authentication.
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    authentication_token_webhook: Option<bool>,
+
+    /// `--authentication-token-webhook-cache-ttl` (options.go:387), default 2m.
+    #[arg(long, value_parser = parse_go_duration_flag)]
+    authentication_token_webhook_cache_ttl: Option<std::time::Duration>,
+
+    /// `--client-ca-file` (options.go:389): PEM bundle for x509 client
+    /// certificate authentication.
+    #[arg(long)]
+    client_ca_file: Option<String>,
+
+    /// `--authorization-mode` (options.go:394): `AlwaysAllow` or `Webhook`.
+    #[arg(long)]
+    authorization_mode: Option<String>,
+
+    /// `--authorization-webhook-cache-authorized-ttl` (options.go:397), default 5m.
+    #[arg(long, value_parser = parse_go_duration_flag)]
+    authorization_webhook_cache_authorized_ttl: Option<std::time::Duration>,
+
+    /// `--authorization-webhook-cache-unauthorized-ttl` (options.go:399), default 30s.
+    #[arg(long, value_parser = parse_go_duration_flag)]
+    authorization_webhook_cache_unauthorized_ttl: Option<std::time::Duration>,
+
     /// Hard eviction thresholds, upstream `<signal><op><value>` syntax.
     /// Empty string disables eviction. See module docs for details.
     #[arg(long, default_value = None)]
@@ -349,6 +381,14 @@ fn build_eviction_manager(
     Ok(EvictionManager::with_config(thresholds, transition_period))
 }
 
+/// A Go `time.Duration` flag value (`fs.DurationVar`).
+fn parse_go_duration_flag(s: &str) -> Result<std::time::Duration, String> {
+    let nanos = rusternetes_common::go_duration::parse_go_duration(s)?;
+    u64::try_from(nanos)
+        .map(std::time::Duration::from_nanos)
+        .map_err(|_| format!("negative duration {s}"))
+}
+
 /// Apply `--feature-gates` process-wide. Port of `featureGate.Set`
 /// (staging/src/k8s.io/component-base/featuregate/feature_gate.go:340-359).
 fn apply_feature_gates(args: &Args) -> Result<()> {
@@ -426,7 +466,7 @@ async fn main() -> Result<()> {
         args.sync_interval,
         args.metrics_port,
         args.log_level,
-        config_file,
+        config_file.clone(),
         node_name,
         etcd_endpoints,
     )?;
@@ -443,6 +483,9 @@ async fn main() -> Result<()> {
     // Initialize storage. In API mode (--kubeconfig) the kubelet reads/writes
     // cluster state through the api-server via StorageBackend::Api; the rest of
     // the kubelet keeps its ordinary Arc<StorageBackend> handle unchanged.
+    // The API client, kept for `BuildAuth` (`kubeDeps.KubeClient`); `None` in
+    // standalone (storage) mode.
+    let mut api_client: Option<Arc<rusternetes_client::http::ApiClient>> = None;
     let storage = if let Some(kubeconfig) = args.kubeconfig.as_deref() {
         use rusternetes_client::http::ApiClient;
         use rusternetes_client::kubeconfig::KubeConfig;
@@ -486,6 +529,7 @@ async fn main() -> Result<()> {
             client_key.map(|p| p.into_bytes()),
             token,
         )?);
+        api_client = Some(client.clone());
         Arc::new(StorageBackend::new_api(client))
     } else {
         let storage_config = match args.storage_backend.as_str() {
@@ -681,7 +725,37 @@ async fn main() -> Result<()> {
         kubelet: Some(kubelet.clone()),
     };
     let tls_node_name = runtime_config.node_name.clone();
+
+    // `BuildAuth` (cmd/kubelet/app/server.go:719-725): always built, and its
+    // client-CA reload runs for the life of the process.
+    let (authn_config, authz_config) = server_auth::resolve_auth_config(
+        config_file.as_ref(),
+        &server_auth::AuthFlags {
+            anonymous_auth: args.anonymous_auth,
+            authentication_token_webhook: args.authentication_token_webhook,
+            authentication_token_webhook_cache_ttl: args.authentication_token_webhook_cache_ttl,
+            client_ca_file: args.client_ca_file.clone(),
+            authorization_mode: args.authorization_mode.clone(),
+            authorization_webhook_cache_authorized_ttl: args
+                .authorization_webhook_cache_authorized_ttl,
+            authorization_webhook_cache_unauthorized_ttl: args
+                .authorization_webhook_cache_unauthorized_ttl,
+        },
+    );
+    let (auth, client_ca) = server_auth::build_auth(
+        &runtime_config.node_name,
+        api_client,
+        &authn_config,
+        &authz_config,
+    )?;
+    let (_auth_stop_tx, auth_stop_rx) = tokio::sync::watch::channel(false);
+    if let Some(ca) = client_ca {
+        tokio::spawn(ca.run(auth_stop_rx));
+    }
+    let client_ca_file =
+        (!authn_config.client_ca_file.is_empty()).then(|| authn_config.client_ca_file.clone());
     tokio::spawn(async move {
+        let _keep_auth_stop = _auth_stop_tx;
         let app = Router::new()
             .route("/metrics", get(|| async move { metrics_clone.gather() }))
             .route(
@@ -727,14 +801,21 @@ async fn main() -> Result<()> {
             .map(String::from)
             .collect();
         let app = server::install_statusz(app, registered);
+        // server.go:312-314 `InstallAuthFilter`: wraps every route registered
+        // above (and /statusz).
+        let app = server_auth::install_auth_filter(app, Some(auth));
 
         // Serve the kubelet API port over HTTPS (#1644): a vanilla api-server
         // proxies logs/exec/attach/metrics to `https://<nodeIP>:10250` and will
         // not talk plain HTTP to a kubelet.
         let addr: std::net::SocketAddr = metrics_addr.parse().expect("valid metrics addr");
-        let tls = serving_tls::kubelet_serving_tls(&tls_node_name)
-            .expect("build kubelet serving TLS config");
-        axum_server::bind_rustls(addr, tls)
+        let tls = serving_tls::kubelet_serving_tls_with_client_ca(
+            &tls_node_name,
+            client_ca_file.as_deref(),
+        )
+        .expect("build kubelet serving TLS config");
+        axum_server::bind_rustls(addr, tls.clone())
+            .acceptor(serving_tls::PeerCertAcceptor::new(tls))
             .serve(app.into_make_service())
             .await
             .unwrap();

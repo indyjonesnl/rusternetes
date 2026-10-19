@@ -22,9 +22,8 @@ use rusternetes_common::auth::UserInfo;
 use rusternetes_common::authz::{Authorizer, Decision, Opinion, RequestAttributes};
 use rusternetes_common::error::{Error, Result as AuthzResult};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// `maxControlledAttrCacheSize` (webhook.go:56).
@@ -150,42 +149,7 @@ pub fn parse_go_duration(s: &str) -> std::result::Result<Duration, String> {
     Ok(Duration::from_secs_f64(total))
 }
 
-/// `wait.Backoff`.
-#[derive(Debug, Clone)]
-pub struct Backoff {
-    pub duration: Duration,
-    pub factor: f64,
-    pub jitter: f64,
-    pub steps: u32,
-}
-
-impl Backoff {
-    /// `DefaultAuthWebhookRetryBackoff`
-    /// (`apiserver/pkg/server/options/authentication.go:46`) ==
-    /// `DefaultRetryBackoffWithInitialDelay(500ms)`.
-    pub fn default_auth_webhook() -> Self {
-        Self {
-            duration: Duration::from_millis(500),
-            factor: 1.5,
-            jitter: 0.2,
-            steps: 5,
-        }
-    }
-
-    /// `Backoff.Step`: the next sleep, then grow.
-    fn step(&mut self) -> Duration {
-        self.steps = self.steps.saturating_sub(1);
-        let mut d = self.duration;
-        if self.factor != 0.0 {
-            self.duration = self.duration.mul_f64(self.factor);
-        }
-        if self.jitter > 0.0 {
-            // wait.Jitter: d + rand*jitter*d
-            d += d.mul_f64(rand::random::<f64>() * self.jitter);
-        }
-        d
-    }
-}
+pub use rusternetes_common::wait::Backoff;
 
 /// `authzconfig.FailurePolicy` (`reload.go:136-143`): the decision when the
 /// webhook cannot be consulted. The legacy flags use `NoOpinion`
@@ -525,63 +489,7 @@ impl SarVersion {
 // LRU expire cache (`k8s.io/apimachinery/pkg/util/cache.LRUExpireCache`)
 // ---------------------------------------------------------------------------
 
-struct ExpireCache {
-    cap: usize,
-    inner: Mutex<CacheInner>,
-}
-
-#[derive(Default)]
-struct CacheInner {
-    tick: u64,
-    entries: HashMap<String, (SarStatus, Instant, u64)>,
-}
-
-impl ExpireCache {
-    fn new(cap: usize) -> Self {
-        Self {
-            cap,
-            inner: Mutex::new(CacheInner::default()),
-        }
-    }
-
-    fn get(&self, key: &str, now: Instant) -> Option<SarStatus> {
-        let mut c = self.inner.lock().unwrap();
-        c.tick += 1;
-        let tick = c.tick;
-        match c.entries.get_mut(key) {
-            Some((status, expires, used)) if *expires > now => {
-                *used = tick;
-                Some(status.clone())
-            }
-            Some(_) => {
-                c.entries.remove(key);
-                None
-            }
-            None => None,
-        }
-    }
-
-    fn add(&self, key: String, status: SarStatus, ttl: Duration, now: Instant) {
-        let mut c = self.inner.lock().unwrap();
-        c.tick += 1;
-        let tick = c.tick;
-        if !c.entries.contains_key(&key) && c.entries.len() >= self.cap {
-            // drop expired entries first, else the least recently used
-            c.entries.retain(|_, (_, exp, _)| *exp > now);
-            if c.entries.len() >= self.cap {
-                if let Some(lru) = c
-                    .entries
-                    .iter()
-                    .min_by_key(|(_, (_, _, used))| *used)
-                    .map(|(k, _)| k.clone())
-                {
-                    c.entries.remove(&lru);
-                }
-            }
-        }
-        c.entries.insert(key, (status, now + ttl, tick));
-    }
-}
+type ExpireCache = rusternetes_common::lru_expire_cache::LruExpireCache<SarStatus>;
 
 // ---------------------------------------------------------------------------
 // The authorizer

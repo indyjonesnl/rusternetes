@@ -37,6 +37,7 @@ pub mod jsonpath;
 pub mod label_selector;
 pub mod latency_trackers;
 pub mod leaderelection;
+pub mod lru_expire_cache;
 pub mod observability;
 pub mod pagination;
 pub mod patch;
@@ -61,6 +62,7 @@ pub mod tolerations;
 pub mod tracing;
 pub mod types;
 pub mod validation;
+pub mod wait;
 
 pub use cel::{CELContext, CELEvaluator};
 pub use error::{Error, Result};

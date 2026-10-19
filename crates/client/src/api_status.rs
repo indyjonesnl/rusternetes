@@ -139,6 +139,23 @@ pub fn is_forbidden(err: &anyhow::Error) -> bool {
     reason_or_code(err, "Forbidden", 403)
 }
 
+/// `IsTimeout` (errors.go:689-698).
+pub fn is_timeout(err: &anyhow::Error) -> bool {
+    reason_or_code(err, "Timeout", 504)
+}
+
+/// `IsInternalError` (errors.go:711-720).
+pub fn is_internal_error(err: &anyhow::Error) -> bool {
+    reason_or_code(err, "InternalError", 500)
+}
+
+/// `IsTooManyRequests` (errors.go:725-738): the code check does not require an
+/// unknown reason.
+pub fn is_too_many_requests(err: &anyhow::Error) -> bool {
+    let (reason, code) = reason_and_code_for_error(err);
+    reason == "TooManyRequests" || code == 429
+}
+
 /// `IsUnsupportedMediaType` (errors.go:607-615).
 pub fn is_unsupported_media_type(err: &anyhow::Error) -> bool {
     reason_or_code(err, "UnsupportedMediaType", 415)
@@ -164,6 +181,22 @@ mod tests {
         assert!(!is_unsupported_media_type(&err(415, "Forbidden")));
         assert!(is_unsupported_media_type(&err(0, "UnsupportedMediaType")));
         assert!(!is_unsupported_media_type(&err(200, "")));
+    }
+
+    // errors.go IsTimeout / IsInternalError / IsTooManyRequests
+    #[test]
+    fn retry_predicates() {
+        assert!(is_timeout(&err(504, "")));
+        assert!(is_timeout(&err(0, "Timeout")));
+        assert!(!is_timeout(&err(504, "Forbidden")));
+        assert!(is_internal_error(&err(500, "")));
+        assert!(is_internal_error(&err(0, "InternalError")));
+        assert!(!is_internal_error(&err(500, "Forbidden")));
+        assert!(is_too_many_requests(&err(429, "")));
+        // IsTooManyRequests' code check does not require an unknown reason
+        assert!(is_too_many_requests(&err(429, "Forbidden")));
+        assert!(is_too_many_requests(&err(0, "TooManyRequests")));
+        assert!(!is_too_many_requests(&err(500, "")));
     }
 
     #[test]
