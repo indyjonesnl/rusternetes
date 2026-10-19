@@ -7,6 +7,8 @@ pub mod admission_metrics;
 pub mod cel_evaluators;
 
 #[cfg(test)]
+mod match_conditions_budget_tests;
+#[cfg(test)]
 mod vap_authorizer_tests;
 
 use rusternetes_common::latency_trackers::latency_trackers_from_context;
@@ -1116,11 +1118,20 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                                     continue;
                                 }
                                 crate::cel_evaluators::MatchOutcome::Error(msg) => {
-                                    // Upstream `matcher.go` treats compile/runtime
-                                    // errors as "no match" — the webhook is skipped.
-                                    // The caller can layer failurePolicy on top of the
-                                    // webhook *call*; matchCondition errors themselves
-                                    // do not flip the policy.
+                                    // matcher.go:86-95, :128-141: an error is
+                                    // `MatchResult{Error}` on `Fail` and a skip
+                                    // on `Ignore`; generic/webhook.go:232-234
+                                    // fails the request closed with Forbidden.
+                                    if !matches!(
+                                        webhook.failure_policy,
+                                        Some(FailurePolicy::Ignore)
+                                    ) {
+                                        warn!(
+                                            "Failed evaluating match conditions, failing closed {}: {}",
+                                            webhook.name, msg
+                                        );
+                                        return Err(match_conditions_forbidden(gvr, name, &msg));
+                                    }
                                     debug!(
                                         "Skipping validating webhook {} — matchCondition error: {}",
                                         webhook.name, msg
@@ -1673,6 +1684,19 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                                     continue;
                                 }
                                 crate::cel_evaluators::MatchOutcome::Error(msg) => {
+                                    // matcher.go:86-95, :128-141 and
+                                    // generic/webhook.go:232-234, as for the
+                                    // validating dispatcher.
+                                    if !matches!(
+                                        webhook.failure_policy,
+                                        Some(FailurePolicy::Ignore)
+                                    ) {
+                                        warn!(
+                                            "Failed evaluating match conditions, failing closed {}: {}",
+                                            webhook.name, msg
+                                        );
+                                        return Err(match_conditions_forbidden(gvr, name, &msg));
+                                    }
                                     debug!(
                                         "Skipping mutating webhook {} — matchCondition error: {}",
                                         webhook.name, msg
@@ -2757,6 +2781,27 @@ impl<S: Storage> AdmissionWebhookManager<S> {
             crate::cel_evaluators::MatchOutcome::Matched
         )
     }
+}
+
+/// `apierrors.NewForbidden(attr.GetResource().GroupResource(), attr.GetName(),
+/// matchResult.Error)` (`generic/webhook.go:234`, `errors.go:209-217`).
+fn match_conditions_forbidden(
+    gvr: &GroupVersionResource,
+    name: &str,
+    err: &str,
+) -> rusternetes_common::Error {
+    // `attr.GetResource()` carries no subresource.
+    let resource = gvr.resource.split('/').next().unwrap_or("");
+    let qualified = if gvr.group.is_empty() {
+        resource.to_string()
+    } else {
+        format!("{resource}.{}", gvr.group)
+    };
+    rusternetes_common::Error::Forbidden(if name.is_empty() {
+        format!("{qualified} is forbidden: {err}")
+    } else {
+        format!("{qualified} \"{name}\" is forbidden: {err}")
+    })
 }
 
 /// Build a typed `AdmissionRequest` from the loose params used inside the
