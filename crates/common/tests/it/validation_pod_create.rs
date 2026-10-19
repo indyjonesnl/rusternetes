@@ -1634,3 +1634,169 @@ mod pod_only_rules_on_create_and_resize {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// TestValidateVolumes - legacy volume sources (#3954)
+// Upstream: pkg/apis/core/validation/validation_test.go TestValidateVolumes
+// (gitRepo/glusterfs/rbd/cinder/cephfs/quobyte/flocker/azure*/... cases) and
+// validateVolumeSource's single-volume-type count.
+// ---------------------------------------------------------------------------
+
+fn pod_with_volume_json(vol: serde_json::Value) -> Pod {
+    let v: rusternetes_common::resources::pod::Volume = serde_json::from_value(vol).unwrap();
+    pod_with_spec(PodSpec {
+        containers: vec![minimal_container("c", "nginx")],
+        volumes: Some(vec![v]),
+        ..PodSpec::default()
+    })
+}
+
+fn volume_errs(vol: serde_json::Value) -> String {
+    format!(
+        "{:?}",
+        validate_pod_create(&pod_with_volume_json(vol), true)
+    )
+}
+
+#[test]
+fn legacy_volume_sources_valid_count_as_one_type() {
+    use serde_json::json;
+    for src in [
+        json!({"gitRepo": {"repository": "r"}}),
+        json!({"gcePersistentDisk": {"pdName": "d"}}),
+        json!({"awsElasticBlockStore": {"volumeID": "d"}}),
+        json!({"glusterfs": {"endpoints": "e", "path": "p"}}),
+        json!({"flocker": {"datasetName": "x"}}),
+        json!({"rbd": {"monitors": ["m"], "image": "i"}}),
+        json!({"cinder": {"volumeID": "v"}}),
+        json!({"cephfs": {"monitors": ["m"]}}),
+        json!({"quobyte": {"registry": "a:1,b:2", "volume": "v"}}),
+        json!({"flexVolume": {"driver": "d"}}),
+        json!({"azureFile": {"secretName": "s", "shareName": "n"}}),
+        json!({"vsphereVolume": {"volumePath": "p"}}),
+        json!({"photonPersistentDisk": {"pdID": "p"}}),
+        json!({"portworxVolume": {"volumeID": "p"}}),
+        json!({"azureDisk": {"diskName": "d", "diskURI": "https://a/b", "kind": "Shared"}}),
+        json!({"storageos": {"volumeName": "v"}}),
+        json!({"scaleIO": {"gateway": "g", "system": "s", "volumeName": "v"}}),
+    ] {
+        let mut vol = json!({"name": "v"});
+        vol.as_object_mut()
+            .unwrap()
+            .extend(src.as_object().unwrap().clone());
+        let e = volume_errs(vol);
+        assert_eq!(e, "[]", "{src}: {e}");
+    }
+}
+
+#[test]
+fn legacy_volume_sources_required_fields() {
+    use serde_json::json;
+    for (src, want) in [
+        (json!({"gitRepo": {}}), "volumes[0].gitRepo.repository"),
+        (
+            json!({"gitRepo": {"repository": "r", "directory": "../x"}}),
+            "must not contain '..'",
+        ),
+        (
+            json!({"gcePersistentDisk": {}}),
+            "volumes[0].persistentDisk.pdName",
+        ),
+        (
+            json!({"gcePersistentDisk": {"pdName": "d", "partition": 256}}),
+            "persistentDisk.partition",
+        ),
+        (
+            json!({"awsElasticBlockStore": {}}),
+            "awsElasticBlockStore.volumeID",
+        ),
+        (json!({"glusterfs": {}}), "glusterfs.endpoints"),
+        (json!({"glusterfs": {"endpoints": "e"}}), "glusterfs.path"),
+        (
+            json!({"flocker": {}}),
+            "one of datasetName and datasetUUID is required",
+        ),
+        (
+            json!({"flocker": {"datasetName": "a", "datasetUUID": "b"}}),
+            "can not be specified simultaneously",
+        ),
+        (
+            json!({"flocker": {"datasetName": "a/b"}}),
+            "must not contain '/'",
+        ),
+        (json!({"rbd": {}}), "rbd.monitors"),
+        (json!({"rbd": {"monitors": ["m"]}}), "rbd.image"),
+        (json!({"cinder": {}}), "cinder.volumeID"),
+        (
+            json!({"cinder": {"volumeID": "v", "secretRef": {}}}),
+            "cinder.secretRef.name",
+        ),
+        (json!({"cephfs": {}}), "volumes[0].cephfs.monitors"),
+        (json!({"quobyte": {}}), "quobyte.registry"),
+        (
+            json!({"quobyte": {"registry": "nohostport", "volume": "v"}}),
+            "host:port pair",
+        ),
+        (json!({"quobyte": {"registry": "a:1"}}), "quobyte.volume"),
+        (json!({"flexVolume": {}}), "flexVolume.driver"),
+        (
+            json!({"flexVolume": {"driver": "d", "options": {"foo.kubernetes.io/x": "y"}}}),
+            "namespaces are reserved",
+        ),
+        (json!({"azureFile": {}}), "azureFile.secretName"),
+        (json!({"vsphereVolume": {}}), "vsphereVolume.volumePath"),
+        (
+            json!({"photonPersistentDisk": {}}),
+            "photonPersistentDisk.pdID",
+        ),
+        (json!({"portworxVolume": {}}), "portworxVolume.volumeID"),
+        (json!({"azureDisk": {}}), "azureDisk.diskName"),
+        (
+            json!({"azureDisk": {"diskName": "d", "diskURI": "x", "kind": "Managed"}}),
+            "diskURI",
+        ),
+        (
+            json!({"azureDisk": {"diskName": "d", "diskURI": "x", "cachingMode": "Bad"}}),
+            "cachingMode",
+        ),
+        (json!({"storageos": {}}), "storageos.volumeName"),
+        (
+            json!({"storageos": {"volumeName": "v", "secretRef": {}}}),
+            "storageos.secretRef.name",
+        ),
+        (json!({"scaleIO": {}}), "scaleIO.gateway"),
+    ] {
+        let mut vol = json!({"name": "v"});
+        vol.as_object_mut()
+            .unwrap()
+            .extend(src.as_object().unwrap().clone());
+        let e = volume_errs(vol);
+        assert!(e.contains(want), "{src}: want {want:?} in {e}");
+        assert!(!e.contains("must specify a volume type"), "{src}: {e}");
+    }
+}
+
+#[test]
+fn legacy_volume_sources_count_toward_single_type() {
+    use serde_json::json;
+    // glusterfs precedes rbd in upstream order: the later one is forbidden.
+    let e = volume_errs(json!({
+        "name": "v",
+        "glusterfs": {"endpoints": "e", "path": "p"},
+        "rbd": {"monitors": ["m"], "image": "i"},
+    }));
+    assert!(
+        e.contains("volumes[0].rbd") && e.contains("may not specify more than 1 volume type"),
+        "{e}"
+    );
+    // emptyDir + gitRepo
+    let e = volume_errs(json!({
+        "name": "v",
+        "emptyDir": {},
+        "gitRepo": {"repository": "r"},
+    }));
+    assert!(
+        e.contains("volumes[0].gitRepo") && e.contains("may not specify more than 1 volume type"),
+        "{e}"
+    );
+}
