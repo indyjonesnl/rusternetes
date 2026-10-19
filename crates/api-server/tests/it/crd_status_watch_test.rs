@@ -49,6 +49,7 @@ fn crd_with_status() -> Value {
                 "name": "v1",
                 "served": true,
                 "storage": true,
+                "schema": {"openAPIV3Schema": {"type": "object", "x-kubernetes-preserve-unknown-fields": true}},
                 "subresources": { "status": {} }
             }]
         }

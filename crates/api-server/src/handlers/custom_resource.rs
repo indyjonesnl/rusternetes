@@ -675,10 +675,14 @@ pub(crate) fn apply_schema_defaults(
     };
 
     // Apply defaults from schema if present
-    if let Some(ref validation) = crd_version.schema {
+    if let Some(root_schema) = crd_version
+        .schema
+        .as_ref()
+        .and_then(|s| s.open_apiv3_schema.as_ref())
+    {
         // The CRD schema's top-level properties typically include "spec", "status", etc.
         // We need to find the "spec" property schema and apply defaults to cr.spec.
-        if let Some(ref properties) = validation.open_apiv3_schema.properties {
+        if let Some(ref properties) = root_schema.properties {
             if let Some(spec_schema) = properties.get("spec") {
                 let spec = cr.spec.get_or_insert_with(|| serde_json::json!({}));
                 SchemaValidator::apply_defaults(spec_schema, spec);
@@ -687,7 +691,7 @@ pub(crate) fn apply_schema_defaults(
         // Also apply defaults at the top level for the whole object
         // (handles cases where the schema defines defaults for top-level fields like "a")
         let mut cr_value = serde_json::to_value(&*cr).unwrap_or_default();
-        SchemaValidator::apply_defaults(&validation.open_apiv3_schema, &mut cr_value);
+        SchemaValidator::apply_defaults(root_schema, &mut cr_value);
         // Update spec from applied defaults
         if let Some(spec_val) = cr_value.get("spec") {
             cr.spec = Some(spec_val.clone());
@@ -780,20 +784,21 @@ fn validate_custom_resource_with_ratcheting(
             version
         )));
     }
-    let Some(ref validation) = crd_version.schema else {
+    let Some(root_schema) = crd_version
+        .schema
+        .as_ref()
+        .and_then(|s| s.open_apiv3_schema.as_ref())
+    else {
         return Ok(());
     };
     let crd_preserves = crd.spec.preserve_unknown_fields == Some(true);
-    let schema_preserves = validation
-        .open_apiv3_schema
-        .x_kubernetes_preserve_unknown_fields
-        == Some(true);
+    let schema_preserves = root_schema.x_kubernetes_preserve_unknown_fields == Some(true);
     if crd_preserves || schema_preserves {
         // K8s skips structural validation when preserve-unknown-fields is set.
         return Ok(());
     }
 
-    let Some(ref properties) = validation.open_apiv3_schema.properties else {
+    let Some(ref properties) = root_schema.properties else {
         return Ok(());
     };
 
@@ -926,17 +931,18 @@ fn validate_custom_resource_schema(
     // (line 1432 in customresource_handler.go). Only metadata coercion runs.
     // Also skip if the schema root has x-kubernetes-preserve-unknown-fields: true.
     let crd_preserves = crd.spec.preserve_unknown_fields == Some(true);
-    if let Some(ref validation) = crd_version.schema {
-        let schema_preserves = validation
-            .open_apiv3_schema
-            .x_kubernetes_preserve_unknown_fields
-            == Some(true);
+    if let Some(root_schema) = crd_version
+        .schema
+        .as_ref()
+        .and_then(|s| s.open_apiv3_schema.as_ref())
+    {
+        let schema_preserves = root_schema.x_kubernetes_preserve_unknown_fields == Some(true);
 
         if !crd_preserves && !schema_preserves {
             // Validate ALL top-level properties against the schema, not just spec.
             // K8s validates the entire CR object. Some CRDs define enum fields
             // at the top level (e.g., cronies), not under spec.
-            if let Some(ref properties) = validation.open_apiv3_schema.properties {
+            if let Some(ref properties) = root_schema.properties {
                 // Validate spec if present. Root the error path at "spec" so a
                 // missing nested required field reports the upstream-format path
                 // (e.g. `spec.bars[0].name: Required value`).
@@ -1350,7 +1356,7 @@ mod tests {
 
         let mut crd = create_test_crd();
         crd.spec.versions[0].schema = Some(CustomResourceValidation {
-            open_apiv3_schema: top_schema,
+            open_apiv3_schema: Some(top_schema),
         });
         crd
     }

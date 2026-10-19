@@ -98,6 +98,8 @@ fn validate_cr_against_stored_crd(
     let validation = crd_version.schema.as_ref().expect("test CRD has schema");
     let properties = validation
         .open_apiv3_schema
+        .as_ref()
+        .expect("test schema")
         .properties
         .as_ref()
         .expect("test schema has properties");
@@ -145,7 +147,13 @@ async fn cr_with_unknown_enum_value_is_rejected() {
         .iter()
         .find(|v| v.name == "v1")
         .expect("v1 must exist");
-    let schema = &v1.schema.as_ref().expect("schema").open_apiv3_schema;
+    let schema = v1
+        .schema
+        .as_ref()
+        .expect("schema")
+        .open_apiv3_schema
+        .as_ref()
+        .expect("openAPIV3Schema");
     let spec_props = schema.properties.as_ref().unwrap();
     let bars_schema = spec_props
         .get("spec")
@@ -229,11 +237,13 @@ async fn crd_update_reflects_in_stored_schema_for_openapi_publish() {
 
     // Read back as typed → confirm enum on the original schema.
     let crd_v1: CustomResourceDefinition = storage.get(&key).await.unwrap();
-    let v1_schema = &crd_v1.spec.versions[0]
+    let v1_schema = crd_v1.spec.versions[0]
         .schema
         .as_ref()
         .unwrap()
-        .open_apiv3_schema;
+        .open_apiv3_schema
+        .as_ref()
+        .unwrap();
     assert!(v1_schema.properties.is_some());
 
     // "Update" the CRD: replace the schema so that the items no longer
@@ -254,11 +264,13 @@ async fn crd_update_reflects_in_stored_schema_for_openapi_publish() {
     let _: serde_json::Value = storage.update(&key, &body_v2).await.unwrap();
 
     let crd_v2: CustomResourceDefinition = storage.get(&key).await.unwrap();
-    let v2_schema = &crd_v2.spec.versions[0]
+    let v2_schema = crd_v2.spec.versions[0]
         .schema
         .as_ref()
         .unwrap()
-        .open_apiv3_schema;
+        .open_apiv3_schema
+        .as_ref()
+        .unwrap();
 
     // The schema MUST reflect the rename/removal — `feeling` is gone.
     let spec_props = v2_schema.properties.as_ref().unwrap();

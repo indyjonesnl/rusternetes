@@ -246,10 +246,15 @@ pub struct SelectableField {
 pub struct CustomResourceValidation {
     /// OpenAPIV3Schema is the OpenAPI v3 schema to validate against
     ///
-    /// A `schema: {}` with no `openAPIV3Schema` is the zero schema upstream,
-    /// which the structural-schema check rejects rather than the decoder.
-    #[serde(rename = "openAPIV3Schema", default)]
-    pub open_apiv3_schema: JSONSchemaProps,
+    /// `OpenAPIV3Schema *JSONSchemaProps` upstream: `None` is an absent
+    /// `openAPIV3Schema` (`schema: {}`), which `requireOpenAPISchema` rejects
+    /// (`validation.go:371-377`); `Some(zero)` is an explicit `{}`.
+    #[serde(
+        rename = "openAPIV3Schema",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub open_apiv3_schema: Option<JSONSchemaProps>,
 }
 
 /// JSONSchemaProps is a JSON-Schema that validates a JSON object
@@ -876,7 +881,9 @@ pub fn prune_custom_resource_value(
     let Some(validation) = &crd_version.schema else {
         return;
     };
-    let schema = &validation.open_apiv3_schema;
+    let Some(schema) = &validation.open_apiv3_schema else {
+        return;
+    };
 
     // Root-level preserveUnknownFields disables pruning for the whole object.
     if schema.x_kubernetes_preserve_unknown_fields == Some(true) {
@@ -930,8 +937,10 @@ pub fn prune_custom_resource(
     }
 
     let schema = match &crd_version.schema {
-        Some(s) => &s.open_apiv3_schema,
-        None => return,
+        Some(CustomResourceValidation {
+            open_apiv3_schema: Some(s),
+        }) => s,
+        _ => return,
     };
 
     // Check if root schema preserves unknown fields
@@ -1223,6 +1232,8 @@ mod tests {
         let schema = version.schema.as_ref().expect("no schema");
         let spec_schema = schema
             .open_apiv3_schema
+            .as_ref()
+            .unwrap()
             .properties
             .as_ref()
             .unwrap()

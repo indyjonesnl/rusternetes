@@ -248,8 +248,8 @@ pub fn find_preexisting_expressions(spec: &CustomResourceDefinitionSpec) -> Pree
     use std::cell::RefCell;
     let found = RefCell::new(PreexistingExpressions::default());
     for v in &spec.versions {
-        if let Some(validation) = &v.schema {
-            rusternetes_common::validation::crd::schema_has(&validation.open_apiv3_schema, &|s| {
+        if let Some(schema) = v.schema.as_ref().and_then(|s| s.open_apiv3_schema.as_ref()) {
+            rusternetes_common::validation::crd::schema_has(schema, &|s| {
                 for raw in s.x_kubernetes_validations.iter().flatten() {
                     if let Some(rule) = raw.get("rule").and_then(|r| r.as_str()) {
                         found.borrow_mut().rules.insert(rule.to_string());
@@ -664,10 +664,14 @@ pub fn validate_cr_against_crd(
     let Some(crd_version) = crd.spec.versions.iter().find(|v| v.name == version) else {
         return Ok(());
     };
-    let Some(validation) = &crd_version.schema else {
+    let Some(schema) = crd_version
+        .schema
+        .as_ref()
+        .and_then(|s| s.open_apiv3_schema.as_ref())
+    else {
         return Ok(());
     };
-    let rules = collect_rules(&validation.open_apiv3_schema);
+    let rules = collect_rules(schema);
     validate_cr_rules(&rules, cr, old_cr)
 }
 

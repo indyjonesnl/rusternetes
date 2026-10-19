@@ -22,7 +22,6 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use rusternetes_common::resources::crd::JSONSchemaProps;
 use rusternetes_common::resources::{CustomResourceDefinition, CustomResourceDefinitionCondition};
 use rusternetes_common::validation::crd::{
     api_approval_state, is_protected_community_group, ApiApprovalState,
@@ -76,17 +75,11 @@ pub fn calculate_non_structural_condition(
     }
 
     // :102-122. A version with no `openAPIV3Schema` is skipped upstream
-    // (`v.Schema == nil || v.Schema.OpenAPIV3Schema == nil`). Deviation: the
-    // typed model cannot tell an absent `openAPIV3Schema` from an empty one
-    // (it decodes to the default), so the default schema is treated as absent.
-    let absent = JSONSchemaProps::default();
+    // (`v.Schema == nil || v.Schema.OpenAPIV3Schema == nil`).
     for (i, v) in crd.spec.versions.iter().enumerate() {
-        let Some(schema) = v.schema.as_ref().map(|s| &s.open_apiv3_schema) else {
+        let Some(schema) = v.schema.as_ref().and_then(|s| s.open_apiv3_schema.as_ref()) else {
             continue;
         };
-        if *schema == absent {
-            continue;
-        }
         let s = match new_structural(schema) {
             Ok(s) => s,
             Err(e) => {
