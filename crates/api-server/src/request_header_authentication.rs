@@ -219,22 +219,70 @@ pub fn client_ca_files<'a>(
         .collect()
 }
 
-/// The per-connection acceptor for a listener whose TLS config trusts
-/// [`client_ca_files`].
-pub fn peer_cert_acceptor(
-    rustls_config: axum_server::tls_rustls::RustlsConfig,
+/// The reload machinery behind a mTLS listener; the CA files are re-read
+/// while this is alive (`DynamicFileCAContent.Run` plus
+/// `DynamicServingCertificateController.Run`), and abandoned when it drops.
+pub struct CaReload {
+    _tasks: crate::dynamic_certificates::ReloadTasks,
+}
+
+/// The acceptor for a listener that authenticates client certificates:
+///   * `--client-ca-file` and `--requestheader-client-ca-file` are each a
+///     `NewDynamicCAContentFromFile` provider (authentication.go:165, :238);
+///   * the TLS handshake trusts their union (`ApplyClientCert`, config.go:535-548),
+///     rebuilt by the serving controller whenever either file changes;
+///   * which authenticator owns a presented cert is decided against each
+///     provider's CURRENT bundle.
+///
+/// Must be called inside a tokio runtime (the watch tasks are spawned here).
+pub fn mtls_acceptor(
+    tls_config: rusternetes_common::tls::TlsConfig,
     client_ca_file: Option<&str>,
     trust: Option<&RequestHeaderTrust>,
-) -> anyhow::Result<crate::peer_cert_acceptor::PeerCertAcceptor> {
-    let acceptor = crate::peer_cert_acceptor::PeerCertAcceptor::new(rustls_config);
-    match trust {
-        None => Ok(acceptor),
-        Some(t) => acceptor.with_request_header(
+) -> anyhow::Result<(crate::peer_cert_acceptor::PeerCertAcceptor, CaReload)> {
+    use crate::dynamic_certificates::{
+        CaContentProvider, DynamicFileCaContent, DynamicServingCertificateController, ReloadTasks,
+        UnionCaContent,
+    };
+
+    let client_ca: Option<Arc<DynamicFileCaContent>> = client_ca_file
+        .filter(|c| !c.is_empty())
+        .map(|f| DynamicFileCaContent::new("client-ca-bundle", f))
+        .transpose()?;
+    let request_header_ca: Option<Arc<DynamicFileCaContent>> = trust
+        .map(|t| DynamicFileCaContent::new("request-header", &t.client_ca_file))
+        .transpose()?;
+
+    let providers: Vec<Arc<dyn CaContentProvider>> = client_ca
+        .iter()
+        .map(|c| c.clone() as Arc<dyn CaContentProvider>)
+        .chain(
+            request_header_ca
+                .iter()
+                .map(|c| c.clone() as Arc<dyn CaContentProvider>),
+        )
+        .collect();
+    anyhow::ensure!(
+        !providers.is_empty(),
+        "mtls_acceptor needs at least one client CA file"
+    );
+    let union: Arc<dyn CaContentProvider> = UnionCaContent::new(providers);
+
+    let controller = DynamicServingCertificateController::new(tls_config, union.clone())?;
+    let mut tasks = ReloadTasks::default();
+    tasks.extend(union.clone().run());
+    tasks.extend(controller.clone().run());
+
+    let acceptor = crate::peer_cert_acceptor::PeerCertAcceptor::new(controller.rustls_config());
+    let acceptor = match (trust, request_header_ca) {
+        (Some(t), Some(rh_ca)) => acceptor.with_request_header(
             t.config.clone(),
-            &t.client_ca_file,
-            client_ca_file.filter(|c| !c.is_empty()),
+            rh_ca,
+            client_ca.map(|c| c as Arc<dyn CaContentProvider>),
         ),
-    }
+        _ => acceptor,
+    };
+    Ok((acceptor, CaReload { _tasks: tasks }))
 }
 
 #[cfg(test)]

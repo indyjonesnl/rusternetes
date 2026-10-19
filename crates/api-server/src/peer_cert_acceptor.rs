@@ -23,6 +23,7 @@ use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::dynamic_certificates::CaContentProvider;
 use axum::Extension;
 use axum_server::accept::Accept;
 use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
@@ -39,10 +40,21 @@ use tower::Layer;
 #[derive(Clone)]
 struct FrontProxyTrust {
     config: Arc<RequestHeaderConfig>,
-    request_header_ca: Arc<dyn ClientCertVerifier>,
+    /// Providers, not verifiers: the CA files reload on change, and the
+    /// verifier is read per connection (`VerifyOptions()` is called per
+    /// request by `x509.Verifier`, x509.go:229-255).
+    request_header_ca: Arc<dyn CaContentProvider>,
     /// `None` when `--client-ca-file` is unset: x509 authentication is then
     /// disabled (`config.ClientCAContentProvider != nil`, config.go:128).
-    client_ca: Option<Arc<dyn ClientCertVerifier>>,
+    client_ca: Option<Arc<dyn CaContentProvider>>,
+}
+
+/// [`chain_verifies`] against a provider's current bundle; a provider with no
+/// bundle loaded verifies nothing (`VerifyOptions` returning `false`).
+fn provider_verifies(provider: &dyn CaContentProvider, chain: &[Vec<u8>]) -> bool {
+    provider
+        .verifier()
+        .is_some_and(|v| chain_verifies(v.as_ref(), chain))
 }
 
 /// Whether `chain` (leaf first) verifies against `verifier`'s CA bundle
@@ -80,26 +92,21 @@ impl PeerCertAcceptor {
     }
 
     /// Enable request-header (front-proxy) authentication. The `RustlsConfig`
-    /// must trust the union of `client_ca_file` and `request_header_ca_file`
-    /// (`TlsConfig::into_mtls_server_config_for_cas`); this acceptor then
-    /// decides, per connection, which authenticator the presented chain is
-    /// valid for.
+    /// must trust the union of both CA providers (the serving controller keeps
+    /// it current); this acceptor then decides, per connection, which
+    /// authenticator the presented chain is valid for.
     pub fn with_request_header(
         mut self,
         config: Arc<RequestHeaderConfig>,
-        request_header_ca_file: &str,
-        client_ca_file: Option<&str>,
-    ) -> anyhow::Result<Self> {
+        request_header_ca: Arc<dyn CaContentProvider>,
+        client_ca: Option<Arc<dyn CaContentProvider>>,
+    ) -> Self {
         self.front_proxy = Some(FrontProxyTrust {
             config,
-            request_header_ca: rusternetes_common::tls::client_cert_verifier_for_ca_file(
-                request_header_ca_file,
-            )?,
-            client_ca: client_ca_file
-                .map(rusternetes_common::tls::client_cert_verifier_for_ca_file)
-                .transpose()?,
+            request_header_ca,
+            client_ca,
         });
-        Ok(self)
+        self
     }
 }
 
@@ -141,14 +148,14 @@ where
                 Some(trust) => {
                     let connection = FrontProxyConnection {
                         config: trust.config.clone(),
-                        verified_by_request_header_ca: chain_verifies(
+                        verified_by_request_header_ca: provider_verifies(
                             trust.request_header_ca.as_ref(),
                             &chain,
                         ),
                         verified_by_client_ca: trust
                             .client_ca
                             .as_ref()
-                            .map(|v| chain_verifies(v.as_ref(), &chain)),
+                            .map(|v| provider_verifies(v.as_ref(), &chain)),
                         presented: Arc::new(chain),
                     };
                     (connection.x509_chain(), Some(connection))

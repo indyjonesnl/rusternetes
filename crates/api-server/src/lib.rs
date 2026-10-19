@@ -24,6 +24,7 @@ pub use rusternetes_middleware::cbor;
 pub mod apiserver_request_metrics;
 pub mod conversion;
 pub mod deprecation;
+pub mod dynamic_certificates;
 pub mod dynamic_routes;
 pub mod endpoints;
 pub mod flow_control;
@@ -497,28 +498,33 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
             request_header.as_ref(),
         );
         let client_cert_authn = !client_cas.is_empty();
-        let server_config = if client_cert_authn {
+        // `--client-ca-file` / `--requestheader-client-ca-file` are dynamic CA
+        // providers: edits to the files take effect without a restart (#3426).
+        let (mtls, plain_config) = if client_cert_authn {
             info!(
                 "Client certificate authentication enabled (CAs: {})",
                 client_cas.join(", ")
             );
-            tls_config.into_mtls_server_config_for_cas(&client_cas)?
-        } else {
-            tls_config.into_server_config()?
-        };
-        let rustls_config = RustlsConfig::from_config(server_config);
-        info!("HTTPS server listening on {}", config.bind_address);
-        let addr = config.bind_address.parse()?;
-        if client_cert_authn {
-            // mTLS: serve via PeerCertAcceptor so the verified client cert reaches
-            // handlers for x509 authn (CN→user / O→groups, #1129).
-            let mut server = axum_server::bind(addr).acceptor(
-                request_header_authentication::peer_cert_acceptor(
-                    rustls_config,
+            (
+                Some(request_header_authentication::mtls_acceptor(
+                    tls_config,
                     config.client_ca_file.as_deref(),
                     request_header.as_ref(),
-                )?,
-            );
+                )?),
+                None,
+            )
+        } else {
+            (
+                None,
+                Some(RustlsConfig::from_config(tls_config.into_server_config()?)),
+            )
+        };
+        info!("HTTPS server listening on {}", config.bind_address);
+        let addr = config.bind_address.parse()?;
+        if let Some((acceptor, _ca_reload)) = mtls {
+            // mTLS: serve via PeerCertAcceptor so the verified client cert reaches
+            // handlers for x509 authn (CN→user / O→groups, #1129).
+            let mut server = axum_server::bind(addr).acceptor(acceptor);
             server
                 .http_builder()
                 .http2()
@@ -527,7 +533,8 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
                 .max_concurrent_streams(250);
             server.serve(app.into_make_service()).await?;
         } else {
-            let mut server = axum_server::bind_rustls(addr, rustls_config);
+            let mut server =
+                axum_server::bind_rustls(addr, plain_config.expect("set when no client CA"));
             server
                 .http_builder()
                 .http2()
