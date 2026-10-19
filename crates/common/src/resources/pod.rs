@@ -1040,8 +1040,8 @@ pub struct VolumeMount {
 /// does not implement these plugins, but the API must still round-trip them
 /// losslessly and PodSecurity `restrictedVolumes` names the type of the
 /// offending source (`check_restrictedVolumes.go:108-153`). Most sources are
-/// kept as opaque JSON; only their presence is interpreted. `gcePersistentDisk`
-/// and `awsElasticBlockStore` are typed (the same core/v1 structs a PV uses)
+/// kept as opaque JSON; only their presence is interpreted. `gcePersistentDisk`,
+/// `awsElasticBlockStore` and `fc` are typed (the same core/v1 structs a PV uses)
 /// because csi-translation reads them (`TranslateInTreeInlineVolumeToCSI`,
 /// `staging/src/k8s.io/csi-translation-lib/translate.go:67-90`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1077,7 +1077,7 @@ pub struct LegacyVolumeSources {
     pub flocker: Option<serde_json::Value>,
 
     #[serde(rename = "fc", skip_serializing_if = "Option::is_none")]
-    pub fc: Option<serde_json::Value>,
+    pub fc: Option<crate::resources::volume::FCVolumeSource>,
 
     #[serde(rename = "azureFile", skip_serializing_if = "Option::is_none")]
     pub azure_file: Option<serde_json::Value>,

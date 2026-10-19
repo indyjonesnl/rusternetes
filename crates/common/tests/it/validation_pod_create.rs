@@ -1800,3 +1800,98 @@ fn legacy_volume_sources_count_toward_single_type() {
         "{e}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #3504: pod `volumes[].fc` is a typed FCVolumeSource validated by
+// validateFCVolumeSource (validation.go:928-948), reached from
+// validateVolumeSource (validation.go:685-691).
+// ---------------------------------------------------------------------------
+
+fn pod_with_fc(fc: serde_json::Value) -> Pod {
+    let mut spec = minimal_spec(vec![minimal_container("c", "img")]);
+    spec.volumes = Some(vec![serde_json::from_value(
+        serde_json::json!({"name": "v", "fc": fc}),
+    )
+    .unwrap()]);
+    pod_with_spec(spec)
+}
+
+fn fc_errs(fc: serde_json::Value) -> Vec<String> {
+    validate_pod_create(&pod_with_fc(fc), true)
+        .iter()
+        .map(|e| e.to_string())
+        .collect()
+}
+
+#[test]
+fn volume_fc_valid_forms_are_accepted() {
+    assert_eq!(
+        fc_errs(
+            serde_json::json!({"targetWWNs": ["500a0982991b8dc5"], "lun": 2, "fsType": "ext4"})
+        ),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        fc_errs(serde_json::json!({"wwids": ["3600508b400105e210000900000490000"]})),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn volume_fc_requires_targetwwns_or_wwids() {
+    let e = fc_errs(serde_json::json!({}));
+    assert!(
+        e.iter().any(|m| m.contains("spec.volumes[0].fc.targetWWNs: Required value: must specify either targetWWNs or wwids, but not both")),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn volume_fc_rejects_both_and_bad_lun() {
+    let e = fc_errs(serde_json::json!({"targetWWNs": ["a"], "wwids": ["b"], "lun": 1}));
+    assert!(
+        e.iter()
+            .any(|m| m.contains("targetWWNs and wwids can not be specified simultaneously")),
+        "{e:?}"
+    );
+    let e = fc_errs(serde_json::json!({"targetWWNs": ["a"]}));
+    assert!(
+        e.iter().any(|m| m.contains(
+            "spec.volumes[0].fc.lun: Required value: lun is required if targetWWNs is specified"
+        )),
+        "{e:?}"
+    );
+    let e = fc_errs(serde_json::json!({"targetWWNs": ["a"], "lun": 256}));
+    assert!(
+        e.iter().any(|m| m.contains(
+            "spec.volumes[0].fc.lun: Invalid value: 256: must be between 0 and 255, inclusive"
+        )),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn volume_fc_counts_toward_one_volume_type() {
+    let mut spec = minimal_spec(vec![minimal_container("c", "img")]);
+    spec.volumes = Some(vec![serde_json::from_value(serde_json::json!({
+        "name": "v", "emptyDir": {}, "fc": {"wwids": ["b"]}
+    }))
+    .unwrap()]);
+    let e = validate_pod_create(&pod_with_spec(spec), true);
+    assert!(
+        e.iter().any(|m| m
+            .to_string()
+            .contains("spec.volumes[0].fc: Forbidden: may not specify more than 1 volume type")),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn volume_fc_malformed_is_rejected_at_decode() {
+    assert!(
+        serde_json::from_value::<rusternetes_common::resources::pod::Volume>(
+            serde_json::json!({"name": "v", "fc": {"lun": "two"}})
+        )
+        .is_err()
+    );
+}
