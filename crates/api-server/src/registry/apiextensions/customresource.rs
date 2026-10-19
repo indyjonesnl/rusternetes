@@ -622,6 +622,36 @@ impl RestUpdateStrategy<CustomResource> for StatusStrategy {
 
 struct Noop;
 
+/// The root-`metadata` half of what the storage codec does to an object it
+/// reads: `unstructuredSchemaCoercer.apply` runs
+/// `GetObjectMetaWithOptions{DropMalformedFields: v.dropInvalidMetadata}` on
+/// the object and, when `metadata` was found, writes the decoded ObjectMeta
+/// back with `SetObjectMeta` (customresource_handler.go:1415-1421, 1464-1470),
+/// with `dropInvalidMetadata: true` for the storage codec (:1280-1283). A
+/// stored `metadata.labels: 3` therefore comes back dropped; the typed
+/// `ObjectMeta` would have failed the decode. Like upstream's, an error (here
+/// a `metadata` that is not an object) leaves the object to fail its decode.
+pub fn drop_invalid_root_metadata(value: &mut serde_json::Value) {
+    use rusternetes_common::validation::structural::objectmeta::{
+        get_object_meta_with_options, set_object_meta, ObjectMetaOptions,
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    let Ok(res) = get_object_meta_with_options(
+        obj,
+        &ObjectMetaOptions {
+            drop_malformed_fields: true,
+            ..Default::default()
+        },
+    ) else {
+        return;
+    };
+    if res.found {
+        set_object_meta(obj, res.meta);
+    }
+}
+
 #[async_trait]
 impl Finish for Noop {
     async fn finish(self: Box<Self>, _success: bool) {}
@@ -686,6 +716,7 @@ pub fn new_store(
         strategy.clone(),
     );
     store.storage_prefix = storage_prefix(&crd.spec.group, &crd.spec.names.plural);
+    store.decode_value = Some(drop_invalid_root_metadata);
     store.begin_update = Some(Arc::new(DecodeRepair {
         strategy: strategy.clone(),
     }));
@@ -930,8 +961,7 @@ impl RestStorage<CustomResource> for CustomResourceRest {
             .unwrap_or(0);
         crate::registry::generic::reject_compacted_continue(&*self.store.storage, list_options)
             .await?;
-        let mut items: Vec<CustomResource> =
-            rusternetes_storage::Storage::list(&*self.store.storage, &prefix).await?;
+        let mut items: Vec<CustomResource> = self.store.read_list(&prefix).await?;
         for item in &mut items {
             self.repair.repair(ctx, item);
             apply_schema_defaults(self.crd(), &self.strategy.version, item);

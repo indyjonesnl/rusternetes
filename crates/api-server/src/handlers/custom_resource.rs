@@ -288,8 +288,19 @@ pub async fn list_custom_resources(
     // ValidateListOptions + the resourceVersion floor (#2683).
     crate::handlers::list_options::prepare_list(&*state.storage, &params).await?;
 
-    let mut crs: Vec<CustomResource> =
-        crate::handlers::list_options::list_items(&*state.storage, &prefix, &params).await?;
+    // The storage codec drops a malformed root `metadata` field before the
+    // typed decode (#3468).
+    let mut crs: Vec<CustomResource> = crate::handlers::list_options::list_items::<
+        serde_json::Value,
+        _,
+    >(&*state.storage, &prefix, &params)
+    .await?
+    .into_iter()
+    .map(|mut value| {
+        crate::registry::apiextensions::customresource::drop_invalid_root_metadata(&mut value);
+        serde_json::from_value(value).map_err(rusternetes_common::Error::Serialization)
+    })
+    .collect::<rusternetes_common::Result<_>>()?;
 
     // Apply schema defaults on read (K8s "defaulting on read")
     let strategy = crate::registry::apiextensions::customresource::Strategy::new(
