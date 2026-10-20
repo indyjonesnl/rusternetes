@@ -486,6 +486,20 @@ fn compile_schema_rules(
             continue;
         }
         let rule_field = rule_path(i).child("rule");
+        // validation.go:1309-1312: `optionalOldSelf` on a rule that never
+        // uses `oldSelf` (`cr.UsesOldSelf`, approximated by
+        // `rule_references_old_self`; no typed checker here) is rejected.
+        // Upstream reports it after the rule/messageExpression errors; the
+        // order is not observable beyond the error list's order.
+        if !rule_references_old_self(rule) {
+            if let Some(v) = raw.get("optionalOldSelf").filter(|v| !v.is_null()) {
+                errs.push(FieldError::invalid(
+                    &rule_path(i).child("optionalOldSelf"),
+                    v.to_string(),
+                    "may not be set if oldSelf is not used in rule",
+                ));
+            }
+        }
         // compileRule (compilation.go:242-246), then the unknown-property
         // heuristic standing in for the schema-typed checker.
         let failure = compile_failure(rule, env_set, pre.rule_env(rule))

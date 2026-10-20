@@ -1890,6 +1890,35 @@ mod tests {
         );
     }
 
+    /// validation.go:1309-1312: `optionalOldSelf` without `oldSelf` in the
+    /// rule is `Invalid` at `x-kubernetes-validations[i].optionalOldSelf`.
+    #[test]
+    fn optional_old_self_requires_old_self_in_rule() {
+        let c = crd_with_schema(serde_json::json!({"type": "object",
+            "x-kubernetes-validations": [
+                {"rule": "self.size() >= 0", "optionalOldSelf": true},
+                {"rule": "self.size() >= 0", "optionalOldSelf": false},
+                {"rule": "oldSelf.hasValue() || self.size() >= 0", "optionalOldSelf": true},
+                {"rule": "self.size() >= 0"}]}));
+        let errs = schema_rule_errors_in(&c, None, &env_1_32());
+        assert_eq!(
+            fields(&errs),
+            vec![
+                (
+                    "Invalid".to_string(),
+                    format!("{P}.x-kubernetes-validations[0].optionalOldSelf")
+                ),
+                (
+                    "Invalid".to_string(),
+                    format!("{P}.x-kubernetes-validations[1].optionalOldSelf")
+                ),
+            ]
+        );
+        assert!(errs.iter().all(|e| e
+            .detail
+            .contains("may not be set if oldSelf is not used in rule")));
+    }
+
     /// `allOf`/`anyOf`/`oneOf`/`not`/`definitions`/`dependencies` recurse with
     /// a nil `celContext` (validation.go:1088-1141): their rules are NOT
     /// compiled upstream either.
