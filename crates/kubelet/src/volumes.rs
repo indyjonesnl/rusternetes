@@ -1390,18 +1390,18 @@ impl VolumeManager {
                 &pvc_source.claim_name,
             );
             let pvc: PersistentVolumeClaim = storage.get(&pvc_key).await.with_context(|| {
-                format!(
+                crate::lifecycle::VolumeWaitError(format!(
                     "PersistentVolumeClaim {} not found in namespace {}",
                     pvc_source.claim_name, namespace
-                )
+                ))
             })?;
 
             // Get the bound PV name
-            let pv_name = pvc
-                .spec
-                .volume_name
-                .as_ref()
-                .context("PersistentVolumeClaim is not bound to a volume")?;
+            let pv_name = pvc.spec.volume_name.as_ref().ok_or_else(|| {
+                crate::lifecycle::VolumeWaitError(
+                    "PersistentVolumeClaim is not bound to a volume".to_string(),
+                )
+            })?;
 
             // Get the PV
             let pv_key = build_key("persistentvolumes", None, pv_name);
@@ -1481,10 +1481,10 @@ impl VolumeManager {
                 // Now use the PVC like a regular PersistentVolumeClaim
                 let pvc: PersistentVolumeClaim =
                     storage.get(&pvc_key).await.with_context(|| {
-                        format!(
+                        crate::lifecycle::VolumeWaitError(format!(
                             "PersistentVolumeClaim {} not found in namespace {}",
                             pvc_name, namespace
-                        )
+                        ))
                     })?;
 
                 if let Some(pv_name) = &pvc.spec.volume_name {
@@ -1510,10 +1510,11 @@ impl VolumeManager {
                     // `is_volume_wait_error` treats it as a retriable wait
                     // (upstream: an ephemeral volume is handled "the same way
                     // as a PVC reference", `desired_state_of_world_populator.go:432-441`).
-                    return Err(anyhow::anyhow!(
+                    return Err(crate::lifecycle::VolumeWaitError(format!(
                         "PersistentVolumeClaim {} is not bound to a volume",
                         pvc_name
-                    ));
+                    ))
+                    .into());
                 }
             }
         }
@@ -3542,6 +3543,7 @@ mod pvc_resolution_tests {
             err.to_string(),
             "PersistentVolumeClaim missing not found in namespace ns"
         );
+        assert!(crate::lifecycle::is_volume_wait_anyhow(&err));
     }
 
     /// Preserved byte-for-byte: `lifecycle.rs::is_volume_wait_error` matches
@@ -3582,6 +3584,7 @@ mod pvc_resolution_tests {
             err.to_string(),
             "PersistentVolumeClaim is not bound to a volume"
         );
+        assert!(crate::lifecycle::is_volume_wait_anyhow(&err));
     }
 
     /// #1981: upstream handles a generic ephemeral volume "the same way as a
@@ -3612,7 +3615,7 @@ mod pvc_resolution_tests {
             err.to_string(),
             "PersistentVolumeClaim p-scratch is not bound to a volume"
         );
-        assert!(crate::lifecycle::is_volume_wait_error(&err.to_string()));
+        assert!(crate::lifecycle::is_volume_wait_anyhow(&err));
     }
 
     /// Ruling 3: `ephemeral` set but `volumeClaimTemplate` absent falls
@@ -3972,7 +3975,7 @@ mod dispatch_tests {
             err.to_string(),
             "failed to get Plugin from volumeSpec for volume \"rbd-vol\" err=no volume plugin matched"
         );
-        assert!(crate::lifecycle::is_volume_wait_error(&err.to_string()));
+        assert!(crate::lifecycle::is_volume_wait_anyhow(&err));
         assert!(!tmp.path().join("pods").exists(), "no fallback dir");
     }
 

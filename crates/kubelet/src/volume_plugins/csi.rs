@@ -1073,9 +1073,14 @@ impl Mounter for CsiMounter {
             // Treat the absence of the CSI driver as a transient error
             // (https://github.com/kubernetes/kubernetes/issues/120268).
             Err(e) => {
-                return Err(transient(format!(
-                    "kubernetes.io/csi: mounter.SetUpAt failed to get CSI client: {e}"
-                )))
+                {
+                    let msg =
+                        format!("kubernetes.io/csi: mounter.SetUpAt failed to get CSI client: {e}");
+                    // Typed wait marker (#3513) over the CsiError::Transient source.
+                    return Err(
+                        transient(msg.clone()).context(crate::lifecycle::VolumeWaitError(msg))
+                    );
+                }
             }
         };
 

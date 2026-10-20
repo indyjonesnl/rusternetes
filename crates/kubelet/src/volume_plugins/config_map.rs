@@ -206,12 +206,11 @@ impl Mounter for ConfigMapMounter {
             Err(e) => {
                 // Required ConfigMap not found — abort pod start so kubelet
                 // retries on next reconciliation (when the ConfigMap exists).
-                return Err(anyhow::anyhow!(
+                return Err(crate::lifecycle::VolumeWaitError(format!(
                     "ConfigMap {} not found in namespace {}: {}",
-                    configmap_name,
-                    self.namespace,
-                    e
-                ));
+                    configmap_name, self.namespace, e
+                ))
+                .into());
             }
         };
 

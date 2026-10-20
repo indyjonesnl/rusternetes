@@ -223,12 +223,11 @@ impl Mounter for SecretMounter {
                     // retries on next sync. K8s leaves the pod in Pending with
                     // ContainerCreating and retries until the secret exists.
                     // K8s ref: pkg/kubelet/kubelet_pods.go — makeVolumes
-                    return Err(anyhow::anyhow!(
+                    return Err(crate::lifecycle::VolumeWaitError(format!(
                         "Secret {} not found in namespace {}: {}",
-                        secret_name,
-                        self.namespace,
-                        e
-                    ));
+                        secret_name, self.namespace, e
+                    ))
+                    .into());
                 }
             }
         };
