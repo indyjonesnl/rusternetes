@@ -10,6 +10,8 @@ pub mod eviction;
 pub mod go_selinux;
 pub mod go_selinux_label;
 pub mod host_port;
+pub mod image_gc;
+pub mod image_gc_cri;
 pub mod kubelet;
 pub mod labels;
 pub mod lifecycle;
@@ -182,7 +184,13 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
             external_cloud_provider,
         )
         .await?
-        .with_hostname(&hostname),
+        .with_hostname(&hostname)
+        // Upstream defaults (imageGC{High,Low}ThresholdPercent 85/80,
+        // imageMinimumGCAge 2m, imageMaximumGCAge 0); the all-in-one binary
+        // takes no KubeletConfiguration file.
+        .with_image_gc_policy(image_gc::ImageGcPolicy::from_config(
+            &config::KubeletConfiguration::default(),
+        )),
     );
 
     k.register_pod_certificate_metrics(&metrics.registry);

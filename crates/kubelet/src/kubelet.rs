@@ -479,6 +479,10 @@ pub struct Kubelet {
     /// often an UNCHANGED node status is still written. Upstream
     /// `Kubelet.nodeStatusReportFrequency` (pkg/kubelet/kubelet.go:624).
     node_status_report_frequency: Duration,
+    /// `ImageGCPolicy` built from `imageMinimumGCAge`, `imageMaximumGCAge` and
+    /// `imageGC{High,Low}ThresholdPercent` (kubelet.go:509-515). `None` keeps
+    /// image GC off (tests / callers that do not configure it).
+    image_gc_policy: Option<crate::image_gc::ImageGcPolicy>,
     /// `lastStatusReportTime` + `delayAfterNodeStatusChange`
     /// (pkg/kubelet/kubelet.go:1374, :1370).
     status_report_state: Mutex<StatusReportState>,
@@ -854,6 +858,7 @@ impl Kubelet {
             node_status_update_frequency: Duration::from_secs(10),
             file_check_frequency: Duration::from_secs(20),
             node_status_report_frequency: Duration::from_secs(300),
+            image_gc_policy: None,
             status_report_state: Mutex::new(StatusReportState::default()),
             static_pods: Arc::new(Mutex::new(HashMap::new())),
             sysctl_allowlist: crate::sysctl::Allowlist::new(&allowed_unsafe_sysctls),
@@ -942,6 +947,13 @@ impl Kubelet {
             self.crash_loop_backoff_max = m;
             self.crash_loop_backoff_initial = i;
         }
+        self
+    }
+
+    /// Enable image garbage collection with the policy `NewMainKubelet` builds
+    /// from the KubeletConfiguration (kubelet.go:509-515).
+    pub fn with_image_gc_policy(mut self, policy: crate::image_gc::ImageGcPolicy) -> Self {
+        self.image_gc_policy = Some(policy);
         self
     }
 
@@ -1148,6 +1160,29 @@ impl Kubelet {
                     gc_self.container_gc().await;
                 }
             });
+        }
+
+        // Image GC: `NewImageGCManager` (kubelet.go:897), `imageManager.Start`
+        // (kubelet.go:1709) and the image half of `StartGarbageCollection`.
+        if let Some(policy) = self.image_gc_policy.clone() {
+            let cri = self.runtime.cri_client();
+            match crate::image_gc::ImageGcManager::new(
+                Arc::new(crate::image_gc_cri::CriImageGcRuntime::new(cri.clone())),
+                Arc::new(crate::image_gc_cri::CriStatsProvider::new(cri)),
+                Vec::new(),
+                Arc::new(crate::image_gc_cri::NodeEvents::new(
+                    rusternetes_storage::EventRecorder::new(self.storage.clone()),
+                    &self.node_name,
+                )),
+                policy,
+            ) {
+                Ok(manager) => {
+                    let manager = Arc::new(manager);
+                    tokio::spawn(manager.clone().run_detect_loop());
+                    tokio::spawn(manager.run_gc_loop());
+                }
+                Err(err) => anyhow::bail!("failed to initialize image manager: {err}"),
+            }
         }
 
         // Channel for watch events to trigger immediate pod syncs

@@ -31,6 +31,9 @@ mod go_selinux;
 mod go_selinux_label;
 mod host_port;
 #[allow(dead_code)]
+mod image_gc;
+mod image_gc_cri;
+#[allow(dead_code)]
 mod kubelet;
 #[allow(dead_code)]
 mod labels;
@@ -426,6 +429,12 @@ async fn main() -> Result<()> {
     // runtimeRequestTimeout from the config file (None => upstream default 2m).
     let runtime_request_timeout = config_file.as_ref().and_then(|c| c.runtime_request_timeout);
 
+    // ImageGCPolicy (kubelet.go:509-515); unset fields take the v1beta1 defaults.
+    let image_gc_policy = {
+        let c = config_file.clone().unwrap_or_default();
+        image_gc::ImageGcPolicy::from_config(&c)
+    };
+
     // crashLoopBackOff.maxContainerRestartPeriod (None => 300s default).
     let crash_loop_backoff_max = config_file
         .as_ref()
@@ -647,7 +656,8 @@ async fn main() -> Result<()> {
         .with_file_check_frequency(file_check_frequency)
         .with_node_status_report_frequency(node_status_report_frequency)
         .with_runtime_request_timeout(runtime_request_timeout)
-        .with_crash_loop_backoff_max(crash_loop_backoff_max),
+        .with_crash_loop_backoff_max(crash_loop_backoff_max)
+        .with_image_gc_policy(image_gc_policy),
     );
 
     kubelet.register_pod_certificate_metrics(&plugin_metrics.registry);
