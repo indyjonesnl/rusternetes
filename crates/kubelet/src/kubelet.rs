@@ -480,6 +480,16 @@ pub struct Kubelet {
     /// `sourceFile.run` re-lists on `time.NewTicker(s.period)`
     /// (pkg/kubelet/config/file.go:93-104).
     file_check_frequency: Duration,
+    /// `KubeletConfiguration.httpCheckFrequency`: period of the manifest-URL
+    /// source (`config.NewSourceURL(..., kubeCfg.HTTPCheckFrequency.Duration,
+    /// ...)`, pkg/kubelet/kubelet.go:390; `wait.Until` in http.go:60).
+    http_check_frequency: Duration,
+    /// `staticPodURL` source; `None` = not configured (kubelet.go:388).
+    static_pod_url_source: Option<Arc<crate::static_pod_url::UrlSource>>,
+    /// Last SET update of each static pod source (PodConfig keeps one pod set
+    /// per source and merges them, pkg/kubelet/config/config.go).
+    file_static_pods: Mutex<Vec<Pod>>,
+    http_static_pods: Mutex<Vec<Pod>>,
     /// `KubeletConfiguration.nodeStatusReportFrequency` (default 5m): how
     /// often an UNCHANGED node status is still written. Upstream
     /// `Kubelet.nodeStatusReportFrequency` (pkg/kubelet/kubelet.go:624).
@@ -866,6 +876,10 @@ impl Kubelet {
             pod_manifest_path: None,
             node_status_update_frequency: Duration::from_secs(10),
             file_check_frequency: Duration::from_secs(20),
+            http_check_frequency: Duration::from_secs(20),
+            static_pod_url_source: None,
+            file_static_pods: Mutex::new(Vec::new()),
+            http_static_pods: Mutex::new(Vec::new()),
             node_status_report_frequency: Duration::from_secs(300),
             image_gc_policy: None,
             node_status_max_images: 50,
@@ -922,6 +936,39 @@ impl Kubelet {
         self
     }
 
+    /// Apply `KubeletConfiguration.httpCheckFrequency` (20s when unset/zero,
+    /// v1beta1/defaults.go).
+    pub fn with_http_check_frequency(mut self, d: Option<Duration>) -> Self {
+        self.http_check_frequency = d
+            .filter(|d| !d.is_zero())
+            .unwrap_or(Duration::from_secs(20));
+        self
+    }
+
+    /// Add the manifest-URL source (`staticPodURL` + `staticPodURLHeader`,
+    /// pkg/kubelet/kubelet.go:366-391). Empty URL = none, as upstream's
+    /// `kubeCfg.StaticPodURL != ""`.
+    pub fn with_static_pod_url(
+        mut self,
+        url: Option<&str>,
+        header: &std::collections::BTreeMap<String, Vec<String>>,
+    ) -> Result<Self> {
+        if let Some(url) = url.filter(|u| !u.is_empty()) {
+            info!(url, "Adding pod URL with HTTP header");
+            self.static_pod_url_source = Some(Arc::new(crate::static_pod_url::UrlSource::new(
+                url,
+                header,
+                &self.node_name,
+            )?));
+        }
+        Ok(self)
+    }
+
+    /// Period of the manifest-URL source poll in `run`.
+    pub(crate) fn static_pod_url_poll_interval(&self) -> Duration {
+        self.http_check_frequency
+    }
+
     /// Period of the static-pod file source poll in `run`.
     pub(crate) fn static_pod_poll_interval(&self) -> Duration {
         self.file_check_frequency
@@ -936,6 +983,29 @@ impl Kubelet {
             return;
         };
         let pods = crate::static_pods::load_static_pods(dir, &self.node_name);
+        *self.file_static_pods.lock().unwrap() = pods;
+        self.publish_static_pods().await;
+    }
+
+    /// One pass of the URL source (`sourceURL.run`, pkg/kubelet/config/http.go:63):
+    /// a SET update replaces this source's pods; a failed fetch keeps the
+    /// previous set. Returns whether a source is configured.
+    pub(crate) async fn poll_static_pod_url(&self) -> bool {
+        let Some(src) = &self.static_pod_url_source else {
+            return false;
+        };
+        if let Some(pods) = src.run().await {
+            *self.http_static_pods.lock().unwrap() = pods;
+            self.publish_static_pods().await;
+        }
+        true
+    }
+
+    /// Merge the per-source pod sets, project mirror pods and publish the
+    /// result to the cache `sync_loop` consumes.
+    async fn publish_static_pods(&self) {
+        let mut pods: Vec<Pod> = self.file_static_pods.lock().unwrap().clone();
+        pods.extend(self.http_static_pods.lock().unwrap().iter().cloned());
         if let Err(e) =
             crate::static_pods::reconcile_mirror_pods(self.storage.as_ref(), &self.node_name, &pods)
                 .await
@@ -1294,6 +1364,9 @@ impl Kubelet {
         // immediately to speed up startup", file.go:96), then every
         // fileCheckFrequency.
         let mut static_pod_timer = tokio::time::interval(self.static_pod_poll_interval());
+        // URL source poll (`wait.Until(run, httpCheckFrequency)`, http.go:60):
+        // first pass immediately, then every httpCheckFrequency.
+        let mut static_pod_url_timer = tokio::time::interval(self.static_pod_url_poll_interval());
         // File source watch (`startWatch`, file.go:116): inotify events on the
         // manifest dir trigger an immediate pass; the timer above stays as the
         // resync / fallback.
@@ -1511,6 +1584,14 @@ impl Kubelet {
                 _ = static_pod_timer.tick() => {
                     self.poll_static_pods().await;
                     if self.pod_manifest_path.is_some() {
+                        if let Err(e) = self.sync_loop().await {
+                            error!("Error in static pod sync: {}", e);
+                        }
+                    }
+                }
+                // Static pod URL source (NewSourceURL, kubelet.go:390)
+                _ = static_pod_url_timer.tick(), if self.static_pod_url_source.is_some() => {
+                    if self.poll_static_pod_url().await {
                         if let Err(e) = self.sync_loop().await {
                             error!("Error in static pod sync: {}", e);
                         }
@@ -6920,6 +7001,81 @@ mod tests {
         assert!(k.static_pods.lock().unwrap().is_empty(), "no poll yet");
         k.poll_static_pods().await;
         assert_eq!(k.static_pods.lock().unwrap().len(), 1);
+    }
+
+    /// `httpCheckFrequency` drives the manifest-URL source poll (kubelet.go:390
+    /// -> http.go:60) and a poll publishes the URL's pods to the cache
+    /// `sync_loop` reads, alongside file-sourced pods.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn http_check_frequency_drives_static_pod_url_poll() {
+        use rusternetes_storage::StorageBackend;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("absent.sock");
+        std::env::set_var(
+            "CONTAINER_RUNTIME_ENDPOINT",
+            format!("unix://{}", sock.display()),
+        );
+        let manifests = dir.path().join("manifests");
+        std::fs::create_dir_all(&manifests).unwrap();
+        std::fs::write(
+            manifests.join("web.yaml"),
+            "apiVersion: v1\nkind: Pod\nmetadata:\n  name: web\nspec:\n  containers:\n  - name: c\n    image: busybox\n",
+        )
+        .unwrap();
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/pod", l.local_addr().unwrap());
+        tokio::spawn(async move {
+            let body = "apiVersion: v1\nkind: Pod\nmetadata:\n  name: remote\nspec:\n  containers:\n  - name: c\n    image: busybox\n";
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = s.read(&mut buf).await;
+            let _ = s
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        });
+        let mk = || async {
+            Kubelet::new(
+                "node-hc".into(),
+                std::sync::Arc::new(StorageBackend::new_memory()),
+                10,
+                dir.path().join("vols").display().to_string(),
+                "10.96.0.10".into(),
+                "cluster.local".into(),
+                "bridge".into(),
+                String::new(),
+            )
+            .await
+            .unwrap()
+        };
+        let d = mk().await;
+        assert_eq!(d.static_pod_url_poll_interval(), Duration::from_secs(20));
+        assert!(!d.poll_static_pod_url().await, "no staticPodURL, no source");
+        let z = mk().await.with_http_check_frequency(Some(Duration::ZERO));
+        assert_eq!(z.static_pod_url_poll_interval(), Duration::from_secs(20));
+        let k = mk()
+            .await
+            .with_pod_manifest_path(Some(manifests))
+            .with_http_check_frequency(Some(Duration::from_secs(7)))
+            .with_static_pod_url(Some(&url), &Default::default())
+            .unwrap();
+        assert_eq!(k.static_pod_url_poll_interval(), Duration::from_secs(7));
+        k.poll_static_pods().await;
+        assert!(k.poll_static_pod_url().await);
+        let names: std::collections::BTreeSet<String> =
+            k.static_pods.lock().unwrap().keys().cloned().collect();
+        assert_eq!(
+            names,
+            ["remote-node-hc".to_string(), "web-node-hc".to_string()].into()
+        );
     }
 
     /// `runtimeRequestTimeout` reaches the CRI client (upstream passes
