@@ -15,13 +15,14 @@
 //! estimator, so cel-go's checker cannot be called. This module ports the two
 //! pieces over the crate's parsed AST:
 //!
-//! * a type pass for the part of the checker that needs no function
-//!   declarations: the type of `device` and its fields, container element
-//!   types, comparison / logical operators and macro iteration variables,
-//!   reporting `_[_]` applied to a key of the wrong type, an undefined field of
-//!   `device`, and an output type that is neither `bool` nor `any`. Anything it
-//!   cannot type (a call to a library function) is `dyn`, which type-checks,
-//!   so it never rejects what upstream accepts;
+//! * a type pass over the checker: the type of `device` and its fields,
+//!   container element types, macro iteration variables, an undeclared
+//!   reference or function, `_[_]` applied to a key of the wrong type, an
+//!   undefined field of `device`, a call that no overload of
+//!   `cel_dra_decls` accepts (`found no matching overload`), and an output
+//!   type that is neither `bool` nor `any`. The result type of a call is
+//!   still the pass's own (`dyn` when it cannot tell), which type-checks, so
+//!   a call result never causes a rejection upstream would not make;
 //! * `checker.Cost` (`vendor/github.com/google/cel-go/checker/cost.go`,
 //!   `coster`) with the DRA `sizeEstimator` (`compile.go:417-475`) and the
 //!   Kubernetes libraries' `CostEstimator.EstimateCallCost`
@@ -33,6 +34,8 @@
 use std::collections::HashMap;
 
 use cel::common::ast::{operators, EntryExpr, Expr, IdedExpr, LiteralValue};
+
+use crate::cel_dra_decls::{self, DType};
 
 /// `resourceapi.CELSelectorExpressionMaxCost` (`staging/src/k8s.io/api/resource/v1/types.go:1245`).
 pub const CEL_SELECTOR_EXPRESSION_MAX_COST: u64 = 1_000_000;
@@ -95,7 +98,7 @@ pub fn compile_selector(expression: &str) -> SelectorCompilation {
     let mut checker = Checker::new(expression);
     let mut scope: Vec<(String, Ty)> = Vec::new();
     let out = checker.infer(&root, &mut scope);
-    if let Some(msg) = checker.error.take() {
+    if let Some(msg) = checker.errors_display() {
         return SelectorCompilation::Invalid(format!("compilation failed: {msg}"));
     }
     if !matches!(out, Ty::Bool | Ty::Any | Ty::Dyn) && out.fully_known() {
@@ -176,6 +179,27 @@ impl Ty {
 
     fn is_scalar(&self) -> bool {
         matches!(self, Ty::Bool | Ty::Int | Ty::Uint | Ty::Double)
+    }
+
+    /// The declaration-side type (`cel_dra_decls`) of this type.
+    fn to_dtype(&self) -> DType {
+        match self {
+            Ty::Bool => DType::Bool,
+            Ty::Int => DType::Int,
+            Ty::Uint => DType::Uint,
+            Ty::Double => DType::Double,
+            Ty::Str => DType::Str,
+            Ty::Bytes => DType::Bytes,
+            Ty::Null => DType::Null,
+            Ty::Dyn => DType::Dyn,
+            Ty::Any => DType::Any,
+            Ty::Quantity => DType::Struct("apiserver.cel.Quantity".into()),
+            Ty::Lib(n @ ("net.IP" | "net.CIDR")) => DType::Opaque((*n).into(), vec![]),
+            Ty::Lib(n) => DType::Struct((*n).into()),
+            Ty::Device => DType::Struct("kubernetes.DRADevice".into()),
+            Ty::List(t) => DType::List(Box::new(t.to_dtype())),
+            Ty::Map(k, v) => DType::Map(Box::new(k.to_dtype()), Box::new(v.to_dtype())),
+        }
     }
 }
 
@@ -685,21 +709,25 @@ struct Checker<'a> {
     /// False while visiting the synthesized parts of a macro expansion, which
     /// hold none of the source's operators.
     counting: bool,
-    error: Option<String>,
+    /// `(line, column, rendered)` of every reported error, `common.Errors`.
+    errors: Vec<(usize, usize, String)>,
     types: HashMap<u64, Ty>,
+    /// Token offsets of every expression ID, see [`source_info_for`].
+    source_info: Option<std::sync::Arc<cel::common::ast::SourceInfo>>,
 }
 
 impl<'a> Checker<'a> {
     fn new(source: &'a str) -> Self {
         let (brackets, dots) = operator_offsets(source);
         Self {
+            source_info: source_info_for(source),
             source,
             brackets,
             dots,
             next_bracket: 0,
             next_dot: 0,
             counting: true,
-            error: None,
+            errors: Vec::new(),
             types: HashMap::new(),
         }
     }
@@ -725,9 +753,6 @@ impl<'a> Checker<'a> {
     /// cel-go's `common.Errors` rendering: `ERROR: <input>:L:C: msg`, the
     /// source line and a caret under the column.
     fn report(&mut self, offset: Option<usize>, msg: String) {
-        if self.error.is_some() {
-            return;
-        }
         let offset = offset.unwrap_or(0);
         let (mut line, mut col) = (1usize, 1usize);
         for (i, c) in self.source.chars().enumerate() {
@@ -742,10 +767,30 @@ impl<'a> Checker<'a> {
             }
         }
         let text = self.source.lines().nth(line - 1).unwrap_or("");
-        self.error = Some(format!(
-            "ERROR: <input>:{line}:{col}: {msg}\n | {text}\n | {}^",
-            ".".repeat(col - 1)
+        self.errors.push((
+            line,
+            col,
+            format!(
+                "ERROR: <input>:{line}:{col}: {msg}\n | {text}\n | {}^",
+                ".".repeat(col - 1)
+            ),
         ));
+    }
+
+    /// `common.Errors.ToDisplayString` (common/errors.go:84-112): the errors
+    /// stably sorted by position, newline delimited.
+    fn errors_display(&mut self) -> Option<String> {
+        if self.errors.is_empty() {
+            return None;
+        }
+        self.errors.sort_by_key(|(line, col, _)| (*line, *col));
+        Some(
+            self.errors
+                .iter()
+                .map(|(_, _, text)| text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
     }
 
     fn infer(&mut self, e: &IdedExpr, scope: &mut Vec<(String, Ty)>) -> Ty {
@@ -853,7 +898,7 @@ impl<'a> Checker<'a> {
                     );
                     Ty::Dyn
                 }
-                None => self.infer_call(c, scope),
+                None => self.infer_call(e.id, c, scope),
             },
             Expr::Comprehension(c) => {
                 let range = self.infer(&c.iter_range, scope);
@@ -889,7 +934,12 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn infer_call(&mut self, c: &cel::common::ast::CallExpr, scope: &mut Vec<(String, Ty)>) -> Ty {
+    fn infer_call(
+        &mut self,
+        id: u64,
+        c: &cel::common::ast::CallExpr,
+        scope: &mut Vec<(String, Ty)>,
+    ) -> Ty {
         let name = c.func_name.as_str();
         if (name == operators::INDEX || name == operators::OPT_INDEX) && c.args.len() == 2 {
             let container = self.infer(&c.args[0], scope);
@@ -918,19 +968,30 @@ impl<'a> Checker<'a> {
             return result;
         }
 
-        // A bare identifier receiver may name a function namespace
-        // (`math.greatest`, `base64.encode`): checker.go:230-282 resolves the
-        // qualified function name before the receiver, which needs the
-        // function declarations this pass does not have, so it is not
-        // reported as undeclared.
-        let target = c.target.as_ref().map(|t| match &t.expr {
-            Expr::Ident(n) if !scope.iter().any(|(s, _)| s == n) && n != "device" => Ty::Dyn,
-            _ => self.infer(t, scope),
-        });
+        // checker.go:249-262: a receiver that is a qualified name may be the
+        // namespace of a declared function (`sets.contains`, `strings.quote`),
+        // in which case the call is a plain call of that function and the
+        // receiver is not an expression to check. Only a bare identifier can
+        // be one here (no declared namespace is dotted).
+        let namespaced = match c.target.as_ref().map(|t| &t.expr) {
+            Some(Expr::Ident(n))
+                if !scope.iter().any(|(s, _)| s == n)
+                    && n != "device"
+                    && cel_dra_decls::lookup(&format!("{n}.{name}")).is_some() =>
+            {
+                Some(format!("{n}.{name}"))
+            }
+            _ => None,
+        };
+        let target = match (&c.target, &namespaced) {
+            (Some(t), None) => Some(self.infer(t, scope)),
+            _ => None,
+        };
         if c.target.is_some() {
             self.take_dot();
         }
         let args: Vec<Ty> = c.args.iter().map(|a| self.infer(a, scope)).collect();
+        self.check_call(id, c, namespaced.as_deref(), target.as_ref(), &args);
 
         match name {
             operators::LOGICAL_AND
@@ -997,6 +1058,98 @@ impl<'a> Checker<'a> {
             }
             _ => Ty::Dyn,
         }
+    }
+}
+
+impl Checker<'_> {
+    /// The character offset of the token of expression `id`
+    /// (`common.Source.OffsetLocation(sourceInfo.GetStartOffset(id))`).
+    fn id_offset(&self, id: u64) -> Option<usize> {
+        let (start, _) = self.source_info.as_ref()?.offset_for(id)?;
+        // The parser counts bytes; every other offset here counts characters.
+        let bytes = self.source.as_bytes();
+        let start = (start as usize).min(bytes.len());
+        Some(String::from_utf8_lossy(&bytes[..start]).chars().count())
+    }
+
+    /// `checker.checkCall` (checker.go:217-290) past the argument traversal:
+    /// the function must be declared and one of its overloads must accept the
+    /// argument types. `qualified` is the resolved name of a namespaced
+    /// function, in which case there is no receiver.
+    fn check_call(
+        &mut self,
+        id: u64,
+        c: &cel::common::ast::CallExpr,
+        qualified: Option<&str>,
+        target: Option<&Ty>,
+        args: &[Ty],
+    ) {
+        let name = qualified.unwrap_or(c.func_name.as_str());
+        if cel_dra_decls::is_macro(name)
+            || (name.starts_with('@')
+                && name != operators::IN
+                && name != operators::NOT_STRICTLY_FALSE)
+        {
+            return;
+        }
+        let at = self.id_offset(id);
+        let Some(decls) = cel_dra_decls::lookup(name) else {
+            // checker.go:228-232 / 288-290.
+            self.report(
+                at,
+                format!("undeclared reference to '{name}' (in container '')"),
+            );
+            return;
+        };
+        let mut arg_types: Vec<DType> = Vec::new();
+        if let Some(t) = target {
+            arg_types.push(t.to_dtype());
+        }
+        arg_types.extend(args.iter().map(Ty::to_dtype));
+
+        // checker.go:309-322: `&&` / `||` check each argument against bool
+        // (the AST form is variadic upstream; binary here).
+        if name == operators::LOGICAL_AND || name == operators::LOGICAL_OR {
+            for (i, a) in arg_types.iter().enumerate() {
+                if !cel_dra_decls::is_assignable(a, &DType::Bool) {
+                    let arg_at = c.args.get(i).and_then(|x| self.id_offset(x.id));
+                    self.report(
+                        arg_at,
+                        format!("expected type 'bool' but found '{}'", a.name()),
+                    );
+                    return;
+                }
+            }
+            return;
+        }
+
+        let member = target.is_some();
+        if let cel_dra_decls::Resolution::NoMatch(shown) =
+            cel_dra_decls::resolve(decls, member, &arg_types)
+        {
+            self.report(
+                at,
+                format!(
+                    "found no matching overload for '{}' applied to '{}'",
+                    name,
+                    cel_dra_decls::format_signature(&shown, member)
+                ),
+            );
+        }
+    }
+}
+
+/// The parser keeps the offset of every expression ID in its `SourceInfo`
+/// but drops it when the parse succeeds, so the expression is parsed once
+/// more with a trailing `)` that makes the parse fail: the identifiers the
+/// parser hands out are the same, and the error carries the `SourceInfo`.
+fn source_info_for(source: &str) -> Option<std::sync::Arc<cel::common::ast::SourceInfo>> {
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cel::parser::Parser::new().parse(&format!("{source}\n)"))
+    }));
+    match r {
+        Ok(Err(e)) => e.errors.first()?.source_info.clone(),
+        _ => None,
     }
 }
 
@@ -2168,5 +2321,128 @@ mod tests {
     #[test]
     fn quantity_equality_is_constant_cost() {
         assert_eq!(cost("quantity('1') == quantity('2')"), 3);
+    }
+
+    /// `checker.go:261-348` `resolveOverload`: every declared library
+    /// function of the base environment accepts its documented arguments.
+    #[test]
+    fn declared_library_calls_are_accepted() {
+        for x in [
+            r#"device.driver.startsWith("a") && device.attributes["d"].x.isGreaterThan(semver("1.0.0"))"#,
+            r#"device.capacity["d"].memory.compareTo(quantity("1Gi")) >= 0"#,
+            r#"sets.contains([1], [1]) && sets.intersects(["a"], ["a"])"#,
+            r#"strings.quote("a") == "\"a\"""#,
+            "lists.range(3).size() == 3",
+            r#"format.named("dns1123Label").hasValue()"#,
+            r#"format.dns1123Label().validate("a").hasValue()"#,
+            r#""%d".format([1]) == "1""#,
+            "[1, 2, 3].sum() == 6",
+            "[1, 2, 3].map(x, x + 1).size() == 3",
+            r#"ip("1.2.3.4").family() == 4 && cidr("10.0.0.0/8").containsIP("10.1.1.1")"#,
+            r#"string(ip("1.2.3.4")) == "x" && isIP("1.2.3.4") && ip.isCanonical("1.2.3.4")"#,
+            "size(device.driver) > 0 && device.driver.size() == 1",
+            r#"duration("1h") + timestamp("2020-01-01T00:00:00Z") > timestamp("2021-01-01T00:00:00Z")"#,
+            "1 < 2.0 && 1u < 2 && 2.5 >= 1u",
+            r#""a" in ["a"] && 1 in {1: "a"}"#,
+            r#"device.driver.matches("a") && matches(device.driver, "a")"#,
+            r#"device.driver.split(",").join("-") == "a""#,
+            r#"device.driver.indexOf("a") == 0 && [1, 2].indexOf(2) == 1"#,
+            r#"device.driver.find("a") == "a" && device.driver.findAll("a").size() == 1"#,
+            r#"device.driver.replace("a", "b", 1).substring(1, 2).trim().lowerAscii().upperAscii().charAt(0) == "a""#,
+            r#"optional.of(1).hasValue() && optional.none().orValue(2) == 2"#,
+            r#"[1, 2].first().hasValue() && ["a"].last().value() == "a""#,
+            r#"cel.bind(a, device.attributes["d"], a.x == 1)"#,
+            r#"device.driver == "a" ? true : false"#,
+            r#"isSemver("v1.0.0", true) && semver("1.2.3").major() == 1"#,
+            r#"[1, 2].exists(x, x > 1) && [1, 2].all(x, x > 0) && [1, 2].filter(x, x > 1).size() == 1"#,
+            r#"!(device.allowMultipleAllocations) && -1 < 0 && 5 % 3 == 2 && 6 / 3 == 2 && 2 * 3 == 6 && 3 - 1 == 2"#,
+            r#"[[1], [2]].flatten().size() == 2 && [2, 1].sort() == [1, 2] && [1, 1].distinct() == [1] && [1, 2].reverse() == [2, 1] && [1, 2].slice(0, 1) == [1]"#,
+            r#"url("http://a").getHost() == "a" && isURL("http://a")"#,
+            r#"bytes("a") + b"b" == b"ab" && double(1) > 0.5 && int("1") == 1 && uint(1) == 1u && bool("true")"#,
+        ] {
+            assert_eq!(invalid(x), None, "{x}");
+        }
+    }
+
+    #[test]
+    fn no_matching_overload_for_an_operator() {
+        assert_eq!(
+            invalid(r#"1 + "x" == 2"#).unwrap(),
+            "compilation failed: ERROR: <input>:1:3: found no matching overload for '_+_' applied to '(int, string)'\n | 1 + \"x\" == 2\n | ..^"
+        );
+        assert_eq!(
+            invalid(r#"device.driver == 1"#).unwrap(),
+            "compilation failed: ERROR: <input>:1:15: found no matching overload for '_==_' applied to '(string, int)'\n | device.driver == 1\n | ..............^"
+        );
+        // A type parameter binds once: `int == double` has no overload.
+        assert!(invalid("1 == 1.0")
+            .unwrap()
+            .contains("'_==_' applied to '(int, double)'"));
+    }
+
+    #[test]
+    fn no_matching_overload_for_a_member_call() {
+        assert_eq!(
+            invalid("device.driver.startsWith(1)").unwrap(),
+            "compilation failed: ERROR: <input>:1:25: found no matching overload for 'startsWith' applied to 'string.(int)'\n | device.driver.startsWith(1)\n | ........................^"
+        );
+        // checker.go:309-322: the receiver style must match the overload.
+        assert!(invalid(r#"startsWith(device.driver, "a")"#)
+            .unwrap()
+            .contains("'startsWith' applied to '(string, string)'"));
+    }
+
+    #[test]
+    fn no_matching_overload_for_a_global_call() {
+        assert_eq!(
+            invalid("size(1) == 1").unwrap(),
+            "compilation failed: ERROR: <input>:1:5: found no matching overload for 'size' applied to '(int)'\n | size(1) == 1\n | ....^"
+        );
+    }
+
+    /// checker.go:309-322.
+    #[test]
+    fn logical_operators_need_bool_arguments() {
+        assert_eq!(
+            invalid("device.driver && true").unwrap(),
+            "compilation failed: ERROR: <input>:1:7: expected type 'bool' but found 'string'\n | device.driver && true\n | ......^"
+        );
+    }
+
+    /// checker.go:249-290: an unknown namespace is reported as the
+    /// undeclared receiver and the undeclared function, as upstream does for
+    /// `math` and `base64`, which the base environment does not declare.
+    #[test]
+    fn undeclared_namespaced_function_reports_receiver_and_function() {
+        assert_eq!(
+            invalid("math.greatest(1, 2) > 0").unwrap(),
+            "compilation failed: ERROR: <input>:1:1: undeclared reference to 'math' (in container '')\n | math.greatest(1, 2) > 0\n | ^\nERROR: <input>:1:14: undeclared reference to 'greatest' (in container '')\n | math.greatest(1, 2) > 0\n | .............^"
+        );
+        assert!(invalid(r#"base64.encode(b"a") == "a""#)
+            .unwrap()
+            .contains("undeclared reference to 'base64'"));
+    }
+
+    #[test]
+    fn undeclared_member_function_is_reported() {
+        assert_eq!(
+            invalid("device.driver.nope()").unwrap(),
+            "compilation failed: ERROR: <input>:1:19: undeclared reference to 'nope' (in container '')\n | device.driver.nope()\n | ..................^"
+        );
+    }
+
+    #[test]
+    fn conditional_branches_must_agree() {
+        assert!(invalid(r#"true ? 1 : "a""#)
+            .unwrap()
+            .contains("'_?_:_' applied to '(bool, int, string)'"));
+    }
+
+    /// Expression offsets come from the parser's own `SourceInfo`, also for
+    /// non-ASCII source.
+    #[test]
+    fn error_offsets_count_characters() {
+        let d = invalid(r#""é" + 1 == 2"#).unwrap();
+        assert!(d.contains("<input>:1:5:"), "{d}");
     }
 }

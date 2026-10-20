@@ -10,6 +10,7 @@ pub mod cel_authz;
 pub mod cel_authz_library;
 pub mod cel_cost;
 pub mod cel_dra;
+mod cel_dra_decls;
 pub mod cel_env;
 pub mod cel_struct;
 pub mod cel_versions;

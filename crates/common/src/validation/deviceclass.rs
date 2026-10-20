@@ -104,7 +104,7 @@ mod tests {
     #[test]
     fn valid_selector_passes() {
         assert!(errs(serde_json::json!({
-            "selectors": [{"cel": {"expression": "device.attributes['x'] == 1"}}]
+            "selectors": [{"cel": {"expression": "device.attributes['x'].y == 1"}}]
         }))
         .is_empty());
         // empty spec also passes
