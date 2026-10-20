@@ -1476,7 +1476,7 @@ mod pod_update_fidelity {
             "{}",
             e.detail
         );
-        assert!(e.detail.contains("hostname"), "{}", e.detail);
+        assert!(e.detail.contains("Hostname"), "{}", e.detail);
     }
 
     #[test]

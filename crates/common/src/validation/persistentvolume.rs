@@ -1251,9 +1251,14 @@ pub fn validate_persistent_volume_update(
     }
 
     if persistent_volume_source(&new_spec) != persistent_volume_source(&old.spec) {
+        // validation.go:2283-2284: `diff.Diff(old source, new source)`.
+        let source_diff = crate::diff_schema::persistent_volume_source_diff(
+            &serde_json::to_value(&old.spec).unwrap_or_default(),
+            &serde_json::to_value(&new_spec).unwrap_or_default(),
+        );
         errs.push(Error::forbidden(
             &Path::new("spec").child("persistentvolumesource"),
-            "spec.persistentvolumesource is immutable after creation",
+            format!("spec.persistentvolumesource is immutable after creation\n{source_diff}"),
         ));
     }
 
@@ -1530,6 +1535,37 @@ mod update_tests {
                 .to_string()
                 .contains("persistentvolumesource is immutable")),
             "{errs:?}"
+        );
+    }
+
+    /// validation.go:2282-2284: the immutability error appends
+    /// `diff.Diff(oldPv.Spec.PersistentVolumeSource, newPv.Spec.PersistentVolumeSource)`,
+    /// a unified diff (context 3) of `json.MarshalIndent` of the INTERNAL
+    /// `core.PersistentVolumeSource` (Go field names, declaration order, nil
+    /// pointers as `null`).
+    #[test]
+    fn changed_source_error_carries_diff_text() {
+        let old = hostpath_pv("/data");
+        let new = hostpath_pv("/other");
+        let errs = validate_persistent_volume_update(&new, &old);
+        let e = errs
+            .iter()
+            .find(|e| e.field == "spec.persistentvolumesource")
+            .unwrap_or_else(|| panic!("{errs:?}"));
+        assert_eq!(
+            e.detail,
+            concat!(
+                "spec.persistentvolumesource is immutable after creation\n",
+                "@@ -2,7 +2,7 @@\n",
+                "  \"GCEPersistentDisk\": null,\n",
+                "  \"AWSElasticBlockStore\": null,\n",
+                "  \"HostPath\": {\n",
+                "-  \"Path\": \"/data\",\n",
+                "+  \"Path\": \"/other\",\n",
+                "   \"Type\": null\n",
+                "  },\n",
+                "  \"Glusterfs\": null,\n",
+            )
         );
     }
 
