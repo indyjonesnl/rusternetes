@@ -52,6 +52,9 @@ pub enum Kind {
     QuantityMap,
     /// `intstr.IntOrString` value: a number or a string, `0` when absent.
     IntOrStr,
+    /// `*metav1.FieldsV1`: raw JSON bytes whose key order is the one
+    /// `fieldpath.Set.emitContentsV1` wrote (see [`fields_v1_order`]).
+    FieldsV1,
     /// Not modelled: rendered from the serde value as is. Documented gap.
     Raw,
 }
@@ -107,14 +110,15 @@ const OWNER_REFERENCE: &[Field] = &[
     f("blockOwnerDeletion", "blockOwnerDeletion", Kind::PtrBool).omit(),
 ];
 /// `metav1.ManagedFieldsEntry` (meta/v1 types.go:1340-1377). `FieldsV1` is
-/// raw JSON bytes in Go; it is rendered from the serde value as is.
+/// raw JSON bytes in Go (`FieldsV1.MarshalJSON` returns `Raw`, so
+/// `json.MarshalIndent` keeps the stored key order); see [`Kind::FieldsV1`].
 const MANAGED_FIELDS_ENTRY: &[Field] = &[
     f("manager", "manager", Kind::Str).omit(),
     f("operation", "operation", Kind::Str).omit(),
     f("apiVersion", "apiVersion", Kind::Str).omit(),
     f("time", "time", Kind::PtrStr).omit(),
     f("fieldsType", "fieldsType", Kind::Str).omit(),
-    f("fieldsV1", "fieldsV1", Kind::Raw).omit(),
+    f("fieldsV1", "fieldsV1", Kind::FieldsV1).omit(),
     f("subresource", "subresource", Kind::Str).omit(),
 ];
 
@@ -1563,7 +1567,10 @@ fn is_empty_value(kind: Kind, j: &GoJson) -> bool {
         GoJson::Number(n) => n == "0",
         GoJson::String(s) => s.is_empty() && !matches!(kind, Kind::Quantity | Kind::PtrQuantity),
         GoJson::Array(a) => a.is_empty(),
-        GoJson::Object(o) => o.is_empty() && !matches!(kind, Kind::Struct(_) | Kind::PtrStruct(_)),
+        // A non-nil `*FieldsV1` is never empty (`omitempty` tests the pointer).
+        GoJson::Object(o) => {
+            o.is_empty() && !matches!(kind, Kind::Struct(_) | Kind::PtrStruct(_) | Kind::FieldsV1)
+        }
     }
 }
 
@@ -1638,7 +1645,155 @@ pub fn render(kind: Kind, v: Option<&Value>) -> GoJson {
         // intstr.IntOrString.MarshalJSON: the int or the string; zero value
         // is the int 0.
         Kind::IntOrStr => v.map_or(GoJson::Number("0".to_string()), raw_json),
+        Kind::FieldsV1 => v.map_or(GoJson::Null, fields_v1_json),
         Kind::Raw => v.map_or(GoJson::Null, raw_json),
+    }
+}
+
+/// A `FieldsV1` object key, deserialised per
+/// `fieldpath.DeserializePathElement` (serialize-pe.go:76-128).
+enum PathElem {
+    /// `"."`: the set's own membership, always written first
+    /// (serialize.go:90-94).
+    Dot,
+    Field(String),
+    Key(Vec<(String, Value)>),
+    Value(Value),
+    Index(i64),
+    Unknown(String),
+}
+
+fn parse_path_elem(k: &str) -> PathElem {
+    if k == "." {
+        return PathElem::Dot;
+    }
+    let (Some(rest), true) = (k.get(2..), k.as_bytes().get(1) == Some(&b':')) else {
+        return PathElem::Unknown(k.to_string());
+    };
+    let unknown = || PathElem::Unknown(k.to_string());
+    match k.as_bytes()[0] {
+        b'f' => PathElem::Field(rest.to_string()),
+        b'v' => serde_json::from_str(rest).map_or_else(|_| unknown(), PathElem::Value),
+        // serde_json::Map is sorted by name == `fields.Sort()`.
+        b'k' => match serde_json::from_str::<Value>(rest) {
+            Ok(Value::Object(m)) => PathElem::Key(m.into_iter().collect()),
+            _ => unknown(),
+        },
+        b'i' => rest.parse().map_or_else(|_| unknown(), PathElem::Index),
+        _ => unknown(),
+    }
+}
+
+/// `value.Compare` (structured-merge-diff value/value.go:264-345): a total
+/// order across types, numbers < strings < bools < lists < maps < null;
+/// ints and floats compare numerically.
+fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    fn rank(v: &Value) -> u8 {
+        match v {
+            Value::Number(_) => 0,
+            Value::String(_) => 1,
+            Value::Bool(_) => 2,
+            Value::Array(_) => 3,
+            Value::Object(_) => 4,
+            Value::Null => 5,
+        }
+    }
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => match (x.as_i64(), y.as_i64()) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            _ => x
+                .as_f64()
+                .partial_cmp(&y.as_f64())
+                .unwrap_or(Ordering::Equal),
+        },
+        (Value::String(x), Value::String(y)) => x.as_bytes().cmp(y.as_bytes()),
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        (Value::Array(x), Value::Array(y)) => {
+            for (p, q) in x.iter().zip(y) {
+                let c = compare_values(p, q);
+                if c != Ordering::Equal {
+                    return c;
+                }
+            }
+            x.len().cmp(&y.len())
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            for ((kp, p), (kq, q)) in x.iter().zip(y) {
+                let c = kp
+                    .as_bytes()
+                    .cmp(kq.as_bytes())
+                    .then_with(|| compare_values(p, q));
+                if c != Ordering::Equal {
+                    return c;
+                }
+            }
+            x.len().cmp(&y.len())
+        }
+        _ => rank(a).cmp(&rank(b)),
+    }
+}
+
+/// `PathElement.Compare` (fieldpath/element.go:87-127) over [`PathElem`]:
+/// field names < keys < values < indexes. `FieldList.Compare`
+/// (value/fields.go:65-89) orders keys name-then-value, lexically.
+fn compare_path_elems(a: &PathElem, b: &PathElem) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    fn rank(e: &PathElem) -> u8 {
+        match e {
+            PathElem::Dot => 0,
+            PathElem::Field(_) => 1,
+            PathElem::Key(_) => 2,
+            PathElem::Value(_) => 3,
+            PathElem::Index(_) => 4,
+            PathElem::Unknown(_) => 5,
+        }
+    }
+    match (a, b) {
+        (PathElem::Field(x), PathElem::Field(y)) | (PathElem::Unknown(x), PathElem::Unknown(y)) => {
+            x.as_bytes().cmp(y.as_bytes())
+        }
+        (PathElem::Key(x), PathElem::Key(y)) => {
+            for ((nx, vx), (ny, vy)) in x.iter().zip(y) {
+                let c = nx
+                    .as_bytes()
+                    .cmp(ny.as_bytes())
+                    .then_with(|| compare_values(vx, vy));
+                if c != Ordering::Equal {
+                    return c;
+                }
+            }
+            x.len().cmp(&y.len())
+        }
+        (PathElem::Value(x), PathElem::Value(y)) => compare_values(x, y),
+        (PathElem::Index(x), PathElem::Index(y)) => x.cmp(y),
+        _ => rank(a).cmp(&rank(b)),
+    }
+}
+
+/// The order `fieldpath.Set.emitContentsV1` (fieldpath/serialize.go:79-)
+/// writes the keys of a `FieldsV1` object in: `"."` first, then the merged,
+/// sorted members and children. `serde_json::Value` loses that order (its
+/// maps are sorted by key string, which would put `i:` before `k:`), so it
+/// is re-derived here.
+pub fn fields_v1_order(a: &str, b: &str) -> std::cmp::Ordering {
+    compare_path_elems(&parse_path_elem(a), &parse_path_elem(b))
+}
+
+/// `FieldsV1.Raw` as `json.MarshalIndent` emits it: the stored bytes, i.e.
+/// the keys in [`fields_v1_order`] at every level.
+fn fields_v1_json(v: &Value) -> GoJson {
+    match v {
+        Value::Object(o) => {
+            let mut e: Vec<(&String, &Value)> = o.iter().collect();
+            e.sort_by(|a, b| fields_v1_order(a.0, b.0));
+            GoJson::Object(
+                e.into_iter()
+                    .map(|(k, v)| (k.clone(), fields_v1_json(v)))
+                    .collect(),
+            )
+        }
+        other => raw_json(other),
     }
 }
 
@@ -1792,6 +1947,46 @@ mod tests {
             "   \"Resources\": {\n    \"Limits\": null,\n    \"Requests\": {\n     \"storage\": \"1Gi\"\n    }\n   },",
         );
         assert!(out.starts_with(want), "{out}");
+    }
+
+    /// `FieldsV1` renders in `emitContentsV1` order, not serde's sorted-key
+    /// order: `.`, field names, keys, values, then numeric indexes.
+    #[test]
+    fn fields_v1_keys_follow_fieldpath_order() {
+        let v = json!({"fieldsV1": {
+            "i:10": {}, "i:2": {}, "v:3": {}, "k:{\"name\":\"b\"}": {},
+            "k:{\"name\":\"a\"}": {}, "f:z": {}, "f:a": {}, ".": {}}});
+        let out = render(Kind::Struct(MANAGED_FIELDS_ENTRY), Some(&v)).marshal_indent();
+        let keys: Vec<&str> = out
+            .lines()
+            .filter(|l| l.starts_with("  \""))
+            .map(|l| l.trim().split("\": ").next().unwrap())
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "\".",
+                "\"f:a",
+                "\"f:z",
+                "\"k:{\\\"name\\\":\\\"a\\\"}",
+                "\"k:{\\\"name\\\":\\\"b\\\"}",
+                "\"v:3",
+                "\"i:2",
+                "\"i:10"
+            ],
+            "{out}"
+        );
+    }
+
+    /// An empty-but-present `*FieldsV1` (`{}`) is not omitted.
+    #[test]
+    fn empty_fields_v1_not_omitted() {
+        let out = render(
+            Kind::Struct(MANAGED_FIELDS_ENTRY),
+            Some(&json!({"fieldsV1": {}})),
+        )
+        .marshal_indent();
+        assert!(out.contains("\"fieldsV1\": {}"), "{out}");
     }
 
     /// Every one of the 22 `PersistentVolumeSource` members renders, in
