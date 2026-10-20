@@ -170,8 +170,9 @@ mod aggregator_hooks {
             storage,
             6443,
             "10.96.0.1".parse().unwrap(),
+            crate::bootstrap::AdvertiseAddress::new(None, "0.0.0.0:6443"),
             vec!["10.96.0.0/12".to_string()],
-            None,
+            super::ClusterAuthnInputs::default(),
             |_| {},
         )
         .await;
