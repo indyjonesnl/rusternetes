@@ -131,6 +131,11 @@ pub struct VolumeManager {
     /// (`unmount_device`, `list_staged_devices`) that are not part of
     /// `VolumePlugin`. `plugin_mgr` holds the plugin as a `dyn VolumePlugin`.
     pub(crate) csi_plugin: Arc<crate::volume_plugins::csi::CsiPlugin>,
+    /// `csiMigratedPluginManager` of `desiredStateOfWorldPopulator`
+    /// (`desired_state_of_world_populator.go:131`).
+    pub(crate) csi_migrated_plugin_manager: rusternetes_common::csi_migration::PluginManager,
+    /// `intreeToCSITranslator` of `desiredStateOfWorldPopulator` (`:132`).
+    pub(crate) intree_to_csi_translator: rusternetes_common::csi_translation::CsiTranslator,
     /// Each mounted pod volume's `Mounter.GetAttributes()` result plus the
     /// `SELinuxLabeled` bit, keyed by (pod UID, volume name). Stands in for the
     /// `VolumeInfo{Mounter, SELinuxLabeled}` map upstream's `makeMounts` reads
@@ -284,9 +289,70 @@ impl VolumeManager {
             node_allocatable,
             plugin_mgr,
             csi_plugin: Arc::new(crate::volume_plugins::csi::CsiPlugin::new(host)),
+            csi_migrated_plugin_manager: Default::default(),
+            intree_to_csi_translator: rusternetes_common::csi_translation::CsiTranslator::new(),
             mounted: Arc::default(),
             pod_certificate_manager,
         }
+    }
+
+    /// The migration tail of `createVolumeSpec`
+    /// (`desired_state_of_world_populator.go:475-482` for a claim,
+    /// `:511-518` for an inline volume):
+    ///
+    /// ```go
+    /// migratable, err := dswp.csiMigratedPluginManager.IsMigratable(volumeSpec)
+    /// if err != nil { return nil, nil, "", err }
+    /// if migratable {
+    ///     volumeSpec, err = csimigration.TranslateInTreeSpecToCSI(logger, volumeSpec, pod.Namespace, dswp.intreeToCSITranslator)
+    ///     if err != nil { return nil, nil, "", err }
+    /// }
+    /// ```
+    ///
+    /// `pv` is the bound PV of a claim (`NewSpecFromPersistentVolume`, whose
+    /// `Spec.Volume` is nil); without one the spec is `NewSpecFromVolume`.
+    ///
+    /// **Deviation, inherited from [`Spec`]:** the translated upstream spec has
+    /// `Volume == nil`; ours keeps the pod's `Volume` (mandatory in `Spec`) next
+    /// to the translated CSI PV. The migrated plugin still sees exactly one
+    /// source, the PV's `csi`, because the retained in-tree volume carries none.
+    pub(crate) fn create_volume_spec(
+        &self,
+        pod_namespace: &str,
+        volume: &rusternetes_common::resources::Volume,
+        pv: Option<&PersistentVolume>,
+        read_only: bool,
+    ) -> Result<crate::volume_plugins::OwnedSpec> {
+        use rusternetes_common::csi_migration::{translate_in_tree_spec_to_csi, VolumeSpec};
+        let spec = VolumeSpec {
+            volume: pv.is_none().then(|| volume.clone()),
+            persistent_volume: pv.cloned(),
+            read_only,
+            ..Default::default()
+        };
+        let migratable = self
+            .csi_migrated_plugin_manager
+            .is_migratable(Some(&spec))
+            .map_err(anyhow::Error::msg)?;
+        if !migratable {
+            return Ok(crate::volume_plugins::OwnedSpec {
+                volume: volume.clone(),
+                persistent_volume: pv.cloned(),
+                read_only,
+                migrated: false,
+                inline_volume_spec_for_csi_migration: false,
+            });
+        }
+        let translated =
+            translate_in_tree_spec_to_csi(&spec, pod_namespace, &self.intree_to_csi_translator)
+                .map_err(anyhow::Error::msg)?;
+        Ok(crate::volume_plugins::OwnedSpec {
+            volume: volume.clone(),
+            persistent_volume: translated.persistent_volume,
+            read_only: translated.read_only,
+            migrated: translated.migrated,
+            inline_volume_spec_for_csi_migration: translated.inline_volume_spec_for_csi_migration,
+        })
     }
 
     /// The `makeMounts` read of each mounted volume's attributes for one
@@ -354,11 +420,19 @@ impl VolumeManager {
                     continue;
                 }
             };
-            let vspec = crate::volume_plugins::Spec {
+            let owned = match self.create_volume_spec(
+                &pod.metadata.namespace.clone().unwrap_or_default(),
                 volume,
-                persistent_volume: pv.as_ref(),
-                read_only: pv.is_some() && pvc_read_only(volume),
+                pv.as_ref(),
+                pv.is_some() && pvc_read_only(volume),
+            ) {
+                Ok(o) => o,
+                Err(e) => {
+                    warn!("reconstruct mount attributes: volume {}: {e}", volume.name);
+                    continue;
+                }
             };
+            let vspec = owned.as_spec();
             let Ok(plugin) = self.plugin_mgr.find_plugin_by_spec(&vspec) else {
                 continue;
             };
@@ -743,6 +817,8 @@ impl VolumeManager {
             volume: reconstructed.volume,
             persistent_volume: reconstructed.persistent_volume,
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         });
         let volume_name = match crate::volume_plugins::util::get_unique_volume_name_from_spec(
             plugin,
@@ -932,6 +1008,8 @@ impl VolumeManager {
             volume,
             persistent_volume: None,
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         match self.plugin_mgr.find_plugin_by_spec(&spec) {
             Ok(plugin) => plugin.name(),
@@ -1463,13 +1541,17 @@ impl VolumeManager {
         // template (which is not actionable and falls through like upstream's
         // empty spec would).
         let pv = self.resolve_persistent_volume(pod, volume).await?;
-        let spec = crate::volume_plugins::Spec {
+        // `NewSpecFromPersistentVolume(pv, pvcSource.ReadOnly)`; a spec
+        // without a PV is `NewSpecFromVolume`, ReadOnly false. Then the
+        // `IsMigratable` / `TranslateInTreeSpecToCSI` tail of
+        // `createVolumeSpec` (`desired_state_of_world_populator.go:475`, `:511`).
+        let owned = self.create_volume_spec(
+            &pod.metadata.namespace.clone().unwrap_or_default(),
             volume,
-            persistent_volume: pv.as_ref(),
-            // `NewSpecFromPersistentVolume(pv, pvcSource.ReadOnly)`; a spec
-            // without a PV is `NewSpecFromVolume`, ReadOnly false.
-            read_only: pv.is_some() && pvc_read_only(volume),
-        };
+            pv.as_ref(),
+            pv.is_some() && pvc_read_only(volume),
+        )?;
+        let spec = owned.as_spec();
 
         match self.plugin_mgr.find_plugin_by_spec(&spec) {
             Ok(_) => {
@@ -3116,6 +3198,72 @@ mod pvc_resolution_tests {
         )
     }
 
+    /// `createVolumeSpec` (`desired_state_of_world_populator.go:475`, `:511`):
+    /// an inline in-tree gcePersistentDisk is `IsMigratable`, so the spec the
+    /// plugin lookup sees is the translated CSI PV, flagged `Migrated` and
+    /// `InlineVolumeSpecForCSIMigration`, and the CSI plugin claims it.
+    #[test]
+    fn create_volume_spec_translates_a_migratable_inline_volume() {
+        let manager = vm(None);
+        let volume: Volume = serde_json::from_value(json!({
+            "name": "pd", "gcePersistentDisk": {"pdName": "disk-1", "fsType": "ext4"}
+        }))
+        .unwrap();
+        let owned = manager
+            .create_volume_spec("ns", &volume, None, false)
+            .unwrap();
+        assert!(owned.migrated && owned.inline_volume_spec_for_csi_migration);
+        let csi = owned.persistent_volume.as_ref().unwrap().spec.csi.as_ref();
+        assert_eq!(csi.unwrap().driver, "pd.csi.storage.gke.io");
+        let spec = owned.as_spec();
+        assert_eq!(
+            manager
+                .plugin_mgr
+                .find_plugin_by_spec(&spec)
+                .unwrap()
+                .name(),
+            "kubernetes.io/csi"
+        );
+    }
+
+    /// The claim arm (`:475`): a bound in-tree PV is translated with
+    /// `InlineVolumeSpecForCSIMigration` false and `ReadOnly` carried over.
+    #[test]
+    fn create_volume_spec_translates_a_migratable_pv() {
+        let manager = vm(None);
+        let volume: Volume = serde_json::from_value(json!({
+            "name": "c", "persistentVolumeClaim": {"claimName": "c", "readOnly": true}
+        }))
+        .unwrap();
+        let pv: PersistentVolume = serde_json::from_value(json!({
+            "metadata": {"name": "pv-1"},
+            "spec": {"gcePersistentDisk": {"pdName": "disk-1"}}
+        }))
+        .unwrap();
+        let owned = manager
+            .create_volume_spec("ns", &volume, Some(&pv), true)
+            .unwrap();
+        assert!(owned.migrated && !owned.inline_volume_spec_for_csi_migration);
+        assert!(owned.read_only);
+        let csi = owned.persistent_volume.as_ref().unwrap().spec.csi.as_ref();
+        assert_eq!(
+            csi.unwrap().volume_handle.as_deref(),
+            Some("projects/UNSPECIFIED/zones/UNSPECIFIED/disks/disk-1")
+        );
+    }
+
+    /// A non-migratable spec passes through untouched.
+    #[test]
+    fn create_volume_spec_leaves_a_non_migratable_volume_alone() {
+        let manager = vm(None);
+        let volume: Volume = serde_json::from_value(json!({"name": "e", "emptyDir": {}})).unwrap();
+        let owned = manager
+            .create_volume_spec("ns", &volume, None, false)
+            .unwrap();
+        assert!(!owned.migrated && !owned.inline_volume_spec_for_csi_migration);
+        assert!(owned.persistent_volume.is_none());
+    }
+
     /// A PVC-backed volume must reach the plugin that owns the PV's SOURCE.
     /// There is no pvc plugin upstream: hostPath claims it via the
     /// PersistentVolume arm of `CanSupport` (`host_path.go:98-101`).
@@ -3176,6 +3324,8 @@ mod pvc_resolution_tests {
             volume: &volume,
             persistent_volume: Some(&resolved),
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         };
         let plugin = manager.plugin_mgr.find_plugin_by_spec(&spec).unwrap();
         assert_eq!(plugin.name(), crate::pod_dirs::plugin::HOST_PATH);

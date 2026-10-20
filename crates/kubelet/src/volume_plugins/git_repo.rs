@@ -302,6 +302,8 @@ impl Mounter for GitRepoVolumeMounter {
                     volume: &wrapped_volume,
                     persistent_volume: None,
                     read_only: false,
+                    migrated: false,
+                    inline_volume_spec_for_csi_migration: false,
                 },
                 &self.pod,
             )
@@ -477,6 +479,8 @@ mod tests {
             volume: v,
             persistent_volume: None,
             read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
         }
     }
 
