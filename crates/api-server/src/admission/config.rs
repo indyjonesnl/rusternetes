@@ -21,6 +21,28 @@ fn make_abs(path: &str, base: &Path) -> std::io::Result<PathBuf> {
     Ok(base.join(p))
 }
 
+/// `legacyPluginsWithUnversionedConfig` (config.go:112).
+const LEGACY_UNVERSIONED_PLUGINS: &[&str] = &["ImagePolicyWebhook", "PodNodeSelector"];
+
+/// The legacy fallback of `ReadAdmissionConfiguration` (config.go:92-110): the
+/// document did not decode as an `AdmissionConfiguration` for lack of a
+/// version, a kind or a registered type, and it carries one of the two legacy
+/// top-level keys.
+fn is_legacy_plugin_config(doc: &serde_json::Value) -> bool {
+    let Some(obj) = doc.as_object() else {
+        return false;
+    };
+    let s = |k: &str| obj.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    let decodes = !s("apiVersion").is_empty()
+        && !s("kind").is_empty()
+        && s("kind") == "AdmissionConfiguration"
+        && matches!(
+            s("apiVersion"),
+            "apiserver.config.k8s.io/v1" | "apiserver.k8s.io/v1alpha1"
+        );
+    !decodes && (obj.contains_key("imagePolicy") || obj.contains_key("podNodeSelectorPluginConfig"))
+}
+
 /// `configProvider.ConfigFor` (config.go:141-160) +
 /// `GetAdmissionPluginConfigurationFor` (:120-137): the configuration of the
 /// first plugin entry named `plugin_name`, as YAML text.
@@ -35,6 +57,13 @@ pub fn plugin_configuration_for(
     plugin_name: &str,
 ) -> Result<Option<String>, String> {
     let doc: serde_json::Value = serde_yaml::from_str(yaml).map_err(|e| e.to_string())?;
+    if is_legacy_plugin_config(&doc) {
+        // `legacyPluginsWithUnversionedConfig` (config.go:113-123): the whole
+        // file is the configuration of each enabled legacy plugin.
+        let legacy = LEGACY_UNVERSIONED_PLUGINS.contains(&plugin_name)
+            && super::plugins::enabled(plugin_name);
+        return Ok(legacy.then(|| yaml.to_string()));
+    }
     let Some(entry) = doc
         .get("plugins")
         .and_then(|p| p.as_array())
@@ -61,4 +90,44 @@ pub fn plugin_configuration_for(
             abs.display()
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::admission::plugins::EnabledForTest;
+
+    const LEGACY: &str = "podNodeSelectorPluginConfig:\n  clusterDefaultNodeSelector: a=b\n";
+
+    // config.go:92-125: a file with the unversioned `podNodeSelectorPluginConfig`
+    // key is the configuration of the enabled legacy plugins, whole.
+    #[test]
+    fn legacy_unversioned_config_goes_to_enabled_legacy_plugins() {
+        let _g = EnabledForTest::new(&["PodNodeSelector"]);
+        let f = Path::new("/etc/admission.yaml");
+        assert_eq!(
+            plugin_configuration_for(LEGACY, f, "PodNodeSelector").unwrap(),
+            Some(LEGACY.to_string())
+        );
+        // ImagePolicyWebhook is legacy too but not enabled; other plugins never.
+        assert_eq!(
+            plugin_configuration_for(LEGACY, f, "ImagePolicyWebhook").unwrap(),
+            None
+        );
+        assert_eq!(
+            plugin_configuration_for(LEGACY, f, "PodSecurity").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn versioned_config_is_not_legacy() {
+        let _g = EnabledForTest::new(&["PodNodeSelector"]);
+        let doc = "apiVersion: apiserver.config.k8s.io/v1\nkind: AdmissionConfiguration\nplugins:\n- name: PodNodeSelector\n  configuration:\n    podNodeSelectorPluginConfig:\n      x: y=z\n";
+        let text = plugin_configuration_for(doc, Path::new("/f"), "PodNodeSelector")
+            .unwrap()
+            .unwrap();
+        assert!(text.contains("podNodeSelectorPluginConfig"));
+        assert!(!text.contains("AdmissionConfiguration"));
+    }
 }

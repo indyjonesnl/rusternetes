@@ -528,6 +528,18 @@ impl Admission<'_> {
             ) {
                 rusternetes_common::tolerations::add_default_tolerations(spec);
             }
+            // PodTolerationRestriction registers for Create and Update
+            // (podtolerationrestriction/admission.go:Admit); it follows
+            // DefaultTolerationSeconds in `AllOrderedPlugins`.
+            if self.subresource.is_none() && plugin_enabled("PodTolerationRestriction") {
+                crate::admission::pod_plugins::toleration_restriction_admit(
+                    &self.state.storage,
+                    self.namespace.unwrap_or(""),
+                    false,
+                    &mut pod,
+                )
+                .await?;
+            }
             return Ok(pod);
         }
         if *op != Operation::Create {
@@ -580,6 +592,13 @@ impl Admission<'_> {
             }
         }
 
+        // PodNodeSelector.Admit (podnodeselector/admission.go): CREATE only; it
+        // precedes Priority in `AllOrderedPlugins`.
+        if plugin_enabled("PodNodeSelector") {
+            crate::admission::pod_plugins::pod_node_selector_admit(storage, namespace, &mut pod)
+                .await?;
+        }
+
         if plugin_enabled("Priority") {
             self.admit_pod_priority(&mut pod).await?;
         }
@@ -591,6 +610,15 @@ impl Admission<'_> {
             plugin_enabled("DefaultTolerationSeconds"),
         ) {
             rusternetes_common::tolerations::add_default_tolerations(spec);
+        }
+
+        // PodTolerationRestriction.Admit: the namespace/cluster default
+        // tolerations, after DefaultTolerationSeconds.
+        if plugin_enabled("PodTolerationRestriction") {
+            crate::admission::pod_plugins::toleration_restriction_admit(
+                storage, namespace, true, &mut pod,
+            )
+            .await?;
         }
 
         // RuntimeClass.Admit (plugin/pkg/admission/runtimeclass/admission.go):
@@ -793,6 +821,28 @@ impl Admission<'_> {
                 }
             }
             _ => {}
+        }
+
+        // PodNodeSelector.Validate (Create) and PodTolerationRestriction.Validate
+        // (Create, Update): pods proper, never a subresource.
+        if self.subresource.is_none() {
+            if let Some(pod) = obj {
+                let namespace = self.namespace.unwrap_or("");
+                if *op == Operation::Create && plugin_enabled("PodNodeSelector") {
+                    crate::admission::pod_plugins::pod_node_selector_validate(
+                        storage, namespace, pod,
+                    )
+                    .await?;
+                }
+                if matches!(op, Operation::Create | Operation::Update)
+                    && plugin_enabled("PodTolerationRestriction")
+                {
+                    crate::admission::pod_plugins::toleration_restriction_validate(
+                        storage, namespace, pod,
+                    )
+                    .await?;
+                }
+            }
         }
 
         // Pod quota is the last plugin (`validate_quota`): the pod evaluator
