@@ -9,7 +9,8 @@ use rusternetes_common::resources::validating_admission_policy::{
     ValidatingAdmissionPolicy, ValidatingAdmissionPolicyBinding,
 };
 use rusternetes_common::validation::validating_admission_policy::{
-    set_defaults_validating_admission_policy, validate_validating_admission_policy, validate_validating_admission_policy_binding,
+    set_defaults_validating_admission_policy, validate_validating_admission_policy,
+    validate_validating_admission_policy_binding,
 };
 use serde_json::{json, Value};
 

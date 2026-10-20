@@ -57,11 +57,11 @@ pub struct MutatingAdmissionPolicySpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mutations: Option<Vec<Mutation>>,
 
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "empty_string_as_none"
-    )]
+    /// No `empty_string_as_none`: upstream's field is a `*FailurePolicyType`
+    /// (v1beta1/types.go:1283), defaulting only fills nil
+    /// (`SetDefaults_MutatingAdmissionPolicySpec`) and validation answers
+    /// NotSupported for `""` (validation.go:1379-1380) (#2562).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_policy: Option<FailurePolicy>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
