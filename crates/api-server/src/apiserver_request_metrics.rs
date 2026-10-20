@@ -561,7 +561,40 @@ pub fn record_long_running(req: &RequestMeta, component: &str) -> LongRunningGua
 /// until the body (the watch / connect / log stream) is finished or dropped.
 struct GuardedBody {
     inner: axum::body::Body,
-    _guard: Arc<LongRunningGuard>,
+    guard: Arc<StreamMonitor>,
+}
+
+/// `MonitorRequest` for a blocking handler. Upstream runs `MonitorRequest`
+/// after `routeFunc` returns (`InstrumentRouteFunc`, metrics.go:645-647), and a
+/// WATCH / CONNECT handler blocks until the stream or connection ends, so the
+/// duration covers the connection's lifetime. Here the handler returns at the
+/// response headers, so the observation moves to the drop of the last owner:
+/// the response body (watch, log) or, for an upgraded connect, the
+/// `ConnectionHold` moved into the splice task. Also owns the
+/// `longrunning_requests` gauge (`RecordLongRunning`, metrics.go:551-575), which
+/// falls after the observation, as `defer g.Dec()` runs inside the handler.
+struct StreamMonitor {
+    meta: RequestMeta,
+    started: std::time::Instant,
+    code: std::sync::atomic::AtomicU16,
+    /// `ResponseWriterDelegator.written` (metrics.go:844, :863).
+    written: std::sync::atomic::AtomicU64,
+    trackers: Option<Arc<LatencyTrackers>>,
+    _guard: LongRunningGuard,
+}
+
+impl Drop for StreamMonitor {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        monitor_request(
+            &self.meta,
+            "apiserver",
+            self.code.load(Relaxed),
+            self.started.elapsed(),
+            self.written.load(Relaxed),
+            self.trackers.as_ref().map(|t| t.excluded_latency()),
+        );
+    }
 }
 
 impl http_body::Body for GuardedBody {
@@ -572,7 +605,17 @@ impl http_body::Body for GuardedBody {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
+        let poll = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
+        // `ResponseWriterDelegator.Write` counts the bytes written
+        // (metrics.go:858-865).
+        if let std::task::Poll::Ready(Some(Ok(frame))) = &poll {
+            if let Some(data) = frame.data_ref() {
+                self.guard
+                    .written
+                    .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        poll
     }
 
     fn is_end_stream(&self) -> bool {
@@ -647,18 +690,42 @@ pub async fn instrument_request(
     // the last owner drops.
     let verb = reported_verb(&meta, clean_scope(&meta));
     let upgrade = req.headers().contains_key(axum::http::header::UPGRADE) && verb == "CONNECT";
-    let long_running = matches!(verb.as_str(), "WATCH" | "CONNECT")
-        .then(|| Arc::new(record_long_running(&meta, "apiserver")));
+    let monitor = matches!(verb.as_str(), "WATCH" | "CONNECT").then(|| {
+        Arc::new(StreamMonitor {
+            _guard: record_long_running(&meta, "apiserver"),
+            meta: meta.clone(),
+            started,
+            code: std::sync::atomic::AtomicU16::new(0),
+            written: std::sync::atomic::AtomicU64::new(0),
+            trackers: trackers.clone(),
+        })
+    });
     if upgrade {
-        if let Some(g) = &long_running {
+        if let Some(g) = &monitor {
             req.extensions_mut()
                 .insert(rusternetes_streamproxy::ConnectionHold(g.clone()));
         }
     }
-    let mut resp = match &trackers {
+    let resp = match &trackers {
         Some(t) => with_latency_trackers(t.clone(), next.run(req)).await,
         None => next.run(req).await,
     };
+    // `RecordLongRunning` wraps watch serving (handlers/get.go:283), connect
+    // handlers (handlers/rest.go:218) and `StreamObject` for logs
+    // (responsewriters/writers.go:327); the verbs those paths report are
+    // WATCH and CONNECT (`validConnectRequests` includes log). Their
+    // `MonitorRequest` runs when the stream ends (see [`StreamMonitor`]).
+    if let Some(monitor) = monitor {
+        monitor
+            .code
+            .store(resp.status().as_u16(), std::sync::atomic::Ordering::Relaxed);
+        return resp.map(|body| {
+            axum::body::Body::new(GuardedBody {
+                inner: body,
+                guard: monitor,
+            })
+        });
+    }
     let size = resp
         .headers()
         .get(axum::http::header::CONTENT_LENGTH)
@@ -673,18 +740,6 @@ pub async fn instrument_request(
         size,
         trackers.map(|t| t.excluded_latency()),
     );
-    // `RecordLongRunning` wraps watch serving (handlers/get.go:283), connect
-    // handlers (handlers/rest.go:218) and `StreamObject` for logs
-    // (responsewriters/writers.go:327); the verbs those paths report are
-    // WATCH and CONNECT (`validConnectRequests` includes log).
-    if let Some(guard) = long_running {
-        resp = resp.map(|body| {
-            axum::body::Body::new(GuardedBody {
-                inner: body,
-                _guard: guard,
-            })
-        });
-    }
     resp
 }
 
@@ -1015,8 +1070,21 @@ mod tests {
             .unwrap();
         let l = [("verb", "WATCH"), ("resource", "lrwatchthings")];
         assert_eq!(sample("apiserver_longrunning_requests", &l), 1.0);
+        // MonitorRequest runs when the handler returns, i.e. at stream end
+        // (metrics.go:645-647): nothing observed while the body is open.
+        assert_eq!(sample("apiserver_request_duration_seconds", &l), 0.0);
+        assert_eq!(sample("apiserver_request_total", &l), 0.0);
+        tokio::time::sleep(Duration::from_millis(30)).await;
         drop(resp);
         assert_eq!(sample("apiserver_longrunning_requests", &l), 0.0);
+        assert_eq!(sample("apiserver_request_duration_seconds", &l), 1.0);
+        assert_eq!(sample("apiserver_request_total", &l), 1.0);
+        assert!(
+            crate::flow_control::metric_test_util::sample_sum(
+                "apiserver_request_duration_seconds",
+                &l
+            ) >= 0.03
+        );
     }
 
     // ConnectResource (handlers/rest.go:218) wraps the whole `ServeHTTP` in
@@ -1074,11 +1142,15 @@ mod tests {
         let mut out = [0u8; 5];
         c.read_exact(&mut out).await.unwrap();
         assert_eq!(&out, b"HELLO");
-        // The 101 response is long gone; the connection is still open.
+        // The 101 response is long gone; the connection is still open and
+        // the request is not yet observed (it ends with the connection).
         assert_eq!(sample("apiserver_longrunning_requests", &l), 1.0);
+        assert_eq!(sample("apiserver_request_duration_seconds", &l), 0.0);
         drop(c);
         for _ in 0..100 {
             if sample("apiserver_longrunning_requests", &l) == 0.0 {
+                assert_eq!(sample("apiserver_request_duration_seconds", &l), 1.0);
+                assert_eq!(sample("apiserver_request_total", &l), 1.0);
                 return;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
