@@ -227,7 +227,7 @@ fn validate_port_num_or_name(port: &IntOrString, fld: &Path) -> ErrorList {
 }
 
 /// `ValidateDNS1123Label`.
-fn validate_dns1123_label(value: &str, fld: &Path) -> ErrorList {
+pub(crate) fn validate_dns1123_label(value: &str, fld: &Path) -> ErrorList {
     is_dns1123_label(value)
         .into_iter()
         .map(|msg| Error::invalid(fld, value, msg))
