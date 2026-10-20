@@ -537,47 +537,288 @@ impl RequestAuthenticator for WebsocketProtocolAuthenticator {
 // x509 client certificate authenticator
 // ---------------------------------------------------------------------------
 
-/// `dynamiccertificates.DynamicFileCAContent` for the kubelet's
-/// `authentication.x509.clientCAFile` (`NewDynamicCAContentFromFile
-/// ("client-ca-bundle", ...)`): a verifier over the file's bundle, re-read by
-/// [`ClientCaContent::run`] every `FileRefreshDuration` (1 minute).
-pub struct ClientCaContent {
-    path: String,
-    verifier: RwLock<Arc<dyn ClientCertVerifier>>,
+/// `dynamiccertificates.Listener` (interfaces.go:23-26): told when the CA
+/// content may have changed.
+pub trait Listener: Send + Sync {
+    /// `Enqueue`.
+    fn enqueue(&self);
 }
 
-/// `FileRefreshDuration` (dynamic_cafile_content.go:39).
+/// `FileRefreshDuration` (dynamic_cafile_content.go:39): upstream's
+/// `wait.Until` period (`Run`, :168-172) for restarting a failed file watch.
 const FILE_REFRESH_DURATION: Duration = Duration::from_secs(60);
+
+/// The queue of `DynamicFileCAContent`, which "only ever has one item, but has
+/// nice error handling backoff/retry semantics" (dynamic_cafile_content.go:63).
+/// `Add` coalesces into one pending item; `AddRateLimited` re-adds after the
+/// per-item exponential failure delay of `DefaultTypedControllerRateLimiter`
+/// (5ms base, doubling, capped at 1000s: workqueue/default_rate_limiters.go;
+/// its overall token bucket cannot bind a one-item queue).
+struct SingleItemQueue {
+    notify: tokio::sync::Notify,
+    failures: std::sync::atomic::AtomicU32,
+}
+
+impl SingleItemQueue {
+    const BASE_DELAY: Duration = Duration::from_millis(5);
+    const MAX_DELAY: Duration = Duration::from_secs(1000);
+
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            notify: tokio::sync::Notify::new(),
+            failures: std::sync::atomic::AtomicU32::new(0),
+        })
+    }
+
+    /// `queue.Add`.
+    fn add(&self) {
+        self.notify.notify_one();
+    }
+
+    /// `queue.Forget`.
+    fn forget(&self) {
+        self.failures.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `ItemExponentialFailureRateLimiter.When`.
+    fn when(&self) -> Duration {
+        let exp = self
+            .failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .min(31);
+        Self::BASE_DELAY
+            .saturating_mul(2u32.saturating_pow(exp))
+            .min(Self::MAX_DELAY)
+    }
+
+    /// `queue.AddRateLimited`.
+    fn add_rate_limited(self: &Arc<Self>) {
+        let delay = self.when();
+        let q = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            q.add();
+        });
+    }
+
+    /// `queue.Get`.
+    async fn get(&self) {
+        self.notify.notified().await;
+    }
+}
+
+/// `caBundleAndVerifier`.
+struct CaBundleAndVerifier {
+    ca_bundle: Vec<u8>,
+    verifier: Arc<dyn ClientCertVerifier>,
+}
+
+/// `dynamiccertificates.DynamicFileCAContent` for the kubelet's
+/// `authentication.x509.clientCAFile` (`NewDynamicCAContentFromFile
+/// ("client-ca-bundle", ...)`, cmd/kubelet/app/auth.go:73-74): a verifier over
+/// the file's bundle that reloads when the file changes. [`ClientCaContent::run`]
+/// watches the file (inotify in place of fsnotify) and reloads on every event;
+/// a reload that fails is retried with exponential backoff and keeps the
+/// previous bundle.
+pub struct ClientCaContent {
+    name: String,
+    /// The file to read.
+    filename: String,
+    /// The last read, non-zero length content of the file (`caBundle`).
+    ca_bundle: RwLock<Option<Arc<CaBundleAndVerifier>>>,
+    listeners: std::sync::Mutex<Vec<Arc<dyn Listener>>>,
+    queue: Arc<SingleItemQueue>,
+}
 
 impl ClientCaContent {
     /// `NewDynamicCAContentFromFile`: loads the file now, failing when it
     /// cannot be loaded.
     pub fn from_file(path: &str) -> anyhow::Result<Arc<Self>> {
-        let verifier = rusternetes_common::tls::client_cert_verifier_for_ca_file(path)?;
-        Ok(Arc::new(Self {
-            path: path.to_string(),
-            verifier: RwLock::new(verifier),
-        }))
+        if path.is_empty() {
+            anyhow::bail!("missing filename for ca bundle");
+        }
+        let ret = Arc::new(Self {
+            name: format!("client-ca-bundle::{path}"),
+            filename: path.to_string(),
+            ca_bundle: RwLock::new(None),
+            listeners: std::sync::Mutex::new(Vec::new()),
+            queue: SingleItemQueue::new(),
+        });
+        ret.load_ca_bundle()?;
+        Ok(ret)
+    }
+
+    /// `AddListener`.
+    #[allow(dead_code)] // ported provider surface; the kubelet bin has no consumer yet
+    pub fn add_listener(&self, listener: Arc<dyn Listener>) {
+        self.listeners.lock().unwrap().push(listener);
+    }
+
+    /// `CurrentCABundleContent`.
+    #[allow(dead_code)] // ported provider surface; the kubelet bin has no consumer yet
+    pub fn current_ca_bundle_content(&self) -> Vec<u8> {
+        self.current()
+            .map(|b| b.ca_bundle.clone())
+            .unwrap_or_default()
     }
 
     /// The verifier for the bundle as last loaded (`VerifyOptions`).
     pub fn verifier(&self) -> Arc<dyn ClientCertVerifier> {
-        self.verifier.read().unwrap().clone()
+        // `NewDynamicCAContentFromFile` fails unless a bundle loaded, so one
+        // is always present.
+        self.current()
+            .expect("CA bundle is loaded at construction")
+            .verifier
+            .clone()
     }
 
-    /// The `Run` loop (dynamic_cafile_content.go:157-172): reload the file on
-    /// every tick; a reload that fails keeps the previous bundle.
+    fn current(&self) -> Option<Arc<CaBundleAndVerifier>> {
+        self.ca_bundle.read().unwrap().clone()
+    }
+
+    /// `loadCABundle`: determines the next set of content for the file.
+    fn load_ca_bundle(&self) -> anyhow::Result<()> {
+        let ca_bundle = std::fs::read(&self.filename)
+            .map_err(|e| anyhow::anyhow!("open {}: {e}", self.filename))?;
+        if ca_bundle.is_empty() {
+            anyhow::bail!("missing content for CA bundle {:?}", self.name);
+        }
+
+        // check to see if we have a change. If the values are the same, do nothing.
+        if !self.has_ca_changed(&ca_bundle) {
+            return Ok(());
+        }
+
+        let verifier =
+            rusternetes_common::tls::client_cert_verifier_for_ca_bundle(&self.name, &ca_bundle)?;
+        *self.ca_bundle.write().unwrap() = Some(Arc::new(CaBundleAndVerifier {
+            ca_bundle,
+            verifier,
+        }));
+        tracing::info!(name = %self.name, "Loaded a new CA Bundle and Verifier");
+
+        // Clone out so a listener may call back into this provider.
+        let listeners = self.listeners.lock().unwrap().clone();
+        for listener in listeners {
+            listener.enqueue();
+        }
+        Ok(())
+    }
+
+    /// `hasCAChanged`.
+    fn has_ca_changed(&self, ca_bundle: &[u8]) -> bool {
+        match self.current() {
+            None => true,
+            Some(existing) => existing.ca_bundle != ca_bundle,
+        }
+    }
+
+    /// `RunOnce`.
+    #[allow(dead_code)] // ported provider surface; the kubelet bin has no consumer yet
+    pub fn run_once(&self) -> anyhow::Result<()> {
+        self.load_ca_bundle()
+    }
+
+    /// `Run` (dynamic_cafile_content.go:157-175): one worker, plus the loop
+    /// that watches the CA file and restarts the watch every
+    /// `FileRefreshDuration` after it fails. Returns when `stop` fires.
     pub async fn run(self: Arc<Self>, mut stop: tokio::sync::watch::Receiver<bool>) {
-        let mut tick = tokio::time::interval(FILE_REFRESH_DURATION);
-        tick.tick().await;
-        loop {
-            tokio::select! {
-                _ = tick.tick() => {}
-                _ = stop.changed() => return,
+        tracing::info!(name = %self.name, "Starting controller");
+        let worker = tokio::spawn(Arc::clone(&self).run_worker());
+        let this = Arc::clone(&self);
+        let watcher = tokio::spawn(async move {
+            loop {
+                if let Err(e) = this.watch_ca_file().await {
+                    tracing::error!("Failed to watch CA file, will retry later: {e:#}");
+                }
+                tokio::time::sleep(FILE_REFRESH_DURATION).await;
             }
-            match rusternetes_common::tls::client_cert_verifier_for_ca_file(&self.path) {
-                Ok(v) => *self.verifier.write().unwrap() = v,
-                Err(e) => tracing::error!("Reloading client CA {}: {e:#}", self.path),
+        });
+        let _ = stop.changed().await;
+        worker.abort();
+        watcher.abort();
+        tracing::info!(name = %self.name, "Shutting down controller");
+    }
+
+    /// The events fsnotify's inotify backend registers for a watched path
+    /// (backend_inotify.go: `IN_MOVED_TO | IN_MOVED_FROM | IN_CREATE |
+    /// IN_ATTRIB | IN_MODIFY | IN_MOVE_SELF | IN_DELETE | IN_DELETE_SELF`).
+    fn watch_mask() -> inotify::WatchMask {
+        use inotify::WatchMask;
+        WatchMask::MOVED_TO
+            | WatchMask::MOVED_FROM
+            | WatchMask::CREATE
+            | WatchMask::ATTRIB
+            | WatchMask::MODIFY
+            | WatchMask::MOVE_SELF
+            | WatchMask::DELETE
+            | WatchMask::DELETE_SELF
+    }
+
+    /// `watchCAFile`.
+    async fn watch_ca_file(&self) -> anyhow::Result<()> {
+        use futures_util::StreamExt;
+        // Trigger a check here to ensure the content will be checked
+        // periodically even if the following watch fails.
+        self.queue.add();
+
+        let inotify = inotify::Inotify::init()
+            .map_err(|e| anyhow::anyhow!("error creating fsnotify watcher: {e}"))?;
+        let mut watches = inotify.watches();
+        watches
+            .add(&self.filename, Self::watch_mask())
+            .map_err(|e| anyhow::anyhow!("error adding watch for file {}: {e}", self.filename))?;
+        // Trigger a check in case the file is updated before the watch starts.
+        self.queue.add();
+
+        let mut events = inotify.into_event_stream(vec![0u8; 4096])?;
+        while let Some(event) = events.next().await {
+            let event = event.map_err(|e| anyhow::anyhow!("received fsnotify error: {e}"))?;
+            self.handle_watch_event(event.mask, &mut watches)?;
+        }
+        Ok(())
+    }
+
+    /// `handleWatchEvent`: triggers reloading the CA file, and restarts a new
+    /// watch if it's a Remove or Rename event.
+    fn handle_watch_event(
+        &self,
+        mask: inotify::EventMask,
+        watches: &mut inotify::Watches,
+    ) -> anyhow::Result<()> {
+        use inotify::EventMask;
+        // `defer c.queue.Add(workItemKey)`: runs after the watch is restarted
+        // so no file event is missed.
+        let result = (|| {
+            // fsnotify reports Remove for IN_DELETE_SELF and Rename for IN_MOVE_SELF.
+            if !mask.intersects(EventMask::DELETE_SELF | EventMask::MOVE_SELF) {
+                return Ok(());
+            }
+            // A fresh `add` on the path covers the replacement file; adding an
+            // already-watched inode only updates its mask.
+            watches
+                .add(&self.filename, Self::watch_mask())
+                .map(|_| ())
+                .map_err(|e| anyhow::anyhow!("error adding watch for file {}: {e}", self.filename))
+        })();
+        self.queue.add();
+        result
+    }
+
+    async fn run_worker(self: Arc<Self>) {
+        loop {
+            self.process_next_work_item().await;
+        }
+    }
+
+    /// `processNextWorkItem`.
+    async fn process_next_work_item(&self) {
+        self.queue.get().await;
+        match self.load_ca_bundle() {
+            Ok(()) => self.queue.forget(),
+            Err(e) => {
+                tracing::error!("key failed with : {e:#}");
+                self.queue.add_rate_limited();
             }
         }
     }
@@ -2140,5 +2381,112 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(bad.get(&url).send().await.unwrap().status(), 401);
+    }
+
+    // ---- DynamicFileCAContent (dynamic_cafile_content_test.go) ------------
+
+    struct CountingListener(std::sync::atomic::AtomicUsize);
+    impl Listener for CountingListener {
+        fn enqueue(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    async fn verifies(ca: &Arc<ClientCaContent>, pki: &Pki) -> bool {
+        let (der, _, _) = client_cert(pki, "u", "g");
+        let leaf = CertificateDer::from(der);
+        ca.verifier()
+            .verify_client_cert(&leaf, &[], UnixTime::now())
+            .is_ok()
+    }
+
+    async fn eventually<F: std::future::Future<Output = bool>>(mut f: impl FnMut() -> F) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if f().await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("condition not reached in time");
+    }
+
+    // NewDynamicCAContentFromFile: a missing, empty or certificate-less file
+    // fails construction.
+    #[test]
+    fn client_ca_content_rejects_bad_files() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(ClientCaContent::from_file("").is_err());
+        assert!(ClientCaContent::from_file(dir.path().join("none").to_str().unwrap()).is_err());
+        let empty = dir.path().join("empty.pem");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(ClientCaContent::from_file(empty.to_str().unwrap()).is_err());
+        let junk = dir.path().join("junk.pem");
+        std::fs::write(&junk, b"not a cert").unwrap();
+        assert!(ClientCaContent::from_file(junk.to_str().unwrap()).is_err());
+    }
+
+    // loadCABundle: unchanged content does not notify listeners; changed
+    // content swaps the bundle and notifies; a bad write keeps the old one.
+    #[test]
+    fn client_ca_content_load_detects_change() {
+        let (a, b) = (pki(), pki());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.pem");
+        std::fs::write(&path, &a.ca_pem).unwrap();
+        let ca = ClientCaContent::from_file(path.to_str().unwrap()).unwrap();
+        let l = Arc::new(CountingListener(Default::default()));
+        ca.add_listener(l.clone());
+
+        ca.run_once().unwrap();
+        assert_eq!(l.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        std::fs::write(&path, &b.ca_pem).unwrap();
+        ca.run_once().unwrap();
+        assert_eq!(l.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(ca.current_ca_bundle_content(), b.ca_pem.as_bytes());
+
+        std::fs::write(&path, b"garbage").unwrap();
+        assert!(ca.run_once().is_err());
+        assert_eq!(ca.current_ca_bundle_content(), b.ca_pem.as_bytes());
+        std::fs::write(&path, b"").unwrap();
+        assert!(ca.run_once().is_err());
+        assert_eq!(ca.current_ca_bundle_content(), b.ca_pem.as_bytes());
+    }
+
+    // Run: an in-place write and an atomic rename-over (kubelet configmap/secret
+    // volume style) are both picked up by the file watch, with no 1-minute wait.
+    #[tokio::test]
+    async fn client_ca_content_reloads_on_file_change() {
+        let (a, b, c) = (pki(), pki(), pki());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.pem");
+        std::fs::write(&path, &a.ca_pem).unwrap();
+        let ca = ClientCaContent::from_file(path.to_str().unwrap()).unwrap();
+        assert!(verifies(&ca, &a).await);
+        assert!(!verifies(&ca, &b).await);
+
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(ca.clone().run(stop_rx));
+        // let the watch register
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        std::fs::write(&path, &b.ca_pem).unwrap();
+        eventually(|| verifies(&ca, &b)).await;
+        assert!(!verifies(&ca, &a).await);
+
+        // rename over the watched file: the watch is re-added on the new inode
+        let tmp = dir.path().join("ca.pem.tmp");
+        std::fs::write(&tmp, &c.ca_pem).unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+        eventually(|| verifies(&ca, &c)).await;
+
+        // and a second replacement still lands
+        std::fs::write(&tmp, &a.ca_pem).unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+        eventually(|| verifies(&ca, &a)).await;
+
+        stop_tx.send(true).unwrap();
+        task.await.unwrap();
     }
 }
