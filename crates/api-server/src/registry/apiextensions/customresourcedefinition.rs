@@ -1573,10 +1573,12 @@ impl ControllerRateLimiter {
 /// `wait.UntilWithContext(ctx, c.runWorker, time.Second)`, :280-282). A CRD
 /// left Terminating by a restart or a failed `delete_instances` is retried.
 ///
-/// Upstream's controllers also react to each watch event; here a CRD write
-/// queues the CRD on the workqueue of `controller_queue.rs`, so this task is
-/// the resync-driven half. The finalizer has its own queue and workers
-/// (`finalizer_queue.rs`), fed by the same writes.
+/// Upstream's controllers react to each informer event: [`run_crd_informer`]
+/// (a storage watch) feeds them here, and a CRD write through the request
+/// path queues the CRD directly as well (the queues dedupe). The workers
+/// (naming/establishing on `controller_queue.rs`, the finalizer's five on
+/// `finalizer_queue.rs`) are started by this hook, as `go <controller>.Run`
+/// in apiserver.go:244-249; this task is the resync-driven half.
 ///
 /// Registered as the `start-apiextensions-controllers` post-start hook
 /// (apiserver.go:228-261: `go <controller>.Run(...)` for each, `return nil`).
@@ -1625,10 +1627,142 @@ pub fn spawn_crd_informer_synced_hook(storage: Arc<StorageBackend>) -> tokio::ta
     })
 }
 
+/// One CRD informer event, as `cache.SharedIndexInformer` hands it to the
+/// controllers' `ResourceEventHandlerFuncs`.
+#[derive(Debug, Clone)]
+pub(super) enum CrdEvent {
+    Add(Box<CustomResourceDefinition>),
+    Update(Box<CustomResourceDefinition>, Box<CustomResourceDefinition>),
+    Delete(Box<CustomResourceDefinition>),
+}
+
+/// The informer's local store (`DeltaFIFO` + indexer): turns a CRD's
+/// presence in it into add vs update, and supplies the update's `oldObj`.
+pub(super) fn apply_crd(
+    cache: &mut std::collections::HashMap<String, CustomResourceDefinition>,
+    new: CustomResourceDefinition,
+) -> CrdEvent {
+    match cache.insert(new.metadata.name.clone(), new.clone()) {
+        Some(old) => CrdEvent::Update(Box::new(old), Box::new(new)),
+        None => CrdEvent::Add(Box::new(new)),
+    }
+}
+
+/// `Replace` (shared_informer.go / delta_fifo.go): after a (re)list, every
+/// listed object is an add/update against the cache and every cached object
+/// that is no longer listed is a delete.
+pub(super) fn relist_events(
+    cache: &mut std::collections::HashMap<String, CustomResourceDefinition>,
+    listed: Vec<CustomResourceDefinition>,
+) -> Vec<CrdEvent> {
+    let names: std::collections::HashSet<String> =
+        listed.iter().map(|c| c.metadata.name.clone()).collect();
+    let mut events: Vec<CrdEvent> = Vec::new();
+    let gone: Vec<String> = cache
+        .keys()
+        .filter(|n| !names.contains(*n))
+        .cloned()
+        .collect();
+    for name in gone {
+        if let Some(old) = cache.remove(&name) {
+            events.push(CrdEvent::Delete(Box::new(old)));
+        }
+    }
+    for crd in listed {
+        events.push(apply_crd(cache, crd));
+    }
+    events
+}
+
+impl CrdRest {
+    /// The controllers' event handlers for one informer event: the naming
+    /// and establishing controllers' `AddFunc`/`UpdateFunc`/`DeleteFunc`
+    /// (`queue.Add(key)`, naming_controller.go:343-379,
+    /// establishing_controller.go:71-73) and the finalizer's
+    /// `AddFunc`/`UpdateFunc` filters (crd_finalizer.go:332-366). The
+    /// workqueues dedupe, so an event the write path already delivered is
+    /// not processed twice.
+    pub(super) fn handle_crd_event(&self, event: &CrdEvent) {
+        match event {
+            CrdEvent::Add(new) => {
+                self.enqueue(&new.metadata.name);
+                self.finalizer_event(None, new);
+            }
+            CrdEvent::Update(old, new) => {
+                self.enqueue(&new.metadata.name);
+                self.finalizer_event(Some(old), new);
+            }
+            CrdEvent::Delete(old) => {
+                self.controllers.conditions.forget(&old.metadata.name);
+                self.enqueue(&old.metadata.name);
+            }
+        }
+    }
+}
+
+/// The CRD informer behind `s.Informers.Apiextensions().V1().
+/// CustomResourceDefinitions()` (started by the `start-apiextensions-informers`
+/// hook, apiserver.go:221-224): a storage watch opened BEFORE the initial
+/// list so no event falls between them, feeding [`CrdRest::handle_crd_event`].
+/// Controllers therefore react to every CRD change in storage, not only to
+/// writes that went through this api-server's request path. A watch that
+/// ends is re-established and re-listed (reflector `ListAndWatch`).
+async fn run_crd_informer(
+    storage: Arc<StorageBackend>,
+    controllers: Arc<super::controller_queue::CrdControllers>,
+) {
+    use futures::StreamExt;
+    use rusternetes_storage::WatchEvent;
+    let rest = CrdRest::with_controllers(storage.clone(), controllers);
+    let prefix = build_prefix("customresourcedefinitions", None);
+    let mut cache = std::collections::HashMap::new();
+    loop {
+        match storage.watch(&prefix).await {
+            Err(e) => warn!("crd informer: cannot watch CRDs: {e}"),
+            Ok(mut stream) => match storage.list::<CustomResourceDefinition>(&prefix).await {
+                Err(e) => warn!("crd informer: cannot list CRDs: {e}"),
+                Ok(listed) => {
+                    for ev in relist_events(&mut cache, listed) {
+                        rest.handle_crd_event(&ev);
+                    }
+                    while let Some(ev) = stream.next().await {
+                        let Ok(ev) = ev else { break };
+                        let event = match ev {
+                            WatchEvent::Added(_, v) | WatchEvent::Modified(_, v) => {
+                                match serde_json::from_str::<CustomResourceDefinition>(&v) {
+                                    Ok(new) => apply_crd(&mut cache, new),
+                                    Err(_) => continue,
+                                }
+                            }
+                            WatchEvent::Deleted(_, v) => {
+                                match serde_json::from_str::<CustomResourceDefinition>(&v) {
+                                    Ok(old) => {
+                                        cache.remove(&old.metadata.name);
+                                        CrdEvent::Delete(Box::new(old))
+                                    }
+                                    Err(_) => continue,
+                                }
+                            }
+                        };
+                        rest.handle_crd_event(&event);
+                    }
+                }
+            },
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
 fn start_controllers_loop(
     storage: Arc<StorageBackend>,
     controllers: Arc<super::controller_queue::CrdControllers>,
 ) -> tokio::task::JoinHandle<()> {
+    // `go namingController.RunWithContext`, `go establishingController...`,
+    // `go finalizingController.Run(5, ..)` (apiserver.go:244-249): the
+    // workers start with the hook, not on the first CRD write.
+    controllers.ensure_started(storage.clone());
+    // The informer whose events feed them (apiserver.go:221-224).
+    tokio::spawn(run_crd_informer(storage.clone(), controllers.clone()));
     tokio::spawn(async move {
         // The one set of controllers (queue + memos) the request path uses.
         let rest = CrdRest::with_controllers(storage, controllers);
@@ -1767,6 +1901,77 @@ mod tests {
         .await;
         assert_eq!(out.len(), 12);
         assert_eq!(peak.load(Ordering::SeqCst), 5);
+    }
+
+    fn named(name: &str) -> CustomResourceDefinition {
+        let mut c = crd(serde_json::json!({}));
+        c.metadata.name = name.to_string();
+        c
+    }
+
+    /// The informer's store: first sight is an add, then updates carry the
+    /// cached `oldObj`; a relist deletes what is no longer listed
+    /// (delta_fifo.go `Replace`).
+    #[test]
+    fn informer_cache_yields_add_update_and_relist_delete() {
+        let mut cache = std::collections::HashMap::new();
+        assert!(matches!(
+            apply_crd(&mut cache, named("a")),
+            CrdEvent::Add(_)
+        ));
+        assert!(matches!(
+            apply_crd(&mut cache, named("a")),
+            CrdEvent::Update(_, _)
+        ));
+        apply_crd(&mut cache, named("b"));
+        let events = relist_events(&mut cache, vec![named("b"), named("c")]);
+        let kinds: Vec<(&str, String)> = events
+            .iter()
+            .map(|e| match e {
+                CrdEvent::Add(c) => ("add", c.metadata.name.clone()),
+                CrdEvent::Update(_, c) => ("update", c.metadata.name.clone()),
+                CrdEvent::Delete(c) => ("delete", c.metadata.name.clone()),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("delete", "a".to_string()),
+                ("update", "b".to_string()),
+                ("add", "c".to_string())
+            ]
+        );
+    }
+
+    /// A CRD written straight to storage (not through the request path) is
+    /// still established: the post-start hook's informer delivers the event
+    /// to workers the hook started (apiserver.go:221-252).
+    #[tokio::test]
+    async fn hook_started_informer_establishes_a_crd_written_to_storage() {
+        let storage = Arc::new(StorageBackend::new_memory());
+        let controllers: Arc<super::super::controller_queue::CrdControllers> = Default::default();
+        let _h = start_controllers_loop(storage.clone(), controllers.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let c = named("widgets.example.com");
+        storage
+            .create(
+                "/registry/customresourcedefinitions/widgets.example.com",
+                &c,
+            )
+            .await
+            .unwrap();
+        let rest = CrdRest::with_controllers(storage.clone(), controllers);
+        for _ in 0..100 {
+            if let Some(c) = rest.get_crd("widgets.example.com").await.unwrap() {
+                if super::controllers::find_crd_condition(&c, "Established")
+                    .is_some_and(|x| x.status == "True")
+                {
+                    return;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("CRD written to storage was never established");
     }
 
     fn crd(extra: serde_json::Value) -> CustomResourceDefinition {

@@ -13,11 +13,14 @@
 //! of `pkg/apis/apiextensions/helpers.go` they share.
 //!
 //! Upstream runs them as informer-driven controllers started by a post-start
-//! hook of the apiextensions-apiserver. Here a CRD write enqueues the CRD on
-//! a workqueue (`controller_queue.rs`) that a worker drains, running the same
-//! functions through the `/status` store (see `CrdRest` in
-//! `customresourcedefinition.rs`), so the create response is not Established
-//! and the condition arrives on a later update, as upstream's does.
+//! hook of the apiextensions-apiserver. Here the `start-apiextensions-
+//! controllers` hook starts the workers and a CRD informer (a storage watch,
+//! `run_crd_informer` in `customresourcedefinition.rs`) enqueues each CRD
+//! event on their workqueues (`controller_queue.rs`); a CRD write through
+//! the request path enqueues it too (deduped). The workers run the same
+//! functions through the `/status` store (see `CrdRest`), so the create
+//! response is not Established and the condition arrives on a later update,
+//! as upstream's does.
 //!
 //! The `nonstructuralschema` and `apiapproval` controllers live in
 //! `condition_controllers.rs`.
