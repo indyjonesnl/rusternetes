@@ -7,7 +7,7 @@
 //! attach/detach controller, which this project does not run in the kubelet.
 //! `mountArgs.SELinuxLabel` / `AddSELinuxMountOption` (`attacher.go:128-130`)
 //! waits on [`DeviceMounterArgs`] carrying the label (#2312, #3493). Nothing
-//! calls `UnmountDevice` yet (#3492).
+//! drives `UnmountDevice` from `VolumeManager::unmount_unused_iscsi_devices`.
 
 use super::{
     create_secret_map, get_iscsi_volume_info, volume_spec_to_mounter_with, DiskManager, IscsiDisk,

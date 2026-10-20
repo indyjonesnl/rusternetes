@@ -2426,7 +2426,7 @@ impl Kubelet {
             .filter(|p| !pod_volumes_released(p))
             .cloned()
             .collect();
-        self.runtime.unmount_unused_csi_devices(&desired_pods).await;
+        self.runtime.unmount_unused_devices(&desired_pods).await;
         self.runtime.cleanup_orphaned_pod_dirs(&live_pod_uids);
 
         // Garbage-collect terminal pods (Succeeded/Failed) from storage.
