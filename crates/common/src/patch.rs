@@ -516,26 +516,11 @@ fn apply_strategic_merge_patch(original: &Value, patch: &Value) -> Result<Value,
             }
         }
         "delete" => {
-            // Upstream parity: `$patch: delete` on a map clears the
-            // original. If the patch carries sibling (non-directive)
-            // keys, treat the directive as "start from an empty map and
-            // merge the siblings" so combined delete + add bodies work
-            // (e.g. `{$patch: delete, new: value}`).
-            let mut new_obj = serde_json::Map::new();
-            let mut had_siblings = false;
-            for (key, value) in patch_obj {
-                if key.starts_with('$') {
-                    continue;
-                }
-                had_siblings = true;
-                if !value.is_null() {
-                    new_obj.insert(key.clone(), value.clone());
-                }
-            }
-            if had_siblings {
-                return Ok(Value::Object(new_obj));
-            }
-            return Ok(Value::Null);
+            // `handleDirectiveInMergeMap` (apimachinery strategicpatch/
+            // patch.go:916-920): "If the patch contains "$patch: delete",
+            // don't merge it, just return an empty map." Sibling keys are
+            // ignored and `mergeMap` stores the `{}` under the key.
+            return Ok(json!({}));
         }
         _ => {
             // Default merge strategy
@@ -1828,7 +1813,21 @@ mod tests {
         });
 
         let result = apply_strategic_merge_patch(&original, &patch).unwrap();
-        assert!(result["metadata"]["annotations"].is_null());
+        // `handleDirectiveInMergeMap` (strategicpatch/patch.go:916-920)
+        // returns an empty map, and `mergeMap` stores it under the key.
+        assert_eq!(result["metadata"]["annotations"], json!({}));
+    }
+
+    /// `$patch: delete` ignores every sibling key (patch.go:916-920), unlike
+    /// a "clear then merge siblings" reading.
+    #[test]
+    fn test_strategic_merge_delete_directive_ignores_siblings() {
+        let original = json!({"metadata": {"annotations": {"old": "1"}}});
+        let patch = json!({
+            "metadata": {"annotations": {"$patch": "delete", "new": "2"}}
+        });
+        let result = apply_strategic_merge_patch(&original, &patch).unwrap();
+        assert_eq!(result["metadata"]["annotations"], json!({}));
     }
 
     // Regression: the garbage collector orphans a dependent by strategic-merge
