@@ -39,7 +39,7 @@ use rusternetes_storage::Storage;
 use super::rest::{authorize, RequestScope};
 use crate::admission::caching_authorizer::new_caching_authorizer;
 use crate::admission::plugins::enabled as plugin_enabled;
-use crate::admission::{resourcequota, storage_object_in_use_protection};
+use crate::admission::{builtin_plugins, resourcequota, storage_object_in_use_protection};
 use crate::registry::rest::{
     GroupResource, Object, RequestContext, TransformFunc, ValidateObject, ValidateObjectUpdate,
 };
@@ -147,10 +147,33 @@ impl Admission<'_> {
     /// (plugin/pkg/admission/storage/storageclass/setdefault/admission.go)
     /// handles only CREATE of a PersistentVolumeClaim. LimitRanger's `Admit`
     /// mutates only pods.
-    async fn admit_in_tree<T: Object>(&self, op: &Operation, obj: T) -> Result<T> {
+    async fn admit_in_tree<T: Object>(&self, op: &Operation, obj: T, old: Option<&T>) -> Result<T> {
         if self.is_core("pods") {
             let pod: Pod = recast(&obj)?;
-            return recast(&self.admit_pod(op, pod).await?);
+            let mut pod = self.admit_pod(op, pod).await?;
+            // AlwaysPullImages.Admit (alwayspullimages/admission.go:53-76):
+            // Create and Update, skipping `shouldIgnore` (:161-171).
+            if plugin_enabled("AlwaysPullImages")
+                && matches!(op, Operation::Create | Operation::Update)
+            {
+                let old: Option<Pod> = old.map(recast).transpose()?;
+                if !builtin_plugins::is_update_with_no_new_images(&pod, old.as_ref()) {
+                    builtin_plugins::always_pull_images_admit(&mut pod);
+                }
+            }
+            return recast(&pod);
+        }
+        // DefaultIngressClass.Admit (defaultingressclass/admission.go:84-129):
+        // CREATE of an `ingresses` in networking.k8s.io, no subresource.
+        if *op == Operation::Create
+            && plugin_enabled("DefaultIngressClass")
+            && self.resource.group == "networking.k8s.io"
+            && self.resource.resource == "ingresses"
+            && self.subresource.is_none()
+        {
+            let mut ingress: rusternetes_common::resources::Ingress = recast(&obj)?;
+            builtin_plugins::default_ingress_class(&self.state.storage, &mut ingress).await?;
+            return recast(&ingress);
         }
         // NodeRestriction.Admit (admission.go:228-229): a node's request on
         // any operation or subresource of a PodCertificateRequest.
@@ -291,6 +314,7 @@ impl Admission<'_> {
                 }
             }
         }
+        self.validate_builtin_plugins(op, obj, old).await?;
         if self.is_core("pods") || self.is_pod_resize() || self.is_pod_ephemeralcontainers() {
             let obj: Option<Pod> = obj.map(recast).transpose()?;
             let old: Option<Pod> = old.map(recast).transpose()?;
@@ -319,6 +343,52 @@ impl Admission<'_> {
             Ok(Some(err)) => Err(self.forbidden(&pvc.metadata.name, err)),
             Err(e) => Err(self.forbidden(&pvc.metadata.name, e)),
         }
+    }
+
+    /// The validating half of the small in-tree plugins of
+    /// [`crate::admission::builtin_plugins`], in `AllOrderedPlugins` order
+    /// (plugins.go:69-111): LimitPodHardAntiAffinityTopology,
+    /// AlwaysPullImages, PersistentVolumeClaimResize,
+    /// DenyServiceExternalIPs. Each registers for Create and Update (the
+    /// resize plugin for Update only) and ignores subresources.
+    async fn validate_builtin_plugins<T: Object>(
+        &self,
+        op: &Operation,
+        obj: Option<&T>,
+        old: Option<&T>,
+    ) -> Result<()> {
+        let (Some(obj), true) = (obj, matches!(op, Operation::Create | Operation::Update)) else {
+            return Ok(());
+        };
+        if self.is_core("pods") {
+            let pod: Pod = recast(obj)?;
+            if plugin_enabled("LimitPodHardAntiAffinityTopology") {
+                builtin_plugins::limit_pod_hard_anti_affinity_topology(&pod)?;
+            }
+            if plugin_enabled("AlwaysPullImages") {
+                let old: Option<Pod> = old.map(recast).transpose()?;
+                if !builtin_plugins::is_update_with_no_new_images(&pod, old.as_ref()) {
+                    builtin_plugins::always_pull_images_validate("pods", &pod)?;
+                }
+            }
+        }
+        if *op == Operation::Update
+            && plugin_enabled("PersistentVolumeClaimResize")
+            && self.is_core("persistentvolumeclaims")
+        {
+            if let Some(old) = old {
+                let pvc: PersistentVolumeClaim = recast(obj)?;
+                let old: PersistentVolumeClaim = recast(old)?;
+                builtin_plugins::pvc_resize_validate(&self.state.storage, &pvc, &old).await?;
+            }
+        }
+        if plugin_enabled("DenyServiceExternalIPs") && self.is_core("services") {
+            let svc: rusternetes_common::resources::Service = recast(obj)?;
+            let old: Option<rusternetes_common::resources::Service> =
+                old.map(recast).transpose()?;
+            builtin_plugins::deny_service_external_ips(&svc, old.as_ref())?;
+        }
+        Ok(())
     }
 
     /// The `certificates/approval` and `certificates/signing` plugins, for an
@@ -824,6 +894,11 @@ impl Admission<'_> {
         use crate::admission::policy_mutating::ReinvocationContext;
         let reinvocation = std::sync::Arc::new(ReinvocationContext::new(false));
         let obj = self.admit_chain(&op, obj, old, &reinvocation).await?;
+        // AlwaysDeny is last in `AllOrderedPlugins` (plugins.go:69-111),
+        // after the webhooks.
+        if plugin_enabled("AlwaysDeny") {
+            return Err(self.always_deny(obj.metadata()));
+        }
         if !reinvocation.should_reinvoke() {
             return Ok(obj);
         }
@@ -842,7 +917,7 @@ impl Admission<'_> {
         // MutatingAdmissionPolicy is first (plugins.go:106-110), ahead of
         // the webhooks; the in-tree plugins in `AllOrderedPlugins` precede
         // all four, and they are kept ahead of it here as before.
-        let obj = self.admit_in_tree(op, obj).await?;
+        let obj = self.admit_in_tree(op, obj, old).await?;
         let obj = self
             .admit_mutating_policy(op, obj, old, reinvocation)
             .await?;
@@ -939,6 +1014,10 @@ impl Admission<'_> {
             .or(old)
             .map(|o| o.metadata().name.clone())
             .unwrap_or_default();
+        let deny = plugin_enabled("AlwaysDeny").then(|| {
+            let default = rusternetes_common::types::ObjectMeta::default();
+            self.always_deny(obj.or(old).map(|o| o.metadata()).unwrap_or(&default))
+        });
         let obj = obj.map(to_value).transpose()?;
         let old = old.map(to_value).transpose()?;
 
@@ -986,11 +1065,21 @@ impl Admission<'_> {
             }
         }
 
-        if !plugin_enabled("ResourceQuota") {
-            return Ok(());
+        if plugin_enabled("ResourceQuota") {
+            self.validate_quota(op.clone(), &name, obj.as_ref(), old.as_ref())
+                .await?;
         }
-        self.validate_quota(op, &name, obj.as_ref(), old.as_ref())
-            .await
+        // AlwaysDeny is last in `AllOrderedPlugins` (plugins.go:69-111) and
+        // handles every operation (deny/admission.go:57-60).
+        deny.map_or(Ok(()), Err)
+    }
+
+    /// `alwaysDeny`'s `NewForbidden` (deny/admission.go:46-54).
+    fn always_deny(&self, meta: &rusternetes_common::types::ObjectMeta) -> Error {
+        builtin_plugins::always_deny(
+            &GroupResource::new(&self.resource.group, &self.resource.resource).to_string(),
+            &builtin_plugins::attr_name(meta),
+        )
     }
 
     /// `QuotaAdmission.Validate` (apiserver/pkg/admission/plugin/
