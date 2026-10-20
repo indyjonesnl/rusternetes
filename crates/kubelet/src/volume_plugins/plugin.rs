@@ -362,6 +362,11 @@ pub struct Attributes {
 /// `desired_size` is the byte count of the `resource.Quantity`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MounterArgs {
+    /// `MounterArgs.Recorder` (`volume.go:134`): the event recorder the
+    /// operation generator hands the mounter (`og.recorder`,
+    /// `operation_generator.go:587`). `None` is a nil recorder: events a
+    /// mounter would emit are dropped.
+    pub recorder: Option<MounterRecorder>,
     /// When set, ownership of the volume is changed to be owned and writable
     /// by `fs_user`. Currently only for projected service account tokens.
     pub fs_user: Option<i64>,
@@ -370,6 +375,32 @@ pub struct MounterArgs {
     pub desired_size: Option<i64>,
     pub selinux_label: String,
 }
+
+/// The `record.EventRecorder` carried by [`MounterArgs`]
+/// (`MounterArgs.Recorder`, `volume.go:134`).
+///
+/// A newtype so [`MounterArgs`] keeps its `Debug`/`PartialEq` derives: the
+/// recorder is a handle onto shared state, not part of the args' value, so
+/// two args are equal regardless of the recorder (it is skipped by `Debug`
+/// too).
+#[derive(Clone)]
+pub struct MounterRecorder(
+    pub rusternetes_storage::EventRecorder<rusternetes_storage::StorageBackend>,
+);
+
+impl std::fmt::Debug for MounterRecorder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MounterRecorder")
+    }
+}
+
+impl PartialEq for MounterRecorder {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for MounterRecorder {}
 
 /// Port of `volume.Mounter` (`pkg/volume/volume.go:162`).
 ///

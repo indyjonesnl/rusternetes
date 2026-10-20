@@ -21,7 +21,7 @@ pub struct HostUtil;
 /// `FileType` (`hostutil.go:24-39`), reduced to the kinds `PathIsDevice`
 /// distinguishes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FileType {
+pub enum FileType {
     BlockDev,
     CharDev,
     Directory,
@@ -30,7 +30,7 @@ enum FileType {
 }
 
 /// `getFileType` (`hostutil.go:80-110`): `os.Stat`, then classify the mode.
-fn get_file_type(pathname: &str) -> io::Result<FileType> {
+pub fn get_file_type(pathname: &str) -> io::Result<FileType> {
     use std::os::unix::fs::FileTypeExt;
     let info = match std::fs::metadata(pathname) {
         Ok(info) => info,

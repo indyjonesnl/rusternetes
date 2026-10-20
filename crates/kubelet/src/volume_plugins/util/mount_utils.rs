@@ -424,6 +424,35 @@ pub fn is_not_mount_point(file: &str) -> io::Result<bool> {
     is_mount_point_at(file, PROC_MOUNT_INFO_PATH).map(|m| !m)
 }
 
+/// `mount.IsNotMountPoint(mounter, file)` (`mount.go:240-290`), over any
+/// [`MountInterface`](super::mount_interface::MountInterface): the cheap
+/// `IsLikelyNotMountPoint` check, then, when that says "not a mount point",
+/// the authoritative `List()` scan (a bind mount of the same device is
+/// invisible to the cheap check). A permission error on the cheap check falls
+/// back to the scan; any other error is returned.
+pub fn is_not_mount_point_with(
+    mounter: &dyn super::mount_interface::MountInterface,
+    file: &str,
+) -> io::Result<bool> {
+    let not_mnt = match mounter.is_likely_not_mount_point(file) {
+        Ok(v) => v,
+        // We were not allowed to do the simple stat() check, e.g. on NFS with
+        // root_squash. Fall back to the mount list check below.
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => true,
+        Err(e) => return Err(e),
+    };
+    // identified as mountpoint, so return this fact.
+    if !not_mnt {
+        return Ok(false);
+    }
+    // Resolve any symlinks in file, kernel would do the same and use the
+    // resolved path in /proc/mounts.
+    let resolved = std::fs::canonicalize(file)?;
+    let resolved = resolved.to_string_lossy();
+    // check all mountpoints since IsLikelyNotMountPoint did not help
+    Ok(!mounter.list()?.iter().any(|mp| mp.path == resolved))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
