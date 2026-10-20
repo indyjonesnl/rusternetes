@@ -43,6 +43,9 @@ pub const CONTAINER_PROBE_WARNING: &str = "ProbeWarning";
 /// A node filesystem resize failed (`FileSystemResizeFailed`,
 /// `pkg/kubelet/events/event.go:67`).
 pub const FILE_SYSTEM_RESIZE_FAILED: &str = "FileSystemResizeFailed";
+/// A volume resize failed (`VolumeResizeFailed`,
+/// `pkg/kubelet/events/event.go:65`).
+pub const VOLUME_RESIZE_FAILED: &str = "VolumeResizeFailed";
 /// A node filesystem resize succeeded (`FileSystemResizeSuccess`,
 /// `pkg/kubelet/events/event.go:69`; the reason string is
 /// `FileSystemResizeSuccessful`).

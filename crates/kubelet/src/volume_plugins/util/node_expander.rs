@@ -488,7 +488,7 @@ pub(crate) mod tests {
             Some(self)
         }
         async fn new_mounter(&self, _s: &Spec<'_>, _p: &Pod) -> anyhow::Result<Box<dyn Mounter>> {
-            Err(anyhow!("not used"))
+            Ok(Box::new(FakeMounter))
         }
         fn new_unmounter(
             &self,
@@ -503,6 +503,26 @@ pub(crate) mod tests {
             _p: &str,
         ) -> anyhow::Result<crate::volume_plugins::plugin::ReconstructedVolume> {
             Err(anyhow!("not used"))
+        }
+    }
+
+    /// `FakeVolume`'s mounter: only `GetPath` is read by node expansion.
+    struct FakeMounter;
+
+    #[async_trait]
+    impl Mounter for FakeMounter {
+        fn get_path(&self) -> String {
+            "/mnt/fake".to_string()
+        }
+        async fn set_up_at(
+            &self,
+            _dir: &str,
+            _args: &crate::volume_plugins::MounterArgs,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn get_attributes(&self) -> crate::volume_plugins::plugin::Attributes {
+            Default::default()
         }
     }
 
@@ -564,6 +584,7 @@ pub(crate) mod tests {
             "metadata": {"name": "test-vol0"},
             "spec": {
                 "capacity": {"storage": cap},
+                "volumeMode": "Filesystem",
                 "csi": {"driver": "d", "volumeHandle": "h"},
                 "claimRef": {"namespace": "ns", "name": "test-vol0"}
             }
