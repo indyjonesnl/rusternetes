@@ -398,6 +398,7 @@ mod tests {
             namespace: Some("default"),
             user: &user,
             dry_run: false,
+            forbid_create: false,
         };
         let op = if old.is_some() {
             Operation::Update
