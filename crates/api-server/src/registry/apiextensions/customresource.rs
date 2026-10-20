@@ -47,6 +47,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use rusternetes_common::deletion::{DeleteOptions, Preconditions};
+use rusternetes_common::fieldmanager::schema::Type as FieldType;
 use rusternetes_common::resources::{
     prune_custom_resource, CustomResource, CustomResourceDefinition,
     CustomResourceSubresourceScale, ResourceScope, Scale, ScaleSpec, ScaleStatus,
@@ -237,6 +238,8 @@ pub enum StrictMode {
 pub struct Strategy {
     crd: Arc<CustomResourceDefinition>,
     version: String,
+    /// The served version's field-manager schema, built on first use.
+    field_schema: std::sync::OnceLock<Option<Arc<FieldType>>>,
 }
 
 impl Strategy {
@@ -244,7 +247,21 @@ impl Strategy {
         Self {
             crd,
             version: version.to_string(),
+            field_schema: std::sync::OnceLock::new(),
         }
+    }
+
+    /// The `typeConverter` of this version's field manager
+    /// (`customresource_handler.go` `typeConverter` from
+    /// `managedfields.NewTypeConverter(openapiModels, preserveUnknownFields)`):
+    /// the served version's structural schema.
+    fn field_schema(&self) -> Option<Arc<FieldType>> {
+        self.field_schema
+            .get_or_init(|| {
+                self.structural_schema()
+                    .map(|s| Arc::new(FieldType::from_structural(&s)))
+            })
+            .clone()
     }
 
     fn api_version(&self) -> String {
@@ -542,6 +559,10 @@ impl RestUpdateStrategy<CustomResource> for Strategy {
     /// strategy.go:282-285.
     /// `GetResetFields` (strategy.go:130-142): `status`, only when the
     /// version has a `/status` subresource (`a.status != nil`).
+    fn field_schema(&self) -> Option<Arc<FieldType>> {
+        Strategy::field_schema(self)
+    }
+
     fn get_reset_fields(&self) -> ResetFields {
         let mut fields = ResetFields::new();
         if self.status_enabled() {
@@ -609,6 +630,10 @@ impl RestUpdateStrategy<CustomResource> for StatusStrategy {
         _old: &CustomResource,
     ) -> Vec<String> {
         Vec::new()
+    }
+
+    fn field_schema(&self) -> Option<Arc<FieldType>> {
+        self.0.field_schema()
     }
 
     /// `GetResetFields` (status_strategy.go:46-64): `spec`.
@@ -852,6 +877,10 @@ impl RestStorage<CustomResource> for CustomResourceRest {
     /// from it (store.go:1698-1703).
     fn get_reset_fields(&self) -> ResetFields {
         RestStorage::get_reset_fields(&self.store)
+    }
+
+    fn field_schema(&self) -> Option<Arc<FieldType>> {
+        RestStorage::field_schema(&self.store)
     }
 
     /// `schemaCoercingDecoder.Decode` + `unstructuredDefaulter.Default`

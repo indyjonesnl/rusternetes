@@ -96,3 +96,106 @@ fn the_user_agent_prefix_is_printable_and_bounded() {
     assert_eq!(prefix_from_user_agent(""), "");
     assert_eq!(prefix_from_user_agent(&"x".repeat(300)).len(), 128);
 }
+
+fn pod_fields(obj: &Value) -> Value {
+    let t = super::schemas::builtin("v1", "Pod").expect("Pod schema");
+    Fields::of_typed(obj, &t).set.to_fields_v1()
+}
+
+/// Pod `ports` are keyed by `[containerPort, protocol]`, the key `protocol`
+/// defaulting to `TCP` from the schema (`x-kubernetes-list-map-keys`); the
+/// name table keyed no such list (#2734).
+#[test]
+fn pod_ports_are_keyed_by_port_and_protocol_with_the_schema_default() {
+    let obj = json!({"spec": {"containers": [{"name": "c", "ports": [
+        {"containerPort": 53, "protocol": "UDP"},
+        {"containerPort": 53}]}]}});
+    let ports = &pod_fields(&obj)["f:spec"]["f:containers"]["k:{\"name\":\"c\"}"]["f:ports"];
+    assert!(ports
+        .get("k:{\"containerPort\":53,\"protocol\":\"UDP\"}")
+        .is_some());
+    assert!(ports
+        .get("k:{\"containerPort\":53,\"protocol\":\"TCP\"}")
+        .is_some());
+}
+
+/// `nodeSelector` is `x-kubernetes-map-type: atomic` and `tolerations` an
+/// atomic list: one leaf each, where the name table made `nodeSelector` a
+/// granular map.
+#[test]
+fn atomic_maps_and_lists_are_one_leaf() {
+    let obj = json!({"spec": {"nodeSelector": {"a": "b"}, "tolerations": [{"key": "k"}]}});
+    let f = pod_fields(&obj);
+    assert_eq!(f["f:spec"]["f:nodeSelector"], json!({}));
+    assert_eq!(f["f:spec"]["f:tolerations"], json!({}));
+}
+
+/// A Deployment's root comes from the vendored apps/v1 definition, so
+/// `spec.selector` (a `LabelSelector`, atomic) is a leaf.
+#[test]
+fn deployment_selector_is_atomic() {
+    let t = super::schemas::builtin("apps/v1", "Deployment").expect("Deployment schema");
+    let obj = json!({"spec": {"selector": {"matchLabels": {"a": "b"}}, "replicas": 1}});
+    assert_eq!(
+        Fields::of_typed(&obj, &t).set.to_fields_v1(),
+        json!({"f:spec": {"f:replicas": {}, "f:selector": {}}})
+    );
+}
+
+/// A custom resource's `x-kubernetes-list-type` / `x-kubernetes-map-type`
+/// from its structural schema, including the multi-key list the name table
+/// could not express.
+#[test]
+fn a_custom_resource_schema_drives_the_field_sets() {
+    use rusternetes_common::fieldmanager::schema::Type;
+    use rusternetes_common::resources::crd::JSONSchemaProps;
+    use rusternetes_common::validation::structural::new_structural;
+    let props: JSONSchemaProps = serde_json::from_value(json!({
+        "type": "object", "properties": {"spec": {"type": "object", "properties": {
+            "tags": {"type": "array", "items": {"type": "string"}, "x-kubernetes-list-type": "set"},
+            "items": {"type": "array", "x-kubernetes-list-type": "map",
+                "x-kubernetes-list-map-keys": ["a", "b"],
+                "items": {"type": "object", "properties": {
+                    "a": {"type": "string"}, "b": {"type": "string"}, "v": {"type": "string"}}}},
+            "pinned": {"type": "object", "x-kubernetes-map-type": "atomic",
+                "properties": {"x": {"type": "string"}}},
+            "free": {"type": "object", "x-kubernetes-preserve-unknown-fields": true}}}}
+    }))
+    .unwrap();
+    let t = Type::from_structural(&new_structural(&props).unwrap());
+    let obj = json!({"spec": {
+        "tags": ["x"],
+        "items": [{"a": "1", "b": "2", "v": "3"}],
+        "pinned": {"x": "y"},
+        "free": {"k": [1, 2]}}});
+    assert_eq!(
+        Fields::of_typed(&obj, &t).set.to_fields_v1(),
+        json!({"f:spec": {
+            "f:tags": {"v:\"x\"": {}},
+            "f:items": {"k:{\"a\":\"1\",\"b\":\"2\"}": {".": {}, "f:a": {}, "f:b": {}, "f:v": {}}},
+            "f:pinned": {},
+            "f:free": {"f:k": {}}}})
+    );
+}
+
+/// An Update takes only the changed port: with the keyed list it is the one
+/// `[containerPort, protocol]` item, not the whole list.
+#[test]
+fn update_with_a_schema_changes_one_keyed_item() {
+    let schema = super::schemas::builtin("v1", "Pod");
+    let fm = FieldManager::new("v1", None, ResetFields::new()).with_schema(schema);
+    let live = json!({"spec": {"containers": [{"name": "c", "ports": [
+        {"containerPort": 80, "protocol": "TCP"}, {"containerPort": 80, "protocol": "UDP"}]}]}});
+    let new = json!({"spec": {"containers": [{"name": "c", "ports": [
+        {"containerPort": 80, "protocol": "TCP"},
+        {"containerPort": 80, "protocol": "UDP", "name": "dns"}]}]}});
+    let managed = fm.update_managed(&live, &new, Managed::default(), "m", true);
+    let entries = managed.encode().unwrap();
+    let fields = entries[0].fields_v1.clone().unwrap();
+    let ports = &fields["f:spec"]["f:containers"]["k:{\"name\":\"c\"}"]["f:ports"];
+    let udp = &ports["k:{\"containerPort\":80,\"protocol\":\"UDP\"}"];
+    assert!(udp.get("f:name").is_some());
+    assert!(ports
+        .get("k:{\"containerPort\":80,\"protocol\":\"TCP\"}")
+        .is_none());
+}

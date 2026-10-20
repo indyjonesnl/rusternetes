@@ -377,7 +377,7 @@ pub async fn get_openapi_spec_path(
 /// from release-1.35 `api/openapi-spec/v3` by
 /// `scripts/sync-upstream-openapi.sh`. Only group-versions listed here are
 /// served from upstream definitions; the rest still use the stub schemas.
-fn upstream_v3_schemas(
+pub(crate) fn upstream_v3_schemas(
     group: &str,
     version: &str,
 ) -> Option<&'static serde_json::Map<String, serde_json::Value>> {

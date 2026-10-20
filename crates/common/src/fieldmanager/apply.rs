@@ -29,7 +29,8 @@
 use chrono::{SubsecRound, Utc};
 use serde_json::{Map, Value};
 
-use super::fieldset::{field_kind, key_element, FieldKind, Fields, Set};
+use super::fieldset::{field_kind, key_element, typed_key_element, FieldKind, Set};
+use super::schema::{ListKind, Type};
 use super::{
     build_manager_identifier, remove_managed_fields, strip_set, FieldManager, Managed,
     ManagerIdentity, VersionedSet, OPERATION_APPLY,
@@ -157,9 +158,9 @@ impl FieldManager {
         );
 
         // Updater.Apply (update.go:209-254).
-        let mut merged = merge_values(live, config, "");
+        let mut merged = self.merge(live, config);
         let last_set = managed.fields.get(&id).map(|vs| vs.set.clone());
-        let mut set = Fields::of(config).set;
+        let mut set = self.fields_of(config).set;
         let exclude = self.reset_set();
         if !exclude.is_empty() {
             set = set.recursive_difference(&exclude);
@@ -185,7 +186,7 @@ impl FieldManager {
         }
 
         // Updater.update (update.go:73-164), conflict half.
-        let mut comparison = Fields::of(live).compare(&Fields::of(&merged));
+        let mut comparison = self.fields_of(live).compare(&self.fields_of(&merged));
         if !exclude.is_empty() {
             comparison = comparison.exclude(&exclude);
         }
@@ -242,9 +243,116 @@ impl FieldManager {
     }
 }
 
+impl FieldManager {
+    /// `TypedValue.Merge` over the kind's schema, or the name table without one.
+    pub(crate) fn merge(&self, live: &Value, config: &Value) -> Value {
+        match &self.schema {
+            Some(t) => merge_typed(live, config, t),
+            None => merge_values(live, config, ""),
+        }
+    }
+}
+
+/// The merge of two values of one field: typed when the schema has a type for
+/// it, by name otherwise.
+fn merge_field(live: &Value, config: &Value, name: &str, ty: Option<&Type>) -> Value {
+    match ty {
+        None | Some(Type::Legacy) => merge_values(live, config, name),
+        Some(t) => merge_typed(live, config, t),
+    }
+}
+
+/// `TypedValue.Merge` (typed/merge.go) driven by the schema: structs and
+/// granular maps merge field by field, `x-kubernetes-list-type: map` lists by
+/// item key, sets by union; scalars, atomic structs and atomic lists are
+/// replaced by the config.
+pub fn merge_typed(live: &Value, config: &Value, ty: &Type) -> Value {
+    match (live, config, ty) {
+        (Value::Object(_), Value::Object(_), Type::Struct(s)) if s.atomic => config.clone(),
+        (Value::Object(_), Value::Object(_), Type::Map { atomic: true, .. }) => config.clone(),
+        (
+            Value::Object(l),
+            Value::Object(c),
+            Type::Struct(_) | Type::Map { .. } | Type::Deduced,
+        ) => {
+            let mut out = l.clone();
+            for (k, cv) in c {
+                if cv.is_null() {
+                    out.remove(k);
+                    continue;
+                }
+                let merged = match l.get(k) {
+                    Some(lv) => merge_field(lv, cv, k, ty.field(k)),
+                    None => cv.clone(),
+                };
+                out.insert(k.clone(), merged);
+            }
+            Value::Object(out)
+        }
+        (Value::Array(l), Value::Array(c), Type::List { elem, kind }) => match kind {
+            ListKind::Map(keys) => merge_keyed(
+                l,
+                c,
+                |i| typed_key_element(keys, i),
+                |a, b| merge_typed(a, b, elem),
+            )
+            .unwrap_or_else(|| config.clone()),
+            ListKind::Set if c.iter().chain(l).all(|i| !i.is_object() && !i.is_array()) => {
+                union_scalars(l, c)
+            }
+            _ => config.clone(),
+        },
+        // Legacy: no schema for this node.
+        (_, _, Type::Legacy) => merge_values(live, config, ""),
+        _ => config.clone(),
+    }
+}
+
+fn union_scalars(l: &[Value], c: &[Value]) -> Value {
+    let mut out = l.to_vec();
+    for item in c {
+        if !out.contains(item) {
+            out.push(item.clone());
+        }
+    }
+    Value::Array(out)
+}
+
+/// Merge two associative lists by item key; `None` when an item has no key
+/// (the list is then replaced). A live list with duplicate keys is
+/// consolidated into one merged entry (smd_test.go: "apply configuration
+/// modify existing env variable").
+fn merge_keyed(
+    l: &[Value],
+    c: &[Value],
+    key: impl Fn(&Value) -> Option<String>,
+    merge_item: impl Fn(&Value, &Value) -> Value,
+) -> Option<Value> {
+    let lk: Vec<String> = l.iter().map(&key).collect::<Option<_>>()?;
+    let ck: Vec<String> = c.iter().map(&key).collect::<Option<_>>()?;
+    let mut out: Vec<Value> = Vec::with_capacity(l.len());
+    let mut merged_keys: Vec<&String> = Vec::new();
+    for (item, k) in l.iter().zip(&lk) {
+        match ck.iter().position(|x| x == k) {
+            Some(_) if merged_keys.contains(&k) => {}
+            Some(i) => {
+                merged_keys.push(k);
+                out.push(merge_item(item, &c[i]));
+            }
+            None => out.push(item.clone()),
+        }
+    }
+    for (item, k) in c.iter().zip(&ck) {
+        if !lk.contains(k) {
+            out.push(item.clone());
+        }
+    }
+    Some(Value::Array(out))
+}
+
 /// `TypedValue.Merge` (typed/merge.go): maps merge key by key, associative
 /// lists by item key, sets by union; scalars and atomic lists are replaced by
-/// the config.
+/// the config. Name-driven: the shapes come from [`field_kind`].
 pub fn merge_values(live: &Value, config: &Value, name: &str) -> Value {
     match (live, config) {
         (Value::Object(_), Value::Object(_)) if field_kind(name) == FieldKind::Atomic => {
@@ -266,44 +374,15 @@ pub fn merge_values(live: &Value, config: &Value, name: &str) -> Value {
             Value::Object(out)
         }
         (Value::Array(l), Value::Array(c)) => match field_kind(name) {
-            FieldKind::KeyedList(keys) => {
-                let lk: Option<Vec<String>> = l.iter().map(|i| key_element(keys, i)).collect();
-                let ck: Option<Vec<String>> = c.iter().map(|i| key_element(keys, i)).collect();
-                match (lk, ck) {
-                    (Some(lk), Some(ck)) => {
-                        let mut out: Vec<Value> = Vec::with_capacity(l.len());
-                        let mut merged_keys: Vec<&String> = Vec::new();
-                        for (item, key) in l.iter().zip(&lk) {
-                            match ck.iter().position(|k| k == key) {
-                                // A live list with duplicate keys is consolidated
-                                // into one merged entry (smd_test.go:
-                                // "apply configuration modify existing env variable").
-                                Some(_) if merged_keys.contains(&key) => {}
-                                Some(i) => {
-                                    merged_keys.push(key);
-                                    out.push(merge_values(item, &c[i], ""));
-                                }
-                                None => out.push(item.clone()),
-                            }
-                        }
-                        for (item, key) in c.iter().zip(&ck) {
-                            if !lk.contains(key) {
-                                out.push(item.clone());
-                            }
-                        }
-                        Value::Array(out)
-                    }
-                    _ => config.clone(),
-                }
-            }
+            FieldKind::KeyedList(keys) => merge_keyed(
+                l,
+                c,
+                |i| key_element(keys, i),
+                |a, b| merge_values(a, b, ""),
+            )
+            .unwrap_or_else(|| config.clone()),
             FieldKind::ScalarSet if c.iter().chain(l).all(|i| !i.is_object() && !i.is_array()) => {
-                let mut out = l.clone();
-                for item in c {
-                    if !out.contains(item) {
-                        out.push(item.clone());
-                    }
-                }
-                Value::Array(out)
+                union_scalars(l, c)
             }
             _ => config.clone(),
         },

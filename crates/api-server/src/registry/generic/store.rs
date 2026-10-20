@@ -1780,6 +1780,12 @@ impl<T: Object, S: Storage + Send + Sync + 'static> crate::registry::rest::RestS
         self.update_strategy.get_reset_fields()
     }
 
+    fn field_schema(
+        &self,
+    ) -> Option<std::sync::Arc<rusternetes_common::fieldmanager::schema::Type>> {
+        self.update_strategy.field_schema()
+    }
+
     async fn get(&self, ctx: &RequestContext, name: &str, options: &GetOptions) -> Result<T> {
         Store::get(self, ctx, name, options).await
     }

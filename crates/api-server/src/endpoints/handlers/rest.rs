@@ -117,11 +117,19 @@ impl<T: Object> RequestScope<T> {
     /// `scope.FieldManager` (installer.go:697-722 `NewDefaultFieldManager`):
     /// the Update path's field manager for this resource or subresource.
     pub(super) fn field_manager(&self) -> crate::fieldmanager::FieldManager {
+        let api_version = self.api_version();
+        // The kind's `typeConverter`: the storage's own (a custom resource's
+        // structural schema), else the vendored OpenAPI definition.
+        let schema = self
+            .store
+            .field_schema()
+            .or_else(|| crate::fieldmanager::schemas::builtin(&api_version, &self.kind.kind));
         crate::fieldmanager::FieldManager::new(
-            &self.api_version(),
+            &api_version,
             self.subresource,
             self.store.get_reset_fields(),
         )
+        .with_schema(schema)
     }
 
     pub(super) fn namespace_scoped(&self) -> bool {
