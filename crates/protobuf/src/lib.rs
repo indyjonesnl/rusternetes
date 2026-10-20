@@ -2979,8 +2979,85 @@ impl ProtoRegistry {
         Self::register_authorization_v1(&mut schemas);
         Self::register_authorization_v1_selectors(&mut schemas);
         Self::register_certificates_v1(&mut schemas);
+        Self::register_certificates_v1beta1_pod_certificate_request(&mut schemas);
 
         ProtoRegistry { schemas }
+    }
+
+    /// certificates.k8s.io/v1beta1 PodCertificateRequest (+ List).
+    ///
+    /// Field numbers from staging/src/k8s.io/api/certificates/v1beta1/
+    /// generated.proto (release-1.35): `message PodCertificateRequest`,
+    /// `PodCertificateRequestList`, `PodCertificateRequestSpec`,
+    /// `PodCertificateRequestStatus`. Status has no field 3 (`notBefore` = 4).
+    fn register_certificates_v1beta1_pod_certificate_request(
+        schemas: &mut HashMap<String, MessageSchema>,
+    ) {
+        let m = |n: &str| FieldType::Message(n.into());
+        schemas.insert(
+            "PodCertificateRequest".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("metadata".into(), m("ObjectMeta"))),
+                    (2, ("spec".into(), m("PodCertificateRequestSpec"))),
+                    (3, ("status".into(), m("PodCertificateRequestStatus"))),
+                ]),
+            },
+        );
+        schemas.insert(
+            "PodCertificateRequestList".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("metadata".into(), m("ListMeta"))),
+                    (
+                        2,
+                        (
+                            "items".into(),
+                            FieldType::Repeated(Box::new(m("PodCertificateRequest"))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "PodCertificateRequestSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("signerName".into(), FieldType::String)),
+                    (2, ("podName".into(), FieldType::String)),
+                    (3, ("podUID".into(), FieldType::String)),
+                    (4, ("serviceAccountName".into(), FieldType::String)),
+                    (5, ("serviceAccountUID".into(), FieldType::String)),
+                    (6, ("nodeName".into(), FieldType::String)),
+                    (7, ("nodeUID".into(), FieldType::String)),
+                    (8, ("maxExpirationSeconds".into(), FieldType::Int)),
+                    (9, ("pkixPublicKey".into(), FieldType::Bytes)),
+                    (10, ("proofOfPossession".into(), FieldType::Bytes)),
+                    (
+                        11,
+                        ("unverifiedUserAnnotations".into(), FieldType::StringMap),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "PodCertificateRequestStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "conditions".into(),
+                            FieldType::Repeated(Box::new(m("Condition"))),
+                        ),
+                    ),
+                    (2, ("certificateChain".into(), FieldType::String)),
+                    (4, ("notBefore".into(), m("Time"))),
+                    (5, ("beginRefreshAt".into(), m("Time"))),
+                    (6, ("notAfter".into(), m("Time"))),
+                ]),
+            },
+        );
     }
 
     /// Register scheduling/v1 message schemas.
