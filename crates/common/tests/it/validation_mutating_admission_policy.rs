@@ -120,6 +120,24 @@ fn policy_enum_values_report_unsupported_value() {
     );
 }
 
+/// `failurePolicy` is `*FailurePolicyType` upstream (v1beta1/types.go:1283);
+/// defaulting only fills nil (v1beta1/defaults.go
+/// `SetDefaults_MutatingAdmissionPolicySpec`), so `""` reaches validation and
+/// is NotSupported (validation.go:1379-1380) (#2562).
+#[test]
+fn empty_failure_policy_is_not_supported() {
+    let mut v = policy();
+    v["spec"]["failurePolicy"] = json!("");
+    let mut p: MutatingAdmissionPolicy = serde_json::from_value(v).unwrap();
+    set_defaults_mutating_admission_policy(&mut p);
+    let errs: Vec<String> = validate_mutating_admission_policy(&p)
+        .iter()
+        .map(|e| e.to_string())
+        .collect();
+    let want = r#"spec.failurePolicy: Unsupported value: "": supported values: "Fail", "Ignore""#;
+    assert!(errs.iter().any(|e| e.contains(want)), "{errs:?}");
+}
+
 #[test]
 fn patch_type_is_required() {
     // :5049-5074
