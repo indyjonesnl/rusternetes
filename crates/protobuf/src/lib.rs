@@ -117,6 +117,13 @@ pub enum FieldType {
     /// map<string, Quantity> — repeated MapEntry where value is a Quantity message.
     /// Used for ResourceRequirements.limits and ResourceRequirements.requests.
     QuantityMap,
+    /// map<string, ExtraValue> where `ExtraValue { repeated string items = 1; }`
+    /// (authentication/v1 `UserInfo.extra`, authorization/v1
+    /// `SubjectAccessReviewSpec.extra`, certificates/v1
+    /// `CertificateSigningRequestSpec.extra`). Go's `ExtraValue` is
+    /// `type ExtraValue []string`, so the JSON form is `{key: [..strings..]}`
+    /// while the wire form nests each list in a one-field message.
+    StringListMap,
 }
 
 /// Schema for a single protobuf message type
@@ -8043,6 +8050,16 @@ impl ProtoRegistry {
                                     }
                                 }
                             }
+                            FieldType::StringListMap => {
+                                // map<string, ExtraValue> — MapEntry{1: key, 2: ExtraValue}
+                                let (key, items) = decode_string_list_map_entry(field_data);
+                                let map = obj
+                                    .entry(name.clone())
+                                    .or_insert_with(|| Value::Object(Map::new()));
+                                if let Value::Object(ref mut m) = map {
+                                    m.insert(key, Value::Array(items));
+                                }
+                            }
                             FieldType::MessageMap(ref msg_type) => {
                                 // map<string, Message> — decode MapEntry with message value
                                 let (key, val) =
@@ -8192,6 +8209,10 @@ impl ProtoRegistry {
             }
             FieldType::MessageMap(_) => {
                 // Should be handled at the caller level as MessageMapEntry
+                Value::Object(Map::new())
+            }
+            FieldType::StringListMap => {
+                // Should be handled at the caller level as a MapEntry
                 Value::Object(Map::new())
             }
             FieldType::IntOrString => {
@@ -8439,6 +8460,25 @@ impl ProtoRegistry {
                         let mut qbuf = Vec::new();
                         push_string_field(&mut qbuf, 1, s.as_bytes());
                         push_length_delimited_field(&mut entry, 2, &qbuf);
+                        push_length_delimited_field(buf, tag, &entry);
+                    }
+                }
+            }
+            FieldType::StringListMap => {
+                if let Some(map) = val.as_object() {
+                    for (k, v) in map {
+                        let mut entry = Vec::new();
+                        push_string_field(&mut entry, 1, k.as_bytes());
+                        // ExtraValue message: repeated string items = 1. The
+                        // value is always written (gogo marshals a
+                        // non-nullable map value unconditionally).
+                        let mut inner = Vec::new();
+                        for item in v.as_array().into_iter().flatten() {
+                            if let Some(s) = item.as_str() {
+                                push_string_field(&mut inner, 1, s.as_bytes());
+                            }
+                        }
+                        push_length_delimited_field(&mut entry, 2, &inner);
                         push_length_delimited_field(buf, tag, &entry);
                     }
                 }
@@ -8842,6 +8882,84 @@ fn decode_quantity_map_entry(data: &[u8]) -> (String, String) {
         }
     }
     (key, val)
+}
+
+/// Decode a `map<string, ExtraValue>` entry. MapEntry field 1 is the key and
+/// field 2 the `ExtraValue` message, whose `repeated string items = 1` becomes
+/// the JSON string array. An absent/empty value decodes to `[]` (Go would yield
+/// a nil slice; the Rust resource types model it as `Vec<String>`).
+fn decode_string_list_map_entry(data: &[u8]) -> (String, Vec<Value>) {
+    let mut key = String::new();
+    let mut items = Vec::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        let Some((tag, new_pos)) = read_varint(data, pos) else {
+            break;
+        };
+        pos = new_pos;
+        let field_num = (tag >> 3) as u32;
+        match (tag & 0x07) as u8 {
+            WIRE_LENGTH_DELIMITED => {
+                let Some((len, new_pos)) = read_varint(data, pos) else {
+                    break;
+                };
+                pos = new_pos;
+                let len = len as usize;
+                if pos + len > data.len() {
+                    break;
+                }
+                let body = &data[pos..pos + len];
+                match field_num {
+                    1 => key = String::from_utf8_lossy(body).to_string(),
+                    2 => items = decode_extra_value_items(body),
+                    _ => {}
+                }
+                pos += len;
+            }
+            WIRE_VARINT => match read_varint(data, pos) {
+                Some((_, new_pos)) => pos = new_pos,
+                None => break,
+            },
+            _ => break,
+        }
+    }
+    (key, items)
+}
+
+/// Decode `ExtraValue { repeated string items = 1; }` to its strings.
+fn decode_extra_value_items(data: &[u8]) -> Vec<Value> {
+    let mut items = Vec::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        let Some((tag, new_pos)) = read_varint(data, pos) else {
+            break;
+        };
+        pos = new_pos;
+        match (tag & 0x07) as u8 {
+            WIRE_LENGTH_DELIMITED => {
+                let Some((len, new_pos)) = read_varint(data, pos) else {
+                    break;
+                };
+                pos = new_pos;
+                let len = len as usize;
+                if pos + len > data.len() {
+                    break;
+                }
+                if tag >> 3 == 1 {
+                    items.push(Value::String(
+                        String::from_utf8_lossy(&data[pos..pos + len]).to_string(),
+                    ));
+                }
+                pos += len;
+            }
+            WIRE_VARINT => match read_varint(data, pos) {
+                Some((_, new_pos)) => pos = new_pos,
+                None => break,
+            },
+            _ => break,
+        }
+    }
+    items
 }
 
 /// Decode a `map<string, bytes>` entry. MapEntry messages have field 1
@@ -13181,8 +13299,7 @@ impl ProtoRegistry {
     /// the handler returned 500 "Either resourceAttributes or
     /// nonResourceAttributes must be specified" (the [sig-auth] SubjectReview
     /// conformance test). `spec.extra` (map<string, ExtraValue=repeated string>)
-    /// has no matching FieldType variant and is rarely set, so it is omitted —
-    /// the decoder simply skips field 5.
+    /// is field 5, carried by `FieldType::StringListMap`.
     fn register_authorization_v1(schemas: &mut HashMap<String, MessageSchema>) {
         let review_kind = |spec_type: &str| MessageSchema {
             fields: HashMap::from([
@@ -13239,6 +13356,9 @@ impl ProtoRegistry {
                             FieldType::Repeated(Box::new(FieldType::String)),
                         ),
                     ),
+                    // authorization/v1 generated.proto:297
+                    //   map<string, ExtraValue> extra = 5;
+                    (5, ("extra".into(), FieldType::StringListMap)),
                     (6, ("uid".into(), FieldType::String)),
                 ]),
             },
@@ -13462,8 +13582,8 @@ impl ProtoRegistry {
 
     /// certificates.k8s.io/v1. Field numbers from
     /// staging/src/k8s.io/api/certificates/v1/generated.proto. `spec.extra`
-    /// (map<string, ExtraValue=repeated string>) has no matching FieldType and
-    /// is omitted — the decoder skips field 6.
+    /// (map<string, ExtraValue=repeated string>) is field 6, carried by
+    /// `FieldType::StringListMap`.
     fn register_certificates_v1(schemas: &mut HashMap<String, MessageSchema>) {
         // certificates.k8s.io/v1beta1 ClusterTrustBundle
         // (staging/src/k8s.io/api/certificates/v1beta1/generated.proto:214-257).
@@ -13540,6 +13660,9 @@ impl ProtoRegistry {
                             FieldType::Repeated(Box::new(FieldType::String)),
                         ),
                     ),
+                    // certificates/v1 generated.proto:197
+                    //   map<string, ExtraValue> extra = 6;
+                    (6, ("extra".into(), FieldType::StringListMap)),
                     (7, ("signerName".into(), FieldType::String)),
                     (8, ("expirationSeconds".into(), FieldType::Int)),
                 ]),
@@ -13654,10 +13777,25 @@ impl ProtoRegistry {
                             FieldType::Repeated(Box::new(FieldType::String)),
                         ),
                     ),
-                    // extra is map<string, ExtraValue> where ExtraValue is a
-                    // repeated-string wrapper; omitted from the decode schema
-                    // because no conformance write populates it.
+                    // authentication/v1 generated.proto:210
+                    //   map<string, ExtraValue> extra = 4;
+                    (4, ("extra".into(), FieldType::StringListMap)),
                 ]),
+            },
+        );
+        // authentication/v1 generated.proto:53
+        //   message ExtraValue { repeated string items = 1; }
+        // (identical in authorization/v1:34 and certificates/v1:249).
+        schemas.insert(
+            "ExtraValue".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "items".into(),
+                        FieldType::Repeated(Box::new(FieldType::String)),
+                    ),
+                )]),
             },
         );
         schemas.insert(
@@ -15266,6 +15404,7 @@ mod tests {
             FieldType::StringMap => json!({ "k": "v" }),
             FieldType::BytesMap => json!({ "k": "YWJj" }),
             FieldType::QuantityMap => json!({ "k": "1" }),
+            FieldType::StringListMap => json!({ "k": ["a"] }),
             FieldType::Repeated(inner) => {
                 let v = proto_synth_value(reg, inner, path);
                 if v.is_null() {
@@ -15689,5 +15828,77 @@ mod tests {
         let spec = json!({"service":{"namespace":"ns","name":"svc","port":443},"group":"g","version":"v1"});
         let b = reg.encode_message("APIServiceSpec", &spec).unwrap();
         assert_eq!(reg.decode_message("APIServiceSpec", &b).unwrap(), spec);
+    }
+    // map<string, ExtraValue> wire parity (#3057). ExtraValue is
+    // `message ExtraValue { repeated string items = 1; }` and the maps are
+    // authentication/v1 UserInfo.extra = 4, authorization/v1
+    // SubjectAccessReviewSpec.extra = 5, certificates/v1
+    // CertificateSigningRequestSpec.extra = 6. Bytes are hand-encoded from
+    // the proto, not produced by our encoder.
+    //   entry = 0a 01 'k' | 12 06 { 0a 01 'a' 0a 01 'b' }
+    const EXTRA_ENTRY: [u8; 11] = [
+        0x0a, 0x01, b'k', 0x12, 0x06, 0x0a, 0x01, b'a', 0x0a, 0x01, b'b',
+    ];
+
+    fn extra_wire(prefix: &[u8], tag: u8) -> Vec<u8> {
+        let mut v = prefix.to_vec();
+        v.push(tag);
+        v.push(EXTRA_ENTRY.len() as u8);
+        v.extend_from_slice(&EXTRA_ENTRY);
+        v
+    }
+
+    #[test]
+    fn test_extra_value_map_decodes_hand_encoded_wire() {
+        let reg = ProtoRegistry::new();
+        // UserInfo: username(1)="u", extra(4)
+        let b = extra_wire(&[0x0a, 0x01, b'u'], 0x22);
+        let got = reg.decode_message("UserInfo", &b).unwrap();
+        assert_eq!(got, json!({"username": "u", "extra": {"k": ["a", "b"]}}));
+        // SubjectAccessReviewSpec: user(3)="u", extra(5)
+        let b = extra_wire(&[0x1a, 0x01, b'u'], 0x2a);
+        let got = reg.decode_message("SubjectAccessReviewSpec", &b).unwrap();
+        assert_eq!(got, json!({"user": "u", "extra": {"k": ["a", "b"]}}));
+        // CertificateSigningRequestSpec: username(2)="u", extra(6)
+        let b = extra_wire(&[0x12, 0x01, b'u'], 0x32);
+        let got = reg
+            .decode_message("CertificateSigningRequestSpec", &b)
+            .unwrap();
+        assert_eq!(got["extra"], json!({"k": ["a", "b"]}));
+    }
+
+    #[test]
+    fn test_extra_value_map_encodes_upstream_wire() {
+        let reg = ProtoRegistry::new();
+        let v = json!({"username": "u", "extra": {"k": ["a", "b"]}});
+        assert_eq!(
+            reg.encode_message("UserInfo", &v).unwrap(),
+            extra_wire(&[0x0a, 0x01, b'u'], 0x22)
+        );
+        let v = json!({"user": "u", "extra": {"k": ["a", "b"]}});
+        assert_eq!(
+            reg.encode_message("SubjectAccessReviewSpec", &v).unwrap(),
+            extra_wire(&[0x1a, 0x01, b'u'], 0x2a)
+        );
+        // An empty list still emits the entry with an empty ExtraValue value
+        // (gogo marshals a non-nullable map value unconditionally).
+        let v = json!({"extra": {"k": []}});
+        assert_eq!(
+            reg.encode_message("UserInfo", &v).unwrap(),
+            vec![0x22, 0x05, 0x0a, 0x01, b'k', 0x12, 0x00]
+        );
+        let back = reg
+            .decode_message("UserInfo", &reg.encode_message("UserInfo", &v).unwrap())
+            .unwrap();
+        assert_eq!(back, v);
+    }
+
+    #[test]
+    fn test_extra_value_message_registered() {
+        let reg = ProtoRegistry::new();
+        let v = json!({"items": ["a", "b"]});
+        let b = reg.encode_message("ExtraValue", &v).unwrap();
+        assert_eq!(b, vec![0x0a, 0x01, b'a', 0x0a, 0x01, b'b']);
+        assert_eq!(reg.decode_message("ExtraValue", &b).unwrap(), v);
     }
 }
