@@ -340,6 +340,22 @@ impl WebhookClientConfig {
         })
     }
 
+    /// A POST to the webhook's `cluster.server` (used as-is) carrying the
+    /// kubeconfig user's bearer token or basic credentials (the `rest.Config`
+    /// credentials of `webhookutil.LoadKubeconfig`). Shared by the generic
+    /// webhook clients (`NewGenericWebhook`, util/webhook/webhook.go:84-103).
+    pub fn post(&self, client: &reqwest::Client) -> reqwest::RequestBuilder {
+        let mut req = client
+            .post(&self.server)
+            .header("Accept", "application/json");
+        if let Some(t) = &self.bearer_token {
+            req = req.bearer_auth(t);
+        } else if let Some((u, p)) = &self.basic_auth {
+            req = req.basic_auth(u, Some(p));
+        }
+        req
+    }
+
     /// `if Timeout.Duration != 0 { clientConfig.Timeout = ... }`
     /// (reload.go:134-136).
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -349,7 +365,7 @@ impl WebhookClientConfig {
         self
     }
 
-    fn build_client(&self) -> anyhow::Result<reqwest::Client> {
+    pub fn build_client(&self) -> anyhow::Result<reqwest::Client> {
         let mut b = reqwest::Client::builder().timeout(self.timeout);
         if self.insecure_skip_tls_verify {
             b = b.danger_accept_invalid_certs(true);
@@ -777,7 +793,7 @@ impl WebhookAuthorizer {
 }
 
 /// `utilnet.IsConnectionReset`.
-fn is_connection_reset(e: &reqwest::Error) -> bool {
+pub fn is_connection_reset(e: &reqwest::Error) -> bool {
     let mut src: Option<&(dyn std::error::Error + 'static)> = Some(e);
     while let Some(s) = src {
         if let Some(io) = s.downcast_ref::<std::io::Error>() {
