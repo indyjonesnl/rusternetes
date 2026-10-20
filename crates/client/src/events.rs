@@ -218,6 +218,7 @@ mod tests {
                 code,
                 reason: reason.into(),
                 message: format!("Error from server ({reason}): m"),
+                retry_after_seconds: None,
             })
         };
         let ae = typed(409, "AlreadyExists");
@@ -245,6 +246,7 @@ mod tests {
                 code,
                 reason: reason.into(),
                 message: message.into(),
+                retry_after_seconds: None,
             })
         };
         // 409 with an unknown reason and an opaque message is a Conflict.

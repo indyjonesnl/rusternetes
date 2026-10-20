@@ -132,20 +132,21 @@ impl SubjectAccessReviewClient for ApiClient {
     }
 }
 
-/// `webhook.DefaultShouldRetry` (`pkg/util/webhook/webhook.go`): a connection
-/// reset, or an internal error / timeout / too-many-requests status.
-/// (`utilnet.IsHTTP2ConnectionLost` and `apierrors.SuggestsClientDelay` read
-/// state this client does not model: HTTP/2 stream errors, `Status.details.
-/// retryAfterSeconds`.)
+/// `webhook.DefaultShouldRetry` (`pkg/util/webhook/webhook.go:59-73`):
+/// connection reset, `utilnet.IsHTTP2ConnectionLost`, an internal error /
+/// timeout / too-many-requests status, or `apierrors.SuggestsClientDelay`
+/// (a `Retry-After` is "an explicit confirmation we should retry").
 fn default_should_retry(err: &anyhow::Error) -> bool {
     let reset = err.chain().any(|c| {
         c.downcast_ref::<std::io::Error>()
             .is_some_and(|e| e.kind() == std::io::ErrorKind::ConnectionReset)
     });
     reset
+        || api_status::is_http2_connection_lost(err)
         || api_status::is_internal_error(err)
         || api_status::is_timeout(err)
         || api_status::is_too_many_requests(err)
+        || api_status::suggests_client_delay(err).is_some()
 }
 
 /// `webhook.WithExponentialBackoff` (`pkg/util/webhook/webhook.go`) over
@@ -1515,6 +1516,33 @@ pub fn install_auth_filter(router: axum::Router, auth: Option<Arc<KubeletAuth>>)
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn default_should_retry_covers_delay_and_http2_lost() {
+        let st = |code: u16, reason: &str, secs: Option<i32>| {
+            anyhow::Error::new(api_status::ApiStatusError {
+                code,
+                reason: reason.into(),
+                message: "m".into(),
+                retry_after_seconds: secs,
+            })
+        };
+        // SuggestsClientDelay: Retry-After on an otherwise non-retriable code.
+        assert!(default_should_retry(&st(
+            503,
+            "ServiceUnavailable",
+            Some(2)
+        )));
+        assert!(default_should_retry(&st(418, "", Some(1))));
+        assert!(default_should_retry(&st(418, "ServerTimeout", Some(0))));
+        assert!(!default_should_retry(&st(418, "", Some(0))));
+        assert!(!default_should_retry(&st(403, "Forbidden", None)));
+        // IsHTTP2ConnectionLost.
+        assert!(default_should_retry(&anyhow::anyhow!(
+            "Post: http2: client connection lost"
+        )));
+        assert!(!default_should_retry(&anyhow::anyhow!("boom")));
+    }
+
     use super::*;
     use axum::routing::get;
     use axum::Router;
@@ -1546,6 +1574,7 @@ mod tests {
                     code: 500,
                     reason: "InternalError".into(),
                     message: "boom".into(),
+                    retry_after_seconds: None,
                 }));
             }
             let status = match review.spec.token.as_str() {
@@ -1603,6 +1632,7 @@ mod tests {
                     code: 403,
                     reason: "Forbidden".into(),
                     message: "sar forbidden".into(),
+                    retry_after_seconds: None,
                 }));
             }
             let status = SubjectAccessReviewStatus {

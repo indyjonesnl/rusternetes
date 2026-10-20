@@ -1470,6 +1470,7 @@ mod tests {
                 code,
                 reason: reason.into(),
                 message: message.into(),
+                retry_after_seconds: None,
             })
         };
         assert!(is_expired_error(&typed(
@@ -1496,6 +1497,7 @@ mod tests {
             code: 415,
             reason: "UnsupportedMediaType".into(),
             message: "Error from server (UnsupportedMediaType): Apply not supported".into(),
+            retry_after_seconds: None,
         });
         assert!(matches!(map_write_err(e), Error::UnsupportedMediaType(_)));
     }
