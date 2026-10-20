@@ -152,6 +152,10 @@ impl<S: Storage + 'static> DynamicProvisionerController<S> {
 
         let queue = WorkQueue::new();
 
+        // ONE worker, by upstream design (#2517): provisioning runs inside the PV
+        // controller's `claimWorker`, which "must run only once" and is launched
+        // a single time (pkg/controller/volume/persistentvolume/pv_controller_base.go:331,
+        // doc at :553-555).
         let worker_queue = queue.clone();
         let worker_self = Arc::clone(&self);
         tokio::spawn(async move {

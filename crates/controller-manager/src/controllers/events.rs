@@ -43,6 +43,9 @@ impl<S: Storage + 'static> EventsController<S> {
 
         let queue = WorkQueue::new();
 
+        // ONE worker (#2517): upstream has no Events controller; events are plain
+        // objects written by client-go's EventBroadcaster, so there is no worker
+        // count to port.
         let worker_queue = queue.clone();
         let worker_self = Arc::clone(&self);
         tokio::spawn(async move {
