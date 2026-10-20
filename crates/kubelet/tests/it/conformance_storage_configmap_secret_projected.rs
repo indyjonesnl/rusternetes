@@ -62,7 +62,7 @@ impl Node {
         std::fs::write(&probe, b"").unwrap();
         let gid = std::fs::metadata(&probe).unwrap().gid();
         let api = Arc::new(StorageBackend::new_memory());
-        let vm = VolumeManager::new(
+        let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             root.path().to_string_lossy().to_string(),
             Some(api.clone()),
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),

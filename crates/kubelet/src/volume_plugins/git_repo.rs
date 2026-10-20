@@ -287,9 +287,13 @@ impl Mounter for GitRepoVolumeMounter {
         // Wrap EmptyDir, let it do the setup (`NewWrapperMounter`,
         // `volume_host.go:190-199`); its `SetUpAt` ends with
         // `volumeutil.SetReady(ed.getMetaDir())` (`empty_dir.go:284`).
-        let wrapped =
-            crate::volume_plugins::util::new_wrapper_mounter(&self.host, &self.vol_name, &self.pod)
-                .await?;
+        let wrapped = crate::volume_plugins::util::new_wrapper_mounter(
+            &self.host,
+            &self.vol_name,
+            None,
+            &self.pod,
+        )
+        .await?;
         wrapped.set_up_at(dir, args).await?;
 
         let mut clone_args = vec!["clone", "--", self.source.as_str()];
