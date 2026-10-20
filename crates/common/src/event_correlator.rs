@@ -447,7 +447,7 @@ impl<C: PassiveClock> EventLogger<C> {
 /// `burst`. `try_accept(now)` succeeds iff at least one token is available at
 /// `now`, consuming it.
 #[derive(Clone)]
-struct TokenBucket {
+pub struct TokenBucket {
     qps: f64,
     burst: f64,
     tokens: f64,
@@ -458,7 +458,7 @@ struct TokenBucket {
 }
 
 impl TokenBucket {
-    fn new(qps: f64, burst: usize) -> Self {
+    pub fn new(qps: f64, burst: usize) -> Self {
         Self {
             qps,
             burst: burst as f64,
@@ -481,7 +481,7 @@ impl TokenBucket {
     }
 
     /// Attempts to consume one token at time `t`. Mirrors `AllowN(t, 1)`.
-    fn try_accept(&mut self, t: DateTime<Utc>) -> bool {
+    pub fn try_accept(&mut self, t: DateTime<Utc>) -> bool {
         let tokens = self.advance(t) - 1.0;
         // ok iff no wait is required (tokens non-negative) — burst >= 1 always
         // holds for our configs.

@@ -565,6 +565,13 @@ impl Admission<'_> {
         })
         .await?;
         self.validate_builtin_plugins(op, obj, old).await?;
+        // EventRateLimit: `NewHandler(Create, Update)` and
+        // `var _ admission.ValidationInterface`
+        // (plugin/pkg/admission/eventratelimit/admission.go:64, :78).
+        self.plugin("EventRateLimit", op, VALIDATE, async {
+            self.validate_event_rate_limit(op, obj)
+        })
+        .await?;
         // KEP-5328 + KEP-1287: a Guaranteed-QoS CPU resize against a node
         // that has not declared `GuaranteedQoSPodCPUResize` is refused (the
         // NodeDeclaredFeatureValidator plugin, off with its gate).
@@ -715,6 +722,29 @@ impl Admission<'_> {
             Ok(())
         })
         .await
+    }
+
+    /// The `EventRateLimit` plugin (eventratelimit/admission.go:91-120): for
+    /// CREATE and UPDATE of a core Event, when it is configured. The enabled
+    /// and operation checks are made by [`Self::plugin`].
+    fn validate_event_rate_limit<T: Object>(&self, _op: &Operation, obj: Option<&T>) -> Result<()> {
+        use crate::admission::event_rate_limit as erl;
+        let Some(plugin) = erl::installed() else {
+            return Ok(());
+        };
+        let event: Option<rusternetes_common::resources::Event> = if self.is_core("events") {
+            obj.map(recast).transpose()?
+        } else {
+            None
+        };
+        plugin.validate(&erl::Attributes {
+            group: &self.kind.group,
+            kind: &self.kind.kind,
+            namespace: self.namespace.unwrap_or_default(),
+            user: &self.user.username,
+            dry_run: self.dry_run,
+            object: event.as_ref(),
+        })
     }
 
     /// The `certificates/approval` and `certificates/signing` plugins, for an
