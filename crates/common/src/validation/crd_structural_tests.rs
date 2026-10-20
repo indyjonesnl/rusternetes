@@ -83,18 +83,20 @@ fn unstructural_schema_in_one_version_is_required_type() {
     assert!(got.iter().all(|g| g.contains("versions[1]")), "{got:#?}");
 }
 
-/// `NewStructural` rejects an unsupported field (`convert.go`); the error is
-/// `Invalid` at the schema path.
+/// An unsupported field is reported by the `ValidateCustomResourceDefinitionOpenAPISchema`
+/// walk (`Forbidden`); the overlapping `NewStructural` init error is then
+/// suppressed (`validation.go:975-979`).
 #[test]
-fn unsupported_field_is_invalid_at_schema() {
+fn unsupported_field_is_forbidden_by_the_walk() {
     let mut s = valid_schema();
     s["properties"]["spec"]["id"] = json!("foo");
     let errs = validate_custom_resource_definition(&crd_with(&[s]));
+    let got = schema_errs(&errs);
+    assert_eq!(got.len(), 1, "init error must be hidden: {got:#?}");
     assert!(
-        schema_errs(&errs)
-            .iter()
-            .any(|e| e.starts_with("spec.versions[0].schema.openAPIV3Schema: Invalid value:")),
-        "{errs:?}"
+        got[0]
+            .starts_with("spec.versions[0].schema.openAPIV3Schema.properties[spec].id: Forbidden"),
+        "{got:#?}"
     );
 }
 

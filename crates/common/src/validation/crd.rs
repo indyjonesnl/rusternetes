@@ -30,6 +30,7 @@ use crate::resources::{
     CustomResourceDefinitionNames, CustomResourceDefinitionSpec, CustomResourceSubresources,
     JSONSchemaProps, JSONSchemaPropsOrBool, ResourceScope, SelectableField,
 };
+use crate::validation::crd_openapi_schema::OpenApiSchemaOptions;
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::{is_dns1035_label, is_dns1123_subdomain};
 use crate::validation::structural::Structural;
@@ -405,7 +406,15 @@ pub fn validate_custom_resource_definition_spec(
     spec: &CustomResourceDefinitionSpec,
     fld_path: &Path,
 ) -> ErrorList {
-    validate_custom_resource_definition_spec_opts(spec, true, true, true, true, fld_path)
+    validate_custom_resource_definition_spec_opts(
+        spec,
+        true,
+        true,
+        true,
+        true,
+        OpenApiSchemaOptions::default(),
+        fld_path,
+    )
 }
 
 /// [`validate_custom_resource_definition_spec`] with
@@ -416,6 +425,7 @@ fn validate_custom_resource_definition_spec_opts(
     require_structural_schema: bool,
     require_open_api_schema: bool,
     require_pruned_defaults: bool,
+    schema_opts: OpenApiSchemaOptions,
     fld_path: &Path,
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
@@ -526,8 +536,14 @@ fn validate_custom_resource_definition_spec_opts(
         {
             errs.extend(validate_custom_resource_definition_validation(
                 schema,
+                // `hasStatusEnabled(getSubresourcesForVersion(...))` (`:446`).
+                version
+                    .subresources
+                    .as_ref()
+                    .is_some_and(|s| s.status.is_some()),
                 require_structural_schema,
                 require_pruned_defaults,
+                &schema_opts,
                 &vp.child("schema"),
             ));
         }
@@ -598,46 +614,82 @@ fn validate_custom_resource_definition_spec_opts(
 /// }
 /// ```
 ///
-/// `ValidateDefaults` (`:963`) runs when `ValidateStructural` found nothing
-/// (see [`crate::validation::structural::defaulting`]; its CEL step is not
-/// ported). Not ported here (tracked separately): the
-/// `ValidateCustomResourceDefinitionOpenAPISchema` walk (`:973`) and CEL cost.
-/// Because that walk is absent, the init errors are shown whenever
-/// `ValidateStructural` found nothing.
+/// The `ValidateCustomResourceDefinitionOpenAPISchema` walk (`:973`) always
+/// runs (its schema errors are produced by
+/// [`crate::validation::crd_openapi_schema`]); `NewStructural` init errors overlap
+/// with those, so they are only shown when nothing else was reported
+/// (`:975-979`). `ValidateDefaults` (`:963`) runs when `ValidateStructural`
+/// found nothing (see [`crate::validation::structural::defaulting`]; its CEL
+/// step is not ported).
+///
+/// Not ported here (tracked separately): the `CELErrors` half of the walk (it
+/// lives in the api-server crate) and the final `NewSchemaValidator` build
+/// check (`:1001-1005`).
 ///
 /// An absent `openAPIV3Schema` is `None` and the caller skips it, as upstream
 /// skips a nil pointer (`:914-916`); an explicit `{}` is validated.
 fn validate_custom_resource_definition_validation(
     schema: &JSONSchemaProps,
+    status_subresource_enabled: bool,
     require_structural_schema: bool,
     require_pruned_defaults: bool,
+    schema_opts: &OpenApiSchemaOptions,
     fld_path: &Path,
 ) -> ErrorList {
-    if !require_structural_schema {
-        return Vec::new();
-    }
     let schema_path = fld_path.child("openAPIV3Schema");
-    match crate::validation::structural::new_structural(schema) {
-        Err(msg) => vec![Error::invalid(&schema_path, String::new(), msg)],
-        Ok(ss) => {
-            let errs = crate::validation::structural::validate_structural(&schema_path, &ss);
-            if !errs.is_empty() {
-                return errs;
+    let mut errs = crate::validation::crd_openapi_schema::validate_root_restrictions(
+        schema,
+        status_subresource_enabled,
+        fld_path,
+    );
+
+    let mut structural_schema_init_errs = ErrorList::new();
+    if require_structural_schema {
+        match crate::validation::structural::new_structural(schema) {
+            // These validation errors overlap with OpenAPISchema validation
+            // errors so we keep track of them separately and only show them if
+            // OpenAPISchema validation does not report any errors.
+            Err(msg) => {
+                structural_schema_init_errs.push(Error::invalid(&schema_path, String::new(), msg))
             }
-            // `validation.go:963`: `ValidateDefaults(ctx, fldPath.Child("openAPIV3Schema"), ss, true, opts.requirePrunedDefaults)`.
-            match crate::validation::structural::defaulting::validate_defaults(
-                &schema_path,
-                &ss,
-                schema,
-                true,
-                require_pruned_defaults,
-            ) {
-                // "this should never happen"
-                Err(msg) => vec![Error::invalid(&schema_path, String::new(), msg)],
-                Ok(errs) => errs,
+            Ok(ss) => {
+                let structural_errs =
+                    crate::validation::structural::validate_structural(&schema_path, &ss);
+                if !structural_errs.is_empty() {
+                    errs.extend(structural_errs);
+                } else {
+                    // `validation.go:963`: `ValidateDefaults(ctx, fldPath.Child("openAPIV3Schema"), ss, true, opts.requirePrunedDefaults)`.
+                    match crate::validation::structural::defaulting::validate_defaults(
+                        &schema_path,
+                        &ss,
+                        schema,
+                        true,
+                        require_pruned_defaults,
+                    ) {
+                        // "this should never happen"
+                        Err(msg) => structural_schema_init_errs.push(Error::invalid(
+                            &schema_path,
+                            String::new(),
+                            msg,
+                        )),
+                        Ok(default_errs) => errs.extend(default_errs),
+                    }
+                }
             }
         }
     }
+    errs.extend(
+        crate::validation::crd_openapi_schema::validate_openapi_schema_walk(
+            schema,
+            fld_path,
+            schema_opts,
+        ),
+    );
+
+    if errs.is_empty() && !structural_schema_init_errs.is_empty() {
+        errs.extend(structural_schema_init_errs);
+    }
+    errs
 }
 
 /// The `len(version.SelectableFields) > 0` block of
@@ -1502,6 +1554,9 @@ pub fn validate_custom_resource_definition_update(
         require_open_api_schema(&old.spec),
         // `requirePrunedDefaults(&oldObj.Spec)` (`validation.go:238`, `:1779`).
         crate::validation::structural::defaulting::require_pruned_defaults(&old.spec),
+        // `requireValidPropertyType`, `requireAtomicSetType`,
+        // `requireMapListKeysMapSetValidation` (`validation.go:236-239`).
+        OpenApiSchemaOptions::for_update(&old.spec),
         &spec_path,
     ));
     errs.extend(validate_custom_resource_definition_spec_update(
@@ -1845,3 +1900,6 @@ mod selectable_fields_tests;
 #[cfg(test)]
 #[path = "crd_defaults_tests.rs"]
 mod defaults_tests;
+
+#[path = "crd_openapi_schema_tests.rs"]
+mod openapi_schema_tests;
