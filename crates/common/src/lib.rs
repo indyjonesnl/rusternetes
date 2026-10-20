@@ -38,6 +38,7 @@ pub mod label_selector;
 pub mod latency_trackers;
 pub mod leaderelection;
 pub mod lru_expire_cache;
+pub mod names;
 pub mod observability;
 pub mod pagination;
 pub mod patch;
