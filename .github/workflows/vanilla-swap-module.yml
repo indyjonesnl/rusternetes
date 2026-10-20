@@ -30,6 +30,11 @@ on:
         required: false
         type: string
         default: v1.35
+      focus:
+        description: "Optional ginkgo focus override (single-test proof, e.g. cross-node '\\[sig-network\\] Networking Granular Checks'). Non-empty also suppresses the badge publish so a narrowed run never overwrites the module badge."
+        required: false
+        type: string
+        default: ""
       publish-badge:
         description: "Publish the module's pass-rate badge"
         required: false
@@ -52,6 +57,11 @@ on:
         required: false
         type: string
         default: v1.35
+      focus:
+        description: "Optional ginkgo focus override (single-test proof, e.g. cross-node '\\[sig-network\\] Networking Granular Checks'). Non-empty also suppresses the badge publish so a narrowed run never overwrites the module badge."
+        required: false
+        type: string
+        default: ""
       publish-badge:
         description: "Publish the module's pass-rate badge"
         required: false
@@ -115,6 +125,9 @@ jobs:
           MODULE: ${{ inputs.module }}
           K8S_VERSION: ${{ inputs.k8s-version }}
           RUSTERNETES_IMAGE_TAG: ${{ inputs.image-tag }}
+          # Single-test proof (#1648); empty keeps the registry focus. Read by
+          # scripts/vanilla-swap-run.sh (VS_FOCUS_OVERRIDE).
+          VS_FOCUS_OVERRIDE: ${{ inputs.focus }}
           CONTAINER_RUNTIME: docker
         run: |
           set -euo pipefail
@@ -160,7 +173,7 @@ jobs:
         #
         # `main` only: the README badge reports main's state, so a run on a
         # branch must not overwrite it (#1835).
-        if: ${{ always() && inputs.publish-badge && github.ref == 'refs/heads/main' }}
+        if: ${{ always() && inputs.publish-badge && inputs.focus == '' && github.ref == 'refs/heads/main' }}
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
