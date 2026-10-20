@@ -204,6 +204,18 @@ fn extract_field_value(resource: &Value, field_path: &str) -> Option<String> {
         }
         return Some(component.to_string());
     }
+    // strategy.go:117-121: `"reportingComponent": event.ReportingController`
+    // ("use the core/v1 field name").
+    if field_path == "reportingComponent" {
+        return Some(
+            resource
+                .get("reportingController")
+                .or_else(|| resource.get("reportingComponent"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        );
+    }
     // Every other key (`type`, `reason`, `involvedObject.*`, the events.k8s.io/v1
     // `reportingController`, ...) is a plain dotted path into the object.
     let resolved_path = field_path;
@@ -526,5 +538,27 @@ mod tests {
         assert!(!FieldSelector::parse("source=ctl").unwrap().matches(&ev));
         // Neither set: selects as the empty string.
         assert!(FieldSelector::parse("source=").unwrap().matches(&json!({})));
+    }
+
+    /// strategy.go:117-121 (`"reportingComponent": event.ReportingController, //
+    /// use the core/v1 field name`): the selector key `reportingComponent`
+    /// selects on the reporting controller, however the object serializes it.
+    #[test]
+    fn event_reporting_component_selects_on_the_reporting_controller() {
+        let ev = json!({"reportingController": "ctl"});
+        assert!(FieldSelector::parse("reportingComponent=ctl")
+            .unwrap()
+            .matches(&ev));
+        assert!(!FieldSelector::parse("reportingComponent=other")
+            .unwrap()
+            .matches(&ev));
+        let ev = json!({"reportingComponent": "ctl"});
+        assert!(FieldSelector::parse("reportingComponent=ctl")
+            .unwrap()
+            .matches(&ev));
+        // Absent: selects as the empty string, like the Go struct field.
+        assert!(FieldSelector::parse("reportingComponent=")
+            .unwrap()
+            .matches(&json!({})));
     }
 }
