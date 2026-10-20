@@ -52,6 +52,9 @@
 
 use rusternetes_common::admission::AdmissionRequest;
 use rusternetes_common::cel::{CELContext, CELEvaluator};
+use rusternetes_common::cel_cost::{
+    charge_budget, CostOptions, RUNTIME_CEL_COST_BUDGET_MATCH_CONDITIONS,
+};
 use rusternetes_common::resources::MatchCondition;
 use serde_json::Value;
 
@@ -149,28 +152,69 @@ impl MatchConditionEvaluator {
     /// Same as [`Self::evaluate`] but with a pre-built [`CELContext`] — used by
     /// the VAP path that needs to layer `variables` / `namespaceObject` onto
     /// the base activation before evaluating.
+    ///
+    /// Ported from `webhook/matchconditions/matcher.go` `Match` (:60-143) over
+    /// `cel/condition.go` `ForInput` (:90-111): EVERY condition is evaluated
+    /// first (`condition.go:103-109`), each charged against
+    /// `RuntimeCELCostBudgetMatchConditions` (`matcher.go:82-85`,
+    /// `apis/cel/config.go:31`) via `activation.Evaluate`
+    /// (`activation.go:132-189`); running out of budget returns the error
+    /// instead of any evaluation (`return nil, -1, err`) and `Match` reports
+    /// it as an error (:86-95). Only then are the results read in order: the
+    /// first `false` skips the webhook (:111-119), otherwise any evaluation
+    /// errors are reported as one aggregate error (:128-141).
     pub fn evaluate_with_context(
         &mut self,
         conditions: &[MatchCondition],
         context: &CELContext,
     ) -> MatchOutcome {
+        // condition.go:103: `remainingBudget := runtimeCELCostBudget`.
+        let mut remaining = RUNTIME_CEL_COST_BUDGET_MATCH_CONDITIONS;
+        let mut results: Vec<(&MatchCondition, Result<bool, String>)> = Vec::new();
         for cond in conditions {
             if cond.expression.trim().is_empty() {
                 continue;
             }
-            match self.inner.evaluate(&cond.expression, context) {
-                Ok(true) => {}
-                Ok(false) => return MatchOutcome::NotMatched,
-                Err(e) => {
-                    return MatchOutcome::Error(format!(
+            // Each expression runs under the per-call limit
+            // (`environment/base.go:83`, `CostOptions::default`).
+            let (value, cost) =
+                self.inner
+                    .evaluate_with_cost(&cond.expression, context, CostOptions::default());
+            remaining = match charge_budget(None, cost, remaining) {
+                Ok(r) => r,
+                Err(e) => return MatchOutcome::Error(e.detail),
+            };
+            results.push((
+                cond,
+                match value {
+                    Ok(cel::Value::Bool(b)) => Ok(b),
+                    Ok(other) => Err(format!(
+                        "matchCondition '{}' (expression: {}) failed: expression resulted in non-bool value: {other:?}",
+                        cond.name, cond.expression
+                    )),
+                    Err(e) => Err(format!(
                         "matchCondition '{}' (expression: {}) failed: {}",
                         cond.name, cond.expression, e
-                    ));
-                }
-            }
+                    )),
+                },
+            ));
         }
 
-        MatchOutcome::Matched
+        let mut errors: Vec<String> = Vec::new();
+        for (_, result) in results {
+            match result {
+                Err(e) => errors.push(e),
+                // matcher.go:111-119: any false skips the webhook, always.
+                Ok(false) => return MatchOutcome::NotMatched,
+                Ok(true) => {}
+            }
+        }
+        match errors.as_slice() {
+            [] => MatchOutcome::Matched,
+            // `utilerrors.NewAggregate(...).Error()`.
+            [one] => MatchOutcome::Error(one.clone()),
+            many => MatchOutcome::Error(format!("[{}]", many.join(", "))),
+        }
     }
 }
 
