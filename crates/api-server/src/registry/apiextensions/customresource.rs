@@ -268,6 +268,40 @@ impl Strategy {
         format!("{}/{}", self.crd.spec.group, self.version)
     }
 
+    /// `NewDefaultCRDFieldManager`'s `objectConverter` and hub
+    /// (customresource_handler.go:1133-1142): with `conversion.strategy:
+    /// None` the `nopConverter` only rewrites `apiVersion`
+    /// (conversion/nop_converter.go), and the hub is the storage version
+    /// (`HubGroupVersion`). A webhook conversion is asynchronous and is not
+    /// available to the field manager yet, so a webhook CRD keeps the
+    /// identity.
+    fn field_converter(
+        &self,
+    ) -> Option<std::sync::Arc<dyn rusternetes_common::fieldmanager::versionconverter::Converter>>
+    {
+        use rusternetes_common::fieldmanager::versionconverter::{
+            NopObjectConvertor, VersionConverter,
+        };
+        use rusternetes_common::resources::ConversionStrategyType;
+        if self.crd.spec.versions.len() < 2 {
+            return None;
+        }
+        let strategy = self
+            .crd
+            .spec
+            .conversion
+            .as_ref()
+            .and_then(|c| c.strategy.as_ref());
+        if !matches!(strategy, None | Some(ConversionStrategyType::None)) {
+            return None;
+        }
+        let storage = self.crd.spec.versions.iter().find(|v| v.storage)?;
+        Some(std::sync::Arc::new(VersionConverter::new_crd(
+            std::sync::Arc::new(NopObjectConvertor),
+            &format!("{}/{}", self.crd.spec.group, storage.name),
+        )))
+    }
+
     fn crd_version(
         &self,
     ) -> Option<&rusternetes_common::resources::CustomResourceDefinitionVersion> {
@@ -563,6 +597,13 @@ impl RestUpdateStrategy<CustomResource> for Strategy {
         Strategy::field_schema(self)
     }
 
+    fn field_converter(
+        &self,
+    ) -> Option<std::sync::Arc<dyn rusternetes_common::fieldmanager::versionconverter::Converter>>
+    {
+        Strategy::field_converter(self)
+    }
+
     fn get_reset_fields(&self) -> ResetFields {
         let mut fields = ResetFields::new();
         if self.status_enabled() {
@@ -634,6 +675,13 @@ impl RestUpdateStrategy<CustomResource> for StatusStrategy {
 
     fn field_schema(&self) -> Option<Arc<FieldType>> {
         self.0.field_schema()
+    }
+
+    fn field_converter(
+        &self,
+    ) -> Option<std::sync::Arc<dyn rusternetes_common::fieldmanager::versionconverter::Converter>>
+    {
+        self.0.field_converter()
     }
 
     /// `GetResetFields` (status_strategy.go:46-64): `spec`.
@@ -881,6 +929,13 @@ impl RestStorage<CustomResource> for CustomResourceRest {
 
     fn field_schema(&self) -> Option<Arc<FieldType>> {
         RestStorage::field_schema(&self.store)
+    }
+
+    fn field_converter(
+        &self,
+    ) -> Option<std::sync::Arc<dyn rusternetes_common::fieldmanager::versionconverter::Converter>>
+    {
+        RestStorage::field_converter(&self.store)
     }
 
     /// `schemaCoercingDecoder.Decode` + `unstructuredDefaulter.Default`
@@ -1473,5 +1528,62 @@ mod prune_nulls_tests {
             err.to_string(),
             "Other.stable.example.com \"w\" is invalid: kind: Invalid value: \"Other\": must be Widget"
         );
+    }
+}
+
+#[cfg(test)]
+mod field_converter_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn strategy(versions: &[&str], conversion: Option<serde_json::Value>) -> Strategy {
+        let versions: Vec<_> = versions
+            .iter()
+            .enumerate()
+            .map(|(i, v)| json!({"name": v, "served": true, "storage": i == 0}))
+            .collect();
+        let mut spec = json!({
+            "group": "stable.example.com", "scope": "Namespaced",
+            "names": {"plural": "widgets", "kind": "Widget", "listKind": "WidgetList"},
+            "versions": versions
+        });
+        if let Some(c) = conversion {
+            spec["conversion"] = c;
+        }
+        let crd: CustomResourceDefinition = serde_json::from_value(json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {"name": "widgets.stable.example.com"},
+            "spec": spec
+        }))
+        .unwrap();
+        Strategy::new(Arc::new(crd), "v1")
+    }
+
+    /// customresource_handler.go:1133-1142: a multi-version CRD with
+    /// `strategy: None` converts with `nopConverter` through the storage
+    /// version.
+    #[test]
+    fn a_multi_version_crd_with_no_conversion_gets_the_nop_converter() {
+        let s = strategy(&["v1", "v2"], Some(json!({"strategy": "None"})));
+        let c = s.field_converter().expect("a converter");
+        let out = c
+            .convert(
+                &json!({"apiVersion": "stable.example.com/v2", "spec": {"a": 1}}),
+                "stable.example.com/v1",
+            )
+            .unwrap();
+        assert_eq!(out["apiVersion"], "stable.example.com/v1");
+        assert_eq!(out["spec"]["a"], 1);
+    }
+
+    #[test]
+    fn a_single_version_or_webhook_crd_has_none() {
+        assert!(strategy(&["v1"], None).field_converter().is_none());
+        let webhook = json!({"strategy": "Webhook", "webhook": {
+            "conversionReviewVersions": ["v1"], "clientConfig": {"url": "https://x"}}});
+        assert!(strategy(&["v1", "v2"], Some(webhook))
+            .field_converter()
+            .is_none());
     }
 }
