@@ -8,7 +8,8 @@
 //! conditions the kubelet does not own.
 //!
 //! Slice 1 of #3808: the two Running-transition sites in `kubelet.rs` are
-//! migrated. The rest are tracked in the issue.
+//! migrated. Slice 2 (#3901): the create-error Pending write too. The rest
+//! are tracked in the issue.
 
 use rusternetes_common::{
     resources::{pod::HostIP, ContainerStatus, Pod, PodCondition, PodIP, PodStatus},
