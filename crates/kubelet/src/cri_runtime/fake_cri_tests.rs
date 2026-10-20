@@ -99,3 +99,145 @@ async fn has_terminated_containers_ignores_other_incarnations() {
     pod_old.metadata.uid = "uid-old".to_string();
     assert!(rt.has_terminated_containers(&pod_old).await);
 }
+
+// ---- Sandbox/container lifecycle against the fake's RPCs (#1115, #3884) ----
+//
+// Upstream parity: the fake mirrors `FakeRuntimeService`
+// (`staging/src/k8s.io/cri-api/pkg/apis/testing/fake_runtime_service.go`), and
+// the teardown sequence under test is `killPodWithSyncResult` ->
+// `StopPodSandbox` then `RemovePodSandbox` (`kuberuntime_manager.go`) with
+// containers stopped first (`killContainersWithSyncResult`).
+
+use super::translate::sandbox_config;
+use rusternetes_cri::v1;
+use rusternetes_cri::CriClient;
+
+fn pod(ns: &str, name: &str, uid: &str) -> rusternetes_common::resources::Pod {
+    let mut p = rusternetes_common::resources::Pod::new(name, Default::default());
+    p.metadata.namespace = Some(ns.to_string());
+    p.metadata.uid = uid.to_string();
+    p
+}
+
+/// A second raw client on the fake's socket, used to set up runtime state the
+/// way `start_pod` would (RunPodSandbox + CreateContainer + StartContainer).
+async fn setup_client(fake: &FakeCri) -> (CriClient, CriContainerRuntime, tempfile::TempDir) {
+    let (rt, tmp) = runtime_on(fake).await;
+    let cri = CriClient::connect(tmp.path().join("fake-cri.sock"))
+        .await
+        .unwrap();
+    (cri, rt, tmp)
+}
+
+async fn run_pod_with_container(cri: &mut CriClient, p: &rusternetes_common::resources::Pod) {
+    let sb_cfg = sandbox_config(p, "/tmp/fake-logs");
+    let sb = cri.run_pod_sandbox(sb_cfg.clone(), "").await.unwrap();
+    let cfg = v1::ContainerConfig {
+        metadata: Some(v1::ContainerMetadata {
+            name: "app".into(),
+            attempt: 0,
+        }),
+        labels: [
+            (labels::POD_UID.to_string(), p.metadata.uid.clone()),
+            (labels::CONTAINER_NAME.to_string(), "app".to_string()),
+        ]
+        .into(),
+        ..Default::default()
+    };
+    let cid = cri.create_container(&sb, cfg, sb_cfg).await.unwrap();
+    cri.start_container(&cid).await.unwrap();
+}
+
+#[tokio::test]
+async fn duplicate_container_name_is_rejected_which_exists_check_guards() {
+    // containerd reserves (name, sandbox, attempt): a second create for the
+    // same container collides. `container_exists` is what keeps
+    // `computePodActions` from issuing it (#1112).
+    let fake = FakeCri::new();
+    let (mut cri, rt, _tmp) = setup_client(&fake).await;
+    let p = pod("ns", "web-0", "uid-1");
+    run_pod_with_container(&mut cri, &p).await;
+    assert!(rt.container_exists("uid-1", "app").await);
+
+    let sb = cri.list_pod_sandbox(None).await.unwrap().remove(0);
+    let cfg = v1::ContainerConfig {
+        metadata: Some(v1::ContainerMetadata {
+            name: "app".into(),
+            attempt: 0,
+        }),
+        ..Default::default()
+    };
+    let err = cri
+        .create_container(&sb.id, cfg, sandbox_config(&p, "/tmp/fake-logs"))
+        .await
+        .unwrap_err();
+    assert!(format!("{err:?}").contains("AlreadyExists"), "{err:?}");
+}
+
+#[tokio::test]
+async fn stop_and_remove_pod_is_namespace_scoped() {
+    let fake = FakeCri::new();
+    let (mut cri, rt, _tmp) = setup_client(&fake).await;
+    run_pod_with_container(&mut cri, &pod("ns-a", "srv", "uid-a")).await;
+    run_pod_with_container(&mut cri, &pod("ns-b", "srv", "uid-b")).await;
+
+    rt.stop_and_remove_pod("ns-a", "srv").await.unwrap();
+
+    // Only ns-b's sandbox and container survive.
+    assert_eq!(fake.sandboxes().len(), 1);
+    assert!(rt.container_exists("uid-b", "app").await);
+    assert!(!rt.container_exists("uid-a", "app").await);
+}
+
+#[tokio::test]
+async fn stop_and_remove_pod_for_removes_only_that_incarnation() {
+    // Same name + namespace, different UID (StatefulSet replacement): tearing
+    // down the old incarnation must leave the new one running.
+    let fake = FakeCri::new();
+    let (mut cri, rt, _tmp) = setup_client(&fake).await;
+    let old = pod("ns", "web-0", "uid-old");
+    let mut new = old.clone();
+    new.metadata.uid = "uid-new".into();
+    run_pod_with_container(&mut cri, &old).await;
+    run_pod_with_container(&mut cri, &new).await;
+
+    rt.stop_and_remove_pod_for(&old).await.unwrap();
+
+    assert!(!rt.container_exists("uid-old", "app").await);
+    assert!(rt.is_container_running("uid-new", "app").await.unwrap());
+    assert_eq!(fake.sandboxes().len(), 1);
+}
+
+#[tokio::test]
+async fn stop_pod_with_grace_period_stops_containers_before_sandbox() {
+    let fake = FakeCri::new();
+    let (mut cri, rt, _tmp) = setup_client(&fake).await;
+    run_pod_with_container(&mut cri, &pod("ns", "web-0", "uid-1")).await;
+
+    rt.stop_pod_with_grace_period("ns", "web-0", 5)
+        .await
+        .unwrap();
+
+    let called = fake.called();
+    let pos = |n: &str| called.iter().rposition(|c| c == n).unwrap();
+    assert!(pos("StopContainer") < pos("StopPodSandbox"), "{called:?}");
+    assert!(
+        pos("StopPodSandbox") < pos("RemovePodSandbox"),
+        "{called:?}"
+    );
+    assert!(fake.sandboxes().is_empty() && fake.containers().is_empty());
+}
+
+#[tokio::test]
+async fn garbage_collect_containers_removes_only_undesired_sandboxes() {
+    let fake = FakeCri::new();
+    let (mut cri, rt, _tmp) = setup_client(&fake).await;
+    run_pod_with_container(&mut cri, &pod("ns", "keep", "uid-keep")).await;
+    run_pod_with_container(&mut cri, &pod("ns", "gone", "uid-gone")).await;
+
+    let existing = std::collections::HashSet::from(["keep".to_string()]);
+    assert_eq!(rt.garbage_collect_containers(&existing).await.unwrap(), 1);
+
+    assert!(rt.container_exists("uid-keep", "app").await);
+    assert!(!rt.container_exists("uid-gone", "app").await);
+}

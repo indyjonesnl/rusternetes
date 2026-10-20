@@ -3,8 +3,21 @@
 //! paths (stale-incarnation exists-checks, same-name sync races) run in a unit
 //! test with no containerd (#1115).
 //!
-//! Only the list RPCs the tests need are implemented; every other RPC answers
-//! `UNIMPLEMENTED`, like a runtime that lacks the feature. List filtering
+//! Implemented: the list RPCs plus the sandbox/container lifecycle RPCs
+//! (`RunPodSandbox`, `StopPodSandbox`, `RemovePodSandbox`, `CreateContainer`,
+//! `StartContainer`, `StopContainer`, `RemoveContainer`). Every other RPC
+//! answers `UNIMPLEMENTED`, like a runtime that lacks the feature.
+//!
+//! Ported from upstream's `FakeRuntimeService`
+//! (`staging/src/k8s.io/cri-api/pkg/apis/testing/fake_runtime_service.go`:
+//! `RunPodSandbox`, `StopPodSandbox`, `RemovePodSandbox`, `CreateContainer`,
+//! `StartContainer`, `StopContainer`, `RemoveContainer`) and served the way
+//! `cri-client/pkg/fake/fake_runtime.go` (`RemoteRuntime`) serves it. One
+//! deliberate deviation: upstream derives the ID from the metadata, so a
+//! duplicate silently overwrites; here IDs are unique and a duplicate name is
+//! rejected with `AlreadyExists`, which is what containerd's CRI plugin does
+//! (`containerNameIndex.Reserve` / `sandboxNameIndex.Reserve`) and is the
+//! collision `computePodActions` must avoid (#1112). List filtering
 //! follows the CRI proto's `label_selector` contract (`proto/runtime/v1/api.proto`,
 //! `ContainerFilter`): "Only api.MatchLabels is supported for now and the
 //! requirements are ANDed" — i.e. exact key/value match, all pairs required.
@@ -23,6 +36,20 @@ use crate::v1::runtime_service_server::{RuntimeService, RuntimeServiceServer};
 struct FakeState {
     containers: Vec<v1::Container>,
     sandboxes: Vec<v1::PodSandbox>,
+    next_id: u64,
+    /// RPC names in call order (upstream `FakeRuntimeService.Called`).
+    called: Vec<String>,
+}
+
+impl FakeState {
+    fn record(&mut self, rpc: &str) {
+        self.called.push(rpc.to_string());
+    }
+
+    fn new_id(&mut self, prefix: &str) -> String {
+        self.next_id += 1;
+        format!("{prefix}-{}", self.next_id)
+    }
 }
 
 /// Handle to the fake runtime: seed state, then point a `CriClient` at the
@@ -64,6 +91,34 @@ impl FakeCri {
                 .collect(),
             ..Default::default()
         });
+    }
+
+    /// RPC names received so far, in order (upstream `Called`).
+    pub fn called(&self) -> Vec<String> {
+        self.state.lock().unwrap().called.clone()
+    }
+
+    /// `(id, state)` of every container currently in the store.
+    pub fn containers(&self) -> Vec<(String, v1::ContainerState)> {
+        let st = self.state.lock().unwrap();
+        st.containers
+            .iter()
+            .map(|c| (c.id.clone(), v1::ContainerState::try_from(c.state).unwrap()))
+            .collect()
+    }
+
+    /// `(id, state)` of every sandbox currently in the store.
+    pub fn sandboxes(&self) -> Vec<(String, v1::PodSandboxState)> {
+        let st = self.state.lock().unwrap();
+        st.sandboxes
+            .iter()
+            .map(|s| {
+                (
+                    s.id.clone(),
+                    v1::PodSandboxState::try_from(s.state).unwrap(),
+                )
+            })
+            .collect()
     }
 
     /// Bind `socket` and serve the fake until the returned task is aborted.
@@ -134,10 +189,154 @@ fake_runtime_service! {
             .sandboxes
             .iter()
             .filter(|s| filter.id.is_empty() || s.id == filter.id)
+            .filter(|s| filter.state.as_ref().is_none_or(|v| s.state == v.state))
             .filter(|s| labels_match(&s.labels, &filter.label_selector))
             .cloned()
             .collect();
         Ok(Response::new(v1::ListPodSandboxResponse { items }))
+    }
+
+    /// `RunPodSandbox`: new sandbox in `SANDBOX_READY`. A second sandbox with
+    /// the same (name, namespace, uid, attempt) is `AlreadyExists`, as with
+    /// containerd's `sandboxNameIndex.Reserve`.
+    async fn run_pod_sandbox(
+        &self,
+        request: Request<v1::RunPodSandboxRequest>,
+    ) -> Result<Response<v1::RunPodSandboxResponse>, Status> {
+        let config = request.into_inner().config.unwrap_or_default();
+        let meta = config.metadata.clone().unwrap_or_default();
+        let mut st = self.state.lock().unwrap();
+        st.record("RunPodSandbox");
+        if st.sandboxes.iter().any(|s| s.metadata.as_ref() == Some(&meta)) {
+            return Err(Status::already_exists(format!(
+                "failed to reserve sandbox name \"{}_{}_{}_{}\"",
+                meta.name, meta.namespace, meta.uid, meta.attempt
+            )));
+        }
+        let id = st.new_id("sandbox");
+        st.sandboxes.push(v1::PodSandbox {
+            id: id.clone(),
+            metadata: Some(meta),
+            state: v1::PodSandboxState::SandboxReady as i32,
+            labels: config.labels,
+            annotations: config.annotations,
+            ..Default::default()
+        });
+        Ok(Response::new(v1::RunPodSandboxResponse { pod_sandbox_id: id }))
+    }
+
+    /// `StopPodSandbox`: NOTREADY, and the sandbox's containers exit.
+    async fn stop_pod_sandbox(
+        &self,
+        request: Request<v1::StopPodSandboxRequest>,
+    ) -> Result<Response<v1::StopPodSandboxResponse>, Status> {
+        let id = request.into_inner().pod_sandbox_id;
+        let mut st = self.state.lock().unwrap();
+        st.record("StopPodSandbox");
+        let Some(sb) = st.sandboxes.iter_mut().find(|s| s.id == id) else {
+            return Err(Status::not_found(format!("pod sandbox {id} not found")));
+        };
+        sb.state = v1::PodSandboxState::SandboxNotready as i32;
+        for c in st.containers.iter_mut().filter(|c| c.pod_sandbox_id == id) {
+            c.state = v1::ContainerState::ContainerExited as i32;
+        }
+        Ok(Response::new(v1::StopPodSandboxResponse {}))
+    }
+
+    /// `RemovePodSandbox`: drops the sandbox and its containers. Removing an
+    /// unknown sandbox succeeds (CRI: no such sandbox is a no-op; upstream's
+    /// fake `delete`s unconditionally).
+    async fn remove_pod_sandbox(
+        &self,
+        request: Request<v1::RemovePodSandboxRequest>,
+    ) -> Result<Response<v1::RemovePodSandboxResponse>, Status> {
+        let id = request.into_inner().pod_sandbox_id;
+        let mut st = self.state.lock().unwrap();
+        st.record("RemovePodSandbox");
+        st.sandboxes.retain(|s| s.id != id);
+        st.containers.retain(|c| c.pod_sandbox_id != id);
+        Ok(Response::new(v1::RemovePodSandboxResponse {}))
+    }
+
+    /// `CreateContainer`: new container in `CONTAINER_CREATED`. A duplicate
+    /// (sandbox, name, attempt) is `AlreadyExists` like containerd's
+    /// `containerNameIndex.Reserve`.
+    async fn create_container(
+        &self,
+        request: Request<v1::CreateContainerRequest>,
+    ) -> Result<Response<v1::CreateContainerResponse>, Status> {
+        let req = request.into_inner();
+        let config = req.config.unwrap_or_default();
+        let meta = config.metadata.clone().unwrap_or_default();
+        let mut st = self.state.lock().unwrap();
+        st.record("CreateContainer");
+        if !st.sandboxes.iter().any(|s| s.id == req.pod_sandbox_id) {
+            return Err(Status::not_found(format!(
+                "pod sandbox {} not found",
+                req.pod_sandbox_id
+            )));
+        }
+        if let Some(existing) = st
+            .containers
+            .iter()
+            .find(|c| c.pod_sandbox_id == req.pod_sandbox_id && c.metadata.as_ref() == Some(&meta))
+        {
+            return Err(Status::already_exists(format!(
+                "failed to reserve container name \"{}_{}\": name is reserved for \"{}\"",
+                meta.name, meta.attempt, existing.id
+            )));
+        }
+        let id = st.new_id("container");
+        st.containers.push(v1::Container {
+            id: id.clone(),
+            pod_sandbox_id: req.pod_sandbox_id,
+            metadata: Some(meta),
+            image: config.image,
+            state: v1::ContainerState::ContainerCreated as i32,
+            labels: config.labels,
+            annotations: config.annotations,
+            ..Default::default()
+        });
+        Ok(Response::new(v1::CreateContainerResponse { container_id: id }))
+    }
+
+    async fn start_container(
+        &self,
+        request: Request<v1::StartContainerRequest>,
+    ) -> Result<Response<v1::StartContainerResponse>, Status> {
+        let id = request.into_inner().container_id;
+        let mut st = self.state.lock().unwrap();
+        st.record("StartContainer");
+        let Some(c) = st.containers.iter_mut().find(|c| c.id == id) else {
+            return Err(Status::not_found(format!("container {id} not found")));
+        };
+        c.state = v1::ContainerState::ContainerRunning as i32;
+        Ok(Response::new(v1::StartContainerResponse {}))
+    }
+
+    async fn stop_container(
+        &self,
+        request: Request<v1::StopContainerRequest>,
+    ) -> Result<Response<v1::StopContainerResponse>, Status> {
+        let id = request.into_inner().container_id;
+        let mut st = self.state.lock().unwrap();
+        st.record("StopContainer");
+        let Some(c) = st.containers.iter_mut().find(|c| c.id == id) else {
+            return Err(Status::not_found(format!("container {id} not found")));
+        };
+        c.state = v1::ContainerState::ContainerExited as i32;
+        Ok(Response::new(v1::StopContainerResponse {}))
+    }
+
+    async fn remove_container(
+        &self,
+        request: Request<v1::RemoveContainerRequest>,
+    ) -> Result<Response<v1::RemoveContainerResponse>, Status> {
+        let id = request.into_inner().container_id;
+        let mut st = self.state.lock().unwrap();
+        st.record("RemoveContainer");
+        st.containers.retain(|c| c.id != id);
+        Ok(Response::new(v1::RemoveContainerResponse {}))
     }
 
         type GetContainerEventsStream =
@@ -152,14 +351,7 @@ fake_runtime_service! {
     }
     stubs {
         version: VersionRequest => VersionResponse,
-        run_pod_sandbox: RunPodSandboxRequest => RunPodSandboxResponse,
-        stop_pod_sandbox: StopPodSandboxRequest => StopPodSandboxResponse,
-        remove_pod_sandbox: RemovePodSandboxRequest => RemovePodSandboxResponse,
         pod_sandbox_status: PodSandboxStatusRequest => PodSandboxStatusResponse,
-        create_container: CreateContainerRequest => CreateContainerResponse,
-        start_container: StartContainerRequest => StartContainerResponse,
-        stop_container: StopContainerRequest => StopContainerResponse,
-        remove_container: RemoveContainerRequest => RemoveContainerResponse,
         container_status: ContainerStatusRequest => ContainerStatusResponse,
         update_container_resources: UpdateContainerResourcesRequest => UpdateContainerResourcesResponse,
         reopen_container_log: ReopenContainerLogRequest => ReopenContainerLogResponse,
