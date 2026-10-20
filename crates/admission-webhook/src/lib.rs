@@ -2911,27 +2911,6 @@ impl<S: Storage> AdmissionWebhookManager<S> {
     }
 }
 
-/// `apierrors.NewForbidden(attr.GetResource().GroupResource(), attr.GetName(),
-/// matchResult.Error)` (`generic/webhook.go:234`, `errors.go:209-217`).
-fn match_conditions_forbidden(
-    gvr: &GroupVersionResource,
-    name: &str,
-    err: &str,
-) -> rusternetes_common::Error {
-    // `attr.GetResource()` carries no subresource.
-    let resource = gvr.resource.split('/').next().unwrap_or("");
-    let qualified = if gvr.group.is_empty() {
-        resource.to_string()
-    } else {
-        format!("{resource}.{}", gvr.group)
-    };
-    rusternetes_common::Error::Forbidden(if name.is_empty() {
-        format!("{qualified} is forbidden: {err}")
-    } else {
-        format!("{qualified} \"{name}\" is forbidden: {err}")
-    })
-}
-
 /// Build a typed `AdmissionRequest` from the loose params used inside the
 /// admission_webhook dispatcher. Used by all three match-condition call sites
 /// (VAP, validating webhook, mutating webhook) to feed

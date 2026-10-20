@@ -20,6 +20,9 @@ use std::time::Instant;
 
 use rusternetes_common::admission::AdmissionRequest;
 use rusternetes_common::cel::CELEvaluator;
+use rusternetes_common::cel_cost::{
+    charge_budget, CostOptions, RUNTIME_CEL_COST_BUDGET_MATCH_CONDITIONS,
+};
 use rusternetes_common::resources::admission_webhook::MatchCondition;
 use rusternetes_common::resources::FailurePolicy;
 
@@ -152,26 +155,61 @@ fn match_inner(
         }
     };
 
+    // condition.go:90-111 `ForInput`: EVERY condition is evaluated first,
+    // each charged against `RuntimeCELCostBudgetMatchConditions`; running out
+    // returns `nil, -1, err` (no results), which `Match` treats as the filter
+    // failing (matcher.go:86-103).
     let mut evaluator = CELEvaluator::new();
-    let mut errors: Vec<String> = Vec::new();
+    let mut remaining = RUNTIME_CEL_COST_BUDGET_MATCH_CONDITIONS;
+    let mut results: Vec<(&MatchCondition, Result<bool, String>)> = Vec::new();
     for cond in conditions {
         if cond.expression.trim().is_empty() {
             continue;
         }
-        match evaluator.evaluate(&cond.expression, &context) {
-            Ok(true) => {}
+        // Each expression runs under the per-call limit
+        // (`environment/base.go:83`, `CostOptions::default`).
+        let (value, cost) =
+            evaluator.evaluate_with_cost(&cond.expression, &context, CostOptions::default());
+        remaining = match charge_budget(None, cost, remaining) {
+            Ok(r) => r,
+            Err(e) => {
+                observe_time(t);
+                return match policy {
+                    FailurePolicy::Fail => Inner::Error(e.detail),
+                    FailurePolicy::Ignore => Inner::Excluded,
+                    FailurePolicy::Unknown(_) => Inner::Matches,
+                };
+            }
+        };
+        results.push((
+            cond,
+            match value {
+                Ok(cel::Value::Bool(b)) => Ok(b),
+                Ok(other) => Err(format!(
+                    "matchCondition '{}' (expression: {}) failed: expression resulted in non-bool value: {other:?}",
+                    cond.name, cond.expression
+                )),
+                Err(e) => Err(format!(
+                    "matchCondition '{}' (expression: {}) failed: {}",
+                    cond.name, cond.expression, e
+                )),
+            },
+        ));
+    }
+
+    let mut errors: Vec<String> = Vec::new();
+    for (_, result) in results {
+        match result {
+            Err(e) => {
+                errors.push(e);
+                observe_match_condition_eval_error(name, KIND_WEBHOOK, step_type, op);
+            }
+            // matcher.go:111-117: any false skips the webhook always.
             Ok(false) => {
-                // matcher.go:111-117: any false skips the webhook always.
                 observe_time(t);
                 return Inner::Excluded;
             }
-            Err(e) => {
-                errors.push(format!(
-                    "matchCondition '{}' (expression: {}) failed: {}",
-                    cond.name, cond.expression, e
-                ));
-                observe_match_condition_eval_error(name, KIND_WEBHOOK, step_type, op);
-            }
+            Ok(true) => {}
         }
     }
     if !errors.is_empty() {
