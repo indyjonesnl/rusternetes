@@ -1109,28 +1109,15 @@ impl VolumeManager {
         // crash a config watcher such as kube-proxy (#1652).
         if let Some(cm_source) = &volume.config_map {
             if let Some(cm_name) = &cm_source.name {
-                if let Some(cm) = fetched.config_map(cm_name) {
-                    let volume_dir = self.pod_volume_dir(pod, volume);
-                    let is_optional = cm_source.optional.unwrap_or(false);
-                    let mode = cm_source.default_mode.unwrap_or(0o644) as u32;
-                    match build_configmap_payload(
-                        cm,
-                        cm_source.items.as_ref(),
-                        cm_name,
-                        is_optional,
-                        mode,
-                    ) {
-                        Ok(payload) => {
-                            let _ = crate::volume_ownership::write_payload_with_ownership(
-                                std::path::Path::new(&volume_dir),
-                                &payload,
-                                crate::volume_plugins::util::fs_group_from(pod),
-                                true,
-                            );
-                        }
-                        Err(e) => warn!("ConfigMap {} resync: {}", cm_name, e),
-                    }
-                }
+                let volume_dir = self.pod_volume_dir(pod, volume);
+                Self::reproject_config_map(
+                    &volume_dir,
+                    cm_source,
+                    cm_name,
+                    fetched.config_map(cm_name),
+                    crate::volume_plugins::util::fs_group_from(pod),
+                    "resync",
+                );
             }
         }
         // Resync projected volumes: re-run the projected plugin's SetUp
@@ -1189,6 +1176,54 @@ impl VolumeManager {
             }
         }
         Ok(())
+    }
+
+    /// Re-project a ConfigMap volume through the AtomicWriter.
+    ///
+    /// Ports `configMapVolumeMounter.SetUpAt`
+    /// (`pkg/volume/configmap/configmap.go:166-181`): a ConfigMap that is
+    /// gone (`IsNotFound`) and `optional` is replaced by an empty ConfigMap
+    /// carrying only name/namespace, and setup CONTINUES into `MakePayload`
+    /// and `AtomicWriter.Write` (`pkg/volume/util/atomic_writer.go`), which
+    /// prunes every key absent from the new (empty) payload. A required
+    /// ConfigMap that cannot be read leaves the volume untouched (upstream's
+    /// failed `SetUpAt` writes nothing). An unchanged payload is a no-op, so
+    /// there is never an in-place rewrite through `..data` (#1652).
+    fn reproject_config_map(
+        volume_dir: &str,
+        source: &rusternetes_common::resources::ConfigMapVolumeSource,
+        cm_name: &str,
+        fetched: Option<&ConfigMap>,
+        fs_group: Option<i64>,
+        what: &str,
+    ) {
+        let optional = source.optional.unwrap_or(false);
+        let namespace = fetched
+            .and_then(|c| c.metadata.namespace.clone())
+            .unwrap_or_default();
+        let empty = ConfigMap::new(cm_name, namespace);
+        let cm = match fetched {
+            Some(c) => c,
+            None if optional => &empty,
+            None => return,
+        };
+        let mode = source.default_mode.unwrap_or(0o644) as u32;
+        let payload =
+            match build_configmap_payload(cm, source.items.as_ref(), cm_name, optional, mode) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("ConfigMap {} {}: {}", cm_name, what, e);
+                    return;
+                }
+            };
+        if let Err(e) = crate::volume_ownership::write_payload_with_ownership(
+            std::path::Path::new(volume_dir),
+            &payload,
+            fs_group,
+            true,
+        ) {
+            warn!("ConfigMap {} {}: {:#}", cm_name, what, e);
+        }
     }
 
     /// Re-project a Secret volume through the AtomicWriter (#1656).
@@ -1539,47 +1574,14 @@ impl VolumeManager {
                     Some(n) => n,
                     None => return Ok(()),
                 };
-                match fetched.config_map(cm_name) {
-                    Some(cm) => {
-                        // Re-project through the AtomicWriter (same path as the
-                        // initial mount): an unchanged ConfigMap is a true no-op,
-                        // and key removals are handled by the writer's stale
-                        // user-visible-symlink pruning. This must NOT rewrite the
-                        // user-visible files in place — that follows the `..data`
-                        // symlinks and fires an fsnotify Write, crash-looping a
-                        // config watcher like kube-proxy (#1652).
-                        let is_optional = cm_source.optional.unwrap_or(false);
-                        let mode = cm_source.default_mode.unwrap_or(0o644) as u32;
-                        match build_configmap_payload(
-                            cm,
-                            cm_source.items.as_ref(),
-                            cm_name,
-                            is_optional,
-                            mode,
-                        ) {
-                            Ok(payload) => {
-                                let _ = crate::volume_ownership::write_payload_with_ownership(
-                                    std::path::Path::new(&volume_dir),
-                                    &payload,
-                                    crate::volume_plugins::util::fs_group_from(pod),
-                                    true,
-                                );
-                            }
-                            Err(e) => warn!("ConfigMap {} refresh: {}", cm_name, e),
-                        }
-                    }
-                    None => {
-                        // ConfigMap deleted — clean up files if optional
-                        let is_optional = cm_source.optional.unwrap_or(false);
-                        if is_optional {
-                            if let Ok(entries) = std::fs::read_dir(&volume_dir) {
-                                for entry in entries.flatten() {
-                                    let _ = std::fs::remove_file(entry.path());
-                                }
-                            }
-                        }
-                    }
-                }
+                Self::reproject_config_map(
+                    &volume_dir,
+                    cm_source,
+                    cm_name,
+                    fetched.config_map(cm_name),
+                    crate::volume_plugins::util::fs_group_from(pod),
+                    "refresh",
+                );
             }
         }
         Ok(())
