@@ -517,34 +517,143 @@ const ENDPOINTSLICE_KEY: &str = "/registry/endpointslices/default/kubernetes";
 /// (`pkg/controlplane/reconcilers/endpointsadapter.go`).
 const SKIP_MIRROR_LABEL: &str = "endpointslice.kubernetes.io/skip-mirror";
 
-/// Get the API server's IP address from the network interface.
-/// This discovers the container's IP on the Docker/Podman network.
-fn get_api_server_ip() -> Result<String> {
-    // Try to get IP from network interfaces.
-    // Look for non-loopback IPv4 addresses.
-    let interfaces = match get_if_addrs::get_if_addrs() {
-        Ok(addrs) => addrs,
-        Err(e) => {
-            warn!("Failed to get network interfaces: {}", e);
-            return Err(anyhow::anyhow!("Failed to get network interfaces: {}", e));
-        }
-    };
+/// Address family, mirroring `utilnet.AddressFamily`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AddrFamily {
+    V4,
+    V6,
+}
 
-    // Find the first non-loopback IPv4 address.
-    for iface in interfaces {
-        if !iface.is_loopback() {
-            if let get_if_addrs::IfAddr::V4(addr) = iface.addr {
-                let ip = addr.ip.to_string();
-                info!(
-                    "Discovered API server IP: {} (interface: {})",
-                    ip, iface.name
-                );
-                return Ok(ip);
+/// `utilnet.preferIPv4` / `preferIPv6`
+/// (`staging/src/k8s.io/apimachinery/pkg/util/net/interface.go:43-44`).
+const PREFER_IPV4: [AddrFamily; 2] = [AddrFamily::V4, AddrFamily::V6];
+const PREFER_IPV6: [AddrFamily; 2] = [AddrFamily::V6, AddrFamily::V4];
+
+/// Go's `net.IP.IsGlobalUnicast`: not unspecified, loopback, multicast,
+/// link-local unicast, or the IPv4 limited broadcast address.
+fn is_global_unicast(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            !(v4.is_broadcast()
+                || v4.is_unspecified()
+                || v4.is_loopback()
+                || v4.is_multicast()
+                || v4.is_link_local())
+        }
+        std::net::IpAddr::V6(v6) => {
+            !(v6.is_unspecified()
+                || v6.is_loopback()
+                || v6.is_multicast()
+                // fe80::/10, Go's IsLinkLocalUnicast.
+                || (v6.segments()[0] & 0xffc0) == 0xfe80)
+        }
+    }
+}
+
+/// Port of `utilnet.chooseIPFromHostInterfaces`
+/// (`apimachinery/pkg/util/net/interface.go:312-358`): for each preferred
+/// family in order, the first global unicast address of that family on a
+/// non-loopback interface.
+///
+/// `get_if_addrs` exposes neither interface up/down nor point-to-point flags
+/// (`isInterfaceUp` / `isLoopbackOrPointToPoint`), so only the loopback skip is
+/// ported; the default-route based selection (`chooseHostInterfaceFromRoute`)
+/// is not ported either.
+fn choose_ip_from_host_interfaces(
+    addrs: &[(String, std::net::IpAddr)],
+    families: [AddrFamily; 2],
+) -> Result<std::net::IpAddr> {
+    if addrs.is_empty() {
+        return Err(anyhow::anyhow!("no interfaces found on host."));
+    }
+    for family in families {
+        for (name, ip) in addrs {
+            let member = match ip {
+                std::net::IpAddr::V4(_) => family == AddrFamily::V4,
+                std::net::IpAddr::V6(_) => family == AddrFamily::V6,
+            };
+            if !member || !is_global_unicast(ip) {
+                continue;
             }
+            info!("Discovered API server IP: {} (interface: {})", ip, name);
+            return Ok(*ip);
+        }
+    }
+    Err(anyhow::anyhow!(
+        "no acceptable interface with global unicast address found on host"
+    ))
+}
+
+fn host_interface_addrs() -> Result<Vec<(String, std::net::IpAddr)>> {
+    let interfaces = get_if_addrs::get_if_addrs().map_err(|e| {
+        warn!("Failed to get network interfaces: {}", e);
+        anyhow::anyhow!("Failed to get network interfaces: {}", e)
+    })?;
+    Ok(interfaces
+        .into_iter()
+        .filter(|i| !i.is_loopback())
+        .map(|i| (i.name.clone(), i.ip()))
+        .collect())
+}
+
+/// Port of `utilnet.ResolveBindAddress`
+/// (`apimachinery/pkg/util/net/interface.go:468-480`): an unspecified or
+/// loopback bind address (or none) resolves to the host's default address of
+/// the bind address's family (IPv4-preferred when it has none); anything else
+/// is returned as is.
+fn resolve_bind_address(bind: Option<std::net::IpAddr>) -> Result<std::net::IpAddr> {
+    resolve_bind_address_with(bind, host_interface_addrs)
+}
+
+fn resolve_bind_address_with(
+    bind: Option<std::net::IpAddr>,
+    addrs: impl FnOnce() -> Result<Vec<(String, std::net::IpAddr)>>,
+) -> Result<std::net::IpAddr> {
+    let families = match bind {
+        Some(std::net::IpAddr::V6(_)) => PREFER_IPV6,
+        _ => PREFER_IPV4,
+    };
+    match bind {
+        Some(ip) if !ip.is_unspecified() && !ip.is_loopback() => Ok(ip),
+        _ => choose_ip_from_host_interfaces(&addrs()?, families),
+    }
+}
+
+/// Where the api-server's own address for the `kubernetes` Endpoints comes
+/// from. Upstream sets `GenericConfig.PublicAddress` from `--advertise-address`
+/// and, when that is unset or unspecified, from
+/// `SecureServingOptions.DefaultExternalAddress` ->
+/// `utilnet.ResolveBindAddress(--bind-address)`
+/// (`apiserver/pkg/server/options/server_run_options.go:172-187`,
+/// `serving.go:123-128`); `pkg/controlplane/instance.go:350` hands it to the
+/// reconciler as `PublicIP`. So the family follows the bind address, not the
+/// service range.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AdvertiseAddress {
+    /// `--advertise-address`.
+    pub advertise: Option<std::net::IpAddr>,
+    /// The IP of `--bind-address`.
+    pub bind: Option<std::net::IpAddr>,
+}
+
+impl AdvertiseAddress {
+    /// `bind_address` is the `host:port` listen string.
+    pub fn new(advertise: Option<std::net::IpAddr>, bind_address: &str) -> Self {
+        Self {
+            advertise,
+            bind: bind_address
+                .parse::<std::net::SocketAddr>()
+                .ok()
+                .map(|a| a.ip()),
         }
     }
 
-    Err(anyhow::anyhow!("No non-loopback IPv4 address found"))
+    pub fn resolve(&self) -> Result<std::net::IpAddr> {
+        match self.advertise {
+            Some(ip) if !ip.is_unspecified() => Ok(ip),
+            _ => resolve_bind_address(self.bind),
+        }
+    }
 }
 
 /// The single canonical `EndpointSubset` the `kubernetes` Endpoints must hold:
@@ -670,7 +779,34 @@ async fn reconcile_endpointslice<S: Storage + ?Sized>(
         app_protocol: None,
     }];
 
+    // `endpointSliceFromEndpoints`: IPv4 unless every address is IPv6
+    // (`pkg/controlplane/reconcilers/endpointsadapter.go:126,138-140`).
+    let address_type = if ip.parse::<std::net::Ipv6Addr>().is_ok() {
+        "IPv6"
+    } else {
+        "IPv4"
+    };
+
     match storage.get::<EndpointSlice>(ENDPOINTSLICE_KEY).await {
+        Ok(es) if es.address_type != address_type => {
+            // `EnsureEndpointSliceFromEndpoints` (:96-104): an address-type
+            // change cannot be updated in place, so delete and re-create.
+            storage
+                .delete(ENDPOINTSLICE_KEY)
+                .await
+                .context("Failed to delete kubernetes EndpointSlice")?;
+            create_kubernetes_endpointslice(
+                storage,
+                address_type,
+                desired_endpoints,
+                desired_ports,
+            )
+            .await?;
+            info!(
+                "Re-created kubernetes EndpointSlice ({}) with IP: {}",
+                address_type, ip
+            );
+        }
         Ok(mut es) => {
             if es.endpoints != desired_endpoints || es.ports != desired_ports {
                 es.endpoints = desired_endpoints;
@@ -683,41 +819,57 @@ async fn reconcile_endpointslice<S: Storage + ?Sized>(
             }
         }
         Err(_) => {
-            use rusternetes_common::types::{ObjectMeta, TypeMeta};
-
-            let mut metadata = ObjectMeta::new("kubernetes");
-            metadata.namespace = Some("default".to_string());
-            let mut labels = std::collections::HashMap::new();
-            labels.insert(
-                "kubernetes.io/service-name".to_string(),
-                "kubernetes".to_string(),
-            );
-            labels.insert(
-                "endpointslice.kubernetes.io/managed-by".to_string(),
-                "endpointslice-mirroring-controller.k8s.io".to_string(),
-            );
-            metadata.labels = Some(labels);
-            metadata.ensure_uid();
-            metadata.ensure_creation_timestamp();
-
-            let es = EndpointSlice {
-                type_meta: TypeMeta {
-                    kind: "EndpointSlice".to_string(),
-                    api_version: "discovery.k8s.io/v1".to_string(),
-                },
-                metadata,
-                address_type: "IPv4".to_string(),
-                endpoints: desired_endpoints,
-                ports: desired_ports,
-            };
-
-            storage
-                .create(ENDPOINTSLICE_KEY, &es)
-                .await
-                .context("Failed to create kubernetes EndpointSlice")?;
+            create_kubernetes_endpointslice(
+                storage,
+                address_type,
+                desired_endpoints,
+                desired_ports,
+            )
+            .await?;
             info!("Created kubernetes EndpointSlice with IP: {}", ip);
         }
     }
+    Ok(())
+}
+
+async fn create_kubernetes_endpointslice<S: Storage + ?Sized>(
+    storage: &S,
+    address_type: &str,
+    desired_endpoints: Vec<rusternetes_common::resources::endpointslice::Endpoint>,
+    desired_ports: Vec<rusternetes_common::resources::endpointslice::EndpointPort>,
+) -> Result<()> {
+    use rusternetes_common::types::{ObjectMeta, TypeMeta};
+
+    let mut metadata = ObjectMeta::new("kubernetes");
+    metadata.namespace = Some("default".to_string());
+    let mut labels = std::collections::HashMap::new();
+    labels.insert(
+        "kubernetes.io/service-name".to_string(),
+        "kubernetes".to_string(),
+    );
+    labels.insert(
+        "endpointslice.kubernetes.io/managed-by".to_string(),
+        "endpointslice-mirroring-controller.k8s.io".to_string(),
+    );
+    metadata.labels = Some(labels);
+    metadata.ensure_uid();
+    metadata.ensure_creation_timestamp();
+
+    let es = EndpointSlice {
+        type_meta: TypeMeta {
+            kind: "EndpointSlice".to_string(),
+            api_version: "discovery.k8s.io/v1".to_string(),
+        },
+        metadata,
+        address_type: address_type.to_string(),
+        endpoints: desired_endpoints,
+        ports: desired_ports,
+    };
+
+    storage
+        .create(ENDPOINTSLICE_KEY, &es)
+        .await
+        .context("Failed to create kubernetes EndpointSlice")?;
     Ok(())
 }
 
@@ -850,9 +1002,13 @@ pub async fn bootstrap_kubernetes_service(
     storage: Arc<StorageBackend>,
     api_server_port: u16,
     service_ip: std::net::IpAddr,
+    advertise: AdvertiseAddress,
 ) -> Result<()> {
     info!("Bootstrapping kubernetes Service and Endpoints");
-    let api_server_ip = get_api_server_ip().context("Failed to discover API server IP address")?;
+    let api_server_ip = advertise
+        .resolve()
+        .context("Failed to discover API server IP address")?
+        .to_string();
     info!(
         "API server IP: {}, Port: {}",
         api_server_ip, api_server_port
@@ -875,9 +1031,10 @@ pub fn spawn_endpoint_reconciler(
     storage: Arc<StorageBackend>,
     api_server_port: u16,
     service_ip: std::net::IpAddr,
+    advertise: AdvertiseAddress,
 ) -> tokio::task::JoinHandle<()> {
     crate::post_start_hooks::spawn_starting_hook(BOOTSTRAP_CONTROLLER_HOOK, move || {
-        spawn_endpoint_reconciler_loop(storage, api_server_port, service_ip);
+        spawn_endpoint_reconciler_loop(storage, api_server_port, service_ip, advertise);
     })
 }
 
@@ -885,6 +1042,7 @@ fn spawn_endpoint_reconciler_loop(
     storage: Arc<StorageBackend>,
     api_server_port: u16,
     service_ip: std::net::IpAddr,
+    advertise: AdvertiseAddress,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(ENDPOINT_RECONCILE_INTERVAL);
@@ -892,8 +1050,8 @@ fn spawn_endpoint_reconciler_loop(
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            let ip = match get_api_server_ip() {
-                Ok(ip) => ip,
+            let ip = match advertise.resolve() {
+                Ok(ip) => ip.to_string(),
                 Err(e) => {
                     warn!(
                         "endpoint reconciler: could not discover api-server IP: {}",
@@ -2967,7 +3125,12 @@ mod post_start_hook_registration_tests {
     #[tokio::test]
     async fn controller_hooks_register_and_finish() {
         let storage = Arc::new(StorageBackend::new_memory());
-        spawn_endpoint_reconciler(storage.clone(), 6443, super::test_service_ip());
+        spawn_endpoint_reconciler(
+            storage.clone(),
+            6443,
+            super::test_service_ip(),
+            AdvertiseAddress::default(),
+        );
         spawn_apiservice_availability_controller(storage.clone());
         crate::registry::apiextensions::customresourcedefinition::start_controllers(
             storage.clone(),
@@ -3100,3 +3263,118 @@ mod system_namespaces_tests {
 #[cfg(test)]
 #[path = "bootstrap_policy_tests.rs"]
 mod bootstrap_policy_tests;
+
+/// Ports of the `utilnet` host-address tests
+/// (`apimachinery/pkg/util/net/interface_test.go` `TestGetIPFromHostInterfaces`,
+/// `TestMemberOf`) plus `ResolveBindAddress` / `AdvertiseAddress` semantics.
+#[cfg(test)]
+mod advertise_address_tests {
+    use super::*;
+    use rusternetes_storage::memory::MemoryStorage;
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    fn addrs(list: &[&str]) -> Vec<(String, IpAddr)> {
+        list.iter()
+            .enumerate()
+            .map(|(i, a)| (format!("eth{i}"), ip(a)))
+            .collect()
+    }
+
+    #[test]
+    fn prefers_requested_family_and_falls_back() {
+        let both = addrs(&["10.0.0.5", "2001:db8::5"]);
+        assert_eq!(
+            choose_ip_from_host_interfaces(&both, PREFER_IPV4).unwrap(),
+            ip("10.0.0.5")
+        );
+        assert_eq!(
+            choose_ip_from_host_interfaces(&both, PREFER_IPV6).unwrap(),
+            ip("2001:db8::5")
+        );
+        let v6_only = addrs(&["2001:db8::5"]);
+        assert_eq!(
+            choose_ip_from_host_interfaces(&v6_only, PREFER_IPV4).unwrap(),
+            ip("2001:db8::5")
+        );
+        let v4_only = addrs(&["10.0.0.5"]);
+        assert_eq!(
+            choose_ip_from_host_interfaces(&v4_only, PREFER_IPV6).unwrap(),
+            ip("10.0.0.5")
+        );
+    }
+
+    #[test]
+    fn skips_non_global_unicast_and_errors_when_none() {
+        let l = addrs(&["169.254.1.1", "fe80::1", "224.0.0.1", "10.0.0.5"]);
+        assert_eq!(
+            choose_ip_from_host_interfaces(&l, PREFER_IPV6).unwrap(),
+            ip("10.0.0.5")
+        );
+        let none = addrs(&["fe80::1", "169.254.1.1"]);
+        assert!(choose_ip_from_host_interfaces(&none, PREFER_IPV4).is_err());
+        assert!(choose_ip_from_host_interfaces(&[], PREFER_IPV4).is_err());
+    }
+
+    /// `ResolveBindAddress`: a concrete bind address is returned as is; an
+    /// unspecified one resolves within ITS family.
+    #[test]
+    fn resolve_bind_address_follows_bind_family() {
+        let host = || Ok(addrs(&["10.0.0.5", "2001:db8::5"]));
+        assert_eq!(
+            resolve_bind_address_with(Some(ip("192.0.2.9")), host).unwrap(),
+            ip("192.0.2.9")
+        );
+        assert_eq!(
+            resolve_bind_address_with(Some(ip("0.0.0.0")), host).unwrap(),
+            ip("10.0.0.5")
+        );
+        assert_eq!(
+            resolve_bind_address_with(Some(ip("::")), host).unwrap(),
+            ip("2001:db8::5")
+        );
+        assert_eq!(
+            resolve_bind_address_with(Some(ip("::1")), host).unwrap(),
+            ip("2001:db8::5")
+        );
+        assert_eq!(
+            resolve_bind_address_with(None, host).unwrap(),
+            ip("10.0.0.5")
+        );
+    }
+
+    #[test]
+    fn advertise_address_wins_unless_unspecified() {
+        let a = AdvertiseAddress::new(Some(ip("2001:db8::7")), "0.0.0.0:6443");
+        assert_eq!(a.resolve().unwrap(), ip("2001:db8::7"));
+        let a = AdvertiseAddress::new(None, "[2001:db8::9]:6443");
+        assert_eq!(a.bind, Some(ip("2001:db8::9")));
+        assert_eq!(a.resolve().unwrap(), ip("2001:db8::9"));
+        // Unspecified --advertise-address falls through to the bind address.
+        let a = AdvertiseAddress::new(Some(ip("::")), "10.1.1.1:6443");
+        assert_eq!(a.resolve().unwrap(), ip("10.1.1.1"));
+    }
+
+    /// `endpointSliceFromEndpoints`: IPv6 address -> IPv6 slice; a transition
+    /// replaces the slice (`EnsureEndpointSliceFromEndpoints`, :96-104).
+    #[tokio::test]
+    async fn endpointslice_address_type_follows_ip_and_is_replaced() {
+        let storage = MemoryStorage::new();
+        reconcile_kubernetes_endpoint(&storage, "2001:db8::5", 6443)
+            .await
+            .unwrap();
+        let es: EndpointSlice = storage.get(ENDPOINTSLICE_KEY).await.unwrap();
+        assert_eq!(es.address_type, "IPv6");
+        assert_eq!(es.endpoints[0].addresses, vec!["2001:db8::5".to_string()]);
+
+        reconcile_kubernetes_endpoint(&storage, "10.0.0.5", 6443)
+            .await
+            .unwrap();
+        let es: EndpointSlice = storage.get(ENDPOINTSLICE_KEY).await.unwrap();
+        assert_eq!(es.address_type, "IPv4");
+        assert_eq!(es.endpoints[0].addresses, vec!["10.0.0.5".to_string()]);
+    }
+}

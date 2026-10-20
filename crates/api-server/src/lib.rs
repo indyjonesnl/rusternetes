@@ -177,6 +177,9 @@ pub fn ca_cert_pem_for_config(config: &ApiServerConfig) -> anyhow::Result<Option
 /// Configuration for the API server component.
 pub struct ApiServerConfig {
     pub bind_address: String,
+    /// `--advertise-address`: the IP the `kubernetes` Endpoints advertise.
+    /// Unset -> resolved from `bind_address` (`utilnet.ResolveBindAddress`).
+    pub advertise_address: Option<std::net::IpAddr>,
     pub jwt_secret: String,
     /// `--service-account-key-file` / `--service-account-signing-key-file` /
     /// `--service-account-issuer` / `--api-audiences` (#1575).
@@ -341,6 +344,7 @@ impl Default for ApiServerConfig {
     fn default() -> Self {
         Self {
             bind_address: "0.0.0.0:6443".to_string(),
+            advertise_address: None,
             jwt_secret: "rusternetes-secret-change-in-production".to_string(),
             service_account: Default::default(),
             tls: false,
@@ -449,6 +453,7 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
         storage.clone(),
         api_port,
         service_ranges.api_server_service_ip(),
+        bootstrap::AdvertiseAddress::new(config.advertise_address, &config.bind_address),
         service_ranges.cidrs(),
         startup::ClusterAuthnInputs {
             ca_cert_pem: ca_cert_pem.as_deref(),

@@ -32,12 +32,14 @@ pub async fn register_post_start_hooks(
     storage: Arc<StorageBackend>,
     api_port: u16,
     service_ip: std::net::IpAddr,
+    advertise: bootstrap::AdvertiseAddress,
     service_cidrs: Vec<String>,
     authn: ClusterAuthnInputs<'_>,
     spawn_crd_resync: impl FnOnce(Arc<StorageBackend>),
 ) {
     if let Err(e) =
-        bootstrap::bootstrap_kubernetes_service(storage.clone(), api_port, service_ip).await
+        bootstrap::bootstrap_kubernetes_service(storage.clone(), api_port, service_ip, advertise)
+            .await
     {
         warn!(
             "Failed to bootstrap kubernetes Service Endpoints: {}. Continuing anyway.",
@@ -66,7 +68,7 @@ pub async fn register_post_start_hooks(
     storage_readiness_hook::spawn_for_backend(storage.clone());
     // Keep the kubernetes endpoint tracking the live api-server IP across
     // container recreates / IP changes (upstream EndpointReconciler, #1188).
-    bootstrap::spawn_endpoint_reconciler(storage.clone(), api_port, service_ip);
+    bootstrap::spawn_endpoint_reconciler(storage.clone(), api_port, service_ip, advertise);
 
     // Aggregation layer: probe aggregated APIService backends and set their
     // Available condition (upstream kube-aggregator availability controller,
