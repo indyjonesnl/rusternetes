@@ -179,6 +179,14 @@ const PLUGINS: &[Spec] = &[
         admit: true,
         validate: true,
     },
+    // eventratelimit/admission.go:64 (ValidationInterface only), :78
+    // (NewHandler(Create, Update))
+    Spec {
+        name: "EventRateLimit",
+        ops: C | U,
+        admit: false,
+        validate: true,
+    },
     // antiaffinity/admission.go:45, :50
     Spec {
         name: "LimitPodHardAntiAffinityTopology",
