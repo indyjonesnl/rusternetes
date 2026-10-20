@@ -2774,7 +2774,7 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             // matching upstream, where admission runs after authn/authz.
             // Rejects creating content in a Terminating namespace (#1846).
             .layer(axum_middleware::from_fn(
-                middleware::namespace_lifecycle_middleware,
+                crate::admission::namespace_plugins::namespace_lifecycle_gate,
             ))
             // Decodes DeleteOptions once for every DELETE, so no handler has to
             // read the body itself and none can forget to. Upstream does this
@@ -2844,7 +2844,7 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             // matching upstream, where admission runs after authn/authz.
             // Rejects creating content in a Terminating namespace (#1846).
             .layer(axum_middleware::from_fn(
-                middleware::namespace_lifecycle_middleware,
+                crate::admission::namespace_plugins::namespace_lifecycle_gate,
             ))
             // Decodes DeleteOptions once for every DELETE, so no handler has to
             // read the body itself and none can forget to. Upstream does this
