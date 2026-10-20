@@ -13,6 +13,7 @@ use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const CTB: &str = "/apis/certificates.k8s.io/v1beta1/clustertrustbundles";
+const CTB_ALPHA: &str = "/apis/certificates.k8s.io/v1alpha1/clustertrustbundles";
 
 fn pem(cn: &str, ca: bool) -> String {
     use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair};
@@ -64,6 +65,12 @@ async fn not_served_while_the_gate_is_off() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, _) = api.get("/apis/certificates.k8s.io/v1beta1").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = api.get("/apis/certificates.k8s.io/v1alpha1").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = api.get(CTB_ALPHA).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = api.post(CTB_ALPHA, &ctb("foo", "", &pem("a", true))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
     let (_, groups) = api.get("/apis").await;
     let certs = groups["groups"]
         .as_array()
@@ -95,7 +102,7 @@ async fn discovery_advertises_v1beta1_when_the_gate_is_on() {
         .iter()
         .map(|v| v["version"].as_str().unwrap())
         .collect();
-    assert_eq!(versions, vec!["v1", "v1beta1"], "{certs}");
+    assert_eq!(versions, vec!["v1", "v1beta1", "v1alpha1"], "{certs}");
     assert_eq!(certs["preferredVersion"]["version"], "v1");
 
     let (status, list) = api.get("/apis/certificates.k8s.io/v1beta1").await;
@@ -109,7 +116,7 @@ async fn discovery_advertises_v1beta1_when_the_gate_is_on() {
     // The trailing-slash route is the one backed by the built-in group table.
     let (status, group) = api.get("/apis/certificates.k8s.io/").await;
     assert_eq!(status, StatusCode::OK, "{group}");
-    assert_eq!(group["versions"].as_array().unwrap().len(), 2, "{group}");
+    assert_eq!(group["versions"].as_array().unwrap().len(), 3, "{group}");
 }
 
 /// storage_test.go TestCreate/TestUpdate/TestDelete/TestGet/TestList plus the
@@ -514,4 +521,75 @@ mod attest {
             "{out}"
         );
     }
+}
+
+/// v1alpha1Storage (storage_certificates.go:122-138) installs the same store
+/// as v1beta1: an object written at one version is read at the other, each
+/// encoded with the version it was requested at; v1alpha1 is advertised and
+/// lists clustertrustbundles.
+#[tokio::test]
+#[serial_test::serial]
+async fn v1alpha1_shares_the_v1beta1_storage() {
+    let _g = with_feature(Feature::ClusterTrustBundle, true);
+    let api = TestApiServer::new();
+    let c1 = pem("root1", true);
+
+    let (status, list) = api.get("/apis/certificates.k8s.io/v1alpha1").await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(list["groupVersion"], "certificates.k8s.io/v1alpha1");
+    let res = list["resources"].as_array().unwrap();
+    assert_eq!(res.len(), 1, "{list}");
+    assert_eq!(res[0]["name"], "clustertrustbundles");
+    assert_eq!(res[0]["kind"], "ClusterTrustBundle");
+
+    let mut body = ctb("alpha1", "", &c1);
+    body["apiVersion"] = json!("certificates.k8s.io/v1alpha1");
+    let (status, out) = api.post(CTB_ALPHA, &body).await;
+    assert_eq!(status, StatusCode::CREATED, "{out}");
+    assert_eq!(out["apiVersion"], "certificates.k8s.io/v1alpha1");
+
+    // Read back at both versions.
+    let (status, got) = api.get(&format!("{CTB_ALPHA}/alpha1")).await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(got["apiVersion"], "certificates.k8s.io/v1alpha1");
+    let (status, got) = api.get(&format!("{CTB}/alpha1")).await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(got["apiVersion"], "certificates.k8s.io/v1beta1");
+
+    // A v1beta1 write is visible at v1alpha1, and lists encode per version.
+    let (status, out) = api.post(CTB, &ctb("beta1", "", &pem("root2", true))).await;
+    assert_eq!(status, StatusCode::CREATED, "{out}");
+    let (status, list) = api.get(CTB_ALPHA).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(list["apiVersion"], "certificates.k8s.io/v1alpha1");
+    let items = list["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "{list}");
+    assert!(items
+        .iter()
+        .all(|i| i["apiVersion"] == "certificates.k8s.io/v1alpha1"));
+    let (_, list) = api.get(CTB).await;
+    assert!(list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|i| i["apiVersion"] == "certificates.k8s.io/v1beta1"));
+
+    // Validation is the shared strategy: an empty bundle is rejected.
+    let mut bad = ctb("bad", "", "");
+    bad["apiVersion"] = json!("certificates.k8s.io/v1alpha1");
+    let (status, out) = api.post(CTB_ALPHA, &bad).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{out}");
+    assert_eq!(causes(&out), vec!["spec.trustBundle"], "{out}");
+
+    // Update and delete through v1alpha1.
+    let (_, got) = api.get(&format!("{CTB_ALPHA}/alpha1")).await;
+    let mut upd = got.clone();
+    upd["spec"]["trustBundle"] = json!(format!("{c1}\n{}", pem("root3", true)));
+    let (status, out) = api.put(&format!("{CTB_ALPHA}/alpha1"), &upd).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["apiVersion"], "certificates.k8s.io/v1alpha1");
+    let (status, out) = api.delete(&format!("{CTB_ALPHA}/alpha1")).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let (status, _) = api.get(&format!("{CTB}/alpha1")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }

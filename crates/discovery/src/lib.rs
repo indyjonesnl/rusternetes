@@ -259,7 +259,7 @@ pub async fn get_api_groups(
             }
             seen_groups.insert(name.to_string());
             let versions = if group_v1beta1_served(name) {
-                vec![
+                let mut v = vec![
                     serde_json::json!({
                         "version": version,
                         "resources": get_aggregated_resources_for_group(name, version),
@@ -270,7 +270,15 @@ pub async fn get_api_groups(
                         "resources": get_aggregated_resources_for_group(name, "v1beta1"),
                         "freshness": "Current"
                     }),
-                ]
+                ];
+                if group_v1alpha1_served(name) {
+                    v.push(serde_json::json!({
+                        "version": "v1alpha1",
+                        "resources": get_aggregated_resources_for_group(name, "v1alpha1"),
+                        "freshness": "Current"
+                    }));
+                }
+                v
             } else if name == "autoscaling" {
                 vec![
                     serde_json::json!({
@@ -782,6 +790,13 @@ pub async fn get_api_groups(
                 group_version: "certificates.k8s.io/v1beta1".to_string(),
                 version: "v1beta1".to_string(),
             });
+            // v1alpha1 follows v1beta1 (priority order, aggregator.go:317-352).
+            if certificates_v1alpha1_served() {
+                group.versions.push(GroupVersionForDiscovery {
+                    group_version: "certificates.k8s.io/v1alpha1".to_string(),
+                    version: "v1alpha1".to_string(),
+                });
+            }
         }
     }
 
@@ -920,6 +935,26 @@ fn certificates_v1beta1_served() -> bool {
     enabled(Feature::ClusterTrustBundle) || enabled(Feature::PodCertificateRequest)
 }
 
+/// Whether `certificates.k8s.io/v1alpha1` is served: its only resource,
+/// `clustertrustbundles`, is installed by `v1alpha1Storage` under the
+/// `ClusterTrustBundle` gate
+/// (pkg/registry/certificates/rest/storage_certificates.go:122-138), and
+/// upstream drops a group version that has no storage. Upstream also needs the
+/// alpha version enabled through `--runtime-config`
+/// (`alphaAPIGroupVersionsDisabledByDefault`, pkg/controlplane/instance.go);
+/// Rusternetes has no `--runtime-config`, so the gate stands in for both, as it
+/// does for v1beta1.
+fn certificates_v1alpha1_served() -> bool {
+    rusternetes_common::feature_gates::enabled(
+        rusternetes_common::feature_gates::Feature::ClusterTrustBundle,
+    )
+}
+
+/// Whether `group` also serves a `v1alpha1` next to its v1beta1.
+fn group_v1alpha1_served(group: &str) -> bool {
+    group == "certificates.k8s.io" && certificates_v1alpha1_served()
+}
+
 /// Whether `admissionregistration.k8s.io/v1beta1` is served: its resources,
 /// `mutatingadmissionpolicies` and `mutatingadmissionpolicybindings`, are
 /// installed only while the version is enabled, i.e. under the
@@ -982,6 +1017,9 @@ pub fn delegate_listed_paths() -> Vec<String> {
         if group_v1beta1_served(group) {
             paths.push(format!("/apis/{group}/v1beta1"));
         }
+        if group_v1alpha1_served(group) {
+            paths.push(format!("/apis/{group}/v1alpha1"));
+        }
         if group == "autoscaling" {
             paths.push("/apis/autoscaling/v1".to_string());
         }
@@ -999,6 +1037,7 @@ pub fn resolve_kind_to_resource(group: &str, version: &str, kind: &str) -> Optio
     let served = match (group, version) {
         ("", "v1") | ("autoscaling", "v1") => true,
         ("certificates.k8s.io", "v1beta1") => certificates_v1beta1_served(),
+        ("certificates.k8s.io", "v1alpha1") => certificates_v1alpha1_served(),
         ("admissionregistration.k8s.io", "v1beta1") => admissionregistration_v1beta1_served(),
         _ => get_api_group_names()
             .iter()
@@ -1046,6 +1085,9 @@ pub fn registered_kinds() -> Vec<RegisteredKind> {
         group_versions.push((group.to_string(), version.to_string()));
         if group_v1beta1_served(group) {
             group_versions.push((group.to_string(), "v1beta1".to_string()));
+        }
+        if group_v1alpha1_served(group) {
+            group_versions.push((group.to_string(), "v1alpha1".to_string()));
         }
     }
     let text = |v: &serde_json::Value, k: &str| v[k].as_str().unwrap_or("").to_string();
@@ -1620,6 +1662,21 @@ fn get_aggregated_resources_for_group_uncategorized(
         "coordination.k8s.io" => vec![res("leases", "lease", "Lease", true, all_verbs, vec![])],
         // v1beta1 serves ClusterTrustBundle and PodCertificateRequest, each
         // under its own gate (storage_certificates.go:91-117).
+        // v1alpha1 serves ClusterTrustBundle only (storage_certificates.go:122-138).
+        "certificates.k8s.io" if version == "v1alpha1" => {
+            if certificates_v1alpha1_served() {
+                vec![res(
+                    "clustertrustbundles",
+                    "clustertrustbundle",
+                    "ClusterTrustBundle",
+                    false,
+                    all_verbs,
+                    vec![],
+                )]
+            } else {
+                Vec::new()
+            }
+        }
         "certificates.k8s.io" if version == "v1beta1" => {
             use rusternetes_common::feature_gates::{enabled, Feature};
             let mut v = Vec::new();
@@ -1881,7 +1938,7 @@ pub async fn get_api_group(
     if let Some((name, version)) = found {
         // autoscaling has both v1 and v2
         let versions = if group_v1beta1_served(name) {
-            vec![
+            let mut v = vec![
                 GroupVersionForDiscovery {
                     group_version: format!("{}/{}", name, version),
                     version: version.to_string(),
@@ -1890,7 +1947,14 @@ pub async fn get_api_group(
                     group_version: format!("{}/v1beta1", name),
                     version: "v1beta1".to_string(),
                 },
-            ]
+            ];
+            if group_v1alpha1_served(name) {
+                v.push(GroupVersionForDiscovery {
+                    group_version: format!("{}/v1alpha1", name),
+                    version: "v1alpha1".to_string(),
+                });
+            }
+            v
         } else if *name == "autoscaling" {
             vec![
                 GroupVersionForDiscovery {
@@ -3721,6 +3785,59 @@ pub async fn get_certificates_v1beta1_resources() -> Response {
         api_version: "v1".to_string(),
         group_version: "certificates.k8s.io/v1beta1".to_string(),
         resources,
+    };
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
+        .into_response()
+}
+
+/// GET /apis/certificates.k8s.io/v1alpha1
+/// Returns `clustertrustbundles`, the only resource of v1alpha1
+/// (`v1alpha1Storage`, storage_certificates.go:122-138), 404 while the
+/// `ClusterTrustBundle` gate is off, as for an API version with no storage.
+pub async fn get_certificates_v1alpha1_resources() -> Response {
+    if !certificates_v1alpha1_served() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "kind": "Status",
+                "apiVersion": "v1",
+                "status": "Failure",
+                "message": "the server could not find the requested resource",
+                "reason": "NotFound",
+                "code": 404
+            })),
+        )
+            .into_response();
+    }
+    let resource_list = APIResourceList {
+        kind: "APIResourceList".to_string(),
+        api_version: "v1".to_string(),
+        group_version: "certificates.k8s.io/v1alpha1".to_string(),
+        resources: vec![APIResource {
+            name: "clustertrustbundles".to_string(),
+            singular_name: "clustertrustbundle".to_string(),
+            namespaced: false,
+            kind: "ClusterTrustBundle".to_string(),
+            verbs: [
+                "create",
+                "delete",
+                "deletecollection",
+                "get",
+                "list",
+                "patch",
+                "update",
+                "watch",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+            short_names: None,
+            categories: None,
+            storage_version_hash: None,
+        }],
     };
     (
         StatusCode::OK,

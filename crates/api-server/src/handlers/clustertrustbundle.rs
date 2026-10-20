@@ -63,7 +63,7 @@ fn scope(state: &ApiServerState) -> RequestScope<ClusterTrustBundle> {
     }
 }
 
-fn patch_content_type(headers: &HeaderMap) -> &str {
+pub(crate) fn patch_content_type(headers: &HeaderMap) -> &str {
     headers
         .get("x-original-content-type")
         .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))

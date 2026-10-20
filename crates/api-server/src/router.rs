@@ -963,6 +963,10 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             get(handlers::discovery::get_certificates_v1beta1_resources),
         )
         .route(
+            "/apis/certificates.k8s.io/v1alpha1",
+            get(handlers::discovery::get_certificates_v1alpha1_resources),
+        )
+        .route(
             "/apis/admissionregistration.k8s.io/v1beta1",
             get(handlers::discovery::get_admissionregistration_v1beta1_resources),
         )
@@ -2091,6 +2095,25 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         .route(
             "/apis/certificates.k8s.io/v1beta1/watch/clustertrustbundles",
             get(handlers::watch::watch_clustertrustbundles),
+        )
+        // Certificates v1alpha1 API - ClusterTrustBundles, the same storage
+        // as v1beta1 (storage_certificates.go:122-138; same gate)
+        .route(
+            "/apis/certificates.k8s.io/v1alpha1/clustertrustbundles",
+            get(handlers::clustertrustbundle_v1alpha1::list_clustertrustbundles)
+                .post(handlers::clustertrustbundle_v1alpha1::create_clustertrustbundle)
+                .delete(handlers::clustertrustbundle_v1alpha1::deletecollection_clustertrustbundles),
+        )
+        .route(
+            "/apis/certificates.k8s.io/v1alpha1/clustertrustbundles/:name",
+            get(handlers::clustertrustbundle_v1alpha1::get_clustertrustbundle)
+                .put(handlers::clustertrustbundle_v1alpha1::update_clustertrustbundle)
+                .patch(handlers::clustertrustbundle_v1alpha1::patch_clustertrustbundle)
+                .delete(handlers::clustertrustbundle_v1alpha1::delete_clustertrustbundle),
+        )
+        .route(
+            "/apis/certificates.k8s.io/v1alpha1/watch/clustertrustbundles",
+            get(handlers::clustertrustbundle_v1alpha1::watch_clustertrustbundles),
         )
         .route(
             "/apis/certificates.k8s.io/v1beta1/watch/podcertificaterequests",

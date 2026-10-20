@@ -4,6 +4,7 @@ pub mod authorization;
 pub mod cel_validation;
 pub mod certificates;
 pub mod clustertrustbundle;
+pub mod clustertrustbundle_v1alpha1;
 pub mod componentstatus;
 pub mod configmap;
 pub mod controllerrevision;
