@@ -30,7 +30,7 @@ rand = "0.9"
 ipnet = "2"
 mimalloc = { version = "0.1", optional = true }
 async-trait.workspace = true
-rusternetes-common = { path = "../common", features = ["axum-support"] }
+rusternetes-common = { path = "../common", features = ["axum-support", "clap-support"] }
 rusternetes-middleware = { path = "../middleware" }
 rusternetes-discovery = { path = "../discovery" }
 rusternetes-protobuf = { path = "../protobuf" }

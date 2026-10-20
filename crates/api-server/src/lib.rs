@@ -61,6 +61,7 @@ pub mod state;
 #[allow(dead_code)]
 pub mod streaming;
 pub mod watch_cache;
+pub mod zpages;
 
 use axum_server::tls_rustls::RustlsConfig;
 use rusternetes_common::auth::TokenManager;

@@ -2766,6 +2766,10 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         // CRD fallback — must be inside protected_routes so auth middleware applies
         .fallback(custom_resource_fallback);
 
+    // `/statusz` and `/flagz` behind ComponentStatusz / ComponentFlagz; in
+    // protected_routes so they are authenticated and authorized (#3436).
+    protected_routes = crate::zpages::install(protected_routes);
+
     // Conditionally apply authentication middleware
     if skip_auth {
         // In skip-auth mode, inject a default admin user context
