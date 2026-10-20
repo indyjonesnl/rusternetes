@@ -147,12 +147,25 @@ fn validate_omit_stages(stages: &[String], path: &str, errs: &mut Vec<String>) {
 
 impl Policy {
     /// `LoadPolicyFromBytes` (reader.go): decode, check the group-version,
-    /// `ValidatePolicy`, and refuse a policy with no rules. Decoding is the
-    /// lenient path (unknown fields ignored); upstream warns and falls back
-    /// to it on a strict-decode error.
+    /// `ValidatePolicy`, and refuse a policy with no rules. Decoding is
+    /// strict first; a strict-only error (unknown fields) logs "Audit policy
+    /// contains errors, falling back to lenient decoding" and keeps the
+    /// lenient result, as `IsStrictDecodingError` does upstream.
     pub fn from_yaml(yaml: &str) -> Result<Policy, String> {
-        let mut policy: Policy =
-            serde_yaml::from_str(yaml).map_err(|e| format!("failed decoding: {e}"))?;
+        let mut unknown: Vec<String> = Vec::new();
+        let de = serde_yaml::Deserializer::from_str(yaml);
+        let mut policy: Policy = serde_ignored::deserialize(de, |p| unknown.push(p.to_string()))
+            .map_err(|e| format!("failed decoding: {e}"))?;
+        if !unknown.is_empty() {
+            let errs: Vec<String> = unknown
+                .iter()
+                .map(|f| format!("unknown field \"{f}\""))
+                .collect();
+            tracing::warn!(
+                "Audit policy contains errors, falling back to lenient decoding: strict decoding error: {}",
+                errs.join(", ")
+            );
+        }
         if policy.api_version != "audit.k8s.io/v1" || policy.kind != "Policy" {
             return Err(format!(
                 "unknown group version field {}, Kind={} in policy",
@@ -1253,6 +1266,20 @@ rules:
         // The default (no rule) config carries the policy's omitStages.
         let c = p.evaluate(&attrs(Method::GET, "/api/v1/namespaces/ns/services/s"));
         assert_eq!(c.omit_stages, vec!["RequestReceived"]);
+    }
+
+    #[test]
+    fn policy_with_unknown_fields_falls_back_to_lenient() {
+        // reader.go LoadPolicyFromBytes: a strict-decode error only warns.
+        let p = Policy::from_yaml(
+            "apiVersion: audit.k8s.io/v1\nkind: Policy\nbogus: 1\nrules:\n- level: Metadata\n  nope: [a]\n",
+        )
+        .expect("lenient fallback");
+        assert_eq!(p.rules.len(), 1);
+        // A type error is not a strict-decoding error: hard failure.
+        let e =
+            Policy::from_yaml("apiVersion: audit.k8s.io/v1\nkind: Policy\nrules: 5\n").unwrap_err();
+        assert!(e.starts_with("failed decoding"), "{e}");
     }
 
     #[test]
