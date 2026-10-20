@@ -762,3 +762,32 @@ async fn inline_non_migratable_and_inline_csi_volumes_are_never_attached() {
     controller(&s).reconcile_all().await.unwrap();
     assert!(vas(&s).await.is_empty());
 }
+
+// ---- verifyVolumeIsSafeToDetach (operation_generator.go:1489-1514) ----
+
+#[tokio::test]
+async fn verify_safe_to_detach_refuses_while_node_lists_volume_in_use() {
+    let s = Arc::new(MemoryStorage::new());
+    seed_node(&s, "node-1", Some(&unique())).await;
+    let e = controller(&s)
+        .verify_volume_is_safe_to_detach("node-1", &unique())
+        .await
+        .unwrap_err();
+    assert!(e.contains("still in use by node"), "{e}");
+}
+
+#[tokio::test]
+async fn verify_safe_to_detach_passes_when_not_in_use_or_node_missing() {
+    let s = Arc::new(MemoryStorage::new());
+    seed_node(&s, "node-1", Some("kubernetes.io/csi/other^x")).await;
+    let c = controller(&s);
+    assert!(c
+        .verify_volume_is_safe_to_detach("node-1", &unique())
+        .await
+        .is_ok());
+    // Node NotFound: "DetachVolume will skip safe to detach check".
+    assert!(c
+        .verify_volume_is_safe_to_detach("gone", &unique())
+        .await
+        .is_ok());
+}
