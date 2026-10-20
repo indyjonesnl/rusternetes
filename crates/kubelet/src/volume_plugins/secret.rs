@@ -261,18 +261,20 @@ impl Mounter for SecretMounter {
         // no volume behind (`TestInvalidPathSecret`, secret_test.go:365). The
         // wrapped emptyDir's `setupDir` creates the root at 0777. Its fsGroup
         // ownership runs in the AtomicWriter's `setPerms` (:242-247) below.
-        crate::volume_plugins::empty_dir::setup_dir(volume_dir)
-            .context("Failed to create Secret volume directory")?;
-        // The wrapped emptyDir's `SetUpAt` ends with
-        // `volumeutil.SetReady(ed.getMetaDir())` (empty_dir.go:284), which
-        // creates `<pod>/plugins/kubernetes.io~empty-dir/wrapped_<vol>`
-        // (`TestPlugin`, secret_test.go:340-348).
-        let meta_dir = crate::volume_plugins::util::wrapped_empty_dir_meta_dir(
+        // `wrappedVolumeSpec()` is a `Medium: Memory` emptyDir (secret.go:52-56),
+        // so this mounts a tmpfs on the volume dir and ends with
+        // `SetReady(getMetaDir())` (empty_dir.go:284), which creates
+        // `<pod>/plugins/kubernetes.io~empty-dir/wrapped_<vol>`.
+        crate::volume_plugins::util::new_wrapper_mounter(
             &self.host,
             &self.volume_name,
-            &self.pod.metadata.uid,
-        );
-        crate::volume_plugins::util::set_ready(&meta_dir);
+            Some("Memory"),
+            &self.pod,
+        )
+        .await?
+        .set_up_at(volume_dir, args)
+        .await
+        .context("Failed to create Secret volume directory")?;
         // `volumeutil.MakeNestedMountpoints(b.volName, dir, b.pod)`
         // (secret.go:181-183), before the failure-teardown `defer` is armed.
         crate::volume_plugins::util::nested_volumes::make_nested_mountpoints(
@@ -292,9 +294,16 @@ impl Mounter for SecretMounter {
             args.fs_group,
             true,
         ) {
-            // emptyDir `TearDownAt` removes the ready dir first (empty_dir.go:497-500).
-            let _ = std::fs::remove_dir_all(&meta_dir);
-            if let Err(td) = std::fs::remove_dir_all(volume_dir) {
+            // `defer` teardown: `unmounter.TearDown()` -> `UnmountViaEmptyDir`
+            // (ready dir, umount of the tmpfs, volume dir).
+            if let Err(td) = crate::volume_plugins::util::unmount_via_empty_dir(
+                &self.host,
+                volume_dir,
+                &self.volume_name,
+                &self.pod.metadata.uid,
+            )
+            .await
+            {
                 tracing::error!("Error tearing down volume {}: {}", self.volume_name, td);
             }
             return Err(

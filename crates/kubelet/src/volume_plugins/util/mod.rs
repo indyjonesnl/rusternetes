@@ -373,6 +373,48 @@ pub fn wrapped_empty_dir_meta_dir(
         .into_owned()
 }
 
+/// `VolumeHost.NewWrapperMounter` (`pkg/kubelet/volume_host.go:190-199`): the
+/// mounter of the emptyDir named `wrapped_<vol_name>` built from the caller's
+/// `wrappedVolumeSpec()`. `medium` is that spec's `EmptyDir.Medium`:
+/// `Some("Memory")` for secret (`secret.go:52-56`), downwardAPI
+/// (`downwardapi.go:54-58`) and projected (`projected.go:59-67`); `None` for
+/// configMap (`configmap.go:165-172`: "This should be on a tmpfs instead of the
+/// local disk") and git_repo. Its `SetUpAt` creates the volume dir, mounts the
+/// tmpfs for `Memory`, and ends with `volumeutil.SetReady(ed.getMetaDir())`
+/// (`empty_dir.go:284`).
+///
+/// Deviation (see [`unmount_via_empty_dir`]): upstream resolves the plugin by
+/// `FindPluginBySpec`; the wrapped spec always selects emptyDir, so it is
+/// constructed directly.
+pub async fn new_wrapper_mounter(
+    host: &std::sync::Arc<dyn crate::volume_plugins::VolumeHost>,
+    vol_name: &str,
+    medium: Option<&str>,
+    pod: &rusternetes_common::resources::Pod,
+) -> anyhow::Result<Box<dyn crate::volume_plugins::Mounter>> {
+    use crate::volume_plugins::VolumePlugin;
+    let mut empty_dir = serde_json::json!({});
+    if let Some(m) = medium {
+        empty_dir["medium"] = m.into();
+    }
+    let volume: rusternetes_common::resources::Volume = serde_json::from_value(
+        serde_json::json!({"name": format!("wrapped_{vol_name}"), "emptyDir": empty_dir}),
+    )
+    .expect("static emptyDir volume");
+    crate::volume_plugins::empty_dir::EmptyDirPlugin::new(host.clone())
+        .new_mounter(
+            &crate::volume_plugins::Spec {
+                volume: &volume,
+                persistent_volume: None,
+                read_only: false,
+                migrated: false,
+                inline_volume_spec_for_csi_migration: false,
+            },
+            pod,
+        )
+        .await
+}
+
 /// `volumeutil.IsReady` (`pkg/volume/util/util.go:75-90`): true when `dir`
 /// holds a regular file called `ready`.
 pub fn is_ready(dir: &str) -> bool {
@@ -785,5 +827,117 @@ mod mount_refs_tests {
             .unwrap_err()
             .to_string();
         assert_eq!(err, "boom");
+    }
+}
+
+#[cfg(test)]
+mod wrapper_mounter_tests {
+    use super::*;
+    use crate::volume_plugins::empty_dir::fake_mount_deps;
+
+    fn pod() -> rusternetes_common::resources::Pod {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "ns", "uid": "uid-1"},
+            "spec": {"containers": []}
+        }))
+        .unwrap()
+    }
+
+    fn tmp(tag: &str) -> String {
+        let d = std::env::temp_dir().join(format!("wrapper-mounter-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_string_lossy().into_owned()
+    }
+
+    fn host_with(
+        root: &str,
+        deps: crate::volume_plugins::empty_dir::EmptyDirMountDeps,
+    ) -> std::sync::Arc<dyn crate::volume_plugins::VolumeHost> {
+        std::sync::Arc::new(
+            crate::volume_plugins::KubeletVolumeHost::new(
+                root.to_string(),
+                None,
+                rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+                std::collections::HashMap::new(),
+            )
+            .with_empty_dir_mount_deps(deps),
+        )
+    }
+
+    /// `wrappedVolumeSpec()` with `Medium: Memory` (`secret.go:52-56`,
+    /// `downwardapi.go:54-58`, `projected.go:59-67`): `SetUpAt` mounts a
+    /// tmpfs on the dir (`setupTmpfs`, `empty_dir.go:320-340`) and writes the
+    /// ready file (`:284`).
+    #[tokio::test]
+    async fn memory_wrapper_mounts_a_tmpfs_and_sets_ready() {
+        let root = tmp("mem");
+        let (deps, rec) = fake_mount_deps();
+        let host = host_with(&root, deps);
+        let dir = format!("{root}/vol");
+        let m = new_wrapper_mounter(&host, "sec", Some("Memory"), &pod())
+            .await
+            .unwrap();
+        m.set_up_at(&dir, &Default::default()).await.unwrap();
+        let calls = rec.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].0, "tmpfs");
+        assert_eq!(calls[0].1, dir);
+        assert_eq!(calls[0].2, "tmpfs");
+        assert!(std::path::Path::new(&dir).is_dir());
+        assert!(
+            is_ready(&wrapped_empty_dir_meta_dir(&host, "sec", "uid-1")),
+            "wrapped_sec ready dir"
+        );
+    }
+
+    /// configMap's `wrappedVolumeSpec()` has no medium (`configmap.go:165-172`):
+    /// a disk emptyDir, so no mount.
+    #[tokio::test]
+    async fn default_medium_wrapper_does_not_mount() {
+        let root = tmp("def");
+        let (deps, rec) = fake_mount_deps();
+        let host = host_with(&root, deps);
+        let dir = format!("{root}/vol");
+        let m = new_wrapper_mounter(&host, "cfg", None, &pod())
+            .await
+            .unwrap();
+        m.set_up_at(&dir, &Default::default()).await.unwrap();
+        assert!(rec.calls.lock().unwrap().is_empty());
+        assert!(is_ready(&wrapped_empty_dir_meta_dir(&host, "cfg", "uid-1")));
+    }
+
+    /// `setupTmpfs` is idempotent (`empty_dir.go:326-334`): a dir that already
+    /// is a memory mount point is not mounted again.
+    #[tokio::test]
+    async fn memory_wrapper_does_not_remount_an_existing_tmpfs() {
+        use crate::volume_plugins::empty_dir::{EmptyDirMountDeps, Medium, MountDetector};
+        struct AlreadyMounted;
+        impl MountDetector for AlreadyMounted {
+            fn get_mount_medium(
+                &self,
+                _p: &str,
+                _m: &str,
+            ) -> anyhow::Result<(Medium, bool, Option<u64>)> {
+                Ok((Medium::Memory, true, None))
+            }
+        }
+        let root = tmp("idem");
+        let (deps, rec) = fake_mount_deps();
+        let host = host_with(
+            &root,
+            EmptyDirMountDeps {
+                detector: std::sync::Arc::new(AlreadyMounted),
+                ..deps
+            },
+        );
+        let m = new_wrapper_mounter(&host, "sec", Some("Memory"), &pod())
+            .await
+            .unwrap();
+        m.set_up_at(&format!("{root}/vol"), &Default::default())
+            .await
+            .unwrap();
+        assert!(rec.calls.lock().unwrap().is_empty());
     }
 }

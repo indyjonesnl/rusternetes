@@ -82,6 +82,13 @@ pub trait VolumeHost: Send + Sync {
     /// (`cmd/kubelet/app/server.go:487`).
     fn get_mounter(&self) -> &Mounter;
 
+    /// The mounter and mount detector emptyDir (and so the wrapper plugins)
+    /// mount with. `None` is `GetMounter()` + the real detector; a host
+    /// returns `Some` to inject fakes (upstream `FakeVolumeHost`).
+    fn empty_dir_mount_deps(&self) -> Option<crate::volume_plugins::empty_dir::EmptyDirMountDeps> {
+        None
+    }
+
     fn pod_certificate_manager(&self) -> Option<&Arc<dyn crate::podcertificate::Manager>> {
         None
     }
@@ -105,6 +112,7 @@ pub struct KubeletVolumeHost {
     pod_certificate_manager: Option<Arc<dyn crate::podcertificate::Manager>>,
     csi_driver_lister: Option<CsiDriverLister>,
     mounter: Mounter,
+    empty_dir_mount_deps: Option<crate::volume_plugins::empty_dir::EmptyDirMountDeps>,
 }
 
 impl KubeletVolumeHost {
@@ -128,7 +136,24 @@ impl KubeletVolumeHost {
                 true,
                 crate::volume_plugins::util::mount_ops::detect_safe_not_mounted_behavior(),
             ),
+            // Unit tests run unprivileged on temp dirs: record tmpfs mounts
+            // instead of performing them.
+            #[cfg(test)]
+            empty_dir_mount_deps: Some(crate::volume_plugins::empty_dir::fake_mount_deps().0),
+            #[cfg(not(test))]
+            empty_dir_mount_deps: None,
         }
+    }
+
+    /// Inject the emptyDir mounter and mount detector (see
+    /// [`VolumeHost::empty_dir_mount_deps`]).
+    #[cfg(test)]
+    pub(crate) fn with_empty_dir_mount_deps(
+        mut self,
+        deps: crate::volume_plugins::empty_dir::EmptyDirMountDeps,
+    ) -> Self {
+        self.empty_dir_mount_deps = Some(deps);
+        self
     }
 
     /// Attach the `CSIDriver` lister (`kubeletVolumeHost.csiDriverLister`,
@@ -221,6 +246,10 @@ impl VolumeHost for KubeletVolumeHost {
 
     fn get_mounter(&self) -> &Mounter {
         &self.mounter
+    }
+
+    fn empty_dir_mount_deps(&self) -> Option<crate::volume_plugins::empty_dir::EmptyDirMountDeps> {
+        self.empty_dir_mount_deps.clone()
     }
 
     fn pod_certificate_manager(&self) -> Option<&Arc<dyn crate::podcertificate::Manager>> {
