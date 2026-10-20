@@ -4582,9 +4582,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "chrono",
  "clap",
+ "crc",
  "futures",
  "mimalloc",
+ "miniz_oxide",
+ "prometheus",
+ "protobuf",
  "rusternetes-client",
  "rusternetes-common",
  "rusternetes-controller-manager",
@@ -4596,6 +4601,7 @@ dependencies = [
  "tower 0.4.13",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

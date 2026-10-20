@@ -164,7 +164,8 @@ use std::process::Command;
 use tracing::{debug, info, warn};
 
 /// What the node-network agent needs to know about itself.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NodeNetConfig {
     /// This node's name, matched against `metadata.name` when picking our Node.
     pub node_name: String,

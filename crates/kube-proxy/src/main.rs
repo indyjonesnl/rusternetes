@@ -101,6 +101,14 @@ struct Args {
     /// gets port 10249).
     #[arg(long, default_value = "")]
     metrics_bind_address: String,
+
+    /// Health listener address (options.go:118; defaults.go:47-50).
+    #[arg(long, default_value = "0.0.0.0:10256")]
+    healthz_bind_address: String,
+
+    /// Exit after a diagnostic listener bind failure (options.go:120).
+    #[arg(long)]
+    bind_address_hard_fail: bool,
 }
 
 /// Apply `--feature-gates` process-wide. Port of `featureGate.Set`
@@ -144,6 +152,18 @@ async fn main() -> Result<()> {
         ),
     };
 
+    let diagnostics = rusternetes_kube_proxy::serve_metrics::DiagnosticsOptions {
+        healthz_bind_address: if args.healthz_bind_address.is_empty() {
+            String::new()
+        } else {
+            rusternetes_kube_proxy::serve_metrics::append_port_if_needed(
+                &args.healthz_bind_address,
+                10256,
+            )
+        },
+        bind_address_hard_fail: args.bind_address_hard_fail,
+    };
+
     // In-cluster path: read cluster state from the api-server (no storage handle).
     if let Some(kubeconfig) = args.kubeconfig.as_deref() {
         use rusternetes_client::http::ApiClient;
@@ -173,7 +193,8 @@ async fn main() -> Result<()> {
             client_key.map(|p| p.into_bytes()),
             None,
         )?);
-        return rusternetes_kube_proxy::run_with_api(client, config).await;
+        return rusternetes_kube_proxy::run_with_api_and_diagnostics(client, config, diagnostics)
+            .await;
     }
 
     let storage_config = match args.storage_backend.as_str() {
@@ -196,7 +217,7 @@ async fn main() -> Result<()> {
     };
     let storage = Arc::new(StorageBackend::new(storage_config).await?);
 
-    rusternetes_kube_proxy::run(storage, config).await
+    rusternetes_kube_proxy::run_with_diagnostics(storage, config, diagnostics).await
 }
 
 #[cfg(test)]

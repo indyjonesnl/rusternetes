@@ -12,6 +12,8 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 /// Configuration for the kube-proxy component.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct KubeProxyConfig {
     pub node_name: String,
     pub sync_interval: u64,
@@ -49,14 +51,37 @@ impl Default for KubeProxyConfig {
 
 /// Run kube-proxy against a storage backend directly (all-in-one binary).
 pub async fn run(storage: Arc<StorageBackend>, config: KubeProxyConfig) -> anyhow::Result<()> {
-    run_proxy(storage, config).await
+    run_with_diagnostics(
+        storage,
+        config,
+        serve_metrics::DiagnosticsOptions::default(),
+    )
+    .await
 }
 
 /// Run kube-proxy as an api-server client: Services/Endpoints/EndpointSlices are
 /// read through [`ApiStorage`] over REST, with no direct storage handle. Used by
 /// the in-cluster compose service (host network → published api-server port).
 pub async fn run_with_api(client: Arc<ApiClient>, config: KubeProxyConfig) -> anyhow::Result<()> {
-    run_proxy(Arc::new(ApiStorage::new(client)), config).await
+    run_with_api_and_diagnostics(client, config, serve_metrics::DiagnosticsOptions::default()).await
+}
+
+/// Run with explicit diagnostic listener options.
+pub async fn run_with_diagnostics(
+    storage: Arc<StorageBackend>,
+    config: KubeProxyConfig,
+    diagnostics: serve_metrics::DiagnosticsOptions,
+) -> anyhow::Result<()> {
+    run_proxy(storage, config, diagnostics).await
+}
+
+/// Run as an API client with explicit diagnostic listener options.
+pub async fn run_with_api_and_diagnostics(
+    client: Arc<ApiClient>,
+    config: KubeProxyConfig,
+    diagnostics: serve_metrics::DiagnosticsOptions,
+) -> anyhow::Result<()> {
+    run_proxy(Arc::new(ApiStorage::new(client)), config, diagnostics).await
 }
 
 /// The kube-proxy sync loop, generic over the storage seam so the same iptables
@@ -64,6 +89,7 @@ pub async fn run_with_api(client: Arc<ApiClient>, config: KubeProxyConfig) -> an
 async fn run_proxy<S: Storage + Send + Sync + 'static>(
     storage: Arc<S>,
     config: KubeProxyConfig,
+    diagnostics: serve_metrics::DiagnosticsOptions,
 ) -> anyhow::Result<()> {
     info!(
         "Starting Rusternetes Kube-proxy for node: {}",
@@ -94,9 +120,49 @@ async fn run_proxy<S: Storage + Send + Sync + 'static>(
         config.node_name.clone(),
     )?));
 
-    // `serveMetrics` (cmd/kube-proxy/app/server.go:561); proxy mode is iptables.
-    serve_metrics::serve_metrics(config.metrics_bind_address.clone(), "iptables");
+    // newProxyServer's configz registration is fatal on duplicate names and
+    // stores the effective component config (server.go:189-193). Serialize the
+    // native Rust config, including the separate diagnostic listener options.
+    let configs = serve_metrics::config_registry();
+    configs
+        .register(serve_metrics::CONFIG_GROUP)
+        .map_err(|error| anyhow::anyhow!("unable to register configz: {error}"))?;
+    let mut effective_config = serde_json::to_value(&config)?;
+    effective_config["healthzBindAddress"] = diagnostics.healthz_bind_address.clone().into();
+    effective_config["bindAddressHardFail"] = diagnostics.bind_address_hard_fail.into();
+    configs.set(serve_metrics::CONFIG_GROUP, effective_config)?;
 
+    // server.go:244-245,558-561; the existing proxier programs IPv4 iptables.
+    let health = serve_metrics::ProxyHealthServer::new(std::time::Duration::from_secs(
+        config.sync_interval.saturating_mul(2),
+    ));
+    health.watch_node(Arc::clone(&storage), config.node_name.clone());
+    // SyncLoop reports its initial update before it begins (proxier.go:533-535).
+    health.updated("IPv4");
+    let (errors, mut diagnostic_errors) = tokio::sync::mpsc::unbounded_channel();
+    let errors = diagnostics.bind_address_hard_fail.then_some(errors);
+    health.serve_with_errors(diagnostics.healthz_bind_address, errors.clone());
+    serve_metrics::serve_metrics_with_errors(
+        config.metrics_bind_address.clone(),
+        "iptables",
+        errors,
+    );
+
+    // ProxyServer.Run (server.go:626-631) waits for listener errors
+    // independently of informer/sync work. Failed watch establishment must
+    // not postpone BindAddressHardFail.
+    tokio::select! {
+        result = run_loop(storage, config, kube_proxy, health) => result,
+        Some(error) = diagnostic_errors.recv() => Err(error),
+    }
+}
+
+async fn run_loop<S: Storage + Send + Sync + 'static>(
+    storage: Arc<S>,
+    config: KubeProxyConfig,
+    kube_proxy: Arc<tokio::sync::Mutex<KubeProxy<S>>>,
+    health: serve_metrics::ProxyHealthServer,
+) -> anyhow::Result<()> {
     info!("Kube-proxy initialized successfully");
     info!("Syncing services every {} seconds", config.sync_interval);
 
@@ -140,12 +206,17 @@ async fn run_proxy<S: Storage + Send + Sync + 'static>(
 
     let worker_queue = queue.clone();
     let worker_proxy = Arc::clone(&kube_proxy);
+    let worker_health = health.clone();
     tokio::spawn(async move {
         info!("Kube-proxy worker started");
         while let Some(key) = worker_queue.get().await {
             info!("Kube-proxy worker processing key: {}", key);
             match worker_proxy.lock().await.sync().await {
-                Ok(()) => worker_queue.forget(&key).await,
+                Ok(()) => {
+                    // Updated only after successful dataplane sync (proxier.go:1521-1522).
+                    worker_health.updated("IPv4");
+                    worker_queue.forget(&key).await;
+                }
                 Err(e) => {
                     tracing::error!("sync error: {}", e);
                     worker_queue.requeue_rate_limited(key.clone()).await;
@@ -219,6 +290,8 @@ async fn run_proxy<S: Storage + Send + Sync + 'static>(
                 event = svc_watch.next() => {
                     match event {
                         Some(Ok(_)) => {
+                            // Proxier.Sync (iptables/proxier.go:523-528).
+                            health.queued_update("IPv4");
                             queue.add(RECONCILE_ALL_SENTINEL.into()).await;
                         }
                         Some(Err(e)) => {
@@ -234,6 +307,8 @@ async fn run_proxy<S: Storage + Send + Sync + 'static>(
                 event = ep_watch.next() => {
                     match event {
                         Some(Ok(_)) => {
+                            // Proxier.Sync (iptables/proxier.go:523-528).
+                            health.queued_update("IPv4");
                             queue.add(RECONCILE_ALL_SENTINEL.into()).await;
                         }
                         Some(Err(e)) => {
@@ -249,6 +324,8 @@ async fn run_proxy<S: Storage + Send + Sync + 'static>(
                 event = es_watch.next() => {
                     match event {
                         Some(Ok(_)) => {
+                            // Proxier.Sync (iptables/proxier.go:523-528).
+                            health.queued_update("IPv4");
                             queue.add(RECONCILE_ALL_SENTINEL.into()).await;
                         }
                         Some(Err(e)) => {
@@ -264,6 +341,8 @@ async fn run_proxy<S: Storage + Send + Sync + 'static>(
                 event = pod_watch.next() => {
                     match event {
                         Some(Ok(_)) => {
+                            // Proxier.Sync (iptables/proxier.go:523-528).
+                            health.queued_update("IPv4");
                             queue.add(RECONCILE_ALL_SENTINEL.into()).await;
                         }
                         Some(Err(e)) => {
