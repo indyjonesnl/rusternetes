@@ -12,7 +12,7 @@ use anyhow::Result;
 use clap::Parser;
 use rusternetes_storage::{StorageBackend, StorageConfig};
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 // Heap-profiling allocator (off by default; `--features dhat-heap`). Attributes
 // the all-in-one's idle RAM by backtrace for #1138. Dumps `dhat-heap.json` when
@@ -87,6 +87,13 @@ struct Args {
     /// socket path>`. Repeatable. Same flag as the standalone controller-manager.
     #[arg(long = "csi-attacher", value_name = "DRIVER=SOCKET")]
     csi_attachers: Vec<String>,
+
+    /// Port serving the embedded controller-manager's Prometheus `/metrics`
+    /// (plain HTTP). 0 disables it. Default is upstream
+    /// kube-controller-manager's port (`ports.KubeControllerManagerPort`,
+    /// pkg/cluster/ports/ports.go), matching the standalone controller-manager.
+    #[arg(long, default_value_t = 10257)]
+    controller_manager_metrics_port: u16,
 
     /// Run the CSI half of the AttachDetachController (#3048). Off by default;
     /// enable together with `--csi-attacher`.
@@ -322,6 +329,40 @@ fn apply_feature_gates(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// `GET /metrics` serving `gather()` — the controller-manager `legacyregistry`
+/// endpoint. Mirrors the standalone binary's `spawn_metrics_server`
+/// (crates/controller-manager/src/main.rs); upstream mounts it on the secure
+/// port mux (cmd/kube-controller-manager/app/controllermanager.go).
+fn controller_manager_metrics_router(gather: fn() -> String) -> axum::Router {
+    axum::Router::new().route(
+        "/metrics",
+        axum::routing::get(move || async move { gather() }),
+    )
+}
+
+/// Serve the embedded controller-manager's metrics. A bind failure is logged,
+/// not fatal: metrics must not take the cluster down.
+fn spawn_controller_manager_metrics(port: u16) {
+    if port == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        let app = controller_manager_metrics_router(
+            rusternetes_controller_manager::controllers::gather_metrics,
+        );
+        let addr = format!("0.0.0.0:{port}");
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(listener) => {
+                info!("Serving controller-manager /metrics on {addr}");
+                if let Err(e) = axum::serve(listener, app).await {
+                    error!("controller-manager metrics server error: {e}");
+                }
+            }
+            Err(e) => warn!("controller-manager metrics: cannot bind {addr}: {e}"),
+        }
+    });
+}
+
 /// Build the embedded scheduler config, loading `--scheduler-config` when set.
 fn scheduler_config_from_args(args: &Args) -> Result<rusternetes_scheduler::SchedulerConfig> {
     let profiles = match &args.scheduler_config {
@@ -536,6 +577,7 @@ async fn async_main() -> Result<()> {
         None,
     )?);
     info!("Controller manager reading cluster state from embedded api-server at {loopback_url}");
+    spawn_controller_manager_metrics(args.controller_manager_metrics_port);
     tokio::spawn(async move {
         if let Err(e) = rusternetes_controller_manager::run_with_api(cm_client, cm_config).await {
             error!("Controller manager error: {}", e);
@@ -792,5 +834,52 @@ mod feature_gates_flag_tests {
         let none = scheduler_config_from_args(&parse("--scheduler-interval=3")).unwrap();
         assert_eq!(none.interval, 3);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod controller_manager_metrics_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// #2481 item 2: the embedded controller-manager serves `GET /metrics` on
+    /// `--controller-manager-metrics-port` (upstream kube-controller-manager
+    /// default `ports.KubeControllerManagerPort` = 10257), 0 disables it.
+    #[test]
+    fn metrics_port_flag_defaults_to_10257() {
+        let a = Args::try_parse_from(["rusternetes"]).unwrap();
+        assert_eq!(a.controller_manager_metrics_port, 10257);
+        let a = Args::try_parse_from(["rusternetes", "--controller-manager-metrics-port", "0"])
+            .unwrap();
+        assert_eq!(a.controller_manager_metrics_port, 0);
+    }
+
+    #[tokio::test]
+    async fn serves_controller_manager_registry_on_metrics() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                controller_manager_metrics_router(|| "cm_marker 1\n".to_string()),
+            )
+            .await
+            .unwrap();
+        });
+        let get = |path: &'static str| async move {
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            s.write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+            let mut out = String::new();
+            s.read_to_string(&mut out).await.unwrap();
+            out
+        };
+        let ok = get("/metrics").await;
+        assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+        assert!(ok.contains("cm_marker 1"), "{ok}");
+        assert!(get("/nope").await.starts_with("HTTP/1.1 404"));
     }
 }
