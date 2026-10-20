@@ -11,9 +11,13 @@
 //!   ([`AggregatorHandlerManager`]);
 //! - `handler_discovery.go` -- `discoveryManager` (`AddAPIService`,
 //!   `RemoveAPIService`, `syncAPIService`, `Run`, `removeUnusedServices`,
-//!   `fetchFreshDiscoveryForService`'s freshness rule). Tests are ported from
+//!   `fetchFreshDiscoveryForService`). The HTTP half (etag/304, v2/v2beta1,
+//!   legacy `/apis/{g}/{v}` fallback, 5s timeout) is in
+//!   [`crate::aggregated_discovery`]. Tests are ported from
 //!   `handler_discovery_test.go` (`TestInitialRunHasAllAPIServices`,
-//!   `TestWaitForSync`, `TestRemoveAPIService`).
+//!   `TestWaitForSync`, `TestRemoveAPIService`, `TestBasic`, `TestServiceGC`,
+//!   `TestV2Beta1Skew`, `TestDirty`, `TestLegacyFallback*`,
+//!   `TestAPIServiceStale`, `TestNotModified`).
 //!
 //! Deviations (each tracked as a follow-up issue):
 //! - The APIService informer is a storage watch ([`spawn_apiservice_event_handlers`])
@@ -24,23 +28,26 @@
 //!   storage per request. [`AggregatorHandlerManager`] keeps upstream's
 //!   `proxyHandlers` / `handledGroupVersions` bookkeeping and forwards to the
 //!   discovery manager, which is what the hooks' ordering depends on.
-//! - Fetching the aggregated server's `/apis` discovery document
-//!   (`fetchFreshDiscoveryForService`'s HTTP/etag/legacy-fallback half) is a
-//!   [`DiscoveryFetcher`]; the default one reports the backend unreachable, so
-//!   entries are marked `Stale` exactly as upstream does for an unreachable
-//!   backend. The merged document ([`MergedDiscovery`]) is not yet read by the
-//!   `/apis` handler.
+//! - The `http.Handler` of an APIService is an [`AggregatorHandler`]
+//!   (production: [`crate::aggregated_discovery::ProxyDiscoveryHandler`]).
+//! - The merged document ([`MergedDiscovery`], process-global via
+//!   [`merged_discovery`]) is read by the `/apis` handler in `router.rs` to fill
+//!   in aggregated groups' resources and freshness.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
 use futures::StreamExt;
 use rusternetes_common::resources::APIService;
 use rusternetes_storage::{build_prefix, Storage, WatchEvent};
 use tokio::sync::watch;
 
+use crate::aggregated_discovery::{
+    is_aggregated_discovery_content_type, legacy_path, parse_discovery_list,
+    parse_legacy_resource_list, serve_with_timeout, AggregatorHandler, HandlerRequest,
+    ProxyDiscoveryHandler, ACCEPT_V2, ACCEPT_V2_BETA1, AGGREGATOR_GROUP, AGGREGATOR_USER,
+};
 use crate::autoregister::{APIServiceClient, StorageAPIServiceClient};
 use crate::crdregistration::WorkQueue;
 use crate::post_start_hooks::{spawn_hook_with, PostStartHooks};
@@ -355,31 +362,12 @@ fn new_service_key(s: &rusternetes_common::resources::APIServiceReference) -> Se
     }
 }
 
-/// The half of `fetchFreshDiscoveryForService` that talks to the aggregated
-/// server: its discovery document, as group -> version -> entry.
-#[async_trait]
-pub trait DiscoveryFetcher: Send + Sync {
-    async fn fetch(
-        &self,
-        service: &ServiceKey,
-    ) -> Result<BTreeMap<(String, String), VersionDiscovery>, String>;
-}
-
-/// Reports every backend unreachable, so entries are `Stale` (the upstream
-/// outcome for an unreachable backend). See the module deviation note.
-pub struct UnreachableFetcher;
-
-#[async_trait]
-impl DiscoveryFetcher for UnreachableFetcher {
-    async fn fetch(
-        &self,
-        service: &ServiceKey,
-    ) -> Result<BTreeMap<(String, String), VersionDiscovery>, String> {
-        Err(format!(
-            "aggregated discovery fetch from {}/{}:{} is not implemented",
-            service.namespace, service.name, service.port
-        ))
-    }
+/// The process-wide merged aggregated-discovery document the discovery manager
+/// writes and the `/apis` handler reads (upstream: the aggregator's
+/// `discoveryendpoint.ResourceManager`).
+pub fn merged_discovery() -> &'static Arc<MergedDiscovery> {
+    static MERGED: std::sync::OnceLock<Arc<MergedDiscovery>> = std::sync::OnceLock::new();
+    MERGED.get_or_init(|| Arc::new(MergedDiscovery::default()))
 }
 
 #[derive(Clone)]
@@ -395,6 +383,8 @@ struct GroupVersionInfo {
 #[derive(Clone)]
 struct CachedResult {
     discovery: BTreeMap<(String, String), VersionDiscovery>,
+    /// ETag of the cached discovery document.
+    etag: Option<String>,
     /// "Guaranteed to be a time less than the time the server responded".
     last_updated: Instant,
 }
@@ -402,7 +392,7 @@ struct CachedResult {
 /// `discoveryManager` (handler_discovery.go:67-110).
 pub struct DiscoveryManager {
     merged: Arc<MergedDiscovery>,
-    fetcher: Arc<dyn DiscoveryFetcher>,
+    handler: Arc<dyn AggregatorHandler>,
     api_services: Mutex<HashMap<String, GroupVersionInfo>>,
     cached_results: Mutex<HashMap<ServiceKey, CachedResult>>,
     dirty_api_service_queue: WorkQueue<String>,
@@ -411,10 +401,10 @@ pub struct DiscoveryManager {
 
 impl DiscoveryManager {
     /// `NewDiscoveryManager`.
-    pub fn new(merged: Arc<MergedDiscovery>, fetcher: Arc<dyn DiscoveryFetcher>) -> Arc<Self> {
+    pub fn new(merged: Arc<MergedDiscovery>, handler: Arc<dyn AggregatorHandler>) -> Arc<Self> {
         Arc::new(Self {
             merged,
-            fetcher,
+            handler,
             api_services: Mutex::new(HashMap::new()),
             cached_results: Mutex::new(HashMap::new()),
             dirty_api_service_queue: WorkQueue::default(),
@@ -474,39 +464,126 @@ impl DiscoveryManager {
             .retain(|k, _| used.contains(k));
     }
 
-    /// `fetchFreshDiscoveryForService`'s cache rule: "Returns the cached result
-    /// if it is retrieved after the apiservice was last marked dirty. If there
-    /// was an error in fetching, returns the stale cached result if it exists,
-    /// and a non-nil error."
+    /// `fetchFreshDiscoveryForService` (handler_discovery.go:216-379).
+    ///
+    /// "Returns the cached result if it is retrieved after the apiservice was
+    /// last marked dirty." On a fetch error upstream returns a nil result and
+    /// the error (its doc comment promises the stale cache entry, its code does
+    /// not; the code is what is ported), so the caller marks the GV `Stale`
+    /// with no resources.
     async fn fetch_fresh_discovery_for_service(
         &self,
+        group: &str,
+        version: &str,
         info: &GroupVersionInfo,
     ) -> (Option<CachedResult>, Option<String>) {
+        // "Lookup last cached result for this apiservice's service."
         let cached = self
             .cached_results
             .lock()
             .unwrap()
             .get(&info.service)
             .cloned();
+        // "If entry exists and was updated after the given time, just stop now"
         if let Some(c) = &cached {
             if c.last_updated > info.last_marked_dirty {
                 return (cached, None);
             }
         }
-        let started = Instant::now();
-        match self.fetcher.fetch(&info.service).await {
-            Ok(discovery) => {
-                let result = CachedResult {
-                    discovery,
-                    last_updated: started,
+        let etag = cached.as_ref().and_then(|c| c.etag.clone());
+
+        let req = HandlerRequest {
+            path: "/apis".to_string(),
+            accept: format!("{ACCEPT_V2},{ACCEPT_V2_BETA1}"),
+            if_none_match: etag.clone(),
+            user: AGGREGATOR_USER.to_string(),
+            groups: vec![AGGREGATOR_GROUP.to_string()],
+        };
+        // "Important that the time recorded in the data's "lastUpdated" is
+        // conservatively from BEFORE the request is dispatched so that
+        // lastUpdated can be used to de-duplicate requests."
+        let now = Instant::now();
+        let resp = serve_with_timeout(self.handler.as_ref(), group, version, req).await;
+        let is_aggregated = resp
+            .content_type
+            .as_deref()
+            .is_some_and(is_aggregated_discovery_content_type);
+
+        match resp.status {
+            304 => {
+                // "Keep old entry, update timestamp"
+                let c = CachedResult {
+                    discovery: cached.map(|c| c.discovery).unwrap_or_default(),
+                    etag,
+                    last_updated: now,
                 };
                 self.cached_results
                     .lock()
                     .unwrap()
-                    .insert(info.service.clone(), result.clone());
-                (Some(result), None)
+                    .insert(info.service.clone(), c.clone());
+                (Some(c), None)
             }
-            Err(e) => (cached, Some(e)),
+            503 => (
+                None,
+                Some(format!(
+                    "service {}/{}:{} returned non-success response code: 503",
+                    info.service.namespace, info.service.name, info.service.port
+                )),
+            ),
+            200 if is_aggregated => match parse_discovery_list(&resp.body) {
+                Err(e) => (None, Some(e)),
+                Ok(discovery) => {
+                    let c = CachedResult {
+                        discovery,
+                        etag: resp.etag,
+                        last_updated: now,
+                    };
+                    self.cached_results
+                        .lock()
+                        .unwrap()
+                        .insert(info.service.clone(), c.clone());
+                    (Some(c), None)
+                }
+            },
+            _ => {
+                // "Could not get acceptable response for Aggregated Discovery.
+                // Fall back to legacy discovery information"
+                if version.is_empty() {
+                    return (None, Some("not found".to_string()));
+                }
+                let path = legacy_path(group, version);
+                let req = HandlerRequest {
+                    path: path.clone(),
+                    accept: "application/json".to_string(),
+                    if_none_match: etag,
+                    user: AGGREGATOR_USER.to_string(),
+                    groups: Vec::new(),
+                };
+                let resp = serve_with_timeout(self.handler.as_ref(), group, version, req).await;
+                if resp.status != 200 {
+                    return (
+                        None,
+                        Some(format!(
+                            "failed to download legacy discovery for {path}: {}",
+                            String::from_utf8_lossy(&resp.body)
+                        )),
+                    );
+                }
+                match parse_legacy_resource_list(group, version, &resp.body) {
+                    Err(e) => (None, Some(e)),
+                    // "Do not save the resolve as the legacy fallback only
+                    // fetches one group version and an API Service may serve
+                    // multiple group versions."
+                    Ok(discovery) => (
+                        Some(CachedResult {
+                            discovery,
+                            etag: None,
+                            last_updated: now,
+                        }),
+                        None,
+                    ),
+                }
+            }
         }
     }
 
@@ -525,7 +602,9 @@ impl DiscoveryManager {
             return Ok(());
         };
 
-        let (cached, err) = self.fetch_fresh_discovery_for_service(&info).await;
+        let (cached, err) = self
+            .fetch_fresh_discovery_for_service(&group, &version, &info)
+            .await;
         // "Just use empty GV to mark that GV exists, but no resources" when
         // nothing was fetched, or the server did not include this GV.
         let mut entry = cached
@@ -807,8 +886,10 @@ pub fn register_apiservice_hooks_with(
 /// discovery manager is created first and handed to the handler manager, as
 /// upstream does before `NewAPIServiceRegistrationController` runs.
 pub fn spawn_apiservice_registration_hooks<S: Storage + 'static>(storage: Arc<S>) {
-    let merged = Arc::new(MergedDiscovery::default());
-    let discovery = DiscoveryManager::new(merged, Arc::new(UnreachableFetcher));
+    let discovery = DiscoveryManager::new(
+        merged_discovery().clone(),
+        Arc::new(ProxyDiscoveryHandler::new(storage.clone())),
+    );
     let manager = Arc::new(AggregatorHandlerManager::new(Some(discovery.clone())));
     let controller = Arc::new(APIServiceRegistrationController::new(
         Arc::new(StorageAPIServiceClient(storage.clone())),
@@ -833,7 +914,9 @@ pub fn spawn_apiservice_registration_hooks<S: Storage + 'static>(storage: Arc<S>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aggregated_discovery::HandlerResponse;
     use crate::autoregister::ClientError;
+    use async_trait::async_trait;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn svc(name: &str, with_service: bool) -> APIService {
@@ -902,7 +985,7 @@ mod tests {
         Arc<MergedDiscovery>,
     ) {
         let merged = Arc::new(MergedDiscovery::default());
-        let dm = DiscoveryManager::new(merged.clone(), Arc::new(UnreachableFetcher));
+        let dm = DiscoveryManager::new(merged.clone(), FnHandler::status(503));
         let mgr = Arc::new(AggregatorHandlerManager::new(Some(dm.clone())));
         let c = Arc::new(APIServiceRegistrationController::new(lister, mgr.clone()));
         (c, mgr, dm, merged)
@@ -985,7 +1068,7 @@ mod tests {
     #[tokio::test]
     async fn discovery_initial_run_has_all_apiservices_stale() {
         let merged = Arc::new(MergedDiscovery::default());
-        let dm = DiscoveryManager::new(merged.clone(), Arc::new(UnreachableFetcher));
+        let dm = DiscoveryManager::new(merged.clone(), FnHandler::status(503));
         dm.add_api_service(&svc("v1.stable.example.com", true));
         let (_stop_tx, stop_rx) = watch::channel(false);
         let (tx, mut rx) = watch::channel(false);
@@ -1002,23 +1085,93 @@ mod tests {
         );
     }
 
-    struct OkFetcher;
-    #[async_trait]
-    impl DiscoveryFetcher for OkFetcher {
-        async fn fetch(
-            &self,
-            _: &ServiceKey,
-        ) -> Result<BTreeMap<(String, String), VersionDiscovery>, String> {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            Ok(BTreeMap::from([(
-                ("stable.example.com".to_string(), "v1".to_string()),
-                VersionDiscovery {
-                    version: "v1".into(),
-                    resources: vec![serde_json::json!({"resource": "foos"})],
-                    freshness: DiscoveryFreshness::Current,
-                },
-            )]))
+    fn v2_doc(groups: &[(&str, &[&str])]) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "APIGroupDiscoveryList",
+            "apiVersion": "apidiscovery.k8s.io/v2",
+            "items": groups.iter().map(|(g, vs)| serde_json::json!({
+                "metadata": {"name": g},
+                "versions": vs.iter().map(|v| serde_json::json!({
+                    "version": v,
+                    "freshness": "Current",
+                    "resources": [{
+                        "resource": "foos",
+                        "responseKind": {"group": g, "version": v, "kind": "Foo"},
+                        "scope": "Cluster",
+                        "verbs": ["get"],
+                    }],
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    fn ok(content_type: &str, body: &serde_json::Value, etag: Option<&str>) -> HandlerResponse {
+        HandlerResponse {
+            status: 200,
+            content_type: Some(content_type.to_string()),
+            etag: etag.map(str::to_string),
+            body: body.to_string().into_bytes(),
         }
+    }
+
+    /// A closure-backed [`AggregatorHandler`] that records every request.
+    struct FnHandler {
+        f: Box<dyn Fn(&HandlerRequest) -> HandlerResponse + Send + Sync>,
+        delay: Duration,
+        seen: Mutex<Vec<HandlerRequest>>,
+    }
+    impl FnHandler {
+        fn new(
+            f: impl Fn(&HandlerRequest) -> HandlerResponse + Send + Sync + 'static,
+        ) -> Arc<Self> {
+            Self::slow(Duration::ZERO, f)
+        }
+        fn slow(
+            delay: Duration,
+            f: impl Fn(&HandlerRequest) -> HandlerResponse + Send + Sync + 'static,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                f: Box::new(f),
+                delay,
+                seen: Mutex::new(Vec::new()),
+            })
+        }
+        fn status(code: u16) -> Arc<Self> {
+            Self::new(move |_| HandlerResponse {
+                status: code,
+                ..Default::default()
+            })
+        }
+        fn paths(&self) -> Vec<String> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| r.path.clone())
+                .collect()
+        }
+    }
+    #[async_trait]
+    impl AggregatorHandler for FnHandler {
+        async fn serve(&self, _: &str, _: &str, req: HandlerRequest) -> HandlerResponse {
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            let r = (self.f)(&req);
+            self.seen.lock().unwrap().push(req);
+            r
+        }
+    }
+
+    const V2_CT: &str = "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList";
+    const V2BETA1_CT: &str =
+        "application/json;g=apidiscovery.k8s.io;v=v2beta1;as=APIGroupDiscoveryList";
+
+    async fn run_to_idle(dm: &Arc<DiscoveryManager>) -> watch::Sender<bool> {
+        let (stop_tx, stop_rx) = watch::channel(false);
+        tokio::spawn(dm.clone().run(stop_rx, None));
+        dm.wait_for_queue_complete().await;
+        stop_tx
     }
 
     /// `TestWaitForSync`: `Run` blocks on the slow backend before signalling,
@@ -1026,7 +1179,12 @@ mod tests {
     #[tokio::test]
     async fn discovery_run_waits_for_slow_backend() {
         let merged = Arc::new(MergedDiscovery::default());
-        let dm = DiscoveryManager::new(merged.clone(), Arc::new(OkFetcher));
+        let dm = DiscoveryManager::new(
+            merged.clone(),
+            FnHandler::slow(Duration::from_millis(300), |_| {
+                ok(V2_CT, &v2_doc(&[("stable.example.com", &["v1"])]), None)
+            }),
+        );
         dm.add_api_service(&svc("v1.stable.example.com", true));
         let (_stop_tx, stop_rx) = watch::channel(false);
         let (tx, rx) = watch::channel(false);
@@ -1044,7 +1202,7 @@ mod tests {
     #[tokio::test]
     async fn discovery_remove_api_service_drops_group() {
         let merged = Arc::new(MergedDiscovery::default());
-        let dm = DiscoveryManager::new(merged.clone(), Arc::new(UnreachableFetcher));
+        let dm = DiscoveryManager::new(merged.clone(), FnHandler::status(503));
         let a = svc("v1.stable.example.com", true);
         let b = svc("v2.stable.example.com", true);
         dm.add_api_service(&a);
@@ -1062,10 +1220,8 @@ mod tests {
     /// A local APIService (no `spec.service`) is not tracked by the manager.
     #[test]
     fn local_apiservice_is_not_tracked_by_discovery() {
-        let dm = DiscoveryManager::new(
-            Arc::new(MergedDiscovery::default()),
-            Arc::new(UnreachableFetcher),
-        );
+        let dm =
+            DiscoveryManager::new(Arc::new(MergedDiscovery::default()), FnHandler::status(503));
         dm.add_api_service(&svc("v1.apps", false));
         assert!(dm.api_services.lock().unwrap().is_empty());
     }
@@ -1108,5 +1264,264 @@ mod tests {
         // The discovery hook returns only once every APIService is in the
         // merged document.
         assert!(merged.groups().contains_key("a.example.com"));
+    }
+
+    /// `TestBasic`: one backend serving several groups feeds every APIService
+    /// that points at it; each GV gets only its own entry, `Current`.
+    #[tokio::test]
+    async fn discovery_basic_merges_groups_from_backend() {
+        let merged = Arc::new(MergedDiscovery::default());
+        let h = FnHandler::new(|r| {
+            assert_eq!(r.path, "/apis");
+            assert_eq!(r.user, AGGREGATOR_USER);
+            assert_eq!(r.groups, vec![AGGREGATOR_GROUP.to_string()]);
+            assert_eq!(r.accept, format!("{ACCEPT_V2},{ACCEPT_V2_BETA1}"));
+            ok(
+                V2_CT,
+                &v2_doc(&[("a.example.com", &["v1", "v2"]), ("b.example.com", &["v1"])]),
+                Some("\"e1\""),
+            )
+        });
+        let dm = DiscoveryManager::new(merged.clone(), h.clone());
+        for n in ["v1.a.example.com", "v2.a.example.com", "v1.b.example.com"] {
+            dm.add_api_service(&svc(n, true));
+        }
+        let _stop = run_to_idle(&dm).await;
+        let groups = merged.groups();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups["a.example.com"].len(), 2);
+        for vs in groups.values() {
+            for v in vs.values() {
+                assert_eq!(v.freshness, DiscoveryFreshness::Current);
+                assert_eq!(v.resources.len(), 1);
+            }
+        }
+    }
+
+    /// `TestServiceGC`: re-pointing an APIService at another service purges the
+    /// cache entry of the old one.
+    #[tokio::test]
+    async fn discovery_service_gc_purges_unused_cache_entries() {
+        let h = FnHandler::new(|_| ok(V2_CT, &v2_doc(&[("stable.example.com", &["v1"])]), None));
+        let dm = DiscoveryManager::new(Arc::new(MergedDiscovery::default()), h);
+        let _stop = run_to_idle(&dm).await;
+        dm.add_api_service(&svc("v1.stable.example.com", true));
+        dm.wait_for_queue_complete().await;
+        assert_eq!(dm.cached_results.lock().unwrap().len(), 1);
+        let mut changed = svc("v1.stable.example.com", true);
+        changed.spec.service.as_mut().unwrap().name = "backend-changed".into();
+        dm.add_api_service(&changed);
+        dm.wait_for_queue_complete().await;
+        let cache = dm.cached_results.lock().unwrap();
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.keys().next().unwrap().name, "backend-changed");
+    }
+
+    /// `TestV2Beta1Skew`: a backend that only serves v2beta1 is still read,
+    /// and nil `responseKind`s are defaulted.
+    #[tokio::test]
+    async fn discovery_accepts_v2beta1_backend() {
+        let merged = Arc::new(MergedDiscovery::default());
+        let h = FnHandler::new(|_| {
+            let mut d = v2_doc(&[("stable.example.com", &["v1"])]);
+            d["apiVersion"] = "apidiscovery.k8s.io/v2beta1".into();
+            d["items"][0]["versions"][0]["resources"][0]["responseKind"] = serde_json::Value::Null;
+            ok(V2BETA1_CT, &d, None)
+        });
+        let dm = DiscoveryManager::new(merged.clone(), h);
+        dm.add_api_service(&svc("v1.stable.example.com", true));
+        let _stop = run_to_idle(&dm).await;
+        let v = &merged.groups()["stable.example.com"]["v1"];
+        assert_eq!(v.freshness, DiscoveryFreshness::Current);
+        assert_eq!(v.resources[0]["responseKind"], serde_json::json!({}));
+    }
+
+    /// `TestDirty`: the handler is pinged for a newly added APIService.
+    #[tokio::test]
+    async fn discovery_pings_handler_for_dirty_apiservice() {
+        let h = FnHandler::new(|_| ok(V2_CT, &v2_doc(&[("stable.example.com", &["v1"])]), None));
+        let dm = DiscoveryManager::new(Arc::new(MergedDiscovery::default()), h.clone());
+        dm.add_api_service(&svc("v1.stable.example.com", true));
+        let _stop = run_to_idle(&dm).await;
+        assert_eq!(h.paths(), vec!["/apis".to_string()]);
+    }
+
+    fn legacy_handler(root: HandlerResponse) -> Arc<FnHandler> {
+        FnHandler::new(move |r| match r.path.as_str() {
+            "/apis" => root.clone(),
+            "/apis/stable.example.com/v1" => HandlerResponse {
+                status: 200,
+                content_type: Some("application/json".into()),
+                etag: None,
+                body: serde_json::json!({
+                    "kind": "APIResourceList",
+                    "groupVersion": "stable.example.com/v1",
+                    "resources": [{
+                        "name": "foos", "singularName": "foo", "namespaced": false,
+                        "group": "stable.example.com", "version": "v1", "kind": "Foo",
+                        "verbs": ["get", "list"], "categories": ["all"],
+                    }],
+                })
+                .to_string()
+                .into_bytes(),
+            },
+            p => panic!("unexpected request sent to {p}"),
+        })
+    }
+
+    /// `TestLegacyFallback`: every kind of unacceptable root response falls
+    /// back to `/apis/{group}/{version}`; the result is `Current`, converted,
+    /// and NOT cached (`TestLegacyFallbackNoCache`).
+    #[tokio::test]
+    async fn discovery_legacy_fallback_for_unacceptable_root() {
+        let roots = [
+            HandlerResponse {
+                status: 406,
+                ..Default::default()
+            },
+            HandlerResponse {
+                status: 404,
+                ..Default::default()
+            },
+            HandlerResponse {
+                status: 200,
+                content_type: Some("application/json".into()),
+                ..Default::default()
+            },
+            HandlerResponse {
+                status: 200,
+                content_type: Some(
+                    "application/json;g=apidiscovery.k8s.io;v=v1alpha1;as=APIGroupDiscoveryList"
+                        .into(),
+                ),
+                ..Default::default()
+            },
+        ];
+        for root in roots {
+            let merged = Arc::new(MergedDiscovery::default());
+            let dm = DiscoveryManager::new(merged.clone(), legacy_handler(root));
+            dm.add_api_service(&svc("v1.stable.example.com", true));
+            let _stop = run_to_idle(&dm).await;
+            let v = &merged.groups()["stable.example.com"]["v1"];
+            assert_eq!(v.freshness, DiscoveryFreshness::Current);
+            assert_eq!(v.resources.len(), 1);
+            assert_eq!(v.resources[0]["resource"], "foos");
+            assert_eq!(v.resources[0]["scope"], "Cluster");
+            assert_eq!(v.resources[0]["singularResource"], "foo");
+            assert_eq!(v.resources[0]["categories"], serde_json::json!(["all"]));
+            assert_eq!(v.resources[0]["responseKind"]["kind"], "Foo");
+            assert!(dm.cached_results.lock().unwrap().is_empty());
+        }
+    }
+
+    /// A legacy failure marks the GV `Stale`.
+    #[tokio::test]
+    async fn discovery_legacy_failure_is_stale() {
+        let merged = Arc::new(MergedDiscovery::default());
+        let h = FnHandler::new(|_| HandlerResponse {
+            status: 404,
+            ..Default::default()
+        });
+        let dm = DiscoveryManager::new(merged.clone(), h.clone());
+        dm.add_api_service(&svc("v1.stable.example.com", true));
+        let _stop = run_to_idle(&dm).await;
+        let v = &merged.groups()["stable.example.com"]["v1"];
+        assert_eq!(v.freshness, DiscoveryFreshness::Stale);
+        assert!(v.resources.is_empty());
+        assert_eq!(
+            h.paths()[..2],
+            [
+                "/apis".to_string(),
+                "/apis/stable.example.com/v1".to_string()
+            ]
+        );
+    }
+
+    /// `TestAPIServiceStale`: a 503 backend is listed `Stale` with no resources.
+    #[tokio::test]
+    async fn discovery_503_backend_is_stale_and_empty() {
+        let merged = Arc::new(MergedDiscovery::default());
+        let h = FnHandler::status(503);
+        let dm = DiscoveryManager::new(merged.clone(), h.clone());
+        dm.add_api_service(&svc("v1.stable.example.com", true));
+        let _stop = run_to_idle(&dm).await;
+        let v = &merged.groups()["stable.example.com"]["v1"];
+        assert_eq!(v.freshness, DiscoveryFreshness::Stale);
+        assert!(v.resources.is_empty());
+        // 503 is a hard error: no legacy fallback request.
+        // (Run's initial sync and the dirty queue each try once.)
+        assert!(h.paths().iter().all(|p| p == "/apis"), "{:?}", h.paths());
+    }
+
+    /// `http.TimeoutHandler(..., 5s)`: a backend that never answers is `Stale`.
+    #[tokio::test(start_paused = true)]
+    async fn discovery_timeout_is_stale() {
+        let merged = Arc::new(MergedDiscovery::default());
+        let h = FnHandler::slow(Duration::from_secs(60), |_| {
+            ok(V2_CT, &v2_doc(&[("stable.example.com", &["v1"])]), None)
+        });
+        let dm = DiscoveryManager::new(merged.clone(), h);
+        dm.add_api_service(&svc("v1.stable.example.com", true));
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let (tx, mut rx) = watch::channel(false);
+        tokio::spawn(dm.clone().run(stop_rx, Some(tx)));
+        rx.wait_for(|s| *s).await.unwrap();
+        assert_eq!(
+            merged.groups()["stable.example.com"]["v1"].freshness,
+            DiscoveryFreshness::Stale
+        );
+    }
+
+    /// `TestNotModified`: once an etag is cached, a re-sync after the APIService
+    /// is marked dirty sends `If-None-Match`; a 304 keeps the cached resources.
+    #[tokio::test]
+    async fn discovery_not_modified_keeps_cached_document() {
+        let merged = Arc::new(MergedDiscovery::default());
+        let h = FnHandler::new(|r| match &r.if_none_match {
+            Some(e) if e == "\"e1\"" => HandlerResponse {
+                status: 304,
+                ..Default::default()
+            },
+            Some(e) => panic!("unexpected etag {e}"),
+            None => ok(
+                V2_CT,
+                &v2_doc(&[("stable.example.com", &["v1"])]),
+                Some("\"e1\""),
+            ),
+        });
+        let dm = DiscoveryManager::new(merged.clone(), h.clone());
+        dm.add_api_service(&svc("v1.stable.example.com", true));
+        let _stop = run_to_idle(&dm).await;
+        assert_eq!(h.seen.lock().unwrap().len(), 1);
+        // Mark dirty again (as the minute poll / an APIService update does).
+        dm.add_api_service(&svc("v1.stable.example.com", true));
+        dm.wait_for_queue_complete().await;
+        {
+            let seen = h.seen.lock().unwrap();
+            assert_eq!(seen.len(), 2);
+            assert_eq!(seen[1].if_none_match.as_deref(), Some("\"e1\""));
+        }
+        let v = &merged.groups()["stable.example.com"]["v1"];
+        assert_eq!(v.freshness, DiscoveryFreshness::Current);
+        assert_eq!(v.resources.len(), 1);
+    }
+
+    /// The cache rule: a result fetched after the APIService was marked dirty is
+    /// reused, so syncing again does not contact the backend.
+    #[tokio::test]
+    async fn discovery_fresh_cache_is_not_refetched() {
+        let h = FnHandler::new(|_| {
+            ok(
+                V2_CT,
+                &v2_doc(&[("a.example.com", &["v1"]), ("b.example.com", &["v1"])]),
+                None,
+            )
+        });
+        let dm = DiscoveryManager::new(Arc::new(MergedDiscovery::default()), h.clone());
+        dm.add_api_service(&svc("v1.a.example.com", true));
+        let _stop = run_to_idle(&dm).await;
+        let n = h.seen.lock().unwrap().len();
+        dm.sync_api_service("v1.a.example.com").await.unwrap();
+        assert_eq!(h.seen.lock().unwrap().len(), n);
     }
 }

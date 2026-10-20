@@ -500,7 +500,7 @@ pub async fn forward_to_aggregator(
 /// to the resolved pod IP (so the cert — issued for the service DNS name — still
 /// verifies while we connect to a reachable address).
 #[allow(dead_code)]
-fn build_aggregator_client(target: &AggregatorTarget) -> Option<reqwest::Client> {
+pub(crate) fn build_aggregator_client(target: &AggregatorTarget) -> Option<reqwest::Client> {
     let mut b = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none());
