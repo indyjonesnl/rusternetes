@@ -527,9 +527,16 @@ impl ProjectedMounter {
         // force "rusternetes", or a vanilla api-server issues a
         // token whose audience it rejects on use).
         let requested_audiences: Vec<String> = sa_token.audience.iter().cloned().collect();
-        // Audience baked into the self-mint FALLBACK claims (native
-        // storage-mode only): default to "rusternetes".
-        let mut audiences = vec!["rusternetes".to_string()];
+        // Audience baked into the self-mint FALLBACK claims (storage-direct
+        // backends only). TokenRequest defaults an empty audience list to the
+        // api-server's `--api-audiences`
+        // (`pkg/registry/core/serviceaccount/storage/token.go`
+        // `TokenREST.Create`), so use those, else "rusternetes".
+        let mut audiences = if self.token_manager.api_audiences().is_empty() {
+            vec!["rusternetes".to_string()]
+        } else {
+            self.token_manager.api_audiences().to_vec()
+        };
         if let Some(ref aud) = sa_token.audience {
             audiences = vec![aud.clone()];
         }

@@ -1446,7 +1446,12 @@ impl CsiMounter {
         let exp = chrono::Utc::now() + chrono::Duration::seconds(expiration_seconds);
         claims.exp = exp.timestamp();
         claims.aud = if audiences.is_empty() {
-            vec!["rusternetes".to_string()]
+            // TokenREST.Create: empty audiences default to --api-audiences.
+            if self.token_manager.api_audiences().is_empty() {
+                vec!["rusternetes".to_string()]
+            } else {
+                self.token_manager.api_audiences().to_vec()
+            }
         } else {
             audiences.to_vec()
         };

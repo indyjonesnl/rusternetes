@@ -62,6 +62,11 @@ pub struct KubeletConfig {
     /// Kubelet `--hostname-override` (empty = use `node_name` as the
     /// hostname).
     pub hostname_override: String,
+    /// The co-located api-server's `--service-account-*` / `--api-audiences`
+    /// options, so the storage-direct token fallback signs with the same key
+    /// and issuer (all-in-one only; see
+    /// [`kubelet::service_account_token_manager`]).
+    pub service_account: rusternetes_common::auth::ServiceAccountOptions,
 }
 
 impl Default for KubeletConfig {
@@ -78,6 +83,7 @@ impl Default for KubeletConfig {
             node_ip: String::new(),
             cloud_provider: String::new(),
             hostname_override: String::new(),
+            service_account: Default::default(),
         }
     }
 }
@@ -182,6 +188,7 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
             Vec::new(),
             node_ips,
             external_cloud_provider,
+            kubelet::service_account_token_manager(&config.service_account)?,
         )
         .await?
         .with_hostname(&hostname)
