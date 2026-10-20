@@ -144,6 +144,10 @@ struct Args {
     request_header:
         rusternetes_api_server::request_header_authentication::RequestHeaderAuthenticationArgs,
 
+    /// `--egress-selector-config-file` (#3416).
+    #[command(flatten)]
+    egress_selector: rusternetes_api_server::egress_selector::EgressSelectorArgs,
+
     /// Enable TLS/HTTPS
     #[arg(long)]
     tls: bool,
@@ -427,6 +431,7 @@ async fn main() -> Result<()> {
         authorization_webhook: args.authorization.webhook.clone(),
         authorization_config: args.authorization.authorization_config.clone(),
         authorization_legacy_flags_set: args.authorization.legacy_flags_set,
+        egress_selector_config_file: args.egress_selector.config_file.clone(),
         ..Default::default()
     };
     let prepared_tls = rusternetes_api_server::prepare_tls_for_config(&api_config)?;

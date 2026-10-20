@@ -25,6 +25,7 @@ pub mod apiserver_request_metrics;
 pub mod conversion;
 pub mod deprecation;
 pub mod dynamic_routes;
+pub mod egress_selector;
 pub mod endpoints;
 pub mod flow_control;
 pub mod flow_control_conc_alloc;
@@ -197,6 +198,8 @@ pub struct ApiServerConfig {
     pub authorization_config: String,
     /// `AreLegacyFlagsSet` (authorization.go:200-211).
     pub authorization_legacy_flags_set: bool,
+    /// `--egress-selector-config-file` (#3416); empty means dial directly.
+    pub egress_selector_config_file: String,
     pub prometheus_url: Option<String>,
     /// Path to the console SPA build directory. When set, the API server
     /// serves the console UI at `/console/` and falls back to `index.html`
@@ -351,6 +354,7 @@ impl Default for ApiServerConfig {
             authorization_webhook: Default::default(),
             authorization_config: String::new(),
             authorization_legacy_flags_set: false,
+            egress_selector_config_file: String::new(),
             prometheus_url: None,
             console_dir: None,
             client_ca_file: None,
@@ -399,6 +403,17 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
         &config.authorization_config,
         config.authorization_legacy_flags_set,
     )?;
+
+    // `EgressSelectorOptions.Validate` then `ApplyTo`
+    // (pkg/server/options/egress_selector.go:80, :55).
+    let egress_errs = egress_selector::validate_options(&config.egress_selector_config_file);
+    if !egress_errs.is_empty() {
+        anyhow::bail!("{}", egress_errs.join(", "));
+    }
+    egress_selector::set_egress_selector(
+        egress_selector::apply_to(&config.egress_selector_config_file)
+            .map_err(|e| anyhow::anyhow!(e))?,
+    );
 
     let metrics = Arc::new(MetricsRegistry::new().with_api_server_metrics()?);
 
