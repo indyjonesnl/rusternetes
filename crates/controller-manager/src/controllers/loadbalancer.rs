@@ -50,6 +50,10 @@ impl<S: Storage + 'static> LoadBalancerController<S> {
 
         let queue = WorkQueue::new();
 
+        // ONE worker, by upstream default (#2517): the cloud service controller's
+        // `ConcurrentServiceSyncs` defaults to 1
+        // (staging/src/k8s.io/cloud-provider/controllers/service/config/v1alpha1/defaults.go:29-30),
+        // passed to `serviceController.Run(ctx, n, ..)` (cloud-provider/app/core.go:97).
         let worker_queue = queue.clone();
         let worker_self = Arc::clone(&self);
         tokio::spawn(async move {

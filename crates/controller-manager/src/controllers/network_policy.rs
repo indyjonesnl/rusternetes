@@ -32,6 +32,9 @@ impl<S: Storage + 'static> NetworkPolicyController<S> {
 
         let queue = WorkQueue::new();
 
+        // ONE worker (#2517): kube-controller-manager has no NetworkPolicy controller
+        // (enforcement is the CNI's: kube-router/Calico), so there is no upstream
+        // worker count to port.
         let worker_queue = queue.clone();
         let worker_self = Arc::clone(&self);
         tokio::spawn(async move {

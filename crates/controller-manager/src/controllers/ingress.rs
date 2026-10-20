@@ -33,6 +33,9 @@ impl<S: Storage + 'static> IngressController<S> {
 
         let queue = WorkQueue::new();
 
+        // ONE worker (#2517): kube-controller-manager has no Ingress controller
+        // (no pkg/controller/ingress in release-1.35; ingress-nginx/ingress-gce are
+        // external), so there is no upstream worker count to port.
         let worker_queue = queue.clone();
         let worker_self = Arc::clone(&self);
         tokio::spawn(async move {

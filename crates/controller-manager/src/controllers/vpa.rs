@@ -50,6 +50,9 @@ impl<S: Storage + 'static> VerticalPodAutoscalerController<S> {
 
         let queue = WorkQueue::new();
 
+        // ONE worker (#2517): VPA lives in kubernetes/autoscaler, not
+        // kube-controller-manager (no pkg/controller counterpart in release-1.35),
+        // so there is no upstream worker count to port.
         let worker_queue = queue.clone();
         let worker_self = Arc::clone(&self);
         tokio::spawn(async move {
