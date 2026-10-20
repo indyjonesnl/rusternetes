@@ -53,6 +53,9 @@ mod registry;
 use rusternetes_api_server::request_scope;
 // `s.Flagz` is read by the lib router, so set it through the lib module.
 use rusternetes_api_server::zpages;
+// The aggregator handler table is installed by the lib's registration hooks and
+// read by the bin's router, so both must share the lib's copy (#3925).
+use rusternetes_api_server::aggregator_mux;
 // The bin's own `bootstrap` copy names the lib's trust type (#3414).
 use rusternetes_api_server::request_header_authentication;
 // The bin's own `admission` copy shares the lib's webhook client (ImagePolicyWebhook).
