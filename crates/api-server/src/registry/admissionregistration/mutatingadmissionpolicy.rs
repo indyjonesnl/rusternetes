@@ -11,12 +11,14 @@ use std::sync::Arc;
 
 use rusternetes_common::authz::Authorizer;
 use rusternetes_common::cel_env::{mutation_env_failure, ExpectedOutput, MutationEnv};
+use rusternetes_common::cel_versions::{self, EnvSet, EnvType};
 use rusternetes_common::resources::mutating_admission_policy::PatchType;
 use rusternetes_common::resources::MutatingAdmissionPolicy;
 use rusternetes_common::validation::field::{Error as FieldError, ErrorList, Path};
 use rusternetes_common::validation::mutating_admission_policy::{
+    find_mutating_policy_preexisting_expressions,
     ignore_mutating_admission_policy_match_conditions, set_defaults_mutating_admission_policy,
-    validate_mutating_admission_policy,
+    validate_mutating_admission_policy, PreexistingExpressions,
 };
 use rusternetes_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
 use rusternetes_storage::StorageBackend;
@@ -54,13 +56,24 @@ fn validate(obj: &MutatingAdmissionPolicy) -> ErrorList {
 /// One CEL compile, as `convertCELErrorToValidationError`
 /// (validation.go:1073-1085) reports it: `field.Invalid` carrying the
 /// expression, under `fld_path`.
+///
+/// `env_type` is `StoredExpressions` for an expression the old policy already
+/// stores, else `NewExpressions` (the `envType` selection of `validateMatchConditionsExpression`,
+/// `validateApplyConfiguration`, `validateJSONPatch`, `validateVariable`,
+/// validation.go:999-1032, :1100-1112, :1455-1498).
 fn compile_error(
     expression: &str,
     env: &MutationEnv,
     expected: ExpectedOutput,
+    env_set: &EnvSet,
+    env_type: EnvType,
     fld_path: &Path,
 ) -> Option<FieldError> {
+    // The checker's declarations first, then the library versions of the
+    // environment the expression compiles in (`CompileCELExpression` in
+    // `envType`, compile.go:166-229).
     mutation_env_failure(expression, env, expected)
+        .or_else(|| cel_versions::compile_failure(expression, env_set, env_type))
         .map(|detail| FieldError::invalid(fld_path, expression.to_string(), detail))
 }
 
@@ -77,9 +90,30 @@ fn compile_error(
 /// crate lets this port (declarations, `variables` fields, `Object` /
 /// `JSONPatch` type names, the output type of the unambiguous shapes) and what
 /// it does not (type inference). `environment.StoredExpressions`, which
-/// `preexistingExpressions` selects, only gates library versions and so makes
-/// no difference here.
-fn compile_errors(obj: &MutatingAdmissionPolicy, ignore_match_conditions: bool) -> ErrorList {
+/// `preexistingExpressions` selects, gates library versions
+/// ([`rusternetes_common::cel_versions`]): see [`compile_error`].
+fn compile_errors(
+    obj: &MutatingAdmissionPolicy,
+    ignore_match_conditions: bool,
+    old: Option<&MutatingAdmissionPolicy>,
+) -> ErrorList {
+    compile_errors_in(
+        obj,
+        ignore_match_conditions,
+        &old.map(find_mutating_policy_preexisting_expressions)
+            .unwrap_or_default(),
+        &EnvSet::must_base_env_set(cel_versions::default_compatibility_version()),
+    )
+}
+
+/// [`compile_errors`] against explicit preexisting expressions and environment
+/// set (`MustBaseEnvSet(DefaultCompatibilityVersion())`, validation.go:95).
+fn compile_errors_in(
+    obj: &MutatingAdmissionPolicy,
+    ignore_match_conditions: bool,
+    preexisting: &PreexistingExpressions,
+    env_set: &EnvSet,
+) -> ErrorList {
     let mut errs = ErrorList::new();
     let Some(spec) = &obj.spec else {
         return errs;
@@ -102,7 +136,19 @@ fn compile_errors(obj: &MutatingAdmissionPolicy, ignore_match_conditions: bool) 
                     .child("matchConditions")
                     .index(i)
                     .child("expression");
-                errs.extend(compile_error(expression, &env, ExpectedOutput::Bool, &path));
+                let env_type = if preexisting.match_condition_expressions.contains(expression) {
+                    EnvType::StoredExpressions
+                } else {
+                    EnvType::NewExpressions
+                };
+                errs.extend(compile_error(
+                    expression,
+                    &env,
+                    ExpectedOutput::Bool,
+                    env_set,
+                    env_type,
+                    &path,
+                ));
             }
         }
     }
@@ -128,6 +174,12 @@ fn compile_errors(obj: &MutatingAdmissionPolicy, ignore_match_conditions: bool) 
                 &v.expression,
                 &variable_env,
                 ExpectedOutput::Any,
+                env_set,
+                // `findMutatingPolicyPreexistingExpressions` never fills
+                // `validationExpressions` (validation.go:326-340), which is
+                // the set `validateVariable` consults (:1012-1015), so a
+                // variable always compiles as a new expression.
+                EnvType::NewExpressions,
                 &path,
             ));
         }
@@ -156,10 +208,24 @@ fn compile_errors(obj: &MutatingAdmissionPolicy, ignore_match_conditions: bool) 
         if let Some(expression) = expression {
             let trimmed = expression.trim();
             if !trimmed.is_empty() {
+                // Upstream replicated: `validateJSONPatch` consults
+                // `applyConfigurationExpressions` (validation.go:1485), not
+                // `jsonPatchExpressions`, so a stored jsonPatch is only
+                // `StoredExpressions` when it equals a stored applyConfiguration.
+                let env_type = if preexisting
+                    .apply_configuration_expressions
+                    .contains(expression)
+                {
+                    EnvType::StoredExpressions
+                } else {
+                    EnvType::NewExpressions
+                };
                 errs.extend(compile_error(
                     trimmed,
                     &mutation_env,
                     expected,
+                    env_set,
+                    env_type,
                     &path.child(child).child("expression"),
                 ));
             }
@@ -192,7 +258,7 @@ impl RestCreateStrategy<MutatingAdmissionPolicy> for Strategy {
     /// which is `validate_async`.
     fn validate(&self, _ctx: &RequestContext, obj: &MutatingAdmissionPolicy) -> ErrorList {
         let mut errs = validate(obj);
-        errs.extend(compile_errors(obj, false));
+        errs.extend(compile_errors(obj, false, None));
         errs
     }
 
@@ -248,6 +314,7 @@ impl RestUpdateStrategy<MutatingAdmissionPolicy> for Strategy {
         errs.extend(compile_errors(
             obj,
             ignore_mutating_admission_policy_match_conditions(obj, old),
+            Some(old),
         ));
         errs
     }
@@ -396,6 +463,112 @@ mod tests {
         old: &MutatingAdmissionPolicy,
     ) -> ErrorList {
         Strategy::default().validate_update(ctx, new, old)
+    }
+
+    const SEMVER: &str = "semver('1.2.3').major() > 0";
+
+    fn env_1_32() -> EnvSet {
+        EnvSet::must_base_env_set(rusternetes_common::feature_gates::Version::major_minor(
+            1, 32,
+        ))
+    }
+
+    fn with_expressions(
+        match_condition: Option<&str>,
+        variable: Option<&str>,
+        apply: Option<&str>,
+        json_patch: Option<&str>,
+    ) -> MutatingAdmissionPolicy {
+        let mut p = valid();
+        let spec = p.spec.as_mut().unwrap();
+        if let Some(e) = match_condition {
+            spec.match_conditions =
+                Some(serde_json::from_value(json!([{"name": "mc", "expression": e}])).unwrap());
+        }
+        if let Some(e) = variable {
+            spec.variables =
+                Some(serde_json::from_value(json!([{"name": "x", "expression": e}])).unwrap());
+        }
+        if let Some(e) = apply {
+            spec.mutations = Some(
+                serde_json::from_value(json!([{"patchType": "ApplyConfiguration",
+                    "applyConfiguration": {"expression": e}}]))
+                .unwrap(),
+            );
+        }
+        if let Some(e) = json_patch {
+            spec.mutations = Some(
+                serde_json::from_value(
+                    json!([{"patchType": "JSONPatch", "jsonPatch": {"expression": e}}]),
+                )
+                .unwrap(),
+            );
+        }
+        p
+    }
+
+    fn errs_in(new: &MutatingAdmissionPolicy, old: Option<&MutatingAdmissionPolicy>) -> String {
+        let preexisting = old
+            .map(find_mutating_policy_preexisting_expressions)
+            .unwrap_or_default();
+        messages(&compile_errors_in(new, false, &preexisting, &env_1_32()))
+    }
+
+    /// `validateMatchConditionsExpression` (validation.go:1100-1112): a new
+    /// expression compiles in `NewExpressions`, where a library introduced
+    /// above the min-compatibility version is undeclared; one the old policy
+    /// stores compiles in `StoredExpressions`.
+    #[test]
+    fn match_condition_new_expression_is_version_gated() {
+        let new = with_expressions(Some(SEMVER), None, None, None);
+        let got = errs_in(&new, None);
+        assert!(
+            got.contains("spec.matchConditions[0].expression")
+                && got.contains("undeclared reference to 'semver'"),
+            "{got}"
+        );
+        assert_eq!(errs_in(&new, Some(&new)), "");
+        let other = with_expressions(Some("semver('1.2.3').minor() > 0"), None, None, None);
+        assert!(errs_in(&other, Some(&new)).contains("undeclared reference to 'semver'"));
+    }
+
+    /// `validateVariable` consults `validationExpressions` (validation.go:1012),
+    /// which `findMutatingPolicyPreexistingExpressions` never fills, so a
+    /// variable is always a new expression.
+    #[test]
+    fn variable_is_always_a_new_expression() {
+        let p = with_expressions(None, Some(SEMVER), None, None);
+        for old in [None, Some(&p)] {
+            let got = errs_in(&p, old);
+            assert!(
+                got.contains("spec.variables[0].expression")
+                    && got.contains("undeclared reference to 'semver'"),
+                "{got}"
+            );
+        }
+    }
+
+    /// `validateApplyConfiguration` (validation.go:1461) uses
+    /// `applyConfigurationExpressions`.
+    #[test]
+    fn apply_configuration_preexisting_is_stored() {
+        let e = "Object{spec: Object.spec{replicas: semver('1.2.3').major()}}";
+        let p = with_expressions(None, None, Some(e), None);
+        assert!(errs_in(&p, None).contains("undeclared reference to 'semver'"));
+        assert_eq!(errs_in(&p, Some(&p)), "");
+    }
+
+    /// Upstream replicated: `validateJSONPatch` checks
+    /// `applyConfigurationExpressions` (validation.go:1485), not
+    /// `jsonPatchExpressions`, so a stored jsonPatch is still compiled as new.
+    #[test]
+    fn json_patch_consults_the_apply_configuration_set() {
+        let e = "[JSONPatch{op: 'add', path: '/x', value: semver('1.2.3').major()}]";
+        let p = with_expressions(None, None, None, Some(e));
+        assert!(errs_in(&p, Some(&p)).contains("undeclared reference to 'semver'"));
+        // Equal to a stored applyConfiguration expression: the stored env.
+        let apply = with_expressions(None, None, Some(e), None);
+        assert_eq!(errs_in(&p, Some(&apply)), "");
     }
 
     /// `TestValidateMutatingAdmissionPolicy` "variable compile error"
