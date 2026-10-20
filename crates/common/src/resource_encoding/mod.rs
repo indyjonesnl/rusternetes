@@ -27,6 +27,7 @@
 //! (see [`scheme_table`]).
 
 mod scheme_table;
+pub mod storage_version_hash;
 
 use crate::compatibility::{current_effective_version, EffectiveVersion};
 use crate::feature_gates::Version;

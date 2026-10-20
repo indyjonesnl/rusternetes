@@ -234,14 +234,33 @@ async fn custom_resource_fallback(
                 "update",
                 "watch",
             ];
+            // customresource_discovery_controller.go:133-135: the hash of the
+            // storage:true version (the last one, as upstream's loop
+            // overwrites), with the CRD's Spec.Names.Kind.
+            let storage_version_hash = crd
+                .spec
+                .versions
+                .iter()
+                .rev()
+                .find(|v| v.storage)
+                .map(|v| {
+                    rusternetes_common::resource_encoding::storage_version_hash::storage_version_hash(
+                        &crd.spec.group,
+                        &v.name,
+                        &crd.spec.names.kind,
+                    )
+                });
             let mut res = serde_json::json!({
                 "name": crd.spec.names.plural,
                 "singularName": crd.spec.names.singular,
                 "namespaced": namespaced,
                 "kind": crd.spec.names.kind,
                 "verbs": verbs,
-                "storageVersionHash": "",
             });
+            // `omitempty`: absent when no version is the storage version.
+            if let Some(h) = storage_version_hash {
+                res["storageVersionHash"] = serde_json::json!(h);
+            }
             if let Some(ref short) = crd.spec.names.short_names {
                 res["shortNames"] = serde_json::json!(short);
             }

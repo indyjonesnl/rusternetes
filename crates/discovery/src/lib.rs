@@ -2033,6 +2033,35 @@ pub struct APIResource {
     pub storage_version_hash: Option<String>,
 }
 
+impl APIResourceList {
+    /// installer.go:488-498: stamp `storageVersionHash` on every top-level
+    /// resource whose storage is a `genericregistry.Store`, hashing the
+    /// *storage* GVK (shared by every served version). Subresources
+    /// (`name` containing `/`) are served by REST objects that are not
+    /// `StorageVersionProvider`s and carry no hash.
+    pub fn with_storage_version_hashes(mut self) -> Self {
+        use rusternetes_common::resource_encoding::{
+            storage_version_hash::discovery_storage_version_hash, GroupResource,
+            StorageFactoryConfig,
+        };
+        let group = self
+            .group_version
+            .split_once('/')
+            .map(|(g, _)| g)
+            .unwrap_or("")
+            .to_string();
+        let config = StorageFactoryConfig::new().resource_encoding_config();
+        for r in self.resources.iter_mut().filter(|r| !r.name.contains('/')) {
+            r.storage_version_hash = discovery_storage_version_hash(
+                &config,
+                &GroupResource::new(&group, &r.name),
+                &r.kind,
+            );
+        }
+        self
+    }
+}
+
 /// GET /api/v1
 /// Returns the list of resources available in the core v1 API
 pub async fn get_core_resources() -> (StatusCode, Json<APIResourceList>) {
@@ -2475,7 +2504,10 @@ pub async fn get_core_resources() -> (StatusCode, Json<APIResourceList>) {
         resources,
     };
 
-    (StatusCode::OK, Json(resource_list))
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
 }
 
 /// GET /apis/apps/v1
@@ -2685,7 +2717,10 @@ pub async fn get_apps_v1_resources() -> (StatusCode, Json<APIResourceList>) {
         resources,
     };
 
-    (StatusCode::OK, Json(resource_list))
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
 }
 
 /// GET /apis/batch/v1
@@ -2771,7 +2806,10 @@ pub async fn get_batch_v1_resources() -> (StatusCode, Json<APIResourceList>) {
         resources,
     };
 
-    (StatusCode::OK, Json(resource_list))
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
 }
 
 /// GET /apis/networking.k8s.io/v1
@@ -2923,7 +2961,10 @@ pub async fn get_networking_v1_resources() -> (StatusCode, Json<APIResourceList>
         resources,
     };
 
-    (StatusCode::OK, Json(resource_list))
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
 }
 
 /// GET /apis/rbac.authorization.k8s.io/v1
@@ -3027,7 +3068,10 @@ pub async fn get_rbac_v1_resources() -> (StatusCode, Json<APIResourceList>) {
         resources,
     };
 
-    (StatusCode::OK, Json(resource_list))
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
 }
 
 /// GET /apis/storage.k8s.io/v1
@@ -3188,7 +3232,10 @@ pub async fn get_storage_v1_resources() -> (StatusCode, Json<APIResourceList>) {
         resources,
     };
 
-    (StatusCode::OK, Json(resource_list))
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
 }
 
 /// GET /apis/scheduling.k8s.io/v1
@@ -3224,7 +3271,10 @@ pub async fn get_scheduling_v1_resources() -> (StatusCode, Json<APIResourceList>
         resources,
     };
 
-    (StatusCode::OK, Json(resource_list))
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
 }
 
 /// GET /apis/apiextensions.k8s.io/v1
@@ -3275,7 +3325,10 @@ pub async fn get_apiextensions_v1_resources() -> (StatusCode, Json<APIResourceLi
         resources,
     };
 
-    (StatusCode::OK, Json(resource_list))
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
 }
 
 /// GET /apis/admissionregistration.k8s.io/v1
@@ -3392,7 +3445,10 @@ pub async fn get_admissionregistration_v1_resources() -> (StatusCode, Json<APIRe
         resources,
     };
 
-    (StatusCode::OK, Json(resource_list))
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
 }
 
 /// GET /apis/coordination.k8s.io/v1
@@ -3428,7 +3484,10 @@ pub async fn get_coordination_v1_resources() -> (StatusCode, Json<APIResourceLis
         resources,
     };
 
-    (StatusCode::OK, Json(resource_list))
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
 }
 
 /// GET /apis/flowcontrol.apiserver.k8s.io/v1
@@ -3514,7 +3573,10 @@ pub async fn get_flowcontrol_v1_resources() -> (StatusCode, Json<APIResourceList
         resources,
     };
 
-    (StatusCode::OK, Json(resource_list))
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
 }
 
 /// GET /apis/certificates.k8s.io/v1
@@ -3575,7 +3637,10 @@ pub async fn get_certificates_v1_resources() -> (StatusCode, Json<APIResourceLis
         resources,
     };
 
-    (StatusCode::OK, Json(resource_list))
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
 }
 
 /// GET /apis/certificates.k8s.io/v1beta1
@@ -3657,7 +3722,11 @@ pub async fn get_certificates_v1beta1_resources() -> Response {
         group_version: "certificates.k8s.io/v1beta1".to_string(),
         resources,
     };
-    (StatusCode::OK, Json(resource_list)).into_response()
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
+        .into_response()
 }
 
 /// GET /apis/admissionregistration.k8s.io/v1beta1
@@ -3744,7 +3813,11 @@ pub async fn get_admissionregistration_v1beta1_resources() -> Response {
             ),
         ],
     };
-    (StatusCode::OK, Json(resource_list)).into_response()
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
+        .into_response()
 }
 
 /// GET /apis/snapshot.storage.k8s.io/v1
@@ -3852,7 +3925,10 @@ pub async fn get_snapshot_v1_resources() -> (StatusCode, Json<APIResourceList>) 
         resources,
     };
 
-    (StatusCode::OK, Json(resource_list))
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
 }
 
 /// GET /apis/gateway.networking.k8s.io/v1beta1
@@ -3891,7 +3967,10 @@ pub async fn get_gateway_v1beta1_resources() -> (StatusCode, Json<APIResourceLis
         resources,
     };
 
-    (StatusCode::OK, Json(resource_list))
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
 }
 
 /// GET /apis/discovery.k8s.io/v1
@@ -3933,7 +4012,10 @@ pub async fn get_discovery_v1_resources() -> (StatusCode, Json<APIResourceList>)
         resources,
     };
 
-    (StatusCode::OK, Json(resource_list))
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
 }
 
 /// GET /apis/node.k8s.io/v1
@@ -3969,7 +4051,10 @@ pub async fn get_node_v1_resources() -> (StatusCode, Json<APIResourceList>) {
         resources,
     };
 
-    (StatusCode::OK, Json(resource_list))
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
 }
 
 /// GET /apis/authentication.k8s.io/v1
@@ -4005,7 +4090,10 @@ pub async fn get_authentication_v1_resources() -> (StatusCode, Json<APIResourceL
         resources,
     };
 
-    (StatusCode::OK, Json(resource_list))
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
 }
 
 /// GET /apis/authorization.k8s.io/v1
@@ -4061,7 +4149,10 @@ pub async fn get_authorization_v1_resources() -> (StatusCode, Json<APIResourceLi
         resources,
     };
 
-    (StatusCode::OK, Json(resource_list))
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
 }
 
 /// GET /apis/metrics.k8s.io/v1beta1
@@ -4097,7 +4188,10 @@ pub async fn get_metrics_v1beta1_resources() -> (StatusCode, Json<APIResourceLis
         resources,
     };
 
-    (StatusCode::OK, Json(resource_list))
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
 }
 
 /// GET /apis/custom.metrics.k8s.io/v1beta2
@@ -4121,7 +4215,10 @@ pub async fn get_custom_metrics_v1beta2_resources() -> (StatusCode, Json<APIReso
         resources,
     };
 
-    (StatusCode::OK, Json(resource_list))
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
 }
 
 /// GET /apis/external.metrics.k8s.io/v1beta1
@@ -4147,7 +4244,10 @@ pub async fn get_external_metrics_v1beta1_resources() -> (StatusCode, Json<APIRe
         resources,
     };
 
-    (StatusCode::OK, Json(resource_list))
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
 }
 
 /// GET /apis/resource.k8s.io/v1
@@ -4264,7 +4364,10 @@ pub async fn get_resource_v1_resources() -> (StatusCode, Json<APIResourceList>) 
         resources,
     };
 
-    (StatusCode::OK, Json(resource_list))
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
 }
 
 /// GET /apis/autoscaling/v1
@@ -4315,7 +4418,10 @@ pub async fn get_autoscaling_v1_resources() -> (StatusCode, Json<APIResourceList
         resources,
     };
 
-    (StatusCode::OK, Json(resource_list))
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
 }
 
 /// GET /apis/autoscaling/v2
@@ -4366,7 +4472,10 @@ pub async fn get_autoscaling_v2_resources() -> (StatusCode, Json<APIResourceList
         resources,
     };
 
-    (StatusCode::OK, Json(resource_list))
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
 }
 
 /// GET /apis/policy/v1
@@ -4417,7 +4526,10 @@ pub async fn get_policy_v1_resources() -> (StatusCode, Json<APIResourceList>) {
         resources,
     };
 
-    (StatusCode::OK, Json(resource_list))
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
 }
 
 /// GET /apis/events.k8s.io/v1
@@ -4453,7 +4565,10 @@ pub async fn get_events_v1_resources() -> (StatusCode, Json<APIResourceList>) {
         resources,
     };
 
-    (StatusCode::OK, Json(resource_list))
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
 }
 
 /// GET /apis/apiregistration.k8s.io/v1
@@ -4505,7 +4620,10 @@ pub async fn get_apiregistration_v1_resources() -> (StatusCode, Json<APIResource
         resources,
     };
 
-    (StatusCode::OK, Json(resource_list))
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
 }
 
 #[cfg(test)]
@@ -4535,6 +4653,26 @@ mod listed_paths_tests {
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+
+    /// installer.go:488-498: top-level resources carry the storage-version
+    /// hash, subresources and non-Store resources do not.
+    #[tokio::test]
+    async fn resource_lists_carry_storage_version_hash() {
+        let (_, Json(core)) = get_core_resources().await;
+        let find = |l: &APIResourceList, n: &str| {
+            l.resources
+                .iter()
+                .find(|r| r.name == n)
+                .unwrap_or_else(|| panic!("{n}"))
+                .storage_version_hash
+                .clone()
+        };
+        assert_eq!(find(&core, "pods").as_deref(), Some("xPOwRZ+Yhw8="));
+        assert_eq!(find(&core, "pods/status"), None);
+        assert_eq!(find(&core, "componentstatuses"), None);
+        let (_, Json(apps)) = get_apps_v1_resources().await;
+        assert_eq!(find(&apps, "deployments").as_deref(), Some("8aSe+NMegvE="));
+    }
 
     /// config.go:1129 `routes.Version{Version: c.EffectiveVersion.Info()}`:
     /// /version carries the emulation + min-compatibility fields.
