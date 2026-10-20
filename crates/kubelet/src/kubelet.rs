@@ -49,6 +49,8 @@ pub enum PodWorkerState {
 /// Initial CrashLoopBackOff delay before the *second* restart of a container.
 /// The first restart after a crash is immediate. Matches upstream
 /// `pkg/kubelet/kubelet.go` `backOffPeriod = 10s`.
+/// `nodeReadyGracePeriod` (pkg/kubelet/kubelet.go:157).
+const NODE_READY_GRACE_PERIOD: Duration = Duration::from_secs(120);
 const CRASHLOOP_BACKOFF_INITIAL: Duration = Duration::from_secs(10);
 /// Default maximum CrashLoopBackOff delay: upstream `MaxCrashLoopBackOff` (5m),
 /// overridable by `crashLoopBackOff.maxContainerRestartPeriod`.
@@ -1145,6 +1147,13 @@ impl Kubelet {
         // Register the node
         self.register_node().await?;
 
+        // `go kl.fastStatusUpdateOnce()` (kubelet.go:1855): push the first
+        // Ready status without waiting for the next heartbeat.
+        {
+            let fast_self = Arc::clone(self);
+            tokio::spawn(async move { fast_self.fast_status_update_once().await });
+        }
+
         // Startup cleanup: immediately remove any containers from previous runs
         // that don't correspond to pods in etcd. K8s kubelet does a full
         // reconciliation at startup to ensure no stale containers remain.
@@ -1545,6 +1554,84 @@ impl Kubelet {
             .await
             .map_err(|e| e.to_string());
         self.runtime_state.update_from_status(status);
+    }
+
+    /// Port of `fastStatusUpdateOnce` (kubelet.go:3238-3252): retry
+    /// `fast_node_status_update` every 100ms until it completes or
+    /// `nodeReadyGracePeriod` (kubelet.go:157) expires.
+    async fn fast_status_update_once(&self) {
+        let start = std::time::Instant::now();
+        loop {
+            if self
+                .fast_node_status_update(start.elapsed() >= NODE_READY_GRACE_PERIOD)
+                .await
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Port of `fastNodeStatusUpdate` (kubelet_node_status.go:371-440).
+    /// Returns true (completed) when the node is already Ready, when the
+    /// status was pushed, or on timeout; completion arms
+    /// `containerRuntimeReadyExpected` (:376-382).
+    async fn fast_node_status_update(&self, timeout: bool) -> bool {
+        let completed = self.fast_node_status_update_inner(timeout).await;
+        if completed {
+            self.runtime_state.set_container_runtime_ready_expected();
+        }
+        completed
+    }
+
+    async fn fast_node_status_update_inner(&self, timeout: bool) -> bool {
+        if timeout {
+            error!("Node not becoming ready in time after startup");
+            return true;
+        }
+        let key = build_key("nodes", None, &self.node_name);
+        let original: Node = match self.storage.get(&key).await {
+            Ok(n) => n,
+            Err(e) => {
+                error!("Error getting the current node from lister: {e}");
+                return false;
+            }
+        };
+        let Some(status) = original.status.as_ref() else {
+            error!("Node does not have NodeReady condition");
+            return false;
+        };
+        let conditions = status.conditions.clone().unwrap_or_default();
+        let Some(ready) = conditions.iter().find(|c| c.condition_type == "Ready") else {
+            error!("Node does not have NodeReady condition");
+            return false;
+        };
+        if ready.status == "True" {
+            return true;
+        }
+        // In addition to the regular sync, get the runtime status earlier.
+        self.update_runtime_up().await;
+        let mut computed = conditions;
+        crate::runtime_state::set_ready_condition(
+            &mut computed,
+            status.capacity.as_ref(),
+            self.ready_errors(),
+            chrono::Utc::now(),
+            LOCAL_STORAGE_CAPACITY_ISOLATION,
+        );
+        if !computed
+            .iter()
+            .any(|c| c.condition_type == "Ready" && c.status == "True")
+        {
+            return false;
+        }
+        info!("Fast updating node status as it just became ready");
+        // patchNodeStatus failure falls back to the regular sync upstream
+        // (:428-436); update_node_status re-reads the node itself.
+        if let Err(e) = self.update_node_status().await {
+            error!("Error updating node status, will retry with syncNodeStatus: {e}");
+        }
+        true
     }
 
     /// `kubeletVolumeHost.SetKubeletError` (pkg/kubelet/volume_host.go:122):
@@ -7558,6 +7645,58 @@ mod tests {
         let node: rusternetes_common::resources::Node = storage.get(&key).await.unwrap();
         let c = ready(&node);
         assert!(!c.message.unwrap().contains("CSINode"));
+    }
+
+    /// `fastNodeStatusUpdate` (kubelet_node_status.go:371-440): NotReady
+    /// node + unready runtime -> not completed; timeout -> completed and
+    /// arms containerRuntimeReadyExpected. (The push path needs a live CRI
+    /// runtime, covered by the conformance canary.)
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn fast_node_status_update_retries_then_arms_on_timeout() {
+        use rusternetes_storage::{build_key, Storage, StorageBackend};
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("absent.sock");
+        std::env::set_var(
+            "CONTAINER_RUNTIME_ENDPOINT",
+            format!("unix://{}", sock.display()),
+        );
+        let storage = std::sync::Arc::new(StorageBackend::new_memory());
+        let k = Kubelet::new(
+            "node-fast".into(),
+            storage.clone(),
+            10,
+            dir.path().join("vols").display().to_string(),
+            "10.96.0.10".into(),
+            "cluster.local".into(),
+            "bridge".into(),
+            String::new(),
+        )
+        .await
+        .unwrap();
+        k.update_runtime_up().await;
+        k.register_node().await.unwrap();
+        let key = build_key("nodes", None, "node-fast");
+        let is_ready = |n: &rusternetes_common::resources::Node| {
+            n.status
+                .as_ref()
+                .unwrap()
+                .conditions
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|c| c.condition_type == "Ready" && c.status == "True")
+        };
+        let node: rusternetes_common::resources::Node = storage.get(&key).await.unwrap();
+        assert!(!is_ready(&node));
+
+        // Runtime still absent: keep retrying, nothing armed.
+        assert!(!k.fast_node_status_update(false).await);
+        assert!(!k.runtime_state.container_runtime_ready_expected());
+
+        // Grace period expired: completes and arms the flag.
+        assert!(k.fast_node_status_update(true).await);
+        assert!(k.runtime_state.container_runtime_ready_expected());
     }
 
     fn resources(pairs: &[(&str, &str)]) -> Option<std::collections::HashMap<String, String>> {
