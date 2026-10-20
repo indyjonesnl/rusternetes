@@ -341,21 +341,26 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
 
         // `New` (scheduler.go:282-341): the per-profile QueueingHintMap feeds
         // the scheduling queue; PrioritySort is the only queue-sort plugin.
+        let queueing_hint_map =
+            hints::build_queueing_hint_map_per_profile(self.profiles.profiles());
+        // `unionedGVKs` (scheduler.go:635-647) decides which resource
+        // handlers `addAllEventHandlers` installs below.
+        let gvk_map = crate::resource_events::unioned_gvks(&queueing_hint_map);
         let queue = PriorityQueue::new(
             priority_sort_less(),
             PriorityQueueOptions {
-                queueing_hint_map: hints::build_queueing_hint_map_per_profile(
-                    self.profiles.profiles(),
-                ),
-                // Deviation: upstream flushes pods that sat in
-                // unschedulablePods for 5m. Rusternetes does not yet watch
-                // PV/PVC/StorageClass/CSINode/CSIStorageCapacity/ResourceClaim
-                // (whose events would requeue VolumeBinding/VolumeZone/DRA
-                // rejections), so the resync tick below flushes pods older
-                // than one `interval` instead — the pre-queue retry cadence.
-                pod_max_in_unschedulable_pods_duration: self.interval,
+                queueing_hint_map,
+                // Upstream default (5m): pods rejected by the volume plugins
+                // are requeued by the PV/PVC/StorageClass/CSI* events fed by
+                // `add_resource_event_handlers`, not by a short flush.
                 ..Default::default()
             },
+        );
+        crate::resource_events::add_resource_event_handlers(
+            &self.data,
+            &queue,
+            &gvk_map,
+            self.interval,
         );
         queue.run();
 
@@ -716,8 +721,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
 
     /// Periodic relist (the reflector's resync, which upstream's informers
     /// also perform): replays adds/updates/deletes the watch may have missed,
-    /// then flushes unschedulable pods older than
-    /// `podMaxInUnschedulablePodsDuration` (set to `interval`, see `run`).
+    /// The queue's own ticker runs `flushUnschedulablePodsLeftover`.
     async fn resync(&self, queue: &PriorityQueue, seen: &mut SeenObjects) {
         match self.data.list_pods().await {
             Ok(pods) => {
@@ -759,7 +763,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             }
             Err(e) => error!("Failed to list nodes for resync: {}", e),
         }
-        queue.flush_unschedulable_pods_leftover();
     }
 
     // -----------------------------------------------------------------------
