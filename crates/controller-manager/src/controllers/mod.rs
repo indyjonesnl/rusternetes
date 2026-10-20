@@ -76,6 +76,7 @@ pub mod ttl_controller;
 pub mod uid_precondition_double;
 #[allow(dead_code)]
 pub mod vac_protection;
+pub mod volume_data_source_validator;
 pub mod volume_expansion;
 pub mod volume_snapshot;
 pub mod vpa;

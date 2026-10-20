@@ -82,6 +82,7 @@ mod status_subresource_guard;
 mod storageclass_controller_test;
 mod ttl_controller_test;
 mod update_carries_stored_identity_guard_test;
+mod volume_data_source_validator_test;
 mod volume_expansion_test;
 mod volume_snapshot_controller_test;
 mod volume_snapshot_default_class_test;

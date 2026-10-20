@@ -46,6 +46,7 @@ use controllers::{
     storage_class::StorageClassController,
     ttl_controller::TTLController,
     vac_protection::VacProtectionController,
+    volume_data_source_validator::VolumeDataSourceValidator,
     volume_expansion::VolumeExpansionController,
     volume_snapshot::VolumeSnapshotController,
     vpa::VerticalPodAutoscalerController,
@@ -1355,6 +1356,17 @@ async fn main() -> Result<()> {
         async move {
             if let Err(e) = controller.run().await {
                 tracing::error!("Volume Snapshot controller error: {}", e);
+            }
+        }
+    });
+
+    // Start volume-data-source-validator (kubernetes-csi/volume-data-source-validator)
+    let volume_data_source_validator = Arc::new(VolumeDataSourceValidator::new(storage.clone()));
+    spawn_controller!("Volume Data Source Validator", leader_elector, {
+        let controller = volume_data_source_validator.clone();
+        async move {
+            if let Err(e) = controller.run().await {
+                tracing::error!("Volume Data Source Validator error: {}", e);
             }
         }
     });
