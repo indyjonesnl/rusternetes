@@ -19,6 +19,7 @@ pub mod hints;
 pub mod preemption_hints;
 pub mod scheduling_queue;
 pub mod topology_spread_hints;
+pub mod volume_binding_hints;
 pub mod volume_hints;
 
 pub use events::*;

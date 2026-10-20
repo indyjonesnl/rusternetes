@@ -186,17 +186,34 @@ pub fn events_to_register(plugin_name: &str, profile: &Profile) -> Vec<ClusterEv
                 Arc::new(super::topology_spread_hints::is_schedulable_after_node_change),
             ),
         ],
-        // volumebinding/volume_binding.go:145-192 — hint fns are the subject
-        // of #3617's remainder.
-        names::VOLUME_BINDING => vec![
-            ev(R::StorageClass, A::ADD | A::UPDATE),
-            ev(R::PersistentVolumeClaim, A::ADD | A::UPDATE),
-            ev(R::PersistentVolume, A::ADD | A::UPDATE),
-            ev(R::Node, A::ADD | A::UPDATE_NODE_LABEL),
-            ev(R::CsiNode, A::ADD | A::UPDATE),
-            ev(R::CsiDriver, A::UPDATE),
-            ev(R::CsiStorageCapacity, A::ADD | A::UPDATE),
-        ],
+        // volumebinding/volume_binding.go:105-141
+        names::VOLUME_BINDING => {
+            use super::volume_binding_hints as vb;
+            vec![
+                ClusterEventWithHint::with_hint(
+                    ClusterEvent::new(R::StorageClass, A::ADD | A::UPDATE),
+                    Arc::new(vb::is_schedulable_after_storage_class_change),
+                ),
+                ClusterEventWithHint::with_hint(
+                    ClusterEvent::new(R::PersistentVolumeClaim, A::ADD | A::UPDATE),
+                    Arc::new(vb::is_schedulable_after_pvc_change),
+                ),
+                ev(R::PersistentVolume, A::ADD | A::UPDATE),
+                ev(R::Node, A::ADD | A::UPDATE_NODE_LABEL),
+                ClusterEventWithHint::with_hint(
+                    ClusterEvent::new(R::CsiNode, A::ADD | A::UPDATE),
+                    Arc::new(vb::is_schedulable_after_csi_node_change),
+                ),
+                ClusterEventWithHint::with_hint(
+                    ClusterEvent::new(R::CsiDriver, A::UPDATE),
+                    Arc::new(vb::is_schedulable_after_csi_driver_change),
+                ),
+                ClusterEventWithHint::with_hint(
+                    ClusterEvent::new(R::CsiStorageCapacity, A::ADD | A::UPDATE),
+                    Arc::new(vb::is_schedulable_after_csi_storage_capacity_change),
+                ),
+            ]
+        }
         // volumerestrictions/volume_restrictions.go:336-352
         names::VOLUME_RESTRICTIONS => vec![
             ClusterEventWithHint::with_hint(
