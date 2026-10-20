@@ -41,8 +41,8 @@ use rusternetes_client::events::ClientEventRecorder;
 use rusternetes_client::http::{ApiClient, GetError};
 use rusternetes_client::reflector::Reflector;
 use rusternetes_common::resources::{
-    CSINode, EventType, Node, PersistentVolume, PersistentVolumeClaim, Pod, PodDisruptionBudget,
-    PriorityClass,
+    CSIDriver, CSINode, EventType, Node, PersistentVolume, PersistentVolumeClaim, Pod,
+    PodDisruptionBudget, PriorityClass, StorageClass, VolumeAttachment,
 };
 use rusternetes_common::{Error, Result};
 use rusternetes_storage::{build_key, Storage};
@@ -114,6 +114,104 @@ fn priority_class_store_key(pc: &PriorityClass) -> String {
     pc.metadata.name.clone()
 }
 
+fn pvc_store_key(p: &PersistentVolumeClaim) -> String {
+    format!(
+        "{}/{}",
+        p.metadata.namespace.as_deref().unwrap_or("default"),
+        p.metadata.name
+    )
+}
+
+/// Key for the cluster-scoped kinds the NodeVolumeLimits listers read.
+fn cluster_store_key<T: HasMeta>(o: &T) -> String {
+    o.meta_name().to_string()
+}
+
+/// Name accessor over the cluster-scoped kinds behind [`cluster_store_key`].
+trait HasMeta {
+    fn meta_name(&self) -> &str;
+}
+
+macro_rules! has_meta {
+    ($($t:ty),*) => {$(
+        impl HasMeta for $t {
+            fn meta_name(&self) -> &str {
+                &self.metadata.name
+            }
+        }
+    )*};
+}
+has_meta!(
+    PersistentVolume,
+    StorageClass,
+    CSIDriver,
+    CSINode,
+    VolumeAttachment
+);
+
+/// Informers behind the NodeVolumeLimits plugin's listers (csi.go:
+/// `pvLister`, `pvcLister`, `scLister`, `vaLister`, `csiDriverLister`, and the
+/// `csiNodeLister` the shared informer factory provides). Upstream builds all of
+/// them from one `informerFactory` (scheduler.go `NewInformerFactory` / `New`)
+/// so `Filter` never touches the API server.
+type ClusterReflector<T> = Arc<Reflector<T, fn(&T) -> String>>;
+pub(crate) struct VolumeReflectors {
+    pub(crate) pvcs: ClusterReflector<PersistentVolumeClaim>,
+    pub(crate) pvs: ClusterReflector<PersistentVolume>,
+    pub(crate) classes: ClusterReflector<StorageClass>,
+    pub(crate) csi_drivers: ClusterReflector<CSIDriver>,
+    pub(crate) csi_nodes: ClusterReflector<CSINode>,
+    pub(crate) volume_attachments: ClusterReflector<VolumeAttachment>,
+}
+
+impl VolumeReflectors {
+    fn new(client: &Arc<ApiClient>) -> Self {
+        use rusternetes_client::reflector::ApiListWatch;
+        fn cluster<T>(client: &Arc<ApiClient>, path: &str) -> ClusterReflector<T>
+        where
+            T: HasMeta + Clone + Send + Sync + serde::de::DeserializeOwned + 'static,
+        {
+            let lw = Arc::new(ApiListWatch::new(Arc::clone(client), path));
+            Arc::new(Reflector::new(
+                lw,
+                cluster_store_key::<T> as fn(&T) -> String,
+            ))
+        }
+        Self {
+            pvcs: Arc::new(Reflector::new(
+                Arc::new(ApiListWatch::new(
+                    Arc::clone(client),
+                    "/api/v1/persistentvolumeclaims",
+                )),
+                pvc_store_key as fn(&PersistentVolumeClaim) -> String,
+            )),
+            pvs: cluster(client, "/api/v1/persistentvolumes"),
+            classes: cluster(client, "/apis/storage.k8s.io/v1/storageclasses"),
+            csi_drivers: cluster(client, "/apis/storage.k8s.io/v1/csidrivers"),
+            csi_nodes: cluster(client, "/apis/storage.k8s.io/v1/csinodes"),
+            volume_attachments: cluster(client, "/apis/storage.k8s.io/v1/volumeattachments"),
+        }
+    }
+
+    /// Start every reflector's list+watch loop (informerFactory.Start).
+    pub(crate) fn spawn(&self) {
+        macro_rules! go {
+            ($($f:ident),*) => {$({
+                let r = Arc::clone(&self.$f);
+                tokio::spawn(async move { r.run().await });
+            })*};
+        }
+        go!(
+            pvcs,
+            pvs,
+            classes,
+            csi_drivers,
+            csi_nodes,
+            volume_attachments
+        );
+    }
+}
+
 /// A reflector keyed by a plain function pointer (no captured state), shared
 /// behind an `Arc` so the run loops and the read paths reference the same store.
 type PodReflector = Arc<Reflector<Pod, fn(&Pod) -> String>>;
@@ -131,6 +229,8 @@ pub struct ApiBackend {
     /// collapsing pod priorities to 0 and breaking preemption ordering. A
     /// local informer store is always complete and current.
     pub(crate) priority_classes: PriorityClassReflector,
+    /// Listers for the NodeVolumeLimits plugin (#3794).
+    pub(crate) volumes: VolumeReflectors,
 }
 
 impl ApiBackend {
@@ -154,11 +254,13 @@ impl ApiBackend {
             pc_lw,
             priority_class_store_key as fn(&PriorityClass) -> String,
         ));
+        let volumes = VolumeReflectors::new(&client);
         Self {
             client,
             pods,
             nodes,
             priority_classes,
+            volumes,
         }
     }
 
@@ -295,6 +397,8 @@ impl<S: Storage + Send + Sync + 'static> DataPlane<S> {
     /// Cluster-wide listers the NodeVolumeLimits plugin reads (`csi.go`
     /// `pvLister`, `pvcLister`, `scLister`, `vaLister`, `csiDriverLister` and
     /// the shared CSINode lister). Only called for pods that pass its PreFilter.
+    /// API mode reads the informer stores (no per-cycle LIST, #3794); storage
+    /// mode is an in-process list.
     pub async fn list_node_volume_limits_snapshot(&self) -> Result<NodeVolumeLimitsSnapshot> {
         match self {
             DataPlane::Storage(s) => {
@@ -311,32 +415,14 @@ impl<S: Storage + Send + Sync + 'static> DataPlane<S> {
                 })
             }
             DataPlane::Api(a) => {
-                let c = &a.client;
+                let v = &a.volumes;
                 Ok(NodeVolumeLimitsSnapshot {
-                    pvcs: c
-                        .get_list("/api/v1/persistentvolumeclaims")
-                        .await
-                        .map_err(get_err_to_common)?,
-                    pvs: c
-                        .get_list("/api/v1/persistentvolumes")
-                        .await
-                        .map_err(get_err_to_common)?,
-                    classes: c
-                        .get_list("/apis/storage.k8s.io/v1/storageclasses")
-                        .await
-                        .map_err(get_err_to_common)?,
-                    csi_drivers: c
-                        .get_list("/apis/storage.k8s.io/v1/csidrivers")
-                        .await
-                        .map_err(get_err_to_common)?,
-                    csi_nodes: c
-                        .get_list("/apis/storage.k8s.io/v1/csinodes")
-                        .await
-                        .map_err(get_err_to_common)?,
-                    volume_attachments: c
-                        .get_list("/apis/storage.k8s.io/v1/volumeattachments")
-                        .await
-                        .map_err(get_err_to_common)?,
+                    pvcs: v.pvcs.store().items(),
+                    pvs: v.pvs.store().items(),
+                    classes: v.classes.store().items(),
+                    csi_drivers: v.csi_drivers.store().items(),
+                    csi_nodes: v.csi_nodes.store().items(),
+                    volume_attachments: v.volume_attachments.store().items(),
                 })
             }
         }
