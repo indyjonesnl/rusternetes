@@ -225,6 +225,34 @@ pub trait Storage: Send + Sync {
         patch_via_update(self, key, patch).await
     }
 
+    /// [`Storage::patch_strategic_merge`] guarded by [`Preconditions`]: the
+    /// patch only lands if the object CURRENTLY stored has the given UID
+    /// and/or resourceVersion. This is `GuaranteedUpdate(..., preconditions,
+    /// tryUpdate)` (`staging/src/k8s.io/apiserver/pkg/storage/etcd3/store.go:463`),
+    /// which runs `preconditions.Check` against the object it is about to
+    /// replace on EVERY attempt of its CAS loop (`:500-517`), so a delete +
+    /// recreate between the caller's read and the write is rejected rather than
+    /// patched. A failed precondition is `Error::Conflict` (409), as for
+    /// [`Storage::delete_with_preconditions`].
+    ///
+    /// Upstream clients express the UID precondition by putting
+    /// `metadata.uid` in the patch body (`applyv1.Secret(..).WithUID(uid)`,
+    /// `pkg/controller/serviceaccount/legacy_serviceaccount_token_cleaner.go:190-198`);
+    /// the registry turns it into a storage precondition
+    /// (`registry/generic/registry/store.go:626-632`). `ApiStorage` does the
+    /// same. Direct backends run the check inside the CAS retry loop.
+    async fn patch_strategic_merge_with_preconditions<T>(
+        &self,
+        key: &str,
+        patch: &serde_json::Value,
+        preconditions: &Preconditions,
+    ) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        patch_via_update_with_preconditions(self, key, patch, Some(preconditions)).await
+    }
+
     /// Server-side apply `apply_config` as `field_manager`: the client-go
     /// `Apply(ctx, applyConfig, metav1.ApplyOptions{FieldManager, Force})`
     /// verb (e.g. `ClusterRoles().Apply` at
@@ -745,9 +773,31 @@ where
     S: Storage + ?Sized,
     T: Serialize + DeserializeOwned + Send + Sync,
 {
+    patch_via_update_with_preconditions(storage, key, patch, None).await
+}
+
+/// Body of the default [`Storage::patch_strategic_merge_with_preconditions`]:
+/// `GuaranteedUpdate`'s loop (`etcd3/store.go:463-540`). Each attempt reads the
+/// current object, checks `preconditions` against it (a failure is returned
+/// as-is: the data is already current, `:500-505`), applies the patch and writes
+/// with the read resourceVersion; a CAS [`Error::Conflict`] from the write
+/// re-reads and re-checks.
+async fn patch_via_update_with_preconditions<S, T>(
+    storage: &S,
+    key: &str,
+    patch: &serde_json::Value,
+    preconditions: Option<&Preconditions>,
+) -> Result<T>
+where
+    S: Storage + ?Sized,
+    T: Serialize + DeserializeOwned + Send + Sync,
+{
     const MAX_ATTEMPTS: usize = 8;
     for attempt in 0..MAX_ATTEMPTS {
         let mut current: serde_json::Value = storage.get(key).await?;
+        if let Some(p) = preconditions {
+            p.check(key, &current)?;
+        }
         json_merge_patch(&mut current, patch);
         match storage.update::<serde_json::Value>(key, &current).await {
             Ok(updated) => return serde_json::from_value(updated).map_err(Error::Serialization),
@@ -999,6 +1049,20 @@ impl<S: Storage> Storage for std::sync::Arc<S> {
         T: Serialize + DeserializeOwned + Send + Sync,
     {
         (**self).patch_strategic_merge(key, patch).await
+    }
+
+    async fn patch_strategic_merge_with_preconditions<T>(
+        &self,
+        key: &str,
+        patch: &serde_json::Value,
+        preconditions: &Preconditions,
+    ) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        (**self)
+            .patch_strategic_merge_with_preconditions(key, patch, preconditions)
+            .await
     }
 
     async fn apply<T>(
@@ -1562,6 +1626,27 @@ impl Storage for StorageBackend {
             #[cfg(feature = "api-client")]
             StorageBackend::Api(s) => Storage::patch_strategic_merge(s, key, patch).await,
             _ => patch_via_update(self, key, patch).await,
+        }
+    }
+
+    /// `Api` sends the preconditions in the PATCH body; every other variant
+    /// checks them inside the default CAS loop.
+    async fn patch_strategic_merge_with_preconditions<T>(
+        &self,
+        key: &str,
+        patch: &serde_json::Value,
+        preconditions: &Preconditions,
+    ) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        match self {
+            #[cfg(feature = "api-client")]
+            StorageBackend::Api(s) => {
+                Storage::patch_strategic_merge_with_preconditions(s, key, patch, preconditions)
+                    .await
+            }
+            _ => patch_via_update_with_preconditions(self, key, patch, Some(preconditions)).await,
         }
     }
 
