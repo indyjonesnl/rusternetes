@@ -73,6 +73,7 @@ pub mod ttl_controller;
 #[cfg(test)]
 pub mod uid_precondition_double;
 #[allow(dead_code)]
+pub mod vac_protection;
 pub mod volume_expansion;
 pub mod volume_snapshot;
 pub mod vpa;
