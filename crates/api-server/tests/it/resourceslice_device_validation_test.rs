@@ -190,3 +190,50 @@ async fn a_well_formed_resource_slice_is_written() {
         "a well-formed ResourceSlice must be written: {status} {body}"
     );
 }
+
+/// A zero `validRange.step` answers 500, as upstream does (#3250).
+///
+/// `CapacityRequestPolicyRange.Step` has no validation tag
+/// (`pkg/apis/resource/types.go:521-546`) and the imperative validation runs
+/// first (`registry/resource/resourceslice/strategy.go:63`), so
+/// `validateRequestPolicyRangeStep` evaluates `added%stepVal` with a zero
+/// divisor (`validation.go:1085`): a runtime panic that `WithPanicRecovery`
+/// turns into `500 "This request caused apiserver to panic..."`
+/// (`apiserver/pkg/server/filters/wrap.go:30-58`).
+#[tokio::test]
+#[serial_test::serial]
+async fn a_zero_range_step_panics_to_500_like_upstream() {
+    let _consumable = feature_gates::with_feature(Feature::DRAConsumableCapacity, true);
+    let api = TestApiServer::new();
+    let (status, raw, _body) = api
+        .send_raw(
+            "POST",
+            "/apis/resource.k8s.io/v1/resourceslices",
+            Some("application/json"),
+            Some(&json!({
+                "apiVersion": "resource.k8s.io/v1",
+                "kind": "ResourceSlice",
+                "metadata": { "name": "slice-zero-step" },
+                "spec": spec(json!({
+                    "devices": [{
+                        "name": "gpu-0",
+                        "allowMultipleAllocations": true,
+                        "capacity": { "mem": {
+                            "value": "10Gi",
+                            "requestPolicy": {
+                                "default": "1Gi",
+                                "validRange": { "min": "1Gi", "step": "0" }
+                            }
+                        } }
+                    }]
+                })),
+            })),
+        )
+        .await;
+    let text = String::from_utf8_lossy(&raw);
+    assert_eq!(status.as_u16(), 500, "{status} {text}");
+    assert_eq!(
+        text,
+        "This request caused apiserver to panic. Look in the logs for details.\n"
+    );
+}
