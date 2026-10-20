@@ -18,6 +18,7 @@ pub mod heap;
 pub mod hints;
 pub mod preemption_hints;
 pub mod scheduling_queue;
+pub mod volume_hints;
 
 pub use events::*;
 pub use scheduling_queue::*;
