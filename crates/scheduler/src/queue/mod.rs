@@ -12,9 +12,11 @@
 //! - [`hints`]: per-plugin `EventsToRegister` and `isSchedulableAfter*`
 //!   functions, and `buildQueueingHintMap`.
 
+pub mod csi_hints;
 pub mod events;
 pub mod heap;
 pub mod hints;
+pub mod preemption_hints;
 pub mod scheduling_queue;
 
 pub use events::*;

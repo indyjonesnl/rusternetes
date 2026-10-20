@@ -206,10 +206,25 @@ pub fn events_to_register(plugin_name: &str, profile: &Profile) -> Vec<ClusterEv
         ],
         // nodevolumelimits/csi.go:90-109
         names::NODE_VOLUME_LIMITS => vec![
-            ev(R::CsiNode, A::ADD | A::UPDATE),
-            ev(R::Pod, A::DELETE),
-            ev(R::PersistentVolumeClaim, A::ADD),
-            ev(R::VolumeAttachment, A::DELETE),
+            // No hint on CSINode/Add intentionally: any new CSINode could make
+            // pods rejected by CSI volumes schedulable (csi.go:90-91).
+            ev(R::CsiNode, A::ADD),
+            ClusterEventWithHint::with_hint(
+                ClusterEvent::new(R::CsiNode, A::UPDATE),
+                Arc::new(super::csi_hints::is_schedulable_after_csi_node_updated),
+            ),
+            ClusterEventWithHint::with_hint(
+                ClusterEvent::new(R::Pod, A::DELETE),
+                Arc::new(super::csi_hints::is_schedulable_after_pod_deleted),
+            ),
+            ClusterEventWithHint::with_hint(
+                ClusterEvent::new(R::PersistentVolumeClaim, A::ADD),
+                Arc::new(super::csi_hints::is_schedulable_after_pvc_added),
+            ),
+            ClusterEventWithHint::with_hint(
+                ClusterEvent::new(R::VolumeAttachment, A::DELETE),
+                Arc::new(super::csi_hints::is_schedulable_after_volume_attachment_deleted),
+            ),
         ],
         // dynamicresources/dynamicresources.go:262-304
         names::DYNAMIC_RESOURCES => vec![
@@ -225,7 +240,10 @@ pub fn events_to_register(plugin_name: &str, profile: &Profile) -> Vec<ClusterEv
         // schedulinggates/scheduling_gates.go:60-67
         names::SCHEDULING_GATES => vec![ev(R::Pod, A::UPDATE_POD_SCHEDULING_GATES_ELIMINATED)],
         // defaultpreemption/default_preemption.go:107-116 (async preemption on)
-        names::DEFAULT_PREEMPTION => vec![ev(R::Pod, A::DELETE)],
+        names::DEFAULT_PREEMPTION => vec![ClusterEventWithHint::with_hint(
+            ClusterEvent::new(R::Pod, A::DELETE),
+            Arc::new(super::preemption_hints::is_pod_schedulable_after_pod_deletion),
+        )],
         // Plugins without EnqueueExtensions (score-only, bind, etc.).
         _ => unroll_wild_card_resource(),
     }
