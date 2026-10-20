@@ -224,6 +224,12 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
             .collect();
         let app = server::install_statusz(app, registered);
         let app = server_auth::install_auth_filter(app, Some(auth));
+        // server.go:1176 `ServeHTTP`: request metrics outside the auth filter.
+        let app = server::install_metrics_filter(
+            app,
+            server::MetricsBuckets::new_server(server::server_bucket_options()),
+            true,
+        );
         // Serve the kubelet API port over HTTPS (#1644) — a Kubernetes
         // api-server proxies logs/exec/attach/metrics via `https://…:10250`.
         let addr: std::net::SocketAddr = metrics_addr.parse().expect("valid metrics addr");

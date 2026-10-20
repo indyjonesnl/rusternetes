@@ -172,9 +172,8 @@ pub fn install_statusz(router: Router, registered_paths: Vec<String>) -> Router 
 /// (pkg/kubelet/server/server.go:125-126, initialised at :308-309) with
 /// `addMetricsBucketMatcher` (:402), `getMetricBucket` (:407) and
 /// `getMetricMethodBucket` (:415), plus the bucket registrations of
-/// `NewServer`'s installers ([`MetricsBuckets::new_server`]). Not consumed yet: the per-request HTTP
-/// metrics instrumentation that reads the bucket is not wired (#3476).
-#[allow(dead_code)]
+/// `NewServer`'s installers ([`MetricsBuckets::new_server`]). Read per request
+/// by [`install_metrics_filter`] (`Server.ServeHTTP`, :1176-1200).
 #[derive(Debug, Clone)]
 pub struct MetricsBuckets {
     buckets: std::collections::HashSet<String>,
@@ -182,7 +181,6 @@ pub struct MetricsBuckets {
 }
 
 /// The inputs of `NewServer` that decide which bucket matchers are added.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ServerBucketOptions {
     /// `kubeCfg.EnableDebuggingHandlers`.
@@ -195,7 +193,6 @@ pub struct ServerBucketOptions {
     pub statusz_enabled: bool,
 }
 
-#[allow(dead_code)]
 impl MetricsBuckets {
     /// `sets.New[string]()` plus the method set
     /// `"OPTIONS", "GET", "HEAD", "POST", "PUT", "DELETE", "TRACE", "CONNECT"`.
@@ -349,14 +346,12 @@ const LONG_RUNNING_REQUEST_PATHS: [&str; 4] = ["exec", "attach", "portforward", 
 
 /// `isLongRunningRequest` (server.go:1160-1163): fed the bucketed path by
 /// `ServeHTTP` (:1187-1189).
-#[allow(dead_code)]
 pub fn is_long_running_request(path: &str) -> bool {
     LONG_RUNNING_REQUEST_PATHS.contains(&path)
 }
 
 /// `getURLRootPath` (server.go:1139-1150): the first path segment, or
 /// `metrics/<sub>` for a `/metrics/...` path.
-#[allow(dead_code)]
 fn get_url_root_path(path: &str) -> String {
     let trimmed = path.strip_prefix('/').unwrap_or(path);
     let mut parts = trimmed.splitn(3, '/');
@@ -367,6 +362,101 @@ fn get_url_root_path(path: &str) -> String {
         }
     }
     first.to_string()
+}
+
+/// `Server.ServeHTTP`'s request instrumentation (server.go:1176-1200), as the
+/// outermost layer of the kubelet API router: upstream's `ServeHTTP` wraps the
+/// whole restful container, so requests the auth filter rejects are counted too.
+#[derive(Debug)]
+struct MetricsFilterState {
+    buckets: MetricsBuckets,
+    /// `"readonly"` when `s.auth == nil`, else `"readwrite"` (:1179-1185).
+    server_type: &'static str,
+}
+
+/// `defer HTTPInflightRequests.WithLabelValues(...).Dec()` (:1194): a guard so
+/// the decrement also runs when the request future is dropped (client gone).
+struct InflightGuard(prometheus::Gauge);
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.dec();
+    }
+}
+
+async fn metrics_filter(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<MetricsFilterState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use crate::server_metrics::{HTTP_INFLIGHT_REQUESTS, HTTP_REQUESTS, HTTP_REQUESTS_DURATION};
+    let method = state
+        .buckets
+        .get_metric_method_bucket(req.method().as_str());
+    let path = state.buckets.get_metric_bucket(req.uri().path());
+    let long_running = is_long_running_request(&path).to_string();
+    let labels = [
+        method.as_str(),
+        path.as_str(),
+        state.server_type,
+        long_running.as_str(),
+    ];
+
+    HTTP_REQUESTS.with_label_values(&labels).inc();
+
+    let inflight = HTTP_INFLIGHT_REQUESTS.with_label_values(&labels);
+    inflight.inc();
+    let _inflight = InflightGuard(inflight);
+
+    // server.go:1196-1197:
+    //   startTime := time.Now()
+    //   defer HTTPRequestsDuration.WithLabelValues(...).Observe(SinceInSeconds(startTime))
+    // Go evaluates a deferred call's arguments at the `defer` statement, so
+    // upstream observes the (near-zero) time elapsed since `startTime` right
+    // here, not the request duration. Ported as-is rather than "fixed", so the
+    // series matches upstream's.
+    let start = std::time::Instant::now();
+    HTTP_REQUESTS_DURATION
+        .with_label_values(&labels)
+        .observe(start.elapsed().as_secs_f64());
+
+    next.run(req).await
+}
+
+/// Wrap `router` in `Server.ServeHTTP`'s HTTP request metrics (server.go:1176).
+/// `auth_enabled` is `s.auth != nil` and picks the `server_type` label. Must be
+/// applied last (outside [`crate::server_auth::install_auth_filter`]).
+pub fn install_metrics_filter(
+    router: Router,
+    buckets: MetricsBuckets,
+    auth_enabled: bool,
+) -> Router {
+    crate::server_metrics::register();
+    let state = std::sync::Arc::new(MetricsFilterState {
+        buckets,
+        server_type: if auth_enabled {
+            "readwrite"
+        } else {
+            "readonly"
+        },
+    });
+    router.layer(axum::middleware::from_fn_with_state(state, metrics_filter))
+}
+
+/// The `NewServer` bucket inputs for this kubelet's installed handlers:
+/// debugging handlers are always on (`EnableDebuggingHandlers` default true),
+/// `ComponentStatusz` follows its gate, and `flagz`/`checkpoint` are off
+/// because this kubelet installs neither handler (no flagz registry,
+/// server.go:602-607; no `CheckpointContainer`).
+pub fn server_bucket_options() -> ServerBucketOptions {
+    ServerBucketOptions {
+        enable_debugging_handlers: true,
+        flagz_enabled: false,
+        checkpoint_enabled: false,
+        statusz_enabled: rusternetes_common::feature_gates::enabled(
+            rusternetes_common::feature_gates::Feature::ComponentStatusz,
+        ),
+    }
 }
 
 /// Paths [`read_only_router`] registers (the route templates, as go-restful's
@@ -776,6 +866,107 @@ mod statusz_tests {
         assert!(!is_long_running_request("portForward"));
         for p in ["healthz", "pods", "other", "logs"] {
             assert!(!is_long_running_request(p), "{p}");
+        }
+    }
+
+    // server.go:1176-1200 `ServeHTTP`: the request counter, the in-flight
+    // gauge and the duration histogram carry (method, bucketed path,
+    // server_type, long_running); unknown paths and verbs collapse to `other`.
+    #[tokio::test]
+    async fn serve_http_records_bucketed_request_metrics() {
+        use crate::server_metrics::{
+            HTTP_INFLIGHT_REQUESTS, HTTP_REQUESTS, HTTP_REQUESTS_DURATION,
+        };
+        let app = Router::new()
+            .route("/healthz", axum::routing::get(|| async { "ok" }))
+            .route("/exec/:ns/:pod/:c", axum::routing::get(|| async { "x" }));
+        let app = install_metrics_filter(
+            app,
+            MetricsBuckets::new_server(ServerBucketOptions {
+                enable_debugging_handlers: true,
+                ..Default::default()
+            }),
+            true,
+        );
+        for (method, uri) in [
+            ("GET", "/healthz/syncloop"),
+            ("GET", "/healthz"),
+            ("GET", "/exec/ns/pod/c"),
+            ("GET", "/junk"),
+            ("WEIRD", "/healthz"),
+        ] {
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            app.clone().oneshot(req).await.unwrap();
+        }
+        let count = |m: &str, p: &str, lr: &str| {
+            HTTP_REQUESTS
+                .with_label_values(&[m, p, "readwrite", lr])
+                .get() as u64
+        };
+        assert_eq!(count("GET", "healthz", "false"), 2);
+        assert_eq!(count("GET", "exec", "true"), 1);
+        assert_eq!(count("GET", "other", "false"), 1);
+        assert_eq!(count("other", "healthz", "false"), 1);
+        // Every request has finished: the in-flight gauge is back to zero.
+        assert_eq!(
+            HTTP_INFLIGHT_REQUESTS
+                .with_label_values(&["GET", "healthz", "readwrite", "false"])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            HTTP_REQUESTS_DURATION
+                .with_label_values(&["GET", "exec", "readwrite", "true"])
+                .get_sample_count(),
+            1
+        );
+        // Registered into the process-global registry `/metrics` serves.
+        let body = rusternetes_common::observability::MetricsRegistry::new().gather();
+        assert!(body.contains("# HELP kubelet_http_requests_total [ALPHA] Number of the http requests received since the server started"));
+        assert!(body.contains("kubelet_http_requests_duration_seconds_count"));
+        assert!(body.contains("# TYPE kubelet_http_inflight_requests gauge"));
+    }
+
+    // server.go:1179-1185: no auth -> `readonly`.
+    #[tokio::test]
+    async fn serve_http_server_type_is_readonly_without_auth() {
+        use crate::server_metrics::HTTP_REQUESTS;
+        let app = install_metrics_filter(
+            Router::new().route("/pods", axum::routing::get(|| async { "p" })),
+            MetricsBuckets::new(),
+            false,
+        );
+        let req = Request::builder().uri("/pods").body(Body::empty()).unwrap();
+        app.oneshot(req).await.unwrap();
+        // `new()` has no matchers, so `/pods` is `other`.
+        assert_eq!(
+            HTTP_REQUESTS
+                .with_label_values(&["GET", "other", "readonly", "false"])
+                .get() as u64,
+            1
+        );
+    }
+
+    // server_test.go:TestTrimURLPath (`getURLRootPath`).
+    #[test]
+    fn trim_url_path() {
+        for (path, want) in [
+            ("", ""),
+            ("//", ""),
+            ("/pods", "pods"),
+            ("pods", "pods"),
+            ("pods/", "pods"),
+            ("good/", "good"),
+            ("pods/probes", "pods"),
+            ("metrics", "metrics"),
+            ("metrics/resource", "metrics/resource"),
+            ("metrics/hello", "metrics/hello"),
+        ] {
+            assert_eq!(get_url_root_path(path), want, "path is: {path}");
         }
     }
 }
