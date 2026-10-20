@@ -28,12 +28,16 @@
 //! DEVIATIONS, deliberate: (1) the field sets come from the kind's OpenAPI /
 //! structural schema ([`schema`], #2734) where the caller supplies one
 //! ([`FieldManager::with_schema`]), and from [`fieldset`]'s name-driven table
-//! for a kind with none; (2) one version per kind is
-//! served here, so upstream's per-manager `versionConverter` is the identity.
+//! for a kind with none; (2) the per-manager `versionConverter`
+//! ([`versionconverter`], #2736) is used when the caller supplies a
+//! [`Converter`] ([`FieldManager::with_converter`]); a kind served at one
+//! version has none and every manager's set is compared at the served
+//! version, as upstream's identity conversion does.
 
 pub mod apply;
 pub mod fieldset;
 pub mod schema;
+pub mod versionconverter;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -44,6 +48,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use self::fieldset::{field_path, Fields, Set};
+use self::versionconverter::{Converter, UpdateFailure};
 
 /// `map[fieldpath.APIVersion]*fieldpath.Set`: what a strategy resets on write,
 /// per `group/version` (`rest.ResetFieldsStrategy.GetResetFields`,
@@ -250,6 +255,8 @@ pub struct FieldManager {
     reset_fields: ResetFields,
     /// The schema of the kind (`typeconverter`), when this tree has one.
     schema: Option<Arc<schema::Type>>,
+    /// `merge.Updater.Converter`: converts the objects to a manager's version.
+    converter: Option<Arc<dyn Converter>>,
 }
 
 impl FieldManager {
@@ -264,6 +271,7 @@ impl FieldManager {
             subresource: subresource.unwrap_or_default().to_string(),
             reset_fields,
             schema: None,
+            converter: None,
         }
     }
 
@@ -275,6 +283,13 @@ impl FieldManager {
         self
     }
 
+    /// The `Converter` of `merge.Updater` (`newVersionConverter` /
+    /// `newCRDVersionConverter`), for a kind served at several versions.
+    pub fn with_converter(mut self, converter: Option<Arc<dyn Converter>>) -> Self {
+        self.converter = converter;
+        self
+    }
+
     /// `typeconverter.ObjectToTyped(obj).ToFieldSet()`.
     pub(crate) fn fields_of(&self, obj: &Value) -> Fields {
         match &self.schema {
@@ -283,7 +298,9 @@ impl FieldManager {
         }
     }
 
-    /// The managers below `FieldManager`, outermost first.
+    /// The managers below `FieldManager`, outermost first. Fails when a
+    /// manager's version cannot be converted (`Updater.update`'s
+    /// `failed to convert old object`), which `UpdateNoErrors` absorbs.
     pub fn update_managed(
         &self,
         live: &Value,
@@ -291,12 +308,12 @@ impl FieldManager {
         mut managed: Managed,
         manager: &str,
         live_is_new: bool,
-    ) -> Managed {
+    ) -> Result<Managed, String> {
         // skipNonAppliedManager.Update (skipnonapplied.go): with no entries,
         // an update is not tracked; a create is, with
         // DefaultTrackOnCreateProbability = 1.
         if managed.fields.is_empty() && !live_is_new {
-            return managed;
+            return Ok(managed);
         }
 
         // buildManagerInfoManager.Update (buildmanagerinfo.go).
@@ -315,23 +332,18 @@ impl FieldManager {
         // managedFieldsUpdater.Update (managedfieldsupdater.go:36-56), over
         // stripMetaManager.Update and structuredMergeManager.Update, which is
         // `merge.Updater.Update` (update.go:167-204) with the name "current-operation"
-        // as the manager.
+        // as the manager, so no entry is skipped.
         let exclude = self.reset_set();
-        let mut comparison = self.fields_of(live).compare(&self.fields_of(new));
-        if !exclude.is_empty() {
-            comparison = comparison.exclude(&exclude);
-        }
-        let changed = comparison.modified.union(&comparison.added);
         // update.go:112-139: other managers lose what this operation changed
-        // (force is true for an update) and what it removed.
-        for vs in managed.fields.values_mut() {
-            let conflicts = vs.set.intersection(&changed);
-            vs.set = vs
-                .set
-                .difference(&conflicts)
-                .difference(&comparison.removed);
-        }
-        managed.fields.retain(|_, vs| !vs.set.is_empty());
+        // (force is true for an update) and what it removed, each compared at
+        // its own version.
+        let comparison = self
+            .update_versions(live, new, &mut managed, None, true)
+            .map_err(|e| match e {
+                UpdateFailure::Convert(m) => m,
+                UpdateFailure::Conflicts(_) => "unexpected conflicts on update".to_string(),
+            })?;
+        let changed = comparison.modified.union(&comparison.added);
 
         let mut current = changed;
         if !exclude.is_empty() {
@@ -361,13 +373,18 @@ impl FieldManager {
 
         // capManagersManager.Update.
         cap_update_managers(&mut managed, DEFAULT_MAX_UPDATE_MANAGERS);
-        managed
+        Ok(managed)
     }
 
     /// The strategy's reset fields for this version, as a set.
     fn reset_set(&self) -> Set {
+        self.reset_set_for(&self.api_version)
+    }
+
+    /// `GetResetFields()[version]` as a set.
+    pub(crate) fn reset_set_for(&self, version: &str) -> Set {
         let mut set = Set::new();
-        for path in self.reset_fields.for_version(&self.api_version) {
+        for path in self.reset_fields.for_version(version) {
             let names: Vec<&str> = path.iter().map(String::as_str).collect();
             set.insert(&field_path(&names));
         }

@@ -218,6 +218,16 @@ pub trait RestUpdateStrategy<T>: NamespaceScopedStrategy + Send + Sync {
     ) -> Option<std::sync::Arc<rusternetes_common::fieldmanager::schema::Type>> {
         None
     }
+
+    /// The kind's version `Converter` (`NewDefaultCRDFieldManager`'s
+    /// `objectConverter` + hub, #2736): a custom resource served at several
+    /// versions. `None` for a kind with one served version.
+    fn field_converter(
+        &self,
+    ) -> Option<std::sync::Arc<dyn rusternetes_common::fieldmanager::versionconverter::Converter>>
+    {
+        None
+    }
 }
 
 /// `rest.GarbageCollectionPolicy` (rest/delete.go:40-47).
@@ -784,6 +794,16 @@ pub trait RestStorage<T: Object>: Send + Sync {
     fn field_schema(
         &self,
     ) -> Option<std::sync::Arc<rusternetes_common::fieldmanager::schema::Type>> {
+        None
+    }
+
+    /// The kind's version `Converter` (`NewDefaultCRDFieldManager`'s
+    /// `objectConverter` + hub, #2736): a custom resource served at several
+    /// versions. `None` for a kind with one served version.
+    fn field_converter(
+        &self,
+    ) -> Option<std::sync::Arc<dyn rusternetes_common::fieldmanager::versionconverter::Converter>>
+    {
         None
     }
 
