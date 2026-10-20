@@ -144,6 +144,8 @@ async fn mapper_paths_and_persisted_volume_data() {
         volume: &v,
         persistent_volume: Some(&pv),
         read_only: false,
+        migrated: false,
+        inline_volume_spec_for_csi_migration: false,
     };
     let bp = f.plugin.as_block_volume_plugin().unwrap();
     let mapper = bp.new_block_volume_mapper(&spec, &pod).unwrap();
@@ -192,6 +194,8 @@ async fn new_block_volume_mapper_rejects_a_non_csi_spec() {
         volume: &v,
         persistent_volume: None,
         read_only: false,
+        migrated: false,
+        inline_volume_spec_for_csi_migration: false,
     };
     let bp = f.plugin.as_block_volume_plugin().unwrap();
     assert!(bp.new_block_volume_mapper(&spec, &pod()).is_err());
@@ -206,6 +210,8 @@ async fn construct_block_volume_spec_rebuilds_a_block_pv() {
         volume: &v,
         persistent_volume: Some(&pv),
         read_only: false,
+        migrated: false,
+        inline_volume_spec_for_csi_migration: false,
     };
     let bp = f.plugin.as_block_volume_plugin().unwrap();
     bp.new_block_volume_mapper(&spec, &pod).unwrap();
@@ -252,6 +258,8 @@ async fn set_up_device_stages_a_block_volume() {
         volume: &v,
         persistent_volume: Some(&pv),
         read_only: false,
+        migrated: false,
+        inline_volume_spec_for_csi_migration: false,
     };
     let bp = f.plugin.as_block_volume_plugin().unwrap();
     let mapper = bp.new_block_volume_mapper(&spec, &pod).unwrap();
@@ -286,6 +294,8 @@ async fn set_up_device_without_stage_unstage_skips_staging() {
         volume: &v,
         persistent_volume: Some(&pv),
         read_only: false,
+        migrated: false,
+        inline_volume_spec_for_csi_migration: false,
     };
     let mapper = f
         .plugin
@@ -312,6 +322,8 @@ async fn set_up_device_missing_attachment_is_transient() {
         volume: &v,
         persistent_volume: Some(&pv),
         read_only: false,
+        migrated: false,
+        inline_volume_spec_for_csi_migration: false,
     };
     let mapper = f
         .plugin
@@ -356,6 +368,8 @@ async fn map_pod_device_publishes_a_block_volume() {
         volume: &v,
         persistent_volume: Some(&pv),
         read_only: true,
+        migrated: false,
+        inline_volume_spec_for_csi_migration: false,
     };
     let mapper = f
         .plugin
@@ -402,6 +416,8 @@ async fn unmapper_unpublishes_unstages_and_cleans_up() {
         volume: &v,
         persistent_volume: Some(&pv),
         read_only: false,
+        migrated: false,
+        inline_volume_spec_for_csi_migration: false,
     };
     let bp = f.plugin.as_block_volume_plugin().unwrap();
     let mapper = bp.new_block_volume_mapper(&spec, &pod).unwrap();
@@ -450,6 +466,8 @@ async fn tear_down_device_skips_unstage_when_staging_path_is_gone() {
         volume: &v,
         persistent_volume: Some(&pv),
         read_only: false,
+        migrated: false,
+        inline_volume_spec_for_csi_migration: false,
     };
     let bp = f.plugin.as_block_volume_plugin().unwrap();
     bp.new_block_volume_mapper(&spec, &pod).unwrap();
@@ -491,6 +509,8 @@ async fn mapper_metrics_come_from_node_get_volume_stats() {
         volume: &v,
         persistent_volume: Some(&pv),
         read_only: false,
+        migrated: false,
+        inline_volume_spec_for_csi_migration: false,
     };
     let bp = f.plugin.as_block_volume_plugin().unwrap();
     let mapper = bp.new_block_volume_mapper(&spec, &pod).unwrap();
