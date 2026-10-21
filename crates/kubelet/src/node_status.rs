@@ -10,7 +10,8 @@
 //! computed every `nodeStatusUpdateFrequency` but only written when it
 //! changed or `nodeStatusReportFrequency` elapsed.
 
-use rusternetes_common::resources::{Node, NodeCondition, NodeStatus};
+use crate::image_gc::Image;
+use rusternetes_common::resources::{ContainerImage, Node, NodeCondition, NodeStatus};
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
@@ -113,6 +114,53 @@ pub fn node_status_has_changed(
         normalize(serde_json::to_value(&s).unwrap_or(Value::Null))
     };
     strip(o) != strip(c)
+}
+
+/// `MaxNamesPerImageInNodeStatus` (pkg/kubelet/nodestatus/setters.go:53).
+pub const MAX_NAMES_PER_IMAGE_IN_NODE_STATUS: usize = 5;
+
+/// `nodestatus.Images` (pkg/kubelet/nodestatus/setters.go:385). `image_list` is
+/// `Kubelet.imageManager.GetImageList`'s result, already sorted by size
+/// descending, so only truncation is needed. On error the node's image list is
+/// reset to empty and the error is returned.
+pub fn set_images(
+    node: &mut Node,
+    node_status_max_images: i32,
+    image_list: anyhow::Result<Vec<Image>>,
+) -> Result<(), String> {
+    let Some(status) = node.status.as_mut() else {
+        return Ok(());
+    };
+    let mut container_images = match image_list {
+        Ok(l) => l,
+        Err(err) => {
+            status.images = None;
+            return Err(format!("error getting image list: {err}"));
+        }
+    };
+    // we expect the list to be sorted, so we just need to truncate
+    if node_status_max_images > -1 && (node_status_max_images as usize) < container_images.len() {
+        container_images.truncate(node_status_max_images as usize);
+    }
+    let images: Vec<ContainerImage> = container_images
+        .into_iter()
+        .map(|image| {
+            let mut names: Vec<String> = image.repo_digests;
+            names.extend(image.repo_tags);
+            // Report up to MaxNamesPerImageInNodeStatus names per image.
+            names.truncate(MAX_NAMES_PER_IMAGE_IN_NODE_STATUS);
+            ContainerImage {
+                names: if names.is_empty() { None } else { Some(names) },
+                size_bytes: Some(image.size),
+            }
+        })
+        .collect();
+    status.images = if images.is_empty() {
+        None
+    } else {
+        Some(images)
+    };
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -376,6 +424,149 @@ pub fn prepare_patch_for_node_status(old: &Node, new: &Node) -> Result<Value, St
 
 #[cfg(test)]
 mod tests {
+    // Ports pkg/kubelet/nodestatus/setters_test.go TestImages.
+    fn make_image_list(n_images: usize, n_names: usize, min: i64, max: i64) -> Vec<Image> {
+        (0..n_images)
+            .map(|i| Image {
+                id: format!("img-{i}"),
+                size: min + (max - min) * i as i64 / n_images.max(1) as i64,
+                repo_tags: (0..n_names).map(|j| format!("tag-{i}-{j}")).collect(),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    fn sorted(mut l: Vec<Image>) -> Vec<Image> {
+        l.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| b.id.cmp(&a.id)));
+        l
+    }
+
+    fn node_with_status() -> Node {
+        let mut n = Node::new("n");
+        n.status = Some(NodeStatus::default());
+        n
+    }
+
+    fn expected(list: &[Image], max: i32) -> Vec<ContainerImage> {
+        let n = if max > -1 {
+            (max as usize).min(list.len())
+        } else {
+            list.len()
+        };
+        list[..n]
+            .iter()
+            .map(|i| {
+                let mut names = i.repo_digests.clone();
+                names.extend(i.repo_tags.clone());
+                names.truncate(MAX_NAMES_PER_IMAGE_IN_NODE_STATUS);
+                ContainerImage {
+                    names: if names.is_empty() { None } else { Some(names) },
+                    size_bytes: Some(i.size),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn images_max_images_enforced() {
+        let list = sorted(make_image_list(2, 1, 23 << 20, 1000 << 20));
+        let mut node = node_with_status();
+        set_images(&mut node, 1, Ok(list.clone())).unwrap();
+        assert_eq!(
+            serde_json::to_value(node.status.unwrap().images.unwrap()).unwrap(),
+            serde_json::to_value(expected(&list, 1)).unwrap()
+        );
+    }
+
+    #[test]
+    fn images_no_cap_for_minus_one() {
+        let list = sorted(make_image_list(2, 1, 23 << 20, 1000 << 20));
+        let mut node = node_with_status();
+        set_images(&mut node, -1, Ok(list.clone())).unwrap();
+        assert_eq!(
+            serde_json::to_value(node.status.unwrap().images.unwrap()).unwrap(),
+            serde_json::to_value(expected(&list, -1)).unwrap()
+        );
+    }
+
+    #[test]
+    fn images_max_names_per_image_enforced() {
+        let list = make_image_list(
+            1,
+            MAX_NAMES_PER_IMAGE_IN_NODE_STATUS + 1,
+            23 << 20,
+            1000 << 20,
+        );
+        let mut node = node_with_status();
+        set_images(&mut node, -1, Ok(list)).unwrap();
+        let images = node.status.unwrap().images.unwrap();
+        assert_eq!(
+            images[0].names.as_ref().unwrap().len(),
+            MAX_NAMES_PER_IMAGE_IN_NODE_STATUS
+        );
+    }
+
+    #[test]
+    fn images_sorted_by_size_descending() {
+        // The setter trusts the list order (the image cache sorts on write).
+        let list = sorted(vec![
+            Image {
+                size: 3,
+                ..Default::default()
+            },
+            Image {
+                size: 1,
+                ..Default::default()
+            },
+            Image {
+                size: 4,
+                ..Default::default()
+            },
+            Image {
+                size: 2,
+                ..Default::default()
+            },
+        ]);
+        let mut node = node_with_status();
+        set_images(&mut node, -1, Ok(list)).unwrap();
+        let sizes: Vec<_> = node
+            .status
+            .unwrap()
+            .images
+            .unwrap()
+            .iter()
+            .map(|i| i.size_bytes.unwrap())
+            .collect();
+        assert_eq!(sizes, vec![4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn images_repo_digests_and_tags_both_show_up() {
+        let list = vec![Image {
+            repo_digests: vec!["foo".into(), "bar".into()],
+            repo_tags: vec!["baz".into(), "quux".into()],
+            ..Default::default()
+        }];
+        let mut node = node_with_status();
+        set_images(&mut node, -1, Ok(list)).unwrap();
+        assert_eq!(
+            node.status.unwrap().images.unwrap()[0]
+                .names
+                .as_ref()
+                .unwrap(),
+            &vec!["foo", "bar", "baz", "quux"]
+        );
+    }
+
+    #[test]
+    fn images_error_resets_image_list() {
+        let mut node = node_with_status();
+        set_images(&mut node, -1, Ok(make_image_list(1, 1, 1, 2))).unwrap();
+        let err = set_images(&mut node, -1, Err(anyhow::anyhow!("foo"))).unwrap_err();
+        assert_eq!(err, "error getting image list: foo");
+        assert!(node.status.unwrap().images.is_none());
+    }
+
     use super::*;
     use chrono::{DateTime, Duration as CDur, TimeZone, Utc};
 

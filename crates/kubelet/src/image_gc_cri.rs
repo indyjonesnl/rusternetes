@@ -74,6 +74,8 @@ impl ImageGcRuntime for CriImageGcRuntime {
                 size: img.size as i64,
                 runtime_handler: img.spec.map(|s| s.runtime_handler).unwrap_or_default(),
                 pinned: img.pinned,
+                repo_tags: img.repo_tags,
+                repo_digests: img.repo_digests,
             })
             .collect())
     }
