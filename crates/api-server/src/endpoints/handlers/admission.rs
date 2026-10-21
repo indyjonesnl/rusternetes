@@ -540,6 +540,11 @@ impl Admission<'_> {
                 )
                 .await?;
             }
+            // ExtendedResourceToleration registers for Create and Update;
+            // it follows EventRateLimit in `AllOrderedPlugins`.
+            if self.subresource.is_none() && plugin_enabled("ExtendedResourceToleration") {
+                crate::admission::pod_plugins::extended_resource_toleration_admit(&mut pod);
+            }
             return Ok(pod);
         }
         if *op != Operation::Create {
@@ -619,6 +624,11 @@ impl Admission<'_> {
                 storage, namespace, true, &mut pod,
             )
             .await?;
+        }
+
+        // ExtendedResourceToleration.Admit: after PodTolerationRestriction.
+        if plugin_enabled("ExtendedResourceToleration") {
+            crate::admission::pod_plugins::extended_resource_toleration_admit(&mut pod);
         }
 
         // RuntimeClass.Admit (plugin/pkg/admission/runtimeclass/admission.go):
