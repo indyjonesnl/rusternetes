@@ -15,7 +15,9 @@ use super::job_tracking::{
     push_uncounted_succeeded, remove_tracking_finalizer, uncounted_has_failed,
     uncounted_has_succeeded, FinalizerExpectations, JOB_TRACKING_FINALIZER,
 };
-use super::replicationcontroller::slow_start_batches_capped;
+use super::replicationcontroller::{
+    generate_pod_name, slow_start_batches_capped, MAX_NAME_GENERATION_CREATE_ATTEMPTS,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -2638,11 +2640,7 @@ impl<S: Storage + 'static> JobController<S> {
         index_failure_counts: Option<(i32, i32)>,
     ) -> Result<String> {
         let job_name = &job.metadata.name;
-        let pod_name = format!(
-            "{}-{}",
-            job_name,
-            uuid::Uuid::new_v4().to_string().split('-').next().unwrap()
-        );
+        let pod_name = generate_pod_name(job_name);
 
         // Create pod from template
         let template = &job.spec.template;
@@ -2779,10 +2777,32 @@ impl<S: Storage + 'static> JobController<S> {
             }),
         };
 
-        let key = format!("/registry/pods/{}/{}", namespace, pod_name);
-        self.storage.create(&key, &pod).await?;
+        // Retry a name collision under a freshly generated name, as upstream's
+        // api-server does for `generateName` objects
+        // (registry/generic/registry/store.go:464-475,
+        // `maxNameGenerationCreateAttempts = 8`). Any other error is returned
+        // on the first attempt.
+        let mut pod = pod;
+        let mut attempt_name = pod_name;
+        for attempt in 0..MAX_NAME_GENERATION_CREATE_ATTEMPTS {
+            pod.metadata.name = attempt_name.clone();
+            let key = build_key("pods", Some(namespace), &attempt_name);
+            match self.storage.create(&key, &pod).await {
+                Ok(_) => return Ok(attempt_name),
+                Err(rusternetes_common::Error::AlreadyExists(_))
+                    if attempt + 1 < MAX_NAME_GENERATION_CREATE_ATTEMPTS =>
+                {
+                    attempt_name = generate_pod_name(job_name);
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
 
-        Ok(pod_name)
+        Err(rusternetes_common::Error::AlreadyExists(format!(
+            "could not generate a free pod name for {}/{} after {} attempts",
+            namespace, job_name, MAX_NAME_GENERATION_CREATE_ATTEMPTS
+        ))
+        .into())
     }
 }
 
@@ -3898,6 +3918,48 @@ mod tests {
             status.completion_time.is_none(),
             "completionTime is only valid for Complete jobs; a failed job must not set it"
         );
+    }
+
+    /// Port of the `generateName` retry in the generic registry's
+    /// `Store.Create` (store.go:464-475): a colliding generated pod name is
+    /// redrawn, up to 8 attempts, rather than failing the create.
+    #[tokio::test]
+    async fn test_job_retries_pod_create_when_the_generated_name_collides() {
+        use super::super::replicationcontroller::tests::NameCollisionStorage;
+        // Seven collisions: the eighth (last) attempt succeeds.
+        let storage = Arc::new(NameCollisionStorage::new(
+            Arc::new(MemoryStorage::new()),
+            MAX_NAME_GENERATION_CREATE_ATTEMPTS - 1,
+        ));
+        let controller = JobController::new(storage.clone());
+        let mut job = make_job("collide-job", "default", 1, 1);
+        storage
+            .create("/registry/jobs/default/collide-job", &job)
+            .await
+            .unwrap();
+        controller.reconcile(&mut job).await.unwrap();
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        assert_eq!(pods.len(), 1, "collisions must be retried under a new name");
+        assert_eq!(pods[0].metadata.name.len(), "collide-job-".len() + 5);
+    }
+
+    /// Eight collisions exhaust the budget (store.go:440): the create fails.
+    #[tokio::test]
+    async fn test_job_pod_create_gives_up_after_eight_name_collisions() {
+        use super::super::replicationcontroller::tests::NameCollisionStorage;
+        let storage = Arc::new(NameCollisionStorage::new(
+            Arc::new(MemoryStorage::new()),
+            MAX_NAME_GENERATION_CREATE_ATTEMPTS,
+        ));
+        let controller = JobController::new(storage.clone());
+        let job = make_job("exhaust-job", "default", 1, 1);
+        let err = controller
+            .create_pod(&job, "default", 0, false, None)
+            .await
+            .unwrap_err();
+        assert!(super::super::is_already_exists_anyhow(&err));
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        assert!(pods.is_empty());
     }
 
     #[tokio::test]
