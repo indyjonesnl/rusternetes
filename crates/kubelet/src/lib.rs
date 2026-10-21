@@ -28,6 +28,7 @@ pub mod runtime_state;
 pub mod server;
 pub mod server_auth;
 pub mod server_metrics;
+pub mod server_metrics_endpoints;
 pub mod serving_tls;
 pub mod static_pod_watch;
 pub mod static_pods;

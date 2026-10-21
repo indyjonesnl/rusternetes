@@ -87,15 +87,33 @@ async fn handle_list_running_pods(State(state): State<ServerState>) -> impl Into
 }
 
 async fn handle_healthz(State(state): State<ServerState>) -> impl IntoResponse {
-    match &state.kubelet {
+    use crate::server_metrics_endpoints::{observe_healthcheck, HealthcheckStatus};
+    // healthz.go:handleRootHealth observes every check (`slis.ObserveHealthcheck`)
+    // under type "healthz": ping, log and syncloop (server.go:430-434).
+    observe_healthcheck("ping", "healthz", HealthcheckStatus::Success);
+    observe_healthcheck("log", "healthz", HealthcheckStatus::Success);
+    let healthy = match &state.kubelet {
         // No kubelet attached (router-shape tests / early startup): treat as healthy.
-        None => (StatusCode::OK, "ok").into_response(),
-        Some(k) if k.healthy() => (StatusCode::OK, "ok").into_response(),
-        Some(_) => (
+        None => true,
+        Some(k) => k.healthy(),
+    };
+    observe_healthcheck(
+        "syncloop",
+        "healthz",
+        if healthy {
+            HealthcheckStatus::Success
+        } else {
+            HealthcheckStatus::Error
+        },
+    );
+    if healthy {
+        (StatusCode::OK, "ok").into_response()
+    } else {
+        (
             StatusCode::INTERNAL_SERVER_ERROR,
             "kubelet sync_loop is stale",
         )
-            .into_response(),
+            .into_response()
     }
 }
 
