@@ -29,12 +29,12 @@ use crate::resources::pod::{
     Lifecycle, LifecycleHandler, NodeAffinity, NodeSelectorTerm, Pod, PodAffinityTerm,
     PodDNSConfig, PodOS, PodReadinessGate, PodResourceClaim, PodSchedulingGate, PodSecurityContext,
     PodSpec, PreferredSchedulingTerm, Probe, ProjectedVolumeSource, ResourceFieldSelector,
-    SeccompProfile, SecretVolumeSource, SleepAction, TCPSocketAction, Toleration,
+    SeccompProfile, SecretVolumeSource, SecurityContext, SleepAction, TCPSocketAction, Toleration,
     TopologySpreadConstraint, Volume, VolumeDevice, VolumeMount, WeightedPodAffinityTerm,
     WorkloadReference,
 };
 use crate::resources::policy::IntOrString;
-use crate::validation::field::{Error, ErrorList, Path};
+use crate::validation::field::{BadValue, Error, ErrorList, Path};
 use crate::validation::metav1::{
     is_dns1123_label, is_dns1123_subdomain, is_dns1123_subdomain_with_underscore,
     is_qualified_name, is_valid_label_value, validate_label_name, validate_label_selector,
@@ -43,6 +43,7 @@ use crate::validation::metav1::{
 use crate::validation::pod_options::{
     get_validation_options_from_pod_spec_and_meta, PodValidationOptions,
 };
+use crate::validation::pod_status::is_valid_id;
 use once_cell::sync::Lazy;
 use regex::Regex;
 
@@ -315,6 +316,9 @@ fn validate_pod_spec_for(
     // passes `spec.TerminationGracePeriodSeconds` to `validateContainers`).
     let grace_period = spec.termination_grace_period_seconds;
 
+    // `:4633-4635`: hostUsers defaults to true.
+    let host_users = spec.host_users.unwrap_or(true);
+
     // spec.os (PodOS) gates lifecycle.stopSignal validation (upstream threads
     // `os` into validateContainers → validateLifecycle → validateStopSignal).
     let os = spec.os.as_ref();
@@ -337,6 +341,7 @@ fn validate_pod_spec_for(
             grace_period,
             os,
             spec.restart_policy.as_deref(),
+            host_users,
             &containers_path.index(i),
         ));
         if !c.name.is_empty() && !all_names.insert(c.name.clone()) {
@@ -358,6 +363,7 @@ fn validate_pod_spec_for(
                 grace_period,
                 os,
                 spec.restart_policy.as_deref(),
+                host_users,
                 &init_path.index(i),
             ));
             if !c.name.is_empty() && !all_names.insert(c.name.clone()) {
@@ -1236,6 +1242,7 @@ pub(crate) fn validate_host_sysctl(
 ///
 /// Mirrors upstream `validateContainer` / `validateInitContainer`
 /// (`pkg/apis/core/validation/validation.go`, release-1.35).
+#[allow(clippy::too_many_arguments)] // mirrors upstream validateContainerCommon's parameter list
 pub(crate) fn validate_container(
     c: &Container,
     is_init: bool,
@@ -1243,6 +1250,7 @@ pub(crate) fn validate_container(
     grace_period: Option<i64>,
     os: Option<&PodOS>,
     pod_restart_policy: Option<&str>,
+    host_users: bool,
     fld_path: &Path,
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
@@ -1372,28 +1380,13 @@ pub(crate) fn validate_container(
         errs.extend(validate_container_restart_rules(rules, fld_path));
     }
 
-    // securityContext.seccompProfile / .appArmorProfile (upstream
-    // `validateSecurityContext`, `:8392` and `:8408`).
+    // securityContext (upstream `validateContainerCommon`, `:3915`).
     if let Some(ref sc) = c.security_context {
-        let sc_path = fld_path.child("securityContext");
-        if let Some(ref sp) = sc.seccomp_profile {
-            errs.extend(validate_seccomp_profile(
-                sp,
-                &sc_path.child("seccompProfile"),
-            ));
-        }
-        errs.extend(
-            crate::validation::windows_options::validate_windows_security_context_options(
-                sc.windows_options.as_ref(),
-                &sc_path.child("windowsOptions"),
-            ),
-        );
-        if let Some(ref ap) = sc.app_armor_profile {
-            errs.extend(validate_app_armor_profile(
-                ap,
-                &sc_path.child("appArmorProfile"),
-            ));
-        }
+        errs.extend(validate_security_context(
+            sc,
+            &fld_path.child("securityContext"),
+            host_users,
+        ));
     }
 
     // imagePullPolicy enum (upstream validatePullPolicy). Unset/empty is
@@ -1656,6 +1649,96 @@ fn validate_container_restart_rules(rules: &[ContainerRestartRule], fld_path: &P
             }
         }
     }
+    errs
+}
+
+/// `ValidateProcMountType` (`pkg/apis/core/validation/validation.go:8728-8736`).
+fn validate_proc_mount_type(fld_path: &Path, proc_mount: &str) -> Option<Error> {
+    match proc_mount {
+        "Default" | "Unmasked" => None,
+        other => Some(Error::not_supported(
+            fld_path,
+            other.to_string(),
+            &["Default", "Unmasked"],
+        )),
+    }
+}
+
+/// `ValidateSecurityContext` (`pkg/apis/core/validation/validation.go:8358-8405`).
+///
+/// `capabilities.Get().AllowPrivileged` is always true here (the
+/// `--allow-privileged` flag is gone upstream, `pkg/capabilities`), so the
+/// `:8366-8370` "disallowed by cluster policy" arm is unreachable. Not yet
+/// ported: `validateWindowsSecurityContextOptions` (`:8404`), tracked in
+/// its own issue.
+fn validate_security_context(sc: &SecurityContext, fld_path: &Path, host_users: bool) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+
+    if let Some(uid) = sc.run_as_user {
+        for msg in is_valid_id(uid) {
+            errs.push(Error::invalid(&fld_path.child("runAsUser"), uid, msg));
+        }
+    }
+    if let Some(gid) = sc.run_as_group {
+        for msg in is_valid_id(gid) {
+            errs.push(Error::invalid(&fld_path.child("runAsGroup"), gid, msg));
+        }
+    }
+
+    if let Some(ref pm) = sc.proc_mount {
+        if let Some(e) = validate_proc_mount_type(&fld_path.child("procMount"), pm) {
+            errs.push(e);
+        }
+        if host_users && pm == "Unmasked" {
+            errs.push(Error::invalid(
+                &fld_path.child("procMount"),
+                pm.clone(),
+                "`hostUsers` must be false to use `Unmasked`",
+            ));
+        }
+    }
+
+    if let Some(ref sp) = sc.seccomp_profile {
+        errs.extend(validate_seccomp_profile(
+            sp,
+            &fld_path.child("seccompProfile"),
+        ));
+    }
+
+    if sc.allow_privilege_escalation == Some(false) {
+        if sc.privileged == Some(true) {
+            errs.push(Error::invalid(
+                fld_path,
+                BadValue::marshal(sc),
+                "cannot set `allowPrivilegeEscalation` to false and `privileged` to true",
+            ));
+        }
+        if let Some(ref caps) = sc.capabilities {
+            for cap in caps.add.iter().flatten() {
+                if cap == "CAP_SYS_ADMIN" {
+                    errs.push(Error::invalid(
+                        fld_path,
+                        BadValue::marshal(sc),
+                        "cannot set `allowPrivilegeEscalation` to false and `capabilities.Add` CAP_SYS_ADMIN",
+                    ));
+                }
+            }
+        }
+    }
+
+    errs.extend(
+        crate::validation::windows_options::validate_windows_security_context_options(
+            sc.windows_options.as_ref(),
+            &fld_path.child("windowsOptions"),
+        ),
+    );
+    if let Some(ref ap) = sc.app_armor_profile {
+        errs.extend(validate_app_armor_profile(
+            ap,
+            &fld_path.child("appArmorProfile"),
+        ));
+    }
+
     errs
 }
 
@@ -6026,6 +6109,86 @@ mod tests {
         );
     }
 
+    /// `TestValidateSecurityContext` (validation_test.go:23214-23323).
+    fn sc_errs(sc: serde_json::Value, host_users: bool) -> Vec<Error> {
+        let sc: SecurityContext = serde_json::from_value(sc).unwrap();
+        validate_security_context(&sc, &Path::new("field"), host_users)
+    }
+
+    #[test]
+    fn security_context_success_cases() {
+        let base = || {
+            serde_json::json!({"privileged": false, "runAsUser": 1,
+            "capabilities": {"add": ["foo"], "drop": ["bar"]}})
+        };
+        assert!(sc_errs(base(), false).is_empty());
+        let mut pm = base();
+        pm["procMount"] = "Default".into();
+        assert!(sc_errs(pm, true).is_empty());
+        let mut um = base();
+        um["procMount"] = "Unmasked".into();
+        assert!(sc_errs(um, false).is_empty());
+    }
+
+    #[test]
+    fn security_context_error_cases() {
+        let e = sc_errs(serde_json::json!({"runAsUser": -1}), true);
+        assert!(e[0].detail.contains("must be between"), "{e:?}");
+        let e = sc_errs(serde_json::json!({"runAsGroup": -1}), true);
+        assert!(e[0].field == "field.runAsGroup", "{e:?}");
+        let e = sc_errs(
+            serde_json::json!({"allowPrivilegeEscalation": false, "capabilities": {"add": ["CAP_SYS_ADMIN"]}}),
+            true,
+        );
+        assert!(e[0].detail.contains(
+            "cannot set `allowPrivilegeEscalation` to false and `capabilities.Add` CAP_SYS_ADMIN"
+        ));
+        let e = sc_errs(
+            serde_json::json!({"allowPrivilegeEscalation": false, "privileged": true}),
+            true,
+        );
+        assert!(e[0]
+            .detail
+            .contains("cannot set `allowPrivilegeEscalation` to false and `privileged` to true"));
+        // validation.go:8387-8389
+        let e = sc_errs(serde_json::json!({"procMount": "Unmasked"}), true);
+        assert!(e[0]
+            .detail
+            .contains("`hostUsers` must be false to use `Unmasked`"));
+        assert_eq!(e[0].field, "field.procMount");
+        // ValidateProcMountType (:8728)
+        let e = sc_errs(serde_json::json!({"procMount": "Bogus"}), false);
+        assert_eq!(
+            e[0].error_type,
+            crate::validation::field::ErrorType::NotSupported
+        );
+    }
+
+    #[test]
+    fn pod_spec_unmasked_procmount_needs_host_users_false() {
+        // fixtures_procMount.go:93 `failRequiresError`: a container with
+        // procMount Unmasked and hostUsers unset fails API validation.
+        let mut spec = serde_json::json!({"containers": [{"name": "c", "image": "i",
+            "securityContext": {"procMount": "Unmasked"}}]});
+        let pod = |spec: &serde_json::Value| -> Pod {
+            serde_json::from_value(serde_json::json!({"apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": "p", "namespace": "d"}, "spec": spec}))
+            .unwrap()
+        };
+        let errs = validate_pod_create(&pod(&spec), false);
+        assert!(
+            errs.iter()
+                .any(|e| e.field == "spec.containers[0].securityContext.procMount"),
+            "{errs:?}"
+        );
+        spec["hostUsers"] = false.into();
+        let errs = validate_pod_create(&pod(&spec), false);
+        assert!(
+            !errs.iter().any(|e| e.field.ends_with("procMount")),
+            "{errs:?}"
+        );
+    }
+
     fn cerrs(json: serde_json::Value) -> Vec<String> {
         let vols: HashSet<&str> = HashSet::new();
         validate_container(
@@ -6035,6 +6198,7 @@ mod tests {
             Some(30),
             None,
             None,
+            true,
             &Path::new("spec").child("containers").index(0),
         )
         .into_iter()
@@ -6655,6 +6819,7 @@ mod tests {
             Some(30),
             None,
             None,
+            true,
             &Path::new("spec").child("containers").index(0),
         )
         .into_iter()
@@ -6717,6 +6882,7 @@ mod tests {
             Some(30),
             None,
             Some("Never"),
+            true,
             &Path::new("spec").child("containers").index(0),
         )
         .into_iter()
