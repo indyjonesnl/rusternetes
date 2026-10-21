@@ -61,7 +61,7 @@ impl MetricsClient for SeqCpuMetrics {
         _: &str,
         _: &LabelSelector,
         _: &str,
-    ) -> anyhow::Result<PodMetricsInfo> {
+    ) -> anyhow::Result<(PodMetricsInfo, chrono::DateTime<chrono::Utc>)> {
         anyhow::bail!("not used")
     }
     async fn get_object_metric(
