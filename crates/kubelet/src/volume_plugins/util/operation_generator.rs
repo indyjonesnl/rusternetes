@@ -4,13 +4,15 @@
 //! `expandVolumeDuringMount`, `checkForRecoveryFromExpansion` and
 //! `legacyCallNodeExpandOnPlugin`, driving [`super::node_expander`].
 //!
-//! Not ported: `GenerateExpandInUseVolumeFunc` / `doOnlineExpansion` — the
-//! closure wrapper around `nodeExpandVolume` — which needs the operation
-//! executor's `GeneratedOperations` and `volume.DeviceMounter`
-//! (`DeviceStagePath`), neither of which exists yet (#1970). Nothing in the
-//! running kubelet calls these functions yet.
+//! `GenerateExpandInUseVolumeFunc` / `doOnlineExpansion` — the closure
+//! wrapper around `nodeExpandVolume` — are ported as
+//! [`OperationGenerator::generate_expand_in_use_volume_func`] and
+//! [`GeneratedExpandInUse`]. Nothing in the running kubelet calls these
+//! functions yet: the operation executor that runs a `GeneratedOperations`
+//! (`ExpandInUseVolume`, `operation_executor.go:925`) and the volume-manager
+//! reconciler's expand-in-use hook do not exist (#1970).
 
-use crate::events::{FILE_SYSTEM_RESIZE_FAILED, FILE_SYSTEM_RESIZE_SUCCESS};
+use crate::events::{FILE_SYSTEM_RESIZE_FAILED, FILE_SYSTEM_RESIZE_SUCCESS, VOLUME_RESIZE_FAILED};
 use crate::volume_manager::cache::actual_state_of_world::ActualStateOfWorld;
 use crate::volume_manager::cache::desired_state_of_world::{
     desired_size_limit, effective_selinux_mount_label, get_selinux_label,
@@ -542,6 +544,224 @@ pub async fn mount_volume_with_attributes(
         )?)
         .await?;
     Ok((mounter.get_path(), mounter.get_attributes()))
+}
+
+/// `util.CheckVolumeModeFilesystem` (`pkg/volume/util/util.go:354-365`): true
+/// for Filesystem, false for Block; a PV without `volumeMode` is an error
+/// (`GetVolumeMode`).
+fn check_volume_mode_filesystem(spec: &Spec<'_>) -> anyhow::Result<bool> {
+    let mode = crate::volume_plugins::iscsi::get_volume_mode(spec)?;
+    Ok(!matches!(
+        mode,
+        rusternetes_common::resources::volume::PersistentVolumeMode::Block
+    ))
+}
+
+/// The operation `GenerateExpandInUseVolumeFunc` returns
+/// (`operation_generator.go:1815-1923`): the `GeneratedOperations` with
+/// `OperationName: "volume_fs_resize"`, whose `OperationFunc` is
+/// [`Self::run`] and whose `EventRecorderFunc` is
+/// [`Self::record_event_on_error`].
+///
+/// Not ported: `CompleteFunc` (`util.OperationCompleteHook`, the per-operation
+/// metrics hook), for lack of an operation executor to consume it (#1970).
+pub struct GeneratedExpandInUse<'v, 'a, S: Storage + ?Sized> {
+    /// `OperationName`.
+    pub operation_name: &'static str,
+    og: &'v OperationGenerator<'a, S>,
+    volume_plugin: &'v dyn crate::volume_plugins::plugin::VolumePlugin,
+    volume_to_mount: &'v VolumeToMount,
+    actual_state_of_world: &'v ActualStateOfWorld,
+    current_size: Quantity,
+}
+
+impl<'a, S: Storage + ?Sized> OperationGenerator<'a, S> {
+    /// Port of `operationGenerator.GenerateExpandInUseVolumeFunc`
+    /// (`operation_generator.go:1815-1923`): find the plugin for the spec and
+    /// return the operation that expands the in-use volume from
+    /// `current_size` to `volumeToMount.DesiredPersistentVolumeSize`.
+    pub fn generate_expand_in_use_volume_func<'v>(
+        &'v self,
+        volume_to_mount: &'v VolumeToMount,
+        actual_state_of_world: &'v ActualStateOfWorld,
+        current_size: Quantity,
+    ) -> anyhow::Result<GeneratedExpandInUse<'v, 'a, S>> {
+        let spec = volume_to_mount.volume_spec.as_spec();
+        let volume_plugin = self
+            .volume_plugin_mgr
+            .find_plugin_by_spec(&spec)
+            .map_err(|e| {
+                volume_to_mount.generate_error_detailed(
+                    "NodeExpandVolume.FindPluginBySpec failed",
+                    &anyhow!(e),
+                )
+            })?;
+        Ok(GeneratedExpandInUse {
+            operation_name: "volume_fs_resize",
+            og: self,
+            volume_plugin,
+            volume_to_mount,
+            actual_state_of_world,
+            current_size,
+        })
+    }
+}
+
+impl<'v, 'a, S: Storage + ?Sized> GeneratedExpandInUse<'v, 'a, S>
+where
+    'a: 'v,
+{
+    /// The plugin's name, for the `CompleteFunc` hook's metric label
+    /// (`GetFullQualifiedPluginNameForVolume(volumePlugin.GetPluginName(), ..)`).
+    pub fn plugin_name(&self) -> &str {
+        self.volume_plugin.name()
+    }
+
+    /// The `eventRecorderFunc` closure (`:1909-1913`): a failed resize is
+    /// recorded as a `VolumeResizeFailed` warning on the pod.
+    pub async fn record_event_on_error(&self, err: Option<&Error>) {
+        let Some(err) = err else { return };
+        let pod = &self.volume_to_mount.pod;
+        let node_name = pod.spec.as_ref().and_then(|s| s.node_name.as_deref());
+        record_event(
+            self.og.recorder,
+            &crate::events::pod_object_reference(pod),
+            node_name,
+            EventType::Warning,
+            VOLUME_RESIZE_FAILED,
+            &err.to_string(),
+        )
+        .await;
+    }
+
+    /// The `fsResizeFunc` closure (`:1826-1907`).
+    pub async fn run(&self) -> OperationContext {
+        let vmt = self.volume_to_mount;
+        let og = self.og;
+        // `migrated := false`: this closure never consults the migration
+        // status upstream either.
+        let migrated = false;
+        let fail = |prefix: &str, err: &Error| {
+            let (event_err, detailed_err) = vmt.generate_error(prefix, err);
+            OperationContext::new(Some(event_err), Some(detailed_err), migrated)
+        };
+
+        let desired = match vmt.desired_persistent_volume_size {
+            Some(d) if !d.is_zero() && !self.current_size.is_zero() => d,
+            _ => {
+                return fail(
+                    "NodeExpandvolume.expansion failed",
+                    &anyhow!("current or new size of the volume is not set"),
+                )
+            }
+        };
+
+        let spec = vmt.volume_spec.as_spec();
+        let mut resize_options = NodeResizeOptions {
+            volume_spec: &spec,
+            device_path: vmt.device_path.clone(),
+            device_mount_path: String::new(),
+            device_stage_path: String::new(),
+            old_size: self.current_size,
+            new_size: desired,
+        };
+        let fs_volume = match check_volume_mode_filesystem(&spec) {
+            Ok(v) => v,
+            Err(e) => return fail("NodeExpandvolume.CheckVolumeModeFilesystem failed", &e),
+        };
+
+        if fs_volume {
+            let volume_mounter = match self.volume_plugin.new_mounter(&spec, &vmt.pod).await {
+                Ok(m) => m,
+                Err(e) => return fail("NodeExpandVolume.NewMounter initialization failed", &e),
+            };
+            resize_options.device_mount_path = volume_mounter.get_path();
+
+            // `deviceMountableVolumePlugin, _ := FindDeviceMountablePluginBySpec`
+            // and `volumeDeviceMounter, _ = NewDeviceMounter()`: both errors
+            // are discarded upstream.
+            let volume_device_mounter = og
+                .volume_plugin_mgr
+                .find_device_mountable_plugin_by_spec(&spec)
+                .and_then(|p| p.as_device_mountable_plugin())
+                .and_then(|p| p.new_device_mounter().ok());
+            if let Some(mounter) = volume_device_mounter {
+                match mounter.get_device_mount_path(&spec) {
+                    Ok(path) => resize_options.device_stage_path = path,
+                    Err(e) => return fail("NodeExpandVolume.GetDeviceMountPath failed", &e),
+                }
+            }
+        } else {
+            // Get block volume mapper plugin
+            let block_volume_plugin = match og.volume_plugin_mgr.find_mapper_plugin_by_spec(&spec)
+            {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    return fail(
+                        "MapVolume.FindMapperPluginBySpec failed to find BlockVolumeMapper plugin. Volume plugin is nil.",
+                        &anyhow!("<nil>"),
+                    )
+                }
+                Err(e) => return fail("MapVolume.FindMapperPluginBySpec failed", &anyhow!(e)),
+            };
+            let block_volume_mapper = match block_volume_plugin
+                .new_block_volume_mapper(&spec, &vmt.pod)
+            {
+                Ok(m) => m,
+                Err(e) => return fail("MapVolume.NewBlockVolumeMapper initialization failed", &e),
+            };
+            // if plugin supports custom mappers lets add DeviceStagePath
+            if let Some(custom) = block_volume_mapper.as_custom_block_volume_mapper() {
+                resize_options.device_stage_path = custom.get_staging_path();
+            }
+        }
+
+        // if we are doing online expansion then volume is already published
+        let (resize_done, event_err, detailed_err) = self.do_online_expansion(resize_options).await;
+        if event_err.is_some() || detailed_err.is_some() {
+            return OperationContext::new(event_err, detailed_err, migrated);
+        }
+        if !resize_done {
+            info!(
+                "Waiting for volume to be expandable on the node (volumeName {:?})",
+                vmt.volume_name.0
+            );
+        }
+        OperationContext::new(None, None, migrated)
+    }
+
+    /// Port of `doOnlineExpansion` (`operation_generator.go:1925-1947`):
+    /// `(resizeDone, eventErr, detailedErr)`.
+    async fn do_online_expansion(
+        &self,
+        resize_options: NodeResizeOptions<'_>,
+    ) -> (bool, Option<Error>, Option<Error>) {
+        let vmt = self.volume_to_mount;
+        let (resize_done, new_size, err) = self
+            .og
+            .node_expand_volume(vmt, self.actual_state_of_world, resize_options)
+            .await;
+        if let Some(err) = err {
+            let (e1, e2) = vmt.generate_error("NodeExpandVolume.NodeExpandVolume failed", &err);
+            error!("{e2}");
+            return (false, Some(e1), Some(e2));
+        }
+        if resize_done {
+            let marking_done = self
+                .actual_state_of_world
+                .mark_volume_as_resized(&vmt.volume_name, new_size);
+            if !marking_done {
+                // On failure, return error. Caller will log and retry.
+                let (e1, e2) = vmt.generate_error(
+                    "NodeExpandVolume.MarkVolumeAsResized failed",
+                    &anyhow!("unable to mark volume as resized"),
+                );
+                return (false, Some(e1), Some(e2));
+            }
+            return (true, None, None);
+        }
+        (false, None, None)
+    }
 }
 
 /// The operation `GenerateUnmountDeviceFunc` returns
@@ -1193,6 +1413,150 @@ mod tests {
             f.pvc().await.status.unwrap().capacity.unwrap()["storage"],
             "2G"
         );
+    }
+
+    // ---- `GenerateExpandInUseVolumeFunc` (`operation_generator.go:1815-1947`) ----
+
+    /// An actual state of world that knows the fixture's plugin, with the
+    /// volume attached.
+    fn attached_asow(f: &Fixture, vmt: &VolumeToMount) -> ActualStateOfWorld {
+        let asow = ActualStateOfWorld::new(
+            "node-1",
+            Arc::new(VolumePluginMgr::new(vec![Box::new(f.plugin.sharing())])),
+        );
+        asow.mark_volume_as_attached(
+            Some(&vmt.volume_name),
+            Arc::clone(&vmt.volume_spec),
+            "",
+            "/dev/fake",
+        )
+        .unwrap();
+        asow
+    }
+
+    /// The closure refuses an unset current or desired size
+    /// (`:1832-1836`) before touching any plugin.
+    #[tokio::test]
+    async fn expand_in_use_requires_current_and_new_size() {
+        let pvc = test_pvc("2G", "1G", "2G", "NodeResizePending", false, false);
+        let f = Fixture::new(&pvc, FakeExpandPlugin::ok()).await;
+        let pv = test_pv("2G");
+        let asow = test_asow();
+        let mut vmt = test_vmt(&pv, "2G");
+        let og = f.og();
+        let op = og
+            .generate_expand_in_use_volume_func(&vmt, &asow, q("0"))
+            .unwrap();
+        assert_eq!(op.operation_name, "volume_fs_resize");
+        let ctx = op.run().await;
+        let err = ctx.detailed_err.expect("zero current size is an error");
+        assert!(err
+            .to_string()
+            .contains("current or new size of the volume is not set"));
+        assert!(!f.called());
+
+        vmt.desired_persistent_volume_size = None;
+        let op = og
+            .generate_expand_in_use_volume_func(&vmt, &asow, q("1G"))
+            .unwrap();
+        assert!(op.run().await.event_err.is_some());
+        assert!(!f.called());
+    }
+
+    /// Online expansion: `nodeExpandVolume` runs, then `MarkVolumeAsResized`
+    /// records the new size in the actual state of world (`:1925-1947`).
+    #[tokio::test]
+    async fn expand_in_use_expands_and_marks_volume_resized() {
+        let pvc = test_pvc("2G", "1G", "2G", "NodeResizePending", false, false);
+        let f = Fixture::new(&pvc, FakeExpandPlugin::ok()).await;
+        let pv = test_pv("2G");
+        let vmt = test_vmt(&pv, "2G");
+        let asow = attached_asow(&f, &vmt);
+        let og = f.og();
+        let op = og
+            .generate_expand_in_use_volume_func(&vmt, &asow, q("1G"))
+            .unwrap();
+        let ctx = op.run().await;
+        assert!(
+            ctx.event_err.is_none() && ctx.detailed_err.is_none(),
+            "{:?}",
+            ctx.detailed_err
+        );
+        assert!(f.called());
+        assert_eq!(
+            f.pvc().await.status.unwrap().capacity.unwrap()["storage"],
+            "2G"
+        );
+    }
+
+    /// A volume the ASW does not track cannot be marked resized: the
+    /// operation reports `MarkVolumeAsResized failed` for the caller to retry
+    /// (`:1938-1944`).
+    #[tokio::test]
+    async fn expand_in_use_reports_unmarkable_volume() {
+        let pvc = test_pvc("2G", "1G", "2G", "NodeResizePending", false, false);
+        let f = Fixture::new(&pvc, FakeExpandPlugin::ok()).await;
+        let pv = test_pv("2G");
+        let asow = test_asow();
+        let vmt = test_vmt(&pv, "2G");
+        let og = f.og();
+        let ctx = og
+            .generate_expand_in_use_volume_func(&vmt, &asow, q("1G"))
+            .unwrap()
+            .run()
+            .await;
+        assert!(ctx
+            .detailed_err
+            .unwrap()
+            .to_string()
+            .contains("NodeExpandVolume.MarkVolumeAsResized failed"));
+    }
+
+    /// A plugin failure surfaces as `NodeExpandVolume.NodeExpandVolume failed`
+    /// and the event recorder func emits a `VolumeResizeFailed` warning on
+    /// the pod (`:1909-1913`).
+    #[tokio::test]
+    async fn expand_in_use_failure_is_reported_and_recorded() {
+        let pvc = test_pvc("2G", "1G", "", "", false, false);
+        let plugin = FakeExpandPlugin::failing(|| anyhow!("boom"));
+        let f = Fixture::new(&pvc, plugin).await;
+        let pv = test_pv("2G");
+        let vmt = test_vmt(&pv, "2G");
+        let asow = attached_asow(&f, &vmt);
+        let og = f.og();
+        let op = og
+            .generate_expand_in_use_volume_func(&vmt, &asow, q("1G"))
+            .unwrap();
+        let ctx = op.run().await;
+        let event_err = ctx.event_err.expect("plugin failure is an error");
+        assert!(event_err
+            .to_string()
+            .contains("NodeExpandVolume.NodeExpandVolume failed"));
+        op.record_event_on_error(Some(&event_err)).await;
+        op.record_event_on_error(None).await;
+    }
+
+    /// `FindPluginBySpec` failing aborts generation (`:1818-1821`).
+    #[test]
+    fn expand_in_use_generation_fails_without_a_plugin() {
+        let storage = StorageBackend::new_memory();
+        let recorder = EventRecorder::new(Arc::new(StorageBackend::new_memory()));
+        let empty = VolumePluginMgr::new(vec![]);
+        let og = OperationGenerator {
+            volume_plugin_mgr: &empty,
+            kube_client: &storage,
+            recorder: &recorder,
+        };
+        let pv = test_pv("2G");
+        let vmt = test_vmt(&pv, "2G");
+        let asow = test_asow();
+        let err = og
+            .generate_expand_in_use_volume_func(&vmt, &asow, q("1G"))
+            .err()
+            .expect("no plugin");
+        assert!(err
+            .to_string()
+            .contains("NodeExpandVolume.FindPluginBySpec failed"));
     }
 
     // ---- `MounterArgs` population (`operation_generator.go:582-589`, #2900) ----

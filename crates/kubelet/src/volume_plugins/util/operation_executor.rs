@@ -112,6 +112,17 @@ impl VolumeToMount {
     pub fn generate_error_detailed(&self, prefix_msg: &str, err: &anyhow::Error) -> anyhow::Error {
         anyhow::anyhow!(self.generate_msg_detailed(prefix_msg, &err_suffix(Some(err))))
     }
+
+    /// Port of `VolumeToMount.GenerateError`
+    /// (`operation_executor.go:538-541`): `(simpleErr, detailedErr)`.
+    pub fn generate_error(
+        &self,
+        prefix_msg: &str,
+        err: &anyhow::Error,
+    ) -> (anyhow::Error, anyhow::Error) {
+        let (simple, detailed) = self.generate_msg(prefix_msg, &err_suffix(Some(err)));
+        (anyhow::anyhow!(simple), anyhow::anyhow!(detailed))
+    }
 }
 
 /// Port of `errSuffix` (`operation_executor.go:306-312`).
