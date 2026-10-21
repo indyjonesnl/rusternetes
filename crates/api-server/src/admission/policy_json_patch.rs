@@ -14,7 +14,7 @@ use rusternetes_common::admission::Operation as AdmissionOperation;
 use rusternetes_common::auth::UserInfo;
 use rusternetes_common::cel::{CELContext, CELEvaluator};
 use rusternetes_common::cel_authz_library;
-use rusternetes_common::cel_cost::CostOptions;
+use rusternetes_common::cel_cost::{charge_budget, CostOptions};
 use rusternetes_common::cel_struct::{self, TypeCheck};
 use serde_json::{json, Value};
 
@@ -59,13 +59,17 @@ impl JsonPatcher {
     fn evaluate_patch_expression(
         &self,
         r: &PatchRequest<'_>,
+        remaining_budget: i64,
     ) -> Result<Vec<Operation>, PatchError> {
-        let json = evaluate_expression(
+        // json_patch.go:121: `ForInput(..., remainingBudget)`; the remaining
+        // budget returned is discarded by `Patch` (`patchObj, _, err :=`).
+        let (json, _) = evaluate_expression_budgeted(
             &self.evaluator,
             &self.expression,
             &self.variables,
             r,
             TypeCheck::JsonPatchValues,
+            remaining_budget,
         )?;
         Self::operations_from(json)
     }
@@ -103,14 +107,38 @@ impl JsonPatcher {
 /// The shared half of `jsonPatcher.evaluatePatchExpression` and
 /// `applyConfigPatcher.Patch`: bind `object`/`oldObject`/`params`/
 /// `namespaceObject`/`request`, evaluate, and marshal the result to JSON.
-pub(super) fn evaluate_expression(
+///
+/// `MutatingEvaluator.ForInput(..., remainingBudget)` (cel/mutation.go:51-70):
+/// the composited variables the expression read and the expression itself are
+/// charged against `remaining_budget` (`activation.Evaluate`, activation.go:
+/// 132-189), so an out-of-budget expression fails with the `ErrOutOfBudget`
+/// error before any evaluation error is reported. Returns the value and the
+/// remaining budget.
+pub(super) fn evaluate_expression_budgeted(
     evaluator: &Mutex<CELEvaluator>,
     expression: &str,
     variables: &[(String, String)],
     r: &PatchRequest<'_>,
     check: TypeCheck,
-) -> Result<Value, PatchError> {
-    evaluate_expression_costed(evaluator, expression, variables, r, check, None)
+    remaining_budget: i64,
+) -> Result<(Value, i64), PatchError> {
+    let mut report = CostReport::default();
+    let result = evaluate_expression_costed(
+        evaluator,
+        expression,
+        variables,
+        r,
+        check,
+        Some(&mut report),
+    );
+    let composition: u64 = report.variable_costs.iter().map(|(_, c)| *c).sum();
+    let remaining = charge_budget(
+        Some(i64::try_from(composition).unwrap_or(i64::MAX)),
+        report.cost,
+        remaining_budget,
+    )
+    .map_err(|e| PatchError::Other(e.detail))?;
+    result.map(|v| (v, remaining))
 }
 
 /// What a costed evaluation spent (`EvalDetails.ActualCost()` and the
@@ -376,7 +404,11 @@ fn create_admission_request(r: &PatchRequest<'_>) -> Value {
 impl Patcher for JsonPatcher {
     /// `jsonPatcher.Patch` (json_patch.go:72-116), over the unstructured
     /// representation (the `*unstructured.Unstructured` branch at :102-103).
-    async fn patch(&self, request: &PatchRequest<'_>) -> Result<Value, PatchError> {
+    async fn patch(
+        &self,
+        request: &PatchRequest<'_>,
+        runtime_cel_cost_budget: i64,
+    ) -> Result<Value, PatchError> {
         if let Some(e) = &self.compile_error {
             // cel_struct checks `Object.<path>{}` type names statically
             // (CheckTypeNamesMatchFieldPathNames), which upstream does at
@@ -389,7 +421,7 @@ impl Patcher for JsonPatcher {
                 },
             ));
         }
-        let ops = self.evaluate_patch_expression(request)?;
+        let ops = self.evaluate_patch_expression(request, runtime_cel_cost_budget)?;
         let object = request
             .versioned_attributes
             .versioned_object
@@ -406,12 +438,17 @@ impl Patcher for JsonPatcher {
 }
 
 #[cfg(test)]
+#[path = "policy_patch_budget_tests.rs"]
+mod budget_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::admission::policy_matching::Attributes;
     use crate::admission::policy_mutating::VersionedAttributes;
     use rusternetes_common::admission::Operation as AdmissionOperation;
     use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
+    use rusternetes_common::cel_cost::RUNTIME_CEL_COST_BUDGET;
     use serde_json::json;
 
     fn attributes(object: &Value) -> Attributes {
@@ -469,10 +506,11 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
-        rt.block_on(patcher.patch(&req)).map_err(|e| match e {
-            PatchError::Status(e) => e.to_string(),
-            PatchError::Other(m) => m,
-        })
+        rt.block_on(patcher.patch(&req, RUNTIME_CEL_COST_BUDGET))
+            .map_err(|e| match e {
+                PatchError::Status(e) => e.to_string(),
+                PatchError::Other(m) => m,
+            })
     }
 
     fn run(expression: &str, object: Value) -> Result<Value, String> {
