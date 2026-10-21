@@ -171,13 +171,19 @@ pub fn events_to_register(plugin_name: &str, profile: &Profile) -> Vec<ClusterEv
         ],
         // podtopologyspread/plugin.go:138-156
         names::POD_TOPOLOGY_SPREAD => vec![
-            ev(
-                R::Pod,
-                A::ADD | A::UPDATE_POD_LABEL | A::UPDATE_POD_TOLERATION | A::DELETE,
+            ClusterEventWithHint::with_hint(
+                ClusterEvent::new(
+                    R::Pod,
+                    A::ADD | A::UPDATE_POD_LABEL | A::UPDATE_POD_TOLERATION | A::DELETE,
+                ),
+                Arc::new(super::topology_spread_hints::is_schedulable_after_pod_change),
             ),
-            ev(
-                R::Node,
-                A::ADD | A::DELETE | A::UPDATE_NODE_LABEL | A::UPDATE_NODE_TAINT,
+            ClusterEventWithHint::with_hint(
+                ClusterEvent::new(
+                    R::Node,
+                    A::ADD | A::DELETE | A::UPDATE_NODE_LABEL | A::UPDATE_NODE_TAINT,
+                ),
+                Arc::new(super::topology_spread_hints::is_schedulable_after_node_change),
             ),
         ],
         // volumebinding/volume_binding.go:145-192 — hint fns are the subject
