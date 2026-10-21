@@ -239,6 +239,30 @@ static REQUEST_ABORTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     )
 });
 
+/// `requestPostTimeoutTotal` (metrics.go:254-270): the activity of a request
+/// handler after the apiserver timed its request out.
+static REQUEST_POST_TIMEOUT_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    counter_vec(
+        "request_post_timeout_total",
+        "Tracks the activity of the request handlers after the associated requests have been timed out by the apiserver",
+        &["source", "status"],
+    )
+});
+
+/// `PostTimeoutSourceTimeoutHandler` (metrics.go:392).
+pub const POST_TIMEOUT_SOURCE_TIMEOUT_HANDLER: &str = "timeout-handler";
+/// `PostTimeoutHandlerPanic` (metrics.go:402).
+pub const POST_TIMEOUT_HANDLER_PANIC: &str = "panic";
+/// `PostTimeoutHandlerOK` (metrics.go:410).
+pub const POST_TIMEOUT_HANDLER_OK: &str = "ok";
+
+/// `RecordRequestPostTimeout` (metrics.go:487-489).
+pub fn record_request_post_timeout(source: &str, status: &str) {
+    REQUEST_POST_TIMEOUT_TOTAL
+        .with_label_values(&[source, status])
+        .inc();
+}
+
 fn histogram_vec(name: &str, help: &str, buckets: Vec<f64>, labels: &[&str]) -> HistogramVec {
     let h = HistogramVec::new(
         HistogramOpts::new(name, help)
