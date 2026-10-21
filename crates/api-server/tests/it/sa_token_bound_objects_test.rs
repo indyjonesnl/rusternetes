@@ -88,6 +88,7 @@ fn token_with(bound: impl FnOnce(&mut KubernetesClaims)) -> String {
         pod: None,
         node: None,
         secret: None,
+        warnafter: None,
     };
     bound(&mut k);
     let claims = ServiceAccountClaims {

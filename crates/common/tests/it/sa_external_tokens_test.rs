@@ -555,3 +555,37 @@ fn service_account_lookup_flag_2714() {
         .unwrap();
     assert!(!tm.service_account_lookup());
 }
+
+/// `TokenREST.Create` expiration tweak (token.go:228-237) and the
+/// `--service-account-extend-token-expiration` default (authentication.go:227).
+#[test]
+fn tweak_expiration_3725() {
+    let auds = vec![ISSUER.to_string()];
+    let tm = manager(&opts(&["rsa.pub"]));
+    assert!(tm.extend_expiration());
+    assert_eq!(tm.max_extended_expiration_seconds(), 24 * 365 * 60 * 60);
+    // pod-bound, 3607s, kube audience: extended, warn after the request
+    assert_eq!(tm.tweak_expiration(3607, true, &auds), (31_536_000, 3607));
+    // not pod-bound / other expiration / foreign audience: untouched
+    assert_eq!(tm.tweak_expiration(3607, false, &auds), (3607, 0));
+    assert_eq!(tm.tweak_expiration(3600, true, &auds), (3600, 0));
+    assert_eq!(
+        tm.tweak_expiration(3607, true, &["other".to_string()]),
+        (3607, 0)
+    );
+    // flag off
+    let off = manager(&ServiceAccountOptions {
+        extend_expiration: false,
+        ..opts(&["rsa.pub"])
+    });
+    assert_eq!(off.tweak_expiration(3607, true, &auds), (3607, 0));
+}
+
+/// `kubernetes.io.warnafter` round-trips as Unix seconds (`jwt.NumericDate`).
+#[test]
+fn warnafter_claim_roundtrip_3725() {
+    let k: rusternetes_common::auth::KubernetesClaims =
+        serde_json::from_value(json!({"namespace": "n", "warnafter": 1234})).unwrap();
+    assert_eq!(k.warnafter, Some(1234));
+    assert_eq!(serde_json::to_value(&k).unwrap()["warnafter"], 1234);
+}
