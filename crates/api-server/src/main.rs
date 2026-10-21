@@ -367,6 +367,11 @@ async fn main() -> Result<()> {
         )
         .map_err(|e| anyhow::anyhow!("parsing {path}: {e}"))?;
         admission::resourcequota::config::install_limited_resources(limited);
+        admission::pod_plugins::install_from_admission_configuration(
+            &yaml,
+            std::path::Path::new(path),
+        )
+        .map_err(|e| anyhow::anyhow!("parsing {path}: {e}"))?;
     }
 
     install_audit_from_flags(&args).await?;
