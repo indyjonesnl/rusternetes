@@ -405,7 +405,7 @@ pub fn validate_custom_resource_definition_spec(
     spec: &CustomResourceDefinitionSpec,
     fld_path: &Path,
 ) -> ErrorList {
-    validate_custom_resource_definition_spec_opts(spec, true, true, true, fld_path)
+    validate_custom_resource_definition_spec_opts(spec, true, true, true, true, fld_path)
 }
 
 /// [`validate_custom_resource_definition_spec`] with
@@ -415,6 +415,7 @@ fn validate_custom_resource_definition_spec_opts(
     allow_invalid_ca_bundle: bool,
     require_structural_schema: bool,
     require_open_api_schema: bool,
+    require_pruned_defaults: bool,
     fld_path: &Path,
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
@@ -526,6 +527,7 @@ fn validate_custom_resource_definition_spec_opts(
             errs.extend(validate_custom_resource_definition_validation(
                 schema,
                 require_structural_schema,
+                require_pruned_defaults,
                 &vp.child("schema"),
             ));
         }
@@ -596,7 +598,9 @@ fn validate_custom_resource_definition_spec_opts(
 /// }
 /// ```
 ///
-/// Not ported here (tracked separately): `ValidateDefaults` (`:963`), the
+/// `ValidateDefaults` (`:963`) runs when `ValidateStructural` found nothing
+/// (see [`crate::validation::structural::defaulting`]; its CEL step is not
+/// ported). Not ported here (tracked separately): the
 /// `ValidateCustomResourceDefinitionOpenAPISchema` walk (`:973`) and CEL cost.
 /// Because that walk is absent, the init errors are shown whenever
 /// `ValidateStructural` found nothing.
@@ -606,6 +610,7 @@ fn validate_custom_resource_definition_spec_opts(
 fn validate_custom_resource_definition_validation(
     schema: &JSONSchemaProps,
     require_structural_schema: bool,
+    require_pruned_defaults: bool,
     fld_path: &Path,
 ) -> ErrorList {
     if !require_structural_schema {
@@ -614,7 +619,24 @@ fn validate_custom_resource_definition_validation(
     let schema_path = fld_path.child("openAPIV3Schema");
     match crate::validation::structural::new_structural(schema) {
         Err(msg) => vec![Error::invalid(&schema_path, String::new(), msg)],
-        Ok(ss) => crate::validation::structural::validate_structural(&schema_path, &ss),
+        Ok(ss) => {
+            let errs = crate::validation::structural::validate_structural(&schema_path, &ss);
+            if !errs.is_empty() {
+                return errs;
+            }
+            // `validation.go:963`: `ValidateDefaults(ctx, fldPath.Child("openAPIV3Schema"), ss, true, opts.requirePrunedDefaults)`.
+            match crate::validation::structural::defaulting::validate_defaults(
+                &schema_path,
+                &ss,
+                schema,
+                true,
+                require_pruned_defaults,
+            ) {
+                // "this should never happen"
+                Err(msg) => vec![Error::invalid(&schema_path, String::new(), msg)],
+                Ok(errs) => errs,
+            }
+        }
     }
 }
 
@@ -1478,6 +1500,8 @@ pub fn validate_custom_resource_definition_update(
         !spec_has_non_structural_schema(&old.spec),
         // `requireOpenAPISchema(&oldObj.Spec)` (`validation.go:235`, `:1596`).
         require_open_api_schema(&old.spec),
+        // `requirePrunedDefaults(&oldObj.Spec)` (`validation.go:238`, `:1779`).
+        crate::validation::structural::defaulting::require_pruned_defaults(&old.spec),
         &spec_path,
     ));
     errs.extend(validate_custom_resource_definition_spec_update(
@@ -1817,3 +1841,7 @@ mod structural_schema_tests;
 #[cfg(test)]
 #[path = "crd_selectable_tests.rs"]
 mod selectable_fields_tests;
+
+#[cfg(test)]
+#[path = "crd_defaults_tests.rs"]
+mod defaults_tests;
