@@ -1542,6 +1542,32 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Start the kube-apiserver-serving ClusterTrustBundle publisher
+    // (certificates.go:289-353): ClusterTrustBundle gate, root CA from pki_dir.
+    if rusternetes_common::feature_gates::enabled(
+        rusternetes_common::feature_gates::Feature::ClusterTrustBundle,
+    ) {
+        let root_ca = std::fs::read_to_string(format!("{}/ca.crt", args.pki_dir)).ok();
+        match controllers::clustertrustbundle_publisher::ClusterTrustBundlePublisher::for_kube_apiserver_serving(
+            storage.clone(),
+            root_ca.as_deref(),
+        ) {
+            Ok(Some(publisher)) => {
+                let publisher = Arc::new(publisher);
+                spawn_controller!("ClusterTrustBundle publisher", leader_elector, {
+                    let controller = publisher.clone();
+                    async move {
+                        if let Err(e) = controller.run().await {
+                            tracing::error!("ClusterTrustBundle publisher error: {}", e);
+                        }
+                    }
+                });
+            }
+            Ok(None) => {}
+            Err(e) => tracing::error!("ClusterTrustBundle publisher not started: {}", e),
+        }
+    }
+
     // Start Namespace controller (watch-based). Hand it the CA cert so it can
     // (re)create kube-root-ca.crt in every namespace (read from pki_dir, the
     // same dir the metrics/cert paths use above).

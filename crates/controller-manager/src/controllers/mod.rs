@@ -6,6 +6,7 @@ pub mod cert_authority;
 pub mod certificate_signing_request;
 pub mod cidrset_metrics;
 pub mod clusterrole_aggregation;
+pub mod clustertrustbundle_publisher;
 pub(crate) mod controller_utils;
 pub mod cronjob;
 pub mod csi_attacher;
