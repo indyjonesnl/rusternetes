@@ -694,6 +694,253 @@ pub async fn handle_container_logs(
     }
 }
 
+// ---------------------------------------------------------------------------
+// `/run` and `/checkpoint` (InstallAuthRequiredHandlers, server.go:519-629)
+// ---------------------------------------------------------------------------
+
+/// Route template of the `/checkpoint` web service (server.go:624-626).
+pub const CHECKPOINT_PATH: &str = "/checkpoint/:namespace/:pod/:container";
+
+/// State of the `/run` and `/checkpoint` handlers: `s.host.GetPodByName` is a
+/// lookup of the pods bound to this node and `kl.getCheckpointsDir()` is
+/// `<rootDir>/checkpoints` (kubelet_getters.go:89, `DefaultKubeletCheckpointsDirName`).
+#[derive(Clone)]
+pub struct RunState {
+    pub server: crate::server::ServerState,
+    pub checkpoints_dir: std::path::PathBuf,
+}
+
+/// `kubecontainer.GetPodFullName`: `name_namespace`.
+fn pod_full_name(pod: &Pod) -> String {
+    format!(
+        "{}_{}",
+        pod.metadata.name,
+        pod.metadata.namespace.as_deref().unwrap_or("")
+    )
+}
+
+/// `s.host.GetPodByName(namespace, name)`.
+async fn get_pod_by_name(state: &RunState, namespace: &str, name: &str) -> Option<Pod> {
+    let list = crate::server::pods_for_node(&state.server.storage, &state.server.node_name)
+        .await
+        .ok()?;
+    list.items.into_iter().find(|p| {
+        p.metadata.name == name && p.metadata.namespace.as_deref().unwrap_or("") == namespace
+    })
+}
+
+/// `response.WriteError(status, err)`: the error text as a plain body.
+fn write_error(status: StatusCode, msg: impl Into<String>) -> Response {
+    (status, msg.into()).into_response()
+}
+
+/// `writeJSONResponse` (server.go:1011-1022): a nil body is a bare 200.
+fn write_json_response(data: Vec<u8>) -> Response {
+    if data.is_empty() {
+        return StatusCode::OK.into_response();
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .body(Body::from(data))
+        .unwrap()
+}
+
+/// All values of query key `key`, percent-decoded (`req.Request.URL.Query()[key]`).
+fn query_values(query: &str, key: &str) -> Vec<String> {
+    query
+        .split('&')
+        .filter_map(|pair| {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            (decode_simple(k) == key).then(|| decode_simple(v))
+        })
+        .collect()
+}
+
+/// `(*Kubelet).findContainer` (kubelet_pods.go): the container of the pod
+/// matching `podFullName` (and `podUID` when given), as a CRI container id.
+async fn find_container(
+    pod: &Pod,
+    pod_uid: &str,
+    container: &str,
+) -> anyhow::Result<Option<String>> {
+    if !pod_uid.is_empty() && pod.metadata.uid != pod_uid {
+        return Ok(None);
+    }
+    let mut cri = rusternetes_cri::stream::connect().await?;
+    rusternetes_cri::stream::resolve_container_id(&mut cri, pod, container).await
+}
+
+/// `(*Server).getRun` (server.go:992-1008): run a command synchronously and
+/// return the combined output. `cmd` is split on spaces (the legacy `cmd`
+/// query parameter, not exec's `command`).
+async fn run_in_container(
+    state: RunState,
+    namespace: &str,
+    pod_name: &str,
+    uid: &str,
+    container: &str,
+    query: &str,
+) -> Response {
+    let Some(pod) = get_pod_by_name(&state, namespace, pod_name).await else {
+        return write_error(StatusCode::NOT_FOUND, "pod does not exist");
+    };
+    // `strings.Split(request.QueryParameter("cmd"), " ")`
+    let cmd: Vec<String> = query_values(query, "cmd")
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+        .split(' ')
+        .map(String::from)
+        .collect();
+    // `kl.RunInContainer` (kubelet_pods.go:2698-2708): timeout 0.
+    let container_id = match find_container(&pod, uid, container).await {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            return write_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("container not found ({container:?})"),
+            )
+        }
+        Err(e) => return write_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let mut cri = match rusternetes_cri::stream::connect().await {
+        Ok(c) => c,
+        Err(e) => return write_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    match rusternetes_cri::stream::exec_sync(&mut cri, &container_id, &cmd, 0).await {
+        Ok((mut stdout, stderr, exit_code)) => {
+            if exit_code != 0 {
+                // remote_runtime.go ExecSync: `exec.CodeExitError`.
+                return write_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "command '{}' exited with {exit_code}: {}",
+                        cmd.join(" "),
+                        String::from_utf8_lossy(&stderr)
+                    ),
+                );
+            }
+            // kuberuntime RunInContainer: `append(stdout, stderr...)`.
+            stdout.extend_from_slice(&stderr);
+            write_json_response(stdout)
+        }
+        Err(e) => write_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// `POST /run/:namespace/:pod/:container`
+pub async fn handle_run(
+    axum::extract::State(state): axum::extract::State<RunState>,
+    Path(p): Path<ExecPath3>,
+    req: axum::extract::Request,
+) -> Response {
+    let query = req.uri().query().unwrap_or("").to_string();
+    run_in_container(state, &p.namespace, &p.pod, "", &p.container, &query).await
+}
+
+/// `POST /run/:namespace/:pod/:uid/:container`
+pub async fn handle_run_uid(
+    axum::extract::State(state): axum::extract::State<RunState>,
+    Path(p): Path<ExecPath4>,
+    req: axum::extract::Request,
+) -> Response {
+    let query = req.uri().query().unwrap_or("").to_string();
+    run_in_container(state, &p.namespace, &p.pod, &p.uid, &p.container, &query).await
+}
+
+/// `(*Server).checkpoint` (server.go:1053-1136) with
+/// `(*Kubelet).CheckpointContainer` (kubelet.go:3259-3291).
+pub async fn handle_checkpoint(
+    axum::extract::State(state): axum::extract::State<RunState>,
+    Path(p): Path<ExecPath3>,
+    req: axum::extract::Request,
+) -> Response {
+    let Some(pod) = get_pod_by_name(&state, &p.namespace, &p.pod).await else {
+        return write_error(StatusCode::NOT_FOUND, "pod does not exist");
+    };
+    let container = p.container;
+    let found = pod.spec.as_ref().is_some_and(|s| {
+        s.containers.iter().any(|c| c.name == container)
+            || s.init_containers
+                .iter()
+                .flatten()
+                .any(|c| c.name == container)
+            || s.ephemeral_containers
+                .iter()
+                .flatten()
+                .any(|c| c.name == container)
+    });
+    if !found {
+        return write_error(
+            StatusCode::NOT_FOUND,
+            format!("container {container} does not exist"),
+        );
+    }
+
+    // "If the user specified one or multiple values for timeouts we are using
+    // the last available value."
+    let mut timeout: i64 = 0;
+    if let Some(last) = query_values(req.uri().query().unwrap_or(""), "timeout").pop() {
+        match last.parse::<i64>() {
+            Ok(t) => timeout = t,
+            Err(_) => {
+                return write_error(
+                    StatusCode::NOT_FOUND,
+                    "cannot parse value of timeout parameter",
+                )
+            }
+        }
+    }
+
+    let failed = |e: String| {
+        write_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "checkpointing of {}/{}/{} failed ({e})",
+                p.namespace, p.pod, container
+            ),
+        )
+    };
+    let container_id = match find_container(&pod, "", &container).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return failed(format!("container {container} not found")),
+        Err(e) => return failed(e.to_string()),
+    };
+    let location = state.checkpoints_dir.join(format!(
+        "checkpoint-{}-{}-{}.tar",
+        pod_full_name(&pod),
+        container,
+        chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
+    ));
+    let location = location.to_string_lossy().into_owned();
+    let mut cri = match rusternetes_cri::stream::connect().await {
+        Ok(c) => c,
+        Err(e) => return failed(e.to_string()),
+    };
+    if let Err(e) = cri
+        .checkpoint_container(&container_id, &location, timeout)
+        .await
+    {
+        return failed(e.to_string());
+    }
+    write_json_response(format!("{{\"items\":[\"{location}\"]}}").into_bytes())
+}
+
+/// The `/run` and `/checkpoint` routes of `InstallAuthRequiredHandlers`;
+/// `/checkpoint` only when `checkpoint_enabled` (the `ContainerCheckpoint`
+/// gate, server.go:620-628).
+pub fn run_router(state: RunState, checkpoint_enabled: bool) -> axum::Router {
+    use axum::routing::post;
+    let mut router = axum::Router::new()
+        .route("/run/:namespace/:pod/:container", post(handle_run))
+        .route("/run/:namespace/:pod/:uid/:container", post(handle_run_uid));
+    if checkpoint_enabled {
+        router = router.route(CHECKPOINT_PATH, post(handle_checkpoint));
+    }
+    router.with_state(state)
+}
+
 /// Build the `/containerLogs` response for a completed (`follow=false`) read.
 ///
 /// The body is deliberately a one-item *stream*, not `Body::from(bytes)`, so
@@ -908,6 +1155,122 @@ fn cri_container_gone(
                 Err(_) => false,
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod run_checkpoint_tests {
+    use super::*;
+    use crate::server::ServerState;
+    use axum::http::{Method, Request};
+    use rusternetes_storage::{Storage, StorageBackend};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    async fn app(checkpoint: bool) -> axum::Router {
+        let storage = Arc::new(StorageBackend::new_memory());
+        let pod = Pod {
+            type_meta: rusternetes_common::types::TypeMeta {
+                api_version: "v1".into(),
+                kind: "Pod".into(),
+            },
+            metadata: ObjectMeta {
+                name: "p".into(),
+                namespace: Some("ns".into()),
+                uid: "u1".into(),
+                ..Default::default()
+            },
+            spec: Some(
+                serde_json::from_value(serde_json::json!({
+                    "nodeName": "n",
+                    "containers": [{"name": "main", "image": "x"}]
+                }))
+                .unwrap(),
+            ),
+            status: None,
+        };
+        storage
+            .create(
+                &rusternetes_storage::build_key("pods", Some("ns"), "p"),
+                &pod,
+            )
+            .await
+            .unwrap();
+        run_router(
+            RunState {
+                server: ServerState {
+                    node_name: "n".into(),
+                    storage,
+                    kubelet: None,
+                },
+                checkpoints_dir: "/tmp/checkpoints".into(),
+            },
+            checkpoint,
+        )
+    }
+
+    async fn call(app: &axum::Router, m: Method, path: &str) -> (u16, String) {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(m)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&b).into_owned())
+    }
+
+    // server.go:994-998: unknown pod => 404 "pod does not exist".
+    #[tokio::test]
+    async fn run_unknown_pod_is_404() {
+        let app = app(true).await;
+        let (s, b) = call(&app, Method::POST, "/run/ns/nope/main?cmd=ls").await;
+        assert_eq!((s, b.as_str()), (404, "pod does not exist"));
+        let (s, _) = call(&app, Method::POST, "/run/ns/nope/u1/main?cmd=ls").await;
+        assert_eq!(s, 404);
+    }
+
+    // The /run web service only registers POST routes (server.go:526-529).
+    #[tokio::test]
+    async fn run_is_post_only() {
+        let app = app(true).await;
+        assert_eq!(
+            call(&app, Method::GET, "/run/ns/p/main?cmd=ls").await.0,
+            405
+        );
+    }
+
+    // server.go:1056-1086, 1100-1115.
+    #[tokio::test]
+    async fn checkpoint_validates_pod_container_and_timeout() {
+        let app = app(true).await;
+        let (s, b) = call(&app, Method::POST, "/checkpoint/ns/nope/main").await;
+        assert_eq!((s, b.as_str()), (404, "pod does not exist"));
+        let (s, b) = call(&app, Method::POST, "/checkpoint/ns/p/other").await;
+        assert_eq!((s, b.as_str()), (404, "container other does not exist"));
+        let (s, b) = call(&app, Method::POST, "/checkpoint/ns/p/main?timeout=abc").await;
+        assert_eq!(
+            (s, b.as_str()),
+            (404, "cannot parse value of timeout parameter")
+        );
+    }
+
+    // server.go:620: /checkpoint exists only with the ContainerCheckpoint gate.
+    #[tokio::test]
+    async fn checkpoint_route_absent_without_gate() {
+        let app = app(false).await;
+        assert_eq!(
+            call(&app, Method::POST, "/checkpoint/ns/p/main").await.0,
+            404
+        );
     }
 }
 
