@@ -134,6 +134,12 @@ struct Args {
     #[arg(long = "bootstrap-signer-controller", default_value_t = false)]
     bootstrap_signer_controller: bool,
 
+    /// `--terminated-pod-gc-threshold`: number of terminated pods that can
+    /// exist before the pod garbage collector starts deleting the oldest.
+    /// `<= 0` disables that pass (default 12500, podgc config defaults.go:34).
+    #[arg(long, default_value_t = controllers::podgc::DEFAULT_TERMINATED_POD_GC_THRESHOLD, allow_hyphen_values = true)]
+    terminated_pod_gc_threshold: i32,
+
     /// `AttachDetachControllerConfiguration.ReconcilerMaxWaitForUnmountDuration`
     /// (default 6m): how long a volume still mounted on an unhealthy node is
     /// kept attached before it is force detached.
@@ -637,6 +643,7 @@ async fn run_api_mode(
         csi_attachers: Vec::new(),
         attach_detach_controller: false,
         bootstrap_signer_controller: false,
+        terminated_pod_gc_threshold: args.terminated_pod_gc_threshold,
         // Route HPA metric fetches through the same kubeconfig-derived
         // credentials as the data plane (CA + bearer token, honouring the
         // insecure flag) instead of the default mTLS client cert under
@@ -1524,6 +1531,21 @@ async fn main() -> Result<()> {
         async move {
             if let Err(e) = controller.run().await {
                 tracing::error!("CertificateSigningRequest controller error: {}", e);
+            }
+        }
+    });
+
+    // Start the pod garbage collector (`newPodGarbageCollectorController`,
+    // cmd/kube-controller-manager/app/core.go:564-576).
+    let podgc = Arc::new(controllers::podgc::PodGcController::new(
+        storage.clone(),
+        args.terminated_pod_gc_threshold,
+    ));
+    spawn_controller!("PodGC controller", leader_elector, {
+        let controller = podgc.clone();
+        async move {
+            if let Err(e) = controller.run().await {
+                tracing::error!("PodGC controller error: {}", e);
             }
         }
     });
