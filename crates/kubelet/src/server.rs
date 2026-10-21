@@ -139,12 +139,31 @@ async fn handle_stats_summary(State(state): State<ServerState>) -> impl IntoResp
 /// Callers (`main.rs`, `lib.rs::run`) `.merge()` it into their own
 /// router so routes that need additional state (metrics, configz, exec)
 /// can be wired alongside.
+///
+/// `/runningpods/` is an auth-required, debugging-gated route upstream
+/// (`InstallAuthRequiredHandlers`, server.go:609-618); this fragment keeps it
+/// for callers that do not gate (tests). The kubelet servers use
+/// [`auth_not_required_router`] plus [`install_debugging_handlers`] instead.
+#[allow(dead_code)] // unused by the `kubelet` bin, which gates /runningpods/
 pub fn read_only_router(state: ServerState) -> Router {
+    auth_not_required_router(state.clone()).merge(running_pods_router(state))
+}
+
+/// The state-backed routes of `InstallAuthNotRequiredHandlers`
+/// (server.go:427-510): `/healthz`, `/pods` and `/stats/`, which are served
+/// whether or not `EnableDebuggingHandlers` is set.
+pub fn auth_not_required_router(state: ServerState) -> Router {
     Router::new()
         .route("/pods", get(handle_list_pods))
-        .route("/runningpods/", get(handle_list_running_pods))
         .route("/healthz", get(handle_healthz))
         .route("/stats/summary", get(handle_stats_summary))
+        .with_state(state)
+}
+
+/// `/runningpods/` (server.go:609-618, "used for testing only").
+pub fn running_pods_router(state: ServerState) -> Router {
+    Router::new()
+        .route("/runningpods/", get(handle_list_running_pods))
         .with_state(state)
 }
 
@@ -443,25 +462,35 @@ pub fn install_metrics_filter(
     router.layer(axum::middleware::from_fn_with_state(state, metrics_filter))
 }
 
+/// The `ContainerCheckpoint` gate, read once when the handlers are installed
+/// (server.go:620 reads it inside `InstallAuthRequiredHandlers`).
+pub fn checkpoint_enabled() -> bool {
+    rusternetes_common::feature_gates::gate_enabled("ContainerCheckpoint").unwrap_or(false)
+}
+
 /// The `NewServer` bucket inputs for this kubelet's installed handlers:
-/// debugging handlers are always on (`EnableDebuggingHandlers` default true),
-/// `ComponentStatusz` follows its gate, and `flagz`/`checkpoint` are off
-/// because this kubelet installs neither handler (no flagz registry,
-/// server.go:602-607; no `CheckpointContainer`).
-pub fn server_bucket_options() -> ServerBucketOptions {
+/// `enable_debugging_handlers` is `kubeCfg.EnableDebuggingHandlers`,
+/// `ComponentStatusz` follows its gate, `checkpoint` follows
+/// [`checkpoint_enabled`], and `flagz` is off because this kubelet installs no
+/// flagz handler (no flagz registry, server.go:602-607).
+pub fn server_bucket_options(enable_debugging_handlers: bool) -> ServerBucketOptions {
     ServerBucketOptions {
-        enable_debugging_handlers: true,
+        enable_debugging_handlers,
         flagz_enabled: false,
-        checkpoint_enabled: false,
+        checkpoint_enabled: checkpoint_enabled(),
         statusz_enabled: rusternetes_common::feature_gates::enabled(
             rusternetes_common::feature_gates::Feature::ComponentStatusz,
         ),
     }
 }
 
-/// Paths [`read_only_router`] registers (the route templates, as go-restful's
-/// `RegisteredHandlePaths()` reports them).
-pub const READ_ONLY_PATHS: [&str; 4] = ["/pods", "/runningpods/", "/healthz", "/stats/summary"];
+/// Paths [`auth_not_required_router`] registers (the route templates, as
+/// go-restful's `RegisteredHandlePaths()` reports them).
+pub const READ_ONLY_PATHS: [&str; 3] = ["/pods", "/healthz", "/stats/summary"];
+
+/// `/runningpods/` as [`running_pods_router`] registers it.
+#[allow(dead_code)] // unused by the `kubelet` bin
+pub const RUNNING_PODS_ROUTE: &str = "/runningpods/";
 
 /// `authorizer.AttributesRecord` (as populated by `GetRequestAttributes`).
 #[allow(dead_code)] // consumed by the kubelet authn/authz filter (not yet wired)
@@ -582,6 +611,79 @@ pub const STREAMING_PATHS: [&str; 7] = [
     "/portForward/:namespace/:pod/:uid",
     "/containerLogs/:namespace/:pod/:container",
 ];
+
+/// The path prefixes `InstallDebuggingDisabledHandlers` (server.go:633-651)
+/// answers: `"/run/", "/exec/", "/attach/", "/portForward/", "/containerLogs/",
+/// runningPodsPath, pprofBasePath, logsPath`. `/logs/` is registered by the
+/// system-log handler install (`server_logs`), not here.
+pub const DEBUGGING_DISABLED_PATHS: [&str; 7] = [
+    "/run/",
+    "/exec/",
+    "/attach/",
+    "/portForward/",
+    "/containerLogs/",
+    "/runningpods/",
+    "/debug/pprof/",
+];
+
+/// `getHandlerForDisabledEndpoint` / the handler of
+/// `InstallDebuggingDisabledHandlers`: `http.Error(w, msg, 405)`.
+fn disabled_endpoint(msg: &'static str) -> axum::response::Response {
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
+        format!("{msg}\n"),
+    )
+        .into_response()
+}
+
+/// `(*Server).InstallDebuggingDisabledHandlers` (server.go:633-651): with
+/// `EnableDebuggingHandlers` off, every method on the debugging prefixes
+/// answers 405 "Debug endpoints are disabled.". A Go `ServeMux` pattern ending
+/// in `/` also matches the subtree and redirects the bare path to it; here the
+/// bare path, the prefix and the subtree answer directly.
+pub fn install_debugging_disabled_handlers(router: Router) -> Router {
+    use axum::routing::any;
+    let mut router = router;
+    for prefix in DEBUGGING_DISABLED_PATHS {
+        let handler = any(|| async { disabled_endpoint("Debug endpoints are disabled.") });
+        router = router
+            .route(prefix.trim_end_matches('/'), handler.clone())
+            .route(prefix, handler.clone())
+            .route(&format!("{prefix}*rest"), handler);
+    }
+    router
+}
+
+/// `RegisteredHandlePaths()` contribution of the debugging handlers: when
+/// enabled, `InstallAuthRequiredHandlers`' runningpods/run/checkpoint web
+/// services (exec/attach/portForward/containerLogs are [`STREAMING_PATHS`]);
+/// when disabled, [`DEBUGGING_DISABLED_PATHS`].
+pub fn debugging_registered_paths(
+    enable_debugging_handlers: bool,
+    run_and_checkpoint: bool,
+    checkpoint_enabled: bool,
+) -> Vec<String> {
+    let mut paths: Vec<&str> = Vec::new();
+    if !enable_debugging_handlers {
+        paths.extend(DEBUGGING_DISABLED_PATHS);
+    } else {
+        paths.push("/runningpods/");
+        if run_and_checkpoint {
+            paths.extend([
+                "/run/:namespace/:pod/:container",
+                "/run/:namespace/:pod/:uid/:container",
+            ]);
+            if checkpoint_enabled {
+                paths.push("/checkpoint/:namespace/:pod/:container");
+            }
+        }
+    }
+    paths.into_iter().map(String::from).collect()
+}
 
 #[cfg(test)]
 mod statusz_tests {
@@ -968,5 +1070,107 @@ mod statusz_tests {
         ] {
             assert_eq!(get_url_root_path(path), want, "path is: {path}");
         }
+    }
+}
+
+#[cfg(test)]
+mod debugging_handlers_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Method, Request};
+    use tower::ServiceExt;
+
+    async fn call(app: &Router, method: Method, path: &str) -> (u16, String) {
+        let req = Request::builder()
+            .method(method)
+            .uri(path)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status().as_u16();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    // server_test.go:TestDebuggingDisabledHandlers. `/logs/kubelet.log` is
+    // served by the system-log handler install, not by this fragment.
+    #[tokio::test]
+    async fn debugging_disabled_handlers_answer_405_on_every_path() {
+        let app = install_debugging_disabled_handlers(Router::new());
+        let paths = [
+            "/run",
+            "/exec",
+            "/attach",
+            "/portForward",
+            "/containerLogs",
+            "/runningpods",
+            "/run/",
+            "/exec/",
+            "/attach/",
+            "/portForward/",
+            "/containerLogs/",
+            "/runningpods/",
+            "/run/xxx",
+            "/exec/xxx",
+            "/attach/xxx",
+            "/debug/pprof/profile",
+        ];
+        for p in paths {
+            for m in [Method::GET, Method::POST] {
+                let (status, body) = call(&app, m, p).await;
+                assert_eq!(status, 405, "{p}");
+                assert_eq!(body, "Debug endpoints are disabled.\n", "{p}");
+            }
+        }
+    }
+
+    // `InstallDebuggingDisabledHandlers` leaves the auth-not-required routes
+    // alone and /configz is not served (it is an auth-required handler).
+    #[tokio::test]
+    async fn disabled_keeps_healthz_and_drops_configz() {
+        let state = ServerState {
+            node_name: "n".into(),
+            storage: Arc::new(StorageBackend::new_memory()),
+            kubelet: None,
+        };
+        let app = install_debugging_disabled_handlers(
+            Router::new().merge(auth_not_required_router(state)),
+        );
+        assert_eq!(call(&app, Method::GET, "/healthz").await.0, 200);
+        assert_eq!(call(&app, Method::GET, "/pods").await.0, 200);
+        assert_eq!(call(&app, Method::GET, "/configz").await.0, 404);
+    }
+
+    #[test]
+    fn registered_paths_follow_the_gate() {
+        let on = debugging_registered_paths(true, true, true);
+        assert!(on.contains(&"/runningpods/".to_string()));
+        assert!(on.contains(&"/run/:namespace/:pod/:container".to_string()));
+        assert!(on.contains(&"/checkpoint/:namespace/:pod/:container".to_string()));
+        assert!(!debugging_registered_paths(true, true, false)
+            .iter()
+            .any(|p| p.starts_with("/checkpoint")));
+        let off = debugging_registered_paths(false, true, true);
+        assert_eq!(off.len(), DEBUGGING_DISABLED_PATHS.len());
+        assert!(off.contains(&"/debug/pprof/".to_string()));
+    }
+
+    // auth.go GetRequestAttributes: `/run` and `/checkpoint` map to the
+    // `proxy` / `checkpoint` subresource with the POST -> `create` verb.
+    #[test]
+    fn run_and_checkpoint_auth_attributes() {
+        let run = get_request_attributes("n", "u", "POST", "/run/ns/pod/c");
+        assert_eq!(run.len(), 1);
+        assert_eq!(
+            (run[0].verb.as_str(), run[0].subresource.as_str()),
+            ("create", "proxy")
+        );
+        let cp = get_request_attributes("n", "u", "POST", "/checkpoint/ns/pod/c");
+        assert_eq!(
+            (cp[0].verb.as_str(), cp[0].subresource.as_str()),
+            ("create", "checkpoint")
+        );
     }
 }

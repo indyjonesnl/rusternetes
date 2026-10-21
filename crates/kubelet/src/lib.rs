@@ -217,9 +217,12 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
             )
             .merge(server::read_only_router(server_state));
         // server.go:328 `installStatusZ()`: last, over the routes registered so far.
+        // No kubelet config file here: `EnableDebuggingHandlers` defaults to
+        // true; the exec/attach/run handlers are not part of this binary.
         let registered: Vec<String> = ["/metrics", "/configz"]
             .into_iter()
             .chain(server::READ_ONLY_PATHS)
+            .chain([server::RUNNING_PODS_ROUTE])
             .map(String::from)
             .collect();
         let app = server::install_statusz(app, registered);
@@ -227,7 +230,7 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
         // server.go:1176 `ServeHTTP`: request metrics outside the auth filter.
         let app = server::install_metrics_filter(
             app,
-            server::MetricsBuckets::new_server(server::server_bucket_options()),
+            server::MetricsBuckets::new_server(server::server_bucket_options(true)),
             true,
         );
         // Serve the kubelet API port over HTTPS (#1644) — a Kubernetes
