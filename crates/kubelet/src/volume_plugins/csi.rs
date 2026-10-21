@@ -55,6 +55,7 @@ mod vol_data_key {
     pub const NODE_NAME: &str = "nodeName";
     pub const ATTACHMENT_ID: &str = "attachmentID";
     pub const VOLUME_LIFECYCLE_MODE: &str = "volumeLifecycleMode";
+    pub const SELINUX_MOUNT_CONTEXT: &str = "seLinuxMountContext";
 }
 
 /// `globalMountInGlobalPath` (`csi_attacher.go:46`).
@@ -400,7 +401,8 @@ impl CsiPlugin {
     /// directory, i.e. the parent of `mount`). An `Ephemeral` volume becomes a
     /// `CSIVolumeSource` (`constructVolSourceSpec`), anything else a PV with a
     /// `CSIPersistentVolumeSource` and Filesystem mode (`constructPVSourceSpec`).
-    /// The SELinux mount context is not ported (feature gate off).
+    /// With `SELinuxMountReadWriteOncePod`, `SELinuxMountContext` is the
+    /// persisted `seLinuxMountContext` (`csi_plugin.go:579-581`).
     fn construct_volume_spec_at(&self, mount_path: &Path) -> Result<ReconstructedVolume> {
         let data = load_volume_data(mount_path).map_err(|e| {
             anyhow!(
@@ -409,6 +411,13 @@ impl CsiPlugin {
             )
         })?;
         let get = |k: &str| data.get(k).cloned().unwrap_or_default();
+        let selinux_mount_context = if rusternetes_common::feature_gates::enabled(
+            rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
+        ) {
+            get(vol_data_key::SELINUX_MOUNT_CONTEXT)
+        } else {
+            String::new()
+        };
         let (spec_vol_id, driver) = (
             get(vol_data_key::SPEC_VOL_ID),
             get(vol_data_key::DRIVER_NAME),
@@ -420,6 +429,7 @@ impl CsiPlugin {
             return Ok(ReconstructedVolume {
                 volume,
                 persistent_volume: None,
+                selinux_mount_context,
             });
         }
         let pv: PersistentVolume = serde_json::from_value(serde_json::json!({
@@ -433,6 +443,7 @@ impl CsiPlugin {
         Ok(ReconstructedVolume {
             volume,
             persistent_volume: Some(pv),
+            selinux_mount_context,
         })
     }
 
@@ -875,8 +886,10 @@ impl DeviceMounter for CsiAttacher {
     /// run by the `MountVolume` operation before `SetUp`
     /// ([`crate::volume_plugins::util::operation_generator::mount_volume`]).
     ///
-    /// Not ported: the SELinux mount option (`:331-343`,
-    /// `DeviceMounterArgs.SELinuxLabel`), see #2312.
+    /// SELinux (`:331-350`): with `SELinuxMountReadWriteOncePod`, a driver whose
+    /// `CSIDriver.Spec.SELinuxMount` is set and a non-empty
+    /// `DeviceMounterArgs.SELinuxLabel` stage with `-o context=` and persist
+    /// `seLinuxMountContext` in the device `vol_data.json`.
     async fn mount_device(
         &self,
         spec: &Spec<'_>,
@@ -938,6 +951,26 @@ impl DeviceMounter for CsiAttacher {
                 })?;
         }
 
+        let mut mount_options = pv.spec.mount_options.clone().unwrap_or_default();
+        let mut selinux_supported = false;
+        if rusternetes_common::feature_gates::enabled(
+            rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
+        ) {
+            // `c.plugin.SupportsSELinuxContextMount(spec)` (`csi_plugin.go:637`):
+            // the CSIDriver fetched above; a missing one is `(false, nil)`.
+            let support = driver
+                .as_ref()
+                .and_then(|d| d.spec.se_linux_mount)
+                .unwrap_or(false);
+            if support && !args.selinux_label.is_empty() {
+                mount_options = crate::volume_plugins::util::selinux::add_selinux_mount_option(
+                    mount_options,
+                    &args.selinux_label,
+                );
+                selinux_supported = true;
+            }
+        }
+
         // Store volume metadata for UnmountDevice. Keep it around even if the
         // driver does not support NodeStage, UnmountDevice still needs it.
         make_dir_0750(device_mount_path).map_err(|e| {
@@ -972,10 +1005,16 @@ impl DeviceMounter for CsiAttacher {
                 ))
             })?;
 
-        let data = HashMap::from([
+        let mut data = HashMap::from([
             (vol_data_key::VOL_HANDLE.to_string(), handle.clone()),
             (vol_data_key::DRIVER_NAME.to_string(), pv_src.driver.clone()),
         ]);
+        if selinux_supported {
+            data.insert(
+                vol_data_key::SELINUX_MOUNT_CONTEXT.to_string(),
+                args.selinux_label.clone(),
+            );
+        }
         if let Err(e) = save_volume_data(data_dir, &data) {
             error!("kubernetes.io/csi: failed to save volume info data: {e}");
             if let Err(re) = remove_mount_dir(device_mount_path) {
@@ -1006,7 +1045,7 @@ impl DeviceMounter for CsiAttacher {
                 &access_mode,
                 stage_secrets,
                 pv_src.volume_attributes.clone().unwrap_or_default(),
-                pv.spec.mount_options.as_deref().unwrap_or_default(),
+                &mount_options,
                 node_stage_fs_group,
             )
             .await;

@@ -190,6 +190,17 @@ pub fn supports_selinux_context_mount(
     }
 }
 
+/// Port of `AddSELinuxMountOption` (`pkg/volume/util/selinux.go:228-236`):
+/// append `context="XYZ"` to the mount options. Double quotes allow a comma
+/// in the label (Go `%q`; Rust `{:?}` agrees on the ASCII labels SELinux uses).
+pub fn add_selinux_mount_option(mut options: Vec<String>, selinux_context: &str) -> Vec<String> {
+    if !feature_gates::enabled(Feature::SELinuxMountReadWriteOncePod) {
+        return options;
+    }
+    options.push(format!("context={selinux_context:?}"));
+    options
+}
+
 /// Port of `VolumeSupportsSELinuxMount` (`pkg/volume/util/selinux.go:185-208`).
 ///
 /// Answers "can this volume's *access mode* carry `-o context=`", which is a
@@ -401,5 +412,33 @@ mod translator_tests {
         let l = labeler();
         selinux_options_to_file_label_with(&l, true, Some(&so("", "", "", "s0:c1,c2"))).unwrap();
         assert!(!l.is_reserved("s0:c1,c2"));
+    }
+}
+
+#[cfg(test)]
+mod add_selinux_mount_option_tests {
+    use super::*;
+
+    /// `selinux.go:233-235`: the comma-bearing example from upstream's comment
+    /// is quoted as one option; the gate off leaves the options alone.
+    #[test]
+    #[serial_test::serial]
+    fn quotes_the_label_when_the_gate_is_on_and_skips_it_when_off() {
+        let ctx = "system_u:object_r:container_file_t:s0:c15,c25";
+        let on = feature_gates::with_feature(Feature::SELinuxMountReadWriteOncePod, true);
+        assert_eq!(
+            add_selinux_mount_option(vec!["dirsync".into(), "noatime".into()], ctx),
+            vec![
+                "dirsync".to_string(),
+                "noatime".into(),
+                format!("context=\"{ctx}\"")
+            ]
+        );
+        drop(on);
+        let _off = feature_gates::with_feature(Feature::SELinuxMountReadWriteOncePod, false);
+        assert_eq!(
+            add_selinux_mount_option(vec!["a".into()], ctx),
+            vec!["a".to_string()]
+        );
     }
 }

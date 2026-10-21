@@ -325,6 +325,7 @@ async fn mount_device_delegates_fs_group_to_a_volume_mount_group_driver() {
     let args = DeviceMounterArgs {
         fs_group: Some(4242),
         node_name: "node-1".into(),
+        ..Default::default()
     };
     dm.mount_device(&spec, "", &path, &args).await.unwrap();
     let calls = f.fake.calls.lock().unwrap();
@@ -2287,4 +2288,137 @@ fn can_attach_waits_for_cache_sync() {
     let r = can_attach_of(&p, &v, Some(&pv("noattach.csi.example.com", json!({}))));
     assert!(!r.unwrap());
     t.join().unwrap();
+}
+
+// ---- ConstructVolumeSpec / MountDevice: SELinux mount context (#3882) ------
+
+const SELINUX_CTX: &str = "system_u:object_r:container_file_t:s0:c314,c894";
+
+/// `TestPluginConstructVolumeSpec` SELinux rows (`csi_plugin_test.go:349-366`):
+/// the persisted `seLinuxMountContext` comes back only with the gate on.
+#[tokio::test]
+#[serial_test::serial]
+async fn construct_volume_spec_returns_the_selinux_context_only_with_the_gate() {
+    for (gate, expected) in [(true, SELINUX_CTX), (false, "")] {
+        let _g = rusternetes_common::feature_gates::with_feature(
+            rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
+            gate,
+        );
+        let f = fx("construct-selinux", &[], None).await;
+        let dir = std::path::Path::new(&f.root).join(format!("vol-{gate}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let data = HashMap::from([
+            ("specVolID".to_string(), "spec3".to_string()),
+            ("driverName".to_string(), f.driver.clone()),
+            ("volumeHandle".to_string(), "handle3".to_string()),
+            ("seLinuxMountContext".to_string(), SELINUX_CTX.to_string()),
+        ]);
+        save_volume_data(&dir, &data).unwrap();
+        let rec = f
+            .plugin
+            .construct_volume_spec("spec3", dir.to_str().unwrap())
+            .unwrap();
+        assert_eq!(rec.selinux_mount_context, expected, "gate={gate}");
+    }
+}
+
+/// `MountDevice` SELinux (`csi_attacher.go:331-350`): returns the stage mount
+/// flags and whether the device `vol_data.json` persisted the context.
+async fn selinux_mount_device(
+    name: &str,
+    driver_spec: serde_json::Value,
+    label: &str,
+) -> (Vec<String>, Option<String>) {
+    let f = fx(name, &[Cap::StageUnstageVolume], Some(driver_spec)).await;
+    let p = pv(&f.driver, json!({}));
+    let v = claim_volume();
+    let spec = Spec {
+        volume: &v,
+        persistent_volume: Some(&p),
+        read_only: false,
+        migrated: false,
+        inline_volume_spec_for_csi_migration: false,
+    };
+    let dm = f.plugin.new_device_mounter().unwrap();
+    let path = dm.get_device_mount_path(&spec).unwrap();
+    let args = DeviceMounterArgs {
+        selinux_label: label.into(),
+        node_name: "node-1".into(),
+        ..Default::default()
+    };
+    dm.mount_device(&spec, "", &path, &args).await.unwrap();
+    let flags = {
+        let calls = f.fake.calls.lock().unwrap();
+        match calls.stage[0]
+            .volume_capability
+            .as_ref()
+            .unwrap()
+            .access_type
+            .as_ref()
+            .unwrap()
+        {
+            AccessType::Mount(m) => m.mount_flags.clone(),
+            other => panic!("expected mount, got {other:?}"),
+        }
+    };
+    let data = load_volume_data(std::path::Path::new(&path).parent().unwrap()).unwrap();
+    (flags, data.get("seLinuxMountContext").cloned())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn mount_device_stages_with_the_selinux_context_option() {
+    let _g = rusternetes_common::feature_gates::with_feature(
+        rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
+        true,
+    );
+    // Driver supports `-o context=` and the pod has a label.
+    let (flags, ctx) = selinux_mount_device(
+        "stage-se-yes",
+        json!({"attachRequired": false, "seLinuxMount": true}),
+        SELINUX_CTX,
+    )
+    .await;
+    assert_eq!(
+        flags,
+        vec!["foo=bar".to_string(), format!("context=\"{SELINUX_CTX}\"")]
+    );
+    assert_eq!(ctx.as_deref(), Some(SELINUX_CTX));
+
+    // Driver does not support it.
+    let (flags, ctx) = selinux_mount_device(
+        "stage-se-no",
+        json!({"attachRequired": false, "seLinuxMount": false}),
+        SELINUX_CTX,
+    )
+    .await;
+    assert_eq!(flags, vec!["foo=bar".to_string()]);
+    assert_eq!(ctx, None);
+
+    // No pod label.
+    let (flags, ctx) = selinux_mount_device(
+        "stage-se-nolabel",
+        json!({"attachRequired": false, "seLinuxMount": true}),
+        "",
+    )
+    .await;
+    assert_eq!(flags, vec!["foo=bar".to_string()]);
+    assert_eq!(ctx, None);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn mount_device_ignores_the_selinux_label_with_the_gate_off() {
+    let _g = rusternetes_common::feature_gates::with_feature(
+        rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
+        false,
+    );
+    let (flags, ctx) = selinux_mount_device(
+        "stage-se-gateoff",
+        json!({"attachRequired": false, "seLinuxMount": true}),
+        SELINUX_CTX,
+    )
+    .await;
+    assert_eq!(flags, vec!["foo=bar".to_string()]);
+    assert_eq!(ctx, None);
 }
