@@ -375,6 +375,19 @@ impl ApiClient {
     }
 
     pub async fn post<T: Serialize, R: DeserializeOwned>(&self, path: &str, body: &T) -> Result<R> {
+        self.post_with_status(path, body).await.1
+    }
+
+    /// `POST` that also reports the HTTP status code of the response, as the
+    /// `(result, statusCode, err)` of the webhook review clients' `Create`
+    /// (`rest.Result.StatusCode`, plugin/pkg/authenticator/token/webhook/
+    /// webhook.go `tokenReviewV1Client.Create`). The code is 0 when no
+    /// response was received.
+    pub async fn post_with_status<T: Serialize, R: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &T,
+    ) -> (u16, Result<R>) {
         let url = format!("{}{}", self.base_url, path);
         self.limiter.acquire().await;
         let mut request = self.client.post(&url).json(body);
@@ -383,24 +396,30 @@ impl ApiClient {
             request = request.header("Authorization", format!("Bearer {}", token));
         }
 
-        let response = request
-            .send()
-            .await
-            .context("Failed to send POST request")?;
+        let response = match request.send().await.context("Failed to send POST request") {
+            Ok(r) => r,
+            Err(e) => return (0, Err(e)),
+        };
 
-        if !response.status().is_success() {
-            let status = response.status();
+        let status = response.status();
+        if !status.is_success() {
             let retry_after = retry_after_seconds(&response);
             let body = response.text().await.unwrap_or_default();
-            return Err(format_status_error(
-                status,
-                &reqwest::Method::POST,
-                &body,
-                retry_after,
-            ));
+            return (
+                status.as_u16(),
+                Err(format_status_error(
+                    status,
+                    &reqwest::Method::POST,
+                    &body,
+                    retry_after,
+                )),
+            );
         }
 
-        response.json().await.context("Failed to parse response")
+        (
+            status.as_u16(),
+            response.json().await.context("Failed to parse response"),
+        )
     }
 
     pub async fn put<T: Serialize, R: DeserializeOwned>(&self, path: &str, body: &T) -> Result<R> {
