@@ -223,12 +223,15 @@ pub trait VolumePlugin: Send + Sync {
 pub struct ReconstructedVolume {
     pub volume: Volume,
     pub persistent_volume: Option<PersistentVolume>,
+    /// `ReconstructedVolume.SELinuxMountContext` (`plugins.go`): the
+    /// `-o context=` the volume was mounted with, empty when none.
+    pub selinux_mount_context: String,
 }
 
 /// Port of `volume.DeviceMounterArgs` (`pkg/volume/volume.go:290-294`).
 ///
-/// `SELinuxLabel` is not ported (SELinuxMountReadWriteOncePod is not modelled
-/// for CSI; see #2312).
+/// `selinux_label` is `SELinuxLabel`: with `SELinuxMountReadWriteOncePod` the
+/// CSI attacher adds it to the stage mount flags as `-o context=`.
 ///
 /// **Deviation:** `node_name` is not upstream. Upstream's attacher reads it
 /// from `host.GetNodeName()` (`csi_attacher.go:297`); our `VolumeHost` has no
@@ -236,6 +239,7 @@ pub struct ReconstructedVolume {
 #[derive(Clone, Debug, Default)]
 pub struct DeviceMounterArgs {
     pub fs_group: Option<i64>,
+    pub selinux_label: String,
     pub node_name: String,
 }
 
