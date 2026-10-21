@@ -39,8 +39,17 @@
 //!   `attach_detach_controller.go:92`) expired (unless
 //!   `disableForceDetachOnTimeout`), or the node has the
 //!   `node.kubernetes.io/out-of-service` taint. Re-desired attached volumes
-//!   reset the timer (`:342-346`). `verifySafeToDetach` has no equivalent
-//!   here (`VerifyVolumesAreAttached` is not ported).
+//!   reset the timer (`:342-346`).
+//!
+//! - `verifySafeToDetach` (`reconciler.go:269-276`, `operation_generator.go`
+//!   `GenerateDetachVolumeFunc` `:393-395` + `verifyVolumeIsSafeToDetach`
+//!   `:1489-1514`): unless the detach is forced (timeout expired, or the
+//!   out-of-service taint), the node is re-read right before the delete and
+//!   the detach is refused while it still lists the volume in
+//!   `status.volumesInUse`. A node NotFound skips the check; a read error
+//!   fails the detach. A failed detach re-adds the volume to the report
+//!   (`reconciler.go` `AddVolumeToReportAsAttached`, `:294-300`).
+//!   `VerifyVolumesAreAttached` (the periodic `syncStates` probe) is NOT ported.
 //!
 //! - `.../reconciler/reconciler.go` `reportMultiAttachError` (`:376`), reported
 //!   once per volume/node (`MultiAttachErrorReported`, `:352`, reset when the
@@ -514,6 +523,39 @@ impl<S: Storage + 'static> AttachDetachController<S> {
         }
     }
 
+    /// `verifyVolumeIsSafeToDetach` (`operation_generator.go:1489-1514`): the
+    /// freshly read node must not list `unique` in `status.volumesInUse`.
+    pub async fn verify_volume_is_safe_to_detach(
+        &self,
+        node_name: &str,
+        unique: &str,
+    ) -> std::result::Result<(), String> {
+        let node: Node = match self.storage.get(&build_key("nodes", None, node_name)).await {
+            Ok(n) => n,
+            Err(Error::NotFound(_)) => {
+                warn!("Node {node_name} not found on API server. DetachVolume will skip safe to detach check");
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(format!(
+                    "DetachVolume failed fetching node from API server: {e}"
+                ))
+            }
+        };
+        let in_use = node
+            .status
+            .as_ref()
+            .and_then(|s| s.volumes_in_use.as_ref())
+            .is_some_and(|u| u.iter().any(|v| v == unique));
+        if in_use {
+            return Err(format!(
+                "DetachVolume failed for volume {unique} on node {node_name}: volume is still in use by node, according to Node status"
+            ));
+        }
+        info!("Verified volume {unique} is safe to detach from {node_name}");
+        Ok(())
+    }
+
     /// One pass of `reconciler.reconcile`: detaches, then attaches.
     /// `reportMultiAttachError` (`reconciler.go:376-433`): a Warning
     /// `FailedAttachVolume` event on every pod waiting for `w`, naming the pods
@@ -767,6 +809,22 @@ impl<S: Storage + 'static> AttachDetachController<S> {
                     .or_default()
                     .insert(unique);
                 continue;
+            }
+            // reconciler.go:275: the safe-to-detach check is skipped when the
+            // force timeout expired or the node is out of service.
+            if !force_timeout_expired && !out_of_service {
+                if let Err(e) = self
+                    .verify_volume_is_safe_to_detach(&va.spec.node_name, &unique)
+                    .await
+                {
+                    warn!("{e}");
+                    // reconciler.go:294-300: back into the report.
+                    report
+                        .entry(va.spec.node_name.clone())
+                        .or_default()
+                        .insert(unique);
+                    continue;
+                }
             }
             // Detach (csi_attacher.go:442): delete; NotFound is done.
             self.storage
