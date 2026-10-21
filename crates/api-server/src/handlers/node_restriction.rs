@@ -27,8 +27,14 @@
 //! so static-pod lifecycle was broken (#1906). This module is the missing half;
 //! the authorizer grant is restored alongside it.
 
+use rusternetes_common::authz::{Authorizer, Decision, RequestAttributes};
+use rusternetes_common::csi_translation::CsiTranslator;
+use rusternetes_common::resources::csi::CSIDriver;
+use rusternetes_common::resources::pod::Volume;
 use rusternetes_common::resources::podcertificaterequest::PodCertificateRequest;
-use rusternetes_common::resources::{Node, Pod, ServiceAccount};
+use rusternetes_common::resources::{
+    Node, PersistentVolume, PersistentVolumeClaim, Pod, ServiceAccount, TokenRequest,
+};
 use rusternetes_common::types::ObjectMeta;
 use rusternetes_common::{Error, Result};
 use rusternetes_middleware::AuthContext;
@@ -335,6 +341,280 @@ where
     Ok(())
 }
 
+/// `admitServiceAccount` (`plugin/pkg/admission/noderestriction/admission.go:623-674`),
+/// dispatched from `Admit` at `admission.go:224-225`: a node may only create a
+/// `serviceaccounts/token` bound to a pod scheduled on itself. Every other
+/// operation or subresource on serviceaccounts is not restricted here.
+///
+/// Upstream's lister errors map as: NotFound is returned as-is (`:650-652`),
+/// anything else is Forbidden (`:653-655`).
+///
+/// `audience_restriction` is the `ServiceAccountNodeAudienceRestriction` gate
+/// (`:111`, pkg/features/kube_features.go:1773-1776, Beta, on since 1.33).
+pub async fn admit_service_account_token<S>(
+    storage: &S,
+    authz: &dyn Authorizer,
+    auth: &AuthContext,
+    namespace: &str,
+    sa_name: &str,
+    tr: &TokenRequest,
+    audience_restriction: bool,
+) -> Result<()>
+where
+    S: rusternetes_storage::Storage,
+{
+    let Some(node_name) = node_identity(auth) else {
+        return Ok(());
+    };
+
+    // TokenRequests from a node must have a pod binding. That pod must be
+    // scheduled on the node.
+    let bound = tr.spec.bound_object_ref.as_ref();
+    let get = |f: fn(
+        &rusternetes_common::resources::authentication::BoundObjectReference,
+    ) -> &Option<String>| {
+        bound
+            .and_then(|b| f(b).as_deref())
+            .unwrap_or("")
+            .to_string()
+    };
+    let api_version = get(|b| &b.api_version);
+    let kind = get(|b| &b.kind);
+    let ref_name = get(|b| &b.name);
+    let ref_uid = get(|b| &b.uid);
+    if bound.is_none() || api_version != "v1" || kind != "Pod" || ref_name.is_empty() {
+        return Err(Error::Forbidden(
+            "node requested token not bound to a pod".to_string(),
+        ));
+    }
+    if ref_uid.is_empty() {
+        return Err(Error::Forbidden(
+            "node requested token with a pod binding without a uid".to_string(),
+        ));
+    }
+    let pod: Pod = storage
+        .get(&rusternetes_storage::build_key(
+            "pods",
+            Some(namespace),
+            &ref_name,
+        ))
+        .await
+        .map_err(|e| match e {
+            Error::NotFound(m) => Error::NotFound(m),
+            other => Error::Forbidden(other.to_string()),
+        })?;
+    if ref_uid != pod.metadata.uid {
+        return Err(Error::Forbidden(format!(
+            "the UID in the bound object reference ({ref_uid}) does not match the UID in record. The object might have been deleted and then recreated"
+        )));
+    }
+    if spec_node_name(&pod) != node_name {
+        return Err(Error::Forbidden(
+            "node requested token bound to a pod scheduled on a different node".to_string(),
+        ));
+    }
+
+    if audience_restriction {
+        validate_node_service_account_audience(storage, authz, auth, namespace, sa_name, tr, &pod)
+            .await
+            .map_err(Error::Forbidden)?;
+    }
+    Ok(())
+}
+
+/// `validateNodeServiceAccountAudience` (`admission.go:676-719`).
+async fn validate_node_service_account_audience<S>(
+    storage: &S,
+    authz: &dyn Authorizer,
+    auth: &AuthContext,
+    namespace: &str,
+    sa_name: &str,
+    tr: &TokenRequest,
+    pod: &Pod,
+) -> std::result::Result<(), String>
+where
+    S: rusternetes_storage::Storage,
+{
+    let requested_audience = match tr.spec.audiences.len() {
+        0 => "",
+        1 => tr.spec.audiences[0].as_str(),
+        _ => return Err("node may only request 0 or 1 audiences".to_string()),
+    };
+
+    let found = pod_references_audience(storage, pod, requested_audience)
+        .await
+        .map_err(|e| format!("error validating audience {requested_audience:?}: {e}"))?;
+    if found {
+        return Ok(());
+    }
+
+    let user = auth.user.username.as_str();
+    let attrs = RequestAttributes::new(
+        auth.user.clone(),
+        "request-serviceaccounts-token-audience",
+        requested_audience,
+    )
+    .with_namespace(namespace)
+    .with_api_group("")
+    .with_api_version("v1")
+    .with_name(sa_name);
+
+    // An authorizer like RBAC can hit evaluation errors and still allow, so the
+    // decision is checked before the error (`admission.go:704-711`).
+    match authz.authorize(&attrs).await {
+        Ok(Decision::Allow) => Ok(()),
+        Ok(Decision::Deny(_)) => Err(format!(
+            "audience {requested_audience:?} not found in pod spec volume, {user} is not authorized to request tokens for this audience"
+        )),
+        Err(e) => Err(format!(
+            "audience {requested_audience:?} not found in pod spec volume, error authorizing {user} to request tokens for this audience: {e}"
+        )),
+    }
+}
+
+/// `podReferencesAudience` (`admission.go:721-777`). Errors are aggregated like
+/// `utilerrors.NewAggregate`: one error prints bare, several as `[a, b]`.
+async fn pod_references_audience<S>(
+    storage: &S,
+    pod: &Pod,
+    audience: &str,
+) -> std::result::Result<bool, String>
+where
+    S: rusternetes_storage::Storage,
+{
+    let translator = CsiTranslator::new();
+    let namespace = pod.metadata.namespace.as_deref().unwrap_or("");
+    let mut errs: Vec<String> = Vec::new();
+
+    let volumes: &[Volume] = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.volumes.as_deref())
+        .unwrap_or(&[]);
+    for v in volumes {
+        if let Some(projected) = v.projected.as_ref() {
+            for src in projected.sources.iter().flatten() {
+                if let Some(t) = src.service_account_token.as_ref() {
+                    if t.audience.as_deref().unwrap_or("") == audience {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+
+        // also allow audiences for CSI token requests
+        // - pod --> ephemeral --> pvc --> pv --> csi --> driver --> tokenrequest with audience
+        // - pod --> pvc --> pv --> csi --> driver --> tokenrequest with audience
+        // - pod --> csi --> driver --> tokenrequest with audience
+        let driver: std::result::Result<String, String> = if v
+            .ephemeral
+            .as_ref()
+            .is_some_and(|e| e.volume_claim_template.is_some())
+        {
+            // `ephemeral.VolumeClaimName` (`component-helpers/storage/ephemeral`):
+            // `<pod name>-<volume name>`.
+            let claim = format!("{}-{}", pod.metadata.name, v.name);
+            get_csi_from_pvc(storage, &translator, namespace, &claim).await
+        } else if let Some(pvc) = v.persistent_volume_claim.as_ref() {
+            get_csi_from_pvc(storage, &translator, namespace, &pvc.claim_name).await
+        } else if let Some(csi) = v.csi.as_ref() {
+            Ok(csi.driver.clone())
+        } else if translator.is_inline_migratable(v) {
+            translator
+                .translate_in_tree_inline_volume_to_csi(v, namespace)
+                .map(|pv| pv.spec.csi.map(|c| c.driver).unwrap_or_default())
+        } else {
+            Ok(String::new())
+        };
+
+        let driver = match driver {
+            Ok(d) => d,
+            Err(e) => {
+                errs.push(e);
+                continue;
+            }
+        };
+        if !driver.is_empty() {
+            match csi_driver_has_audience(storage, &driver, audience).await {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(e) => errs.push(e),
+            }
+        }
+    }
+
+    match errs.len() {
+        0 => Ok(false),
+        1 => Err(errs.remove(0)),
+        _ => Err(format!("[{}]", errs.join(", "))),
+    }
+}
+
+/// `getCSIFromPVC` (`admission.go:779-804`): the PVC -> PV -> CSI driver chain,
+/// translating an in-tree PV first.
+async fn get_csi_from_pvc<S>(
+    storage: &S,
+    translator: &CsiTranslator,
+    namespace: &str,
+    claim_name: &str,
+) -> std::result::Result<String, String>
+where
+    S: rusternetes_storage::Storage,
+{
+    let pvc: PersistentVolumeClaim = storage
+        .get(&rusternetes_storage::build_key(
+            "persistentvolumeclaims",
+            Some(namespace),
+            claim_name,
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
+    let pv_name = pvc.spec.volume_name.clone().unwrap_or_default();
+    let pv: PersistentVolume = storage
+        .get(&rusternetes_storage::build_key(
+            "persistentvolumes",
+            None,
+            &pv_name,
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Some(csi) = pv.spec.csi.as_ref() {
+        return Ok(csi.driver.clone());
+    }
+    if translator.is_pv_migratable(&pv) {
+        let translated = translator.translate_in_tree_pv_to_csi(&pv)?;
+        if let Some(csi) = translated.spec.csi.as_ref() {
+            return Ok(csi.driver.clone());
+        }
+    }
+    Ok(String::new())
+}
+
+/// `csiDriverHasAudience` (`admission.go:806-818`).
+async fn csi_driver_has_audience<S>(
+    storage: &S,
+    driver_name: &str,
+    audience: &str,
+) -> std::result::Result<bool, String>
+where
+    S: rusternetes_storage::Storage,
+{
+    let driver: CSIDriver = storage
+        .get(&rusternetes_storage::build_key(
+            "csidrivers",
+            None,
+            driver_name,
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(driver
+        .spec
+        .token_requests
+        .iter()
+        .flatten()
+        .any(|t| t.audience == audience))
+}
+
 /// `podutil.HasAPIObjectReference` (`pkg/api/pod/util.go:1696-1766`), returning
 /// the resource name upstream reports, or `None` when the pod references
 /// nothing from the API.
@@ -428,4 +708,307 @@ fn api_object_reference(pod: &Pod) -> Option<&'static str> {
     }
 
     None
+}
+
+/// Ports of the `serviceaccounts/token` rows of `TestAdmit`
+/// (`plugin/pkg/admission/noderestriction/admission_test.go:1342-1520`).
+#[cfg(test)]
+mod service_account_token_tests {
+    use super::*;
+    use rusternetes_common::authz::{AlwaysAllowAuthorizer, AlwaysDenyAuthorizer};
+    use rusternetes_storage::{MemoryStorage, Storage};
+    use serde_json::{json, Value};
+
+    fn user(name: &str, groups: &[&str]) -> AuthContext {
+        AuthContext {
+            user: rusternetes_common::auth::UserInfo {
+                username: name.to_string(),
+                uid: String::new(),
+                groups: groups.iter().map(|g| g.to_string()).collect(),
+                extra: Default::default(),
+            },
+        }
+    }
+
+    fn pod(name: &str, uid: &str, node: &str, volumes: Value) -> Value {
+        json!({"apiVersion":"v1","kind":"Pod",
+            "metadata":{"name":name,"namespace":"ns","uid":uid},
+            "spec":{"nodeName":node,"containers":[{"name":"c","image":"i"}],"volumes":volumes}})
+    }
+
+    async fn put<T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync>(
+        s: &MemoryStorage,
+        resource: &str,
+        ns: Option<&str>,
+        name: &str,
+        v: Value,
+    ) {
+        let obj: T = serde_json::from_value(v).unwrap();
+        s.create(&rusternetes_storage::build_key(resource, ns, name), &obj)
+            .await
+            .unwrap();
+    }
+
+    fn tr(pod: Option<(&str, &str)>, audiences: &[&str]) -> TokenRequest {
+        let mut spec = json!({"audiences": audiences});
+        if let Some((n, u)) = pod {
+            let mut r = json!({"apiVersion":"v1","kind":"Pod","name":n});
+            if !u.is_empty() {
+                r["uid"] = json!(u);
+            }
+            spec["boundObjectRef"] = r;
+        }
+        serde_json::from_value(json!({"spec": spec})).unwrap()
+    }
+
+    fn driver(name: &str, audience: &str) -> Value {
+        json!({"apiVersion":"storage.k8s.io/v1","kind":"CSIDriver","metadata":{"name":name},
+            "spec":{"tokenRequests":[{"audience":audience}]}})
+    }
+
+    async fn run(s: &MemoryStorage, t: &TokenRequest, gate: bool, allow: bool) -> Result<()> {
+        let auth = user("system:node:mynode", &["system:nodes"]);
+        if allow {
+            admit_service_account_token(s, &AlwaysAllowAuthorizer, &auth, "ns", "mysa", t, gate)
+                .await
+        } else {
+            admit_service_account_token(s, &AlwaysDenyAuthorizer, &auth, "ns", "mysa", t, gate)
+                .await
+        }
+    }
+
+    fn msg(r: Result<()>) -> String {
+        match r.unwrap_err() {
+            Error::Forbidden(m) | Error::Internal(m) | Error::NotFound(m) => m,
+            e => e.to_string(),
+        }
+    }
+
+    const NOT_AUTHORIZED: &str = "not found in pod spec volume, system:node:mynode is not authorized to request tokens for this audience";
+
+    async fn base() -> MemoryStorage {
+        let s = MemoryStorage::new();
+        let own = pod("mypod", "u1", "mynode", json!([]));
+        let other = pod("other", "u2", "othernode", json!([]));
+        put::<Pod>(&s, "pods", Some("ns"), "mypod", own).await;
+        put::<Pod>(&s, "pods", Some("ns"), "other", other).await;
+        s
+    }
+
+    #[tokio::test]
+    async fn non_node_is_not_restricted() {
+        let s = base().await;
+        let auth = user("alice", &[]);
+        let t = tr(None, &["foo"]);
+        admit_service_account_token(&s, &AlwaysDenyAuthorizer, &auth, "ns", "mysa", &t, true)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn binding_rules() {
+        let s = base().await;
+        // forbid create of unbound token
+        assert_eq!(
+            msg(run(&s, &tr(None, &["foo"]), false, true).await),
+            "node requested token not bound to a pod"
+        );
+        // forbid create of token bound to nonexistent pod
+        let r = run(&s, &tr(Some(("nopod", "someuid")), &["foo"]), false, true).await;
+        assert!(matches!(r, Err(Error::NotFound(_))));
+        // forbid create of token bound to pod without uid
+        assert_eq!(
+            msg(run(&s, &tr(Some(("mypod", "")), &["foo"]), false, true).await),
+            "node requested token with a pod binding without a uid"
+        );
+        // uid mismatch
+        let m = msg(run(&s, &tr(Some(("mypod", "zzz")), &["foo"]), false, true).await);
+        assert!(m.starts_with("the UID in the bound object reference (zzz) does not match"));
+        // forbid create of token bound to pod scheduled on another node
+        assert_eq!(
+            msg(run(&s, &tr(Some(("other", "u2")), &["foo"]), false, true).await),
+            "node requested token bound to a pod scheduled on a different node"
+        );
+        // allow create of token bound to pod scheduled this node
+        run(&s, &tr(Some(("mypod", "u1")), &["foo"]), false, true)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn audience_in_projected_volume() {
+        let s = base().await;
+        let vols = |a: &str| json!([{"name":"p","projected":{"sources":[{"serviceAccountToken":{"path":"t","audience":a}}]}}]);
+        let foo = pod("psat", "u3", "mynode", vols("foo"));
+        let empty = pod("psat-empty", "u4", "mynode", vols(""));
+        put::<Pod>(&s, "pods", Some("ns"), "psat", foo).await;
+        put::<Pod>(&s, "pods", Some("ns"), "psat-empty", empty).await;
+        run(&s, &tr(Some(("psat", "u3")), &["foo"]), true, false)
+            .await
+            .unwrap();
+        // no requested audience matches the empty projected audience
+        run(&s, &tr(Some(("psat-empty", "u4")), &[]), true, false)
+            .await
+            .unwrap();
+        // multiple audiences
+        assert_eq!(
+            msg(run(&s, &tr(Some(("psat", "u3")), &["foo", "bar"]), true, false).await),
+            "node may only request 0 or 1 audiences"
+        );
+        // audience not in pod spec
+        assert_eq!(
+            msg(run(&s, &tr(Some(("mypod", "u1")), &["foo"]), true, false).await),
+            format!("audience \"foo\" {NOT_AUTHORIZED}")
+        );
+        // ... unless the authorizer allows request-serviceaccounts-token-audience
+        run(&s, &tr(Some(("mypod", "u1")), &["foo"]), true, true)
+            .await
+            .unwrap();
+        // gate off: the audience is not checked at all
+        run(&s, &tr(Some(("mypod", "u1")), &["foo"]), false, false)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn audience_via_csi_driver() {
+        let s = base().await;
+        let p = pod(
+            "csipod",
+            "u5",
+            "mynode",
+            json!([{"name":"v","csi":{"driver":"d.example"}}]),
+        );
+        put::<Pod>(&s, "pods", Some("ns"), "csipod", p).await;
+        let t = |a: &str| tr(Some(("csipod", "u5")), &[a]);
+        // csidriver not found
+        let m = msg(run(&s, &t("foo"), true, false).await);
+        assert!(m.starts_with("error validating audience \"foo\": "), "{m}");
+        put::<CSIDriver>(
+            &s,
+            "csidrivers",
+            None,
+            "d.example",
+            driver("d.example", "foo"),
+        )
+        .await;
+        run(&s, &t("foo"), true, false).await.unwrap();
+        assert_eq!(
+            msg(run(&s, &t("bar"), true, false).await),
+            format!("audience \"bar\" {NOT_AUTHORIZED}")
+        );
+    }
+
+    fn pvc(name: &str, pv: &str) -> Value {
+        json!({"apiVersion":"v1","kind":"PersistentVolumeClaim",
+            "metadata":{"name":name,"namespace":"ns"},"spec":{"volumeName":pv}})
+    }
+
+    fn csi_pv(name: &str) -> Value {
+        json!({"apiVersion":"v1","kind":"PersistentVolume","metadata":{"name":name},
+            "spec":{"csi":{"driver":"d.example","volumeHandle":"h"}}})
+    }
+
+    #[tokio::test]
+    async fn audience_via_pvc_pv_csi() {
+        let s = base().await;
+        let vol = json!([{"name":"v","persistentVolumeClaim":{"claimName":"c1"}}]);
+        put::<Pod>(
+            &s,
+            "pods",
+            Some("ns"),
+            "pvcpod",
+            pod("pvcpod", "u6", "mynode", vol),
+        )
+        .await;
+        let t = |a: &str| tr(Some(("pvcpod", "u6")), &[a]);
+        put::<CSIDriver>(
+            &s,
+            "csidrivers",
+            None,
+            "d.example",
+            driver("d.example", "foo"),
+        )
+        .await;
+        // pvc not found
+        let m = msg(run(&s, &t("foo"), true, false).await);
+        assert!(m.starts_with("error validating audience \"foo\": "), "{m}");
+        put::<PersistentVolumeClaim>(
+            &s,
+            "persistentvolumeclaims",
+            Some("ns"),
+            "c1",
+            pvc("c1", "pv1"),
+        )
+        .await;
+        // pv not found
+        let m = msg(run(&s, &t("foo"), true, false).await);
+        assert!(m.starts_with("error validating audience \"foo\": "), "{m}");
+        put::<PersistentVolume>(&s, "persistentvolumes", None, "pv1", csi_pv("pv1")).await;
+        run(&s, &t("foo"), true, false).await.unwrap();
+        assert_eq!(
+            msg(run(&s, &t("bar"), true, false).await),
+            format!("audience \"bar\" {NOT_AUTHORIZED}")
+        );
+    }
+
+    #[tokio::test]
+    async fn audience_via_ephemeral_and_inline_migratable() {
+        let s = base().await;
+        let eph = json!([{"name":"e","ephemeral":{"volumeClaimTemplate":{"spec":{}}}}]);
+        put::<Pod>(
+            &s,
+            "pods",
+            Some("ns"),
+            "ephpod",
+            pod("ephpod", "u7", "mynode", eph),
+        )
+        .await;
+        put::<CSIDriver>(
+            &s,
+            "csidrivers",
+            None,
+            "d.example",
+            driver("d.example", "foo"),
+        )
+        .await;
+        put::<PersistentVolumeClaim>(
+            &s,
+            "persistentvolumeclaims",
+            Some("ns"),
+            "ephpod-e",
+            pvc("ephpod-e", "pv2"),
+        )
+        .await;
+        put::<PersistentVolume>(&s, "persistentvolumes", None, "pv2", csi_pv("pv2")).await;
+        run(&s, &tr(Some(("ephpod", "u7")), &["foo"]), true, false)
+            .await
+            .unwrap();
+
+        // In-tree inline volume translated to CSI (admission.go:748).
+        let ebs =
+            json!([{"name":"v","awsElasticBlockStore":{"volumeID":"vol-123","fsType":"ext4"}}]);
+        put::<Pod>(
+            &s,
+            "pods",
+            Some("ns"),
+            "ebspod",
+            pod("ebspod", "u8", "mynode", ebs),
+        )
+        .await;
+        put::<CSIDriver>(
+            &s,
+            "csidrivers",
+            None,
+            "ebs.csi.aws.com",
+            driver("ebs.csi.aws.com", "bar"),
+        )
+        .await;
+        run(&s, &tr(Some(("ebspod", "u8")), &["bar"]), true, false)
+            .await
+            .unwrap();
+        assert!(run(&s, &tr(Some(("ebspod", "u8")), &["baz"]), true, false)
+            .await
+            .is_err());
+    }
 }

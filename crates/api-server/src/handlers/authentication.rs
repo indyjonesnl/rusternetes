@@ -239,6 +239,30 @@ pub async fn create_token_request(
         ));
     }
 
+    // NodeRestriction.Admit for `serviceaccounts/token` (admission.go:224-225);
+    // upstream runs `createValidation` after ValidateTokenRequest (token.go:145).
+    if crate::admission::plugins::enabled("NodeRestriction") {
+        crate::handlers::node_restriction::admit_service_account_token(
+            &*state.storage,
+            &*state.authorizer,
+            &auth_ctx,
+            &namespace,
+            &service_account_name,
+            &token_request,
+            rusternetes_common::feature_gates::enabled(
+                rusternetes_common::feature_gates::Feature::ServiceAccountNodeAudienceRestriction,
+            ),
+        )
+        .await
+        .map_err(|e| match e {
+            // `admission.NewForbidden(a, err)` (attributes.go): `<resource> "<name>" is forbidden: <err>`.
+            rusternetes_common::Error::Forbidden(m) => rusternetes_common::Error::Forbidden(
+                format!("serviceaccounts \"{service_account_name}\" is forbidden: {m}"),
+            ),
+            other => other,
+        })?;
+    }
+
     // `--service-account-max-token-expiration`: shorten a longer request to the
     // maximum (token.go:222-226), after validation.
     let expiration_seconds = state
