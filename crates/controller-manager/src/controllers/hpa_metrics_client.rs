@@ -19,8 +19,9 @@ use rusternetes_common::types::LabelSelector;
 use std::collections::HashMap;
 
 /// Per-pod metric reading. `value` is the raw metric in milli-units for cpu
-/// (e.g. 500 = 500m) or whole units otherwise; `utilization` is the percentage
-/// of the pod's request (resource metrics only).
+/// (e.g. 500 = 500m) and for custom (Pods) metrics (`Quantity.MilliValue()`,
+/// `metrics/client.go:97`), whole units for other resources (memory bytes);
+/// `utilization` is the percentage of the pod's request (resource metrics only).
 #[derive(Debug, Clone)]
 pub struct PodMetric {
     pub value: i64,
@@ -536,7 +537,7 @@ impl MetricsClient for HttpMetricsClient {
             info.insert(
                 name,
                 PodMetric {
-                    value: item_value(m, metric),
+                    value: item_value(m),
                     utilization: None,
                     timestamp: item_timestamp(m)?,
                     window,
@@ -582,7 +583,7 @@ impl MetricsClient for HttpMetricsClient {
         if items.is_empty() {
             anyhow::bail!("no metrics returned from external metrics API");
         }
-        let values = items.iter().map(|m| item_value(m, metric)).collect();
+        let values = items.iter().map(item_value).collect();
         Ok((values, item_timestamp(&items[0])?))
     }
 }
@@ -596,11 +597,37 @@ fn items_of(body: &serde_json::Value) -> &[serde_json::Value] {
 }
 
 /// `m.Value.MilliValue()` for one metric item.
-fn item_value(item: &serde_json::Value, metric: &str) -> i64 {
+fn item_value(item: &serde_json::Value) -> i64 {
     item.get("value")
         .and_then(|v| v.as_str())
-        .map(|q| parse_quantity_milli(q, metric))
+        .map(metric_milli_value)
         .unwrap_or(0)
+}
+
+/// `Quantity.MilliValue()` for a custom / external / object metric sample
+/// (`metrics/client.go:97,162,190,213`: `val.MilliValue()`,
+/// `m.Value.MilliValue()`). Unlike the resource path (`parse_quantity_milli`,
+/// CPU millicores / memory bytes, only ever used as a ratio), these values
+/// surface in `status.currentMetrics` and are compared against targets read
+/// with `MetricTarget.*.MilliValue()`, so every one is in milli-units.
+/// Unparseable input reads as 0.
+pub(crate) fn metric_milli_value(q: &str) -> i64 {
+    parse_milli(q).unwrap_or(0)
+}
+
+/// Strict `Quantity.MilliValue()` (rounded up away from zero, saturating).
+pub(crate) fn parse_milli(q: &str) -> Option<i64> {
+    let v = rusternetes_common::quantity::Quantity::parse(q.trim())
+        .ok()?
+        .milli_value();
+    Some(v.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
+}
+
+/// `resource.NewMilliQuantity(v, resource.DecimalSI).String()`, as
+/// `horizontal.go:563,572,598,719,739` build `status.currentMetrics` values.
+pub(crate) fn format_milli_quantity(v: i64) -> String {
+    use rusternetes_common::quantity::{Format, Quantity};
+    Quantity::from_milli_value(v, Format::DecimalSI).canonical_string()
 }
 
 /// `m.Timestamp.Time` for one metric item.
@@ -697,7 +724,7 @@ impl HttpMetricsClient {
                 items.len()
             );
         }
-        Ok((item_value(&items[0], metric), item_timestamp(&items[0])?))
+        Ok((item_value(&items[0]), item_timestamp(&items[0])?))
     }
 
     /// `customMetricsClient.qualResourceForKind` (versioned_client.go:84-92):
@@ -824,6 +851,25 @@ mod tests {
             .unwrap();
         assert_eq!(info.len(), 2);
         assert_eq!(info["p1"].value, 200);
+    }
+
+    #[test]
+    fn custom_metric_values_are_milli() {
+        // client.go:162 `m.Value.MilliValue()`: "5" reads 5000, "500m" 500.
+        assert_eq!(metric_milli_value("5"), 5000);
+        assert_eq!(metric_milli_value("500m"), 500);
+        assert_eq!(metric_milli_value("1k"), 1_000_000);
+        assert_eq!(metric_milli_value("0.5"), 500);
+        assert_eq!(metric_milli_value("bogus"), 0);
+        assert_eq!(parse_milli("bogus"), None);
+    }
+
+    #[test]
+    fn milli_quantity_formats_like_new_milli_quantity() {
+        assert_eq!(format_milli_quantity(5000), "5");
+        assert_eq!(format_milli_quantity(500), "500m");
+        assert_eq!(format_milli_quantity(1_500), "1500m");
+        assert_eq!(format_milli_quantity(0), "0");
     }
 
     #[test]
@@ -1163,7 +1209,7 @@ mod tests {
             .get_object_metric("qps", "ns", &obj, "env=prod")
             .await
             .unwrap();
-        assert_eq!(value, 9);
+        assert_eq!(value, 9000);
         assert_eq!(stamp, ts("2026-01-01T00:00:10Z"));
         let reqs = seen.lock().unwrap().clone();
         let metric_req = reqs.last().unwrap();
@@ -1250,7 +1296,7 @@ mod tests {
             .get_external_metric("qps", "ns", "env=prod")
             .await
             .unwrap();
-        assert_eq!(values, vec![4, 6]);
+        assert_eq!(values, vec![4000, 6000]);
         assert_eq!(stamp, ts("2026-01-01T00:00:30Z"));
         let reqs = seen.lock().unwrap().clone();
         assert_eq!(

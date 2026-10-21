@@ -900,7 +900,7 @@ async fn test_hpa_metrics_server_custom_metrics_integration() {
     let mut fake = FakeMetricsClient::new();
     fake.pods.insert(
         "requests-per-second".to_string(),
-        FakeMetricsClient::pods_info(&[("p1", 200, None), ("p2", 200, None)]),
+        FakeMetricsClient::pods_info(&[("p1", 200_000, None), ("p2", 200_000, None)]),
     );
     let controller =
         HorizontalPodAutoscalerController::with_metrics_client(storage.clone(), Arc::new(fake));
@@ -967,6 +967,18 @@ async fn test_hpa_metrics_server_custom_metrics_integration() {
         pods_metric.pods.is_some(),
         "Pods metric status struct should be populated"
     );
+    // horizontal.go:719: currentMetrics averageValue is NewMilliQuantity of
+    // the milli-value usage, so 200 requests/s reads back as "200", not "200000".
+    assert_eq!(
+        pods_metric
+            .pods
+            .as_ref()
+            .unwrap()
+            .current
+            .average_value
+            .as_deref(),
+        Some("200")
+    );
 }
 
 /// HPA external metrics — metrics not associated with any in-cluster object
@@ -982,7 +994,7 @@ async fn test_hpa_external_metrics() {
     // ceil(120/30) = 4 replicas; the test only asserts the External reading
     // is surfaced in status, not a precise replica count.
     fake.external
-        .insert("sqs_queue_depth".to_string(), vec![120]);
+        .insert("sqs_queue_depth".to_string(), vec![120_000]);
     let controller =
         HorizontalPodAutoscalerController::with_metrics_client(storage.clone(), Arc::new(fake));
 
@@ -1494,7 +1506,8 @@ async fn test_hpa_object_metric_routing() {
     let mut fake = FakeMetricsClient::new();
     // Object metric value vs target=1000; the test asserts the Object reading
     // is routed/surfaced in status, not a precise replica count.
-    fake.object.insert("requests-per-second".to_string(), 2000);
+    fake.object
+        .insert("requests-per-second".to_string(), 2_000_000);
     let controller =
         HorizontalPodAutoscalerController::with_metrics_client(storage.clone(), Arc::new(fake));
 
