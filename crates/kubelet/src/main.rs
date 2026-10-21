@@ -814,6 +814,12 @@ async fn main() -> Result<()> {
         // server.go:312-314 `InstallAuthFilter`: wraps every route registered
         // above (and /statusz).
         let app = server_auth::install_auth_filter(app, Some(auth));
+        // server.go:1176 `ServeHTTP`: request metrics outside the auth filter.
+        let app = server::install_metrics_filter(
+            app,
+            server::MetricsBuckets::new_server(server::server_bucket_options()),
+            true,
+        );
 
         // Serve the kubelet API port over HTTPS (#1644): a vanilla api-server
         // proxies logs/exec/attach/metrics to `https://<nodeIP>:10250` and will
