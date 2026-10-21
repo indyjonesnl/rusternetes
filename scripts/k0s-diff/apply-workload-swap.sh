@@ -73,8 +73,11 @@ case "$component" in
     fi
     ok=0
     for _ in $(seq 1 10); do
-      if kubectl -n default exec dnstest -- nslookup kubernetes.default.svc.cluster.local 10.96.0.10 2>&1 \
-           | tee -a "$diag" | grep -qE 'Address: *10\.96\.0\.1'; then
+      # grep -c (not -q): -q closes the pipe on first match and the upstream
+      # writer can die with SIGPIPE under pipefail (same pattern as run-variant.sh).
+      hits="$(kubectl -n default exec dnstest -- nslookup kubernetes.default.svc.cluster.local 10.96.0.10 2>&1 \
+           | tee -a "$diag" | grep -cE 'Address: *10\.96\.0\.1' || true)"
+      if [ "${hits:-0}" -gt 0 ]; then
         ok=1; break
       fi
       sleep 3
