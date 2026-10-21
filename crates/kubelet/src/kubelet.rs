@@ -776,7 +776,8 @@ impl Kubelet {
             Some(storage.clone()),
             token_manager,
             Some(pod_certificate_manager.clone()),
-        );
+        )
+        .with_node_name(&node_name);
 
         // The kubernetes Service host:port injected into pods as
         // KUBERNETES_SERVICE_* so in-cluster clients reach the api-server.
