@@ -16,6 +16,7 @@
 //! compile is not. The status-side allocation results are tracked in #2016.
 //! ObjectMeta is validated separately.
 
+use crate::cel_versions::{self, EnvSet, EnvType};
 use crate::resources::{
     AllocatedDeviceStatus, AllocationConfigSource, AllocationResult, DeviceAllocationConfiguration,
     DeviceAllocationMode, DeviceClaim, DeviceClaimConfiguration, DeviceRequestAllocationResult,
@@ -547,6 +548,30 @@ fn validate_device_allocation_configuration(
 /// `validateCELSelector` (`validation.go:298-330`). Shared with `DeviceClass`,
 /// which validates the identical shape.
 pub(crate) fn validate_selector_slice(selectors: &[DeviceSelector], fld_path: &Path) -> ErrorList {
+    validate_selector_slice_in(
+        selectors,
+        fld_path,
+        false,
+        &EnvSet::must_base_env_set(cel_versions::default_compatibility_version()),
+    )
+}
+
+/// `validateSelectorSlice(selectors, fldPath, stored)`. `stored` picks the
+/// CEL environment type (`validateCELSelector`, `validation.go:316-322`):
+/// `StoredExpressions` when true, else `NewExpressions`. `env_set` is the
+/// compiler's envset (`newCompiler`, `compile.go:302-373`, built from
+/// `MustBaseEnvSet(DefaultCompatibilityVersion())`).
+pub(crate) fn validate_selector_slice_in(
+    selectors: &[DeviceSelector],
+    fld_path: &Path,
+    stored: bool,
+    env_set: &EnvSet,
+) -> ErrorList {
+    let env_type = if stored {
+        EnvType::StoredExpressions
+    } else {
+        EnvType::NewExpressions
+    };
     let mut errs: ErrorList = Vec::new();
     if selectors.len() > DEVICE_SELECTORS_MAX_SIZE {
         errs.push(too_many_max_items(
@@ -569,6 +594,12 @@ pub(crate) fn validate_selector_slice(selectors: &[DeviceSelector], fld_path: &P
                         CEL_SELECTOR_EXPRESSION_MAX_LENGTH,
                     ));
                 } else if let Some(detail) = crate::cel::parse_failure(&cel.expression) {
+                    errs.push(Error::invalid(&expr_path, cel.expression.clone(), detail));
+                } else if let Some(detail) =
+                    cel_versions::compile_failure(&cel.expression, env_set, env_type)
+                {
+                    // A library the chosen environment does not carry:
+                    // `envset.Env(envType)` omits it (`compile.go:166`).
                     errs.push(Error::invalid(&expr_path, cel.expression.clone(), detail));
                 } else {
                     // `CompileCELExpression` type-checks against the DRA

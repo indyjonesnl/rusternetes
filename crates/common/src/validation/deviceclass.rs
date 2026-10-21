@@ -7,9 +7,10 @@
 //! ≤10Ki) and the `config` set (≤32). Parse-checking the CEL expressions; compiling against the
 //! DRA CEL environment is tracked in #1442. ObjectMeta is validated separately.
 
+use crate::cel_versions::{self, EnvSet};
 use crate::resources::{DeviceClass, DeviceClassSpec};
 use crate::validation::field::{ErrorList, Path};
-use crate::validation::resourceclaim::{too_many_max_items, validate_selector_slice};
+use crate::validation::resourceclaim::{too_many_max_items, validate_selector_slice_in};
 
 const DEVICE_CONFIG_MAX_SIZE: usize = 32;
 
@@ -19,19 +20,52 @@ pub fn validate_device_class(class: &DeviceClass) -> ErrorList {
     validate_device_class_spec(&class.spec, &Path::new("spec"))
 }
 
-// Note: `ValidateDeviceClassUpdate` upstream simply re-runs `ValidateDeviceClass`
-// (the spec is mutable, no immutable fields), so the update handler calls
-// `validate_device_class` directly.
+/// `validateDeviceClassSpec(spec, oldSpec, fldPath)` as called from
+/// `ValidateDeviceClassUpdate` (`validation.go:545-567`): the selectors are
+/// "stored" (compiled in `StoredExpressions`) iff exactly as before; any
+/// change, including a reorder, compiles them as new expressions.
+pub fn validate_device_class_update(class: &DeviceClass, old: &DeviceClass) -> ErrorList {
+    validate_device_class_update_in(
+        class,
+        old,
+        &EnvSet::must_base_env_set(cel_versions::default_compatibility_version()),
+    )
+}
+
+pub fn validate_device_class_update_in(
+    class: &DeviceClass,
+    old: &DeviceClass,
+    env_set: &EnvSet,
+) -> ErrorList {
+    let stored = class.spec.selectors == old.spec.selectors;
+    validate_device_class_spec_in(&class.spec, &Path::new("spec"), stored, env_set)
+}
 
 fn validate_device_class_spec(spec: &DeviceClassSpec, fld_path: &Path) -> ErrorList {
+    validate_device_class_spec_in(
+        spec,
+        fld_path,
+        false,
+        &EnvSet::must_base_env_set(cel_versions::default_compatibility_version()),
+    )
+}
+
+fn validate_device_class_spec_in(
+    spec: &DeviceClassSpec,
+    fld_path: &Path,
+    stored: bool,
+    env_set: &EnvSet,
+) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
 
     // Upstream reaches the identical `validateSelectorSlice` from both a
     // DeviceClass and a claim's requests (`validation.go:298`), so this calls
     // the one port of it rather than keeping a second copy.
-    errs.extend(validate_selector_slice(
+    errs.extend(validate_selector_slice_in(
         &spec.selectors,
         &fld_path.child("selectors"),
+        stored,
+        env_set,
     ));
 
     if spec.config.len() > DEVICE_CONFIG_MAX_SIZE {
@@ -161,5 +195,46 @@ mod tests {
         got.sort();
         let m = |f: &str| (f.to_string(), "maxItems".to_string());
         assert_eq!(got, vec![m("spec.config"), m("spec.selectors")]);
+    }
+
+    fn class_with(expr: &str) -> DeviceClass {
+        dc(serde_json::json!({"selectors": [{"cel": {"expression": expr}}]}))
+    }
+
+    fn env_1_32() -> EnvSet {
+        EnvSet::must_base_env_set(crate::feature_gates::Version::major_minor(1, 32))
+    }
+
+    /// `validateCELSelector` (validation.go:316-322) + `validateDeviceClassSpec`
+    /// (:571-577): an unchanged selector list compiles in `StoredExpressions`
+    /// (every library), a changed one in `NewExpressions`, which carries only
+    /// the libraries introduced by the compatibility version (semver: 1.33).
+    #[test]
+    fn selector_library_gated_by_new_vs_stored_environment() {
+        let expr = "device.attributes['d'].v.isSemver()";
+        let new = class_with(expr);
+        let msgs = |errs: ErrorList| errs.into_iter().map(|e| e.to_string()).collect::<Vec<_>>();
+
+        let created = msgs(validate_device_class_update_in(
+            &new,
+            &class_with("true"),
+            &env_1_32(),
+        ));
+        assert!(
+            created
+                .iter()
+                .any(|m| m.contains("undeclared reference to 'isSemver'")),
+            "{created:?}"
+        );
+        let stored = msgs(validate_device_class_update_in(&new, &new, &env_1_32()));
+        assert!(stored.is_empty(), "{stored:?}");
+        let mut two = new.clone();
+        two.spec
+            .selectors
+            .push(class_with("true").spec.selectors[0].clone());
+        let mut swapped = two.clone();
+        swapped.spec.selectors.reverse();
+        assert!(!msgs(validate_device_class_update_in(&swapped, &two, &env_1_32())).is_empty());
+        assert!(validate_device_class(&new).is_empty());
     }
 }
