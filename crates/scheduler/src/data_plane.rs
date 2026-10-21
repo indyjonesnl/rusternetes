@@ -206,6 +206,23 @@ impl<S: Storage + Send + Sync + 'static> DataPlane<S> {
         }
     }
 
+    /// List every Namespace (`nsLister.List`, `nsLister.Get` in
+    /// `interpodaffinity/plugin.go`). Storage: `list(/registry/namespaces)`.
+    /// API: GET the collection.
+    pub async fn list_namespaces(&self) -> Result<Vec<rusternetes_common::resources::Namespace>> {
+        match self {
+            DataPlane::Storage(s) => {
+                s.list(&rusternetes_storage::build_prefix("namespaces", None))
+                    .await
+            }
+            DataPlane::Api(a) => a
+                .client
+                .get_list("/api/v1/namespaces")
+                .await
+                .map_err(get_err_to_common),
+        }
+    }
+
     /// List every PriorityClass. Storage: `list(/registry/priorityclasses)`.
     /// API: GET the collection (priority classes change rarely, so no informer).
     pub async fn list_priority_classes(&self) -> Result<Vec<PriorityClass>> {

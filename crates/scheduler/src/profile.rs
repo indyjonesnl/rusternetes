@@ -64,6 +64,9 @@ pub struct Profile {
     /// `NodeResourcesBalancedAllocation` scorer
     /// (`NodeResourcesBalancedAllocationArgs.Resources`).
     pub balanced_scorer: crate::score::ResourceAllocationScorer,
+    /// `InterPodAffinityArgs` (`HardPodAffinityWeight`,
+    /// `IgnorePreferredTermsOfExistingPods`), read by its PreScore.
+    pub inter_pod_affinity: crate::inter_pod_affinity_score::Args,
     /// The built framework for this profile (plugins per extension point +
     /// score weights). [`Map::new_map`] rebuilds it from `plugins`.
     pub framework: Framework,
@@ -88,6 +91,7 @@ impl Profile {
             min_candidate_nodes_absolute: 100,
             fit_scorer: crate::score::ResourceAllocationScorer::default_fit(),
             balanced_scorer: crate::score::ResourceAllocationScorer::default_balanced(),
+            inter_pod_affinity: crate::inter_pod_affinity_score::Args::default(),
             framework: Framework::default(),
         };
         p.framework = p

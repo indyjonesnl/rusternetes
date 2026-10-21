@@ -167,6 +167,11 @@ impl DefaultPreemptionArgs {
 pub struct InterPodAffinityArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hard_pod_affinity_weight: Option<i32>,
+    /// `IgnorePreferredTermsOfExistingPods` (types_pluginargs.go:56-58):
+    /// ignore existing pods' preferred affinity rules when the incoming pod
+    /// has no inter-pod affinity terms of its own.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ignore_preferred_terms_of_existing_pods: bool,
 }
 
 impl InterPodAffinityArgs {
@@ -903,6 +908,15 @@ fn resolve_profiles(
                     a.set_defaults();
                     p.balanced_scorer =
                         crate::score::ResourceAllocationScorer::balanced(a.resources);
+                }
+                "InterPodAffinity" => {
+                    let mut a: InterPodAffinityArgs = decode_args(pc, &args_path)?;
+                    a.set_defaults();
+                    p.inter_pod_affinity = crate::inter_pod_affinity_score::Args {
+                        hard_pod_affinity_weight: a.hard_pod_affinity_weight.unwrap_or(1),
+                        ignore_preferred_terms_of_existing_pods: a
+                            .ignore_preferred_terms_of_existing_pods,
+                    };
                 }
                 "DefaultPreemption" => {
                     let mut a: DefaultPreemptionArgs = decode_args(pc, &args_path)?;
@@ -1838,6 +1852,7 @@ profiles:
         let ok = |w| {
             InterPodAffinityArgs {
                 hard_pod_affinity_weight: Some(w),
+                ..Default::default()
             }
             .validate(&Path::default())
         };
@@ -1862,6 +1877,7 @@ profiles:
         assert_eq!(a.hard_pod_affinity_weight, Some(1));
         let mut b = InterPodAffinityArgs {
             hard_pod_affinity_weight: Some(0),
+            ..Default::default()
         };
         b.set_defaults();
         assert_eq!(b.hard_pod_affinity_weight, Some(0));
