@@ -121,7 +121,7 @@ services:
     # evict every running pod — including calico-node — into Failed, and the
     # DaemonSet controller then GCs and recreates them in a tight loop. kind
     # disables eviction the same way for local clusters.
-    command: ["--node-name", "node-1", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.rusternetes/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--pod-manifest-path", "/etc/rusternetes/manifests", "--eviction-hard", ""]
+    command: ["--hostname-override", "node-1", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.rusternetes/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--pod-manifest-path", "/etc/rusternetes/manifests", "--eviction-hard", ""]
 
   # Worker node.
   node-2:
@@ -146,7 +146,7 @@ services:
       - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}/node-2
     # See node-1: eviction disabled because the shared host disk is ~99% full.
-    command: ["--node-name", "node-2", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.rusternetes/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--eviction-hard", ""]
+    command: ["--hostname-override", "node-2", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.rusternetes/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--eviction-hard", ""]
 
   # kube-proxy per node, in that node's network namespace, so its Service
   # iptables apply where the node's pods live (Calico pod network).

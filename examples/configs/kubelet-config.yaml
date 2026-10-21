@@ -2,7 +2,7 @@
 # This file demonstrates production-grade configuration options for the Rusternetes Kubelet
 #
 # Usage:
-#   kubelet --node-name=node-1 --config=/path/to/kubelet-config.yaml --etcd-servers=http://localhost:2379
+#   kubelet --hostname-override=node-1 --config=/path/to/kubelet-config.yaml --etcd-servers=http://localhost:2379
 #
 # For more information, see the documentation at docs/KUBELET_CONFIGURATION.md
 

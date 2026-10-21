@@ -224,12 +224,12 @@ rusternetes-controller-manager [OPTIONS]
 ### kubelet
 
 ```
-rusternetes-kubelet --node-name <NAME> [OPTIONS]
+rusternetes-kubelet [--hostname-override <NAME>] [OPTIONS]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
-| `--node-name` | *(required)* | Node name |
+| `--hostname-override` | OS hostname | Node name and hostname (upstream derives `nodeName` from it) |
 | `--etcd-servers` | `http://localhost:2379` | etcd/Rhino endpoints |
 | `--storage-backend` | `etcd` | `etcd` or `sqlite` |
 | `--data-dir` | `./data/rusternetes.db` | SQLite path |
@@ -492,7 +492,7 @@ kubelet + kube-proxy on each worker, all pointed at the same storage endpoint
 
 # each worker (kube-proxy needs root or CAP_NET_ADMIN)
 export CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
-./target/release/kubelet --node-name worker-1 --etcd-servers http://STORE:2379
+./target/release/kubelet --hostname-override worker-1 --etcd-servers http://STORE:2379
 sudo ./target/release/kube-proxy --node-name worker-1 --etcd-servers http://STORE:2379
 ```
 

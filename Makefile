@@ -141,7 +141,7 @@ run-controller: ## Run controller manager locally
 	cargo run --bin controller-manager -- --etcd-servers http://localhost:2379
 
 run-kubelet: ## Run kubelet locally
-	cargo run --bin kubelet -- --node-name node-1 --etcd-servers http://localhost:2379
+	cargo run --bin kubelet -- --hostname-override node-1 --etcd-servers http://localhost:2379
 
 run-kube-proxy: ## Run kube-proxy locally
 	cargo run --bin kube-proxy -- --node-name node-1

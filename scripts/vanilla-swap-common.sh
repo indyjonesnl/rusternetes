@@ -621,7 +621,7 @@ vs_swap_join_worker() {
     -e "KUBELET_VOLUMES_PATH=/app/volumes" \
     -e "CONTAINERD_STREAM_HOST=localhost" \
     "$image" \
-    --node-name "$node_name" \
+    --hostname-override "$node_name" \
     --kubeconfig /app/admin.conf \
     --api-server-url "https://${node_ip}:6443" \
     --cluster-dns "$clusterdns" \

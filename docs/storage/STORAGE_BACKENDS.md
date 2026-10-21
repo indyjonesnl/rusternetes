@@ -195,7 +195,7 @@ podman compose up -d
 api-server --etcd-servers http://etcd:2379
 scheduler --etcd-servers http://etcd:2379
 controller-manager --etcd-servers http://etcd:2379
-kubelet --node-name node-1 --etcd-servers http://etcd:2379
+kubelet --hostname-override node-1 --etcd-servers http://etcd:2379
 kube-proxy --node-name node-1 --etcd-servers http://etcd:2379
 ```
 

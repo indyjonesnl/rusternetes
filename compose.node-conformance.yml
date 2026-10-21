@@ -156,7 +156,7 @@ services:
     # already be above kubelet's default disk-pressure thresholds. Keep memory
     # eviction enabled, but disable disk-based eviction for this harness so the
     # suite exercises pod behavior instead of host free-space variance.
-    command: ["--node-name", "node-1", "--etcd-servers", "http://rhino:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--eviction-hard", "memory.available<100Mi"]
+    command: ["--hostname-override", "node-1", "--etcd-servers", "http://rhino:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--eviction-hard", "memory.available<100Mi"]
 
   scheduler:
     build:
